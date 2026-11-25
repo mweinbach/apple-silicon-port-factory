@@ -266,6 +266,13 @@ fn mix_dsound_frames(
                 sl = mono;
                 sr = mono;
             }
+            if !buf.effects.is_empty() {
+                for fx in &buf.effects {
+                    let (nl, nr) = fx.lock().unwrap().process_sample(sl, sr, mix_rate as f32);
+                    sl = nl;
+                    sr = nr;
+                }
+            }
 
             out[f * 2] += sl * gain_l;
             out[f * 2 + 1] += sr * gain_r;

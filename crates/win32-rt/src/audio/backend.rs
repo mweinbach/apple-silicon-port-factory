@@ -28,7 +28,7 @@
 
 use super::ring::Ring;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 /// One host output device as seen by the endpoint layer.
@@ -228,6 +228,320 @@ thread_local! {
     static IN_CA_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Query CoreAudio HAL device master scalar volume `[0.0, 1.0]` when using the
+/// CoreAudio backend on macOS (returns `None` on null/virtual/iOS devices).
+pub fn device_volume_scalar(dev: &DeviceInfo, is_capture: bool) -> Option<f32> {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_volume_scalar(id, is_capture))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = is_capture;
+        None
+    }
+}
+
+pub fn set_device_volume_scalar(dev: &DeviceInfo, is_capture: bool, scalar: f32) -> bool {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::set_device_volume_scalar(id, is_capture, scalar))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, scalar);
+        false
+    }
+}
+
+pub fn device_channel_volume_scalar(dev: &DeviceInfo, is_capture: bool, channel: u32) -> Option<f32> {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_channel_volume_scalar(id, is_capture, channel))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, channel);
+        None
+    }
+}
+
+pub fn set_device_channel_volume_scalar(dev: &DeviceInfo, is_capture: bool, channel: u32, scalar: f32) -> bool {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::set_device_channel_volume_scalar(id, is_capture, channel, scalar))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, channel, scalar);
+        false
+    }
+}
+
+pub fn device_mute(dev: &DeviceInfo, is_capture: bool) -> Option<bool> {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_mute(id, is_capture))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = is_capture;
+        None
+    }
+}
+
+pub fn set_device_mute(dev: &DeviceInfo, is_capture: bool, mute: bool) -> bool {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::set_device_mute(id, is_capture, mute))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, mute);
+        false
+    }
+}
+
+pub fn device_volume_range_db(dev: &DeviceInfo, is_capture: bool) -> Option<(f32, f32)> {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_volume_range_db(id, is_capture))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = is_capture;
+        None
+    }
+}
+
+/// Query whether the endpoint's CoreAudio HAL device actually supports writable hardware
+/// `(volume, mute)` controls. Returns `(false, false)` for Null/iOS/software-only endpoints.
+pub fn device_hardware_volume_support(dev: &DeviceInfo, is_capture: bool, channels: u32) -> (bool, bool) {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return (false, false);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_hardware_volume_support(id, is_capture, channels))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, channels);
+        (false, false)
+    }
+}
+
+/// Real-time safe channel-layout converter + linear resampler for loopback audio.
+/// Converts interleaved float32 input `(src_rate, src_channels)` into `(dst_rate, dst_channels)`
+/// using preallocated buffers so the CoreAudio IOProc never allocates on the realtime thread.
+pub(crate) struct TapFormatConverter {
+    src_rate: u32,
+    src_channels: usize,
+    dst_rate: u32,
+    dst_channels: usize,
+    /// Preallocated scratch buffer for channel-converted frames (`src_rate`, `dst_channels`).
+    ch_buf: Vec<f32>,
+    /// Preallocated scratch buffer for resampled output frames (`dst_rate`, `dst_channels`).
+    out_buf: Vec<f32>,
+    /// Exact rational input-frame cursor numerator in units of `1 / dst_rate` input frames
+    /// (zero floating-point drift across arbitrary stream durations).
+    phase_num: u64,
+    /// Last channel-converted frame from the previous callback (for interpolation across boundaries).
+    prev_frame: [f32; 8],
+    has_prev: bool,
+}
+
+impl TapFormatConverter {
+    pub(crate) fn new(src_rate: u32, src_channels: u32, dst_rate: u32, dst_channels: u32) -> Self {
+        let sc = src_channels.clamp(1, 8) as usize;
+        let dc = dst_channels.clamp(1, 8) as usize;
+        Self {
+            src_rate: src_rate.max(1),
+            src_channels: sc,
+            dst_rate: dst_rate.max(1),
+            dst_channels: dc,
+            ch_buf: Vec::with_capacity(4096 * dc),
+            out_buf: Vec::with_capacity(8192 * dc),
+            phase_num: 0,
+            prev_frame: [0.0; 8],
+            has_prev: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn matches_src(&self, src_rate: u32, src_channels: u32) -> bool {
+        self.src_rate == src_rate.max(1) && self.src_channels == src_channels.clamp(1, 8) as usize
+    }
+
+    #[inline]
+    pub(crate) fn is_passthrough(&self) -> bool {
+        self.src_rate == self.dst_rate && self.src_channels == self.dst_channels
+    }
+
+    /// Convert interleaved float32 input samples and return a slice of interleaved float32 output
+    /// samples in `(dst_rate, dst_channels)`.
+    pub(crate) fn convert<'a>(&'a mut self, input: &'a [f32]) -> &'a [f32] {
+        if self.is_passthrough() {
+            return input;
+        }
+        let sc = self.src_channels;
+        let dc = self.dst_channels;
+        let in_frames = input.len() / sc;
+        if in_frames == 0 {
+            return &[];
+        }
+
+        // Step 1: Channel conversion (src_channels -> dst_channels).
+        let ch_src: &[f32] = if sc == dc {
+            &input[..in_frames * sc]
+        } else {
+            self.ch_buf.clear();
+            let cap_frames = self.ch_buf.capacity() / dc;
+            let frames = in_frames.min(cap_frames.max(in_frames));
+            if self.ch_buf.capacity() < frames * dc {
+                self.ch_buf.reserve(frames * dc - self.ch_buf.capacity());
+            }
+            for f in 0..frames {
+                let base = f * sc;
+                if dc == 1 {
+                    let mut sum = 0.0f32;
+                    for c in 0..sc {
+                        sum += input[base + c];
+                    }
+                    self.ch_buf.push(sum / sc as f32);
+                } else if sc == 1 {
+                    let s = input[base];
+                    for c in 0..dc {
+                        self.ch_buf.push(if c < 2 { s } else { 0.0 });
+                    }
+                } else {
+                    for c in 0..dc {
+                        self.ch_buf.push(if c < sc { input[base + c] } else { 0.0 });
+                    }
+                }
+            }
+            &self.ch_buf
+        };
+
+        if self.src_rate == self.dst_rate {
+            return ch_src;
+        }
+
+        // Step 2: Exact-ratio linear resampling (src_rate -> dst_rate).
+        let src_frames = ch_src.len() / dc;
+        let sr = self.src_rate as u64;
+        let dr = self.dst_rate as u64;
+        let inv_dr = 1.0f32 / self.dst_rate as f32;
+        self.out_buf.clear();
+        if !self.has_prev {
+            for c in 0..dc {
+                self.prev_frame[c] = ch_src[c];
+            }
+            self.has_prev = true;
+        }
+
+        let mut pos_num = self.phase_num;
+        let limit_num = (src_frames as u64) * dr;
+        while pos_num < limit_num {
+            let idx = (pos_num / dr) as usize;
+            let frac = (pos_num % dr) as f32 * inv_dr;
+            for c in 0..dc {
+                let s0 = if idx == 0 {
+                    self.prev_frame[c]
+                } else {
+                    ch_src[(idx - 1) * dc + c]
+                };
+                let s1 = ch_src[idx.min(src_frames - 1) * dc + c];
+                self.out_buf.push(s0 + (s1 - s0) * frac);
+            }
+            pos_num += sr;
+        }
+        self.phase_num = pos_num - limit_num;
+        let last_base = (src_frames - 1) * dc;
+        for c in 0..dc {
+            self.prev_frame[c] = ch_src[last_base + c];
+        }
+        &self.out_buf
+    }
+}
+
+/// Optional live macOS 14.2+ CoreAudio Process Tap for system loopback capture.
+pub struct LoopbackTap {
+    #[cfg(target_os = "macos")]
+    tap: Option<ca::ProcessTap>,
+}
+
+impl LoopbackTap {
+    /// Attempt to open a macOS 14.2+ CoreAudio process tap feeding `ring` in `(target_rate, target_channels)`.
+    /// Returns `None` when headless, on the Null backend, on iOS, on macOS < 14.2,
+    /// or when audio-capture TCC permission is not granted (caller falls back to
+    /// in-process WASAPI render loopback).
+    pub fn try_open(dev: &DeviceInfo, ring: Arc<Ring>, target_rate: u32, target_channels: u32) -> Option<Self> {
+        let headless = std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
+            || std::env::var("AW2_HEADLESS").is_ok_and(|v| v == "1");
+        if headless || dev.id == 0 || backend() != Backend::CoreAudio {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let uid = dev.uid.clone();
+            match ca_sync(move || ca::ProcessTap::open(ring, Some(&uid), target_rate, target_channels)) {
+                Ok(tap) => {
+                    log::info!(target: "audio", "CoreAudio ProcessTap opened for loopback capture on '{}'", dev.name);
+                    Some(Self { tap: Some(tap) })
+                }
+                Err(e) => {
+                    log::debug!(target: "audio", "CoreAudio ProcessTap unavailable ({e}); using in-process WASAPI render loopback");
+                    None
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (ring, target_rate, target_channels);
+            None
+        }
+    }
+}
+
+impl Drop for LoopbackTap {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(t) = self.tap.take() {
+            ca_sync(move || drop(t));
+        }
+    }
+}
+
 /// Run `f` on the dedicated host thread that owns all CoreAudio calls and wait
 /// for its result. If already running on the CoreAudio control thread, runs
 /// inline to prevent self-deadlock.
@@ -264,10 +578,170 @@ pub fn ca_sync<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
 // Streams
 // ---------------------------------------------------------------------------
 
+/// Playback-side loopback feed attached to render/spatial `StreamShared` instances.
+///
+/// The playback consumer (CoreAudio RT callback or Null clock thread) feeds samples
+/// strictly as playback consumes them from `StreamShared::ring`, ensuring unstarted
+/// prefill or reset audio never leaks into fallback loopback capture.
+pub struct LoopbackFeed {
+    pub ep_id: String,
+    pub source_id: u64,
+    pub rate: u32,
+    pub channels: u16,
+    /// Lock-free SPSC ring filled by the realtime CoreAudio IO thread and drained by
+    /// the non-RT `wwise-audio-pump` thread into `push_loopback_frames`.
+    pub ring: Ring,
+    /// True when `OutputStream::open` attached this feed automatically for a native
+    /// middleware stream (`StreamShared::new`), so `StreamControl::start`/`stop` and
+    /// `OutputStream::drop` drive its fallback loopback source registration lifecycle.
+    pub(super) managed_by_stream: bool,
+}
+
+/// Lock-free per-channel stream gain state (`IAudioStreamVolume`), safe to read from
+/// the realtime CoreAudio render callback without acquiring any mutex.
+pub struct StreamChannelGain {
+    count: AtomicU32,
+    levels: [AtomicU32; 8],
+}
+
+impl StreamChannelGain {
+    pub fn new(channels: usize) -> Arc<Self> {
+        Arc::new(Self {
+            count: AtomicU32::new(channels.clamp(1, 8) as u32),
+            levels: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+        })
+    }
+
+    pub fn resize(&self, channels: usize) {
+        let new_n = channels.clamp(1, 8);
+        let old_n = self.count.swap(new_n as u32, Ordering::AcqRel) as usize;
+        for slot in self.levels.iter().take(new_n).skip(old_n) {
+            slot.store(1.0f32.to_bits(), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count.load(Ordering::Acquire) as usize
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<f32> {
+        if idx >= self.len() {
+            return None;
+        }
+        Some(f32::from_bits(self.levels[idx].load(Ordering::Acquire)))
+    }
+
+    #[inline]
+    pub fn set(&self, idx: usize, level: f32) -> bool {
+        if idx >= self.len() {
+            return false;
+        }
+        self.levels[idx].store(level.to_bits(), Ordering::Release);
+        true
+    }
+
+    pub fn snapshot(&self) -> [f32; 8] {
+        let mut out = [1.0f32; 8];
+        let n = self.len().min(8);
+        for (dst, src) in out.iter_mut().zip(self.levels.iter()).take(n) {
+            *dst = f32::from_bits(src.load(Ordering::Acquire));
+        }
+        out
+    }
+
+    pub fn set_all(&self, vals: &[f32]) -> bool {
+        let n = self.len();
+        if vals.len() != n {
+            return false;
+        }
+        for (dst, &v) in self.levels.iter().zip(vals.iter()).take(n) {
+            dst.store(v.to_bits(), Ordering::Release);
+        }
+        true
+    }
+}
+
+/// Lock-free playback gain chain evaluated at consumption time (CoreAudio RT callback and
+/// Null clock thread) so `ISimpleAudioVolume`, `IAudioStreamVolume`, and software
+/// `IAudioEndpointVolume` changes apply immediately to already-queued audio.
+pub(super) struct PlaybackGain {
+    session: Arc<super::mmdevapi::SessionState>,
+    stream_ch: Arc<StreamChannelGain>,
+    /// `true` when stream channels map 1:1 to ring channels; `false` when a pre-ring channel
+    /// matrix already applied per-client-channel `stream_ch` gains before downmixing.
+    apply_stream_ch: bool,
+    ep_sw: Arc<super::mmdevapi::EndpointSwAtomic>,
+}
+
+impl PlaybackGain {
+    pub(super) fn new(
+        session: Arc<super::mmdevapi::SessionState>,
+        stream_ch: Arc<StreamChannelGain>,
+        apply_stream_ch: bool,
+        ep_sw: Arc<super::mmdevapi::EndpointSwAtomic>,
+    ) -> Self {
+        Self {
+            session,
+            stream_ch,
+            apply_stream_ch,
+            ep_sw,
+        }
+    }
+
+    /// Apply live session, stream-channel, and software endpoint gains in-place.
+    /// Returns `true` when session/endpoint mute completely silences the buffer.
+    #[inline]
+    pub(super) fn apply(&self, samples: &mut [f32], channels: usize) -> bool {
+        if self.ep_sw.sw_muted.load(Ordering::Acquire) {
+            samples.fill(0.0);
+            return true;
+        }
+        let master = self.session.effective_gain();
+        if master == 0.0 {
+            samples.fill(0.0);
+            return true;
+        }
+        let ch = channels.max(1);
+        let n = ch.min(8);
+        let mut eff = [master; 8];
+        let mut unity = (master - 1.0).abs() <= 1e-6;
+        for c in 0..n {
+            let mut g = master * f32::from_bits(self.ep_sw.sw_channels[c].load(Ordering::Acquire));
+            if self.apply_stream_ch {
+                g *= f32::from_bits(self.stream_ch.levels[c].load(Ordering::Acquire));
+            }
+            eff[c] = g;
+            if (g - 1.0).abs() > 1e-6 {
+                unity = false;
+            }
+        }
+        if unity {
+            return false;
+        }
+        for frame in samples.chunks_exact_mut(ch) {
+            for (c, sample) in frame.iter_mut().enumerate() {
+                let g = if c < 8 { eff[c] } else { master };
+                *sample *= g;
+            }
+        }
+        false
+    }
+}
+
 /// State shared between the client, the IO callback and the pump thread.
 pub struct StreamShared {
     pub ring: Ring,
+    loopback: OnceLock<LoopbackFeed>,
+    pub(super) gain: Option<PlaybackGain>,
+    /// Endpoint software volume/mute handle attached by `OutputStream::open` for streams
+    /// constructed without WASAPI session controls (DirectSound, XAudio2, FMOD, OpenAL, Bink).
+    ep_sw: OnceLock<Arc<super::mmdevapi::EndpointSwAtomic>>,
     pub started: AtomicBool,
+    /// Monotonic total frames rendered by the output backend while started (including
+    /// zero-filled underrun periods), in the stream's sample rate.
+    pub rendered_frames: AtomicU64,
     pub underrun_frames: AtomicU64,
     pub callbacks: AtomicU64,
     /// Largest slice the device pulled in one callback.
@@ -295,7 +769,11 @@ impl StreamShared {
     pub fn new(ring: Ring) -> Arc<StreamShared> {
         Arc::new(StreamShared {
             ring,
+            loopback: OnceLock::new(),
+            gain: None,
+            ep_sw: OnceLock::new(),
             started: AtomicBool::new(false),
+            rendered_frames: AtomicU64::new(0),
             underrun_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
             max_slice: AtomicU64::new(0),
@@ -307,6 +785,123 @@ impl StreamShared {
         })
     }
 
+    pub(super) fn with_loopback(
+        ring: Ring,
+        ep_id: String,
+        source_id: u64,
+        rate: u32,
+        channels: u16,
+        gain: Option<PlaybackGain>,
+    ) -> Arc<StreamShared> {
+        let lb_cap = ring.capacity().max(8192);
+        let lb_ring = Ring::new(lb_cap, channels.max(1) as usize);
+        let loopback = OnceLock::new();
+        let _ = loopback.set(LoopbackFeed {
+            ep_id,
+            source_id,
+            rate,
+            channels,
+            ring: lb_ring,
+            managed_by_stream: false,
+        });
+        Arc::new(StreamShared {
+            ring,
+            loopback,
+            gain,
+            ep_sw: OnceLock::new(),
+            started: AtomicBool::new(false),
+            rendered_frames: AtomicU64::new(0),
+            underrun_frames: AtomicU64::new(0),
+            callbacks: AtomicU64::new(0),
+            max_slice: AtomicU64::new(0),
+            event: Mutex::new(None),
+            has_event: AtomicBool::new(false),
+            invalid: AtomicBool::new(false),
+            sema: Semaphore::new(),
+            quit: AtomicBool::new(false),
+        })
+    }
+
+    #[inline]
+    pub(super) fn loopback(&self) -> Option<&LoopbackFeed> {
+        self.loopback.get()
+    }
+
+    /// Consume one rendered hardware period into `out` (`want * channels` samples),
+    /// apply playback gain/mute, and publish the complete rendered interval (including
+    /// any muted frames or zero-filled underrun silence tail) to the loopback feed so
+    /// cross-stream mixer positions stay synchronized across underruns.
+    ///
+    /// Returns `(got_frames, is_silent)`.
+    pub(super) fn render_period(&self, out: &mut [f32], publish_direct: bool) -> (usize, bool) {
+        let ch = self.ring.channels();
+        let want = out.len() / ch;
+        let got = self.ring.pop_into(out);
+        let is_silent = if got > 0 {
+            self.apply_playback_gain(&mut out[..got * ch], ch)
+        } else {
+            true
+        };
+        if want > 0 {
+            if let Some(lb) = self.loopback() {
+                if super::audioclient::has_loopback_subscribers() {
+                    let rendered = &out[..want * ch];
+                    if publish_direct {
+                        super::audioclient::push_loopback_frames(
+                            &lb.ep_id,
+                            lb.source_id,
+                            rendered,
+                            lb.rate,
+                            lb.channels,
+                        );
+                    } else {
+                        lb.ring.push(rendered);
+                    }
+                }
+            }
+        }
+        (got, is_silent)
+    }
+
+    /// Lock-free realtime-safe gain application at playback consumption.
+    /// Applies full WASAPI session + stream-channel + endpoint gains when `gain` is present,
+    /// or endpoint software volume/mute (`ep_sw`) for native middleware output streams.
+    #[inline]
+    pub(super) fn apply_playback_gain(&self, samples: &mut [f32], channels: usize) -> bool {
+        if let Some(g) = &self.gain {
+            return g.apply(samples, channels);
+        }
+        let Some(ep_sw) = self.ep_sw.get() else {
+            return false;
+        };
+        if ep_sw.sw_muted.load(Ordering::Acquire) {
+            samples.fill(0.0);
+            return true;
+        }
+        let ch = channels.max(1);
+        let n = ch.min(8);
+        let mut eff = [1.0f32; 8];
+        let mut unity = true;
+        for c in 0..n {
+            let g = f32::from_bits(ep_sw.sw_channels[c].load(Ordering::Acquire));
+            eff[c] = g;
+            if (g - 1.0).abs() > 1e-6 {
+                unity = false;
+            }
+        }
+        if unity {
+            return false;
+        }
+        for frame in samples.chunks_exact_mut(ch) {
+            for (c, sample) in frame.iter_mut().enumerate() {
+                if c < 8 {
+                    *sample *= eff[c];
+                }
+            }
+        }
+        false
+    }
+
     pub fn set_event(&self, ev: Arc<crate::handles::Event>) {
         *self.event.lock().unwrap() = Some(ev);
         self.has_event.store(true, Ordering::Release);
@@ -315,6 +910,7 @@ impl StreamShared {
     /// Realtime-safe: the device consumed `frames` (got `got` of them).
     #[inline]
     pub fn consumed(&self, frames: usize, got: usize) {
+        self.rendered_frames.fetch_add(frames as u64, Ordering::Release);
         if got < frames {
             let miss = (frames - got) as u64;
             self.underrun_frames.fetch_add(miss, Ordering::Relaxed);
@@ -392,6 +988,11 @@ impl StreamControl {
                 return Err(e);
             }
         }
+        if let Some(lb) = self.shared.loopback() {
+            if lb.managed_by_stream {
+                super::audioclient::set_loopback_source_started(&lb.ep_id, lb.source_id, true);
+            }
+        }
         Ok(())
     }
 
@@ -402,6 +1003,11 @@ impl StreamControl {
             ca_sync(move || ca::stop(au));
         }
         self.shared.started.store(false, Ordering::Release);
+        if let Some(lb) = self.shared.loopback() {
+            if lb.managed_by_stream {
+                super::audioclient::set_loopback_source_started(&lb.ep_id, lb.source_id, false);
+            }
+        }
     }
 }
 
@@ -422,15 +1028,58 @@ impl OutputStream {
     /// Open (but don't start) a stream of interleaved f32 at `rate`/`channels`.
     /// `io_request` = desired IO cycle in device frames.
     pub fn open(dev: &DeviceInfo, rate: u32, channels: u16, shared: Arc<StreamShared>, io_request: u32) -> Result<OutputStream, String> {
+        let ep_id = super::mmdevapi::render_endpoint_id_for_uid(&dev.uid);
+        if shared.gain.is_none() {
+            let _ = shared.ep_sw.set(super::mmdevapi::endpoint_software_gain_handle(&ep_id));
+        }
+        if shared.loopback.get().is_none() {
+            let lb_ch = shared.ring.channels().max(1);
+            let lb_cap = shared.ring.capacity().max(8192);
+            let lb_ring = Ring::new(lb_cap, lb_ch);
+            let source_id = super::audioclient::alloc_loopback_source_id();
+            let _ = shared.loopback.set(LoopbackFeed {
+                ep_id,
+                source_id,
+                rate,
+                channels: lb_ch as u16,
+                ring: lb_ring,
+                managed_by_stream: true,
+            });
+        }
         let kind = if dev.id == 0 { Backend::Null } else { backend() };
         let pump = {
             let s = shared.clone();
             std::thread::Builder::new()
                 .name("wwise-audio-pump".into())
                 .spawn(move || {
+                    let mut lb_buf = Vec::<f32>::new();
                     while !s.quit.load(Ordering::Acquire) {
-                        if s.sema.wait() && !s.quit.load(Ordering::Acquire) && s.started.load(Ordering::Acquire) {
-                            s.signal_event();
+                        if s.sema.wait() && !s.quit.load(Ordering::Acquire) {
+                            if let Some(lb) = s.loopback() {
+                                let ch = lb.ring.channels();
+                                loop {
+                                    let avail = lb.ring.len();
+                                    if avail == 0 {
+                                        break;
+                                    }
+                                    let take = avail.min(4096);
+                                    lb_buf.resize(take * ch, 0.0);
+                                    let got = lb.ring.pop_into(&mut lb_buf[..take * ch]);
+                                    if got == 0 {
+                                        break;
+                                    }
+                                    super::audioclient::push_loopback_frames(
+                                        &lb.ep_id,
+                                        lb.source_id,
+                                        &lb_buf[..got * ch],
+                                        lb.rate,
+                                        lb.channels,
+                                    );
+                                }
+                            }
+                            if s.started.load(Ordering::Acquire) {
+                                s.signal_event();
+                            }
                         }
                     }
                 })
@@ -461,6 +1110,8 @@ impl OutputStream {
                     std::thread::Builder::new()
                         .name("wwise-audio-null".into())
                         .spawn(move || {
+                            let ch = s.ring.channels();
+                            let mut lb_buf = vec![0.0f32; period * ch];
                             let mut next = std::time::Instant::now();
                             while !s.quit.load(Ordering::Acquire) {
                                 next += dur;
@@ -471,7 +1122,15 @@ impl OutputStream {
                                     next = now; // don't burst after a long stall
                                 }
                                 if s.started.load(Ordering::Acquire) {
-                                    let got = s.ring.discard(period);
+                                    let got = if s.loopback().is_some()
+                                        && super::audioclient::has_loopback_subscribers()
+                                    {
+                                        let (got, _silent) =
+                                            s.render_period(&mut lb_buf[..period * ch], true);
+                                        got
+                                    } else {
+                                        s.ring.discard(period)
+                                    };
                                     s.consumed(period, got);
                                 }
                             }
@@ -512,6 +1171,11 @@ impl Drop for OutputStream {
         }
         if let Some(t) = self.pump.take() {
             let _ = t.join();
+        }
+        if let Some(lb) = self.shared.loopback() {
+            if lb.managed_by_stream {
+                super::audioclient::unregister_loopback_source(&lb.ep_id, lb.source_id);
+            }
         }
     }
 }
@@ -596,6 +1260,12 @@ mod ca {
     const kAudioDevicePropertyTransportType: u32 = fourcc(b"tran");
     const kAudioDeviceTransportTypeBluetooth: u32 = fourcc(b"blue");
     const kIOAudioOutputPortSubTypeHeadphones: u32 = fourcc(b"hdpn");
+    const kAudioHardwareServiceDeviceProperty_VirtualMainVolume: u32 = fourcc(b"vmvc");
+    const kAudioDevicePropertyVolumeScalar: u32 = fourcc(b"volm");
+    const kAudioDevicePropertyMute: u32 = fourcc(b"mute");
+    const kAudioDevicePropertyVolumeRangeDecibels: u32 = fourcc(b"vdb#");
+    const kAudioDevicePropertyStreamFormat: u32 = fourcc(b"sfmt");
+    const kAudioTapPropertyFormat: u32 = fourcc(b"tfmt");
 
     const kAudioUnitType_Output: u32 = fourcc(b"auou");
     const kAudioUnitSubType_HALOutput: u32 = fourcc(b"ahal");
@@ -610,6 +1280,7 @@ mod ca {
     const kAudioFormatLinearPCM: u32 = fourcc(b"lpcm");
     const kAudioFormatFlagIsFloat: u32 = 1;
     const kAudioFormatFlagIsPacked: u32 = 8;
+    const kAudioFormatFlagIsNonInterleaved: u32 = 1 << 5;
     const kAudioUnitRenderAction_OutputIsSilence: u32 = 1 << 4;
     const kCFStringEncodingUTF8: u32 = 0x0800_0100;
 
@@ -633,6 +1304,7 @@ mod ca {
     }
 
     #[repr(C)]
+    #[derive(Default)]
     struct AudioStreamBasicDescription {
         mSampleRate: f64,
         mFormatID: u32,
@@ -671,6 +1343,12 @@ mod ca {
 
     #[link(name = "CoreAudio", kind = "framework")]
     extern "C" {
+        fn AudioObjectHasProperty(id: AudioObjectID, addr: *const AudioObjectPropertyAddress) -> u8;
+        fn AudioObjectIsPropertySettable(
+            id: AudioObjectID,
+            addr: *const AudioObjectPropertyAddress,
+            is_settable: *mut u8,
+        ) -> OSStatus;
         fn AudioObjectAddPropertyListener(id: AudioObjectID, addr: *const AudioObjectPropertyAddress, proc_: ListenerProc, client: *mut c_void) -> OSStatus;
         fn AudioObjectRemovePropertyListener(id: AudioObjectID, addr: *const AudioObjectPropertyAddress, proc_: ListenerProc, client: *mut c_void) -> OSStatus;
         fn AudioObjectSetPropertyData(
@@ -934,6 +1612,450 @@ mod ca {
         check(unsafe { AudioObjectSetPropertyData(kAudioObjectSystemObject, &a, 0, std::ptr::null(), 4, &id as *const u32 as *const c_void) }, "set DefaultOutputDevice")
     }
 
+    /// Query CoreAudio HAL device master scalar volume `[0.0, 1.0]`.
+    pub fn device_volume_scalar(id: AudioObjectID, is_capture: bool) -> Option<f32> {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        unsafe {
+            get::<f32>(id, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope)
+                .or_else(|| get::<f32>(id, kAudioDevicePropertyVolumeScalar, scope))
+                .map(|v| v.clamp(0.0, 1.0))
+        }
+    }
+
+    /// Set CoreAudio HAL device master scalar volume `[0.0, 1.0]`.
+    pub fn set_device_volume_scalar(id: AudioObjectID, is_capture: bool, scalar: f32) -> bool {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        let v = scalar.clamp(0.0, 1.0);
+        unsafe {
+            let a_vm = addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope);
+            if AudioObjectSetPropertyData(id, &a_vm, 0, std::ptr::null(), 4, &v as *const f32 as *const c_void) == 0 {
+                return true;
+            }
+            let a_vs = addr(kAudioDevicePropertyVolumeScalar, scope);
+            AudioObjectSetPropertyData(id, &a_vs, 0, std::ptr::null(), 4, &v as *const f32 as *const c_void) == 0
+        }
+    }
+
+    /// Query CoreAudio HAL per-channel scalar volume `[0.0, 1.0]` (`channel` is 0-based -> CoreAudio element `channel + 1`).
+    pub fn device_channel_volume_scalar(id: AudioObjectID, is_capture: bool, channel: u32) -> Option<f32> {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        let a = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: scope,
+            mElement: channel.saturating_add(1),
+        };
+        let mut v: f32 = 0.0;
+        let mut n = std::mem::size_of::<f32>() as u32;
+        if unsafe { AudioObjectGetPropertyData(id, &a, 0, std::ptr::null(), &mut n, &mut v as *mut f32 as *mut c_void) } == 0
+            && n == 4
+        {
+            Some(v.clamp(0.0, 1.0))
+        } else {
+            None
+        }
+    }
+
+    /// Set CoreAudio HAL per-channel scalar volume `[0.0, 1.0]` (`channel` is 0-based -> CoreAudio element `channel + 1`).
+    pub fn set_device_channel_volume_scalar(id: AudioObjectID, is_capture: bool, channel: u32, scalar: f32) -> bool {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        let a = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: scope,
+            mElement: channel.saturating_add(1),
+        };
+        let v = scalar.clamp(0.0, 1.0);
+        unsafe { AudioObjectSetPropertyData(id, &a, 0, std::ptr::null(), 4, &v as *const f32 as *const c_void) == 0 }
+    }
+
+    /// Query CoreAudio HAL device mute flag.
+    pub fn device_mute(id: AudioObjectID, is_capture: bool) -> Option<bool> {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        unsafe { get::<u32>(id, kAudioDevicePropertyMute, scope).map(|m| m != 0) }
+    }
+
+    /// Set CoreAudio HAL device mute flag.
+    pub fn set_device_mute(id: AudioObjectID, is_capture: bool, mute: bool) -> bool {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        let m: u32 = u32::from(mute);
+        let a = addr(kAudioDevicePropertyMute, scope);
+        unsafe { AudioObjectSetPropertyData(id, &a, 0, std::ptr::null(), 4, &m as *const u32 as *const c_void) == 0 }
+    }
+
+    /// Query CoreAudio HAL device decibel range `(min_db, max_db)`.
+    pub fn device_volume_range_db(id: AudioObjectID, is_capture: bool) -> Option<(f32, f32)> {
+        #[repr(C)]
+        #[derive(Default)]
+        struct AudioValueRange {
+            min: f64,
+            max: f64,
+        }
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        unsafe {
+            let r = get::<AudioValueRange>(id, kAudioDevicePropertyVolumeRangeDecibels, scope)?;
+            if r.min.is_finite() && r.max.is_finite() && r.max > r.min {
+                Some((r.min as f32, r.max as f32))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Check whether a CoreAudio HAL property exists and is writable for `(id, selector, scope, element)`.
+    unsafe fn property_is_settable(id: AudioObjectID, selector: u32, scope: u32, element: u32) -> bool {
+        let a = AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: scope,
+            mElement: element,
+        };
+        if AudioObjectHasProperty(id, &a) == 0 {
+            return false;
+        }
+        let mut settable: u8 = 0;
+        AudioObjectIsPropertySettable(id, &a, &mut settable) == 0 && settable != 0
+    }
+
+    /// Query whether CoreAudio HAL exposes writable hardware `(volume, mute)` controls on `id`.
+    pub fn device_hardware_volume_support(id: AudioObjectID, is_capture: bool, channels: u32) -> (bool, bool) {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        unsafe {
+            let mut hw_vol = property_is_settable(id, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope, 0)
+                || property_is_settable(id, kAudioDevicePropertyVolumeScalar, scope, 0);
+            if !hw_vol {
+                for ch in 1..=channels.clamp(1, 8) {
+                    if property_is_settable(id, kAudioDevicePropertyVolumeScalar, scope, ch) {
+                        hw_vol = true;
+                        break;
+                    }
+                }
+            }
+            let hw_mute = property_is_settable(id, kAudioDevicePropertyMute, scope, 0);
+            (hw_vol, hw_mute)
+        }
+    }
+
+    struct TapIoCtx {
+        ring: Arc<Ring>,
+        converter: TapFormatConverter,
+        non_interleaved: bool,
+        src_channels: usize,
+        interleave_buf: Vec<f32>,
+    }
+
+    /// Construct a `CATapDescription` scoped to `device_uid` (stream 0) when a specific
+    /// output endpoint UID is supplied, or a stereo global tap when `device_uid` is `None`.
+    /// Returns a retained Objective-C `CATapDescription*` that the caller must `release`.
+    pub(super) unsafe fn build_tap_description(
+        device_uid: Option<&str>,
+    ) -> Result<*mut objc2::runtime::AnyObject, String> {
+        use objc2::msg_send;
+        use objc2::runtime::{AnyClass, AnyObject};
+        use objc2_foundation::{NSArray, NSString};
+
+        let Some(cls) = AnyClass::get(c"CATapDescription") else {
+            return Err("CATapDescription class unavailable (requires macOS 14.2+)".into());
+        };
+        let alloc_obj: *mut AnyObject = msg_send![cls, alloc];
+        if alloc_obj.is_null() {
+            return Err("CATapDescription alloc returned null".into());
+        }
+        let empty_arr = NSArray::<AnyObject>::new();
+        let tap_desc: *mut AnyObject = match device_uid {
+            Some(uid) => {
+                if uid.is_empty() || uid == "aw2-null" {
+                    let _: () = msg_send![alloc_obj, release];
+                    return Err("ProcessTap requires a valid output device UID".into());
+                }
+                let uid_ns = NSString::from_str(uid);
+                msg_send![
+                    alloc_obj,
+                    initExcludingProcesses: &*empty_arr,
+                    andDeviceUID: &*uid_ns,
+                    withStream: 0isize
+                ]
+            }
+            None => msg_send![alloc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_arr],
+        };
+        if tap_desc.is_null() {
+            return Err("CATapDescription init returned null".into());
+        }
+        Ok(tap_desc)
+    }
+
+    /// macOS 14.2+ CoreAudio Process Tap (`AudioHardwareCreateProcessTap` + private
+    /// aggregate device + IOProc) for system/endpoint loopback capture.
+    /// Dynamically resolved via `dlsym` so older macOS versions degrade cleanly.
+    pub struct ProcessTap {
+        tap_id: AudioObjectID,
+        agg_id: AudioObjectID,
+        io_proc_id: *mut c_void,
+        /// Heap-allocated context owned by `ProcessTap` and freed strictly AFTER
+        /// `AudioDeviceStop` and `AudioDeviceDestroyIOProcID` in `Drop`.
+        ctx: *mut TapIoCtx,
+        destroy_tap_fn: unsafe extern "C" fn(AudioObjectID) -> OSStatus,
+        destroy_agg_fn: unsafe extern "C" fn(AudioObjectID) -> OSStatus,
+        stop_fn: unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus,
+        destroy_ioproc_fn: unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus,
+    }
+    unsafe impl Send for ProcessTap {}
+
+    impl ProcessTap {
+        pub fn open(
+            ring: Arc<Ring>,
+            device_uid: Option<&str>,
+            target_rate: u32,
+            target_channels: u32,
+        ) -> Result<Self, String> {
+            use objc2::msg_send;
+            use objc2::runtime::AnyObject;
+            use objc2_foundation::NSString;
+
+            type CreateTapFn = unsafe extern "C" fn(*const AnyObject, *mut AudioObjectID) -> OSStatus;
+            type DestroyTapFn = unsafe extern "C" fn(AudioObjectID) -> OSStatus;
+            type CreateAggFn = unsafe extern "C" fn(*const c_void, *mut AudioObjectID) -> OSStatus;
+            type DestroyAggFn = unsafe extern "C" fn(AudioObjectID) -> OSStatus;
+            type IOProc = unsafe extern "C" fn(
+                AudioObjectID,
+                *const c_void,
+                *const AudioBufferList,
+                *const c_void,
+                *mut AudioBufferList,
+                *const c_void,
+                *mut c_void,
+            ) -> OSStatus;
+            type CreateIOProcFn = unsafe extern "C" fn(AudioObjectID, IOProc, *mut c_void, *mut *mut c_void) -> OSStatus;
+            type DestroyIOProcFn = unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus;
+            type StartStopFn = unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus;
+
+            unsafe extern "C" fn tap_ioproc(
+                _dev: AudioObjectID,
+                _now: *const c_void,
+                in_data: *const AudioBufferList,
+                _in_time: *const c_void,
+                _out_data: *mut AudioBufferList,
+                _out_time: *const c_void,
+                client_data: *mut c_void,
+            ) -> OSStatus {
+                if in_data.is_null() || client_data.is_null() {
+                    return 0;
+                }
+                let ctx = &mut *(client_data as *mut TapIoCtx);
+                let nbufs = (*in_data).mNumberBuffers as usize;
+                if nbufs == 0 {
+                    return 0;
+                }
+                if ctx.non_interleaved {
+                    let ch = ctx.src_channels.min(nbufs);
+                    let bufs = std::slice::from_raw_parts((*in_data).mBuffers.as_ptr(), ch);
+                    let frames = bufs
+                        .iter()
+                        .map(|b| if b.mData.is_null() { 0 } else { (b.mDataByteSize / 4) as usize })
+                        .min()
+                        .unwrap_or(0);
+                    let cap_frames = ctx.interleave_buf.capacity() / ch.max(1);
+                    let frames = frames.min(cap_frames);
+                    if frames == 0 {
+                        return 0;
+                    }
+                    ctx.interleave_buf.clear();
+                    for f in 0..frames {
+                        for b in bufs.iter() {
+                            let s = *(b.mData as *const f32).add(f);
+                            ctx.interleave_buf.push(s);
+                        }
+                    }
+                    let converted = ctx.converter.convert(&ctx.interleave_buf);
+                    if !converted.is_empty() {
+                        ctx.ring.push(converted);
+                    }
+                } else {
+                    let b0 = &(*in_data).mBuffers[0];
+                    if !b0.mData.is_null() && b0.mDataByteSize >= 4 {
+                        let samples = std::slice::from_raw_parts(
+                            b0.mData as *const f32,
+                            (b0.mDataByteSize / 4) as usize,
+                        );
+                        let converted = ctx.converter.convert(samples);
+                        if !converted.is_empty() {
+                            ctx.ring.push(converted);
+                        }
+                    }
+                }
+                0
+            }
+
+            unsafe {
+                let sym = |name: &std::ffi::CStr| -> Result<*mut c_void, String> {
+                    let p = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
+                    if p.is_null() {
+                        Err(format!("CoreAudio symbol {:?} unavailable", name))
+                    } else {
+                        Ok(p)
+                    }
+                };
+                let create_tap: CreateTapFn = std::mem::transmute(sym(c"AudioHardwareCreateProcessTap")?);
+                let destroy_tap: DestroyTapFn = std::mem::transmute(sym(c"AudioHardwareDestroyProcessTap")?);
+                let create_agg: CreateAggFn = std::mem::transmute(sym(c"AudioHardwareCreateAggregateDevice")?);
+                let destroy_agg: DestroyAggFn = std::mem::transmute(sym(c"AudioHardwareDestroyAggregateDevice")?);
+                let create_ioproc: CreateIOProcFn = std::mem::transmute(sym(c"AudioDeviceCreateIOProcID")?);
+                let destroy_ioproc: DestroyIOProcFn = std::mem::transmute(sym(c"AudioDeviceDestroyIOProcID")?);
+                let start_dev: StartStopFn = std::mem::transmute(sym(c"AudioDeviceStart")?);
+                let stop_dev: StartStopFn = std::mem::transmute(sym(c"AudioDeviceStop")?);
+
+                let tap_desc = build_tap_description(device_uid)?;
+                let tap_uuid: *mut AnyObject = msg_send![tap_desc, UUID];
+                let tap_uid_ns: *mut NSString = msg_send![tap_uuid, UUIDString];
+                let tap_uid = if !tap_uid_ns.is_null() {
+                    (*tap_uid_ns).to_string()
+                } else {
+                    String::new()
+                };
+
+                let mut tap_id: AudioObjectID = 0;
+                let st = create_tap(tap_desc, &mut tap_id);
+                let _: () = msg_send![tap_desc, release];
+                check(st, "AudioHardwareCreateProcessTap")?;
+                if tap_uid.is_empty() {
+                    let _ = destroy_tap(tap_id);
+                    return Err("CATapDescription UUID empty".into());
+                }
+
+                // Create a private aggregate device hosting the process tap.
+                #[link(name = "CoreFoundation", kind = "framework")]
+                extern "C" {
+                    static kCFTypeDictionaryKeyCallBacks: u8;
+                    static kCFTypeDictionaryValueCallBacks: u8;
+                    static kCFTypeArrayCallBacks: u8;
+                    fn CFStringCreateWithCString(alloc: *const c_void, s: *const std::ffi::c_char, enc: u32) -> CFStringRef;
+                    fn CFNumberCreate(alloc: *const c_void, ty: isize, v: *const c_void) -> *const c_void;
+                    fn CFDictionaryCreate(alloc: *const c_void, k: *const *const c_void, v: *const *const c_void, n: isize, kcb: *const u8, vcb: *const u8) -> *const c_void;
+                    fn CFArrayCreate(alloc: *const c_void, v: *const *const c_void, n: isize, cb: *const u8) -> *const c_void;
+                }
+                let cfstr = |s: &str| -> CFStringRef {
+                    let c = std::ffi::CString::new(s).unwrap();
+                    CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), kCFStringEncodingUTF8)
+                };
+                let make_dict = |kv: &[(&str, *const c_void)]| -> *const c_void {
+                    let k: Vec<*const c_void> = kv.iter().map(|(k, _)| cfstr(k)).collect();
+                    let v: Vec<*const c_void> = kv.iter().map(|(_, v)| *v).collect();
+                    let d = CFDictionaryCreate(
+                        std::ptr::null(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        kv.len() as isize,
+                        &kCFTypeDictionaryKeyCallBacks,
+                        &kCFTypeDictionaryValueCallBacks,
+                    );
+                    for p in k.into_iter().chain(v) {
+                        CFRelease(p);
+                    }
+                    d
+                };
+
+                let one = 1i32;
+                let tap_entry = make_dict(&[("uid", cfstr(&tap_uid))]);
+                let tap_list = CFArrayCreate(std::ptr::null(), &tap_entry, 1, &kCFTypeArrayCallBacks);
+                CFRelease(tap_entry);
+                let agg_uid = format!("port-factory-tap-{}-{}", std::process::id(), tap_id);
+                let mut kvs: Vec<(&str, *const c_void)> = vec![
+                    ("uid", cfstr(&agg_uid)),
+                    ("name", cfstr("Port Factory Loopback Tap")),
+                    ("private", CFNumberCreate(std::ptr::null(), 3, &one as *const i32 as *const c_void)),
+                    ("tapautostart", CFNumberCreate(std::ptr::null(), 3, &one as *const i32 as *const c_void)),
+                    ("taps", tap_list),
+                ];
+                if let Some(uid) = device_uid {
+                    if !uid.is_empty() && uid != "aw2-null" {
+                        kvs.push(("master", cfstr(uid)));
+                    }
+                }
+                let desc = make_dict(&kvs);
+                let mut agg_id: AudioObjectID = 0;
+                let st2 = create_agg(desc, &mut agg_id);
+                CFRelease(desc);
+                if st2 != 0 {
+                    let _ = destroy_tap(tap_id);
+                    return Err(format!("AudioHardwareCreateAggregateDevice for tap failed: {st2}"));
+                }
+
+                // Query actual ProcessTap stream format (rate, channels, interleaved vs planar, float32)
+                // so the IOProc converts channel layout and resamples into the client's capture format.
+                let tap_asbd = get::<AudioStreamBasicDescription>(tap_id, kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal)
+                    .or_else(|| get::<AudioStreamBasicDescription>(agg_id, kAudioDevicePropertyStreamFormat, kAudioDevicePropertyScopeInput));
+                let (src_rate, src_channels, non_interleaved) = match tap_asbd {
+                    Some(asbd) => {
+                        let is_f32 = asbd.mFormatID == kAudioFormatLinearPCM
+                            && (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                            && asbd.mBitsPerChannel == 32;
+                        if !is_f32 || asbd.mChannelsPerFrame == 0 || asbd.mChannelsPerFrame > 8 || asbd.mSampleRate <= 0.0 {
+                            let _ = destroy_agg(agg_id);
+                            let _ = destroy_tap(tap_id);
+                            return Err(format!(
+                                "ProcessTap unsupported stream format (fmt={:#x}, bits={}, ch={}, rate={})",
+                                asbd.mFormatID, asbd.mBitsPerChannel, asbd.mChannelsPerFrame, asbd.mSampleRate
+                            ));
+                        }
+                        (
+                            asbd.mSampleRate.round() as u32,
+                            asbd.mChannelsPerFrame,
+                            (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
+                        )
+                    }
+                    None => (48_000, 2, false),
+                };
+
+                let ctx = Box::into_raw(Box::new(TapIoCtx {
+                    ring,
+                    converter: TapFormatConverter::new(src_rate, src_channels, target_rate, target_channels),
+                    non_interleaved,
+                    src_channels: src_channels.clamp(1, 8) as usize,
+                    interleave_buf: Vec::with_capacity(4096 * src_channels.clamp(1, 8) as usize),
+                }));
+
+                let mut io_proc_id: *mut c_void = std::ptr::null_mut();
+                let st3 = create_ioproc(agg_id, tap_ioproc, ctx as *mut c_void, &mut io_proc_id);
+                if st3 != 0 {
+                    drop(Box::from_raw(ctx));
+                    let _ = destroy_agg(agg_id);
+                    let _ = destroy_tap(tap_id);
+                    return Err(format!("AudioDeviceCreateIOProcID failed: {st3}"));
+                }
+                let st4 = start_dev(agg_id, io_proc_id);
+                if st4 != 0 {
+                    let _ = destroy_ioproc(agg_id, io_proc_id);
+                    drop(Box::from_raw(ctx));
+                    let _ = destroy_agg(agg_id);
+                    let _ = destroy_tap(tap_id);
+                    return Err(format!("AudioDeviceStart(tap) failed: {st4}"));
+                }
+                Ok(Self {
+                    tap_id,
+                    agg_id,
+                    io_proc_id,
+                    ctx,
+                    destroy_tap_fn: destroy_tap,
+                    destroy_agg_fn: destroy_agg,
+                    stop_fn: stop_dev,
+                    destroy_ioproc_fn: destroy_ioproc,
+                })
+            }
+        }
+    }
+
+    impl Drop for ProcessTap {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = (self.stop_fn)(self.agg_id, self.io_proc_id);
+                let _ = (self.destroy_ioproc_fn)(self.agg_id, self.io_proc_id);
+                let _ = (self.destroy_agg_fn)(self.agg_id);
+                let _ = (self.destroy_tap_fn)(self.tap_id);
+                if !self.ctx.is_null() {
+                    drop(Box::from_raw(self.ctx));
+                    self.ctx = std::ptr::null_mut();
+                }
+            }
+        }
+    }
+
     /// Process-private aggregate devices (tests: a hot-pluggable device that
     /// exists only for this process and disappears with it).
     #[cfg(test)]
@@ -1022,7 +2144,10 @@ mod ca {
             return 0;
         }
         let want = out.len() / s.ring.channels();
-        let got = s.ring.pop_into(out);
+        let (got, is_silent) = s.render_period(out, false);
+        if is_silent {
+            *flags |= kAudioUnitRenderAction_OutputIsSilence;
+        }
         s.consumed(want, got);
         0
     }
@@ -1278,7 +2403,10 @@ mod ca {
             return 0;
         }
         let want = out.len() / s.ring.channels();
-        let got = s.ring.pop_into(out);
+        let (got, is_silent) = s.render_period(out, false);
+        if is_silent {
+            *flags |= kAudioUnitRenderAction_OutputIsSilence;
+        }
         s.consumed(want, got);
         0
     }
@@ -1403,4 +2531,73 @@ pub fn create_private_aggregate(uid: &str, name: &str, sub_uid: &str) -> Result<
 #[cfg(all(test, target_os = "macos"))]
 pub fn destroy_private_aggregate(id: u32) -> Result<(), String> {
     ca_sync(move || ca::aggregate::destroy(id))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tap_tests {
+    use super::ca;
+    use objc2::msg_send;
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2_foundation::NSString;
+
+    #[test]
+    fn process_tap_description_scopes_to_selected_endpoint_uid() {
+        unsafe {
+            let desc = match ca::build_tap_description(Some("BuiltInSpeakerDevice")) {
+                Ok(d) => d,
+                Err(e) if e.contains("unavailable") => return,
+                Err(e) => panic!("unexpected error building device-scoped tap: {e}"),
+            };
+            let uid_ns: *mut NSString = msg_send![desc, deviceUID];
+            assert!(!uid_ns.is_null(), "device-scoped CATapDescription must set deviceUID");
+            assert_eq!((*uid_ns).to_string(), "BuiltInSpeakerDevice");
+            let stream_num: *mut AnyObject = msg_send![desc, stream];
+            assert!(!stream_num.is_null(), "device-scoped CATapDescription must set stream");
+            let stream_idx: isize = msg_send![stream_num, integerValue];
+            assert_eq!(stream_idx, 0);
+            let exclusive: Bool = msg_send![desc, isExclusive];
+            assert!(exclusive.as_bool());
+            let _: () = msg_send![desc, release];
+
+            // Reject invalid/null endpoint UIDs rather than silently creating a global tap.
+            assert!(ca::build_tap_description(Some("")).is_err());
+            assert!(ca::build_tap_description(Some("aw2-null")).is_err());
+
+            // Explicit None builds an unscoped global tap.
+            let global = ca::build_tap_description(None).expect("global tap description");
+            let global_uid: *mut NSString = msg_send![global, deviceUID];
+            assert!(global_uid.is_null(), "global CATapDescription should have nil deviceUID");
+            let _: () = msg_send![global, release];
+        }
+    }
+
+    #[test]
+    fn middleware_stream_shared_applies_endpoint_software_mute_and_channel_gains() {
+        let _audio_guard = crate::audio::audio_test_lock();
+        super::force_backend(Some(super::Backend::Null));
+        crate::audio::mmdevapi::reset_endpoint_software_gains_for_test();
+
+        let dev = super::null_device();
+        let ep_id = crate::audio::mmdevapi::render_endpoint_id_for_uid(&dev.uid);
+        let ep_sw = crate::audio::mmdevapi::endpoint_software_gain_handle(&ep_id);
+        let shared = super::StreamShared::new(super::Ring::new(512, 2));
+        let _out = super::OutputStream::open(&dev, 48_000, 2, shared.clone(), 128).unwrap();
+
+        // Channel software gains apply directly to middleware streams constructed via StreamShared::new.
+        ep_sw.sw_channels[0].store(0.25f32.to_bits(), std::sync::atomic::Ordering::Release);
+        ep_sw.sw_channels[1].store(0.5f32.to_bits(), std::sync::atomic::Ordering::Release);
+        let mut samples = [0.8f32, 0.8, -0.4, 0.4];
+        assert!(!shared.apply_playback_gain(&mut samples, 2));
+        assert!((samples[0] - 0.2).abs() < 1e-5);
+        assert!((samples[1] - 0.4).abs() < 1e-5);
+        assert!((samples[2] + 0.1).abs() < 1e-5);
+        assert!((samples[3] - 0.2).abs() < 1e-5);
+
+        // Endpoint software mute silences middleware output completely.
+        ep_sw.sw_muted.store(true, std::sync::atomic::Ordering::Release);
+        assert!(shared.apply_playback_gain(&mut samples, 2));
+        assert!(samples.iter().all(|&s| s == 0.0));
+
+        crate::audio::mmdevapi::reset_endpoint_software_gains_for_test();
+    }
 }
