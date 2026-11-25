@@ -253,6 +253,13 @@ pub(crate) struct ZlibStream {
     mode: ZlibMode,
 }
 
+/// Error returned by [`ZlibStream::inflate_chunk_streaming`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InflateStreamError<E> {
+    Zlib(i32),
+    Callback(E),
+}
+
 #[allow(dead_code)]
 impl ZlibStream {
     /// Initialize a streaming inflater (`window_bits`: `15` for zlib, `15 + 16`
@@ -366,27 +373,33 @@ impl ZlibStream {
         self.strm.total_out
     }
 
-    /// Feed a compressed chunk into an inflate stream, appending decoded bytes
-    /// to `out`. Returns `Ok(true)` when `Z_STREAM_END` is reached, `Ok(false)`
-    /// when more input is required, or `Err(rc)` on zlib errors (e.g. `Z_DATA_ERROR`).
-    pub(crate) fn inflate_chunk(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<bool, i32> {
-        if self.mode != ZlibMode::Inflate {
-            return Err(Z_STREAM_ERROR);
+    /// Feed a compressed chunk into an inflate stream, delivering decoded slices
+    /// through the caller-supplied fixed-size `out_buf` without allocating an
+    /// unbounded intermediate buffer. Stops immediately if `on_output` returns
+    /// `Err(e)`. Returns `Ok(true)` when `Z_STREAM_END` is reached, `Ok(false)`
+    /// when more input is required.
+    pub(crate) fn inflate_chunk_streaming<E>(
+        &mut self,
+        input: &[u8],
+        out_buf: &mut [u8],
+        mut on_output: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<bool, InflateStreamError<E>> {
+        if self.mode != ZlibMode::Inflate || out_buf.is_empty() {
+            return Err(InflateStreamError::Zlib(Z_STREAM_ERROR));
         }
         if input.is_empty() {
             return Ok(false);
         }
         let mut offset = 0usize;
-        let mut scratch = [0u8; 16384];
         while offset < input.len() {
             let mut consumed_pass = 0usize;
             let mut stream_end = false;
             loop {
                 let (rc, consumed, produced) =
-                    self.step(&input[offset + consumed_pass..], &mut scratch, Z_NO_FLUSH);
+                    self.step(&input[offset + consumed_pass..], out_buf, Z_NO_FLUSH);
                 consumed_pass += consumed;
                 if produced > 0 {
-                    out.extend_from_slice(&scratch[..produced]);
+                    on_output(&out_buf[..produced]).map_err(InflateStreamError::Callback)?;
                 }
                 if rc == Z_STREAM_END {
                     stream_end = true;
@@ -396,7 +409,7 @@ impl ZlibStream {
                     break;
                 }
                 if rc != Z_OK && rc != Z_BUF_ERROR {
-                    return Err(rc);
+                    return Err(InflateStreamError::Zlib(rc));
                 }
                 if consumed == 0 && produced == 0 {
                     break;
@@ -411,6 +424,21 @@ impl ZlibStream {
             }
         }
         Ok(false)
+    }
+
+    /// Feed a compressed chunk into an inflate stream, appending decoded bytes
+    /// to `out`. Returns `Ok(true)` when `Z_STREAM_END` is reached, `Ok(false)`
+    /// when more input is required, or `Err(rc)` on zlib errors (e.g. `Z_DATA_ERROR`).
+    pub(crate) fn inflate_chunk(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<bool, i32> {
+        let mut scratch = [0u8; 16384];
+        match self.inflate_chunk_streaming::<std::convert::Infallible>(input, &mut scratch, |chunk| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        }) {
+            Ok(done) => Ok(done),
+            Err(InflateStreamError::Zlib(rc)) => Err(rc),
+            Err(InflateStreamError::Callback(never)) => match never {},
+        }
     }
 
     /// One-shot deflate of `src` into a newly allocated `Vec<u8>`.

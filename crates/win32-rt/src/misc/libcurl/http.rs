@@ -13,7 +13,7 @@ use super::easy::{
     CURLAUTH_NEGOTIATE, CURLAUTH_NTLM, CURLPROTO_HTTP, CURLPROTO_HTTPS, CURL_IPRESOLVE_V4,
     CURL_IPRESOLVE_V6, CURL_REDIR_POST_301, CURL_REDIR_POST_302, CURL_REDIR_POST_303,
 };
-use crate::misc::zlib1::{ZlibStream, Z_DATA_ERROR};
+use crate::misc::zlib1::{InflateStreamError, ZlibStream, Z_DATA_ERROR};
 use crate::net_tls::{self, HttpStream, TlsVerifyPolicy};
 use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
@@ -281,6 +281,7 @@ struct StreamingInflater {
     finished: bool,
     produced_any: bool,
     raw_deflate_fallback: bool,
+    total_decoded: i64,
 }
 
 impl StreamingInflater {
@@ -296,44 +297,103 @@ impl StreamingInflater {
             finished: false,
             produced_any: false,
             raw_deflate_fallback,
+            total_decoded: 0,
         })
     }
 
-    fn decompress(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), i32> {
+    /// Stream decoded output through a fixed `CURL_MAX_WRITE_SIZE` (16 KiB) buffer,
+    /// enforcing `max_decoded` (`CURLOPT_MAXFILESIZE`) before allocating or delivering
+    /// any output slice to `on_chunk`. Returns `Ok(true)` if at least one decoded slice
+    /// was emitted during this call.
+    fn decompress_streaming(
+        &mut self,
+        input: &[u8],
+        max_decoded: i64,
+        mut on_chunk: impl FnMut(&[u8]) -> Result<(), (i32, String, i32)>,
+    ) -> Result<bool, (i32, String, i32)> {
         if input.is_empty() || self.finished {
-            return Ok(());
+            return Ok(false);
         }
-        let out_start = out.len();
-        match self.stream.inflate_chunk(input, out) {
+        let mut scratch = [0u8; CURL_MAX_WRITE_SIZE];
+        let mut emitted = false;
+        let mut total_decoded = self.total_decoded;
+        let mut produced_any = self.produced_any;
+
+        let res = self.stream.inflate_chunk_streaming(input, &mut scratch, |slice| {
+            let next_decoded = total_decoded.saturating_add(slice.len() as i64);
+            if max_decoded > 0 && next_decoded > max_decoded {
+                return Err((
+                    CURLE_FILESIZE_EXCEEDED,
+                    format!("Maximum file size ({max_decoded}) exceeded"),
+                    0,
+                ));
+            }
+            total_decoded = next_decoded;
+            produced_any = true;
+            emitted = true;
+            on_chunk(slice)
+        });
+        self.total_decoded = total_decoded;
+        self.produced_any = produced_any;
+
+        match res {
             Ok(done) => {
-                if out.len() > out_start {
-                    self.produced_any = true;
-                }
                 if done {
                     self.finished = true;
                 }
-                Ok(())
+                Ok(emitted)
             }
-            Err(Z_DATA_ERROR)
-                if self.raw_deflate_fallback && !self.produced_any && out.len() == out_start =>
+            Err(InflateStreamError::Callback(err)) => Err(err),
+            Err(InflateStreamError::Zlib(Z_DATA_ERROR))
+                if self.raw_deflate_fallback && !self.produced_any =>
             {
-                // Retry as raw RFC 1951 deflate (-15).
+                // Retry as raw RFC 1951 deflate (-15) when zlib header parsing fails before output.
                 self.raw_deflate_fallback = false;
-                self.stream =
-                    ZlibStream::new_inflate(-15).map_err(|_| CURLE_BAD_CONTENT_ENCODING)?;
-                let done = self
-                    .stream
-                    .inflate_chunk(input, out)
-                    .map_err(|_| CURLE_BAD_CONTENT_ENCODING)?;
-                if out.len() > out_start {
-                    self.produced_any = true;
+                self.stream = ZlibStream::new_inflate(-15).map_err(|_| {
+                    (
+                        CURLE_BAD_CONTENT_ENCODING,
+                        "Content-Encoding decompression failed".to_string(),
+                        0,
+                    )
+                })?;
+                let mut total_decoded = self.total_decoded;
+                let mut produced_any = self.produced_any;
+                let retry = self.stream.inflate_chunk_streaming(input, &mut scratch, |slice| {
+                    let next_decoded = total_decoded.saturating_add(slice.len() as i64);
+                    if max_decoded > 0 && next_decoded > max_decoded {
+                        return Err((
+                            CURLE_FILESIZE_EXCEEDED,
+                            format!("Maximum file size ({max_decoded}) exceeded"),
+                            0,
+                        ));
+                    }
+                    total_decoded = next_decoded;
+                    produced_any = true;
+                    emitted = true;
+                    on_chunk(slice)
+                });
+                self.total_decoded = total_decoded;
+                self.produced_any = produced_any;
+                match retry {
+                    Ok(done) => {
+                        if done {
+                            self.finished = true;
+                        }
+                        Ok(emitted)
+                    }
+                    Err(InflateStreamError::Callback(err)) => Err(err),
+                    Err(InflateStreamError::Zlib(_)) => Err((
+                        CURLE_BAD_CONTENT_ENCODING,
+                        "Content-Encoding decompression failed".to_string(),
+                        0,
+                    )),
                 }
-                if done {
-                    self.finished = true;
-                }
-                Ok(())
             }
-            Err(_) => Err(CURLE_BAD_CONTENT_ENCODING),
+            Err(InflateStreamError::Zlib(_)) => Err((
+                CURLE_BAD_CONTENT_ENCODING,
+                "Content-Encoding decompression failed".to_string(),
+                0,
+            )),
         }
     }
 }
@@ -818,18 +878,23 @@ fn emit_body_bytes(
                 0,
             ));
         }
-        let mut decoded = Vec::with_capacity(raw.len().saturating_mul(2));
-        inf.decompress(raw, &mut decoded)
-            .map_err(|code| (code, "Content-Encoding decompression failed".to_string(), 0))?;
-        if decoded.is_empty() {
-            sink.on_progress(dltotal, *size_download, ultotal, ultotal)
-                .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
-            return Ok(());
-        }
-        for chunk in decoded.chunks(CURL_MAX_WRITE_SIZE) {
+        let dlnow = *size_download;
+        let emitted = inf.decompress_streaming(raw, max_filesize, |chunk| {
+            if sink.is_cancelled() {
+                return Err((
+                    CURLE_ABORTED_BY_CALLBACK,
+                    "Transfer cancelled".to_string(),
+                    0,
+                ));
+            }
             sink.on_body_chunk(chunk.to_vec())
                 .map_err(|code| (code, "Write callback aborted transfer".to_string(), 0))?;
-            sink.on_progress(dltotal, *size_download, ultotal, ultotal)
+            sink.on_progress(dltotal, dlnow, ultotal, ultotal)
+                .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+            Ok(())
+        })?;
+        if !emitted {
+            sink.on_progress(dltotal, dlnow, ultotal, ultotal)
                 .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
         }
         return Ok(());

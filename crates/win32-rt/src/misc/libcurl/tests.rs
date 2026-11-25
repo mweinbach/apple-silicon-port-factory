@@ -1717,3 +1717,134 @@ fn easy_gzip_progress_reports_transferred_bytes_not_decompressed() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn easy_gzip_large_buffer_streams_bounded_and_enforces_max_filesize() {
+    use super::easy::{
+        CURLE_FILESIZE_EXCEEDED, CURLE_WRITE_ERROR, CURLOPT_ACCEPT_ENCODING, CURLOPT_BUFFERSIZE,
+        CURLOPT_MAXFILESIZE,
+    };
+    use super::http::CURL_MAX_WRITE_SIZE;
+    use crate::misc::zlib1::ZlibStream;
+
+    struct BoundedSink {
+        total_bytes: usize,
+        max_chunk: usize,
+        abort_after_chunks: usize,
+        chunks_seen: usize,
+    }
+
+    unsafe extern "win64" fn bounded_write_cb(
+        _ptr: *const u8,
+        size: usize,
+        nmemb: usize,
+        userdata: *mut c_void,
+    ) -> usize {
+        let total = size.saturating_mul(nmemb);
+        let st = &mut *(userdata as *mut BoundedSink);
+        st.chunks_seen += 1;
+        st.max_chunk = st.max_chunk.max(total);
+        st.total_bytes += total;
+        if st.abort_after_chunks > 0 && st.chunks_seen >= st.abort_after_chunks {
+            return 0; // Signal abort to verify streaming inflate stops immediately.
+        }
+        total
+    }
+
+    // 4 MiB highly compressible payload compresses to ~4 KiB (>1000x ratio).
+    let plain = vec![b'A'; 4 * 1024 * 1024];
+    let gzipped = ZlibStream::deflate_all(&plain, 6, 15 + 16).expect("gzip compress");
+    assert!(
+        gzipped.len() < 16 * 1024,
+        "expected tiny gzip payload, got {} bytes",
+        gzipped.len()
+    );
+    let gz_srv = gzipped.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut sock, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut sock);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                gz_srv.len()
+            );
+            let _ = sock.write_all(hdr.as_bytes());
+            let _ = sock.write_all(&gz_srv);
+            let _ = sock.flush();
+        }
+    });
+
+    unsafe {
+        crate::register_native_va(
+            bounded_write_cb as *const () as u64,
+            bounded_write_cb as *const () as usize,
+        );
+        let url = format!("http://{addr}/bomb.gz\0");
+        let enc = b"gzip\0";
+
+        // 1. With CURLOPT_BUFFERSIZE = 512 KiB and CURLOPT_MAXFILESIZE = 64 KiB,
+        //    decoded output must stop before exceeding 64 KiB even though wire size is ~4 KiB.
+        let easy1 = curl_easy_init();
+        let mut st1 = BoundedSink {
+            total_bytes: 0,
+            max_chunk: 0,
+            abort_after_chunks: 0,
+            chunks_seen: 0,
+        };
+        assert_eq!(curl_easy_setopt(easy1, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy1, CURLOPT_ACCEPT_ENCODING, enc.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy1, CURLOPT_BUFFERSIZE, 512 * 1024), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy1, CURLOPT_MAXFILESIZE, 64 * 1024), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy1, CURLOPT_WRITEFUNCTION, bounded_write_cb as *const () as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy1, CURLOPT_WRITEDATA, &mut st1 as *mut BoundedSink as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_perform(easy1), CURLE_FILESIZE_EXCEEDED);
+        assert!(
+            st1.total_bytes <= 64 * 1024,
+            "decoded output exceeded CURLOPT_MAXFILESIZE: {} bytes",
+            st1.total_bytes
+        );
+        assert!(
+            st1.max_chunk <= CURL_MAX_WRITE_SIZE,
+            "decoded chunk exceeded CURL_MAX_WRITE_SIZE: {}",
+            st1.max_chunk
+        );
+        curl_easy_cleanup(easy1);
+
+        // 2. Without MAXFILESIZE, aborting on the 2nd 16 KiB write callback must halt
+        //    streaming inflation immediately without decoding the rest of the 4 MiB payload.
+        let easy2 = curl_easy_init();
+        let mut st2 = BoundedSink {
+            total_bytes: 0,
+            max_chunk: 0,
+            abort_after_chunks: 2,
+            chunks_seen: 0,
+        };
+        assert_eq!(curl_easy_setopt(easy2, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy2, CURLOPT_ACCEPT_ENCODING, enc.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy2, CURLOPT_BUFFERSIZE, 512 * 1024), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy2, CURLOPT_WRITEFUNCTION, bounded_write_cb as *const () as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy2, CURLOPT_WRITEDATA, &mut st2 as *mut BoundedSink as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_perform(easy2), CURLE_WRITE_ERROR);
+        assert_eq!(st2.chunks_seen, 2);
+        assert!(st2.total_bytes <= 2 * CURL_MAX_WRITE_SIZE);
+        curl_easy_cleanup(easy2);
+    }
+
+    server.join().unwrap();
+}
