@@ -36,9 +36,8 @@ pub unsafe extern "win64" fn CreateThread(
     let body = Box::new(move || unsafe {
         crate::call_guest8(start_addr, param_u as u64, 0, 0, 0, 0, 0, 0, 0) as u32
     });
-    match thread::spawn(body, size, flags & CREATE_SUSPENDED != 0, false) {
+    match thread::spawn_with_start_address(body, size, flags & CREATE_SUSPENDED != 0, false, start_addr) {
         Ok(t) => {
-            t.start_address.store(start_addr, Ordering::Relaxed);
             let tid = t.tid.load(Ordering::Relaxed) as u32;
             log::debug!("CreateThread start={} param={param:p} -> tid 0x{tid:x}", crate::symbolize(start as usize));
             if !tid_out.is_null() {
@@ -1984,6 +1983,38 @@ mod tests {
             assert_eq!(rcode, 42);
             assert_eq!(CloseHandle(rt), TRUE);
             assert_eq!(CloseHandle(self_h), TRUE);
+
+            // 5. CreateThread (non-suspended) publishes start_address BEFORE pthread_create so the
+            //    new thread immediately observes its own Win32StartAddress on entry.
+            unsafe extern "win64" fn query_own_start(out_slot: *mut c_void) -> u32 {
+                let mut got: usize = 0;
+                let mut ret: u32 = 0;
+                let st = crate::ntdll::NtQueryInformationThread(
+                    handles::CURRENT_THREAD,
+                    9,
+                    &mut got as *mut usize as *mut u8,
+                    8,
+                    &mut ret,
+                );
+                if st == 0 && !out_slot.is_null() {
+                    (*(out_slot as *const std::sync::atomic::AtomicUsize))
+                        .store(got, Ordering::Release);
+                }
+                0
+            }
+            let observed = std::sync::atomic::AtomicUsize::new(0);
+            let h_start = CreateThread(
+                std::ptr::null_mut(),
+                0,
+                Some(query_own_start),
+                &observed as *const std::sync::atomic::AtomicUsize as *mut c_void,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert!(!h_start.is_null());
+            assert_eq!(WaitForSingleObject(h_start, 5_000), WAIT_OBJECT_0);
+            assert_eq!(observed.load(Ordering::Acquire), query_own_start as *const () as usize);
+            assert_eq!(CloseHandle(h_start), TRUE);
         }
     }
 }

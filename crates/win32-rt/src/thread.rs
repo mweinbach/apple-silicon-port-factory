@@ -635,6 +635,19 @@ pub fn spawn(
     suspended: bool,
     is_initial: bool,
 ) -> std::io::Result<Arc<ThreadObj>> {
+    spawn_with_start_address(body, stack_size, suspended, is_initial, 0)
+}
+
+/// Like [`spawn`], publishing `start_address` on the `ThreadObj` BEFORE `pthread_create`
+/// so `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` sees the entry address
+/// immediately from `DLL_THREAD_ATTACH` and the thread's own entry function.
+pub fn spawn_with_start_address(
+    body: Box<dyn FnOnce() -> u32 + Send>,
+    stack_size: usize,
+    suspended: bool,
+    is_initial: bool,
+    start_address: usize,
+) -> std::io::Result<Arc<ThreadObj>> {
     if NO_SPAWN.load(Ordering::Relaxed) {
         return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
     }
@@ -659,6 +672,7 @@ pub fn spawn(
         let hi = lo + size;
         let obj = ThreadObj::new(suspended);
         obj.tid.store(teb::alloc_tid() as usize, Ordering::Relaxed);
+        obj.start_address.store(start_address, Ordering::Release);
         THREADS.lock().unwrap().push(obj.clone());
         let info = Box::new(StartInfo {
             obj: obj.clone(),

@@ -571,7 +571,7 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
             }
             let start = tobj
                 .as_ref()
-                .map_or(0, |t| t.start_address.load(std::sync::atomic::Ordering::Relaxed));
+                .map_or(0, |t| t.start_address.load(std::sync::atomic::Ordering::Acquire));
             std::ptr::write_unaligned(out as *mut usize, start);
             STATUS_SUCCESS
         }

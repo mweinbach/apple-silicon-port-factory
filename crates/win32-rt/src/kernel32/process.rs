@@ -1701,6 +1701,27 @@ impl JobMember {
     }
 }
 
+const JOB_OBJECT_LIMIT_JOB_TIME: u32 = 0x0004;
+
+/// Current process `(user_100ns, kernel_100ns, page_faults)` from `getrusage(RUSAGE_SELF)`.
+fn self_rusage_snapshot() -> (u64, u64, u64) {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
+            let user = (ru.ru_utime.tv_sec.max(0) as u64)
+                .saturating_mul(10_000_000)
+                .saturating_add((ru.ru_utime.tv_usec.max(0) as u64).saturating_mul(10));
+            let kernel = (ru.ru_stime.tv_sec.max(0) as u64)
+                .saturating_mul(10_000_000)
+                .saturating_add((ru.ru_stime.tv_usec.max(0) as u64).saturating_mul(10));
+            let faults = (ru.ru_minflt.max(0) as u64).saturating_add(ru.ru_majflt.max(0) as u64);
+            (user, kernel, faults)
+        } else {
+            (0, 0, 0)
+        }
+    }
+}
+
 struct JobState {
     basic_limits: [u8; 64],
     process_memory_limit: usize,
@@ -1717,6 +1738,10 @@ struct JobState {
     members: Vec<JobMember>,
     total_processes: u32,
     total_terminated: u32,
+    /// `(user_100ns, kernel_100ns, page_faults)` captured when the current process joined.
+    self_assign_rusage: Option<(u64, u64, u64)>,
+    /// `(user_100ns, kernel_100ns)` captured at the start of the current job time-limit period.
+    self_period_rusage: Option<(u64, u64)>,
     name: Option<String>,
 }
 
@@ -1738,6 +1763,8 @@ impl JobState {
             members: Vec::new(),
             total_processes: 0,
             total_terminated: 0,
+            self_assign_rusage: None,
+            self_period_rusage: None,
             name,
         }
     }
@@ -1952,6 +1979,11 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
             PRIORITY_CLASS.store(prio, Ordering::Relaxed);
         }
     }
+    if matches!(member, JobMember::SelfProc(_)) {
+        let snap = self_rusage_snapshot();
+        st.self_assign_rusage = Some(snap);
+        st.self_period_rusage = Some((snap.0, snap.1));
+    }
     st.members.push(member);
     st.total_processes = st.total_processes.saturating_add(1);
     TRUE
@@ -1987,6 +2019,10 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 }
             }
             st.basic_limits = buf;
+            if (flags & JOB_OBJECT_LIMIT_JOB_TIME) != 0 && st.self_assign_rusage.is_some() {
+                let (u, k, _) = self_rusage_snapshot();
+                st.self_period_rusage = Some((u, k));
+            }
             if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && st.contains_pid(std::process::id()) {
                 let prio = u32::from_le_bytes(buf[56..60].try_into().unwrap());
                 if prio != 0 {
@@ -2042,6 +2078,10 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 }
             }
             st.basic_limits = basic;
+            if (flags & JOB_OBJECT_LIMIT_JOB_TIME) != 0 && st.self_assign_rusage.is_some() {
+                let (u, k, _) = self_rusage_snapshot();
+                st.self_period_rusage = Some((u, k));
+            }
             st.process_memory_limit = std::ptr::read_unaligned(bytes.add(112) as *const usize);
             st.job_memory_limit = std::ptr::read_unaligned(bytes.add(120) as *const usize);
             if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && st.contains_pid(std::process::id()) {
@@ -2167,14 +2207,35 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
     match class {
         1 => {
             // JobObjectBasicAccountingInformation (48 bytes):
-            // +0..32: 4x LARGE_INTEGER times, +32: TotalPageFaultCount (u32),
-            // +36: TotalProcesses (u32), +40: ActiveProcesses (u32), +44: TotalTerminatedProcesses (u32).
+            // +0: TotalUserTime (u64), +8: TotalKernelTime (u64),
+            // +16: ThisPeriodTotalUserTime (u64), +24: ThisPeriodTotalKernelTime (u64),
+            // +32: TotalPageFaultCount (u32), +36: TotalProcesses (u32),
+            // +40: ActiveProcesses (u32), +44: TotalTerminatedProcesses (u32).
+            if st.members.iter().any(|m| matches!(m, JobMember::Child(_))) {
+                // Per-child CPU/fault accounting is not aggregated across waitpid; fail honestly
+                // rather than omitting child resource usage.
+                put_ret(0);
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
             if len < 48 {
                 put_ret(48);
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
             std::ptr::write_bytes(out, 0, 48);
+            if let Some((u0, k0, f0)) = st.self_assign_rusage {
+                let (u_now, k_now, f_now) = self_rusage_snapshot();
+                let (pu0, pk0) = st.self_period_rusage.unwrap_or((u0, k0));
+                std::ptr::write_unaligned(out.add(0) as *mut u64, u_now.saturating_sub(u0));
+                std::ptr::write_unaligned(out.add(8) as *mut u64, k_now.saturating_sub(k0));
+                std::ptr::write_unaligned(out.add(16) as *mut u64, u_now.saturating_sub(pu0));
+                std::ptr::write_unaligned(out.add(24) as *mut u64, k_now.saturating_sub(pk0));
+                std::ptr::write_unaligned(
+                    out.add(32) as *mut u32,
+                    f_now.saturating_sub(f0).min(u32::MAX as u64) as u32,
+                );
+            }
             std::ptr::write_unaligned(out.add(36) as *mut u32, st.total_processes);
             std::ptr::write_unaligned(out.add(40) as *mut u32, st.active_count());
             std::ptr::write_unaligned(out.add(44) as *mut u32, st.total_terminated);
@@ -3833,12 +3894,27 @@ pub(crate) mod tests {
             assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(112) as *const usize), 64 * 1024 * 1024);
             assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(120) as *const usize), 128 * 1024 * 1024);
 
+            // Burn a small amount of real CPU time so getrusage(RUSAGE_SELF) advances visibly.
+            let mut spin: u64 = 1;
+            let spin_start = std::time::Instant::now();
+            while spin_start.elapsed() < std::time::Duration::from_millis(5) {
+                spin = spin.wrapping_mul(6364136223846793005).wrapping_add(1);
+                std::hint::black_box(spin);
+            }
+
             // Query JobObjectBasicAccountingInformation (class 1) at the exact Windows ABI offsets:
+            // +0 TotalUserTime, +8 TotalKernelTime, +16 ThisPeriodTotalUserTime, +24 ThisPeriodTotalKernelTime,
             // +32 TotalPageFaultCount, +36 TotalProcesses, +40 ActiveProcesses, +44 TotalTerminatedProcesses.
             let mut acct = [0u8; 48];
             assert_eq!(QueryInformationJobObject(job, 1, acct.as_mut_ptr() as *mut c_void, 48, &mut ret_len), TRUE);
             assert_eq!(ret_len, 48);
-            assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(32) as *const u32), 0);
+            let total_user = std::ptr::read_unaligned(acct.as_ptr().add(0) as *const u64);
+            let total_kernel = std::ptr::read_unaligned(acct.as_ptr().add(8) as *const u64);
+            let period_user = std::ptr::read_unaligned(acct.as_ptr().add(16) as *const u64);
+            let period_kernel = std::ptr::read_unaligned(acct.as_ptr().add(24) as *const u64);
+            assert!(total_user + total_kernel > 0, "expected real CPU time accounting after busy spin");
+            assert_eq!(period_user, total_user);
+            assert_eq!(period_kernel, total_kernel);
             assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(36) as *const u32), 1);
             assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(40) as *const u32), 1);
             assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(44) as *const u32), 0);
