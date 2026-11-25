@@ -435,8 +435,12 @@ struct SchannelContext {
     pending_handshake_out: Vec<u8>,
     pending_eof: bool,
     pending_plaintext: Vec<u8>,
+    client_hello_hs_buf: Vec<u8>,
+    client_hello_parsed: bool,
+    tls_client_random: Option<[u8; 32]>,
     server_hello_hs_buf: Vec<u8>,
     server_hello_parsed: bool,
+    tls_server_random: Option<[u8; 32]>,
     tls12_session_id: Vec<u8>,
 }
 
@@ -809,9 +813,62 @@ fn inspect_tls_record(buf: &[u8]) -> Result<Option<usize>, usize> {
     Ok(Some(total))
 }
 
-/// Sniff the `ServerHello.session_id` (up to 32 bytes) from TLS handshake records so
-/// `SECPKG_ATTR_SESSION_INFO` can report the negotiated TLS 1.2 session ID alongside
-/// `rustls::HandshakeKind`. Skips TLS 1.3 HelloRetryRequest messages.
+/// Sniff `ClientHello.random` (32 bytes) from TLS handshake records so TLS 1.2
+/// `SECPKG_ATTR_EAP_KEY_BLOCK` can derive RFC 5216 §2.3 IVs with the empty-secret PRF.
+fn capture_client_hello_random(ctx: &mut SchannelContext, tls_records: &[u8]) {
+    if ctx.client_hello_parsed {
+        return;
+    }
+    let mut off = 0usize;
+    while off + 5 <= tls_records.len() {
+        let ctype = tls_records[off];
+        let rec_len = u16::from_be_bytes([tls_records[off + 3], tls_records[off + 4]]) as usize;
+        let end = off + 5 + rec_len;
+        if end > tls_records.len() {
+            break;
+        }
+        if ctype == 22 {
+            let payload = &tls_records[off + 5..end];
+            let cap = 256usize.saturating_sub(ctx.client_hello_hs_buf.len());
+            if cap > 0 {
+                let take = payload.len().min(cap);
+                ctx.client_hello_hs_buf.extend_from_slice(&payload[..take]);
+            }
+        }
+        off = end;
+    }
+    let mut pos = 0usize;
+    while pos + 4 <= ctx.client_hello_hs_buf.len() {
+        let hs_type = ctx.client_hello_hs_buf[pos];
+        let hs_len = u32::from_be_bytes([
+            0,
+            ctx.client_hello_hs_buf[pos + 1],
+            ctx.client_hello_hs_buf[pos + 2],
+            ctx.client_hello_hs_buf[pos + 3],
+        ]) as usize;
+        let body_start = pos + 4;
+        if hs_type == 0x01 {
+            if body_start + 34 > ctx.client_hello_hs_buf.len() {
+                return;
+            }
+            if let Ok(rand) = <[u8; 32]>::try_from(&ctx.client_hello_hs_buf[body_start + 2..body_start + 34]) {
+                ctx.tls_client_random = Some(rand);
+            }
+            ctx.client_hello_parsed = true;
+            ctx.client_hello_hs_buf.clear();
+            return;
+        }
+        let next = body_start.saturating_add(hs_len);
+        if next > ctx.client_hello_hs_buf.len() {
+            return;
+        }
+        pos = next;
+    }
+}
+
+/// Sniff `ServerHello.random` (32 bytes) and `ServerHello.session_id` (up to 32 bytes) from TLS
+/// handshake records so `SECPKG_ATTR_SESSION_INFO` and `SECPKG_ATTR_EAP_KEY_BLOCK` have the
+/// negotiated TLS 1.2 session ID and server random. Skips TLS 1.3 HelloRetryRequest messages.
 fn capture_server_hello_session_id(ctx: &mut SchannelContext, tls_records: &[u8]) {
     if ctx.server_hello_parsed {
         return;
@@ -864,6 +921,9 @@ fn capture_server_hello_session_id(ctx: &mut SchannelContext, tls_records: &[u8]
                 return;
             }
             if random != HRR_RANDOM {
+                if let Ok(rand) = <[u8; 32]>::try_from(random) {
+                    ctx.tls_server_random = Some(rand);
+                }
                 ctx.tls12_session_id =
                     ctx.server_hello_hs_buf[body_start + 35..body_start + 35 + sid_len].to_vec();
                 ctx.server_hello_parsed = true;
@@ -876,6 +936,48 @@ fn capture_server_hello_session_id(ctx: &mut SchannelContext, tls_records: &[u8]
             return;
         }
         pos = next;
+    }
+}
+
+/// RFC 5246 §5 TLS 1.2 PRF: `PRF(secret, label, seed) = P_<hash>(secret, label + seed)`.
+pub(super) fn tls12_prf(
+    digest: crate::misc::bcrypt::Digest,
+    secret: &[u8],
+    label: &[u8],
+    seed: &[u8],
+    out: &mut [u8],
+) {
+    let mut label_seed = Vec::with_capacity(label.len() + seed.len());
+    label_seed.extend_from_slice(label);
+    label_seed.extend_from_slice(seed);
+    let mut a = digest.hmac(secret, &label_seed);
+    let mut pos = 0usize;
+    while pos < out.len() {
+        let mut block_in = Vec::with_capacity(a.len() + label_seed.len());
+        block_in.extend_from_slice(&a);
+        block_in.extend_from_slice(&label_seed);
+        let block = digest.hmac(secret, &block_in);
+        let take = (out.len() - pos).min(block.len());
+        out[pos..pos + take].copy_from_slice(&block[..take]);
+        pos += take;
+        if pos < out.len() {
+            a = digest.hmac(secret, &a);
+        }
+    }
+}
+
+fn tls12_prf_digest_for_suite(
+    suite: Option<rustls::SupportedCipherSuite>,
+) -> crate::misc::bcrypt::Digest {
+    use crate::misc::bcrypt::Digest;
+    match suite.map(|s| s.suite()) {
+        Some(
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384
+            | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+        ) => Digest::Sha384,
+        _ => Digest::Sha256,
     }
 }
 
@@ -1577,7 +1679,7 @@ pub(super) unsafe fn initialize_security_context_impl(
         }
 
         let stored_target = target_name.clone().unwrap_or_default();
-        let ctx_id = CTXT_TABLE.insert(SchannelContext {
+        let mut new_ctx = SchannelContext {
             conn,
             is_server: false,
             manual_validation,
@@ -1593,10 +1695,16 @@ pub(super) unsafe fn initialize_security_context_impl(
             pending_handshake_out: Vec::new(),
             pending_eof: false,
             pending_plaintext: Vec::new(),
+            client_hello_hs_buf: Vec::new(),
+            client_hello_parsed: false,
+            tls_client_random: None,
             server_hello_hs_buf: Vec::new(),
             server_hello_parsed: false,
+            tls_server_random: None,
             tls12_session_id: Vec::new(),
-        });
+        };
+        capture_client_hello_random(&mut new_ctx, &client_hello);
+        let ctx_id = CTXT_TABLE.insert(new_ctx);
         write_handle(ph_new_context, MAGIC_CTXT, ctx_id);
         if !pf_context_attr.is_null() {
             std::ptr::write_unaligned(pf_context_attr, ret_attr);
@@ -1720,7 +1828,9 @@ pub(super) unsafe fn initialize_security_context_impl(
                     }
                     Ok(Some(rec_total)) => {
                         let rec_slice = &input[consumed..consumed + rec_total];
-                        if !ctx.is_server {
+                        if ctx.is_server {
+                            capture_client_hello_random(ctx, rec_slice);
+                        } else {
                             capture_server_hello_session_id(ctx, rec_slice);
                         }
                         let mut rec = rec_slice;
@@ -1903,8 +2013,12 @@ pub(super) unsafe fn accept_security_context_impl(
             pending_handshake_out: Vec::new(),
             pending_eof: false,
             pending_plaintext: Vec::new(),
+            client_hello_hs_buf: Vec::new(),
+            client_hello_parsed: false,
+            tls_client_random: None,
             server_hello_hs_buf: Vec::new(),
             server_hello_parsed: false,
+            tls_server_random: None,
             tls12_session_id: Vec::new(),
         });
         (id, true)
@@ -1995,7 +2109,9 @@ pub(super) unsafe fn accept_security_context_impl(
                     Ok(None) => return SEC_E_INVALID_TOKEN,
                     Ok(Some(rec_total)) => {
                         let rec_slice = &input[consumed..consumed + rec_total];
-                        if !ctx.is_server {
+                        if ctx.is_server {
+                            capture_client_hello_random(ctx, rec_slice);
+                        } else {
                             capture_server_hello_session_id(ctx, rec_slice);
                         }
                         let mut rec = rec_slice;
@@ -3200,17 +3316,34 @@ pub(super) unsafe fn query_context_attributes_impl(
                         }
                     }
                     Some(ProtocolVersion::TLSv1_2) => {
-                        // RFC 5216 §2.3 / RFC 5705 (EAP-TLS 1.2): 128B keys + 64B IVs
-                        let mut mat = [0u8; 192];
+                        // RFC 5216 §2.3 (EAP-TLS 1.2):
+                        //   Key_Material = TLS-PRF-128(master_secret, "client EAP encryption",
+                        //                              client.random || server.random)
+                        //   IV           = TLS-PRF-64("", "client EAP encryption",
+                        //                             client.random || server.random)
                         if ctx
                             .conn
-                            .export_keying_material(&mut mat, b"client EAP encryption", None)
+                            .export_keying_material(&mut kb.rgb_keys, b"client EAP encryption", None)
                             .is_err()
                         {
                             return SEC_E_INVALID_HANDLE;
                         }
-                        kb.rgb_keys.copy_from_slice(&mat[..128]);
-                        kb.rgb_ivs.copy_from_slice(&mat[128..192]);
+                        let (Some(client_random), Some(server_random)) =
+                            (ctx.tls_client_random, ctx.tls_server_random)
+                        else {
+                            return SEC_E_INVALID_HANDLE;
+                        };
+                        let mut seed = [0u8; 64];
+                        seed[..32].copy_from_slice(&client_random);
+                        seed[32..64].copy_from_slice(&server_random);
+                        let prf_digest = tls12_prf_digest_for_suite(ctx.conn.negotiated_cipher_suite());
+                        tls12_prf(
+                            prf_digest,
+                            &[],
+                            b"client EAP encryption",
+                            &seed,
+                            &mut kb.rgb_ivs,
+                        );
                     }
                     _ => return SEC_E_INVALID_HANDLE,
                 }

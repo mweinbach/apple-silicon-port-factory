@@ -917,9 +917,14 @@ fn sch_credentials_v5_tls12_and_custom_chain_engine_exclusive_root() {
         )
         .to_vec();
         assert_eq!(FreeContextBuffer(out_buf.pv_buffer), SEC_E_OK);
+        let client_random: [u8; 32] = to_server[11..43].try_into().unwrap();
+        let mut server_random: Option<[u8; 32]> = None;
         let mut done = false;
         for _ in 0..6 {
             let mut from_server = server_step(&mut srv, &to_server);
+            if server_random.is_none() && from_server.len() >= 43 && from_server[0] == 22 && from_server[5] == 2 {
+                server_random = Some(from_server[11..43].try_into().unwrap());
+            }
             if from_server.is_empty() && !srv.is_handshaking() {
                 break;
             }
@@ -973,7 +978,9 @@ fn sch_credentials_v5_tls12_and_custom_chain_engine_exclusive_root() {
         }
         assert!(done, "TLS 1.2 handshake did not complete");
 
-        // Verify RFC 5216 §2.3 EAP-TLS 1.2 key derivation matches peer rustls exporter (128B keys + 64B IVs)
+        // Verify RFC 5216 §2.3 EAP-TLS 1.2 key derivation:
+        //   rgb_keys = TLS-PRF-128(master_secret, "client EAP encryption", client.random || server.random)
+        //   rgb_ivs  = TLS-PRF-64("",            "client EAP encryption", client.random || server.random)
         let mut eap12 = super::schannel::SecPkgContextEapKeyBlock {
             rgb_keys: [0; 128],
             rgb_ivs: [0; 64],
@@ -986,12 +993,64 @@ fn sch_credentials_v5_tls12_and_custom_chain_engine_exclusive_root() {
             ),
             SEC_E_OK
         );
-        let mut expected_eap12 = [0u8; 192];
-        srv.export_keying_material(&mut expected_eap12, b"client EAP encryption", None)
+        let mut expected_eap12_master = [0u8; 192];
+        srv.export_keying_material(&mut expected_eap12_master, b"client EAP encryption", None)
             .unwrap();
-        assert_eq!(eap12.rgb_keys, expected_eap12[..128]);
-        assert_eq!(eap12.rgb_ivs, expected_eap12[128..192]);
+        assert_eq!(eap12.rgb_keys, expected_eap12_master[..128]);
+        assert_ne!(
+            eap12.rgb_ivs,
+            expected_eap12_master[128..192],
+            "RFC 5216 §2.3 IV block must use empty-secret PRF, not continuation of master-secret exporter"
+        );
+        // Independently derive RFC 5216 §2.3 IV block from wire randoms via rustls's TLS 1.2
+        // PRF provider (`for_secret` with empty secret `""`) and verify independent SHA-256 /
+        // SHA-384 RFC 5246 §5 known-answer vectors.
+        let s_rand = server_random.expect("captured TLS 1.2 ServerHello random");
+        let mut seed = [0u8; 64];
+        seed[..32].copy_from_slice(&client_random);
+        seed[32..64].copy_from_slice(&s_rand);
+        let mut expected_ivs = [0u8; 64];
+        match srv.negotiated_cipher_suite() {
+            Some(rustls::SupportedCipherSuite::Tls12(s)) => {
+                s.prf_provider
+                    .for_secret(&mut expected_ivs, &[], b"client EAP encryption", &seed);
+            }
+            other => panic!("expected TLS 1.2 cipher suite, got {other:?}"),
+        }
+        assert_eq!(eap12.rgb_ivs, expected_ivs);
         assert_ne!(eap12.rgb_ivs, [0u8; 64]);
+
+        // Known-answer vectors for RFC 5216 §2.3 empty-secret TLS-PRF-64("", "client EAP encryption", 0x00..0x3f)
+        // independently computed via Python hmac/hashlib for both SHA-256 and SHA-384 PRFs.
+        let mut kat_seed = [0u8; 64];
+        for (i, b) in kat_seed.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut kat_out = [0u8; 64];
+        super::schannel::tls12_prf(
+            crate::misc::bcrypt::Digest::Sha256,
+            &[],
+            b"client EAP encryption",
+            &kat_seed,
+            &mut kat_out,
+        );
+        let kat_hex: String = kat_out.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            kat_hex,
+            "0c0ec968133bf4d5f8cc06ccbe36e94f37ef0f502bf0cb50222a7ec2e4829cf29965119282feda35bb44b0a5481a6113c382873b95626a434ee027e897c9553d"
+        );
+        super::schannel::tls12_prf(
+            crate::misc::bcrypt::Digest::Sha384,
+            &[],
+            b"client EAP encryption",
+            &kat_seed,
+            &mut kat_out,
+        );
+        let kat384_hex: String = kat_out.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            kat384_hex,
+            "cf201e31879f2d87f90c0c77f12f3221a1a9f86826a6023d46c4d0b46025ea3dc1a445ca9c97630797c520ca5babc74dee8a39c82a10299e69d8c295ba48e5f4"
+        );
 
         let mut cinfo = std::mem::zeroed::<SecPkgContextConnectionInfo>();
         assert_eq!(
@@ -3213,6 +3272,34 @@ fn schannel_session_info_reports_resumption_and_session_id() {
         assert_eq!(si1.cb_session_id, 32);
         assert_eq!(ci1.rgb_session_id, si1.rgb_session_id);
         assert_ne!(ci1.rgb_session_id, [0u8; 32]);
+        // TLS 1.2 EAP-TLS key block (keys + empty-secret PRF IVs) must match between Schannel client and server.
+        let mut eap_c1 = super::schannel::SecPkgContextEapKeyBlock {
+            rgb_keys: [0; 128],
+            rgb_ivs: [0; 64],
+        };
+        let mut eap_s1 = super::schannel::SecPkgContextEapKeyBlock {
+            rgb_keys: [0; 128],
+            rgb_ivs: [0; 64],
+        };
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut c1 as *mut _ as *mut c_void,
+                super::schannel::SECPKG_ATTR_EAP_KEY_BLOCK,
+                &mut eap_c1 as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut s1 as *mut _ as *mut c_void,
+                super::schannel::SECPKG_ATTR_EAP_KEY_BLOCK,
+                &mut eap_s1 as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        assert_eq!(eap_c1.rgb_keys, eap_s1.rgb_keys);
+        assert_eq!(eap_c1.rgb_ivs, eap_s1.rgb_ivs);
+        assert_ne!(eap_c1.rgb_ivs, [0u8; 64]);
         DeleteSecurityContext(&mut c1 as *mut _ as *mut c_void);
         DeleteSecurityContext(&mut s1 as *mut _ as *mut c_void);
 
