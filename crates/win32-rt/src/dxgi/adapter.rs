@@ -379,7 +379,7 @@ unsafe extern "win64" fn enum_outputs(this: PA, i: u32, out: *mut *mut c_void) -
         Obj::new(Output {
             adapter: this,
             monitor_id: ms[k].id,
-            owned_device: std::sync::Mutex::new(None),
+            owner_id: next_output_owner_id(),
         }) as *mut c_void,
     );
     S_OK
@@ -429,17 +429,14 @@ pub unsafe fn output_monitor_rect(p: *mut c_void) -> Option<crate::user32::RECT>
 pub struct Output {
     adapter: PA,
     monitor_id: u32,
-    owned_device: std::sync::Mutex<Option<usize>>,
+    owner_id: u64,
 }
 unsafe impl Send for Output {}
 unsafe impl Sync for Output {}
 
 impl Drop for Output {
     fn drop(&mut self) {
-        let dev = self.owned_device.lock().ok().and_then(|mut g| g.take());
-        if let Some(dev) = dev {
-            release_monitor_ownership(self.monitor_id, dev);
-        }
+        release_monitor_ownership(self.monitor_id, self.owner_id);
         unsafe { Obj::release(self.adapter) };
     }
 }
@@ -698,22 +695,28 @@ unsafe extern "win64" fn find_closest_matching_mode1(this: PO, want: *const Mode
 
 const DXGI_ERROR_NOT_CURRENTLY_AVAILABLE: HRESULT = 0x887A_0022u32 as i32;
 
-/// Per-output logical ownership table (`monitor_id -> (device_ptr, exclusive)`).
+fn next_output_owner_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Per-output logical ownership table (`monitor_id -> Vec<(output_owner_id, device_ptr, exclusive)>`).
 ///
-/// On Windows 10/11 flip-model swapchains (`DXGI_SWAP_EFFECT_FLIP_DISCARD` /
-/// `FLIP_SEQUENTIAL`), `IDXGIOutput::TakeOwnership` / `ReleaseOwnership` coordinate
-/// logical output ownership between devices while fullscreen presentation runs via
-/// DWM borderless fullscreen (`IDXGISwapChain::SetFullscreenState`).
-fn output_owners() -> &'static std::sync::Mutex<std::collections::HashMap<u32, (usize, bool)>> {
-    static OWNERS: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, (usize, bool)>>> =
+/// Tracks every outstanding `IDXGIOutput::TakeOwnership` acquisition (both exclusive and
+/// concurrent nonexclusive owners across distinct output objects) under a single mutex.
+fn output_owners() -> &'static std::sync::Mutex<std::collections::HashMap<u32, Vec<(u64, usize, bool)>>> {
+    static OWNERS: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Vec<(u64, usize, bool)>>>> =
         OnceLock::new();
     OWNERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn release_monitor_ownership(monitor_id: u32, dev: usize) {
+fn release_monitor_ownership(monitor_id: u32, owner_id: u64) {
     if let Ok(mut map) = output_owners().lock() {
-        if map.get(&monitor_id).is_some_and(|&(owner, _)| owner == dev) {
-            map.remove(&monitor_id);
+        if let Some(entries) = map.get_mut(&monitor_id) {
+            entries.retain(|&(oid, _, _)| oid != owner_id);
+            if entries.is_empty() {
+                map.remove(&monitor_id);
+            }
         }
     }
 }
@@ -904,26 +907,25 @@ unsafe extern "win64" fn take_ownership(this: PO, dev: *mut c_void, excl: BOOL) 
     let dev_key = dev as usize;
     let exclusive = excl != 0;
     let mut map = output_owners().lock().unwrap();
-    if let Some(&(owner, owner_excl)) = map.get(&out.monitor_id) {
-        if owner != dev_key && (owner_excl || exclusive) {
-            return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
-        }
+    if map.get(&out.monitor_id).is_some_and(|entries| {
+        entries.iter().any(|&(oid, owner_dev, owner_excl)| {
+            oid != out.owner_id && owner_dev != dev_key && (owner_excl || exclusive)
+        })
+    }) {
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
-    map.insert(out.monitor_id, (dev_key, exclusive));
-    *out.owned_device.lock().unwrap() = Some(dev_key);
+    let entries = map.entry(out.monitor_id).or_default();
+    if let Some(existing) = entries.iter_mut().find(|(oid, _, _)| *oid == out.owner_id) {
+        *existing = (out.owner_id, dev_key, exclusive);
+    } else {
+        entries.push((out.owner_id, dev_key, exclusive));
+    }
     S_OK
 }
 
 unsafe extern "win64" fn release_ownership(this: PO) {
     let out = Obj::get(this);
-    // Acquire `output_owners()` before `out.owned_device` (same lock order as `take_ownership`)
-    // so concurrent TakeOwnership/ReleaseOwnership calls on the same output cannot deadlock.
-    let mut map = output_owners().lock().unwrap();
-    if let Some(dev) = out.owned_device.lock().unwrap().take() {
-        if map.get(&out.monitor_id).is_some_and(|&(owner, _)| owner == dev) {
-            map.remove(&out.monitor_id);
-        }
-    }
+    release_monitor_ownership(out.monitor_id, out.owner_id);
 }
 
 unsafe extern "win64" fn supports_overlays(_this: PO) -> BOOL {
@@ -1167,6 +1169,9 @@ mod tests {
 
             let dev_a = 0xA000usize as *mut c_void;
             let dev_b = 0xB000usize as *mut c_void;
+            let dev_c = 0xC000usize as *mut c_void;
+            let mut o3_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(primary_output(f_ptr as *mut Obj<Factory>, &mut o3_ptr), S_OK);
             assert_eq!(take_ownership(o1_ptr as PO, std::ptr::null_mut(), TRUE), DXGI_ERROR_INVALID_CALL);
             assert_eq!(take_ownership(o1_ptr as PO, dev_a, TRUE), S_OK);
             // Same device re-acquiring succeeds; another device fails with NOT_CURRENTLY_AVAILABLE.
@@ -1175,6 +1180,17 @@ mod tests {
             release_ownership(o1_ptr as PO);
             assert_eq!(take_ownership(o2_ptr as PO, dev_b, TRUE), S_OK);
             release_ownership(o2_ptr as PO);
+
+            // Nonexclusive owners on separate output objects must all be preserved:
+            // releasing B must not drop A's nonexclusive acquisition or allow C to take exclusive.
+            assert_eq!(take_ownership(o1_ptr as PO, dev_a, FALSE), S_OK);
+            assert_eq!(take_ownership(o2_ptr as PO, dev_b, FALSE), S_OK);
+            release_ownership(o2_ptr as PO);
+            assert_eq!(take_ownership(o3_ptr as PO, dev_c, TRUE), DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+            release_ownership(o1_ptr as PO);
+            assert_eq!(take_ownership(o3_ptr as PO, dev_c, TRUE), S_OK);
+            release_ownership(o3_ptr as PO);
+            com_release(o3_ptr);
 
             // WaitForVBlank returns S_OK synchronized to display VBlank (CVDisplayLink on macOS).
             assert_eq!(wait_for_vblank(o1_ptr as PO), S_OK);

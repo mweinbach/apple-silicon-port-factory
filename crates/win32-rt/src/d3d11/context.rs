@@ -1358,6 +1358,31 @@ unsafe fn prepare_gfx_draw(
     Ok(())
 }
 
+pub(super) fn accumulate_draw_pipeline_stats(
+    stats: &mut D3D11_QUERY_DATA_PIPELINE_STATISTICS,
+    topology: u32,
+    count: u32,
+    instances: u32,
+    has_gs: bool,
+    has_hs: bool,
+) {
+    let verts = (count as u64).saturating_mul(instances as u64);
+    let prims = d3d11_primitives_per_instance(topology, count as u64)
+        .saturating_mul(instances as u64);
+    stats.IAVertices = stats.IAVertices.saturating_add(verts);
+    stats.IAPrimitives = stats.IAPrimitives.saturating_add(prims);
+    stats.VSInvocations = stats.VSInvocations.saturating_add(verts);
+    // Without tessellation, each IA primitive invokes the GS once. When tessellation is active,
+    // the number of primitives reaching GS depends on GPU tessellation factors, so do not
+    // fabricate GSInvocations from the input-assembler patch count.
+    if has_gs && !has_hs {
+        stats.GSInvocations = stats.GSInvocations.saturating_add(prims);
+    }
+    if has_hs {
+        stats.HSInvocations = stats.HSInvocations.saturating_add(prims);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn exec_draw(
     device: &DeviceCore,
@@ -1380,20 +1405,16 @@ unsafe fn exec_draw(
         exec.cl.draw(count, instances, start_vertex, start_instance)?;
     }
     if !exec.active_pipeline_stats.is_empty() {
-        let verts = (count as u64).saturating_mul(instances as u64);
-        let prims = d3d11_primitives_per_instance(st.topology, count as u64)
-            .saturating_mul(instances as u64);
         for q in &exec.active_pipeline_stats {
             let mut rt = q.rt.lock().unwrap();
-            rt.pipeline_stats.IAVertices = rt.pipeline_stats.IAVertices.saturating_add(verts);
-            rt.pipeline_stats.IAPrimitives = rt.pipeline_stats.IAPrimitives.saturating_add(prims);
-            rt.pipeline_stats.VSInvocations = rt.pipeline_stats.VSInvocations.saturating_add(verts);
-            if st.gs.is_some() {
-                rt.pipeline_stats.GSInvocations = rt.pipeline_stats.GSInvocations.saturating_add(prims);
-            }
-            if st.hs.is_some() {
-                rt.pipeline_stats.HSInvocations = rt.pipeline_stats.HSInvocations.saturating_add(prims);
-            }
+            accumulate_draw_pipeline_stats(
+                &mut rt.pipeline_stats,
+                st.topology,
+                count,
+                instances,
+                st.gs.is_some(),
+                st.hs.is_some(),
+            );
         }
     }
     exec.has_work = true;

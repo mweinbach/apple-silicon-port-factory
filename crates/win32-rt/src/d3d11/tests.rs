@@ -4106,6 +4106,40 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
         com_release(ctx);
         com_release(dev);
     }
+
+    // 4. Pipeline statistics: GSInvocations counts IA primitives only when tessellation is inactive;
+    //    when HS is bound with GS, HSInvocations counts patches and GSInvocations is not fabricated.
+    {
+        let mut s_gs_only = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
+        super::context::accumulate_draw_pipeline_stats(
+            &mut s_gs_only,
+            topology::TRIANGLELIST,
+            6,
+            2,
+            true,
+            false,
+        );
+        assert_eq!(s_gs_only.IAVertices, 12);
+        assert_eq!(s_gs_only.IAPrimitives, 4);
+        assert_eq!(s_gs_only.VSInvocations, 12);
+        assert_eq!(s_gs_only.GSInvocations, 4);
+        assert_eq!(s_gs_only.HSInvocations, 0);
+
+        let mut s_tess_gs = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
+        super::context::accumulate_draw_pipeline_stats(
+            &mut s_tess_gs,
+            topology::PATCHLIST_3,
+            9,
+            2,
+            true,
+            true,
+        );
+        assert_eq!(s_tess_gs.IAVertices, 18);
+        assert_eq!(s_tess_gs.IAPrimitives, 6);
+        assert_eq!(s_tess_gs.VSInvocations, 18);
+        assert_eq!(s_tess_gs.HSInvocations, 6);
+        assert_eq!(s_tess_gs.GSInvocations, 0, "must not fabricate GSInvocations from IA patch count");
+    }
 }
 
 #[test]
