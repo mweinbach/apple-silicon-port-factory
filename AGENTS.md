@@ -28,8 +28,8 @@ When you run `port-runner` on a Windows `.exe`, five layers do the work:
    via an `iced-x86` decoder, block JIT, and persistent `.aot` cache on disk (`--prewarm-aot`
    compiles blocks ahead of time). Handles Win64 ↔ AAPCS64 calls, `VA_DISPATCH`, and MSVC
    FH4/SEH exceptions.
-3. **Win32 & OS layer (`crates/win32-rt`)** — Implements 86 Windows and middleware DLLs (3,241
-   exports) directly on macOS primitives: Mach/POSIX threads and waits, AppKit windows and HID/
+3. **Win32 & OS layer (`crates/win32-rt`)** — Implements Windows and middleware DLL exports ([catalog totals](docs/STATUS.md#catalog-totals))
+   directly on macOS primitives: Mach/POSIX threads and waits, AppKit windows and HID/
    GameController input, CoreAudio for WASAPI, a `~/Translator` virtual `C:\` filesystem, plus
    Direct3D 12, Direct3D 11, and Vulkan entry points.
 4. **Shaders (`crates/dxil-metal`)** — Converts DXIL SM 6.x through Apple's Metal Shader Converter
@@ -121,8 +121,7 @@ Use this lookup table before you create or edit a file:
 
 ## Fast build, run, and test commands
 
-The default universal runner (`port-runner`) is ~17 MB and builds in ~15 seconds because it does not
-compile the 4.47M LOC of Alan Wake 2 shards. Stay on `port-runner` and `cargo factory-test` unless
+The default universal runner (`port-runner`) builds without compiling the Alan Wake 2 shards. Stay on `port-runner` and `cargo factory-test` unless
 you are explicitly working on Alan Wake 2.
 
 ```sh
