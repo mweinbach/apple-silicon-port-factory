@@ -919,12 +919,15 @@ pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
         22 => 0,                                                     // NUMFONTS
         24 => if bpp <= 8 { 1 << bpp } else { -1 },                  // NUMCOLORS
         26 => 0,                                                     // PDEVICESIZE
-        28 => 0x01FF,                                                // CURVECAPS
-        30 => 0x00FE,                                                // LINECAPS
-        32 => 0x00FF,                                                // POLYGONALCAPS
-        34 => 0x7804,                                                // TEXTCAPS
-        36 => 1,                                                     // CLIPCAPS (CP_RECTANGLE)
-        38 => 0x7E99,                                                // RASTERCAPS
+        28 => 0,                                                     // CURVECAPS (CC_NONE)
+        30 => 0,                                                     // LINECAPS (LC_NONE)
+        32 => 0x0002,                                                // POLYGONALCAPS (PC_RECTANGLE)
+        34 => 0x2000,                                                // TEXTCAPS (TC_RA_ABLE)
+        36 => 0,                                                     // CLIPCAPS (CP_NONE)
+        // RASTERCAPS: only advertise operations backed by real exports in this module:
+        // RC_BITBLT (0x0001) | RC_BITMAP64 (0x0008) | RC_DI_BITMAP (0x0080) | RC_STRETCHBLT (0x0800).
+        // Keep RC_DIBTODEV, RC_STRETCHDIB, RC_FLOODFILL, etc. clear until implemented.
+        38 => 0x0001 | 0x0008 | 0x0080 | 0x0800,
         40 => 36,                                                    // ASPECTX
         42 => 36,                                                    // ASPECTY
         44 => 51,                                                    // ASPECTXY
@@ -937,7 +940,7 @@ pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
         117 => mon.height(),                                         // DESKTOPVERTRES
         118 => mon.width(),                                          // DESKTOPHORZRES
         119 => 0,                                                    // BLTALIGNMENT
-        120 => 3,                                                    // SHADEBLENDCAPS (SB_CONST_ALPHA|SB_PIXEL_ALPHA)
+        120 => 0,                                                    // SHADEBLENDCAPS (SB_NONE: AlphaBlend/GradientFill unimplemented)
         121 => 0,                                                    // COLORMGMTCAPS (CM_NONE)
         _ => 0,                                                      // Windows returns 0 for unknown indices
     }
@@ -2010,13 +2013,21 @@ mod tests {
             assert_eq!(GetDeviceCaps(0, 12), 32); // BITSPIXEL
             assert_eq!(GetDeviceCaps(0, 14), 1); // PLANES
             assert_eq!(GetDeviceCaps(0, 24), -1); // NUMCOLORS
-            assert_eq!(GetDeviceCaps(0, 36), 1); // CLIPCAPS
-            assert_ne!(GetDeviceCaps(0, 38), 0); // RASTERCAPS
+            assert_eq!(GetDeviceCaps(0, 28), 0); // CURVECAPS == CC_NONE
+            assert_eq!(GetDeviceCaps(0, 30), 0); // LINECAPS == LC_NONE
+            assert_eq!(GetDeviceCaps(0, 32), 0x0002); // POLYGONALCAPS == PC_RECTANGLE
+            assert_eq!(GetDeviceCaps(0, 34), 0x2000); // TEXTCAPS == TC_RA_ABLE
+            assert_eq!(GetDeviceCaps(0, 36), 0); // CLIPCAPS == CP_NONE
+            let rc = GetDeviceCaps(0, 38); // RASTERCAPS
+            assert_eq!(rc, 0x0001 | 0x0008 | 0x0080 | 0x0800);
+            assert_eq!(rc & 0x0200, 0, "RC_DIBTODEV must stay clear while SetDIBitsToDevice is unimplemented");
+            assert_eq!(rc & 0x2000, 0, "RC_STRETCHDIB must stay clear while StretchDIBits is unimplemented");
+            assert_eq!(rc & 0x1000, 0, "RC_FLOODFILL must stay clear while FloodFill is unimplemented");
             assert_eq!(GetDeviceCaps(0, 45), 0); // unused index -> 0
             assert!(GetDeviceCaps(0, 88) >= 96); // LOGPIXELSX
             assert_eq!(GetDeviceCaps(0, 108), 24); // COLORRES
             assert!(GetDeviceCaps(0, 116) >= 30); // VREFRESH
-            assert_eq!(GetDeviceCaps(0, 120), 3); // SHADEBLENDCAPS (SB_CONST_ALPHA | SB_PIXEL_ALPHA)
+            assert_eq!(GetDeviceCaps(0, 120), 0); // SHADEBLENDCAPS == SB_NONE
             assert_eq!(GetDeviceCaps(0, 9999), 0); // unknown index -> 0
 
             // Selecting a 64x32 24bpp DIB into a compatible memory DC must NOT override the
