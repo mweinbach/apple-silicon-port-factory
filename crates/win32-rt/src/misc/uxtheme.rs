@@ -251,6 +251,8 @@ const TASK_DIALOG_TIMER_INTERVAL: std::time::Duration = std::time::Duration::fro
 const TDM_CLICK_BUTTON: u32 = crate::user32::wm::USER + 102;
 const TDM_SET_ELEMENT_TEXT: u32 = crate::user32::wm::USER + 108;
 const TDM_CLICK_RADIO_BUTTON: u32 = crate::user32::wm::USER + 110;
+const TDM_ENABLE_BUTTON: u32 = crate::user32::wm::USER + 111;
+const TDM_ENABLE_RADIO_BUTTON: u32 = crate::user32::wm::USER + 112;
 const TDM_CLICK_VERIFICATION: u32 = crate::user32::wm::USER + 113;
 const TDM_UPDATE_ELEMENT_TEXT: u32 = crate::user32::wm::USER + 114;
 
@@ -277,7 +279,9 @@ struct ActiveTaskDialog {
     expanded: String,
     footer: String,
     buttons: Vec<(i32, String)>,
+    button_enabled: Vec<bool>,
     radios: Vec<(i32, String)>,
+    radio_enabled: Vec<bool>,
     selected_radio_idx: Option<usize>,
     has_verification: bool,
     verified: bool,
@@ -302,6 +306,8 @@ impl ActiveTaskDialog {
                 crate::macos::TaskDialogLiveUpdate {
                     caption: self.caption.clone(),
                     text: self.compose_body(),
+                    button_enabled: self.button_enabled.clone(),
+                    radio_enabled: self.radio_enabled.clone(),
                     selected_radio_idx: self.selected_radio_idx,
                     verification_checked: self.has_verification.then_some(self.verified),
                     click_button_idx,
@@ -423,6 +429,48 @@ unsafe extern "win64" fn task_dialog_wndproc(
                     0,
                     0,
                 );
+            }
+            0
+        }
+        TDM_ENABLE_BUTTON => {
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    let bid = w_param as i32;
+                    let enabled = l_param != 0;
+                    if let Some(idx) = dlg.buttons.iter().position(|(id, _)| *id == bid) {
+                        if let Some(slot) = dlg.button_enabled.get_mut(idx) {
+                            *slot = enabled;
+                        }
+                        dlg.live_update(None)
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
+            }
+            0
+        }
+        TDM_ENABLE_RADIO_BUTTON => {
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    let rid = w_param as i32;
+                    let enabled = l_param != 0;
+                    if let Some(idx) = dlg.radios.iter().position(|(id, _)| *id == rid) {
+                        if let Some(slot) = dlg.radio_enabled.get_mut(idx) {
+                            *slot = enabled;
+                        }
+                        dlg.live_update(None)
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
             }
             0
         }
@@ -657,7 +705,9 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 expanded,
                 footer,
                 buttons: buttons.clone(),
+                button_enabled: vec![true; buttons.len()],
                 radios: radios.clone(),
+                radio_enabled: vec![true; radios.len()],
                 selected_radio_idx,
                 has_verification: verification_text.is_some(),
                 verified,
@@ -692,17 +742,19 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     let _ = notify(TDN_CREATED, 0);
 
     let chosen_id = loop {
-        let (cur_caption, cur_body, cur_radio_idx, cur_verified, programmatic_click) = {
+        let (cur_caption, cur_body, cur_button_enabled, cur_radio_enabled, cur_radio_idx, cur_verified, programmatic_click) = {
             let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
             let dlg = map.get_mut(&dialog_hwnd).expect("active task dialog missing");
             let snap = (
                 dlg.caption.clone(),
                 dlg.compose_body(),
+                dlg.button_enabled.clone(),
+                dlg.radio_enabled.clone(),
                 dlg.selected_radio_idx,
                 dlg.verified,
                 dlg.pending_click_button.take(),
             );
-            if snap.4.is_none() {
+            if snap.6.is_none() {
                 dlg.modal_open = true;
             }
             snap
@@ -722,8 +774,10 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             cur_caption,
             cur_body,
             labels.clone(),
+            cur_button_enabled.clone(),
             default_button_idx,
             radio_labels.clone(),
+            cur_radio_enabled,
             cur_radio_idx,
             verification_text.clone(),
             cur_verified,
@@ -795,9 +849,10 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 break 0;
             }
             crate::macos::TaskDialogOutcome::Unavailable => {
-                if buttons.len() == 1 && !has_selection_controls && !callback_timer {
-                    // Pure single-button informational dialog with no selection controls or timer
-                    // can dismiss in headless mode (matching MessageBox MB_OK).
+                let single_enabled = cur_button_enabled.first().copied().unwrap_or(true);
+                if buttons.len() == 1 && !has_selection_controls && !callback_timer && single_enabled {
+                    // Pure single-button informational dialog with an enabled button and no
+                    // selection controls or timer can dismiss in headless mode (matching MessageBox MB_OK).
                     (buttons[0].0, false)
                 } else {
                     // Multi-button prompts or dialogs with radio buttons / verification checkboxes /
@@ -1342,7 +1397,7 @@ mod tests {
 
             let mut step = 0usize;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, body, btns, def_btn, rads, def_rad, ver_txt, ver_chk, emit| {
+                move |_cap, body, btns, _btn_en, def_btn, rads, _rad_en, def_rad, ver_txt, ver_chk, emit| {
                     step += 1;
                     assert_eq!(btns, &["Yes", "No"]);
                     assert_eq!(def_btn, Some(1)); // n_default_button == IDNO (7)
@@ -1567,7 +1622,7 @@ mod tests {
             SEEN_NOTIFS.lock().unwrap().clear();
             SUB_PINGS.store(0, std::sync::atomic::Ordering::SeqCst);
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                |cap, body, _btns, _def_btn, _rads, def_rad, _ver_txt, ver_chk, _emit| {
+                |cap, body, _btns, _btn_en, _def_btn, _rads, _rad_en, def_rad, _ver_txt, ver_chk, _emit| {
                     assert_eq!(cap, "Callback Title");
                     assert_eq!(body, "Updated Body");
                     assert_eq!(def_rad, Some(0)); // updated via TDM_CLICK_RADIO_BUTTON(201)
@@ -1699,7 +1754,7 @@ mod tests {
             VETO_FIRST.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut step = 0usize;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, _body, _btns, _db, _rads, _dr, _vt, _vc, emit| {
+                move |_cap, _body, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
                     step += 1;
                     if step == 1 {
                         // Triggers TDM_CLICK_BUTTON(6) while modal_open == true.
@@ -1763,7 +1818,9 @@ mod tests {
                         expanded: String::new(),
                         footer: String::new(),
                         buttons: vec![(1, "OK".to_string())],
+                        button_enabled: vec![true],
                         radios: Vec::new(),
+                        radio_enabled: Vec::new(),
                         selected_radio_idx: None,
                         has_verification: false,
                         verified: false,
@@ -1850,7 +1907,9 @@ mod tests {
                         expanded: String::new(),
                         footer: String::new(),
                         buttons: vec![(1, "OK".to_string())],
+                        button_enabled: vec![true],
                         radios: Vec::new(),
+                        radio_enabled: Vec::new(),
                         selected_radio_idx: None,
                         has_verification: false,
                         verified: false,
@@ -2008,7 +2067,7 @@ mod tests {
             quit_cfg.pf_callback = quit_td_cb as *const () as usize;
 
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                |_cap, _body, _btns, _db, _rads, _dr, _vt, _vc, _emit| {
+                |_cap, _body, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
                     crate::user32::message::PostQuitMessage(77);
                     crate::macos::TaskDialogOutcome::Quit
                 },
@@ -2035,6 +2094,133 @@ mod tests {
             );
             assert_eq!(outer_msg2.message, crate::user32::wm::QUIT);
             assert_eq!(outer_msg2.wparam as i32, 77);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn task_dialog_enable_and_disable_buttons_before_and_during_presentation() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            // Callback disables OK (ID 1) and radio 202 during TDN_CREATED, then re-enables
+            // OK (and radio 202) live when the user checks the verification checkbox.
+            unsafe extern "win64" fn gate_cb(
+                hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                if msg == TDN_CREATED {
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_ENABLE_BUTTON, 1, 0);
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_ENABLE_RADIO_BUTTON, 202, 0);
+                } else if msg == TDN_VERIFICATION_CLICKED {
+                    let en: isize = if wp != 0 { 1 } else { 0 };
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_ENABLE_BUTTON, 1, en);
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_ENABLE_RADIO_BUTTON, 202, en);
+                }
+                S_OK
+            }
+
+            let title_w = crate::strings::to_wide_z("Gate");
+            let ver_w = crate::strings::to_wide_z("I accept");
+            let r1 = crate::strings::to_wide_z("R1");
+            let r2 = crate::strings::to_wide_z("R2");
+            let radios = [
+                TaskDialogButton { button_id: 201, button_text: r1.as_ptr() },
+                TaskDialogButton { button_id: 202, button_text: r2.as_ptr() },
+            ];
+
+            let mut cfg: TaskDialogConfig = std::mem::zeroed();
+            cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg.dw_common_buttons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+            cfg.psz_window_title = title_w.as_ptr();
+            cfg.c_radio_buttons = radios.len() as u32;
+            cfg.p_radio_buttons = radios.as_ptr();
+            cfg.psz_verification_text = ver_w.as_ptr();
+            cfg.pf_callback = gate_cb as *const () as usize;
+
+            let live_btn_states: std::sync::Arc<Mutex<Vec<(Vec<bool>, Vec<bool>)>>> =
+                std::sync::Arc::new(Mutex::new(Vec::new()));
+            let live_hook = live_btn_states.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |_sid, upd| {
+                live_hook
+                    .lock()
+                    .unwrap()
+                    .push((upd.button_enabled.clone(), upd.radio_enabled.clone()));
+            })));
+
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |_cap, _body, btns, btn_en, _db, rads, rad_en, _dr, _vt, _vc, emit| {
+                    assert_eq!(btns, &["OK", "Cancel"]);
+                    assert_eq!(rads, &["R1", "R2"]);
+                    // Pre-presentation TDM_ENABLE_BUTTON(1, FALSE) and TDM_ENABLE_RADIO_BUTTON(202, FALSE)
+                    // sent in TDN_CREATED must already be reflected at initial presentation.
+                    assert_eq!(btn_en, &[false, true]);
+                    assert_eq!(rad_en, &[true, false]);
+
+                    // User checks verification box -> callback sends live TDM_ENABLE_BUTTON(1, TRUE).
+                    emit(crate::macos::TaskDialogEvent::VerificationToggled(true));
+
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: Some(1),
+                        verified: true,
+                    })
+                },
+            )));
+
+            let mut btn = 0;
+            let mut radio = 0;
+            let mut verified = FALSE;
+            let hr = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut radio,
+                &mut verified,
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            crate::macos::set_test_task_dialog_updater(None);
+
+            assert_eq!(hr, S_OK);
+            assert_eq!((btn, radio, verified), (1, 202, TRUE));
+            let updates = live_btn_states.lock().unwrap().clone();
+            assert!(
+                updates.iter().any(|(be, re)| be == &[true, true] && re == &[true, true]),
+                "live TDM_ENABLE_BUTTON/TDM_ENABLE_RADIO_BUTTON must push updated enabled states: {updates:?}"
+            );
+
+            // Headless single-button dialog whose sole button is disabled in TDN_CREATED
+            // must NOT auto-dismiss — it returns HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION.
+            unsafe extern "win64" fn disable_only_ok_cb(
+                hwnd: HWND,
+                msg: u32,
+                _wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                if msg == TDN_CREATED {
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_ENABLE_BUTTON, 1, 0);
+                }
+                S_OK
+            }
+            let mut single_cfg: TaskDialogConfig = std::mem::zeroed();
+            single_cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            single_cfg.dw_common_buttons = TDCBF_OK_BUTTON;
+            single_cfg.psz_window_title = title_w.as_ptr();
+            single_cfg.pf_callback = disable_only_ok_cb as *const () as usize;
+            let mut sbtn = 99;
+            assert_eq!(
+                TaskDialogIndirect(
+                    &single_cfg as *const TaskDialogConfig as *const u8,
+                    &mut sbtn,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION
+            );
+            assert_eq!(sbtn, 0);
         })
         .join()
         .unwrap();

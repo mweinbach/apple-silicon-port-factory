@@ -1388,6 +1388,7 @@ impl TaskDialogEventSink {
 struct ActiveTaskDialogAlert {
     session_id: u64,
     alert: Retained<NSAlert>,
+    action_buttons: Vec<Retained<NSButton>>,
     radio_buttons: Vec<Retained<NSButton>>,
     sink: TaskDialogEventSink,
     /// Deferred programmatic dismissal or `WM_QUIT` abort received while a nested
@@ -1475,7 +1476,9 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         caption,
         text,
         buttons,
+        &[],
         None,
+        &[],
         &[],
         None,
         None,
@@ -1492,11 +1495,22 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
 
 fn apply_live_update_to_alert(
     alert: &NSAlert,
+    action_buttons: &[Retained<NSButton>],
     radio_buttons: &[Retained<NSButton>],
     update: &super::TaskDialogLiveUpdate,
 ) {
     alert.setMessageText(&NSString::from_str(&update.caption));
     alert.setInformativeText(&NSString::from_str(&update.text));
+    for (i, b) in action_buttons.iter().enumerate() {
+        if let Some(&en) = update.button_enabled.get(i) {
+            b.setEnabled(en);
+        }
+    }
+    for (i, b) in radio_buttons.iter().enumerate() {
+        if let Some(&en) = update.radio_enabled.get(i) {
+            b.setEnabled(en);
+        }
+    }
     if let Some(ridx) = update.selected_radio_idx {
         for (i, b) in radio_buttons.iter().enumerate() {
             let st = if i == ridx { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
@@ -1520,7 +1534,7 @@ pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDial
         };
         let is_top = pos + 1 == s.len();
         let active = &mut s[pos];
-        apply_live_update_to_alert(&active.alert, &active.radio_buttons, update);
+        apply_live_update_to_alert(&active.alert, &active.action_buttons, &active.radio_buttons, update);
         let stop = if let Some(bidx) = update.click_button_idx {
             if is_top {
                 Some(1000 + bidx as isize)
@@ -1577,8 +1591,10 @@ fn run_task_dialog_alert(
     caption: &str,
     text: &str,
     buttons: &[String],
+    button_enabled: &[bool],
     default_button_idx: Option<usize>,
     radios: &[String],
+    radio_enabled: &[bool],
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
     verification_checked: bool,
@@ -1602,12 +1618,15 @@ fn run_task_dialog_alert(
     a.setInformativeText(&NSString::from_str(text));
     a.setAlertStyle(if critical { NSAlertStyle::Critical } else { NSAlertStyle::Warning });
     let custom_default = default_button_idx.filter(|&idx| idx < buttons.len());
+    let mut action_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(buttons.len());
     for (idx, b) in buttons.iter().enumerate() {
         let btn = a.addButtonWithTitle(&NSString::from_str(b));
         if let Some(def_idx) = custom_default {
             let eq = NSString::from_str(if idx == def_idx { "\r" } else { "" });
             let _: () = unsafe { msg_send![&*btn, setKeyEquivalent: &*eq] };
         }
+        btn.setEnabled(button_enabled.get(idx).copied().unwrap_or(true));
+        action_buttons.push(btn);
     }
 
     let target = TaskDialogRadioTarget::new(mtm, session_id);
@@ -1651,6 +1670,7 @@ fn run_task_dialog_alert(
                 NS_CONTROL_STATE_OFF
             };
             let _: () = unsafe { msg_send![&*btn, setState: state] };
+            btn.setEnabled(radio_enabled.get(idx).copied().unwrap_or(true));
             container.addSubview(&btn);
             radio_buttons.push(btn);
         }
@@ -1690,6 +1710,7 @@ fn run_task_dialog_alert(
         stack.borrow_mut().push(ActiveTaskDialogAlert {
             session_id,
             alert: a.clone(),
+            action_buttons: action_buttons.clone(),
             radio_buttons: radio_buttons.clone(),
             sink,
             deferred_stop: None,
@@ -1703,7 +1724,7 @@ fn run_task_dialog_alert(
         let queued = PENDING_TASK_DIALOG_UPDATES.with(|map| map.borrow_mut().remove(&session_id));
         if let Some(updates) = queued {
             for upd in updates {
-                apply_live_update_to_alert(&a, &radio_buttons, &upd);
+                apply_live_update_to_alert(&a, &action_buttons, &radio_buttons, &upd);
                 if let Some(bidx) = upd.click_button_idx {
                     pre_clicked = Some(bidx);
                 }
@@ -1755,8 +1776,10 @@ pub(super) fn task_dialog_alert_channel(
     caption: &str,
     text: &str,
     buttons: &[String],
+    button_enabled: &[bool],
     default_button_idx: Option<usize>,
     radios: &[String],
+    radio_enabled: &[bool],
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
     verification_checked: bool,
@@ -1769,8 +1792,10 @@ pub(super) fn task_dialog_alert_channel(
         caption,
         text,
         buttons,
+        button_enabled,
         default_button_idx,
         radios,
+        radio_enabled,
         default_radio_idx,
         verification_text,
         verification_checked,
@@ -1836,8 +1861,10 @@ pub(super) fn task_dialog_alert_inline(
     caption: &str,
     text: &str,
     buttons: &[String],
+    button_enabled: &[bool],
     default_button_idx: Option<usize>,
     radios: &[String],
+    radio_enabled: &[bool],
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
     verification_checked: bool,
@@ -1897,8 +1924,10 @@ pub(super) fn task_dialog_alert_inline(
         caption,
         text,
         buttons,
+        button_enabled,
         default_button_idx,
         radios,
+        radio_enabled,
         default_radio_idx,
         verification_text,
         verification_checked,
