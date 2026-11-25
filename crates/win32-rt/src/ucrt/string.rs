@@ -68,42 +68,128 @@ const fn build_ctype() -> [u16; 257] {
 
 pub static CTYPE: [u16; 257] = build_ctype();
 
+struct LocaleCaseTables {
+    ctype: [u16; 257],
+    lower: [u8; 256],
+    upper: [u8; 256],
+}
+
+const fn build_ascii_lower() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = if i >= b'A' as usize && i <= b'Z' as usize { (i + 32) as u8 } else { i as u8 };
+        i += 1;
+    }
+    t
+}
+
+const fn build_ascii_upper() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = if i >= b'a' as usize && i <= b'z' as usize { (i - 32) as u8 } else { i as u8 };
+        i += 1;
+    }
+    t
+}
+
+static C_TABLES: LocaleCaseTables = LocaleCaseTables {
+    ctype: build_ctype(),
+    lower: build_ascii_lower(),
+    upper: build_ascii_upper(),
+};
+
+static ACTIVE_TABLES: std::sync::atomic::AtomicPtr<LocaleCaseTables> =
+    std::sync::atomic::AtomicPtr::new(&C_TABLES as *const LocaleCaseTables as *mut LocaleCaseTables);
+
 /// Build and cache the 257-entry MSVC `__pctype_func` classification table (`index 0 = EOF`)
-/// for `cp`. `"C"` (`0`) and UTF-8 (`65001`) classify only ASCII bytes (`0x00..=0x7F`);
-/// SBCS/DBCS code pages classify `0x80..=0xFF` via `kernel32::string` (marking DBCS lead bytes
-/// with `_LEADBYTE` = `0x8000`).
-fn ctype_table_for_cp(cp: u32) -> &'static [u16; 257] {
-    if cp == 0 || cp == 65001 {
-        return &CTYPE;
+/// and 256-entry `tolower`/`toupper` tables for `(cp, icu_locale)`.
+fn tables_for_locale(cp: u32, icu_locale: &str) -> &'static LocaleCaseTables {
+    if cp == 0 {
+        return &C_TABLES;
     }
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static TABLES: OnceLock<Mutex<HashMap<u32, &'static [u16; 257]>>> = OnceLock::new();
+    static TABLES: OnceLock<Mutex<HashMap<(u32, String), &'static LocaleCaseTables>>> = OnceLock::new();
     let m = TABLES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (cp, icu_locale.to_string());
     let mut g = m.lock().unwrap();
-    if let Some(&tbl) = g.get(&cp) {
+    if let Some(&tbl) = g.get(&key) {
         return tbl;
     }
-    let mut tbl = CTYPE;
-    for b in 0x80u8..=0xFF {
-        let is_lead = unsafe { crate::kernel32::string::IsDBCSLeadByteEx(cp, b) != 0 };
-        if is_lead {
-            tbl[b as usize + 1] = _LEADBYTE;
+    let mut ctype = CTYPE;
+    let mut lower = C_TABLES.lower;
+    let mut upper = C_TABLES.upper;
+    for b in 0u8..=0xFF {
+        if cp == 65001 && b >= 0x80 {
             continue;
         }
-        if let Ok(units) = crate::kernel32::string::decode_cp_to_utf16_strict(cp, &[b], true) {
-            if units.len() == 1 {
-                tbl[b as usize + 1] = crate::kernel32::string::ctype1(units[0]) & 0x1FF;
-            }
+        let is_lead = cp != 65001 && unsafe { crate::kernel32::string::IsDBCSLeadByteEx(cp, b) != 0 };
+        if is_lead {
+            ctype[b as usize + 1] = _LEADBYTE;
+            lower[b as usize] = b;
+            upper[b as usize] = b;
+            continue;
         }
+        let unit = if b < 0x80 {
+            Some(b as u16)
+        } else {
+            crate::kernel32::string::decode_cp_to_utf16_strict(cp, &[b], true)
+                .ok()
+                .filter(|u| u.len() == 1)
+                .map(|u| u[0])
+        };
+        let Some(u) = unit else { continue };
+        if b >= 0x80 {
+            ctype[b as usize + 1] = crate::kernel32::string::ctype1(u) & 0x1FF;
+        }
+        // Apply locale-specific ICU case mapping BEFORE any ASCII fallback so Turkic locales
+        // (`tr_TR`, `az_*`) map `'i'` -> `'İ'` (CP1254 `0xDD`) and `'I'` -> `'ı'` (`0xFD`).
+        let lo_u = crate::kernel32::string::case_map_unit_icu(icu_locale, u, false);
+        lower[b as usize] = if lo_u == u {
+            b
+        } else if cp == 65001 {
+            if lo_u < 0x80 { lo_u as u8 } else { b }
+        } else {
+            crate::kernel32::string::encode_utf16_to_cp(cp, &[lo_u], None)
+                .ok()
+                .filter(|(out, used)| !used && out.len() == 1)
+                .map(|(out, _)| out[0])
+                .unwrap_or(b)
+        };
+        let up_u = crate::kernel32::string::case_map_unit_icu(icu_locale, u, true);
+        upper[b as usize] = if up_u == u {
+            b
+        } else if cp == 65001 {
+            if up_u < 0x80 { up_u as u8 } else { b }
+        } else {
+            crate::kernel32::string::encode_utf16_to_cp(cp, &[up_u], None)
+                .ok()
+                .filter(|(out, used)| !used && out.len() == 1)
+                .map(|(out, _)| out[0])
+                .unwrap_or(b)
+        };
     }
-    let leaked: &'static [u16; 257] = Box::leak(Box::new(tbl));
-    g.insert(cp, leaked);
+    let leaked: &'static LocaleCaseTables = Box::leak(Box::new(LocaleCaseTables { ctype, lower, upper }));
+    g.insert(key, leaked);
     leaked
 }
 
+/// Called by `ucrt::locale` whenever global `LC_CTYPE` changes so `__pctype_func`, `is*`,
+/// `tolower`, and `toupper` observe the new tables lock-free.
+pub(super) fn refresh_global_ctype_tables(cp: u32, icu_locale: &str) {
+    let tbl = tables_for_locale(cp, icu_locale);
+    ACTIVE_TABLES.store(tbl as *const LocaleCaseTables as *mut LocaleCaseTables, std::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+fn active_tables() -> &'static LocaleCaseTables {
+    unsafe { &*ACTIVE_TABLES.load(std::sync::atomic::Ordering::Acquire) }
+}
+
 pub unsafe extern "win64" fn __pctype_func() -> *const u16 {
-    ctype_table_for_cp(super::locale::mb_cp()).as_ptr().add(1)
+    active_tables().ctype.as_ptr().add(1)
 }
 pub unsafe extern "win64" fn __pwctype_func() -> *const u16 {
     CTYPE.as_ptr().add(1)
@@ -112,7 +198,7 @@ pub unsafe extern "win64" fn __pwctype_func() -> *const u16 {
 /// Classification of an `int` argument as ucrt does it (EOF and 0..=255) for `cp`.
 fn cls_cp(c: i32, cp: u32) -> u16 {
     if (-1..=255).contains(&c) {
-        ctype_table_for_cp(cp)[(c + 1) as usize]
+        tables_for_locale(cp, "").ctype[(c + 1) as usize]
     } else {
         0
     }
@@ -120,7 +206,11 @@ fn cls_cp(c: i32, cp: u32) -> u16 {
 
 /// Classification of an `int` argument as ucrt does it (EOF and 0..=255).
 fn cls(c: i32) -> u16 {
-    cls_cp(c, super::locale::mb_cp())
+    if (-1..=255).contains(&c) {
+        active_tables().ctype[(c + 1) as usize]
+    } else {
+        0
+    }
 }
 
 pub unsafe extern "win64" fn _isctype(c: i32, mask: i32) -> i32 {
@@ -172,43 +262,21 @@ pub unsafe extern "win64" fn __iscsymf(c: i32) -> i32 {
     (cls(c) & _ALPHA != 0 || c == b'_' as i32) as i32
 }
 
-fn map_narrow_case(c: i32, cp: u32, to_upper: bool) -> i32 {
-    if to_upper {
-        if (b'a' as i32..=b'z' as i32).contains(&c) {
-            return c - 32;
-        }
-    } else if (b'A' as i32..=b'Z' as i32).contains(&c) {
-        return c + 32;
-    }
-    if !(0x80..=0xFF).contains(&c) || cp == 0 || cp == 65001 {
-        return c;
-    }
-    let b = c as u8;
-    if unsafe { crate::kernel32::string::IsDBCSLeadByteEx(cp, b) != 0 } {
-        return c;
-    }
-    if let Ok(units) = crate::kernel32::string::decode_cp_to_utf16_strict(cp, &[b], true) {
-        if units.len() == 1 {
-            let mapped = if to_upper { wupper(units[0]) } else { wlower(units[0]) };
-            if mapped != units[0] {
-                if let Ok((out, used)) = crate::kernel32::string::encode_utf16_to_cp(cp, &[mapped], None) {
-                    if !used && out.len() == 1 {
-                        return out[0] as i32;
-                    }
-                }
-            }
-        }
-    }
-    c
-}
-
 #[inline(never)]
 pub unsafe extern "win64" fn tolower(c: i32) -> i32 {
-    map_narrow_case(c, super::locale::mb_cp(), false)
+    if (0..=255).contains(&c) {
+        active_tables().lower[c as usize] as i32
+    } else {
+        c
+    }
 }
 #[inline(never)]
 pub unsafe extern "win64" fn toupper(c: i32) -> i32 {
-    map_narrow_case(c, super::locale::mb_cp(), true)
+    if (0..=255).contains(&c) {
+        active_tables().upper[c as usize] as i32
+    } else {
+        c
+    }
 }
 pub unsafe extern "win64" fn _tolower(c: i32) -> i32 {
     c + 32
@@ -217,10 +285,24 @@ pub unsafe extern "win64" fn _toupper(c: i32) -> i32 {
     c - 32
 }
 pub unsafe extern "win64" fn _tolower_l(c: i32, l: *mut c_void) -> i32 {
-    map_narrow_case(c, super::locale::locale_obj_cp(l), false)
+    if !(0..=255).contains(&c) {
+        return c;
+    }
+    if l.is_null() {
+        return active_tables().lower[c as usize] as i32;
+    }
+    let (cp, icu_loc) = super::locale::ctype_cp_and_icu(l);
+    tables_for_locale(cp, &icu_loc).lower[c as usize] as i32
 }
 pub unsafe extern "win64" fn _toupper_l(c: i32, l: *mut c_void) -> i32 {
-    map_narrow_case(c, super::locale::locale_obj_cp(l), true)
+    if !(0..=255).contains(&c) {
+        return c;
+    }
+    if l.is_null() {
+        return active_tables().upper[c as usize] as i32;
+    }
+    let (cp, icu_loc) = super::locale::ctype_cp_and_icu(l);
+    tables_for_locale(cp, &icu_loc).upper[c as usize] as i32
 }
 
 // Wide classification
@@ -1108,12 +1190,24 @@ mod tests {
             assert_ne!(*__pctype_func().add(0xE4) & _ALPHA, 0);
             assert_eq!(toupper(0xE4), 0xC4); // 'Ä'
             assert_eq!(tolower(0xC4), 0xE4); // 'ä'
+            // Turkish locale (CP1254) applies Turkic dotted/dotless-I casing before ASCII rules.
+            assert!(!crate::ucrt::locale::setlocale(0, b"tr-TR\0".as_ptr()).is_null());
+            assert_eq!(toupper(b'i' as i32), 0xDD); // 'İ' in CP1254
+            assert_eq!(tolower(b'I' as i32), 0xFD); // 'ı' in CP1254
+            assert_eq!(toupper(0xFD), b'I' as i32); // 'ı' -> 'I'
+            assert_eq!(tolower(0xDD), b'i' as i32); // 'İ' -> 'i'
             // UTF-8 locale leaves bytes >= 0x80 unclassified.
             assert!(!crate::ucrt::locale::setlocale(0, b"en-US.utf8\0".as_ptr()).is_null());
             assert_eq!(isalpha(0xE4), 0);
             assert_eq!(isprint(0xE4), 0);
-            // Restore "C" locale for subsequent serial tests.
+            // Explicit _locale_t honors tr-TR casing even while global locale is "C".
             assert!(!crate::ucrt::locale::setlocale(0, b"C\0".as_ptr()).is_null());
+            let l_tr = crate::ucrt::locale::_create_locale(0, b"tr-TR\0".as_ptr());
+            assert!(!l_tr.is_null());
+            assert_eq!(_toupper_l(b'i' as i32, l_tr), 0xDD);
+            assert_eq!(_tolower_l(b'I' as i32, l_tr), 0xFD);
+            assert_eq!(toupper(b'i' as i32), b'I' as i32); // global "C" unchanged
+            crate::ucrt::locale::_free_locale(l_tr);
         }
     }
     #[test]

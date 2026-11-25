@@ -1214,6 +1214,20 @@ pub fn sort_key(s: &[u16], flags: u32) -> Vec<u8> {
     k
 }
 
+/// Map a single UTF-16 code unit to upper or lower case using Apple ICU with `icu_locale`
+/// (e.g. `"tr_TR"` maps `'i'` -> `'İ'` and `'I'` -> `'ı'`). Returns `u` unchanged if the
+/// mapping expands to multiple code units (standard C `toupper`/`towupper` contract).
+pub(crate) fn case_map_unit_icu(icu_locale: &str, u: u16, to_upper: bool) -> u16 {
+    let mode = if to_upper { LCMAP_UPPERCASE } else { LCMAP_LOWERCASE };
+    if let Some(mapped) = icu_case_map(icu_locale, mode, &[u]) {
+        if mapped.len() == 1 {
+            return mapped[0];
+        }
+        return u;
+    }
+    if to_upper { wupper(u) } else { wlower(u) }
+}
+
 fn icu_case_map(icu_locale: &str, mode: u32, s: &[u16]) -> Option<Vec<u16>> {
     let a = icu::api()?;
     let cloc = icu::c_str(icu_locale);

@@ -46,6 +46,23 @@ pub(super) unsafe fn locale_obj_cp(l: *mut c_void) -> u32 {
     }
 }
 
+/// `(cp, icu_locale)` for the active global `LC_CTYPE` or an explicit `_locale_t`.
+pub(super) unsafe fn ctype_cp_and_icu(l: *mut c_void) -> (u32, String) {
+    let (is_c, cp, bcp47) = if l.is_null() {
+        let st = global_state().lock().unwrap();
+        let e = &st.cats[(LC_CTYPE - 1) as usize];
+        (e.is_c, e.cp, e.bcp47.clone())
+    } else {
+        let obj = &*(l as *const LocaleObj);
+        (obj.entry.is_c, obj.entry.cp, obj.entry.bcp47.clone())
+    };
+    if is_c || cp == 0 {
+        return (0, String::new());
+    }
+    let icu_id = kstr::resolve_locale_tag(&bcp47).map(|r| r.icu_id).unwrap_or_default();
+    (cp, icu_id)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocaleEntry {
     is_c: bool,
@@ -106,6 +123,12 @@ fn sync_atomics(st: &LocaleState) {
     C_LOCALE.store(ctype.is_c, Ordering::Relaxed);
     CTYPE_CP.store(ctype.cp, Ordering::Relaxed);
     COLLATE_CP.store(collate.cp, Ordering::Relaxed);
+    let icu_id = if ctype.is_c || ctype.cp == 0 {
+        String::new()
+    } else {
+        kstr::resolve_locale_tag(&ctype.bcp47).map(|r| r.icu_id).unwrap_or_default()
+    };
+    super::string::refresh_global_ctype_tables(if ctype.is_c { 0 } else { ctype.cp }, &icu_id);
 }
 
 fn intern_bytes(bytes: &[u8]) -> *mut u8 {
