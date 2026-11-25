@@ -205,11 +205,29 @@ fn bad_fd() -> i32 {
     -1
 }
 
+/// Write all of `buf` using `write_fn`, retrying `EINTR` and looping on short writes.
+/// Returns `Err(host_errno)` on error or zero-byte progress (`EIO`).
+fn write_all_with<F>(mut buf: &[u8], mut write_fn: F) -> Result<(), i32>
+where
+    F: FnMut(&[u8]) -> Result<usize, i32>,
+{
+    while !buf.is_empty() {
+        match write_fn(buf) {
+            Ok(0) => return Err(libc::EIO),
+            Ok(n) => buf = &buf[n..],
+            Err(libc::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Detect or emit BOM for Unicode text modes (`_O_WTEXT`, `fopen(..., "..., ccs=...")`).
 /// Matches MSVC UCRT BOM precedence: an existing BOM overrides the requested encoding;
 /// creating/truncating a new writable file with BOM enabled writes the UTF-16LE or UTF-8 BOM.
 /// When `ansi_if_no_bom` is true (low-level `_open(..., _O_WTEXT)`), an existing file without a
 /// BOM falls back to `TextMode::AnsiText`; for `fopen(..., "..., ccs=UNICODE")` it stays UTF-16LE.
+/// Returns `Err(host_errno)` if writing the BOM fails (truncating any partial BOM back to 0).
 unsafe fn apply_unicode_bom(
     fd: i32,
     oflag: i32,
@@ -217,10 +235,10 @@ unsafe fn apply_unicode_bom(
     write_bom_on_new: bool,
     detect_bom: bool,
     ansi_if_no_bom: bool,
-) -> TextMode {
+) -> Result<TextMode, i32> {
     let mut st: libc::stat = std::mem::zeroed();
     if libc::fstat(fd, &mut st) != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
-        return requested;
+        return Ok(requested);
     }
     let acc = oflag & 3;
     let can_write = acc == O_WRONLY || acc == O_RDWR;
@@ -233,33 +251,49 @@ unsafe fn apply_unicode_bom(
                 _ => &[],
             };
             if !bom.is_empty() {
-                let _ = libc::write(fd, bom.as_ptr() as *const c_void, bom.len());
+                if let Err(e) = write_all_with(bom, |chunk| {
+                    let n = libc::write(fd, chunk.as_ptr() as *const c_void, chunk.len());
+                    if n < 0 {
+                        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+                    } else {
+                        Ok(n as usize)
+                    }
+                }) {
+                    let _ = libc::ftruncate(fd, 0);
+                    return Err(e);
+                }
             }
-            return requested;
+            return Ok(requested);
         }
-        return if !can_write && ansi_if_no_bom { TextMode::AnsiText } else { requested };
+        return Ok(if !can_write && ansi_if_no_bom { TextMode::AnsiText } else { requested });
     }
     if detect_bom {
         let mut head = [0u8; 3];
-        let n = libc::pread(fd, head.as_mut_ptr() as *mut c_void, 3, 0);
+        let n = loop {
+            let r = libc::pread(fd, head.as_mut_ptr() as *mut c_void, 3, 0);
+            if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break r;
+        };
         let is_append = (oflag & O_APPEND) != 0;
         if n >= 2 && head[0] == 0xFF && head[1] == 0xFE {
             if !is_append || can_read {
                 let _ = libc::lseek(fd, 2, libc::SEEK_SET);
             }
-            return TextMode::Utf16Le;
+            return Ok(TextMode::Utf16Le);
         }
         if n >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF {
             if !is_append || can_read {
                 let _ = libc::lseek(fd, 3, libc::SEEK_SET);
             }
-            return TextMode::Utf8;
+            return Ok(TextMode::Utf8);
         }
         if ansi_if_no_bom {
-            return TextMode::AnsiText;
+            return Ok(TextMode::AnsiText);
         }
     }
-    requested
+    Ok(requested)
 }
 
 pub fn open_host(win_path: &str, oflag: i32, pmode: i32) -> i32 {
@@ -372,7 +406,7 @@ fn open_host_path(
         }
     };
     let final_mode = if req_mode.is_unicode() {
-        unsafe {
+        match unsafe {
             apply_unicode_bom(
                 fd,
                 oflag,
@@ -381,6 +415,13 @@ fn open_host_path(
                 detect_bom && bom_readable,
                 ansi_if_no_bom,
             )
+        } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { libc::close(fd) };
+                errno::set(errno::from_host(e));
+                return -1;
+            }
         }
     } else {
         req_mode
@@ -3602,6 +3643,36 @@ mod tests {
                 std::fs::set_permissions(&wo_path, std::fs::Permissions::from_mode(0o644)).unwrap();
             }
             assert_eq!(std::fs::read(&wo_path).unwrap(), b"pre:ok");
+
+            // 14. BOM write failure propagation + EINTR / short-write handling.
+            let mut written = Vec::new();
+            let mut calls = 0;
+            write_all_with(&[0xEF, 0xBB, 0xBF], |chunk| {
+                calls += 1;
+                if calls == 1 {
+                    return Err(libc::EINTR);
+                }
+                written.push(chunk[0]);
+                Ok(1)
+            })
+            .unwrap();
+            assert_eq!(written, vec![0xEF, 0xBB, 0xBF]);
+            assert_eq!(
+                write_all_with(&[0xEF, 0xBB, 0xBF], |_| Err(libc::ENOSPC)),
+                Err(libc::ENOSPC)
+            );
+            // Real libc::write failure (EBADF on O_RDONLY host fd) propagates Err instead of Ok.
+            let ro_empty = dir.join("bom_fail_empty.txt");
+            std::fs::write(&ro_empty, b"").unwrap();
+            let c_ro = std::ffi::CString::new(ro_empty.as_os_str().as_encoded_bytes()).unwrap();
+            let ro_fd = libc::open(c_ro.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            assert!(ro_fd >= 0);
+            assert_eq!(
+                apply_unicode_bom(ro_fd, O_WRONLY | O_U8TEXT, TextMode::Utf8, true, false, false),
+                Err(libc::EBADF)
+            );
+            libc::close(ro_fd);
+            assert_eq!(std::fs::metadata(&ro_empty).unwrap().len(), 0);
         }
 
         let _ = std::fs::remove_dir_all(&dir);

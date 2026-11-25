@@ -1128,9 +1128,53 @@ unsafe fn configure_ucollator(a: &icu::IcuNls, col: *mut c_void, flags: u32) {
     }
 }
 
-/// Locale-aware comparison via Apple ICU (`ucol_strcoll`), matching `sort_key_for_locale`,
-/// falling back to `compare_linguistic` if ICU is unavailable.
+/// Windows word-sort special-weight extraction: strips hyphen `'-'` and apostrophe `'\''`
+/// from `s` for primary/secondary/tertiary comparison and records `(position, weight)` entries
+/// (`'\''` = `0x02`, `'-'` = `0x03`) for 4th-level tie-breaking and sort-key suffix encoding.
+fn word_sort_strip(s: &[u16]) -> (Vec<u16>, Vec<(u32, u8)>) {
+    let mut stripped = Vec::with_capacity(s.len());
+    let mut special = Vec::new();
+    for (idx, &u) in s.iter().enumerate() {
+        if u == b'\'' as u16 {
+            special.push((idx as u32, 0x02));
+        } else if u == b'-' as u16 {
+            special.push((idx as u32, 0x03));
+        } else {
+            stripped.push(u);
+        }
+    }
+    (stripped, special)
+}
+
+/// Append Windows word-sort 4th-level special weights to a NUL-terminated ICU sort key using
+/// strictly non-zero bytes (`0x02..=0xFF`, big-endian base-254 position + weight) after a
+/// `0x01` level separator so `memcmp` matches `compare_for_locale` 1-to-1 and never embeds `0x00`.
+fn append_word_sort_weights(key: &mut Vec<u8>, special: &[(u32, u8)]) {
+    if special.is_empty() {
+        return;
+    }
+    if key.last() == Some(&0) {
+        key.pop();
+    }
+    key.push(0x01);
+    for &(pos, w) in special {
+        // Encode `pos` in 4 big-endian base-254 digits shifted by +2 (range 0x02..=0xFF).
+        let d3 = (pos % 254) as u8 + 2;
+        let q3 = pos / 254;
+        let d2 = (q3 % 254) as u8 + 2;
+        let q2 = q3 / 254;
+        let d1 = (q2 % 254) as u8 + 2;
+        let d0 = ((q2 / 254) % 254) as u8 + 2;
+        key.extend_from_slice(&[d0, d1, d2, d3, w]);
+    }
+    key.push(0x00);
+}
+
+/// Locale-aware comparison via Apple ICU (`ucol_strcoll`), matching `sort_key_for_locale`
+/// (including Windows word sort vs `SORT_STRINGSORT`), falling back to `compare_linguistic`
+/// if ICU is unavailable.
 fn compare_for_locale(icu_locale: &str, lhs: &[u16], rhs: &[u16], flags: u32) -> Ordering {
+    let word_sort = (flags & SORT_STRINGSORT) == 0 && (flags & NORM_IGNORESYMBOLS) == 0;
     if let Some(a) = icu::api() {
         let cloc = icu::c_str(icu_locale);
         unsafe {
@@ -1138,17 +1182,20 @@ fn compare_for_locale(icu_locale: &str, lhs: &[u16], rhs: &[u16], flags: u32) ->
             let col = (a.ucol_open)(cloc.as_ptr(), &mut st);
             if !col.is_null() && st <= 0 {
                 configure_ucollator(a, col, flags);
-                let r = (a.ucol_strcoll)(
-                    col,
-                    lhs.as_ptr(),
-                    lhs.len() as i32,
-                    rhs.as_ptr(),
-                    rhs.len() as i32,
-                );
+                let (ord, lhs_sw, rhs_sw) = if word_sort {
+                    let (ls, lsw) = word_sort_strip(lhs);
+                    let (rs, rsw) = word_sort_strip(rhs);
+                    let r = (a.ucol_strcoll)(col, ls.as_ptr(), ls.len() as i32, rs.as_ptr(), rs.len() as i32);
+                    (r, lsw, rsw)
+                } else {
+                    let r = (a.ucol_strcoll)(col, lhs.as_ptr(), lhs.len() as i32, rhs.as_ptr(), rhs.len() as i32);
+                    (r, Vec::new(), Vec::new())
+                };
                 (a.ucol_close)(col);
-                return match r {
+                return match ord {
                     x if x < 0 => Ordering::Less,
                     x if x > 0 => Ordering::Greater,
+                    _ if word_sort => lhs_sw.cmp(&rhs_sw),
                     _ => Ordering::Equal,
                 };
             }
@@ -1157,9 +1204,10 @@ fn compare_for_locale(icu_locale: &str, lhs: &[u16], rhs: &[u16], flags: u32) ->
     compare_linguistic(lhs, rhs, flags)
 }
 
-/// Locale-aware sort key via Apple ICU (`ucol_getSortKey`), falling back to
-/// `sort_key` if ICU is unavailable.
+/// Locale-aware sort key via Apple ICU (`ucol_getSortKey`), matching `compare_for_locale`
+/// (including Windows word sort vs `SORT_STRINGSORT`), falling back to `sort_key` if ICU is unavailable.
 fn sort_key_for_locale(icu_locale: &str, s: &[u16], flags: u32) -> Vec<u8> {
+    let word_sort = (flags & SORT_STRINGSORT) == 0 && (flags & NORM_IGNORESYMBOLS) == 0;
     if let Some(a) = icu::api() {
         let cloc = icu::c_str(icu_locale);
         unsafe {
@@ -1167,22 +1215,29 @@ fn sort_key_for_locale(icu_locale: &str, s: &[u16], flags: u32) -> Vec<u8> {
             let col = (a.ucol_open)(cloc.as_ptr(), &mut st);
             if !col.is_null() && st <= 0 {
                 configure_ucollator(a, col, flags);
-                let mut buf = vec![0u8; s.len() * 6 + 16];
-                let need = (a.ucol_get_sort_key)(col, s.as_ptr(), s.len() as i32, buf.as_mut_ptr(), buf.len() as i32);
-                if need as usize > buf.len() {
+                let (stripped, special) = if word_sort {
+                    word_sort_strip(s)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let src = if word_sort { stripped.as_slice() } else { s };
+                let mut buf = vec![0u8; src.len() * 6 + 16];
+                let need = (a.ucol_get_sort_key)(col, src.as_ptr(), src.len() as i32, buf.as_mut_ptr(), buf.len() as i32);
+                let got = if need as usize > buf.len() {
                     buf.resize(need as usize, 0);
-                    let need2 = (a.ucol_get_sort_key)(col, s.as_ptr(), s.len() as i32, buf.as_mut_ptr(), buf.len() as i32);
+                    let need2 = (a.ucol_get_sort_key)(col, src.as_ptr(), src.len() as i32, buf.as_mut_ptr(), buf.len() as i32);
                     (a.ucol_close)(col);
-                    if need2 > 0 {
-                        buf.truncate(need2 as usize);
-                        return buf;
-                    }
+                    need2
                 } else {
                     (a.ucol_close)(col);
-                    if need > 0 {
-                        buf.truncate(need as usize);
-                        return buf;
+                    need
+                };
+                if got > 0 {
+                    buf.truncate(got as usize);
+                    if word_sort {
+                        append_word_sort_weights(&mut buf, &special);
                     }
+                    return buf;
                 }
             }
         }
@@ -3886,6 +3941,26 @@ mod tests {
         let kb = sort_key(&w("Apple"), 0);
         let kc = sort_key(&w("b"), 0);
         assert!(ka < kb && kb < kc);
+
+        // Windows word sort (flags = 0) vs string sort (SORT_STRINGSORT = 0x1000) via ICU:
+        // word sort treats '-' and '\'' as 4th-level tie-breakers so "co-op" > "con" and
+        // "coop" < "co-op", while other punctuation ("a!b" < "ab") keeps primary weight.
+        assert_eq!(compare_for_locale("en_US", &w("co-op"), &w("con"), 0), Ordering::Greater);
+        assert_eq!(compare_for_locale("en_US", &w("coop"), &w("co-op"), 0), Ordering::Less);
+        assert_eq!(compare_for_locale("en_US", &w("a'b"), &w("a-b"), 0), Ordering::Less);
+        assert_eq!(compare_for_locale("en_US", &w("a!b"), &w("ab"), 0), Ordering::Less);
+        assert_eq!(compare_for_locale("en_US", &w("co-op"), &w("con"), SORT_STRINGSORT), Ordering::Less);
+        assert_eq!(compare_for_locale("en_US", &w("co-op"), &w("coop"), NORM_IGNORESYMBOLS), Ordering::Equal);
+
+        // Sort keys must match compare_for_locale 1-to-1 in both word sort and string sort.
+        let k_coop_w = sort_key_for_locale("en_US", &w("coop"), 0);
+        let k_co_op_w = sort_key_for_locale("en_US", &w("co-op"), 0);
+        let k_con_w = sort_key_for_locale("en_US", &w("con"), 0);
+        assert!(k_con_w < k_coop_w && k_coop_w < k_co_op_w);
+        assert!(!k_co_op_w[..k_co_op_w.len() - 1].contains(&0));
+        let k_co_op_s = sort_key_for_locale("en_US", &w("co-op"), SORT_STRINGSORT);
+        let k_con_s = sort_key_for_locale("en_US", &w("con"), SORT_STRINGSORT);
+        assert!(k_co_op_s < k_con_s);
     }
     #[test]
     fn date_picture() {
