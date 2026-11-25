@@ -151,6 +151,21 @@ pub enum FileKind {
     Device,
 }
 
+struct DirEnumEntry {
+    name: String,
+    attrs: u32,
+    times: Times,
+    size: u64,
+    alloc_size: u64,
+    ino: u64,
+    reparse_tag: u32,
+}
+
+struct DirEnumState {
+    entries: Vec<DirEnumEntry>,
+    cursor: usize,
+}
+
 pub struct FileObj {
     file: ManuallyDrop<File>,
     owned: bool,
@@ -169,6 +184,10 @@ pub struct FileObj {
     dir_watcher: Mutex<Option<Arc<DirWatcher>>>,
     /// Present for server-side named pipe handles created via `CreateNamedPipeW`/`A`.
     named_pipe_server: Option<Arc<NamedPipeServer>>,
+    /// Stateful directory enumeration cursor for `GetFileInformationByHandleEx` dir classes.
+    dir_enum: Mutex<Option<DirEnumState>>,
+    /// Per-handle I/O priority hint (`FILE_IO_PRIORITY_HINT_INFO`, default `2` = `IoPriorityNormal`).
+    io_priority: Mutex<u32>,
 }
 
 impl FileObj {
@@ -187,6 +206,8 @@ impl FileObj {
             peek_buf: Mutex::new(VecDeque::new()),
             dir_watcher: Mutex::new(None),
             named_pipe_server: None,
+            dir_enum: Mutex::new(None),
+            io_priority: Mutex::new(2),
         }
     }
     pub fn fd(&self) -> i32 {
@@ -411,26 +432,105 @@ pub unsafe extern "win64" fn SetStdHandle(which: u32, h: HANDLE) -> BOOL {
     TRUE
 }
 
+struct ConsoleSession {
+    attached: bool,
+    in_mode: u32,
+    out_mode: u32,
+    in_cp: u32,
+    out_cp: u32,
+    title: String,
+    /// Handles created by the active `AllocConsole` / `AttachConsole` session so `FreeConsole` can detach cleanly.
+    session_handles: Option<[usize; 3]>,
+}
+
+fn console_session() -> &'static Mutex<ConsoleSession> {
+    static S: OnceLock<Mutex<ConsoleSession>> = OnceLock::new();
+    S.get_or_init(|| {
+        Mutex::new(ConsoleSession {
+            attached: false,
+            // ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT
+            in_mode: 0x0007,
+            // ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            out_mode: 0x0007,
+            in_cp: ACP,
+            out_cp: ACP,
+            title: String::new(),
+            session_handles: None,
+        })
+    })
+}
+
+/// Active POSIX fd backing console / standard input (used by `ucrt::_getch` and `_kbhit`).
+pub(crate) fn console_input_fd() -> i32 {
+    let h = std_handle(0);
+    get_file(h).map(|f| f.fd()).filter(|&fd| fd >= 0).unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn open_console_pty() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::OwnedFd;
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        if master < 0 {
+            return None;
+        }
+        set_cloexec(master);
+        let master_fd = OwnedFd::from_raw_fd(master);
+        if libc::grantpt(master) != 0 || libc::unlockpt(master) != 0 {
+            return None;
+        }
+        let name = libc::ptsname(master);
+        if name.is_null() {
+            return None;
+        }
+        let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+        if slave < 0 {
+            return None;
+        }
+        let slave_fd = OwnedFd::from_raw_fd(slave);
+        Some((master_fd, slave_fd))
+    }
+}
+
 fn is_console(h: HANDLE) -> bool {
     get_file(h).is_some_and(|f| f.kind == FileKind::Console)
 }
 
 pub unsafe extern "win64" fn GetConsoleMode(h: HANDLE, mode: *mut u32) -> BOOL {
-    if !is_console(h) {
+    let Some(f) = get_file(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if f.kind != FileKind::Console {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
     if !mode.is_null() {
-        // ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | VT processing
-        *mode = 0x7;
+        let st = console_session().lock().unwrap();
+        let val = if (f.access & GENERIC_READ) != 0 && (f.access & GENERIC_WRITE) == 0 {
+            st.in_mode
+        } else {
+            st.out_mode
+        };
+        std::ptr::write_unaligned(mode, val);
     }
     TRUE
 }
 
-pub unsafe extern "win64" fn SetConsoleMode(h: HANDLE, _mode: u32) -> BOOL {
-    if !is_console(h) {
+pub unsafe extern "win64" fn SetConsoleMode(h: HANDLE, mode: u32) -> BOOL {
+    let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
+    };
+    if f.kind != FileKind::Console {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    let mut st = console_session().lock().unwrap();
+    if (f.access & GENERIC_READ) != 0 && (f.access & GENERIC_WRITE) == 0 {
+        st.in_mode = mode;
+    } else {
+        st.out_mode = mode;
     }
     TRUE
 }
@@ -459,26 +559,233 @@ pub unsafe extern "win64" fn GetNumberOfConsoleInputEvents(h: HANDLE, count: *mu
 }
 
 pub unsafe extern "win64" fn GetConsoleCP() -> u32 {
-    ACP
+    console_session().lock().unwrap().in_cp
 }
 pub unsafe extern "win64" fn GetConsoleOutputCP() -> u32 {
-    ACP
+    console_session().lock().unwrap().out_cp
 }
-pub unsafe extern "win64" fn SetConsoleCP(_cp: u32) -> BOOL {
+pub unsafe extern "win64" fn SetConsoleCP(cp: u32) -> BOOL {
+    if !crate::kernel32::string::valid_cp(cp) {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    console_session().lock().unwrap().in_cp = crate::kernel32::string::resolve_cp(cp);
     TRUE
 }
-pub unsafe extern "win64" fn SetConsoleOutputCP(_cp: u32) -> BOOL {
+pub unsafe extern "win64" fn SetConsoleOutputCP(cp: u32) -> BOOL {
+    if !crate::kernel32::string::valid_cp(cp) {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    console_session().lock().unwrap().out_cp = crate::kernel32::string::resolve_cp(cp);
     TRUE
 }
 
+/// Allocate a real POSIX PTY-backed console session (on macOS; pipe/stdio-backed on iOS)
+/// and bind `STD_INPUT_HANDLE`/`STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` to `FileKind::Console`
+/// handles. Matches Windows: a process may own at most one console, so a second `AllocConsole`
+/// without `FreeConsole` fails with `ERROR_ACCESS_DENIED`.
 pub unsafe extern "win64" fn AllocConsole() -> BOOL {
-    stub!("no separate console window; stdout/stderr of the loader act as the console");
+    let mut st = console_session().lock().unwrap();
+    if st.attached {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    let new_handles: [HANDLE; 3] = {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some((master_fd, slave_fd)) = open_console_pty() {
+                use std::os::fd::AsRawFd;
+                let sfd = slave_fd.as_raw_fd();
+                let in_dup = libc::fcntl(sfd, libc::F_DUPFD_CLOEXEC, 3);
+                let out_dup = libc::fcntl(sfd, libc::F_DUPFD_CLOEXEC, 3);
+                let err_dup = libc::fcntl(sfd, libc::F_DUPFD_CLOEXEC, 3);
+                drop(slave_fd);
+                if in_dup >= 0 && out_dup >= 0 && err_dup >= 0 {
+                    // Drain PTY master output to host stderr so guest console writes never block
+                    // on PTY buffer capacity and remain visible in the host process logs.
+                    let _ = std::thread::Builder::new()
+                        .name("win32-console-pty".into())
+                        .spawn(move || {
+                            use std::io::Write;
+                            let mfd = master_fd.as_raw_fd();
+                            let mut buf = [0u8; 4096];
+                            loop {
+                                let n = libc::read(mfd, buf.as_mut_ptr() as *mut c_void, buf.len());
+                                if n <= 0 {
+                                    break;
+                                }
+                                let _ = std::io::stderr().write_all(&buf[..n as usize]);
+                            }
+                            drop(master_fd);
+                        });
+                    let h_in = handles::insert(Arc::new(FileObj::new(
+                        File::from_raw_fd(in_dup),
+                        FileKind::Console,
+                        "CONIN$".into(),
+                        None,
+                        GENERIC_READ,
+                        0,
+                    )));
+                    let h_out = handles::insert(Arc::new(FileObj::new(
+                        File::from_raw_fd(out_dup),
+                        FileKind::Console,
+                        "CONOUT$".into(),
+                        None,
+                        GENERIC_WRITE,
+                        0,
+                    )));
+                    let h_err = handles::insert(Arc::new(FileObj::new(
+                        File::from_raw_fd(err_dup),
+                        FileKind::Console,
+                        "CONOUT$".into(),
+                        None,
+                        GENERIC_WRITE,
+                        0,
+                    )));
+                    [h_in, h_out, h_err]
+                } else {
+                    for fd in [in_dup, out_dup, err_dup] {
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                    }
+                    set_err(errno_to_win32(last_errno()));
+                    return FALSE;
+                }
+            } else {
+                // Fallback if PTY limit reached: bind console handles to dup'd host stdio.
+                let mk = |fd: i32, name: &str, access: u32| -> Option<HANDLE> {
+                    let d = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3);
+                    if d < 0 {
+                        return None;
+                    }
+                    Some(handles::insert(Arc::new(FileObj::new(
+                        File::from_raw_fd(d),
+                        FileKind::Console,
+                        name.into(),
+                        None,
+                        access,
+                        0,
+                    ))))
+                };
+                match (mk(0, "CONIN$", GENERIC_READ), mk(1, "CONOUT$", GENERIC_WRITE), mk(2, "CONOUT$", GENERIC_WRITE)) {
+                    (Some(a), Some(b), Some(c)) => [a, b, c],
+                    _ => {
+                        set_err(errno_to_win32(last_errno()));
+                        return FALSE;
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mk = |fd: i32, name: &str, access: u32| -> Option<HANDLE> {
+                let d = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3);
+                if d < 0 {
+                    return None;
+                }
+                Some(handles::insert(Arc::new(FileObj::new(
+                    File::from_raw_fd(d),
+                    FileKind::Console,
+                    name.into(),
+                    None,
+                    access,
+                    0,
+                ))))
+            };
+            match (mk(0, "CONIN$", GENERIC_READ), mk(1, "CONOUT$", GENERIC_WRITE), mk(2, "CONOUT$", GENERIC_WRITE)) {
+                (Some(a), Some(b), Some(c)) => [a, b, c],
+                _ => {
+                    set_err(errno_to_win32(last_errno()));
+                    return FALSE;
+                }
+            }
+        }
+    };
+    {
+        let mut hs = std_handles().lock().unwrap();
+        *hs = new_handles;
+    }
+    st.attached = true;
+    st.in_mode = 0x0007;
+    st.out_mode = 0x0007;
+    st.session_handles = Some([new_handles[0] as usize, new_handles[1] as usize, new_handles[2] as usize]);
     TRUE
 }
+
 pub unsafe extern "win64" fn FreeConsole() -> BOOL {
+    let mut st = console_session().lock().unwrap();
+    if !st.attached {
+        // Microsoft Learn: FreeConsole succeeds even if the process is not attached to a console.
+        return TRUE;
+    }
+    st.attached = false;
+    if let Some(old) = st.session_handles.take() {
+        let mut hs = std_handles().lock().unwrap();
+        for (i, &h_raw) in old.iter().enumerate() {
+            let h = h_raw as HANDLE;
+            if hs[i] == h {
+                // Restore non-owning host stdio fallback handle so post-FreeConsole writes don't crash.
+                let fd = i as i32;
+                let tty = libc::isatty(fd) == 1;
+                let kind = if tty { FileKind::Console } else { host_fd_kind(fd) };
+                let mut o = FileObj::new(
+                    File::from_raw_fd(fd),
+                    kind,
+                    ["CONIN$", "CONOUT$", "CONOUT$"][i].into(),
+                    None,
+                    if i == 0 { GENERIC_READ } else { GENERIC_WRITE },
+                    0,
+                );
+                o.owned = false;
+                hs[i] = handles::insert(Arc::new(o));
+            }
+            let _ = handles::close(h);
+        }
+    }
     TRUE
 }
-pub unsafe extern "win64" fn AttachConsole(_pid: u32) -> BOOL {
+
+pub unsafe extern "win64" fn AttachConsole(pid: u32) -> BOOL {
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    let mut st = console_session().lock().unwrap();
+    if st.attached {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    if pid != ATTACH_PARENT_PROCESS && pid != std::process::id() {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    let mk = |fd: i32, name: &str, access: u32| -> Option<HANDLE> {
+        let d = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3);
+        if d < 0 {
+            return None;
+        }
+        Some(handles::insert(Arc::new(FileObj::new(
+            File::from_raw_fd(d),
+            FileKind::Console,
+            name.into(),
+            None,
+            access,
+            0,
+        ))))
+    };
+    let (Some(a), Some(b), Some(c)) = (
+        mk(0, "CONIN$", GENERIC_READ),
+        mk(1, "CONOUT$", GENERIC_WRITE),
+        mk(2, "CONOUT$", GENERIC_WRITE),
+    ) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    {
+        let mut hs = std_handles().lock().unwrap();
+        *hs = [a, b, c];
+    }
+    st.attached = true;
+    st.session_handles = Some([a as usize, b as usize, c as usize]);
     TRUE
 }
 pub unsafe extern "win64" fn GetConsoleWindow() -> HWND {
@@ -490,9 +797,20 @@ pub unsafe extern "win64" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *mut u1
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
+    // Query real terminal window size via TIOCGWINSZ when available.
+    let (cols, rows) = get_file(h)
+        .and_then(|f| {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(f.fd(), libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                Some((ws.ws_col, ws.ws_row))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((120, 50));
     // COORD dwSize, COORD cursor, WORD attr, SMALL_RECT window, COORD max
-    let vals: [u16; 11] = [120, 9000, 0, 0, 7, 0, 0, 119, 49, 120, 50];
-    std::ptr::copy_nonoverlapping(vals.as_ptr(), info, 11);
+    let vals: [u16; 11] = [cols, rows.max(9000), 0, 0, 7, 0, 0, cols.saturating_sub(1), rows.saturating_sub(1), cols, rows];
+    std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, info as *mut u8, 22);
     TRUE
 }
 
@@ -500,11 +818,15 @@ pub unsafe extern "win64" fn SetConsoleTextAttribute(_h: HANDLE, _a: u16) -> BOO
     TRUE
 }
 pub unsafe extern "win64" fn SetConsoleTitleA(t: LPCSTR) -> BOOL {
-    log::info!("SetConsoleTitle: {}", from_ansi(t));
+    let s = from_ansi(t);
+    log::info!("SetConsoleTitle: {s}");
+    console_session().lock().unwrap().title = s;
     TRUE
 }
 pub unsafe extern "win64" fn SetConsoleTitleW(t: LPCWSTR) -> BOOL {
-    log::info!("SetConsoleTitle: {}", from_wide(t));
+    let s = from_wide(t);
+    log::info!("SetConsoleTitle: {s}");
+    console_session().lock().unwrap().title = s;
     TRUE
 }
 pub unsafe extern "win64" fn SetConsoleScreenBufferSize(_h: HANDLE, _c: u32) -> BOOL {
@@ -2013,11 +2335,178 @@ pub unsafe extern "win64" fn GetFileInformationByHandle(h: HANDLE, out: *mut u8)
     TRUE
 }
 
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+fn collect_dir_enum_entries(dir: &Path) -> std::io::Result<Vec<DirEnumEntry>> {
+    let mut out = Vec::new();
+    // Windows directory enumeration starts with "." and ".." for non-root directories.
+    if let Ok(m) = std::fs::metadata(dir) {
+        let t = meta_times(&m);
+        out.push(DirEnumEntry {
+            name: ".".into(),
+            attrs: FILE_ATTRIBUTE_DIRECTORY,
+            times: t,
+            size: 0,
+            alloc_size: 0,
+            ino: m.ino(),
+            reparse_tag: 0,
+        });
+        let parent_m = dir.parent().and_then(|p| std::fs::metadata(p).ok()).unwrap_or(m);
+        let pt = meta_times(&parent_m);
+        out.push(DirEnumEntry {
+            name: "..".into(),
+            attrs: FILE_ATTRIBUTE_DIRECTORY,
+            times: pt,
+            size: 0,
+            alloc_size: 0,
+            ino: parent_m.ino(),
+            reparse_tag: 0,
+        });
+    }
+    let mut children = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(sm) = std::fs::symlink_metadata(entry.path()) else { continue };
+        let is_symlink = sm.file_type().is_symlink();
+        let m = if is_symlink { std::fs::metadata(entry.path()).unwrap_or(sm) } else { sm };
+        let mut attrs = meta_attrs(&m, &name);
+        let reparse_tag = if is_symlink {
+            attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
+            IO_REPARSE_TAG_SYMLINK
+        } else {
+            0
+        };
+        let len = if m.is_dir() { 0 } else { m.len() };
+        let alloc_size = if m.is_dir() { 0 } else { (m.blocks() * 512).max(len) };
+        children.push(DirEnumEntry {
+            name,
+            attrs,
+            times: meta_times(&m),
+            size: len,
+            alloc_size,
+            ino: m.ino(),
+            reparse_tag,
+        });
+    }
+    children.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.extend(children);
+    Ok(out)
+}
+
+#[derive(Clone, Copy)]
+enum DirInfoLayout {
+    IdBoth, // class 10/11: header 104 bytes
+    Full,   // class 14/15: header 68 bytes
+    IdExtd, // class 19/20: header 88 bytes
+}
+
+unsafe fn fill_dir_info_by_handle(f: &FileObj, layout: DirInfoLayout, restart: bool, out: *mut u8, size: u32) -> BOOL {
+    if f.kind != FileKind::Dir {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(host_dir) = &f.host_path else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let mut guard = f.dir_enum.lock().unwrap();
+    if restart || guard.is_none() {
+        match collect_dir_enum_entries(host_dir) {
+            Ok(entries) => *guard = Some(DirEnumState { entries, cursor: 0 }),
+            Err(e) => {
+                set_err(io_err(&e));
+                return FALSE;
+            }
+        }
+    }
+    let st = guard.as_mut().unwrap();
+    if st.cursor >= st.entries.len() {
+        set_err(err::ERROR_NO_MORE_FILES);
+        return FALSE;
+    }
+    let header_len: usize = match layout {
+        DirInfoLayout::IdBoth => 104,
+        DirInfoLayout::Full => 68,
+        DirInfoLayout::IdExtd => 88,
+    };
+    let cap = size as usize;
+    let mut off = 0usize;
+    let mut last_off: Option<usize> = None;
+    while st.cursor < st.entries.len() {
+        let e = &st.entries[st.cursor];
+        let w = to_wide(&e.name);
+        let name_bytes = w.len() * 2;
+        let rec_len = header_len + name_bytes;
+        let aligned_len = (rec_len + 7) & !7;
+        let needed = if off == 0 { rec_len } else { aligned_len };
+        if off + rec_len > cap {
+            if last_off.is_none() {
+                set_err(err::ERROR_MORE_DATA);
+                return FALSE;
+            }
+            break;
+        }
+        if let Some(prev) = last_off {
+            (out.add(prev) as *mut u32).write_unaligned((off - prev) as u32);
+        }
+        let dst = out.add(off);
+        std::ptr::write_bytes(dst, 0, header_len.min(cap - off));
+        (dst.add(4) as *mut u32).write_unaligned(st.cursor as u32); // FileIndex
+        put_ft(dst.add(8), e.times.create);
+        put_ft(dst.add(16), e.times.access);
+        put_ft(dst.add(24), e.times.write);
+        put_ft(dst.add(32), e.times.change);
+        put_ft(dst.add(40), e.size);
+        put_ft(dst.add(48), e.alloc_size);
+        (dst.add(56) as *mut u32).write_unaligned(e.attrs);
+        (dst.add(60) as *mut u32).write_unaligned(name_bytes as u32);
+        (dst.add(64) as *mut u32).write_unaligned(0); // EaSize
+        match layout {
+            DirInfoLayout::IdBoth => {
+                // ShortNameLength @68 = 0, ShortName[12] @70..94 = 0, FileId @96
+                (dst.add(96) as *mut u64).write_unaligned(e.ino);
+                std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, dst.add(104), name_bytes);
+            }
+            DirInfoLayout::Full => {
+                std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, dst.add(68), name_bytes);
+            }
+            DirInfoLayout::IdExtd => {
+                (dst.add(68) as *mut u32).write_unaligned(e.reparse_tag);
+                (dst.add(72) as *mut u64).write_unaligned(e.ino);
+                std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, dst.add(88), name_bytes);
+            }
+        }
+        last_off = Some(off);
+        st.cursor += 1;
+        let next = off + needed;
+        if next >= cap {
+            break;
+        }
+        off = (off + rec_len + 7) & !7;
+    }
+    TRUE
+}
+
 pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32, out: *mut u8, size: u32) -> BOOL {
+    if out.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    // Directory enumeration classes manage their own cursor and metadata.
+    match class {
+        10 => return fill_dir_info_by_handle(&f, DirInfoLayout::IdBoth, false, out, size),
+        11 => return fill_dir_info_by_handle(&f, DirInfoLayout::IdBoth, true, out, size),
+        14 => return fill_dir_info_by_handle(&f, DirInfoLayout::Full, false, out, size),
+        15 => return fill_dir_info_by_handle(&f, DirInfoLayout::Full, true, out, size),
+        19 => return fill_dir_info_by_handle(&f, DirInfoLayout::IdExtd, false, out, size),
+        20 => return fill_dir_info_by_handle(&f, DirInfoLayout::IdExtd, true, out, size),
+        _ => {}
+    }
     let m = match f.file().metadata() {
         Ok(m) => m,
         Err(e) => {
@@ -2036,7 +2525,7 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
     };
     match class {
         0 => {
-            // FILE_BASIC_INFO
+            // FileBasicInfo (40 bytes)
             if !need(40) {
                 return FALSE;
             }
@@ -2049,7 +2538,7 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             (out.add(32) as *mut u32).write_unaligned(meta_attrs(&m, &name));
         }
         1 => {
-            // FILE_STANDARD_INFO
+            // FileStandardInfo (24 bytes)
             if !need(24) {
                 return FALSE;
             }
@@ -2060,8 +2549,8 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             *out.add(20) = *f.delete_on_close.lock().unwrap() as u8;
             *out.add(21) = m.is_dir() as u8;
         }
-        2 => {
-            // FILE_NAME_INFO: path without the drive letter.
+        2 | 24 => {
+            // FileNameInfo (2) / FileNormalizedNameInfo (24): path without the drive letter.
             let p = f.win_path.get(2..).unwrap_or("").to_string();
             let w = to_wide(&p);
             if !need(4) {
@@ -2069,37 +2558,111 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             }
             (out as *mut u32).write_unaligned((w.len() * 2) as u32);
             let room = (size as usize - 4) / 2;
-            std::ptr::copy_nonoverlapping(w.as_ptr(), out.add(4) as *mut u16, w.len().min(room));
+            std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, out.add(4), w.len().min(room) * 2);
             if w.len() > room {
                 set_err(err::ERROR_MORE_DATA);
                 return FALSE;
             }
         }
+        7 => {
+            // FileStreamInfo: NTFS exposes default "::$DATA" stream for regular files;
+            // directories have no unnamed data stream and return ERROR_HANDLE_EOF.
+            if m.is_dir() {
+                set_err(err::ERROR_HANDLE_EOF);
+                return FALSE;
+            }
+            let stream_name = to_wide("::$DATA");
+            let name_bytes = stream_name.len() * 2;
+            let total = 24 + name_bytes;
+            if (size as usize) < total {
+                set_err(err::ERROR_MORE_DATA);
+                return FALSE;
+            }
+            std::ptr::write_bytes(out, 0, 24);
+            (out as *mut u32).write_unaligned(0); // NextEntryOffset
+            (out.add(4) as *mut u32).write_unaligned(name_bytes as u32);
+            put_ft(out.add(8), m.len());
+            put_ft(out.add(16), (m.blocks() * 512).max(m.len()));
+            std::ptr::copy_nonoverlapping(stream_name.as_ptr() as *const u8, out.add(24), name_bytes);
+        }
+        8 => {
+            // FileCompressionInfo (16 bytes)
+            if !need(16) {
+                return FALSE;
+            }
+            std::ptr::write_bytes(out, 0, 16);
+            put_ft(out, m.len());
+            // CompressionFormat = COMPRESSION_FORMAT_NONE (0)
+        }
         9 => {
-            // FILE_ATTRIBUTE_TAG_INFO
+            // FileAttributeTagInfo (8 bytes)
             if !need(8) {
                 return FALSE;
             }
-            (out as *mut u32).write_unaligned(meta_attrs(&m, &name));
-            (out.add(4) as *mut u32).write_unaligned(0);
+            let is_symlink = f
+                .host_path
+                .as_deref()
+                .and_then(|p| std::fs::symlink_metadata(p).ok())
+                .is_some_and(|sm| sm.file_type().is_symlink());
+            let mut attrs = meta_attrs(&m, &name);
+            let tag = if is_symlink {
+                attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
+                IO_REPARSE_TAG_SYMLINK
+            } else {
+                0
+            };
+            (out as *mut u32).write_unaligned(attrs);
+            (out.add(4) as *mut u32).write_unaligned(tag);
+        }
+        13 => {
+            // FileRemoteProtocolInfo (116 bytes): Windows returns ERROR_INVALID_PARAMETER for
+            // files on local volumes (only populated for SMB/NFS/WebDAV network shares).
+            let mut sfs: libc::statfs = std::mem::zeroed();
+            let is_remote = libc::fstatfs(f.fd(), &mut sfs) == 0 && (sfs.f_flags & libc::MNT_LOCAL as u32) == 0;
+            if !is_remote {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            if !need(116) {
+                return FALSE;
+            }
+            std::ptr::write_bytes(out, 0, 116);
+            (out as *mut u16).write_unaligned(116); // StructureSize
+            (out.add(2) as *mut u16).write_unaligned(2); // StructureVersion
+            let fs_type = std::ffi::CStr::from_ptr(sfs.f_fstypename.as_ptr()).to_string_lossy();
+            // WNNC_NET_LANMAN (0x0002_0000) for SMB, WNNC_NET_SUN_PC_NFS (0x0007_0000) for NFS.
+            let proto = if fs_type.eq_ignore_ascii_case("nfs") { 0x0007_0000u32 } else { 0x0002_0000u32 };
+            (out.add(4) as *mut u32).write_unaligned(proto);
+            (out.add(8) as *mut u32).write_unaligned(3); // ProtocolMajorVersion
+            (out.add(12) as *mut u32).write_unaligned(0); // ProtocolMinorVersion
+        }
+        16 => {
+            // FileStorageInfo (28 bytes): report real volume sector sizes via statfs/IOKit.
+            if !need(28) {
+                return FALSE;
+            }
+            let vol = query_volume_storage_info(&f);
+            let flags = 0x1u32 | 0x2 | if !vol.incurs_seek_penalty { 0x8 } else { 0 };
+            let vals: [u32; 7] = [
+                vol.logical_sector_size,
+                vol.physical_sector_size,
+                vol.physical_sector_size,
+                vol.physical_sector_size,
+                flags,
+                0,
+                0,
+            ];
+            std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, out, 28);
         }
         17 => {
-            // FILE_ALIGNMENT_INFO
+            // FileAlignmentInfo (4 bytes): FILE_BYTE_ALIGNMENT (0)
             if !need(4) {
                 return FALSE;
             }
             (out as *mut u32).write_unaligned(0);
         }
-        16 => {
-            // FILE_STORAGE_INFO: report 4K physical sectors.
-            if !need(28) {
-                return FALSE;
-            }
-            let vals: [u32; 7] = [512, 4096, 4096, 4096, 0x1 | 0x2 | 0x8, 0, 0];
-            std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, out, 28);
-        }
         18 => {
-            // FILE_ID_INFO
+            // FileIdInfo (24 bytes)
             if !need(24) {
                 return FALSE;
             }
@@ -2107,8 +2670,19 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             put_ft(out, m.dev() as u64);
             put_ft(out.add(8), m.ino());
         }
+        23 => {
+            // FileCaseSensitiveInfo (4 bytes): query real volume case sensitivity via fpathconf.
+            if !need(4) {
+                return FALSE;
+            }
+            let cs = libc::fpathconf(f.fd(), libc::_PC_CASE_SENSITIVE);
+            let flags: u32 = if cs > 0 { 1 } else { 0 };
+            (out as *mut u32).write_unaligned(flags);
+        }
+        // Write-only classes (3=Rename, 4=Disposition, 5=Allocation, 6=EndOfFile, 12=IoPriorityHint,
+        // 21=DispositionEx, 22=RenameEx) and out-of-range values (>= MaximumFileInfoByHandleClass)
+        // fail with ERROR_INVALID_PARAMETER on Windows.
         _ => {
-            stub!("GetFileInformationByHandleEx class {class} not supported");
             set_err(err::ERROR_INVALID_PARAMETER);
             return FALSE;
         }
@@ -2117,31 +2691,75 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
 }
 
 pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, info: *const u8, size: u32) -> BOOL {
+    if info.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
     match class {
         0 => {
+            // FileBasicInfo (40 bytes): times (0 or -1 = don't change) and optional read-only attribute.
+            if size < 40 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
             if f.is_protected_native() {
                 set_err(err::ERROR_ACCESS_DENIED);
                 return FALSE;
             }
-            // FILE_BASIC_INFO: times (0 = don't change).
             let a = (info.add(8) as *const i64).read_unaligned();
             let w = (info.add(16) as *const i64).read_unaligned();
+            let attrs = (info.add(32) as *const u32).read_unaligned();
+            if attrs != 0 {
+                if let Some(ref p) = f.host_path {
+                    if let Ok(m) = std::fs::metadata(p) {
+                        let mut perm = m.permissions();
+                        let mode = perm.mode();
+                        perm.set_mode(if attrs & FILE_ATTRIBUTE_READONLY != 0 { mode & !0o222 } else { mode | 0o200 });
+                        let _ = std::fs::set_permissions(p, perm);
+                    }
+                }
+            }
             set_times(&f, a, w)
         }
-        3 => {
-            // FILE_RENAME_INFO { BOOLEAN ReplaceIfExists; HANDLE RootDirectory; DWORD FileNameLength; WCHAR FileName[] }
-            let replace = *info != 0;
-            let len = (info.add(16) as *const u32).read_unaligned() as usize / 2;
-            let name = String::from_utf16_lossy(std::slice::from_raw_parts(info.add(20) as *const u16, len));
+        3 | 22 => {
+            // FileRenameInfo (3) / FileRenameInfoEx (22):
+            // x64 layout: { DWORD Flags/ReplaceIfExists (@0); HANDLE RootDirectory (@8); DWORD FileNameLength (@16); WCHAR FileName[] (@20) }
+            if size < 22 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let replace = if class == 3 {
+                *info != 0
+            } else {
+                ((info as *const u32).read_unaligned() & 0x1) != 0
+            };
+            let root_dir = (info.add(8) as *const HANDLE).read_unaligned();
+            let name_bytes = (info.add(16) as *const u32).read_unaligned() as usize;
+            if name_bytes == 0 || name_bytes % 2 != 0 || 20 + name_bytes > size as usize {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let len = name_bytes / 2;
+            let raw_units = crate::strings::read_wide_slice(info.add(20) as *const u16, len);
+            let rel_name = String::from_utf16_lossy(&raw_units);
+            let target_win = if !root_dir.is_null() {
+                let Some(root_obj) = get_file(root_dir) else {
+                    set_err(err::ERROR_INVALID_HANDLE);
+                    return FALSE;
+                };
+                format!("{}\\{}", root_obj.win_path.trim_end_matches('\\'), rel_name.trim_start_matches('\\'))
+            } else {
+                rel_name
+            };
             let Some(src) = &f.host_path else {
                 set_err(err::ERROR_INVALID_HANDLE);
                 return FALSE;
             };
-            let dst = match host_path(&name) {
+            let dst = match host_path(&target_win) {
                 Ok(p) => p,
                 Err(e) => {
                     set_err(e);
@@ -2168,7 +2786,12 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
             }
         }
         4 | 21 => {
-            // FILE_DISPOSITION_INFO(_EX)
+            // FileDispositionInfo (4, 1 byte) / FileDispositionInfoEx (21, 4 bytes)
+            let min_sz = if class == 4 { 1 } else { 4 };
+            if size < min_sz {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
             let del = if class == 4 { *info != 0 } else { (info as *const u32).read_unaligned() & 1 != 0 };
             if del && f.is_protected_native() {
                 set_err(err::ERROR_ACCESS_DENIED);
@@ -2178,14 +2801,45 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
             TRUE
         }
         5 | 6 => {
-            // FILE_ALLOCATION_INFO / FILE_END_OF_FILE_INFO
+            // FileAllocationInfo (5) / FileEndOfFileInfo (6), both 8 bytes
+            if size < 8 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
             let len = (info as *const i64).read_unaligned();
-            if class == 5 {
-                return TRUE; // allocation hint only
+            if len < 0 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
             }
             if f.is_protected_native() {
                 set_err(err::ERROR_ACCESS_DENIED);
                 return FALSE;
+            }
+            if class == 5 {
+                let cur_len = f.file().metadata().map(|m| m.len() as i64).unwrap_or(0);
+                if len < cur_len {
+                    // Windows shrinks EndOfFile when AllocationSize is set smaller than EOF.
+                    if libc::ftruncate(f.fd(), len) != 0 {
+                        set_err(errno_to_win32(last_errno()));
+                        return FALSE;
+                    }
+                } else if len > cur_len {
+                    #[cfg(target_vendor = "apple")]
+                    {
+                        let mut store = libc::fstore_t {
+                            fst_flags: libc::F_ALLOCATECONTIG,
+                            fst_posmode: libc::F_PEOFPOSMODE,
+                            fst_offset: 0,
+                            fst_length: len - cur_len,
+                            fst_bytesalloc: 0,
+                        };
+                        if libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut store) == -1 {
+                            store.fst_flags = libc::F_ALLOCATEALL;
+                            let _ = libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut store);
+                        }
+                    }
+                }
+                return TRUE;
             }
             if libc::ftruncate(f.fd(), len) != 0 {
                 set_err(errno_to_win32(last_errno()));
@@ -2193,9 +2847,42 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
             }
             TRUE
         }
+        12 => {
+            // FileIoPriorityHintInfo (4 bytes): 0=VeryLow, 1=Low, 2=Normal
+            if size < 4 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let prio = (info as *const u32).read_unaligned();
+            if prio >= 3 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            *f.io_priority.lock().unwrap() = prio;
+            TRUE
+        }
+        23 => {
+            // FileCaseSensitiveInfo (4 bytes): APFS volume case-sensitivity is fixed at format time;
+            // succeed if matching the volume's actual mode, else fail with ERROR_NOT_SUPPORTED.
+            if size < 4 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let req = (info as *const u32).read_unaligned();
+            if (req & !1) != 0 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let actual = if libc::fpathconf(f.fd(), libc::_PC_CASE_SENSITIVE) > 0 { 1 } else { 0 };
+            if req == actual {
+                TRUE
+            } else {
+                set_err(err::ERROR_NOT_SUPPORTED);
+                FALSE
+            }
+        }
+        // Read-only classes and out-of-range values fail with ERROR_INVALID_PARAMETER on Windows.
         _ => {
-            let _ = size;
-            stub!("SetFileInformationByHandle class {class} not supported");
             set_err(err::ERROR_INVALID_PARAMETER);
             FALSE
         }
@@ -2473,6 +3160,8 @@ pub unsafe extern "win64" fn DeleteFileA(name: LPCSTR) -> BOOL {
 
 const MOVEFILE_REPLACE_EXISTING: u32 = 1;
 const MOVEFILE_COPY_ALLOWED: u32 = 2;
+const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 4;
+const MOVEFILE_WRITE_THROUGH: u32 = 8;
 
 pub fn move_file(src: &str, dst: &str, flags: u32) -> BOOL {
     let (s, d) = match (host_path(src), host_path(dst)) {
@@ -2494,39 +3183,63 @@ pub fn move_file(src: &str, dst: &str, flags: u32) -> BOOL {
         set_err(err::ERROR_ALREADY_EXISTS);
         return FALSE;
     }
-    match std::fs::rename(&s, &d) {
-        Ok(()) => TRUE,
+    let ok = match std::fs::rename(&s, &d) {
+        Ok(()) => true,
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) && flags & MOVEFILE_COPY_ALLOWED != 0 => {
             match std::fs::copy(&s, &d).and_then(|_| std::fs::remove_file(&s)) {
-                Ok(()) => TRUE,
+                Ok(()) => true,
                 Err(e) => {
                     log::warn!("move_file({src:?} -> {dst:?}) cross-device copy failed: {e}");
                     set_err(io_err(&e));
-                    FALSE
+                    false
                 }
             }
         }
         Err(e) => {
             log::warn!("move_file({src:?} -> {dst:?}) failed: {e}");
             set_err(io_err(&e));
-            FALSE
+            false
+        }
+    };
+    if ok && (flags & MOVEFILE_WRITE_THROUGH) != 0 {
+        if let Ok(f) = File::open(&d) {
+            let _ = f.sync_all();
         }
     }
+    ok as BOOL
+}
+
+fn move_file_ex(src: Option<String>, dst: Option<String>, flags: u32) -> BOOL {
+    let Some(src_s) = src else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    if (flags & MOVEFILE_DELAY_UNTIL_REBOOT) != 0 {
+        // Microsoft Learn (`MoveFileExW`):
+        // - `MOVEFILE_DELAY_UNTIL_REBOOT` cannot be combined with `MOVEFILE_COPY_ALLOWED`.
+        // - Scheduling a reboot-time rename/delete writes `PendingFileRenameOperations` under
+        //   HKLM and requires Administrator/LocalSystem privilege; a standard non-elevated user
+        //   process receives `FALSE` with `ERROR_ACCESS_DENIED` (5).
+        if (flags & MOVEFILE_COPY_ALLOWED) != 0 {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    let Some(dst_s) = dst else {
+        // `lpNewFileName == NULL` is only valid with `MOVEFILE_DELAY_UNTIL_REBOOT`.
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    move_file(&src_s, &dst_s, flags)
 }
 
 pub unsafe extern "win64" fn MoveFileExW(src: LPCWSTR, dst: LPCWSTR, flags: u32) -> BOOL {
-    if dst.is_null() {
-        stub!("MoveFileExW delete-on-reboot ignored");
-        return TRUE;
-    }
-    move_file(&from_wide(src), &from_wide(dst), flags)
+    move_file_ex(from_wide_opt(src), from_wide_opt(dst), flags)
 }
 pub unsafe extern "win64" fn MoveFileExA(src: LPCSTR, dst: LPCSTR, flags: u32) -> BOOL {
-    if dst.is_null() {
-        stub!("MoveFileExA delete-on-reboot ignored");
-        return TRUE;
-    }
-    move_file(&from_ansi(src), &from_ansi(dst), flags)
+    move_file_ex(from_ansi_opt(src), from_ansi_opt(dst), flags)
 }
 pub unsafe extern "win64" fn MoveFileW(src: LPCWSTR, dst: LPCWSTR) -> BOOL {
     move_file(&from_wide(src), &from_wide(dst), MOVEFILE_COPY_ALLOWED)
@@ -6844,9 +7557,20 @@ pub unsafe extern "win64" fn MapViewOfFile3(
     _ext: *mut c_void,
     _ext_count: u32,
 ) -> *mut c_void {
-    if !proc_.is_null() && proc_ != handles::CURRENT_PROCESS {
-        stub!("MapViewOfFile3 on another process");
-        set_err(err::ERROR_ACCESS_DENIED);
+    if !proc_.is_null()
+        && proc_ != handles::CURRENT_PROCESS
+        && handles::get_as::<crate::kernel32::process::ProcessObj>(proc_).is_none()
+    {
+        // Microsoft Learn (`MapViewOfFile3`): requires `PROCESS_VM_OPERATION` on `Process`.
+        // Mapping views into another OS process is disallowed on macOS/iOS (SIP / hardened
+        // runtime without `task_for_pid`), matching Windows returning `ERROR_ACCESS_DENIED`
+        // for a remote process handle without `PROCESS_VM_OPERATION`, and `ERROR_INVALID_HANDLE`
+        // when `Process` is not a valid process handle.
+        if handles::get_as::<crate::kernel32::process::ChildProcessObj>(proc_).is_some() {
+            set_err(err::ERROR_ACCESS_DENIED);
+        } else {
+            set_err(err::ERROR_INVALID_HANDLE);
+        }
         return std::ptr::null_mut();
     }
     let Some(m) = handles::get_as::<MappingObj>(h) else {
@@ -6947,13 +7671,428 @@ pub unsafe extern "win64" fn FlushViewOfFile(p: *const c_void, n: usize) -> BOOL
 }
 
 // ---------------------------------------------------------------------------
-// DeviceIoControl
+// DeviceIoControl & real volume / IOKit storage inspection
 // ---------------------------------------------------------------------------
 
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
 const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
+const IOCTL_STORAGE_CHECK_VERIFY: u32 = 0x002D_4800;
+const IOCTL_STORAGE_CHECK_VERIFY2: u32 = 0x002D_0800;
+const IOCTL_STORAGE_GET_MEDIA_TYPES_EX: u32 = 0x002D_0C04;
+const IOCTL_STORAGE_GET_HOTPLUG_INFO: u32 = 0x002D_0C14;
 const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
+const IOCTL_VOLUME_IS_OFFLINE: u32 = 0x0056_0008;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x0007_0000;
+const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
+const IOCTL_DISK_IS_WRITABLE: u32 = 0x0007_0024;
+const IOCTL_DISK_GET_PARTITION_INFO_EX: u32 = 0x0007_0048;
+const IOCTL_DISK_CHECK_VERIFY: u32 = 0x0007_4800;
+const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
+
+const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
+const FSCTL_UNLOCK_VOLUME: u32 = 0x0009_001C;
+const FSCTL_IS_VOLUME_MOUNTED: u32 = 0x0009_0028;
+const FSCTL_GET_COMPRESSION: u32 = 0x0009_003C;
+const FSCTL_SET_COMPRESSION: u32 = 0x0009_C040;
+const FSCTL_GET_NTFS_VOLUME_DATA: u32 = 0x0009_0064;
+const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+const FSCTL_SET_ZERO_DATA: u32 = 0x0009_80C8;
+const FSCTL_QUERY_ALLOCATED_RANGES: u32 = 0x0009_40CF;
+
+const ERROR_NOT_A_REPARSE_POINT: u32 = 4390;
+
+#[derive(Clone, Debug)]
+struct VolumeStorageInfo {
+    vendor: String,
+    product: String,
+    revision: String,
+    serial: String,
+    bus_type: u32,
+    removable: bool,
+    incurs_seek_penalty: bool,
+    trim_enabled: bool,
+    writable: bool,
+    logical_sector_size: u32,
+    physical_sector_size: u32,
+    max_transfer_length: u32,
+    max_physical_pages: u32,
+    alignment_mask: u32,
+    disk_number: u32,
+    partition_number: u32,
+    partition_offset: u64,
+    volume_size_bytes: u64,
+    volume_free_bytes: u64,
+    cluster_size: u32,
+    volume_serial: u64,
+    media_uuid: String,
+}
+
+impl Default for VolumeStorageInfo {
+    fn default() -> Self {
+        Self {
+            vendor: "Apple".into(),
+            product: "APPLE SSD".into(),
+            revision: "1.0".into(),
+            serial: "0000000000000001".into(),
+            bus_type: 17, // BusTypeNvme
+            removable: false,
+            incurs_seek_penalty: false,
+            trim_enabled: true,
+            writable: true,
+            logical_sector_size: 4096,
+            physical_sector_size: 4096,
+            max_transfer_length: 1 << 20,
+            max_physical_pages: 256,
+            alignment_mask: 3,
+            disk_number: 0,
+            partition_number: 1,
+            partition_offset: 0,
+            volume_size_bytes: 0,
+            volume_free_bytes: 0,
+            cluster_size: 4096,
+            volume_serial: 0,
+            media_uuid: String::new(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod iokit_storage {
+    use super::VolumeStorageInfo;
+    use std::ffi::{c_char, c_void, CStr, CString};
+    use std::sync::OnceLock;
+
+    const K_CFSTRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CFNUMBER_SINT64: isize = 4;
+    const K_IOREG_ITERATE_RECURSIVELY: u32 = 0x0000_0001;
+    const K_IOREG_ITERATE_PARENTS: u32 = 0x0000_0002;
+
+    struct IoKitApis {
+        io_bsd_name_matching: unsafe extern "C" fn(u32, u32, *const c_char) -> *mut c_void,
+        io_service_get_matching_service: unsafe extern "C" fn(u32, *mut c_void) -> u32,
+        io_reg_search_cf_prop: unsafe extern "C" fn(u32, *const c_char, *const c_void, *const c_void, u32) -> *const c_void,
+        io_object_release: unsafe extern "C" fn(u32) -> i32,
+        cf_release: unsafe extern "C" fn(*const c_void),
+        cf_dict_get_value: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void,
+        cf_string_create: unsafe extern "C" fn(*const c_void, *const c_char, u32) -> *const c_void,
+        cf_string_get_cstr: unsafe extern "C" fn(*const c_void, *mut c_char, isize, u32) -> u8,
+        cf_number_get_value: unsafe extern "C" fn(*const c_void, isize, *mut c_void) -> u8,
+        cf_boolean_get_value: unsafe extern "C" fn(*const c_void) -> u8,
+        cf_get_type_id: unsafe extern "C" fn(*const c_void) -> usize,
+        cf_string_type_id: unsafe extern "C" fn() -> usize,
+        cf_number_type_id: unsafe extern "C" fn() -> usize,
+        cf_boolean_type_id: unsafe extern "C" fn() -> usize,
+        cf_dict_type_id: unsafe extern "C" fn() -> usize,
+    }
+
+    fn apis() -> Option<&'static IoKitApis> {
+        static APIS: OnceLock<Option<IoKitApis>> = OnceLock::new();
+        APIS.get_or_init(|| unsafe {
+            let iokit = libc::dlopen(
+                c"/System/Library/Frameworks/IOKit.framework/IOKit".as_ptr(),
+                libc::RTLD_LAZY | libc::RTLD_LOCAL,
+            );
+            let cf = libc::dlopen(
+                c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation".as_ptr(),
+                libc::RTLD_LAZY | libc::RTLD_LOCAL,
+            );
+            if iokit.is_null() || cf.is_null() {
+                return None;
+            }
+            macro_rules! sym {
+                ($lib:expr, $name:expr, $ty:ty) => {{
+                    let p = libc::dlsym($lib, $name.as_ptr());
+                    if p.is_null() {
+                        return None;
+                    }
+                    std::mem::transmute::<*mut c_void, $ty>(p)
+                }};
+            }
+            Some(IoKitApis {
+                io_bsd_name_matching: sym!(iokit, c"IOBSDNameMatching", unsafe extern "C" fn(u32, u32, *const c_char) -> *mut c_void),
+                io_service_get_matching_service: sym!(iokit, c"IOServiceGetMatchingService", unsafe extern "C" fn(u32, *mut c_void) -> u32),
+                io_reg_search_cf_prop: sym!(
+                    iokit,
+                    c"IORegistryEntrySearchCFProperty",
+                    unsafe extern "C" fn(u32, *const c_char, *const c_void, *const c_void, u32) -> *const c_void
+                ),
+                io_object_release: sym!(iokit, c"IOObjectRelease", unsafe extern "C" fn(u32) -> i32),
+                cf_release: sym!(cf, c"CFRelease", unsafe extern "C" fn(*const c_void)),
+                cf_dict_get_value: sym!(cf, c"CFDictionaryGetValue", unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void),
+                cf_string_create: sym!(cf, c"CFStringCreateWithCString", unsafe extern "C" fn(*const c_void, *const c_char, u32) -> *const c_void),
+                cf_string_get_cstr: sym!(cf, c"CFStringGetCString", unsafe extern "C" fn(*const c_void, *mut c_char, isize, u32) -> u8),
+                cf_number_get_value: sym!(cf, c"CFNumberGetValue", unsafe extern "C" fn(*const c_void, isize, *mut c_void) -> u8),
+                cf_boolean_get_value: sym!(cf, c"CFBooleanGetValue", unsafe extern "C" fn(*const c_void) -> u8),
+                cf_get_type_id: sym!(cf, c"CFGetTypeID", unsafe extern "C" fn(*const c_void) -> usize),
+                cf_string_type_id: sym!(cf, c"CFStringGetTypeID", unsafe extern "C" fn() -> usize),
+                cf_number_type_id: sym!(cf, c"CFNumberGetTypeID", unsafe extern "C" fn() -> usize),
+                cf_boolean_type_id: sym!(cf, c"CFBooleanGetTypeID", unsafe extern "C" fn() -> usize),
+                cf_dict_type_id: sym!(cf, c"CFDictionaryGetTypeID", unsafe extern "C" fn() -> usize),
+            })
+        })
+        .as_ref()
+    }
+
+    unsafe fn cf_str(a: &IoKitApis, v: *const c_void) -> Option<String> {
+        if v.is_null() || (a.cf_get_type_id)(v) != (a.cf_string_type_id)() {
+            return None;
+        }
+        let mut buf = [0 as c_char; 256];
+        if (a.cf_string_get_cstr)(v, buf.as_mut_ptr(), buf.len() as isize, K_CFSTRING_ENCODING_UTF8) != 0 {
+            Some(CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    }
+
+    unsafe fn cf_i64(a: &IoKitApis, v: *const c_void) -> Option<i64> {
+        if v.is_null() || (a.cf_get_type_id)(v) != (a.cf_number_type_id)() {
+            return None;
+        }
+        let mut out = 0i64;
+        if (a.cf_number_get_value)(v, K_CFNUMBER_SINT64, &mut out as *mut i64 as *mut c_void) != 0 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn cf_bool(a: &IoKitApis, v: *const c_void) -> Option<bool> {
+        if v.is_null() || (a.cf_get_type_id)(v) != (a.cf_boolean_type_id)() {
+            return None;
+        }
+        Some((a.cf_boolean_get_value)(v) != 0)
+    }
+
+    unsafe fn dict_val(a: &IoKitApis, dict: *const c_void, key: &CStr) -> *const c_void {
+        if dict.is_null() || (a.cf_get_type_id)(dict) != (a.cf_dict_type_id)() {
+            return std::ptr::null();
+        }
+        let cf_k = (a.cf_string_create)(std::ptr::null(), key.as_ptr(), K_CFSTRING_ENCODING_UTF8);
+        if cf_k.is_null() {
+            return std::ptr::null();
+        }
+        let v = (a.cf_dict_get_value)(dict, cf_k);
+        (a.cf_release)(cf_k);
+        v
+    }
+
+    unsafe fn search_prop(a: &IoKitApis, svc: u32, key: &CStr, opts: u32) -> *const c_void {
+        let cf_k = (a.cf_string_create)(std::ptr::null(), key.as_ptr(), K_CFSTRING_ENCODING_UTF8);
+        if cf_k.is_null() {
+            return std::ptr::null();
+        }
+        let v = (a.io_reg_search_cf_prop)(svc, c"IOService".as_ptr(), cf_k, std::ptr::null(), opts);
+        (a.cf_release)(cf_k);
+        v
+    }
+
+    pub fn enrich_from_bsd_name(bsd_name: &str, info: &mut VolumeStorageInfo) {
+        let Some(a) = apis() else { return };
+        let Ok(c_bsd) = CString::new(bsd_name) else { return };
+        unsafe {
+            let matching = (a.io_bsd_name_matching)(0, 0, c_bsd.as_ptr());
+            if matching.is_null() {
+                return;
+            }
+            let svc = (a.io_service_get_matching_service)(0, matching);
+            if svc == 0 {
+                return;
+            }
+            let up = K_IOREG_ITERATE_RECURSIVELY | K_IOREG_ITERATE_PARENTS;
+
+            // Direct IOMedia properties
+            let v_unit = search_prop(a, svc, c"BSD Unit", 0);
+            if let Some(u) = cf_i64(a, v_unit) {
+                if u >= 0 {
+                    info.disk_number = u as u32;
+                }
+            }
+            if !v_unit.is_null() {
+                (a.cf_release)(v_unit);
+            }
+
+            let v_part = search_prop(a, svc, c"Partition ID", 0);
+            if let Some(p) = cf_i64(a, v_part) {
+                if p > 0 {
+                    info.partition_number = p as u32;
+                }
+            }
+            if !v_part.is_null() {
+                (a.cf_release)(v_part);
+            }
+
+            let v_base = search_prop(a, svc, c"Base", 0);
+            if let Some(b) = cf_i64(a, v_base) {
+                if b >= 0 {
+                    info.partition_offset = b as u64;
+                }
+            }
+            if !v_base.is_null() {
+                (a.cf_release)(v_base);
+            }
+
+            let v_uuid = search_prop(a, svc, c"UUID", 0);
+            if let Some(u) = cf_str(a, v_uuid) {
+                info.media_uuid = u;
+            }
+            if !v_uuid.is_null() {
+                (a.cf_release)(v_uuid);
+            }
+
+            let v_rem = search_prop(a, svc, c"Removable", up);
+            if let Some(r) = cf_bool(a, v_rem) {
+                info.removable = r;
+            }
+            if !v_rem.is_null() {
+                (a.cf_release)(v_rem);
+            }
+
+            // Block/sector sizes & transfer limits from IOBlockStorageDevice ancestors
+            for (key, dst) in [
+                (c"Logical Block Size", &mut info.logical_sector_size),
+                (c"Physical Block Size", &mut info.physical_sector_size),
+                (c"IOMaximumByteCountRead", &mut info.max_transfer_length),
+                (c"IOMaximumSegmentCountRead", &mut info.max_physical_pages),
+            ] {
+                let v = search_prop(a, svc, key, up);
+                if let Some(n) = cf_i64(a, v) {
+                    if n > 0 {
+                        *dst = (n as u64).min(u32::MAX as u64) as u32;
+                    }
+                }
+                if !v.is_null() {
+                    (a.cf_release)(v);
+                }
+            }
+
+            let v_align = search_prop(a, svc, c"IOMinimumSegmentAlignmentByteCount", up);
+            if let Some(n) = cf_i64(a, v_align) {
+                if n > 0 {
+                    info.alignment_mask = (n as u32).saturating_sub(1);
+                }
+            }
+            if !v_align.is_null() {
+                (a.cf_release)(v_align);
+            }
+
+            // Device Characteristics dictionary: Vendor, Product, Revision, Serial, Medium Type
+            let dev_chars = search_prop(a, svc, c"Device Characteristics", up);
+            if !dev_chars.is_null() {
+                if let Some(s) = cf_str(a, dict_val(a, dev_chars, c"Vendor Name")).filter(|s| !s.is_empty()) {
+                    info.vendor = s;
+                }
+                if let Some(s) = cf_str(a, dict_val(a, dev_chars, c"Product Name")).filter(|s| !s.is_empty()) {
+                    info.product = s;
+                }
+                if let Some(s) = cf_str(a, dict_val(a, dev_chars, c"Product Revision Level")).filter(|s| !s.is_empty()) {
+                    info.revision = s;
+                }
+                if let Some(s) = cf_str(a, dict_val(a, dev_chars, c"Serial Number")).filter(|s| !s.is_empty()) {
+                    info.serial = s;
+                }
+                if let Some(m) = cf_str(a, dict_val(a, dev_chars, c"Medium Type")) {
+                    info.incurs_seek_penalty = m.eq_ignore_ascii_case("Rotational");
+                }
+                (a.cf_release)(dev_chars);
+            }
+
+            // Protocol Characteristics: Physical Interconnect -> STORAGE_BUS_TYPE
+            let proto_chars = search_prop(a, svc, c"Protocol Characteristics", up);
+            if !proto_chars.is_null() {
+                if let Some(interconnect) = cf_str(a, dict_val(a, proto_chars, c"Physical Interconnect")) {
+                    let lc = interconnect.to_ascii_lowercase();
+                    info.bus_type = if lc.contains("nvme") || lc.contains("apple fabric") || lc.contains("pci") {
+                        17 // BusTypeNvme
+                    } else if lc.contains("usb") {
+                        7 // BusTypeUsb
+                    } else if lc.contains("sata") {
+                        11 // BusTypeSata
+                    } else if lc.contains("secure digital") || lc == "sd" {
+                        12 // BusTypeSd
+                    } else if lc.contains("virtual") || lc.contains("file") {
+                        15 // BusTypeFileBackedVirtual
+                    } else if lc.contains("sas") {
+                        10 // BusTypeSas
+                    } else {
+                        17
+                    };
+                }
+                (a.cf_release)(proto_chars);
+            }
+
+            // IOStorageFeatures: Unmap -> TRIM support
+            let features = search_prop(a, svc, c"IOStorageFeatures", up);
+            if !features.is_null() {
+                if let Some(unmap) = cf_bool(a, dict_val(a, features, c"Unmap")) {
+                    info.trim_enabled = unmap;
+                }
+                (a.cf_release)(features);
+            }
+
+            (a.io_object_release)(svc);
+        }
+    }
+}
+
+unsafe fn query_volume_storage_info(f: &FileObj) -> VolumeStorageInfo {
+    let mut info = VolumeStorageInfo::default();
+    let mut sfs: libc::statfs = std::mem::zeroed();
+    let got_sfs = if f.kind == FileKind::Disk || f.kind == FileKind::Dir {
+        libc::fstatfs(f.fd(), &mut sfs) == 0
+    } else {
+        // Resolve volume device handles (e.g. `\\.\C:`, `\\.\PhysicalDrive0`, `\\?\Volume{...}`)
+        // to the mounted host directory for that drive letter (or C:\ -> /).
+        let drive_win = if f.win_path.len() >= 6 && f.win_path.starts_with("\\\\.\\") && f.win_path.as_bytes()[5] == b':' {
+            format!("{}:\\", f.win_path.as_bytes()[4] as char)
+        } else {
+            "C:\\".to_string()
+        };
+        let host = path::to_host(&drive_win).unwrap_or_else(|| PathBuf::from("/"));
+        if let Ok(c) = std::ffi::CString::new(host.as_os_str().as_encoded_bytes()) {
+            libc::statfs(c.as_ptr(), &mut sfs) == 0
+        } else {
+            false
+        }
+    };
+    if got_sfs {
+        let bsize = (sfs.f_bsize as u64).max(512);
+        info.cluster_size = bsize as u32;
+        info.logical_sector_size = (bsize as u32).min(4096);
+        info.physical_sector_size = bsize as u32;
+        info.volume_size_bytes = (sfs.f_blocks as u64).saturating_mul(bsize);
+        info.volume_free_bytes = (sfs.f_bfree as u64).saturating_mul(bsize);
+        info.writable = (sfs.f_flags & libc::MNT_RDONLY as u32) == 0;
+        let fsid_words = std::ptr::read_unaligned(&sfs.f_fsid as *const libc::fsid_t as *const [u32; 2]);
+        info.volume_serial = ((fsid_words[1] as u64) << 32) | (fsid_words[0] as u64);
+
+        let mnt_from = std::ffi::CStr::from_ptr(sfs.f_mntfromname.as_ptr()).to_string_lossy();
+        if let Some(bsd) = mnt_from.strip_prefix("/dev/") {
+            // APFS snapshot mounts look like `/dev/disk3s1s1` or `com.apple.os.update-...@/dev/disk3s1`;
+            // extract the base BSD device name (e.g. `disk3s1` or `disk3`).
+            let bsd_clean = bsd.split('@').next_back().unwrap_or(bsd).strip_prefix("/dev/").unwrap_or(bsd);
+            // Parse diskN and sM numbers as fallback if IOKit doesn't report them.
+            if let Some(rest) = bsd_clean.strip_prefix("disk") {
+                let mut parts = rest.split('s');
+                if let Some(d) = parts.next().and_then(|x| x.parse::<u32>().ok()) {
+                    info.disk_number = d;
+                }
+                if let Some(p) = parts.next().and_then(|x| x.parse::<u32>().ok()) {
+                    info.partition_number = p;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                iokit_storage::enrich_from_bsd_name(bsd_clean, &mut info);
+            }
+        }
+    }
+    if info.volume_size_bytes == 0 {
+        info.volume_size_bytes = 1u64 << 40;
+    }
+    info
+}
 
 pub unsafe extern "win64" fn DeviceIoControl(
     h: HANDLE,
@@ -6965,20 +8104,26 @@ pub unsafe extern "win64" fn DeviceIoControl(
     ret: *mut u32,
     ov: *mut OVERLAPPED,
 ) -> BOOL {
-    let Some(_f) = get_file(h) else {
+    let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
     let out8 = out as *mut u8;
     let put = |data: &[u8]| -> BOOL {
+        if !data.is_empty() && out8.is_null() {
+            set_err(err::ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
         let n = data.len().min(out_len as usize);
         if n < data.len() && n < 8 {
             set_err(err::ERROR_INSUFFICIENT_BUFFER);
             return FALSE;
         }
-        std::ptr::copy_nonoverlapping(data.as_ptr(), out8, n);
+        if n > 0 {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out8, n);
+        }
         if !ret.is_null() {
-            *ret = n as u32;
+            std::ptr::write_unaligned(ret, n as u32);
         }
         if !ov.is_null() {
             complete_overlapped(ov, STATUS_SUCCESS, n);
@@ -6989,20 +8134,56 @@ pub unsafe extern "win64" fn DeviceIoControl(
         }
         TRUE
     };
+    let put_exact = |data: &[u8]| -> BOOL {
+        if (out_len as usize) < data.len() || (!data.is_empty() && out8.is_null()) {
+            set_err(err::ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        if !data.is_empty() {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out8, data.len());
+        }
+        if !ret.is_null() {
+            std::ptr::write_unaligned(ret, data.len() as u32);
+        }
+        if !ov.is_null() {
+            complete_overlapped(ov, STATUS_SUCCESS, data.len());
+        }
+        TRUE
+    };
     match code {
-        IOCTL_STORAGE_QUERY_PROPERTY if in_len >= 8 => {
-            let prop = *(inp as *const u32);
-            let qtype = *(inp as *const u32).add(1);
+        IOCTL_STORAGE_QUERY_PROPERTY => {
+            if inp.is_null() || in_len < 8 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let prop = std::ptr::read_unaligned(inp as *const u32);
+            let qtype = std::ptr::read_unaligned((inp as *const u8).add(4) as *const u32);
             log::debug!("DeviceIoControl(IOCTL_STORAGE_QUERY_PROPERTY, prop={prop}, type={qtype})");
+            let supported = matches!(prop, 0 | 1 | 2 | 3 | 4 | 6 | 7 | 8 | 9 | 11 | 12 | 14 | 17);
             if qtype == 1 {
                 // PropertyExistsQuery
-                return if matches!(prop, 0 | 1 | 6 | 7 | 8) { put(&[]) } else { fail_not_supported() };
+                return if supported { put_exact(&[]) } else { fail_not_supported() };
             }
+            if qtype != 0 {
+                // PropertyMaskQuery / PropertyQueryMaxDefined
+                return fail_not_supported();
+            }
+            if !supported {
+                // Standard Windows storage stack returns ERROR_NOT_SUPPORTED (50) for properties
+                // not exposed by the underlying disk/controller (e.g. RPMB, inline crypto, miniport).
+                return fail_not_supported();
+            }
+            let vol = query_volume_storage_info(&f);
             match prop {
                 0 => {
-                    // STORAGE_DEVICE_DESCRIPTOR. The host disk is an Apple NVMe SSD.
+                    // StorageDeviceProperty -> STORAGE_DEVICE_DESCRIPTOR (header 40 bytes + NUL strings)
                     let mut d = vec![0u8; 40];
-                    let strings = ["Apple\0", "APPLE SSD\0", "1.0\0", "0000000000000001\0"];
+                    let strings = [
+                        format!("{}\0", vol.vendor),
+                        format!("{}\0", vol.product),
+                        format!("{}\0", vol.revision),
+                        format!("{}\0", vol.serial),
+                    ];
                     let mut offs = [0u32; 4];
                     for (i, s) in strings.iter().enumerate() {
                         offs[i] = d.len() as u32;
@@ -7011,79 +8192,433 @@ pub unsafe extern "win64" fn DeviceIoControl(
                     let total = d.len() as u32;
                     d[0..4].copy_from_slice(&40u32.to_le_bytes());
                     d[4..8].copy_from_slice(&total.to_le_bytes());
-                    d[8] = 0; // DeviceType (disk)
-                    d[10] = 0; // RemovableMedia
+                    d[8] = 0; // DeviceType (DIRECT_ACCESS_DEVICE)
+                    d[10] = vol.removable as u8;
                     d[11] = 1; // CommandQueueing
                     for (i, o) in offs.iter().enumerate() {
                         d[12 + i * 4..16 + i * 4].copy_from_slice(&o.to_le_bytes());
                     }
-                    d[28..32].copy_from_slice(&17u32.to_le_bytes()); // BusTypeNvme
+                    d[28..32].copy_from_slice(&vol.bus_type.to_le_bytes());
                     put(&d)
                 }
                 1 => {
-                    // STORAGE_ADAPTER_DESCRIPTOR (32 bytes)
+                    // StorageAdapterProperty -> STORAGE_ADAPTER_DESCRIPTOR (32 bytes)
                     let mut d = [0u8; 32];
                     d[0..4].copy_from_slice(&32u32.to_le_bytes());
                     d[4..8].copy_from_slice(&32u32.to_le_bytes());
-                    d[8..12].copy_from_slice(&(1u32 << 20).to_le_bytes()); // MaximumTransferLength
-                    d[12..16].copy_from_slice(&256u32.to_le_bytes()); // MaximumPhysicalPages
-                    d[16..20].copy_from_slice(&3u32.to_le_bytes()); // AlignmentMask
+                    d[8..12].copy_from_slice(&vol.max_transfer_length.to_le_bytes());
+                    d[12..16].copy_from_slice(&vol.max_physical_pages.to_le_bytes());
+                    d[16..20].copy_from_slice(&vol.alignment_mask.to_le_bytes());
                     d[22] = 1; // CommandQueueing
-                    d[25] = 17; // BusType = NVMe
+                    d[25] = vol.bus_type as u8;
+                    put(&d)
+                }
+                2 => {
+                    // StorageDeviceIdProperty -> STORAGE_DEVICE_ID_DESCRIPTOR (12 bytes + STORAGE_IDENTIFIER)
+                    let id_bytes = if !vol.media_uuid.is_empty() { vol.media_uuid.as_bytes() } else { vol.serial.as_bytes() };
+                    let ident_len = (16 + id_bytes.len() + 3) & !3;
+                    let total = 12 + ident_len;
+                    let mut d = vec![0u8; total];
+                    d[0..4].copy_from_slice(&12u32.to_le_bytes()); // Version
+                    d[4..8].copy_from_slice(&(total as u32).to_le_bytes()); // Size
+                    d[8..12].copy_from_slice(&1u32.to_le_bytes()); // NumberOfIdentifiers
+                    // STORAGE_IDENTIFIER @12: CodeSet=Ascii(2), Type=VendorId(1), IdentifierSize, NextOffset=0, Association=Device(0)
+                    d[12..16].copy_from_slice(&2u32.to_le_bytes());
+                    d[16..20].copy_from_slice(&1u32.to_le_bytes());
+                    d[20..22].copy_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                    d[22..24].copy_from_slice(&0u16.to_le_bytes());
+                    d[24..28].copy_from_slice(&0u32.to_le_bytes());
+                    d[28..28 + id_bytes.len()].copy_from_slice(id_bytes);
+                    put(&d)
+                }
+                3 => {
+                    // StorageDeviceUniqueIdProperty -> STORAGE_DEVICE_UNIQUE_IDENTIFIER (20 bytes)
+                    let mut d = [0u8; 20];
+                    d[0..4].copy_from_slice(&20u32.to_le_bytes());
+                    d[4..8].copy_from_slice(&20u32.to_le_bytes());
+                    put(&d)
+                }
+                4 => {
+                    // StorageDeviceWriteCacheProperty -> STORAGE_WRITE_CACHE_PROPERTY (28 bytes)
+                    let mut d = [0u8; 28];
+                    d[0..4].copy_from_slice(&28u32.to_le_bytes()); // Version
+                    d[4..8].copy_from_slice(&28u32.to_le_bytes()); // Size
+                    d[8..12].copy_from_slice(&2u32.to_le_bytes()); // WriteCacheTypeWriteBack
+                    d[12..16].copy_from_slice(&1u32.to_le_bytes()); // WriteCacheEnableEnabled
+                    d[16..20].copy_from_slice(&0u32.to_le_bytes()); // WriteCacheChangeUnknown
+                    d[20..24].copy_from_slice(&1u32.to_le_bytes()); // WriteThroughSupported
+                    d[24] = 1; // FlushCacheSupported
                     put(&d)
                 }
                 6 => {
-                    // STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR
-                    let vals: [u32; 7] = [28, 28, 64, 0, 4096, 0, 512];
+                    // StorageAccessAlignmentProperty -> STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR (28 bytes)
+                    let vals: [u32; 7] = [
+                        28,
+                        28,
+                        64, // BytesPerCacheLine
+                        0,  // BytesOffsetForCacheAlignment
+                        vol.logical_sector_size,
+                        vol.physical_sector_size,
+                        0,  // BytesOffsetForSectorAlignment
+                    ];
                     put(std::slice::from_raw_parts(vals.as_ptr() as *const u8, 28))
                 }
                 7 => {
-                    // DEVICE_SEEK_PENALTY_DESCRIPTOR: SSDs incur no seek penalty (true on Apple storage).
+                    // StorageDeviceSeekPenaltyProperty -> DEVICE_SEEK_PENALTY_DESCRIPTOR (12 bytes)
                     let mut d = [0u8; 12];
                     d[0..4].copy_from_slice(&12u32.to_le_bytes());
                     d[4..8].copy_from_slice(&12u32.to_le_bytes());
-                    d[8] = 0;
+                    d[8] = vol.incurs_seek_penalty as u8;
                     put(&d)
                 }
                 8 => {
-                    // DEVICE_TRIM_DESCRIPTOR: TRIM enabled.
+                    // StorageDeviceTrimProperty -> DEVICE_TRIM_DESCRIPTOR (12 bytes)
                     let mut d = [0u8; 12];
                     d[0..4].copy_from_slice(&12u32.to_le_bytes());
                     d[4..8].copy_from_slice(&12u32.to_le_bytes());
-                    d[8] = 1;
+                    d[8] = vol.trim_enabled as u8;
                     put(&d)
                 }
-                _ => {
-                    stub!("IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported");
-                    fail_not_supported()
+                9 => {
+                    // StorageDeviceWriteAggregationProperty -> DEVICE_WRITE_AGGREGATION_DESCRIPTOR (12 bytes)
+                    let mut d = [0u8; 12];
+                    d[0..4].copy_from_slice(&12u32.to_le_bytes());
+                    d[4..8].copy_from_slice(&12u32.to_le_bytes());
+                    d[8] = 1; // BenefitsFromWriteAggregation
+                    put(&d)
                 }
+                11 => {
+                    // StorageDevicePowerProperty -> DEVICE_POWER_DESCRIPTOR (20 bytes)
+                    let mut d = [0u8; 20];
+                    d[0..4].copy_from_slice(&20u32.to_le_bytes());
+                    d[4..8].copy_from_slice(&20u32.to_le_bytes());
+                    d[8] = 1; // DeviceAttentionSupported
+                    put(&d)
+                }
+                12 => {
+                    // StorageDeviceCopyOffloadProperty -> DEVICE_COPY_OFFLOAD_DESCRIPTOR (40 bytes)
+                    let mut d = [0u8; 40];
+                    d[0..4].copy_from_slice(&40u32.to_le_bytes());
+                    d[4..8].copy_from_slice(&40u32.to_le_bytes());
+                    d[8..12].copy_from_slice(&vol.max_transfer_length.to_le_bytes());
+                    put(&d)
+                }
+                14 => {
+                    // StorageDeviceMediumProductType -> STORAGE_MEDIUM_PRODUCT_TYPE_DESCRIPTOR (12 bytes)
+                    let mut d = [0u8; 12];
+                    d[0..4].copy_from_slice(&12u32.to_le_bytes());
+                    d[4..8].copy_from_slice(&12u32.to_le_bytes());
+                    // 0x04 = NVMe SSD / generic flash
+                    d[8..12].copy_from_slice(&(if vol.incurs_seek_penalty { 0u32 } else { 4u32 }).to_le_bytes());
+                    put(&d)
+                }
+                17 => {
+                    // StorageDeviceIoCapabilityProperty -> STORAGE_DEVICE_IO_CAPABILITY_DESCRIPTOR (16 bytes)
+                    let mut d = [0u8; 16];
+                    d[0..4].copy_from_slice(&16u32.to_le_bytes());
+                    d[4..8].copy_from_slice(&16u32.to_le_bytes());
+                    d[8..12].copy_from_slice(&64u32.to_le_bytes());  // LunMaxIoCount
+                    d[12..16].copy_from_slice(&256u32.to_le_bytes()); // AdapterMaxIoCount
+                    put(&d)
+                }
+                _ => fail_not_supported(),
             }
         }
         IOCTL_STORAGE_GET_DEVICE_NUMBER => {
-            // STORAGE_DEVICE_NUMBER { DeviceType=FILE_DEVICE_DISK(7), DeviceNumber=0, PartitionNumber=1 }
-            let vals: [u32; 3] = [7, 0, 1];
-            put(std::slice::from_raw_parts(vals.as_ptr() as *const u8, 12))
+            let vol = query_volume_storage_info(&f);
+            // STORAGE_DEVICE_NUMBER { DeviceType=FILE_DEVICE_DISK(7), DeviceNumber, PartitionNumber }
+            let vals: [u32; 3] = [7, vol.disk_number, vol.partition_number];
+            put_exact(std::slice::from_raw_parts(vals.as_ptr() as *const u8, 12))
+        }
+        IOCTL_STORAGE_CHECK_VERIFY | IOCTL_STORAGE_CHECK_VERIFY2 | IOCTL_DISK_CHECK_VERIFY => {
+            if out_len >= 4 && !out8.is_null() {
+                put_exact(&0u32.to_le_bytes())
+            } else {
+                put_exact(&[])
+            }
+        }
+        IOCTL_STORAGE_GET_MEDIA_TYPES_EX => {
+            let vol = query_volume_storage_info(&f);
+            // GET_MEDIA_TYPES (8 byte header + 1 DEVICE_MEDIA_INFO = 32 bytes -> 40 bytes)
+            let bps = vol.logical_sector_size.max(512);
+            let cyls = (vol.volume_size_bytes / (bps as u64 * 255 * 63)).max(1);
+            let mut d = [0u8; 40];
+            d[0..4].copy_from_slice(&7u32.to_le_bytes()); // FILE_DEVICE_DISK
+            d[4..8].copy_from_slice(&1u32.to_le_bytes()); // MediaInfoCount = 1
+            d[8..16].copy_from_slice(&cyls.to_le_bytes());
+            d[16..20].copy_from_slice(&12u32.to_le_bytes()); // FixedMedia
+            d[20..24].copy_from_slice(&255u32.to_le_bytes());
+            d[24..28].copy_from_slice(&63u32.to_le_bytes());
+            d[28..32].copy_from_slice(&bps.to_le_bytes());
+            d[32..36].copy_from_slice(&1u32.to_le_bytes()); // NumberMediaSides
+            d[36..40].copy_from_slice(&(0x2u32 | if vol.writable { 0x4 } else { 0 }).to_le_bytes());
+            put(&d)
+        }
+        IOCTL_STORAGE_GET_HOTPLUG_INFO => {
+            let vol = query_volume_storage_info(&f);
+            // STORAGE_HOTPLUG_INFO (8 bytes)
+            let mut d = [0u8; 8];
+            d[0..4].copy_from_slice(&8u32.to_le_bytes());
+            d[4] = vol.removable as u8;
+            d[5] = 0; // MediaHotplug
+            d[6] = vol.removable as u8; // DeviceHotplug
+            d[7] = 0; // WriteCacheEnableOverride
+            put_exact(&d)
         }
         IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS => {
-            // VOLUME_DISK_EXTENTS { NumberOfDiskExtents=1, pad, DISK_EXTENT{ DiskNumber=0, Start=0, Length } }
+            let vol = query_volume_storage_info(&f);
+            // VOLUME_DISK_EXTENTS { NumberOfDiskExtents=1, pad, DISK_EXTENT{ DiskNumber, pad, StartingOffset, ExtentLength } }
             let mut d = [0u8; 32];
             d[0..4].copy_from_slice(&1u32.to_le_bytes());
-            d[24..32].copy_from_slice(&(1u64 << 40).to_le_bytes());
+            d[8..12].copy_from_slice(&vol.disk_number.to_le_bytes());
+            d[16..24].copy_from_slice(&vol.partition_offset.to_le_bytes());
+            d[24..32].copy_from_slice(&vol.volume_size_bytes.to_le_bytes());
             put(&d)
         }
-        IOCTL_DISK_GET_DRIVE_GEOMETRY => {
-            // DISK_GEOMETRY: Cylinders, MediaType=FixedMedia(12), TracksPerCylinder, SectorsPerTrack, BytesPerSector
-            let mut d = [0u8; 24];
-            d[0..8].copy_from_slice(&(1u64 << 20).to_le_bytes());
-            d[8..12].copy_from_slice(&12u32.to_le_bytes());
+        IOCTL_VOLUME_IS_OFFLINE => {
+            // Microsoft Learn: succeeds if the volume is offline; fails with ERROR_INVALID_FUNCTION if online.
+            set_err(err::ERROR_INVALID_FUNCTION);
+            FALSE
+        }
+        IOCTL_DISK_GET_DRIVE_GEOMETRY | IOCTL_DISK_GET_DRIVE_GEOMETRY_EX => {
+            let vol = query_volume_storage_info(&f);
+            let bps = vol.logical_sector_size.max(512);
+            let cyls = (vol.volume_size_bytes / (bps as u64 * 255 * 63)).max(1);
+            let mut d = [0u8; 32];
+            d[0..8].copy_from_slice(&cyls.to_le_bytes());
+            d[8..12].copy_from_slice(&(if vol.removable { 11u32 } else { 12u32 }).to_le_bytes());
             d[12..16].copy_from_slice(&255u32.to_le_bytes());
             d[16..20].copy_from_slice(&63u32.to_le_bytes());
-            d[20..24].copy_from_slice(&512u32.to_le_bytes());
-            put(&d)
+            d[20..24].copy_from_slice(&bps.to_le_bytes());
+            if code == IOCTL_DISK_GET_DRIVE_GEOMETRY {
+                put_exact(&d[..24])
+            } else {
+                d[24..32].copy_from_slice(&(vol.volume_size_bytes as i64).to_le_bytes());
+                put(&d)
+            }
+        }
+        IOCTL_DISK_GET_LENGTH_INFO => {
+            let len = if f.kind == FileKind::Disk {
+                f.file().metadata().map(|m| m.len()).unwrap_or(0)
+            } else {
+                query_volume_storage_info(&f).volume_size_bytes
+            };
+            put_exact(&(len as i64).to_le_bytes())
+        }
+        IOCTL_DISK_IS_WRITABLE => {
+            let vol = query_volume_storage_info(&f);
+            if vol.writable {
+                put_exact(&[])
+            } else {
+                set_err(err::ERROR_WRITE_PROTECT);
+                FALSE
+            }
+        }
+        IOCTL_DISK_GET_PARTITION_INFO_EX => {
+            let vol = query_volume_storage_info(&f);
+            // PARTITION_INFORMATION_EX (144 bytes): PartitionStyle=PARTITION_STYLE_GPT(1)
+            let mut d = [0u8; 144];
+            d[0..4].copy_from_slice(&1u32.to_le_bytes()); // PARTITION_STYLE_GPT
+            d[8..16].copy_from_slice(&(vol.partition_offset as i64).to_le_bytes());
+            d[16..24].copy_from_slice(&(vol.volume_size_bytes as i64).to_le_bytes());
+            d[24..28].copy_from_slice(&vol.partition_number.to_le_bytes());
+            d[28] = 0; // RewritePartition
+            // GPT PartitionType GUID (Basic Data Partition: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7) @32..48
+            d[32..48].copy_from_slice(&[
+                0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+            ]);
+            put_exact(&d)
+        }
+        FSCTL_GET_REPARSE_POINT => {
+            let Some(ref p) = f.host_path else {
+                set_err(ERROR_NOT_A_REPARSE_POINT);
+                return FALSE;
+            };
+            let Ok(target) = std::fs::read_link(p) else {
+                set_err(ERROR_NOT_A_REPARSE_POINT);
+                return FALSE;
+            };
+            let target_str = target.to_string_lossy().replace('/', "\\");
+            let flags: u32 = if target.is_relative() { 1 } else { 0 }; // SYMLINK_FLAG_RELATIVE
+            let sub_name = if target.is_relative() {
+                target_str.clone()
+            } else {
+                format!("\\??\\{target_str}")
+            };
+            let sub_w = to_wide(&sub_name);
+            let prt_w = to_wide(&target_str);
+            let sub_bytes = sub_w.len() * 2;
+            let prt_bytes = prt_w.len() * 2;
+            let data_len = 12 + sub_bytes + prt_bytes;
+            let mut d = vec![0u8; 8 + data_len];
+            d[0..4].copy_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+            d[4..6].copy_from_slice(&(data_len as u16).to_le_bytes());
+            // SymbolicLinkReparseBuffer @8: SubstituteNameOffset(0), SubstituteNameLength, PrintNameOffset, PrintNameLength, Flags
+            d[8..10].copy_from_slice(&0u16.to_le_bytes());
+            d[10..12].copy_from_slice(&(sub_bytes as u16).to_le_bytes());
+            d[12..14].copy_from_slice(&(sub_bytes as u16).to_le_bytes());
+            d[14..16].copy_from_slice(&(prt_bytes as u16).to_le_bytes());
+            d[16..20].copy_from_slice(&flags.to_le_bytes());
+            for (i, &u) in sub_w.iter().enumerate() {
+                d[20 + i * 2..22 + i * 2].copy_from_slice(&u.to_le_bytes());
+            }
+            for (i, &u) in prt_w.iter().enumerate() {
+                d[20 + sub_bytes + i * 2..22 + sub_bytes + i * 2].copy_from_slice(&u.to_le_bytes());
+            }
+            put_exact(&d)
+        }
+        FSCTL_SET_SPARSE => {
+            if f.kind != FileKind::Disk || f.is_protected_native() {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            // APFS/HFS+ natively support sparse holes without an explicit toggle.
+            put_exact(&[])
+        }
+        FSCTL_QUERY_ALLOCATED_RANGES => {
+            if inp.is_null() || in_len < 16 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let req_off = std::ptr::read_unaligned(inp as *const i64);
+            let req_len = std::ptr::read_unaligned((inp as *const u8).add(8) as *const i64);
+            if req_off < 0 || req_len < 0 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let file_len = f.file().metadata().map(|m| m.len() as i64).unwrap_or(0);
+            let range_end = req_off.saturating_add(req_len).min(file_len);
+            if req_off >= range_end {
+                return put_exact(&[]);
+            }
+            // Query real allocated ranges via SEEK_DATA/SEEK_HOLE (preserving file offset).
+            let saved_pos = libc::lseek(f.fd(), 0, libc::SEEK_CUR);
+            let mut ranges: Vec<(i64, i64)> = Vec::new();
+            let mut cur = req_off;
+            while cur < range_end {
+                let data_start = libc::lseek(f.fd(), cur, libc::SEEK_DATA);
+                if data_start < 0 || data_start >= range_end {
+                    break;
+                }
+                let hole_start = libc::lseek(f.fd(), data_start, libc::SEEK_HOLE);
+                let end = if hole_start < 0 || hole_start > range_end { range_end } else { hole_start };
+                if end > data_start {
+                    ranges.push((data_start, end - data_start));
+                }
+                if hole_start < 0 || end >= range_end {
+                    break;
+                }
+                cur = end;
+            }
+            if saved_pos >= 0 {
+                libc::lseek(f.fd(), saved_pos, libc::SEEK_SET);
+            }
+            let max_entries = (out_len as usize) / 16;
+            let count = ranges.len().min(max_entries);
+            let mut buf = Vec::with_capacity(count * 16);
+            for &(o, l) in &ranges[..count] {
+                buf.extend_from_slice(&o.to_le_bytes());
+                buf.extend_from_slice(&l.to_le_bytes());
+            }
+            if !buf.is_empty() && out8.is_null() {
+                set_err(err::ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            if !buf.is_empty() {
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), out8, buf.len());
+            }
+            if !ret.is_null() {
+                std::ptr::write_unaligned(ret, buf.len() as u32);
+            }
+            if !ov.is_null() {
+                complete_overlapped(ov, STATUS_SUCCESS, buf.len());
+            }
+            if count < ranges.len() {
+                set_err(err::ERROR_MORE_DATA);
+                return FALSE;
+            }
+            TRUE
+        }
+        FSCTL_SET_ZERO_DATA => {
+            if inp.is_null() || in_len < 16 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            if f.is_protected_native() {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+            let start = std::ptr::read_unaligned(inp as *const i64);
+            let beyond = std::ptr::read_unaligned((inp as *const u8).add(8) as *const i64);
+            if start < 0 || beyond < start {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let file_len = f.file().metadata().map(|m| m.len() as i64).unwrap_or(0);
+            let end = beyond.min(file_len);
+            if end > start {
+                let zeros = [0u8; 4096];
+                let mut pos = start as u64;
+                let end_u = end as u64;
+                while pos < end_u {
+                    let chunk = ((end_u - pos) as usize).min(zeros.len());
+                    if let Err(e) = f.file().write_all_at(&zeros[..chunk], pos) {
+                        set_err(io_err(&e));
+                        return FALSE;
+                    }
+                    pos += chunk as u64;
+                }
+            }
+            put_exact(&[])
+        }
+        FSCTL_GET_COMPRESSION => {
+            // COMPRESSION_FORMAT_NONE (0)
+            put_exact(&0u16.to_le_bytes())
+        }
+        FSCTL_SET_COMPRESSION => {
+            if inp.is_null() || in_len < 2 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let fmt = std::ptr::read_unaligned(inp as *const u16);
+            if fmt == 0 {
+                put_exact(&[])
+            } else {
+                set_err(err::ERROR_NOT_SUPPORTED);
+                FALSE
+            }
+        }
+        FSCTL_IS_VOLUME_MOUNTED => put_exact(&[]),
+        FSCTL_GET_NTFS_VOLUME_DATA => {
+            let vol = query_volume_storage_info(&f);
+            let bps = vol.logical_sector_size.max(512) as u64;
+            let bpc = vol.cluster_size.max(bps as u32) as u64;
+            let total_sectors = vol.volume_size_bytes / bps;
+            let total_clusters = vol.volume_size_bytes / bpc;
+            let free_clusters = vol.volume_free_bytes / bpc;
+            // NTFS_VOLUME_DATA_BUFFER (96 bytes)
+            let mut d = [0u8; 96];
+            d[0..8].copy_from_slice(&vol.volume_serial.to_le_bytes());
+            d[8..16].copy_from_slice(&(total_sectors as i64).to_le_bytes());
+            d[16..24].copy_from_slice(&(total_clusters as i64).to_le_bytes());
+            d[24..32].copy_from_slice(&(free_clusters as i64).to_le_bytes());
+            d[40..44].copy_from_slice(&(bps as u32).to_le_bytes());
+            d[44..48].copy_from_slice(&(bpc as u32).to_le_bytes());
+            d[48..52].copy_from_slice(&1024u32.to_le_bytes()); // BytesPerFileRecordSegment
+            d[52..56].copy_from_slice(&0u32.to_le_bytes()); // ClustersPerFileRecordSegment
+            put_exact(&d)
+        }
+        FSCTL_LOCK_VOLUME | FSCTL_UNLOCK_VOLUME => {
+            // Locking/dismounting a mounted OS volume requires exclusive admin access on Windows.
+            set_err(err::ERROR_ACCESS_DENIED);
+            FALSE
         }
         _ => {
-            stub!("DeviceIoControl code {code:#x} unsupported");
-            fail_not_supported()
+            // Windows I/O Manager returns STATUS_INVALID_DEVICE_REQUEST -> ERROR_INVALID_FUNCTION (1)
+            // for control codes not handled by the target file/device driver.
+            log::debug!("DeviceIoControl: unrecognized control code {code:#x} -> ERROR_INVALID_FUNCTION");
+            set_err(err::ERROR_INVALID_FUNCTION);
+            FALSE
         }
     }
 }
@@ -9973,6 +11508,350 @@ mod tests {
         }
 
         drop(target_file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alloc_free_attach_console_lifecycle() {
+        unsafe {
+            assert_eq!(FreeConsole(), TRUE);
+            assert_eq!(AllocConsole(), TRUE);
+            // Second AllocConsole while attached fails with ERROR_ACCESS_DENIED.
+            assert_eq!(AllocConsole(), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+            let h_in = GetStdHandle(STD_INPUT_HANDLE);
+            let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+            assert!(is_console(h_in));
+            assert!(is_console(h_out));
+
+            let mut mode = 0u32;
+            assert_eq!(SetConsoleMode(h_out, 0x0005), TRUE);
+            assert_eq!(GetConsoleMode(h_out, &mut mode), TRUE);
+            assert_eq!(mode, 0x0005);
+
+            assert_eq!(SetConsoleCP(1252), TRUE);
+            assert_eq!(GetConsoleCP(), 1252);
+            assert_eq!(SetConsoleOutputCP(65001), TRUE);
+            assert_eq!(GetConsoleOutputCP(), 65001);
+            assert_eq!(SetConsoleCP(999999), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(SetConsoleCP(ACP), TRUE);
+
+            assert_eq!(FreeConsole(), TRUE);
+            // AttachConsole with bogus pid fails with ERROR_INVALID_HANDLE.
+            assert_eq!(AttachConsole(0xDEAD_BEEF), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+            // AttachConsole to parent succeeds once, then fails with ERROR_ACCESS_DENIED.
+            assert_eq!(AttachConsole(0xFFFF_FFFF), TRUE);
+            assert_eq!(AttachConsole(0xFFFF_FFFF), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(FreeConsole(), TRUE);
+        }
+    }
+
+    #[test]
+    fn file_info_by_handle_ex_all_classes() {
+        let dir = std::env::temp_dir().join(format!("win32_rt_finfo_ex_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_p = dir.join("sample.dat");
+        std::fs::write(&file_p, b"0123456789abcdef").unwrap();
+        let link_p = dir.join("sym.dat");
+        let _ = std::os::unix::fs::symlink(&file_p, &link_p);
+        crate::path::add_mount("K:\\", &dir);
+
+        unsafe {
+            let wf = to_wide_z("K:\\sample.dat");
+            let h = CreateFileW(wf.as_ptr(), GENERIC_READ | GENERIC_WRITE, 7, std::ptr::null_mut(), OPEN_EXISTING, 0x80, std::ptr::null_mut());
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+
+            // Class 7: FileStreamInfo -> "::$DATA"
+            let mut sbuf = [0u8; 64];
+            assert_eq!(GetFileInformationByHandleEx(h, 7, sbuf.as_mut_ptr(), sbuf.len() as u32), TRUE);
+            let name_len = (sbuf.as_ptr().add(4) as *const u32).read_unaligned() as usize;
+            let stream_sz = (sbuf.as_ptr().add(8) as *const u64).read_unaligned();
+            let sname_u16 = crate::strings::read_wide_slice(sbuf.as_ptr().add(24) as *const u16, name_len / 2);
+            assert_eq!(String::from_utf16_lossy(&sname_u16), "::$DATA");
+            assert_eq!(stream_sz, 16);
+
+            // Class 8: FileCompressionInfo
+            let mut cbuf = [0u8; 16];
+            assert_eq!(GetFileInformationByHandleEx(h, 8, cbuf.as_mut_ptr(), 16), TRUE);
+            assert_eq!((cbuf.as_ptr() as *const u64).read_unaligned(), 16);
+            assert_eq!((cbuf.as_ptr().add(8) as *const u16).read_unaligned(), 0);
+
+            // Class 13: FileRemoteProtocolInfo fails on local volume with ERROR_INVALID_PARAMETER
+            let mut rbuf = [0u8; 128];
+            assert_eq!(GetFileInformationByHandleEx(h, 13, rbuf.as_mut_ptr(), 128), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Class 16: FileStorageInfo reports real volume sector sizes (>= 512)
+            let mut stbuf = [0u8; 28];
+            assert_eq!(GetFileInformationByHandleEx(h, 16, stbuf.as_mut_ptr(), 28), TRUE);
+            let logical_bps = (stbuf.as_ptr() as *const u32).read_unaligned();
+            let phys_bps = (stbuf.as_ptr().add(4) as *const u32).read_unaligned();
+            assert!(logical_bps >= 512 && phys_bps >= 512);
+
+            // Class 23: FileCaseSensitiveInfo Get & Set
+            let mut cs = 0u32;
+            assert_eq!(GetFileInformationByHandleEx(h, 23, &mut cs as *mut u32 as *mut u8, 4), TRUE);
+            assert!(cs == 0 || cs == 1);
+            assert_eq!(SetFileInformationByHandle(h, 23, &cs as *const u32 as *const u8, 4), TRUE);
+            let flipped = cs ^ 1;
+            assert_eq!(SetFileInformationByHandle(h, 23, &flipped as *const u32 as *const u8, 4), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // Class 24: FileNormalizedNameInfo
+            let mut nbuf = [0u8; 128];
+            assert_eq!(GetFileInformationByHandleEx(h, 24, nbuf.as_mut_ptr(), 128), TRUE);
+            let nlen = (nbuf.as_ptr() as *const u32).read_unaligned() as usize;
+            let nstr = String::from_utf16_lossy(&crate::strings::read_wide_slice(nbuf.as_ptr().add(4) as *const u16, nlen / 2));
+            assert_eq!(nstr, "\\sample.dat");
+
+            // Class 12: FileIoPriorityHintInfo (Set)
+            let prio_low = 1u32;
+            assert_eq!(SetFileInformationByHandle(h, 12, &prio_low as *const u32 as *const u8, 4), TRUE);
+            let prio_bad = 9u32;
+            assert_eq!(SetFileInformationByHandle(h, 12, &prio_bad as *const u32 as *const u8, 4), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Invalid class fails with ERROR_INVALID_PARAMETER
+            assert_eq!(GetFileInformationByHandleEx(h, 99, nbuf.as_mut_ptr(), 64), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(SetFileInformationByHandle(h, 99, nbuf.as_ptr(), 64), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Directory enumeration classes 10/11 (IdBoth), 14/15 (Full), 19/20 (IdExtd)
+            let wd = to_wide_z("K:\\");
+            let hd = CreateFileW(wd.as_ptr(), GENERIC_READ, 7, std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut());
+            assert_ne!(hd, INVALID_HANDLE_VALUE);
+            for (restart_cls, next_cls, name_off) in [(11u32, 10u32, 104usize), (15, 14, 68), (20, 19, 88)] {
+                let mut dbuf = vec![0u8; 4096];
+                let mut names = Vec::new();
+                let mut cls = restart_cls;
+                while GetFileInformationByHandleEx(hd, cls, dbuf.as_mut_ptr(), dbuf.len() as u32) != 0 {
+                    let mut off = 0usize;
+                    loop {
+                        let next_off = (dbuf.as_ptr().add(off) as *const u32).read_unaligned() as usize;
+                        let flen = (dbuf.as_ptr().add(off + 60) as *const u32).read_unaligned() as usize;
+                        let u = crate::strings::read_wide_slice(dbuf.as_ptr().add(off + name_off) as *const u16, flen / 2);
+                        names.push(String::from_utf16_lossy(&u));
+                        if next_off == 0 {
+                            break;
+                        }
+                        off += next_off;
+                    }
+                    cls = next_cls;
+                }
+                assert_eq!(teb::last_error(), err::ERROR_NO_MORE_FILES);
+                assert!(names.iter().any(|n| n == "sample.dat"), "class {restart_cls} missed sample.dat: {names:?}");
+            }
+
+            // Class 22: FileRenameInfoEx relative to RootDirectory
+            let mut ren = vec![0u8; 64];
+            (ren.as_mut_ptr() as *mut u32).write_unaligned(1); // FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+            (ren.as_mut_ptr().add(8) as *mut HANDLE).write_unaligned(hd);
+            let new_w = to_wide("renamed.dat");
+            (ren.as_mut_ptr().add(16) as *mut u32).write_unaligned((new_w.len() * 2) as u32);
+            std::ptr::copy_nonoverlapping(new_w.as_ptr() as *const u8, ren.as_mut_ptr().add(20), new_w.len() * 2);
+            assert_eq!(SetFileInformationByHandle(h, 22, ren.as_ptr(), ren.len() as u32), TRUE);
+            assert!(dir.join("renamed.dat").exists());
+
+            crate::kernel32::threads::CloseHandle(h);
+            crate::kernel32::threads::CloseHandle(hd);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_file_ex_delay_until_reboot_and_null_dst() {
+        let dir = std::env::temp_dir().join(format!("win32_rt_moveex_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        crate::path::add_mount("R:\\", &dir);
+
+        unsafe {
+            let src_w = to_wide_z("R:\\a.txt");
+            let dst_w = to_wide_z("R:\\b.txt");
+            // MOVEFILE_DELAY_UNTIL_REBOOT as non-admin returns FALSE + ERROR_ACCESS_DENIED.
+            assert_eq!(MoveFileExW(src_w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExA(b"R:\\a.txt\0".as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            // Combining MOVEFILE_DELAY_UNTIL_REBOOT with MOVEFILE_COPY_ALLOWED -> ERROR_INVALID_PARAMETER.
+            assert_eq!(
+                MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_COPY_ALLOWED),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            // NULL dst without MOVEFILE_DELAY_UNTIL_REBOOT -> ERROR_INVALID_PARAMETER.
+            assert_eq!(MoveFileExW(src_w.as_ptr(), std::ptr::null(), 0), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(MoveFileExA(b"R:\\a.txt\0".as_ptr(), std::ptr::null(), 0), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            // Normal move with MOVEFILE_WRITE_THROUGH succeeds.
+            assert_eq!(MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH), TRUE);
+            assert!(dir.join("b.txt").exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn map_view_of_file3_process_handle_semantics() {
+        unsafe {
+            let hmap = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0x04, 0, 4096, std::ptr::null());
+            assert!(!hmap.is_null());
+
+            // Own process handle from OpenProcess succeeds.
+            let h_self = crate::kernel32::process::OpenProcess(0x001F_0FFF, FALSE, std::process::id());
+            assert!(!h_self.is_null());
+            let p = MapViewOfFile3(hmap, h_self, std::ptr::null_mut(), 0, 4096, 0, 0x04, std::ptr::null_mut(), 0);
+            assert!(!p.is_null());
+            assert_eq!(UnmapViewOfFile(p), TRUE);
+            crate::kernel32::threads::CloseHandle(h_self);
+
+            // Bogus handle fails with ERROR_INVALID_HANDLE.
+            let bad = MapViewOfFile3(hmap, 0x12345 as HANDLE, std::ptr::null_mut(), 0, 4096, 0, 0x04, std::ptr::null_mut(), 0);
+            assert!(bad.is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            crate::kernel32::threads::CloseHandle(hmap);
+        }
+    }
+
+    #[test]
+    fn device_io_control_real_storage_and_fsctls() {
+        let dir = std::env::temp_dir().join(format!("win32_rt_ioctl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_p = dir.join("disk.bin");
+        std::fs::write(&file_p, vec![0x5Au8; 8192]).unwrap();
+        let link_p = dir.join("link.bin");
+        std::os::unix::fs::symlink(&file_p, &link_p).unwrap();
+        crate::path::add_mount("V:\\", &dir);
+
+        unsafe {
+            let dev_w = to_wide_z("\\\\.\\V:");
+            let hdev = CreateFileW(dev_w.as_ptr(), 0, 3, std::ptr::null_mut(), OPEN_EXISTING, 0, std::ptr::null_mut());
+            assert_ne!(hdev, INVALID_HANDLE_VALUE);
+
+            // IOCTL_STORAGE_QUERY_PROPERTY: StorageDeviceProperty (0), WriteCache (4), IoCapability (17)
+            for (prop, min_sz) in [(0u32, 40u32), (1, 32), (4, 28), (6, 28), (7, 12), (8, 12), (17, 16)] {
+                let query = [prop, 0u32, 0u32]; // PropertyStandardQuery
+                let mut out = [0u8; 256];
+                let mut ret = 0u32;
+                assert_eq!(
+                    DeviceIoControl(
+                        hdev,
+                        IOCTL_STORAGE_QUERY_PROPERTY,
+                        query.as_ptr() as *const c_void,
+                        12,
+                        out.as_mut_ptr() as *mut c_void,
+                        out.len() as u32,
+                        &mut ret,
+                        std::ptr::null_mut(),
+                    ),
+                    TRUE,
+                    "IOCTL_STORAGE_QUERY_PROPERTY prop={prop}"
+                );
+                assert!(ret >= min_sz, "prop={prop} ret={ret} < {min_sz}");
+            }
+
+            // Unsupported property ID returns FALSE + ERROR_NOT_SUPPORTED.
+            let bad_q = [50u32, 0, 0];
+            let mut out = [0u8; 64];
+            let mut ret = 0u32;
+            assert_eq!(
+                DeviceIoControl(
+                    hdev,
+                    IOCTL_STORAGE_QUERY_PROPERTY,
+                    bad_q.as_ptr() as *const c_void,
+                    12,
+                    out.as_mut_ptr() as *mut c_void,
+                    64,
+                    &mut ret,
+                    std::ptr::null_mut(),
+                ),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS returns real volume size > 0
+            let mut ext = [0u8; 32];
+            assert_eq!(
+                DeviceIoControl(hdev, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, std::ptr::null(), 0, ext.as_mut_ptr() as _, 32, &mut ret, std::ptr::null_mut()),
+                TRUE
+            );
+            let vol_len = (ext.as_ptr().add(24) as *const u64).read_unaligned();
+            assert!(vol_len > 0);
+
+            // IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO, FSCTL_GET_NTFS_VOLUME_DATA
+            let mut gex = [0u8; 32];
+            assert_eq!(
+                DeviceIoControl(hdev, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, std::ptr::null(), 0, gex.as_mut_ptr() as _, 32, &mut ret, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!((gex.as_ptr().add(24) as *const i64).read_unaligned() as u64, vol_len);
+
+            let mut ntfs = [0u8; 96];
+            assert_eq!(
+                DeviceIoControl(hdev, FSCTL_GET_NTFS_VOLUME_DATA, std::ptr::null(), 0, ntfs.as_mut_ptr() as _, 96, &mut ret, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(ret, 96);
+
+            // Unrecognized IOCTL returns FALSE + ERROR_INVALID_FUNCTION
+            assert_eq!(
+                DeviceIoControl(hdev, 0x00FF_1234, std::ptr::null(), 0, std::ptr::null_mut(), 0, &mut ret, std::ptr::null_mut()),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_FUNCTION);
+            crate::kernel32::threads::CloseHandle(hdev);
+
+            // File-level FSCTLs: FSCTL_SET_ZERO_DATA, FSCTL_QUERY_ALLOCATED_RANGES, FSCTL_GET_REPARSE_POINT
+            let wf = to_wide_z("V:\\disk.bin");
+            let hf = CreateFileW(wf.as_ptr(), GENERIC_READ | GENERIC_WRITE, 7, std::ptr::null_mut(), OPEN_EXISTING, 0x80, std::ptr::null_mut());
+            assert_ne!(hf, INVALID_HANDLE_VALUE);
+            // Non-reparse point fails with ERROR_NOT_A_REPARSE_POINT (4390).
+            assert_eq!(
+                DeviceIoControl(hf, FSCTL_GET_REPARSE_POINT, std::ptr::null(), 0, out.as_mut_ptr() as _, 64, &mut ret, std::ptr::null_mut()),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), ERROR_NOT_A_REPARSE_POINT);
+
+            let zero_req: [i64; 2] = [100, 200];
+            assert_eq!(
+                DeviceIoControl(hf, FSCTL_SET_ZERO_DATA, zero_req.as_ptr() as _, 16, std::ptr::null_mut(), 0, &mut ret, std::ptr::null_mut()),
+                TRUE
+            );
+            let data = std::fs::read(&file_p).unwrap();
+            assert_eq!(data[99], 0x5A);
+            assert!(data[100..200].iter().all(|&b| b == 0));
+            assert_eq!(data[200], 0x5A);
+
+            let q_range: [i64; 2] = [0, 8192];
+            let mut r_out = [0i64; 4];
+            assert_eq!(
+                DeviceIoControl(hf, FSCTL_QUERY_ALLOCATED_RANGES, q_range.as_ptr() as _, 16, r_out.as_mut_ptr() as _, 32, &mut ret, std::ptr::null_mut()),
+                TRUE
+            );
+            assert!(ret >= 16 && r_out[1] > 0);
+            crate::kernel32::threads::CloseHandle(hf);
+
+            // Symlink FSCTL_GET_REPARSE_POINT returns valid IO_REPARSE_TAG_SYMLINK buffer.
+            let wl = to_wide_z("V:\\link.bin");
+            let hl = CreateFileW(wl.as_ptr(), GENERIC_READ, 7, std::ptr::null_mut(), OPEN_EXISTING, 0x80, std::ptr::null_mut());
+            assert_ne!(hl, INVALID_HANDLE_VALUE);
+            let mut rp = [0u8; 512];
+            assert_eq!(
+                DeviceIoControl(hl, FSCTL_GET_REPARSE_POINT, std::ptr::null(), 0, rp.as_mut_ptr() as _, 512, &mut ret, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!((rp.as_ptr() as *const u32).read_unaligned(), IO_REPARSE_TAG_SYMLINK);
+            crate::kernel32::threads::CloseHandle(hl);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
