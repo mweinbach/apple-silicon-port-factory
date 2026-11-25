@@ -421,6 +421,7 @@ struct VerifiedSigner {
 
 struct VerifiedAuthenticode {
     certs: Vec<VerifiedCert>,
+    all_certs_der: Vec<Vec<u8>>,
     signer: VerifiedSigner,
 }
 
@@ -663,6 +664,7 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         spki_unused_bits: c.spki_unused_bits,
         self_signed: c.issuer_raw == c.subject_raw,
     };
+    let signer_idx = cur_idx;
     let mut chain = vec![to_verified(&certs[cur_idx])];
     let mut visited = vec![cur_idx];
     for _ in 0..16 {
@@ -700,7 +702,18 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         cur_idx = parent_idx;
     }
 
-    Ok(VerifiedAuthenticode { certs: chain, signer })
+    let mut all_certs_der: Vec<Vec<u8>> = Vec::with_capacity(certs.len());
+    all_certs_der.push(certs[signer_idx].raw_der.to_vec());
+    for (i, c) in certs.iter().enumerate() {
+        if i != signer_idx {
+            all_certs_der.push(c.raw_der.to_vec());
+        }
+    }
+    Ok(VerifiedAuthenticode {
+        certs: chain,
+        all_certs_der,
+        signer,
+    })
 }
 
 pub(crate) struct ParsedSignerInfo {
@@ -1782,9 +1795,24 @@ fn verify_standalone_pkcs7(
             }
         })
         .collect();
-    let all_certs_der: Vec<Vec<u8>> = chain_certs.iter().map(|c| c.raw_der.clone()).collect();
+    // Preserve every embedded PKCS#7 certificate (signer first, followed by all other embedded
+    // certificates) in `all_certs_der` as intermediate candidates for `CertGetCertificateChain`
+    // so cross-signed / alternative issuer paths remain available when a self-signed CA variant
+    // is untrusted. `CertGetCertificateChain` cryptographically authenticates the issuer path
+    // and excludes unrelated certificates; `verified.certs` holds the primary display chain.
+    let mut all_certs_der: Vec<Vec<u8>> = Vec::with_capacity(certs.len());
+    all_certs_der.push(certs[signer_idx].raw_der.to_vec());
+    for (i, c) in certs.iter().enumerate() {
+        if i != signer_idx {
+            all_certs_der.push(c.raw_der.to_vec());
+        }
+    }
     Ok(StandalonePkcs7Result {
-        verified: VerifiedAuthenticode { certs: chain_certs, signer },
+        verified: VerifiedAuthenticode {
+            certs: chain_certs,
+            all_certs_der: all_certs_der.clone(),
+            signer,
+        },
         encap_content_type_oid,
         encap_content_der,
         all_certs_der,
@@ -2513,11 +2541,9 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             match verify_pe_authenticode(&bytes) {
                 Ok(verified) => {
                     let ncerts = verified.certs.len();
-                    let all_der: Vec<Vec<u8>> =
-                        verified.certs.iter().map(|c| c.raw_der.clone()).collect();
                     let chain_rc = verify_pkcs7_signer_chain(
                         &verified,
-                        &all_der,
+                        &verified.all_certs_der,
                         chain_policy_oid,
                         policy_extra,
                         chain_flags,
@@ -4492,6 +4518,313 @@ mod tests {
             t_ci.elapsed() < std::time::Duration::from_millis(200),
             "outer ContentInfo child cap must reject immediately before collecting 200k TLVs"
         );
+    }
+
+    #[test]
+    fn standalone_pkcs7_preserves_cross_signed_issuer_for_chain_building() {
+        use crate::misc::bcrypt::{Digest, RsaKey};
+
+        fn der_tlv(tag: u8, val: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if val.len() < 0x80 {
+                out.push(val.len() as u8);
+            } else if val.len() <= 0xFF {
+                out.push(0x81);
+                out.push(val.len() as u8);
+            } else {
+                out.push(0x82);
+                out.push((val.len() >> 8) as u8);
+                out.push((val.len() & 0xFF) as u8);
+            }
+            out.extend_from_slice(val);
+            out
+        }
+
+        let root_key = RsaKey::generate(2048).expect("gen root RSA-2048");
+        let ca_key = RsaKey::generate(2048).expect("gen CA RSA-2048");
+        let leaf_key = RsaKey::generate(2048).expect("gen leaf RSA-2048");
+
+        let der_uint = |bytes: &[u8]| -> Vec<u8> {
+            let trimmed = match bytes.iter().position(|&b| b != 0) {
+                Some(i) => &bytes[i..],
+                None => &[0],
+            };
+            let mut v = Vec::with_capacity(trimmed.len() + 1);
+            if (trimmed[0] & 0x80) != 0 {
+                v.push(0);
+            }
+            v.extend_from_slice(trimmed);
+            der_tlv(0x02, &v)
+        };
+        let mk_spki = |k: &RsaKey| -> Vec<u8> {
+            let mut rsa_pub_body = der_uint(&k.pub_key.n);
+            rsa_pub_body.extend_from_slice(&der_uint(&k.pub_key.e));
+            let rsa_pub_seq = der_tlv(0x30, &rsa_pub_body);
+            let mut bs = vec![0u8];
+            bs.extend_from_slice(&rsa_pub_seq);
+            let mut alg_body = der_tlv(0x06, OID_RSA_ENCRYPTION);
+            alg_body.extend_from_slice(&der_tlv(0x05, &[]));
+            let mut spki_body = der_tlv(0x30, &alg_body);
+            spki_body.extend_from_slice(&der_tlv(0x03, &bs));
+            der_tlv(0x30, &spki_body)
+        };
+        let mk_dn = |cn: &str| -> Vec<u8> {
+            let mut atv = der_tlv(0x06, &[0x55, 0x04, 0x03]);
+            atv.extend_from_slice(&der_tlv(0x0C, cn.as_bytes()));
+            der_tlv(0x30, &der_tlv(0x31, &der_tlv(0x30, &atv)))
+        };
+        let sha256_rsa_alg = {
+            let mut a = der_tlv(0x06, OID_SHA256_WITH_RSA);
+            a.extend_from_slice(&der_tlv(0x05, &[]));
+            der_tlv(0x30, &a)
+        };
+        let sign_cert = |serial: u8,
+                         subj: &str,
+                         iss: &str,
+                         subj_key: &RsaKey,
+                         iss_key: &RsaKey,
+                         is_ca: bool|
+         -> Vec<u8> {
+            let mut val = der_tlv(0x17, b"240101000000Z");
+            val.extend_from_slice(&der_tlv(0x17, b"350101000000Z"));
+            let mut exts = Vec::new();
+            let mut bc_val = Vec::new();
+            if is_ca {
+                bc_val.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+            }
+            let mut bc = der_tlv(0x06, &[0x55, 0x1D, 0x13]);
+            bc.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+            bc.extend_from_slice(&der_tlv(0x04, &der_tlv(0x30, &bc_val)));
+            exts.extend_from_slice(&der_tlv(0x30, &bc));
+            if is_ca {
+                let mut ku = der_tlv(0x06, &[0x55, 0x1D, 0x0F]);
+                ku.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+                ku.extend_from_slice(&der_tlv(0x04, &der_tlv(0x03, &[0x02, 0x04]))); // keyCertSign
+                exts.extend_from_slice(&der_tlv(0x30, &ku));
+            } else {
+                let mut eku = der_tlv(0x06, &[0x55, 0x1D, 0x25]);
+                eku.extend_from_slice(&der_tlv(
+                    0x04,
+                    &der_tlv(0x30, &der_tlv(0x06, &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03])),
+                ));
+                exts.extend_from_slice(&der_tlv(0x30, &eku));
+            }
+            let mut tbs_body = der_tlv(0xA0, &der_tlv(0x02, &[0x02]));
+            tbs_body.extend_from_slice(&der_tlv(0x02, &[serial]));
+            tbs_body.extend_from_slice(&sha256_rsa_alg);
+            tbs_body.extend_from_slice(&mk_dn(iss));
+            tbs_body.extend_from_slice(&der_tlv(0x30, &val));
+            tbs_body.extend_from_slice(&mk_dn(subj));
+            tbs_body.extend_from_slice(&mk_spki(subj_key));
+            tbs_body.extend_from_slice(&der_tlv(0xA3, &der_tlv(0x30, &exts)));
+            let tbs = der_tlv(0x30, &tbs_body);
+            let tbs_hash = Digest::Sha256.hash(&tbs);
+            let sig = iss_key.sign_pkcs1(Some(Digest::Sha256), &tbs_hash).expect("sign cert");
+            let mut sig_bits = vec![0u8];
+            sig_bits.extend_from_slice(&sig);
+            let mut body = tbs;
+            body.extend_from_slice(&sha256_rsa_alg);
+            body.extend_from_slice(&der_tlv(0x03, &sig_bits));
+            der_tlv(0x30, &body)
+        };
+
+        let trusted_root = sign_cert(1, "CrossTrustedRoot", "CrossTrustedRoot", &root_key, &root_key, true);
+        let self_signed_ca = sign_cert(2, "CrossSubCA", "CrossSubCA", &ca_key, &ca_key, true);
+        let cross_signed_ca = sign_cert(3, "CrossSubCA", "CrossTrustedRoot", &ca_key, &root_key, true);
+        let leaf_cert = sign_cert(4, "CrossLeaf", "CrossSubCA", &leaf_key, &ca_key, false);
+
+        // Build CMS SignedData embedding [leaf_cert, self_signed_ca, cross_signed_ca]:
+        // self_signed_ca is untrusted, while cross_signed_ca leads to trusted_root.
+        let payload = b"cross-signed-chain-payload";
+        let payload_hash = Digest::Sha256.hash(payload);
+        let sig = leaf_key.sign_pkcs1(Some(Digest::Sha256), &payload_hash).expect("sign cms");
+        let sha256_alg = {
+            let mut a = der_tlv(0x06, OID_SHA256);
+            a.extend_from_slice(&der_tlv(0x05, &[]));
+            der_tlv(0x30, &a)
+        };
+        let rsa_alg = {
+            let mut a = der_tlv(0x06, OID_RSA_ENCRYPTION);
+            a.extend_from_slice(&der_tlv(0x05, &[]));
+            der_tlv(0x30, &a)
+        };
+        let ias = der_tlv(0x30, &[mk_dn("CrossSubCA"), der_tlv(0x02, &[4])].concat());
+        let signer_info = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[1]),
+                ias,
+                sha256_alg.clone(),
+                rsa_alg,
+                der_tlv(0x04, &sig),
+            ]
+            .concat(),
+        );
+        let eci = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x06, OID_DATA),
+                der_tlv(0xA0, &der_tlv(0x04, payload)),
+            ]
+            .concat(),
+        );
+        let certs_bag = der_tlv(0xA0, &[leaf_cert.clone(), self_signed_ca.clone(), cross_signed_ca.clone()].concat());
+        let signed_data = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[1]),
+                der_tlv(0x31, &sha256_alg),
+                eci,
+                certs_bag,
+                der_tlv(0x31, &signer_info),
+            ]
+            .concat(),
+        );
+        let p7_der = der_tlv(
+            0x30,
+            &[der_tlv(0x06, OID_SIGNED_DATA), der_tlv(0xA0, &signed_data)].concat(),
+        );
+
+        let parsed = verify_standalone_pkcs7(&p7_der, None).expect("standalone pkcs7 must verify");
+        assert!(
+            parsed.all_certs_der.iter().any(|c| c == &cross_signed_ca),
+            "all_certs_der must retain cross-signed issuer candidate alongside self-signed CA"
+        );
+
+        struct CrossCbCtx {
+            trust_err: u32,
+            chain_ders: Vec<Vec<u8>>,
+        }
+        unsafe extern "C" fn cross_cb(
+            _p_prov_data: u64,
+            _dw_step_error: u64,
+            _dw_reg_policy_settings: u64,
+            c_signer: u64,
+            rgp_signer: u64,
+            pv_policy_arg: u64,
+            _a7: u64,
+            _a8: u64,
+        ) -> u64 {
+            let ctx = &mut *(pv_policy_arg as *mut CrossCbCtx);
+            if c_signer == 1 && rgp_signer != 0 {
+                let sptr = *(rgp_signer as *const *const WtdGenericChainPolicySignerInfo);
+                if !sptr.is_null() {
+                    let sinfo = std::ptr::read_unaligned(sptr);
+                    if !sinfo.p_chain_context.is_null() {
+                        let cc = &*(sinfo.p_chain_context as *const CertChainContext);
+                        ctx.trust_err = cc.trust_status.dw_error_status;
+                        if cc.c_chain > 0 && !cc.rgp_chain.is_null() {
+                            let simple = &*(*cc.rgp_chain);
+                            for i in 0..simple.c_element as usize {
+                                let el = &*(*simple.rgp_element.add(i));
+                                let cert = &*el.p_cert_context;
+                                ctx.chain_ders.push(
+                                    std::slice::from_raw_parts(
+                                        cert.pb_cert_encoded,
+                                        cert.cb_cert_encoded as usize,
+                                    )
+                                    .to_vec(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if ctx.trust_err == 0 {
+                ERROR_SUCCESS as u32 as u64
+            } else {
+                0x800B_0109u64
+            }
+        }
+
+        unsafe {
+            let root_st = crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    root_st,
+                    X509_ASN_ENCODING,
+                    trusted_root.as_ptr(),
+                    trusted_root.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            let mut eng_cfg = [0u8; 0x60];
+            std::ptr::write_unaligned(eng_cfg.as_mut_ptr() as *mut u32, eng_cfg.len() as u32);
+            std::ptr::write_unaligned(eng_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, root_st);
+            let mut eng: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertCreateCertificateChainEngine(
+                    eng_cfg.as_ptr() as *const c_void,
+                    &mut eng,
+                ),
+                1
+            );
+
+            let mut cb_ctx = CrossCbCtx {
+                trust_err: 0xFFFF,
+                chain_ders: Vec::new(),
+            };
+            let mut signer_chain_info = [0u8; 0x28];
+            std::ptr::write_unaligned(signer_chain_info.as_mut_ptr() as *mut u32, 0x28u32);
+            std::ptr::write_unaligned(
+                signer_chain_info.as_mut_ptr().add(0x08) as *mut *mut c_void,
+                eng,
+            );
+            let mut gc_para = [0u8; 0x28];
+            std::ptr::write_unaligned(gc_para.as_mut_ptr() as *mut u32, 0x28u32);
+            std::ptr::write_unaligned(
+                gc_para.as_mut_ptr().add(0x08) as *mut *const u8,
+                signer_chain_info.as_ptr(),
+            );
+            std::ptr::write_unaligned(
+                gc_para.as_mut_ptr().add(0x18) as *mut usize,
+                cross_cb as *const () as usize,
+            );
+            std::ptr::write_unaligned(
+                gc_para.as_mut_ptr().add(0x20) as *mut *mut c_void,
+                &mut cb_ctx as *mut CrossCbCtx as *mut c_void,
+            );
+
+            let mut blob_info = [0u8; 0x38];
+            std::ptr::write_unaligned(blob_info.as_mut_ptr() as *mut u32, 0x38u32);
+            std::ptr::write_unaligned(
+                blob_info.as_mut_ptr().add(0x20) as *mut u32,
+                p7_der.len() as u32,
+            );
+            std::ptr::write_unaligned(
+                blob_info.as_mut_ptr().add(0x28) as *mut *const u8,
+                p7_der.as_ptr(),
+            );
+
+            let mut wtd = [0u8; 0x58];
+            std::ptr::write_unaligned(wtd.as_mut_ptr() as *mut u32, 0x58u32);
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
+                gc_para.as_ptr() as *const c_void,
+            );
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_BLOB);
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x28) as *mut *const u8,
+                blob_info.as_ptr(),
+            );
+
+            let rc = WinVerifyTrust(
+                std::ptr::null_mut(),
+                WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                wtd.as_mut_ptr() as *mut c_void,
+            );
+            assert_eq!(
+                rc, ERROR_SUCCESS,
+                "WinVerifyTrust must trust leaf via embedded cross-signed CA even when untrusted self-signed CA is also embedded"
+            );
+            assert_eq!(cb_ctx.trust_err, 0);
+            assert_eq!(cb_ctx.chain_ders, vec![leaf_cert, cross_signed_ca, trusted_root]);
+
+            crate::misc::crypt32::CertFreeCertificateChainEngine(eng);
+            crate::misc::crypt32::CertCloseStore(root_st, 0);
+        }
     }
 }
 
