@@ -3312,8 +3312,8 @@ pub unsafe extern "win64" fn BCryptGetProperty(h: *mut c_void, prop: *const u16,
             (KeyData::Symmetric { iv, alg, .. }, "IV") if alg.block_size() > 0 => iv.clone(),
             (KeyData::Symmetric { alg, .. }, "AlgorithmName") => wide_bytes(alg.as_name()),
             (KeyData::Symmetric { .. }, "PrimitiveType") => u32v(BCRYPT_CIPHER_INTERFACE),
-            (KeyData::Rsa(r), "KeyLength" | "KeyStrength") => u32v(r.pub_key.bits() as u32),
-            (KeyData::Rsa(r), "BlockLength" | "SignatureLength" | "PublicKeyLength") => u32v(r.pub_key.k() as u32),
+            (KeyData::Rsa(r), "KeyLength" | "KeyStrength" | "PublicKeyLength") => u32v(r.pub_key.bits() as u32),
+            (KeyData::Rsa(r), "BlockLength" | "SignatureLength") => u32v(r.pub_key.k() as u32),
             (KeyData::Rsa(_), "KeyLengths") => key_lengths(512, 16384, 64),
             (KeyData::Rsa(_), "PaddingSchemes") => u32v(
                 BCRYPT_SUPPORTED_PAD_PKCS1_ENC
@@ -3323,10 +3323,10 @@ pub unsafe extern "win64" fn BCryptGetProperty(h: *mut c_void, prop: *const u16,
             ),
             (KeyData::Rsa(_), "AlgorithmName") => wide_bytes("RSA"),
             (KeyData::Rsa(_), "PrimitiveType") => u32v(BCRYPT_ASYMMETRIC_ENCRYPTION_INTERFACE),
-            (KeyData::PendingRsa { bits }, "KeyLength" | "KeyStrength") => u32v(*bits),
+            (KeyData::PendingRsa { bits }, "KeyLength" | "KeyStrength" | "PublicKeyLength") => u32v(*bits),
             (KeyData::PendingRsa { bits }, "BlockLength" | "SignatureLength") => u32v((*bits as usize).div_ceil(8) as u32),
             (KeyData::PendingRsa { .. }, "AlgorithmName") => wide_bytes("RSA"),
-            (KeyData::Ecc(e), "KeyLength" | "KeyStrength") => u32v(e.curve.bits()),
+            (KeyData::Ecc(e), "KeyLength" | "KeyStrength" | "PublicKeyLength") => u32v(e.curve.bits()),
             (KeyData::Ecc(e), "SignatureLength") if e.usage == EccUsage::Ecdsa => u32v((e.curve.coord_len() * 2) as u32),
             (KeyData::Ecc(e), "BlockLength") => u32v(e.curve.coord_len() as u32),
             (KeyData::Ecc(e), "KeyLengths") => key_lengths(e.curve.bits(), e.curve.bits(), 0),
@@ -5410,6 +5410,13 @@ mod tests {
                 STATUS_INVALID_SIGNATURE
             );
 
+            let mut pub_kbits = 0u32;
+            let mut got_pk = 0u32;
+            assert_eq!(
+                BCryptGetProperty(h_pub, w("PublicKeyLength").as_ptr(), &mut pub_kbits as *mut u32 as *mut u8, 4, &mut got_pk, 0),
+                STATUS_SUCCESS
+            );
+            assert_eq!(pub_kbits, 2048);
             assert_eq!(BCryptDestroyKey(h_priv), STATUS_SUCCESS);
             assert_eq!(BCryptDestroyKey(h_pub), STATUS_SUCCESS);
             assert_eq!(BCryptDestroyKey(h_key), STATUS_SUCCESS);
@@ -6049,6 +6056,13 @@ mod tests {
                 STATUS_INVALID_PARAMETER
             );
 
+            let mut pub_kbits = 0u32;
+            let mut got_pk = 0u32;
+            assert_eq!(
+                BCryptGetProperty(h_pub, w("PublicKeyLength").as_ptr(), &mut pub_kbits as *mut u32 as *mut u8, 4, &mut got_pk, 0),
+                STATUS_SUCCESS
+            );
+            assert_eq!(pub_kbits, 2048);
             assert_eq!(BCryptDestroyKey(h_priv), STATUS_SUCCESS);
             assert_eq!(BCryptDestroyKey(h_pub), STATUS_SUCCESS);
             assert_eq!(BCryptDestroyKey(h_key), STATUS_SUCCESS);
