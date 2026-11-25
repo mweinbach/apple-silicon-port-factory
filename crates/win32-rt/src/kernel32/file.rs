@@ -2728,13 +2728,20 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
             let w = (info.add(16) as *const i64).read_unaligned();
             let attrs = (info.add(32) as *const u32).read_unaligned();
             if attrs != 0 {
-                if let Some(ref p) = f.host_path {
-                    if let Ok(m) = std::fs::metadata(p) {
-                        let mut perm = m.permissions();
-                        let mode = perm.mode();
-                        perm.set_mode(if attrs & FILE_ATTRIBUTE_READONLY != 0 { mode & !0o222 } else { mode | 0o200 });
-                        let _ = std::fs::set_permissions(p, perm);
-                    }
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::fstat(f.fd(), &mut st) != 0 {
+                    set_err(errno_to_win32(last_errno()));
+                    return FALSE;
+                }
+                let mode = (st.st_mode as libc::mode_t) & 0o7777;
+                let new_mode = if attrs & FILE_ATTRIBUTE_READONLY != 0 {
+                    mode & !0o222
+                } else {
+                    mode | 0o200
+                };
+                if libc::fchmod(f.fd(), new_mode) != 0 {
+                    set_err(errno_to_win32(last_errno()));
+                    return FALSE;
                 }
             }
             set_times(&f, a, w)
@@ -11737,6 +11744,28 @@ mod tests {
             std::ptr::copy_nonoverlapping(new_w.as_ptr() as *const u8, ren.as_mut_ptr().add(20), new_w.len() * 2);
             assert_eq!(SetFileInformationByHandle(h, 22, ren.as_ptr(), ren.len() as u32), TRUE);
             assert!(dir.join("renamed.dat").exists());
+
+            // Class 0 (FileBasicInfo) updates the open inode via fstat/fchmod even after the
+            // original path has been renamed and replaced by another file.
+            let replacement = dir.join("sample.dat");
+            std::fs::write(&replacement, b"replacement").unwrap();
+            let mut basic_ro = [0u8; 40];
+            (basic_ro.as_mut_ptr().add(32) as *mut u32).write_unaligned(FILE_ATTRIBUTE_READONLY);
+            assert_eq!(SetFileInformationByHandle(h, 0, basic_ro.as_ptr(), 40), TRUE);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(dir.join("renamed.dat")).unwrap().permissions().mode() & 0o222, 0);
+                assert_ne!(std::fs::metadata(&replacement).unwrap().permissions().mode() & 0o200, 0);
+            }
+            let mut basic_rw = [0u8; 40];
+            (basic_rw.as_mut_ptr().add(32) as *mut u32).write_unaligned(FILE_ATTRIBUTE_NORMAL);
+            assert_eq!(SetFileInformationByHandle(h, 0, basic_rw.as_ptr(), 40), TRUE);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_ne!(std::fs::metadata(dir.join("renamed.dat")).unwrap().permissions().mode() & 0o200, 0);
+            }
 
             // Class 5: FileAllocationInfo repeated same-size reservation does not grow allocation.
             let wp = to_wide_z("K:\\prealloc.dat");

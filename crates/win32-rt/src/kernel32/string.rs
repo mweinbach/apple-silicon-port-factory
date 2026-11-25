@@ -3522,7 +3522,10 @@ pub unsafe extern "win64" fn GetCalendarInfoEx(
     // Only Gregorian calendars (`CAL_GREGORIAN = 1`, `CAL_GREGORIAN_US = 2`) are backed here;
     // reject non-Gregorian or unknown calendar IDs (e.g. `CAL_JAPAN = 3`) honestly with
     // `ERROR_INVALID_PARAMETER` rather than returning fabricated Gregorian data.
-    let cal_loc: ResolvedLocale = match cal {
+    // Explicitly pin `@calendar=gregorian` on `cal_loc.icu_id` so locales whose default ICU
+    // calendar is non-Gregorian (e.g. `th-TH` Buddhist, `ar-SA` Islamic) still query Gregorian
+    // eras, patterns, and month names when `cal` is 1 or 2.
+    let mut cal_loc: ResolvedLocale = match cal {
         1 => loc,
         2 => ResolvedLocale::en_us(),
         _ => {
@@ -3530,19 +3533,27 @@ pub unsafe extern "win64" fn GetCalendarInfoEx(
             return 0;
         }
     };
+    let base_icu = if cal_loc.invariant { "en_US" } else { cal_loc.icu_id.as_str() };
+    cal_loc.icu_id = if base_icu.contains('@') {
+        format!("{base_icu};calendar=gregorian")
+    } else {
+        format!("{base_icu}@calendar=gregorian")
+    };
     let cal_id = cal;
     let return_num = (ty & CAL_RETURN_NUMBER) != 0;
     let base = ty & 0xFFFF;
     let era_str = || -> String {
         if let Some(a) = icu::api() {
-            let cloc = icu::c_str(if cal_loc.invariant { "en_US" } else { &cal_loc.icu_id });
+            let cloc = icu::c_str(&cal_loc.icu_id);
             let mut st = 0i32;
             let df = (a.udat_open)(icu::UDAT_NONE, icu::UDAT_SHORT, cloc.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0, &mut st);
             if !df.is_null() && st <= 0 {
                 let s = icu::call_u16_str(|b, c, e| (a.udat_get_symbols)(df, icu::UDAT_ERAS, 1, b, c, e));
                 (a.udat_close)(df);
                 if let Some(s) = s {
-                    return s;
+                    if !s.is_empty() {
+                        return s;
+                    }
                 }
             }
         }
@@ -4514,6 +4525,14 @@ mod tests {
             // CAL_GREGORIAN_US (2) returns US English Gregorian names.
             assert!(GetCalendarInfoEx(de.as_ptr(), 2, std::ptr::null(), 0x07, buf.as_mut_ptr(), 128, std::ptr::null_mut()) > 0);
             assert_eq!(from_wide(buf.as_ptr()), "Monday");
+
+            // Locales whose default ICU calendar is non-Gregorian (e.g. th-TH Buddhist) still
+            // return localized Gregorian era & month data when CAL_GREGORIAN (1) is requested.
+            let th = to_wide_z("th-TH");
+            assert!(GetCalendarInfoEx(th.as_ptr(), 1, std::ptr::null(), 0x04 /* CAL_SERASTRING */, buf.as_mut_ptr(), 128, std::ptr::null_mut()) > 1);
+            assert!(!from_wide(buf.as_ptr()).is_empty());
+            assert!(GetCalendarInfoEx(th.as_ptr(), 1, std::ptr::null(), 0x15 /* CAL_SMONTHNAME1 */, buf.as_mut_ptr(), 128, std::ptr::null_mut()) > 1);
+            assert_eq!(from_wide(buf.as_ptr()), "มกราคม");
 
             // Non-Gregorian calendars (e.g. CAL_JAPAN = 3) are rejected honestly with ERROR_INVALID_PARAMETER.
             let ja = to_wide_z("ja-JP");
