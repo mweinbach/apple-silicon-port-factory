@@ -1076,6 +1076,36 @@ pub(super) fn clipboard_change_count() -> isize {
 // Alert
 // ---------------------------------------------------------------------------
 
+const NS_CONTROL_STATE_OFF: isize = 0;
+const NS_CONTROL_STATE_ON: isize = 1;
+
+enum TaskDialogEventSink {
+    Channel(std::sync::mpsc::Sender<super::TaskDialogEvent>),
+    Inline(*mut dyn FnMut(super::TaskDialogEvent)),
+}
+
+impl TaskDialogEventSink {
+    fn emit(&mut self, ev: super::TaskDialogEvent) {
+        match self {
+            TaskDialogEventSink::Channel(tx) => {
+                let _ = tx.send(ev);
+            }
+            TaskDialogEventSink::Inline(cb) => unsafe { (**cb)(ev) },
+        }
+    }
+}
+
+struct ActiveTaskDialogAlert {
+    session_id: u64,
+    alert: Retained<NSAlert>,
+    radio_buttons: Vec<Retained<NSButton>>,
+    sink: TaskDialogEventSink,
+}
+
+thread_local! {
+    static ACTIVE_TASK_DIALOG_ALERT: RefCell<Option<ActiveTaskDialogAlert>> = const { RefCell::new(None) };
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -1084,7 +1114,27 @@ define_class!(
 
     impl TaskDialogRadioTarget {
         #[unsafe(method(radioSelected:))]
-        fn radio_selected(&self, _sender: &AnyObject) {}
+        fn radio_selected(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            if tag >= 0 {
+                ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
+                    if let Some(active) = slot.borrow_mut().as_mut() {
+                        active.sink.emit(super::TaskDialogEvent::RadioSelected(tag as usize));
+                    }
+                });
+            }
+        }
+
+        #[unsafe(method(verificationToggled:))]
+        fn verification_toggled(&self, sender: &AnyObject) {
+            let st: isize = unsafe { msg_send![sender, state] };
+            let checked = st == NS_CONTROL_STATE_ON;
+            ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
+                if let Some(active) = slot.borrow_mut().as_mut() {
+                    active.sink.emit(super::TaskDialogEvent::VerificationToggled(checked));
+                }
+            });
+        }
     }
 );
 
@@ -1095,11 +1145,45 @@ impl TaskDialogRadioTarget {
 }
 
 pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: bool) -> usize {
-    task_dialog_alert(caption, text, buttons, None, &[], None, None, false, critical).button_index
+    let mut noop = |_ev: super::TaskDialogEvent| {};
+    task_dialog_alert_inline(0, caption, text, buttons, None, &[], None, None, false, critical, &mut noop)
+        .button_index
+}
+
+pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDialogLiveUpdate) {
+    let mtm = mtm();
+    ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
+        let borrow = slot.borrow();
+        let Some(active) = borrow.as_ref() else {
+            return;
+        };
+        if active.session_id != session_id {
+            return;
+        }
+        active.alert.setMessageText(&NSString::from_str(&update.caption));
+        active.alert.setInformativeText(&NSString::from_str(&update.text));
+        if let Some(ridx) = update.selected_radio_idx {
+            for (i, b) in active.radio_buttons.iter().enumerate() {
+                let st = if i == ridx { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
+                let _: () = unsafe { msg_send![&**b, setState: st] };
+            }
+        }
+        if let Some(checked) = update.verification_checked {
+            if let Some(cb) = active.alert.suppressionButton() {
+                let st = if checked { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
+                let _: () = unsafe { msg_send![&*cb, setState: st] };
+            }
+        }
+        if let Some(bidx) = update.click_button_idx {
+            let app = NSApplication::sharedApplication(mtm);
+            app.stopModalWithCode(1000 + bidx as isize);
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn task_dialog_alert(
+fn run_task_dialog_alert(
+    session_id: u64,
     caption: &str,
     text: &str,
     buttons: &[String],
@@ -1109,6 +1193,7 @@ pub(super) fn task_dialog_alert(
     verification_text: Option<&str>,
     verification_checked: bool,
     critical: bool,
+    sink: TaskDialogEventSink,
 ) -> super::TaskDialogAlertResult {
     let mtm = mtm();
     let app = NSApplication::sharedApplication(mtm);
@@ -1126,8 +1211,7 @@ pub(super) fn task_dialog_alert(
         }
     }
 
-    const NS_CONTROL_STATE_OFF: isize = 0;
-    const NS_CONTROL_STATE_ON: isize = 1;
+    let target = TaskDialogRadioTarget::new(mtm);
 
     if let Some(vtext) = verification_text {
         a.setShowsSuppressionButton(true);
@@ -1135,12 +1219,13 @@ pub(super) fn task_dialog_alert(
             cb.setTitle(&NSString::from_str(vtext));
             let state = if verification_checked { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
             let _: () = unsafe { msg_send![&*cb, setState: state] };
+            let _: () = unsafe { msg_send![&*cb, setTarget: &*target] };
+            let _: () = unsafe { msg_send![&*cb, setAction: sel!(verificationToggled:)] };
         }
     }
 
     let mut radio_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(radios.len());
-    let _radio_target = if !radios.is_empty() {
-        let target = TaskDialogRadioTarget::new(mtm);
+    if !radios.is_empty() {
         let row_h = 24.0f64;
         let width = 320.0f64;
         let total_h = row_h * (radios.len() as f64) + 4.0;
@@ -1157,6 +1242,7 @@ pub(super) fn task_dialog_alert(
                     mtm,
                 )
             };
+            let _: () = unsafe { msg_send![&*btn, setTag: idx as isize] };
             // Position top-to-bottom in AppKit's bottom-up coordinate system.
             let y = total_h - ((idx + 1) as f64) * row_h;
             btn.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, row_h)));
@@ -1170,10 +1256,23 @@ pub(super) fn task_dialog_alert(
             radio_buttons.push(btn);
         }
         a.setAccessoryView(Some(&container));
-        Some(target)
-    } else {
-        None
-    };
+    }
+
+    struct ActiveAlertGuard;
+    impl Drop for ActiveAlertGuard {
+        fn drop(&mut self) {
+            ACTIVE_TASK_DIALOG_ALERT.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
+        *slot.borrow_mut() = Some(ActiveTaskDialogAlert {
+            session_id,
+            alert: a.clone(),
+            radio_buttons: radio_buttons.clone(),
+            sink,
+        });
+    });
+    let _active_guard = ActiveAlertGuard;
 
     let r = a.runModal();
     // NSAlertFirstButtonReturn = 1000
@@ -1194,11 +1293,74 @@ pub(super) fn task_dialog_alert(
     } else {
         false
     };
+    let _keep_target_alive = target;
     super::TaskDialogAlertResult {
         button_index,
         radio_index,
         verified,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn task_dialog_alert_channel(
+    session_id: u64,
+    caption: &str,
+    text: &str,
+    buttons: &[String],
+    default_button_idx: Option<usize>,
+    radios: &[String],
+    default_radio_idx: Option<usize>,
+    verification_text: Option<&str>,
+    verification_checked: bool,
+    critical: bool,
+    tx: std::sync::mpsc::Sender<super::TaskDialogEvent>,
+) {
+    let res = run_task_dialog_alert(
+        session_id,
+        caption,
+        text,
+        buttons,
+        default_button_idx,
+        radios,
+        default_radio_idx,
+        verification_text,
+        verification_checked,
+        critical,
+        TaskDialogEventSink::Channel(tx.clone()),
+    );
+    let _ = tx.send(super::TaskDialogEvent::ButtonClicked(res));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn task_dialog_alert_inline(
+    session_id: u64,
+    caption: &str,
+    text: &str,
+    buttons: &[String],
+    default_button_idx: Option<usize>,
+    radios: &[String],
+    default_radio_idx: Option<usize>,
+    verification_text: Option<&str>,
+    verification_checked: bool,
+    critical: bool,
+    on_event: &mut dyn FnMut(super::TaskDialogEvent),
+) -> super::TaskDialogAlertResult {
+    // SAFETY: ACTIVE_TASK_DIALOG_ALERT is cleared by ActiveAlertGuard before this function returns.
+    let cb_ptr: *mut dyn FnMut(super::TaskDialogEvent) =
+        unsafe { std::mem::transmute::<&mut dyn FnMut(super::TaskDialogEvent), *mut dyn FnMut(super::TaskDialogEvent)>(on_event) };
+    run_task_dialog_alert(
+        session_id,
+        caption,
+        text,
+        buttons,
+        default_button_idx,
+        radios,
+        default_radio_idx,
+        verification_text,
+        verification_checked,
+        critical,
+        TaskDialogEventSink::Inline(cb_ptr),
+    )
 }
 
 // ---------------------------------------------------------------------------

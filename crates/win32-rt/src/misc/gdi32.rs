@@ -845,6 +845,7 @@ pub unsafe extern "win64" fn GetTextExtentPoint32A(hdc: usize, s: LPCSTR, n: i32
 }
 
 pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
+    let _ = hdc;
     let mon = crate::user32::monitor::primary_rect();
     let dpi = crate::user32::window::dpi().max(1) as i32;
     let refresh = crate::macos::display::monitors()
@@ -852,28 +853,10 @@ pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
         .map(|m| m.refresh_hz as i32)
         .unwrap_or(60);
 
-    // If `hdc` is a memory DC with a non-stock bitmap selected, report its surface
-    // dimensions and color format for HORZRES/VERTRES/BITSPIXEL/PLANES.
-    let mem_surface: Option<(i32, i32, i32, i32)> = if hdc != 0 {
-        let m = objs().lock().unwrap();
-        if let Some(Obj::Dc(dc)) = m.get(&hdc) {
-            if dc.window == 0 {
-                if let Some(Obj::Bitmap(bm)) = m.get(&dc.bitmap) {
-                    Some((bm.width as i32, bm.height as i32, bm.bpp as i32, bm.planes as i32))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let (w, h, bpp, planes) = mem_surface.unwrap_or((mon.width(), mon.height(), 32, 1));
+    // Per Microsoft Learn GetDeviceCaps: HORZRES/VERTRES/HORZSIZE/VERTSIZE/BITSPIXEL/PLANES
+    // describe the display device capabilities (inherited by compatible memory DCs), never
+    // the currently selected bitmap object (which is queried via GetObject).
+    let (w, h, bpp, planes) = (mon.width(), mon.height(), 32, 1);
     match index {
         0 => 0x4000,                                                 // DRIVERVERSION (4.0)
         2 => 1,                                                      // TECHNOLOGY (DT_RASDISPLAY)
@@ -1985,16 +1968,30 @@ mod tests {
             assert!(GetDeviceCaps(0, 116) >= 30); // VREFRESH
             assert_eq!(GetDeviceCaps(0, 9999), 0); // unknown index -> 0
 
-            // Memory DC with selected 64x32 24bpp DIB reports bitmap dimensions/depth.
+            // Selecting a 64x32 24bpp DIB into a compatible memory DC must NOT override the
+            // display device capabilities reported by GetDeviceCaps (bitmap dimensions come
+            // from GetObject instead).
+            let screen_w = GetDeviceCaps(0, 8);
+            let screen_h = GetDeviceCaps(0, 10);
+            let screen_mm_w = GetDeviceCaps(0, 4);
+            let screen_mm_h = GetDeviceCaps(0, 6);
             let dc = CreateCompatibleDC(0);
             let bmi = make_bmi_header(64, -32, 24);
             let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
             let hbm = CreateDIBSection(dc, bmi.as_ptr(), 0, &mut bits, std::ptr::null_mut(), 0);
             let old = SelectObject(dc, hbm);
-            assert_eq!(GetDeviceCaps(dc, 8), 64);
-            assert_eq!(GetDeviceCaps(dc, 10), 32);
-            assert_eq!(GetDeviceCaps(dc, 12), 24);
+            assert_eq!(GetDeviceCaps(dc, 8), screen_w);
+            assert_eq!(GetDeviceCaps(dc, 10), screen_h);
+            assert_eq!(GetDeviceCaps(dc, 4), screen_mm_w);
+            assert_eq!(GetDeviceCaps(dc, 6), screen_mm_h);
+            assert_eq!(GetDeviceCaps(dc, 12), 32);
+            assert_eq!(GetDeviceCaps(dc, 14), 1);
             assert_eq!(GetDeviceCaps(dc, 108), 24);
+            let mut bm_buf = [0u8; 32];
+            assert_eq!(GetObjectW(hbm, 32, bm_buf.as_mut_ptr()), 32);
+            assert_eq!(i32::from_le_bytes(bm_buf[4..8].try_into().unwrap()), 64);
+            assert_eq!(i32::from_le_bytes(bm_buf[8..12].try_into().unwrap()), 32);
+            assert_eq!(u16::from_le_bytes(bm_buf[18..20].try_into().unwrap()), 24);
             SelectObject(dc, old);
             DeleteObject(hbm);
             DeleteDC(dc);

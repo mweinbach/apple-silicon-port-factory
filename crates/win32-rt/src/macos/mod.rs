@@ -455,11 +455,33 @@ pub struct TaskDialogAlertResult {
     pub verified: bool,
 }
 
+/// Live events emitted by an open interactive TaskDialog alert while its modal
+/// session is running, forwarded to the owning Win32 thread immediately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskDialogEvent {
+    RadioSelected(usize),
+    VerificationToggled(bool),
+    ButtonClicked(TaskDialogAlertResult),
+}
+
+/// Live content/selection/dismissal update pushed from a Win32 TaskDialog
+/// callback back to the currently open native `NSAlert`.
+#[derive(Clone, Debug)]
+pub struct TaskDialogLiveUpdate {
+    pub caption: String,
+    pub text: String,
+    pub selected_radio_idx: Option<usize>,
+    pub verification_checked: Option<bool>,
+    pub click_button_idx: Option<usize>,
+}
+
 /// Show a modal task-dialog alert with push buttons plus optional radio buttons
-/// and verification checkbox; returns the user's actual selections, or `None`
-/// when headless / on iOS (no interactive selection UI available).
+/// and verification checkbox, forwarding radio/checkbox selection changes live
+/// to `on_event` on the calling Win32 thread while the modal session is open.
+/// Returns `None` when headless / on iOS (no interactive selection UI available).
 #[allow(clippy::too_many_arguments)]
-pub fn task_dialog_alert(
+pub fn task_dialog_alert<F>(
+    session_id: u64,
     caption: String,
     text: String,
     buttons: Vec<String>,
@@ -469,7 +491,11 @@ pub fn task_dialog_alert(
     verification_text: Option<String>,
     verification_checked: bool,
     critical: bool,
-) -> Option<TaskDialogAlertResult> {
+    mut on_event: F,
+) -> Option<TaskDialogAlertResult>
+where
+    F: FnMut(TaskDialogEvent),
+{
     #[cfg(test)]
     {
         if let Some(res) = invoke_test_task_dialog_presenter(
@@ -481,14 +507,19 @@ pub fn task_dialog_alert(
             default_radio_idx,
             verification_text.as_deref(),
             verification_checked,
+            &mut on_event,
         ) {
             return res;
         }
     }
     #[cfg(target_os = "macos")]
     {
-        run_sync(move || {
-            appkit::task_dialog_alert(
+        if !active() {
+            return None;
+        }
+        if is_main_thread() {
+            return Some(appkit::task_dialog_alert_inline(
+                session_id,
                 &caption,
                 &text,
                 &buttons,
@@ -498,12 +529,37 @@ pub fn task_dialog_alert(
                 verification_text.as_deref(),
                 verification_checked,
                 critical,
-            )
-        })
+                &mut on_event,
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<TaskDialogEvent>();
+        run_async(move || {
+            appkit::task_dialog_alert_channel(
+                session_id,
+                &caption,
+                &text,
+                &buttons,
+                default_button_idx,
+                &radios,
+                default_radio_idx,
+                verification_text.as_deref(),
+                verification_checked,
+                critical,
+                tx,
+            );
+        });
+        while let Ok(ev) = rx.recv() {
+            match ev {
+                TaskDialogEvent::ButtonClicked(res) => return Some(res),
+                other => on_event(other),
+            }
+        }
+        None
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (
+            session_id,
             caption,
             text,
             buttons,
@@ -513,9 +569,28 @@ pub fn task_dialog_alert(
             verification_text,
             verification_checked,
             critical,
+            &mut on_event,
         );
         None
     }
+}
+
+/// Push a live content/selection/dismissal update to an open native TaskDialog
+/// alert (`session_id`) from a Win32 callback (`SetWindowTextW`, `TDM_*`).
+pub fn task_dialog_alert_update(session_id: u64, update: TaskDialogLiveUpdate) {
+    #[cfg(test)]
+    invoke_test_task_dialog_updater(session_id, &update);
+
+    #[cfg(target_os = "macos")]
+    if active() {
+        if is_main_thread() {
+            appkit::task_dialog_alert_update(session_id, &update);
+        } else {
+            run_async(move || appkit::task_dialog_alert_update(session_id, &update));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (session_id, update);
 }
 
 /// Show a modal alert with the given buttons; returns the index of the
@@ -667,18 +742,29 @@ pub(crate) type TestTaskDialogPresenter = Box<
         Option<usize>,
         Option<&str>,
         bool,
+        &mut dyn FnMut(TaskDialogEvent),
     ) -> Option<TaskDialogAlertResult>,
 >;
 
 #[cfg(test)]
+pub(crate) type TestTaskDialogUpdater = Box<dyn FnMut(u64, &TaskDialogLiveUpdate)>;
+
+#[cfg(test)]
 thread_local! {
     static TEST_TASK_DIALOG_PRESENTER: std::cell::RefCell<Option<TestTaskDialogPresenter>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_TASK_DIALOG_UPDATER: std::cell::RefCell<Option<TestTaskDialogUpdater>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn set_test_task_dialog_presenter(hook: Option<TestTaskDialogPresenter>) {
     TEST_TASK_DIALOG_PRESENTER.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_task_dialog_updater(hook: Option<TestTaskDialogUpdater>) {
+    TEST_TASK_DIALOG_UPDATER.with(|cell| *cell.borrow_mut() = hook);
 }
 
 #[cfg(test)]
@@ -692,6 +778,7 @@ fn invoke_test_task_dialog_presenter(
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
     verification_checked: bool,
+    on_event: &mut dyn FnMut(TaskDialogEvent),
 ) -> Option<Option<TaskDialogAlertResult>> {
     TEST_TASK_DIALOG_PRESENTER.with(|cell| {
         cell.borrow_mut().as_mut().map(|f| {
@@ -704,7 +791,17 @@ fn invoke_test_task_dialog_presenter(
                 default_radio_idx,
                 verification_text,
                 verification_checked,
+                on_event,
             )
         })
     })
+}
+
+#[cfg(test)]
+fn invoke_test_task_dialog_updater(session_id: u64, update: &TaskDialogLiveUpdate) {
+    TEST_TASK_DIALOG_UPDATER.with(|cell| {
+        if let Some(f) = cell.borrow_mut().as_mut() {
+            f(session_id, update);
+        }
+    });
 }

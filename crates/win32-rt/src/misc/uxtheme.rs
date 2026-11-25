@@ -257,13 +257,19 @@ const TDE_MAIN_INSTRUCTION: usize = 3;
 const S_FALSE_HR: HRESULT = 1;
 const HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION: HRESULT = 0x8007_05B3u32 as i32;
 
+static NEXT_TASK_DIALOG_SESSION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 struct ActiveTaskDialog {
+    session_id: u64,
+    modal_open: bool,
     hinst: usize,
     caption: String,
     main_inst: String,
     content: String,
     expanded: String,
     footer: String,
+    buttons: Vec<(i32, String)>,
     radios: Vec<(i32, String)>,
     selected_radio_idx: Option<usize>,
     has_verification: bool,
@@ -280,6 +286,21 @@ impl ActiveTaskDialog {
             }
         }
         body_parts.join("\n\n")
+    }
+
+    fn live_update(&self, click_button_idx: Option<usize>) -> Option<(u64, crate::macos::TaskDialogLiveUpdate)> {
+        self.modal_open.then(|| {
+            (
+                self.session_id,
+                crate::macos::TaskDialogLiveUpdate {
+                    caption: self.caption.clone(),
+                    text: self.compose_body(),
+                    selected_radio_idx: self.selected_radio_idx,
+                    verification_checked: self.has_verification.then_some(self.verified),
+                    click_button_idx,
+                },
+            )
+        })
     }
 }
 
@@ -307,12 +328,15 @@ unsafe extern "win64" fn task_dialog_wndproc(
             } else {
                 crate::strings::from_wide(l_param as LPCWSTR)
             };
-            if let Some(dlg) = active_task_dialogs()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&h)
-            {
-                dlg.caption = new_title;
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    dlg.caption = new_title;
+                    dlg.live_update(None)
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
             }
             res
         }
@@ -324,52 +348,66 @@ unsafe extern "win64" fn task_dialog_wndproc(
                 .map(|d| d.hinst as HINSTANCE)
                 .unwrap_or(std::ptr::null_mut());
             let new_text = resolve_task_dialog_str(hinst, l_param as LPCWSTR);
-            if let Some(dlg) = active_task_dialogs()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&h)
-            {
-                match w_param {
-                    TDE_CONTENT => dlg.content = new_text,
-                    TDE_EXPANDED_INFORMATION => dlg.expanded = new_text,
-                    TDE_FOOTER => dlg.footer = new_text,
-                    TDE_MAIN_INSTRUCTION => dlg.main_inst = new_text,
-                    _ => {}
-                }
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    match w_param {
+                        TDE_CONTENT => dlg.content = new_text,
+                        TDE_EXPANDED_INFORMATION => dlg.expanded = new_text,
+                        TDE_FOOTER => dlg.footer = new_text,
+                        TDE_MAIN_INSTRUCTION => dlg.main_inst = new_text,
+                        _ => {}
+                    }
+                    dlg.live_update(None)
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
             }
             0
         }
         TDM_CLICK_BUTTON => {
-            if let Some(dlg) = active_task_dialogs()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&h)
-            {
-                dlg.pending_click_button = Some(w_param as i32);
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    let bid = w_param as i32;
+                    dlg.pending_click_button = Some(bid);
+                    let bidx = dlg.buttons.iter().position(|(id, _)| *id == bid);
+                    dlg.live_update(bidx)
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
             }
             0
         }
         TDM_CLICK_RADIO_BUTTON => {
-            if let Some(dlg) = active_task_dialogs()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&h)
-            {
-                if let Some(idx) = dlg.radios.iter().position(|(id, _)| *id == w_param as i32) {
-                    dlg.selected_radio_idx = Some(idx);
-                }
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    if let Some(idx) = dlg.radios.iter().position(|(id, _)| *id == w_param as i32) {
+                        dlg.selected_radio_idx = Some(idx);
+                    }
+                    dlg.live_update(None)
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
             }
             0
         }
         TDM_CLICK_VERIFICATION => {
-            if let Some(dlg) = active_task_dialogs()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&h)
-            {
-                if dlg.has_verification {
-                    dlg.verified = w_param != 0;
-                }
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    if dlg.has_verification {
+                        dlg.verified = w_param != 0;
+                    }
+                    dlg.live_update(None)
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
             }
             0
         }
@@ -542,6 +580,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     // Allocate a dialog-owned Win32 HWND (distinct from cfg.hwnd_parent, non-NULL even for
     // unparented dialogs) so callbacks using SetWindowText, SetWindowSubclass, or TDM_*
     // messages operate on the TaskDialog window rather than mutating the parent window.
+    let session_id = NEXT_TASK_DIALOG_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dialog_hwnd = crate::user32::window::create_virtual_dialog_hwnd(
         "#32770_TaskDialog",
         &caption,
@@ -554,12 +593,15 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         .insert(
             dialog_hwnd,
             ActiveTaskDialog {
+                session_id,
+                modal_open: false,
                 hinst: hinst as usize,
                 caption,
                 main_inst,
                 content,
                 expanded,
                 footer,
+                buttons: buttons.clone(),
                 radios: radios.clone(),
                 selected_radio_idx,
                 has_verification: verification_text.is_some(),
@@ -594,13 +636,17 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         let (cur_caption, cur_body, cur_radio_idx, cur_verified, programmatic_click) = {
             let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
             let dlg = map.get_mut(&dialog_hwnd).expect("active task dialog missing");
-            (
+            let snap = (
                 dlg.caption.clone(),
                 dlg.compose_body(),
                 dlg.selected_radio_idx,
                 dlg.verified,
                 dlg.pending_click_button.take(),
-            )
+            );
+            if snap.4.is_none() {
+                dlg.modal_open = true;
+            }
+            snap
         };
 
         if let Some(bid) = programmatic_click {
@@ -612,6 +658,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         }
 
         let presented = crate::macos::task_dialog_alert(
+            session_id,
             cur_caption,
             cur_body,
             labels.clone(),
@@ -621,29 +668,51 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             verification_text.clone(),
             cur_verified,
             critical,
-        );
-        let (bid, interactive) = if let Some(res) = presented {
-            let mut radio_changed: Option<i32> = None;
-            let mut ver_changed: Option<bool> = None;
-            {
-                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(dlg) = map.get_mut(&dialog_hwnd) {
-                    if res.radio_index != dlg.selected_radio_idx {
-                        dlg.selected_radio_idx = res.radio_index;
-                        radio_changed = res.radio_index.and_then(|ridx| radios.get(ridx).map(|(rid, _)| *rid));
+            |ev| match ev {
+                crate::macos::TaskDialogEvent::RadioSelected(ridx) => {
+                    let rid_opt = {
+                        let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                        map.get_mut(&dialog_hwnd).and_then(|dlg| {
+                            dlg.selected_radio_idx = Some(ridx);
+                            radios.get(ridx).map(|(rid, _)| *rid)
+                        })
+                    };
+                    if let Some(rid) = rid_opt {
+                        let _ = notify(TDN_RADIO_BUTTON_CLICKED, rid as u64);
                     }
-                    if dlg.has_verification && res.verified != dlg.verified {
+                }
+                crate::macos::TaskDialogEvent::VerificationToggled(checked) => {
+                    let has_ver = {
+                        let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                        map.get_mut(&dialog_hwnd).is_some_and(|dlg| {
+                            if dlg.has_verification {
+                                dlg.verified = checked;
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    };
+                    if has_ver {
+                        let _ = notify(TDN_VERIFICATION_CLICKED, if checked { 1 } else { 0 });
+                    }
+                }
+                crate::macos::TaskDialogEvent::ButtonClicked(_) => {}
+            },
+        );
+        {
+            let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(dlg) = map.get_mut(&dialog_hwnd) {
+                dlg.modal_open = false;
+                if let Some(ref res) = presented {
+                    dlg.selected_radio_idx = res.radio_index;
+                    if dlg.has_verification {
                         dlg.verified = res.verified;
-                        ver_changed = Some(res.verified);
                     }
                 }
             }
-            if let Some(rid) = radio_changed {
-                let _ = notify(TDN_RADIO_BUTTON_CLICKED, rid as u64);
-            }
-            if let Some(v) = ver_changed {
-                let _ = notify(TDN_VERIFICATION_CLICKED, if v { 1 } else { 0 });
-            }
+        }
+        let (bid, interactive) = if let Some(res) = presented {
             let bid = buttons
                 .get(res.button_index)
                 .map(|(id, _)| *id)
@@ -1154,13 +1223,22 @@ mod tests {
             //    actual final selections once the callback allows dismissal.
             static REJECT_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
             unsafe extern "win64" fn td_cb_keep_open(
-                _hwnd: HWND,
+                hwnd: HWND,
                 msg: u32,
                 wp: usize,
                 _lp: isize,
                 _ref_data: isize,
             ) -> HRESULT {
                 CB_MSGS.lock().unwrap().push((msg, wp as u64));
+                if msg == TDN_RADIO_BUTTON_CLICKED && wp == 201 {
+                    let live_body = crate::strings::to_wide_z("Live Radio 201 Body");
+                    let _ = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_SET_ELEMENT_TEXT,
+                        TDE_CONTENT,
+                        live_body.as_ptr() as isize,
+                    );
+                }
                 if msg == TDN_BUTTON_CLICKED && REJECT_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     return S_FALSE_HR;
                 }
@@ -1172,9 +1250,16 @@ mod tests {
             CB_MSGS.lock().unwrap().clear();
             REJECT_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
 
+            let live_updates: std::sync::Arc<Mutex<Vec<String>>> =
+                std::sync::Arc::new(Mutex::new(Vec::new()));
+            let live_updates_hook = live_updates.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |_sid, upd| {
+                live_updates_hook.lock().unwrap().push(upd.text.clone());
+            })));
+
             let mut step = 0usize;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, _body, btns, def_btn, rads, def_rad, ver_txt, ver_chk| {
+                move |_cap, body, btns, def_btn, rads, def_rad, ver_txt, ver_chk, emit| {
                     step += 1;
                     assert_eq!(btns, &["Yes", "No"]);
                     assert_eq!(def_btn, Some(1)); // n_default_button == IDNO (7)
@@ -1184,15 +1269,25 @@ mod tests {
                         // Initial defaults: radio index 1 (ID 202), verified = true.
                         assert_eq!(def_rad, Some(1));
                         assert!(ver_chk);
-                        // User clicks "Yes" (idx 0) with radio switched to 0 (ID 201) and unchecked;
-                        // callback returns S_FALSE so the dialog must remain open!
+                        // Emit intermediate live clicks while the modal dialog is open (201 -> 202 -> 201,
+                        // plus verification unchecked) and verify callbacks run BEFORE dismissal.
+                        emit(crate::macos::TaskDialogEvent::RadioSelected(0));
+                        emit(crate::macos::TaskDialogEvent::RadioSelected(1));
+                        emit(crate::macos::TaskDialogEvent::RadioSelected(0));
+                        emit(crate::macos::TaskDialogEvent::VerificationToggled(false));
+                        assert!(
+                            CB_MSGS.lock().unwrap().contains(&(TDN_RADIO_BUTTON_CLICKED, 202)),
+                            "intermediate radio click must be delivered live before modal dismissal"
+                        );
+                        // User clicks "Yes" (idx 0); callback returns S_FALSE so the dialog remains open.
                         Some(crate::macos::TaskDialogAlertResult {
                             button_index: 0,
                             radio_index: Some(0),
                             verified: false,
                         })
                     } else {
-                        // Second presentation carries forward the updated selection state.
+                        // Second presentation carries forward both updated selection state and live content.
+                        assert_eq!(body, "Live Radio 201 Body");
                         assert_eq!(def_rad, Some(0));
                         assert!(!ver_chk);
                         // User clicks "No" (idx 1) with radio 0 (ID 201) and verified = false.
@@ -1211,15 +1306,22 @@ mod tests {
                 &mut verified,
             );
             crate::macos::set_test_task_dialog_presenter(None);
+            crate::macos::set_test_task_dialog_updater(None);
             assert_eq!(hr_interactive, S_OK);
             assert_eq!(btn, 7); // IDNO (second click after first S_FALSE kept dialog open)
             assert_eq!(radio, 201); // updated radio choice, not default 202
             assert_eq!(verified, FALSE); // updated checkbox state, not default TRUE
+            assert!(
+                live_updates.lock().unwrap().iter().any(|t| t == "Live Radio 201 Body"),
+                "live update from TDN_RADIO_BUTTON_CLICKED must be pushed while modal is open"
+            );
             assert_eq!(
                 CB_MSGS.lock().unwrap().clone(),
                 vec![
                     (TDN_DIALOG_CONSTRUCTED, 0),
                     (TDN_CREATED, 0),
+                    (TDN_RADIO_BUTTON_CLICKED, 201),
+                    (TDN_RADIO_BUTTON_CLICKED, 202),
                     (TDN_RADIO_BUTTON_CLICKED, 201),
                     (TDN_VERIFICATION_CLICKED, 0),
                     (TDN_BUTTON_CLICKED, 6), // IDYES rejected with S_FALSE
@@ -1368,7 +1470,7 @@ mod tests {
             SEEN_HWNDS.lock().unwrap().clear();
             SUB_PINGS.store(0, std::sync::atomic::Ordering::SeqCst);
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                |cap, body, _btns, _def_btn, _rads, def_rad, _ver_txt, ver_chk| {
+                |cap, body, _btns, _def_btn, _rads, def_rad, _ver_txt, ver_chk, _emit| {
                     assert_eq!(cap, "Callback Title");
                     assert_eq!(body, "Updated Body");
                     assert_eq!(def_rad, Some(0)); // updated via TDM_CLICK_RADIO_BUTTON(201)
