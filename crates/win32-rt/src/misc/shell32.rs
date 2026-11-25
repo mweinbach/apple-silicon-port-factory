@@ -441,8 +441,10 @@ fn query_file_info(
             std::fs::read_dir(&host)
                 .ok()
                 .map(|rd| {
-                    rd.filter_map(|e| e.ok())
-                        .any(|e| e.file_type().is_ok_and(|ft| ft.is_dir()))
+                    rd.filter_map(|e| e.ok()).any(|e| {
+                        !crate::path::is_host_private_keystore_path(&e.path())
+                            && e.file_type().is_ok_and(|ft| ft.is_dir())
+                    })
                 })
                 .unwrap_or(false)
         } else {
@@ -764,12 +766,16 @@ fn expand_win_source(win_spec: &str, files_only: bool) -> Result<Vec<PathBuf>, i
         let rd = std::fs::read_dir(&host_dir).map_err(|e| io_err_win32(&e))?;
         let mut matches = Vec::new();
         for entry in rd.filter_map(|e| e.ok()) {
+            let ep = entry.path();
+            if crate::path::is_host_private_keystore_path(&ep) {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             if crate::kernel32::file::wildcard_match(base_part, &name) {
                 if files_only && entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                     continue;
                 }
-                matches.push(entry.path());
+                matches.push(ep);
             }
         }
         if matches.is_empty() {
@@ -778,6 +784,9 @@ fn expand_win_source(win_spec: &str, files_only: bool) -> Result<Vec<PathBuf>, i
         Ok(matches)
     } else {
         let host = crate::path::to_host(win_spec).ok_or(err::ERROR_PATH_NOT_FOUND as i32)?;
+        if crate::path::is_host_private_keystore_path(&host) {
+            return Err(err::ERROR_ACCESS_DENIED as i32);
+        }
         if std::fs::symlink_metadata(&host).is_err() {
             return Err(err::ERROR_FILE_NOT_FOUND as i32);
         }
@@ -786,7 +795,7 @@ fn expand_win_source(win_spec: &str, files_only: bool) -> Result<Vec<PathBuf>, i
 }
 
 fn copy_entry(src: &Path, dst: &Path, no_recursion: bool, files_only: bool) -> Result<(), i32> {
-    if crate::path::is_protected_host_write(dst) {
+    if crate::path::is_host_private_keystore_path(src) || crate::path::is_protected_host_write(dst) {
         return Err(err::ERROR_ACCESS_DENIED as i32);
     }
     let meta = std::fs::symlink_metadata(src).map_err(|e| io_err_win32(&e))?;
@@ -797,11 +806,17 @@ fn copy_entry(src: &Path, dst: &Path, no_recursion: bool, files_only: bool) -> R
         if files_only {
             return Ok(());
         }
+        if !no_recursion && crate::path::is_host_private_keystore_ancestor(src) {
+            return Err(err::ERROR_ACCESS_DENIED as i32);
+        }
         std::fs::create_dir_all(dst).map_err(|e| io_err_win32(&e))?;
         if !no_recursion {
             for entry in std::fs::read_dir(src).map_err(|e| io_err_win32(&e))? {
                 let entry = entry.map_err(|e| io_err_win32(&e))?;
                 let sp = entry.path();
+                if crate::path::is_host_private_keystore_path(&sp) {
+                    return Err(err::ERROR_ACCESS_DENIED as i32);
+                }
                 let dp = dst.join(entry.file_name());
                 copy_entry(&sp, &dp, false, files_only)?;
             }
@@ -2230,6 +2245,63 @@ mod tests {
             }
         }
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sh_file_operation_and_find_block_private_capi_keystore() {
+        let root = std::env::temp_dir().join(format!("pf_shell_ks_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ks = root.join(".capi-keystore");
+        let dst = root.join("exfil");
+        std::fs::create_dir_all(&ks).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(ks.join("user_test.key"), [0xAAu8; 32]).unwrap();
+        std::fs::write(ks.join("user_test_containers.bin"), b"PFCAPIE1secret").unwrap();
+
+        let prev_home = std::env::var_os("TRANSLATOR_HOME");
+        let prev_drive = std::env::var_os("AW2_DRIVE_C");
+        std::env::set_var("TRANSLATOR_HOME", &root);
+        std::env::remove_var("AW2_DRIVE_C");
+        crate::path::add_mount("V:\\", &root);
+
+        // 1. Wildcard SHFileOperationW(FO_COPY) on V:\.capi-* must not match or copy .capi-keystore
+        let rc_wild = execute_file_op(
+            FO_COPY,
+            &["V:\\.capi-*".to_string()],
+            &["V:\\exfil".to_string()],
+            0,
+        );
+        assert_eq!(rc_wild, err::ERROR_FILE_NOT_FOUND as i32);
+        assert!(!dst.join(".capi-keystore").exists());
+
+        // 2. Recursive SHFileOperationW(FO_COPY) on parent V:\ must be rejected before copying .capi-keystore
+        let rc_rec = execute_file_op(
+            FO_COPY,
+            &["V:\\".to_string()],
+            &["V:\\exfil\\copy".to_string()],
+            0,
+        );
+        assert_eq!(rc_rec, err::ERROR_ACCESS_DENIED as i32);
+        assert!(!dst.join("copy").join(".capi-keystore").exists());
+
+        // 3. FindFirstFileW wildcard must not reveal .capi-keystore
+        unsafe {
+            let pat = crate::strings::to_wide_z("V:\\.capi-*");
+            let mut fdata = [0u8; 592];
+            let h = crate::kernel32::file::FindFirstFileW(pat.as_ptr(), fdata.as_mut_ptr());
+            assert_eq!(h, INVALID_HANDLE_VALUE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+        }
+
+        match prev_home {
+            Some(v) => std::env::set_var("TRANSLATOR_HOME", v),
+            None => std::env::remove_var("TRANSLATOR_HOME"),
+        }
+        match prev_drive {
+            Some(v) => std::env::set_var("AW2_DRIVE_C", v),
+            None => std::env::remove_var("AW2_DRIVE_C"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }
