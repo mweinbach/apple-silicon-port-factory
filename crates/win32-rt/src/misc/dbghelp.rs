@@ -1,23 +1,41 @@
-//! dbghelp.dll: crash-reporting helpers.
+//! dbghelp.dll: crash-reporting, stack-walking, minidump, and PDB line-info helpers.
 //!
-//! The function-table / module-base callbacks are real (backed by the loader
-//! module list and `.pdata`). Symbol lookup, StackWalk64 and minidumps are not
-//! implemented and fail with a STUB log; crashes are reported by our own
-//! signal handler instead.
+//! Backed by the loader's module table, the x64 `.pdata` unwinder (`crate::unwind`),
+//! an MSF 7.0 / CodeView C13 PDB line-table reader, and a full Windows `MDMP` writer.
 
 use crate::types::*;
+use crate::unwind::{Context, ExceptionRecord, RBP, RSP};
+use pe_image::RuntimeFunction;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
 
-const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_INVALID_ADDRESS: u32 = 487;
+const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
+const ADDR_MODE_FLAT: u32 = 3;
 
 static OPTIONS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Debug)]
+struct PdbLineEntry {
+    rva: u32,
+    line: u32,
+    file_idx: usize,
+}
+
+struct PdbLineCache {
+    /// Cached NUL-terminated ANSI & UTF-16 file paths kept at stable heap addresses
+    /// for the lifetime of the `SymState` entry (`IMAGEHLP_LINE64::FileName` pointers).
+    ansi_files: Vec<Box<[u8]>>,
+    wide_files: Vec<Box<[u16]>>,
+    lines: Vec<PdbLineEntry>,
+}
 
 #[derive(Clone, Debug)]
 struct SymModule {
@@ -31,6 +49,8 @@ struct SymModule {
 struct SymState {
     search_path: String,
     modules: Vec<SymModule>,
+    /// Per-module base address -> parsed PDB line info (`None` = searched and not found).
+    pdb_lines: HashMap<u64, Option<PdbLineCache>>,
 }
 
 fn sym_table() -> &'static Mutex<HashMap<usize, SymState>> {
@@ -79,6 +99,7 @@ fn init_sym_state(process: HANDLE, search_path: Option<String>, invade: bool) ->
     let mut st = SymState {
         search_path: search_path.unwrap_or_else(|| ".".to_string()),
         modules: Vec::new(),
+        pdb_lines: HashMap::new(),
     };
     if invade {
         if let Some(loader) = crate::try_loader() {
@@ -499,10 +520,1322 @@ pub unsafe extern "win64" fn SymEnumerateModulesW64(
     TRUE
 }
 
-// @exports SymGetLineFromAddr64 SymGetLineFromAddrW64 StackWalk64 MiniDumpWriteDump
-failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
-    SymGetLineFromAddr64, SymGetLineFromAddrW64,
-    StackWalk64, MiniDumpWriteDump);
+// ============================================================================
+// StackWalk64 (backed by `crate::unwind` x64 `.pdata` unwinder)
+// ============================================================================
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Address64 {
+    offset: u64,
+    segment: u16,
+    _pad: u16,
+    mode: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KdHelp64 {
+    thread: u64,
+    th_callback_stack: u32,
+    th_callback_bstore: u32,
+    next_callback: u32,
+    frame_pointer: u32,
+    ki_call_user_mode: u64,
+    ke_user_callback_dispatcher: u64,
+    system_range_start: u64,
+    ki_user_exception_dispatcher: u64,
+    stack_base: u64,
+    stack_limit: u64,
+    build_version: u32,
+    retpoline_stub_function_table_size: u32,
+    retpoline_stub_function_table: u64,
+    retpoline_stub_offset: u32,
+    retpoline_stub_size: u32,
+    reserved0: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct StackFrame64 {
+    addr_pc: Address64,
+    addr_return: Address64,
+    addr_frame: Address64,
+    addr_stack: Address64,
+    addr_bstore: Address64,
+    func_table_entry: u64,
+    params: [u64; 4],
+    far: BOOL,
+    virtual_: BOOL,
+    reserved: [u64; 3],
+    kd_help: KdHelp64,
+}
+
+const _: () = assert!(std::mem::size_of::<Address64>() == 16);
+const _: () = assert!(std::mem::size_of::<KdHelp64>() == 112);
+const _: () = assert!(std::mem::size_of::<StackFrame64>() == 264);
+
+const STACKWALK_INIT_MAGIC: u64 = 0x5357_3634_0000_0001;
+const STACKWALK_MAX_DEPTH: u64 = 256;
+
+fn flat_addr(offset: u64) -> Address64 {
+    Address64 {
+        offset,
+        segment: 0,
+        _pad: 0,
+        mode: ADDR_MODE_FLAT,
+    }
+}
+
+unsafe fn sw_read_mem(
+    h_process: HANDLE,
+    read_mem_cb: *const c_void,
+    addr: u64,
+    buf: &mut [u8],
+) -> bool {
+    if addr < 0x1000 || buf.is_empty() {
+        return false;
+    }
+    if !read_mem_cb.is_null() {
+        let mut n_read: u32 = 0;
+        let ok = crate::call_guest8(
+            read_mem_cb as usize,
+            h_process as u64,
+            addr,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            &mut n_read as *mut u32 as u64,
+            0,
+            0,
+            0,
+        );
+        return ok != 0 && (n_read as usize) == buf.len();
+    }
+    crate::crash::safe_read(addr, buf)
+}
+
+unsafe fn sw_read_u64(h_process: HANDLE, read_mem_cb: *const c_void, addr: u64) -> Option<u64> {
+    let mut b = [0u8; 8];
+    sw_read_mem(h_process, read_mem_cb, addr, &mut b).then(|| u64::from_le_bytes(b))
+}
+
+unsafe fn sw_lookup_rf(
+    h_process: HANDLE,
+    pc: u64,
+    fn_table_cb: *const c_void,
+    mod_base_cb: *const c_void,
+    read_mem_cb: *const c_void,
+) -> Option<(u64, RuntimeFunction, u64)> {
+    if pc < 0x1000 {
+        return None;
+    }
+    let default_ft = SymFunctionTableAccess64 as *const () as usize;
+    let default_mb = SymGetModuleBase64 as *const () as usize;
+
+    let use_custom_ft = !fn_table_cb.is_null() && (fn_table_cb as usize) != default_ft;
+    let use_custom_mb = !mod_base_cb.is_null() && (mod_base_cb as usize) != default_mb;
+
+    if !use_custom_ft && !use_custom_mb {
+        let (base, rf_ptr) = crate::unwind::lookup_function_entry(pc)?;
+        let mut raw = [0u8; 12];
+        if !sw_read_mem(h_process, read_mem_cb, rf_ptr as u64, &mut raw) {
+            return None;
+        }
+        let rf = std::ptr::read_unaligned(raw.as_ptr() as *const RuntimeFunction);
+        return Some((base, rf, rf_ptr as u64));
+    }
+
+    let rf_addr = if use_custom_ft {
+        crate::call_guest8(fn_table_cb as usize, h_process as u64, pc, 0, 0, 0, 0, 0, 0)
+    } else {
+        SymFunctionTableAccess64(h_process, pc) as u64
+    };
+    if rf_addr == 0 {
+        return None;
+    }
+    let base = if use_custom_mb {
+        crate::call_guest8(mod_base_cb as usize, h_process as u64, pc, 0, 0, 0, 0, 0, 0)
+    } else {
+        SymGetModuleBase64(h_process, pc)
+    };
+    if base == 0 {
+        return None;
+    }
+    let mut raw = [0u8; 12];
+    if !sw_read_mem(h_process, read_mem_cb, rf_addr, &mut raw) {
+        return None;
+    }
+    let rf = std::ptr::read_unaligned(raw.as_ptr() as *const RuntimeFunction);
+    Some((base, rf, rf_addr))
+}
+
+/// Unwind `ctx` by one x86-64 frame using `.pdata` (via `safe_virtual_unwind`)
+/// or the x64 leaf-function convention (`[rsp]`) when no `.pdata` entry exists.
+unsafe fn sw_unwind_one(
+    h_process: HANDLE,
+    ctx: &mut Context,
+    is_first_frame: bool,
+    fn_table_cb: *const c_void,
+    mod_base_cb: *const c_void,
+    read_mem_cb: *const c_void,
+) -> bool {
+    if ctx.rip == 0 {
+        return false;
+    }
+    let old_rip = ctx.rip;
+    let old_rsp = ctx.gpr[RSP];
+    let lookup_pc = if is_first_frame {
+        ctx.rip
+    } else {
+        ctx.rip.saturating_sub(1)
+    };
+    let allow_epilog = is_first_frame;
+
+    let unwound = if let Some((base, rf, _)) =
+        sw_lookup_rf(h_process, lookup_pc, fn_table_cb, mod_base_cb, read_mem_cb)
+    {
+        crate::unwind::safe_virtual_unwind(base, lookup_pc, rf, ctx, allow_epilog)
+    } else {
+        // Leaf function (no `.pdata` entry): return address sits directly at [RSP].
+        match sw_read_u64(h_process, read_mem_cb, ctx.gpr[RSP]) {
+            Some(ret) if ret != 0 => {
+                ctx.rip = ret;
+                ctx.gpr[RSP] = ctx.gpr[RSP].wrapping_add(8);
+                true
+            }
+            _ => false,
+        }
+    };
+    if !unwound || ctx.rip == 0 {
+        return false;
+    }
+    if ctx.gpr[RSP] < old_rsp || (ctx.gpr[RSP] == old_rsp && ctx.rip == old_rip) {
+        return false;
+    }
+    true
+}
+
+unsafe fn sw_fill_params(
+    h_process: HANDLE,
+    read_mem_cb: *const c_void,
+    rsp: u64,
+    sf: &mut StackFrame64,
+) {
+    for i in 0..4 {
+        let addr = rsp.wrapping_add(8 + (i as u64) * 8);
+        sf.params[i] = sw_read_u64(h_process, read_mem_cb, addr).unwrap_or(0);
+    }
+}
+
+pub unsafe extern "win64" fn StackWalk64(
+    machine_type: u32,
+    h_process: HANDLE,
+    _h_thread: HANDLE,
+    stack_frame: *mut u8,
+    context_record: *mut u8,
+    read_memory_routine: *const c_void,
+    function_table_access_routine: *const c_void,
+    get_module_base_routine: *const c_void,
+    _translate_address: *const c_void,
+) -> BOOL {
+    if stack_frame.is_null() || machine_type != IMAGE_FILE_MACHINE_AMD64 {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut sf = std::ptr::read_unaligned(stack_frame as *const StackFrame64);
+    let mut ctx = if !context_record.is_null() {
+        std::ptr::read_unaligned(context_record as *const Context)
+    } else {
+        let mut c = Context::zeroed();
+        c.rip = sf.addr_pc.offset;
+        c.gpr[RSP] = sf.addr_stack.offset;
+        c.gpr[RBP] = sf.addr_frame.offset;
+        c
+    };
+
+    if sf.reserved[0] != STACKWALK_INIT_MAGIC {
+        // First call: report the starting frame, then peek one frame ahead for AddrReturn.
+        if sf.addr_pc.offset != 0 {
+            ctx.rip = sf.addr_pc.offset;
+        }
+        if sf.addr_stack.offset != 0 {
+            ctx.gpr[RSP] = sf.addr_stack.offset;
+        }
+        if sf.addr_frame.offset != 0 {
+            ctx.gpr[RBP] = sf.addr_frame.offset;
+        }
+        if ctx.rip == 0 {
+            return FALSE;
+        }
+        sf.addr_pc = flat_addr(ctx.rip);
+        sf.addr_stack = flat_addr(ctx.gpr[RSP]);
+        sf.addr_frame = flat_addr(ctx.gpr[RBP]);
+        sf.func_table_entry = sw_lookup_rf(
+            h_process,
+            ctx.rip,
+            function_table_access_routine,
+            get_module_base_routine,
+            read_memory_routine,
+        )
+        .map(|(_, _, ptr)| ptr)
+        .unwrap_or(0);
+        sw_fill_params(h_process, read_memory_routine, ctx.gpr[RSP], &mut sf);
+
+        let mut peek = ctx;
+        let next_rip = if sw_unwind_one(
+            h_process,
+            &mut peek,
+            true,
+            function_table_access_routine,
+            get_module_base_routine,
+            read_memory_routine,
+        ) {
+            peek.rip
+        } else {
+            0
+        };
+        sf.addr_return = flat_addr(next_rip);
+        sf.far = FALSE;
+        sf.virtual_ = TRUE;
+        sf.reserved[0] = STACKWALK_INIT_MAGIC;
+        sf.reserved[1] = 1;
+        std::ptr::write_unaligned(stack_frame as *mut StackFrame64, sf);
+        return TRUE;
+    }
+
+    // Subsequent call: advance one frame from the current context.
+    let depth = sf.reserved[1];
+    if sf.addr_return.offset == 0 || depth >= STACKWALK_MAX_DEPTH {
+        sf.addr_pc = flat_addr(0);
+        sf.addr_return = flat_addr(0);
+        std::ptr::write_unaligned(stack_frame as *mut StackFrame64, sf);
+        return FALSE;
+    }
+
+    let is_first_step = depth == 1;
+    if !sw_unwind_one(
+        h_process,
+        &mut ctx,
+        is_first_step,
+        function_table_access_routine,
+        get_module_base_routine,
+        read_memory_routine,
+    ) {
+        sf.addr_pc = flat_addr(0);
+        sf.addr_return = flat_addr(0);
+        std::ptr::write_unaligned(stack_frame as *mut StackFrame64, sf);
+        return FALSE;
+    }
+
+    if !context_record.is_null() {
+        std::ptr::write_unaligned(context_record as *mut Context, ctx);
+    }
+
+    sf.addr_pc = flat_addr(ctx.rip);
+    sf.addr_stack = flat_addr(ctx.gpr[RSP]);
+    sf.addr_frame = flat_addr(ctx.gpr[RBP]);
+    sf.func_table_entry = sw_lookup_rf(
+        h_process,
+        ctx.rip.saturating_sub(1),
+        function_table_access_routine,
+        get_module_base_routine,
+        read_memory_routine,
+    )
+    .map(|(_, _, ptr)| ptr)
+    .unwrap_or(0);
+    sw_fill_params(h_process, read_memory_routine, ctx.gpr[RSP], &mut sf);
+
+    let mut peek = ctx;
+    let next_rip = if sw_unwind_one(
+        h_process,
+        &mut peek,
+        false,
+        function_table_access_routine,
+        get_module_base_routine,
+        read_memory_routine,
+    ) {
+        peek.rip
+    } else {
+        0
+    };
+    sf.addr_return = flat_addr(next_rip);
+    sf.reserved[1] = depth + 1;
+    std::ptr::write_unaligned(stack_frame as *mut StackFrame64, sf);
+    TRUE
+}
+
+// ============================================================================
+// MiniDumpWriteDump (valid Windows `MDMP` writer)
+// ============================================================================
+
+const MINIDUMP_SIGNATURE: u32 = 0x504D_444D; // "MDMP"
+const MINIDUMP_VERSION: u32 = 0x0000_A793; // 42899
+const MINIDUMP_THREAD_LIST_STREAM: u32 = 3;
+const MINIDUMP_MODULE_LIST_STREAM: u32 = 4;
+const MINIDUMP_MEMORY_LIST_STREAM: u32 = 5;
+const MINIDUMP_EXCEPTION_STREAM: u32 = 6;
+const MINIDUMP_SYSTEM_INFO_STREAM: u32 = 7;
+const MINIDUMP_MISC_INFO_STREAM: u32 = 15;
+const MINIDUMP_MISC1_PROCESS_ID: u32 = 0x0000_0001;
+
+struct MdmpBuilder {
+    buf: Vec<u8>,
+}
+
+impl MdmpBuilder {
+    fn new() -> Self {
+        Self { buf: Vec::with_capacity(64 * 1024) }
+    }
+
+    fn rva(&self) -> u32 {
+        self.buf.len() as u32
+    }
+
+    fn align4(&mut self) {
+        while (self.buf.len() & 3) != 0 {
+            self.buf.push(0);
+        }
+    }
+
+    fn push_u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+
+    fn push_u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_bytes(&mut self, b: &[u8]) -> (u32, u32) {
+        let rva = self.rva();
+        self.buf.extend_from_slice(b);
+        (b.len() as u32, rva)
+    }
+
+    fn push_minidump_string(&mut self, s: &str) -> u32 {
+        self.align4();
+        let rva = self.rva();
+        let units: Vec<u16> = s.encode_utf16().collect();
+        self.push_u32((units.len() * 2) as u32);
+        for u in units {
+            self.push_u16(u);
+        }
+        self.push_u16(0); // NUL terminator (not counted in byte length)
+        rva
+    }
+
+    fn patch_u32(&mut self, off: usize, v: u32) {
+        self.buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Extract PE `TimeDateStamp`, `CheckSum`, and optional CodeView `RSDS` record bytes
+/// from a mapped PE image in guest memory using fault-safe reads.
+fn read_pe_debug_metadata(base: u64) -> (u32, u32, Option<Vec<u8>>) {
+    let mut dos = [0u8; 64];
+    if !crate::crash::safe_read(base, &mut dos) || &dos[0..2] != b"MZ" {
+        return (0, 0, None);
+    }
+    let e_lfanew = u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]) as u64;
+    if e_lfanew < 64 || e_lfanew > 0x10_0000 {
+        return (0, 0, None);
+    }
+    let mut nt = [0u8; 264];
+    if !crate::crash::safe_read(base.wrapping_add(e_lfanew), &mut nt) || &nt[0..4] != b"PE\0\0" {
+        return (0, 0, None);
+    }
+    let time_date_stamp = u32::from_le_bytes([nt[8], nt[9], nt[10], nt[11]]);
+    let opt_magic = u16::from_le_bytes([nt[24], nt[25]]);
+    let checksum = u32::from_le_bytes([nt[24 + 64], nt[24 + 65], nt[24 + 66], nt[24 + 67]]);
+
+    // DataDirectory[6] = IMAGE_DIRECTORY_ENTRY_DEBUG.
+    // PE32+: data directories start at opt+112 (nt+136); entry 6 at nt+136+48 = nt+184.
+    // PE32:  data directories start at opt+96  (nt+120); entry 6 at nt+120+48 = nt+168.
+    let dd_off = match opt_magic {
+        0x20B => 24 + 112 + 6 * 8,
+        0x10B => 24 + 96 + 6 * 8,
+        _ => return (time_date_stamp, checksum, None),
+    };
+    let num_rva = u32::from_le_bytes([
+        nt[dd_off - 6 * 8 - 4],
+        nt[dd_off - 6 * 8 - 3],
+        nt[dd_off - 6 * 8 - 2],
+        nt[dd_off - 6 * 8 - 1],
+    ]);
+    if num_rva <= 6 || dd_off + 8 > nt.len() {
+        return (time_date_stamp, checksum, None);
+    }
+    let dbg_rva = u32::from_le_bytes([nt[dd_off], nt[dd_off + 1], nt[dd_off + 2], nt[dd_off + 3]]);
+    let dbg_sz =
+        u32::from_le_bytes([nt[dd_off + 4], nt[dd_off + 5], nt[dd_off + 6], nt[dd_off + 7]]);
+    if dbg_rva == 0 || dbg_sz < 28 {
+        return (time_date_stamp, checksum, None);
+    }
+    let entries = (dbg_sz / 28).min(32);
+    for i in 0..entries {
+        let mut dir = [0u8; 28];
+        if !crate::crash::safe_read(
+            base.wrapping_add(dbg_rva as u64).wrapping_add(i as u64 * 28),
+            &mut dir,
+        ) {
+            break;
+        }
+        let dbg_type = u32::from_le_bytes([dir[12], dir[13], dir[14], dir[15]]);
+        if dbg_type == 2 {
+            // IMAGE_DEBUG_TYPE_CODEVIEW
+            let data_sz = u32::from_le_bytes([dir[16], dir[17], dir[18], dir[19]]) as usize;
+            let addr_rva = u32::from_le_bytes([dir[20], dir[21], dir[22], dir[23]]) as u64;
+            if addr_rva != 0 && (24..=4096).contains(&data_sz) {
+                let mut cv = vec![0u8; data_sz];
+                if crate::crash::safe_read(base.wrapping_add(addr_rva), &mut cv) {
+                    return (time_date_stamp, checksum, Some(cv));
+                }
+            }
+        }
+    }
+    (time_date_stamp, checksum, None)
+}
+
+/// Capture up to `max_bytes` starting at `start` using fault-safe page-by-page reads.
+fn safe_read_range(start: u64, max_bytes: usize) -> Vec<u8> {
+    if start < 0x1000 || max_bytes == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cur = start;
+    while out.len() < max_bytes {
+        let page_rem = (0x1000 - (cur & 0xFFF)) as usize;
+        let step = page_rem.min(max_bytes - out.len());
+        let mut chunk = vec![0u8; step];
+        if !crate::crash::safe_read(cur, &mut chunk) {
+            break;
+        }
+        out.extend_from_slice(&chunk);
+        cur = match cur.checked_add(step as u64) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    out
+}
+
+pub unsafe extern "win64" fn MiniDumpWriteDump(
+    h_process: HANDLE,
+    process_id: u32,
+    h_file: HANDLE,
+    dump_type: u32,
+    exception_param: *const u8,
+    user_stream_param: *const u8,
+    _callback_param: *const u8,
+) -> BOOL {
+    if h_file.is_null() || h_file == INVALID_HANDLE_VALUE {
+        crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    let my_pid = std::process::id();
+    let is_self_handle = h_process.is_null()
+        || (h_process as isize) == -1
+        || (h_process as usize) == (my_pid as usize)
+        || crate::kernel32::process::GetProcessId(h_process) == my_pid;
+    if !is_self_handle && process_id != 0 && process_id != my_pid {
+        crate::teb::set_last_error(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+
+    // Read optional MINIDUMP_EXCEPTION_INFORMATION { ThreadId: u32, ExceptionPointers: ptr, ClientPointers: BOOL }
+    // Note: minidumpapiset.h uses `#pragma pack(push, 4)` so offsets are +0 ThreadId(4), +4 ExceptionPointers(8), +12 ClientPointers(4).
+    let mut exc_thread_id: Option<u32> = None;
+    let mut exc_record: Option<ExceptionRecord> = None;
+    let mut exc_context: Option<Context> = None;
+    if !exception_param.is_null() {
+        let tid = std::ptr::read_unaligned(exception_param as *const u32);
+        let ep_ptr = std::ptr::read_unaligned(exception_param.add(4) as *const usize);
+        if ep_ptr != 0 {
+            let er_ptr = std::ptr::read_unaligned(ep_ptr as *const *const ExceptionRecord);
+            let ctx_ptr =
+                std::ptr::read_unaligned((ep_ptr + 8) as *const *const Context);
+            if !er_ptr.is_null() {
+                exc_record = Some(std::ptr::read_unaligned(er_ptr));
+            }
+            if !ctx_ptr.is_null() {
+                exc_context = Some(std::ptr::read_unaligned(ctx_ptr));
+            }
+            exc_thread_id = Some(tid);
+        }
+    }
+
+    // Collect caller user streams (`MINIDUMP_USER_STREAM_INFORMATION`, packed(4): +0 count(4), +4 array_ptr(8)).
+    let mut user_streams: Vec<(u32, Vec<u8>)> = Vec::new();
+    if !user_stream_param.is_null() {
+        let count = std::ptr::read_unaligned(user_stream_param as *const u32) as usize;
+        let arr_ptr = std::ptr::read_unaligned(user_stream_param.add(4) as *const *const u8);
+        if count > 0 && !arr_ptr.is_null() {
+            // MINIDUMP_USER_STREAM (packed(4)): +0 Type(4), +4 BufferSize(4), +8 Buffer(8) = 16 bytes.
+            for i in 0..count.min(64) {
+                let elem = arr_ptr.add(i * 16);
+                let stype = std::ptr::read_unaligned(elem as *const u32);
+                let sz = std::ptr::read_unaligned(elem.add(4) as *const u32) as usize;
+                let ptr = std::ptr::read_unaligned(elem.add(8) as *const u64);
+                let mut data = vec![0u8; sz.min(16 * 1024 * 1024)];
+                if !data.is_empty() && ptr != 0 {
+                    if !crate::crash::safe_read(ptr, &mut data) {
+                        data.clear();
+                    }
+                }
+                user_streams.push((stype, data));
+            }
+        }
+    }
+
+    // Capture current thread context if no exception context was supplied.
+    let current_tid = crate::kernel32::threads::GetCurrentThreadId();
+    let active_ctx = exc_context.unwrap_or_else(|| {
+        if let Some(gc) = crate::crash::capture_guest_context() {
+            gc
+        } else {
+            let mut c = Context::zeroed();
+            crate::unwind::RtlCaptureContext(&mut c);
+            c
+        }
+    });
+
+    // Gather module list (loader modules + manually SymLoadModule64-registered modules).
+    let mut modules: Vec<SymModule> = Vec::new();
+    if let Some(loader) = crate::try_loader() {
+        for (base, size, path) in loader.loaded_modules() {
+            let mod_name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+            modules.push(SymModule {
+                base: base as u64,
+                size,
+                module_name: mod_name,
+                image_name: path,
+            });
+        }
+    }
+    {
+        let tbl = sym_table().lock().unwrap();
+        if let Some(st) = tbl.get(&proc_key(h_process)) {
+            for m in &st.modules {
+                if !modules.iter().any(|existing| existing.base == m.base) {
+                    modules.push(m.clone());
+                }
+            }
+        }
+    }
+
+    // Gather thread entries: primary/crashing thread + any other tracked Win32 threads.
+    let mut thread_entries: Vec<(u32, u64, Context)> = Vec::new();
+    let main_tid = exc_thread_id.unwrap_or(current_tid);
+    let main_teb = crate::teb::current() as u64;
+    thread_entries.push((main_tid, main_teb, active_ctx));
+    for t in crate::thread::all_threads() {
+        let tid = t.tid.load(Ordering::Relaxed) as u32;
+        if tid != 0 && tid != main_tid && t.exit_code().is_none() {
+            let teb = t.teb.load(Ordering::Relaxed) as u64;
+            let mut c = Context::zeroed();
+            c.context_flags = crate::unwind::CONTEXT_FULL;
+            thread_entries.push((tid, teb, c));
+        }
+    }
+
+    // Stream directory count: ThreadList, ModuleList, MemoryList, SystemInfo, MiscInfo
+    // + optional ExceptionStream + user streams.
+    let has_exc = exc_record.is_some();
+    let num_streams = 5u32 + u32::from(has_exc) + (user_streams.len() as u32);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+
+    let mut md = MdmpBuilder::new();
+    // MINIDUMP_HEADER (32 bytes)
+    md.push_u32(MINIDUMP_SIGNATURE);
+    md.push_u32(MINIDUMP_VERSION);
+    md.push_u32(num_streams);
+    md.push_u32(32); // StreamDirectoryRva
+    md.push_u32(0); // CheckSum
+    md.push_u32(now_unix);
+    md.push_u64(dump_type as u64);
+
+    // Reserve MINIDUMP_DIRECTORY array (12 bytes per stream).
+    let dir_base = md.buf.len();
+    for _ in 0..num_streams {
+        md.push_u32(0);
+        md.push_u32(0);
+        md.push_u32(0);
+    }
+    let mut dir_idx = 0usize;
+    let mut write_dir = |md: &mut MdmpBuilder, stype: u32, size: u32, rva: u32| {
+        let off = dir_base + dir_idx * 12;
+        md.patch_u32(off, stype);
+        md.patch_u32(off + 4, size);
+        md.patch_u32(off + 8, rva);
+        dir_idx += 1;
+    };
+
+    // 1. SystemInfoStream (7): 56 bytes + CSDVersion MINIDUMP_STRING
+    let csd_rva = md.push_minidump_string("");
+    md.align4();
+    let sys_rva = md.rva();
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get().min(255) as u8)
+        .unwrap_or(1);
+    md.push_u16(9); // PROCESSOR_ARCHITECTURE_AMD64
+    md.push_u16(6); // ProcessorLevel
+    md.push_u16(0); // ProcessorRevision
+    md.push_u8(ncpu);
+    md.push_u8(1); // VER_NT_WORKSTATION
+    md.push_u32(10); // MajorVersion
+    md.push_u32(0); // MinorVersion
+    md.push_u32(19045); // BuildNumber
+    md.push_u32(2); // VER_PLATFORM_WIN32_NT
+    md.push_u32(csd_rva);
+    md.push_u16(0x0100); // VER_SUITE_SINGLEUSERTS
+    md.push_u16(0); // Reserved2
+    // CPU_INFORMATION union (24 bytes): OtherCpuInfo.ProcessorFeatures[2]
+    md.push_u64(0);
+    md.push_u64(0);
+    md.push_u64(0);
+    write_dir(&mut md, MINIDUMP_SYSTEM_INFO_STREAM, 56, sys_rva);
+
+    // 2. MiscInfoStream (15): 24 bytes
+    md.align4();
+    let misc_rva = md.rva();
+    md.push_u32(24); // SizeOfInfo
+    md.push_u32(MINIDUMP_MISC1_PROCESS_ID);
+    md.push_u32(if process_id != 0 { process_id } else { my_pid });
+    md.push_u32(0);
+    md.push_u32(0);
+    md.push_u32(0);
+    write_dir(&mut md, MINIDUMP_MISC_INFO_STREAM, 24, misc_rva);
+
+    // 3. Pre-write module names and CodeView records, then ModuleListStream (4)
+    let mut mod_meta: Vec<(u32, u32, u32, (u32, u32))> = Vec::with_capacity(modules.len());
+    for m in &modules {
+        let name_rva = md.push_minidump_string(&m.image_name);
+        let (ts, csum, cv) = read_pe_debug_metadata(m.base);
+        let cv_loc = match cv {
+            Some(bytes) => {
+                md.align4();
+                md.push_bytes(&bytes)
+            }
+            None => (0, 0),
+        };
+        mod_meta.push((name_rva, ts, csum, cv_loc));
+    }
+    md.align4();
+    let mod_list_rva = md.rva();
+    md.push_u32(modules.len() as u32);
+    for (m, &(name_rva, ts, csum, (cv_sz, cv_rva))) in modules.iter().zip(mod_meta.iter()) {
+        // MINIDUMP_MODULE (108 bytes)
+        md.push_u64(m.base);
+        md.push_u32(m.size);
+        md.push_u32(csum);
+        md.push_u32(ts);
+        md.push_u32(name_rva);
+        // VS_FIXEDFILEINFO (52 bytes)
+        md.push_u32(0xFEEF_04BD); // dwSignature
+        md.push_u32(0x0001_0000); // dwStrucVersion
+        for _ in 0..11 {
+            md.push_u32(0);
+        }
+        // CvRecord (8 bytes)
+        md.push_u32(cv_sz);
+        md.push_u32(cv_rva);
+        // MiscRecord (8 bytes)
+        md.push_u32(0);
+        md.push_u32(0);
+        // Reserved0, Reserved1 (16 bytes)
+        md.push_u64(0);
+        md.push_u64(0);
+    }
+    let mod_list_sz = 4 + (modules.len() as u32) * 108;
+    write_dir(&mut md, MINIDUMP_MODULE_LIST_STREAM, mod_list_sz, mod_list_rva);
+
+    // 4. Write thread contexts + stack captures, then ThreadListStream (3)
+    let mut mem_ranges: Vec<(u64, u32, u32)> = Vec::new();
+    let mut thread_locs: Vec<(u32, u64, (u64, u32, u32), (u32, u32))> =
+        Vec::with_capacity(thread_entries.len());
+    let mut primary_ctx_loc = (0u32, 0u32);
+    for (idx, (tid, teb, ctx)) in thread_entries.iter().enumerate() {
+        md.align4();
+        let ctx_bytes = std::slice::from_raw_parts(
+            ctx as *const Context as *const u8,
+            std::mem::size_of::<Context>(),
+        );
+        let ctx_loc = md.push_bytes(ctx_bytes);
+        if idx == 0 {
+            primary_ctx_loc = ctx_loc;
+        }
+        let stack_start = ctx.gpr[RSP];
+        let stack_bytes = safe_read_range(stack_start, 64 * 1024);
+        let stack_loc = if !stack_bytes.is_empty() {
+            md.align4();
+            let (sz, rva) = md.push_bytes(&stack_bytes);
+            mem_ranges.push((stack_start, sz, rva));
+            (stack_start, sz, rva)
+        } else {
+            (0, 0, 0)
+        };
+        thread_locs.push((*tid, *teb, stack_loc, ctx_loc));
+    }
+    md.align4();
+    let thr_list_rva = md.rva();
+    md.push_u32(thread_locs.len() as u32);
+    for &(tid, teb, (st_start, st_sz, st_rva), (ctx_sz, ctx_rva)) in &thread_locs {
+        // MINIDUMP_THREAD (48 bytes)
+        md.push_u32(tid);
+        md.push_u32(0); // SuspendCount
+        md.push_u32(0x20); // PriorityClass (NORMAL_PRIORITY_CLASS)
+        md.push_u32(0); // Priority
+        md.push_u64(teb);
+        // Stack: MINIDUMP_MEMORY_DESCRIPTOR (16 bytes)
+        md.push_u64(st_start);
+        md.push_u32(st_sz);
+        md.push_u32(st_rva);
+        // ThreadContext: MINIDUMP_LOCATION_DESCRIPTOR (8 bytes)
+        md.push_u32(ctx_sz);
+        md.push_u32(ctx_rva);
+    }
+    let thr_list_sz = 4 + (thread_locs.len() as u32) * 48;
+    write_dir(&mut md, MINIDUMP_THREAD_LIST_STREAM, thr_list_sz, thr_list_rva);
+
+    // 5. Optional code window around RIP + MemoryListStream (5)
+    if active_ctx.rip >= 0x1000 {
+        let code_start = active_ctx.rip.saturating_sub(64);
+        let code_bytes = safe_read_range(code_start, 256);
+        if !code_bytes.is_empty()
+            && !mem_ranges
+                .iter()
+                .any(|&(s, sz, _)| code_start >= s && code_start < s.saturating_add(sz as u64))
+        {
+            md.align4();
+            let (sz, rva) = md.push_bytes(&code_bytes);
+            mem_ranges.push((code_start, sz, rva));
+        }
+    }
+    md.align4();
+    let mem_list_rva = md.rva();
+    md.push_u32(mem_ranges.len() as u32);
+    for &(start, sz, rva) in &mem_ranges {
+        md.push_u64(start);
+        md.push_u32(sz);
+        md.push_u32(rva);
+    }
+    let mem_list_sz = 4 + (mem_ranges.len() as u32) * 16;
+    write_dir(&mut md, MINIDUMP_MEMORY_LIST_STREAM, mem_list_sz, mem_list_rva);
+
+    // 6. Optional ExceptionStream (6): 168 bytes
+    if let Some(er) = exc_record {
+        md.align4();
+        let exc_rva = md.rva();
+        md.push_u32(main_tid);
+        md.push_u32(0); // __alignment
+        md.push_u32(er.code);
+        md.push_u32(er.flags);
+        md.push_u64(er.record as u64);
+        md.push_u64(er.address as u64);
+        md.push_u32(er.number_parameters.min(15));
+        md.push_u32(0); // __unusedAlignment
+        for &info in &er.information {
+            md.push_u64(info);
+        }
+        md.push_u32(primary_ctx_loc.0);
+        md.push_u32(primary_ctx_loc.1);
+        write_dir(&mut md, MINIDUMP_EXCEPTION_STREAM, 168, exc_rva);
+    }
+
+    // 7. Caller-provided UserStreams
+    for (stype, data) in &user_streams {
+        md.align4();
+        let (sz, rva) = md.push_bytes(data);
+        write_dir(&mut md, *stype, sz, rva);
+    }
+
+    // Write the entire MDMP file to `h_file`.
+    let mut offset = 0usize;
+    while offset < md.buf.len() {
+        let chunk = (md.buf.len() - offset).min(u32::MAX as usize) as u32;
+        let mut written = 0u32;
+        let ok = crate::kernel32::file::WriteFile(
+            h_file,
+            md.buf.as_ptr().add(offset) as *const c_void,
+            chunk,
+            &mut written,
+            std::ptr::null_mut(),
+        );
+        if ok == FALSE || written == 0 {
+            return FALSE;
+        }
+        offset += written as usize;
+    }
+    TRUE
+}
+
+// ============================================================================
+// MSF 7.0 / CodeView C13 PDB Line-Table Reader + SymGetLineFromAddr{64,W64}
+// ============================================================================
+
+const MSF7_MAGIC: &[u8; 32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0";
+const DEBUG_S_LINES: u32 = 0xF2;
+const DEBUG_S_FILECHKSMS: u32 = 0xF4;
+
+fn read_le_u16(b: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
+}
+
+fn read_le_u32(b: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
+}
+
+struct MsfFile<'a> {
+    data: &'a [u8],
+    block_size: usize,
+    streams: Vec<(usize, Vec<u32>)>,
+}
+
+impl<'a> MsfFile<'a> {
+    fn parse(data: &'a [u8]) -> Option<Self> {
+        if data.len() < 56 || &data[0..32] != MSF7_MAGIC {
+            return None;
+        }
+        let block_size = read_le_u32(data, 32)? as usize;
+        if !(512..=65536).contains(&block_size) || !block_size.is_power_of_two() {
+            return None;
+        }
+        let dir_bytes = read_le_u32(data, 44)? as usize;
+        let block_map_addr = read_le_u32(data, 52)? as usize;
+        let dir_blocks = dir_bytes.div_ceil(block_size);
+        let map_off = block_map_addr.checked_mul(block_size)?;
+        let mut dir_buf = Vec::with_capacity(dir_blocks * block_size);
+        for i in 0..dir_blocks {
+            let blk = read_le_u32(data, map_off + i * 4)? as usize;
+            let start = blk.checked_mul(block_size)?;
+            dir_buf.extend_from_slice(data.get(start..start + block_size)?);
+        }
+        dir_buf.truncate(dir_bytes);
+
+        let num_streams = read_le_u32(&dir_buf, 0)? as usize;
+        if num_streams > 65536 {
+            return None;
+        }
+        let mut sizes = Vec::with_capacity(num_streams);
+        let mut pos = 4usize;
+        for _ in 0..num_streams {
+            sizes.push(read_le_u32(&dir_buf, pos)?);
+            pos += 4;
+        }
+        let mut streams = Vec::with_capacity(num_streams);
+        for raw_sz in sizes {
+            if raw_sz == u32::MAX || raw_sz == 0 {
+                streams.push((0, Vec::new()));
+                continue;
+            }
+            let sz = raw_sz as usize;
+            let nblocks = sz.div_ceil(block_size);
+            let mut blocks = Vec::with_capacity(nblocks);
+            for _ in 0..nblocks {
+                blocks.push(read_le_u32(&dir_buf, pos)?);
+                pos += 4;
+            }
+            streams.push((sz, blocks));
+        }
+        Some(Self { data, block_size, streams })
+    }
+
+    fn read_stream(&self, idx: usize) -> Option<Vec<u8>> {
+        let (sz, blocks) = self.streams.get(idx)?;
+        if *sz == 0 {
+            return Some(Vec::new());
+        }
+        let mut out = Vec::with_capacity(blocks.len() * self.block_size);
+        for &blk in blocks {
+            let start = (blk as usize).checked_mul(self.block_size)?;
+            out.extend_from_slice(self.data.get(start..start + self.block_size)?);
+        }
+        out.truncate(*sz);
+        Some(out)
+    }
+}
+
+/// Find the `/names` string-table stream index in PDB stream 1 (PDB Info Stream).
+fn parse_pdb_names_stream_index(pdb_info: &[u8]) -> Option<usize> {
+    // Header: Version(4), Signature(4), Age(4), Guid(16) = 28 bytes.
+    if pdb_info.len() < 32 {
+        return None;
+    }
+    let names_buf_len = read_le_u32(pdb_info, 28)? as usize;
+    let names_buf_start = 32usize;
+    let names_buf_end = names_buf_start.checked_add(names_buf_len)?;
+    let names_buf = pdb_info.get(names_buf_start..names_buf_end)?;
+
+    // Serialized hash table: Size(4), Capacity(4), PresentBitVector, DeletedBitVector, (k, v) pairs.
+    let mut pos = names_buf_end;
+    let _size = read_le_u32(pdb_info, pos)?;
+    pos += 4;
+    let _cap = read_le_u32(pdb_info, pos)?;
+    pos += 4;
+    let present_words = read_le_u32(pdb_info, pos)? as usize;
+    pos += 4;
+    let mut present_bits = Vec::with_capacity(present_words);
+    for _ in 0..present_words {
+        present_bits.push(read_le_u32(pdb_info, pos)?);
+        pos += 4;
+    }
+    let deleted_words = read_le_u32(pdb_info, pos)? as usize;
+    pos += 4 + deleted_words * 4;
+
+    let present_count: usize = present_bits.iter().map(|w| w.count_ones() as usize).sum();
+    for _ in 0..present_count {
+        let name_off = read_le_u32(pdb_info, pos)? as usize;
+        let stream_idx = read_le_u32(pdb_info, pos + 4)? as usize;
+        pos += 8;
+        if let Some(tail) = names_buf.get(name_off..) {
+            let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+            if &tail[..end] == b"/names" {
+                return Some(stream_idx);
+            }
+        }
+    }
+    None
+}
+
+/// Read section virtual addresses (1-based `seg` -> RVA) from a mapped PE image.
+fn read_pe_section_rvas(base: u64) -> Vec<u32> {
+    let mut dos = [0u8; 64];
+    if !crate::crash::safe_read(base, &mut dos) || &dos[0..2] != b"MZ" {
+        return Vec::new();
+    }
+    let e_lfanew = u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]) as u64;
+    let mut coff = [0u8; 24];
+    if !crate::crash::safe_read(base.wrapping_add(e_lfanew), &mut coff) || &coff[0..4] != b"PE\0\0" {
+        return Vec::new();
+    }
+    let num_sec = u16::from_le_bytes([coff[6], coff[7]]) as usize;
+    let opt_sz = u16::from_le_bytes([coff[20], coff[21]]) as u64;
+    let sec_start = base.wrapping_add(e_lfanew).wrapping_add(24).wrapping_add(opt_sz);
+    let mut rvas = Vec::with_capacity(num_sec.min(128));
+    for i in 0..num_sec.min(128) {
+        let mut hdr = [0u8; 40];
+        if !crate::crash::safe_read(sec_start.wrapping_add(i as u64 * 40), &mut hdr) {
+            break;
+        }
+        rvas.push(u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]));
+    }
+    rvas
+}
+
+/// Parse an MSF 7.0 PDB file into a sorted RVA -> (file, line) cache.
+fn parse_pdb_line_cache(pdb_bytes: &[u8], fallback_sec_rvas: &[u32]) -> Option<PdbLineCache> {
+    let msf = MsfFile::parse(pdb_bytes)?;
+    let pdb_info = msf.read_stream(1)?;
+    let names_stream_idx = parse_pdb_names_stream_index(&pdb_info)?;
+    let names_stream = msf.read_stream(names_stream_idx)?;
+    // `/names` header: Signature(0xEFFEEFFE), HashVersion(4), ByteSize(4), then NUL-terminated strings.
+    if names_stream.len() < 12 || read_le_u32(&names_stream, 0)? != 0xEFFE_EFFE {
+        return None;
+    }
+    let str_byte_len = read_le_u32(&names_stream, 8)? as usize;
+    let str_table = names_stream.get(12..12usize.checked_add(str_byte_len)?)?;
+
+    // Stream 3: DBI stream.
+    let dbi = msf.read_stream(3)?;
+    if dbi.len() < 64 {
+        return None;
+    }
+    let mod_info_sz = read_le_u32(&dbi, 24)? as usize;
+    let sec_contrib_sz = read_le_u32(&dbi, 28)? as usize;
+    let sec_map_sz = read_le_u32(&dbi, 32)? as usize;
+    let src_info_sz = read_le_u32(&dbi, 36)? as usize;
+    let type_server_sz = read_le_u32(&dbi, 40)? as usize;
+    let opt_dbg_sz = read_le_u32(&dbi, 48)? as usize;
+    let ec_sz = read_le_u32(&dbi, 52)? as usize;
+
+    // Optional Debug Header Substream: entry 5 = Section Header stream index (u16).
+    let opt_dbg_off = 64usize
+        .checked_add(mod_info_sz)?
+        .checked_add(sec_contrib_sz)?
+        .checked_add(sec_map_sz)?
+        .checked_add(src_info_sz)?
+        .checked_add(type_server_sz)?
+        .checked_add(ec_sz)?;
+    let mut sec_rvas: Vec<u32> = Vec::new();
+    if opt_dbg_sz >= 12 {
+        if let Some(sec_hdr_idx) = read_le_u16(&dbi, opt_dbg_off + 10) {
+            if sec_hdr_idx != 0xFFFF {
+                if let Some(sec_stream) = msf.read_stream(sec_hdr_idx as usize) {
+                    for chunk in sec_stream.chunks_exact(40) {
+                        sec_rvas.push(u32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]));
+                    }
+                }
+            }
+        }
+    }
+    if sec_rvas.is_empty() {
+        sec_rvas.extend_from_slice(fallback_sec_rvas);
+    }
+
+    let mut file_map: HashMap<String, usize> = HashMap::new();
+    let mut ansi_files: Vec<Box<[u8]>> = Vec::new();
+    let mut wide_files: Vec<Box<[u16]>> = Vec::new();
+    let mut lines: Vec<PdbLineEntry> = Vec::new();
+
+    let mut intern_file = |name: String| -> usize {
+        if let Some(&idx) = file_map.get(&name) {
+            return idx;
+        }
+        let idx = ansi_files.len();
+        let mut a = name.as_bytes().to_vec();
+        a.push(0);
+        ansi_files.push(a.into_boxed_slice());
+        wide_files.push(crate::strings::to_wide_z(&name).into_boxed_slice());
+        file_map.insert(name, idx);
+        idx
+    };
+
+    // Walk Module Info Substream starting at DBI offset 64.
+    let mod_end = 64usize.checked_add(mod_info_sz)?;
+    let mut mpos = 64usize;
+    while mpos + 64 <= mod_end && mpos + 64 <= dbi.len() {
+        let mod_stream = read_le_u16(&dbi, mpos + 34)?;
+        let sym_sz = read_le_u32(&dbi, mpos + 36)? as usize;
+        let c11_sz = read_le_u32(&dbi, mpos + 40)? as usize;
+        let c13_sz = read_le_u32(&dbi, mpos + 44)? as usize;
+        // Skip ModuleName and ObjFileName (two NUL-terminated strings after fixed 64-byte header), align to 4.
+        let mut npos = mpos + 64;
+        for _ in 0..2 {
+            while npos < mod_end && dbi[npos] != 0 {
+                npos += 1;
+            }
+            if npos < mod_end {
+                npos += 1;
+            }
+        }
+        mpos = (npos + 3) & !3;
+
+        if mod_stream == 0xFFFF || c13_sz == 0 {
+            continue;
+        }
+        let Some(ms) = msf.read_stream(mod_stream as usize) else {
+            continue;
+        };
+        let c13_start = sym_sz.saturating_add(c11_sz);
+        let Some(c13) = ms.get(c13_start..c13_start.saturating_add(c13_sz).min(ms.len())) else {
+            continue;
+        };
+
+        // Pass 1: find DEBUG_S_FILECHKSMS subsection (`file_id` offset -> filename string).
+        let mut chksms_slice: Option<&[u8]> = None;
+        let mut spos = 0usize;
+        while spos + 8 <= c13.len() {
+            let stype = read_le_u32(c13, spos)?;
+            let slen = read_le_u32(c13, spos + 4)? as usize;
+            let body_start = spos + 8;
+            let body_end = body_start.saturating_add(slen).min(c13.len());
+            if stype == DEBUG_S_FILECHKSMS {
+                chksms_slice = Some(&c13[body_start..body_end]);
+                break;
+            }
+            spos = (body_end + 3) & !3;
+        }
+        let Some(chksms) = chksms_slice else {
+            continue;
+        };
+
+        // Pass 2: parse all DEBUG_S_LINES subsections.
+        spos = 0;
+        while spos + 8 <= c13.len() {
+            let stype = read_le_u32(c13, spos)?;
+            let slen = read_le_u32(c13, spos + 4)? as usize;
+            let body_start = spos + 8;
+            let body_end = body_start.saturating_add(slen).min(c13.len());
+            spos = (body_end + 3) & !3;
+            if stype != DEBUG_S_LINES || body_end - body_start < 12 {
+                continue;
+            }
+            let body = &c13[body_start..body_end];
+            let off_con = read_le_u32(body, 0)?;
+            let seg_con = read_le_u16(body, 4)?;
+            let flags = read_le_u16(body, 6)?;
+            let has_cols = (flags & 1) != 0;
+            let sec_rva = if seg_con >= 1 {
+                sec_rvas.get((seg_con - 1) as usize).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let mut bpos = 12usize;
+            while bpos + 12 <= body.len() {
+                let file_id = read_le_u32(body, bpos)? as usize;
+                let n_lines = read_le_u32(body, bpos + 4)? as usize;
+                let cb_block = read_le_u32(body, bpos + 8)? as usize;
+                if cb_block < 12 || bpos + cb_block > body.len() {
+                    break;
+                }
+                let file_name = read_le_u32(chksms, file_id)
+                    .and_then(|name_off| {
+                        let tail = str_table.get(name_off as usize..)?;
+                        let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+                        Some(String::from_utf8_lossy(&tail[..nul]).into_owned())
+                    })
+                    .unwrap_or_default();
+                let file_idx = intern_file(file_name);
+                let line_rec_start = bpos + 12;
+                let max_lines = (cb_block - 12) / if has_cols { 12 } else { 8 };
+                for li in 0..n_lines.min(max_lines) {
+                    let lpos = line_rec_start + li * 8;
+                    let off = read_le_u32(body, lpos)?;
+                    let raw_line = read_le_u32(body, lpos + 4)?;
+                    let line_num = raw_line & 0x00FF_FFFF;
+                    let rva = sec_rva.wrapping_add(off_con).wrapping_add(off);
+                    lines.push(PdbLineEntry { rva, line: line_num, file_idx });
+                }
+                bpos += cb_block;
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort_by_key(|e| e.rva);
+    Some(PdbLineCache { ansi_files, wide_files, lines })
+}
+
+/// Locate a PDB file on disk for `m` using the PE's CodeView `RSDS` record and `search_path`.
+fn load_pdb_for_module(m: &SymModule, search_path: &str) -> Option<PdbLineCache> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let (_, _, cv) = read_pe_debug_metadata(m.base);
+    if let Some(ref cv_bytes) = cv {
+        // RSDS: 'R','S','D','S'(4), GUID(16), Age(4), NUL-terminated UTF-8 path.
+        if cv_bytes.len() > 24 && &cv_bytes[0..4] == b"RSDS" {
+            let tail = &cv_bytes[24..];
+            let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+            let pdb_raw = String::from_utf8_lossy(&tail[..nul]);
+            if !pdb_raw.is_empty() {
+                candidates.push(PathBuf::from(pdb_raw.as_ref()));
+                if let Some(fname) = pdb_raw.rsplit(['\\', '/']).next() {
+                    for dir in search_path.split(';').filter(|d| !d.is_empty()) {
+                        candidates.push(PathBuf::from(dir).join(fname));
+                    }
+                }
+            }
+        }
+    }
+    // Also check `<module_name>.pdb` beside the image and in every search-path directory.
+    let pdb_fname = format!(
+        "{}.pdb",
+        m.module_name
+            .trim_end_matches(".dll")
+            .trim_end_matches(".exe")
+    );
+    if let Some(parent) = PathBuf::from(&m.image_name).parent() {
+        if !parent.as_os_str().is_empty() {
+            candidates.push(parent.join(&pdb_fname));
+        }
+    }
+    for dir in search_path.split(';').filter(|d| !d.is_empty()) {
+        candidates.push(PathBuf::from(dir).join(&pdb_fname));
+    }
+
+    let sec_rvas = read_pe_section_rvas(m.base);
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Some(cache) = parse_pdb_line_cache(&bytes, &sec_rvas) {
+                return Some(cache);
+            }
+        }
+    }
+    None
+}
+
+unsafe fn sym_get_line_impl(
+    process: HANDLE,
+    qw_addr: u64,
+    displacement: *mut u32,
+    line_out: *mut u8,
+    wide: bool,
+) -> BOOL {
+    if line_out.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let cb = std::ptr::read_unaligned(line_out as *const u32);
+    if cb < 40 {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(m) = find_sym_module(process, qw_addr) else {
+        crate::teb::set_last_error(ERROR_MOD_NOT_FOUND);
+        return FALSE;
+    };
+    let rva = qw_addr.saturating_sub(m.base) as u32;
+    let key = proc_key(process);
+
+    let mut tbl = sym_table().lock().unwrap();
+    let st = tbl.entry(key).or_default();
+    let search_path = st.search_path.clone();
+    let cache = st
+        .pdb_lines
+        .entry(m.base)
+        .or_insert_with(|| load_pdb_for_module(&m, &search_path));
+    let Some(cache) = cache.as_ref() else {
+        crate::teb::set_last_error(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    };
+
+    let idx = match cache.lines.binary_search_by_key(&rva, |e| e.rva) {
+        Ok(i) => i,
+        Err(0) => {
+            crate::teb::set_last_error(ERROR_INVALID_ADDRESS);
+            return FALSE;
+        }
+        Err(i) => i - 1,
+    };
+    let entry = &cache.lines[idx];
+    let line_addr = m.base.saturating_add(entry.rva as u64);
+    let disp = qw_addr.saturating_sub(line_addr) as u32;
+    if !displacement.is_null() {
+        std::ptr::write_unaligned(displacement, disp);
+    }
+    // IMAGEHLP_LINE64 / IMAGEHLP_LINEW64 (40 bytes on x64):
+    // +0 SizeOfStruct(u32), +8 Key(ptr), +16 LineNumber(u32), +24 FileName(ptr), +32 Address(u64).
+    std::ptr::write_unaligned(line_out.add(8) as *mut usize, 0);
+    std::ptr::write_unaligned(line_out.add(16) as *mut u32, entry.line);
+    let name_ptr = if wide {
+        cache.wide_files[entry.file_idx].as_ptr() as usize
+    } else {
+        cache.ansi_files[entry.file_idx].as_ptr() as usize
+    };
+    std::ptr::write_unaligned(line_out.add(24) as *mut usize, name_ptr);
+    std::ptr::write_unaligned(line_out.add(32) as *mut u64, line_addr);
+    TRUE
+}
+
+pub unsafe extern "win64" fn SymGetLineFromAddr64(
+    process: HANDLE,
+    qw_addr: u64,
+    pdw_displacement: *mut u32,
+    line64: *mut u8,
+) -> BOOL {
+    sym_get_line_impl(process, qw_addr, pdw_displacement, line64, false)
+}
+
+pub unsafe extern "win64" fn SymGetLineFromAddrW64(
+    process: HANDLE,
+    qw_addr: u64,
+    pdw_displacement: *mut u32,
+    line64: *mut u8,
+) -> BOOL {
+    sym_get_line_impl(process, qw_addr, pdw_displacement, line64, true)
+}
 
 #[cfg(test)]
 mod tests {
@@ -550,6 +1883,433 @@ mod tests {
             assert_eq!((sym.as_ptr().add(32) as *const u64).read_unaligned(), 0x14000_0000);
 
             assert_eq!(SymCleanup(proc), TRUE);
+        }
+    }
+
+    #[test]
+    fn stack_walk64_unwinds_pdata_and_leaf_frames() {
+        unsafe {
+            // Build a synthetic image buffer containing a leaf frame + two .pdata frames.
+            // Image layout (base = img.as_ptr()):
+            //   +0x100..+0x140: fn_outer (UWOP_ALLOC_SMALL 0x28 -> inf=4)
+            //   +0x200..+0x240: fn_mid   (UWOP_ALLOC_SMALL 0x28 -> inf=4, UWOP_PUSH_NONVOL rbx)
+            //   +0x300..+0x340: fn_leaf  (no .pdata; return address at [rsp])
+            //   +0x400: UNWIND_INFO for fn_outer
+            //   +0x420: UNWIND_INFO for fn_mid
+            let mut img = vec![0x90u8; 0x1000];
+            let base = img.as_ptr() as u64;
+
+            // UNWIND_INFO for fn_outer at +0x400: version=1, prolog=4, count=1, fr=0
+            //   code[0]: off=4, op=UWOP_ALLOC_SMALL(2) | (4 << 4) => allocates (4+1)*8 = 40 bytes
+            img[0x400] = 1;
+            img[0x401] = 4;
+            img[0x402] = 1;
+            img[0x403] = 0;
+            img[0x404] = 4;
+            img[0x405] = 2 | (4 << 4);
+
+            // UNWIND_INFO for fn_mid at +0x420: version=1, prolog=6, count=2, fr=0
+            //   code[0]: off=6, op=UWOP_ALLOC_SMALL(2) | (4 << 4) => +40 bytes
+            //   code[1]: off=2, op=UWOP_PUSH_NONVOL(0) | (3 << 4) => pop rbx (+8 bytes)
+            img[0x420] = 1;
+            img[0x421] = 6;
+            img[0x422] = 2;
+            img[0x423] = 0;
+            img[0x424] = 6;
+            img[0x425] = 2 | (4 << 4);
+            img[0x426] = 2;
+            img[0x427] = 0 | (3 << 4);
+
+            let rfs = [
+                RuntimeFunction { begin_rva: 0x100, end_rva: 0x140, unwind_rva: 0x400 },
+                RuntimeFunction { begin_rva: 0x200, end_rva: 0x240, unwind_rva: 0x420 },
+            ];
+            crate::unwind::RtlAddFunctionTable(rfs.as_ptr(), rfs.len() as u32, base);
+
+            // Build synthetic x64 stack (grows downward; stack[idx] at sp + idx*8):
+            //   idx 0: return address from fn_leaf -> fn_mid + 0x20
+            //   idx 1..=5: 40-byte frame of fn_mid
+            //   idx 6: saved rbx = 0xCAFE_BABE_1234_5678
+            //   idx 7: return address from fn_mid -> fn_outer + 0x18
+            //   idx 8..=12: 40-byte frame of fn_outer
+            //   idx 13: 0 (end of call stack)
+            let mut stack = [0u64; 16];
+            stack[0] = base + 0x220;
+            stack[6] = 0xCAFE_BABE_1234_5678;
+            stack[7] = base + 0x118;
+            stack[13] = 0;
+
+            let mut ctx = Context::zeroed();
+            ctx.rip = base + 0x310; // inside fn_leaf
+            ctx.gpr[RSP] = stack.as_ptr() as u64;
+            ctx.gpr[3] = 0x1111; // rbx before unwind
+
+            let mut sf = StackFrame64::default();
+            sf.addr_pc = flat_addr(ctx.rip);
+            sf.addr_stack = flat_addr(ctx.gpr[RSP]);
+
+            let mut pcs = Vec::new();
+            while StackWalk64(
+                IMAGE_FILE_MACHINE_AMD64,
+                (-1isize) as HANDLE,
+                (-2isize) as HANDLE,
+                &mut sf as *mut StackFrame64 as *mut u8,
+                &mut ctx as *mut Context as *mut u8,
+                std::ptr::null(),
+                SymFunctionTableAccess64 as *const () as *const c_void,
+                SymGetModuleBase64 as *const () as *const c_void,
+                std::ptr::null(),
+            ) == TRUE
+            {
+                pcs.push(sf.addr_pc.offset);
+            }
+
+            crate::unwind::RtlDeleteFunctionTable(rfs.as_ptr());
+
+            assert_eq!(pcs, vec![base + 0x310, base + 0x220, base + 0x118]);
+            assert_eq!(ctx.gpr[3], 0xCAFE_BABE_1234_5678, "UWOP_PUSH_NONVOL must restore RBX");
+        }
+    }
+
+    #[test]
+    fn minidump_write_dump_emits_valid_mdmp_with_exception_and_user_stream() {
+        unsafe {
+            let tmp_dir = std::env::temp_dir().join(format!(
+                "port_factory_mdmp_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+            crate::path::add_mount("M:\\", &tmp_dir);
+            let wpath = crate::strings::to_wide_z("M:\\crash.dmp");
+            let h_file = crate::kernel32::file::CreateFileW(
+                wpath.as_ptr(),
+                0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+                0,
+                std::ptr::null_mut(),
+                2, // CREATE_ALWAYS
+                0x80,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_file, INVALID_HANDLE_VALUE);
+
+            let proc = (-1isize) as HANDLE;
+            let _ = SymInitialize(proc, std::ptr::null(), FALSE);
+            let _ = SymLoadModule64(
+                proc,
+                std::ptr::null_mut(),
+                c"C:\\Test\\demo.exe".as_ptr() as *const u8,
+                c"demo".as_ptr() as *const u8,
+                0x14000_0000,
+                0x10000,
+            );
+
+            // Build exception info and a custom user stream.
+            let mut er: ExceptionRecord = std::mem::zeroed();
+            er.code = 0xC000_0005;
+            er.address = 0x14000_1234usize as *mut c_void;
+            let mut ctx = Context::zeroed();
+            ctx.context_flags = crate::unwind::CONTEXT_FULL;
+            ctx.rip = 0x14000_1234;
+            let stack_probe = [0xAAu8; 64];
+            ctx.gpr[RSP] = stack_probe.as_ptr() as u64;
+
+            let ep = [&er as *const ExceptionRecord as usize, &ctx as *const Context as usize];
+            #[repr(C, packed(4))]
+            struct ExcInfo {
+                tid: u32,
+                ep: usize,
+                client_ptrs: i32,
+            }
+            let exc_info = ExcInfo { tid: 42, ep: ep.as_ptr() as usize, client_ptrs: 0 };
+
+            let payload = b"hello-minidump-user-stream";
+            #[repr(C, packed(4))]
+            struct UserStream {
+                stype: u32,
+                sz: u32,
+                buf: usize,
+            }
+            #[repr(C, packed(4))]
+            struct UserStreamInfo {
+                count: u32,
+                arr: usize,
+            }
+            let us = UserStream {
+                stype: 0x0001_0042,
+                sz: payload.len() as u32,
+                buf: payload.as_ptr() as usize,
+            };
+            let usi = UserStreamInfo { count: 1, arr: &us as *const UserStream as usize };
+
+            assert_eq!(
+                MiniDumpWriteDump(
+                    proc,
+                    std::process::id(),
+                    h_file,
+                    0, // MiniDumpNormal
+                    &exc_info as *const ExcInfo as *const u8,
+                    &usi as *const UserStreamInfo as *const u8,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            let mut fsize: i64 = 0;
+            assert_eq!(crate::kernel32::file::GetFileSizeEx(h_file, &mut fsize), TRUE);
+            assert!(fsize > 32);
+            let mut new_pos: i64 = 0;
+            assert_eq!(crate::kernel32::file::SetFilePointerEx(h_file, 0, &mut new_pos, 0), TRUE);
+            let mut bytes = vec![0u8; fsize as usize];
+            let mut got = 0u32;
+            assert_eq!(
+                crate::kernel32::file::ReadFile(
+                    h_file,
+                    bytes.as_mut_ptr() as *mut c_void,
+                    bytes.len() as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+            bytes.truncate(got as usize);
+            crate::kernel32::threads::CloseHandle(h_file);
+            let _ = crate::kernel32::file::DeleteFileW(wpath.as_ptr());
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = SymCleanup(proc);
+
+            assert!(bytes.len() >= 32 + 7 * 12);
+            assert_eq!(&bytes[0..4], b"MDMP");
+            assert_eq!(read_le_u32(&bytes, 4).unwrap() & 0xFFFF, 0xA793);
+            let n_streams = read_le_u32(&bytes, 8).unwrap();
+            assert_eq!(n_streams, 7); // SysInfo, Misc, ModList, ThrList, MemList, Exception, UserStream
+            let dir_rva = read_le_u32(&bytes, 12).unwrap() as usize;
+            let mut seen = HashMap::new();
+            for i in 0..n_streams as usize {
+                let st = read_le_u32(&bytes, dir_rva + i * 12).unwrap();
+                let sz = read_le_u32(&bytes, dir_rva + i * 12 + 4).unwrap();
+                let rva = read_le_u32(&bytes, dir_rva + i * 12 + 8).unwrap();
+                seen.insert(st, (sz, rva));
+            }
+            // Verify SystemInfo = AMD64 (9), Exception = 0xC0000005 @ 0x140001234, UserStream matches.
+            let (_, sys_rva) = seen[&MINIDUMP_SYSTEM_INFO_STREAM];
+            assert_eq!(read_le_u16(&bytes, sys_rva as usize).unwrap(), 9);
+            let (_, exc_rva) = seen[&MINIDUMP_EXCEPTION_STREAM];
+            assert_eq!(read_le_u32(&bytes, exc_rva as usize).unwrap(), 42);
+            assert_eq!(read_le_u32(&bytes, exc_rva as usize + 8).unwrap(), 0xC000_0005);
+            let (us_sz, us_rva) = seen[&0x0001_0042];
+            assert_eq!(&bytes[us_rva as usize..(us_rva + us_sz) as usize], payload);
+            assert!(seen.contains_key(&MINIDUMP_MODULE_LIST_STREAM));
+            assert!(seen.contains_key(&MINIDUMP_THREAD_LIST_STREAM));
+            assert!(seen.contains_key(&MINIDUMP_MEMORY_LIST_STREAM));
+            assert!(seen.contains_key(&MINIDUMP_MISC_INFO_STREAM));
+        }
+    }
+
+    /// Build a minimal valid MSF 7.0 PDB containing `/names`, DBI (with 1 module & 1 section
+    /// header at RVA 0x1000), and C13 `DEBUG_S_FILECHKSMS` + `DEBUG_S_LINES` entries.
+    fn build_minimal_pdb(src_file: &str, seg_offset: u32, line_num: u32) -> Vec<u8> {
+        let block_size = 4096usize;
+
+        // Stream 1: PDB info stream mapping "/names" -> stream 4
+        let mut s1 = Vec::new();
+        s1.extend_from_slice(&20000404u32.to_le_bytes()); // Version
+        s1.extend_from_slice(&0u32.to_le_bytes()); // Sig
+        s1.extend_from_slice(&1u32.to_le_bytes()); // Age
+        s1.extend_from_slice(&[0u8; 16]); // Guid
+        let key_str = b"/names\0";
+        s1.extend_from_slice(&(key_str.len() as u32).to_le_bytes());
+        s1.extend_from_slice(key_str);
+        s1.extend_from_slice(&1u32.to_le_bytes()); // Size
+        s1.extend_from_slice(&2u32.to_le_bytes()); // Capacity
+        s1.extend_from_slice(&1u32.to_le_bytes()); // Present words = 1
+        s1.extend_from_slice(&1u32.to_le_bytes()); // bit 0 set
+        s1.extend_from_slice(&0u32.to_le_bytes()); // Deleted words = 0
+        s1.extend_from_slice(&0u32.to_le_bytes()); // key offset = 0
+        s1.extend_from_slice(&4u32.to_le_bytes()); // stream idx = 4
+
+        // Stream 4: `/names` string table
+        let mut s4 = Vec::new();
+        s4.extend_from_slice(&0xEFFE_EFFEu32.to_le_bytes());
+        s4.extend_from_slice(&1u32.to_le_bytes());
+        let mut stbl = vec![0u8]; // offset 0 = ""
+        let file_name_off = stbl.len() as u32;
+        stbl.extend_from_slice(src_file.as_bytes());
+        stbl.push(0);
+        s4.extend_from_slice(&(stbl.len() as u32).to_le_bytes());
+        s4.extend_from_slice(&stbl);
+
+        // Stream 5: Section Header stream (1 IMAGE_SECTION_HEADER with VirtualAddress = 0x1000)
+        let mut s5 = vec![0u8; 40];
+        s5[0..5].copy_from_slice(b".text");
+        s5[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
+
+        // Stream 6: Module stream with C13 DEBUG_S_FILECHKSMS + DEBUG_S_LINES
+        let mut s6 = Vec::new();
+        // Subsection 1: DEBUG_S_FILECHKSMS (0xF4): name_off(4), hash_len(1)=0, hash_type(1)=0, pad(2)
+        s6.extend_from_slice(&DEBUG_S_FILECHKSMS.to_le_bytes());
+        s6.extend_from_slice(&8u32.to_le_bytes());
+        s6.extend_from_slice(&file_name_off.to_le_bytes());
+        s6.extend_from_slice(&[0u8; 4]);
+        // Subsection 2: DEBUG_S_LINES (0xF2):
+        //   header(12): off_con(4), seg_con(2)=1, flags(2)=0, cb_con(4)=0x100
+        //   file_block(12+8=20): file_id(4)=0, n_lines(4)=1, cb_block(4)=20, off(4)=0, line(4)
+        s6.extend_from_slice(&DEBUG_S_LINES.to_le_bytes());
+        s6.extend_from_slice(&32u32.to_le_bytes());
+        s6.extend_from_slice(&seg_offset.to_le_bytes());
+        s6.extend_from_slice(&1u16.to_le_bytes());
+        s6.extend_from_slice(&0u16.to_le_bytes());
+        s6.extend_from_slice(&0x100u32.to_le_bytes());
+        s6.extend_from_slice(&0u32.to_le_bytes()); // file_id
+        s6.extend_from_slice(&1u32.to_le_bytes()); // n_lines
+        s6.extend_from_slice(&20u32.to_le_bytes()); // cb_block
+        s6.extend_from_slice(&0u32.to_le_bytes()); // line offset
+        s6.extend_from_slice(&line_num.to_le_bytes());
+
+        // Stream 3: DBI stream
+        let mut mod_info = vec![0u8; 64];
+        mod_info[34..36].copy_from_slice(&6u16.to_le_bytes()); // module stream = 6
+        mod_info[44..48].copy_from_slice(&(s6.len() as u32).to_le_bytes()); // c13_byte_size
+        mod_info.extend_from_slice(b"test.obj\0test.obj\0");
+        while (mod_info.len() & 3) != 0 {
+            mod_info.push(0);
+        }
+        let mut opt_dbg = vec![0xFFu8; 12];
+        opt_dbg[10..12].copy_from_slice(&5u16.to_le_bytes()); // section hdr stream = 5
+
+        let mut s3 = vec![0u8; 64];
+        s3[24..28].copy_from_slice(&(mod_info.len() as u32).to_le_bytes());
+        s3[48..52].copy_from_slice(&(opt_dbg.len() as u32).to_le_bytes());
+        s3.extend_from_slice(&mod_info);
+        s3.extend_from_slice(&opt_dbg);
+
+        let streams: [&[u8]; 7] = [&[], &s1, &[], &s3, &s4, &s5, &s6];
+
+        // Allocate blocks: block 0 = superblock, 1 = block map, 2 = stream dir, 3.. = stream payloads.
+        let mut stream_blocks: Vec<Vec<u32>> = Vec::new();
+        let mut next_blk = 3u32;
+        for st in &streams {
+            let n = st.len().div_ceil(block_size);
+            let mut blks = Vec::new();
+            for _ in 0..n {
+                blks.push(next_blk);
+                next_blk += 1;
+            }
+            stream_blocks.push(blks);
+        }
+
+        let mut dir = Vec::new();
+        dir.extend_from_slice(&(streams.len() as u32).to_le_bytes());
+        for st in &streams {
+            dir.extend_from_slice(&(st.len() as u32).to_le_bytes());
+        }
+        for blks in &stream_blocks {
+            for &b in blks {
+                dir.extend_from_slice(&b.to_le_bytes());
+            }
+        }
+        assert!(dir.len() <= block_size);
+
+        let total_blocks = next_blk as usize;
+        let mut out = vec![0u8; total_blocks * block_size];
+        out[0..32].copy_from_slice(MSF7_MAGIC);
+        out[32..36].copy_from_slice(&(block_size as u32).to_le_bytes());
+        out[40..44].copy_from_slice(&(total_blocks as u32).to_le_bytes());
+        out[44..48].copy_from_slice(&(dir.len() as u32).to_le_bytes());
+        out[52..56].copy_from_slice(&1u32.to_le_bytes()); // block_map_addr = block 1
+
+        // Block 1: block map pointing to directory block 2
+        out[block_size..block_size + 4].copy_from_slice(&2u32.to_le_bytes());
+        // Block 2: stream directory
+        out[2 * block_size..2 * block_size + dir.len()].copy_from_slice(&dir);
+        // Stream payloads
+        for (st, blks) in streams.iter().zip(stream_blocks.iter()) {
+            for (i, &b) in blks.iter().enumerate() {
+                let src = &st[i * block_size..((i + 1) * block_size).min(st.len())];
+                let dst = (b as usize) * block_size;
+                out[dst..dst + src.len()].copy_from_slice(src);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sym_get_line_from_addr_resolves_pdb_and_reports_windows_errors() {
+        unsafe {
+            let dir = std::env::temp_dir().join(format!(
+                "port_factory_pdb_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let pdb_path = dir.join("samplemod.pdb");
+            let pdb_bytes = build_minimal_pdb("src\\engine.cpp", 0x240, 137);
+            std::fs::write(&pdb_path, &pdb_bytes).unwrap();
+
+            let proc = 0x5678usize as HANDLE;
+            let sp = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+            assert_eq!(SymInitialize(proc, sp.as_ptr() as *const u8, FALSE), TRUE);
+            let base = SymLoadModule64(
+                proc,
+                std::ptr::null_mut(),
+                c"samplemod.dll".as_ptr() as *const u8,
+                c"samplemod".as_ptr() as *const u8,
+                0x2000_0000,
+                0x10000,
+            );
+            assert_eq!(base, 0x2000_0000);
+
+            // Exact hit + 0x10 byte displacement inside .text (RVA 0x1000 + 0x240 + 0x10).
+            let mut line_a = [0u8; 40];
+            (line_a.as_mut_ptr() as *mut u32).write_unaligned(40);
+            let mut disp = 0u32;
+            assert_eq!(
+                SymGetLineFromAddr64(proc, base + 0x1250, &mut disp, line_a.as_mut_ptr()),
+                TRUE
+            );
+            assert_eq!(disp, 0x10);
+            assert_eq!((line_a.as_ptr().add(16) as *const u32).read_unaligned(), 137);
+            let fname_a = (line_a.as_ptr().add(24) as *const *const u8).read_unaligned();
+            assert_eq!(crate::strings::from_ansi(fname_a), "src\\engine.cpp");
+            assert_eq!((line_a.as_ptr().add(32) as *const u64).read_unaligned(), base + 0x1240);
+
+            // Wide variant returns UTF-16 filename and same metadata.
+            let mut line_w = [0u8; 40];
+            (line_w.as_mut_ptr() as *mut u32).write_unaligned(40);
+            assert_eq!(
+                SymGetLineFromAddrW64(proc, base + 0x1240, &mut disp, line_w.as_mut_ptr()),
+                TRUE
+            );
+            assert_eq!(disp, 0);
+            let fname_w = (line_w.as_ptr().add(24) as *const *const u16).read_unaligned();
+            assert_eq!(crate::strings::from_wide(fname_w), "src\\engine.cpp");
+
+            // Address outside any loaded module -> FALSE, ERROR_MOD_NOT_FOUND.
+            assert_eq!(
+                SymGetLineFromAddr64(proc, 0x9999_0000, &mut disp, line_a.as_mut_ptr()),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_MOD_NOT_FOUND);
+
+            // Module with no PDB on disk -> FALSE, ERROR_INVALID_ADDRESS.
+            let base2 = SymLoadModule64(
+                proc,
+                std::ptr::null_mut(),
+                c"nopdb.dll".as_ptr() as *const u8,
+                c"nopdb".as_ptr() as *const u8,
+                0x3000_0000,
+                0x10000,
+            );
+            assert_eq!(
+                SymGetLineFromAddr64(proc, base2 + 0x100, &mut disp, line_a.as_mut_ptr()),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_ADDRESS);
+
+            assert_eq!(SymCleanup(proc), TRUE);
+            let _ = std::fs::remove_file(&pdb_path);
+            let _ = std::fs::remove_dir(&dir);
         }
     }
 }
