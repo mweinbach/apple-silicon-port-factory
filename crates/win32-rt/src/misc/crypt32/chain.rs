@@ -1740,15 +1740,50 @@ fn cert_policy_oids(der: &[u8]) -> Vec<String> {
     out
 }
 
-/// Returns true if the certificate uses a legacy weak signature hash (MD2, MD5, or SHA-1).
+/// Returns true if the certificate uses a legacy weak signature hash (MD2, MD5, or SHA-1),
+/// including RSASSA-PSS with omitted (default SHA-1) or weak `hashAlgorithm`.
 fn cert_uses_weak_signature_hash(der: &[u8]) -> bool {
+    const OID_RSASSA_PSS: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
+    const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+    const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+
     let Some(parts) = parse_cert_der_parts(der) else {
         return true;
     };
-    let Some((sig_oid, _)) = parse_der_item(parts.sig_alg_inner) else {
+    let Some((sig_oid, rest)) = parse_der_item(parts.sig_alg_inner) else {
         return true;
     };
     if sig_oid.tag != 0x06 {
+        return true;
+    }
+    if sig_oid.val == OID_RSASSA_PSS {
+        // RFC 4055 §3.1: omitted hashAlgorithm defaults to SHA-1 (weak).
+        let Some((params_seq, _)) = parse_der_item(rest) else {
+            return true;
+        };
+        if params_seq.tag != 0x30 {
+            return true;
+        }
+        let Some(fields) = der_item_children(params_seq.val) else {
+            return true;
+        };
+        for f in fields {
+            if f.tag == 0xA0 {
+                if let Some((alg_seq, _)) = parse_der_item(f.val) {
+                    if alg_seq.tag == 0x30 {
+                        if let Some((hash_oid, _)) = parse_der_item(alg_seq.val) {
+                            if hash_oid.tag == 0x06 {
+                                return !matches!(
+                                    hash_oid.val,
+                                    OID_SHA256 | OID_SHA384 | OID_SHA512
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return true;
     }
     matches!(
@@ -1760,6 +1795,12 @@ fn cert_uses_weak_signature_hash(der: &[u8]) -> bool {
             | [0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x03] // dsa-with-SHA1
     )
 }
+
+/// Windows SDK `wincrypt.h` `CERT_STRONG_SIGN_PARA.dwInfoChoice` discriminators.
+const CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE: u32 = 1;
+const CERT_STRONG_SIGN_OID_INFO_CHOICE: u32 = 2;
+const CERT_TRUST_HAS_WEAK_SIGNATURE: u32 = 0x0010_0000;
+const TRUST_E_CERT_SIGNATURE: u32 = 0x8009_6004;
 
 /// Evaluate `CERT_CHAIN_PARA` (`RequestedUsage`, `RequestedIssuancePolicy`, and `pStrongSignPara`)
 /// against `chain_der`. Returns `Ok((trust_status_bits, chain_para_error))` or `Err(win32_err)`.
@@ -1866,32 +1907,36 @@ unsafe fn evaluate_cert_chain_para(
             if cb_ss < 0x10 {
                 return Err(err::ERROR_INVALID_PARAMETER);
             }
-            // CERT_STRONG_SIGN_OID_INFO_CHOICE == 1 with standard strong-sign OIDs:
-            // enforce non-MD2/MD5/SHA-1 signatures across the chain; fail closed on custom rules.
-            let recognized_strong_oid = if dw_choice == 1 {
-                let psz_oid = std::ptr::read_unaligned(p_strong.add(8) as *const *const u8);
-                if psz_oid.is_null() {
-                    false
-                } else {
+            // Per Windows SDK wincrypt.h:
+            //   CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE == 1 (pSerializedInfo)
+            //   CERT_STRONG_SIGN_OID_INFO_CHOICE        == 2 (pszOID)
+            // Enforce non-MD2/MD5/SHA-1 signatures for standard OS strong-sign OIDs;
+            // fail closed on serialized info or unrecognized OIDs.
+            match dw_choice {
+                CERT_STRONG_SIGN_OID_INFO_CHOICE => {
+                    let psz_oid = std::ptr::read_unaligned(p_strong.add(8) as *const *const u8);
+                    if psz_oid.is_null() {
+                        return Err(err::ERROR_INVALID_PARAMETER);
+                    }
                     let s = crate::strings::from_ansi(psz_oid);
-                    matches!(
+                    let recognized_strong_oid = matches!(
                         s.as_str(),
-                        "1.3.6.1.5.5.7.6.30"
-                            | "1.3.6.1.4.1.311.72.1.1"
-                            | "1.3.6.1.4.1.311.72.1.2"
-                            | "1.3.6.1.4.1.311.72.1.3"
-                    )
+                        "1.3.6.1.4.1.311.72.1.1" // szOID_CERT_STRONG_SIGN_OS_1
+                            | "1.3.6.1.4.1.311.72.1.2" // szOID_CERT_STRONG_SIGN_OS_CURRENT
+                            | "1.3.6.1.4.1.311.72.1.3" // szOID_CERT_STRONG_SIGN_OS_SERVER_1
+                    );
+                    if !recognized_strong_oid {
+                        return Err(err::ERROR_NOT_SUPPORTED);
+                    }
                 }
-            } else {
-                false
-            };
-            if !recognized_strong_oid {
-                return Err(err::ERROR_NOT_SUPPORTED);
+                CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE | _ => {
+                    return Err(err::ERROR_NOT_SUPPORTED);
+                }
             }
             if chain_der.iter().any(|d| cert_uses_weak_signature_hash(d)) {
-                trust_bits |= CERT_TRUST_IS_NOT_SIGNATURE_VALID;
+                trust_bits |= CERT_TRUST_IS_NOT_SIGNATURE_VALID | CERT_TRUST_HAS_WEAK_SIGNATURE;
                 if para_err == 0 {
-                    para_err = CERT_E_WRONG_USAGE;
+                    para_err = TRUST_E_CERT_SIGNATURE;
                 }
             }
         }
@@ -2547,11 +2592,18 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                 }
                 if has_bc {
                     if idx == 0 {
-                        if require_ca_leaf && !is_ca {
+                        // Per MSDN CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_BASIC_CONSTRAINTS):
+                        // setting both CA_FLAG and END_ENTITY_FLAG allows either leaf type;
+                        // enforce a specific leaf type only when exactly one flag is set.
+                        if require_ca_leaf && require_ee_leaf {
+                            if !is_ca && !is_ee {
+                                violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
+                                break;
+                            }
+                        } else if require_ca_leaf && !is_ca {
                             violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
                             break;
-                        }
-                        if require_ee_leaf && !is_ee {
+                        } else if require_ee_leaf && !is_ee {
                             violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
                             break;
                         }

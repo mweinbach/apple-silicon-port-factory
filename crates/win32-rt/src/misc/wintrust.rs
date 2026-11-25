@@ -3321,14 +3321,37 @@ mod tests {
                 crate::misc::crypt32::CERT_E_INVALID_POLICY as i32,
                 "pChainPara RequestedIssuancePolicy must reject missing policy"
             );
-            // 3. Unsupported custom pStrongSignPara MUST fail closed (CERT_E_CHAINING).
+            // 3. pStrongSignPara: SDK CERT_STRONG_SIGN_PARA_OS_CURRENT
+            //    (dwInfoChoice = CERT_STRONG_SIGN_OID_INFO_CHOICE = 2,
+            //     pszOID = szOID_CERT_STRONG_SIGN_OS_CURRENT = "1.3.6.1.4.1.311.72.1.2")
+            //    must succeed on our SHA-256-signed chain.
             std::ptr::write_unaligned(chain_para.as_mut_ptr().add(0x28) as *mut u32, 0u32);
-            let mut custom_ss = [0u8; 0x18];
-            std::ptr::write_unaligned(custom_ss.as_mut_ptr() as *mut u32, 0x18u32);
-            std::ptr::write_unaligned(custom_ss.as_mut_ptr().add(4) as *mut u32, 2u32); // SERIALIZED_INFO
+            let strong_oid = b"1.3.6.1.4.1.311.72.1.2\0";
+            let mut strong_ss = [0u8; 0x10];
+            std::ptr::write_unaligned(strong_ss.as_mut_ptr() as *mut u32, 0x10u32);
+            std::ptr::write_unaligned(strong_ss.as_mut_ptr().add(4) as *mut u32, 2u32); // CERT_STRONG_SIGN_OID_INFO_CHOICE
+            std::ptr::write_unaligned(
+                strong_ss.as_mut_ptr().add(8) as *mut *const u8,
+                strong_oid.as_ptr(),
+            );
             std::ptr::write_unaligned(
                 chain_para.as_mut_ptr().add(0x50) as *mut *const u8,
-                custom_ss.as_ptr(),
+                strong_ss.as_ptr(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS,
+                "CERT_STRONG_SIGN_PARA_OS_CURRENT (dwInfoChoice=2) must succeed on SHA-256 chain"
+            );
+            // Unknown strong-sign OID under CERT_STRONG_SIGN_OID_INFO_CHOICE (2) must fail closed.
+            let bad_oid = b"1.2.3.4.5.999\0";
+            std::ptr::write_unaligned(
+                strong_ss.as_mut_ptr().add(8) as *mut *const u8,
+                bad_oid.as_ptr(),
             );
             assert_eq!(
                 WinVerifyTrust(
@@ -3337,7 +3360,24 @@ mod tests {
                     wtd.as_mut_ptr() as *mut c_void,
                 ),
                 CERT_E_CHAINING,
-                "unsupported custom pStrongSignPara must fail closed"
+                "unrecognized strong-sign OID must fail closed"
+            );
+            // CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE (dwInfoChoice=1) must fail closed
+            // without treating pSerializedInfo as an ANSI OID string.
+            let fake_serialized_struct = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+            std::ptr::write_unaligned(strong_ss.as_mut_ptr().add(4) as *mut u32, 1u32); // CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE
+            std::ptr::write_unaligned(
+                strong_ss.as_mut_ptr().add(8) as *mut *const u8,
+                fake_serialized_struct.as_ptr(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                CERT_E_CHAINING,
+                "CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE (dwInfoChoice=1) must fail closed"
             );
             crate::misc::crypt32::CertFreeCertificateChainEngine(excl_eng);
             crate::misc::crypt32::CertCloseStore(excl_root_st, 0);

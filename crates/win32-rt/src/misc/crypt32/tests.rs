@@ -4430,6 +4430,108 @@ fn macos_trust_store_and_extended_chain_policies() {
         CertCloseStore(sub_store, 0);
         CertFreeCertificateContext(legacy_leaf_ctx);
 
+        // CERT_CHAIN_POLICY_BASIC_CONSTRAINTS: setting BOTH CA_FLAG and END_ENTITY_FLAG
+        // allows either leaf type (both CA leaf and end-entity leaf with BC v2 must pass).
+        const BC_CA_FLAG: u32 = 0x8000_0000;
+        const BC_EE_FLAG: u32 = 0x4000_0000;
+        let bc_ca_false = super::asn1::encode_der_tlv(0x30, &[]);
+        let ee_bc_cert = make_synth_cert(5, "EE-BC", "CA-Root", Some(&bc_ca_false));
+        let ee_bc_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            ee_bc_cert.as_ptr(),
+            ee_bc_cert.len() as u32,
+        );
+        let mut ee_bc_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                ee_bc_ctx,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut ee_bc_chain,
+            ),
+            TRUE
+        );
+        let mut bc_para = [0u8; 0x18];
+        std::ptr::write_unaligned(bc_para.as_mut_ptr() as *mut u32, bc_para.len() as u32);
+        // CA_FLAG alone accepts CA leaf (`chain`) and rejects end-entity leaf (`ee_bc_chain`)
+        std::ptr::write_unaligned(bc_para.as_mut_ptr().add(4) as *mut u32, BC_CA_FLAG);
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                chain,
+                bc_para.as_ptr() as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0);
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                ee_bc_chain,
+                bc_para.as_ptr() as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0x8009_6019); // TRUST_E_BASIC_CONSTRAINTS
+        // END_ENTITY_FLAG alone rejects CA leaf (`chain`) and accepts end-entity leaf (`ee_bc_chain`)
+        std::ptr::write_unaligned(bc_para.as_mut_ptr().add(4) as *mut u32, BC_EE_FLAG);
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                chain,
+                bc_para.as_ptr() as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0x8009_6019);
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                ee_bc_chain,
+                bc_para.as_ptr() as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0);
+        // BOTH CA_FLAG | END_ENTITY_FLAG accepts BOTH CA leaf and end-entity leaf!
+        std::ptr::write_unaligned(
+            bc_para.as_mut_ptr().add(4) as *mut u32,
+            BC_CA_FLAG | BC_EE_FLAG,
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                chain,
+                bc_para.as_ptr() as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0, "CA_FLAG | END_ENTITY_FLAG must accept CA leaf");
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                ee_bc_chain,
+                bc_para.as_ptr() as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            status.dw_error, 0,
+            "CA_FLAG | END_ENTITY_FLAG must accept end-entity leaf"
+        );
+        CertFreeCertificateChain(ee_bc_chain);
+        CertFreeCertificateContext(ee_bc_ctx);
+
         // MICROSOFT_ROOT fails with CERT_E_UNTRUSTEDROOT on non-Microsoft cert even when trusted
         // by an exclusive root engine, AND NT_AUTH enforces Enterprise NTAuth issuer authorization
         // (returning CERT_E_UNTRUSTEDCA for ordinary trusted CAs until explicitly added to NTAUTH).
