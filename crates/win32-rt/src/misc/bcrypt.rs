@@ -2858,6 +2858,7 @@ const KDF_SECRET_APPEND: u32 = 0x2;
 const KDF_HMAC_KEY: u32 = 0x3;
 const KDF_TLS_PRF_LABEL: u32 = 0x4;
 const KDF_TLS_PRF_SEED: u32 = 0x5;
+const KDF_TLS_PRF_PROTOCOL: u32 = 0x6;
 const KDF_ALGORITHMID: u32 = 0x8;
 const KDF_PARTYUINFO: u32 = 0x9;
 const KDF_PARTYVINFO: u32 = 0xA;
@@ -2994,6 +2995,7 @@ struct Key {
 #[repr(C)]
 struct Secret {
     magic: u32,
+    curve: EccCurve,
     secret: Vec<u8>,
 }
 
@@ -4613,7 +4615,7 @@ pub unsafe extern "win64" fn BCryptSecretAgreement(
     };
     std::ptr::write_unaligned(
         ph_agreed_secret,
-        Box::into_raw(Box::new(Secret { magic: SECRET_MAGIC, secret })) as *mut c_void,
+        Box::into_raw(Box::new(Secret { magic: SECRET_MAGIC, curve: priv_ec.curve, secret })) as *mut c_void,
     );
     STATUS_SUCCESS
 }
@@ -4665,6 +4667,7 @@ pub unsafe extern "win64" fn BCryptDeriveKey(
     let mut hmac_key: Option<Vec<u8>> = None;
     let mut tls_label: Vec<u8> = Vec::new();
     let mut tls_seed: Vec<u8> = Vec::new();
+    let mut tls_protocol: Option<u32> = None;
     let mut alg_id: Vec<u8> = Vec::new();
     let mut party_u: Vec<u8> = Vec::new();
     let mut party_v: Vec<u8> = Vec::new();
@@ -4691,11 +4694,18 @@ pub unsafe extern "win64" fn BCryptDeriveKey(
                         hash_alg = Some(d);
                     }
                 }
-                KDF_SECRET_PREPEND => prepend = slice.to_vec(),
-                KDF_SECRET_APPEND => append = slice.to_vec(),
+                // Microsoft Learn: multiple KDF_SECRET_PREPEND / KDF_SECRET_APPEND buffers concatenate in descriptor order.
+                KDF_SECRET_PREPEND => prepend.extend_from_slice(slice),
+                KDF_SECRET_APPEND => append.extend_from_slice(slice),
                 KDF_HMAC_KEY => hmac_key = Some(slice.to_vec()),
                 KDF_TLS_PRF_LABEL => tls_label = slice.to_vec(),
                 KDF_TLS_PRF_SEED => tls_seed = slice.to_vec(),
+                KDF_TLS_PRF_PROTOCOL => {
+                    if slice.len() < 4 {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    tls_protocol = Some(u32::from_le_bytes(slice[0..4].try_into().unwrap()));
+                }
                 KDF_ALGORITHMID => alg_id = slice.to_vec(),
                 KDF_PARTYUINFO => party_u = slice.to_vec(),
                 KDF_PARTYVINFO => party_v = slice.to_vec(),
@@ -4718,13 +4728,16 @@ pub unsafe extern "win64" fn BCryptDeriveKey(
         "HMAC" => {
             let d = hash_alg.unwrap_or(Digest::Sha1);
             let use_secret_as_key = (flags & KDF_USE_SECRET_AS_HMAC_KEY_FLAG) != 0;
-            let (k, msg): (&[u8], Vec<u8>) = if use_secret_as_key {
-                (&sec.secret, [&prepend[..], &append[..]].concat())
+            // Microsoft Learn: HMAC message is always `prepend || secret || append`;
+            // KDF_USE_SECRET_AS_HMAC_KEY_FLAG selects `secret` as the HMAC key as well.
+            let msg = [&prepend[..], &sec.secret[..], &append[..]].concat();
+            let k: &[u8] = if use_secret_as_key {
+                &sec.secret
             } else {
                 let Some(ref hk) = hmac_key else {
                     return STATUS_INVALID_PARAMETER;
                 };
-                (hk, [&prepend[..], &sec.secret[..], &append[..]].concat())
+                hk
             };
             d.hmac(k, &msg)
         }
@@ -4733,20 +4746,37 @@ pub unsafe extern "win64" fn BCryptDeriveKey(
             let mut seed = Vec::with_capacity(tls_label.len() + tls_seed.len());
             seed.extend_from_slice(&tls_label);
             seed.extend_from_slice(&tls_seed);
-            if let Some(d) = hash_alg {
-                p_hash(d, &sec.secret, &seed, want)
-            } else {
-                // TLS 1.0/1.1 PRF: P_MD5(S1, seed) XOR P_SHA1(S2, seed)
-                let half = sec.secret.len().div_ceil(2);
-                let s1 = &sec.secret[..half];
-                let s2 = &sec.secret[sec.secret.len() - half..];
-                let p1 = p_hash(Digest::Md5, s1, &seed, want);
-                let p2 = p_hash(Digest::Sha1, s2, &seed, want);
-                p1.iter().zip(&p2).map(|(a, b)| a ^ b).collect()
+            match tls_protocol {
+                Some(0x0303) => {
+                    // TLS 1.2 PRF: defaults to SHA-256 when KDF_HASH_ALGORITHM is omitted.
+                    let d = hash_alg.unwrap_or(Digest::Sha256);
+                    p_hash(d, &sec.secret, &seed, want)
+                }
+                Some(0x0301 | 0x0302) | None => {
+                    if let Some(d) = hash_alg {
+                        p_hash(d, &sec.secret, &seed, want)
+                    } else {
+                        // TLS 1.0 / 1.1 PRF: P_MD5(S1, seed) XOR P_SHA1(S2, seed)
+                        let half = sec.secret.len().div_ceil(2);
+                        let s1 = &sec.secret[..half];
+                        let s2 = &sec.secret[sec.secret.len() - half..];
+                        let p1 = p_hash(Digest::Md5, s1, &seed, want);
+                        let p2 = p_hash(Digest::Sha1, s2, &seed, want);
+                        p1.iter().zip(&p2).map(|(a, b)| a ^ b).collect()
+                    }
+                }
+                Some(_) => return STATUS_NOT_SUPPORTED,
             }
         }
         "SP800_56A_CONCAT" => {
-            let d = hash_alg.unwrap_or(Digest::Sha256);
+            // Microsoft Learn: default hash algorithm follows the ECDH curve (P-256 -> SHA-256,
+            // P-384 -> SHA-384, P-521 -> SHA-512) when KDF_HASH_ALGORITHM is omitted.
+            let default_digest = match sec.curve {
+                EccCurve::P256 => Digest::Sha256,
+                EccCurve::P384 => Digest::Sha384,
+                EccCurve::P521 => Digest::Sha512,
+            };
+            let d = hash_alg.unwrap_or(default_digest);
             let want = if pb_derived_key.is_null() { d.len() } else { cb_derived_key as usize };
             let reps = want.div_ceil(d.len());
             let mut out = Vec::with_capacity(reps * d.len());
@@ -5938,14 +5968,18 @@ mod tests {
             assert_eq!(got, 32);
             assert_eq!(raw.as_slice(), expected_z_le.as_slice());
 
-            // 2. BCRYPT_KDF_HASH ("HASH") with SHA-256 + prepend/append
+            // 2. BCRYPT_KDF_HASH ("HASH") with SHA-256 + repeated prepend/append buffers (must concatenate in order)
             let mut sha256_w = wbytes("SHA256");
-            let mut pre = b"PRE".to_vec();
-            let mut app = b"APP".to_vec();
+            let mut pre1 = b"PR".to_vec();
+            let mut pre2 = b"E".to_vec();
+            let mut app1 = b"AP".to_vec();
+            let mut app2 = b"P".to_vec();
             let mut bufs = [
                 BcryptBuffer { cb_buffer: sha256_w.len() as u32, buffer_type: KDF_HASH_ALGORITHM, pv_buffer: sha256_w.as_mut_ptr() as *mut c_void },
-                BcryptBuffer { cb_buffer: pre.len() as u32, buffer_type: KDF_SECRET_PREPEND, pv_buffer: pre.as_mut_ptr() as *mut c_void },
-                BcryptBuffer { cb_buffer: app.len() as u32, buffer_type: KDF_SECRET_APPEND, pv_buffer: app.as_mut_ptr() as *mut c_void },
+                BcryptBuffer { cb_buffer: pre1.len() as u32, buffer_type: KDF_SECRET_PREPEND, pv_buffer: pre1.as_mut_ptr() as *mut c_void },
+                BcryptBuffer { cb_buffer: pre2.len() as u32, buffer_type: KDF_SECRET_PREPEND, pv_buffer: pre2.as_mut_ptr() as *mut c_void },
+                BcryptBuffer { cb_buffer: app1.len() as u32, buffer_type: KDF_SECRET_APPEND, pv_buffer: app1.as_mut_ptr() as *mut c_void },
+                BcryptBuffer { cb_buffer: app2.len() as u32, buffer_type: KDF_SECRET_APPEND, pv_buffer: app2.as_mut_ptr() as *mut c_void },
             ];
             let desc = BcryptBufferDesc { ul_version: 0, c_buffers: bufs.len() as u32, p_buffers: bufs.as_mut_ptr() };
             let mut dk = [0u8; 32];
@@ -5954,6 +5988,46 @@ mod tests {
                 STATUS_SUCCESS
             );
             assert_eq!(dk.as_slice(), Digest::Sha256.hash_slices(&[b"PRE", &expected_z_be, b"APP"]).as_slice());
+
+            // 2b. BCRYPT_KDF_HMAC with KDF_USE_SECRET_AS_HMAC_KEY_FLAG keeps secret in message (`prepend || secret || append`)
+            let mut hmac_dk = [0u8; 32];
+            assert_eq!(
+                BCryptDeriveKey(
+                    h_sec,
+                    w("HMAC").as_ptr(),
+                    &desc as *const _ as *const c_void,
+                    hmac_dk.as_mut_ptr(),
+                    32,
+                    &mut got,
+                    KDF_USE_SECRET_AS_HMAC_KEY_FLAG,
+                ),
+                STATUS_SUCCESS
+            );
+            let hmac_msg = [&b"PRE"[..], &expected_z_be[..], &b"APP"[..]].concat();
+            assert_eq!(hmac_dk.as_slice(), Digest::Sha256.hmac(&expected_z_be, &hmac_msg).as_slice());
+
+            // 2c. BCRYPT_KDF_TLS_PRF honors KDF_TLS_PRF_PROTOCOL=0x0303 (TLS 1.2 -> SHA-256 default) and rejects unknown protocol
+            let mut label = b"master secret".to_vec();
+            let mut seed = b"0123456789abcdef".to_vec();
+            let mut proto_tls12 = 0x0303u32.to_le_bytes();
+            let mut tls_bufs = [
+                BcryptBuffer { cb_buffer: label.len() as u32, buffer_type: KDF_TLS_PRF_LABEL, pv_buffer: label.as_mut_ptr() as *mut c_void },
+                BcryptBuffer { cb_buffer: seed.len() as u32, buffer_type: KDF_TLS_PRF_SEED, pv_buffer: seed.as_mut_ptr() as *mut c_void },
+                BcryptBuffer { cb_buffer: 4, buffer_type: KDF_TLS_PRF_PROTOCOL, pv_buffer: proto_tls12.as_mut_ptr() as *mut c_void },
+            ];
+            let tls_desc = BcryptBufferDesc { ul_version: 0, c_buffers: tls_bufs.len() as u32, p_buffers: tls_bufs.as_mut_ptr() };
+            let mut tls_out = [0u8; 48];
+            assert_eq!(
+                BCryptDeriveKey(h_sec, w("TLS_PRF").as_ptr(), &tls_desc as *const _ as *const c_void, tls_out.as_mut_ptr(), 48, &mut got, 0),
+                STATUS_SUCCESS
+            );
+            assert_eq!(tls_out.as_slice(), p_hash(Digest::Sha256, &expected_z_be, &[&label[..], &seed[..]].concat(), 48).as_slice());
+            let mut bad_proto = 0x0304u32.to_le_bytes();
+            tls_bufs[2].pv_buffer = bad_proto.as_mut_ptr() as *mut c_void;
+            assert_eq!(
+                BCryptDeriveKey(h_sec, w("TLS_PRF").as_ptr(), &tls_desc as *const _ as *const c_void, tls_out.as_mut_ptr(), 48, &mut got, 0),
+                STATUS_NOT_SUPPORTED
+            );
 
             // 3. BCRYPT_KDF_SP80056A_CONCAT
             let mut party_u = b"Alice".to_vec();
@@ -5995,6 +6069,14 @@ mod tests {
             assert_eq!(BCryptDeriveKey(sa, w("TRUNCATE").as_ptr(), std::ptr::null(), da.as_mut_ptr(), 48, &mut got, 0), STATUS_SUCCESS);
             assert_eq!(BCryptDeriveKey(sb, w("TRUNCATE").as_ptr(), std::ptr::null(), db.as_mut_ptr(), 48, &mut got, 0), STATUS_SUCCESS);
             assert_eq!(da, db);
+
+            // P-384 SP800_56A_CONCAT with omitted hash algorithm defaults to SHA-384 (48 bytes)
+            let mut concat_sz = 0u32;
+            assert_eq!(
+                BCryptDeriveKey(sa, w("SP800_56A_CONCAT").as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0, &mut concat_sz, 0),
+                STATUS_SUCCESS
+            );
+            assert_eq!(concat_sz, 48);
 
             assert_eq!(BCryptDestroySecret(sa), STATUS_SUCCESS);
             assert_eq!(BCryptDestroySecret(sb), STATUS_SUCCESS);
