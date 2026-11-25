@@ -1824,7 +1824,7 @@ fn attach_child_to_inherited_jobs(child: &Arc<ChildProcessObj>, jobs: &[Arc<JobO
 }
 
 /// Return `Some((effective_mask, allow_subset))` if the current process belongs to any live
-/// job with `JOB_OBJECT_LIMIT_AFFINITY` set.
+/// job with `JOB_OBJECT_LIMIT_AFFINITY` or `JobObjectGroupInformationEx` affinity set.
 fn job_affinity_constraint() -> Option<(usize, bool)> {
     let my_pid = std::process::id();
     let jobs: Vec<Arc<JobObj>> = {
@@ -1835,17 +1835,16 @@ fn job_affinity_constraint() -> Option<(usize, bool)> {
     let mut allow_subset = true;
     for jo in jobs {
         let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
-        let flags = st.limit_flags();
-        if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 && st.contains_pid(my_pid) {
-            let aff = usize::from_le_bytes(st.basic_limits[48..56].try_into().unwrap());
-            if aff != 0 {
-                combined = Some(match combined {
-                    Some(cur) => cur & aff,
-                    None => aff,
-                });
-                if (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) == 0 {
-                    allow_subset = false;
-                }
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        if let Some((aff, job_subset)) = st.effective_affinity() {
+            combined = Some(match combined {
+                Some(cur) => cur & aff,
+                None => aff,
+            });
+            if !job_subset {
+                allow_subset = false;
             }
         }
     }
@@ -2002,6 +2001,36 @@ impl JobState {
 
     fn contains_pid(&self, pid: u32) -> bool {
         self.members.iter().any(|m| m.pid() == pid)
+    }
+
+    /// Effective `(mask, allow_subset)` affinity constraint imposed by this job across both
+    /// `JOB_OBJECT_LIMIT_AFFINITY` (class 2/9) and `JobObjectGroupInformationEx` (class 14).
+    fn effective_affinity(&self) -> Option<(usize, bool)> {
+        let flags = self.limit_flags();
+        let mut mask: Option<usize> = None;
+        let mut allow_subset = true;
+        if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
+            let aff = usize::from_le_bytes(self.basic_limits[48..56].try_into().unwrap());
+            if aff != 0 {
+                mask = Some(aff);
+                if (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) == 0 {
+                    allow_subset = false;
+                }
+            }
+        }
+        if !self.group_affinities.is_empty() {
+            let mut ga_mask = 0usize;
+            for ga in &self.group_affinities {
+                ga_mask |= usize::from_le_bytes(ga[0..8].try_into().unwrap());
+            }
+            if ga_mask != 0 {
+                mask = Some(match mask {
+                    Some(m) => m & ga_mask,
+                    None => ga_mask,
+                });
+            }
+        }
+        mask.filter(|&m| m != 0).map(|m| (m, allow_subset))
     }
 }
 
@@ -2259,10 +2288,8 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
             PRIORITY_CLASS.store(prio, Ordering::Relaxed);
         }
     }
-    let apply_aff = if (st.limit_flags() & JOB_OBJECT_LIMIT_AFFINITY) != 0 && pid == std::process::id() {
-        let aff = usize::from_le_bytes(st.basic_limits[48..56].try_into().unwrap());
-        let allow_subset = (st.limit_flags() & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) != 0;
-        (aff != 0).then_some((aff, allow_subset))
+    let apply_aff = if pid == std::process::id() {
+        st.effective_affinity()
     } else {
         None
     };
@@ -2346,12 +2373,7 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                     PRIORITY_CLASS.store(prio, Ordering::Relaxed);
                 }
             }
-            let apply_aff = if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 && contains_self {
-                let aff = usize::from_le_bytes(buf[48..56].try_into().unwrap());
-                Some((aff, (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) != 0))
-            } else {
-                None
-            };
+            let apply_aff = if contains_self { st.effective_affinity() } else { None };
             drop(st);
             if let Some((aff, allow_subset)) = apply_aff {
                 apply_job_affinity_limit(aff, allow_subset);
@@ -2439,12 +2461,7 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                     PRIORITY_CLASS.store(prio, Ordering::Relaxed);
                 }
             }
-            let apply_aff = if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 && contains_self {
-                let aff = usize::from_le_bytes(basic[48..56].try_into().unwrap());
-                Some((aff, (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) != 0))
-            } else {
-                None
-            };
+            let apply_aff = if contains_self { st.effective_affinity() } else { None };
             drop(st);
             if let Some((aff, allow_subset)) = apply_aff {
                 apply_job_affinity_limit(aff, allow_subset);
@@ -2490,6 +2507,7 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             let count = (len / 16) as usize;
             let sm = system_affinity_mask();
             let mut out = Vec::with_capacity(count);
+            let mut combined_mask = 0usize;
             for i in 0..count {
                 let mut ga = [0u8; 16];
                 std::ptr::copy_nonoverlapping(bytes.add(i * 16), ga.as_mut_ptr(), 16);
@@ -2499,9 +2517,26 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                     set_err(err::ERROR_INVALID_PARAMETER);
                     return FALSE;
                 }
+                combined_mask |= mask;
                 out.push(ga);
             }
+            if (st.limit_flags() & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
+                let basic_aff = usize::from_le_bytes(st.basic_limits[48..56].try_into().unwrap());
+                if basic_aff != 0 && (basic_aff & combined_mask) == 0 {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+            }
             st.group_affinities = out;
+            let apply_aff = if st.contains_pid(std::process::id()) {
+                st.effective_affinity()
+            } else {
+                None
+            };
+            drop(st);
+            if let Some((aff, allow_subset)) = apply_aff {
+                apply_job_affinity_limit(aff, allow_subset);
+            }
             TRUE
         }
         15 => {
@@ -2674,6 +2709,14 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
         9 => {
             // JobObjectExtendedLimitInformation (144 bytes on x64).
             // Per Microsoft Learn, `IoInfo` (+64..112) is "Reserved for future use" and left zeroed.
+            if st.members.iter().any(|m| matches!(m, JobMember::Child(_))) {
+                // Per-child peak memory usage is not aggregated across child processes;
+                // fail honestly rather than reporting incomplete job/process peaks.
+                log::warn!("QueryInformationJobObject(JobObjectExtendedLimitInformation): child peak memory accounting is not available");
+                put_ret(0);
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
             if len < 144 {
                 put_ret(144);
                 set_err(err::ERROR_BAD_LENGTH);
@@ -4359,6 +4402,26 @@ pub(crate) mod tests {
                 assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
                 assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
                 assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+                // Clear basic affinity limit and verify JobObjectGroupInformationEx (class 14)
+                // enforces its restricted group-0 CPU mask identically.
+                std::ptr::write_unaligned(aff_basic.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_ACTIVE_PROCESS);
+                assert_eq!(SetInformationJobObject(job, 2, aff_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), TRUE);
+
+                let mut ga = [0u8; 16];
+                std::ptr::write_unaligned(ga.as_mut_ptr() as *mut usize, 0x1usize); // mask = CPU 0, group = 0
+                assert_eq!(SetInformationJobObject(job, 14, ga.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut pm_now, &mut sm_now), TRUE);
+                assert_eq!(pm_now, 0x1);
+                assert_eq!(crate::kernel32::threads::SetThreadAffinityMask(handles::CURRENT_THREAD, 0x2), 0);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+                // Restore full group-0 affinity mask before continuing.
+                std::ptr::write_unaligned(ga.as_mut_ptr() as *mut usize, orig_sm);
+                assert_eq!(SetInformationJobObject(job, 14, ga.as_ptr() as *const c_void, 16), TRUE);
             }
 
             // Child creation inherits the current process's job by default, respects
@@ -4398,6 +4461,12 @@ pub(crate) mod tests {
                 let mut inh_in_job: BOOL = FALSE;
                 assert_eq!(IsProcessInJob(inh_h, job, &mut inh_in_job), TRUE);
                 assert_eq!(inh_in_job, TRUE);
+                // With a child member present, JobObjectExtendedLimitInformation (class 9) fails
+                // honestly with ERROR_NOT_SUPPORTED rather than omitting child memory peaks.
+                let mut child_ext = [0u8; 144];
+                assert_eq!(QueryInformationJobObject(job, 9, child_ext.as_mut_ptr() as *mut c_void, 144, &mut ret_len), FALSE);
+                assert_eq!(ret_len, 0);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
                 // ActiveProcessLimit == 2 is now saturated (self + inherited child).
                 assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
                 inh_child.finish_reaped(Some(0), 0);
