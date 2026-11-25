@@ -6024,8 +6024,9 @@ mod tests {
             assert_eq!(tls_out.as_slice(), p_hash(Digest::Sha256, &expected_z_be, &[&label[..], &seed[..]].concat(), 48).as_slice());
             let mut bad_proto = 0x0304u32.to_le_bytes();
             tls_bufs[2].pv_buffer = bad_proto.as_mut_ptr() as *mut c_void;
+            let tls_desc_bad = BcryptBufferDesc { ul_version: 0, c_buffers: tls_bufs.len() as u32, p_buffers: tls_bufs.as_mut_ptr() };
             assert_eq!(
-                BCryptDeriveKey(h_sec, w("TLS_PRF").as_ptr(), &tls_desc as *const _ as *const c_void, tls_out.as_mut_ptr(), 48, &mut got, 0),
+                BCryptDeriveKey(h_sec, w("TLS_PRF").as_ptr(), &tls_desc_bad as *const _ as *const c_void, tls_out.as_mut_ptr(), 48, &mut got, 0),
                 STATUS_NOT_SUPPORTED
             );
 
