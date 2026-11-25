@@ -4165,7 +4165,16 @@ pub unsafe extern "win64" fn CryptGenKey(
         SymAlg::Des => 8,
         SymAlg::Des3_112 => 16,
         SymAlg::Des3 => 24,
-        SymAlg::Rc2 | SymAlg::Rc4 => {
+        SymAlg::Rc2 => {
+            if req_bits == 0 {
+                default_len
+            } else if req_bits % 8 == 0 && (40..=1024).contains(&req_bits) {
+                (req_bits / 8) as usize
+            } else {
+                return err(NTE_BAD_FLAGS, FALSE);
+            }
+        }
+        SymAlg::Rc4 => {
             if req_bits == 0 {
                 default_len
             } else if req_bits % 8 == 0 && (40..=2048).contains(&req_bits) {
@@ -7322,6 +7331,21 @@ mod tests {
             assert_eq!(CryptDestroyKey(h_rc4_nosalt), TRUE);
             assert_eq!(CryptDestroyKey(h_rc4_def), TRUE);
             assert_eq!(CryptDestroyHash(h_md5), TRUE);
+
+            // RC2 key generation rejects >1024-bit keys (NTE_BAD_FLAGS) and roundtrips 1024-bit export/import
+            let mut h_rc2_bad = 0usize;
+            assert_eq!(CryptGenKey(hprov2, CALG_RC2, (2048 << 16) | CRYPT_EXPORTABLE, &mut h_rc2_bad), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            let mut h_rc2_max = 0usize;
+            assert_eq!(CryptGenKey(hprov2, CALG_RC2, (1024 << 16) | CRYPT_EXPORTABLE, &mut h_rc2_max), TRUE);
+            let mut rc2_blob = vec![0u8; 160];
+            let mut rc2_blen = 160u32;
+            assert_eq!(CryptExportKey(h_rc2_max, 0, PLAINTEXTKEYBLOB, 0, rc2_blob.as_mut_ptr(), &mut rc2_blen), TRUE);
+            assert_eq!(rc2_blen, 12 + 128);
+            let mut h_rc2_imp = 0usize;
+            assert_eq!(CryptImportKey(hprov2, rc2_blob.as_ptr(), rc2_blen, 0, 0, &mut h_rc2_imp), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc2_imp), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc2_max), TRUE);
 
             // 6. Real Windows PUBLICKEYBLOB + little-endian CAPI signature interoperability vector
             // (1024-bit OpenSSL key & SHA-256 PKCS#1 v1.5 signature over "aw2 license test",
