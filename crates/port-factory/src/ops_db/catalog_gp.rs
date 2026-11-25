@@ -24,7 +24,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "(elided in JIT block; yield for pause)",
                 semantics: "Zero-cost no-op; advances guest RIP without touching flags or registers",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 16,
             },
             OpRecord {
@@ -40,7 +40,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "mov xd/wd, xn/wn | bfxil xd, xn, #0, #8/#16",
                 semantics: "w=32 zeroes bits 63:32; w=8/16 merges into destination via bfxil; flags unchanged",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 64,
             },
             OpRecord {
@@ -56,7 +56,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "ldr/ldrh/ldrb (or ldapr in TSO mode) + bfxil for w=8/16",
                 semantics: "Range-checked guest load (+ gs:[disp] TEB support); w=32 zeroes upper 32 bits",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 64,
             },
             OpRecord {
@@ -72,7 +72,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "str/strh/strb (or stlr in TSO mode)",
                 semantics: "Range-checked guest store; release semantics under TSO mode",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 64,
             },
             OpRecord {
@@ -88,7 +88,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "movz + movk (up to 4x16b) | bfxil for w=8/16",
                 semantics: "Immediate pre-extended/masked; w=32 zeroes bits 63:32; w=8/16 preserves upper bits",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 64,
             },
             OpRecord {
@@ -104,7 +104,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "movz/movk xs, #imm + str/stlr xs, [xa]",
                 semantics: "Stores 8/16/32/64-bit sign-extended immediate to guest memory",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 32,
             },
             OpRecord {
@@ -120,7 +120,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "ubfx xd/wd, xn/wn, #0, #8/#16 | ldrb/ldrh + bfxil",
                 semantics: "Zero-extends 8/16-bit source to 16/32/64-bit destination",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 48,
             },
             OpRecord {
@@ -136,7 +136,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "sbfx xd/wd, xn/wn, #0, #8/#16/#32",
                 semantics: "Sign-extends 8/16/32-bit source to 16/32/64-bit destination",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 48,
             },
             OpRecord {
@@ -152,7 +152,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "add xd, xbase, xindex, lsl #scale + add/sub #disp",
                 semantics: "Computes effective address without memory access or flag modification",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 64,
             },
             OpRecord {
@@ -168,7 +168,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "sbfx x0/w0, x0/w0, #0, #8/#16/#32 | asr x2/w2, x0/w0, #31/#63",
                 semantics: "Sign-extends AL/AX/EAX/RAX into AX/EAX/RAX or DX:AX / EDX:EAX / RDX:RAX",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 36,
             },
             OpRecord {
@@ -184,7 +184,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "mov tmp, r0; mov r0, r1; mov r1, tmp | rev xd/wd, xn/wn | rev16",
                 semantics: "Register swap and big-endian byte reversal; flags unchanged",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 48,
             },
             OpRecord {
@@ -200,7 +200,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "ubfx xs, x_gpr, #8, #8 + op + bfi x_gpr, xs, #8, #8",
                 semantics: "Bitfield extract/insert on bits [15:8] of RAX/RCX/RDX/RBX with exact 8-bit flags",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_more.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/more.rs",
                 verified_vectors: 48,
             },
             // ---- GP Integer ALU (K_12..=K_18, K_34..=K_36, K_56..=K_59) ----
@@ -217,7 +217,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "adds/subs xd/wd, xn/wn, xm/wm/#imm (or lsl #24/#16 for w=8/16)",
                 semantics: "ARM64 NZCV maps CF={!C for sub, C for add}, ZF=Z, SF=N, OF=V; lazy parity in pfv",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 160,
             },
             OpRecord {
@@ -233,7 +233,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "adcs/sbcs xd/wd, xn/wn, xm/wm (with CF materialized into NZCV.C)",
                 semantics: "Full 8/16/32/64-bit carry/borrow chain; SBB inverts ARM64 C bit on input & output",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 96,
             },
             OpRecord {
@@ -249,7 +249,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "ands xd/wd, xn, xm | orr/eor xd, xn, xm + tst",
                 semantics: "Clears CF=0, OF=0; sets ZF, SF, PF from result; xor reg,reg zeroes without reading",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 160,
             },
             OpRecord {
@@ -265,7 +265,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "subs/ands wzr/xzr, xn, xm + b.<cond> (macro-fused in JIT)",
                 semantics: "Keeps flags in hardware NZCV across adjacent Jcc/CMOVcc/SETcc without memory stores",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 128,
             },
             OpRecord {
@@ -281,7 +281,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "adds/subs xd, xn, #1 (preserving Cpu::cf) | negs xd, xn | mvn xd, xn",
                 semantics: "INC/DEC updates OF/SF/ZF/PF while preserving prior CF; NEG sets CF=(src!=0)",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 96,
             },
             // ---- GP Shifts & Rotates (K_19..=K_20, K_66, K_79..=K_81, K_92..=K_95) ----
@@ -298,7 +298,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "lslv/lsrv/asrv xd/wd, xn/wn, xm + cbnz count flag update",
                 semantics: "Masks shift count to 5/6 bits; count==0 leaves flags untouched (w=32 still zeroes upper 32b)",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 128,
             },
             OpRecord {
@@ -314,7 +314,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "rorv/extr xd/wd, xn/wn, xm/wm, #cnt + CF/OF bit extraction",
                 semantics: "Exact modular rotate for 8/16/32/64-bit operands and double-precision funnel shifts",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 96,
             },
             // ---- GP Bit Scan, Bit Test & Manipulation (K_62..=K_65, K_69..=K_78, K_110..=K_111, K_122) ----
@@ -331,7 +331,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "rbit + clz + csel (BSF leaves dst unchanged on 0; TZCNT/LZCNT set CF=(src==0); POPCNT uses fmov+cnt.8b+addv.8b)",
                 semantics: "Preserves destination register when BSF/BSR source is 0; exact ZF/CF for TZCNT/LZCNT/POPCNT",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 120,
             },
             OpRecord {
@@ -347,7 +347,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "lsrv cf, src, idx; and cf, cf, #1 + lslv mask, #1, idx + orr/bic/eor",
                 semantics: "Extracts tested bit into CF and optionally sets/resets/complements bit in destination",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 80,
             },
             OpRecord {
@@ -363,7 +363,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "bics, lslv/lsrv/asrv/ror, umulh, crc32cb/h/w/x, bit-deposit/extract loops",
                 semantics: "Flag-free shifts/rotates/mulx, hardware ARM64 CRC32C instruction, dual carry chains (CF/OF)",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_ext.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ext.rs",
                 verified_vectors: 140,
             },
             // ---- GP Multiply & Divide (K_52..=K_55, K_82..=K_83) ----
@@ -380,7 +380,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "mul xd, xn, xm + smulh/sbfx overflow check -> CF=OF",
                 semantics: "Signed product truncated to w bits; sets CF=OF=(full product != sign_ext(low_w))",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 80,
             },
             OpRecord {
@@ -396,7 +396,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "mul + umulh/smulh | udiv/sdiv + msub for RDX:RAX quotient/remainder",
                 semantics: "Full 128-bit RDX:RAX multiply/divide and 8/16/32-bit accumulator forms with CF=OF on high half",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 96,
             },
             // ---- GP Stack, Control Flow & Conditionals (K_21..=K_33, K_86..=K_90, K_114) ----
@@ -413,7 +413,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "sub x_rsp, x_rsp, #8 + str/stlr | ldr/ldapr + add x_rsp, x_rsp, #8",
                 semantics: "Handles push rsp / pop rsp edge cases, enter frame allocation, and 16-bit operand-size stack pointer adjustments",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 64,
             },
             OpRecord {
@@ -429,7 +429,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "Direct patched b/b.<cond> between JIT blocks + lookup_ret/lookup_jmp hash dispatch",
                 semantics: "Intercepts host VA_DISPATCH targets & __chkstk; links direct block targets in MAP_JIT",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 128,
             },
             OpRecord {
@@ -445,7 +445,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "csel xd/wd, x_true, x_false, <cond> | cset wd, <cond>",
                 semantics: "32-bit CMOVcc unconditionally zero-extends destination bits 63:32 even when condition is false",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 128,
             },
             // ---- GP Atomic / LOCK, String & System (K_84..=K_85, K_91, K_119, K_121, K_123) ----
@@ -462,7 +462,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "ldaxr/stlxr retry loop (ldaxp/stlxp for cmpxchg16b) + dmb ish",
                 semantics: "SeqCst LL/SC atomic RMW against guest memory; sets ZF=(old==expected) and updates RAX/RDX:RAX",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_more.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/more.rs",
                 verified_vectors: 96,
             },
             OpRecord {
@@ -478,7 +478,7 @@ macro_rules! gp_ops {
                 arm64_pattern: "Inline ARM64 loop over RCX with DF (+/-width) stepping and ZF termination",
                 semantics: "Honors Cpu::df direction flag, RCX count=0 early exit, and REPE/REPNE ZF comparison flags",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_more.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/more.rs",
                 verified_vectors: 64,
             },
             OpRecord {

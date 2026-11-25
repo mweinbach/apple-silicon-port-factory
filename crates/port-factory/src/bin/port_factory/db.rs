@@ -7,7 +7,7 @@ use super::{
 };
 use anyhow::{bail, Result};
 use pe_image::Pe;
-use port_factory::doctor::check_or_fix_db_tsvs;
+use port_factory::doctor::check_workspace_catalogs;
 use port_factory::game_profiles::{
     audit_all_game_profiles, detect_pe_game_profile, sync_and_format_game_profiles,
     TOP_GAME_PROFILES,
@@ -603,10 +603,7 @@ pub fn cmd_doctor(args: &[String]) -> Result<i32> {
     let (fix, json, pe_args) = parse_doctor_args(args)?;
     let root = workspace_root();
 
-    // 1-4. Verify (or with `--fix`, synchronize) all four canonical `db/*.tsv` databases:
-    //      `db/ops_x86_to_arm64.tsv`, `db/win32_apis.tsv`, `db/shader_formats.tsv`,
-    //      and `db/game_profiles.tsv`.
-    let db_report = check_or_fix_db_tsvs(&root, &root.join("db"), fix)?;
+    let db_report = check_workspace_catalogs(&root, fix)?;
 
     // 5. Verify standard ~/Translator VFS layout + ShaderCache + Native Pipelines
     let translator_root = WinFs::default_translator_root();
