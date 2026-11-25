@@ -132,7 +132,9 @@ void mainCRTStartup(void) {
             })
         };
         assert!(reports("fld1", "interpreter_only"));
-        assert!(reports("cvtpi2ps", "interpreter_only"));
+        assert!(!ops
+            .iter()
+            .any(|op| op.get("mnemonic").and_then(|v| v.as_str()) == Some("cvtpi2ps")));
         assert_eq!(reports("rdpkru", "unimplemented"), abort);
         let aot = dir.join(format!("{name}-aot"));
         for mode in ["jit", "prewarm", "aot"] {
