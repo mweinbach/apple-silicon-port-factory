@@ -9,14 +9,12 @@
 //! summary so `cargo opsdb -- doctor` exits non-zero on any drift. Passing `fix = true`
 //! (`cargo opsdb -- doctor --fix`) rewrites only the missing or drifted TSV files in place.
 
-use crate::game_profiles::{
-    audit_all_game_profiles, format_game_profiles_tsv, TOP_GAME_PROFILES,
-};
+use crate::game_profiles::{audit_all_game_profiles, format_game_profiles_tsv, TOP_GAME_PROFILES};
 use crate::ops_db::{catalog_stats, format_tsv as format_ops_tsv};
 use crate::stub_inventory::{
     check_no_new_stubs_against_file, format_inventory_tsv, scan_workspace_stubs,
 };
-use crate::win32_db::{ImplKind, Win32Database};
+use crate::win32_db::{mask_non_code, ImplKind, Win32Database};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -63,10 +61,11 @@ pub struct TsvCheckItem {
     pub status: TsvSyncStatus,
 }
 
-/// Aggregated report across all four canonical `db/*.tsv` databases.
+/// Aggregated report across the canonical `db/*.tsv` databases.
 #[derive(Debug, Clone)]
 pub struct DoctorDbReport {
     pub items: Vec<TsvCheckItem>,
+    pub catalog_errors: Vec<String>,
 }
 
 impl DoctorDbReport {
@@ -75,7 +74,7 @@ impl DoctorDbReport {
     }
 
     pub fn has_drift(&self) -> bool {
-        self.items.iter().any(|i| i.status.is_drift())
+        !self.catalog_errors.is_empty() || self.items.iter().any(|i| i.status.is_drift())
     }
 
     /// Format a clear, human-readable status and mismatch summary for stdout.
@@ -131,12 +130,18 @@ impl DoctorDbReport {
                 }
             }
         }
+        for error in &self.catalog_errors {
+            let _ = writeln!(out, "  [DRIFT]   {error}");
+        }
         out
     }
 
     /// Returns `Ok(())` when all TSV files match their canonical generated state, or an `Err`
     /// enumerating every missing/drifted file so CLI callers exit non-zero.
     pub fn ensure_clean(&self) -> Result<()> {
+        if !self.catalog_errors.is_empty() {
+            bail!("{}", self.catalog_errors.join("\n"));
+        }
         let drifted = self.drifted_items();
         if drifted.is_empty() {
             return Ok(());
@@ -322,27 +327,135 @@ fn check_or_fix_single(
     })
 }
 
-/// Check (when `fix == false`) or synchronize (when `fix == true`) all four canonical TSV
-/// databases in `db_dir`:
-/// - `ops_x86_to_arm64.tsv`
-/// - `win32_apis.tsv`
-/// - `shader_formats.tsv`
-/// - `game_profiles.tsv`
-pub fn check_or_fix_db_tsvs(
+/// Verify source links even when the generator and the committed TSV agree on a stale path.
+fn catalog_source_errors<'a>(
+    root: &Path,
+    source_files: impl Iterator<Item = &'a str>,
+    rust_paths: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for file in source_files.collect::<BTreeSet<_>>() {
+        let path = Path::new(file);
+        if path.is_absolute() || !root.join(path).is_file() {
+            errors.push(format!(
+                "catalog source_file does not resolve in the workspace: {file}"
+            ));
+        }
+    }
+
+    // rust_path is a qualified Rust item, including cross-DLL forwarders. An
+    // EXTRA_EXPORTS[decorated name] row names an element of a generated table.
+    let mut modules = BTreeMap::<&str, BTreeSet<String>>::new();
+    for path in rust_paths.collect::<BTreeSet<_>>() {
+        let item = path.split('[').next().unwrap_or(path);
+        let Some((module, name)) = item
+            .strip_prefix("win32_rt::")
+            .and_then(|p| p.rsplit_once("::"))
+        else {
+            errors.push(format!("invalid Win32 rust_path: {path}"));
+            continue;
+        };
+        let identifiers = modules.entry(module).or_insert_with(|| {
+            let base = root
+                .join("crates/win32-rt/src")
+                .join(module.replace("::", "/"));
+            let src = fs::read_to_string(base.with_extension("rs"))
+                .or_else(|_| fs::read_to_string(base.join("mod.rs")))
+                .unwrap_or_default();
+            let code = mask_non_code(src.split("#[cfg(test)]").next().unwrap_or(""));
+            String::from_utf8_lossy(&code)
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        });
+        if !identifiers.contains(name) {
+            errors.push(format!(
+                "Win32 rust_path has no matching source item: {path}"
+            ));
+        }
+    }
+    errors
+}
+
+const COUNTS_START: &str = "<!-- opsdb:catalog -->";
+const COUNTS_END: &str = "<!-- /opsdb:catalog -->";
+
+fn check_status_counts(doc: &Path, counts: &str, fix: bool) -> Result<Option<String>> {
+    let text = fs::read_to_string(doc).with_context(|| format!("read {}", doc.display()))?;
+    let region = text.split_once(COUNTS_START).and_then(|(before, rest)| {
+        rest.split_once(COUNTS_END)
+            .map(|(old, after)| (before, old, after))
+    });
+    let Some((before, old, after)) = region else {
+        return Ok(Some(
+            "docs/STATUS.md is missing its opsdb:catalog markers".into(),
+        ));
+    };
+    if [before, old, after]
+        .iter()
+        .any(|s| s.contains(COUNTS_START) || s.contains(COUNTS_END))
+    {
+        return Ok(Some(
+            "docs/STATUS.md has ambiguous opsdb:catalog markers".into(),
+        ));
+    }
+    if old == counts {
+        return Ok(None);
+    }
+    if fix {
+        fs::write(
+            doc,
+            format!("{before}{COUNTS_START}{counts}{COUNTS_END}{after}"),
+        )?;
+        Ok(None)
+    } else {
+        Ok(Some(
+            "docs/STATUS.md catalog counts drifted; run `cargo opsdb -- doctor --fix`".into(),
+        ))
+    }
+}
+
+/// Check the canonical databases and the published catalog totals.
+pub fn check_workspace_catalogs(root: &Path, fix: bool) -> Result<DoctorDbReport> {
+    check_catalogs(
+        root,
+        &root.join("db"),
+        Some(&root.join("docs/STATUS.md")),
+        fix,
+    )
+}
+
+/// Check or regenerate just the databases in the supplied directory.
+pub fn check_or_fix_db_tsvs(root: &Path, db_dir: &Path, fix: bool) -> Result<DoctorDbReport> {
+    check_catalogs(root, db_dir, None, fix)
+}
+
+fn check_catalogs(
     workspace_root: &Path,
     db_dir: &Path,
+    status_doc: Option<&Path>,
     fix: bool,
 ) -> Result<DoctorDbReport> {
     // 1. x86-64 -> ARM64 Ops Database
     let ops_expected = format_ops_tsv();
     let st = catalog_stats();
+    let mut tiers = BTreeMap::new();
+    for row in crate::ops_db::OPS_CATALOG {
+        *tiers.entry(row.tier.as_str()).or_insert(0usize) += 1;
+    }
+    let tiers = tiers
+        .iter()
+        .map(|(tier, n)| format!("{n} {tier}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let ops_item = check_or_fix_single(
         "ops_x86_to_arm64.tsv",
         db_dir.join("ops_x86_to_arm64.tsv"),
         "Ops Database",
         format!(
-            "{} families, {} mnemonics ({} JIT_ARM64, {} vectors)",
-            st.total_records, st.total_mnemonics, st.jit_arm64_records, st.total_verified_vectors
+            "{} families ({tiers}), {} distinct mnemonics, {} cataloged vectors",
+            st.total_records, st.total_mnemonics, st.total_verified_vectors
         ),
         "cargo opsdb -- sync",
         &ops_expected,
@@ -358,7 +471,7 @@ pub fn check_or_fix_db_tsvs(
         db_dir.join("win32_apis.tsv"),
         "Win32 Database",
         format!(
-            "{} APIs across {} DLLs ({} real, {} partial, {} stub, {} failing)",
+            "{} exports across {} DLLs ({} real, {} partial, {} stub, {} failing)",
             win_db.entries.len(),
             dll_count.len(),
             win_db.count_by_impl_kind(ImplKind::Real),
@@ -389,7 +502,10 @@ pub fn check_or_fix_db_tsvs(
     // 4. Top PC Games & Engines Compatibility Catalog
     let gp_expected = format_game_profiles_tsv();
     let gp_audits = audit_all_game_profiles(&win_db);
-    let gp_ready = gp_audits.iter().filter(|a| a.missing_dlls.is_empty()).count();
+    let gp_ready = gp_audits
+        .iter()
+        .filter(|a| a.missing_dlls.is_empty())
+        .count();
     let gp_item = check_or_fix_single(
         "game_profiles.tsv",
         db_dir.join("game_profiles.tsv"),
@@ -422,7 +538,33 @@ pub fn check_or_fix_db_tsvs(
         fix,
     )?;
 
+    let mut catalog_errors = catalog_source_errors(
+        workspace_root,
+        crate::ops_db::OPS_CATALOG
+            .iter()
+            .map(|r| r.source_file)
+            .chain(win_db.entries.iter().map(|e| e.source_file.as_str()))
+            .chain(stubs.iter().map(|e| e.file.as_str())),
+        win_db.entries.iter().map(|e| e.rust_path.as_str()),
+    );
+    if let Some(doc) = status_doc {
+        let a64_rows = |file: &str| -> Result<usize> {
+            let path = db_dir.join(file);
+            Ok(fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?
+                .lines()
+                .skip(1)
+                .count())
+        };
+        let counts = format!(
+            "\n\n- x86-64 operations — {}.\n- Win32 — {}.\n- Stub inventory — {}.\n- A64 emitter — {} test words checked against {} encoding forms.\n\n",
+            ops_item.detail, win_item.detail, stub_item.detail,
+            a64_rows("a64_emitter_matches.tsv")?, a64_rows("a64_encodings.tsv")?,
+        );
+        catalog_errors.extend(check_status_counts(doc, &counts, fix)?);
+    }
     Ok(DoctorDbReport {
+        catalog_errors,
         items: vec![ops_item, win_item, shader_item, gp_item, stub_item],
     })
 }
@@ -452,6 +594,56 @@ mod tests {
     }
 
     #[test]
+    fn source_and_qualified_item_must_exist_even_if_the_tsv_is_in_sync() {
+        let tmp = make_temp_db_dir("references");
+        let src = "crates/win32-rt/src/example/mod.rs";
+        let file = tmp.path().join(src);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            file,
+            "fn Working() {} // Removed\nstatic EXTRA_EXPORTS: () = ();",
+        )
+        .unwrap();
+        let errors = catalog_source_errors(
+            tmp.path(),
+            [src, "crates/deleted.rs"].into_iter(),
+            [
+                "win32_rt::example::Working",
+                "win32_rt::example::EXTRA_EXPORTS[?decorated]",
+                "win32_rt::example::Removed",
+                "win32_rt::old_module::Working",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        for missing in ["deleted.rs", "example::Removed", "old_module::Working"] {
+            assert!(errors.iter().any(|e| e.contains(missing)));
+        }
+    }
+
+    #[test]
+    fn status_fix_preserves_prose_and_refuses_ambiguous_markers() {
+        let tmp = make_temp_db_dir("counts");
+        let doc = tmp.path().join("STATUS.md");
+        let original = format!("before\n{COUNTS_START}\nstale\n{COUNTS_END}\nafter\n");
+        fs::write(&doc, &original).unwrap();
+        let counts = "\ncurrent\n";
+        assert!(check_status_counts(&doc, counts, false).unwrap().is_some());
+        assert_eq!(fs::read_to_string(&doc).unwrap(), original);
+        assert_eq!(check_status_counts(&doc, counts, true).unwrap(), None);
+        assert_eq!(
+            fs::read_to_string(&doc).unwrap(),
+            original.replace("stale", "current")
+        );
+        assert_eq!(check_status_counts(&doc, counts, false).unwrap(), None);
+        for broken in [original.replace(COUNTS_END, ""), original.repeat(2)] {
+            fs::write(&doc, &broken).unwrap();
+            assert!(check_status_counts(&doc, counts, true).unwrap().is_some());
+            assert_eq!(fs::read_to_string(&doc).unwrap(), broken);
+        }
+    }
+
+    #[test]
     fn doctor_detects_missing_fixes_and_verifies_in_sync() {
         let root = workspace_root();
         let tmp = make_temp_db_dir("missing_and_sync");
@@ -477,7 +669,7 @@ mod tests {
         assert!(err_msg.contains("game_profiles.tsv"));
         assert!(err_msg.contains("stub_inventory.tsv"));
 
-        // 2. Fix mode writes all 4 canonical TSVs cleanly.
+        // 2. Fix mode writes all five canonical TSVs cleanly.
         let fixed_rep = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
         assert!(!fixed_rep.has_drift());
         assert!(fixed_rep.ensure_clean().is_ok());
@@ -486,7 +678,7 @@ mod tests {
             assert!(item.abs_path.is_file());
         }
 
-        // 3. Subsequent check mode passes with all 4 InSync.
+        // 3. Subsequent check mode passes with all five InSync.
         let clean_rep = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap();
         assert!(!clean_rep.has_drift());
         assert!(clean_rep.ensure_clean().is_ok());
@@ -496,11 +688,11 @@ mod tests {
     }
 
     #[test]
-    fn doctor_detects_drift_in_each_of_the_four_tsvs_individually() {
+    fn doctor_detects_drift_in_each_of_the_tsvs_individually() {
         let root = workspace_root();
         let tmp = make_temp_db_dir("individual_drift");
 
-        // Seed all 4 canonical TSVs cleanly first.
+        // Seed all five canonical TSVs cleanly first.
         let seeded = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
         assert!(seeded.ensure_clean().is_ok());
 
@@ -543,7 +735,7 @@ mod tests {
             // Ensure check mode did not silently overwrite the drifted file.
             assert_eq!(fs::read_to_string(&p).unwrap(), mutated);
 
-            // Fix mode repairs only `target_file`, leaving the other 3 untouched/InSync.
+            // Fix mode repairs only `target_file`, leaving the other files untouched/InSync.
             let fix_rep = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
             assert!(fix_rep.ensure_clean().is_ok());
             assert_eq!(fs::read_to_string(&p).unwrap(), orig);

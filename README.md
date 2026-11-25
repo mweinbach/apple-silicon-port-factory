@@ -37,8 +37,8 @@ plus a starter template at [`games/_template/game.toml`](games/_template/game.to
 - **Universal ARM64 execution (`crates/x86-runtime`, `crates/port-loader`, `crates/pe-image`)** —
   Loads Windows PE32+ executables and DLLs, translates x86-64 to ARM64/NEON through an `iced-x86`
   interpreter, block JIT, relocatable `.aot` disk cache (`--prewarm-aot`), and static iOS Mach-O
-  `.aot.o` emitter, with MSVC FH4/SEH unwinding. The default `port-runner` binary is ~17 MB, builds
-  in ~15 seconds, and contains zero game-specific code.
+  `.aot.o` emitter, with MSVC FH4/SEH unwinding. The default `port-runner` builds independently of game-specific crates.
+  [Current instruction and export counts](docs/STATUS.md#catalog-totals)
 - **Native Win32 & OS layer (`crates/win32-rt`)** — Clean-room Windows and middleware DLL exports
   built directly on macOS/iOS primitives: Mach/POSIX threads & sync, `~/Translator` virtual `C:\`
   filesystem, AppKit/UIKit surfaces, raw input, `GameController` XInput + CoreHaptics rumble,

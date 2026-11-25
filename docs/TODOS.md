@@ -10,6 +10,12 @@ Related docs: [What's Next](WHATS_NEXT.md) Â· [What's Needed](WHATS_NEEDED.md) Â
 
 ## P0 â€” Immediate Priorities
 
+- [ ] Take a second offline single-player game past menus on both `port-runner` and the packaged
+      app. Keep game-specific settings in its manifest.
+- [x] Report hangs before the first frame. The launch watchdog records heartbeats, thread
+      activity and guest stacks. `pre_present_hang_e2e` checks a blocked guest and a healthy
+      message pump. Fatal crash files include structured JSON and guest `.pdata` frames.
+
 - [x] **First non-AW2 shipping game to rendered frame on `port-runner`:** **Overwatch 2**
       (`games/overwatch/game.toml`, Steam AppID `2357570`) now runs end-to-end on `port-runner` and
       inside its self-contained bundle `out/apps/Overwatch.app` (`15/15` `bundle-verify` PASS),
@@ -79,7 +85,7 @@ Related docs: [What's Next](WHATS_NEXT.md) Â· [What's Needed](WHATS_NEEDED.md) Â
       `wait`/`rdsspq`, and AVX2 256-bit reg/mem-count shifts (`vpsll*/vpsrl*/vpsra*`) to
       `JIT_ARM64` (`0` non-trap `GENERIC_INTERP` instructions in 577M-instr live Overwatch run),
       expanded x87 FPU (`fdivr`/`ffreep`/`fistp`/`fstp`/`fld m80`/`fxam`/`fnclex`), and synced
-      `db/ops_x86_to_arm64.tsv` (**49 families, 996 mnemonics, 47 `JIT_ARM64`, 4,884 vectors**).
+      the [ops catalog](STATUS.md#catalog-totals).
 - [x] **`.aot` verification in CI/local checks:** Added standalone multi-module `.aot` prewarm +
       shifted-base reload verification integration test under `PORT_AOT_VERIFY=1`
       (`crates/x86-runtime/tests/aot_multi_module_verify.rs`, 0 verify mismatches).
@@ -198,10 +204,9 @@ Related docs: [What's Next](WHATS_NEXT.md) Â· [What's Needed](WHATS_NEEDED.md) Â
       copies `libmetalirconverter.dylib` (and optional `libdxilconv.dylib` / `libMoltenVK.dylib`)
       into `Contents/Frameworks/` and generates a native launcher that resolves them with an empty
       environment (verified by compiling and executing the generated launcher under `env_clear()`;
-      cold Finder launch of a full converted game remains tracked in Step 3 of `docs/WHATS_NEXT.md`).
-- [x] **Verify `cargo opsdb -- doctor`:** Checks for drift across `db/win32_apis.tsv`,
-      `db/ops_x86_to_arm64.tsv`, `db/shader_formats.tsv`, and `db/game_profiles.tsv` read-only by
-      default, exits non-zero on mismatch, and supports `--fix` to sync (`crates/port-factory/src/doctor.rs`
+      cold Finder launch of a full converted game remains tracked in [the cold-launch milestone](WHATS_NEXT.md#package-and-relaunch)).
+- [x] **Verify `cargo opsdb -- doctor`:** Checks five generated TSVs, catalog source references, the zero-new-stub policy and the
+      [published totals](STATUS.md#catalog-totals). Exits nonzero on drift (`crates/port-factory/src/doctor.rs`
       with unit tests).
 - [x] **Overwatch 2 bring-up audit (`games/overwatch/game.toml`):** Ran `win32-audit`
       (1,155/1,155 = 100%), `anticheat-audit` (no kernel anti-cheat; runtime unpacker),
