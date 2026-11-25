@@ -11,17 +11,80 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **262** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 167 |
-| `failing` (honest-failing macro exports) | 40 |
+| Total remaining stub sites | **236** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 152 |
+| `failing` (honest-failing macro exports) | 29 |
 | `middleware_stub` (third-party/engine middleware fallbacks) | 55 |
-| DLLs with remaining stubs | 45 |
+| DLLs with remaining stubs | 43 |
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
 | File | Summary |
 |---|---|
+| [`crypto-certs.md`](stub-backlog.d/crypto-certs.md) | Stubs 4: crypt32, Schannel and WinVerifyTrust |
 | [`guest-corpus-bench.md`](stub-backlog.d/guest-corpus-bench.md) | Stub & API Gap Backlog — `toolkit/guest-corpus-bench` |
+
+### From `docs/stub-backlog.d/crypto-certs.md`
+
+# Stubs 4: crypt32, Schannel and WinVerifyTrust
+
+Scope: 27 stub sites across `crates/win32-rt/src/misc/crypt32.rs`, `crypt32/asn1.rs`, `crypt32/chain.rs`, `secur32/schannel.rs`, and `wintrust.rs`.
+
+- **Sites in scope before**: 27 (12 `failing!` + 15 `stub!`)
+- **Sites in scope after**: 1 (1 `failing!`, 0 `stub!`)
+- **Disposition**: 24 made real, 2 native-unsupported (matching Windows without TPM hardware), 1 honest leftover (blocked on parallel branch `stubs/crypto-cng-capi`)
+
+## DPAPI Key Derivation Audit Note
+
+The earlier review flag about DPAPI deriving keys from public constants in `crates/win32-rt/src/misc/crypt32/asn1.rs` was verified to be **already resolved on `origin/main`**: `dpapi_host_secret()` generates a 32-byte random key via `arc4random_buf`, atomically persists it with `0o600` permissions in per-user (`dpapi_user_<user>.key`) or machine (`dpapi_machine.key`) state files, never falls back to hardcoded/public constants, and is covered by `dpapi_uses_0600_host_secrets_and_isolates_secrets_and_machine_scope`.
+
+---
+
+## Remaining Sites in Scope (1)
+
+| DLL!API | Kind | Why Not Implemented Yet | Next Step |
+|---|---|---|---|
+| `crypt32.dll!CryptImportPublicKeyInfo` | `failing` | Returns a CryptoAPI `HCRYPTKEY` handle associated with an `advapi32.dll` `HCRYPTPROV`, which must be usable by `advapi32.dll!CryptDestroyKey`, `CryptVerifySignature`, `CryptEncrypt`, and `CryptExportKey`. In `crates/win32-rt/src/advapi32.rs` (owned by parallel branch `stubs/crypto-cng-capi`, outside this branch's scope), `CryptImportKey`/`CryptDestroyKey`/`CryptExportKey` are currently 0-arg `failing!` macros. The `CERT_PUBLIC_KEY_INFO` -> CAPI `PUBLICKEYBLOB` (`RSA1` `BLOBHEADER` + `RSAPUBKEY` + little-endian modulus) converter (`crypt32::decode::spki_to_capi_public_key_blob`) is already implemented and unit-tested. | Once `stubs/crypto-cng-capi` lands real `advapi32::CryptImportKey`, replace the `failing!` line in `crates/win32-rt/src/misc/crypt32.rs` with a call to `decode::spki_to_capi_public_key_blob` followed by `advapi32::CryptImportKey(h_crypt_prov, blob.as_ptr(), blob.len() as u32, 0, 0, ph_key)`. |
+
+---
+
+## Native-Unsupported (Matches Windows Without the Feature) (2)
+
+| DLL!API | Return Value / Error | Capability Absent on Apple Silicon | Microsoft Learn Reference |
+|---|---|---|---|
+| `wintrust.dll!Tbsip_Context_Close` | `TBS_E_INVALID_CONTEXT` (`0x80284004`) | Apple Silicon Macs have no TCG TPM 1.2/2.0 hardware device and no Windows TPM Base Services (TBS) daemon. Because `Tbsi_Context_Create` returns `TBS_E_TPM_NOT_FOUND` and never issues a valid `TBS_HCONTEXT`, any handle passed to `Tbsip_Context_Close` is invalid, matching Windows on a machine without a TPM. | [Tbsip_Context_Close (tbs.h)](https://learn.microsoft.com/en-us/windows/win32/api/tbs/nf-tbs-tbsip_context_close) |
+| `wintrust.dll!Tbsip_Submit_Command` | `TBS_E_TPM_NOT_FOUND` (`0x8028400F`, zeroes `*pResultBufSize`) | No TPM device is present to receive TPM command buffers; matches Windows TBS when no compatible TPM is found on the host. | [Tbsip_Submit_Command (tbs.h)](https://learn.microsoft.com/en-us/windows/win32/api/tbs/nf-tbs-tbsip_submit_command) |
+
+---
+
+## Sites Made Real (24)
+
+| DLL!API | File | Implementation Summary |
+|---|---|---|
+| `crypt32.dll!CryptFindOIDInfo` | `misc/crypt32/decode.rs` | Win64 ABI-exact 64-byte static `CRYPT_OID_INFO` catalog supporting all 6 key types (`OID`, `NAME`, `ALGID`, `SIGN`, `CNG_ALGID`, `CNG_SIGN`) and all 10 OID groups. |
+| `crypt32.dll!CertStrToNameA` | `misc/crypt32/decode.rs` | RFC 1779/2253 X.500 DN string parser (`CN`, `O`, `OU`, `C`, `L`, `S`/`ST`, `E`, `DC`, `SN`, `SERIALNUMBER`, dotted OIDs, quotes/escapes, `+` multi-valued RDNs, `#hex` DER, `CERT_NAME_STR_REVERSE_FLAG`, `ppszError` + `CRYPT_E_INVALID_X500_STRING`). |
+| `crypt32.dll!CertStrToNameW` | `misc/crypt32/decode.rs` | UTF-16 counterpart to `CertStrToNameA` with UTF-16 character error offset calculation. |
+| `crypt32.dll!CryptDecodeObject` | `misc/crypt32/decode.rs` | Single-buffer relocating `DecodeArena` decoder for 25+ X.509/PKCS#7 struct types and OID aliases with Windows size-query and `ERROR_MORE_DATA` semantics. |
+| `crypt32.dll!CryptDecodeObjectEx` | `misc/crypt32/decode.rs` | Extended decoder adding `CRYPT_DECODE_ALLOC_FLAG` (`LocalAlloc`), `CRYPT_DECODE_NOCOPY_FLAG`, `CRYPT_DECODE_SHARE_OID_STRING_FLAG`, and `ERROR_FILE_NOT_FOUND` for unknown struct types. |
+| `crypt32.dll!CryptEncodeObjectEx` (`encode_x509_object`) | `misc/crypt32/asn1.rs` | Added `X509_ENUMERATED`, `PKCS_UTC_TIME`, `X509_ALGORITHM_IDENTIFIER`, `PKCS_CONTENT_INFO`, `PKCS_ATTRIBUTE`, `PKCS_ATTRIBUTES`, `X509_AUTHORITY_KEY_ID2` (`2.5.29.35`), `CNG_RSA_PUBLIC_KEY_BLOB`, `PKCS_7_ASN_ENCODING`, and `ERROR_FILE_NOT_FOUND` for unknown struct types. |
+| `crypt32.dll!CryptStringToBinaryA/W` (`crypt_string_to_binary_impl`) | `misc/crypt32/asn1.rs` | Added `CRYPT_STRING_PERCENTESCAPE` (`0x0E`) decoder and returns `ERROR_INVALID_DATA` for unsupported flag values. |
+| `crypt32.dll!CertGetCertificateContextProperty` | `misc/crypt32/store.rs` | Real computed and stored properties (`SHA1_HASH`, `MD5_HASH`, `SHA256_HASH`, `SIGNATURE_HASH`, `KEY_IDENTIFIER`, `SUBJECT_PUBLIC_KEY_MD5_HASH`, `ISSUER_PUBLIC_KEY_MD5_HASH`, `SUBJECT_NAME_MD5_HASH`, `ENHKEY_USAGE`, `PUBKEY_ALG_PARA`, `ACCESS_STATE`, `KEY_SPEC`, `KEY_PROV_INFO`, `FRIENDLY_NAME`, custom properties) plus `CertSetCertificateContextProperty`. |
+| `crypt32.dll!CertFreeCRLContext` | `misc/crypt32/store.rs` | Real refcounted `CRL_CONTEXT` registry with `CertCreateCRLContext`, `CertDuplicateCRLContext`, and `CertFreeCRLContext` (returns `TRUE` on null/unregistered per Windows). |
+| `crypt32.dll!CertFreeCTLContext` | `misc/crypt32/store.rs` | Real refcounted `CTL_CONTEXT` registry with `CertCreateCTLContext`, `CertDuplicateCTLContext`, and `CertFreeCTLContext`. |
+| `crypt32.dll!CryptMsgOpenToDecode` | `misc/crypt32/pkcs.rs` | Real PKCS#7/CMS decode message handle creation (attached & detached `CMSG_DETACHED_FLAG`). |
+| `crypt32.dll!CryptMsgUpdate` | `misc/crypt32/pkcs.rs` | Streaming/chunked DER `ContentInfo` accumulation and finalization with `CryptMsgGetParam` support (`TYPE`, `VERSION`, `CONTENT`, `BARE_CONTENT`, `INNER_CONTENT_TYPE`, `ENCODED_MESSAGE`, `SIGNER_COUNT`, `SIGNER_INFO`, `SIGNER_CERT_INFO`, `CERT_COUNT`, `CERT`, `SIGNER_AUTH_ATTR`, `SIGNER_UNAUTH_ATTR`). |
+| `crypt32.dll!CryptVerifyMessageSignature` | `misc/crypt32/pkcs.rs` | Real RSA PKCS#1 v1.5, ECDSA, and Ed25519 signature verification over `signedAttrs` (SET-retagged `0x31` + `messageDigest` match) or direct content, with payload decoding and signer `PCCERT_CONTEXT` output. |
+| `crypt32.dll!PFXImportCertStore` | `misc/crypt32/pkcs.rs` | Real RFC 7292 PKCS#12 parser backed by Apple CommonCrypto (`CCCrypt`, `CCKeyDerivationPBKDF`, `Digest::hmac`) supporting PBES2 (PBKDF2 + AES-128/192/256-CBC, 3DES-CBC) and legacy PBES1 (SHA1-3DES-CBC, SHA1-RC2-128/40-CBC), MAC verification (`ERROR_INVALID_PASSWORD`), `friendlyName`/`localKeyId` attributes, and PKCS#8 private key attachment. |
+| `crypt32.dll!CertVerifySubjectCertificateContext` | `misc/crypt32/chain.rs` | Real RSA/ECDSA/Ed25519 signature verification against issuer SPKI, time validity check (`NotBefore`/`NotAfter`), and revocation/flag masking semantics. |
+| `crypt32.dll!CertFreeCertificateChainEngine` | `misc/crypt32/chain.rs` | Proper handling of `NULL`, `HCCE_LOCAL_MACHINE` (`1`), and custom engine handles without stub warning. |
+| `crypt32.dll!CertFreeCertificateChain` | `misc/crypt32/chain.rs` | Refcounted chain handles with `CertDuplicateCertificateChain` and safe cleanup. |
+| `crypt32.dll!CertVerifyCertificateChainPolicy` | `misc/crypt32/chain.rs` | Added Apple `Security.framework` macOS root store integration (`SecTrustCopyAnchorCertificates` + `SecTrustSettingsCopyCertificates` + `SecTrustEvaluateWithError`) and implemented policies `BASIC_CONSTRAINTS` (5), `NT_AUTH` (6), `MICROSOFT_ROOT` (7), `EV` (8), `SSL_F12` (9), `SSL_HPKP_HEADER` (10), `THIRD_PARTY_ROOT` (11), `SSL_KEY_PIN` (12), returning `ERROR_FILE_NOT_FOUND` for unknown policy OIDs. |
+| `secur32.dll!AcquireCredentialsHandleA/W` | `misc/secur32/schannel.rs` | Real inbound (`SECPKG_CRED_INBOUND`) and bidirectional (`SECPKG_CRED_BOTH`) Schannel credentials reading cert chain + PKCS#8 private key from `SCHANNEL_CRED`/`SCH_CREDENTIALS` `paCred`, returning `SEC_E_NO_CREDENTIALS` if missing, paired with `AcceptSecurityContext` (`rustls::ServerConnection`). |
+| `secur32.dll!ApplyControlToken` | `misc/secur32/schannel.rs` | Real `SCHANNEL_SHUTDOWN` (1), `SCHANNEL_ALERT` (2, warning and fatal), and `SCHANNEL_SESSION` (3, enable/disable reconnects); returns `SEC_E_INVALID_TOKEN` for unknown token types. |
+| `secur32.dll!QueryContextAttributesA/W` | `misc/secur32/schannel.rs` | Added `LIFESPAN`, `KEY_INFO`, `AUTHORITY`, `PROTO_INFO`, `NEGOTIATION_INFO`, `FLAGS`, `UNIQUE_BINDINGS`/`ENDPOINT_BINDINGS` (RFC 5929 `tls-server-end-point:` SHA-256), `CLIENT_SPECIFIED_TARGET`, `LOCAL_CERT_CONTEXT`, `ROOT_STORE`, `SUPPORTED_ALGS`, `CIPHER_STRENGTHS`, `SUPPORTED_PROTOCOLS`, `EAP_KEY_BLOCK` (`export_keying_material`), `SESSION_INFO`, `REMOTE_CERT_CHAIN`, `LOCAL_CERT_CHAIN`. |
+| `secur32.dll!QueryCredentialsAttributesA/W` | `misc/secur32/schannel.rs` | Added `SUPPORTED_ALGS`, `CIPHER_STRENGTHS`, and server protocol flags in `SUPPORTED_PROTOCOLS`. |
+| `wintrust.dll!WinVerifyTrust` (action dispatch) | `misc/wintrust.rs` | Implemented all 6 standard action GUIDs (`GENERIC_VERIFY_V2`, `TRUSTPROVIDER_TEST`, `GENERIC_CERT_VERIFY`, `GENERIC_CHAIN_VERIFY`, `DRIVER_ACTION_VERIFY`, `HTTPSPROV_ACTION`), returning `TRUST_E_ACTION_UNKNOWN` for unknown GUIDs. |
+| `wintrust.dll!WinVerifyTrust` (union choice) | `misc/wintrust.rs` | Implemented all 5 `WINTRUST_DATA.dwUnionChoice` modes (`FILE`, `CATALOG`, `BLOB`, `SIGNER`, `CERT`) backed by real Authenticode/PKCS#7/cert-chain verification, returning `TRUST_E_SUBJECT_FORM_UNKNOWN` for invalid choices. |
 
 ### From `docs/stub-backlog.d/guest-corpus-bench.md`
 
@@ -56,7 +119,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 |---|---:|---|---|
 | `kernel32.dll` | 34 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
 | `bcrypt.dll` | 20 | Unimplemented CNG algorithm, key-wrap blob, or padding mode | Add remaining CNG algorithms/padding modes (OAEP/PSS/ECDH/3DES) backed by CommonCrypto/ring as games import them. |
-| `crypt32.dll` | 19 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
 | `d3d11.dll` | 14 | Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop) | Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them. |
 | `user32.dll` | 13 | Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature | Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation. |
 | `ole32.dll` | 12 | Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion | Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions. |
@@ -75,8 +137,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `dbghelp.dll` | 4 | Unimplemented DbgHelp stack walk or minidump writer | Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump. |
 | `dwrite.dll` | 4 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `physx_64.dll` | 4 | NVIDIA PhysX 4.x/5.x C++ ABI (vtable layout varies by build; shipping DLL runs natively under ARM64 JIT) | Run shipping PhysX_64.dll / PhysXCooking_64.dll under ARM64 JIT via [middleware.physx] mode = "guest". |
-| `secur32.dll` | 4 | Server-side Schannel (INBOUND) or uncommon context/credential attribute | Add server-side TLS or missing SECPKG_ATTR_* queries if a game hosts local TLS sockets. |
-| `wintrust.dll` | 4 | Unimplemented WinVerifyTrust action/choice or TPM Base Services (TBS) | Keep TPM TBS returning TBS_E_TPM_NOT_FOUND honestly; extend WinVerifyTrust for additional catalog/blob choices as needed. |
 | `amd_ags_x64.dll` | 3 | AMD GPU Services vendor extension on non-D3D12 command list | Forward recognized D3D12 debug markers to Metal command-buffer labels; return failure on foreign pointers. |
 | `powrprof.dll` | 3 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `d3d12.dll` | 2 | D3D12 root-signature deserializer COM object not yet implemented | Parse DXBC/RTS0 root-signature blobs in win32-rt/src/d3d12 and expose ID3D12RootSignatureDeserializer / VersionedDeserializer. |
@@ -87,6 +147,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `uxtheme.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `xaudio2_9redist.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `zstd.dll` | 2 | Open-source Zstandard compression fallback (no native zstd crate linked yet) | Run shipping zstd.dll via ARM64 JIT, or add a clean-room / zstd-safe native backend with unit round-trip tests. |
+| `crypt32.dll` | 1 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
 | `d2d1.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `directml.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `dsound.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
@@ -169,33 +230,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `BCryptSignHash` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2057` | `"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"` |
 | `BCryptVerifySignature` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2122` | `"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"` |
 | `bcrypt_aes_crypt` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2173` | `"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }` |
-
-### `crypt32.dll` (19)
-
-- **Reason:** Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property
-- **Next step:** Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `CertFreeCRLContext` | `stub` | `crates/win32-rt/src/misc/crypt32.rs:355` | `"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"` |
-| `CertFreeCTLContext` | `stub` | `crates/win32-rt/src/misc/crypt32.rs:362` | `"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"` |
-| `CertGetCertificateContextProperty` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertStrToNameA` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertStrToNameW` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertVerifySubjectCertificateContext` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDecodeObject` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDecodeObjectEx` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptFindOIDInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:42` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `CryptImportPublicKeyInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptMsgOpenToDecode` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:42` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `CryptMsgUpdate` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptVerifyMessageSignature` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `PFXImportCertStore` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:42` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `cert_free_certificate_chain_engine_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:593` | `"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"` |
-| `cert_free_certificate_chain_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:787` | `"CertFreeCertificateChain({chain:p}): foreign chain ignored"` |
-| `cert_verify_certificate_chain_policy_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:807` | `"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"` |
-| `crypt_string_to_binary_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:1276` | `"CryptStringToBinary unsupported flags {flags:#x}"` |
-| `encode_x509_object` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:941` | `"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"` |
 
 ### `d3d11.dll` (14)
 
@@ -488,30 +522,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `PxRegisterPhysicsSerializers` | `middleware_stub` | `crates/win32-rt/src/misc/physx_64.rs:56` | `"PhysX_64!PxRegisterPhysicsSerializers: PhysX 4.x/5.x serializers require shipping PE ([middleware.physx] version = \"4.1\" \| \"5.x\", mode ...` |
 | `PxUnregisterPhysicsSerializers` | `middleware_stub` | `crates/win32-rt/src/misc/physx_64.rs:62` | `"PhysX_64!PxUnregisterPhysicsSerializers: PhysX 4.x/5.x serializers require shipping PE ([middleware.physx] version = \"4.1\" \| \"5.x\", mod...` |
 
-### `secur32.dll` (4)
-
-- **Reason:** Server-side Schannel (INBOUND) or uncommon context/credential attribute
-- **Next step:** Add server-side TLS or missing SECPKG_ATTR_* queries if a game hosts local TLS sockets.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `acquire_credentials_impl` | `stub` | `crates/win32-rt/src/misc/secur32/schannel.rs:594` | `"AcquireCredentialsHandle(pkg={package_name:?}, use={f_credential_use:#x}): inbound unsupported"` |
-| `apply_control_token_impl` | `stub` | `crates/win32-rt/src/misc/secur32/schannel.rs:1025` | `"ApplyControlToken(ctx={id}, token={token_val:?}) -> SEC_E_UNSUPPORTED_FUNCTION"` |
-| `query_context_attributes_impl` | `stub` | `crates/win32-rt/src/misc/secur32/schannel.rs:1787` | `"QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION"` |
-| `query_credentials_attributes_impl` | `stub` | `crates/win32-rt/src/misc/secur32/schannel.rs:1849` | `"QueryCredentialsAttributes{}(attr={ul_attribute:#x}) -> SEC_E_UNSUPPORTED_FUNCTION", if wide { "W" } else { "A" }` |
-
-### `wintrust.dll` (4)
-
-- **Reason:** Unimplemented WinVerifyTrust action/choice or TPM Base Services (TBS)
-- **Next step:** Keep TPM TBS returning TBS_E_TPM_NOT_FOUND honestly; extend WinVerifyTrust for additional catalog/blob choices as needed.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `Tbsip_Context_Close` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1644` | `"Tbsip_Context_Close({h_context:p}) -> TBS_E_INVALID_CONTEXT"` |
-| `Tbsip_Submit_Command` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1661` | `"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"` |
-| `WinVerifyTrust` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1415` | `"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"` |
-| `WinVerifyTrust` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1439` | `"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"` |
-
 ### `amd_ags_x64.dll` (3)
 
 - **Reason:** AMD GPU Services vendor extension on non-D3D12 command list
@@ -613,6 +623,15 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 |---|---|---|---|
 | `ZSTD_compress` | `middleware_stub` | `crates/win32-rt/src/misc/zstd.rs:33` | `"zstd!ZSTD_compress(src_size={src_size})"` |
 | `ZSTD_decompress` | `middleware_stub` | `crates/win32-rt/src/misc/zstd.rs:43` | `"zstd!ZSTD_decompress(compressed_size={compressed_size})"` |
+
+### `crypt32.dll` (1)
+
+- **Reason:** Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property
+- **Next step:** Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring.
+
+| API | Kind | Location | Detail |
+|---|---|---|---|
+| `CryptImportPublicKeyInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:51` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
 
 ### `d2d1.dll` (1)
 
