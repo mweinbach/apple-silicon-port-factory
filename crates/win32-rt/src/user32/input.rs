@@ -1049,6 +1049,9 @@ fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
     // Registered hotkeys (RegisterHotKey) intercept keydown before WM_KEYDOWN,
     // posting WM_HOTKEY to the registering window/thread — unless the foreground
     // raw-keyboard registration opted out via RIDEV_NOHOTKEYS.
+    // Raw input (WM_INPUT) is a separate device-input stream, so deliver the raw
+    // keyboard record before consuming the legacy keydown via WM_HOTKEY.
+    let mut raw_delivered = false;
     if k.down && !raw_nohotkeys_active() {
         let mut mods = 0u32;
         if alt {
@@ -1068,8 +1071,9 @@ fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
             && super::misc::has_hooks(super::misc::WH_KEYBOARD_LL)
             && super::misc::has_matching_hotkey(mods, key.vk as u32)
         {
-            // Defer both WH_KEYBOARD_LL evaluation and conditional WM_HOTKEY posting
-            // onto the hook-owning Win32 thread so a suppressing hook blocks the hotkey.
+            // Defer both WH_KEYBOARD_LL evaluation and conditional raw + WM_HOTKEY
+            // delivery onto the hook-owning Win32 thread so a suppressing hook blocks both.
+            let raw_key = *key;
             let vk = key.vk as u32;
             let scan = key.scan as u32;
             let ext = key.ext;
@@ -1085,17 +1089,22 @@ fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
             if let Some(q) = q {
                 q.call(move || {
                     if !dispatch_keyboard_ll_hook(msg, vk, scan, ext, alt_after, up, time) {
+                        raw_keyboard(&raw_key, true, msg);
                         let _ = super::misc::try_dispatch_hotkey(mods, vk, is_repeat);
                     }
                 });
                 return;
             }
         }
-        if super::misc::try_dispatch_hotkey(mods, key.vk as u32, is_repeat) {
-            if !ll_checked {
-                defer_keyboard_ll_hook(0, msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time);
+        if super::misc::has_matching_hotkey(mods, key.vk as u32) {
+            raw_keyboard(key, k.down, msg);
+            raw_delivered = true;
+            if super::misc::try_dispatch_hotkey(mods, key.vk as u32, is_repeat) {
+                if !ll_checked {
+                    defer_keyboard_ll_hook(0, msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time);
+                }
+                return;
             }
-            return;
         }
     }
     let target = target_override.filter(|&h| h != 0).unwrap_or_else(|| FOCUS.load(Ordering::Acquire));
@@ -1106,7 +1115,9 @@ fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
         return;
     }
     // Raw input first (Windows delivers WM_INPUT ahead of the legacy message).
-    raw_keyboard(key, k.down, msg);
+    if !raw_delivered {
+        raw_keyboard(key, k.down, msg);
+    }
     if raw_nolegacy_active(1, 6) {
         if !ll_checked {
             defer_keyboard_ll_hook(target, msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time);
@@ -2640,6 +2651,177 @@ mod tests {
             assert_eq!(m.wparam, 77);
 
             assert_eq!(super::super::misc::UnregisterHotKey(hwnd, 77), TRUE);
+            assert_eq!(super::super::misc::UnhookWindowsHookEx(h_kb), TRUE);
+            let _ = window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn hotkey_interception_preserves_raw_keyboard_keydown_direct_and_deferred() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            static SUPPRESS_A: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+
+            unsafe extern "win64" fn raw_hotkey_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+                if code >= 0 && lp != 0 {
+                    let ks = (lp as *const super::super::misc::KBDLLHOOKSTRUCT).read_unaligned();
+                    if ks.vk_code == b'A' as u32 && SUPPRESS_A.load(Ordering::Acquire) {
+                        return 1;
+                    }
+                }
+                super::super::misc::CallNextHookEx(0, code, wp, lp)
+            }
+
+            let cls = crate::strings::to_wide_z("RawHotkeyPreserveWnd");
+            let wc = class::WNDCLASS {
+                style: 0,
+                wndproc: register_typed_host_wndproc(defproc::DefWindowProcW),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = class::RegisterClassW(&wc);
+            let hwnd = window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                ws::POPUP,
+                0,
+                0,
+                200,
+                200,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            set_active_window(hwnd as usize, false);
+            set_focus(hwnd as usize);
+
+            // Register foreground raw keyboard WITHOUT RIDEV_NOHOTKEYS, plus Ctrl+A hotkey.
+            let dev = RAWINPUTDEVICE {
+                usage_page: 1,
+                usage: 6,
+                flags: 0,
+                target: hwnd as usize,
+            };
+            assert_eq!(RegisterRawInputDevices(&dev, 1, 16), TRUE);
+            assert_eq!(
+                super::super::misc::RegisterHotKey(hwnd, 88, 0x0002 /* MOD_CONTROL */, b'A' as u32),
+                TRUE
+            );
+
+            let drain_raw_a = |hwnd: HWND| -> Vec<(u16, u32)> {
+                let mut m = MSG::default();
+                let mut events = Vec::new();
+                while message::PeekMessageW(&mut m, hwnd, wm::INPUT, wm::INPUT, message::PM_REMOVE) != 0 {
+                    let mut buf = [0u8; 64];
+                    let mut sz = buf.len() as u32;
+                    let got = GetRawInputData(
+                        m.lparam as usize,
+                        RID_INPUT,
+                        buf.as_mut_ptr(),
+                        &mut sz,
+                        HEADER_SIZE as u32,
+                    );
+                    assert_eq!(got, 40);
+                    let flags = u16::from_le_bytes([buf[26], buf[27]]);
+                    let vk = u16::from_le_bytes([buf[30], buf[31]]);
+                    let msg = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+                    if vk == b'A' as u16 {
+                        events.push((flags, msg));
+                    }
+                }
+                events
+            };
+
+            // 1. Direct hotkey interception: delivers WM_HOTKEY, consumes legacy WM_KEYDOWN for 'A',
+            //    and still delivers BOTH make and break WM_INPUT records for 'A'.
+            native_key(NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x3B, down: false, repeat: false, chars: Vec::new() });
+            release_all_keys();
+
+            let mut m = MSG::default();
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, message::PM_REMOVE),
+                TRUE
+            );
+            assert_eq!(m.wparam, 88);
+            let mut legacy_a_down = false;
+            while message::PeekMessageW(&mut m, hwnd, wm::KEYDOWN, wm::KEYDOWN, message::PM_REMOVE) != 0 {
+                if m.wparam == b'A' as usize {
+                    legacy_a_down = true;
+                }
+            }
+            assert!(!legacy_a_down, "hotkey interception must still consume legacy WM_KEYDOWN");
+            assert_eq!(
+                drain_raw_a(hwnd),
+                vec![(0, wm::KEYDOWN), (1, wm::KEYUP)],
+                "raw keyboard consumer must receive both make and break when a hotkey intercepts keydown"
+            );
+
+            // 2. Deferred WH_KEYBOARD_LL hotkey path: when allowed, delivers both WM_INPUT make and WM_HOTKEY;
+            //    when suppressed, blocks both WM_INPUT make and WM_HOTKEY.
+            let h_kb = super::super::misc::SetWindowsHookExW(
+                super::super::misc::WH_KEYBOARD_LL,
+                raw_hotkey_ll_proc as *const () as usize,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_ne!(h_kb, 0);
+
+            SUPPRESS_A.store(false, Ordering::Release);
+            super::super::misc::set_force_defer_guest_hooks(true);
+            native_key(NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x3B, down: false, repeat: false, chars: Vec::new() });
+            super::super::misc::set_force_defer_guest_hooks(false);
+            release_all_keys();
+
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, message::PM_REMOVE),
+                TRUE,
+                "allowed deferred WH_KEYBOARD_LL must deliver WM_HOTKEY"
+            );
+            let deferred_allowed = drain_raw_a(hwnd);
+            assert!(
+                deferred_allowed.contains(&(0, wm::KEYDOWN)) && deferred_allowed.contains(&(1, wm::KEYUP)),
+                "allowed deferred WH_KEYBOARD_LL must deliver both make and break raw records, got {deferred_allowed:?}"
+            );
+
+            SUPPRESS_A.store(true, Ordering::Release);
+            super::super::misc::set_force_defer_guest_hooks(true);
+            native_key(NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            super::super::misc::set_force_defer_guest_hooks(false);
+            release_all_keys();
+
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, message::PM_REMOVE),
+                FALSE,
+                "suppressing deferred WH_KEYBOARD_LL must block WM_HOTKEY"
+            );
+            let deferred_suppressed = drain_raw_a(hwnd);
+            assert!(
+                !deferred_suppressed.contains(&(0, wm::KEYDOWN)),
+                "suppressing deferred WH_KEYBOARD_LL must block raw keydown, got {deferred_suppressed:?}"
+            );
+
+            let rem = RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_REMOVE, target: 0 };
+            assert_eq!(RegisterRawInputDevices(&rem, 1, 16), TRUE);
+            assert_eq!(super::super::misc::UnregisterHotKey(hwnd, 88), TRUE);
             assert_eq!(super::super::misc::UnhookWindowsHookEx(h_kb), TRUE);
             let _ = window::DestroyWindow(hwnd);
         })
