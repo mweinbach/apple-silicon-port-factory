@@ -99,14 +99,8 @@ pub(super) fn parse_der_item(buf: &[u8]) -> Option<(DerItem<'_>, &[u8])> {
     ))
 }
 
-pub(super) fn der_item_children(mut buf: &[u8]) -> Option<Vec<DerItem<'_>>> {
-    let mut out = Vec::new();
-    while !buf.is_empty() {
-        let (it, rest) = parse_der_item(buf)?;
-        out.push(it);
-        buf = rest;
-    }
-    Some(out)
+pub(super) fn der_item_children(buf: &[u8]) -> Option<Vec<DerItem<'_>>> {
+    der_item_children_bounded(buf, MAX_BER_ITEMS)
 }
 
 /// Parse at most `max_items` sibling DER TLV items, returning `None` before parsing or

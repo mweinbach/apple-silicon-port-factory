@@ -158,16 +158,6 @@ fn parse_der_elem(buf: &[u8]) -> Option<(DerElem<'_>, &[u8])> {
     Some((DerElem { tag, raw: &buf[..end], val: &buf[hdr_len..end] }, &buf[end..]))
 }
 
-fn der_children(mut buf: &[u8]) -> Option<Vec<DerElem<'_>>> {
-    let mut out = Vec::new();
-    while !buf.is_empty() {
-        let (e, rest) = parse_der_elem(buf)?;
-        out.push(e);
-        buf = rest;
-    }
-    Some(out)
-}
-
 fn der_children_bounded(mut buf: &[u8], max_items: usize) -> Option<Vec<DerElem<'_>>> {
     let mut out = Vec::new();
     while !buf.is_empty() {
@@ -278,7 +268,7 @@ fn parse_x509_cert(elem: DerElem<'_>) -> Option<ParsedCert<'_>> {
     if elem.tag != 0x30 {
         return None;
     }
-    let top = der_children(elem.val)?;
+    let top = der_children_bounded(elem.val, 8)?;
     if top.len() < 3 || top[0].tag != 0x30 || top[2].tag != 0x03 || top[2].val.is_empty() {
         return None;
     }
@@ -289,7 +279,7 @@ fn parse_x509_cert(elem: DerElem<'_>) -> Option<ParsedCert<'_>> {
     }
     let sig_bytes = &top[2].val[1..];
 
-    let tbs_kids = der_children(tbs.val)?;
+    let tbs_kids = der_children_bounded(tbs.val, 16)?;
     let mut idx = 0usize;
     let mut version = 0u32;
     if tbs_kids.get(idx)?.tag == 0xA0 {
@@ -310,7 +300,7 @@ fn parse_x509_cert(elem: DerElem<'_>) -> Option<ParsedCert<'_>> {
         return None;
     }
     let (not_before, not_after) = if validity.tag == 0x30 {
-        if let Some(vk) = der_children(validity.val) {
+        if let Some(vk) = der_children_bounded(validity.val, 4) {
             if vk.len() >= 2 {
                 (parse_asn1_time_filetime(vk[0]), parse_asn1_time_filetime(vk[1]))
             } else {
@@ -327,13 +317,13 @@ fn parse_x509_cert(elem: DerElem<'_>) -> Option<ParsedCert<'_>> {
     let mut spki_alg_params: &[u8] = &[];
     let mut spki_key_bytes: &[u8] = &[];
     let mut spki_unused_bits = 0u32;
-    if let Some(spki_kids) = der_children(spki.val) {
+    if let Some(spki_kids) = der_children_bounded(spki.val, 4) {
         if spki_kids.len() >= 2 {
             if let Some(oid) = parse_alg_id_oid(spki_kids[0]) {
                 spki_alg_oid = oid;
             }
             if spki_kids[0].tag == 0x30 {
-                if let Some(alg_kids) = der_children(spki_kids[0].val) {
+                if let Some(alg_kids) = der_children_bounded(spki_kids[0].val, 8) {
                     if alg_kids.len() >= 2 {
                         spki_alg_params = alg_kids[1].raw;
                     }
@@ -345,7 +335,7 @@ fn parse_x509_cert(elem: DerElem<'_>) -> Option<ParsedCert<'_>> {
                 if spki_alg_oid == OID_RSA_ENCRYPTION && spki_unused_bits == 0 {
                     if let Some((pub_seq, _)) = parse_der_elem(spki_key_bytes) {
                         if pub_seq.tag == 0x30 {
-                            if let Some(pk) = der_children(pub_seq.val) {
+                            if let Some(pk) = der_children_bounded(pub_seq.val, 4) {
                                 if pk.len() >= 2 && pk[0].tag == 0x02 && pk[1].tag == 0x02 {
                                     rsa_pub = Some(RsaPublicKey {
                                         n: strip_der_int_sign(pk[0].val).to_vec(),
@@ -448,7 +438,7 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
     if ci.tag != 0x30 {
         return Err(TRUST_E_BAD_DIGEST);
     }
-    let ci_kids = der_children(ci.val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let ci_kids = der_children_bounded(ci.val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
     if ci_kids.len() < 2 || ci_kids[0].tag != 0x06 || ci_kids[0].val != OID_SIGNED_DATA || ci_kids[1].tag != 0xA0 {
         return Err(TRUST_E_BAD_DIGEST);
     }
@@ -456,13 +446,13 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
     if sd_seq.tag != 0x30 {
         return Err(TRUST_E_BAD_DIGEST);
     }
-    let sd_kids = der_children(sd_seq.val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let sd_kids = der_children_bounded(sd_seq.val, 16).ok_or(TRUST_E_BAD_DIGEST)?;
     if sd_kids.len() < 4 {
         return Err(TRUST_E_BAD_DIGEST);
     }
 
     // encapContentInfo: SEQUENCE { contentType OID(SPC_INDIRECT_DATA), [0] EXPLICIT SpcIndirectDataContent }
-    let eci_kids = der_children(sd_kids[2].val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let eci_kids = der_children_bounded(sd_kids[2].val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
     if eci_kids.len() < 2 || eci_kids[0].tag != 0x06 || eci_kids[0].val != OID_SPC_INDIRECT_DATA || eci_kids[1].tag != 0xA0 {
         return Err(TRUST_E_BAD_DIGEST);
     }
@@ -470,12 +460,12 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
     if spc_seq.tag != 0x30 {
         return Err(TRUST_E_BAD_DIGEST);
     }
-    let spc_kids = der_children(spc_seq.val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let spc_kids = der_children_bounded(spc_seq.val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
     if spc_kids.len() < 2 || spc_kids[1].tag != 0x30 {
         return Err(TRUST_E_BAD_DIGEST);
     }
     // DigestInfo ::= SEQUENCE { digestAlgorithm AlgorithmIdentifier, digest OCTET STRING }
-    let di_kids = der_children(spc_kids[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let di_kids = der_children_bounded(spc_kids[1].val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
     if di_kids.len() < 2 || di_kids[1].tag != 0x04 {
         return Err(TRUST_E_BAD_DIGEST);
     }
@@ -532,12 +522,12 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         if si.tag != 0x30 {
             continue;
         }
-        let kids = der_children(si.val).ok_or(TRUST_E_BAD_DIGEST)?;
+        let kids = der_children_bounded(si.val, 16).ok_or(TRUST_E_BAD_DIGEST)?;
         if kids.len() < 5 || kids[1].tag != 0x30 {
             continue;
         }
         // issuerAndSerialNumber
-        let ias = der_children(kids[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+        let ias = der_children_bounded(kids[1].val, 4).ok_or(TRUST_E_BAD_DIGEST)?;
         if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
             continue;
         }
@@ -574,10 +564,10 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
                 if attr.tag != 0x30 {
                     continue;
                 }
-                let ak = der_children(attr.val).ok_or(TRUST_E_BAD_DIGEST)?;
+                let ak = der_children_bounded(attr.val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
                 if ak.len() >= 2 && ak[0].tag == 0x06 && ak[1].tag == 0x31 {
                     if ak[0].val == OID_MESSAGE_DIGEST {
-                        let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+                        let vals = der_children_bounded(ak[1].val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
                         let expected_content_md = si_digest.hash(spc_seq.val);
                         if vals.len() != 1
                             || vals[0].tag != 0x04
@@ -587,7 +577,7 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
                         }
                         md_count += 1;
                     } else if ak[0].val == OID_CONTENT_TYPE {
-                        let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+                        let vals = der_children_bounded(ak[1].val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
                         if vals.len() != 1
                             || vals[0].tag != 0x06
                             || vals[0].val != OID_SPC_INDIRECT_DATA
@@ -736,7 +726,7 @@ fn parse_pkcs7_signed_data(pkcs7_raw: &[u8], embedded_in_pe: bool) -> Option<Par
     if ci.tag != 0x30 {
         return None;
     }
-    let ci_kids = der_children(ci.val)?;
+    let ci_kids = der_children_bounded(ci.val, 8)?;
     if ci_kids.len() < 2 || ci_kids[0].tag != 0x06 || ci_kids[0].val != OID_SIGNED_DATA || ci_kids[1].tag != 0xA0 {
         return None;
     }
@@ -744,7 +734,7 @@ fn parse_pkcs7_signed_data(pkcs7_raw: &[u8], embedded_in_pe: bool) -> Option<Par
     if sd_seq.tag != 0x30 {
         return None;
     }
-    let sd_kids = der_children(sd_seq.val)?;
+    let sd_kids = der_children_bounded(sd_seq.val, 16)?;
     if sd_kids.len() < 4 {
         return None;
     }
@@ -770,7 +760,7 @@ fn parse_pkcs7_signed_data(pkcs7_raw: &[u8], embedded_in_pe: bool) -> Option<Par
                 if si.tag != 0x30 {
                     continue;
                 }
-                let Some(kids) = der_children(si.val) else { continue };
+                let Some(kids) = der_children_bounded(si.val, 16) else { continue };
                 if kids.len() < 5 || kids[1].tag != 0x30 {
                     continue;
                 }
@@ -779,7 +769,7 @@ fn parse_pkcs7_signed_data(pkcs7_raw: &[u8], embedded_in_pe: bool) -> Option<Par
                 } else {
                     1
                 };
-                let Some(ias) = der_children(kids[1].val) else { continue };
+                let Some(ias) = der_children_bounded(kids[1].val, 4) else { continue };
                 if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
                     continue;
                 }
@@ -832,15 +822,15 @@ pub(crate) fn extract_dn_attr(dn_der: &[u8], target_oid: &[u8]) -> Option<String
     if seq.tag != 0x30 {
         return None;
     }
-    for rdn in der_children(seq.val)? {
+    for rdn in der_children_bounded(seq.val, 64)? {
         if rdn.tag != 0x31 {
             continue;
         }
-        for atv in der_children(rdn.val)? {
+        for atv in der_children_bounded(rdn.val, 16)? {
             if atv.tag != 0x30 {
                 continue;
             }
-            let kids = der_children(atv.val)?;
+            let kids = der_children_bounded(atv.val, 8)?;
             if kids.len() >= 2 && kids[0].tag == 0x06 && kids[0].val == target_oid {
                 return decode_asn1_string(kids[1]);
             }
@@ -856,15 +846,15 @@ pub(crate) fn format_dn(dn_der: &[u8]) -> Option<String> {
         return None;
     }
     let mut parts = Vec::new();
-    for rdn in der_children(seq.val)? {
+    for rdn in der_children_bounded(seq.val, 64)? {
         if rdn.tag != 0x31 {
             continue;
         }
-        for atv in der_children(rdn.val)? {
+        for atv in der_children_bounded(rdn.val, 16)? {
             if atv.tag != 0x30 {
                 continue;
             }
-            let kids = der_children(atv.val)?;
+            let kids = der_children_bounded(atv.val, 8)?;
             if kids.len() >= 2 && kids[0].tag == 0x06 {
                 if let Some(val) = decode_asn1_string(kids[1]) {
                     let key = match kids[0].val {
@@ -1525,7 +1515,7 @@ fn verify_standalone_pkcs7(
     if ci.tag != 0x30 {
         return Err(TRUST_E_NOSIGNATURE);
     }
-    let ci_kids = der_children(ci.val).ok_or(TRUST_E_NOSIGNATURE)?;
+    let ci_kids = der_children_bounded(ci.val, 8).ok_or(TRUST_E_NOSIGNATURE)?;
     if ci_kids.len() < 2
         || ci_kids[0].tag != 0x06
         || ci_kids[0].val != OID_SIGNED_DATA
@@ -1537,12 +1527,12 @@ fn verify_standalone_pkcs7(
     if sd_seq.tag != 0x30 {
         return Err(TRUST_E_BAD_DIGEST);
     }
-    let sd_kids = der_children(sd_seq.val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let sd_kids = der_children_bounded(sd_seq.val, 16).ok_or(TRUST_E_BAD_DIGEST)?;
     if sd_kids.len() < 4 || sd_kids[2].tag != 0x30 {
         return Err(TRUST_E_BAD_DIGEST);
     }
 
-    let eci_kids = der_children(sd_kids[2].val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let eci_kids = der_children_bounded(sd_kids[2].val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
     let encap_content_type_oid = eci_kids
         .first()
         .filter(|e| e.tag == 0x06)
@@ -1607,11 +1597,11 @@ fn verify_standalone_pkcs7(
         if si.tag != 0x30 {
             continue;
         }
-        let kids = der_children(si.val).ok_or(TRUST_E_BAD_DIGEST)?;
+        let kids = der_children_bounded(si.val, 16).ok_or(TRUST_E_BAD_DIGEST)?;
         if kids.len() < 5 || kids[1].tag != 0x30 {
             continue;
         }
-        let ias = der_children(kids[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+        let ias = der_children_bounded(kids[1].val, 4).ok_or(TRUST_E_BAD_DIGEST)?;
         if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
             continue;
         }
@@ -1647,10 +1637,10 @@ fn verify_standalone_pkcs7(
                 if attr.tag != 0x30 {
                     continue;
                 }
-                let ak = der_children(attr.val).ok_or(TRUST_E_BAD_DIGEST)?;
+                let ak = der_children_bounded(attr.val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
                 if ak.len() >= 2 && ak[0].tag == 0x06 && ak[1].tag == 0x31 {
                     if ak[0].val == OID_MESSAGE_DIGEST {
-                        let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+                        let vals = der_children_bounded(ak[1].val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
                         if vals.len() != 1
                             || vals[0].tag != 0x04
                             || vals[0].val != expected_md.as_slice()
@@ -1659,7 +1649,7 @@ fn verify_standalone_pkcs7(
                         }
                         md_count += 1;
                     } else if ak[0].val == OID_CONTENT_TYPE {
-                        let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+                        let vals = der_children_bounded(ak[1].val, 8).ok_or(TRUST_E_BAD_DIGEST)?;
                         if vals.len() != 1
                             || vals[0].tag != 0x06
                             || vals[0].val != encap_content_type_oid.as_slice()
@@ -1922,12 +1912,14 @@ struct CtlMemberEntry<'a> {
 
 /// Parse a DER-encoded Microsoft `CertificateTrustList` (`szOID_CTL`) into its `TrustedSubject`
 /// entries and any signed `SPC_INDIRECT_DATA_OBJID` member digests.
+const MAX_CTL_SUBJECTS: usize = 4096;
+
 fn parse_ctl_entries(ctl_der: &[u8]) -> Option<Vec<CtlMemberEntry<'_>>> {
     let (seq, _) = parse_der_elem(ctl_der)?;
     if seq.tag != 0x30 {
         return None;
     }
-    let kids = der_children(seq.val)?;
+    let kids = der_children_bounded(seq.val, 16)?;
     // CertificateTrustList ::= SEQUENCE { subjectUsage, [listId], [seqNum], thisUpdate, [nextUpdate],
     //   subjectAlgorithm, [trustedSubjects SEQUENCE OF TrustedSubject], [ctlExtensions [0]] }
     // Locate `trustedSubjects`: the SEQUENCE immediately after `subjectAlgorithm` (which itself is a
@@ -1953,36 +1945,44 @@ fn parse_ctl_entries(ctl_der: &[u8]) -> Option<Vec<CtlMemberEntry<'_>>> {
     let Some(subj_seq) = subjects_seq else {
         return Some(entries);
     };
-    for subj in der_children(subj_seq.val)? {
+    let mut rest = subj_seq.val;
+    let mut seen = 0usize;
+    while !rest.is_empty() {
+        if seen >= MAX_CTL_SUBJECTS {
+            return None;
+        }
+        let (subj, next) = parse_der_elem(rest)?;
+        rest = next;
+        seen += 1;
         if subj.tag != 0x30 {
             continue;
         }
-        let sk = der_children(subj.val)?;
+        let sk = der_children_bounded(subj.val, 8)?;
         if sk.is_empty() || sk[0].tag != 0x04 {
             continue;
         }
         let subject_id = sk[0].val;
         let mut digests = Vec::new();
         if let Some(attrs) = sk.get(1).filter(|e| e.tag == 0x31) {
-            if let Some(attr_list) = der_children(attrs.val) {
+            if let Some(attr_list) = der_children_bounded(attrs.val, 64) {
                 for attr in attr_list {
                     if attr.tag != 0x30 {
                         continue;
                     }
-                    let Some(ak) = der_children(attr.val) else { continue };
+                    let Some(ak) = der_children_bounded(attr.val, 8) else { continue };
                     if ak.len() < 2 || ak[0].tag != 0x06 || ak[0].val != OID_SPC_INDIRECT_DATA || ak[1].tag != 0x31 {
                         continue;
                     }
-                    let Some(vals) = der_children(ak[1].val) else { continue };
+                    let Some(vals) = der_children_bounded(ak[1].val, 16) else { continue };
                     for v in vals {
                         if v.tag != 0x30 {
                             continue;
                         }
-                        let Some(spc_kids) = der_children(v.val) else { continue };
+                        let Some(spc_kids) = der_children_bounded(v.val, 8) else { continue };
                         if spc_kids.len() < 2 || spc_kids[1].tag != 0x30 {
                             continue;
                         }
-                        let Some(di_kids) = der_children(spc_kids[1].val) else { continue };
+                        let Some(di_kids) = der_children_bounded(spc_kids[1].val, 8) else { continue };
                         if di_kids.len() < 2 || di_kids[1].tag != 0x04 {
                             continue;
                         }
@@ -2982,6 +2982,16 @@ pub unsafe extern "win64" fn Tbsi_GetDeviceInfo(_size: u32, _info: *mut c_void) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn der_children(mut buf: &[u8]) -> Option<Vec<DerElem<'_>>> {
+        let mut out = Vec::new();
+        while !buf.is_empty() {
+            let (e, rest) = parse_der_elem(buf)?;
+            out.push(e);
+            buf = rest;
+        }
+        Some(out)
+    }
 
     #[test]
     fn tbs_reports_tpm_not_found() {
@@ -4408,6 +4418,37 @@ mod tests {
             None,
         )
         .is_ok());
+
+        // 5. Outer SignedData and ContentInfo packed with 200,000 tiny 2-byte NULL TLVs must
+        //    stop immediately under tight structural bounds without allocating an ~80 MB vector.
+        let mut tiny_tlvs = Vec::with_capacity(200_000 * 2);
+        for _ in 0..200_000 {
+            tiny_tlvs.extend_from_slice(&[0x05, 0x00]);
+        }
+        let bloated_sd = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x06, OID_SIGNED_DATA),
+                der_tlv(0xA0, &der_tlv(0x30, &tiny_tlvs)),
+            ]
+            .concat(),
+        );
+        let t_sd = std::time::Instant::now();
+        assert_eq!(verify_standalone_pkcs7(&bloated_sd, None).err(), Some(TRUST_E_BAD_DIGEST));
+        assert!(parse_pkcs7_signed_data(&bloated_sd, false).is_none());
+        assert!(
+            t_sd.elapsed() < std::time::Duration::from_millis(200),
+            "outer SignedData child cap must reject immediately before collecting 200k TLVs"
+        );
+
+        let bloated_ci = der_tlv(0x30, &tiny_tlvs);
+        let t_ci = std::time::Instant::now();
+        assert_eq!(verify_standalone_pkcs7(&bloated_ci, None).err(), Some(TRUST_E_NOSIGNATURE));
+        assert!(parse_pkcs7_signed_data(&bloated_ci, false).is_none());
+        assert!(
+            t_ci.elapsed() < std::time::Duration::from_millis(200),
+            "outer ContentInfo child cap must reject immediately before collecting 200k TLVs"
+        );
     }
 }
 
