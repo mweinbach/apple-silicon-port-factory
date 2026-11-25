@@ -234,11 +234,14 @@ const TDCBF_RETRY_BUTTON: u32 = 0x0010;
 const TDCBF_CLOSE_BUTTON: u32 = 0x0020;
 
 const TDF_ENABLE_HYPERLINKS: u32 = 0x0001;
+const TDF_ALLOW_DIALOG_CANCELLATION: u32 = 0x0008;
 const TDF_VERIFICATION_FLAG_CHECKED: u32 = 0x0100;
 const TDF_SHOW_PROGRESS_BAR: u32 = 0x0200;
 const TDF_SHOW_MARQUEE_PROGRESS_BAR: u32 = 0x0400;
 const TDF_CALLBACK_TIMER: u32 = 0x0800;
 const TDF_NO_DEFAULT_RADIO_BUTTON: u32 = 0x4000;
+
+const IDCANCEL: i32 = 2;
 
 const TDN_CREATED: u32 = 0;
 const TDN_NAVIGATED: u32 = 1;
@@ -288,6 +291,7 @@ struct ParsedTaskDialogPage {
     pf_callback: usize,
     lp_callback_data: isize,
     enable_hyperlinks: bool,
+    allow_cancellation: bool,
     callback_timer: bool,
     progress: Option<crate::macos::TaskDialogProgressState>,
     critical: bool,
@@ -399,6 +403,7 @@ unsafe fn parse_task_dialog_config(config: *const u8) -> Result<ParsedTaskDialog
         None
     };
     let enable_hyperlinks = (cfg.dw_flags & TDF_ENABLE_HYPERLINKS) != 0;
+    let allow_cancellation = (cfg.dw_flags & TDF_ALLOW_DIALOG_CANCELLATION) != 0;
     let callback_timer = (cfg.dw_flags & TDF_CALLBACK_TIMER) != 0 && cfg.pf_callback != 0;
     let show_progress =
         (cfg.dw_flags & (TDF_SHOW_PROGRESS_BAR | TDF_SHOW_MARQUEE_PROGRESS_BAR)) != 0;
@@ -417,6 +422,7 @@ unsafe fn parse_task_dialog_config(config: *const u8) -> Result<ParsedTaskDialog
         pf_callback: cfg.pf_callback,
         lp_callback_data: cfg.lp_callback_data,
         enable_hyperlinks,
+        allow_cancellation,
         callback_timer,
         progress,
         critical,
@@ -439,6 +445,7 @@ struct ActiveTaskDialog {
     page_generation: u64,
     modal_open: bool,
     enable_hyperlinks: bool,
+    allow_cancellation: bool,
     callback_timer: bool,
     reset_timer_on_present: bool,
     critical: bool,
@@ -597,6 +604,7 @@ impl ActiveTaskDialog {
             page_generation: 0,
             modal_open: false,
             enable_hyperlinks: page.enable_hyperlinks,
+            allow_cancellation: page.allow_cancellation,
             callback_timer: page.callback_timer,
             reset_timer_on_present: false,
             critical: page.critical,
@@ -625,6 +633,7 @@ impl ActiveTaskDialog {
     fn apply_page(&mut self, page: ParsedTaskDialogPage) {
         self.page_generation = self.page_generation.wrapping_add(1);
         self.enable_hyperlinks = page.enable_hyperlinks;
+        self.allow_cancellation = page.allow_cancellation;
         self.callback_timer = page.callback_timer;
         self.reset_timer_on_present = true;
         self.critical = page.critical;
@@ -1200,6 +1209,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             buttons: Vec<(i32, String)>,
             button_enabled: Vec<bool>,
             default_button_idx: Option<usize>,
+            allow_cancellation: bool,
             radio_labels: Vec<String>,
             radio_enabled: Vec<bool>,
             selected_radio_idx: Option<usize>,
@@ -1229,6 +1239,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 buttons: dlg.buttons.clone(),
                 button_enabled: dlg.button_enabled.clone(),
                 default_button_idx: dlg.default_button_idx,
+                allow_cancellation: dlg.allow_cancellation,
                 radio_labels: dlg.radios.iter().map(|(_, l)| l.clone()).collect(),
                 radio_enabled: dlg.radio_enabled.clone(),
                 selected_radio_idx: dlg.selected_radio_idx,
@@ -1269,6 +1280,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             labels,
             snap.button_enabled.clone(),
             snap.default_button_idx,
+            snap.allow_cancellation,
             snap.radio_labels,
             snap.radio_enabled,
             snap.selected_radio_idx,
@@ -1320,6 +1332,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     }
                 }
                 crate::macos::TaskDialogEvent::ButtonClicked(_)
+                | crate::macos::TaskDialogEvent::Cancelled { .. }
                 | crate::macos::TaskDialogEvent::Navigated => {}
             },
             |elapsed_ms| notify(TDN_TIMER, elapsed_ms as u64) == S_FALSE_HR,
@@ -1335,11 +1348,20 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     let navigated = dlg.page_generation != presented_gen;
                     dlg.modal_open = false;
                     if !navigated {
-                        if let crate::macos::TaskDialogOutcome::Completed(ref res) = presented {
-                            dlg.selected_radio_idx = res.radio_index;
-                            if dlg.has_verification {
-                                dlg.verified = res.verified;
+                        match presented {
+                            crate::macos::TaskDialogOutcome::Completed(ref res) => {
+                                dlg.selected_radio_idx = res.radio_index;
+                                if dlg.has_verification {
+                                    dlg.verified = res.verified;
+                                }
                             }
+                            crate::macos::TaskDialogOutcome::Cancelled { radio_index, verified } => {
+                                dlg.selected_radio_idx = radio_index;
+                                if dlg.has_verification {
+                                    dlg.verified = verified;
+                                }
+                            }
+                            _ => {}
                         }
                         (false, dlg.pending_click_button.take())
                     } else {
@@ -1367,12 +1389,19 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 });
                 (bid, true)
             }
+            crate::macos::TaskDialogOutcome::Cancelled { .. } => {
+                let bid = consumed_prog_click.unwrap_or(IDCANCEL);
+                (bid, true)
+            }
             crate::macos::TaskDialogOutcome::Navigated | crate::macos::TaskDialogOutcome::Quit => {
                 unreachable!()
             }
             crate::macos::TaskDialogOutcome::Unavailable => {
                 let single_enabled = snap.button_enabled.first().copied().unwrap_or(true);
+                let cancel_adds_choice =
+                    snap.allow_cancellation && snap.buttons.first().is_some_and(|(id, _)| *id != IDCANCEL);
                 if snap.buttons.len() == 1
+                    && !cancel_adds_choice
                     && !has_selection_controls
                     && !snap.callback_timer
                     && snap.links.is_empty()
@@ -1380,8 +1409,8 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     && single_enabled
                 {
                     // Pure single-button informational dialog with an enabled button and no
-                    // selection controls, hyperlinks, progress bar, or timer can dismiss in
-                    // headless mode (matching MessageBox MB_OK).
+                    // cancellation escape, selection controls, hyperlinks, progress bar, or
+                    // timer can dismiss in headless mode (matching MessageBox MB_OK).
                     (snap.buttons[0].0, false)
                 } else {
                     // Multi-button prompts or dialogs with radio buttons / verification checkboxes /
@@ -2343,6 +2372,7 @@ mod tests {
                         page_generation: 0,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        allow_cancellation: false,
                         callback_timer: false,
                         reset_timer_on_present: false,
                         critical: false,
@@ -2440,6 +2470,7 @@ mod tests {
                         page_generation: 0,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        allow_cancellation: false,
                         callback_timer: false,
                         reset_timer_on_present: false,
                         critical: false,
@@ -3175,6 +3206,7 @@ mod tests {
                         page_generation: 0,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        allow_cancellation: false,
                         callback_timer: false,
                         reset_timer_on_present: false,
                         critical: false,
@@ -3601,6 +3633,116 @@ mod tests {
                     format!("p3:{TDN_DESTROYED}:0:0x3333"),
                 ]
             );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn task_dialog_allow_dialog_cancellation_without_cancel_button() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            static CANCEL_CLICKS: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+
+            unsafe extern "win64" fn cancel_cb(
+                _hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                if msg == TDN_BUTTON_CLICKED && wp == IDCANCEL as usize {
+                    let prev = CANCEL_CLICKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    // Reject first Escape/close cancellation with S_FALSE; accept second.
+                    return if prev == 0 { S_FALSE_HR } else { S_OK };
+                }
+                S_OK
+            }
+
+            let title = crate::strings::to_wide_z("Confirm");
+            let rad1 = crate::strings::to_wide_z("First");
+            let rad2 = crate::strings::to_wide_z("Second");
+            let radios = [
+                TaskDialogButton { button_id: 501, button_text: rad1.as_ptr() },
+                TaskDialogButton { button_id: 502, button_text: rad2.as_ptr() },
+            ];
+            let ver_txt = crate::strings::to_wide_z("Remember choice");
+
+            // 1. Yes/No dialog (no Cancel button) with TDF_ALLOW_DIALOG_CANCELLATION:
+            //    forwards allow_cancellation=true, handles S_FALSE keep-open on first
+            //    cancellation, and returns IDCANCEL with preserved radio/verification state.
+            let mut cfg: TaskDialogConfig = std::mem::zeroed();
+            cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg.dw_flags = TDF_ALLOW_DIALOG_CANCELLATION;
+            cfg.dw_common_buttons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+            cfg.psz_window_title = title.as_ptr();
+            cfg.c_radio_buttons = radios.len() as u32;
+            cfg.p_radio_buttons = radios.as_ptr();
+            cfg.n_default_radio_button = 501;
+            cfg.psz_verification_text = ver_txt.as_ptr();
+            cfg.pf_callback = cancel_cb as *const () as usize;
+
+            CANCEL_CLICKS.store(0, std::sync::atomic::Ordering::Release);
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_hook = calls.clone();
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |_cap, _body, _links, _prog, btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
+                    assert!(
+                        crate::macos::last_test_task_dialog_allow_cancellation(),
+                        "TDF_ALLOW_DIALOG_CANCELLATION must be forwarded to the presenter"
+                    );
+                    assert_eq!(btns, &["Yes".to_string(), "No".to_string()]);
+                    let n = calls_hook.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if n == 0 {
+                        crate::macos::TaskDialogOutcome::Cancelled {
+                            radio_index: Some(0),
+                            verified: false,
+                        }
+                    } else {
+                        crate::macos::TaskDialogOutcome::Cancelled {
+                            radio_index: Some(1),
+                            verified: true,
+                        }
+                    }
+                },
+            )));
+
+            let mut out_btn = 0;
+            let mut out_rad = 0;
+            let mut out_ver = FALSE;
+            let hr = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut out_btn,
+                &mut out_rad,
+                &mut out_ver,
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(hr, S_OK);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 2);
+            assert_eq!(CANCEL_CLICKS.load(std::sync::atomic::Ordering::Acquire), 2);
+            assert_eq!(out_btn, IDCANCEL);
+            assert_eq!(out_rad, 502);
+            assert_eq!(out_ver, TRUE);
+
+            // 2. Headless single-OK dialog with TDF_ALLOW_DIALOG_CANCELLATION must refuse
+            //    auto-dismissal because the user has two outcomes (OK vs Escape/IDCANCEL).
+            let mut hcfg: TaskDialogConfig = std::mem::zeroed();
+            hcfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            hcfg.dw_flags = TDF_ALLOW_DIALOG_CANCELLATION;
+            hcfg.dw_common_buttons = TDCBF_OK_BUTTON;
+            hcfg.psz_window_title = title.as_ptr();
+            let mut hbtn = 99;
+            assert_eq!(
+                TaskDialogIndirect(
+                    &hcfg as *const TaskDialogConfig as *const u8,
+                    &mut hbtn,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION
+            );
+            assert_eq!(hbtn, 0);
         })
         .join()
         .unwrap();

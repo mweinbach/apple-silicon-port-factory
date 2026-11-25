@@ -460,6 +460,13 @@ pub struct TaskDialogAlertResult {
 pub enum TaskDialogOutcome {
     /// Interactive dialog was dismissed by a button click or `TDM_CLICK_BUTTON`.
     Completed(TaskDialogAlertResult),
+    /// User cancelled the dialog via Escape / close button under
+    /// `TDF_ALLOW_DIALOG_CANCELLATION` (without clicking a configured button),
+    /// yielding `IDCANCEL` while preserving the latest radio/verification state.
+    Cancelled {
+        radio_index: Option<usize>,
+        verified: bool,
+    },
     /// Active modal alert was torn down because `TDM_NAVIGATE_PAGE` replaced the
     /// dialog's page configuration while open; caller should immediately re-present
     /// the new page.
@@ -480,6 +487,10 @@ pub enum TaskDialogEvent {
     VerificationToggled(bool),
     HyperlinkClicked(String),
     ButtonClicked(TaskDialogAlertResult),
+    Cancelled {
+        radio_index: Option<usize>,
+        verified: bool,
+    },
     Navigated,
 }
 
@@ -600,6 +611,9 @@ where
         }
         match rx.recv_timeout(wait) {
             Ok(TaskDialogEvent::ButtonClicked(res)) => return TaskDialogOutcome::Completed(res),
+            Ok(TaskDialogEvent::Cancelled { radio_index, verified }) => {
+                return TaskDialogOutcome::Cancelled { radio_index, verified };
+            }
             Ok(TaskDialogEvent::Navigated) => return TaskDialogOutcome::Navigated,
             Ok(other) => on_event(other),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -631,6 +645,7 @@ pub fn task_dialog_alert<F, T>(
     buttons: Vec<String>,
     button_enabled: Vec<bool>,
     default_button_idx: Option<usize>,
+    allow_cancellation: bool,
     radios: Vec<String>,
     radio_enabled: Vec<bool>,
     default_radio_idx: Option<usize>,
@@ -659,6 +674,7 @@ where
             &buttons,
             &button_enabled,
             default_button_idx,
+            allow_cancellation,
             &radios,
             &radio_enabled,
             default_radio_idx,
@@ -684,6 +700,7 @@ where
                 &buttons,
                 &button_enabled,
                 default_button_idx,
+                allow_cancellation,
                 &radios,
                 &radio_enabled,
                 default_radio_idx,
@@ -709,6 +726,7 @@ where
                 &buttons,
                 &button_enabled,
                 default_button_idx,
+                allow_cancellation,
                 &radios,
                 &radio_enabled,
                 default_radio_idx,
@@ -747,6 +765,7 @@ where
             buttons,
             button_enabled,
             default_button_idx,
+            allow_cancellation,
             radios,
             radio_enabled,
             default_radio_idx,
@@ -948,6 +967,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static TEST_TASK_DIALOG_UPDATER: std::cell::RefCell<Option<TestTaskDialogUpdater>> =
         const { std::cell::RefCell::new(None) };
+    static LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -961,6 +982,11 @@ pub(crate) fn set_test_task_dialog_updater(hook: Option<TestTaskDialogUpdater>) 
 }
 
 #[cfg(test)]
+pub(crate) fn last_test_task_dialog_allow_cancellation() -> bool {
+    LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION.with(|c| c.get())
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn invoke_test_task_dialog_presenter(
     caption: &str,
@@ -970,6 +996,7 @@ fn invoke_test_task_dialog_presenter(
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
+    allow_cancellation: bool,
     radios: &[String],
     radio_enabled: &[bool],
     default_radio_idx: Option<usize>,
@@ -977,6 +1004,7 @@ fn invoke_test_task_dialog_presenter(
     verification_checked: bool,
     on_event: &mut dyn FnMut(TaskDialogEvent),
 ) -> Option<TaskDialogOutcome> {
+    LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION.with(|c| c.set(allow_cancellation));
     TEST_TASK_DIALOG_PRESENTER.with(|cell| {
         cell.borrow_mut().as_mut().map(|f| {
             f(

@@ -12,9 +12,10 @@ use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSButton,
-    NSColor, NSCursor, NSEvent, NSEventMask, NSFont, NSImage, NSMenu, NSMenuItem, NSPasteboard,
-    NSPasteboardTypeString, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSTextField,
-    NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
+    NSColor, NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSFont, NSImage, NSMenu,
+    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSScreen, NSTextField, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -1371,6 +1372,9 @@ const TASK_DIALOG_ABORT_CODE: isize = -1001;
 /// TaskDialog page while its native `NSAlert` is open so the caller immediately
 /// rebuilds and re-presents the dialog with the new configuration.
 const TASK_DIALOG_NAVIGATE_CODE: isize = -2001;
+/// Sentinel modal return code used when the user cancels a `TDF_ALLOW_DIALOG_CANCELLATION`
+/// dialog via Escape, Cmd+W, or the window close button (yielding `IDCANCEL`).
+const TASK_DIALOG_CANCEL_CODE: isize = -2002;
 
 #[derive(Clone, Copy, Debug)]
 enum DeferredModalStop {
@@ -1453,7 +1457,24 @@ define_class!(
     #[ivars = SessionIvar]
     struct TaskDialogRadioTarget;
 
+    unsafe impl NSObjectProtocol for TaskDialogRadioTarget {}
+
+    unsafe impl NSWindowDelegate for TaskDialogRadioTarget {
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _sender: &NSWindow) -> bool {
+            let app = NSApplication::sharedApplication(mtm());
+            app.stopModalWithCode(TASK_DIALOG_CANCEL_CODE);
+            false
+        }
+    }
+
     impl TaskDialogRadioTarget {
+        #[unsafe(method(cancelDialog:))]
+        fn cancel_dialog(&self, _sender: &AnyObject) {
+            let app = NSApplication::sharedApplication(mtm());
+            app.stopModalWithCode(TASK_DIALOG_CANCEL_CODE);
+        }
+
         #[unsafe(method(radioSelected:))]
         fn radio_selected(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
@@ -1547,6 +1568,7 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         buttons,
         &[],
         None,
+        false,
         &[],
         &[],
         None,
@@ -1801,6 +1823,7 @@ fn run_task_dialog_alert(
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
+    allow_cancellation: bool,
     radios: &[String],
     radio_enabled: &[bool],
     default_radio_idx: Option<usize>,
@@ -1827,6 +1850,7 @@ fn run_task_dialog_alert(
     a.setAlertStyle(if critical { NSAlertStyle::Critical } else { NSAlertStyle::Warning });
     let custom_default = default_button_idx.filter(|&idx| idx < buttons.len());
     let mut action_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(buttons.len());
+    let mut has_escape_button = false;
     for (idx, b) in buttons.iter().enumerate() {
         let btn = a.addButtonWithTitle(&NSString::from_str(b));
         let existing_eq = btn.keyEquivalent().to_string();
@@ -1835,6 +1859,9 @@ fn run_task_dialog_alert(
         {
             let eq = NSString::from_str(new_eq);
             let _: () = unsafe { msg_send![&*btn, setKeyEquivalent: &*eq] };
+        }
+        if btn.keyEquivalent().to_string() == "\u{1b}" {
+            has_escape_button = true;
         }
         btn.setEnabled(button_enabled.get(idx).copied().unwrap_or(true));
         action_buttons.push(btn);
@@ -1893,12 +1920,58 @@ fn run_task_dialog_alert(
         links,
     );
 
+    // Under `TDF_ALLOW_DIALOG_CANCELLATION`, allow Escape, Cmd+W, and the window's
+    // title-bar close button to cancel the dialog with `IDCANCEL` even when no
+    // `TDCBF_CANCEL_BUTTON` / Cancel button is configured.
+    let mut cancel_shortcut_buttons: Vec<Retained<NSButton>> = Vec::new();
+    let mut attached_close_delegate_win: Option<Retained<NSWindow>> = None;
+    if allow_cancellation {
+        let _: () = unsafe { msg_send![&*a, layout] };
+        let win = a.window();
+        win.setStyleMask(win.styleMask() | NSWindowStyleMask::Closable);
+        if win.delegate().is_none() {
+            win.setDelegate(Some(ProtocolObject::from_ref(&*target)));
+            attached_close_delegate_win = Some(win.clone());
+        }
+        if let Some(cv) = win.contentView() {
+            let add_hidden_cancel = |key: &str, mods: Option<NSEventModifierFlags>| {
+                let btn = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        &NSString::from_str(""),
+                        Some(&target),
+                        Some(sel!(cancelDialog:)),
+                        mtm,
+                    )
+                };
+                btn.setBordered(false);
+                btn.setTransparent(true);
+                btn.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)));
+                let eq = NSString::from_str(key);
+                let _: () = unsafe { msg_send![&*btn, setKeyEquivalent: &*eq] };
+                if let Some(m) = mods {
+                    btn.setKeyEquivalentModifierMask(m);
+                }
+                cv.addSubview(&btn);
+                btn
+            };
+            if !has_escape_button {
+                cancel_shortcut_buttons.push(add_hidden_cancel("\u{1b}", None));
+            }
+            cancel_shortcut_buttons
+                .push(add_hidden_cancel("w", Some(NSEventModifierFlags::Command)));
+        }
+    }
+
     struct ActiveAlertGuard {
         session_id: u64,
         mtm: MainThreadMarker,
+        attached_delegate_win: Option<Retained<NSWindow>>,
     }
     impl Drop for ActiveAlertGuard {
         fn drop(&mut self) {
+            if let Some(ref win) = self.attached_delegate_win {
+                win.setDelegate(None);
+            }
             let deferred_parent_stop = ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
                 let mut s = stack.borrow_mut();
                 if let Some(pos) = s.iter().rposition(|a| a.session_id == self.session_id) {
@@ -1937,7 +2010,11 @@ fn run_task_dialog_alert(
             deferred_stop: None,
         });
     });
-    let _active_guard = ActiveAlertGuard { session_id, mtm };
+    let _active_guard = ActiveAlertGuard {
+        session_id,
+        mtm,
+        attached_delegate_win: attached_close_delegate_win,
+    };
 
     // Apply any live updates that arrived before `run_task_dialog_alert` began.
     let mut pre_clicked: Option<usize> = None;
@@ -1984,14 +2061,14 @@ fn run_task_dialog_alert(
     } else {
         a.runModal()
     };
-    if r == TASK_DIALOG_ABORT_CODE || cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
+    let quit_requested = cancelled.is_some_and(|c| c.load(Ordering::Acquire))
+        || crate::user32::message::has_pending_quit();
+    if quit_requested || (r == TASK_DIALOG_ABORT_CODE && !allow_cancellation) {
         return super::TaskDialogOutcome::Quit;
     }
     if r == TASK_DIALOG_NAVIGATE_CODE {
         return super::TaskDialogOutcome::Navigated;
     }
-    // NSAlertFirstButtonReturn = 1000
-    let button_index = (r - 1000).clamp(0, buttons.len().saturating_sub(1) as isize) as usize;
     let radio_index = if radio_buttons.is_empty() {
         None
     } else {
@@ -2008,7 +2085,13 @@ fn run_task_dialog_alert(
     } else {
         false
     };
+    let _keep_cancel_shortcuts_alive = cancel_shortcut_buttons;
     let _keep_target_alive = target;
+    if r == TASK_DIALOG_CANCEL_CODE || (r == TASK_DIALOG_ABORT_CODE && allow_cancellation) {
+        return super::TaskDialogOutcome::Cancelled { radio_index, verified };
+    }
+    // NSAlertFirstButtonReturn = 1000
+    let button_index = (r - 1000).clamp(0, buttons.len().saturating_sub(1) as isize) as usize;
     super::TaskDialogOutcome::Completed(super::TaskDialogAlertResult {
         button_index,
         radio_index,
@@ -2026,6 +2109,7 @@ pub(super) fn task_dialog_alert_channel(
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
+    allow_cancellation: bool,
     radios: &[String],
     radio_enabled: &[bool],
     default_radio_idx: Option<usize>,
@@ -2044,6 +2128,7 @@ pub(super) fn task_dialog_alert_channel(
         buttons,
         button_enabled,
         default_button_idx,
+        allow_cancellation,
         radios,
         radio_enabled,
         default_radio_idx,
@@ -2055,6 +2140,9 @@ pub(super) fn task_dialog_alert_channel(
     ) {
         super::TaskDialogOutcome::Completed(res) => {
             let _ = tx.send(super::TaskDialogEvent::ButtonClicked(res));
+        }
+        super::TaskDialogOutcome::Cancelled { radio_index, verified } => {
+            let _ = tx.send(super::TaskDialogEvent::Cancelled { radio_index, verified });
         }
         super::TaskDialogOutcome::Navigated => {
             let _ = tx.send(super::TaskDialogEvent::Navigated);
@@ -2121,6 +2209,7 @@ pub(super) fn task_dialog_alert_inline(
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
+    allow_cancellation: bool,
     radios: &[String],
     radio_enabled: &[bool],
     default_radio_idx: Option<usize>,
@@ -2186,6 +2275,7 @@ pub(super) fn task_dialog_alert_inline(
         buttons,
         button_enabled,
         default_button_idx,
+        allow_cancellation,
         radios,
         radio_enabled,
         default_radio_idx,
