@@ -128,6 +128,130 @@ pub(super) unsafe fn numeric_decimal_wide(l: *mut c_void) -> &'static [u16] {
     }
 }
 
+/// Encode `s` into `cp` bytes (`0` or `65001` => UTF-8).
+pub(super) fn encode_in_cp(s: &str, cp: u32) -> Vec<u8> {
+    if cp == 0 || cp == 65001 {
+        return s.as_bytes().to_vec();
+    }
+    let w = to_wide(s);
+    kstr::encode_utf16_to_cp(cp, &w, Some(b'?'))
+        .map(|(b, _)| b)
+        .unwrap_or_else(|_| s.as_bytes().to_vec())
+}
+
+/// `(is_c, cp, bcp47)` for the active global `LC_COLLATE` or an explicit `_locale_t`.
+pub(super) unsafe fn collate_cp_and_bcp47(l: *mut c_void) -> (bool, u32, String) {
+    if l.is_null() {
+        let st = global_state().lock().unwrap();
+        let e = &st.cats[(LC_COLLATE - 1) as usize];
+        (e.is_c, e.cp, e.bcp47.clone())
+    } else {
+        let e = &(*(l as *const LocaleObj)).cats[(LC_COLLATE - 1) as usize];
+        (e.is_c, e.cp, e.bcp47.clone())
+    }
+}
+
+pub(super) struct TimeLocaleNames {
+    pub is_c: bool,
+    pub cp: u32,
+    pub bcp47: String,
+    pub days_abbr: [String; 7],
+    pub days: [String; 7],
+    pub mon_abbr: [String; 12],
+    pub mons: [String; 12],
+    pub ampm: [String; 2],
+    pub short_date: String,
+    pub long_date: String,
+    pub time_fmt: String,
+}
+
+fn c_time_names() -> &'static TimeLocaleNames {
+    static C: OnceLock<TimeLocaleNames> = OnceLock::new();
+    C.get_or_init(|| TimeLocaleNames {
+        is_c: true,
+        cp: 0,
+        bcp47: String::new(),
+        days_abbr: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(String::from),
+        days: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map(String::from),
+        mon_abbr: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].map(String::from),
+        mons: [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ]
+        .map(String::from),
+        ampm: ["AM".into(), "PM".into()],
+        short_date: "MM/dd/yy".into(),
+        long_date: "dddd, MMMM dd, yyyy".into(),
+        time_fmt: "HH:mm:ss".into(),
+    })
+}
+
+static ACTIVE_TIME_NAMES: std::sync::atomic::AtomicPtr<TimeLocaleNames> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn time_names_for_entry(e: &LocaleEntry) -> &'static TimeLocaleNames {
+    if e.is_c {
+        return c_time_names();
+    }
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32), &'static TimeLocaleNames>>> = OnceLock::new();
+    let m = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (e.bcp47.clone(), e.cp);
+    let mut g = m.lock().unwrap();
+    if let Some(&t) = g.get(&key) {
+        return t;
+    }
+    let cdef = c_time_names();
+    let Some(loc) = kstr::resolve_locale_tag(&e.bcp47) else {
+        return cdef;
+    };
+    let q = |lctype: u32, fallback: &str| -> String {
+        kstr::locale_info_for(&loc, lctype)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    // Windows LCTYPE day numbering is Mon=0..Sun=6; C struct tm.tm_wday is Sun=0..Sat=6.
+    let days: [String; 7] = std::array::from_fn(|wd| {
+        let lctype = if wd == 0 { 0x30 } else { 0x2A + (wd as u32 - 1) };
+        q(lctype, &cdef.days[wd])
+    });
+    let days_abbr: [String; 7] = std::array::from_fn(|wd| {
+        let lctype = if wd == 0 { 0x37 } else { 0x31 + (wd as u32 - 1) };
+        q(lctype, &cdef.days_abbr[wd])
+    });
+    let mons: [String; 12] = std::array::from_fn(|mo| q(0x38 + mo as u32, &cdef.mons[mo]));
+    let mon_abbr: [String; 12] = std::array::from_fn(|mo| q(0x44 + mo as u32, &cdef.mon_abbr[mo]));
+    let ampm = [q(0x28, &cdef.ampm[0]), q(0x29, &cdef.ampm[1])];
+    let short_date = q(0x1F, &cdef.short_date);
+    let long_date = q(0x20, &cdef.long_date);
+    let time_fmt = q(0x1003, &cdef.time_fmt);
+    let leaked: &'static TimeLocaleNames = Box::leak(Box::new(TimeLocaleNames {
+        is_c: false,
+        cp: e.cp,
+        bcp47: e.bcp47.clone(),
+        days_abbr,
+        days,
+        mon_abbr,
+        mons,
+        ampm,
+        short_date,
+        long_date,
+        time_fmt,
+    }));
+    g.insert(key, leaked);
+    leaked
+}
+
+/// Active `LC_TIME` localized names/patterns for global locale (`l == NULL`) or explicit `_locale_t`.
+pub(super) unsafe fn time_locale_names(l: *mut c_void) -> &'static TimeLocaleNames {
+    if l.is_null() {
+        let p = ACTIVE_TIME_NAMES.load(Ordering::Acquire);
+        if p.is_null() { c_time_names() } else { &*p }
+    } else {
+        let e = &(*(l as *const LocaleObj)).cats[(LC_TIME - 1) as usize];
+        time_names_for_entry(e)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocaleEntry {
     is_c: bool,
@@ -197,6 +321,8 @@ fn sync_atomics(st: &LocaleState) {
     super::string::refresh_global_ctype_tables(if ctype.is_c { 0 } else { ctype.cp }, &icu_id);
     let dec = numeric_decimal_for_entry(numeric);
     ACTIVE_NUMERIC_DEC.store(dec as *const NumericDecimal as *mut NumericDecimal, Ordering::Release);
+    let tnames = time_names_for_entry(&st.cats[(LC_TIME - 1) as usize]);
+    ACTIVE_TIME_NAMES.store(tnames as *const TimeLocaleNames as *mut TimeLocaleNames, Ordering::Release);
 }
 
 fn intern_bytes(bytes: &[u8]) -> *mut u8 {
@@ -217,6 +343,14 @@ fn intern_bytes(bytes: &[u8]) -> *mut u8 {
 
 fn intern_ansi(s: &str) -> *mut u8 {
     intern_bytes(s.as_bytes())
+}
+
+pub(super) fn intern_in_cp_str(s: &str, cp: u32) -> *const u8 {
+    intern_in_cp(s, cp)
+}
+
+pub(super) fn intern_wide_str(s: &str) -> *const u16 {
+    intern_wide(s) as *const u16
 }
 
 fn intern_in_cp(s: &str, cp: u32) -> *const u8 {

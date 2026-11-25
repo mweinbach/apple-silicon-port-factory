@@ -337,8 +337,127 @@ fn iso_week(tm: &Tm) -> (i32, i32) {
     (week, year)
 }
 
+fn format_win_picture(pic: &str, tm: &Tm, names: &super::locale::TimeLocaleNames) -> String {
+    let chars: Vec<char> = pic.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let wd = tm.tm_wday.clamp(0, 6) as usize;
+    let mo = tm.tm_mon.clamp(0, 11) as usize;
+    let year = tm.tm_year + 1900;
+    let h12 = if tm.tm_hour % 12 == 0 { 12 } else { tm.tm_hour % 12 };
+    let ampm = &names.ampm[(tm.tm_hour >= 12) as usize];
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                        out.push('\'');
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if matches!(ch, 'd' | 'M' | 'y' | 'H' | 'h' | 'm' | 's' | 't') {
+            let start = i;
+            while i < chars.len() && chars[i] == ch {
+                i += 1;
+            }
+            let n = i - start;
+            match ch {
+                'd' => match n {
+                    1 => out.push_str(&format!("{}", tm.tm_mday)),
+                    2 => out.push_str(&format!("{:02}", tm.tm_mday)),
+                    3 => out.push_str(&names.days_abbr[wd]),
+                    _ => out.push_str(&names.days[wd]),
+                },
+                'M' => match n {
+                    1 => out.push_str(&format!("{}", tm.tm_mon + 1)),
+                    2 => out.push_str(&format!("{:02}", tm.tm_mon + 1)),
+                    3 => out.push_str(&names.mon_abbr[mo]),
+                    _ => out.push_str(&names.mons[mo]),
+                },
+                'y' => {
+                    if n >= 4 {
+                        out.push_str(&format!("{year:04}"));
+                    } else if n == 2 {
+                        out.push_str(&format!("{:02}", year.rem_euclid(100)));
+                    } else {
+                        out.push_str(&format!("{}", year.rem_euclid(100)));
+                    }
+                }
+                'H' => {
+                    if n >= 2 {
+                        out.push_str(&format!("{:02}", tm.tm_hour));
+                    } else {
+                        out.push_str(&format!("{}", tm.tm_hour));
+                    }
+                }
+                'h' => {
+                    if n >= 2 {
+                        out.push_str(&format!("{h12:02}"));
+                    } else {
+                        out.push_str(&format!("{h12}"));
+                    }
+                }
+                'm' => {
+                    if n >= 2 {
+                        out.push_str(&format!("{:02}", tm.tm_min));
+                    } else {
+                        out.push_str(&format!("{}", tm.tm_min));
+                    }
+                }
+                's' => {
+                    if n >= 2 {
+                        out.push_str(&format!("{:02}", tm.tm_sec));
+                    } else {
+                        out.push_str(&format!("{}", tm.tm_sec));
+                    }
+                }
+                't' => {
+                    if n >= 2 {
+                        out.push_str(ampm);
+                    } else if let Some(first) = ampm.chars().next() {
+                        out.push(first);
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            out.push(ch);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Format per C-locale strftime. Returns `None` for invalid input.
 pub fn strftime_str(fmt: &[u32], tm: &Tm) -> Option<String> {
+    let names = super::locale::TimeLocaleNames {
+        is_c: true,
+        cp: 0,
+        bcp47: String::new(),
+        days_abbr: DAYS_ABBR.map(String::from),
+        days: DAYS.map(String::from),
+        mon_abbr: MON_ABBR.map(String::from),
+        mons: MONS.map(String::from),
+        ampm: ["AM".into(), "PM".into()],
+        short_date: "MM/dd/yy".into(),
+        long_date: "dddd, MMMM dd, yyyy".into(),
+        time_fmt: "HH:mm:ss".into(),
+    };
+    strftime_str_with_names(fmt, tm, &names)
+}
+
+fn strftime_str_with_names(fmt: &[u32], tm: &Tm, names: &super::locale::TimeLocaleNames) -> Option<String> {
     let mut out = String::new();
     let mut i = 0;
     let wd = tm.tm_wday.clamp(0, 6) as usize;
@@ -363,16 +482,40 @@ pub fn strftime_str(fmt: &[u32], tm: &Tm) -> Option<String> {
         i += 1;
         let num = |v: i32, w: usize| if alt { format!("{v}") } else { format!("{v:0w$}") };
         let h12 = if tm.tm_hour % 12 == 0 { 12 } else { tm.tm_hour % 12 };
+        let ampm = &names.ampm[(tm.tm_hour >= 12) as usize];
         let s = match spec {
-            'a' => DAYS_ABBR[wd].to_string(),
-            'A' => DAYS[wd].to_string(),
-            'b' | 'h' => MON_ABBR[mo].to_string(),
-            'B' => MONS[mo].to_string(),
+            'a' => names.days_abbr[wd].clone(),
+            'A' => names.days[wd].clone(),
+            'b' | 'h' => names.mon_abbr[mo].clone(),
+            'B' => names.mons[mo].clone(),
             'c' => {
-                if alt {
-                    format!("{}, {} {:02}, {} {:02}:{:02}:{:02}", DAYS[wd], MONS[mo], tm.tm_mday, tm.tm_year + 1900, tm.tm_hour, tm.tm_min, tm.tm_sec)
+                if names.is_c {
+                    if alt {
+                        format!(
+                            "{}, {} {:02}, {} {:02}:{:02}:{:02}",
+                            names.days[wd],
+                            names.mons[mo],
+                            tm.tm_mday,
+                            tm.tm_year + 1900,
+                            tm.tm_hour,
+                            tm.tm_min,
+                            tm.tm_sec
+                        )
+                    } else {
+                        format!(
+                            "{:02}/{:02}/{:02} {:02}:{:02}:{:02}",
+                            tm.tm_mon + 1,
+                            tm.tm_mday,
+                            (tm.tm_year + 1900) % 100,
+                            tm.tm_hour,
+                            tm.tm_min,
+                            tm.tm_sec
+                        )
+                    }
                 } else {
-                    format!("{:02}/{:02}/{:02} {:02}:{:02}:{:02}", tm.tm_mon + 1, tm.tm_mday, (tm.tm_year + 1900) % 100, tm.tm_hour, tm.tm_min, tm.tm_sec)
+                    let d = format_win_picture(if alt { &names.long_date } else { &names.short_date }, tm, names);
+                    let t = format_win_picture(&names.time_fmt, tm, names);
+                    format!("{d} {t}")
                 }
             }
             'C' => num((tm.tm_year + 1900) / 100, 2),
@@ -388,22 +531,33 @@ pub fn strftime_str(fmt: &[u32], tm: &Tm) -> Option<String> {
             'm' => num(tm.tm_mon + 1, 2),
             'M' => num(tm.tm_min, 2),
             'n' => "\n".into(),
-            'p' => if tm.tm_hour < 12 { "AM" } else { "PM" }.into(),
-            'r' => format!("{:02}:{:02}:{:02} {}", h12, tm.tm_min, tm.tm_sec, if tm.tm_hour < 12 { "AM" } else { "PM" }),
+            'p' => ampm.clone(),
+            'r' => format!("{:02}:{:02}:{:02} {}", h12, tm.tm_min, tm.tm_sec, ampm),
             'R' => format!("{:02}:{:02}", tm.tm_hour, tm.tm_min),
             'S' => num(tm.tm_sec, 2),
             't' => "\t".into(),
-            'T' | 'X' => format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+            'T' => format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+            'X' => {
+                if names.is_c {
+                    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+                } else {
+                    format_win_picture(&names.time_fmt, tm, names)
+                }
+            }
             'u' => format!("{}", if tm.tm_wday == 0 { 7 } else { tm.tm_wday }),
             'U' => num((tm.tm_yday + 7 - tm.tm_wday) / 7, 2),
             'V' => num(iso_week(tm).0, 2),
             'w' => format!("{}", tm.tm_wday),
             'W' => num((tm.tm_yday + 7 - (tm.tm_wday + 6) % 7) / 7, 2),
             'x' => {
-                if alt {
-                    format!("{}, {} {:02}, {}", DAYS[wd], MONS[mo], tm.tm_mday, tm.tm_year + 1900)
+                if names.is_c {
+                    if alt {
+                        format!("{}, {} {:02}, {}", names.days[wd], names.mons[mo], tm.tm_mday, tm.tm_year + 1900)
+                    } else {
+                        format!("{:02}/{:02}/{:02}", tm.tm_mon + 1, tm.tm_mday, (tm.tm_year + 1900) % 100)
+                    }
                 } else {
-                    format!("{:02}/{:02}/{:02}", tm.tm_mon + 1, tm.tm_mday, (tm.tm_year + 1900) % 100)
+                    format_win_picture(if alt { &names.long_date } else { &names.short_date }, tm, names)
                 }
             }
             'y' => num((tm.tm_year + 1900) % 100, 2),
@@ -432,35 +586,47 @@ pub fn strftime_str(fmt: &[u32], tm: &Tm) -> Option<String> {
     Some(out)
 }
 
-unsafe fn strftime_impl(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm) -> usize {
+unsafe fn strftime_impl(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm, loc: *mut c_void) -> usize {
     if buf.is_null() || fmt.is_null() || tm.is_null() || max == 0 {
         super::errno::set(super::errno::EINVAL);
         return 0;
     }
-    let f: Vec<u32> = cstr_slice(fmt).iter().map(|&b| b as u32).collect();
-    let Some(s) = strftime_str(&f, &*tm) else {
+    let names = super::locale::time_locale_names(loc);
+    let raw = cstr_slice(fmt);
+    let f: Vec<u32> = if names.cp != 0 && names.cp != 65001 {
+        let w = crate::kernel32::string::decode_cp_to_utf16(names.cp, raw)
+            .unwrap_or_else(|_| String::from_utf8_lossy(raw).encode_utf16().collect());
+        String::from_utf16_lossy(&w).chars().map(|c| c as u32).collect()
+    } else if names.cp == 65001 {
+        String::from_utf8_lossy(raw).chars().map(|c| c as u32).collect()
+    } else {
+        raw.iter().map(|&b| b as u32).collect()
+    };
+    let Some(s) = strftime_str_with_names(&f, &*tm, names) else {
         *buf = 0;
         super::errno::set(super::errno::EINVAL);
         super::runtime::invalid_parameter("strftime: bad format");
         return 0;
     };
-    if s.len() >= max {
+    let bytes = super::locale::encode_in_cp(&s, names.cp);
+    if bytes.len() >= max {
         *buf = 0;
         super::errno::set(super::errno::ERANGE);
         return 0;
     }
-    std::ptr::copy_nonoverlapping(s.as_ptr(), buf, s.len());
-    *buf.add(s.len()) = 0;
-    s.len()
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+    *buf.add(bytes.len()) = 0;
+    bytes.len()
 }
 
-unsafe fn wcsftime_impl(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm) -> usize {
+unsafe fn wcsftime_impl(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm, loc: *mut c_void) -> usize {
     if buf.is_null() || fmt.is_null() || tm.is_null() || max == 0 {
         super::errno::set(super::errno::EINVAL);
         return 0;
     }
-    let f: Vec<u32> = wide_slice(fmt).iter().map(|&c| c as u32).collect();
-    let Some(s) = strftime_str(&f, &*tm) else {
+    let names = super::locale::time_locale_names(loc);
+    let f: Vec<u32> = String::from_utf16_lossy(wide_slice(fmt)).chars().map(|c| c as u32).collect();
+    let Some(s) = strftime_str_with_names(&f, &*tm, names) else {
         *buf = 0;
         super::errno::set(super::errno::EINVAL);
         return 0;
@@ -477,22 +643,22 @@ unsafe fn wcsftime_impl(buf: *mut u16, max: usize, fmt: *const u16, tm: *const T
 }
 
 pub unsafe extern "win64" fn strftime(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm) -> usize {
-    strftime_impl(buf, max, fmt, tm)
+    strftime_impl(buf, max, fmt, tm, std::ptr::null_mut())
 }
-pub unsafe extern "win64" fn _strftime_l(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm, _l: *mut c_void) -> usize {
-    strftime_impl(buf, max, fmt, tm)
+pub unsafe extern "win64" fn _strftime_l(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm, l: *mut c_void) -> usize {
+    strftime_impl(buf, max, fmt, tm, l)
 }
 pub unsafe extern "win64" fn _Strftime(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm, _names: *mut c_void) -> usize {
-    strftime_impl(buf, max, fmt, tm)
+    strftime_impl(buf, max, fmt, tm, std::ptr::null_mut())
 }
 pub unsafe extern "win64" fn wcsftime(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm) -> usize {
-    wcsftime_impl(buf, max, fmt, tm)
+    wcsftime_impl(buf, max, fmt, tm, std::ptr::null_mut())
 }
-pub unsafe extern "win64" fn _wcsftime_l(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm, _l: *mut c_void) -> usize {
-    wcsftime_impl(buf, max, fmt, tm)
+pub unsafe extern "win64" fn _wcsftime_l(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm, l: *mut c_void) -> usize {
+    wcsftime_impl(buf, max, fmt, tm, l)
 }
 pub unsafe extern "win64" fn _Wcsftime(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm, _names: *mut c_void) -> usize {
-    wcsftime_impl(buf, max, fmt, tm)
+    wcsftime_impl(buf, max, fmt, tm, std::ptr::null_mut())
 }
 
 pub unsafe extern "win64" fn asctime_s(buf: *mut u8, size: usize, tm: *const Tm) -> i32 {
@@ -544,41 +710,45 @@ fn malloc_copy(bytes: &[u8]) -> *mut u8 {
     }
 }
 
-fn days_string() -> String {
+fn days_string(names: &super::locale::TimeLocaleNames) -> String {
     let mut s = String::new();
     for d in 0..7 {
-        s.push_str(&format!(":{}:{}", DAYS_ABBR[d], DAYS[d]));
+        s.push_str(&format!(":{}:{}", names.days_abbr[d], names.days[d]));
     }
     s
 }
-fn months_string() -> String {
+fn months_string(names: &super::locale::TimeLocaleNames) -> String {
     let mut s = String::new();
     for m in 0..12 {
-        s.push_str(&format!(":{}:{}", MON_ABBR[m], MONS[m]));
+        s.push_str(&format!(":{}:{}", names.mon_abbr[m], names.mons[m]));
     }
     s
 }
 
 pub unsafe extern "win64" fn _Getdays() -> *mut u8 {
-    let mut b = days_string().into_bytes();
+    let names = super::locale::time_locale_names(std::ptr::null_mut());
+    let mut b = super::locale::encode_in_cp(&days_string(names), names.cp);
     b.push(0);
     malloc_copy(&b)
 }
 pub unsafe extern "win64" fn _Getmonths() -> *mut u8 {
-    let mut b = months_string().into_bytes();
+    let names = super::locale::time_locale_names(std::ptr::null_mut());
+    let mut b = super::locale::encode_in_cp(&months_string(names), names.cp);
     b.push(0);
     malloc_copy(&b)
 }
 pub unsafe extern "win64" fn _W_Getdays() -> *mut u16 {
-    let w = crate::strings::to_wide_z(&days_string());
+    let names = super::locale::time_locale_names(std::ptr::null_mut());
+    let w = crate::strings::to_wide_z(&days_string(names));
     malloc_copy(std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2)) as *mut u16
 }
 pub unsafe extern "win64" fn _W_Getmonths() -> *mut u16 {
-    let w = crate::strings::to_wide_z(&months_string());
+    let names = super::locale::time_locale_names(std::ptr::null_mut());
+    let w = crate::strings::to_wide_z(&months_string(names));
     malloc_copy(std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2)) as *mut u16
 }
 
-/// `__crt_lc_time_data` (C locale). The caller frees the block with `free`;
+/// `__crt_lc_time_data` for the active `LC_TIME`. The caller frees the block with `free`;
 /// the strings it points to are static.
 #[repr(C)]
 struct LcTimeData {
@@ -604,28 +774,30 @@ struct LcTimeData {
 }
 
 pub unsafe extern "win64" fn _Gettnames() -> *mut c_void {
-    let a = |s: &str| crate::strings::leak_ansi_z(s) as *const u8;
-    let w = |s: &str| crate::strings::leak_wide_z(s) as *const u16;
+    let names = super::locale::time_locale_names(std::ptr::null_mut());
+    let cp = names.cp;
+    let a = |s: &str| super::locale::intern_in_cp_str(s, cp);
+    let w = |s: &str| super::locale::intern_wide_str(s);
     let d = LcTimeData {
-        wday_abbr: DAYS_ABBR.map(a),
-        wday: DAYS.map(a),
-        month_abbr: MON_ABBR.map(a),
-        month: MONS.map(a),
-        ampm: ["AM", "PM"].map(a),
-        ww_sdatefmt: a("MM/dd/yy"),
-        ww_ldatefmt: a("dddd, MMMM dd, yyyy"),
-        ww_timefmt: a("HH:mm:ss"),
+        wday_abbr: std::array::from_fn(|i| a(&names.days_abbr[i])),
+        wday: std::array::from_fn(|i| a(&names.days[i])),
+        month_abbr: std::array::from_fn(|i| a(&names.mon_abbr[i])),
+        month: std::array::from_fn(|i| a(&names.mons[i])),
+        ampm: [a(&names.ampm[0]), a(&names.ampm[1])],
+        ww_sdatefmt: a(&names.short_date),
+        ww_ldatefmt: a(&names.long_date),
+        ww_timefmt: a(&names.time_fmt),
         ww_caltype: 1,
         refcount: 0,
-        w_wday_abbr: DAYS_ABBR.map(w),
-        w_wday: DAYS.map(w),
-        w_month_abbr: MON_ABBR.map(w),
-        w_month: MONS.map(w),
-        w_ampm: ["AM", "PM"].map(w),
-        w_ww_sdatefmt: w("MM/dd/yy"),
-        w_ww_ldatefmt: w("dddd, MMMM dd, yyyy"),
-        w_ww_timefmt: w("HH:mm:ss"),
-        w_ww_locale_name: w(""),
+        w_wday_abbr: std::array::from_fn(|i| w(&names.days_abbr[i])),
+        w_wday: std::array::from_fn(|i| w(&names.days[i])),
+        w_month_abbr: std::array::from_fn(|i| w(&names.mon_abbr[i])),
+        w_month: std::array::from_fn(|i| w(&names.mons[i])),
+        w_ampm: [w(&names.ampm[0]), w(&names.ampm[1])],
+        w_ww_sdatefmt: w(&names.short_date),
+        w_ww_ldatefmt: w(&names.long_date),
+        w_ww_timefmt: w(&names.time_fmt),
+        w_ww_locale_name: w(&names.bcp47),
     };
     let p = crate::heap::alloc(std::mem::size_of::<LcTimeData>(), false) as *mut LcTimeData;
     std::ptr::write(p, d);
@@ -651,6 +823,31 @@ mod tests {
             let mut buf = [0u8; 8];
             assert_eq!(strftime(buf.as_mut_ptr(), 8, b"%Y-%m-%d\0".as_ptr(), &tm), 0, "too small -> 0");
             assert_eq!(std::mem::size_of::<LcTimeData>(), 704);
+
+            // LC_TIME = de-DE formats localized German weekday/month names in strftime, wcsftime,
+            // _strftime_l, _wcsftime_l, and _Gettnames.
+            assert!(!crate::ucrt::locale::setlocale(5 /* LC_TIME */, b"de-DE\0".as_ptr()).is_null());
+            let mut nbuf = [0u8; 64];
+            let n = strftime(nbuf.as_mut_ptr(), nbuf.len(), b"%A %B\0".as_ptr(), &tm);
+            assert!(n > 0);
+            assert_eq!(&nbuf[..n], b"Dienstag November");
+            let mut wbuf = [0u16; 64];
+            let wfmt: Vec<u16> = "%A %B\0".encode_utf16().collect();
+            let wn = wcsftime(wbuf.as_mut_ptr(), wbuf.len(), wfmt.as_ptr(), &tm);
+            assert!(wn > 0);
+            assert_eq!(String::from_utf16_lossy(&wbuf[..wn]), "Dienstag November");
+            // Restore global "C" and verify explicit _locale_t honors LC_TIME independently.
+            assert!(!crate::ucrt::locale::setlocale(5, b"C\0".as_ptr()).is_null());
+            let loc_de = crate::ucrt::locale::_create_locale(5, b"de-DE\0".as_ptr());
+            assert!(!loc_de.is_null());
+            let n2 = _strftime_l(nbuf.as_mut_ptr(), nbuf.len(), b"%A %B\0".as_ptr(), &tm, loc_de);
+            assert_eq!(&nbuf[..n2], b"Dienstag November");
+            let wn2 = _wcsftime_l(wbuf.as_mut_ptr(), wbuf.len(), wfmt.as_ptr(), &tm, loc_de);
+            assert_eq!(String::from_utf16_lossy(&wbuf[..wn2]), "Dienstag November");
+            // Global "C" still produces English names.
+            let nc = strftime(nbuf.as_mut_ptr(), nbuf.len(), b"%A %B\0".as_ptr(), &tm);
+            assert_eq!(&nbuf[..nc], b"Tuesday November");
+            crate::ucrt::locale::_free_locale(loc_de);
         }
     }
 }

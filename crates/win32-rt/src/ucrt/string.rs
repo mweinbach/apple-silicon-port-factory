@@ -461,22 +461,100 @@ pub unsafe extern "win64" fn _strnicmp_l(a: *const u8, b: *const u8, n: usize, _
 pub unsafe extern "win64" fn _strcmpi(a: *const u8, b: *const u8) -> i32 {
     _stricmp(a, b)
 }
+unsafe fn narrow_coll_impl(a: *const u8, b: *const u8, max: Option<usize>, ignore_case: bool) -> i32 {
+    let (is_c, cp, bcp47) = super::locale::collate_cp_and_bcp47(std::ptr::null_mut());
+    if is_c {
+        return match (max, ignore_case) {
+            (None, false) => strcmp(a, b),
+            (None, true) => _stricmp(a, b),
+            (Some(n), false) => strncmp(a, b, n),
+            (Some(n), true) => _strnicmp(a, b, n),
+        };
+    }
+    let slice_a = match max {
+        Some(n) => std::slice::from_raw_parts(a, strnlen(a, n)),
+        None => std::slice::from_raw_parts(a, strlen(a)),
+    };
+    let slice_b = match max {
+        Some(n) => std::slice::from_raw_parts(b, strnlen(b, n)),
+        None => std::slice::from_raw_parts(b, strlen(b)),
+    };
+    let wa = crate::kernel32::string::decode_cp_to_utf16(cp, slice_a)
+        .unwrap_or_else(|_| String::from_utf8_lossy(slice_a).encode_utf16().collect());
+    let wb = crate::kernel32::string::decode_cp_to_utf16(cp, slice_b)
+        .unwrap_or_else(|_| String::from_utf8_lossy(slice_b).encode_utf16().collect());
+    let loc_w = crate::strings::to_wide_z(&bcp47);
+    let flags = if ignore_case { 1 /* NORM_IGNORECASE */ } else { 0 };
+    let r = crate::kernel32::string::CompareStringEx(
+        loc_w.as_ptr(),
+        flags,
+        wa.as_ptr(),
+        wa.len() as i32,
+        wb.as_ptr(),
+        wb.len() as i32,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+    if r == 0 { 0 } else { r - 2 }
+}
+
 pub unsafe extern "win64" fn strcoll(a: *const u8, b: *const u8) -> i32 {
-    strcmp(a, b)
+    narrow_coll_impl(a, b, None, false)
 }
 pub unsafe extern "win64" fn _stricoll(a: *const u8, b: *const u8) -> i32 {
-    _stricmp(a, b)
+    narrow_coll_impl(a, b, None, true)
 }
 pub unsafe extern "win64" fn _strncoll(a: *const u8, b: *const u8, n: usize) -> i32 {
-    strncmp(a, b, n)
+    narrow_coll_impl(a, b, Some(n), false)
 }
 pub unsafe extern "win64" fn _strnicoll(a: *const u8, b: *const u8, n: usize) -> i32 {
-    _strnicmp(a, b, n)
+    narrow_coll_impl(a, b, Some(n), true)
 }
 pub unsafe extern "win64" fn strxfrm(d: *mut u8, s: *const u8, n: usize) -> usize {
-    let len = strlen(s);
+    let (is_c, cp, bcp47) = super::locale::collate_cp_and_bcp47(std::ptr::null_mut());
+    if is_c {
+        let len = strlen(s);
+        if len < n && !d.is_null() {
+            std::ptr::copy_nonoverlapping(s, d, len + 1);
+        }
+        return len;
+    }
+    let bytes = std::slice::from_raw_parts(s, strlen(s));
+    let w = crate::kernel32::string::decode_cp_to_utf16(cp, bytes)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).encode_utf16().collect());
+    let loc_w = crate::strings::to_wide_z(&bcp47);
+    const LCMAP_SORTKEY: u32 = 0x0000_0400;
+    let need = crate::kernel32::string::LCMapStringEx(
+        loc_w.as_ptr(),
+        LCMAP_SORTKEY,
+        w.as_ptr(),
+        w.len() as i32,
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+    if need <= 0 {
+        return 0;
+    }
+    let mut key = vec![0u8; need as usize];
+    crate::kernel32::string::LCMapStringEx(
+        loc_w.as_ptr(),
+        LCMAP_SORTKEY,
+        w.as_ptr(),
+        w.len() as i32,
+        key.as_mut_ptr() as *mut u16,
+        need,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+    let len = key.iter().position(|&b| b == 0).unwrap_or(key.len());
     if len < n && !d.is_null() {
-        std::ptr::copy_nonoverlapping(s, d, len + 1);
+        std::ptr::copy_nonoverlapping(key.as_ptr(), d, len);
+        *d.add(len) = 0;
     }
     len
 }
@@ -865,25 +943,96 @@ pub unsafe extern "win64" fn _wcsicmp_l(a: *const u16, b: *const u16, _l: *mut c
 pub unsafe extern "win64" fn _wcsnicmp_l(a: *const u16, b: *const u16, n: usize, _l: *mut c_void) -> i32 {
     _wcsnicmp(a, b, n)
 }
-pub unsafe extern "win64" fn wcscoll(a: *const u16, b: *const u16) -> i32 {
-    if c_locale_active() {
-        return wcscmp(a, b);
+unsafe fn wide_coll_impl(a: *const u16, b: *const u16, max: Option<usize>, ignore_case: bool) -> i32 {
+    let (is_c, _, bcp47) = super::locale::collate_cp_and_bcp47(std::ptr::null_mut());
+    if is_c {
+        return match (max, ignore_case) {
+            (None, false) => wcscmp(a, b),
+            (None, true) => _wcsicmp(a, b),
+            (Some(n), false) => wcsncmp(a, b, n),
+            (Some(n), true) => _wcsnicmp(a, b, n),
+        };
     }
-    crate::kernel32::string::CompareStringW(0x400, 0x1000, a, -1, b, -1) - 2
+    let la = match max {
+        Some(n) => wcsnlen(a, n) as i32,
+        None => wcslen(a) as i32,
+    };
+    let lb = match max {
+        Some(n) => wcsnlen(b, n) as i32,
+        None => wcslen(b) as i32,
+    };
+    let loc_w = crate::strings::to_wide_z(&bcp47);
+    let flags = if ignore_case { 1 /* NORM_IGNORECASE */ } else { 0 };
+    let r = crate::kernel32::string::CompareStringEx(
+        loc_w.as_ptr(),
+        flags,
+        a,
+        la,
+        b,
+        lb,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+    if r == 0 { 0 } else { r - 2 }
+}
+
+pub unsafe extern "win64" fn wcscoll(a: *const u16, b: *const u16) -> i32 {
+    wide_coll_impl(a, b, None, false)
 }
 pub unsafe extern "win64" fn _wcsicoll(a: *const u16, b: *const u16) -> i32 {
-    _wcsicmp(a, b)
+    wide_coll_impl(a, b, None, true)
 }
 pub unsafe extern "win64" fn _wcsncoll(a: *const u16, b: *const u16, n: usize) -> i32 {
-    wcsncmp(a, b, n)
+    wide_coll_impl(a, b, Some(n), false)
 }
 pub unsafe extern "win64" fn _wcsnicoll(a: *const u16, b: *const u16, n: usize) -> i32 {
-    _wcsnicmp(a, b, n)
+    wide_coll_impl(a, b, Some(n), true)
 }
 pub unsafe extern "win64" fn wcsxfrm(d: *mut u16, s: *const u16, n: usize) -> usize {
-    let len = wcslen(s);
+    let (is_c, _, bcp47) = super::locale::collate_cp_and_bcp47(std::ptr::null_mut());
+    if is_c {
+        let len = wcslen(s);
+        if len < n && !d.is_null() {
+            std::ptr::copy_nonoverlapping(s, d, len + 1);
+        }
+        return len;
+    }
+    let slen = wcslen(s);
+    let loc_w = crate::strings::to_wide_z(&bcp47);
+    const LCMAP_SORTKEY: u32 = 0x0000_0400;
+    let need = crate::kernel32::string::LCMapStringEx(
+        loc_w.as_ptr(),
+        LCMAP_SORTKEY,
+        s,
+        slen as i32,
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+    if need <= 0 {
+        return 0;
+    }
+    let mut key = vec![0u8; need as usize];
+    crate::kernel32::string::LCMapStringEx(
+        loc_w.as_ptr(),
+        LCMAP_SORTKEY,
+        s,
+        slen as i32,
+        key.as_mut_ptr() as *mut u16,
+        need,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+    let len = key.iter().position(|&b| b == 0).unwrap_or(key.len());
     if len < n && !d.is_null() {
-        std::ptr::copy_nonoverlapping(s, d, len + 1);
+        for (i, &b) in key[..len].iter().enumerate() {
+            *d.add(i) = b as u16;
+        }
+        *d.add(len) = 0;
     }
     len
 }
@@ -1208,6 +1357,20 @@ mod tests {
             assert_eq!(_tolower_l(b'I' as i32, l_tr), 0xFD);
             assert_eq!(toupper(b'i' as i32), b'I' as i32); // global "C" unchanged
             crate::ucrt::locale::_free_locale(l_tr);
+
+            // LC_COLLATE = de-DE sorts 'ä' (CP1252 0xE4) before 'b' (whereas C byte order puts 0xE4 > 'b').
+            assert!(!crate::ucrt::locale::setlocale(1 /* LC_COLLATE */, b"de-DE\0".as_ptr()).is_null());
+            assert!(strcoll(b"\xE4\0".as_ptr(), b"b\0".as_ptr()) < 0);
+            let wa: Vec<u16> = "ä\0".encode_utf16().collect();
+            let wb: Vec<u16> = "b\0".encode_utf16().collect();
+            assert!(wcscoll(wa.as_ptr(), wb.as_ptr()) < 0);
+            let mut ka = [0u8; 64];
+            let mut kb = [0u8; 64];
+            let la = strxfrm(ka.as_mut_ptr(), b"\xE4\0".as_ptr(), ka.len());
+            let lb = strxfrm(kb.as_mut_ptr(), b"b\0".as_ptr(), kb.len());
+            assert!(la > 0 && lb > 0 && strcmp(ka.as_ptr(), kb.as_ptr()) < 0);
+            assert!(!crate::ucrt::locale::setlocale(1, b"C\0".as_ptr()).is_null());
+            assert!(strcoll(b"\xE4\0".as_ptr(), b"b\0".as_ptr()) > 0);
         }
     }
     #[test]

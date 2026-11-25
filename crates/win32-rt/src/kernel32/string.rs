@@ -1454,18 +1454,36 @@ pub unsafe extern "win64" fn LCMapStringW(lcid: u32, flags: u32, src: LPCWSTR, n
 }
 
 pub unsafe extern "win64" fn LCMapStringA(lcid: u32, flags: u32, src: LPCSTR, n: i32, dst: LPSTR, cap: i32) -> i32 {
-    let bytes = if n < 0 { std::slice::from_raw_parts(src, strlen(src) + 1) } else { std::slice::from_raw_parts(src, n as usize) };
-    let w: Vec<u16> = String::from_utf8_lossy(bytes).encode_utf16().collect();
-    if flags & LCMAP_SORTKEY != 0 {
-        return LCMapStringW(lcid, flags, w.as_ptr(), w.len() as i32, dst as LPWSTR, cap);
+    if src.is_null() || n == 0 || cap < 0 || (cap > 0 && dst.is_null()) {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
     }
-    let need = LCMapStringW(lcid, flags, w.as_ptr(), w.len() as i32, std::ptr::null_mut(), 0);
+    const LOCALE_USE_CP_ACP_FLAG: u32 = 0x4000_0000;
+    let bytes = if n < 0 { std::slice::from_raw_parts(src, strlen(src) + 1) } else { std::slice::from_raw_parts(src, n as usize) };
+    let cp = if (flags & LOCALE_USE_CP_ACP_FLAG) != 0 {
+        ACP
+    } else {
+        resolve_lcid(lcid)
+            .and_then(|loc| locale_info_for(&loc, 0x1004))
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&c| c != 0 && valid_cp(c))
+            .unwrap_or(ACP)
+    };
+    let w = decode_cp_to_utf16(cp, bytes)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).encode_utf16().collect());
+    let inner_flags = flags & !LOCALE_USE_CP_ACP_FLAG;
+    if inner_flags & (LCMAP_SORTKEY | LCMAP_HASH) != 0 {
+        return LCMapStringW(lcid, inner_flags, w.as_ptr(), w.len() as i32, dst as LPWSTR, cap);
+    }
+    let need = LCMapStringW(lcid, inner_flags, w.as_ptr(), w.len() as i32, std::ptr::null_mut(), 0);
     if need <= 0 {
         return 0;
     }
     let mut out = vec![0u16; need as usize];
-    LCMapStringW(lcid, flags, w.as_ptr(), w.len() as i32, out.as_mut_ptr(), need);
-    let b = String::from_utf16_lossy(&out).into_bytes();
+    LCMapStringW(lcid, inner_flags, w.as_ptr(), w.len() as i32, out.as_mut_ptr(), need);
+    let b = encode_utf16_to_cp(cp, &out, Some(b'?'))
+        .map(|(v, _)| v)
+        .unwrap_or_else(|_| String::from_utf16_lossy(&out).into_bytes());
     if cap == 0 {
         return b.len() as i32;
     }
@@ -4114,6 +4132,20 @@ mod tests {
             // Insufficient buffer fails with ERROR_INSUFFICIENT_BUFFER.
             assert_eq!(
                 LCMapStringEx(en.as_ptr(), LCMAP_HASH, s_hi.as_ptr(), -1, &mut h1 as *mut u32 as LPWSTR, 2, std::ptr::null_mut(), std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(teb::last_error(), err::ERROR_INSUFFICIENT_BUFFER);
+
+            // LCMapStringA preserves raw 4-byte binary hash output without UTF-16->UTF-8 conversion.
+            assert_eq!(LCMapStringA(0x0409, LCMAP_HASH, b"Hello\0".as_ptr(), -1, std::ptr::null_mut(), 0), 4);
+            let mut ha = 0u32;
+            assert_eq!(
+                LCMapStringA(0x0409, LCMAP_HASH, b"Hello\0".as_ptr(), -1, &mut ha as *mut u32 as LPSTR, 4),
+                4
+            );
+            assert_eq!(ha, h3);
+            assert_eq!(
+                LCMapStringA(0x0409, LCMAP_HASH, b"Hello\0".as_ptr(), -1, &mut ha as *mut u32 as LPSTR, 2),
                 0
             );
             assert_eq!(teb::last_error(), err::ERROR_INSUFFICIENT_BUFFER);
