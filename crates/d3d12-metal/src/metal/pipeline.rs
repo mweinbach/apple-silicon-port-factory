@@ -35,7 +35,7 @@ pub use dxil_hk::{
 };
 pub use graphics::{
     depth_stencil_state, infer_vertex_input_format, vertex_buffer_index, GeometryEmulation,
-    GraphicsDesc, GraphicsPipeline, MtlDepthStencil, MAX_VERTEX_SLOTS,
+    GraphicsDesc, GraphicsPipeline, MtlDepthStencil, TessellationEmulation, MAX_VERTEX_SLOTS,
 };
 pub(crate) use opts::RenderPsoStateKey;
 pub use opts::{

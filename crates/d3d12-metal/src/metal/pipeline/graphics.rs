@@ -66,6 +66,25 @@ pub struct GeometryEmulation {
     pub instance_count: u32,
 }
 
+/// Metal 4 object+mesh tessellation emulation metadata attached to a [`GraphicsPipeline`]
+/// built via [`GraphicsPipeline::new_with_tessellation`] (VS+HS in object stage,
+/// tessellator+DS+(optional GS or passthrough) in mesh stage, optional PS in fragment stage).
+pub struct TessellationEmulation {
+    pub hs: Arc<CompiledShader>,
+    pub ds: Arc<CompiledShader>,
+    pub gs: Option<Arc<CompiledShader>>,
+    pub stage_in: Option<Arc<CompiledShader>>,
+    /// `IRTessellatorOutputPrimitive`: 1=Point, 2=Line, 3=TriangleCW, 4=TriangleCCW.
+    pub output_primitive: u32,
+    pub vs_output_size_in_bytes: u32,
+    pub gs_max_input_primitives_per_mesh_threadgroup: u32,
+    pub hs_max_patches_per_object_threadgroup: u32,
+    pub hs_input_control_point_count: u32,
+    pub hs_max_object_threads_per_patch: u32,
+    pub hs_max_tessellation_factor: f32,
+    pub gs_instance_count: u32,
+}
+
 pub struct GraphicsPipeline {
     pub pso: Retained<MtlRenderPipeline>,
     pub rs: Arc<RootSignature>,
@@ -117,6 +136,9 @@ pub struct GraphicsPipeline {
     /// Present when this pipeline emulates a D3D11/D3D12 geometry shader on a Metal 4
     /// mesh render pipeline (object = VS + linked stage-in, mesh = GS, fragment = PS).
     pub gs_emu: Option<GeometryEmulation>,
+    /// Present when this pipeline emulates D3D11/D3D12 Hull+Domain tessellation (+ optional GS)
+    /// on a Metal 4 mesh render pipeline.
+    pub tess_emu: Option<TessellationEmulation>,
     pub(crate) icb_desc: Option<(Retained<MTL4RenderPipelineDescriptor>, u128)>,
     pub(crate) icb_pso: OnceLock<Result<Retained<MtlRenderPipeline>, String>>,
 }
@@ -501,6 +523,419 @@ impl GraphicsPipeline {
                 max_input_primitives_per_mesh_threadgroup: max_input_prims,
                 instance_count: gs_instance_count,
             }),
+            tess_emu: None,
+            icb_desc: None,
+            icb_pso: OnceLock::new(),
+        })
+    }
+
+    /// Build a graphics pipeline that emulates D3D11/D3D12 Hull + Domain tessellation
+    /// (with an optional Geometry Shader) using Apple Metal Shader Converter's Metal 4
+    /// object+mesh tessellation emulation pipeline.
+    pub fn new_with_tessellation(
+        rs: Arc<RootSignature>,
+        d: &GraphicsDesc,
+        hs_dxil: &[u8],
+        ds_dxil: &[u8],
+        gs_dxil: Option<&[u8]>,
+        label: &str,
+    ) -> Result<GraphicsPipeline, String> {
+        Self::new_tessellation_in_cache(
+            pso_cache()?,
+            rs,
+            d,
+            hs_dxil,
+            ds_dxil,
+            gs_dxil,
+            label,
+            shader_immutable_opt(),
+            shader_pso_opt_v2(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_tessellation_in_cache(
+        cache: &PipelineCache,
+        rs: Arc<RootSignature>,
+        d: &GraphicsDesc,
+        hs_dxil: &[u8],
+        ds_dxil: &[u8],
+        gs_dxil: Option<&[u8]>,
+        label: &str,
+        immut_opt: bool,
+        pso_opt_v2: bool,
+    ) -> Result<GraphicsPipeline, String> {
+        let blend = crate::state::blend_state(&d.blend);
+        if !blend.unsupported_logic_ops.is_empty() {
+            log::warn!(
+                target: "d3d",
+                "tessellation PSO: unsupported logic ops {:?} (blending off)",
+                blend.unsupported_logic_ops.as_slice()
+            );
+        }
+        let mut vs_opts = CompileOptions::default();
+        vs_opts.geometry_tessellation_emulation = true;
+        vs_opts.stage_in_mode = StageInMode::SeparateFunction;
+        vs_opts.input_topology = Some(dxil_metal::InputTopology::Patch);
+        let vs = compile(ShaderStage::Vertex, d.vs, &rs, &vs_opts)?;
+        let StageInfo::Vertex { needs_draw_params, vertex_output_size_in_bytes, inputs, .. } =
+            &vs.reflection.info
+        else {
+            return Err(format!(
+                "tessellation PSO: vertex shader without vertex reflection: {:?}",
+                vs.reflection.info
+            ));
+        };
+        let vertex_output_size = *vertex_output_size_in_bytes;
+
+        let mut layout = d.input_layout.clone();
+        dxil_metal::compiler::resolve_append_aligned(
+            &mut layout,
+            crate::format_ext::vertex_format_size,
+        );
+        let mut vertex_slots = 0u32;
+        for inp in inputs {
+            if let Some(e) = layout
+                .iter()
+                .find(|e| semantic_matches(&inp.name, &e.semantic_name, e.semantic_index))
+            {
+                if e.input_slot < MAX_VERTEX_SLOTS {
+                    vertex_slots |= 1 << e.input_slot;
+                }
+            } else {
+                layout.push(InputElement {
+                    semantic_name: inp.name.clone(),
+                    semantic_index: 0,
+                    format: infer_vertex_input_format(d.vs, &inp.name),
+                    input_slot: MAX_VERTEX_SLOTS - 1,
+                    aligned_byte_offset: 0,
+                    input_slot_class: 1,
+                    instance_data_step_rate: 0,
+                });
+                vertex_slots |= 1 << (MAX_VERTEX_SLOTS - 1);
+            }
+        }
+        let stage_in = if !inputs.is_empty() || !layout.is_empty() {
+            let sp = ShaderPipeline::global().map_err(|e| format!("shader pipeline: {e}"))?;
+            Some(
+                sp.stage_in(&vs, &layout, &vs_opts)
+                    .map_err(|e| format!("stage-in synthesis: {e}"))?,
+            )
+        } else {
+            ShaderPipeline::global().ok().and_then(|sp| sp.stage_in(&vs, &[], &vs_opts).ok())
+        };
+
+        let mut hs_opts = CompileOptions::default();
+        hs_opts.geometry_tessellation_emulation = true;
+        hs_opts.input_topology = Some(dxil_metal::InputTopology::Patch);
+        let hs = compile(ShaderStage::Hull, hs_dxil, &rs, &hs_opts)?;
+        let StageInfo::Hull {
+            max_patches_per_object_threadgroup,
+            max_object_threads_per_patch,
+            input_control_point_count,
+            tessellator_output_primitive,
+            max_tessellation_factor,
+            ..
+        } = &hs.reflection.info
+        else {
+            return Err(format!(
+                "tessellation PSO: hull shader without hull reflection: {:?}",
+                hs.reflection.info
+            ));
+        };
+        let hs_max_patches = (*max_patches_per_object_threadgroup).max(1);
+        let hs_threads_per_patch = (*max_object_threads_per_patch).max(1);
+        let hs_input_cps = (*input_control_point_count).max(1);
+        let output_primitive = *tessellator_output_primitive;
+        let max_tess_factor = if max_tessellation_factor.is_finite() && *max_tessellation_factor > 0.0 {
+            *max_tessellation_factor
+        } else {
+            64.0
+        };
+
+        let mut ds_opts = CompileOptions::default();
+        ds_opts.geometry_tessellation_emulation = true;
+        let ds = compile(ShaderStage::Domain, ds_dxil, &rs, &ds_opts)?;
+        let ds_max_input_prims = match &ds.reflection.info {
+            StageInfo::Domain { max_input_prims_per_mesh_threadgroup, .. } => {
+                (*max_input_prims_per_mesh_threadgroup).max(1)
+            }
+            other => {
+                return Err(format!(
+                    "tessellation PSO: domain shader without domain reflection: {other:?}"
+                ));
+            }
+        };
+
+        let (gs, gs_max_input_prims, gs_instance_count) = match gs_dxil {
+            Some(gb) => {
+                let mut gs_opts = CompileOptions::default();
+                gs_opts.geometry_tessellation_emulation = true;
+                let g = compile(ShaderStage::Geometry, gb, &rs, &gs_opts)?;
+                let (mp, ic) = match &g.reflection.info {
+                    StageInfo::Geometry {
+                        max_input_primitives_per_mesh_threadgroup,
+                        instance_count,
+                        ..
+                    } => ((*max_input_primitives_per_mesh_threadgroup).max(1), (*instance_count).max(1)),
+                    other => {
+                        return Err(format!(
+                            "tessellation PSO: geometry shader without geometry reflection: {other:?}"
+                        ));
+                    }
+                };
+                (Some(g), mp, ic)
+            }
+            None => (None, ds_max_input_prims, 1),
+        };
+
+        let mut ps_opts = crate::state::pixel_compile_options(&blend, &d.rtv_formats);
+        let full =
+            if d.sample_count >= 32 { u32::MAX } else { (1u32 << d.sample_count.max(1)) - 1 };
+        if d.sample_mask & full != full {
+            ps_opts.sample_mask = Some(d.sample_mask);
+        }
+        let ps = match d.ps {
+            Some(b) => Some(compile(ShaderStage::Fragment, b, &rs, &ps_opts)?),
+            None => None,
+        };
+
+        let desc = MTL4MeshRenderPipelineDescriptor::new();
+        let vlib = library(&vs)?;
+        let hlib = library(&hs)?;
+        let dlib = library(&ds)?;
+
+        // Object stage: VS wrapper specialized with tessellationEnabled = true,
+        // statically linked with stage-in function + irconverter_hull_shader.
+        let tess_on: [u8; 1] = [1];
+        let obj_name = format!("{}.dxil_irconverter_object_shader", vs.function_name);
+        let obj_fn = specialized_function_descriptor(
+            &vlib,
+            &obj_name,
+            &vs,
+            &[("tessellationEnabled", MTLDataType::Bool, &tess_on)],
+        );
+        desc.setObjectFunctionDescriptor(Some(&obj_fn));
+
+        let vs_out_bytes = (vertex_output_size as i32).to_ne_bytes();
+        let max_tess_bytes = max_tess_factor.to_ne_bytes();
+        let hull_fn = specialized_function_descriptor(
+            &hlib,
+            "irconverter_hull_shader",
+            &hs,
+            &[
+                ("vertex_shader_output_size_fc", MTLDataType::Int, &vs_out_bytes),
+                ("max_tessellation_factor_fc", MTLDataType::Float, &max_tess_bytes),
+            ],
+        );
+        let mut obj_linked: Vec<Retained<MTL4FunctionDescriptor>> = Vec::with_capacity(2);
+        if let Some(si) = &stage_in {
+            let silib = library(si)?;
+            obj_linked.push(Retained::into_super(function_descriptor(&silib, &si.function_name)));
+        }
+        obj_linked.push(hull_fn);
+        let obj_linking = MTL4StaticLinkingDescriptor::new();
+        obj_linking.setFunctionDescriptors(Some(&NSArray::from_retained_slice(&obj_linked)));
+        desc.setObjectStaticLinkingDescriptor(Some(&obj_linking));
+
+        // Mesh stage: either real GS (tessellationEnabled = true) or MSC's passthrough
+        // geometry shader inside domainLibrary, statically linked with irconverter_tessellator
+        // + irconverter_dxil_domain_shader.
+        let mesh_fn = if let Some(g) = &gs {
+            let glib = library(g)?;
+            let so_off: [u8; 1] = [0];
+            specialized_function_descriptor(
+                &glib,
+                &g.function_name,
+                g,
+                &[
+                    ("tessellationEnabled", MTLDataType::Bool, &tess_on),
+                    ("streamOutEnabled", MTLDataType::Bool, &so_off),
+                    ("vertex_shader_output_size_fc", MTLDataType::Int, &vs_out_bytes),
+                ],
+            )
+        } else {
+            let passthrough_name = match output_primitive {
+                1 => dxil_metal::runtime::POINT_PASSTHROUGH_GEOMETRY_SHADER,
+                2 => dxil_metal::runtime::LINE_PASSTHROUGH_GEOMETRY_SHADER,
+                _ => dxil_metal::runtime::TRIANGLE_PASSTHROUGH_GEOMETRY_SHADER,
+            };
+            Retained::into_super(function_descriptor(&dlib, passthrough_name))
+        };
+        desc.setMeshFunctionDescriptor(Some(&mesh_fn));
+
+        let tess_fn = specialized_function_descriptor(
+            &hlib,
+            "irconverter_tessellator",
+            &hs,
+            &[
+                ("vertex_shader_output_size_fc", MTLDataType::Int, &vs_out_bytes),
+                ("max_tessellation_factor_fc", MTLDataType::Float, &max_tess_bytes),
+            ],
+        );
+        let domain_fn: Retained<MTL4FunctionDescriptor> =
+            Retained::into_super(function_descriptor(&dlib, "irconverter_dxil_domain_shader"));
+        let mesh_linked = NSArray::from_retained_slice(&[tess_fn, domain_fn]);
+        let mesh_linking = MTL4StaticLinkingDescriptor::new();
+        mesh_linking.setFunctionDescriptors(Some(&mesh_linked));
+        desc.setMeshStaticLinkingDescriptor(Some(&mesh_linking));
+
+        if let Some(ps) = &ps {
+            let plib = library(ps)?;
+            desc.setFragmentFunctionDescriptor(Some(&shader_function_descriptor(&plib, ps)));
+        }
+
+        if !label.is_empty() {
+            desc.setLabel(Some(&NSString::from_str(label)));
+        }
+        desc.setPayloadMemoryLength(16384);
+        desc.setMaxTotalThreadgroupsPerMeshGrid(crate::mesh::MAX_MESH_GRID_THREADGROUPS as usize);
+        if immut_opt {
+            apply_immutable_pipeline_options(&desc);
+            desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Disabled);
+            desc.setSupportObjectBinaryLinking(false);
+            desc.setSupportMeshBinaryLinking(false);
+            desc.setSupportFragmentBinaryLinking(false);
+            desc.setColorAttachmentMappingState(
+                MTL4LogicalToPhysicalColorAttachmentMappingState::Identity,
+            );
+        }
+        if pso_opt_v2 {
+            unsafe { desc.setMaxVertexAmplificationCount(1) };
+            desc.setAlphaToOneState(MTL4AlphaToOneState::Disabled);
+        }
+
+        let ca = desc.colorAttachments();
+        for (i, f) in d.rtv_formats.iter().enumerate().take(8) {
+            let a = unsafe { ca.objectAtIndexedSubscript(i) };
+            let pf = crate::format::info(*f).mtl;
+            a.setPixelFormat(pf);
+            if pf != MTLPixelFormat::Invalid {
+                blend.attachments[i].apply_to_with_opt(&a, pso_opt_v2);
+            }
+        }
+        unsafe { desc.setRasterSampleCount(d.sample_count.max(1) as usize) };
+        desc.setAlphaToCoverageState(if blend.alpha_to_coverage {
+            MTL4AlphaToCoverageState::Enabled
+        } else {
+            MTL4AlphaToCoverageState::Disabled
+        });
+
+        let mut key = dxil_metal::hash::KeyHasher::new("d3d12-metal tess-emu pso v1");
+        key.u128(vs.key)
+            .u128(hs.key)
+            .u128(ds.key)
+            .u128(gs.as_ref().map_or(0, |g| g.key))
+            .u128(stage_in.as_ref().map_or(0, |s| s.key))
+            .u128(ps.as_ref().map_or(0, |p| p.key))
+            .u32(vertex_output_size)
+            .u32(output_primitive)
+            .u32(max_tess_factor.to_bits());
+        RenderPsoStateKey::new(blend, &d.rtv_formats, d.sample_count, d.topology_type)
+            .write_to(&mut key);
+        let mut pso_key = key.finish();
+        if immut_opt {
+            pso_key ^= IMMUTABLE_OPT_KEY_SALT;
+        }
+        if pso_opt_v2 {
+            pso_key ^= SHADER_PSO_OPT_V2_SALT;
+        }
+        let pso = cache
+            .render_pipeline(Some(pso_key), &desc)
+            .map_err(|e| format!("tessellation render pipeline: {e}"))?;
+
+        let ds_state = if d.dsv_format == 0 {
+            DepthStencilState::without_depth_stencil()
+        } else {
+            d.depth_stencil
+        };
+        let vs_sum = ShaderStageSummary::new(d.vs, &vs, &rs);
+        let hs_sum = ShaderStageSummary::new(hs_dxil, &hs, &rs);
+        let ds_sum = ShaderStageSummary::new(ds_dxil, &ds, &rs);
+        let gs_sum = gs.as_ref().zip(gs_dxil).map(|(g, b)| (g, ShaderStageSummary::new(b, g, &rs)));
+        let ps_sum = ps.as_ref().zip(d.ps).map(|(p, b)| (p, b, ShaderStageSummary::new(b, p, &rs)));
+        let pre_raster_reads = vs_sum.stage_reads_resources(&vs, pso_opt_v2)
+            | hs_sum.stage_reads_resources(&hs, pso_opt_v2)
+            | ds_sum.stage_reads_resources(&ds, pso_opt_v2)
+            | gs_sum.as_ref().map_or(0, |(g, s)| s.stage_reads_resources(g, pso_opt_v2));
+        let vs_writes_uav = vs_sum.shader_writes_uav(true)
+            || hs_sum.shader_writes_uav(true)
+            || ds_sum.shader_writes_uav(true)
+            || gs_sum.as_ref().is_some_and(|(_, s)| s.shader_writes_uav(true));
+        let ps_writes_uav = ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_uav(true));
+        let writes_uav = vs_writes_uav || ps_writes_uav;
+        let (ps_srv_uav_classes, ps_read_classes) = match &ps_sum {
+            Some((p, _, s)) => {
+                let srv_uav = s.stage_srv_uav_classes(p, &rs, true);
+                let mut m = srv_uav;
+                if s.stage_may_read_cbv(&rs, true) {
+                    m |= READS_BUF;
+                }
+                (srv_uav, m)
+            }
+            None => (0, 0),
+        };
+        let uses_uav = writes_uav
+            || vs_sum.shader_uses_uav(&rs)
+            || hs_sum.shader_uses_uav(&rs)
+            || ds_sum.shader_uses_uav(&rs)
+            || gs_sum.as_ref().is_some_and(|(_, s)| s.shader_uses_uav(&rs))
+            || ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_uses_uav(&rs));
+        let (vs_access, vs_hk_profile) = vs_sum.for_stage(d.vs, &rs, &vs, true);
+        let (ps_access, ps_hk_profile) = match &ps_sum {
+            Some((p, b, s)) => {
+                let (acc, hk) = s.for_stage(b, &rs, p, false);
+                (Some(acc), Some(hk))
+            }
+            None => (None, None),
+        };
+        Ok(GraphicsPipeline {
+            pso,
+            rs,
+            raster: d.raster,
+            blend,
+            depth_stencil: depth_stencil_state(&ds_state)?,
+            depth_bounds: ds_state.depth_bounds,
+            needs_draw_params: *needs_draw_params,
+            topology_type: d.topology_type,
+            strip_cut: d.strip_cut,
+            rtv_formats: d.rtv_formats.clone(),
+            dsv_format: d.dsv_format,
+            sample_count: d.sample_count.max(1),
+            vertex_slots,
+            pre_raster_reads,
+            vs_reads_cbv_or_ia: true,
+            writes_uav,
+            sm66_pre_raster_reads: pre_raster_reads,
+            sm66_vs_reads_cbv_or_ia: true,
+            sm66_writes_uav: writes_uav,
+            sm66_narrowed: false,
+            vs_writes_uav,
+            ps_writes_uav,
+            ps_read_classes,
+            ps_srv_uav_classes,
+            uses_uav,
+            vs_access,
+            ps_access,
+            vs_hk_profile,
+            ps_hk_profile,
+            vs,
+            ps,
+            gs_emu: None,
+            tess_emu: Some(TessellationEmulation {
+                hs,
+                ds,
+                gs,
+                stage_in,
+                output_primitive,
+                vs_output_size_in_bytes: vertex_output_size,
+                gs_max_input_primitives_per_mesh_threadgroup: gs_max_input_prims,
+                hs_max_patches_per_object_threadgroup: hs_max_patches,
+                hs_input_control_point_count: hs_input_cps,
+                hs_max_object_threads_per_patch: hs_threads_per_patch,
+                hs_max_tessellation_factor: max_tess_factor,
+                gs_instance_count,
+            }),
             icb_desc: None,
             icb_pso: OnceLock::new(),
         })
@@ -842,6 +1277,7 @@ impl GraphicsPipeline {
             vs: vs.clone(),
             ps,
             gs_emu: None,
+            tess_emu: None,
             icb_desc,
             icb_pso: OnceLock::new(),
         })
