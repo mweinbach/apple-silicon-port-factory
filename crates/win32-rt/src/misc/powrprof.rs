@@ -960,18 +960,10 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             STATUS_NOT_IMPLEMENTED
         }
         VERIFY_SYSTEM_POLICY_AC | VERIFY_SYSTEM_POLICY_DC => {
-            if in_buf.is_null() || in_len < SYSTEM_POWER_POLICY_SIZE {
-                return STATUS_INVALID_PARAMETER;
-            }
-            if out_buf.is_null() || out_len < SYSTEM_POWER_POLICY_SIZE {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            std::ptr::copy_nonoverlapping(
-                in_buf as *const u8,
-                out_buf as *mut u8,
-                SYSTEM_POWER_POLICY_SIZE as usize,
+            log::warn!(
+                "powrprof: CallNtPowerInformation(VerifySystemPolicy level={info_level}) is unsupported"
             );
-            STATUS_SUCCESS
+            STATUS_NOT_IMPLEMENTED
         }
         SYSTEM_POWER_CAPABILITIES => {
             if out_buf.is_null() || out_len < 76 {
@@ -1076,18 +1068,10 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             STATUS_NOT_IMPLEMENTED
         }
         VERIFY_PROCESSOR_POLICY_AC | VERIFY_PROCESSOR_POLICY_DC => {
-            if in_buf.is_null() || in_len < PROCESSOR_POWER_POLICY_SIZE {
-                return STATUS_INVALID_PARAMETER;
-            }
-            if out_buf.is_null() || out_len < PROCESSOR_POWER_POLICY_SIZE {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            std::ptr::copy_nonoverlapping(
-                in_buf as *const u8,
-                out_buf as *mut u8,
-                PROCESSOR_POWER_POLICY_SIZE as usize,
+            log::warn!(
+                "powrprof: CallNtPowerInformation(VerifyProcessorPolicy level={info_level}) is unsupported"
             );
-            STATUS_SUCCESS
+            STATUS_NOT_IMPLEMENTED
         }
         SYSTEM_WAKE_SOURCE | SYSTEM_HIBER_FILE_SIZE | SYSTEM_HIBER_FILE_INFORMATION => {
             if out_buf.is_null() || out_len < 4 {
@@ -1759,6 +1743,43 @@ mod tests {
                 ),
                 STATUS_INVALID_PARAMETER
             );
+
+            // Verify*Policy* levels are documented as unsupported by CallNtPowerInformation
+            // and must fail with STATUS_NOT_IMPLEMENTED without echoing input into out_buf.
+            for lvl in [VERIFY_SYSTEM_POLICY_AC, VERIFY_SYSTEM_POLICY_DC] {
+                let mut verify_out = [0x66u8; 232];
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_sys.as_ptr() as *const c_void,
+                        custom_sys.len() as u32,
+                        verify_out.as_mut_ptr() as *mut c_void,
+                        verify_out.len() as u32,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert!(
+                    verify_out.iter().all(|&b| b == 0x66),
+                    "unsupported VerifySystemPolicy level {lvl} must not echo input into out_buf"
+                );
+            }
+            for lvl in [VERIFY_PROCESSOR_POLICY_AC, VERIFY_PROCESSOR_POLICY_DC] {
+                let mut verify_out = [0x77u8; 76];
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_proc.as_ptr() as *const c_void,
+                        custom_proc.len() as u32,
+                        verify_out.as_mut_ptr() as *mut c_void,
+                        verify_out.len() as u32,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert!(
+                    verify_out.iter().all(|&b| b == 0x77),
+                    "unsupported VerifyProcessorPolicy level {lvl} must not echo input into out_buf"
+                );
+            }
 
             // Privileged admin-only level returns STATUS_ACCESS_DENIED; unknown returns STATUS_INVALID_PARAMETER.
             assert_eq!(
