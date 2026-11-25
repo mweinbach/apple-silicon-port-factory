@@ -3114,9 +3114,11 @@ pub unsafe extern "win64" fn BCryptOpenAlgorithmProvider(out: *mut *mut c_void, 
         log::debug!("BCryptOpenAlgorithmProvider({name:?}, flags 0x{flags:x}) -> STATUS_NOT_FOUND");
         return STATUS_NOT_FOUND;
     };
+    // Per Microsoft Learn (CNG Property Identifiers - BCRYPT_MESSAGE_BLOCK_LENGTH),
+    // block ciphers default to 1-byte feedback (CFB8) until explicitly overridden.
     let (mode, msg_block_len) = match kind {
-        AlgKind::Symmetric(s) => (s.default_mode(), s.block_size() as u32),
-        _ => (CipherMode::Cbc, 16),
+        AlgKind::Symmetric(s) => (s.default_mode(), if s.block_size() > 0 { 1 } else { 0 }),
+        _ => (CipherMode::Cbc, 1),
     };
     let ecc_curve = match kind {
         AlgKind::Ecc { curve, .. } => curve,
@@ -5127,6 +5129,13 @@ mod tests {
             assert_eq!(BCryptDestroyKey(h_ecb), STATUS_SUCCESS);
 
             // --- NIST SP 800-38A AES-128-CFB128 (F.3.13) ---
+            // Default MessageBlockLength on block ciphers must be 1 byte (CFB8)
+            let mut default_mbl = 0u32;
+            assert_eq!(
+                BCryptGetProperty(h_alg, w("MessageBlockLength").as_ptr(), &mut default_mbl as *mut u32 as *mut u8, 4, &mut got, 0),
+                STATUS_SUCCESS
+            );
+            assert_eq!(default_mbl, 1);
             let mode_cfb = wbytes("ChainingModeCFB");
             assert_eq!(BCryptSetProperty(h_alg, w("ChainingMode").as_ptr(), mode_cfb.as_ptr(), mode_cfb.len() as u32, 0), STATUS_SUCCESS);
             let mbl16 = 16u32.to_le_bytes();
@@ -5810,6 +5819,25 @@ mod tests {
             assert_eq!(BCryptDecrypt(h_des, ct.as_ptr(), 8, std::ptr::null_mut(), std::ptr::null_mut(), 0, dec.as_mut_ptr(), 8, &mut out_len, 0), STATUS_SUCCESS);
             assert_eq!(dec.as_slice(), des_pt.as_slice());
             assert_eq!(BCryptDestroyKey(h_des), STATUS_SUCCESS);
+            // Default DES MessageBlockLength must be 1 byte (CFB8) and differ from explicit CFB64
+            let mut des_mbl = 0u32;
+            let mut des_got = 0u32;
+            assert_eq!(BCryptGetProperty(h_des_alg, w("MessageBlockLength").as_ptr(), &mut des_mbl as *mut u32 as *mut u8, 4, &mut des_got, 0), STATUS_SUCCESS);
+            assert_eq!(des_mbl, 1);
+            let mode_cfb = wbytes("ChainingModeCFB");
+            assert_eq!(BCryptSetProperty(h_des_alg, w("ChainingMode").as_ptr(), mode_cfb.as_ptr(), mode_cfb.len() as u32, 0), STATUS_SUCCESS);
+            let mut h_des_cfb8 = std::ptr::null_mut();
+            assert_eq!(BCryptGenerateSymmetricKey(h_des_alg, &mut h_des_cfb8, std::ptr::null_mut(), 0, des_key.as_ptr(), 8, 0), STATUS_SUCCESS);
+            let mut iv_cfb8 = hex("1234567890abcdef");
+            let mut ct_cfb8 = [0u8; 8];
+            assert_eq!(BCryptEncrypt(h_des_cfb8, des_pt.as_ptr(), 8, std::ptr::null_mut(), iv_cfb8.as_mut_ptr(), 8, ct_cfb8.as_mut_ptr(), 8, &mut out_len, 0), STATUS_SUCCESS);
+            let mbl8 = 8u32.to_le_bytes();
+            assert_eq!(BCryptSetProperty(h_des_cfb8, w("MessageBlockLength").as_ptr(), mbl8.as_ptr(), 4, 0), STATUS_SUCCESS);
+            let mut iv_cfb64 = hex("1234567890abcdef");
+            let mut ct_cfb64 = [0u8; 8];
+            assert_eq!(BCryptEncrypt(h_des_cfb8, des_pt.as_ptr(), 8, std::ptr::null_mut(), iv_cfb64.as_mut_ptr(), 8, ct_cfb64.as_mut_ptr(), 8, &mut out_len, 0), STATUS_SUCCESS);
+            assert_ne!(ct_cfb8, ct_cfb64, "default DES-CFB8 must differ from explicit DES-CFB64");
+            assert_eq!(BCryptDestroyKey(h_des_cfb8), STATUS_SUCCESS);
             assert_eq!(BCryptCloseAlgorithmProvider(h_des_alg, 0), STATUS_SUCCESS);
 
             // --- 3DES & 3DES_112 CBC + PKCS7 + OpaqueKeyBlob v2 roundtrip ---

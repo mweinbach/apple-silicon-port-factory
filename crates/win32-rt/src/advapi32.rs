@@ -3185,6 +3185,14 @@ fn capi_default_provider_name(prov_type: u32) -> &'static str {
     }
 }
 
+fn capi_provider_default_rc_key_len(prov_name: &str) -> usize {
+    if prov_name.to_ascii_lowercase().starts_with("microsoft base cryptographic provider") {
+        5 // 40-bit default for Microsoft Base Cryptographic Provider
+    } else {
+        16 // 128-bit default for Strong / Enhanced / AES providers
+    }
+}
+
 #[derive(Clone)]
 struct StoredUserKey {
     key: RsaKey,
@@ -4107,9 +4115,13 @@ pub unsafe extern "win64" fn CryptGenKey(
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
     std::ptr::write_unaligned(ph_key, 0);
-    if !capi_providers().lock().unwrap().contains_key(&h_prov) {
-        return err(NTE_BAD_UID, FALSE);
-    }
+    let prov_name = {
+        let provs = capi_providers().lock().unwrap();
+        let Some(p) = provs.get(&h_prov) else {
+            return err(NTE_BAD_UID, FALSE);
+        };
+        p.prov_name.clone()
+    };
     let exportable = (dw_flags & CRYPT_EXPORTABLE) != 0;
     let req_bits = dw_flags >> 16;
 
@@ -4166,7 +4178,7 @@ pub unsafe extern "win64" fn CryptGenKey(
         SymAlg::Des3 => 24,
         SymAlg::Rc2 => {
             if req_bits == 0 {
-                default_len
+                capi_provider_default_rc_key_len(&prov_name)
             } else if req_bits % 8 == 0 && (40..=1024).contains(&req_bits) {
                 (req_bits / 8) as usize
             } else {
@@ -4175,7 +4187,7 @@ pub unsafe extern "win64" fn CryptGenKey(
         }
         SymAlg::Rc4 => {
             if req_bits == 0 {
-                default_len
+                capi_provider_default_rc_key_len(&prov_name)
             } else if req_bits % 8 == 0 && (40..=2048).contains(&req_bits) {
                 (req_bits / 8) as usize
             } else {
@@ -4218,9 +4230,13 @@ pub unsafe extern "win64" fn CryptDeriveKey(
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
     std::ptr::write_unaligned(ph_key, 0);
-    if !capi_providers().lock().unwrap().contains_key(&h_prov) {
-        return err(NTE_BAD_UID, FALSE);
-    }
+    let prov_name = {
+        let provs = capi_providers().lock().unwrap();
+        let Some(p) = provs.get(&h_prov) else {
+            return err(NTE_BAD_UID, FALSE);
+        };
+        p.prov_name.clone()
+    };
     let Some((sym_alg, default_len)) = capi_alg_to_sym(alg_id) else {
         return err(NTE_BAD_ALGID, FALSE);
     };
@@ -4250,7 +4266,7 @@ pub unsafe extern "win64" fn CryptDeriveKey(
         SymAlg::Des3 => 24,
         SymAlg::Rc2 | SymAlg::Rc4 => {
             if req_bits == 0 {
-                default_len
+                capi_provider_default_rc_key_len(&prov_name)
             } else if req_bits % 8 == 0 && (40..=128).contains(&req_bits) {
                 (req_bits / 8) as usize
             } else {
@@ -7561,6 +7577,42 @@ mod tests {
             assert_eq!(CryptDecrypt(hk_base_reloaded, 0, TRUE, 0, base_ct.as_mut_ptr(), &mut base_ct_len), TRUE);
             assert_eq!(&base_ct[..base_ct_len as usize], base_msg);
             assert_eq!(CryptDestroyKey(hk_base_reloaded), TRUE);
+
+            // Base CSP defaults RC2/RC4 to 40 bits (with 11-byte zero salt), whereas Enhanced defaults to 128 bits
+            let mut h_base_rc2 = 0usize;
+            assert_eq!(CryptGenKey(hp_base, CALG_RC2, 0, &mut h_base_rc2), TRUE);
+            let mut kbits = 0u32;
+            let mut kblen = 4u32;
+            assert_eq!(CryptGetKeyParam(h_base_rc2, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
+            assert_eq!(kbits, 40);
+            assert_eq!(CryptDestroyKey(h_base_rc2), TRUE);
+
+            let mut h_base_md5 = 0usize;
+            assert_eq!(CryptCreateHash(hp_base, CALG_MD5, 0, 0, &mut h_base_md5), TRUE);
+            assert_eq!(CryptHashData(h_base_md5, b"password".as_ptr(), 8, 0), TRUE);
+            let mut h_base_rc4 = 0usize;
+            assert_eq!(CryptDeriveKey(hp_base, CALG_RC4, h_base_md5, 0, &mut h_base_rc4), TRUE);
+            kblen = 4;
+            assert_eq!(CryptGetKeyParam(h_base_rc4, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
+            assert_eq!(kbits, 40);
+            let mut base_salt = [0xAAu8; 16];
+            let mut base_slen = 16u32;
+            assert_eq!(CryptGetKeyParam(h_base_rc4, KP_SALT, base_salt.as_mut_ptr(), &mut base_slen, 0), TRUE);
+            assert_eq!(base_slen, 11);
+            assert_eq!(&base_salt[..11], &[0u8; 11]);
+            assert_eq!(CryptDestroyKey(h_base_rc4), TRUE);
+            assert_eq!(CryptDestroyHash(h_base_md5), TRUE);
+
+            let mut hp_enh_v = 0usize;
+            assert_eq!(CryptAcquireContextW(&mut hp_enh_v, std::ptr::null(), csp_enh.as_ptr(), 1, CRYPT_VERIFYCONTEXT), TRUE);
+            let mut h_enh_rc4_gen = 0usize;
+            assert_eq!(CryptGenKey(hp_enh_v, CALG_RC4, 0, &mut h_enh_rc4_gen), TRUE);
+            kblen = 4;
+            assert_eq!(CryptGetKeyParam(h_enh_rc4_gen, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
+            assert_eq!(kbits, 128);
+            assert_eq!(CryptDestroyKey(h_enh_rc4_gen), TRUE);
+            assert_eq!(CryptReleaseContext(hp_enh_v, 0), TRUE);
+
             assert_eq!(CryptReleaseContext(hp_base, 0), TRUE);
             assert_eq!(CryptAcquireContextW(&mut hp_base, shared_cname.as_ptr(), csp_base.as_ptr(), 1, CRYPT_DELETEKEYSET), TRUE);
 
