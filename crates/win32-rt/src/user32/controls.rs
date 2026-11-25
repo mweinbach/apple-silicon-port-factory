@@ -265,6 +265,26 @@ pub(crate) fn apply_native_edit_constraints(
         suffix += 1;
     }
 
+    // Keep prefix/suffix boundaries aligned to whole UTF-16 surrogate pairs and
+    // CRLF pairs so case conversion or filtering never splits a character.
+    let splits_pair = |slice: &[u16], idx: usize| -> bool {
+        if idx == 0 || idx >= slice.len() {
+            return false;
+        }
+        let a = slice[idx - 1];
+        let b = slice[idx];
+        ((0xD800..=0xDBFF).contains(&a) && (0xDC00..=0xDFFF).contains(&b))
+            || (a == b'\r' as u16 && b == b'\n' as u16)
+    };
+    while prefix > 0 && (splits_pair(prev, prefix) || splits_pair(next, prefix)) {
+        prefix -= 1;
+    }
+    while suffix > 0
+        && (splits_pair(prev, prev.len() - suffix) || splits_pair(next, next.len() - suffix))
+    {
+        suffix -= 1;
+    }
+
     let raw_inserted = &next[prefix..next.len() - suffix];
     let mut inserted: Vec<u16> = Vec::with_capacity(raw_inserted.len());
 
@@ -1021,6 +1041,14 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
                             return 0;
                         }
                         lo -= 1;
+                        // Treat CRLF and UTF-16 surrogate pairs as one editing unit.
+                        if lo > 0
+                            && ((text[lo - 1] == b'\r' as u16 && text[lo] == b'\n' as u16)
+                                || ((0xD800..=0xDBFF).contains(&text[lo - 1])
+                                    && (0xDC00..=0xDFFF).contains(&text[lo])))
+                        {
+                            lo -= 1;
+                        }
                     }
                     text.drain(lo..hi);
                     window::set_internal_text(h, text);
@@ -1078,6 +1106,14 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
                     return 0;
                 }
                 hi += 1;
+                // Treat CRLF and UTF-16 surrogate pairs as one editing unit.
+                if hi < text.len()
+                    && ((text[hi - 1] == b'\r' as u16 && text[hi] == b'\n' as u16)
+                        || ((0xD800..=0xDBFF).contains(&text[hi - 1])
+                            && (0xDC00..=0xDFFF).contains(&text[hi])))
+                {
+                    hi += 1;
+                }
             }
             text.drain(lo..hi);
             window::set_internal_text(h, text);
@@ -2898,6 +2934,37 @@ mod tests {
             assert_eq!(String::from_utf16_lossy(&buf[..n2]), "a\r\nXb");
             SendMessageW(edit, wm::EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM);
             assert_eq!((s, e), (4, 4));
+
+            // Backspace right after CRLF removes the entire \r\n pair in one step.
+            assert_eq!(SetWindowTextW(edit, crate::strings::to_wide_z("a\r\nb").as_ptr()), TRUE);
+            SendMessageW(edit, wm::EM_SETSEL, 3, 3);
+            SendMessageW(edit, wm::CHAR, 0x08, 0);
+            let n3 = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n3]), "ab");
+            assert_eq!(SendMessageW(edit, wm::EM_GETLINECOUNT, 0, 0), 1);
+            SendMessageW(edit, wm::EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM);
+            assert_eq!((s, e), (1, 1));
+
+            // Delete right before CRLF removes the entire \r\n pair in one step.
+            assert_eq!(SetWindowTextW(edit, crate::strings::to_wide_z("a\r\nb").as_ptr()), TRUE);
+            SendMessageW(edit, wm::EM_SETSEL, 1, 1);
+            SendMessageW(edit, wm::KEYDOWN, VK_DELETE, 0);
+            let n4 = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n4]), "ab");
+            assert_eq!(SendMessageW(edit, wm::EM_GETLINECOUNT, 0, 0), 1);
+            SendMessageW(edit, wm::EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM);
+            assert_eq!((s, e), (1, 1));
+
+            // Replacing a supplementary character sharing its high surrogate under
+            // ES_UPPERCASE / ES_LOWERCASE must keep the whole surrogate pair intact.
+            let prev_emoji: Vec<u16> = "😀".encode_utf16().collect();
+            let next_emoji: Vec<u16> = "😁".encode_utf16().collect();
+            for st in [ES_UPPERCASE, ES_LOWERCASE] {
+                let norm = apply_native_edit_constraints(&prev_emoji, &next_emoji, 2, 2, st, 0);
+                assert_eq!(norm.units, next_emoji);
+                assert!(norm.text_changed);
+                assert!(!norm.reconcile_native);
+            }
 
             assert_eq!(DestroyWindow(parent), TRUE);
             assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);
