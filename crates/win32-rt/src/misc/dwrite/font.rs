@@ -296,21 +296,37 @@ impl FontFaceInner {
         }
     }
 
-    fn glyph_metrics(&self, gid: u16) -> DWRITE_GLYPH_METRICS {
+    pub(super) fn glyph_metrics(&self, gid: u16) -> DWRITE_GLYPH_METRICS {
         let m = &self.meta.metrics;
-        let adv_h = (m.ascent as u32) + (m.descent as u32);
-        let v_origin = m.ascent as i32;
+        let default_adv_h = (m.ascent as u32) + (m.descent as u32);
+        let default_v_origin = m.ascent as i32;
 
         if let Some(ref sfnt) = self.sfnt {
             if let Some((adv_w, lsb)) = sfnt.hmtx(gid) {
-                let (rsb, tsb, bsb) = if let Some((xmin, ymin, xmax, ymax)) = sfnt.glyph_bbox(gid) {
+                let bbox = sfnt.glyph_bbox(gid);
+                let rsb = if let Some((xmin, _, xmax, _)) = bbox {
                     let bw = (xmax as i32) - (xmin as i32);
-                    let r = (adv_w as i32) - (lsb as i32) - bw;
+                    (adv_w as i32) - (lsb as i32) - bw
+                } else {
+                    0
+                };
+                let (adv_h, tsb, bsb, v_origin) = if let Some((vm_adv_h, vm_tsb)) = sfnt.vmtx(gid) {
+                    let ah = vm_adv_h as u32;
+                    let t = vm_tsb as i32;
+                    if let Some((_, ymin, _, ymax)) = bbox {
+                        let bh = (ymax as i32) - (ymin as i32);
+                        let b = (ah as i32) - t - bh;
+                        let vo = (ymax as i32) + t;
+                        (ah, t, b, vo)
+                    } else {
+                        (ah, t, (m.descent as i32) / 2, default_v_origin)
+                    }
+                } else if let Some((_, ymin, _, ymax)) = bbox {
                     let t = (m.ascent as i32) - (ymax as i32);
                     let b = (ymin as i32) + (m.descent as i32);
-                    (r, t, b)
+                    (default_adv_h, t, b, default_v_origin)
                 } else {
-                    (0, (m.ascent as i32) / 5, (m.descent as i32) / 2)
+                    (default_adv_h, (m.ascent as i32) / 5, (m.descent as i32) / 2, default_v_origin)
                 };
                 return DWRITE_GLYPH_METRICS {
                     leftSideBearing: lsb as i32,
@@ -333,9 +349,9 @@ impl FontFaceInner {
             advanceWidth: adv_w,
             rightSideBearing: rsb,
             topSideBearing: (m.ascent as i32) - (m.capHeight as i32),
-            advanceHeight: adv_h,
+            advanceHeight: default_adv_h,
             bottomSideBearing: m.descent as i32,
-            verticalOriginY: v_origin,
+            verticalOriginY: default_v_origin,
         }
     }
 
@@ -343,6 +359,12 @@ impl FontFaceInner {
         let gm = self.glyph_metrics(gid);
         let upem = self.meta.metrics.designUnitsPerEm.max(1) as f32;
         (gm.advanceWidth as f32) * em_size / upem
+    }
+
+    pub(super) fn scaled_vertical_advance(&self, gid: u16, em_size: f32) -> f32 {
+        let gm = self.glyph_metrics(gid);
+        let upem = self.meta.metrics.designUnitsPerEm.max(1) as f32;
+        (gm.advanceHeight as f32) * em_size / upem
     }
 }
 

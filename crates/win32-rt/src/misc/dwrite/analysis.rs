@@ -757,7 +757,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
     glyph_count: u32,
     font_face: *mut c_void,
     font_em_size_bits: u32,
-    _is_sideways: BOOL,
+    is_sideways: BOOL,
     is_rtl: BOOL,
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     _locale_name: *const u16,
@@ -781,7 +781,8 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
         return E_INVALIDARG;
     }
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
-    if text_len > 0 && !text_string.is_null() && glyph_count > 0 {
+    let sideways = is_sideways != FALSE;
+    if !sideways && text_len > 0 && !text_string.is_null() && glyph_count > 0 {
         let mut units = Vec::with_capacity(text_len as usize);
         for i in 0..text_len as usize {
             units.push(text_string.add(i).read_unaligned());
@@ -821,7 +822,13 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
     }
     for i in 0..glyph_count as usize {
         let gid = glyph_indices.add(i).read_unaligned();
-        let adv = if no_visual { 0.0 } else { face.scaled_advance(gid, em_size) };
+        let adv = if no_visual {
+            0.0
+        } else if sideways {
+            face.scaled_vertical_advance(gid, em_size)
+        } else {
+            face.scaled_advance(gid, em_size)
+        };
         glyph_advances.add(i).write_unaligned(adv);
         glyph_offsets.add(i).write_unaligned(DWRITE_GLYPH_OFFSET::default());
     }
@@ -845,7 +852,7 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     pixels_per_dip_bits: u32,
     _transform: *const DWRITE_MATRIX,
     use_gdi_natural: BOOL,
-    _is_sideways: BOOL,
+    is_sideways: BOOL,
     is_rtl: BOOL,
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     _locale_name: *const u16,
@@ -870,7 +877,8 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
         return E_INVALIDARG;
     }
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
-    if text_len > 0 && !text_string.is_null() && glyph_count > 0 {
+    let sideways = is_sideways != FALSE;
+    if !sideways && text_len > 0 && !text_string.is_null() && glyph_count > 0 {
         let mut units = Vec::with_capacity(text_len as usize);
         for i in 0..text_len as usize {
             units.push(text_string.add(i).read_unaligned());
@@ -914,7 +922,13 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     }
     for i in 0..glyph_count as usize {
         let gid = glyph_indices.add(i).read_unaligned();
-        let mut adv = if no_visual { 0.0 } else { face.scaled_advance(gid, em_size) };
+        let mut adv = if no_visual {
+            0.0
+        } else if sideways {
+            face.scaled_vertical_advance(gid, em_size)
+        } else {
+            face.scaled_advance(gid, em_size)
+        };
         if use_gdi_natural == FALSE {
             adv = (adv * ppd).round() / ppd;
         }
@@ -1175,8 +1189,30 @@ impl GlyphRunAnalysisInner {
         }
 
         let m = transform.copied().unwrap_or_default();
+        let is_sideways = run.isSideways != FALSE;
         let is_rtl = (run.bidiLevel & 1) != 0;
         let rtl_dir = if is_rtl { -1.0f32 } else { 1.0f32 };
+
+        // Per DWRITE_GLYPH_RUN: when `isSideways` is TRUE, each glyph is rotated
+        // 90° counter-clockwise (left) around its vertical origin before applying the
+        // caller's transform `m`. In Y-down row-vector space, 90° CCW is
+        // `R_left = (m11: 0, m12: -1, m21: 1, m22: 0)`, so `R_left * m` has rows
+        // `(-m21, -m22)` and `(m11, m12)`. Applying the documented vertical-writing
+        // 90° CW world transform `(0, 1, -1, 0)` cancels `R_left` back to upright.
+        let glyph_m = if is_sideways {
+            DWRITE_MATRIX {
+                m11: -m.m21,
+                m12: -m.m22,
+                m21: m.m11,
+                m22: m.m12,
+                dx: 0.0,
+                dy: 0.0,
+            }
+        } else {
+            m
+        };
+        let upem = face.meta.metrics.designUnitsPerEm.max(1) as f32;
+        let du_to_dip = run.fontEmSize / upem;
 
         let mut pen_x = baseline_x;
         let pen_y = baseline_y;
@@ -1190,6 +1226,8 @@ impl GlyphRunAnalysisInner {
             let gid = run.glyphIndices.add(i).read_unaligned();
             let adv = if !run.glyphAdvances.is_null() {
                 run.glyphAdvances.add(i).read_unaligned()
+            } else if is_sideways {
+                face.scaled_vertical_advance(gid, run.fontEmSize)
             } else {
                 face.scaled_advance(gid, run.fontEmSize)
             };
@@ -1206,12 +1244,25 @@ impl GlyphRunAnalysisInner {
                 pen_x -= adv;
             }
 
-            let gx_dip = pen_x + off.advanceOffset * rtl_dir;
-            let gy_dip = pen_y - off.ascenderOffset;
+            // When sideways, translate from the glyph's horizontal origin `(0, 0)` to its
+            // vertical origin `(advanceWidth/2, -verticalOriginY)` in Y-down DIPs before
+            // the 90° CCW rotation `R_left`: `(0 - vx, 0 - vy) * R_left = (+vorig_y, +vorig_x)`.
+            let (sideways_dx, sideways_dy) = if is_sideways {
+                let gm = face.glyph_metrics(gid);
+                (
+                    (gm.verticalOriginY as f32) * du_to_dip,
+                    (gm.advanceWidth as f32) * 0.5 * du_to_dip,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+
+            let gx_dip = pen_x + off.advanceOffset * rtl_dir + sideways_dx;
+            let gy_dip = pen_y - off.ascenderOffset + sideways_dy;
             let gx_px = (gx_dip * m.m11 + gy_dip * m.m21 + m.dx) * pixels_per_dip;
             let gy_px = (gx_dip * m.m12 + gy_dip * m.m22 + m.dy) * pixels_per_dip;
 
-            let rast = rasterize_glyph_transformed(&face, gid, run.fontEmSize, pixels_per_dip, &m);
+            let rast = rasterize_glyph_transformed(&face, gid, run.fontEmSize, pixels_per_dip, &glyph_m);
             if rast.width > 0 && rast.height > 0 {
                 let left = gx_px.round() as i32 + rast.offset_x;
                 let top = gy_px.round() as i32 + rast.offset_y;

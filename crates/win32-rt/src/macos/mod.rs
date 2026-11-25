@@ -572,7 +572,7 @@ where
             ));
         }
         let (tx, rx) = std::sync::mpsc::channel::<TaskDialogEvent>();
-        run_async(move || {
+        appkit::schedule_task_dialog_present(move || {
             appkit::task_dialog_alert_channel(
                 session_id,
                 &caption,
@@ -620,7 +620,9 @@ pub fn task_dialog_alert_update(session_id: u64, update: TaskDialogLiveUpdate) {
         if is_main_thread() {
             appkit::task_dialog_alert_update(session_id, &update);
         } else {
-            run_async(move || appkit::task_dialog_alert_update(session_id, &update));
+            appkit::schedule_task_dialog_update(move || {
+                appkit::task_dialog_alert_update(session_id, &update);
+            });
         }
     }
     #[cfg(not(target_os = "macos"))]

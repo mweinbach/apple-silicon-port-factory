@@ -2052,3 +2052,207 @@ fn text_analyzer_shapes_complex_arabic_and_combining_marks_and_rejects_unshapeab
         release_com(fac);
     }
 }
+
+#[test]
+fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
+    use super::analysis::{
+        gra_create_alpha_texture, gra_get_alpha_texture_bounds, ta_get_glyph_placements,
+        PGlyphRunAnalysis, PTextAnalyzer,
+    };
+    use crate::user32::RECT;
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &G_IDWRITE_FACTORY as *const _ as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        // Use a non-square glyph ('I' or built-in fallback 'H' / 'I') whose height != width
+        // so 90-degree rotation is unmistakably observable in alpha-texture bounds.
+        let sys = system_font_collection_data(false);
+        let face_inner = sys.resolve_face(
+            "Segoe UI",
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+        );
+        let gid_i = face_inner.codepoint_to_glyph('I' as u32);
+        let em_size = 40.0f32;
+        let horiz_adv = face_inner.scaled_advance(gid_i, em_size);
+        let vert_adv = face_inner.scaled_vertical_advance(gid_i, em_size);
+        assert!(vert_adv > horiz_adv, "expected vertical advance > horizontal advance for 'I': h={horiz_adv}, v={vert_adv}");
+
+        let face = new_font_face(face_inner);
+
+        // Verify GetGlyphPlacements returns vertical advance when isSideways == TRUE.
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+        let text_i = ['I' as u16];
+        let cmap = [0u16];
+        let tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default()];
+        let gids1 = [gid_i];
+        let gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default()];
+        let mut placed_adv = [0.0f32; 1];
+        let mut placed_off = [DWRITE_GLYPH_OFFSET::default(); 1];
+        assert_eq!(
+            ta_get_glyph_placements(
+                ta as PTextAnalyzer,
+                text_i.as_ptr(),
+                cmap.as_ptr(),
+                tprops.as_ptr(),
+                1,
+                gids1.as_ptr(),
+                gprops.as_ptr(),
+                1,
+                face,
+                em_size.to_bits(),
+                TRUE, // isSideways
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                placed_adv.as_mut_ptr(),
+                placed_off.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert!(
+            (placed_adv[0] - vert_adv).abs() < 1e-3,
+            "sideways GetGlyphPlacements should return vertical advance {vert_adv}, got {}",
+            placed_adv[0]
+        );
+
+        // 1. Baseline horizontal upright single glyph (isSideways = FALSE, identity).
+        let run_horiz = DWRITE_GLYPH_RUN {
+            fontFace: face,
+            fontEmSize: em_size,
+            glyphCount: 1,
+            glyphIndices: gids1.as_ptr(),
+            glyphAdvances: std::ptr::null(),
+            glyphOffsets: std::ptr::null(),
+            isSideways: FALSE,
+            bidiLevel: 0,
+        };
+        let mut gra_h: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run_horiz,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                40.0,
+                &mut gra_h,
+            ),
+            S_OK
+        );
+        let mut b_h = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_h as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_h), S_OK);
+        let w_h = b_h.right - b_h.left;
+        let h_h = b_h.bottom - b_h.top;
+        assert!(h_h > w_h + 4, "upright 'I' should be taller than wide: {b_h:?}");
+
+        // 2. Sideways run with identity transform: rotated 90° left (width <-> height swapped).
+        let run_sw = DWRITE_GLYPH_RUN { isSideways: TRUE, ..run_horiz };
+        let mut gra_sw: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run_sw,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                40.0,
+                &mut gra_sw,
+            ),
+            S_OK
+        );
+        let mut b_sw = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_sw as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_sw), S_OK);
+        let w_sw = b_sw.right - b_sw.left;
+        let h_sw = b_sw.bottom - b_sw.top;
+        assert!((w_sw - h_h).abs() <= 3, "sideways width {w_sw} should match upright height {h_h}");
+        assert!((h_sw - w_h).abs() <= 3, "sideways height {h_sw} should match upright width {w_h}");
+
+        // 3. Documented vertical writing: isSideways = TRUE + 90° CW compensating world transform
+        //    (m11=0, m12=1, m21=-1, m22=0) restores upright orientation AND stacks 2 glyphs vertically.
+        let rot_cw = DWRITE_MATRIX { m11: 0.0, m12: 1.0, m21: -1.0, m22: 0.0, dx: 0.0, dy: 0.0 };
+        let mut gra_v1: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run_sw,
+                1.0,
+                &rot_cw,
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                10.0,
+                -50.0, // maps under rot_cw to x = +50, y = +10
+                &mut gra_v1,
+            ),
+            S_OK
+        );
+        let mut b_v1 = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_v1 as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_v1), S_OK);
+        let w_v1 = b_v1.right - b_v1.left;
+        let h_v1 = b_v1.bottom - b_v1.top;
+        assert!((w_v1 - w_h).abs() <= 3, "compensated vertical width {w_v1} should match upright width {w_h}");
+        assert!((h_v1 - h_h).abs() <= 3, "compensated vertical height {h_v1} should match upright height {h_h}");
+
+        let gids2 = [gid_i, gid_i];
+        let run_sw2 = DWRITE_GLYPH_RUN {
+            glyphCount: 2,
+            glyphIndices: gids2.as_ptr(),
+            ..run_sw
+        };
+        let mut gra_v2: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run_sw2,
+                1.0,
+                &rot_cw,
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                10.0,
+                -50.0,
+                &mut gra_v2,
+            ),
+            S_OK
+        );
+        let mut b_v2 = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_v2 as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_v2), S_OK);
+        assert_eq!(b_v2.left, b_v1.left, "vertical 2-glyph run must stay horizontally aligned");
+        assert_eq!(b_v2.right, b_v1.right, "vertical 2-glyph run must stay horizontally aligned");
+        assert!(
+            b_v2.bottom >= b_v1.bottom + (vert_adv.round() as i32) - 2,
+            "second vertical glyph must advance downward by vertical advance {vert_adv}: v1={b_v1:?}, v2={b_v2:?}"
+        );
+        // Ensure alpha texture actually renders non-zero pixels for the vertical run.
+        let tex_w = (b_v2.right - b_v2.left) as usize;
+        let tex_h = (b_v2.bottom - b_v2.top) as usize;
+        let mut tex = vec![0u8; tex_w * tex_h];
+        assert_eq!(
+            gra_create_alpha_texture(gra_v2 as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &b_v2, tex.as_mut_ptr(), tex.len() as u32),
+            S_OK
+        );
+        assert!(tex.iter().any(|&a| a >= 128), "vertical alpha texture must contain lit glyph pixels");
+
+        release_com(gra_v2);
+        release_com(gra_v1);
+        release_com(gra_sw);
+        release_com(gra_h);
+        release_com(ta);
+        release_com(face);
+        release_com(fac);
+    }
+}

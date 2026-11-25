@@ -583,6 +583,7 @@ pub(super) struct SfntFace {
     upem: u16,
     index_to_loc_format: i16,
     num_hmetrics: u16,
+    num_vmetrics: u16,
     cmap_subtable: Option<(u16, usize)>, // (format, byte offset into raw)
     /// Reverse map from glyph ID to Unicode codepoint for CFF fallback rendering.
     glyph_to_char: HashMap<u16, char>,
@@ -637,6 +638,11 @@ impl SfntFace {
             .and_then(|t| be_u16(t, 34))
             .unwrap_or(1)
             .max(1);
+        let num_vmetrics = tables
+            .get(b"vhea")
+            .and_then(|&(o, l)| b.get(o..o + l))
+            .and_then(|t| be_u16(t, 34))
+            .unwrap_or(0);
 
         let cmap_subtable = Self::pick_cmap(b, &tables);
         let mut face = Self {
@@ -645,6 +651,7 @@ impl SfntFace {
             upem,
             index_to_loc_format,
             num_hmetrics,
+            num_vmetrics,
             cmap_subtable,
             glyph_to_char: HashMap::new(),
         };
@@ -778,6 +785,26 @@ impl SfntFace {
             let lsb_off = nh * 4 + (g - nh) * 2;
             let lsb = be_i16(tbl, lsb_off).unwrap_or(0);
             Some((adv, lsb))
+        }
+    }
+
+    pub(super) fn vmtx(&self, gid: u16) -> Option<(u16, i16)> {
+        if self.num_vmetrics == 0 {
+            return None;
+        }
+        let &(off, len) = self.tables.get(b"vmtx")?;
+        let tbl = self.raw.get(off..off + len)?;
+        let nv = self.num_vmetrics as usize;
+        let g = gid as usize;
+        if g < nv {
+            let adv = be_u16(tbl, g * 4)?;
+            let tsb = be_i16(tbl, g * 4 + 2)?;
+            Some((adv, tsb))
+        } else {
+            let adv = be_u16(tbl, nv.saturating_sub(1) * 4)?;
+            let tsb_off = nv * 4 + (g - nv) * 2;
+            let tsb = be_i16(tbl, tsb_off).unwrap_or(0);
+            Some((adv, tsb))
         }
     }
 
@@ -1392,7 +1419,7 @@ fn rasterize_fallback_8x8_transformed(
         _ => &FALLBACK_NOTDEF_8X8,
     };
     let gw = (em_size * 0.62).max(1.0);
-    let gh = (em_size * 0.92).max(1.0);
+    let gh = (em_size * 0.88).max(1.0);
     let shear_dip = if italic { em_size * 0.16 } else { 0.0 };
     let ascent_dip = em_size * 0.78;
     let local_w = gw + shear_dip;

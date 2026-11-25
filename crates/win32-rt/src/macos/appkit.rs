@@ -22,10 +22,10 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -78,12 +78,34 @@ extern "C" {
     fn CGImageDestinationFinalize(dest: *mut c_void) -> bool;
 }
 
+#[repr(C)]
+struct CFRunLoopSourceContext {
+    version: isize,
+    info: *mut c_void,
+    retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<extern "C" fn(*const c_void)>,
+    copy_description: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    equal: Option<extern "C" fn(*const c_void, *const c_void) -> u8>,
+    hash: Option<extern "C" fn(*const c_void) -> usize>,
+    schedule: Option<extern "C" fn(*mut c_void, *mut c_void, *const c_void)>,
+    cancel: Option<extern "C" fn(*mut c_void, *mut c_void, *const c_void)>,
+    perform: Option<extern "C" fn(*mut c_void)>,
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
+    static kCFRunLoopDefaultMode: *const c_void;
+    static kCFRunLoopCommonModes: *const c_void;
     fn CFRelease(p: *const c_void);
+    fn CFRetain(p: *const c_void) -> *const c_void;
     fn CFDataCreate(alloc: *const c_void, bytes: *const u8, len: isize) -> *const c_void;
     fn CFURLCreateFromFileSystemRepresentation(alloc: *const c_void, buf: *const u8, len: isize, is_dir: bool) -> *const c_void;
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const std::ffi::c_char, enc: u32) -> *const c_void;
+    fn CFRunLoopGetCurrent() -> *mut c_void;
+    fn CFRunLoopSourceCreate(alloc: *const c_void, order: isize, ctx: *mut CFRunLoopSourceContext) -> *mut c_void;
+    fn CFRunLoopAddSource(rl: *mut c_void, src: *mut c_void, mode: *const c_void);
+    fn CFRunLoopSourceSignal(src: *mut c_void);
+    fn CFRunLoopWakeUp(rl: *mut c_void);
 }
 
 /// Capture one of our windows (or, with `whole_screen`, every on-screen
@@ -448,6 +470,7 @@ pub(super) fn init() {
     objc2_app_kit::NSEvent::setMouseCoalescingEnabled(false);
     display::refresh(mtm);
     super::keyboard::init_main_thread();
+    init_task_dialog_dispatcher();
     crate::dxgi::adapter::register_fullscreen_toggle(window_set_dxgi_fullscreen);
     log::info!("macos: NSApplication ready (main thread owns AppKit)");
 }
@@ -1073,8 +1096,201 @@ pub(super) fn clipboard_change_count() -> isize {
 }
 
 // ---------------------------------------------------------------------------
-// Alert
+// Alert (presented & updated via CFRunLoopSource, outside _dispatch_main_q)
 // ---------------------------------------------------------------------------
+
+type MainRunLoopTask = Box<dyn FnOnce() + Send>;
+
+struct RunLoopTaskQueue {
+    tasks: Mutex<VecDeque<MainRunLoopTask>>,
+    source: std::sync::atomic::AtomicUsize,
+}
+
+/// Dual-source CoreFoundation run-loop dispatcher for modal TaskDialogs.
+///
+/// Presenting `NSAlert::runModal()` via a `CFRunLoopSource` registered in
+/// `kCFRunLoopDefaultMode` keeps `_dispatch_main_q` completely unoccupied while
+/// the modal session runs (libdispatch refuses recursive main-queue draining).
+/// Live updates (`TDM_CLICK_BUTTON`, `SetWindowTextW`, selection updates) are
+/// signaled on a second `CFRunLoopSource` registered in both
+/// `kCFRunLoopCommonModes` and `NSModalPanelRunLoopMode`, so they execute
+/// immediately while `NSAlert::runModal()` is open.
+struct RunLoopDispatcher {
+    run_loop: usize,
+    present_src: usize,
+    update_src: usize,
+    present_q: *mut RunLoopTaskQueue,
+    update_q: *mut RunLoopTaskQueue,
+}
+
+// SAFETY: `CFRunLoopSourceSignal` and `CFRunLoopWakeUp` are documented
+// thread-safe by Apple CoreFoundation; queues are protected by `Mutex`.
+unsafe impl Send for RunLoopDispatcher {}
+unsafe impl Sync for RunLoopDispatcher {}
+
+extern "C" fn perform_one_runloop_task(info: *mut c_void) {
+    if info.is_null() {
+        return;
+    }
+    let q = unsafe { &*(info as *const RunLoopTaskQueue) };
+    let (task, more) = {
+        let mut guard = q.tasks.lock().unwrap();
+        let t = guard.pop_front();
+        (t, !guard.is_empty())
+    };
+    if more {
+        let src = q.source.load(Ordering::Acquire) as *mut c_void;
+        if !src.is_null() {
+            unsafe { CFRunLoopSourceSignal(src) };
+        }
+    }
+    if let Some(f) = task {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| autoreleasepool(|_| f()))).is_err() {
+            log::error!("macos: panic in task-dialog run-loop presentation");
+        }
+    }
+}
+
+extern "C" fn perform_all_runloop_tasks(info: *mut c_void) {
+    if info.is_null() {
+        return;
+    }
+    let q = unsafe { &*(info as *const RunLoopTaskQueue) };
+    loop {
+        let task = q.tasks.lock().unwrap().pop_front();
+        let Some(f) = task else { break };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| autoreleasepool(|_| f()))).is_err() {
+            log::error!("macos: panic in task-dialog run-loop update");
+        }
+    }
+}
+
+impl RunLoopDispatcher {
+    fn new_for_current_runloop() -> Option<Self> {
+        unsafe {
+            let rl = CFRunLoopGetCurrent();
+            if rl.is_null() {
+                return None;
+            }
+            CFRetain(rl as *const c_void);
+
+            let present_q = Box::into_raw(Box::new(RunLoopTaskQueue {
+                tasks: Mutex::new(VecDeque::new()),
+                source: std::sync::atomic::AtomicUsize::new(0),
+            }));
+            let update_q = Box::into_raw(Box::new(RunLoopTaskQueue {
+                tasks: Mutex::new(VecDeque::new()),
+                source: std::sync::atomic::AtomicUsize::new(0),
+            }));
+
+            let mut present_ctx = CFRunLoopSourceContext {
+                version: 0,
+                info: present_q as *mut c_void,
+                retain: None,
+                release: None,
+                copy_description: None,
+                equal: None,
+                hash: None,
+                schedule: None,
+                cancel: None,
+                perform: Some(perform_one_runloop_task),
+            };
+            let present_src = CFRunLoopSourceCreate(std::ptr::null(), 0, &mut present_ctx);
+
+            let mut update_ctx = CFRunLoopSourceContext {
+                version: 0,
+                info: update_q as *mut c_void,
+                retain: None,
+                release: None,
+                copy_description: None,
+                equal: None,
+                hash: None,
+                schedule: None,
+                cancel: None,
+                perform: Some(perform_all_runloop_tasks),
+            };
+            let update_src = CFRunLoopSourceCreate(std::ptr::null(), 0, &mut update_ctx);
+
+            if present_src.is_null() || update_src.is_null() {
+                if !present_src.is_null() {
+                    CFRelease(present_src as *const c_void);
+                }
+                if !update_src.is_null() {
+                    CFRelease(update_src as *const c_void);
+                }
+                CFRelease(rl as *const c_void);
+                drop(Box::from_raw(present_q));
+                drop(Box::from_raw(update_q));
+                return None;
+            }
+
+            (*present_q).source.store(present_src as usize, Ordering::Release);
+            (*update_q).source.store(update_src as usize, Ordering::Release);
+
+            CFRunLoopAddSource(rl, present_src, kCFRunLoopDefaultMode);
+            CFRunLoopAddSource(rl, update_src, kCFRunLoopCommonModes);
+            // Explicitly register in NSModalPanelRunLoopMode as well so updates fire
+            // inside `NSAlert::runModal()` even before AppKit adds modal mode to common modes.
+            let modal_mode = CFStringCreateWithCString(
+                std::ptr::null(),
+                c"NSModalPanelRunLoopMode".as_ptr(),
+                0x0800_0100, // kCFStringEncodingUTF8
+            );
+            if !modal_mode.is_null() {
+                CFRunLoopAddSource(rl, update_src, modal_mode);
+                CFRelease(modal_mode);
+            }
+
+            Some(Self {
+                run_loop: rl as usize,
+                present_src: present_src as usize,
+                update_src: update_src as usize,
+                present_q,
+                update_q,
+            })
+        }
+    }
+
+    fn schedule_present(&self, f: impl FnOnce() + Send + 'static) {
+        unsafe {
+            (*self.present_q).tasks.lock().unwrap().push_back(Box::new(f));
+            CFRunLoopSourceSignal(self.present_src as *mut c_void);
+            CFRunLoopWakeUp(self.run_loop as *mut c_void);
+        }
+    }
+
+    fn schedule_update(&self, f: impl FnOnce() + Send + 'static) {
+        unsafe {
+            (*self.update_q).tasks.lock().unwrap().push_back(Box::new(f));
+            CFRunLoopSourceSignal(self.update_src as *mut c_void);
+            CFRunLoopWakeUp(self.run_loop as *mut c_void);
+        }
+    }
+}
+
+static TASK_DIALOG_DISPATCHER: OnceLock<RunLoopDispatcher> = OnceLock::new();
+
+fn init_task_dialog_dispatcher() {
+    if let Some(d) = RunLoopDispatcher::new_for_current_runloop() {
+        let _ = TASK_DIALOG_DISPATCHER.set(d);
+    }
+}
+
+pub(super) fn schedule_task_dialog_present(f: impl FnOnce() + Send + 'static) {
+    if let Some(d) = TASK_DIALOG_DISPATCHER.get() {
+        d.schedule_present(f);
+    } else {
+        super::run_async(f);
+    }
+}
+
+pub(super) fn schedule_task_dialog_update(f: impl FnOnce() + Send + 'static) {
+    if let Some(d) = TASK_DIALOG_DISPATCHER.get() {
+        d.schedule_update(f);
+    } else {
+        super::run_async(f);
+    }
+}
 
 const NS_CONTROL_STATE_OFF: isize = 0;
 const NS_CONTROL_STATE_ON: isize = 1;
@@ -1104,6 +1320,7 @@ struct ActiveTaskDialogAlert {
 
 thread_local! {
     static ACTIVE_TASK_DIALOG_ALERT: RefCell<Option<ActiveTaskDialogAlert>> = const { RefCell::new(None) };
+    static PENDING_TASK_DIALOG_UPDATES: RefCell<HashMap<u64, Vec<super::TaskDialogLiveUpdate>>> = RefCell::new(HashMap::new());
 }
 
 define_class!(
@@ -1150,35 +1367,53 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         .button_index
 }
 
+fn apply_live_update_to_alert(
+    alert: &NSAlert,
+    radio_buttons: &[Retained<NSButton>],
+    update: &super::TaskDialogLiveUpdate,
+) {
+    alert.setMessageText(&NSString::from_str(&update.caption));
+    alert.setInformativeText(&NSString::from_str(&update.text));
+    if let Some(ridx) = update.selected_radio_idx {
+        for (i, b) in radio_buttons.iter().enumerate() {
+            let st = if i == ridx { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
+            let _: () = unsafe { msg_send![&**b, setState: st] };
+        }
+    }
+    if let Some(checked) = update.verification_checked {
+        if let Some(cb) = alert.suppressionButton() {
+            let st = if checked { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
+            let _: () = unsafe { msg_send![&*cb, setState: st] };
+        }
+    }
+}
+
 pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDialogLiveUpdate) {
     let mtm = mtm();
-    ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
+    let applied = ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
         let borrow = slot.borrow();
         let Some(active) = borrow.as_ref() else {
-            return;
+            return false;
         };
         if active.session_id != session_id {
-            return;
+            return false;
         }
-        active.alert.setMessageText(&NSString::from_str(&update.caption));
-        active.alert.setInformativeText(&NSString::from_str(&update.text));
-        if let Some(ridx) = update.selected_radio_idx {
-            for (i, b) in active.radio_buttons.iter().enumerate() {
-                let st = if i == ridx { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
-                let _: () = unsafe { msg_send![&**b, setState: st] };
-            }
-        }
-        if let Some(checked) = update.verification_checked {
-            if let Some(cb) = active.alert.suppressionButton() {
-                let st = if checked { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
-                let _: () = unsafe { msg_send![&*cb, setState: st] };
-            }
-        }
+        apply_live_update_to_alert(&active.alert, &active.radio_buttons, update);
         if let Some(bidx) = update.click_button_idx {
             let app = NSApplication::sharedApplication(mtm);
             app.stopModalWithCode(1000 + bidx as isize);
         }
+        true
     });
+    if !applied && session_id != 0 {
+        PENDING_TASK_DIALOG_UPDATES.with(|map| {
+            let mut m = map.borrow_mut();
+            let q = m.entry(session_id).or_default();
+            if q.len() < 64 {
+                q.push(update.clone());
+            }
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1258,10 +1493,15 @@ fn run_task_dialog_alert(
         a.setAccessoryView(Some(&container));
     }
 
-    struct ActiveAlertGuard;
+    struct ActiveAlertGuard(u64);
     impl Drop for ActiveAlertGuard {
         fn drop(&mut self) {
             ACTIVE_TASK_DIALOG_ALERT.with(|slot| *slot.borrow_mut() = None);
+            if self.0 != 0 {
+                PENDING_TASK_DIALOG_UPDATES.with(|map| {
+                    map.borrow_mut().remove(&self.0);
+                });
+            }
         }
     }
     ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
@@ -1272,9 +1512,27 @@ fn run_task_dialog_alert(
             sink,
         });
     });
-    let _active_guard = ActiveAlertGuard;
+    let _active_guard = ActiveAlertGuard(session_id);
 
-    let r = a.runModal();
+    // Apply any live updates that arrived before `run_task_dialog_alert` began.
+    let mut pre_clicked: Option<usize> = None;
+    if session_id != 0 {
+        let queued = PENDING_TASK_DIALOG_UPDATES.with(|map| map.borrow_mut().remove(&session_id));
+        if let Some(updates) = queued {
+            for upd in updates {
+                apply_live_update_to_alert(&a, &radio_buttons, &upd);
+                if let Some(bidx) = upd.click_button_idx {
+                    pre_clicked = Some(bidx);
+                }
+            }
+        }
+    }
+
+    let r = if let Some(bidx) = pre_clicked {
+        1000 + bidx as isize
+    } else {
+        a.runModal()
+    };
     // NSAlertFirstButtonReturn = 1000
     let button_index = (r - 1000).clamp(0, buttons.len().saturating_sub(1) as isize) as usize;
     let radio_index = if radio_buttons.is_empty() {
@@ -1470,6 +1728,13 @@ pub(super) fn progress_window_close() {
 mod tests {
     use super::*;
 
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRunLoopRunInMode(mode: *const c_void, secs: f64, ret_after_source: u8) -> i32;
+        fn CFRunLoopStop(rl: *mut c_void);
+        fn CFRunLoopRemoveSource(rl: *mut c_void, src: *mut c_void, mode: *const c_void);
+    }
+
     #[test]
     fn unique_nspasteboard_text_roundtrip() {
         // Uses an isolated pasteboard name so the host user's generalPasteboard is untouched.
@@ -1481,5 +1746,102 @@ mod tests {
         assert_eq!(pasteboard_get_text(&pb).as_deref(), Some(text));
         pb.clearContents();
         assert_eq!(pasteboard_get_text(&pb), None);
+    }
+
+    #[test]
+    fn task_dialog_runloop_dispatcher_delivers_updates_inside_modal_mode() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (disp_tx, disp_rx) = mpsc::channel::<Arc<RunLoopDispatcher>>();
+        let (modal_entered_tx, modal_entered_rx) = mpsc::channel::<()>();
+        let (modal_exited_tx, modal_exited_rx) = mpsc::channel::<bool>();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let update_ran = Arc::new(AtomicBool::new(false));
+        let update_ran_modal = Arc::clone(&update_ran);
+
+        let rl_thread = std::thread::spawn(move || {
+            let disp = Arc::new(
+                RunLoopDispatcher::new_for_current_runloop().expect("CFRunLoop dispatcher"),
+            );
+            disp_tx.send(Arc::clone(&disp)).unwrap();
+
+            // Pump default mode until our presentation task runs and returns.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && !update_ran_modal.load(Ordering::Acquire) {
+                unsafe {
+                    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 1);
+                }
+            }
+            let _ = shutdown_rx.recv_timeout(Duration::from_secs(2));
+
+            // Clean up sources created on this test thread's run loop.
+            unsafe {
+                let rl = disp.run_loop as *mut c_void;
+                let psrc = disp.present_src as *mut c_void;
+                let usrc = disp.update_src as *mut c_void;
+                CFRunLoopRemoveSource(rl, psrc, kCFRunLoopDefaultMode);
+                CFRunLoopRemoveSource(rl, usrc, kCFRunLoopCommonModes);
+                let modal_mode = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    c"NSModalPanelRunLoopMode".as_ptr(),
+                    0x0800_0100,
+                );
+                if !modal_mode.is_null() {
+                    CFRunLoopRemoveSource(rl, usrc, modal_mode);
+                    CFRelease(modal_mode);
+                }
+                CFRelease(psrc as *const c_void);
+                CFRelease(usrc as *const c_void);
+                CFRelease(rl as *const c_void);
+                drop(Box::from_raw(disp.present_q));
+                drop(Box::from_raw(disp.update_q));
+            }
+        });
+
+        let disp = disp_rx.recv_timeout(Duration::from_secs(2)).expect("dispatcher");
+        let update_ran_check = Arc::clone(&update_ran);
+        disp.schedule_present(move || {
+            // Simulate NSAlert::runModal() entering a nested NSModalPanelRunLoopMode loop
+            // inside the presentation callback.
+            let _ = modal_entered_tx.send(());
+            unsafe {
+                let modal_mode = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    c"NSModalPanelRunLoopMode".as_ptr(),
+                    0x0800_0100,
+                );
+                assert!(!modal_mode.is_null());
+                CFRunLoopRunInMode(modal_mode, 3.0, 0);
+                CFRelease(modal_mode);
+            }
+            let _ = modal_exited_tx.send(update_ran_check.load(Ordering::Acquire));
+        });
+
+        // Wait until the nested modal run-loop mode is active, then schedule a live update.
+        modal_entered_rx.recv_timeout(Duration::from_secs(2)).expect("modal entered");
+        let t0 = Instant::now();
+        let update_ran_set = Arc::clone(&update_ran);
+        disp.schedule_update(move || {
+            update_ran_set.store(true, Ordering::Release);
+            unsafe {
+                CFRunLoopStop(CFRunLoopGetCurrent());
+            }
+        });
+
+        let saw_update_before_exit = modal_exited_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("modal exited via live update");
+        assert!(
+            saw_update_before_exit,
+            "live update must execute inside nested NSModalPanelRunLoopMode and stop it"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "modal loop must be dismissed immediately by live update, not timeout"
+        );
+        drop(disp);
+        let _ = shutdown_tx.send(());
+        rl_thread.join().unwrap();
     }
 }
