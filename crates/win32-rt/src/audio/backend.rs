@@ -342,6 +342,24 @@ pub fn device_volume_range_db(dev: &DeviceInfo, is_capture: bool) -> Option<(f32
     }
 }
 
+/// Query whether the endpoint's CoreAudio HAL device actually supports writable hardware
+/// `(volume, mute)` controls. Returns `(false, false)` for Null/iOS/software-only endpoints.
+pub fn device_hardware_volume_support(dev: &DeviceInfo, is_capture: bool, channels: u32) -> (bool, bool) {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return (false, false);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_hardware_volume_support(id, is_capture, channels))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, channels);
+        (false, false)
+    }
+}
+
 /// Real-time safe channel-layout converter + linear resampler for loopback audio.
 /// Converts interleaved float32 input `(src_rate, src_channels)` into `(dst_rate, dst_channels)`
 /// using preallocated buffers so the CoreAudio IOProc never allocates on the realtime thread.
@@ -1298,6 +1316,12 @@ mod ca {
 
     #[link(name = "CoreAudio", kind = "framework")]
     extern "C" {
+        fn AudioObjectHasProperty(id: AudioObjectID, addr: *const AudioObjectPropertyAddress) -> u8;
+        fn AudioObjectIsPropertySettable(
+            id: AudioObjectID,
+            addr: *const AudioObjectPropertyAddress,
+            is_settable: *mut u8,
+        ) -> OSStatus;
         fn AudioObjectAddPropertyListener(id: AudioObjectID, addr: *const AudioObjectPropertyAddress, proc_: ListenerProc, client: *mut c_void) -> OSStatus;
         fn AudioObjectRemovePropertyListener(id: AudioObjectID, addr: *const AudioObjectPropertyAddress, proc_: ListenerProc, client: *mut c_void) -> OSStatus;
         fn AudioObjectSetPropertyData(
@@ -1646,6 +1670,39 @@ mod ca {
             } else {
                 None
             }
+        }
+    }
+
+    /// Check whether a CoreAudio HAL property exists and is writable for `(id, selector, scope, element)`.
+    unsafe fn property_is_settable(id: AudioObjectID, selector: u32, scope: u32, element: u32) -> bool {
+        let a = AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: scope,
+            mElement: element,
+        };
+        if AudioObjectHasProperty(id, &a) == 0 {
+            return false;
+        }
+        let mut settable: u8 = 0;
+        AudioObjectIsPropertySettable(id, &a, &mut settable) == 0 && settable != 0
+    }
+
+    /// Query whether CoreAudio HAL exposes writable hardware `(volume, mute)` controls on `id`.
+    pub fn device_hardware_volume_support(id: AudioObjectID, is_capture: bool, channels: u32) -> (bool, bool) {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        unsafe {
+            let mut hw_vol = property_is_settable(id, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope, 0)
+                || property_is_settable(id, kAudioDevicePropertyVolumeScalar, scope, 0);
+            if !hw_vol {
+                for ch in 1..=channels.clamp(1, 8) {
+                    if property_is_settable(id, kAudioDevicePropertyVolumeScalar, scope, ch) {
+                        hw_vol = true;
+                        break;
+                    }
+                }
+            }
+            let hw_mute = property_is_settable(id, kAudioDevicePropertyMute, scope, 0);
+            (hw_vol, hw_mute)
         }
     }
 

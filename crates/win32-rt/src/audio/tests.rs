@@ -456,6 +456,10 @@ fn enumerator_devices_and_property_store() {
         let mut epv_mute: BOOL = FALSE;
         assert_eq!(call!(epv, 15, (*mut BOOL) -> HRESULT; &mut epv_mute), S_OK);
         assert_eq!(epv_mute, TRUE);
+        let mut epv_hw = u32::MAX;
+        assert_eq!(call!(epv, 19, (*mut u32) -> HRESULT; &mut epv_hw), S_OK);
+        assert_eq!(epv_hw, 0, "software-only null endpoint must report 0 hardware volume/mute support");
+        assert_eq!(call!(epv, 19, (*mut u32) -> HRESULT; std::ptr::null_mut()), E_POINTER);
         let mut min_db = 0.0f32;
         let mut max_db = 0.0f32;
         let mut inc_db = 0.0f32;

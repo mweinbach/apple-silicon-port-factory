@@ -1350,6 +1350,26 @@ impl EndpointVolumeState {
         });
     }
 
+    fn hardware_support_mask_from(hw_volume: bool, hw_mute: bool) -> u32 {
+        let mut mask = 0u32;
+        if hw_volume {
+            mask |= ENDPOINT_HARDWARE_SUPPORT_VOLUME;
+        }
+        if hw_mute {
+            mask |= ENDPOINT_HARDWARE_SUPPORT_MUTE;
+        }
+        mask
+    }
+
+    fn hardware_support_mask(&self) -> u32 {
+        let (hw_vol, hw_mute) = backend::device_hardware_volume_support(
+            &self.ep.info,
+            self.ep.is_capture(),
+            self.channel_count as u32,
+        );
+        Self::hardware_support_mask_from(hw_vol, hw_mute)
+    }
+
     /// Dispatch `IAudioEndpointVolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA)`
     /// to every callback registered for this endpoint without holding any lock.
     unsafe fn notify_callbacks(&self, ctx_guid: *const GUID) {
@@ -1597,8 +1617,12 @@ mod endpoint_vol {
         S_OK
     }
 
-    pub unsafe extern "win64" fn query_hardware_support(_this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {
-        write_out(out, ENDPOINT_HARDWARE_SUPPORT_VOLUME | ENDPOINT_HARDWARE_SUPPORT_MUTE)
+    pub unsafe extern "win64" fn query_hardware_support(this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let mask = EndpointVolumeObj::inner(this).hardware_support_mask();
+        write_out(out, mask)
     }
 
     pub unsafe extern "win64" fn get_volume_range(
@@ -1788,5 +1812,81 @@ mod tests {
         assert!((eff2(1) - st.scalar_to_amplitude_gain(0.4)).abs() < 1e-5);
 
         reset_endpoint_software_gains_for_test();
+    }
+
+    #[test]
+    fn query_hardware_support_reflects_actual_hal_capabilities() {
+        let _audio_guard = super::super::audio_test_lock();
+
+        // Pure capability mask mapping covers every combination cleanly.
+        assert_eq!(EndpointVolumeState::hardware_support_mask_from(false, false), 0);
+        assert_eq!(
+            EndpointVolumeState::hardware_support_mask_from(true, false),
+            ENDPOINT_HARDWARE_SUPPORT_VOLUME
+        );
+        assert_eq!(
+            EndpointVolumeState::hardware_support_mask_from(false, true),
+            ENDPOINT_HARDWARE_SUPPORT_MUTE
+        );
+        assert_eq!(
+            EndpointVolumeState::hardware_support_mask_from(true, true),
+            ENDPOINT_HARDWARE_SUPPORT_VOLUME | ENDPOINT_HARDWARE_SUPPORT_MUTE
+        );
+
+        // Software-only / null endpoint must report 0 (no hardware volume/mute controls),
+        // even when CoreAudio is the active backend.
+        backend::force_backend(Some(backend::Backend::Null));
+        let null_ep = Arc::new(Endpoint::new(backend::null_device()));
+        let null_st = EndpointVolumeState::new(null_ep.clone());
+        assert_eq!(null_st.hardware_support_mask(), 0);
+
+        #[cfg(target_os = "macos")]
+        {
+            backend::force_backend(Some(backend::Backend::CoreAudio));
+            assert_eq!(
+                null_st.hardware_support_mask(),
+                0,
+                "null/software-only endpoint must still report 0 under CoreAudio backend"
+            );
+            for dev in backend::output_devices() {
+                let ep = Arc::new(Endpoint::new(dev.clone()));
+                let st = EndpointVolumeState::new(ep);
+                let (hw_vol, hw_mute) =
+                    backend::device_hardware_volume_support(&dev, false, st.channel_count as u32);
+                let expected = EndpointVolumeState::hardware_support_mask_from(hw_vol, hw_mute);
+                assert_eq!(st.hardware_support_mask(), expected);
+                if dev.id == 0 {
+                    assert_eq!(expected, 0);
+                }
+                if hw_vol {
+                    let has_any_vol = backend::device_volume_scalar(&dev, false).is_some()
+                        || (0..st.channel_count as u32)
+                            .any(|ch| backend::device_channel_volume_scalar(&dev, false, ch).is_some());
+                    assert!(
+                        has_any_vol,
+                        "endpoint '{}' reported ENDPOINT_HARDWARE_SUPPORT_VOLUME without readable HAL volume",
+                        dev.name
+                    );
+                }
+                if hw_mute {
+                    assert!(
+                        backend::device_mute(&dev, false).is_some(),
+                        "endpoint '{}' reported ENDPOINT_HARDWARE_SUPPORT_MUTE without readable HAL mute",
+                        dev.name
+                    );
+                }
+            }
+            for dev in backend::input_devices() {
+                let ep = Arc::new(Endpoint::new_capture(dev.clone()));
+                let st = EndpointVolumeState::new(ep);
+                let (hw_vol, hw_mute) =
+                    backend::device_hardware_volume_support(&dev, true, st.channel_count as u32);
+                assert_eq!(
+                    st.hardware_support_mask(),
+                    EndpointVolumeState::hardware_support_mask_from(hw_vol, hw_mute)
+                );
+            }
+            backend::force_backend(None);
+        }
     }
 }
