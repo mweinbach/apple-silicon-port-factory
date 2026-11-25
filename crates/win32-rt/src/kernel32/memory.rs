@@ -1283,6 +1283,14 @@ pub unsafe fn ensure_host_page_readable(addr: usize) {
     let _ = host_mprotect(addr, PAGE, libc::PROT_READ);
 }
 
+/// Run `f` while holding the global `VM` mutex so concurrent `VirtualProtect` /
+/// `VirtualAlloc` / `VirtualFree` / `consume_guard_page` calls cannot race with
+/// temporary host-page freezing during cross-page atomic emulation.
+pub unsafe fn with_vm_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _vm = VM.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 pub unsafe extern "win64" fn VirtualProtectEx(_p: HANDLE, addr: *mut c_void, size: usize, prot: u32, old: *mut u32) -> BOOL {
     VirtualProtect(addr, size, prot, old)
 }

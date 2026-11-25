@@ -915,6 +915,110 @@ fn first_blocked_subpage(start_addr: usize, len: usize, is_write: bool) -> Optio
     None
 }
 
+/// Global RwLock serializing subpage-emulated memory operations against unaligned /
+/// cross-host-page atomics (`write`) while letting non-atomic isolated transfers and
+/// frozen-page signal waiters take shared (`read`) access.
+#[cfg(target_arch = "aarch64")]
+static SUBPAGE_ATOMIC_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Host 16 KiB pages currently frozen to `PROT_NONE` by an in-flight unaligned or
+/// cross-host-page atomic so overlapping native loads/stores/atomics on an accessible
+/// adjacent host page trap into `wait_if_frozen_atomic_hpage` instead of racing.
+#[cfg(target_arch = "aarch64")]
+static FROZEN_ATOMIC_HPAGES: [std::sync::atomic::AtomicUsize; 2] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Recently frozen 16 KiB host pages (indexed by `(hp >> 14) & 15`) and monotonic freeze
+/// epoch so a native fault already in flight to the kernel when the cross-page atomic
+/// restores host protection retries cleanly instead of being misclassified as fatal.
+#[cfg(target_arch = "aarch64")]
+static RECENT_FROZEN_HPAGES: [std::sync::atomic::AtomicUsize; 16] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
+#[cfg(target_arch = "aarch64")]
+static ATOMIC_FREEZE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_arch = "aarch64")]
+fn wait_if_frozen_atomic_hpage(addr: usize, pc: u64) -> bool {
+    thread_local! {
+        static LAST_FROZEN_RETRY: std::cell::Cell<(u64, usize, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+    }
+    let hp = addr & !0x3FFF;
+    if hp == 0 {
+        return false;
+    }
+    if FROZEN_ATOMIC_HPAGES[0].load(Ordering::Acquire) == hp
+        || FROZEN_ATOMIC_HPAGES[1].load(Ordering::Acquire) == hp
+    {
+        let _g = SUBPAGE_ATOMIC_LOCK.read().unwrap_or_else(|e| e.into_inner());
+        let epoch = ATOMIC_FREEZE_EPOCH.load(Ordering::Acquire);
+        LAST_FROZEN_RETRY.with(|c| c.set((pc, addr, epoch)));
+        return true;
+    }
+    if RECENT_FROZEN_HPAGES[(hp >> 14) & 15].load(Ordering::Acquire) == hp {
+        let _g = SUBPAGE_ATOMIC_LOCK.read().unwrap_or_else(|e| e.into_inner());
+        let epoch = ATOMIC_FREEZE_EPOCH.load(Ordering::Acquire);
+        let key = (pc, addr, epoch);
+        if LAST_FROZEN_RETRY.with(|c| c.get()) != key {
+            LAST_FROZEN_RETRY.with(|c| c.set(key));
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn query_host_vm_prot(hpage: usize) -> Option<i32> {
+    const VM_REGION_BASIC_INFO_64: i32 = 9;
+    const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+    extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_region(
+            target_task: libc::mach_port_t,
+            address: *mut u64,
+            size: *mut u64,
+            flavor: i32,
+            info: *mut i32,
+            info_cnt: *mut u32,
+            object_name: *mut libc::mach_port_t,
+        ) -> i32;
+    }
+    let mut qaddr = hpage as u64;
+    let mut qsize = 0u64;
+    let mut info = [0i32; 9];
+    let mut cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    let mut obj: libc::mach_port_t = 0;
+    let kr = mach_vm_region(
+        mach_task_self_,
+        &mut qaddr,
+        &mut qsize,
+        VM_REGION_BASIC_INFO_64,
+        info.as_mut_ptr(),
+        &mut cnt,
+        &mut obj,
+    );
+    if kr != 0 || qaddr > hpage as u64 || (hpage as u64) >= qaddr.saturating_add(qsize) {
+        return None;
+    }
+    Some(info[0])
+}
+
+#[cfg(target_arch = "aarch64")]
+fn vm_prot_to_libc(vm_prot: i32) -> i32 {
+    let mut p = 0i32;
+    if (vm_prot & 1) != 0 {
+        p |= libc::PROT_READ;
+    }
+    if (vm_prot & 2) != 0 {
+        p |= libc::PROT_WRITE;
+    }
+    if (vm_prot & 4) != 0 {
+        p |= libc::PROT_EXEC;
+    }
+    p
+}
+
 /// Transfer `buf` bytes at guest address `[start_addr, start_addr + buf.len())` through an
 /// isolated ephemeral `mach_vm_remap` alias mapping so the guest virtual address stays
 /// strictly `PROT_NONE` for the entire operation — concurrent threads touching `PAGE_GUARD`
@@ -922,6 +1026,12 @@ fn first_blocked_subpage(start_addr: usize, len: usize, is_write: bool) -> Optio
 /// transient readable/writable window.
 #[cfg(target_arch = "aarch64")]
 unsafe fn isolated_hpage_transfer(start_addr: usize, buf: &mut [u8], is_write: bool) -> bool {
+    let _atomic_read = SUBPAGE_ATOMIC_LOCK.read().unwrap_or_else(|e| e.into_inner());
+    isolated_hpage_transfer_unlocked(start_addr, buf, is_write)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn isolated_hpage_transfer_unlocked(start_addr: usize, buf: &mut [u8], is_write: bool) -> bool {
     extern "C" {
         static mach_task_self_: libc::mach_port_t;
         fn mach_vm_remap(
@@ -1006,15 +1116,15 @@ unsafe fn isolated_hpage_transfer(start_addr: usize, buf: &mut [u8], is_write: b
 /// `CAS`, or `CASP`) at guest address `start_addr` through an isolated `mach_vm_remap`
 /// alias so the guest VA stays strictly `PROT_NONE` throughout.
 ///
-/// All subpage-emulated atomics (aligned single-host-page and unaligned/cross-host-page)
-/// serialize under `SUBPAGE_ATOMIC_LOCK` so an unaligned cross-page atomic at `0x3FFC`
-/// cannot race with an overlapping aligned atomic at `0x4000` across distinct `HPAGE_LOCKS`
-/// buckets.
+/// All subpage-emulated atomics serialize under `SUBPAGE_ATOMIC_LOCK` (`write`).
+/// For unaligned or cross-host-page atomics, every touched 16 KiB host page that is not
+/// already `PROT_NONE` is temporarily frozen to `PROT_NONE` (hardware TLB shootdown under
+/// `VM` lock) so overlapping native hardware atomics on an accessible neighboring host
+/// page trap into `wait_if_frozen_atomic_hpage` and retry once the RMW completes.
 #[cfg(target_arch = "aarch64")]
 unsafe fn isolated_hpage_atomic(start_addr: usize, op: Arm64MemOp, ss: *mut u64) -> bool {
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8};
-    static SUBPAGE_ATOMIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _atomic_guard = SUBPAGE_ATOMIC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _atomic_guard = SUBPAGE_ATOMIC_LOCK.write().unwrap_or_else(|e| e.into_inner());
     extern "C" {
         static mach_task_self_: libc::mach_port_t;
         fn mach_vm_remap(
@@ -1207,82 +1317,141 @@ unsafe fn isolated_hpage_atomic(start_addr: usize, op: Arm64MemOp, ss: *mut u64)
         return true;
     }
 
-    // Unaligned or cross-host-page atomic: already serialized with aligned subpage atomics
-    // under `SUBPAGE_ATOMIC_LOCK` above; transfer through isolated aliases.
-    let mut cur = [0u8; 16];
-    if !isolated_hpage_transfer(start_addr, &mut cur[..total_bytes], false) {
-        return false;
-    }
-    let mut next = cur;
-    match op {
-        Arm64MemOp::AtomicRmw { op: rmw, rs, rt, bytes } => {
-            let val = if rs == 31 { 0u64 } else { *ss.add(rs) };
-            let mut old_arr = [0u8; 8];
-            old_arr[..bytes].copy_from_slice(&cur[..bytes]);
-            let old = u64::from_le_bytes(old_arr);
-            let mask = if bytes == 8 { u64::MAX } else { (1u64 << (bytes * 8)) - 1 };
-            let res = match rmw {
-                AtomicRmwOp::Add => old.wrapping_add(val) & mask,
-                AtomicRmwOp::Clr => (old & !val) & mask,
-                AtomicRmwOp::Eor => (old ^ val) & mask,
-                AtomicRmwOp::Set => (old | val) & mask,
-                AtomicRmwOp::Swp => val & mask,
+    // Unaligned or cross-host-page atomic: hold `VM` lock and temporarily freeze every
+    // touched host page that is not already `PROT_NONE` so concurrent native loads/stores/
+    // atomics on an accessible adjacent host page trap into `wait_if_frozen_atomic_hpage`
+    // and retry after we restore host protections.
+    let h0 = hpage;
+    let h1 = end_addr & !0x3FFF;
+    win32_rt::kernel32::memory::with_vm_lock(|| {
+        let mut frozen: [(usize, i32); 2] = [(0, 0); 2];
+        let mut frozen_n = 0usize;
+        let pages = if h1 != h0 { [h0, h1] } else { [h0, 0] };
+
+        FROZEN_ATOMIC_HPAGES[0].store(pages[0], Ordering::Release);
+        FROZEN_ATOMIC_HPAGES[1].store(pages[1], Ordering::Release);
+        for &hp in &pages {
+            if hp != 0 {
+                RECENT_FROZEN_HPAGES[(hp >> 14) & 15].store(hp, Ordering::Release);
+            }
+        }
+        ATOMIC_FREEZE_EPOCH.fetch_add(1, Ordering::Release);
+
+        let mut freeze_ok = true;
+        for &hp in &pages {
+            if hp == 0 {
+                continue;
+            }
+            let Some(cur_vm_prot) = query_host_vm_prot(hp) else {
+                freeze_ok = false;
+                break;
             };
-            next[..bytes].copy_from_slice(&res.to_le_bytes()[..bytes]);
-            if !isolated_hpage_transfer(start_addr, &mut next[..bytes], true) {
-                return false;
-            }
-            if rt < 31 {
-                *ss.add(rt) = old;
+            if cur_vm_prot != 0 {
+                if libc::mprotect(hp as *mut libc::c_void, 0x4000, libc::PROT_NONE) != 0 {
+                    freeze_ok = false;
+                    break;
+                }
+                frozen[frozen_n] = (hp, vm_prot_to_libc(cur_vm_prot));
+                frozen_n += 1;
             }
         }
-        Arm64MemOp::AtomicCas { rs, rt, bytes } => {
-            let mask = if bytes == 8 { u64::MAX } else { (1u64 << (bytes * 8)) - 1 };
-            let exp = (if rs == 31 { 0u64 } else { *ss.add(rs) }) & mask;
-            let rep = (if rt == 31 { 0u64 } else { *ss.add(rt) }) & mask;
-            let mut old_arr = [0u8; 8];
-            old_arr[..bytes].copy_from_slice(&cur[..bytes]);
-            let old = u64::from_le_bytes(old_arr);
-            if old == exp {
-                next[..bytes].copy_from_slice(&rep.to_le_bytes()[..bytes]);
-                if !isolated_hpage_transfer(start_addr, &mut next[..bytes], true) {
-                    return false;
-                }
-            }
-            if rs < 31 {
-                *ss.add(rs) = old;
-            }
-        }
-        Arm64MemOp::AtomicCasp { rs, rt, elem_bytes } => {
-            if elem_bytes == 4 {
-                let old_lo = u32::from_le_bytes(cur[0..4].try_into().unwrap());
-                let old_hi = u32::from_le_bytes(cur[4..8].try_into().unwrap());
-                if old_lo == *ss.add(rs) as u32 && old_hi == *ss.add(rs + 1) as u32 {
-                    next[0..4].copy_from_slice(&(*ss.add(rt) as u32).to_le_bytes());
-                    next[4..8].copy_from_slice(&(*ss.add(rt + 1) as u32).to_le_bytes());
-                    if !isolated_hpage_transfer(start_addr, &mut next[..8], true) {
-                        return false;
-                    }
-                }
-                *ss.add(rs) = old_lo as u64;
-                *ss.add(rs + 1) = old_hi as u64;
+
+        let ok = if freeze_ok {
+            let mut cur = [0u8; 16];
+            if !isolated_hpage_transfer_unlocked(start_addr, &mut cur[..total_bytes], false) {
+                false
             } else {
-                let old_lo = u64::from_le_bytes(cur[0..8].try_into().unwrap());
-                let old_hi = u64::from_le_bytes(cur[8..16].try_into().unwrap());
-                if old_lo == *ss.add(rs) && old_hi == *ss.add(rs + 1) {
-                    next[0..8].copy_from_slice(&(*ss.add(rt)).to_le_bytes());
-                    next[8..16].copy_from_slice(&(*ss.add(rt + 1)).to_le_bytes());
-                    if !isolated_hpage_transfer(start_addr, &mut next[..16], true) {
-                        return false;
+                let mut next = cur;
+                match op {
+                    Arm64MemOp::AtomicRmw { op: rmw, rs, rt, bytes } => {
+                        let val = if rs == 31 { 0u64 } else { *ss.add(rs) };
+                        let mut old_arr = [0u8; 8];
+                        old_arr[..bytes].copy_from_slice(&cur[..bytes]);
+                        let old = u64::from_le_bytes(old_arr);
+                        let mask = if bytes == 8 { u64::MAX } else { (1u64 << (bytes * 8)) - 1 };
+                        let res = match rmw {
+                            AtomicRmwOp::Add => old.wrapping_add(val) & mask,
+                            AtomicRmwOp::Clr => (old & !val) & mask,
+                            AtomicRmwOp::Eor => (old ^ val) & mask,
+                            AtomicRmwOp::Set => (old | val) & mask,
+                            AtomicRmwOp::Swp => val & mask,
+                        };
+                        next[..bytes].copy_from_slice(&res.to_le_bytes()[..bytes]);
+                        if isolated_hpage_transfer_unlocked(start_addr, &mut next[..bytes], true) {
+                            if rt < 31 {
+                                *ss.add(rt) = old;
+                            }
+                            true
+                        } else {
+                            false
+                        }
                     }
+                    Arm64MemOp::AtomicCas { rs, rt, bytes } => {
+                        let mask = if bytes == 8 { u64::MAX } else { (1u64 << (bytes * 8)) - 1 };
+                        let exp = (if rs == 31 { 0u64 } else { *ss.add(rs) }) & mask;
+                        let rep = (if rt == 31 { 0u64 } else { *ss.add(rt) }) & mask;
+                        let mut old_arr = [0u8; 8];
+                        old_arr[..bytes].copy_from_slice(&cur[..bytes]);
+                        let old = u64::from_le_bytes(old_arr);
+                        let wrote_ok = if old == exp {
+                            next[..bytes].copy_from_slice(&rep.to_le_bytes()[..bytes]);
+                            isolated_hpage_transfer_unlocked(start_addr, &mut next[..bytes], true)
+                        } else {
+                            true
+                        };
+                        if wrote_ok && rs < 31 {
+                            *ss.add(rs) = old;
+                        }
+                        wrote_ok
+                    }
+                    Arm64MemOp::AtomicCasp { rs, rt, elem_bytes } => {
+                        if elem_bytes == 4 {
+                            let old_lo = u32::from_le_bytes(cur[0..4].try_into().unwrap());
+                            let old_hi = u32::from_le_bytes(cur[4..8].try_into().unwrap());
+                            let wrote_ok = if old_lo == *ss.add(rs) as u32 && old_hi == *ss.add(rs + 1) as u32 {
+                                next[0..4].copy_from_slice(&(*ss.add(rt) as u32).to_le_bytes());
+                                next[4..8].copy_from_slice(&(*ss.add(rt + 1) as u32).to_le_bytes());
+                                isolated_hpage_transfer_unlocked(start_addr, &mut next[..8], true)
+                            } else {
+                                true
+                            };
+                            if wrote_ok {
+                                *ss.add(rs) = old_lo as u64;
+                                *ss.add(rs + 1) = old_hi as u64;
+                            }
+                            wrote_ok
+                        } else {
+                            let old_lo = u64::from_le_bytes(cur[0..8].try_into().unwrap());
+                            let old_hi = u64::from_le_bytes(cur[8..16].try_into().unwrap());
+                            let wrote_ok = if old_lo == *ss.add(rs) && old_hi == *ss.add(rs + 1) {
+                                next[0..8].copy_from_slice(&(*ss.add(rt)).to_le_bytes());
+                                next[8..16].copy_from_slice(&(*ss.add(rt + 1)).to_le_bytes());
+                                isolated_hpage_transfer_unlocked(start_addr, &mut next[..16], true)
+                            } else {
+                                true
+                            };
+                            if wrote_ok {
+                                *ss.add(rs) = old_lo;
+                                *ss.add(rs + 1) = old_hi;
+                            }
+                            wrote_ok
+                        }
+                    }
+                    _ => false,
                 }
-                *ss.add(rs) = old_lo;
-                *ss.add(rs + 1) = old_hi;
             }
+        } else {
+            false
+        };
+
+        for &(hp, orig_prot) in &frozen[..frozen_n] {
+            let _ = libc::mprotect(hp as *mut libc::c_void, 0x4000, orig_prot);
         }
-        _ => return false,
-    }
-    true
+        ATOMIC_FREEZE_EPOCH.fetch_add(1, Ordering::Release);
+        FROZEN_ATOMIC_HPAGES[0].store(0, Ordering::Release);
+        FROZEN_ATOMIC_HPAGES[1].store(0, Ordering::Release);
+        ok
+    })
 }
 
 /// Emulate one AArch64 GPR, SIMD&FP, pair, or LSE atomic instruction against logically
@@ -1796,10 +1965,13 @@ extern "C" fn handler(sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut li
             let ec = (esr >> 26) & 0x3F;
             let is_write = (ec == 0x24 || ec == 0x25) && (esr & (1 << 6)) != 0;
             let clean_fault = fault_addr & 0x0000_FFFF_FFFF_FFFF;
+            let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
+            if wait_if_frozen_atomic_hpage(clean_fault as usize, pc) {
+                return;
+            }
             if win32_rt::kernel32::memory::try_handle_write_watch_fault(clean_fault as usize, is_write) {
                 return;
             }
-            let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
             if try_dispatch_guest_page_fault(clean_fault, pc, is_write, mc, ss) {
                 return;
             }
@@ -2264,6 +2436,65 @@ mod tests {
             let hi = u32::from_le_bytes(got[4..8].try_into().unwrap());
             assert_eq!(lo, ITERS as u32);
             assert_eq!(hi, (ITERS * 2) as u32, "aligned and cross-page subpage atomics must not lose updates");
+
+            libc::munmap(raw, 0x8000);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn isolated_hpage_atomic_serializes_with_native_overlapping_atomics() {
+        use std::sync::atomic::AtomicU32;
+        install_handlers();
+        unsafe {
+            // Host page 0 is PROT_NONE (restricted); host page 1 is normally writable (PROT_READ | PROT_WRITE).
+            let raw = libc::mmap(
+                std::ptr::null_mut(),
+                0x8000,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(raw, libc::MAP_FAILED);
+            assert_eq!(libc::mprotect(raw, 0x4000, libc::PROT_NONE), 0);
+
+            let base = raw as usize;
+            let cross_addr = base + 0x3FFC;
+            let native_addr = base + 0x4000;
+            const CROSS_ITERS: usize = 300;
+            const NATIVE_ITERS: usize = 5000;
+
+            let t_cross = std::thread::spawn(move || {
+                let mut ss = [0u64; 33];
+                ss[1] = 0x0000_0001_0000_0001u64; // +1 to low u32 (0x3FFC) and +1 to high u32 (0x4000)
+                let op = Arm64MemOp::AtomicRmw { op: AtomicRmwOp::Add, rs: 1, rt: 2, bytes: 8 };
+                for _ in 0..CROSS_ITERS {
+                    assert!(isolated_hpage_atomic(cross_addr, op, ss.as_mut_ptr()));
+                }
+            });
+            let t_native = std::thread::spawn(move || {
+                let cell = &*(native_addr as *const AtomicU32);
+                for _ in 0..NATIVE_ITERS {
+                    cell.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            t_cross.join().unwrap();
+            t_native.join().unwrap();
+
+            let mut got = [0u8; 8];
+            assert!(isolated_hpage_transfer(cross_addr, &mut got, false));
+            let lo = u32::from_le_bytes(got[0..4].try_into().unwrap());
+            let hi = u32::from_le_bytes(got[4..8].try_into().unwrap());
+            assert_eq!(lo, CROSS_ITERS as u32);
+            assert_eq!(
+                hi,
+                (CROSS_ITERS + NATIVE_ITERS) as u32,
+                "cross-page atomic must serialize with native overlapping atomics on the writable second host page"
+            );
+            // Verify host page protections were restored identically: page 0 stays PROT_NONE, page 1 stays RW.
+            assert_eq!(query_host_vm_prot(base), Some(0));
+            assert_eq!(query_host_vm_prot(native_addr), Some(1 | 2));
 
             libc::munmap(raw, 0x8000);
         }

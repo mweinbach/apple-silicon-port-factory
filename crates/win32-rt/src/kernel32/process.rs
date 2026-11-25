@@ -1781,6 +1781,12 @@ fn collect_inherited_jobs_for_child(creation_flags: u32) -> Result<Vec<Arc<JobOb
                 return Err(err::ERROR_NOT_ENOUGH_QUOTA);
             }
         }
+        if st.has_unenforced_child_limits() {
+            log::warn!(
+                "CreateProcess: parent job has affinity/priority limits that cannot be enforced on child processes"
+            );
+            return Err(err::ERROR_NOT_SUPPORTED);
+        }
         drop(st);
         inherited.push(jo);
     }
@@ -1788,7 +1794,8 @@ fn collect_inherited_jobs_for_child(creation_flags: u32) -> Result<Vec<Arc<JobOb
 }
 
 /// Attach a newly spawned `ChildProcessObj` to every inherited parent job, re-checking
-/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` under each job's lock and posting `JOB_OBJECT_MSG_NEW_PROCESS`.
+/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` and child-limit enforceability under each job's lock
+/// and posting `JOB_OBJECT_MSG_NEW_PROCESS`.
 #[cfg(not(target_os = "ios"))]
 fn attach_child_to_inherited_jobs(child: &Arc<ChildProcessObj>, jobs: &[Arc<JobObj>]) -> Result<(), u32> {
     let pid = child.pid;
@@ -1798,18 +1805,28 @@ fn attach_child_to_inherited_jobs(child: &Arc<ChildProcessObj>, jobs: &[Arc<JobO
         if st.contains_pid(pid) {
             continue;
         }
-        if (st.limit_flags() & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 {
-            let limit = st.active_process_limit();
-            if limit > 0 && st.active_count() >= limit {
-                drop(st);
-                // Roll back earlier attachments in this batch before failing.
-                for prev in attached {
-                    let mut pst = prev.state.lock().unwrap_or_else(|e| e.into_inner());
-                    pst.members.retain(|m| m.pid() != pid);
-                    pst.total_processes = pst.total_processes.saturating_sub(1);
-                }
-                return Err(err::ERROR_NOT_ENOUGH_QUOTA);
+        let fail_err = if (st.limit_flags() & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0
+            && st.active_process_limit() > 0
+            && st.active_count() >= st.active_process_limit()
+        {
+            Some(err::ERROR_NOT_ENOUGH_QUOTA)
+        } else if st.has_unenforced_child_limits() {
+            log::warn!(
+                "CreateProcess: parent job has affinity/priority limits that cannot be enforced on child processes"
+            );
+            Some(err::ERROR_NOT_SUPPORTED)
+        } else {
+            None
+        };
+        if let Some(code) = fail_err {
+            drop(st);
+            // Roll back earlier attachments in this batch before failing.
+            for prev in attached {
+                let mut pst = prev.state.lock().unwrap_or_else(|e| e.into_inner());
+                pst.members.retain(|m| m.pid() != pid);
+                pst.total_processes = pst.total_processes.saturating_sub(1);
             }
+            return Err(code);
         }
         st.members.push(JobMember::Child(Arc::clone(child)));
         st.total_processes = st.total_processes.saturating_add(1);
@@ -2005,12 +2022,12 @@ impl JobState {
 
     /// Effective `(mask, allow_subset)` affinity constraint imposed by this job across both
     /// `JOB_OBJECT_LIMIT_AFFINITY` (class 2/9) and `JobObjectGroupInformationEx` (class 14).
-    fn effective_affinity(&self) -> Option<(usize, bool)> {
-        let flags = self.limit_flags();
+    fn effective_affinity_from(basic_limits: &[u8; 64], group_affinities: &[[u8; 16]]) -> Option<(usize, bool)> {
+        let flags = u32::from_le_bytes(basic_limits[16..20].try_into().unwrap());
         let mut mask: Option<usize> = None;
         let mut allow_subset = true;
         if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
-            let aff = usize::from_le_bytes(self.basic_limits[48..56].try_into().unwrap());
+            let aff = usize::from_le_bytes(basic_limits[48..56].try_into().unwrap());
             if aff != 0 {
                 mask = Some(aff);
                 if (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) == 0 {
@@ -2018,13 +2035,46 @@ impl JobState {
                 }
             }
         }
-        if let Some(ga_mask) = self.group_affinity_mask() {
-            mask = Some(match mask {
-                Some(m) => m & ga_mask,
-                None => ga_mask,
-            });
+        if !group_affinities.is_empty() {
+            let mut ga_mask = 0usize;
+            for ga in group_affinities {
+                ga_mask |= usize::from_le_bytes(ga[0..8].try_into().unwrap());
+            }
+            if ga_mask != 0 {
+                mask = Some(match mask {
+                    Some(m) => m & ga_mask,
+                    None => ga_mask,
+                });
+            }
         }
         mask.filter(|&m| m != 0).map(|m| (m, allow_subset))
+    }
+    fn effective_affinity(&self) -> Option<(usize, bool)> {
+        Self::effective_affinity_from(&self.basic_limits, &self.group_affinities)
+    }
+    fn has_live_child(&self) -> bool {
+        self.members.iter().any(|m| match m {
+            JobMember::Child(c) => c.current_exit_code().is_none(),
+            JobMember::SelfProc(_) => false,
+        })
+    }
+    fn limits_require_child_enforcement(basic_limits: &[u8; 64], group_affinities: &[[u8; 16]]) -> bool {
+        if let Some((aff, allow_subset)) = Self::effective_affinity_from(basic_limits, group_affinities) {
+            if aff != system_affinity_mask() || !allow_subset {
+                return true;
+            }
+        }
+        let flags = u32::from_le_bytes(basic_limits[16..20].try_into().unwrap());
+        if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 {
+            let prio = u32::from_le_bytes(basic_limits[56..60].try_into().unwrap());
+            if prio != 0 {
+                return true;
+            }
+        }
+        false
+    }
+    fn has_unenforced_child_limits(&self) -> bool {
+        Self::limits_require_child_enforcement(&self.basic_limits, &self.group_affinities)
     }
     fn group_affinity_mask(&self) -> Option<usize> {
         if self.group_affinities.is_empty() {
@@ -2286,6 +2336,13 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
             return FALSE;
         }
     }
+    if matches!(member, JobMember::Child(_)) && st.has_unenforced_child_limits() {
+        log::warn!(
+            "AssignProcessToJobObject: cannot assign child process to job with affinity/priority limits (cross-process enforcement is not supported)"
+        );
+        set_err(err::ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
     if (st.limit_flags() & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && pid == std::process::id() {
         let prio = u32::from_le_bytes(st.basic_limits[56..60].try_into().unwrap());
         if prio != 0 {
@@ -2371,6 +2428,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                     set_err(err::ERROR_INVALID_PARAMETER);
                     return FALSE;
                 }
+            }
+            if st.has_live_child() && JobState::limits_require_child_enforcement(&buf, &st.group_affinities) {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectBasicLimitInformation): cannot apply affinity/priority limits to a job containing child processes"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
             }
             st.basic_limits = buf;
             let contains_self = st.contains_pid(std::process::id());
@@ -2463,6 +2527,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                     return FALSE;
                 }
             }
+            if st.has_live_child() && JobState::limits_require_child_enforcement(&basic, &st.group_affinities) {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectExtendedLimitInformation): cannot apply affinity/priority limits to a job containing child processes"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
             st.basic_limits = basic;
             let contains_self = st.contains_pid(std::process::id());
             if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && contains_self {
@@ -2536,6 +2607,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                     set_err(err::ERROR_INVALID_PARAMETER);
                     return FALSE;
                 }
+            }
+            if st.has_live_child() && JobState::limits_require_child_enforcement(&st.basic_limits, &out) {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectGroupInformationEx): cannot apply restricted group affinity to a job containing child processes"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
             }
             st.group_affinities = out;
             let apply_aff = if st.contains_pid(std::process::id()) {
@@ -4499,8 +4577,39 @@ pub(crate) mod tests {
                 assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
                 // ActiveProcessLimit == 2 is now saturated (self + inherited child).
                 assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
+                // While a live child belongs to the job, setting restricted affinity (class 2/9/14)
+                // or priority class fails honestly with ERROR_NOT_SUPPORTED.
+                if orig_sm >= 0x3 {
+                    let mut child_aff = [0u8; 64];
+                    std::ptr::write_unaligned(
+                        child_aff.as_mut_ptr().add(16) as *mut u32,
+                        JOB_OBJECT_LIMIT_AFFINITY,
+                    );
+                    std::ptr::write_unaligned(child_aff.as_mut_ptr().add(48) as *mut usize, 0x1usize);
+                    assert_eq!(SetInformationJobObject(job, 2, child_aff.as_ptr() as *const c_void, 64), FALSE);
+                    assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                    let mut child_ga = [0u8; 16];
+                    std::ptr::write_unaligned(child_ga.as_mut_ptr() as *mut usize, 0x1usize);
+                    assert_eq!(SetInformationJobObject(job, 14, child_ga.as_ptr() as *const c_void, 16), FALSE);
+                    assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                }
                 inh_child.finish_reaped(Some(0), 0);
                 assert_eq!(crate::kernel32::threads::CloseHandle(inh_h), TRUE);
+
+                // Assigning a child to a job that already has restricted affinity (class 2 or 14)
+                // fails honestly with ERROR_NOT_SUPPORTED instead of leaving the child unrestricted.
+                if orig_sm >= 0x3 {
+                    let rjob = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                    assert!(!rjob.is_null());
+                    let mut rga = [0u8; 16];
+                    std::ptr::write_unaligned(rga.as_mut_ptr() as *mut usize, 0x1usize);
+                    assert_eq!(SetInformationJobObject(rjob, 14, rga.as_ptr() as *const c_void, 16), TRUE);
+                    let rej_child = make_test_child_handle(99992, "C:\\Games\\RejectedChild.exe");
+                    assert_eq!(AssignProcessToJobObject(rjob, rej_child), FALSE);
+                    assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                    assert_eq!(crate::kernel32::threads::CloseHandle(rej_child), TRUE);
+                    assert_eq!(crate::kernel32::threads::CloseHandle(rjob), TRUE);
+                }
             }
 
             // Switch to SILENT_BREAKAWAY_OK (clearing KILL_ON_JOB_CLOSE, ACTIVE_PROCESS, and AFFINITY)
