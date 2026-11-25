@@ -1903,6 +1903,25 @@ fn text_analyzer_shapes_complex_arabic_and_combining_marks_and_rejects_unshapeab
         );
         assert_eq!(bsink.bidis, vec![(0, 2, 1, 1), (2, 2, 1, 2), (4, 1, 1, 1)]);
 
+        // Devanagari ("אב कख ג") and Hangul ("אב 한글 ג") in RTL paragraphs must resolve to
+        // [1, 1, 1, 2, 2, 1, 1] -> runs (0, 3, 1, 1), (3, 2, 1, 2), (5, 2, 1, 1).
+        for sample in ["\u{05D0}\u{05D1} \u{0915}\u{0916} \u{05D2}", "\u{05D0}\u{05D1} \u{D55C}\u{AE00} \u{05D2}"] {
+            let u16s: Vec<u16> = sample.encode_utf16().collect();
+            rsrc.text = u16s.clone();
+            bsink.bidis.clear();
+            assert_eq!(
+                an_bidi(
+                    ta,
+                    &mut rsrc as *mut _ as *mut c_void,
+                    0,
+                    u16s.len() as u32,
+                    &mut bsink as *mut _ as *mut c_void,
+                ),
+                S_OK
+            );
+            assert_eq!(bsink.bidis, vec![(0, 3, 1, 1), (3, 2, 1, 2), (5, 2, 1, 1)], "sample={sample:?}");
+        }
+
         // 5. Per-range OpenType features: "fifi" with range 0 (len 2) disabling `liga` and
         //    range 1 (len 2) enabling `liga` on a font with an `fi` ligature produces 2 glyphs
         //    for range 0 and 1 ligature glyph for range 1 (total 3 glyphs, clusterMap [0,1,2,2]).

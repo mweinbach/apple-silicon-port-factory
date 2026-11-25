@@ -92,10 +92,16 @@ fn classify_script(ch: char) -> u16 {
 
 fn is_strong_ltr(ch: char) -> bool {
     let c = ch as u32;
-    (0x0041..=0x005A).contains(&c)
-        || (0x0061..=0x007A).contains(&c)
-        || (0x00C0..=0x052F).contains(&c)
-        || (0x3040..=0x9FFF).contains(&c)
+    if c == 0x200E {
+        return true; // LEFT-TO-RIGHT MARK
+    }
+    if matches!(
+        c,
+        0x0590..=0x08FF | 0xFB1D..=0xFEFC | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF
+    ) {
+        return false;
+    }
+    ch.is_alphabetic()
 }
 
 fn decode_u16_at(units: &[u16], i: usize) -> (char, usize) {
@@ -242,11 +248,21 @@ fn classify_bidi(ch: char) -> BidiClass {
             BidiClass::WS
         }
         // Arabic letters (AL)
-        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => {
-            BidiClass::AL
-        }
-        // Strong RTL (Hebrew, Syriac, Thaana, NKo, etc.)
-        0x0590..=0x05FF | 0x0700..=0x074F | 0x0780..=0x089F | 0xFB1D..=0xFB4F => BidiClass::R,
+        0x0600..=0x06FF
+        | 0x0750..=0x077F
+        | 0x0870..=0x08FF
+        | 0xFB50..=0xFDFF
+        | 0xFE70..=0xFEFF
+        | 0x1EE00..=0x1EEFF => BidiClass::AL,
+        // Strong RTL (Hebrew, Syriac, Thaana, NKo, RLM, SMP RTL scripts)
+        0x0590..=0x05FF
+        | 0x0700..=0x074F
+        | 0x0780..=0x086F
+        | 0x200F
+        | 0xFB1D..=0xFB4F
+        | 0x10800..=0x10FFF
+        | 0x1E800..=0x1EDFF
+        | 0x1EF00..=0x1EFFF => BidiClass::R,
         _ if is_strong_ltr(ch) => BidiClass::L,
         _ => BidiClass::ON,
     }
