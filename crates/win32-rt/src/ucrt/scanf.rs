@@ -17,19 +17,30 @@ struct Input {
 }
 
 impl Input {
-    unsafe fn peek(&self) -> Option<u32> {
-        if self.pos >= self.len {
+    unsafe fn peek_at(&self, off: usize) -> Option<u32> {
+        let idx = self.pos.checked_add(off)?;
+        if idx >= self.len {
             return None;
         }
-        let c = if self.wide { *(self.p as *const u16).add(self.pos) as u32 } else { *self.p.add(self.pos) as u32 };
+        let c = if self.wide {
+            (self.p as *const u16).add(idx).read_unaligned() as u32
+        } else {
+            *self.p.add(idx) as u32
+        };
         if c == 0 {
             None
         } else {
             Some(c)
         }
     }
+    unsafe fn peek(&self) -> Option<u32> {
+        self.peek_at(0)
+    }
     fn bump(&mut self) {
         self.pos += 1;
+    }
+    fn advance(&mut self, n: usize) {
+        self.pos += n;
     }
 }
 
@@ -300,73 +311,132 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
                 });
                 let maxc = if lower == b'c' && width == 0 { 1 } else { maxw };
                 let cp = super::locale::locale_obj_cp(loc);
-                let mut got: Vec<u32> = Vec::new();
-                if lower == b'c' && !wide && is_wide && cp != 0 {
-                    let mut chars = 0usize;
-                    while chars < maxc {
-                        let Some(b0) = input.peek() else { break };
-                        let need_bytes = if cp == 65001 {
-                            match b0 as u8 {
-                                0x00..=0x7F => 1,
-                                0xC2..=0xDF => 2,
-                                0xE0..=0xEF => 3,
-                                0xF0..=0xF4 => 4,
-                                _ => 1,
-                            }
-                        } else if crate::kernel32::string::IsDBCSLeadByteEx(cp, b0 as u8) != 0 {
-                            2
-                        } else {
-                            1
-                        };
-                        for _ in 0..need_bytes {
-                            let Some(b) = input.peek() else { break };
-                            got.push(b);
-                            input.bump();
-                        }
-                        chars += 1;
+                let mut units: Vec<u32> = Vec::new();
+                let mut conv_failed = false;
+                let char_ok = |c: u32| -> bool {
+                    match lower {
+                        b's' => !is_space(c),
+                        b'c' => true,
+                        _ => set.iter().any(|&(a, b)| c >= a && c <= b) != negate,
                     }
-                } else {
-                    while got.len() < maxc {
-                        let Some(c) = input.peek() else { break };
-                        let ok = match lower {
-                            b's' => !is_space(c),
-                            b'c' => true,
-                            _ => set.iter().any(|&(a, b)| c >= a && c <= b) != negate,
-                        };
-                        if !ok {
-                            break;
-                        }
-                        got.push(c);
-                        input.bump();
-                    }
-                }
-                if got.is_empty() || (lower == b'c' && got.len() < maxc) && got.is_empty() {
-                    break;
-                }
-                // Convert between input width and destination width using LC_CTYPE.
-                let units: Vec<u32> = match (wide, is_wide) {
+                };
+                match (wide, is_wide) {
                     (false, true) => {
-                        let bytes: Vec<u8> = got.iter().map(|&c| c as u8).collect();
-                        match super::convert::mb_decode_slice_cp(cp, &bytes) {
-                            Ok(w) => w.into_iter().map(|u| u as u32).collect(),
-                            Err(()) => {
-                                super::errno::set(super::errno::EILSEQ);
+                        // Narrow input -> wide UTF-16 destination: bound by destination UTF-16
+                        // units (`maxc`) so supplementary characters never overflow `%lc`/`%Nlc`.
+                        while units.len() < maxc {
+                            let Some(b0) = input.peek() else { break };
+                            if !char_ok(b0) {
                                 break;
+                            }
+                            let need_bytes = if cp == 0 {
+                                1usize
+                            } else if cp == 65001 {
+                                match b0 as u8 {
+                                    0x00..=0x7F => 1,
+                                    0xC2..=0xDF => 2,
+                                    0xE0..=0xEF => 3,
+                                    0xF0..=0xF4 => 4,
+                                    _ => {
+                                        super::errno::set(super::errno::EILSEQ);
+                                        conv_failed = true;
+                                        break;
+                                    }
+                                }
+                            } else if crate::kernel32::string::IsDBCSLeadByteEx(cp, b0 as u8) != 0 {
+                                2
+                            } else {
+                                1
+                            };
+                            let mut seq = [b0 as u8, 0, 0, 0];
+                            let mut complete = true;
+                            for k in 1..need_bytes {
+                                match input.peek_at(k) {
+                                    Some(bk) => seq[k] = bk as u8,
+                                    None => {
+                                        complete = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !complete {
+                                super::errno::set(super::errno::EILSEQ);
+                                conv_failed = true;
+                                break;
+                            }
+                            match super::convert::mb_decode_cp(cp, &seq[..need_bytes]) {
+                                Ok(Some((w, used))) => {
+                                    if units.len() + w.len() > maxc {
+                                        if lower == b'c' || units.is_empty() {
+                                            super::errno::set(super::errno::EILSEQ);
+                                            conv_failed = true;
+                                        }
+                                        break;
+                                    }
+                                    units.extend(w.into_iter().map(|u| u as u32));
+                                    input.advance(used);
+                                }
+                                Ok(None) | Err(()) => {
+                                    super::errno::set(super::errno::EILSEQ);
+                                    conv_failed = true;
+                                    break;
+                                }
                             }
                         }
                     }
                     (true, false) => {
-                        let w: Vec<u16> = got.iter().map(|&c| c as u16).collect();
-                        match super::convert::wc_encode_slice_cp(cp, &w) {
-                            Ok(bytes) => bytes.into_iter().map(|b| b as u32).collect(),
-                            Err(()) => {
-                                super::errno::set(super::errno::EILSEQ);
+                        // Wide UTF-16 input -> narrow byte destination: bound by destination
+                        // byte count (`maxc`) so multibyte encodings never overflow `%hc`/`%Nhc`.
+                        while units.len() < maxc {
+                            let Some(u0) = input.peek() else { break };
+                            if !char_ok(u0) {
                                 break;
+                            }
+                            let u0_16 = u0 as u16;
+                            let (enc, step) = if (0xD800..=0xDBFF).contains(&u0_16) {
+                                match input.peek_at(1) {
+                                    Some(u1) if (0xDC00..=0xDFFF).contains(&(u1 as u16)) => {
+                                        (super::convert::wc_encode_slice_cp(cp, &[u0_16, u1 as u16]), 2)
+                                    }
+                                    _ => (super::convert::wc_encode_cp(cp, u0_16), 1),
+                                }
+                            } else {
+                                (super::convert::wc_encode_cp(cp, u0_16), 1)
+                            };
+                            match enc {
+                                Ok(bytes) => {
+                                    if units.len() + bytes.len() > maxc {
+                                        if lower == b'c' || units.is_empty() {
+                                            super::errno::set(super::errno::EILSEQ);
+                                            conv_failed = true;
+                                        }
+                                        break;
+                                    }
+                                    units.extend(bytes.into_iter().map(|b| b as u32));
+                                    input.advance(step);
+                                }
+                                Err(()) => {
+                                    super::errno::set(super::errno::EILSEQ);
+                                    conv_failed = true;
+                                    break;
+                                }
                             }
                         }
                     }
-                    _ => got.clone(),
-                };
+                    _ => {
+                        while units.len() < maxc {
+                            let Some(c) = input.peek() else { break };
+                            if !char_ok(c) {
+                                break;
+                            }
+                            units.push(c);
+                            input.bump();
+                        }
+                    }
+                }
+                if conv_failed || units.is_empty() {
+                    break;
+                }
                 converted_any = true;
                 if !suppress {
                     let p = args.next_ptr::<u8>();
@@ -375,7 +445,7 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
                     if need > cap {
                         if cap > 0 {
                             if is_wide {
-                                *(p as *mut u16) = 0;
+                                (p as *mut u16).write_unaligned(0);
                             } else {
                                 *p = 0;
                             }
@@ -385,14 +455,14 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
                     }
                     for (k, &u) in units.iter().enumerate() {
                         if is_wide {
-                            *(p as *mut u16).add(k) = u as u16;
+                            (p as *mut u16).add(k).write_unaligned(u as u16);
                         } else {
                             *p.add(k) = u as u8;
                         }
                     }
                     if lower != b'c' {
                         if is_wide {
-                            *(p as *mut u16).add(units.len()) = 0;
+                            (p as *mut u16).add(units.len()).write_unaligned(0);
                         } else {
                             *p.add(units.len()) = 0;
                         }
@@ -533,7 +603,83 @@ mod tests {
                 1
             );
             assert_eq!(&nbuf[..3], &[0x82, 0xA0, 0]);
+            // Wide -> narrow %hc must reject 2-byte CP932 char instead of overflowing 1-byte dest.
+            let mut ncan = [0xAAu8, 0xEF];
+            let fmt_hc: Vec<u16> = "%hc\0".encode_utf16().collect();
+            let fmt_2hc: Vec<u16> = "%2hc\0".encode_utf16().collect();
+            let args_ncan = [ncan.as_mut_ptr() as u64];
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vswscanf(0, wide_ja.as_ptr(), usize::MAX, fmt_hc.as_ptr(), loc_ja_ct, args_ncan.as_ptr() as *const u8),
+                0
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EILSEQ);
+            assert_eq!(ncan, [0xAA, 0xEF]);
+            let mut ncan2 = [0u8, 0, 0xEF];
+            let args_ncan2 = [ncan2.as_mut_ptr() as u64];
+            assert_eq!(
+                __stdio_common_vswscanf(0, wide_ja.as_ptr(), usize::MAX, fmt_2hc.as_ptr(), loc_ja_ct, args_ncan2.as_ptr() as *const u8),
+                1
+            );
+            assert_eq!(ncan2, [0x82, 0xA0, 0xEF]);
             crate::ucrt::locale::_free_locale(loc_ja_ct);
+
+            // UTF-8 supplementary scalar ("😀" = 2 UTF-16 surrogates) must not overflow %lc (1 wchar_t).
+            let loc_u8 = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"de-DE.utf8\0".as_ptr());
+            assert!(!loc_u8.is_null());
+            let emoji = "😀\0";
+            let mut wcan = [0xAAAAu16, 0xBEEF];
+            let args_wcan = [wcan.as_mut_ptr() as u64];
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vsscanf(0, emoji.as_ptr(), usize::MAX, b"%lc\0".as_ptr(), loc_u8, args_wcan.as_ptr() as *const u8),
+                0
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EILSEQ);
+            assert_eq!(wcan, [0xAAAA, 0xBEEF]);
+
+            // %2lc fits the 2 UTF-16 surrogate units cleanly without touching the trailing canary.
+            let mut wcan2 = [0u16, 0, 0xBEEF];
+            let args_wcan2 = [wcan2.as_mut_ptr() as u64];
+            assert_eq!(
+                __stdio_common_vsscanf(0, emoji.as_ptr(), usize::MAX, b"%2lc\0".as_ptr(), loc_u8, args_wcan2.as_ptr() as *const u8),
+                1
+            );
+            assert_eq!(wcan2, [0xD83D, 0xDE00, 0xBEEF]);
+
+            // %2lc on "a😀" rejects instead of overwriting past 2 wchar_t slots.
+            let a_emoji = "a😀\0";
+            let mut wcan3 = [0xAAAAu16, 0xBBBB, 0xBEEF];
+            let args_wcan3 = [wcan3.as_mut_ptr() as u64];
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vsscanf(0, a_emoji.as_ptr(), usize::MAX, b"%2lc\0".as_ptr(), loc_u8, args_wcan3.as_ptr() as *const u8),
+                0
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EILSEQ);
+            assert_eq!(wcan3, [0xAAAA, 0xBBBB, 0xBEEF]);
+
+            // %2ls on "a😀" stores only L"a\0" (1 unit <= 2) and leaves "😀" unconsumed.
+            let mut wcan4 = [0xAAAAu16, 0xBBBB, 0xCCCC, 0xBEEF];
+            let args_wcan4 = [wcan4.as_mut_ptr() as u64];
+            assert_eq!(
+                __stdio_common_vsscanf(0, a_emoji.as_ptr(), usize::MAX, b"%2ls\0".as_ptr(), loc_u8, args_wcan4.as_ptr() as *const u8),
+                1
+            );
+            assert_eq!(&wcan4[..2], &[b'a' as u16, 0]);
+            assert_eq!(wcan4[3], 0xBEEF);
+
+            // %1ls on "😀" fails cleanly without overflowing.
+            let mut wcan5 = [0xAAAAu16, 0xBEEF];
+            let args_wcan5 = [wcan5.as_mut_ptr() as u64];
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vsscanf(0, emoji.as_ptr(), usize::MAX, b"%1ls\0".as_ptr(), loc_u8, args_wcan5.as_ptr() as *const u8),
+                0
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EILSEQ);
+            assert_eq!(wcan5, [0xAAAA, 0xBEEF]);
+            crate::ucrt::locale::_free_locale(loc_u8);
         }
     }
 }

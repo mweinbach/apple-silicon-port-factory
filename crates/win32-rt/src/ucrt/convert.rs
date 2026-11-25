@@ -625,22 +625,6 @@ pub(super) fn mb_decode_cp(cp: u32, bytes: &[u8]) -> Result<Option<(Vec<u16>, us
     Ok(Some((w, len)))
 }
 
-/// Strictly decode an entire multibyte byte slice into UTF-16 under `cp`.
-pub(super) fn mb_decode_slice_cp(cp: u32, bytes: &[u8]) -> Result<Vec<u16>, ()> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        match mb_decode_cp(cp, &bytes[pos..]) {
-            Ok(Some((w, used))) => {
-                out.extend_from_slice(&w);
-                pos += used;
-            }
-            Ok(None) | Err(()) => return Err(()),
-        }
-    }
-    Ok(out)
-}
-
 /// Decode one multibyte char using the active CRT `LC_CTYPE` code page.
 /// Ok((wchar(s), bytes)) / Err(()) = EILSEQ / Ok(None) incomplete.
 fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
