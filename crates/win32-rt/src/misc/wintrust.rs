@@ -63,6 +63,7 @@ const X509_ASN_ENCODING: u32 = 1;
 // DER OID value bytes
 const OID_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
 const OID_SPC_INDIRECT_DATA: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04];
+const OID_CTL: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x01];
 const OID_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
 const OID_RSA_ENCRYPTION: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
 
@@ -1427,9 +1428,23 @@ fn alloc_provider_state(verified: VerifiedAuthenticode, wintrust_data: *mut c_vo
     handle as *mut c_void
 }
 
+/// Result of cryptographically verifying a standalone DER PKCS#7 SignedData blob.
+struct StandalonePkcs7Result {
+    verified: VerifiedAuthenticode,
+    encap_content_type_oid: Vec<u8>,
+    encap_content_der: Vec<u8>,
+    all_certs_der: Vec<Vec<u8>>,
+}
+
 /// Verify a standalone DER PKCS#7 SignedData blob (and optional detached payload) for
 /// `WTD_CHOICE_BLOB` / `WTD_CHOICE_CATALOG`.
-fn verify_standalone_pkcs7(pkcs7_raw: &[u8], detached_content: Option<&[u8]>) -> Result<VerifiedAuthenticode, i32> {
+///
+/// NOTE: Callers MUST also validate the signer certificate chain via
+/// `verify_pkcs7_signer_chain` before reporting `ERROR_SUCCESS`.
+fn verify_standalone_pkcs7(
+    pkcs7_raw: &[u8],
+    detached_content: Option<&[u8]>,
+) -> Result<StandalonePkcs7Result, i32> {
     let (ci, _) = parse_der_elem(pkcs7_raw).ok_or(TRUST_E_NOSIGNATURE)?;
     if ci.tag != 0x30 {
         return Err(TRUST_E_NOSIGNATURE);
@@ -1452,12 +1467,28 @@ fn verify_standalone_pkcs7(pkcs7_raw: &[u8], detached_content: Option<&[u8]>) ->
     }
 
     let eci_kids = der_children(sd_kids[2].val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let encap_content_type_oid = eci_kids
+        .first()
+        .filter(|e| e.tag == 0x06)
+        .map(|e| e.val.to_vec())
+        .unwrap_or_default();
+    let mut encap_content_der = Vec::new();
     let content_bytes: Vec<u8> = if let Some(d) = detached_content {
         d.to_vec()
     } else if let Some(ec) = eci_kids.get(1).filter(|e| e.tag == 0xA0) {
         if let Some((inner, _)) = parse_der_elem(ec.val) {
+            // In RFC 5652 CMS, eContent is wrapped in OCTET STRING (0x04) whose value octets are
+            // both the hashed content and the inner DER (e.g. CertificateTrustList). In legacy
+            // PKCS#7 (e.g. makecat), structured eContent is placed directly as a SEQUENCE (0x30)
+            // where messageDigest hashes inner.val while the DER object is inner.raw.
+            encap_content_der = if inner.tag == 0x04 {
+                inner.val.to_vec()
+            } else {
+                inner.raw.to_vec()
+            };
             inner.val.to_vec()
         } else {
+            encap_content_der = ec.val.to_vec();
             ec.val.to_vec()
         }
     } else {
@@ -1565,25 +1596,305 @@ fn verify_standalone_pkcs7(pkcs7_raw: &[u8], detached_content: Option<&[u8]>) ->
         break;
     }
 
-    let Some((cur_idx, signer)) = verified_signer else {
+    let Some((signer_idx, signer)) = verified_signer else {
         return Err(TRUST_E_BAD_DIGEST);
     };
-    let c = &certs[cur_idx];
-    let vc = VerifiedCert {
-        version: c.version,
-        raw_der: c.raw_der.to_vec(),
-        serial_val: c.serial_val.to_vec(),
-        sig_alg_oid_str: decode_oid_str(c.sig_alg_oid),
-        issuer_raw: c.issuer_raw.to_vec(),
-        not_before: c.not_before,
-        not_after: c.not_after,
-        subject_raw: c.subject_raw.to_vec(),
-        spki_alg_oid_str: decode_oid_str(c.spki_alg_oid),
-        spki_key_bytes: c.spki_key_bytes.to_vec(),
-        spki_unused_bits: c.spki_unused_bits,
-        self_signed: c.issuer_raw == c.subject_raw,
+
+    // Preserve the signer certificate followed by any issuer chain links present in SignedData.
+    let mut chain_indices = vec![signer_idx];
+    let mut cur = signer_idx;
+    for _ in 0..8 {
+        if certs[cur].issuer_raw == certs[cur].subject_raw {
+            break;
+        }
+        if let Some(next_idx) = certs
+            .iter()
+            .enumerate()
+            .position(|(i, c)| !chain_indices.contains(&i) && c.subject_raw == certs[cur].issuer_raw)
+        {
+            chain_indices.push(next_idx);
+            cur = next_idx;
+        } else {
+            break;
+        }
+    }
+    let chain_certs: Vec<VerifiedCert> = chain_indices
+        .into_iter()
+        .map(|idx| {
+            let c = &certs[idx];
+            VerifiedCert {
+                version: c.version,
+                raw_der: c.raw_der.to_vec(),
+                serial_val: c.serial_val.to_vec(),
+                sig_alg_oid_str: decode_oid_str(c.sig_alg_oid),
+                issuer_raw: c.issuer_raw.to_vec(),
+                not_before: c.not_before,
+                not_after: c.not_after,
+                subject_raw: c.subject_raw.to_vec(),
+                spki_alg_oid_str: decode_oid_str(c.spki_alg_oid),
+                spki_key_bytes: c.spki_key_bytes.to_vec(),
+                spki_unused_bits: c.spki_unused_bits,
+                self_signed: c.issuer_raw == c.subject_raw,
+            }
+        })
+        .collect();
+    let all_certs_der: Vec<Vec<u8>> = certs.iter().map(|c| c.raw_der.to_vec()).collect();
+    Ok(StandalonePkcs7Result {
+        verified: VerifiedAuthenticode { certs: chain_certs, signer },
+        encap_content_type_oid,
+        encap_content_der,
+        all_certs_der,
+    })
+}
+
+/// Validate the signer certificate of a cryptographically verified PKCS#7 message against
+/// Windows trust chain & policy rules, supplying all embedded PKCS#7 certificates as
+/// intermediate candidates.
+unsafe fn verify_pkcs7_signer_chain(
+    verified: &VerifiedAuthenticode,
+    all_certs_der: &[Vec<u8>],
+    policy_oid: usize,
+) -> i32 {
+    let Some(leaf) = verified.certs.first() else {
+        return TRUST_E_NOSIGNATURE;
     };
-    Ok(VerifiedAuthenticode { certs: vec![vc], signer })
+    let leaf_ctx = super::crypt32::CertCreateCertificateContext(
+        X509_ASN_ENCODING,
+        leaf.raw_der.as_ptr(),
+        leaf.raw_der.len() as u32,
+    );
+    if leaf_ctx.is_null() {
+        return CERT_E_CHAINING;
+    }
+    let extra_store = super::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+    if !extra_store.is_null() {
+        for der in all_certs_der {
+            let _ = super::crypt32::CertAddEncodedCertificateToStore(
+                extra_store,
+                X509_ASN_ENCODING,
+                der.as_ptr(),
+                der.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+    let stores = [extra_store];
+    let rc = verify_cert_via_chain_policy(
+        leaf_ctx,
+        if extra_store.is_null() { 0 } else { 1 },
+        if extra_store.is_null() { std::ptr::null() } else { stores.as_ptr() },
+        std::ptr::null(),
+        policy_oid,
+    );
+    if !extra_store.is_null() {
+        super::crypt32::CertCloseStore(extra_store, 0);
+    }
+    super::crypt32::CertFreeCertificateContext(leaf_ctx);
+    rc
+}
+
+/// Compute the PE Authenticode digest of `bytes` using `alg`, or `None` if `bytes` is not a PE.
+fn compute_pe_authenticode_digest(bytes: &[u8], alg: Digest) -> Option<Vec<u8>> {
+    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+        return None;
+    }
+    let pe_off = u32::from_le_bytes(bytes[0x3C..0x40].try_into().ok()?) as usize;
+    if pe_off + 24 + 96 > bytes.len() || &bytes[pe_off..pe_off + 4] != b"PE\0\0" {
+        return None;
+    }
+    let opt = pe_off + 24;
+    let magic = u16::from_le_bytes(bytes[opt..opt + 2].try_into().ok()?);
+    let dd_off = match magic {
+        0x10B => opt + 96,
+        0x20B => opt + 112,
+        _ => return None,
+    };
+    let checksum_off = opt + 64;
+    let sec_dir_off = dd_off + 4 * 8;
+    if sec_dir_off + 8 > bytes.len() {
+        return None;
+    }
+    let sec_off = u32::from_le_bytes(bytes[sec_dir_off..sec_dir_off + 4].try_into().ok()?) as usize;
+    let sec_sz = u32::from_le_bytes(bytes[sec_dir_off + 4..sec_dir_off + 8].try_into().ok()?) as usize;
+    if sec_off != 0 && sec_sz > 0 && sec_off >= sec_dir_off + 8 && sec_off.saturating_add(sec_sz) <= bytes.len() {
+        Some(alg.hash_slices(&[
+            &bytes[..checksum_off],
+            &bytes[checksum_off + 4..sec_dir_off],
+            &bytes[sec_dir_off + 8..sec_off],
+            &bytes[sec_off + sec_sz..],
+        ]))
+    } else {
+        Some(alg.hash_slices(&[
+            &bytes[..checksum_off],
+            &bytes[checksum_off + 4..sec_dir_off],
+            &bytes[sec_dir_off + 8..],
+        ]))
+    }
+}
+
+struct CtlMemberEntry<'a> {
+    subject_id: &'a [u8],
+    digests: Vec<(Digest, &'a [u8])>,
+}
+
+/// Parse a DER-encoded Microsoft `CertificateTrustList` (`szOID_CTL`) into its `TrustedSubject`
+/// entries and any signed `SPC_INDIRECT_DATA_OBJID` member digests.
+fn parse_ctl_entries(ctl_der: &[u8]) -> Option<Vec<CtlMemberEntry<'_>>> {
+    let (seq, _) = parse_der_elem(ctl_der)?;
+    if seq.tag != 0x30 {
+        return None;
+    }
+    let kids = der_children(seq.val)?;
+    // CertificateTrustList ::= SEQUENCE { subjectUsage, [listId], [seqNum], thisUpdate, [nextUpdate],
+    //   subjectAlgorithm, [trustedSubjects SEQUENCE OF TrustedSubject], [ctlExtensions [0]] }
+    // Locate `trustedSubjects`: the SEQUENCE immediately after `subjectAlgorithm` (which itself is a
+    // SEQUENCE starting with an OID, appearing after `thisUpdate` UTCTime/GeneralizedTime).
+    let mut after_time = false;
+    let mut after_alg = false;
+    let mut subjects_seq: Option<DerElem<'_>> = None;
+    for &elem in &kids {
+        if elem.tag == 0x17 || elem.tag == 0x18 {
+            after_time = true;
+            continue;
+        }
+        if after_time && !after_alg && elem.tag == 0x30 {
+            after_alg = true;
+            continue;
+        }
+        if after_alg && elem.tag == 0x30 {
+            subjects_seq = Some(elem);
+            break;
+        }
+    }
+    let mut entries = Vec::new();
+    let Some(subj_seq) = subjects_seq else {
+        return Some(entries);
+    };
+    for subj in der_children(subj_seq.val)? {
+        if subj.tag != 0x30 {
+            continue;
+        }
+        let sk = der_children(subj.val)?;
+        if sk.is_empty() || sk[0].tag != 0x04 {
+            continue;
+        }
+        let subject_id = sk[0].val;
+        let mut digests = Vec::new();
+        if let Some(attrs) = sk.get(1).filter(|e| e.tag == 0x31) {
+            if let Some(attr_list) = der_children(attrs.val) {
+                for attr in attr_list {
+                    if attr.tag != 0x30 {
+                        continue;
+                    }
+                    let Some(ak) = der_children(attr.val) else { continue };
+                    if ak.len() < 2 || ak[0].tag != 0x06 || ak[0].val != OID_SPC_INDIRECT_DATA || ak[1].tag != 0x31 {
+                        continue;
+                    }
+                    let Some(vals) = der_children(ak[1].val) else { continue };
+                    for v in vals {
+                        if v.tag != 0x30 {
+                            continue;
+                        }
+                        let Some(spc_kids) = der_children(v.val) else { continue };
+                        if spc_kids.len() < 2 || spc_kids[1].tag != 0x30 {
+                            continue;
+                        }
+                        let Some(di_kids) = der_children(spc_kids[1].val) else { continue };
+                        if di_kids.len() < 2 || di_kids[1].tag != 0x04 {
+                            continue;
+                        }
+                        if let Some(alg_oid) = parse_alg_id_oid(di_kids[0]) {
+                            if let Some(alg) = digest_from_oid(alg_oid) {
+                                digests.push((alg, di_kids[1].val));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        entries.push(CtlMemberEntry { subject_id, digests });
+    }
+    Some(entries)
+}
+
+fn ctl_subject_id_matches_tag(subject_id: &[u8], tag: &str) -> bool {
+    // Windows catalogs typically encode subjectIdentifier as UTF-16LE (with or without NUL)
+    // or ASCII/UTF-8 hex string. Match case-insensitively.
+    if subject_id.len() >= 2 && subject_id.len() % 2 == 0 {
+        let mut u16s: Vec<u16> = subject_id
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        while u16s.last() == Some(&0) {
+            u16s.pop();
+        }
+        if let Ok(s) = String::from_utf16(&u16s) {
+            if s.eq_ignore_ascii_case(tag) {
+                return true;
+            }
+        }
+    }
+    if let Ok(s) = std::str::from_utf8(subject_id) {
+        if s.trim_end_matches('\0').eq_ignore_ascii_case(tag) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Verify that a catalog member (identified by `member_tag` and either `calculated_hash` or
+/// `member_bytes`) matches a signed entry in `ctl_der`.
+fn verify_ctl_membership(
+    ctl_der: &[u8],
+    member_tag: Option<&str>,
+    calculated_hash: Option<&[u8]>,
+    member_bytes: Option<&[u8]>,
+) -> Result<(), i32> {
+    if calculated_hash.is_none() && member_bytes.is_none() {
+        return Err(TRUST_E_NOSIGNATURE);
+    }
+    let entries = parse_ctl_entries(ctl_der).ok_or(TRUST_E_SUBJECT_FORM_UNKNOWN)?;
+    let mut matched_tag = false;
+    for entry in &entries {
+        if let Some(tag) = member_tag {
+            if !ctl_subject_id_matches_tag(entry.subject_id, tag) {
+                continue;
+            }
+            matched_tag = true;
+        }
+        // Check SPC_INDIRECT_DATA DigestInfo entries first.
+        for &(alg, expected_digest) in &entry.digests {
+            if let Some(calc) = calculated_hash {
+                if calc == expected_digest {
+                    return Ok(());
+                }
+            }
+            if let Some(bytes) = member_bytes {
+                if let Some(pe_hash) = compute_pe_authenticode_digest(bytes, alg) {
+                    if pe_hash.as_slice() == expected_digest {
+                        return Ok(());
+                    }
+                }
+                if alg.hash(bytes).as_slice() == expected_digest {
+                    return Ok(());
+                }
+            }
+        }
+        // Fallback: some catalogs store raw member digest bytes directly in subjectIdentifier.
+        if entry.digests.is_empty() {
+            if let Some(calc) = calculated_hash {
+                if calc == entry.subject_id {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if matched_tag {
+        Err(TRUST_E_BAD_DIGEST)
+    } else {
+        Err(TRUST_E_NOSIGNATURE)
+    }
 }
 
 unsafe fn verify_cert_via_chain_policy(
@@ -1769,12 +2080,35 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             }
         }
         WTD_CHOICE_CATALOG => {
-            // WINTRUST_CATALOG_INFO (Win64): pcwszCatalogFilePath @ +0x08, pcwszMemberFilePath @ +0x18,
-            // hMemberFile @ +0x20, pbCalculatedFileHash @ +0x28, cbCalculatedFileHash @ +0x30
+            // WINTRUST_CATALOG_INFO (Win64):
+            //   cbStruct @ +0x00, dwCatalogVersion @ +0x04,
+            //   pcwszCatalogFilePath @ +0x08, pcwszMemberTag @ +0x10,
+            //   pcwszMemberFilePath @ +0x18, hMemberFile @ +0x20,
+            //   pbCalculatedFileHash @ +0x28, cbCalculatedFileHash @ +0x30
+            let cb_cat = std::ptr::read_unaligned(p_union as *const u32);
+            if cb_cat < 0x20 {
+                return TRUST_E_SUBJECT_FORM_UNKNOWN;
+            }
             let cat_path_w = std::ptr::read_unaligned(p_union.add(0x08) as *const *const u16);
             if cat_path_w.is_null() {
                 return TRUST_E_NOSIGNATURE;
             }
+            let member_tag_w = std::ptr::read_unaligned(p_union.add(0x10) as *const *const u16);
+            let member_path_w = std::ptr::read_unaligned(p_union.add(0x18) as *const *const u16);
+            let member_handle = if cb_cat >= 0x28 {
+                std::ptr::read_unaligned(p_union.add(0x20) as *const crate::types::HANDLE)
+            } else {
+                std::ptr::null_mut()
+            };
+            let (calc_hash_ptr, calc_hash_len) = if cb_cat >= 0x34 {
+                (
+                    std::ptr::read_unaligned(p_union.add(0x28) as *const *const u8),
+                    std::ptr::read_unaligned(p_union.add(0x30) as *const u32) as usize,
+                )
+            } else {
+                (std::ptr::null(), 0)
+            };
+
             let win = crate::strings::from_wide(cat_path_w);
             let abs = crate::path::absolute(&win);
             let Some(host) = crate::path::to_host(&abs) else {
@@ -1783,16 +2117,63 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             let Ok(cat_bytes) = std::fs::read(&host) else {
                 return CRYPT_E_FILE_ERROR;
             };
-            match verify_standalone_pkcs7(&cat_bytes, None) {
-                Ok(verified) => {
-                    if state_action == WTD_STATEACTION_VERIFY {
-                        let h = alloc_provider_state(verified, data);
-                        std::ptr::write_unaligned(state_data_slot, h);
-                    }
-                    ERROR_SUCCESS
-                }
-                Err(code) => code,
+
+            // Step 1: Verify catalog PKCS#7 cryptographic signature and require szOID_CTL content.
+            let p7 = match verify_standalone_pkcs7(&cat_bytes, None) {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            if p7.encap_content_type_oid.as_slice() != OID_CTL {
+                return TRUST_E_SUBJECT_FORM_UNKNOWN;
             }
+
+            // Step 2: Obtain the specified catalog member's hash or file bytes and verify
+            // membership against the signed CertificateTrustList entries.
+            let member_tag = (!member_tag_w.is_null()).then(|| crate::strings::from_wide(member_tag_w));
+            let calc_hash = (calc_hash_len > 0 && !calc_hash_ptr.is_null())
+                .then(|| std::slice::from_raw_parts(calc_hash_ptr, calc_hash_len));
+            let member_bytes = if calc_hash.is_none() {
+                if !member_path_w.is_null() {
+                    let mw = crate::strings::from_wide(member_path_w);
+                    let mabs = crate::path::absolute(&mw);
+                    let Some(mhost) = crate::path::to_host(&mabs) else {
+                        return CRYPT_E_FILE_ERROR;
+                    };
+                    let Ok(b) = std::fs::read(&mhost) else {
+                        return CRYPT_E_FILE_ERROR;
+                    };
+                    Some(b)
+                } else if !member_handle.is_null() && member_handle != crate::types::INVALID_HANDLE_VALUE {
+                    let Some(mhost) = crate::kernel32::file::get_file(member_handle).and_then(|f| f.host_path.clone()) else {
+                        return CRYPT_E_FILE_ERROR;
+                    };
+                    let Ok(b) = std::fs::read(&mhost) else {
+                        return CRYPT_E_FILE_ERROR;
+                    };
+                    Some(b)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Err(code) = verify_ctl_membership(
+                &p7.encap_content_der,
+                member_tag.as_deref(),
+                calc_hash,
+                member_bytes.as_deref(),
+            ) {
+                return code;
+            }
+
+            // Step 3: Validate the catalog signer's certificate chain & action policy.
+            let chain_rc =
+                verify_pkcs7_signer_chain(&p7.verified, &p7.all_certs_der, chain_policy_oid);
+            if state_action == WTD_STATEACTION_VERIFY {
+                let h = alloc_provider_state(p7.verified, data);
+                std::ptr::write_unaligned(state_data_slot, h);
+            }
+            chain_rc
         }
         WTD_CHOICE_BLOB => {
             // WINTRUST_BLOB_INFO (Win64): cbMemObject @ +0x20, pbMemObject @ +0x28,
@@ -1811,30 +2192,61 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             } else {
                 (0, std::ptr::null())
             };
-            let result = if cb_sig > 0 && !pb_sig.is_null() {
+            if cb_sig > 0 && !pb_sig.is_null() {
                 let sig_slice = std::slice::from_raw_parts(pb_sig, cb_sig);
                 let obj_opt = (cb_obj > 0 && !pb_obj.is_null())
                     .then(|| std::slice::from_raw_parts(pb_obj, cb_obj));
-                verify_standalone_pkcs7(sig_slice, obj_opt)
+                match verify_standalone_pkcs7(sig_slice, obj_opt) {
+                    Ok(p7) => {
+                        let chain_rc = verify_pkcs7_signer_chain(
+                            &p7.verified,
+                            &p7.all_certs_der,
+                            chain_policy_oid,
+                        );
+                        if state_action == WTD_STATEACTION_VERIFY {
+                            let h = alloc_provider_state(p7.verified, data);
+                            std::ptr::write_unaligned(state_data_slot, h);
+                        }
+                        chain_rc
+                    }
+                    Err(code) => code,
+                }
             } else if cb_obj > 0 && !pb_obj.is_null() {
                 let obj_slice = std::slice::from_raw_parts(pb_obj, cb_obj);
                 if obj_slice.len() >= 2 && &obj_slice[..2] == b"MZ" {
-                    verify_pe_authenticode(obj_slice)
+                    match verify_pe_authenticode(obj_slice) {
+                        Ok(verified) => {
+                            let all_der: Vec<Vec<u8>> =
+                                verified.certs.iter().map(|c| c.raw_der.clone()).collect();
+                            let chain_rc =
+                                verify_pkcs7_signer_chain(&verified, &all_der, chain_policy_oid);
+                            if state_action == WTD_STATEACTION_VERIFY {
+                                let h = alloc_provider_state(verified, data);
+                                std::ptr::write_unaligned(state_data_slot, h);
+                            }
+                            chain_rc
+                        }
+                        Err(code) => code,
+                    }
                 } else {
-                    verify_standalone_pkcs7(obj_slice, None)
+                    match verify_standalone_pkcs7(obj_slice, None) {
+                        Ok(p7) => {
+                            let chain_rc = verify_pkcs7_signer_chain(
+                                &p7.verified,
+                                &p7.all_certs_der,
+                                chain_policy_oid,
+                            );
+                            if state_action == WTD_STATEACTION_VERIFY {
+                                let h = alloc_provider_state(p7.verified, data);
+                                std::ptr::write_unaligned(state_data_slot, h);
+                            }
+                            chain_rc
+                        }
+                        Err(code) => code,
+                    }
                 }
             } else {
-                Err(TRUST_E_NOSIGNATURE)
-            };
-            match result {
-                Ok(verified) => {
-                    if state_action == WTD_STATEACTION_VERIFY {
-                        let h = alloc_provider_state(verified, data);
-                        std::ptr::write_unaligned(state_data_slot, h);
-                    }
-                    ERROR_SUCCESS
-                }
-                Err(code) => code,
+                TRUST_E_NOSIGNATURE
             }
         }
         WTD_CHOICE_SIGNER => {
@@ -2181,7 +2593,9 @@ mod tests {
                 TRUST_E_ACTION_UNKNOWN
             );
 
-            // WTD_CHOICE_BLOB with real OpenSSL PKCS#7 SignedData verifies cryptographically!
+            // WTD_CHOICE_BLOB with real OpenSSL PKCS#7 SignedData signed by a self-signed untrusted
+            // cert: verifies PKCS#7 cryptography, enforces signer chain policy -> CERT_E_UNTRUSTEDROOT,
+            // and still populates hWVTStateData when WTD_STATEACTION_VERIFY is requested.
             let pkcs7 = crate::misc::crypt32::tests::test_vectors::PKCS7_SIGNED_DER;
             let mut blob_info = [0u8; 0x40];
             std::ptr::write_unaligned(blob_info.as_mut_ptr() as *mut u32, blob_info.len() as u32);
@@ -2197,7 +2611,7 @@ mod tests {
                     WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
                     wtd.as_mut_ptr() as *mut c_void,
                 ),
-                ERROR_SUCCESS
+                crate::misc::crypt32::CERT_E_UNTRUSTEDROOT as i32
             );
             let st_handle = std::ptr::read_unaligned(wtd.as_ptr().add(0x38) as *const *mut c_void);
             assert!(!st_handle.is_null());
@@ -2218,7 +2632,7 @@ mod tests {
                 ERROR_SUCCESS
             );
 
-            // Tampered blob fails with TRUST_E_BAD_DIGEST (also exercises DRIVER_ACTION_VERIFY)
+            // Tampered blob fails earlier at cryptographic check with TRUST_E_BAD_DIGEST
             let mut bad_p7 = pkcs7.to_vec();
             let last = bad_p7.len() - 1;
             bad_p7[last] ^= 0xFF;
@@ -2284,25 +2698,90 @@ mod tests {
                 crate::misc::crypt32::CERT_E_UNTRUSTEDROOT as i32
             );
 
-            // WTD_CHOICE_CATALOG with a temporary PKCS#7 file on disk verifies cryptographically
+            // WTD_CHOICE_CATALOG: validates CTL structure, member tag & member digest, AND signer chain
             let tmp_dir = std::env::temp_dir().join(format!("wintrust_cat_{}", std::process::id()));
             std::fs::create_dir_all(&tmp_dir).unwrap();
-            let tmp_cat = tmp_dir.join("test.cat");
-            std::fs::write(&tmp_cat, pkcs7).unwrap();
+            let tmp_non_ctl = tmp_dir.join("notctl.cat");
+            std::fs::write(&tmp_non_ctl, pkcs7).unwrap();
+            let tmp_ctl = tmp_dir.join("real.cat");
+            let ctl_signed = crate::misc::crypt32::tests::test_vectors::CATALOG_CTL_SIGNED_DER;
+            let member_payload = crate::misc::crypt32::tests::test_vectors::CATALOG_MEMBER_PAYLOAD;
+            std::fs::write(&tmp_ctl, ctl_signed).unwrap();
+            let tmp_member = tmp_dir.join("member.bin");
+            std::fs::write(&tmp_member, member_payload).unwrap();
+            let tmp_bad_member = tmp_dir.join("tampered.bin");
+            std::fs::write(&tmp_bad_member, b"tampered-payload").unwrap();
             crate::path::add_mount("T:\\", &tmp_dir);
-            let cat_w = crate::strings::to_wide_z("T:\\test.cat");
+
+            let non_ctl_w = crate::strings::to_wide_z("T:\\notctl.cat");
+            let ctl_w = crate::strings::to_wide_z("T:\\real.cat");
+            let tag_ok_w = crate::strings::to_wide_z("MEMBER01");
+            let tag_bad_w = crate::strings::to_wide_z("OTHER99");
+            let member_w = crate::strings::to_wide_z("T:\\member.bin");
+            let bad_member_w = crate::strings::to_wide_z("T:\\tampered.bin");
+            let good_hash = Digest::Sha256.hash(member_payload);
+            let mut wrong_hash = good_hash.clone();
+            wrong_hash[0] ^= 0xFF;
+
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_CATALOG);
+            // 1) Non-CTL PKCS#7 is rejected with TRUST_E_SUBJECT_FORM_UNKNOWN
             let mut cat_info = [0u8; 0x38];
             std::ptr::write_unaligned(cat_info.as_mut_ptr() as *mut u32, cat_info.len() as u32);
-            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x08) as *mut *const u16, cat_w.as_ptr());
-            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_CATALOG);
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x08) as *mut *const u16, non_ctl_w.as_ptr());
             std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x28) as *mut *const u8, cat_info.as_ptr());
             assert_eq!(
-                WinVerifyTrust(
-                    std::ptr::null_mut(),
-                    WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
-                    wtd.as_mut_ptr() as *mut c_void,
-                ),
-                ERROR_SUCCESS
+                WinVerifyTrust(std::ptr::null_mut(), WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(), wtd.as_mut_ptr() as *mut c_void),
+                TRUST_E_SUBJECT_FORM_UNKNOWN
+            );
+
+            // 2) Real CTL with NO member hash/file -> TRUST_E_NOSIGNATURE
+            cat_info.fill(0);
+            std::ptr::write_unaligned(cat_info.as_mut_ptr() as *mut u32, cat_info.len() as u32);
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x08) as *mut *const u16, ctl_w.as_ptr());
+            assert_eq!(
+                WinVerifyTrust(std::ptr::null_mut(), WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(), wtd.as_mut_ptr() as *mut c_void),
+                TRUST_E_NOSIGNATURE
+            );
+
+            // 3) Real CTL with matching member tag + WRONG hash -> TRUST_E_BAD_DIGEST
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x10) as *mut *const u16, tag_ok_w.as_ptr());
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x28) as *mut *const u8, wrong_hash.as_ptr());
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x30) as *mut u32, wrong_hash.len() as u32);
+            assert_eq!(
+                WinVerifyTrust(std::ptr::null_mut(), WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(), wtd.as_mut_ptr() as *mut c_void),
+                TRUST_E_BAD_DIGEST
+            );
+
+            // 4) Real CTL with unknown member tag -> TRUST_E_NOSIGNATURE
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x10) as *mut *const u16, tag_bad_w.as_ptr());
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x28) as *mut *const u8, good_hash.as_ptr());
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x30) as *mut u32, good_hash.len() as u32);
+            assert_eq!(
+                WinVerifyTrust(std::ptr::null_mut(), WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(), wtd.as_mut_ptr() as *mut c_void),
+                TRUST_E_NOSIGNATURE
+            );
+
+            // 5) Real CTL with matching member tag + GOOD hash -> passes membership check and
+            // reaches signer chain trust check (CERT_E_UNTRUSTEDROOT for self-signed test cert)
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x10) as *mut *const u16, tag_ok_w.as_ptr());
+            assert_eq!(
+                WinVerifyTrust(std::ptr::null_mut(), WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(), wtd.as_mut_ptr() as *mut c_void),
+                crate::misc::crypt32::CERT_E_UNTRUSTEDROOT as i32
+            );
+
+            // 6) Real CTL with pcwszMemberFilePath: tampered member file -> TRUST_E_BAD_DIGEST,
+            // genuine member file -> passes membership check (reaches CERT_E_UNTRUSTEDROOT)
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x28) as *mut *const u8, std::ptr::null());
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x30) as *mut u32, 0);
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x18) as *mut *const u16, bad_member_w.as_ptr());
+            assert_eq!(
+                WinVerifyTrust(std::ptr::null_mut(), WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(), wtd.as_mut_ptr() as *mut c_void),
+                TRUST_E_BAD_DIGEST
+            );
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x18) as *mut *const u16, member_w.as_ptr());
+            assert_eq!(
+                WinVerifyTrust(std::ptr::null_mut(), WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(), wtd.as_mut_ptr() as *mut c_void),
+                crate::misc::crypt32::CERT_E_UNTRUSTEDROOT as i32
             );
             let _ = std::fs::remove_dir_all(&tmp_dir);
 

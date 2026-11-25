@@ -1582,7 +1582,12 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
 
         // Full Schannel Client (InitializeSecurityContext) <-> Schannel Server (AcceptSecurityContext) handshake!
         let target = b"test.example.com\0";
-        let req = ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM | ISC_REQ_CONFIDENTIALITY;
+        let cli_req = ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM | ISC_REQ_CONFIDENTIALITY;
+        let srv_req = super::schannel::ASC_REQ_ALLOCATE_MEMORY
+            | super::schannel::ASC_REQ_STREAM
+            | super::schannel::ASC_REQ_CONFIDENTIALITY
+            | super::schannel::ASC_REQ_EXTENDED_ERROR;
+        let mut srv_attr = 0u32;
         let mut cli_ctx = SecHandle::default();
         let mut srv_ctx = SecHandle::default();
         let mut c2s = Vec::new();
@@ -1598,7 +1603,7 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
                 &mut cli_cred as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
                 target.as_ptr(),
-                req,
+                cli_req,
                 0,
                 0,
                 std::ptr::null_mut(),
@@ -1627,14 +1632,17 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
                     &mut srv_cred as *mut _ as *mut c_void,
                     if srv_started { &mut srv_ctx as *mut _ as *mut c_void } else { std::ptr::null_mut() },
                     &mut in_d as *mut _ as *mut c_void,
-                    req,
+                    srv_req,
                     0,
                     &mut srv_ctx as *mut _ as *mut c_void,
                     &mut out_d as *mut _ as *mut c_void,
-                    std::ptr::null_mut(),
+                    &mut srv_attr,
                     std::ptr::null_mut(),
                 );
                 assert!(st == SEC_E_OK || st == SEC_I_CONTINUE_NEEDED, "AcceptSecurityContext failed: {st:#x}");
+                assert_ne!(srv_attr & super::schannel::ASC_REQ_STREAM, 0, "ASC_RET_STREAM (0x10000) must be set");
+                assert_ne!(srv_attr & super::schannel::ASC_REQ_EXTENDED_ERROR, 0, "ASC_RET_EXTENDED_ERROR (0x8000) must be set");
+                assert_ne!(srv_attr & super::schannel::ASC_REQ_CONFIDENTIALITY, 0);
                 srv_started = true;
                 c2s.clear();
                 if !out_b.pv_buffer.is_null() && out_b.cb_buffer > 0 {
@@ -1657,7 +1665,7 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
                     &mut cli_cred as *mut _ as *mut c_void,
                     &mut cli_ctx as *mut _ as *mut c_void,
                     target.as_ptr(),
-                    req,
+                    cli_req,
                     0,
                     0,
                     &mut in_d as *mut _ as *mut c_void,

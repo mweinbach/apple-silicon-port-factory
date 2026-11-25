@@ -62,6 +62,15 @@ pub(super) const ISC_REQ_EXTENDED_ERROR: u32 = 0x0000_4000;
 pub(super) const ISC_REQ_STREAM: u32 = 0x0000_8000;
 pub(super) const ISC_REQ_MANUAL_CRED_VALIDATION: u32 = 0x0008_0000;
 
+// Server-side AcceptSecurityContext request/return flags (sspi.h).
+// Note: ASC_REQ_EXTENDED_ERROR (0x8000) and ASC_REQ_STREAM (0x10000) differ from ISC_REQ_*!
+pub(super) const ASC_REQ_REPLAY_DETECT: u32 = 0x0000_0004;
+pub(super) const ASC_REQ_SEQUENCE_DETECT: u32 = 0x0000_0008;
+pub(super) const ASC_REQ_CONFIDENTIALITY: u32 = 0x0000_0010;
+pub(super) const ASC_REQ_ALLOCATE_MEMORY: u32 = 0x0000_0100;
+pub(super) const ASC_REQ_EXTENDED_ERROR: u32 = 0x0000_8000;
+pub(super) const ASC_REQ_STREAM: u32 = 0x0001_0000;
+
 const SECBUFFER_ATTRMASK: u32 = 0xF000_0000;
 pub(super) const SECBUFFER_EMPTY: u32 = 0;
 pub(super) const SECBUFFER_DATA: u32 = 1;
@@ -1207,15 +1216,15 @@ pub(super) unsafe fn accept_security_context_impl(
     pf_context_attr: *mut u32,
     pts_expiry: *mut i64,
 ) -> i32 {
-    let allocate_mem = (f_context_req & ISC_REQ_ALLOCATE_MEMORY) != 0;
+    let allocate_mem = (f_context_req & ASC_REQ_ALLOCATE_MEMORY) != 0;
     if !pts_expiry.is_null() {
         std::ptr::write_unaligned(pts_expiry, i64::MAX);
     }
-    let ret_attr = ISC_REQ_REPLAY_DETECT
-        | ISC_REQ_SEQUENCE_DETECT
-        | ISC_REQ_CONFIDENTIALITY
-        | ISC_REQ_STREAM
-        | (f_context_req & (ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_EXTENDED_ERROR));
+    let ret_attr = ASC_REQ_REPLAY_DETECT
+        | ASC_REQ_SEQUENCE_DETECT
+        | ASC_REQ_CONFIDENTIALITY
+        | ASC_REQ_STREAM
+        | (f_context_req & (ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_EXTENDED_ERROR));
 
     // Create a fresh server context on initial call (ph_context == NULL).
     let (ctx_id, created_new) = if ph_context.is_null() {
@@ -1336,7 +1345,7 @@ pub(super) unsafe fn accept_security_context_impl(
                         consumed += rec_total;
                         if let Err(ref e) = ctx.conn.process_new_packets() {
                             let sec_err = map_rustls_error_to_sec(e);
-                            if (ctx.context_req & ISC_REQ_EXTENDED_ERROR) != 0 {
+                            if (ctx.context_req & ASC_REQ_EXTENDED_ERROR) != 0 {
                                 let alert = drain_tls_out(&mut ctx.conn);
                                 if !alert.is_empty() {
                                     unsafe {

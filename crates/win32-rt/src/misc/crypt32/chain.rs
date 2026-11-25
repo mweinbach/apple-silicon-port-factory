@@ -65,6 +65,10 @@ mod apple_trust {
         fn CFDataGetLength(the_data: *const c_void) -> isize;
         #[cfg(target_os = "macos")]
         fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
+        #[cfg(target_os = "macos")]
+        fn CFDictionaryGetValue(the_dict: *const c_void, key: *const c_void) -> *const c_void;
+        #[cfg(target_os = "macos")]
+        fn CFNumberGetValue(number: *const c_void, the_type: isize, value_ptr: *mut c_void) -> u8;
         fn CFDateCreate(allocator: *const c_void, at: f64) -> *const c_void;
         fn CFStringCreateWithBytes(
             alloc: *const c_void,
@@ -102,6 +106,12 @@ mod apple_trust {
         fn SecTrustCopyAnchorCertificates(anchors: *mut *const c_void) -> i32;
         #[cfg(target_os = "macos")]
         fn SecTrustSettingsCopyCertificates(domain: u32, certs_out: *mut *const c_void) -> i32;
+        #[cfg(target_os = "macos")]
+        fn SecTrustSettingsCopyTrustSettings(
+            cert_ref: *const c_void,
+            domain: u32,
+            trust_settings: *mut *const c_void,
+        ) -> i32;
     }
 
     struct CfRef(*const c_void);
@@ -134,23 +144,121 @@ mod apple_trust {
         Some(std::slice::from_raw_parts(ptr, len as usize).to_vec())
     }
 
-    /// Copy trusted root certificates from the macOS System/Admin/User trust stores.
     #[cfg(target_os = "macos")]
-    pub fn load_macos_trust_anchors_der() -> Vec<Vec<u8>> {
-        let mut out = Vec::new();
-        unsafe {
-            let mut anchors: *const c_void = std::ptr::null();
-            if SecTrustCopyAnchorCertificates(&mut anchors) == 0 && !anchors.is_null() {
-                let _g = CfRef(anchors);
-                let count = CFArrayGetCount(anchors);
-                for i in 0..count {
-                    let cert = CFArrayGetValueAtIndex(anchors, i);
-                    if let Some(der) = cert_ref_to_der(cert) {
-                        out.push(der);
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TrustSettingDecision {
+        NotSet,
+        UnconditionalTrustRoot,
+        Denied,
+        PolicyRestrictedOrUnspecified,
+    }
+
+    /// Inspect macOS `SecTrustSettingsCopyTrustSettings` for a single certificate in `domain`.
+    /// Per Apple's Trust Settings specification:
+    /// - An empty `trustSettings` array means "Always Trust" unconditionally for all policies.
+    /// - `kSecTrustSettingsResult` == 1 (`TrustRoot`) or 2 (`TrustAsRoot`) with no
+    ///   `kSecTrustSettingsPolicy` restriction grants unconditional root trust.
+    /// - `kSecTrustSettingsResult` == 3 (`Deny`) with no policy restriction denies the cert
+    ///   unconditionally (even if present in the built-in System anchor list).
+    /// - Policy-scoped or `Unspecified` rules are NOT flattened into unrestricted anchors;
+    ///   `evaluate_sec_trust()` evaluates them with the real policy instead.
+    #[cfg(target_os = "macos")]
+    unsafe fn inspect_trust_settings(cert: *const c_void, domain: u32) -> TrustSettingDecision {
+        const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+        const K_CF_NUMBER_SINT32_TYPE: isize = 3;
+        const K_SEC_TRUST_SETTINGS_RESULT_TRUST_ROOT: i32 = 1;
+        const K_SEC_TRUST_SETTINGS_RESULT_TRUST_AS_ROOT: i32 = 2;
+        const K_SEC_TRUST_SETTINGS_RESULT_DENY: i32 = 3;
+
+        let mut settings: *const c_void = std::ptr::null();
+        if SecTrustSettingsCopyTrustSettings(cert, domain, &mut settings) != 0 || settings.is_null()
+        {
+            return TrustSettingDecision::NotSet;
+        }
+        let _sg = CfRef(settings);
+        let count = CFArrayGetCount(settings);
+        if count == 0 {
+            return TrustSettingDecision::UnconditionalTrustRoot;
+        }
+
+        let k_result = CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            b"kSecTrustSettingsResult".as_ptr(),
+            23,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        let _krg = CfRef(k_result);
+        let k_policy = CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            b"kSecTrustSettingsPolicy".as_ptr(),
+            23,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        let _kpg = CfRef(k_policy);
+        let k_policy_str = CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            b"kSecTrustSettingsPolicyString".as_ptr(),
+            29,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        let _kpsg = CfRef(k_policy_str);
+
+        let mut saw_unconditional_trust = false;
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(settings, i);
+            if dict.is_null() {
+                continue;
+            }
+            let has_policy = (!k_policy.is_null() && !CFDictionaryGetValue(dict, k_policy).is_null())
+                || (!k_policy_str.is_null()
+                    && !CFDictionaryGetValue(dict, k_policy_str).is_null());
+            let mut result_val: i32 = K_SEC_TRUST_SETTINGS_RESULT_TRUST_ROOT;
+            if !k_result.is_null() {
+                let num = CFDictionaryGetValue(dict, k_result);
+                if !num.is_null() {
+                    let mut v: i32 = 0;
+                    if CFNumberGetValue(
+                        num,
+                        K_CF_NUMBER_SINT32_TYPE,
+                        &mut v as *mut i32 as *mut c_void,
+                    ) != 0
+                    {
+                        result_val = v;
                     }
                 }
             }
-            // Also include Admin (1) and User (0) trust-settings certificates (deduped by bytes).
+            if !has_policy {
+                if result_val == K_SEC_TRUST_SETTINGS_RESULT_DENY {
+                    return TrustSettingDecision::Denied;
+                }
+                if result_val == K_SEC_TRUST_SETTINGS_RESULT_TRUST_ROOT
+                    || result_val == K_SEC_TRUST_SETTINGS_RESULT_TRUST_AS_ROOT
+                {
+                    saw_unconditional_trust = true;
+                }
+            }
+        }
+        if saw_unconditional_trust {
+            TrustSettingDecision::UnconditionalTrustRoot
+        } else {
+            TrustSettingDecision::PolicyRestrictedOrUnspecified
+        }
+    }
+
+    /// Copy unconditionally trusted root certificates from the macOS System/Admin/User trust
+    /// stores while honoring `SecTrustSettingsCopyTrustSettings` (excluding explicitly denied
+    /// certificates and avoiding flattening policy-restricted entries into universal roots).
+    #[cfg(target_os = "macos")]
+    pub fn load_macos_trust_anchors_der() -> Vec<Vec<u8>> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut out = Vec::new();
+        unsafe {
+            // Evaluate Admin (1) then User (0) so User trust settings override Admin.
+            let mut domain_decisions: HashMap<Vec<u8>, TrustSettingDecision> = HashMap::new();
             for domain in [1u32, 0u32] {
                 let mut arr: *const c_void = std::ptr::null();
                 if SecTrustSettingsCopyCertificates(domain, &mut arr) == 0 && !arr.is_null() {
@@ -158,12 +266,49 @@ mod apple_trust {
                     let count = CFArrayGetCount(arr);
                     for i in 0..count {
                         let cert = CFArrayGetValueAtIndex(arr, i);
+                        let decision = inspect_trust_settings(cert, domain);
+                        if decision == TrustSettingDecision::NotSet {
+                            continue;
+                        }
                         if let Some(der) = cert_ref_to_der(cert) {
-                            if !out.iter().any(|existing| existing == &der) {
-                                out.push(der);
-                            }
+                            domain_decisions.insert(der, decision);
                         }
                     }
+                }
+            }
+
+            let mut denied: HashSet<Vec<u8>> = HashSet::new();
+            let mut custom_trusted: Vec<Vec<u8>> = Vec::new();
+            for (der, decision) in domain_decisions {
+                match decision {
+                    TrustSettingDecision::Denied => {
+                        denied.insert(der);
+                    }
+                    TrustSettingDecision::UnconditionalTrustRoot => {
+                        custom_trusted.push(der);
+                    }
+                    TrustSettingDecision::PolicyRestrictedOrUnspecified
+                    | TrustSettingDecision::NotSet => {}
+                }
+            }
+
+            let mut anchors: *const c_void = std::ptr::null();
+            if SecTrustCopyAnchorCertificates(&mut anchors) == 0 && !anchors.is_null() {
+                let _g = CfRef(anchors);
+                let count = CFArrayGetCount(anchors);
+                for i in 0..count {
+                    let cert = CFArrayGetValueAtIndex(anchors, i);
+                    if let Some(der) = cert_ref_to_der(cert) {
+                        if !denied.contains(&der) {
+                            out.push(der);
+                        }
+                    }
+                }
+            }
+
+            for der in custom_trusted {
+                if !denied.contains(&der) && !out.iter().any(|existing| existing == &der) {
+                    out.push(der);
                 }
             }
         }
