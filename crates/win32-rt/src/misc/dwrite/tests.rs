@@ -2659,11 +2659,227 @@ fn text_analyzer_honors_number_substitution_for_localized_digits() {
             assert_eq!((before, after, is_ws), (2, 3, 1), "mandatory separator at idx {sep_idx} (u={:#x}) had bits={bits:#x}", sample_u16[sep_idx]);
         }
 
+        // 7. Word-internal boundaries must be marked MAY_NOT_BREAK (2), while space/hyphen/CJK
+        //    boundaries allow breaking (CAN_BREAK = 1) and CR+LF breaks only after LF (MUST_BREAK = 3).
+        let analyze_bps = |s: &str| -> Vec<(u8, u8, u8, u8)> {
+            let u16s: Vec<u16> = s.encode_utf16().collect();
+            let mut src = BpSource { vtbl: &bp_src_vtbl, text: u16s.clone() };
+            let mut snk = BpSink { vtbl: &bp_snk_vtbl, bps: Vec::new() };
+            assert_eq!(
+                an_lb_fn(ta, &mut src as *mut _ as *mut c_void, 0, u16s.len() as u32, &mut snk as *mut _ as *mut c_void),
+                S_OK
+            );
+            snk.bps
+                .into_iter()
+                .map(|b| (b & 0x3, (b >> 2) & 0x3, (b >> 4) & 0x1, (b >> 5) & 0x1))
+                .collect()
+        };
+        let hello_bps = analyze_bps("a hello");
+        assert_eq!(hello_bps.len(), 7);
+        // 'a' -> ' ' prohibited; ' ' -> 'h' allowed; all boundaries inside "hello" prohibited.
+        assert_eq!(hello_bps[0].1, 2, "must not break between 'a' and space: {hello_bps:?}");
+        assert_eq!((hello_bps[1].0, hello_bps[1].1, hello_bps[1].2), (2, 1, 1), "space must allow break after: {hello_bps:?}");
+        assert_eq!(hello_bps[2].0, 1, "'h' after space allows break before: {hello_bps:?}");
+        for idx in 2..6 {
+            assert_eq!(hello_bps[idx].1, 2, "word-internal break after idx {idx} in 'hello' must be MAY_NOT_BREAK: {hello_bps:?}");
+            assert_eq!(hello_bps[idx + 1].0, 2, "word-internal break before idx {} in 'hello' must be MAY_NOT_BREAK: {hello_bps:?}", idx + 1);
+        }
+
+        let hyp_nbsp = analyze_bps("foo-bar\u{00A0}baz");
+        // Break allowed after '-' (idx 3 -> 4), prohibited around NBSP (idx 7) and inside words.
+        assert_eq!((hyp_nbsp[3].1, hyp_nbsp[4].0), (1, 1), "hyphen allows break after: {hyp_nbsp:?}");
+        assert_eq!((hyp_nbsp[6].1, hyp_nbsp[7].0, hyp_nbsp[7].1, hyp_nbsp[8].0), (2, 2, 2, 2), "NBSP prohibits break before and after: {hyp_nbsp:?}");
+        assert_eq!((hyp_nbsp[0].1, hyp_nbsp[1].0), (2, 2), "word-internal 'fo' must prohibit break: {hyp_nbsp:?}");
+
+        let crlf_bps = analyze_bps("a\r\nb");
+        assert_eq!((crlf_bps[1].1, crlf_bps[2].0, crlf_bps[2].1), (2, 2, 3), "CR+LF must not break between CR and LF and must break after LF: {crlf_bps:?}");
+
+        let cjk_bps = analyze_bps("日本語");
+        assert_eq!((cjk_bps[0].1, cjk_bps[1].0, cjk_bps[1].1, cjk_bps[2].0), (1, 1, 1, 1), "CJK ideographs allow breaks between chars: {cjk_bps:?}");
+
         release_com(ns_ctx);
         release_com(ns_none);
         release_com(ns_national);
         release_com(face);
         release_com(ta);
         release_com(fac);
+    }
+}
+
+#[test]
+fn glyph_run_analysis_preserves_fractional_subpixel_origins() {
+    use super::analysis::{gra_create_alpha_texture, gra_get_alpha_texture_bounds, PGlyphRunAnalysis};
+    use super::sfnt::{fallback_cp_to_gid, parse_font_bytes_metadata, SfntFace};
+    use crate::user32::RECT;
+
+    unsafe {
+            let mut fac: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                DWriteCreateFactory(
+                    DWRITE_FACTORY_TYPE_SHARED,
+                    &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                    &mut fac,
+                ),
+                S_OK
+            );
+
+            // Build a TrueType contour font face (gid 1 = solid rectangle outline).
+            let ttf = build_synthetic_ttf();
+            let raw = Arc::new(ttf);
+            let metas = parse_font_bytes_metadata(Arc::clone(&raw), "SubpixelTest");
+            assert!(!metas.is_empty());
+            let sfnt = SfntFace::from_bytes(Arc::clone(&raw), 0).map(Arc::new);
+            let tt_face = new_font_face(Arc::new(FontFaceInner {
+                meta: Arc::new(metas[0].clone()),
+                simulations: 0,
+                sfnt,
+            }));
+
+            let render_centroid = |face_ptr: *mut c_void, mode: u32, tex_ty: u32, bx: f32, by: f32| -> (RECT, Vec<u8>, f64, f64) {
+                let gids = [1u16];
+                let adv = [20.0f32];
+                let offs = [DWRITE_GLYPH_OFFSET::default()];
+                let run = DWRITE_GLYPH_RUN {
+                    fontFace: face_ptr,
+                    fontEmSize: 32.0,
+                    glyphCount: 1,
+                    glyphIndices: gids.as_ptr(),
+                    glyphAdvances: adv.as_ptr(),
+                    glyphOffsets: offs.as_ptr(),
+                    isSideways: FALSE,
+                    bidiLevel: 0,
+                };
+                let mut gra: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    fac_create_glyph_run_analysis(
+                        fac as PFactory,
+                        &run,
+                        1.0,
+                        std::ptr::null(),
+                        mode,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                        bx,
+                        by,
+                        &mut gra,
+                    ),
+                    S_OK
+                );
+                let mut rc = RECT::default();
+                assert_eq!(gra_get_alpha_texture_bounds(gra as PGlyphRunAnalysis, tex_ty, &mut rc), S_OK);
+                let w = (rc.right - rc.left) as usize;
+                let h = (rc.bottom - rc.top) as usize;
+                let bpp = if tex_ty == DWRITE_TEXTURE_ALIASED_1X1 { 1usize } else { 3usize };
+                let mut buf = vec![0u8; w * h * bpp];
+                assert_eq!(
+                    gra_create_alpha_texture(gra as PGlyphRunAnalysis, tex_ty, &rc, buf.as_mut_ptr(), buf.len() as u32),
+                    S_OK
+                );
+                release_com(gra);
+
+                let mut sum = 0.0f64;
+                let mut sum_x = 0.0f64;
+                let mut sum_y = 0.0f64;
+                for y in 0..h {
+                    for x in 0..w {
+                        let cov = buf[(y * w + x) * bpp] as f64;
+                        sum += cov;
+                        sum_x += cov * (rc.left as f64 + x as f64 + 0.5);
+                        sum_y += cov * (rc.top as f64 + y as f64 + 0.5);
+                    }
+                }
+                assert!(sum > 0.0, "expected non-empty coverage for mode={mode}, bx={bx}, by={by}");
+                (rc, buf, sum_x / sum, sum_y / sum)
+            };
+
+            // 1. Natural mode preserves fractional X origins: 0.0 -> 0.4 -> 0.6 shifts coverage smoothly,
+            //    never producing identical coverage for 0.0 and 0.4.
+            let (_, tex_0, cx_0, cy_0) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.0, 32.0);
+            let (_, tex_04, cx_04, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.4, 32.0);
+            let (_, _, cx_06, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.6, 32.0);
+            assert_ne!(tex_0, tex_04, "NATURAL mode must produce distinct coverage at baseline_x 0.0 vs 0.4");
+            assert!(((cx_04 - cx_0) - 0.4).abs() < 0.06, "expected +0.4px X shift: cx_0={cx_0}, cx_04={cx_04}");
+            assert!(((cx_06 - cx_0) - 0.6).abs() < 0.06, "expected +0.6px X shift: cx_0={cx_0}, cx_06={cx_06}");
+
+            // NATURAL snaps vertical baseline to whole pixel; NATURAL_SYMMETRIC preserves fractional Y too.
+            let (_, _, _, cy_nat_04) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.0, 32.4);
+            assert!((cy_nat_04 - cy_0).abs() < 1e-4, "NATURAL mode snaps baseline Y: cy_0={cy_0}, cy_nat_04={cy_nat_04}");
+            let (_, _, _, cy_sym_04) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.0, 32.4);
+            assert!(((cy_sym_04 - cy_0) - 0.4).abs() < 0.15, "NATURAL_SYMMETRIC must preserve fractional Y: cy_0={cy_0}, cy_sym_04={cy_sym_04}");
+
+            // 2. ALIASED and GDI_CLASSIC snap origins to whole pixels (0.0 and 0.4 match).
+            let (rc_al_0, tex_al_0, _, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_ALIASED, DWRITE_TEXTURE_ALIASED_1X1, 0.0, 32.0);
+            let (rc_al_04, tex_al_04, _, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_ALIASED, DWRITE_TEXTURE_ALIASED_1X1, 0.4, 32.0);
+            assert_eq!((rc_al_0.left, rc_al_0.top, rc_al_0.right, rc_al_0.bottom), (rc_al_04.left, rc_al_04.top, rc_al_04.right, rc_al_04.bottom));
+            assert_eq!(tex_al_0, tex_al_04, "ALIASED mode must snap 0.0 and 0.4 to the same whole pixel");
+
+            let (rc_gdi_0, tex_gdi_0, _, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_GDI_CLASSIC, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.0, 32.0);
+            let (rc_gdi_04, tex_gdi_04, _, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_GDI_CLASSIC, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.4, 32.0);
+            assert_eq!((rc_gdi_0.left, rc_gdi_0.top, rc_gdi_0.right, rc_gdi_0.bottom), (rc_gdi_04.left, rc_gdi_04.top, rc_gdi_04.right, rc_gdi_04.bottom));
+            assert_eq!(tex_gdi_0, tex_gdi_04, "GDI_CLASSIC mode must snap 0.0 and 0.4 to the same whole pixel");
+
+            // 3. Fallback 8x8 bitmap rasterizer also preserves fractional X origins under NATURAL mode.
+            let fb_face = new_font_face(Arc::new(FontFaceInner {
+                meta: Arc::new(metas[0].clone()),
+                simulations: 0,
+                sfnt: None,
+            }));
+            let gids_h = [fallback_cp_to_gid('H' as u32)];
+            let adv_h = [20.0f32];
+            let offs_h = [DWRITE_GLYPH_OFFSET::default()];
+            let render_fb = |bx: f32| -> (Vec<u8>, f64) {
+                let run = DWRITE_GLYPH_RUN {
+                    fontFace: fb_face,
+                    fontEmSize: 32.0,
+                    glyphCount: 1,
+                    glyphIndices: gids_h.as_ptr(),
+                    glyphAdvances: adv_h.as_ptr(),
+                    glyphOffsets: offs_h.as_ptr(),
+                    isSideways: FALSE,
+                    bidiLevel: 0,
+                };
+                let mut gra: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    fac_create_glyph_run_analysis(
+                        fac as PFactory,
+                        &run,
+                        1.0,
+                        std::ptr::null(),
+                        DWRITE_RENDERING_MODE_NATURAL,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                        bx,
+                        32.0,
+                        &mut gra,
+                    ),
+                    S_OK
+                );
+                let mut rc = RECT::default();
+                assert_eq!(gra_get_alpha_texture_bounds(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut rc), S_OK);
+                let w = (rc.right - rc.left) as usize;
+                let h = (rc.bottom - rc.top) as usize;
+                let mut buf = vec![0u8; w * h * 3];
+                assert_eq!(
+                    gra_create_alpha_texture(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &rc, buf.as_mut_ptr(), buf.len() as u32),
+                    S_OK
+                );
+                release_com(gra);
+                let mut sum = 0.0f64;
+                let mut sum_x = 0.0f64;
+                for y in 0..h {
+                    for x in 0..w {
+                        let cov = buf[(y * w + x) * 3] as f64;
+                        sum += cov;
+                        sum_x += cov * (rc.left as f64 + x as f64 + 0.5);
+                    }
+                }
+                (buf, sum_x / sum)
+            };
+            let (fb_tex_0, fb_cx_0) = render_fb(0.0);
+            let (fb_tex_04, fb_cx_04) = render_fb(0.4);
+            assert_ne!(fb_tex_0, fb_tex_04, "fallback 8x8 glyph must differ at baseline_x 0.0 vs 0.4");
+            assert!(((fb_cx_04 - fb_cx_0) - 0.4).abs() < 0.2, "fallback X shift expected ~0.4: 0={fb_cx_0}, 0.4={fb_cx_04}");
+
+            release_com(fb_face);
+            release_com(tt_face);
+            release_com(fac);
     }
 }

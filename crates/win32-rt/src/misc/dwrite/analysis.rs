@@ -436,20 +436,35 @@ struct IcuBidiApi {
     ubidi_get_levels: unsafe extern "C" fn(*mut c_void, *mut i32) -> *const u8,
 }
 
-fn icu_bidi_api() -> Option<&'static IcuBidiApi> {
-    static API: OnceLock<Option<IcuBidiApi>> = OnceLock::new();
-    API.get_or_init(|| unsafe {
-        let mut handle: *mut c_void = std::ptr::null_mut();
+struct IcuBreakApi {
+    ubrk_open: unsafe extern "C" fn(i32, *const libc::c_char, *const u16, i32, *mut i32) -> *mut c_void,
+    ubrk_close: unsafe extern "C" fn(*mut c_void),
+    ubrk_first: unsafe extern "C" fn(*mut c_void) -> i32,
+    ubrk_next: unsafe extern "C" fn(*mut c_void) -> i32,
+    ubrk_get_rule_status: unsafe extern "C" fn(*mut c_void) -> i32,
+}
+
+fn open_icucore() -> *mut c_void {
+    static HANDLE: OnceLock<usize> = OnceLock::new();
+    *HANDLE.get_or_init(|| unsafe {
         for name in [
             c"/usr/lib/libicucore.A.dylib",
             c"libicucore.A.dylib",
             c"libicucore.dylib",
         ] {
-            handle = libc::dlopen(name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
-            if !handle.is_null() {
-                break;
+            let h = libc::dlopen(name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+            if !h.is_null() {
+                return h as usize;
             }
         }
+        0
+    }) as *mut c_void
+}
+
+fn icu_bidi_api() -> Option<&'static IcuBidiApi> {
+    static API: OnceLock<Option<IcuBidiApi>> = OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let handle = open_icucore();
         if handle.is_null() {
             return None;
         }
@@ -465,6 +480,32 @@ fn icu_bidi_api() -> Option<&'static IcuBidiApi> {
             ubidi_close: std::mem::transmute(close),
             ubidi_set_para: std::mem::transmute(set_para),
             ubidi_get_levels: std::mem::transmute(get_levels),
+        })
+    })
+    .as_ref()
+}
+
+fn icu_break_api() -> Option<&'static IcuBreakApi> {
+    static API: OnceLock<Option<IcuBreakApi>> = OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let handle = open_icucore();
+        if handle.is_null() {
+            return None;
+        }
+        let open = libc::dlsym(handle, c"ubrk_open".as_ptr());
+        let close = libc::dlsym(handle, c"ubrk_close".as_ptr());
+        let first = libc::dlsym(handle, c"ubrk_first".as_ptr());
+        let next = libc::dlsym(handle, c"ubrk_next".as_ptr());
+        let status = libc::dlsym(handle, c"ubrk_getRuleStatus".as_ptr());
+        if open.is_null() || close.is_null() || first.is_null() || next.is_null() || status.is_null() {
+            return None;
+        }
+        Some(IcuBreakApi {
+            ubrk_open: std::mem::transmute(open),
+            ubrk_close: std::mem::transmute(close),
+            ubrk_first: std::mem::transmute(first),
+            ubrk_next: std::mem::transmute(next),
+            ubrk_get_rule_status: std::mem::transmute(status),
         })
     })
     .as_ref()
@@ -790,6 +831,100 @@ unsafe extern "win64" fn ta_analyze_number_substitution(
     S_OK
 }
 
+fn is_mandatory_break_u16(u: u16) -> bool {
+    matches!(u, 0x000A | 0x000B | 0x000C | 0x000D | 0x0085 | 0x2028 | 0x2029)
+}
+
+fn is_whitespace_u16(u: u16) -> bool {
+    matches!(
+        u,
+        0x0009
+            | 0x000A..=0x000D
+            | 0x0020
+            | 0x0085
+            | 0x00A0
+            | 0x1680
+            | 0x2000..=0x200A
+            | 0x2028
+            | 0x2029
+            | 0x202F
+            | 0x205F
+            | 0x3000
+    )
+}
+
+fn is_no_break_joiner_u16(u: u16) -> bool {
+    matches!(u, 0x00A0 | 0x202F | 0x2060 | 0xFEFF)
+}
+
+fn is_soft_break_after_u16(u: u16) -> bool {
+    matches!(
+        u,
+        0x0020 | 0x0009 | 0x1680 | 0x2000..=0x200A | 0x205F | 0x3000 | 0x200B | 0x002D | 0x00AD
+    )
+}
+
+/// Resolve UAX #14 line break opportunities via Apple's system `libicucore` (`ubrk_open(UBRK_LINE)`).
+/// Returns a `units.len() + 1` table where `out[k]` is:
+/// - `0`: no line break allowed at boundary `k`
+/// - `1`: soft line break opportunity (`UBRK_LINE_SOFT`)
+/// - `2`: mandatory/hard line break (`UBRK_LINE_HARD`)
+fn resolve_line_breaks_icu(units: &[u16], locale: Option<&str>) -> Option<Vec<u8>> {
+    const UBRK_LINE: i32 = 2;
+    const UBRK_LINE_HARD: i32 = 100;
+    let len = i32::try_from(units.len()).ok()?;
+    let api = icu_break_api()?;
+    let loc_cstr = locale
+        .map(|s| s.trim().replace('-', "_"))
+        .and_then(|s| std::ffi::CString::new(s).ok())
+        .unwrap_or_else(|| std::ffi::CString::new("").unwrap());
+    unsafe {
+        let mut err: i32 = 0;
+        let bi = (api.ubrk_open)(UBRK_LINE, loc_cstr.as_ptr(), units.as_ptr(), len, &mut err);
+        if err > 0 || bi.is_null() {
+            return None;
+        }
+        let mut breaks = vec![0u8; units.len() + 1];
+        let mut pos = (api.ubrk_first)(bi);
+        while pos != -1 {
+            let idx = pos as usize;
+            if idx > 0 && idx <= units.len() {
+                let st = (api.ubrk_get_rule_status)(bi);
+                breaks[idx] = if st >= UBRK_LINE_HARD { 2 } else { 1 };
+            }
+            pos = (api.ubrk_next)(bi);
+        }
+        (api.ubrk_close)(bi);
+        Some(breaks)
+    }
+}
+
+/// Fallback contextual line-break resolver when `libicucore` is unavailable:
+/// prohibits word-internal breaks by default, allows breaks after whitespace/hyphens/ZWSP/CJK,
+/// and enforces mandatory breaks after LF, standalone CR, VT, FF, NEL, LS, and PS.
+fn resolve_line_breaks_fallback(units: &[u16]) -> Vec<u8> {
+    let n = units.len();
+    let mut breaks = vec![0u8; n + 1];
+    for i in 0..n {
+        let u = units[i];
+        let next = units.get(i + 1).copied();
+        if u == 0x000D {
+            breaks[i + 1] = if next == Some(0x000A) { 0 } else { 2 };
+        } else if is_mandatory_break_u16(u) {
+            breaks[i + 1] = 2;
+        } else if is_no_break_joiner_u16(u) || next.is_some_and(is_no_break_joiner_u16) {
+            breaks[i + 1] = 0;
+        } else if next.is_some_and(|nx| is_mandatory_break_u16(nx) || (is_whitespace_u16(nx) && nx != 0x00A0 && nx != 0x202F)) {
+            breaks[i + 1] = 0;
+        } else if is_soft_break_after_u16(u) {
+            breaks[i + 1] = 1;
+        } else if (0x4E00..=0x9FFF).contains(&u) || (0x3040..=0x30FF).contains(&u) {
+            breaks[i + 1] = 1;
+        }
+    }
+    breaks
+}
+
 unsafe extern "win64" fn ta_analyze_line_breakpoints(
     this: PTextAnalyzer,
     source: *mut c_void,
@@ -810,60 +945,85 @@ unsafe extern "win64" fn ta_analyze_line_breakpoints(
     if units.is_empty() {
         return S_OK;
     }
-    // DWRITE_BREAK_CONDITION: 0=NEUTRAL, 1=CAN_BREAK, 2=MAY_NOT_BREAK, 3=MUST_BREAK
-    let mut bps = Vec::with_capacity(units.len());
-    for (idx, &u) in units.iter().enumerate() {
-        let mut before: u8 = 0; // NEUTRAL
-        let mut after: u8 = 0;
-        let mut is_ws = false;
-        let mut is_soft_hyphen = false;
-        match u {
-            0x000A => {
-                // LF: must break after; never break before (LB6) including CR+LF.
-                before = 2;
-                after = 3;
-                is_ws = true;
+
+    // Query source locale for UAX #14 locale-tailored line breaking if provided.
+    let locale: Option<String> = {
+        let src_vtbl = (source as *const *const usize).read_unaligned();
+        let get_locale = if !src_vtbl.is_null() {
+            src_vtbl.add(6).read_unaligned()
+        } else {
+            0
+        };
+        if get_locale != 0 {
+            let mut loc_len = 0u32;
+            let mut loc_ptr: *const u16 = std::ptr::null();
+            let hr = crate::call_guest8(
+                get_locale,
+                source as u64,
+                text_pos as u64,
+                &mut loc_len as *mut u32 as u64,
+                &mut loc_ptr as *mut *const u16 as u64,
+                0,
+                0,
+                0,
+                0,
+            ) as HRESULT;
+            if hr >= 0 && !loc_ptr.is_null() {
+                Some(crate::strings::from_wide(loc_ptr))
+            } else {
+                None
             }
-            0x000D => {
-                before = 2;
-                after = if idx + 1 < units.len() && units[idx + 1] == 0x000A { 2 } else { 3 };
-                is_ws = true;
-            }
-            // Unicode UAX #14 mandatory line/paragraph break characters (BK):
-            // VT (U+000B), FF (U+000C), NEL (U+0085), LS (U+2028), PS (U+2029).
-            0x000B | 0x000C | 0x0085 | 0x2028 | 0x2029 => {
-                before = 2; // MAY_NOT_BREAK before mandatory break char (LB6)
-                after = 3;  // MUST_BREAK after (LB4/LB5)
-                is_ws = true;
-            }
-            0x0020 | 0x0009 | 0x1680 | 0x2000..=0x200A | 0x205F | 0x3000 => {
-                after = 1; // CAN_BREAK
-                is_ws = true;
-            }
-            0x200B => {
-                // Zero-width space allows break after without counting as whitespace.
-                after = 1;
-            }
-            0x002D => {
-                after = 1; // hyphen allows break after
-            }
-            0x00AD => {
-                after = 1;
-                is_soft_hyphen = true;
-            }
-            0x00A0 | 0x202F => {
-                // NBSP / NNBSP: may not break before or after
-                before = 2;
-                after = 2;
-                is_ws = true;
-            }
-            0x2060 | 0xFEFF => {
-                // Word joiner / ZWNBSP: may not break before or after
-                before = 2;
-                after = 2;
-            }
-            _ => {}
+        } else {
+            None
         }
+    };
+
+    let breaks = resolve_line_breaks_icu(&units, locale.as_deref())
+        .unwrap_or_else(|| resolve_line_breaks_fallback(&units));
+
+    // DWRITE_BREAK_CONDITION: 0=NEUTRAL, 1=CAN_BREAK, 2=MAY_NOT_BREAK, 3=MUST_BREAK
+    let n = units.len();
+    let mut bps = Vec::with_capacity(n);
+    for idx in 0..n {
+        let u = units[idx];
+        let before: u8 = if idx == 0 {
+            if is_mandatory_break_u16(u) || is_no_break_joiner_u16(u) {
+                2 // MAY_NOT_BREAK
+            } else {
+                0 // NEUTRAL
+            }
+        } else {
+            match breaks[idx] {
+                0 => 2, // MAY_NOT_BREAK (word-internal, before space/newline, CR+LF, joiners)
+                1 => 1, // CAN_BREAK
+                _ => {
+                    // Preceding character ended with MUST_BREAK; keep MAY_NOT_BREAK on
+                    // mandatory separators / joiners (MUST_BREAK still wins via max).
+                    if is_mandatory_break_u16(u) || is_no_break_joiner_u16(u) {
+                        2
+                    } else {
+                        0
+                    }
+                }
+            }
+        };
+        let after: u8 = if idx + 1 < n {
+            match breaks[idx + 1] {
+                2 => 3, // MUST_BREAK
+                1 => 1, // CAN_BREAK
+                _ => 2, // MAY_NOT_BREAK
+            }
+        } else if breaks[n] == 2 || is_mandatory_break_u16(u) {
+            3 // MUST_BREAK
+        } else if is_no_break_joiner_u16(u) {
+            2 // MAY_NOT_BREAK
+        } else if is_soft_break_after_u16(u) {
+            1 // CAN_BREAK
+        } else {
+            0 // NEUTRAL
+        };
+        let is_ws = is_whitespace_u16(u);
+        let is_soft_hyphen = u == 0x00AD;
         let bits = (before & 0x3)
             | ((after & 0x3) << 2)
             | ((is_ws as u8) << 4)
@@ -1734,10 +1894,37 @@ impl GlyphRunAnalysisInner {
             let gx_px = (gx_dip * m.m11 + gy_dip * m.m21 + m.dx) * pixels_per_dip;
             let gy_px = (gx_dip * m.m12 + gy_dip * m.m22 + m.dy) * pixels_per_dip;
 
-            let rast = rasterize_glyph_transformed(&face, gid, run.fontEmSize, pixels_per_dip, &glyph_m);
+            // Preserve fractional device-pixel origins where the rendering mode supports
+            // subpixel positioning; snap to whole pixels only where required by the mode.
+            let (base_x, sub_x, base_y, sub_y) = match rendering_mode {
+                DWRITE_RENDERING_MODE_ALIASED
+                | DWRITE_RENDERING_MODE_GDI_CLASSIC
+                | DWRITE_RENDERING_MODE_GDI_NATURAL => {
+                    (gx_px.round() as i32, 0.0f32, gy_px.round() as i32, 0.0f32)
+                }
+                DWRITE_RENDERING_MODE_NATURAL => {
+                    let bx = gx_px.floor();
+                    (bx as i32, gx_px - bx, gy_px.round() as i32, 0.0f32)
+                }
+                // DEFAULT (0), NATURAL_SYMMETRIC (5), OUTLINE (6): subpixel X and Y.
+                _ => {
+                    let bx = gx_px.floor();
+                    let by = gy_px.floor();
+                    (bx as i32, gx_px - bx, by as i32, gy_px - by)
+                }
+            };
+
+            let rast = rasterize_glyph_transformed(
+                &face,
+                gid,
+                run.fontEmSize,
+                pixels_per_dip,
+                &glyph_m,
+                (sub_x, sub_y),
+            );
             if rast.width > 0 && rast.height > 0 {
-                let left = gx_px.round() as i32 + rast.offset_x;
-                let top = gy_px.round() as i32 + rast.offset_y;
+                let left = base_x + rast.offset_x;
+                let top = base_y + rast.offset_y;
                 let right = left.saturating_add(rast.width as i32);
                 let bottom = top.saturating_add(rast.height as i32);
                 min_x = min_x.min(left);

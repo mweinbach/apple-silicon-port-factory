@@ -1171,7 +1171,7 @@ pub(super) fn flatten_quad_contour(
     scale: f32,
     italic_shear: f32,
 ) -> Vec<(f32, f32)> {
-    flatten_quad_contour_transformed(contour, scale, italic_shear, (1.0, 0.0, 0.0, 1.0))
+    flatten_quad_contour_transformed(contour, scale, italic_shear, (1.0, 0.0, 0.0, 1.0), (0.0, 0.0))
 }
 
 fn flatten_quad_contour_transformed(
@@ -1179,6 +1179,7 @@ fn flatten_quad_contour_transformed(
     scale: f32,
     italic_shear: f32,
     mat: (f32, f32, f32, f32),
+    subpixel_offset: (f32, f32),
 ) -> Vec<(f32, f32)> {
     let n = contour.len();
     if n < 2 {
@@ -1187,7 +1188,10 @@ fn flatten_quad_contour_transformed(
     let tx = |x: f32, y: f32| -> (f32, f32) {
         let dx = (x + y * italic_shear) * scale;
         let dy = -y * scale;
-        (dx * mat.0 + dy * mat.2, dx * mat.1 + dy * mat.3)
+        (
+            dx * mat.0 + dy * mat.2 + subpixel_offset.0,
+            dx * mat.1 + dy * mat.3 + subpixel_offset.1,
+        )
     };
     // Find an explicit or implied starting on-curve point.
     let first_on = contour.iter().position(|p| p.2);
@@ -1248,6 +1252,7 @@ fn rasterize_contours(
     scale: f32,
     italic_shear: f32,
     mat: (f32, f32, f32, f32),
+    subpixel_offset: (f32, f32),
 ) -> RasterizedGlyph {
     let mut polys: Vec<Vec<(f32, f32)>> = Vec::with_capacity(contours.len());
     let mut min_x = f32::INFINITY;
@@ -1256,7 +1261,7 @@ fn rasterize_contours(
     let mut max_y = f32::NEG_INFINITY;
 
     for c in contours {
-        let poly = flatten_quad_contour_transformed(c, scale, italic_shear, mat);
+        let poly = flatten_quad_contour_transformed(c, scale, italic_shear, mat, subpixel_offset);
         if poly.len() >= 3 {
             for &(x, y) in &poly {
                 if x < min_x { min_x = x; }
@@ -1399,11 +1404,14 @@ fn rasterize_fallback_8x8_transformed(
     bold: bool,
     italic: bool,
     mat: (f32, f32, f32, f32),
+    subpixel_offset: (f32, f32),
 ) -> RasterizedGlyph {
     let is_identity = (mat.0 - 1.0).abs() < 1e-5
         && mat.1.abs() < 1e-5
         && mat.2.abs() < 1e-5
-        && (mat.3 - 1.0).abs() < 1e-5;
+        && (mat.3 - 1.0).abs() < 1e-5
+        && subpixel_offset.0.abs() < 1e-5
+        && subpixel_offset.1.abs() < 1e-5;
     if is_identity {
         return rasterize_fallback_8x8(ch, em_size, bold, italic);
     }
@@ -1434,8 +1442,8 @@ fn rasterize_fallback_8x8_transformed(
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     for &(lx, ly) in &corners {
-        let px = lx * mat.0 + ly * mat.2;
-        let py = lx * mat.1 + ly * mat.3;
+        let px = lx * mat.0 + ly * mat.2 + subpixel_offset.0;
+        let py = lx * mat.1 + ly * mat.3 + subpixel_offset.1;
         min_x = min_x.min(px);
         min_y = min_y.min(py);
         max_x = max_x.max(px);
@@ -1450,8 +1458,9 @@ fn rasterize_fallback_8x8_transformed(
     if out_w == 0 || out_h == 0 {
         return RasterizedGlyph { offset_x: 0, offset_y: 0, width: 0, height: 0, alpha: Vec::new() };
     }
-    // Inverse of row-vector transform (lx*m11 + ly*m21, lx*m12 + ly*m22):
-    // lx = (px*m22 - py*m21) / det, ly = (-px*m12 + py*m11) / det.
+    // Inverse of row-vector transform (lx*m11 + ly*m21 + sub_x, lx*m12 + ly*m22 + sub_y):
+    // lx = ((px - sub_x)*m22 - (py - sub_y)*m21) / det,
+    // ly = (-(px - sub_x)*m12 + (py - sub_y)*m11) / det.
     let inv_det = 1.0 / det;
     let sample_bit = |u: f32, v: f32| -> f32 {
         let bx = (u * 8.0).floor() as i32;
@@ -1472,10 +1481,10 @@ fn rasterize_fallback_8x8_transformed(
     for py in 0..out_h {
         for px in 0..out_w {
             let mut acc = 0.0f32;
-            for sy in 0..2 {
-                let oy = (iy0 + py as i32) as f32 + (sy as f32 + 0.5) * 0.5;
-                for sx in 0..2 {
-                    let ox = (ix0 + px as i32) as f32 + (sx as f32 + 0.5) * 0.5;
+            for sy in 0..4 {
+                let oy = (iy0 + py as i32) as f32 + (sy as f32 + 0.5) * 0.25 - subpixel_offset.1;
+                for sx in 0..4 {
+                    let ox = (ix0 + px as i32) as f32 + (sx as f32 + 0.5) * 0.25 - subpixel_offset.0;
                     let lx = (ox * mat.3 - oy * mat.2) * inv_det;
                     let ly = (-ox * mat.1 + oy * mat.0) * inv_det;
                     let ly_box = ly + ascent_dip;
@@ -1485,14 +1494,14 @@ fn rasterize_fallback_8x8_transformed(
                     acc += sample_bit(u, v);
                 }
             }
-            alpha[(py * out_w + px) as usize] = ((acc * 0.25).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            alpha[(py * out_w + px) as usize] = ((acc * 0.0625).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         }
     }
     RasterizedGlyph { offset_x: ix0, offset_y: iy0, width: out_w, height: out_h, alpha }
 }
 
 pub(crate) fn rasterize_glyph(face: &FontFaceInner, glyph_id: u16, em_size: f32) -> RasterizedGlyph {
-    rasterize_glyph_transformed(face, glyph_id, em_size, 1.0, &DWRITE_MATRIX::default())
+    rasterize_glyph_transformed(face, glyph_id, em_size, 1.0, &DWRITE_MATRIX::default(), (0.0, 0.0))
 }
 
 pub(crate) fn rasterize_glyph_transformed(
@@ -1501,6 +1510,7 @@ pub(crate) fn rasterize_glyph_transformed(
     em_size: f32,
     pixels_per_dip: f32,
     m: &DWRITE_MATRIX,
+    subpixel_offset: (f32, f32),
 ) -> RasterizedGlyph {
     if em_size <= 0.0 || !em_size.is_finite() || pixels_per_dip <= 0.0 || !pixels_per_dip.is_finite() {
         return RasterizedGlyph { offset_x: 0, offset_y: 0, width: 0, height: 0, alpha: Vec::new() };
@@ -1520,7 +1530,7 @@ pub(crate) fn rasterize_glyph_transformed(
         if let Some(contours) = sfnt.glyph_contours(glyph_id, 0) {
             if !contours.is_empty() {
                 let scale = em_size / (sfnt.upem as f32);
-                return rasterize_contours(&contours, scale, italic_shear, mat);
+                return rasterize_contours(&contours, scale, italic_shear, mat, subpixel_offset);
             }
             // Space or empty TrueType glyph (e.g. ' ' has valid empty glyf slice, or no outline).
             if sfnt.glyph_to_char.get(&glyph_id) == Some(&' ') {
@@ -1532,12 +1542,12 @@ pub(crate) fn rasterize_glyph_transformed(
         let bold = face.meta.weight >= 650 || (face.simulations & DWRITE_FONT_SIMULATIONS_BOLD) != 0;
         let italic = face.meta.style != DWRITE_FONT_STYLE_NORMAL
             || (face.simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE) != 0;
-        return rasterize_fallback_8x8_transformed(ch, em_size, bold, italic, mat);
+        return rasterize_fallback_8x8_transformed(ch, em_size, bold, italic, mat, subpixel_offset);
     }
 
     let ch = fallback_gid_to_char(glyph_id);
     let bold = face.meta.weight >= 650 || (face.simulations & DWRITE_FONT_SIMULATIONS_BOLD) != 0;
     let italic = face.meta.style != DWRITE_FONT_STYLE_NORMAL
         || (face.simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE) != 0;
-    rasterize_fallback_8x8_transformed(ch, em_size, bold, italic, mat)
+    rasterize_fallback_8x8_transformed(ch, em_size, bold, italic, mat, subpixel_offset)
 }
