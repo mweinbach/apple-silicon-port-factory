@@ -154,6 +154,11 @@ impl ThreadObj {
         }
     }
 
+    /// True iff this thread is currently held in a Mach `thread_suspend` (e.g. via `SuspendThread`).
+    pub fn is_kernel_suspended(&self) -> bool {
+        self.suspend.lock().unwrap_or_else(|e| e.into_inner()).kernel_suspended
+    }
+
     fn is_current_thread(&self, mach_port: u32) -> bool {
         if current_thread_object().is_some_and(|c| std::ptr::eq(&*c, self)) {
             return true;

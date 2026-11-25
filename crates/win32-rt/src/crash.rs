@@ -697,6 +697,227 @@ pub unsafe fn snapshot_thread(pthread: usize, max: usize) -> Result<Vec<u64>, &'
     snapshot_walk(pthread, max)
 }
 
+/// Read up to `buf.len()` contiguous readable bytes starting at `addr` page-by-page without
+/// allocating (safe to invoke while a target thread is parked or Mach-suspended).
+fn safe_read_into(addr: u64, buf: &mut [u8]) -> usize {
+    if addr < 0x1000 || buf.is_empty() {
+        return 0;
+    }
+    let mut copied = 0usize;
+    while copied < buf.len() {
+        let cur = addr.wrapping_add(copied as u64);
+        let page_rem = (0x1000 - (cur & 0xFFF)) as usize;
+        let chunk = page_rem.min(buf.len() - copied);
+        if !safe_read(cur, &mut buf[copied..copied + chunk]) {
+            break;
+        }
+        copied += chunk;
+    }
+    copied
+}
+
+#[cfg(target_vendor = "apple")]
+unsafe fn capture_via_mach_thread_state(mach_port: u32, stack_buf: &mut [u8]) -> Option<(Context, usize)> {
+    extern "C" {
+        fn thread_suspend(target_act: u32) -> i32;
+        fn thread_resume(target_act: u32) -> i32;
+        fn thread_get_state(
+            target_act: u32,
+            flavor: i32,
+            old_state: *mut u32,
+            old_state_cnt: *mut u32,
+        ) -> i32;
+    }
+    if mach_port == 0 {
+        return None;
+    }
+    if thread_suspend(mach_port) != 0 {
+        return None;
+    }
+    // IMPORTANT: Never allocate or take Rust locks while the target thread is Mach-suspended
+    // (it could hold the system allocator lock). Only raw Mach syscalls + writes into `stack_buf`.
+    let captured = {
+        #[cfg(target_arch = "aarch64")]
+        {
+            const ARM_THREAD_STATE64: i32 = 6;
+            const ARM_THREAD_STATE64_COUNT: u32 = 68;
+            #[repr(C)]
+            struct ArmThreadState64 {
+                x: [u64; 29],
+                fp: u64,
+                lr: u64,
+                sp: u64,
+                pc: u64,
+                cpsr: u32,
+                pad: u32,
+            }
+            let mut state: ArmThreadState64 = std::mem::zeroed();
+            let mut count = ARM_THREAD_STATE64_COUNT;
+            let kr = thread_get_state(
+                mach_port,
+                ARM_THREAD_STATE64,
+                &mut state as *mut ArmThreadState64 as *mut u32,
+                &mut count,
+            );
+            if kr == 0 {
+                let mut ctx = Context::zeroed();
+                ctx.context_flags = unwind::CONTEXT_FULL | unwind::CONTEXT_SEGMENTS;
+                ctx.gpr[unwind::RAX] = state.x[0];
+                ctx.gpr[unwind::RCX] = state.x[0];
+                ctx.gpr[unwind::RDX] = state.x[1];
+                ctx.gpr[unwind::R8] = state.x[2];
+                ctx.gpr[unwind::R9] = state.x[3];
+                ctx.gpr[RBP] = state.fp & 0x0000_FFFF_FFFF_FFFF;
+                ctx.gpr[RSP] = state.sp & 0x0000_FFFF_FFFF_FFFF;
+                ctx.rip = state.pc & 0x0000_FFFF_FFFF_FFFF;
+                ctx.mx_csr = 0x1F80;
+                let stack_len = safe_read_into(ctx.gpr[RSP], stack_buf);
+                Some((ctx, stack_len))
+            } else {
+                None
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            const X86_THREAD_STATE64: i32 = 4;
+            const X86_THREAD_STATE64_COUNT: u32 = 42;
+            let mut ss = [0u64; 21];
+            let mut count = X86_THREAD_STATE64_COUNT;
+            let kr = thread_get_state(
+                mach_port,
+                X86_THREAD_STATE64,
+                ss.as_mut_ptr() as *mut u32,
+                &mut count,
+            );
+            if kr == 0 {
+                let mut ctx = Context::zeroed();
+                ctx.context_flags = unwind::CONTEXT_FULL | unwind::CONTEXT_SEGMENTS;
+                for (c, s) in [(0, 0), (1, 2), (2, 3), (3, 1), (4, 7), (5, 6), (6, 5), (7, 4)] {
+                    ctx.gpr[c] = ss[s];
+                }
+                for i in 0..8 {
+                    ctx.gpr[8 + i] = ss[8 + i];
+                }
+                ctx.rip = ss[16];
+                ctx.eflags = ss[17] as u32;
+                ctx.seg_cs = 0x33;
+                ctx.seg_ss = 0x2B;
+                ctx.seg_ds = 0x2B;
+                ctx.seg_es = 0x2B;
+                ctx.seg_fs = 0x53;
+                ctx.seg_gs = 0x2B;
+                ctx.mx_csr = 0x1F80;
+                let stack_len = safe_read_into(ctx.gpr[RSP], stack_buf);
+                Some((ctx, stack_len))
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let _ = stack_buf;
+            None
+        }
+    };
+    let _ = thread_resume(mach_port);
+    captured
+}
+
+/// Capture the real CPU [`Context`] and stack bytes of another live thread in this process
+/// (used by `MiniDumpWriteDump`).
+///
+/// Prefers the `SIGUSR2` snapshot path when installed and the target is not already Mach-suspended
+/// so we capture active guest x86-64 interpreter registers (`GUEST_STATE`) when present; falls back
+/// to Darwin Mach `thread_suspend` + `thread_get_state` + `thread_resume` when `SIGUSR2` is
+/// unavailable or the thread is already suspended. Returns `None` if neither mechanism can capture
+/// a real context (never fabricates a zeroed context).
+pub unsafe fn capture_thread_context_and_stack(
+    pthread: usize,
+    mach_port: u32,
+    kernel_suspended: bool,
+    max_stack: usize,
+) -> Option<(Context, Vec<u8>)> {
+    let me = libc::pthread_self() as usize;
+    if pthread != 0 && pthread == me {
+        let ctx = capture_guest_context().unwrap_or_else(|| {
+            let mut c = Context::zeroed();
+            unwind::RtlCaptureContext(&mut c);
+            c
+        });
+        let mut stack_buf = vec![0u8; max_stack];
+        let n = safe_read_into(ctx.gpr[RSP], &mut stack_buf);
+        stack_buf.truncate(n);
+        return Some((ctx, stack_buf));
+    }
+
+    // Preallocate before pausing/suspending the target thread to avoid allocator lock deadlocks.
+    let mut stack_buf = vec![0u8; max_stack];
+
+    if !kernel_suspended
+        && pthread != 0
+        && SNAP_HANDLER_INSTALLED.load(Ordering::Acquire)
+        && REPORTER.load(Ordering::Acquire) == 0
+    {
+        let _guard = SNAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if SNAP.state.load(Ordering::Acquire) != SNAP_IDLE {
+            std::thread::sleep(Duration::from_millis(50));
+            SNAP.state.store(SNAP_IDLE, Ordering::Release);
+        }
+        SNAP.target.store(pthread, Ordering::Release);
+        SNAP.state.store(SNAP_REQUESTED, Ordering::Release);
+        if libc::pthread_kill(pthread as libc::pthread_t, libc::SIGUSR2) == 0 {
+            let t0 = Instant::now();
+            while SNAP.state.load(Ordering::Acquire) != SNAP_CAPTURED {
+                if t0.elapsed() > Duration::from_millis(200) {
+                    SNAP.target.store(0, Ordering::Release);
+                    SNAP.state.store(SNAP_IDLE, Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            if SNAP.state.load(Ordering::Acquire) == SNAP_CAPTURED {
+                let host_ctx = *SNAP.ctx.get();
+                let guest = (*SNAP.guest.get()).take();
+                let ctx = if let Some((gpr, rip)) = guest {
+                    let mut gc = Context::zeroed();
+                    gc.context_flags = unwind::CONTEXT_FULL | unwind::CONTEXT_SEGMENTS;
+                    gc.gpr = gpr;
+                    gc.rip = rip;
+                    gc.mx_csr = 0x1F80;
+                    gc
+                } else {
+                    host_ctx
+                };
+                let captured_len = safe_read_into(ctx.gpr[RSP], &mut stack_buf);
+                SNAP.target.store(0, Ordering::Release);
+                SNAP.state.store(SNAP_RELEASED, Ordering::Release);
+                let t1 = Instant::now();
+                while SNAP.state.load(Ordering::Acquire) != SNAP_IDLE
+                    && t1.elapsed() < Duration::from_millis(100)
+                {
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+                stack_buf.truncate(captured_len);
+                return Some((ctx, stack_buf));
+            }
+        } else {
+            SNAP.target.store(0, Ordering::Release);
+            SNAP.state.store(SNAP_IDLE, Ordering::Release);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    if let Some((ctx, captured_len)) = capture_via_mach_thread_state(mach_port, &mut stack_buf) {
+        stack_buf.truncate(captured_len);
+        return Some((ctx, stack_buf));
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = mach_port;
+
+    None
+}
+
 /// Process main thread `pthread_t` recorded by [`install`].
 pub fn main_pthread() -> usize {
     MAIN_PTHREAD.load(Ordering::Relaxed)

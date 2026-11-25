@@ -1392,3 +1392,499 @@ fn ds7_compat_controls_format_listener_orientation_doppler_and_notify_offset() {
         assert_eq!(ds_release(ds), 0);
     }
 }
+
+#[test]
+fn dsound8_set_fx_get_object_in_path_and_dsp_processing() {
+    unsafe {
+        let ds = make_paused_ds8();
+        let wfx = float_wfx(2, 48_000);
+        let mut impulse = vec![0.0f32; 1024 * 2];
+        impulse[0] = 1.0;
+        impulse[1] = 1.0;
+        let bytes: Vec<u8> = impulse.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        // Buffer WITHOUT DSBCAPS_CTRLFX -> DSERR_CONTROLUNAVAIL on SetFX(1).
+        let no_fx_desc = make_desc(DSBCAPS_CTRLVOLUME, bytes.len() as u32, &wfx as *const WAVEFORMATEX as *const u8);
+        let mut raw_nofx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(ds_create_sound_buffer(ds, &no_fx_desc as *const DsBufferDesc as *const c_void, &mut raw_nofx, std::ptr::null_mut()), DS_OK);
+        let fx_echo = DsEffectDesc {
+            dw_size: std::mem::size_of::<DsEffectDesc>() as u32,
+            dw_flags: 0,
+            guid_dsfx_class: GUID_DSFX_STANDARD_ECHO,
+            dw_reserved1: 0,
+            dw_reserved2: 0,
+        };
+        let mut res = 0u32;
+        assert_eq!(dsb_set_fx(raw_nofx as *mut DsBufferCom, 1, &fx_echo as *const DsEffectDesc as *const c_void, &mut res), DSERR_CONTROLUNAVAIL);
+        assert_eq!(dsb_release(raw_nofx as *mut DsBufferCom), 0);
+
+        // Buffer WITH DSBCAPS_CTRLFX -> SetFX(Echo) succeeds, GetObjectInPath returns IDirectSoundFXEcho.
+        let fx_desc = make_desc(DSBCAPS_CTRLFX | DSBCAPS_CTRLVOLUME, bytes.len() as u32, &wfx as *const WAVEFORMATEX as *const u8);
+        let mut raw_buf: *mut c_void = std::ptr::null_mut();
+        assert_eq!(ds_create_sound_buffer(ds, &fx_desc as *const DsBufferDesc as *const c_void, &mut raw_buf, std::ptr::null_mut()), DS_OK);
+        let buf = raw_buf as *mut DsBufferCom;
+        write_all_bytes(buf, &bytes);
+
+        assert_eq!(dsb_set_fx(buf, 1, &fx_echo as *const DsEffectDesc as *const c_void, &mut res), DS_OK);
+        assert_eq!(res, DSFXR_LOCSOFTWARE);
+
+        // GetObjectInPath returns IDirectSoundFXEcho with SetAllParameters/GetAllParameters.
+        let mut fx_obj: *mut c_void = std::ptr::null_mut();
+        assert_eq!(dsb_get_object_in_path(buf, &GUID_DSFX_STANDARD_ECHO, 0, &IID_IDIRECTSOUNDFXECHO, &mut fx_obj), DS_OK);
+        assert!(!fx_obj.is_null());
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct EchoParams { wet_dry: f32, feedback: f32, left_ms: f32, right_ms: f32, pan_delay: i32 }
+        let set_p = EchoParams { wet_dry: 50.0, feedback: 50.0, left_ms: 1.0, right_ms: 1.0, pan_delay: 0 };
+        let vtbl = *(fx_obj as *const *const usize);
+        let set_fn: unsafe extern "win64" fn(*mut c_void, *const c_void) -> HRESULT = std::mem::transmute(*vtbl.add(3));
+        let get_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(*vtbl.add(4));
+        let rel_fn: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
+        assert_eq!(set_fn(fx_obj, &set_p as *const EchoParams as *const c_void), DS_OK);
+        let mut got_p = EchoParams { wet_dry: 0.0, feedback: 0.0, left_ms: 0.0, right_ms: 0.0, pan_delay: 0 };
+        assert_eq!(get_fn(fx_obj, &mut got_p as *mut EchoParams as *mut c_void), DS_OK);
+        assert_eq!(got_p.left_ms, 1.0);
+        assert_eq!(rel_fn(fx_obj), 0);
+
+        // Play impulse and verify Echo produces a delayed repeat at 1 ms (~44 frames @ 44.1 kHz / 48 @ 48 kHz).
+        let mix_rate = (&*ds).core.state.lock().unwrap().primary_format.rate;
+        let expected_delay = ((0.001 * mix_rate as f32) as usize).max(1);
+        assert_eq!(dsb_play(buf, 0, 0, 0), DS_OK);
+        let mut out = vec![0.0f32; 128 * 2];
+        (&*ds).core.mix_frames(128, &mut out);
+        assert!((out[0] - 0.5).abs() < 1e-3, "dry impulse={}", out[0]);
+        assert!(
+            out[expected_delay * 2].abs() > 0.2,
+            "expected echo tap at {expected_delay} frames (mix_rate={mix_rate}), got {}",
+            out[expected_delay * 2]
+        );
+        assert_eq!(dsb_stop(buf), DS_OK);
+
+        // Unknown DMO CLSID returns DSERR_FXUNAVAILABLE with DSFXR_UNKNOWN.
+        let bad_fx = DsEffectDesc {
+            dw_size: std::mem::size_of::<DsEffectDesc>() as u32,
+            dw_flags: 0,
+            guid_dsfx_class: GUID::new(0xDEAD_BEEF, 0, 0, [1; 8]),
+            dw_reserved1: 0,
+            dw_reserved2: 0,
+        };
+        assert_eq!(dsb_set_fx(buf, 1, &bad_fx as *const DsEffectDesc as *const c_void, &mut res), DSERR_FXUNAVAILABLE);
+        assert_eq!(res, DSFXR_UNKNOWN);
+
+        // SetFX(0) removes all effects cleanly.
+        assert_eq!(dsb_set_fx(buf, 0, std::ptr::null(), std::ptr::null_mut()), DS_OK);
+        assert_eq!(dsb_get_object_in_path(buf, &GUID_DSFX_STANDARD_ECHO, 0, &IID_IDIRECTSOUNDFXECHO, &mut fx_obj), DSERR_OBJECTNOTFOUND);
+
+        assert_eq!(dsb_release(buf), 0);
+        assert_eq!(ds_release(ds), 0);
+    }
+}
+
+#[test]
+fn dsound8_i3dl2_reverb_full_vtable_preset_and_quality() {
+    let _audio_guard = crate::audio::audio_test_lock();
+    backend::force_backend(Some(Backend::Null));
+
+    unsafe {
+        let ds = make_paused_ds8();
+        let wfx = float_wfx(2, 48_000);
+        let desc = make_desc(
+            DSBCAPS_CTRLFX | DSBCAPS_CTRLVOLUME,
+            1024 * 8,
+            &wfx as *const WAVEFORMATEX as *const u8,
+        );
+        let mut raw_buf: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ds_create_sound_buffer(
+                ds,
+                &desc as *const DsBufferDesc as *const c_void,
+                &mut raw_buf,
+                std::ptr::null_mut(),
+            ),
+            DS_OK
+        );
+        let buf = raw_buf as *mut DsBufferCom;
+
+        let fx_reverb = DsEffectDesc {
+            dw_size: std::mem::size_of::<DsEffectDesc>() as u32,
+            dw_flags: 0,
+            guid_dsfx_class: GUID_DSFX_STANDARD_I3DL2REVERB,
+            dw_reserved1: 0,
+            dw_reserved2: 0,
+        };
+        let mut res = 0u32;
+        assert_eq!(
+            dsb_set_fx(buf, 1, &fx_reverb as *const DsEffectDesc as *const c_void, &mut res),
+            DS_OK
+        );
+        assert_eq!(res, DSFXR_LOCSOFTWARE);
+
+        // GetObjectInPath with GUID_All_Objects matches installed effects; GUID_NULL does not.
+        let mut null_fx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            dsb_get_object_in_path(
+                buf,
+                &GUID_NULL,
+                0,
+                &IID_IDIRECTSOUNDFXI3DL2REVERB,
+                &mut null_fx,
+            ),
+            DSERR_OBJECTNOTFOUND
+        );
+        assert!(null_fx.is_null());
+
+        let mut wildcard_fx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            dsb_get_object_in_path(
+                buf,
+                &GUID_ALL_OBJECTS,
+                0,
+                &IID_IDIRECTSOUNDFXI3DL2REVERB,
+                &mut wildcard_fx,
+            ),
+            DS_OK
+        );
+        assert!(!wildcard_fx.is_null());
+        let wvtbl = *(wildcard_fx as *const *const usize);
+        let wrel: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*wvtbl.add(2));
+        assert_eq!(wrel(wildcard_fx), 0);
+
+        let mut fx_obj: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            dsb_get_object_in_path(
+                buf,
+                &GUID_DSFX_STANDARD_I3DL2REVERB,
+                0,
+                &IID_IDIRECTSOUNDFXI3DL2REVERB,
+                &mut fx_obj,
+            ),
+            DS_OK
+        );
+        assert!(!fx_obj.is_null());
+
+        let vtbl = *(fx_obj as *const *const usize);
+        let qi_fn: unsafe extern "win64" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(*vtbl.add(0));
+        let rel_fn: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
+        let get_all_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void) -> HRESULT =
+            std::mem::transmute(*vtbl.add(4));
+        let set_preset_fn: unsafe extern "win64" fn(*mut c_void, u32) -> HRESULT =
+            std::mem::transmute(*vtbl.add(5));
+        let get_preset_fn: unsafe extern "win64" fn(*mut c_void, *mut u32) -> HRESULT =
+            std::mem::transmute(*vtbl.add(6));
+        let set_quality_fn: unsafe extern "win64" fn(*mut c_void, i32) -> HRESULT =
+            std::mem::transmute(*vtbl.add(7));
+        let get_quality_fn: unsafe extern "win64" fn(*mut c_void, *mut i32) -> HRESULT =
+            std::mem::transmute(*vtbl.add(8));
+
+        // QI for IID_IDIRECTSOUNDFXI3DL2REVERB succeeds.
+        let mut qi_out: *mut c_void = std::ptr::null_mut();
+        assert_eq!(qi_fn(fx_obj, &IID_IDIRECTSOUNDFXI3DL2REVERB, &mut qi_out), DS_OK);
+        assert_eq!(qi_out, fx_obj);
+        assert_eq!(rel_fn(qi_out), 1);
+
+        // Default preset (0 = DEFAULT) and default quality (2).
+        let mut preset = 99u32;
+        assert_eq!(get_preset_fn(fx_obj, &mut preset), DS_OK);
+        assert_eq!(preset, 0);
+        let mut quality = -1i32;
+        assert_eq!(get_quality_fn(fx_obj, &mut quality), DS_OK);
+        assert_eq!(quality, DSFX_I3DL2REVERB_QUALITY_DEFAULT);
+
+        // SetPreset(9 = CAVE) updates both GetPreset and the 48-byte DSFXI3DL2Reverb struct.
+        assert_eq!(set_preset_fn(fx_obj, 9), DS_OK);
+        assert_eq!(get_preset_fn(fx_obj, &mut preset), DS_OK);
+        assert_eq!(preset, 9);
+        let mut raw_params = [0u8; 48];
+        assert_eq!(get_all_fn(fx_obj, raw_params.as_mut_ptr() as *mut c_void), DS_OK);
+        let decay_time = f32::from_le_bytes(raw_params[12..16].try_into().unwrap());
+        assert!((decay_time - 2.91).abs() < 1e-4, "CAVE preset decay_time={decay_time}");
+
+        // Out-of-range preset -> DSERR_INVALIDPARAM; preset unchanged.
+        assert_eq!(set_preset_fn(fx_obj, 30), DSERR_INVALIDPARAM);
+        assert_eq!(get_preset_fn(fx_obj, &mut preset), DS_OK);
+        assert_eq!(preset, 9);
+
+        // SetQuality / GetQuality bounds (0..=3).
+        assert_eq!(set_quality_fn(fx_obj, 3), DS_OK);
+        assert_eq!(get_quality_fn(fx_obj, &mut quality), DS_OK);
+        assert_eq!(quality, 3);
+        assert_eq!(set_quality_fn(fx_obj, -1), DSERR_INVALIDPARAM);
+        assert_eq!(set_quality_fn(fx_obj, 4), DSERR_INVALIDPARAM);
+        assert_eq!(get_quality_fn(fx_obj, &mut quality), DS_OK);
+        assert_eq!(quality, 3);
+
+        assert_eq!(rel_fn(fx_obj), 0);
+        assert_eq!(dsb_release(buf), 0);
+        assert_eq!(ds_release(ds), 0);
+    }
+
+    // Verify I3DL2 quality settings (0..=3) produce genuinely distinct DSP impulse responses.
+    let render_i3dl2_ir = |quality: i32| -> Vec<f32> {
+        let mut fx = BufferEffect::new(DsFxKind::I3dl2Reverb);
+        fx.params = i3dl2_preset_params(9).unwrap(); // CAVE preset (strong early + late reverb)
+        fx.i3dl2_quality = quality;
+        let mut out = Vec::with_capacity(4800);
+        for i in 0..4800 {
+            let x = if i == 0 { 1.0 } else { 0.0 };
+            out.push(fx.process_sample(x, 0.0, 48_000.0).0);
+        }
+        out
+    };
+    let irs: Vec<Vec<f32>> = (0..=3).map(render_i3dl2_ir).collect();
+    // Quality 0 omits early reflection at flReflectionsDelay (0.015 s = 720 samples @ 48 kHz),
+    // whereas Quality 1..=3 emit it.
+    assert!(irs[0][720].abs() < 1e-6, "quality 0 skips early reflections, got {}", irs[0][720]);
+    assert!(irs[1][720].abs() > 0.1, "quality 1 emits early reflection tap, got {}", irs[1][720]);
+    // Every pair of quality tiers (0, 1, 2, 3) produces measurably distinct reverb output.
+    for a in 0..4 {
+        for b in (a + 1)..4 {
+            let max_diff = irs[a]
+                .iter()
+                .zip(irs[b].iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff > 1e-3,
+                "I3DL2 quality {a} and quality {b} must produce distinct DSP responses (max_diff={max_diff})"
+            );
+        }
+    }
+}
+
+#[test]
+fn dsound8_compressor_honors_attack_release_predelay_and_sample_rate() {
+    let make_comp = |attack_ms: f32, release_ms: f32, predelay_ms: f32| -> BufferEffect {
+        let mut fx = BufferEffect::new(DsFxKind::Compressor);
+        let mut raw = Vec::with_capacity(24);
+        for f in [0.0f32, attack_ms, release_ms, -20.0, 10.0, predelay_ms] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        fx.params = raw;
+        fx
+    };
+
+    // 1. Faster fAttack compresses a 1.0 step more strongly after 2 ms (96 samples @ 48 kHz).
+    let mut fast_atk = make_comp(1.0, 200.0, 0.0);
+    let mut slow_atk = make_comp(200.0, 200.0, 0.0);
+    let mut out_fast = 0.0f32;
+    let mut out_slow = 0.0f32;
+    for _ in 0..96 {
+        out_fast = fast_atk.process_sample(1.0, 1.0, 48_000.0).0;
+        out_slow = slow_atk.process_sample(1.0, 1.0, 48_000.0).0;
+    }
+    assert!(
+        out_fast < out_slow * 0.4,
+        "fast attack ({out_fast}) should attenuate much more than slow attack ({out_slow})"
+    );
+
+    // 2. Faster fRelease recovers gain much more quickly after signal drops to 0.05 (below -20 dB).
+    let mut fast_rel = make_comp(0.5, 50.0, 0.0);
+    let mut slow_rel = make_comp(0.5, 2000.0, 0.0);
+    for _ in 0..480 {
+        fast_rel.process_sample(1.0, 1.0, 48_000.0);
+        slow_rel.process_sample(1.0, 1.0, 48_000.0);
+    }
+    // 50 ms at 48 kHz = 2400 samples: fast release should recover well above slow release.
+    let mut rel_fast = 0.0f32;
+    let mut rel_slow = 0.0f32;
+    for _ in 0..2400 {
+        rel_fast = fast_rel.process_sample(0.05, 0.05, 48_000.0).0;
+        rel_slow = slow_rel.process_sample(0.05, 0.05, 48_000.0).0;
+    }
+    assert!(
+        rel_fast > rel_slow * 1.5,
+        "fast release ({rel_fast}) should recover much faster than slow release ({rel_slow})"
+    );
+
+    // 3. Attack time constant is sample-rate independent: 10 ms at 24 kHz vs 48 kHz matches.
+    let mut fx_24k = make_comp(10.0, 200.0, 0.0);
+    let mut fx_48k = make_comp(10.0, 200.0, 0.0);
+    let mut y_24k = 0.0f32;
+    let mut y_48k = 0.0f32;
+    for _ in 0..240 {
+        y_24k = fx_24k.process_sample(1.0, 1.0, 24_000.0).0;
+    }
+    for _ in 0..480 {
+        y_48k = fx_48k.process_sample(1.0, 1.0, 48_000.0).0;
+    }
+    assert!(
+        (y_24k - y_48k).abs() < 1e-3,
+        "10 ms attack should be sample-rate independent (24k={y_24k}, 48k={y_48k})"
+    );
+
+    // 4. Non-zero fPredelay delays the audio path by round(predelay_ms * sr / 1000) samples.
+    let mut fx_pre = make_comp(10.0, 200.0, 1.0);
+    let first = fx_pre.process_sample(0.05, 0.05, 48_000.0).0;
+    assert!(first.abs() < 1e-6, "1 ms predelay should delay sample 0, got {first}");
+    let mut delayed = 0.0f32;
+    for _ in 0..48 {
+        delayed = fx_pre.process_sample(0.0, 0.0, 48_000.0).0;
+    }
+    assert!(
+        (delayed - 0.05).abs() < 1e-4,
+        "impulse should emerge after 48 samples (1 ms @ 48 kHz), got {delayed}"
+    );
+
+    // 5. Default compressor (-20 dB threshold, 3:1 ratio, 0 dB gain) compresses sustained
+    //    0 dBFS input in the dB domain to -13.3333 dBFS (~0.21544 linear).
+    let mut fx_db = BufferEffect::new(DsFxKind::Compressor);
+    let mut settled = 0.0f32;
+    for _ in 0..8000 {
+        settled = fx_db.process_sample(1.0, 1.0, 48_000.0).0;
+    }
+    let expected_linear = 10.0f32.powf((-20.0 + 20.0 / 3.0) / 20.0);
+    assert!(
+        (settled - expected_linear).abs() < 1e-3,
+        "settled 3:1 compression at -20 dB threshold should be {expected_linear} (-13.33 dBFS), got {settled}"
+    );
+}
+
+#[test]
+fn dsound8_echo_pan_delay_and_remaining_fx_parameters() {
+    // 1. DSFXEcho lPanDelay: left-only impulse stays on L when lPanDelay == 0,
+    //    and alternates onto R (at dl + dr) then back to L when lPanDelay == 1.
+    let make_echo = |pan_delay: i32| -> BufferEffect {
+        let mut fx = BufferEffect::new(DsFxKind::Echo);
+        let mut raw = Vec::with_capacity(20);
+        for f in [50.0f32, 50.0, 1.0, 1.0] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        raw.extend_from_slice(&pan_delay.to_le_bytes());
+        fx.params = raw;
+        fx
+    };
+    let mut echo_normal = make_echo(0);
+    let mut echo_pan = make_echo(1);
+    let mut norm_r_peak = 0.0f32;
+    let mut pan_r_at_96 = 0.0f32;
+    let mut pan_l_at_144 = 0.0f32;
+    for i in 0..160 {
+        let in_l = if i == 0 { 1.0 } else { 0.0 };
+        let (_, nr) = echo_normal.process_sample(in_l, 0.0, 48_000.0);
+        norm_r_peak = norm_r_peak.max(nr.abs());
+        let (pl, pr) = echo_pan.process_sample(in_l, 0.0, 48_000.0);
+        if i == 96 {
+            pan_r_at_96 = pr;
+        }
+        if i == 144 {
+            pan_l_at_144 = pl;
+        }
+    }
+    assert!(norm_r_peak < 1e-6, "lPanDelay=0 must not leak left impulse to right ({norm_r_peak})");
+    assert!(pan_r_at_96 > 0.2, "lPanDelay=1 must bounce left echo onto right at 2*48 frames ({pan_r_at_96})");
+    assert!(pan_l_at_144 > 0.1, "lPanDelay=1 must bounce right echo back to left at 3*48 frames ({pan_l_at_144})");
+
+    // 2. DSFXChorus lPhase creates stereo L/R divergence on identical L/R input.
+    let make_chorus = |waveform: i32, phase: i32| -> BufferEffect {
+        let mut fx = BufferEffect::new(DsFxKind::Chorus);
+        let mut raw = Vec::with_capacity(28);
+        for f in [100.0f32, 100.0, 0.0, 5.0] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        raw.extend_from_slice(&waveform.to_le_bytes());
+        raw.extend_from_slice(&10.0f32.to_le_bytes());
+        raw.extend_from_slice(&phase.to_le_bytes());
+        fx.params = raw;
+        fx
+    };
+    let mut ch_inphase = make_chorus(0, 2); // triangle, 0 deg
+    let mut ch_quad = make_chorus(0, 3);    // triangle, +90 deg
+    let mut max_diff_inphase = 0.0f32;
+    let mut max_diff_quad = 0.0f32;
+    for i in 0..2000 {
+        let x = ((i as f32) * 0.07).sin();
+        let (l0, r0) = ch_inphase.process_sample(x, x, 48_000.0);
+        max_diff_inphase = max_diff_inphase.max((l0 - r0).abs());
+        let (l1, r1) = ch_quad.process_sample(x, x, 48_000.0);
+        max_diff_quad = max_diff_quad.max((l1 - r1).abs());
+    }
+    assert!(max_diff_inphase < 1e-6, "lPhase=0deg must keep L==R");
+    assert!(max_diff_quad > 0.05, "lPhase=90deg must produce stereo modulation diff ({max_diff_quad})");
+
+    // 2b. Zero modulation depth preserves exact configured fDelay for both Chorus (16 ms -> frame 768)
+    //     and Flanger (2 ms -> frame 96) at 48 kHz.
+    for (kind, delay_ms, want_frame) in [
+        (DsFxKind::Chorus, 16.0f32, 768usize),
+        (DsFxKind::Flanger, 2.0f32, 96usize),
+    ] {
+        let mut fx = BufferEffect::new(kind);
+        let mut raw = Vec::with_capacity(28);
+        for f in [100.0f32, 0.0, 0.0, 1.0] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        raw.extend_from_slice(&1i32.to_le_bytes()); // sin
+        raw.extend_from_slice(&delay_ms.to_le_bytes());
+        raw.extend_from_slice(&2i32.to_le_bytes()); // 0 deg
+        fx.params = raw;
+        let mut impulse_frame = None;
+        for frame in 0..=want_frame + 16 {
+            let inp = if frame == 0 { 1.0 } else { 0.0 };
+            let (ol, or) = fx.process_sample(inp, inp, 48_000.0);
+            if ol.abs() > 0.5 || or.abs() > 0.5 {
+                assert!(
+                    impulse_frame.is_none(),
+                    "{kind:?} unexpected duplicate impulse at frame {frame}"
+                );
+                impulse_frame = Some(frame);
+            }
+        }
+        assert_eq!(
+            impulse_frame,
+            Some(want_frame),
+            "{kind:?} with depth=0 and fDelay={delay_ms}ms must output impulse at frame {want_frame}"
+        );
+    }
+
+    // 3. DSFXDistortion honors fPreLowpassCutoff / fPostEQCenterFrequency.
+    let make_dist = |post_fc: f32, pre_lp: f32| -> BufferEffect {
+        let mut fx = BufferEffect::new(DsFxKind::Distortion);
+        let mut raw = Vec::with_capacity(20);
+        for f in [0.0f32, 20.0, post_fc, 400.0, pre_lp] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        fx.params = raw;
+        fx
+    };
+    let mut dist_hi = make_dist(4000.0, 8000.0);
+    let mut dist_lo = make_dist(300.0, 300.0);
+    let mut rms_hi = 0.0f32;
+    let mut rms_lo = 0.0f32;
+    for i in 0..1024 {
+        let x = ((i as f32) * std::f32::consts::TAU * 4000.0 / 48_000.0).sin() * 0.5;
+        let y_hi = dist_hi.process_sample(x, x, 48_000.0).0;
+        let y_lo = dist_lo.process_sample(x, x, 48_000.0).0;
+        if i >= 256 {
+            rms_hi += y_hi * y_hi;
+            rms_lo += y_lo * y_lo;
+        }
+    }
+    assert!(
+        rms_hi > rms_lo * 5.0,
+        "4 kHz tone should pass 4 kHz post-EQ/8 kHz pre-LP ({rms_hi}) much stronger than 300 Hz ({rms_lo})"
+    );
+
+    // 4. Echo delay line dynamically resizes for mixer sample rates > 48 kHz:
+    //    a 2,000 ms delay at 96 kHz must produce its echo at exact frame 192,000 (not 95,999).
+    let mut echo_96k = BufferEffect::new(DsFxKind::Echo);
+    let mut raw_2s = Vec::with_capacity(20);
+    for f in [50.0f32, 0.0, 2000.0, 2000.0] {
+        raw_2s.extend_from_slice(&f.to_le_bytes());
+    }
+    raw_2s.extend_from_slice(&0i32.to_le_bytes());
+    echo_96k.params = raw_2s;
+    let mut at_95999 = 0.0f32;
+    let mut at_192000 = 0.0f32;
+    for i in 0..=192_000 {
+        let x = if i == 0 { 1.0 } else { 0.0 };
+        let (y, _) = echo_96k.process_sample(x, 0.0, 96_000.0);
+        if i == 95_999 {
+            at_95999 = y;
+        }
+        if i == 192_000 {
+            at_192000 = y;
+        }
+    }
+    assert!(at_95999.abs() < 1e-6, "echo at 96 kHz must not truncate at frame 95,999 (got {at_95999})");
+    assert!((at_192000 - 0.5).abs() < 1e-4, "2000 ms echo at 96 kHz must emerge at frame 192,000 (got {at_192000})");
+}

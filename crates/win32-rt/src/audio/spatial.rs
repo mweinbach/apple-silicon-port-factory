@@ -18,10 +18,13 @@
 //! when headless or `AW2_AUDIO_BACKEND=null`) while signaling the caller's
 //! Win32 `EventHandle` on each 480-frame (10 ms @ 48 kHz) audio quantum.
 
+use super::audioclient::{
+    alloc_loopback_source_id, set_loopback_source_started, unregister_loopback_source,
+};
 use super::backend::{self, Backend, OutputStream, StreamControl, StreamShared};
 use super::com::*;
 use super::format::{SampleType, WaveFormat, WAVEFORMATEX, WAVE_FORMAT_IEEE_FLOAT};
-use super::mmdevapi::Endpoint;
+use super::mmdevapi::{new_session_control, new_simple_audio_volume, Endpoint, SessionState};
 use super::ring::Ring;
 use crate::types::*;
 use std::ffi::c_void;
@@ -498,6 +501,9 @@ impl StreamState {
 
 pub struct SpatialStreamCore {
     ep: Arc<Endpoint>,
+    loopback_source_id: u64,
+    session: Arc<SessionState>,
+    channel_volumes: Arc<backend::StreamChannelGain>,
     shared: Arc<StreamShared>,
     /// Live CoreAudio/Null output stream. Lives outside `st` mutex so dropping
     /// it never deadlocks with audio pump/clock/CoreAudio control threads.
@@ -518,6 +524,7 @@ unsafe fn guest_unknown_call(obj: *mut c_void, slot: usize) -> u32 {
 impl Drop for SpatialStreamCore {
     fn drop(&mut self) {
         self.ctrl.stop();
+        unregister_loopback_source(&self.ep.id, self.loopback_source_id);
         if self.notify_object != 0 {
             unsafe {
                 guest_unknown_call(self.notify_object as *mut c_void, 2);
@@ -799,6 +806,279 @@ mod spatial_object {
 //   10     ISpatialAudioObjectRenderStream::ActivateSpatialAudioObject
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Spatial stream services: IAudioClock (+ IAudioClock2), IAudioStreamVolume
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct SpatialClockInner {
+    clock2_vtbl: *const ComVtbl<4>,
+    core: Arc<SpatialStreamCore>,
+}
+unsafe impl Send for SpatialClockInner {}
+unsafe impl Sync for SpatialClockInner {}
+
+type SpatialClockObj = ComObj<ComVtbl<6>, SpatialClockInner>;
+
+const SPATIAL_CLOCK2_IFACE_OFFSET: usize =
+    std::mem::offset_of!(SpatialClockObj, inner) + std::mem::offset_of!(SpatialClockInner, clock2_vtbl);
+
+fn new_spatial_clock(core: Arc<SpatialStreamCore>) -> *mut SpatialClockObj {
+    SpatialClockObj::create(
+        spatial_clock::vtbl(),
+        SpatialClockInner {
+            clock2_vtbl: spatial_clock2::vtbl(),
+            core,
+        },
+    )
+}
+
+mod spatial_clock {
+    use super::*;
+
+    pub unsafe extern "win64" fn qi(
+        this: *mut SpatialClockObj,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
+        let Some(iid) = GUID::read(riid) else {
+            return E_POINTER;
+        };
+        if iid == IID_IUnknown || iid == IID_IAudioClock {
+            SpatialClockObj::add_ref(this);
+            std::ptr::write_unaligned(out, this as *mut c_void);
+            S_OK
+        } else if iid == IID_IAudioClock2 {
+            SpatialClockObj::add_ref(this);
+            std::ptr::write_unaligned(
+                out,
+                (this as *mut u8).add(SPATIAL_CLOCK2_IFACE_OFFSET) as *mut c_void,
+            );
+            S_OK
+        } else {
+            crate::com::warn_qi_failed_once("SpatialAudioClock", &crate::com::Guid::from_win_guid(iid));
+            E_NOINTERFACE
+        }
+    }
+
+    pub unsafe extern "win64" fn add_ref(this: *mut SpatialClockObj) -> u32 {
+        SpatialClockObj::add_ref(this)
+    }
+
+    pub unsafe extern "win64" fn release(this: *mut SpatialClockObj) -> u32 {
+        SpatialClockObj::release(this)
+    }
+
+    pub unsafe extern "win64" fn get_frequency(_this: *mut SpatialClockObj, out: *mut u64) -> HRESULT {
+        write_out(out, SPATIAL_SAMPLE_RATE as u64 * 8) // stereo f32 byte rate
+    }
+
+    pub unsafe extern "win64" fn get_position(
+        this: *mut SpatialClockObj,
+        pos: *mut u64,
+        qpc: *mut u64,
+    ) -> HRESULT {
+        if pos.is_null() {
+            return E_POINTER;
+        }
+        let core = &SpatialClockObj::inner(this).core;
+        if core.is_invalid() {
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
+        let frames = SpatialStreamCore::clone_consumed(core);
+        std::ptr::write_unaligned(pos, frames * 8);
+        if !qpc.is_null() {
+            std::ptr::write_unaligned(qpc, crate::kernel32::time::interrupt_time_100ns());
+        }
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn get_characteristics(_this: *mut SpatialClockObj, out: *mut u32) -> HRESULT {
+        write_out(out, 0)
+    }
+
+    pub fn vtbl() -> &'static ComVtbl<6> {
+        static V: OnceLock<ComVtbl<6>> = OnceLock::new();
+        V.get_or_init(|| {
+            register_vtbl([
+                qi as *const () as usize,
+                add_ref as *const () as usize,
+                release as *const () as usize,
+                get_frequency as *const () as usize,
+                get_position as *const () as usize,
+                get_characteristics as *const () as usize,
+            ])
+        })
+    }
+}
+
+mod spatial_clock2 {
+    use super::*;
+
+    #[inline]
+    unsafe fn owner(this: *mut *const ComVtbl<4>) -> *mut SpatialClockObj {
+        (this as *mut u8).sub(SPATIAL_CLOCK2_IFACE_OFFSET) as *mut SpatialClockObj
+    }
+
+    pub unsafe extern "win64" fn qi(
+        this: *mut *const ComVtbl<4>,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        spatial_clock::qi(owner(this), riid, out)
+    }
+
+    pub unsafe extern "win64" fn add_ref(this: *mut *const ComVtbl<4>) -> u32 {
+        SpatialClockObj::add_ref(owner(this))
+    }
+
+    pub unsafe extern "win64" fn release(this: *mut *const ComVtbl<4>) -> u32 {
+        SpatialClockObj::release(owner(this))
+    }
+
+    pub unsafe extern "win64" fn get_device_position(
+        this: *mut *const ComVtbl<4>,
+        pos: *mut u64,
+        qpc: *mut u64,
+    ) -> HRESULT {
+        if pos.is_null() {
+            return E_POINTER;
+        }
+        let core = &SpatialClockObj::inner(owner(this)).core;
+        if core.is_invalid() {
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
+        let rendered_frames = core.shared.rendered_frames.load(Ordering::Acquire);
+        let dev_rate = core.ep.mix_format().rate as u64;
+        let stream_rate = SPATIAL_SAMPLE_RATE as u64;
+        let dev_frames = if stream_rate > 0 && dev_rate > 0 && stream_rate != dev_rate {
+            ((rendered_frames as u128 * dev_rate as u128) / stream_rate as u128) as u64
+        } else {
+            rendered_frames
+        };
+        std::ptr::write_unaligned(pos, dev_frames);
+        if !qpc.is_null() {
+            std::ptr::write_unaligned(qpc, crate::kernel32::time::interrupt_time_100ns());
+        }
+        S_OK
+    }
+
+    pub fn vtbl() -> &'static ComVtbl<4> {
+        static V: OnceLock<ComVtbl<4>> = OnceLock::new();
+        V.get_or_init(|| {
+            register_vtbl([
+                qi as *const () as usize,
+                add_ref as *const () as usize,
+                release as *const () as usize,
+                get_device_position as *const () as usize,
+            ])
+        })
+    }
+}
+
+type SpatialStreamVolObj = ComObj<ComVtbl<8>, Arc<SpatialStreamCore>>;
+
+mod spatial_stream_vol {
+    use super::*;
+    crate::com_iunknown!(SpatialStreamVolObj, [IID_IAudioStreamVolume]);
+
+    pub unsafe extern "win64" fn get_channel_count(_this: *mut SpatialStreamVolObj, out: *mut u32) -> HRESULT {
+        write_out(out, 2)
+    }
+
+    pub unsafe extern "win64" fn set_channel_volume(
+        this: *mut SpatialStreamVolObj,
+        idx: u32,
+        level: f32,
+    ) -> HRESULT {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+            return E_INVALIDARG;
+        }
+        if !SpatialStreamVolObj::inner(this).channel_volumes.set(idx as usize, level) {
+            return E_INVALIDARG;
+        }
+        S_OK
+    }
+    crate::win64_bridge!(fn set_channel_volume(*mut SpatialStreamVolObj, u32, f32) -> HRESULT);
+
+    pub unsafe extern "win64" fn get_channel_volume(
+        this: *mut SpatialStreamVolObj,
+        idx: u32,
+        out: *mut f32,
+    ) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let Some(v) = SpatialStreamVolObj::inner(this).channel_volumes.get(idx as usize) else {
+            return E_INVALIDARG;
+        };
+        write_out(out, v)
+    }
+
+    pub unsafe extern "win64" fn set_all_volumes(
+        this: *mut SpatialStreamVolObj,
+        count: u32,
+        levels: *const f32,
+    ) -> HRESULT {
+        if levels.is_null() {
+            return E_POINTER;
+        }
+        if count != 2 {
+            return E_INVALIDARG;
+        }
+        let l = std::ptr::read_unaligned(levels);
+        let r = std::ptr::read_unaligned(levels.add(1));
+        if !l.is_finite() || !r.is_finite() || !(0.0..=1.0).contains(&l) || !(0.0..=1.0).contains(&r) {
+            return E_INVALIDARG;
+        }
+        SpatialStreamVolObj::inner(this).channel_volumes.set_all(&[l, r]);
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn get_all_volumes(
+        this: *mut SpatialStreamVolObj,
+        count: u32,
+        levels: *mut f32,
+    ) -> HRESULT {
+        if levels.is_null() {
+            return E_POINTER;
+        }
+        if count != 2 {
+            return E_INVALIDARG;
+        }
+        let v = SpatialStreamVolObj::inner(this).channel_volumes.snapshot();
+        std::ptr::write_unaligned(levels, v[0]);
+        std::ptr::write_unaligned(levels.add(1), v[1]);
+        S_OK
+    }
+
+    pub fn vtbl() -> &'static ComVtbl<8> {
+        static V: OnceLock<ComVtbl<8>> = OnceLock::new();
+        V.get_or_init(|| {
+            register_vtbl([
+                qi as *const () as usize,
+                add_ref as *const () as usize,
+                release as *const () as usize,
+                get_channel_count as *const () as usize,
+                crate::bridge_entry!(set_channel_volume) as usize,
+                get_channel_volume as *const () as usize,
+                set_all_volumes as *const () as usize,
+                get_all_volumes as *const () as usize,
+            ])
+        })
+    }
+}
+
+impl SpatialStreamCore {
+    fn clone_consumed(&self) -> u64 {
+        self.shared.ring.consumed() as u64
+    }
+}
+
 pub type SpatialStreamObj = ComObj<ComVtbl<11>, Arc<SpatialStreamCore>>;
 
 mod render_stream {
@@ -843,7 +1123,40 @@ mod render_stream {
             std::ptr::write_unaligned(service, this as *mut c_void);
             return S_OK;
         }
-        stub!("ISpatialAudioObjectRenderStream::GetService({iid:?}) -> E_NOINTERFACE");
+        let core = SpatialStreamObj::inner(this).clone();
+        if iid == IID_IAudioClock {
+            std::ptr::write_unaligned(service, new_spatial_clock(core) as *mut c_void);
+            return S_OK;
+        }
+        if iid == IID_IAudioClock2 {
+            let ck = new_spatial_clock(core);
+            std::ptr::write_unaligned(
+                service,
+                (ck as *mut u8).add(SPATIAL_CLOCK2_IFACE_OFFSET) as *mut c_void,
+            );
+            return S_OK;
+        }
+        if iid == IID_ISimpleAudioVolume {
+            std::ptr::write_unaligned(service, new_simple_audio_volume(core.session.clone()));
+            return S_OK;
+        }
+        if iid == IID_IAudioStreamVolume {
+            std::ptr::write_unaligned(
+                service,
+                SpatialStreamVolObj::create(spatial_stream_vol::vtbl(), core) as *mut c_void,
+            );
+            return S_OK;
+        }
+        if iid == IID_IAudioSessionControl || iid == IID_IAudioSessionControl2 {
+            std::ptr::write_unaligned(service, new_session_control(core.session.clone()));
+            return S_OK;
+        }
+        // Standard COM behavior: return E_NOINTERFACE for unrecognized service IIDs
+        // (Microsoft Learn: ISpatialAudioObjectRenderStreamBase::GetService).
+        crate::com::warn_qi_failed_once(
+            "ISpatialAudioObjectRenderStream::GetService",
+            &crate::com::Guid::from_win_guid(iid),
+        );
         E_NOINTERFACE
     }
 
@@ -866,6 +1179,7 @@ mod render_stream {
             core.st.lock().unwrap().started = false;
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
+        set_loopback_source_started(&core.ep.id, core.loopback_source_id, true);
         // Signal the caller's EventHandle immediately so the first quantum is requested.
         core.shared.signal_event();
         log::debug!(target: "audio", "ISpatialAudioObjectRenderStream::Start on '{}'", core.ep.info.name);
@@ -882,6 +1196,7 @@ mod render_stream {
         };
         if let Some(ctrl) = ctrl {
             ctrl.stop();
+            set_loopback_source_started(&core.ep.id, core.loopback_source_id, false);
         }
         if core.is_invalid() {
             AUDCLNT_E_DEVICE_INVALIDATED
@@ -979,8 +1294,9 @@ mod render_stream {
                 }
             }
 
-            for s in mix_buf.iter_mut() {
-                *s = if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 };
+            for pair in mix_buf.chunks_exact_mut(2) {
+                pair[0] = if pair[0].is_finite() { pair[0].clamp(-1.0, 1.0) } else { 0.0 };
+                pair[1] = if pair[1].is_finite() { pair[1].clamp(-1.0, 1.0) } else { 0.0 };
             }
             core.shared.ring.push(mix_buf);
             last_mixed.clear();
@@ -1265,7 +1581,23 @@ mod client {
 
         let granted_dynamic = max_dyn.min(MAX_DYNAMIC_OBJECTS);
         let ring_cap = (2 * backend::MAX_SLICE + QUANTUM_FRAMES * 4) as usize;
-        let shared = StreamShared::new(Ring::new(ring_cap, 2));
+        let loopback_source_id = alloc_loopback_source_id();
+        let session = SessionState::get_or_create(inner.ep.clone(), None);
+        let channel_volumes = backend::StreamChannelGain::new(2);
+        let gain = backend::PlaybackGain::new(
+            session.clone(),
+            channel_volumes.clone(),
+            true,
+            crate::audio::mmdevapi::endpoint_software_gain_handle(&inner.ep.id),
+        );
+        let shared = StreamShared::with_loopback(
+            Ring::new(ring_cap, 2),
+            inner.ep.id.clone(),
+            loopback_source_id,
+            SPATIAL_SAMPLE_RATE,
+            2,
+            Some(gain),
+        );
         shared.set_event(event);
 
         // Open CoreAudio output stream, auto-falling back to Backend::Null when
@@ -1328,6 +1660,9 @@ mod client {
         let out_kind = out.kind;
         let core = Arc::new(SpatialStreamCore {
             ep: inner.ep.clone(),
+            loopback_source_id,
+            session,
+            channel_volumes,
             shared,
             _out: out,
             ctrl,
