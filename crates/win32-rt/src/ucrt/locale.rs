@@ -407,9 +407,11 @@ fn legacy_crt_to_bcp47(lang_part: &str) -> Option<&'static str> {
         ("english" | "ena", Some("australia" | "aus")) => "en-AU",
         ("english", Some("ireland" | "irl")) => "en-IE",
         ("english", Some("new zealand" | "nzl")) => "en-NZ",
+        ("english", Some("india" | "ind")) => "en-IN",
         ("german" | "deu" | "ger", None | Some("germany" | "deu" | "de")) => "de-DE",
         ("german" | "dea", Some("austria" | "aut")) => "de-AT",
         ("german" | "des", Some("switzerland" | "che" | "swiss")) => "de-CH",
+        ("german", Some("belgium" | "bel")) => "de-BE",
         ("french" | "fra" | "fre", None | Some("france" | "fra" | "fr")) => "fr-FR",
         ("french" | "frc", Some("canada" | "can")) => "fr-CA",
         ("french" | "frs", Some("switzerland" | "che")) => "fr-CH",
@@ -417,8 +419,8 @@ fn legacy_crt_to_bcp47(lang_part: &str) -> Option<&'static str> {
         ("japanese" | "jpn", None | Some("japan" | "jpn" | "jp")) => "ja-JP",
         ("chinese" | "chs" | "chinese-simplified" | "chinese_simplified", None | Some("china" | "chn" | "cn" | "prc" | "simplified")) => "zh-CN",
         ("chinese" | "cht" | "chinese-traditional" | "chinese_traditional", Some("taiwan" | "twn" | "tw" | "traditional")) => "zh-TW",
-        ("chinese", Some("hong kong" | "hkg" | "hk")) => "zh-HK",
-        ("korean" | "kor", None | Some("korea" | "kor" | "kr")) => "ko-KR",
+        ("chinese", Some("hong kong" | "hong kong sar" | "hong kong sar china" | "hkg" | "hk")) => "zh-HK",
+        ("korean" | "kor", None | Some("korea" | "south korea" | "republic of korea" | "kor" | "kr")) => "ko-KR",
         ("spanish" | "esp" | "esn", None | Some("spain" | "esp" | "es")) => "es-ES",
         ("spanish" | "esm", Some("mexico" | "mex" | "mx")) => "es-MX",
         ("italian" | "ita", None | Some("italy" | "ita" | "it")) => "it-IT",
@@ -426,6 +428,7 @@ fn legacy_crt_to_bcp47(lang_part: &str) -> Option<&'static str> {
         ("portuguese" | "ptg", Some("portugal" | "prt" | "pt")) => "pt-PT",
         ("russian" | "rus", None | Some("russia" | "rus" | "ru")) => "ru-RU",
         ("dutch" | "nld", None | Some("netherlands" | "nld" | "nl" | "holland")) => "nl-NL",
+        ("dutch", Some("belgium" | "bel")) => "nl-BE",
         ("swedish" | "sve", None | Some("sweden" | "swe" | "se")) => "sv-SE",
         ("finnish" | "fin", None | Some("finland" | "fin" | "fi")) => "fi-FI",
         ("danish" | "dan", None | Some("denmark" | "dnk" | "dk")) => "da-DK",
@@ -433,7 +436,7 @@ fn legacy_crt_to_bcp47(lang_part: &str) -> Option<&'static str> {
         ("polish" | "plk", None | Some("poland" | "pol" | "pl")) => "pl-PL",
         ("czech" | "csy", None | Some("czechia" | "czech republic" | "cze" | "cz")) => "cs-CZ",
         ("hungarian" | "hun", None | Some("hungary" | "hun" | "hu")) => "hu-HU",
-        ("turkish" | "trk", None | Some("turkey" | "tur" | "tr")) => "tr-TR",
+        ("turkish" | "trk", None | Some("turkey" | "turkiye" | "türkiye" | "tur" | "tr")) => "tr-TR",
         ("greek" | "ell", None | Some("greece" | "grc" | "gr")) => "el-GR",
         ("hebrew" | "heb", None | Some("israel" | "isr" | "il")) => "he-IL",
         ("arabic" | "ara", None | Some("saudi arabia" | "sau" | "sa")) => "ar-SA",
@@ -445,19 +448,48 @@ fn legacy_crt_to_bcp47(lang_part: &str) -> Option<&'static str> {
         ("croatian" | "hrv", None | Some("croatia" | "hrv" | "hr")) => "hr-HR",
         ("slovak" | "sky", None | Some("slovakia" | "svk" | "sk")) => "sk-SK",
         ("indonesian" | "ind", None | Some("indonesia" | "idn" | "id")) => "id-ID",
+        ("hindi" | "hin", None | Some("india" | "ind" | "in")) => "hi-IN",
         _ => return None,
     })
+}
+
+fn generated_crt_names() -> &'static Mutex<HashMap<String, String>> {
+    static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lookup_generated_crt_name(base: &str) -> Option<String> {
+    generated_crt_names()
+        .lock()
+        .unwrap()
+        .get(&base.trim().to_ascii_lowercase())
+        .cloned()
 }
 
 fn format_crt_name(loc: &ResolvedLocale, cp: u32) -> String {
     let lang = kstr::locale_info_for(loc, 0x1001).unwrap_or_else(|| loc.bcp47.clone());
     let country = kstr::locale_info_for(loc, 0x1002).unwrap_or_default();
     let cp_str = if cp == 65001 { "utf8".to_string() } else { cp.to_string() };
-    if country.is_empty() {
-        format!("{lang}.{cp_str}")
+    let candidate = if country.is_empty() {
+        lang
     } else {
-        format!("{lang}_{country}.{cp_str}")
-    }
+        format!("{lang}_{country}")
+    };
+    // Ensure every formatted CRT name round-trips back to the exact BCP-47 locale tag when
+    // passed back to `setlocale`/`_create_locale` (including inside composite `LC_ALL` strings).
+    let base = {
+        let key = candidate.to_ascii_lowercase();
+        let mut map = generated_crt_names().lock().unwrap();
+        match map.get(&key) {
+            Some(existing) if existing != &loc.bcp47 => loc.bcp47.clone(),
+            Some(_) => candidate,
+            None => {
+                map.insert(key, loc.bcp47.clone());
+                candidate
+            }
+        }
+    };
+    format!("{base}.{cp_str}")
 }
 
 fn parse_single_locale(name: &str) -> Option<LocaleEntry> {
@@ -479,13 +511,20 @@ fn parse_single_locale(name: &str) -> Option<LocaleEntry> {
             cp,
         });
     }
-    // Split optional `.codepage` suffix (strip any `@modifier` if present).
-    let (base, cp_opt) = match trimmed.split_once('.') {
+    // Split optional `.codepage` suffix from the right (so country names like "St. Lucia" stay
+    // intact), after stripping any `@modifier`.
+    let no_mod = trimmed.split('@').next().unwrap_or(trimmed).trim();
+    let (base, cp_opt) = match no_mod.rsplit_once('.') {
         Some((b, c)) => {
-            let c_clean = c.split('@').next().unwrap_or(c);
-            (b.trim(), Some(parse_codepage_suffix(c_clean)?))
+            if let Some(cp) = parse_codepage_suffix(c) {
+                (b.trim(), Some(cp))
+            } else if lookup_generated_crt_name(no_mod).is_some() {
+                (no_mod, None)
+            } else {
+                return None;
+            }
         }
-        None => (trimmed.split('@').next().unwrap_or(trimmed).trim(), None),
+        None => (no_mod, None),
     };
     if base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
         let cp = cp_opt.unwrap_or(0);
@@ -499,7 +538,11 @@ fn parse_single_locale(name: &str) -> Option<LocaleEntry> {
             cp,
         });
     }
-    let bcp47_candidate = legacy_crt_to_bcp47(base).unwrap_or(base);
+    let generated = lookup_generated_crt_name(base);
+    let bcp47_candidate = generated
+        .as_deref()
+        .or_else(|| legacy_crt_to_bcp47(base))
+        .unwrap_or(base);
     let loc = kstr::resolve_locale_tag(bcp47_candidate)?;
     if loc.invariant {
         return Some(LocaleEntry::c_locale());
@@ -1030,11 +1073,33 @@ mod tests {
             assert_eq!(___lc_codepage_func(), 932);
             assert_eq!(___mb_cur_max_func(), 2);
 
-            // Per-category setlocale + composite LC_ALL query & roundtrip
+            // Per-category setlocale + composite LC_ALL query & roundtrip (including ICU locales
+            // whose formatted names use multi-word country names like "Korean_South Korea.949"
+            // or less-common combinations like "de-BE" / "es-AR").
+            for tag in ["ko-KR", "de-BE", "es-AR", "hi-IN"] {
+                let ctag = std::ffi::CString::new(tag).unwrap();
+                let r = setlocale(LC_ALL, ctag.as_ptr() as *const u8);
+                assert!(!r.is_null(), "setlocale({tag}) failed");
+                let saved = from_ansi(r);
+                let saved_cp = ___lc_codepage_func();
+                assert!(!setlocale(LC_ALL, b"C\0".as_ptr()).is_null());
+                let csaved = std::ffi::CString::new(saved.as_str()).unwrap();
+                let restored = setlocale(LC_ALL, csaved.as_ptr() as *const u8);
+                assert!(!restored.is_null(), "round-trip setlocale({saved}) failed");
+                assert_eq!(from_ansi(restored), saved);
+                assert_eq!(___lc_codepage_func(), saved_cp);
+            }
+            assert!(!setlocale(LC_ALL, b"ko-KR\0".as_ptr()).is_null());
             assert!(!setlocale(LC_NUMERIC, b"C\0".as_ptr()).is_null());
             let comp = from_ansi(setlocale(LC_ALL, std::ptr::null()));
             assert!(comp.contains("LC_NUMERIC=C"), "composite={comp}");
             assert_eq!(from_ansi((*localeconv()).decimal_point), ".");
+            // Save/switch/restore composite LC_ALL string containing ko-KR + C.
+            assert!(!setlocale(LC_ALL, b"C\0".as_ptr()).is_null());
+            let ccomp = std::ffi::CString::new(comp.as_str()).unwrap();
+            let comp_restored = setlocale(LC_ALL, ccomp.as_ptr() as *const u8);
+            assert!(!comp_restored.is_null(), "composite round-trip failed for {comp}");
+            assert_eq!(from_ansi(comp_restored), comp);
 
             // Invalid locale returns NULL and preserves state
             assert!(setlocale(LC_ALL, b"not_a_real_locale_xyz\0".as_ptr()).is_null());
