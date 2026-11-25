@@ -3295,6 +3295,53 @@ fn capi_store_lock() -> &'static std::sync::Mutex<()> {
     L.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+struct CapiStoreGuard {
+    _mem: std::sync::MutexGuard<'static, ()>,
+    flock_file: std::fs::File,
+}
+
+impl Drop for CapiStoreGuard {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.flock_file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_capi_store_lock() -> std::io::Result<CapiStoreGuard> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let mem = capi_store_lock().lock().unwrap();
+    let lock_path = capi_store_path()
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent"))?
+        .join(".containers.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+    let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    Ok(CapiStoreGuard { _mem: mem, flock_file: file })
+}
+
 fn capi_store_path() -> std::path::PathBuf {
     crate::path::default_translator_root()
         .join("AppData")
@@ -3441,7 +3488,7 @@ unsafe fn store_container_user_key(h_prov: usize, key_spec: u32, rsa: RsaKey, ex
     }
     let map_key = (prov.prov_type, prov.container.clone());
     drop(provs);
-    let _guard = capi_store_lock().lock().unwrap();
+    let _guard = acquire_capi_store_lock().map_err(|_| NTE_FAIL)?;
     let mut disk = load_persisted_capi_containers().map_err(|_| NTE_FAIL)?;
     let entry = disk.entry(map_key.clone()).or_default();
     if key_spec == AT_SIGNATURE {
@@ -3485,7 +3532,7 @@ unsafe fn load_container_user_key(h_prov: usize, key_spec: u32) -> Result<Option
         }
     }
     // Load from persisted DPAPI-encrypted store (handles cross-process / post-restart access).
-    let _guard = capi_store_lock().lock().unwrap();
+    let _guard = acquire_capi_store_lock().map_err(|_| NTE_FAIL)?;
     let disk = load_persisted_capi_containers().map_err(|_| NTE_FAIL)?;
     let found = disk.get(&map_key).cloned();
     if let Some(ref c) = found {
@@ -3512,7 +3559,9 @@ unsafe fn crypt_acquire_context_impl(
     let cname = container.unwrap_or_default();
     if (dw_flags & CRYPT_DELETEKEYSET) != 0 {
         let map_key = (dw_prov_type, cname);
-        let _guard = capi_store_lock().lock().unwrap();
+        let Ok(_guard) = acquire_capi_store_lock() else {
+            return err(NTE_FAIL, FALSE);
+        };
         let mut disk = match load_persisted_capi_containers() {
             Ok(d) => d,
             Err(_) => return err(NTE_FAIL, FALSE),
@@ -3533,7 +3582,9 @@ unsafe fn crypt_acquire_context_impl(
     let ephemeral = (dw_flags & CRYPT_VERIFYCONTEXT) != 0;
     if !ephemeral {
         let key = (dw_prov_type, cname.clone());
-        let _guard = capi_store_lock().lock().unwrap();
+        let Ok(_guard) = acquire_capi_store_lock() else {
+            return err(NTE_FAIL, FALSE);
+        };
         let mut disk = match load_persisted_capi_containers() {
             Ok(d) => d,
             Err(_) => return err(NTE_FAIL, FALSE),
