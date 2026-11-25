@@ -83,6 +83,7 @@ mod icu {
     pub const UCOL_PRIMARY: i32 = 0;
     pub const UCOL_SECONDARY: i32 = 1;
     pub const UCOL_TERTIARY: i32 = 2;
+    pub const UCOL_QUATERNARY: i32 = 3;
     pub const UCOL_ON: i32 = 17;
     pub const UCOL_SHIFTED: i32 = 20;
     pub const UCOL_LOWER_FIRST: i32 = 24;
@@ -935,6 +936,9 @@ fn coll(c: char, flags: u32) -> (u32, u8) {
 }
 
 pub fn compare_linguistic(a: &[u16], b: &[u16], flags: u32) -> Ordering {
+    let a_norm = normalize_collation_input(a, flags);
+    let b_norm = normalize_collation_input(b, flags);
+    let (a, b) = (a_norm.as_ref(), b_norm.as_ref());
     let ignore_case = flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE) != 0;
     let filt = |s: &[u16]| -> Vec<char> {
         char::decode_utf16(s.iter().copied())
@@ -1103,10 +1107,17 @@ const NORM_IGNOREWIDTH: u32 = 0x0002_0000;
 unsafe fn configure_ucollator(a: &icu::IcuNls, col: *mut c_void, flags: u32) {
     let ignore_case = (flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE)) != 0;
     let ignore_diacritics = (flags & (NORM_IGNORENONSPACE | LINGUISTIC_IGNOREDIACRITIC)) != 0;
+    let ignore_symbols = (flags & NORM_IGNORESYMBOLS) != 0;
+    // In CLDR Japanese collation (`ja_JP`), Hiragana/Katakana and kana width are quaternary
+    // distinctions; use `UCOL_QUATERNARY` whenever full comparison is requested without shifted
+    // punctuation so kana/width distinctions stay visible unless `normalize_collation_input`
+    // explicitly folded them for `NORM_IGNOREKANATYPE`/`NORM_IGNOREWIDTH`.
     let strength = if ignore_diacritics {
         icu::UCOL_PRIMARY
     } else if ignore_case {
         icu::UCOL_SECONDARY
+    } else if !ignore_symbols {
+        icu::UCOL_QUATERNARY
     } else {
         icu::UCOL_TERTIARY
     };
@@ -1170,10 +1181,89 @@ fn append_word_sort_weights(key: &mut Vec<u8>, special: &[(u32, u8)]) {
     key.push(0x00);
 }
 
+/// Normalize width (`NORM_IGNOREWIDTH`) and/or kana type (`NORM_IGNOREKANATYPE`) before
+/// collation and sort-key generation so `CompareStringEx`/`CompareStringW`, `LCMAP_SORTKEY`,
+/// and `LCMAP_HASH` agree across all flag combinations.
+fn normalize_collation_input<'a>(s: &'a [u16], flags: u32) -> Cow<'a, [u16]> {
+    let ignore_width = (flags & NORM_IGNOREWIDTH) != 0;
+    let ignore_kana = (flags & NORM_IGNOREKANATYPE) != 0;
+    if !ignore_width && !ignore_kana {
+        return Cow::Borrowed(s);
+    }
+    let mut out: Vec<u16> = if ignore_width {
+        let mut buf = Vec::with_capacity(s.len());
+        let mut i = 0usize;
+        while i < s.len() {
+            let c = s[i];
+            if (0xFF61..=0xFF9F).contains(&c) || (0xFFA0..=0xFFDC).contains(&c) {
+                // Fold halfwidth Katakana/Hangul spans to fullwidth so halfwidth `ｶ`/`ｶﾞ`
+                // matches fullwidth `カ`/`ガ` (and composes with `NORM_IGNOREKANATYPE` -> `か`/`が`).
+                let start = i;
+                while i < s.len() && ((0xFF61..=0xFF9F).contains(&s[i]) || (0xFFA0..=0xFFDC).contains(&s[i])) {
+                    i += 1;
+                }
+                if let Some(fw) = icu::transliterate("Halfwidth-Fullwidth", &s[start..i]) {
+                    buf.extend_from_slice(&fw);
+                } else {
+                    buf.extend_from_slice(&s[start..i]);
+                }
+                continue;
+            }
+            let mapped = match c {
+                0x3000 => 0x0020,
+                0xFF01..=0xFF5E => c - 0xFEE0,
+                0xFF5F => 0x2985,
+                0xFF60 => 0x2986,
+                0xFFE0 => 0x00A2,
+                0xFFE1 => 0x00A3,
+                0xFFE2 => 0x00AC,
+                0xFFE3 => 0x00AF,
+                0xFFE4 => 0x00A6,
+                0xFFE5 => 0x00A5,
+                0xFFE6 => 0x20A9,
+                0xFFE8 => 0x2502,
+                0xFFE9 => 0x2190,
+                0xFFEA => 0x2191,
+                0xFFEB => 0x2192,
+                0xFFEC => 0x2193,
+                0xFFED => 0x25A0,
+                0xFFEE => 0x25CB,
+                _ => c,
+            };
+            buf.push(mapped);
+            i += 1;
+        }
+        buf
+    } else {
+        s.to_vec()
+    };
+
+    if ignore_kana {
+        // Fold fullwidth Katakana -> Hiragana (preserving halfwidth Katakana width distinction
+        // unless `NORM_IGNOREWIDTH` also folded halfwidth spans above).
+        let mut folded = Vec::with_capacity(out.len());
+        for c in out {
+            match c {
+                0x30A1..=0x30F6 | 0x30FD..=0x30FE => folded.push(c - 0x60),
+                0x30F7..=0x30FA => {
+                    folded.push(c - 0x68);
+                    folded.push(0x3099);
+                }
+                _ => folded.push(c),
+            }
+        }
+        out = folded;
+    }
+    Cow::Owned(out)
+}
+
 /// Locale-aware comparison via Apple ICU (`ucol_strcoll`), matching `sort_key_for_locale`
-/// (including Windows word sort vs `SORT_STRINGSORT`), falling back to `compare_linguistic`
-/// if ICU is unavailable.
+/// (including Windows word sort vs `SORT_STRINGSORT`, `NORM_IGNOREWIDTH`, and `NORM_IGNOREKANATYPE`),
+/// falling back to `compare_linguistic` if ICU is unavailable.
 fn compare_for_locale(icu_locale: &str, lhs: &[u16], rhs: &[u16], flags: u32) -> Ordering {
+    let lhs_norm = normalize_collation_input(lhs, flags);
+    let rhs_norm = normalize_collation_input(rhs, flags);
+    let (lhs, rhs) = (lhs_norm.as_ref(), rhs_norm.as_ref());
     let word_sort = (flags & SORT_STRINGSORT) == 0 && (flags & NORM_IGNORESYMBOLS) == 0;
     if let Some(a) = icu::api() {
         let cloc = icu::c_str(icu_locale);
@@ -1201,12 +1291,15 @@ fn compare_for_locale(icu_locale: &str, lhs: &[u16], rhs: &[u16], flags: u32) ->
             }
         }
     }
-    compare_linguistic(lhs, rhs, flags)
+    compare_linguistic(lhs, rhs, flags & !(NORM_IGNOREWIDTH | NORM_IGNOREKANATYPE))
 }
 
 /// Locale-aware sort key via Apple ICU (`ucol_getSortKey`), matching `compare_for_locale`
-/// (including Windows word sort vs `SORT_STRINGSORT`), falling back to `sort_key` if ICU is unavailable.
+/// (including Windows word sort vs `SORT_STRINGSORT`, `NORM_IGNOREWIDTH`, and `NORM_IGNOREKANATYPE`),
+/// falling back to `sort_key` if ICU is unavailable.
 fn sort_key_for_locale(icu_locale: &str, s: &[u16], flags: u32) -> Vec<u8> {
+    let s_norm = normalize_collation_input(s, flags);
+    let s = s_norm.as_ref();
     let word_sort = (flags & SORT_STRINGSORT) == 0 && (flags & NORM_IGNORESYMBOLS) == 0;
     if let Some(a) = icu::api() {
         let cloc = icu::c_str(icu_locale);
@@ -1242,11 +1335,13 @@ fn sort_key_for_locale(icu_locale: &str, s: &[u16], flags: u32) -> Vec<u8> {
             }
         }
     }
-    sort_key(s, flags)
+    sort_key(s, flags & !(NORM_IGNOREWIDTH | NORM_IGNOREKANATYPE))
 }
 
 /// Sort key whose `memcmp` order matches [`compare_linguistic`].
 pub fn sort_key(s: &[u16], flags: u32) -> Vec<u8> {
+    let s_norm = normalize_collation_input(s, flags);
+    let s = s_norm.as_ref();
     let ignore_case = flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE) != 0;
     let chars: Vec<char> = char::decode_utf16(s.iter().copied())
         .map(|r| r.unwrap_or('\u{FFFD}'))
@@ -4383,6 +4478,36 @@ mod tests {
             assert_eq!(get_sort_key(&en, &ae, NORM_IGNORENONSPACE), get_sort_key(&en, &a_lo, NORM_IGNORENONSPACE));
             assert_eq!(CompareStringEx(en.as_ptr(), NORM_IGNORENONSPACE, a_lo.as_ptr(), -1, a_up.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_LESS_THAN);
             assert!(get_sort_key(&en, &a_lo, NORM_IGNORENONSPACE) < get_sort_key(&en, &a_up, NORM_IGNORENONSPACE));
+
+            // NORM_IGNOREWIDTH & NORM_IGNOREKANATYPE fold consistently in CompareStringEx and LCMAP_SORTKEY.
+            let ja = to_wide_z("ja-JP");
+            let a_fw = to_wide_z("Ａ");
+            let ka_hira = to_wide_z("か");
+            let ka_kata = to_wide_z("カ");
+            let ka_half = to_wide_z("ｶ");
+            let ga_hira = to_wide_z("が");
+            let ga_half = to_wide_z("ｶﾞ");
+            // Without flags: width and kana type are distinguished.
+            assert_ne!(CompareStringEx(en.as_ptr(), 0, a_up.as_ptr(), -1, a_fw.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_ne!(CompareStringEx(en.as_ptr(), 0, ka_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            // NORM_IGNOREWIDTH: A == Ａ and カ == ｶ, while a != Ａ and か != カ.
+            assert_eq!(CompareStringEx(en.as_ptr(), NORM_IGNOREWIDTH, a_up.as_ptr(), -1, a_fw.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&en, &a_up, NORM_IGNOREWIDTH), get_sort_key(&en, &a_fw, NORM_IGNOREWIDTH));
+            assert_ne!(CompareStringEx(en.as_ptr(), NORM_IGNOREWIDTH, a_lo.as_ptr(), -1, a_fw.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(CompareStringEx(ja.as_ptr(), NORM_IGNOREWIDTH, ka_kata.as_ptr(), -1, ka_half.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&ja, &ka_kata, NORM_IGNOREWIDTH), get_sort_key(&ja, &ka_half, NORM_IGNOREWIDTH));
+            assert_ne!(CompareStringEx(ja.as_ptr(), NORM_IGNOREWIDTH, ka_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            // NORM_IGNOREKANATYPE: か == カ, while A != Ａ and か != ｶ.
+            assert_eq!(CompareStringEx(en.as_ptr(), NORM_IGNOREKANATYPE, ka_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&en, &ka_hira, NORM_IGNOREKANATYPE), get_sort_key(&en, &ka_kata, NORM_IGNOREKANATYPE));
+            assert_ne!(CompareStringEx(en.as_ptr(), NORM_IGNOREKANATYPE, a_up.as_ptr(), -1, a_fw.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_ne!(CompareStringEx(ja.as_ptr(), NORM_IGNOREKANATYPE, ka_hira.as_ptr(), -1, ka_half.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            // Combined NORM_IGNOREWIDTH | NORM_IGNOREKANATYPE: か == ｶ and が == ｶﾞ.
+            let wk = NORM_IGNOREWIDTH | NORM_IGNOREKANATYPE;
+            assert_eq!(CompareStringEx(ja.as_ptr(), wk, ka_hira.as_ptr(), -1, ka_half.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&ja, &ka_hira, wk), get_sort_key(&ja, &ka_half, wk));
+            assert_eq!(CompareStringEx(ja.as_ptr(), wk, ga_hira.as_ptr(), -1, ga_half.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&ja, &ga_hira, wk), get_sort_key(&ja, &ga_half, wk));
         }
     }
 
