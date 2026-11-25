@@ -67,6 +67,7 @@ pub(super) const CERT_KEY_PROV_HANDLE_PROP_ID: u32 = 1;
 pub(super) const CERT_KEY_PROV_INFO_PROP_ID: u32 = 2;
 pub(super) const CERT_SHA1_HASH_PROP_ID: u32 = 3;
 pub(super) const CERT_MD5_HASH_PROP_ID: u32 = 4;
+pub(super) const CERT_KEY_CONTEXT_PROP_ID: u32 = 5;
 pub(super) const CERT_KEY_SPEC_PROP_ID: u32 = 6;
 pub(super) const CERT_ENHKEY_USAGE_PROP_ID: u32 = 9;
 pub(super) const CERT_FRIENDLY_NAME_PROP_ID: u32 = 11;
@@ -77,8 +78,19 @@ pub(super) const CERT_KEY_IDENTIFIER_PROP_ID: u32 = 20;
 pub(super) const CERT_PUBKEY_ALG_PARA_PROP_ID: u32 = 22;
 pub(super) const CERT_ISSUER_PUBLIC_KEY_MD5_HASH_PROP_ID: u32 = 24;
 pub(super) const CERT_SUBJECT_PUBLIC_KEY_MD5_HASH_PROP_ID: u32 = 25;
+pub(super) const CERT_DATE_STAMP_PROP_ID: u32 = 27;
 pub(super) const CERT_SUBJECT_NAME_MD5_HASH_PROP_ID: u32 = 29;
+pub(super) const CERT_NCRYPT_KEY_HANDLE_PROP_ID: u32 = 78;
 pub(super) const CERT_SHA256_HASH_PROP_ID: u32 = 107;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct CertKeyContext {
+    pub(super) cb_size: u32,
+    pub(super) h_crypt_prov: usize,
+    pub(super) dw_key_spec: u32,
+}
+const _: () = assert!(std::mem::size_of::<CertKeyContext>() == 24);
 
 // ---------------------------------------------------------------------------
 // Internal registries for certificates, stores, and PKCS#7 messages
@@ -666,16 +678,28 @@ pub(super) unsafe fn cert_delete_certificate_from_store_impl(p_cert_context: *mu
     let cc = std::ptr::read_unaligned(p_cert_context as *const CertContext);
     let cert_h = p_cert_context as usize;
     let store_h = cc.h_cert_store as usize;
+    let cert_der = if !cc.pb_cert_encoded.is_null() && cc.cb_cert_encoded > 0 {
+        Some(std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize).to_vec())
+    } else {
+        None
+    };
     let mut st = STORE_STATE.lock().unwrap();
     let mut removed_from_store = false;
+    let mut removed_from_ntauth = false;
     if store_h != 0 {
         if let Some(store) = st.stores.get_mut(&store_h) {
             if let Some(pos) = store.certs.iter().position(|&h| h == cert_h) {
                 store.certs.remove(pos);
+                removed_from_ntauth = store.is_ntauth;
                 // Release the store's own reference to this cert.
                 release_cert_locked(&mut st, cert_h);
                 removed_from_store = true;
             }
+        }
+    }
+    if removed_from_ntauth {
+        if let Some(ref der) = cert_der {
+            st.ntauth_certs_der.retain(|existing| existing != der);
         }
     }
     // Windows CertDeleteCertificateFromStore always frees the caller's context reference.
@@ -1933,7 +1957,36 @@ pub(super) unsafe fn cert_set_certificate_context_property_impl(
         if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID {
             entry.key_prov_info = None;
         }
+        if dw_prop_id == CERT_KEY_CONTEXT_PROP_ID {
+            entry.properties.remove(&CERT_KEY_PROV_HANDLE_PROP_ID);
+            entry.properties.remove(&CERT_KEY_SPEC_PROP_ID);
+        }
         entry.properties.remove(&dw_prop_id);
+        return TRUE;
+    }
+    if dw_prop_id == CERT_KEY_CONTEXT_PROP_ID {
+        // Per MSDN CertSetCertificateContextProperty: CERT_KEY_CONTEXT_PROP_ID receives a
+        // CERT_KEY_CONTEXT* (24B on Win64: cbSize, hCryptProv/hNCryptKey, dwKeySpec) — NEVER a
+        // CRYPT_DATA_BLOB* and NEVER dereference the opaque provider handle.
+        let kc = std::ptr::read_unaligned(pv_data as *const CertKeyContext);
+        if kc.cb_size < std::mem::size_of::<CertKeyContext>() as u32 {
+            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        let normalized = CertKeyContext {
+            cb_size: std::mem::size_of::<CertKeyContext>() as u32,
+            h_crypt_prov: kc.h_crypt_prov,
+            dw_key_spec: kc.dw_key_spec,
+        };
+        let mut raw = vec![0u8; std::mem::size_of::<CertKeyContext>()];
+        std::ptr::write_unaligned(raw.as_mut_ptr() as *mut CertKeyContext, normalized);
+        entry.properties.insert(CERT_KEY_CONTEXT_PROP_ID, raw);
+        entry
+            .properties
+            .insert(CERT_KEY_PROV_HANDLE_PROP_ID, kc.h_crypt_prov.to_le_bytes().to_vec());
+        entry
+            .properties
+            .insert(CERT_KEY_SPEC_PROP_ID, kc.dw_key_spec.to_le_bytes().to_vec());
         return TRUE;
     }
     if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID {
@@ -1999,8 +2052,11 @@ pub(super) unsafe fn cert_set_certificate_context_property_impl(
         CERT_KEY_SPEC_PROP_ID | CERT_ACCESS_STATE_PROP_ID => {
             std::ptr::read_unaligned(pv_data as *const u32).to_le_bytes().to_vec()
         }
-        CERT_KEY_PROV_HANDLE_PROP_ID => {
+        CERT_KEY_PROV_HANDLE_PROP_ID | CERT_NCRYPT_KEY_HANDLE_PROP_ID => {
             std::ptr::read_unaligned(pv_data as *const usize).to_le_bytes().to_vec()
+        }
+        CERT_DATE_STAMP_PROP_ID => {
+            std::ptr::read_unaligned(pv_data as *const u64).to_le_bytes().to_vec()
         }
         _ => {
             // CRYPT_DATA_BLOB pointer

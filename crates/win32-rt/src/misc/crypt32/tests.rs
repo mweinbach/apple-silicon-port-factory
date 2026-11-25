@@ -4388,14 +4388,17 @@ fn macos_trust_store_and_extended_chain_policies() {
         );
         assert_eq!(status.dw_error, super::chain::CERT_E_UNTRUSTEDCA);
 
-        // Once the issuing CA is explicitly added to the Enterprise NTAUTH store, NT_AUTH succeeds!
+        // Once the issuing CA is explicitly added to the Enterprise NTAUTH store, NT_AUTH succeeds,
+        // and deleting it via CertDeleteCertificateFromStore withdraws authorization & cache state!
         let ntauth_name = b"NTAUTH\0";
         let ntauth_st = CertOpenSystemStoreA(0, ntauth_name.as_ptr());
         assert!(!ntauth_st.is_null());
+        let mut ntauth_ctx: *mut c_void = std::ptr::null_mut();
         assert_eq!(
-            CertAddCertificateContextToStore(ntauth_st, cert, 4, std::ptr::null_mut()),
+            CertAddCertificateContextToStore(ntauth_st, cert, 4, &mut ntauth_ctx),
             TRUE
         );
+        assert!(!ntauth_ctx.is_null());
         assert_eq!(
             CertVerifyCertificateChainPolicy(
                 CERT_CHAIN_POLICY_NT_AUTH as *const u8,
@@ -4406,7 +4409,121 @@ fn macos_trust_store_and_extended_chain_policies() {
             TRUE
         );
         assert_eq!(status.dw_error, 0);
+        // Delete from NTAUTH -> must immediately revoke NT_AUTH authorization AND not reappear on reopen
+        assert_eq!(CertDeleteCertificateFromStore(ntauth_ctx), TRUE);
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_NT_AUTH as *const u8,
+                trusted_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, super::chain::CERT_E_UNTRUSTEDCA);
         CertCloseStore(ntauth_st, 0);
+        let ntauth_reopen = CertOpenSystemStoreA(0, ntauth_name.as_ptr());
+        assert!(!ntauth_reopen.is_null());
+        assert!(
+            CertEnumCertificatesInStore(ntauth_reopen, std::ptr::null_mut()).is_null(),
+            "reopening NTAUTH must not restore a deleted certificate"
+        );
+        CertCloseStore(ntauth_reopen, 0);
+
+        // CERT_KEY_CONTEXT_PROP_ID (5) accepts a CERT_KEY_CONTEXT with an opaque numeric provider
+        // handle (e.g. 0xC000_0001 from advapi32) without dereferencing it, round-trips cleanly,
+        // and rejects truncated cbSize.
+        let bad_kc = super::store::CertKeyContext {
+            cb_size: 8,
+            h_crypt_prov: 0xC000_0001,
+            dw_key_spec: 1,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                cert,
+                super::store::CERT_KEY_CONTEXT_PROP_ID,
+                0,
+                &bad_kc as *const _ as *const c_void,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+        let good_kc = super::store::CertKeyContext {
+            cb_size: std::mem::size_of::<super::store::CertKeyContext>() as u32,
+            h_crypt_prov: 0xC000_0001,
+            dw_key_spec: 2, // AT_SIGNATURE
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                cert,
+                super::store::CERT_KEY_CONTEXT_PROP_ID,
+                0,
+                &good_kc as *const _ as *const c_void,
+            ),
+            TRUE
+        );
+        let mut out_kc = super::store::CertKeyContext {
+            cb_size: 0,
+            h_crypt_prov: 0,
+            dw_key_spec: 0,
+        };
+        let mut kc_cb = std::mem::size_of::<super::store::CertKeyContext>() as u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                cert,
+                super::store::CERT_KEY_CONTEXT_PROP_ID,
+                &mut out_kc as *mut _ as *mut c_void,
+                &mut kc_cb,
+            ),
+            TRUE
+        );
+        assert_eq!(kc_cb, 24);
+        assert_eq!(out_kc.cb_size, 24);
+        assert_eq!(out_kc.h_crypt_prov, 0xC000_0001);
+        assert_eq!(out_kc.dw_key_spec, 2);
+        let mut out_prov = 0usize;
+        let mut prov_cb = std::mem::size_of::<usize>() as u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                cert,
+                super::store::CERT_KEY_PROV_HANDLE_PROP_ID,
+                &mut out_prov as *mut _ as *mut c_void,
+                &mut prov_cb,
+            ),
+            TRUE
+        );
+        assert_eq!(out_prov, 0xC000_0001);
+        let mut out_spec = 0u32;
+        let mut spec_cb = 4u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                cert,
+                super::store::CERT_KEY_SPEC_PROP_ID,
+                &mut out_spec as *mut _ as *mut c_void,
+                &mut spec_cb,
+            ),
+            TRUE
+        );
+        assert_eq!(out_spec, 2);
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                cert,
+                super::store::CERT_KEY_CONTEXT_PROP_ID,
+                0,
+                std::ptr::null(),
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                cert,
+                super::store::CERT_KEY_CONTEXT_PROP_ID,
+                std::ptr::null_mut(),
+                &mut kc_cb,
+            ),
+            FALSE
+        );
+
         CertFreeCertificateChain(trusted_chain);
         CertFreeCertificateChainEngine(excl_engine);
         CertCloseStore(excl_store, 0);
