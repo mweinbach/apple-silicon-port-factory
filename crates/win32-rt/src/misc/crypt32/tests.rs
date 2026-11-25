@@ -9027,3 +9027,69 @@ fn cert_enhkey_usage_prop_enforced_in_chain_and_policy_validation() {
         CertCloseStore(root_st, 0);
     }
 }
+
+#[test]
+fn x509_object_identifier_decodes_and_encodes_multibyte_first_subid() {
+    use super::asn1::X509_OBJECT_IDENTIFIER;
+
+    unsafe {
+        // DER 06 03 88 37 03 == OID "2.999.3" (first subid 40*2 + 999 = 1079 = 0x88 0x37).
+        let oid_der: [u8; 5] = [0x06, 0x03, 0x88, 0x37, 0x03];
+        let mut out_ptr: *mut c_void = std::ptr::null_mut();
+        let mut out_len: u32 = 0;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_OBJECT_IDENTIFIER as *const u8,
+                oid_der.as_ptr(),
+                oid_der.len() as u32,
+                0x8000, // CRYPT_DECODE_ALLOC_FLAG
+                std::ptr::null(),
+                &mut out_ptr as *mut *mut c_void as *mut c_void,
+                &mut out_len,
+            ),
+            TRUE
+        );
+        let psz = std::ptr::read_unaligned(out_ptr as *const *const u8);
+        assert_eq!(crate::strings::from_ansi(psz), "2.999.3");
+        crate::kernel32::memory::LocalFree(out_ptr);
+
+        // Round-trip encode "2.999.3" back to DER 06 03 88 37 03.
+        let oid_c = b"2.999.3\0";
+        let in_ptr = oid_c.as_ptr();
+        let mut enc_buf = [0u8; 32];
+        let mut enc_len = enc_buf.len() as u32;
+        assert_eq!(
+            CryptEncodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_OBJECT_IDENTIFIER as *const u8,
+                &in_ptr as *const *const u8 as *const c_void,
+                0,
+                std::ptr::null(),
+                enc_buf.as_mut_ptr() as *mut c_void,
+                &mut enc_len,
+            ),
+            TRUE
+        );
+        assert_eq!(&enc_buf[..enc_len as usize], &oid_der);
+
+        // Truncated multi-byte subidentifier must be rejected with CRYPT_E_ASN1_BADTAG.
+        let bad_oid_der: [u8; 3] = [0x06, 0x01, 0x88];
+        let mut bad_ptr: *mut c_void = std::ptr::null_mut();
+        let mut bad_len: u32 = 0;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_OBJECT_IDENTIFIER as *const u8,
+                bad_oid_der.as_ptr(),
+                bad_oid_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut bad_ptr as *mut *mut c_void as *mut c_void,
+                &mut bad_len,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_310B);
+    }
+}

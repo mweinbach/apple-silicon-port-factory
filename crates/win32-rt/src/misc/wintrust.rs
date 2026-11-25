@@ -186,27 +186,56 @@ fn strip_der_int_sign(mut b: &[u8]) -> &[u8] {
     b
 }
 
-pub(crate) fn decode_oid_str(oid: &[u8]) -> String {
+/// Decode DER `OBJECT IDENTIFIER` value bytes into dotted-decimal notation per ITU-T X.690 §8.19.
+/// Reads the complete base-128 VLQ first subidentifier before splitting it into the first two arcs
+/// (`< 40` -> `0.x`, `< 80` -> `1.(x-40)`, `>= 80` -> `2.(x-80)`), and rejects empty, non-minimal
+/// leading-`0x80`, truncated, or overflowing encodings.
+pub(crate) fn try_decode_oid_str(oid: &[u8]) -> Option<String> {
     if oid.is_empty() {
-        return String::new();
+        return None;
     }
-    let first = (oid[0] / 40) as u32;
-    let second = (oid[0] % 40) as u32;
-    let mut parts = vec![first.to_string(), second.to_string()];
-    let mut i = 1usize;
-    while i < oid.len() {
-        let mut val: u64 = 0;
+    let read_subid = |idx: &mut usize| -> Option<u128> {
+        if *idx >= oid.len() {
+            return None;
+        }
+        // X.690 §8.19.2: subidentifier encodings must be minimal (no leading 0x80 byte).
+        if oid[*idx] == 0x80 {
+            return None;
+        }
+        let mut val: u128 = 0;
         loop {
-            let b = oid[i];
-            i += 1;
-            val = (val << 7) | ((b & 0x7F) as u64);
-            if (b & 0x80) == 0 || i >= oid.len() {
-                break;
+            if *idx >= oid.len() {
+                return None;
+            }
+            let b = oid[*idx];
+            *idx += 1;
+            if val > (u128::MAX >> 7) {
+                return None;
+            }
+            val = (val << 7) | ((b & 0x7F) as u128);
+            if (b & 0x80) == 0 {
+                return Some(val);
             }
         }
-        parts.push(val.to_string());
+    };
+    let mut i = 0usize;
+    let first_subid = read_subid(&mut i)?;
+    let (first, second) = if first_subid < 40 {
+        (0u128, first_subid)
+    } else if first_subid < 80 {
+        (1u128, first_subid - 40)
+    } else {
+        (2u128, first_subid - 80)
+    };
+    let mut parts = vec![first.to_string(), second.to_string()];
+    while i < oid.len() {
+        parts.push(read_subid(&mut i)?.to_string());
     }
-    parts.join(".")
+    Some(parts.join("."))
+}
+
+pub(crate) fn decode_oid_str(oid: &[u8]) -> String {
+    try_decode_oid_str(oid).unwrap_or_default()
 }
 
 pub(crate) fn parse_asn1_time_filetime_raw(tag: u8, val: &[u8]) -> u64 {
@@ -875,18 +904,10 @@ pub(crate) fn format_dn(dn_der: &[u8]) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// Parse an ASCII dotted OID (e.g. `"2.5.4.3"`) into DER OID value bytes.
+/// Parse an ASCII dotted OID (e.g. `"2.5.4.3"` or `"2.999.3"`) into DER OID value bytes.
 pub(crate) fn encode_oid_str(s: &str) -> Option<Vec<u8>> {
-    let mut nums = s.split('.').map(|p| p.parse::<u32>().ok());
-    let first = nums.next()??;
-    let second = nums.next()??;
-    if first > 2 || (first < 2 && second >= 40) {
-        return None;
-    }
-    let mut out = vec![(first * 40 + second) as u8];
-    for n in nums {
-        let mut v = n?;
-        let mut buf = [0u8; 5];
+    let push_base128 = |out: &mut Vec<u8>, mut v: u128| {
+        let mut buf = [0u8; 20];
         let mut k = 0usize;
         buf[k] = (v & 0x7F) as u8;
         k += 1;
@@ -900,6 +921,18 @@ pub(crate) fn encode_oid_str(s: &str) -> Option<Vec<u8>> {
             k -= 1;
             out.push(buf[k]);
         }
+    };
+    let mut nums = s.split('.').map(|p| p.parse::<u128>().ok());
+    let first = nums.next()??;
+    let second = nums.next()??;
+    if first > 2 || (first < 2 && second >= 40) {
+        return None;
+    }
+    let combined = first.checked_mul(40)?.checked_add(second)?;
+    let mut out = Vec::new();
+    push_base128(&mut out, combined);
+    for n in nums {
+        push_base128(&mut out, n?);
     }
     Some(out)
 }
@@ -3039,6 +3072,16 @@ mod tests {
         assert_eq!(cn_oid, vec![0x55, 0x04, 0x03]);
         assert_eq!(decode_oid_str(&cn_oid), "2.5.4.3");
         assert_eq!(decode_oid_str(OID_SHA256_WITH_RSA), "1.2.840.113549.1.1.11");
+        // Multi-byte first subidentifier (2.999.3 -> 40*2 + 999 = 1079 -> 0x88 0x37, then 0x03)
+        // and arc 2.40 (40*2 + 40 = 120 -> 0x78, must NOT decode as 3.0).
+        assert_eq!(decode_oid_str(&[0x88, 0x37, 0x03]), "2.999.3");
+        assert_eq!(encode_oid_str("2.999.3").as_deref(), Some(&[0x88, 0x37, 0x03][..]));
+        assert_eq!(decode_oid_str(&[0x78]), "2.40");
+        assert_eq!(encode_oid_str("2.40").as_deref(), Some(&[0x78][..]));
+        // Reject malformed/truncated/non-minimal OID encodings.
+        assert_eq!(try_decode_oid_str(&[]), None);
+        assert_eq!(try_decode_oid_str(&[0x88]), None);
+        assert_eq!(try_decode_oid_str(&[0x80, 0x01]), None);
 
         // Minimal DER Name: SEQUENCE { SET { SEQUENCE { OID 2.5.4.3, UTF8String "Test Signer" } } }
         let dn: &[u8] = &[

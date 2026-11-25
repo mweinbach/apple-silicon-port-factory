@@ -791,9 +791,9 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
             if root.tag != 0x06 {
                 return Err(CRYPT_E_ASN1_BADTAG);
             }
+            let oid_s = wintrust::try_decode_oid_str(root.val).ok_or(CRYPT_E_ASN1_BADTAG)?;
             // Output is a struct containing a single LPSTR (8B) pointing to the NUL-terminated OID.
             let off = arena.alloc_aligned(8, 8);
-            let oid_s = wintrust::decode_oid_str(root.val);
             let coff = arena.push_cstr(&oid_s);
             arena.write_ptr(off, Some(coff));
             Ok(arena)
