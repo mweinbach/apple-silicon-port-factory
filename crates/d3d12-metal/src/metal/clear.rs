@@ -249,6 +249,7 @@ kernel void port_upscale_2d_f(texture2d<float, access::sample> src [[texture(0)]
     float2 src_sz = float2(p.x0 > 0 ? p.x0 : src.get_width(), p.y0 > 0 ? p.y0 : src.get_height());
     float2 src_off = float2(p.u.x, p.u.y);
     float2 uv = src_off + (float2(g.xy) + 0.5) * (src_sz / float2(p.w, p.h));
+    uv = clamp(uv, src_off + 0.5, src_off + max(src_sz - 0.5, 0.5));
     dst.write(src.sample(s, uv), g.xy + uint2(p.u.z, p.u.w));
 }
 

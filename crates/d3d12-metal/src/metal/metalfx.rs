@@ -1736,5 +1736,29 @@ mod tests {
         let mb = f16_to_f32(px[out_mid + 2]);
         assert!((mr - 0.1).abs() < 0.1 && (mg - 0.8).abs() < 0.1 && (mb - 0.2).abs() < 0.1,
             "subrect temporal upscale should sample green subrect (0.1, 0.8, 0.2), got ({mr}, {mg}, {mb})");
+
+        // 3) Bilinear compute fallback (`w < 64` bypasses MetalFX spatial) must clamp
+        //    samples to the source subrect so adjacent red pixels never bleed onto the border.
+        l.begin(&alloc).unwrap();
+        unsafe {
+            l.clear_rtv(&rtv_out, [0.05, 0.05, 0.05, 1.0], &[]).unwrap();
+        }
+        l.upscale_resource_subrect(&out, &color, [16, 16], [32, 32], [32, 32], [16, 16]).unwrap();
+        l.copy_texture_region(CopyLoc::Footprint(&rb_out, fp_out), [0, 0, 0], CopyLoc::Subresource(&out, 0), None).unwrap();
+        l.close().unwrap();
+        q.execute_command_lists(&mut [&mut l]);
+        q.wait_idle();
+
+        let px2 = unsafe { std::slice::from_raw_parts(rb_out.cpu_ptr().unwrap() as *const u16, 192 * 192 * 4) };
+        // Exact top-left border pixel (16, 16) of the 32x32 output subrect must have zero red bleed
+        // from source x=31/y=31 (which is red = 0.9).
+        let border = (16 * 192 + 16) * 4;
+        let br = f16_to_f32(px2[border]);
+        let bg = f16_to_f32(px2[border + 1]);
+        let bb = f16_to_f32(px2[border + 2]);
+        assert!(
+            (br - 0.1).abs() < 0.02 && (bg - 0.8).abs() < 0.02 && (bb - 0.2).abs() < 0.02,
+            "bilinear subrect border leaked outside source subrect: got ({br}, {bg}, {bb})"
+        );
     }
 }
