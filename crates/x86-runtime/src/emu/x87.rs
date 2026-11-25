@@ -842,16 +842,12 @@ impl Fp80 {
                 if Self::should_round_up(self.sign, (int_part & 1) != 0, rbit, sticky, rc) {
                     int_part += 1;
                     if int_part == (1u64 << (self.exp as u32 + 1)) {
-                        int_part >>= 1;
                         exp += 1;
                     }
                 }
-                Self {
-                    kind: Fp80Kind::Finite,
-                    sign: self.sign,
-                    exp,
-                    sig: int_part << ((63 - exp) as u32),
-                }
+                let sig = int_part << ((63 - exp) as u32);
+                debug_assert!(sig & (1u64 << 63) != 0);
+                Self { kind: Fp80Kind::Finite, sign: self.sign, exp, sig }
             }
         }
     }

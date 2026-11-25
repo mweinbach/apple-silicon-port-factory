@@ -1776,3 +1776,73 @@ fn x87_fcmov_validates_both_operands_before_condition() {
         assert_eq!(rd_m80(m80_off), INDEF, "case {idx} must write QNAN_INDEF to ST(0)");
     }
 }
+
+/// 14. Regression: `frndint` rounding up across a power-of-two boundary (e.g. `1.5 -> 2.0`,
+/// `-1.5 -> -2.0`, `3.75 -> 4.0`, `1.5 + 2^-60 -> 2.0`, `2^63 - 0.5 -> 2^63`) must keep the
+/// J-bit normalized (`sig = 0x8000_0000_0000_0000`) and never produce an unnormal encoding.
+#[test]
+fn x87_frndint_power_of_two_carry() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 256];
+    init[0..8].copy_from_slice(&1.5f64.to_bits().to_le_bytes());
+    init[8..16].copy_from_slice(&(-1.5f64).to_bits().to_le_bytes());
+    init[16..24].copy_from_slice(&3.75f64.to_bits().to_le_bytes());
+    // m80: 1.5 + 2^-60 -> forces cold soft-f80 frndint path even under JIT!
+    init[32..40].copy_from_slice(&0xC000_0000_0000_0008u64.to_le_bytes());
+    init[40..42].copy_from_slice(&0x3FFFu16.to_le_bytes());
+    // m80: 2^63 - 0.5 (exp = 62 -> biased 0x403D, sig = u64::MAX) -> rounds to 2^63 (0x403E:0x8000..0)
+    init[48..56].copy_from_slice(&u64::MAX.to_le_bytes());
+    init[56..58].copy_from_slice(&0x403Du16.to_le_bytes());
+
+    let code = assemble(|a| {
+        a.fninit().unwrap();
+        // 1.5 -> 2.0, then fadd st0, st0 -> 4.0 (verifies normalized J-bit; unnormal would raise IE!)
+        a.fld(qword_ptr(rcx)).unwrap();
+        a.frndint().unwrap();
+        a.fld(st0).unwrap();
+        a.fstp(tbyte_ptr(rcx + 64)).unwrap();
+        a.fadd_2(st0, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 200)).unwrap();
+        a.fstp(qword_ptr(rcx + 144)).unwrap();
+
+        // -1.5 -> -2.0
+        a.fld(qword_ptr(rcx + 8)).unwrap();
+        a.frndint().unwrap();
+        a.fstp(tbyte_ptr(rcx + 80)).unwrap();
+
+        // 3.75 -> 4.0
+        a.fld(qword_ptr(rcx + 16)).unwrap();
+        a.frndint().unwrap();
+        a.fstp(tbyte_ptr(rcx + 96)).unwrap();
+
+        // m80 (1.5 + 2^-60) -> 2.0 (cold path)
+        a.fld(tbyte_ptr(rcx + 32)).unwrap();
+        a.frndint().unwrap();
+        a.fstp(tbyte_ptr(rcx + 112)).unwrap();
+
+        // m80 (2^63 - 0.5) -> 2^63 (cold path, exp = 62 -> 63 boundary)
+        a.fld(tbyte_ptr(rcx + 48)).unwrap();
+        a.frndint().unwrap();
+        a.fstp(tbyte_ptr(rcx + 128)).unwrap();
+    });
+
+    let r = run_diff_x87("frndint_pow2_carry", &code, &init);
+    let rd_m80 = |off: usize| -> (u64, u16) {
+        (
+            u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()),
+            u16::from_le_bytes(r.data[off + 8..off + 10].try_into().unwrap()),
+        )
+    };
+    assert_eq!(rd_m80(64), (0x8000_0000_0000_0000, 0x4000), "frndint(1.5) == 2.0");
+    assert_eq!(
+        f64::from_bits(u64::from_le_bytes(r.data[144..152].try_into().unwrap())),
+        4.0,
+        "2.0 + 2.0 == 4.0"
+    );
+    let sw = u16::from_le_bytes(r.data[200..202].try_into().unwrap());
+    assert_eq!(sw & 0x0001, 0, "SW.IE must be 0 after frndint(1.5) + fadd");
+    assert_eq!(rd_m80(80), (0x8000_0000_0000_0000, 0xC000), "frndint(-1.5) == -2.0");
+    assert_eq!(rd_m80(96), (0x8000_0000_0000_0000, 0x4001), "frndint(3.75) == 4.0");
+    assert_eq!(rd_m80(112), (0x8000_0000_0000_0000, 0x4000), "frndint(1.5+2^-60) == 2.0");
+    assert_eq!(rd_m80(128), (0x8000_0000_0000_0000, 0x403E), "frndint(2^63-0.5) == 2^63");
+}
