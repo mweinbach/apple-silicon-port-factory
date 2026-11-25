@@ -97,18 +97,43 @@ pub fn native_deactivated(hwnd: usize) {
     super::cursor::update_state();
 }
 
+fn sync_native_focus(old: usize, old_is_native: bool, old_root: usize, new: usize) {
+    let new_is_native = new != 0 && window::get(new).is_some_and(|w| w.data().native_control);
+    let new_root = if new != 0 { top_level_of(new) } else { 0 };
+    if new_is_native {
+        if old_is_native && old_root != 0 && old_root != new_root {
+            crate::macos::control_unfocus(old);
+        }
+        crate::macos::control_focus(new);
+        return;
+    }
+    if old_is_native {
+        crate::macos::control_unfocus(old);
+    }
+    if new_root != 0 && window::get(new_root).is_some_and(|w| w.data().native) {
+        crate::macos::window_clear_control_focus(new_root);
+    } else if !old_is_native && old_root != 0 && window::get(old_root).is_some_and(|w| w.data().native) {
+        crate::macos::window_clear_control_focus(old_root);
+    }
+}
+
 /// Change the keyboard focus; returns the previous focus window.
 pub fn set_focus(hwnd: usize) -> usize {
     let old = FOCUS.swap(hwnd, Ordering::AcqRel);
     if old == hwnd {
         return old;
     }
+    let old_is_native = old != 0 && window::get(old).is_some_and(|w| w.data().native_control);
+    let old_root = if old != 0 { top_level_of(old) } else { 0 };
     if old != 0 && window::exists(old) {
         message::send_message(old, wm::KILLFOCUS, hwnd, 0);
     }
-    if hwnd != 0 && FOCUS.load(Ordering::Acquire) == hwnd {
-        message::send_message(hwnd, wm::SETFOCUS, old, 0);
-        super::misc::dispatch_win_event(0x8005 /* EVENT_OBJECT_FOCUS */, hwnd, 0, 0);
+    if FOCUS.load(Ordering::Acquire) == hwnd {
+        sync_native_focus(old, old_is_native, old_root, hwnd);
+        if hwnd != 0 {
+            message::send_message(hwnd, wm::SETFOCUS, old, 0);
+            super::misc::dispatch_win_event(0x8005 /* EVENT_OBJECT_FOCUS */, hwnd, 0, 0);
+        }
     }
     old
 }
@@ -139,12 +164,30 @@ pub fn window_going_away(hwnd: usize) {
     if CAPTURE.load(Ordering::Acquire) == hwnd {
         CAPTURE.store(0, Ordering::Release);
     }
-    if FOCUS.load(Ordering::Acquire) == hwnd || window::is_child_of(FOCUS.load(Ordering::Acquire), hwnd) {
+    let cur_focus = FOCUS.load(Ordering::Acquire);
+    if cur_focus != 0 && (cur_focus == hwnd || window::is_child_of(cur_focus, hwnd)) {
         FOCUS.store(0, Ordering::Release);
+        if window::get(cur_focus).is_some_and(|w| w.data().native_control) {
+            crate::macos::control_unfocus(cur_focus);
+        }
     }
     if ACTIVE.load(Ordering::Acquire) == hwnd {
         ACTIVE.store(0, Ordering::Release);
         super::cursor::update_state();
+    }
+}
+
+/// Clear Win32 focus (delivering `WM_KILLFOCUS` and resigning any native AppKit
+/// editor) when the currently focused window is `hwnd` or one of its descendants.
+pub fn clear_focus_if_in_subtree(hwnd: usize) {
+    let cur = FOCUS.load(Ordering::Acquire);
+    if cur != 0 && (cur == hwnd || window::is_child_of(cur, hwnd)) {
+        on_owner(cur, move || {
+            let cur_now = FOCUS.load(Ordering::Acquire);
+            if cur_now == cur && (cur_now == hwnd || window::is_child_of(cur_now, hwnd)) {
+                set_focus(0);
+            }
+        });
     }
 }
 
@@ -864,6 +907,42 @@ pub(crate) fn filter_posted_msg(m: &MSG, remove: bool) -> bool {
 }
 
 pub fn native_key(k: NativeKey) {
+    native_key_with_target(k, None);
+}
+
+/// Deliver a native key event directly to `target_hwnd` (e.g. a focused native
+/// `EDIT` control's dialog navigation/cancel key) while updating Win32 key state.
+pub fn native_key_for_hwnd(target_hwnd: usize, k: NativeKey) {
+    native_key_with_target(k, Some(target_hwnd));
+}
+
+/// Update Win32 async and synchronous key state (`GetAsyncKeyState` /
+/// `GetKeyState` / `GetKeyboardState`) without posting a duplicate `WM_KEYDOWN`
+/// / `WM_CHAR` message. Used when a native AppKit text field handles the text
+/// edit directly and reports the updated string via its delegate.
+pub fn native_key_state_only(k: NativeKey) {
+    let Some(key) = keymap::from_mac(k.mac) else {
+        return;
+    };
+    set_async_key(key, k.down);
+    let mut s = SYNC.lock().unwrap();
+    for v in [key.vk, key.vk_lr] {
+        if v == 0 {
+            continue;
+        }
+        let e = &mut s[v as usize];
+        if k.down {
+            if *e & 0x80 == 0 {
+                *e ^= 1;
+            }
+            *e |= 0x80;
+        } else {
+            *e &= !0x80;
+        }
+    }
+}
+
+fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
     let Some(key) = keymap::from_mac(k.mac) else {
         log::trace!("unmapped mac key code {:#x}", k.mac);
         return;
@@ -891,8 +970,8 @@ pub fn native_key(k: NativeKey) {
     };
     set_async_key(key, k.down);
     let alt = async_down(VK_MENU);
-    let target = FOCUS.load(Ordering::Acquire);
-    if target == 0 {
+    let target = target_override.filter(|&h| h != 0).unwrap_or_else(|| FOCUS.load(Ordering::Acquire));
+    if target == 0 || !window::effective_child_enabled(target) {
         return;
     }
     // Raw input first (Windows delivers WM_INPUT ahead of the legacy message).
