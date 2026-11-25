@@ -123,6 +123,11 @@ struct SocketMeta {
     /// concurrently with other operations.
     guest_nonblocking: bool,
     handle_flags: u32,
+    /// Default multicast destination set by `WSAJoinLeaf` (`JL_SENDER_ONLY` / `JL_BOTH`).
+    /// Retained separately instead of calling POSIX `connect(2)` so bidirectional (`JL_BOTH`)
+    /// UDP sockets remain unconnected on Darwin and continue receiving multicast datagrams
+    /// whose source IP is a sender's unicast address rather than the group address.
+    mcast_dest: Option<(libc::sockaddr_storage, libc::socklen_t)>,
 }
 
 static STARTUPS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -356,6 +361,7 @@ fn register_fd_with_mode(
             connected,
             guest_nonblocking,
             handle_flags: crate::handles::HANDLE_FLAG_INHERIT,
+            mcast_dest: None,
         },
     );
     register_external_io_handle(h as HANDLE);
@@ -1499,6 +1505,7 @@ pub unsafe extern "win64" fn connect(s: usize, name: *const u8, namelen: i32) ->
     if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
         m.connecting = false;
         m.connected = true;
+        m.mcast_dest = None;
     }
     event_select_on_connect_complete(s, 0);
     0
@@ -1579,6 +1586,11 @@ fn map_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
         (WIN_IPPROTO_IPV6, 39) => Some((libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS)),
         (WIN_IPPROTO_IP, 3) => Some((libc::IPPROTO_IP, libc::IP_TOS)),
         (WIN_IPPROTO_IP, 4) => Some((libc::IPPROTO_IP, libc::IP_TTL)),
+        (WIN_IPPROTO_IP, 9) => Some((libc::IPPROTO_IP, libc::IP_MULTICAST_IF)),
+        (WIN_IPPROTO_IP, 10) => Some((libc::IPPROTO_IP, libc::IP_MULTICAST_TTL)),
+        (WIN_IPPROTO_IP, 11) => Some((libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP)),
+        (WIN_IPPROTO_IP, 12) => Some((libc::IPPROTO_IP, libc::IP_ADD_MEMBERSHIP)),
+        (WIN_IPPROTO_IP, 13) => Some((libc::IPPROTO_IP, libc::IP_DROP_MEMBERSHIP)),
         (WIN_IPPROTO_IP, 19) => Some((libc::IPPROTO_IP, libc::IP_PKTINFO)),
         _ => None,
     }
@@ -1635,6 +1647,16 @@ pub unsafe extern "win64" fn setsockopt(s: usize, level: i32, optname: i32, optv
         let linger = std::ptr::read_unaligned(optval.add(2) as *const u16) as i32;
         let l = libc::linger { l_onoff: onoff, l_linger: linger };
         if libc::setsockopt(fd, plevel, popt, &l as *const libc::linger as *const c_void, std::mem::size_of::<libc::linger>() as libc::socklen_t) != 0 {
+            return err(last_errno_wsa(), SOCKET_ERROR);
+        }
+        return 0;
+    }
+    if plevel == libc::IPPROTO_IP
+        && (popt == libc::IP_MULTICAST_TTL || popt == libc::IP_MULTICAST_LOOP)
+        && optlen >= 4
+    {
+        let v = std::ptr::read_unaligned(optval as *const u32).min(u8::MAX as u32) as u8;
+        if libc::setsockopt(fd, plevel, popt, &v as *const u8 as *const c_void, 1) != 0 {
             return err(last_errno_wsa(), SOCKET_ERROR);
         }
         return 0;
@@ -2092,11 +2114,24 @@ pub unsafe extern "win64" fn WSAIoctl(
 }
 
 pub unsafe extern "win64" fn send(s: usize, buf: *const u8, len: i32, flags: i32) -> i32 {
-    let Some(fd) = lookup_fd(s) else {
+    let Some(meta) = lookup_meta(s) else {
         return err(WSAENOTSOCK, SOCKET_ERROR);
     };
+    let fd = meta.fd;
+    let mcast_dest = if !meta.connected { meta.mcast_dest } else { None };
     loop {
-        let n = libc::send(fd, buf as *const c_void, len.max(0) as usize, flags);
+        let n = if let Some((ref dst, dlen)) = mcast_dest {
+            libc::sendto(
+                fd,
+                buf as *const c_void,
+                len.max(0) as usize,
+                flags,
+                dst as *const libc::sockaddr_storage as *const libc::sockaddr,
+                dlen,
+            )
+        } else {
+            libc::send(fd, buf as *const c_void, len.max(0) as usize, flags)
+        };
         if n >= 0 {
             return n as i32;
         }
@@ -2650,9 +2685,10 @@ pub unsafe extern "win64" fn WSASend(
         Err(e) => return err(e, SOCKET_ERROR),
     };
     let pflags = win_msg_flags_to_posix(flags);
+    let mcast_dest = if !meta.connected { meta.mcast_dest } else { None };
     if overlapped.is_null() {
         let n = loop {
-            let r = sendmsg_bufs(fd, &bufs, pflags, None);
+            let r = sendmsg_bufs(fd, &bufs, pflags, mcast_dest.as_ref());
             if r >= 0 {
                 break r;
             }
@@ -2685,7 +2721,7 @@ pub unsafe extern "win64" fn WSASend(
         sent,
         meta.sock_type == libc::SOCK_STREAM,
         pflags,
-        None,
+        mcast_dest,
         overlapped as *mut OVERLAPPED,
         completion,
     )
@@ -4207,6 +4243,8 @@ pub unsafe extern "win64" fn WSASendMsg(
             Ok(v) => Some(v),
             Err(e) => return err(e, SOCKET_ERROR),
         }
+    } else if !meta.connected {
+        meta.mcast_dest
     } else {
         None
     };
@@ -4630,19 +4668,11 @@ pub unsafe extern "win64" fn WSAJoinLeaf(
                 }
             }
             if join_send && sin.sin_port != 0 {
-                if libc::connect(
-                    meta.fd,
-                    &storage as *const _ as *const libc::sockaddr,
-                    plen,
-                ) != 0
-                {
-                    let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
-                    if raw_e != libc::EINPROGRESS {
-                        return err(errno_to_wsa(raw_e), INVALID_SOCKET);
-                    }
-                }
+                // Keep the native UDP socket unconnected on Darwin so bidirectional (`JL_BOTH`)
+                // sockets still receive multicast datagrams from unicast source addresses; store
+                // the group destination on `SocketMeta` for default `send` / `WSASend` calls.
                 if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
-                    m.connected = true;
+                    m.mcast_dest = Some((storage, plen));
                 }
             }
             s
@@ -4666,19 +4696,8 @@ pub unsafe extern "win64" fn WSAJoinLeaf(
                 }
             }
             if join_send && sin6.sin6_port != 0 {
-                if libc::connect(
-                    meta.fd,
-                    &storage as *const _ as *const libc::sockaddr,
-                    plen,
-                ) != 0
-                {
-                    let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
-                    if raw_e != libc::EINPROGRESS {
-                        return err(errno_to_wsa(raw_e), INVALID_SOCKET);
-                    }
-                }
                 if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
-                    m.connected = true;
+                    m.mcast_dest = Some((storage, plen));
                 }
             }
             s
@@ -11481,6 +11500,87 @@ mod tests {
 
             assert_eq!(closesocket(mcast), 0);
             assert_eq!(closesocket(s), 0);
+        }
+    }
+
+    #[test]
+    fn wsa_join_leaf_jl_both_keeps_socket_unconnected_and_sends_to_group() {
+        unsafe {
+            let mcast = socket(AF_INET as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            assert_ne!(mcast, INVALID_SOCKET);
+            let reuse: i32 = 1;
+            assert_eq!(
+                setsockopt(mcast, 0xFFFF, 0x0004 /* SO_REUSEADDR */, &reuse as *const i32 as *const u8, 4),
+                0
+            );
+            let bind_sa = loopback_sa(0);
+            assert_eq!(bind(mcast, bind_sa.as_ptr(), 16), 0);
+
+            let mut local_sa = [0u8; 16];
+            let mut local_len = 16i32;
+            assert_eq!(getsockname(mcast, local_sa.as_mut_ptr(), &mut local_len), 0);
+            let bound_port = u16::from_be((local_sa.as_ptr().add(2) as *const u16).read_unaligned());
+            assert_ne!(bound_port, 0);
+
+            // Configure multicast interface to loopback so send() to 239.255.1.2 routes locally.
+            let lo_if = [127u8, 0, 0, 1];
+            assert_eq!(
+                setsockopt(mcast, 0 /* IPPROTO_IP */, 9 /* IP_MULTICAST_IF */, lo_if.as_ptr(), 4),
+                0
+            );
+            let loop_en: i32 = 1;
+            assert_eq!(
+                setsockopt(mcast, 0 /* IPPROTO_IP */, 11 /* IP_MULTICAST_LOOP */, &loop_en as *const i32 as *const u8, 4),
+                0
+            );
+
+            let mut grp = [0u8; 16];
+            (grp.as_mut_ptr() as *mut u16).write_unaligned(AF_INET);
+            (grp.as_mut_ptr().add(2) as *mut u16).write_unaligned(bound_port.to_be());
+            grp[4..8].copy_from_slice(&[239, 255, 1, 2]);
+            let joined = WSAJoinLeaf(
+                mcast,
+                grp.as_ptr(),
+                16,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                JL_BOTH,
+            );
+            assert_eq!(joined, mcast);
+
+            // Socket must remain unconnected on Darwin so incoming packets from unicast senders
+            // are never filtered out by connect(2) peer matching.
+            let mut peer_sa = [0u8; 16];
+            let mut peer_len = 16i32;
+            assert_eq!(getpeername(mcast, peer_sa.as_mut_ptr(), &mut peer_len), SOCKET_ERROR);
+            assert_eq!(WSAGetLastError(), WSAENOTCONN as i32);
+
+            // Unicast peer sends a datagram to `mcast`: must be received despite JL_BOTH.
+            let sender = socket(AF_INET as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            assert_ne!(sender, INVALID_SOCKET);
+            let dst = loopback_sa(bound_port);
+            assert_eq!(sendto(sender, b"ping".as_ptr(), 4, 0, dst.as_ptr(), 16), 4);
+            let mut rbuf = [0u8; 16];
+            let mut from_sa = [0u8; 16];
+            let mut from_len = 16i32;
+            let got = recvfrom(mcast, rbuf.as_mut_ptr(), rbuf.len() as i32, 0, from_sa.as_mut_ptr(), &mut from_len);
+            assert_eq!(got, 4);
+            assert_eq!(&rbuf[..4], b"ping");
+
+            // send() and WSASend() without explicit destination must use the stored multicast group.
+            assert_eq!(send(mcast, b"grp1".as_ptr(), 4, 0), 4);
+            let mut wbuf = WsaBuf { len: 4, buf: b"grp2".as_ptr() as *mut u8 };
+            let mut sent = 0u32;
+            assert_eq!(
+                WSASend(mcast, &mut wbuf, 1, &mut sent, 0, std::ptr::null_mut(), std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(sent, 4);
+
+            assert_eq!(closesocket(sender), 0);
+            assert_eq!(closesocket(mcast), 0);
         }
     }
 }
