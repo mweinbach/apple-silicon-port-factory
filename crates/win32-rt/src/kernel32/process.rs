@@ -550,11 +550,46 @@ pub unsafe extern "win64" fn SetProcessAffinityMask(h: HANDLE, mask: usize) -> B
 
 static PRIORITY_CLASS: AtomicU32 = AtomicU32::new(0x20); // NORMAL_PRIORITY_CLASS
 
-pub unsafe extern "win64" fn GetPriorityClass(_h: HANDLE) -> u32 {
-    PRIORITY_CLASS.load(Ordering::Relaxed)
+fn is_valid_priority_class(c: u32) -> bool {
+    matches!(c, 0x20 | 0x40 | 0x80 | 0x100 | 0x4000 | 0x8000)
 }
-pub unsafe extern "win64" fn SetPriorityClass(_h: HANDLE, c: u32) -> BOOL {
-    PRIORITY_CLASS.store(c, Ordering::Relaxed);
+
+pub unsafe extern "win64" fn GetPriorityClass(h: HANDLE) -> u32 {
+    if !is_self(h) {
+        if handles::get_as::<ChildProcessObj>(h).is_some() {
+            log::warn!("GetPriorityClass: querying priority class of a child process is not supported");
+            set_err(err::ERROR_NOT_SUPPORTED);
+        } else {
+            set_err(err::ERROR_INVALID_HANDLE);
+        }
+        return 0;
+    }
+    PRIORITY_CLASS.load(Ordering::Acquire)
+}
+pub unsafe extern "win64" fn SetPriorityClass(h: HANDLE, c: u32) -> BOOL {
+    if !is_self(h) {
+        set_err(if handles::get_as::<ChildProcessObj>(h).is_some() {
+            err::ERROR_ACCESS_DENIED
+        } else {
+            err::ERROR_INVALID_HANDLE
+        });
+        return FALSE;
+    }
+    const PROCESS_MODE_BACKGROUND_BEGIN: u32 = 0x0010_0000;
+    const PROCESS_MODE_BACKGROUND_END: u32 = 0x0020_0000;
+    if !is_valid_priority_class(c) && c != PROCESS_MODE_BACKGROUND_BEGIN && c != PROCESS_MODE_BACKGROUND_END {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if let Some(job_prio) = job_priority_class_constraint() {
+        if c != job_prio {
+            set_err(err::ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+    }
+    if is_valid_priority_class(c) {
+        PRIORITY_CLASS.store(c, Ordering::Release);
+    }
     TRUE
 }
 pub unsafe extern "win64" fn SetProcessPriorityBoost(_h: HANDLE, _d: BOOL) -> BOOL {
@@ -1897,6 +1932,66 @@ fn other_self_jobs_affinity_constraint(exclude: &Arc<JobObj>) -> Result<Option<(
     Ok(combined)
 }
 
+/// Return `Some(priority_class)` if the current process belongs to any live job with
+/// `JOB_OBJECT_LIMIT_PRIORITY_CLASS` set (fail closed with `Some(0)` if two jobs conflict).
+fn job_priority_class_constraint() -> Option<u32> {
+    let my_pid = std::process::id();
+    let jobs: Vec<Arc<JobObj>> = {
+        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut locked: Option<u32> = None;
+    for jo in jobs {
+        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        if let Some(p) = st.priority_class_limit() {
+            match locked {
+                None => locked = Some(p),
+                Some(cur) if cur == p => {}
+                Some(_) => return Some(0),
+            }
+        }
+    }
+    locked
+}
+
+/// Priority class constraint of all live jobs containing the current process other than `exclude`.
+fn other_self_jobs_priority_constraint(exclude: &Arc<JobObj>) -> Result<Option<u32>, ()> {
+    let my_pid = std::process::id();
+    let jobs: Vec<Arc<JobObj>> = {
+        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut locked: Option<u32> = None;
+    for jo in jobs {
+        if Arc::ptr_eq(&jo, exclude) {
+            continue;
+        }
+        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        if let Some(p) = st.priority_class_limit() {
+            match locked {
+                None => locked = Some(p),
+                Some(cur) if cur == p => {}
+                Some(_) => return Err(()),
+            }
+        }
+    }
+    Ok(locked)
+}
+
+fn combine_priority_constraints(a: Option<u32>, b: Option<u32>) -> Result<Option<u32>, ()> {
+    match (a, b) {
+        (None, x) | (x, None) => Ok(x),
+        (Some(p1), Some(p2)) if p1 == p2 => Ok(Some(p1)),
+        (Some(_), Some(_)) => Err(()),
+    }
+}
+
 /// Return `Some((effective_mask, allow_subset))` if the current process belongs to any live
 /// job with `JOB_OBJECT_LIMIT_AFFINITY` or `JobObjectGroupInformationEx` affinity set.
 /// Never treats an empty intersection as unconstrained (fail closed with `Some((0, false))`).
@@ -2105,6 +2200,18 @@ impl JobState {
     }
     fn effective_affinity(&self) -> Option<(usize, bool)> {
         Self::effective_affinity_from(&self.basic_limits, &self.group_affinities)
+    }
+    fn priority_class_from(basic_limits: &[u8; 64]) -> Option<u32> {
+        let flags = u32::from_le_bytes(basic_limits[16..20].try_into().unwrap());
+        if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 {
+            let prio = u32::from_le_bytes(basic_limits[56..60].try_into().unwrap());
+            (prio != 0).then_some(prio)
+        } else {
+            None
+        }
+    }
+    fn priority_class_limit(&self) -> Option<u32> {
+        Self::priority_class_from(&self.basic_limits)
     }
     fn has_live_child(&self) -> bool {
         self.members.iter().any(|m| match m {
@@ -2381,16 +2488,24 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
     let pid = member.pid();
     let is_self_member = matches!(member, JobMember::SelfProc(_));
     let _aff_guard = is_self_member.then(|| job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner()));
-    let other_aff = if is_self_member {
-        match other_self_jobs_affinity_constraint(&j) {
+    let (other_aff, other_prio) = if is_self_member {
+        let a = match other_self_jobs_affinity_constraint(&j) {
             Ok(a) => a,
             Err(()) => {
                 set_err(err::ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
-        }
+        };
+        let p = match other_self_jobs_priority_constraint(&j) {
+            Ok(p) => p,
+            Err(()) => {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        };
+        (a, p)
     } else {
-        None
+        (None, None)
     };
     let mut st = j.state.lock().unwrap();
     if st.contains_pid(pid) {
@@ -2421,11 +2536,19 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
     } else {
         None
     };
-    if (st.limit_flags() & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && is_self_member {
-        let prio = u32::from_le_bytes(st.basic_limits[56..60].try_into().unwrap());
-        if prio != 0 {
-            PRIORITY_CLASS.store(prio, Ordering::Relaxed);
+    let apply_prio = if is_self_member {
+        match combine_priority_constraints(other_prio, st.priority_class_limit()) {
+            Ok(combined) => combined,
+            Err(()) => {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
         }
+    } else {
+        None
+    };
+    if let Some(prio) = apply_prio {
+        PRIORITY_CLASS.store(prio, Ordering::Release);
     }
     if matches!(member, JobMember::SelfProc(_)) {
         let snap = self_rusage_snapshot();
@@ -2480,6 +2603,11 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
     } else {
         Ok(None)
     };
+    let other_prio = if matches!(class, 2 | 9) {
+        other_self_jobs_priority_constraint(&j)
+    } else {
+        Ok(None)
+    };
     let mut st = j.state.lock().unwrap();
     match class {
         2 => {
@@ -2509,6 +2637,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                     return FALSE;
                 }
             }
+            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 {
+                let prio = u32::from_le_bytes(buf[56..60].try_into().unwrap());
+                if !is_valid_priority_class(prio) {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+            }
             if st.has_live_child() && JobState::limits_require_child_enforcement(&buf, &st.group_affinities) {
                 log::warn!(
                     "SetInformationJobObject(JobObjectBasicLimitInformation): cannot apply affinity/priority limits to a job containing child processes"
@@ -2517,28 +2652,34 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 return FALSE;
             }
             let contains_self = st.contains_pid(std::process::id());
-            let apply_aff = if contains_self {
-                let Ok(other) = other_aff else {
+            let (apply_aff, apply_prio) = if contains_self {
+                let (Ok(other_a), Ok(other_p)) = (other_aff, other_prio) else {
                     set_err(err::ERROR_INVALID_PARAMETER);
                     return FALSE;
                 };
                 let new_aff = JobState::effective_affinity_from(&buf, &st.group_affinities);
-                match combine_affinity_constraints(other, new_aff) {
+                let combined_aff = match combine_affinity_constraints(other_a, new_aff) {
                     Ok(combined) => combined,
                     Err(()) => {
                         set_err(err::ERROR_INVALID_PARAMETER);
                         return FALSE;
                     }
-                }
+                };
+                let new_prio = JobState::priority_class_from(&buf);
+                let combined_prio = match combine_priority_constraints(other_p, new_prio) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                };
+                (combined_aff, combined_prio)
             } else {
-                None
+                (None, None)
             };
             st.basic_limits = buf;
-            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && contains_self {
-                let prio = u32::from_le_bytes(buf[56..60].try_into().unwrap());
-                if prio != 0 {
-                    PRIORITY_CLASS.store(prio, Ordering::Relaxed);
-                }
+            if let Some(prio) = apply_prio {
+                PRIORITY_CLASS.store(prio, Ordering::Release);
             }
             drop(st);
             if let Some((aff, allow_subset)) = apply_aff {
@@ -2622,6 +2763,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                     return FALSE;
                 }
             }
+            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 {
+                let prio = u32::from_le_bytes(basic[56..60].try_into().unwrap());
+                if !is_valid_priority_class(prio) {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+            }
             if st.has_live_child() && JobState::limits_require_child_enforcement(&basic, &st.group_affinities) {
                 log::warn!(
                     "SetInformationJobObject(JobObjectExtendedLimitInformation): cannot apply affinity/priority limits to a job containing child processes"
@@ -2630,28 +2778,34 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 return FALSE;
             }
             let contains_self = st.contains_pid(std::process::id());
-            let apply_aff = if contains_self {
-                let Ok(other) = other_aff else {
+            let (apply_aff, apply_prio) = if contains_self {
+                let (Ok(other_a), Ok(other_p)) = (other_aff, other_prio) else {
                     set_err(err::ERROR_INVALID_PARAMETER);
                     return FALSE;
                 };
                 let new_aff = JobState::effective_affinity_from(&basic, &st.group_affinities);
-                match combine_affinity_constraints(other, new_aff) {
+                let combined_aff = match combine_affinity_constraints(other_a, new_aff) {
                     Ok(combined) => combined,
                     Err(()) => {
                         set_err(err::ERROR_INVALID_PARAMETER);
                         return FALSE;
                     }
-                }
+                };
+                let new_prio = JobState::priority_class_from(&basic);
+                let combined_prio = match combine_priority_constraints(other_p, new_prio) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                };
+                (combined_aff, combined_prio)
             } else {
-                None
+                (None, None)
             };
             st.basic_limits = basic;
-            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && contains_self {
-                let prio = u32::from_le_bytes(basic[56..60].try_into().unwrap());
-                if prio != 0 {
-                    PRIORITY_CLASS.store(prio, Ordering::Relaxed);
-                }
+            if let Some(prio) = apply_prio {
+                PRIORITY_CLASS.store(prio, Ordering::Release);
             }
             drop(st);
             if let Some((aff, allow_subset)) = apply_aff {
@@ -4689,11 +4843,58 @@ pub(crate) mod tests {
                 let mut child_sm = 0usize;
                 assert_eq!(GetProcessAffinityMask(child_probe, &mut child_pm, &mut child_sm), FALSE);
                 assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                assert_eq!(GetPriorityClass(child_probe), 0);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                assert_eq!(SetPriorityClass(child_probe, 0x20), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
                 assert_eq!(crate::kernel32::threads::CloseHandle(child_probe), TRUE);
 
                 // Restore full group-0 affinity mask before continuing.
                 std::ptr::write_unaligned(ga.as_mut_ptr() as *mut usize, orig_sm);
                 assert_eq!(SetInformationJobObject(job, 14, ga.as_ptr() as *const c_void, 16), TRUE);
+            }
+
+            // JOB_OBJECT_LIMIT_PRIORITY_CLASS applies the priority class AND blocks subsequent
+            // SetPriorityClass attempts from escaping it (both class 2 and class 9), as well as
+            // rejecting conflicting priority classes across jobs.
+            {
+                let orig_prio = GetPriorityClass(handles::CURRENT_PROCESS);
+                let mut prio_basic = [0u8; 64];
+                std::ptr::write_unaligned(
+                    prio_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+                );
+                std::ptr::write_unaligned(prio_basic.as_mut_ptr().add(40) as *mut u32, 1u32);
+                std::ptr::write_unaligned(prio_basic.as_mut_ptr().add(56) as *mut u32, 0x4000u32); // BELOW_NORMAL
+                assert_eq!(SetInformationJobObject(job, 2, prio_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(GetPriorityClass(handles::CURRENT_PROCESS), 0x4000);
+                // Changing priority class to HIGH (0x80) is rejected with ERROR_ACCESS_DENIED.
+                assert_eq!(SetPriorityClass(handles::CURRENT_PROCESS, 0x80), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+                assert_eq!(GetPriorityClass(handles::CURRENT_PROCESS), 0x4000);
+                // Setting the exact job-locked class succeeds idempotently.
+                assert_eq!(SetPriorityClass(handles::CURRENT_PROCESS, 0x4000), TRUE);
+                // Assigning self to a second job with a conflicting priority class is rejected.
+                let pjob2 = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!pjob2.is_null());
+                let mut p2_ext = [0u8; 144];
+                std::ptr::write_unaligned(
+                    p2_ext.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+                );
+                std::ptr::write_unaligned(p2_ext.as_mut_ptr().add(56) as *mut u32, 0x80u32); // HIGH
+                assert_eq!(SetInformationJobObject(pjob2, 9, p2_ext.as_ptr() as *const c_void, 144), TRUE);
+                assert_eq!(AssignProcessToJobObject(pjob2, handles::CURRENT_PROCESS), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(crate::kernel32::threads::CloseHandle(pjob2), TRUE);
+                // Clearing JOB_OBJECT_LIMIT_PRIORITY_CLASS restores SetPriorityClass control.
+                std::ptr::write_unaligned(
+                    prio_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                );
+                assert_eq!(SetInformationJobObject(job, 2, prio_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(SetPriorityClass(handles::CURRENT_PROCESS, orig_prio), TRUE);
+                assert_eq!(GetPriorityClass(handles::CURRENT_PROCESS), orig_prio);
             }
 
             // Child creation inherits the current process's job by default, respects

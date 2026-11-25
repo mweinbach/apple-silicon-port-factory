@@ -1890,11 +1890,18 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     }
     if fault_protected {
         let av_write = if in_guest(eff_addr) { false } else { is_write };
+        // Release HPAGE_LOCKS before dispatching the VEH on `PageFaultHelper` (a separate
+        // OS thread). If the VEH writes to a writable sibling 4 KiB subpage on this same
+        // 16 KiB host page while host PROT_WRITE is disabled for a read-only subpage, the
+        // helper faults and acquires this same lock to emulate that sibling write; holding
+        // it across dispatch would deadlock.
+        drop(hpage_guard.take());
         handled = deliver_page_fault(unwind::STATUS_ACCESS_VIOLATION, eff_fault_addr, av_write);
         if !handled {
             IN_FAULT.with(|f| f.set(false));
             return false;
         }
+        hpage_guard = Some(hpage_lock.lock().unwrap());
     }
     // Unlock any sibling 4 KiB encrypted PAGE_NOACCESS sub-pages sharing this 16 KiB host page
     // (never eagerly consume sibling PAGE_GUARD pages).
@@ -1906,17 +1913,19 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         }
         let sub_noaccess = memory::query(sub).is_some_and(|m| m.state == MEM_COMMIT && m.protect == PAGE_NOACCESS);
         if sub_noaccess && in_guest(sub) {
+            drop(hpage_guard.take());
             let _ = deliver_page_fault(unwind::STATUS_ACCESS_VIOLATION, sub as u64, false);
+            hpage_guard = Some(hpage_lock.lock().unwrap());
         }
     }
-    // Restore host readability if any non-guest/permanent PAGE_NOACCESS sibling
-    // caused VirtualProtect to defer mprotect, or if the faulting page itself was
-    // already logically readable (e.g. PE header or .rdata sharing the 16 KiB page).
+    // Revalidate protections after VEH dispatch and restore host readability or emulate
+    // the access if another sibling still restricts this 16 KiB host page.
     let still_prot = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
     if !fault_protected {
         if !still_prot {
+            let cur_prot = memory::query(eff_addr).map_or(mbi.protect, |m| m.protect);
             let any_non_writable = (0..4).any(|i| sub_blocks_host_write(hpage + i * 0x1000));
-            let mut host_p = memory::win_prot_to_host(mbi.protect);
+            let mut host_p = memory::win_prot_to_host(cur_prot);
             if any_non_writable {
                 host_p &= !libc::PROT_WRITE;
             }
@@ -1933,7 +1942,16 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         }
     } else if still_prot && in_guest(eff_addr) {
         memory::ensure_host_page_readable(eff_addr);
+    } else if handled
+        && sibling_requires_emul(hpage)
+        && first_blocked_subpage(span_start, span_bytes, is_write).is_none()
+    {
+        // VEH updated eff_addr's protection (e.g. PAGE_READONLY -> PAGE_READWRITE) while
+        // another sibling on the same 16 KiB host page still restricts host access: emulate
+        // this single faulting instruction cleanly through an isolated alias.
+        handled = try_emulate_subpage_access(fault_addr, is_write, mc, ss);
     }
+    drop(hpage_guard);
     IN_FAULT.with(|f| f.set(false));
     handled
 }
