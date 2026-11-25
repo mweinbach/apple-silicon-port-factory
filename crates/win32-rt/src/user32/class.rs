@@ -9,7 +9,16 @@ use crate::types::*;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub const CS_VREDRAW: u32 = 0x0001;
+pub const CS_HREDRAW: u32 = 0x0002;
 pub const CS_DBLCLKS: u32 = 0x0008;
+pub const CS_PARENTDC: u32 = 0x0080;
+pub const CS_SAVEBITS: u32 = 0x0800;
+pub const CS_GLOBALCLASS: u32 = 0x4000;
+
+/// Predefined dialog box class atom (`WC_DIALOG` = `#32770`).
+pub const ATOM_DIALOG: ATOM = 32770;
+const DLGWINDOWEXTRA: i32 = 30;
 
 #[derive(Debug)]
 pub struct Class {
@@ -27,6 +36,8 @@ pub struct Class {
     pub menu_name: AtomicUsize,
     pub extra: Mutex<Vec<u8>>,
     pub unicode: bool,
+    /// Built-in USER32 system global class (cannot be unregistered by applications).
+    pub system: bool,
 }
 
 struct Table {
@@ -34,9 +45,95 @@ struct Table {
     classes: Vec<Arc<Class>>,
 }
 
+fn builtin_system_classes(next_atom: &mut ATOM) -> Vec<Arc<Class>> {
+    let mut classes = Vec::new();
+    let mut push_sys = |atom_override: Option<ATOM>, name: &str, style: u32, wndproc: usize, wnd_extra: i32| {
+        let atom = match atom_override {
+            Some(a) => a,
+            None => {
+                let a = *next_atom;
+                *next_atom = next_atom.wrapping_add(1);
+                a
+            }
+        };
+        classes.push(Arc::new(Class {
+            atom,
+            name: name.to_string(),
+            style: AtomicU32::new(style | CS_GLOBALCLASS),
+            wndproc: AtomicUsize::new(wndproc),
+            cls_extra: 0,
+            wnd_extra,
+            instance: AtomicUsize::new(0),
+            icon: AtomicUsize::new(0),
+            icon_sm: AtomicUsize::new(0),
+            cursor: Mutex::new(0),
+            background: AtomicUsize::new(0),
+            menu_name: AtomicUsize::new(0),
+            extra: Mutex::new(Vec::new()),
+            unicode: true,
+            system: true,
+        }));
+    };
+
+    push_sys(
+        Some(ATOM_DIALOG),
+        "#32770",
+        CS_DBLCLKS | CS_SAVEBITS,
+        super::WNDPROC_HANDLE_DEF_DLG_W,
+        DLGWINDOWEXTRA,
+    );
+    push_sys(
+        None,
+        "Button",
+        CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW | CS_PARENTDC,
+        super::WNDPROC_HANDLE_BUTTON,
+        0,
+    );
+    push_sys(
+        None,
+        "Edit",
+        CS_DBLCLKS | CS_PARENTDC,
+        super::WNDPROC_HANDLE_EDIT,
+        0,
+    );
+    push_sys(
+        None,
+        "Static",
+        CS_DBLCLKS | CS_PARENTDC,
+        super::WNDPROC_HANDLE_STATIC,
+        0,
+    );
+    push_sys(
+        None,
+        "ListBox",
+        CS_DBLCLKS | CS_PARENTDC,
+        super::WNDPROC_HANDLE_DEFAULT_CTRL,
+        0,
+    );
+    push_sys(
+        None,
+        "ScrollBar",
+        CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW | CS_PARENTDC,
+        super::WNDPROC_HANDLE_DEFAULT_CTRL,
+        0,
+    );
+    push_sys(
+        None,
+        "ComboBox",
+        CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW | CS_PARENTDC,
+        super::WNDPROC_HANDLE_DEFAULT_CTRL,
+        0,
+    );
+    classes
+}
+
 fn table() -> &'static Mutex<Table> {
     static T: OnceLock<Mutex<Table>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(Table { next_atom: 0xC000, classes: Vec::new() }))
+    T.get_or_init(|| {
+        let mut next_atom = 0xC000;
+        let classes = builtin_system_classes(&mut next_atom);
+        Mutex::new(Table { next_atom, classes })
+    })
 }
 
 /// Class name argument: an atom (`MAKEINTATOM`) or a string.
@@ -123,6 +220,7 @@ pub fn register(d: ClassDesc) -> ATOM {
         menu_name: AtomicUsize::new(0),
         extra: Mutex::new(vec![0u8; d.cls_extra.max(0) as usize]),
         unicode: d.unicode,
+        system: false,
     }));
     atom
 }
@@ -243,6 +341,10 @@ fn unregister(name: ClassName) -> BOOL {
         set_error(e::CLASS_DOES_NOT_EXIST);
         return FALSE;
     };
+    if c.system {
+        set_error(e::CLASS_DOES_NOT_EXIST);
+        return FALSE;
+    }
     if super::window::any_window_of_class(c.atom) {
         set_error(e::CLASS_HAS_WINDOWS);
         return FALSE;

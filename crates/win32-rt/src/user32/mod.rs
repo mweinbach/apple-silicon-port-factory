@@ -38,6 +38,7 @@
 #![allow(clippy::upper_case_acronyms)]
 
 pub mod class;
+pub mod controls;
 pub mod cursor;
 pub mod defproc;
 pub mod dialog;
@@ -73,6 +74,7 @@ pub const WNDPROC_HANDLE_DEF_DLG_A: usize = 0xFFFF_0004;
 pub const WNDPROC_HANDLE_BUTTON: usize = 0xFFFF_0005;
 pub const WNDPROC_HANDLE_EDIT: usize = 0xFFFF_0006;
 pub const WNDPROC_HANDLE_DEFAULT_CTRL: usize = 0xFFFF_0007;
+pub const WNDPROC_HANDLE_STATIC: usize = 0xFFFF_0008;
 const WNDPROC_HANDLE_DYNAMIC_BASE: usize = 0xFFFF_0100;
 
 static TYPED_HOST_WNDPROCS: std::sync::Mutex<Vec<TypedWndProc>> = std::sync::Mutex::new(Vec::new());
@@ -126,9 +128,10 @@ pub(crate) fn resolve_typed_wndproc(p: usize) -> Option<TypedWndProc> {
         WNDPROC_HANDLE_DEF_WINDOW_A => return Some(defproc::DefWindowProcA),
         WNDPROC_HANDLE_DEF_DLG_W => return Some(dialog::DefDlgProcW),
         WNDPROC_HANDLE_DEF_DLG_A => return Some(dialog::DefDlgProcA),
-        WNDPROC_HANDLE_BUTTON => return Some(dialog::button_wndproc),
-        WNDPROC_HANDLE_EDIT => return Some(dialog::edit_wndproc),
-        WNDPROC_HANDLE_DEFAULT_CTRL => return Some(dialog::default_control_wndproc),
+        WNDPROC_HANDLE_BUTTON => return Some(controls::button_wndproc),
+        WNDPROC_HANDLE_EDIT => return Some(controls::edit_wndproc),
+        WNDPROC_HANDLE_DEFAULT_CTRL => return Some(controls::default_control_wndproc),
+        WNDPROC_HANDLE_STATIC => return Some(controls::static_wndproc),
         _ => {}
     }
     if p >= WNDPROC_HANDLE_DYNAMIC_BASE && (p >> 16) == 0xFFFF {
@@ -284,6 +287,8 @@ pub mod wm {
     pub const NEXTDLGCTL: u32 = 0x0028;
     pub const VKEYTOITEM: u32 = 0x002E;
     pub const CHARTOITEM: u32 = 0x002F;
+    pub const SETFONT: u32 = 0x0030;
+    pub const GETFONT: u32 = 0x0031;
     pub const QUERYDRAGICON: u32 = 0x0037;
     pub const COMPAREITEM: u32 = 0x0039;
     pub const WINDOWPOSCHANGING: u32 = 0x0046;
@@ -298,9 +303,29 @@ pub mod wm {
     pub const NCPAINT: u32 = 0x0085;
     pub const NCACTIVATE: u32 = 0x0086;
     pub const GETDLGCODE: u32 = 0x0087;
+    pub const EM_GETSEL: u32 = 0x00B0;
+    pub const EM_SETSEL: u32 = 0x00B1;
+    pub const EM_SCROLLCARET: u32 = 0x00B7;
+    pub const EM_GETMODIFY: u32 = 0x00B8;
+    pub const EM_SETMODIFY: u32 = 0x00B9;
+    pub const EM_GETLINECOUNT: u32 = 0x00BA;
+    pub const EM_LINEINDEX: u32 = 0x00BB;
+    pub const EM_LINELENGTH: u32 = 0x00C1;
+    pub const EM_REPLACESEL: u32 = 0x00C2;
+    pub const EM_GETLINE: u32 = 0x00C4;
+    pub const EM_LIMITTEXT: u32 = 0x00C5;
+    pub const EM_SETPASSWORDCHAR: u32 = 0x00CC;
+    pub const EM_SETREADONLY: u32 = 0x00CF;
+    pub const EM_GETPASSWORDCHAR: u32 = 0x00D2;
+    pub const EM_GETLIMITTEXT: u32 = 0x00D5;
     pub const BM_GETCHECK: u32 = 0x00F0;
     pub const BM_SETCHECK: u32 = 0x00F1;
+    pub const BM_GETSTATE: u32 = 0x00F2;
+    pub const BM_SETSTATE: u32 = 0x00F3;
+    pub const BM_SETSTYLE: u32 = 0x00F4;
     pub const BM_CLICK: u32 = 0x00F5;
+    pub const BM_GETIMAGE: u32 = 0x00F6;
+    pub const BM_SETIMAGE: u32 = 0x00F7;
     pub const INPUT: u32 = 0x00FF;
     pub const KEYDOWN: u32 = 0x0100;
     pub const KEYUP: u32 = 0x0101;
@@ -315,6 +340,10 @@ pub mod wm {
     pub const TIMER: u32 = 0x0113;
     pub const CTLCOLORMSGBOX: u32 = 0x0132;
     pub const CTLCOLORSTATIC: u32 = 0x0138;
+    pub const STM_SETICON: u32 = 0x0170;
+    pub const STM_GETICON: u32 = 0x0171;
+    pub const STM_SETIMAGE: u32 = 0x0172;
+    pub const STM_GETIMAGE: u32 = 0x0173;
     pub const MOUSEMOVE: u32 = 0x0200;
     pub const LBUTTONDOWN: u32 = 0x0201;
     pub const LBUTTONUP: u32 = 0x0202;
@@ -355,6 +384,8 @@ pub mod ws {
     pub const MAXIMIZE: u32 = 0x0100_0000;
     pub const CAPTION: u32 = 0x00C0_0000;
     pub const BORDER: u32 = 0x0080_0000;
+    pub const VSCROLL: u32 = 0x0020_0000;
+    pub const HSCROLL: u32 = 0x0010_0000;
     pub const SYSMENU: u32 = 0x0008_0000;
     pub const THICKFRAME: u32 = 0x0004_0000;
     pub const MINIMIZEBOX: u32 = 0x0002_0000;

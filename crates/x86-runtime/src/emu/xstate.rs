@@ -14,6 +14,7 @@ const DEFAULT_MXCSR: u32 = 0x1f80;
 
 #[derive(Debug, PartialEq)]
 pub(super) struct Fault {
+    code: u32,
     address: u64,
     write: bool,
 }
@@ -21,7 +22,15 @@ pub(super) struct Fault {
 impl Fault {
     pub(super) fn gp() -> Self {
         // Windows reports a #GP(0) as an access violation with no linear fault address.
-        Self { address: u64::MAX, write: false }
+        Self { code: win32_rt::unwind::STATUS_ACCESS_VIOLATION, address: u64::MAX, write: false }
+    }
+
+    pub(super) fn pf(address: u64, write: bool) -> Self {
+        Self { code: win32_rt::unwind::STATUS_ACCESS_VIOLATION, address, write }
+    }
+
+    pub(super) fn ud() -> Self {
+        Self { code: win32_rt::unwind::STATUS_ILLEGAL_INSTRUCTION, address: u64::MAX, write: false }
     }
 
     pub(super) unsafe fn dispatch(self, cpu: &mut Cpu, ip: u64) {
@@ -32,11 +41,9 @@ impl Fault {
             return;
         }
         use win32_rt::unwind;
-        let mut rec = unwind::guest_exception_record(
-            unwind::STATUS_ACCESS_VIOLATION,
-            ip,
-            &[self.write as u64, self.address],
-        );
+        let av_info = [self.write as u64, self.address];
+        let info: &[u64] = if self.code == unwind::STATUS_ACCESS_VIOLATION { &av_info } else { &[] };
+        let mut rec = unwind::guest_exception_record(self.code, ip, info);
         let mut ctx = unwind::guest_context(&cpu.gpr, &cpu.xmm, ip, cpu.rflags());
         ctx.mx_csr = cpu.jx.mxcsr;
         ctx.flt_save[24..28].copy_from_slice(&cpu.jx.mxcsr.to_le_bytes());
@@ -72,7 +79,7 @@ impl Area {
         if is_valid_guest_range(addr, N) && win32_rt::crash::safe_read(addr, &mut buf) {
             Ok(buf)
         } else {
-            Err(Fault { address: addr, write: false })
+            Err(Fault::pf(addr, false))
         }
     }
 
@@ -88,7 +95,7 @@ impl Area {
         {
             Ok(())
         } else {
-            Err(Fault { address: addr, write: true })
+            Err(Fault::pf(addr, true))
         }
     }
 }
@@ -159,7 +166,7 @@ impl Cpu {
         }
         let restore = matches!(mn, Fxrstor | Fxrstor64 | Xrstor | Xrstor64);
         if !is_valid_guest_range(area.0, 1) {
-            return Err(Fault { address: area.0, write: !restore });
+            return Err(Fault::pf(area.0, !restore));
         }
         if restore {
             return self.restore_state(&area, mask, legacy, wide);

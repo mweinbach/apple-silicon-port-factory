@@ -278,6 +278,7 @@ fn vop_of(ins: &Instruction) -> Option<(u8, u8, u8, bool, Option<usize>)> {
         M::Packusdw | M::Vpackusdw => s(VS_PACKUSDW),
         M::Pshufd | M::Vpshufd => s(VS_PSHUFD),
         M::Vpermilps => s(if imm_form { VS_PSHUFD } else { VS_VPERMILPS }),
+        M::Vpermilpd => s(if imm_form { VS_VPERMILPD_I } else { VS_VPERMILPD }),
         M::Pshuflw | M::Vpshuflw => s(VS_PSHUFLW),
         M::Pshufhw | M::Vpshufhw => s(VS_PSHUFHW),
         M::Shufps | M::Vshufps => s(VS_SHUFPS),
