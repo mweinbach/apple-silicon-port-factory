@@ -57,6 +57,24 @@ const WTD_CHOICE_CERT: u32 = 5;
 const WTD_STATEACTION_VERIFY: u32 = 1;
 const WTD_STATEACTION_CLOSE: u32 = 2;
 
+// WINTRUST_DATA.fdwRevocationChecks (+0x1C)
+const WTD_REVOKE_NONE: u32 = 0x0000_0000;
+const WTD_REVOKE_WHOLECHAIN: u32 = 0x0000_0001;
+
+// WINTRUST_DATA.dwProvFlags (+0x48, when cbStruct >= 0x4C)
+const WTD_REVOCATION_CHECK_NONE: u32 = 0x0000_0010;
+const WTD_REVOCATION_CHECK_END_CERT: u32 = 0x0000_0020;
+const WTD_REVOCATION_CHECK_CHAIN: u32 = 0x0000_0040;
+const WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT: u32 = 0x0000_0080;
+const WTD_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_1000;
+
+// CertGetCertificateChain dwFlags mapped from WINTRUST_DATA revocation fields
+const CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_0004;
+const CERT_CHAIN_REVOCATION_CHECK_END_CERT: u32 = 0x1000_0000;
+const CERT_CHAIN_REVOCATION_CHECK_CHAIN: u32 = 0x2000_0000;
+const CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT: u32 = 0x4000_0000;
+const CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY: u32 = 0x8000_0000;
+
 const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
 const X509_ASN_ENCODING: u32 = 1;
 
@@ -1684,11 +1702,41 @@ fn verify_standalone_pkcs7(
 /// Validate the signer certificate of a cryptographically verified PKCS#7 message against
 /// Windows trust chain & policy rules, supplying all embedded PKCS#7 certificates as
 /// intermediate candidates.
+/// Map `WINTRUST_DATA.fdwRevocationChecks` (+0x1C) and `WINTRUST_DATA.dwProvFlags` (+0x48)
+/// into the corresponding `CertGetCertificateChain` `dwFlags` revocation bits.
+fn map_wintrust_revocation_flags(fdw_revocation_checks: u32, dw_prov_flags: u32) -> u32 {
+    let mut chain_flags = 0u32;
+    if (dw_prov_flags & WTD_REVOCATION_CHECK_END_CERT) != 0 {
+        chain_flags |= CERT_CHAIN_REVOCATION_CHECK_END_CERT;
+    }
+    if (dw_prov_flags & WTD_REVOCATION_CHECK_CHAIN) != 0 {
+        chain_flags |= CERT_CHAIN_REVOCATION_CHECK_CHAIN;
+    }
+    if (dw_prov_flags & WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT) != 0 {
+        chain_flags |= CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
+    }
+    if chain_flags == 0
+        && (dw_prov_flags & WTD_REVOCATION_CHECK_NONE) == 0
+        && (fdw_revocation_checks == WTD_REVOKE_WHOLECHAIN
+            || fdw_revocation_checks != WTD_REVOKE_NONE)
+    {
+        // WTD_REVOKE_WHOLECHAIN (or any non-zero fdwRevocationChecks) checks the whole chain
+        // excluding the trusted root, matching Windows WinTrust semantics.
+        chain_flags |= CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
+    }
+    if (dw_prov_flags & WTD_CACHE_ONLY_URL_RETRIEVAL) != 0 {
+        chain_flags |=
+            CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY;
+    }
+    chain_flags
+}
+
 unsafe fn verify_pkcs7_signer_chain(
     verified: &VerifiedAuthenticode,
     all_certs_der: &[Vec<u8>],
     policy_oid: usize,
     policy_extra: *const c_void,
+    chain_flags: u32,
 ) -> i32 {
     let Some(leaf) = verified.certs.first() else {
         return TRUST_E_NOSIGNATURE;
@@ -1722,6 +1770,7 @@ unsafe fn verify_pkcs7_signer_chain(
         std::ptr::null(),
         policy_oid,
         policy_extra,
+        chain_flags,
     );
     if !extra_store.is_null() {
         super::crypt32::CertCloseStore(extra_store, 0);
@@ -1965,6 +2014,7 @@ unsafe fn verify_cert_via_chain_policy(
     p_time: *const c_void,
     policy_oid: usize,
     policy_extra: *const c_void,
+    chain_flags: u32,
 ) -> i32 {
     if cert_ctx.is_null() {
         return TRUST_E_NOSIGNATURE;
@@ -1998,7 +2048,7 @@ unsafe fn verify_cert_via_chain_policy(
         p_time,
         extra_store,
         std::ptr::null(),
-        0,
+        chain_flags,
         std::ptr::null_mut(),
         &mut chain_ctx,
     );
@@ -2078,11 +2128,18 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
     if cb_struct < 0x40 {
         return TRUST_E_PROVIDER_UNKNOWN;
     }
+    let fdw_revocation_checks = std::ptr::read_unaligned(base.add(0x1C) as *const u32);
     let union_choice = std::ptr::read_unaligned(base.add(0x20) as *const u32);
     let p_union = std::ptr::read_unaligned(base.add(0x28) as *const *const u8);
     let state_action = std::ptr::read_unaligned(base.add(0x30) as *const u32);
     let state_data_slot = (data as *mut u8).add(0x38) as *mut *mut c_void;
     let cur_state = std::ptr::read_unaligned(state_data_slot);
+    let dw_prov_flags = if cb_struct >= 0x4C {
+        std::ptr::read_unaligned(base.add(0x48) as *const u32)
+    } else {
+        0
+    };
+    let chain_flags = map_wintrust_revocation_flags(fdw_revocation_checks, dw_prov_flags);
 
     if state_action == WTD_STATEACTION_CLOSE {
         if !cur_state.is_null() {
@@ -2177,6 +2234,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                         &all_der,
                         chain_policy_oid,
                         policy_extra,
+                        chain_flags,
                     );
                     if state_action == WTD_STATEACTION_VERIFY {
                         let h = alloc_provider_state(verified, data);
@@ -2288,6 +2346,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 &p7.all_certs_der,
                 chain_policy_oid,
                 policy_extra,
+                chain_flags,
             );
             if state_action == WTD_STATEACTION_VERIFY {
                 let h = alloc_provider_state(p7.verified, data);
@@ -2323,6 +2382,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                             &p7.all_certs_der,
                             chain_policy_oid,
                             policy_extra,
+                            chain_flags,
                         );
                         if state_action == WTD_STATEACTION_VERIFY {
                             let h = alloc_provider_state(p7.verified, data);
@@ -2344,6 +2404,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                                 &all_der,
                                 chain_policy_oid,
                                 policy_extra,
+                                chain_flags,
                             );
                             if state_action == WTD_STATEACTION_VERIFY {
                                 let h = alloc_provider_state(verified, data);
@@ -2361,6 +2422,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                                 &p7.all_certs_der,
                                 chain_policy_oid,
                                 policy_extra,
+                                chain_flags,
                             );
                             if state_action == WTD_STATEACTION_VERIFY {
                                 let h = alloc_provider_state(p7.verified, data);
@@ -2430,6 +2492,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 std::ptr::null(),
                 chain_policy_oid,
                 policy_extra,
+                chain_flags,
             );
             super::crypt32::CertFreeCertificateContext(found_cert);
             rc
@@ -2464,6 +2527,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 p_time,
                 chain_policy_oid,
                 policy_extra,
+                chain_flags,
             )
         }
         other => {
@@ -2874,7 +2938,7 @@ mod tests {
                 ),
                 0x800B_010Fu32 as i32, // CERT_E_CN_NO_MATCH
             );
-            // Matching SAN hostname passes
+            // Matching SAN hostname passes when revocation check is WTD_REVOKE_NONE
             std::ptr::write_unaligned(
                 https_para.as_mut_ptr().add(0x10) as *mut *const u16,
                 right_host_w.as_ptr(),
@@ -2887,6 +2951,87 @@ mod tests {
                 ),
                 ERROR_SUCCESS,
             );
+            // Requested revocation checks (via either fdwRevocationChecks or dwProvFlags) MUST
+            // fail closed when positive revocation status cannot be obtained, rather than returning
+            // ERROR_SUCCESS.
+            assert_eq!(map_wintrust_revocation_flags(WTD_REVOKE_NONE, 0), 0);
+            assert_eq!(
+                map_wintrust_revocation_flags(WTD_REVOKE_WHOLECHAIN, 0),
+                CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT
+            );
+            assert_eq!(
+                map_wintrust_revocation_flags(WTD_REVOKE_WHOLECHAIN, WTD_REVOCATION_CHECK_NONE),
+                0
+            );
+            assert_eq!(
+                map_wintrust_revocation_flags(
+                    WTD_REVOKE_NONE,
+                    WTD_REVOCATION_CHECK_END_CERT | WTD_CACHE_ONLY_URL_RETRIEVAL
+                ),
+                CERT_CHAIN_REVOCATION_CHECK_END_CERT
+                    | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL
+                    | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY
+            );
+            assert_eq!(
+                map_wintrust_revocation_flags(WTD_REVOKE_NONE, WTD_REVOCATION_CHECK_CHAIN),
+                CERT_CHAIN_REVOCATION_CHECK_CHAIN
+            );
+            assert_eq!(
+                map_wintrust_revocation_flags(
+                    WTD_REVOKE_NONE,
+                    WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT
+                ),
+                CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT
+            );
+
+            // 1) fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN -> fails closed
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x1C) as *mut u32,
+                WTD_REVOKE_WHOLECHAIN,
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                crate::misc::crypt32::CRYPT_E_REVOCATION_OFFLINE as i32,
+            );
+            // 2) dwProvFlags = WTD_REVOCATION_CHECK_NONE disables revocation checking
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x48) as *mut u32,
+                WTD_REVOCATION_CHECK_NONE,
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS,
+            );
+            // 3) Each WTD_REVOCATION_CHECK_* mode in dwProvFlags fails closed when offline/unknown
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x1C) as *mut u32, WTD_REVOKE_NONE);
+            for prov_flag in [
+                WTD_REVOCATION_CHECK_END_CERT,
+                WTD_REVOCATION_CHECK_CHAIN,
+                WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+                WTD_REVOCATION_CHECK_END_CERT | WTD_CACHE_ONLY_URL_RETRIEVAL,
+            ] {
+                std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x48) as *mut u32, prov_flag);
+                assert_eq!(
+                    WinVerifyTrust(
+                        std::ptr::null_mut(),
+                        HTTPSPROV_ACTION.as_ptr(),
+                        wtd.as_mut_ptr() as *mut c_void,
+                    ),
+                    crate::misc::crypt32::CRYPT_E_REVOCATION_OFFLINE as i32,
+                    "dwProvFlags={prov_flag:#x} must fail closed when revocation is unavailable"
+                );
+            }
+            // Reset revocation fields before subsequent tests
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x1C) as *mut u32, WTD_REVOKE_NONE);
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x48) as *mut u32, 0u32);
             // Truncated HTTPSPolicyCallbackData -> E_INVALIDARG
             std::ptr::write_unaligned(https_para.as_mut_ptr() as *mut u32, 8u32);
             assert_eq!(

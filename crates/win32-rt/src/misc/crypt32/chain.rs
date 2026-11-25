@@ -66,6 +66,7 @@ mod apple_trust {
         #[cfg(target_os = "macos")]
         fn CFNumberGetValue(number: *const c_void, the_type: isize, value_ptr: *mut c_void) -> u8;
         fn CFDateCreate(allocator: *const c_void, at: f64) -> *const c_void;
+        fn CFErrorGetCode(err: *const c_void) -> isize;
         fn CFStringCreateWithBytes(
             alloc: *const c_void,
             bytes: *const u8,
@@ -77,6 +78,7 @@ mod apple_trust {
 
     #[link(name = "Security", kind = "framework")]
     extern "C" {
+        static kSecTrustRevocationChecked: *const c_void;
         fn SecCertificateCreateWithData(
             allocator: *const c_void,
             data: *const c_void,
@@ -85,12 +87,14 @@ mod apple_trust {
         fn SecCertificateCopyData(certificate: *const c_void) -> *const c_void;
         fn SecPolicyCreateBasicX509() -> *const c_void;
         fn SecPolicyCreateSSL(server: u8, hostname: *const c_void) -> *const c_void;
+        fn SecPolicyCreateRevocation(revocation_flags: usize) -> *const c_void;
         fn SecTrustCreateWithCertificates(
             certificates: *const c_void,
             policies: *const c_void,
             trust: *mut *const c_void,
         ) -> i32;
         fn SecTrustSetVerifyDate(trust: *const c_void, verify_date: *const c_void) -> i32;
+        fn SecTrustSetNetworkFetchAllowed(trust: *const c_void, allow_fetch: u8) -> i32;
         fn SecTrustSetAnchorCertificates(
             trust: *const c_void,
             anchor_certificates: *const c_void,
@@ -547,6 +551,162 @@ mod apple_trust {
             !ev_val.is_null() && CFBooleanGetValue(ev_val) != 0
         }
     }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum RevocationCheckResult {
+        VerifiedGood,
+        Revoked,
+        OfflineOrUnknown,
+    }
+
+    /// Evaluate certificate revocation via Apple Security.framework (`SecPolicyCreateRevocation`
+    /// with `kSecRevocationUseAnyAvailableMethod | kSecRevocationRequirePositiveResponse`).
+    /// Fails closed (`OfflineOrUnknown` or `Revoked`) unless Apple's trust engine positively
+    /// confirms non-revoked status AND sets `kSecTrustRevocationChecked = true`.
+    pub fn evaluate_sec_trust_revocation(
+        chain_der: &[Vec<u8>],
+        exclusive_anchors: Option<&[Vec<u8>]>,
+        extra_anchors: &[Vec<u8>],
+        verify_unix_secs: Option<f64>,
+        cache_only: bool,
+    ) -> RevocationCheckResult {
+        const K_SEC_REVOCATION_USE_ANY: usize = (1 << 0) | (1 << 1);
+        const K_SEC_REVOCATION_REQUIRE_POSITIVE: usize = 1 << 3;
+        const K_SEC_REVOCATION_NETWORK_DISABLED: usize = 1 << 4;
+        const ERR_SEC_CERTIFICATE_REVOKED: isize = -67820;
+
+        if chain_der.is_empty() {
+            return RevocationCheckResult::OfflineOrUnknown;
+        }
+        unsafe {
+            let mut cert_guards = Vec::with_capacity(chain_der.len());
+            let mut cert_ptrs = Vec::with_capacity(chain_der.len());
+            for der in chain_der {
+                let d = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len() as isize);
+                if d.is_null() {
+                    continue;
+                }
+                let _dg = CfRef(d);
+                let c = SecCertificateCreateWithData(kCFAllocatorDefault, d);
+                if !c.is_null() {
+                    cert_ptrs.push(c);
+                    cert_guards.push(CfRef(c));
+                }
+            }
+            if cert_ptrs.is_empty() {
+                return RevocationCheckResult::OfflineOrUnknown;
+            }
+            let cf_certs = CFArrayCreate(
+                kCFAllocatorDefault,
+                cert_ptrs.as_ptr(),
+                cert_ptrs.len() as isize,
+                std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+            );
+            if cf_certs.is_null() {
+                return RevocationCheckResult::OfflineOrUnknown;
+            }
+            let _certs_g = CfRef(cf_certs);
+
+            let basic_policy = SecPolicyCreateBasicX509();
+            if basic_policy.is_null() {
+                return RevocationCheckResult::OfflineOrUnknown;
+            }
+            let _bp_g = CfRef(basic_policy);
+
+            let mut rev_flags = K_SEC_REVOCATION_USE_ANY | K_SEC_REVOCATION_REQUIRE_POSITIVE;
+            if cache_only {
+                rev_flags |= K_SEC_REVOCATION_NETWORK_DISABLED;
+            }
+            let rev_policy = SecPolicyCreateRevocation(rev_flags);
+            if rev_policy.is_null() {
+                return RevocationCheckResult::OfflineOrUnknown;
+            }
+            let _rp_g = CfRef(rev_policy);
+
+            let pol_ptrs = [basic_policy, rev_policy];
+            let cf_policies = CFArrayCreate(
+                kCFAllocatorDefault,
+                pol_ptrs.as_ptr(),
+                pol_ptrs.len() as isize,
+                std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+            );
+            if cf_policies.is_null() {
+                return RevocationCheckResult::OfflineOrUnknown;
+            }
+            let _pols_g = CfRef(cf_policies);
+
+            let mut trust: *const c_void = std::ptr::null();
+            if SecTrustCreateWithCertificates(cf_certs, cf_policies, &mut trust) != 0
+                || trust.is_null()
+            {
+                return RevocationCheckResult::OfflineOrUnknown;
+            }
+            let _trust_g = CfRef(trust);
+
+            let _ = SecTrustSetNetworkFetchAllowed(trust, u8::from(!cache_only));
+            if let Some(unix_s) = verify_unix_secs {
+                let cf_abs = unix_s - 978_307_200.0;
+                let date = CFDateCreate(kCFAllocatorDefault, cf_abs);
+                if !date.is_null() {
+                    let _dg = CfRef(date);
+                    let _ = SecTrustSetVerifyDate(trust, date);
+                }
+            }
+
+            let anchor_slice = exclusive_anchors.unwrap_or(extra_anchors);
+            if exclusive_anchors.is_some() || !anchor_slice.is_empty() {
+                let mut a_guards = Vec::with_capacity(anchor_slice.len());
+                let mut a_ptrs = Vec::with_capacity(anchor_slice.len());
+                for der in anchor_slice {
+                    let d = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len() as isize);
+                    if d.is_null() {
+                        continue;
+                    }
+                    let _dg = CfRef(d);
+                    let c = SecCertificateCreateWithData(kCFAllocatorDefault, d);
+                    if !c.is_null() {
+                        a_ptrs.push(c);
+                        a_guards.push(CfRef(c));
+                    }
+                }
+                let cf_anchors = CFArrayCreate(
+                    kCFAllocatorDefault,
+                    a_ptrs.as_ptr(),
+                    a_ptrs.len() as isize,
+                    std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+                );
+                if !cf_anchors.is_null() {
+                    let _ag = CfRef(cf_anchors);
+                    let _ = SecTrustSetAnchorCertificates(trust, cf_anchors);
+                    let _ = SecTrustSetAnchorCertificatesOnly(
+                        trust,
+                        u8::from(exclusive_anchors.is_some()),
+                    );
+                }
+            }
+
+            let mut cf_err: *const c_void = std::ptr::null();
+            let ok = SecTrustEvaluateWithError(trust, &mut cf_err);
+            let _eg = CfRef(cf_err);
+            if ok != 0 {
+                let result_dict = SecTrustCopyResult(trust);
+                if result_dict.is_null() {
+                    return RevocationCheckResult::OfflineOrUnknown;
+                }
+                let _rdg = CfRef(result_dict);
+                let checked = CFDictionaryGetValue(result_dict, kSecTrustRevocationChecked);
+                if !checked.is_null() && CFBooleanGetValue(checked) != 0 {
+                    RevocationCheckResult::VerifiedGood
+                } else {
+                    RevocationCheckResult::OfflineOrUnknown
+                }
+            } else if !cf_err.is_null() && CFErrorGetCode(cf_err) == ERR_SEC_CERTIFICATE_REVOKED {
+                RevocationCheckResult::Revoked
+            } else {
+                RevocationCheckResult::OfflineOrUnknown
+            }
+        }
+    }
 }
 
 pub(super) fn macos_system_roots_der() -> &'static [Vec<u8>] {
@@ -580,8 +740,22 @@ const CERT_CHAIN_POLICY_IGNORE_ALL_NOT_TIME_VALID_FLAGS: u32 = 0x0000_0007;
 pub(super) const CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG: u32 = 0x0000_0010;
 const CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG: u32 = 0x0000_0020;
 const CERT_CHAIN_POLICY_IGNORE_INVALID_NAME_FLAG: u32 = 0x0000_0040;
+const CERT_CHAIN_POLICY_IGNORE_END_REV_UNKNOWN_FLAG: u32 = 0x0000_0100;
+const CERT_CHAIN_POLICY_IGNORE_CA_REV_UNKNOWN_FLAG: u32 = 0x0000_0400;
+const CERT_CHAIN_POLICY_IGNORE_ROOT_REV_UNKNOWN_FLAG: u32 = 0x0000_0800;
+const SECURITY_FLAG_IGNORE_REVOCATION: u32 = 0x0000_0080;
 
-// Windows CERT_E_* verification status codes
+// CertGetCertificateChain dwFlags
+const CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_0004;
+const CERT_CHAIN_REVOCATION_CHECK_END_CERT: u32 = 0x1000_0000;
+const CERT_CHAIN_REVOCATION_CHECK_CHAIN: u32 = 0x2000_0000;
+const CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT: u32 = 0x4000_0000;
+const CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY: u32 = 0x8000_0000;
+const CERT_CHAIN_REVOCATION_CHECK_MASK: u32 = CERT_CHAIN_REVOCATION_CHECK_END_CERT
+    | CERT_CHAIN_REVOCATION_CHECK_CHAIN
+    | CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
+
+// Windows CERT_E_* / CRYPT_E_* verification status codes
 pub(crate) const CERT_E_EXPIRED: u32 = 0x800B_0101;
 pub(crate) const CERT_E_UNTRUSTEDROOT: u32 = 0x800B_0109;
 pub(crate) const CERT_E_CHAINING: u32 = 0x800B_010A;
@@ -589,13 +763,17 @@ pub(crate) const CERT_E_REVOKED: u32 = 0x800B_010C;
 pub(crate) const CERT_E_CN_NO_MATCH: u32 = 0x800B_010F;
 pub(crate) const CERT_E_WRONG_USAGE: u32 = 0x800B_0110;
 pub(crate) const CERT_E_UNTRUSTEDCA: u32 = 0x800B_0112;
+pub(crate) const CRYPT_E_NO_REVOCATION_CHECK: u32 = 0x8009_2012;
+pub(crate) const CRYPT_E_REVOCATION_OFFLINE: u32 = 0x8009_2013;
 
 // CERT_TRUST_STATUS.dwErrorStatus bits
 const CERT_TRUST_IS_NOT_TIME_VALID: u32 = 0x0000_0001;
 const CERT_TRUST_IS_REVOKED: u32 = 0x0000_0004;
-const CERT_TRUST_IS_UNTRUSTED_ROOT: u32 = 0x0000_0020;
-const CERT_TRUST_IS_PARTIAL_CHAIN: u32 = 0x0001_0000;
 const CERT_TRUST_IS_NOT_VALID_FOR_USAGE: u32 = 0x0000_0010;
+const CERT_TRUST_IS_UNTRUSTED_ROOT: u32 = 0x0000_0020;
+const CERT_TRUST_REVOCATION_STATUS_UNKNOWN: u32 = 0x0000_0040;
+const CERT_TRUST_IS_PARTIAL_CHAIN: u32 = 0x0001_0000;
+const CERT_TRUST_IS_OFFLINE_REVOCATION: u32 = 0x0100_0000;
 
 // ---------------------------------------------------------------------------
 // Chain engine & chain registries (backed by `HandleTable`)
@@ -620,6 +798,8 @@ struct RegisteredChain {
     exclusive_roots_der: Option<Vec<Vec<u8>>>,
     extra_roots_der: Vec<Vec<u8>>,
     default_chain_error: u32,
+    revocation_flags: u32,
+    revocation_error: u32,
 }
 
 unsafe impl Send for RegisteredChain {}
@@ -1087,6 +1267,10 @@ fn cert_error_to_trust_status(cert_error: u32) -> u32 {
         CERT_E_UNTRUSTEDROOT => CERT_TRUST_IS_UNTRUSTED_ROOT,
         CERT_E_WRONG_USAGE => CERT_TRUST_IS_NOT_VALID_FOR_USAGE,
         CERT_E_CHAINING => CERT_TRUST_IS_PARTIAL_CHAIN,
+        CRYPT_E_NO_REVOCATION_CHECK => CERT_TRUST_REVOCATION_STATUS_UNKNOWN,
+        CRYPT_E_REVOCATION_OFFLINE => {
+            CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION
+        }
         // Hostname mismatch is evaluated at SSL policy time, not raw chain status.
         CERT_E_CN_NO_MATCH => 0,
         _ => CERT_TRUST_IS_UNTRUSTED_ROOT,
@@ -1227,6 +1411,10 @@ fn trust_status_to_cert_error(dw_error_status: u32) -> u32 {
         CERT_E_WRONG_USAGE
     } else if (dw_error_status & CERT_TRUST_IS_PARTIAL_CHAIN) != 0 {
         CERT_E_CHAINING
+    } else if (dw_error_status & CERT_TRUST_IS_OFFLINE_REVOCATION) != 0 {
+        CRYPT_E_REVOCATION_OFFLINE
+    } else if (dw_error_status & CERT_TRUST_REVOCATION_STATUS_UNKNOWN) != 0 {
+        CRYPT_E_NO_REVOCATION_CHECK
     } else {
         CERT_E_UNTRUSTEDROOT
     }
@@ -1346,6 +1534,7 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
     p_cert_context: *const c_void,
     p_time: *const c_void,
     h_additional_store: *mut c_void,
+    dw_flags: u32,
     pp_chain_context: *mut *mut c_void,
 ) -> BOOL {
     if p_cert_context.is_null() || pp_chain_context.is_null() {
@@ -1442,7 +1631,55 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
         return FALSE;
     }
 
-    let mut trust_err_bits = cert_error_to_trust_status(default_chain_error);
+    // Evaluate certificate revocation when requested via CERT_CHAIN_REVOCATION_CHECK_* flags.
+    // Fails closed with CRYPT_E_REVOCATION_OFFLINE / CRYPT_E_NO_REVOCATION_CHECK (or CERT_E_REVOKED)
+    // whenever positive non-revoked status cannot be confirmed for the requested scope.
+    let revocation_flags = dw_flags
+        & (CERT_CHAIN_REVOCATION_CHECK_MASK
+            | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY
+            | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL);
+    let revocation_error: u32 = if (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_MASK) != 0 {
+        let cache_only = (revocation_flags
+            & (CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL))
+            != 0;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let outcome = apple_trust::evaluate_sec_trust_revocation(
+            &chain_der,
+            exclusive_roots_der.as_deref(),
+            &extra_roots_der,
+            Some(verify_unix.as_secs() as f64),
+            cache_only,
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let outcome = {
+            let _ = cache_only;
+            0u8
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        match outcome {
+            apple_trust::RevocationCheckResult::VerifiedGood => {
+                // Apple Security.framework checks leaf + intermediate CAs, not self-signed roots.
+                // CERT_CHAIN_REVOCATION_CHECK_CHAIN explicitly requires checking the root as well.
+                if (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_CHAIN) != 0 {
+                    CRYPT_E_NO_REVOCATION_CHECK
+                } else {
+                    0
+                }
+            }
+            apple_trust::RevocationCheckResult::Revoked => CERT_E_REVOKED,
+            apple_trust::RevocationCheckResult::OfflineOrUnknown => CRYPT_E_REVOCATION_OFFLINE,
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let _ = outcome;
+            CRYPT_E_REVOCATION_OFFLINE
+        }
+    } else {
+        0
+    };
+
+    let mut trust_err_bits =
+        cert_error_to_trust_status(default_chain_error) | cert_error_to_trust_status(revocation_error);
     let mut elements = Vec::with_capacity(owned_certs.len());
     let mut element_ptrs = Vec::with_capacity(owned_certs.len());
     for (idx, cert) in owned_certs.iter().enumerate() {
@@ -1521,6 +1758,8 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
             exclusive_roots_der,
             extra_roots_der,
             default_chain_error,
+            revocation_flags,
+            revocation_error,
         },
     );
     std::ptr::write_unaligned(pp_chain_context, ctx_ptr as *mut c_void);
@@ -1590,25 +1829,39 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         return FALSE;
     }
 
-    let (chain_der, element_times, verify_ft, exclusive_roots, extra_roots, default_chain_error) =
-        if let Some(found) = CHAINS.with(p_chain_context as usize, |c| {
-            (
-                c.chain_der.clone(),
-                c.element_times.clone(),
-                c.verify_filetime,
-                c.exclusive_roots_der.clone(),
-                c.extra_roots_der.clone(),
-                c.default_chain_error,
-            )
-        }) {
-            found
-        } else {
-            let Some((ders, times, ext_err)) = extract_external_chain(p_chain_context) else {
-                crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
-                return FALSE;
-            };
-            (ders, times, None, None, Vec::new(), ext_err)
+    let (
+        chain_der,
+        element_times,
+        verify_ft,
+        exclusive_roots,
+        extra_roots,
+        default_chain_error,
+        revocation_flags,
+        revocation_error,
+    ) = if let Some(found) = CHAINS.with(p_chain_context as usize, |c| {
+        (
+            c.chain_der.clone(),
+            c.element_times.clone(),
+            c.verify_filetime,
+            c.exclusive_roots_der.clone(),
+            c.extra_roots_der.clone(),
+            c.default_chain_error,
+            c.revocation_flags,
+            c.revocation_error,
+        )
+    }) {
+        found
+    } else {
+        let Some((ders, times, ext_err)) = extract_external_chain(p_chain_context) else {
+            crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+            return FALSE;
         };
+        let ext_rev_err = match ext_err {
+            CERT_E_REVOKED | CRYPT_E_REVOCATION_OFFLINE | CRYPT_E_NO_REVOCATION_CHECK => ext_err,
+            _ => 0,
+        };
+        (ders, times, None, None, Vec::new(), ext_err, 0, ext_rev_err)
+    };
 
     let (dw_flags, extra_ptr) = if !p_policy_para.is_null() {
         let para = std::ptr::read_unaligned(p_policy_para as *const CertChainPolicyPara);
@@ -1648,7 +1901,49 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         .iter()
         .position(|&(nb, na)| (nb > 0 && check_ft < nb) || (na > 0 && check_ft > na));
 
-    let (err_code, elem_idx): (u32, i32) = match policy_id {
+    let effective_rev_err: u32 = {
+        let rev_err = if default_chain_error == CERT_E_REVOKED || revocation_error == CERT_E_REVOKED
+        {
+            CERT_E_REVOKED
+        } else {
+            revocation_error
+        };
+        if rev_err == 0 || rev_err == CERT_E_REVOKED {
+            rev_err
+        } else if policy_id == CERT_CHAIN_POLICY_SSL
+            && (fdw_checks & SECURITY_FLAG_IGNORE_REVOCATION) != 0
+        {
+            0
+        } else if rev_err == CRYPT_E_NO_REVOCATION_CHECK
+            && (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_CHAIN) != 0
+            && (dw_flags & CERT_CHAIN_POLICY_IGNORE_ROOT_REV_UNKNOWN_FLAG) != 0
+        {
+            0
+        } else {
+            let ignore_end = (dw_flags & CERT_CHAIN_POLICY_IGNORE_END_REV_UNKNOWN_FLAG) != 0;
+            let ignore_ca_rev = (dw_flags & CERT_CHAIN_POLICY_IGNORE_CA_REV_UNKNOWN_FLAG) != 0;
+            let ignore_root_rev = (dw_flags & CERT_CHAIN_POLICY_IGNORE_ROOT_REV_UNKNOWN_FLAG) != 0;
+            let ignored = if (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_END_CERT) != 0
+                && (revocation_flags
+                    & (CERT_CHAIN_REVOCATION_CHECK_CHAIN
+                        | CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT))
+                    == 0
+            {
+                ignore_end
+            } else if (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_CHAIN) != 0 {
+                ignore_end && ignore_ca_rev && ignore_root_rev
+            } else {
+                ignore_end && ignore_ca_rev
+            };
+            if ignored {
+                0
+            } else {
+                rev_err
+            }
+        }
+    };
+
+    let (mut err_code, mut elem_idx): (u32, i32) = match policy_id {
         CERT_CHAIN_POLICY_SSL => {
             let mut raw = verify_chain_webpki_at(
                 &chain_der,
@@ -1972,6 +2267,21 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         }
         _ => unreachable!(),
     };
+
+    // Confirmed revocation (CERT_E_REVOKED) always takes precedence across trust policies;
+    // un-ignored offline/unknown revocation errors fail closed whenever other checks pass.
+    if policy_id != CERT_CHAIN_POLICY_BASIC_CONSTRAINTS && effective_rev_err != 0 {
+        if effective_rev_err == CERT_E_REVOKED || err_code == 0 {
+            err_code = effective_rev_err;
+            elem_idx = if effective_rev_err == CRYPT_E_NO_REVOCATION_CHECK
+                && (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_CHAIN) != 0
+            {
+                chain_der.len().saturating_sub(1) as i32
+            } else {
+                0
+            };
+        }
+    }
 
     let mut status = std::ptr::read_unaligned(p_policy_status as *const CertChainPolicyStatus);
     status.dw_error = err_code;

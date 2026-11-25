@@ -676,6 +676,154 @@ fn cert_open_store_system_and_find_all_types() {
 }
 
 #[test]
+fn cert_chain_revocation_flags_fail_closed_and_respect_ignore_flags() {
+    use super::chain::{CRYPT_E_REVOCATION_OFFLINE, CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG};
+    const CERT_CHAIN_REVOCATION_CHECK_END_CERT: u32 = 0x1000_0000;
+    const CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT: u32 = 0x4000_0000;
+    const CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY: u32 = 0x8000_0000;
+    const CERT_TRUST_REVOCATION_STATUS_UNKNOWN: u32 = 0x0000_0040;
+    const CERT_TRUST_IS_OFFLINE_REVOCATION: u32 = 0x0100_0000;
+    const CERT_CHAIN_POLICY_IGNORE_END_REV_UNKNOWN_FLAG: u32 = 0x0000_0100;
+    const CERT_CHAIN_POLICY_IGNORE_CA_REV_UNKNOWN_FLAG: u32 = 0x0000_0400;
+
+    unsafe {
+        let cs_der = build_synthetic_cert(
+            "Revocation Test Signer",
+            "Revocation Test Signer",
+            b"200101000000Z",
+            b"400101000000Z",
+            None,
+            &[&[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03]],
+        );
+        let ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            cs_der.as_ptr(),
+            cs_der.len() as u32,
+        );
+        assert!(!ctx.is_null());
+
+        let mut chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                ctx,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT
+                    | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY,
+                std::ptr::null_mut(),
+                &mut chain,
+            ),
+            TRUE
+        );
+        assert!(!chain.is_null());
+        let cc = std::ptr::read_unaligned(chain as *const crate::misc::wintrust::CertChainContext);
+        assert_ne!(
+            cc.trust_status.dw_error_status
+                & (CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION),
+            0,
+            "chain status must record unknown/offline revocation when positive check fails"
+        );
+
+        // Even with ALLOW_UNKNOWN_CA, AUTHENTICODE and BASE must fail closed on offline revocation
+        let mut st: CertChainPolicyStatus = std::mem::zeroed();
+        st.cb_size = std::mem::size_of::<CertChainPolicyStatus>() as u32;
+        let para_ca_only = CertChainPolicyPara {
+            cb_size: 16,
+            dw_flags: CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG,
+            pv_extra_policy_para: std::ptr::null(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_AUTHENTICODE as *const u8,
+                chain,
+                &para_ca_only as *const _ as *const c_void,
+                &mut st as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(st.dw_error, CRYPT_E_REVOCATION_OFFLINE);
+
+        // Ignoring only END_REV_UNKNOWN is insufficient for CHAIN_EXCLUDE_ROOT (needs CA too)
+        let para_end_only = CertChainPolicyPara {
+            cb_size: 16,
+            dw_flags: CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG
+                | CERT_CHAIN_POLICY_IGNORE_END_REV_UNKNOWN_FLAG,
+            pv_extra_policy_para: std::ptr::null(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_AUTHENTICODE as *const u8,
+                chain,
+                &para_end_only as *const _ as *const c_void,
+                &mut st as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(st.dw_error, CRYPT_E_REVOCATION_OFFLINE);
+
+        // Ignoring both END and CA revocation unknown clears the offline revocation error
+        let para_both = CertChainPolicyPara {
+            cb_size: 16,
+            dw_flags: CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG
+                | CERT_CHAIN_POLICY_IGNORE_END_REV_UNKNOWN_FLAG
+                | CERT_CHAIN_POLICY_IGNORE_CA_REV_UNKNOWN_FLAG,
+            pv_extra_policy_para: std::ptr::null(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_AUTHENTICODE as *const u8,
+                chain,
+                &para_both as *const _ as *const c_void,
+                &mut st as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(st.dw_error, 0);
+        CertFreeCertificateChain(chain);
+
+        // END_CERT mode fails closed until IGNORE_END_REV_UNKNOWN is explicitly passed
+        let mut chain_end: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                ctx,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                CERT_CHAIN_REVOCATION_CHECK_END_CERT | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY,
+                std::ptr::null_mut(),
+                &mut chain_end,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASE as *const u8,
+                chain_end,
+                &para_ca_only as *const _ as *const c_void,
+                &mut st as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(st.dw_error, CRYPT_E_REVOCATION_OFFLINE);
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASE as *const u8,
+                chain_end,
+                &para_end_only as *const _ as *const c_void,
+                &mut st as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(st.dw_error, 0);
+        CertFreeCertificateChain(chain_end);
+        assert_eq!(CertFreeCertificateContext(ctx), TRUE);
+    }
+}
+
+#[test]
 fn cert_verify_policy_base_ssl_authenticode_validity_and_hostname() {
     unsafe {
         // 1. Expired leaf cert with wildcard SAN "*.example.org"
