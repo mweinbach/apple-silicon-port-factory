@@ -4291,6 +4291,7 @@ pub unsafe extern "win64" fn WSASendMsg(
 
 /// Outstanding async Winsock 1.1 lookup task registry for `WSACancelAsyncRequest`.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum AsyncTaskState {
     Pending,
     Completed,
