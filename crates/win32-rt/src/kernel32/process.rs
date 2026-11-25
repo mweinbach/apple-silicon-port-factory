@@ -222,17 +222,24 @@ impl ChildProcessObj {
     #[cfg(not(target_os = "ios"))]
     fn finish_reaped(&self, guest_code: Option<u32>, fallback_code: u32) {
         self.os_pid.store(0, Ordering::Release);
-        {
+        let newly_finished = {
             let g = handles::wait_lock();
             let slot = self.exit_code.get(&g);
             if slot.is_none() {
                 let term_code = *self.terminated_code.get(&g);
                 // Prefer an explicit 32-bit guest exit code if the child completed ExitProcess/return;
                 // otherwise prefer the 32-bit code passed to TerminateProcess over POSIX signal fallback.
-                *slot = Some(guest_code.or(term_code).unwrap_or(fallback_code));
+                let final_code = guest_code.or(term_code).unwrap_or(fallback_code);
+                *slot = Some(final_code);
+                Some(final_code)
+            } else {
+                None
             }
-        }
+        };
         handles::notify_object_key(handles::obj_key(self), usize::MAX);
+        if let Some(code) = newly_finished {
+            notify_jobs_of_child_exit(self.pid, code);
+        }
     }
 }
 
@@ -303,7 +310,7 @@ pub unsafe extern "win64" fn OpenProcess(_access: u32, inherit: BOOL, pid: u32) 
         return std::ptr::null_mut();
     }
     let found = {
-        let mut m = child_processes().lock().unwrap();
+        let mut m = crate::thread::defer_lock(child_processes());
         let obj = m.get(&pid).and_then(|w| w.upgrade());
         if obj.is_none() {
             m.remove(&pid);
@@ -483,30 +490,140 @@ pub unsafe extern "win64" fn WTSGetActiveConsoleSessionId() -> u32 {
     1
 }
 
-pub unsafe extern "win64" fn GetProcessAffinityMask(_h: HANDLE, proc_mask: *mut usize, sys_mask: *mut usize) -> BOOL {
+static PROCESS_AFFINITY_MASK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn system_affinity_mask() -> usize {
     let n = pr::num_cpus().min(64);
-    let m = if n == 64 { usize::MAX } else { (1usize << n) - 1 };
+    if n == 64 { usize::MAX } else { (1usize << n) - 1 }
+}
+
+pub fn current_process_affinity_mask() -> usize {
+    let v = PROCESS_AFFINITY_MASK.load(Ordering::Acquire);
+    if v == 0 { system_affinity_mask() } else { v }
+}
+
+pub unsafe extern "win64" fn GetProcessAffinityMask(h: HANDLE, proc_mask: *mut usize, sys_mask: *mut usize) -> BOOL {
+    if !is_self(h) {
+        if handles::get_as::<ChildProcessObj>(h).is_some() {
+            log::warn!("GetProcessAffinityMask: querying affinity mask of a child process is not supported");
+            set_err(err::ERROR_NOT_SUPPORTED);
+        } else {
+            set_err(err::ERROR_INVALID_HANDLE);
+        }
+        return FALSE;
+    }
+    let sm = system_affinity_mask();
+    let pm = current_process_affinity_mask() & sm;
     if !proc_mask.is_null() {
-        *proc_mask = m;
+        std::ptr::write_unaligned(proc_mask, if pm == 0 { sm } else { pm });
     }
     if !sys_mask.is_null() {
-        *sys_mask = m;
+        std::ptr::write_unaligned(sys_mask, sm);
     }
     TRUE
 }
 
-pub unsafe extern "win64" fn SetProcessAffinityMask(_h: HANDLE, mask: usize) -> BOOL {
-    log::debug!("SetProcessAffinityMask({mask:#x}) ignored (macOS has no hard affinity)");
+pub unsafe extern "win64" fn SetProcessAffinityMask(h: HANDLE, mask: usize) -> BOOL {
+    if !is_self(h) {
+        set_err(if handles::get_as::<ChildProcessObj>(h).is_some() {
+            err::ERROR_ACCESS_DENIED
+        } else {
+            err::ERROR_INVALID_HANDLE
+        });
+        return FALSE;
+    }
+    let sm = system_affinity_mask();
+    if mask == 0 || (mask & !sm) != 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let _aff_guard = crate::thread::defer_lock(job_affinity_lock());
+    if let Some((job_mask, allow_subset)) = job_affinity_constraint() {
+        if (mask & !job_mask) != 0 || (!allow_subset && mask != job_mask) {
+            set_err(err::ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+    }
+    PROCESS_AFFINITY_MASK.store(mask, Ordering::Release);
+    clamp_live_thread_affinities(mask);
     TRUE
 }
 
 static PRIORITY_CLASS: AtomicU32 = AtomicU32::new(0x20); // NORMAL_PRIORITY_CLASS
 
-pub unsafe extern "win64" fn GetPriorityClass(_h: HANDLE) -> u32 {
-    PRIORITY_CLASS.load(Ordering::Relaxed)
+fn is_valid_priority_class(c: u32) -> bool {
+    matches!(c, 0x20 | 0x40 | 0x80 | 0x100 | 0x4000 | 0x8000)
 }
-pub unsafe extern "win64" fn SetPriorityClass(_h: HANDLE, c: u32) -> BOOL {
-    PRIORITY_CLASS.store(c, Ordering::Relaxed);
+
+/// Windows NT base scheduling priority (`KPRIORITY`) corresponding to the current process priority class.
+pub fn current_process_base_priority() -> i32 {
+    match PRIORITY_CLASS.load(Ordering::Acquire) {
+        0x40 => 4,    // IDLE_PRIORITY_CLASS
+        0x4000 => 6,  // BELOW_NORMAL_PRIORITY_CLASS
+        0x20 => 8,    // NORMAL_PRIORITY_CLASS
+        0x8000 => 10, // ABOVE_NORMAL_PRIORITY_CLASS
+        0x80 => 13,   // HIGH_PRIORITY_CLASS
+        0x100 => 24,  // REALTIME_PRIORITY_CLASS
+        _ => 8,
+    }
+}
+
+/// Convert a Win32 relative thread priority (`THREAD_PRIORITY_*`) into an absolute Windows NT
+/// base scheduling priority (`KPRIORITY`) under the current process priority class.
+pub fn thread_base_priority(rel_prio: i32) -> i32 {
+    if PRIORITY_CLASS.load(Ordering::Acquire) == 0x100 {
+        match rel_prio {
+            -15 => 16,
+            15 => 31,
+            d => 24i32.saturating_add(d).clamp(16, 31),
+        }
+    } else {
+        let base = current_process_base_priority();
+        match rel_prio {
+            -15 => 1,
+            15 => 15,
+            d => base.saturating_add(d).clamp(1, 15),
+        }
+    }
+}
+
+pub unsafe extern "win64" fn GetPriorityClass(h: HANDLE) -> u32 {
+    if !is_self(h) {
+        if handles::get_as::<ChildProcessObj>(h).is_some() {
+            log::warn!("GetPriorityClass: querying priority class of a child process is not supported");
+            set_err(err::ERROR_NOT_SUPPORTED);
+        } else {
+            set_err(err::ERROR_INVALID_HANDLE);
+        }
+        return 0;
+    }
+    PRIORITY_CLASS.load(Ordering::Acquire)
+}
+pub unsafe extern "win64" fn SetPriorityClass(h: HANDLE, c: u32) -> BOOL {
+    if !is_self(h) {
+        set_err(if handles::get_as::<ChildProcessObj>(h).is_some() {
+            err::ERROR_ACCESS_DENIED
+        } else {
+            err::ERROR_INVALID_HANDLE
+        });
+        return FALSE;
+    }
+    const PROCESS_MODE_BACKGROUND_BEGIN: u32 = 0x0010_0000;
+    const PROCESS_MODE_BACKGROUND_END: u32 = 0x0020_0000;
+    if !is_valid_priority_class(c) && c != PROCESS_MODE_BACKGROUND_BEGIN && c != PROCESS_MODE_BACKGROUND_END {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let _aff_guard = crate::thread::defer_lock(job_affinity_lock());
+    if let Some(job_prio) = job_priority_class_constraint() {
+        if c != job_prio {
+            set_err(err::ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+    }
+    if is_valid_priority_class(c) {
+        PRIORITY_CLASS.store(c, Ordering::Release);
+    }
     TRUE
 }
 pub unsafe extern "win64" fn SetProcessPriorityBoost(_h: HANDLE, _d: BOOL) -> BOOL {
@@ -540,8 +657,16 @@ pub unsafe extern "win64" fn IsWow64Process2(_h: HANDLE, proc_m: *mut u16, nativ
 pub unsafe extern "win64" fn GetProcessVersion(_pid: u32) -> u32 {
     (teb::OS_MAJOR << 16) | teb::OS_MINOR
 }
-pub unsafe extern "win64" fn GetProcessHandleCount(_h: HANDLE, n: *mut u32) -> BOOL {
-    *n = 64;
+pub unsafe extern "win64" fn GetProcessHandleCount(h: HANDLE, n: *mut u32) -> BOOL {
+    if n.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if !is_self(h) {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    std::ptr::write_unaligned(n, handles::live_count());
     TRUE
 }
 pub unsafe extern "win64" fn SetProcessInformation(_h: HANDLE, class: u32, _i: *const c_void, _n: u32) -> BOOL {
@@ -587,23 +712,14 @@ pub unsafe extern "win64" fn SetSearchPathMode(_f: u32) -> BOOL {
     TRUE
 }
 
-fn task_memory() -> (u64, u64) {
-    // On iOS, Jetsam accounts against `task_vm_info.phys_footprint` (which includes Metal
-    // GPU allocations and compressed pages), whereas `resident_size` under-reports by 1-2 GiB.
-    #[cfg(target_os = "ios")]
-    {
-        let fp = crate::d3d12::mtl::process_phys_footprint();
-        if fp != 0 {
-            static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let peak = PEAK.fetch_max(fp, std::sync::atomic::Ordering::Relaxed).max(fp);
-            return (fp, peak);
-        }
-    }
-    // (resident, peak) via mach task_info(MACH_TASK_BASIC_INFO).
+/// Return `(virtual_size, peak_virtual_size, resident_size, peak_resident_size)` in bytes
+/// from Mach `MACH_TASK_BASIC_INFO` (using `phys_footprint` for resident memory on iOS).
+pub(crate) fn task_vm_memory() -> (u64, u64, u64, u64) {
+    static PEAK_VSIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     extern "C" {
         static mach_task_self_: libc::mach_port_t;
     }
-    unsafe {
+    let (vsize, mach_rss, mach_peak_rss) = unsafe {
         let mut info: libc::mach_task_basic_info = std::mem::zeroed();
         let mut count = (std::mem::size_of::<libc::mach_task_basic_info>() / std::mem::size_of::<libc::natural_t>()) as u32;
         let r = libc::task_info(
@@ -613,11 +729,37 @@ fn task_memory() -> (u64, u64) {
             &mut count,
         );
         if r == 0 {
-            (info.resident_size, info.resident_size_max)
+            (info.virtual_size, info.resident_size, info.resident_size_max)
         } else {
-            (0, 0)
+            (0, 0, 0)
         }
-    }
+    };
+    let peak_vsize = PEAK_VSIZE.fetch_max(vsize, Ordering::Relaxed).max(vsize);
+    let (rss, peak_rss) = {
+        // On iOS, Jetsam accounts against `task_vm_info.phys_footprint` (which includes Metal
+        // GPU allocations and compressed pages), whereas `resident_size` under-reports by 1-2 GiB.
+        #[cfg(target_os = "ios")]
+        {
+            let fp = crate::d3d12::mtl::process_phys_footprint();
+            if fp != 0 {
+                static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let peak = PEAK.fetch_max(fp, Ordering::Relaxed).max(fp);
+                (fp, peak)
+            } else {
+                (mach_rss, mach_peak_rss)
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            (mach_rss, mach_peak_rss)
+        }
+    };
+    (vsize, peak_vsize, rss, peak_rss)
+}
+
+pub(crate) fn task_memory() -> (u64, u64) {
+    let (_, _, rss, peak) = task_vm_memory();
+    (rss, peak)
 }
 
 pub unsafe extern "win64" fn K32GetProcessMemoryInfo(_h: HANDLE, out: *mut u8, cb: u32) -> BOOL {
@@ -1129,6 +1271,7 @@ fn spawn_and_verify_suspended_child(
     envs: &[(std::ffi::OsString, std::ffi::OsString)],
     stdio: &ChildStdioPlan,
     inherit_fd: Option<i32>,
+    resume_immediately: bool,
 ) -> Result<libc::pid_t, u32> {
     use std::ffi::CString;
 
@@ -1255,7 +1398,7 @@ fn spawn_and_verify_suspended_child(
             return Err(err::ERROR_ACCESS_DENIED);
         }
 
-        if libc::kill(pid, libc::SIGCONT) != 0 {
+        if resume_immediately && libc::kill(pid, libc::SIGCONT) != 0 {
             let e = last_errno();
             pr::kill_and_reap_pid(pid);
             return Err(errno_to_win32(e));
@@ -1279,9 +1422,13 @@ pub unsafe extern "win64" fn CreateProcessW(
 ) -> BOOL {
     #[cfg(target_os = "ios")]
     {
+        // Native-unsupported on iOS: Apple's iOS App Sandbox and kernel policy prohibit
+        // spawning child processes (`posix_spawn` / `execve` are blocked by entitlement).
+        // Returning FALSE with ERROR_NOT_SUPPORTED matches Windows platforms without
+        // child-process creation capability.
         let _ = (inherit, flags, env, cwd, si, pi);
-        stub!(
-            "CreateProcessW unavailable on iOS: app={:?} cmd={:?}",
+        log::debug!(
+            "CreateProcessW unavailable on iOS sandbox: app={:?} cmd={:?}",
             from_wide_opt(app),
             from_wide_opt(cmd)
         );
@@ -1507,6 +1654,14 @@ pub unsafe extern "win64" fn CreateProcessW(
             std::ffi::OsString::from(child_exit_wfd.to_string()),
         ));
 
+        // Enforce parent job breakaway / quota / inheritance rules BEFORE spawning the child.
+        if let Err(e) = check_parent_jobs_for_child_spawn(flags) {
+            set_err(e);
+            return FALSE;
+        }
+
+        // Keep the child suspended until post-spawn parent-job revalidation completes so a
+        // rejected spawn can never execute guest instructions or cause side effects.
         let raw_pid = match spawn_and_verify_suspended_child(
             &trusted_runner.exe_path,
             &trusted_runner.identity,
@@ -1514,6 +1669,7 @@ pub unsafe extern "win64" fn CreateProcessW(
             &envs,
             &stdio_plan,
             Some(child_exit_wfd),
+            false,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -1526,6 +1682,15 @@ pub unsafe extern "win64" fn CreateProcessW(
         drop(exit_write_fd);
         drop(stdio_plan);
 
+        // Re-check parent job rules while the child is still suspended at dyld entry in case
+        // another thread assigned the current process to a non-breakaway job concurrently.
+        if let Err(e) = check_parent_jobs_for_child_spawn(flags) {
+            pr::kill_and_reap_pid(raw_pid);
+            drop(exit_read_fd);
+            set_err(e);
+            return FALSE;
+        }
+
         let pid = raw_pid as u32;
         let proc_obj = Arc::new(ChildProcessObj {
             pid,
@@ -1534,10 +1699,16 @@ pub unsafe extern "win64" fn CreateProcessW(
             terminated_code: handles::Guarded::new(None),
             os_pid: std::sync::atomic::AtomicI32::new(raw_pid),
         });
-        child_processes()
-            .lock()
-            .unwrap()
+        crate::thread::defer_lock(child_processes())
             .insert(pid, Arc::downgrade(&proc_obj));
+        if libc::kill(raw_pid, libc::SIGCONT) != 0 {
+            let e = last_errno();
+            crate::thread::defer_lock(child_processes()).remove(&pid);
+            pr::kill_and_reap_pid(raw_pid);
+            drop(exit_read_fd);
+            set_err(errno_to_win32(e));
+            return FALSE;
+        }
         let thread_obj = Arc::new(ChildThreadObj {
             tid: pid,
             process: Arc::clone(&proc_obj),
@@ -1632,10 +1803,526 @@ pub unsafe extern "win64" fn CreateProcessA(
 }
 
 // ---------------------------------------------------------------------------
-// Job objects (accepted, no effect)
+// Job objects (limits tracking, process membership, query, kill-on-close)
 // ---------------------------------------------------------------------------
 
-pub struct JobObj;
+const JOB_OBJECT_LIMIT_WORKINGSET: u32 = 0x0000_0001;
+const JOB_OBJECT_LIMIT_PROCESS_TIME: u32 = 0x0000_0002;
+const JOB_OBJECT_LIMIT_JOB_TIME: u32 = 0x0000_0004;
+const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0000_0008;
+const JOB_OBJECT_LIMIT_AFFINITY: u32 = 0x0000_0010;
+const JOB_OBJECT_LIMIT_PRIORITY_CLASS: u32 = 0x0000_0020;
+const JOB_OBJECT_LIMIT_SCHEDULING_CLASS: u32 = 0x0000_0080;
+const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
+const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x0000_0200;
+#[cfg(not(target_os = "ios"))]
+const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
+#[cfg(any(not(target_os = "ios"), test))]
+const JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: u32 = 0x0000_1000;
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+const JOB_OBJECT_LIMIT_SUBSET_AFFINITY: u32 = 0x0000_4000;
+#[cfg(not(target_os = "ios"))]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+const UNENFORCED_JOB_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_WORKINGSET
+    | JOB_OBJECT_LIMIT_PROCESS_TIME
+    | JOB_OBJECT_LIMIT_JOB_TIME
+    | JOB_OBJECT_LIMIT_SCHEDULING_CLASS
+    | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+    | JOB_OBJECT_LIMIT_JOB_MEMORY;
+
+/// Check live parent jobs when spawning a child process under Windows job-inheritance rules.
+///
+/// Permits spawns that cleanly break away from every parent job (`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`,
+/// or `CREATE_BREAKAWAY_FROM_JOB` with `JOB_OBJECT_LIMIT_BREAKAWAY_OK`). Rejects unauthorized
+/// breakaway with `ERROR_ACCESS_DENIED`, saturated `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` quotas with
+/// `ERROR_NOT_ENOUGH_QUOTA`, and non-breakaway cross-process job inheritance with
+/// `ERROR_NOT_SUPPORTED` (child runner processes do not share parent `JobState`, so descendants
+/// would otherwise escape `IsProcessInJob`, active-process quotas, and job termination).
+#[cfg(not(target_os = "ios"))]
+fn check_parent_jobs_for_child_spawn(creation_flags: u32) -> Result<(), u32> {
+    let my_pid = std::process::id();
+    let parent_jobs: Vec<Arc<JobObj>> = {
+        let all = crate::thread::defer_lock(all_jobs());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let wants_breakaway = (creation_flags & CREATE_BREAKAWAY_FROM_JOB) != 0;
+    for jo in parent_jobs {
+        let st = crate::thread::defer_lock(&jo.state);
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        let flags = st.limit_flags();
+        if (flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK) != 0 {
+            continue;
+        }
+        if wants_breakaway {
+            if (flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK) != 0 {
+                continue;
+            }
+            return Err(err::ERROR_ACCESS_DENIED);
+        }
+        if (flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 && st.active_count() >= st.active_process_limit() {
+            return Err(err::ERROR_NOT_ENOUGH_QUOTA);
+        }
+        log::warn!(
+            "CreateProcess: cross-process job inheritance into child/grandchild runtimes is not supported (configure JOB_OBJECT_LIMIT_BREAKAWAY_OK or JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)"
+        );
+        return Err(err::ERROR_NOT_SUPPORTED);
+    }
+    Ok(())
+}
+
+/// Serializes cross-job affinity/priority validation and updates with process and thread
+/// affinity/priority setters so concurrent updates cannot violate active job limits.
+/// Lock order: `job_affinity_lock() -> {all_jobs(), thread list} -> JobObj::state`.
+fn job_affinity_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+pub(crate) fn with_affinity_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = crate::thread::defer_lock(job_affinity_lock());
+    f()
+}
+
+/// Intersect two optional job affinity constraints `(mask, allow_subset)`.
+/// Returns `Err(())` when no non-empty process affinity mask can simultaneously satisfy both
+/// constraints (either disjoint masks or a stricter mask conflicting with `!allow_subset`).
+fn combine_affinity_constraints(
+    a: Option<(usize, bool)>,
+    b: Option<(usize, bool)>,
+) -> Result<Option<(usize, bool)>, ()> {
+    match (a, b) {
+        (None, x) | (x, None) => Ok(x),
+        (Some((m1, s1)), Some((m2, s2))) => {
+            let inter = m1 & m2;
+            if inter == 0 || (!s1 && inter != m1) || (!s2 && inter != m2) {
+                Err(())
+            } else {
+                Ok(Some((inter, s1 && s2)))
+            }
+        }
+    }
+}
+
+/// Combined affinity constraint of all live jobs containing the current process other than `exclude`.
+/// Returns `Err(())` if existing memberships already conflict (fail closed).
+fn other_self_jobs_affinity_constraint(exclude: &Arc<JobObj>) -> Result<Option<(usize, bool)>, ()> {
+    let my_pid = std::process::id();
+    let jobs: Vec<Arc<JobObj>> = {
+        let all = crate::thread::defer_lock(all_jobs());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut combined: Option<(usize, bool)> = None;
+    for jo in jobs {
+        if Arc::ptr_eq(&jo, exclude) {
+            continue;
+        }
+        let st = crate::thread::defer_lock(&jo.state);
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        if let Some(aff) = st.effective_affinity() {
+            combined = combine_affinity_constraints(combined, Some(aff))?;
+        }
+    }
+    Ok(combined)
+}
+
+/// Return `Some(priority_class)` if the current process belongs to any live job with
+/// `JOB_OBJECT_LIMIT_PRIORITY_CLASS` set (fail closed with `Some(0)` if two jobs conflict).
+fn job_priority_class_constraint() -> Option<u32> {
+    let my_pid = std::process::id();
+    let jobs: Vec<Arc<JobObj>> = {
+        let all = crate::thread::defer_lock(all_jobs());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut locked: Option<u32> = None;
+    for jo in jobs {
+        let st = crate::thread::defer_lock(&jo.state);
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        if let Some(p) = st.priority_class_limit() {
+            match locked {
+                None => locked = Some(p),
+                Some(cur) if cur == p => {}
+                Some(_) => return Some(0),
+            }
+        }
+    }
+    locked
+}
+
+/// Priority class constraint of all live jobs containing the current process other than `exclude`.
+fn other_self_jobs_priority_constraint(exclude: &Arc<JobObj>) -> Result<Option<u32>, ()> {
+    let my_pid = std::process::id();
+    let jobs: Vec<Arc<JobObj>> = {
+        let all = crate::thread::defer_lock(all_jobs());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut locked: Option<u32> = None;
+    for jo in jobs {
+        if Arc::ptr_eq(&jo, exclude) {
+            continue;
+        }
+        let st = crate::thread::defer_lock(&jo.state);
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        if let Some(p) = st.priority_class_limit() {
+            match locked {
+                None => locked = Some(p),
+                Some(cur) if cur == p => {}
+                Some(_) => return Err(()),
+            }
+        }
+    }
+    Ok(locked)
+}
+
+fn combine_priority_constraints(a: Option<u32>, b: Option<u32>) -> Result<Option<u32>, ()> {
+    match (a, b) {
+        (None, x) | (x, None) => Ok(x),
+        (Some(p1), Some(p2)) if p1 == p2 => Ok(Some(p1)),
+        (Some(_), Some(_)) => Err(()),
+    }
+}
+
+/// Return `Some((effective_mask, allow_subset))` if the current process belongs to any live
+/// job with `JOB_OBJECT_LIMIT_AFFINITY` or `JobObjectGroupInformationEx` affinity set.
+/// Never treats an empty intersection as unconstrained (fail closed with `Some((0, false))`).
+fn job_affinity_constraint() -> Option<(usize, bool)> {
+    let my_pid = std::process::id();
+    let jobs: Vec<Arc<JobObj>> = {
+        let all = crate::thread::defer_lock(all_jobs());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut combined: Option<(usize, bool)> = None;
+    for jo in jobs {
+        let st = crate::thread::defer_lock(&jo.state);
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        if let Some(aff) = st.effective_affinity() {
+            match combine_affinity_constraints(combined, Some(aff)) {
+                Ok(next) => combined = next,
+                Err(()) => return Some((0, false)),
+            }
+        }
+    }
+    combined
+}
+
+/// Clamp every live thread's non-zero affinity mask to `proc_mask` so threads cannot remain
+/// bound to CPUs disallowed by the process or job affinity mask.
+fn clamp_live_thread_affinities(proc_mask: usize) {
+    for t in crate::thread::all_threads() {
+        let cur = t.affinity_mask.load(Ordering::Acquire);
+        if cur != 0 && (cur & !proc_mask) != 0 {
+            let next = if (cur & proc_mask) != 0 { cur & proc_mask } else { proc_mask };
+            t.affinity_mask.store(next, Ordering::Release);
+            crate::thread::sched::apply_affinity_mask(&t, next, proc_mask);
+        }
+    }
+}
+
+/// Apply a job's `JOB_OBJECT_LIMIT_AFFINITY` restriction to the current process and live threads.
+fn apply_job_affinity_limit(aff: usize, allow_subset: bool) {
+    let sm = system_affinity_mask();
+    let eff = aff & sm;
+    if eff == 0 {
+        return;
+    }
+    let cur = current_process_affinity_mask();
+    let next = if allow_subset && (cur & eff) != 0 { cur & eff } else { eff };
+    PROCESS_AFFINITY_MASK.store(next, Ordering::Release);
+    clamp_live_thread_affinities(next);
+}
+
+enum JobMember {
+    SelfProc(u32),
+    Child(Arc<ChildProcessObj>),
+}
+
+impl JobMember {
+    fn pid(&self) -> u32 {
+        match self {
+            JobMember::SelfProc(pid) => *pid,
+            JobMember::Child(c) => c.pid,
+        }
+    }
+    fn is_active(&self) -> bool {
+        match self {
+            JobMember::SelfProc(_) => true,
+            JobMember::Child(c) => c.current_exit_code().is_none(),
+        }
+    }
+}
+
+const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
+const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
+const JOB_OBJECT_MSG_EXIT_PROCESS: u32 = 7;
+const JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS: u32 = 8;
+
+fn post_job_iocp_msg(cp: &(usize, Arc<crate::kernel32::file::IoCompletionPort>), msg: u32, payload: usize) {
+    cp.1.post(crate::kernel32::file::IocpPacket {
+        bytes: msg,
+        key: cp.0,
+        overlapped: payload,
+        internal_status: crate::ntdll::STATUS_SUCCESS as usize,
+    });
+}
+
+#[cfg(not(target_os = "ios"))]
+fn notify_jobs_of_child_exit(pid: u32, exit_code: u32) {
+    let jobs: Vec<Arc<JobObj>> = {
+        let mut all = crate::thread::defer_lock(all_jobs());
+        all.retain(|w| w.strong_count() > 0);
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let exit_msg = if (0x8000_0000..=0xCFFF_FFFF).contains(&exit_code) {
+        JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS
+    } else {
+        JOB_OBJECT_MSG_EXIT_PROCESS
+    };
+    for jo in jobs {
+        let st = crate::thread::defer_lock(&jo.state);
+        if st.contains_pid(pid) {
+            if let Some(ref cp) = st.completion_port {
+                post_job_iocp_msg(cp, exit_msg, pid as usize);
+                if st.active_count() == 0 {
+                    post_job_iocp_msg(cp, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0);
+                }
+            }
+        }
+    }
+    release_inactive_jobs();
+}
+
+/// Current process `(user_100ns, kernel_100ns, page_faults)` from `getrusage(RUSAGE_SELF)`.
+fn self_rusage_snapshot() -> (u64, u64, u64) {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
+            let user = (ru.ru_utime.tv_sec.max(0) as u64)
+                .saturating_mul(10_000_000)
+                .saturating_add((ru.ru_utime.tv_usec.max(0) as u64).saturating_mul(10));
+            let kernel = (ru.ru_stime.tv_sec.max(0) as u64)
+                .saturating_mul(10_000_000)
+                .saturating_add((ru.ru_stime.tv_usec.max(0) as u64).saturating_mul(10));
+            let faults = (ru.ru_minflt.max(0) as u64).saturating_add(ru.ru_majflt.max(0) as u64);
+            (user, kernel, faults)
+        } else {
+            (0, 0, 0)
+        }
+    }
+}
+
+struct JobState {
+    basic_limits: [u8; 64],
+    completion_port: Option<(usize, Arc<crate::kernel32::file::IoCompletionPort>)>,
+    group_ids: Vec<u16>,
+    group_affinities: Vec<[u8; 16]>,
+    members: Vec<JobMember>,
+    total_processes: u32,
+    total_terminated: u32,
+    /// `(user_100ns, kernel_100ns, page_faults)` captured when the current process joined.
+    self_assign_rusage: Option<(u64, u64, u64)>,
+    /// `(user_100ns, kernel_100ns)` captured at the start of the current job time-limit period.
+    self_period_rusage: Option<(u64, u64)>,
+    name: Option<String>,
+}
+
+impl JobState {
+    fn new(name: Option<String>) -> Self {
+        Self {
+            basic_limits: [0u8; 64],
+            completion_port: None,
+            group_ids: vec![0],
+            group_affinities: Vec::new(),
+            members: Vec::new(),
+            total_processes: 0,
+            total_terminated: 0,
+            self_assign_rusage: None,
+            self_period_rusage: None,
+            name,
+        }
+    }
+
+    fn limit_flags(&self) -> u32 {
+        u32::from_le_bytes(self.basic_limits[16..20].try_into().unwrap())
+    }
+
+    fn active_process_limit(&self) -> u32 {
+        u32::from_le_bytes(self.basic_limits[40..44].try_into().unwrap())
+    }
+
+    fn active_count(&self) -> u32 {
+        self.members.iter().filter(|m| m.is_active()).count() as u32
+    }
+
+    fn contains_pid(&self, pid: u32) -> bool {
+        self.members.iter().any(|m| m.pid() == pid)
+    }
+
+    /// Effective `(mask, allow_subset)` affinity constraint imposed by this job across both
+    /// `JOB_OBJECT_LIMIT_AFFINITY` (class 2/9) and `JobObjectGroupInformationEx` (class 14).
+    fn effective_affinity_from(basic_limits: &[u8; 64], group_affinities: &[[u8; 16]]) -> Option<(usize, bool)> {
+        let flags = u32::from_le_bytes(basic_limits[16..20].try_into().unwrap());
+        let mut mask: Option<usize> = None;
+        let mut allow_subset = true;
+        if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
+            let aff = usize::from_le_bytes(basic_limits[48..56].try_into().unwrap());
+            if aff != 0 {
+                mask = Some(aff);
+                if (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) == 0 {
+                    allow_subset = false;
+                }
+            }
+        }
+        if !group_affinities.is_empty() {
+            let mut ga_mask = 0usize;
+            for ga in group_affinities {
+                ga_mask |= usize::from_le_bytes(ga[0..8].try_into().unwrap());
+            }
+            if ga_mask != 0 {
+                mask = Some(match mask {
+                    Some(m) => m & ga_mask,
+                    None => ga_mask,
+                });
+            }
+        }
+        mask.filter(|&m| m != 0).map(|m| (m, allow_subset))
+    }
+    fn effective_affinity(&self) -> Option<(usize, bool)> {
+        Self::effective_affinity_from(&self.basic_limits, &self.group_affinities)
+    }
+    fn priority_class_from(basic_limits: &[u8; 64]) -> Option<u32> {
+        let flags = u32::from_le_bytes(basic_limits[16..20].try_into().unwrap());
+        if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 {
+            let prio = u32::from_le_bytes(basic_limits[56..60].try_into().unwrap());
+            (prio != 0).then_some(prio)
+        } else {
+            None
+        }
+    }
+    fn priority_class_limit(&self) -> Option<u32> {
+        Self::priority_class_from(&self.basic_limits)
+    }
+    fn has_live_child(&self) -> bool {
+        self.members.iter().any(|m| match m {
+            JobMember::Child(c) => c.current_exit_code().is_none(),
+            JobMember::SelfProc(_) => false,
+        })
+    }
+    fn limits_require_child_enforcement(basic_limits: &[u8; 64], group_affinities: &[[u8; 16]]) -> bool {
+        if let Some((aff, allow_subset)) = Self::effective_affinity_from(basic_limits, group_affinities) {
+            if aff != system_affinity_mask() || !allow_subset {
+                return true;
+            }
+        }
+        let flags = u32::from_le_bytes(basic_limits[16..20].try_into().unwrap());
+        if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 {
+            let prio = u32::from_le_bytes(basic_limits[56..60].try_into().unwrap());
+            if prio != 0 {
+                return true;
+            }
+        }
+        false
+    }
+    fn has_unenforced_child_limits(&self) -> bool {
+        Self::limits_require_child_enforcement(&self.basic_limits, &self.group_affinities)
+    }
+    fn group_affinity_mask(&self) -> Option<usize> {
+        if self.group_affinities.is_empty() {
+            return None;
+        }
+        let mut ga_mask = 0usize;
+        for ga in &self.group_affinities {
+            ga_mask |= usize::from_le_bytes(ga[0..8].try_into().unwrap());
+        }
+        (ga_mask != 0).then_some(ga_mask)
+    }
+}
+
+pub struct JobObj {
+    state: std::sync::Mutex<JobState>,
+    /// Number of open handle-table entries currently referencing this job object.
+    /// Closing the last handle (`1 -> 0`) unlinks any object name and enforces
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, independently of whether live assigned
+    /// processes retain the job object itself in [`active_jobs`].
+    open_handles: AtomicUsize,
+}
+
+impl JobObj {
+    fn new(name: Option<String>) -> Arc<Self> {
+        let obj = Arc::new(Self {
+            state: std::sync::Mutex::new(JobState::new(name)),
+            open_handles: AtomicUsize::new(0),
+        });
+        let mut all = crate::thread::defer_lock(all_jobs());
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(&obj));
+        obj
+    }
+
+    fn terminate_children(&self, exit_code: u32) -> bool {
+        let children: Vec<Arc<ChildProcessObj>> = {
+            let mut st = crate::thread::defer_lock(&self.state);
+            let mut out = Vec::new();
+            for m in &st.members {
+                if let JobMember::Child(c) = m {
+                    if c.current_exit_code().is_none() {
+                        out.push(Arc::clone(c));
+                    }
+                }
+            }
+            st.total_terminated = st.total_terminated.saturating_add(out.len() as u32);
+            out
+        };
+        #[cfg(not(target_os = "ios"))]
+        for child in children {
+            let already_exited = {
+                let g = handles::wait_lock();
+                if child.exit_code.get(&g).is_some() {
+                    true
+                } else {
+                    let tslot = child.terminated_code.get(&g);
+                    if tslot.is_none() {
+                        *tslot = Some(exit_code);
+                    }
+                    false
+                }
+            };
+            if !already_exited {
+                let pid = child.os_pid.swap(0, Ordering::AcqRel);
+                if pid > 0 {
+                    unsafe {
+                        let _ = libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "ios")]
+        let _ = (children, exit_code);
+        let st = crate::thread::defer_lock(&self.state);
+        st.contains_pid(std::process::id())
+    }
+}
+
+impl Drop for JobObj {
+    fn drop(&mut self) {
+        let name = self.state.get_mut().unwrap_or_else(|e| e.into_inner()).name.take();
+        if let Some(n) = name {
+            let mut jobs = crate::thread::defer_lock(named_jobs());
+            if jobs.get(&n).is_some_and(|w| w.strong_count() == 0) {
+                jobs.remove(&n);
+            }
+        }
+    }
+}
+
 impl KObject for JobObj {
     fn type_name(&self) -> &'static str {
         "Job"
@@ -1643,24 +2330,935 @@ impl KObject for JobObj {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn on_handle_open(&self) {
+        self.open_handles.fetch_add(1, Ordering::AcqRel);
+    }
+    fn on_handle_close(&self) {
+        if self.open_handles.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // Re-check under named_jobs() in case a concurrent Create/OpenJobObject just opened a handle.
+        let mut jobs = crate::thread::defer_lock(named_jobs());
+        if self.open_handles.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let (kill_on_close, name) = {
+            let st = crate::thread::defer_lock(&self.state);
+            (
+                (st.limit_flags() & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) != 0,
+                st.name.clone(),
+            )
+        };
+        if let Some(n) = name {
+            if jobs
+                .get(&n)
+                .and_then(|w| w.upgrade())
+                .is_some_and(|cur| std::ptr::eq(Arc::as_ptr(&cur), self))
+            {
+                jobs.remove(&n);
+            }
+        }
+        drop(jobs);
+        if kill_on_close {
+            // Terminate all processes associated with this job on last-handle close
+            // (both assigned child processes and the current process if assigned).
+            if self.terminate_children(1) {
+                pr::exit_process(1);
+            }
+        }
+    }
 }
 
-pub unsafe extern "win64" fn CreateJobObjectW(_sec: *mut c_void, _name: LPCWSTR) -> HANDLE {
-    handles::insert(Arc::new(JobObj))
+fn all_jobs() -> &'static std::sync::Mutex<Vec<std::sync::Weak<JobObj>>> {
+    static JOBS: OnceLock<std::sync::Mutex<Vec<std::sync::Weak<JobObj>>>> = OnceLock::new();
+    JOBS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
-pub unsafe extern "win64" fn CreateJobObjectA(_sec: *mut c_void, _name: LPCSTR) -> HANDLE {
-    handles::insert(Arc::new(JobObj))
+
+/// Strong references retaining jobs while they have at least one live assigned process
+/// (Windows keeps a job object alive until its last handle is closed AND all associated
+/// processes have terminated).
+fn active_jobs() -> &'static std::sync::Mutex<Vec<Arc<JobObj>>> {
+    static ACTIVE: OnceLock<std::sync::Mutex<Vec<Arc<JobObj>>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
-pub unsafe extern "win64" fn AssignProcessToJobObject(_job: HANDLE, _p: HANDLE) -> BOOL {
-    stub!("job objects have no effect");
+
+fn retain_active_job(j: &Arc<JobObj>) {
+    let mut active = crate::thread::defer_lock(active_jobs());
+    if !active.iter().any(|x| Arc::ptr_eq(x, j)) {
+        active.push(Arc::clone(j));
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn release_inactive_jobs() {
+    let mut active = crate::thread::defer_lock(active_jobs());
+    active.retain(|j| crate::thread::defer_lock(&j.state).active_count() > 0);
+}
+
+/// Weak namespace for named job objects; entries are unlinked when the last open handle
+/// closes (matching Windows temporary kernel object namespace semantics).
+fn named_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<JobObj>>> {
+    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<JobObj>>>> =
+        OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn create_job_object_impl(name: Option<String>) -> HANDLE {
+    let Some(n) = name.filter(|s| !s.is_empty()) else {
+        set_err(0);
+        return handles::insert(JobObj::new(None));
+    };
+    {
+        let other = crate::thread::defer_lock(handles::named_objects());
+        if other.contains_key(&n) {
+            set_err(err::ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
+        }
+    }
+    let mut jobs = crate::thread::defer_lock(named_jobs());
+    if let Some(existing) = jobs
+        .get(&n)
+        .and_then(|w| w.upgrade())
+        .filter(|j| j.open_handles.load(Ordering::Acquire) > 0)
+    {
+        let h = handles::insert(existing);
+        drop(jobs);
+        set_err(err::ERROR_ALREADY_EXISTS);
+        return h;
+    }
+    let obj = JobObj::new(Some(n.clone()));
+    let h = handles::insert(Arc::clone(&obj) as Arc<dyn KObject>);
+    jobs.insert(n, Arc::downgrade(&obj));
+    drop(jobs);
+    set_err(0);
+    h
+}
+
+pub unsafe extern "win64" fn CreateJobObjectW(_sec: *mut c_void, name: LPCWSTR) -> HANDLE {
+    create_job_object_impl(from_wide_opt(name))
+}
+pub unsafe extern "win64" fn CreateJobObjectA(_sec: *mut c_void, name: LPCSTR) -> HANDLE {
+    create_job_object_impl(from_ansi_opt(name))
+}
+
+pub unsafe extern "win64" fn OpenJobObjectW(_access: u32, inherit: BOOL, name: LPCWSTR) -> HANDLE {
+    let Some(n) = from_wide_opt(name).filter(|s| !s.is_empty()) else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
+    let flags = if inherit != 0 { handles::HANDLE_FLAG_INHERIT } else { 0 };
+    let mut jobs = crate::thread::defer_lock(named_jobs());
+    if let Some(existing) = jobs
+        .get(&n)
+        .and_then(|w| w.upgrade())
+        .filter(|j| j.open_handles.load(Ordering::Acquire) > 0)
+    {
+        return handles::insert_with_flags(existing, flags);
+    }
+    jobs.remove(&n);
+    set_err(err::ERROR_FILE_NOT_FOUND);
+    std::ptr::null_mut()
+}
+
+pub unsafe extern "win64" fn OpenJobObjectA(access: u32, inherit: BOOL, name: LPCSTR) -> HANDLE {
+    let Some(s) = from_ansi_opt(name) else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
+    let w = to_wide_z(&s);
+    OpenJobObjectW(access, inherit, w.as_ptr())
+}
+
+pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) -> BOOL {
+    let Some(j) = handles::get_as::<JobObj>(job) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let member = if is_self(p) {
+        JobMember::SelfProc(std::process::id())
+    } else if let Some(child) = handles::get_as::<ChildProcessObj>(p) {
+        JobMember::Child(child)
+    } else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let pid = member.pid();
+    let is_self_member = matches!(member, JobMember::SelfProc(_));
+    let _aff_guard = is_self_member.then(|| crate::thread::defer_lock(job_affinity_lock()));
+    let (other_aff, other_prio) = if is_self_member {
+        let a = match other_self_jobs_affinity_constraint(&j) {
+            Ok(a) => a,
+            Err(()) => {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        };
+        let p = match other_self_jobs_priority_constraint(&j) {
+            Ok(p) => p,
+            Err(()) => {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        };
+        (a, p)
+    } else {
+        (None, None)
+    };
+    let mut st = crate::thread::defer_lock(&j.state);
+    if st.contains_pid(pid) {
+        return TRUE;
+    }
+    if (st.limit_flags() & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 && st.active_count() >= st.active_process_limit() {
+        set_err(err::ERROR_NOT_ENOUGH_QUOTA);
+        return FALSE;
+    }
+    if matches!(member, JobMember::Child(_)) && st.has_unenforced_child_limits() {
+        log::warn!(
+            "AssignProcessToJobObject: cannot assign child process to job with affinity/priority limits (cross-process enforcement is not supported)"
+        );
+        set_err(err::ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
+    let apply_aff = if is_self_member {
+        match combine_affinity_constraints(other_aff, st.effective_affinity()) {
+            Ok(combined) => combined,
+            Err(()) => {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        }
+    } else {
+        None
+    };
+    let apply_prio = if is_self_member {
+        match combine_priority_constraints(other_prio, st.priority_class_limit()) {
+            Ok(combined) => combined,
+            Err(()) => {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(prio) = apply_prio {
+        PRIORITY_CLASS.store(prio, Ordering::Release);
+    }
+    if matches!(member, JobMember::SelfProc(_)) {
+        let snap = self_rusage_snapshot();
+        st.self_assign_rusage = Some(snap);
+        st.self_period_rusage = Some((snap.0, snap.1));
+    }
+    let exited_code = match &member {
+        JobMember::Child(c) => c.current_exit_code(),
+        JobMember::SelfProc(_) => None,
+    };
+    st.members.push(member);
+    st.total_processes = st.total_processes.saturating_add(1);
+    let keep_alive = exited_code.is_none();
+    if let Some(ref cp) = st.completion_port {
+        post_job_iocp_msg(cp, JOB_OBJECT_MSG_NEW_PROCESS, pid as usize);
+        if let Some(code) = exited_code {
+            let msg = if (0x8000_0000..=0xCFFF_FFFF).contains(&code) {
+                JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS
+            } else {
+                JOB_OBJECT_MSG_EXIT_PROCESS
+            };
+            post_job_iocp_msg(cp, msg, pid as usize);
+            if st.active_count() == 0 {
+                post_job_iocp_msg(cp, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0);
+            }
+        }
+    }
+    drop(st);
+    if let Some((aff, allow_subset)) = apply_aff {
+        apply_job_affinity_limit(aff, allow_subset);
+    }
+    if keep_alive {
+        retain_active_job(&j);
+    }
     TRUE
 }
-pub unsafe extern "win64" fn SetInformationJobObject(_job: HANDLE, class: u32, _i: *const c_void, _n: u32) -> BOOL {
-    stub!("SetInformationJobObject class {class} ignored");
+
+pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, info: *const c_void, len: u32) -> BOOL {
+    let Some(j) = handles::get_as::<JobObj>(job) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if info.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    // Capture and validate all guest input buffers BEFORE acquiring `job_affinity_lock()`
+    // or `j.state`, so a `PAGE_GUARD` fault whose VEH re-enters job APIs cannot deadlock
+    // on either lock.
+    let bytes = info as *const u8;
+    enum SetJobInput {
+        BasicLimits([u8; 64]),
+        AssociateCompletionPort(usize, HANDLE),
+        ExtendedLimits([u8; 64]),
+        GroupIds(Vec<u16>),
+        GroupAffinities(Vec<[u8; 16]>, usize),
+    }
+    let parsed = match class {
+        2 => {
+            // JobObjectBasicLimitInformation (64 bytes on x64)
+            if len != 64 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let mut buf = [0u8; 64];
+            std::ptr::copy_nonoverlapping(bytes, buf.as_mut_ptr(), 64);
+            SetJobInput::BasicLimits(buf)
+        }
+        4 => {
+            // JobObjectBasicUIRestrictions (4 bytes): accepting 0 (no restrictions) is truthful;
+            // non-zero UI restrictions are not enforced by user32.
+            if len != 4 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let mask = std::ptr::read_unaligned(bytes as *const u32);
+            if mask != 0 {
+                log::warn!("SetInformationJobObject(JobObjectBasicUIRestrictions, mask=0x{mask:x}): UI restrictions are not enforced");
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            return TRUE;
+        }
+        6 => {
+            // JobObjectEndOfJobTimeInformation (4 bytes): job time-limit expiry actions are not enforced.
+            if len != 4 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            log::warn!("SetInformationJobObject(JobObjectEndOfJobTimeInformation): end-of-job-time actions are not enforced");
+            set_err(err::ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
+        7 => {
+            // JobObjectAssociateCompletionPortInformation (16 bytes on x64):
+            // +0: PVOID CompletionKey, +8: HANDLE CompletionPort.
+            if len != 16 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let key = std::ptr::read_unaligned(bytes as *const usize);
+            let port = std::ptr::read_unaligned(bytes.add(8) as *const HANDLE);
+            SetJobInput::AssociateCompletionPort(key, port)
+        }
+        9 => {
+            // JobObjectExtendedLimitInformation (144 bytes on x64)
+            if len != 144 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let mut full = [0u8; 144];
+            std::ptr::copy_nonoverlapping(bytes, full.as_mut_ptr(), 144);
+            let mut basic = [0u8; 64];
+            basic.copy_from_slice(&full[..64]);
+            SetJobInput::ExtendedLimits(basic)
+        }
+        11 => {
+            // JobObjectGroupInformation (array of WORD group numbers)
+            if len == 0 || (len % 2) != 0 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let count = (len / 2) as usize;
+            let mut groups = Vec::with_capacity(count);
+            for i in 0..count {
+                let g = std::ptr::read_unaligned(bytes.add(i * 2) as *const u16);
+                if g != 0 {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+                groups.push(g);
+            }
+            SetJobInput::GroupIds(groups)
+        }
+        12 => {
+            // JobObjectNotificationLimitInformation (72 bytes on x64): threshold notifications
+            // are not enforced; return an honest unsupported failure rather than silently storing.
+            if len != 72 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            log::warn!("SetInformationJobObject(JobObjectNotificationLimitInformation): notification limits are not enforced");
+            set_err(err::ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
+        14 => {
+            // JobObjectGroupInformationEx (array of GROUP_AFFINITY, 16 bytes each)
+            if len == 0 || (len % 16) != 0 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let count = (len / 16) as usize;
+            let sm = system_affinity_mask();
+            let mut out = Vec::with_capacity(count);
+            let mut combined_mask = 0usize;
+            for i in 0..count {
+                let mut ga = [0u8; 16];
+                std::ptr::copy_nonoverlapping(bytes.add(i * 16), ga.as_mut_ptr(), 16);
+                let mask = usize::from_le_bytes(ga[0..8].try_into().unwrap());
+                let group = u16::from_le_bytes(ga[8..10].try_into().unwrap());
+                if group != 0 || mask == 0 || (mask & !sm) != 0 {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+                combined_mask |= mask;
+                out.push(ga);
+            }
+            SetJobInput::GroupAffinities(out, combined_mask)
+        }
+        15 => {
+            // JobObjectCpuRateControlInformation (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION: 8 bytes:
+            // DWORD ControlFlags + 4-byte union CpuRate/Weight/{MinRate,MaxRate}).
+            // Disabling (ControlFlags == 0) is truthful; enabling caps/weights is not enforced
+            // by the host scheduler and must fail honestly rather than pretending to cap CPU.
+            if len != 8 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let control_flags = std::ptr::read_unaligned(bytes as *const u32);
+            if control_flags != 0 {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectCpuRateControlInformation, flags=0x{control_flags:x}): CPU rate controls are not enforced on macOS/iOS"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            return TRUE;
+        }
+        _ => {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    };
+
+    let updates_affinity = matches!(
+        parsed,
+        SetJobInput::BasicLimits(_) | SetJobInput::ExtendedLimits(_) | SetJobInput::GroupAffinities(_, _)
+    );
+    let _aff_guard = updates_affinity.then(|| crate::thread::defer_lock(job_affinity_lock()));
+    let other_aff = if updates_affinity {
+        other_self_jobs_affinity_constraint(&j)
+    } else {
+        Ok(None)
+    };
+    let other_prio = if matches!(parsed, SetJobInput::BasicLimits(_) | SetJobInput::ExtendedLimits(_)) {
+        other_self_jobs_priority_constraint(&j)
+    } else {
+        Ok(None)
+    };
+    let mut st = crate::thread::defer_lock(&j.state);
+    match parsed {
+        SetJobInput::BasicLimits(buf) => {
+            let flags = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+            if (flags & UNENFORCED_JOB_LIMIT_FLAGS) != 0 {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectBasicLimitInformation, flags=0x{flags:x}): requested resource/time/memory limits are not enforced"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
+                let aff = usize::from_le_bytes(buf[48..56].try_into().unwrap());
+                let sm = system_affinity_mask();
+                if aff == 0
+                    || (aff & !sm) != 0
+                    || st.group_affinity_mask().is_some_and(|gm| (aff & gm) == 0)
+                {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+            }
+            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 {
+                let prio = u32::from_le_bytes(buf[56..60].try_into().unwrap());
+                if !is_valid_priority_class(prio) {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+            }
+            if st.has_live_child() && JobState::limits_require_child_enforcement(&buf, &st.group_affinities) {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectBasicLimitInformation): cannot apply affinity/priority limits to a job containing child processes"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            let contains_self = st.contains_pid(std::process::id());
+            let (apply_aff, apply_prio) = if contains_self {
+                let (Ok(other_a), Ok(other_p)) = (other_aff, other_prio) else {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                };
+                let new_aff = JobState::effective_affinity_from(&buf, &st.group_affinities);
+                let combined_aff = match combine_affinity_constraints(other_a, new_aff) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                };
+                let new_prio = JobState::priority_class_from(&buf);
+                let combined_prio = match combine_priority_constraints(other_p, new_prio) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                };
+                (combined_aff, combined_prio)
+            } else {
+                (None, None)
+            };
+            st.basic_limits = buf;
+            if let Some(prio) = apply_prio {
+                PRIORITY_CLASS.store(prio, Ordering::Release);
+            }
+            drop(st);
+            if let Some((aff, allow_subset)) = apply_aff {
+                apply_job_affinity_limit(aff, allow_subset);
+            }
+            TRUE
+        }
+        SetJobInput::AssociateCompletionPort(key, port) => {
+            if port.is_null() {
+                st.completion_port = None;
+                return TRUE;
+            }
+            if st.completion_port.is_some() {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let Some(iocp) = handles::get_as::<crate::kernel32::file::IoCompletionPort>(port) else {
+                set_err(err::ERROR_INVALID_HANDLE);
+                return FALSE;
+            };
+            let cp = (key, iocp);
+            // Per Microsoft Learn (JOBOBJECT_ASSOCIATE_COMPLETION_PORT): associating a
+            // completion port immediately posts JOB_OBJECT_MSG_NEW_PROCESS for every active
+            // process already in the job (synchronized under `j.state` against concurrent
+            // assignments and exits).
+            for m in &st.members {
+                if m.is_active() {
+                    post_job_iocp_msg(&cp, JOB_OBJECT_MSG_NEW_PROCESS, m.pid() as usize);
+                }
+            }
+            st.completion_port = Some(cp);
+            TRUE
+        }
+        SetJobInput::ExtendedLimits(basic) => {
+            let flags = u32::from_le_bytes(basic[16..20].try_into().unwrap());
+            if (flags & UNENFORCED_JOB_LIMIT_FLAGS) != 0 {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectExtendedLimitInformation, flags=0x{flags:x}): requested resource/time/memory limits are not enforced"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
+                let aff = usize::from_le_bytes(basic[48..56].try_into().unwrap());
+                let sm = system_affinity_mask();
+                if aff == 0
+                    || (aff & !sm) != 0
+                    || st.group_affinity_mask().is_some_and(|gm| (aff & gm) == 0)
+                {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+            }
+            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 {
+                let prio = u32::from_le_bytes(basic[56..60].try_into().unwrap());
+                if !is_valid_priority_class(prio) {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+            }
+            if st.has_live_child() && JobState::limits_require_child_enforcement(&basic, &st.group_affinities) {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectExtendedLimitInformation): cannot apply affinity/priority limits to a job containing child processes"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            let contains_self = st.contains_pid(std::process::id());
+            let (apply_aff, apply_prio) = if contains_self {
+                let (Ok(other_a), Ok(other_p)) = (other_aff, other_prio) else {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                };
+                let new_aff = JobState::effective_affinity_from(&basic, &st.group_affinities);
+                let combined_aff = match combine_affinity_constraints(other_a, new_aff) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                };
+                let new_prio = JobState::priority_class_from(&basic);
+                let combined_prio = match combine_priority_constraints(other_p, new_prio) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                };
+                (combined_aff, combined_prio)
+            } else {
+                (None, None)
+            };
+            st.basic_limits = basic;
+            if let Some(prio) = apply_prio {
+                PRIORITY_CLASS.store(prio, Ordering::Release);
+            }
+            drop(st);
+            if let Some((aff, allow_subset)) = apply_aff {
+                apply_job_affinity_limit(aff, allow_subset);
+            }
+            TRUE
+        }
+        SetJobInput::GroupIds(groups) => {
+            st.group_ids = groups;
+            TRUE
+        }
+        SetJobInput::GroupAffinities(out, combined_mask) => {
+            if (st.limit_flags() & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
+                let basic_aff = usize::from_le_bytes(st.basic_limits[48..56].try_into().unwrap());
+                if basic_aff != 0 && (basic_aff & combined_mask) == 0 {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+            }
+            if st.has_live_child() && JobState::limits_require_child_enforcement(&st.basic_limits, &out) {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectGroupInformationEx): cannot apply restricted group affinity to a job containing child processes"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            let apply_aff = if st.contains_pid(std::process::id()) {
+                let Ok(other) = other_aff else {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                };
+                let new_aff = JobState::effective_affinity_from(&st.basic_limits, &out);
+                match combine_affinity_constraints(other, new_aff) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                }
+            } else {
+                None
+            };
+            st.group_affinities = out;
+            drop(st);
+            if let Some((aff, allow_subset)) = apply_aff {
+                apply_job_affinity_limit(aff, allow_subset);
+            }
+            TRUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn QueryInformationJobObject(
+    job: HANDLE,
+    class: u32,
+    info: *mut c_void,
+    len: u32,
+    ret_len: *mut u32,
+) -> BOOL {
+    if info.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let j: Arc<JobObj> = if job.is_null() {
+        // Per Microsoft Learn: NULL queries the job associated with the current process.
+        let my_pid = std::process::id();
+        let found = {
+            let jobs = crate::thread::defer_lock(all_jobs());
+            jobs.iter()
+                .filter_map(|w| w.upgrade())
+                .find(|jo| crate::thread::defer_lock(&jo.state).contains_pid(my_pid))
+        };
+        match found {
+            Some(jo) => jo,
+            None => {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+        }
+    } else {
+        match handles::get_as::<JobObj>(job) {
+            Some(jo) => jo,
+            None => {
+                set_err(err::ERROR_INVALID_HANDLE);
+                return FALSE;
+            }
+        }
+    };
+
+    let put_ret = |n: u32| {
+        if !ret_len.is_null() {
+            std::ptr::write_unaligned(ret_len, n);
+        }
+    };
+    let out = info as *mut u8;
+    // Snapshot all required job state under `j.state`, then drop the lock BEFORE touching
+    // guest pointers (`info` / `ret_len`) so a `PAGE_GUARD` fault whose VEH re-enters
+    // `QueryInformationJobObject` / `SetInformationJobObject` cannot deadlock on `j.state`.
+    match class {
+        1 => {
+            // JobObjectBasicAccountingInformation (48 bytes):
+            // +0: TotalUserTime (u64), +8: TotalKernelTime (u64),
+            // +16: ThisPeriodTotalUserTime (u64), +24: ThisPeriodTotalKernelTime (u64),
+            // +32: TotalPageFaultCount (u32), +36: TotalProcesses (u32),
+            // +40: ActiveProcesses (u32), +44: TotalTerminatedProcesses (u32).
+            let (has_child, self_assign_rusage, self_period_rusage, total_processes, active_count, total_terminated) = {
+                let st = crate::thread::defer_lock(&j.state);
+                (
+                    st.members.iter().any(|m| matches!(m, JobMember::Child(_))),
+                    st.self_assign_rusage,
+                    st.self_period_rusage,
+                    st.total_processes,
+                    st.active_count(),
+                    st.total_terminated,
+                )
+            };
+            if has_child {
+                // Per-child CPU/fault accounting is not aggregated across waitpid; fail honestly
+                // rather than omitting child resource usage.
+                put_ret(0);
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            if len < 48 {
+                put_ret(48);
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            std::ptr::write_bytes(out, 0, 48);
+            if let Some((u0, k0, f0)) = self_assign_rusage {
+                let (u_now, k_now, f_now) = self_rusage_snapshot();
+                let (pu0, pk0) = self_period_rusage.unwrap_or((u0, k0));
+                std::ptr::write_unaligned(out.add(0) as *mut u64, u_now.saturating_sub(u0));
+                std::ptr::write_unaligned(out.add(8) as *mut u64, k_now.saturating_sub(k0));
+                std::ptr::write_unaligned(out.add(16) as *mut u64, u_now.saturating_sub(pu0));
+                std::ptr::write_unaligned(out.add(24) as *mut u64, k_now.saturating_sub(pk0));
+                std::ptr::write_unaligned(
+                    out.add(32) as *mut u32,
+                    f_now.saturating_sub(f0).min(u32::MAX as u64) as u32,
+                );
+            }
+            std::ptr::write_unaligned(out.add(36) as *mut u32, total_processes);
+            std::ptr::write_unaligned(out.add(40) as *mut u32, active_count);
+            std::ptr::write_unaligned(out.add(44) as *mut u32, total_terminated);
+            put_ret(48);
+            TRUE
+        }
+        2 => {
+            // JobObjectBasicLimitInformation (64 bytes)
+            let basic = crate::thread::defer_lock(&j.state).basic_limits;
+            if len < 64 {
+                put_ret(64);
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            std::ptr::copy_nonoverlapping(basic.as_ptr(), out, 64);
+            put_ret(64);
+            TRUE
+        }
+        3 => {
+            // JobObjectBasicProcessIdList: u32 assigned, u32 in_list, ULONG_PTR[in_list]
+            if len < 8 {
+                put_ret(8);
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let pids: Vec<usize> = {
+                let st = crate::thread::defer_lock(&j.state);
+                st.members.iter().filter(|m| m.is_active()).map(|m| m.pid() as usize).collect()
+            };
+            let cap = ((len as usize) - 8) / std::mem::size_of::<usize>();
+            let copy_n = pids.len().min(cap);
+            std::ptr::write_unaligned(out as *mut u32, pids.len() as u32);
+            std::ptr::write_unaligned(out.add(4) as *mut u32, copy_n as u32);
+            for (i, &pid) in pids.iter().take(copy_n).enumerate() {
+                std::ptr::write_unaligned(out.add(8 + i * 8) as *mut usize, pid);
+            }
+            let written = (8 + copy_n * 8) as u32;
+            put_ret(written);
+            if copy_n < pids.len() {
+                set_err(err::ERROR_MORE_DATA);
+                return FALSE;
+            }
+            TRUE
+        }
+        4 => {
+            // JobObjectBasicUIRestrictions (4 bytes): 0 = no UI restrictions active.
+            if len < 4 {
+                put_ret(4);
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            std::ptr::write_unaligned(out as *mut u32, 0);
+            put_ret(4);
+            TRUE
+        }
+        6 => {
+            // JobObjectEndOfJobTimeInformation: not enforced.
+            put_ret(0);
+            set_err(err::ERROR_NOT_SUPPORTED);
+            FALSE
+        }
+        8 => {
+            // JobObjectBasicAndIoAccountingInformation requires real per-job I/O counters
+            // (ReadOperationCount/WriteOperationCount/TransferCount across all I/O subsystems).
+            // Return an honest unsupported failure rather than fabricated zero I/O counters.
+            put_ret(0);
+            set_err(err::ERROR_NOT_SUPPORTED);
+            FALSE
+        }
+        9 => {
+            // JobObjectExtendedLimitInformation (144 bytes on x64).
+            // Per Microsoft Learn, `IoInfo` (+64..112) is "Reserved for future use" and left zeroed.
+            let (has_child, basic, contains_self) = {
+                let st = crate::thread::defer_lock(&j.state);
+                (
+                    st.members.iter().any(|m| matches!(m, JobMember::Child(_))),
+                    st.basic_limits,
+                    st.contains_pid(std::process::id()),
+                )
+            };
+            if has_child {
+                // Per-child peak memory usage is not aggregated across child processes;
+                // fail honestly rather than reporting incomplete job/process peaks.
+                log::warn!("QueryInformationJobObject(JobObjectExtendedLimitInformation): child peak memory accounting is not available");
+                put_ret(0);
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            if len < 144 {
+                put_ret(144);
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            std::ptr::write_bytes(out, 0, 144);
+            std::ptr::copy_nonoverlapping(basic.as_ptr(), out, 64);
+            let self_peak = if contains_self {
+                task_memory().1 as usize
+            } else {
+                0
+            };
+            std::ptr::write_unaligned(out.add(128) as *mut usize, self_peak);
+            std::ptr::write_unaligned(out.add(136) as *mut usize, self_peak);
+            put_ret(144);
+            TRUE
+        }
+        11 => {
+            // JobObjectGroupInformation
+            let group_ids = crate::thread::defer_lock(&j.state).group_ids.clone();
+            let needed = (group_ids.len() * 2) as u32;
+            put_ret(needed);
+            if len < needed {
+                set_err(err::ERROR_MORE_DATA);
+                return FALSE;
+            }
+            for (i, &g) in group_ids.iter().enumerate() {
+                std::ptr::write_unaligned(out.add(i * 2) as *mut u16, g);
+            }
+            TRUE
+        }
+        12 => {
+            // JobObjectNotificationLimitInformation: not enforced.
+            put_ret(0);
+            set_err(err::ERROR_NOT_SUPPORTED);
+            FALSE
+        }
+        14 => {
+            // JobObjectGroupInformationEx
+            let entries: Vec<[u8; 16]> = {
+                let st = crate::thread::defer_lock(&j.state);
+                if st.group_affinities.is_empty() {
+                    let mut def = [0u8; 16];
+                    def[0..8].copy_from_slice(&current_process_affinity_mask().to_le_bytes());
+                    vec![def]
+                } else {
+                    st.group_affinities.clone()
+                }
+            };
+            let needed = (entries.len() * 16) as u32;
+            put_ret(needed);
+            if len < needed {
+                set_err(err::ERROR_MORE_DATA);
+                return FALSE;
+            }
+            for (i, ga) in entries.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(ga.as_ptr(), out.add(i * 16), 16);
+            }
+            TRUE
+        }
+        15 => {
+            // JobObjectCpuRateControlInformation (8 bytes): reports disabled (all zeros).
+            if len < 8 {
+                put_ret(8);
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            std::ptr::write_bytes(out, 0, 8);
+            put_ret(8);
+            TRUE
+        }
+        _ => {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            FALSE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn IsProcessInJob(p: HANDLE, job: HANDLE, out: *mut BOOL) -> BOOL {
+    if out.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let pid = if is_self(p) {
+        std::process::id()
+    } else if let Some(child) = handles::get_as::<ChildProcessObj>(p) {
+        child.pid
+    } else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let in_job = if job.is_null() {
+        let jobs = crate::thread::defer_lock(all_jobs());
+        jobs.iter()
+            .filter_map(|w| w.upgrade())
+            .any(|jo| crate::thread::defer_lock(&jo.state).contains_pid(pid))
+    } else {
+        let Some(jo) = handles::get_as::<JobObj>(job) else {
+            set_err(err::ERROR_INVALID_HANDLE);
+            return FALSE;
+        };
+        let found = crate::thread::defer_lock(&jo.state).contains_pid(pid);
+        found
+    };
+    std::ptr::write_unaligned(out, if in_job { TRUE } else { FALSE });
     TRUE
 }
-pub unsafe extern "win64" fn IsProcessInJob(_p: HANDLE, _job: HANDLE, out: *mut BOOL) -> BOOL {
-    *out = FALSE;
+
+pub unsafe extern "win64" fn TerminateJobObject(job: HANDLE, exit_code: u32) -> BOOL {
+    let Some(j) = handles::get_as::<JobObj>(job) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let includes_self = j.terminate_children(exit_code);
+    if includes_self {
+        pr::exit_process(exit_code);
+    }
     TRUE
 }
 
@@ -1736,15 +3334,17 @@ unsafe fn process_entry(h: HANDLE, out: *mut u8, first: bool, wide: bool) -> BOO
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let mut pos = s.proc_pos.lock().unwrap();
-    if first {
-        *pos = 0;
+    {
+        let mut pos = crate::thread::defer_lock(&s.proc_pos);
+        if first {
+            *pos = 0;
+        }
+        if (s.flags & TH32CS_SNAPPROCESS) == 0 || *pos >= 1 {
+            set_err(err::ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        *pos += 1;
     }
-    if (s.flags & TH32CS_SNAPPROCESS) == 0 || *pos >= 1 {
-        set_err(err::ERROR_NO_MORE_FILES);
-        return FALSE;
-    }
-    *pos += 1;
     let size = if wide { 568 } else { 304 };
     std::ptr::write_bytes(out.add(4), 0, size - 4);
     (out.add(8) as *mut u32).write_unaligned(std::process::id());
@@ -1785,15 +3385,18 @@ unsafe fn thread_entry(h: HANDLE, out: *mut u8, first: bool) -> BOOL {
         set_err(24); // ERROR_BAD_LENGTH
         return FALSE;
     }
-    let mut pos = s.thread_pos.lock().unwrap();
-    if first {
-        *pos = 0;
-    }
-    let Some(&(tid, base_pri)) = s.threads.get(*pos) else {
-        set_err(err::ERROR_NO_MORE_FILES);
-        return FALSE;
+    let (tid, base_pri) = {
+        let mut pos = crate::thread::defer_lock(&s.thread_pos);
+        if first {
+            *pos = 0;
+        }
+        let Some(&entry) = s.threads.get(*pos) else {
+            set_err(err::ERROR_NO_MORE_FILES);
+            return FALSE;
+        };
+        *pos += 1;
+        entry
     };
-    *pos += 1;
     // THREADENTRY32 (28 bytes):
     // +0x00 dwSize, +0x04 cntUsage, +0x08 th32ThreadID, +0x0C th32OwnerProcessID,
     // +0x10 tpBasePri, +0x14 tpDeltaPri, +0x18 dwFlags
@@ -1829,15 +3432,20 @@ unsafe fn module_entry(h: HANDLE, out: *mut u8, first: bool, wide: bool) -> BOOL
         set_err(24); // ERROR_BAD_LENGTH
         return FALSE;
     }
-    let mut pos = s.mod_pos.lock().unwrap();
-    if first {
-        *pos = 0;
-    }
-    let Some((base, size, path)) = s.modules.get(*pos) else {
-        set_err(err::ERROR_NO_MORE_FILES);
-        return FALSE;
+    let idx = {
+        let mut pos = crate::thread::defer_lock(&s.mod_pos);
+        if first {
+            *pos = 0;
+        }
+        if *pos >= s.modules.len() {
+            set_err(err::ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        let cur = *pos;
+        *pos += 1;
+        cur
     };
-    *pos += 1;
+    let (base, size, path) = &s.modules[idx];
     std::ptr::write_bytes(out.add(4), 0, (expected as usize) - 4);
     // Win64 MODULEENTRY32 / MODULEENTRY32W:
     // +0x00 dwSize, +0x04 th32ModuleID, +0x08 th32ProcessID,
@@ -1911,7 +3519,7 @@ pub unsafe extern "win64" fn AppPolicyGetWindowingModel(_token: HANDLE, policy: 
 // Pointer encoding
 // ---------------------------------------------------------------------------
 
-fn process_cookie() -> usize {
+pub(crate) fn process_cookie() -> usize {
     static C: OnceLock<usize> = OnceLock::new();
     *C.get_or_init(|| {
         let mut v: u64 = 0;
@@ -2166,28 +3774,124 @@ unsafe fn format_inserts(fmt: &str, ignore: bool, wide_args: bool, arg: &mut dyn
     out
 }
 
-unsafe fn format_message(flags: u32, source: *const c_void, id: u32, args: *const u64, wide: bool) -> Result<String, u32> {
+/// Search one `MESSAGE_RESOURCE_DATA` blob for message `id`.
+///
+/// Parses the Windows `MESSAGE_RESOURCE_DATA` / `MESSAGE_RESOURCE_BLOCK` /
+/// `MESSAGE_RESOURCE_ENTRY` binary format (`winnt.h`), supporting both Unicode
+/// (`MESSAGE_RESOURCE_UNICODE = 0x0001`) and ANSI entries.
+unsafe fn search_message_table(data: *const u8, total_len: usize, id: u32) -> Option<String> {
+    const MESSAGE_RESOURCE_UNICODE: u16 = 0x0001;
+    if data.is_null() || total_len < 4 {
+        return None;
+    }
+    let num_blocks = std::ptr::read_unaligned(data as *const u32) as usize;
+    let header_end = 4usize.checked_add(num_blocks.checked_mul(12)?)?;
+    if header_end > total_len {
+        return None;
+    }
+    for b in 0..num_blocks {
+        let blk = data.add(4 + b * 12);
+        let low_id = std::ptr::read_unaligned(blk as *const u32);
+        let high_id = std::ptr::read_unaligned(blk.add(4) as *const u32);
+        let mut off = std::ptr::read_unaligned(blk.add(8) as *const u32) as usize;
+        if id < low_id || id > high_id {
+            continue;
+        }
+        let target_idx = id - low_id;
+        for idx in 0..=target_idx {
+            if off.checked_add(4).is_none_or(|e| e > total_len) {
+                break;
+            }
+            let entry_len = std::ptr::read_unaligned(data.add(off) as *const u16) as usize;
+            let entry_flags = std::ptr::read_unaligned(data.add(off + 2) as *const u16);
+            if entry_len < 4 || off.checked_add(entry_len).is_none_or(|e| e > total_len) {
+                break;
+            }
+            if idx == target_idx {
+                let payload = data.add(off + 4);
+                let payload_len = entry_len - 4;
+                if (entry_flags & MESSAGE_RESOURCE_UNICODE) != 0 {
+                    let max_units = payload_len / 2;
+                    let mut units = Vec::with_capacity(max_units);
+                    for k in 0..max_units {
+                        let u = std::ptr::read_unaligned(payload.add(k * 2) as *const u16);
+                        if u == 0 {
+                            break;
+                        }
+                        units.push(u);
+                    }
+                    return Some(String::from_utf16_lossy(&units));
+                } else {
+                    let mut bytes = Vec::with_capacity(payload_len);
+                    for k in 0..payload_len {
+                        let ch = *payload.add(k);
+                        if ch == 0 {
+                            break;
+                        }
+                        bytes.push(ch);
+                    }
+                    return Some(bytes.into_iter().map(|c| c as char).collect());
+                }
+            }
+            off += entry_len;
+        }
+    }
+    None
+}
+
+/// Look up message `id` across all `RT_MESSAGETABLE` (resource type 11) resources in a loaded PE module.
+unsafe fn lookup_module_message(source: *const c_void, id: u32, lang: u32) -> Result<String, u32> {
+    const RT_MESSAGETABLE: u16 = 11;
+    let hmod: HMODULE = if source.is_null() {
+        match crate::try_loader().and_then(|l| l.get_module_handle(None)) {
+            Some(base) if base != 0 => base as HMODULE,
+            _ => return Err(err::ERROR_MR_MID_NOT_FOUND),
+        }
+    } else {
+        source as HMODULE
+    };
+    let tables = crate::kernel32::module::find_all_resources_of_type(hmod, RT_MESSAGETABLE, lang as u16)?;
+    for (data, total_len) in tables {
+        if let Some(msg) = search_message_table(data, total_len, id) {
+            return Ok(msg);
+        }
+    }
+    Err(err::ERROR_MR_MID_NOT_FOUND)
+}
+
+unsafe fn format_message(flags: u32, source: *const c_void, id: u32, lang: u32, args: *const u64, wide: bool) -> Result<String, u32> {
     let fmt: String = if flags & FORMAT_MESSAGE_FROM_STRING != 0 {
+        if source.is_null() {
+            return Err(err::ERROR_INVALID_PARAMETER);
+        }
         if wide {
             from_wide(source as *const u16)
         } else {
             from_ansi(source as *const u8)
         }
-    } else if flags & FORMAT_MESSAGE_FROM_SYSTEM != 0 {
-        match system_message(id) {
-            Some(m) => format!("{m}\r\n"),
-            None if flags & FORMAT_MESSAGE_FROM_HMODULE != 0 => {
-                stub!("message tables in modules are not supported (id {id:#x})");
-                return Err(317);
-            }
-            None => {
-                log::debug!("FormatMessage: no system text for {id:#x}");
-                return Err(317); // ERROR_MR_MID_NOT_FOUND
-            }
+    } else if (flags & (FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_FROM_SYSTEM)) != 0 {
+        // Per Microsoft Learn (FormatMessage): when both FROM_HMODULE and FROM_SYSTEM
+        // are specified, search the module's RT_MESSAGETABLE first and fall back to the
+        // system message table if not found.
+        let from_mod = if (flags & FORMAT_MESSAGE_FROM_HMODULE) != 0 {
+            Some(lookup_module_message(source, id, lang))
+        } else {
+            None
+        };
+        match from_mod {
+            Some(Ok(m)) => m,
+            _ if (flags & FORMAT_MESSAGE_FROM_SYSTEM) != 0 => match system_message(id) {
+                Some(m) => format!("{m}\r\n"),
+                None => {
+                    log::debug!("FormatMessage: no system text for {id:#x}");
+                    return Err(err::ERROR_MR_MID_NOT_FOUND);
+                }
+            },
+            Some(Err(e)) => return Err(e),
+            None => return Err(err::ERROR_MR_MID_NOT_FOUND),
         }
     } else {
-        stub!("FormatMessage from module message table (id {id:#x})");
-        return Err(317);
+        return Err(err::ERROR_INVALID_PARAMETER);
     };
     let array = flags & FORMAT_MESSAGE_ARGUMENT_ARRAY != 0;
     // Non-array args are a `va_list*`; on Win64 a va_list is a pointer to 8-byte slots.
@@ -2213,8 +3917,8 @@ unsafe fn format_message(flags: u32, source: *const c_void, id: u32, args: *cons
     Ok(s)
 }
 
-pub unsafe extern "win64" fn FormatMessageW(flags: u32, source: *const c_void, id: u32, _lang: u32, buf: LPWSTR, size: u32, args: *const u64) -> u32 {
-    let s = match format_message(flags, source, id, args, true) {
+pub unsafe extern "win64" fn FormatMessageW(flags: u32, source: *const c_void, id: u32, lang: u32, buf: LPWSTR, size: u32, args: *const u64) -> u32 {
+    let s = match format_message(flags, source, id, lang, args, true) {
         Ok(s) => s,
         Err(e) => {
             set_err(e);
@@ -2236,8 +3940,8 @@ pub unsafe extern "win64" fn FormatMessageW(flags: u32, source: *const c_void, i
     w.len() as u32 - 1
 }
 
-pub unsafe extern "win64" fn FormatMessageA(flags: u32, source: *const c_void, id: u32, _lang: u32, buf: LPSTR, size: u32, args: *const u64) -> u32 {
-    let s = match format_message(flags, source, id, args, false) {
+pub unsafe extern "win64" fn FormatMessageA(flags: u32, source: *const c_void, id: u32, lang: u32, buf: LPSTR, size: u32, args: *const u64) -> u32 {
+    let s = match format_message(flags, source, id, lang, args, false) {
         Ok(s) => s,
         Err(e) => {
             set_err(e);
@@ -2267,7 +3971,7 @@ static NEXT_ATOM: AtomicUsize = AtomicUsize::new(0xC000);
 
 fn add_atom(s: String) -> u16 {
     static ATOMS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, u16>>> = OnceLock::new();
-    let mut map = ATOMS.get_or_init(Default::default).lock().unwrap();
+    let mut map = crate::thread::defer_lock(ATOMS.get_or_init(Default::default));
     let key = s.to_ascii_lowercase();
     if let Some(&a) = map.get(&key) {
         return a;
@@ -2409,7 +4113,7 @@ pub unsafe extern "win64" fn GetBinaryTypeW(_app_name: LPCWSTR, binary_type: *mu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn pointer_codec() {
@@ -2778,6 +4482,7 @@ mod tests {
             &[],
             &stdio1,
             None,
+            true,
         );
         drop(stdio1);
         assert_eq!(
@@ -2805,6 +4510,7 @@ mod tests {
             &[],
             &stdio2,
             None,
+            true,
         )
         .expect("matching kernel CDHash must resume and succeed");
         drop(stdio2);
@@ -2814,6 +4520,31 @@ mod tests {
         assert_eq!(waited, pid);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         assert_eq!(out, b"verified-ok\n");
+
+        // 3. With resume_immediately=false, a verified child remains suspended until explicitly
+        //    resumed or killed, producing zero side effects if aborted before SIGCONT.
+        let (r3, w3) = make_pipe();
+        let stdio3 = ChildStdioPlan {
+            stdin: ChildStdioTarget::DevNull,
+            stdout: ChildStdioTarget::DupFd(w3),
+            stderr: ChildStdioTarget::DevNull,
+        };
+        let suspended_pid = spawn_and_verify_suspended_child(
+            echo_path,
+            &echo_trusted.identity,
+            &[std::ffi::OsString::from("MUST_STAY_SUSPENDED")],
+            &[],
+            &stdio3,
+            None,
+            false,
+        )
+        .expect("matching kernel CDHash must return suspended pid");
+        drop(stdio3);
+        pr::kill_and_reap_pid(suspended_pid);
+        assert!(
+            read_all(&r3).is_empty(),
+            "child killed while suspended before SIGCONT must never execute userspace code"
+        );
     }
 
     #[cfg(not(target_os = "ios"))]
@@ -2990,5 +4721,972 @@ mod tests {
         crate::path::set_cwd(&prev_cwd);
         pr::set_env("Path", prev_path.as_deref());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_object_limits_membership_query_and_active_limit() {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            assert!(!job.is_null());
+
+            // Initially current process is not in this job.
+            let mut in_job: BOOL = TRUE;
+            assert_eq!(IsProcessInJob(handles::CURRENT_PROCESS, job, &mut in_job), TRUE);
+            assert_eq!(in_job, FALSE);
+
+            // Unenforced process/job memory limits fail honestly with ERROR_NOT_SUPPORTED.
+            let mut ext_mem = [0u8; 144];
+            std::ptr::write_unaligned(ext_mem.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_PROCESS_MEMORY);
+            std::ptr::write_unaligned(ext_mem.as_mut_ptr().add(112) as *mut usize, 64 * 1024 * 1024);
+            assert_eq!(SetInformationJobObject(job, 9, ext_mem.as_ptr() as *const c_void, 144), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            std::ptr::write_unaligned(ext_mem.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_JOB_MEMORY);
+            std::ptr::write_unaligned(ext_mem.as_mut_ptr().add(120) as *mut usize, 128 * 1024 * 1024);
+            assert_eq!(SetInformationJobObject(job, 9, ext_mem.as_ptr() as *const c_void, 144), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // Set enforced extended limits (KILL_ON_JOB_CLOSE | ACTIVE_PROCESS=1).
+            let mut ext = [0u8; 144];
+            let flags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            std::ptr::write_unaligned(ext.as_mut_ptr().add(16) as *mut u32, flags);
+            std::ptr::write_unaligned(ext.as_mut_ptr().add(40) as *mut u32, 1u32); // ActiveProcessLimit = 1
+            assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
+
+            // Assign current process.
+            assert_eq!(AssignProcessToJobObject(job, handles::CURRENT_PROCESS), TRUE);
+            assert_eq!(IsProcessInJob(handles::CURRENT_PROCESS, job, &mut in_job), TRUE);
+            assert_eq!(in_job, TRUE);
+            assert_eq!(IsProcessInJob(handles::CURRENT_PROCESS, std::ptr::null_mut(), &mut in_job), TRUE);
+            assert_eq!(in_job, TRUE);
+
+            // Query back JobObjectExtendedLimitInformation (class 9).
+            let mut out_ext = [0u8; 144];
+            let mut ret_len = 0u32;
+            assert_eq!(QueryInformationJobObject(job, 9, out_ext.as_mut_ptr() as *mut c_void, 144, &mut ret_len), TRUE);
+            assert_eq!(ret_len, 144);
+            assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(16) as *const u32), flags);
+            assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(40) as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(112) as *const usize), 0);
+            assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(120) as *const usize), 0);
+            assert!(std::ptr::read_unaligned(out_ext.as_ptr().add(128) as *const usize) > 0);
+            assert!(std::ptr::read_unaligned(out_ext.as_ptr().add(136) as *const usize) > 0);
+
+            // Burn a small amount of real CPU time so getrusage(RUSAGE_SELF) advances visibly.
+            let mut spin: u64 = 1;
+            let spin_start = std::time::Instant::now();
+            while spin_start.elapsed() < std::time::Duration::from_millis(5) {
+                spin = spin.wrapping_mul(6364136223846793005).wrapping_add(1);
+                std::hint::black_box(spin);
+            }
+
+            // Query JobObjectBasicAccountingInformation (class 1) at the exact Windows ABI offsets:
+            // +0 TotalUserTime, +8 TotalKernelTime, +16 ThisPeriodTotalUserTime, +24 ThisPeriodTotalKernelTime,
+            // +32 TotalPageFaultCount, +36 TotalProcesses, +40 ActiveProcesses, +44 TotalTerminatedProcesses.
+            let mut acct = [0u8; 48];
+            assert_eq!(QueryInformationJobObject(job, 1, acct.as_mut_ptr() as *mut c_void, 48, &mut ret_len), TRUE);
+            assert_eq!(ret_len, 48);
+            let total_user = std::ptr::read_unaligned(acct.as_ptr().add(0) as *const u64);
+            let total_kernel = std::ptr::read_unaligned(acct.as_ptr().add(8) as *const u64);
+            let period_user = std::ptr::read_unaligned(acct.as_ptr().add(16) as *const u64);
+            let period_kernel = std::ptr::read_unaligned(acct.as_ptr().add(24) as *const u64);
+            assert!(total_user + total_kernel > 0, "expected real CPU time accounting after busy spin");
+            assert_eq!(period_user, total_user);
+            assert_eq!(period_kernel, total_kernel);
+            assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(36) as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(40) as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(44) as *const u32), 0);
+
+            // JobObjectBasicAndIoAccountingInformation (class 8) honestly fails with ERROR_NOT_SUPPORTED
+            // until real per-job I/O accounting is wired.
+            let mut acct_io = [0u8; 96];
+            ret_len = 99;
+            assert_eq!(QueryInformationJobObject(job, 8, acct_io.as_mut_ptr() as *mut c_void, 96, &mut ret_len), FALSE);
+            assert_eq!(ret_len, 0);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // Query JobObjectBasicProcessIdList (class 3).
+            let mut pid_list = [0u8; 32];
+            assert_eq!(QueryInformationJobObject(job, 3, pid_list.as_mut_ptr() as *mut c_void, 32, &mut ret_len), TRUE);
+            assert_eq!(std::ptr::read_unaligned(pid_list.as_ptr() as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(pid_list.as_ptr().add(4) as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(pid_list.as_ptr().add(8) as *const usize), std::process::id() as usize);
+
+            // JobObjectCpuRateControlInformation (class 15): validates 8-byte ABI, rejects enabled
+            // CPU caps honestly with ERROR_NOT_SUPPORTED, and accepts disabled (0) cleanly.
+            let mut cpu_rate = [0u8; 8];
+            std::ptr::write_unaligned(cpu_rate.as_mut_ptr() as *mut u32, 0x05u32); // ENABLE | HARD_CAP
+            std::ptr::write_unaligned(cpu_rate.as_mut_ptr().add(4) as *mut u32, 5000u32); // 50%
+            assert_eq!(SetInformationJobObject(job, 15, cpu_rate.as_ptr() as *const c_void, 12), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_BAD_LENGTH);
+            assert_eq!(SetInformationJobObject(job, 15, cpu_rate.as_ptr() as *const c_void, 8), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            let zero_cpu = [0u8; 8];
+            assert_eq!(SetInformationJobObject(job, 15, zero_cpu.as_ptr() as *const c_void, 8), TRUE);
+            let mut out_cpu = [0xFFu8; 8];
+            assert_eq!(QueryInformationJobObject(job, 15, out_cpu.as_mut_ptr() as *mut c_void, 8, &mut ret_len), TRUE);
+            assert_eq!(ret_len, 8);
+            assert_eq!(out_cpu, zero_cpu);
+
+            // Unenforced UI restrictions (non-zero), end-of-job-time action, and notification limits fail honestly.
+            let ui_mask = 1u32;
+            assert_eq!(SetInformationJobObject(job, 4, &ui_mask as *const u32 as *const c_void, 4), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            let ui_zero = 0u32;
+            assert_eq!(SetInformationJobObject(job, 4, &ui_zero as *const u32 as *const c_void, 4), TRUE);
+            let notif = [0u8; 72];
+            assert_eq!(SetInformationJobObject(job, 12, notif.as_ptr() as *const c_void, 72), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // Wrong struct size -> ERROR_BAD_LENGTH.
+            assert_eq!(SetInformationJobObject(job, 2, ext.as_ptr() as *const c_void, 16), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_BAD_LENGTH);
+
+            // Unknown info class -> ERROR_INVALID_PARAMETER.
+            assert_eq!(SetInformationJobObject(job, 999, ext.as_ptr() as *const c_void, 4), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // JOB_OBJECT_LIMIT_AFFINITY restricts GetProcessAffinityMask, SetProcessAffinityMask,
+            // and SetThreadAffinityMask for assigned processes.
+            let mut orig_pm = 0usize;
+            let mut orig_sm = 0usize;
+            assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut orig_pm, &mut orig_sm), TRUE);
+            if orig_sm >= 0x3 {
+                let mut aff_basic = [0u8; 64];
+                std::ptr::write_unaligned(
+                    aff_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_AFFINITY,
+                );
+                std::ptr::write_unaligned(aff_basic.as_mut_ptr().add(40) as *mut u32, 1u32);
+                std::ptr::write_unaligned(aff_basic.as_mut_ptr().add(48) as *mut usize, 0x1usize);
+                assert_eq!(SetInformationJobObject(job, 2, aff_basic.as_ptr() as *const c_void, 64), TRUE);
+
+                let mut pm_now = 0usize;
+                let mut sm_now = 0usize;
+                assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut pm_now, &mut sm_now), TRUE);
+                assert_eq!(pm_now, 0x1);
+                // Disallowed CPU bit 1 rejected by both SetThreadAffinityMask and SetProcessAffinityMask.
+                assert_eq!(crate::kernel32::threads::SetThreadAffinityMask(handles::CURRENT_THREAD, 0x2), 0);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+                // Clear basic affinity limit and verify JobObjectGroupInformationEx (class 14)
+                // enforces its restricted group-0 CPU mask identically.
+                std::ptr::write_unaligned(aff_basic.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_ACTIVE_PROCESS);
+                assert_eq!(SetInformationJobObject(job, 2, aff_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), TRUE);
+
+                let mut ga = [0u8; 16];
+                std::ptr::write_unaligned(ga.as_mut_ptr() as *mut usize, 0x1usize); // mask = CPU 0, group = 0
+                assert_eq!(SetInformationJobObject(job, 14, ga.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut pm_now, &mut sm_now), TRUE);
+                assert_eq!(pm_now, 0x1);
+                assert_eq!(crate::kernel32::threads::SetThreadAffinityMask(handles::CURRENT_THREAD, 0x2), 0);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+                // Setting JOB_OBJECT_LIMIT_AFFINITY (class 2 or class 9) to a mask disjoint from
+                // the existing JobObjectGroupInformationEx mask (0x1) must be rejected instead of
+                // clearing the effective affinity constraint.
+                std::ptr::write_unaligned(
+                    aff_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_AFFINITY,
+                );
+                std::ptr::write_unaligned(aff_basic.as_mut_ptr().add(48) as *mut usize, 0x2usize);
+                assert_eq!(SetInformationJobObject(job, 2, aff_basic.as_ptr() as *const c_void, 64), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                let mut disjoint_ext = [0u8; 144];
+                disjoint_ext[..64].copy_from_slice(&aff_basic);
+                assert_eq!(SetInformationJobObject(job, 9, disjoint_ext.as_ptr() as *const c_void, 144), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                // Existing group affinity restriction (0x1) remains intact after the rejected updates.
+                assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut pm_now, &mut sm_now), TRUE);
+                assert_eq!(pm_now, 0x1);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+                // Cross-job affinity compatibility: assigning self to a second job with a disjoint
+                // mask (0x2 vs existing 0x1) must fail instead of clearing the combined constraint,
+                // and updating a second assigned job to a disjoint mask must likewise be rejected.
+                let job2 = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!job2.is_null());
+                let mut ga2 = [0u8; 16];
+                std::ptr::write_unaligned(ga2.as_mut_ptr() as *mut usize, 0x2usize);
+                assert_eq!(SetInformationJobObject(job2, 14, ga2.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(AssignProcessToJobObject(job2, handles::CURRENT_PROCESS), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                // Compatible wider mask (0x3) succeeds while preserving the intersected 0x1 restriction.
+                std::ptr::write_unaligned(ga2.as_mut_ptr() as *mut usize, 0x3usize);
+                assert_eq!(SetInformationJobObject(job2, 14, ga2.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(AssignProcessToJobObject(job2, handles::CURRENT_PROCESS), TRUE);
+                assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut pm_now, &mut sm_now), TRUE);
+                assert_eq!(pm_now, 0x1);
+                // Updating job2 to disjoint mask 0x2 (via class 14 or class 2) must fail.
+                std::ptr::write_unaligned(ga2.as_mut_ptr() as *mut usize, 0x2usize);
+                assert_eq!(SetInformationJobObject(job2, 14, ga2.as_ptr() as *const c_void, 16), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(SetInformationJobObject(job2, 2, aff_basic.as_ptr() as *const c_void, 64), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                // Restore job2 to unrestricted full mask + SILENT_BREAKAWAY_OK before closing so it
+                // never constrains subsequent tests in this binary.
+                std::ptr::write_unaligned(ga2.as_mut_ptr() as *mut usize, orig_sm);
+                assert_eq!(SetInformationJobObject(job2, 14, ga2.as_ptr() as *const c_void, 16), TRUE);
+                let mut job2_clear = [0u8; 64];
+                std::ptr::write_unaligned(
+                    job2_clear.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+                );
+                assert_eq!(SetInformationJobObject(job2, 2, job2_clear.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(job2), TRUE);
+
+                // GetProcessAffinityMask on a child handle fails honestly with ERROR_NOT_SUPPORTED
+                // rather than leaking the parent's restricted affinity mask.
+                let child_probe = make_test_child_handle(99990, "C:\\Games\\AffinityProbe.exe");
+                let mut child_pm = 0usize;
+                let mut child_sm = 0usize;
+                assert_eq!(GetProcessAffinityMask(child_probe, &mut child_pm, &mut child_sm), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                assert_eq!(GetPriorityClass(child_probe), 0);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                assert_eq!(SetPriorityClass(child_probe, 0x20), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+                assert_eq!(crate::kernel32::threads::CloseHandle(child_probe), TRUE);
+
+                // Restore full group-0 affinity mask before continuing.
+                std::ptr::write_unaligned(ga.as_mut_ptr() as *mut usize, orig_sm);
+                assert_eq!(SetInformationJobObject(job, 14, ga.as_ptr() as *const c_void, 16), TRUE);
+            }
+
+            // JOB_OBJECT_LIMIT_PRIORITY_CLASS applies the priority class AND blocks subsequent
+            // SetPriorityClass attempts from escaping it (both class 2 and class 9), as well as
+            // rejecting conflicting priority classes across jobs.
+            {
+                let orig_prio = GetPriorityClass(handles::CURRENT_PROCESS);
+                let mut prio_basic = [0u8; 64];
+                std::ptr::write_unaligned(
+                    prio_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+                );
+                std::ptr::write_unaligned(prio_basic.as_mut_ptr().add(40) as *mut u32, 1u32);
+                std::ptr::write_unaligned(prio_basic.as_mut_ptr().add(56) as *mut u32, 0x4000u32); // BELOW_NORMAL
+                assert_eq!(SetInformationJobObject(job, 2, prio_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(GetPriorityClass(handles::CURRENT_PROCESS), 0x4000);
+                // Changing priority class to HIGH (0x80) is rejected with ERROR_ACCESS_DENIED.
+                assert_eq!(SetPriorityClass(handles::CURRENT_PROCESS, 0x80), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+                assert_eq!(GetPriorityClass(handles::CURRENT_PROCESS), 0x4000);
+                // Setting the exact job-locked class succeeds idempotently.
+                assert_eq!(SetPriorityClass(handles::CURRENT_PROCESS, 0x4000), TRUE);
+                // Assigning self to a second job with a conflicting priority class is rejected.
+                let pjob2 = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!pjob2.is_null());
+                let mut p2_ext = [0u8; 144];
+                std::ptr::write_unaligned(
+                    p2_ext.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+                );
+                std::ptr::write_unaligned(p2_ext.as_mut_ptr().add(56) as *mut u32, 0x80u32); // HIGH
+                assert_eq!(SetInformationJobObject(pjob2, 9, p2_ext.as_ptr() as *const c_void, 144), TRUE);
+                assert_eq!(AssignProcessToJobObject(pjob2, handles::CURRENT_PROCESS), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(crate::kernel32::threads::CloseHandle(pjob2), TRUE);
+                // Clearing JOB_OBJECT_LIMIT_PRIORITY_CLASS restores SetPriorityClass control.
+                std::ptr::write_unaligned(
+                    prio_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                );
+                assert_eq!(SetInformationJobObject(job, 2, prio_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(SetPriorityClass(handles::CURRENT_PROCESS, orig_prio), TRUE);
+                assert_eq!(GetPriorityClass(handles::CURRENT_PROCESS), orig_prio);
+            }
+
+            // JOB_OBJECT_LIMIT_ACTIVE_PROCESS with ActiveProcessLimit == 0 enforces a zero quota
+            // rather than treating 0 as unlimited (both on direct assignment and child inheritance).
+            {
+                let zero_job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!zero_job.is_null());
+                let mut zero_basic = [0u8; 64];
+                std::ptr::write_unaligned(
+                    zero_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                );
+                // ActiveProcessLimit at offset +40 stays 0.
+                assert_eq!(SetInformationJobObject(zero_job, 2, zero_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(AssignProcessToJobObject(zero_job, handles::CURRENT_PROCESS), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_ENOUGH_QUOTA);
+                let zero_child_h = make_test_child_handle(99990, "C:\\Games\\ZeroQuota.exe");
+                assert_eq!(AssignProcessToJobObject(zero_job, zero_child_h), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_ENOUGH_QUOTA);
+                assert_eq!(crate::kernel32::threads::CloseHandle(zero_child_h), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(zero_job), TRUE);
+            }
+
+            // Concurrent SetProcessAffinityMask vs job-limit updates never leave the process
+            // with an affinity mask violating an active job restriction.
+            if orig_sm >= 0x3 {
+                let mut race_basic = [0u8; 64];
+                std::ptr::write_unaligned(
+                    race_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_AFFINITY,
+                );
+                std::ptr::write_unaligned(race_basic.as_mut_ptr().add(40) as *mut u32, 1u32);
+                std::ptr::write_unaligned(race_basic.as_mut_ptr().add(48) as *mut usize, 0x1usize);
+                let job_raw = job as usize;
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let b2 = Arc::clone(&barrier);
+                let setter = std::thread::spawn(move || {
+                    b2.wait();
+                    for _ in 0..64 {
+                        let _ = SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm);
+                    }
+                });
+                barrier.wait();
+                assert_eq!(
+                    SetInformationJobObject(job_raw as HANDLE, 2, race_basic.as_ptr() as *const c_void, 64),
+                    TRUE
+                );
+                setter.join().unwrap();
+                assert_eq!(current_process_affinity_mask(), 0x1);
+                // Clear JOB_OBJECT_LIMIT_AFFINITY and restore full mask.
+                std::ptr::write_unaligned(
+                    race_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                );
+                assert_eq!(SetInformationJobObject(job, 2, race_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), TRUE);
+            }
+
+            // Child creation enforces ActiveProcessLimit, CREATE_BREAKAWAY_FROM_JOB /
+            // SILENT_BREAKAWAY_OK, and honestly rejects unsupported cross-process job inheritance.
+            #[cfg(not(target_os = "ios"))]
+            {
+                // ActiveProcessLimit == 0 on a job containing self rejects child spawn with ERROR_NOT_ENOUGH_QUOTA.
+                let mut zero_inh = [0u8; 64];
+                std::ptr::write_unaligned(
+                    zero_inh.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                );
+                assert_eq!(SetInformationJobObject(job, 2, zero_inh.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(check_parent_jobs_for_child_spawn(0), Err(err::ERROR_NOT_ENOUGH_QUOTA));
+                std::ptr::write_unaligned(zero_inh.as_mut_ptr().add(40) as *mut u32, 1u32);
+                assert_eq!(SetInformationJobObject(job, 2, zero_inh.as_ptr() as *const c_void, 64), TRUE);
+
+                // ActiveProcessLimit == 1 is already saturated by CURRENT_PROCESS -> ERROR_NOT_ENOUGH_QUOTA.
+                assert_eq!(check_parent_jobs_for_child_spawn(0), Err(err::ERROR_NOT_ENOUGH_QUOTA));
+                // CREATE_BREAKAWAY_FROM_JOB without BREAKAWAY_OK -> ERROR_ACCESS_DENIED.
+                assert_eq!(
+                    check_parent_jobs_for_child_spawn(CREATE_BREAKAWAY_FROM_JOB),
+                    Err(err::ERROR_ACCESS_DENIED)
+                );
+
+                // Allow 2 active processes + BREAKAWAY_OK: explicit breakaway succeeds, while
+                // non-breakaway child inheritance fails honestly with ERROR_NOT_SUPPORTED.
+                std::ptr::write_unaligned(
+                    ext.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                );
+                std::ptr::write_unaligned(ext.as_mut_ptr().add(40) as *mut u32, 2u32);
+                assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
+
+                assert_eq!(check_parent_jobs_for_child_spawn(CREATE_BREAKAWAY_FROM_JOB), Ok(()));
+                assert_eq!(check_parent_jobs_for_child_spawn(0), Err(err::ERROR_NOT_SUPPORTED));
+
+                // Direct AssignProcessToJobObject attaches a child to `job` for parent-side
+                // quota/termination/IOCP tracking, enforces class-9/affinity child guards.
+                let inh_child = Arc::new(ChildProcessObj {
+                    pid: 99991,
+                    exe_win: "C:\\Games\\AssignedChild.exe".to_string(),
+                    exit_code: handles::Guarded::new(None),
+                    terminated_code: handles::Guarded::new(None),
+                    os_pid: std::sync::atomic::AtomicI32::new(0),
+                });
+                let inh_h = handles::insert(Arc::clone(&inh_child) as Arc<dyn KObject>);
+                assert_eq!(AssignProcessToJobObject(job, inh_h), TRUE);
+                let mut inh_in_job: BOOL = FALSE;
+                assert_eq!(IsProcessInJob(inh_h, job, &mut inh_in_job), TRUE);
+                assert_eq!(inh_in_job, TRUE);
+                // With a child member present, JobObjectExtendedLimitInformation (class 9) fails
+                // honestly with ERROR_NOT_SUPPORTED rather than omitting child memory peaks.
+                let mut child_ext = [0u8; 144];
+                assert_eq!(QueryInformationJobObject(job, 9, child_ext.as_mut_ptr() as *mut c_void, 144, &mut ret_len), FALSE);
+                assert_eq!(ret_len, 0);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                // ActiveProcessLimit == 2 is now saturated (self + assigned child).
+                assert_eq!(check_parent_jobs_for_child_spawn(0), Err(err::ERROR_NOT_ENOUGH_QUOTA));
+                // While a live child belongs to the job, setting restricted affinity (class 2/9/14)
+                // or priority class fails honestly with ERROR_NOT_SUPPORTED.
+                if orig_sm >= 0x3 {
+                    let mut child_aff = [0u8; 64];
+                    std::ptr::write_unaligned(
+                        child_aff.as_mut_ptr().add(16) as *mut u32,
+                        JOB_OBJECT_LIMIT_AFFINITY,
+                    );
+                    std::ptr::write_unaligned(child_aff.as_mut_ptr().add(48) as *mut usize, 0x1usize);
+                    assert_eq!(SetInformationJobObject(job, 2, child_aff.as_ptr() as *const c_void, 64), FALSE);
+                    assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                    let mut child_ga = [0u8; 16];
+                    std::ptr::write_unaligned(child_ga.as_mut_ptr() as *mut usize, 0x1usize);
+                    assert_eq!(SetInformationJobObject(job, 14, child_ga.as_ptr() as *const c_void, 16), FALSE);
+                    assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                }
+                inh_child.finish_reaped(Some(0), 0);
+                assert_eq!(crate::kernel32::threads::CloseHandle(inh_h), TRUE);
+
+                // Assigning a child to a job that already has restricted affinity (class 2 or 14)
+                // fails honestly with ERROR_NOT_SUPPORTED instead of leaving the child unrestricted.
+                if orig_sm >= 0x3 {
+                    let rjob = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                    assert!(!rjob.is_null());
+                    let mut rga = [0u8; 16];
+                    std::ptr::write_unaligned(rga.as_mut_ptr() as *mut usize, 0x1usize);
+                    assert_eq!(SetInformationJobObject(rjob, 14, rga.as_ptr() as *const c_void, 16), TRUE);
+                    let rej_child = make_test_child_handle(99992, "C:\\Games\\RejectedChild.exe");
+                    assert_eq!(AssignProcessToJobObject(rjob, rej_child), FALSE);
+                    assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                    assert_eq!(crate::kernel32::threads::CloseHandle(rej_child), TRUE);
+                    assert_eq!(crate::kernel32::threads::CloseHandle(rjob), TRUE);
+                }
+            }
+
+            // Switch to SILENT_BREAKAWAY_OK (clearing KILL_ON_JOB_CLOSE, ACTIVE_PROCESS, and AFFINITY)
+            // before closing in-process so subsequent tests in this binary can still spawn children
+            // freely and keep unrestricted affinity while this retained job remains queryable.
+            std::ptr::write_unaligned(ext.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK);
+            std::ptr::write_unaligned(ext.as_mut_ptr().add(40) as *mut u32, 0u32);
+            assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
+            assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_pm), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(job), TRUE);
+
+            // Closing the last job handle without KILL_ON_JOB_CLOSE retains the job while
+            // assigned processes remain alive: IsProcessInJob(self, NULL) and
+            // QueryInformationJobObject(NULL, ...) must continue to see this job.
+            in_job = FALSE;
+            assert_eq!(IsProcessInJob(handles::CURRENT_PROCESS, std::ptr::null_mut(), &mut in_job), TRUE);
+            assert_eq!(in_job, TRUE);
+            let mut out_basic_after_close = [0u8; 64];
+            assert_eq!(
+                QueryInformationJobObject(
+                    std::ptr::null_mut(),
+                    2,
+                    out_basic_after_close.as_mut_ptr() as *mut c_void,
+                    64,
+                    &mut ret_len,
+                ),
+                TRUE
+            );
+            assert_eq!(
+                std::ptr::read_unaligned(out_basic_after_close.as_ptr().add(16) as *const u32),
+                JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+            );
+            #[cfg(not(target_os = "ios"))]
+            assert_eq!(check_parent_jobs_for_child_spawn(0), Ok(()));
+
+            // Named job objects release namespace ownership when the last handle closes.
+            let jname = to_wide_z("Local\\KernelCoreNamedJobTest");
+            let nj1 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
+            assert!(!nj1.is_null());
+            assert_eq!(crate::teb::last_error(), 0);
+            let mut nj_basic = [0u8; 64];
+            std::ptr::write_unaligned(nj_basic.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_ACTIVE_PROCESS);
+            std::ptr::write_unaligned(nj_basic.as_mut_ptr().add(40) as *mut u32, 3u32);
+            assert_eq!(SetInformationJobObject(nj1, 2, nj_basic.as_ptr() as *const c_void, 64), TRUE);
+            let nj2 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
+            assert!(!nj2.is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_ALREADY_EXISTS);
+            assert_eq!(crate::kernel32::threads::CloseHandle(nj1), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(nj2), TRUE);
+            // OpenJobObject fails once all handles have closed.
+            assert!(OpenJobObjectW(0x1F001F, FALSE, jname.as_ptr()).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+            // Recreating with the same name yields a brand-new job with fresh zeroed state.
+            let nj3 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
+            assert!(!nj3.is_null());
+            assert_eq!(crate::teb::last_error(), 0);
+            let mut fresh_basic = [0xFFu8; 64];
+            assert_eq!(QueryInformationJobObject(nj3, 2, fresh_basic.as_mut_ptr() as *mut c_void, 64, &mut ret_len), TRUE);
+            assert_eq!(fresh_basic, [0u8; 64]);
+            assert_eq!(crate::kernel32::threads::CloseHandle(nj3), TRUE);
+
+            // JobObjectAssociateCompletionPortInformation (class 7) delivers real IOCP
+            // notifications on process assignment and child exit (including ACTIVE_PROCESS_ZERO).
+            #[cfg(not(target_os = "ios"))]
+            {
+                let iocp = crate::kernel32::file::CreateIoCompletionPort(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                );
+                assert!(!iocp.is_null());
+                let cjob = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!cjob.is_null());
+
+                // Bogus port handle -> ERROR_INVALID_HANDLE.
+                let mut assoc = [0u8; 16];
+                std::ptr::write_unaligned(assoc.as_mut_ptr() as *mut usize, 0xCAFE_1234usize);
+                std::ptr::write_unaligned(assoc.as_mut_ptr().add(8) as *mut HANDLE, 0xDEADusize as HANDLE);
+                assert_eq!(SetInformationJobObject(cjob, 7, assoc.as_ptr() as *const c_void, 16), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+                // Valid IOCP association succeeds; re-associating a non-null port fails with ERROR_INVALID_PARAMETER.
+                std::ptr::write_unaligned(assoc.as_mut_ptr().add(8) as *mut HANDLE, iocp);
+                assert_eq!(SetInformationJobObject(cjob, 7, assoc.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(SetInformationJobObject(cjob, 7, assoc.as_ptr() as *const c_void, 16), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+                let child_obj = Arc::new(ChildProcessObj {
+                    pid: 77777,
+                    exe_win: "C:\\Games\\Worker.exe".to_string(),
+                    exit_code: handles::Guarded::new(None),
+                    terminated_code: handles::Guarded::new(None),
+                    os_pid: std::sync::atomic::AtomicI32::new(0),
+                });
+                let child_h = handles::insert(Arc::clone(&child_obj) as Arc<dyn KObject>);
+                assert_eq!(AssignProcessToJobObject(cjob, child_h), TRUE);
+
+                let mut msg: u32 = 0;
+                let mut key: usize = 0;
+                let mut ov: *mut crate::kernel32::file::OVERLAPPED = std::ptr::null_mut();
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_NEW_PROCESS);
+                assert_eq!(key, 0xCAFE_1234);
+                assert_eq!(ov as usize, 77777);
+
+                // Child exit posts EXIT_PROCESS followed by ACTIVE_PROCESS_ZERO.
+                child_obj.finish_reaped(Some(0), 0);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_EXIT_PROCESS);
+                assert_eq!(key, 0xCAFE_1234);
+                assert_eq!(ov as usize, 77777);
+
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO);
+                assert_eq!(key, 0xCAFE_1234);
+                assert_eq!(ov as usize, 0);
+
+                // NULL completion port disassociates cleanly.
+                std::ptr::write_unaligned(assoc.as_mut_ptr().add(8) as *mut HANDLE, std::ptr::null_mut());
+                assert_eq!(SetInformationJobObject(cjob, 7, assoc.as_ptr() as *const c_void, 16), TRUE);
+
+                assert_eq!(crate::kernel32::threads::CloseHandle(child_h), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(cjob), TRUE);
+
+                // Associating a completion port AFTER processes are already assigned must
+                // immediately post JOB_OBJECT_MSG_NEW_PROCESS for each existing active member.
+                let cjob2 = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!cjob2.is_null());
+                let pre_child = Arc::new(ChildProcessObj {
+                    pid: 77778,
+                    exe_win: "C:\\Games\\PreAssigned.exe".to_string(),
+                    exit_code: handles::Guarded::new(None),
+                    terminated_code: handles::Guarded::new(None),
+                    os_pid: std::sync::atomic::AtomicI32::new(0),
+                });
+                let pre_h = handles::insert(Arc::clone(&pre_child) as Arc<dyn KObject>);
+                assert_eq!(AssignProcessToJobObject(cjob2, pre_h), TRUE);
+                let mut assoc2 = [0u8; 16];
+                std::ptr::write_unaligned(assoc2.as_mut_ptr() as *mut usize, 0xBEEF_5678usize);
+                std::ptr::write_unaligned(assoc2.as_mut_ptr().add(8) as *mut HANDLE, iocp);
+                assert_eq!(SetInformationJobObject(cjob2, 7, assoc2.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_NEW_PROCESS);
+                assert_eq!(key, 0xBEEF_5678);
+                assert_eq!(ov as usize, 77778);
+                pre_child.finish_reaped(Some(0), 0);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_EXIT_PROCESS);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO);
+                assert_eq!(crate::kernel32::threads::CloseHandle(pre_h), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(cjob2), TRUE);
+
+                // A job with a live child stays alive after its last handle closes until the child exits
+                // (delivering IOCP exit/zero notifications and then releasing cleanly).
+                let cjob2 = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!cjob2.is_null());
+                std::ptr::write_unaligned(assoc.as_mut_ptr() as *mut usize, 0xBEEF_5678usize);
+                std::ptr::write_unaligned(assoc.as_mut_ptr().add(8) as *mut HANDLE, iocp);
+                assert_eq!(SetInformationJobObject(cjob2, 7, assoc.as_ptr() as *const c_void, 16), TRUE);
+                let child_obj2 = Arc::new(ChildProcessObj {
+                    pid: 88888,
+                    exe_win: "C:\\Games\\Worker2.exe".to_string(),
+                    exit_code: handles::Guarded::new(None),
+                    terminated_code: handles::Guarded::new(None),
+                    os_pid: std::sync::atomic::AtomicI32::new(0),
+                });
+                let child_h2 = handles::insert(Arc::clone(&child_obj2) as Arc<dyn KObject>);
+                assert_eq!(AssignProcessToJobObject(cjob2, child_h2), TRUE);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!((msg, key, ov as usize), (JOB_OBJECT_MSG_NEW_PROCESS, 0xBEEF_5678, 88888));
+
+                // Close the last job handle while child 2 is still running.
+                assert_eq!(crate::kernel32::threads::CloseHandle(cjob2), TRUE);
+                let mut child2_in_job: BOOL = FALSE;
+                assert_eq!(IsProcessInJob(child_h2, std::ptr::null_mut(), &mut child2_in_job), TRUE);
+                assert_eq!(child2_in_job, TRUE);
+
+                // Once child 2 exits, the retained job still delivers EXIT_PROCESS + ACTIVE_PROCESS_ZERO
+                // and is then destroyed so IsProcessInJob(child_h2, NULL) returns FALSE.
+                child_obj2.finish_reaped(Some(0), 0);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!((msg, key, ov as usize), (JOB_OBJECT_MSG_EXIT_PROCESS, 0xBEEF_5678, 88888));
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!((msg, key, ov as usize), (JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0xBEEF_5678, 0));
+                assert_eq!(IsProcessInJob(child_h2, std::ptr::null_mut(), &mut child2_in_job), TRUE);
+                assert_eq!(child2_in_job, FALSE);
+
+                assert_eq!(crate::kernel32::threads::CloseHandle(child_h2), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(iocp), TRUE);
+            }
+        }
+    }
+
+    pub(crate) fn make_test_child_handle(pid: u32, exe_win: &str) -> HANDLE {
+        let obj = Arc::new(ChildProcessObj {
+            pid,
+            exe_win: exe_win.to_string(),
+            exit_code: handles::Guarded::new(None),
+            #[cfg(not(target_os = "ios"))]
+            terminated_code: handles::Guarded::new(None),
+            #[cfg(not(target_os = "ios"))]
+            os_pid: std::sync::atomic::AtomicI32::new(0),
+        });
+        handles::insert(obj)
+    }
+
+    pub(crate) fn make_test_child_thread_handle(pid: u32, tid: u32) -> HANDLE {
+        let proc_obj = Arc::new(ChildProcessObj {
+            pid,
+            exe_win: "C:\\Games\\Child.exe".to_string(),
+            exit_code: handles::Guarded::new(None),
+            #[cfg(not(target_os = "ios"))]
+            terminated_code: handles::Guarded::new(None),
+            #[cfg(not(target_os = "ios"))]
+            os_pid: std::sync::atomic::AtomicI32::new(0),
+        });
+        handles::insert(Arc::new(ChildThreadObj { tid, process: proc_obj }))
+    }
+
+    #[test]
+    fn job_object_kill_on_close_terminates_current_process_on_last_handle() {
+        const ENV_KEY: &str = "WIN32_RT_TEST_JOB_KILL_SELF";
+        if std::env::var_os(ENV_KEY).is_some() {
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!job.is_null());
+                let mut ext = [0u8; 144];
+                std::ptr::write_unaligned(
+                    ext.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                );
+                assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
+                assert_eq!(AssignProcessToJobObject(job, handles::CURRENT_PROCESS), TRUE);
+                // Closing the last handle must terminate this process with code 1 and never return.
+                let _ = crate::kernel32::threads::CloseHandle(job);
+                std::process::exit(99);
+            }
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let status = std::process::Command::new(exe)
+            .env(ENV_KEY, "1")
+            .arg("--exact")
+            .arg("kernel32::process::tests::job_object_kill_on_close_terminates_current_process_on_last_handle")
+            .arg("--nocapture")
+            .status()
+            .expect("spawn job kill-on-close child");
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "closing last handle of KILL_ON_JOB_CLOSE job containing self must terminate process with code 1"
+        );
+    }
+
+    #[test]
+    fn format_message_from_module_rt_messagetable_unicode_and_ansi() {
+        // Build a minimal in-memory PE32+ image containing an RT_MESSAGETABLE (type 11, id 1, lang 0x0409)
+        // with two blocks: a Unicode block [0x1000..=0x1001] and an ANSI block [0x2000..=0x2000].
+        let mut pe = vec![0u8; 0x2000];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew = 0x80
+        let nt = 0x80usize;
+        pe[nt..nt + 4].copy_from_slice(b"PE\0\0");
+        pe[nt + 4..nt + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[nt + 20..nt + 22].copy_from_slice(&0xF0u16.to_le_bytes()); // SizeOfOptionalHeader
+        let opt = nt + 24;
+        pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+        pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+        // DataDirectory[2] (Resource Table) at opt + 112 + 2*8 = opt + 128
+        let rsrc_rva = 0x1000u32;
+        pe[opt + 128..opt + 132].copy_from_slice(&rsrc_rva.to_le_bytes());
+        pe[opt + 132..opt + 136].copy_from_slice(&0x1000u32.to_le_bytes());
+
+        // 3-level resource directory at rsrc_rva with 3 RT_MESSAGETABLE resources:
+        //   - Named resource "CUSTOM_MT" (id 0x4000)
+        //   - Numeric ID 1 (ids 0x1000..=0x1001, 0x2000)
+        //   - Numeric ID 7 (id 0x3000)
+        // +0x00: root dir (1 ID entry: type 11 -> subdir at +0x20)
+        // +0x20: type dir (1 named entry + 2 ID entries)
+        // +0x60: name string "CUSTOM_MT" (IMAGE_RESOURCE_DIR_STRING_U)
+        // +0x80: lang dir for "CUSTOM_MT" -> data entry at +0xE0 (rva 0x1400)
+        // +0xA0: lang dir for ID 1        -> data entry at +0xF0 (rva 0x1200)
+        // +0xC0: lang dir for ID 7        -> data entry at +0x100 (rva 0x1300)
+        let r = rsrc_rva as usize;
+        // Root dir
+        pe[r + 14..r + 16].copy_from_slice(&1u16.to_le_bytes());
+        pe[r + 16..r + 20].copy_from_slice(&11u32.to_le_bytes()); // RT_MESSAGETABLE
+        pe[r + 20..r + 24].copy_from_slice(&(0x8000_0000u32 | 0x20).to_le_bytes());
+        // Type dir: 1 named entry, 2 ID entries
+        pe[r + 0x20 + 12..r + 0x20 + 14].copy_from_slice(&1u16.to_le_bytes()); // NumberOfNamedEntries
+        pe[r + 0x20 + 14..r + 0x20 + 16].copy_from_slice(&2u16.to_le_bytes()); // NumberOfIdEntries
+        // Entry 0 (named "CUSTOM_MT" at +0x60) -> lang dir at +0x80
+        pe[r + 0x20 + 16..r + 0x20 + 20].copy_from_slice(&(0x8000_0000u32 | 0x60).to_le_bytes());
+        pe[r + 0x20 + 20..r + 0x20 + 24].copy_from_slice(&(0x8000_0000u32 | 0x80).to_le_bytes());
+        // Entry 1 (ID 1) -> lang dir at +0xA0
+        pe[r + 0x20 + 24..r + 0x20 + 28].copy_from_slice(&1u32.to_le_bytes());
+        pe[r + 0x20 + 28..r + 0x20 + 32].copy_from_slice(&(0x8000_0000u32 | 0xA0).to_le_bytes());
+        // Entry 2 (ID 7) -> lang dir at +0xC0
+        pe[r + 0x20 + 32..r + 0x20 + 36].copy_from_slice(&7u32.to_le_bytes());
+        pe[r + 0x20 + 36..r + 0x20 + 40].copy_from_slice(&(0x8000_0000u32 | 0xC0).to_le_bytes());
+        // String "CUSTOM_MT" at +0x60
+        let name_u16: Vec<u16> = "CUSTOM_MT".encode_utf16().collect();
+        pe[r + 0x60..r + 0x62].copy_from_slice(&(name_u16.len() as u16).to_le_bytes());
+        for (i, u) in name_u16.iter().enumerate() {
+            pe[r + 0x62 + i * 2..r + 0x64 + i * 2].copy_from_slice(&u.to_le_bytes());
+        }
+        // Lang dir for "CUSTOM_MT" at +0x80 -> data entry at +0xE0
+        pe[r + 0x80 + 14..r + 0x80 + 16].copy_from_slice(&1u16.to_le_bytes());
+        pe[r + 0x80 + 16..r + 0x80 + 20].copy_from_slice(&0x0409u32.to_le_bytes());
+        pe[r + 0x80 + 20..r + 0x80 + 24].copy_from_slice(&0xE0u32.to_le_bytes());
+        // Lang dir for ID 1 at +0xA0 -> data entry at +0xF0
+        pe[r + 0xA0 + 14..r + 0xA0 + 16].copy_from_slice(&1u16.to_le_bytes());
+        pe[r + 0xA0 + 16..r + 0xA0 + 20].copy_from_slice(&0x0409u32.to_le_bytes());
+        pe[r + 0xA0 + 20..r + 0xA0 + 24].copy_from_slice(&0xF0u32.to_le_bytes());
+        // Lang dir for ID 7 at +0xC0 -> data entry at +0x100
+        pe[r + 0xC0 + 14..r + 0xC0 + 16].copy_from_slice(&1u16.to_le_bytes());
+        pe[r + 0xC0 + 16..r + 0xC0 + 20].copy_from_slice(&0x0409u32.to_le_bytes());
+        pe[r + 0xC0 + 20..r + 0xC0 + 24].copy_from_slice(&0x100u32.to_le_bytes());
+
+        let build_single_unicode_mt = |msg_id: u32, text: &str| -> Vec<u8> {
+            let mut tbl = Vec::<u8>::new();
+            tbl.extend_from_slice(&1u32.to_le_bytes()); // NumberOfBlocks = 1
+            tbl.extend_from_slice(&msg_id.to_le_bytes());
+            tbl.extend_from_slice(&msg_id.to_le_bytes());
+            tbl.extend_from_slice(&16u32.to_le_bytes()); // offset of entry 0
+            let units: Vec<u16> = format!("{text}\0").encode_utf16().collect();
+            let entry_len = ((4 + units.len() * 2 + 3) & !3) as u16;
+            tbl.extend_from_slice(&entry_len.to_le_bytes());
+            tbl.extend_from_slice(&1u16.to_le_bytes()); // MESSAGE_RESOURCE_UNICODE
+            for u in &units {
+                tbl.extend_from_slice(&u.to_le_bytes());
+            }
+            tbl.resize(16 + entry_len as usize, 0);
+            tbl
+        };
+
+        // Construct MESSAGE_RESOURCE_DATA for ID 1
+        let mut mt = Vec::<u8>::new();
+        mt.extend_from_slice(&2u32.to_le_bytes()); // NumberOfBlocks = 2
+        // Placeholder for 2 blocks (24 bytes), entries start at offset 28
+        let blk0_off = 28u32;
+        let msg_u0: Vec<u16> = "Hello %1!\0".encode_utf16().collect();
+        let mut e0 = Vec::<u8>::new();
+        let e0_len = ((4 + msg_u0.len() * 2 + 3) & !3) as u16;
+        e0.extend_from_slice(&e0_len.to_le_bytes());
+        e0.extend_from_slice(&1u16.to_le_bytes()); // MESSAGE_RESOURCE_UNICODE
+        for u in &msg_u0 {
+            e0.extend_from_slice(&u.to_le_bytes());
+        }
+        e0.resize(e0_len as usize, 0);
+
+        let msg_u1: Vec<u16> = "Second=%1!u!\0".encode_utf16().collect();
+        let mut e1 = Vec::<u8>::new();
+        let e1_len = ((4 + msg_u1.len() * 2 + 3) & !3) as u16;
+        e1.extend_from_slice(&e1_len.to_le_bytes());
+        e1.extend_from_slice(&1u16.to_le_bytes());
+        for u in &msg_u1 {
+            e1.extend_from_slice(&u.to_le_bytes());
+        }
+        e1.resize(e1_len as usize, 0);
+
+        let blk1_off = blk0_off + (e0.len() + e1.len()) as u32;
+        let msg_a = b"Ansi code %1!x!\0";
+        let mut e2 = Vec::<u8>::new();
+        let e2_len = ((4 + msg_a.len() + 3) & !3) as u16;
+        e2.extend_from_slice(&e2_len.to_le_bytes());
+        e2.extend_from_slice(&0u16.to_le_bytes()); // ANSI
+        e2.extend_from_slice(msg_a);
+        e2.resize(e2_len as usize, 0);
+
+        // Block 0: 0x1000..=0x1001
+        mt.extend_from_slice(&0x1000u32.to_le_bytes());
+        mt.extend_from_slice(&0x1001u32.to_le_bytes());
+        mt.extend_from_slice(&blk0_off.to_le_bytes());
+        // Block 1: 0x2000..=0x2000
+        mt.extend_from_slice(&0x2000u32.to_le_bytes());
+        mt.extend_from_slice(&0x2000u32.to_le_bytes());
+        mt.extend_from_slice(&blk1_off.to_le_bytes());
+        mt.extend_from_slice(&e0);
+        mt.extend_from_slice(&e1);
+        mt.extend_from_slice(&e2);
+
+        let mt_id7 = build_single_unicode_mt(0x3000, "From id7: %1");
+        let mt_named = build_single_unicode_mt(0x4000, "From named: %1");
+
+        // Data entry for "CUSTOM_MT" at r + 0xE0 -> RVA 0x1400
+        pe[r + 0xE0..r + 0xE4].copy_from_slice(&0x1400u32.to_le_bytes());
+        pe[r + 0xE4..r + 0xE8].copy_from_slice(&(mt_named.len() as u32).to_le_bytes());
+        pe[0x1400..0x1400 + mt_named.len()].copy_from_slice(&mt_named);
+        // Data entry for ID 1 at r + 0xF0 -> RVA 0x1200
+        pe[r + 0xF0..r + 0xF4].copy_from_slice(&0x1200u32.to_le_bytes());
+        pe[r + 0xF4..r + 0xF8].copy_from_slice(&(mt.len() as u32).to_le_bytes());
+        pe[0x1200..0x1200 + mt.len()].copy_from_slice(&mt);
+        // Data entry for ID 7 at r + 0x100 -> RVA 0x1300
+        pe[r + 0x100..r + 0x104].copy_from_slice(&0x1300u32.to_le_bytes());
+        pe[r + 0x104..r + 0x108].copy_from_slice(&(mt_id7.len() as u32).to_le_bytes());
+        pe[0x1300..0x1300 + mt_id7.len()].copy_from_slice(&mt_id7);
+
+        unsafe {
+            let hmod = pe.as_ptr() as *const c_void;
+            let mut out = [0u16; 128];
+            let arg_str = to_wide_z("World");
+            let args1 = [arg_str.as_ptr() as u64];
+            let n = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod,
+                0x1000,
+                0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                args1.as_ptr(),
+            );
+            assert_eq!(from_wide(out.as_ptr()), "Hello World!");
+            assert_eq!(n, 12);
+
+            // Non-1 numeric RT_MESSAGETABLE resource (ID 7).
+            let n_id7 = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod,
+                0x3000,
+                0x0409,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                args1.as_ptr(),
+            );
+            assert_eq!(from_wide(out.as_ptr()), "From id7: World");
+            assert_eq!(n_id7, 15);
+
+            // Named RT_MESSAGETABLE resource ("CUSTOM_MT").
+            let n_named = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod,
+                0x4000,
+                0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                args1.as_ptr(),
+            );
+            assert_eq!(from_wide(out.as_ptr()), "From named: World");
+            assert_eq!(n_named, 17);
+
+            // Module with ONLY a non-1 numeric RT_MESSAGETABLE resource (no ID 1 at all).
+            let mut pe_no_id1 = pe.clone();
+            pe_no_id1[r + 0x20 + 12..r + 0x20 + 14].copy_from_slice(&0u16.to_le_bytes()); // 0 named
+            pe_no_id1[r + 0x20 + 14..r + 0x20 + 16].copy_from_slice(&1u16.to_le_bytes()); // 1 ID (ID 7 only)
+            pe_no_id1[r + 0x20 + 16..r + 0x20 + 20].copy_from_slice(&7u32.to_le_bytes());
+            pe_no_id1[r + 0x20 + 20..r + 0x20 + 24].copy_from_slice(&(0x8000_0000u32 | 0xC0).to_le_bytes());
+            let hmod_no_id1 = pe_no_id1.as_ptr() as *const c_void;
+            assert!(crate::kernel32::module::FindResourceExW(
+                hmod_no_id1 as HMODULE,
+                11usize as LPCWSTR,
+                1usize as LPCWSTR,
+                0,
+            )
+            .is_null());
+            let n_only_id7 = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod_no_id1,
+                0x3000,
+                0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                args1.as_ptr(),
+            );
+            assert_eq!(from_wide(out.as_ptr()), "From id7: World");
+            assert_eq!(n_only_id7, 15);
+
+            let args2 = [42u64];
+            let n2 = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod,
+                0x1001,
+                0x0409,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                args2.as_ptr(),
+            );
+            assert_eq!(from_wide(out.as_ptr()), "Second=42");
+            assert_eq!(n2, 9);
+
+            // ANSI entry via FormatMessageA
+            let mut out_a = [0u8; 128];
+            let args3 = [0xABu64];
+            let n3 = FormatMessageA(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod,
+                0x2000,
+                0,
+                out_a.as_mut_ptr(),
+                out_a.len() as u32,
+                args3.as_ptr(),
+            );
+            assert_eq!(from_ansi(out_a.as_ptr()), "Ansi code ab");
+            assert_eq!(n3, 12);
+
+            // Fallback FROM_HMODULE | FROM_SYSTEM falls back to system table for ERROR_FILE_NOT_FOUND (2).
+            let n_sys = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                hmod,
+                2,
+                0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                std::ptr::null(),
+            );
+            assert!(n_sys > 0);
+            assert!(from_wide(out.as_ptr()).contains("file specified"));
+
+            // Explicit unavailable LANGID (0x040C fr-FR on en-US-only module) must fail with
+            // ERROR_RESOURCE_LANG_NOT_FOUND (1815) rather than silently falling back to English.
+            assert_eq!(
+                FormatMessageW(
+                    FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_IGNORE_INSERTS,
+                    hmod,
+                    0x1000,
+                    0x040C,
+                    out.as_mut_ptr(),
+                    out.len() as u32,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(crate::teb::last_error(), 1815);
+
+            // Missing ID -> 0 and ERROR_MR_MID_NOT_FOUND (317).
+            assert_eq!(
+                FormatMessageW(
+                    FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_IGNORE_INSERTS,
+                    hmod,
+                    0x9999,
+                    0,
+                    out.as_mut_ptr(),
+                    out.len() as u32,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_MR_MID_NOT_FOUND);
+        }
     }
 }

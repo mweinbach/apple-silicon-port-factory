@@ -59,6 +59,7 @@ fn main() {
         "explain" => db::cmd_explain(rest),
         "scan" => scan::cmd_scan(rest),
         "readiness" => scan::cmd_readiness(rest),
+        "isa-coverage" => db::cmd_isa_coverage(rest),
         "win32-sync" => db::cmd_win32_sync(rest),
         "win32-stats" => db::cmd_win32_stats(rest),
         "win32-audit" => scan::cmd_win32_audit(rest),

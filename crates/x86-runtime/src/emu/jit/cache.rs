@@ -427,6 +427,15 @@ pub(in crate::emu) struct JitCache {
     rdtscp_slow: usize,
     pub(super) index: Box<[JEnt]>,
     pub(super) meta: Box<[JMeta]>,
+    /// Lazy tier-isolated lookup tables used only when `translated_accounting_enabled()` is true:
+    /// `aot_table` holds only AOT + `DF_PLAIN` host entries and `jit_table` holds only runtime-JIT
+    /// + `DF_PLAIN` host entries, preventing cross-tier chaining so AOT vs runtime-JIT instruction
+    /// counts stay exact.
+    aot_table: Box<[JEnt]>,
+    jit_table: Box<[JEnt]>,
+    /// True if a runtime-JIT block was ever direct-linked to an AOT target before tier accounting
+    /// was enabled (triggers one flush if accounting is turned on later in the same process).
+    cross_tier_linked: bool,
     /// All blocks compiled since the last flush, so direct-mapped `index` collisions can
     /// swap a previously compiled block back into its slot without re-translating.
     compiled: std::collections::HashMap<u64, (JEnt, JMeta)>,
@@ -506,6 +515,9 @@ impl JitCache {
             rdtscp_slow: 0,
             index: Box::new([]),
             meta: Box::new([]),
+            aot_table: Box::new([]),
+            jit_table: Box::new([]),
+            cross_tier_linked: false,
             compiled: std::collections::HashMap::new(),
             links: std::collections::HashMap::new(),
             far_islands: std::collections::HashMap::new(),
@@ -807,12 +819,26 @@ impl JitCache {
     fn flush(&mut self) {
         if self.static_only {
             self.index.fill(JEnt::default());
+            if !self.aot_table.is_empty() {
+                self.aot_table.fill(JEnt::default());
+            }
+            if !self.jit_table.is_empty() {
+                self.jit_table.fill(JEnt::default());
+            }
+            self.cross_tier_linked = false;
             self.ras_clear();
             self.flushes += 1;
             return;
         }
         self.cursor = STUBS_BYTES;
         self.index.fill(JEnt::default());
+        if !self.aot_table.is_empty() {
+            self.aot_table.fill(JEnt::default());
+        }
+        if !self.jit_table.is_empty() {
+            self.jit_table.fill(JEnt::default());
+        }
+        self.cross_tier_linked = false;
         self.compiled.clear();
         self.links.clear();
         self.far_islands.clear();
@@ -872,6 +898,9 @@ impl JitCache {
             if let Some((code, host)) = crate::emu::exec_mem::lookup_static_aot(ip) {
                 let ent = JEnt { ip, fast: if host { 0 } else { code as u64 }, gen: 0, hits: 0, code: code as u64 };
                 self.index[s] = ent;
+                if !self.aot_table.is_empty() {
+                    self.aot_table[s] = ent;
+                }
                 return Some(code);
             }
             self.index[s] = JEnt { ip, fast: 0, gen: 0, hits: NOJIT, code: 0 };
@@ -887,6 +916,9 @@ impl JitCache {
                     if mem::code_hash(to_mapped_addr(ip), meta.len as usize) != meta.hash {
                         self.compiled.remove(&ip);
                         self.index[s] = JEnt { ip, ..JEnt::default() };
+                        if !self.jit_table.is_empty() {
+                            self.jit_table[s] = JEnt::default();
+                        }
                         return self.translate(ip, bc);
                     }
                     ent.gen = gen;
@@ -895,6 +927,9 @@ impl JitCache {
             }
             self.index[s] = ent;
             self.meta[s] = meta;
+            if !self.jit_table.is_empty() {
+                self.jit_table[s] = ent;
+            }
             return Some(ent.code as usize);
         }
         if let Some(code) = self.install_aot(s, ip) {
@@ -925,12 +960,36 @@ impl JitCache {
         let gen = mem::code_gen();
         if mem::code_hash(to_mapped_addr(e.ip), m.len as usize) == m.hash {
             self.index[s].gen = gen;
+            if !self.jit_table.is_empty() && self.jit_table[s].ip == e.ip {
+                self.jit_table[s].gen = gen;
+            }
             self.compiled.insert(e.ip, (self.index[s], m));
             return Some(e.code as usize);
         }
         self.compiled.remove(&e.ip);
         self.index[s] = JEnt { ip: e.ip, ..JEnt::default() };
+        if !self.jit_table.is_empty() && self.jit_table[s].ip == e.ip {
+            self.jit_table[s] = JEnt::default();
+        }
         self.translate(e.ip, bc)
+    }
+
+    /// True when `code` points inside this thread's runtime `MAP_JIT` translation buffer
+    /// (as opposed to an installed AOT or static Mach-O AOT image).
+    #[inline(always)]
+    pub(in crate::emu) fn owns_code(&self, code: usize) -> bool {
+        if self.mem.is_null() {
+            return false;
+        }
+        let lo = self.mem as usize;
+        code >= lo && code < lo + CODE_SIZE
+    }
+
+    /// True when AOT vs runtime-JIT translated instruction totals are being collected and this
+    /// cache can host both tiers (so cross-tier chaining must be disabled for exact attribution).
+    #[inline(always)]
+    fn tier_split_active(&self) -> bool {
+        !self.static_only && crate::emu::aot_strict::translated_accounting_enabled()
     }
 
     /// Run translated code at `code` with an instruction budget; returns the exit code and
@@ -959,24 +1018,69 @@ impl JitCache {
         if self.enter == 0 {
             return (EXIT_RIP, 0);
         }
+        let split = self.tier_split_active();
+        if split && self.cross_tier_linked {
+            // Earlier runtime-JIT blocks were direct-linked to AOT targets before tier
+            // accounting was enabled; flush once so no cross-tier direct branches remain.
+            self.flush();
+            return (EXIT_RIP, 0);
+        }
+        let from_aot = !self.owns_code(code);
         #[cfg(test)]
         let budget = test_budget_cap(budget);
         cpu.jx.budget = budget;
         cpu.jx.ctx_vagen = self.va_gen as u64;
-        cpu.jx.table = self.index.as_ptr() as usize;
-        cpu.jx.mul = JMUL;
-        cpu.jx.codegen = mem::code_gen_ptr();
-        cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
-        cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
-        cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
-        cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
-        cpu.jx.aot_dir = if self.static_only {
+        let aot_dir = if self.static_only {
             crate::emu::exec_mem::static_probe_table()
         } else if crate::emu::aot::active() {
             crate::emu::aot::probe_table()
         } else {
             0
         };
+        if split {
+            let mem_lo = self.mem as usize;
+            let mem_hi = mem_lo.saturating_add(CODE_SIZE);
+            let is_owned = |c: usize| mem_lo != 0 && c >= mem_lo && c < mem_hi;
+            if from_aot {
+                if self.aot_table.is_empty() {
+                    self.aot_table = crate::emu::zeroed_slice::<JEnt>(JLEN);
+                    for (dst, src) in self.aot_table.iter_mut().zip(self.index.iter()) {
+                        let is_plain = (src.fast & 1) != 0;
+                        let is_aot = src.code != 0 && !is_owned(src.code as usize);
+                        if is_plain || is_aot {
+                            *dst = *src;
+                        }
+                    }
+                }
+                cpu.jx.table = self.aot_table.as_ptr() as usize;
+                cpu.jx.aot_dir = aot_dir;
+            } else {
+                if self.jit_table.is_empty() {
+                    self.jit_table = crate::emu::zeroed_slice::<JEnt>(JLEN);
+                    for (dst, src) in self.jit_table.iter_mut().zip(self.index.iter()) {
+                        let is_plain = (src.fast & 1) != 0;
+                        let is_jit = src.code != 0 && is_owned(src.code as usize);
+                        if is_plain || is_jit {
+                            *dst = *src;
+                        }
+                    }
+                }
+                cpu.jx.table = self.jit_table.as_ptr() as usize;
+                cpu.jx.aot_dir = 0;
+                // Clear RAS before entering runtime-JIT so a `ret` cannot jump straight back
+                // to an AOT caller landing pad without accounting the tier transition.
+                self.ras_clear();
+            }
+        } else {
+            cpu.jx.table = self.index.as_ptr() as usize;
+            cpu.jx.aot_dir = aot_dir;
+        }
+        cpu.jx.mul = JMUL;
+        cpu.jx.codegen = mem::code_gen_ptr();
+        cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
+        cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
+        cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
+        cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         // `cpu.jx.ymm_dirty` is maintained incrementally across interpreter and translated writes;
         // skip the 256-byte `cpu.ymm_hi` scan on every `JitCache::run()`.
         #[cfg(debug_assertions)]
@@ -1000,6 +1104,11 @@ impl JitCache {
                 TEST_RAS_MOVES.with(|c| c.set(c.get() + 1));
             }
             self.ras_top = cpu.jx.ras;
+            if split && !from_aot {
+                // Clear any runtime-JIT landing pads pushed during this run so an enclosing
+                // or subsequent AOT run cannot `ret` directly into runtime-JIT code.
+                self.ras_clear();
+            }
         }
         #[cfg(test)]
         TEST_EXECUTED.with(|c| c.set(c.get() + (budget - cpu.jx.budget) as u64));
@@ -1175,9 +1284,13 @@ impl JitCache {
         if crate::diag::nan_trace_installed() && crate::diag::nan_trace_covers(target) {
             return None;
         }
+        let split = self.tier_split_active();
         let e = &self.index[jslot(target)];
         if e.ip == target && e.code != 0 && e.fast != 0 && e.gen == 0 {
-            return Some(e.code as usize);
+            let tc = e.code as usize;
+            if !split || self.owns_code(tc) {
+                return Some(tc);
+            }
         }
         if let Some(&(e, _)) = self.compiled.get(&target) {
             if e.code != 0 && e.fast != 0 && e.gen == 0 {
@@ -1193,8 +1306,11 @@ impl JitCache {
         let (code, host) = crate::emu::aot::find(ip)?;
         let ent = JEnt { ip, fast: if host { 0 } else { code as u64 }, gen: 0, hits: 0, code: code as u64 };
         self.index[s] = ent;
+        if !self.aot_table.is_empty() {
+            self.aot_table[s] = ent;
+        }
         self.meta[s] = JMeta::default();
-        if !host {
+        if !host && !self.tier_split_active() {
             if let Some(sites) = self.links.remove(&ip) {
                 let mut unlinked = Vec::new();
                 let mut patched = Vec::new();
@@ -1211,6 +1327,9 @@ impl JitCache {
                     }
                 }
                 jit_write_protect(true);
+                if !patched.is_empty() {
+                    self.cross_tier_linked = true;
+                }
                 for site in patched {
                     icache_invalidate(site as *mut u8, 4);
                 }
@@ -1259,6 +1378,18 @@ impl JitCache {
         let r = self.translate_jit(ip, bc);
         let ns = t0.elapsed().as_nanos() as u64;
         self.compile_ns += ns;
+        if r.is_some() {
+            let reason = if !crate::emu::aot::active() {
+                "aot_disabled"
+            } else if mem::in_jit(to_mapped_addr(ip)) {
+                "smc_or_dyn_code"
+            } else if crate::emu::aot::was_killed_at(ip) {
+                "revalidation_dead"
+            } else {
+                "aot_miss"
+            };
+            crate::emu::aot_strict::record_jit_compile(ip, reason);
+        }
         if crate::emu::jit_stats::enabled() {
             crate::emu::jit_stats::compile(ns, r.is_some());
             if r.is_some() && crate::emu::aot::active() {
@@ -1325,11 +1456,17 @@ impl JitCache {
                 Some(tc) if b_reach(site, tc) => {
                     write_b(site, tc);
                     patched.push(site);
+                    if !self.owns_code(tc) {
+                        self.cross_tier_linked = true;
+                    }
                 }
                 Some(tc) => {
                     if let Some(isl) = self.far_island(tc) {
                         write_b(site, isl);
                         patched.push(site);
+                        if !self.owns_code(tc) {
+                            self.cross_tier_linked = true;
+                        }
                     } else {
                         far_sites += 1;
                         self.links.entry(target).or_default().push(site);
@@ -1363,6 +1500,9 @@ impl JitCache {
             JMeta::default()
         };
         self.index[s] = ent;
+        if !self.jit_table.is_empty() {
+            self.jit_table[s] = ent;
+        }
         self.meta[s] = meta;
         self.compiled.insert(ip, (ent, meta));
         jit_write_protect(true);
@@ -1374,6 +1514,12 @@ impl JitCache {
         self.tr_scratch.patched = patched;
         if gen == 0 {
             crate::emu::aot::profile_note(ip);
+            if crate::emu::aot::active() {
+                crate::emu::aot::record_runtime_callback(
+                    ip,
+                    crate::emu::aot::CallbackKind::GenericCallback,
+                );
+            }
         }
         self.translated += 1;
         TOTAL_JIT_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
