@@ -1258,6 +1258,7 @@ const TOKEN_MANDATORY_POLICY_NO_WRITE_UP: u32 = 1;
 struct TokenObj {
     token_type: u32,
     imp_level: u32,
+    access: u32,
     token_id: u64,
     auth_id: u64,
     modified_id: u64,
@@ -1272,59 +1273,82 @@ impl handles::KObject for TokenObj {
     }
 }
 
-fn new_token_obj(token_type: u32, imp_level: u32) -> Arc<TokenObj> {
+impl TokenObj {
+    fn access_mask(request: u32) -> u32 {
+        const TOKEN_ALL_ACCESS: u32 = 0x000f_01ff;
+        if request & (0x0200_0000 | 0x1000_0000) != 0 {
+            return TOKEN_ALL_ACCESS;
+        }
+        let mut mask = request & 0x0fff_ffff;
+        for (generic, rights) in [(0x8000_0000, 0x2_0008), (0x4000_0000, 0x2_00e0), (0x2000_0000, 0x2_0000)] {
+            if request & generic != 0 {
+                mask |= rights;
+            }
+        }
+        mask
+    }
+
+    fn resolve(h: HANDLE, required_access: u32) -> Result<Self, u32> {
+        let raw = h as isize;
+        // Windows 8+ pseudo-token handles: GetCurrentProcessToken (-4),
+        // GetCurrentThreadToken (-5), GetCurrentThreadEffectiveToken (-6).
+        let tok = if raw == -4 || raw == -6 {
+            Self {
+                token_type: TOKEN_PRIMARY,
+                imp_level: SECURITY_IMPERSONATION,
+                access: 0x0008, // TOKEN_QUERY
+                token_id: 0x100,
+                auth_id: 0x3E7,
+                modified_id: 0x101,
+            }
+        } else if raw == -5 {
+            Self {
+                token_type: TOKEN_IMPERSONATION,
+                imp_level: SECURITY_IMPERSONATION,
+                access: 0x0008, // TOKEN_QUERY
+                token_id: 0x102,
+                auth_id: 0x3E7,
+                modified_id: 0x103,
+            }
+        } else if let Some(tok) = handles::get_as::<Self>(h) {
+            Self {
+                token_type: tok.token_type,
+                imp_level: tok.imp_level,
+                access: tok.access,
+                token_id: tok.token_id,
+                auth_id: tok.auth_id,
+                modified_id: tok.modified_id,
+            }
+        } else if handles::get(h).is_some_and(|o| o.type_name() == "Token") {
+            Self {
+                token_type: TOKEN_PRIMARY,
+                imp_level: SECURITY_IMPERSONATION,
+                access: 0x000f_01ff,
+                token_id: 0x100,
+                auth_id: 0x3E7,
+                modified_id: 0x101,
+            }
+        } else {
+            return Err(ERROR_INVALID_HANDLE);
+        };
+        if (tok.access & required_access) != required_access {
+            return Err(ERROR_ACCESS_DENIED);
+        }
+        Ok(tok)
+    }
+}
+
+fn new_token_obj(token_type: u32, imp_level: u32, access: u32) -> Arc<TokenObj> {
     let tid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
     let mid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
     Arc::new(TokenObj {
         token_type,
         imp_level,
+        access,
         token_id: tid,
         auth_id: 0x0000_03E7, // SYSTEM_LUID / logon session LUID
         modified_id: mid,
     })
-}
-
-fn resolve_token(h: HANDLE) -> Option<TokenObj> {
-    let raw = h as isize;
-    // Windows 8+ pseudo-token handles: GetCurrentProcessToken (-4),
-    // GetCurrentThreadToken (-5), GetCurrentThreadEffectiveToken (-6).
-    if raw == -4 || raw == -6 {
-        return Some(TokenObj {
-            token_type: TOKEN_PRIMARY,
-            imp_level: SECURITY_IMPERSONATION,
-            token_id: 0x100,
-            auth_id: 0x3E7,
-            modified_id: 0x101,
-        });
-    }
-    if raw == -5 {
-        return Some(TokenObj {
-            token_type: TOKEN_IMPERSONATION,
-            imp_level: SECURITY_IMPERSONATION,
-            token_id: 0x102,
-            auth_id: 0x3E7,
-            modified_id: 0x103,
-        });
-    }
-    if let Some(tok) = handles::get_as::<TokenObj>(h) {
-        return Some(TokenObj {
-            token_type: tok.token_type,
-            imp_level: tok.imp_level,
-            token_id: tok.token_id,
-            auth_id: tok.auth_id,
-            modified_id: tok.modified_id,
-        });
-    }
-    if handles::get(h).is_some_and(|o| o.type_name() == "Token") {
-        return Some(TokenObj {
-            token_type: TOKEN_PRIMARY,
-            imp_level: SECURITY_IMPERSONATION,
-            token_id: 0x100,
-            auth_id: 0x3E7,
-            modified_id: 0x101,
-        });
-    }
-    None
 }
 
 fn build_sid(authority: u8, subs: &[u32]) -> Vec<u8> {
@@ -1417,8 +1441,8 @@ pub unsafe extern "win64" fn AllocateLocallyUniqueId(luid: *mut u64) -> BOOL {
 }
 
 pub unsafe extern "win64" fn PrivilegeCheck(token: HANDLE, _privs: *mut c_void, result: *mut BOOL) -> BOOL {
-    if resolve_token(token).is_none() {
-        return err(ERROR_INVALID_HANDLE, FALSE);
+    if let Err(e) = TokenObj::resolve(token, 0x0008) {
+        return err(e, FALSE);
     }
     if result.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
@@ -1427,11 +1451,15 @@ pub unsafe extern "win64" fn PrivilegeCheck(token: HANDLE, _privs: *mut c_void, 
     TRUE
 }
 
-pub unsafe extern "win64" fn OpenProcessToken(_proc: HANDLE, _access: u32, out: *mut HANDLE) -> BOOL {
+pub unsafe extern "win64" fn OpenProcessToken(process: HANDLE, access: u32, out: *mut HANDLE) -> BOOL {
     if out.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    std::ptr::write_unaligned(out, handles::insert(new_token_obj(TOKEN_PRIMARY, SECURITY_IMPERSONATION)));
+    if !crate::kernel32::process::is_self(process) {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    }
+    let access = TokenObj::access_mask(access);
+    std::ptr::write_unaligned(out, handles::insert(new_token_obj(TOKEN_PRIMARY, SECURITY_IMPERSONATION, access)));
     TRUE
 }
 
@@ -1456,12 +1484,15 @@ pub unsafe extern "win64" fn GetTokenInformation(
     buf_len: u32,
     ret_len: *mut u32,
 ) -> BOOL {
-    if token.is_null() || ret_len.is_null() {
+    if ret_len.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    let Some(tok) = resolve_token(token) else {
-        std::ptr::write_unaligned(ret_len, 0);
-        return err(ERROR_INVALID_HANDLE, FALSE);
+    let tok = match TokenObj::resolve(token, 0x0008) {
+        Ok(t) => t,
+        Err(e) => {
+            std::ptr::write_unaligned(ret_len, 0);
+            return err(e, FALSE);
+        }
     };
     match info_class {
         // TokenUser (1): TOKEN_USER { SID_AND_ATTRIBUTES { PSID @0, DWORD Attrs @8 } } + user SID
@@ -1789,37 +1820,30 @@ pub unsafe extern "win64" fn GetTokenInformation(
     }
 }
 
-pub unsafe extern "win64" fn DuplicateToken(
-    existing: HANDLE,
-    imp_level: u32,
-    out: *mut HANDLE,
-) -> BOOL {
-    if out.is_null() {
-        return err(ERROR_INVALID_PARAMETER, FALSE);
-    }
-    if resolve_token(existing).is_none() {
-        return err(ERROR_INVALID_HANDLE, FALSE);
-    }
-    std::ptr::write_unaligned(out, handles::insert(new_token_obj(TOKEN_IMPERSONATION, imp_level)));
-    TRUE
+pub unsafe extern "win64" fn DuplicateToken(existing: HANDLE, imp_level: u32, out: *mut HANDLE) -> BOOL {
+    DuplicateTokenEx(existing, 0x0c, std::ptr::null_mut(), imp_level, TOKEN_IMPERSONATION, out)
 }
 
 pub unsafe extern "win64" fn DuplicateTokenEx(
     existing: HANDLE,
-    _access: u32,
+    access: u32,
     _attr: *mut c_void,
     imp_level: u32,
     token_type: u32,
     out: *mut HANDLE,
 ) -> BOOL {
-    if out.is_null() {
+    if out.is_null() || !matches!(token_type, TOKEN_PRIMARY | TOKEN_IMPERSONATION) || imp_level > 3 {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    if resolve_token(existing).is_none() {
-        return err(ERROR_INVALID_HANDLE, FALSE);
+    let original = match TokenObj::resolve(existing, 0x0002) {
+        Ok(t) => t,
+        Err(e) => return err(e, FALSE),
+    };
+    if original.token_type == TOKEN_IMPERSONATION && imp_level > original.imp_level {
+        return err(1346, FALSE);
     }
-    let tt = if token_type == TOKEN_IMPERSONATION { TOKEN_IMPERSONATION } else { TOKEN_PRIMARY };
-    std::ptr::write_unaligned(out, handles::insert(new_token_obj(tt, imp_level)));
+    let new_access = if access == 0 { original.access } else { TokenObj::access_mask(access) };
+    std::ptr::write_unaligned(out, handles::insert(new_token_obj(token_type, imp_level, new_access)));
     TRUE
 }
 
@@ -2104,15 +2128,22 @@ pub unsafe extern "win64" fn ConvertSidToStringSidA(sid: *const u8, out: *mut LP
     TRUE
 }
 
-pub unsafe extern "win64" fn CheckTokenMembership(
-    _token: HANDLE,
-    _sid: *const c_void,
-    is_member: *mut BOOL,
-) -> BOOL {
-    if is_member.is_null() {
+pub unsafe extern "win64" fn CheckTokenMembership(token: HANDLE, sid: *const c_void, is_member: *mut BOOL) -> BOOL {
+    if is_member.is_null() || sid.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    std::ptr::write_unaligned(is_member, FALSE);
+    if !token.is_null() {
+        match TokenObj::resolve(token, 0x0008) {
+            Ok(t) if t.token_type == TOKEN_IMPERSONATION => {}
+            Ok(_) => return err(1309, FALSE), // ERROR_NO_IMPERSONATION_TOKEN
+            Err(e) => return err(e, FALSE),
+        }
+    }
+    let groups = token_default_groups();
+    let enabled = groups
+        .iter()
+        .any(|(group, flags)| (flags & SE_GROUP_ENABLED) != 0 && EqualSid(sid.cast(), group.as_ptr()) != 0);
+    is_member.write_unaligned(enabled as BOOL);
     TRUE
 }
 
@@ -6898,8 +6929,16 @@ mod tests {
     fn token_information_all_classes_windows_semantics() {
         unsafe {
             let mut tok: HANDLE = std::ptr::null_mut();
-            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008, &mut tok), TRUE);
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008 | 0x0002, &mut tok), TRUE);
             assert!(!tok.is_null());
+
+            // TOKEN_QUERY-only handle cannot be duplicated (ERROR_ACCESS_DENIED)
+            let mut ro_tok: HANDLE = std::ptr::null_mut();
+            let mut denied_dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008, &mut ro_tok), TRUE);
+            assert_eq!(DuplicateToken(ro_tok, SECURITY_IMPERSONATION, &mut denied_dup), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_ACCESS_DENIED);
+            let _ = crate::kernel32::threads::CloseHandle(ro_tok);
 
             let mut need = 0u32;
             // TokenType (8) -> TokenPrimary (1)

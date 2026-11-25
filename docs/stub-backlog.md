@@ -11,9 +11,9 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **188** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 145 |
-| `failing` (honest-failing macro exports) | 24 |
+| Total remaining stub sites | **182** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 141 |
+| `failing` (honest-failing macro exports) | 22 |
 | `middleware_stub` (third-party/engine middleware fallbacks) | 19 |
 | DLLs with remaining stubs | 31 |
 
@@ -193,15 +193,15 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | DLL | Count | Reason | Next Step |
 |---|---:|---|---|
-| `kernel32.dll` | 34 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
+| `kernel32.dll` | 30 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
 | `crypt32.dll` | 19 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
 | `d3d11.dll` | 14 | Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop) | Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them. |
 | `user32.dll` | 13 | Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature | Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation. |
 | `ole32.dll` | 12 | Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion | Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions. |
 | `physx3common_x64.dll` | 12 | PhysX 3.4 geometry/mesh query path without cooked mesh payload | Prefer shipping PhysX3*.dll under ARM64 JIT, or decode cooked BVH/triangle mesh payloads in physx3common_x64. |
 | `dxgi.dll` | 10 | Unsupported Windows-only DXGI path (WARP software rasterizer, UWP CoreWindow, exclusive fullscreen ownership, event notifications) | Implement VSync-synchronized WaitForVBlank via CVDisplayLink/CADisplayLink and shared-handle LUID lookup; keep WARP/CoreWindow honestly unsupported. |
-| `ws2_32.dll` | 10 | Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication | Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them. |
 | `ntdll.dll` | 9 | Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export | Add missing Process/Thread/System information classes on demand; TxF transactions and direct KiUser* calls remain honestly unsupported. |
+| `ws2_32.dll` | 8 | Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication | Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them. |
 | `mmdevapi.dll` | 6 | Optional WASAPI mode/service (exclusive mode, loopback capture, hardware offload, unknown COM IID) | Add CoreAudio loopback capture / tap support when a game requests AUDCLNT_STREAMFLAGS_LOOPBACK; keep exclusive/offload honestly rejected. |
 | `ucrtbase.dll` | 6 | Uncommon CRT locale, multibyte codepage, UTF-16 stream encoding, or interactive console/shell call | Add UTF-16 FILE stream translation and locale/codepage tables; keep system() safely sandboxed/refused. |
 | `dinput8.dll` | 5 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
@@ -225,47 +225,43 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `shell32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `xinput1_4.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 
-### `kernel32.dll` (34)
+### `kernel32.dll` (30)
 
 - **Reason:** Partial Windows kernel/file/memory/locale/job/threadpool sub-feature
 - **Next step:** Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives.
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `AllocConsole` | `stub` | `crates/win32-rt/src/kernel32/file.rs:475` | `"no separate console window; stdout/stderr of the loader act as the console"` |
+| `AllocConsole` | `stub` | `crates/win32-rt/src/kernel32/file.rs:477` | `"no separate console window; stdout/stderr of the loader act as the console"` |
 | `AssignProcessToJobObject` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1655` | `"job objects have no effect"` |
-| `CloseThreadpoolCleanupGroupMembers` | `stub` | `crates/win32-rt/src/kernel32/threadpool.rs:808` | `"cleanup groups do not track members"` |
 | `CreateProcessW` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1283` | `"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)` |
 | `CreateRemoteThread` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:60` | `"CreateRemoteThread into another process"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7057` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7085` | `"DeviceIoControl code {code:#x} unsupported"` |
-| `FlushProcessWriteBuffers` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:1028` | `"FlushProcessWriteBuffers approximated by a local fence"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7127` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7155` | `"DeviceIoControl code {code:#x} unsupported"` |
+| `FlushProcessWriteBuffers` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:1045` | `"FlushProcessWriteBuffers approximated by a local fence"` |
 | `GetCalendarInfoEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1354` | `"GetCalendarInfoEx type {ty:#x}"` |
-| `GetFileInformationByHandleEx` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2111` | `"GetFileInformationByHandleEx class {class} not supported"` |
+| `GetFileInformationByHandleEx` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2137` | `"GetFileInformationByHandleEx class {class} not supported"` |
 | `GetGeoInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1125` | `"GetGeoInfo for geo id {geo} answered with US data"` |
 | `GetLocaleInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:918` | `"locale {lcid:#x} not available; answering with en-US data"` |
 | `GetNumberFormatEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1323` | `"custom NUMBERFMT ignored"` |
-| `InitOnceBeginInitialize` | `stub` | `crates/win32-rt/src/sync.rs:744` | `"INIT_ONCE_ASYNC treated as synchronous"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:552` | `"LCMAP_HASH unsupported"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:578` | `"LCMapString flags {flags:#x} partially honoured"` |
-| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6848` | `"MapViewOfFile3 on another process"` |
-| `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2526` | `"MoveFileExA delete-on-reboot ignored"` |
-| `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2519` | `"MoveFileExW delete-on-reboot ignored"` |
-| `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2198` | `"SetFileInformationByHandle class {class} not supported"` |
+| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6918` | `"MapViewOfFile3 on another process"` |
+| `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2596` | `"MoveFileExA delete-on-reboot ignored"` |
+| `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2589` | `"MoveFileExW delete-on-reboot ignored"` |
+| `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2268` | `"SetFileInformationByHandle class {class} not supported"` |
 | `SetInformationJobObject` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1659` | `"SetInformationJobObject class {class} ignored"` |
-| `SetThreadAffinityMask` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:244` | `"thread affinity not applied"` |
-| `SetThreadGroupAffinity` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:250` | `"thread group affinity not applied"` |
 | `TerminateThread` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:173` | `"TerminateThread unsupported"` |
-| `VirtualAlloc2` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:575` | `"VirtualAlloc2 on another process"` |
-| `VirtualAllocEx` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:566` | `"VirtualAllocEx on another process"` |
-| `VirtualProtect` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:678` | `"PAGE_GUARD not emulated"` |
+| `VirtualAlloc2` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:577` | `"VirtualAlloc2 on another process"` |
+| `VirtualAllocEx` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:568` | `"VirtualAllocEx on another process"` |
+| `VirtualProtect` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:684` | `"PAGE_GUARD not emulated"` |
 | `format_message` | `stub` | `crates/win32-rt/src/kernel32/process.rs:2180` | `"message tables in modules are not supported (id {id:#x})"` |
 | `format_message` | `stub` | `crates/win32-rt/src/kernel32/process.rs:2189` | `"FormatMessage from module message table (id {id:#x})"` |
 | `get_locale_info` | `stub` | `crates/win32-rt/src/kernel32/string.rs:865` | `"GetLocaleInfo LCTYPE {lctype:#x} unknown"` |
 | `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:362` | `"MEM_LARGE_PAGES ignored"` |
 | `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:365` | `"MEM_WRITE_WATCH not tracked"` |
-| `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:368` | `"PAGE_GUARD not emulated (treated as normal pages)"` |
-| `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:375` | `"MEM_RESET_UNDO: contents may have been discarded"` |
+| `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:369` | `"PAGE_GUARD not emulated"` |
+| `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:377` | `"MEM_RESET_UNDO: contents may have been discarded"` |
 
 ### `crypt32.dll` (19)
 
@@ -326,16 +322,16 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `CreateCursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:987` | `"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"` |
 | `DisplayConfigGetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:684` | `"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
 | `DisplayConfigSetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:692` | `"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
-| `GetSystemMetrics` | `stub` | `crates/win32-rt/src/user32/misc.rs:234` | `"GetSystemMetrics({index}) -> 0"` |
-| `RegisterHotKey` | `stub` | `crates/win32-rt/src/user32/misc.rs:759` | `"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize` |
+| `GetSystemMetrics` | `stub` | `crates/win32-rt/src/user32/misc.rs:239` | `"GetSystemMetrics({index}) -> 0"` |
+| `RegisterHotKey` | `stub` | `crates/win32-rt/src/user32/misc.rs:770` | `"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize` |
 | `RegisterRawInputDevices` | `stub` | `crates/win32-rt/src/user32/input.rs:1363` | `"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"` |
 | `ReplyMessage` | `stub` | `crates/win32-rt/src/user32/message.rs:883` | `"ReplyMessage: early reply not supported"` |
 | `def_window_proc` | `stub` | `crates/win32-rt/src/user32/defproc.rs:154` | `"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"` |
 | `load_cursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:87` | `"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"` |
-| `message_box` | `stub` | `crates/win32-rt/src/user32/misc.rs:1876` | `"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"` |
-| `spi` | `stub` | `crates/win32-rt/src/user32/misc.rs:565` | `"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }` |
-| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:600` | `"GetUserObjectInformation on handle {h:#x} (only the window station is known)"` |
-| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:622` | `"GetUserObjectInformation index {index} not supported"` |
+| `message_box` | `stub` | `crates/win32-rt/src/user32/misc.rs:1887` | `"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"` |
+| `spi` | `stub` | `crates/win32-rt/src/user32/misc.rs:576` | `"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }` |
+| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:611` | `"GetUserObjectInformation on handle {h:#x} (only the window station is known)"` |
+| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:633` | `"GetUserObjectInformation index {index} not supported"` |
 
 ### `ole32.dll` (12)
 
@@ -395,7 +391,24 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `take_ownership` | `stub` | `crates/win32-rt/src/dxgi/adapter.rs:669` | `"TakeOwnership: exclusive fullscreen is not supported"` |
 | `wait_for_vblank` | `stub` | `crates/win32-rt/src/dxgi/adapter.rs:663` | `"WaitForVBlank: sleeps one refresh period ({hz} Hz), not synchronized to the display"` |
 
-### `ws2_32.dll` (10)
+### `ntdll.dll` (9)
+
+- **Reason:** Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export
+- **Next step:** Add missing Process/Thread/System information classes on demand; TxF transactions and direct KiUser* calls remain honestly unsupported.
+
+| API | Kind | Location | Detail |
+|---|---|---|---|
+| `KiUserApcDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1678` | `"KiUserApcDispatcher called directly"` |
+| `KiUserCallbackDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1682` | `"KiUserCallbackDispatcher called directly"` |
+| `KiUserExceptionDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1674` | `"KiUserExceptionDispatcher called directly"` |
+| `LdrInitializeThunk` | `stub` | `crates/win32-rt/src/ntdll.rs:2420` | `"LdrInitializeThunk called directly"` |
+| `NtCommitTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:747` | `"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"` |
+| `NtCreateTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:742` | `"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"` |
+| `NtQueryInformationProcess` | `stub` | `crates/win32-rt/src/ntdll.rs:241` | `"NtQueryInformationProcess class {class}"` |
+| `NtQueryInformationThread` | `stub` | `crates/win32-rt/src/ntdll.rs:313` | `"NtQueryInformationThread class {class}"` |
+| `NtQuerySystemInformation` | `stub` | `crates/win32-rt/src/ntdll.rs:438` | `"NtQuerySystemInformation class {class}"` |
+
+### `ws2_32.dll` (8)
 
 - **Reason:** Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication
 - **Next step:** Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them.
@@ -407,28 +420,9 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `WSAConnectByNameA` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
 | `WSAConnectByNameW` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
 | `WSAGetQOSByName` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAIoctl` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1782` | `"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"` |
+| `WSAIoctl` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1802` | `"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"` |
 | `WSAJoinLeaf` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSARecvMsg` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSASendMsg` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `duplicate_socket_into_info` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1319` | `"WSADuplicateSocket cross-process target pid={pid} unsupported"` |
-
-### `ntdll.dll` (9)
-
-- **Reason:** Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export
-- **Next step:** Add missing Process/Thread/System information classes on demand; TxF transactions and direct KiUser* calls remain honestly unsupported.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `KiUserApcDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1662` | `"KiUserApcDispatcher called directly"` |
-| `KiUserCallbackDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1666` | `"KiUserCallbackDispatcher called directly"` |
-| `KiUserExceptionDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1658` | `"KiUserExceptionDispatcher called directly"` |
-| `LdrInitializeThunk` | `stub` | `crates/win32-rt/src/ntdll.rs:2404` | `"LdrInitializeThunk called directly"` |
-| `NtCommitTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:731` | `"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"` |
-| `NtCreateTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:726` | `"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"` |
-| `NtQueryInformationProcess` | `stub` | `crates/win32-rt/src/ntdll.rs:239` | `"NtQueryInformationProcess class {class}"` |
-| `NtQueryInformationThread` | `stub` | `crates/win32-rt/src/ntdll.rs:303` | `"NtQueryInformationThread class {class}"` |
-| `NtQuerySystemInformation` | `stub` | `crates/win32-rt/src/ntdll.rs:422` | `"NtQuerySystemInformation class {class}"` |
+| `duplicate_socket_into_info` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1322` | `"WSADuplicateSocket cross-process target pid={pid} unsupported"` |
 
 ### `mmdevapi.dll` (6)
 
@@ -623,7 +617,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `GetDeviceCaps` | `stub` | `crates/win32-rt/src/misc/gdi32.rs:860` | `"GetDeviceCaps({index}) -> 0"` |
+| `GetDeviceCaps` | `stub` | `crates/win32-rt/src/misc/gdi32.rs:866` | `"GetDeviceCaps({index}) -> 0"` |
 
 ### `hid.dll` (1)
 
