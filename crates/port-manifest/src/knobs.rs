@@ -835,6 +835,15 @@ pub const KNOBS: &[KnobSpec] = &[
         crates: &["x86-runtime"],
     },
     KnobSpec {
+        name: "PORT_AOT_STRICT",
+        aliases: &[],
+        kind: KnobType::Enum(&["off", "report", "fail"]),
+        default: "off",
+        description: "Strict AOT fallback accounting: 'report' logs & counts runtime JIT compiles, interpreter steps, and software-FP fallbacks with module+RVA; 'fail' aborts (exit 87) on the first fallback.",
+        affects_aot_key: false,
+        crates: &["x86-runtime"],
+    },
+    KnobSpec {
         name: "PORT_AOT_THREADS",
         aliases: &["AW2_DLL_AOT_THREADS"],
         kind: KnobType::U32,

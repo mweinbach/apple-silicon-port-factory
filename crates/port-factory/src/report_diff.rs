@@ -12,6 +12,24 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
+pub struct AotFallbackDiffData {
+    pub present: bool,
+    pub strict_mode: String,
+    pub aot_insns: u64,
+    pub runtime_jit_insns: u64,
+    pub runtime_jit_compiles: u64,
+    pub interp_fast_steps: u64,
+    pub interp_generic_steps: u64,
+    pub interp_mmx_steps: u64,
+    pub interp_trap_steps: u64,
+    pub soft_fp_steps: u64,
+    pub total_fallbacks: u64,
+    pub top_mnemonics: BTreeMap<String, u64>,
+    pub top_sites: BTreeMap<String, u64>,
+    pub top_jit_compiles: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct BootReport {
     pub exe: String,
     pub exit_kind: String,
@@ -29,6 +47,7 @@ pub struct BootReport {
     pub aot_kills: u64,
     pub aot_revived: u64,
     pub static_aot_blocks: u64,
+    pub aot_fallbacks: AotFallbackDiffData,
     pub tier1_memory_hits: u64,
     pub tier1_disk_hits: u64,
     pub tier1_compiles: u64,
@@ -95,6 +114,55 @@ pub fn parse_boot_report(raw: &str) -> Result<BootReport> {
         r.aot_kills = get_u64(t, "aot_kills");
         r.aot_revived = get_u64(t, "aot_revived");
         r.static_aot_blocks = get_u64(t, "static_aot_blocks");
+    }
+    if let Some(af) = obj.get("aot_fallbacks").and_then(|v| v.as_obj()) {
+        let d = &mut r.aot_fallbacks;
+        d.present = true;
+        d.strict_mode = get_str(af, "strict_mode").to_string();
+        d.aot_insns = get_u64(af, "aot_insns");
+        d.runtime_jit_insns = get_u64(af, "runtime_jit_insns");
+        d.runtime_jit_compiles = get_u64(af, "runtime_jit_compiles");
+        d.interp_fast_steps = get_u64(af, "interp_fast_steps");
+        d.interp_generic_steps = get_u64(af, "interp_generic_steps");
+        d.interp_mmx_steps = get_u64(af, "interp_mmx_steps");
+        d.interp_trap_steps = get_u64(af, "interp_trap_steps");
+        d.soft_fp_steps = get_u64(af, "soft_fp_steps");
+        d.total_fallbacks = get_u64(af, "total_fallbacks");
+        if let Some(arr) = af.get("top_mnemonics").and_then(|v| v.as_arr()) {
+            for item in arr {
+                if let Some(m) = item.as_obj() {
+                    let name = get_str(m, "mnemonic");
+                    if !name.is_empty() {
+                        d.top_mnemonics.insert(name.to_string(), get_u64(m, "count"));
+                    }
+                }
+            }
+        }
+        if let Some(arr) = af.get("top_sites").and_then(|v| v.as_arr()) {
+            for item in arr {
+                if let Some(s) = item.as_obj() {
+                    let loc = get_str(s, "location");
+                    let kind = get_str(s, "kind");
+                    let mn = get_str(s, "mnemonic");
+                    if !loc.is_empty() {
+                        d.top_sites
+                            .insert(format!("[{kind}:{mn}] {loc}"), get_u64(s, "count"));
+                    }
+                }
+            }
+        }
+        if let Some(arr) = af.get("top_jit_compiles").and_then(|v| v.as_arr()) {
+            for item in arr {
+                if let Some(s) = item.as_obj() {
+                    let loc = get_str(s, "location");
+                    let reason = get_str(s, "reason");
+                    if !loc.is_empty() {
+                        d.top_jit_compiles
+                            .insert(format!("[{reason}] {loc}"), get_u64(s, "count"));
+                    }
+                }
+            }
+        }
     }
     if let Some(s) = obj.get("shaders").and_then(|v| v.as_obj()) {
         r.tier1_memory_hits = get_u64(s, "tier1_memory_hits");
@@ -225,6 +293,95 @@ pub fn format_boot_report_diff(before: &BootReport, after: &BootReport) -> Strin
         fmt_delta(before.static_aot_blocks, after.static_aot_blocks)
     );
 
+    if before.aot_fallbacks.present || after.aot_fallbacks.present {
+        let bf = &before.aot_fallbacks;
+        let af = &after.aot_fallbacks;
+        let _ = writeln!(out);
+        let _ = writeln!(out, "AOT Fallbacks:");
+        let _ = writeln!(
+            out,
+            "  strict_mode           : {} -> {}",
+            bf.strict_mode, af.strict_mode
+        );
+        let _ = writeln!(
+            out,
+            "  aot_insns             : {}",
+            fmt_delta(bf.aot_insns, af.aot_insns)
+        );
+        let _ = writeln!(
+            out,
+            "  runtime_jit_insns     : {}",
+            fmt_delta(bf.runtime_jit_insns, af.runtime_jit_insns)
+        );
+        let _ = writeln!(
+            out,
+            "  runtime_jit_compiles  : {}",
+            fmt_delta(bf.runtime_jit_compiles, af.runtime_jit_compiles)
+        );
+        let _ = writeln!(
+            out,
+            "  interp_fast_steps     : {}",
+            fmt_delta(bf.interp_fast_steps, af.interp_fast_steps)
+        );
+        let _ = writeln!(
+            out,
+            "  interp_generic_steps  : {}",
+            fmt_delta(bf.interp_generic_steps, af.interp_generic_steps)
+        );
+        let _ = writeln!(
+            out,
+            "  interp_mmx_steps      : {}",
+            fmt_delta(bf.interp_mmx_steps, af.interp_mmx_steps)
+        );
+        let _ = writeln!(
+            out,
+            "  interp_trap_steps     : {}",
+            fmt_delta(bf.interp_trap_steps, af.interp_trap_steps)
+        );
+        let _ = writeln!(
+            out,
+            "  soft_fp_steps         : {}",
+            fmt_delta(bf.soft_fp_steps, af.soft_fp_steps)
+        );
+        let _ = writeln!(
+            out,
+            "  total_fallbacks       : {}",
+            fmt_delta(bf.total_fallbacks, af.total_fallbacks)
+        );
+        let new_sites: Vec<_> = af
+            .top_sites
+            .iter()
+            .filter(|(k, _)| !bf.top_sites.contains_key(*k))
+            .collect();
+        let gone_sites: Vec<_> = bf
+            .top_sites
+            .iter()
+            .filter(|(k, _)| !af.top_sites.contains_key(*k))
+            .collect();
+        for (site, c) in new_sites.iter().take(15) {
+            let _ = writeln!(out, "  + fallback site {site} ({c})");
+        }
+        for (site, c) in gone_sites.iter().take(15) {
+            let _ = writeln!(out, "  - fallback site {site} ({c})");
+        }
+        let new_jit: Vec<_> = af
+            .top_jit_compiles
+            .iter()
+            .filter(|(k, _)| !bf.top_jit_compiles.contains_key(*k))
+            .collect();
+        let gone_jit: Vec<_> = bf
+            .top_jit_compiles
+            .iter()
+            .filter(|(k, _)| !af.top_jit_compiles.contains_key(*k))
+            .collect();
+        for (site, c) in new_jit.iter().take(15) {
+            let _ = writeln!(out, "  + runtime-jit {site} ({c})");
+        }
+        for (site, c) in gone_jit.iter().take(15) {
+            let _ = writeln!(out, "  - runtime-jit {site} ({c})");
+        }
+    }
+
     // Shaders & PSOs diff
     let _ = writeln!(out);
     let _ = writeln!(out, "Shaders & PSOs:");
@@ -311,5 +468,71 @@ mod tests {
         assert!(diff.contains("ws2_32.dll!WSAJoinLeaf"));
         assert!(diff.contains("12 -> 45 (+33)"));
         assert!(diff.contains("5 -> 0 (-5)"));
+    }
+
+    #[test]
+    fn report_diff_surfaces_aot_fallback_regressions_and_fixes() {
+        let before_json = r#"{
+          "schema_version": 1,
+          "target": { "exe": "app.exe", "game_dir": "/app", "manifest": "" },
+          "exit": { "kind": "clean_exit", "code": 0, "detail": "", "elapsed_ms": 100, "frames_presented": 10, "graphics_api": "d3d12" },
+          "ranked_blockers": [],
+          "stubs": { "total_hits": 0, "unique_sites": 0, "entries": [] },
+          "tiers": { "exec_mode": "jit_writable", "decoded_interp_blocks": 10, "jit_blocks_compiled": 5, "aot_active": true, "aot_kills": 0, "aot_revived": 0, "static_aot_modules": 0, "static_aot_blocks": 0, "static_aot_bytes": 0 },
+          "aot_fallbacks": {
+            "strict_mode": "report",
+            "aot_insns": 100000,
+            "runtime_jit_insns": 500,
+            "runtime_jit_compiles": 5,
+            "interp_fast_steps": 12,
+            "interp_generic_steps": 3,
+            "interp_mmx_steps": 0,
+            "interp_trap_steps": 0,
+            "soft_fp_steps": 1,
+            "total_fallbacks": 21,
+            "runtime_jit_reasons": [{ "reason": "aot_miss", "count": 5 }],
+            "top_mnemonics": [{ "mnemonic": "xgetbv", "count": 3 }],
+            "top_sites": [{ "location": "app.exe+0x1200", "ip": 4608, "kind": "interp_generic", "mnemonic": "xgetbv", "count": 3 }],
+            "top_jit_compiles": [{ "location": "app.exe+0x1204", "ip": 4612, "reason": "aot_miss", "count": 1 }]
+          },
+          "shaders": { "tier1_initialized": false, "tier1_memory_hits": 0, "tier1_disk_hits": 0, "tier1_compiles": 0, "tier1_failures": 0, "tier1_compile_ms": 0, "pso_initialized": false, "pso_memory_hits": 0, "pso_archive_hits": 0, "pso_compiles": 0, "pso_failures": 0, "pso_compile_ms": 0 },
+          "unresolved_imports": []
+        }"#;
+        let after_json = r#"{
+          "schema_version": 1,
+          "target": { "exe": "app.exe", "game_dir": "/app", "manifest": "" },
+          "exit": { "kind": "clean_exit", "code": 0, "detail": "", "elapsed_ms": 95, "frames_presented": 10, "graphics_api": "d3d12" },
+          "ranked_blockers": [],
+          "stubs": { "total_hits": 0, "unique_sites": 0, "entries": [] },
+          "tiers": { "exec_mode": "jit_writable", "decoded_interp_blocks": 2, "jit_blocks_compiled": 1, "aot_active": true, "aot_kills": 0, "aot_revived": 0, "static_aot_modules": 0, "static_aot_blocks": 0, "static_aot_bytes": 0 },
+          "aot_fallbacks": {
+            "strict_mode": "report",
+            "aot_insns": 100500,
+            "runtime_jit_insns": 0,
+            "runtime_jit_compiles": 1,
+            "interp_fast_steps": 0,
+            "interp_generic_steps": 3,
+            "interp_mmx_steps": 0,
+            "interp_trap_steps": 0,
+            "soft_fp_steps": 0,
+            "total_fallbacks": 4,
+            "runtime_jit_reasons": [{ "reason": "aot_miss", "count": 1 }],
+            "top_mnemonics": [{ "mnemonic": "xgetbv", "count": 3 }],
+            "top_sites": [{ "location": "app.exe+0x1200", "ip": 4608, "kind": "interp_generic", "mnemonic": "xgetbv", "count": 3 }],
+            "top_jit_compiles": [{ "location": "app.exe+0x9000", "ip": 36864, "reason": "aot_miss", "count": 1 }]
+          },
+          "shaders": { "tier1_initialized": false, "tier1_memory_hits": 0, "tier1_disk_hits": 0, "tier1_compiles": 0, "tier1_failures": 0, "tier1_compile_ms": 0, "pso_initialized": false, "pso_memory_hits": 0, "pso_archive_hits": 0, "pso_compiles": 0, "pso_failures": 0, "pso_compile_ms": 0 },
+          "unresolved_imports": []
+        }"#;
+
+        let b = parse_boot_report(before_json).unwrap();
+        let a = parse_boot_report(after_json).unwrap();
+        let diff = format_boot_report_diff(&b, &a);
+        assert!(diff.contains("AOT Fallbacks:"));
+        assert!(diff.contains("runtime_jit_compiles  : 5 -> 1 (-4)"));
+        assert!(diff.contains("interp_fast_steps     : 12 -> 0 (-12)"));
+        assert!(diff.contains("soft_fp_steps         : 1 -> 0 (-1)"));
+        assert!(diff.contains("- runtime-jit [aot_miss] app.exe+0x1204 (1)"));
+        assert!(diff.contains("+ runtime-jit [aot_miss] app.exe+0x9000 (1)"));
     }
 }

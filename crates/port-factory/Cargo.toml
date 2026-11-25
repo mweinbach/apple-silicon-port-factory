@@ -14,7 +14,7 @@ bink2-codec.workspace = true
 pe-image.workspace = true
 port-manifest.workspace = true
 dxil-metal.workspace = true
-iced-x86.workspace = true
+iced-x86 = { workspace = true, features = ["op_code_info"] }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
 x86-runtime.workspace = true

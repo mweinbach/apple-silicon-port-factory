@@ -124,6 +124,7 @@ pub const CONTEXT_AW2_LONGJMP: u32 = 0x2000_0000;
 pub const STATUS_NONCONTINUABLE_EXCEPTION: u32 = 0xC000_0025;
 pub const STATUS_INVALID_DISPOSITION: u32 = 0xC000_0026;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+pub const STATUS_GUARD_PAGE_VIOLATION: u32 = 0x8000_0001;
 pub const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 pub const STATUS_INTEGER_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
 pub const STATUS_BREAKPOINT: u32 = 0x8000_0003;
@@ -2211,6 +2212,7 @@ pub static UNHANDLED_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic:
 pub fn describe_exception(rec: &ExceptionRecord) -> String {
     let name = match rec.code {
         STATUS_ACCESS_VIOLATION => "ACCESS_VIOLATION",
+        STATUS_GUARD_PAGE_VIOLATION => "GUARD_PAGE_VIOLATION",
         CXX_EXCEPTION => "C++ exception (0xE06D7363)",
         STATUS_BREAKPOINT => "BREAKPOINT",
         STATUS_ILLEGAL_INSTRUCTION => "ILLEGAL_INSTRUCTION",
