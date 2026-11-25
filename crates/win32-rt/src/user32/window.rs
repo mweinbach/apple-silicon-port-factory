@@ -86,6 +86,7 @@ pub struct WinData {
     pub enabled: bool,
     pub topmost: bool,
     pub native: bool,
+    pub native_control: bool,
     pub destroying: bool,
     pub erase_pending: bool,
 }
@@ -571,6 +572,7 @@ pub unsafe fn create_window(a: CreateArgs) -> usize {
             enabled: style & ws::DISABLED == 0,
             topmost,
             native: false,
+            native_control: false,
             destroying: false,
             erase_pending: true,
         }),
@@ -627,6 +629,25 @@ pub unsafe fn create_window(a: CreateArgs) -> usize {
         if crate::macos::window_create(hwnd, desc) {
             win.data().native = true;
         }
+    } else if let Some(kind) = super::controls::control_kind_for_class(&cls.name) {
+        if let Some((root_hwnd, root_rect)) = root_top_level_and_rect(hwnd) {
+            if get(root_hwnd).is_some_and(|rw| rw.data().native) {
+                let desc = {
+                    let d = win.data();
+                    crate::macos::NativeControlDesc {
+                        kind,
+                        rect: root_rect,
+                        style: d.style,
+                        exstyle: d.exstyle,
+                        text: String::from_utf16_lossy(&d.text),
+                        enabled: d.enabled,
+                        visible: d.visible,
+                    }
+                };
+                crate::macos::control_create(hwnd, root_hwnd, desc);
+                win.data().native_control = true;
+            }
+        }
     }
 
     if send_message(hwnd, wm::CREATE, 0, csp) == -1 {
@@ -675,6 +696,29 @@ fn default_minmax(style: u32, exstyle: u32) -> MINMAXINFO {
     }
 }
 
+/// Walk up `WS_CHILD` ancestors to find the root top-level HWND and this
+/// child's rectangle in that top-level window's client pixel coordinates.
+fn root_top_level_and_rect(hwnd: usize) -> Option<(usize, RECT)> {
+    let w = get(hwnd)?;
+    let (mut cur, mut rect, is_child) = {
+        let d = w.data();
+        (d.parent, d.rect, (d.style & ws::CHILD) != 0)
+    };
+    if !is_child {
+        return None;
+    }
+    for _ in 0..64 {
+        let pw = get(cur)?;
+        let pd = pw.data();
+        if (pd.style & ws::CHILD) == 0 {
+            return Some((cur, rect));
+        }
+        rect = rect.offset(pd.client.left, pd.client.top);
+        cur = pd.parent;
+    }
+    None
+}
+
 fn free_window(hwnd: usize) {
     let w = {
         let mut t = table().write().unwrap();
@@ -685,14 +729,22 @@ fn free_window(hwnd: usize) {
         if let Some(q) = message::queue_of(w.tid) {
             q.purge_window(hwnd);
         }
-        if w.data().native {
+        let (native, native_control) = {
+            let d = w.data();
+            (d.native, d.native_control)
+        };
+        if native {
             crate::macos::window_destroy(hwnd);
+        }
+        if native_control {
+            crate::macos::control_destroy(hwnd);
         }
     }
     super::input::forget_window(hwnd);
     super::misc::forget_device_notifications(hwnd);
     crate::misc::uxtheme::forget_window_subclasses(hwnd);
     super::dialog::forget_dialog(hwnd);
+    super::controls::forget_control(hwnd);
 }
 
 pub unsafe fn create_window_w(
@@ -850,7 +902,7 @@ pub unsafe extern "win64" fn IsWindowEnabled(hwnd: HWND) -> BOOL {
 
 pub unsafe extern "win64" fn EnableWindow(hwnd: HWND, enable: BOOL) -> BOOL {
     let Some(w) = require(hwnd as usize) else { return FALSE };
-    let was_disabled = {
+    let (was_disabled, native_control) = {
         let mut d = w.data();
         let was = !d.enabled;
         d.enabled = enable != 0;
@@ -859,8 +911,11 @@ pub unsafe extern "win64" fn EnableWindow(hwnd: HWND, enable: BOOL) -> BOOL {
         } else {
             d.style |= ws::DISABLED;
         }
-        was
+        (was, d.native_control)
     };
+    if native_control {
+        crate::macos::control_set_enabled(hwnd as usize, enable != 0);
+    }
     if was_disabled == (enable != 0) {
         send_message(hwnd as usize, wm::ENABLE, (enable != 0) as usize, 0);
     }
@@ -911,7 +966,7 @@ pub unsafe fn set_window_pos_impl(w: &Arc<Window>, after: usize, x: i32, y: i32,
         send_message(hwnd, wm::NCCALCSIZE, 0, &mut r as *mut RECT as LPARAM);
         new_client = r;
     }
-    let (native, minimized) = {
+    let (native, native_control, minimized) = {
         let mut d = w.data();
         d.rect = new_rect;
         d.client = new_client;
@@ -930,7 +985,7 @@ pub unsafe fn set_window_pos_impl(w: &Arc<Window>, after: usize, x: i32, y: i32,
                 _ => {}
             }
         }
-        (d.native, d.minimized)
+        (d.native, d.native_control, d.minimized)
     };
     let _ = (style, exstyle);
     if flags & SWP_NOZORDER == 0 && (after == HWND_TOP || after == HWND_TOPMOST) {
@@ -950,6 +1005,18 @@ pub unsafe fn set_window_pos_impl(w: &Arc<Window>, after: usize, x: i32, y: i32,
         }
         if flags & SWP_SHOWWINDOW != 0 {
             crate::macos::window_show(hwnd, true, flags & SWP_NOACTIVATE == 0);
+        }
+    } else if native_control {
+        if new_rect != old_rect || flags & SWP_FRAMECHANGED != 0 {
+            if let Some((_, root_rect)) = root_top_level_and_rect(hwnd) {
+                crate::macos::control_set_frame(hwnd, root_rect);
+            }
+        }
+        if flags & SWP_HIDEWINDOW != 0 {
+            crate::macos::control_set_visible(hwnd, false);
+        }
+        if flags & SWP_SHOWWINDOW != 0 {
+            crate::macos::control_set_visible(hwnd, true);
         }
     }
     if flags & SWP_SHOWWINDOW != 0 || (new_client != old_client && w.data().visible) {
@@ -1825,20 +1892,28 @@ fn set_long(hwnd: usize, idx: i32, val: isize, size: usize) -> isize {
             let mut ss = STYLESTRUCT { old, new: val as u32 };
             let which = if idx == GWL_STYLE { -16isize } else { -20isize } as usize;
             send_message(hwnd, 0x007C, which, &mut ss as *mut STYLESTRUCT as LPARAM); // WM_STYLECHANGING
-            {
+            let sync_ctrl = {
                 let mut d = w.data();
                 if idx == GWL_STYLE {
                     let (s, _) = framed_top_level_style(ss.new, d.exstyle);
                     ss.new = s;
                     // WS_VISIBLE changes the visibility state directly (no messages).
                     d.visible = ss.new & ws::VISIBLE != 0;
+                    d.enabled = ss.new & ws::DISABLED == 0;
                     d.style = ss.new;
+                    d.native_control.then_some((d.visible, d.enabled, ss.new))
                 } else {
                     let (_, ex) = framed_top_level_style(d.style, ss.new);
                     ss.new = ex;
                     d.exstyle = ss.new;
                     d.topmost = ss.new & ws::EX_TOPMOST != 0;
+                    None
                 }
+            };
+            if let Some((vis, en, new_style)) = sync_ctrl {
+                crate::macos::control_set_visible(hwnd, vis);
+                crate::macos::control_set_enabled(hwnd, en);
+                crate::macos::control_set_style(hwnd, new_style);
             }
             log::debug!("SetWindowLong {hwnd:#x} {} {old:#x} -> {:#x}", if idx == GWL_STYLE { "GWL_STYLE" } else { "GWL_EXSTYLE" }, ss.new);
             send_message(hwnd, 0x007D, which, &mut ss as *mut STYLESTRUCT as LPARAM); // WM_STYLECHANGED
@@ -1995,14 +2070,24 @@ pub fn internal_text(hwnd: usize) -> Option<Vec<u16>> {
 
 pub fn set_internal_text(hwnd: usize, text: Vec<u16>) {
     if let Some(w) = get(hwnd) {
-        let native = {
+        let (native, native_control) = {
             let mut d = w.data();
             d.text = text.clone();
-            d.native
+            (d.native, d.native_control)
         };
         if native {
             crate::macos::window_set_title(hwnd, String::from_utf16_lossy(&text));
+        } else if native_control {
+            crate::macos::control_set_text(hwnd, String::from_utf16_lossy(&text));
         }
+    }
+}
+
+/// Update stored window text in response to a native AppKit text edit without
+/// echoing the string back to the AppKit control.
+pub fn set_internal_text_from_native(hwnd: usize, text: Vec<u16>) {
+    if let Some(w) = get(hwnd) {
+        w.data().text = text;
     }
 }
 

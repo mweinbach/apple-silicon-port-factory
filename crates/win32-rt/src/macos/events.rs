@@ -19,12 +19,18 @@ thread_local! {
 pub(super) fn handle(app: &NSApplication, ev: &NSEvent, mtm: MainThreadMarker) {
     let ty = ev.r#type();
     match ty {
-        NSEventType::KeyDown | NSEventType::KeyUp | NSEventType::FlagsChanged => match translate_key(ev) {
-            KeyAction::Forward => app.sendEvent(ev),
-            KeyAction::Key(k) => input::native_key(k),
-            KeyAction::CapsToggle(mac) => input::native_caps_toggle(mac),
-            KeyAction::Ignore => {}
-        },
+        NSEventType::KeyDown | NSEventType::KeyUp | NSEventType::FlagsChanged => {
+            if super::appkit::window_has_native_text_focus(ev, mtm) {
+                app.sendEvent(ev);
+                return;
+            }
+            match translate_key(ev) {
+                KeyAction::Forward => app.sendEvent(ev),
+                KeyAction::Key(k) => input::native_key(k),
+                KeyAction::CapsToggle(mac) => input::native_caps_toggle(mac),
+                KeyAction::Ignore => {}
+            }
+        }
         NSEventType::MouseMoved
         | NSEventType::LeftMouseDragged
         | NSEventType::RightMouseDragged
@@ -54,6 +60,9 @@ pub(super) fn handle(app: &NSApplication, ev: &NSEvent, mtm: MainThreadMarker) {
                 }
             };
             input::native_mouse(NativeMouse::Button { hwnd, client, screen, button, down, clicks: ev.clickCount() as i64 });
+            if down && matches!(button, MouseButton::Left) {
+                super::appkit::notify_static_click_if_hit(ev, mtm);
+            }
             // In relative mode the frozen pointer may sit on a title bar;
             // don't let AppKit start a window drag from game clicks.
             if !crate::user32::cursor::relative_mode() || hwnd == 0 {
@@ -61,6 +70,10 @@ pub(super) fn handle(app: &NSApplication, ev: &NSEvent, mtm: MainThreadMarker) {
             }
         }
         NSEventType::ScrollWheel => {
+            if super::appkit::window_has_native_controls(ev, mtm) {
+                app.sendEvent(ev);
+                return;
+            }
             let (_, _, screen) = locate(ev, mtm);
             let (dy, dx) = wheel_notches(ev);
             let (ay, ax) = WHEEL_ACC.with(|a| {

@@ -406,6 +406,53 @@ async_op!(window_minimize(minimize: bool) => window_minimize);
 async_op!(window_set_title(title: String) => window_set_title);
 async_op!(window_activate() => window_activate);
 
+// ---------------------------------------------------------------------------
+// Native child controls (BUTTON / EDIT / STATIC) — all FIFO dispatch_async
+// ---------------------------------------------------------------------------
+
+/// Built-in USER32 control class mapped to a native AppKit view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeControlKind {
+    Button,
+    Edit,
+    Static,
+}
+
+/// Snapshot of a Win32 child control's initial properties for native creation.
+#[derive(Clone, Debug)]
+pub struct NativeControlDesc {
+    pub kind: NativeControlKind,
+    /// Control rect in the root top-level window's client pixel coordinates.
+    pub rect: RECT,
+    pub style: u32,
+    pub exstyle: u32,
+    pub text: String,
+    pub enabled: bool,
+    pub visible: bool,
+}
+
+macro_rules! async_ctrl_op {
+    ($name:ident ( $($a:ident : $t:ty),* ) => $imp:ident) => {
+        pub fn $name(hwnd: usize, $($a: $t),*) {
+            #[cfg(target_os = "macos")]
+            run_async(move || appkit::$imp(hwnd, $($a),*));
+            #[cfg(not(target_os = "macos"))]
+            let _ = (hwnd, $($a),*);
+        }
+    };
+}
+
+async_ctrl_op!(control_create(parent_hwnd: usize, desc: NativeControlDesc) => control_create);
+async_ctrl_op!(control_destroy() => control_destroy);
+async_ctrl_op!(control_set_frame(rect: RECT) => control_set_frame);
+async_ctrl_op!(control_set_text(text: String) => control_set_text);
+async_ctrl_op!(control_set_visible(visible: bool) => control_set_visible);
+async_ctrl_op!(control_set_enabled(enabled: bool) => control_set_enabled);
+async_ctrl_op!(control_set_readonly(readonly: bool) => control_set_readonly);
+async_ctrl_op!(control_set_check(state: u32) => control_set_check);
+async_ctrl_op!(control_set_style(style: u32) => control_set_style);
+async_ctrl_op!(control_set_icon(payload: Option<crate::user32::cursor::IconPayload>) => control_set_icon);
+
 pub(crate) fn register_shared(hwnd: usize, s: Arc<WindowShared>) {
     shared_map().lock().unwrap().insert(hwnd, s);
 }

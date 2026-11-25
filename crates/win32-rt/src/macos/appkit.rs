@@ -2,22 +2,28 @@
 //! (marshalled from [`super`]); nothing here calls guest code or the TEB.
 
 use super::display;
-use super::{CursorState, NativeDesc, WindowShared};
-use crate::user32::cursor::Shape;
+use super::{CursorState, NativeControlDesc, NativeControlKind, NativeDesc, WindowShared};
+use crate::user32::controls;
+use crate::user32::cursor::{IconPayload, Shape};
 use crate::user32::window::{native_event, NativeEvent};
 use crate::user32::{ws, POINT, RECT};
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSColor, NSCursor, NSEventMask,
-    NSFont, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSScreen, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
+    NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSBezelStyle,
+    NSBitmapImageRep, NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSCalibratedRGBColorSpace,
+    NSColor, NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSCursor, NSEvent, NSEventMask, NSFont, NSImage, NSImageScaling,
+    NSImageView, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSScreen, NSScrollView, NSSecureTextField, NSText, NSTextAlignment,
+    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSTextViewDelegate, NSView,
+    NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString,
+    MainThreadMarker, NSData, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol,
+    NSPoint, NSRect, NSSize, NSString,
 };
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, RefCell};
@@ -324,6 +330,7 @@ struct SavedWindowed {
 struct NativeWin {
     window: Retained<AW2Window>,
     view: Retained<AW2View>,
+    _metal_view: Retained<NSView>,
     _delegate: Retained<AW2WindowDelegate>,
     layer: Retained<CAMetalLayer>,
     shared: Arc<WindowShared>,
@@ -331,12 +338,14 @@ struct NativeWin {
     programmatic: Cell<bool>,
     desc: RefCell<NativeDesc>,
     shown_once: Cell<bool>,
+    has_controls: Cell<bool>,
     /// Saved windowed `NSWindow` state while in DXGI borderless fullscreen.
     dxgi_fullscreen_saved: RefCell<Option<SavedWindowed>>,
 }
 
 thread_local! {
     static WINDOWS: RefCell<HashMap<usize, NativeWin>> = RefCell::new(HashMap::new());
+    static CONTROLS: RefCell<HashMap<usize, NativeControl>> = RefCell::new(HashMap::new());
     static APP_DELEGATE: RefCell<Option<Retained<AW2AppDelegate>>> = const { RefCell::new(None) };
     static ACTIVATED_ONCE: Cell<bool> = const { Cell::new(false) };
 }
@@ -365,6 +374,7 @@ fn frame_changed(hwnd: usize) {
     }) else {
         return;
     };
+    reposition_child_controls(hwnd);
     if !programmatic {
         native_event(hwnd, NativeEvent::Frame { client });
     }
@@ -553,20 +563,29 @@ pub(super) fn window_create(hwnd: usize, desc: NativeDesc) -> bool {
         window.setLevel(NORMAL_LEVEL);
     }
 
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), content.size);
     let view: Retained<AW2View> = unsafe {
         let this = AW2View::alloc(mtm).set_ivars(());
-        msg_send![super(this), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), content.size)]
+        msg_send![super(this), initWithFrame: bounds]
     };
     // NSViewWidthSizable (2) | NSViewHeightSizable (16) = 18 so live window resize
     // and green-button fullscreen resize the content view automatically.
     let _: () = unsafe { msg_send![&*view, setAutoresizingMask: 18usize] };
+    view.setWantsLayer(true);
+
+    // Host CAMetalLayer on a dedicated full-bleed background subview so native
+    // AppKit child controls added to `view` composite cleanly above it.
+    let metal_view = NSView::initWithFrame(NSView::alloc(mtm), bounds);
+    let _: () = unsafe { msg_send![&*metal_view, setAutoresizingMask: 18usize] };
     let layer = CAMetalLayer::new();
     let win_scale = display::scale_for_rect(&desc.client);
     layer.setContentsScale(win_scale);
     layer.setOpaque(true);
     let _: () = unsafe { msg_send![&*layer, setContentsGravity: &*NSString::from_str("resizeAspect")] };
-    view.setLayer(Some(&layer));
-    view.setWantsLayer(true);
+    metal_view.setLayer(Some(&layer));
+    metal_view.setWantsLayer(true);
+    view.addSubview(&metal_view);
+
     window.setContentView(Some(&view));
     window.makeFirstResponder(Some(&view));
 
@@ -598,12 +617,14 @@ pub(super) fn window_create(hwnd: usize, desc: NativeDesc) -> bool {
             NativeWin {
                 window,
                 view,
+                _metal_view: metal_view,
                 _delegate: delegate,
                 layer,
                 shared,
                 programmatic: Cell::new(false),
                 desc: RefCell::new(desc),
                 shown_once: Cell::new(false),
+                has_controls: Cell::new(false),
                 dxgi_fullscreen_saved: RefCell::new(None),
             },
         )
@@ -612,13 +633,23 @@ pub(super) fn window_create(hwnd: usize, desc: NativeDesc) -> bool {
 }
 
 pub(super) fn window_destroy(hwnd: usize) {
+    let orphan_ctrls: Vec<usize> = CONTROLS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(_, c)| c.parent_hwnd == hwnd)
+            .map(|(h, _)| *h)
+            .collect()
+    });
+    for ch in orphan_ctrls {
+        control_destroy(ch);
+    }
     let w = WINDOWS.with(|m| m.borrow_mut().remove(&hwnd));
     super::unregister_shared(hwnd);
     if let Some(w) = w {
         w.window.setDelegate(None);
         w.window.orderOut(None);
         w.window.close();
-        let _ = (&w.view, &w.layer);
+        let _ = (&w.view, &w._metal_view, &w.layer);
         log::info!("NSWindow for hwnd {hwnd:#x} destroyed");
     }
     update_presentation();
@@ -637,6 +668,7 @@ pub(super) fn window_set_frame(hwnd: usize, client: RECT) {
         w.desc.borrow_mut().client = client;
         w.shared.set_client_size(client.width(), client.height());
     });
+    reposition_child_controls(hwnd);
     update_presentation();
 }
 
@@ -1124,6 +1156,695 @@ pub(super) fn progress_window_close() {
             pw.window.close();
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Native child controls (BUTTON / EDIT / STATIC)
+// ---------------------------------------------------------------------------
+
+struct ControlTargetIvar {
+    hwnd: Cell<usize>,
+    is_toggle: Cell<bool>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AW2ControlTarget"]
+    #[ivars = ControlTargetIvar]
+    struct AW2ControlTarget;
+
+    unsafe impl NSObjectProtocol for AW2ControlTarget {}
+
+    impl AW2ControlTarget {
+        #[unsafe(method(buttonClicked:))]
+        fn button_clicked(&self, sender: &NSButton) {
+            let hwnd = self.ivars().hwnd.get();
+            let check = if self.ivars().is_toggle.get() {
+                let st = sender.state();
+                let v = if st == NSControlStateValueOn {
+                    controls::BST_CHECKED
+                } else if st == NSControlStateValueMixed {
+                    controls::BST_INDETERMINATE
+                } else {
+                    controls::BST_UNCHECKED
+                };
+                Some(v)
+            } else {
+                None
+            };
+            controls::native_button_clicked(hwnd, check);
+        }
+    }
+);
+
+impl AW2ControlTarget {
+    fn new(mtm: MainThreadMarker, hwnd: usize, is_toggle: bool) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ControlTargetIvar {
+            hwnd: Cell::new(hwnd),
+            is_toggle: Cell::new(is_toggle),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AW2TextDelegate"]
+    #[ivars = HwndIvar]
+    struct AW2TextDelegate;
+
+    unsafe impl NSObjectProtocol for AW2TextDelegate {}
+
+    unsafe impl NSControlTextEditingDelegate for AW2TextDelegate {
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            let hwnd = self.ivars().hwnd.get();
+            let text = CONTROLS.with(|m| {
+                let map = m.borrow();
+                let ctrl = map.get(&hwnd)?;
+                if let NativeControlView::SingleLineEdit { field, programmatic, .. } = &ctrl.view {
+                    if programmatic.get() {
+                        return None;
+                    }
+                    return Some(field.stringValue().to_string());
+                }
+                None
+            });
+            if let Some(t) = text {
+                controls::native_edit_text_changed(hwnd, t);
+            }
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for AW2TextDelegate {}
+
+    unsafe impl NSTextDelegate for AW2TextDelegate {
+        #[unsafe(method(textDidChange:))]
+        fn text_did_change(&self, _notification: &NSNotification) {
+            let hwnd = self.ivars().hwnd.get();
+            let text = CONTROLS.with(|m| {
+                let map = m.borrow();
+                let ctrl = map.get(&hwnd)?;
+                if let NativeControlView::MultiLineEdit { text_view, programmatic, .. } = &ctrl.view {
+                    if programmatic.get() {
+                        return None;
+                    }
+                    return Some(text_view.string().to_string());
+                }
+                None
+            });
+            if let Some(t) = text {
+                controls::native_edit_text_changed(hwnd, t);
+            }
+        }
+    }
+
+    unsafe impl NSTextViewDelegate for AW2TextDelegate {}
+);
+
+impl AW2TextDelegate {
+    fn new(mtm: MainThreadMarker, hwnd: usize) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(HwndIvar { hwnd: Cell::new(hwnd) });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+enum NativeControlView {
+    Button {
+        button: Retained<NSButton>,
+        _target: Retained<AW2ControlTarget>,
+    },
+    GroupBox {
+        box_view: Retained<NSBox>,
+    },
+    SingleLineEdit {
+        field: Retained<NSTextField>,
+        _delegate: Retained<AW2TextDelegate>,
+        programmatic: Cell<bool>,
+    },
+    MultiLineEdit {
+        scroll: Retained<NSScrollView>,
+        text_view: Retained<NSTextView>,
+        _delegate: Retained<AW2TextDelegate>,
+        programmatic: Cell<bool>,
+        readonly: Cell<bool>,
+        enabled: Cell<bool>,
+    },
+    StaticLabel {
+        label: Retained<NSTextField>,
+        no_prefix: bool,
+    },
+    StaticIcon {
+        image_view: Retained<NSImageView>,
+    },
+    StaticBox {
+        box_view: Retained<NSBox>,
+    },
+}
+
+impl NativeControlView {
+    fn root_view(&self) -> &NSView {
+        match self {
+            Self::Button { button, .. } => button,
+            Self::GroupBox { box_view } | Self::StaticBox { box_view } => box_view,
+            Self::SingleLineEdit { field, .. } => field,
+            Self::MultiLineEdit { scroll, .. } => scroll,
+            Self::StaticLabel { label, .. } => label,
+            Self::StaticIcon { image_view } => image_view,
+        }
+    }
+}
+
+struct NativeControl {
+    parent_hwnd: usize,
+    kind: NativeControlKind,
+    notify_click: Cell<bool>,
+    rect_px: Cell<RECT>,
+    view: NativeControlView,
+}
+
+fn child_cocoa_rect(parent: &NativeWin, rect: &RECT) -> NSRect {
+    let s = f64::from_bits(parent.shared.scale.load(Ordering::Acquire)).max(1.0);
+    let cv_h = parent.view.bounds().size.height;
+    let x = rect.left as f64 / s;
+    let w = rect.width().max(0) as f64 / s;
+    let h = rect.height().max(0) as f64 / s;
+    let y = cv_h - (rect.top as f64 / s) - h;
+    NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+}
+
+fn reposition_child_controls(parent_hwnd: usize) {
+    let items: Vec<(usize, RECT)> = CONTROLS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(_, c)| c.parent_hwnd == parent_hwnd)
+            .map(|(h, c)| (*h, c.rect_px.get()))
+            .collect()
+    });
+    if items.is_empty() {
+        return;
+    }
+    with_win(parent_hwnd, |parent| {
+        CONTROLS.with(|m| {
+            let map = m.borrow();
+            for (ch, rect) in items {
+                if let Some(ctrl) = map.get(&ch) {
+                    let frame = child_cocoa_rect(parent, &rect);
+                    ctrl.view.root_view().setFrame(frame);
+                }
+            }
+        });
+    });
+}
+
+fn apply_button_style(btn: &NSButton, style: u32) {
+    let btn_type = style & controls::BS_TYPEMASK;
+    match btn_type {
+        controls::BS_CHECKBOX | controls::BS_AUTOCHECKBOX => {
+            btn.setButtonType(NSButtonType::Switch);
+            btn.setAllowsMixedState(false);
+            btn.setKeyEquivalent(&NSString::from_str(""));
+        }
+        controls::BS_3STATE | controls::BS_AUTO3STATE => {
+            btn.setButtonType(NSButtonType::Switch);
+            btn.setAllowsMixedState(true);
+            btn.setKeyEquivalent(&NSString::from_str(""));
+        }
+        controls::BS_RADIOBUTTON | controls::BS_AUTORADIOBUTTON => {
+            btn.setButtonType(NSButtonType::Radio);
+            btn.setAllowsMixedState(false);
+            btn.setKeyEquivalent(&NSString::from_str(""));
+        }
+        _ => {
+            btn.setButtonType(NSButtonType::MomentaryPushIn);
+            btn.setBezelStyle(NSBezelStyle::Push);
+            btn.setAllowsMixedState(false);
+            if matches!(
+                btn_type,
+                controls::BS_DEFPUSHBUTTON | controls::BS_DEFSPLITBUTTON | controls::BS_DEFCOMMANDLINK
+            ) {
+                btn.setKeyEquivalent(&NSString::from_str("\r"));
+            } else {
+                btn.setKeyEquivalent(&NSString::from_str(""));
+            }
+        }
+    }
+}
+
+fn ns_alignment_from_edit(style: u32) -> NSTextAlignment {
+    match style & 0x3 {
+        controls::ES_CENTER => NSTextAlignment::Center,
+        controls::ES_RIGHT => NSTextAlignment::Right,
+        _ => NSTextAlignment::Left,
+    }
+}
+
+fn ns_alignment_from_static(style: u32) -> NSTextAlignment {
+    match style & controls::SS_TYPEMASK {
+        controls::SS_CENTER => NSTextAlignment::Center,
+        controls::SS_RIGHT => NSTextAlignment::Right,
+        _ => NSTextAlignment::Left,
+    }
+}
+
+fn nsimage_from_icon_payload(payload: &IconPayload) -> Option<Retained<NSImage>> {
+    match payload {
+        IconPayload::Stock(id) => {
+            let name = match *id {
+                32513 | 32515 | 32518 => "NSCaution",       // IDI_ERROR / IDI_WARNING / IDI_SHIELD
+                32514 | 32516 => "NSInfo",                  // IDI_QUESTION / IDI_INFORMATION
+                _ => "NSApplicationIcon",                   // IDI_APPLICATION
+            };
+            NSImage::imageNamed(&NSString::from_str(name))
+        }
+        IconPayload::Png(bytes) => {
+            let data = NSData::with_bytes(bytes);
+            NSImage::initWithData(NSImage::alloc(), &data)
+        }
+        IconPayload::Bgra { width, height, pixels } => {
+            let w = *width as usize;
+            let h = *height as usize;
+            if w == 0 || h == 0 || pixels.len() < w * h * 4 {
+                return None;
+            }
+            let color_space = unsafe { NSCalibratedRGBColorSpace };
+            let rep = unsafe {
+                NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                    NSBitmapImageRep::alloc(),
+                    std::ptr::null_mut(),
+                    w as isize,
+                    h as isize,
+                    8,
+                    4,
+                    true,
+                    false,
+                    color_space,
+                    (w * 4) as isize,
+                    32,
+                )
+            }?;
+            let dst = rep.bitmapData();
+            if dst.is_null() {
+                return None;
+            }
+            // Convert BGRA -> RGBA into the bitmap backing store.
+            unsafe {
+                let dst_slice = std::slice::from_raw_parts_mut(dst, w * h * 4);
+                for (d, s) in dst_slice.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    d[3] = s[3];
+                }
+            }
+            let img = NSImage::initWithSize(NSImage::alloc(), NSSize::new(w as f64, h as f64));
+            img.addRepresentation(&rep);
+            Some(img)
+        }
+    }
+}
+
+pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeControlDesc) {
+    let mtm = mtm();
+    let frame = match with_win(parent_hwnd, |p| {
+        if !p.has_controls.replace(true) {
+            p.layer.setOpaque(false);
+            p.window.setBackgroundColor(Some(&NSColor::windowBackgroundColor()));
+        }
+        child_cocoa_rect(p, &desc.rect)
+    }) {
+        Some(f) => f,
+        None => return,
+    };
+
+    let view = match desc.kind {
+        NativeControlKind::Button => {
+            let btn_type = desc.style & controls::BS_TYPEMASK;
+            let title = controls::strip_win32_mnemonic(&desc.text);
+            if btn_type == controls::BS_GROUPBOX {
+                let box_view = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+                box_view.setTitle(&NSString::from_str(&title));
+                NativeControlView::GroupBox { box_view }
+            } else {
+                let button = NSButton::initWithFrame(NSButton::alloc(mtm), frame);
+                apply_button_style(&button, desc.style);
+                button.setTitle(&NSString::from_str(&title));
+                button.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                button.setEnabled(desc.enabled);
+                let is_toggle = matches!(
+                    btn_type,
+                    controls::BS_CHECKBOX
+                        | controls::BS_AUTOCHECKBOX
+                        | controls::BS_3STATE
+                        | controls::BS_AUTO3STATE
+                        | controls::BS_RADIOBUTTON
+                        | controls::BS_AUTORADIOBUTTON
+                );
+                let target = AW2ControlTarget::new(mtm, hwnd, is_toggle);
+                unsafe {
+                    button.setTarget(Some(&*target));
+                    button.setAction(Some(sel!(buttonClicked:)));
+                }
+                NativeControlView::Button { button, _target: target }
+            }
+        }
+        NativeControlKind::Edit => {
+            let readonly = (desc.style & controls::ES_READONLY) != 0;
+            let delegate = AW2TextDelegate::new(mtm, hwnd);
+            if (desc.style & controls::ES_MULTILINE) != 0 {
+                let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
+                scroll.setHasVerticalScroller(
+                    (desc.style & (ws::VSCROLL | controls::ES_AUTOVSCROLL)) != 0,
+                );
+                scroll.setHasHorizontalScroller((desc.style & ws::HSCROLL) != 0);
+                scroll.setBorderType(NSBorderType::BezelBorder);
+
+                let content_sz = scroll.contentSize();
+                let tv_frame = NSRect::new(NSPoint::new(0.0, 0.0), content_sz);
+                let text_view = NSTextView::initWithFrame(NSTextView::alloc(mtm), tv_frame);
+                text_view.setEditable(!readonly && desc.enabled);
+                text_view.setSelectable(true);
+                text_view.setRichText(false);
+                text_view.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                text_view.setAlignment(ns_alignment_from_edit(desc.style));
+                text_view.setVerticallyResizable(true);
+                text_view.setHorizontallyResizable((desc.style & ws::HSCROLL) != 0);
+                text_view.setString(&NSString::from_str(&desc.text));
+                text_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+                scroll.setDocumentView(Some(&text_view));
+                NativeControlView::MultiLineEdit {
+                    scroll,
+                    text_view,
+                    _delegate: delegate,
+                    programmatic: Cell::new(false),
+                    readonly: Cell::new(readonly),
+                    enabled: Cell::new(desc.enabled),
+                }
+            } else {
+                let field: Retained<NSTextField> = if (desc.style & controls::ES_PASSWORD) != 0 {
+                    let secure = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame);
+                    Retained::into_super(secure)
+                } else {
+                    NSTextField::initWithFrame(NSTextField::alloc(mtm), frame)
+                };
+                field.setStringValue(&NSString::from_str(&desc.text));
+                field.setEditable(!readonly);
+                field.setSelectable(true);
+                field.setBordered(true);
+                field.setBezeled(true);
+                field.setDrawsBackground(true);
+                field.setEnabled(desc.enabled);
+                field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                field.setAlignment(ns_alignment_from_edit(desc.style));
+                unsafe { field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
+                NativeControlView::SingleLineEdit {
+                    field,
+                    _delegate: delegate,
+                    programmatic: Cell::new(false),
+                }
+            }
+        }
+        NativeControlKind::Static => {
+            let st_type = desc.style & controls::SS_TYPEMASK;
+            match st_type {
+                controls::SS_ICON | controls::SS_BITMAP => {
+                    let image_view = NSImageView::initWithFrame(NSImageView::alloc(mtm), frame);
+                    image_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                    NativeControlView::StaticIcon { image_view }
+                }
+                controls::SS_ETCHEDHORZ | controls::SS_ETCHEDVERT | controls::SS_ETCHEDFRAME => {
+                    let box_view = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+                    box_view.setBoxType(NSBoxType::Separator);
+                    NativeControlView::StaticBox { box_view }
+                }
+                _ => {
+                    let no_prefix = (desc.style & controls::SS_NOPREFIX) != 0;
+                    let text = if no_prefix {
+                        desc.text.clone()
+                    } else {
+                        controls::strip_win32_mnemonic(&desc.text)
+                    };
+                    let label = if matches!(st_type, controls::SS_SIMPLE | controls::SS_LEFTNOWORDWRAP) {
+                        NSTextField::labelWithString(&NSString::from_str(&text), mtm)
+                    } else {
+                        NSTextField::wrappingLabelWithString(&NSString::from_str(&text), mtm)
+                    };
+                    label.setFrame(frame);
+                    label.setAlignment(ns_alignment_from_static(desc.style));
+                    label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                    label.setEnabled(desc.enabled);
+                    NativeControlView::StaticLabel { label, no_prefix }
+                }
+            }
+        }
+    };
+
+    let root = view.root_view();
+    root.setWantsLayer(true);
+    root.setHidden(!desc.visible);
+    with_win(parent_hwnd, |p| {
+        p.view.addSubview(root);
+    });
+
+    let notify_click = desc.kind == NativeControlKind::Static && (desc.style & controls::SS_NOTIFY) != 0;
+    CONTROLS.with(|m| {
+        m.borrow_mut().insert(
+            hwnd,
+            NativeControl {
+                parent_hwnd,
+                kind: desc.kind,
+                notify_click: Cell::new(notify_click),
+                rect_px: Cell::new(desc.rect),
+                view,
+            },
+        );
+    });
+}
+
+pub(super) fn control_destroy(hwnd: usize) {
+    let ctrl = CONTROLS.with(|m| m.borrow_mut().remove(&hwnd));
+    if let Some(ctrl) = ctrl {
+        match &ctrl.view {
+            NativeControlView::Button { button, .. } => unsafe {
+                button.setTarget(None);
+                button.setAction(None);
+            },
+            NativeControlView::SingleLineEdit { field, .. } => unsafe {
+                field.setDelegate(None);
+            },
+            NativeControlView::MultiLineEdit { text_view, .. } => {
+                text_view.setDelegate(None);
+            }
+            _ => {}
+        }
+        ctrl.view.root_view().removeFromSuperview();
+    }
+}
+
+pub(super) fn control_set_frame(hwnd: usize, rect: RECT) {
+    let parent_hwnd = CONTROLS.with(|m| {
+        let map = m.borrow();
+        let ctrl = map.get(&hwnd)?;
+        ctrl.rect_px.set(rect);
+        Some(ctrl.parent_hwnd)
+    });
+    if let Some(ph) = parent_hwnd {
+        with_win(ph, |p| {
+            let frame = child_cocoa_rect(p, &rect);
+            CONTROLS.with(|m| {
+                if let Some(ctrl) = m.borrow().get(&hwnd) {
+                    ctrl.view.root_view().setFrame(frame);
+                }
+            });
+        });
+    }
+}
+
+pub(super) fn control_set_text(hwnd: usize, text: String) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::Button { button, .. } => {
+                let s = controls::strip_win32_mnemonic(&text);
+                button.setTitle(&NSString::from_str(&s));
+            }
+            NativeControlView::GroupBox { box_view } => {
+                let s = controls::strip_win32_mnemonic(&text);
+                box_view.setTitle(&NSString::from_str(&s));
+            }
+            NativeControlView::SingleLineEdit { field, programmatic, .. } => {
+                programmatic.set(true);
+                field.setStringValue(&NSString::from_str(&text));
+                programmatic.set(false);
+            }
+            NativeControlView::MultiLineEdit { text_view, programmatic, .. } => {
+                programmatic.set(true);
+                text_view.setString(&NSString::from_str(&text));
+                programmatic.set(false);
+            }
+            NativeControlView::StaticLabel { label, no_prefix } => {
+                let s = if *no_prefix { text } else { controls::strip_win32_mnemonic(&text) };
+                label.setStringValue(&NSString::from_str(&s));
+            }
+            NativeControlView::StaticIcon { .. } | NativeControlView::StaticBox { .. } => {}
+        }
+    });
+}
+
+pub(super) fn control_set_visible(hwnd: usize, visible: bool) {
+    CONTROLS.with(|m| {
+        if let Some(ctrl) = m.borrow().get(&hwnd) {
+            ctrl.view.root_view().setHidden(!visible);
+        }
+    });
+}
+
+pub(super) fn control_set_enabled(hwnd: usize, enabled: bool) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::Button { button, .. } => button.setEnabled(enabled),
+            NativeControlView::SingleLineEdit { field, .. } => field.setEnabled(enabled),
+            NativeControlView::MultiLineEdit { text_view, readonly, enabled: en_cell, .. } => {
+                en_cell.set(enabled);
+                text_view.setEditable(enabled && !readonly.get());
+            }
+            NativeControlView::StaticLabel { label, .. } => label.setEnabled(enabled),
+            _ => {}
+        }
+    });
+}
+
+pub(super) fn control_set_readonly(hwnd: usize, readonly: bool) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::SingleLineEdit { field, .. } => field.setEditable(!readonly),
+            NativeControlView::MultiLineEdit { text_view, readonly: ro_cell, enabled, .. } => {
+                ro_cell.set(readonly);
+                text_view.setEditable(enabled.get() && !readonly);
+            }
+            _ => {}
+        }
+    });
+}
+
+pub(super) fn control_set_check(hwnd: usize, state: u32) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        if let NativeControlView::Button { button, .. } = &ctrl.view {
+            let v = match state & 0x3 {
+                controls::BST_CHECKED => NSControlStateValueOn,
+                controls::BST_INDETERMINATE => NSControlStateValueMixed,
+                _ => NSControlStateValueOff,
+            };
+            button.setState(v);
+        }
+    });
+}
+
+pub(super) fn control_set_style(hwnd: usize, style: u32) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::Button { button, .. } => apply_button_style(button, style),
+            NativeControlView::SingleLineEdit { field, .. } => {
+                field.setEditable((style & controls::ES_READONLY) == 0);
+                field.setAlignment(ns_alignment_from_edit(style));
+            }
+            NativeControlView::MultiLineEdit { text_view, readonly, enabled, .. } => {
+                let ro = (style & controls::ES_READONLY) != 0;
+                readonly.set(ro);
+                text_view.setEditable(enabled.get() && !ro);
+                text_view.setAlignment(ns_alignment_from_edit(style));
+            }
+            NativeControlView::StaticLabel { label, .. } => {
+                ctrl.notify_click.set((style & controls::SS_NOTIFY) != 0);
+                label.setAlignment(ns_alignment_from_static(style));
+            }
+            NativeControlView::StaticIcon { .. } | NativeControlView::StaticBox { .. } => {
+                ctrl.notify_click.set((style & controls::SS_NOTIFY) != 0);
+            }
+            _ => {}
+        }
+    });
+}
+
+pub(super) fn control_set_icon(hwnd: usize, payload: Option<IconPayload>) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        if let NativeControlView::StaticIcon { image_view } = &ctrl.view {
+            let img = payload.as_ref().and_then(nsimage_from_icon_payload);
+            image_view.setImage(img.as_deref());
+        }
+    });
+}
+
+/// True when the event targets one of our windows whose AppKit `firstResponder`
+/// is an `NSText` (an `NSTextView` or `NSTextField` field editor) for a native
+/// `EDIT` child control, so key events must be forwarded to AppKit.
+pub(super) fn window_has_native_text_focus(ev: &NSEvent, mtm: MainThreadMarker) -> bool {
+    let win = ev
+        .window(mtm)
+        .or_else(|| NSApplication::sharedApplication(mtm).keyWindow());
+    let Some(win) = win else { return false };
+    let Some(hwnd) = hwnd_for_window(&win) else { return false };
+    let has_edit = CONTROLS.with(|m| {
+        m.borrow()
+            .values()
+            .any(|c| c.parent_hwnd == hwnd && c.kind == NativeControlKind::Edit)
+    });
+    if !has_edit {
+        return false;
+    }
+    let Some(resp) = win.firstResponder() else { return false };
+    let is_text: bool = unsafe { msg_send![&*resp, isKindOfClass: NSText::class()] };
+    is_text
+}
+
+/// True when the event targets one of our windows that hosts native child controls.
+pub(super) fn window_has_native_controls(ev: &NSEvent, mtm: MainThreadMarker) -> bool {
+    let Some(win) = ev.window(mtm) else { return false };
+    let Some(hwnd) = hwnd_for_window(&win) else { return false };
+    with_win(hwnd, |w| w.has_controls.get()).unwrap_or(false)
+}
+
+/// If a left mouse-down lands on a visible `SS_NOTIFY` `STATIC` control, queue `STN_CLICKED`.
+pub(super) fn notify_static_click_if_hit(ev: &NSEvent, mtm: MainThreadMarker) {
+    let Some(win) = ev.window(mtm) else { return };
+    let Some(parent_hwnd) = hwnd_for_window(&win) else { return };
+    if !with_win(parent_hwnd, |w| w.has_controls.get()).unwrap_or(false) {
+        return;
+    }
+    let loc = ev.locationInWindow();
+    let hit = CONTROLS.with(|m| {
+        m.borrow()
+            .iter()
+            .find(|(_, c)| {
+                c.parent_hwnd == parent_hwnd
+                    && c.notify_click.get()
+                    && !c.view.root_view().isHidden()
+                    && {
+                        let f = c.view.root_view().frame();
+                        loc.x >= f.origin.x
+                            && loc.x <= f.origin.x + f.size.width
+                            && loc.y >= f.origin.y
+                            && loc.y <= f.origin.y + f.size.height
+                    }
+            })
+            .map(|(h, _)| *h)
+    });
+    if let Some(h) = hit {
+        controls::native_static_clicked(h);
+    }
 }
 
 #[cfg(test)]
