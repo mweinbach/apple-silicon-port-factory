@@ -537,6 +537,7 @@ pub unsafe extern "win64" fn SetProcessAffinityMask(h: HANDLE, mask: usize) -> B
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    let _aff_guard = job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((job_mask, allow_subset)) = job_affinity_constraint() {
         if (mask & !job_mask) != 0 || (!allow_subset && mask != job_mask) {
             set_err(err::ERROR_ACCESS_DENIED);
@@ -581,6 +582,7 @@ pub unsafe extern "win64" fn SetPriorityClass(h: HANDLE, c: u32) -> BOOL {
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    let _aff_guard = job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(job_prio) = job_priority_class_constraint() {
         if c != job_prio {
             set_err(err::ERROR_ACCESS_DENIED);
@@ -1815,11 +1817,8 @@ fn collect_inherited_jobs_for_child(creation_flags: u32) -> Result<Vec<Arc<JobOb
             }
             return Err(err::ERROR_ACCESS_DENIED);
         }
-        if (flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 {
-            let limit = st.active_process_limit();
-            if limit > 0 && st.active_count() >= limit {
-                return Err(err::ERROR_NOT_ENOUGH_QUOTA);
-            }
+        if (flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 && st.active_count() >= st.active_process_limit() {
+            return Err(err::ERROR_NOT_ENOUGH_QUOTA);
         }
         if st.has_unenforced_child_limits() {
             log::warn!(
@@ -1846,7 +1845,6 @@ fn attach_child_to_inherited_jobs(child: &Arc<ChildProcessObj>, jobs: &[Arc<JobO
             continue;
         }
         let fail_err = if (st.limit_flags() & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0
-            && st.active_process_limit() > 0
             && st.active_count() >= st.active_process_limit()
         {
             Some(err::ERROR_NOT_ENOUGH_QUOTA)
@@ -1880,12 +1878,17 @@ fn attach_child_to_inherited_jobs(child: &Arc<ChildProcessObj>, jobs: &[Arc<JobO
     Ok(())
 }
 
-/// Serializes cross-job affinity validation and updates for the current process so two
-/// concurrent assignments or limit updates cannot accept incompatible affinity masks.
-/// Lock order: `job_affinity_lock() -> all_jobs() -> JobObj::state`.
+/// Serializes cross-job affinity/priority validation and updates with process and thread
+/// affinity/priority setters so concurrent updates cannot violate active job limits.
+/// Lock order: `job_affinity_lock() -> {all_jobs(), thread list} -> JobObj::state`.
 fn job_affinity_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+pub(crate) fn with_affinity_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner());
+    f()
 }
 
 /// Intersect two optional job affinity constraints `(mask, allow_subset)`.
@@ -2511,12 +2514,9 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
     if st.contains_pid(pid) {
         return TRUE;
     }
-    if (st.limit_flags() & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 {
-        let limit = st.active_process_limit();
-        if limit > 0 && st.active_count() >= limit {
-            set_err(err::ERROR_NOT_ENOUGH_QUOTA);
-            return FALSE;
-        }
+    if (st.limit_flags() & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 && st.active_count() >= st.active_process_limit() {
+        set_err(err::ERROR_NOT_ENOUGH_QUOTA);
+        return FALSE;
     }
     if matches!(member, JobMember::Child(_)) && st.has_unenforced_child_limits() {
         log::warn!(
@@ -4897,10 +4897,86 @@ pub(crate) mod tests {
                 assert_eq!(GetPriorityClass(handles::CURRENT_PROCESS), orig_prio);
             }
 
+            // JOB_OBJECT_LIMIT_ACTIVE_PROCESS with ActiveProcessLimit == 0 enforces a zero quota
+            // rather than treating 0 as unlimited (both on direct assignment and child inheritance).
+            {
+                let zero_job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!zero_job.is_null());
+                let mut zero_basic = [0u8; 64];
+                std::ptr::write_unaligned(
+                    zero_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                );
+                // ActiveProcessLimit at offset +40 stays 0.
+                assert_eq!(SetInformationJobObject(zero_job, 2, zero_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(AssignProcessToJobObject(zero_job, handles::CURRENT_PROCESS), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_ENOUGH_QUOTA);
+                let zero_child_h = make_test_child_handle(99990, "C:\\Games\\ZeroQuota.exe");
+                assert_eq!(AssignProcessToJobObject(zero_job, zero_child_h), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_ENOUGH_QUOTA);
+                #[cfg(not(target_os = "ios"))]
+                {
+                    let zj_arc = handles::get_as::<JobObj>(zero_job).unwrap();
+                    let zc_arc = handles::get_as::<ChildProcessObj>(zero_child_h).unwrap();
+                    assert_eq!(
+                        attach_child_to_inherited_jobs(&zc_arc, &[zj_arc]),
+                        Err(err::ERROR_NOT_ENOUGH_QUOTA)
+                    );
+                }
+                assert_eq!(crate::kernel32::threads::CloseHandle(zero_child_h), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(zero_job), TRUE);
+            }
+
+            // Concurrent SetProcessAffinityMask vs job-limit updates never leave the process
+            // with an affinity mask violating an active job restriction.
+            if orig_sm >= 0x3 {
+                let mut race_basic = [0u8; 64];
+                std::ptr::write_unaligned(
+                    race_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_AFFINITY,
+                );
+                std::ptr::write_unaligned(race_basic.as_mut_ptr().add(40) as *mut u32, 1u32);
+                std::ptr::write_unaligned(race_basic.as_mut_ptr().add(48) as *mut usize, 0x1usize);
+                let job_raw = job as usize;
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let b2 = Arc::clone(&barrier);
+                let setter = std::thread::spawn(move || {
+                    b2.wait();
+                    for _ in 0..64 {
+                        let _ = SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm);
+                    }
+                });
+                barrier.wait();
+                assert_eq!(
+                    SetInformationJobObject(job_raw as HANDLE, 2, race_basic.as_ptr() as *const c_void, 64),
+                    TRUE
+                );
+                setter.join().unwrap();
+                assert_eq!(current_process_affinity_mask(), 0x1);
+                // Clear JOB_OBJECT_LIMIT_AFFINITY and restore full mask.
+                std::ptr::write_unaligned(
+                    race_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                );
+                assert_eq!(SetInformationJobObject(job, 2, race_basic.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), TRUE);
+            }
+
             // Child creation inherits the current process's job by default, respects
             // ActiveProcessLimit and CREATE_BREAKAWAY_FROM_JOB / SILENT_BREAKAWAY_OK.
             #[cfg(not(target_os = "ios"))]
             {
+                // ActiveProcessLimit == 0 on a job containing self also rejects child inheritance.
+                let mut zero_inh = [0u8; 64];
+                std::ptr::write_unaligned(
+                    zero_inh.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                );
+                assert_eq!(SetInformationJobObject(job, 2, zero_inh.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
+                std::ptr::write_unaligned(zero_inh.as_mut_ptr().add(40) as *mut u32, 1u32);
+                assert_eq!(SetInformationJobObject(job, 2, zero_inh.as_ptr() as *const c_void, 64), TRUE);
+
                 // ActiveProcessLimit == 1 is already saturated by CURRENT_PROCESS -> ERROR_NOT_ENOUGH_QUOTA.
                 assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
                 // CREATE_BREAKAWAY_FROM_JOB without BREAKAWAY_OK -> ERROR_ACCESS_DENIED.

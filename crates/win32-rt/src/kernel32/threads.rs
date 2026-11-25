@@ -268,15 +268,17 @@ pub unsafe extern "win64" fn SetThreadAffinityMask(h: HANDLE, mask: usize) -> us
         set_err(err::ERROR_INVALID_HANDLE);
         return 0;
     };
-    let proc_mask = crate::kernel32::process::current_process_affinity_mask();
-    if mask == 0 || (mask & !proc_mask) != 0 {
-        set_err(err::ERROR_INVALID_PARAMETER);
-        return 0;
-    }
-    let old = t.affinity_mask.swap(mask, Ordering::AcqRel);
-    let prev = if old == 0 { proc_mask } else { old };
-    thread::sched::apply_affinity_mask(&t, mask, proc_mask);
-    prev
+    crate::kernel32::process::with_affinity_lock(|| {
+        let proc_mask = crate::kernel32::process::current_process_affinity_mask();
+        if mask == 0 || (mask & !proc_mask) != 0 {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let old = t.affinity_mask.swap(mask, Ordering::AcqRel);
+        let prev = if old == 0 { proc_mask } else { old };
+        thread::sched::apply_affinity_mask(&t, mask, proc_mask);
+        prev
+    })
 }
 
 pub unsafe extern "win64" fn SetThreadGroupAffinity(h: HANDLE, group_affinity: *const c_void, prev: *mut u8) -> BOOL {
@@ -288,7 +290,6 @@ pub unsafe extern "win64" fn SetThreadGroupAffinity(h: HANDLE, group_affinity: *
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let proc_mask = crate::kernel32::process::current_process_affinity_mask();
     let ga = group_affinity as *const u8;
     let mask = std::ptr::read_unaligned(ga as *const usize);
     let group = std::ptr::read_unaligned(ga.add(8) as *const u16);
@@ -297,20 +298,23 @@ pub unsafe extern "win64" fn SetThreadGroupAffinity(h: HANDLE, group_affinity: *
         std::ptr::read_unaligned(ga.add(12) as *const u16),
         std::ptr::read_unaligned(ga.add(14) as *const u16),
     ];
-    if group != 0 || reserved != [0; 3] || mask == 0 || (mask & !proc_mask) != 0 {
-        set_err(err::ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    let old_mask = t.affinity_mask.swap(mask, Ordering::AcqRel);
-    let old_group = t.affinity_group.swap(group, Ordering::AcqRel);
-    let prev_mask = if old_mask == 0 { proc_mask } else { old_mask };
-    if !prev.is_null() {
-        std::ptr::write_bytes(prev, 0, 16);
-        std::ptr::write_unaligned(prev as *mut usize, prev_mask);
-        std::ptr::write_unaligned(prev.add(8) as *mut u16, old_group);
-    }
-    thread::sched::apply_affinity_mask(&t, mask, proc_mask);
-    TRUE
+    crate::kernel32::process::with_affinity_lock(|| {
+        let proc_mask = crate::kernel32::process::current_process_affinity_mask();
+        if group != 0 || reserved != [0; 3] || mask == 0 || (mask & !proc_mask) != 0 {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        let old_mask = t.affinity_mask.swap(mask, Ordering::AcqRel);
+        let old_group = t.affinity_group.swap(group, Ordering::AcqRel);
+        let prev_mask = if old_mask == 0 { proc_mask } else { old_mask };
+        if !prev.is_null() {
+            std::ptr::write_bytes(prev, 0, 16);
+            std::ptr::write_unaligned(prev as *mut usize, prev_mask);
+            std::ptr::write_unaligned(prev.add(8) as *mut u16, old_group);
+        }
+        thread::sched::apply_affinity_mask(&t, mask, proc_mask);
+        TRUE
+    })
 }
 
 pub unsafe extern "win64" fn GetThreadGroupAffinity(h: HANDLE, out: *mut u8) -> BOOL {
