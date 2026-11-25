@@ -641,9 +641,11 @@ pub unsafe fn create_window(a: CreateArgs) -> usize {
                         exstyle: d.exstyle,
                         text: String::from_utf16_lossy(&d.text),
                         enabled: d.enabled,
-                        visible: d.visible,
+                        visible: false,
                     }
                 };
+                let mut desc = desc;
+                desc.visible = effective_child_visible(hwnd);
                 crate::macos::control_create(hwnd, root_hwnd, desc);
                 win.data().native_control = true;
             }
@@ -693,6 +695,53 @@ fn default_minmax(style: u32, exstyle: u32) -> MINMAXINFO {
         max_position: POINT { x: full.left, y: full.top },
         min_track: POINT { x: 136, y: 39 },
         max_track: POINT { x: super::misc::virtual_screen().width() + 16, y: super::misc::virtual_screen().height() + 16 },
+    }
+}
+
+/// True when `hwnd` and every `WS_CHILD` ancestor up to (excluding) the
+/// top-level window are visible. Used so flattened AppKit child views reflect
+/// hidden/shown intermediate child containers (e.g. tabbed dialog pages).
+pub(crate) fn effective_child_visible(hwnd: usize) -> bool {
+    let mut cur = hwnd;
+    for _ in 0..64 {
+        let Some(w) = get(cur) else { return false };
+        let d = w.data();
+        if (d.style & ws::CHILD) == 0 {
+            return true;
+        }
+        if !d.visible {
+            return false;
+        }
+        cur = d.parent;
+    }
+    false
+}
+
+/// Propagate container visibility and/or frame offset changes down to all
+/// descendant native AppKit controls attached to the root top-level content view.
+fn sync_descendant_native_controls(parent_hwnd: usize, sync_frame: bool, sync_vis: bool) {
+    if !sync_frame && !sync_vis {
+        return;
+    }
+    let mut stack = children_of(parent_hwnd);
+    let mut visited = 0usize;
+    while let Some(ch) = stack.pop() {
+        visited += 1;
+        if visited > 4096 {
+            break;
+        }
+        let is_native_ctrl = get(ch).is_some_and(|w| w.data().native_control);
+        if is_native_ctrl {
+            if sync_frame {
+                if let Some((_, root_rect)) = root_top_level_and_rect(ch) {
+                    crate::macos::control_set_frame(ch, root_rect);
+                }
+            }
+            if sync_vis {
+                crate::macos::control_set_visible(ch, effective_child_visible(ch));
+            }
+        }
+        stack.extend(children_of(ch));
     }
 }
 
@@ -1012,11 +1061,15 @@ pub unsafe fn set_window_pos_impl(w: &Arc<Window>, after: usize, x: i32, y: i32,
                 crate::macos::control_set_frame(hwnd, root_rect);
             }
         }
-        if flags & SWP_HIDEWINDOW != 0 {
-            crate::macos::control_set_visible(hwnd, false);
+        if flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW) != 0 {
+            crate::macos::control_set_visible(hwnd, effective_child_visible(hwnd));
         }
-        if flags & SWP_SHOWWINDOW != 0 {
-            crate::macos::control_set_visible(hwnd, true);
+    }
+    if (style & ws::CHILD) != 0 {
+        let moved_or_resized = new_rect != old_rect || flags & SWP_FRAMECHANGED != 0;
+        let vis_changed = flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW) != 0;
+        if moved_or_resized || vis_changed {
+            sync_descendant_native_controls(hwnd, moved_or_resized, vis_changed);
         }
     }
     if flags & SWP_SHOWWINDOW != 0 || (new_client != old_client && w.data().visible) {
@@ -1892,28 +1945,33 @@ fn set_long(hwnd: usize, idx: i32, val: isize, size: usize) -> isize {
             let mut ss = STYLESTRUCT { old, new: val as u32 };
             let which = if idx == GWL_STYLE { -16isize } else { -20isize } as usize;
             send_message(hwnd, 0x007C, which, &mut ss as *mut STYLESTRUCT as LPARAM); // WM_STYLECHANGING
-            let sync_ctrl = {
+            let (sync_ctrl, sync_child_vis) = {
                 let mut d = w.data();
                 if idx == GWL_STYLE {
+                    let was_vis = d.visible;
                     let (s, _) = framed_top_level_style(ss.new, d.exstyle);
                     ss.new = s;
                     // WS_VISIBLE changes the visibility state directly (no messages).
                     d.visible = ss.new & ws::VISIBLE != 0;
                     d.enabled = ss.new & ws::DISABLED == 0;
                     d.style = ss.new;
-                    d.native_control.then_some((d.visible, d.enabled, ss.new))
+                    let child_vis_changed = (d.style & ws::CHILD) != 0 && d.visible != was_vis;
+                    (d.native_control.then_some((d.enabled, ss.new)), child_vis_changed)
                 } else {
                     let (_, ex) = framed_top_level_style(d.style, ss.new);
                     ss.new = ex;
                     d.exstyle = ss.new;
                     d.topmost = ss.new & ws::EX_TOPMOST != 0;
-                    None
+                    (None, false)
                 }
             };
-            if let Some((vis, en, new_style)) = sync_ctrl {
-                crate::macos::control_set_visible(hwnd, vis);
+            if let Some((en, new_style)) = sync_ctrl {
+                crate::macos::control_set_visible(hwnd, effective_child_visible(hwnd));
                 crate::macos::control_set_enabled(hwnd, en);
                 crate::macos::control_set_style(hwnd, new_style);
+            }
+            if sync_child_vis {
+                sync_descendant_native_controls(hwnd, false, true);
             }
             log::debug!("SetWindowLong {hwnd:#x} {} {old:#x} -> {:#x}", if idx == GWL_STYLE { "GWL_STYLE" } else { "GWL_EXSTYLE" }, ss.new);
             send_message(hwnd, 0x007D, which, &mut ss as *mut STYLESTRUCT as LPARAM); // WM_STYLECHANGED

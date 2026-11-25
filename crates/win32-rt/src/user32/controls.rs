@@ -85,6 +85,100 @@ pub(crate) fn truncate_utf16_at_limit(units: &mut Vec<u16>, limit: usize) -> boo
     true
 }
 
+/// Result of applying Win32 `EDIT` input constraints (`ES_NUMBER`, `ES_UPPERCASE`,
+/// `ES_LOWERCASE`, and range-preserving `EM_LIMITTEXT`) to a native edit transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NormalizedEdit {
+    pub units: Vec<u16>,
+    pub sel_start: usize,
+    pub sel_end: usize,
+    /// True if `units` differs from `prev`.
+    pub text_changed: bool,
+    /// True if normalization altered `next` (so the native AppKit view must be reconciled).
+    pub reconcile_native: bool,
+}
+
+/// Enforce `ES_NUMBER`, `ES_UPPERCASE`, `ES_LOWERCASE`, and `EM_LIMITTEXT` on the
+/// inserted/replaced range between `prev` and `next` without deleting existing text
+/// outside that range.
+pub(crate) fn apply_native_edit_constraints(
+    prev: &[u16],
+    next: &[u16],
+    sel_start: usize,
+    sel_end: usize,
+    style: u32,
+    limit: usize,
+) -> NormalizedEdit {
+    let lo_in = sel_start.min(sel_end).min(next.len());
+    let hi_in = sel_start.max(sel_end).min(next.len());
+
+    // Find the minimal changed span [prefix .. len - suffix], anchored around the
+    // post-edit selection so inserting duplicate characters preserves the suffix.
+    let max_prefix = prev.len().min(lo_in);
+    let mut prefix = 0usize;
+    while prefix < max_prefix && prev[prefix] == next[prefix] {
+        prefix += 1;
+    }
+    let max_suffix = (prev.len() - prefix).min(next.len() - hi_in);
+    let mut suffix = 0usize;
+    while suffix < max_suffix && prev[prev.len() - 1 - suffix] == next[next.len() - 1 - suffix] {
+        suffix += 1;
+    }
+
+    let raw_inserted = &next[prefix..next.len() - suffix];
+    let mut inserted: Vec<u16> = Vec::with_capacity(raw_inserted.len());
+
+    if (style & ES_NUMBER) != 0 {
+        for &u in raw_inserted {
+            if (b'0' as u16..=b'9' as u16).contains(&u) {
+                inserted.push(u);
+            }
+        }
+    } else if (style & ES_UPPERCASE) != 0 {
+        let s = String::from_utf16_lossy(raw_inserted);
+        inserted.extend(s.to_uppercase().encode_utf16());
+    } else if (style & ES_LOWERCASE) != 0 {
+        let s = String::from_utf16_lossy(raw_inserted);
+        inserted.extend(s.to_lowercase().encode_utf16());
+    } else {
+        inserted.extend_from_slice(raw_inserted);
+    }
+
+    // Enforce EM_LIMITTEXT strictly against the newly inserted slice so existing
+    // prefix/suffix text outside the edited range is never deleted.
+    if limit > 0 && !inserted.is_empty() {
+        let base_len = prefix + suffix;
+        let avail = limit.saturating_sub(base_len);
+        if avail == 0 {
+            inserted.clear();
+        } else {
+            truncate_utf16_at_limit(&mut inserted, avail);
+        }
+    }
+
+    let mut out = Vec::with_capacity(prefix + inserted.len() + suffix);
+    out.extend_from_slice(&prev[..prefix]);
+    out.extend_from_slice(&inserted);
+    out.extend_from_slice(&prev[prev.len() - suffix..]);
+
+    let reconcile_native = out != next;
+    let text_changed = out != prev;
+    let (out_lo, out_hi) = if reconcile_native {
+        let caret = (prefix + inserted.len()).min(out.len());
+        (caret, caret)
+    } else {
+        (lo_in.min(out.len()), hi_in.min(out.len()))
+    };
+
+    NormalizedEdit {
+        units: out,
+        sel_start: out_lo,
+        sel_end: out_hi,
+        text_changed,
+        reconcile_native,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Static styles and notifications
 // ---------------------------------------------------------------------------
@@ -363,50 +457,59 @@ pub fn native_button_clicked(hwnd: usize, native_check_state: Option<u32>) {
 /// Queue a native AppKit `NSTextField` / `NSTextView` text edit and its live
 /// UTF-16 selection range onto the owning Win32 thread.
 ///
-/// If the text exceeds the control's `EM_LIMITTEXT` limit, the stored Win32
-/// text is truncated at a valid UTF-16 boundary and reconciled back to the
-/// native AppKit control so displayed text and `GetWindowText` always match.
+/// Applies `ES_NUMBER`, `ES_UPPERCASE`, `ES_LOWERCASE`, and range-preserving
+/// `EM_LIMITTEXT` against the edited span; whenever normalization alters the
+/// text, the reconciled text and selection are pushed back to AppKit so
+/// displayed text and `GetWindowText`/`EN_CHANGE` always agree.
 pub fn native_edit_text_changed(hwnd: usize, text: String, sel_start: usize, sel_end: usize) {
     let Some(w) = window::get(hwnd) else { return };
     let Some(q) = message::queue_of(w.tid) else { return };
     q.call(move || {
         let Some(w) = window::get(hwnd) else { return };
-        let (style, native) = {
+        let (style, native, prev_units) = {
             let d = w.data();
-            (d.style, d.native_control)
+            (d.style, d.native_control, d.text.clone())
         };
         if (style & ES_READONLY) != 0 {
             return;
         }
-        let mut units: Vec<u16> = text.encode_utf16().collect();
+        let next_units: Vec<u16> = text.encode_utf16().collect();
         let limit = edit_states()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&hwnd)
             .map(|s| s.limit)
             .unwrap_or(DEFAULT_EDIT_LIMIT);
-        let truncated = truncate_utf16_at_limit(&mut units, limit);
-        let len = units.len();
-        let lo = sel_start.min(sel_end).min(len);
-        let hi = sel_start.max(sel_end).min(len);
-        if truncated {
-            // Reconcile the displayed native AppKit text + selection with the truncated Win32 text.
-            window::set_internal_text(hwnd, units);
+        let norm = apply_native_edit_constraints(
+            &prev_units,
+            &next_units,
+            sel_start,
+            sel_end,
+            style,
+            limit,
+        );
+        if norm.reconcile_native {
+            // Reconcile the displayed native AppKit text + selection with the normalized Win32 text.
+            window::set_internal_text(hwnd, norm.units);
             if native {
-                crate::macos::control_set_selection(hwnd, lo, hi);
+                crate::macos::control_set_selection(hwnd, norm.sel_start, norm.sel_end);
             }
         } else {
-            window::set_internal_text_from_native(hwnd, units);
+            window::set_internal_text_from_native(hwnd, norm.units);
         }
         {
             let mut map = edit_states().lock().unwrap_or_else(|e| e.into_inner());
             let st = map.entry(hwnd).or_default();
-            st.modified = true;
-            st.sel_start = lo;
-            st.sel_end = hi;
+            if norm.text_changed {
+                st.modified = true;
+            }
+            st.sel_start = norm.sel_start;
+            st.sel_end = norm.sel_end;
         }
-        notify_parent_command(hwnd, EN_UPDATE);
-        notify_parent_command(hwnd, EN_CHANGE);
+        if norm.text_changed {
+            notify_parent_command(hwnd, EN_UPDATE);
+            notify_parent_command(hwnd, EN_CHANGE);
+        }
     });
 }
 
@@ -1971,6 +2074,213 @@ mod tests {
             native_control_focused(h_edit as usize);
             let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
             assert_eq!(input::GetFocus(), h_edit);
+
+            assert_eq!(DestroyWindow(parent), TRUE);
+            assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn native_edit_preserves_suffix_at_limit_and_enforces_char_styles() {
+        let u = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+
+        // 1. At limit=5 with "abcde", typing 'X' at index 0 must NOT delete suffix 'e'.
+        let r1 = apply_native_edit_constraints(&u("abcde"), &u("Xabcde"), 1, 1, 0, 5);
+        assert_eq!(String::from_utf16_lossy(&r1.units), "abcde");
+        assert_eq!((r1.sel_start, r1.sel_end), (0, 0));
+        assert!(!r1.text_changed);
+        assert!(r1.reconcile_native);
+
+        // 2. With limit=5 and "abc", pasting "XYZ" at index 1 keeps suffix "bc" -> "aXYbc".
+        let r2 = apply_native_edit_constraints(&u("abc"), &u("aXYZbc"), 4, 4, 0, 5);
+        assert_eq!(String::from_utf16_lossy(&r2.units), "aXYbc");
+        assert_eq!((r2.sel_start, r2.sel_end), (3, 3));
+        assert!(r2.text_changed);
+        assert!(r2.reconcile_native);
+
+        // 3. Replacing "bc" inside "abcde" with "WXYZ" at limit=5 -> "aWXde" (preserves "de").
+        let r3 = apply_native_edit_constraints(&u("abcde"), &u("aWXYZde"), 5, 5, 0, 5);
+        assert_eq!(String::from_utf16_lossy(&r3.units), "aWXde");
+        assert_eq!((r3.sel_start, r3.sel_end), (3, 3));
+
+        // 4. Live EDIT tests: ES_NUMBER, ES_UPPERCASE, ES_LOWERCASE, and range-preserving limit.
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            let (parent, parent_cls) = make_parent("TestEditStyleConstraintsParent");
+            let edit_cls = crate::strings::to_wide_z("EDIT");
+
+            let h_lim = CreateWindowExW(
+                0,
+                edit_cls.as_ptr(),
+                crate::strings::to_wide_z("abcde").as_ptr(),
+                ws::CHILD | ws::VISIBLE,
+                10,
+                10,
+                200,
+                24,
+                parent,
+                260,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let h_num = CreateWindowExW(
+                0,
+                edit_cls.as_ptr(),
+                crate::strings::to_wide_z("").as_ptr(),
+                ws::CHILD | ws::VISIBLE | ES_NUMBER,
+                10,
+                40,
+                200,
+                24,
+                parent,
+                261,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let h_up = CreateWindowExW(
+                0,
+                edit_cls.as_ptr(),
+                crate::strings::to_wide_z("").as_ptr(),
+                ws::CHILD | ws::VISIBLE | ES_UPPERCASE,
+                10,
+                70,
+                200,
+                24,
+                parent,
+                262,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let h_lo = CreateWindowExW(
+                0,
+                edit_cls.as_ptr(),
+                crate::strings::to_wide_z("").as_ptr(),
+                ws::CHILD | ws::VISIBLE | ES_LOWERCASE,
+                10,
+                100,
+                200,
+                24,
+                parent,
+                263,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+
+            let mut msg = MSG::default();
+            let mut buf = [0u16; 32];
+
+            // Rejecting excess insertion at start preserves "abcde" and suppresses spurious EN_CHANGE.
+            SendMessageW(h_lim, wm::EM_LIMITTEXT, 5, 0);
+            COMMAND_LOG.lock().unwrap().clear();
+            native_edit_text_changed(h_lim as usize, "Xabcde".to_string(), 1, 1);
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            let n = GetWindowTextW(h_lim, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "abcde");
+            assert!(COMMAND_LOG.lock().unwrap().is_empty(), "rejected excess insert must not emit EN_CHANGE");
+
+            // ES_NUMBER strips non-digits and rejects pure-letter typing.
+            native_edit_text_changed(h_num as usize, "12a3b".to_string(), 5, 5);
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            let n = GetWindowTextW(h_num, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "123");
+            COMMAND_LOG.lock().unwrap().clear();
+            native_edit_text_changed(h_num as usize, "12x3".to_string(), 3, 3);
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            let n = GetWindowTextW(h_num, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "123");
+            assert!(COMMAND_LOG.lock().unwrap().is_empty());
+
+            // ES_UPPERCASE / ES_LOWERCASE convert native typed text.
+            native_edit_text_changed(h_up as usize, "Hello".to_string(), 5, 5);
+            native_edit_text_changed(h_lo as usize, "HeLLo".to_string(), 5, 5);
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            let n_up = GetWindowTextW(h_up, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n_up]), "HELLO");
+            let n_lo = GetWindowTextW(h_lo, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n_lo]), "hello");
+
+            assert_eq!(DestroyWindow(parent), TRUE);
+            assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn nested_controls_reflect_child_container_visibility() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            let (parent, parent_cls) = make_parent("TestNestedContainerVisParent");
+
+            // Create an intermediate child container (e.g. a dialog tab page) with nested controls.
+            let page = CreateWindowExW(
+                0,
+                parent_cls.as_ptr(),
+                std::ptr::null(),
+                ws::CHILD | ws::VISIBLE,
+                10,
+                10,
+                300,
+                200,
+                parent,
+                400,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let nested_edit = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("Inside page").as_ptr(),
+                ws::CHILD | ws::VISIBLE,
+                8,
+                8,
+                200,
+                24,
+                page,
+                401,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let nested_btn = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("BUTTON").as_ptr(),
+                crate::strings::to_wide_z("Apply").as_ptr(),
+                ws::CHILD | ws::VISIBLE,
+                8,
+                40,
+                80,
+                28,
+                page,
+                402,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!page.is_null() && !nested_edit.is_null() && !nested_btn.is_null());
+
+            assert!(window::effective_child_visible(nested_edit as usize));
+            assert!(window::effective_child_visible(nested_btn as usize));
+
+            // Hiding the child container must make descendant controls effectively hidden.
+            assert_eq!(ShowWindow(page, SW_HIDE), TRUE);
+            assert!(!window::effective_child_visible(nested_edit as usize));
+            assert!(!window::effective_child_visible(nested_btn as usize));
+            assert_eq!(IsWindowVisible(nested_edit), FALSE);
+            assert_eq!(IsWindowVisible(nested_btn), FALSE);
+
+            // Showing the child container restores descendant effective visibility.
+            assert_eq!(ShowWindow(page, SW_SHOW), FALSE);
+            assert!(window::effective_child_visible(nested_edit as usize));
+            assert!(window::effective_child_visible(nested_btn as usize));
+            assert_eq!(IsWindowVisible(nested_edit), TRUE);
+
+            // Toggling WS_VISIBLE via SetWindowLongW on the container also propagates.
+            let cur_style = super::super::window::GetWindowLongW(page, super::super::window::GWL_STYLE) as u32;
+            super::super::window::SetWindowLongW(page, super::super::window::GWL_STYLE, (cur_style & !ws::VISIBLE) as i32);
+            assert!(!window::effective_child_visible(nested_edit as usize));
+            super::super::window::SetWindowLongW(page, super::super::window::GWL_STYLE, (cur_style | ws::VISIBLE) as i32);
+            assert!(window::effective_child_visible(nested_edit as usize));
 
             assert_eq!(DestroyWindow(parent), TRUE);
             assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);

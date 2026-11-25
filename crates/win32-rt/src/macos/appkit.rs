@@ -1266,7 +1266,9 @@ define_class!(
                 if let NativeControlView::SingleLineEdit {
                     field,
                     programmatic,
+                    edit_style,
                     max_len,
+                    last_text,
                     last_sel,
                     pending_sel,
                     ..
@@ -1277,33 +1279,42 @@ define_class!(
                     }
                     pending_sel.set(None);
                     let raw = field.stringValue().to_string();
-                    let mut units: Vec<u16> = raw.encode_utf16().collect();
+                    let next_units: Vec<u16> = raw.encode_utf16().collect();
                     let ed = field.currentEditor();
-                    let (mut lo, mut hi) = if let Some(ref e) = ed {
+                    let (lo, hi) = if let Some(ref e) = ed {
                         let r = e.selectedRange();
                         (r.location, r.location.saturating_add(r.length))
                     } else {
-                        (units.len(), units.len())
+                        (next_units.len(), next_units.len())
                     };
-                    let truncated = controls::truncate_utf16_at_limit(&mut units, max_len.get());
-                    let final_text = if truncated {
-                        let s = String::from_utf16_lossy(&units);
-                        lo = lo.min(units.len());
-                        hi = hi.min(units.len());
+                    let norm = controls::apply_native_edit_constraints(
+                        &last_text.borrow(),
+                        &next_units,
+                        lo,
+                        hi,
+                        edit_style.get(),
+                        max_len.get(),
+                    );
+                    let final_text = if norm.reconcile_native {
+                        let s = String::from_utf16_lossy(&norm.units);
                         programmatic.set(true);
                         field.setStringValue(&NSString::from_str(&s));
                         if let Some(ref e) = ed {
-                            e.setSelectedRange(NSRange::new(lo, hi.saturating_sub(lo)));
+                            e.setSelectedRange(NSRange::new(
+                                norm.sel_start,
+                                norm.sel_end.saturating_sub(norm.sel_start),
+                            ));
                         }
                         programmatic.set(false);
                         s
                     } else {
-                        lo = lo.min(units.len());
-                        hi = hi.min(units.len());
                         raw
                     };
-                    last_sel.set((lo, hi));
-                    return Some((final_text, lo, hi));
+                    *last_text.borrow_mut() = norm.units;
+                    last_sel.set((norm.sel_start, norm.sel_end));
+                    if norm.text_changed {
+                        return Some((final_text, norm.sel_start, norm.sel_end));
+                    }
                 }
                 None
             });
@@ -1330,7 +1341,9 @@ define_class!(
                 if let NativeControlView::MultiLineEdit {
                     text_view,
                     programmatic,
+                    edit_style,
                     max_len,
+                    last_text,
                     last_sel,
                     ..
                 } = &ctrl.view
@@ -1339,27 +1352,36 @@ define_class!(
                         return None;
                     }
                     let raw = text_view.string().to_string();
-                    let mut units: Vec<u16> = raw.encode_utf16().collect();
+                    let next_units: Vec<u16> = raw.encode_utf16().collect();
                     let r = text_view.selectedRange();
-                    let mut lo = r.location;
-                    let mut hi = r.location.saturating_add(r.length);
-                    let truncated = controls::truncate_utf16_at_limit(&mut units, max_len.get());
-                    let final_text = if truncated {
-                        let s = String::from_utf16_lossy(&units);
-                        lo = lo.min(units.len());
-                        hi = hi.min(units.len());
+                    let lo = r.location;
+                    let hi = r.location.saturating_add(r.length);
+                    let norm = controls::apply_native_edit_constraints(
+                        &last_text.borrow(),
+                        &next_units,
+                        lo,
+                        hi,
+                        edit_style.get(),
+                        max_len.get(),
+                    );
+                    let final_text = if norm.reconcile_native {
+                        let s = String::from_utf16_lossy(&norm.units);
                         programmatic.set(true);
                         text_view.setString(&NSString::from_str(&s));
-                        text_view.setSelectedRange(NSRange::new(lo, hi.saturating_sub(lo)));
+                        text_view.setSelectedRange(NSRange::new(
+                            norm.sel_start,
+                            norm.sel_end.saturating_sub(norm.sel_start),
+                        ));
                         programmatic.set(false);
                         s
                     } else {
-                        lo = lo.min(units.len());
-                        hi = hi.min(units.len());
                         raw
                     };
-                    last_sel.set((lo, hi));
-                    return Some((final_text, lo, hi));
+                    *last_text.borrow_mut() = norm.units;
+                    last_sel.set((norm.sel_start, norm.sel_end));
+                    if norm.text_changed {
+                        return Some((final_text, norm.sel_start, norm.sel_end));
+                    }
                 }
                 None
             });
@@ -1422,7 +1444,9 @@ enum NativeControlView {
         field: Retained<NSTextField>,
         _delegate: Retained<AW2TextDelegate>,
         programmatic: Cell<bool>,
+        edit_style: Cell<u32>,
         max_len: Cell<usize>,
+        last_text: RefCell<Vec<u16>>,
         last_sel: Cell<(usize, usize)>,
         pending_sel: Cell<Option<(usize, usize)>>,
     },
@@ -1433,8 +1457,10 @@ enum NativeControlView {
         programmatic: Cell<bool>,
         readonly: Cell<bool>,
         enabled: Cell<bool>,
+        edit_style: Cell<u32>,
         wants_return: Cell<bool>,
         max_len: Cell<usize>,
+        last_text: RefCell<Vec<u16>>,
         last_sel: Cell<(usize, usize)>,
     },
     StaticLabel {
@@ -1686,8 +1712,10 @@ pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeContro
                     programmatic: Cell::new(false),
                     readonly: Cell::new(readonly),
                     enabled: Cell::new(desc.enabled),
+                    edit_style: Cell::new(desc.style),
                     wants_return: Cell::new((desc.style & controls::ES_WANTRETURN) != 0),
                     max_len: Cell::new(controls::DEFAULT_EDIT_LIMIT),
+                    last_text: RefCell::new(desc.text.encode_utf16().collect()),
                     last_sel: Cell::new((0, 0)),
                 }
             } else {
@@ -1711,7 +1739,9 @@ pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeContro
                     field,
                     _delegate: delegate,
                     programmatic: Cell::new(false),
+                    edit_style: Cell::new(desc.style),
                     max_len: Cell::new(controls::DEFAULT_EDIT_LIMIT),
+                    last_text: RefCell::new(desc.text.encode_utf16().collect()),
                     last_sel: Cell::new((0, 0)),
                     pending_sel: Cell::new(None),
                 }
@@ -1826,12 +1856,14 @@ pub(super) fn control_set_text(hwnd: usize, text: String) {
                 let s = controls::strip_win32_mnemonic(&text);
                 box_view.setTitle(&NSString::from_str(&s));
             }
-            NativeControlView::SingleLineEdit { field, programmatic, .. } => {
+            NativeControlView::SingleLineEdit { field, programmatic, last_text, .. } => {
+                *last_text.borrow_mut() = text.encode_utf16().collect();
                 programmatic.set(true);
                 field.setStringValue(&NSString::from_str(&text));
                 programmatic.set(false);
             }
-            NativeControlView::MultiLineEdit { text_view, programmatic, .. } => {
+            NativeControlView::MultiLineEdit { text_view, programmatic, last_text, .. } => {
+                *last_text.borrow_mut() = text.encode_utf16().collect();
                 programmatic.set(true);
                 text_view.setString(&NSString::from_str(&text));
                 programmatic.set(false);
@@ -2004,13 +2036,22 @@ pub(super) fn control_set_style(hwnd: usize, style: u32) {
         let Some(ctrl) = map.get(&hwnd) else { return };
         match &ctrl.view {
             NativeControlView::Button { button, .. } => apply_button_style(button, style),
-            NativeControlView::SingleLineEdit { field, .. } => {
+            NativeControlView::SingleLineEdit { field, edit_style, .. } => {
+                edit_style.set(style);
                 field.setEditable((style & controls::ES_READONLY) == 0);
                 field.setAlignment(ns_alignment_from_edit(style));
             }
-            NativeControlView::MultiLineEdit { text_view, readonly, enabled, wants_return, .. } => {
+            NativeControlView::MultiLineEdit {
+                text_view,
+                readonly,
+                enabled,
+                edit_style,
+                wants_return,
+                ..
+            } => {
                 let ro = (style & controls::ES_READONLY) != 0;
                 readonly.set(ro);
+                edit_style.set(style);
                 wants_return.set((style & controls::ES_WANTRETURN) != 0);
                 text_view.setEditable(enabled.get() && !ro);
                 text_view.setAlignment(ns_alignment_from_edit(style));
