@@ -9,7 +9,7 @@ use super::html::html_escape;
 use super::vdf::apply_post_install;
 use crate::aot::{compile_pe_file_to_rust, AotOptions};
 use crate::bundle_common::{
-    codesign_ad_hoc, copy_portable_shader_cache, find_or_build_release_binary,
+    codesign_ad_hoc, copy_game_payload, copy_portable_shader_cache, find_or_build_release_binary,
     otool_install_names, set_executable_mode,
 };
 use crate::gpu_shaders::precompile_shaders_for_paths;
@@ -894,43 +894,18 @@ fn package_macos_game_bundle(
         .zip(fs::canonicalize(&bundle_game_dir).ok())
         .is_some_and(|(a, b)| a == b);
     if !same_dir {
-        if bundle_game_dir.is_symlink() {
-            let _ = fs::remove_file(&bundle_game_dir);
-        } else if bundle_game_dir.exists() {
-            let _ = fs::remove_dir_all(&bundle_game_dir);
+        let skip_self = fs::canonicalize(out_app).ok();
+        let copy_report =
+            copy_game_payload(&entry.install_dir, &bundle_game_dir, skip_self.as_deref())?;
+        let skipped = copy_report.skipped_symlinks();
+        if skipped > 0 {
+            eprintln!(
+                "note: skipped {skipped} unsafe symlink(s) while copying game payload (escaping={}, dangling={}, cycle={})",
+                copy_report.symlinks_skipped_escaping,
+                copy_report.symlinks_skipped_dangling,
+                copy_report.symlinks_skipped_cycle,
+            );
         }
-        let status = Command::new("cp")
-            .args([
-                "-Rc",
-                &format!("{}/", entry.install_dir.display()),
-                &bundle_game_dir.to_string_lossy(),
-            ])
-            .status();
-        if !status.is_ok_and(|s| s.success()) {
-            let _ = fs::remove_dir_all(&bundle_game_dir);
-            let status_plain = Command::new("cp")
-                .args([
-                    "-R",
-                    &format!("{}/", entry.install_dir.display()),
-                    &bundle_game_dir.to_string_lossy(),
-                ])
-                .status()
-                .with_context(|| {
-                    format!(
-                        "copying game assets from {} to {}",
-                        entry.install_dir.display(),
-                        bundle_game_dir.display()
-                    )
-                })?;
-            if !status_plain.success() {
-                bail!(
-                    "failed to copy game assets into {}",
-                    bundle_game_dir.display()
-                );
-            }
-        }
-        // Strip DepotDownloader internal staging metadata from the packaged `.app` copy.
-        let _ = fs::remove_dir_all(bundle_game_dir.join(".DepotDownloader"));
     }
     let _ = apply_post_install(&entry.install_dir, &entry.app_id, &bundle_game_dir);
 
