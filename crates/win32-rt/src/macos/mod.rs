@@ -474,15 +474,17 @@ pub enum TaskDialogOutcome {
 pub enum TaskDialogEvent {
     RadioSelected(usize),
     VerificationToggled(bool),
+    HyperlinkClicked(String),
     ButtonClicked(TaskDialogAlertResult),
 }
 
-/// Live content/selection/enabled/dismissal update pushed from a Win32 TaskDialog
-/// callback back to the currently open native `NSAlert`.
+/// Live content/selection/enabled/hyperlink/dismissal update pushed from a
+/// Win32 TaskDialog callback back to the currently open native `NSAlert`.
 #[derive(Clone, Debug)]
 pub struct TaskDialogLiveUpdate {
     pub caption: String,
     pub text: String,
+    pub links: Vec<(String, String)>,
     pub button_enabled: Vec<bool>,
     pub radio_enabled: Vec<bool>,
     pub selected_radio_idx: Option<usize>,
@@ -603,6 +605,7 @@ pub fn task_dialog_alert<F, T>(
     dialog_hwnd: usize,
     caption: String,
     text: String,
+    links: Vec<(String, String)>,
     buttons: Vec<String>,
     button_enabled: Vec<bool>,
     default_button_idx: Option<usize>,
@@ -629,6 +632,7 @@ where
         if let Some(res) = invoke_test_task_dialog_presenter(
             &caption,
             &text,
+            &links,
             &buttons,
             &button_enabled,
             default_button_idx,
@@ -652,6 +656,7 @@ where
                 session_id,
                 &caption,
                 &text,
+                &links,
                 &buttons,
                 &button_enabled,
                 default_button_idx,
@@ -678,6 +683,7 @@ where
                 session_id,
                 &caption,
                 &text,
+                &links,
                 &buttons,
                 &button_enabled,
                 default_button_idx,
@@ -714,6 +720,7 @@ where
             dialog_hwnd,
             caption,
             text,
+            links,
             buttons,
             button_enabled,
             default_button_idx,
@@ -895,6 +902,7 @@ pub(crate) type TestTaskDialogPresenter = Box<
     dyn FnMut(
         &str,
         &str,
+        &[(String, String)],
         &[String],
         &[bool],
         Option<usize>,
@@ -933,6 +941,7 @@ pub(crate) fn set_test_task_dialog_updater(hook: Option<TestTaskDialogUpdater>) 
 fn invoke_test_task_dialog_presenter(
     caption: &str,
     text: &str,
+    links: &[(String, String)],
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
@@ -948,6 +957,7 @@ fn invoke_test_task_dialog_presenter(
             f(
                 caption,
                 text,
+                links,
                 buttons,
                 button_enabled,
                 default_button_idx,

@@ -1388,8 +1388,11 @@ impl TaskDialogEventSink {
 struct ActiveTaskDialogAlert {
     session_id: u64,
     alert: Retained<NSAlert>,
+    target: Retained<TaskDialogRadioTarget>,
     action_buttons: Vec<Retained<NSButton>>,
     radio_buttons: Vec<Retained<NSButton>>,
+    link_buttons: Vec<Retained<NSButton>>,
+    links: Vec<(String, String)>,
     sink: TaskDialogEventSink,
     /// Deferred programmatic dismissal or `WM_QUIT` abort received while a nested
     /// modal alert was on top.
@@ -1457,6 +1460,32 @@ define_class!(
                 }
             }
         }
+
+        #[unsafe(method(hyperlinkClicked:))]
+        fn hyperlink_clicked(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            if tag < 0 {
+                return;
+            }
+            let sid = self.ivars().session_id.get();
+            let payload = ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
+                let s = stack.borrow();
+                s.iter()
+                    .rev()
+                    .find(|a| sid == 0 || a.session_id == sid)
+                    .and_then(|a| {
+                        let href = a.links.get(tag as usize)?.1.clone();
+                        Some((a.sink.clone(), href))
+                    })
+            });
+            if let Some((sink, href)) = payload {
+                let is_inline = matches!(sink, TaskDialogEventSink::Inline(_));
+                sink.emit(super::TaskDialogEvent::HyperlinkClicked(href));
+                if is_inline && sid != 0 && crate::user32::message::has_pending_quit() {
+                    task_dialog_alert_cancel(sid);
+                }
+            }
+        }
     }
 );
 
@@ -1475,6 +1504,7 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         0,
         caption,
         text,
+        &[],
         buttons,
         &[],
         None,
@@ -1493,14 +1523,91 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
     .unwrap_or(0)
 }
 
-fn apply_live_update_to_alert(
+fn rebuild_task_dialog_accessory_view(
+    mtm: MainThreadMarker,
     alert: &NSAlert,
+    target: &TaskDialogRadioTarget,
+    radio_buttons: &[Retained<NSButton>],
+    link_buttons: &mut Vec<Retained<NSButton>>,
+    links: &[(String, String)],
+) {
+    for b in link_buttons.drain(..) {
+        b.removeFromSuperview();
+    }
+    for b in radio_buttons {
+        b.removeFromSuperview();
+    }
+    let total_rows = radio_buttons.len() + links.len();
+    if total_rows == 0 {
+        alert.setAccessoryView(None);
+        return;
+    }
+    let row_h = 24.0f64;
+    let width = 320.0f64;
+    let gap = if !radio_buttons.is_empty() && !links.is_empty() { 6.0f64 } else { 0.0f64 };
+    let total_h = row_h * (total_rows as f64) + gap + 4.0;
+    let container = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, total_h)),
+    );
+    for (idx, btn) in radio_buttons.iter().enumerate() {
+        // Position top-to-bottom in AppKit's bottom-up coordinate system.
+        let y = total_h - ((idx + 1) as f64) * row_h;
+        btn.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, row_h)));
+        container.addSubview(btn);
+    }
+    let link_top = total_h - (radio_buttons.len() as f64) * row_h - gap;
+    for (idx, (label, _href)) in links.iter().enumerate() {
+        let btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(label),
+                Some(target),
+                Some(sel!(hyperlinkClicked:)),
+                mtm,
+            )
+        };
+        btn.setBordered(false);
+        btn.setContentTintColor(Some(&NSColor::linkColor()));
+        let _: () = unsafe { msg_send![&*btn, setAlignment: 0isize] };
+        let _: () = unsafe { msg_send![&*btn, setTag: idx as isize] };
+        let y = link_top - ((idx + 1) as f64) * row_h;
+        btn.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, row_h)));
+        container.addSubview(&btn);
+        link_buttons.push(btn);
+    }
+    alert.setAccessoryView(Some(&container));
+}
+
+fn apply_live_update_to_alert(
+    mtm: MainThreadMarker,
+    alert: &NSAlert,
+    target: &TaskDialogRadioTarget,
     action_buttons: &[Retained<NSButton>],
     radio_buttons: &[Retained<NSButton>],
+    link_buttons: &mut Vec<Retained<NSButton>>,
+    links_slot: &mut Vec<(String, String)>,
     update: &super::TaskDialogLiveUpdate,
 ) {
     alert.setMessageText(&NSString::from_str(&update.caption));
     alert.setInformativeText(&NSString::from_str(&update.text));
+    *links_slot = update.links.clone();
+    if update.links.len() == link_buttons.len() {
+        for (i, b) in link_buttons.iter().enumerate() {
+            if let Some((label, _)) = update.links.get(i) {
+                b.setTitle(&NSString::from_str(label));
+            }
+        }
+    } else {
+        rebuild_task_dialog_accessory_view(
+            mtm,
+            alert,
+            target,
+            radio_buttons,
+            link_buttons,
+            &update.links,
+        );
+        let _: () = unsafe { msg_send![alert, layout] };
+    }
     for (i, b) in action_buttons.iter().enumerate() {
         if let Some(&en) = update.button_enabled.get(i) {
             b.setEnabled(en);
@@ -1534,7 +1641,16 @@ pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDial
         };
         let is_top = pos + 1 == s.len();
         let active = &mut s[pos];
-        apply_live_update_to_alert(&active.alert, &active.action_buttons, &active.radio_buttons, update);
+        apply_live_update_to_alert(
+            mtm,
+            &active.alert,
+            &active.target,
+            &active.action_buttons,
+            &active.radio_buttons,
+            &mut active.link_buttons,
+            &mut active.links,
+            update,
+        );
         let stop = if let Some(bidx) = update.click_button_idx {
             if is_top {
                 Some(1000 + bidx as isize)
@@ -1590,6 +1706,7 @@ fn run_task_dialog_alert(
     session_id: u64,
     caption: &str,
     text: &str,
+    links: &[(String, String)],
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
@@ -1643,39 +1760,34 @@ fn run_task_dialog_alert(
     }
 
     let mut radio_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(radios.len());
-    if !radios.is_empty() {
-        let row_h = 24.0f64;
-        let width = 320.0f64;
-        let total_h = row_h * (radios.len() as f64) + 4.0;
-        let container = NSView::initWithFrame(
-            NSView::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, total_h)),
-        );
-        for (idx, label) in radios.iter().enumerate() {
-            let btn = unsafe {
-                NSButton::radioButtonWithTitle_target_action(
-                    &NSString::from_str(label),
-                    Some(&target),
-                    Some(sel!(radioSelected:)),
-                    mtm,
-                )
-            };
-            let _: () = unsafe { msg_send![&*btn, setTag: idx as isize] };
-            // Position top-to-bottom in AppKit's bottom-up coordinate system.
-            let y = total_h - ((idx + 1) as f64) * row_h;
-            btn.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, row_h)));
-            let state = if default_radio_idx == Some(idx) {
-                NS_CONTROL_STATE_ON
-            } else {
-                NS_CONTROL_STATE_OFF
-            };
-            let _: () = unsafe { msg_send![&*btn, setState: state] };
-            btn.setEnabled(radio_enabled.get(idx).copied().unwrap_or(true));
-            container.addSubview(&btn);
-            radio_buttons.push(btn);
-        }
-        a.setAccessoryView(Some(&container));
+    for (idx, label) in radios.iter().enumerate() {
+        let btn = unsafe {
+            NSButton::radioButtonWithTitle_target_action(
+                &NSString::from_str(label),
+                Some(&target),
+                Some(sel!(radioSelected:)),
+                mtm,
+            )
+        };
+        let _: () = unsafe { msg_send![&*btn, setTag: idx as isize] };
+        let state = if default_radio_idx == Some(idx) {
+            NS_CONTROL_STATE_ON
+        } else {
+            NS_CONTROL_STATE_OFF
+        };
+        let _: () = unsafe { msg_send![&*btn, setState: state] };
+        btn.setEnabled(radio_enabled.get(idx).copied().unwrap_or(true));
+        radio_buttons.push(btn);
     }
+    let mut link_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(links.len());
+    rebuild_task_dialog_accessory_view(
+        mtm,
+        &a,
+        &target,
+        &radio_buttons,
+        &mut link_buttons,
+        links,
+    );
 
     struct ActiveAlertGuard {
         session_id: u64,
@@ -1710,8 +1822,11 @@ fn run_task_dialog_alert(
         stack.borrow_mut().push(ActiveTaskDialogAlert {
             session_id,
             alert: a.clone(),
+            target: target.clone(),
             action_buttons: action_buttons.clone(),
             radio_buttons: radio_buttons.clone(),
+            link_buttons,
+            links: links.to_vec(),
             sink,
             deferred_stop: None,
         });
@@ -1723,12 +1838,25 @@ fn run_task_dialog_alert(
     if session_id != 0 {
         let queued = PENDING_TASK_DIALOG_UPDATES.with(|map| map.borrow_mut().remove(&session_id));
         if let Some(updates) = queued {
-            for upd in updates {
-                apply_live_update_to_alert(&a, &action_buttons, &radio_buttons, &upd);
-                if let Some(bidx) = upd.click_button_idx {
-                    pre_clicked = Some(bidx);
+            ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
+                if let Some(entry) = stack.borrow_mut().iter_mut().rev().find(|e| e.session_id == session_id) {
+                    for upd in updates {
+                        apply_live_update_to_alert(
+                            mtm,
+                            &entry.alert,
+                            &entry.target,
+                            &entry.action_buttons,
+                            &entry.radio_buttons,
+                            &mut entry.link_buttons,
+                            &mut entry.links,
+                            &upd,
+                        );
+                        if let Some(bidx) = upd.click_button_idx {
+                            pre_clicked = Some(bidx);
+                        }
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -1775,6 +1903,7 @@ pub(super) fn task_dialog_alert_channel(
     session_id: u64,
     caption: &str,
     text: &str,
+    links: &[(String, String)],
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
@@ -1791,6 +1920,7 @@ pub(super) fn task_dialog_alert_channel(
         session_id,
         caption,
         text,
+        links,
         buttons,
         button_enabled,
         default_button_idx,
@@ -1860,6 +1990,7 @@ pub(super) fn task_dialog_alert_inline(
     session_id: u64,
     caption: &str,
     text: &str,
+    links: &[(String, String)],
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
@@ -1923,6 +2054,7 @@ pub(super) fn task_dialog_alert_inline(
         session_id,
         caption,
         text,
+        links,
         buttons,
         button_enabled,
         default_button_idx,

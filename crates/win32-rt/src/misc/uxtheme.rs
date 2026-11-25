@@ -233,12 +233,14 @@ const TDCBF_CANCEL_BUTTON: u32 = 0x0008;
 const TDCBF_RETRY_BUTTON: u32 = 0x0010;
 const TDCBF_CLOSE_BUTTON: u32 = 0x0020;
 
+const TDF_ENABLE_HYPERLINKS: u32 = 0x0001;
 const TDF_VERIFICATION_FLAG_CHECKED: u32 = 0x0100;
 const TDF_CALLBACK_TIMER: u32 = 0x0800;
 const TDF_NO_DEFAULT_RADIO_BUTTON: u32 = 0x4000;
 
 const TDN_CREATED: u32 = 0;
 const TDN_BUTTON_CLICKED: u32 = 2;
+const TDN_HYPERLINK_CLICKED: u32 = 3;
 const TDN_TIMER: u32 = 4;
 const TDN_DESTROYED: u32 = 5;
 const TDN_RADIO_BUTTON_CLICKED: u32 = 6;
@@ -270,6 +272,7 @@ static NEXT_TASK_DIALOG_SESSION: std::sync::atomic::AtomicU64 =
 struct ActiveTaskDialog {
     session_id: u64,
     modal_open: bool,
+    enable_hyperlinks: bool,
     hinst: usize,
     pf_callback: usize,
     lp_callback_data: isize,
@@ -288,24 +291,163 @@ struct ActiveTaskDialog {
     pending_click_button: Option<i32>,
 }
 
-impl ActiveTaskDialog {
-    fn compose_body(&self) -> String {
-        let mut body_parts: Vec<&str> = Vec::new();
-        for part in [&self.main_inst, &self.content, &self.expanded, &self.footer] {
-            if !part.is_empty() {
-                body_parts.push(part.as_str());
+/// Extract Windows TaskDialog `<A HREF="...">label</A>` anchor markup from a text
+/// element, returning the stripped visible text and `(label, href)` pairs in order.
+fn parse_task_dialog_hyperlinks(input: &str) -> (String, Vec<(String, String)>) {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut visible = String::with_capacity(len);
+    let mut links: Vec<(String, String)> = Vec::new();
+    let mut i = 0usize;
+
+    while i < len {
+        if bytes[i] == b'<'
+            && i + 2 < len
+            && bytes[i + 1].eq_ignore_ascii_case(&b'a')
+            && (bytes[i + 2].is_ascii_whitespace() || bytes[i + 2] == b'>')
+        {
+            // Find the end of the opening `<a ...>` tag while respecting quoted attributes.
+            let mut j = i + 2;
+            let mut quote: u8 = 0;
+            while j < len {
+                let b = bytes[j];
+                if quote != 0 {
+                    if b == quote {
+                        quote = 0;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = b;
+                } else if b == b'>' {
+                    break;
+                }
+                j += 1;
+            }
+            if j < len && bytes[j] == b'>' {
+                let attrs = &input[i + 2..j];
+                // Find the matching `</a>` closing tag (case-insensitive).
+                let content_start = j + 1;
+                let mut k = content_start;
+                let mut close_end: Option<usize> = None;
+                while k + 3 < len {
+                    if bytes[k] == b'<'
+                        && bytes[k + 1] == b'/'
+                        && bytes[k + 2].eq_ignore_ascii_case(&b'a')
+                    {
+                        let mut m = k + 3;
+                        while m < len && bytes[m].is_ascii_whitespace() {
+                            m += 1;
+                        }
+                        if m < len && bytes[m] == b'>' {
+                            close_end = Some(m + 1);
+                            break;
+                        }
+                    }
+                    k += 1;
+                }
+                if let Some(end_idx) = close_end {
+                    let href = extract_href_attribute(attrs);
+                    let label = &input[content_start..k];
+                    visible.push_str(label);
+                    let display_label = if label.trim().is_empty() {
+                        href.clone()
+                    } else {
+                        label.to_string()
+                    };
+                    links.push((display_label, href));
+                    i = end_idx;
+                    continue;
+                }
             }
         }
-        body_parts.join("\n\n")
+        let ch = input[i..].chars().next().unwrap();
+        visible.push(ch);
+        i += ch.len_utf8();
+    }
+
+    (visible, links)
+}
+
+fn extract_href_attribute(attrs: &str) -> String {
+    let bytes = attrs.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let name = &attrs[name_start..i];
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < len && bytes[i] == b'=' {
+            i += 1;
+            while i < len && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let val = if i < len && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let q = bytes[i];
+                i += 1;
+                let val_start = i;
+                while i < len && bytes[i] != q {
+                    i += 1;
+                }
+                let s = &attrs[val_start..i];
+                if i < len {
+                    i += 1;
+                }
+                s
+            } else {
+                let val_start = i;
+                while i < len && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                &attrs[val_start..i]
+            };
+            if name.eq_ignore_ascii_case("href") {
+                return val.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+impl ActiveTaskDialog {
+    fn compose_body_and_links(&self) -> (String, Vec<(String, String)>) {
+        let mut body_parts: Vec<String> = Vec::new();
+        let mut links: Vec<(String, String)> = Vec::new();
+        if !self.main_inst.is_empty() {
+            body_parts.push(self.main_inst.clone());
+        }
+        for part in [&self.content, &self.expanded, &self.footer] {
+            if part.is_empty() {
+                continue;
+            }
+            if self.enable_hyperlinks {
+                let (plain, mut part_links) = parse_task_dialog_hyperlinks(part);
+                links.append(&mut part_links);
+                if !plain.is_empty() {
+                    body_parts.push(plain);
+                }
+            } else {
+                body_parts.push(part.clone());
+            }
+        }
+        (body_parts.join("\n\n"), links)
     }
 
     fn live_update(&self, click_button_idx: Option<usize>) -> Option<(u64, crate::macos::TaskDialogLiveUpdate)> {
         self.modal_open.then(|| {
+            let (text, links) = self.compose_body_and_links();
             (
                 self.session_id,
                 crate::macos::TaskDialogLiveUpdate {
                     caption: self.caption.clone(),
-                    text: self.compose_body(),
+                    text,
+                    links,
                     button_enabled: self.button_enabled.clone(),
                     radio_enabled: self.radio_enabled.clone(),
                     selected_radio_idx: self.selected_radio_idx,
@@ -688,6 +830,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         cfg.hwnd_parent as usize,
         task_dialog_wndproc_va(),
     );
+    let enable_hyperlinks = (cfg.dw_flags & TDF_ENABLE_HYPERLINKS) != 0;
     active_task_dialogs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -696,6 +839,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             ActiveTaskDialog {
                 session_id,
                 modal_open: false,
+                enable_hyperlinks,
                 hinst: hinst as usize,
                 pf_callback: cfg.pf_callback,
                 lp_callback_data: cfg.lp_callback_data,
@@ -716,14 +860,14 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         );
     let _dialog_guard = TaskDialogHwndGuard { hwnd: dialog_hwnd };
 
-    let notify = |msg: u32, wp: u64| -> HRESULT {
+    let notify_lp = |msg: u32, wp: u64, lp: u64| -> HRESULT {
         if cfg.pf_callback != 0 {
             crate::call_guest8(
                 cfg.pf_callback,
                 dialog_hwnd as u64,
                 msg as u64,
                 wp,
-                0,
+                lp,
                 cfg.lp_callback_data as u64,
                 0,
                 0,
@@ -733,6 +877,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             S_OK
         }
     };
+    let notify = |msg: u32, wp: u64| -> HRESULT { notify_lp(msg, wp, 0) };
 
     let callback_timer = (cfg.dw_flags & TDF_CALLBACK_TIMER) != 0 && cfg.pf_callback != 0;
     let timer_interval = callback_timer.then_some(TASK_DIALOG_TIMER_INTERVAL);
@@ -742,19 +887,30 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     let _ = notify(TDN_CREATED, 0);
 
     let chosen_id = loop {
-        let (cur_caption, cur_body, cur_button_enabled, cur_radio_enabled, cur_radio_idx, cur_verified, programmatic_click) = {
+        let (
+            cur_caption,
+            cur_body,
+            cur_links,
+            cur_button_enabled,
+            cur_radio_enabled,
+            cur_radio_idx,
+            cur_verified,
+            programmatic_click,
+        ) = {
             let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
             let dlg = map.get_mut(&dialog_hwnd).expect("active task dialog missing");
+            let (body, links) = dlg.compose_body_and_links();
             let snap = (
                 dlg.caption.clone(),
-                dlg.compose_body(),
+                body,
+                links,
                 dlg.button_enabled.clone(),
                 dlg.radio_enabled.clone(),
                 dlg.selected_radio_idx,
                 dlg.verified,
                 dlg.pending_click_button.take(),
             );
-            if snap.6.is_none() {
+            if snap.7.is_none() {
                 dlg.modal_open = true;
             }
             snap
@@ -773,6 +929,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             dialog_hwnd,
             cur_caption,
             cur_body,
+            cur_links.clone(),
             labels.clone(),
             cur_button_enabled.clone(),
             default_button_idx,
@@ -813,6 +970,10 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                         let _ = notify(TDN_VERIFICATION_CLICKED, if checked { 1 } else { 0 });
                     }
                 }
+                crate::macos::TaskDialogEvent::HyperlinkClicked(href) => {
+                    let wide = crate::strings::to_wide_z(&href);
+                    let _ = notify_lp(TDN_HYPERLINK_CLICKED, 0, wide.as_ptr() as u64);
+                }
                 crate::macos::TaskDialogEvent::ButtonClicked(_) => {}
             },
             |elapsed_ms| notify(TDN_TIMER, elapsed_ms as u64) == S_FALSE_HR,
@@ -850,14 +1011,20 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             }
             crate::macos::TaskDialogOutcome::Unavailable => {
                 let single_enabled = cur_button_enabled.first().copied().unwrap_or(true);
-                if buttons.len() == 1 && !has_selection_controls && !callback_timer && single_enabled {
+                if buttons.len() == 1
+                    && !has_selection_controls
+                    && !callback_timer
+                    && cur_links.is_empty()
+                    && single_enabled
+                {
                     // Pure single-button informational dialog with an enabled button and no
-                    // selection controls or timer can dismiss in headless mode (matching MessageBox MB_OK).
+                    // selection controls, hyperlinks, or timer can dismiss in headless mode
+                    // (matching MessageBox MB_OK).
                     (buttons[0].0, false)
                 } else {
                     // Multi-button prompts or dialogs with radio buttons / verification checkboxes /
-                    // TDF_CALLBACK_TIMER require an interactive desktop so we never fabricate user
-                    // selections or silently skip timer callbacks.
+                    // clickable hyperlinks / TDF_CALLBACK_TIMER require an interactive desktop so we
+                    // never fabricate user selections or silently skip callbacks.
                     if callback_timer {
                         log::warn!("uxtheme: TaskDialogIndirect with TDF_CALLBACK_TIMER requires interactive desktop");
                     }
@@ -1397,7 +1564,7 @@ mod tests {
 
             let mut step = 0usize;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, body, btns, _btn_en, def_btn, rads, _rad_en, def_rad, ver_txt, ver_chk, emit| {
+                move |_cap, body, _links, btns, _btn_en, def_btn, rads, _rad_en, def_rad, ver_txt, ver_chk, emit| {
                     step += 1;
                     assert_eq!(btns, &["Yes", "No"]);
                     assert_eq!(def_btn, Some(1)); // n_default_button == IDNO (7)
@@ -1622,7 +1789,7 @@ mod tests {
             SEEN_NOTIFS.lock().unwrap().clear();
             SUB_PINGS.store(0, std::sync::atomic::Ordering::SeqCst);
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                |cap, body, _btns, _btn_en, _def_btn, _rads, _rad_en, def_rad, _ver_txt, ver_chk, _emit| {
+                |cap, body, _links, _btns, _btn_en, _def_btn, _rads, _rad_en, def_rad, _ver_txt, ver_chk, _emit| {
                     assert_eq!(cap, "Callback Title");
                     assert_eq!(body, "Updated Body");
                     assert_eq!(def_rad, Some(0)); // updated via TDM_CLICK_RADIO_BUTTON(201)
@@ -1754,7 +1921,7 @@ mod tests {
             VETO_FIRST.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut step = 0usize;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, _body, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
+                move |_cap, _body, _links, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
                     step += 1;
                     if step == 1 {
                         // Triggers TDM_CLICK_BUTTON(6) while modal_open == true.
@@ -1809,6 +1976,7 @@ mod tests {
                     ActiveTaskDialog {
                         session_id: sid,
                         modal_open: true,
+                        enable_hyperlinks: false,
                         hinst: 0,
                         pf_callback: 0,
                         lp_callback_data: 0,
@@ -1898,6 +2066,7 @@ mod tests {
                     ActiveTaskDialog {
                         session_id: timer_sid,
                         modal_open: true,
+                        enable_hyperlinks: false,
                         hinst: 0,
                         pf_callback: 0,
                         lp_callback_data: 0,
@@ -2067,7 +2236,7 @@ mod tests {
             quit_cfg.pf_callback = quit_td_cb as *const () as usize;
 
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                |_cap, _body, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
+                |_cap, _body, _links, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
                     crate::user32::message::PostQuitMessage(77);
                     crate::macos::TaskDialogOutcome::Quit
                 },
@@ -2152,7 +2321,7 @@ mod tests {
             })));
 
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, _body, btns, btn_en, _db, rads, rad_en, _dr, _vt, _vc, emit| {
+                move |_cap, _body, _links, btns, btn_en, _db, rads, rad_en, _dr, _vt, _vc, emit| {
                     assert_eq!(btns, &["OK", "Cancel"]);
                     assert_eq!(rads, &["R1", "R2"]);
                     // Pre-presentation TDM_ENABLE_BUTTON(1, FALSE) and TDM_ENABLE_RADIO_BUTTON(202, FALSE)
@@ -2221,6 +2390,184 @@ mod tests {
                 HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION
             );
             assert_eq!(sbtn, 0);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn task_dialog_hyperlinks_strip_markup_and_dispatch_tdn_hyperlink_clicked() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 1. Parser handles double-quoted, single-quoted, extra-attribute, mixed-case,
+        //    empty-label, and multiple anchor tags while preserving malformed tags literally.
+        let (vis, parsed) = parse_task_dialog_hyperlinks(
+            "See <A ID=\"help\" HREF=\"https://example.com/docs\">the docs</A> or <a href='mailto:a@b.c'>email us</a> and <a href=\"https://bare.test\"></a> (<abbr>ok</abbr>).",
+        );
+        assert_eq!(vis, "See the docs or email us and  (<abbr>ok</abbr>).");
+        assert_eq!(
+            parsed,
+            vec![
+                ("the docs".to_string(), "https://example.com/docs".to_string()),
+                ("email us".to_string(), "mailto:a@b.c".to_string()),
+                ("https://bare.test".to_string(), "https://bare.test".to_string()),
+            ]
+        );
+
+        std::thread::spawn(|| unsafe {
+            static CLICKED_HREFS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            unsafe extern "win64" fn link_cb(
+                hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                if msg == TDN_HYPERLINK_CLICKED {
+                    assert_eq!(wp, 0);
+                    let href = if lp != 0 {
+                        crate::strings::from_wide(lp as LPCWSTR)
+                    } else {
+                        String::new()
+                    };
+                    CLICKED_HREFS.lock().unwrap().push(href.clone());
+                    if href == "https://example.com/docs" {
+                        let next_footer = crate::strings::to_wide_z(
+                            "Updated <a href=\"https://example.com/changelog\">Changelog</a>",
+                        );
+                        let _ = crate::user32::message::SendMessageW(
+                            hwnd,
+                            TDM_SET_ELEMENT_TEXT,
+                            TDE_FOOTER,
+                            next_footer.as_ptr() as isize,
+                        );
+                    }
+                }
+                S_OK
+            }
+
+            let title_w = crate::strings::to_wide_z("Help");
+            let main_w = crate::strings::to_wide_z("Heading <a href=\"ignored\">Raw</a>");
+            let content_w = crate::strings::to_wide_z(
+                "Read <A HREF=\"https://example.com/docs\">Documentation</A>.",
+            );
+            let expanded_w = crate::strings::to_wide_z(
+                "Extra <a href='https://example.com/faq'>FAQ</a>.",
+            );
+            let footer_w = crate::strings::to_wide_z(
+                "Support: <a href=\"https://example.com/support\">Contact</a>",
+            );
+
+            let mut cfg: TaskDialogConfig = std::mem::zeroed();
+            cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg.dw_flags = TDF_ENABLE_HYPERLINKS;
+            cfg.dw_common_buttons = TDCBF_CLOSE_BUTTON;
+            cfg.psz_window_title = title_w.as_ptr();
+            cfg.psz_main_instruction = main_w.as_ptr();
+            cfg.psz_content = content_w.as_ptr();
+            cfg.psz_expanded_information = expanded_w.as_ptr();
+            cfg.psz_footer = footer_w.as_ptr();
+            cfg.pf_callback = link_cb as *const () as usize;
+
+            // 2. Interactive dialog strips markup in content/expanded/footer (leaving main_instruction
+            //    verbatim), surfaces extracted links, delivers TDN_HYPERLINK_CLICKED with UTF-16 href,
+            //    and pushes live updated links on TDM_SET_ELEMENT_TEXT.
+            CLICKED_HREFS.lock().unwrap().clear();
+            let live_links: std::sync::Arc<Mutex<Vec<Vec<(String, String)>>>> =
+                std::sync::Arc::new(Mutex::new(Vec::new()));
+            let live_links_hook = live_links.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |_sid, upd| {
+                live_links_hook.lock().unwrap().push(upd.links.clone());
+            })));
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |_cap, body, links, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
+                    assert_eq!(
+                        body,
+                        "Heading <a href=\"ignored\">Raw</a>\n\nRead Documentation.\n\nExtra FAQ.\n\nSupport: Contact"
+                    );
+                    assert_eq!(
+                        links,
+                        &[
+                            ("Documentation".to_string(), "https://example.com/docs".to_string()),
+                            ("FAQ".to_string(), "https://example.com/faq".to_string()),
+                            ("Contact".to_string(), "https://example.com/support".to_string()),
+                        ]
+                    );
+                    emit(crate::macos::TaskDialogEvent::HyperlinkClicked(
+                        "https://example.com/docs".to_string(),
+                    ));
+                    emit(crate::macos::TaskDialogEvent::HyperlinkClicked(
+                        "https://example.com/changelog".to_string(),
+                    ));
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: None,
+                        verified: false,
+                    })
+                },
+            )));
+
+            let mut btn = 0;
+            let hr = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            crate::macos::set_test_task_dialog_updater(None);
+            assert_eq!(hr, S_OK);
+            assert_eq!(btn, 8);
+            assert_eq!(
+                CLICKED_HREFS.lock().unwrap().clone(),
+                vec![
+                    "https://example.com/docs".to_string(),
+                    "https://example.com/changelog".to_string(),
+                ]
+            );
+            let pushed = live_links.lock().unwrap().clone();
+            assert!(
+                pushed.iter().any(|ls| ls.iter().any(|(l, u)| l == "Changelog" && u == "https://example.com/changelog")),
+                "TDM_SET_ELEMENT_TEXT on a hyperlink-enabled dialog must push updated links: {pushed:?}"
+            );
+
+            // 3. Headless single-button dialog with TDF_ENABLE_HYPERLINKS and active links must
+            //    refuse auto-dismissal rather than dropping clickable links.
+            let mut headless_btn = 99;
+            assert_eq!(
+                TaskDialogIndirect(
+                    &cfg as *const TaskDialogConfig as *const u8,
+                    &mut headless_btn,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION
+            );
+            assert_eq!(headless_btn, 0);
+
+            // 4. Without TDF_ENABLE_HYPERLINKS, anchor tags remain literal and no links are extracted.
+            cfg.dw_flags = 0;
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |_cap, body, links, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
+                    assert!(body.contains("<A HREF=\"https://example.com/docs\">Documentation</A>"));
+                    assert!(links.is_empty());
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: None,
+                        verified: false,
+                    })
+                },
+            )));
+            assert_eq!(
+                TaskDialogIndirect(
+                    &cfg as *const TaskDialogConfig as *const u8,
+                    &mut btn,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                S_OK
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
         })
         .join()
         .unwrap();
@@ -2313,6 +2660,7 @@ mod tests {
                     ActiveTaskDialog {
                         session_id: sid,
                         modal_open: true,
+                        enable_hyperlinks: false,
                         hinst: 0,
                         pf_callback: 0,
                         lp_callback_data: 0,
