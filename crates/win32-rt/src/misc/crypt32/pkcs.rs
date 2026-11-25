@@ -1227,6 +1227,17 @@ fn password_to_bmp_string(pass: Option<&str>) -> Vec<u8> {
 }
 
 unsafe fn cc_decrypt_cbc(alg: u32, key: &[u8], iv: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
+    // CommonCrypto `CCCrypt` takes no IV-length parameter and always reads a full cipher block
+    // from `iv`. Validate both IV and key lengths before crossing FFI to prevent over-reads.
+    let valid_params = match alg {
+        K_CC_ALGORITHM_AES => iv.len() == 16 && matches!(key.len(), 16 | 24 | 32),
+        K_CC_ALGORITHM_3DES => iv.len() == 8 && key.len() == 24,
+        K_CC_ALGORITHM_RC2 => iv.len() == 8 && (1..=128).contains(&key.len()),
+        _ => false,
+    };
+    if !valid_params {
+        return None;
+    }
     if ct.is_empty() {
         return Some(Vec::new());
     }
@@ -1335,14 +1346,20 @@ unsafe fn decrypt_pbe(
             return None;
         }
         let iv = iv_elem.val;
-        let (cc_alg, default_key_len) = match enc_oid {
-            OID_AES_128_CBC => (K_CC_ALGORITHM_AES, 16usize),
-            OID_AES_192_CBC => (K_CC_ALGORITHM_AES, 24usize),
-            OID_AES_256_CBC => (K_CC_ALGORITHM_AES, 32usize),
-            OID_3DES_CBC => (K_CC_ALGORITHM_3DES, 24usize),
+        let (cc_alg, default_key_len, expected_iv_len) = match enc_oid {
+            OID_AES_128_CBC => (K_CC_ALGORITHM_AES, 16usize, 16usize),
+            OID_AES_192_CBC => (K_CC_ALGORITHM_AES, 24usize, 16usize),
+            OID_AES_256_CBC => (K_CC_ALGORITHM_AES, 32usize, 16usize),
+            OID_3DES_CBC => (K_CC_ALGORITHM_3DES, 24usize, 8usize),
             _ => return None,
         };
+        if iv.len() != expected_iv_len {
+            return None;
+        }
         let key_len = explicit_key_len.unwrap_or(default_key_len);
+        if key_len != default_key_len || iters == 0 {
+            return None;
+        }
         let mut key = vec![0u8; key_len];
         let pw_bytes = password_utf8.as_bytes();
         let st = CCKeyDerivationPBKDF(
@@ -1352,7 +1369,7 @@ unsafe fn decrypt_pbe(
             salt.as_ptr(),
             salt.len(),
             prf_cc,
-            iters.max(1),
+            iters,
             key.as_mut_ptr(),
             key.len(),
         );

@@ -2816,6 +2816,80 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         assert!(CertEnumCertificatesInStore(st_noid, c_second).is_null());
         CertCloseStore(st_noid, 0);
 
+        // 2c. PFXImportCertStore: malformed MacData-free PBES2 PFX with empty or truncated IV
+        //     must be safely rejected before invoking CommonCrypto CCCrypt.
+        for (enc_oid, bad_iv) in [
+            (&[0x60u8, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A][..], &[][..]), // AES-256-CBC empty IV
+            (&[0x60u8, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A][..], &[1u8, 2, 3, 4][..]), // AES-256-CBC 4B IV
+            (&[0x2Au8, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x03, 0x07][..], &[1u8, 2, 3][..]), // 3DES-CBC 3B IV
+        ] {
+            let kdf = encode_der_tlv(
+                0x30,
+                &[
+                    encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0C]),
+                    encode_der_tlv(
+                        0x30,
+                        &[
+                            encode_der_tlv(0x04, &[0xAA; 8]),
+                            encode_der_tlv(0x02, &[0x01]),
+                        ]
+                        .concat(),
+                    ),
+                ]
+                .concat(),
+            );
+            let enc = encode_der_tlv(
+                0x30,
+                &[encode_der_tlv(0x06, enc_oid), encode_der_tlv(0x04, bad_iv)].concat(),
+            );
+            let pbes2 = encode_der_tlv(
+                0x30,
+                &[
+                    encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0D]),
+                    encode_der_tlv(0x30, &[kdf, enc].concat()),
+                ]
+                .concat(),
+            );
+            let eci = encode_der_tlv(
+                0x30,
+                &[
+                    encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01]),
+                    pbes2,
+                    encode_der_tlv(0x80, &[0x55; 16]),
+                ]
+                .concat(),
+            );
+            let ed = encode_der_tlv(0x30, &[encode_der_tlv(0x02, &[0x00]), eci].concat());
+            let ed_ci = encode_der_tlv(
+                0x30,
+                &[
+                    encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x06]),
+                    encode_der_tlv(0xA0, &ed),
+                ]
+                .concat(),
+            );
+            let auth_safe = encode_der_tlv(0x30, &ed_ci);
+            let outer_ci = encode_der_tlv(
+                0x30,
+                &[
+                    encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01]),
+                    encode_der_tlv(0xA0, &encode_der_tlv(0x04, &auth_safe)),
+                ]
+                .concat(),
+            );
+            let bad_pfx = encode_der_tlv(0x30, &[encode_der_tlv(0x02, &[0x03]), outer_ci].concat());
+            let bad_blob = CryptDataBlob {
+                cb_data: bad_pfx.len() as u32,
+                pb_data: bad_pfx.as_ptr(),
+            };
+            assert!(
+                PFXImportCertStore(&bad_blob as *const _ as *const c_void, empty_pw.as_ptr(), 0)
+                    .is_null(),
+                "PFX with invalid PBES2 IV length ({} bytes) must be rejected",
+                bad_iv.len()
+            );
+        }
+
         // 3. CryptMsgOpenToDecode + chunked CryptMsgUpdate + CryptMsgGetParam
         let h_msg = CryptMsgOpenToDecode(
             X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
