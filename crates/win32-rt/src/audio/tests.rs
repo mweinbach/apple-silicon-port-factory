@@ -33,6 +33,32 @@ macro_rules! call {
     }};
 }
 
+/// Call a COM method with signature `(this, f32, *const GUID) -> HRESULT` through
+/// its real `win64_bridge!` vtable slot (Win64 passes `f32` in `xmm1`, `ctx` in `r8`).
+unsafe fn call_bridge_f32_guid(obj: P, idx: usize, level: f32, ctx: *const GUID) -> HRESULT {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let br: unsafe extern "C" fn(
+            u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            f64, f64, f64, f64,
+        ) -> HRESULT = std::mem::transmute(slot(obj, idx));
+        br(
+            obj as u64,
+            0,
+            ctx as u64,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0.0,
+            f64::from_bits(level.to_bits() as u64),
+            0.0,
+            0.0,
+        )
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        call!(obj, idx, (f32, *const GUID) -> HRESULT; level, ctx)
+    }
+}
+
 unsafe fn release(o: P) -> u32 {
     call!(o, 2, () -> u32;)
 }
@@ -319,7 +345,7 @@ fn enumerator_devices_and_property_store() {
         assert_eq!(call!(sc2, 16, (BOOL) -> HRESULT; TRUE), S_OK); // SetDuckingPreference
         let mut vol: P = std::ptr::null_mut();
         assert_eq!(call!(sm, 4, (*const GUID, u32, *mut P) -> HRESULT; std::ptr::null(), 0, &mut vol), S_OK);
-        assert_eq!(call!(vol, 3, (f32, *const GUID) -> HRESULT; 0.75f32, std::ptr::null()), S_OK);
+        assert_eq!(call_bridge_f32_guid(vol, 3, 0.75f32, std::ptr::null()), S_OK);
         let mut got_v = 0.0f32;
         assert_eq!(call!(vol, 4, (*mut f32) -> HRESULT; &mut got_v), S_OK);
         assert_eq!(got_v, 0.75f32);
@@ -341,13 +367,37 @@ fn enumerator_devices_and_property_store() {
         assert!(!sac.is_null());
         assert_eq!(release(sac), 0);
 
-        // Optional interfaces not available on macOS: honest E_NOINTERFACE.
-        for iid in [IID_IAudioEndpointVolume] {
-            let mut o: P = 1 as P;
-            let hr = call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &iid, CLSCTX_ALL, std::ptr::null_mut(), &mut o);
-            assert_eq!(hr, E_NOINTERFACE, "{iid:?}");
-            assert!(o.is_null());
-        }
+        // IAudioEndpointVolume activates cleanly and supports scalar/dB/channel/mute/step queries.
+        let mut epv: P = std::ptr::null_mut();
+        assert_eq!(
+            call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &IID_IAudioEndpointVolume, CLSCTX_ALL, std::ptr::null_mut(), &mut epv),
+            S_OK
+        );
+        assert!(!epv.is_null());
+        let mut epv_ch = 0u32;
+        assert_eq!(call!(epv, 5, (*mut u32) -> HRESULT; &mut epv_ch), S_OK);
+        assert_eq!(epv_ch, 2);
+        assert_eq!(call_bridge_f32_guid(epv, 7, 0.5f32, std::ptr::null()), S_OK);
+        let mut epv_scalar = 0.0f32;
+        assert_eq!(call!(epv, 9, (*mut f32) -> HRESULT; &mut epv_scalar), S_OK);
+        assert!((epv_scalar - 0.5).abs() < 1e-4);
+        assert_eq!(call!(epv, 14, (BOOL, *const GUID) -> HRESULT; TRUE, std::ptr::null()), S_OK);
+        let mut epv_mute: BOOL = FALSE;
+        assert_eq!(call!(epv, 15, (*mut BOOL) -> HRESULT; &mut epv_mute), S_OK);
+        assert_eq!(epv_mute, TRUE);
+        let mut min_db = 0.0f32;
+        let mut max_db = 0.0f32;
+        let mut inc_db = 0.0f32;
+        assert_eq!(call!(epv, 20, (*mut f32, *mut f32, *mut f32) -> HRESULT; &mut min_db, &mut max_db, &mut inc_db), S_OK);
+        assert!(min_db < max_db && inc_db > 0.0);
+        assert_eq!(release(epv), 0);
+
+        // Unknown IIDs return standard COM E_NOINTERFACE.
+        let unknown_iid = GUID::new(0x1111_2222, 0x3333, 0x4444, [0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC]);
+        let mut o: P = 1 as P;
+        let hr = call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &unknown_iid, CLSCTX_ALL, std::ptr::null_mut(), &mut o);
+        assert_eq!(hr, E_NOINTERFACE);
+        assert!(o.is_null());
 
         release(d);
         release(d1);
@@ -1773,6 +1823,171 @@ fn spatial_audio_render_stream_end_to_end_and_lifecycle() {
         crate::kernel32::threads::CloseHandle(ev);
         assert_eq!(release(fe), 0);
         assert_eq!(release(sac), 0);
+        assert_eq!(release(d), 0);
+        assert_eq!(release(e), 0);
+    }
+}
+
+#[test]
+fn wasapi_services_buffer_limits_and_loopback_capture() {
+    let _f = Fixture::null();
+    unsafe {
+        let e = enumerator();
+        let d = default_device(e);
+
+        // 1. IAudioClient2::GetBufferSizeLimits validates format & returns shared-mode bounds.
+        let render_c = activate_client(d);
+        let mut mix: *mut WAVEFORMATEX = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_MIXFMT, (*mut *mut WAVEFORMATEX) -> HRESULT; &mut mix), S_OK);
+        let mut min_hns = 0i64;
+        let mut max_hns = 0i64;
+        assert_eq!(
+            call!(render_c, 17, (*const WAVEFORMATEX, BOOL, *mut i64, *mut i64) -> HRESULT; mix, FALSE, &mut min_hns, &mut max_hns),
+            S_OK
+        );
+        assert_eq!(min_hns, super::audioclient::DEFAULT_PERIOD_HNS);
+        assert_eq!(max_hns, super::audioclient::MAX_BUFFER_DURATION_HNS);
+        assert_eq!(
+            call!(render_c, 17, (*const WAVEFORMATEX, BOOL, *mut i64, *mut i64) -> HRESULT; mix, TRUE, &mut min_hns, &mut max_hns),
+            S_OK
+        );
+        assert_eq!(min_hns, super::audioclient::MIN_PERIOD_HNS);
+        assert_eq!(
+            call!(render_c, 17, (*const WAVEFORMATEX, BOOL, *mut i64, *mut i64) -> HRESULT; std::ptr::null(), FALSE, &mut min_hns, &mut max_hns),
+            E_POINTER
+        );
+
+        // 2. Initialize render stream and verify GetService for ISimpleAudioVolume, IAudioStreamVolume,
+        //    IAudioSessionControl2, IAudioClock2, plus unknown IID -> E_NOINTERFACE.
+        assert_eq!(
+            call!(render_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 200_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut rc: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioRenderClient, &mut rc), S_OK);
+
+        let mut sv: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_ISimpleAudioVolume, &mut sv), S_OK);
+        assert_eq!(call_bridge_f32_guid(sv, 3, 0.5f32, std::ptr::null()), S_OK);
+
+        let mut stv: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioStreamVolume, &mut stv), S_OK);
+        let mut ch_cnt = 0u32;
+        assert_eq!(call!(stv, 3, (*mut u32) -> HRESULT; &mut ch_cnt), S_OK);
+        assert_eq!(ch_cnt, 2);
+        let vols = [1.0f32, 0.5f32];
+        assert_eq!(call!(stv, 6, (u32, *const f32) -> HRESULT; 2, vols.as_ptr()), S_OK);
+        let mut got_vols = [0.0f32; 2];
+        assert_eq!(call!(stv, 7, (u32, *mut f32) -> HRESULT; 2, got_vols.as_mut_ptr()), S_OK);
+        assert_eq!(got_vols, vols);
+
+        let mut sc: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioSessionControl2, &mut sc), S_OK);
+        let mut pid = 0u32;
+        assert_eq!(call!(sc, 14, (*mut u32) -> HRESULT; &mut pid), S_OK);
+        assert_eq!(pid, std::process::id());
+
+        let mut ck2: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioClock2, &mut ck2), S_OK);
+        let mut dpos = 0u64;
+        let mut qpc = 0u64;
+        assert_eq!(call!(ck2, 3, (*mut u64, *mut u64) -> HRESULT; &mut dpos, &mut qpc), S_OK);
+        assert!(qpc > 0);
+
+        let bogus = GUID::new(0xAAAA_BBBB, 0xCCCC, 0xDDDD, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut missing: P = 1 as P;
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &bogus, &mut missing), E_NOINTERFACE);
+        assert!(missing.is_null());
+
+        // 3. Open a loopback capture client on the SAME render endpoint and verify rendered
+        //    audio (with ISimpleAudioVolume=0.5 and IAudioStreamVolume=[1.0, 0.5]) arrives intact.
+        let lb_c = activate_client(d);
+        assert_eq!(
+            call!(lb_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, super::audioclient::AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut cc: P = std::ptr::null_mut();
+        assert_eq!(call!(lb_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioCaptureClient, &mut cc), S_OK);
+        assert_eq!(call!(lb_c, AC_START, () -> HRESULT;), S_OK);
+
+        // Submit 64 frames of (0.8, 0.4) to render client -> effective output should be (0.4, 0.1).
+        let mut rp: *mut u8 = std::ptr::null_mut();
+        assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 64, &mut rp), S_OK);
+        let samples = std::slice::from_raw_parts_mut(rp as *mut f32, 64 * 2);
+        for pair in samples.chunks_exact_mut(2) {
+            pair[0] = 0.8;
+            pair[1] = 0.4;
+        }
+        assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 64, 0), S_OK);
+
+        // Loopback capture client immediately receives the 64 non-silent frames with applied gains!
+        let mut next_pkt = 0u32;
+        assert_eq!(call!(cc, CC_NEXT, (*mut u32) -> HRESULT; &mut next_pkt), S_OK);
+        assert_eq!(next_pkt, 64);
+        let mut cap_ptr: *mut u8 = std::ptr::null_mut();
+        let mut cap_frames = 0u32;
+        let mut cap_flags = 0u32;
+        assert_eq!(
+            call!(cc, CC_GET, (*mut *mut u8, *mut u32, *mut u32, *mut u64, *mut u64) -> HRESULT; &mut cap_ptr, &mut cap_frames, &mut cap_flags, std::ptr::null_mut(), std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(cap_frames, 64);
+        assert_eq!(cap_flags, 0, "live loopback audio must not have SILENT flag");
+        let got_f32 = std::slice::from_raw_parts(cap_ptr as *const f32, 64 * 2);
+        assert!((got_f32[0] - 0.4).abs() < 1e-4, "L={} expected 0.4", got_f32[0]);
+        assert!((got_f32[1] - 0.1).abs() < 1e-4, "R={} expected 0.1", got_f32[1]);
+        assert_eq!(call!(cc, CC_RELEASE, (u32) -> HRESULT; 64), S_OK);
+
+        // Loopback on a capture endpoint still fails with AUDCLNT_E_WRONG_ENDPOINT_TYPE.
+        let mut cap_dev: P = std::ptr::null_mut();
+        assert_eq!(call!(e, EN_DEFAULT, (u32, u32, *mut P) -> HRESULT; E_CAPTURE, E_CONSOLE, &mut cap_dev), S_OK);
+        let cap_c = activate_client(cap_dev);
+        assert_eq!(
+            call!(cap_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, super::audioclient::AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, mix, std::ptr::null()),
+            AUDCLNT_E_WRONG_ENDPOINT_TYPE
+        );
+
+        // 4. Spatial stream GetService supports IAudioClock, IAudioClock2, ISimpleAudioVolume, IAudioStreamVolume, IAudioSessionControl2.
+        let mut sac: P = std::ptr::null_mut();
+        assert_eq!(call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &IID_ISpatialAudioClient, CLSCTX_ALL, std::ptr::null_mut(), &mut sac), S_OK);
+        let ev = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+        let obj_fmt = super::spatial::preferred_object_format();
+        let sp_params = super::spatial::SpatialAudioObjectRenderStreamActivationParams {
+            object_format: &obj_fmt,
+            static_object_type_mask: super::spatial::AudioObjectType_FrontLeft | super::spatial::AudioObjectType_FrontRight,
+            min_dynamic_object_count: 0,
+            max_dynamic_object_count: 2,
+            category: 6,
+            event_handle: ev,
+            notify_object: std::ptr::null_mut(),
+        };
+        let mut pv = [0u8; 24];
+        (pv.as_mut_ptr() as *mut u16).write_unaligned(VT_BLOB);
+        (pv.as_mut_ptr().add(8) as *mut u32).write_unaligned(std::mem::size_of_val(&sp_params) as u32);
+        (pv.as_mut_ptr().add(16) as *mut usize).write_unaligned(&sp_params as *const _ as usize);
+        let mut sp_stream: P = std::ptr::null_mut();
+        assert_eq!(call!(sac, 10, (*const u8, *const GUID, *mut P) -> HRESULT; pv.as_ptr(), &super::spatial::IID_ISpatialAudioObjectRenderStream, &mut sp_stream), S_OK);
+        for iid in [IID_IAudioClock, IID_IAudioClock2, IID_ISimpleAudioVolume, IID_IAudioStreamVolume, IID_IAudioSessionControl2] {
+            let mut s: P = std::ptr::null_mut();
+            assert_eq!(call!(sp_stream, 4, (*const GUID, *mut P) -> HRESULT; &iid, &mut s), S_OK, "spatial GetService({iid:?})");
+            assert!(!s.is_null());
+            assert_eq!(release(s), 0);
+        }
+        assert_eq!(release(sp_stream), 0);
+        crate::kernel32::threads::CloseHandle(ev);
+        assert_eq!(release(sac), 0);
+
+        CoTaskMemFree(mix as P);
+        assert_eq!(release(cap_c), 0);
+        assert_eq!(release(cap_dev), 0);
+        assert_eq!(release(cc), 0);
+        assert_eq!(release(lb_c), 0);
+        assert_eq!(release(ck2), 0);
+        assert_eq!(release(sc), 0);
+        assert_eq!(release(stv), 0);
+        assert_eq!(release(sv), 0);
+        assert_eq!(release(rc), 0);
+        assert_eq!(release(render_c), 0);
         assert_eq!(release(d), 0);
         assert_eq!(release(e), 0);
     }

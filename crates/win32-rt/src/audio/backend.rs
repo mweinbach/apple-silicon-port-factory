@@ -228,6 +228,136 @@ thread_local! {
     static IN_CA_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Query CoreAudio HAL device master scalar volume `[0.0, 1.0]` when using the
+/// CoreAudio backend on macOS (returns `None` on null/virtual/iOS devices).
+pub fn device_volume_scalar(dev: &DeviceInfo, is_capture: bool) -> Option<f32> {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_volume_scalar(id, is_capture))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = is_capture;
+        None
+    }
+}
+
+pub fn set_device_volume_scalar(dev: &DeviceInfo, is_capture: bool, scalar: f32) -> bool {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::set_device_volume_scalar(id, is_capture, scalar))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, scalar);
+        false
+    }
+}
+
+pub fn device_mute(dev: &DeviceInfo, is_capture: bool) -> Option<bool> {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_mute(id, is_capture))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = is_capture;
+        None
+    }
+}
+
+pub fn set_device_mute(dev: &DeviceInfo, is_capture: bool, mute: bool) -> bool {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::set_device_mute(id, is_capture, mute))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, mute);
+        false
+    }
+}
+
+pub fn device_volume_range_db(dev: &DeviceInfo, is_capture: bool) -> Option<(f32, f32)> {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_volume_range_db(id, is_capture))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = is_capture;
+        None
+    }
+}
+
+/// Optional live macOS 14.2+ CoreAudio Process Tap for system loopback capture.
+pub struct LoopbackTap {
+    #[cfg(target_os = "macos")]
+    tap: Option<ca::ProcessTap>,
+}
+
+impl LoopbackTap {
+    /// Attempt to open a macOS 14.2+ CoreAudio process tap feeding `ring`.
+    /// Returns `None` when headless, on the Null backend, on iOS, on macOS < 14.2,
+    /// or when audio-capture TCC permission is not granted (caller falls back to
+    /// in-process WASAPI render loopback).
+    pub fn try_open(dev: &DeviceInfo, ring: Arc<Ring>) -> Option<Self> {
+        let headless = std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
+            || std::env::var("AW2_HEADLESS").is_ok_and(|v| v == "1");
+        if headless || dev.id == 0 || backend() != Backend::CoreAudio {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let uid = dev.uid.clone();
+            match ca_sync(move || ca::ProcessTap::open(ring, Some(&uid))) {
+                Ok(tap) => {
+                    log::info!(target: "audio", "CoreAudio ProcessTap opened for loopback capture on '{}'", dev.name);
+                    Some(Self { tap: Some(tap) })
+                }
+                Err(e) => {
+                    log::debug!(target: "audio", "CoreAudio ProcessTap unavailable ({e}); using in-process WASAPI render loopback");
+                    None
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = ring;
+            None
+        }
+    }
+}
+
+impl Drop for LoopbackTap {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(t) = self.tap.take() {
+            ca_sync(move || drop(t));
+        }
+    }
+}
+
 /// Run `f` on the dedicated host thread that owns all CoreAudio calls and wait
 /// for its result. If already running on the CoreAudio control thread, runs
 /// inline to prevent self-deadlock.
@@ -596,6 +726,10 @@ mod ca {
     const kAudioDevicePropertyTransportType: u32 = fourcc(b"tran");
     const kAudioDeviceTransportTypeBluetooth: u32 = fourcc(b"blue");
     const kIOAudioOutputPortSubTypeHeadphones: u32 = fourcc(b"hdpn");
+    const kAudioHardwareServiceDeviceProperty_VirtualMainVolume: u32 = fourcc(b"vmvc");
+    const kAudioDevicePropertyVolumeScalar: u32 = fourcc(b"volm");
+    const kAudioDevicePropertyMute: u32 = fourcc(b"mute");
+    const kAudioDevicePropertyVolumeRangeDecibels: u32 = fourcc(b"vdb#");
 
     const kAudioUnitType_Output: u32 = fourcc(b"auou");
     const kAudioUnitSubType_HALOutput: u32 = fourcc(b"ahal");
@@ -932,6 +1066,270 @@ mod ca {
     pub fn set_default_output(id: AudioObjectID) -> Result<(), String> {
         let a = addr(kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal);
         check(unsafe { AudioObjectSetPropertyData(kAudioObjectSystemObject, &a, 0, std::ptr::null(), 4, &id as *const u32 as *const c_void) }, "set DefaultOutputDevice")
+    }
+
+    /// Query CoreAudio HAL device master scalar volume `[0.0, 1.0]`.
+    pub fn device_volume_scalar(id: AudioObjectID, is_capture: bool) -> Option<f32> {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        unsafe {
+            get::<f32>(id, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope)
+                .or_else(|| get::<f32>(id, kAudioDevicePropertyVolumeScalar, scope))
+                .map(|v| v.clamp(0.0, 1.0))
+        }
+    }
+
+    /// Set CoreAudio HAL device master scalar volume `[0.0, 1.0]`.
+    pub fn set_device_volume_scalar(id: AudioObjectID, is_capture: bool, scalar: f32) -> bool {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        let v = scalar.clamp(0.0, 1.0);
+        unsafe {
+            let a_vm = addr(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope);
+            if AudioObjectSetPropertyData(id, &a_vm, 0, std::ptr::null(), 4, &v as *const f32 as *const c_void) == 0 {
+                return true;
+            }
+            let a_vs = addr(kAudioDevicePropertyVolumeScalar, scope);
+            AudioObjectSetPropertyData(id, &a_vs, 0, std::ptr::null(), 4, &v as *const f32 as *const c_void) == 0
+        }
+    }
+
+    /// Query CoreAudio HAL device mute flag.
+    pub fn device_mute(id: AudioObjectID, is_capture: bool) -> Option<bool> {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        unsafe { get::<u32>(id, kAudioDevicePropertyMute, scope).map(|m| m != 0) }
+    }
+
+    /// Set CoreAudio HAL device mute flag.
+    pub fn set_device_mute(id: AudioObjectID, is_capture: bool, mute: bool) -> bool {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        let m: u32 = u32::from(mute);
+        let a = addr(kAudioDevicePropertyMute, scope);
+        unsafe { AudioObjectSetPropertyData(id, &a, 0, std::ptr::null(), 4, &m as *const u32 as *const c_void) == 0 }
+    }
+
+    /// Query CoreAudio HAL device decibel range `(min_db, max_db)`.
+    pub fn device_volume_range_db(id: AudioObjectID, is_capture: bool) -> Option<(f32, f32)> {
+        #[repr(C)]
+        #[derive(Default)]
+        struct AudioValueRange {
+            min: f64,
+            max: f64,
+        }
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        unsafe {
+            let r = get::<AudioValueRange>(id, kAudioDevicePropertyVolumeRangeDecibels, scope)?;
+            if r.min.is_finite() && r.max.is_finite() && r.max > r.min {
+                Some((r.min as f32, r.max as f32))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// macOS 14.2+ CoreAudio Process Tap (`AudioHardwareCreateProcessTap` + private
+    /// aggregate device + IOProc) for system/endpoint loopback capture.
+    /// Dynamically resolved via `dlsym` so older macOS versions degrade cleanly.
+    pub struct ProcessTap {
+        tap_id: AudioObjectID,
+        agg_id: AudioObjectID,
+        io_proc_id: *mut c_void,
+        _ring: Arc<Ring>,
+        destroy_tap_fn: unsafe extern "C" fn(AudioObjectID) -> OSStatus,
+        destroy_agg_fn: unsafe extern "C" fn(AudioObjectID) -> OSStatus,
+        stop_fn: unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus,
+        destroy_ioproc_fn: unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus,
+    }
+    unsafe impl Send for ProcessTap {}
+
+    impl ProcessTap {
+        pub fn open(ring: Arc<Ring>, device_uid: Option<&str>) -> Result<Self, String> {
+            use objc2::msg_send;
+            use objc2::runtime::{AnyClass, AnyObject};
+            use objc2_foundation::{NSArray, NSString};
+
+            type CreateTapFn = unsafe extern "C" fn(*const AnyObject, *mut AudioObjectID) -> OSStatus;
+            type DestroyTapFn = unsafe extern "C" fn(AudioObjectID) -> OSStatus;
+            type CreateAggFn = unsafe extern "C" fn(*const c_void, *mut AudioObjectID) -> OSStatus;
+            type DestroyAggFn = unsafe extern "C" fn(AudioObjectID) -> OSStatus;
+            type IOProc = unsafe extern "C" fn(
+                AudioObjectID,
+                *const c_void,
+                *const AudioBufferList,
+                *const c_void,
+                *mut AudioBufferList,
+                *const c_void,
+                *mut c_void,
+            ) -> OSStatus;
+            type CreateIOProcFn = unsafe extern "C" fn(AudioObjectID, IOProc, *mut c_void, *mut *mut c_void) -> OSStatus;
+            type DestroyIOProcFn = unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus;
+            type StartStopFn = unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus;
+
+            unsafe extern "C" fn tap_ioproc(
+                _dev: AudioObjectID,
+                _now: *const c_void,
+                in_data: *const AudioBufferList,
+                _in_time: *const c_void,
+                _out_data: *mut AudioBufferList,
+                _out_time: *const c_void,
+                client_data: *mut c_void,
+            ) -> OSStatus {
+                if in_data.is_null() || client_data.is_null() {
+                    return 0;
+                }
+                let ring = &*(client_data as *const Ring);
+                let nbufs = (*in_data).mNumberBuffers as usize;
+                if nbufs == 0 {
+                    return 0;
+                }
+                let b0 = &(*in_data).mBuffers[0];
+                if !b0.mData.is_null() && b0.mDataByteSize >= 4 {
+                    let samples = std::slice::from_raw_parts(
+                        b0.mData as *const f32,
+                        (b0.mDataByteSize / 4) as usize,
+                    );
+                    ring.push(samples);
+                }
+                0
+            }
+
+            unsafe {
+                let sym = |name: &std::ffi::CStr| -> Result<*mut c_void, String> {
+                    let p = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
+                    if p.is_null() {
+                        Err(format!("CoreAudio symbol {:?} unavailable", name))
+                    } else {
+                        Ok(p)
+                    }
+                };
+                let create_tap: CreateTapFn = std::mem::transmute(sym(c"AudioHardwareCreateProcessTap")?);
+                let destroy_tap: DestroyTapFn = std::mem::transmute(sym(c"AudioHardwareDestroyProcessTap")?);
+                let create_agg: CreateAggFn = std::mem::transmute(sym(c"AudioHardwareCreateAggregateDevice")?);
+                let destroy_agg: DestroyAggFn = std::mem::transmute(sym(c"AudioHardwareDestroyAggregateDevice")?);
+                let create_ioproc: CreateIOProcFn = std::mem::transmute(sym(c"AudioDeviceCreateIOProcID")?);
+                let destroy_ioproc: DestroyIOProcFn = std::mem::transmute(sym(c"AudioDeviceDestroyIOProcID")?);
+                let start_dev: StartStopFn = std::mem::transmute(sym(c"AudioDeviceStart")?);
+                let stop_dev: StartStopFn = std::mem::transmute(sym(c"AudioDeviceStop")?);
+
+                let Some(cls) = AnyClass::get(c"CATapDescription") else {
+                    return Err("CATapDescription class unavailable (requires macOS 14.2+)".into());
+                };
+                let alloc_obj: *mut AnyObject = msg_send![cls, alloc];
+                let empty_arr = NSArray::<AnyObject>::new();
+                let tap_desc: *mut AnyObject = msg_send![alloc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_arr];
+                if tap_desc.is_null() {
+                    return Err("CATapDescription init returned null".into());
+                }
+                let tap_uuid: *mut AnyObject = msg_send![tap_desc, UUID];
+                let tap_uid_ns: *mut NSString = msg_send![tap_uuid, UUIDString];
+                let tap_uid = if !tap_uid_ns.is_null() {
+                    (*tap_uid_ns).to_string()
+                } else {
+                    String::new()
+                };
+
+                let mut tap_id: AudioObjectID = 0;
+                let st = create_tap(tap_desc, &mut tap_id);
+                let _: () = msg_send![tap_desc, release];
+                check(st, "AudioHardwareCreateProcessTap")?;
+                if tap_uid.is_empty() {
+                    let _ = destroy_tap(tap_id);
+                    return Err("CATapDescription UUID empty".into());
+                }
+
+                // Create a private aggregate device hosting the process tap.
+                #[link(name = "CoreFoundation", kind = "framework")]
+                extern "C" {
+                    static kCFTypeDictionaryKeyCallBacks: u8;
+                    static kCFTypeDictionaryValueCallBacks: u8;
+                    static kCFTypeArrayCallBacks: u8;
+                    fn CFStringCreateWithCString(alloc: *const c_void, s: *const std::ffi::c_char, enc: u32) -> CFStringRef;
+                    fn CFNumberCreate(alloc: *const c_void, ty: isize, v: *const c_void) -> *const c_void;
+                    fn CFDictionaryCreate(alloc: *const c_void, k: *const *const c_void, v: *const *const c_void, n: isize, kcb: *const u8, vcb: *const u8) -> *const c_void;
+                    fn CFArrayCreate(alloc: *const c_void, v: *const *const c_void, n: isize, cb: *const u8) -> *const c_void;
+                }
+                let cfstr = |s: &str| -> CFStringRef {
+                    let c = std::ffi::CString::new(s).unwrap();
+                    CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), kCFStringEncodingUTF8)
+                };
+                let make_dict = |kv: &[(&str, *const c_void)]| -> *const c_void {
+                    let k: Vec<*const c_void> = kv.iter().map(|(k, _)| cfstr(k)).collect();
+                    let v: Vec<*const c_void> = kv.iter().map(|(_, v)| *v).collect();
+                    let d = CFDictionaryCreate(
+                        std::ptr::null(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        kv.len() as isize,
+                        &kCFTypeDictionaryKeyCallBacks,
+                        &kCFTypeDictionaryValueCallBacks,
+                    );
+                    for p in k.into_iter().chain(v) {
+                        CFRelease(p);
+                    }
+                    d
+                };
+
+                let one = 1i32;
+                let tap_entry = make_dict(&[("uid", cfstr(&tap_uid))]);
+                let tap_list = CFArrayCreate(std::ptr::null(), &tap_entry, 1, &kCFTypeArrayCallBacks);
+                CFRelease(tap_entry);
+                let agg_uid = format!("port-factory-tap-{}-{}", std::process::id(), tap_id);
+                let mut kvs: Vec<(&str, *const c_void)> = vec![
+                    ("uid", cfstr(&agg_uid)),
+                    ("name", cfstr("Port Factory Loopback Tap")),
+                    ("private", CFNumberCreate(std::ptr::null(), 3, &one as *const i32 as *const c_void)),
+                    ("tapautostart", CFNumberCreate(std::ptr::null(), 3, &one as *const i32 as *const c_void)),
+                    ("taps", tap_list),
+                ];
+                if let Some(uid) = device_uid {
+                    if !uid.is_empty() && uid != "aw2-null" {
+                        kvs.push(("master", cfstr(uid)));
+                    }
+                }
+                let desc = make_dict(&kvs);
+                let mut agg_id: AudioObjectID = 0;
+                let st2 = create_agg(desc, &mut agg_id);
+                CFRelease(desc);
+                if st2 != 0 {
+                    let _ = destroy_tap(tap_id);
+                    return Err(format!("AudioHardwareCreateAggregateDevice for tap failed: {st2}"));
+                }
+
+                let mut io_proc_id: *mut c_void = std::ptr::null_mut();
+                let st3 = create_ioproc(agg_id, tap_ioproc, Arc::as_ptr(&ring) as *mut c_void, &mut io_proc_id);
+                if st3 != 0 {
+                    let _ = destroy_agg(agg_id);
+                    let _ = destroy_tap(tap_id);
+                    return Err(format!("AudioDeviceCreateIOProcID failed: {st3}"));
+                }
+                let st4 = start_dev(agg_id, io_proc_id);
+                if st4 != 0 {
+                    let _ = destroy_ioproc(agg_id, io_proc_id);
+                    let _ = destroy_agg(agg_id);
+                    let _ = destroy_tap(tap_id);
+                    return Err(format!("AudioDeviceStart(tap) failed: {st4}"));
+                }
+                Ok(Self {
+                    tap_id,
+                    agg_id,
+                    io_proc_id,
+                    _ring: ring,
+                    destroy_tap_fn: destroy_tap,
+                    destroy_agg_fn: destroy_agg,
+                    stop_fn: stop_dev,
+                    destroy_ioproc_fn: destroy_ioproc,
+                })
+            }
+        }
+    }
+
+    impl Drop for ProcessTap {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = (self.stop_fn)(self.agg_id, self.io_proc_id);
+                let _ = (self.destroy_ioproc_fn)(self.agg_id, self.io_proc_id);
+                let _ = (self.destroy_agg_fn)(self.agg_id);
+                let _ = (self.destroy_tap_fn)(self.tap_id);
+            }
+        }
     }
 
     /// Process-private aggregate devices (tests: a hot-pluggable device that

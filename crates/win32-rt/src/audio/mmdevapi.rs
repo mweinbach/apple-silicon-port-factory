@@ -584,12 +584,14 @@ mod device {
             log::debug!(target: "audio", "IMMDevice::Activate(ISpatialAudioClient, ctx {ctx:#x}) on '{}'", ep.info.name);
             return super::super::spatial::create_spatial_audio_client(ep, out);
         }
-        let what = if iid == IID_IAudioEndpointVolume {
-            "IAudioEndpointVolume"
-        } else {
-            "unknown interface"
-        };
-        stub!("IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE");
+        if iid == IID_IAudioEndpointVolume {
+            log::debug!(target: "audio", "IMMDevice::Activate(IAudioEndpointVolume, ctx {ctx:#x}) on '{}'", ep.info.name);
+            std::ptr::write_unaligned(out, super::new_endpoint_volume(ep) as *mut c_void);
+            return S_OK;
+        }
+        // Standard COM behavior: IMMDevice::Activate returns E_NOINTERFACE for
+        // interfaces not supported by this endpoint (Microsoft Learn: IMMDevice::Activate).
+        crate::com::warn_qi_failed_once("IMMDevice::Activate", &crate::com::Guid::from_win_guid(iid));
         E_NOINTERFACE
     }
 
@@ -664,8 +666,8 @@ static ENDPOINT_VTBL: IMMEndpointVtbl = IMMEndpointVtbl {
 // IAudioSessionManager / IAudioSessionManager2 + IAudioSessionControl2 + ISimpleAudioVolume
 // ---------------------------------------------------------------------------
 
-struct SessionState {
-    ep: Arc<Endpoint>,
+pub(super) struct SessionState {
+    pub(super) ep: Arc<Endpoint>,
     volume_bits: AtomicU32, // f32::to_bits (default 1.0)
     muted: std::sync::atomic::AtomicBool,
     display_name: Mutex<String>,
@@ -674,7 +676,7 @@ struct SessionState {
 }
 
 impl SessionState {
-    fn new(ep: Arc<Endpoint>) -> Arc<Self> {
+    pub(super) fn new(ep: Arc<Endpoint>) -> Arc<Self> {
         Arc::new(Self {
             ep,
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
@@ -684,6 +686,23 @@ impl SessionState {
             grouping: Mutex::new(GUID::new(0, 0, 0, [0; 8])),
         })
     }
+
+    #[inline]
+    pub(super) fn effective_gain(&self) -> f32 {
+        if self.muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(self.volume_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+        }
+    }
+}
+
+pub(super) fn new_session_control(st: Arc<SessionState>) -> *mut c_void {
+    SessionControlObj::create(&SESSION_CTRL_VTBL, st) as *mut c_void
+}
+
+pub(super) fn new_simple_audio_volume(st: Arc<SessionState>) -> *mut c_void {
+    SimpleVolumeObj::create(simple_vol::vtbl(), st) as *mut c_void
 }
 
 #[repr(C)]
@@ -730,7 +749,7 @@ mod session_mgr {
             return E_POINTER;
         }
         let st = SessionManagerObj::inner(this).clone();
-        std::ptr::write_unaligned(out, SimpleVolumeObj::create(&SIMPLE_VOL_VTBL, st) as *mut c_void);
+        std::ptr::write_unaligned(out, super::new_simple_audio_volume(st));
         S_OK
     }
 
@@ -883,15 +902,7 @@ static SESSION_CTRL_VTBL: IAudioSessionControl2Vtbl = IAudioSessionControl2Vtbl 
 };
 
 #[repr(C)]
-struct ISimpleAudioVolumeVtbl {
-    qi: unsafe extern "win64" fn(*mut SimpleVolumeObj, *const GUID, *mut *mut c_void) -> HRESULT,
-    add_ref: unsafe extern "win64" fn(*mut SimpleVolumeObj) -> u32,
-    release: unsafe extern "win64" fn(*mut SimpleVolumeObj) -> u32,
-    set_master_volume: unsafe extern "win64" fn(*mut SimpleVolumeObj, f32, *const GUID) -> HRESULT,
-    get_master_volume: unsafe extern "win64" fn(*mut SimpleVolumeObj, *mut f32) -> HRESULT,
-    set_mute: unsafe extern "win64" fn(*mut SimpleVolumeObj, BOOL, *const GUID) -> HRESULT,
-    get_mute: unsafe extern "win64" fn(*mut SimpleVolumeObj, *mut BOOL) -> HRESULT,
-}
+struct ISimpleAudioVolumeVtbl([usize; 7]);
 
 type SimpleVolumeObj = ComObj<ISimpleAudioVolumeVtbl, Arc<SessionState>>;
 
@@ -900,12 +911,14 @@ mod simple_vol {
     com_iunknown!(SimpleVolumeObj, [IID_ISimpleAudioVolume]);
 
     pub unsafe extern "win64" fn set_master_volume(this: *mut SimpleVolumeObj, level: f32, _ctx: *const GUID) -> HRESULT {
-        if !(0.0..=1.0).contains(&level) {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
             return E_INVALIDARG;
         }
         SimpleVolumeObj::inner(this).volume_bits.store(level.to_bits(), Ordering::Relaxed);
         S_OK
     }
+    crate::win64_bridge!(fn set_master_volume(*mut SimpleVolumeObj, f32, *const GUID) -> HRESULT);
+
     pub unsafe extern "win64" fn get_master_volume(this: *mut SimpleVolumeObj, out: *mut f32) -> HRESULT {
         let v = f32::from_bits(SimpleVolumeObj::inner(this).volume_bits.load(Ordering::Relaxed));
         write_out(out, v)
@@ -918,17 +931,323 @@ mod simple_vol {
         let m = SimpleVolumeObj::inner(this).muted.load(Ordering::Relaxed);
         write_out(out, if m { TRUE } else { FALSE })
     }
+
+    pub fn vtbl() -> &'static ISimpleAudioVolumeVtbl {
+        static V: std::sync::OnceLock<ISimpleAudioVolumeVtbl> = std::sync::OnceLock::new();
+        V.get_or_init(|| {
+            let slots = [
+                qi as *const () as usize,
+                add_ref as *const () as usize,
+                release as *const () as usize,
+                crate::bridge_entry!(set_master_volume) as usize,
+                get_master_volume as *const () as usize,
+                set_mute as *const () as usize,
+                get_mute as *const () as usize,
+            ];
+            for &a in &slots {
+                crate::register_native_va(a as u64, a);
+            }
+            ISimpleAudioVolumeVtbl(slots)
+        })
+    }
 }
 
-static SIMPLE_VOL_VTBL: ISimpleAudioVolumeVtbl = ISimpleAudioVolumeVtbl {
-    qi: simple_vol::qi,
-    add_ref: simple_vol::add_ref,
-    release: simple_vol::release,
-    set_master_volume: simple_vol::set_master_volume,
-    get_master_volume: simple_vol::get_master_volume,
-    set_mute: simple_vol::set_mute,
-    get_mute: simple_vol::get_mute,
-};
+// ---------------------------------------------------------------------------
+// IAudioEndpointVolume (backed by CoreAudio HAL volume/mute on macOS)
+// ---------------------------------------------------------------------------
+
+const ENDPOINT_HARDWARE_SUPPORT_VOLUME: u32 = 0x1;
+const ENDPOINT_HARDWARE_SUPPORT_MUTE: u32 = 0x2;
+const ENDPOINT_VOLUME_STEPS: u32 = 64;
+const DEFAULT_MIN_DB: f32 = -65.25;
+const DEFAULT_MAX_DB: f32 = 0.0;
+const DEFAULT_STEP_DB: f32 = 0.5;
+
+struct EndpointVolumeState {
+    ep: Arc<Endpoint>,
+    min_db: f32,
+    max_db: f32,
+    master_scalar: AtomicU32, // f32 bits
+    channels: Mutex<Vec<f32>>,
+    muted: std::sync::atomic::AtomicBool,
+    callbacks: Mutex<Vec<usize>>,
+}
+
+impl EndpointVolumeState {
+    fn new(ep: Arc<Endpoint>) -> Arc<Self> {
+        let is_cap = ep.is_capture();
+        let (min_db, max_db) =
+            backend::device_volume_range_db(&ep.info, is_cap).unwrap_or((DEFAULT_MIN_DB, DEFAULT_MAX_DB));
+        let master = backend::device_volume_scalar(&ep.info, is_cap).unwrap_or(1.0);
+        let muted = backend::device_mute(&ep.info, is_cap).unwrap_or(false);
+        let ch = ep.mix_format().channels.max(1) as usize;
+        Arc::new(Self {
+            ep,
+            min_db,
+            max_db,
+            master_scalar: AtomicU32::new(master.to_bits()),
+            channels: Mutex::new(vec![master; ch]),
+            muted: std::sync::atomic::AtomicBool::new(muted),
+            callbacks: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn scalar_to_db(&self, scalar: f32) -> f32 {
+        let s = scalar.clamp(0.0, 1.0);
+        self.min_db + s * (self.max_db - self.min_db)
+    }
+
+    fn db_to_scalar(&self, db: f32) -> f32 {
+        let span = (self.max_db - self.min_db).max(1e-3);
+        ((db - self.min_db) / span).clamp(0.0, 1.0)
+    }
+
+    fn current_master_scalar(&self) -> f32 {
+        if let Some(v) = backend::device_volume_scalar(&self.ep.info, self.ep.is_capture()) {
+            self.master_scalar.store(v.to_bits(), Ordering::Relaxed);
+            v
+        } else {
+            f32::from_bits(self.master_scalar.load(Ordering::Relaxed))
+        }
+    }
+
+    fn set_master_scalar(&self, scalar: f32) {
+        let s = scalar.clamp(0.0, 1.0);
+        self.master_scalar.store(s.to_bits(), Ordering::Relaxed);
+        let _ = backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s);
+        for c in self.channels.lock().unwrap().iter_mut() {
+            *c = s;
+        }
+    }
+
+    fn current_mute(&self) -> bool {
+        if let Some(m) = backend::device_mute(&self.ep.info, self.ep.is_capture()) {
+            self.muted.store(m, Ordering::Relaxed);
+            m
+        } else {
+            self.muted.load(Ordering::Relaxed)
+        }
+    }
+
+    fn set_mute(&self, mute: bool) {
+        self.muted.store(mute, Ordering::Relaxed);
+        let _ = backend::set_device_mute(&self.ep.info, self.ep.is_capture(), mute);
+    }
+}
+
+#[repr(C)]
+struct IAudioEndpointVolumeVtbl([usize; 21]);
+
+type EndpointVolumeObj = ComObj<IAudioEndpointVolumeVtbl, Arc<EndpointVolumeState>>;
+
+fn new_endpoint_volume(ep: Arc<Endpoint>) -> *mut EndpointVolumeObj {
+    EndpointVolumeObj::create(endpoint_vol::vtbl(), EndpointVolumeState::new(ep))
+}
+
+mod endpoint_vol {
+    use super::*;
+    com_iunknown!(EndpointVolumeObj, [IID_IAudioEndpointVolume]);
+
+    pub unsafe extern "win64" fn register_notify(this: *mut EndpointVolumeObj, cb: *mut c_void) -> HRESULT {
+        if cb.is_null() {
+            return E_POINTER;
+        }
+        let mut cbs = EndpointVolumeObj::inner(this).callbacks.lock().unwrap();
+        let p = cb as usize;
+        if !cbs.contains(&p) {
+            cbs.push(p);
+        }
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn unregister_notify(this: *mut EndpointVolumeObj, cb: *mut c_void) -> HRESULT {
+        if cb.is_null() {
+            return E_POINTER;
+        }
+        let mut cbs = EndpointVolumeObj::inner(this).callbacks.lock().unwrap();
+        let before = cbs.len();
+        cbs.retain(|&p| p != cb as usize);
+        if cbs.len() == before { E_NOTFOUND } else { S_OK }
+    }
+
+    pub unsafe extern "win64" fn get_channel_count(this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {
+        let n = EndpointVolumeObj::inner(this).channels.lock().unwrap().len() as u32;
+        write_out(out, n)
+    }
+
+    pub unsafe extern "win64" fn set_master_volume_db(this: *mut EndpointVolumeObj, db: f32, _ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        if !db.is_finite() || db < st.min_db - 1e-3 || db > st.max_db + 1e-3 {
+            return E_INVALIDARG;
+        }
+        st.set_master_scalar(st.db_to_scalar(db));
+        S_OK
+    }
+    crate::win64_bridge!(fn set_master_volume_db(*mut EndpointVolumeObj, f32, *const GUID) -> HRESULT);
+
+    pub unsafe extern "win64" fn set_master_volume_scalar(this: *mut EndpointVolumeObj, level: f32, _ctx: *const GUID) -> HRESULT {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+            return E_INVALIDARG;
+        }
+        EndpointVolumeObj::inner(this).set_master_scalar(level);
+        S_OK
+    }
+    crate::win64_bridge!(fn set_master_volume_scalar(*mut EndpointVolumeObj, f32, *const GUID) -> HRESULT);
+
+    pub unsafe extern "win64" fn get_master_volume_db(this: *mut EndpointVolumeObj, out: *mut f32) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        write_out(out, st.scalar_to_db(st.current_master_scalar()))
+    }
+
+    pub unsafe extern "win64" fn get_master_volume_scalar(this: *mut EndpointVolumeObj, out: *mut f32) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        write_out(out, st.current_master_scalar())
+    }
+
+    pub unsafe extern "win64" fn set_channel_volume_db(this: *mut EndpointVolumeObj, ch: u32, db: f32, _ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        if !db.is_finite() || db < st.min_db - 1e-3 || db > st.max_db + 1e-3 {
+            return E_INVALIDARG;
+        }
+        let mut chs = st.channels.lock().unwrap();
+        let Some(slot) = chs.get_mut(ch as usize) else {
+            return E_INVALIDARG;
+        };
+        *slot = st.db_to_scalar(db);
+        S_OK
+    }
+    crate::win64_bridge!(fn set_channel_volume_db(*mut EndpointVolumeObj, u32, f32, *const GUID) -> HRESULT);
+
+    pub unsafe extern "win64" fn set_channel_volume_scalar(this: *mut EndpointVolumeObj, ch: u32, level: f32, _ctx: *const GUID) -> HRESULT {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+            return E_INVALIDARG;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        let mut chs = st.channels.lock().unwrap();
+        let Some(slot) = chs.get_mut(ch as usize) else {
+            return E_INVALIDARG;
+        };
+        *slot = level;
+        S_OK
+    }
+    crate::win64_bridge!(fn set_channel_volume_scalar(*mut EndpointVolumeObj, u32, f32, *const GUID) -> HRESULT);
+
+    pub unsafe extern "win64" fn get_channel_volume_db(this: *mut EndpointVolumeObj, ch: u32, out: *mut f32) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        let chs = st.channels.lock().unwrap();
+        let Some(&s) = chs.get(ch as usize) else {
+            return E_INVALIDARG;
+        };
+        write_out(out, st.scalar_to_db(s))
+    }
+
+    pub unsafe extern "win64" fn get_channel_volume_scalar(this: *mut EndpointVolumeObj, ch: u32, out: *mut f32) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        let chs = st.channels.lock().unwrap();
+        let Some(&s) = chs.get(ch as usize) else {
+            return E_INVALIDARG;
+        };
+        write_out(out, s)
+    }
+
+    pub unsafe extern "win64" fn set_mute(this: *mut EndpointVolumeObj, mute: BOOL, _ctx: *const GUID) -> HRESULT {
+        EndpointVolumeObj::inner(this).set_mute(mute != 0);
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn get_mute(this: *mut EndpointVolumeObj, out: *mut BOOL) -> HRESULT {
+        let m = EndpointVolumeObj::inner(this).current_mute();
+        write_out(out, if m { TRUE } else { FALSE })
+    }
+
+    pub unsafe extern "win64" fn get_volume_step_info(this: *mut EndpointVolumeObj, step_out: *mut u32, count_out: *mut u32) -> HRESULT {
+        if step_out.is_null() && count_out.is_null() {
+            return E_POINTER;
+        }
+        let s = EndpointVolumeObj::inner(this).current_master_scalar();
+        let step = (s * ENDPOINT_VOLUME_STEPS as f32).round().clamp(0.0, ENDPOINT_VOLUME_STEPS as f32) as u32;
+        if !step_out.is_null() {
+            std::ptr::write_unaligned(step_out, step);
+        }
+        if !count_out.is_null() {
+            std::ptr::write_unaligned(count_out, ENDPOINT_VOLUME_STEPS);
+        }
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn volume_step_up(this: *mut EndpointVolumeObj, _ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        let next = (st.current_master_scalar() + 1.0 / ENDPOINT_VOLUME_STEPS as f32).min(1.0);
+        st.set_master_scalar(next);
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn volume_step_down(this: *mut EndpointVolumeObj, _ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        let next = (st.current_master_scalar() - 1.0 / ENDPOINT_VOLUME_STEPS as f32).max(0.0);
+        st.set_master_scalar(next);
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn query_hardware_support(_this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {
+        write_out(out, ENDPOINT_HARDWARE_SUPPORT_VOLUME | ENDPOINT_HARDWARE_SUPPORT_MUTE)
+    }
+
+    pub unsafe extern "win64" fn get_volume_range(
+        this: *mut EndpointVolumeObj,
+        min_out: *mut f32,
+        max_out: *mut f32,
+        inc_out: *mut f32,
+    ) -> HRESULT {
+        if min_out.is_null() || max_out.is_null() || inc_out.is_null() {
+            return E_POINTER;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        std::ptr::write_unaligned(min_out, st.min_db);
+        std::ptr::write_unaligned(max_out, st.max_db);
+        std::ptr::write_unaligned(inc_out, DEFAULT_STEP_DB);
+        S_OK
+    }
+
+    pub fn vtbl() -> &'static IAudioEndpointVolumeVtbl {
+        static V: std::sync::OnceLock<IAudioEndpointVolumeVtbl> = std::sync::OnceLock::new();
+        V.get_or_init(|| {
+            let slots = [
+                qi as *const () as usize,                                 // 0
+                add_ref as *const () as usize,                            // 1
+                release as *const () as usize,                            // 2
+                register_notify as *const () as usize,                    // 3
+                unregister_notify as *const () as usize,                  // 4
+                get_channel_count as *const () as usize,                  // 5
+                crate::bridge_entry!(set_master_volume_db) as usize,      // 6
+                crate::bridge_entry!(set_master_volume_scalar) as usize,  // 7
+                get_master_volume_db as *const () as usize,               // 8
+                get_master_volume_scalar as *const () as usize,           // 9
+                crate::bridge_entry!(set_channel_volume_db) as usize,     // 10
+                crate::bridge_entry!(set_channel_volume_scalar) as usize, // 11
+                get_channel_volume_db as *const () as usize,              // 12
+                get_channel_volume_scalar as *const () as usize,          // 13
+                set_mute as *const () as usize,                           // 14
+                get_mute as *const () as usize,                           // 15
+                get_volume_step_info as *const () as usize,               // 16
+                volume_step_up as *const () as usize,                     // 17
+                volume_step_down as *const () as usize,                   // 18
+                query_hardware_support as *const () as usize,             // 19
+                get_volume_range as *const () as usize,                   // 20
+            ];
+            for &a in &slots {
+                crate::register_native_va(a as u64, a);
+            }
+            IAudioEndpointVolumeVtbl(slots)
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {

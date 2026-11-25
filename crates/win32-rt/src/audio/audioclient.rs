@@ -22,17 +22,17 @@
 //! the null clock) pulls whatever it needs and signals the client event once
 //! per IO cycle (~one 10 ms period).
 
-use super::backend::{self, OutputStream, StreamShared};
+use super::backend::{self, LoopbackTap, OutputStream, StreamShared};
 use super::com::*;
 use super::format::{apply_matrix, channel_matrix, to_f32, FormatError, SampleType, WaveFormat, WAVEFORMATEX};
-use super::mmdevapi::Endpoint;
+use super::mmdevapi::{new_session_control, new_simple_audio_volume, Endpoint, SessionState};
 use super::ring::Ring;
 use super::tap::{self, Tap};
 use crate::types::*;
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 pub const AUDCLNT_SHAREMODE_SHARED: u32 = 0;
@@ -122,8 +122,131 @@ struct RenderState {
     low_latency: bool,
 }
 
+/// Maximum shared-mode buffer duration advertised by `IAudioClient2::GetBufferSizeLimits` (2 s).
+pub const MAX_BUFFER_DURATION_HNS: i64 = 20_000_000;
+
+/// Per-endpoint in-process render loopback subscriber (for `AUDCLNT_STREAMFLAGS_LOOPBACK`).
+struct LoopbackSub {
+    ring: Arc<Ring>,
+    channels: u16,
+}
+
+static LOOPBACK_SUB_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOOPBACK_BUS: Mutex<Vec<(String, Weak<LoopbackSub>)>> = Mutex::new(Vec::new());
+
+impl Drop for LoopbackSub {
+    fn drop(&mut self) {
+        LOOPBACK_SUB_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn register_loopback_sub(ep_id: &str, cap_frames: usize, channels: u16) -> Arc<LoopbackSub> {
+    let sub = Arc::new(LoopbackSub {
+        ring: Arc::new(Ring::new(cap_frames.max(4096), channels.max(1) as usize)),
+        channels: channels.max(1),
+    });
+    LOOPBACK_SUB_COUNT.fetch_add(1, Ordering::Relaxed);
+    let mut bus = LOOPBACK_BUS.lock().unwrap();
+    bus.retain(|(_, w)| w.strong_count() > 0);
+    bus.push((ep_id.to_string(), Arc::downgrade(&sub)));
+    sub
+}
+
+/// Fast-path render tee: zero lock overhead when no loopback capture client is active.
+pub(super) fn push_loopback_frames(ep_id: &str, samples_f32: &[f32], src_channels: u16) {
+    if LOOPBACK_SUB_COUNT.load(Ordering::Relaxed) == 0 || samples_f32.is_empty() || src_channels == 0 {
+        return;
+    }
+    let subs: Vec<Arc<LoopbackSub>> = {
+        let mut bus = LOOPBACK_BUS.lock().unwrap();
+        bus.retain(|(_, w)| w.strong_count() > 0);
+        bus.iter()
+            .filter(|(id, _)| id == ep_id)
+            .filter_map(|(_, w)| w.upgrade())
+            .collect()
+    };
+    let src_ch = src_channels as usize;
+    let frames = samples_f32.len() / src_ch;
+    for sub in subs {
+        let dst_ch = sub.channels as usize;
+        if dst_ch == src_ch {
+            sub.ring.push(&samples_f32[..frames * src_ch]);
+        } else {
+            let mut conv = vec![0.0f32; frames * dst_ch];
+            for f in 0..frames {
+                for c in 0..dst_ch {
+                    conv[f * dst_ch + c] = if c < src_ch {
+                        samples_f32[f * src_ch + c]
+                    } else if src_ch == 1 {
+                        samples_f32[f]
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            sub.ring.push(&conv);
+        }
+    }
+}
+
+/// Encode interleaved float32 samples into client PCM format bytes.
+fn encode_from_f32(sample: SampleType, src: &[f32], out: &mut Vec<u8>) {
+    out.clear();
+    match sample {
+        SampleType::F32 => {
+            out.reserve(src.len() * 4);
+            for &v in src {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        SampleType::F64 => {
+            out.reserve(src.len() * 8);
+            for &v in src {
+                out.extend_from_slice(&(v as f64).to_le_bytes());
+            }
+        }
+        SampleType::I16 => {
+            out.reserve(src.len() * 2);
+            for &v in src {
+                let s = (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        SampleType::I24 => {
+            out.reserve(src.len() * 3);
+            for &v in src {
+                let s = (v.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
+                let b = s.to_le_bytes();
+                out.extend_from_slice(&b[0..3]);
+            }
+        }
+        SampleType::I32 => {
+            out.reserve(src.len() * 4);
+            for &v in src {
+                let s = (v.clamp(-1.0, 1.0) as f64 * 2_147_483_647.0).round() as i32;
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        SampleType::U8 => {
+            out.reserve(src.len());
+            for &v in src {
+                let s = ((v.clamp(-1.0, 1.0) * 127.5) + 128.0).round().clamp(0.0, 255.0) as u8;
+                out.push(s);
+            }
+        }
+    }
+}
+
+struct LoopbackCapture {
+    sub: Arc<LoopbackSub>,
+    _ca_tap: Option<LoopbackTap>,
+    ca_ring: Option<Arc<Ring>>,
+    scratch_f32: Vec<f32>,
+    packets: VecDeque<(Vec<u8>, u32, bool)>,
+}
+
 struct CaptureState {
-    /// Zero-filled PCM buffer handed out by `IAudioCaptureClient::GetBuffer`.
+    /// Zero-filled or PCM-populated buffer handed out by `IAudioCaptureClient::GetBuffer`.
     staging: Vec<u8>,
     packet_frames: u32,
     queued_packets: VecDeque<u32>,
@@ -131,12 +254,48 @@ struct CaptureState {
     last_tick: Option<Instant>,
     frame_accum: f64,
     device_pos: u64,
+    loopback: Option<LoopbackCapture>,
     _timer: Option<CaptureTimer>,
 }
 
 impl CaptureState {
-    /// Advance wall-clock silent packet arrival up to `Instant::now()`.
-    fn advance(&mut self, rate: u32, buffer_frames: u32) {
+    /// Advance capture arrival up to `Instant::now()`: for loopback streams,
+    /// drains live frames from the CoreAudio Process Tap or in-process render
+    /// loopback bus; for silent capture or idle loopback, paces silent packets.
+    fn advance(&mut self, fmt: &WaveFormat, buffer_frames: u32) {
+        let rate = fmt.rate;
+        let ch = fmt.channels.max(1) as usize;
+        let pkt = self.packet_frames.max(1);
+
+        if let Some(lb) = &mut self.loopback {
+            // Drain live frames from CoreAudio process tap (if active and non-empty)
+            // or from the in-process WASAPI render loopback ring.
+            let pull_ring = lb
+                .ca_ring
+                .as_ref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or(&lb.sub.ring);
+            let avail_frames = pull_ring.len() as u32;
+            if avail_frames > 0 && self.queued_frames < buffer_frames {
+                let take = avail_frames.min(buffer_frames - self.queued_frames);
+                let n_samples = take as usize * ch;
+                lb.scratch_f32.resize(n_samples, 0.0);
+                let got = pull_ring.pop_into(&mut lb.scratch_f32) as u32;
+                if got > 0 {
+                    let used = got as usize * ch;
+                    let silent = lb.scratch_f32[..used].iter().all(|&x| x == 0.0);
+                    let mut encoded = Vec::new();
+                    encode_from_f32(fmt.sample, &lb.scratch_f32[..used], &mut encoded);
+                    lb.packets.push_back((encoded, got, silent));
+                    self.queued_packets.push_back(got);
+                    self.queued_frames += got;
+                    self.last_tick = Some(Instant::now());
+                    self.frame_accum = 0.0;
+                    return;
+                }
+            }
+        }
+
         let Some(prev) = self.last_tick else {
             return;
         };
@@ -144,10 +303,13 @@ impl CaptureState {
         let dt = now.saturating_duration_since(prev).as_secs_f64();
         self.last_tick = Some(now);
         self.frame_accum += dt * rate as f64;
-        let pkt = self.packet_frames.max(1);
         while self.frame_accum >= pkt as f64 {
             self.frame_accum -= pkt as f64;
             if self.queued_frames + pkt <= buffer_frames {
+                if let Some(lb) = &mut self.loopback {
+                    let byte_len = pkt as usize * fmt.block_align as usize;
+                    lb.packets.push_back((vec![0u8; byte_len], pkt, true));
+                }
                 self.queued_packets.push_back(pkt);
                 self.queued_frames += pkt;
             } else {
@@ -188,7 +350,7 @@ impl Stream {
     /// (with adaptive headroom unless `AW2_AUDIO_LOW_LATENCY=0`). For capture
     /// streams: frames currently available to read in the capture buffer.
     fn padding(&mut self) -> u32 {
-        let rate = self.fmt.rate;
+        let fmt = self.fmt;
         let buffer_frames = self.buffer_frames;
         let seen = self.shared.max_slice.load(Ordering::Relaxed) as u32;
         match &mut self.io {
@@ -204,7 +366,7 @@ impl Stream {
                 (len + buffer_frames - target).min(buffer_frames)
             }
             StreamIo::Capture(c) => {
-                c.advance(rate, buffer_frames);
+                c.advance(&fmt, buffer_frames);
                 c.queued_frames
             }
         }
@@ -315,6 +477,8 @@ pub struct ClientState {
 
 pub struct ClientCore {
     pub ep: Arc<Endpoint>,
+    pub(super) session: Arc<SessionState>,
+    pub(super) channel_volumes: Mutex<Vec<f32>>,
     pub st: Mutex<ClientState>,
 }
 
@@ -395,7 +559,17 @@ pub struct IAudioClient3Vtbl {
 pub type ClientObj = ComObj<IAudioClient3Vtbl, Arc<ClientCore>>;
 
 pub fn new_client(ep: Arc<Endpoint>) -> *mut ClientObj {
-    ClientObj::create(&CLIENT_VTBL, Arc::new(ClientCore { ep, st: Mutex::new(ClientState::default()) }))
+    let ch = ep.mix_format().channels.max(1) as usize;
+    let session = SessionState::new(ep.clone());
+    ClientObj::create(
+        &CLIENT_VTBL,
+        Arc::new(ClientCore {
+            ep,
+            session,
+            channel_volumes: Mutex::new(vec![1.0; ch]),
+            st: Mutex::new(ClientState::default()),
+        }),
+    )
 }
 
 unsafe fn alloc_format(f: &WaveFormat) -> *mut WAVEFORMATEX {
@@ -424,7 +598,11 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
         return AUDCLNT_E_DEVICE_INVALIDATED;
     }
     if mode == AUDCLNT_SHAREMODE_EXCLUSIVE {
-        stub!("IAudioClient::Initialize: exclusive mode is not supported -> AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED");
+        // Native-unsupported: macOS shared audio endpoints (AirPods/Bluetooth/virtual) and iOS
+        // AVAudioSession do not allow exclusive hardware hogging without silencing the entire OS.
+        // Matches Windows WASAPI when exclusive-mode access is disallowed on an endpoint
+        // (Microsoft Learn: IAudioClient::Initialize -> AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED).
+        log::debug!(target: "audio", "IAudioClient::Initialize(EXCLUSIVE) on '{}' -> AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED", core.ep.info.name);
         return AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
     }
     if mode != AUDCLNT_SHAREMODE_SHARED || dur < 0 {
@@ -433,12 +611,9 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
     if flags & !KNOWN_FLAGS != 0 {
         return AUDCLNT_E_INVALID_STREAM_FLAG;
     }
-    if flags & AUDCLNT_STREAMFLAGS_LOOPBACK != 0 {
-        if core.ep.is_capture() {
-            return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
-        }
-        stub!("IAudioClient::Initialize: loopback capture is not supported -> E_NOTIMPL");
-        return E_NOTIMPL;
+    let is_loopback = flags & AUDCLNT_STREAMFLAGS_LOOPBACK != 0;
+    if is_loopback && core.ep.is_capture() {
+        return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
     }
     let f = match unsafe { WaveFormat::from_ptr(fmt) } {
         Ok(f) => f,
@@ -464,7 +639,7 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
     let period_frames = frames_for(DEFAULT_PERIOD_HNS, f.rate).max(1);
     let requested = frames_for(dur, f.rate);
 
-    let (shared, stream) = if core.ep.is_capture() {
+    let (shared, stream) = if core.ep.is_capture() || is_loopback {
         let buffer_frames = requested.max(period_frames * 4);
         let shared = StreamShared::new(Ring::new(1, 1));
         let timer = if flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK != 0 {
@@ -479,10 +654,26 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
         } else {
             None
         };
+        let loopback = if is_loopback {
+            let sub = register_loopback_sub(&core.ep.id, buffer_frames as usize * 2, f.channels);
+            let ca_ring = Arc::new(Ring::new(buffer_frames as usize * 2, f.channels.max(1) as usize));
+            let ca_tap = LoopbackTap::try_open(&core.ep.info, ca_ring.clone());
+            let ca_ring_opt = ca_tap.as_ref().map(|_| ca_ring);
+            Some(LoopbackCapture {
+                sub,
+                _ca_tap: ca_tap,
+                ca_ring: ca_ring_opt,
+                scratch_f32: Vec::new(),
+                packets: VecDeque::new(),
+            })
+        } else {
+            None
+        };
         let staging_bytes = buffer_frames as usize * f.block_align as usize;
         log::info!(
             target: "audio",
-            "IAudioClient::Initialize (capture) on '{}': {} Hz {} ch {:?}, flags {flags:#x}, buffer {} frames, packet {} frames (silent cadence)",
+            "IAudioClient::Initialize ({}) on '{}': {} Hz {} ch {:?}, flags {flags:#x}, buffer {} frames, packet {} frames",
+            if is_loopback { "loopback" } else { "capture" },
             core.ep.info.name, f.rate, f.channels, f.sample, buffer_frames, period_frames
         );
         let stream = Stream {
@@ -503,6 +694,7 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
                 last_tick: None,
                 frame_accum: 0.0,
                 device_pos: 0,
+                loopback,
                 _timer: timer,
             }),
         };
@@ -583,6 +775,10 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
         (shared, stream)
     };
 
+    {
+        let mut ch_vols = core.channel_volumes.lock().unwrap();
+        ch_vols.resize(f.channels.max(1) as usize, 1.0);
+    }
     STREAMS_INITIALIZED.fetch_add(1, Ordering::Relaxed);
     LIVE.lock().unwrap().push((core.ep.id.clone(), Arc::downgrade(&shared)));
     {
@@ -758,12 +954,12 @@ mod client {
             let invalid = is_invalid(s);
             let ctrl = if was {
                 s.started = false;
-                let rate = s.fmt.rate;
+                let fmt = s.fmt;
                 let buf = s.buffer_frames;
                 match &mut s.io {
                     StreamIo::Render(r) => Some(r.out.control()),
                     StreamIo::Capture(c) => {
-                        c.advance(rate, buf);
+                        c.advance(&fmt, buf);
                         c.last_tick = None;
                         s.shared.started.store(false, Ordering::Release);
                         None
@@ -808,6 +1004,13 @@ mod client {
                         return S_FALSE;
                     }
                     c.queued_packets.clear();
+                    if let Some(lb) = &mut c.loopback {
+                        lb.packets.clear();
+                        lb.sub.ring.clear();
+                        if let Some(cr) = &lb.ca_ring {
+                            cr.clear();
+                        }
+                    }
                     c.queued_frames = 0;
                     c.frame_accum = 0.0;
                     S_OK
@@ -870,19 +1073,22 @@ mod client {
         } else if iid == IID_IAudioClock {
             std::ptr::write_unaligned(out, ClockObj::create(&CLOCK_VTBL, c) as *mut c_void);
             S_OK
+        } else if iid == IID_IAudioClock2 {
+            std::ptr::write_unaligned(out, Clock2Obj::create(&CLOCK2_VTBL, c) as *mut c_void);
+            S_OK
+        } else if iid == IID_ISimpleAudioVolume {
+            std::ptr::write_unaligned(out, new_simple_audio_volume(c.session.clone()));
+            S_OK
+        } else if iid == IID_IAudioStreamVolume {
+            std::ptr::write_unaligned(out, StreamVolumeObj::create(stream_vol::vtbl(), c) as *mut c_void);
+            S_OK
+        } else if iid == IID_IAudioSessionControl || iid == IID_IAudioSessionControl2 {
+            std::ptr::write_unaligned(out, new_session_control(c.session.clone()));
+            S_OK
         } else {
-            let what = if iid == IID_ISimpleAudioVolume {
-                "ISimpleAudioVolume"
-            } else if iid == IID_IAudioStreamVolume {
-                "IAudioStreamVolume"
-            } else if iid == IID_IAudioSessionControl {
-                "IAudioSessionControl"
-            } else if iid == IID_IAudioClock2 {
-                "IAudioClock2"
-            } else {
-                "unknown service"
-            };
-            stub!("IAudioClient::GetService({iid:?} = {what}) -> E_NOINTERFACE");
+            // Standard COM behavior: IAudioClient::GetService returns E_NOINTERFACE for
+            // unrecognized service IIDs (Microsoft Learn: IAudioClient::GetService).
+            crate::com::warn_qi_failed_once("IAudioClient::GetService", &crate::com::Guid::from_win_guid(iid));
             E_NOINTERFACE
         }
     }
@@ -914,10 +1120,25 @@ mod client {
         S_OK
     }
 
-    pub unsafe extern "win64" fn get_buffer_size_limits(_this: *mut C, _f: *const WAVEFORMATEX, _ev: BOOL, _min: *mut i64, _max: *mut i64) -> HRESULT {
-        // Only meaningful for hardware-offloaded streams, which we never offer.
-        stub!("IAudioClient2::GetBufferSizeLimits -> E_NOTIMPL (no offload)");
-        E_NOTIMPL
+    pub unsafe extern "win64" fn get_buffer_size_limits(
+        _this: *mut C,
+        fmt: *const WAVEFORMATEX,
+        event_driven: BOOL,
+        min_dur: *mut i64,
+        max_dur: *mut i64,
+    ) -> HRESULT {
+        if min_dur.is_null() || max_dur.is_null() {
+            return E_POINTER;
+        }
+        match WaveFormat::from_ptr(fmt) {
+            Ok(_) => {}
+            Err(FormatError::Null) => return E_POINTER,
+            Err(_) => return AUDCLNT_E_UNSUPPORTED_FORMAT,
+        }
+        let min_hns = if event_driven != 0 { MIN_PERIOD_HNS } else { DEFAULT_PERIOD_HNS };
+        std::ptr::write_unaligned(min_dur, min_hns);
+        std::ptr::write_unaligned(max_dur, MAX_BUFFER_DURATION_HNS);
+        S_OK
     }
 
     pub unsafe extern "win64" fn get_shared_mode_engine_period(
@@ -1009,8 +1230,9 @@ pub struct IAudioRenderClientVtbl {
 
 pub type RenderObj = ComObj<IAudioRenderClientVtbl, Arc<ClientCore>>;
 
-/// Push `frames` frames from the staging buffer (or silence) into the ring and the tap.
-fn submit(s: &mut Stream, frames: u32, flags: u32) {
+/// Push `frames` frames from the staging buffer (or silence) into the ring,
+/// applying session/per-channel volume gains and teeing to active loopback subscribers.
+fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frames: u32, flags: u32) {
     let n = frames as usize;
     let bytes = n * s.fmt.block_align as usize;
     let padding_before = s.padding();
@@ -1030,7 +1252,9 @@ fn submit(s: &mut Stream, frames: u32, flags: u32) {
         s.frames_written += frames as u64;
         return;
     }
-    if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
+    let has_gain = (master_gain - 1.0).abs() > 1e-6
+        || ch_gains.iter().any(|&g| (g - 1.0).abs() > 1e-6);
+    if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || master_gain == 0.0 {
         if let Some(t) = &mut r.tap {
             t.submit(frames, flags, padding_before, None, bytes);
         }
@@ -1046,17 +1270,34 @@ fn submit(s: &mut Stream, frames: u32, flags: u32) {
         if let Some(t) = &mut r.tap {
             t.submit(frames, flags, padding_before, Some(raw), 0);
         }
-        if fmt.sample == SampleType::F32 && r.matrix.is_none() {
-            s.shared.ring.push(&r.staging[..n * fmt.channels as usize]);
+        let pushed: &[f32] = if fmt.sample == SampleType::F32 && r.matrix.is_none() && !has_gain {
+            &r.staging[..n * fmt.channels as usize]
         } else {
-            to_f32(&fmt, raw, n, &mut r.scratch);
+            if fmt.sample == SampleType::F32 {
+                let count = n * fmt.channels as usize;
+                r.scratch.clear();
+                r.scratch.extend_from_slice(&r.staging[..count]);
+            } else {
+                to_f32(&fmt, raw, n, &mut r.scratch);
+            }
+            if has_gain {
+                let ch = fmt.channels.max(1) as usize;
+                for frame in r.scratch.chunks_exact_mut(ch) {
+                    for (c, sample) in frame.iter_mut().enumerate() {
+                        let cg = ch_gains.get(c).copied().unwrap_or(1.0);
+                        *sample *= master_gain * cg;
+                    }
+                }
+            }
             if let Some(m) = &r.matrix {
                 apply_matrix(m, fmt.channels as usize, r.out_channels as usize, &r.scratch, &mut r.scratch2);
-                s.shared.ring.push(&r.scratch2);
+                &r.scratch2
             } else {
-                s.shared.ring.push(&r.scratch);
+                &r.scratch
             }
-        }
+        };
+        s.shared.ring.push(pushed);
+        push_loopback_frames(ep_id, pushed, r.out_channels);
     }
     s.frames_written += frames as u64;
 }
@@ -1120,7 +1361,9 @@ mod render {
         }
         s.pending = None;
         if frames > 0 {
-            submit(s, frames, flags);
+            let master_gain = core.session.effective_gain();
+            let ch_gains = core.channel_volumes.lock().unwrap().clone();
+            submit(s, &core.ep.id, master_gain, &ch_gains, frames, flags);
         }
         S_OK
     }
@@ -1180,19 +1423,31 @@ mod capture {
         if s.pending.is_some() {
             return AUDCLNT_E_OUT_OF_ORDER;
         }
-        let rate = s.fmt.rate;
+        let fmt = s.fmt;
         let buffer_frames = s.buffer_frames;
         let StreamIo::Capture(c) = &mut s.io else {
             return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
         };
-        c.advance(rate, buffer_frames);
+        c.advance(&fmt, buffer_frames);
         let Some(&pkt_frames) = c.queued_packets.front() else {
             return AUDCLNT_S_BUFFER_EMPTY;
         };
+        let mut buf_flags = AUDCLNT_BUFFERFLAGS_SILENT;
+        if let Some(lb) = &c.loopback {
+            if let Some((bytes, _nf, silent)) = lb.packets.front() {
+                if c.staging.len() < bytes.len() {
+                    c.staging.resize(bytes.len(), 0);
+                }
+                c.staging[..bytes.len()].copy_from_slice(bytes);
+                if !silent {
+                    buf_flags = 0;
+                }
+            }
+        }
         s.pending = Some(pkt_frames);
         std::ptr::write_unaligned(pp_data, c.staging.as_mut_ptr());
         std::ptr::write_unaligned(num_frames_out, pkt_frames);
-        std::ptr::write_unaligned(flags_out, AUDCLNT_BUFFERFLAGS_SILENT);
+        std::ptr::write_unaligned(flags_out, buf_flags);
         if !dev_pos_out.is_null() {
             std::ptr::write_unaligned(dev_pos_out, c.device_pos);
         }
@@ -1224,6 +1479,9 @@ mod capture {
         s.pending = None;
         if num_frames_read == req {
             if let Some(pkt) = c.queued_packets.pop_front() {
+                if let Some(lb) = &mut c.loopback {
+                    let _ = lb.packets.pop_front();
+                }
                 c.queued_frames = c.queued_frames.saturating_sub(pkt);
                 c.device_pos += pkt as u64;
             }
@@ -1243,12 +1501,12 @@ mod capture {
         if is_invalid(s) {
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
-        let rate = s.fmt.rate;
+        let fmt = s.fmt;
         let buffer_frames = s.buffer_frames;
         let StreamIo::Capture(c) = &mut s.io else {
             return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
         };
-        c.advance(rate, buffer_frames);
+        c.advance(&fmt, buffer_frames);
         let next = c.queued_packets.front().copied().unwrap_or(0);
         write_out(out, next)
     }
@@ -1327,3 +1585,152 @@ static CLOCK_VTBL: IAudioClockVtbl = IAudioClockVtbl {
     get_position: clock::get_position,
     get_characteristics: clock::get_characteristics,
 };
+
+// ---------------------------------------------------------------------------
+// IAudioClock2
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct IAudioClock2Vtbl {
+    qi: unsafe extern "win64" fn(*mut Clock2Obj, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref: unsafe extern "win64" fn(*mut Clock2Obj) -> u32,
+    release: unsafe extern "win64" fn(*mut Clock2Obj) -> u32,
+    get_device_position: unsafe extern "win64" fn(*mut Clock2Obj, *mut u64, *mut u64) -> HRESULT,
+}
+
+pub type Clock2Obj = ComObj<IAudioClock2Vtbl, Arc<ClientCore>>;
+
+mod clock2 {
+    use super::*;
+    crate::com_iunknown!(Clock2Obj, [IID_IAudioClock2]);
+
+    pub unsafe extern "win64" fn get_device_position(
+        this: *mut Clock2Obj,
+        dev_pos: *mut u64,
+        qpc_pos: *mut u64,
+    ) -> HRESULT {
+        if dev_pos.is_null() {
+            return E_POINTER;
+        }
+        let st = Clock2Obj::inner(this).st.lock().unwrap();
+        match st.stream.as_ref() {
+            None => AUDCLNT_E_NOT_INITIALIZED,
+            Some(s) if is_invalid(s) => AUDCLNT_E_DEVICE_INVALIDATED,
+            Some(s) => {
+                let frames = match &s.io {
+                    StreamIo::Render(_) => s.shared.ring.consumed() as u64 + s.dropped_silence,
+                    StreamIo::Capture(c) => c.device_pos,
+                };
+                std::ptr::write_unaligned(dev_pos, frames);
+                if !qpc_pos.is_null() {
+                    std::ptr::write_unaligned(qpc_pos, crate::kernel32::time::interrupt_time_100ns());
+                }
+                S_OK
+            }
+        }
+    }
+}
+
+static CLOCK2_VTBL: IAudioClock2Vtbl = IAudioClock2Vtbl {
+    qi: clock2::qi,
+    add_ref: clock2::add_ref,
+    release: clock2::release,
+    get_device_position: clock2::get_device_position,
+};
+
+// ---------------------------------------------------------------------------
+// IAudioStreamVolume
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct IAudioStreamVolumeVtbl([usize; 8]);
+
+pub type StreamVolumeObj = ComObj<IAudioStreamVolumeVtbl, Arc<ClientCore>>;
+
+mod stream_vol {
+    use super::*;
+    crate::com_iunknown!(StreamVolumeObj, [IID_IAudioStreamVolume]);
+
+    pub unsafe extern "win64" fn get_channel_count(this: *mut StreamVolumeObj, out: *mut u32) -> HRESULT {
+        let n = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap().len() as u32;
+        write_out(out, n)
+    }
+
+    pub unsafe extern "win64" fn set_channel_volume(this: *mut StreamVolumeObj, idx: u32, level: f32) -> HRESULT {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+            return E_INVALIDARG;
+        }
+        let mut vols = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap();
+        let Some(slot) = vols.get_mut(idx as usize) else {
+            return E_INVALIDARG;
+        };
+        *slot = level;
+        S_OK
+    }
+    crate::win64_bridge!(fn set_channel_volume(*mut StreamVolumeObj, u32, f32) -> HRESULT);
+
+    pub unsafe extern "win64" fn get_channel_volume(this: *mut StreamVolumeObj, idx: u32, out: *mut f32) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let vols = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap();
+        let Some(&v) = vols.get(idx as usize) else {
+            return E_INVALIDARG;
+        };
+        write_out(out, v)
+    }
+
+    pub unsafe extern "win64" fn set_all_volumes(this: *mut StreamVolumeObj, count: u32, levels: *const f32) -> HRESULT {
+        if levels.is_null() {
+            return E_POINTER;
+        }
+        let mut vols = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap();
+        if count as usize != vols.len() {
+            return E_INVALIDARG;
+        }
+        let mut next = Vec::with_capacity(vols.len());
+        for i in 0..vols.len() {
+            let v = std::ptr::read_unaligned(levels.add(i));
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return E_INVALIDARG;
+            }
+            next.push(v);
+        }
+        *vols = next;
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn get_all_volumes(this: *mut StreamVolumeObj, count: u32, levels: *mut f32) -> HRESULT {
+        if levels.is_null() {
+            return E_POINTER;
+        }
+        let vols = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap();
+        if count as usize != vols.len() {
+            return E_INVALIDARG;
+        }
+        for (i, &v) in vols.iter().enumerate() {
+            std::ptr::write_unaligned(levels.add(i), v);
+        }
+        S_OK
+    }
+
+    pub fn vtbl() -> &'static IAudioStreamVolumeVtbl {
+        static V: OnceLock<IAudioStreamVolumeVtbl> = OnceLock::new();
+        V.get_or_init(|| {
+            let slots = [
+                qi as *const () as usize,
+                add_ref as *const () as usize,
+                release as *const () as usize,
+                get_channel_count as *const () as usize,
+                crate::bridge_entry!(set_channel_volume) as usize,
+                get_channel_volume as *const () as usize,
+                set_all_volumes as *const () as usize,
+                get_all_volumes as *const () as usize,
+            ];
+            for &a in &slots {
+                crate::register_native_va(a as u64, a);
+            }
+            IAudioStreamVolumeVtbl(slots)
+        })
+    }
+}
