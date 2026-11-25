@@ -161,6 +161,16 @@ pub fn queue_of(tid: u32) -> Option<Arc<Queue>> {
     queues().lock().unwrap().get(&tid).cloned()
 }
 
+/// Queue of thread `tid`, creating it if that thread has not pumped messages yet.
+pub fn queue_for(tid: u32) -> Arc<Queue> {
+    queues()
+        .lock()
+        .unwrap()
+        .entry(tid)
+        .or_insert_with(|| Arc::new(Queue { tid, st: Guarded::new(QState::default()) }))
+        .clone()
+}
+
 fn thread_alive(tid: u32) -> bool {
     match crate::thread::find_by_tid(tid) {
         Some(t) => t.exit_code().is_none(),

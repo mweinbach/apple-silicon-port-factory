@@ -99,10 +99,12 @@ pub fn register_export_override(dll: impl AsRef<str>, name: impl Into<String>, p
 
 type GuestDispatcherFn = unsafe fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
 type NativeVaRegistrarFn = fn(u64, usize);
+type IncomingRspReaderFn = fn() -> (u64, u64);
 type BoundaryNanHookFn = fn(&str, usize, usize, &str);
 
 static GUEST_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_VA_REGISTRAR: AtomicUsize = AtomicUsize::new(0);
+static INCOMING_RSP_READER: AtomicUsize = AtomicUsize::new(0);
 static BOUNDARY_NAN_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Register a universal diagnostic hook called when a Win32/middleware boundary receives
@@ -150,6 +152,26 @@ pub fn register_native_va(va: u64, ptr: usize) {
     if r != 0 {
         let f: NativeVaRegistrarFn = unsafe { std::mem::transmute(r) };
         f(va, ptr);
+    }
+}
+
+/// Register the per-thread incoming guest Win64 RSP window reader
+/// (`x86_runtime::emu::peek_incoming_rsp`) so native COM/Win32 entry thunks with >16
+/// parameters can read Win64 stack slots beyond the 16 forwarded by `host_call_asm`.
+pub fn set_incoming_rsp_reader(f: IncomingRspReaderFn) {
+    INCOMING_RSP_READER.store(f as usize, Ordering::Release);
+}
+
+/// Read the active guest call's Win64 stack window `(rsp_lo, rsp_hi)` on the current thread,
+/// or `(0, 0)` when no guest-to-host call is active or no reader is registered.
+#[inline]
+pub fn incoming_rsp() -> (u64, u64) {
+    let r = INCOMING_RSP_READER.load(Ordering::Acquire);
+    if r != 0 {
+        let f: IncomingRspReaderFn = unsafe { std::mem::transmute(r) };
+        f()
+    } else {
+        (0, 0)
     }
 }
 

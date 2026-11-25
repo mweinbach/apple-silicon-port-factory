@@ -1029,8 +1029,21 @@ unsafe extern "win64" fn geom_simplify(
 }
 crate::win64_bridge!(fn geom_simplify(PGeom, u32, *const D2D1_MATRIX_3X2_F, f32, *mut c_void) -> HRESULT);
 
-fn triangulate_polygon(raw_pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
-    // Strip consecutive duplicate vertices (and closing duplicate).
+fn poly_cross(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f64 {
+    ((b.0 - a.0) as f64) * ((c.1 - a.1) as f64) - ((b.1 - a.1) as f64) * ((c.0 - a.0) as f64)
+}
+
+fn poly_signed_area2(pts: &[(f32, f32)]) -> f64 {
+    let mut area2 = 0.0f64;
+    for i in 0..pts.len() {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[(i + 1) % pts.len()];
+        area2 += (x0 as f64) * (y1 as f64) - (x1 as f64) * (y0 as f64);
+    }
+    area2
+}
+
+fn clean_ring(raw_pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
     let mut pts: Vec<(f32, f32)> = Vec::with_capacity(raw_pts.len());
     for &(x, y) in raw_pts {
         if !x.is_finite() || !y.is_finite() {
@@ -1052,32 +1065,206 @@ fn triangulate_polygon(raw_pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
             break;
         }
     }
+    pts
+}
+
+fn point_in_ring(x: f32, y: f32, pts: &[(f32, f32)]) -> bool {
+    let n = pts.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    for i in 0..n {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[(i + 1) % n];
+        if (y0 <= y && y1 > y) || (y1 <= y && y0 > y) {
+            let t = (y - y0) / (y1 - y0);
+            if x0 + t * (x1 - x0) > x {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Find a point guaranteed to lie strictly inside a simple polygon `pts`.
+fn ring_interior_point(pts: &[(f32, f32)]) -> (f32, f32) {
+    let n = pts.len();
+    let ccw = poly_signed_area2(pts) > 0.0;
+    // The lexicographically rightmost (then highest) vertex is always strictly convex.
+    let mut best = 0usize;
+    for i in 1..n {
+        if pts[i].0 > pts[best].0 || (pts[i].0 == pts[best].0 && pts[i].1 > pts[best].1) {
+            best = i;
+        }
+    }
+    let prev = (best + n - 1) % n;
+    let next = (best + 1) % n;
+    let a = pts[prev];
+    let b = pts[best];
+    let c = pts[next];
+    let (ta, tb, tc) = if ccw { (a, b, c) } else { (c, b, a) };
+
+    let mut closest: Option<((f32, f32), f64)> = None;
+    for (k, &p) in pts.iter().enumerate() {
+        if k == prev || k == best || k == next {
+            continue;
+        }
+        let c1 = poly_cross(ta, tb, p);
+        let c2 = poly_cross(tb, tc, p);
+        let c3 = poly_cross(tc, ta, p);
+        if c1 >= -1e-7 && c2 >= -1e-7 && c3 >= -1e-7 {
+            let d2 = ((p.0 - b.0) as f64).powi(2) + ((p.1 - b.1) as f64).powi(2);
+            if closest.map_or(true, |(_, bd)| d2 < bd) {
+                closest = Some((p, d2));
+            }
+        }
+    }
+    if let Some((p, _)) = closest {
+        (0.5 * (b.0 + p.0), 0.5 * (b.1 + p.1))
+    } else {
+        ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0)
+    }
+}
+
+/// Splice CW `holes` into a CCW `outer` contour using Eberly's mutually-visible
+/// horizontal-ray bridge algorithm, producing a single CCW polygon for ear-clipping.
+fn splice_holes_into_outer(mut poly: Vec<(f32, f32)>, mut holes: Vec<Vec<(f32, f32)>>) -> Vec<(f32, f32)> {
+    // Process holes from rightmost maximum-X vertex to leftmost so earlier bridges never
+    // interfere with later +X rays.
+    holes.sort_by(|a, b| {
+        let ma = a
+            .iter()
+            .copied()
+            .max_by(|p, q| p.0.total_cmp(&q.0).then_with(|| p.1.total_cmp(&q.1)))
+            .unwrap_or((f32::NEG_INFINITY, 0.0));
+        let mb = b
+            .iter()
+            .copied()
+            .max_by(|p, q| p.0.total_cmp(&q.0).then_with(|| p.1.total_cmp(&q.1)))
+            .unwrap_or((f32::NEG_INFINITY, 0.0));
+        mb.0.total_cmp(&ma.0).then_with(|| mb.1.total_cmp(&ma.1))
+    });
+
+    for hole in holes {
+        if hole.len() < 3 || poly.len() < 3 {
+            continue;
+        }
+        let mut m_idx = 0usize;
+        for i in 1..hole.len() {
+            if hole[i].0 > hole[m_idx].0
+                || (hole[i].0 == hole[m_idx].0 && hole[i].1 > hole[m_idx].1)
+            {
+                m_idx = i;
+            }
+        }
+        let m = hole[m_idx];
+        let n = poly.len();
+
+        // Cast +X horizontal ray from M to find the closest intersection with `poly`.
+        let mut best_ix = f64::INFINITY;
+        let mut hit_edge: Option<(usize, usize, bool)> = None; // (e0, e1, exact_vertex_e0)
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let a = poly[i];
+            let b = poly[j];
+            // Exact vertex hit on the ray (at A).
+            if (a.1 - m.1).abs() < 1e-6 && a.0 >= m.0 - 1e-6 {
+                let ix = a.0 as f64;
+                if ix < best_ix - 1e-7 {
+                    best_ix = ix;
+                    hit_edge = Some((i, j, true));
+                }
+            }
+            // Proper edge crossing where ray crosses segment (a, b) at y = m.1.
+            if (a.1 <= m.1 && b.1 > m.1) || (b.1 <= m.1 && a.1 > m.1) {
+                let t = ((m.1 - a.1) as f64) / ((b.1 - a.1) as f64);
+                let ix = (a.0 as f64) + t * ((b.0 - a.0) as f64);
+                if ix >= (m.0 as f64) - 1e-6 && ix < best_ix - 1e-7 {
+                    best_ix = ix;
+                    hit_edge = Some((i, j, false));
+                }
+            }
+        }
+
+        let vis_idx = if let Some((e0, e1, exact_v)) = hit_edge {
+            if exact_v {
+                e0
+            } else {
+                let p_idx = if poly[e0].0 >= poly[e1].0 { e0 } else { e1 };
+                let p = poly[p_idx];
+                let hit_pt = (best_ix as f32, m.1);
+
+                // Orient search triangle (M, I, P) CCW for containment test.
+                let tri_ccw = poly_cross(m, hit_pt, p) >= 0.0;
+                let (ta, tb, tc) = if tri_ccw { (m, hit_pt, p) } else { (m, p, hit_pt) };
+
+                // Any reflex vertex of `poly` strictly inside (or on) triangle (M, I, P)
+                // blocks visibility to P; pick the one at minimum angle from +X.
+                let mut best_reflex: Option<(usize, f64, f64)> = None;
+                for k in 0..n {
+                    if k == p_idx {
+                        continue;
+                    }
+                    let r = poly[k];
+                    if (r.0 - p.0).abs() < 1e-5 && (r.1 - p.1).abs() < 1e-5 {
+                        continue;
+                    }
+                    let prev = poly[(k + n - 1) % n];
+                    let next = poly[(k + 1) % n];
+                    if poly_cross(prev, r, next) > 1e-7 {
+                        continue; // convex vertex cannot intrude into triangle
+                    }
+                    let c1 = poly_cross(ta, tb, r);
+                    let c2 = poly_cross(tb, tc, r);
+                    let c3 = poly_cross(tc, ta, r);
+                    if c1 >= -1e-7 && c2 >= -1e-7 && c3 >= -1e-7 {
+                        let dx = ((r.0 - m.0) as f64).max(1e-12);
+                        let dy = ((r.1 - m.1) as f64).abs();
+                        let slope = dy / dx;
+                        let dist2 = dx * dx + dy * dy;
+                        if best_reflex.map_or(true, |(_, bs, bd)| {
+                            slope < bs - 1e-9 || ((slope - bs).abs() <= 1e-9 && dist2 < bd)
+                        }) {
+                            best_reflex = Some((k, slope, dist2));
+                        }
+                    }
+                }
+                best_reflex.map_or(p_idx, |(k, _, _)| k)
+            }
+        } else {
+            // Degenerate fallback: nearest vertex of `poly` to M.
+            (0..n)
+                .min_by(|&i, &j| {
+                    let di = ((poly[i].0 - m.0) as f64).powi(2) + ((poly[i].1 - m.1) as f64).powi(2);
+                    let dj = ((poly[j].0 - m.0) as f64).powi(2) + ((poly[j].1 - m.1) as f64).powi(2);
+                    di.total_cmp(&dj)
+                })
+                .unwrap_or(0)
+        };
+
+        // Splice: poly[0..=vis_idx] + hole[m_idx..] + hole[..m_idx] + M + poly[vis_idx] + poly[vis_idx+1..]
+        let mut merged = Vec::with_capacity(poly.len() + hole.len() + 2);
+        merged.extend_from_slice(&poly[..=vis_idx]);
+        merged.extend_from_slice(&hole[m_idx..]);
+        merged.extend_from_slice(&hole[..m_idx]);
+        merged.push(hole[m_idx]);
+        merged.push(poly[vis_idx]);
+        merged.extend_from_slice(&poly[vis_idx + 1..]);
+        poly = merged;
+    }
+
+    poly
+}
+
+fn triangulate_ccw_polygon(pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
     if pts.len() < 3 {
         return;
     }
-
-    // Ensure positive signed area (counter-clockwise in standard coordinates)
-    // so convex corners satisfy cross(b - a, c - b) > 0.
-    let mut area2 = 0.0f64;
-    for i in 0..pts.len() {
-        let (x0, y0) = pts[i];
-        let (x1, y1) = pts[(i + 1) % pts.len()];
-        area2 += (x0 as f64) * (y1 as f64) - (x1 as f64) * (y0 as f64);
-    }
-    if area2.abs() < 1e-8 {
-        return;
-    }
-    if area2 < 0.0 {
-        pts.reverse();
-    }
-
-    let cross = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| -> f64 {
-        ((b.0 - a.0) as f64) * ((c.1 - a.1) as f64) - ((b.1 - a.1) as f64) * ((c.0 - a.0) as f64)
-    };
     let pt_in_tri = |p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)| -> bool {
-        let c1 = cross(a, b, p);
-        let c2 = cross(b, c, p);
-        let c3 = cross(c, a, p);
+        let c1 = poly_cross(a, b, p);
+        let c2 = poly_cross(b, c, p);
+        let c3 = poly_cross(c, a, p);
         c1 >= -1e-7 && c2 >= -1e-7 && c3 >= -1e-7
     };
 
@@ -1092,7 +1279,7 @@ fn triangulate_polygon(raw_pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
             let a = pts[i_prev];
             let b = pts[i_curr];
             let c = pts[i_next];
-            if cross(a, b, c) <= 1e-7 {
+            if poly_cross(a, b, c) <= 1e-7 {
                 continue;
             }
             let mut contains_other = false;
@@ -1101,9 +1288,9 @@ fn triangulate_polygon(raw_pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
                     continue;
                 }
                 let p = pts[k];
-                if (p.0 - a.0).abs() < 1e-5 && (p.1 - a.1).abs() < 1e-5
-                    || (p.0 - b.0).abs() < 1e-5 && (p.1 - b.1).abs() < 1e-5
-                    || (p.0 - c.0).abs() < 1e-5 && (p.1 - c.1).abs() < 1e-5
+                if ((p.0 - a.0).abs() < 1e-5 && (p.1 - a.1).abs() < 1e-5)
+                    || ((p.0 - b.0).abs() < 1e-5 && (p.1 - b.1).abs() < 1e-5)
+                    || ((p.0 - c.0).abs() < 1e-5 && (p.1 - c.1).abs() < 1e-5)
                 {
                     continue;
                 }
@@ -1122,8 +1309,8 @@ fn triangulate_polygon(raw_pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
         let pos = ear_pos.unwrap_or_else(|| {
             (0..n)
                 .max_by(|&i, &j| {
-                    let ci = cross(pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]);
-                    let cj = cross(pts[idx[(j + n - 1) % n]], pts[idx[j]], pts[idx[(j + 1) % n]]);
+                    let ci = poly_cross(pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]);
+                    let cj = poly_cross(pts[idx[(j + n - 1) % n]], pts[idx[j]], pts[idx[(j + 1) % n]]);
                     ci.total_cmp(&cj)
                 })
                 .unwrap_or(0)
@@ -1131,7 +1318,7 @@ fn triangulate_polygon(raw_pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
         let a = pts[idx[(pos + n - 1) % n]];
         let b = pts[idx[pos]];
         let c = pts[idx[(pos + 1) % n]];
-        if cross(a, b, c).abs() > 1e-8 {
+        if poly_cross(a, b, c).abs() > 1e-8 {
             out.push(D2D1_TRIANGLE {
                 point1: D2D1_POINT_2F { x: a.0, y: a.1 },
                 point2: D2D1_POINT_2F { x: b.0, y: b.1 },
@@ -1144,13 +1331,145 @@ fn triangulate_polygon(raw_pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
         let a = pts[idx[0]];
         let b = pts[idx[1]];
         let c = pts[idx[2]];
-        if cross(a, b, c).abs() > 1e-8 {
+        if poly_cross(a, b, c).abs() > 1e-8 {
             out.push(D2D1_TRIANGLE {
                 point1: D2D1_POINT_2F { x: a.0, y: a.1 },
                 point2: D2D1_POINT_2F { x: b.0, y: b.1 },
                 point3: D2D1_POINT_2F { x: c.0, y: c.1 },
             });
         }
+    }
+}
+
+/// Resolve all filled contours under `fill_mode` (`D2D1_FILL_MODE_ALTERNATE` or
+/// `D2D1_FILL_MODE_WINDING`), bridge holes into their enclosing outer contours, and
+/// emit triangles covering the exact filled region.
+fn tessellate_flattened(fg: &FlattenedGeometry, out: &mut Vec<D2D1_TRIANGLE>) {
+    struct Ring {
+        pts: Vec<(f32, f32)>,
+        area2: f64,
+        abs_area: f64,
+        winding_sign: i32,
+        probe: (f32, f32),
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        Outer,
+        Hole,
+        Redundant,
+    }
+
+    let mut rings: Vec<Ring> = Vec::new();
+    for sp in &fg.subpaths {
+        if !sp.filled || sp.points.len() < 3 {
+            continue;
+        }
+        let pts = clean_ring(&sp.points);
+        if pts.len() < 3 {
+            continue;
+        }
+        let area2 = poly_signed_area2(&pts);
+        if area2.abs() < 1e-8 {
+            continue;
+        }
+        let probe = ring_interior_point(&pts);
+        rings.push(Ring {
+            pts,
+            area2,
+            abs_area: area2.abs(),
+            winding_sign: if area2 > 0.0 { 1 } else { -1 },
+            probe,
+        });
+    }
+    if rings.is_empty() {
+        return;
+    }
+
+    // Fast path: single contour has no hole interactions.
+    if rings.len() == 1 {
+        let mut pts = rings.pop().unwrap().pts;
+        if poly_signed_area2(&pts) < 0.0 {
+            pts.reverse();
+        }
+        triangulate_ccw_polygon(&pts, out);
+        return;
+    }
+
+    // Build containment lists: containers[i] = indices of strictly larger rings enclosing ring i.
+    let m = rings.len();
+    let mut containers: Vec<Vec<usize>> = vec![Vec::new(); m];
+    for i in 0..m {
+        let p = rings[i].probe;
+        for j in 0..m {
+            if i == j || rings[j].abs_area <= rings[i].abs_area {
+                continue;
+            }
+            if point_in_ring(p.0, p.1, &rings[j].pts) {
+                containers[i].push(j);
+            }
+        }
+    }
+
+    // Classify every ring under the active Direct2D fill rule (matching `point_in_subpaths`).
+    let mut roles = vec![Role::Redundant; m];
+    for i in 0..m {
+        if fg.fill_mode == D2D1_FILL_MODE_WINDING {
+            let outside_w: i32 = containers[i].iter().map(|&j| rings[j].winding_sign).sum();
+            let inside_w = outside_w + rings[i].winding_sign;
+            roles[i] = if outside_w == 0 && inside_w != 0 {
+                Role::Outer
+            } else if outside_w != 0 && inside_w == 0 {
+                Role::Hole
+            } else {
+                Role::Redundant
+            };
+        } else {
+            roles[i] = if containers[i].len() % 2 == 0 {
+                Role::Outer
+            } else {
+                Role::Hole
+            };
+        }
+    }
+
+    // Attach each hole to its immediate (smallest-area) enclosing Outer ring.
+    let mut holes_of: Vec<Vec<usize>> = vec![Vec::new(); m];
+    for i in 0..m {
+        if roles[i] != Role::Hole {
+            continue;
+        }
+        if let Some(&parent) = containers[i]
+            .iter()
+            .filter(|&&j| roles[j] == Role::Outer)
+            .min_by(|&&a, &&b| rings[a].abs_area.total_cmp(&rings[b].abs_area))
+        {
+            holes_of[parent].push(i);
+        }
+    }
+
+    // Triangulate each Outer ring together with its immediate holes.
+    for i in 0..m {
+        if roles[i] != Role::Outer {
+            continue;
+        }
+        let mut outer = rings[i].pts.clone();
+        if rings[i].area2 < 0.0 {
+            outer.reverse(); // CCW
+        }
+        let mut holes: Vec<Vec<(f32, f32)>> = Vec::with_capacity(holes_of[i].len());
+        for &h_idx in &holes_of[i] {
+            let mut h = rings[h_idx].pts.clone();
+            if rings[h_idx].area2 > 0.0 {
+                h.reverse(); // CW
+            }
+            holes.push(h);
+        }
+        let combined = if holes.is_empty() {
+            outer
+        } else {
+            splice_holes_into_outer(outer, holes)
+        };
+        triangulate_ccw_polygon(&combined, out);
     }
 }
 
@@ -1174,11 +1493,7 @@ pub(super) unsafe extern "win64" fn geom_tessellate(
     let m = (!world.is_null()).then(|| world.read_unaligned());
     let fg = ComObj::inner(this).flatten(m.as_ref(), tol.max(0.1));
     let mut triangles = Vec::new();
-    for sp in &fg.subpaths {
-        if sp.filled && sp.points.len() >= 3 {
-            triangulate_polygon(&sp.points, &mut triangles);
-        }
-    }
+    tessellate_flattened(&fg, &mut triangles);
     if !triangles.is_empty() {
         crate::call_guest8(
             fn_add_triangles,

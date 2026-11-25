@@ -2437,7 +2437,7 @@ unsafe extern "win64" fn wsprintf_w_impl(args: *const u64) -> i32 {
     };
     let n = units.len().min(WSPRINTF_MAX_CHARS);
     if n > 0 {
-        std::ptr::copy_nonoverlapping(units.as_ptr(), out, n);
+        std::ptr::copy_nonoverlapping(units.as_ptr() as *const u8, out as *mut u8, n * 2);
     }
     std::ptr::write_unaligned(out.add(n), 0);
     n as i32
@@ -3337,6 +3337,23 @@ mod tests {
             );
             assert_eq!(wn_cap, 1023);
             assert_eq!(wbuf[1023], 0);
+
+            // Odd-address (unaligned) UTF-16 output buffer must work without UB/alignment panic.
+            let mut raw = vec![0xA5u8; 128];
+            let odd_out = raw.as_mut_ptr().add(1) as *mut u16;
+            assert!(!odd_out.is_aligned(), "expected odd-address unaligned u16 pointer");
+            let wn_odd = wsprintfW(
+                odd_out as u64,
+                fmt_w.as_ptr() as u64,
+                7,
+                0x2A,
+                ws_arg.as_ptr() as u64,
+                0, 0, 0, 0, 0, 0, 0,
+            );
+            assert_eq!(wn_odd, 21);
+            assert_eq!(read_wide_unaligned(odd_out), "val=7 hex=2A str=wide");
+            assert_eq!(std::ptr::read_unaligned(odd_out.add(21)), 0);
+            assert_eq!(raw[0], 0xA5);
         }
     }
 

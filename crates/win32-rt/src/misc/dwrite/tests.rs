@@ -1276,6 +1276,149 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
         );
         assert_eq!(gdi_adv[0], 14.0);
 
+        // 3b. Exercise the actual COM vtable entry thunks (slots 7, 8, 9) using the real
+        //     guest-ABI path (16 u64 slots + Win64 incoming_rsp stack window for args 16..21).
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TEST_RSP_LO: AtomicU64 = AtomicU64::new(0);
+            static TEST_RSP_HI: AtomicU64 = AtomicU64::new(0);
+            fn test_incoming_rsp() -> (u64, u64) {
+                (TEST_RSP_LO.load(Ordering::Acquire), TEST_RSP_HI.load(Ordering::Acquire))
+            }
+            type Vtbl16Fn = unsafe extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64,
+                u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> HRESULT;
+
+            let call_vtbl_win64 = |slot: usize, args: &[u64]| -> HRESULT {
+                // Build a Win64 stack frame: [rsp+0x00..0x20] = shadow space,
+                // [rsp+0x20 + (i-4)*8] = arg i for i >= 4.
+                let mut stack = [0u64; 32]; // 0x100 bytes
+                for (i, &v) in args.iter().enumerate().skip(4) {
+                    stack[4 + (i - 4)] = v;
+                }
+                let lo = stack.as_ptr() as u64;
+                let hi = lo + (stack.len() * 8) as u64;
+                TEST_RSP_LO.store(lo, Ordering::Release);
+                TEST_RSP_HI.store(hi, Ordering::Release);
+                crate::set_incoming_rsp_reader(test_incoming_rsp);
+                let a = |i: usize| args.get(i).copied().unwrap_or(0);
+                let f: Vtbl16Fn = std::mem::transmute(vtbl_of(ta).add(slot).read_unaligned());
+                let hr = f(
+                    a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7),
+                    a(8), a(9), a(10), a(11), a(12), a(13), a(14), a(15),
+                );
+                TEST_RSP_LO.store(0, Ordering::Release);
+                TEST_RSP_HI.store(0, Ordering::Release);
+                hr
+            };
+
+            // Slot 7: GetGlyphs (18 args: glyphProps @ #16, actualGlyphCount @ #17)
+            let mut v_cmap = [0xFFFFu16; 1];
+            let mut v_tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 1];
+            let mut v_gids = [0u16; 1];
+            let mut v_gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 1];
+            let mut v_actual = 0u32;
+            assert_eq!(
+                call_vtbl_win64(
+                    7,
+                    &[
+                        ta as u64,
+                        a_u16.as_ptr() as u64,
+                        1,
+                        face as u64,
+                        FALSE as u64,
+                        FALSE as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1, // maxGlyphCount (#12)
+                        v_cmap.as_mut_ptr() as u64,
+                        v_tprops.as_mut_ptr() as u64,
+                        v_gids.as_mut_ptr() as u64,
+                        v_gprops.as_mut_ptr() as u64, // #16 -> [rsp+0x80]
+                        &mut v_actual as *mut u32 as u64, // #17 -> [rsp+0x88]
+                    ],
+                ),
+                S_OK
+            );
+            assert_eq!((v_actual, v_gids[0], v_cmap[0]), (1, 1, 0));
+            assert_ne!(v_gprops[0].bits, 0);
+
+            // Slot 8: GetGlyphPlacements (19 args: fontEmSize @ #9, glyphAdvances @ #17, glyphOffsets @ #18)
+            let mut v_adv = [0.0f32; 1];
+            let mut v_offs = [DWRITE_GLYPH_OFFSET { advanceOffset: 99.0, ascenderOffset: 99.0 }; 1];
+            assert_eq!(
+                call_vtbl_win64(
+                    8,
+                    &[
+                        ta as u64,
+                        a_u16.as_ptr() as u64,
+                        v_cmap.as_ptr() as u64,
+                        v_tprops.as_ptr() as u64,
+                        1,
+                        v_gids.as_ptr() as u64,
+                        v_gprops.as_ptr() as u64,
+                        1,
+                        face as u64,
+                        20.0f32.to_bits() as u64,
+                        FALSE as u64,
+                        FALSE as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0, // featureRanges (#16)
+                        v_adv.as_mut_ptr() as u64, // #17 -> [rsp+0x88]
+                        v_offs.as_mut_ptr() as u64, // #18 -> [rsp+0x90]
+                    ],
+                ),
+                S_OK
+            );
+            assert!((v_adv[0] - 14.4).abs() < 1e-2, "vtable GetGlyphPlacements adv={}", v_adv[0]);
+            assert_eq!((v_offs[0].advanceOffset, v_offs[0].ascenderOffset), (0.0, 0.0));
+
+            // Slot 9: GetGdiCompatibleGlyphPlacements (22 args: glyphAdvances @ #20, glyphOffsets @ #21)
+            let mut v_gdi_adv = [0.0f32; 1];
+            v_offs[0] = DWRITE_GLYPH_OFFSET { advanceOffset: 77.0, ascenderOffset: 77.0 };
+            assert_eq!(
+                call_vtbl_win64(
+                    9,
+                    &[
+                        ta as u64,
+                        a_u16.as_ptr() as u64,
+                        v_cmap.as_ptr() as u64,
+                        v_tprops.as_ptr() as u64,
+                        1,
+                        v_gids.as_ptr() as u64,
+                        v_gprops.as_ptr() as u64,
+                        1,
+                        face as u64,
+                        20.0f32.to_bits() as u64,
+                        1.0f32.to_bits() as u64,
+                        0,
+                        FALSE as u64,
+                        FALSE as u64,
+                        FALSE as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        v_gdi_adv.as_mut_ptr() as u64, // #20 -> [rsp+0xA0]
+                        v_offs.as_mut_ptr() as u64,    // #21 -> [rsp+0xA8]
+                    ],
+                ),
+                S_OK
+            );
+            assert_eq!(v_gdi_adv[0], 14.0);
+            assert_eq!((v_offs[0].advanceOffset, v_offs[0].ascenderOffset), (0.0, 0.0));
+        }
+
         // 4. CreateGlyphRunAnalysis: GetAlphaTextureBounds + CreateAlphaTexture (1x1 & 3x1) + GetAlphaBlendParams
         let run = DWRITE_GLYPH_RUN {
             fontFace: face,

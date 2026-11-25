@@ -932,14 +932,23 @@ unsafe fn deliver_to_target(target: &PowerNotifyTarget, pbt_type: u32, setting_b
             );
         }
         PowerNotifyTarget::Window(hwnd) => {
-            if crate::user32::window::exists(hwnd) {
-                let lp = setting_buf.map_or(0isize, |b| b.as_ptr() as isize);
-                let _ = crate::user32::message::PostMessageW(
-                    hwnd as HWND,
-                    crate::user32::wm::POWERBROADCAST,
-                    pbt_type as usize,
-                    lp,
-                );
+            if let Some(w) = crate::user32::window::get(hwnd) {
+                // Keep an owned copy of `POWERBROADCAST_SETTING` alive until the owning Win32
+                // thread finishes running the window procedure (Windows delivers WM_POWERBROADCAST
+                // as a sent notification so lParam stays valid across the WndProc call).
+                let owned_pkt = setting_buf.map(|b| b.to_vec());
+                let q = crate::user32::message::queue_for(w.tid);
+                q.call(move || {
+                    if crate::user32::window::exists(hwnd) {
+                        let lp = owned_pkt.as_ref().map_or(0isize, |b| b.as_ptr() as isize);
+                        crate::user32::window::call_window_proc(
+                            hwnd,
+                            crate::user32::wm::POWERBROADCAST,
+                            pbt_type as usize,
+                            lp,
+                        );
+                    }
+                });
             }
         }
         PowerNotifyTarget::Service => {}
@@ -1327,5 +1336,162 @@ mod tests {
             assert_eq!(PowerUnregisterSuspendResumeNotification(h_sr), 0);
             assert_eq!(PowerSettingUnregisterNotification(h_set), 0);
         }
+    }
+
+    #[test]
+    fn window_power_setting_payload_stays_alive_until_wndproc_delivery() {
+        static RECEIVED: Mutex<Vec<(usize, Option<([u8; 16], Vec<u8>)>)>> = Mutex::new(Vec::new());
+
+        unsafe extern "win64" fn power_wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize {
+            if msg == crate::user32::wm::POWERBROADCAST {
+                let setting = if wparam as u32 == PBT_POWERSETTINGCHANGE && lparam != 0 {
+                    let p = lparam as *const u8;
+                    let mut guid = [0u8; 16];
+                    std::ptr::copy_nonoverlapping(p, guid.as_mut_ptr(), 16);
+                    let len = std::ptr::read_unaligned(p.add(16) as *const u32) as usize;
+                    let mut data = vec![0u8; len];
+                    if len > 0 {
+                        std::ptr::copy_nonoverlapping(p.add(20), data.as_mut_ptr(), len);
+                    }
+                    Some((guid, data))
+                } else {
+                    None
+                };
+                RECEIVED.lock().unwrap().push((wparam, setting));
+                return 1;
+            }
+            crate::user32::defproc::DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        std::thread::spawn(|| unsafe {
+            let wndproc_handle = crate::user32::register_typed_host_wndproc(power_wndproc);
+            RECEIVED.lock().unwrap().clear();
+
+            let cls = crate::strings::to_wide_z("PowerNotifyPayloadTestWnd");
+            let wc = crate::user32::class::WNDCLASSEX {
+                cb_size: std::mem::size_of::<crate::user32::class::WNDCLASSEX>() as u32,
+                style: 0,
+                wndproc: wndproc_handle,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+                icon_sm: 0,
+            };
+            let _ = crate::user32::class::RegisterClassExW(&wc);
+            let hwnd = crate::user32::window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                crate::user32::ws::POPUP,
+                0,
+                0,
+                40,
+                40,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+
+            // 1. Register window-based power-setting notification. Its local packet in
+            //    PowerSettingRegisterNotification goes out of scope immediately upon return.
+            let mut h_set: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_ACDC_POWER_SOURCE.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                    hwnd as HANDLE,
+                    &mut h_set,
+                ),
+                0
+            );
+            // Clobber recently freed small heap blocks to expose any use-after-free.
+            let _churn: Vec<Vec<u8>> = (0..64).map(|_| vec![0xDEu8; 24]).collect();
+
+            let mut msg = crate::user32::MSG::default();
+            let _ = crate::user32::message::PeekMessageW(
+                &mut msg,
+                hwnd,
+                0,
+                0,
+                crate::user32::message::PM_REMOVE,
+            );
+            {
+                let got = RECEIVED.lock().unwrap();
+                assert_eq!(got.len(), 1, "expected initial WM_POWERBROADCAST delivery");
+                assert_eq!(got[0].0, PBT_POWERSETTINGCHANGE as usize);
+                let (guid, data) = got[0].1.as_ref().expect("missing POWERBROADCAST_SETTING");
+                assert_eq!(*guid, GUID_ACDC_POWER_SOURCE);
+                assert_eq!(data.len(), 4);
+                let val = u32::from_le_bytes(data[..4].try_into().unwrap());
+                assert!(val == 0 || val == 1, "unexpected initial AC/DC value {val:#x}");
+            }
+
+            // 2. Dispatch a subsequent change from another thread (mirrors IOKit callback thread).
+            let payload_val = 0x1357_2468u32;
+            std::thread::spawn(move || {
+                dispatch_power_setting_change(GUID_ACDC_POWER_SOURCE, &payload_val.to_le_bytes());
+            })
+            .join()
+            .unwrap();
+            let _churn2: Vec<Vec<u8>> = (0..64).map(|_| vec![0xCCu8; 24]).collect();
+
+            let _ = crate::user32::message::PeekMessageW(
+                &mut msg,
+                hwnd,
+                0,
+                0,
+                crate::user32::message::PM_REMOVE,
+            );
+            {
+                let got = RECEIVED.lock().unwrap();
+                assert_eq!(got.len(), 2, "expected dispatched WM_POWERBROADCAST delivery");
+                assert_eq!(got[1].0, PBT_POWERSETTINGCHANGE as usize);
+                let (guid, data) = got[1].1.as_ref().expect("missing POWERBROADCAST_SETTING");
+                assert_eq!(*guid, GUID_ACDC_POWER_SOURCE);
+                assert_eq!(data, &payload_val.to_le_bytes());
+            }
+
+            // 3. Window-based suspend/resume notification delivers with lParam == 0.
+            let mut h_sr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                    hwnd as HANDLE,
+                    &mut h_sr,
+                ),
+                0
+            );
+            dispatch_suspend_resume_event(PBT_APMSUSPEND);
+            let _ = crate::user32::message::PeekMessageW(
+                &mut msg,
+                hwnd,
+                0,
+                0,
+                crate::user32::message::PM_REMOVE,
+            );
+            {
+                let got = RECEIVED.lock().unwrap();
+                assert_eq!(got.len(), 3);
+                assert_eq!(got[2], (PBT_APMSUSPEND as usize, None));
+            }
+
+            assert_eq!(PowerUnregisterSuspendResumeNotification(h_sr), 0);
+            assert_eq!(PowerSettingUnregisterNotification(h_set), 0);
+            let _ = crate::user32::window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
     }
 }

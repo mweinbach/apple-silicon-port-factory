@@ -586,9 +586,198 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     S_OK
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn read_win64_stack_slot(arg_index: usize) -> Option<u64> {
+    debug_assert!(arg_index >= 4);
+    let (rsp_lo, rsp_hi) = crate::incoming_rsp();
+    if rsp_lo == 0 {
+        return None;
+    }
+    // Win64 stack layout at host_call/host_tail_call entry:
+    // `[rsp + 0x00..0x20]` = shadow space, `[rsp + 0x20]` = 0-indexed arg 4,
+    // `[rsp + 0x80]` = arg 16, ..., `[rsp + 0xA8]` = arg 21.
+    let off = 0x20u64 + ((arg_index - 4) as u64) * 8;
+    let addr = rsp_lo.checked_add(off)?;
+    let end = addr.checked_add(8)?;
+    if end > rsp_hi {
+        return None;
+    }
+    Some(std::ptr::read_unaligned(addr as *const u64))
+}
+
+/// Guest-ABI entry thunk for `IDWriteTextAnalyzer::GetGlyphs` (18 parameters).
+/// Receives all 16 forwarded 8-byte Win64 slots (`x0..x7` + `[sp+0x00..0x38]`) as `u64`
+/// (avoiding Apple AAPCS64 4-byte packing of stack `u32`/`BOOL` args) and reads slots
+/// 16..=17 directly from the active guest Win64 stack frame via [`crate::incoming_rsp`].
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn ta_get_glyphs_entry(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+    a13: u64,
+    a14: u64,
+    a15: u64,
+) -> HRESULT {
+    let (Some(a16), Some(a17)) = (read_win64_stack_slot(16), read_win64_stack_slot(17)) else {
+        return E_INVALIDARG;
+    };
+    ta_get_glyphs(
+        a0 as PTextAnalyzer,
+        a1 as *const u16,
+        a2 as u32,
+        a3 as *mut c_void,
+        a4 as BOOL,
+        a5 as BOOL,
+        a6 as *const DWRITE_SCRIPT_ANALYSIS,
+        a7 as *const u16,
+        a8 as *mut c_void,
+        a9 as *const *const c_void,
+        a10 as *const u32,
+        a11 as u32,
+        a12 as u32,
+        a13 as *mut u16,
+        a14 as *mut DWRITE_SHAPING_TEXT_PROPERTIES,
+        a15 as *mut u16,
+        a16 as *mut DWRITE_SHAPING_GLYPH_PROPERTIES,
+        a17 as *mut u32,
+    )
+}
+
+/// Guest-ABI entry thunk for `IDWriteTextAnalyzer::GetGlyphPlacements` (19 parameters).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn ta_get_glyph_placements_entry(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+    a13: u64,
+    a14: u64,
+    a15: u64,
+) -> HRESULT {
+    let (Some(a16), Some(a17), Some(a18)) = (
+        read_win64_stack_slot(16),
+        read_win64_stack_slot(17),
+        read_win64_stack_slot(18),
+    ) else {
+        return E_INVALIDARG;
+    };
+    ta_get_glyph_placements(
+        a0 as PTextAnalyzer,
+        a1 as *const u16,
+        a2 as *const u16,
+        a3 as *const DWRITE_SHAPING_TEXT_PROPERTIES,
+        a4 as u32,
+        a5 as *const u16,
+        a6 as *const DWRITE_SHAPING_GLYPH_PROPERTIES,
+        a7 as u32,
+        a8 as *mut c_void,
+        a9 as u32,
+        a10 as BOOL,
+        a11 as BOOL,
+        a12 as *const DWRITE_SCRIPT_ANALYSIS,
+        a13 as *const u16,
+        a14 as *const *const c_void,
+        a15 as *const u32,
+        a16 as u32,
+        a17 as *mut f32,
+        a18 as *mut DWRITE_GLYPH_OFFSET,
+    )
+}
+
+/// Guest-ABI entry thunk for `IDWriteTextAnalyzer::GetGdiCompatibleGlyphPlacements` (22 parameters).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn ta_get_gdi_compatible_glyph_placements_entry(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+    a13: u64,
+    a14: u64,
+    a15: u64,
+) -> HRESULT {
+    let (Some(a16), Some(a17), Some(a18), Some(a19), Some(a20), Some(a21)) = (
+        read_win64_stack_slot(16),
+        read_win64_stack_slot(17),
+        read_win64_stack_slot(18),
+        read_win64_stack_slot(19),
+        read_win64_stack_slot(20),
+        read_win64_stack_slot(21),
+    ) else {
+        return E_INVALIDARG;
+    };
+    ta_get_gdi_compatible_glyph_placements(
+        a0 as PTextAnalyzer,
+        a1 as *const u16,
+        a2 as *const u16,
+        a3 as *const DWRITE_SHAPING_TEXT_PROPERTIES,
+        a4 as u32,
+        a5 as *const u16,
+        a6 as *const DWRITE_SHAPING_GLYPH_PROPERTIES,
+        a7 as u32,
+        a8 as *mut c_void,
+        a9 as u32,
+        a10 as u32,
+        a11 as *const DWRITE_MATRIX,
+        a12 as BOOL,
+        a13 as BOOL,
+        a14 as BOOL,
+        a15 as *const DWRITE_SCRIPT_ANALYSIS,
+        a16 as *const u16,
+        a17 as *const *const c_void,
+        a18 as *const u32,
+        a19 as u32,
+        a20 as *mut f32,
+        a21 as *mut DWRITE_GLYPH_OFFSET,
+    )
+}
+
 fn text_analyzer_vtbl() -> *const usize {
     static V: OnceLock<[usize; 10]> = OnceLock::new();
     register_vtable_once(&V, || {
+        #[cfg(target_arch = "aarch64")]
+        let (get_glyphs, get_placements, get_gdi_placements) = (
+            ta_get_glyphs_entry as *const () as usize,
+            ta_get_glyph_placements_entry as *const () as usize,
+            ta_get_gdi_compatible_glyph_placements_entry as *const () as usize,
+        );
+        #[cfg(not(target_arch = "aarch64"))]
+        let (get_glyphs, get_placements, get_gdi_placements) = (
+            ta_get_glyphs as *const () as usize,
+            ta_get_glyph_placements as *const () as usize,
+            ta_get_gdi_compatible_glyph_placements as *const () as usize,
+        );
         [
             ta_qi as *const () as usize,                                    // 0
             com_add_ref::<TextAnalyzerInner> as *const () as usize,         // 1
@@ -597,9 +786,9 @@ fn text_analyzer_vtbl() -> *const usize {
             ta_analyze_bidi as *const () as usize,                          // 4
             ta_analyze_number_substitution as *const () as usize,           // 5
             ta_analyze_line_breakpoints as *const () as usize,              // 6
-            ta_get_glyphs as *const () as usize,                            // 7
-            ta_get_glyph_placements as *const () as usize,                  // 8
-            ta_get_gdi_compatible_glyph_placements as *const () as usize,   // 9
+            get_glyphs,                                                     // 7
+            get_placements,                                                 // 8
+            get_gdi_placements,                                             // 9
         ]
     })
 }
