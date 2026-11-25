@@ -1683,6 +1683,15 @@ int main(void) {
         fprintf(stderr, "FAIL: precision on character field\n");
         return 6;
     }
+    WCHAR acute = 0x00e9;
+    char encoded[8];
+    int bytes = WideCharToMultiByte(CP_ACP, 0, &acute, 1, encoded, sizeof(encoded), NULL, NULL);
+    n = wsprintfA(abuf, "A%.1CB", acute);
+    if (bytes <= 0 || n != bytes + 2 || abuf[0] != 'A' ||
+        memcmp(abuf + 1, encoded, bytes) || abuf[n - 1] != 'B' || abuf[n] != 0) {
+        fprintf(stderr, "FAIL: precision split an encoded character\n");
+        return 7;
+    }
     memset(abuf, '!', sizeof(abuf));
     n = wsprintfA(abuf, "%2000d", 1);
     if (n >= 2000 || abuf[1023] != 0 || abuf[1024] != '!') {
