@@ -177,6 +177,7 @@ pub struct FileObj {
     pub flags: u32,
     pub append: bool,
     delete_on_close: Mutex<bool>,
+    io_priority_hint: AtomicU8,
     completion: Arc<IoCompletionBinding>,
     /// Unread peek buffer for pipes (`PeekNamedPipe` fills; `ReadFile`/`ReadFileEx` drains first).
     peek_buf: Mutex<VecDeque<u8>>,
@@ -186,8 +187,6 @@ pub struct FileObj {
     named_pipe_server: Option<Arc<NamedPipeServer>>,
     /// Stateful directory enumeration cursor for `GetFileInformationByHandleEx` dir classes.
     dir_enum: Mutex<Option<DirEnumState>>,
-    /// Per-handle I/O priority hint (`FILE_IO_PRIORITY_HINT_INFO`, default `2` = `IoPriorityNormal`).
-    io_priority: Mutex<u32>,
 }
 
 impl FileObj {
@@ -202,12 +201,12 @@ impl FileObj {
             flags,
             append: false,
             delete_on_close: Mutex::new(flags & FILE_FLAG_DELETE_ON_CLOSE != 0),
+            io_priority_hint: AtomicU8::new(2), // IoPriorityHintNormal
             completion: Arc::new(IoCompletionBinding::new()),
             peek_buf: Mutex::new(VecDeque::new()),
             dir_watcher: Mutex::new(None),
             named_pipe_server: None,
             dir_enum: Mutex::new(None),
-            io_priority: Mutex::new(2),
         }
     }
     pub fn fd(&self) -> i32 {
@@ -2665,7 +2664,7 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             }
             (out as *mut u32).write_unaligned((w.len() * 2) as u32);
             let room = (size as usize - 4) / 2;
-            std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, out.add(4), w.len().min(room) * 2);
+            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), out.add(4), 2 * w.len().min(room));
             if w.len() > room {
                 set_err(err::ERROR_MORE_DATA);
                 return FALSE;
@@ -2673,33 +2672,38 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
         }
         7 => {
             // FileStreamInfo: NTFS exposes default "::$DATA" stream for regular files;
-            // directories have no unnamed data stream and return ERROR_HANDLE_EOF.
-            if m.is_dir() {
+            // non-regular files (e.g. directories) have no unnamed data stream and return ERROR_HANDLE_EOF.
+            if !m.is_file() {
                 set_err(err::ERROR_HANDLE_EOF);
                 return FALSE;
             }
             let stream_name = to_wide("::$DATA");
             let name_bytes = stream_name.len() * 2;
-            let total = 24 + name_bytes;
-            if (size as usize) < total {
-                set_err(err::ERROR_MORE_DATA);
+            if !need((24 + name_bytes) as u32) {
                 return FALSE;
             }
             std::ptr::write_bytes(out, 0, 24);
-            (out as *mut u32).write_unaligned(0); // NextEntryOffset
+            (out as *mut u32).write_unaligned(0); // NextEntryOffset (last stream)
             (out.add(4) as *mut u32).write_unaligned(name_bytes as u32);
             put_ft(out.add(8), m.len());
             put_ft(out.add(16), (m.blocks() * 512).max(m.len()));
-            std::ptr::copy_nonoverlapping(stream_name.as_ptr() as *const u8, out.add(24), name_bytes);
+            std::ptr::copy_nonoverlapping(stream_name.as_ptr().cast::<u8>(), out.add(24), name_bytes);
         }
         8 => {
-            // FileCompressionInfo (16 bytes)
+            // FileCompressionInfo (16 bytes): the guest volume exposes uncompressed files.
             if !need(16) {
                 return FALSE;
             }
             std::ptr::write_bytes(out, 0, 16);
             put_ft(out, m.len());
             // CompressionFormat = COMPRESSION_FORMAT_NONE (0)
+        }
+        12 => {
+            // FileIoPriorityHintInfo (4 bytes)
+            if !need(4) {
+                return FALSE;
+            }
+            out.cast::<u32>().write_unaligned(f.io_priority_hint.load(Ordering::Relaxed) as u32);
         }
         9 => {
             // FileAttributeTagInfo (8 bytes)
@@ -2779,7 +2783,7 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             let flags: u32 = if cs > 0 { 1 } else { 0 };
             (out as *mut u32).write_unaligned(flags);
         }
-        // Write-only classes (3=Rename, 4=Disposition, 5=Allocation, 6=EndOfFile, 12=IoPriorityHint,
+        // Write-only classes (3=Rename, 4=Disposition, 5=Allocation, 6=EndOfFile,
         // 21=DispositionEx, 22=RenameEx) and out-of-range values (>= MaximumFileInfoByHandleClass)
         // fail with ERROR_INVALID_PARAMETER on Windows.
         _ => {
@@ -2799,6 +2803,18 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    let minimum = match class {
+        0 => 40,
+        3 | 22 => 22,
+        4 => 1,
+        5 | 6 => 8,
+        12 | 21 | 23 => 4,
+        _ => 0,
+    };
+    if size < minimum {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     match class {
         0 => {
             // FileBasicInfo (40 bytes): times (0 or -1 = don't change) and optional read-only attribute.
@@ -2835,10 +2851,6 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
         3 | 22 => {
             // FileRenameInfo (3) / FileRenameInfoEx (22):
             // x64 layout: { DWORD Flags/ReplaceIfExists (@0); HANDLE RootDirectory (@8); DWORD FileNameLength (@16); WCHAR FileName[] (@20) }
-            if size < 22 {
-                set_err(err::ERROR_INVALID_PARAMETER);
-                return FALSE;
-            }
             let replace = if class == 3 {
                 *info != 0
             } else {
@@ -2918,44 +2930,47 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
                 set_err(err::ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
-            if f.is_protected_native() {
+            if f.access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA) == 0 || f.is_protected_native() {
                 set_err(err::ERROR_ACCESS_DENIED);
                 return FALSE;
             }
             if class == 5 {
-                let mut st: libc::stat = std::mem::zeroed();
-                let (cur_len, cur_alloc) = if libc::fstat(f.fd(), &mut st) == 0 {
-                    (st.st_size, (st.st_blocks as i64).saturating_mul(512).max(st.st_size))
-                } else {
-                    let l = f.file().metadata().map(|m| m.len() as i64).unwrap_or(0);
-                    (l, l)
-                };
-                if len < cur_len {
-                    // Windows shrinks EndOfFile when AllocationSize is set smaller than EOF.
-                    if libc::ftruncate(f.fd(), len) != 0 {
-                        set_err(errno_to_win32(last_errno()));
+                let meta = match f.file().metadata() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        set_err(io_err(&e));
                         return FALSE;
                     }
-                } else if len > cur_alloc {
+                };
+                if (len as u64) >= meta.len() {
+                    let allocated = meta.blocks() * 512;
+                    let cluster = meta.blksize().max(1);
+                    if (len as u64).next_multiple_of(cluster) < allocated {
+                        // Darwin F_PREALLOCATE can only extend past physical EOF. Shrinking
+                        // reserved space here by changing EOF would expose data to other handles.
+                        set_err(err::ERROR_NOT_SUPPORTED);
+                        return FALSE;
+                    }
+                    let extra = (len as u64).saturating_sub(allocated);
+                    if extra == 0 {
+                        return TRUE;
+                    }
                     #[cfg(target_vendor = "apple")]
                     {
-                        let mut store = libc::fstore_t {
-                            fst_flags: libc::F_ALLOCATECONTIG,
+                        let mut request = libc::fstore_t {
+                            fst_flags: libc::F_ALLOCATEALL,
                             fst_posmode: libc::F_PEOFPOSMODE,
                             fst_offset: 0,
-                            fst_length: len - cur_alloc,
+                            fst_length: extra as i64,
                             fst_bytesalloc: 0,
                         };
-                        if libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut store) == -1 {
-                            store.fst_flags = libc::F_ALLOCATEALL;
-                            if libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut store) == -1 {
-                                set_err(errno_to_win32(last_errno()));
-                                return FALSE;
-                            }
+                        if libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut request) == -1 {
+                            set_err(errno_to_win32(last_errno()));
+                            return FALSE;
                         }
                     }
+                    return TRUE;
                 }
-                return TRUE;
             }
             if libc::ftruncate(f.fd(), len) != 0 {
                 set_err(errno_to_win32(last_errno()));
@@ -2965,25 +2980,18 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
         }
         12 => {
             // FileIoPriorityHintInfo (4 bytes): 0=VeryLow, 1=Low, 2=Normal
-            if size < 4 {
+            let hint = info.cast::<u32>().read_unaligned();
+            if hint > 2 {
                 set_err(err::ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
-            let prio = (info as *const u32).read_unaligned();
-            if prio >= 3 {
-                set_err(err::ERROR_INVALID_PARAMETER);
-                return FALSE;
-            }
-            *f.io_priority.lock().unwrap() = prio;
+            // Windows treats this as an advisory property of the open file object.
+            f.io_priority_hint.store(hint as u8, Ordering::Relaxed);
             TRUE
         }
         23 => {
             // FileCaseSensitiveInfo (4 bytes): APFS volume case-sensitivity is fixed at format time;
             // succeed if matching the volume's actual mode, else fail with ERROR_NOT_SUPPORTED.
-            if size < 4 {
-                set_err(err::ERROR_INVALID_PARAMETER);
-                return FALSE;
-            }
             let req = (info as *const u32).read_unaligned();
             if (req & !1) != 0 {
                 set_err(err::ERROR_INVALID_PARAMETER);
