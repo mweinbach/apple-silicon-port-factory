@@ -299,13 +299,27 @@ fn emit_f80_to_f32_exact(
 }
 
 impl Tr<'_> {
+    /// Load `X87State*` into `XA` and invalidate the cached guest effective address `xa_key`.
+    #[inline]
+    fn load_x87_state(&mut self) {
+        self.xa_key = None;
+        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+    }
+
+    /// Compute the guest effective address of `op` into `XA` and invalidate any prior `xa_key`.
+    #[inline]
+    fn addr_x87(&mut self, op: &FastOp) -> u32 {
+        self.xa_key = None;
+        self.addr_into(op, XA)
+    }
+
     /// Flush any deferred static x87 TOP / `SW[13:11]` updates into `X87State`.
     /// Preserves NZCV and `x87_top_known`.
     pub(super) fn flush_x87_top(&mut self) {
         if !self.x87_top_dirty && !self.x87_sw_top_dirty {
             return;
         }
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         emit_flush_top_raw(
             &mut self.a,
             XA,
@@ -324,7 +338,7 @@ impl Tr<'_> {
         if !top_dirty && !sw_top_dirty {
             return;
         }
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         emit_flush_top_raw(&mut self.a, XA, XS, T0, top_known, top_dirty, sw_top_dirty);
     }
 
@@ -416,6 +430,7 @@ impl Tr<'_> {
     /// Caller must have loaded `x1..x3` (args) already; this loads `x0 = X87State*` and
     /// `XA = helper_fn_ptr`. Preserves guest GPRs, `XCPU`, `XBUD`, `XRAS`, `v16..v31`, `NZCV`.
     fn emit_call_x87_helper(&mut self, helper_off: u32) {
+        self.xa_key = None;
         self.a.ldr(64, T0, XCPU, OFF_X87_STATE);
         self.a.ldr(64, XA, XCPU, OFF_X87_HELPERS);
         self.a.ldr(64, XA, XA, helper_off);
@@ -431,7 +446,7 @@ impl Tr<'_> {
                 // Zero all 8 register slots + set cw = 0x037F, sw = 0, fop = 0, top = 0, valid_mask = 0,
                 // fip = 0, fdp = 0 (matches `x87_reset()` bit-for-bit across all tiers).
                 // Does NOT touch NZCV!
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 for slot in 0..8i32 {
                     self.a.stp_x(ZR, ZR, XA, slot * 16);
                 }
@@ -445,7 +460,7 @@ impl Tr<'_> {
             }
             X87_FNCLEX => {
                 // Does NOT touch NZCV!
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.a.ldr(16, T0, XA, OFF_X87_SW);
                 self.a.movz(false, T1, 0x80FF, 0);
                 self.a.bic_rr(false, T0, T0, T1);
@@ -454,32 +469,32 @@ impl Tr<'_> {
             X87_FLDCW => {
                 // Does NOT touch NZCV!
                 self.load_op(k, T0, op, 16);
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.a.str(16, T0, XA, OFF_X87_CW);
             }
             X87_FNSTCW => {
                 // Does NOT touch NZCV!
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.a.ldr(16, T0, XA, OFF_X87_CW);
                 self.store_op(k, T0, op, 16);
             }
             X87_FNSTSW_AX => {
                 // Does NOT touch NZCV!
                 self.flush_x87_top();
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.a.ldr(16, T0, XA, OFF_X87_SW);
                 self.wr_gpr(0, 16, T0);
             }
             X87_FNSTSW_M => {
                 // Does NOT touch NZCV!
                 self.flush_x87_top();
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.a.ldr(16, T0, XA, OFF_X87_SW);
                 self.store_op(k, T0, op, 16);
             }
             X87_FDECSTP | X87_FINCSTP => {
                 // Does NOT touch NZCV!
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.a.ldr(16, T0, XA, OFF_X87_SW);
                 self.a.logic_ri(false, 0, T0, T0, enc_logic_imm(!(SW_C1 as u64), false).unwrap());
                 self.a.str(16, T0, XA, OFF_X87_SW);
@@ -488,7 +503,7 @@ impl Tr<'_> {
             }
             X87_FFREE => {
                 // Does NOT touch NZCV!
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.emit_phys_idx(XA, op.r0, T0);
                 self.a.ldr(8, T1, XA, OFF_X87_VALID);
                 self.a.movz(false, T2, 1, 0);
@@ -509,7 +524,7 @@ impl Tr<'_> {
             X87_FXCH => {
                 self.flush_flags(self.live[k]);
                 self.fs.host = 0;
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 // Clear C1
                 self.a.ldr(16, T0, XA, OFF_X87_SW);
                 self.a.logic_ri(false, 0, T0, T0, enc_logic_imm(!(SW_C1 as u64), false).unwrap());
@@ -554,7 +569,7 @@ impl Tr<'_> {
             X87_FABS | X87_FCHS => {
                 self.flush_flags(self.live[k]);
                 self.fs.host = 0;
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.a.ldr(16, T0, XA, OFF_X87_SW);
                 self.a.logic_ri(false, 0, T0, T0, enc_logic_imm(!(SW_C1 as u64), false).unwrap());
                 self.a.str(16, T0, XA, OFF_X87_SW);
@@ -591,7 +606,7 @@ impl Tr<'_> {
                 self.fs.host = 0;
                 let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                 let mut cold_sites = Vec::new();
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.emit_slot_ptr(XA, op.r0, T1, T2); // src
                 self.emit_slot_ptr(XA, 7, T3, T4); // new_top = (top - 1) & 7
                 // Require src valid AND new_top empty; else cold helper.
@@ -626,7 +641,7 @@ impl Tr<'_> {
                     self.fs.host = 0;
                     let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                     let mut cold_sites = Vec::new();
-                    self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                    self.load_x87_state();
                     self.emit_slot_ptr(XA, 7, T1, T2);
                     self.emit_test_valid(XA, T2, T3, T4);
                     cold_sites.push(self.a.bcond(NE)); // overflow -> cold
@@ -677,7 +692,7 @@ impl Tr<'_> {
                         } else {
                             emit_f32_to_f80(&mut self.a, T6, T0, T1, T2, T3, T4, &mut cold_sites);
                         }
-                        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                        self.load_x87_state();
                         self.emit_slot_ptr(XA, 7, T2, T3);
                         self.emit_test_valid(XA, T3, T4, T5);
                         cold_sites.push(self.a.bcond(NE)); // overflow -> cold
@@ -700,7 +715,7 @@ impl Tr<'_> {
                     }
                     _ => {
                         // m80fp (10 bytes): range-check [a, a+10), load (lo=T5, hi=T6), push inline.
-                        let a = self.addr_into(op, XA);
+                        let a = self.addr_x87(op);
                         self.range_check_span(k, a, 10, T0);
                         self.a.ldr(64, T5, a, 0);
                         self.a.ldr(16, T6, a, 8);
@@ -709,7 +724,7 @@ impl Tr<'_> {
                         }
                         let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                         let mut cold_sites = Vec::new();
-                        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                        self.load_x87_state();
                         self.emit_slot_ptr(XA, 7, T0, T1);
                         self.emit_test_valid(XA, T1, T2, T3);
                         cold_sites.push(self.a.bcond(NE)); // overflow -> cold
@@ -742,7 +757,7 @@ impl Tr<'_> {
                 }
                 let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                 let mut cold_sites = Vec::new();
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.emit_slot_ptr(XA, 7, T2, T3);
                 self.emit_test_valid(XA, T3, T4, T5);
                 cold_sites.push(self.a.bcond(NE)); // overflow -> cold
@@ -784,7 +799,7 @@ impl Tr<'_> {
                 let pop = op.w != 0;
                 let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                 let mut cold_sites = Vec::new();
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.emit_slot_ptr(XA, 0, T1, T2); // p0
                 self.emit_slot_ptr(XA, op.r0, T3, T4); // pi
                 self.emit_test_valid(XA, T2, T5, T0);
@@ -823,12 +838,12 @@ impl Tr<'_> {
                 let pop = op.r1 != 0;
                 let sz = op.w;
                 // Range-check destination address BEFORE mutating any x87 state!
-                let a = self.addr_into(op, XA);
+                let a = self.addr_x87(op);
                 self.range_check_span(k, a, sz as u32, T0);
                 self.a.mov_rr(true, T6, a); // save checked address in T6 for hot store
                 let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                 let mut cold_sites = Vec::new();
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.emit_slot_ptr(XA, 0, T0, T1);
                 self.emit_test_valid(XA, T1, T2, T3);
                 cold_sites.push(self.a.bcond(EQ)); // empty -> cold
@@ -884,12 +899,12 @@ impl Tr<'_> {
                 let pop = (op.r1 & 1) != 0;
                 let trunc = (op.r1 & 2) != 0;
                 // Range-check destination address BEFORE mutating x87 state!
-                let a = self.addr_into(op, XA);
+                let a = self.addr_x87(op);
                 self.range_check_span(k, a, sz, T0);
                 self.a.mov_rr(true, T6, a);
                 let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                 let mut cold_sites = Vec::new();
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 self.emit_slot_ptr(XA, 0, T0, T1);
                 self.emit_test_valid(XA, T1, T2, T3);
                 cold_sites.push(self.a.bcond(EQ)); // empty -> cold
@@ -1011,7 +1026,7 @@ impl Tr<'_> {
                 self.fs.host = 0;
                 let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                 let mut cold_sites = Vec::new();
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 // Always clear SW.C1 even when condition is false.
                 self.a.ldr(16, T0, XA, OFF_X87_SW);
                 self.a.logic_ri(false, 0, T0, T0, enc_logic_imm(!(SW_C1 as u64), false).unwrap());
@@ -1045,7 +1060,7 @@ impl Tr<'_> {
             }
             X87_FBLD => {
                 // Range-check [a, a+10), load 10 bytes, call native Rust BCD helper.
-                let a = self.addr_into(op, XA);
+                let a = self.addr_x87(op);
                 self.range_check_span(k, a, 10, T0);
                 self.a.ldr(64, T1, a, 0);
                 self.a.ldr(16, T2, a, 8);
@@ -1060,12 +1075,12 @@ impl Tr<'_> {
             }
             X87_FBSTP => {
                 // Range-check [a, a+10) BEFORE mutating x87 state!
-                let a = self.addr_into(op, XA);
+                let a = self.addr_x87(op);
                 self.range_check_span(k, a, 10, T0);
                 self.flush_x87_top();
                 self.emit_call_x87_helper(H_FBSTP);
                 // Helper returns (x0=lo, x1=hi); recompute guest addr into XA and store!
-                let a = self.addr_into(op, XA);
+                let a = self.addr_x87(op);
                 if mem::tso() {
                     self.a.dmb_ishst();
                 }
@@ -1085,7 +1100,7 @@ impl Tr<'_> {
                     (true, true) => 94,
                     (true, false) => 108,
                 };
-                let a = self.addr_into(op, XA);
+                let a = self.addr_x87(op);
                 self.range_check_span(k, a, len, T0);
                 self.a.mov_rr(true, T1, a);
                 self.flush_x87_top();
@@ -1161,7 +1176,7 @@ impl Tr<'_> {
         let pop = (op.w & 8) != 0;
         let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
         let mut cold_sites = Vec::new();
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         // Check CW.PC: 2 = 53-bit (f64 fast path), 0 = 24-bit (f32 fast path), 1|3 = 64-bit -> cold.
         self.a.ldr(16, T0, XA, OFF_X87_CW);
         self.a.ubfm(false, T0, T0, 8, 9);
@@ -1259,7 +1274,7 @@ impl Tr<'_> {
         }
         let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
         let mut cold_sites = Vec::new();
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         // Fast path for PC == 53-bit (Win64 default); PC == 24/64 -> cold soft-f80 helper.
         self.a.ldr(16, T0, XA, OFF_X87_CW);
         self.a.ubfm(false, T0, T0, 8, 9);
@@ -1326,7 +1341,7 @@ impl Tr<'_> {
         self.fs.host = 0;
         let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
         let mut cold_sites = Vec::new();
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         self.a.ldr(16, T0, XA, OFF_X87_CW);
         self.a.ubfm(false, T0, T0, 8, 9);
         self.a.addsub_ri(false, true, true, ZR, T0, 2, false);
@@ -1413,7 +1428,7 @@ impl Tr<'_> {
         self.fs.host = 0;
         let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
         let mut cold_sites = Vec::new();
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         self.emit_slot_ptr(XA, 0, T1, T2);
         self.emit_test_valid(XA, T2, T3, T4);
         cold_sites.push(self.a.bcond(EQ));
@@ -1463,7 +1478,7 @@ impl Tr<'_> {
         }
         let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
         let mut cold_sites = Vec::new();
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         self.emit_slot_ptr(XA, 0, T1, T2);
         self.emit_slot_ptr(XA, op.r0, T3, T4);
         self.a.ldr(8, T5, XA, OFF_X87_VALID);
@@ -1579,7 +1594,7 @@ impl Tr<'_> {
             self.a.fmov_gf(false, 1, T6);
             self.a.fcvt_d_s(1, 1);
         }
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         self.emit_slot_ptr(XA, 0, T1, T2);
         self.emit_test_valid(XA, T2, T3, T4);
         cold_sites.push(self.a.bcond(EQ));
@@ -1622,7 +1637,7 @@ impl Tr<'_> {
         self.fs.host = 0;
         let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
         let mut cold_sites = Vec::new();
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_state();
         self.emit_slot_ptr(XA, 0, T1, T2);
         self.emit_test_valid(XA, T2, T3, T4);
         cold_sites.push(self.a.bcond(EQ));
@@ -1667,7 +1682,7 @@ impl Tr<'_> {
             // (Preserve T5 and T6 because `FldF32`/`FldF64`/`FldF80`/`FildI64`/`BinopMem`/`CmpMem`
             // pass loaded memory operands in T5/T6!)
             if c.top_dirty || c.sw_top_dirty {
-                self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                self.load_x87_state();
                 emit_flush_top_raw(&mut self.a, XA, XS, T0, c.top_known, c.top_dirty, c.sw_top_dirty);
             }
             match c.kind {
@@ -1707,7 +1722,7 @@ impl Tr<'_> {
                             self.a.movz(false, T1, pop as u32, 0);
                             self.emit_call_x87_helper(H_FST_F32);
                             self.a.mov_rr(false, T4, T0);
-                            let a = self.addr_into(&op, XA);
+                            let a = self.addr_x87(&op);
                             if mem::tso() {
                                 self.a.dmb_ishst();
                             }
@@ -1717,7 +1732,7 @@ impl Tr<'_> {
                             self.a.movz(false, T1, pop as u32, 0);
                             self.emit_call_x87_helper(H_FST_F64);
                             self.a.mov_rr(true, T4, T0);
-                            let a = self.addr_into(&op, XA);
+                            let a = self.addr_x87(&op);
                             if mem::tso() {
                                 self.a.dmb_ishst();
                             }
@@ -1727,7 +1742,7 @@ impl Tr<'_> {
                             self.emit_call_x87_helper(H_FSTP_F80);
                             self.a.mov_rr(true, T4, T0);
                             self.a.mov_rr(true, T5, T1);
-                            let a = self.addr_into(&op, XA);
+                            let a = self.addr_x87(&op);
                             if mem::tso() {
                                 self.a.dmb_ishst();
                             }
@@ -1741,7 +1756,7 @@ impl Tr<'_> {
                     self.a.movz(false, T2, flags as u32, 0);
                     self.emit_call_x87_helper(H_FIST);
                     self.a.mov_rr(true, T4, T0);
-                    let a = self.addr_into(&op, XA);
+                    let a = self.addr_x87(&op);
                     if mem::tso() {
                         self.a.dmb_ishst();
                     }

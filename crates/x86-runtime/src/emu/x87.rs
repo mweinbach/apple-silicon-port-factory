@@ -599,8 +599,12 @@ impl Fp80 {
                 let s = if a.sign == b.sign { a.sign } else { u8::from(rc == RC_RM) };
                 Self::zero(s)
             }
-            (Fp80Kind::Zero, _) => b,
-            (_, Fp80Kind::Zero) => a,
+            (Fp80Kind::Zero, Fp80Kind::Finite) => {
+                Self::round_from_parts(b.sign, b.exp, b.sig, 0, prec, rc, sw)
+            }
+            (Fp80Kind::Finite, Fp80Kind::Zero) => {
+                Self::round_from_parts(a.sign, a.exp, a.sig, 0, prec, rc, sw)
+            }
             (Fp80Kind::Finite, Fp80Kind::Finite) => {
                 // Ensure |big| >= |small|.
                 let (big, small) = if a.exp > b.exp || (a.exp == b.exp && a.sig >= b.sig) {

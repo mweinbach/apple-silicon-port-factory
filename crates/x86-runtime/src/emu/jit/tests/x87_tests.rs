@@ -1372,3 +1372,183 @@ fn x87_differential_env16_fcomi_jcc_and_static_top_cold_fallback() {
         assert_eq!(fr.rax, want_rax, "fcomi_jcc case {case_i}");
     }
 }
+
+/// 9. Regression: x87 lowering must invalidate `Tr::xa_key` whenever it overwrites `XA`
+/// (both when `load_op` populates `xa_key` before `load_x87_state` and when an earlier
+/// ordinary memory access populated `xa_key` before `fnstcw`/`fnstsw`/`fstp`/`fistp`).
+#[test]
+fn x87_xa_key_invalidation_with_indexed_mem() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 512];
+    let f_val: f32 = 12.5;
+    let f_add: f32 = 3.25;
+    let i_val: i32 = 42;
+    let cw_val: u16 = 0x027F;
+    init[16..20].copy_from_slice(&f_val.to_bits().to_le_bytes()); // [rcx + 4*4]
+    init[32..36].copy_from_slice(&f_add.to_bits().to_le_bytes()); // [rcx + 8*4]
+    init[48..52].copy_from_slice(&i_val.to_le_bytes());           // [rcx + 12*4]
+    init[64..66].copy_from_slice(&cw_val.to_le_bytes());          // [rcx + 16*4]
+    init[80..84].copy_from_slice(&0x1122_3344u32.to_le_bytes());  // [rcx + 20*4]
+    init[96..100].copy_from_slice(&0x5566_7788u32.to_le_bytes()); // [rcx + 24*4]
+
+    let code = assemble(|a| {
+        a.fninit().unwrap();
+        // Pattern 1: fld dword ptr [rcx + rdx*4] populates xa_key, clobbers XA with X87State*,
+        // then `mov eax, [rcx + rdx*4]` MUST still read guest memory, NOT X87State!
+        a.mov(rdx, 4u64).unwrap();
+        a.fld(dword_ptr(rcx + rdx * 4)).unwrap();
+        a.mov(eax, dword_ptr(rcx + rdx * 4)).unwrap();
+        a.mov(dword_ptr(rcx + 128), eax).unwrap();
+
+        // Pattern 2: fadd dword ptr [rcx + rdx*4] followed by mov eax, [rcx + rdx*4]
+        a.mov(rdx, 8u64).unwrap();
+        a.fadd(dword_ptr(rcx + rdx * 4)).unwrap();
+        a.mov(eax, dword_ptr(rcx + rdx * 4)).unwrap();
+        a.mov(dword_ptr(rcx + 132), eax).unwrap();
+
+        // Pattern 3: fild dword ptr [rcx + rdx*4] followed by mov eax, [rcx + rdx*4]
+        a.mov(rdx, 12u64).unwrap();
+        a.fild(dword_ptr(rcx + rdx * 4)).unwrap();
+        a.mov(eax, dword_ptr(rcx + rdx * 4)).unwrap();
+        a.mov(dword_ptr(rcx + 136), eax).unwrap();
+        a.faddp(st1, st0).unwrap(); // ST(0) = 12.5 + 3.25 + 42.0 = 57.75
+
+        // Pattern 4: fldcw word ptr [rcx + rdx*4] followed by movzx eax, word ptr [rcx + rdx*4]
+        a.mov(rdx, 16u64).unwrap();
+        a.fldcw(word_ptr(rcx + rdx * 4)).unwrap();
+        a.movzx(eax, word_ptr(rcx + rdx * 4)).unwrap();
+        a.mov(dword_ptr(rcx + 140), eax).unwrap();
+
+        // Pattern 5: ordinary load sets xa_key, then fnstcw/fnstsw store to the SAME indexed address!
+        a.mov(rdx, 20u64).unwrap();
+        a.mov(eax, dword_ptr(rcx + rdx * 4)).unwrap();
+        a.fnstcw(word_ptr(rcx + rdx * 4)).unwrap();
+        a.mov(rdx, 24u64).unwrap();
+        a.mov(eax, dword_ptr(rcx + rdx * 4)).unwrap();
+        a.fnstsw(word_ptr(rcx + rdx * 4)).unwrap();
+
+        // Pattern 6: ordinary load sets xa_key, then fstp stores to the same indexed address!
+        a.mov(rdx, 40u64).unwrap(); // [rcx + 160]
+        a.mov(eax, dword_ptr(rcx + rdx * 4)).unwrap();
+        a.fstp(dword_ptr(rcx + rdx * 4)).unwrap();
+    });
+
+    let r = run_diff_x87("xa_key_invalidation", &code, &init);
+    assert_eq!(u32::from_le_bytes(r.data[128..132].try_into().unwrap()), f_val.to_bits());
+    assert_eq!(u32::from_le_bytes(r.data[132..136].try_into().unwrap()), f_add.to_bits());
+    assert_eq!(i32::from_le_bytes(r.data[136..140].try_into().unwrap()), i_val);
+    assert_eq!(u32::from_le_bytes(r.data[140..144].try_into().unwrap()), cw_val as u32);
+    assert_eq!(u16::from_le_bytes(r.data[80..82].try_into().unwrap()), cw_val);
+    assert_eq!(
+        f32::from_bits(u32::from_le_bytes(r.data[160..164].try_into().unwrap())),
+        57.75f32
+    );
+}
+
+/// 10. Regression: FADD/FSUB with a zero operand must still apply CW.PC precision rounding
+/// and raise SW.PE when the nonzero operand has extra significand bits beyond CW.PC.
+#[test]
+fn x87_add_sub_zero_precision_rounding() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 512];
+    // m80 value = 1 + 2^-60: sig = 0x8000_0000_0000_0008, exp_biased = 0x3FFF
+    init[0..8].copy_from_slice(&0x8000_0000_0000_0008u64.to_le_bytes());
+    init[8..10].copy_from_slice(&0x3FFFu16.to_le_bytes());
+    // Control words:
+    init[16..18].copy_from_slice(&0x027Fu16.to_le_bytes()); // PC=53, RN
+    init[18..20].copy_from_slice(&0x0A7Fu16.to_le_bytes()); // PC=53, RP (+inf)
+    init[20..22].copy_from_slice(&0x007Fu16.to_le_bytes()); // PC=24, RN
+    init[22..24].copy_from_slice(&0x037Fu16.to_le_bytes()); // PC=64, RN
+
+    let code = assemble(|a| {
+        // Case 1: PC=53, RN: (1 + 2^-60) + 0.0 -> 1.0 (sig = 0x8000_0000_0000_0000), SW.PE = 1
+        a.fninit().unwrap();
+        a.fldcw(word_ptr(rcx + 16)).unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fldz().unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 64)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 80)).unwrap();
+
+        // Case 2: PC=53, RN: 0.0 + (1 + 2^-60) -> reversed operand order
+        a.fnclex().unwrap();
+        a.fldz().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 66)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 96)).unwrap();
+
+        // Case 3: PC=53, RN: 0.0 - (1 + 2^-60) -> -1.0 (sig = 0x8000_0000_0000_0000, se = 0xBFFF), SW.PE = 1
+        a.fnclex().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fldz().unwrap();
+        a.fsubp(st1, st0).unwrap(); // ST(1) - ST(0) = (1 + 2^-60) - 0.0
+        a.fnstsw(word_ptr(rcx + 68)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 112)).unwrap();
+
+        a.fnclex().unwrap();
+        a.fldz().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fsubp(st1, st0).unwrap(); // ST(1) - ST(0) = 0.0 - (1 + 2^-60)
+        a.fnstsw(word_ptr(rcx + 70)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 128)).unwrap();
+
+        // Case 4: PC=53, RP (+inf): (1 + 2^-60) + 0.0 -> 1 + 2^-52 (sig = 0x8000_0000_0000_0800), SW.PE = 1
+        a.fnclex().unwrap();
+        a.fldcw(word_ptr(rcx + 18)).unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fldz().unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 72)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 144)).unwrap();
+
+        // Case 5: PC=24, RN: (1 + 2^-60) + 0.0 -> 1.0 (sig = 0x8000_0000_0000_0000), SW.PE = 1
+        a.fnclex().unwrap();
+        a.fldcw(word_ptr(rcx + 20)).unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fldz().unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 74)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 160)).unwrap();
+
+        // Case 6: PC=64, RN: (1 + 2^-60) + 0.0 -> exact (sig = 0x8000_0000_0000_0008), SW.PE = 0
+        a.fnclex().unwrap();
+        a.fldcw(word_ptr(rcx + 22)).unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fldz().unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 76)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 176)).unwrap();
+    });
+
+    let r = run_diff_x87("add_sub_zero_pc_rounding", &code, &init);
+    let rd_m80 = |off: usize| -> (u64, u16) {
+        (
+            u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()),
+            u16::from_le_bytes(r.data[off + 8..off + 10].try_into().unwrap()),
+        )
+    };
+    let rd_sw = |off: usize| u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap());
+    const SW_PE: u16 = 0x0020;
+
+    assert_eq!(rd_m80(80), (0x8000_0000_0000_0000, 0x3FFF));
+    assert_ne!(rd_sw(64) & SW_PE, 0, "PC=53 RN (x + 0) must set PE");
+
+    assert_eq!(rd_m80(96), (0x8000_0000_0000_0000, 0x3FFF));
+    assert_ne!(rd_sw(66) & SW_PE, 0, "PC=53 RN (0 + x) must set PE");
+
+    assert_eq!(rd_m80(112), (0x8000_0000_0000_0000, 0x3FFF));
+    assert_ne!(rd_sw(68) & SW_PE, 0, "PC=53 RN (x - 0) must set PE");
+
+    assert_eq!(rd_m80(128), (0x8000_0000_0000_0000, 0xBFFF));
+    assert_ne!(rd_sw(70) & SW_PE, 0, "PC=53 RN (0 - x) must set PE");
+
+    assert_eq!(rd_m80(144), (0x8000_0000_0000_0800, 0x3FFF));
+    assert_ne!(rd_sw(72) & SW_PE, 0, "PC=53 RP (x + 0) must round up and set PE");
+
+    assert_eq!(rd_m80(160), (0x8000_0000_0000_0000, 0x3FFF));
+    assert_ne!(rd_sw(74) & SW_PE, 0, "PC=24 RN (x + 0) must round and set PE");
+
+    assert_eq!(rd_m80(176), (0x8000_0000_0000_0008, 0x3FFF));
+    assert_eq!(rd_sw(76) & SW_PE, 0, "PC=64 RN (x + 0) must stay exact with PE=0");
+}
