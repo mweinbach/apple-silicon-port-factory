@@ -298,7 +298,7 @@ macro_rules! simd_ops {
                 semantics: "Interpreted in regfile_ext::exec_x87_ins; not lowered to ARM64 JIT",
                 tier: TranslationTier::GenericInterp,
                 source_file: "crates/x86-runtime/src/emu/regfile_ext.rs",
-                verified_vectors: 22,
+                verified_vectors: 27,
             },
             OpRecord {
                 id: "TRAP_OR_BOUNDARY",

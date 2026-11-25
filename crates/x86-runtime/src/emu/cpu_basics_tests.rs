@@ -170,6 +170,97 @@ fn fprem_raw_operand_exception_priority() {
 }
 
 #[test]
+fn x87_raw_denormal_operand_status() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fnstsw(word_ptr(rcx + 32)).unwrap();
+    a.fxam().unwrap();
+    a.fnstsw(word_ptr(rcx + 34)).unwrap();
+    a.fstp(tbyte_ptr(rcx + 64)).unwrap();
+    a.fnstsw(word_ptr(rcx + 36)).unwrap();
+
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fld1().unwrap();
+    a.faddp(st1, st0).unwrap();
+    a.fnstsw(word_ptr(rcx + 38)).unwrap();
+    a.fstp(qword_ptr(rcx + 80)).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fadd(qword_ptr(rcx + 16)).unwrap();
+    a.fnstsw(word_ptr(rcx + 40)).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fsqrt().unwrap();
+    a.fnstsw(word_ptr(rcx + 42)).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fld1().unwrap();
+    a.fucomip(st0, st1).unwrap();
+    a.fnstsw(word_ptr(rcx + 44)).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.frndint().unwrap();
+    a.fnstsw(word_ptr(rcx + 46)).unwrap();
+    a.fninit().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+    for (sig, exp, other, expected) in [
+        (1u64, 0u16, 1.0f64, [0, 0, 0, 2, 2, 2, 2, 2]),
+        (1, 0x8000, f64::NAN, [0, 0, 0, 2, 0, 0, 2, 2]),
+        (1 << 63, 0, 1.0, [0, 0, 0, 2, 2, 2, 2, 2]), // pseudo-denormal
+        (0, 0x8000, 1.0, [0; 8]),                    // negative zero
+    ] {
+        let mut init = [0u8; 88];
+        init[..8].copy_from_slice(&sig.to_le_bytes());
+        init[8..10].copy_from_slice(&exp.to_le_bytes());
+        init[16..24].copy_from_slice(&other.to_le_bytes());
+        let check = |out: &[u8]| {
+            let de: [u8; 8] = std::array::from_fn(|i| out[32 + 2 * i] & 2);
+            assert_eq!(de, expected, "raw sign/exponent {exp:#x}, significand {sig:#x}");
+            let class = if sig != 0 { 0x4400 } else { 0x4000 };
+            let sign = (exp >> 15) << 9;
+            let fxam = u16::from_le_bytes([out[34], out[35]]);
+            assert_eq!(fxam & 0x4700, class | sign, "FXAM classification");
+            assert_eq!(&out[64..74], &init[..10], "m80 copy");
+            assert_eq!(&out[80..88], &1.0f64.to_le_bytes(), "sum with one");
+        };
+        if cfg!(feature = "rosetta-oracle") {
+            check(&rosetta(&code, &init));
+        }
+        run_tiers(&code, &init, check);
+    }
+}
+
+#[test]
+fn x87_raw_denormal_divisor_priority() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fldz().unwrap();
+    a.fdivp(st1, st0).unwrap();
+    a.fnstsw(word_ptr(rcx + 16)).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fldz().unwrap();
+    a.fdivrp(st1, st0).unwrap();
+    a.fnstsw(word_ptr(rcx + 18)).unwrap();
+    a.fninit().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+    let mut init = [0u8; 20];
+    init[0] = 1;
+    let check = |out: &[u8]| {
+        assert_eq!(out[16] & 2, 0, "divide by zero takes priority over DE");
+        assert_eq!(out[18] & 2, 2, "a raw denormal divisor is nonzero");
+    };
+    if cfg!(feature = "rosetta-oracle") {
+        check(&rosetta(&code, &init));
+    }
+    run_tiers(&code, &init, check);
+}
+
+#[test]
 fn xstate_roundtrip_across_tiers() {
     // Rosetta advertises XSAVE but not XSAVEOPT or XSAVEC. All three save formats are
     // independently checked against the same restored x87, XMM, YMM and MXCSR values.
