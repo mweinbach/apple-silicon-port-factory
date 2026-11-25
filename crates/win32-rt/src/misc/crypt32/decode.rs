@@ -3,7 +3,8 @@
 //! and SPKI-to-CAPI `PUBLICKEYBLOB` conversion for `crypt32.dll`.
 
 use super::asn1::{
-    der_item_children, encode_der_tlv, parse_der_item, DerItem, PKCS_7_ASN_ENCODING,
+    der_item_children, der_item_children_bounded, encode_der_tlv, parse_der_item, DerItem,
+    PKCS_7_ASN_ENCODING,
     X509_ALTERNATE_NAME, X509_ANY_STRING, X509_ASN_ENCODING, X509_BASIC_CONSTRAINTS2, X509_BITS,
     X509_CERT, X509_CERT_TO_BE_SIGNED, X509_CHOICE_OF_TIME, X509_ECC_SIGNATURE,
     X509_ENHANCED_KEY_USAGE, X509_EXTENSIONS, X509_INTEGER, X509_KEY_USAGE,
@@ -44,6 +45,7 @@ pub(super) const CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG: u32 = 0x0100_0
 const CRYPT_DECODE_ALLOC_FLAG: u32 = 0x0000_8000;
 const CRYPT_E_ASN1_BADTAG: u32 = 0x8009_310B;
 const CRYPT_E_INVALID_X500_STRING: u32 = 0x8009_2023;
+pub(super) const MAX_CRL_ENTRIES: usize = 65_536;
 
 // ---------------------------------------------------------------------------
 // Single-buffer relocating DecodeArena for CryptDecodeObject / Ex
@@ -512,7 +514,9 @@ fn decode_attribute_into(arena: &mut DecodeArena, attr_off: usize, attr_elem: De
     let oid_s = wintrust::decode_oid_str(kids[0].val);
     let coff = arena.push_cstr(&oid_s);
     arena.write_ptr(attr_off, Some(coff));
-    let vals = der_item_children(kids[1].val).unwrap_or_default();
+    let Some(vals) = der_item_children(kids[1].val) else {
+        return false;
+    };
     arena.write_u32(attr_off + 8, vals.len() as u32);
     if !vals.is_empty() {
         let arr_off = arena.alloc_aligned(vals.len() * 16, 8);
@@ -1337,25 +1341,70 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
             }
             if kids.get(pos).is_some_and(|k| k.tag == 0x30) {
                 // revokedCertificates SEQUENCE OF SEQUENCE { userCertificate INTEGER, revocationDate Time, crlEntryExtensions OPTIONAL }
-                let entries = der_item_children(kids[pos].val).unwrap_or_default();
+                // Parse incrementally with a dedicated CRL entry cap (above MAX_BER_ITEMS=4096)
+                // and propagate any malformed DER or cap-exceeded error instead of returning an
+                // empty revocation list.
+                struct ParsedCrlEntry<'a> {
+                    serial: &'a [u8],
+                    rev_time_tag: u8,
+                    rev_time_val: &'a [u8],
+                    exts: Option<Vec<DerItem<'a>>>,
+                }
+                let mut rem = kids[pos].val;
+                let mut entries: Vec<ParsedCrlEntry<'_>> = Vec::new();
+                while !rem.is_empty() {
+                    if entries.len() >= MAX_CRL_ENTRIES {
+                        return Err(CRYPT_E_ASN1_BADTAG);
+                    }
+                    let (re, rest) = parse_der_item(rem).ok_or(CRYPT_E_ASN1_BADTAG)?;
+                    if re.tag != 0x30 {
+                        return Err(CRYPT_E_ASN1_BADTAG);
+                    }
+                    let rk = der_item_children_bounded(re.val, 8).ok_or(CRYPT_E_ASN1_BADTAG)?;
+                    if rk.len() < 2
+                        || rk.len() > 3
+                        || rk[0].tag != 0x02
+                        || rk[0].val.is_empty()
+                        || (rk[1].tag != 0x17 && rk[1].tag != 0x18)
+                    {
+                        return Err(CRYPT_E_ASN1_BADTAG);
+                    }
+                    let exts = if rk.len() == 3 {
+                        if rk[2].tag != 0x30 {
+                            return Err(CRYPT_E_ASN1_BADTAG);
+                        }
+                        Some(der_item_children(rk[2].val).ok_or(CRYPT_E_ASN1_BADTAG)?)
+                    } else {
+                        None
+                    };
+                    entries.push(ParsedCrlEntry {
+                        serial: rk[0].val,
+                        rev_time_tag: rk[1].tag,
+                        rev_time_val: rk[1].val,
+                        exts,
+                    });
+                    rem = rest;
+                }
                 arena.write_u32(off + 64, entries.len() as u32);
                 if !entries.is_empty() {
                     // CRL_ENTRY (40B): SerialNumber (16B @ 0), RevocationDate (u64 @ 16), cExtension (u32 @ 24), rgExtension (*mut @ 32)
                     let earr = arena.alloc_aligned(entries.len() * 40, 8);
                     arena.write_ptr(off + 72, Some(earr));
-                    for (i, re) in entries.iter().enumerate() {
-                        if let Some(rk) = der_item_children(re.val) {
-                            if rk.len() >= 2 && rk[0].tag == 0x02 {
-                                let eo = earr + i * 40;
-                                let mut ser_le = rk[0].val.to_vec();
-                                ser_le.reverse();
-                                arena.write_blob(eo, &ser_le);
-                                arena.write_u64(eo + 16, wintrust::parse_asn1_time_filetime_raw(rk[1].tag, rk[1].val));
-                                if rk.len() >= 3 && rk[2].tag == 0x30 {
-                                    if let Some(el) = der_item_children(rk[2].val) {
-                                        decode_extensions_into(&mut arena, eo + 24, &el);
-                                    }
-                                }
+                    for (i, entry) in entries.into_iter().enumerate() {
+                        let eo = earr + i * 40;
+                        let mut ser_le = entry.serial.to_vec();
+                        ser_le.reverse();
+                        arena.write_blob(eo, &ser_le);
+                        arena.write_u64(
+                            eo + 16,
+                            wintrust::parse_asn1_time_filetime_raw(
+                                entry.rev_time_tag,
+                                entry.rev_time_val,
+                            ),
+                        );
+                        if let Some(el) = entry.exts {
+                            if !decode_extensions_into(&mut arena, eo + 24, &el) {
+                                return Err(CRYPT_E_ASN1_BADTAG);
                             }
                         }
                     }
@@ -1363,12 +1412,13 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
                 pos += 1;
             }
             if kids.get(pos).is_some_and(|k| k.tag == 0xA0) {
-                if let Some((ext_seq, _)) = parse_der_item(kids[pos].val) {
-                    if ext_seq.tag == 0x30 {
-                        if let Some(ext_list) = der_item_children(ext_seq.val) {
-                            decode_extensions_into(&mut arena, off + 80, &ext_list);
-                        }
-                    }
+                let (ext_seq, rem) = parse_der_item(kids[pos].val).ok_or(CRYPT_E_ASN1_BADTAG)?;
+                if !rem.is_empty() || ext_seq.tag != 0x30 {
+                    return Err(CRYPT_E_ASN1_BADTAG);
+                }
+                let ext_list = der_item_children(ext_seq.val).ok_or(CRYPT_E_ASN1_BADTAG)?;
+                if !decode_extensions_into(&mut arena, off + 80, &ext_list) {
+                    return Err(CRYPT_E_ASN1_BADTAG);
                 }
             }
             Ok(arena)
@@ -1591,8 +1641,9 @@ pub(super) unsafe fn decode_ctl_info_alloc(ctl_der: &[u8]) -> Option<*mut c_void
                 let eo = earr + i * 32;
                 arena.write_blob(eo, sk[0].val);
                 if let Some(attrs) = sk.get(1).filter(|e| e.tag == 0x31) {
-                    if let Some(al) = der_item_children(attrs.val) {
-                        decode_attributes_list_into(&mut arena, eo + 16, &al);
+                    let al = der_item_children(attrs.val)?;
+                    if !decode_attributes_list_into(&mut arena, eo + 16, &al) {
+                        return None;
                     }
                 }
             }
@@ -1601,12 +1652,13 @@ pub(super) unsafe fn decode_ctl_info_alloc(ctl_der: &[u8]) -> Option<*mut c_void
     }
     // Optional ctlExtensions [0] EXPLICIT Extensions -> cExtension @ +112, rgExtension @ +120
     if kids.get(idx).is_some_and(|k| k.tag == 0xA0) {
-        if let Some((ext_seq, _)) = parse_der_item(kids[idx].val) {
-            if ext_seq.tag == 0x30 {
-                if let Some(ext_list) = der_item_children(ext_seq.val) {
-                    decode_extensions_into(&mut arena, off + 112, &ext_list);
-                }
-            }
+        let (ext_seq, rem) = parse_der_item(kids[idx].val)?;
+        if !rem.is_empty() || ext_seq.tag != 0x30 {
+            return None;
+        }
+        let ext_list = der_item_children(ext_seq.val)?;
+        if !decode_extensions_into(&mut arena, off + 112, &ext_list) {
+            return None;
         }
     }
 

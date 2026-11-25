@@ -8367,3 +8367,159 @@ fn chain_para_authenticates_multi_level_issuers_against_same_spki_clone() {
         CertCloseStore(perm_add_st, 0);
     }
 }
+
+#[test]
+fn crl_decoder_handles_large_lists_and_rejects_failures() {
+    use super::asn1::encode_der_tlv;
+    use super::decode::{MAX_CRL_ENTRIES, X509_CERT_CRL_TO_BE_SIGNED};
+
+    let build_signed_crl = |revoked_entries_body: &[u8]| -> Vec<u8> {
+        let sig_alg = encode_der_tlv(
+            0x30,
+            &[
+                0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B, 0x05, 0x00,
+            ],
+        );
+        let issuer = encode_der_tlv(
+            0x30,
+            &encode_der_tlv(
+                0x31,
+                &encode_der_tlv(0x30, &[0x06, 0x03, 0x55, 0x04, 0x03, 0x0C, 0x02, b'C', b'A']),
+            ),
+        );
+        let revoked_seq = encode_der_tlv(0x30, revoked_entries_body);
+        let mut tbs_body = Vec::with_capacity(revoked_seq.len() + 64);
+        tbs_body.extend_from_slice(&encode_der_tlv(0x02, &[0x01]));
+        tbs_body.extend_from_slice(&sig_alg);
+        tbs_body.extend_from_slice(&issuer);
+        tbs_body.extend_from_slice(&encode_der_tlv(0x17, b"260101000000Z"));
+        tbs_body.extend_from_slice(&revoked_seq);
+        let tbs = encode_der_tlv(0x30, &tbs_body);
+        let mut signed_body = Vec::with_capacity(tbs.len() + 32);
+        signed_body.extend_from_slice(&tbs);
+        signed_body.extend_from_slice(&sig_alg);
+        signed_body.extend_from_slice(&encode_der_tlv(0x03, &[0x00, 0xDE, 0xAD]));
+        encode_der_tlv(0x30, &signed_body)
+    };
+
+    unsafe {
+        // 1. A valid CRL with 4,097 revoked certificates (> MAX_BER_ITEMS=4096) must decode
+        // all 4,097 entries faithfully via both CryptDecodeObjectEx and CertCreateCRLContext.
+        let count_over_ber: usize = 4_097;
+        let rev_time = encode_der_tlv(0x17, b"260101000000Z");
+        let mut large_body = Vec::with_capacity(count_over_ber * 24);
+        for i in 1u32..=(count_over_ber as u32) {
+            let be = i.to_be_bytes();
+            let first_nz = be.iter().position(|&b| b != 0).unwrap_or(3);
+            let serial_bytes = &be[first_nz..];
+            let mut entry_body = Vec::with_capacity(24);
+            entry_body.extend_from_slice(&encode_der_tlv(0x02, serial_bytes));
+            entry_body.extend_from_slice(&rev_time);
+            large_body.extend_from_slice(&encode_der_tlv(0x30, &entry_body));
+        }
+        let large_crl = build_signed_crl(&large_body);
+
+        let mut decoded_ptr: *mut c_void = std::ptr::null_mut();
+        let mut decoded_len: u32 = 0;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_CERT_CRL_TO_BE_SIGNED as *const u8,
+                large_crl.as_ptr(),
+                large_crl.len() as u32,
+                0x8000, // CRYPT_DECODE_ALLOC_FLAG
+                std::ptr::null(),
+                &mut decoded_ptr as *mut *mut c_void as *mut c_void,
+                &mut decoded_len,
+            ),
+            TRUE
+        );
+        assert!(!decoded_ptr.is_null());
+        let info = decoded_ptr as *const u8;
+        let c_entry = std::ptr::read_unaligned(info.add(64) as *const u32);
+        let rg_entry = std::ptr::read_unaligned(info.add(72) as *const *const u8);
+        assert_eq!(c_entry, count_over_ber as u32);
+        assert!(!rg_entry.is_null());
+        // Verify last entry (index 4096) has serial 4097 = 0x1001 in little-endian [0x01, 0x10].
+        let last_entry = rg_entry.add((count_over_ber - 1) * 40);
+        let last_ser_len = std::ptr::read_unaligned(last_entry as *const u32) as usize;
+        let last_ser_ptr = std::ptr::read_unaligned(last_entry.add(8) as *const *const u8);
+        assert_eq!(
+            std::slice::from_raw_parts(last_ser_ptr, last_ser_len),
+            &[0x01, 0x10]
+        );
+        crate::kernel32::memory::LocalFree(decoded_ptr);
+
+        let crl_ctx = CertCreateCRLContext(
+            X509_ASN_ENCODING,
+            large_crl.as_ptr(),
+            large_crl.len() as u32,
+        );
+        assert!(!crl_ctx.is_null(), "CertCreateCRLContext must accept 4,097-entry CRL");
+        let p_crl_info = std::ptr::read_unaligned((crl_ctx as *const u8).add(24) as *const *const u8);
+        assert_eq!(
+            std::ptr::read_unaligned(p_crl_info.add(64) as *const u32),
+            count_over_ber as u32
+        );
+        assert_eq!(CertFreeCRLContext(crl_ctx), TRUE);
+
+        // 2. Malformed revokedCertificates (non-SEQUENCE child or truncated entry) must fail
+        // with CRYPT_E_ASN1_BADTAG instead of returning an empty revocation list.
+        let malformed_crl = build_signed_crl(&[0x05, 0x00, 0x05, 0x00]);
+        let mut bad_ptr: *mut c_void = std::ptr::null_mut();
+        let mut bad_len: u32 = 0;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_CERT_CRL_TO_BE_SIGNED as *const u8,
+                malformed_crl.as_ptr(),
+                malformed_crl.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut bad_ptr as *mut *mut c_void as *mut c_void,
+                &mut bad_len,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_310B);
+        assert!(CertCreateCRLContext(
+            X509_ASN_ENCODING,
+            malformed_crl.as_ptr(),
+            malformed_crl.len() as u32,
+        )
+        .is_null());
+
+        // 3. A CRL exceeding MAX_CRL_ENTRIES must fail cleanly rather than returning cCRLEntry == 0.
+        let one_entry = encode_der_tlv(
+            0x30,
+            &[encode_der_tlv(0x02, &[0x01]), rev_time].concat(),
+        );
+        let mut over_cap_body = Vec::with_capacity(one_entry.len() * (MAX_CRL_ENTRIES + 1));
+        for _ in 0..(MAX_CRL_ENTRIES + 1) {
+            over_cap_body.extend_from_slice(&one_entry);
+        }
+        let over_cap_crl = build_signed_crl(&over_cap_body);
+        let mut cap_ptr: *mut c_void = std::ptr::null_mut();
+        let mut cap_len: u32 = 0;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_CERT_CRL_TO_BE_SIGNED as *const u8,
+                over_cap_crl.as_ptr(),
+                over_cap_crl.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut cap_ptr as *mut *mut c_void as *mut c_void,
+                &mut cap_len,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_310B);
+        assert!(CertCreateCRLContext(
+            X509_ASN_ENCODING,
+            over_cap_crl.as_ptr(),
+            over_cap_crl.len() as u32,
+        )
+        .is_null());
+    }
+}
