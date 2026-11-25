@@ -388,6 +388,13 @@ struct SecPkgInfoW {
 
 type ClientConfigCacheKey = (bool, bool, bool, Vec<Vec<u8>>);
 
+#[derive(Clone, Debug)]
+struct TlsParamRule {
+    /// Empty means default/wildcard (`cAlpnIds == 0`); non-empty lists ALPN protocol IDs.
+    alpn_ids: Vec<Vec<u8>>,
+    disabled_protocols: u32,
+}
+
 #[derive(Clone)]
 struct SchannelCred {
     principal: String,
@@ -397,6 +404,7 @@ struct SchannelCred {
     client_enable_tls13: bool,
     server_enable_tls12: bool,
     server_enable_tls13: bool,
+    tls_param_rules: Vec<TlsParamRule>,
     has_root_store: bool,
     extra_roots_der: Vec<Vec<u8>>,
     server_cert_chain: Vec<Vec<u8>>,
@@ -470,6 +478,158 @@ unsafe fn write_handle(p: *mut SecHandle, magic: usize, id: usize) {
     }
 }
 
+/// Resolve `(enable_tls12, enable_tls13)` for a connection with `active_alpn` against any
+/// `SCH_CREDENTIALS` v5 `TLS_PARAMETERS` rules (falling back to the credential's base flags).
+/// When multiple rules can match `active_alpn`, conservatively union their disabled masks so
+/// no protocol restriction from any applicable entry can ever be bypassed.
+fn resolve_effective_protocols(
+    cred: &SchannelCred,
+    is_server: bool,
+    active_alpn: &[Vec<u8>],
+) -> (bool, bool) {
+    let (base12, base13) = if is_server {
+        (cred.server_enable_tls12, cred.server_enable_tls13)
+    } else {
+        (cred.client_enable_tls12, cred.client_enable_tls13)
+    };
+    if cred.tls_param_rules.is_empty() {
+        return (base12, base13);
+    }
+    let (bit12, bit13) = if is_server {
+        (SP_PROT_TLS1_2_SERVER, SP_PROT_TLS1_3_SERVER)
+    } else {
+        (SP_PROT_TLS1_2_CLIENT, SP_PROT_TLS1_3_CLIENT)
+    };
+
+    let mut disabled = 0u32;
+    let mut matched_any = false;
+    if active_alpn.is_empty() {
+        for r in &cred.tls_param_rules {
+            if r.alpn_ids.is_empty() {
+                disabled |= r.disabled_protocols;
+                matched_any = true;
+            }
+        }
+    } else {
+        let mut uncovered = false;
+        for proto in active_alpn {
+            let mut proto_matched = false;
+            for r in &cred.tls_param_rules {
+                if !r.alpn_ids.is_empty() && r.alpn_ids.iter().any(|id| id == proto) {
+                    disabled |= r.disabled_protocols;
+                    proto_matched = true;
+                    matched_any = true;
+                }
+            }
+            if !proto_matched {
+                uncovered = true;
+            }
+        }
+        if uncovered {
+            for r in &cred.tls_param_rules {
+                if r.alpn_ids.is_empty() {
+                    disabled |= r.disabled_protocols;
+                    matched_any = true;
+                }
+            }
+        }
+    }
+    if !matched_any {
+        return (base12, base13);
+    }
+    ((disabled & bit12) == 0, (disabled & bit13) == 0)
+}
+
+/// Parse offered ALPN protocol IDs from a complete TLS ClientHello record.
+/// Returns `Some(protos)` if a complete ClientHello was parsed (possibly empty if no ALPN
+/// extension is present), or `None` if the input is incomplete/fragmented/not a ClientHello.
+fn parse_client_hello_alpn(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if buf.len() < 5 || buf[0] != 0x16 {
+        return None;
+    }
+    let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    let rec_end = 5usize.checked_add(rec_len)?;
+    if rec_end > buf.len() {
+        return None;
+    }
+    let hs = &buf[5..rec_end];
+    if hs.len() < 4 || hs[0] != 0x01 {
+        return None;
+    }
+    let hs_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
+    let ch_end = 4usize.checked_add(hs_len)?;
+    if ch_end > hs.len() {
+        return None;
+    }
+    let ch = &hs[4..ch_end];
+    // legacy_version (2) + random (32)
+    let mut off = 34usize;
+    if off >= ch.len() {
+        return None;
+    }
+    // session_id (1-byte len)
+    let sid_len = ch[off] as usize;
+    off = off.checked_add(1 + sid_len)?;
+    // cipher_suites (2-byte len)
+    if off + 2 > ch.len() {
+        return None;
+    }
+    let cs_len = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
+    off = off.checked_add(2 + cs_len)?;
+    // compression_methods (1-byte len)
+    if off >= ch.len() {
+        return None;
+    }
+    let cm_len = ch[off] as usize;
+    off = off.checked_add(1 + cm_len)?;
+    if off == ch.len() {
+        return Some(Vec::new());
+    }
+    // extensions (2-byte len)
+    if off + 2 > ch.len() {
+        return None;
+    }
+    let ext_len = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
+    off += 2;
+    let ext_end = off.checked_add(ext_len)?;
+    if ext_end > ch.len() {
+        return None;
+    }
+    while off + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([ch[off], ch[off + 1]]);
+        let ed_len = u16::from_be_bytes([ch[off + 2], ch[off + 3]]) as usize;
+        off += 4;
+        let ed_end = off.checked_add(ed_len)?;
+        if ed_end > ext_end {
+            return None;
+        }
+        if ext_type == 0x0010 {
+            if ed_len < 2 {
+                return None;
+            }
+            let list_len = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
+            let mut p = off + 2;
+            let list_end = p.checked_add(list_len)?;
+            if list_end > ed_end {
+                return None;
+            }
+            let mut protos = Vec::new();
+            while p < list_end {
+                let plen = ch[p] as usize;
+                p += 1;
+                if plen == 0 || p + plen > list_end {
+                    return None;
+                }
+                protos.push(ch[p..p + plen].to_vec());
+                p += plen;
+            }
+            return Some(protos);
+        }
+        off = ed_end;
+    }
+    Some(Vec::new())
+}
+
 fn build_schannel_tls_config(
     cred: &SchannelCred,
     manual_validation: bool,
@@ -484,10 +644,11 @@ fn build_schannel_tls_config(
 
     // Fast path onto shared cached `crate::net_tls::build_tls_config` when using
     // default roots, both TLS 1.2 + 1.3, standard SNI, reconnects enabled, and no client cert.
+    let (enable_tls12, enable_tls13) = resolve_effective_protocols(cred, false, &alpn);
     let disable_reconnects = (cred.flags & SCH_CRED_DISABLE_RECONNECTS) != 0;
     if cred.extra_roots_der.is_empty()
-        && cred.client_enable_tls12
-        && cred.client_enable_tls13
+        && enable_tls12
+        && enable_tls13
         && enable_sni
         && !has_client_cert
         && !disable_reconnects
@@ -509,10 +670,10 @@ fn build_schannel_tls_config(
     }
 
     let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::with_capacity(2);
-    if cred.client_enable_tls13 {
+    if enable_tls13 {
         versions.push(&rustls::version::TLS13);
     }
-    if cred.client_enable_tls12 {
+    if enable_tls12 {
         versions.push(&rustls::version::TLS12);
     }
     if versions.is_empty() {
@@ -852,6 +1013,7 @@ impl rustls::server::danger::ClientCertVerifier for RevocationClientCertVerifier
 fn build_schannel_server_config(
     cred: &SchannelCred,
     alpn: Vec<Vec<u8>>,
+    effective_alpn: &[Vec<u8>],
     require_client_auth: bool,
 ) -> Result<Arc<ServerConfig>, i32> {
     let Some(ref key_pkcs8) = cred.server_private_key_pkcs8 else {
@@ -860,11 +1022,12 @@ fn build_schannel_server_config(
     if cred.server_cert_chain.is_empty() {
         return Err(SEC_E_NO_CREDENTIALS);
     }
+    let (enable_tls12, enable_tls13) = resolve_effective_protocols(cred, true, effective_alpn);
     let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::with_capacity(2);
-    if cred.server_enable_tls13 {
+    if enable_tls13 {
         versions.push(&rustls::version::TLS13);
     }
-    if cred.server_enable_tls12 {
+    if enable_tls12 {
         versions.push(&rustls::version::TLS12);
     }
     if versions.is_empty() {
@@ -1103,6 +1266,7 @@ pub(super) unsafe fn acquire_credentials_impl(
     let mut client_enable_tls13 = true;
     let mut server_enable_tls12 = true;
     let mut server_enable_tls13 = true;
+    let mut tls_param_rules: Vec<TlsParamRule> = Vec::new();
     let mut has_root_store = false;
     let mut extra_roots_der = Vec::new();
     let mut server_cert_chain = Vec::new();
@@ -1160,17 +1324,18 @@ pub(super) unsafe fn acquire_credentials_impl(
                     extra_roots_der = crypt32::store_certs_der(h_root_store);
                 }
                 if enabled != 0 {
-                    let want_c12 = (enabled & SP_PROT_TLS1_2_CLIENT) != 0;
-                    let want_c13 = (enabled & SP_PROT_TLS1_3_CLIENT) != 0;
-                    let want_s12 = (enabled & SP_PROT_TLS1_2_SERVER) != 0;
-                    let want_s13 = (enabled & SP_PROT_TLS1_3_SERVER) != 0;
-                    if want_c12 || want_c13 {
-                        client_enable_tls12 = want_c12;
-                        client_enable_tls13 = want_c13;
-                    }
-                    if want_s12 || want_s13 {
-                        server_enable_tls12 = want_s12;
-                        server_enable_tls13 = want_s13;
+                    // Per SCHANNEL_CRED docs, only a zero mask selects system defaults. Any
+                    // nonzero mask explicitly selects the enabled protocols; if none of the
+                    // supported TLS 1.2 / 1.3 bits for the requested direction are enabled,
+                    // fail with SEC_E_ALGORITHM_MISMATCH rather than silently falling back.
+                    client_enable_tls12 = (enabled & SP_PROT_TLS1_2_CLIENT) != 0;
+                    client_enable_tls13 = (enabled & SP_PROT_TLS1_3_CLIENT) != 0;
+                    server_enable_tls12 = (enabled & SP_PROT_TLS1_2_SERVER) != 0;
+                    server_enable_tls13 = (enabled & SP_PROT_TLS1_3_SERVER) != 0;
+                    if (want_outbound && !client_enable_tls12 && !client_enable_tls13)
+                        || (want_inbound && !server_enable_tls12 && !server_enable_tls13)
+                    {
+                        return SEC_E_ALGORITHM_MISMATCH;
                     }
                 }
             }
@@ -1188,15 +1353,78 @@ pub(super) unsafe fn acquire_credentials_impl(
                     has_root_store = true;
                     extra_roots_der = crypt32::store_certs_der(h_root_store);
                 }
-                if c_params > 0 && !p_params.is_null() {
-                    // TLS_PARAMETERS.grbitDisabledProtocols @ +0x10
-                    let disabled = std::ptr::read_unaligned(p_params.add(0x10) as *const u32);
-                    client_enable_tls12 = (disabled & SP_PROT_TLS1_2_CLIENT) == 0;
-                    client_enable_tls13 = (disabled & SP_PROT_TLS1_3_CLIENT) == 0;
-                    server_enable_tls12 = (disabled & SP_PROT_TLS1_2_SERVER) == 0;
-                    server_enable_tls13 = (disabled & SP_PROT_TLS1_3_SERVER) == 0;
-                    if (want_outbound && !client_enable_tls12 && !client_enable_tls13)
-                        || (want_inbound && !server_enable_tls12 && !server_enable_tls13)
+                if c_params > 0 {
+                    const MAX_TLS_PARAMETERS: usize = 32;
+                    const MAX_ALPN_IDS_PER_PARAM: usize = 32;
+                    const TLS_PARAMETERS_SIZE: usize = 0x28;
+                    if p_params.is_null() || (c_params as usize) > MAX_TLS_PARAMETERS {
+                        return SEC_E_INTERNAL_ERROR;
+                    }
+                    let mut wildcard_disabled = 0u32;
+                    let mut has_wildcard = false;
+                    let mut any_client_12 = false;
+                    let mut any_client_13 = false;
+                    let mut any_server_12 = false;
+                    let mut any_server_13 = false;
+                    for i in 0..c_params as usize {
+                        // TLS_PARAMETERS (Win64, 0x28 bytes):
+                        //   +0x00 cAlpnIds (u32), +0x08 rgstrAlpnIds (PUNICODE_STRING),
+                        //   +0x10 grbitDisabledProtocols (u32), ...
+                        let entry = p_params.add(i * TLS_PARAMETERS_SIZE);
+                        let c_alpn_ids = std::ptr::read_unaligned(entry as *const u32) as usize;
+                        let rgstr_alpn_ids =
+                            std::ptr::read_unaligned(entry.add(0x08) as *const *const u8);
+                        let disabled = std::ptr::read_unaligned(entry.add(0x10) as *const u32);
+                        let mut alpn_ids = Vec::with_capacity(c_alpn_ids.min(MAX_ALPN_IDS_PER_PARAM));
+                        if c_alpn_ids > 0 {
+                            if rgstr_alpn_ids.is_null() || c_alpn_ids > MAX_ALPN_IDS_PER_PARAM {
+                                return SEC_E_INTERNAL_ERROR;
+                            }
+                            for j in 0..c_alpn_ids {
+                                // UNICODE_STRING (Win64, 0x10 bytes): Length (u16) @ +0, Buffer (*const u16) @ +8
+                                let us = rgstr_alpn_ids.add(j * 0x10);
+                                let byte_len = std::ptr::read_unaligned(us as *const u16) as usize;
+                                let buf_ptr =
+                                    std::ptr::read_unaligned(us.add(0x08) as *const *const u16);
+                                if byte_len == 0 || (byte_len % 2) != 0 || buf_ptr.is_null() {
+                                    return SEC_E_INTERNAL_ERROR;
+                                }
+                                let u16_len = byte_len / 2;
+                                let mut units = Vec::with_capacity(u16_len);
+                                for k in 0..u16_len {
+                                    units.push(std::ptr::read_unaligned(buf_ptr.add(k)));
+                                }
+                                let Ok(s) = String::from_utf16(&units) else {
+                                    return SEC_E_INTERNAL_ERROR;
+                                };
+                                alpn_ids.push(s.into_bytes());
+                            }
+                        } else {
+                            has_wildcard = true;
+                            wildcard_disabled |= disabled;
+                        }
+                        any_client_12 |= (disabled & SP_PROT_TLS1_2_CLIENT) == 0;
+                        any_client_13 |= (disabled & SP_PROT_TLS1_3_CLIENT) == 0;
+                        any_server_12 |= (disabled & SP_PROT_TLS1_2_SERVER) == 0;
+                        any_server_13 |= (disabled & SP_PROT_TLS1_3_SERVER) == 0;
+                        tls_param_rules.push(TlsParamRule {
+                            alpn_ids,
+                            disabled_protocols: disabled,
+                        });
+                    }
+                    if has_wildcard {
+                        client_enable_tls12 = (wildcard_disabled & SP_PROT_TLS1_2_CLIENT) == 0;
+                        client_enable_tls13 = (wildcard_disabled & SP_PROT_TLS1_3_CLIENT) == 0;
+                        server_enable_tls12 = (wildcard_disabled & SP_PROT_TLS1_2_SERVER) == 0;
+                        server_enable_tls13 = (wildcard_disabled & SP_PROT_TLS1_3_SERVER) == 0;
+                    } else {
+                        client_enable_tls12 = any_client_12;
+                        client_enable_tls13 = any_client_13;
+                        server_enable_tls12 = any_server_12;
+                        server_enable_tls13 = any_server_13;
+                    }
+                    if (want_outbound && !any_client_12 && !any_client_13)
+                        || (want_inbound && !any_server_12 && !any_server_13)
                     {
                         return SEC_E_ALGORITHM_MISMATCH;
                     }
@@ -1221,6 +1449,7 @@ pub(super) unsafe fn acquire_credentials_impl(
         client_enable_tls13,
         server_enable_tls12,
         server_enable_tls13,
+        tls_param_rules,
         has_root_store,
         extra_roots_der,
         server_cert_chain,
@@ -1614,7 +1843,43 @@ pub(super) unsafe fn accept_security_context_impl(
             return SEC_E_INVALID_HANDLE;
         }
         let alpn = parse_alpn_protocols(p_input);
-        let cfg = match build_schannel_server_config(&cred, alpn, require_client_auth) {
+        let effective_alpn: Vec<Vec<u8>> = if alpn.is_empty() || cred.tls_param_rules.is_empty() {
+            Vec::new()
+        } else {
+            // Inspect the initial ClientHello token (when present and complete) to match the
+            // exact ALPN rustls will negotiate; if fragmented/unavailable, fall back
+            // conservatively to the full server ALPN list so every matching TLS_PARAMETERS
+            // restriction is enforced.
+            let mut token_slice: Option<&[u8]> = None;
+            if !p_input.is_null() {
+                let desc = std::ptr::read_unaligned(p_input);
+                if !desc.p_buffers.is_null() {
+                    for i in 0..desc.c_buffers as usize {
+                        let sb = std::ptr::read_unaligned(desc.p_buffers.add(i));
+                        if (sb.buffer_type & !SECBUFFER_ATTRMASK) == SECBUFFER_TOKEN
+                            && !sb.pv_buffer.is_null()
+                            && sb.cb_buffer > 0
+                        {
+                            token_slice = Some(std::slice::from_raw_parts(
+                                sb.pv_buffer as *const u8,
+                                sb.cb_buffer as usize,
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            match token_slice.and_then(parse_client_hello_alpn) {
+                Some(client_alpns) => alpn
+                    .iter()
+                    .find(|s| client_alpns.iter().any(|c| c == *s))
+                    .cloned()
+                    .into_iter()
+                    .collect(),
+                None => alpn.clone(),
+            }
+        };
+        let cfg = match build_schannel_server_config(&cred, alpn, &effective_alpn, require_client_auth) {
             Ok(c) => c,
             Err(code) => return code,
         };

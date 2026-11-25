@@ -77,6 +77,9 @@ const CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY: u32 = 0x8000_0000;
 
 const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
 const X509_ASN_ENCODING: u32 = 1;
+const MAX_CMS_CERTS: usize = 128;
+const MAX_CMS_SIGNERS: usize = 32;
+const MAX_CMS_AUTH_ATTRS: usize = 64;
 
 // DER OID value bytes
 const OID_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
@@ -158,6 +161,19 @@ fn parse_der_elem(buf: &[u8]) -> Option<(DerElem<'_>, &[u8])> {
 fn der_children(mut buf: &[u8]) -> Option<Vec<DerElem<'_>>> {
     let mut out = Vec::new();
     while !buf.is_empty() {
+        let (e, rest) = parse_der_elem(buf)?;
+        out.push(e);
+        buf = rest;
+    }
+    Some(out)
+}
+
+fn der_children_bounded(mut buf: &[u8], max_items: usize) -> Option<Vec<DerElem<'_>>> {
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        if out.len() >= max_items {
+            return None;
+        }
         let (e, rest) = parse_der_elem(buf)?;
         out.push(e);
         buf = rest;
@@ -478,12 +494,16 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         return Err(TRUST_E_BAD_DIGEST);
     }
 
-    // Parse certificates ([0] IMPLICIT) and signerInfos (SET).
+    // Parse certificates ([0] IMPLICIT) and signerInfos (SET) with hard bounds.
     let mut certs: Vec<ParsedCert<'_>> = Vec::new();
+    let mut raw_cert_count = 0usize;
     let mut signer_infos_elem: Option<DerElem<'_>> = None;
     for &elem in &sd_kids[3..] {
         if elem.tag == 0xA0 {
-            for ce in der_children(elem.val).ok_or(TRUST_E_BAD_DIGEST)? {
+            let remaining = MAX_CMS_CERTS.saturating_sub(raw_cert_count);
+            let cert_elems = der_children_bounded(elem.val, remaining).ok_or(TRUST_E_BAD_DIGEST)?;
+            raw_cert_count += cert_elems.len();
+            for ce in cert_elems {
                 if let Some(c) = parse_x509_cert(ce) {
                     certs.push(c);
                 }
@@ -493,9 +513,17 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         }
     }
     let si_set = signer_infos_elem.ok_or(TRUST_E_BAD_DIGEST)?;
-    let si_list = der_children(si_set.val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let si_list = der_children_bounded(si_set.val, MAX_CMS_SIGNERS).ok_or(TRUST_E_BAD_DIGEST)?;
     if si_list.is_empty() || certs.is_empty() {
         return Err(TRUST_E_BAD_DIGEST);
+    }
+
+    // Index parsed certificates by (issuer DER, normalized serial) for O(1) signer matching.
+    let mut certs_by_ias: HashMap<(&[u8], &[u8]), usize> = HashMap::with_capacity(certs.len());
+    for (idx, c) in certs.iter().enumerate() {
+        certs_by_ias
+            .entry((c.issuer_raw, strip_der_int_sign(c.serial_val)))
+            .or_insert(idx);
     }
 
     // Step 2 & 3: Verify at least one SignerInfo against its matching certificate.
@@ -514,8 +542,8 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
             continue;
         }
         let issuer_raw = ias[0].raw;
-        let serial_val = ias[1].val;
-        let Some(cert_idx) = certs.iter().position(|c| c.issuer_raw == issuer_raw && c.serial_val == serial_val) else {
+        let serial_val = strip_der_int_sign(ias[1].val);
+        let Some(&cert_idx) = certs_by_ias.get(&(issuer_raw, serial_val)) else {
             continue;
         };
         let Some(ref rsa_pub) = certs[cert_idx].rsa_pub else {
@@ -542,7 +570,7 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         if let Some(aa) = auth_attrs {
             let mut md_count = 0usize;
             let mut ct_count = 0usize;
-            for attr in der_children(aa.val).ok_or(TRUST_E_BAD_DIGEST)? {
+            for attr in der_children_bounded(aa.val, MAX_CMS_AUTH_ATTRS).ok_or(TRUST_E_BAD_DIGEST)? {
                 if attr.tag != 0x30 {
                     continue;
                 }
@@ -617,7 +645,8 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         self_signed: c.issuer_raw == c.subject_raw,
     };
     let mut chain = vec![to_verified(&certs[cur_idx])];
-    for _ in 0..certs.len() {
+    let mut visited = vec![cur_idx];
+    for _ in 0..16 {
         let cur = &certs[cur_idx];
         if cur.issuer_raw == cur.subject_raw {
             break; // self-signed root
@@ -625,8 +654,18 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         // Prefer a self-signed root cert over a cross-signed cert when both share the issuer DN.
         let parent_idx = certs
             .iter()
-            .position(|c| c.subject_raw == cur.issuer_raw && c.issuer_raw == c.subject_raw && c.raw_der != cur.raw_der)
-            .or_else(|| certs.iter().position(|c| c.subject_raw == cur.issuer_raw && c.raw_der != cur.raw_der));
+            .enumerate()
+            .position(|(i, c)| {
+                !visited.contains(&i)
+                    && c.subject_raw == cur.issuer_raw
+                    && c.issuer_raw == c.subject_raw
+                    && c.raw_der != cur.raw_der
+            })
+            .or_else(|| {
+                certs.iter().enumerate().position(|(i, c)| {
+                    !visited.contains(&i) && c.subject_raw == cur.issuer_raw && c.raw_der != cur.raw_der
+                })
+            });
         let Some(parent_idx) = parent_idx else {
             break; // stops at external root CA (not embedded in PKCS#7 bundle)
         };
@@ -637,6 +676,7 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
                 return Err(CERT_E_CHAINING);
             }
         }
+        visited.push(parent_idx);
         chain.push(to_verified(parent));
         cur_idx = parent_idx;
     }
@@ -709,60 +749,64 @@ fn parse_pkcs7_signed_data(pkcs7_raw: &[u8], embedded_in_pe: bool) -> Option<Par
         return None;
     }
     let mut certs_der = Vec::new();
+    let mut raw_cert_count = 0usize;
+    let mut raw_signer_count = 0usize;
     let mut signers = Vec::new();
     for &elem in &sd_kids[3..] {
         if elem.tag == 0xA0 {
-            if let Some(cert_elems) = der_children(elem.val) {
-                for ce in cert_elems {
-                    if parse_x509_cert(ce).is_some() {
-                        certs_der.push(ce.raw.to_vec());
-                    }
+            let remaining = MAX_CMS_CERTS.saturating_sub(raw_cert_count);
+            let cert_elems = der_children_bounded(elem.val, remaining)?;
+            raw_cert_count += cert_elems.len();
+            for ce in cert_elems {
+                if parse_x509_cert(ce).is_some() {
+                    certs_der.push(ce.raw.to_vec());
                 }
             }
         } else if elem.tag == 0x31 {
-            if let Some(si_list) = der_children(elem.val) {
-                for si in si_list {
-                    if si.tag != 0x30 {
-                        continue;
-                    }
-                    let Some(kids) = der_children(si.val) else { continue };
-                    if kids.len() < 5 || kids[1].tag != 0x30 {
-                        continue;
-                    }
-                    let version = if kids[0].tag == 0x02 && !kids[0].val.is_empty() {
-                        kids[0].val[kids[0].val.len() - 1] as u32
-                    } else {
-                        1
-                    };
-                    let Some(ias) = der_children(kids[1].val) else { continue };
-                    if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
-                        continue;
-                    }
-                    let issuer_raw = ias[0].raw.to_vec();
-                    let serial_be = ias[1].val.to_vec();
-                    let hash_alg_oid = parse_alg_id_oid(kids[2]).unwrap_or(OID_SHA256);
-                    let mut pos = 3usize;
-                    if kids.get(pos).is_some_and(|e| e.tag == 0xA0) {
-                        pos += 1;
-                    }
-                    let enc_alg_oid = kids
-                        .get(pos)
-                        .and_then(|&e| parse_alg_id_oid(e))
-                        .unwrap_or(OID_RSA_ENCRYPTION);
-                    let encrypted_hash = kids
-                        .get(pos + 1)
-                        .filter(|e| e.tag == 0x04)
-                        .map(|e| e.val.to_vec())
-                        .unwrap_or_default();
-                    signers.push(ParsedSignerInfo {
-                        version,
-                        issuer_raw,
-                        serial_be,
-                        hash_alg_oid_str: decode_oid_str(hash_alg_oid),
-                        enc_alg_oid_str: decode_oid_str(enc_alg_oid),
-                        encrypted_hash,
-                    });
+            let remaining = MAX_CMS_SIGNERS.saturating_sub(raw_signer_count);
+            let si_list = der_children_bounded(elem.val, remaining)?;
+            raw_signer_count += si_list.len();
+            for si in si_list {
+                if si.tag != 0x30 {
+                    continue;
                 }
+                let Some(kids) = der_children(si.val) else { continue };
+                if kids.len() < 5 || kids[1].tag != 0x30 {
+                    continue;
+                }
+                let version = if kids[0].tag == 0x02 && !kids[0].val.is_empty() {
+                    kids[0].val[kids[0].val.len() - 1] as u32
+                } else {
+                    1
+                };
+                let Some(ias) = der_children(kids[1].val) else { continue };
+                if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
+                    continue;
+                }
+                let issuer_raw = ias[0].raw.to_vec();
+                let serial_be = ias[1].val.to_vec();
+                let hash_alg_oid = parse_alg_id_oid(kids[2]).unwrap_or(OID_SHA256);
+                let mut pos = 3usize;
+                if kids.get(pos).is_some_and(|e| e.tag == 0xA0) {
+                    pos += 1;
+                }
+                let enc_alg_oid = kids
+                    .get(pos)
+                    .and_then(|&e| parse_alg_id_oid(e))
+                    .unwrap_or(OID_RSA_ENCRYPTION);
+                let encrypted_hash = kids
+                    .get(pos + 1)
+                    .filter(|e| e.tag == 0x04)
+                    .map(|e| e.val.to_vec())
+                    .unwrap_or_default();
+                signers.push(ParsedSignerInfo {
+                    version,
+                    issuer_raw,
+                    serial_be,
+                    hash_alg_oid_str: decode_oid_str(hash_alg_oid),
+                    enc_alg_oid_str: decode_oid_str(enc_alg_oid),
+                    encrypted_hash,
+                });
             }
         }
     }
@@ -1528,10 +1572,14 @@ fn verify_standalone_pkcs7(
     };
 
     let mut certs: Vec<ParsedCert<'_>> = Vec::new();
+    let mut raw_cert_count = 0usize;
     let mut signer_infos_elem: Option<DerElem<'_>> = None;
     for &elem in &sd_kids[3..] {
         if elem.tag == 0xA0 {
-            for ce in der_children(elem.val).ok_or(TRUST_E_BAD_DIGEST)? {
+            let remaining = MAX_CMS_CERTS.saturating_sub(raw_cert_count);
+            let cert_elems = der_children_bounded(elem.val, remaining).ok_or(TRUST_E_BAD_DIGEST)?;
+            raw_cert_count += cert_elems.len();
+            for ce in cert_elems {
                 if let Some(c) = parse_x509_cert(ce) {
                     certs.push(c);
                 }
@@ -1541,9 +1589,17 @@ fn verify_standalone_pkcs7(
         }
     }
     let si_set = signer_infos_elem.ok_or(TRUST_E_BAD_DIGEST)?;
-    let si_list = der_children(si_set.val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let si_list = der_children_bounded(si_set.val, MAX_CMS_SIGNERS).ok_or(TRUST_E_BAD_DIGEST)?;
     if si_list.is_empty() || certs.is_empty() {
         return Err(TRUST_E_BAD_DIGEST);
+    }
+
+    // Index parsed certificates by (issuer DER, normalized serial) for O(1) signer matching.
+    let mut certs_by_ias: HashMap<(&[u8], &[u8]), usize> = HashMap::with_capacity(certs.len());
+    for (idx, c) in certs.iter().enumerate() {
+        certs_by_ias
+            .entry((c.issuer_raw, strip_der_int_sign(c.serial_val)))
+            .or_insert(idx);
     }
 
     let mut verified_signer: Option<(usize, VerifiedSigner)> = None;
@@ -1559,10 +1615,7 @@ fn verify_standalone_pkcs7(
         if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
             continue;
         }
-        let Some(cert_idx) = certs
-            .iter()
-            .position(|c| c.issuer_raw == ias[0].raw && strip_der_int_sign(c.serial_val) == strip_der_int_sign(ias[1].val))
-        else {
+        let Some(&cert_idx) = certs_by_ias.get(&(ias[0].raw, strip_der_int_sign(ias[1].val))) else {
             continue;
         };
         let Some(ref rsa_pub) = certs[cert_idx].rsa_pub else {
@@ -1590,7 +1643,7 @@ fn verify_standalone_pkcs7(
             let mut md_count = 0usize;
             let mut ct_count = 0usize;
             let expected_md = si_digest.hash(&content_bytes);
-            for attr in der_children(aa.val).ok_or(TRUST_E_BAD_DIGEST)? {
+            for attr in der_children_bounded(aa.val, MAX_CMS_AUTH_ATTRS).ok_or(TRUST_E_BAD_DIGEST)? {
                 if attr.tag != 0x30 {
                     continue;
                 }
@@ -4074,6 +4127,141 @@ mod tests {
             crate::misc::crypt32::CertCloseStore(add_st, 0);
             crate::misc::crypt32::CertFreeCertificateContext(leaf_ctx);
         }
+    }
+
+    #[test]
+    fn standalone_cms_bounds_certs_and_signers_against_quadratic_dos() {
+        fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if body.len() < 0x80 {
+                out.push(body.len() as u8);
+            } else if body.len() < 0x100 {
+                out.push(0x81);
+                out.push(body.len() as u8);
+            } else if body.len() < 0x1_0000 {
+                out.push(0x82);
+                out.push((body.len() >> 8) as u8);
+                out.push((body.len() & 0xFF) as u8);
+            } else {
+                out.push(0x83);
+                out.push((body.len() >> 16) as u8);
+                out.push(((body.len() >> 8) & 0xFF) as u8);
+                out.push((body.len() & 0xFF) as u8);
+            }
+            out.extend_from_slice(body);
+            out
+        }
+
+        // Build a standalone CMS SignedData repeating a parseable certificate `cert_count` times
+        // and an unmatched syntactically valid SignerInfo `signer_count` times.
+        let build_cms = |cert_count: usize, signer_count: usize| -> Vec<u8> {
+            let cert_der = crate::misc::secur32::tests::TEST_LEAF_DER;
+            let mut certs_body = Vec::with_capacity(cert_der.len() * cert_count);
+            for _ in 0..cert_count {
+                certs_body.extend_from_slice(cert_der);
+            }
+            // Syntactically valid SignerInfo whose issuer+serial does NOT match `cert_der`.
+            let unmatched_ias = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x30, &[]),       // empty Issuer DN
+                    der_tlv(0x02, &[0x7F]),   // serial 0x7F
+                ]
+                .concat(),
+            );
+            let sha256_alg = der_tlv(0x30, &[der_tlv(0x06, OID_SHA256), der_tlv(0x05, &[])].concat());
+            let rsa_alg = der_tlv(0x30, &[der_tlv(0x06, OID_RSA_ENCRYPTION), der_tlv(0x05, &[])].concat());
+            let one_si = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &[1]),
+                    unmatched_ias,
+                    sha256_alg.clone(),
+                    rsa_alg,
+                    der_tlv(0x04, &[0u8; 32]),
+                ]
+                .concat(),
+            );
+            let mut signers_body = Vec::with_capacity(one_si.len() * signer_count);
+            for _ in 0..signer_count {
+                signers_body.extend_from_slice(&one_si);
+            }
+            let eci = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x06, OID_DATA),
+                    der_tlv(0xA0, &der_tlv(0x04, b"payload")),
+                ]
+                .concat(),
+            );
+            let sd = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &[1]),
+                    der_tlv(0x31, &sha256_alg),
+                    eci,
+                    der_tlv(0xA0, &certs_body),
+                    der_tlv(0x31, &signers_body),
+                ]
+                .concat(),
+            );
+            der_tlv(
+                0x30,
+                &[der_tlv(0x06, OID_SIGNED_DATA), der_tlv(0xA0, &sd)].concat(),
+            )
+        };
+
+        let check_blob_rejected = |blob: &[u8]| unsafe {
+            let mut blob_info = [0u8; 0x38];
+            std::ptr::write_unaligned(blob_info.as_mut_ptr() as *mut u32, 0x38u32);
+            std::ptr::write_unaligned(
+                blob_info.as_mut_ptr().add(0x20) as *mut u32,
+                blob.len() as u32,
+            );
+            std::ptr::write_unaligned(
+                blob_info.as_mut_ptr().add(0x28) as *mut *const u8,
+                blob.as_ptr(),
+            );
+            let mut wtd = [0u8; 0x58];
+            std::ptr::write_unaligned(wtd.as_mut_ptr() as *mut u32, 0x58u32);
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_BLOB);
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x28) as *mut *const u8,
+                blob_info.as_ptr(),
+            );
+            let t0 = std::time::Instant::now();
+            let rc = WinVerifyTrust(
+                std::ptr::null_mut(),
+                WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
+                wtd.as_mut_ptr() as *mut c_void,
+            );
+            assert_eq!(rc, TRUST_E_BAD_DIGEST);
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(2),
+                "CMS verification must reject unbounded/repeated certs & signers quickly"
+            );
+        };
+
+        // 1. Over-cap certificate list is rejected immediately before parsing.
+        let too_many_certs = build_cms(MAX_CMS_CERTS + 1, 1);
+        check_blob_rejected(&too_many_certs);
+        assert!(parse_pkcs7_signed_data(&too_many_certs, false).is_none());
+
+        // 2. Over-cap SignerInfo list is rejected immediately.
+        let too_many_signers = build_cms(1, MAX_CMS_SIGNERS + 1);
+        check_blob_rejected(&too_many_signers);
+        assert!(parse_pkcs7_signed_data(&too_many_signers, false).is_none());
+
+        // 3. Worst-case within-cap (MAX_CMS_CERTS x MAX_CMS_SIGNERS) matches in O(C + S).
+        let at_cap = build_cms(MAX_CMS_CERTS, MAX_CMS_SIGNERS);
+        check_blob_rejected(&at_cap);
+
+        // 4. Legitimate standalone signed blob still verifies cleanly via indexed lookup.
+        assert!(verify_standalone_pkcs7(
+            crate::misc::crypt32::tests::test_vectors::PKCS7_SIGNED_DER,
+            None,
+        )
+        .is_ok());
     }
 }
 
