@@ -78,11 +78,151 @@ pub(crate) fn truncate_utf16_at_limit(units: &mut Vec<u16>, limit: usize) -> boo
         return false;
     }
     let mut new_len = limit;
-    if new_len > 0 && (0xD800..=0xDBFF).contains(&units[new_len - 1]) {
-        new_len -= 1;
+    if new_len > 0 {
+        let prev = units[new_len - 1];
+        let next = units[new_len];
+        // Never split a UTF-16 surrogate pair or a CRLF pair at the truncation boundary.
+        if (0xD800..=0xDBFF).contains(&prev) || (prev == b'\r' as u16 && next == b'\n' as u16) {
+            new_len -= 1;
+        }
     }
     units.truncate(new_len);
     true
+}
+
+/// Normalize native AppKit line breaks (`\n`, `\r`, or `\r\n`) to Win32 CRLF
+/// (`\r\n`) and translate the UTF-16 selection range `(sel_start, sel_end)` into
+/// the resulting Win32 UTF-16 offsets. Idempotent on already-CRLF input.
+pub(crate) fn native_newlines_to_win32(
+    units: &[u16],
+    sel_start: usize,
+    sel_end: usize,
+) -> (Vec<u16>, usize, usize) {
+    let lo = sel_start.min(sel_end).min(units.len());
+    let hi = sel_start.max(sel_end).min(units.len());
+    let mut out = Vec::with_capacity(units.len());
+    let mut out_lo = None;
+    let mut out_hi = None;
+    let mut i = 0usize;
+    while i < units.len() {
+        if i == lo && out_lo.is_none() {
+            out_lo = Some(out.len());
+        }
+        if i == hi && out_hi.is_none() {
+            out_hi = Some(out.len());
+        }
+        if units[i] == b'\r' as u16 {
+            if i + 1 < units.len() && units[i + 1] == b'\n' as u16 {
+                out.push(b'\r' as u16);
+                if i + 1 == lo && out_lo.is_none() {
+                    out_lo = Some(out.len());
+                }
+                if i + 1 == hi && out_hi.is_none() {
+                    out_hi = Some(out.len());
+                }
+                out.push(b'\n' as u16);
+                i += 2;
+            } else {
+                out.push(b'\r' as u16);
+                out.push(b'\n' as u16);
+                i += 1;
+            }
+        } else if units[i] == b'\n' as u16 {
+            out.push(b'\r' as u16);
+            out.push(b'\n' as u16);
+            i += 1;
+        } else {
+            out.push(units[i]);
+            i += 1;
+        }
+    }
+    let final_lo = out_lo.unwrap_or(out.len());
+    let final_hi = out_hi.unwrap_or(out.len());
+    (out, final_lo, final_hi)
+}
+
+/// Convert Win32 text (`\r\n` / `\r` / `\n`) to native AppKit LF (`\n`) text
+/// and translate the Win32 UTF-16 selection range `(sel_start, sel_end)` into
+/// native UTF-16 offsets.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn win32_newlines_to_native(
+    units: &[u16],
+    sel_start: usize,
+    sel_end: usize,
+) -> (Vec<u16>, usize, usize) {
+    let lo = sel_start.min(sel_end).min(units.len());
+    let hi = sel_start.max(sel_end).min(units.len());
+    let mut out = Vec::with_capacity(units.len());
+    let mut out_lo = None;
+    let mut out_hi = None;
+    let mut i = 0usize;
+    while i < units.len() {
+        if i == lo && out_lo.is_none() {
+            out_lo = Some(out.len());
+        }
+        if i == hi && out_hi.is_none() {
+            out_hi = Some(out.len());
+        }
+        if units[i] == b'\r' as u16 && i + 1 < units.len() && units[i + 1] == b'\n' as u16 {
+            if i + 1 == lo && out_lo.is_none() {
+                out_lo = Some(out.len());
+            }
+            if i + 1 == hi && out_hi.is_none() {
+                out_hi = Some(out.len());
+            }
+            out.push(b'\n' as u16);
+            i += 2;
+        } else if units[i] == b'\r' as u16 {
+            out.push(b'\n' as u16);
+            i += 1;
+        } else {
+            out.push(units[i]);
+            i += 1;
+        }
+    }
+    let final_lo = out_lo.unwrap_or(out.len());
+    let final_hi = out_hi.unwrap_or(out.len());
+    (out, final_lo, final_hi)
+}
+
+/// Map a Win32 UTF-16 offset within `win32` to the corresponding native LF
+/// offset in the text produced by [`win32_newlines_to_native`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn win32_offset_to_native(win32: &[u16], offset: usize) -> usize {
+    let target = offset.min(win32.len());
+    let mut nat = 0usize;
+    let mut i = 0usize;
+    while i < target {
+        if win32[i] == b'\r' as u16 && i + 1 < win32.len() && win32[i + 1] == b'\n' as u16 {
+            if i + 1 == target {
+                break;
+            }
+            nat += 1;
+            i += 2;
+        } else {
+            nat += 1;
+            i += 1;
+        }
+    }
+    nat
+}
+
+/// Map a native LF UTF-16 offset back to the corresponding Win32 UTF-16 offset
+/// within `win32`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn native_offset_to_win32(win32: &[u16], nat_offset: usize) -> usize {
+    let mut nat = 0usize;
+    let mut i = 0usize;
+    while i < win32.len() && nat < nat_offset {
+        if win32[i] == b'\r' as u16 && i + 1 < win32.len() && win32[i + 1] == b'\n' as u16 {
+            i += 2;
+            nat += 1;
+        } else {
+            i += 1;
+            nat += 1;
+        }
+    }
+    i
 }
 
 /// Result of applying Win32 `EDIT` input constraints (`ES_NUMBER`, `ES_UPPERCASE`,
@@ -492,7 +632,12 @@ pub fn native_edit_text_changed(hwnd: usize, text: String, sel_start: usize, sel
         if (style & ES_READONLY) != 0 || !window::effective_child_enabled(hwnd) {
             return;
         }
-        let next_units: Vec<u16> = text.encode_utf16().collect();
+        let raw_units: Vec<u16> = text.encode_utf16().collect();
+        let (next_units, sel_start, sel_end) = if (style & ES_MULTILINE) != 0 {
+            native_newlines_to_win32(&raw_units, sel_start, sel_end)
+        } else {
+            (raw_units, sel_start, sel_end)
+        };
         let limit = edit_states()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2657,6 +2802,102 @@ mod tests {
             assert!(ops.contains(&RecordedControlOp::SetEnabled(individually_disabled as usize, false)));
             assert!(window::effective_child_enabled(nested_btn as usize));
             assert!(!window::effective_child_enabled(individually_disabled as usize));
+
+            assert_eq!(DestroyWindow(parent), TRUE);
+            assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn native_multiline_edits_normalize_crlf_and_translate_selections() {
+        // Pure-helper bidirectional conversion and offset translation.
+        let nat: Vec<u16> = "a\nb\nc".encode_utf16().collect();
+        let (win32, wlo, whi) = native_newlines_to_win32(&nat, 2, 5);
+        assert_eq!(String::from_utf16_lossy(&win32), "a\r\nb\r\nc");
+        assert_eq!((wlo, whi), (3, 7));
+
+        // Idempotent when already CRLF.
+        let (win32_again, wlo2, whi2) = native_newlines_to_win32(&win32, wlo, whi);
+        assert_eq!(win32_again, win32);
+        assert_eq!((wlo2, whi2), (3, 7));
+
+        // Inverse Win32 CRLF -> native LF + offsets.
+        let (nat_back, nlo, nhi) = win32_newlines_to_native(&win32, 3, 7);
+        assert_eq!(nat_back, nat);
+        assert_eq!((nlo, nhi), (2, 5));
+        assert_eq!(win32_offset_to_native(&win32, 0), 0);
+        assert_eq!(win32_offset_to_native(&win32, 1), 1);
+        assert_eq!(win32_offset_to_native(&win32, 2), 1); // between \r and \n snaps to \n
+        assert_eq!(win32_offset_to_native(&win32, 3), 2);
+        assert_eq!(win32_offset_to_native(&win32, 7), 5);
+        assert_eq!(native_offset_to_win32(&win32, 0), 0);
+        assert_eq!(native_offset_to_win32(&win32, 1), 1);
+        assert_eq!(native_offset_to_win32(&win32, 2), 3);
+        assert_eq!(native_offset_to_win32(&win32, 4), 6);
+        assert_eq!(native_offset_to_win32(&win32, 5), 7);
+
+        // Raw LF text explicitly set by Win32 preserves 1:1 native<->win32 offsets.
+        let raw_lf: Vec<u16> = "a\nb".encode_utf16().collect();
+        assert_eq!(native_offset_to_win32(&raw_lf, 2), 2);
+        assert_eq!(native_offset_to_win32(&raw_lf, 3), 3);
+
+        // EM_LIMITTEXT never splits a \r\n pair when rejecting a Return at limit.
+        let prev_ab: Vec<u16> = "ab".encode_utf16().collect();
+        let (next_ab_nl, nlo_nl, nhi_nl) =
+            native_newlines_to_win32(&"ab\n".encode_utf16().collect::<Vec<_>>(), 3, 3);
+        let norm_rej = apply_native_edit_constraints(&prev_ab, &next_ab_nl, nlo_nl, nhi_nl, ES_MULTILINE, 3);
+        assert_eq!(String::from_utf16_lossy(&norm_rej.units), "ab");
+        assert!(!norm_rej.text_changed);
+        assert!(norm_rej.reconcile_native);
+        let norm_ok = apply_native_edit_constraints(&prev_ab, &next_ab_nl, nlo_nl, nhi_nl, ES_MULTILINE, 4);
+        assert_eq!(String::from_utf16_lossy(&norm_ok.units), "ab\r\n");
+        assert_eq!((norm_ok.sel_start, norm_ok.sel_end), (4, 4));
+        assert!(norm_ok.text_changed);
+        assert!(!norm_ok.reconcile_native);
+
+        // End-to-end ES_MULTILINE | ES_WANTRETURN edit control through native_edit_text_changed.
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            let (parent, parent_cls) = make_parent("MultilineCrlfParent");
+            let edit = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("").as_ptr(),
+                ws::CHILD | ws::VISIBLE | ES_MULTILINE | ES_WANTRETURN,
+                10,
+                10,
+                240,
+                100,
+                parent,
+                600,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!edit.is_null());
+
+            // Simulate AppKit inserting LF ("a\nb") with caret at native offset 2 (start of line 2).
+            native_edit_text_changed(edit as usize, "a\nb".to_string(), 2, 2);
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+
+            let mut buf = [0u16; 32];
+            let n = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "a\r\nb");
+            assert_eq!(SendMessageW(edit, wm::EM_GETLINECOUNT, 0, 0), 2);
+            assert_eq!(SendMessageW(edit, wm::EM_LINEINDEX, 1, 0), 3);
+            let (mut s, mut e) = (0u32, 0u32);
+            SendMessageW(edit, wm::EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM);
+            assert_eq!((s, e), (3, 3));
+
+            // EM_REPLACESEL at the translated caret inserts cleanly at the start of line 2.
+            let ins = crate::strings::to_wide_z("X");
+            SendMessageW(edit, wm::EM_REPLACESEL, 0, ins.as_ptr() as LPARAM);
+            let n2 = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n2]), "a\r\nXb");
+            SendMessageW(edit, wm::EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM);
+            assert_eq!((s, e), (4, 4));
 
             assert_eq!(DestroyWindow(parent), TRUE);
             assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);

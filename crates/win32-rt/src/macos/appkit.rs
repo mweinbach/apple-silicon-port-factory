@@ -1388,35 +1388,45 @@ define_class!(
                         return None;
                     }
                     let raw = text_view.string().to_string();
-                    let next_units: Vec<u16> = raw.encode_utf16().collect();
+                    let native_units: Vec<u16> = raw.encode_utf16().collect();
                     let r = text_view.selectedRange();
-                    let lo = r.location;
-                    let hi = r.location.saturating_add(r.length);
+                    let (win32_next, win32_lo, win32_hi) = controls::native_newlines_to_win32(
+                        &native_units,
+                        r.location,
+                        r.location.saturating_add(r.length),
+                    );
                     let norm = controls::apply_native_edit_constraints(
                         &last_text.borrow(),
-                        &next_units,
-                        lo,
-                        hi,
+                        &win32_next,
+                        win32_lo,
+                        win32_hi,
                         edit_style.get(),
                         max_len.get(),
                     );
-                    let final_text = if norm.reconcile_native {
-                        let s = String::from_utf16_lossy(&norm.units);
-                        programmatic.set(true);
-                        text_view.setString(&NSString::from_str(&s));
-                        text_view.setSelectedRange(NSRange::new(
+                    if norm.reconcile_native {
+                        let (nat_units, nat_lo, nat_hi) = controls::win32_newlines_to_native(
+                            &norm.units,
                             norm.sel_start,
-                            norm.sel_end.saturating_sub(norm.sel_start),
+                            norm.sel_end,
+                        );
+                        let nat_str = String::from_utf16_lossy(&nat_units);
+                        programmatic.set(true);
+                        text_view.setString(&NSString::from_str(&nat_str));
+                        text_view.setSelectedRange(NSRange::new(
+                            nat_lo,
+                            nat_hi.saturating_sub(nat_lo),
                         ));
                         programmatic.set(false);
-                        s
+                    }
+                    let final_win32 = if norm.text_changed {
+                        Some(String::from_utf16_lossy(&norm.units))
                     } else {
-                        raw
+                        None
                     };
                     *last_text.borrow_mut() = norm.units;
                     last_sel.set((norm.sel_start, norm.sel_end));
-                    if norm.text_changed {
-                        return Some((final_text, norm.sel_start, norm.sel_end));
+                    if let Some(win32_text) = final_win32 {
+                        return Some((win32_text, norm.sel_start, norm.sel_end));
                     }
                 }
                 None
@@ -1437,6 +1447,7 @@ define_class!(
                 if let NativeControlView::MultiLineEdit {
                     text_view,
                     programmatic,
+                    last_text,
                     last_sel,
                     ..
                 } = &ctrl.view
@@ -1446,8 +1457,11 @@ define_class!(
                     }
                     let len = text_view.string().length();
                     let r = text_view.selectedRange();
-                    let lo = r.location.min(len);
-                    let hi = r.location.saturating_add(r.length).min(len);
+                    let nat_lo = r.location.min(len);
+                    let nat_hi = r.location.saturating_add(r.length).min(len);
+                    let win32_units = last_text.borrow();
+                    let lo = controls::native_offset_to_win32(&win32_units, nat_lo);
+                    let hi = controls::native_offset_to_win32(&win32_units, nat_hi);
                     if last_sel.replace((lo, hi)) != (lo, hi) {
                         return Some((lo, hi));
                     }
@@ -1781,7 +1795,9 @@ pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeContro
                 text_view.setAlignment(ns_alignment_from_edit(desc.style));
                 text_view.setVerticallyResizable(true);
                 text_view.setHorizontallyResizable((desc.style & ws::HSCROLL) != 0);
-                text_view.setString(&NSString::from_str(&desc.text));
+                let win32_units: Vec<u16> = desc.text.encode_utf16().collect();
+                let (nat_units, _, _) = controls::win32_newlines_to_native(&win32_units, 0, 0);
+                text_view.setString(&NSString::from_str(&String::from_utf16_lossy(&nat_units)));
                 text_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
                 scroll.setDocumentView(Some(&text_view));
                 NativeControlView::MultiLineEdit {
@@ -1794,7 +1810,7 @@ pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeContro
                     edit_style: Cell::new(desc.style),
                     wants_return: Cell::new((desc.style & controls::ES_WANTRETURN) != 0),
                     max_len: Cell::new(controls::DEFAULT_EDIT_LIMIT),
-                    last_text: RefCell::new(desc.text.encode_utf16().collect()),
+                    last_text: RefCell::new(win32_units),
                     last_sel: Cell::new((0, 0)),
                 }
             } else {
@@ -1947,9 +1963,11 @@ pub(super) fn control_set_text(hwnd: usize, text: String) {
                 programmatic.set(false);
             }
             NativeControlView::MultiLineEdit { text_view, programmatic, last_text, .. } => {
-                *last_text.borrow_mut() = text.encode_utf16().collect();
+                let win32_units: Vec<u16> = text.encode_utf16().collect();
+                let (nat_units, _, _) = controls::win32_newlines_to_native(&win32_units, 0, 0);
+                *last_text.borrow_mut() = win32_units;
                 programmatic.set(true);
-                text_view.setString(&NSString::from_str(&text));
+                text_view.setString(&NSString::from_str(&String::from_utf16_lossy(&nat_units)));
                 programmatic.set(false);
             }
             NativeControlView::StaticLabel { label, no_prefix } => {
@@ -2057,15 +2075,20 @@ pub(super) fn control_set_selection(hwnd: usize, start: usize, end: usize) {
             NativeControlView::MultiLineEdit {
                 text_view,
                 programmatic,
+                last_text,
                 last_sel,
                 ..
             } => {
-                let len = text_view.string().length();
-                let lo = start.min(end).min(len);
-                let hi = start.max(end).min(len);
+                let win32_units = last_text.borrow();
+                let win32_len = win32_units.len();
+                let lo = start.min(end).min(win32_len);
+                let hi = start.max(end).min(win32_len);
                 last_sel.set((lo, hi));
+                let nat_len = text_view.string().length();
+                let nat_lo = controls::win32_offset_to_native(&win32_units, lo).min(nat_len);
+                let nat_hi = controls::win32_offset_to_native(&win32_units, hi).min(nat_len);
                 programmatic.set(true);
-                text_view.setSelectedRange(NSRange::new(lo, hi - lo));
+                text_view.setSelectedRange(NSRange::new(nat_lo, nat_hi.saturating_sub(nat_lo)));
                 programmatic.set(false);
             }
             _ => {}
@@ -2492,6 +2515,7 @@ pub(super) fn sync_focused_edit_selection(ev: &NSEvent, mtm: MainThreadMarker) {
             NativeControlView::MultiLineEdit {
                 text_view,
                 programmatic,
+                last_text,
                 last_sel,
                 ..
             } => {
@@ -2500,8 +2524,11 @@ pub(super) fn sync_focused_edit_selection(ev: &NSEvent, mtm: MainThreadMarker) {
                 }
                 let len = text_view.string().length();
                 let r = text_view.selectedRange();
-                let lo = r.location.min(len);
-                let hi = r.location.saturating_add(r.length).min(len);
+                let nat_lo = r.location.min(len);
+                let nat_hi = r.location.saturating_add(r.length).min(len);
+                let win32_units = last_text.borrow();
+                let lo = controls::native_offset_to_win32(&win32_units, nat_lo);
+                let hi = controls::native_offset_to_win32(&win32_units, nat_hi);
                 if last_sel.replace((lo, hi)) != (lo, hi) {
                     return Some((lo, hi));
                 }
