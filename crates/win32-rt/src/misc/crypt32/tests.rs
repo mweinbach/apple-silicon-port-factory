@@ -842,6 +842,49 @@ fn macos_trust_settings_preserves_application_key_usage_and_error_constraints() 
             ("kSecTrustSettingsApplication", s_dummy),
         ]);
         assert_eq!(scoped_deny, TrustSettingDecision::PolicyRestrictedOrUnspecified);
+
+        // Multi-entry trust-settings array with a scoped Deny BEFORE an unconditional TrustRoot
+        // fallback MUST also return PolicyRestrictedOrUnspecified (never UnconditionalTrustRoot),
+        // so the scoped Deny is preserved and deferred to policy-aware SecTrust evaluation.
+        let k_res_1 = cf_str("kSecTrustSettingsResult");
+        let k_app_1 = cf_str("kSecTrustSettingsApplication");
+        let d1_keys = [k_res_1, k_app_1];
+        let d1_vals = [n_deny, s_dummy];
+        let dict_scoped_deny = CFDictionaryCreate(
+            kCFAllocatorDefault,
+            d1_keys.as_ptr(),
+            d1_vals.as_ptr(),
+            2,
+            std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks) as *const u8,
+            std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks) as *const u8,
+        );
+        let d2_keys = [k_res_1];
+        let d2_vals = [n_trust_root];
+        let dict_uncond_trust = CFDictionaryCreate(
+            kCFAllocatorDefault,
+            d2_keys.as_ptr(),
+            d2_vals.as_ptr(),
+            1,
+            std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks) as *const u8,
+            std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks) as *const u8,
+        );
+        let mixed_dicts = [dict_scoped_deny, dict_uncond_trust];
+        let mixed_arr = CFArrayCreate(
+            kCFAllocatorDefault,
+            mixed_dicts.as_ptr(),
+            2,
+            std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+        );
+        assert_eq!(
+            classify_trust_settings_array(mixed_arr),
+            TrustSettingDecision::PolicyRestrictedOrUnspecified,
+            "mixed [scoped Deny, unconditional TrustRoot] array must defer to SecTrust"
+        );
+        CFRelease(mixed_arr);
+        CFRelease(dict_scoped_deny);
+        CFRelease(dict_uncond_trust);
+        CFRelease(k_res_1);
+        CFRelease(k_app_1);
         let root_ok = vec![0x30u8, 0x01];
         let root_scoped_deny = vec![0x30u8, 0x02];
         let root_uncond_deny = vec![0x30u8, 0x03];
@@ -4969,6 +5012,156 @@ fn macos_trust_store_and_extended_chain_policies() {
         CertFreeCertificateChain(chain);
         CertFreeCertificateContext(cert);
         CertCloseStore(st, 0);
+
+        // Strong-sign key-strength and signature-hash enforcement (szOID_CERT_STRONG_SIGN_OS_1):
+        // A 1024-bit RSA leaf signed with SHA-256 by a trusted 2048-bit RSA CA must FAIL when
+        // dwStrongSignFlags == 0 (weak 1024-bit leaf key < 2047 bits), and PASS when
+        // dwStrongSignFlags == CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG (1).
+        // Conversely, a SHA-1-signed 2048-bit RSA leaf must FAIL even with DISABLE_END_CHECK_FLAG.
+        let ss_root_st = CertOpenStore(
+            super::store::CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                ss_root_st,
+                X509_ASN_ENCODING,
+                self::test_vectors::RSA2048_CA_DER.as_ptr(),
+                self::test_vectors::RSA2048_CA_DER.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut ss_eng_cfg = [0u8; 0x60];
+        std::ptr::write_unaligned(ss_eng_cfg.as_mut_ptr() as *mut u32, ss_eng_cfg.len() as u32);
+        std::ptr::write_unaligned(ss_eng_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, ss_root_st);
+        let mut ss_eng: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertCreateCertificateChainEngine(ss_eng_cfg.as_ptr() as *const c_void, &mut ss_eng),
+            TRUE
+        );
+        let leaf1024_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            self::test_vectors::RSA1024_LEAF_SHA256_DER.as_ptr(),
+            self::test_vectors::RSA1024_LEAF_SHA256_DER.len() as u32,
+        );
+        assert!(!leaf1024_ctx.is_null());
+
+        let oid_os1 = b"1.3.6.1.4.1.311.72.1.1\0";
+        let mut ss_para = [0u8; 0x10];
+        std::ptr::write_unaligned(ss_para.as_mut_ptr() as *mut u32, 0x10u32);
+        std::ptr::write_unaligned(ss_para.as_mut_ptr().add(4) as *mut u32, 2u32); // CERT_STRONG_SIGN_OID_INFO_CHOICE
+        std::ptr::write_unaligned(ss_para.as_mut_ptr().add(8) as *mut *const u8, oid_os1.as_ptr());
+
+        let mut cp_ss = [0u8; 0x60];
+        std::ptr::write_unaligned(cp_ss.as_mut_ptr() as *mut u32, 0x60u32);
+        std::ptr::write_unaligned(cp_ss.as_mut_ptr().add(0x50) as *mut *const u8, ss_para.as_ptr());
+        std::ptr::write_unaligned(cp_ss.as_mut_ptr().add(0x58) as *mut u32, 0u32); // dwStrongSignFlags = 0
+
+        let mut weak_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                ss_eng,
+                leaf1024_ctx,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                cp_ss.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut weak_chain,
+            ),
+            TRUE
+        );
+        let weak_ts = std::ptr::read_unaligned((weak_chain as *const u8).add(4) as *const u32);
+        assert_ne!(
+            weak_ts & 0x0010_0000, // CERT_TRUST_HAS_WEAK_SIGNATURE
+            0,
+            "1024-bit RSA leaf must trigger CERT_TRUST_HAS_WEAK_SIGNATURE when dwStrongSignFlags=0"
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASE as *const u8,
+                weak_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0x8009_6004); // TRUST_E_CERT_SIGNATURE
+        CertFreeCertificateChain(weak_chain);
+
+        // With CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG (1), the 1024-bit leaf's own
+        // public key is exempt while its SHA-256 signature and 2048-bit CA key pass.
+        std::ptr::write_unaligned(cp_ss.as_mut_ptr().add(0x58) as *mut u32, 1u32);
+        let mut end_exempt_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                ss_eng,
+                leaf1024_ctx,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                cp_ss.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut end_exempt_chain,
+            ),
+            TRUE
+        );
+        let exempt_ts = std::ptr::read_unaligned((end_exempt_chain as *const u8).add(4) as *const u32);
+        assert_eq!(
+            exempt_ts & 0x0010_0000,
+            0,
+            "DISABLE_END_CHECK_FLAG must allow 1024-bit leaf signed with SHA-256 by 2048-bit CA"
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASE as *const u8,
+                end_exempt_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0);
+        CertFreeCertificateChain(end_exempt_chain);
+
+        // A 2048-bit RSA leaf signed with SHA-1 must STILL be rejected as weak even when
+        // CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG is set.
+        let leaf_sha1_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            self::test_vectors::RSA2048_LEAF_SHA1_DER.as_ptr(),
+            self::test_vectors::RSA2048_LEAF_SHA1_DER.len() as u32,
+        );
+        assert!(!leaf_sha1_ctx.is_null());
+        let mut sha1_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                ss_eng,
+                leaf_sha1_ctx,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                cp_ss.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut sha1_chain,
+            ),
+            TRUE
+        );
+        let sha1_ts = std::ptr::read_unaligned((sha1_chain as *const u8).add(4) as *const u32);
+        assert_ne!(
+            sha1_ts & 0x0010_0000,
+            0,
+            "SHA-1 leaf signature must still fail strong-sign check even with DISABLE_END_CHECK_FLAG"
+        );
+        CertFreeCertificateChain(sha1_chain);
+        CertFreeCertificateContext(leaf_sha1_ctx);
+        CertFreeCertificateContext(leaf1024_ctx);
+        CertFreeCertificateChainEngine(ss_eng);
+        CertCloseStore(ss_root_st, 0);
     }
 }
 

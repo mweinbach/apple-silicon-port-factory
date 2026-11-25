@@ -208,6 +208,8 @@ pub(super) mod apple_trust {
         }
 
         let mut saw_unconditional_trust = false;
+        let mut saw_unconditional_deny = false;
+        let mut saw_constrained_rule = false;
         for i in 0..count {
             let dict = CFArrayGetValueAtIndex(settings, i);
             if dict.is_null() {
@@ -251,19 +253,28 @@ pub(super) mod apple_trust {
             // If ANY other key is present (kSecTrustSettingsPolicy, kSecTrustSettingsPolicyString,
             // kSecTrustSettingsApplication, kSecTrustSettingsAllowedError, restrictive
             // kSecTrustSettingsKeyUsage, or any future constraint key), total_keys > unconstrained_keys
-            // and this rule is NOT unconditional.
+            // and this rule is constrained. A trust-settings array containing ANY constrained rule
+            // (e.g. a scoped Deny before an unconditional TrustRoot fallback) MUST NOT be promoted
+            // to unconditional trust — defer the root to policy-aware SecTrust evaluation.
             if total_keys == unconstrained_keys {
                 if result_val == K_SEC_TRUST_SETTINGS_RESULT_DENY {
-                    return TrustSettingDecision::Denied;
-                }
-                if result_val == K_SEC_TRUST_SETTINGS_RESULT_TRUST_ROOT
+                    saw_unconditional_deny = true;
+                } else if result_val == K_SEC_TRUST_SETTINGS_RESULT_TRUST_ROOT
                     || result_val == K_SEC_TRUST_SETTINGS_RESULT_TRUST_AS_ROOT
                 {
                     saw_unconditional_trust = true;
+                } else {
+                    saw_constrained_rule = true;
                 }
+            } else {
+                saw_constrained_rule = true;
             }
         }
-        if saw_unconditional_trust {
+        if saw_constrained_rule {
+            TrustSettingDecision::PolicyRestrictedOrUnspecified
+        } else if saw_unconditional_deny {
+            TrustSettingDecision::Denied
+        } else if saw_unconditional_trust {
             TrustSettingDecision::UnconditionalTrustRoot
         } else {
             TrustSettingDecision::PolicyRestrictedOrUnspecified
@@ -1740,33 +1751,34 @@ fn cert_policy_oids(der: &[u8]) -> Vec<String> {
     out
 }
 
-/// Returns true if the certificate uses a legacy weak signature hash (MD2, MD5, or SHA-1),
-/// including RSASSA-PSS with omitted (default SHA-1) or weak `hashAlgorithm`.
-fn cert_uses_weak_signature_hash(der: &[u8]) -> bool {
+/// Returns true if the certificate uses a strong signature algorithm accepted by Windows
+/// `szOID_CERT_STRONG_SIGN_OS_1` / `OS_CURRENT` / `OS_SERVER_1` (SHA-256/384/512 with RSA,
+/// RSASSA-PSS, or ECDSA, or Ed25519/Ed448).
+fn cert_has_strong_signature_alg(der: &[u8]) -> bool {
     const OID_RSASSA_PSS: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
     const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
     const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
     const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
 
     let Some(parts) = parse_cert_der_parts(der) else {
-        return true;
+        return false;
     };
     let Some((sig_oid, rest)) = parse_der_item(parts.sig_alg_inner) else {
-        return true;
+        return false;
     };
     if sig_oid.tag != 0x06 {
-        return true;
+        return false;
     }
     if sig_oid.val == OID_RSASSA_PSS {
         // RFC 4055 §3.1: omitted hashAlgorithm defaults to SHA-1 (weak).
         let Some((params_seq, _)) = parse_der_item(rest) else {
-            return true;
+            return false;
         };
         if params_seq.tag != 0x30 {
-            return true;
+            return false;
         }
         let Some(fields) = der_item_children(params_seq.val) else {
-            return true;
+            return false;
         };
         for f in fields {
             if f.tag == 0xA0 {
@@ -1774,7 +1786,7 @@ fn cert_uses_weak_signature_hash(der: &[u8]) -> bool {
                     if alg_seq.tag == 0x30 {
                         if let Some((hash_oid, _)) = parse_der_item(alg_seq.val) {
                             if hash_oid.tag == 0x06 {
-                                return !matches!(
+                                return matches!(
                                     hash_oid.val,
                                     OID_SHA256 | OID_SHA384 | OID_SHA512
                                 );
@@ -1784,29 +1796,96 @@ fn cert_uses_weak_signature_hash(der: &[u8]) -> bool {
                 }
             }
         }
-        return true;
+        return false;
     }
     matches!(
         sig_oid.val,
-        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x02] // md2WithRSAEncryption
-            | [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04] // md5WithRSAEncryption
-            | [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05] // sha1WithRSAEncryption
-            | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x01] // ecdsa-with-SHA1
-            | [0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x03] // dsa-with-SHA1
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B] // sha256WithRSAEncryption
+            | [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C] // sha384WithRSAEncryption
+            | [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D] // sha512WithRSAEncryption
+            | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02] // ecdsa-with-SHA256
+            | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03] // ecdsa-with-SHA384
+            | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04] // ecdsa-with-SHA512
+            | [0x2B, 0x65, 0x70] // id-Ed25519
+            | [0x2B, 0x65, 0x71] // id-Ed448
     )
 }
 
-/// Windows SDK `wincrypt.h` `CERT_STRONG_SIGN_PARA.dwInfoChoice` discriminators.
+/// Returns true if the certificate's SubjectPublicKeyInfo meets Windows strong-sign key-strength
+/// requirements (`szOID_CERT_STRONG_SIGN_OS_1` / `OS_CURRENT` / `OS_SERVER_1`):
+/// RSA >= 2047 bits, ECDSA on P-256 / P-384 / P-521, or Ed25519 / Ed448.
+fn cert_has_strong_public_key(der: &[u8]) -> bool {
+    const OID_RSA_ENCRYPTION: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+    const OID_RSASSA_PSS: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
+    const OID_EC_PUBLIC_KEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+    const OID_SECP256R1: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    const OID_SECP384R1: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22];
+    const OID_SECP521R1: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x23];
+    const OID_ED25519: &[u8] = &[0x2B, 0x65, 0x70];
+    const OID_ED448: &[u8] = &[0x2B, 0x65, 0x71];
+
+    let Some(parts) = parse_cert_der_parts(der) else {
+        return false;
+    };
+    let Some((alg_oid, alg_rest)) = parse_der_item(parts.spki_alg_inner) else {
+        return false;
+    };
+    if alg_oid.tag != 0x06 {
+        return false;
+    }
+    match alg_oid.val {
+        OID_RSA_ENCRYPTION | OID_RSASSA_PSS => {
+            let Some((rsa_seq, _)) = parse_der_item(parts.spki_key_bits) else {
+                return false;
+            };
+            if rsa_seq.tag != 0x30 {
+                return false;
+            }
+            let Some(kids) = der_item_children(rsa_seq.val) else {
+                return false;
+            };
+            if kids.len() < 2 || kids[0].tag != 0x02 || kids[1].tag != 0x02 {
+                return false;
+            }
+            let mut modulus = kids[0].val;
+            if modulus.is_empty() || (modulus[0] & 0x80) != 0 {
+                return false;
+            }
+            while modulus.len() > 1 && modulus[0] == 0 {
+                modulus = &modulus[1..];
+            }
+            if modulus[0] == 0 {
+                return false;
+            }
+            let bit_len = (modulus.len() - 1) * 8 + (8 - modulus[0].leading_zeros() as usize);
+            bit_len >= 2047
+        }
+        OID_EC_PUBLIC_KEY => {
+            let Some((curve_oid, _)) = parse_der_item(alg_rest) else {
+                return false;
+            };
+            curve_oid.tag == 0x06
+                && matches!(curve_oid.val, OID_SECP256R1 | OID_SECP384R1 | OID_SECP521R1)
+        }
+        OID_ED25519 | OID_ED448 => true,
+        _ => false,
+    }
+}
+
+/// Windows SDK `wincrypt.h` `CERT_STRONG_SIGN_PARA.dwInfoChoice` discriminators and flags.
 const CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE: u32 = 1;
 const CERT_STRONG_SIGN_OID_INFO_CHOICE: u32 = 2;
+const CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG: u32 = 0x0000_0001;
 const CERT_TRUST_HAS_WEAK_SIGNATURE: u32 = 0x0010_0000;
 const TRUST_E_CERT_SIGNATURE: u32 = 0x8009_6004;
 
 /// Evaluate `CERT_CHAIN_PARA` (`RequestedUsage`, `RequestedIssuancePolicy`, and `pStrongSignPara`)
-/// against `chain_der`. Returns `Ok((trust_status_bits, chain_para_error))` or `Err(win32_err)`.
+/// against `chain_der` (and optional trusted root pool `root_pool`).
+/// Returns `Ok((trust_status_bits, chain_para_error))` or `Err(win32_err)`.
 unsafe fn evaluate_cert_chain_para(
     p_chain_para: *const c_void,
     chain_der: &[Vec<u8>],
+    root_pool: &[Vec<u8>],
 ) -> Result<(u32, u32), u32> {
     if p_chain_para.is_null() {
         return Ok((0, 0));
@@ -1933,7 +2012,50 @@ unsafe fn evaluate_cert_chain_para(
                     return Err(err::ERROR_NOT_SUPPORTED);
                 }
             }
-            if chain_der.iter().any(|d| cert_uses_weak_signature_hash(d)) {
+            // Read dwStrongSignFlags (@ +0x58 when cbSize >= 0x5C).
+            let dw_strong_flags = if cb_size >= 0x5C {
+                std::ptr::read_unaligned(base.add(0x58) as *const u32)
+            } else {
+                0
+            };
+            let disable_end_check =
+                (dw_strong_flags & CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG) != 0;
+
+            let mut weak = false;
+            for (idx, d) in chain_der.iter().enumerate() {
+                let is_self_signed = parse_cert_der_parts(d)
+                    .is_some_and(|p| p.subject_inner == p.issuer_inner);
+                // Enforce strong signature algorithm on the leaf and all non-self-signed
+                // certificates (historical self-signed roots may carry SHA-1 self-signatures
+                // while still requiring a strong public key).
+                if (idx == 0 || !is_self_signed) && !cert_has_strong_signature_alg(d) {
+                    weak = true;
+                    break;
+                }
+                // Enforce strong public key length (RSA >= 2047 bits, ECDSA >= P-256, Ed25519/Ed448)
+                // on all issuer CAs, and on the leaf unless CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG is set.
+                if (idx > 0 || !disable_end_check) && !cert_has_strong_public_key(d) {
+                    weak = true;
+                    break;
+                }
+            }
+            // If the top certificate in chain_der is issued by a root in root_pool, verify
+            // that the issuing root's public key also meets strong-sign key strength.
+            if !weak {
+                if let Some(top_parts) = chain_der.last().and_then(|d| parse_cert_der_parts(d)) {
+                    if top_parts.subject_inner != top_parts.issuer_inner {
+                        if let Some(root_der) = root_pool.iter().find(|r| {
+                            parse_cert_der_parts(r)
+                                .is_some_and(|rp| rp.subject_inner == top_parts.issuer_inner)
+                        }) {
+                            if !cert_has_strong_public_key(root_der) {
+                                weak = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if weak {
                 trust_bits |= CERT_TRUST_IS_NOT_SIGNATURE_VALID | CERT_TRUST_HAS_WEAK_SIGNATURE;
                 if para_err == 0 {
                     para_err = TRUST_E_CERT_SIGNATURE;
@@ -2063,8 +2185,11 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
         revocation_flags,
     );
 
-    let (para_trust_bits, chain_para_error) = match evaluate_cert_chain_para(p_chain_para, &chain_der)
-    {
+    let strong_root_pool = exclusive_roots_der
+        .as_deref()
+        .unwrap_or(&extra_roots_der);
+    let (para_trust_bits, chain_para_error) =
+        match evaluate_cert_chain_para(p_chain_para, &chain_der, strong_root_pool) {
         Ok(pair) => pair,
         Err(le) => {
             crate::teb::set_last_error(le);
