@@ -4,26 +4,29 @@
 //! `fatal_unhandled`), faults in host code and `__fastfail` (loader
 //! `signals.rs`), CRT abort/watson/invalid-parameter and unresolved-import
 //! traps. It prints, through the log and into
-//! `out/crash/crash-<pid>-<time>.txt` (`AW2_CRASH_DIR` overrides):
+//! `out/crash/crash-<pid>-<time>.txt` plus a structured
+//! `out/crash/crash-<pid>-<time>.json` beside it (`PORT_CRASH_DIR` /
+//! `AW2_CRASH_DIR` overrides):
 //!
 //! * the exception (code, address, parameters, kind of access violation);
 //! * all general-purpose registers, annotated when they point into an image;
 //! * the bytes around RIP and a disassembly of the next instructions;
-//! * a raw scan of the stack for return addresses into PE images;
-//! * the faulting thread's backtrace, then a backtrace of every other
-//!   Windows thread (and the AppKit main thread).
+//! * the faulting thread's `.pdata`-unwound guest and host backtraces (with a
+//!   stack-scan fallback only when `.pdata` unwinding stops early);
+//! * a `.pdata`-unwound guest + host backtrace of every other Windows thread
+//!   (and the AppKit main thread).
 //!
 //! Frames are symbolized by the loader: `module+0xrva [va ...]` plus the
 //! fndb name/owner/status for exe frames (needs `out/symbols/*.syms`, see
 //! `tools/debug/export_symbols.py`), builtin export names for our thunks and
 //! demangled Rust names for host frames.
 //!
-//! The walker mixes two strategies: PE frames unwind with `.pdata`
-//! (`virtual_unwind`), every other frame (Rust/system libraries, JIT code)
-//! follows the `rbp` chain (macOS x86_64 code keeps frame pointers). The two
-//! meet naturally: an `extern "win64"` export called by the guest pushes the
-//! guest `rbp` and its `[rbp+8]` is the guest return address; a guest callback
-//! preserves the host `rbp`.
+//! The walker mixes two strategies: PE frames (and dynamic `RtlAddFunctionTable`
+//! frames) unwind with `.pdata` (`safe_virtual_unwind`), every other frame
+//! (Rust/system libraries, JIT code) follows the `rbp`/`fp` chain (macOS keeps
+//! frame pointers). On ARM64, guest x86-64 state captured via [`GUEST_STATE`]
+//! is unwound from `.pdata` as well, both on fatal crashes and in `SIGUSR2`
+//! thread snapshots (used by `other_threads` and `hitch.rs` stall reports).
 //!
 //! Other threads are captured with `SIGUSR2`: the handler stores the
 //! interrupted context and parks (at most 2 s) while the reporting thread
@@ -228,55 +231,324 @@ pub fn current_stack_ranges() -> [(u64, u64); 2] {
     [current_stack_bounds(), pthread_bounds(unsafe { libc::pthread_self() })]
 }
 
+/// Sentinel return address pushed on top of a guest frame by `x86-runtime` when
+/// entering `emu_run_full`. Reaching it means the guest stack unwound cleanly to
+/// the host↔guest boundary.
+const EMU_RET_SENTINEL: u64 = 0xDEAD_BEEF_CAFE_0000;
+
+/// Single unwound stack frame with its unwind provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkFrame {
+    pub pc: u64,
+    pub in_pe: bool,
+    pub unwound_by: &'static str,
+}
+
+/// Result of unwinding a guest x86-64 stack from `(gpr, rip)` via `.pdata`.
+#[derive(Debug, Clone)]
+pub struct GuestWalk {
+    pub frames: Vec<WalkFrame>,
+    pub method: &'static str,
+    pub complete: bool,
+}
+
+/// Lookup `.pdata` for `pc` without blocking or running guest callbacks.
+/// Returns `(image_base, unwind_pc, runtime_function, allow_epilog)`.
+///
+/// When `unwind_pc` is adjusted back by 1 byte into a preceding `call` instruction,
+/// `allow_epilog` is `false` so operand bytes inside `call` (e.g. `0xC3` in
+/// `FF 53 C3` / `call [rbx-0x3d]`) are never decoded as epilogue instructions.
+fn lookup_pdata(pc: u64, is_return_addr: bool) -> Option<(u64, u64, pe_image::RuntimeFunction, bool)> {
+    if pc < 0x1000 || pc == EMU_RET_SENTINEL {
+        return None;
+    }
+    if is_return_addr {
+        let prev = pc.saturating_sub(1);
+        if let Some((base, rf)) = unwind::lookup_function_entry_no_callbacks(prev) {
+            return Some((base, prev, rf, false));
+        }
+        return unwind::lookup_function_entry_no_callbacks(pc).map(|(b, rf)| (b, pc, rf, false));
+    }
+    if let Some((base, rf)) = unwind::lookup_function_entry_no_callbacks(pc) {
+        let begin = base.wrapping_add(rf.begin_rva as u64);
+        if follows_call(pc) {
+            let prev = pc.saturating_sub(1);
+            if pc == begin {
+                if let Some((pbase, prf)) = unwind::lookup_function_entry_no_callbacks(prev) {
+                    if pbase.wrapping_add(prf.end_rva as u64) == pc {
+                        return Some((pbase, prev, prf, false));
+                    }
+                }
+            } else {
+                return Some((base, prev, rf, false));
+            }
+        }
+        return Some((base, pc, rf, true));
+    }
+    if follows_call(pc) {
+        let prev = pc.saturating_sub(1);
+        if let Some((base, rf)) = unwind::lookup_function_entry_no_callbacks(prev) {
+            return Some((base, prev, rf, false));
+        }
+    }
+    None
+}
+
+fn is_guest_code_pc(pc: u64) -> bool {
+    pc >= 0x10000
+        && pc != EMU_RET_SENTINEL
+        && (loader_module(pc)
+            || unwind::lookup_function_entry_no_callbacks(pc).is_some()
+            || unwind::lookup_function_entry_no_callbacks(pc.saturating_sub(1)).is_some())
+}
+
 /// [`walk`] over several stack ranges (a thread's guest TEB stack and its host pthread
 /// stack): a frame may live in any of them. The stack pointer must grow from frame to frame
 /// within one range; moving to another range is allowed (bounded by `max`).
 pub unsafe fn walk_in(ctx: &Context, ranges: &[(u64, u64)], max: usize) -> Vec<u64> {
-    let range_of = |p: u64| ranges.iter().position(|&(lo, hi)| p >= lo && p < hi);
+    walk_in_detailed(ctx, ranges, max).0.into_iter().map(|f| f.pc).collect()
+}
+
+/// Mixed `.pdata` (guest x86-64) + frame-pointer (host) stack walk returning per-frame
+/// unwind metadata and whether the walk terminated cleanly.
+pub unsafe fn walk_in_detailed(ctx: &Context, ranges: &[(u64, u64)], max: usize) -> (Vec<WalkFrame>, bool) {
+    let mut eff_ranges: Vec<(u64, u64)> = ranges.iter().copied().filter(|&(lo, hi)| lo < hi).collect();
+    if !eff_ranges.iter().any(|&(lo, hi)| ctx.gpr[RSP] >= lo && ctx.gpr[RSP] < hi)
+        && ctx.gpr[RSP] >= 0x10000
+        && read_u64(ctx.gpr[RSP]).is_some()
+    {
+        eff_ranges.push((ctx.gpr[RSP], ctx.gpr[RSP].saturating_add(16 << 20)));
+    }
+    let range_of = |p: u64| eff_ranges.iter().position(|&(lo, hi)| p >= lo && p < hi);
     let in_stack = |p: u64| range_of(p).is_some();
     let mut out = Vec::new();
     let mut cur = *ctx;
-    while out.len() < max && cur.rip != 0 {
-        out.push(cur.rip);
-        let mut next = cur;
+    let mut complete = true;
+    while out.len() < max && cur.rip != 0 && cur.rip != EMU_RET_SENTINEL {
+        let is_return_addr = !out.is_empty();
+        let pdata = lookup_pdata(cur.rip, is_return_addr);
+        let in_pe = loader_module(cur.rip) || pdata.is_some();
         let rsp = cur.gpr[RSP];
-        if loader_module(cur.rip) {
-            if !in_stack(rsp) || read_u64(rsp).is_none() {
-                break;
-            }
-            match unwind::lookup_function_entry(cur.rip) {
-                Some((base, f)) => {
-                    unwind::virtual_unwind(0, base, cur.rip, f, &mut next);
+        if in_pe {
+            let mut next = cur;
+            match pdata {
+                Some((base, lookup_pc, rf, allow_epilog)) => {
+                    out.push(WalkFrame { pc: cur.rip, in_pe: true, unwound_by: "pdata" });
+                    if !in_stack(rsp) || read_u64(rsp).is_none() {
+                        complete = false;
+                        break;
+                    }
+                    if !unwind::safe_virtual_unwind(base, lookup_pc, rf, &mut next, allow_epilog) {
+                        complete = false;
+                        break;
+                    }
                 }
                 None => {
                     // Leaf function (or a builtin thunk): return address on top.
-                    next.rip = read_u64(rsp).unwrap_or(0);
-                    next.gpr[RSP] = rsp + 8;
+                    out.push(WalkFrame { pc: cur.rip, in_pe: true, unwound_by: "leaf" });
+                    if !in_stack(rsp) {
+                        complete = false;
+                        break;
+                    }
+                    let Some(ret) = read_u64(rsp) else {
+                        complete = false;
+                        break;
+                    };
+                    let Some(next_rsp) = rsp.checked_add(8) else {
+                        complete = false;
+                        break;
+                    };
+                    next.rip = ret;
+                    next.gpr[RSP] = next_rsp;
                 }
             }
-        } else {
-            let fp = cur.gpr[RBP] & 0x0000_FFFF_FFFF_FFFF;
-            let same = range_of(fp).is_some() && range_of(fp) == range_of(rsp);
-            if fp & 7 != 0 || (same && fp < rsp) || !in_stack(fp) {
+            if next.rip == 0 || next.rip == EMU_RET_SENTINEL {
                 break;
             }
-            let (Some(next_fp), Some(ret)) = (read_u64(fp), read_u64(fp + 8)) else { break };
+            let nsp = next.gpr[RSP];
+            if nsp <= rsp && (range_of(nsp).is_none() || range_of(nsp) == range_of(rsp)) {
+                complete = false;
+                break;
+            }
+            cur = next;
+        } else {
+            out.push(WalkFrame { pc: cur.rip, in_pe: false, unwound_by: "fp" });
+            let mut next = cur;
+            let fp = cur.gpr[RBP] & 0x0000_FFFF_FFFF_FFFF;
+            if fp == 0 {
+                if out.len() <= 1 {
+                    complete = false;
+                }
+                break;
+            }
+            let same = range_of(fp).is_some() && range_of(fp) == range_of(rsp);
+            if fp & 7 != 0 || (same && fp < rsp) || !in_stack(fp) {
+                complete = false;
+                break;
+            }
+            let (Some(next_fp), Some(ret)) = (read_u64(fp), read_u64(fp + 8)) else {
+                complete = false;
+                break;
+            };
             let next_fp = next_fp & 0x0000_FFFF_FFFF_FFFF;
             let ret = ret & 0x0000_FFFF_FFFF_FFFF;
+            if ret == 0 || ret == EMU_RET_SENTINEL {
+                break;
+            }
             if !follows_call(ret) {
+                complete = false;
                 break;
             }
             next.rip = ret;
             next.gpr[RSP] = fp + 16;
             next.gpr[RBP] = next_fp;
+            let nsp = next.gpr[RSP];
+            if nsp <= rsp && (range_of(nsp).is_none() || range_of(nsp) == range_of(rsp)) {
+                complete = false;
+                break;
+            }
+            cur = next;
         }
-        let nsp = next.gpr[RSP];
-        if next.gpr[RSP] <= rsp && (range_of(nsp).is_none() || range_of(nsp) == range_of(rsp)) {
+    }
+    if out.len() >= max && cur.rip != 0 && cur.rip != EMU_RET_SENTINEL {
+        complete = false;
+    }
+    (out, complete)
+}
+
+/// Unwind guest x86-64 frames from `(gpr, rip)` using `.pdata` (`safe_virtual_unwind`)
+/// and leaf `[rsp]` unwinding, with zero heuristic stack scanning.
+pub fn walk_guest_state(
+    guest: Option<([u64; 16], u64)>,
+    ranges: &[(u64, u64)],
+    max: usize,
+) -> GuestWalk {
+    let Some((gpr, rip)) = guest else {
+        return GuestWalk { frames: Vec::new(), method: "none", complete: true };
+    };
+    if max == 0 {
+        return GuestWalk { frames: Vec::new(), method: "none", complete: true };
+    }
+
+    let mut eff_ranges: Vec<(u64, u64)> = ranges.iter().copied().filter(|&(lo, hi)| lo < hi).collect();
+    if !eff_ranges.iter().any(|&(lo, hi)| gpr[RSP] >= lo && gpr[RSP] < hi)
+        && gpr[RSP] >= 0x10000
+        && read_u64(gpr[RSP]).is_some()
+    {
+        eff_ranges.push(bounds_for_rsp(gpr[RSP]));
+    }
+    let range_of = |p: u64| eff_ranges.iter().position(|&(lo, hi)| p >= lo && p < hi);
+    let in_stack = |p: u64| range_of(p).is_some();
+
+    let mut cur = Context::zeroed();
+    cur.gpr = gpr;
+    cur.rip = rip;
+
+    let mut frames = Vec::new();
+    let mut is_return_addr = false;
+    let mut used_pdata = false;
+    let mut used_leaf = false;
+    let mut complete = true;
+
+    // If `rip` is outside guest PE code (e.g. null call or native trap/thunk), check `[rsp]`
+    // for the guest caller return address so unwinding still recovers the call chain.
+    if !is_guest_code_pc(cur.rip) {
+        if cur.rip != 0 && cur.rip != EMU_RET_SENTINEL {
+            frames.push(WalkFrame { pc: cur.rip, in_pe: false, unwound_by: "leaf" });
+        }
+        if in_stack(cur.gpr[RSP]) {
+            if let Some(caller) = read_u64(cur.gpr[RSP]) {
+                if is_guest_code_pc(caller) {
+                    cur.rip = caller;
+                    cur.gpr[RSP] = cur.gpr[RSP].wrapping_add(8);
+                    is_return_addr = true;
+                } else {
+                    complete = caller == 0 || caller == EMU_RET_SENTINEL;
+                    cur.rip = 0;
+                }
+            } else {
+                complete = false;
+                cur.rip = 0;
+            }
+        } else {
+            complete = false;
+            cur.rip = 0;
+        }
+    }
+
+    while frames.len() < max && cur.rip != 0 && cur.rip != EMU_RET_SENTINEL {
+        let pdata = lookup_pdata(cur.rip, is_return_addr);
+        let in_pe = loader_module(cur.rip) || pdata.is_some();
+        if !in_pe {
+            complete = false;
             break;
         }
-        cur = next;
+        let rsp = cur.gpr[RSP];
+        match pdata {
+            Some((base, lookup_pc, rf, allow_epilog)) => {
+                frames.push(WalkFrame { pc: cur.rip, in_pe: true, unwound_by: "pdata" });
+                used_pdata = true;
+                if !in_stack(rsp) || read_u64(rsp).is_none() {
+                    complete = false;
+                    break;
+                }
+                let mut next = cur;
+                if !unwind::safe_virtual_unwind(base, lookup_pc, rf, &mut next, allow_epilog) {
+                    complete = false;
+                    break;
+                }
+                if next.rip == 0 || next.rip == EMU_RET_SENTINEL {
+                    break;
+                }
+                let nsp = next.gpr[RSP];
+                if nsp <= rsp && (range_of(nsp).is_none() || range_of(nsp) == range_of(rsp)) {
+                    complete = false;
+                    break;
+                }
+                cur = next;
+                is_return_addr = true;
+            }
+            None => {
+                // Leaf function without `.pdata`: return address sits at `[rsp]`.
+                frames.push(WalkFrame { pc: cur.rip, in_pe: true, unwound_by: "leaf" });
+                used_leaf = true;
+                if !in_stack(rsp) {
+                    complete = false;
+                    break;
+                }
+                let Some(ret) = read_u64(rsp) else {
+                    complete = false;
+                    break;
+                };
+                let Some(next_rsp) = rsp.checked_add(8) else {
+                    complete = false;
+                    break;
+                };
+                if ret == 0 || ret == EMU_RET_SENTINEL {
+                    break;
+                }
+                if !is_guest_code_pc(ret) {
+                    complete = false;
+                    break;
+                }
+                cur.rip = ret;
+                cur.gpr[RSP] = next_rsp;
+                is_return_addr = true;
+            }
+        }
     }
-    out
+
+    if frames.len() >= max && cur.rip != 0 && cur.rip != EMU_RET_SENTINEL {
+        complete = false;
+    }
+
+    let method = match (used_pdata, used_leaf) {
+        (true, true) => "pdata+leaf",
+        (true, false) => "pdata",
+        (false, true) => "leaf",
+        (false, false) => "none",
+    };
+    GuestWalk { frames, method, complete }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,22 +577,10 @@ static SNAP: Snapshot = Snapshot {
     guest: UnsafeCell::new(None),
 };
 
-/// Guest frames for a snapshot: the interpreter's current guest IP followed by plausible
-/// guest return addresses found on the guest stack (heuristic scan, innermost first).
-fn guest_frames(guest: Option<([u64; 16], u64)>) -> Vec<u64> {
-    let Some((gpr, rip)) = guest else { return Vec::new() };
-    let mut out = vec![rip];
-    let rsp = gpr[RSP];
-    for i in 0..1024u64 {
-        let Some(v) = read_u64(rsp.wrapping_add(i * 8)) else { break };
-        if v >= 0x10000 && loader_module(v) && follows_call(v) {
-            out.push(v);
-            if out.len() >= 12 {
-                break;
-            }
-        }
-    }
-    out
+/// Structured thread snapshot returned by [`snapshot_walk_detailed`].
+struct ThreadSnapshot {
+    guest: GuestWalk,
+    host: Vec<WalkFrame>,
 }
 
 /// pthread of the process main thread (AppKit), recorded by [`install`].
@@ -368,8 +628,9 @@ pub fn install() {
 
 static SNAP_LOCK: Mutex<()> = Mutex::new(());
 
-/// Interrupt `pthread`, walk its stack while it is parked, release it.
-unsafe fn snapshot_walk(pthread: usize, max: usize) -> Result<Vec<u64>, &'static str> {
+/// Interrupt `pthread`, unwind its guest (`.pdata`) and host (`fp`) stacks while
+/// parked, then release it.
+unsafe fn snapshot_walk_detailed(pthread: usize, max: usize) -> Result<ThreadSnapshot, &'static str> {
     if !SNAP_HANDLER_INSTALLED.load(Ordering::Acquire) {
         return Err("SIGUSR2 snapshot handler not installed");
     }
@@ -397,16 +658,24 @@ unsafe fn snapshot_walk(pthread: usize, max: usize) -> Result<Vec<u64>, &'static
     let ctx = *SNAP.ctx.get();
     let bounds = *SNAP.bounds.get();
     let guest = (*SNAP.guest.get()).take();
-    let host = walk_in(&ctx, &[bounds, pthread_bounds(pthread as libc::pthread_t)], max);
-    // Guest stack is read while the target is still parked.
-    let mut frames = guest_frames(guest);
-    frames.extend(host);
+    let ranges = [bounds, pthread_bounds(pthread as libc::pthread_t)];
+    let (host, _) = walk_in_detailed(&ctx, &ranges, max);
+    // Unwind guest frames from `.pdata` while the target thread is still parked.
+    let guest_walk = walk_guest_state(guest, &ranges, max);
     SNAP.target.store(0, Ordering::Release);
     SNAP.state.store(SNAP_RELEASED, Ordering::Release);
     let t1 = Instant::now();
     while SNAP.state.load(Ordering::Acquire) != SNAP_IDLE && t1.elapsed() < Duration::from_millis(100) {
         std::thread::sleep(Duration::from_micros(50));
     }
+    Ok(ThreadSnapshot { guest: guest_walk, host })
+}
+
+/// Interrupt `pthread`, walk its stack while it is parked, release it.
+unsafe fn snapshot_walk(pthread: usize, max: usize) -> Result<Vec<u64>, &'static str> {
+    let snap = snapshot_walk_detailed(pthread, max)?;
+    let mut frames: Vec<u64> = snap.guest.frames.iter().map(|f| f.pc).collect();
+    frames.extend(snap.host.iter().map(|f| f.pc));
     Ok(frames)
 }
 
@@ -439,12 +708,301 @@ pub fn pthread_label(pthread: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Report
+// Report (text + structured JSON sidecar)
 // ---------------------------------------------------------------------------
+
+const REG_NAMES: [&str; 16] = [
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+];
+
+#[derive(Debug, Clone)]
+struct FrameJson {
+    index: usize,
+    address: u64,
+    symbol: String,
+    in_pe: bool,
+    unwound_by: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ExceptionJson {
+    code: u32,
+    description: String,
+    address: u64,
+    parameters: Vec<u64>,
+    access_violation: Option<(&'static str, u64)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodeAtJson {
+    address: u64,
+    readable: bool,
+    bytes_around: Option<String>,
+    disassembly: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GuestStateJson {
+    rip: u64,
+    symbol: String,
+    gpr: [u64; 16],
+    unwind_method: &'static str,
+    unwind_complete: bool,
+    frames: Vec<FrameJson>,
+}
+
+#[derive(Debug, Clone)]
+struct OtherThreadJson {
+    win_tid: u32,
+    name: String,
+    pthread_name: String,
+    label: String,
+    error: Option<String>,
+    guest_unwind_method: &'static str,
+    guest_unwind_complete: bool,
+    guest_frames: Vec<FrameJson>,
+    host_frames: Vec<FrameJson>,
+}
+
+#[derive(Debug, Clone)]
+struct WatchdogJson {
+    frames_presented: u32,
+    graphics_api: &'static str,
+    last_heartbeat_kind: &'static str,
+    last_heartbeat_tid: u32,
+    last_stage_detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct CrashReportJson {
+    kind: String,
+    title: String,
+    timestamp_unix_secs: u64,
+    elapsed_ms: u64,
+    pid: u32,
+    truncated: bool,
+    watchdog: WatchdogJson,
+    win_tid: u32,
+    thread_name: String,
+    host_tid: usize,
+    pthread_name: String,
+    exception: Option<ExceptionJson>,
+    gpr: [u64; 16],
+    rip: u64,
+    eflags: u32,
+    mxcsr: u32,
+    code_at_rip: CodeAtJson,
+    stack_ranges: [(u64, u64); 2],
+    backtrace_complete: bool,
+    backtrace_frames: Vec<FrameJson>,
+    host_fallback_frames: Vec<FrameJson>,
+    guest_state: Option<GuestStateJson>,
+    other_threads: Vec<OtherThreadJson>,
+}
+
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn write_frames_json(out: &mut String, indent: &str, frames: &[FrameJson]) {
+    if frames.is_empty() {
+        out.push_str("[]");
+        return;
+    }
+    out.push_str("[\n");
+    for (i, f) in frames.iter().enumerate() {
+        let comma = if i + 1 < frames.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "{indent}  {{\"index\":{},\"address\":\"0x{:x}\",\"symbol\":{},\"in_pe\":{},\"unwound_by\":{}}}{comma}",
+            f.index,
+            f.address,
+            json_quote(&f.symbol),
+            f.in_pe,
+            json_quote(f.unwound_by),
+        );
+    }
+    let _ = write!(out, "{indent}]");
+}
+
+impl CrashReportJson {
+    fn to_json(&self) -> String {
+        let mut out = String::with_capacity(4096);
+        let _ = writeln!(out, "{{");
+        let _ = writeln!(out, "  \"schema_version\": 1,");
+        let _ = writeln!(out, "  \"kind\": {},", json_quote(&self.kind));
+        let _ = writeln!(out, "  \"title\": {},", json_quote(&self.title));
+        let _ = writeln!(out, "  \"timestamp_unix_secs\": {},", self.timestamp_unix_secs);
+        let _ = writeln!(out, "  \"elapsed_ms\": {},", self.elapsed_ms);
+        let _ = writeln!(out, "  \"pid\": {},", self.pid);
+        let _ = writeln!(out, "  \"arch\": {},", json_quote(std::env::consts::ARCH));
+        let _ = writeln!(out, "  \"truncated\": {},", self.truncated);
+
+        // Watchdog / pre-first-frame status
+        let _ = writeln!(out, "  \"watchdog\": {{");
+        let _ = writeln!(out, "    \"frames_presented\": {},", self.watchdog.frames_presented);
+        let _ = writeln!(out, "    \"graphics_api\": {},", json_quote(self.watchdog.graphics_api));
+        let _ = writeln!(out, "    \"last_heartbeat_kind\": {},", json_quote(self.watchdog.last_heartbeat_kind));
+        let _ = writeln!(out, "    \"last_heartbeat_tid\": {},", self.watchdog.last_heartbeat_tid);
+        let _ = writeln!(out, "    \"last_stage_detail\": {}", json_quote(&self.watchdog.last_stage_detail));
+        let _ = writeln!(out, "  }},");
+
+        // Faulting thread
+        let _ = writeln!(out, "  \"faulting_thread\": {{");
+        let _ = writeln!(out, "    \"win_tid\": {},", self.win_tid);
+        let _ = writeln!(out, "    \"name\": {},", json_quote(&self.thread_name));
+        let _ = writeln!(out, "    \"host_tid\": {},", self.host_tid);
+        let _ = writeln!(out, "    \"pthread_name\": {}", json_quote(&self.pthread_name));
+        let _ = writeln!(out, "  }},");
+
+        // Exception
+        match &self.exception {
+            Some(ex) => {
+                let _ = writeln!(out, "  \"exception\": {{");
+                let _ = writeln!(out, "    \"code\": \"0x{:08x}\",", ex.code);
+                let _ = writeln!(out, "    \"description\": {},", json_quote(&ex.description));
+                let _ = writeln!(out, "    \"address\": \"0x{:x}\",", ex.address);
+                let params: Vec<String> = ex.parameters.iter().map(|p| format!("\"0x{p:x}\"")).collect();
+                let _ = writeln!(out, "    \"parameters\": [{}],", params.join(", "));
+                match ex.access_violation {
+                    Some((op, addr)) => {
+                        let _ = writeln!(
+                            out,
+                            "    \"access_violation\": {{\"operation\": {}, \"address\": \"0x{:x}\"}}",
+                            json_quote(op),
+                            addr
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(out, "    \"access_violation\": null");
+                    }
+                }
+                let _ = writeln!(out, "  }},");
+            }
+            None => {
+                let _ = writeln!(out, "  \"exception\": null,");
+            }
+        }
+
+        // Registers
+        let _ = writeln!(out, "  \"registers\": {{");
+        for (i, n) in REG_NAMES.iter().enumerate() {
+            let _ = writeln!(out, "    \"{n}\": \"0x{:016x}\",", self.gpr[i]);
+        }
+        let _ = writeln!(out, "    \"rip\": \"0x{:016x}\",", self.rip);
+        let _ = writeln!(out, "    \"eflags\": \"0x{:08x}\",", self.eflags);
+        let _ = writeln!(out, "    \"mxcsr\": \"0x{:08x}\"", self.mxcsr);
+        let _ = writeln!(out, "  }},");
+
+        // Code at RIP
+        let _ = writeln!(out, "  \"code_at_rip\": {{");
+        let _ = writeln!(out, "    \"address\": \"0x{:x}\",", self.code_at_rip.address);
+        let _ = writeln!(out, "    \"readable\": {},", self.code_at_rip.readable);
+        match &self.code_at_rip.bytes_around {
+            Some(b) => { let _ = writeln!(out, "    \"bytes_around\": {},", json_quote(b)); }
+            None => { let _ = writeln!(out, "    \"bytes_around\": null,"); }
+        }
+        let dis: Vec<String> = self.code_at_rip.disassembly.iter().map(|s| json_quote(s)).collect();
+        let _ = writeln!(out, "    \"disassembly\": [{}]", dis.join(", "));
+        let _ = writeln!(out, "  }},");
+
+        // Primary backtrace
+        let _ = writeln!(out, "  \"backtrace\": {{");
+        let _ = writeln!(
+            out,
+            "    \"stack_ranges\": [[\"0x{:x}\", \"0x{:x}\"], [\"0x{:x}\", \"0x{:x}\"]],",
+            self.stack_ranges[0].0,
+            self.stack_ranges[0].1,
+            self.stack_ranges[1].0,
+            self.stack_ranges[1].1,
+        );
+        let _ = writeln!(out, "    \"complete\": {},", self.backtrace_complete);
+        let _ = write!(out, "    \"frames\": ");
+        write_frames_json(&mut out, "    ", &self.backtrace_frames);
+        let _ = writeln!(out, ",");
+        let _ = write!(out, "    \"host_fallback_frames\": ");
+        write_frames_json(&mut out, "    ", &self.host_fallback_frames);
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  }},");
+
+        // Guest interpreter state (ARM64)
+        match &self.guest_state {
+            Some(gs) => {
+                let _ = writeln!(out, "  \"guest_state\": {{");
+                let _ = writeln!(out, "    \"rip\": \"0x{:x}\",", gs.rip);
+                let _ = writeln!(out, "    \"symbol\": {},", json_quote(&gs.symbol));
+                let _ = writeln!(out, "    \"registers\": {{");
+                for (i, n) in REG_NAMES.iter().enumerate() {
+                    let comma = if i + 1 < REG_NAMES.len() { "," } else { "" };
+                    let _ = writeln!(out, "      \"{n}\": \"0x{:016x}\"{comma}", gs.gpr[i]);
+                }
+                let _ = writeln!(out, "    }},");
+                let _ = writeln!(out, "    \"unwind_method\": {},", json_quote(gs.unwind_method));
+                let _ = writeln!(out, "    \"unwind_complete\": {},", gs.unwind_complete);
+                let _ = write!(out, "    \"frames\": ");
+                write_frames_json(&mut out, "    ", &gs.frames);
+                let _ = writeln!(out);
+                let _ = writeln!(out, "  }},");
+            }
+            None => {
+                let _ = writeln!(out, "  \"guest_state\": null,");
+            }
+        }
+
+        // Other threads
+        if self.other_threads.is_empty() {
+            let _ = writeln!(out, "  \"other_threads\": []");
+        } else {
+            let _ = writeln!(out, "  \"other_threads\": [");
+            for (i, t) in self.other_threads.iter().enumerate() {
+                let comma = if i + 1 < self.other_threads.len() { "," } else { "" };
+                let _ = writeln!(out, "    {{");
+                let _ = writeln!(out, "      \"win_tid\": {},", t.win_tid);
+                let _ = writeln!(out, "      \"name\": {},", json_quote(&t.name));
+                let _ = writeln!(out, "      \"pthread_name\": {},", json_quote(&t.pthread_name));
+                let _ = writeln!(out, "      \"label\": {},", json_quote(&t.label));
+                match &t.error {
+                    Some(e) => { let _ = writeln!(out, "      \"error\": {},", json_quote(e)); }
+                    None => { let _ = writeln!(out, "      \"error\": null,"); }
+                }
+                let _ = writeln!(out, "      \"guest_unwind_method\": {},", json_quote(t.guest_unwind_method));
+                let _ = writeln!(out, "      \"guest_unwind_complete\": {},", t.guest_unwind_complete);
+                let _ = write!(out, "      \"guest_frames\": ");
+                write_frames_json(&mut out, "      ", &t.guest_frames);
+                let _ = writeln!(out, ",");
+                let _ = write!(out, "      \"host_frames\": ");
+                write_frames_json(&mut out, "      ", &t.host_frames);
+                let _ = writeln!(out);
+                let _ = writeln!(out, "    }}{comma}");
+            }
+            let _ = writeln!(out, "  ]");
+        }
+        out.push_str("}\n");
+        out
+    }
+}
 
 /// Thread id of the thread currently writing a report (0 = none).
 static REPORTER: AtomicUsize = AtomicUsize::new(0);
 static BUF: Mutex<String> = Mutex::new(String::new());
+static JSON_BUF: Mutex<Option<CrashReportJson>> = Mutex::new(None);
 
 fn line(s: impl AsRef<str>) {
     let s = s.as_ref();
@@ -452,6 +1010,14 @@ fn line(s: impl AsRef<str>) {
     if let Ok(mut b) = BUF.try_lock() {
         b.push_str(s);
         b.push('\n');
+    }
+}
+
+fn with_json(f: impl FnOnce(&mut CrashReportJson)) {
+    if let Ok(mut g) = JSON_BUF.try_lock() {
+        if let Some(ref mut report) = *g {
+            f(report);
+        }
     }
 }
 
@@ -475,23 +1041,53 @@ fn flush_file() {
         Ok(mut b) => std::mem::take(&mut *b),
         Err(_) => return,
     };
-    if text.is_empty() {
+    let json_data = JSON_BUF.try_lock().ok().and_then(|mut g| g.take());
+    if text.is_empty() && json_data.is_none() {
         return;
     }
     let dir = crash_dir();
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let path = dir.join(format!("crash-{}-{secs}.txt", std::process::id()));
+    let secs = json_data.as_ref().map(|j| j.timestamp_unix_secs).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    });
+    let stem = format!("crash-{}-{secs}", std::process::id());
+    let path = dir.join(format!("{stem}.txt"));
+    let json_path = dir.join(format!("{stem}.json"));
+    let json_text = json_data.as_ref().map(CrashReportJson::to_json);
     match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &text)) {
         Ok(()) => {
-            let log_dir_name = crate::config::app_config().log_dir_name;
-            if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-                let log_dir = home.join("Library/Logs").join(&log_dir_name);
-                let _ = std::fs::create_dir_all(&log_dir);
-                let _ = std::fs::write(log_dir.join("last-crash.txt"), &text);
+            let json_written = json_text
+                .as_deref()
+                .map(|js| std::fs::write(&json_path, js).is_ok())
+                .unwrap_or(false);
+            let has_override =
+                std::env::var_os("PORT_CRASH_DIR").is_some() || std::env::var_os("AW2_CRASH_DIR").is_some();
+            if !cfg!(test) && !has_override {
+                let log_dir_name = crate::config::app_config().log_dir_name;
+                if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+                    let log_dir = home.join("Library/Logs").join(&log_dir_name);
+                    let _ = std::fs::create_dir_all(&log_dir);
+                    let _ = std::fs::write(log_dir.join("last-crash.txt"), &text);
+                    if let Some(ref js) = json_text {
+                        let _ = std::fs::write(log_dir.join("last-crash.json"), js);
+                    }
+                }
             }
             let p = path.canonicalize().unwrap_or(path);
-            log::error!(target: "win32_rt::crash", "crash report written to {}", p.display());
-            eprintln!("crash report written to {}", p.display());
+            if json_written {
+                let jp = json_path.canonicalize().unwrap_or(json_path);
+                log::error!(
+                    target: "win32_rt::crash",
+                    "crash report written to {} (json: {})",
+                    p.display(),
+                    jp.display()
+                );
+                eprintln!("crash report written to {} (json: {})", p.display(), jp.display());
+            } else {
+                log::error!(target: "win32_rt::crash", "crash report written to {}", p.display());
+                eprintln!("crash report written to {}", p.display());
+            }
         }
         Err(e) => log::error!(target: "win32_rt::crash", "could not write crash report to {}: {e}", path.display()),
     }
@@ -503,10 +1099,16 @@ fn self_tid() -> usize {
     tid as usize
 }
 
-fn thread_label(pthread: usize) -> String {
+fn pthread_name_raw(pthread: usize) -> String {
     let mut name = [0u8; 64];
     unsafe { libc::pthread_getname_np(pthread as libc::pthread_t, name.as_mut_ptr() as *mut libc::c_char, name.len()) };
-    let n = std::ffi::CStr::from_bytes_until_nul(&name).map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+    std::ffi::CStr::from_bytes_until_nul(&name)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn thread_label(pthread: usize) -> String {
+    let n = pthread_name_raw(pthread);
     if n.is_empty() {
         String::new()
     } else {
@@ -518,12 +1120,28 @@ fn sym(pc: u64) -> String {
     crate::symbolize(pc as usize)
 }
 
-/// Print a crash report. Safe to call from any thread; concurrent reports
-/// are serialized and a fault inside the report just flushes what exists.
+fn to_frame_json(frames: &[WalkFrame]) -> Vec<FrameJson> {
+    frames
+        .iter()
+        .enumerate()
+        .map(|(index, f)| FrameJson {
+            index,
+            address: f.pc,
+            symbol: sym(f.pc),
+            in_pe: f.in_pe,
+            unwound_by: f.unwound_by,
+        })
+        .collect()
+}
+
+/// Print a crash report (and write both `.txt` and `.json` sidecar files). Safe to
+/// call from any thread; concurrent reports are serialized and a fault inside the
+/// report just flushes what exists.
 pub unsafe fn report(title: &str, rec: Option<&ExceptionRecord>, ctx: &Context) {
     let me = self_tid();
     if let Err(owner) = REPORTER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire) {
         if owner == me {
+            with_json(|j| j.truncated = true);
             line(format!("!!! fault inside the crash reporter ({title}); report truncated"));
             flush_file();
             return;
@@ -538,6 +1156,9 @@ pub unsafe fn report(title: &str, rec: Option<&ExceptionRecord>, ctx: &Context) 
         }
     }
     let t_start = Instant::now();
+    let timestamp_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     if let Some(l) = crate::try_loader() {
         l.wait_symbols();
     }
@@ -555,10 +1176,72 @@ pub unsafe fn report(title: &str, rec: Option<&ExceptionRecord>, ctx: &Context) 
     let wname = crate::thread::current_thread_object()
         .and_then(|t| t.name.try_lock().ok().map(|n| n.clone()))
         .unwrap_or_default();
+    let self_pt = libc::pthread_self() as usize;
+    let pt_name = pthread_name_raw(self_pt);
+    let wd = crate::hitch::watchdog_state();
+    let [b, p] = current_stack_ranges();
+
+    let exception_json = rec.map(|rec| {
+        let description = unwind::describe_exception(rec);
+        let params: Vec<u64> = rec.information[..(rec.number_parameters as usize).min(rec.information.len())].to_vec();
+        let av = if rec.code == unwind::STATUS_ACCESS_VIOLATION && rec.number_parameters >= 2 {
+            let op = match rec.information[0] {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "access",
+            };
+            Some((op, rec.information[1]))
+        } else {
+            None
+        };
+        ExceptionJson {
+            code: rec.code,
+            description,
+            address: rec.address as u64,
+            parameters: params,
+            access_violation: av,
+        }
+    });
+
+    if let Ok(mut g) = JSON_BUF.try_lock() {
+        *g = Some(CrashReportJson {
+            kind: reason_kind.to_string(),
+            title: title.to_string(),
+            timestamp_unix_secs,
+            elapsed_ms: 0,
+            pid: std::process::id(),
+            truncated: false,
+            watchdog: WatchdogJson {
+                frames_presented: crate::present::present_count(),
+                graphics_api: crate::present::last_present_api().label(),
+                last_heartbeat_kind: wd.last_heartbeat_kind.label(),
+                last_heartbeat_tid: wd.last_heartbeat_tid,
+                last_stage_detail: wd.last_stage_detail,
+            },
+            win_tid,
+            thread_name: wname.clone(),
+            host_tid: me,
+            pthread_name: pt_name,
+            exception: exception_json,
+            gpr: ctx.gpr,
+            rip: ctx.rip,
+            eflags: ctx.eflags,
+            mxcsr: ctx.mx_csr,
+            code_at_rip: CodeAtJson { address: ctx.rip, ..Default::default() },
+            stack_ranges: [b, p],
+            backtrace_complete: true,
+            backtrace_frames: Vec::new(),
+            host_fallback_frames: Vec::new(),
+            guest_state: None,
+            other_threads: Vec::new(),
+        });
+    }
+
     line(format!(
         "pid {} thread 0x{win_tid:x} {wname:?} (host tid {me}{})",
         std::process::id(),
-        thread_label(libc::pthread_self() as usize)
+        thread_label(self_pt)
     ));
     if let Some(rec) = rec {
         line(unwind::describe_exception(rec));
@@ -573,25 +1256,51 @@ pub unsafe fn report(title: &str, rec: Option<&ExceptionRecord>, ctx: &Context) 
         }
     }
     registers(ctx);
-    code_at(ctx.rip);
-    stack_scan(ctx.gpr[RSP]);
-    guest_state();
+    let code_json = code_at(ctx.rip);
+    with_json(|j| j.code_at_rip = code_json);
 
-    let [b, p] = current_stack_ranges();
+    let guest_json = guest_state(&[b, p]);
+    with_json(|j| j.guest_state = guest_json);
+
     line(format!("backtrace (faulting thread, stack 0x{:x}..0x{:x}, host 0x{:x}..0x{:x}):", b.0, b.1, p.0, p.1));
-    let frames = walk_in(ctx, &[b, p], 64);
-    for (i, pc) in frames.iter().enumerate() {
-        line(format!("  #{i:<2} {}", sym(*pc)));
+    let (frames, complete) = walk_in_detailed(ctx, &[b, p], 64);
+    let frames_json = to_frame_json(&frames);
+    for f in &frames_json {
+        line(format!("  #{:<2} {} [{}]", f.index, f.symbol, f.unwound_by));
+    }
+    with_json(|j| {
+        j.backtrace_complete = complete;
+        j.backtrace_frames = frames_json;
+    });
+    if !complete && frames.len() <= 1 {
+        stack_scan(ctx.gpr[RSP]);
     }
     if frames.len() < 8 {
         // Short walk (frame chain broken or on an unexpected stack): libSystem's unwinder
         // from here, through the signal frame. Starts with the reporter's own frames.
         line("host backtrace (libSystem unwinder; the first frames are the crash reporter's):");
-        for (i, pc) in host_backtrace(64).iter().enumerate() {
-            line(format!("  #{i:<2} {}", sym(*pc)));
+        let hb = host_backtrace(64);
+        let hb_json: Vec<FrameJson> = hb
+            .iter()
+            .enumerate()
+            .map(|(index, &pc)| FrameJson {
+                index,
+                address: pc,
+                symbol: sym(pc),
+                in_pe: loader_module(pc),
+                unwound_by: "libsystem",
+            })
+            .collect();
+        for f in &hb_json {
+            line(format!("  #{:<2} {}", f.index, f.symbol));
         }
+        with_json(|j| j.host_fallback_frames = hb_json);
     }
-    other_threads();
+    let others = other_threads();
+    with_json(|j| {
+        j.other_threads = others;
+        j.elapsed_ms = t_start.elapsed().as_millis() as u64;
+    });
     line(format!("==================== end of crash report ({:?}) ====================", t_start.elapsed()));
     flush_file();
     // Flush traces etc. now: the process may die without reaching ExitProcess.
@@ -600,18 +1309,16 @@ pub unsafe fn report(title: &str, rec: Option<&ExceptionRecord>, ctx: &Context) 
 }
 
 unsafe fn registers(ctx: &Context) {
-    const NAMES: [&str; 16] =
-        ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
     line("registers:");
     for row in [[0usize, 3, 1, 2], [6, 7, 5, 4], [8, 9, 10, 11], [12, 13, 14, 15]] {
         let mut s = String::from(" ");
         for i in row {
-            let _ = write!(s, " {:>3}={:016x}", NAMES[i], ctx.gpr[i]);
+            let _ = write!(s, " {:>3}={:016x}", REG_NAMES[i], ctx.gpr[i]);
         }
         line(s);
     }
     line(format!("  rip={:016x} eflags={:08x} mxcsr={:08x}", ctx.rip, ctx.eflags, ctx.mx_csr));
-    for (i, n) in NAMES.iter().enumerate() {
+    for (i, n) in REG_NAMES.iter().enumerate() {
         let v = ctx.gpr[i];
         if i == RSP || v < 0x10000 {
             continue;
@@ -623,21 +1330,21 @@ unsafe fn registers(ctx: &Context) {
     }
 }
 
-/// Guest x86-64 registers of the innermost interpreter frame on this thread, if any.
-unsafe fn guest_state() {
-    let Some(f) = GUEST_STATE.get() else { return };
-    let Some((gpr, rip)) = f() else { return };
-    const NAMES: [&str; 16] =
-        ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
-    line(format!("guest interpreter state (innermost emu frame; rip = after current instruction): rip={rip:#x} {}", sym(rip)));
+/// Guest x86-64 registers and `.pdata`-unwound backtrace of the innermost interpreter
+/// frame on this thread, if any.
+unsafe fn guest_state(ranges: &[(u64, u64)]) -> Option<GuestStateJson> {
+    let f = GUEST_STATE.get()?;
+    let (gpr, rip) = f()?;
+    let rip_sym = sym(rip);
+    line(format!("guest interpreter state (innermost emu frame; rip = after current instruction): rip={rip:#x} {rip_sym}"));
     for row in [[0usize, 3, 1, 2], [6, 7, 5, 4], [8, 9, 10, 11], [12, 13, 14, 15]] {
         let mut s = String::from(" ");
         for i in row {
-            let _ = write!(s, " {:>3}={:016x}", NAMES[i], gpr[i]);
+            let _ = write!(s, " {:>3}={:016x}", REG_NAMES[i], gpr[i]);
         }
         line(s);
     }
-    for (i, n) in NAMES.iter().enumerate() {
+    for (i, n) in REG_NAMES.iter().enumerate() {
         let v = gpr[i];
         if i == RSP || v < 0x10000 {
             continue;
@@ -647,20 +1354,41 @@ unsafe fn guest_state() {
             line(format!("  guest {n} -> {s}"));
         }
     }
-    code_at(rip);
+    let _ = code_at(rip);
     if !loader_module(rip) {
         if let Some(caller) = read_u64(gpr[RSP]) {
             if loader_module(caller) {
                 line(format!("guest caller @[rsp] = {caller:#x} {}:", sym(caller)));
-                code_at(caller.saturating_sub(0x18));
+                let _ = code_at(caller.saturating_sub(0x18));
             }
         }
     }
-    line("guest stack:");
-    stack_scan(gpr[RSP]);
-    if std::env::var_os("PORT_CRASH_DISASM").is_some_and(|v| v == "1") {
-        disasm_guest_frames(&gpr, rip);
+    let walk = walk_guest_state(Some((gpr, rip)), ranges, 64);
+    let frames_json = to_frame_json(&walk.frames);
+    line(format!(
+        "guest backtrace ({}, {} frame(s){}):",
+        walk.method,
+        frames_json.len(),
+        if walk.complete { "" } else { ", incomplete" }
+    ));
+    for frame in &frames_json {
+        line(format!("  #{:<2} {} [{}]", frame.index, frame.symbol, frame.unwound_by));
     }
+    if !walk.complete && walk.frames.len() <= 1 {
+        line("guest stack scan fallback (unwinder stopped early):");
+        stack_scan(gpr[RSP]);
+    }
+    if std::env::var_os("PORT_CRASH_DISASM").is_some_and(|v| v == "1") {
+        disasm_guest_frames(&walk.frames, rip);
+    }
+    Some(GuestStateJson {
+        rip,
+        symbol: rip_sym,
+        gpr,
+        unwind_method: walk.method,
+        unwind_complete: walk.complete,
+        frames: frames_json,
+    })
 }
 
 unsafe fn disasm_function_around(pc: u64, label: &str) {
@@ -692,15 +1420,15 @@ unsafe fn disasm_function_around(pc: u64, label: &str) {
     }
 }
 
-unsafe fn disasm_guest_frames(gpr: &[u64; 16], rip: u64) {
+unsafe fn disasm_guest_frames(frames: &[WalkFrame], rip: u64) {
     let mut seen = Vec::<u64>::new();
     let mut dump_once = |pc: u64, label: &str| {
         if !loader_module(pc) {
             return;
         }
-        let key = crate::try_loader()
-            .and_then(|l| l.lookup_function_entry(pc))
-            .map(|(b, rf)| b + (*rf).begin_rva as u64)
+        let key = unwind::lookup_function_entry_no_callbacks(pc)
+            .or_else(|| unwind::lookup_function_entry_no_callbacks(pc.saturating_sub(1)))
+            .map(|(b, rf)| b + rf.begin_rva as u64)
             .unwrap_or(pc & !0xF);
         if seen.contains(&key) {
             return;
@@ -709,17 +1437,8 @@ unsafe fn disasm_guest_frames(gpr: &[u64; 16], rip: u64) {
         disasm_function_around(pc, label);
     };
     dump_once(rip, "rip");
-    let rsp = gpr[RSP];
-    let mut count = 0usize;
-    for i in 0..256u64 {
-        let Some(v) = read_u64(rsp + i * 8) else { break };
-        if loader_module(v) && follows_call(v) {
-            dump_once(v, &format!("stack[+0x{:x}]", i * 8));
-            count += 1;
-            if count >= 8 {
-                break;
-            }
-        }
+    for (idx, frame) in frames.iter().take(8).enumerate() {
+        dump_once(frame.pc, &format!("frame#{idx}"));
     }
     if let Ok(extra) = std::env::var("PORT_CRASH_DISASM_ADDRS") {
         for tok in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -731,19 +1450,23 @@ unsafe fn disasm_guest_frames(gpr: &[u64; 16], rip: u64) {
     }
 }
 
-unsafe fn code_at(rip: u64) {
+unsafe fn code_at(rip: u64) -> CodeAtJson {
+    let mut out = CodeAtJson { address: rip, readable: false, bytes_around: None, disassembly: Vec::new() };
     let mut around = [0u8; 32];
     if safe_read(rip.wrapping_sub(16), &mut around) {
         let hex: Vec<String> =
             around.iter().enumerate().map(|(i, b)| if i == 16 { format!("[{b:02x}]") } else { format!("{b:02x}") }).collect();
-        line(format!("code @rip-16: {}", hex.join(" ")));
+        let joined = hex.join(" ");
+        line(format!("code @rip-16: {joined}"));
+        out.bytes_around = Some(joined);
     }
     let mut code = [0u8; 48];
     let n = (0..=3).map(|k| 48 - k * 16).find(|&n| safe_read(rip, &mut code[..n])).unwrap_or(0);
     if n == 0 {
         line(format!("code @rip: 0x{rip:x} is not readable"));
-        return;
+        return out;
     }
+    out.readable = true;
     if let Some(l) = crate::try_loader() {
         let lines = l.disassemble(rip, &code[..n], 6);
         if !lines.is_empty() {
@@ -751,12 +1474,14 @@ unsafe fn code_at(rip: u64) {
             for (i, s) in lines.iter().enumerate() {
                 line(format!("  {} {s}", if i == 0 { "=>" } else { "  " }));
             }
+            out.disassembly = lines;
         }
     }
+    out
 }
 
-/// Return addresses into PE images among the top 4 KiB of the stack (helps
-/// when the unwind chain is broken).
+/// Return addresses into PE images among the top 4 KiB of the stack (fallback
+/// when `.pdata` unwinding cannot step past a corrupt frame).
 unsafe fn stack_scan(rsp: u64) {
     let mut first = true;
     let mut shown = 0;
@@ -777,9 +1502,9 @@ unsafe fn stack_scan(rsp: u64) {
     }
 }
 
-unsafe fn other_threads() {
+unsafe fn other_threads() -> Vec<OtherThreadJson> {
     let me = libc::pthread_self() as usize;
-    let mut targets: Vec<(String, usize)> = Vec::new();
+    let mut targets: Vec<(u32, String, String, usize)> = Vec::new();
     for teb in crate::thread::all_tebs() {
         let tid: usize = crate::teb::field(teb, crate::teb::off::CLIENT_ID_THREAD);
         let Some(obj) = crate::thread::find_by_tid(tid as u32) else { continue };
@@ -788,27 +1513,62 @@ unsafe fn other_threads() {
             continue;
         }
         let name = obj.name.try_lock().map(|n| n.clone()).unwrap_or_default();
-        targets.push((format!("thread 0x{tid:x} {name:?}"), pt));
+        targets.push((tid as u32, name.clone(), format!("thread 0x{tid:x} {name:?}"), pt));
     }
     let main = MAIN_PTHREAD.load(Ordering::Relaxed);
-    if main != 0 && main != me && !targets.iter().any(|t| t.1 == main) {
-        targets.push(("main thread (AppKit)".into(), main));
+    if main != 0 && main != me && !targets.iter().any(|t| t.3 == main) {
+        targets.push((0, String::new(), "main thread (AppKit)".into(), main));
     }
     if targets.is_empty() {
-        return;
+        return Vec::new();
     }
     line(format!("other threads ({}):", targets.len()));
-    for (label, pt) in targets {
+    let mut out = Vec::with_capacity(targets.len());
+    for (win_tid, name, label, pt) in targets {
+        let pt_name = pthread_name_raw(pt);
         line(format!("--- {label}{}", thread_label(pt)));
-        match snapshot_walk(pt, 32) {
-            Ok(frames) => {
-                for (i, pc) in frames.iter().enumerate() {
-                    line(format!("  #{i:<2} {}", sym(*pc)));
+        match snapshot_walk_detailed(pt, 32) {
+            Ok(snap) => {
+                let guest_frames = to_frame_json(&snap.guest.frames);
+                let host_frames = to_frame_json(&snap.host);
+                let mut idx = 0usize;
+                for f in &guest_frames {
+                    line(format!("  #{idx:<2} {} [{}]", f.symbol, f.unwound_by));
+                    idx += 1;
                 }
+                for f in &host_frames {
+                    line(format!("  #{idx:<2} {} [{}]", f.symbol, f.unwound_by));
+                    idx += 1;
+                }
+                out.push(OtherThreadJson {
+                    win_tid,
+                    name,
+                    pthread_name: pt_name,
+                    label,
+                    error: None,
+                    guest_unwind_method: snap.guest.method,
+                    guest_unwind_complete: snap.guest.complete,
+                    guest_frames,
+                    host_frames,
+                });
             }
-            Err(e) => line(format!("  ({e})")),
+            Err(e) => {
+                line(format!("  ({e})"));
+                out.push(OtherThreadJson {
+                    win_tid,
+                    name,
+                    pthread_name: pt_name,
+                    label,
+                    error: Some(e.to_string()),
+                    guest_unwind_method: "none",
+                    guest_unwind_complete: false,
+                    guest_frames: Vec::new(),
+                    host_frames: Vec::new(),
+                });
+            }
         }
     }
+    out
 }
 
 extern "C" {
@@ -943,5 +1703,318 @@ mod tests {
         assert_eq!(ctx.gpr[15], 0x10f);
         assert_eq!(ctx.rip, 0x110);
         assert_eq!(ctx.eflags, 0x111);
+    }
+
+    #[test]
+    fn walk_guest_state_unwinds_multi_frame_pdata_and_ignores_stale_stack_entries() {
+        // Build a synthetic image buffer containing 3 functions with x64 .pdata + UNWIND_INFO:
+        // - fn0 (inner):  push rbx; push rbp; sub rsp, 0x28  (frame = 0x28 + 16 = 0x38, plus ret)
+        // - fn1 (middle): push rbp; mov rbp, rsp; sub rsp, 0x100  (UWOP_SET_FPREG + UWOP_ALLOC_LARGE + UWOP_PUSH_NONVOL rbp)
+        // - fn2 (outer):  sub rsp, 0x28  (returns to EMU_RET_SENTINEL)
+        let mut img = vec![0x90u8; 0x2000];
+        // Plant `call rel32` (0xE8 00 00 00 00) right before each return site so follows_call() is true.
+        // fn0: 0x0100..0x0140, pc = 0x0120 (after prolog of 0x10 bytes)
+        img[0x011b] = 0xE8;
+        // fn1: 0x0200..0x0260, ret_pc = 0x0230 (after prolog of 0x10 bytes)
+        img[0x022b] = 0xE8;
+        // fn2: 0x0300..0x0360, ret_pc = 0x0330 (after prolog of 0x10 bytes)
+        img[0x032b] = 0xE8;
+        // Stale fake return address inside fn2 (0x0350) preceded by a `call rel32`:
+        // a heuristic stack scanner would falsely report this!
+        img[0x034b] = 0xE8;
+
+        // UNWIND_INFO for fn0 at 0x0800:
+        // version=1, flags=0, prolog=0x10, count=3, frame_reg=0
+        // codes (reverse prolog order):
+        //   off=0x10, UWOP_ALLOC_SMALL (2), info=4 => (4+1)*8 = 0x28
+        //   off=0x08, UWOP_PUSH_NONVOL (0), info=5 (rbp)
+        //   off=0x04, UWOP_PUSH_NONVOL (0), info=3 (rbx)
+        img[0x0800..0x080a].copy_from_slice(&[
+            1, 0x10, 3, 0,
+            0x10, (4 << 4) | 2,
+            0x08, (5 << 4) | 0,
+            0x04, (3 << 4) | 0,
+        ]);
+
+        // UNWIND_INFO for fn1 at 0x0840:
+        // version=1, flags=0, prolog=0x10, count=4, frame_reg=5 (rbp), frame_off=0
+        // codes:
+        //   off=0x10, UWOP_ALLOC_LARGE (1), info=0, slot16=0x20 (0x20 * 8 = 0x100)
+        //   off=0x08, UWOP_SET_FPREG (3), info=0 (restores rsp = rbp)
+        //   off=0x04, UWOP_PUSH_NONVOL (0), info=5 (rbp)
+        img[0x0840..0x084c].copy_from_slice(&[
+            1, 0x10, 4, 5,
+            0x10, (0 << 4) | 1,
+            0x20, 0x00,
+            0x08, (0 << 4) | 3,
+            0x04, (5 << 4) | 0,
+        ]);
+
+        // UNWIND_INFO for fn2 at 0x0880:
+        // version=1, flags=0, prolog=0x10, count=1, frame_reg=0
+        // codes:
+        //   off=0x10, UWOP_ALLOC_SMALL (2), info=4 => 0x28
+        img[0x0880..0x0886].copy_from_slice(&[
+            1, 0x10, 1, 0,
+            0x10, (4 << 4) | 2,
+        ]);
+
+        let base = img.as_ptr() as u64;
+        let mut table = [
+            pe_image::RuntimeFunction { begin_rva: 0x0100, end_rva: 0x0140, unwind_rva: 0x0800 },
+            pe_image::RuntimeFunction { begin_rva: 0x0200, end_rva: 0x0260, unwind_rva: 0x0840 },
+            pe_image::RuntimeFunction { begin_rva: 0x0300, end_rva: 0x0360, unwind_rva: 0x0880 },
+        ];
+        unsafe {
+            assert_eq!(unwind::RtlAddFunctionTable(table.as_mut_ptr(), table.len() as u32, base), 1);
+        }
+
+        // Build the exact guest stack layout (64-bit slots, low address = stack top):
+        // Index 0..5   : fn0 local 0x28 bytes (5 qwords)
+        // Index 5      : fn0 saved rbp (points to fn1's rbp slot = stack_base + 72*8)
+        // Index 6      : fn0 saved rbx (0xBB)
+        // Index 7      : fn0 return address -> fn1 (base + 0x0230)
+        // Index 8..40  : fn1 local 0x100 bytes (32 qwords) -- plant stale return addr at index 12!
+        // Index 40     : fn1 saved rbp (0x5555) -- fn1's rbp points here!
+        // Index 41     : fn1 return address -> fn2 (base + 0x0330)
+        // Index 42..47 : fn2 local 0x28 bytes (5 qwords)
+        // Index 47     : fn2 return address -> EMU_RET_SENTINEL
+        let mut stack = vec![0u64; 64];
+        let stack_base = stack.as_ptr() as u64;
+        let stack_end = stack_base + (stack.len() as u64) * 8;
+
+        let fn1_rbp = stack_base + 40 * 8;
+        let stale_ret = base + 0x0350;
+        stack[5] = fn1_rbp;
+        stack[6] = 0xBB;
+        stack[7] = base + 0x0230;
+        stack[12] = stale_ret; // stale return address inside fn1's local frame
+        stack[40] = 0x5555;
+        stack[41] = base + 0x0330;
+        stack[47] = EMU_RET_SENTINEL;
+
+        let mut gpr = [0u64; 16];
+        gpr[RSP] = stack_base;
+        gpr[RBP] = 0x1111; // fn0 does not use rbp as frame reg; saved fn1_rbp is popped on unwind!
+
+        let walk = walk_guest_state(Some((gpr, base + 0x0120)), &[(stack_base, stack_end)], 32);
+        unsafe {
+            assert_eq!(unwind::RtlDeleteFunctionTable(table.as_mut_ptr()), 1);
+        }
+
+        let pcs: Vec<u64> = walk.frames.iter().map(|f| f.pc).collect();
+        assert_eq!(walk.method, "pdata", "walk={walk:?}");
+        assert!(walk.complete, "expected clean termination at EMU_RET_SENTINEL: {walk:?}");
+        assert_eq!(
+            pcs,
+            vec![base + 0x0120, base + 0x0230, base + 0x0330],
+            "expected exact .pdata-unwound chain without stale frame {stale_ret:#x}"
+        );
+        assert!(walk.frames.iter().all(|f| f.unwound_by == "pdata" && f.in_pe));
+        assert!(!pcs.contains(&stale_ret), "stale return address leaked into unwound frames");
+    }
+
+    #[test]
+    fn walk_guest_state_handles_corrupt_stack_without_faulting() {
+        let mut img = vec![0x90u8; 0x1000];
+        img[0x0800..0x0806].copy_from_slice(&[1, 0x08, 1, 0, 0x08, (4 << 4) | 2]);
+        let base = img.as_ptr() as u64;
+        let mut table = [pe_image::RuntimeFunction {
+            begin_rva: 0x0100,
+            end_rva: 0x0140,
+            unwind_rva: 0x0800,
+        }];
+        unsafe {
+            assert_eq!(unwind::RtlAddFunctionTable(table.as_mut_ptr(), 1, base), 1);
+        }
+        // Unmapped PROT_NONE page as guest stack pointer.
+        let unmapped = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                0x4000,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED);
+            p as u64
+        };
+        let mut gpr = [0u64; 16];
+        gpr[RSP] = unmapped;
+        let walk = walk_guest_state(Some((gpr, base + 0x0120)), &[(unmapped, unmapped + 0x4000)], 16);
+        unsafe {
+            libc::munmap(unmapped as *mut libc::c_void, 0x4000);
+            assert_eq!(unwind::RtlDeleteFunctionTable(table.as_mut_ptr()), 1);
+        }
+        assert_eq!(walk.frames.len(), 1);
+        assert_eq!(walk.frames[0].pc, base + 0x0120);
+        assert!(!walk.complete);
+    }
+
+    #[test]
+    fn walk_guest_state_marks_corrupt_return_address_incomplete() {
+        let mut img = vec![0x90u8; 0x1000];
+        // sub rsp, 0x28 (5 qwords), then saved return address at stack[5]
+        img[0x0800..0x0806].copy_from_slice(&[1, 0x08, 1, 0, 0x08, (4 << 4) | 2]);
+        let base = img.as_ptr() as u64;
+        let mut table = [pe_image::RuntimeFunction {
+            begin_rva: 0x0100,
+            end_rva: 0x0140,
+            unwind_rva: 0x0800,
+        }];
+        unsafe {
+            assert_eq!(unwind::RtlAddFunctionTable(table.as_mut_ptr(), 1, base), 1);
+        }
+        let mut stack = vec![0u64; 16];
+        stack[5] = 0x4141_4141_4141_4141; // corrupted non-zero return address outside all PE/dynamic tables
+        let stack_base = stack.as_ptr() as u64;
+        let stack_end = stack_base + (stack.len() as u64) * 8;
+        let mut gpr = [0u64; 16];
+        gpr[RSP] = stack_base;
+
+        let walk = walk_guest_state(Some((gpr, base + 0x0120)), &[(stack_base, stack_end)], 16);
+        unsafe {
+            assert_eq!(unwind::RtlDeleteFunctionTable(table.as_mut_ptr()), 1);
+        }
+        assert_eq!(walk.frames.len(), 1);
+        assert_eq!(walk.frames[0].pc, base + 0x0120);
+        assert_eq!(walk.method, "pdata");
+        assert!(!walk.complete, "corrupt non-zero return address must mark walk incomplete");
+    }
+
+    #[test]
+    fn walk_in_detailed_marks_broken_fp_chain_incomplete() {
+        let mut stack = vec![0u64; 32];
+        let lo = stack.as_ptr() as u64;
+        let hi = lo + (stack.len() as u64) * 8;
+
+        // 1. Misaligned frame pointer
+        let mut ctx = Context::zeroed();
+        ctx.rip = 0x1_0000_1234;
+        ctx.gpr[RSP] = lo;
+        ctx.gpr[RBP] = lo + 3;
+        let (frames, complete) = unsafe { walk_in_detailed(&ctx, &[(lo, hi)], 16) };
+        assert_eq!(frames.len(), 1);
+        assert!(!complete, "misaligned fp must mark walk incomplete");
+
+        // 2. Out-of-stack frame pointer
+        ctx.gpr[RBP] = hi + 0x1000;
+        let (frames, complete) = unsafe { walk_in_detailed(&ctx, &[(lo, hi)], 16) };
+        assert_eq!(frames.len(), 1);
+        assert!(!complete, "out-of-stack fp must mark walk incomplete");
+
+        // 3. Valid fp pointing to a non-call (corrupted) return address
+        stack[4] = lo + 8 * 8;
+        stack[5] = 0x4141_4141_4141_4141;
+        ctx.gpr[RBP] = lo + 4 * 8;
+        let (frames, complete) = unsafe { walk_in_detailed(&ctx, &[(lo, hi)], 16) };
+        assert_eq!(frames.len(), 1);
+        assert!(!complete, "corrupted non-call return address must mark walk incomplete");
+    }
+
+    #[test]
+    fn walk_guest_state_does_not_decode_epilog_inside_call_ending_in_c3() {
+        // Reproduces `FF 53 C3` (`call [rbx - 0x3d]`) ending in 0xC3 (`ret`):
+        // unwinding with `pc - 1` must apply the caller's .pdata unwind codes
+        // (skipping the 0x28-byte local frame) instead of decoding `0xC3` as an epilog.
+        let mut img = vec![0x90u8; 0x1000];
+        // fn0: 0x0100..0x0140, call at 0x011d..0x0120 = FF 53 C3, return PC = 0x0120
+        img[0x011d..0x0120].copy_from_slice(&[0xFF, 0x53, 0xC3]);
+        // fn1: 0x0200..0x0240, call at 0x021d..0x0220 = FF 53 C3, return PC = 0x0220
+        img[0x021d..0x0220].copy_from_slice(&[0xFF, 0x53, 0xC3]);
+        // UNWIND_INFO at 0x0800: sub rsp, 0x28 (UWOP_ALLOC_SMALL info=4)
+        img[0x0800..0x0806].copy_from_slice(&[1, 0x08, 1, 0, 0x08, (4 << 4) | 2]);
+
+        let base = img.as_ptr() as u64;
+        let mut table = [
+            pe_image::RuntimeFunction { begin_rva: 0x0100, end_rva: 0x0140, unwind_rva: 0x0800 },
+            pe_image::RuntimeFunction { begin_rva: 0x0200, end_rva: 0x0240, unwind_rva: 0x0800 },
+        ];
+        unsafe {
+            assert_eq!(unwind::RtlAddFunctionTable(table.as_mut_ptr(), table.len() as u32, base), 1);
+        }
+
+        // stack[0..5] = fn0's 0x28-byte local frame (zeros); stack[5] = return into fn1;
+        // stack[6..11] = fn1's 0x28-byte local frame (zeros); stack[11] = EMU_RET_SENTINEL.
+        let mut stack = vec![0u64; 24];
+        stack[5] = base + 0x0220;
+        stack[11] = EMU_RET_SENTINEL;
+        let lo = stack.as_ptr() as u64;
+        let hi = lo + (stack.len() as u64) * 8;
+        let mut gpr = [0u64; 16];
+        gpr[RSP] = lo;
+
+        let walk = walk_guest_state(Some((gpr, base + 0x0120)), &[(lo, hi)], 16);
+        unsafe {
+            assert_eq!(unwind::RtlDeleteFunctionTable(table.as_mut_ptr()), 1);
+        }
+        let pcs: Vec<u64> = walk.frames.iter().map(|f| f.pc).collect();
+        assert_eq!(pcs, vec![base + 0x0120, base + 0x0220], "walk={walk:?}");
+        assert_eq!(walk.method, "pdata");
+        assert!(walk.complete);
+    }
+
+    #[test]
+    fn report_writes_json_sidecar_beside_text_file() {
+        let dir = std::env::temp_dir().join(format!("win32-rt-crash-json-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let prev_port = std::env::var_os("PORT_CRASH_DIR");
+        let prev_aw2 = std::env::var_os("AW2_CRASH_DIR");
+        std::env::set_var("PORT_CRASH_DIR", &dir);
+        std::env::set_var("AW2_CRASH_DIR", &dir);
+
+        let mut rec = unsafe { std::mem::zeroed::<ExceptionRecord>() };
+        rec.code = unwind::STATUS_ACCESS_VIOLATION;
+        rec.address = 0x14000_1234usize as *mut _;
+        rec.number_parameters = 2;
+        rec.information[0] = 0; // read
+        rec.information[1] = 0xDEAD_BEEF;
+
+        let mut ctx = Context::zeroed();
+        unsafe { unwind::RtlCaptureContext(&mut ctx) };
+        unsafe { report("unit test access violation", Some(&rec), &ctx) };
+
+        match prev_port {
+            Some(v) => std::env::set_var("PORT_CRASH_DIR", v),
+            None => std::env::remove_var("PORT_CRASH_DIR"),
+        }
+        match prev_aw2 {
+            Some(v) => std::env::set_var("AW2_CRASH_DIR", v),
+            None => std::env::remove_var("AW2_CRASH_DIR"),
+        }
+
+        let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        let txt_path = entries.iter().find(|p| p.extension().is_some_and(|e| e == "txt")).cloned();
+        let json_path = entries.iter().find(|p| p.extension().is_some_and(|e| e == "json")).cloned();
+        assert!(txt_path.is_some(), "expected .txt crash file in {entries:?}");
+        assert!(json_path.is_some(), "expected .json crash sidecar in {entries:?}");
+        let txt_path = txt_path.unwrap();
+        let json_path = json_path.unwrap();
+        assert_eq!(
+            txt_path.file_stem(),
+            json_path.file_stem(),
+            "expected matching filename stem for text and JSON crash reports"
+        );
+        let txt = std::fs::read_to_string(&txt_path).unwrap();
+        let js = std::fs::read_to_string(&json_path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(txt.contains("AW2 CRASH REPORT: unit test access violation"), "{txt}");
+        assert!(js.contains("\"schema_version\": 1"), "{js}");
+        assert!(js.contains("\"kind\": \"crash\""), "{js}");
+        assert!(js.contains("\"title\": \"unit test access violation\""), "{js}");
+        assert!(js.contains("\"code\": \"0xc0000005\""), "{js}");
+        assert!(js.contains("\"operation\": \"read\""), "{js}");
+        assert!(js.contains("\"address\": \"0xdeadbeef\""), "{js}");
+        assert!(js.contains("\"watchdog\":"), "{js}");
+        assert!(js.contains("\"backtrace\":"), "{js}");
+        assert!(js.trim_start().starts_with('{') && js.trim_end().ends_with('}'), "{js}");
     }
 }
