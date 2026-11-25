@@ -362,15 +362,19 @@ pub enum WsaExtension {
     DisconnectEx = 2,
     TransmitFile = 3,
     GetAcceptExSockaddrs = 4,
+    WSARecvMsg = 5,
+    WSASendMsg = 6,
 }
 
 impl WsaExtension {
-    pub const ALL: [WsaExtension; 5] = [
+    pub const ALL: [WsaExtension; 7] = [
         WsaExtension::AcceptEx,
         WsaExtension::ConnectEx,
         WsaExtension::DisconnectEx,
         WsaExtension::TransmitFile,
         WsaExtension::GetAcceptExSockaddrs,
+        WsaExtension::WSARecvMsg,
+        WsaExtension::WSASendMsg,
     ];
 
     pub const fn symbol_name(self) -> &'static str {
@@ -380,6 +384,8 @@ impl WsaExtension {
             WsaExtension::DisconnectEx => "ws2_32!DisconnectEx",
             WsaExtension::TransmitFile => "ws2_32!TransmitFile",
             WsaExtension::GetAcceptExSockaddrs => "ws2_32!GetAcceptExSockaddrs",
+            WsaExtension::WSARecvMsg => "ws2_32!WSARecvMsg",
+            WsaExtension::WSASendMsg => "ws2_32!WSASendMsg",
         }
     }
 }

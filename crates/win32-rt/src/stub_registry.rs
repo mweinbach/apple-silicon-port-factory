@@ -1032,10 +1032,16 @@ mod tests {
                 0,
             );
         }
-        // Hit a failing! export once.
-        unsafe {
-            let _ = crate::misc::ws2_32::WSAJoinLeaf();
-        }
+        // Hit a synthetic StubKind::Failing site once (decoupled from live ws2_32 exports).
+        static TEST_FAILING_SITE: StubSite = StubSite::new(
+            StubKind::Failing,
+            "win32_rt::misc::ws2_32",
+            "crates/win32-rt/src/stub_registry.rs",
+            1037,
+        );
+        TEST_FAILING_SITE.record_hit("TestFailingExport", || {
+            "TestFailingExport -> WSAEOPNOTSUPP".to_string()
+        });
 
         let snap = snapshot();
         assert_eq!(snap.unique_sites, 3);
@@ -1056,14 +1062,14 @@ mod tests {
         assert_eq!(snap.entries[1].first_frame, 42);
 
         assert_eq!(snap.entries[2].dll, "ws2_32.dll");
-        assert_eq!(snap.entries[2].api, "WSAJoinLeaf");
+        assert_eq!(snap.entries[2].api, "TestFailingExport");
         assert_eq!(snap.entries[2].kind, StubKind::Failing);
         assert_eq!(snap.entries[2].hits, 1);
         assert_eq!(snap.entries[2].first_frame, 42);
 
         let table = snap.format_ranked_table();
         assert!(table.contains("zstd.dll!ZSTD_decompress"));
-        assert!(table.contains("ws2_32.dll!WSAJoinLeaf"));
+        assert!(table.contains("ws2_32.dll!TestFailingExport"));
         assert!(table.contains("middleware_stub"));
         assert!(table.contains("failing"));
 
