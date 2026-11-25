@@ -412,16 +412,33 @@ pub fn caps_on() -> bool {
 }
 
 pub(crate) fn release_all_keys() {
+    let mut cleared_mouse = false;
+    let mut cleared_key = false;
     for (i, a) in ASYNC.iter().enumerate() {
         if i != VK_CAPITAL as usize && i != VK_NUMLOCK as usize {
-            a.fetch_and(!0x80, Ordering::Relaxed);
+            let prev = a.fetch_and(!0x80, Ordering::Relaxed);
+            if prev & 0x80 != 0 {
+                if matches!(i as u8, VK_LBUTTON | VK_RBUTTON | VK_MBUTTON | VK_XBUTTON1 | VK_XBUTTON2) {
+                    cleared_mouse = true;
+                } else {
+                    cleared_key = true;
+                }
+            }
         }
     }
-    let mut s = SYNC.lock().unwrap();
-    for (i, v) in s.iter_mut().enumerate() {
-        if i != VK_CAPITAL as usize && i != VK_NUMLOCK as usize {
-            *v &= !0x80;
+    {
+        let mut s = SYNC.lock().unwrap();
+        for (i, v) in s.iter_mut().enumerate() {
+            if i != VK_CAPITAL as usize && i != VK_NUMLOCK as usize {
+                *v &= !0x80;
+            }
         }
+    }
+    if cleared_key {
+        crate::misc::gameinput::on_keyboard_changed();
+    }
+    if cleared_mouse {
+        crate::misc::gameinput::on_mouse_changed();
     }
 }
 
@@ -979,21 +996,24 @@ pub fn native_key_state_only(k: NativeKey) {
         return;
     };
     set_async_key(key, k.down);
-    let mut s = SYNC.lock().unwrap();
-    for v in [key.vk, key.vk_lr] {
-        if v == 0 {
-            continue;
-        }
-        let e = &mut s[v as usize];
-        if k.down {
-            if *e & 0x80 == 0 {
-                *e ^= 1;
+    {
+        let mut s = SYNC.lock().unwrap();
+        for v in [key.vk, key.vk_lr] {
+            if v == 0 {
+                continue;
             }
-            *e |= 0x80;
-        } else {
-            *e &= !0x80;
+            let e = &mut s[v as usize];
+            if k.down {
+                if *e & 0x80 == 0 {
+                    *e ^= 1;
+                }
+                *e |= 0x80;
+            } else {
+                *e &= !0x80;
+            }
         }
     }
+    crate::misc::gameinput::on_keyboard_changed();
 }
 
 fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {

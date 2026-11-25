@@ -3183,14 +3183,45 @@ mod tests {
             });
             let async_lbtn = crate::user32::input::GetAsyncKeyState(keymap::VK_LBUTTON as i32);
             assert!(async_lbtn < 0 && (async_lbtn & 1) != 0, "GameInput snapshot must not consume GetAsyncKeyState pressed-since bit for mouse");
-            crate::user32::input::native_mouse(NativeMouse::Button {
-                hwnd: 0,
-                client: None,
-                screen: POINT { x: 100, y: 100 },
-                button: MouseButton::Left,
-                down: false,
-                clicks: 1,
-            });
+
+            // Focus-loss release (`release_all_keys`) while both a key and mouse button are held
+            // must record the released keyboard and mouse snapshots in GameInput history immediately.
+            let mdev = device_ptr(DeviceKind::Mouse);
+            crate::user32::input::native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            let t_held = gi_get_current_timestamp(gi);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            crate::user32::input::release_all_keys();
+            let t_released = gi_get_current_timestamp(gi);
+            assert!(t_released > t_held);
+
+            assert_eq!(gi_get_temporal_reading(gi, t_released, kdev, &mut out), S_OK);
+            let n_rel_keys = rd_get_key_state(out, keys.len() as u32, keys.as_mut_ptr()) as usize;
+            assert!(
+                !keys[..n_rel_keys].iter().any(|k| k.virtual_key == b'A'),
+                "focus-loss release_all_keys must record keyboard release in GameInput history"
+            );
+            assert_eq!(rd_release(out), 0);
+
+            assert_eq!(gi_get_temporal_reading(gi, t_released, mdev, &mut out), S_OK);
+            let mut ms_rel = GameInputMouseState::default();
+            assert_eq!(rd_get_mouse_state(out, &mut ms_rel), 1);
+            assert_eq!(
+                ms_rel.buttons & GAME_INPUT_MOUSE_LEFT_BUTTON,
+                0,
+                "focus-loss release_all_keys must record mouse button release in GameInput history"
+            );
+            assert_eq!(rd_release(out), 0);
+
+            // Historical lookup before focus loss still sees both held.
+            assert_eq!(gi_get_temporal_reading(gi, t_held, kdev, &mut out), S_OK);
+            let n_held_keys = rd_get_key_state(out, keys.len() as u32, keys.as_mut_ptr()) as usize;
+            assert!(keys[..n_held_keys].iter().any(|k| k.virtual_key == b'A'));
+            assert_eq!(rd_release(out), 0);
+            assert_eq!(gi_get_temporal_reading(gi, t_held, mdev, &mut out), S_OK);
+            let mut ms_held = GameInputMouseState::default();
+            assert_eq!(rd_get_mouse_state(out, &mut ms_held), 1);
+            assert_ne!(ms_held.buttons & GAME_INPUT_MOUSE_LEFT_BUTTON, 0);
+            assert_eq!(rd_release(out), 0);
 
             assert_eq!(gi_release(gi), 0);
         }
