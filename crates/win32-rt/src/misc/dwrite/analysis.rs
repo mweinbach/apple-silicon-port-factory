@@ -1656,6 +1656,17 @@ impl GlyphRunAnalysisInner {
         };
         Ok(Self { rendering_mode, bounds, bitmaps })
     }
+
+    /// Texture type corresponding to this analysis's rendering mode: aliased runs produce
+    /// `DWRITE_TEXTURE_ALIASED_1X1` coverage only; ClearType/antialiased runs produce
+    /// `DWRITE_TEXTURE_CLEARTYPE_3X1` coverage only.
+    fn texture_type(&self) -> u32 {
+        if self.rendering_mode == DWRITE_RENDERING_MODE_ALIASED {
+            DWRITE_TEXTURE_ALIASED_1X1
+        } else {
+            DWRITE_TEXTURE_CLEARTYPE_3X1
+        }
+    }
 }
 
 unsafe extern "win64" fn gra_qi(this: PGlyphRunAnalysis, riid: *const u8, ppv: *mut *mut c_void) -> HRESULT {
@@ -1673,7 +1684,13 @@ pub(super) unsafe extern "win64" fn gra_get_alpha_texture_bounds(
     if texture_type != DWRITE_TEXTURE_ALIASED_1X1 && texture_type != DWRITE_TEXTURE_CLEARTYPE_3X1 {
         return E_INVALIDARG;
     }
-    texture_bounds.write_unaligned(ComObj::inner(this).bounds);
+    let inner = ComObj::inner(this);
+    let bounds = if inner.texture_type() == texture_type {
+        inner.bounds
+    } else {
+        RECT::default()
+    };
+    texture_bounds.write_unaligned(bounds);
     S_OK
 }
 
@@ -1714,8 +1731,10 @@ pub(super) unsafe extern "win64" fn gra_create_alpha_texture(
     std::ptr::write_bytes(alpha_values, 0, needed);
 
     let inner = ComObj::inner(this);
-    let aliased_binary =
-        texture_type == DWRITE_TEXTURE_ALIASED_1X1 && inner.rendering_mode == DWRITE_RENDERING_MODE_ALIASED;
+    if inner.texture_type() != texture_type {
+        return S_OK;
+    }
+    let aliased_binary = texture_type == DWRITE_TEXTURE_ALIASED_1X1;
 
     for bm in &inner.bitmaps {
         for sy in 0..bm.height as i32 {

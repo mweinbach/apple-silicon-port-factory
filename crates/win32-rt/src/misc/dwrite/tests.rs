@@ -1476,12 +1476,16 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
         let h = (bounds.bottom - bounds.top) as usize;
         assert!(w >= 15 && h >= 15, "bounds={bounds:?}");
 
-        let mut tex1 = vec![0u8; w * h];
+        // ClearType/Default run has empty bounds and zero pixels when queried as ALIASED_1X1.
+        let mut empty_aliased = RECT { left: 1, top: 2, right: 3, bottom: 4 };
+        assert_eq!(gra_get_alpha_texture_bounds(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut empty_aliased), S_OK);
+        assert_eq!((empty_aliased.left, empty_aliased.top, empty_aliased.right, empty_aliased.bottom), (0, 0, 0, 0));
+        let mut mismatched_tex1 = vec![0xAAu8; w * h];
         assert_eq!(
-            gra_create_alpha_texture(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &bounds, tex1.as_mut_ptr(), tex1.len() as u32),
+            gra_create_alpha_texture(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &bounds, mismatched_tex1.as_mut_ptr(), mismatched_tex1.len() as u32),
             S_OK
         );
-        assert!(tex1.iter().filter(|&&a| a >= 200).count() >= 60);
+        assert!(mismatched_tex1.iter().all(|&a| a == 0), "ClearType run must not emit pixels into ALIASED_1X1 texture");
 
         let mut tex3 = vec![0u8; w * h * 3];
         assert_eq!(
@@ -1489,6 +1493,43 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
             S_OK
         );
         assert!(tex3.iter().filter(|&&a| a >= 200).count() >= 180);
+
+        // Aliased run reports nonempty ALIASED_1X1 bounds/binary pixels and empty CLEARTYPE_3X1 bounds/zeros.
+        let mut gra_aliased: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_ALIASED,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                32.0,
+                &mut gra_aliased,
+            ),
+            S_OK
+        );
+        let mut b_al = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_aliased as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_al), S_OK);
+        assert_eq!((b_al.left, b_al.top, b_al.right, b_al.bottom), (bounds.left, bounds.top, bounds.right, bounds.bottom));
+        let mut empty_ct = RECT { left: 1, top: 2, right: 3, bottom: 4 };
+        assert_eq!(gra_get_alpha_texture_bounds(gra_aliased as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut empty_ct), S_OK);
+        assert_eq!((empty_ct.left, empty_ct.top, empty_ct.right, empty_ct.bottom), (0, 0, 0, 0));
+        let mut tex1 = vec![0u8; w * h];
+        assert_eq!(
+            gra_create_alpha_texture(gra_aliased as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &b_al, tex1.as_mut_ptr(), tex1.len() as u32),
+            S_OK
+        );
+        assert!(tex1.iter().filter(|&&a| a == 255).count() >= 60);
+        assert!(tex1.iter().all(|&a| a == 0 || a == 255), "aliased 1x1 texture must be binary");
+        let mut mismatched_tex3 = vec![0xBBu8; w * h * 3];
+        assert_eq!(
+            gra_create_alpha_texture(gra_aliased as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &b_al, mismatched_tex3.as_mut_ptr(), mismatched_tex3.len() as u32),
+            S_OK
+        );
+        assert!(mismatched_tex3.iter().all(|&a| a == 0), "aliased run must not emit pixels into CLEARTYPE_3X1 texture");
+        release_com(gra_aliased);
 
         // 4b. Non-uniform scale (m11=2, m22=1) and 90-degree rotation must transform glyph
         //     coverage & bounds, not only glyph origins.
@@ -1509,17 +1550,17 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
             S_OK
         );
         let mut b_wide = RECT::default();
-        assert_eq!(gra_get_alpha_texture_bounds(gra_wide as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_wide), S_OK);
+        assert_eq!(gra_get_alpha_texture_bounds(gra_wide as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_wide), S_OK);
         let w_wide = (b_wide.right - b_wide.left) as usize;
         let h_wide = (b_wide.bottom - b_wide.top) as usize;
         assert!(w_wide >= w * 2 - 4 && w_wide <= w * 2 + 4, "expected 2x width: base={w}, wide={w_wide}");
         assert!((h_wide as i32 - h as i32).abs() <= 2, "expected unchanged height: base={h}, wide={h_wide}");
-        let mut tex_wide = vec![0u8; w_wide * h_wide];
+        let mut tex_wide = vec![0u8; w_wide * h_wide * 3];
         assert_eq!(
-            gra_create_alpha_texture(gra_wide as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &b_wide, tex_wide.as_mut_ptr(), tex_wide.len() as u32),
+            gra_create_alpha_texture(gra_wide as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &b_wide, tex_wide.as_mut_ptr(), tex_wide.len() as u32),
             S_OK
         );
-        let lit_base = tex1.iter().filter(|&&a| a >= 200).count();
+        let lit_base = tex3.iter().filter(|&&a| a >= 200).count();
         let lit_wide = tex_wide.iter().filter(|&&a| a >= 200).count();
         assert!(lit_wide >= lit_base * 3 / 2, "expected ~2x lit pixels under 2x X-scale: base={lit_base}, wide={lit_wide}");
 
@@ -1541,7 +1582,7 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
             S_OK
         );
         let mut b_rot = RECT::default();
-        assert_eq!(gra_get_alpha_texture_bounds(gra_rot as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_rot), S_OK);
+        assert_eq!(gra_get_alpha_texture_bounds(gra_rot as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_rot), S_OK);
         let w_rot = (b_rot.right - b_rot.left) as usize;
         let h_rot = (b_rot.bottom - b_rot.top) as usize;
         assert!((w_rot as i32 - h_wide as i32).abs() <= 3, "rotated width {w_rot} should match unrotated height {h_wide}");
@@ -1578,7 +1619,7 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
             S_OK
         );
         let mut b_rtl = RECT::default();
-        assert_eq!(gra_get_alpha_texture_bounds(gra_rtl as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_rtl), S_OK);
+        assert_eq!(gra_get_alpha_texture_bounds(gra_rtl as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_rtl), S_OK);
         // LTR bounds at baseline_x=0 were [bounds.left..bounds.right]; RTL at 100 with adv=25
         // places the glyph origin at 100 - 25 = 75, so bounds shift by +75 (strictly left of 100+bounds.left).
         assert_eq!(b_rtl.left, bounds.left + 75, "RTL left bound: ltr={bounds:?}, rtl={b_rtl:?}");
@@ -2231,7 +2272,7 @@ fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
             S_OK
         );
         let mut b_h = RECT::default();
-        assert_eq!(gra_get_alpha_texture_bounds(gra_h as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_h), S_OK);
+        assert_eq!(gra_get_alpha_texture_bounds(gra_h as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_h), S_OK);
         let w_h = b_h.right - b_h.left;
         let h_h = b_h.bottom - b_h.top;
         assert!(h_h > w_h + 4, "upright 'I' should be taller than wide: {b_h:?}");
@@ -2254,7 +2295,7 @@ fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
             S_OK
         );
         let mut b_sw = RECT::default();
-        assert_eq!(gra_get_alpha_texture_bounds(gra_sw as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_sw), S_OK);
+        assert_eq!(gra_get_alpha_texture_bounds(gra_sw as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_sw), S_OK);
         let w_sw = b_sw.right - b_sw.left;
         let h_sw = b_sw.bottom - b_sw.top;
         assert!((w_sw - h_h).abs() <= 3, "sideways width {w_sw} should match upright height {h_h}");
@@ -2279,7 +2320,7 @@ fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
             S_OK
         );
         let mut b_v1 = RECT::default();
-        assert_eq!(gra_get_alpha_texture_bounds(gra_v1 as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_v1), S_OK);
+        assert_eq!(gra_get_alpha_texture_bounds(gra_v1 as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_v1), S_OK);
         let w_v1 = b_v1.right - b_v1.left;
         let h_v1 = b_v1.bottom - b_v1.top;
         assert!((w_v1 - w_h).abs() <= 3, "compensated vertical width {w_v1} should match upright width {w_h}");
@@ -2307,7 +2348,7 @@ fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
             S_OK
         );
         let mut b_v2 = RECT::default();
-        assert_eq!(gra_get_alpha_texture_bounds(gra_v2 as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_v2), S_OK);
+        assert_eq!(gra_get_alpha_texture_bounds(gra_v2 as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_v2), S_OK);
         assert_eq!(b_v2.left, b_v1.left, "vertical 2-glyph run must stay horizontally aligned");
         assert_eq!(b_v2.right, b_v1.right, "vertical 2-glyph run must stay horizontally aligned");
         assert!(
@@ -2317,9 +2358,9 @@ fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
         // Ensure alpha texture actually renders non-zero pixels for the vertical run.
         let tex_w = (b_v2.right - b_v2.left) as usize;
         let tex_h = (b_v2.bottom - b_v2.top) as usize;
-        let mut tex = vec![0u8; tex_w * tex_h];
+        let mut tex = vec![0u8; tex_w * tex_h * 3];
         assert_eq!(
-            gra_create_alpha_texture(gra_v2 as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &b_v2, tex.as_mut_ptr(), tex.len() as u32),
+            gra_create_alpha_texture(gra_v2 as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &b_v2, tex.as_mut_ptr(), tex.len() as u32),
             S_OK
         );
         assert!(tex.iter().any(|&a| a >= 128), "vertical alpha texture must contain lit glyph pixels");
