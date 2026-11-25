@@ -2013,13 +2013,17 @@ fn load_pdb_for_module(m: &SymModule, search_path: &str) -> Option<PdbLineCache>
         }
     }
     // Also check `<module_name>.pdb` beside the image and in every search-path directory.
-    let stem = if m.module_name.len() > 4
-        && (m.module_name[m.module_name.len() - 4..].eq_ignore_ascii_case(".dll")
-            || m.module_name[m.module_name.len() - 4..].eq_ignore_ascii_case(".exe"))
-    {
-        &m.module_name[..m.module_name.len() - 4]
-    } else {
-        &m.module_name
+    // Compare ASCII suffixes on raw bytes before slicing so non-ASCII module names (e.g. "游戏")
+    // never panic on a mid-character UTF-8 index.
+    let stem = match m.module_name.as_bytes().len().checked_sub(4) {
+        Some(split)
+            if split > 0
+                && (m.module_name.as_bytes()[split..].eq_ignore_ascii_case(b".dll")
+                    || m.module_name.as_bytes()[split..].eq_ignore_ascii_case(b".exe")) =>
+        {
+            &m.module_name[..split]
+        }
+        _ => &m.module_name,
     };
     let pdb_fname = format!("{stem}.pdb");
     if let Some(parent) = img_parent {
@@ -3682,6 +3686,67 @@ mod tests {
             assert_eq!((line.as_ptr().add(16) as *const u32).read_unaligned(), 99);
             let name_c_ptr = (line.as_ptr().add(24) as *const usize).read_unaligned() as *const u8;
             assert_eq!(crate::strings::from_ansi(name_c_ptr), "src\\mod_c.cpp");
+
+            assert_eq!(SymCleanup(proc_h), TRUE);
+        }
+
+        let _ = std::fs::remove_dir_all(&sym_dir);
+    }
+
+    #[test]
+    fn sym_get_line_from_addr_handles_non_ascii_module_names_without_panicking() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sym_dir = std::env::temp_dir().join(format!("pf_pdb_utf8_{uniq}"));
+        std::fs::create_dir_all(&sym_dir).unwrap();
+
+        let pdb = build_minimal_pdb_with_id("src\\utf8.cpp", 0x200, 77, [0x77; 16], 1);
+        std::fs::write(sym_dir.join("游戏.pdb"), &pdb).unwrap();
+
+        let base1 = 0x0000_0007_2234_0000u64;
+        let base2 = 0x0000_0007_2244_0000u64;
+
+        unsafe {
+            let proc_h = 0x7778usize as HANDLE;
+            let sp = format!("{}\0", sym_dir.display());
+            assert_eq!(SymInitialize(proc_h, sp.as_ptr(), FALSE), TRUE);
+
+            // 1. Extensionless non-ASCII module name ("游戏" = 6 UTF-8 bytes): len()-4 lands inside
+            //    the first character; must NOT panic and must resolve `游戏.pdb` cleanly.
+            assert_eq!(
+                SymLoadModule64(
+                    proc_h,
+                    std::ptr::null_mut(),
+                    "C:\\tmp\\游戏\0".as_ptr(),
+                    "游戏\0".as_ptr(),
+                    base1,
+                    0x10_000,
+                ),
+                base1
+            );
+            let mut disp = 0u32;
+            let mut line = [0u8; 40];
+            (line.as_mut_ptr() as *mut u32).write_unaligned(40);
+            assert_eq!(SymGetLineFromAddr64(proc_h, base1 + 0x1200, &mut disp, line.as_mut_ptr()), TRUE);
+            assert_eq!((line.as_ptr().add(16) as *const u32).read_unaligned(), 77);
+
+            // 2. Non-ASCII module name with uppercase `.DLL` suffix ("游戏.DLL"): strips `.DLL`
+            //    safely and resolves `游戏.pdb`.
+            assert_eq!(
+                SymLoadModule64(
+                    proc_h,
+                    std::ptr::null_mut(),
+                    "C:\\tmp\\游戏.DLL\0".as_ptr(),
+                    "游戏.DLL\0".as_ptr(),
+                    base2,
+                    0x10_000,
+                ),
+                base2
+            );
+            assert_eq!(SymGetLineFromAddr64(proc_h, base2 + 0x1200, &mut disp, line.as_mut_ptr()), TRUE);
+            assert_eq!((line.as_ptr().add(16) as *const u32).read_unaligned(), 77);
 
             assert_eq!(SymCleanup(proc_h), TRUE);
         }
