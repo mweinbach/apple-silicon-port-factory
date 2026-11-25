@@ -209,8 +209,8 @@ pub unsafe fn icache_invalidate(start: *mut u8, len: usize) {
 
 /// Magic constant (`"SAOT"`) for [`StaticAotModuleDesc`].
 pub const STATIC_AOT_DESC_MAGIC: u32 = 0x5341_4F54;
-/// Version 3 reads a timestamp mode byte. Version 2 interpreted it as a boolean.
-pub const STATIC_AOT_DESC_VERSION: u32 = 3;
+/// Version 4 records the ARM instruction features required by a static image.
+pub const STATIC_AOT_DESC_VERSION: u32 = 4;
 
 /// Module descriptor flags (`StaticAotModuleDesc::flags`).
 pub const STATIC_AOT_MOD_HAS_RAS: u32 = 1 << 0;
@@ -432,6 +432,10 @@ pub unsafe fn register_static_aot_desc(desc: &StaticAotModuleDesc) -> bool {
             desc.magic,
             desc.version
         );
+        return false;
+    }
+    if !super::features::host().can_run(desc.knobs) {
+        log::warn!("exec_mem: ignoring static AOT image requiring unavailable ARM features");
         return false;
     }
     if desc.code_base == 0 || desc.entries.is_null() || desc.entry_count == 0 || desc.module_name.is_null() {
@@ -939,10 +943,14 @@ mod tests {
             entries: entries.as_ptr(),
             module_name: name.as_ptr(),
         };
-        for version in [1, 2] {
+        for version in [1, 2, 3] {
             let legacy_clock = StaticAotModuleDesc { version, ..desc };
             assert!(!unsafe { register_static_aot_desc(&legacy_clock) });
         }
+        super::super::features::without_features(u8::MAX, || {
+            let requires_aes = StaticAotModuleDesc { knobs: 1 << 19, ..desc };
+            assert!(!unsafe { register_static_aot_desc(&requires_aes) });
+        });
         assert!(unsafe { register_static_aot_desc(&desc) });
         assert_eq!(static_aot_preferred_base("basecheck.dll"), Some(0x1_8000_0000));
         // Wrong runtime base must honestly refuse binding.

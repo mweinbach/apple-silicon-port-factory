@@ -25,9 +25,12 @@ mod dispatch;
 pub mod eh;
 pub mod exec_mem;
 mod fast;
+mod features;
+pub(crate) mod cpuid;
 mod generic_ops;
 mod interp;
 mod mem;
+mod mmx;
 pub mod regfile;
 pub mod regfile_ext;
 mod routes;
@@ -35,6 +38,7 @@ mod simd_fp;
 mod simd_kernels;
 mod simd_mov;
 mod tsc;
+mod xstate;
 #[cfg(target_arch = "aarch64")]
 mod jit;
 #[cfg(not(target_arch = "aarch64"))]
@@ -53,6 +57,8 @@ pub mod verify;
 mod sse_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
 mod jit_tests;
+#[cfg(all(test, target_arch = "aarch64"))]
+mod cpu_basics_tests;
 #[cfg(test)]
 mod mod_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -129,7 +135,9 @@ use cpu::{enter_precise_oracle, leave_precise_oracle};
 use cpu::PRECISE_LOCAL;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_imports)]
-use cpu::{mxcsr_to_fpcr, read_fpcr, write_fpcr, FPCR_GUEST_MASK, MXCSR_FPCR_MASK};
+use cpu::{read_fpcr, write_fpcr};
+#[cfg(all(test, target_arch = "aarch64"))]
+use cpu::FPCR_GUEST_MASK;
 
 #[cfg(target_arch = "aarch64")]
 use dispatch::jit_host_xfer;

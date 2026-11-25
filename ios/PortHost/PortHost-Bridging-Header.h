@@ -49,7 +49,7 @@ typedef struct StaticAotModuleDesc {
 
 enum {
     STATIC_AOT_DESC_MAGIC = 0x53414F54u,
-    STATIC_AOT_DESC_VERSION = 3u,
+    STATIC_AOT_DESC_VERSION = 4u,
     STATIC_AOT_MOD_HAS_RAS = 1u << 0,
     STATIC_AOT_MOD_HAS_XMM_PIN = 1u << 1,
     STATIC_AOT_MOD_HAS_AOT_PROBE = 1u << 2,

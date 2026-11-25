@@ -5,6 +5,10 @@ edition.workspace = true
 version.workspace = true
 publish.workspace = true
 
+[features]
+# Run the CPU instruction fixtures under Rosetta as an independent control in tests.
+rosetta-oracle = []
+
 [dependencies]
 win64-abi.workspace = true
 win32-rt.workspace = true

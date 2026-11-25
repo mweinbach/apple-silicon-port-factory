@@ -1088,6 +1088,7 @@ fn lower_ext(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
 /// Lower one decoded instruction (falls back to [`K_GENERIC`]).
 pub(in crate::emu) fn lower(ins: &Instruction) -> FastOp {
     let mut f = FastOp { ip: ins.ip(), len: ins.len() as u8, ..FastOp::default() };
+    if crate::emu::mmx::uses_mmx(ins) { return f; }
     if let Some(g) = lower_inner(ins, f) {
         f = g;
     } else if let Some(g) = lower_ext(ins, f) {
@@ -1111,10 +1112,10 @@ fn lower_inner(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
         Some(())
     };
     match mn {
-        Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Fnop | Mnemonic::Endbr64 | Mnemonic::Endbr32
+        Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Endbr64 | Mnemonic::Endbr32
         | Mnemonic::Clflush | Mnemonic::Prefetch | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1
         | Mnemonic::Prefetcht2 | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Prefetchwt1
-        | Mnemonic::Wait | Mnemonic::Rdsspd | Mnemonic::Rdsspq | Mnemonic::Emms | Mnemonic::Femms => {
+        | Mnemonic::Wait | Mnemonic::Rdsspd | Mnemonic::Rdsspq => {
             f.kind = K_NOP;
         }
         Mnemonic::Movnti => {

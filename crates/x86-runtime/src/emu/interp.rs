@@ -639,7 +639,7 @@ unsafe fn emu_run_region(
             ..jit::JitScratch::default()
         },
     };
-    let _fpcr_guard = GuestFpcrGuard::enter(&cpu.jx.mxcsr as *const u32);
+    let _fpcr_guard = GuestFpcrGuard::enter(&raw const cpu.jx.mxcsr);
     if entry_ip != 0 {
         cpu.gpr[0] = rax_in; // rax
     }
@@ -1245,8 +1245,11 @@ unsafe fn emu_run_region(
                             p.unhandled(cur_ip, mn);
                         }
                         report_unimplemented(cur_ip, mn, &ins, &cpu);
-                    } else if let Some(ref pf) = pre_fp {
-                        crate::diag::post_ins(pf, &cpu, cur_ip, &ins);
+                    } else {
+                        super::regfile_ext::record_x87_environment(&cpu, &ins);
+                        if let Some(ref pf) = pre_fp {
+                            crate::diag::post_ins(pf, &cpu, cur_ip, &ins);
+                        }
                     }
                 }
             }

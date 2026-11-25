@@ -311,10 +311,16 @@ impl Fp80 {
 /// mask where bit `phys` is `1` iff physical slot `phys` is non-empty).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct X87State {
-    regs: [Fp80; 8],
-    top: u8,
-    sw: u16,
-    valid_mask: u8,
+    // Store the architectural bytes so state transfers preserve SNaNs, unsupported encodings,
+    // and the contents of empty slots without an arithmetic conversion.
+    pub(super) regs: [[u8; 10]; 8],
+    pub(super) cw: u16,
+    pub(super) fop: u16,
+    pub(super) fip: u64,
+    pub(super) fdp: u64,
+    pub(super) top: u8,
+    pub(super) sw: u16,
+    pub(super) valid_mask: u8,
 }
 
 impl Default for X87State {
@@ -328,7 +334,11 @@ impl X87State {
     #[inline]
     pub const fn new() -> Self {
         Self {
-            regs: [Fp80 { kind: Fp80Kind::Zero, sign: 0, exp: 0, sig: 0 }; 8],
+            regs: [[0; 10]; 8],
+            cw: 0x037f,
+            fop: 0,
+            fip: 0,
+            fdp: 0,
             top: 0,
             sw: 0,
             valid_mask: 0,
@@ -336,8 +346,12 @@ impl X87State {
     }
 
     #[inline(always)]
-    fn phys(&self, i: u8) -> usize {
+    pub(super) fn phys(&self, i: u8) -> usize {
         (self.top.wrapping_add(i) & 7) as usize
+    }
+
+    fn value(&self, slot: usize) -> Fp80 {
+        Fp80::from_f80_bytes(self.regs[slot], &mut 0)
     }
 
     #[inline(always)]
@@ -358,31 +372,14 @@ impl X87State {
             return None;
         }
         let mut sw = self.sw;
-        Some(self.regs[p].to_f64_bits(&mut sw))
+        Some(self.value(p).to_f64_bits(&mut sw))
     }
 
     #[inline]
     pub fn push_f64_bits(&mut self, bits: u64) {
         let mut sw = self.sw & !0x0200; // C1 cleared on non-overflow push
         let val = Fp80::from_f64_bits(bits, &mut sw);
-        let new_top = self.top.wrapping_sub(1) & 7;
-        let p = new_top as usize;
-        if (self.valid_mask & (1 << p)) != 0 {
-            // Stack overflow (`SF | IE | C1`): return x87 QNaN Indefinite.
-            sw |= 0x0241;
-            self.regs[p] = Fp80 {
-                kind: Fp80Kind::Nan,
-                sign: 1,
-                exp: 0,
-                sig: 0xC000_0000_0000_0000,
-            };
-        } else {
-            self.regs[p] = val;
-            self.valid_mask |= 1 << p;
-        }
-        self.top = new_top;
-        self.sw = sw;
-        self.sync_top();
+        self.push_fp80(val, sw);
     }
 
     #[inline]
@@ -409,7 +406,7 @@ impl X87State {
             sw |= 0x0041;
             0xFFF8_0000_0000_0000
         } else {
-            let v = self.regs[p0];
+            let v = self.value(p0);
             self.valid_mask &= !(1 << p0);
             v.to_f64_bits(&mut sw)
         };
@@ -442,13 +439,13 @@ impl X87State {
                 sign: 1,
                 exp: 0,
                 sig: 0xC000_0000_0000_0000,
-            };
+            }.to_f80_bytes();
             self.valid_mask |= 1 << p0;
             self.sync_top();
             return;
         }
-        let a = self.regs[p0];
-        let b = self.regs[p1];
+        let a = self.value(p0);
+        let b = self.value(p1);
 
         if a.kind == Fp80Kind::Nan || b.kind == Fp80Kind::Nan {
             let mut res = if a.kind == Fp80Kind::Nan && b.kind == Fp80Kind::Nan {
@@ -467,7 +464,7 @@ impl X87State {
                 b
             };
             res.sig |= 1u64 << 62;
-            self.regs[p0] = res;
+            self.regs[p0] = res.to_f80_bytes();
             self.sync_top();
             return;
         }
@@ -479,7 +476,7 @@ impl X87State {
                 sign: 1,
                 exp: 0,
                 sig: 0xC000_0000_0000_0000,
-            };
+            }.to_f80_bytes();
             self.sync_top();
             return;
         }
@@ -513,7 +510,7 @@ impl X87State {
                 self.sw |= 1 << 8; // C0 = Q2
             }
             if rem == 0 {
-                self.regs[p0] = Fp80 { kind: Fp80Kind::Zero, sign: a.sign, exp: 0, sig: 0 };
+                self.regs[p0] = Fp80 { kind: Fp80Kind::Zero, sign: a.sign, exp: 0, sig: 0 }.to_f80_bytes();
             } else {
                 let clz = rem.leading_zeros() as i32;
                 self.regs[p0] = Fp80 {
@@ -521,7 +518,7 @@ impl X87State {
                     sign: a.sign,
                     exp: b.exp - clz,
                     sig: rem << (clz as u32),
-                };
+                }.to_f80_bytes();
             }
         } else {
             let n = 32 + (d & 31);
@@ -529,7 +526,7 @@ impl X87State {
             let rem = (num % (b.sig as u128)) as u64;
             self.sw |= 1 << 10; // C2 = 1 (incomplete reduction; PF=1 after shr eax,8; push rax; popfq)
             if rem == 0 {
-                self.regs[p0] = Fp80 { kind: Fp80Kind::Zero, sign: a.sign, exp: 0, sig: 0 };
+                self.regs[p0] = Fp80 { kind: Fp80Kind::Zero, sign: a.sign, exp: 0, sig: 0 }.to_f80_bytes();
             } else {
                 let clz = rem.leading_zeros() as i32;
                 self.regs[p0] = Fp80 {
@@ -537,7 +534,7 @@ impl X87State {
                     sign: a.sign,
                     exp: (a.exp - n) - clz,
                     sig: rem << (clz as u32),
-                };
+                }.to_f80_bytes();
             }
         }
         self.sync_top();
@@ -545,6 +542,10 @@ impl X87State {
 
     #[inline]
     fn push_fp80(&mut self, val: Fp80, extra_sw: u16) {
+        self.push_bytes(val.to_f80_bytes(), extra_sw);
+    }
+
+    fn push_bytes(&mut self, val: [u8; 10], extra_sw: u16) {
         let mut sw = (self.sw & !0x0200) | extra_sw;
         let new_top = self.top.wrapping_sub(1) & 7;
         let p = new_top as usize;
@@ -555,7 +556,7 @@ impl X87State {
                 sign: 1,
                 exp: 0,
                 sig: 0xC000_0000_0000_0000,
-            };
+            }.to_f80_bytes();
         } else {
             self.regs[p] = val;
             self.valid_mask |= 1 << p;
@@ -605,7 +606,7 @@ impl X87State {
             self.sync_top();
             return;
         }
-        let v = self.regs[p0];
+        let v = self.value(p0);
         if v.sign != 0 {
             self.sw |= 1 << 9; // C1 = sign bit
         }
@@ -639,7 +640,7 @@ impl X87State {
             return f64::from_bits(0xFFF8_0000_0000_0000);
         }
         let mut sw = self.sw;
-        let bits = self.regs[pi].to_f64_bits(&mut sw);
+        let bits = self.value(pi).to_f64_bits(&mut sw);
         self.sw = sw;
         f64::from_bits(bits)
     }
@@ -648,7 +649,7 @@ impl X87State {
     fn write_st_f64(&mut self, idx: u8, val: f64) {
         let pi = self.phys(idx & 7);
         let mut sw = self.sw;
-        self.regs[pi] = Fp80::from_f64_bits(val.to_bits(), &mut sw);
+        self.regs[pi] = Fp80::from_f64_bits(val.to_bits(), &mut sw).to_f80_bytes();
         self.valid_mask |= 1 << pi;
         self.sw = sw;
         self.sync_top();
@@ -686,8 +687,41 @@ fn with_x87_ref<R>(f: impl FnOnce(&X87State) -> R) -> R {
 /// Safety invariant for callers: `f` must be a leaf closure that never re-enters `with_x87_ref` /
 /// `with_x87_mut` and never invokes guest callbacks or memory helpers that could fault/dispatch.
 #[inline(always)]
-fn with_x87_mut<R>(f: impl FnOnce(&mut X87State) -> R) -> R {
+pub(super) fn with_x87_mut<R>(f: impl FnOnce(&mut X87State) -> R) -> R {
     TLS_X87.with(|cell| unsafe { f(&mut *cell.get()) })
+}
+
+/// Retire a decoded x87 data instruction. FOP is the low 3 bits of the escape
+/// opcode followed by ModRM, independently of legacy, address-size and REX prefixes.
+pub(super) unsafe fn record_x87_environment(cpu: &Cpu, ins: &Instruction) {
+    use iced_x86::CpuidFeature::{CMOV, FPU, FPU287, FPU387};
+    use Mnemonic::*;
+    if !ins.cpuid_features().iter().any(|f| matches!(f, FPU | FPU287 | FPU387 | CMOV))
+        || matches!(
+            ins.mnemonic(),
+            Fldcw | Fnstcw | Fstcw | Fninit | Finit | Fnclex | Fclex | Fnstsw | Fstsw | Wait
+        )
+        || (super::precise_faults() && super::FAULT_PENDING.with(|p| p.get().is_some()))
+    {
+        return;
+    }
+    let bytes = core::slice::from_raw_parts(super::to_mapped_addr(ins.ip()) as *const u8, ins.len());
+    // Check the opcode itself: CMOV is also the CPUID requirement for integer CMOVcc.
+    let mut bytes = bytes
+        .iter()
+        .copied()
+        .skip_while(|b| matches!(b, 0x26|0x2e|0x36|0x3e|0x64..=0x67|0x40..=0x4f|0xf2|0xf3));
+    let (Some(op @ 0xd8..=0xdf), Some(modrm)) = (bytes.next(), bytes.next()) else {
+        return;
+    };
+    let data = (0..ins.op_count()).find(|&i| ins.op_kind(i) == OpKind::Memory).map(|_| cpu.eff_addr(ins));
+    with_x87_mut(|st| {
+        st.fip = ins.ip();
+        st.fop = (u16::from(op & 7) << 8) | u16::from(modrm);
+        if let Some(addr) = data {
+            st.fdp = addr;
+        }
+    });
 }
 
 /// Snapshot this thread's x87 state (used by `run_oracle` rollback and differential tests).
@@ -1129,7 +1163,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                         );
                     } else {
                         let val = st.regs[pi];
-                        st.push_fp80(val, 0);
+                        st.push_bytes(val, 0);
                     }
                 });
                 true
@@ -1158,9 +1192,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                             return true;
                         };
                         with_x87_mut(|st| {
-                            let mut extra_sw = 0u16;
-                            let val = Fp80::from_f80_bytes(bytes, &mut extra_sw);
-                            st.push_fp80(val, extra_sw);
+                            st.push_bytes(bytes, 0);
                         });
                         true
                     }
@@ -1261,7 +1293,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                         sw |= 0x0041;
                         0xFFF8_0000_0000_0000
                     } else {
-                        st.regs[p0].to_f64_bits(&mut sw)
+                        st.value(p0).to_f64_bits(&mut sw)
                     };
                     st.sw = sw;
                     st.sync_top();
@@ -1304,7 +1336,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                         let p0 = st.phys(0);
                         let val = if (st.valid_mask & (1 << p0)) == 0 {
                             st.sw |= 0x0041;
-                            Fp80 { kind: Fp80Kind::Nan, sign: 1, exp: 0, sig: 0xC000_0000_0000_0000 }
+                            Fp80 { kind: Fp80Kind::Nan, sign: 1, exp: 0, sig: 0xC000_0000_0000_0000 }.to_f80_bytes()
                         } else {
                             let v = st.regs[p0];
                             st.valid_mask &= !(1 << p0);
@@ -1313,7 +1345,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                         st.top = st.top.wrapping_add(1) & 7;
                         st.sw &= !0x0200;
                         st.sync_top();
-                        val.to_f80_bytes()
+                        val
                     });
                     cpu.write_mem(addr, 64, u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
                     if !faulted() {
@@ -1360,7 +1392,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                     sw |= 0x0041; // SF | IE
                     1u64 << (bits - 1)
                 } else {
-                    st.regs[p0].to_int_bits(bits, trunc, &mut sw)
+                    st.value(p0).to_int_bits(bits, trunc, &mut sw)
                 };
                 if pop {
                     st.valid_mask &= !(1 << p0);
@@ -1487,11 +1519,11 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                 match mn {
                     Mnemonic::Fabs => {
                         let p0 = st.phys(0);
-                        st.regs[p0].sign = 0;
+                        st.regs[p0][9] &= 0x7f;
                     }
                     Mnemonic::Fchs => {
                         let p0 = st.phys(0);
-                        st.regs[p0].sign ^= 1;
+                        st.regs[p0][9] ^= 0x80;
                     }
                     Mnemonic::Fsqrt => {
                         let v = st.read_st_f64(0);

@@ -1739,6 +1739,20 @@ pub(in crate::emu) fn psadbw(a: u128, b: u128) -> u128 {
 }
 
 #[inline(always)]
+pub(in crate::emu) fn phadd_sub_sw(a: u128, b: u128, sub: bool) -> u128 {
+    let mut result = 0u128;
+    for (j, value) in [a, b].into_iter().enumerate() {
+        for i in 0..4 {
+            let pair = value >> (32*i);
+            let (x, y) = (pair as i16, (pair >> 16) as i16);
+            let sum = if sub { x.saturating_sub(y) } else { x.saturating_add(y) };
+            result |= u128::from(sum as u16) << (64*j + 16*i);
+        }
+    }
+    result
+}
+
+#[inline(always)]
 pub(in crate::emu) fn phadd_sub_w(a: u128, b: u128, sub: bool) -> u128 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -2821,11 +2835,10 @@ pub(in crate::emu) fn pmovsx_zx(raw: u128, code: u8, ymm: bool) -> (u128, u128) 
 pub(in crate::emu) fn pclmulqdq(a: u128, b: u128, imm: u8) -> u128 {
     let x = if (imm & 0x01) != 0 { (a >> 64) as u64 } else { a as u64 };
     let y = if (imm & 0x10) != 0 { (b >> 64) as u64 } else { b as u64 };
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    {
-        unsafe { vmull_p64(x, y) }
+    #[cfg(target_arch = "aarch64")]
+    if super::features::host().has(super::features::HostFeatures::PMULL) {
+        return unsafe { vmull_p64(x, y) };
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     {
         let mut res = 0u128;
         let mut xx = x as u128;
@@ -2845,9 +2858,9 @@ pub(in crate::emu) fn pclmulqdq(a: u128, b: u128, imm: u8) -> u128 {
 /// `sub`: 0=enc, 1=enclast, 2=dec, 3=declast, 4=imc, 5=keygenassist.
 #[inline(always)]
 pub(in crate::emu) fn aes_op_128(sub: u8, state: u128, src: u128, imm8: u8) -> u128 {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    {
-        unsafe {
+    #[cfg(target_arch = "aarch64")]
+    if super::features::host().has(super::features::HostFeatures::AES) {
+        return unsafe {
             let va = qb(state);
             let vb = qb(src);
             let zero = vdupq_n_u8(0);
@@ -2868,9 +2881,8 @@ pub(in crate::emu) fn aes_op_128(sub: u8, state: u128, src: u128, imm8: u8) -> u
                     uq(veorq_u32(vreinterpretq_u32_u8(w), vld1q_u32(rc.as_ptr())))
                 }
             }
-        }
+        };
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     {
         const SBOX: [u8; 256] = [
             0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
@@ -3071,7 +3083,6 @@ pub(in crate::emu) fn vcvtps2ph(lo: u128, hi: u128, is_256: bool) -> u128 {
     packed
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_feature = "crc")))]
 const CRC32C_TABLE: [u32; 256] = {
     let mut t = [0u32; 256];
     let mut i = 0usize;
@@ -3091,16 +3102,17 @@ const CRC32C_TABLE: [u32; 256] = {
 /// SSE4.2 CRC32C step (hardware `crc32c*` when `target_feature = "crc"`, 256-entry LUT elsewhere).
 #[inline(always)]
 pub(in crate::emu) fn crc32c_step(crc: u32, v: u64, src_bits: u32) -> u32 {
-    #[cfg(all(target_arch = "aarch64", target_feature = "crc"))]
-    unsafe {
-        match src_bits {
-            8 => __crc32cb(crc, v as u8),
-            16 => __crc32ch(crc, v as u16),
-            32 => __crc32cw(crc, v as u32),
-            _ => __crc32cd(crc, v),
-        }
+    #[cfg(target_arch = "aarch64")]
+    if super::features::host().has(super::features::HostFeatures::CRC32) {
+        return unsafe {
+            match src_bits {
+                8 => __crc32cb(crc, v as u8),
+                16 => __crc32ch(crc, v as u16),
+                32 => __crc32cw(crc, v as u32),
+                _ => __crc32cd(crc, v),
+            }
+        };
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "crc")))]
     {
         let mut c = crc;
         let nbytes = src_bits >> 3;
@@ -3121,12 +3133,17 @@ pub(in crate::emu) fn pcmpstr(
     imm: u8,
     is_explicit: bool,
     is_mask: bool,
+    long: bool,
 ) {
     let is_words = (imm & 0x01) != 0;
     let is_signed = (imm & 0x02) != 0;
     let n: usize = if is_words { 8 } else { 16 };
     let agg = (imm >> 2) & 0x03;
 
+    let length = |value: u64| {
+        let signed = if long { value as i64 } else { i64::from(value as i32) };
+        signed.unsigned_abs().min(n as u64) as usize
+    };
     let (a_len, b_len, int_res1) = if !is_words {
         let ab = a.to_le_bytes();
         let bb = b.to_le_bytes();
@@ -3134,8 +3151,8 @@ pub(in crate::emu) fn pcmpstr(
         let (a_len, b_len) = unsafe {
             if is_explicit {
                 (
-                    (cpu.gpr[0] as i32).unsigned_abs().min(16) as usize,
-                    (cpu.gpr[2] as i32).unsigned_abs().min(16) as usize,
+                    length(cpu.gpr[0]),
+                    length(cpu.gpr[2]),
                 )
             } else {
                 let z = vdupq_n_u8(0);
@@ -3150,8 +3167,8 @@ pub(in crate::emu) fn pcmpstr(
         #[cfg(not(target_arch = "aarch64"))]
         let (a_len, b_len) = if is_explicit {
             (
-                (cpu.gpr[0] as i32).unsigned_abs().min(16) as usize,
-                (cpu.gpr[2] as i32).unsigned_abs().min(16) as usize,
+                length(cpu.gpr[0]),
+                length(cpu.gpr[2]),
             )
         } else {
             (
@@ -3295,8 +3312,8 @@ pub(in crate::emu) fn pcmpstr(
         let bw: [u16; 8] = core::array::from_fn(|i| ((b >> (i * 16)) & 0xFFFF) as u16);
         let (a_len, b_len) = if is_explicit {
             (
-                (cpu.gpr[0] as i32).unsigned_abs().min(8) as usize,
-                (cpu.gpr[2] as i32).unsigned_abs().min(8) as usize,
+                length(cpu.gpr[0]),
+                length(cpu.gpr[2]),
             )
         } else {
             (

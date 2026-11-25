@@ -69,7 +69,11 @@ impl H128 {
 pub(in crate::emu) fn codegen_hash() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
-        const SRC: [&[u8]; 30] = [
+        const SRC: &[&[u8]] = &[
+            include_bytes!("../features.rs"),
+            include_bytes!("../cpuid.rs"),
+            include_bytes!("../mmx.rs"),
+            include_bytes!("../xstate.rs"),
             include_bytes!("../jit.rs"),
             include_bytes!("../jit/emit.rs"),
             include_bytes!("../jit/cache.rs"),
@@ -106,6 +110,7 @@ pub(in crate::emu) fn codegen_hash() -> u64 {
             h.bytes(s);
         }
         h.word(core::mem::size_of::<crate::emu::Cpu>() as u64);
+        h.word(crate::emu::BLK_MAX_INSNS as u64);
         h.word(FORMAT_VERSION as u64);
         h.finish()[0]
     })
