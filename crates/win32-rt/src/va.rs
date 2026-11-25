@@ -37,8 +37,7 @@ impl VaList {
     }
 }
 
-/// Define a variadic win64 export `$name` whose first `$fixed` parameters are
-/// fixed; the body receives a pointer to the first argument slot.
+/// Define a variadic win64 export whose body receives the complete guest argument area.
 ///
 /// ```ignore
 /// win64_varargs_thunk!(wsprintfW => wsprintfW_impl);
@@ -66,13 +65,16 @@ macro_rules! win64_varargs_thunk {
             )
         }
         #[cfg(not(target_arch = "x86_64"))]
-        pub unsafe extern "win64" fn $name(
-            a0: u64, a1: u64, a2: u64, a3: u64,
-            a4: u64, a5: u64, a6: u64, a7: u64,
-            a8: u64, a9: u64, a10: u64, a11: u64,
-        ) -> i32 {
-            let args = [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11];
-            $imp(args.as_ptr())
+        pub unsafe extern "win64" fn $name(a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
+            let mut caller = $crate::unwind::Context::zeroed();
+            if $crate::unwind::guest_caller_context($name as *const () as usize, &mut caller).is_none() {
+                return -1;
+            }
+            // The bridge records RSP at the call site, before pushing a return address.
+            // Home the four register arguments immediately before the real stack arguments.
+            let home = caller.gpr[$crate::unwind::RSP] as *mut [u64; 4];
+            home.write_unaligned([a0, a1, a2, a3]);
+            $imp(home.cast())
         }
     };
 }

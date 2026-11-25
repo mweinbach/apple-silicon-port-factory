@@ -16,7 +16,12 @@ mod guest_corpus_common;
 use guest_corpus_common::{
     compile_c_guest, compile_cpp_guest, find_zig, run_guest_both_modes, TempDir,
 };
+use std::path::PathBuf;
 use std::time::Duration;
+
+fn corpus_compiler() -> PathBuf {
+    find_zig().expect("os_guest_corpus requires Zig 0.16.0 on PATH or in ZIG (see CONTRIBUTING.md)")
+}
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -26,10 +31,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[test]
 fn guest_threads_waits_and_apcs() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_threads_waits_and_apcs: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("threads-waits-apcs");
     let exe = compile_c_guest(
         &zig,
@@ -268,10 +270,7 @@ int main(void) {
 
 #[test]
 fn guest_seh_and_cpp_exceptions() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_seh_and_cpp_exceptions: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("seh-cpp-exc");
     let exe = compile_cpp_guest(
         &zig,
@@ -461,10 +460,7 @@ int main() {
 
 #[test]
 fn guest_tls_and_fls() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_tls_and_fls: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("tls-fls");
     let exe = compile_c_guest(
         &zig,
@@ -585,10 +581,7 @@ int main(void) {
 
 #[test]
 fn guest_iocp() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_iocp: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("iocp");
     let exe = compile_c_guest(&zig, tmp.path(), "iocp_test", IOCP_C, &["kernel32"]);
     run_guest_both_modes(
@@ -757,10 +750,7 @@ int main(void) {
 
 #[test]
 fn guest_fibers() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_fibers: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("fibers");
     let exe = compile_c_guest(&zig, tmp.path(), "fibers_test", FIBERS_C, &["kernel32"]);
     run_guest_both_modes(
@@ -887,10 +877,7 @@ int main(void) {
 
 #[test]
 fn guest_sockets() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_sockets: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("sockets");
     let exe = compile_c_guest(
         &zig,
@@ -1079,10 +1066,7 @@ int main(void) {
 
 #[test]
 fn guest_registry() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_registry: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("registry");
     let exe = compile_c_guest(
         &zig,
@@ -1252,10 +1236,7 @@ int main(void) {
 
 #[test]
 fn guest_file_io_and_paths() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_file_io_and_paths: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("file-io-paths");
     let exe = compile_c_guest(
         &zig,
@@ -1414,10 +1395,7 @@ int main(void) {
 
 #[test]
 fn guest_com_activation() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_com_activation: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("com-activation");
     let exe = compile_c_guest(
         &zig,
@@ -1646,22 +1624,18 @@ int main(void) {
 "##;
 
 // ---------------------------------------------------------------------------
-// Backlog expected failure: user32.dll!wsprintfW / wsprintfA
+// USER32 variadic ANSI and Unicode formatting
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "expected failure: docs/stub-backlog.d/guest-corpus-bench.md (user32.dll!wsprintfW, user32.dll!wsprintfA)"]
-fn guest_user32_wsprintf_backlog() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_user32_wsprintf_backlog: zig not found");
-        return;
-    };
-    let tmp = TempDir::new("wsprintf-backlog");
+fn guest_user32_wsprintf() {
+    let zig = corpus_compiler();
+    let tmp = TempDir::new("wsprintf");
     let exe = compile_c_guest(
         &zig,
         tmp.path(),
         "wsprintf_test",
-        WSPRINTF_BACKLOG_C,
+        WSPRINTF_C,
         &["user32", "kernel32"],
     );
     run_guest_both_modes(
@@ -1673,7 +1647,7 @@ fn guest_user32_wsprintf_backlog() {
     );
 }
 
-const WSPRINTF_BACKLOG_C: &str = r##"
+const WSPRINTF_C: &str = r##"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -1681,17 +1655,30 @@ const WSPRINTF_BACKLOG_C: &str = r##"
 #include <wchar.h>
 
 int main(void) {
-    char abuf[64];
-    wsprintfA(abuf, "val=%d", 42);
-    if (strcmp(abuf, "val=42") != 0) {
-        fprintf(stderr, "FAIL: wsprintfA formatted '%s' instead of 'val=42'\n", abuf);
-        ExitProcess(1);
+    char abuf[1025];
+    int n = wsprintfA(abuf, "%% %s/%S %05d %.3s %Ix %c %C",
+                      "a", L"b", -7, "abcdef", (UINT_PTR)0x123456789ULL, 'x', L'Y');
+    if (strcmp(abuf, "% a/b -0007 abc 123456789 x Y") || n != (int)strlen(abuf)) {
+        fprintf(stderr, "FAIL: wsprintfA output '%s', count %d\n", abuf, n);
+        return 1;
     }
     WCHAR wbuf[64];
-    wsprintfW(wbuf, L"val=%d", 42);
-    if (wcscmp(wbuf, L"val=42") != 0) {
-        fprintf(stderr, "FAIL: wsprintfW mismatch\n");
-        ExitProcess(2);
+    n = wsprintfW(wbuf, L"%s:%S:%ls:%hs:%c:%C:%04X", L"wide", "ansi", L"w", "a", L'Z', 'z', 0x1b);
+    if (wcscmp(wbuf, L"wide:ansi:w:a:Z:z:001B") || n != (int)wcslen(wbuf)) {
+        fprintf(stderr, "FAIL: wsprintfW result or count\n");
+        return 2;
+    }
+    n = wsprintfA(abuf, "%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d",
+                  1,2,3,4,5,6,7,8,9,0,1,2,3,4,5,6,7);
+    if (n != 17 || strcmp(abuf, "12345678901234567")) {
+        fprintf(stderr, "FAIL: variadic stack arguments\n");
+        return 3;
+    }
+    memset(abuf, '!', sizeof(abuf));
+    n = wsprintfA(abuf, "%2000d", 1);
+    if (n >= 2000 || abuf[1023] != 0 || abuf[1024] != '!') {
+        fprintf(stderr, "FAIL: output limit\n");
+        return 4;
     }
     printf("CORPUS_WSPRINTF: PASS ALL\n");
     fflush(stdout);
