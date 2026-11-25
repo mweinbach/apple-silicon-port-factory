@@ -918,7 +918,7 @@ struct DeviceState {
     buffer_size: u32,
     ff_gain: u32,
     autocenter: u32,
-    calibration_mode: u32,
+    axis_calibration_modes: [u32; NUM_AXES],
     axis_ranges: [(i32, i32); NUM_AXES],
     axis_deadzones: [u32; NUM_AXES],
     axis_saturations: [u32; NUM_AXES],
@@ -942,7 +942,7 @@ impl DeviceState {
             buffer_size: 0,
             ff_gain: 10_000,
             autocenter: DIPROPAUTOCENTER_ON,
-            calibration_mode: DIPROPCALIBRATIONMODE_COOKED,
+            axis_calibration_modes: [DIPROPCALIBRATIONMODE_COOKED; NUM_AXES],
             axis_ranges: [(DEFAULT_AXIS_MIN, DEFAULT_AXIS_MAX); NUM_AXES],
             axis_deadzones: [0; NUM_AXES],
             axis_saturations: [10000; NUM_AXES],
@@ -996,10 +996,10 @@ impl DeviceState {
     }
 
     fn sample_axis(&self, pad: &Gamepad, aid: AxisId) -> i32 {
-        if self.calibration_mode == DIPROPCALIBRATIONMODE_RAW {
+        let i = aid as usize;
+        if self.axis_calibration_modes[i] == DIPROPCALIBRATIONMODE_RAW {
             axis_raw_value(pad, aid)
         } else {
-            let i = aid as usize;
             axis_value_cooked(
                 pad,
                 aid,
@@ -1352,10 +1352,16 @@ unsafe extern "win64" fn dev_get_property(this: *mut DeviceObj, prop: *const Gui
             DI_OK
         }
         DIPROP_CALIBRATIONMODE => {
-            if hdr.dw_size != std::mem::size_of::<DIPROPDWORD>() as u32 || hdr.dw_how != DIPH_DEVICE {
+            if hdr.dw_size != std::mem::size_of::<DIPROPDWORD>() as u32 {
                 return DIERR_INVALIDPARAM;
             }
-            (diph as *mut DIPROPDWORD).write_unaligned(DIPROPDWORD { diph: hdr, dw_data: st.calibration_mode });
+            let Some(axes) = st.resolve_axis_indices(hdr.dw_obj, hdr.dw_how) else {
+                return DIERR_OBJECTNOTFOUND;
+            };
+            (diph as *mut DIPROPDWORD).write_unaligned(DIPROPDWORD {
+                diph: hdr,
+                dw_data: st.axis_calibration_modes[axes[0]],
+            });
             DI_OK
         }
         DIPROP_CALIBRATION => {
@@ -1563,14 +1569,19 @@ unsafe extern "win64" fn dev_set_property(this: *mut DeviceObj, prop: *const Gui
             DI_PROPNOEFFECT
         }
         DIPROP_CALIBRATIONMODE => {
-            if hdr.dw_size != std::mem::size_of::<DIPROPDWORD>() as u32 || hdr.dw_how != DIPH_DEVICE {
+            if hdr.dw_size != std::mem::size_of::<DIPROPDWORD>() as u32 {
                 return DIERR_INVALIDPARAM;
             }
             let v = (diph as *const DIPROPDWORD).read_unaligned().dw_data;
             if v != DIPROPCALIBRATIONMODE_COOKED && v != DIPROPCALIBRATIONMODE_RAW {
                 return DIERR_INVALIDPARAM;
             }
-            st.calibration_mode = v;
+            let Some(axes) = st.resolve_axis_indices(hdr.dw_obj, hdr.dw_how) else {
+                return DIERR_OBJECTNOTFOUND;
+            };
+            for i in axes {
+                st.axis_calibration_modes[i] = v;
+            }
             DI_OK
         }
         DIPROP_CALIBRATION => {
@@ -1752,6 +1763,8 @@ unsafe extern "win64" fn dev_set_data_format(this: *mut DeviceObj, lpdf: *const 
     let mut st = (*this).state.lock().unwrap();
     st.data_size = df.dw_data_size;
     st.mappings = mappings;
+    // Windows DirectInput resets DIPROP_APPDATA associations whenever SetDataFormat succeeds.
+    st.app_data.clear();
     DI_OK
 }
 
@@ -2717,6 +2730,115 @@ mod tests {
             backend_update(0, GcPad::default().to_xinput());
             assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
             assert!(js.l_x < -150, "expected negative calibrated lx, got {}", js.l_x);
+
+            backend_disconnect(0);
+            assert_eq!((dvt.release)(dev), 0);
+            assert_eq!((vt.release)(di), 0);
+        }
+    }
+
+    #[test]
+    fn per_axis_calibration_mode_and_set_data_format_resets_app_data() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            for s in 0..XUSER_MAX_COUNT {
+                backend_disconnect(s);
+            }
+            backend_connect(0, DeviceInfo { name: "PerAxisPad".into(), wireless: false, rumble: false, battery: None });
+
+            let mut di_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(DirectInput8Create(0, 0x800, &IID_IDIRECTINPUT8W, &mut di_ptr, std::ptr::null_mut()), S_OK);
+            let di = di_ptr as *mut Obj;
+            let vt = &*(*di).vtbl;
+
+            let mut dev_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!((vt.create_device)(di, &slot_guid(0), &mut dev_ptr, std::ptr::null_mut()), S_OK);
+            let dev = dev_ptr as *mut DeviceObj;
+            let dvt = &*(*dev).vtbl;
+
+            let df_default = DIDATAFORMAT { dw_size: 32, dw_obj_size: 24, dw_flags: 1, dw_data_size: 80, dw_num_objs: 0, rgodf: std::ptr::null() };
+            assert_eq!((dvt.set_data_format)(dev, &df_default), DI_OK);
+
+            // Configure range -1000..1000 and 25% deadzone on all axes.
+            let rng = DIPROPRANGE { diph: DIPROPHEADER { dw_size: 24, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_DEVICE }, l_min: -1000, l_max: 1000 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_RANGE as *const Guid, &rng.diph), DI_OK);
+            let dz = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_DEVICE }, dw_data: 2500 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_DEADZONE as *const Guid, &dz.diph), DI_OK);
+
+            // Switch ONLY X axis (offset 0) to RAW; keep Y axis (offset 4) COOKED.
+            let x_raw = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET }, dw_data: DIPROPCALIBRATIONMODE_RAW };
+            assert_eq!((dvt.set_property)(dev, DIPROP_CALIBRATIONMODE as *const Guid, &x_raw.diph), DI_OK);
+
+            let mut x_q = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET }, dw_data: 99 };
+            assert_eq!((dvt.get_property)(dev, DIPROP_CALIBRATIONMODE as *const Guid, &mut x_q.diph), DI_OK);
+            assert_eq!(x_q.dw_data, DIPROPCALIBRATIONMODE_RAW);
+
+            let y_id = native_objects().iter().find(|o| o.kind == ObjKind::Axis(AxisId::Y)).unwrap().dw_type;
+            let mut y_q = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: y_id, dw_how: DIPH_BYID }, dw_data: 99 };
+            assert_eq!((dvt.get_property)(dev, DIPROP_CALIBRATIONMODE as *const Guid, &mut y_q.diph), DI_OK);
+            assert_eq!(y_q.dw_data, DIPROPCALIBRATIONMODE_COOKED);
+
+            // Non-axis objects (buttons) must be rejected with DIERR_OBJECTNOTFOUND.
+            let btn_id = native_objects().iter().find(|o| o.kind == ObjKind::Button(0)).unwrap().dw_type;
+            let btn_raw = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: btn_id, dw_how: DIPH_BYID }, dw_data: DIPROPCALIBRATIONMODE_RAW };
+            assert_eq!((dvt.set_property)(dev, DIPROP_CALIBRATIONMODE as *const Guid, &btn_raw.diph), DIERR_OBJECTNOTFOUND);
+
+            // Move both X and Y inside the 25% deadzone: X reports raw (~39321), Y stays deadzoned (0).
+            backend_update(0, GcPad { lx: 0.2, ly: 0.2, ..Default::default() }.to_xinput());
+            assert_eq!((dvt.acquire)(dev), DI_OK);
+            let mut js = std::mem::zeroed::<DIJOYSTATE>();
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert!((js.l_x - 39_321).abs() <= 4, "expected RAW X ~39321, got {}", js.l_x);
+            assert_eq!(js.l_y, 0, "expected COOKED Y inside deadzone to be 0, got {}", js.l_y);
+
+            // Setting Y by DIPH_BYID to RAW switches Y independently too.
+            let y_raw = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: y_id, dw_how: DIPH_BYID }, dw_data: DIPROPCALIBRATIONMODE_RAW };
+            assert_eq!((dvt.set_property)(dev, DIPROP_CALIBRATIONMODE as *const Guid, &y_raw.diph), DI_OK);
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert!((js.l_y - 26_214).abs() <= 4, "expected RAW Y ~26214, got {}", js.l_y);
+
+            // Set DIPROP_APPDATA on offset 0, then replace the data format with button 0 mapped to offset 0.
+            let buf_prop = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_DEVICE }, dw_data: 16 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_BUFFERSIZE as *const Guid, &buf_prop.diph), DI_OK);
+            let app_set = DIPROPPOINTER { diph: DIPROPHEADER { dw_size: 24, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET }, u_data: 0xDEAD_BEEF };
+            assert_eq!((dvt.set_property)(dev, DIPROP_APPDATA as *const Guid, &app_set.diph), DI_OK);
+
+            // Replacing data format must clear prior DIPROP_APPDATA mappings.
+            let objs = [DIOBJECTDATAFORMAT {
+                pguid: &GUID_BUTTON,
+                dw_ofs: 0,
+                dw_type: DIDFT_BUTTON | DIDFT_ANYINSTANCE,
+                dw_flags: 0,
+            }];
+            let df_btn = DIDATAFORMAT {
+                dw_size: 32,
+                dw_obj_size: 24,
+                dw_flags: 1,
+                dw_data_size: 4,
+                dw_num_objs: objs.len() as u32,
+                rgodf: objs.as_ptr(),
+            };
+            assert_eq!((dvt.set_data_format)(dev, &df_btn), DI_OK);
+
+            let mut app_q = DIPROPPOINTER { diph: DIPROPHEADER { dw_size: 24, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET }, u_data: 0x1234 };
+            assert_eq!((dvt.get_property)(dev, DIPROP_APPDATA as *const Guid, &mut app_q.diph), DI_OK);
+            assert_eq!(app_q.u_data, 0, "SetDataFormat must clear prior DIPROP_APPDATA associations");
+
+            // Buffered event on the newly mapped button at offset 0 must not inherit 0xDEAD_BEEF.
+            backend_update(0, GcPad::default().to_xinput());
+            assert_eq!((dvt.poll)(dev), DI_OK);
+            let mut dod = [DIDEVICEOBJECTDATA::default(); 8];
+            let mut n = 8u32;
+            assert_eq!((dvt.get_device_data)(dev, 24, dod.as_mut_ptr() as *mut c_void, &mut n, 0), DI_OK);
+
+            backend_update(0, GcPad { a: true, ..Default::default() }.to_xinput());
+            assert_eq!((dvt.poll)(dev), DI_OK);
+            n = 8;
+            assert_eq!((dvt.get_device_data)(dev, 24, dod.as_mut_ptr() as *mut c_void, &mut n, 0), DI_OK);
+            assert_eq!(n, 1);
+            assert_eq!(dod[0].dw_ofs, 0);
+            assert_eq!(dod[0].dw_data, 0x80);
+            assert_eq!(dod[0].u_app_data, 0, "stale DIPROP_APPDATA must not leak into new data format events");
 
             backend_disconnect(0);
             assert_eq!((dvt.release)(dev), 0);
