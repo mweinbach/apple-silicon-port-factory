@@ -437,7 +437,18 @@ pub(super) struct EllipsisInlineObjectInner {
     pub(super) height: f32,
 }
 
-pub(super) struct NumberSubstitutionInner;
+pub(super) const DWRITE_NUMBER_SUBSTITUTION_METHOD_FROM_CULTURE: u32 = 0;
+pub(super) const DWRITE_NUMBER_SUBSTITUTION_METHOD_CONTEXTUAL: u32 = 1;
+pub(super) const DWRITE_NUMBER_SUBSTITUTION_METHOD_NONE: u32 = 2;
+pub(super) const DWRITE_NUMBER_SUBSTITUTION_METHOD_NATIONAL: u32 = 3;
+pub(super) const DWRITE_NUMBER_SUBSTITUTION_METHOD_TRADITIONAL: u32 = 4;
+
+#[derive(Clone, Debug)]
+pub(super) struct NumberSubstitutionInner {
+    pub(super) method: u32,
+    pub(super) locale: String,
+    pub(super) ignore_user_override: bool,
+}
 
 // ============================================================================
 // IDWriteLocalizedStrings Vtable (9 slots)
@@ -1870,4 +1881,12 @@ pub(super) fn num_sub_vtbl() -> *const usize {
             com_release::<NumberSubstitutionInner> as *const () as usize,
         ]
     })
+}
+
+pub(super) unsafe fn number_substitution_from_ptr(p: *mut c_void) -> Option<NumberSubstitutionInner> {
+    if p.is_null() {
+        return None;
+    }
+    let obj = com_from_iface::<NumberSubstitutionInner>(p, num_sub_vtbl())?;
+    Some(obj.inner.clone())
 }

@@ -94,7 +94,6 @@ struct CFRunLoopSourceContext {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
-    static kCFRunLoopDefaultMode: *const c_void;
     static kCFRunLoopCommonModes: *const c_void;
     fn CFRelease(p: *const c_void);
     fn CFRetain(p: *const c_void) -> *const c_void;
@@ -1227,16 +1226,20 @@ impl RunLoopDispatcher {
             (*present_q).source.store(present_src as usize, Ordering::Release);
             (*update_q).source.store(update_src as usize, Ordering::Release);
 
-            CFRunLoopAddSource(rl, present_src, kCFRunLoopDefaultMode);
+            // Register BOTH presentation and update sources in common + modal-panel modes:
+            // - Running outside `_dispatch_main_q` keeps libdispatch unblocked during `runModal()`.
+            // - Registering `present_src` in modal mode as well allows callbacks from an active
+            //   TaskDialog (e.g. radio/verification notifications) to open nested TaskDialogs
+            //   immediately instead of deadlocking behind the outer modal loop.
+            CFRunLoopAddSource(rl, present_src, kCFRunLoopCommonModes);
             CFRunLoopAddSource(rl, update_src, kCFRunLoopCommonModes);
-            // Explicitly register in NSModalPanelRunLoopMode as well so updates fire
-            // inside `NSAlert::runModal()` even before AppKit adds modal mode to common modes.
             let modal_mode = CFStringCreateWithCString(
                 std::ptr::null(),
                 c"NSModalPanelRunLoopMode".as_ptr(),
                 0x0800_0100, // kCFStringEncodingUTF8
             );
             if !modal_mode.is_null() {
+                CFRunLoopAddSource(rl, present_src, modal_mode);
                 CFRunLoopAddSource(rl, update_src, modal_mode);
                 CFRelease(modal_mode);
             }
@@ -1295,13 +1298,14 @@ pub(super) fn schedule_task_dialog_update(f: impl FnOnce() + Send + 'static) {
 const NS_CONTROL_STATE_OFF: isize = 0;
 const NS_CONTROL_STATE_ON: isize = 1;
 
+#[derive(Clone)]
 enum TaskDialogEventSink {
     Channel(std::sync::mpsc::Sender<super::TaskDialogEvent>),
     Inline(*mut dyn FnMut(super::TaskDialogEvent)),
 }
 
 impl TaskDialogEventSink {
-    fn emit(&mut self, ev: super::TaskDialogEvent) {
+    fn emit(&self, ev: super::TaskDialogEvent) {
         match self {
             TaskDialogEventSink::Channel(tx) => {
                 let _ = tx.send(ev);
@@ -1316,17 +1320,24 @@ struct ActiveTaskDialogAlert {
     alert: Retained<NSAlert>,
     radio_buttons: Vec<Retained<NSButton>>,
     sink: TaskDialogEventSink,
+    /// Deferred programmatic dismissal received while a nested modal alert was on top.
+    deferred_click_button_idx: Option<usize>,
 }
 
 thread_local! {
-    static ACTIVE_TASK_DIALOG_ALERT: RefCell<Option<ActiveTaskDialogAlert>> = const { RefCell::new(None) };
+    static ACTIVE_TASK_DIALOG_ALERTS: RefCell<Vec<ActiveTaskDialogAlert>> = const { RefCell::new(Vec::new()) };
     static PENDING_TASK_DIALOG_UPDATES: RefCell<HashMap<u64, Vec<super::TaskDialogLiveUpdate>>> = RefCell::new(HashMap::new());
+}
+
+struct SessionIvar {
+    session_id: Cell<u64>,
 }
 
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "PortTaskDialogRadioTarget"]
+    #[ivars = SessionIvar]
     struct TaskDialogRadioTarget;
 
     impl TaskDialogRadioTarget {
@@ -1334,11 +1345,19 @@ define_class!(
         fn radio_selected(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
             if tag >= 0 {
-                ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
-                    if let Some(active) = slot.borrow_mut().as_mut() {
-                        active.sink.emit(super::TaskDialogEvent::RadioSelected(tag as usize));
-                    }
+                let sid = self.ivars().session_id.get();
+                // Extract sink and release RefCell borrow before invoking so nested
+                // modal dialogs opened from inline callbacks never double-borrow.
+                let sink = ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
+                    let s = stack.borrow();
+                    s.iter()
+                        .rev()
+                        .find(|a| sid == 0 || a.session_id == sid)
+                        .map(|a| a.sink.clone())
                 });
+                if let Some(sink) = sink {
+                    sink.emit(super::TaskDialogEvent::RadioSelected(tag as usize));
+                }
             }
         }
 
@@ -1346,18 +1365,25 @@ define_class!(
         fn verification_toggled(&self, sender: &AnyObject) {
             let st: isize = unsafe { msg_send![sender, state] };
             let checked = st == NS_CONTROL_STATE_ON;
-            ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
-                if let Some(active) = slot.borrow_mut().as_mut() {
-                    active.sink.emit(super::TaskDialogEvent::VerificationToggled(checked));
-                }
+            let sid = self.ivars().session_id.get();
+            let sink = ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
+                let s = stack.borrow();
+                s.iter()
+                    .rev()
+                    .find(|a| sid == 0 || a.session_id == sid)
+                    .map(|a| a.sink.clone())
             });
+            if let Some(sink) = sink {
+                sink.emit(super::TaskDialogEvent::VerificationToggled(checked));
+            }
         }
     }
 );
 
 impl TaskDialogRadioTarget {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        unsafe { msg_send![Self::alloc(mtm), init] }
+    fn new(mtm: MainThreadMarker, session_id: u64) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(SessionIvar { session_id: Cell::new(session_id) });
+        unsafe { msg_send![super(this), init] }
     }
 }
 
@@ -1390,21 +1416,30 @@ fn apply_live_update_to_alert(
 
 pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDialogLiveUpdate) {
     let mtm = mtm();
-    let applied = ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
-        let borrow = slot.borrow();
-        let Some(active) = borrow.as_ref() else {
-            return false;
+    let (applied, stop_code) = ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
+        let mut s = stack.borrow_mut();
+        let Some(pos) = s.iter().rposition(|a| a.session_id == session_id) else {
+            return (false, None);
         };
-        if active.session_id != session_id {
-            return false;
-        }
+        let is_top = pos + 1 == s.len();
+        let active = &mut s[pos];
         apply_live_update_to_alert(&active.alert, &active.radio_buttons, update);
-        if let Some(bidx) = update.click_button_idx {
-            let app = NSApplication::sharedApplication(mtm);
-            app.stopModalWithCode(1000 + bidx as isize);
-        }
-        true
+        let stop = if let Some(bidx) = update.click_button_idx {
+            if is_top {
+                Some(1000 + bidx as isize)
+            } else {
+                active.deferred_click_button_idx = Some(bidx);
+                None
+            }
+        } else {
+            None
+        };
+        (true, stop)
     });
+    if let Some(code) = stop_code {
+        let app = NSApplication::sharedApplication(mtm);
+        app.stopModalWithCode(code);
+    }
     if !applied && session_id != 0 {
         PENDING_TASK_DIALOG_UPDATES.with(|map| {
             let mut m = map.borrow_mut();
@@ -1446,7 +1481,7 @@ fn run_task_dialog_alert(
         }
     }
 
-    let target = TaskDialogRadioTarget::new(mtm);
+    let target = TaskDialogRadioTarget::new(mtm, session_id);
 
     if let Some(vtext) = verification_text {
         a.setShowsSuppressionButton(true);
@@ -1493,26 +1528,41 @@ fn run_task_dialog_alert(
         a.setAccessoryView(Some(&container));
     }
 
-    struct ActiveAlertGuard(u64);
+    struct ActiveAlertGuard {
+        session_id: u64,
+        mtm: MainThreadMarker,
+    }
     impl Drop for ActiveAlertGuard {
         fn drop(&mut self) {
-            ACTIVE_TASK_DIALOG_ALERT.with(|slot| *slot.borrow_mut() = None);
-            if self.0 != 0 {
+            let deferred_parent_stop = ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
+                let mut s = stack.borrow_mut();
+                if let Some(pos) = s.iter().rposition(|a| a.session_id == self.session_id) {
+                    s.remove(pos);
+                }
+                s.last_mut()
+                    .and_then(|parent| parent.deferred_click_button_idx.take())
+            });
+            if self.session_id != 0 {
                 PENDING_TASK_DIALOG_UPDATES.with(|map| {
-                    map.borrow_mut().remove(&self.0);
+                    map.borrow_mut().remove(&self.session_id);
                 });
+            }
+            if let Some(bidx) = deferred_parent_stop {
+                let app = NSApplication::sharedApplication(self.mtm);
+                app.stopModalWithCode(1000 + bidx as isize);
             }
         }
     }
-    ACTIVE_TASK_DIALOG_ALERT.with(|slot| {
-        *slot.borrow_mut() = Some(ActiveTaskDialogAlert {
+    ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
+        stack.borrow_mut().push(ActiveTaskDialogAlert {
             session_id,
             alert: a.clone(),
             radio_buttons: radio_buttons.clone(),
             sink,
+            deferred_click_button_idx: None,
         });
     });
-    let _active_guard = ActiveAlertGuard(session_id);
+    let _active_guard = ActiveAlertGuard { session_id, mtm };
 
     // Apply any live updates that arrived before `run_task_dialog_alert` began.
     let mut pre_clicked: Option<usize> = None;
@@ -1730,6 +1780,7 @@ mod tests {
 
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
+        static kCFRunLoopDefaultMode: *const c_void;
         fn CFRunLoopRunInMode(mode: *const c_void, secs: f64, ret_after_source: u8) -> i32;
         fn CFRunLoopStop(rl: *mut c_void);
         fn CFRunLoopRemoveSource(rl: *mut c_void, src: *mut c_void, mode: *const c_void);
@@ -1780,7 +1831,7 @@ mod tests {
                 let rl = disp.run_loop as *mut c_void;
                 let psrc = disp.present_src as *mut c_void;
                 let usrc = disp.update_src as *mut c_void;
-                CFRunLoopRemoveSource(rl, psrc, kCFRunLoopDefaultMode);
+                CFRunLoopRemoveSource(rl, psrc, kCFRunLoopCommonModes);
                 CFRunLoopRemoveSource(rl, usrc, kCFRunLoopCommonModes);
                 let modal_mode = CFStringCreateWithCString(
                     std::ptr::null(),
@@ -1788,6 +1839,7 @@ mod tests {
                     0x0800_0100,
                 );
                 if !modal_mode.is_null() {
+                    CFRunLoopRemoveSource(rl, psrc, modal_mode);
                     CFRunLoopRemoveSource(rl, usrc, modal_mode);
                     CFRelease(modal_mode);
                 }
@@ -1818,8 +1870,47 @@ mod tests {
             let _ = modal_exited_tx.send(update_ran_check.load(Ordering::Acquire));
         });
 
-        // Wait until the nested modal run-loop mode is active, then schedule a live update.
-        modal_entered_rx.recv_timeout(Duration::from_secs(2)).expect("modal entered");
+        // Wait until the outer modal run-loop mode is active, then verify a nested
+        // presentation runs live inside the outer modal loop AND is dismissed by a live update.
+        modal_entered_rx.recv_timeout(Duration::from_secs(2)).expect("outer modal entered");
+
+        let (nested_entered_tx, nested_entered_rx) = mpsc::channel::<()>();
+        let (nested_exited_tx, nested_exited_rx) = mpsc::channel::<bool>();
+        let nested_dismissed = Arc::new(AtomicBool::new(false));
+        let nested_dismissed_check = Arc::clone(&nested_dismissed);
+        disp.schedule_present(move || {
+            let _ = nested_entered_tx.send(());
+            unsafe {
+                let modal_mode = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    c"NSModalPanelRunLoopMode".as_ptr(),
+                    0x0800_0100,
+                );
+                assert!(!modal_mode.is_null());
+                CFRunLoopRunInMode(modal_mode, 3.0, 0);
+                CFRelease(modal_mode);
+            }
+            let _ = nested_exited_tx.send(nested_dismissed_check.load(Ordering::Acquire));
+        });
+
+        nested_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("nested modal must present inside outer NSModalPanelRunLoopMode");
+
+        let nested_dismissed_set = Arc::clone(&nested_dismissed);
+        disp.schedule_update(move || {
+            nested_dismissed_set.store(true, Ordering::Release);
+            unsafe {
+                CFRunLoopStop(CFRunLoopGetCurrent());
+            }
+        });
+        assert!(
+            nested_exited_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("nested modal exited"),
+            "nested modal must be dismissed by its live update while outer modal remains open"
+        );
+
         let t0 = Instant::now();
         let update_ran_set = Arc::clone(&update_ran);
         disp.schedule_update(move || {
@@ -1831,7 +1922,7 @@ mod tests {
 
         let saw_update_before_exit = modal_exited_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("modal exited via live update");
+            .expect("outer modal exited via live update");
         assert!(
             saw_update_before_exit,
             "live update must execute inside nested NSModalPanelRunLoopMode and stop it"

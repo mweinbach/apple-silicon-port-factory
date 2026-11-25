@@ -2333,3 +2333,162 @@ fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
         release_com(fac);
     }
 }
+
+#[test]
+fn text_analyzer_honors_number_substitution_for_localized_digits() {
+    use super::analysis::{ta_get_glyphs, PTextAnalyzer};
+    use super::font::{
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_CONTEXTUAL,
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_NATIONAL,
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_NONE,
+    };
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &G_IDWRITE_FACTORY as *const _ as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // Find a system font that has both ASCII '0'..'9' and Arabic-Indic '٠'..'٩' (U+0660..U+0669).
+        let sys = system_font_collection_data(false);
+        let font_meta = ["geeza pro", "arial", "times new roman", "damascus"]
+            .iter()
+            .find_map(|&fam_name| {
+                let idx = sys.find_family_index(fam_name)?;
+                sys.families[idx]
+                    .fonts
+                    .iter()
+                    .find(|m| {
+                        if m.file_path.is_none() {
+                            return false;
+                        }
+                        let fi = FontFaceInner::from_meta((*m).clone(), 0);
+                        fi.codepoint_to_glyph('1' as u32) != 0
+                            && fi.codepoint_to_glyph(0x0661) != 0
+                            && fi.codepoint_to_glyph('1' as u32) != fi.codepoint_to_glyph(0x0661)
+                    })
+                    .cloned()
+            })
+            .expect("expected a macOS system font with distinct Latin and Arabic-Indic digits");
+
+        let face_inner = FontFaceInner::from_meta(font_meta, 0);
+        let latin_123 = [
+            face_inner.codepoint_to_glyph('1' as u32),
+            face_inner.codepoint_to_glyph('2' as u32),
+            face_inner.codepoint_to_glyph('3' as u32),
+        ];
+        let arabic_123 = [
+            face_inner.codepoint_to_glyph(0x0661),
+            face_inner.codepoint_to_glyph(0x0662),
+            face_inner.codepoint_to_glyph(0x0663),
+        ];
+        assert_ne!(latin_123, arabic_123);
+        let face = new_font_face(face_inner);
+
+        let ar_sa = wide("ar-SA");
+        let mut ns_national: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_number_substitution(
+                fac as PFactory,
+                DWRITE_NUMBER_SUBSTITUTION_METHOD_NATIONAL,
+                ar_sa.as_ptr(),
+                TRUE,
+                &mut ns_national,
+            ),
+            S_OK
+        );
+        let mut ns_none: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_number_substitution(
+                fac as PFactory,
+                DWRITE_NUMBER_SUBSTITUTION_METHOD_NONE,
+                ar_sa.as_ptr(),
+                TRUE,
+                &mut ns_none,
+            ),
+            S_OK
+        );
+        let mut ns_ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_number_substitution(
+                fac as PFactory,
+                DWRITE_NUMBER_SUBSTITUTION_METHOD_CONTEXTUAL,
+                ar_sa.as_ptr(),
+                TRUE,
+                &mut ns_ctx,
+            ),
+            S_OK
+        );
+
+        let shape_with_ns = |text: &str, rtl: BOOL, ns: *mut c_void| -> (HRESULT, Vec<u16>) {
+            let u16s: Vec<u16> = text.encode_utf16().collect();
+            let mut cm = vec![0u16; u16s.len()];
+            let mut tp = vec![DWRITE_SHAPING_TEXT_PROPERTIES::default(); u16s.len()];
+            let mut gi = vec![0u16; u16s.len() * 2 + 4];
+            let mut gp = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); gi.len()];
+            let mut actual = 0u32;
+            let hr = ta_get_glyphs(
+                ta as PTextAnalyzer,
+                u16s.as_ptr(),
+                u16s.len() as u32,
+                face,
+                FALSE,
+                rtl,
+                std::ptr::null(),
+                std::ptr::null(),
+                ns,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gi.len() as u32,
+                cm.as_mut_ptr(),
+                tp.as_mut_ptr(),
+                gi.as_mut_ptr(),
+                gp.as_mut_ptr(),
+                &mut actual,
+            );
+            (hr, gi[..actual as usize].to_vec())
+        };
+
+        // 1. NATIONAL ar-SA converts ASCII "123" to Arabic-Indic glyphs.
+        let (hr_nat, g_nat) = shape_with_ns("123", FALSE, ns_national);
+        assert_eq!(hr_nat, S_OK);
+        assert_eq!(g_nat, arabic_123, "NATIONAL ar-SA must produce Arabic-Indic digit glyphs");
+
+        // 2. NONE ar-SA keeps nominal Latin digits.
+        let (hr_none, g_none) = shape_with_ns("123", FALSE, ns_none);
+        assert_eq!(hr_none, S_OK);
+        assert_eq!(g_none, latin_123, "NONE must keep nominal Latin digit glyphs");
+
+        // 3. CONTEXTUAL ar-SA: keeps Latin digits after Latin letters, substitutes after Arabic letters.
+        let (hr_ctx_ltr, g_ctx_ltr) = shape_with_ns("A123", FALSE, ns_ctx);
+        assert_eq!(hr_ctx_ltr, S_OK);
+        assert_eq!(&g_ctx_ltr[1..], &latin_123, "CONTEXTUAL after Latin must keep Latin digits");
+
+        let (hr_ctx_ar, g_ctx_ar) = shape_with_ns("\u{0633}123", TRUE, ns_ctx);
+        assert_eq!(hr_ctx_ar, S_OK);
+        assert!(
+            arabic_123.iter().all(|g| g_ctx_ar.contains(g)),
+            "CONTEXTUAL after Arabic must substitute Arabic-Indic digits: got={g_ctx_ar:?}, expected={arabic_123:?}"
+        );
+
+        // 4. Unrecognized/bogus non-null number_substitution pointer must fail instead of silently ignoring.
+        let mut fake_vtbl = [0usize; 3];
+        let mut fake_obj = fake_vtbl.as_mut_ptr();
+        let (hr_bad, _) = shape_with_ns("123", FALSE, &mut fake_obj as *mut _ as *mut c_void);
+        assert_eq!(hr_bad, E_INVALIDARG);
+
+        release_com(ns_ctx);
+        release_com(ns_none);
+        release_com(ns_national);
+        release_com(face);
+        release_com(ta);
+        release_com(fac);
+    }
+}

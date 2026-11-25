@@ -556,15 +556,31 @@ unsafe extern "win64" fn fac_create_text_analyzer(this: PFactory, out: *mut *mut
 }
 unsafe extern "win64" fn fac_create_number_substitution(
     this: PFactory,
-    _method: u32,
-    _locale: *const u16,
-    _ignore_override: BOOL,
+    method: u32,
+    locale: *const u16,
+    ignore_override: BOOL,
     out: *mut *mut c_void,
 ) -> HRESULT {
+    write_null_out(out);
     if this.is_null() || out.is_null() {
         return E_POINTER;
     }
-    let obj = ComObj::new(num_sub_vtbl(), NumberSubstitutionInner);
+    if method > font::DWRITE_NUMBER_SUBSTITUTION_METHOD_TRADITIONAL {
+        return E_INVALIDARG;
+    }
+    let locale_str = if locale.is_null() {
+        String::new()
+    } else {
+        read_wide_z(locale, DW_MAX_STR)
+    };
+    let obj = ComObj::new(
+        num_sub_vtbl(),
+        NumberSubstitutionInner {
+            method,
+            locale: locale_str,
+            ignore_user_override: ignore_override != FALSE,
+        },
+    );
     out.write_unaligned(obj as *mut c_void);
     S_OK
 }

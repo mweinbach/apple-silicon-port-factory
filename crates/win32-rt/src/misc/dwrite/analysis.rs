@@ -873,6 +873,104 @@ unsafe extern "win64" fn ta_analyze_line_breakpoints(
     ) as HRESULT
 }
 
+/// Determine the localized Unicode zero-digit codepoint (`'0'` base) for a Windows
+/// BCP-47 locale under `DWRITE_NUMBER_SUBSTITUTION_METHOD`.
+fn locale_digit_base(locale: &str, traditional: bool) -> Option<u16> {
+    let norm = locale.trim().to_ascii_lowercase().replace('_', "-");
+    let mut parts = norm.split('-').filter(|s| !s.is_empty());
+    let lang = parts.next().unwrap_or("");
+    let sub1 = parts.next().unwrap_or("");
+    let sub2 = parts.next().unwrap_or("");
+    let is_maghreb = matches!(sub1, "ma" | "dz" | "tn" | "ly")
+        || matches!(sub2, "ma" | "dz" | "tn" | "ly");
+    match lang {
+        "ar" => {
+            if is_maghreb && !traditional {
+                None
+            } else {
+                Some(0x0660) // Arabic-Indic digits ٠..٩
+            }
+        }
+        "fa" | "ur" | "ps" | "sd" | "ks" | "ckb" => Some(0x06F0), // Extended Arabic-Indic ۰..۹
+        "hi" | "mr" | "sa" | "ne" | "kok" => Some(0x0966),        // Devanagari
+        "bn" | "as" => Some(0x09E6),                              // Bengali
+        "pa" => Some(0x0A66),                                     // Gurmukhi
+        "gu" => Some(0x0AE6),                                     // Gujarati
+        "or" => Some(0x0B66),                                     // Oriya
+        "ta" => Some(0x0BE6),                                     // Tamil
+        "te" => Some(0x0C66),                                     // Telugu
+        "kn" => Some(0x0CE6),                                     // Kannada
+        "ml" => Some(0x0D66),                                     // Malayalam
+        "th" => Some(0x0E50),                                     // Thai
+        "lo" => Some(0x0ED0),                                     // Lao
+        "bo" | "dz" => Some(0x0F20),                              // Tibetan
+        "my" => Some(0x1040),                                     // Myanmar
+        "km" => Some(0x17E0),                                     // Khmer
+        "mn" => Some(0x1810),                                     // Mongolian
+        _ => None,
+    }
+}
+
+/// Apply `IDWriteNumberSubstitution` digit substitution to `units` before shaping.
+fn apply_number_substitution(
+    units: &mut [u16],
+    ns: &super::font::NumberSubstitutionInner,
+    is_rtl: bool,
+) {
+    use super::font::{
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_CONTEXTUAL,
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_FROM_CULTURE,
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_NATIONAL,
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_NONE,
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_TRADITIONAL,
+    };
+    let _ = ns.ignore_user_override;
+    if ns.method == DWRITE_NUMBER_SUBSTITUTION_METHOD_NONE {
+        return;
+    }
+    let traditional = ns.method == DWRITE_NUMBER_SUBSTITUTION_METHOD_TRADITIONAL;
+    let Some(base) = locale_digit_base(&ns.locale, traditional) else {
+        return;
+    };
+    match ns.method {
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_NATIONAL
+        | DWRITE_NUMBER_SUBSTITUTION_METHOD_TRADITIONAL => {
+            for u in units.iter_mut() {
+                if (0x0030..=0x0039).contains(u) {
+                    *u = base + (*u - 0x0030);
+                }
+            }
+        }
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_CONTEXTUAL
+        | DWRITE_NUMBER_SUBSTITUTION_METHOD_FROM_CULTURE => {
+            let is_arabic_script_digits = matches!(base, 0x0660 | 0x06F0);
+            if ns.method == DWRITE_NUMBER_SUBSTITUTION_METHOD_FROM_CULTURE
+                && !is_arabic_script_digits
+            {
+                return;
+            }
+            let mut active_ctx = is_rtl && is_arabic_script_digits;
+            let mut i = 0usize;
+            while i < units.len() {
+                let (ch, step) = decode_u16_at(units, i);
+                if step == 1 && (0x0030..=0x0039).contains(&units[i]) {
+                    if active_ctx {
+                        units[i] = base + (units[i] - 0x0030);
+                    }
+                } else {
+                    match classify_bidi(ch) {
+                        BidiClass::AL => active_ctx = is_arabic_script_digits,
+                        BidiClass::L | BidiClass::R => active_ctx = false,
+                        _ => {}
+                    }
+                }
+                i += step;
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "win64" fn ta_get_glyphs(
     this: PTextAnalyzer,
@@ -883,7 +981,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     is_rtl: BOOL,
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     _locale_name: *const u16,
-    _number_substitution: *mut c_void,
+    number_substitution: *mut c_void,
     features: *const *const c_void,
     feature_range_lengths: *const u32,
     feature_ranges: u32,
@@ -909,9 +1007,27 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     let Some(face) = font_face_from_ptr(font_face) else {
         return E_INVALIDARG;
     };
+    let num_sub = if number_substitution.is_null() {
+        None
+    } else {
+        match super::font::number_substitution_from_ptr(number_substitution) {
+            Some(ns) => Some(ns),
+            None => {
+                log::warn!(
+                    "dwrite: IDWriteTextAnalyzer::GetGlyphs received unrecognized IDWriteNumberSubstitution pointer {:p}",
+                    number_substitution
+                );
+                actual_glyph_count.write_unaligned(0);
+                return E_INVALIDARG;
+            }
+        }
+    };
     let mut units = Vec::with_capacity(text_len as usize);
     for i in 0..text_len as usize {
         units.push(text_string.add(i).read_unaligned());
+    }
+    if let Some(ref ns) = num_sub {
+        apply_number_substitution(&mut units, ns, is_rtl != 0);
     }
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
     let feat_ranges = super::shaping::read_feature_ranges(
