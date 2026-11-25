@@ -664,12 +664,12 @@ fn dpad_to_switch(buttons: u32) -> u32 {
 fn snapshot_keyboard() -> Vec<GameInputKeyState> {
     let shift = crate::user32::input::shift_down();
     let caps = crate::user32::input::caps_on();
-    let lshift = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_LSHIFT as i32) < 0 };
-    let rshift = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_RSHIFT as i32) < 0 };
-    let lctrl = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_LCONTROL as i32) < 0 };
-    let rctrl = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_RCONTROL as i32) < 0 };
-    let lalt = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_LMENU as i32) < 0 };
-    let ralt = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_RMENU as i32) < 0 };
+    let lshift = crate::user32::input::async_down(keymap::VK_LSHIFT);
+    let rshift = crate::user32::input::async_down(keymap::VK_RSHIFT);
+    let lctrl = crate::user32::input::async_down(keymap::VK_LCONTROL);
+    let rctrl = crate::user32::input::async_down(keymap::VK_RCONTROL);
+    let lalt = crate::user32::input::async_down(keymap::VK_LMENU);
+    let ralt = crate::user32::input::async_down(keymap::VK_RMENU);
 
     let mut keys = Vec::new();
     for vk in 0x08u8..=0xFEu8 {
@@ -686,7 +686,7 @@ fn snapshot_keyboard() -> Vec<GameInputKeyState> {
             keymap::VK_RCONTROL => rctrl,
             keymap::VK_LMENU => lalt,
             keymap::VK_RMENU => ralt,
-            _ => unsafe { crate::user32::input::GetAsyncKeyState(vk as i32) < 0 },
+            _ => crate::user32::input::async_down(vk),
         };
         if !down {
             continue;
@@ -706,22 +706,20 @@ fn snapshot_keyboard() -> Vec<GameInputKeyState> {
 
 fn snapshot_mouse() -> GameInputMouseState {
     let mut buttons = GAME_INPUT_MOUSE_NONE;
-    unsafe {
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_LBUTTON as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_LEFT_BUTTON;
-        }
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_RBUTTON as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_RIGHT_BUTTON;
-        }
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_MBUTTON as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_MIDDLE_BUTTON;
-        }
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_XBUTTON1 as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_BUTTON_4;
-        }
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_XBUTTON2 as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_BUTTON_5;
-        }
+    if crate::user32::input::async_down(keymap::VK_LBUTTON) {
+        buttons |= GAME_INPUT_MOUSE_LEFT_BUTTON;
+    }
+    if crate::user32::input::async_down(keymap::VK_RBUTTON) {
+        buttons |= GAME_INPUT_MOUSE_RIGHT_BUTTON;
+    }
+    if crate::user32::input::async_down(keymap::VK_MBUTTON) {
+        buttons |= GAME_INPUT_MOUSE_MIDDLE_BUTTON;
+    }
+    if crate::user32::input::async_down(keymap::VK_XBUTTON1) {
+        buttons |= GAME_INPUT_MOUSE_BUTTON_4;
+    }
+    if crate::user32::input::async_down(keymap::VK_XBUTTON2) {
+        buttons |= GAME_INPUT_MOUSE_BUTTON_5;
     }
     let pt = crate::user32::cursor::cursor_pos();
     GameInputMouseState {
@@ -3235,7 +3233,10 @@ mod tests {
             assert_eq!(rd_release(out), 0);
 
             // Keyboard transition via user32::input -> exact GetCurrentTimestamp() -> GetTemporalReading(),
-            // while historical lookup at t0 (before keypress) still resolves the initial baseline.
+            // while historical lookup at t0 (before keypress) still resolves the initial baseline,
+            // and GetAsyncKeyState's pressed-since bit (bit 0) is NOT consumed by GameInput snapshots.
+            let _ = crate::user32::input::GetAsyncKeyState(b'A' as i32);
+            let _ = crate::user32::input::GetAsyncKeyState(keymap::VK_LBUTTON as i32);
             crate::user32::input::native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
             let tk = gi_get_current_timestamp(gi);
             assert_eq!(gi_get_temporal_reading(gi, tk, kdev, &mut out), S_OK);
@@ -3253,7 +3254,28 @@ mod tests {
                 "keyboard baseline at t0 must reflect pre-press state"
             );
             assert_eq!(rd_release(out), 0);
+            let async_a = crate::user32::input::GetAsyncKeyState(b'A' as i32);
+            assert!(async_a < 0 && (async_a & 1) != 0, "GameInput snapshot must not consume GetAsyncKeyState pressed-since bit for keyboard");
             crate::user32::input::native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+
+            crate::user32::input::native_mouse(NativeMouse::Button {
+                hwnd: 0,
+                client: None,
+                screen: POINT { x: 100, y: 100 },
+                button: MouseButton::Left,
+                down: true,
+                clicks: 1,
+            });
+            let async_lbtn = crate::user32::input::GetAsyncKeyState(keymap::VK_LBUTTON as i32);
+            assert!(async_lbtn < 0 && (async_lbtn & 1) != 0, "GameInput snapshot must not consume GetAsyncKeyState pressed-since bit for mouse");
+            crate::user32::input::native_mouse(NativeMouse::Button {
+                hwnd: 0,
+                client: None,
+                screen: POINT { x: 100, y: 100 },
+                button: MouseButton::Left,
+                down: false,
+                clicks: 1,
+            });
 
             assert_eq!(gi_release(gi), 0);
         }

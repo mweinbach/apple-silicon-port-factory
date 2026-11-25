@@ -372,7 +372,8 @@ static SYNC: Mutex<[u8; 256]> = Mutex::new([0; 256]);
 /// Set when the async state changed since GetAsyncKeyState last looked (bit 0).
 static PRESSED_SINCE: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
 
-fn async_down(vk: u8) -> bool {
+/// Non-consuming read of the live async key-down state (does not clear `PRESSED_SINCE`).
+pub(crate) fn async_down(vk: u8) -> bool {
     ASYNC[vk as usize].load(Ordering::Relaxed) & 0x80 != 0
 }
 
