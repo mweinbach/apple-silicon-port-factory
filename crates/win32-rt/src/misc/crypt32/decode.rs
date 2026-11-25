@@ -1103,7 +1103,7 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
             Ok(arena)
         }
         PKCS_ATTRIBUTES => {
-            if root.tag != 0x30 && root.tag != 0x31 && root.tag != 0xA0 {
+            if root.tag != 0x30 && root.tag != 0x31 && root.tag != 0xA0 && root.tag != 0xA1 {
                 return Err(CRYPT_E_ASN1_BADTAG);
             }
             let kids = der_item_children(root.val).ok_or(CRYPT_E_ASN1_BADTAG)?;

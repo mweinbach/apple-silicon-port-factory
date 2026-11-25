@@ -1818,9 +1818,34 @@ fn parse_ctl_entries(ctl_der: &[u8]) -> Option<Vec<CtlMemberEntry<'_>>> {
     Some(entries)
 }
 
-fn ctl_subject_id_matches_tag(subject_id: &[u8], tag: &str) -> bool {
-    // Windows catalogs typically encode subjectIdentifier as UTF-16LE (with or without NUL)
-    // or ASCII/UTF-8 hex string. Match case-insensitively.
+fn decode_hex_tag(tag: &str) -> Option<Vec<u8>> {
+    let s = tag.trim();
+    if s.is_empty() || s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+fn ctl_subject_id_matches_tag(subject_id: &[u8], digests: &[(Digest, &[u8])], tag: &str) -> bool {
+    // Windows catalogs encode subjectIdentifier as:
+    // 1) UTF-16LE text tag (with or without NUL),
+    // 2) ASCII/UTF-8 text tag, or
+    // 3) raw binary digest bytes (e.g. 20-byte SHA-1 / 32-byte SHA-256) referenced by a hex
+    //    `pcwszMemberTag` string (or matching an SPC_INDIRECT_DATA member digest).
+    if let Some(hex_bytes) = decode_hex_tag(tag) {
+        if subject_id == hex_bytes.as_slice()
+            || digests.iter().any(|&(_, d)| d == hex_bytes.as_slice())
+        {
+            return true;
+        }
+    }
     if subject_id.len() >= 2 && subject_id.len() % 2 == 0 {
         let mut u16s: Vec<u16> = subject_id
             .chunks_exact(2)
@@ -1858,7 +1883,7 @@ fn verify_ctl_membership(
     let mut matched_tag = false;
     for entry in &entries {
         if let Some(tag) = member_tag {
-            if !ctl_subject_id_matches_tag(entry.subject_id, tag) {
+            if !ctl_subject_id_matches_tag(entry.subject_id, &entry.digests, tag) {
                 continue;
             }
             matched_tag = true;
@@ -2795,6 +2820,27 @@ mod tests {
 
             crate::misc::crypt32::CertFreeCertificateContext(cert);
             crate::misc::crypt32::CertCloseStore(st, 0);
+
+            // Binary 20-byte SHA-1 subjectIdentifier matches uppercase/lowercase hex member tag
+            let bin_sha1: [u8; 20] = [
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x10, 0x20,
+                0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0,
+            ];
+            assert!(ctl_subject_id_matches_tag(
+                &bin_sha1,
+                &[],
+                "0123456789ABCDEF102030405060708090A0B0C0"
+            ));
+            assert!(ctl_subject_id_matches_tag(
+                &bin_sha1,
+                &[],
+                "0123456789abcdef102030405060708090a0b0c0"
+            ));
+            assert!(!ctl_subject_id_matches_tag(
+                &bin_sha1,
+                &[],
+                "FF23456789ABCDEF102030405060708090A0B0C0"
+            ));
 
             // Invalid union choice returns TRUST_E_SUBJECT_FORM_UNKNOWN
             std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, 99);

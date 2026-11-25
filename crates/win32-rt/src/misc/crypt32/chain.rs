@@ -831,10 +831,40 @@ fn parse_basic_constraints(der: &[u8]) -> Option<(bool, Option<u32>)> {
     Some((is_ca, path_len))
 }
 
+/// Returns `true` if `parts` carries `NameConstraints` (`2.5.29.30`) or any critical extension
+/// not enforced by the manual signature-walking fallback, per RFC 5280 §4.2 & §4.2.1.10.
+fn cert_has_unhandled_constraints(parts: &CertDerParts<'_>) -> bool {
+    const OID_SKI: &[u8] = &[0x55, 0x1D, 0x0E];
+    const OID_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x0F];
+    const OID_SAN: &[u8] = &[0x55, 0x1D, 0x11];
+    const OID_BC: &[u8] = &[0x55, 0x1D, 0x13];
+    const OID_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1D, 0x1E];
+    const OID_AKI: &[u8] = &[0x55, 0x1D, 0x23];
+    const OID_EKU: &[u8] = &[0x55, 0x1D, 0x25];
+
+    for &(oid, is_critical, _) in &parts.extensions {
+        if oid == OID_NAME_CONSTRAINTS {
+            return true;
+        }
+        if is_critical
+            && !matches!(
+                oid,
+                OID_BC | OID_KEY_USAGE | OID_EKU | OID_SKI | OID_AKI | OID_SAN
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Enforce RFC 5280 CA constraints on an intermediate certificate acting as an issuer:
 /// - `BasicConstraints` (`2.5.29.19`) MUST be present with `cA = TRUE`.
 /// - If `pathLenConstraint` is present, `intermediates_below` must be `<= path_len`.
 /// - If `KeyUsage` (`2.5.29.15`) is present, bit 5 (`keyCertSign`, mask `0x04` in byte 0) MUST be set.
+/// - Per RFC 5280 §4.2 & §4.2.1.10, reject any intermediate carrying `NameConstraints` (`2.5.29.30`)
+///   or any unsupported critical extension so the fallback path validator never overrides a
+///   name-constraint or critical-extension failure from WebPKI / SecTrust.
 /// - If `required_eku` is specified and the intermediate carries a non-empty EKU extension,
 ///   it must permit `required_eku` or `anyExtendedKeyUsage`.
 pub(super) fn intermediate_is_valid_ca(
@@ -856,16 +886,20 @@ pub(super) fn intermediate_is_valid_ca(
             return false;
         }
     }
-    if let Some(parts) = parse_cert_der_parts(der) {
-        if let Some((_, _, val)) = parts.extensions.iter().find(|(oid, _, _)| *oid == OID_KEY_USAGE) {
-            if let Some((bs, _)) = parse_der_item(val) {
-                // KeyUsage BIT STRING: byte 0 = unused_bits, byte 1 = bits 0..7 (bit 5 = keyCertSign = 0x04)
-                if bs.tag != 0x03 || bs.val.len() < 2 || (bs.val[1] & 0x04) == 0 {
-                    return false;
-                }
-            } else {
+    let Some(parts) = parse_cert_der_parts(der) else {
+        return false;
+    };
+    if cert_has_unhandled_constraints(&parts) {
+        return false;
+    }
+    if let Some((_, _, val)) = parts.extensions.iter().find(|(oid, _, _)| *oid == OID_KEY_USAGE) {
+        if let Some((bs, _)) = parse_der_item(val) {
+            // KeyUsage BIT STRING: byte 0 = unused_bits, byte 1 = bits 0..7 (bit 5 = keyCertSign = 0x04)
+            if bs.tag != 0x03 || bs.val.len() < 2 || (bs.val[1] & 0x04) == 0 {
                 return false;
             }
+        } else {
+            return false;
         }
     }
     if let Some(req_eku) = required_eku {
@@ -903,6 +937,10 @@ fn verify_chain_to_root_with_eku(
     let mut root_parts: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
     let push_root_der = |dst: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>, der: &[u8]| {
         if let Some(p) = parse_cert_der_parts(der) {
+            // Do not bypass NameConstraints or unknown critical extensions on trust anchors.
+            if cert_has_unhandled_constraints(&p) {
+                return;
+            }
             dst.push((
                 p.subject_inner.to_vec(),
                 p.spki_inner.to_vec(),
@@ -923,6 +961,9 @@ fn verify_chain_to_root_with_eku(
             push_root_der(&mut root_parts, der);
         }
         for ta in webpki_roots::TLS_SERVER_ROOTS {
+            if ta.name_constraints.is_some() {
+                continue;
+            }
             if let Ok(kids) = der_item_children(ta.subject_public_key_info.as_ref()).ok_or(()) {
                 if kids.len() >= 2
                     && kids[0].tag == 0x30
@@ -948,6 +989,10 @@ fn verify_chain_to_root_with_eku(
         .map(|d| parse_cert_der_parts(d))
         .collect();
     let mut cur = parsed[0].as_ref()?;
+    // Per RFC 5280 §4.2, do not bypass unknown critical extensions on the leaf certificate.
+    if cert_has_unhandled_constraints(cur) {
+        return None;
+    }
     let mut issuing_ca_spki: Option<Vec<u8>> = None;
 
     // Walk up to 16 chain links looking for a trusted root.
@@ -1005,7 +1050,7 @@ fn verify_chain_to_root_with_eku(
     None
 }
 
-fn verify_chain_signatures_to_roots(
+pub(super) fn verify_chain_signatures_to_roots(
     chain_der: &[Vec<u8>],
     exclusive_roots_der: Option<&[Vec<u8>]>,
     extra_roots_der: &[Vec<u8>],

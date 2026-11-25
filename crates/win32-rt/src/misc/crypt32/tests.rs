@@ -2347,6 +2347,34 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
         assert_eq!(u32::from_le_bytes(capi_blob[8..12].try_into().unwrap()), 0x3141_5352);
         crate::kernel32::memory::LocalFree(spki_out);
 
+        // PKCS_ATTRIBUTES accepts implicit unsigned-attributes tag 0xA1
+        let unauth_attr_item = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x06]), // countersignature
+                encode_der_tlv(0x31, &encode_der_tlv(0x04, &[0xAA, 0xBB])),
+            ]
+            .concat(),
+        );
+        let unauth_attrs_a1 = encode_der_tlv(0xA1, &unauth_attr_item);
+        let mut unauth_out: *mut u8 = std::ptr::null_mut();
+        let mut unauth_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                super::decode::PKCS_ATTRIBUTES as *const u8,
+                unauth_attrs_a1.as_ptr(),
+                unauth_attrs_a1.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut unauth_out as *mut _ as *mut c_void,
+                &mut unauth_len,
+            ),
+            TRUE
+        );
+        assert_eq!(std::ptr::read_unaligned(unauth_out as *const u32), 1);
+        crate::kernel32::memory::LocalFree(unauth_out as *mut c_void);
+
         // Unknown struct type -> ERROR_FILE_NOT_FOUND
         let mut dummy_len = 0u32;
         assert_eq!(
@@ -2980,6 +3008,71 @@ fn macos_trust_store_and_extended_chain_policies() {
         assert_eq!(CryptMsgGetParam(ctl_msg, 12, 0, ee_der.as_mut_ptr() as *mut c_void, &mut ee_len), TRUE);
         assert!(!super::chain::intermediate_is_valid_ca(&ee_der, 0, None));
         assert_eq!(CryptMsgClose(ctl_msg), TRUE);
+
+        // Intermediate CA with NameConstraints (2.5.29.30) MUST be rejected by fallback validator
+        // so WebPKI / SecTrust name-constraint failures are never overridden.
+        let alg = encode_der_tlv(
+            0x30,
+            &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B, 0x05, 0x00],
+        );
+        let dn = encode_der_tlv(
+            0x30,
+            &encode_der_tlv(
+                0x31,
+                &encode_der_tlv(0x30, &[0x06, 0x03, 0x55, 0x04, 0x03, 0x0C, 0x02, b'N', b'C']),
+            ),
+        );
+        let validity = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x17, b"200101000000Z"),
+                encode_der_tlv(0x17, b"400101000000Z"),
+            ]
+            .concat(),
+        );
+        let spki = encode_der_tlv(0x30, &[alg.clone(), encode_der_tlv(0x03, &[0x00, 0x01])].concat());
+        let bc_ext = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x55, 0x1D, 0x13]),
+                encode_der_tlv(0x01, &[0xFF]),
+                encode_der_tlv(0x04, &encode_der_tlv(0x30, &encode_der_tlv(0x01, &[0xFF]))),
+            ]
+            .concat(),
+        );
+        let nc_ext = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x55, 0x1D, 0x1E]), // NameConstraints 2.5.29.30
+                encode_der_tlv(0x01, &[0xFF]),
+                encode_der_tlv(0x04, &encode_der_tlv(0x30, &[])),
+            ]
+            .concat(),
+        );
+        let nc_tbs = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0xA0, &encode_der_tlv(0x02, &[0x02])),
+                encode_der_tlv(0x02, &[0x01]),
+                alg.clone(),
+                dn.clone(),
+                validity,
+                dn,
+                spki,
+                encode_der_tlv(0xA3, &encode_der_tlv(0x30, &[bc_ext, nc_ext].concat())),
+            ]
+            .concat(),
+        );
+        let nc_ca_cert = encode_der_tlv(
+            0x30,
+            &[nc_tbs, alg, encode_der_tlv(0x03, &[0x00, 0x01])].concat(),
+        );
+        assert!(!super::chain::intermediate_is_valid_ca(&nc_ca_cert, 0, None));
+        assert!(!super::chain::verify_chain_signatures_to_roots(
+            std::slice::from_ref(&nc_ca_cert),
+            Some(std::slice::from_ref(&nc_ca_cert)),
+            &[],
+        ));
 
         // Trusted non-Microsoft root MUST still fail MICROSOFT_ROOT (checked by SPKI key, not name)
         assert_eq!(
