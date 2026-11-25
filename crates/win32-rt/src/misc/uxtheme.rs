@@ -243,8 +243,155 @@ const TDN_RADIO_BUTTON_CLICKED: u32 = 6;
 const TDN_DIALOG_CONSTRUCTED: u32 = 7;
 const TDN_VERIFICATION_CLICKED: u32 = 8;
 
+const TDM_CLICK_BUTTON: u32 = crate::user32::wm::USER + 102;
+const TDM_SET_ELEMENT_TEXT: u32 = crate::user32::wm::USER + 108;
+const TDM_CLICK_RADIO_BUTTON: u32 = crate::user32::wm::USER + 110;
+const TDM_CLICK_VERIFICATION: u32 = crate::user32::wm::USER + 113;
+const TDM_UPDATE_ELEMENT_TEXT: u32 = crate::user32::wm::USER + 114;
+
+const TDE_CONTENT: usize = 0;
+const TDE_EXPANDED_INFORMATION: usize = 1;
+const TDE_FOOTER: usize = 2;
+const TDE_MAIN_INSTRUCTION: usize = 3;
+
 const S_FALSE_HR: HRESULT = 1;
 const HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION: HRESULT = 0x8007_05B3u32 as i32;
+
+struct ActiveTaskDialog {
+    hinst: usize,
+    caption: String,
+    main_inst: String,
+    content: String,
+    expanded: String,
+    footer: String,
+    radios: Vec<(i32, String)>,
+    selected_radio_idx: Option<usize>,
+    has_verification: bool,
+    verified: bool,
+    pending_click_button: Option<i32>,
+}
+
+impl ActiveTaskDialog {
+    fn compose_body(&self) -> String {
+        let mut body_parts: Vec<&str> = Vec::new();
+        for part in [&self.main_inst, &self.content, &self.expanded, &self.footer] {
+            if !part.is_empty() {
+                body_parts.push(part.as_str());
+            }
+        }
+        body_parts.join("\n\n")
+    }
+}
+
+fn active_task_dialogs() -> &'static Mutex<HashMap<usize, ActiveTaskDialog>> {
+    static T: OnceLock<Mutex<HashMap<usize, ActiveTaskDialog>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn task_dialog_wndproc_va() -> usize {
+    crate::user32::register_typed_host_wndproc(task_dialog_wndproc)
+}
+
+unsafe extern "win64" fn task_dialog_wndproc(
+    hwnd: HWND,
+    u_msg: u32,
+    w_param: usize,
+    l_param: isize,
+) -> isize {
+    let h = hwnd as usize;
+    match u_msg {
+        crate::user32::wm::SETTEXT => {
+            let res = crate::user32::defproc::DefWindowProcW(hwnd, u_msg, w_param, l_param);
+            let new_title = if l_param == 0 {
+                String::new()
+            } else {
+                crate::strings::from_wide(l_param as LPCWSTR)
+            };
+            if let Some(dlg) = active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&h)
+            {
+                dlg.caption = new_title;
+            }
+            res
+        }
+        TDM_SET_ELEMENT_TEXT | TDM_UPDATE_ELEMENT_TEXT => {
+            let hinst = active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&h)
+                .map(|d| d.hinst as HINSTANCE)
+                .unwrap_or(std::ptr::null_mut());
+            let new_text = resolve_task_dialog_str(hinst, l_param as LPCWSTR);
+            if let Some(dlg) = active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&h)
+            {
+                match w_param {
+                    TDE_CONTENT => dlg.content = new_text,
+                    TDE_EXPANDED_INFORMATION => dlg.expanded = new_text,
+                    TDE_FOOTER => dlg.footer = new_text,
+                    TDE_MAIN_INSTRUCTION => dlg.main_inst = new_text,
+                    _ => {}
+                }
+            }
+            0
+        }
+        TDM_CLICK_BUTTON => {
+            if let Some(dlg) = active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&h)
+            {
+                dlg.pending_click_button = Some(w_param as i32);
+            }
+            0
+        }
+        TDM_CLICK_RADIO_BUTTON => {
+            if let Some(dlg) = active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&h)
+            {
+                if let Some(idx) = dlg.radios.iter().position(|(id, _)| *id == w_param as i32) {
+                    dlg.selected_radio_idx = Some(idx);
+                }
+            }
+            0
+        }
+        TDM_CLICK_VERIFICATION => {
+            if let Some(dlg) = active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&h)
+            {
+                if dlg.has_verification {
+                    dlg.verified = w_param != 0;
+                }
+            }
+            0
+        }
+        _ => crate::user32::defproc::DefWindowProcW(hwnd, u_msg, w_param, l_param),
+    }
+}
+
+struct TaskDialogHwndGuard {
+    hwnd: usize,
+}
+
+impl Drop for TaskDialogHwndGuard {
+    fn drop(&mut self) {
+        active_task_dialogs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.hwnd);
+        unsafe {
+            let _ = crate::user32::window::DestroyWindow(self.hwnd as HWND);
+        }
+    }
+}
 
 unsafe fn resolve_task_dialog_str(hinst: HINSTANCE, ptr: LPCWSTR) -> String {
     if ptr.is_null() {
@@ -354,7 +501,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         let label = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, rb.button_text));
         radios.push((rid, if label.is_empty() { format!("Option {rid}") } else { label }));
     }
-    let mut selected_radio_idx: Option<usize> =
+    let selected_radio_idx: Option<usize> =
         if !radios.is_empty() && (cfg.dw_flags & TDF_NO_DEFAULT_RADIO_BUTTON) == 0 {
             if cfg.n_default_radio_button != 0 {
                 radios
@@ -373,7 +520,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     } else {
         None
     };
-    let mut verified: bool =
+    let verified: bool =
         verification_text.is_some() && (cfg.dw_flags & TDF_VERIFICATION_FLAG_CHECKED) != 0;
 
     // TD_ERROR_ICON == MAKEINTRESOURCEW(-2) == 0xFFFE.
@@ -383,13 +530,6 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     } else {
         title
     };
-    let mut body_parts: Vec<&str> = Vec::new();
-    for part in [&main_inst, &content, &expanded, &footer] {
-        if !part.is_empty() {
-            body_parts.push(part.as_str());
-        }
-    }
-    let body = body_parts.join("\n\n");
     let labels: Vec<String> = buttons.iter().map(|(_, l)| l.clone()).collect();
     let default_button_idx: Option<usize> = if cfg.n_default_button != 0 {
         buttons.iter().position(|(id, _)| *id == cfg.n_default_button)
@@ -399,11 +539,41 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     let radio_labels: Vec<String> = radios.iter().map(|(_, l)| l.clone()).collect();
     let has_selection_controls = !radios.is_empty() || verification_text.is_some();
 
+    // Allocate a dialog-owned Win32 HWND (distinct from cfg.hwnd_parent, non-NULL even for
+    // unparented dialogs) so callbacks using SetWindowText, SetWindowSubclass, or TDM_*
+    // messages operate on the TaskDialog window rather than mutating the parent window.
+    let dialog_hwnd = crate::user32::window::create_virtual_dialog_hwnd(
+        "#32770_TaskDialog",
+        &caption,
+        cfg.hwnd_parent as usize,
+        task_dialog_wndproc_va(),
+    );
+    active_task_dialogs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            dialog_hwnd,
+            ActiveTaskDialog {
+                hinst: hinst as usize,
+                caption,
+                main_inst,
+                content,
+                expanded,
+                footer,
+                radios: radios.clone(),
+                selected_radio_idx,
+                has_verification: verification_text.is_some(),
+                verified,
+                pending_click_button: None,
+            },
+        );
+    let _dialog_guard = TaskDialogHwndGuard { hwnd: dialog_hwnd };
+
     let notify = |msg: u32, wp: u64| -> HRESULT {
         if cfg.pf_callback != 0 {
             crate::call_guest8(
                 cfg.pf_callback,
-                cfg.hwnd_parent as u64,
+                dialog_hwnd as u64,
                 msg as u64,
                 wp,
                 0,
@@ -421,29 +591,58 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     let _ = notify(TDN_CREATED, 0);
 
     let chosen_id = loop {
+        let (cur_caption, cur_body, cur_radio_idx, cur_verified, programmatic_click) = {
+            let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+            let dlg = map.get_mut(&dialog_hwnd).expect("active task dialog missing");
+            (
+                dlg.caption.clone(),
+                dlg.compose_body(),
+                dlg.selected_radio_idx,
+                dlg.verified,
+                dlg.pending_click_button.take(),
+            )
+        };
+
+        if let Some(bid) = programmatic_click {
+            let cb_hr = notify(TDN_BUTTON_CLICKED, bid as u64);
+            if cb_hr != S_FALSE_HR {
+                break bid;
+            }
+            continue;
+        }
+
         let presented = crate::macos::task_dialog_alert(
-            caption.clone(),
-            body.clone(),
+            cur_caption,
+            cur_body,
             labels.clone(),
             default_button_idx,
             radio_labels.clone(),
-            selected_radio_idx,
+            cur_radio_idx,
             verification_text.clone(),
-            verified,
+            cur_verified,
             critical,
         );
         let (bid, interactive) = if let Some(res) = presented {
-            if res.radio_index != selected_radio_idx {
-                selected_radio_idx = res.radio_index;
-                if let Some(ridx) = selected_radio_idx {
-                    if let Some((rid, _)) = radios.get(ridx) {
-                        let _ = notify(TDN_RADIO_BUTTON_CLICKED, *rid as u64);
+            let mut radio_changed: Option<i32> = None;
+            let mut ver_changed: Option<bool> = None;
+            {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(dlg) = map.get_mut(&dialog_hwnd) {
+                    if res.radio_index != dlg.selected_radio_idx {
+                        dlg.selected_radio_idx = res.radio_index;
+                        radio_changed = res.radio_index.and_then(|ridx| radios.get(ridx).map(|(rid, _)| *rid));
+                    }
+                    if dlg.has_verification && res.verified != dlg.verified {
+                        dlg.verified = res.verified;
+                        ver_changed = Some(res.verified);
                     }
                 }
             }
-            if verification_text.is_some() && res.verified != verified {
-                verified = res.verified;
-                let _ = notify(TDN_VERIFICATION_CLICKED, if verified { 1 } else { 0 });
+            if let Some(rid) = radio_changed {
+                let _ = notify(TDN_RADIO_BUTTON_CLICKED, rid as u64);
+            }
+            if let Some(v) = ver_changed {
+                let _ = notify(TDN_VERIFICATION_CLICKED, if v { 1 } else { 0 });
             }
             let bid = buttons
                 .get(res.button_index)
@@ -474,9 +673,16 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         break bid;
     };
 
+    let (final_radio_idx, final_verified) = {
+        let map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&dialog_hwnd)
+            .map(|d| (d.selected_radio_idx, d.verified))
+            .unwrap_or((selected_radio_idx, verified))
+    };
+
     let _ = notify(TDN_DESTROYED, 0);
 
-    let selected_radio = selected_radio_idx
+    let selected_radio = final_radio_idx
         .and_then(|idx| radios.get(idx))
         .map(|(id, _)| *id)
         .unwrap_or(0);
@@ -487,7 +693,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         radio_button.write_unaligned(selected_radio);
     }
     if !verification_flag.is_null() {
-        verification_flag.write_unaligned(if verified { TRUE } else { FALSE });
+        verification_flag.write_unaligned(if final_verified { TRUE } else { FALSE });
     }
     S_OK
 }
@@ -1050,6 +1256,185 @@ mod tests {
             assert_eq!(hr_multi, HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION);
             assert_eq!(btn, 0);
         }
+    }
+
+    #[test]
+    fn task_dialog_callback_receives_dialog_owned_hwnd_and_routes_operations() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            // Create a real parent window whose title and subclass chain must remain untouched.
+            let cls = crate::strings::to_wide_z("TaskDialogParentTestWnd");
+            let parent_title = crate::strings::to_wide_z("Parent Window");
+            let wc = crate::user32::class::WNDCLASS {
+                style: 0,
+                wndproc: crate::user32::register_typed_host_wndproc(crate::user32::defproc::DefWindowProcW),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = crate::user32::class::RegisterClassW(&wc);
+            let parent_hwnd = crate::user32::window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                parent_title.as_ptr(),
+                crate::user32::ws::POPUP,
+                0,
+                0,
+                200,
+                200,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!parent_hwnd.is_null());
+
+            const WM_TD_PING: u32 = crate::user32::wm::USER + 42;
+            static SEEN_HWNDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+            static SUB_PINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+            unsafe extern "win64" fn td_subclass(
+                hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                lp: isize,
+                uid: usize,
+                ref_data: usize,
+            ) -> isize {
+                if msg == WM_TD_PING && uid == 1 && ref_data == 0xCAFE {
+                    SUB_PINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return 777;
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+
+            unsafe extern "win64" fn td_init_cb(
+                hwnd: HWND,
+                msg: u32,
+                _wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                assert!(!hwnd.is_null(), "callback must always receive a non-NULL dialog HWND");
+                assert_eq!(crate::user32::window::IsWindow(hwnd), TRUE);
+                SEEN_HWNDS.lock().unwrap().push(hwnd as usize);
+                if msg == TDN_CREATED {
+                    let new_title = crate::strings::to_wide_z("Callback Title");
+                    assert_eq!(crate::user32::window::SetWindowTextW(hwnd, new_title.as_ptr()), TRUE);
+                    let new_body = crate::strings::to_wide_z("Updated Body");
+                    let _ = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_SET_ELEMENT_TEXT,
+                        TDE_CONTENT,
+                        new_body.as_ptr() as isize,
+                    );
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_RADIO_BUTTON, 201, 0);
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_VERIFICATION, 0, 0);
+                    assert_eq!(SetWindowSubclass(hwnd, td_subclass as *const () as usize, 1, 0xCAFE), TRUE);
+                    assert_eq!(crate::user32::message::SendMessageW(hwnd, WM_TD_PING, 0, 0), 777);
+                }
+                S_OK
+            }
+
+            // 1. Parented dialog: callback gets a distinct dialog-owned HWND, mutates dialog
+            //    title/content/radio/verification & subclasses it without affecting parent_hwnd.
+            let orig_title = crate::strings::to_wide_z("Initial Title");
+            let orig_body = crate::strings::to_wide_z("Initial Body");
+            let radio_lbl1 = crate::strings::to_wide_z("Alpha");
+            let radio_lbl2 = crate::strings::to_wide_z("Beta");
+            let ver_lbl = crate::strings::to_wide_z("Check me");
+            let radios = [
+                TaskDialogButton { button_id: 201, button_text: radio_lbl1.as_ptr() },
+                TaskDialogButton { button_id: 202, button_text: radio_lbl2.as_ptr() },
+            ];
+            let mut cfg: TaskDialogConfig = std::mem::zeroed();
+            cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg.hwnd_parent = parent_hwnd;
+            cfg.dw_flags = TDF_VERIFICATION_FLAG_CHECKED;
+            cfg.dw_common_buttons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+            cfg.psz_window_title = orig_title.as_ptr();
+            cfg.psz_content = orig_body.as_ptr();
+            cfg.c_radio_buttons = radios.len() as u32;
+            cfg.p_radio_buttons = radios.as_ptr();
+            cfg.n_default_radio_button = 202;
+            cfg.psz_verification_text = ver_lbl.as_ptr();
+            cfg.pf_callback = td_init_cb as *const () as usize;
+
+            SEEN_HWNDS.lock().unwrap().clear();
+            SUB_PINGS.store(0, std::sync::atomic::Ordering::SeqCst);
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                |cap, body, _btns, _def_btn, _rads, def_rad, _ver_txt, ver_chk| {
+                    assert_eq!(cap, "Callback Title");
+                    assert_eq!(body, "Updated Body");
+                    assert_eq!(def_rad, Some(0)); // updated via TDM_CLICK_RADIO_BUTTON(201)
+                    assert!(!ver_chk); // updated via TDM_CLICK_VERIFICATION(0)
+                    Some(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: def_rad,
+                        verified: ver_chk,
+                    })
+                },
+            )));
+
+            let mut btn = 0;
+            let mut radio = 0;
+            let mut verified = TRUE;
+            let hr = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut radio,
+                &mut verified,
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(hr, S_OK);
+            assert_eq!((btn, radio, verified), (1, 201, FALSE));
+            assert_eq!(SUB_PINGS.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            let seen = SEEN_HWNDS.lock().unwrap().clone();
+            assert!(!seen.is_empty());
+            let dlg_hwnd = seen[0];
+            assert!(seen.iter().all(|&h| h == dlg_hwnd), "all notifications must share one dialog HWND");
+            assert_ne!(dlg_hwnd, 0);
+            assert_ne!(dlg_hwnd, parent_hwnd as usize);
+            // Dialog HWND and its subclass entry must be destroyed on return.
+            assert_eq!(crate::user32::window::IsWindow(dlg_hwnd as HWND), FALSE);
+            assert!(!subclass_table().lock().unwrap().contains_key(&dlg_hwnd));
+            // Parent window title and subclass table must be untouched.
+            let mut pbuf = [0u16; 64];
+            let plen = crate::user32::window::GetWindowTextW(parent_hwnd, pbuf.as_mut_ptr(), pbuf.len() as i32);
+            assert_eq!(String::from_utf16_lossy(&pbuf[..plen as usize]), "Parent Window");
+            assert!(!subclass_table().lock().unwrap().contains_key(&(parent_hwnd as usize)));
+
+            // 2. Unparented dialog (hwnd_parent == NULL) must still pass a real, non-NULL HWND.
+            let mut cfg_unparented: TaskDialogConfig = std::mem::zeroed();
+            cfg_unparented.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg_unparented.hwnd_parent = std::ptr::null_mut();
+            cfg_unparented.dw_common_buttons = TDCBF_CLOSE_BUTTON;
+            cfg_unparented.psz_window_title = orig_title.as_ptr();
+            cfg_unparented.pf_callback = td_init_cb as *const () as usize;
+
+            SEEN_HWNDS.lock().unwrap().clear();
+            let hr_unp = TaskDialogIndirect(
+                &cfg_unparented as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut radio,
+                &mut verified,
+            );
+            assert_eq!(hr_unp, S_OK);
+            let unp_seen = SEEN_HWNDS.lock().unwrap().clone();
+            assert!(!unp_seen.is_empty());
+            assert_ne!(unp_seen[0], 0);
+            assert_eq!(crate::user32::window::IsWindow(unp_seen[0] as HWND), FALSE);
+
+            let _ = crate::user32::window::DestroyWindow(parent_hwnd);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
