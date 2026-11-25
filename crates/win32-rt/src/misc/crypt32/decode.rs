@@ -40,6 +40,7 @@ pub(super) const PKCS7_SIGNER_INFO: usize = 500;
 
 pub(super) const CRYPT_DECODE_TO_BE_SIGNED_FLAG: u32 = 0x0000_0002;
 pub(super) const CRYPT_DECODE_NO_SIGNATURE_BYTE_REVERSAL_FLAG: u32 = 0x0000_0008;
+pub(super) const CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG: u32 = 0x0100_0000;
 const CRYPT_DECODE_ALLOC_FLAG: u32 = 0x0000_8000;
 const CRYPT_E_ASN1_BADTAG: u32 = 0x8009_310B;
 const CRYPT_E_INVALID_X500_STRING: u32 = 0x8009_2023;
@@ -264,7 +265,13 @@ fn asn1_tag_to_rdn_type(tag: u8) -> u32 {
     }
 }
 
-fn decode_rdn_value_into(arena: &mut DecodeArena, field_off: usize, item: DerItem<'_>, unicode: bool) {
+fn decode_rdn_value_into(
+    arena: &mut DecodeArena,
+    field_off: usize,
+    item: DerItem<'_>,
+    unicode: bool,
+    dw_flags: u32,
+) {
     let rdn_ty = if item.tag == 0x1E && item.val.len() % 2 != 0 {
         1 // CERT_RDN_ENCODED_BLOB for malformed odd-length BMPString
     } else {
@@ -291,11 +298,17 @@ fn decode_rdn_value_into(arena: &mut DecodeArena, field_off: usize, item: DerIte
         }
         0x12 | 0x13 | 0x14 | 0x16 | 0x1A => {
             if unicode {
-                // Per MSDN CERT_RDN_ATTR (especially CERT_RDN_T61_STRING 0x14): try UTF-8
-                // first, falling back to 8-bit zero-extended code units rather than inserting
-                // U+FFFD replacement characters for valid non-UTF-8 octets.
-                let units: Vec<u16> = if let Ok(utf8) = std::str::from_utf8(item.val) {
-                    utf8.encode_utf16().collect()
+                // Per MSDN CryptDecodeObjectEx / CERT_RDN_T61_STRING (0x14): try UTF-8 first
+                // unless CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG is set, falling back
+                // to 8-bit zero-extended code units rather than inserting U+FFFD.
+                let disable_ie4_utf8 =
+                    (dw_flags & CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG) != 0;
+                let units: Vec<u16> = if item.tag == 0x14 && !disable_ie4_utf8 {
+                    if let Ok(utf8) = std::str::from_utf8(item.val) {
+                        utf8.encode_utf16().collect()
+                    } else {
+                        item.val.iter().map(|&b| b as u16).collect()
+                    }
                 } else {
                     item.val.iter().map(|&b| b as u16).collect()
                 };
@@ -668,7 +681,7 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
                             let oid_s = wintrust::decode_oid_str(ak[0].val);
                             let coff = arena.push_cstr(&oid_s);
                             arena.write_ptr(ao, Some(coff));
-                            decode_rdn_value_into(&mut arena, ao + 8, ak[1], unicode);
+                            decode_rdn_value_into(&mut arena, ao + 8, ak[1], unicode, dw_flags);
                         }
                     }
                 }
@@ -678,7 +691,13 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
         X509_ANY_STRING | X509_UNICODE_ANY_STRING => {
             // CERT_NAME_VALUE (24B): dwValueType (u32 @ 0), Value (CryptDataBlob 16B @ 8)
             let off = arena.alloc_aligned(24, 8);
-            decode_rdn_value_into(&mut arena, off, root, stype == X509_UNICODE_ANY_STRING);
+            decode_rdn_value_into(
+                &mut arena,
+                off,
+                root,
+                stype == X509_UNICODE_ANY_STRING,
+                dw_flags,
+            );
             Ok(arena)
         }
         X509_EXTENSIONS => {

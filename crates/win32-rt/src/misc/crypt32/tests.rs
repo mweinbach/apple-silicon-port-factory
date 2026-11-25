@@ -2615,6 +2615,86 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
             crate::kernel32::memory::LocalFree(ni_ptr as *mut c_void);
         }
 
+        // 2e. T61String containing valid UTF-8 (`14 02 C3 A9`):
+        //     - Without CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG: decodes as U+00E9.
+        //     - With CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG (0x0100_0000): skips UTF-8
+        //       and decodes as 8-bit U+00C3 U+00A9 across X509_UNICODE_ANY_STRING & X509_UNICODE_NAME.
+        let t61_utf8_e: [u8; 4] = [0x14, 0x02, 0xC3, 0xA9];
+        {
+            let mut u_ptr: *mut u8 = std::ptr::null_mut();
+            let mut u_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    super::asn1::X509_UNICODE_ANY_STRING as *const u8,
+                    t61_utf8_e.as_ptr(),
+                    t61_utf8_e.len() as u32,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut u_ptr as *mut _ as *mut c_void,
+                    &mut u_len,
+                ),
+                TRUE
+            );
+            assert_eq!(std::ptr::read_unaligned(u_ptr.add(8) as *const u32), 2);
+            let upb = std::ptr::read_unaligned(u_ptr.add(16) as *const *const u8);
+            assert_eq!(std::slice::from_raw_parts(upb, 4), &[0xE9, 0x00, 0x00, 0x00]);
+            crate::kernel32::memory::LocalFree(u_ptr as *mut c_void);
+
+            let mut d_ptr: *mut u8 = std::ptr::null_mut();
+            let mut d_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    super::asn1::X509_UNICODE_ANY_STRING as *const u8,
+                    t61_utf8_e.as_ptr(),
+                    t61_utf8_e.len() as u32,
+                    0x8000 | super::decode::CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG,
+                    std::ptr::null(),
+                    &mut d_ptr as *mut _ as *mut c_void,
+                    &mut d_len,
+                ),
+                TRUE
+            );
+            assert_eq!(std::ptr::read_unaligned(d_ptr.add(8) as *const u32), 4);
+            let dpb = std::ptr::read_unaligned(d_ptr.add(16) as *const *const u8);
+            assert_eq!(
+                std::slice::from_raw_parts(dpb, 6),
+                &[0xC3, 0x00, 0xA9, 0x00, 0x00, 0x00],
+                "CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG must skip UTF-8 decoding for T.61"
+            );
+            crate::kernel32::memory::LocalFree(d_ptr as *mut c_void);
+
+            let mut atv_u = super::asn1::encode_der_tlv(0x06, &[0x55, 0x04, 0x03]);
+            atv_u.extend_from_slice(&t61_utf8_e);
+            let name_u = super::asn1::encode_der_tlv(
+                0x30,
+                &super::asn1::encode_der_tlv(0x31, &super::asn1::encode_der_tlv(0x30, &atv_u)),
+            );
+            let mut ni_d: *mut CertNameInfo = std::ptr::null_mut();
+            let mut ni_d_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    X509_UNICODE_NAME as *const u8,
+                    name_u.as_ptr(),
+                    name_u.len() as u32,
+                    0x8000 | super::decode::CRYPT_UNICODE_NAME_DECODE_DISABLE_IE4_UTF8_FLAG,
+                    std::ptr::null(),
+                    &mut ni_d as *mut _ as *mut c_void,
+                    &mut ni_d_len,
+                ),
+                TRUE
+            );
+            let attr_d = std::ptr::read_unaligned(std::ptr::read_unaligned((*ni_d).rg_rdn).rg_rdn_attr);
+            assert_eq!(attr_d.value.cb_data, 4);
+            assert_eq!(
+                std::slice::from_raw_parts(attr_d.value.pb_data, 6),
+                &[0xC3, 0x00, 0xA9, 0x00, 0x00, 0x00]
+            );
+            crate::kernel32::memory::LocalFree(ni_d as *mut c_void);
+        }
+
         // 3. X509_ENHANCED_KEY_USAGE + X509_INTEGER + X509_ENUMERATED + X509_OBJECT_IDENTIFIER + X509_OCTET_STRING
         let eku_oids = [b"1.3.6.1.5.5.7.3.1\0".as_ptr(), b"1.3.6.1.5.5.7.3.3\0".as_ptr()];
         let eku_in = CertEnhkeyUsage {
