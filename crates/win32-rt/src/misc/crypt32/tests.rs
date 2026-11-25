@@ -6930,3 +6930,120 @@ fn verify_chain_to_root_respects_macos_trust_exclusions() {
         "excluded webpki root SPKI must not be re-admitted by verify_chain_to_root fallback"
     );
 }
+
+#[test]
+fn strong_sign_para_rejects_sha1_self_issued_rollover_ca() {
+    let tlv = super::asn1::encode_der_tlv;
+    let mk_dn = |cn: &str| {
+        let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+        atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+        tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+    };
+    let alg_ecdsa_sha256 = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]));
+    let alg_ecdsa_sha1 = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x01]));
+    let spki_p256 = |tag: u8| {
+        let mut spki_alg = tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]);
+        spki_alg.extend_from_slice(&tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]));
+        let mut pub_bytes = vec![0x00, 0x04];
+        pub_bytes.extend(std::iter::repeat(tag).take(64));
+        tlv(0x30, &[tlv(0x30, &spki_alg), tlv(0x03, &pub_bytes)].concat())
+    };
+    let mk_cert = |serial: u8, subj: &str, iss: &str, sig_alg: &[u8], key_tag: u8, is_ca: bool| {
+        let validity = tlv(
+            0x30,
+            &[tlv(0x17, b"200101000000Z"), tlv(0x17, b"400101000000Z")].concat(),
+        );
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&tlv(0xA0, &tlv(0x02, &[0x02])));
+        tbs.extend_from_slice(&tlv(0x02, &[serial]));
+        tbs.extend_from_slice(sig_alg);
+        tbs.extend_from_slice(&mk_dn(iss));
+        tbs.extend_from_slice(&validity);
+        tbs.extend_from_slice(&mk_dn(subj));
+        tbs.extend_from_slice(&spki_p256(key_tag));
+        if is_ca {
+            let mut bc = tlv(0x06, &[0x55, 0x1D, 0x13]);
+            bc.extend_from_slice(&tlv(0x01, &[0xFF]));
+            bc.extend_from_slice(&tlv(0x04, &tlv(0x30, &tlv(0x01, &[0xFF]))));
+            tbs.extend_from_slice(&tlv(0xA3, &tlv(0x30, &tlv(0x30, &bc))));
+        }
+        tlv(
+            0x30,
+            &[tlv(0x30, &tbs), sig_alg.to_vec(), tlv(0x03, &[0x00, 0x01])].concat(),
+        )
+    };
+
+    // Leaf (strong P-256 key, SHA-256 sig) issued by a self-issued rollover CA
+    // (same Subject and Issuer DN "RolloverCA", strong P-256 key, but signed with SHA-1
+    // by a prior CA key — NOT cryptographically self-signed).
+    let leaf = mk_cert(1, "RolloverLeaf", "RolloverCA", &alg_ecdsa_sha256, 0x11, false);
+    let rollover_ca = mk_cert(2, "RolloverCA", "RolloverCA", &alg_ecdsa_sha1, 0x22, true);
+    let old_root = mk_cert(3, "RolloverCA", "RolloverCA", &alg_ecdsa_sha256, 0x33, true);
+
+    unsafe {
+        let leaf_ctx = CertCreateCertificateContext(X509_ASN_ENCODING, leaf.as_ptr(), leaf.len() as u32);
+        let add_st = CertOpenStore(
+            super::store::CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                add_st,
+                X509_ASN_ENCODING,
+                rollover_ca.as_ptr(),
+                rollover_ca.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                add_st,
+                X509_ASN_ENCODING,
+                old_root.as_ptr(),
+                old_root.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+
+        let oid_os_current = b"1.3.6.1.4.1.311.72.1.2\0";
+        let mut ss_para = [0u8; 0x10];
+        std::ptr::write_unaligned(ss_para.as_mut_ptr() as *mut u32, 0x10u32);
+        std::ptr::write_unaligned(ss_para.as_mut_ptr().add(4) as *mut u32, 2u32); // OID choice
+        std::ptr::write_unaligned(ss_para.as_mut_ptr().add(8) as *mut *const u8, oid_os_current.as_ptr());
+
+        let mut cp = [0u8; 0x60];
+        std::ptr::write_unaligned(cp.as_mut_ptr() as *mut u32, 0x60u32);
+        std::ptr::write_unaligned(cp.as_mut_ptr().add(0x50) as *mut *const u8, ss_para.as_ptr());
+
+        let mut ch: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                leaf_ctx,
+                std::ptr::null(),
+                add_st,
+                cp.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut ch,
+            ),
+            TRUE
+        );
+        let ts = std::ptr::read_unaligned((ch as *const u8).add(4) as *const u32);
+        assert_ne!(
+            ts & 0x0010_0000, // CERT_TRUST_HAS_WEAK_SIGNATURE
+            0,
+            "self-issued rollover CA signed with SHA-1 must trigger CERT_TRUST_HAS_WEAK_SIGNATURE"
+        );
+        CertFreeCertificateChain(ch);
+        CertCloseStore(add_st, 0);
+        CertFreeCertificateContext(leaf_ctx);
+    }
+}

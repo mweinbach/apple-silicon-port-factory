@@ -2302,12 +2302,19 @@ unsafe fn evaluate_cert_chain_para(
 
             let mut weak = false;
             for (idx, &d) in selected_path.iter().enumerate() {
-                let is_self_signed = parse_cert_der_parts(d)
-                    .is_some_and(|p| p.subject_inner == p.issuer_inner);
-                // Enforce strong signature algorithm on the leaf and all non-self-signed
-                // certificates (historical self-signed roots may carry SHA-1 self-signatures
-                // while still requiring a strong public key).
-                if (idx == 0 || !is_self_signed) && !cert_has_strong_signature_alg(d) {
+                // Only exempt a genuine terminating self-signed trust anchor (last element,
+                // subject == issuer, AND self-signature cryptographically verifies). Self-issued
+                // CA rollover certificates (same subject/issuer DN but signed by a previous CA
+                // key) are NOT self-signed and MUST have their signature algorithm checked.
+                let is_self_signed_root = idx > 0
+                    && idx + 1 == selected_path.len()
+                    && parse_cert_der_parts(d).is_some_and(|p| {
+                        p.subject_inner == p.issuer_inner && cert_signed_by_parts(&p, &p)
+                    });
+                // Enforce strong signature algorithm on the leaf and every non-root certificate
+                // (historical self-signed roots may carry SHA-1 self-signatures while still
+                // requiring a strong public key).
+                if !is_self_signed_root && !cert_has_strong_signature_alg(d) {
                     weak = true;
                     break;
                 }
