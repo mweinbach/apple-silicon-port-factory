@@ -1893,10 +1893,10 @@ fn dpapi_uses_0600_host_secrets_and_isolates_secrets_and_machine_scope() {
 #[test]
 fn crypt_find_oid_info_all_key_types_and_groups() {
     use super::decode::{
-        CryptOidInfo, CRYPT_HASH_ALG_OID_GROUP_ID, CRYPT_OID_INFO_ALGID_KEY,
-        CRYPT_OID_INFO_CNG_ALGID_KEY, CRYPT_OID_INFO_CNG_SIGN_KEY, CRYPT_OID_INFO_NAME_KEY,
-        CRYPT_OID_INFO_OID_KEY, CRYPT_OID_INFO_SIGN_KEY, CRYPT_RDN_ATTR_OID_GROUP_ID,
-        CRYPT_SIGN_ALG_OID_GROUP_ID,
+        CryptOidInfo, CRYPT_ENCRYPT_ALG_OID_GROUP_ID, CRYPT_HASH_ALG_OID_GROUP_ID,
+        CRYPT_OID_INFO_ALGID_KEY, CRYPT_OID_INFO_CNG_ALGID_KEY, CRYPT_OID_INFO_CNG_SIGN_KEY,
+        CRYPT_OID_INFO_NAME_KEY, CRYPT_OID_INFO_OID_KEY, CRYPT_OID_INFO_SIGN_KEY,
+        CRYPT_RDN_ATTR_OID_GROUP_ID, CRYPT_SIGN_ALG_OID_GROUP_ID,
     };
     unsafe {
         // 1. Lookup by OID string
@@ -1963,6 +1963,33 @@ fn crypt_find_oid_info_all_key_types_and_groups() {
         ) as *const CryptOidInfo;
         assert!(!p6.is_null());
         assert_eq!(crate::strings::from_ansi((*p6).psz_oid), "1.2.840.10045.4.3.3");
+
+        // 5b. High-word key-length selector in dwGroupId (CRYPT_OID_INFO_OID_GROUP_BIT_LEN_MASK)
+        //     must select the matching AES-128/192/256 OID and ignore CRYPT_OID_DISABLE_SEARCH_DS_FLAG.
+        let aes_w = crate::strings::to_wide_z("AES");
+        for (bits, want_oid, want_name) in [
+            (128u32, "2.16.840.1.101.3.4.1.2", "aes128"),
+            (192u32, "2.16.840.1.101.3.4.1.22", "aes192"),
+            (256u32, "2.16.840.1.101.3.4.1.42", "aes256"),
+        ] {
+            let p_aes = CryptFindOIDInfo(
+                CRYPT_OID_INFO_CNG_ALGID_KEY,
+                aes_w.as_ptr() as *const c_void,
+                CRYPT_ENCRYPT_ALG_OID_GROUP_ID | (bits << 16) | 0x8000_0000,
+            ) as *const CryptOidInfo;
+            assert!(!p_aes.is_null(), "AES-{bits} lookup must succeed");
+            assert_eq!(crate::strings::from_ansi((*p_aes).psz_oid), want_oid);
+            assert_eq!(crate::strings::from_wide((*p_aes).pwsz_name), want_name);
+        }
+        assert!(
+            CryptFindOIDInfo(
+                CRYPT_OID_INFO_CNG_ALGID_KEY,
+                aes_w.as_ptr() as *const c_void,
+                CRYPT_ENCRYPT_ALG_OID_GROUP_ID | (512u32 << 16),
+            )
+            .is_null(),
+            "unsupported AES-512 key length must return NULL"
+        );
 
         // 6. Unknown OID returns NULL
         assert!(CryptFindOIDInfo(

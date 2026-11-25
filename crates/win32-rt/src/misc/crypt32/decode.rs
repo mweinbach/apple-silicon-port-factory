@@ -1838,11 +1838,30 @@ pub(super) unsafe fn crypt_find_oid_info_impl(
     if pv_key.is_null() {
         return std::ptr::null_mut();
     }
+    const CRYPT_OID_INFO_OID_GROUP_BIT_LEN_MASK: u32 = 0x0FFF_0000;
+    const CRYPT_OID_INFO_OID_GROUP_BIT_LEN_SHIFT: u32 = 16;
+
     let key_type = dw_key_type & 0x0000_FFFF;
     let group_filter = dw_group_id & 0x0000_FFFF;
+    let req_bit_len =
+        (dw_group_id & CRYPT_OID_INFO_OID_GROUP_BIT_LEN_MASK) >> CRYPT_OID_INFO_OID_GROUP_BIT_LEN_SHIFT;
     let table = oid_table();
 
-    let matches_group = |e: &OwnedOidEntry| group_filter == 0 || e.info.dw_group_id == group_filter;
+    let matches_group = |e: &OwnedOidEntry| -> bool {
+        if group_filter != 0 && e.info.dw_group_id != group_filter {
+            return false;
+        }
+        if req_bit_len != 0 {
+            if e._extra_bytes.len() < 4 {
+                return false;
+            }
+            let entry_bits = u32::from_le_bytes(e._extra_bytes[..4].try_into().unwrap());
+            if entry_bits != req_bit_len {
+                return false;
+            }
+        }
+        true
+    };
 
     let found = match key_type {
         CRYPT_OID_INFO_OID_KEY => {
