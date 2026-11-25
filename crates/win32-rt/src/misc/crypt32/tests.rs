@@ -2528,7 +2528,9 @@ fn macos_trust_store_and_extended_chain_policies() {
         );
         assert_eq!(status.dw_error, 0);
 
-        // MICROSOFT_ROOT fails with CERT_E_UNTRUSTEDROOT on non-Microsoft cert
+        // MICROSOFT_ROOT fails with CERT_E_UNTRUSTEDROOT on non-Microsoft cert even when trusted
+        // by an exclusive root engine, AND NT_AUTH enforces Enterprise NTAuth issuer authorization
+        // (returning CERT_E_UNTRUSTEDCA for ordinary trusted CAs until explicitly added to NTAUTH).
         assert_eq!(
             CertVerifyCertificateChainPolicy(
                 CERT_CHAIN_POLICY_MICROSOFT_ROOT as *const u8,
@@ -2540,7 +2542,93 @@ fn macos_trust_store_and_extended_chain_policies() {
         );
         assert_eq!(status.dw_error, CERT_E_UNTRUSTEDROOT);
 
-        // NT_AUTH & EV return TRUE with appropriate policy status
+        // Build a trusted chain with an exclusive root engine trusting `cert` itself
+        let excl_store = CertOpenStore(
+            super::store::CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CertAddCertificateContextToStore(excl_store, cert, 4, std::ptr::null_mut()),
+            TRUE
+        );
+        let mut engine_cfg = [0u8; 0x60];
+        std::ptr::write_unaligned(engine_cfg.as_mut_ptr() as *mut u32, engine_cfg.len() as u32);
+        // hExclusiveRoot @ +0x40 in CERT_CHAIN_ENGINE_CONFIG (Win64)
+        std::ptr::write_unaligned(engine_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, excl_store);
+        let mut excl_engine: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertCreateCertificateChainEngine(
+                engine_cfg.as_ptr() as *const c_void,
+                &mut excl_engine,
+            ),
+            TRUE
+        );
+        let mut trusted_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                excl_engine,
+                cert,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut trusted_chain,
+            ),
+            TRUE
+        );
+
+        // Trusted non-Microsoft root MUST still fail MICROSOFT_ROOT (checked by SPKI key, not name)
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_MICROSOFT_ROOT as *const u8,
+                trusted_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, CERT_E_UNTRUSTEDROOT);
+
+        // Trusted ordinary CA NOT in Enterprise NTAuth store MUST fail NT_AUTH with CERT_E_UNTRUSTEDCA
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_NT_AUTH as *const u8,
+                trusted_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, super::chain::CERT_E_UNTRUSTEDCA);
+
+        // Once the issuing CA is explicitly added to the Enterprise NTAUTH store, NT_AUTH succeeds!
+        let ntauth_name = b"NTAUTH\0";
+        let ntauth_st = CertOpenSystemStoreA(0, ntauth_name.as_ptr());
+        assert!(!ntauth_st.is_null());
+        assert_eq!(
+            CertAddCertificateContextToStore(ntauth_st, cert, 4, std::ptr::null_mut()),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_NT_AUTH as *const u8,
+                trusted_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0);
+        CertCloseStore(ntauth_st, 0);
+        CertFreeCertificateChain(trusted_chain);
+        CertFreeCertificateChainEngine(excl_engine);
+        CertCloseStore(excl_store, 0);
+
+        // Untrusted chain still fails NT_AUTH and EV with CERT_E_UNTRUSTEDROOT
         assert_eq!(
             CertVerifyCertificateChainPolicy(
                 CERT_CHAIN_POLICY_NT_AUTH as *const u8,

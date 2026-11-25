@@ -475,6 +475,7 @@ pub(crate) const CERT_E_CHAINING: u32 = 0x800B_010A;
 pub(crate) const CERT_E_REVOKED: u32 = 0x800B_010C;
 pub(crate) const CERT_E_CN_NO_MATCH: u32 = 0x800B_010F;
 pub(crate) const CERT_E_WRONG_USAGE: u32 = 0x800B_0110;
+pub(crate) const CERT_E_UNTRUSTEDCA: u32 = 0x800B_0112;
 
 // CERT_TRUST_STATUS.dwErrorStatus bits
 const CERT_TRUST_IS_NOT_TIME_VALID: u32 = 0x0000_0001;
@@ -649,13 +650,50 @@ pub(super) fn verify_cert_sig_with_spki(
 /// Verify cryptographic chain signatures from `chain_der[0]` up to a trusted root
 /// without requiring TLS `serverAuth` EKU (used by `CERT_CHAIN_POLICY_BASE` and
 /// `CERT_CHAIN_POLICY_AUTHENTICODE`).
-fn verify_chain_signatures_to_roots(
+/// Verified cryptographic chain endpoints returned by `verify_chain_to_root`.
+struct VerifiedChainEndpoints {
+    /// Inner DER bytes of the terminating trusted root's `SubjectPublicKeyInfo` (without outer 0x30 tag/len).
+    root_spki_inner: Vec<u8>,
+    /// Inner DER bytes of the issuing CA's `SubjectPublicKeyInfo` that cryptographically signed
+    /// the end-entity leaf `chain_der[0]` (or the leaf's own SPKI if self-signed root).
+    issuing_ca_spki_inner: Vec<u8>,
+}
+
+/// Official Microsoft Root Certificate Authority `SubjectPublicKeyInfo` SHA-256 public-key
+/// fingerprints (full DER SEQUENCE `0x30 ...` of SPKI) checked by `CERT_CHAIN_POLICY_MICROSOFT_ROOT`.
+/// Derived directly from Microsoft's published root CAs (not subject display names).
+const MICROSOFT_ROOT_SPKI_SHA256: &[[u8; 32]] = &[
+    // Microsoft RSA Root Certificate Authority 2017
+    [
+        0xB2, 0xF7, 0x29, 0x8B, 0x52, 0xBF, 0x2C, 0x3C, 0xAC, 0x4D, 0xDF, 0xE7, 0x2D, 0xE4, 0xD6,
+        0x82, 0xAC, 0x58, 0x95, 0x75, 0x95, 0x98, 0x2F, 0x2B, 0x62, 0x30, 0x1A, 0xF5, 0x97, 0xC6,
+        0x99, 0xC5,
+    ],
+    // Microsoft ECC Root Certificate Authority 2017
+    [
+        0x35, 0xF5, 0x3C, 0xE1, 0x26, 0x46, 0x11, 0xE0, 0x33, 0x40, 0xFE, 0x37, 0xE1, 0xEC, 0x7D,
+        0x4C, 0xC9, 0x86, 0xC5, 0x61, 0x3D, 0xCA, 0x70, 0xFD, 0x04, 0xAA, 0x44, 0x54, 0x5F, 0x2D,
+        0xAF, 0x28,
+    ],
+];
+
+fn spki_inner_sha256(spki_inner: &[u8]) -> [u8; 32] {
+    let full = super::asn1::encode_der_tlv(0x30, spki_inner);
+    let h = crate::misc::bcrypt::Digest::Sha256.hash(&full);
+    let mut out = [0u8; 32];
+    if h.len() == 32 {
+        out.copy_from_slice(&h);
+    }
+    out
+}
+
+fn verify_chain_to_root(
     chain_der: &[Vec<u8>],
     exclusive_roots_der: Option<&[Vec<u8>]>,
     extra_roots_der: &[Vec<u8>],
-) -> bool {
+) -> Option<VerifiedChainEndpoints> {
     if chain_der.is_empty() {
-        return false;
+        return None;
     }
     // Collect candidate trust anchors as (subject_inner, spki_inner, spki_alg_inner, spki_key_bits).
     let mut root_parts: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
@@ -698,32 +736,40 @@ fn verify_chain_signatures_to_roots(
         }
     }
     if root_parts.is_empty() {
-        return false;
+        return None;
     }
 
     let parsed: Vec<Option<CertDerParts<'_>>> = chain_der
         .iter()
         .map(|d| parse_cert_der_parts(d))
         .collect();
-    let Some(mut cur) = parsed[0].as_ref() else {
-        return false;
-    };
+    let mut cur = parsed[0].as_ref()?;
+    let mut issuing_ca_spki: Option<Vec<u8>> = None;
 
     // Walk up to 16 chain links looking for a trusted root.
     let mut visited = vec![false; chain_der.len()];
     visited[0] = true;
-    for _ in 0..16 {
+    for step in 0..16 {
         // Direct match: cur itself is a trusted root (same subject + SPKI).
-        if root_parts.iter().any(|(subj, spki, _, _)| {
+        if let Some((_, spki, _, _)) = root_parts.iter().find(|(subj, spki, _, _)| {
             subj.as_slice() == cur.subject_inner && spki.as_slice() == cur.spki_inner
         }) {
-            return true;
+            return Some(VerifiedChainEndpoints {
+                root_spki_inner: spki.clone(),
+                issuing_ca_spki_inner: issuing_ca_spki.unwrap_or_else(|| spki.clone()),
+            });
         }
         // Signed directly by a trusted root?
-        if root_parts.iter().any(|(subj, _, alg, key)| {
+        if let Some((_, spki, _, _)) = root_parts.iter().find(|(subj, _, alg, key)| {
             subj.as_slice() == cur.issuer_inner && verify_cert_sig_with_spki(cur, alg, key)
         }) {
-            return true;
+            if step == 0 {
+                issuing_ca_spki = Some(spki.clone());
+            }
+            return Some(VerifiedChainEndpoints {
+                root_spki_inner: spki.clone(),
+                issuing_ca_spki_inner: issuing_ca_spki.unwrap_or_else(|| spki.clone()),
+            });
         }
         // Otherwise look for an intermediate issuer in chain_der.
         let mut next_idx = None;
@@ -740,13 +786,23 @@ fn verify_chain_signatures_to_roots(
                 }
             }
         }
-        let Some(ni) = next_idx else {
-            return false;
-        };
+        let ni = next_idx?;
+        let next_cert = parsed[ni].as_ref().unwrap();
+        if step == 0 {
+            issuing_ca_spki = Some(next_cert.spki_inner.to_vec());
+        }
         visited[ni] = true;
-        cur = parsed[ni].as_ref().unwrap();
+        cur = next_cert;
     }
-    false
+    None
+}
+
+fn verify_chain_signatures_to_roots(
+    chain_der: &[Vec<u8>],
+    exclusive_roots_der: Option<&[Vec<u8>]>,
+    extra_roots_der: &[Vec<u8>],
+) -> bool {
+    verify_chain_to_root(chain_der, exclusive_roots_der, extra_roots_der).is_some()
 }
 
 /// Map a `rustls::Error` from `WebPkiServerVerifier::verify_server_cert` to a Windows `CERT_E_*` code.
@@ -1560,12 +1616,21 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                                     || o.as_slice() == OID_ANY_EKU
                             })
                     });
-            let trust_ok = default_chain_error == 0
-                || verify_chain_signatures_to_roots(
-                    &chain_der,
-                    exclusive_roots.as_deref(),
-                    &extra_roots,
-                );
+            let verified_endpoints = verify_chain_to_root(
+                &chain_der,
+                exclusive_roots.as_deref(),
+                &extra_roots,
+            );
+            let trust_ok = default_chain_error == 0 || verified_endpoints.is_some();
+            // Per MSDN CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_NT_AUTH):
+            // The issuing CA must be explicitly authorized in the Enterprise NTAuth store;
+            // ordinary trusted CAs are NOT authorized for NT authentication -> CERT_E_UNTRUSTEDCA.
+            let ntauth_authorized = verified_endpoints.as_ref().is_some_and(|ep| {
+                super::store::ntauth_store_certs_der().iter().any(|der| {
+                    parse_cert_der_parts(der)
+                        .is_some_and(|p| p.spki_inner == ep.issuing_ca_spki_inner.as_slice())
+                })
+            });
             if default_chain_error == CERT_E_REVOKED {
                 (CERT_E_REVOKED, 0)
             } else if usage_bad {
@@ -1574,26 +1639,26 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                 (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
             } else if !trust_ok && !ignore_ca {
                 (CERT_E_UNTRUSTEDROOT, 0)
+            } else if !ntauth_authorized {
+                (CERT_E_UNTRUSTEDCA, 1.min(chain_der.len().saturating_sub(1)) as i32)
             } else {
                 (0, -1)
             }
         }
         CERT_CHAIN_POLICY_MICROSOFT_ROOT => {
-            let root_is_ms = chain_der.last().is_some_and(|root_der| {
-                parse_cert_der_parts(root_der).is_some_and(|p| {
-                    wintrust::extract_dn_attr(p.subject_raw, &[0x55, 0x04, 0x0A])
-                        .is_some_and(|org| org.to_ascii_lowercase().contains("microsoft"))
-                        || wintrust::extract_dn_attr(p.subject_raw, &[0x55, 0x04, 0x03])
-                            .is_some_and(|cn| cn.to_ascii_lowercase().contains("microsoft"))
-                })
+            // Per MSDN CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_MICROSOFT_ROOT):
+            // Verify the actual cryptographically chained terminating root's public key
+            // against Microsoft's root public keys (never by display name/subject string).
+            let verified_endpoints = verify_chain_to_root(
+                &chain_der,
+                exclusive_roots.as_deref(),
+                &extra_roots,
+            );
+            let root_is_ms_key = verified_endpoints.as_ref().is_some_and(|ep| {
+                let fp = spki_inner_sha256(&ep.root_spki_inner);
+                MICROSOFT_ROOT_SPKI_SHA256.iter().any(|known| known == &fp)
             });
-            let trust_ok = default_chain_error == 0
-                || verify_chain_signatures_to_roots(
-                    &chain_der,
-                    exclusive_roots.as_deref(),
-                    &extra_roots,
-                );
-            if !root_is_ms || (!trust_ok && !ignore_ca) {
+            if !root_is_ms_key {
                 (CERT_E_UNTRUSTEDROOT, chain_der.len().saturating_sub(1) as i32)
             } else if !ignore_date && first_time_invalid_idx.is_some() {
                 (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)

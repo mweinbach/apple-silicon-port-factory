@@ -2367,7 +2367,8 @@ pub(super) unsafe fn query_context_attributes_impl(
                 SEC_E_OK
             }
             SECPKG_ATTR_UNIQUE_BINDINGS | SECPKG_ATTR_ENDPOINT_BINDINGS => {
-                // RFC 5929 tls-server-end-point channel binding: SHA-256 of server leaf cert DER.
+                // RFC 5929 §4.1 tls-server-end-point channel binding: hash the server leaf cert
+                // DER with its signature algorithm's digest (substituting SHA-256 for MD5/SHA-1).
                 let server_cert_der = if ctx.is_server {
                     ctx.local_cert_der.as_deref()
                 } else {
@@ -2379,7 +2380,7 @@ pub(super) unsafe fn query_context_attributes_impl(
                 let Some(cert_der) = server_cert_der else {
                     return SEC_E_NO_CREDENTIALS;
                 };
-                let hash = crate::misc::bcrypt::Digest::Sha256.hash(cert_der);
+                let hash = rfc5929_endpoint_binding_digest(cert_der).hash(cert_der);
                 let mut app_data = Vec::with_capacity(21 + hash.len());
                 app_data.extend_from_slice(b"tls-server-end-point:");
                 app_data.extend_from_slice(&hash);
@@ -2888,4 +2889,84 @@ pub(super) unsafe fn query_security_package_info_w_impl(
     );
     std::ptr::write_unaligned(pp_package_info, mem as *mut c_void);
     SEC_E_OK
+}
+
+fn parse_der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    if input.len() < 2 {
+        return None;
+    }
+    let tag = input[0];
+    let b1 = input[1];
+    let (len, hdr) = if b1 < 0x80 {
+        (b1 as usize, 2usize)
+    } else {
+        let n = (b1 & 0x7F) as usize;
+        if n == 0 || n > 4 || 2 + n > input.len() {
+            return None;
+        }
+        let mut l = 0usize;
+        for i in 0..n {
+            l = (l << 8) | input[2 + i] as usize;
+        }
+        (l, 2 + n)
+    };
+    if hdr.checked_add(len)? > input.len() {
+        return None;
+    }
+    Some((tag, &input[hdr..hdr + len], &input[hdr + len..]))
+}
+
+/// Select the channel-binding hash algorithm for `tls-server-end-point` per RFC 5929 §4.1:
+/// use the hash algorithm from the server certificate's outer `signatureAlgorithm`, substituting
+/// SHA-256 for MD5 or SHA-1 (and for signature schemes without a single legacy digest).
+pub(super) fn rfc5929_endpoint_binding_digest(cert_der: &[u8]) -> crate::misc::bcrypt::Digest {
+    use crate::misc::bcrypt::Digest;
+
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    let Some((0x30, cert_body, _)) = parse_der_tlv(cert_der) else {
+        return Digest::Sha256;
+    };
+    // Skip tbsCertificate
+    let Some((_, _, after_tbs)) = parse_der_tlv(cert_body) else {
+        return Digest::Sha256;
+    };
+    // signatureAlgorithm ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }
+    let Some((0x30, alg_body, _)) = parse_der_tlv(after_tbs) else {
+        return Digest::Sha256;
+    };
+    let Some((0x06, alg_oid, params_rest)) = parse_der_tlv(alg_body) else {
+        return Digest::Sha256;
+    };
+
+    const OID_SHA384_WITH_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C];
+    const OID_SHA512_WITH_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D];
+    const OID_ECDSA_WITH_SHA384: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03];
+    const OID_ECDSA_WITH_SHA512: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04];
+    const OID_RSASSA_PSS: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
+    const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+    const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+
+    match alg_oid {
+        OID_SHA384_WITH_RSA | OID_ECDSA_WITH_SHA384 => Digest::Sha384,
+        OID_SHA512_WITH_RSA | OID_ECDSA_WITH_SHA512 => Digest::Sha512,
+        OID_RSASSA_PSS => {
+            // RSASSA-PSS-params ::= SEQUENCE { [0] hashAlgorithm AlgorithmIdentifier DEFAULT sha1, ... }
+            if let Some((0x30, pss_body, _)) = parse_der_tlv(params_rest) {
+                if let Some((0xA0, hash_ctx, _)) = parse_der_tlv(pss_body) {
+                    if let Some((0x30, hash_alg_seq, _)) = parse_der_tlv(hash_ctx) {
+                        if let Some((0x06, hash_oid, _)) = parse_der_tlv(hash_alg_seq) {
+                            return match hash_oid {
+                                OID_SHA384 => Digest::Sha384,
+                                OID_SHA512 => Digest::Sha512,
+                                _ => Digest::Sha256,
+                            };
+                        }
+                    }
+                }
+            }
+            Digest::Sha256
+        }
+        // MD5, SHA-1 (RFC 5929 §4.1 substitute SHA-256), SHA-256, or default
+        _ => Digest::Sha256,
+    }
 }

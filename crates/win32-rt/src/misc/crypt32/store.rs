@@ -109,6 +109,7 @@ struct RegisteredCert {
 struct RegisteredStore {
     refcount: usize,
     certs: Vec<usize>,
+    is_ntauth: bool,
 }
 
 #[derive(Default)]
@@ -117,6 +118,9 @@ struct StoreState {
     /// Map `SubjectPublicKeyInfo` field address -> cert handle for exact DER SPKI lookup.
     spki_to_cert: HashMap<usize, usize>,
     stores: HashMap<usize, RegisteredStore>,
+    /// Enterprise `NTAuth` issuing CA certificates (empty by default on non-domain macOS;
+    /// populated when a caller opens the `"NTAUTH"` store and adds authorized issuing CAs).
+    ntauth_certs_der: Vec<Vec<u8>>,
     next_store_id: usize,
 }
 
@@ -415,6 +419,7 @@ pub(crate) fn register_peer_cert_chain(
         RegisteredStore {
             refcount: 1,
             certs: store_certs,
+            is_ntauth: false,
         },
     );
 
@@ -499,10 +504,20 @@ pub(super) fn cert_free_certificate_context_impl(ctx: *mut c_void) -> BOOL {
 fn open_named_system_store(store_name: &str) -> *mut c_void {
     let upper = store_name.trim().to_ascii_uppercase();
     let seed_roots = matches!(upper.as_str(), "ROOT" | "AUTHROOT" | "CA");
+    let is_ntauth = upper == "NTAUTH";
     let mut st = STORE_STATE.lock().unwrap();
     let id = st.next_store_id;
     st.next_store_id += 1;
     let mut certs = Vec::new();
+    if is_ntauth {
+        let existing: Vec<Vec<u8>> = st.ntauth_certs_der.clone();
+        for der in existing {
+            if let Some(owned) = wintrust::build_owned_cert_context(&der, id as *mut c_void) {
+                let h = insert_cert_locked(&mut st, owned, vec![der], None, 0);
+                certs.push(h);
+            }
+        }
+    }
     if seed_roots {
         let mut seen_subjects: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         // Seed real macOS Security.framework system/admin/user roots first, then webpki-roots.
@@ -525,9 +540,14 @@ fn open_named_system_store(store_name: &str) -> *mut c_void {
             }
         }
     }
-    st.stores.insert(id, RegisteredStore { refcount: 1, certs });
+    st.stores.insert(id, RegisteredStore { refcount: 1, certs, is_ntauth });
     log::debug!("CertOpenStore(system={store_name:?}) -> {id:#x} (seeded={seed_roots})");
     id as *mut c_void
+}
+
+/// Snapshot of DER certificates currently registered in the Enterprise `NTAuth` store.
+pub(super) fn ntauth_store_certs_der() -> Vec<Vec<u8>> {
+    STORE_STATE.lock().unwrap().ntauth_certs_der.clone()
 }
 
 pub(super) unsafe fn cert_open_store_impl(
@@ -554,6 +574,7 @@ pub(super) unsafe fn cert_open_store_impl(
             RegisteredStore {
                 refcount: 1,
                 certs: Vec::new(),
+                is_ntauth: false,
             },
         );
         return id as *mut c_void;
@@ -717,7 +738,14 @@ unsafe fn add_der_to_store(
     }
 
     let h = insert_cert_locked(&mut st, owned, vec![der.to_vec()], None, 0);
-    st.stores.get_mut(&store_key).unwrap().certs.push(h);
+    let is_ntauth = {
+        let store = st.stores.get_mut(&store_key).unwrap();
+        store.certs.push(h);
+        store.is_ntauth
+    };
+    if is_ntauth && !st.ntauth_certs_der.iter().any(|existing| existing.as_slice() == der) {
+        st.ntauth_certs_der.push(der.to_vec());
+    }
     if !pp_store_context.is_null() {
         st.certs.get_mut(&h).unwrap().refcount += 1;
         std::ptr::write_unaligned(pp_store_context, h as *mut c_void);

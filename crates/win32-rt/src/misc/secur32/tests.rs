@@ -1752,7 +1752,7 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         assert_eq!(QueryContextAttributesA(&mut cli_ctx as *mut _ as *mut c_void, SECPKG_ATTR_FLAGS, &mut flags as *mut _ as *mut c_void), SEC_E_OK);
         assert_ne!(flags.flags, 0);
 
-        // RFC 5929 channel bindings match between client and server!
+        // RFC 5929 §4.1 channel bindings match both each other AND independently computed digest!
         let mut cb_cli = SecPkgContextBindings { bindings_length: 0, bindings: std::ptr::null_mut() };
         let mut cb_srv = SecPkgContextBindings { bindings_length: 0, bindings: std::ptr::null_mut() };
         assert_eq!(QueryContextAttributesA(&mut cli_ctx as *mut _ as *mut c_void, SECPKG_ATTR_ENDPOINT_BINDINGS, &mut cb_cli as *mut _ as *mut c_void), SEC_E_OK);
@@ -1761,9 +1761,38 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         let b1 = std::slice::from_raw_parts(cb_cli.bindings as *const u8, cb_cli.bindings_length as usize);
         let b2 = std::slice::from_raw_parts(cb_srv.bindings as *const u8, cb_srv.bindings_length as usize);
         assert_eq!(b1, b2);
-        assert!(b1[32..].starts_with(b"tls-server-end-point:"));
+        let srv_cctx = std::ptr::read_unaligned(srv_cert as *const crate::misc::wintrust::CertContext);
+        let srv_cert_der = std::slice::from_raw_parts(srv_cctx.pb_cert_encoded, srv_cctx.cb_cert_encoded as usize);
+        let mut expected_app = b"tls-server-end-point:".to_vec();
+        expected_app.extend_from_slice(&crate::misc::bcrypt::Digest::Sha256.hash(srv_cert_der));
+        assert_eq!(&b1[32..], expected_app.as_slice());
         FreeContextBuffer(cb_cli.bindings);
         FreeContextBuffer(cb_srv.bindings);
+
+        // RFC 5929 §4.1 digest selection across signature algorithms (SHA-1 -> SHA-256, SHA-384, SHA-512, RSASSA-PSS)
+        let make_cert_with_alg = |alg_seq_inner: &[u8]| -> Vec<u8> {
+            let mut body = vec![0x30, 0x02, 0x05, 0x00]; // dummy tbsCertificate
+            body.push(0x30);
+            body.push(alg_seq_inner.len() as u8);
+            body.extend_from_slice(alg_seq_inner);
+            body.extend_from_slice(&[0x03, 0x02, 0x00, 0x00]); // dummy signatureValue
+            let mut cert = vec![0x30, body.len() as u8];
+            cert.extend_from_slice(&body);
+            cert
+        };
+        let c_sha1 = make_cert_with_alg(&[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05, 0x05, 0x00]);
+        let c_sha384 = make_cert_with_alg(&[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C, 0x05, 0x00]);
+        let c_ecdsa384 = make_cert_with_alg(&[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]);
+        let c_sha512 = make_cert_with_alg(&[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D, 0x05, 0x00]);
+        let c_pss384 = make_cert_with_alg(&[
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A,
+            0x30, 0x0F, 0xA0, 0x0D, 0x30, 0x0B, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02,
+        ]);
+        assert_eq!(super::schannel::rfc5929_endpoint_binding_digest(&c_sha1).hash(&c_sha1).len(), 32);
+        assert_eq!(super::schannel::rfc5929_endpoint_binding_digest(&c_sha384).hash(&c_sha384).len(), 48);
+        assert_eq!(super::schannel::rfc5929_endpoint_binding_digest(&c_ecdsa384).hash(&c_ecdsa384).len(), 48);
+        assert_eq!(super::schannel::rfc5929_endpoint_binding_digest(&c_sha512).hash(&c_sha512).len(), 64);
+        assert_eq!(super::schannel::rfc5929_endpoint_binding_digest(&c_pss384).hash(&c_pss384).len(), 48);
 
         // Client-specified SNI target received by server!
         let mut sni = SecPkgContextNamesA { s_user_name: std::ptr::null_mut() };
