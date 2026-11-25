@@ -153,6 +153,7 @@ mod icu {
         pub u_str_to_lower: unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *const c_char, *mut i32) -> i32,
         pub u_str_to_upper: unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *const c_char, *mut i32) -> i32,
         pub u_str_to_title: unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *mut c_void, *const c_char, *mut i32) -> i32,
+        pub u_str_fold_case: unsafe extern "C" fn(*mut u16, i32, *const u16, i32, u32, *mut i32) -> i32,
         pub utrans_open_u: unsafe extern "C" fn(*const u16, i32, i32, *const u16, i32, *mut c_void, *mut i32) -> *mut c_void,
         pub utrans_trans_uchars: unsafe extern "C" fn(*const c_void, *mut u16, *mut i32, i32, i32, *mut i32, *mut i32),
         pub utrans_close: unsafe extern "C" fn(*mut c_void),
@@ -248,6 +249,7 @@ mod icu {
                 u_str_to_lower: sym!(c"u_strToLower", unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *const c_char, *mut i32) -> i32),
                 u_str_to_upper: sym!(c"u_strToUpper", unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *const c_char, *mut i32) -> i32),
                 u_str_to_title: sym!(c"u_strToTitle", unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *mut c_void, *const c_char, *mut i32) -> i32),
+                u_str_fold_case: sym!(c"u_strFoldCase", unsafe extern "C" fn(*mut u16, i32, *const u16, i32, u32, *mut i32) -> i32),
                 utrans_open_u: sym!(c"utrans_openU", unsafe extern "C" fn(*const u16, i32, i32, *const u16, i32, *mut c_void, *mut i32) -> *mut c_void),
                 utrans_trans_uchars: sym!(c"utrans_transUChars", unsafe extern "C" fn(*const c_void, *mut u16, *mut i32, i32, i32, *mut i32, *mut i32)),
                 utrans_close: sym!(c"utrans_close", unsafe extern "C" fn(*mut c_void)),
@@ -1185,6 +1187,38 @@ fn append_word_sort_weights(key: &mut Vec<u8>, special: &[(u32, u8)]) {
     key.push(0x00);
 }
 
+/// Unicode case folding via Apple ICU (`u_strFoldCase`), using `U_FOLD_CASE_EXCLUDE_SPECIAL_I`
+/// for Turkic locales (`tr`, `az`) so Greek `ΟΣ`/`ος`/`οσ` all fold to `οσ`, Turkish `İ`->`i`
+/// and `I`->`ı`, and non-case tertiary distinctions (`A` vs `Ａ`, `か` vs `カ`) remain intact.
+fn icu_case_fold(icu_locale: &str, src: &[u16]) -> Option<Vec<u16>> {
+    let a = icu::api()?;
+    let turkic = icu_locale == "tr"
+        || icu_locale.starts_with("tr_")
+        || icu_locale == "az"
+        || icu_locale.starts_with("az_");
+    let opts: u32 = if turkic { 1 } else { 0 }; // U_FOLD_CASE_EXCLUDE_SPECIAL_I : U_FOLD_CASE_DEFAULT
+    unsafe {
+        let mut buf = vec![0u16; src.len() + 16];
+        let mut st = 0i32;
+        let need = (a.u_str_fold_case)(buf.as_mut_ptr(), buf.len() as i32, src.as_ptr(), src.len() as i32, opts, &mut st);
+        if st == 15 && need > 0 {
+            buf.resize(need as usize + 1, 0);
+            st = 0;
+            let n2 = (a.u_str_fold_case)(buf.as_mut_ptr(), buf.len() as i32, src.as_ptr(), src.len() as i32, opts, &mut st);
+            if st <= 0 && n2 >= 0 {
+                buf.truncate(n2 as usize);
+                return Some(buf);
+            }
+            return None;
+        }
+        if st <= 0 && need >= 0 {
+            buf.truncate(need as usize);
+            return Some(buf);
+        }
+    }
+    None
+}
+
 /// Normalize width (`NORM_IGNOREWIDTH`), kana type (`NORM_IGNOREKANATYPE`), and/or linguistic
 /// case folding (`LINGUISTIC_IGNORECASE` / `NORM_IGNORECASE | NORM_LINGUISTIC_CASING`) before
 /// collation and sort-key generation so `CompareStringEx`/`CompareStringW`, `LCMAP_SORTKEY`,
@@ -1263,9 +1297,10 @@ fn normalize_collation_input<'a>(icu_locale: &str, s: &'a [u16], flags: u32) -> 
     }
 
     if linguistic_case {
-        // Apply locale-aware case folding without discarding non-case tertiary distinctions
-        // (fullwidth `Ａ` -> `ａ` stays distinct from `a`, and kana `か`/`カ` stay unchanged).
-        out = icu_case_map(icu_locale, LCMAP_LOWERCASE, &out)
+        // Apply Unicode case folding (`u_strFoldCase`) rather than contextual lowercasing so
+        // Greek `ΟΣ`/`ος`/`οσ` compare equal, Turkic `İ`->`i`/`I`->`ı` holds for `tr`/`az`,
+        // and non-case tertiary distinctions (`Ａ`->`ａ` vs `a`, `か` vs `カ`) remain intact.
+        out = icu_case_fold(icu_locale, &out)
             .unwrap_or_else(|| out.into_iter().map(wlower).collect());
     }
     Cow::Owned(out)
@@ -4544,6 +4579,15 @@ mod tests {
             assert_eq!(CompareStringEx(tr.as_ptr(), LINGUISTIC_IGNORECASE, tr_dotless_i.as_ptr(), -1, tr_cap_i.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
             assert_eq!(get_sort_key(&tr, &tr_dotless_i, LINGUISTIC_IGNORECASE), get_sort_key(&tr, &tr_cap_i, LINGUISTIC_IGNORECASE));
             assert_ne!(CompareStringEx(tr.as_ptr(), LINGUISTIC_IGNORECASE, tr_i.as_ptr(), -1, tr_cap_i.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            // Greek case folding under LINGUISTIC_IGNORECASE: ΟΣ == οσ == ος (not contextual lowercasing).
+            let el = to_wide_z("el-GR");
+            let gr_upper = to_wide_z("ΟΣ");
+            let gr_medial = to_wide_z("οσ");
+            let gr_final = to_wide_z("ος");
+            assert_eq!(CompareStringEx(el.as_ptr(), LINGUISTIC_IGNORECASE, gr_upper.as_ptr(), -1, gr_medial.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&el, &gr_upper, LINGUISTIC_IGNORECASE), get_sort_key(&el, &gr_medial, LINGUISTIC_IGNORECASE));
+            assert_eq!(CompareStringEx(el.as_ptr(), LINGUISTIC_IGNORECASE, gr_upper.as_ptr(), -1, gr_final.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&el, &gr_upper, LINGUISTIC_IGNORECASE), get_sort_key(&el, &gr_final, LINGUISTIC_IGNORECASE));
         }
     }
 
