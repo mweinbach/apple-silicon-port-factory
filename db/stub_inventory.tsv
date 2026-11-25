@@ -1,12 +1,4 @@
 dll	api	kind	file	line	detail
-advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	GetTokenInformation	stub	crates/win32-rt/src/advapi32.rs	1361	"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"
 amd_ags_x64.dll	agsDriverExtensionsDX12_PopMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	406	"agsDriverExtensionsDX12_PopMarker: unsupported command list {cmd_list:#x}"
 amd_ags_x64.dll	agsDriverExtensionsDX12_PushMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	384	"agsDriverExtensionsDX12_PushMarker: unsupported command list {cmd_list:#x}"
 amd_ags_x64.dll	agsDriverExtensionsDX12_SetMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	428	"agsDriverExtensionsDX12_SetMarker: unsupported command list {cmd_list:#x}"
@@ -16,26 +8,6 @@ amd_fidelityfx_loader_dx12.dll	ffxDispatch	middleware_stub	crates/win32-rt/src/m
 amd_fidelityfx_loader_dx12.dll	ffxDispatch	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	558	"ffxDispatch(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
 amd_fidelityfx_loader_dx12.dll	ffxQuery	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	620	"ffxQuery(INTERPOLATIONCOMMANDLIST_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
 amd_fidelityfx_loader_dx12.dll	ffxQuery	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	630	"ffxQuery(INTERPOLATIONTEXTURE_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
-bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2447	"BCryptExportKey(wrapped h_export_key) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2505	"BCryptExportKey({t:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptGenerateKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2614	"BCryptGenerateKeyPair({}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGenerateSymmetricKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2528	"BCryptGenerateSymmetricKey({}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1810	"BCryptGetProperty(alg={}, {p:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1824	"BCryptGetProperty(hash, {p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1859	"BCryptGetProperty(key, {p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2372	"BCryptImportKey({}, wrapped h_import_key) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2429	"BCryptImportKey({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1941	"BCryptImportKeyPair({}, wrapped import_key) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1949	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1964	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1979	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptOpenAlgorithmProvider	stub	crates/win32-rt/src/misc/bcrypt.rs	1720	"BCryptOpenAlgorithmProvider({name:?}, flags 0x{flags:x}) -> STATUS_NOT_FOUND (algorithm not implemented)"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2670	"BCryptSetProperty(ChainingMode={mode_str:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2718	"BCryptSetProperty(ECCCurveName={curve_str:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2756	"BCryptSetProperty({p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSignHash	stub	crates/win32-rt/src/misc/bcrypt.rs	2057	"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptVerifySignature	stub	crates/win32-rt/src/misc/bcrypt.rs	2122	"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"
-bcrypt.dll	bcrypt_aes_crypt	stub	crates/win32-rt/src/misc/bcrypt.rs	2173	"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }
 crypt32.dll	CertFreeCRLContext	stub	crates/win32-rt/src/misc/crypt32.rs	355	"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"
 crypt32.dll	CertFreeCTLContext	stub	crates/win32-rt/src/misc/crypt32.rs	362	"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"
 crypt32.dll	CertGetCertificateContextProperty	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
