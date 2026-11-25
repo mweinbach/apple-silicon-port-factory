@@ -90,11 +90,6 @@ fn classify_script(ch: char) -> u16 {
     }
 }
 
-fn is_strong_rtl(ch: char) -> bool {
-    let c = ch as u32;
-    (0x0590..=0x08FF).contains(&c) || (0xFB1D..=0xFEFC).contains(&c)
-}
-
 fn is_strong_ltr(ch: char) -> bool {
     let c = ch as u32;
     (0x0041..=0x005A).contains(&c)
@@ -188,6 +183,221 @@ unsafe extern "win64" fn ta_analyze_script(
     S_OK
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BidiClass {
+    L,
+    R,
+    AL,
+    EN,
+    ES,
+    ET,
+    AN,
+    CS,
+    NSM,
+    BN,
+    WS,
+    ON,
+}
+
+fn classify_bidi(ch: char) -> BidiClass {
+    let cp = ch as u32;
+    match cp {
+        // European digits (ASCII + superscripts + Extended Arabic-Indic digits)
+        0x0030..=0x0039 | 0x00B2..=0x00B3 | 0x00B9 | 0x06F0..=0x06F9 => BidiClass::EN,
+        // Arabic-Indic digits & separators
+        0x0660..=0x0669 | 0x066B..=0x066C => BidiClass::AN,
+        // European separators
+        0x002B | 0x002D => BidiClass::ES,
+        // European terminators
+        0x0023..=0x0025 | 0x00A2..=0x00A5 | 0x00B0..=0x00B1 | 0x0609..=0x060A | 0x066A | 0x20AC => {
+            BidiClass::ET
+        }
+        // Common separators
+        0x002C | 0x002E..=0x002F | 0x003A | 0x00A0 | 0x060C => BidiClass::CS,
+        // Nonspacing combining marks
+        0x0300..=0x036F
+        | 0x0483..=0x0489
+        | 0x0591..=0x05BD
+        | 0x05BF
+        | 0x05C1..=0x05C2
+        | 0x05C4..=0x05C5
+        | 0x05C7
+        | 0x0610..=0x061A
+        | 0x064B..=0x065F
+        | 0x0670
+        | 0x06D6..=0x06DC
+        | 0x06DF..=0x06E4
+        | 0x06E7..=0x06E8
+        | 0x06EA..=0x06ED
+        | 0x1AB0..=0x1AFF
+        | 0x1DC0..=0x1DFF
+        | 0x20D0..=0x20FF
+        | 0xFE20..=0xFE2F => BidiClass::NSM,
+        // Boundary neutrals
+        0x0000..=0x0008 | 0x000E..=0x001B | 0x007F..=0x0084 | 0x0086..=0x009F | 0x200B..=0x200D => {
+            BidiClass::BN
+        }
+        // Whitespace
+        0x0009 | 0x000C | 0x0020 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x205F | 0x3000 => {
+            BidiClass::WS
+        }
+        // Arabic letters (AL)
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => {
+            BidiClass::AL
+        }
+        // Strong RTL (Hebrew, Syriac, Thaana, NKo, etc.)
+        0x0590..=0x05FF | 0x0700..=0x074F | 0x0780..=0x089F | 0xFB1D..=0xFB4F => BidiClass::R,
+        _ if is_strong_ltr(ch) => BidiClass::L,
+        _ => BidiClass::ON,
+    }
+}
+
+/// Resolve per-UTF-16-code-unit bidi embedding levels following UAX #9 weak (W1-W7),
+/// neutral (N1-N2), and implicit level (I1-I2) rules for a single paragraph run.
+fn resolve_bidi_levels(units: &[u16], explicit: u8) -> Vec<u8> {
+    let mut spans: Vec<(usize, usize, BidiClass)> = Vec::with_capacity(units.len());
+    let mut i = 0usize;
+    while i < units.len() {
+        let (ch, step) = decode_u16_at(units, i);
+        spans.push((i, step, classify_bidi(ch)));
+        i += step;
+    }
+    let n = spans.len();
+    let mut types: Vec<BidiClass> = spans.iter().map(|s| s.2).collect();
+    let base_dir = if (explicit & 1) == 1 { BidiClass::R } else { BidiClass::L };
+
+    // W1: Examine each nonspacing mark (NSM) and change its type to the previous type (or sos).
+    let mut prev = base_dir;
+    for t in &mut types {
+        if *t == BidiClass::NSM {
+            *t = prev;
+        } else if *t != BidiClass::BN {
+            prev = *t;
+        }
+    }
+
+    // W2: Search backward from each EN until the first strong type (R, L, AL, or sos).
+    //     If AL is found, change EN to AN.
+    let mut last_strong = base_dir;
+    for t in &mut types {
+        match *t {
+            BidiClass::L | BidiClass::R | BidiClass::AL => last_strong = *t,
+            BidiClass::EN if last_strong == BidiClass::AL => *t = BidiClass::AN,
+            _ => {}
+        }
+    }
+
+    // W3: Change all ALs to R.
+    for t in &mut types {
+        if *t == BidiClass::AL {
+            *t = BidiClass::R;
+        }
+    }
+
+    // W4: A single ES between two ENs changes to EN; a single CS between two ENs or two ANs
+    //     changes to that type.
+    for idx in 1..n.saturating_sub(1) {
+        match types[idx] {
+            BidiClass::ES if types[idx - 1] == BidiClass::EN && types[idx + 1] == BidiClass::EN => {
+                types[idx] = BidiClass::EN;
+            }
+            BidiClass::CS if types[idx - 1] == BidiClass::EN && types[idx + 1] == BidiClass::EN => {
+                types[idx] = BidiClass::EN;
+            }
+            BidiClass::CS if types[idx - 1] == BidiClass::AN && types[idx + 1] == BidiClass::AN => {
+                types[idx] = BidiClass::AN;
+            }
+            _ => {}
+        }
+    }
+
+    // W5: Sequences of ET adjacent to EN change to EN.
+    let mut k = 0usize;
+    while k < n {
+        if types[k] == BidiClass::ET {
+            let start = k;
+            while k < n && types[k] == BidiClass::ET {
+                k += 1;
+            }
+            let left_en = start > 0 && types[start - 1] == BidiClass::EN;
+            let right_en = k < n && types[k] == BidiClass::EN;
+            if left_en || right_en {
+                for t in &mut types[start..k] {
+                    *t = BidiClass::EN;
+                }
+            }
+        } else {
+            k += 1;
+        }
+    }
+
+    // W6: Remaining separators and terminators change to ON.
+    for t in &mut types {
+        if matches!(*t, BidiClass::ES | BidiClass::ET | BidiClass::CS) {
+            *t = BidiClass::ON;
+        }
+    }
+
+    // W7: Search backward from each EN until the first strong type (L, R, or sos).
+    //     If L is found, change EN to L.
+    let mut last_strong = base_dir;
+    for t in &mut types {
+        match *t {
+            BidiClass::L | BidiClass::R => last_strong = *t,
+            BidiClass::EN if last_strong == BidiClass::L => *t = BidiClass::L,
+            _ => {}
+        }
+    }
+
+    // N1 / N2: Resolve sequences of neutrals (ON, WS, BN). For N1, AN and EN act like R.
+    let is_neutral = |t: BidiClass| matches!(t, BidiClass::ON | BidiClass::WS | BidiClass::BN);
+    let strong_for_n1 = |t: BidiClass| match t {
+        BidiClass::L => BidiClass::L,
+        BidiClass::R | BidiClass::EN | BidiClass::AN => BidiClass::R,
+        _ => base_dir,
+    };
+    let mut k = 0usize;
+    while k < n {
+        if is_neutral(types[k]) {
+            let start = k;
+            while k < n && is_neutral(types[k]) {
+                k += 1;
+            }
+            let left = if start > 0 { strong_for_n1(types[start - 1]) } else { base_dir };
+            let right = if k < n { strong_for_n1(types[k]) } else { base_dir };
+            let resolved = if left == right { left } else { base_dir };
+            for t in &mut types[start..k] {
+                *t = resolved;
+            }
+        } else {
+            k += 1;
+        }
+    }
+
+    // I1 / I2: Resolve implicit embedding levels.
+    let mut levels = vec![explicit; units.len()];
+    for (idx, &(start, step, _)) in spans.iter().enumerate() {
+        let lv = if (explicit & 1) == 0 {
+            // I1 (even base level)
+            match types[idx] {
+                BidiClass::R => explicit + 1,
+                BidiClass::AN | BidiClass::EN => explicit + 2,
+                _ => explicit,
+            }
+        } else {
+            // I2 (odd base level)
+            match types[idx] {
+                BidiClass::L | BidiClass::EN | BidiClass::AN => explicit + 1,
+                _ => explicit,
+            }
+        };
+        for off in 0..step {
+            levels[start + off] = lv;
+        }
+    }
+    levels
+}
+
 unsafe extern "win64" fn ta_analyze_bidi(
     this: PTextAnalyzer,
     source: *mut c_void,
@@ -217,22 +427,7 @@ unsafe extern "win64" fn ta_analyze_bidi(
     };
     let explicit: u8 = if dir == 1 { 1 } else { 0 };
 
-    let mut levels = vec![explicit; units.len()];
-    let mut i = 0usize;
-    while i < units.len() {
-        let (ch, step) = decode_u16_at(&units, i);
-        let lv = if is_strong_rtl(ch) {
-            if (explicit & 1) == 1 { explicit } else { explicit + 1 }
-        } else if is_strong_ltr(ch) {
-            if (explicit & 1) == 0 { explicit } else { explicit + 1 }
-        } else {
-            explicit
-        };
-        for k in 0..step {
-            levels[i + k] = lv;
-        }
-        i += step;
-    }
+    let levels = resolve_bidi_levels(&units, explicit);
 
     let sink_vtbl = (sink as *const *const usize).read_unaligned();
     if sink_vtbl.is_null() {
@@ -426,7 +621,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     _locale_name: *const u16,
     _number_substitution: *mut c_void,
     features: *const *const c_void,
-    _feature_range_lengths: *const u32,
+    feature_range_lengths: *const u32,
     feature_ranges: u32,
     max_glyph_count: u32,
     cluster_map: *mut u16,
@@ -455,8 +650,13 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
         units.push(text_string.add(i).read_unaligned());
     }
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
-    let feat_settings = super::shaping::read_feature_settings(features, feature_ranges);
-    let complex = super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_settings.is_empty());
+    let feat_ranges = super::shaping::read_feature_ranges(
+        features,
+        feature_range_lengths,
+        feature_ranges,
+        units.len(),
+    );
+    let complex = super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_ranges.is_empty());
 
     if let Some(shaped) = super::shaping::shape_run_platform(
         &face,
@@ -464,7 +664,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
         face.meta.metrics.designUnitsPerEm.max(1) as f32,
         is_rtl != 0,
         no_visual,
-        &feat_settings,
+        &feat_ranges,
     ) {
         actual_glyph_count.write_unaligned(shaped.glyphs.len() as u32);
         if shaped.glyphs.len() > max_glyph_count as usize {
@@ -546,7 +746,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     _locale_name: *const u16,
     features: *const *const c_void,
-    _feature_range_lengths: *const u32,
+    feature_range_lengths: *const u32,
     feature_ranges: u32,
     glyph_advances: *mut f32,
     glyph_offsets: *mut DWRITE_GLYPH_OFFSET,
@@ -570,14 +770,19 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
         for i in 0..text_len as usize {
             units.push(text_string.add(i).read_unaligned());
         }
-        let feat_settings = super::shaping::read_feature_settings(features, feature_ranges);
+        let feat_ranges = super::shaping::read_feature_ranges(
+            features,
+            feature_range_lengths,
+            feature_ranges,
+            units.len(),
+        );
         if let Some(shaped) = super::shaping::shape_run_platform(
             &face,
             &units,
             em_size,
             is_rtl != 0,
             no_visual,
-            &feat_settings,
+            &feat_ranges,
         ) {
             if shaped.glyphs.len() == glyph_count as usize
                 && (0..glyph_count as usize)
@@ -589,7 +794,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
                 }
                 return S_OK;
             }
-        } else if super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_settings.is_empty()) {
+        } else if super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_ranges.is_empty()) {
             log::warn!(
                 "dwrite: IDWriteTextAnalyzer::GetGlyphPlacements cannot position complex run (len={}, family={:?})",
                 units.len(),
@@ -629,7 +834,7 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     _locale_name: *const u16,
     features: *const *const c_void,
-    _feature_range_lengths: *const u32,
+    feature_range_lengths: *const u32,
     feature_ranges: u32,
     glyph_advances: *mut f32,
     glyph_offsets: *mut DWRITE_GLYPH_OFFSET,
@@ -654,14 +859,19 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
         for i in 0..text_len as usize {
             units.push(text_string.add(i).read_unaligned());
         }
-        let feat_settings = super::shaping::read_feature_settings(features, feature_ranges);
+        let feat_ranges = super::shaping::read_feature_ranges(
+            features,
+            feature_range_lengths,
+            feature_ranges,
+            units.len(),
+        );
         if let Some(shaped) = super::shaping::shape_run_platform(
             &face,
             &units,
             em_size,
             is_rtl != 0,
             no_visual,
-            &feat_settings,
+            &feat_ranges,
         ) {
             if shaped.glyphs.len() == glyph_count as usize
                 && (0..glyph_count as usize)
@@ -677,7 +887,7 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
                 }
                 return S_OK;
             }
-        } else if super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_settings.is_empty()) {
+        } else if super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_ranges.is_empty()) {
             log::warn!(
                 "dwrite: IDWriteTextAnalyzer::GetGdiCompatibleGlyphPlacements cannot position complex run (len={}, family={:?})",
                 units.len(),

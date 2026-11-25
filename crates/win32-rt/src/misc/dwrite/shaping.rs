@@ -28,35 +28,64 @@ pub(super) struct FeatureSetting {
     pub(super) value: u32,
 }
 
-/// Decode `IDWriteTextAnalyzer`'s `features` / `feature_ranges` parameter arrays.
-pub(super) unsafe fn read_feature_settings(
+/// Per-range OpenType feature settings corresponding to one entry of
+/// `IDWriteTextAnalyzer::GetGlyphs`'s `(features, featureRangeLengths, featureRanges)`.
+#[derive(Clone, Debug)]
+pub(super) struct FeatureRange {
+    pub(super) start: usize,
+    pub(super) len: usize,
+    pub(super) settings: Vec<FeatureSetting>,
+}
+
+/// Decode `IDWriteTextAnalyzer`'s `features`, `featureRangeLengths`, and `featureRanges`
+/// preserving each range's UTF-16 character span.
+pub(super) unsafe fn read_feature_ranges(
     features: *const *const std::ffi::c_void,
+    feature_range_lengths: *const u32,
     feature_ranges: u32,
-) -> Vec<FeatureSetting> {
-    if features.is_null() || feature_ranges == 0 {
+    text_len: usize,
+) -> Vec<FeatureRange> {
+    if features.is_null() || feature_ranges == 0 || text_len == 0 {
         return Vec::new();
     }
     let mut out = Vec::new();
+    let mut pos = 0usize;
     for r in 0..feature_ranges as usize {
+        if pos >= text_len {
+            break;
+        }
+        let range_len = if !feature_range_lengths.is_null() {
+            feature_range_lengths.add(r).read_unaligned() as usize
+        } else {
+            text_len.saturating_sub(pos)
+        };
+        let end = pos.saturating_add(range_len).min(text_len);
         let fset_ptr = features.add(r).read_unaligned() as *const u8;
-        if fset_ptr.is_null() {
-            continue;
+        if end > pos && !fset_ptr.is_null() {
+            // DWRITE_TYPOGRAPHIC_FEATURES: { DWRITE_FONT_FEATURE* features (@0); UINT32 featureCount (@8); }
+            let arr = (fset_ptr as *const *const u8).read_unaligned();
+            let count = (fset_ptr.add(8) as *const u32).read_unaligned() as usize;
+            if !arr.is_null() && count > 0 {
+                let mut settings = Vec::with_capacity(count.min(64));
+                for i in 0..count.min(64) {
+                    let entry = arr.add(i * 8);
+                    let tag_u32 = (entry as *const u32).read_unaligned();
+                    let param = (entry.add(4) as *const u32).read_unaligned();
+                    settings.push(FeatureSetting {
+                        tag: tag_u32.to_le_bytes(),
+                        value: param,
+                    });
+                }
+                if !settings.is_empty() {
+                    out.push(FeatureRange {
+                        start: pos,
+                        len: end - pos,
+                        settings,
+                    });
+                }
+            }
         }
-        // DWRITE_TYPOGRAPHIC_FEATURES: { DWRITE_FONT_FEATURE* features (@0); UINT32 featureCount (@8); }
-        let arr = (fset_ptr as *const *const u8).read_unaligned();
-        let count = (fset_ptr.add(8) as *const u32).read_unaligned() as usize;
-        if arr.is_null() || count == 0 {
-            continue;
-        }
-        for i in 0..count.min(64) {
-            let entry = arr.add(i * 8);
-            let tag_u32 = (entry as *const u32).read_unaligned();
-            let param = (entry.add(4) as *const u32).read_unaligned();
-            out.push(FeatureSetting {
-                tag: tag_u32.to_le_bytes(),
-                value: param,
-            });
-        }
+        pos = end;
     }
     out
 }
@@ -210,6 +239,17 @@ mod coretext {
             str_ref: *const c_void,
             attributes: *const c_void,
         ) -> *const c_void;
+        fn CFAttributedStringCreateMutableCopy(
+            allocator: *const c_void,
+            max_length: isize,
+            a_str: *const c_void,
+        ) -> *mut c_void;
+        fn CFAttributedStringSetAttribute(
+            a_str: *mut c_void,
+            range: CFRange,
+            attr_name: *const c_void,
+            value: *const c_void,
+        );
         fn CFRelease(cf: *const c_void);
     }
 
@@ -255,13 +295,94 @@ mod coretext {
         }
     }
 
+    unsafe fn make_ct_font(
+        base_desc: *const c_void,
+        empty_cascade: *const c_void,
+        ct_size: f64,
+        settings: &[FeatureSetting],
+    ) -> Option<CfGuard> {
+        let mut feat_dicts: Vec<CfGuard> = Vec::new();
+        let mut feat_ptrs: Vec<*const c_void> = Vec::new();
+        for f in settings {
+            let tag_str = CfGuard(CFStringCreateWithBytes(
+                std::ptr::null(),
+                f.tag.as_ptr(),
+                4,
+                CF_STRING_ENCODING_UTF8,
+                false,
+            ));
+            let val_i32 = f.value as i32;
+            let val_num = CfGuard(CFNumberCreate(
+                std::ptr::null(),
+                CF_NUMBER_SINT32_TYPE,
+                &val_i32 as *const i32 as *const c_void,
+            ));
+            if tag_str.0.is_null() || val_num.0.is_null() {
+                continue;
+            }
+            let fkeys = [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue];
+            let fvals = [tag_str.0, val_num.0];
+            let fdict = CfGuard(CFDictionaryCreate(
+                std::ptr::null(),
+                fkeys.as_ptr(),
+                fvals.as_ptr(),
+                2,
+                &kCFTypeDictionaryKeyCallBacks as *const u8,
+                &kCFTypeDictionaryValueCallBacks as *const u8,
+            ));
+            if !fdict.0.is_null() {
+                feat_ptrs.push(fdict.0);
+                feat_dicts.push(fdict);
+            }
+        }
+        let feat_arr = if !feat_ptrs.is_empty() {
+            Some(CfGuard(CFArrayCreate(
+                std::ptr::null(),
+                feat_ptrs.as_ptr(),
+                feat_ptrs.len() as isize,
+                &kCFTypeArrayCallBacks as *const u8,
+            )))
+        } else {
+            None
+        };
+
+        let mut desc_keys = vec![kCTFontCascadeListAttribute];
+        let mut desc_vals = vec![empty_cascade];
+        if let Some(ref fa) = feat_arr {
+            if !fa.0.is_null() {
+                desc_keys.push(kCTFontFeatureSettingsAttribute);
+                desc_vals.push(fa.0);
+            }
+        }
+        let desc_attrs = CfGuard(CFDictionaryCreate(
+            std::ptr::null(),
+            desc_keys.as_ptr(),
+            desc_vals.as_ptr(),
+            desc_keys.len() as isize,
+            &kCFTypeDictionaryKeyCallBacks as *const u8,
+            &kCFTypeDictionaryValueCallBacks as *const u8,
+        ));
+        let tuned_desc = if !desc_attrs.0.is_null() {
+            CfGuard(CTFontDescriptorCreateCopyWithAttributes(base_desc, desc_attrs.0))
+        } else {
+            CfGuard(std::ptr::null())
+        };
+        let use_desc = if !tuned_desc.0.is_null() { tuned_desc.0 } else { base_desc };
+        let ct_font = CfGuard(CTFontCreateWithFontDescriptor(
+            use_desc,
+            ct_size,
+            std::ptr::null(),
+        ));
+        (!ct_font.0.is_null()).then_some(ct_font)
+    }
+
     pub(super) fn shape_run(
         face: &FontFaceInner,
         units: &[u16],
         em_size: f32,
         is_rtl: bool,
         no_visual: bool,
-        features: &[FeatureSetting],
+        feature_ranges: &[FeatureRange],
     ) -> Option<ShapedRun> {
         if units.is_empty() {
             return Some(ShapedRun {
@@ -301,8 +422,7 @@ mod coretext {
                 return None;
             }
 
-            // Disable CoreText font fallback so every glyph belongs strictly to this IDWriteFontFace,
-            // and forward any explicit DWRITE_FONT_FEATURE OpenType tags.
+            // Disable CoreText font fallback so every glyph belongs strictly to this IDWriteFontFace.
             let empty_cascade = CfGuard(CFArrayCreate(
                 std::ptr::null(),
                 std::ptr::null(),
@@ -313,82 +433,7 @@ mod coretext {
                 return None;
             }
 
-            let mut feat_dicts: Vec<CfGuard> = Vec::new();
-            let mut feat_ptrs: Vec<*const c_void> = Vec::new();
-            for f in features {
-                let tag_str = CfGuard(CFStringCreateWithBytes(
-                    std::ptr::null(),
-                    f.tag.as_ptr(),
-                    4,
-                    CF_STRING_ENCODING_UTF8,
-                    false,
-                ));
-                let val_i32 = f.value as i32;
-                let val_num = CfGuard(CFNumberCreate(
-                    std::ptr::null(),
-                    CF_NUMBER_SINT32_TYPE,
-                    &val_i32 as *const i32 as *const c_void,
-                ));
-                if tag_str.0.is_null() || val_num.0.is_null() {
-                    continue;
-                }
-                let fkeys = [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue];
-                let fvals = [tag_str.0, val_num.0];
-                let fdict = CfGuard(CFDictionaryCreate(
-                    std::ptr::null(),
-                    fkeys.as_ptr(),
-                    fvals.as_ptr(),
-                    2,
-                    &kCFTypeDictionaryKeyCallBacks as *const u8,
-                    &kCFTypeDictionaryValueCallBacks as *const u8,
-                ));
-                if !fdict.0.is_null() {
-                    feat_ptrs.push(fdict.0);
-                    feat_dicts.push(fdict);
-                }
-            }
-            let feat_arr = if !feat_ptrs.is_empty() {
-                Some(CfGuard(CFArrayCreate(
-                    std::ptr::null(),
-                    feat_ptrs.as_ptr(),
-                    feat_ptrs.len() as isize,
-                    &kCFTypeArrayCallBacks as *const u8,
-                )))
-            } else {
-                None
-            };
-
-            let mut desc_keys = vec![kCTFontCascadeListAttribute];
-            let mut desc_vals = vec![empty_cascade.0];
-            if let Some(ref fa) = feat_arr {
-                if !fa.0.is_null() {
-                    desc_keys.push(kCTFontFeatureSettingsAttribute);
-                    desc_vals.push(fa.0);
-                }
-            }
-            let desc_attrs = CfGuard(CFDictionaryCreate(
-                std::ptr::null(),
-                desc_keys.as_ptr(),
-                desc_vals.as_ptr(),
-                desc_keys.len() as isize,
-                &kCFTypeDictionaryKeyCallBacks as *const u8,
-                &kCFTypeDictionaryValueCallBacks as *const u8,
-            ));
-            let tuned_desc = if !desc_attrs.0.is_null() {
-                CfGuard(CTFontDescriptorCreateCopyWithAttributes(base_desc, desc_attrs.0))
-            } else {
-                CfGuard(std::ptr::null())
-            };
-            let use_desc = if !tuned_desc.0.is_null() { tuned_desc.0 } else { base_desc };
-
-            let ct_font = CfGuard(CTFontCreateWithFontDescriptor(
-                use_desc,
-                ct_size,
-                std::ptr::null(),
-            ));
-            if ct_font.0.is_null() {
-                return None;
-            }
+            let base_ct_font = make_ct_font(base_desc, empty_cascade.0, ct_size, &[])?;
 
             let dir: i8 = if is_rtl { CT_WRITING_DIRECTION_RTL } else { CT_WRITING_DIRECTION_LTR };
             let psetting = CTParagraphStyleSetting {
@@ -410,7 +455,7 @@ mod coretext {
                 return None;
             }
             let attr_keys = [kCTFontAttributeName, kCTParagraphStyleAttributeName];
-            let attr_vals = [ct_font.0, pstyle.0];
+            let attr_vals = [base_ct_font.0, pstyle.0];
             let attrs = CfGuard(CFDictionaryCreate(
                 std::ptr::null(),
                 attr_keys.as_ptr(),
@@ -422,15 +467,51 @@ mod coretext {
             if attrs.0.is_null() {
                 return None;
             }
-            let astr = CfGuard(CFAttributedStringCreate(
+            let base_astr = CfGuard(CFAttributedStringCreate(
                 std::ptr::null(),
                 cf_str.0,
                 attrs.0,
             ));
-            if astr.0.is_null() {
+            if base_astr.0.is_null() {
                 return None;
             }
-            let line = CfGuard(CTLineCreateWithAttributedString(astr.0));
+
+            // Apply each DWRITE_TYPOGRAPHIC_FEATURES range strictly to its UTF-16 character span.
+            let mut range_fonts: Vec<CfGuard> = Vec::new();
+            let mut_astr = if !feature_ranges.is_empty() {
+                let m = CfGuard(CFAttributedStringCreateMutableCopy(
+                    std::ptr::null(),
+                    units.len() as isize,
+                    base_astr.0,
+                ) as *const c_void);
+                if m.0.is_null() {
+                    return None;
+                }
+                for fr in feature_ranges {
+                    if fr.start >= units.len() || fr.len == 0 || fr.settings.is_empty() {
+                        continue;
+                    }
+                    let clamped_len = fr.len.min(units.len() - fr.start);
+                    if let Some(rf) = make_ct_font(base_desc, empty_cascade.0, ct_size, &fr.settings) {
+                        CFAttributedStringSetAttribute(
+                            m.0 as *mut c_void,
+                            CFRange {
+                                location: fr.start as isize,
+                                length: clamped_len as isize,
+                            },
+                            kCTFontAttributeName,
+                            rf.0,
+                        );
+                        range_fonts.push(rf);
+                    }
+                }
+                Some(m)
+            } else {
+                None
+            };
+            let _keep_range_fonts = &range_fonts;
+            let final_astr = mut_astr.as_ref().map(|g| g.0).unwrap_or(base_astr.0);
+            let line = CfGuard(CTLineCreateWithAttributedString(final_astr));
             if line.0.is_null() {
                 return None;
             }
@@ -600,15 +681,15 @@ pub(super) fn shape_run_platform(
     em_size: f32,
     is_rtl: bool,
     no_visual: bool,
-    features: &[FeatureSetting],
+    feature_ranges: &[FeatureRange],
 ) -> Option<ShapedRun> {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        coretext::shape_run(face, units, em_size, is_rtl, no_visual, features)
+        coretext::shape_run(face, units, em_size, is_rtl, no_visual, feature_ranges)
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
-        let _ = (face, units, em_size, is_rtl, no_visual, features);
+        let _ = (face, units, em_size, is_rtl, no_visual, feature_ranges);
         None
     }
 }

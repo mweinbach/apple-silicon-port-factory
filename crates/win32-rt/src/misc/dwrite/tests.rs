@@ -1854,6 +1854,181 @@ fn text_analyzer_shapes_complex_arabic_and_combining_marks_and_rejects_unshapeab
         assert_eq!(actual, 0);
         release_com(fb_face);
 
+        // 4. Bidi numeric resolution (UAX #9 I2): "אב12ג" in an RTL paragraph must resolve
+        //    to levels [1, 1, 2, 2, 1] rather than assigning digits the odd base level.
+        #[repr(C)]
+        struct RtlSource {
+            vtbl: *const [usize; 8],
+            text: Vec<u16>,
+        }
+        #[repr(C)]
+        struct BidiSink {
+            vtbl: *const [usize; 7],
+            bidis: Vec<(u32, u32, u8, u8)>,
+        }
+        unsafe extern "win64" fn rtl_get_text(this: *mut RtlSource, pos: u32, out_str: *mut *const u16, out_len: *mut u32) -> HRESULT {
+            let p = pos as usize;
+            if p >= (*this).text.len() {
+                out_str.write_unaligned(std::ptr::null());
+                out_len.write_unaligned(0);
+            } else {
+                out_str.write_unaligned((*this).text.as_ptr().add(p));
+                out_len.write_unaligned(((*this).text.len() - p) as u32);
+            }
+            S_OK
+        }
+        unsafe extern "win64" fn rtl_get_dir(_this: *mut RtlSource) -> u32 {
+            1 // DWRITE_READING_DIRECTION_RIGHT_TO_LEFT
+        }
+        unsafe extern "win64" fn bidi_set_level(this: *mut BidiSink, pos: u32, len: u32, expl: u8, res: u8) -> HRESULT {
+            (*this).bidis.push((pos, len, expl, res));
+            S_OK
+        }
+        let rtl_vtbl = [0, 0, 0, rtl_get_text as *const () as usize, 0, rtl_get_dir as *const () as usize, 0, 0];
+        let bidi_vtbl = [0, 0, 0, 0, 0, bidi_set_level as *const () as usize, 0];
+        let hebrew_digits: Vec<u16> = "\u{05D0}\u{05D1}12\u{05D2}".encode_utf16().collect();
+        let mut rsrc = RtlSource { vtbl: &rtl_vtbl, text: hebrew_digits.clone() };
+        let mut bsink = BidiSink { vtbl: &bidi_vtbl, bidis: Vec::new() };
+        let an_bidi: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute((*(ta as *const *const usize)).add(4).read_unaligned());
+        assert_eq!(
+            an_bidi(
+                ta,
+                &mut rsrc as *mut _ as *mut c_void,
+                0,
+                hebrew_digits.len() as u32,
+                &mut bsink as *mut _ as *mut c_void,
+            ),
+            S_OK
+        );
+        assert_eq!(bsink.bidis, vec![(0, 2, 1, 1), (2, 2, 1, 2), (4, 1, 1, 1)]);
+
+        // 5. Per-range OpenType features: "fifi" with range 0 (len 2) disabling `liga` and
+        //    range 1 (len 2) enabling `liga` on a font with an `fi` ligature produces 2 glyphs
+        //    for range 0 and 1 ligature glyph for range 1 (total 3 glyphs, clusterMap [0,1,2,2]).
+        #[repr(C)]
+        struct DWriteFontFeature {
+            name_tag: u32,
+            parameter: u32,
+        }
+        #[repr(C)]
+        struct DWriteTypographicFeatures {
+            features: *const DWriteFontFeature,
+            feature_count: u32,
+        }
+        let liga_tag = u32::from_le_bytes(*b"liga");
+        let f_off = DWriteFontFeature { name_tag: liga_tag, parameter: 0 };
+        let f_on = DWriteFontFeature { name_tag: liga_tag, parameter: 1 };
+        let set_off = DWriteTypographicFeatures { features: &f_off, feature_count: 1 };
+        let set_on = DWriteTypographicFeatures { features: &f_on, feature_count: 1 };
+        let feat_ptrs = [
+            &set_off as *const _ as *const c_void,
+            &set_on as *const _ as *const c_void,
+        ];
+        let feat_lens = [2u32, 2u32];
+
+        let lig_meta = ["georgia", "times new roman", "helvetica", "palatino", "baskerville"]
+            .iter()
+            .find_map(|&fam_name| {
+                let idx = sys.find_family_index(fam_name)?;
+                let meta = sys.families[idx].fonts.iter().find(|m| m.file_path.is_some())?.clone();
+                // Probe whether this font supports the standard `fi` ligature when `liga=1`.
+                let probe_face = new_font_face(FontFaceInner::from_meta(meta.clone(), 0));
+                let fi_u16 = [b'f' as u16, b'i' as u16];
+                let mut cm = [0u16; 2];
+                let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 2];
+                let mut gi = [0u16; 4];
+                let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 4];
+                let mut cnt = 0u32;
+                let on_ptr = [&set_on as *const _ as *const c_void];
+                let on_len = [2u32];
+                let hr = ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    fi_u16.as_ptr(),
+                    2,
+                    probe_face,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    on_ptr.as_ptr(),
+                    on_len.as_ptr(),
+                    1,
+                    4,
+                    cm.as_mut_ptr(),
+                    tp.as_mut_ptr(),
+                    gi.as_mut_ptr(),
+                    gp.as_mut_ptr(),
+                    &mut cnt,
+                );
+                release_com(probe_face);
+                (hr == S_OK && cnt == 1).then_some(meta)
+            });
+
+        if let Some(meta) = lig_meta {
+            let lig_face = new_font_face(FontFaceInner::from_meta(meta, 0));
+            let fifi_u16 = [b'f' as u16, b'i' as u16, b'f' as u16, b'i' as u16];
+            let mut cm = [0xFFFFu16; 4];
+            let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 4];
+            let mut gi = [0u16; 8];
+            let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 8];
+            let mut cnt = 0u32;
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    fifi_u16.as_ptr(),
+                    4,
+                    lig_face,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    2,
+                    8,
+                    cm.as_mut_ptr(),
+                    tp.as_mut_ptr(),
+                    gi.as_mut_ptr(),
+                    gp.as_mut_ptr(),
+                    &mut cnt,
+                ),
+                S_OK
+            );
+            assert_eq!(cnt, 3, "range 0 (liga=0) -> 2 glyphs, range 1 (liga=1) -> 1 ligature glyph");
+            assert_eq!(cm, [0, 1, 2, 2]);
+            let mut adv = [0.0f32; 8];
+            let mut offs = [DWRITE_GLYPH_OFFSET::default(); 8];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    fifi_u16.as_ptr(),
+                    cm.as_ptr(),
+                    tp.as_ptr(),
+                    4,
+                    gi.as_ptr(),
+                    gp.as_ptr(),
+                    cnt,
+                    lig_face,
+                    20.0f32.to_bits(),
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    2,
+                    adv.as_mut_ptr(),
+                    offs.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            assert!(adv[0] > 0.0 && adv[1] > 0.0 && adv[2] > 0.0);
+            release_com(lig_face);
+        }
+
         release_com(ta);
         release_com(fac);
     }
