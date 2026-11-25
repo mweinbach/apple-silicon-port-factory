@@ -305,6 +305,7 @@ When `--json` is passed:
 
 | Command | Key `data` fields |
 |---|---|
+| `readiness` | `assessment`, `ranked_findings[]`, `binaries[]` (instruction forms, CPUID gaps and every regular/delay import), `unscanned[]`. [Usage and exit codes](OPS_DB.md#readiness-for-one-game) |
 | `scan` | `binaries_scanned`, `total_instructions`, `jit_arm64_instructions`, `unmapped_instructions`, `aggregate_jit_coverage_pct`, `recorded_tsv`, `binaries[]` (`binary_name`, `is_dll`, `image_base`, `size_of_image`, `functions_count`, `exports_count`, `jit_coverage_pct`, `imported_dlls[]`, `by_category`, `top_mnemonics[]`, `unmapped_mnemonics[]`), `skipped[]` |
 | `win32-audit` | `binaries_audited`, `total_imports`, `resolved_imports`, `unresolved_imports`, `aggregate_readiness_pct`, `binaries[]` (`binary_name`, `total_imports`, `resolved_imports`, `unresolved_count`, `readiness_pct`, `resolved_by_category`, `detected_middleware[]`, `unresolved[]`, `unresolved_by_dll`) |
 | `anticheat-audit` | `binaries_audited`, `kernel_driver_blockers`, `binaries[]` (`binary_name`, `verdict_code`, `verdict`, `compatible`, `direct_syscalls`, `decoded_ssns[]`, `ud2_count`, `int3_count`, `cpuid_count`, `rdtsc_count`, `xgetbv_count`, `gs_teb_peb_reads`, `kuser_shared_reads`, `sections[]`, `anti_debug_imports[]`, `veh_seh_imports[]`, `memory_unpack_imports[]`, `kernel_driver_imports[]`) |

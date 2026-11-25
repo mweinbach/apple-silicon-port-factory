@@ -724,7 +724,7 @@ pub unsafe extern "win64" fn WakeAllConditionVariable(cv: *mut c_void) {
 }
 
 // ---------------------------------------------------------------------------
-// INIT_ONCE (pointer-sized): low 2 bits state (0 new, 1 running, 2 done),
+// INIT_ONCE (pointer-sized): low 2 bits state (0 new, 1 synchronous, 2 done, 3 asynchronous),
 // upper bits = context.
 // ---------------------------------------------------------------------------
 
@@ -739,49 +739,60 @@ pub unsafe extern "win64" fn InitOnceInitialize(once: *mut c_void) {
 }
 
 pub unsafe extern "win64" fn InitOnceBeginInitialize(once: *mut c_void, flags: u32, pending: *mut BOOL, ctx: *mut *mut c_void) -> BOOL {
-    let a = AtomicWord::from_ptr(once);
-    if flags & INIT_ONCE_ASYNC != 0 {
-        stub!("INIT_ONCE_ASYNC treated as synchronous");
+    if once.is_null() || pending.is_null() || !matches!(flags, 0 | INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC) {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
+    let word = AtomicWord::from_ptr(once);
+    let running = if flags == INIT_ONCE_ASYNC { 3 } else { 1 };
     loop {
-        let v = a.load(Acquire);
-        match v & 3 {
+        let value = word.load(Acquire);
+        match value & 3 {
             2 => {
-                std::ptr::write_unaligned(pending, FALSE);
+                pending.write_unaligned(FALSE);
                 if !ctx.is_null() {
-                    std::ptr::write_unaligned(ctx, (v & !3) as *mut c_void);
+                    ctx.write_unaligned((value & !3) as *mut c_void);
                 }
                 return TRUE;
             }
+            _ if flags == INIT_ONCE_CHECK_ONLY => {
+                crate::teb::set_last_error(31); // STATUS_UNSUCCESSFUL -> ERROR_GEN_FAILURE
+                return FALSE;
+            }
             0 => {
-                if flags & INIT_ONCE_CHECK_ONLY != 0 {
-                    std::ptr::write_unaligned(pending, TRUE);
-                    return TRUE;
-                }
-                if a.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
-                    std::ptr::write_unaligned(pending, TRUE);
-                    return TRUE;
+                if word.compare_exchange(0, running, AcqRel, Acquire).is_ok() {
+                    break;
                 }
             }
+            3 if running == 3 => break,
+            1 if running == 1 => {
+                park(once as usize, || word.load(Acquire) == 1, || {}, |_, _| {}, DEFAULT_PARK_TOKEN, None);
+            }
             _ => {
-                if flags & INIT_ONCE_CHECK_ONLY != 0 {
-                    std::ptr::write_unaligned(pending, TRUE);
-                    return TRUE;
-                }
-                park(once as usize, || a.load(Relaxed) & 3 == 1, || {}, |_, _| {}, DEFAULT_PARK_TOKEN, None);
+                crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
             }
         }
     }
+    pending.write_unaligned(TRUE);
+    TRUE
 }
 
 pub unsafe extern "win64" fn InitOnceComplete(once: *mut c_void, flags: u32, ctx: *mut c_void) -> BOOL {
-    let a = AtomicWord::from_ptr(once);
-    if flags & INIT_ONCE_INIT_FAILED != 0 {
-        a.store(0, Release);
-    } else {
-        a.store((ctx as usize & !3) | 2, Release);
+    if once.is_null() || ctx as usize & 3 != 0 || !matches!(flags, 0 | INIT_ONCE_ASYNC | INIT_ONCE_INIT_FAILED)
+        || (flags == INIT_ONCE_INIT_FAILED && !ctx.is_null()) {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
-    unpark_all(once as usize, DEFAULT_UNPARK_TOKEN);
+    let running = if flags == INIT_ONCE_ASYNC { 3 } else { 1 };
+    let next = if flags == INIT_ONCE_INIT_FAILED { 0 } else { ctx as usize | 2 };
+    if let Err(previous) = AtomicWord::from_ptr(once).compare_exchange(running, next, AcqRel, Acquire) {
+        crate::teb::set_last_error(if matches!(previous & 3, 1 | 3) { err::ERROR_INVALID_PARAMETER } else { 31 });
+        return FALSE;
+    }
+    if running == 1 {
+        unpark_all(once as usize, DEFAULT_UNPARK_TOKEN);
+    }
     TRUE
 }
 
@@ -806,7 +817,10 @@ pub unsafe extern "win64" fn InitOnceExecuteOnce(once: *mut c_void, f: InitOnceF
         0,
     ) as BOOL;
     if ok != FALSE {
-        InitOnceComplete(once, 0, c);
+        if InitOnceComplete(once, 0, c) == FALSE {
+            InitOnceComplete(once, INIT_ONCE_INIT_FAILED, std::ptr::null_mut());
+            return FALSE;
+        }
         if !ctx.is_null() {
             std::ptr::write_unaligned(ctx, (c as usize & !3) as *mut c_void);
         }

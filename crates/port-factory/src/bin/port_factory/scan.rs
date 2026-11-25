@@ -37,6 +37,44 @@ fn collect_pe_targets_or_err(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub fn cmd_readiness(args: &[String]) -> Result<i32> {
+    let mut path = None;
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            s if !s.starts_with('-') && path.is_none() => path = Some(Path::new(s)),
+            _ => return Err(usage_err("usage: readiness <PE_OR_GAME_DIR> [--json]")),
+        }
+    }
+    let input = path.ok_or_else(|| usage_err("readiness requires a game directory or PE"))?;
+    let report = port_factory::readiness::analyze(input, &workspace_root().join("db"))?;
+    if json {
+        let error = match report.exit_code {
+            exit_codes::INCOMPATIBLE => Some("unimplemented guest instructions found".into()),
+            exit_codes::UNRESOLVED_IMPORTS => Some("unresolved imports found".into()),
+            exit_codes::RUNTIME_ERROR => {
+                Some("one or more PE candidates could not be scanned".into())
+            }
+            _ => None,
+        };
+        return Ok(emit_json(&JsonEnvelope::with_status(
+            "readiness",
+            report.exit_code,
+            report.data,
+            error,
+        )));
+    }
+    print!("{}", report.text);
+    Ok(report.exit_code)
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+pub fn cmd_readiness(_: &[String]) -> Result<i32> {
+    anyhow::bail!("readiness requires Apple Silicon macOS to query the ARM64 lowerer")
+}
+
 pub fn cmd_scan(args: &[String]) -> Result<i32> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut record = false;

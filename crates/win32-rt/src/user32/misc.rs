@@ -277,8 +277,8 @@ pub unsafe extern "win64" fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32
     // Scale UI element dimensions linearly with DPI; screen pixel metrics stay unscaled.
     match index {
         2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 20 | 21 | 28 | 29 | 30
-        | 31 | 32 | 33 | 34 | 35 | 38 | 39 | 45 | 46 | 47 | 48 | 49 | 50 | 51 | 52 | 53 | 54
-        | 55 | 57 | 58 | 71 | 72 | 83 | 84 | 92 => {
+        | 31 | 32 | 33 | 34 | 35 | 36 | 37 | 38 | 39 | 45 | 46 | 47 | 48 | 49 | 50 | 51 | 52
+        | 53 | 54 | 55 | 57 | 58 | 71 | 72 | 83 | 84 | 92 => {
             let scaled = (base as i64 * dpi as i64 + 48) / 96;
             scaled as i32
         }
@@ -762,6 +762,8 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool, dpi: u32) -> BO
             spi_state().lock().unwrap().mouse = m;
             TRUE
         }
+        0x200E => put_u32(GetSystemMetricsForDpi(83, dpi) as u32), // SPI_GETFOCUSBORDERWIDTH
+        0x2010 => put_u32(GetSystemMetricsForDpi(84, dpi) as u32), // SPI_GETFOCUSBORDERHEIGHT
         SPI_GETMOUSESPEED => put_u32(spi_state().lock().unwrap().mouse_speed),
         SPI_SETMOUSESPEED => {
             let v = pv as usize as u32;

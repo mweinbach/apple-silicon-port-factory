@@ -1255,11 +1255,47 @@ pub unsafe extern "win64" fn PrivilegeCheck(token: HANDLE, _privs: *mut c_void, 
     TRUE
 }
 
-pub unsafe extern "win64" fn OpenProcessToken(_proc: HANDLE, _access: u32, out: *mut HANDLE) -> BOOL {
-    if out.is_null() {
-        return err(ERROR_INVALID_PARAMETER, FALSE);
+// The emulated process has a standard primary token. Duplicates keep their own
+// type and impersonation level while referring to the same guest identity.
+struct Token {
+    kind: u32,
+    level: u32,
+    access: u32,
+}
+
+impl handles::KObject for Token {
+    fn type_name(&self) -> &'static str { "Token" }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl Token {
+    fn access_mask(request: u32) -> u32 {
+        const TOKEN_ALL_ACCESS: u32 = 0x000f01ff;
+        if request & (0x02000000 | 0x10000000) != 0 { return TOKEN_ALL_ACCESS; }
+        let mut mask = request & 0x0fffffff;
+        for (generic, rights) in [(0x80000000, 0x20008), (0x40000000, 0x200e0), (0x20000000, 0x20000)] {
+            if request & generic != 0 { mask |= rights; }
+        }
+        mask
     }
-    *out = handles::insert(Arc::new(handles::Opaque("Token")));
+
+    fn resolve(h: HANDLE, access: u32) -> Result<Arc<Self>, u32> {
+        // GetCurrentProcessToken and GetCurrentThreadEffectiveToken pseudo-handles.
+        let token = if matches!(h as isize, -4 | -6) {
+            Arc::new(Self { kind: 1, level: 0, access: 8 })
+        } else {
+            handles::get_as::<Self>(h).ok_or(ERROR_INVALID_HANDLE)?
+        };
+        if token.access & access != access { return Err(ERROR_ACCESS_DENIED); }
+        Ok(token)
+    }
+}
+
+pub unsafe extern "win64" fn OpenProcessToken(process: HANDLE, access: u32, out: *mut HANDLE) -> BOOL {
+    if out.is_null() { return err(ERROR_INVALID_PARAMETER, FALSE); }
+    if !crate::kernel32::process::is_self(process) { return err(ERROR_INVALID_HANDLE, FALSE); }
+    let access = Token::access_mask(access);
+    out.write_unaligned(handles::insert(Arc::new(Token { kind: 1, level: 0, access })));
     TRUE
 }
 
@@ -1277,118 +1313,95 @@ pub unsafe extern "win64" fn OpenThreadToken(
     err(1008, FALSE)
 }
 
+const USER_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 0xe8, 3, 0, 0]; // S-1-5-1000
+const USERS_SID: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x21, 2, 0, 0];
+const WORLD_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+const MEDIUM_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 16, 0, 0x20, 0, 0];
+const TOKEN_GROUPS: &[(&[u8], u32)] = &[(WORLD_SID, 7), (USERS_SID, 7), (MEDIUM_SID, 0x60)];
+
 pub unsafe extern "win64" fn GetTokenInformation(
-    token: HANDLE,
-    info_class: u32,
-    buf: *mut u8,
-    buf_len: u32,
-    ret_len: *mut u32,
+    token: HANDLE, info_class: u32, buf: *mut u8, buf_len: u32, ret_len: *mut u32,
 ) -> BOOL {
-    if token.is_null() || ret_len.is_null() {
-        return err(ERROR_INVALID_PARAMETER, FALSE);
-    }
+    if ret_len.is_null() { return err(ERROR_INVALID_PARAMETER, FALSE); }
+    let token = match Token::resolve(token, 8) {
+        Ok(t) => t,
+        Err(e) => return err(e, FALSE),
+    };
+    let fit = |needed: usize| {
+        ret_len.write_unaligned(needed as u32);
+        !buf.is_null() && (buf_len as usize) >= needed
+    };
+    let store_sid = |field: usize, offset: usize, sid: &[u8]| {
+        let dst = buf.add(offset);
+        std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+        buf.add(field).cast::<*mut u8>().write_unaligned(dst);
+    };
     match info_class {
-        // TokenUser (1): TOKEN_USER { SID_AND_ATTRIBUTES { PSID @0, DWORD Attrs @8 } } + 12-byte SID
-        1 => {
-            let need = 16 + 12;
-            std::ptr::write_unaligned(ret_len, need);
-            if buf.is_null() || buf_len < need {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
-            }
-            std::ptr::write_bytes(buf, 0, need as usize);
-            let sid = buf.add(16);
-            *sid = 1; // revision
-            *sid.add(1) = 1; // subauthority count
-            *sid.add(7) = 5; // SECURITY_NT_AUTHORITY
-            std::ptr::write_unaligned(sid.add(8) as *mut u32, 1000);
-            std::ptr::write_unaligned(buf as *mut usize, sid as usize);
-            TRUE
+        1 | 4 | 5 | 25 => { // TokenUser, Owner, PrimaryGroup, IntegrityLevel
+            let (header, sid) = match info_class {
+                1 => (16, USER_SID), 4 => (8, USER_SID),
+                5 => (8, USERS_SID), _ => (16, MEDIUM_SID),
+            };
+            if !fit(header + sid.len()) { return err(ERROR_INSUFFICIENT_BUFFER, FALSE); }
+            std::ptr::write_bytes(buf, 0, header);
+            store_sid(0, header, sid);
+            if info_class == 25 { buf.add(8).cast::<u32>().write_unaligned(0x20); }
         }
-        // TokenSessionId (12) -> 1
-        12 => {
-            std::ptr::write_unaligned(ret_len, 4);
-            if buf.is_null() || buf_len < 4 {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+        2 => { // TOKEN_GROUPS with inline SIDs and absolute pointers into the caller's buffer
+            let header = 8 + 16 * TOKEN_GROUPS.len();
+            let size = header + TOKEN_GROUPS.iter().map(|(s, _)| s.len()).sum::<usize>();
+            if !fit(size) { return err(ERROR_INSUFFICIENT_BUFFER, FALSE); }
+            std::ptr::write_bytes(buf, 0, header);
+            buf.cast::<u32>().write_unaligned(TOKEN_GROUPS.len() as u32);
+            let mut offset = header;
+            for (i, &(sid, attributes)) in TOKEN_GROUPS.iter().enumerate() {
+                let field = 8 + 16 * i;
+                store_sid(field, offset, sid);
+                buf.add(field + 8).cast::<u32>().write_unaligned(attributes);
+                offset += sid.len();
             }
-            std::ptr::write_unaligned(buf as *mut u32, 1);
-            TRUE
         }
-        // TokenElevationType (18) -> TokenElevationTypeDefault (1)
-        18 => {
-            std::ptr::write_unaligned(ret_len, 4);
-            if buf.is_null() || buf_len < 4 {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
-            }
-            std::ptr::write_unaligned(buf as *mut u32, 1);
-            TRUE
+        8 | 9 | 12 | 18 | 20 | 21 | 23 | 24 | 26 | 29 => {
+            let value = match info_class {
+                8 => token.kind,
+                9 if token.kind == 2 => token.level,
+                9 => return err(1349, FALSE), // ERROR_BAD_TOKEN_TYPE
+                12 | 18 => 1, // session 1, TokenElevationTypeDefault
+                _ => 0, // standard user, unrestricted, no virtualization/UIAccess/AppContainer
+            };
+            if !fit(4) { return err(ERROR_INSUFFICIENT_BUFFER, FALSE); }
+            buf.cast::<u32>().write_unaligned(value);
         }
-        // TokenElevation (20) -> 0 (not elevated)
-        20 => {
-            std::ptr::write_unaligned(ret_len, 4);
-            if buf.is_null() || buf_len < 4 {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
-            }
-            std::ptr::write_unaligned(buf as *mut u32, 0);
-            TRUE
-        }
-        // TokenIntegrityLevel (25) -> Medium (0x2000)
-        25 => {
-            let need = 16 + 12;
-            std::ptr::write_unaligned(ret_len, need);
-            if buf.is_null() || buf_len < need {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
-            }
-            std::ptr::write_bytes(buf, 0, need as usize);
-            let sid = buf.add(16);
-            *sid = 1;
-            *sid.add(1) = 1;
-            *sid.add(7) = 16; // SECURITY_MANDATORY_LABEL_AUTHORITY
-            std::ptr::write_unaligned(sid.add(8) as *mut u32, 0x2000); // MEDIUM_RID
-            std::ptr::write_unaligned(buf as *mut usize, sid as usize);
-            std::ptr::write_unaligned(buf.add(8) as *mut u32, 0x20); // SE_GROUP_INTEGRITY
-            TRUE
-        }
-        // TokenIsAppContainer (29) -> 0
-        29 => {
-            std::ptr::write_unaligned(ret_len, 4);
-            if buf.is_null() || buf_len < 4 {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
-            }
-            std::ptr::write_unaligned(buf as *mut u32, 0);
-            TRUE
+        3 => { // TOKEN_PRIVILEGES: this guest identity holds no privileges.
+            if !fit(4) { return err(ERROR_INSUFFICIENT_BUFFER, FALSE); }
+            buf.cast::<u32>().write_unaligned(0);
         }
         _ => {
             stub!("GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED");
-            std::ptr::write_unaligned(ret_len, 0);
-            err(crate::types::err::ERROR_CALL_NOT_IMPLEMENTED, FALSE)
+            ret_len.write_unaligned(0);
+            return err(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
         }
     }
-}
-
-pub unsafe extern "win64" fn DuplicateToken(
-    _existing: HANDLE,
-    _imp_level: u32,
-    out: *mut HANDLE,
-) -> BOOL {
-    if out.is_null() {
-        return err(ERROR_INVALID_PARAMETER, FALSE);
-    }
-    std::ptr::write_unaligned(out, handles::insert(Arc::new(handles::Opaque("Token"))));
     TRUE
 }
 
+pub unsafe extern "win64" fn DuplicateToken(existing: HANDLE, imp_level: u32, out: *mut HANDLE) -> BOOL {
+    DuplicateTokenEx(existing, 0x0c, std::ptr::null_mut(), imp_level, 2, out)
+}
+
 pub unsafe extern "win64" fn DuplicateTokenEx(
-    _existing: HANDLE,
-    _access: u32,
-    _attr: *mut c_void,
-    _imp_level: u32,
-    _token_type: u32,
-    out: *mut HANDLE,
+    existing: HANDLE, access: u32, _attr: *mut c_void, imp_level: u32, token_type: u32, out: *mut HANDLE,
 ) -> BOOL {
-    if out.is_null() {
+    if out.is_null() || !matches!(token_type, 1 | 2) || imp_level > 3 {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    std::ptr::write_unaligned(out, handles::insert(Arc::new(handles::Opaque("Token"))));
+    let original = match Token::resolve(existing, 2) {
+        Ok(t) => t,
+        Err(e) => return err(e, FALSE),
+    };
+    if original.kind == 2 && imp_level > original.level { return err(1346, FALSE); }
+    let access = if access == 0 { original.access } else { Token::access_mask(access) };
+    out.write_unaligned(handles::insert(Arc::new(Token { kind: token_type, level: imp_level, access })));
     TRUE
 }
 
@@ -1673,15 +1686,17 @@ pub unsafe extern "win64" fn ConvertSidToStringSidA(sid: *const u8, out: *mut LP
     TRUE
 }
 
-pub unsafe extern "win64" fn CheckTokenMembership(
-    _token: HANDLE,
-    _sid: *const c_void,
-    is_member: *mut BOOL,
-) -> BOOL {
-    if is_member.is_null() {
-        return err(ERROR_INVALID_PARAMETER, FALSE);
+pub unsafe extern "win64" fn CheckTokenMembership(token: HANDLE, sid: *const c_void, is_member: *mut BOOL) -> BOOL {
+    if is_member.is_null() || sid.is_null() { return err(ERROR_INVALID_PARAMETER, FALSE); }
+    if !token.is_null() {
+        match Token::resolve(token, 8) {
+            Ok(t) if t.kind == 2 => {}
+            Ok(_) => return err(1309, FALSE), // ERROR_NO_IMPERSONATION_TOKEN
+            Err(e) => return err(e, FALSE),
+        }
     }
-    std::ptr::write_unaligned(is_member, FALSE);
+    let enabled = TOKEN_GROUPS.iter().any(|&(group, flags)| flags & 4 != 0 && EqualSid(sid.cast(), group.as_ptr()) != 0);
+    is_member.write_unaligned(enabled as BOOL);
     TRUE
 }
 

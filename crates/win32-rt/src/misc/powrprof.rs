@@ -48,6 +48,7 @@ const SYSTEM_HIBER_FILE_INFORMATION: u32 = 68;
 const POWER_INFORMATION_LEVEL_MAX: u32 = 100;
 
 const STATUS_SUCCESS: i32 = 0;
+const STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
@@ -1146,17 +1147,10 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             STATUS_SUCCESS
         }
         SYSTEM_POWER_INFORMATION => {
-            // SYSTEM_POWER_INFORMATION (16 bytes): MaxIdlenessAllowed, Idleness, TimeRemaining, CoolingMode
-            if out_buf.is_null() || out_len < 16 {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            let p = out_buf as *mut u8;
-            std::ptr::write_bytes(p, 0, 16);
-            std::ptr::write_unaligned(p.add(0) as *mut u32, 50); // MaxIdlenessAllowed
-            std::ptr::write_unaligned(p.add(4) as *mut u32, 0); // Idleness
-            std::ptr::write_unaligned(p.add(8) as *mut u32, 0); // TimeRemaining
-            std::ptr::write_unaligned(p.add(12), 0u8); // CoolingMode = PO_TZ_ACTIVE
-            STATUS_SUCCESS
+            log::warn!(
+                "powrprof: CallNtPowerInformation(SystemPowerInformation) is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
         }
         LAST_WAKE_TIME => {
             if out_buf.is_null() || out_len < 8 {
@@ -1747,7 +1741,7 @@ mod tests {
             assert_eq!(u32::from_le_bytes(pol[192..196].try_into().unwrap()), 600); // VideoTimeout
             assert_eq!(u32::from_le_bytes(pol[212..216].try_into().unwrap()), 1200); // SpindownTimeout
 
-            let mut spi = [0u8; 16];
+            let mut spi = [0xAAu8; 16];
             assert_eq!(
                 CallNtPowerInformation(
                     SYSTEM_POWER_INFORMATION,
@@ -1756,9 +1750,9 @@ mod tests {
                     spi.as_mut_ptr() as *mut c_void,
                     spi.len() as u32,
                 ),
-                STATUS_SUCCESS
+                STATUS_NOT_IMPLEMENTED
             );
-            assert_eq!(u32::from_le_bytes(spi[0..4].try_into().unwrap()), 50);
+            assert!(spi.iter().all(|&b| b == 0xAA), "unsupported SystemPowerInformation must not fabricate telemetry");
 
             let mut wake_t = 0u64;
             assert_eq!(

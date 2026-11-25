@@ -64,6 +64,8 @@ plus a starter template at [`games/_template/game.toml`](games/_template/game.to
   catalog, Win32 import auditor, anti-cheat / .NET / shader / runtime-hazard auditors, offline
   `.aot` prewarming, scaffolding tools (`scaffold-op`, `scaffold-dll`), macOS `.app` and iOS
   `.app`/`.ipa` bundlers, and 4-tier x86 differential verification.
+  Run `cargo opsdb -- readiness /path/to/game` to rank static CPU and import blockers before booting.
+  [Readiness report](docs/OPS_DB.md#readiness-for-one-game)
 - **Per-game targets (`games/`)** — Declarative `game.toml` manifests
   ([`games/_template/game.toml`](games/_template/game.toml),
   [`games/overwatch/game.toml`](games/overwatch/game.toml),

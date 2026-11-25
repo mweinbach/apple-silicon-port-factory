@@ -846,12 +846,11 @@ pub unsafe extern "win64" fn GetTextExtentPoint32A(hdc: usize, s: LPCSTR, n: i32
 
 pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
     let _ = hdc;
-    let mon = crate::user32::monitor::primary_rect();
+    let displays = crate::macos::display::get();
+    let primary = &displays.monitors[0];
+    let mon = primary.rect;
     let dpi = crate::user32::window::dpi().max(1) as i32;
-    let refresh = crate::macos::display::monitors()
-        .first()
-        .map(|m| m.refresh_hz as i32)
-        .unwrap_or(60);
+    let refresh = (primary.refresh_hz as i32).max(1);
 
     // Per Microsoft Learn GetDeviceCaps: HORZRES/VERTRES/HORZSIZE/VERTSIZE/BITSPIXEL/PLANES
     // describe the display device capabilities (inherited by compatible memory DCs), never
@@ -860,8 +859,12 @@ pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
     match index {
         0 => 0x4000,                                                 // DRIVERVERSION (4.0)
         2 => 1,                                                      // TECHNOLOGY (DT_RASDISPLAY)
-        4 => ((w as f64) / (dpi as f64) * 25.4).round() as i32,      // HORZSIZE (mm)
-        6 => ((h as f64) / (dpi as f64) * 25.4).round() as i32,      // VERTSIZE (mm)
+        4 => displays
+            .primary_mm
+            .map_or_else(|| ((w as f64) / (dpi as f64) * 25.4).round() as i32, |mm| mm.0), // HORZSIZE (mm)
+        6 => displays
+            .primary_mm
+            .map_or_else(|| ((h as f64) / (dpi as f64) * 25.4).round() as i32, |mm| mm.1), // VERTSIZE (mm)
         8 => w,                                                      // HORZRES
         10 => h,                                                     // VERTRES
         12 => bpp,                                                   // BITSPIXEL

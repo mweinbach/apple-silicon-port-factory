@@ -1907,3 +1907,61 @@ int main(void) {
     return 0;
 }
 "##;
+
+fn run_core_guest(name: &str, source: &str, libs: &[&str]) {
+    let zig = corpus_compiler();
+    let tmp = TempDir::new(name);
+    std::fs::write(tmp.path().join("check.h"), include_str!("os_guests/check.h")).unwrap();
+    let exe = compile_c_guest(&zig, tmp.path(), name, source, libs);
+    run_guest_both_modes(name, &exe, tmp.path(), &[&format!("PASS {name}")], DEFAULT_TIMEOUT);
+}
+
+#[test]
+fn core_memory_file() {
+    run_core_guest("memory_file", include_str!("os_guests/memory_file.c"), &[]);
+}
+
+#[test]
+fn core_sync_timer() {
+    run_core_guest("sync_timer", include_str!("os_guests/sync_timer.c"), &[]);
+}
+
+#[test]
+fn core_system_time() {
+    run_core_guest("system_time", include_str!("os_guests/system_time.c"), &["winmm"]);
+}
+
+#[test]
+fn core_messages_security() {
+    run_core_guest("messages_security", include_str!("os_guests/messages_security.c"), &["user32", "gdi32", "advapi32"]);
+}
+
+#[test]
+fn core_process_crt() {
+    run_core_guest("process_crt", include_str!("os_guests/process_crt.c"), &[]);
+}
+
+#[test]
+fn core_module_notifications() {
+    let zig = corpus_compiler();
+    let tmp = TempDir::new("module");
+    std::fs::write(tmp.path().join("check.h"), include_str!("os_guests/check.h")).unwrap();
+    std::fs::write(tmp.path().join("notify.c"), include_str!("os_guests/notify_dll.c")).unwrap();
+    let status = std::process::Command::new(&zig)
+        .current_dir(tmp.path())
+        .args(["cc", "-target", "x86_64-windows-gnu", "-O2", "-shared", "notify.c", "-o", "notify_fixture.dll"])
+        .status().expect("compile notification DLL");
+    assert!(status.success(), "building test DLL failed: {status}");
+    let exe = compile_c_guest(&zig, tmp.path(), "module", include_str!("os_guests/module.c"), &[]);
+    run_guest_both_modes("module", &exe, tmp.path(), &["PASS module"], DEFAULT_TIMEOUT);
+}
+
+#[test]
+fn core_threadpool_cleanup() {
+    run_core_guest("threadpool", include_str!("os_guests/threadpool.c"), &[]);
+}
+
+#[test]
+fn core_winsock_messages() {
+    run_core_guest("winsock_msg", include_str!("os_guests/winsock_msg.c"), &["ws2_32"]);
+}
