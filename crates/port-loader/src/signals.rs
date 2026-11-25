@@ -943,12 +943,15 @@ unsafe fn isolated_hpage_transfer(start_addr: usize, buf: &mut [u8], is_write: b
 /// `CAS`, or `CASP`) at guest address `start_addr` through an isolated `mach_vm_remap`
 /// alias so the guest VA stays strictly `PROT_NONE` throughout.
 ///
-/// Naturally aligned single-host-page atomics execute real hardware atomic instructions
-/// (`AtomicU{8,16,32,64}` / `caspal`) directly on the shared physical page frame through
-/// the alias; unaligned or cross-host-page atomics serialize under `UNALIGNED_ATOMIC_LOCK`.
+/// All subpage-emulated atomics (aligned single-host-page and unaligned/cross-host-page)
+/// serialize under `SUBPAGE_ATOMIC_LOCK` so an unaligned cross-page atomic at `0x3FFC`
+/// cannot race with an overlapping aligned atomic at `0x4000` across distinct `HPAGE_LOCKS`
+/// buckets.
 #[cfg(target_arch = "aarch64")]
 unsafe fn isolated_hpage_atomic(start_addr: usize, op: Arm64MemOp, ss: *mut u64) -> bool {
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8};
+    static SUBPAGE_ATOMIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _atomic_guard = SUBPAGE_ATOMIC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     extern "C" {
         static mach_task_self_: libc::mach_port_t;
         fn mach_vm_remap(
@@ -1141,9 +1144,8 @@ unsafe fn isolated_hpage_atomic(start_addr: usize, op: Arm64MemOp, ss: *mut u64)
         return true;
     }
 
-    // Unaligned or cross-host-page atomic: serialize via lock and transfer through isolated aliases.
-    static UNALIGNED_ATOMIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = UNALIGNED_ATOMIC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Unaligned or cross-host-page atomic: already serialized with aligned subpage atomics
+    // under `SUBPAGE_ATOMIC_LOCK` above; transfer through isolated aliases.
     let mut cur = [0u8; 16];
     if !isolated_hpage_transfer(start_addr, &mut cur[..total_bytes], false) {
         return false;
@@ -2026,6 +2028,56 @@ mod tests {
             let mut direct = [0u8; 16];
             std::ptr::copy_nonoverlapping(straddle as *const u8, direct.as_mut_ptr(), 16);
             assert_eq!(direct, pat);
+
+            libc::munmap(raw, 0x8000);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn isolated_hpage_atomic_serializes_cross_page_and_aligned_updates() {
+        unsafe {
+            let raw = libc::mmap(
+                std::ptr::null_mut(),
+                0x8000,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(raw, libc::MAP_FAILED);
+            assert_eq!(libc::mprotect(raw, 0x8000, libc::PROT_NONE), 0);
+
+            let base = raw as usize;
+            let cross_addr = base + 0x3FFC;
+            let aligned_addr = base + 0x4000;
+            const ITERS: usize = 200;
+
+            let t_cross = std::thread::spawn(move || {
+                let mut ss = [0u64; 33];
+                ss[1] = 0x0000_0001_0000_0001u64; // +1 to low u32 (0x3FFC) and +1 to high u32 (0x4000)
+                let op = Arm64MemOp::AtomicRmw { op: AtomicRmwOp::Add, rs: 1, rt: 2, bytes: 8 };
+                for _ in 0..ITERS {
+                    assert!(isolated_hpage_atomic(cross_addr, op, ss.as_mut_ptr()));
+                }
+            });
+            let t_aligned = std::thread::spawn(move || {
+                let mut ss = [0u64; 33];
+                ss[1] = 1u64; // +1 to aligned u32 at 0x4000
+                let op = Arm64MemOp::AtomicRmw { op: AtomicRmwOp::Add, rs: 1, rt: 2, bytes: 4 };
+                for _ in 0..ITERS {
+                    assert!(isolated_hpage_atomic(aligned_addr, op, ss.as_mut_ptr()));
+                }
+            });
+            t_cross.join().unwrap();
+            t_aligned.join().unwrap();
+
+            let mut got = [0u8; 8];
+            assert!(isolated_hpage_transfer(cross_addr, &mut got, false));
+            let lo = u32::from_le_bytes(got[0..4].try_into().unwrap());
+            let hi = u32::from_le_bytes(got[4..8].try_into().unwrap());
+            assert_eq!(lo, ITERS as u32);
+            assert_eq!(hi, (ITERS * 2) as u32, "aligned and cross-page subpage atomics must not lose updates");
 
             libc::munmap(raw, 0x8000);
         }

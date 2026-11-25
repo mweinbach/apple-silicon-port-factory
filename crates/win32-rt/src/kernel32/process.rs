@@ -1700,10 +1700,22 @@ pub unsafe extern "win64" fn CreateProcessA(
 // Job objects (limits tracking, process membership, query, kill-on-close)
 // ---------------------------------------------------------------------------
 
+const JOB_OBJECT_LIMIT_WORKINGSET: u32 = 0x0000_0001;
+const JOB_OBJECT_LIMIT_PROCESS_TIME: u32 = 0x0000_0002;
+const JOB_OBJECT_LIMIT_JOB_TIME: u32 = 0x0000_0004;
 const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0000_0008;
 const JOB_OBJECT_LIMIT_AFFINITY: u32 = 0x0000_0010;
 const JOB_OBJECT_LIMIT_PRIORITY_CLASS: u32 = 0x0000_0020;
+const JOB_OBJECT_LIMIT_SCHEDULING_CLASS: u32 = 0x0000_0080;
+const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
+const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x0000_0200;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+const UNENFORCED_JOB_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_WORKINGSET
+    | JOB_OBJECT_LIMIT_PROCESS_TIME
+    | JOB_OBJECT_LIMIT_JOB_TIME
+    | JOB_OBJECT_LIMIT_SCHEDULING_CLASS
+    | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+    | JOB_OBJECT_LIMIT_JOB_MEMORY;
 
 enum JobMember {
     SelfProc(u32),
@@ -1725,7 +1737,6 @@ impl JobMember {
     }
 }
 
-const JOB_OBJECT_LIMIT_JOB_TIME: u32 = 0x0004;
 const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
 const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
 const JOB_OBJECT_MSG_EXIT_PROCESS: u32 = 7;
@@ -1787,10 +1798,6 @@ fn self_rusage_snapshot() -> (u64, u64, u64) {
 
 struct JobState {
     basic_limits: [u8; 64],
-    process_memory_limit: usize,
-    job_memory_limit: usize,
-    peak_process_memory: usize,
-    peak_job_memory: usize,
     completion_port: Option<(usize, Arc<crate::kernel32::file::IoCompletionPort>)>,
     group_ids: Vec<u16>,
     group_affinities: Vec<[u8; 16]>,
@@ -1808,10 +1815,6 @@ impl JobState {
     fn new(name: Option<String>) -> Self {
         Self {
             basic_limits: [0u8; 64],
-            process_memory_limit: 0,
-            job_memory_limit: 0,
-            peak_process_memory: 0,
-            peak_job_memory: 0,
             completion_port: None,
             group_ids: vec![0],
             group_affinities: Vec::new(),
@@ -2149,6 +2152,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             let mut buf = [0u8; 64];
             std::ptr::copy_nonoverlapping(bytes, buf.as_mut_ptr(), 64);
             let flags = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+            if (flags & UNENFORCED_JOB_LIMIT_FLAGS) != 0 {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectBasicLimitInformation, flags=0x{flags:x}): requested resource/time/memory limits are not enforced"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
             if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
                 let aff = usize::from_le_bytes(buf[48..56].try_into().unwrap());
                 let sm = system_affinity_mask();
@@ -2158,10 +2168,6 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 }
             }
             st.basic_limits = buf;
-            if (flags & JOB_OBJECT_LIMIT_JOB_TIME) != 0 && st.self_assign_rusage.is_some() {
-                let (u, k, _) = self_rusage_snapshot();
-                st.self_period_rusage = Some((u, k));
-            }
             if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && st.contains_pid(std::process::id()) {
                 let prio = u32::from_le_bytes(buf[56..60].try_into().unwrap());
                 if prio != 0 {
@@ -2228,6 +2234,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             let mut basic = [0u8; 64];
             std::ptr::copy_nonoverlapping(bytes, basic.as_mut_ptr(), 64);
             let flags = u32::from_le_bytes(basic[16..20].try_into().unwrap());
+            if (flags & UNENFORCED_JOB_LIMIT_FLAGS) != 0 {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectExtendedLimitInformation, flags=0x{flags:x}): requested resource/time/memory limits are not enforced"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
             if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
                 let aff = usize::from_le_bytes(basic[48..56].try_into().unwrap());
                 let sm = system_affinity_mask();
@@ -2237,12 +2250,6 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 }
             }
             st.basic_limits = basic;
-            if (flags & JOB_OBJECT_LIMIT_JOB_TIME) != 0 && st.self_assign_rusage.is_some() {
-                let (u, k, _) = self_rusage_snapshot();
-                st.self_period_rusage = Some((u, k));
-            }
-            st.process_memory_limit = std::ptr::read_unaligned(bytes.add(112) as *const usize);
-            st.job_memory_limit = std::ptr::read_unaligned(bytes.add(120) as *const usize);
             if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && st.contains_pid(std::process::id()) {
                 let prio = u32::from_le_bytes(basic[56..60].try_into().unwrap());
                 if prio != 0 {
@@ -2486,12 +2493,8 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
             } else {
                 0
             };
-            let peak_proc = st.peak_process_memory.max(self_peak);
-            let peak_job = st.peak_job_memory.max(peak_proc);
-            std::ptr::write_unaligned(out.add(112) as *mut usize, st.process_memory_limit);
-            std::ptr::write_unaligned(out.add(120) as *mut usize, st.job_memory_limit);
-            std::ptr::write_unaligned(out.add(128) as *mut usize, peak_proc);
-            std::ptr::write_unaligned(out.add(136) as *mut usize, peak_job);
+            std::ptr::write_unaligned(out.add(128) as *mut usize, self_peak);
+            std::ptr::write_unaligned(out.add(136) as *mut usize, self_peak);
             put_ret(144);
             TRUE
         }
@@ -4028,13 +4031,22 @@ pub(crate) mod tests {
             assert_eq!(IsProcessInJob(handles::CURRENT_PROCESS, job, &mut in_job), TRUE);
             assert_eq!(in_job, FALSE);
 
-            // Set extended limits (KILL_ON_JOB_CLOSE | ACTIVE_PROCESS=1, ProcessMemoryLimit=64 MiB).
+            // Unenforced process/job memory limits fail honestly with ERROR_NOT_SUPPORTED.
+            let mut ext_mem = [0u8; 144];
+            std::ptr::write_unaligned(ext_mem.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_PROCESS_MEMORY);
+            std::ptr::write_unaligned(ext_mem.as_mut_ptr().add(112) as *mut usize, 64 * 1024 * 1024);
+            assert_eq!(SetInformationJobObject(job, 9, ext_mem.as_ptr() as *const c_void, 144), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            std::ptr::write_unaligned(ext_mem.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_JOB_MEMORY);
+            std::ptr::write_unaligned(ext_mem.as_mut_ptr().add(120) as *mut usize, 128 * 1024 * 1024);
+            assert_eq!(SetInformationJobObject(job, 9, ext_mem.as_ptr() as *const c_void, 144), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // Set enforced extended limits (KILL_ON_JOB_CLOSE | ACTIVE_PROCESS=1).
             let mut ext = [0u8; 144];
             let flags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             std::ptr::write_unaligned(ext.as_mut_ptr().add(16) as *mut u32, flags);
             std::ptr::write_unaligned(ext.as_mut_ptr().add(40) as *mut u32, 1u32); // ActiveProcessLimit = 1
-            std::ptr::write_unaligned(ext.as_mut_ptr().add(112) as *mut usize, 64 * 1024 * 1024);
-            std::ptr::write_unaligned(ext.as_mut_ptr().add(120) as *mut usize, 128 * 1024 * 1024);
             assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
 
             // Assign current process.
@@ -4051,8 +4063,10 @@ pub(crate) mod tests {
             assert_eq!(ret_len, 144);
             assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(16) as *const u32), flags);
             assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(40) as *const u32), 1);
-            assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(112) as *const usize), 64 * 1024 * 1024);
-            assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(120) as *const usize), 128 * 1024 * 1024);
+            assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(112) as *const usize), 0);
+            assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(120) as *const usize), 0);
+            assert!(std::ptr::read_unaligned(out_ext.as_ptr().add(128) as *const usize) > 0);
+            assert!(std::ptr::read_unaligned(out_ext.as_ptr().add(136) as *const usize) > 0);
 
             // Burn a small amount of real CPU time so getrusage(RUSAGE_SELF) advances visibly.
             let mut spin: u64 = 1;
