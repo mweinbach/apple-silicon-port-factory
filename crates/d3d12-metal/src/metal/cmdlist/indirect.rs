@@ -11,7 +11,7 @@ use super::CommandList;
 use crate::metal::binding::{self, MtlArgumentTable};
 use crate::metal::clear;
 use crate::metal::encstats as stats;
-use crate::metal::indirect::{self, IndirectLayout, KernelParams, Work};
+use crate::metal::indirect::{self, IndirectLayout, KernelParams, TessGridParams, Work};
 use crate::metal::indirect_icb::{self, IcbParams, MtlIcb, PrepBatch, PrepItem, MAX_PREP_BATCH};
 use crate::metal::passtiming as pt;
 use crate::metal::pipeline::{
@@ -21,8 +21,9 @@ use crate::metal::pipeline::{
 use crate::metal::resource::{self, SubRange, HK_CBV_BUF, HK_RAW_STRUCT_BUF};
 use dxil_metal::runtime::{
     ARGUMENT_BUFFER_BIND_POINT, ARGUMENT_BUFFER_DRAW_ARGUMENTS_BIND_POINT,
-    ARGUMENT_BUFFER_UNIFORMS_BIND_POINT, DESCRIPTOR_HEAP_BIND_POINT, NON_INDEXED_DRAW,
-    SAMPLER_HEAP_BIND_POINT,
+    ARGUMENT_BUFFER_HULL_DOMAIN_BIND_POINT, ARGUMENT_BUFFER_UNIFORMS_BIND_POINT,
+    DESCRIPTOR_HEAP_BIND_POINT, NON_INDEXED_DRAW, SAMPLER_HEAP_BIND_POINT,
+    TESSELLATOR_TABLES_BIND_POINT, VERTEX_BUFFER_BIND_POINT,
 };
 use objc2::rc::Retained;
 use objc2_metal::{
@@ -1241,6 +1242,11 @@ impl CommandList {
         if mesh && self.gfx.mesh.is_none() {
             return Err("ExecuteIndirect DispatchMesh without a mesh PSO".into());
         }
+        if matches!(l.work, Work::Draw | Work::DrawIndexed)
+            && self.gfx.pso.as_ref().is_some_and(|p| p.tess_emu.is_some())
+        {
+            return self.execute_indirect_tessellation_emulated(l, max_count, args, args_cpu, count);
+        }
         let ws = l.work.size();
         let pred = self.predication;
         if !compute
@@ -1921,6 +1927,312 @@ impl CommandList {
                     None => e.drawPrimitives_indirectBuffer(prim, a),
                 }
             }
+        }
+        self.invalidate_table_cache();
+        Ok(())
+    }
+
+    /// Routes `ExecuteIndirect` (`Work::Draw` / `Work::DrawIndexed`) for tessellation-emulation
+    /// graphics PSOs through a GPU compute expansion into Metal 4 indirect mesh-threadgroup
+    /// dispatches, honoring optional count buffers, predication, and per-command root patches.
+    fn execute_indirect_tessellation_emulated(
+        &mut self,
+        l: &IndirectLayout,
+        max_count: u32,
+        args: u64,
+        args_cpu: Option<&[u8]>,
+        count: Option<u64>,
+    ) -> Result<(), String> {
+        if !self.icb.icb_segs.is_empty() {
+            self.flush_draw_batch(true);
+        }
+        let p = self.gfx.pso.clone().ok_or("indirect tessellation draw without a graphics PSO")?;
+        let emu = p.tess_emu.as_ref().ok_or("not a tessellation-emulation PSO")?;
+        let ir_prim = crate::topology::ir_primitive_type(self.gfx.topology)
+            .ok_or_else(|| format!("unsupported tessellation topology {}", self.gfx.topology))?;
+
+        let mesh_overlap: u16 = match emu.output_primitive {
+            1 => 0, // Point
+            2 => 1, // Line
+            _ => 2, // TriangleCW / TriangleCCW
+        };
+        let max_input_prims = emu.gs_max_input_primitives_per_mesh_threadgroup.max(1);
+        let patches_per_obj_tg = emu.hs_max_patches_per_object_threadgroup.max(1);
+        let input_cps = emu.hs_input_control_point_count.max(1);
+        let threads_per_patch = emu.hs_max_object_threads_per_patch.max(1);
+        let obj_tg_vtx_stride = patches_per_obj_tg.saturating_mul(input_cps).max(1);
+        let obj_tg_size = patches_per_obj_tg.saturating_mul(threads_per_patch).max(1);
+        let mesh_tg_size = max_input_prims;
+
+        let default_index = if l.work == Work::DrawIndexed && l.ib_offset.is_none() {
+            let (addr, _size, fmt) =
+                self.gfx.ib.ok_or("indirect indexed tessellation draw without an index buffer")?;
+            let f = crate::topology::index_format(fmt)
+                .ok_or_else(|| format!("index format {fmt}"))?;
+            Some((f.ir, addr))
+        } else {
+            None
+        };
+        if l.work == Work::DrawIndexed && l.ib_offset.is_some() && args_cpu.is_none() && self.gfx.ib.is_none() {
+            return Err("indirect indexed tessellation draw with GPU-only IB view requires a bound index buffer".into());
+        }
+
+        let (tlab_size, patches) = if l.patches.is_empty() {
+            (0, Vec::new())
+        } else {
+            let rs = self.gfx_root.rs.as_ref().ok_or(
+                "ExecuteIndirect with root argument changes but no root signature",
+            )?;
+            (rs.layout().size, l.kernel_patches(rs.layout())?)
+        };
+        let ts = indirect::tlab_stride(tlab_size);
+        let pred = self.predication;
+
+        let make_draw_info = |idx: Option<(u16, u64)>| -> dxil_metal::runtime::RuntimeDrawInfo {
+            let (index_type, index_buffer) = match idx {
+                Some((ir_idx, ib_va)) => (ir_idx, ib_va),
+                None => (NON_INDEXED_DRAW, 0),
+            };
+            dxil_metal::runtime::RuntimeDrawInfo {
+                index_type,
+                primitive_topology: ir_prim,
+                threads_per_patch: threads_per_patch.min(u8::MAX as u32) as u8,
+                max_input_primitives_per_mesh_threadgroup: max_input_prims as u16,
+                object_threadgroup_vertex_stride: obj_tg_vtx_stride as u16,
+                mesh_threadgroup_primitive_stride: (max_input_prims as u16).saturating_sub(mesh_overlap),
+                gs_instance_count: emu.gs_instance_count.min(u16::MAX as u32) as u16,
+                patches_per_object_threadgroup: patches_per_obj_tg as u16,
+                input_control_points_per_patch: input_cps as u16,
+                index_buffer,
+            }
+        };
+
+        self.pt_split();
+        let ring = self.ring.clone().ok_or("command list is not open")?;
+        const ARGS_OUT_STRIDE: u32 = 32;
+        const GRID_OUT_STRIDE: u32 = 16;
+        let (root, args_out, grid_out, tlabs, kernel_params_va, default_info_va, default_vbs_va) = {
+            let mut r = ring.lock().unwrap();
+            let root = if self.gfx_root.rs.is_some() {
+                if self.gfx_root.is_dirty() {
+                    self.gfx_root.flush(&mut r)?
+                } else {
+                    self.gfx_root.bound
+                }
+            } else {
+                0
+            };
+            let (args_out, _) = r.alloc(ARGS_OUT_STRIDE as usize * max_count as usize, 16)?;
+            let (grid_out, _) = r.alloc(GRID_OUT_STRIDE as usize * max_count as usize, 16)?;
+            let tout = if patches.is_empty() {
+                0
+            } else {
+                r.alloc(ts as usize * max_count as usize, 256)?.0
+            };
+            let mut tp = TessGridParams {
+                args,
+                count: count.unwrap_or(0),
+                args_out,
+                grid_out,
+                tlab_out: tout,
+                tlab_in: root,
+                pred: pred.map_or(0, |pr| pr.gpu_va),
+                stride: l.stride,
+                max_count,
+                work_offset: l.work_offset,
+                work_size: l.work.size(),
+                args_out_stride: ARGS_OUT_STRIDE,
+                grid_out_stride: GRID_OUT_STRIDE,
+                obj_tg_vtx_stride,
+                tlab_size,
+                tlab_stride: ts,
+                npatch: patches.len() as u32,
+                pred_op: pred.map_or(0, |pr| pr.op),
+                _pad: 0,
+                patches: [Default::default(); indirect::MAX_PATCHES],
+            };
+            tp.patches[..patches.len()].copy_from_slice(&patches);
+            let kernel_params_va = r.upload(tp.bytes(), 256)?;
+            let default_info_va = r.upload(&make_draw_info(default_index).to_bytes(), 16)?;
+            let mut vb_bytes = [0u8; 31 * 16];
+            for s in 0..31usize {
+                let (addr, size, stride) =
+                    if s < self.gfx.vbs.len() { self.gfx.vbs[s] } else { (0, 0, 0) };
+                let rv = dxil_metal::runtime::RuntimeVertexBuffer { addr, length: size, stride };
+                vb_bytes[s * 16..(s + 1) * 16].copy_from_slice(&rv.to_bytes());
+            }
+            let default_vbs_va = r.upload(&vb_bytes, 16)?;
+            (
+                root,
+                args_out,
+                grid_out,
+                (tout != 0).then_some((tout, ts as u64)),
+                kernel_params_va,
+                default_info_va,
+                default_vbs_va,
+            )
+        };
+
+        // Expand D3D indirect draw args into Metal indirect mesh-threadgroup grid + draw params.
+        let k = indirect::tess_grid_kernel()?;
+        let ce = self.compute().ok_or("compute encoder")?;
+        self.pt_note_util(pt::synth::EI_EXPAND, 1);
+        ce.setComputePipelineState(k);
+        self.compute_pso_bound = false;
+        self.set_table_addr(kernel_params_va, 0);
+        ce.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: (max_count as usize).div_ceil(64), height: 1, depth: 1 },
+            MTLSize { width: 64, height: 1, depth: 1 },
+        );
+        self.note_stage_ran(MTLStages::Dispatch);
+        stats::inc(&stats::c::ei_expand);
+        self.produced(
+            MTLStages::Dispatch,
+            MTLStages::Vertex
+                | MTLStages::Object
+                | MTLStages::Mesh
+                | MTLStages::Fragment
+                | MTLStages::Dispatch,
+        );
+
+        // Pre-upload any per-command CPU-visible IB/VB overrides before opening the render encoder.
+        let mut per_cmd_overrides: Option<Vec<(Option<u64>, Option<u64>)>> = None;
+        if (l.ib_offset.is_some() || !l.vb_offsets.is_empty()) && args_cpu.is_some() {
+            let cb_all = args_cpu.unwrap();
+            let mut overrides = Vec::with_capacity(max_count as usize);
+            let mut r = ring.lock().unwrap();
+            for i in 0..max_count as usize {
+                let cmd_bytes = cb_all.get(i * (l.stride as usize)..);
+                let cmd_info_va = if let Some(ib_off) = l.ib_offset {
+                    let ib = cmd_bytes
+                        .and_then(|cb| cb.get(ib_off as usize..ib_off as usize + 16))
+                        .and_then(|ib| {
+                            let iaddr = u64::from_le_bytes(ib[0..8].try_into().unwrap());
+                            let isize = u32::from_le_bytes(ib[8..12].try_into().unwrap());
+                            let ifmt = u32::from_le_bytes(ib[12..16].try_into().unwrap());
+                            if iaddr == 0 || isize == 0 {
+                                None
+                            } else {
+                                let f = crate::topology::index_format(ifmt)?;
+                                self.gfx.ib = Some((iaddr, isize, ifmt));
+                                Some((f.ir, iaddr))
+                            }
+                        })
+                        .or_else(|| {
+                            self.gfx.ib.and_then(|(iaddr, isize, ifmt)| {
+                                (iaddr != 0 && isize != 0)
+                                    .then(|| crate::topology::index_format(ifmt).map(|f| (f.ir, iaddr)))
+                                    .flatten()
+                            })
+                        });
+                    Some(r.upload(&make_draw_info(ib).to_bytes(), 16)?)
+                } else {
+                    None
+                };
+                let cmd_vbs_va = if !l.vb_offsets.is_empty() {
+                    if let Some(cb) = cmd_bytes {
+                        for &(slot, voff) in &l.vb_offsets {
+                            if slot < MAX_VERTEX_SLOTS {
+                                if let Some(vb) = cb.get(voff as usize..voff as usize + 16) {
+                                    let vaddr = u64::from_le_bytes(vb[0..8].try_into().unwrap());
+                                    let vsize = u32::from_le_bytes(vb[8..12].try_into().unwrap());
+                                    let vstride = u32::from_le_bytes(vb[12..16].try_into().unwrap());
+                                    self.gfx.vbs[slot as usize] = (vaddr, vsize, vstride);
+                                }
+                            }
+                        }
+                    }
+                    let mut vb_bytes = [0u8; 31 * 16];
+                    for s in 0..31usize {
+                        let (addr, size, stride) =
+                            if s < self.gfx.vbs.len() { self.gfx.vbs[s] } else { (0, 0, 0) };
+                        let rv = dxil_metal::runtime::RuntimeVertexBuffer { addr, length: size, stride };
+                        vb_bytes[s * 16..(s + 1) * 16].copy_from_slice(&rv.to_bytes());
+                    }
+                    Some(r.upload(&vb_bytes, 16)?)
+                } else {
+                    None
+                };
+                overrides.push((cmd_info_va, cmd_vbs_va));
+            }
+            per_cmd_overrides = Some(overrides);
+        }
+
+        let writes_uav = self.gfx_pso_writes_uav(&p);
+        if self.gfx.pass_uav_hazard && writes_uav {
+            self.end_encoder();
+        }
+        let eff_reads = p.pre_raster_reads | READS_BUF;
+        let (e, size) = unsafe { self.draw_encoder_for(eff_reads)? };
+        self.rp_sync.enc_pre_raster_reads |= eff_reads;
+        self.rp_sync.enc_ps_reads |= p.ps_read_classes;
+        self.rp_sync.enc_uav_used |= writes_uav || p.uses_uav;
+        self.render_mid_barrier(&e);
+        self.record_gfx_draw_uav_writes(
+            writes_uav,
+            p.vs_writes_uav,
+            p.ps_writes_uav,
+            MTLStages::Object | MTLStages::Mesh,
+        );
+        self.sync_pre_raster(&e, eff_reads);
+        self.apply_dynamic(&e, &p, size);
+        let fast = self.opts.opt_fast_enc_state;
+        if !(fast && self.rp_sync.enc_render_cache.mesh_stages_bound) {
+            e.setArgumentTable_atStages(&self.table, crate::mesh::STAGES);
+            self.rp_sync.enc_render_cache.mesh_stages_bound = true;
+        }
+        self.bind_table(root);
+        if root != 0 {
+            self.set_table_addr(root, ARGUMENT_BUFFER_HULL_DOMAIN_BIND_POINT as usize);
+        }
+        let tess_tables_va = binding::tessellator_tables_va()?;
+        self.set_table_addr(tess_tables_va, TESSELLATOR_TABLES_BIND_POINT as usize);
+        self.set_table_addr(default_info_va, ARGUMENT_BUFFER_UNIFORMS_BIND_POINT as usize);
+        self.set_table_addr(default_vbs_va, VERTEX_BUFFER_BIND_POINT as usize);
+
+        let mut ran = MTLStages::Object | MTLStages::Mesh;
+        if !self.bar.pass_targets.is_empty()
+            || self.active_dsv().is_some_and(|v| v.resource != 0)
+            || p.ps.is_some()
+        {
+            ran |= MTLStages::Fragment;
+        }
+        self.note_stage_ran(ran);
+        stats::add(&stats::c::ei_draws, max_count as u64);
+        unsafe {
+            e.setObjectThreadgroupMemoryLength_atIndex(15360, 0);
+        }
+        for i in 0..max_count as u64 {
+            if let Some((t, tstride)) = tlabs {
+                let tva = t + i * tstride;
+                unsafe {
+                    self.table.setAddress_atIndex(tva, ARGUMENT_BUFFER_BIND_POINT as usize);
+                    self.table.setAddress_atIndex(tva, ARGUMENT_BUFFER_HULL_DOMAIN_BIND_POINT as usize);
+                }
+            }
+            if let Some(ref overrides) = per_cmd_overrides {
+                let (cmd_info_va, cmd_vbs_va) = overrides[i as usize];
+                if let Some(ia) = cmd_info_va {
+                    unsafe {
+                        self.table.setAddress_atIndex(ia, ARGUMENT_BUFFER_UNIFORMS_BIND_POINT as usize);
+                    }
+                }
+                if let Some(va) = cmd_vbs_va {
+                    unsafe {
+                        self.table.setAddress_atIndex(va, VERTEX_BUFFER_BIND_POINT as usize);
+                    }
+                }
+            }
+            let a = args_out + i * ARGS_OUT_STRIDE as u64;
+            let g = grid_out + i * GRID_OUT_STRIDE as u64;
+            unsafe {
+                self.table.setAddress_atIndex(a, ARGUMENT_BUFFER_DRAW_ARGUMENTS_BIND_POINT as usize);
+            }
+            e.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                g,
+                MTLSize { width: obj_tg_size as usize, height: 1, depth: 1 },
+                MTLSize { width: mesh_tg_size as usize, height: 1, depth: 1 },
+            );
         }
         self.invalidate_table_cache();
         Ok(())

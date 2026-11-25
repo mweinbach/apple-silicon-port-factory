@@ -17,6 +17,8 @@ pub const ARGUMENT_BUFFER_DRAW_ARGUMENTS_BIND_POINT: u64 = 4;
 pub const ARGUMENT_BUFFER_UNIFORMS_BIND_POINT: u64 = 5;
 /// `IRRuntimeVertexBuffers` for geometry emulation (`kIRVertexBufferBindPoint`).
 pub const VERTEX_BUFFER_BIND_POINT: u64 = 6;
+/// Tessellator lookup tables buffer (`kIRRuntimeTessellatorTablesBindPoint`).
+pub const TESSELLATOR_TABLES_BIND_POINT: u64 = 7;
 /// First Metal vertex attribute index used for stage-in (`kIRStageInAttributeStartIndex`).
 pub const STAGE_IN_ATTRIBUTE_START_INDEX: u64 = 11;
 

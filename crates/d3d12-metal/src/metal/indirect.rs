@@ -203,6 +203,38 @@ impl KernelParams {
     }
 }
 
+/// Parameters for [`tess_grid_kernel`] (matches MSL `TessGridParams`; device addresses as u64).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct TessGridParams {
+    pub args: u64,
+    pub count: u64,
+    pub args_out: u64,
+    pub grid_out: u64,
+    pub tlab_out: u64,
+    pub tlab_in: u64,
+    pub pred: u64,
+    pub stride: u32,
+    pub max_count: u32,
+    pub work_offset: u32,
+    pub work_size: u32,
+    pub args_out_stride: u32,
+    pub grid_out_stride: u32,
+    pub obj_tg_vtx_stride: u32,
+    pub tlab_size: u32,
+    pub tlab_stride: u32,
+    pub npatch: u32,
+    pub pred_op: u32,
+    pub _pad: u32,
+    pub patches: [KernelPatch; MAX_PATCHES],
+}
+
+impl TessGridParams {
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>()) }
+    }
+}
+
 /// Bytes between consecutive expanded top-level argument buffers.
 pub fn tlab_stride(size: u32) -> u32 {
     size.max(8).next_multiple_of(64)
@@ -317,25 +349,100 @@ kernel void aw2_execute_indirect(constant Params& p [[buffer(0)]], uint i [[thre
         }
     }
 }
+
+struct TessGridParams {
+    device const uchar* args;
+    device const uint* count;
+    device uchar* args_out;
+    device uchar* grid_out;
+    device uchar* tlab_out;
+    device const uchar* tlab_in;
+    device const ulong* pred;
+    uint stride;
+    uint max_count;
+    uint work_offset;
+    uint work_size;
+    uint args_out_stride;
+    uint grid_out_stride;
+    uint obj_tg_vtx_stride;
+    uint tlab_size;
+    uint tlab_stride;
+    uint npatch;
+    uint pred_op;
+    uint _pad;
+    Patch patches[16];
+};
+
+kernel void aw2_execute_indirect_tess_grid(constant TessGridParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.max_count) return;
+    uint n = p.count != nullptr ? min(p.count[0], p.max_count) : p.max_count;
+    device const uchar* cmd = p.args + (ulong)i * p.stride;
+    bool skip = i >= n;
+    if (p.pred != nullptr) {
+        ulong pv = p.pred[0];
+        if ((p.pred_op == 0u && pv == 0ul) || (p.pred_op != 0u && pv != 0ul)) {
+            skip = true;
+        }
+    }
+    device uint* o = (device uint*)(p.args_out + (ulong)i * p.args_out_stride);
+    uint words = p.work_size / 4u;
+    for (uint w = 0u; w < 5u; ++w) {
+        o[w] = w < words ? *(device const uint*)(cmd + p.work_offset + 4u * w) : 0u;
+    }
+    uint vert_or_idx_count = o[0];
+    uint instances = o[1];
+    device uint* g = (device uint*)(p.grid_out + (ulong)i * p.grid_out_stride);
+    if (skip || vert_or_idx_count == 0u || instances == 0u || p.obj_tg_vtx_stride == 0u) {
+        o[1] = 0u;
+        g[0] = 0u;
+        g[1] = 0u;
+        g[2] = 0u;
+    } else {
+        uint tg_x = (vert_or_idx_count - 1u) / p.obj_tg_vtx_stride + 1u;
+        g[0] = tg_x;
+        g[1] = instances;
+        g[2] = 1u;
+    }
+    if (p.tlab_out != nullptr) {
+        device uchar* t = p.tlab_out + (ulong)i * p.tlab_stride;
+        for (uint b = 0u; b < p.tlab_size; b += 4u) *(device uint*)(t + b) = *(device const uint*)(p.tlab_in + b);
+        for (uint k = 0u; k < p.npatch; ++k) {
+            Patch q = p.patches[k];
+            for (uint w = 0u; w < q.dwords; ++w) {
+                *(device uint*)(t + q.dst + 4u * w) = q.kind == 1u ? i : *(device const uint*)(cmd + q.src + 4u * w);
+            }
+        }
+    }
+}
 "#;
 
 pub type MtlComputePso = ProtocolObject<dyn MTLComputePipelineState>;
 
-struct Kernel(Result<Retained<MtlComputePso>, String>);
-unsafe impl Send for Kernel {}
-unsafe impl Sync for Kernel {}
+struct Kernels(Result<(Retained<MtlComputePso>, Retained<MtlComputePso>), String>);
+unsafe impl Send for Kernels {}
+unsafe impl Sync for Kernels {}
+
+fn compiled_kernels() -> &'static Kernels {
+    static K: OnceLock<Kernels> = OnceLock::new();
+    K.get_or_init(|| {
+        Kernels((|| {
+            let lib = super::pipeline::library_from_source("indirect kernel", SRC)?;
+            let tg = super::pipeline::fast_bind_pso().then_some([64, 1, 1]);
+            let main = super::pipeline::compute_pipeline_from_function_tg(&lib, "aw2_execute_indirect", tg)?;
+            let tess = super::pipeline::compute_pipeline_from_function_tg(&lib, "aw2_execute_indirect_tess_grid", tg)?;
+            Ok((main, tess))
+        })())
+    })
+}
 
 /// The expansion kernel (compiled once from source via `MTL4Compiler` targeting Metal 4.1).
 pub fn kernel() -> Result<&'static MtlComputePso, String> {
-    static K: OnceLock<Kernel> = OnceLock::new();
-    let k = K.get_or_init(|| {
-        Kernel((|| {
-            let lib = super::pipeline::library_from_source("indirect kernel", SRC)?;
-            let tg = super::pipeline::fast_bind_pso().then_some([64, 1, 1]);
-            super::pipeline::compute_pipeline_from_function_tg(&lib, "aw2_execute_indirect", tg)
-        })())
-    });
-    k.0.as_deref().map_err(|e| e.clone())
+    compiled_kernels().0.as_ref().map(|(m, _)| &**m).map_err(|e| e.clone())
+}
+
+/// Indirect tessellation draw-to-mesh-grid expansion kernel (compiled once alongside [`kernel`]).
+pub fn tess_grid_kernel() -> Result<&'static MtlComputePso, String> {
+    compiled_kernels().0.as_ref().map(|(_, t)| &**t).map_err(|e| e.clone())
 }
 
 #[cfg(test)]
@@ -369,6 +476,7 @@ mod tests {
     fn params_layout() {
         // 7 u64 + 12 u32 + 16 patches of 16 bytes.
         assert_eq!(std::mem::size_of::<KernelParams>(), 56 + 48 + 256);
+        assert_eq!(std::mem::size_of::<TessGridParams>(), 56 + 48 + 256);
     }
 
     /// Compiles the MSL and runs it on the GPU (arm64 hosts with Metal).
@@ -508,5 +616,95 @@ mod tests {
         // cmd 2: both zeroed
         assert_eq!(&o3[20..25], &[36, 0, 1, 0, 0]);
         assert_eq!(&o3[25..30], &[36, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn tess_grid_kernel_expands_draw_and_predication() {
+        let Some(d) = super::super::device() else { return };
+        let k = match tess_grid_kernel() {
+            Ok(k) => k,
+            Err(e) => panic!("{e}"),
+        };
+        let opts = MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
+        // 3 commands (non-indexed 16B draw args):
+        // cmd 0: count=7, instances=2 (stride=3 -> tg_x=ceil(7/3)=3, tg_y=2, tg_z=1)
+        // cmd 1: count=0, instances=4 -> zero grid
+        // cmd 2: count=9, instances=1 -> beyond count=2 -> zero grid & zero instance count
+        let args: [u32; 12] = [
+            7, 2, 10, 1,
+            0, 4, 0, 0,
+            9, 1, 0, 0,
+        ];
+        let ab = unsafe { d.dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(args.as_ptr() as *mut _).unwrap(), args.len() * 4, opts) }.unwrap();
+        let cb_ = unsafe { d.dev.newBufferWithBytes_length_options(std::ptr::NonNull::new([2u32].as_ptr() as *mut _).unwrap(), 4, opts) }.unwrap();
+        let args_out = d.dev.newBufferWithLength_options(3 * 32, opts).unwrap();
+        let grid_out = d.dev.newBufferWithLength_options(3 * 16, opts).unwrap();
+        let pred_zero = unsafe { d.dev.newBufferWithBytes_length_options(std::ptr::NonNull::new([0u64].as_ptr() as *mut _).unwrap(), 8, opts) }.unwrap();
+
+        let mut p = TessGridParams {
+            args: ab.gpuAddress(),
+            count: cb_.gpuAddress(),
+            args_out: args_out.gpuAddress(),
+            grid_out: grid_out.gpuAddress(),
+            stride: 16,
+            max_count: 3,
+            work_offset: 0,
+            work_size: 16,
+            args_out_stride: 32,
+            grid_out_stride: 16,
+            obj_tg_vtx_stride: 3,
+            ..Default::default()
+        };
+        let pb = unsafe { d.dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(p.bytes().as_ptr() as *mut _).unwrap(), p.bytes().len(), opts) }.unwrap();
+
+        let rsd = MTLResidencySetDescriptor::new();
+        let rs = d.dev.newResidencySetWithDescriptor_error(&rsd).unwrap();
+        for b in [&ab, &cb_, &args_out, &grid_out, &pred_zero, &pb] {
+            rs.addAllocation(ProtocolObject::from_ref(&**b));
+        }
+        rs.commit();
+
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxBufferBindCount(1);
+        let table = d.dev.newArgumentTableWithDescriptor_error(&atd).unwrap();
+        let q = d.dev.newMTL4CommandQueue().unwrap();
+        q.addResidencySet(&rs);
+        let alloc = d.dev.newCommandAllocator().unwrap();
+        let ev = d.dev.newSharedEvent().unwrap();
+
+        let run_once = |param_va: u64, seq: u64| {
+            let cmd = d.dev.newCommandBuffer().unwrap();
+            cmd.beginCommandBufferWithAllocator(&alloc);
+            let e = cmd.computeCommandEncoder().unwrap();
+            e.setComputePipelineState(k);
+            unsafe { table.setAddress_atIndex(param_va, 0) };
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: 3, height: 1, depth: 1 }, MTLSize { width: 64, height: 1, depth: 1 });
+            e.endEncoding();
+            cmd.endCommandBuffer();
+            let mut cbs = [std::ptr::NonNull::from(&*cmd)];
+            unsafe { q.commit_count(std::ptr::NonNull::new(cbs.as_mut_ptr()).unwrap(), 1) };
+            q.signalEvent_value(ProtocolObject::from_ref(&*ev), seq);
+            assert!(ev.waitUntilSignaledValue_timeoutMS(seq, 5000));
+        };
+
+        run_once(pb.gpuAddress(), 1);
+        let g = unsafe { std::slice::from_raw_parts(grid_out.contents().as_ptr() as *const u32, 12) };
+        assert_eq!(&g[0..3], &[3, 2, 1]);
+        assert_eq!(&g[4..7], &[0, 0, 0]);
+        assert_eq!(&g[8..11], &[0, 0, 0]);
+        let ao = unsafe { std::slice::from_raw_parts(args_out.contents().as_ptr() as *const u32, 24) };
+        assert_eq!(&ao[0..5], &[7, 2, 10, 1, 0]);
+        assert_eq!(&ao[16..21], &[9, 0, 0, 0, 0]);
+
+        // Predicated off with EQUAL_ZERO (pred_op == 0) when pred[0] == 0.
+        p.pred = pred_zero.gpuAddress();
+        p.pred_op = 0;
+        let pb2 = unsafe { d.dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(p.bytes().as_ptr() as *mut _).unwrap(), p.bytes().len(), opts) }.unwrap();
+        rs.addAllocation(ProtocolObject::from_ref(&*pb2));
+        rs.commit();
+        run_once(pb2.gpuAddress(), 2);
+        let g2 = unsafe { std::slice::from_raw_parts(grid_out.contents().as_ptr() as *const u32, 12) };
+        assert_eq!(&g2[0..3], &[0, 0, 0]);
     }
 }

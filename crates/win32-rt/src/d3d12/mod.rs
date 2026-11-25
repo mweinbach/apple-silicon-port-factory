@@ -184,20 +184,503 @@ pub unsafe extern "win64" fn D3D12SerializeVersionedRootSignature(desc: *const c
     serialize(d, out, err, "D3D12SerializeVersionedRootSignature")
 }
 
-pub unsafe extern "win64" fn D3D12CreateRootSignatureDeserializer(_data: *const c_void, size: usize, riid: *const Guid, out: *mut *mut c_void) -> HRESULT {
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+/// `ID3D12RootSignatureDeserializer` and `ID3D12VersionedRootSignatureDeserializer`.
+///
+/// Materializes exact Windows x64 ABI structs (`D3D12_ROOT_SIGNATURE_DESC` /
+/// `D3D12_VERSIONED_ROOT_SIGNATURE_DESC`) in pinned heap storage owned by the COM
+/// object so returned pointers stay valid for the object's lifetime.
+mod deserializer {
+    use super::com::*;
+    use super::vtables::{
+        IID_ID3D12RootSignatureDeserializer, IID_ID3D12VersionedRootSignatureDeserializer,
+    };
+    use crate::types::*;
+    use dxil_metal::root_signature::{
+        flags as rs_flags, DescriptorRangeType, RootDescriptorKind, RootParameterKind,
+        RootSignatureDesc, RootSignatureVersion, StaticSampler,
+    };
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RawRange10 {
+        range_type: u32,
+        num_descriptors: u32,
+        base_shader_register: u32,
+        register_space: u32,
+        offset_in_descriptors_from_table_start: u32,
     }
-    stub!("D3D12CreateRootSignatureDeserializer({size} bytes, {:?}) -> E_NOTIMPL", Guid::read(riid).unwrap_or_default());
-    E_NOTIMPL
+    const _: () = assert!(std::mem::size_of::<RawRange10>() == 20);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RawRange11 {
+        range_type: u32,
+        num_descriptors: u32,
+        base_shader_register: u32,
+        register_space: u32,
+        flags: u32,
+        offset_in_descriptors_from_table_start: u32,
+    }
+    const _: () = assert!(std::mem::size_of::<RawRange11>() == 24);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RawRootParam {
+        parameter_type: u32,
+        _pad0: u32,
+        u0: u32,
+        u1: u32,
+        u2: u64,
+        shader_visibility: u32,
+        _pad1: u32,
+    }
+    const _: () = assert!(std::mem::size_of::<RawRootParam>() == 32);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RawStaticSampler10 {
+        filter: u32,
+        address_u: u32,
+        address_v: u32,
+        address_w: u32,
+        mip_lod_bias: f32,
+        max_anisotropy: u32,
+        comparison_func: u32,
+        border_color: u32,
+        min_lod: f32,
+        max_lod: f32,
+        shader_register: u32,
+        register_space: u32,
+        shader_visibility: u32,
+    }
+    const _: () = assert!(std::mem::size_of::<RawStaticSampler10>() == 52);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RawStaticSampler12 {
+        base: RawStaticSampler10,
+        flags: u32,
+    }
+    const _: () = assert!(std::mem::size_of::<RawStaticSampler12>() == 56);
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct RawRootSigDesc {
+        num_parameters: u32,
+        _pad0: u32,
+        p_parameters: *const RawRootParam,
+        num_static_samplers: u32,
+        _pad1: u32,
+        p_static_samplers: *const c_void,
+        flags: u32,
+        _pad2: u32,
+    }
+    const _: () = assert!(std::mem::size_of::<RawRootSigDesc>() == 40);
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct RawVersionedRootSigDesc {
+        version: u32,
+        _pad: u32,
+        desc: RawRootSigDesc,
+    }
+    const _: () = assert!(std::mem::size_of::<RawVersionedRootSigDesc>() == 48);
+
+    #[allow(dead_code)] // Owns heap storage referenced by `RawRootParam::u2` pointers.
+    enum RangeStorage {
+        V10(Box<[RawRange10]>),
+        V11(Box<[RawRange11]>),
+    }
+
+    #[allow(dead_code)] // Owns heap storage referenced by `RawRootSigDesc::p_static_samplers`.
+    enum SamplerStorage {
+        V10(Box<[RawStaticSampler10]>),
+        V12(Box<[RawStaticSampler12]>),
+    }
+
+    /// Heap-stable storage for one materialized `D3D12_VERSIONED_ROOT_SIGNATURE_DESC`.
+    /// All internal pointers point into the owned `Box<[_]>` buffers stored alongside it.
+    struct MaterializedDesc {
+        versioned: Box<RawVersionedRootSigDesc>,
+        _params: Box<[RawRootParam]>,
+        _ranges: Vec<RangeStorage>,
+        _samplers: SamplerStorage,
+    }
+    // SAFETY: Immutable after construction; pointers point strictly into owned boxes.
+    unsafe impl Send for MaterializedDesc {}
+    unsafe impl Sync for MaterializedDesc {}
+
+    fn static_sampler_10(s: &StaticSampler) -> RawStaticSampler10 {
+        RawStaticSampler10 {
+            filter: s.filter,
+            address_u: s.address_u,
+            address_v: s.address_v,
+            address_w: s.address_w,
+            mip_lod_bias: s.mip_lod_bias,
+            max_anisotropy: s.max_anisotropy,
+            comparison_func: s.comparison_func,
+            border_color: s.border_color,
+            min_lod: s.min_lod,
+            max_lod: s.max_lod,
+            shader_register: s.shader_register,
+            register_space: s.register_space,
+            shader_visibility: s.visibility,
+        }
+    }
+
+    impl MaterializedDesc {
+        fn build(desc: &RootSignatureDesc, target: RootSignatureVersion) -> Result<Self, HRESULT> {
+            // Down-converting a v1.2 root signature that uses v1.2-only static sampler flags
+            // cannot be faithfully represented in v1.0 or v1.1.
+            if target < RootSignatureVersion::V1_2
+                && desc.static_samplers.iter().any(|s| s.flags != 0)
+            {
+                return Err(E_INVALIDARG);
+            }
+
+            let target_v10 = target == RootSignatureVersion::V1_0;
+            let src_v10 = desc.version == RootSignatureVersion::V1_0;
+            let mut ranges_keep: Vec<RangeStorage> = Vec::new();
+            let mut params = Vec::with_capacity(desc.parameters.len());
+
+            for p in &desc.parameters {
+                let raw = match &p.kind {
+                    RootParameterKind::DescriptorTable(rs) => {
+                        let ptr: *const c_void = if rs.is_empty() {
+                            std::ptr::null()
+                        } else if target_v10 {
+                            let boxed: Box<[RawRange10]> = rs
+                                .iter()
+                                .map(|r| RawRange10 {
+                                    range_type: r.range_type as u32,
+                                    num_descriptors: r.num_descriptors,
+                                    base_shader_register: r.base_shader_register,
+                                    register_space: r.register_space,
+                                    offset_in_descriptors_from_table_start: r
+                                        .offset_in_descriptors_from_table_start,
+                                })
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice();
+                            let ptr = boxed.as_ptr() as *const c_void;
+                            ranges_keep.push(RangeStorage::V10(boxed));
+                            ptr
+                        } else {
+                            let boxed: Box<[RawRange11]> = rs
+                                .iter()
+                                .map(|r| {
+                                    let flags = if src_v10 {
+                                        if r.range_type == DescriptorRangeType::Sampler {
+                                            rs_flags::RANGE_V1_0_DEFAULT_SAMPLER
+                                        } else {
+                                            rs_flags::RANGE_V1_0_DEFAULT_CBV_SRV_UAV
+                                        }
+                                    } else {
+                                        r.flags
+                                    };
+                                    RawRange11 {
+                                        range_type: r.range_type as u32,
+                                        num_descriptors: r.num_descriptors,
+                                        base_shader_register: r.base_shader_register,
+                                        register_space: r.register_space,
+                                        flags,
+                                        offset_in_descriptors_from_table_start: r
+                                            .offset_in_descriptors_from_table_start,
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice();
+                            let ptr = boxed.as_ptr() as *const c_void;
+                            ranges_keep.push(RangeStorage::V11(boxed));
+                            ptr
+                        };
+                        RawRootParam {
+                            parameter_type: 0,
+                            _pad0: 0,
+                            u0: rs.len() as u32,
+                            u1: 0,
+                            u2: ptr as usize as u64,
+                            shader_visibility: p.visibility,
+                            _pad1: 0,
+                        }
+                    }
+                    RootParameterKind::Constants {
+                        shader_register,
+                        register_space,
+                        num_32bit_values,
+                    } => RawRootParam {
+                        parameter_type: 1,
+                        _pad0: 0,
+                        u0: *shader_register,
+                        u1: *register_space,
+                        u2: *num_32bit_values as u64,
+                        shader_visibility: p.visibility,
+                        _pad1: 0,
+                    },
+                    RootParameterKind::Descriptor(kind, d) => {
+                        let ty = match kind {
+                            RootDescriptorKind::Cbv => 2,
+                            RootDescriptorKind::Srv => 3,
+                            RootDescriptorKind::Uav => 4,
+                        };
+                        let flags = if target_v10 {
+                            0
+                        } else if src_v10 {
+                            rs_flags::ROOT_DESCRIPTOR_V1_0_DEFAULT
+                        } else {
+                            d.flags
+                        };
+                        RawRootParam {
+                            parameter_type: ty,
+                            _pad0: 0,
+                            u0: d.shader_register,
+                            u1: d.register_space,
+                            u2: flags as u64,
+                            shader_visibility: p.visibility,
+                            _pad1: 0,
+                        }
+                    }
+                };
+                params.push(raw);
+            }
+
+            let params_box = params.into_boxed_slice();
+            let p_parameters = if params_box.is_empty() {
+                std::ptr::null()
+            } else {
+                params_box.as_ptr()
+            };
+
+            let (samplers_storage, p_static_samplers) = if target == RootSignatureVersion::V1_2 {
+                let boxed: Box<[RawStaticSampler12]> = desc
+                    .static_samplers
+                    .iter()
+                    .map(|s| RawStaticSampler12 { base: static_sampler_10(s), flags: s.flags })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let ptr = if boxed.is_empty() {
+                    std::ptr::null()
+                } else {
+                    boxed.as_ptr() as *const c_void
+                };
+                (SamplerStorage::V12(boxed), ptr)
+            } else {
+                let boxed: Box<[RawStaticSampler10]> = desc
+                    .static_samplers
+                    .iter()
+                    .map(static_sampler_10)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let ptr = if boxed.is_empty() {
+                    std::ptr::null()
+                } else {
+                    boxed.as_ptr() as *const c_void
+                };
+                (SamplerStorage::V10(boxed), ptr)
+            };
+
+            let versioned = Box::new(RawVersionedRootSigDesc {
+                version: target as u32,
+                _pad: 0,
+                desc: RawRootSigDesc {
+                    num_parameters: params_box.len() as u32,
+                    _pad0: 0,
+                    p_parameters,
+                    num_static_samplers: desc.static_samplers.len() as u32,
+                    _pad1: 0,
+                    p_static_samplers,
+                    flags: desc.flags,
+                    _pad2: 0,
+                },
+            });
+
+            Ok(Self {
+                versioned,
+                _params: params_box,
+                _ranges: ranges_keep,
+                _samplers: samplers_storage,
+            })
+        }
+
+        fn versioned_ptr(&self) -> *const RawVersionedRootSigDesc {
+            &*self.versioned as *const RawVersionedRootSigDesc
+        }
+
+        fn desc_ptr(&self) -> *const RawRootSigDesc {
+            &self.versioned.desc as *const RawRootSigDesc
+        }
+    }
+
+    pub struct RootSigDeserializer {
+        v10: MaterializedDesc,
+    }
+
+    static DESER_CLASS: OnceLock<Class> = OnceLock::new();
+    impl ComClass for RootSigDeserializer {
+        const TRACE_RELEASE: bool = false;
+        fn class() -> &'static Class {
+            class_once(&DESER_CLASS, || {
+                let mut s = iunknown_slots::<RootSigDeserializer>();
+                s.push(slot!("GetRootSignatureDesc" => get_root_sig_desc));
+                Class {
+                    name: "ID3D12RootSignatureDeserializer",
+                    vtbl: build_vtable("ID3D12RootSignatureDeserializer", &s),
+                    iids: &[IID_ID3D12RootSignatureDeserializer],
+                }
+            })
+        }
+    }
+
+    unsafe extern "win64" fn get_root_sig_desc(
+        this: *mut Obj<RootSigDeserializer>,
+    ) -> *const RawRootSigDesc {
+        Obj::get(this).v10.desc_ptr()
+    }
+
+    pub struct VersionedRootSigDeserializer {
+        parsed: RootSignatureDesc,
+        unconverted: MaterializedDesc,
+        converted: Mutex<[Option<MaterializedDesc>; 3]>,
+    }
+
+    static VDESER_CLASS: OnceLock<Class> = OnceLock::new();
+    impl ComClass for VersionedRootSigDeserializer {
+        const TRACE_RELEASE: bool = false;
+        fn class() -> &'static Class {
+            class_once(&VDESER_CLASS, || {
+                let mut s = iunknown_slots::<VersionedRootSigDeserializer>();
+                s.push(slot!("GetRootSignatureDescAtVersion" => get_desc_at_version));
+                s.push(slot!("GetUnconvertedRootSignatureDesc" => get_unconverted_desc));
+                Class {
+                    name: "ID3D12VersionedRootSignatureDeserializer",
+                    vtbl: build_vtable("ID3D12VersionedRootSignatureDeserializer", &s),
+                    iids: &[IID_ID3D12VersionedRootSignatureDeserializer],
+                }
+            })
+        }
+    }
+
+    unsafe extern "win64" fn get_unconverted_desc(
+        this: *mut Obj<VersionedRootSigDeserializer>,
+    ) -> *const RawVersionedRootSigDesc {
+        Obj::get(this).unconverted.versioned_ptr()
+    }
+
+    unsafe extern "win64" fn get_desc_at_version(
+        this: *mut Obj<VersionedRootSigDeserializer>,
+        convert_to_version: u32,
+        out_desc: *mut *const RawVersionedRootSigDesc,
+    ) -> HRESULT {
+        if !out_desc.is_null() {
+            std::ptr::write_unaligned(out_desc, std::ptr::null());
+        }
+        if out_desc.is_null() {
+            return E_INVALIDARG;
+        }
+        let Some(target) = RootSignatureVersion::from_raw(convert_to_version) else {
+            return E_INVALIDARG;
+        };
+        let d = Obj::get(this);
+        if target == d.parsed.version {
+            std::ptr::write_unaligned(out_desc, d.unconverted.versioned_ptr());
+            return S_OK;
+        }
+        let idx = (target as usize) - 1;
+        let mut cache = d.converted.lock().unwrap();
+        if cache[idx].is_none() {
+            match MaterializedDesc::build(&d.parsed, target) {
+                Ok(m) => cache[idx] = Some(m),
+                Err(hr) => return hr,
+            }
+        }
+        let ptr = cache[idx].as_ref().unwrap().versioned_ptr();
+        std::ptr::write_unaligned(out_desc, ptr);
+        S_OK
+    }
+
+    pub unsafe fn create_v10(
+        data: *const c_void,
+        size: usize,
+        riid: *const Guid,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        if !out.is_null() {
+            std::ptr::write_unaligned(out, std::ptr::null_mut());
+        }
+        if data.is_null() || size == 0 || riid.is_null() || out.is_null() {
+            return E_INVALIDARG;
+        }
+        let bytes = std::slice::from_raw_parts(data as *const u8, size);
+        let parsed = match RootSignatureDesc::from_blob(bytes) {
+            Ok(d) => d,
+            Err(e) => return super::failed!(E_INVALIDARG, "D3D12CreateRootSignatureDeserializer: {e}"),
+        };
+        let v10 = match MaterializedDesc::build(&parsed, RootSignatureVersion::V1_0) {
+            Ok(m) => m,
+            Err(hr) => return hr,
+        };
+        let obj = Obj::new(RootSigDeserializer { v10 });
+        let hr = query_out(obj as *mut c_void, riid, out);
+        Obj::release(obj);
+        hr
+    }
+
+    pub unsafe fn create_versioned(
+        data: *const c_void,
+        size: usize,
+        riid: *const Guid,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        if !out.is_null() {
+            std::ptr::write_unaligned(out, std::ptr::null_mut());
+        }
+        if data.is_null() || size == 0 || riid.is_null() || out.is_null() {
+            return E_INVALIDARG;
+        }
+        let bytes = std::slice::from_raw_parts(data as *const u8, size);
+        let parsed = match RootSignatureDesc::from_blob(bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                return super::failed!(
+                    E_INVALIDARG,
+                    "D3D12CreateVersionedRootSignatureDeserializer: {e}"
+                )
+            }
+        };
+        let unconverted = match MaterializedDesc::build(&parsed, parsed.version) {
+            Ok(m) => m,
+            Err(hr) => return hr,
+        };
+        let obj = Obj::new(VersionedRootSigDeserializer {
+            parsed,
+            unconverted,
+            converted: Mutex::new([None, None, None]),
+        });
+        let hr = query_out(obj as *mut c_void, riid, out);
+        Obj::release(obj);
+        hr
+    }
 }
 
-pub unsafe extern "win64" fn D3D12CreateVersionedRootSignatureDeserializer(_data: *const c_void, size: usize, riid: *const Guid, out: *mut *mut c_void) -> HRESULT {
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
-    }
-    stub!("D3D12CreateVersionedRootSignatureDeserializer({size} bytes, {:?}) -> E_NOTIMPL", Guid::read(riid).unwrap_or_default());
-    E_NOTIMPL
+pub unsafe extern "win64" fn D3D12CreateRootSignatureDeserializer(
+    data: *const c_void,
+    size: usize,
+    riid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    register_names();
+    deserializer::create_v10(data, size, riid, out)
+}
+
+pub unsafe extern "win64" fn D3D12CreateVersionedRootSignatureDeserializer(
+    data: *const c_void,
+    size: usize,
+    riid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    register_names();
+    deserializer::create_versioned(data, size, riid, out)
 }
 
 /// Pure-integer leaf D3D12 COM vtable methods (<= 8 integer args, no XMM args, never
@@ -213,4 +696,266 @@ pub fn plain_com_fns() -> &'static [usize] {
         v.extend_from_slice(resource::plain_fns());
         v.into_boxed_slice()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dxil_metal::root_signature::{
+        flags as rs_flags, DescriptorRange, DescriptorRangeType, RootDescriptor,
+        RootDescriptorKind, RootParameter, RootParameterKind, RootSignatureDesc,
+        RootSignatureVersion, StaticSampler,
+    };
+
+    unsafe fn vtbl_slot(obj: *mut c_void, slot: usize) -> *const () {
+        let vt = *(obj as *const *const *const ());
+        *vt.add(slot)
+    }
+
+    #[test]
+    fn root_signature_deserializer_v10_round_trips_and_validates() {
+        let orig = RootSignatureDesc {
+            version: RootSignatureVersion::V1_0,
+            parameters: vec![
+                RootParameter {
+                    kind: RootParameterKind::DescriptorTable(vec![
+                        DescriptorRange {
+                            range_type: DescriptorRangeType::Srv,
+                            num_descriptors: 4,
+                            base_shader_register: 1,
+                            register_space: 0,
+                            flags: 0,
+                            offset_in_descriptors_from_table_start: 0,
+                        },
+                        DescriptorRange {
+                            range_type: DescriptorRangeType::Sampler,
+                            num_descriptors: 2,
+                            base_shader_register: 0,
+                            register_space: 1,
+                            flags: 0,
+                            offset_in_descriptors_from_table_start:
+                                rs_flags::DESCRIPTOR_RANGE_OFFSET_APPEND,
+                        },
+                    ]),
+                    visibility: 5,
+                },
+                RootParameter {
+                    kind: RootParameterKind::Constants {
+                        shader_register: 2,
+                        register_space: 0,
+                        num_32bit_values: 6,
+                    },
+                    visibility: 1,
+                },
+                RootParameter {
+                    kind: RootParameterKind::Descriptor(
+                        RootDescriptorKind::Cbv,
+                        RootDescriptor { shader_register: 0, register_space: 3, flags: 0 },
+                    ),
+                    visibility: 0,
+                },
+            ],
+            static_samplers: vec![StaticSampler {
+                shader_register: 4,
+                register_space: 1,
+                visibility: 5,
+                ..Default::default()
+            }],
+            flags: rs_flags::ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        };
+        let blob = orig.to_blob();
+
+        unsafe {
+            // Invalid args return E_INVALIDARG.
+            let mut out: *mut c_void = 1usize as *mut c_void;
+            assert_eq!(
+                D3D12CreateRootSignatureDeserializer(
+                    std::ptr::null(),
+                    0,
+                    &IID_ID3D12RootSignatureDeserializer,
+                    &mut out,
+                ),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+            let garbage = [0xAAu8; 16];
+            assert_eq!(
+                D3D12CreateRootSignatureDeserializer(
+                    garbage.as_ptr() as *const c_void,
+                    garbage.len(),
+                    &IID_ID3D12RootSignatureDeserializer,
+                    &mut out,
+                ),
+                E_INVALIDARG
+            );
+            // Wrong IID -> E_NOINTERFACE.
+            assert_eq!(
+                D3D12CreateRootSignatureDeserializer(
+                    blob.as_ptr() as *const c_void,
+                    blob.len(),
+                    &IID_ID3D12VersionedRootSignatureDeserializer,
+                    &mut out,
+                ),
+                E_NOINTERFACE
+            );
+
+            assert_eq!(
+                D3D12CreateRootSignatureDeserializer(
+                    blob.as_ptr() as *const c_void,
+                    blob.len(),
+                    &IID_ID3D12RootSignatureDeserializer,
+                    &mut out,
+                ),
+                S_OK
+            );
+            assert!(!out.is_null());
+
+            let get_desc: unsafe extern "win64" fn(*mut c_void) -> *const u8 =
+                std::mem::transmute(vtbl_slot(out, 3));
+            let desc_ptr = get_desc(out);
+            assert!(!desc_ptr.is_null());
+
+            // Re-parse the raw Windows ABI struct through d3d12_metal::rootsig::desc_from_mem!
+            let parsed = d3d12_metal::rootsig::desc_from_mem(RootSignatureVersion::V1_0, desc_ptr)
+                .expect("desc_from_mem");
+            assert_eq!(parsed.version, RootSignatureVersion::V1_0);
+            assert_eq!(parsed.flags, orig.flags);
+            assert_eq!(parsed.parameters.len(), 3);
+            assert_eq!(parsed.static_samplers.len(), 1);
+            assert_eq!(parsed.static_samplers[0].shader_register, 4);
+            assert_eq!(parsed.static_samplers[0].register_space, 1);
+
+            com_release(out);
+        }
+    }
+
+    #[test]
+    fn versioned_root_signature_deserializer_converts_between_versions() {
+        let orig_v10 = RootSignatureDesc {
+            version: RootSignatureVersion::V1_0,
+            parameters: vec![
+                RootParameter {
+                    kind: RootParameterKind::DescriptorTable(vec![
+                        DescriptorRange {
+                            range_type: DescriptorRangeType::Srv,
+                            num_descriptors: 3,
+                            base_shader_register: 0,
+                            register_space: 0,
+                            flags: 0,
+                            offset_in_descriptors_from_table_start: 0,
+                        },
+                        DescriptorRange {
+                            range_type: DescriptorRangeType::Sampler,
+                            num_descriptors: 1,
+                            base_shader_register: 0,
+                            register_space: 0,
+                            flags: 0,
+                            offset_in_descriptors_from_table_start: 0,
+                        },
+                    ]),
+                    visibility: 0,
+                },
+                RootParameter {
+                    kind: RootParameterKind::Descriptor(
+                        RootDescriptorKind::Uav,
+                        RootDescriptor { shader_register: 1, register_space: 2, flags: 0 },
+                    ),
+                    visibility: 5,
+                },
+            ],
+            static_samplers: vec![StaticSampler::default()],
+            flags: 0x1,
+        };
+        let blob10 = orig_v10.to_blob();
+
+        unsafe {
+            let mut deser: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                D3D12CreateVersionedRootSignatureDeserializer(
+                    blob10.as_ptr() as *const c_void,
+                    blob10.len(),
+                    &IID_ID3D12VersionedRootSignatureDeserializer,
+                    &mut deser,
+                ),
+                S_OK
+            );
+            assert!(!deser.is_null());
+
+            let get_at: unsafe extern "win64" fn(*mut c_void, u32, *mut *const u8) -> HRESULT =
+                std::mem::transmute(vtbl_slot(deser, 3));
+            let get_unconv: unsafe extern "win64" fn(*mut c_void) -> *const u8 =
+                std::mem::transmute(vtbl_slot(deser, 4));
+
+            let unconv_ptr = get_unconv(deser);
+            assert!(!unconv_ptr.is_null());
+            let unconv = d3d12_metal::rootsig::desc_from_versioned(unconv_ptr).unwrap();
+            assert_eq!(unconv.version, RootSignatureVersion::V1_0);
+
+            // Up-convert 1.0 -> 1.1: must populate default v1.0 volatility flags.
+            let mut v11_ptr: *const u8 = std::ptr::null();
+            assert_eq!(get_at(deser, RootSignatureVersion::V1_1 as u32, &mut v11_ptr), S_OK);
+            let v11 = d3d12_metal::rootsig::desc_from_versioned(v11_ptr).unwrap();
+            assert_eq!(v11.version, RootSignatureVersion::V1_1);
+            match &v11.parameters[0].kind {
+                RootParameterKind::DescriptorTable(ranges) => {
+                    assert_eq!(ranges[0].flags, rs_flags::RANGE_V1_0_DEFAULT_CBV_SRV_UAV);
+                    assert_eq!(ranges[1].flags, rs_flags::RANGE_V1_0_DEFAULT_SAMPLER);
+                }
+                other => panic!("unexpected param 0: {other:?}"),
+            }
+            match &v11.parameters[1].kind {
+                RootParameterKind::Descriptor(RootDescriptorKind::Uav, d) => {
+                    assert_eq!(d.flags, rs_flags::ROOT_DESCRIPTOR_V1_0_DEFAULT);
+                }
+                other => panic!("unexpected param 1: {other:?}"),
+            }
+
+            // Up-convert 1.0 -> 1.2: static sampler gets flags == 0.
+            let mut v12_ptr: *const u8 = std::ptr::null();
+            assert_eq!(get_at(deser, RootSignatureVersion::V1_2 as u32, &mut v12_ptr), S_OK);
+            let v12 = d3d12_metal::rootsig::desc_from_versioned(v12_ptr).unwrap();
+            assert_eq!(v12.version, RootSignatureVersion::V1_2);
+            assert_eq!(v12.static_samplers.len(), 1);
+            assert_eq!(v12.static_samplers[0].flags, 0);
+
+            // Invalid version / null out -> E_INVALIDARG.
+            let mut bad_ptr: *const u8 = 1usize as *const u8;
+            assert_eq!(get_at(deser, 99, &mut bad_ptr), E_INVALIDARG);
+            assert!(bad_ptr.is_null());
+            assert_eq!(get_at(deser, 2, std::ptr::null_mut()), E_INVALIDARG);
+
+            com_release(deser);
+
+            // v1.2 blob with non-zero static sampler flags: succeeds at v1.2, rejects down-conversion to v1.0/v1.1.
+            let orig_v12 = RootSignatureDesc {
+                version: RootSignatureVersion::V1_2,
+                parameters: vec![],
+                static_samplers: vec![StaticSampler {
+                    flags: rs_flags::SAMPLER_FLAG_UINT_BORDER_COLOR,
+                    ..Default::default()
+                }],
+                flags: 0,
+            };
+            let blob12 = orig_v12.to_blob();
+            let mut deser12: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                D3D12CreateVersionedRootSignatureDeserializer(
+                    blob12.as_ptr() as *const c_void,
+                    blob12.len(),
+                    &IID_ID3D12VersionedRootSignatureDeserializer,
+                    &mut deser12,
+                ),
+                S_OK
+            );
+            let get_at12: unsafe extern "win64" fn(*mut c_void, u32, *mut *const u8) -> HRESULT =
+                std::mem::transmute(vtbl_slot(deser12, 3));
+            let mut p12: *const u8 = std::ptr::null();
+            assert_eq!(get_at12(deser12, RootSignatureVersion::V1_2 as u32, &mut p12), S_OK);
+            let parsed12 = d3d12_metal::rootsig::desc_from_versioned(p12).unwrap();
+            assert_eq!(parsed12.static_samplers[0].flags, rs_flags::SAMPLER_FLAG_UINT_BORDER_COLOR);
+            assert_eq!(get_at12(deser12, RootSignatureVersion::V1_1 as u32, &mut p12), E_INVALIDARG);
+            assert_eq!(get_at12(deser12, RootSignatureVersion::V1_0 as u32, &mut p12), E_INVALIDARG);
+            com_release(deser12);
+        }
+    }
 }
