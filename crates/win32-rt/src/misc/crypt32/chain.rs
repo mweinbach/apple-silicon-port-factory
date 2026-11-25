@@ -1944,8 +1944,7 @@ fn resolve_selected_issuer_path<'a>(
         {
             break;
         }
-        let find_issuer = |pool: &'a [Vec<u8>]| -> Option<&'a [u8]> {
-            let mut dn_fallback: Option<&'a [u8]> = None;
+        let find_verified = |pool: &'a [Vec<u8>]| -> Option<&'a [u8]> {
             for cand in pool {
                 let cand_slice = cand.as_slice();
                 if path.iter().any(|&p| p == cand_slice) {
@@ -1954,23 +1953,45 @@ fn resolve_selected_issuer_path<'a>(
                 let Some(cp) = parse_cert_der_parts(cand_slice) else {
                     continue;
                 };
-                if cp.subject_inner != cur_parts.issuer_inner {
-                    continue;
-                }
-                if verify_cert_sig_with_spki(&cur_parts, cp.spki_alg_inner, cp.spki_key_bits) {
+                if cp.subject_inner == cur_parts.issuer_inner
+                    && verify_cert_sig_with_spki(&cur_parts, cp.spki_alg_inner, cp.spki_key_bits)
+                {
                     return Some(cand_slice);
                 }
-                if dn_fallback.is_none() {
-                    dn_fallback = Some(cand_slice);
+            }
+            None
+        };
+        let find_dn_only = |pool: &'a [Vec<u8>]| -> Option<&'a [u8]> {
+            for cand in pool {
+                let cand_slice = cand.as_slice();
+                if path.iter().any(|&p| p == cand_slice) {
+                    continue;
+                }
+                let Some(cp) = parse_cert_der_parts(cand_slice) else {
+                    continue;
+                };
+                if cp.subject_inner == cur_parts.issuer_inner {
+                    return Some(cand_slice);
                 }
             }
-            dn_fallback
+            None
         };
-        if let Some(next) = find_issuer(&chain_der[1..]) {
+        // Search BOTH pools for a cryptographically verified issuer before considering any
+        // name-only fallback, so a DN-colliding unrelated cert in hAdditionalStore can never
+        // shadow the genuine issuer in root_pool.
+        if let Some(next) = find_verified(&chain_der[1..]) {
             path.push(next);
             continue;
         }
-        if let Some(root) = find_issuer(root_pool) {
+        if let Some(root) = find_verified(root_pool) {
+            path.push(root);
+            break;
+        }
+        if let Some(next) = find_dn_only(&chain_der[1..]) {
+            path.push(next);
+            continue;
+        }
+        if let Some(root) = find_dn_only(root_pool) {
             path.push(root);
         }
         break;
@@ -2021,33 +2042,45 @@ unsafe fn evaluate_cert_chain_para(
     let mut trust_bits = 0u32;
     let mut para_err = 0u32;
 
-    // 1. RequestedUsage (CERT_USAGE_MATCH @ +0x08) — checked ONLY on the selected issuer path
-    //    so unrelated certificates in hAdditionalStore never taint EKU validation.
+    // 1. RequestedUsage (CERT_USAGE_MATCH @ +0x08) — intersect permitted EKUs across the
+    //    entire selected issuer path before applying AND/OR, so an OR request requires at
+    //    least one requested OID to be permitted end-to-end on every cert along the path.
     if let Some((match_type, req_ekus)) = read_usage_match(0x08)? {
-        for &der in &selected_path {
-            if let Some(raw_oids) = cert_eku_oids(der) {
-                if !raw_oids.is_empty() {
-                    let oids: Vec<String> = raw_oids
-                        .iter()
-                        .map(|o| wintrust::decode_oid_str(o))
-                        .collect();
-                    let has_any = oids.iter().any(|o| o == "2.5.29.37.0");
-                    if !has_any {
-                        let ok = if match_type == 0 {
-                            // USAGE_MATCH_TYPE_AND
-                            req_ekus.iter().all(|r| oids.iter().any(|o| o == r))
-                        } else {
-                            // USAGE_MATCH_TYPE_OR
-                            req_ekus.iter().any(|r| oids.iter().any(|o| o == r))
-                        };
-                        if !ok {
-                            trust_bits |= CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
-                            para_err = CERT_E_WRONG_USAGE;
-                            break;
-                        }
+        let cert_eku_sets: Vec<Option<Vec<String>>> = selected_path
+            .iter()
+            .map(|&der| {
+                cert_eku_oids(der).and_then(|raw_oids| {
+                    if raw_oids.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            raw_oids
+                                .iter()
+                                .map(|o| wintrust::decode_oid_str(o))
+                                .collect(),
+                        )
                     }
+                })
+            })
+            .collect();
+        let path_authorizes_eku = |req: &str| -> bool {
+            cert_eku_sets.iter().all(|opt_oids| match opt_oids {
+                None => true,
+                Some(oids) => {
+                    oids.iter().any(|o| o == "2.5.29.37.0") || oids.iter().any(|o| o == req)
                 }
-            }
+            })
+        };
+        let ok = if match_type == 0 {
+            // USAGE_MATCH_TYPE_AND
+            req_ekus.iter().all(|r| path_authorizes_eku(r))
+        } else {
+            // USAGE_MATCH_TYPE_OR
+            req_ekus.iter().any(|r| path_authorizes_eku(r))
+        };
+        if !ok {
+            trust_bits |= CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
+            para_err = CERT_E_WRONG_USAGE;
         }
     }
 

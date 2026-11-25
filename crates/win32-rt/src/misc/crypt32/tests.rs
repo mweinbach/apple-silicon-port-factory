@@ -5498,6 +5498,183 @@ fn macos_trust_store_and_extended_chain_policies() {
             assert_eq!(wc_anchors, vec![pol_root]);
             assert!(wc_only);
         }
+
+        // 1) RequestedUsage OR must intersect usages across the entire path: a serverAuth-only
+        //    leaf under a clientAuth-only intermediate MUST FAIL OR {serverAuth, clientAuth}
+        //    with CERT_TRUST_IS_NOT_VALID_FOR_USAGE / CERT_E_WRONG_USAGE!
+        let mk_eku_cert = |serial: u8, subj: &str, iss: &str, eku_oids: &[&[u8]], is_ca: bool| -> Vec<u8> {
+            let tlv = super::asn1::encode_der_tlv;
+            let mk_dn = |cn: &str| {
+                let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+                atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+                tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+            };
+            let alg = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]));
+            let mut val = tlv(0x17, b"200101000000Z");
+            val.extend_from_slice(&tlv(0x17, b"400101000000Z"));
+            let mut spki = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]));
+            spki.extend_from_slice(&tlv(0x03, &[0x00, 0x04, serial]));
+            let mut exts = Vec::new();
+            let mut bc = tlv(0x06, &[0x55, 0x1D, 0x13]);
+            bc.extend_from_slice(&tlv(0x01, &[0xFF]));
+            let bc_inner = if is_ca { tlv(0x01, &[0xFF]) } else { Vec::new() };
+            bc.extend_from_slice(&tlv(0x04, &tlv(0x30, &bc_inner)));
+            exts.extend_from_slice(&tlv(0x30, &bc));
+            if !eku_oids.is_empty() {
+                let mut es = Vec::new();
+                for e in eku_oids {
+                    es.extend_from_slice(&tlv(0x06, e));
+                }
+                let mut ee = tlv(0x06, &[0x55, 0x1D, 0x25]); // 2.5.29.37 EKU
+                ee.extend_from_slice(&tlv(0x04, &tlv(0x30, &es)));
+                exts.extend_from_slice(&tlv(0x30, &ee));
+            }
+            let mut tbs = tlv(0xA0, &tlv(0x02, &[0x02]));
+            tbs.extend_from_slice(&tlv(0x02, &[serial]));
+            tbs.extend_from_slice(&alg);
+            tbs.extend_from_slice(&mk_dn(iss));
+            tbs.extend_from_slice(&tlv(0x30, &val));
+            tbs.extend_from_slice(&mk_dn(subj));
+            tbs.extend_from_slice(&tlv(0x30, &spki));
+            tbs.extend_from_slice(&tlv(0xA3, &tlv(0x30, &exts)));
+            let mut body = tlv(0x30, &tbs);
+            body.extend_from_slice(&alg);
+            body.extend_from_slice(&tlv(0x03, &[0x00, 0x01]));
+            tlv(0x30, &body)
+        };
+        let oid_eku_srv: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        let oid_eku_cli: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+        let oid_eku_cs: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+        let disjoint_leaf = mk_eku_cert(21, "DisjointLeaf", "DisjointInter", &[oid_eku_srv], false);
+        let disjoint_inter = mk_eku_cert(22, "DisjointInter", "DisjointRoot", &[oid_eku_cli], true);
+        let disjoint_leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            disjoint_leaf.as_ptr(),
+            disjoint_leaf.len() as u32,
+        );
+        let disjoint_st = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddEncodedCertificateToStore(disjoint_st, X509_ASN_ENCODING, disjoint_inter.as_ptr(), disjoint_inter.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        let srv_z = b"1.3.6.1.5.5.7.3.1\0";
+        let cli_z = b"1.3.6.1.5.5.7.3.2\0";
+        let or_oids = [srv_z.as_ptr(), cli_z.as_ptr()];
+        let mut cp_or = [0u8; 0x38];
+        std::ptr::write_unaligned(cp_or.as_mut_ptr() as *mut u32, 0x38u32);
+        std::ptr::write_unaligned(cp_or.as_mut_ptr().add(0x08) as *mut u32, 1u32); // USAGE_MATCH_TYPE_OR
+        std::ptr::write_unaligned(cp_or.as_mut_ptr().add(0x10) as *mut u32, 2u32);
+        std::ptr::write_unaligned(cp_or.as_mut_ptr().add(0x18) as *mut *const *const u8, or_oids.as_ptr());
+        let mut disjoint_ch: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                disjoint_leaf_ctx,
+                std::ptr::null(),
+                disjoint_st,
+                cp_or.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut disjoint_ch,
+            ),
+            TRUE
+        );
+        let disjoint_ts = std::ptr::read_unaligned((disjoint_ch as *const u8).add(4) as *const u32);
+        assert_ne!(
+            disjoint_ts & 0x0000_0010, // CERT_TRUST_IS_NOT_VALID_FOR_USAGE
+            0,
+            "OR {{serverAuth, clientAuth}} must fail when leaf=serverAuth and inter=clientAuth (empty intersection)"
+        );
+        CertFreeCertificateChain(disjoint_ch);
+        CertCloseStore(disjoint_st, 0);
+        CertFreeCertificateContext(disjoint_leaf_ctx);
+
+        // 2) Cryptographically verified issuer in root_pool MUST beat a DN-colliding different-key
+        //    certificate in hAdditionalStore (even if the colliding cert has incompatible EKU & cA=FALSE).
+        let ca_parts = super::asn1::parse_cert_der_parts(crate::misc::secur32::tests::TEST_CA_DER).unwrap();
+        let ca_dn_tlv = super::asn1::encode_der_tlv(0x30, ca_parts.subject_inner);
+        let tlv = super::asn1::encode_der_tlv;
+        let fake_alg = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]));
+        let mut fake_val = tlv(0x17, b"200101000000Z");
+        fake_val.extend_from_slice(&tlv(0x17, b"400101000000Z"));
+        let mut fake_spki = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]));
+        fake_spki.extend_from_slice(&tlv(0x03, &[0x00, 0x04, 0x99]));
+        let mut fake_bc = tlv(0x06, &[0x55, 0x1D, 0x13]);
+        fake_bc.extend_from_slice(&tlv(0x01, &[0xFF]));
+        fake_bc.extend_from_slice(&tlv(0x04, &tlv(0x30, &[]))); // cA=FALSE
+        let mut fake_eku = tlv(0x06, &[0x55, 0x1D, 0x25]);
+        fake_eku.extend_from_slice(&tlv(0x04, &tlv(0x30, &tlv(0x06, oid_eku_cs)))); // codeSigning only
+        let mut fake_tbs = tlv(0xA0, &tlv(0x02, &[0x02]));
+        fake_tbs.extend_from_slice(&tlv(0x02, &[0x77]));
+        fake_tbs.extend_from_slice(&fake_alg);
+        fake_tbs.extend_from_slice(&ca_dn_tlv);
+        fake_tbs.extend_from_slice(&tlv(0x30, &fake_val));
+        fake_tbs.extend_from_slice(&ca_dn_tlv); // Exact same Subject DN as TEST_CA_DER!
+        fake_tbs.extend_from_slice(&tlv(0x30, &fake_spki));
+        fake_tbs.extend_from_slice(&tlv(0xA3, &tlv(0x30, &[tlv(0x30, &fake_bc), tlv(0x30, &fake_eku)].concat())));
+        let mut fake_body = tlv(0x30, &fake_tbs);
+        fake_body.extend_from_slice(&fake_alg);
+        fake_body.extend_from_slice(&tlv(0x03, &[0x00, 0x01]));
+        let dn_colliding_fake = tlv(0x30, &fake_body);
+
+        let collide_root_st = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddEncodedCertificateToStore(collide_root_st, X509_ASN_ENCODING, crate::misc::secur32::tests::TEST_CA_DER.as_ptr(), crate::misc::secur32::tests::TEST_CA_DER.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        let mut collide_cfg = [0u8; 0x60];
+        std::ptr::write_unaligned(collide_cfg.as_mut_ptr() as *mut u32, collide_cfg.len() as u32);
+        std::ptr::write_unaligned(collide_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, collide_root_st);
+        let mut collide_eng: *mut c_void = std::ptr::null_mut();
+        assert_eq!(CertCreateCertificateChainEngine(collide_cfg.as_ptr() as *const c_void, &mut collide_eng), TRUE);
+        let collide_add_st = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddEncodedCertificateToStore(collide_add_st, X509_ASN_ENCODING, dn_colliding_fake.as_ptr(), dn_colliding_fake.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        let collide_leaf_ctx = CertCreateCertificateContext(X509_ASN_ENCODING, crate::misc::secur32::tests::TEST_LEAF_DER.as_ptr(), crate::misc::secur32::tests::TEST_LEAF_DER.len() as u32);
+        let mut collide_cp = [0u8; 0x38];
+        let srv_only = [srv_z.as_ptr()];
+        std::ptr::write_unaligned(collide_cp.as_mut_ptr() as *mut u32, 0x38u32);
+        std::ptr::write_unaligned(collide_cp.as_mut_ptr().add(0x08) as *mut u32, 0u32);
+        std::ptr::write_unaligned(collide_cp.as_mut_ptr().add(0x10) as *mut u32, 1u32);
+        std::ptr::write_unaligned(collide_cp.as_mut_ptr().add(0x18) as *mut *const *const u8, srv_only.as_ptr());
+        let mut collide_ch: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                collide_eng,
+                collide_leaf_ctx,
+                std::ptr::null(),
+                collide_add_st,
+                collide_cp.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut collide_ch,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASE as *const u8,
+                collide_ch,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            status.dw_error, 0,
+            "verified root in root_pool must beat DN-colliding fake cert in hAdditionalStore"
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                collide_ch,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            status.dw_error, 0,
+            "BASIC_CONSTRAINTS must select verified root over DN-colliding cA=FALSE fake cert"
+        );
+        CertFreeCertificateChain(collide_ch);
+        CertFreeCertificateContext(collide_leaf_ctx);
+        CertCloseStore(collide_add_st, 0);
+        CertFreeCertificateChainEngine(collide_eng);
+        CertCloseStore(collide_root_st, 0);
     }
 }
 
