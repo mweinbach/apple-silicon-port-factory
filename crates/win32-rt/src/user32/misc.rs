@@ -1390,11 +1390,14 @@ pub unsafe extern "win64" fn RegisterHotKey(hwnd: HWND, id: i32, mods: u32, vk: 
         set_error(e::HOTKEY_ALREADY_REGISTERED);
         return FALSE;
     }
-    // Updating an existing (hwnd, tid, id) replaces its key binding in place.
-    if let Some(existing) = list.iter_mut().find(|e| e.hwnd == h && e.tid == tid && e.id == id) {
-        existing.mods = norm_mods;
+    // Per Microsoft Learn RegisterHotKey (Vista+): registering a different key combination
+    // with an existing (hwnd, id) maintains the existing hotkey alongside the new one; only
+    // an identical (hwnd, tid, id, mods, vk) updates MOD_NOREPEAT in place.
+    if let Some(existing) = list
+        .iter_mut()
+        .find(|e| e.hwnd == h && e.tid == tid && e.id == id && e.mods == norm_mods && e.vk == vk)
+    {
         existing.norepeat = norepeat;
-        existing.vk = vk;
     } else {
         list.push(HotKeyEntry { hwnd: h, tid, id, mods: norm_mods, norepeat, vk });
     }
@@ -3628,26 +3631,41 @@ mod tests {
             );
             assert!(!hwnd.is_null());
             assert_eq!(RegisterHotKey(hwnd, 7, 0x0002 /* MOD_CONTROL */ | MOD_NOREPEAT, b'A' as u32), TRUE);
+            // Registering a second key combination with the same (hwnd, id) preserves BOTH bindings.
+            assert_eq!(RegisterHotKey(hwnd, 7, 0x0002 /* MOD_CONTROL */, b'C' as u32), TRUE);
             // Duplicate registration with different ID fails with HOTKEY_ALREADY_REGISTERED.
             assert_eq!(RegisterHotKey(hwnd, 8, 0x0002, b'A' as u32), FALSE);
             assert_eq!(crate::teb::last_error(), e::HOTKEY_ALREADY_REGISTERED);
+            assert_eq!(RegisterHotKey(hwnd, 8, 0x0002, b'C' as u32), FALSE);
+            assert_eq!(crate::teb::last_error(), e::HOTKEY_ALREADY_REGISTERED);
 
-            // Press Ctrl + 'A' (mac 0x3B = LCtrl, 0x00 = 'A').
+            // Press Ctrl + 'A' (mac 0x3B = LCtrl, 0x00 = 'A') and Ctrl + 'C' (mac 0x08 = 'C').
             super::super::input::native_key(super::super::input::NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
             super::super::input::native_key(super::super::input::NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
-            // Repeat must be suppressed by MOD_NOREPEAT.
+            // Repeat must be suppressed by MOD_NOREPEAT on Ctrl+A.
             super::super::input::native_key(super::super::input::NativeKey { mac: 0x00, down: true, repeat: true, chars: vec![b'a' as u16] });
+            // Earlier binding (Ctrl+A) AND second binding (Ctrl+C) must both fire with id=7.
+            super::super::input::native_key(super::super::input::NativeKey { mac: 0x08, down: true, repeat: false, chars: vec![b'c' as u16] });
             super::super::input::release_all_keys();
 
             let mut m = MSG::default();
             assert_eq!(super::super::message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, super::super::message::PM_REMOVE), TRUE);
             assert_eq!(m.wparam, 7);
             assert_eq!(m.lparam, ((0x0002u32) | ((b'A' as u32) << 16)) as isize);
+            assert_eq!(super::super::message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, super::super::message::PM_REMOVE), TRUE);
+            assert_eq!(m.wparam, 7);
+            assert_eq!(m.lparam, ((0x0002u32) | ((b'C' as u32) << 16)) as isize);
             assert_eq!(super::super::message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, super::super::message::PM_REMOVE), FALSE);
 
+            // UnregisterHotKey removes all bindings registered under (hwnd, 7).
             assert_eq!(UnregisterHotKey(hwnd, 7), TRUE);
             assert_eq!(UnregisterHotKey(hwnd, 7), FALSE);
             assert_eq!(crate::teb::last_error(), e::HOTKEY_NOT_REGISTERED);
+            // Both Ctrl+A and Ctrl+C are now free for another ID.
+            assert_eq!(RegisterHotKey(hwnd, 9, 0x0002, b'A' as u32), TRUE);
+            assert_eq!(RegisterHotKey(hwnd, 10, 0x0002, b'C' as u32), TRUE);
+            assert_eq!(UnregisterHotKey(hwnd, 9), TRUE);
+            assert_eq!(UnregisterHotKey(hwnd, 10), TRUE);
             let _ = super::super::window::DestroyWindow(hwnd);
         })
         .join()

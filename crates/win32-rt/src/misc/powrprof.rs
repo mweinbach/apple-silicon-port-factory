@@ -448,6 +448,9 @@ mod macos_power {
     }
 
     unsafe fn run_iokit_power_loop() {
+        // Adopt this dedicated monitor thread into the Windows runtime (TEB + static TLS + GS slots)
+        // before IOKit can deliver any guest power callbacks.
+        let _ = crate::teb::current();
         let iokit = libc::dlopen(
             c"/System/Library/Frameworks/IOKit.framework/IOKit".as_ptr(),
             libc::RTLD_LAZY | libc::RTLD_LOCAL,
@@ -1135,6 +1138,9 @@ unsafe fn deliver_to_entry(entry: &Arc<PowerNotification>, pbt_type: u32, settin
             let Some(_guard) = entry.try_begin_delivery() else {
                 return;
             };
+            // Ensure foreign OS callback threads (e.g. IOKit power monitor) have an
+            // initialized TEB and static TLS before entering guest code.
+            let _ = crate::teb::current();
             let setting_ptr = setting_buf.map_or(0u64, |b| b.as_ptr() as u64);
             let _ = crate::call_guest8(
                 func,
@@ -1906,5 +1912,68 @@ mod tests {
         dispatch_power_setting_change(GUID_POWER_SAVING_STATUS, &0u32.to_le_bytes());
         // 1 initial delivery + 1 dispatched delivery (which self-unregistered); 2nd dispatch suppressed.
         assert_eq!(sc.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn foreign_dispatch_thread_adopts_teb_before_guest_power_callback() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct TebProbe {
+            teb_ptr: AtomicUsize,
+            peb_ptr: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        unsafe extern "win64" fn probe_cb(ctx: *mut c_void, _ty: u32, _setting: *mut c_void) -> u32 {
+            let p = &*(ctx as *const TebProbe);
+            p.teb_ptr
+                .store(crate::teb::gs_read(crate::teb::off::SELF), Ordering::Release);
+            p.peb_ptr
+                .store(crate::teb::gs_read(crate::teb::off::PEB), Ordering::Release);
+            p.calls.fetch_add(1, Ordering::AcqRel);
+            0
+        }
+
+        let probe = Box::new(TebProbe {
+            teb_ptr: AtomicUsize::new(0),
+            peb_ptr: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        });
+        let params: [usize; 2] = [
+            probe_cb as *const () as usize,
+            &*probe as *const TebProbe as usize,
+        ];
+        let mut h_sr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_sr,
+                ),
+                0
+            );
+        }
+
+        // Dispatch from a brand-new unadopted OS thread (mirrors the macOS IOKit monitor thread).
+        std::thread::spawn(|| {
+            assert!(
+                crate::teb::current_raw().is_null(),
+                "fresh Rust thread must start without a TEB before power delivery"
+            );
+            dispatch_suspend_resume_event(PBT_APMSUSPEND);
+            assert!(
+                !crate::teb::current_raw().is_null(),
+                "power delivery must adopt the foreign thread into the Windows runtime"
+            );
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+        assert_ne!(probe.teb_ptr.load(Ordering::Acquire), 0, "gs:[0x30] TEB self must be initialized");
+        assert_ne!(probe.peb_ptr.load(Ordering::Acquire), 0, "gs:[0x60] PEB must be initialized");
+        unsafe {
+            assert_eq!(PowerUnregisterSuspendResumeNotification(h_sr), 0);
+        }
     }
 }
