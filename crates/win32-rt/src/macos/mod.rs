@@ -460,6 +460,10 @@ pub struct TaskDialogAlertResult {
 pub enum TaskDialogOutcome {
     /// Interactive dialog was dismissed by a button click or `TDM_CLICK_BUTTON`.
     Completed(TaskDialogAlertResult),
+    /// Active modal alert was torn down because `TDM_NAVIGATE_PAGE` replaced the
+    /// dialog's page configuration while open; caller should immediately re-present
+    /// the new page.
+    Navigated,
     /// The dialog-owning Win32 thread received `WM_QUIT`; the native modal
     /// session has been cancelled/unwound and `PostQuitMessage` has been
     /// preserved for the outer message loop.
@@ -476,6 +480,7 @@ pub enum TaskDialogEvent {
     VerificationToggled(bool),
     HyperlinkClicked(String),
     ButtonClicked(TaskDialogAlertResult),
+    Navigated,
 }
 
 /// Progress bar state for `TaskDialogIndirect` (`TDF_SHOW_PROGRESS_BAR` /
@@ -504,6 +509,7 @@ pub struct TaskDialogLiveUpdate {
     pub selected_radio_idx: Option<usize>,
     pub verification_checked: Option<bool>,
     pub click_button_idx: Option<usize>,
+    pub navigate_page: bool,
 }
 
 /// Service the owning Win32 thread's full window-message queue (cross-thread
@@ -594,6 +600,7 @@ where
         }
         match rx.recv_timeout(wait) {
             Ok(TaskDialogEvent::ButtonClicked(res)) => return TaskDialogOutcome::Completed(res),
+            Ok(TaskDialogEvent::Navigated) => return TaskDialogOutcome::Navigated,
             Ok(other) => on_event(other),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -668,7 +675,7 @@ where
             return TaskDialogOutcome::Unavailable;
         }
         if is_main_thread() {
-            return match appkit::task_dialog_alert_inline(
+            return appkit::task_dialog_alert_inline(
                 session_id,
                 &caption,
                 &text,
@@ -687,10 +694,7 @@ where
                 timer_interval,
                 &mut on_event,
                 &mut on_timer,
-            ) {
-                Some(res) => TaskDialogOutcome::Completed(res),
-                None => TaskDialogOutcome::Quit,
-            };
+            );
         }
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancelled_main = cancelled.clone();

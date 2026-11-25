@@ -1367,11 +1367,42 @@ const NS_CONTROL_STATE_ON: isize = 1;
 /// `NSModalResponseAbort`: cleanly terminates `NSAlert::runModal()` when the
 /// owning Win32 thread receives `WM_QUIT` without synthesizing a button click.
 const TASK_DIALOG_ABORT_CODE: isize = -1001;
+/// Sentinel modal return code used when `TDM_NAVIGATE_PAGE` replaces the active
+/// TaskDialog page while its native `NSAlert` is open so the caller immediately
+/// rebuilds and re-presents the dialog with the new configuration.
+const TASK_DIALOG_NAVIGATE_CODE: isize = -2001;
 
 #[derive(Clone, Copy, Debug)]
 enum DeferredModalStop {
     Click(usize),
+    Navigate,
     Abort,
+}
+
+/// Compute the replacement `NSButton` key equivalent for a TaskDialog action button
+/// when `nDefaultButton` selects an explicit default button.
+///
+/// Moves Return (`"\r"`) to `def_idx` and clears Return from any other button that
+/// AppKit defaulted to Return, while preserving AppKit's automatic Escape (`"\u{1b}"`)
+/// binding on Cancel buttons (and restoring Escape if Cancel was at index 0).
+fn task_dialog_button_key_equivalent(
+    idx: usize,
+    title: &str,
+    existing_key_equiv: &str,
+    custom_default: Option<usize>,
+) -> Option<&'static str> {
+    let def_idx = custom_default?;
+    if idx == def_idx {
+        Some("\r")
+    } else if existing_key_equiv == "\r" {
+        if title.eq_ignore_ascii_case("cancel") {
+            Some("\u{1b}")
+        } else {
+            Some("")
+        }
+    } else {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -1507,7 +1538,7 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
     let mut noop = |_ev: super::TaskDialogEvent| {};
     let mut noop_timer = |_ms: u32| false;
     let mut origin = std::time::Instant::now();
-    task_dialog_alert_inline(
+    match task_dialog_alert_inline(
         0,
         caption,
         text,
@@ -1526,9 +1557,10 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         None,
         &mut noop,
         &mut noop_timer,
-    )
-    .map(|r| r.button_index)
-    .unwrap_or(0)
+    ) {
+        super::TaskDialogOutcome::Completed(r) => r.button_index,
+        _ => 0,
+    }
 }
 
 fn apply_progress_state_to_indicator(
@@ -1689,6 +1721,15 @@ pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDial
         };
         let is_top = pos + 1 == s.len();
         let active = &mut s[pos];
+        if update.navigate_page {
+            let stop = if is_top {
+                Some(TASK_DIALOG_NAVIGATE_CODE)
+            } else {
+                active.deferred_stop = Some(DeferredModalStop::Navigate);
+                None
+            };
+            return (true, stop);
+        }
         apply_live_update_to_alert(
             mtm,
             &active.alert,
@@ -1768,14 +1809,14 @@ fn run_task_dialog_alert(
     critical: bool,
     sink: TaskDialogEventSink,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
-) -> Option<super::TaskDialogAlertResult> {
+) -> super::TaskDialogOutcome {
     if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
         if session_id != 0 {
             PENDING_TASK_DIALOG_UPDATES.with(|map| {
                 map.borrow_mut().remove(&session_id);
             });
         }
-        return None;
+        return super::TaskDialogOutcome::Quit;
     }
     let mtm = mtm();
     let app = NSApplication::sharedApplication(mtm);
@@ -1788,8 +1829,11 @@ fn run_task_dialog_alert(
     let mut action_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(buttons.len());
     for (idx, b) in buttons.iter().enumerate() {
         let btn = a.addButtonWithTitle(&NSString::from_str(b));
-        if let Some(def_idx) = custom_default {
-            let eq = NSString::from_str(if idx == def_idx { "\r" } else { "" });
+        let existing_eq = btn.keyEquivalent().to_string();
+        if let Some(new_eq) =
+            task_dialog_button_key_equivalent(idx, b, &existing_eq, custom_default)
+        {
+            let eq = NSString::from_str(new_eq);
             let _: () = unsafe { msg_send![&*btn, setKeyEquivalent: &*eq] };
         }
         btn.setEnabled(button_enabled.get(idx).copied().unwrap_or(true));
@@ -1872,6 +1916,7 @@ fn run_task_dialog_alert(
                 let app = NSApplication::sharedApplication(self.mtm);
                 let code = match stop {
                     DeferredModalStop::Click(bidx) => 1000 + bidx as isize,
+                    DeferredModalStop::Navigate => TASK_DIALOG_NAVIGATE_CODE,
                     DeferredModalStop::Abort => TASK_DIALOG_ABORT_CODE,
                 };
                 app.stopModalWithCode(code);
@@ -1896,12 +1941,17 @@ fn run_task_dialog_alert(
 
     // Apply any live updates that arrived before `run_task_dialog_alert` began.
     let mut pre_clicked: Option<usize> = None;
+    let mut pre_navigated = false;
     if session_id != 0 {
         let queued = PENDING_TASK_DIALOG_UPDATES.with(|map| map.borrow_mut().remove(&session_id));
         if let Some(updates) = queued {
             ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
                 if let Some(entry) = stack.borrow_mut().iter_mut().rev().find(|e| e.session_id == session_id) {
                     for upd in updates {
+                        if upd.navigate_page {
+                            pre_navigated = true;
+                            break;
+                        }
                         apply_live_update_to_alert(
                             mtm,
                             &entry.alert,
@@ -1923,7 +1973,10 @@ fn run_task_dialog_alert(
     }
 
     if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
-        return None;
+        return super::TaskDialogOutcome::Quit;
+    }
+    if pre_navigated {
+        return super::TaskDialogOutcome::Navigated;
     }
 
     let r = if let Some(bidx) = pre_clicked {
@@ -1932,7 +1985,10 @@ fn run_task_dialog_alert(
         a.runModal()
     };
     if r == TASK_DIALOG_ABORT_CODE || cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
-        return None;
+        return super::TaskDialogOutcome::Quit;
+    }
+    if r == TASK_DIALOG_NAVIGATE_CODE {
+        return super::TaskDialogOutcome::Navigated;
     }
     // NSAlertFirstButtonReturn = 1000
     let button_index = (r - 1000).clamp(0, buttons.len().saturating_sub(1) as isize) as usize;
@@ -1953,7 +2009,7 @@ fn run_task_dialog_alert(
         false
     };
     let _keep_target_alive = target;
-    Some(super::TaskDialogAlertResult {
+    super::TaskDialogOutcome::Completed(super::TaskDialogAlertResult {
         button_index,
         radio_index,
         verified,
@@ -1979,7 +2035,7 @@ pub(super) fn task_dialog_alert_channel(
     tx: std::sync::mpsc::Sender<super::TaskDialogEvent>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if let Some(res) = run_task_dialog_alert(
+    match run_task_dialog_alert(
         session_id,
         caption,
         text,
@@ -1997,7 +2053,13 @@ pub(super) fn task_dialog_alert_channel(
         TaskDialogEventSink::Channel(tx.clone()),
         Some(&cancelled),
     ) {
-        let _ = tx.send(super::TaskDialogEvent::ButtonClicked(res));
+        super::TaskDialogOutcome::Completed(res) => {
+            let _ = tx.send(super::TaskDialogEvent::ButtonClicked(res));
+        }
+        super::TaskDialogOutcome::Navigated => {
+            let _ = tx.send(super::TaskDialogEvent::Navigated);
+        }
+        super::TaskDialogOutcome::Quit | super::TaskDialogOutcome::Unavailable => {}
     }
 }
 
@@ -2069,7 +2131,7 @@ pub(super) fn task_dialog_alert_inline(
     timer_interval: Option<std::time::Duration>,
     on_event: &mut dyn FnMut(super::TaskDialogEvent),
     on_timer: &mut dyn FnMut(u32) -> bool,
-) -> Option<super::TaskDialogAlertResult> {
+) -> super::TaskDialogOutcome {
     // SAFETY: ACTIVE_TASK_DIALOG_ALERTS and InlineTimerGuard are both torn down before this returns.
     let cb_ptr: *mut dyn FnMut(super::TaskDialogEvent) =
         unsafe { std::mem::transmute::<&mut dyn FnMut(super::TaskDialogEvent), *mut dyn FnMut(super::TaskDialogEvent)>(on_event) };
@@ -2449,5 +2511,49 @@ mod tests {
             assert_eq!(CGImageGetWidth(cg.cast()), 32);
             assert_eq!(CGImageGetHeight(cg.cast()), 32);
         }
+    }
+
+    #[test]
+    fn task_dialog_default_button_preserves_cancel_escape_shortcut() {
+        // OK + Cancel with explicit nDefaultButton = IDOK (idx 0):
+        // OK keeps Return, Cancel keeps AppKit's automatic Escape ("\u{1b}").
+        assert_eq!(
+            task_dialog_button_key_equivalent(0, "OK", "\r", Some(0)),
+            Some("\r")
+        );
+        assert_eq!(
+            task_dialog_button_key_equivalent(1, "Cancel", "\u{1b}", Some(0)),
+            None
+        );
+
+        // Yes + No + Cancel with explicit nDefaultButton = IDNO (idx 1):
+        // Yes loses Return, No gets Return, Cancel preserves Escape.
+        assert_eq!(
+            task_dialog_button_key_equivalent(0, "Yes", "\r", Some(1)),
+            Some("")
+        );
+        assert_eq!(
+            task_dialog_button_key_equivalent(1, "No", "", Some(1)),
+            Some("\r")
+        );
+        assert_eq!(
+            task_dialog_button_key_equivalent(2, "Cancel", "\u{1b}", Some(1)),
+            None
+        );
+
+        // Cancel placed first (idx 0, AppKit defaulted it to "\r") with nDefaultButton = IDOK (idx 1):
+        // Cancel moves from Return to Escape, OK gets Return.
+        assert_eq!(
+            task_dialog_button_key_equivalent(0, "Cancel", "\r", Some(1)),
+            Some("\u{1b}")
+        );
+        assert_eq!(
+            task_dialog_button_key_equivalent(1, "OK", "", Some(1)),
+            Some("\r")
+        );
+
+        // No explicit default button: AppKit's native Return/Escape assignments stay untouched.
+        assert_eq!(task_dialog_button_key_equivalent(0, "OK", "\r", None), None);
+        assert_eq!(task_dialog_button_key_equivalent(1, "Cancel", "\u{1b}", None), None);
     }
 }

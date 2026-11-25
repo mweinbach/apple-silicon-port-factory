@@ -241,6 +241,7 @@ const TDF_CALLBACK_TIMER: u32 = 0x0800;
 const TDF_NO_DEFAULT_RADIO_BUTTON: u32 = 0x4000;
 
 const TDN_CREATED: u32 = 0;
+const TDN_NAVIGATED: u32 = 1;
 const TDN_BUTTON_CLICKED: u32 = 2;
 const TDN_HYPERLINK_CLICKED: u32 = 3;
 const TDN_TIMER: u32 = 4;
@@ -252,6 +253,7 @@ const TDN_VERIFICATION_CLICKED: u32 = 8;
 /// Standard Windows TaskDialog `TDF_CALLBACK_TIMER` notification period (~200 ms).
 const TASK_DIALOG_TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+const TDM_NAVIGATE_PAGE: u32 = crate::user32::wm::USER + 101;
 const TDM_CLICK_BUTTON: u32 = crate::user32::wm::USER + 102;
 const TDM_SET_MARQUEE_PROGRESS_BAR: u32 = crate::user32::wm::USER + 103;
 const TDM_SET_PROGRESS_BAR_STATE: u32 = crate::user32::wm::USER + 104;
@@ -280,10 +282,166 @@ const HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION: HRESULT = 0x8007_05B3u32 as i3
 static NEXT_TASK_DIALOG_SESSION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
+struct ParsedTaskDialogPage {
+    hwnd_parent: HWND,
+    hinst: HINSTANCE,
+    pf_callback: usize,
+    lp_callback_data: isize,
+    enable_hyperlinks: bool,
+    callback_timer: bool,
+    progress: Option<crate::macos::TaskDialogProgressState>,
+    critical: bool,
+    caption: String,
+    main_inst: String,
+    content: String,
+    expanded: String,
+    footer: String,
+    buttons: Vec<(i32, String)>,
+    default_button_idx: Option<usize>,
+    radios: Vec<(i32, String)>,
+    selected_radio_idx: Option<usize>,
+    verification_text: Option<String>,
+    verified: bool,
+}
+
+unsafe fn parse_task_dialog_config(config: *const u8) -> Result<ParsedTaskDialogPage, HRESULT> {
+    if config.is_null() {
+        return Err(E_INVALIDARG);
+    }
+    let cfg = (config as *const TaskDialogConfig).read_unaligned();
+    if cfg.cb_size != std::mem::size_of::<TaskDialogConfig>() as u32 {
+        return Err(E_INVALIDARG);
+    }
+    if (cfg.c_buttons > 0 && cfg.p_buttons.is_null())
+        || (cfg.c_radio_buttons > 0 && cfg.p_radio_buttons.is_null())
+    {
+        return Err(E_INVALIDARG);
+    }
+
+    let hinst = cfg.h_instance;
+    let title = resolve_task_dialog_str(hinst, cfg.psz_window_title);
+    let main_inst = resolve_task_dialog_str(hinst, cfg.psz_main_instruction);
+    let content = resolve_task_dialog_str(hinst, cfg.psz_content);
+    let expanded = resolve_task_dialog_str(hinst, cfg.psz_expanded_information);
+    let footer = resolve_task_dialog_str(hinst, cfg.psz_footer);
+
+    // Collect custom buttons followed by common buttons in Windows dialog order.
+    let mut buttons: Vec<(i32, String)> = Vec::new();
+    for i in 0..cfg.c_buttons as usize {
+        let b = cfg.p_buttons.add(i).read_unaligned();
+        let bid = b.button_id;
+        let label = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, b.button_text));
+        buttons.push((bid, if label.is_empty() { format!("Button {bid}") } else { label }));
+    }
+    let common = cfg.dw_common_buttons;
+    if (common & TDCBF_OK_BUTTON) != 0 {
+        buttons.push((1, "OK".into()));
+    }
+    if (common & TDCBF_YES_BUTTON) != 0 {
+        buttons.push((6, "Yes".into()));
+    }
+    if (common & TDCBF_NO_BUTTON) != 0 {
+        buttons.push((7, "No".into()));
+    }
+    if (common & TDCBF_RETRY_BUTTON) != 0 {
+        buttons.push((4, "Retry".into()));
+    }
+    if (common & TDCBF_CANCEL_BUTTON) != 0 {
+        buttons.push((2, "Cancel".into()));
+    }
+    if (common & TDCBF_CLOSE_BUTTON) != 0 {
+        buttons.push((8, "Close".into()));
+    }
+    if buttons.is_empty() {
+        buttons.push((1, "OK".into()));
+    }
+
+    // Collect radio buttons and resolve initial default selection.
+    let mut radios: Vec<(i32, String)> = Vec::with_capacity(cfg.c_radio_buttons as usize);
+    for i in 0..cfg.c_radio_buttons as usize {
+        let rb = cfg.p_radio_buttons.add(i).read_unaligned();
+        let rid = rb.button_id;
+        let label = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, rb.button_text));
+        radios.push((rid, if label.is_empty() { format!("Option {rid}") } else { label }));
+    }
+    let selected_radio_idx: Option<usize> =
+        if !radios.is_empty() && (cfg.dw_flags & TDF_NO_DEFAULT_RADIO_BUTTON) == 0 {
+            if cfg.n_default_radio_button != 0 {
+                radios
+                    .iter()
+                    .position(|(id, _)| *id == cfg.n_default_radio_button)
+                    .or(Some(0))
+            } else {
+                Some(0)
+            }
+        } else {
+            None
+        };
+    let verification_text: Option<String> = if !cfg.psz_verification_text.is_null() {
+        let s = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, cfg.psz_verification_text));
+        Some(if s.is_empty() { "Confirm".to_string() } else { s })
+    } else {
+        None
+    };
+    let verified: bool =
+        verification_text.is_some() && (cfg.dw_flags & TDF_VERIFICATION_FLAG_CHECKED) != 0;
+
+    // TD_ERROR_ICON == MAKEINTRESOURCEW(-2) == 0xFFFE.
+    let critical = (cfg.main_icon & 0xFFFF) == 0xFFFE && cfg.main_icon <= 0xFFFF;
+    let caption = if title.is_empty() {
+        if critical { "Error".to_string() } else { "Notice".to_string() }
+    } else {
+        title
+    };
+    let default_button_idx: Option<usize> = if cfg.n_default_button != 0 {
+        buttons.iter().position(|(id, _)| *id == cfg.n_default_button)
+    } else {
+        None
+    };
+    let enable_hyperlinks = (cfg.dw_flags & TDF_ENABLE_HYPERLINKS) != 0;
+    let callback_timer = (cfg.dw_flags & TDF_CALLBACK_TIMER) != 0 && cfg.pf_callback != 0;
+    let show_progress =
+        (cfg.dw_flags & (TDF_SHOW_PROGRESS_BAR | TDF_SHOW_MARQUEE_PROGRESS_BAR)) != 0;
+    let progress = show_progress.then(|| crate::macos::TaskDialogProgressState {
+        marquee: (cfg.dw_flags & TDF_SHOW_MARQUEE_PROGRESS_BAR) != 0,
+        marquee_running: false,
+        min: 0,
+        max: 100,
+        pos: 0,
+        state: PBST_NORMAL,
+    });
+
+    Ok(ParsedTaskDialogPage {
+        hwnd_parent: cfg.hwnd_parent,
+        hinst,
+        pf_callback: cfg.pf_callback,
+        lp_callback_data: cfg.lp_callback_data,
+        enable_hyperlinks,
+        callback_timer,
+        progress,
+        critical,
+        caption,
+        main_inst,
+        content,
+        expanded,
+        footer,
+        buttons,
+        default_button_idx,
+        radios,
+        selected_radio_idx,
+        verification_text,
+        verified,
+    })
+}
+
 struct ActiveTaskDialog {
     session_id: u64,
+    page_generation: u64,
     modal_open: bool,
     enable_hyperlinks: bool,
+    callback_timer: bool,
+    reset_timer_on_present: bool,
+    critical: bool,
     progress: Option<crate::macos::TaskDialogProgressState>,
     hinst: usize,
     pf_callback: usize,
@@ -295,9 +453,11 @@ struct ActiveTaskDialog {
     footer: String,
     buttons: Vec<(i32, String)>,
     button_enabled: Vec<bool>,
+    default_button_idx: Option<usize>,
     radios: Vec<(i32, String)>,
     radio_enabled: Vec<bool>,
     selected_radio_idx: Option<usize>,
+    verification_text: Option<String>,
     has_verification: bool,
     verified: bool,
     pending_click_button: Option<i32>,
@@ -428,6 +588,67 @@ fn extract_href_attribute(attrs: &str) -> String {
 }
 
 impl ActiveTaskDialog {
+    fn from_page(session_id: u64, page: ParsedTaskDialogPage) -> Self {
+        let button_enabled = vec![true; page.buttons.len()];
+        let radio_enabled = vec![true; page.radios.len()];
+        let has_verification = page.verification_text.is_some();
+        Self {
+            session_id,
+            page_generation: 0,
+            modal_open: false,
+            enable_hyperlinks: page.enable_hyperlinks,
+            callback_timer: page.callback_timer,
+            reset_timer_on_present: false,
+            critical: page.critical,
+            progress: page.progress,
+            hinst: page.hinst as usize,
+            pf_callback: page.pf_callback,
+            lp_callback_data: page.lp_callback_data,
+            caption: page.caption,
+            main_inst: page.main_inst,
+            content: page.content,
+            expanded: page.expanded,
+            footer: page.footer,
+            buttons: page.buttons,
+            button_enabled,
+            default_button_idx: page.default_button_idx,
+            radios: page.radios,
+            radio_enabled,
+            selected_radio_idx: page.selected_radio_idx,
+            verification_text: page.verification_text,
+            has_verification,
+            verified: page.verified,
+            pending_click_button: None,
+        }
+    }
+
+    fn apply_page(&mut self, page: ParsedTaskDialogPage) {
+        self.page_generation = self.page_generation.wrapping_add(1);
+        self.enable_hyperlinks = page.enable_hyperlinks;
+        self.callback_timer = page.callback_timer;
+        self.reset_timer_on_present = true;
+        self.critical = page.critical;
+        self.progress = page.progress;
+        self.hinst = page.hinst as usize;
+        self.pf_callback = page.pf_callback;
+        self.lp_callback_data = page.lp_callback_data;
+        self.caption = page.caption;
+        self.main_inst = page.main_inst;
+        self.content = page.content;
+        self.expanded = page.expanded;
+        self.footer = page.footer;
+        self.button_enabled = vec![true; page.buttons.len()];
+        self.buttons = page.buttons;
+        self.default_button_idx = page.default_button_idx;
+        self.radio_enabled = vec![true; page.radios.len()];
+        self.radios = page.radios;
+        self.selected_radio_idx = page.selected_radio_idx;
+        self.has_verification = page.verification_text.is_some();
+        self.verification_text = page.verification_text;
+        self.verified = page.verified;
+        self.pending_click_button = None;
+    }
+
     fn compose_body_and_links(&self) -> (String, Vec<(String, String)>) {
         let mut body_parts: Vec<String> = Vec::new();
         let mut links: Vec<(String, String)> = Vec::new();
@@ -466,6 +687,7 @@ impl ActiveTaskDialog {
                     selected_radio_idx: self.selected_radio_idx,
                     verification_checked: self.has_verification.then_some(self.verified),
                     click_button_idx,
+                    navigate_page: false,
                 },
             )
         })
@@ -531,6 +753,77 @@ unsafe extern "win64" fn task_dialog_wndproc(
             };
             if let Some((sid, upd)) = push {
                 crate::macos::task_dialog_alert_update(sid, upd);
+            }
+            0
+        }
+        TDM_NAVIGATE_PAGE => {
+            let page = match parse_task_dialog_config(l_param as *const u8) {
+                Ok(p) => p,
+                Err(hr) => {
+                    log::warn!(
+                        "uxtheme: TDM_NAVIGATE_PAGE rejected invalid TASKDIALOGCONFIG (hr={hr:#x})"
+                    );
+                    return 0;
+                }
+            };
+            let nav_action = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).map(|dlg| {
+                    let old_sid = dlg.session_id;
+                    let was_modal_open = dlg.modal_open;
+                    let stop_old = if was_modal_open {
+                        // Rotate session_id and close the live-update gate so any TDM_*
+                        // messages sent during TDN_NAVIGATED mutate the new page state
+                        // in memory rather than updating the dying NSAlert.
+                        dlg.session_id = NEXT_TASK_DIALOG_SESSION
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        dlg.modal_open = false;
+                        Some((
+                            old_sid,
+                            crate::macos::TaskDialogLiveUpdate {
+                                caption: page.caption.clone(),
+                                text: String::new(),
+                                links: Vec::new(),
+                                progress: None,
+                                button_enabled: Vec::new(),
+                                radio_enabled: Vec::new(),
+                                selected_radio_idx: None,
+                                verification_checked: None,
+                                click_button_idx: None,
+                                navigate_page: true,
+                            },
+                        ))
+                    } else {
+                        None
+                    };
+                    dlg.apply_page(page);
+                    (dlg.caption.clone(), dlg.pf_callback, dlg.lp_callback_data, stop_old)
+                })
+            };
+            if let Some((new_caption, new_cb, new_ref_data, stop_old)) = nav_action {
+                let wide_cap = crate::strings::to_wide_z(&new_caption);
+                let _ = crate::user32::defproc::DefWindowProcW(
+                    hwnd,
+                    crate::user32::wm::SETTEXT,
+                    0,
+                    wide_cap.as_ptr() as isize,
+                );
+                if let Some((old_sid, upd)) = stop_old {
+                    crate::macos::task_dialog_alert_update(old_sid, upd);
+                }
+                if new_cb != 0 {
+                    let _ = crate::call_guest8(
+                        new_cb,
+                        h as u64,
+                        TDN_NAVIGATED as u64,
+                        0,
+                        0,
+                        new_ref_data as u64,
+                        0,
+                        0,
+                        0,
+                    );
+                }
             }
             0
         }
@@ -845,102 +1138,10 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     if !verification_flag.is_null() {
         verification_flag.write_unaligned(FALSE);
     }
-    if config.is_null() {
-        return E_INVALIDARG;
-    }
-    let cfg = (config as *const TaskDialogConfig).read_unaligned();
-    if cfg.cb_size != std::mem::size_of::<TaskDialogConfig>() as u32 {
-        return E_INVALIDARG;
-    }
-    if (cfg.c_buttons > 0 && cfg.p_buttons.is_null())
-        || (cfg.c_radio_buttons > 0 && cfg.p_radio_buttons.is_null())
-    {
-        return E_INVALIDARG;
-    }
-
-    let hinst = cfg.h_instance;
-    let title = resolve_task_dialog_str(hinst, cfg.psz_window_title);
-    let main_inst = resolve_task_dialog_str(hinst, cfg.psz_main_instruction);
-    let content = resolve_task_dialog_str(hinst, cfg.psz_content);
-    let expanded = resolve_task_dialog_str(hinst, cfg.psz_expanded_information);
-    let footer = resolve_task_dialog_str(hinst, cfg.psz_footer);
-
-    // Collect custom buttons followed by common buttons in Windows dialog order.
-    let mut buttons: Vec<(i32, String)> = Vec::new();
-    for i in 0..cfg.c_buttons as usize {
-        let b = cfg.p_buttons.add(i).read_unaligned();
-        let bid = b.button_id;
-        let label = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, b.button_text));
-        buttons.push((bid, if label.is_empty() { format!("Button {bid}") } else { label }));
-    }
-    let common = cfg.dw_common_buttons;
-    if (common & TDCBF_OK_BUTTON) != 0 {
-        buttons.push((1, "OK".into()));
-    }
-    if (common & TDCBF_YES_BUTTON) != 0 {
-        buttons.push((6, "Yes".into()));
-    }
-    if (common & TDCBF_NO_BUTTON) != 0 {
-        buttons.push((7, "No".into()));
-    }
-    if (common & TDCBF_RETRY_BUTTON) != 0 {
-        buttons.push((4, "Retry".into()));
-    }
-    if (common & TDCBF_CANCEL_BUTTON) != 0 {
-        buttons.push((2, "Cancel".into()));
-    }
-    if (common & TDCBF_CLOSE_BUTTON) != 0 {
-        buttons.push((8, "Close".into()));
-    }
-    if buttons.is_empty() {
-        buttons.push((1, "OK".into()));
-    }
-
-    // Collect radio buttons and resolve initial default selection.
-    let mut radios: Vec<(i32, String)> = Vec::with_capacity(cfg.c_radio_buttons as usize);
-    for i in 0..cfg.c_radio_buttons as usize {
-        let rb = cfg.p_radio_buttons.add(i).read_unaligned();
-        let rid = rb.button_id;
-        let label = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, rb.button_text));
-        radios.push((rid, if label.is_empty() { format!("Option {rid}") } else { label }));
-    }
-    let selected_radio_idx: Option<usize> =
-        if !radios.is_empty() && (cfg.dw_flags & TDF_NO_DEFAULT_RADIO_BUTTON) == 0 {
-            if cfg.n_default_radio_button != 0 {
-                radios
-                    .iter()
-                    .position(|(id, _)| *id == cfg.n_default_radio_button)
-                    .or(Some(0))
-            } else {
-                Some(0)
-            }
-        } else {
-            None
-        };
-    let verification_text: Option<String> = if !cfg.psz_verification_text.is_null() {
-        let s = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, cfg.psz_verification_text));
-        Some(if s.is_empty() { "Confirm".to_string() } else { s })
-    } else {
-        None
+    let initial_page = match parse_task_dialog_config(config) {
+        Ok(p) => p,
+        Err(hr) => return hr,
     };
-    let verified: bool =
-        verification_text.is_some() && (cfg.dw_flags & TDF_VERIFICATION_FLAG_CHECKED) != 0;
-
-    // TD_ERROR_ICON == MAKEINTRESOURCEW(-2) == 0xFFFE.
-    let critical = (cfg.main_icon & 0xFFFF) == 0xFFFE && cfg.main_icon <= 0xFFFF;
-    let caption = if title.is_empty() {
-        if critical { "Error".to_string() } else { "Notice".to_string() }
-    } else {
-        title
-    };
-    let labels: Vec<String> = buttons.iter().map(|(_, l)| l.clone()).collect();
-    let default_button_idx: Option<usize> = if cfg.n_default_button != 0 {
-        buttons.iter().position(|(id, _)| *id == cfg.n_default_button)
-    } else {
-        None
-    };
-    let radio_labels: Vec<String> = radios.iter().map(|(_, l)| l.clone()).collect();
-    let has_selection_controls = !radios.is_empty() || verification_text.is_some();
 
     // Allocate a dialog-owned Win32 HWND (distinct from cfg.hwnd_parent, non-NULL even for
     // unparented dialogs) so callbacks using SetWindowText, SetWindowSubclass, or TDM_*
@@ -948,60 +1149,31 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     let session_id = NEXT_TASK_DIALOG_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dialog_hwnd = crate::user32::window::create_virtual_dialog_hwnd(
         "#32770_TaskDialog",
-        &caption,
-        cfg.hwnd_parent as usize,
+        &initial_page.caption,
+        initial_page.hwnd_parent as usize,
         task_dialog_wndproc_va(),
     );
-    let enable_hyperlinks = (cfg.dw_flags & TDF_ENABLE_HYPERLINKS) != 0;
-    let show_progress =
-        (cfg.dw_flags & (TDF_SHOW_PROGRESS_BAR | TDF_SHOW_MARQUEE_PROGRESS_BAR)) != 0;
-    let initial_progress = show_progress.then(|| crate::macos::TaskDialogProgressState {
-        marquee: (cfg.dw_flags & TDF_SHOW_MARQUEE_PROGRESS_BAR) != 0,
-        marquee_running: false,
-        min: 0,
-        max: 100,
-        pos: 0,
-        state: PBST_NORMAL,
-    });
     active_task_dialogs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            dialog_hwnd,
-            ActiveTaskDialog {
-                session_id,
-                modal_open: false,
-                enable_hyperlinks,
-                progress: initial_progress,
-                hinst: hinst as usize,
-                pf_callback: cfg.pf_callback,
-                lp_callback_data: cfg.lp_callback_data,
-                caption,
-                main_inst,
-                content,
-                expanded,
-                footer,
-                buttons: buttons.clone(),
-                button_enabled: vec![true; buttons.len()],
-                radios: radios.clone(),
-                radio_enabled: vec![true; radios.len()],
-                selected_radio_idx,
-                has_verification: verification_text.is_some(),
-                verified,
-                pending_click_button: None,
-            },
-        );
+        .insert(dialog_hwnd, ActiveTaskDialog::from_page(session_id, initial_page));
     let _dialog_guard = TaskDialogHwndGuard { hwnd: dialog_hwnd };
 
     let notify_lp = |msg: u32, wp: u64, lp: u64| -> HRESULT {
-        if cfg.pf_callback != 0 {
+        let cb_info = {
+            let map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&dialog_hwnd)
+                .map(|d| (d.pf_callback, d.lp_callback_data))
+                .unwrap_or((0, 0))
+        };
+        if cb_info.0 != 0 {
             crate::call_guest8(
-                cfg.pf_callback,
+                cb_info.0,
                 dialog_hwnd as u64,
                 msg as u64,
                 wp,
                 lp,
-                cfg.lp_callback_data as u64,
+                cb_info.1 as u64,
                 0,
                 0,
                 0,
@@ -1012,46 +1184,68 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     };
     let notify = |msg: u32, wp: u64| -> HRESULT { notify_lp(msg, wp, 0) };
 
-    let callback_timer = (cfg.dw_flags & TDF_CALLBACK_TIMER) != 0 && cfg.pf_callback != 0;
-    let timer_interval = callback_timer.then_some(TASK_DIALOG_TIMER_INTERVAL);
     let mut timer_origin = std::time::Instant::now();
 
     let _ = notify(TDN_DIALOG_CONSTRUCTED, 0);
     let _ = notify(TDN_CREATED, 0);
 
     let chosen_id = loop {
-        let (
-            cur_caption,
-            cur_body,
-            cur_links,
-            cur_progress,
-            cur_button_enabled,
-            cur_radio_enabled,
-            cur_radio_idx,
-            cur_verified,
-            programmatic_click,
-        ) = {
+        struct PageSnapshot {
+            session_id: u64,
+            page_generation: u64,
+            caption: String,
+            body: String,
+            links: Vec<(String, String)>,
+            progress: Option<crate::macos::TaskDialogProgressState>,
+            buttons: Vec<(i32, String)>,
+            button_enabled: Vec<bool>,
+            default_button_idx: Option<usize>,
+            radio_labels: Vec<String>,
+            radio_enabled: Vec<bool>,
+            selected_radio_idx: Option<usize>,
+            verification_text: Option<String>,
+            verified: bool,
+            critical: bool,
+            callback_timer: bool,
+            reset_timer: bool,
+            programmatic_click: Option<i32>,
+        }
+        let snap = {
             let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
             let dlg = map.get_mut(&dialog_hwnd).expect("active task dialog missing");
             let (body, links) = dlg.compose_body_and_links();
-            let snap = (
-                dlg.caption.clone(),
-                body,
-                links,
-                dlg.progress,
-                dlg.button_enabled.clone(),
-                dlg.radio_enabled.clone(),
-                dlg.selected_radio_idx,
-                dlg.verified,
-                dlg.pending_click_button.take(),
-            );
-            if snap.8.is_none() {
+            let reset_timer = std::mem::take(&mut dlg.reset_timer_on_present);
+            let programmatic_click = dlg.pending_click_button.take();
+            if programmatic_click.is_none() {
                 dlg.modal_open = true;
             }
-            snap
+            PageSnapshot {
+                session_id: dlg.session_id,
+                page_generation: dlg.page_generation,
+                caption: dlg.caption.clone(),
+                body,
+                links,
+                progress: dlg.progress,
+                buttons: dlg.buttons.clone(),
+                button_enabled: dlg.button_enabled.clone(),
+                default_button_idx: dlg.default_button_idx,
+                radio_labels: dlg.radios.iter().map(|(_, l)| l.clone()).collect(),
+                radio_enabled: dlg.radio_enabled.clone(),
+                selected_radio_idx: dlg.selected_radio_idx,
+                verification_text: dlg.verification_text.clone(),
+                verified: dlg.verified,
+                critical: dlg.critical,
+                callback_timer: dlg.callback_timer,
+                reset_timer,
+                programmatic_click,
+            }
         };
 
-        if let Some(bid) = programmatic_click {
+        if snap.reset_timer {
+            timer_origin = std::time::Instant::now();
+        }
+
+        if let Some(bid) = snap.programmatic_click {
             let cb_hr = notify(TDN_BUTTON_CLICKED, bid as u64);
             if cb_hr != S_FALSE_HR {
                 break bid;
@@ -1059,22 +1253,28 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             continue;
         }
 
+        let labels: Vec<String> = snap.buttons.iter().map(|(_, l)| l.clone()).collect();
+        let has_selection_controls =
+            !snap.radio_labels.is_empty() || snap.verification_text.is_some();
+        let timer_interval = snap.callback_timer.then_some(TASK_DIALOG_TIMER_INTERVAL);
+        let presented_gen = snap.page_generation;
+
         let presented = crate::macos::task_dialog_alert(
-            session_id,
+            snap.session_id,
             dialog_hwnd,
-            cur_caption,
-            cur_body,
-            cur_links.clone(),
-            cur_progress,
-            labels.clone(),
-            cur_button_enabled.clone(),
-            default_button_idx,
-            radio_labels.clone(),
-            cur_radio_enabled,
-            cur_radio_idx,
-            verification_text.clone(),
-            cur_verified,
-            critical,
+            snap.caption,
+            snap.body,
+            snap.links.clone(),
+            snap.progress,
+            labels,
+            snap.button_enabled.clone(),
+            snap.default_button_idx,
+            snap.radio_labels,
+            snap.radio_enabled,
+            snap.selected_radio_idx,
+            snap.verification_text,
+            snap.verified,
+            snap.critical,
             &mut timer_origin,
             timer_interval,
             |ev| match ev {
@@ -1082,8 +1282,11 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     let rid_opt = {
                         let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
                         map.get_mut(&dialog_hwnd).and_then(|dlg| {
+                            if dlg.page_generation != presented_gen {
+                                return None;
+                            }
                             dlg.selected_radio_idx = Some(ridx);
-                            radios.get(ridx).map(|(rid, _)| *rid)
+                            dlg.radios.get(ridx).map(|(rid, _)| *rid)
                         })
                     };
                     if let Some(rid) = rid_opt {
@@ -1094,12 +1297,11 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     let has_ver = {
                         let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
                         map.get_mut(&dialog_hwnd).is_some_and(|dlg| {
-                            if dlg.has_verification {
-                                dlg.verified = checked;
-                                true
-                            } else {
-                                false
+                            if dlg.page_generation != presented_gen || !dlg.has_verification {
+                                return false;
                             }
+                            dlg.verified = checked;
+                            true
                         })
                     };
                     if has_ver {
@@ -1107,62 +1309,85 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     }
                 }
                 crate::macos::TaskDialogEvent::HyperlinkClicked(href) => {
-                    let wide = crate::strings::to_wide_z(&href);
-                    let _ = notify_lp(TDN_HYPERLINK_CLICKED, 0, wide.as_ptr() as u64);
+                    let same_page = {
+                        let map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                        map.get(&dialog_hwnd)
+                            .is_some_and(|dlg| dlg.page_generation == presented_gen)
+                    };
+                    if same_page {
+                        let wide = crate::strings::to_wide_z(&href);
+                        let _ = notify_lp(TDN_HYPERLINK_CLICKED, 0, wide.as_ptr() as u64);
+                    }
                 }
-                crate::macos::TaskDialogEvent::ButtonClicked(_) => {}
+                crate::macos::TaskDialogEvent::ButtonClicked(_)
+                | crate::macos::TaskDialogEvent::Navigated => {}
             },
             |elapsed_ms| notify(TDN_TIMER, elapsed_ms as u64) == S_FALSE_HR,
         );
         // Consume any programmatic TDM_CLICK_BUTTON triggered while the native modal was open
         // so it is delivered exactly once and never replayed if TDN_BUTTON_CLICKED returns S_FALSE.
-        let consumed_prog_click = {
+        // If TDM_NAVIGATE_PAGE superseded this page while the modal was open, preserve the new
+        // page's state and loop immediately to present it.
+        let (navigated_while_open, consumed_prog_click) = {
             let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
-            map.get_mut(&dialog_hwnd).and_then(|dlg| {
-                dlg.modal_open = false;
-                if let crate::macos::TaskDialogOutcome::Completed(ref res) = presented {
-                    dlg.selected_radio_idx = res.radio_index;
-                    if dlg.has_verification {
-                        dlg.verified = res.verified;
+            map.get_mut(&dialog_hwnd)
+                .map(|dlg| {
+                    let navigated = dlg.page_generation != presented_gen;
+                    dlg.modal_open = false;
+                    if !navigated {
+                        if let crate::macos::TaskDialogOutcome::Completed(ref res) = presented {
+                            dlg.selected_radio_idx = res.radio_index;
+                            if dlg.has_verification {
+                                dlg.verified = res.verified;
+                            }
+                        }
+                        (false, dlg.pending_click_button.take())
+                    } else {
+                        (true, None)
                     }
-                }
-                dlg.pending_click_button.take()
-            })
+                })
+                .unwrap_or((false, None))
         };
+        if matches!(presented, crate::macos::TaskDialogOutcome::Quit) {
+            // WM_QUIT arrived on the owning thread: exit the modal loop immediately
+            // without synthesizing a button click, leaving the re-posted WM_QUIT
+            // intact for the application's outer message loop.
+            break 0;
+        }
+        if matches!(presented, crate::macos::TaskDialogOutcome::Navigated) || navigated_while_open {
+            continue;
+        }
         let (bid, interactive) = match presented {
             crate::macos::TaskDialogOutcome::Completed(res) => {
                 let bid = consumed_prog_click.unwrap_or_else(|| {
-                    buttons
+                    snap.buttons
                         .get(res.button_index)
                         .map(|(id, _)| *id)
-                        .unwrap_or(buttons[0].0)
+                        .unwrap_or(snap.buttons[0].0)
                 });
                 (bid, true)
             }
-            crate::macos::TaskDialogOutcome::Quit => {
-                // WM_QUIT arrived on the owning thread: exit the modal loop immediately
-                // without synthesizing a button click, leaving the re-posted WM_QUIT
-                // intact for the application's outer message loop.
-                break 0;
+            crate::macos::TaskDialogOutcome::Navigated | crate::macos::TaskDialogOutcome::Quit => {
+                unreachable!()
             }
             crate::macos::TaskDialogOutcome::Unavailable => {
-                let single_enabled = cur_button_enabled.first().copied().unwrap_or(true);
-                if buttons.len() == 1
+                let single_enabled = snap.button_enabled.first().copied().unwrap_or(true);
+                if snap.buttons.len() == 1
                     && !has_selection_controls
-                    && !callback_timer
-                    && cur_links.is_empty()
-                    && cur_progress.is_none()
+                    && !snap.callback_timer
+                    && snap.links.is_empty()
+                    && snap.progress.is_none()
                     && single_enabled
                 {
                     // Pure single-button informational dialog with an enabled button and no
                     // selection controls, hyperlinks, progress bar, or timer can dismiss in
                     // headless mode (matching MessageBox MB_OK).
-                    (buttons[0].0, false)
+                    (snap.buttons[0].0, false)
                 } else {
                     // Multi-button prompts or dialogs with radio buttons / verification checkboxes /
                     // clickable hyperlinks / progress bars / TDF_CALLBACK_TIMER require an interactive
                     // desktop so we never fabricate user selections or silently skip live UI updates.
-                    if callback_timer {
+                    if snap.callback_timer {
                         log::warn!("uxtheme: TaskDialogIndirect with TDF_CALLBACK_TIMER requires interactive desktop");
                     }
                     let _ = notify(TDN_DESTROYED, 0);
@@ -1184,19 +1409,22 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         break bid;
     };
 
-    let (final_radio_idx, final_verified) = {
+    let (selected_radio, final_verified) = {
         let map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
         map.get(&dialog_hwnd)
-            .map(|d| (d.selected_radio_idx, d.verified))
-            .unwrap_or((selected_radio_idx, verified))
+            .map(|d| {
+                let rid = d
+                    .selected_radio_idx
+                    .and_then(|idx| d.radios.get(idx))
+                    .map(|(id, _)| *id)
+                    .unwrap_or(0);
+                (rid, d.verified)
+            })
+            .unwrap_or((0, false))
     };
 
     let _ = notify(TDN_DESTROYED, 0);
 
-    let selected_radio = final_radio_idx
-        .and_then(|idx| radios.get(idx))
-        .map(|(id, _)| *id)
-        .unwrap_or(0);
     if !button.is_null() {
         button.write_unaligned(chosen_id);
     }
@@ -2112,8 +2340,12 @@ mod tests {
                     dlg_hwnd,
                     ActiveTaskDialog {
                         session_id: sid,
+                        page_generation: 0,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        callback_timer: false,
+                        reset_timer_on_present: false,
+                        critical: false,
                         progress: None,
                         hinst: 0,
                         pf_callback: 0,
@@ -2125,9 +2357,11 @@ mod tests {
                         footer: String::new(),
                         buttons: vec![(1, "OK".to_string())],
                         button_enabled: vec![true],
+                        default_button_idx: None,
                         radios: Vec::new(),
                         radio_enabled: Vec::new(),
                         selected_radio_idx: None,
+                        verification_text: None,
                         has_verification: false,
                         verified: false,
                         pending_click_button: None,
@@ -2203,8 +2437,12 @@ mod tests {
                     timer_hwnd,
                     ActiveTaskDialog {
                         session_id: timer_sid,
+                        page_generation: 0,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        callback_timer: false,
+                        reset_timer_on_present: false,
+                        critical: false,
                         progress: None,
                         hinst: 0,
                         pf_callback: 0,
@@ -2216,9 +2454,11 @@ mod tests {
                         footer: String::new(),
                         buttons: vec![(1, "OK".to_string())],
                         button_enabled: vec![true],
+                        default_button_idx: None,
                         radios: Vec::new(),
                         radio_enabled: Vec::new(),
                         selected_radio_idx: None,
+                        verification_text: None,
                         has_verification: false,
                         verified: false,
                         pending_click_button: None,
@@ -2932,8 +3172,12 @@ mod tests {
                     dlg_hwnd,
                     ActiveTaskDialog {
                         session_id: sid,
+                        page_generation: 0,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        callback_timer: false,
+                        reset_timer_on_present: false,
+                        critical: false,
                         progress: None,
                         hinst: 0,
                         pf_callback: 0,
@@ -2945,9 +3189,11 @@ mod tests {
                         footer: String::new(),
                         buttons: vec![(1, "OK".to_string())],
                         button_enabled: vec![true],
+                        default_button_idx: None,
                         radios: Vec::new(),
                         radio_enabled: Vec::new(),
                         selected_radio_idx: None,
+                        verification_text: None,
                         has_verification: false,
                         verified: false,
                         pending_click_button: None,
@@ -3019,6 +3265,341 @@ mod tests {
             assert!(
                 OWNER_TIMER_HITS.load(std::sync::atomic::Ordering::Acquire) >= 1,
                 "owner-window WM_TIMER must be dispatched while modal TaskDialog waits"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn task_dialog_navigate_page_rebuilds_wizard_and_mid_modal_pages() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            static PAGE2_CFG_PTR: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            static PAGE3_CFG_PTR: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+
+            unsafe extern "win64" fn page1_cb(
+                hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                ref_data: isize,
+            ) -> HRESULT {
+                EVENTS.lock().unwrap().push(format!("p1:{msg}:{wp}:{ref_data:#x}"));
+                if msg == TDN_CREATED {
+                    // Invalid configs (null / wrong cbSize) must be rejected without
+                    // firing TDN_NAVIGATED or corrupting the current page.
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_NAVIGATE_PAGE, 0, 0);
+                    let mut bad: TaskDialogConfig = std::mem::zeroed();
+                    bad.cb_size = 16;
+                    let _ = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_NAVIGATE_PAGE,
+                        0,
+                        &bad as *const TaskDialogConfig as isize,
+                    );
+                } else if msg == TDN_BUTTON_CLICKED && wp == 1001 {
+                    let p2 = PAGE2_CFG_PTR.load(std::sync::atomic::Ordering::Acquire);
+                    assert_ne!(p2, 0);
+                    let _ = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_NAVIGATE_PAGE,
+                        0,
+                        p2 as isize,
+                    );
+                    return S_FALSE_HR;
+                }
+                S_OK
+            }
+
+            unsafe extern "win64" fn page2_cb(
+                hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                ref_data: isize,
+            ) -> HRESULT {
+                EVENTS.lock().unwrap().push(format!("p2:{msg}:{wp}:{ref_data:#x}"));
+                if msg == TDN_NAVIGATED {
+                    let mut title_buf = [0u16; 64];
+                    let n = crate::user32::window::GetWindowTextW(
+                        hwnd,
+                        title_buf.as_mut_ptr(),
+                        title_buf.len() as i32,
+                    );
+                    assert_eq!(String::from_utf16_lossy(&title_buf[..n as usize]), "Step 2");
+                    let footer = crate::strings::to_wide_z("Navigated Footer");
+                    let _ = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_SET_ELEMENT_TEXT,
+                        TDE_FOOTER,
+                        footer.as_ptr() as isize,
+                    );
+                } else if msg == TDN_HYPERLINK_CLICKED {
+                    let p3 = PAGE3_CFG_PTR.load(std::sync::atomic::Ordering::Acquire);
+                    if p3 != 0 {
+                        let _ = crate::user32::message::SendMessageW(
+                            hwnd,
+                            TDM_NAVIGATE_PAGE,
+                            0,
+                            p3 as isize,
+                        );
+                    }
+                }
+                S_OK
+            }
+
+            unsafe extern "win64" fn page3_cb(
+                _hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                ref_data: isize,
+            ) -> HRESULT {
+                EVENTS.lock().unwrap().push(format!("p3:{msg}:{wp}:{ref_data:#x}"));
+                S_OK
+            }
+
+            let title1 = crate::strings::to_wide_z("Step 1");
+            let content1 = crate::strings::to_wide_z("Welcome");
+            let next_lbl = crate::strings::to_wide_z("&Next");
+            let btns1 = [TaskDialogButton {
+                button_id: 1001,
+                button_text: next_lbl.as_ptr(),
+            }];
+
+            let title2 = crate::strings::to_wide_z("Step 2");
+            let content2 = crate::strings::to_wide_z(
+                "Details <a href=\"https://example.test/jump\">Jump</a>",
+            );
+            let finish_lbl = crate::strings::to_wide_z("&Finish");
+            let btns2 = [TaskDialogButton {
+                button_id: 2001,
+                button_text: finish_lbl.as_ptr(),
+            }];
+            let rad_a = crate::strings::to_wide_z("Alpha");
+            let rad_b = crate::strings::to_wide_z("Beta");
+            let radios2 = [
+                TaskDialogButton { button_id: 301, button_text: rad_a.as_ptr() },
+                TaskDialogButton { button_id: 302, button_text: rad_b.as_ptr() },
+            ];
+            let ver2 = crate::strings::to_wide_z("Launch now");
+
+            let title3 = crate::strings::to_wide_z("Step 3");
+            let content3 = crate::strings::to_wide_z("Final page");
+            let done_lbl = crate::strings::to_wide_z("Done");
+            let btns3 = [TaskDialogButton {
+                button_id: 3001,
+                button_text: done_lbl.as_ptr(),
+            }];
+
+            let mut cfg2: TaskDialogConfig = std::mem::zeroed();
+            cfg2.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg2.dw_flags = TDF_ENABLE_HYPERLINKS;
+            cfg2.dw_common_buttons = TDCBF_CLOSE_BUTTON;
+            cfg2.psz_window_title = title2.as_ptr();
+            cfg2.psz_content = content2.as_ptr();
+            cfg2.c_buttons = btns2.len() as u32;
+            cfg2.p_buttons = btns2.as_ptr();
+            cfg2.n_default_button = 2001;
+            cfg2.c_radio_buttons = radios2.len() as u32;
+            cfg2.p_radio_buttons = radios2.as_ptr();
+            cfg2.n_default_radio_button = 302;
+            cfg2.psz_verification_text = ver2.as_ptr();
+            cfg2.pf_callback = page2_cb as *const () as usize;
+            cfg2.lp_callback_data = 0x2222;
+
+            let mut cfg3: TaskDialogConfig = std::mem::zeroed();
+            cfg3.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg3.psz_window_title = title3.as_ptr();
+            cfg3.psz_content = content3.as_ptr();
+            cfg3.c_buttons = btns3.len() as u32;
+            cfg3.p_buttons = btns3.as_ptr();
+            cfg3.pf_callback = page3_cb as *const () as usize;
+            cfg3.lp_callback_data = 0x3333;
+
+            let mut cfg1: TaskDialogConfig = std::mem::zeroed();
+            cfg1.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg1.dw_common_buttons = TDCBF_CANCEL_BUTTON;
+            cfg1.psz_window_title = title1.as_ptr();
+            cfg1.psz_content = content1.as_ptr();
+            cfg1.c_buttons = btns1.len() as u32;
+            cfg1.p_buttons = btns1.as_ptr();
+            cfg1.pf_callback = page1_cb as *const () as usize;
+            cfg1.lp_callback_data = 0x1111;
+
+            // 1. Standard wizard transition from TDN_BUTTON_CLICKED (Page 1 -> Page 2).
+            EVENTS.lock().unwrap().clear();
+            PAGE2_CFG_PTR.store(
+                &cfg2 as *const TaskDialogConfig as usize,
+                std::sync::atomic::Ordering::Release,
+            );
+            PAGE3_CFG_PTR.store(0, std::sync::atomic::Ordering::Release);
+
+            let stage = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stage_hook = stage.clone();
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |cap, body, links, _prog, btns, _btn_en, def_btn, rads, _rad_en, def_rad, vt, vc, emit| {
+                    let cur = stage_hook.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if cur == 0 {
+                        assert_eq!(cap, "Step 1");
+                        assert_eq!(body, "Welcome");
+                        assert_eq!(btns, &["Next".to_string(), "Cancel".to_string()]);
+                        assert!(rads.is_empty());
+                        assert_eq!(vt, None);
+                        crate::macos::TaskDialogOutcome::Completed(
+                            crate::macos::TaskDialogAlertResult {
+                                button_index: 0, // ID 1001 ("Next")
+                                radio_index: None,
+                                verified: false,
+                            },
+                        )
+                    } else {
+                        assert_eq!(cur, 1);
+                        assert_eq!(cap, "Step 2");
+                        assert_eq!(body, "Details Jump\n\nNavigated Footer");
+                        assert_eq!(
+                            links,
+                            &[("Jump".to_string(), "https://example.test/jump".to_string())]
+                        );
+                        assert_eq!(btns, &["Finish".to_string(), "Close".to_string()]);
+                        assert_eq!(def_btn, Some(0));
+                        assert_eq!(rads, &["Alpha".to_string(), "Beta".to_string()]);
+                        assert_eq!(def_rad, Some(1));
+                        assert_eq!(vt, Some("Launch now"));
+                        assert!(!vc);
+                        emit(crate::macos::TaskDialogEvent::RadioSelected(0));
+                        emit(crate::macos::TaskDialogEvent::VerificationToggled(true));
+                        crate::macos::TaskDialogOutcome::Completed(
+                            crate::macos::TaskDialogAlertResult {
+                                button_index: 0, // ID 2001 ("Finish")
+                                radio_index: Some(0),
+                                verified: true,
+                            },
+                        )
+                    }
+                },
+            )));
+
+            let mut btn = 0;
+            let mut rad = 0;
+            let mut ver = FALSE;
+            let hr = TaskDialogIndirect(
+                &cfg1 as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut rad,
+                &mut ver,
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(hr, S_OK);
+            assert_eq!(btn, 2001);
+            assert_eq!(rad, 301);
+            assert_eq!(ver, TRUE);
+            assert_eq!(
+                EVENTS.lock().unwrap().clone(),
+                vec![
+                    format!("p1:{TDN_DIALOG_CONSTRUCTED}:0:0x1111"),
+                    format!("p1:{TDN_CREATED}:0:0x1111"),
+                    format!("p1:{TDN_BUTTON_CLICKED}:1001:0x1111"),
+                    format!("p2:{TDN_NAVIGATED}:0:0x2222"),
+                    format!("p2:{TDN_RADIO_BUTTON_CLICKED}:301:0x2222"),
+                    format!("p2:{TDN_VERIFICATION_CLICKED}:1:0x2222"),
+                    format!("p2:{TDN_BUTTON_CLICKED}:2001:0x2222"),
+                    format!("p2:{TDN_DESTROYED}:0:0x2222"),
+                ]
+            );
+
+            // 2. Mid-modal navigation (TDN_HYPERLINK_CLICKED triggers TDM_NAVIGATE_PAGE
+            //    while Page 2's modal is open): must emit navigate_page live update and
+            //    immediately re-present Page 3.
+            EVENTS.lock().unwrap().clear();
+            PAGE3_CFG_PTR.store(
+                &cfg3 as *const TaskDialogConfig as usize,
+                std::sync::atomic::Ordering::Release,
+            );
+            let saw_nav_update = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let saw_nav_hook = saw_nav_update.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |_sid, upd| {
+                if upd.navigate_page {
+                    saw_nav_hook.store(true, std::sync::atomic::Ordering::Release);
+                }
+            })));
+            let stage2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stage2_hook = stage2.clone();
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |cap, body, _links, _prog, btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
+                    let cur = stage2_hook.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    match cur {
+                        0 => {
+                            assert_eq!(cap, "Step 1");
+                            crate::macos::TaskDialogOutcome::Completed(
+                                crate::macos::TaskDialogAlertResult {
+                                    button_index: 0,
+                                    radio_index: None,
+                                    verified: false,
+                                },
+                            )
+                        }
+                        1 => {
+                            assert_eq!(cap, "Step 2");
+                            emit(crate::macos::TaskDialogEvent::HyperlinkClicked(
+                                "https://example.test/jump".to_string(),
+                            ));
+                            crate::macos::TaskDialogOutcome::Navigated
+                        }
+                        _ => {
+                            assert_eq!(cur, 2);
+                            assert_eq!(cap, "Step 3");
+                            assert_eq!(body, "Final page");
+                            assert_eq!(btns, &["Done".to_string()]);
+                            crate::macos::TaskDialogOutcome::Completed(
+                                crate::macos::TaskDialogAlertResult {
+                                    button_index: 0, // ID 3001 ("Done")
+                                    radio_index: None,
+                                    verified: false,
+                                },
+                            )
+                        }
+                    }
+                },
+            )));
+
+            let mut btn3 = 0;
+            let mut rad3 = 99;
+            let mut ver3 = TRUE;
+            let hr2 = TaskDialogIndirect(
+                &cfg1 as *const TaskDialogConfig as *const u8,
+                &mut btn3,
+                &mut rad3,
+                &mut ver3,
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            crate::macos::set_test_task_dialog_updater(None);
+            PAGE2_CFG_PTR.store(0, std::sync::atomic::Ordering::Release);
+            PAGE3_CFG_PTR.store(0, std::sync::atomic::Ordering::Release);
+            assert_eq!(hr2, S_OK);
+            assert!(
+                saw_nav_update.load(std::sync::atomic::Ordering::Acquire),
+                "mid-modal TDM_NAVIGATE_PAGE must signal navigate_page to tear down the active alert"
+            );
+            assert_eq!(btn3, 3001);
+            assert_eq!(rad3, 0);
+            assert_eq!(ver3, FALSE);
+            assert_eq!(
+                EVENTS.lock().unwrap().clone(),
+                vec![
+                    format!("p1:{TDN_DIALOG_CONSTRUCTED}:0:0x1111"),
+                    format!("p1:{TDN_CREATED}:0:0x1111"),
+                    format!("p1:{TDN_BUTTON_CLICKED}:1001:0x1111"),
+                    format!("p2:{TDN_NAVIGATED}:0:0x2222"),
+                    format!("p2:{TDN_HYPERLINK_CLICKED}:0:0x2222"),
+                    format!("p3:{TDN_NAVIGATED}:0:0x3333"),
+                    format!("p3:{TDN_BUTTON_CLICKED}:3001:0x3333"),
+                    format!("p3:{TDN_DESTROYED}:0:0x3333"),
+                ]
             );
         })
         .join()
