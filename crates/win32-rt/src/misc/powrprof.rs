@@ -54,8 +54,11 @@ const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0;
 const DEVICE_NOTIFY_SERVICE_HANDLE: u32 = 1;
 const DEVICE_NOTIFY_CALLBACK: u32 = 2;
 
+#[cfg(any(target_os = "macos", test))]
 const PBT_APMSUSPEND: u32 = 0x0004;
+#[cfg(any(target_os = "macos", test))]
 const PBT_APMRESUMESUSPEND: u32 = 0x0007;
+#[cfg(any(target_os = "macos", test))]
 const PBT_APMRESUMEAUTOMATIC: u32 = 0x0012;
 const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
 
@@ -121,6 +124,7 @@ enum PowerNotifyTarget {
 #[derive(Clone, Debug)]
 struct PowerNotification {
     kind: PowerNotifyKind,
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     target: PowerNotifyTarget,
 }
 
@@ -942,6 +946,7 @@ unsafe fn deliver_to_target(target: &PowerNotifyTarget, pbt_type: u32, setting_b
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn dispatch_suspend_resume_event(pbt_type: u32) {
     let targets: Vec<PowerNotifyTarget> = {
         let map = notifications().lock().unwrap();
@@ -955,6 +960,7 @@ pub(crate) fn dispatch_suspend_resume_event(pbt_type: u32) {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn dispatch_power_setting_change(guid: [u8; 16], data: &[u8]) {
     let targets: Vec<PowerNotifyTarget> = {
         let map = notifications().lock().unwrap();
