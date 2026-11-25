@@ -1733,9 +1733,9 @@ fn map_wintrust_revocation_flags(fdw_revocation_checks: u32, dw_prov_flags: u32)
 
 #[derive(Clone, Copy, Default)]
 struct GenericChainPolicy {
+    h_chain_engine: *mut c_void,
     p_chain_para: *const c_void,
     dw_flags: u32,
-    pv_extra_policy_arg: *const c_void,
     pfn_policy_callback: usize,
     pv_policy_arg: *mut c_void,
 }
@@ -2066,11 +2066,12 @@ unsafe fn verify_cert_via_chain_policy(
         std::ptr::null_mut()
     };
 
+    let h_chain_engine = generic_chain.map_or(std::ptr::null_mut(), |g| g.h_chain_engine);
     let p_chain_para = generic_chain.map_or(std::ptr::null(), |g| g.p_chain_para);
     let effective_chain_flags = chain_flags | generic_chain.map_or(0, |g| g.dw_flags);
     let mut chain_ctx: *mut c_void = std::ptr::null_mut();
     let ok = super::crypt32::CertGetCertificateChain(
-        std::ptr::null_mut(),
+        h_chain_engine,
         cert_ctx,
         p_time,
         extra_store,
@@ -2133,17 +2134,12 @@ unsafe fn verify_cert_via_chain_policy(
         l_element_index: i32,
         pv_extra: *mut c_void,
     }
-    let effective_policy_extra = if !policy_extra.is_null() {
-        policy_extra
-    } else {
-        generic_chain.map_or(std::ptr::null(), |g| g.pv_extra_policy_arg)
-    };
     let policy_para = PolicyPara {
         cb_size: std::mem::size_of::<PolicyPara>() as u32,
         dw_flags: 0,
-        pv_extra_policy_para: effective_policy_extra,
+        pv_extra_policy_para: policy_extra,
     };
-    let p_para = if effective_policy_extra.is_null() {
+    let p_para = if policy_extra.is_null() {
         std::ptr::null()
     } else {
         &policy_para as *const PolicyPara as *const c_void
@@ -2230,20 +2226,43 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
     };
     let generic_chain: Option<GenericChainPolicy> =
         if guid == WINTRUST_ACTION_GENERIC_CHAIN_VERIFY && !p_policy_callback_data.is_null() {
-            // WTD_GENERIC_CHAIN_POLICY_DATA (Win64, 0x30 bytes):
-            //   cbSize @ +0x00, pChainPara @ +0x08, dwFlags @ +0x10,
-            //   pvExtraPolicyArg @ +0x18, pfnPolicyCallback @ +0x20, pvPolicyArg @ +0x28
+            // Windows SDK SoftPub.h WTD_GENERIC_CHAIN_POLICY_DATA (Win64, 0x28 bytes):
+            //   cbSize                  @ +0x00 (DWORD + 4B pad)
+            //   pSignerChainInfo        @ +0x08 (PWTD_GENERIC_CHAIN_POLICY_CREATE_INFO)
+            //   pCounterSignerChainInfo @ +0x10 (PWTD_GENERIC_CHAIN_POLICY_CREATE_INFO)
+            //   pfnPolicyCallback       @ +0x18 (PFN_WTD_GENERIC_CHAIN_POLICY_CALLBACK)
+            //   pvPolicyArg             @ +0x20 (void *)
             let p = p_policy_callback_data as *const u8;
             let cb_gc = std::ptr::read_unaligned(p as *const u32);
-            if cb_gc < 0x30 {
+            if cb_gc < 0x28 {
                 return 0x8007_0057u32 as i32; // E_INVALIDARG
             }
+            let p_signer_chain_info = std::ptr::read_unaligned(p.add(0x08) as *const *const u8);
+            let (h_chain_engine, p_chain_para, dw_flags) = if !p_signer_chain_info.is_null() {
+                // SoftPub.h WTD_GENERIC_CHAIN_POLICY_CREATE_INFO (Win64, 0x28 bytes):
+                //   cbSize       @ +0x00 (DWORD + 4B pad)
+                //   hChainEngine @ +0x08 (HCERTCHAINENGINE)
+                //   pChainPara   @ +0x10 (PCERT_CHAIN_PARA)
+                //   dwFlags      @ +0x18 (DWORD + 4B pad)
+                //   pvReserved   @ +0x20 (void *)
+                let cb_ci = std::ptr::read_unaligned(p_signer_chain_info as *const u32);
+                if cb_ci < 0x28 {
+                    return 0x8007_0057u32 as i32; // E_INVALIDARG
+                }
+                (
+                    std::ptr::read_unaligned(p_signer_chain_info.add(0x08) as *const *mut c_void),
+                    std::ptr::read_unaligned(p_signer_chain_info.add(0x10) as *const *const c_void),
+                    std::ptr::read_unaligned(p_signer_chain_info.add(0x18) as *const u32),
+                )
+            } else {
+                (std::ptr::null_mut(), std::ptr::null(), 0)
+            };
             Some(GenericChainPolicy {
-                p_chain_para: std::ptr::read_unaligned(p.add(0x08) as *const *const c_void),
-                dw_flags: std::ptr::read_unaligned(p.add(0x10) as *const u32),
-                pv_extra_policy_arg: std::ptr::read_unaligned(p.add(0x18) as *const *const c_void),
-                pfn_policy_callback: std::ptr::read_unaligned(p.add(0x20) as *const usize),
-                pv_policy_arg: std::ptr::read_unaligned(p.add(0x28) as *const *mut c_void),
+                h_chain_engine,
+                p_chain_para,
+                dw_flags,
+                pfn_policy_callback: std::ptr::read_unaligned(p.add(0x18) as *const usize),
+                pv_policy_arg: std::ptr::read_unaligned(p.add(0x20) as *const *mut c_void),
             })
         } else {
             None
@@ -3044,6 +3063,54 @@ mod tests {
                 ERROR_SUCCESS,
             );
 
+            // HTTPSPROV_ACTION with AUTHTYPE_CLIENT (1) MUST enforce clientAuth EKU:
+            // TEST_LEAF_DER (serverAuth-only) is rejected with CERT_E_WRONG_USAGE even with
+            // SECURITY_FLAG_IGNORE_UNKNOWN_CA, while TEST_MTLS_CLIENT_DER (clientAuth EKU) passes.
+            std::ptr::write_unaligned(https_para.as_mut_ptr().add(0x04) as *mut u32, 1u32); // AUTHTYPE_CLIENT
+            std::ptr::write_unaligned(
+                https_para.as_mut_ptr().add(0x10) as *mut *const u16,
+                std::ptr::null(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                crate::misc::crypt32::CERT_E_WRONG_USAGE as i32,
+                "AUTHTYPE_CLIENT must reject serverAuth-only certificate"
+            );
+            let client_auth_cert = crate::misc::crypt32::CertCreateCertificateContext(
+                X509_ASN_ENCODING,
+                crate::misc::secur32::tests::TEST_MTLS_CLIENT_DER.as_ptr(),
+                crate::misc::secur32::tests::TEST_MTLS_CLIENT_DER.len() as u32,
+            );
+            assert!(!client_auth_cert.is_null());
+            std::ptr::write_unaligned(
+                cert_info.as_mut_ptr().add(0x10) as *mut *const c_void,
+                client_auth_cert,
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS,
+                "AUTHTYPE_CLIENT should accept clientAuth certificate when unknown CA is ignored"
+            );
+            crate::misc::crypt32::CertFreeCertificateContext(client_auth_cert);
+            // Restore AUTHTYPE_SERVER + tls_cert for subsequent checks below.
+            std::ptr::write_unaligned(https_para.as_mut_ptr().add(0x04) as *mut u32, 2u32);
+            std::ptr::write_unaligned(
+                https_para.as_mut_ptr().add(0x10) as *mut *const u16,
+                right_host_w.as_ptr(),
+            );
+            std::ptr::write_unaligned(
+                cert_info.as_mut_ptr().add(0x10) as *mut *const c_void,
+                tls_cert,
+            );
+
             // WINTRUST_ACTION_GENERIC_CHAIN_VERIFY with WTD_GENERIC_CHAIN_POLICY_DATA MUST invoke
             // pfnPolicyCallback with the built signer chain and return its HRESULT (rather than
             // bypassing it with CERT_CHAIN_POLICY_BASE).
@@ -3073,8 +3140,8 @@ mod tests {
                 }
                 ctx.return_hr as u32 as u64
             }
-            // Undersized WTD_GENERIC_CHAIN_POLICY_DATA returns E_INVALIDARG.
-            let mut bad_gc = [0u8; 0x30];
+            // Undersized WTD_GENERIC_CHAIN_POLICY_DATA (< 0x28 on Win64) returns E_INVALIDARG.
+            let mut bad_gc = [0u8; 0x28];
             std::ptr::write_unaligned(bad_gc.as_mut_ptr() as *mut u32, 0x10u32);
             std::ptr::write_unaligned(
                 wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
@@ -3088,20 +3155,32 @@ mod tests {
                 ),
                 0x8007_0057u32 as i32, // E_INVALIDARG
             );
-            // Restrictive callback returning TRUST_E_EXPLICIT_DISTRUST overrides trust.
+            // SDK-sized (0x28 bytes) WTD_GENERIC_CHAIN_POLICY_DATA with pSignerChainInfo
+            // (WTD_GENERIC_CHAIN_POLICY_CREATE_INFO, 0x28 bytes), pfnPolicyCallback @ +0x18,
+            // and pvPolicyArg @ +0x20.
+            let mut signer_chain_info = [0u8; 0x28];
+            std::ptr::write_unaligned(signer_chain_info.as_mut_ptr() as *mut u32, 0x28u32);
+            std::ptr::write_unaligned(
+                signer_chain_info.as_mut_ptr().add(0x18) as *mut u32,
+                CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+            );
             let mut cb_ctx = GenericPolicyCtx {
                 called: 0,
                 saw_chain: false,
                 return_hr: 0x800B_0111u32 as i32, // TRUST_E_EXPLICIT_DISTRUST
             };
-            let mut gc_para = [0u8; 0x30];
-            std::ptr::write_unaligned(gc_para.as_mut_ptr() as *mut u32, 0x30u32);
+            let mut gc_para = [0u8; 0x28];
+            std::ptr::write_unaligned(gc_para.as_mut_ptr() as *mut u32, 0x28u32);
             std::ptr::write_unaligned(
-                gc_para.as_mut_ptr().add(0x20) as *mut usize,
+                gc_para.as_mut_ptr().add(0x08) as *mut *const u8,
+                signer_chain_info.as_ptr(),
+            );
+            std::ptr::write_unaligned(
+                gc_para.as_mut_ptr().add(0x18) as *mut usize,
                 test_generic_chain_policy_cb as *const () as usize,
             );
             std::ptr::write_unaligned(
-                gc_para.as_mut_ptr().add(0x28) as *mut *mut c_void,
+                gc_para.as_mut_ptr().add(0x20) as *mut *mut c_void,
                 &mut cb_ctx as *mut GenericPolicyCtx as *mut c_void,
             );
             std::ptr::write_unaligned(
@@ -3130,6 +3209,27 @@ mod tests {
                 ERROR_SUCCESS,
             );
             assert_eq!(cb_ctx.called, 2);
+            // Without pfnPolicyCallback, pSignerChainInfo->dwFlags (revocation) is still applied.
+            std::ptr::write_unaligned(gc_para.as_mut_ptr().add(0x18) as *mut usize, 0usize);
+            assert_ne!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS,
+                "pSignerChainInfo revocation flags must fail closed when callback is NULL"
+            );
+            // Undersized pSignerChainInfo (< 0x28) returns E_INVALIDARG.
+            std::ptr::write_unaligned(signer_chain_info.as_mut_ptr() as *mut u32, 0x10u32);
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                0x8007_0057u32 as i32,
+            );
             // Restore HTTPS policy callback pointer for subsequent revocation checks below.
             std::ptr::write_unaligned(
                 wtd.as_mut_ptr().add(0x08) as *mut *const c_void,

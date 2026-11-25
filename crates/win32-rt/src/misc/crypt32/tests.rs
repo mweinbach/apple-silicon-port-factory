@@ -833,6 +833,39 @@ fn macos_trust_settings_preserves_application_key_usage_and_error_constraints() 
             ]),
             TrustSettingDecision::PolicyRestrictedOrUnspecified
         );
+
+        // Policy- or application-scoped Deny MUST exclude the root from unconditional anchors
+        // (even when the root is present in SecTrustCopyAnchorCertificates) so rustls never
+        // bypasses policy-aware SecTrust distrust.
+        let scoped_deny = classify_single_dict(&[
+            ("kSecTrustSettingsResult", n_deny),
+            ("kSecTrustSettingsApplication", s_dummy),
+        ]);
+        assert_eq!(scoped_deny, TrustSettingDecision::PolicyRestrictedOrUnspecified);
+        let root_ok = vec![0x30u8, 0x01];
+        let root_scoped_deny = vec![0x30u8, 0x02];
+        let root_uncond_deny = vec![0x30u8, 0x03];
+        let root_custom_ok = vec![0x30u8, 0x04];
+        let mut decisions = std::collections::HashMap::new();
+        decisions.insert(root_scoped_deny.clone(), scoped_deny);
+        decisions.insert(root_uncond_deny.clone(), TrustSettingDecision::Denied);
+        decisions.insert(
+            root_custom_ok.clone(),
+            TrustSettingDecision::UnconditionalTrustRoot,
+        );
+        let (uncond, excl) = super::chain::apple_trust::filter_unconditional_anchors(
+            vec![root_ok.clone(), root_scoped_deny.clone(), root_uncond_deny.clone()],
+            &decisions,
+        );
+        assert!(uncond.contains(&root_ok));
+        assert!(uncond.contains(&root_custom_ok));
+        assert!(
+            !uncond.contains(&root_scoped_deny),
+            "policy-scoped Deny must NOT remain in unconditional roots"
+        );
+        assert!(!uncond.contains(&root_uncond_deny));
+        assert!(excl.contains(&root_scoped_deny));
+        assert!(excl.contains(&root_uncond_deny));
         // Application-scoped Deny must not unconditionally deny across all apps either
         assert_eq!(
             classify_single_dict(&[

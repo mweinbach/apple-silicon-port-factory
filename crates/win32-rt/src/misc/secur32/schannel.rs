@@ -48,6 +48,11 @@ pub(super) const SCH_CREDENTIALS_VERSION: u32 = 5;
 pub(super) const SCH_CRED_NO_SERVERNAME_CHECK: u32 = 0x0000_0004;
 pub(super) const SCH_CRED_MANUAL_CRED_VALIDATION: u32 = 0x0000_0008;
 pub(super) const SCH_CRED_DISABLE_RECONNECTS: u32 = 0x0000_0080;
+pub(super) const SCH_CRED_REVOCATION_CHECK_END_CERT: u32 = 0x0000_0100;
+pub(super) const SCH_CRED_REVOCATION_CHECK_CHAIN: u32 = 0x0000_0200;
+pub(super) const SCH_CRED_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT: u32 = 0x0000_0400;
+pub(super) const SCH_CRED_IGNORE_NO_REVOCATION_CHECK: u32 = 0x0000_0800;
+pub(super) const SCH_CRED_IGNORE_REVOCATION_OFFLINE: u32 = 0x0000_1000;
 
 pub(super) const SSL_SESSION_RECONNECT: u32 = 1;
 
@@ -590,9 +595,13 @@ fn map_rustls_error_to_sec(err: &rustls::Error) -> i32 {
             | rustls::CertificateError::NotValidYetContext { .. } => SEC_E_CERT_EXPIRED,
             rustls::CertificateError::NotValidForName
             | rustls::CertificateError::NotValidForNameContext { .. } => SEC_E_WRONG_PRINCIPAL,
-            rustls::CertificateError::UnknownIssuer
-            | rustls::CertificateError::BadSignature
-            | rustls::CertificateError::UnknownRevocationStatus => SEC_E_UNTRUSTED_ROOT,
+            rustls::CertificateError::UnknownIssuer | rustls::CertificateError::BadSignature => {
+                SEC_E_UNTRUSTED_ROOT
+            }
+            rustls::CertificateError::Revoked => crypt32::CERT_E_REVOKED as i32,
+            rustls::CertificateError::UnknownRevocationStatus => {
+                crypt32::CRYPT_E_NO_REVOCATION_CHECK as i32
+            }
             _ => SEC_E_CERT_UNKNOWN,
         },
         rustls::Error::NoCertificatesPresented => SEC_E_NO_CREDENTIALS,
@@ -737,6 +746,107 @@ pub(super) fn build_inbound_client_root_store(
     }
 }
 
+fn schannel_revocation_chain_flags(cred_flags: u32) -> u32 {
+    let mut out = 0u32;
+    if (cred_flags & SCH_CRED_REVOCATION_CHECK_END_CERT) != 0 {
+        out |= 0x1000_0000; // CERT_CHAIN_REVOCATION_CHECK_END_CERT
+    }
+    if (cred_flags & SCH_CRED_REVOCATION_CHECK_CHAIN) != 0 {
+        out |= 0x2000_0000; // CERT_CHAIN_REVOCATION_CHECK_CHAIN
+    }
+    if (cred_flags & SCH_CRED_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT) != 0 {
+        out |= 0x4000_0000; // CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT
+    }
+    out
+}
+
+/// Wraps `WebPkiClientVerifier` to enforce `SCH_CRED_REVOCATION_CHECK_*` on inbound mTLS
+/// client certificates via macOS `Security.framework`, failing closed when revocation status
+/// cannot be positively verified (unless explicitly ignored via `SCH_CRED_IGNORE_*`).
+#[derive(Debug)]
+struct RevocationClientCertVerifier {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    has_root_store: bool,
+    extra_roots_der: Vec<Vec<u8>>,
+    cred_flags: u32,
+    chain_revocation_flags: u32,
+}
+
+impl rustls::server::danger::ClientCertVerifier for RevocationClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let verified = self.inner.verify_client_cert(end_entity, intermediates, now)?;
+        let mut chain_der = Vec::with_capacity(1 + intermediates.len());
+        chain_der.push(end_entity.as_ref().to_vec());
+        for ic in intermediates {
+            chain_der.push(ic.as_ref().to_vec());
+        }
+        let rev_err = crypt32::check_chain_revocation_error(
+            &chain_der,
+            self.has_root_store.then_some(self.extra_roots_der.as_slice()),
+            &[],
+            Some(now.as_secs() as f64),
+            self.chain_revocation_flags,
+        );
+        if rev_err == 0 {
+            return Ok(verified);
+        }
+        if rev_err == crypt32::CERT_E_REVOKED {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked,
+            ));
+        }
+        let ignore_no_rev = (self.cred_flags & SCH_CRED_IGNORE_NO_REVOCATION_CHECK) != 0;
+        let ignore_offline = (self.cred_flags & SCH_CRED_IGNORE_REVOCATION_OFFLINE) != 0;
+        if (rev_err == crypt32::CRYPT_E_NO_REVOCATION_CHECK && ignore_no_rev)
+            || (rev_err == crypt32::CRYPT_E_REVOCATION_OFFLINE && ignore_offline)
+        {
+            return Ok(verified);
+        }
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownRevocationStatus,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
 fn build_schannel_server_config(
     cred: &SchannelCred,
     alpn: Vec<Vec<u8>>,
@@ -770,9 +880,22 @@ fn build_schannel_server_config(
         .map_err(|_| SEC_E_ALGORITHM_MISMATCH)?;
     let mut cfg = if require_client_auth {
         let roots = build_inbound_client_root_store(cred.has_root_store, &cred.extra_roots_der);
-        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider)
-            .build()
-            .map_err(|_| SEC_E_NO_CREDENTIALS)?;
+        let base_verifier =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider)
+                .build()
+                .map_err(|_| SEC_E_NO_CREDENTIALS)?;
+        let rev_flags = schannel_revocation_chain_flags(cred.flags);
+        let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = if rev_flags != 0 {
+            Arc::new(RevocationClientCertVerifier {
+                inner: base_verifier,
+                has_root_store: cred.has_root_store,
+                extra_roots_der: cred.extra_roots_der.clone(),
+                cred_flags: cred.flags,
+                chain_revocation_flags: rev_flags,
+            })
+        } else {
+            base_verifier
+        };
         builder
             .with_client_cert_verifier(verifier)
             .with_single_cert(chain, key)

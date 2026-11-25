@@ -281,17 +281,57 @@ pub(super) mod apple_trust {
         classify_trust_settings_array(settings)
     }
 
-    /// Copy unconditionally trusted root certificates from the macOS System/Admin/User trust
-    /// stores while honoring `SecTrustSettingsCopyTrustSettings` (excluding explicitly denied
-    /// certificates and avoiding flattening policy-restricted entries into universal roots).
-    #[cfg(target_os = "macos")]
-    pub fn load_macos_trust_anchors_der() -> Vec<Vec<u8>> {
-        use std::collections::{HashMap, HashSet};
+    /// Split macOS system/custom anchors into `(unconditional_trusted, excluded_from_unconditional)`.
+    /// Any root with `Denied` or `PolicyRestrictedOrUnspecified` trust settings is excluded from
+    /// the unconditional set so policy- or application-scoped distrust is preserved and deferred
+    /// to policy-aware `SecTrust` evaluation rather than being bypassed by rustls.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn filter_unconditional_anchors(
+        system_anchors: Vec<Vec<u8>>,
+        domain_decisions: &std::collections::HashMap<Vec<u8>, TrustSettingDecision>,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        use std::collections::HashSet;
+
+        let mut excluded: HashSet<Vec<u8>> = HashSet::new();
+        let mut custom_trusted: Vec<Vec<u8>> = Vec::new();
+        for (der, &decision) in domain_decisions {
+            match decision {
+                TrustSettingDecision::Denied
+                | TrustSettingDecision::PolicyRestrictedOrUnspecified => {
+                    excluded.insert(der.clone());
+                }
+                TrustSettingDecision::UnconditionalTrustRoot => {
+                    custom_trusted.push(der.clone());
+                }
+                TrustSettingDecision::NotSet => {}
+            }
+        }
 
         let mut out = Vec::new();
+        for der in system_anchors {
+            if !excluded.contains(&der) {
+                out.push(der);
+            }
+        }
+        for der in custom_trusted {
+            if !excluded.contains(&der) && !out.iter().any(|existing| existing == &der) {
+                out.push(der);
+            }
+        }
+        (out, excluded.into_iter().collect())
+    }
+
+    /// Copy unconditionally trusted root certificates from the macOS System/Admin/User trust
+    /// stores while honoring `SecTrustSettingsCopyTrustSettings` (excluding both unconditionally
+    /// denied and policy/application-restricted entries from unconditional roots).
+    #[cfg(target_os = "macos")]
+    pub fn load_macos_trust_anchors_and_exclusions() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        use std::collections::HashMap;
+
+        let mut system_anchors = Vec::new();
+        let mut domain_decisions: HashMap<Vec<u8>, TrustSettingDecision> = HashMap::new();
         unsafe {
             // Evaluate Admin (1) then User (0) so User trust settings override Admin.
-            let mut domain_decisions: HashMap<Vec<u8>, TrustSettingDecision> = HashMap::new();
             for domain in [1u32, 0u32] {
                 let mut arr: *const c_void = std::ptr::null();
                 if SecTrustSettingsCopyCertificates(domain, &mut arr) == 0 && !arr.is_null() {
@@ -310,21 +350,6 @@ pub(super) mod apple_trust {
                 }
             }
 
-            let mut denied: HashSet<Vec<u8>> = HashSet::new();
-            let mut custom_trusted: Vec<Vec<u8>> = Vec::new();
-            for (der, decision) in domain_decisions {
-                match decision {
-                    TrustSettingDecision::Denied => {
-                        denied.insert(der);
-                    }
-                    TrustSettingDecision::UnconditionalTrustRoot => {
-                        custom_trusted.push(der);
-                    }
-                    TrustSettingDecision::PolicyRestrictedOrUnspecified
-                    | TrustSettingDecision::NotSet => {}
-                }
-            }
-
             let mut anchors: *const c_void = std::ptr::null();
             if SecTrustCopyAnchorCertificates(&mut anchors) == 0 && !anchors.is_null() {
                 let _g = CfRef(anchors);
@@ -332,25 +357,17 @@ pub(super) mod apple_trust {
                 for i in 0..count {
                     let cert = CFArrayGetValueAtIndex(anchors, i);
                     if let Some(der) = cert_ref_to_der(cert) {
-                        if !denied.contains(&der) {
-                            out.push(der);
-                        }
+                        system_anchors.push(der);
                     }
                 }
             }
-
-            for der in custom_trusted {
-                if !denied.contains(&der) && !out.iter().any(|existing| existing == &der) {
-                    out.push(der);
-                }
-            }
         }
-        out
+        filter_unconditional_anchors(system_anchors, &domain_decisions)
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn load_macos_trust_anchors_der() -> Vec<Vec<u8>> {
-        Vec::new()
+    pub fn load_macos_trust_anchors_and_exclusions() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (Vec::new(), Vec::new())
     }
 
     /// Evaluate a certificate chain against the Apple Security.framework trust engine.
@@ -741,24 +758,45 @@ pub(super) mod apple_trust {
     }
 }
 
-pub(super) fn macos_system_roots_der() -> &'static [Vec<u8>] {
-    static ROOTS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
+fn macos_roots_and_exclusions() -> &'static (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    static ROOTS: LazyLock<(Vec<Vec<u8>>, Vec<Vec<u8>>)> = LazyLock::new(|| {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            apple_trust::load_macos_trust_anchors_der()
+            apple_trust::load_macos_trust_anchors_and_exclusions()
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     });
     &ROOTS
 }
 
+pub(super) fn macos_system_roots_der() -> &'static [Vec<u8>] {
+    &macos_roots_and_exclusions().0
+}
+
 fn combined_default_root_store() -> Arc<rustls::RootCertStore> {
     static COMBINED: LazyLock<Arc<rustls::RootCertStore>> = LazyLock::new(|| {
-        let mut s = (*net_tls::root_cert_store()).clone();
-        for der in macos_system_roots_der() {
+        let (macos_roots, excluded_der) = macos_roots_and_exclusions();
+        let excluded_spkis: Vec<Vec<u8>> = excluded_der
+            .iter()
+            .filter_map(|der| {
+                parse_cert_der_parts(der).map(|p| p.spki_inner.to_vec())
+            })
+            .collect();
+        let mut s = rustls::RootCertStore::empty();
+        for ta in webpki_roots::TLS_SERVER_ROOTS.iter() {
+            if !excluded_spkis.is_empty()
+                && excluded_spkis
+                    .iter()
+                    .any(|spki| spki.as_slice() == ta.subject_public_key_info.as_ref())
+            {
+                continue;
+            }
+            s.roots.push(ta.clone());
+        }
+        for der in macos_roots {
             let _ = s.add(CertificateDer::from(der.as_slice()));
         }
         Arc::new(s)
@@ -1312,6 +1350,53 @@ fn cert_error_to_trust_status(cert_error: u32) -> u32 {
 /// Verify an X.509 certificate chain (`[leaf, intermediates...]`) using `rustls`'s WebPKI
 /// verifier against either an exclusive root store or the embedded `webpki-roots` bundle.
 /// Returns `0` on success or a Windows `CERT_E_*` error code on failure.
+fn verify_chain_webpki_client_at(
+    chain_der: &[Vec<u8>],
+    exclusive_roots_der: Option<&[Vec<u8>]>,
+    extra_roots_der: &[Vec<u8>],
+    at_time: UnixTime,
+) -> u32 {
+    let Some((leaf, intermediates)) = chain_der.split_first() else {
+        return CERT_E_CHAINING;
+    };
+    let roots = if let Some(excl) = exclusive_roots_der {
+        let mut s = rustls::RootCertStore::empty();
+        for der in excl {
+            let _ = s.add(CertificateDer::from(der.as_slice()));
+        }
+        Arc::new(s)
+    } else if extra_roots_der.is_empty() {
+        combined_default_root_store()
+    } else {
+        let mut s = (*combined_default_root_store()).clone();
+        for der in extra_roots_der {
+            let _ = s.add(CertificateDer::from(der.as_slice()));
+        }
+        Arc::new(s)
+    };
+    if roots.is_empty() {
+        return CERT_E_UNTRUSTEDROOT;
+    }
+    let verifier = match rustls::server::WebPkiClientVerifier::builder_with_provider(
+        roots,
+        net_tls::crypto_provider(),
+    )
+    .build()
+    {
+        Ok(v) => v,
+        Err(_) => return CERT_E_UNTRUSTEDROOT,
+    };
+    let ee = CertificateDer::from(leaf.as_slice());
+    let inters: Vec<CertificateDer<'_>> = intermediates
+        .iter()
+        .map(|d| CertificateDer::from(d.as_slice()))
+        .collect();
+    match verifier.verify_client_cert(&ee, &inters, at_time) {
+        Ok(_) => 0,
+        Err(ref e) => map_rustls_cert_error(e, true),
+    }
+}
+
 fn verify_chain_webpki_at(
     chain_der: &[Vec<u8>],
     server_name: Option<&str>,
@@ -1561,6 +1646,56 @@ pub(super) fn cert_free_certificate_chain_engine_impl(engine: *mut c_void) {
     }
 }
 
+/// Evaluate certificate revocation for a DER chain (`[leaf, intermediates...]`) using macOS/iOS
+/// `Security.framework` revocation policy. Returns `0` on positive non-revoked verification,
+/// `CERT_E_REVOKED`, `CRYPT_E_NO_REVOCATION_CHECK`, or `CRYPT_E_REVOCATION_OFFLINE`.
+pub(crate) fn check_chain_revocation_error(
+    chain_der: &[Vec<u8>],
+    exclusive_roots_der: Option<&[Vec<u8>]>,
+    extra_roots_der: &[Vec<u8>],
+    verify_unix_secs: Option<f64>,
+    revocation_flags: u32,
+) -> u32 {
+    if (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_MASK) == 0 {
+        return 0;
+    }
+    let cache_only = (revocation_flags
+        & (CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL))
+        != 0;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let outcome = apple_trust::evaluate_sec_trust_revocation(
+        chain_der,
+        exclusive_roots_der,
+        extra_roots_der,
+        verify_unix_secs,
+        cache_only,
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let outcome = {
+        let _ = (chain_der, exclusive_roots_der, extra_roots_der, verify_unix_secs, cache_only);
+        0u8
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    match outcome {
+        apple_trust::RevocationCheckResult::VerifiedGood => {
+            // Apple Security.framework checks leaf + intermediate CAs, not self-signed roots.
+            // CERT_CHAIN_REVOCATION_CHECK_CHAIN explicitly requires checking the root as well.
+            if (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_CHAIN) != 0 {
+                CRYPT_E_NO_REVOCATION_CHECK
+            } else {
+                0
+            }
+        }
+        apple_trust::RevocationCheckResult::Revoked => CERT_E_REVOKED,
+        apple_trust::RevocationCheckResult::OfflineOrUnknown => CRYPT_E_REVOCATION_OFFLINE,
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let _ = outcome;
+        CRYPT_E_REVOCATION_OFFLINE
+    }
+}
+
 pub(super) unsafe fn cert_get_certificate_chain_impl(
     h_chain_engine: *mut c_void,
     p_cert_context: *const c_void,
@@ -1670,45 +1805,13 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
         & (CERT_CHAIN_REVOCATION_CHECK_MASK
             | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY
             | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL);
-    let revocation_error: u32 = if (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_MASK) != 0 {
-        let cache_only = (revocation_flags
-            & (CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL))
-            != 0;
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let outcome = apple_trust::evaluate_sec_trust_revocation(
-            &chain_der,
-            exclusive_roots_der.as_deref(),
-            &extra_roots_der,
-            Some(verify_unix.as_secs() as f64),
-            cache_only,
-        );
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let outcome = {
-            let _ = cache_only;
-            0u8
-        };
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        match outcome {
-            apple_trust::RevocationCheckResult::VerifiedGood => {
-                // Apple Security.framework checks leaf + intermediate CAs, not self-signed roots.
-                // CERT_CHAIN_REVOCATION_CHECK_CHAIN explicitly requires checking the root as well.
-                if (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_CHAIN) != 0 {
-                    CRYPT_E_NO_REVOCATION_CHECK
-                } else {
-                    0
-                }
-            }
-            apple_trust::RevocationCheckResult::Revoked => CERT_E_REVOKED,
-            apple_trust::RevocationCheckResult::OfflineOrUnknown => CRYPT_E_REVOCATION_OFFLINE,
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        {
-            let _ = outcome;
-            CRYPT_E_REVOCATION_OFFLINE
-        }
-    } else {
-        0
-    };
+    let revocation_error: u32 = check_chain_revocation_error(
+        &chain_der,
+        exclusive_roots_der.as_deref(),
+        &extra_roots_der,
+        Some(verify_unix.as_secs() as f64),
+        revocation_flags,
+    );
 
     let mut trust_err_bits =
         cert_error_to_trust_status(default_chain_error) | cert_error_to_trust_status(revocation_error);
@@ -1903,10 +2006,14 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
     };
 
     let mut fdw_checks = 0u32;
+    let mut ssl_auth_type: u32 = 2; // AUTHTYPE_SERVER default when extra para absent
     let mut server_name: Option<String> = None;
     if policy_id == CERT_CHAIN_POLICY_SSL && !extra_ptr.is_null() {
         let ssl = std::ptr::read_unaligned(extra_ptr as *const SslExtraCertChainPolicyPara);
         fdw_checks = ssl.fdw_checks;
+        if ssl.dw_auth_type == 1 || ssl.dw_auth_type == 2 {
+            ssl_auth_type = ssl.dw_auth_type;
+        }
         if ssl.cb_size >= 0x18 && !ssl.pwsz_server_name.is_null() {
             let s = crate::strings::from_wide(ssl.pwsz_server_name);
             if !s.is_empty() {
@@ -1977,20 +2084,36 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
 
     let (mut err_code, mut elem_idx): (u32, i32) = match policy_id {
         CERT_CHAIN_POLICY_SSL => {
-            let mut raw = verify_chain_webpki_at(
-                &chain_der,
-                server_name.as_deref(),
-                exclusive_roots.as_deref(),
-                &extra_roots,
-                ignore_cn,
-                verify_unix,
-            );
+            const OID_CLIENT_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+            const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
+            let is_client_auth = ssl_auth_type == 1;
+            let mut raw = if is_client_auth {
+                verify_chain_webpki_client_at(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                    verify_unix,
+                )
+            } else {
+                verify_chain_webpki_at(
+                    &chain_der,
+                    server_name.as_deref(),
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                    ignore_cn,
+                    verify_unix,
+                )
+            };
             // Fall back to Apple Security.framework SecTrust when WebPKI rejects with untrusted root
             // (handles system-installed macOS roots or non-WebPKI chains trusted by Apple's trust store).
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             if raw == CERT_E_UNTRUSTEDROOT {
                 let verify_secs = Some(verify_unix.as_secs() as f64);
-                let host_arg = if ignore_cn { None } else { server_name.as_deref() };
+                let host_arg = if is_client_auth || ignore_cn {
+                    None
+                } else {
+                    server_name.as_deref()
+                };
                 if apple_trust::evaluate_sec_trust(
                     &chain_der,
                     exclusive_roots.as_deref(),
@@ -2010,12 +2133,43 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                 raw = 0;
             }
             // Independent post-checks ensure ignoring one error (e.g. ALLOW_UNKNOWN_CA)
-            // never silently masks an un-ignored expiration or hostname mismatch!
+            // never silently masks an un-ignored expiration, clientAuth EKU, or hostname mismatch!
+            let client_usage_bad = is_client_auth
+                && !ignore_usage
+                && chain_der
+                    .first()
+                    .and_then(|d| cert_eku_oids(d))
+                    .is_some_and(|oids| {
+                        !oids.is_empty()
+                            && !oids.iter().any(|o| {
+                                o.as_slice() == OID_CLIENT_AUTH || o.as_slice() == OID_ANY_EKU
+                            })
+                    });
             if raw == 0 {
-                if !ignore_date {
+                if client_usage_bad {
+                    (CERT_E_WRONG_USAGE, 0)
+                } else if !ignore_date {
                     if let Some(ti) = first_time_invalid_idx {
                         (CERT_E_EXPIRED, ti as i32)
-                    } else if let Some(ref host) = server_name {
+                    } else if !is_client_auth {
+                        if let Some(ref host) = server_name {
+                            if !ignore_cn
+                                && !chain_der
+                                    .first()
+                                    .is_some_and(|leaf| cert_matches_hostname(leaf, host))
+                            {
+                                (CERT_E_CN_NO_MATCH, 0)
+                            } else {
+                                (0, -1)
+                            }
+                        } else {
+                            (0, -1)
+                        }
+                    } else {
+                        (0, -1)
+                    }
+                } else if !is_client_auth {
+                    if let Some(ref host) = server_name {
                         if !ignore_cn
                             && !chain_der
                                 .first()
@@ -2025,16 +2179,6 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                         } else {
                             (0, -1)
                         }
-                    } else {
-                        (0, -1)
-                    }
-                } else if let Some(ref host) = server_name {
-                    if !ignore_cn
-                        && !chain_der
-                            .first()
-                            .is_some_and(|leaf| cert_matches_hostname(leaf, host))
-                    {
-                        (CERT_E_CN_NO_MATCH, 0)
                     } else {
                         (0, -1)
                     }
