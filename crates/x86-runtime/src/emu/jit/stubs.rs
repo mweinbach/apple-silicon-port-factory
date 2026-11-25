@@ -474,23 +474,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     }
     a.ldp_x(4, 5, g(4), 0x20);
     a.ldp_x(6, 7, g(4), 0x30);
-    // Fast-path FPCR: skip `mrs fpcr` when guest `MXCSR == 0x1F80` (default IEEE-754 state).
-    a.ldr(32, XS, XCPU, OFF_MXCSR);
-    a.addsub_ri(false, true, false, XS, XS, 1, true); // sub w17, w17, #0x1000
-    a.addsub_ri(false, true, false, XS, XS, 0xF80, false); // sub w17, w17, #0xF80
-    a.str(64, ZR, 31, 80); // saved_fpcr = 0
-    let fpcr_plain_def = a.cbz(false, XS);
-    a.mrs_fpcr(XS);
-    a.str(64, XS, 31, 80);
-    let fpcr_plain_z = a.cbz(true, XS);
-    a.msr_fpcr(ZR);
-    a.bind(fpcr_plain_z);
-    a.bind(fpcr_plain_def);
-    a.blr(XA);
-    a.ldr(64, XS, 31, 80);
-    let fpcr_plain_r = a.cbz(true, XS);
-    a.msr_fpcr(XS);
-    a.bind(fpcr_plain_r);
+    a.call_with_host_fpcr(80);
     a.ldp_x(8, 9, 31, 0);
     a.ldp_x(10, 11, 31, 16);
     a.ldp_x(12, 13, 31, 32);
@@ -617,23 +601,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     }
     a.ldp_x(4, 5, g(4), 0x20);
     a.ldp_x(6, 7, g(4), 0x30);
-    // Fast-path FPCR: skip `mrs fpcr` when guest `MXCSR == 0x1F80` (default IEEE-754 state).
-    a.ldr(32, XS, XCPU, OFF_MXCSR);
-    a.addsub_ri(false, true, false, XS, XS, 1, true); // sub w17, w17, #0x1000
-    a.addsub_ri(false, true, false, XS, XS, 0xF80, false); // sub w17, w17, #0xF80
-    a.str(64, ZR, 31, 80); // saved_fpcr = 0
-    let fpcr_pj_def = a.cbz(false, XS);
-    a.mrs_fpcr(XS);
-    a.str(64, XS, 31, 80);
-    let fpcr_pj_z = a.cbz(true, XS);
-    a.msr_fpcr(ZR);
-    a.bind(fpcr_pj_z);
-    a.bind(fpcr_pj_def);
-    a.blr(XA);
-    a.ldr(64, XS, 31, 80);
-    let fpcr_pj_r = a.cbz(true, XS);
-    a.msr_fpcr(XS);
-    a.bind(fpcr_pj_r);
+    a.call_with_host_fpcr(80);
     a.ldp_x(8, 9, 31, 0);
     a.ldp_x(10, 11, 31, 16);
     a.ldp_x(12, 13, 31, 32);

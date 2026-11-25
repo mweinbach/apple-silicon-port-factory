@@ -2118,14 +2118,8 @@ pub fn vpermilps_var(a: u128, ctrl: u128) -> u128 {
 
 #[inline(always)]
 pub fn cpuid_x64(leaf: u32, subleaf: u32) -> (u64, u64, u64, u64) {
-    match leaf {
-        0 => (0x16, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
-        1 => (0x0009_06ea, 0x0010_0800, 0x7ffafbbf, 0xbfebfbff),
-        7 if subleaf == 0 => (0, 0x209c_6fbf, 0, 0),
-        0x8000_0000 => (0x8000_0008, 0, 0, 0),
-        0x8000_0001 => (0, 0, 0x0000_0121, 0x2c10_0800),
-        _ => (0, 0, 0, 0),
-    }
+    let [a, b, c, d] = crate::emu::cpuid::query(leaf, subleaf);
+    (a.into(), b.into(), c.into(), d.into())
 }
 
 // Forwarded RAX / XMM argument and XMM return state lives in the per-thread `CallCtx`
