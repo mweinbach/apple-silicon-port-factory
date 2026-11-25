@@ -391,6 +391,52 @@ pub fn static_index_type_va(ir: u16) -> Result<u64, String> {
     Err(format!("unexpected index type uniform {ir}"))
 }
 
+/// Pre-allocated resident GPU address for Apple Metal Shader Converter's fixed-function
+/// tessellator lookup tables (`kIRTessellatorTablesCountsAndOffset` + `kIRTessellatorTablesLookupTable`,
+/// Apache-2.0 licensed, 733,882 bytes uncompressed), bound at `TESSELLATOR_TABLES_BIND_POINT` (7)
+/// for Metal 4 tessellation emulation draws.
+pub fn tessellator_tables_va() -> Result<u64, String> {
+    const UNCOMPRESSED_LEN: usize = 32_768 + 701_114;
+    static COMPRESSED: &[u8] = include_bytes!("tessellator_tables.zlib");
+    static BUF: OnceLock<Result<StaticIndexBuf, String>> = OnceLock::new();
+
+    #[link(name = "z")]
+    extern "C" {
+        fn uncompress(
+            dest: *mut u8,
+            dest_len: *mut libc::c_ulong,
+            source: *const u8,
+            source_len: libc::c_ulong,
+        ) -> libc::c_int;
+    }
+
+    BUF.get_or_init(|| {
+        let d = super::device().ok_or("no Metal device for tessellator tables")?;
+        let opts = MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
+        let buf = d
+            .dev
+            .newBufferWithLength_options(UNCOMPRESSED_LEN, opts)
+            .ok_or("failed to allocate tessellator tables buffer")?;
+        buf.setLabel(Some(&objc2_foundation::NSString::from_str("port tessellator lookup tables")));
+        let dst = buf.contents().as_ptr() as *mut u8;
+        let mut dst_len = UNCOMPRESSED_LEN as libc::c_ulong;
+        let rc = unsafe {
+            uncompress(dst, &mut dst_len, COMPRESSED.as_ptr(), COMPRESSED.len() as libc::c_ulong)
+        };
+        if rc != 0 || dst_len as usize != UNCOMPRESSED_LEN {
+            return Err(format!(
+                "zlib uncompress tessellator tables failed: rc={rc}, len={dst_len}/{UNCOMPRESSED_LEN}"
+            ));
+        }
+        d.add_resident(ProtocolObject::from_ref(&*buf));
+        let base_va = buf.gpuAddress();
+        Ok(StaticIndexBuf { _buf: buf, base_va })
+    })
+    .as_ref()
+    .map(|b| b.base_va)
+    .map_err(Clone::clone)
+}
+
 // ---------------------------------------------------------------------------
 // Static samplers
 // ---------------------------------------------------------------------------

@@ -249,11 +249,16 @@ define_class!(
         }
         #[unsafe(method(windowDidChangeOcclusionState:))]
         fn did_change_occlusion(&self, _n: &NSNotification) {
-            with_win(self.hwnd(), |w| {
+            let changed = with_win(self.hwnd(), |w| {
                 // NSWindowOcclusionStateVisible = 1 << 1
                 let st: usize = unsafe { msg_send![&*w.window, occlusionState] };
-                w.shared.occluded.store(st & 2 == 0, Ordering::Release);
-            });
+                let now_occluded = st & 2 == 0;
+                w.shared.occluded.swap(now_occluded, Ordering::AcqRel) != now_occluded
+            })
+            .unwrap_or(false);
+            if changed {
+                crate::dxgi::notify_occlusion_status_changed();
+            }
         }
     }
 );
@@ -298,6 +303,7 @@ define_class!(
         fn screens_changed(&self, _n: &NSNotification) {
             display::refresh(mtm());
             update_presentation();
+            crate::dxgi::notify_adapters_changed();
         }
     }
 );

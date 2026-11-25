@@ -3,9 +3,10 @@
 //! `launcher`, and the `port-factory` CLI.
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -77,31 +78,459 @@ pub fn set_executable_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Recursively copy `src` into `dst`, skipping `.DepotDownloader`, `.DS_Store`, and an optional
-/// canonicalized path (`skip_canon`, e.g. an output `.app` located inside the source tree).
-pub fn copy_dir_recursive(src: &Path, dst: &Path, skip_canon: Option<&Path>) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
+/// Summary of entries copied or skipped by [`copy_dir_recursive_with_report`] and
+/// [`copy_game_payload`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyDirReport {
+    pub files_copied: usize,
+    pub dirs_created: usize,
+    pub symlinks_preserved: usize,
+    pub symlinks_skipped_escaping: usize,
+    pub symlinks_skipped_dangling: usize,
+    pub symlinks_skipped_cycle: usize,
+}
+
+impl CopyDirReport {
+    /// Total number of unsafe symlinks skipped during the copy.
+    pub fn skipped_symlinks(&self) -> usize {
+        self.symlinks_skipped_escaping
+            + self.symlinks_skipped_dangling
+            + self.symlinks_skipped_cycle
+    }
+}
+
+struct PendingSymlink {
+    src_path: PathBuf,
+    dst_path: PathBuf,
+    rel_path: PathBuf,
+    rel_parent: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelativeResolveError {
+    Escaping,
+    Dangling,
+    Cycle,
+}
+
+#[derive(Debug, Clone)]
+enum ResolveStep {
+    CurDir,
+    ParentDir,
+    Normal(OsString),
+}
+
+fn push_relative_components(
+    raw_target: &Path,
+    front: bool,
+    queue: &mut VecDeque<ResolveStep>,
+) -> std::result::Result<(), RelativeResolveError> {
+    if raw_target.as_os_str().is_empty() || raw_target.is_absolute() {
+        return Err(RelativeResolveError::Escaping);
+    }
+    let mut steps = Vec::new();
+    for comp in raw_target.components() {
+        match comp {
+            Component::Normal(s) => steps.push(ResolveStep::Normal(s.to_os_string())),
+            Component::CurDir => steps.push(ResolveStep::CurDir),
+            Component::ParentDir => steps.push(ResolveStep::ParentDir),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(RelativeResolveError::Escaping);
+            }
+        }
+    }
+    if front {
+        for step in steps.into_iter().rev() {
+            queue.push_front(step);
+        }
+    } else {
+        queue.extend(steps);
+    }
+    Ok(())
+}
+
+/// Resolve `raw_target` component-by-component starting from `start_dir_canon` (inside
+/// `root_canon`), expanding intermediate symlinks the same way POSIX does.
+///
+/// Rejects any symlink whose target (or any intermediate symlink it traverses) is absolute,
+/// steps above `root_canon` via `..`, exceeds `MAX_SYMLINK_HOPS`, or hits a missing/non-regular
+/// entry. Unlike pure lexical normalization, `..` following an intermediate directory symlink
+/// resolves relative to that symlink's target rather than its link name.
+fn verify_relative_resolution_within_root(
+    root_canon: &Path,
+    start_dir_canon: &Path,
+    raw_target: &Path,
+) -> std::result::Result<(), RelativeResolveError> {
+    const MAX_SYMLINK_HOPS: usize = 40;
+    let mut queue = VecDeque::new();
+    push_relative_components(raw_target, false, &mut queue)?;
+
+    let mut cur = start_dir_canon.to_path_buf();
+    let mut hops = 0usize;
+
+    while let Some(step) = queue.pop_front() {
+        match step {
+            ResolveStep::CurDir => {}
+            ResolveStep::ParentDir => {
+                if cur == root_canon {
+                    return Err(RelativeResolveError::Escaping);
+                }
+                if !cur.pop() || !cur.starts_with(root_canon) {
+                    return Err(RelativeResolveError::Escaping);
+                }
+            }
+            ResolveStep::Normal(name) => {
+                let next = cur.join(&name);
+                let meta = fs::symlink_metadata(&next)
+                    .map_err(|_| RelativeResolveError::Dangling)?;
+                if meta.file_type().is_symlink() {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(RelativeResolveError::Cycle);
+                    }
+                    let inter_target = fs::read_link(&next)
+                        .map_err(|_| RelativeResolveError::Dangling)?;
+                    push_relative_components(&inter_target, true, &mut queue)?;
+                } else if meta.is_dir() {
+                    cur = next;
+                } else if meta.is_file() {
+                    if !queue.is_empty() {
+                        return Err(RelativeResolveError::Dangling);
+                    }
+                    cur = next;
+                } else {
+                    return Err(RelativeResolveError::Dangling);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_symlink_loop_error(err: &std::io::Error) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        err.raw_os_error() == Some(62) // ELOOP
+    }
+    #[cfg(target_os = "linux")]
+    {
+        err.raw_os_error() == Some(40) // ELOOP
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "linux"
+    )))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Returns `true` if adding a directory symlink located in `link_parent` pointing to
+/// `link_target` would create a cycle in the destination directory graph given the
+/// already-accepted acyclic directory symlinks `(parent_dir, target_dir)`.
+fn creates_dir_cycle(
+    link_parent: &Path,
+    link_target: &Path,
+    accepted_dir_links: &[(PathBuf, PathBuf)],
+) -> bool {
+    // Direct self/ancestor cycle (e.g. `loop -> .`, `sub/up -> ..`).
+    if link_parent.starts_with(link_target) {
+        return true;
+    }
+    let mut stack = vec![link_target.to_path_buf()];
+    let mut visited = HashSet::new();
+    visited.insert(link_target.to_path_buf());
+    while let Some(cur) = stack.pop() {
+        if link_parent.starts_with(&cur) {
+            return true;
+        }
+        for (p, t) in accepted_dir_links {
+            if p.starts_with(&cur) && visited.insert(t.clone()) {
+                stack.push(t.clone());
+            }
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_copy_dir(
+    cur_src: &Path,
+    cur_dst: &Path,
+    rel_parent: &Path,
+    dst_root_canon: &Path,
+    skip_canon: Option<&Path>,
+    active_dirs: &mut HashSet<PathBuf>,
+    pending_symlinks: &mut Vec<PendingSymlink>,
+    report: &mut CopyDirReport,
+) -> Result<()> {
+    fs::create_dir_all(cur_dst)
+        .with_context(|| format!("creating directory {}", cur_dst.display()))?;
+
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(cur_src)
+        .with_context(|| format!("reading directory {}", cur_src.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("iterating directory {}", cur_src.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
         let name = entry.file_name();
         if name == ".DepotDownloader" || name == ".DS_Store" {
             continue;
         }
         let sp = entry.path();
-        if let Some(skip) = skip_canon {
-            if fs::canonicalize(&sp).ok().as_deref() == Some(skip) {
+        let dp = cur_dst.join(&name);
+        let ft = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", sp.display()))?;
+
+        if ft.is_symlink() {
+            // Never recurse through symlinks during directory copy; evaluate safety once
+            // all real files and directories exist in `dst`.
+            pending_symlinks.push(PendingSymlink {
+                src_path: sp,
+                dst_path: dp,
+                rel_path: rel_parent.join(&name),
+                rel_parent: rel_parent.to_path_buf(),
+            });
+            continue;
+        }
+
+        if ft.is_dir() {
+            let sp_canon = fs::canonicalize(&sp)
+                .with_context(|| format!("canonicalizing directory {}", sp.display()))?;
+            if skip_canon.is_some_and(|skip| sp_canon == skip || sp_canon.starts_with(skip))
+                || sp_canon == dst_root_canon
+                || sp_canon.starts_with(dst_root_canon)
+            {
                 continue;
             }
-        }
-        let dp = dst.join(&name);
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            copy_dir_recursive(&sp, &dp, skip_canon)?;
+            if !active_dirs.insert(sp_canon.clone()) {
+                continue;
+            }
+            report.dirs_created += 1;
+            let child_rel = rel_parent.join(&name);
+            let res = walk_copy_dir(
+                &sp,
+                &dp,
+                &child_rel,
+                dst_root_canon,
+                skip_canon,
+                active_dirs,
+                pending_symlinks,
+                report,
+            );
+            active_dirs.remove(&sp_canon);
+            res?;
         } else if ft.is_file() {
-            fs::copy(&sp, &dp)?;
+            if let Some(skip) = skip_canon {
+                if fs::canonicalize(&sp).ok().as_deref() == Some(skip) {
+                    continue;
+                }
+            }
+            if dp.is_symlink() {
+                let _ = fs::remove_file(&dp);
+            }
+            fs::copy(&sp, &dp)
+                .with_context(|| format!("copying {} -> {}", sp.display(), dp.display()))?;
+            report.files_copied += 1;
         }
     }
     Ok(())
+}
+
+/// Recursively copy `src` into `dst`, skipping `.DepotDownloader`, `.DS_Store`, and an optional
+/// canonicalized path (`skip_canon`, e.g. an output `.app` located inside the source tree).
+///
+/// Symlinks are never followed during directory traversal:
+/// - Dangling symlinks are skipped.
+/// - Symlinks that escape `src` (or use absolute / root-escaping paths) are skipped.
+/// - Symlinks that form loops (`ELOOP`, ancestor links, or mutual directory cycles) are skipped.
+/// - Safe interior relative symlinks that resolve inside `src` without forming cycles are
+///   preserved in `dst`.
+pub fn copy_dir_recursive_with_report(
+    src: &Path,
+    dst: &Path,
+    skip_canon: Option<&Path>,
+) -> Result<CopyDirReport> {
+    let src_root_canon = fs::canonicalize(src)
+        .with_context(|| format!("canonicalizing source directory {}", src.display()))?;
+    fs::create_dir_all(dst)
+        .with_context(|| format!("creating destination directory {}", dst.display()))?;
+    let dst_root_canon = fs::canonicalize(dst)
+        .with_context(|| format!("canonicalizing destination directory {}", dst.display()))?;
+
+    let mut active_dirs = HashSet::new();
+    active_dirs.insert(src_root_canon.clone());
+    let mut pending_symlinks = Vec::new();
+    let mut report = CopyDirReport::default();
+
+    walk_copy_dir(
+        src,
+        dst,
+        Path::new(""),
+        &dst_root_canon,
+        skip_canon,
+        &mut active_dirs,
+        &mut pending_symlinks,
+        &mut report,
+    )?;
+
+    pending_symlinks.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    let mut accepted_dir_links: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut created_symlinks: Vec<PathBuf> = Vec::new();
+
+    for link in &pending_symlinks {
+        let Ok(raw_target) = fs::read_link(&link.src_path) else {
+            report.symlinks_skipped_dangling += 1;
+            continue;
+        };
+
+        let canon_target = match fs::canonicalize(&link.src_path) {
+            Ok(p) => p,
+            Err(err) => {
+                if is_symlink_loop_error(&err) {
+                    report.symlinks_skipped_cycle += 1;
+                } else {
+                    report.symlinks_skipped_dangling += 1;
+                }
+                continue;
+            }
+        };
+
+        if !canon_target.starts_with(&src_root_canon)
+            || skip_canon.is_some_and(|skip| canon_target.starts_with(skip))
+            || canon_target.starts_with(&dst_root_canon)
+        {
+            report.symlinks_skipped_escaping += 1;
+            continue;
+        }
+
+        let src_parent_canon = src_root_canon.join(&link.rel_parent);
+        if let Err(err) =
+            verify_relative_resolution_within_root(&src_root_canon, &src_parent_canon, &raw_target)
+        {
+            match err {
+                RelativeResolveError::Escaping => report.symlinks_skipped_escaping += 1,
+                RelativeResolveError::Dangling => report.symlinks_skipped_dangling += 1,
+                RelativeResolveError::Cycle => report.symlinks_skipped_cycle += 1,
+            }
+            continue;
+        }
+
+        let Ok(target_meta) = fs::metadata(&canon_target) else {
+            report.symlinks_skipped_dangling += 1;
+            continue;
+        };
+        if !target_meta.is_file() && !target_meta.is_dir() {
+            report.symlinks_skipped_dangling += 1;
+            continue;
+        }
+
+        let dst_parent_canon = dst_root_canon.join(&link.rel_parent);
+        let Ok(target_rel_canon) = canon_target.strip_prefix(&src_root_canon) else {
+            report.symlinks_skipped_escaping += 1;
+            continue;
+        };
+        let dst_target_canon = dst_root_canon.join(target_rel_canon);
+
+        if target_meta.is_dir() {
+            if creates_dir_cycle(&dst_parent_canon, &dst_target_canon, &accepted_dir_links) {
+                report.symlinks_skipped_cycle += 1;
+                continue;
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            if link.dst_path.is_symlink() || link.dst_path.is_file() {
+                let _ = fs::remove_file(&link.dst_path);
+            }
+            std::os::unix::fs::symlink(&raw_target, &link.dst_path).with_context(|| {
+                format!(
+                    "creating relative symlink {} -> {}",
+                    link.dst_path.display(),
+                    raw_target.display()
+                )
+            })?;
+            if target_meta.is_dir() {
+                accepted_dir_links.push((dst_parent_canon, dst_target_canon));
+            }
+            created_symlinks.push(link.dst_path.clone());
+            report.symlinks_preserved += 1;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&dst_parent_canon, &dst_target_canon, &accepted_dir_links);
+            report.symlinks_skipped_dangling += 1;
+        }
+    }
+
+    // Post-copy fixed-point check: drop any preserved symlink in `dst` that dangles or escapes
+    // `dst_root_canon` (e.g. a relative link chained through an intermediate link or directory
+    // such as `.DepotDownloader` that was skipped).
+    loop {
+        let mut removed_any = false;
+        created_symlinks.retain(|dp| {
+            let ok = fs::canonicalize(dp)
+                .map(|resolved| resolved.starts_with(&dst_root_canon))
+                .unwrap_or(false);
+            if !ok {
+                let _ = fs::remove_file(dp);
+                report.symlinks_preserved = report.symlinks_preserved.saturating_sub(1);
+                report.symlinks_skipped_dangling += 1;
+                removed_any = true;
+                false
+            } else {
+                true
+            }
+        });
+        if !removed_any {
+            break;
+        }
+    }
+
+    Ok(report)
+}
+
+/// Recursively copy `src` into `dst`, skipping `.DepotDownloader`, `.DS_Store`, unsafe symlinks,
+/// and an optional canonicalized path (`skip_canon`, e.g. an output `.app` inside the source tree).
+pub fn copy_dir_recursive(src: &Path, dst: &Path, skip_canon: Option<&Path>) -> Result<()> {
+    copy_dir_recursive_with_report(src, dst, skip_canon)?;
+    Ok(())
+}
+
+/// Replace `dst` with a fresh, self-contained copy of the game directory `src`.
+///
+/// Removes any stale file, symlink, or directory at `dst` first, then delegates to
+/// [`copy_dir_recursive_with_report`] so escaping, dangling, and cyclic symlinks are skipped
+/// while safe interior relative symlinks are preserved.
+pub fn copy_game_payload(
+    src: &Path,
+    dst: &Path,
+    skip_canon: Option<&Path>,
+) -> Result<CopyDirReport> {
+    if let Ok(meta) = fs::symlink_metadata(dst) {
+        if meta.file_type().is_symlink() || meta.is_file() {
+            fs::remove_file(dst)
+                .with_context(|| format!("removing stale game payload {}", dst.display()))?;
+        } else if meta.is_dir() {
+            fs::remove_dir_all(dst)
+                .with_context(|| format!("removing stale game payload {}", dst.display()))?;
+        }
+    }
+    copy_dir_recursive_with_report(src, dst, skip_canon).with_context(|| {
+        format!(
+            "copying game assets from {} to {}",
+            src.display(),
+            dst.display()
+        )
+    })
 }
 
 /// Recursively copy non-symlink files from `src` to `dst`, skipping host-specific `*.mtl4a` files.
@@ -484,5 +913,235 @@ mod tests {
             p
         };
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_game_payload_filters_unsafe_symlinks_and_preserves_safe_relative_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDirGuard::create_unique("port-factory-copy-symlinks").unwrap();
+        let outside_dir = root.path().join("outside");
+        let game_dir = root.path().join("game_src");
+        let dst_dir = root.path().join("game_dst");
+
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::create_dir_all(game_dir.join("data")).unwrap();
+        fs::create_dir_all(game_dir.join("sub")).unwrap();
+        fs::create_dir_all(game_dir.join("dir_a")).unwrap();
+        fs::create_dir_all(game_dir.join("dir_b")).unwrap();
+        fs::create_dir_all(game_dir.join(".DepotDownloader")).unwrap();
+
+        let outside_secret = outside_dir.join("secret.txt");
+        fs::write(&outside_secret, b"OUTSIDE_SECRET").unwrap();
+        fs::write(game_dir.join("Game.exe"), b"MZ").unwrap();
+        fs::write(game_dir.join("data/real.txt"), b"REAL_DATA").unwrap();
+        fs::write(game_dir.join("sub/nested.txt"), b"NESTED").unwrap();
+        fs::write(game_dir.join(".DepotDownloader/meta.bin"), b"META").unwrap();
+        fs::write(game_dir.join(".DS_Store"), b"DS").unwrap();
+
+        // 1. Escaping symlinks (relative escape, absolute escape, absolute-into-src, root-bounce).
+        symlink("../outside/secret.txt", game_dir.join("escape_rel.txt")).unwrap();
+        symlink(&outside_secret, game_dir.join("escape_abs.txt")).unwrap();
+        symlink(&outside_dir, game_dir.join("escape_dir")).unwrap();
+        symlink(
+            fs::canonicalize(game_dir.join("data/real.txt")).unwrap(),
+            game_dir.join("escape_abs_inside.txt"),
+        )
+        .unwrap();
+        symlink(
+            "../game_src/data/real.txt",
+            game_dir.join("escape_bounce.txt"),
+        )
+        .unwrap();
+
+        // 2. Dangling symlinks + links chained through skipped entries.
+        symlink("missing_target.txt", game_dir.join("dangling.txt")).unwrap();
+        symlink(
+            "escape_abs_inside.txt",
+            game_dir.join("chained_to_skipped.txt"),
+        )
+        .unwrap();
+        symlink(
+            ".DepotDownloader/meta.bin",
+            game_dir.join("chained_to_depot.txt"),
+        )
+        .unwrap();
+
+        // 3. Cycles (self dir loop, ancestor dir loop, mutual ELOOP links, mutual dir cycle).
+        symlink(".", game_dir.join("self_dir_loop")).unwrap();
+        symlink("..", game_dir.join("sub/ancestor_loop")).unwrap();
+        symlink("eloop_b", game_dir.join("eloop_a")).unwrap();
+        symlink("eloop_a", game_dir.join("eloop_b")).unwrap();
+        symlink("../dir_b", game_dir.join("dir_a/to_b")).unwrap();
+        symlink("../dir_a", game_dir.join("dir_b/to_a")).unwrap();
+
+        // 4. Safe interior relative symlinks (file, parent-relative file, acyclic directory).
+        symlink("data/real.txt", game_dir.join("safe_file_link.txt")).unwrap();
+        symlink("../data/real.txt", game_dir.join("sub/safe_parent_file.txt")).unwrap();
+        symlink("../data", game_dir.join("sub/safe_dir_link")).unwrap();
+
+        // Seed a stale symlink at `dst_dir` to ensure `copy_game_payload` replaces it cleanly.
+        symlink(&outside_dir, &dst_dir).unwrap();
+
+        let report = copy_game_payload(&game_dir, &dst_dir, None).unwrap();
+
+        // Regular files copied; metadata stripped.
+        assert_eq!(fs::read(dst_dir.join("Game.exe")).unwrap(), b"MZ");
+        assert_eq!(fs::read(dst_dir.join("data/real.txt")).unwrap(), b"REAL_DATA");
+        assert_eq!(fs::read(dst_dir.join("sub/nested.txt")).unwrap(), b"NESTED");
+        assert!(fs::symlink_metadata(dst_dir.join(".DepotDownloader")).is_err());
+        assert!(fs::symlink_metadata(dst_dir.join(".DS_Store")).is_err());
+
+        // All escaping, dangling, chained-to-skipped, and self/ancestor/ELOOP symlinks skipped.
+        for skipped in [
+            "escape_rel.txt",
+            "escape_abs.txt",
+            "escape_dir",
+            "escape_abs_inside.txt",
+            "escape_bounce.txt",
+            "dangling.txt",
+            "chained_to_skipped.txt",
+            "chained_to_depot.txt",
+            "self_dir_loop",
+            "sub/ancestor_loop",
+            "eloop_a",
+            "eloop_b",
+        ] {
+            assert!(
+                fs::symlink_metadata(dst_dir.join(skipped)).is_err(),
+                "unsafe symlink {skipped} should have been skipped"
+            );
+        }
+
+        // Mutual directory cycle must be broken (`dir_a/to_b` is processed first, so `dir_b/to_a` is skipped).
+        assert!(
+            fs::symlink_metadata(dst_dir.join("dir_b/to_a")).is_err(),
+            "cycle-closing link dir_b/to_a must be skipped"
+        );
+        assert!(
+            !dst_dir.join("dir_a/to_b/to_a").exists(),
+            "mutual directory cycle must not remain traversable"
+        );
+
+        // Safe interior relative symlinks are preserved as relative symlinks resolving inside `dst_dir`.
+        let dst_canon = fs::canonicalize(&dst_dir).unwrap();
+        for (rel, expected_raw) in [
+            ("safe_file_link.txt", "data/real.txt"),
+            ("sub/safe_parent_file.txt", "../data/real.txt"),
+            ("sub/safe_dir_link", "../data"),
+        ] {
+            let p = dst_dir.join(rel);
+            let meta = fs::symlink_metadata(&p)
+                .unwrap_or_else(|e| panic!("expected safe link {rel} to be preserved: {e}"));
+            assert!(meta.file_type().is_symlink(), "{rel} should remain a symlink");
+            assert_eq!(fs::read_link(&p).unwrap(), Path::new(expected_raw));
+            let resolved = fs::canonicalize(&p).unwrap();
+            assert!(
+                resolved.starts_with(&dst_canon),
+                "preserved symlink {rel} resolved outside dst: {}",
+                resolved.display()
+            );
+        }
+        assert_eq!(
+            fs::read(dst_dir.join("safe_file_link.txt")).unwrap(),
+            b"REAL_DATA"
+        );
+        assert_eq!(
+            fs::read(dst_dir.join("sub/safe_parent_file.txt")).unwrap(),
+            b"REAL_DATA"
+        );
+        assert_eq!(
+            fs::read(dst_dir.join("sub/safe_dir_link/real.txt")).unwrap(),
+            b"REAL_DATA"
+        );
+
+        assert_eq!(report.files_copied, 3);
+        assert_eq!(report.symlinks_preserved, 4); // 3 safe links + acyclic `dir_a/to_b`
+        assert_eq!(report.symlinks_skipped_escaping, 6);
+        assert_eq!(report.symlinks_skipped_dangling, 2);
+        assert_eq!(report.symlinks_skipped_cycle, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_game_payload_preserves_relative_symlink_with_parent_dir_after_dir_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDirGuard::create_unique("port-factory-copy-symlink-dotdot").unwrap();
+        let game_dir = root.path().join("game_src");
+        let dst_dir = root.path().join("game_dst");
+
+        fs::create_dir_all(game_dir.join("a")).unwrap();
+        fs::create_dir_all(game_dir.join("c")).unwrap();
+        fs::create_dir_all(game_dir.join("b/deep/nested")).unwrap();
+        fs::write(game_dir.join("link"), b"ROOT_LINK_FILE").unwrap();
+        fs::write(game_dir.join("b/target.txt"), b"DEEP_TARGET").unwrap();
+
+        // Valid relative symlinks where `..` follows an intermediate directory symlink:
+        // - `a/link` has lexical path `a/link` (equal to itself), yet resolves to root `link`.
+        // - `a/deep_target` lexically underflows root, yet resolves strictly inside root.
+        symlink("../c", game_dir.join("a/alias")).unwrap();
+        symlink("alias/../link", game_dir.join("a/link")).unwrap();
+        symlink("../b/deep/nested", game_dir.join("a/deep_alias")).unwrap();
+        symlink(
+            "deep_alias/../../../b/target.txt",
+            game_dir.join("a/deep_target"),
+        )
+        .unwrap();
+
+        // Still unsafe through the intermediate directory symlink:
+        // - `a/loop_via_alias` resolves to the payload root (ancestor of `a/`) -> cycle.
+        // - `a/bounce_via_alias` steps above payload root and bounces back in -> escaping.
+        symlink("alias/..", game_dir.join("a/loop_via_alias")).unwrap();
+        symlink(
+            "alias/../../game_src/link",
+            game_dir.join("a/bounce_via_alias"),
+        )
+        .unwrap();
+
+        let report = copy_game_payload(&game_dir, &dst_dir, None).unwrap();
+        let dst_canon = fs::canonicalize(&dst_dir).unwrap();
+
+        let preserved_link = dst_dir.join("a/link");
+        assert!(
+            fs::symlink_metadata(&preserved_link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a/link should be preserved as a symlink"
+        );
+        assert_eq!(fs::read_link(&preserved_link).unwrap(), Path::new("alias/../link"));
+        assert_eq!(fs::canonicalize(&preserved_link).unwrap(), dst_canon.join("link"));
+        assert_eq!(fs::read(&preserved_link).unwrap(), b"ROOT_LINK_FILE");
+
+        let preserved_deep = dst_dir.join("a/deep_target");
+        assert!(
+            fs::symlink_metadata(&preserved_deep)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a/deep_target should be preserved as a symlink"
+        );
+        assert_eq!(
+            fs::canonicalize(&preserved_deep).unwrap(),
+            dst_canon.join("b/target.txt")
+        );
+        assert_eq!(fs::read(&preserved_deep).unwrap(), b"DEEP_TARGET");
+
+        assert!(
+            fs::symlink_metadata(dst_dir.join("a/loop_via_alias")).is_err(),
+            "ancestor directory cycle through alias must still be skipped"
+        );
+        assert!(
+            fs::symlink_metadata(dst_dir.join("a/bounce_via_alias")).is_err(),
+            "root-escaping bounce through alias must still be skipped"
+        );
+
+        assert_eq!(report.files_copied, 2);
+        assert_eq!(report.symlinks_preserved, 4);
+        assert_eq!(report.symlinks_skipped_escaping, 1);
+        assert_eq!(report.symlinks_skipped_dangling, 0);
+        assert_eq!(report.symlinks_skipped_cycle, 1);
     }
 }
