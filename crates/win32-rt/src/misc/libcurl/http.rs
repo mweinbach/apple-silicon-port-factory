@@ -736,6 +736,11 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
     })
 }
 
+/// Maximum bytes delivered in a single `CURLOPT_WRITEFUNCTION` invocation per
+/// libcurl's documented contract (`CURL_MAX_WRITE_SIZE`, 16 KiB), independent
+/// of `CURLOPT_BUFFERSIZE`.
+pub(super) const CURL_MAX_WRITE_SIZE: usize = 16 * 1024;
+
 fn emit_body_bytes(
     sink: &mut dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
@@ -748,26 +753,20 @@ fn emit_body_bytes(
     if raw.is_empty() {
         return Ok(());
     }
-    if let Some(ref mut inf) = inflater {
-        let mut decoded = Vec::with_capacity(raw.len().saturating_mul(2));
+    let mut decoded = Vec::new();
+    let payload: &[u8] = if let Some(ref mut inf) = inflater {
+        decoded.reserve(raw.len().saturating_mul(2));
         inf.decompress(raw, &mut decoded)
             .map_err(|code| (code, "Content-Encoding decompression failed".to_string(), 0))?;
-        if !decoded.is_empty() {
-            *size_download += decoded.len() as i64;
-            if max_filesize > 0 && *size_download > max_filesize {
-                return Err((
-                    CURLE_FILESIZE_EXCEEDED,
-                    format!("Maximum file size ({max_filesize}) exceeded"),
-                    0,
-                ));
-            }
-            sink.on_body_chunk(decoded)
-                .map_err(|code| (code, "Write callback aborted transfer".to_string(), 0))?;
-            sink.on_progress(dltotal, *size_download, ultotal, ultotal)
-                .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+        if decoded.is_empty() {
+            return Ok(());
         }
+        &decoded
     } else {
-        *size_download += raw.len() as i64;
+        raw
+    };
+    for chunk in payload.chunks(CURL_MAX_WRITE_SIZE) {
+        *size_download += chunk.len() as i64;
         if max_filesize > 0 && *size_download > max_filesize {
             return Err((
                 CURLE_FILESIZE_EXCEEDED,
@@ -775,7 +774,7 @@ fn emit_body_bytes(
                 0,
             ));
         }
-        sink.on_body_chunk(raw.to_vec())
+        sink.on_body_chunk(chunk.to_vec())
             .map_err(|code| (code, "Write callback aborted transfer".to_string(), 0))?;
         sink.on_progress(dltotal, *size_download, ultotal, ultotal)
             .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;

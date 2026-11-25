@@ -4366,6 +4366,32 @@ unsafe fn connect_by_name_impl(
     let Some(meta) = lookup_meta(s) else {
         return err(WSAENOTSOCK, FALSE);
     };
+    if (!local_address.is_null() && local_address_length.is_null())
+        || (!remote_address.is_null() && remote_address_length.is_null())
+    {
+        return err(WSAEFAULT, FALSE);
+    }
+    let min_sa_len: Option<u32> = match meta.family {
+        libc::AF_INET => Some(16),
+        libc::AF_INET6 => Some(28),
+        _ => None,
+    };
+    if let Some(need) = min_sa_len {
+        if !local_address.is_null() {
+            let avail = std::ptr::read_unaligned(local_address_length);
+            if avail < need {
+                std::ptr::write_unaligned(local_address_length, need);
+                return err(WSAEFAULT, FALSE);
+            }
+        }
+        if !remote_address.is_null() {
+            let avail = std::ptr::read_unaligned(remote_address_length);
+            if avail < need {
+                std::ptr::write_unaligned(remote_address_length, need);
+                return err(WSAEFAULT, FALSE);
+            }
+        }
+    }
     let node_str = match node {
         Some(v) if !v.is_empty() => v,
         _ => return err(WSAEINVAL, FALSE),
@@ -4504,34 +4530,35 @@ unsafe fn connect_by_name_impl(
     }
     event_select_on_connect_complete(s, 0);
 
-    if !local_address.is_null() && !local_address_length.is_null() {
+    if !local_address.is_null() {
         let mut lsa: libc::sockaddr_storage = std::mem::zeroed();
         let mut llen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        if libc::getsockname(meta.fd, &mut lsa as *mut _ as *mut libc::sockaddr, &mut llen) == 0 {
-            let mut avail = std::ptr::read_unaligned(local_address_length) as i32;
-            if posix_to_win_sockaddr(
-                &lsa as *const _ as *const libc::sockaddr,
-                llen,
-                local_address,
-                &mut avail,
-            )
-            .is_ok()
-            {
-                std::ptr::write_unaligned(local_address_length, avail as u32);
-            }
+        if libc::getsockname(meta.fd, &mut lsa as *mut _ as *mut libc::sockaddr, &mut llen) != 0 {
+            return err(last_errno_wsa(), FALSE);
+        }
+        let mut avail = std::ptr::read_unaligned(local_address_length) as i32;
+        let res = posix_to_win_sockaddr(
+            &lsa as *const _ as *const libc::sockaddr,
+            llen,
+            local_address,
+            &mut avail,
+        );
+        std::ptr::write_unaligned(local_address_length, avail.max(0) as u32);
+        if let Err(wsa) = res {
+            return err(wsa, FALSE);
         }
     }
-    if !remote_address.is_null() && !remote_address_length.is_null() {
+    if !remote_address.is_null() {
         let mut avail = std::ptr::read_unaligned(remote_address_length) as i32;
-        if posix_to_win_sockaddr(
+        let res = posix_to_win_sockaddr(
             &remote_sa as *const _ as *const libc::sockaddr,
             remote_len,
             remote_address,
             &mut avail,
-        )
-        .is_ok()
-        {
-            std::ptr::write_unaligned(remote_address_length, avail as u32);
+        );
+        std::ptr::write_unaligned(remote_address_length, avail.max(0) as u32);
+        if let Err(wsa) = res {
+            return err(wsa, FALSE);
         }
     }
     TRUE
@@ -11223,6 +11250,74 @@ mod tests {
                 FALSE
             );
             assert_eq!(WSAGetLastError(), WSAHOST_NOT_FOUND as i32);
+
+            // Undersized address output buffers fail with WSAEFAULT and report required size.
+            let c4 = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            let mut small_rem = [0xAAu8; 8];
+            let mut small_rem_len = 8u32;
+            assert_eq!(
+                WSAConnectByNameA(
+                    c4,
+                    b"127.0.0.1\0".as_ptr(),
+                    port_str.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut small_rem_len,
+                    small_rem.as_mut_ptr(),
+                    &tv,
+                    std::ptr::null_mut(),
+                ),
+                FALSE
+            );
+            assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+            assert_eq!(small_rem_len, 16);
+            assert_eq!(small_rem, [0xAAu8; 8]);
+
+            let mut small_loc = [0xBBu8; 8];
+            let mut small_loc_len = 8u32;
+            assert_eq!(
+                WSAConnectByNameA(
+                    c4,
+                    b"127.0.0.1\0".as_ptr(),
+                    port_str.as_ptr(),
+                    &mut small_loc_len,
+                    small_loc.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &tv,
+                    std::ptr::null_mut(),
+                ),
+                FALSE
+            );
+            assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+            assert_eq!(small_loc_len, 16);
+            assert_eq!(small_loc, [0xBBu8; 8]);
+
+            // IPv6 socket with 16-byte remote buffer (too small for 28-byte sockaddr_in6) -> WSAEFAULT + 28.
+            let c6 = socket(AF_INET6 as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            if c6 != INVALID_SOCKET {
+                let mut v6_rem = [0xCCu8; 16];
+                let mut v6_rem_len = 16u32;
+                assert_eq!(
+                    WSAConnectByNameA(
+                        c6,
+                        b"::1\0".as_ptr(),
+                        port_str.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut v6_rem_len,
+                        v6_rem.as_mut_ptr(),
+                        &tv,
+                        std::ptr::null_mut(),
+                    ),
+                    FALSE
+                );
+                assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                assert_eq!(v6_rem_len, 28);
+                assert_eq!(v6_rem, [0xCCu8; 16]);
+                assert_eq!(closesocket(c6), 0);
+            }
+            assert_eq!(closesocket(c4), 0);
 
             assert_eq!(closesocket(c3), 0);
             assert_eq!(closesocket(a2), 0);

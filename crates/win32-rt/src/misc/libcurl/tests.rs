@@ -1317,3 +1317,95 @@ fn multi_delivers_xferinfo_progress_and_honors_abort() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn easy_write_callback_caps_chunks_at_curl_max_write_size() {
+    use super::easy::CURLOPT_BUFFERSIZE;
+    use super::http::CURL_MAX_WRITE_SIZE;
+
+    struct ChunkTracker {
+        body: Vec<u8>,
+        max_chunk: usize,
+        chunks: usize,
+    }
+    unsafe extern "win64" fn tracking_write_cb(
+        ptr: *const u8,
+        size: usize,
+        nmemb: usize,
+        userdata: *mut c_void,
+    ) -> usize {
+        let total = size.saturating_mul(nmemb);
+        let tracker = &mut *(userdata as *mut ChunkTracker);
+        tracker.max_chunk = tracker.max_chunk.max(total);
+        tracker.chunks += 1;
+        if total > 0 && !ptr.is_null() {
+            tracker
+                .body
+                .extend_from_slice(std::slice::from_raw_parts(ptr, total));
+        }
+        total
+    }
+
+    let payload: Vec<u8> = (0..40 * 1024).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s);
+        let hdr = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            payload.len()
+        );
+        s.write_all(hdr.as_bytes()).unwrap();
+        s.write_all(&payload).unwrap();
+    });
+
+    unsafe {
+        crate::register_native_va(
+            tracking_write_cb as *const () as u64,
+            tracking_write_cb as *const () as usize,
+        );
+        let easy = curl_easy_init();
+        let url = format!("http://{addr}/big\0");
+        let mut tracker = ChunkTracker {
+            body: Vec::new(),
+            max_chunk: 0,
+            chunks: 0,
+        };
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        // Set a 64 KiB receive buffer (4x CURL_MAX_WRITE_SIZE); write callback chunks must still be <= 16 KiB.
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_BUFFERSIZE, 64 * 1024), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(
+                easy,
+                CURLOPT_WRITEFUNCTION,
+                tracking_write_cb as *const () as usize
+            ),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(
+                easy,
+                CURLOPT_WRITEDATA,
+                (&mut tracker as *mut ChunkTracker) as usize
+            ),
+            CURLE_OK
+        );
+
+        assert_eq!(curl_easy_perform(easy), CURLE_OK);
+        assert_eq!(tracker.body, expected);
+        assert!(
+            tracker.max_chunk <= CURL_MAX_WRITE_SIZE,
+            "write callback chunk {} exceeded CURL_MAX_WRITE_SIZE ({})",
+            tracker.max_chunk,
+            CURL_MAX_WRITE_SIZE
+        );
+        assert!(tracker.chunks >= 3, "40 KiB body must split into >= 3 chunks");
+
+        curl_easy_cleanup(easy);
+    }
+
+    server.join().unwrap();
+}
