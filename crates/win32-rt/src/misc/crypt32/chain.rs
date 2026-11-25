@@ -2601,6 +2601,104 @@ pub(super) fn cert_free_certificate_chain_impl(chain: *mut c_void) {
     }
 }
 
+/// Check Basic Constraints extension (2.5.29.19 / legacy 2.5.29.10) across the selected issuer path.
+/// Shared by `CERT_CHAIN_POLICY_BASIC_CONSTRAINTS` and `CERT_CHAIN_POLICY_NT_AUTH`.
+fn evaluate_basic_constraints_policy(
+    chain_der: &[Vec<u8>],
+    root_pool: &[Vec<u8>],
+    dw_flags: u32,
+) -> Option<(u32, i32)> {
+    const OID_BC2: &[u8] = &[0x55, 0x1D, 0x13];
+    const OID_BC1: &[u8] = &[0x55, 0x1D, 0x0A];
+    let require_ca_leaf = (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG) != 0;
+    let require_ee_leaf = (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG) != 0;
+    let selected_path = resolve_selected_issuer_path(chain_der, root_pool);
+    let mut non_self_issued_below = 0usize;
+    for (idx, &der) in selected_path.iter().enumerate() {
+        let Some(parts) = parse_cert_der_parts(der) else {
+            continue;
+        };
+        let is_self_issued = parts.subject_inner == parts.issuer_inner;
+        let mut has_bc = false;
+        let mut is_ca = false;
+        let mut is_ee = false;
+        let mut path_len: Option<usize> = None;
+        for (oid, _, val) in &parts.extensions {
+            if *oid == OID_BC2 {
+                has_bc = true;
+                let mut ca_flag = false;
+                if let Some((seq, _)) = parse_der_item(val) {
+                    if let Some(kids) = der_item_children(seq.val) {
+                        for k in kids {
+                            if k.tag == 0x01 {
+                                ca_flag = k.val.first().copied().unwrap_or(0) != 0;
+                            } else if k.tag == 0x02 && !k.val.is_empty() {
+                                let mut v = 0usize;
+                                for &b in k.val {
+                                    v = (v << 8) | (b as usize);
+                                }
+                                path_len = Some(v);
+                            }
+                        }
+                    }
+                }
+                is_ca = ca_flag;
+                is_ee = !ca_flag;
+            } else if *oid == OID_BC1 && !has_bc {
+                has_bc = true;
+                if let Some((seq, _)) = parse_der_item(val) {
+                    if let Some(kids) = der_item_children(seq.val) {
+                        for k in kids {
+                            if k.tag == 0x03 && k.val.len() >= 2 {
+                                let bits = k.val[1];
+                                is_ca = (bits & 0x80) != 0;
+                                is_ee = (bits & 0x40) != 0;
+                            } else if k.tag == 0x02 && !k.val.is_empty() {
+                                let mut v = 0usize;
+                                for &b in k.val {
+                                    v = (v << 8) | (b as usize);
+                                }
+                                path_len = Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if has_bc {
+            if idx == 0 {
+                // Per MSDN CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_BASIC_CONSTRAINTS):
+                // setting both CA_FLAG and END_ENTITY_FLAG allows either leaf type;
+                // enforce a specific leaf type only when exactly one flag is set.
+                if require_ca_leaf && require_ee_leaf {
+                    if !is_ca && !is_ee {
+                        return Some((TRUST_E_BASIC_CONSTRAINTS, 0));
+                    }
+                } else if require_ca_leaf && !is_ca {
+                    return Some((TRUST_E_BASIC_CONSTRAINTS, 0));
+                } else if require_ee_leaf && !is_ee {
+                    return Some((TRUST_E_BASIC_CONSTRAINTS, 0));
+                }
+            } else {
+                if !is_ca {
+                    return Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
+                }
+                // RFC 5280 §4.2.1.9: pathLenConstraint counts only non-self-issued
+                // intermediate certificates subordinate to this CA.
+                if let Some(max_inter) = path_len {
+                    if non_self_issued_below > max_inter {
+                        return Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
+                    }
+                }
+            }
+        }
+        if idx > 0 && !is_self_issued {
+            non_self_issued_below += 1;
+        }
+    }
+    None
+}
+
 pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
     psz_policy_oid: *const u8,
     p_chain_context: *const c_void,
@@ -2932,107 +3030,8 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             }
         }
         CERT_CHAIN_POLICY_BASIC_CONSTRAINTS => {
-            // Check Basic Constraints extension (2.5.29.19 / legacy 2.5.29.10) across the chain.
-            // Per MSDN CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_BASIC_CONSTRAINTS):
-            // if a certificate has neither Basic Constraints extension, it is considered valid
-            // (legacy roots/issuers without Basic Constraints are not treated as explicit non-CAs).
-            const OID_BC2: &[u8] = &[0x55, 0x1D, 0x13];
-            const OID_BC1: &[u8] = &[0x55, 0x1D, 0x0A];
-            let require_ca_leaf = (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG) != 0;
-            let require_ee_leaf =
-                (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG) != 0;
             let bc_root_pool = exclusive_roots.as_deref().unwrap_or(&extra_roots);
-            let selected_path = resolve_selected_issuer_path(&chain_der, bc_root_pool);
-            let mut violation: Option<(u32, i32)> = None;
-            let mut non_self_issued_below = 0usize;
-            for (idx, &der) in selected_path.iter().enumerate() {
-                let Some(parts) = parse_cert_der_parts(der) else {
-                    continue;
-                };
-                let is_self_issued = parts.subject_inner == parts.issuer_inner;
-                let mut has_bc = false;
-                let mut is_ca = false;
-                let mut is_ee = false;
-                let mut path_len: Option<usize> = None;
-                for (oid, _, val) in &parts.extensions {
-                    if *oid == OID_BC2 {
-                        has_bc = true;
-                        let mut ca_flag = false;
-                        if let Some((seq, _)) = parse_der_item(val) {
-                            if let Some(kids) = der_item_children(seq.val) {
-                                for k in kids {
-                                    if k.tag == 0x01 {
-                                        ca_flag = k.val.first().copied().unwrap_or(0) != 0;
-                                    } else if k.tag == 0x02 && !k.val.is_empty() {
-                                        let mut v = 0usize;
-                                        for &b in k.val {
-                                            v = (v << 8) | (b as usize);
-                                        }
-                                        path_len = Some(v);
-                                    }
-                                }
-                            }
-                        }
-                        is_ca = ca_flag;
-                        is_ee = !ca_flag;
-                    } else if *oid == OID_BC1 && !has_bc {
-                        has_bc = true;
-                        if let Some((seq, _)) = parse_der_item(val) {
-                            if let Some(kids) = der_item_children(seq.val) {
-                                for k in kids {
-                                    if k.tag == 0x03 && k.val.len() >= 2 {
-                                        let bits = k.val[1];
-                                        is_ca = (bits & 0x80) != 0;
-                                        is_ee = (bits & 0x40) != 0;
-                                    } else if k.tag == 0x02 && !k.val.is_empty() {
-                                        let mut v = 0usize;
-                                        for &b in k.val {
-                                            v = (v << 8) | (b as usize);
-                                        }
-                                        path_len = Some(v);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if has_bc {
-                    if idx == 0 {
-                        // Per MSDN CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_BASIC_CONSTRAINTS):
-                        // setting both CA_FLAG and END_ENTITY_FLAG allows either leaf type;
-                        // enforce a specific leaf type only when exactly one flag is set.
-                        if require_ca_leaf && require_ee_leaf {
-                            if !is_ca && !is_ee {
-                                violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
-                                break;
-                            }
-                        } else if require_ca_leaf && !is_ca {
-                            violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
-                            break;
-                        } else if require_ee_leaf && !is_ee {
-                            violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
-                            break;
-                        }
-                    } else {
-                        if !is_ca {
-                            violation = Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
-                            break;
-                        }
-                        // RFC 5280 §4.2.1.9: pathLenConstraint counts only non-self-issued
-                        // intermediate certificates subordinate to this CA.
-                        if let Some(max_inter) = path_len {
-                            if non_self_issued_below > max_inter {
-                                violation = Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
-                                break;
-                            }
-                        }
-                    }
-                }
-                if idx > 0 && !is_self_issued {
-                    non_self_issued_below += 1;
-                }
-            }
-            violation.unwrap_or((0, -1))
+            evaluate_basic_constraints_policy(&chain_der, bc_root_pool, dw_flags).unwrap_or((0, -1))
         }
         CERT_CHAIN_POLICY_NT_AUTH => {
             const OID_CLIENT_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
@@ -3051,6 +3050,9 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                                     || o.as_slice() == OID_ANY_EKU
                             })
                     });
+            let bc_root_pool = exclusive_roots.as_deref().unwrap_or(&extra_roots);
+            let bc_violation =
+                evaluate_basic_constraints_policy(&chain_der, bc_root_pool, dw_flags);
             let verified_endpoints = verify_chain_to_root(
                 &chain_der,
                 exclusive_roots.as_deref(),
@@ -3058,8 +3060,8 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             );
             let trust_ok = default_chain_error == 0 || verified_endpoints.is_some();
             // Per MSDN CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_NT_AUTH):
-            // The issuing CA must be explicitly authorized in the Enterprise NTAuth store;
-            // ordinary trusted CAs are NOT authorized for NT authentication -> CERT_E_UNTRUSTEDCA.
+            // enforces BASE + BASIC_CONSTRAINTS (including high-word CA/END_ENTITY flags) +
+            // issuing CA presence in the Enterprise NTAuth store.
             let ntauth_authorized = verified_endpoints.as_ref().is_some_and(|ep| {
                 super::store::ntauth_store_certs_der().iter().any(|der| {
                     parse_cert_der_parts(der)
@@ -3074,6 +3076,8 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                 (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
             } else if !trust_ok && !ignore_ca {
                 (CERT_E_UNTRUSTEDROOT, 0)
+            } else if let Some(viol) = bc_violation {
+                viol
             } else if !ntauth_authorized {
                 (CERT_E_UNTRUSTEDCA, 1.min(chain_der.len().saturating_sub(1)) as i32)
             } else {

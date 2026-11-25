@@ -1,32 +1,4 @@
 dll	api	kind	file	line	detail
-advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	GetTokenInformation	stub	crates/win32-rt/src/advapi32.rs	1380	"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"
-bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2514	"BCryptExportKey(wrapped h_export_key) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2572	"BCryptExportKey({t:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptGenerateKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2681	"BCryptGenerateKeyPair({}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGenerateSymmetricKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2595	"BCryptGenerateSymmetricKey({}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1877	"BCryptGetProperty(alg={}, {p:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1891	"BCryptGetProperty(hash, {p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1926	"BCryptGetProperty(key, {p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2439	"BCryptImportKey({}, wrapped h_import_key) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2496	"BCryptImportKey({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2008	"BCryptImportKeyPair({}, wrapped import_key) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2016	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2031	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2046	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptOpenAlgorithmProvider	stub	crates/win32-rt/src/misc/bcrypt.rs	1787	"BCryptOpenAlgorithmProvider({name:?}, flags 0x{flags:x}) -> STATUS_NOT_FOUND (algorithm not implemented)"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2737	"BCryptSetProperty(ChainingMode={mode_str:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2785	"BCryptSetProperty(ECCCurveName={curve_str:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2823	"BCryptSetProperty({p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSignHash	stub	crates/win32-rt/src/misc/bcrypt.rs	2124	"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptVerifySignature	stub	crates/win32-rt/src/misc/bcrypt.rs	2189	"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"
-bcrypt.dll	bcrypt_aes_crypt	stub	crates/win32-rt/src/misc/bcrypt.rs	2240	"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }
 crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	55	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 d2d1.dll	geom_tessellate	stub	crates/win32-rt/src/misc/d2d1/geometry.rs	1038	"ID2D1Geometry::Tessellate -> E_NOTIMPL"
 d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	794	"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"
@@ -55,8 +27,8 @@ kernel32.dll	AllocConsole	stub	crates/win32-rt/src/kernel32/file.rs	477	"no sepa
 kernel32.dll	AssignProcessToJobObject	stub	crates/win32-rt/src/kernel32/process.rs	1655	"job objects have no effect"
 kernel32.dll	CreateProcessW	stub	crates/win32-rt/src/kernel32/process.rs	1283	"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)
 kernel32.dll	CreateRemoteThread	stub	crates/win32-rt/src/kernel32/threads.rs	60	"CreateRemoteThread into another process"
-kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7127	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
-kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7155	"DeviceIoControl code {code:#x} unsupported"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7135	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7163	"DeviceIoControl code {code:#x} unsupported"
 kernel32.dll	FlushProcessWriteBuffers	stub	crates/win32-rt/src/kernel32/memory.rs	1045	"FlushProcessWriteBuffers approximated by a local fence"
 kernel32.dll	GetCalendarInfoEx	stub	crates/win32-rt/src/kernel32/string.rs	1354	"GetCalendarInfoEx type {ty:#x}"
 kernel32.dll	GetFileInformationByHandleEx	stub	crates/win32-rt/src/kernel32/file.rs	2137	"GetFileInformationByHandleEx class {class} not supported"
@@ -65,7 +37,7 @@ kernel32.dll	GetLocaleInfoW	stub	crates/win32-rt/src/kernel32/string.rs	918	"loc
 kernel32.dll	GetNumberFormatEx	stub	crates/win32-rt/src/kernel32/string.rs	1323	"custom NUMBERFMT ignored"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	552	"LCMAP_HASH unsupported"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	578	"LCMapString flags {flags:#x} partially honoured"
-kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	6918	"MapViewOfFile3 on another process"
+kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	6926	"MapViewOfFile3 on another process"
 kernel32.dll	MoveFileExA	stub	crates/win32-rt/src/kernel32/file.rs	2596	"MoveFileExA delete-on-reboot ignored"
 kernel32.dll	MoveFileExW	stub	crates/win32-rt/src/kernel32/file.rs	2589	"MoveFileExW delete-on-reboot ignored"
 kernel32.dll	SetFileInformationByHandle	stub	crates/win32-rt/src/kernel32/file.rs	2268	"SetFileInformationByHandle class {class} not supported"
@@ -128,7 +100,7 @@ physx3common_x64.dll	mesh_sweep	middleware_stub	crates/win32-rt/src/misc/physx3c
 powrprof.dll	CallNtPowerInformation	stub	crates/win32-rt/src/misc/powrprof.rs	468	"CallNtPowerInformation(level={info_level}) -> STATUS_NOT_IMPLEMENTED"
 powrprof.dll	PowerRegisterSuspendResumeNotification	stub	crates/win32-rt/src/misc/powrprof.rs	533	"PowerRegisterSuspendResumeNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS wake callback not armed)"
 powrprof.dll	PowerSettingRegisterNotification	stub	crates/win32-rt/src/misc/powrprof.rs	604	"PowerSettingRegisterNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS setting callback not armed)"
-shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1733	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
+shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1748	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
 ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	940	"_getch returns EOF"
 ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
 ucrtbase.dll	open_host_path	stub	crates/win32-rt/src/ucrt/stdio.rs	210	"Unicode text modes (0x{oflag:x}) treated as plain text mode"

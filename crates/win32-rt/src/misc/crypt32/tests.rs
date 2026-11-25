@@ -5191,6 +5191,41 @@ fn macos_trust_store_and_extended_chain_policies() {
             TRUE
         );
         assert_eq!(status.dw_error, 0);
+        // CERT_CHAIN_POLICY_NT_AUTH must ALSO enforce BASIC_CONSTRAINTS flags (e.g. requiring
+        // END_ENTITY on a CA leaf fails with TRUST_E_BASIC_CONSTRAINTS, while CA_FLAG passes).
+        let nt_ee_para = CertChainPolicyPara {
+            cb_size: std::mem::size_of::<CertChainPolicyPara>() as u32,
+            dw_flags: 0x4000_0000, // BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG
+            pv_extra_policy_para: std::ptr::null(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_NT_AUTH as *const u8,
+                trusted_chain,
+                &nt_ee_para as *const _ as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            status.dw_error, 0x8009_6019, // TRUST_E_BASIC_CONSTRAINTS
+            "NT_AUTH must enforce BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG"
+        );
+        let nt_ca_para = CertChainPolicyPara {
+            cb_size: std::mem::size_of::<CertChainPolicyPara>() as u32,
+            dw_flags: 0x8000_0000, // BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG
+            pv_extra_policy_para: std::ptr::null(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_NT_AUTH as *const u8,
+                trusted_chain,
+                &nt_ca_para as *const _ as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0);
         // Delete from NTAUTH -> must immediately revoke NT_AUTH authorization AND not reappear on reopen
         assert_eq!(CertDeleteCertificateFromStore(ntauth_ctx), TRUE);
         assert_eq!(
