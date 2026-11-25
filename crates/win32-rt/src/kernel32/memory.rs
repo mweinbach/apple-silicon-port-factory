@@ -363,9 +363,11 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
     }
     if ty & MEM_WRITE_WATCH != 0 {
         stub!("MEM_WRITE_WATCH not tracked");
+        return Err(err::ERROR_NOT_SUPPORTED);
     }
     if prot & PAGE_GUARD != 0 {
-        stub!("PAGE_GUARD not emulated (treated as normal pages)");
+        stub!("PAGE_GUARD not emulated");
+        return Err(if prot & 0xff == PAGE_NOACCESS { err::ERROR_INVALID_PARAMETER } else { err::ERROR_NOT_SUPPORTED });
     }
     if ty & MEM_RESET != 0 {
         discard_host_pages(addr, size);
@@ -392,7 +394,7 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
         }
         return Ok(addr);
     }
-    if ty & (MEM_RESERVE | MEM_RESERVE_PLACEHOLDER) != 0 {
+    if ty & (MEM_RESERVE | MEM_RESERVE_PLACEHOLDER) != 0 || (addr == 0 && ty & MEM_COMMIT != 0) {
         let a = addr & !(GRANULARITY - 1);
         let sz = ((addr + size + PAGE - 1) & !(PAGE - 1)) - if addr != 0 { a } else { 0 };
         let base = reserve_aligned(a, sz, align).ok_or(if addr != 0 { err::ERROR_INVALID_ADDRESS } else { err::ERROR_NOT_ENOUGH_MEMORY })?;
@@ -602,20 +604,16 @@ pub unsafe extern "win64" fn GetWriteWatch(
     _base: *mut c_void,
     _region_size: usize,
     _addresses: *mut *mut c_void,
-    count: *mut usize,
-    granularity: *mut u32,
+    _count: *mut usize,
+    _granularity: *mut u32,
 ) -> u32 {
-    if !count.is_null() {
-        *count = 0;
-    }
-    if !granularity.is_null() {
-        *granularity = PAGE as u32;
-    }
-    0
+    // There are no successfully registered watch regions. An empty successful
+    // result would tell a collector it can discard every intervening write.
+    err::ERROR_INVALID_PARAMETER
 }
 
 pub unsafe extern "win64" fn ResetWriteWatch(_base: *mut c_void, _region_size: usize) -> u32 {
-    0
+    err::ERROR_INVALID_PARAMETER
 }
 
 pub unsafe extern "win64" fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> BOOL {
@@ -672,12 +670,22 @@ pub fn hpage_had_prot_change(hpage: usize) -> bool {
 }
 
 pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot: u32, old: *mut u32) -> BOOL {
+    if old.is_null() || size == 0 {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     let start = addr as usize & !(PAGE - 1);
-    let end = (addr as usize + size + PAGE - 1) & !(PAGE - 1);
+    let Some(last) = (addr as usize).checked_add(size - 1).filter(|&v| v <= usize::MAX - HOST_PAGE) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_ADDRESS);
+        return FALSE;
+    };
+    let end = (last & !(PAGE - 1)) + PAGE;
     if prot & PAGE_GUARD != 0 {
         stub!("PAGE_GUARD not emulated");
+        crate::teb::set_last_error(if prot & 0xff == PAGE_NOACCESS { err::ERROR_INVALID_PARAMETER } else { err::ERROR_NOT_SUPPORTED });
+        return FALSE;
     }
-    let prev = query(start).map(|i| i.protect).unwrap_or(PAGE_READWRITE);
+    let mut prev = query(start).map(|i| i.protect).unwrap_or(PAGE_READWRITE);
     if memdiag() && (prot | prev) & 0xF0 != 0 {
         memdiag_log(format_args!("VirtualProtect({addr:p}, {size:#x}, {prot:#x}) prev={prev:#x}"));
     }
@@ -685,8 +693,15 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
     let mut deferred_noaccess_sibling = false;
     let mprotect_rc = {
         let mut vm = VM.lock().unwrap();
-        if vm.alloc_containing(start).is_some() {
-            vm.set_range(start, end, MEM_COMMIT, prot);
+        let tracked = vm.alloc_containing(start);
+        if let Some((base, alloc)) = tracked {
+            let first = vm.segs.range(..=start).next_back().map(|(_, s)| s);
+            if end > base + alloc.size || !first.is_some_and(|s| s.end > start && s.state == MEM_COMMIT)
+                || vm.segs.range(start..end).any(|(_, s)| s.state != MEM_COMMIT) {
+                crate::teb::set_last_error(err::ERROR_INVALID_ADDRESS);
+                return FALSE;
+            }
+            prev = first.unwrap().prot;
         }
         // On 16 KiB host pages (Apple Silicon), if a sub-host-page non-writable
         // VirtualProtect (e.g. PAGE_EXECUTE_READ after decrypting one 4 KiB page)
@@ -699,7 +714,7 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
             let mut sub = hbase;
             while sub < hbase + HOST_PAGE {
                 if let Some((&_s, seg)) = vm.segs.range(..=sub).next_back() {
-                    if sub < seg.end && seg.state == MEM_COMMIT && (seg.prot == PAGE_NOACCESS || (seg.prot & PAGE_GUARD) != 0) {
+                    if !(start..end).contains(&sub) && sub < seg.end && seg.state == MEM_COMMIT && (seg.prot == PAGE_NOACCESS || (seg.prot & PAGE_GUARD) != 0) {
                         deferred_noaccess_sibling = true;
                         break;
                     }
@@ -720,15 +735,17 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
         }
         // Keep `host_mprotect` serialized under `VM` so concurrent VirtualProtect calls
         // on sibling 4 KiB sub-pages within one 16 KiB host page cannot apply out of order.
-        host_mprotect(start, end - start, host_prot)
+        let rc = host_mprotect(start, end - start, host_prot);
+        if rc == 0 && tracked.is_some() {
+            vm.set_range(start, end, MEM_COMMIT, prot);
+        }
+        rc
     };
     if mprotect_rc != 0 {
         crate::teb::set_last_error(err::ERROR_INVALID_ADDRESS);
         return FALSE;
     }
-    if !old.is_null() {
-        *old = if prev == 0 { PAGE_NOACCESS } else { prev };
-    }
+    old.write_unaligned(if prev == 0 { PAGE_NOACCESS } else { prev });
     if is_exec(prot) || is_exec(prev) {
         note_code_region(start, end);
     }

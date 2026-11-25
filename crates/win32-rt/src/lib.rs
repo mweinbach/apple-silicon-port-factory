@@ -362,19 +362,25 @@ pub enum WsaExtension {
     DisconnectEx = 2,
     TransmitFile = 3,
     GetAcceptExSockaddrs = 4,
+    RecvMsg = 5,
+    SendMsg = 6,
 }
 
 impl WsaExtension {
-    pub const ALL: [WsaExtension; 5] = [
+    pub const ALL: [WsaExtension; 7] = [
         WsaExtension::AcceptEx,
         WsaExtension::ConnectEx,
         WsaExtension::DisconnectEx,
         WsaExtension::TransmitFile,
         WsaExtension::GetAcceptExSockaddrs,
+        WsaExtension::RecvMsg,
+        WsaExtension::SendMsg,
     ];
 
     pub const fn symbol_name(self) -> &'static str {
         match self {
+            WsaExtension::RecvMsg => "ws2_32!WSARecvMsg",
+            WsaExtension::SendMsg => "ws2_32!WSASendMsg",
             WsaExtension::AcceptEx => "ws2_32!AcceptEx",
             WsaExtension::ConnectEx => "ws2_32!ConnectEx",
             WsaExtension::DisconnectEx => "ws2_32!DisconnectEx",
