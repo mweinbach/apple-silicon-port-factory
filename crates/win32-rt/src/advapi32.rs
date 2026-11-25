@@ -3360,6 +3360,29 @@ unsafe fn capi_salt_from_flags(
     }
 }
 
+fn capi_pkcs5_pad(data: &[u8], bs: usize) -> Vec<u8> {
+    let pad = bs - (data.len() % bs);
+    let mut out = Vec::with_capacity(data.len() + pad);
+    out.extend_from_slice(data);
+    out.resize(data.len() + pad, pad as u8);
+    out
+}
+
+fn capi_pkcs5_unpad(mut data: Vec<u8>, bs: usize) -> Result<Vec<u8>, u32> {
+    if data.is_empty() || data.len() % bs != 0 {
+        return Err(NTE_BAD_DATA);
+    }
+    let pad = *data.last().unwrap() as usize;
+    if pad == 0 || pad > bs || pad > data.len() {
+        return Err(NTE_BAD_DATA);
+    }
+    if data[data.len() - pad..].iter().any(|&b| b as usize != pad) {
+        return Err(NTE_BAD_DATA);
+    }
+    data.truncate(data.len() - pad);
+    Ok(data)
+}
+
 fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<Vec<u8>, u32> {
     let required = if encrypt {
         CRYPT_ENCRYPT | CRYPT_EXPORT_KEY
@@ -3388,11 +3411,41 @@ fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<
         return Ok(Rc4State::new(&eff_key).apply(data));
     }
     let bs = alg.block_size();
-    let use_pkcs7 = *padding == PKCS5_PADDING && matches!(*mode, BcCipherMode::Ecb | BcCipherMode::Cbc);
-    if *mode != BcCipherMode::Cfb && (!encrypt || !use_pkcs7) && data.len() % bs != 0 {
+    let use_pkcs7 = *padding == PKCS5_PADDING;
+    if (*mode != BcCipherMode::Cfb || (!encrypt && use_pkcs7)) && (!encrypt || !use_pkcs7) && data.len() % bs != 0 {
         return Err(NTE_BAD_DATA);
     }
     let mut iv_work = iv.clone();
+    if *mode == BcCipherMode::Cfb && use_pkcs7 {
+        if encrypt {
+            let padded = capi_pkcs5_pad(data, bs);
+            return crate::misc::bcrypt::sym_crypt_block_mode(
+                *alg,
+                *mode,
+                true,
+                false,
+                &eff_key,
+                *effective_key_len,
+                &mut iv_work,
+                *msg_block_len as usize,
+                &padded,
+            )
+            .map_err(|_| NTE_BAD_DATA);
+        }
+        let plain = crate::misc::bcrypt::sym_crypt_block_mode(
+            *alg,
+            *mode,
+            false,
+            false,
+            &eff_key,
+            *effective_key_len,
+            &mut iv_work,
+            *msg_block_len as usize,
+            data,
+        )
+        .map_err(|_| NTE_BAD_DATA)?;
+        return capi_pkcs5_unpad(plain, bs);
+    }
     crate::misc::bcrypt::sym_crypt_block_mode(
         *alg,
         *mode,
@@ -4762,11 +4815,13 @@ pub unsafe extern "win64" fn CryptEncrypt(
             rc4,
         } => {
             let bs = alg.block_size();
-            let use_pkcs7 = is_final && *padding == PKCS5_PADDING && matches!(*mode, BcCipherMode::Ecb | BcCipherMode::Cbc);
-            let need = if *alg == SymAlg::Rc4 || *mode == BcCipherMode::Cfb {
+            let use_pkcs7 = *alg != SymAlg::Rc4 && is_final && *padding == PKCS5_PADDING;
+            let need = if *alg == SymAlg::Rc4 {
                 in_len
             } else if use_pkcs7 {
                 ((in_len / bs) + 1) * bs
+            } else if *mode == BcCipherMode::Cfb {
+                in_len
             } else {
                 if in_len % bs != 0 {
                     return err(NTE_BAD_DATA, FALSE);
@@ -4797,16 +4852,25 @@ pub unsafe extern "win64" fn CryptEncrypt(
                 r
             } else {
                 let mut iv_work = running_iv.clone();
+                let (cfb_padded, call_pkcs7);
+                let input_slice: &[u8] = if *mode == BcCipherMode::Cfb && use_pkcs7 {
+                    cfb_padded = capi_pkcs5_pad(&pt, bs);
+                    call_pkcs7 = false;
+                    &cfb_padded
+                } else {
+                    call_pkcs7 = use_pkcs7;
+                    &pt
+                };
                 let res = crate::misc::bcrypt::sym_crypt_block_mode(
                     *alg,
                     *mode,
                     true,
-                    use_pkcs7,
+                    call_pkcs7,
                     &eff_key,
                     *effective_key_len,
                     &mut iv_work,
                     *msg_block_len as usize,
-                    &pt,
+                    input_slice,
                 );
                 let Ok(v) = res else {
                     return err(NTE_BAD_DATA, FALSE);
@@ -4901,16 +4965,17 @@ pub unsafe extern "win64" fn CryptDecrypt(
                 r
             } else {
                 let bs = alg.block_size();
-                let use_pkcs7 = is_final && *padding == PKCS5_PADDING && matches!(*mode, BcCipherMode::Ecb | BcCipherMode::Cbc);
-                if *mode != BcCipherMode::Cfb && ct.len() % bs != 0 {
+                let use_pkcs7 = is_final && *padding == PKCS5_PADDING;
+                if (*mode != BcCipherMode::Cfb || use_pkcs7) && ct.len() % bs != 0 {
                     return err(NTE_BAD_DATA, FALSE);
                 }
                 let mut iv_work = running_iv.clone();
+                let call_pkcs7 = use_pkcs7 && *mode != BcCipherMode::Cfb;
                 let res = crate::misc::bcrypt::sym_crypt_block_mode(
                     *alg,
                     *mode,
                     false,
-                    use_pkcs7,
+                    call_pkcs7,
                     &eff_key,
                     *effective_key_len,
                     &mut iv_work,
@@ -4919,6 +4984,14 @@ pub unsafe extern "win64" fn CryptDecrypt(
                 );
                 let Ok(v) = res else {
                     return err(NTE_BAD_DATA, FALSE);
+                };
+                let v = if *mode == BcCipherMode::Cfb && use_pkcs7 {
+                    match capi_pkcs5_unpad(v, bs) {
+                        Ok(u) => u,
+                        Err(e) => return err(e, FALSE),
+                    }
+                } else {
+                    v
                 };
                 if is_final {
                     *running_iv = iv.clone();
@@ -7001,6 +7074,30 @@ mod tests {
             assert_eq!(flen, 32);
             assert_eq!(CryptDecrypt(h_aes_unwrapped, 0, TRUE, 0, full.as_mut_ptr(), &mut flen), TRUE);
             assert_eq!(&full[..flen as usize], msg_pad);
+
+            // 4a. CRYPT_MODE_CFB final-block PKCS#5 padding (including extra block for 16-byte input)
+            let mut h_cfb = 0usize;
+            assert_eq!(CryptDuplicateKey(h_aes_unwrapped, std::ptr::null(), 0, &mut h_cfb), TRUE);
+            let cfb_mode = CRYPT_MODE_CFB;
+            assert_eq!(CryptSetKeyParam(h_cfb, KP_MODE, &cfb_mode as *const u32 as *const u8, 0), TRUE);
+            assert_eq!(CryptSetKeyParam(h_cfb, KP_IV, iv.as_ptr(), 0), TRUE);
+            let mut cfb_qlen = 16u32;
+            assert_eq!(CryptEncrypt(h_cfb, 0, TRUE, 0, std::ptr::null_mut(), &mut cfb_qlen, 0), TRUE);
+            assert_eq!(cfb_qlen, 32, "16-byte final AES-CFB plaintext must pad to 32 bytes in CAPI");
+            let mut cfb_buf = vec![0u8; 32];
+            cfb_buf[..16].copy_from_slice(&pt);
+            let mut cfb_len = 16u32;
+            assert_eq!(CryptEncrypt(h_cfb, 0, TRUE, 0, cfb_buf.as_mut_ptr(), &mut cfb_len, 32), TRUE);
+            assert_eq!(cfb_len, 32);
+            assert_eq!(CryptDecrypt(h_cfb, 0, TRUE, 0, cfb_buf.as_mut_ptr(), &mut cfb_len), TRUE);
+            assert_eq!(cfb_len, 16);
+            assert_eq!(&cfb_buf[..16], pt.as_slice());
+            // Invalid padding on CFB final decrypt must fail with NTE_BAD_DATA
+            let mut bad_cfb = vec![0xFFu8; 16];
+            let mut bad_cfb_len = 16u32;
+            assert_eq!(CryptDecrypt(h_cfb, 0, TRUE, 0, bad_cfb.as_mut_ptr(), &mut bad_cfb_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+            assert_eq!(CryptDestroyKey(h_cfb), TRUE);
 
             // 4b. Encrypted PRIVATEKEYBLOB export/import with session wrapping key (hExpKey != 0)
             let mut enc_priv_len = 0u32;

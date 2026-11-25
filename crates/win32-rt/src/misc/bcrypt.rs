@@ -3790,7 +3790,11 @@ unsafe fn bcrypt_crypt(
     let pkcs7 = (flags & BCRYPT_BLOCK_PADDING) != 0;
 
     // Size-query path (output == NULL): return exact required output buffer size without mutating state.
-    if output.is_null() {
+    // Per Microsoft Learn (BCryptEncrypt/BCryptDecrypt), empty-message AES-GCM/AES-CCM calls
+    // (pbInput == NULL, cbInput == 0, pbOutput == NULL, cbOutput == 0) must still run AEAD tag
+    // generation / verification rather than short-circuiting as a size query.
+    let is_aead_empty = matches!(mode, CipherMode::Gcm | CipherMode::Ccm) && in_slice.is_empty();
+    if output.is_null() && !is_aead_empty {
         let need = match (alg, mode) {
             (SymAlg::Rc4, _) => in_slice.len(),
             (_, CipherMode::Ecb | CipherMode::Cbc) => {
@@ -5622,6 +5626,97 @@ mod tests {
                     dec.as_mut_ptr(),
                     dec.len() as u32,
                     &mut out_len,
+                    0,
+                ),
+                STATUS_AUTH_TAG_MISMATCH
+            );
+
+            // Zero-length AES-CCM with NULL input & NULL output must still generate & verify auth tag
+            let mut empty_tag = [0u8; 8];
+            let mut empty_auth = BcryptAuthCipherModeInfo {
+                cb_size: std::mem::size_of::<BcryptAuthCipherModeInfo>() as u32,
+                dw_info_version: 1,
+                pb_nonce: nonce.as_mut_ptr(),
+                cb_nonce: nonce.len() as u32,
+                pb_auth_data: aad.as_ptr() as *mut u8,
+                cb_auth_data: aad.len() as u32,
+                pb_tag: empty_tag.as_mut_ptr(),
+                cb_tag: 8,
+                pb_mac_context: std::ptr::null_mut(),
+                cb_mac_context: 0,
+                cb_aad: 0,
+                cb_data: 0,
+                dw_flags: 0,
+            };
+            let mut empty_out_len = 99u32;
+            assert_eq!(
+                BCryptEncrypt(
+                    h_ccm,
+                    std::ptr::null(),
+                    0,
+                    &mut empty_auth as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut empty_out_len,
+                    0,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(empty_out_len, 0);
+            assert_ne!(empty_tag, [0u8; 8]);
+            assert_eq!(
+                BCryptDecrypt(
+                    h_ccm,
+                    std::ptr::null(),
+                    0,
+                    &mut empty_auth as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut empty_out_len,
+                    0,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(empty_out_len, 0);
+            // Tampered tag on zero-length NULL-buffer CCM decrypt MUST fail
+            let mut bad_empty_tag = empty_tag;
+            bad_empty_tag[0] ^= 0xFF;
+            empty_auth.pb_tag = bad_empty_tag.as_mut_ptr();
+            assert_eq!(
+                BCryptDecrypt(
+                    h_ccm,
+                    std::ptr::null(),
+                    0,
+                    &mut empty_auth as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut empty_out_len,
+                    0,
+                ),
+                STATUS_AUTH_TAG_MISMATCH
+            );
+            // Valid tag with tampered AAD MUST also fail
+            empty_auth.pb_tag = empty_tag.as_mut_ptr();
+            let mut bad_aad = aad.clone();
+            bad_aad[0] ^= 0x01;
+            empty_auth.pb_auth_data = bad_aad.as_mut_ptr();
+            assert_eq!(
+                BCryptDecrypt(
+                    h_ccm,
+                    std::ptr::null(),
+                    0,
+                    &mut empty_auth as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut empty_out_len,
                     0,
                 ),
                 STATUS_AUTH_TAG_MISMATCH
