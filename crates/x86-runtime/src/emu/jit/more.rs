@@ -293,16 +293,39 @@ impl Tr<'_> {
                     if src_256 {
                         self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s);
                     }
-                    let rmode = (op.imm as u8) & 3;
-                    if rmode != 0 {
-                        self.a.v_frint(false, rmode, 0, 0);
+                    let imm = op.imm as u8;
+                    if (imm & 4) != 0 {
+                        // imm8[2]=1: use MXCSR.RC (already installed in FPCR.RMode).
+                        self.a.v_fcvtn_h(false, 0, 0);
                         if src_256 {
-                            self.a.v_frint(false, rmode, 1, 1);
+                            self.a.v_fcvtn_h(true, 0, 1);
                         }
-                    }
-                    self.a.v_fcvtn_h(false, 0, 0);
-                    if src_256 {
-                        self.a.v_fcvtn_h(true, 0, 1);
+                    } else {
+                        // imm8[2]=0: override FPCR.RMode from imm8[1:0] without touching NZCV or flush bits.
+                        let arm_rm: u64 = match imm & 3 {
+                            0 => 0, // RN
+                            1 => 2, // RM (-inf)
+                            2 => 1, // RP (+inf)
+                            _ => 3, // RZ (0)
+                        };
+                        self.a.mrs_fpcr(T0);
+                        self.a.mov_imm(true, T2, !(3u64 << 22));
+                        self.a.logic_rr(true, 0, T1, T0, T2, 0, 0);
+                        if arm_rm != 0 {
+                            self.a.mov_imm(true, T2, arm_rm << 22);
+                            self.a.logic_rr(true, 1, T1, T1, T2, 0, 0);
+                        }
+                        self.a.logic_rr(true, 2, T2, T0, T1, 0, 0);
+                        let same_pre = self.a.cbz(true, T2);
+                        self.a.msr_fpcr(T1);
+                        self.a.bind(same_pre);
+                        self.a.v_fcvtn_h(false, 0, 0);
+                        if src_256 {
+                            self.a.v_fcvtn_h(true, 0, 1);
+                        }
+                        let same_post = self.a.cbz(true, T2);
+                        self.a.msr_fpcr(T0);
+                        self.a.bind(same_post);
                     }
                     if mem {
                         let a = self.addr_into(op, XA);
@@ -1601,6 +1624,7 @@ impl Tr<'_> {
     pub(super) fn emit_pcmpstr_op(&mut self, k: usize, op: &FastOp) {
         let is_exp = (op.x & 1) != 0;
         let is_msk = (op.x & 2) != 0;
+        let is_vex = (op.x & 4) != 0;
         let mem = (op.x & 0x20) != 0;
         let imm = op.imm as u8;
         let is_words = (imm & 1) != 0;
@@ -1822,7 +1846,9 @@ impl Tr<'_> {
                 }
             }
             self.xwrite(0, 0);
-            self.clear_ymm_hi(0);
+            if is_vex {
+                self.clear_ymm_hi(0);
+            }
         } else {
             let zero_res = self.a.cbz(false, T2);
             if (imm & 0x40) != 0 {

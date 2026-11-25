@@ -302,6 +302,8 @@ pub(super) const VS_BLENDPD: u8 = 50; // qword blend by imm8[1:0] (upper lane us
 pub(super) const VS_INSERTPS: u8 = 51; // insertps reg form
 pub(super) const VS_INSERTPS_M: u8 = 52; // insertps mem form (count_s = 0)
 pub(super) const VS_DDUP: u8 = 53; // movddup (b[63:0] duplicated)
+pub(super) const VS_VPERMILPD_I: u8 = 54; // b[imm[0]], b[imm[1]] (upper lane uses imm >> 2)
+pub(super) const VS_VPERMILPD: u8 = 55; // a permuted by (b >> 1) & 1 per qword lane
 
 // K_VINT_* sub-ops (all lane-wise on a, b).
 pub(super) const VI_PADDB: u8 = 0;

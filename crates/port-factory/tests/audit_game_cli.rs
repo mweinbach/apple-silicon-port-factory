@@ -472,7 +472,7 @@ fn readiness_uses_real_dispatch_and_classifies_every_import() {
         0x64, 0x48, 0x8b, 0x00, // same Code, FS address falls back
         0xd9, 0xe8, // fld1, generic x87
         0x0f, 0x01, 0xee, // rdpkru, exit 86 if reached
-        0xc4, 0xe2, 0x71, 0x90, 0x04, 0x90, // vpgatherdd: catalog JIT claim has no handler
+        0xc4, 0xe2, 0x71, 0x90, 0x04, 0x90, // vpgatherdd: generic AVX2 gather handler
         0xcc, 0x0f, 0x0b, 0xc3, // guest traps and ret
     ];
     let image = build_synthetic_pe(
@@ -524,18 +524,13 @@ fn readiness_uses_real_dispatch_and_classifies_every_import() {
         Some("unimplemented")
     );
     let gather = op("vpgatherdd");
-    assert_eq!(gather.get("kind").unwrap().as_str(), Some("unimplemented"));
-    // Advertisement follows the guest CPU contract and can legitimately change independently.
-    let has_avx2 = x86_runtime::simd_ops::cpuid_x64(7, 0).1 & (1 << 5) != 0;
-    let features = gather
+    assert_eq!(gather.get("kind").unwrap().as_str(), Some("interpreter_only"));
+    assert!(gather
         .get("advertised_but_unimplemented")
         .unwrap()
         .as_array()
-        .unwrap();
-    assert_eq!(
-        features.iter().any(|v| v.as_str() == Some("AVX2")),
-        has_avx2
-    );
+        .unwrap()
+        .is_empty());
     assert_eq!(
         op("int3").get("kind").unwrap().as_str(),
         Some("guest_boundary")

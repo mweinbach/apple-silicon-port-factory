@@ -29,6 +29,25 @@ pub unsafe fn wide_slice<'a>(p: *const u16) -> &'a [u16] {
     std::slice::from_raw_parts(p, wcslen(p))
 }
 
+/// Read a NUL-terminated UTF-16 string into a `Vec<u16>` using unaligned reads.
+/// Safe for arbitrary x86-64 guest pointers that may not be 2-byte aligned.
+pub unsafe fn wide_vec_unaligned(p: *const u16) -> Vec<u16> {
+    if p.is_null() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let u = p.add(i).read_unaligned();
+        if u == 0 {
+            break;
+        }
+        out.push(u);
+        i += 1;
+    }
+    out
+}
+
 pub unsafe fn cstr_slice<'a>(p: *const u8) -> &'a [u8] {
     if p.is_null() {
         return &[];
