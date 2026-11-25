@@ -109,8 +109,8 @@ enum X87ColdKind {
     CmpMem { w: u8, flags: u8 },
     /// `ftst`.
     Ftst,
-    /// `fcmov*` when condition is true and either slot is empty.
-    FcmovTrue { idx: u8 },
+    /// `fcmov*` when either `ST(0)` or `ST(idx)` is empty (condition in `w6`).
+    FcmovFault { idx: u8 },
 }
 
 /// Helper: emit `bl` to the block-local `x87_trampoline` (patched once in `emit_x87_colds`).
@@ -1027,12 +1027,10 @@ impl Tr<'_> {
                 let (tk, td, std) = (self.x87_top_known, self.x87_top_dirty, self.x87_sw_top_dirty);
                 let mut cold_sites = Vec::new();
                 self.load_x87_state();
-                // Always clear SW.C1 even when condition is false.
+                // Always clear SW.C1 and validate both ST(0) and ST(idx) BEFORE testing cond (T6).
                 self.a.ldr(16, T0, XA, OFF_X87_SW);
                 self.a.logic_ri(false, 0, T0, T0, enc_logic_imm(!(SW_C1 as u64), false).unwrap());
                 self.a.str(16, T0, XA, OFF_X87_SW);
-                let skip_move = self.a.cbz(false, T6);
-                // Condition is true: check both p0 and pi valid, else cold helper `h_fcmov(st, idx, 1)`.
                 self.emit_slot_ptr(XA, 0, T1, T2);
                 self.emit_slot_ptr(XA, op.r0, T3, T4);
                 self.a.ldr(8, T5, XA, OFF_X87_VALID);
@@ -1043,6 +1041,7 @@ impl Tr<'_> {
                 self.a.logic_rr(false, 0, T2, T5, T0, 0, 0);
                 self.a.addsub_rr(false, true, true, ZR, T2, T0, 0);
                 cold_sites.push(self.a.bcond(NE));
+                let skip_move = self.a.cbz(false, T6);
                 if op.r0 != 0 {
                     self.a.ldr(128, 0, T3, 0);
                     self.a.str(128, 0, T1, 0);
@@ -1055,7 +1054,7 @@ impl Tr<'_> {
                     top_known: tk,
                     top_dirty: td,
                     sw_top_dirty: std,
-                    kind: X87ColdKind::FcmovTrue { idx: op.r0 },
+                    kind: X87ColdKind::FcmovFault { idx: op.r0 },
                 });
             }
             X87_FBLD => {
@@ -1858,9 +1857,9 @@ impl Tr<'_> {
                     self.a.movz(false, T2, 1, 0); // signaling=true, pops=0
                     self.emit_call_x87_helper(H_COMPARE_F64);
                 }
-                X87ColdKind::FcmovTrue { idx } => {
+                X87ColdKind::FcmovFault { idx } => {
                     self.a.movz(false, T1, idx as u32, 0);
-                    self.a.movz(false, T2, 1, 0);
+                    self.a.mov_rr(false, T2, T6);
                     self.emit_call_x87_helper(H_FCMOV);
                 }
             }

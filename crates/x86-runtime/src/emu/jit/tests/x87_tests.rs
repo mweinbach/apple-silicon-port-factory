@@ -1718,3 +1718,61 @@ fn x87_mixed_qnan_snan_prefers_qnan() {
     assert_eq!(rd_m80(112), (0xFFFF_FFFF_FFFF_FFFF, 0x7FFF));
     assert_ne!(rd_sw(68) & SW_IE, 0);
 }
+
+/// 13. Regression: `fcmov*` must validate both `ST(0)` and `ST(i)` BEFORE checking the
+/// condition, raising `SW.IE | SW.SF` and storing indefinite QNaN to `ST(0)` on any empty slot.
+#[test]
+fn x87_fcmov_validates_both_operands_before_condition() {
+    let _guard = X87Guard::new();
+    let init = vec![0u8; 256];
+    let code = assemble(|a| {
+        // Case 1: ST(0) empty, ST(7) valid (1.0), CF=1 (cond true) -> IE|SF + QNAN_INDEF
+        a.fninit().unwrap();
+        a.fld1().unwrap();
+        a.fincstp().unwrap(); // ST(0) is now empty, ST(7) holds 1.0
+        a.stc().unwrap();
+        a.fcmovb(st0, st7).unwrap();
+        a.fnstsw(word_ptr(rcx)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 16)).unwrap();
+
+        // Case 2: both empty, CF=0 (cond false) -> still raises IE|SF + QNAN_INDEF
+        a.fninit().unwrap();
+        a.clc().unwrap();
+        a.fcmovb(st0, st1).unwrap();
+        a.fnstsw(word_ptr(rcx + 2)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 32)).unwrap();
+
+        // Case 3: ST(0) valid (1.0), ST(1) empty, CF=0 (cond false) -> raises IE|SF + QNAN_INDEF
+        a.fninit().unwrap();
+        a.fld1().unwrap();
+        a.clc().unwrap();
+        a.fcmovb(st0, st1).unwrap();
+        a.fnstsw(word_ptr(rcx + 4)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 48)).unwrap();
+
+        // Case 4: ST(0) empty, ST(7) valid (1.0), CF=0 (cond false) -> raises IE|SF + QNAN_INDEF
+        a.fninit().unwrap();
+        a.fld1().unwrap();
+        a.fincstp().unwrap();
+        a.clc().unwrap();
+        a.fcmovb(st0, st7).unwrap();
+        a.fnstsw(word_ptr(rcx + 6)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 64)).unwrap();
+    });
+
+    let r = run_diff_x87("fcmov_operand_validation", &code, &init);
+    let rd_sw = |off: usize| u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap());
+    let rd_m80 = |off: usize| -> (u64, u16) {
+        (
+            u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()),
+            u16::from_le_bytes(r.data[off + 8..off + 10].try_into().unwrap()),
+        )
+    };
+    const SW_IE_SF: u16 = 0x0041;
+    const INDEF: (u64, u16) = (0xC000_0000_0000_0000, 0xFFFF);
+
+    for (idx, (sw_off, m80_off)) in [(0, 16), (2, 32), (4, 48), (6, 64)].into_iter().enumerate() {
+        assert_eq!(rd_sw(sw_off) & SW_IE_SF, SW_IE_SF, "case {idx} must set IE|SF");
+        assert_eq!(rd_m80(m80_off), INDEF, "case {idx} must write QNAN_INDEF to ST(0)");
+    }
+}

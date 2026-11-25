@@ -1451,22 +1451,20 @@ impl X87State {
         self.sync_top();
     }
 
-    /// `fcmov*` when condition is `cond_met`: copies `ST(idx)` to `ST(0)` if `cond_met`.
+    /// `fcmov*` when condition is `cond_met`: validates both `ST(0)` and `ST(idx)` before
+    /// checking `cond_met`, then copies `ST(idx)` to `ST(0)` if `cond_met`.
     #[inline]
     pub(super) fn fcmov(&mut self, idx: u8, cond_met: bool) {
         let p0 = self.phys(0);
         let pi = self.phys(idx & 7);
         self.sw &= !SW_C1;
-        if (self.valid_mask & (1 << pi)) == 0 {
-            if cond_met {
-                self.sw |= SW_SF | SW_IE;
-                self.set_slot_bytes(p0, Fp80::QNAN_INDEF_BYTES);
-                self.valid_mask |= 1 << p0;
-            }
+        if (self.valid_mask & (1 << p0)) == 0 || (self.valid_mask & (1 << pi)) == 0 {
+            self.sw |= SW_SF | SW_IE;
+            self.set_slot_bytes(p0, Fp80::QNAN_INDEF_BYTES);
+            self.valid_mask |= 1 << p0;
         } else if cond_met {
             let v = self.slot_bytes(pi);
             self.set_slot_bytes(p0, v);
-            self.valid_mask |= 1 << p0;
         }
         self.sync_top();
     }
