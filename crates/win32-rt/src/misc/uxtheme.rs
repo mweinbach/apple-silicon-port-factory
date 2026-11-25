@@ -659,6 +659,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
 
         let presented = crate::macos::task_dialog_alert(
             session_id,
+            dialog_hwnd,
             cur_caption,
             cur_body,
             labels.clone(),
@@ -700,9 +701,11 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 crate::macos::TaskDialogEvent::ButtonClicked(_) => {}
             },
         );
-        {
+        // Consume any programmatic TDM_CLICK_BUTTON triggered while the native modal was open
+        // so it is delivered exactly once and never replayed if TDN_BUTTON_CLICKED returns S_FALSE.
+        let consumed_prog_click = {
             let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(dlg) = map.get_mut(&dialog_hwnd) {
+            map.get_mut(&dialog_hwnd).and_then(|dlg| {
                 dlg.modal_open = false;
                 if let Some(ref res) = presented {
                     dlg.selected_radio_idx = res.radio_index;
@@ -710,13 +713,16 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                         dlg.verified = res.verified;
                     }
                 }
-            }
-        }
+                dlg.pending_click_button.take()
+            })
+        };
         let (bid, interactive) = if let Some(res) = presented {
-            let bid = buttons
-                .get(res.button_index)
-                .map(|(id, _)| *id)
-                .unwrap_or(buttons[0].0);
+            let bid = consumed_prog_click.unwrap_or_else(|| {
+                buttons
+                    .get(res.button_index)
+                    .map(|(id, _)| *id)
+                    .unwrap_or(buttons[0].0)
+            });
             (bid, true)
         } else if buttons.len() == 1 && !has_selection_controls {
             // Pure single-button informational dialog with no selection controls can
@@ -1534,6 +1540,165 @@ mod tests {
             assert_eq!(crate::user32::window::IsWindow(unp_seen[0] as HWND), FALSE);
 
             let _ = crate::user32::window::DestroyWindow(parent_hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn task_dialog_consumes_live_programmatic_click_once_and_pumps_cross_thread_messages() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            // 1. Live TDM_CLICK_BUTTON from TDN_RADIO_BUTTON_CLICKED whose TDN_BUTTON_CLICKED
+            //    returns S_FALSE must NOT be replayed on the next presentation loop iteration.
+            static BUTTON_CLICKS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+            static VETO_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            static LIVE_DIALOG_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+            unsafe extern "win64" fn prog_click_cb(
+                hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                if msg == TDN_CREATED {
+                    LIVE_DIALOG_HWND.store(hwnd as usize, std::sync::atomic::Ordering::Release);
+                } else if msg == TDN_RADIO_BUTTON_CLICKED && wp == 201 {
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_BUTTON, 6, 0);
+                } else if msg == TDN_BUTTON_CLICKED {
+                    BUTTON_CLICKS.lock().unwrap().push(wp as i32);
+                    if VETO_FIRST.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return S_FALSE_HR;
+                    }
+                }
+                S_OK
+            }
+
+            let title_w = crate::strings::to_wide_z("ProgClick");
+            let r1 = crate::strings::to_wide_z("R1");
+            let r2 = crate::strings::to_wide_z("R2");
+            let radios = [
+                TaskDialogButton { button_id: 201, button_text: r1.as_ptr() },
+                TaskDialogButton { button_id: 202, button_text: r2.as_ptr() },
+            ];
+            let mut cfg: TaskDialogConfig = std::mem::zeroed();
+            cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg.dw_common_buttons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+            cfg.psz_window_title = title_w.as_ptr();
+            cfg.c_radio_buttons = radios.len() as u32;
+            cfg.p_radio_buttons = radios.as_ptr();
+            cfg.n_default_radio_button = 202;
+            cfg.pf_callback = prog_click_cb as *const () as usize;
+
+            BUTTON_CLICKS.lock().unwrap().clear();
+            VETO_FIRST.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut step = 0usize;
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |_cap, _body, _btns, _db, _rads, _dr, _vt, _vc, emit| {
+                    step += 1;
+                    if step == 1 {
+                        // Triggers TDM_CLICK_BUTTON(6) while modal_open == true.
+                        emit(crate::macos::TaskDialogEvent::RadioSelected(0));
+                        // Native modal exits with button_index 0 (IDYES = 6) due to stopModalWithCode.
+                        Some(crate::macos::TaskDialogAlertResult {
+                            button_index: 0,
+                            radio_index: Some(0),
+                            verified: false,
+                        })
+                    } else {
+                        // Second presentation must be reached (not bypassed by a stale pending click!).
+                        Some(crate::macos::TaskDialogAlertResult {
+                            button_index: 1, // IDNO = 7
+                            radio_index: Some(0),
+                            verified: false,
+                        })
+                    }
+                },
+            )));
+            let mut btn = 0;
+            let mut radio = 0;
+            let mut verified = FALSE;
+            assert_eq!(
+                TaskDialogIndirect(
+                    &cfg as *const TaskDialogConfig as *const u8,
+                    &mut btn,
+                    &mut radio,
+                    &mut verified,
+                ),
+                S_OK
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(btn, 7);
+            assert_eq!(BUTTON_CLICKS.lock().unwrap().clone(), vec![6, 7]);
+
+            // 2. Cross-thread SendMessageW to an open dialog HWND while the owner thread waits
+            //    in pump_task_dialog_wait_loop must be processed without deadlocking and push
+            //    the live content update + programmatic dismissal.
+            let dlg_hwnd = crate::user32::window::create_virtual_dialog_hwnd(
+                "#32770_TaskDialog",
+                "WaitTitle",
+                0,
+                task_dialog_wndproc_va(),
+            );
+            let sid = NEXT_TASK_DIALOG_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    dlg_hwnd,
+                    ActiveTaskDialog {
+                        session_id: sid,
+                        modal_open: true,
+                        hinst: 0,
+                        caption: "WaitTitle".to_string(),
+                        main_inst: String::new(),
+                        content: "Before".to_string(),
+                        expanded: String::new(),
+                        footer: String::new(),
+                        buttons: vec![(1, "OK".to_string())],
+                        radios: Vec::new(),
+                        selected_radio_idx: None,
+                        has_verification: false,
+                        verified: false,
+                        pending_click_button: None,
+                    },
+                );
+            let _guard = TaskDialogHwndGuard { hwnd: dlg_hwnd };
+            let (tx, rx) = std::sync::mpsc::channel::<crate::macos::TaskDialogEvent>();
+            let tx_upd = tx.clone();
+            let saw_text = std::sync::Arc::new(Mutex::new(String::new()));
+            let saw_text_hook = saw_text.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |u_sid, upd| {
+                if u_sid == sid {
+                    *saw_text_hook.lock().unwrap() = upd.text.clone();
+                    if let Some(bidx) = upd.click_button_idx {
+                        let _ = tx_upd.send(crate::macos::TaskDialogEvent::ButtonClicked(
+                            crate::macos::TaskDialogAlertResult {
+                                button_index: bidx,
+                                radio_index: None,
+                                verified: false,
+                            },
+                        ));
+                    }
+                }
+            })));
+            let worker = std::thread::spawn(move || {
+                let updated = crate::strings::to_wide_z("From Worker Thread");
+                let _ = crate::user32::message::SendMessageW(
+                    dlg_hwnd as HWND,
+                    TDM_SET_ELEMENT_TEXT,
+                    TDE_CONTENT,
+                    updated.as_ptr() as isize,
+                );
+                let _ = crate::user32::message::SendMessageW(dlg_hwnd as HWND, TDM_CLICK_BUTTON, 1, 0);
+            });
+            let mut noop = |_ev: crate::macos::TaskDialogEvent| {};
+            let res = crate::macos::pump_task_dialog_wait_loop(dlg_hwnd, rx, &mut noop);
+            worker.join().unwrap();
+            crate::macos::set_test_task_dialog_updater(None);
+            assert_eq!(res.map(|r| r.button_index), Some(0));
+            assert_eq!(saw_text.lock().unwrap().as_str(), "From Worker Thread");
         })
         .join()
         .unwrap();

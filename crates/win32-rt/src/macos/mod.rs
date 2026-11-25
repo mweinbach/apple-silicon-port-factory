@@ -475,13 +475,52 @@ pub struct TaskDialogLiveUpdate {
     pub click_button_idx: Option<usize>,
 }
 
+/// Service the owning Win32 thread's message queue (cross-thread `SendMessageW`
+/// sent items and any posted messages for `dialog_hwnd`) while waiting for live
+/// native modal events on `rx`.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn pump_task_dialog_wait_loop<F>(
+    dialog_hwnd: usize,
+    rx: std::sync::mpsc::Receiver<TaskDialogEvent>,
+    on_event: &mut F,
+) -> Option<TaskDialogAlertResult>
+where
+    F: FnMut(TaskDialogEvent),
+{
+    loop {
+        unsafe {
+            let mut msg = crate::user32::MSG::default();
+            // PeekMessageW always drains pending cross-thread sent messages first;
+            // also dispatch any posted messages addressed to the dialog HWND.
+            while crate::user32::message::PeekMessageW(
+                &mut msg,
+                dialog_hwnd as crate::types::HWND,
+                0,
+                0,
+                crate::user32::message::PM_REMOVE,
+            ) != 0
+            {
+                crate::user32::message::DispatchMessageW(&msg);
+            }
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(5)) {
+            Ok(TaskDialogEvent::ButtonClicked(res)) => return Some(res),
+            Ok(other) => on_event(other),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
 /// Show a modal task-dialog alert with push buttons plus optional radio buttons
 /// and verification checkbox, forwarding radio/checkbox selection changes live
 /// to `on_event` on the calling Win32 thread while the modal session is open.
+/// Also pumps cross-thread Win32 messages targeting `dialog_hwnd` while waiting.
 /// Returns `None` when headless / on iOS (no interactive selection UI available).
 #[allow(clippy::too_many_arguments)]
 pub fn task_dialog_alert<F>(
     session_id: u64,
+    dialog_hwnd: usize,
     caption: String,
     text: String,
     buttons: Vec<String>,
@@ -548,18 +587,13 @@ where
                 tx,
             );
         });
-        while let Ok(ev) = rx.recv() {
-            match ev {
-                TaskDialogEvent::ButtonClicked(res) => return Some(res),
-                other => on_event(other),
-            }
-        }
-        None
+        pump_task_dialog_wait_loop(dialog_hwnd, rx, &mut on_event)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (
             session_id,
+            dialog_hwnd,
             caption,
             text,
             buttons,
