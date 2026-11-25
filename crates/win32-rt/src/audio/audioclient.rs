@@ -1510,10 +1510,14 @@ mod client {
                 AUDCLNT_E_WRONG_ENDPOINT_TYPE
             }
         } else if iid == IID_IAudioClock {
-            std::ptr::write_unaligned(out, ClockObj::create(&CLOCK_VTBL, c) as *mut c_void);
+            std::ptr::write_unaligned(out, new_clock(c) as *mut c_void);
             S_OK
         } else if iid == IID_IAudioClock2 {
-            std::ptr::write_unaligned(out, Clock2Obj::create(&CLOCK2_VTBL, c) as *mut c_void);
+            let ck = new_clock(c);
+            std::ptr::write_unaligned(
+                out,
+                (ck as *mut u8).add(CLOCK2_IFACE_OFFSET) as *mut c_void,
+            );
             S_OK
         } else if iid == IID_ISimpleAudioVolume {
             std::ptr::write_unaligned(out, new_simple_audio_volume(session));
@@ -1962,7 +1966,7 @@ static CAPTURE_VTBL: IAudioCaptureClientVtbl = IAudioCaptureClientVtbl {
 };
 
 // ---------------------------------------------------------------------------
-// IAudioClock
+// IAudioClock (+ IAudioClock2 on a secondary vtable with shared COM identity)
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -1975,15 +1979,74 @@ pub struct IAudioClockVtbl {
     get_characteristics: unsafe extern "win64" fn(*mut ClockObj, *mut u32) -> HRESULT,
 }
 
-pub type ClockObj = ComObj<IAudioClockVtbl, Arc<ClientCore>>;
+#[repr(C)]
+pub struct IAudioClock2Vtbl {
+    qi: unsafe extern "win64" fn(*mut *const IAudioClock2Vtbl, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref: unsafe extern "win64" fn(*mut *const IAudioClock2Vtbl) -> u32,
+    release: unsafe extern "win64" fn(*mut *const IAudioClock2Vtbl) -> u32,
+    get_device_position: unsafe extern "win64" fn(*mut *const IAudioClock2Vtbl, *mut u64, *mut u64) -> HRESULT,
+}
+
+#[repr(C)]
+pub struct ClockInner {
+    clock2_vtbl: *const IAudioClock2Vtbl,
+    core: Arc<ClientCore>,
+}
+unsafe impl Send for ClockInner {}
+unsafe impl Sync for ClockInner {}
+
+pub type ClockObj = ComObj<IAudioClockVtbl, ClockInner>;
+
+const CLOCK2_IFACE_OFFSET: usize =
+    std::mem::offset_of!(ClockObj, inner) + std::mem::offset_of!(ClockInner, clock2_vtbl);
+
+fn new_clock(core: Arc<ClientCore>) -> *mut ClockObj {
+    register_vtbl_struct(&CLOCK2_VTBL);
+    ClockObj::create(
+        &CLOCK_VTBL,
+        ClockInner {
+            clock2_vtbl: &CLOCK2_VTBL,
+            core,
+        },
+    )
+}
 
 mod clock {
     use super::*;
-    crate::com_iunknown!(ClockObj, [IID_IAudioClock]);
+
+    pub unsafe extern "win64" fn qi(this: *mut ClockObj, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
+        let Some(iid) = GUID::read(riid) else {
+            return E_POINTER;
+        };
+        if iid == IID_IUnknown || iid == IID_IAudioClock {
+            ClockObj::add_ref(this);
+            std::ptr::write_unaligned(out, this as *mut c_void);
+            S_OK
+        } else if iid == IID_IAudioClock2 {
+            ClockObj::add_ref(this);
+            std::ptr::write_unaligned(out, (this as *mut u8).add(CLOCK2_IFACE_OFFSET) as *mut c_void);
+            S_OK
+        } else {
+            crate::com::warn_qi_failed_once("IAudioClock", &crate::com::Guid::from_win_guid(iid));
+            E_NOINTERFACE
+        }
+    }
+
+    pub unsafe extern "win64" fn add_ref(this: *mut ClockObj) -> u32 {
+        ClockObj::add_ref(this)
+    }
+
+    pub unsafe extern "win64" fn release(this: *mut ClockObj) -> u32 {
+        ClockObj::release(this)
+    }
 
     /// Shared-mode streams report the position in bytes; frequency = byte rate.
     pub unsafe extern "win64" fn get_frequency(this: *mut ClockObj, out: *mut u64) -> HRESULT {
-        let st = ClockObj::inner(this).st.lock().unwrap();
+        let st = ClockObj::inner(this).core.st.lock().unwrap();
         match st.stream.as_ref() {
             None => AUDCLNT_E_NOT_INITIALIZED,
             Some(s) => write_out(out, s.fmt.rate as u64 * s.fmt.block_align as u64),
@@ -1994,7 +2057,7 @@ mod clock {
         if pos.is_null() {
             return E_POINTER;
         }
-        let st = ClockObj::inner(this).st.lock().unwrap();
+        let st = ClockObj::inner(this).core.st.lock().unwrap();
         match st.stream.as_ref() {
             None => AUDCLNT_E_NOT_INITIALIZED,
             Some(s) if is_invalid(s) => AUDCLNT_E_DEVICE_INVALIDATED,
@@ -2026,33 +2089,39 @@ static CLOCK_VTBL: IAudioClockVtbl = IAudioClockVtbl {
     get_characteristics: clock::get_characteristics,
 };
 
-// ---------------------------------------------------------------------------
-// IAudioClock2
-// ---------------------------------------------------------------------------
-
-#[repr(C)]
-pub struct IAudioClock2Vtbl {
-    qi: unsafe extern "win64" fn(*mut Clock2Obj, *const GUID, *mut *mut c_void) -> HRESULT,
-    add_ref: unsafe extern "win64" fn(*mut Clock2Obj) -> u32,
-    release: unsafe extern "win64" fn(*mut Clock2Obj) -> u32,
-    get_device_position: unsafe extern "win64" fn(*mut Clock2Obj, *mut u64, *mut u64) -> HRESULT,
-}
-
-pub type Clock2Obj = ComObj<IAudioClock2Vtbl, Arc<ClientCore>>;
-
 mod clock2 {
     use super::*;
-    crate::com_iunknown!(Clock2Obj, [IID_IAudioClock2]);
+
+    #[inline]
+    unsafe fn owner(this: *mut *const IAudioClock2Vtbl) -> *mut ClockObj {
+        (this as *mut u8).sub(CLOCK2_IFACE_OFFSET) as *mut ClockObj
+    }
+
+    pub unsafe extern "win64" fn qi(
+        this: *mut *const IAudioClock2Vtbl,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        clock::qi(owner(this), riid, out)
+    }
+
+    pub unsafe extern "win64" fn add_ref(this: *mut *const IAudioClock2Vtbl) -> u32 {
+        ClockObj::add_ref(owner(this))
+    }
+
+    pub unsafe extern "win64" fn release(this: *mut *const IAudioClock2Vtbl) -> u32 {
+        ClockObj::release(owner(this))
+    }
 
     pub unsafe extern "win64" fn get_device_position(
-        this: *mut Clock2Obj,
+        this: *mut *const IAudioClock2Vtbl,
         dev_pos: *mut u64,
         qpc_pos: *mut u64,
     ) -> HRESULT {
         if dev_pos.is_null() {
             return E_POINTER;
         }
-        let st = Clock2Obj::inner(this).st.lock().unwrap();
+        let st = ClockObj::inner(owner(this)).core.st.lock().unwrap();
         match st.stream.as_ref() {
             None => AUDCLNT_E_NOT_INITIALIZED,
             Some(s) if is_invalid(s) => AUDCLNT_E_DEVICE_INVALIDATED,

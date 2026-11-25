@@ -807,14 +807,71 @@ mod spatial_object {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Spatial stream services: IAudioClock, IAudioClock2, IAudioStreamVolume
+// Spatial stream services: IAudioClock (+ IAudioClock2), IAudioStreamVolume
 // ---------------------------------------------------------------------------
 
-type SpatialClockObj = ComObj<ComVtbl<6>, Arc<SpatialStreamCore>>;
+#[repr(C)]
+struct SpatialClockInner {
+    clock2_vtbl: *const ComVtbl<4>,
+    core: Arc<SpatialStreamCore>,
+}
+unsafe impl Send for SpatialClockInner {}
+unsafe impl Sync for SpatialClockInner {}
+
+type SpatialClockObj = ComObj<ComVtbl<6>, SpatialClockInner>;
+
+const SPATIAL_CLOCK2_IFACE_OFFSET: usize =
+    std::mem::offset_of!(SpatialClockObj, inner) + std::mem::offset_of!(SpatialClockInner, clock2_vtbl);
+
+fn new_spatial_clock(core: Arc<SpatialStreamCore>) -> *mut SpatialClockObj {
+    SpatialClockObj::create(
+        spatial_clock::vtbl(),
+        SpatialClockInner {
+            clock2_vtbl: spatial_clock2::vtbl(),
+            core,
+        },
+    )
+}
 
 mod spatial_clock {
     use super::*;
-    crate::com_iunknown!(SpatialClockObj, [IID_IAudioClock]);
+
+    pub unsafe extern "win64" fn qi(
+        this: *mut SpatialClockObj,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
+        let Some(iid) = GUID::read(riid) else {
+            return E_POINTER;
+        };
+        if iid == IID_IUnknown || iid == IID_IAudioClock {
+            SpatialClockObj::add_ref(this);
+            std::ptr::write_unaligned(out, this as *mut c_void);
+            S_OK
+        } else if iid == IID_IAudioClock2 {
+            SpatialClockObj::add_ref(this);
+            std::ptr::write_unaligned(
+                out,
+                (this as *mut u8).add(SPATIAL_CLOCK2_IFACE_OFFSET) as *mut c_void,
+            );
+            S_OK
+        } else {
+            crate::com::warn_qi_failed_once("SpatialAudioClock", &crate::com::Guid::from_win_guid(iid));
+            E_NOINTERFACE
+        }
+    }
+
+    pub unsafe extern "win64" fn add_ref(this: *mut SpatialClockObj) -> u32 {
+        SpatialClockObj::add_ref(this)
+    }
+
+    pub unsafe extern "win64" fn release(this: *mut SpatialClockObj) -> u32 {
+        SpatialClockObj::release(this)
+    }
 
     pub unsafe extern "win64" fn get_frequency(_this: *mut SpatialClockObj, out: *mut u64) -> HRESULT {
         write_out(out, SPATIAL_SAMPLE_RATE as u64 * 8) // stereo f32 byte rate
@@ -828,11 +885,12 @@ mod spatial_clock {
         if pos.is_null() {
             return E_POINTER;
         }
-        let core = SpatialStreamCore::clone_consumed(SpatialClockObj::inner(this));
-        if SpatialClockObj::inner(this).is_invalid() {
+        let core = &SpatialClockObj::inner(this).core;
+        if core.is_invalid() {
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
-        std::ptr::write_unaligned(pos, core * 8);
+        let frames = SpatialStreamCore::clone_consumed(core);
+        std::ptr::write_unaligned(pos, frames * 8);
         if !qpc.is_null() {
             std::ptr::write_unaligned(qpc, crate::kernel32::time::interrupt_time_100ns());
         }
@@ -858,21 +916,39 @@ mod spatial_clock {
     }
 }
 
-type SpatialClock2Obj = ComObj<ComVtbl<4>, Arc<SpatialStreamCore>>;
-
 mod spatial_clock2 {
     use super::*;
-    crate::com_iunknown!(SpatialClock2Obj, [IID_IAudioClock2]);
+
+    #[inline]
+    unsafe fn owner(this: *mut *const ComVtbl<4>) -> *mut SpatialClockObj {
+        (this as *mut u8).sub(SPATIAL_CLOCK2_IFACE_OFFSET) as *mut SpatialClockObj
+    }
+
+    pub unsafe extern "win64" fn qi(
+        this: *mut *const ComVtbl<4>,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        spatial_clock::qi(owner(this), riid, out)
+    }
+
+    pub unsafe extern "win64" fn add_ref(this: *mut *const ComVtbl<4>) -> u32 {
+        SpatialClockObj::add_ref(owner(this))
+    }
+
+    pub unsafe extern "win64" fn release(this: *mut *const ComVtbl<4>) -> u32 {
+        SpatialClockObj::release(owner(this))
+    }
 
     pub unsafe extern "win64" fn get_device_position(
-        this: *mut SpatialClock2Obj,
+        this: *mut *const ComVtbl<4>,
         pos: *mut u64,
         qpc: *mut u64,
     ) -> HRESULT {
         if pos.is_null() {
             return E_POINTER;
         }
-        let core = SpatialClock2Obj::inner(this);
+        let core = &SpatialClockObj::inner(owner(this)).core;
         if core.is_invalid() {
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
@@ -1041,16 +1117,14 @@ mod render_stream {
         }
         let core = SpatialStreamObj::inner(this).clone();
         if iid == IID_IAudioClock {
-            std::ptr::write_unaligned(
-                service,
-                SpatialClockObj::create(spatial_clock::vtbl(), core) as *mut c_void,
-            );
+            std::ptr::write_unaligned(service, new_spatial_clock(core) as *mut c_void);
             return S_OK;
         }
         if iid == IID_IAudioClock2 {
+            let ck = new_spatial_clock(core);
             std::ptr::write_unaligned(
                 service,
-                SpatialClock2Obj::create(spatial_clock2::vtbl(), core) as *mut c_void,
+                (ck as *mut u8).add(SPATIAL_CLOCK2_IFACE_OFFSET) as *mut c_void,
             );
             return S_OK;
         }

@@ -1958,6 +1958,31 @@ fn wasapi_services_buffer_limits_and_loopback_capture() {
         assert_eq!(call!(sc, 14, (*mut u32) -> HRESULT; &mut pid), S_OK);
         assert_eq!(pid, std::process::id());
 
+        // Documented Windows acquisition path: GetService(IID_IAudioClock) -> QI(IID_IAudioClock2),
+        // with full COM symmetry (QI back to IAudioClock) and identical IUnknown identity.
+        let mut ck: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioClock, &mut ck), S_OK);
+        let (hr_ck2, ck2_via_qi) = qi(ck, &IID_IAudioClock2);
+        assert_eq!(hr_ck2, S_OK);
+        assert!(!ck2_via_qi.is_null());
+        let mut dpos_qi = 0u64;
+        let mut qpc_qi = 0u64;
+        assert_eq!(call!(ck2_via_qi, 3, (*mut u64, *mut u64) -> HRESULT; &mut dpos_qi, &mut qpc_qi), S_OK);
+        assert!(qpc_qi > 0);
+        let (hr_back, ck_back) = qi(ck2_via_qi, &IID_IAudioClock);
+        assert_eq!(hr_back, S_OK);
+        assert_eq!(ck_back, ck);
+        let (hr_u1, u1) = qi(ck, &IID_IUnknown);
+        let (hr_u2, u2) = qi(ck2_via_qi, &IID_IUnknown);
+        assert_eq!((hr_u1, hr_u2), (S_OK, S_OK));
+        assert_eq!(u1, u2);
+        assert_eq!(release(u2), 4);
+        assert_eq!(release(u1), 3);
+        assert_eq!(release(ck_back), 2);
+        assert_eq!(release(ck2_via_qi), 1);
+        assert_eq!(release(ck), 0);
+
+        // Direct GetService(IID_IAudioClock2) also remains supported.
         let mut ck2: P = std::ptr::null_mut();
         assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioClock2, &mut ck2), S_OK);
         let mut dpos = 0u64;
@@ -2034,6 +2059,15 @@ fn wasapi_services_buffer_limits_and_loopback_capture() {
             let mut s: P = std::ptr::null_mut();
             assert_eq!(call!(sp_stream, 4, (*const GUID, *mut P) -> HRESULT; &iid, &mut s), S_OK, "spatial GetService({iid:?})");
             assert!(!s.is_null());
+            if iid == IID_IAudioClock {
+                let (hr_sck2, sck2) = qi(s, &IID_IAudioClock2);
+                assert_eq!(hr_sck2, S_OK);
+                let mut sp_pos = 0u64;
+                let mut sp_qpc = 0u64;
+                assert_eq!(call!(sck2, 3, (*mut u64, *mut u64) -> HRESULT; &mut sp_pos, &mut sp_qpc), S_OK);
+                assert!(sp_qpc > 0);
+                assert_eq!(release(sck2), 1);
+            }
             assert_eq!(release(s), 0);
         }
         assert_eq!(release(sp_stream), 0);
