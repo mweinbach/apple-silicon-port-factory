@@ -76,7 +76,6 @@ mod icu {
 
     pub const UCOL_ALTERNATE_HANDLING: i32 = 1;
     pub const UCOL_CASE_FIRST: i32 = 2;
-    pub const UCOL_CASE_LEVEL: i32 = 3;
     pub const UCOL_STRENGTH: i32 = 5;
     pub const UCOL_NUMERIC_COLLATION: i32 = 7;
 
@@ -154,6 +153,9 @@ mod icu {
         pub u_str_to_upper: unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *const c_char, *mut i32) -> i32,
         pub u_str_to_title: unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *mut c_void, *const c_char, *mut i32) -> i32,
         pub u_str_fold_case: unsafe extern "C" fn(*mut u16, i32, *const u16, i32, u32, *mut i32) -> i32,
+        pub unorm2_get_nfd_instance: unsafe extern "C" fn(*mut i32) -> *const c_void,
+        pub unorm2_normalize: unsafe extern "C" fn(*const c_void, *const u16, i32, *mut u16, i32, *mut i32) -> i32,
+        pub u_char_type: unsafe extern "C" fn(i32) -> i8,
         pub utrans_open_u: unsafe extern "C" fn(*const u16, i32, i32, *const u16, i32, *mut c_void, *mut i32) -> *mut c_void,
         pub utrans_trans_uchars: unsafe extern "C" fn(*const c_void, *mut u16, *mut i32, i32, i32, *mut i32, *mut i32),
         pub utrans_close: unsafe extern "C" fn(*mut c_void),
@@ -250,6 +252,9 @@ mod icu {
                 u_str_to_upper: sym!(c"u_strToUpper", unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *const c_char, *mut i32) -> i32),
                 u_str_to_title: sym!(c"u_strToTitle", unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *mut c_void, *const c_char, *mut i32) -> i32),
                 u_str_fold_case: sym!(c"u_strFoldCase", unsafe extern "C" fn(*mut u16, i32, *const u16, i32, u32, *mut i32) -> i32),
+                unorm2_get_nfd_instance: sym!(c"unorm2_getNFDInstance", unsafe extern "C" fn(*mut i32) -> *const c_void),
+                unorm2_normalize: sym!(c"unorm2_normalize", unsafe extern "C" fn(*const c_void, *const u16, i32, *mut u16, i32, *mut i32) -> i32),
+                u_char_type: sym!(c"u_charType", unsafe extern "C" fn(i32) -> i8),
                 utrans_open_u: sym!(c"utrans_openU", unsafe extern "C" fn(*const u16, i32, i32, *const u16, i32, *mut c_void, *mut i32) -> *mut c_void),
                 utrans_trans_uchars: sym!(c"utrans_transUChars", unsafe extern "C" fn(*const c_void, *mut u16, *mut i32, i32, i32, *mut i32, *mut i32)),
                 utrans_close: sym!(c"utrans_close", unsafe extern "C" fn(*mut c_void)),
@@ -1108,19 +1113,16 @@ const NORM_IGNOREWIDTH: u32 = 0x0002_0000;
 /// `LCMapStringEx(..., LCMAP_SORTKEY, ...)` always produce identical ordering.
 unsafe fn configure_ucollator(a: &icu::IcuNls, col: *mut c_void, flags: u32) {
     let norm_ignore_case = (flags & NORM_IGNORECASE) != 0;
-    let ignore_case = (flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE)) != 0;
-    let ignore_diacritics = (flags & (NORM_IGNORENONSPACE | LINGUISTIC_IGNOREDIACRITIC)) != 0;
     let ignore_symbols = (flags & NORM_IGNORESYMBOLS) != 0;
     // `NORM_IGNORECASE` suppresses tertiary distinctions (ICU `UCOL_SECONDARY`), whereas
-    // `LINGUISTIC_IGNORECASE` alone suppresses only linguistic casing (applied in
-    // `normalize_collation_input` via locale-aware `u_strToLower`) so non-case tertiary/quaternary
-    // distinctions such as width (`A` vs `Ａ`) and kana type (`か` vs `カ`) remain intact.
+    // `LINGUISTIC_IGNORECASE` (`u_strFoldCase`) and diacritic suppression (`NORM_IGNORENONSPACE` /
+    // `LINGUISTIC_IGNOREDIACRITIC`, via NFD mark stripping) are applied in
+    // `normalize_collation_input` so non-diacritic tertiary/quaternary distinctions such as case,
+    // width (`A` vs `Ａ`), and kana type (`か` vs `カ`) remain intact.
     // In CLDR Japanese collation (`ja_JP`), Hiragana/Katakana and kana width are quaternary
     // distinctions, so use `UCOL_QUATERNARY` when full comparison is requested without shifted
     // punctuation.
-    let strength = if ignore_diacritics {
-        icu::UCOL_PRIMARY
-    } else if norm_ignore_case {
+    let strength = if norm_ignore_case {
         icu::UCOL_SECONDARY
     } else if !ignore_symbols {
         icu::UCOL_QUATERNARY
@@ -1129,10 +1131,6 @@ unsafe fn configure_ucollator(a: &icu::IcuNls, col: *mut c_void, flags: u32) {
     };
     let mut ast = 0i32;
     (a.ucol_set_attribute)(col, icu::UCOL_STRENGTH, strength, &mut ast);
-    if ignore_diacritics && !ignore_case {
-        ast = 0;
-        (a.ucol_set_attribute)(col, icu::UCOL_CASE_LEVEL, icu::UCOL_ON, &mut ast);
-    }
     ast = 0;
     (a.ucol_set_attribute)(col, icu::UCOL_CASE_FIRST, icu::UCOL_LOWER_FIRST, &mut ast);
     if (flags & NORM_IGNORESYMBOLS) != 0 {
@@ -1219,8 +1217,136 @@ fn icu_case_fold(icu_locale: &str, src: &[u16]) -> Option<Vec<u16>> {
     None
 }
 
-/// Normalize width (`NORM_IGNOREWIDTH`), kana type (`NORM_IGNOREKANATYPE`), and/or linguistic
-/// case folding (`LINGUISTIC_IGNORECASE` / `NORM_IGNORECASE | NORM_LINGUISTIC_CASING`) before
+fn next_utf16_cp(s: &[u16], i: usize) -> (u32, usize) {
+    let u0 = s[i];
+    if (0xD800..=0xDBFF).contains(&u0) && i + 1 < s.len() {
+        let u1 = s[i + 1];
+        if (0xDC00..=0xDFFF).contains(&u1) {
+            let cp = 0x10000 + (((u0 as u32 - 0xD800) << 10) | (u1 as u32 - 0xDC00));
+            return (cp, 2);
+        }
+    }
+    (u0 as u32, 1)
+}
+
+/// Strip non-spacing diacritic marks (`Mn`, `U_NON_SPACING_MARK = 6`) via ICU canonical NFD
+/// decomposition while leaving width (`A` vs `Ａ`), kana type (`か` vs `カ`), and case intact.
+/// When `linguistic_only` is true (`LINGUISTIC_IGNOREDIACRITIC` without `NORM_IGNORENONSPACE`),
+/// marks that produce a distinct primary letter in `icu_locale` (e.g. Swedish `ä`/`ö`/`å`) are
+/// preserved while purely secondary diacritics (e.g. `é` -> `e`) are stripped.
+fn icu_strip_diacritics(icu_locale: &str, src: &[u16], linguistic_only: bool) -> Option<Vec<u16>> {
+    const U_NON_SPACING_MARK: i8 = 6;
+    let a = icu::api()?;
+    unsafe {
+        let mut st = 0i32;
+        let nfd = (a.unorm2_get_nfd_instance)(&mut st);
+        if nfd.is_null() || st > 0 {
+            return None;
+        }
+        let mut nfd_buf = vec![0u16; src.len() * 2 + 16];
+        st = 0;
+        let need = (a.unorm2_normalize)(
+            nfd,
+            src.as_ptr(),
+            src.len() as i32,
+            nfd_buf.as_mut_ptr(),
+            nfd_buf.len() as i32,
+            &mut st,
+        );
+        if st == 15 && need > 0 {
+            nfd_buf.resize(need as usize + 1, 0);
+            st = 0;
+            let n2 = (a.unorm2_normalize)(
+                nfd,
+                src.as_ptr(),
+                src.len() as i32,
+                nfd_buf.as_mut_ptr(),
+                nfd_buf.len() as i32,
+                &mut st,
+            );
+            if st > 0 || n2 < 0 {
+                return None;
+            }
+            nfd_buf.truncate(n2 as usize);
+        } else if st <= 0 && need >= 0 {
+            nfd_buf.truncate(need as usize);
+        } else {
+            return None;
+        }
+
+        // Fast path: no non-spacing marks after canonical decomposition.
+        let mut has_mark = false;
+        let mut i = 0;
+        while i < nfd_buf.len() {
+            let (cp, len) = next_utf16_cp(&nfd_buf, i);
+            if (a.u_char_type)(cp as i32) == U_NON_SPACING_MARK {
+                has_mark = true;
+                break;
+            }
+            i += len;
+        }
+        if !has_mark {
+            return Some(src.to_vec());
+        }
+
+        let mut out = Vec::with_capacity(nfd_buf.len());
+        if !linguistic_only {
+            let mut i = 0;
+            while i < nfd_buf.len() {
+                let (cp, len) = next_utf16_cp(&nfd_buf, i);
+                if (a.u_char_type)(cp as i32) != U_NON_SPACING_MARK {
+                    out.extend_from_slice(&nfd_buf[i..i + len]);
+                }
+                i += len;
+            }
+            return Some(out);
+        }
+
+        let cloc = icu::c_str(icu_locale);
+        st = 0;
+        let col = (a.ucol_open)(cloc.as_ptr(), &mut st);
+        if col.is_null() || st > 0 {
+            return None;
+        }
+        let mut ast = 0i32;
+        (a.ucol_set_attribute)(col, icu::UCOL_STRENGTH, icu::UCOL_PRIMARY, &mut ast);
+
+        let mut cluster: Vec<u16> = Vec::new();
+        let mut cand: Vec<u16> = Vec::new();
+        let mut i = 0;
+        while i < nfd_buf.len() {
+            let (cp, len) = next_utf16_cp(&nfd_buf, i);
+            let slice = &nfd_buf[i..i + len];
+            if (a.u_char_type)(cp as i32) != U_NON_SPACING_MARK {
+                out.extend_from_slice(&cluster);
+                cluster.clear();
+                cluster.extend_from_slice(slice);
+            } else {
+                cand.clear();
+                cand.extend_from_slice(&cluster);
+                cand.extend_from_slice(slice);
+                let ord = (a.ucol_strcoll)(
+                    col,
+                    cand.as_ptr(),
+                    cand.len() as i32,
+                    cluster.as_ptr(),
+                    cluster.len() as i32,
+                );
+                if ord != 0 {
+                    cluster.extend_from_slice(slice);
+                }
+            }
+            i += len;
+        }
+        out.extend_from_slice(&cluster);
+        (a.ucol_close)(col);
+        Some(out)
+    }
+}
+
+/// Normalize width (`NORM_IGNOREWIDTH`), kana type (`NORM_IGNOREKANATYPE`), linguistic
+/// case folding (`LINGUISTIC_IGNORECASE` / `NORM_IGNORECASE | NORM_LINGUISTIC_CASING`), and
+/// diacritic suppression (`NORM_IGNORENONSPACE` / `LINGUISTIC_IGNOREDIACRITIC`) before
 /// collation and sort-key generation so `CompareStringEx`/`CompareStringW`, `LCMAP_SORTKEY`,
 /// and `LCMAP_HASH` agree across all flag combinations.
 fn normalize_collation_input<'a>(icu_locale: &str, s: &'a [u16], flags: u32) -> Cow<'a, [u16]> {
@@ -1228,7 +1354,10 @@ fn normalize_collation_input<'a>(icu_locale: &str, s: &'a [u16], flags: u32) -> 
     let ignore_kana = (flags & NORM_IGNOREKANATYPE) != 0;
     let linguistic_case = (flags & LINGUISTIC_IGNORECASE) != 0
         || ((flags & NORM_IGNORECASE) != 0 && (flags & NORM_LINGUISTIC_CASING) != 0);
-    if !ignore_width && !ignore_kana && !linguistic_case {
+    let ignore_diacritics = (flags & (NORM_IGNORENONSPACE | LINGUISTIC_IGNOREDIACRITIC)) != 0;
+    let linguistic_diacritics =
+        (flags & LINGUISTIC_IGNOREDIACRITIC) != 0 && (flags & NORM_IGNORENONSPACE) == 0;
+    if !ignore_width && !ignore_kana && !linguistic_case && !ignore_diacritics {
         return Cow::Borrowed(s);
     }
     let mut out: Vec<u16> = if ignore_width {
@@ -1302,6 +1431,12 @@ fn normalize_collation_input<'a>(icu_locale: &str, s: &'a [u16], flags: u32) -> 
         // and non-case tertiary distinctions (`Ａ`->`ａ` vs `a`, `か` vs `カ`) remain intact.
         out = icu_case_fold(icu_locale, &out)
             .unwrap_or_else(|| out.into_iter().map(wlower).collect());
+    }
+
+    if ignore_diacritics {
+        if let Some(stripped) = icu_strip_diacritics(icu_locale, &out, linguistic_diacritics) {
+            out = stripped;
+        }
     }
     Cow::Owned(out)
 }
@@ -4588,6 +4723,37 @@ mod tests {
             assert_eq!(get_sort_key(&el, &gr_upper, LINGUISTIC_IGNORECASE), get_sort_key(&el, &gr_medial, LINGUISTIC_IGNORECASE));
             assert_eq!(CompareStringEx(el.as_ptr(), LINGUISTIC_IGNORECASE, gr_upper.as_ptr(), -1, gr_final.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
             assert_eq!(get_sort_key(&el, &gr_upper, LINGUISTIC_IGNORECASE), get_sort_key(&el, &gr_final, LINGUISTIC_IGNORECASE));
+
+            // NORM_IGNORENONSPACE and LINGUISTIC_IGNOREDIACRITIC suppress accents while preserving
+            // non-diacritic tertiary/quaternary weights (case, width A vs Ａ, kana か vs カ).
+            let e_acc_a = to_wide_z("éA");
+            let e_plain_a = to_wide_z("eA");
+            let e_acc = to_wide_z("é");
+            let e_plain = to_wide_z("e");
+            for dflag in [NORM_IGNORENONSPACE, LINGUISTIC_IGNOREDIACRITIC] {
+                assert_eq!(CompareStringEx(en.as_ptr(), dflag, ae.as_ptr(), -1, a_lo.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+                assert_eq!(get_sort_key(&en, &ae, dflag), get_sort_key(&en, &a_lo, dflag));
+                assert_eq!(CompareStringEx(en.as_ptr(), dflag, e_acc_a.as_ptr(), -1, e_plain_a.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+                assert_eq!(get_sort_key(&en, &e_acc_a, dflag), get_sort_key(&en, &e_plain_a, dflag));
+                assert_ne!(CompareStringEx(en.as_ptr(), dflag, a_lo.as_ptr(), -1, a_up.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+                assert_ne!(get_sort_key(&en, &a_lo, dflag), get_sort_key(&en, &a_up, dflag));
+                assert_ne!(CompareStringEx(en.as_ptr(), dflag, a_up.as_ptr(), -1, a_fw.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+                assert_ne!(get_sort_key(&en, &a_up, dflag), get_sort_key(&en, &a_fw, dflag));
+                assert_ne!(CompareStringEx(en.as_ptr(), dflag, ka_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+                assert_ne!(get_sort_key(&en, &ka_hira, dflag), get_sort_key(&en, &ka_kata, dflag));
+                assert_ne!(CompareStringEx(ja.as_ptr(), dflag, ka_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+                assert_ne!(get_sort_key(&ja, &ka_hira, dflag), get_sort_key(&ja, &ka_kata, dflag));
+                // Japanese dakuten is a diacritic: が == か, while が != カ.
+                assert_eq!(CompareStringEx(ja.as_ptr(), dflag, ga_hira.as_ptr(), -1, ka_hira.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+                assert_eq!(get_sort_key(&ja, &ga_hira, dflag), get_sort_key(&ja, &ka_hira, dflag));
+                assert_ne!(CompareStringEx(ja.as_ptr(), dflag, ga_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            }
+            // In Swedish (sv-SE), LINGUISTIC_IGNOREDIACRITIC preserves primary letter 'ä' (> 'z')
+            // while still ignoring non-primary diacritics like 'é' == 'e'.
+            assert_eq!(CompareStringEx(sv.as_ptr(), LINGUISTIC_IGNOREDIACRITIC, ae.as_ptr(), -1, zz.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_GREATER_THAN);
+            assert!(get_sort_key(&sv, &ae, LINGUISTIC_IGNOREDIACRITIC) > get_sort_key(&sv, &zz, LINGUISTIC_IGNOREDIACRITIC));
+            assert_eq!(CompareStringEx(sv.as_ptr(), LINGUISTIC_IGNOREDIACRITIC, e_acc.as_ptr(), -1, e_plain.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&sv, &e_acc, LINGUISTIC_IGNOREDIACRITIC), get_sort_key(&sv, &e_plain, LINGUISTIC_IGNOREDIACRITIC));
         }
     }
 
