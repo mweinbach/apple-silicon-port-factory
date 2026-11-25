@@ -983,6 +983,8 @@ struct EndpointSoftwareGain {
     sw_muted: bool,
     /// Per-channel software multipliers (`1.0` for any channel handled by hardware HAL).
     sw_channels: [f32; 8],
+    /// Registered `IAudioEndpointVolumeCallback*` pointers shared across activations on this endpoint.
+    callbacks: Vec<usize>,
 }
 
 impl Default for EndpointSoftwareGain {
@@ -994,6 +996,7 @@ impl Default for EndpointSoftwareGain {
             sw_master: 1.0,
             sw_muted: false,
             sw_channels: [1.0; 8],
+            callbacks: Vec::new(),
         }
     }
 }
@@ -1048,7 +1051,6 @@ struct EndpointVolumeState {
     channel_count: usize,
     min_db: f32,
     max_db: f32,
-    callbacks: Mutex<Vec<usize>>,
 }
 
 impl EndpointVolumeState {
@@ -1062,7 +1064,6 @@ impl EndpointVolumeState {
             channel_count,
             min_db,
             max_db,
-            callbacks: Mutex::new(Vec::new()),
         })
     }
 
@@ -1138,6 +1139,62 @@ impl EndpointVolumeState {
             g.sw_muted = if hw_ok { false } else { mute };
         });
     }
+
+    /// Dispatch `IAudioEndpointVolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA)`
+    /// to every callback registered for this endpoint without holding any lock.
+    unsafe fn notify_callbacks(&self, ctx_guid: *const GUID) {
+        let cbs: Vec<usize> = read_endpoint_sw_state(&self.ep.id, |g| g.callbacks.clone());
+        if cbs.is_empty() {
+            return;
+        }
+        let guid = if ctx_guid.is_null() {
+            GUID::new(0, 0, 0, [0; 8])
+        } else {
+            std::ptr::read_unaligned(ctx_guid)
+        };
+        let muted: BOOL = if self.current_mute() { TRUE } else { FALSE };
+        let master = self.current_master_scalar();
+        let n_ch = self.channel_count.clamp(1, 8);
+        // AUDIO_VOLUME_NOTIFICATION_DATA:
+        // +0: GUID guidEventContext (16)
+        // +16: BOOL bMuted (4)
+        // +20: float fMasterVolume (4)
+        // +24: UINT nChannels (4)
+        // +28: float afChannelVolumes[nChannels] (4 * nChannels)
+        #[repr(C)]
+        struct AudioVolumeNotificationData {
+            guid_event_context: GUID,
+            b_muted: BOOL,
+            f_master_volume: f32,
+            n_channels: u32,
+            af_channel_volumes: [f32; 8],
+        }
+        let mut ch_vols = [master; 8];
+        for (i, slot) in ch_vols.iter_mut().enumerate().take(n_ch) {
+            *slot = self.current_channel_scalar(i).unwrap_or(master);
+        }
+        let data = AudioVolumeNotificationData {
+            guid_event_context: guid,
+            b_muted: muted,
+            f_master_volume: master,
+            n_channels: n_ch as u32,
+            af_channel_volumes: ch_vols,
+        };
+        let data_ptr = &data as *const AudioVolumeNotificationData as u64;
+        for cb in cbs {
+            if cb == 0 {
+                continue;
+            }
+            let vtbl = std::ptr::read_unaligned(cb as *const *const usize);
+            if vtbl.is_null() {
+                continue;
+            }
+            let on_notify = std::ptr::read_unaligned(vtbl.add(3));
+            if on_notify != 0 {
+                crate::call_guest8(on_notify, cb as u64, data_ptr, 0, 0, 0, 0, 0, 0);
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -1157,10 +1214,12 @@ mod endpoint_vol {
         if cb.is_null() {
             return E_POINTER;
         }
-        let mut cbs = EndpointVolumeObj::inner(this).callbacks.lock().unwrap();
+        let ep_id = &EndpointVolumeObj::inner(this).ep.id;
         let p = cb as usize;
-        if !cbs.contains(&p) {
-            cbs.push(p);
+        let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+        let entry = map.entry(ep_id.clone()).or_default();
+        if !entry.callbacks.contains(&p) {
+            entry.callbacks.push(p);
         }
         S_OK
     }
@@ -1169,10 +1228,15 @@ mod endpoint_vol {
         if cb.is_null() {
             return E_POINTER;
         }
-        let mut cbs = EndpointVolumeObj::inner(this).callbacks.lock().unwrap();
-        let before = cbs.len();
-        cbs.retain(|&p| p != cb as usize);
-        if cbs.len() == before { E_NOTFOUND } else { S_OK }
+        let ep_id = &EndpointVolumeObj::inner(this).ep.id;
+        let p = cb as usize;
+        let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+        let Some(entry) = map.get_mut(ep_id) else {
+            return E_NOTFOUND;
+        };
+        let before = entry.callbacks.len();
+        entry.callbacks.retain(|&x| x != p);
+        if entry.callbacks.len() == before { E_NOTFOUND } else { S_OK }
     }
 
     pub unsafe extern "win64" fn get_channel_count(this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {
@@ -1180,21 +1244,24 @@ mod endpoint_vol {
         write_out(out, n)
     }
 
-    pub unsafe extern "win64" fn set_master_volume_db(this: *mut EndpointVolumeObj, db: f32, _ctx: *const GUID) -> HRESULT {
+    pub unsafe extern "win64" fn set_master_volume_db(this: *mut EndpointVolumeObj, db: f32, ctx: *const GUID) -> HRESULT {
         let st = EndpointVolumeObj::inner(this);
         if !db.is_finite() || db < st.min_db - 1e-3 || db > st.max_db + 1e-3 {
             return E_INVALIDARG;
         }
         st.set_master_scalar(st.db_to_scalar(db));
+        st.notify_callbacks(ctx);
         S_OK
     }
     crate::win64_bridge!(fn set_master_volume_db(*mut EndpointVolumeObj, f32, *const GUID) -> HRESULT);
 
-    pub unsafe extern "win64" fn set_master_volume_scalar(this: *mut EndpointVolumeObj, level: f32, _ctx: *const GUID) -> HRESULT {
+    pub unsafe extern "win64" fn set_master_volume_scalar(this: *mut EndpointVolumeObj, level: f32, ctx: *const GUID) -> HRESULT {
         if !level.is_finite() || !(0.0..=1.0).contains(&level) {
             return E_INVALIDARG;
         }
-        EndpointVolumeObj::inner(this).set_master_scalar(level);
+        let st = EndpointVolumeObj::inner(this);
+        st.set_master_scalar(level);
+        st.notify_callbacks(ctx);
         S_OK
     }
     crate::win64_bridge!(fn set_master_volume_scalar(*mut EndpointVolumeObj, f32, *const GUID) -> HRESULT);
@@ -1209,7 +1276,7 @@ mod endpoint_vol {
         write_out(out, st.current_master_scalar())
     }
 
-    pub unsafe extern "win64" fn set_channel_volume_db(this: *mut EndpointVolumeObj, ch: u32, db: f32, _ctx: *const GUID) -> HRESULT {
+    pub unsafe extern "win64" fn set_channel_volume_db(this: *mut EndpointVolumeObj, ch: u32, db: f32, ctx: *const GUID) -> HRESULT {
         let st = EndpointVolumeObj::inner(this);
         if !db.is_finite() || db < st.min_db - 1e-3 || db > st.max_db + 1e-3 {
             return E_INVALIDARG;
@@ -1217,17 +1284,20 @@ mod endpoint_vol {
         if !st.set_channel_scalar(ch as usize, st.db_to_scalar(db)) {
             return E_INVALIDARG;
         }
+        st.notify_callbacks(ctx);
         S_OK
     }
     crate::win64_bridge!(fn set_channel_volume_db(*mut EndpointVolumeObj, u32, f32, *const GUID) -> HRESULT);
 
-    pub unsafe extern "win64" fn set_channel_volume_scalar(this: *mut EndpointVolumeObj, ch: u32, level: f32, _ctx: *const GUID) -> HRESULT {
+    pub unsafe extern "win64" fn set_channel_volume_scalar(this: *mut EndpointVolumeObj, ch: u32, level: f32, ctx: *const GUID) -> HRESULT {
         if !level.is_finite() || !(0.0..=1.0).contains(&level) {
             return E_INVALIDARG;
         }
-        if !EndpointVolumeObj::inner(this).set_channel_scalar(ch as usize, level) {
+        let st = EndpointVolumeObj::inner(this);
+        if !st.set_channel_scalar(ch as usize, level) {
             return E_INVALIDARG;
         }
+        st.notify_callbacks(ctx);
         S_OK
     }
     crate::win64_bridge!(fn set_channel_volume_scalar(*mut EndpointVolumeObj, u32, f32, *const GUID) -> HRESULT);
@@ -1254,8 +1324,10 @@ mod endpoint_vol {
         write_out(out, s)
     }
 
-    pub unsafe extern "win64" fn set_mute(this: *mut EndpointVolumeObj, mute: BOOL, _ctx: *const GUID) -> HRESULT {
-        EndpointVolumeObj::inner(this).set_mute(mute != 0);
+    pub unsafe extern "win64" fn set_mute(this: *mut EndpointVolumeObj, mute: BOOL, ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        st.set_mute(mute != 0);
+        st.notify_callbacks(ctx);
         S_OK
     }
 
@@ -1279,17 +1351,19 @@ mod endpoint_vol {
         S_OK
     }
 
-    pub unsafe extern "win64" fn volume_step_up(this: *mut EndpointVolumeObj, _ctx: *const GUID) -> HRESULT {
+    pub unsafe extern "win64" fn volume_step_up(this: *mut EndpointVolumeObj, ctx: *const GUID) -> HRESULT {
         let st = EndpointVolumeObj::inner(this);
         let next = (st.current_master_scalar() + 1.0 / ENDPOINT_VOLUME_STEPS as f32).min(1.0);
         st.set_master_scalar(next);
+        st.notify_callbacks(ctx);
         S_OK
     }
 
-    pub unsafe extern "win64" fn volume_step_down(this: *mut EndpointVolumeObj, _ctx: *const GUID) -> HRESULT {
+    pub unsafe extern "win64" fn volume_step_down(this: *mut EndpointVolumeObj, ctx: *const GUID) -> HRESULT {
         let st = EndpointVolumeObj::inner(this);
         let next = (st.current_master_scalar() - 1.0 / ENDPOINT_VOLUME_STEPS as f32).max(0.0);
         st.set_master_scalar(next);
+        st.notify_callbacks(ctx);
         S_OK
     }
 

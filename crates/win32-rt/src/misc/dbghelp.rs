@@ -189,14 +189,19 @@ pub unsafe extern "win64" fn SymGetSearchPathW(
 pub unsafe extern "win64" fn SymSetSearchPath(process: HANDLE, search_path: LPCSTR) -> BOOL {
     let s = crate::strings::from_ansi_opt(search_path).unwrap_or_default();
     let mut tbl = sym_table().lock().unwrap();
-    tbl.entry(proc_key(process)).or_default().search_path = s;
+    let st = tbl.entry(proc_key(process)).or_default();
+    st.search_path = s;
+    // Invalidate failed PDB lookups so callers that add a symbol directory can retry.
+    st.pdb_lines.retain(|_, v| v.is_some());
     TRUE
 }
 
 pub unsafe extern "win64" fn SymSetSearchPathW(process: HANDLE, search_path: LPCWSTR) -> BOOL {
     let s = crate::strings::from_wide_opt(search_path).unwrap_or_default();
     let mut tbl = sym_table().lock().unwrap();
-    tbl.entry(proc_key(process)).or_default().search_path = s;
+    let st = tbl.entry(proc_key(process)).or_default();
+    st.search_path = s;
+    st.pdb_lines.retain(|_, v| v.is_some());
     TRUE
 }
 
@@ -2797,6 +2802,16 @@ mod tests {
                 FALSE
             );
             assert_eq!(crate::teb::last_error(), ERROR_INVALID_ADDRESS);
+
+            // Updating the search path via SymSetSearchPath must invalidate the negative cache
+            // so retrying SymGetLineFromAddr64 on the same session resolves the matching PDB.
+            let sp_fixed = std::ffi::CString::new(dir_good.to_str().unwrap()).unwrap();
+            assert_eq!(SymSetSearchPath(proc_bad, sp_fixed.as_ptr() as *const u8), TRUE);
+            assert_eq!(
+                SymGetLineFromAddr64(proc_bad, pe_base + 0x1100, &mut disp, line.as_mut_ptr()),
+                TRUE
+            );
+            assert_eq!((line.as_ptr().add(16) as *const u32).read_unaligned(), 42);
             assert_eq!(SymCleanup(proc_bad), TRUE);
 
             let _ = std::fs::remove_dir_all(&dir_stale);

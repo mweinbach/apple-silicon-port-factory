@@ -2043,23 +2043,70 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
         assert!((got0 - 0.0).abs() < 1e-6);
         assert!((got1 - 0.5).abs() < 1e-6);
 
-        // A second IAudioEndpointVolume activation on the same endpoint must observe the shared state.
+        // A second IAudioEndpointVolume activation on the same endpoint must observe the shared state
+        // and receive IAudioEndpointVolumeCallback::OnNotify with the caller's event-context GUID.
         let mut epv2: P = std::ptr::null_mut();
         assert_eq!(
             call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &IID_IAudioEndpointVolume, CLSCTX_ALL, std::ptr::null_mut(), &mut epv2),
             S_OK
         );
+        #[repr(C)]
+        struct NotifyData {
+            guid: GUID,
+            muted: i32,
+            master: f32,
+            n_ch: u32,
+            ch_vols: [f32; 8],
+        }
+        #[repr(C)]
+        struct TestVolCb {
+            vtbl: *const [usize; 4],
+            calls: usize,
+            last_guid: GUID,
+            last_muted: i32,
+            last_master: f32,
+            last_ch1: f32,
+        }
+        unsafe extern "win64" fn test_vol_on_notify(this: *mut TestVolCb, data: *const NotifyData) -> HRESULT {
+            let cb = &mut *this;
+            let d = std::ptr::read_unaligned(data);
+            cb.calls += 1;
+            cb.last_guid = d.guid;
+            cb.last_muted = d.muted;
+            cb.last_master = d.master;
+            cb.last_ch1 = d.ch_vols[1];
+            S_OK
+        }
+        crate::register_native_va(test_vol_on_notify as *const () as u64, test_vol_on_notify as *const () as usize);
+        let cb_vtbl: [usize; 4] = [0, 0, 0, test_vol_on_notify as *const () as usize];
+        let mut cb_obj = TestVolCb {
+            vtbl: &cb_vtbl,
+            calls: 0,
+            last_guid: GUID::new(0, 0, 0, [0; 8]),
+            last_muted: -1,
+            last_master: -1.0,
+            last_ch1: -1.0,
+        };
+        assert_eq!(call!(epv2, 3 /* RegisterControlChangeNotify */, (*mut c_void) -> HRESULT; &mut cb_obj as *mut TestVolCb as *mut c_void), S_OK);
+        let ctx_guid = GUID::new(0x1234_5678, 0x9ABC, 0xDEF0, [1, 2, 3, 4, 5, 6, 7, 8]);
+
         let mut got0_2 = -1.0f32;
         let mut got1_2 = -1.0f32;
         assert_eq!(call!(epv2, 13, (u32, *mut f32) -> HRESULT; 0, &mut got0_2), S_OK);
         assert_eq!(call!(epv2, 13, (u32, *mut f32) -> HRESULT; 1, &mut got1_2), S_OK);
         assert!((got0_2 - 0.0).abs() < 1e-6);
         assert!((got1_2 - 0.5).abs() < 1e-6);
-        assert_eq!(call!(epv, 14 /* SetMute */, (i32, *const GUID) -> HRESULT; 1, std::ptr::null()), S_OK);
+        assert_eq!(call!(epv, 14 /* SetMute */, (i32, *const GUID) -> HRESULT; 1, &ctx_guid), S_OK);
+        assert_eq!(cb_obj.calls, 1, "OnNotify must fire when mute changes on another activation");
+        assert_eq!(cb_obj.last_guid, ctx_guid);
+        assert_eq!(cb_obj.last_muted, 1);
+        assert!((cb_obj.last_ch1 - 0.5).abs() < 1e-6);
         let mut muted2 = 0i32;
         assert_eq!(call!(epv2, 15 /* GetMute */, (*mut i32) -> HRESULT; &mut muted2), S_OK);
         assert_eq!(muted2, 1, "second activation must observe mute set via first activation");
+        assert_eq!(call!(epv2, 4 /* UnregisterControlChangeNotify */, (*mut c_void) -> HRESULT; &mut cb_obj as *mut TestVolCb as *mut c_void), S_OK);
         assert_eq!(call!(epv2, 14 /* SetMute */, (i32, *const GUID) -> HRESULT; 0, std::ptr::null()), S_OK);
+        assert_eq!(cb_obj.calls, 1, "unregistered callback must not fire");
         assert_eq!(release(epv2), 0);
 
         // Render (0.8, 0.8) and verify loopback sees (0.0, 0.4) — proving endpoint channel gains
