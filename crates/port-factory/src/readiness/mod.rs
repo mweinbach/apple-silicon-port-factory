@@ -7,7 +7,7 @@ use crate::json_output::{exit_codes, JsonObj, JsonValue};
 use anyhow::{ensure, Context, Result};
 use cpu::CpuScan;
 use imports::Catalog;
-use pe_image::{normalize_dll_name, ExportTarget, Exports, ImportDll, Pe};
+use pe_image::{normalize_dll_name, ExportTarget, Exports, ImportDll, ImportName, Pe};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -58,11 +58,20 @@ impl Module {
         let pe = Pe::parse(&bytes)?;
         let mut imports = pe.imports()?;
         imports.extend(pe.delay_imports()?);
+        let exports = pe.exports()?;
         Ok(Self {
-            cpu: CpuScan::scan(&pe)?,
+            cpu: CpuScan::scan(&pe, &exports)?,
             imports,
-            exports: pe.exports()?,
+            exports,
         })
+    }
+
+    fn export(&self, name: &ImportName) -> Option<&ExportTarget> {
+        match name {
+            ImportName::Name { name, .. } => self.exports.by_name(name),
+            ImportName::Ordinal(n) => self.exports.by_ordinal(u32::from(*n)),
+        }
+        .map(|e| &e.target)
     }
 }
 
@@ -86,7 +95,7 @@ impl Package {
     fn discover(root: &Path, single: Option<&Path>, catalog: &Catalog) -> Result<Self> {
         let mut pkg = Self::default();
         let mut dirs = vec![PathBuf::new()];
-        let mut pending = BTreeSet::new();
+        let mut pending = Vec::new();
         while let Some(dir) = dirs.pop() {
             for entry in fs::read_dir(root.join(&dir))? {
                 let entry = entry?;
@@ -106,7 +115,7 @@ impl Package {
                                 continue;
                             }
                         }
-                        pending.insert(rel.clone());
+                        pending.push((rel.clone(), None));
                     }
                     let key = (
                         dir.clone(),
@@ -121,45 +130,48 @@ impl Package {
             }
         }
         if let Some(file) = single {
-            pending.insert(file.to_owned());
+            pending.push((file.to_owned(), None));
         }
         ensure!(!pending.is_empty(), "no PE candidates found");
-        while let Some(rel) = pending.pop_first() {
-            if pkg.modules.contains_key(&rel) || pkg.skipped.contains_key(&rel) {
+        while let Some((rel, request)) = pending.pop() {
+            if pkg.skipped.contains_key(&rel) {
                 continue;
             }
-            match Module::read(&root.join(&rel)) {
-                Ok(module) => {
-                    if single.is_some() {
-                        let forwarders =
-                            module
-                                .exports
-                                .entries
-                                .iter()
-                                .filter_map(|e| match &e.target {
-                                    ExportTarget::Forwarder(s) => {
-                                        imports::forwarder(s).map(|(dll, _)| dll)
-                                    }
-                                    _ => None,
-                                });
-                        for dll in module
-                            .imports
-                            .iter()
-                            .map(|i| i.dll.as_str())
-                            .chain(forwarders)
-                        {
-                            if catalog.use_shipped(dll) {
-                                if let Some(path) = pkg.neighbor(&rel, dll) {
-                                    pending.insert(path.clone());
-                                }
+            if !pkg.modules.contains_key(&rel) {
+                let module = match Module::read(&root.join(&rel)) {
+                    Ok(module) => module,
+                    Err(e) => {
+                        pkg.skipped.insert(rel, format!("{e:#}"));
+                        continue;
+                    }
+                };
+                if single.is_some() {
+                    for imports in &module.imports {
+                        if let Some(path) = catalog.shipped_path(&pkg, &rel, &imports.dll) {
+                            for entry in &imports.entries {
+                                pending.push((path.clone(), Some((entry.name.clone(), 0))));
                             }
                         }
                     }
-                    pkg.modules.insert(rel, module);
                 }
-                Err(e) => {
-                    pkg.skipped.insert(rel, format!("{e:#}"));
-                }
+                pkg.modules.insert(rel.clone(), module);
+            }
+            // Only requesting a particular export makes its forwarder a dependency.
+            // A loaded DLL may receive new symbol requests after its imports have been read.
+            let Some((symbol, depth)) = request else {
+                continue;
+            };
+            if depth >= imports::FORWARDER_LIMIT {
+                continue;
+            }
+            let Some(ExportTarget::Forwarder(target)) = pkg.modules[&rel].export(&symbol) else {
+                continue;
+            };
+            let Some((dll, next)) = imports::forwarder(target) else {
+                continue;
+            };
+            if let Some(path) = catalog.shipped_path(&pkg, &rel, dll) {
+                pending.push((path.clone(), Some((next, depth + 1))));
             }
         }
         Ok(pkg)

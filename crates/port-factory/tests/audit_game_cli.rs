@@ -486,7 +486,16 @@ fn readiness_uses_real_dispatch_and_classifies_every_import() {
     );
     std::fs::write(game.join("play.exe"), &image).unwrap();
     // Keep a leaf outside .pdata in a nonstandard-extension plugin.
-    let mut leaf = build_synthetic_pe(true, &[0xc3, 0x0f, 0x01, 0xee], &[], false);
+    // A padding byte would decode as the start of a two-byte push and swallow
+    // the first byte of the exported leaf if the scan ignored its export RVA.
+    let mut leaf = build_synthetic_pe(true, &[0xc3, 0x6a, 0x0f, 0x01, 0xee, 0xc3], &[], false);
+    let exports = 0x80 + 24 + 112;
+    put_u32(&mut leaf, exports, 0x2040);
+    put_u32(&mut leaf, exports + 4, 0x60);
+    put_u32(&mut leaf, 0x440 + 16, 1);
+    put_u32(&mut leaf, 0x440 + 20, 1);
+    put_u32(&mut leaf, 0x440 + 28, 0x2080);
+    put_u32(&mut leaf, 0x480, 0x1002);
     let exception = 0x80 + 24 + 112 + 3 * 8;
     put_u32(&mut leaf, exception, 0x2000);
     put_u32(&mut leaf, exception + 4, 12);
@@ -631,12 +640,24 @@ fn readiness_resolves_shipped_and_forwarded_delay_ordinals() {
     put_u32(&mut dll, dirs, 0x2000);
     put_u32(&mut dll, dirs + 4, 0x80);
     put_u32(&mut dll, raw + 16, 7); // ordinal base
-    put_u32(&mut dll, raw + 20, 2); // exports #7 and #8 only
+    put_u32(&mut dll, raw + 20, 4); // #7 direct, #8 forwarded, #9 absent, #10 unused
     put_u32(&mut dll, raw + 28, 0x2040);
     put_u32(&mut dll, raw + 0x40, 0x1000); // direct .text export
     put_u32(&mut dll, raw + 0x44, 0x2050); // forwarder in export directory
-    dll[raw + 0x50..raw + 0x5d].copy_from_slice(b"KERNEL32.#17\0");
+    put_u32(&mut dll, raw + 0x4c, 0x2060);
+    dll[raw + 0x50..raw + 0x58].copy_from_slice(b"link.#7\0");
+    dll[raw + 0x60..raw + 0x6a].copy_from_slice(b"unused.#1\0");
+    let mut link = dll.clone();
+    put_u32(&mut link, raw + 20, 1);
+    put_u32(&mut link, raw + 0x40, 0x2050);
+    link[raw + 0x50..raw + 0x5d].copy_from_slice(b"KERNEL32.#17\0");
     std::fs::write(game.join("Unit.DLL"), dll).unwrap();
+    std::fs::write(game.join("link.dll"), link).unwrap();
+    std::fs::write(
+        game.join("unused.dll"),
+        build_synthetic_pe(true, &[0x0f, 0x01, 0xee], &[], false),
+    )
+    .unwrap();
     let (code, report) = run_pf_json(tmp.path(), &["readiness", exe.to_str().unwrap(), "--json"]);
     assert_eq!(code, exit_codes::UNRESOLVED_IMPORTS);
     let binaries = report
@@ -646,7 +667,11 @@ fn readiness_resolves_shipped_and_forwarded_delay_ordinals() {
         .unwrap()
         .as_array()
         .unwrap();
-    assert_eq!(binaries.len(), 2);
+    let paths = binaries
+        .iter()
+        .map(|b| b.get("path").unwrap().as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["Unit.DLL", "link.dll", "play.exe"]);
     let play = binaries
         .iter()
         .find(|b| b.get("path").unwrap().as_str() == Some("play.exe"))

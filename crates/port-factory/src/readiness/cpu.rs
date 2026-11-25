@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use iced_x86::{
     Code, ConditionCode, CpuidFeature, Decoder, DecoderOptions, EncodingKind, Mnemonic,
 };
-use pe_image::Pe;
+use pe_image::{ExportTarget, Exports, Pe};
 use std::collections::{BTreeMap, BTreeSet};
 use x86_runtime::emu::{arm64_guest_cpuid, instruction_lowering, InstructionLowering};
 
@@ -131,11 +131,16 @@ impl CpuScan {
         }
     }
 
-    pub fn scan(pe: &Pe) -> Result<Self> {
+    pub fn scan(pe: &Pe, exports: &Exports) -> Result<Self> {
         let mut scan = Self::default();
         // Restart at known boundaries so inline data cannot desynchronize decoding of
         // the next function. Include the gaps: leaf functions need no .pdata entry.
         let mut boundaries = BTreeSet::from([pe.headers.entry_rva]);
+        boundaries.extend(pe.tls_callback_rvas()?);
+        boundaries.extend(exports.entries.iter().filter_map(|e| match e.target {
+            ExportTarget::Rva(rva) => Some(rva),
+            ExportTarget::Forwarder(_) => None,
+        }));
         for function in pe.runtime_functions()? {
             boundaries.extend([function.begin_rva, function.end_rva]);
         }

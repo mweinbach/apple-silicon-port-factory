@@ -190,13 +190,13 @@ cargo opsdb -- readiness /path/to/game/Game.exe --json
 ```
 
 Directory mode scans regular PE candidates recursively, including extensionless MZ files.
-Single-file mode follows adjacent imported DLLs and export forwarders. Both preserve relative
+Single-file mode follows adjacent imported DLLs and the forwarders those imports use. Both preserve relative
 paths and report unscannable images. Directory symlinks are skipped. Package lookup checks
 the importer's directory and the package root with the default DLL overrides. Runtime
 search-path changes, custom manifests, dynamic imports and unpacked code need a boot trace.
 
-- **CPU.** The scanner walks file-backed executable sections, restarting at entry and
-  `.pdata` boundaries so leaf code outside function tables is included. Each decoded operand
+- **CPU.** The scanner walks file-backed executable sections, restarting at the entry point, exported RVAs,
+  TLS callbacks and `.pdata` boundaries so leaf code outside function tables is included. Each decoded operand
   form goes through the runtime lowerer. A generic dispatch with no interpreter handler is
   listed as `unimplemented` (exit 86 if reached with fail-on-unimplemented enabled).
   `interpreter_only` identifies handled fallbacks. Guest traps and syscall boundaries have

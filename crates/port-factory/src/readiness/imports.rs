@@ -1,10 +1,16 @@
-use super::{Finding, Module, Package};
+use super::{Finding, Package};
 use crate::stub_inventory::{parse_inventory_tsv, StubInventoryEntry};
 use crate::win32_db::{ImplKind, Win32ApiEntry, Win32Category, Win32Database};
 use anyhow::{ensure, Context, Result};
 use pe_image::{normalize_dll_name, ExportTarget, ImportName};
 use port_manifest::DllRoutingTable;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+pub(super) const FORWARDER_LIMIT: usize = 8;
 
 pub(super) struct Catalog {
     apis: Win32Database,
@@ -73,11 +79,20 @@ impl Catalog {
         })
     }
 
-    pub fn use_shipped(&self, dll: &str) -> bool {
+    pub fn shipped_path<'p>(
+        &self,
+        package: &'p Package,
+        requester: &Path,
+        dll: &str,
+    ) -> Option<&'p PathBuf> {
         let dll = normalize_dll_name(dll);
-        !dll.starts_with("api-ms-win-")
-            && !dll.starts_with("ext-ms-win-")
-            && !self.routes.is_builtin_override(&dll)
+        if dll.starts_with("api-ms-win-")
+            || dll.starts_with("ext-ms-win-")
+            || self.routes.is_builtin_override(&dll)
+        {
+            return None;
+        }
+        package.neighbor(requester, &dll)
     }
 
     pub fn resolve(
@@ -103,21 +118,14 @@ impl Catalog {
             provider: reason,
             sites: &[],
         };
-        if depth > 8 {
+        if depth > FORWARDER_LIMIT {
             return missing("forwarder chain exceeded loader limit".into());
         }
-        if let Some(path) = package
-            .neighbor(requester, dll)
-            .filter(|_| self.use_shipped(dll))
-        {
-            let Some(Module { exports, .. }) = package.modules.get(path) else {
+        if let Some(path) = self.shipped_path(package, requester, dll) {
+            let Some(module) = package.modules.get(path) else {
                 return missing(format!("unreadable shipped module {}", path.display()));
             };
-            let export = match name {
-                ImportName::Name { name, .. } => exports.by_name(name),
-                ImportName::Ordinal(n) => exports.by_ordinal(u32::from(*n)),
-            };
-            return match export.map(|e| &e.target) {
+            return match module.export(name) {
                 Some(ExportTarget::Rva(rva)) if *rva != 0 => Binding {
                     finding: Finding::Shipped,
                     provider: format!("{}!{name}", path.display()),
