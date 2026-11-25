@@ -2858,7 +2858,8 @@ const KDF_SECRET_APPEND: u32 = 0x2;
 const KDF_HMAC_KEY: u32 = 0x3;
 const KDF_TLS_PRF_LABEL: u32 = 0x4;
 const KDF_TLS_PRF_SEED: u32 = 0x5;
-const KDF_TLS_PRF_PROTOCOL: u32 = 0x6;
+// 0x6 is KDF_SECRET_HANDLE; KDF_TLS_PRF_PROTOCOL is 0x7 in Windows SDK bcrypt.h.
+const KDF_TLS_PRF_PROTOCOL: u32 = 0x7;
 const KDF_ALGORITHMID: u32 = 0x8;
 const KDF_PARTYUINFO: u32 = 0x9;
 const KDF_PARTYVINFO: u32 = 0xA;
@@ -6125,14 +6126,14 @@ mod tests {
             let hmac_msg = [&b"PRE"[..], &expected_z_be[..], &b"APP"[..]].concat();
             assert_eq!(hmac_dk.as_slice(), Digest::Sha256.hmac(&expected_z_be, &hmac_msg).as_slice());
 
-            // 2c. BCRYPT_KDF_TLS_PRF honors KDF_TLS_PRF_PROTOCOL=0x0303 (TLS 1.2 -> SHA-256 default) and rejects unknown protocol
+            // 2c. BCRYPT_KDF_TLS_PRF honors KDF_TLS_PRF_PROTOCOL (0x7)=0x0303 (TLS 1.2 -> SHA-256 default) and rejects unknown protocol
             let mut label = b"master secret".to_vec();
             let mut seed = b"0123456789abcdef".to_vec();
             let mut proto_tls12 = 0x0303u32.to_le_bytes();
             let mut tls_bufs = [
                 BcryptBuffer { cb_buffer: label.len() as u32, buffer_type: KDF_TLS_PRF_LABEL, pv_buffer: label.as_mut_ptr() as *mut c_void },
                 BcryptBuffer { cb_buffer: seed.len() as u32, buffer_type: KDF_TLS_PRF_SEED, pv_buffer: seed.as_mut_ptr() as *mut c_void },
-                BcryptBuffer { cb_buffer: 4, buffer_type: KDF_TLS_PRF_PROTOCOL, pv_buffer: proto_tls12.as_mut_ptr() as *mut c_void },
+                BcryptBuffer { cb_buffer: 4, buffer_type: 0x7, pv_buffer: proto_tls12.as_mut_ptr() as *mut c_void },
             ];
             let tls_desc = BcryptBufferDesc { ul_version: 0, c_buffers: tls_bufs.len() as u32, p_buffers: tls_bufs.as_mut_ptr() };
             let mut tls_out = [0u8; 48];
