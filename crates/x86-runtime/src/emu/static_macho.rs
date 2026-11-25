@@ -1219,7 +1219,7 @@ struct StaticAotModuleDesc {
 };
 static int g_ok = 0;
 void port_static_aot_register_desc(const struct StaticAotModuleDesc *d) {
-    if (d && d->magic == 0x53414F54u && d->version == 3 && d->code_base != 0 &&
+    if (d && d->magic == 0x53414F54u && d->version == 5 && d->code_base != 0 &&
         d->entries != 0 && d->entry_count > 0 && d->module_name &&
         strcmp(d->module_name, "big_game.exe") == 0) {
         g_ok = 1;
