@@ -2883,3 +2883,161 @@ fn glyph_run_analysis_preserves_fractional_subpixel_origins() {
             release_com(fac);
     }
 }
+
+#[test]
+fn text_analyzer_forwards_locale_to_coretext_shaping() {
+    use super::analysis::{
+        ta_get_gdi_compatible_glyph_placements, ta_get_glyph_placements, ta_get_glyphs,
+        PTextAnalyzer,
+    };
+
+    let sfns_path = "/System/Library/Fonts/SFNS.ttf";
+    if !std::path::Path::new(sfns_path).exists() {
+        return;
+    }
+
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ffile: *mut c_void = std::ptr::null_mut();
+        let path_w = wide(sfns_path);
+        assert_eq!(
+            fac_create_font_file_reference(fac as PFactory, path_w.as_ptr(), std::ptr::null(), &mut ffile),
+            S_OK
+        );
+        let mut face: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_font_face(
+                fac as PFactory,
+                DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                1,
+                &ffile,
+                0,
+                DWRITE_FONT_SIMULATIONS_NONE,
+                &mut face,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // Cyrillic small letter Be (U+0431) has distinct OpenType `locl` forms for Russian vs Serbian in SFNS.
+        let text = [0x0431u16];
+        let shape_locale = |loc: &str| -> Vec<u16> {
+            let loc_w = wide(loc);
+            let mut cm = [0u16; 1];
+            let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 1];
+            let mut gi = [0u16; 4];
+            let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 4];
+            let mut actual = 0u32;
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    text.len() as u32,
+                    face,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    gi.len() as u32,
+                    cm.as_mut_ptr(),
+                    tp.as_mut_ptr(),
+                    gi.as_mut_ptr(),
+                    gp.as_mut_ptr(),
+                    &mut actual,
+                ),
+                S_OK
+            );
+            gi[..actual as usize].to_vec()
+        };
+
+        let g_ru = shape_locale("ru-RU");
+        let g_sr = shape_locale("sr-Cyrl");
+        assert_eq!(g_ru.len(), 1);
+        assert_eq!(g_sr.len(), 1);
+        assert_ne!(
+            g_ru, g_sr,
+            "localeName must be forwarded to CoreText so Serbian and Russian Cyrillic 'б' select distinct locl glyphs"
+        );
+
+        // Verify GetGlyphPlacements and GetGdiCompatibleGlyphPlacements also forward localeName cleanly.
+        let sr_w = wide("sr-Cyrl");
+        let cm = [0u16; 1];
+        let tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 1];
+        let gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 1];
+        let mut adv = [0.0f32; 1];
+        let mut off = [DWRITE_GLYPH_OFFSET::default(); 1];
+        assert_eq!(
+            ta_get_glyph_placements(
+                ta as PTextAnalyzer,
+                text.as_ptr(),
+                cm.as_ptr(),
+                tp.as_ptr(),
+                1,
+                g_sr.as_ptr(),
+                gp.as_ptr(),
+                1,
+                face,
+                24.0f32.to_bits(),
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                sr_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                adv.as_mut_ptr(),
+                off.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert!(adv[0] > 0.0, "expected positive advance for sr-Cyrl glyph, got {}", adv[0]);
+
+        let mut gdi_adv = [0.0f32; 1];
+        assert_eq!(
+            ta_get_gdi_compatible_glyph_placements(
+                ta as PTextAnalyzer,
+                text.as_ptr(),
+                cm.as_ptr(),
+                tp.as_ptr(),
+                1,
+                g_sr.as_ptr(),
+                gp.as_ptr(),
+                1,
+                face,
+                24.0f32.to_bits(),
+                1.0f32.to_bits(),
+                std::ptr::null(),
+                TRUE,
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                sr_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gdi_adv.as_mut_ptr(),
+                off.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert!(gdi_adv[0] > 0.0);
+
+        release_com(ta);
+        release_com(face);
+        release_com(ffile);
+        release_com(fac);
+    }
+}

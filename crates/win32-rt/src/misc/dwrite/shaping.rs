@@ -256,6 +256,7 @@ mod coretext {
     #[link(name = "CoreText", kind = "framework")]
     extern "C" {
         static kCTFontAttributeName: *const c_void;
+        static kCTLanguageAttributeName: *const c_void;
         static kCTParagraphStyleAttributeName: *const c_void;
         static kCTFontCascadeListAttribute: *const c_void;
         static kCTFontFeatureSettingsAttribute: *const c_void;
@@ -382,6 +383,7 @@ mod coretext {
         em_size: f32,
         is_rtl: bool,
         no_visual: bool,
+        locale: Option<&str>,
         feature_ranges: &[FeatureRange],
     ) -> Option<ShapedRun> {
         if units.is_empty() {
@@ -454,13 +456,34 @@ mod coretext {
             if cf_str.0.is_null() {
                 return None;
             }
-            let attr_keys = [kCTFontAttributeName, kCTParagraphStyleAttributeName];
-            let attr_vals = [base_ct_font.0, pstyle.0];
+            let cf_locale = locale
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|loc| {
+                    let g = CfGuard(CFStringCreateWithBytes(
+                        std::ptr::null(),
+                        loc.as_ptr(),
+                        loc.len() as isize,
+                        CF_STRING_ENCODING_UTF8,
+                        false,
+                    ));
+                    (!g.0.is_null()).then_some(g)
+                });
+            let mut attr_keys = Vec::with_capacity(3);
+            let mut attr_vals = Vec::with_capacity(3);
+            attr_keys.push(kCTFontAttributeName);
+            attr_vals.push(base_ct_font.0);
+            attr_keys.push(kCTParagraphStyleAttributeName);
+            attr_vals.push(pstyle.0);
+            if let Some(ref loc) = cf_locale {
+                attr_keys.push(kCTLanguageAttributeName);
+                attr_vals.push(loc.0);
+            }
             let attrs = CfGuard(CFDictionaryCreate(
                 std::ptr::null(),
                 attr_keys.as_ptr(),
                 attr_vals.as_ptr(),
-                2,
+                attr_keys.len() as isize,
                 &kCFTypeDictionaryKeyCallBacks as *const u8,
                 &kCFTypeDictionaryValueCallBacks as *const u8,
             ));
@@ -681,15 +704,16 @@ pub(super) fn shape_run_platform(
     em_size: f32,
     is_rtl: bool,
     no_visual: bool,
+    locale: Option<&str>,
     feature_ranges: &[FeatureRange],
 ) -> Option<ShapedRun> {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        coretext::shape_run(face, units, em_size, is_rtl, no_visual, feature_ranges)
+        coretext::shape_run(face, units, em_size, is_rtl, no_visual, locale, feature_ranges)
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
-        let _ = (face, units, em_size, is_rtl, no_visual, feature_ranges);
+        let _ = (face, units, em_size, is_rtl, no_visual, locale, feature_ranges);
         None
     }
 }

@@ -881,7 +881,6 @@ pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
         40 => 36,                                                    // ASPECTX
         42 => 36,                                                    // ASPECTY
         44 => 51,                                                    // ASPECTXY
-        45 => 3,                                                     // SHADEBLENDCAPS (SB_CONST_ALPHA|SB_PIXEL_ALPHA)
         88 | 90 => dpi,                                              // LOGPIXELSX / LOGPIXELSY
         104 => 0,                                                    // SIZEPALETTE
         106 => 20,                                                   // NUMRESERVED
@@ -891,6 +890,7 @@ pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
         117 => mon.height(),                                         // DESKTOPVERTRES
         118 => mon.width(),                                          // DESKTOPHORZRES
         119 => 0,                                                    // BLTALIGNMENT
+        120 => 3,                                                    // SHADEBLENDCAPS (SB_CONST_ALPHA|SB_PIXEL_ALPHA)
         121 => 0,                                                    // COLORMGMTCAPS (CM_NONE)
         _ => 0,                                                      // Windows returns 0 for unknown indices
     }
@@ -1962,10 +1962,11 @@ mod tests {
             assert_eq!(GetDeviceCaps(0, 24), -1); // NUMCOLORS
             assert_eq!(GetDeviceCaps(0, 36), 1); // CLIPCAPS
             assert_ne!(GetDeviceCaps(0, 38), 0); // RASTERCAPS
-            assert_eq!(GetDeviceCaps(0, 45), 3); // SHADEBLENDCAPS
+            assert_eq!(GetDeviceCaps(0, 45), 0); // unused index -> 0
             assert!(GetDeviceCaps(0, 88) >= 96); // LOGPIXELSX
             assert_eq!(GetDeviceCaps(0, 108), 24); // COLORRES
             assert!(GetDeviceCaps(0, 116) >= 30); // VREFRESH
+            assert_eq!(GetDeviceCaps(0, 120), 3); // SHADEBLENDCAPS (SB_CONST_ALPHA | SB_PIXEL_ALPHA)
             assert_eq!(GetDeviceCaps(0, 9999), 0); // unknown index -> 0
 
             // Selecting a 64x32 24bpp DIB into a compatible memory DC must NOT override the

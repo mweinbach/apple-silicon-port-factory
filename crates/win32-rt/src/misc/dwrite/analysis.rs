@@ -1197,7 +1197,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     _is_sideways: BOOL,
     is_rtl: BOOL,
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
-    _locale_name: *const u16,
+    locale_name: *const u16,
     number_substitution: *mut c_void,
     features: *const *const c_void,
     feature_range_lengths: *const u32,
@@ -1249,6 +1249,13 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     }
     let was_substituted = units != orig_units;
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
+    let locale = if !locale_name.is_null() {
+        let s = crate::strings::from_wide(locale_name);
+        let trimmed = s.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    } else {
+        None
+    };
     let feat_ranges = super::shaping::read_feature_ranges(
         features,
         feature_range_lengths,
@@ -1263,6 +1270,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
         face.meta.metrics.designUnitsPerEm.max(1) as f32,
         is_rtl != 0,
         no_visual,
+        locale.as_deref(),
         &feat_ranges,
     ) {
         actual_glyph_count.write_unaligned(shaped.glyphs.len() as u32);
@@ -1351,6 +1359,7 @@ unsafe fn try_position_glyphs_platform(
     em_size: f32,
     is_rtl: bool,
     no_visual: bool,
+    locale_name: *const u16,
     features: *const *const c_void,
     feature_range_lengths: *const u32,
     feature_ranges: u32,
@@ -1369,6 +1378,13 @@ unsafe fn try_position_glyphs_platform(
     for i in 0..glyph_count as usize {
         caller_gids.push(glyph_indices.add(i).read_unaligned());
     }
+    let locale = if !locale_name.is_null() {
+        let s = crate::strings::from_wide(locale_name);
+        let trimmed = s.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    } else {
+        None
+    };
     let feat_ranges = super::shaping::read_feature_ranges(
         features,
         feature_range_lengths,
@@ -1384,6 +1400,7 @@ unsafe fn try_position_glyphs_platform(
         em_size,
         is_rtl,
         no_visual,
+        locale.as_deref(),
         &feat_ranges,
     ) {
         if shaped.glyphs.len() == caller_gids.len()
@@ -1431,7 +1448,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
     is_sideways: BOOL,
     is_rtl: BOOL,
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
-    _locale_name: *const u16,
+    locale_name: *const u16,
     features: *const *const c_void,
     feature_range_lengths: *const u32,
     feature_ranges: u32,
@@ -1463,6 +1480,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
             em_size,
             is_rtl != 0,
             no_visual,
+            locale_name,
             features,
             feature_range_lengths,
             feature_ranges,
@@ -1508,7 +1526,7 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     is_sideways: BOOL,
     is_rtl: BOOL,
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
-    _locale_name: *const u16,
+    locale_name: *const u16,
     features: *const *const c_void,
     feature_range_lengths: *const u32,
     feature_ranges: u32,
@@ -1542,6 +1560,7 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
             em_size,
             is_rtl != 0,
             no_visual,
+            locale_name,
             features,
             feature_range_lengths,
             feature_ranges,
