@@ -864,3 +864,163 @@ fn offline_mode_duphandle_escape_and_version() {
         assert_eq!(crate::strings::from_ansi(ver_ptr), "8.7.1");
     }
 }
+
+#[test]
+fn easy_extended_setopt_and_getinfo_behaviors() {
+    use super::easy::{
+        CURLE_FILESIZE_EXCEEDED, CURLE_NOT_BUILT_IN, CURLE_UNKNOWN_OPTION,
+        CURLE_UNSUPPORTED_PROTOCOL, CURLAUTH_BASIC, CURLAUTH_BEARER, CURLINFO_ACTIVESOCKET,
+        CURLINFO_APPCONNECT_TIME_T, CURLINFO_CONDITION_UNMET, CURLINFO_EFFECTIVE_METHOD,
+        CURLINFO_FILETIME_T, CURLINFO_HTTPAUTH_AVAIL, CURLINFO_LOCAL_IP, CURLINFO_LOCAL_PORT,
+        CURLINFO_NAMELOOKUP_TIME_T, CURLINFO_PRETRANSFER_TIME_T, CURLINFO_PRIMARY_PORT,
+        CURLINFO_PROTOCOL, CURLINFO_RETRY_AFTER, CURLINFO_SCHEME, CURLINFO_STARTTRANSFER_TIME_T,
+        CURLPROTO_HTTP, CURLPROTO_HTTPS, CURLOPT_IPRESOLVE, CURLOPT_MAXFILESIZE,
+        CURLOPT_NOPROGRESS, CURLOPT_PROTOCOLS, CURLOPT_REQUEST_TARGET, CURLOPT_RESOLVE,
+        CURLOPT_RESUME_FROM, CURLOPT_SSH_AUTH_TYPES, CURLOPT_TCP_KEEPALIVE,
+        CURLOPT_XFERINFODATA, CURLOPT_XFERINFOFUNCTION, CURLOPT_XOAUTH2_BEARER,
+        CURL_IPRESOLVE_V4,
+    };
+
+    unsafe extern "win64" fn progress_cb(
+        userdata: usize,
+        _dltotal: i64,
+        dlnow: i64,
+        _ultotal: i64,
+        _ulnow: i64,
+    ) -> i32 {
+        if userdata != 0 {
+            let max_seen = &mut *(userdata as *mut i64);
+            *max_seen = (*max_seen).max(dlnow);
+        }
+        0
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        // Request 1: verify RESOLVE, XOAUTH2_BEARER, RESUME_FROM, REQUEST_TARGET, and extended CURLINFO
+        let (mut s1, _) = listener.accept().unwrap();
+        let (h1, _) = read_http_request(&mut s1);
+        assert!(h1.starts_with("GET /override-target HTTP/1.1\r\n"));
+        assert!(h1.contains("Authorization: Bearer tok-99\r\n"));
+        assert!(h1.contains("Range: bytes=4-\r\n"));
+        let resp1 = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "WWW-Authenticate: Basic realm=\"x\", Bearer\r\n",
+            "Retry-After: 42\r\n",
+            "Content-Length: 10\r\n",
+            "\r\n",
+            "0123456789"
+        );
+        s1.write_all(resp1.as_bytes()).unwrap();
+        drop(s1);
+
+        // Request 2: MAXFILESIZE exceeded via Content-Length
+        let (mut s2, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s2);
+        s2.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n")
+            .unwrap();
+    });
+
+    unsafe {
+        let easy = curl_easy_init();
+        let resolve_entry = format!("override.local:{}:127.0.0.1\0", addr.port());
+        let slist = curl_slist_append(std::ptr::null_mut(), resolve_entry.as_ptr());
+        let url = format!("http://override.local:{}/ignored\0", addr.port());
+        let mut body = Vec::<u8>::new();
+        let mut max_progress = -1i64;
+
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_RESOLVE, slist as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4 as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_TCP_KEEPALIVE, 1), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_XOAUTH2_BEARER, b"tok-99\0".as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_RESUME_FROM, 4), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_REQUEST_TARGET, b"/override-target\0".as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_NOPROGRESS, 0), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_XFERINFOFUNCTION, progress_cb as *const () as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_XFERINFODATA, (&mut max_progress as *mut i64) as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, vec_write_cb as *const () as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_WRITEDATA, (&mut body as *mut Vec<u8>) as usize), CURLE_OK);
+
+        assert_eq!(curl_easy_perform(easy), CURLE_OK);
+        assert_eq!(body, b"0123456789");
+        assert_eq!(max_progress, 10);
+
+        // Verify extended CURLINFO_* fields
+        let mut primary_port = 0i32;
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_PRIMARY_PORT, &mut primary_port as *mut i32 as *mut c_void), CURLE_OK);
+        assert_eq!(primary_port, addr.port() as i32);
+
+        let mut local_port = 0i32;
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_LOCAL_PORT, &mut local_port as *mut i32 as *mut c_void), CURLE_OK);
+        assert!(local_port > 0);
+
+        let mut local_ip: *const u8 = std::ptr::null();
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_LOCAL_IP, &mut local_ip as *mut *const u8 as *mut c_void), CURLE_OK);
+        assert_eq!(crate::strings::from_ansi(local_ip), "127.0.0.1");
+
+        let mut scheme: *const u8 = std::ptr::null();
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_SCHEME, &mut scheme as *mut *const u8 as *mut c_void), CURLE_OK);
+        assert_eq!(crate::strings::from_ansi(scheme), "HTTP");
+
+        let mut method: *const u8 = std::ptr::null();
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_METHOD, &mut method as *mut *const u8 as *mut c_void), CURLE_OK);
+        assert_eq!(crate::strings::from_ansi(method), "GET");
+
+        let mut proto = 0i32;
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_PROTOCOL, &mut proto as *mut i32 as *mut c_void), CURLE_OK);
+        assert_eq!(proto, CURLPROTO_HTTP as i32);
+
+        let mut auth_avail = 0i32;
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_HTTPAUTH_AVAIL, &mut auth_avail as *mut i32 as *mut c_void), CURLE_OK);
+        assert_eq!(auth_avail, CURLAUTH_BASIC | CURLAUTH_BEARER);
+
+        let mut retry_after = 0i64;
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_RETRY_AFTER, &mut retry_after as *mut i64 as *mut c_void), CURLE_OK);
+        assert_eq!(retry_after, 42);
+
+        let mut cond_unmet = 99i32;
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_CONDITION_UNMET, &mut cond_unmet as *mut i32 as *mut c_void), CURLE_OK);
+        assert_eq!(cond_unmet, 0);
+
+        let mut filetime = 0i64;
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_FILETIME_T, &mut filetime as *mut i64 as *mut c_void), CURLE_OK);
+        assert_eq!(filetime, -1);
+
+        let mut active_sock = 0usize;
+        assert_eq!(curl_easy_getinfo(easy, CURLINFO_ACTIVESOCKET, &mut active_sock as *mut usize as *mut c_void), CURLE_OK);
+        assert_eq!(active_sock, usize::MAX);
+
+        for info in [
+            CURLINFO_NAMELOOKUP_TIME_T,
+            CURLINFO_PRETRANSFER_TIME_T,
+            CURLINFO_STARTTRANSFER_TIME_T,
+            CURLINFO_APPCONNECT_TIME_T,
+        ] {
+            let mut t_us = -1i64;
+            assert_eq!(curl_easy_getinfo(easy, info, &mut t_us as *mut i64 as *mut c_void), CURLE_OK);
+            assert!(t_us >= 0);
+        }
+
+        // MAXFILESIZE enforcement
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_MAXFILESIZE, 100), CURLE_OK);
+        assert_eq!(curl_easy_perform(easy), CURLE_FILESIZE_EXCEEDED);
+
+        // CURLOPT_PROTOCOLS restriction (allow HTTPS only -> HTTP URL rejected)
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS as usize), CURLE_OK);
+        assert_eq!(curl_easy_perform(easy), CURLE_UNSUPPORTED_PROTOCOL);
+
+        // Built-in disabled protocol option -> CURLE_NOT_BUILT_IN; unknown option/info -> CURLE_UNKNOWN_OPTION
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_SSH_AUTH_TYPES, 1), CURLE_NOT_BUILT_IN);
+        assert_eq!(curl_easy_setopt(easy, 999_999, 0), CURLE_UNKNOWN_OPTION);
+        let mut dummy = 0i64;
+        assert_eq!(curl_easy_getinfo(easy, 0x20_9999, &mut dummy as *mut i64 as *mut c_void), CURLE_UNKNOWN_OPTION);
+
+        curl_slist_free_all(slist);
+        curl_easy_cleanup(easy);
+    }
+
+    server.join().unwrap();
+}

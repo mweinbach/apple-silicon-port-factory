@@ -33,6 +33,24 @@ pub(super) const CURLE_SEND_ERROR: i32 = 55;
 pub(super) const CURLE_RECV_ERROR: i32 = 56;
 pub(super) const CURLE_PEER_FAILED_VERIFICATION: i32 = 60;
 pub(super) const CURLE_BAD_CONTENT_ENCODING: i32 = 61;
+pub(super) const CURLE_FILESIZE_EXCEEDED: i32 = 63;
+
+// Protocol bitmasks (CURLPROTO_*)
+pub(super) const CURLPROTO_HTTP: u32 = 1 << 0;
+pub(super) const CURLPROTO_HTTPS: u32 = 1 << 1;
+pub(super) const CURLPROTO_ALL: u32 = 0xFFFF_FFFF;
+
+// IP resolve modes (CURL_IPRESOLVE_*)
+pub(super) const CURL_IPRESOLVE_WHATEVER: i32 = 0;
+pub(super) const CURL_IPRESOLVE_V4: i32 = 1;
+pub(super) const CURL_IPRESOLVE_V6: i32 = 2;
+
+// Auth bitmasks (CURLAUTH_*)
+pub(super) const CURLAUTH_BASIC: i32 = 1 << 0;
+pub(super) const CURLAUTH_DIGEST: i32 = 1 << 1;
+pub(super) const CURLAUTH_NEGOTIATE: i32 = 1 << 2;
+pub(super) const CURLAUTH_NTLM: i32 = 1 << 3;
+pub(super) const CURLAUTH_BEARER: i32 = 1 << 6;
 
 // CURLSHcode
 pub(super) const CURLSHE_OK: i32 = 0;
@@ -68,8 +86,10 @@ pub(super) const CURLOPT_INFILESIZE: i32 = 14;
 pub(super) const CURLOPT_POSTFIELDS: i32 = 10015;
 pub(super) const CURLOPT_REFERER: i32 = 10016;
 pub(super) const CURLOPT_USERAGENT: i32 = 10018;
+pub(super) const CURLOPT_FTPPORT: i32 = 10017;
 pub(super) const CURLOPT_LOW_SPEED_LIMIT: i32 = 19;
 pub(super) const CURLOPT_LOW_SPEED_TIME: i32 = 20;
+pub(super) const CURLOPT_RESUME_FROM: i32 = 21;
 pub(super) const CURLOPT_COOKIE: i32 = 10022;
 pub(super) const CURLOPT_HTTPHEADER: i32 = 10023;
 pub(super) const CURLOPT_HEADERDATA: i32 = 10029;
@@ -94,6 +114,7 @@ pub(super) const CURLOPT_HTTPPROXYTUNNEL: i32 = 61;
 pub(super) const CURLOPT_SSL_VERIFYPEER: i32 = 64;
 pub(super) const CURLOPT_CAINFO: i32 = 10065;
 pub(super) const CURLOPT_MAXREDIRS: i32 = 68;
+pub(super) const CURLOPT_TELNETOPTIONS: i32 = 10070;
 pub(super) const CURLOPT_MAXCONNECTS: i32 = 71;
 pub(super) const CURLOPT_FRESH_CONNECT: i32 = 74;
 pub(super) const CURLOPT_FORBID_REUSE: i32 = 75;
@@ -112,10 +133,15 @@ pub(super) const CURLOPT_NOSIGNAL: i32 = 99;
 pub(super) const CURLOPT_SHARE: i32 = 10100;
 pub(super) const CURLOPT_ACCEPT_ENCODING: i32 = 10102;
 pub(super) const CURLOPT_PRIVATE: i32 = 10103;
+pub(super) const CURLOPT_UNRESTRICTED_AUTH: i32 = 105;
+pub(super) const CURLOPT_HTTPAUTH: i32 = 107;
 pub(super) const CURLOPT_SSL_CTX_FUNCTION: i32 = 20108;
 pub(super) const CURLOPT_SSL_CTX_DATA: i32 = 10109;
 pub(super) const CURLOPT_IPRESOLVE: i32 = 113;
+pub(super) const CURLOPT_MAXFILESIZE: i32 = 114;
 pub(super) const CURLOPT_INFILESIZE_LARGE: i32 = 30115;
+pub(super) const CURLOPT_RESUME_FROM_LARGE: i32 = 30116;
+pub(super) const CURLOPT_MAXFILESIZE_LARGE: i32 = 30117;
 pub(super) const CURLOPT_POSTFIELDSIZE_LARGE: i32 = 30120;
 pub(super) const CURLOPT_TCP_NODELAY: i32 = 121;
 pub(super) const CURLOPT_MAX_SEND_SPEED_LARGE: i32 = 30145;
@@ -123,6 +149,7 @@ pub(super) const CURLOPT_MAX_RECV_SPEED_LARGE: i32 = 30146;
 pub(super) const CURLOPT_SOCKOPTFUNCTION: i32 = 20148;
 pub(super) const CURLOPT_SOCKOPTDATA: i32 = 10149;
 pub(super) const CURLOPT_SSL_SESSIONID_CACHE: i32 = 150;
+pub(super) const CURLOPT_SSH_AUTH_TYPES: i32 = 151;
 pub(super) const CURLOPT_TIMEOUT_MS: i32 = 155;
 pub(super) const CURLOPT_CONNECTTIMEOUT_MS: i32 = 156;
 pub(super) const CURLOPT_HTTP_TRANSFER_DECODING: i32 = 157;
@@ -138,6 +165,10 @@ pub(super) const CURLOPT_PASSWORD: i32 = 10174;
 pub(super) const CURLOPT_NOPROXY: i32 = 10177;
 pub(super) const CURLOPT_PROTOCOLS: i32 = 181;
 pub(super) const CURLOPT_REDIR_PROTOCOLS: i32 = 182;
+pub(super) const CURLOPT_MAIL_FROM: i32 = 10186;
+pub(super) const CURLOPT_MAIL_RCPT: i32 = 10187;
+pub(super) const CURLOPT_RTSP_REQUEST: i32 = 189;
+pub(super) const CURLOPT_RESOLVE: i32 = 10203;
 pub(super) const CURLOPT_CLOSESOCKETFUNCTION: i32 = 20208;
 pub(super) const CURLOPT_CLOSESOCKETDATA: i32 = 10209;
 pub(super) const CURLOPT_TCP_KEEPALIVE: i32 = 213;
@@ -145,10 +176,20 @@ pub(super) const CURLOPT_TCP_KEEPIDLE: i32 = 214;
 pub(super) const CURLOPT_TCP_KEEPINTVL: i32 = 215;
 pub(super) const CURLOPT_SSL_OPTIONS: i32 = 216;
 pub(super) const CURLOPT_XFERINFOFUNCTION: i32 = 20219;
+pub(super) const CURLOPT_XOAUTH2_BEARER: i32 = 10220;
 pub(super) const CURLOPT_EXPECT_100_TIMEOUT_MS: i32 = 227;
+pub(super) const CURLOPT_SSL_FALSESTART: i32 = 233;
 pub(super) const CURLOPT_PATH_AS_IS: i32 = 234;
 pub(super) const CURLOPT_PIPEWAIT: i32 = 237;
+pub(super) const CURLOPT_DEFAULT_PROTOCOL: i32 = 10238;
+pub(super) const CURLOPT_TCP_FASTOPEN: i32 = 244;
+pub(super) const CURLOPT_KEEP_SENDING_ON_ERROR: i32 = 245;
+pub(super) const CURLOPT_REQUEST_TARGET: i32 = 10266;
 pub(super) const CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS: i32 = 271;
+pub(super) const CURLOPT_DNS_SHUFFLE_ADDRESSES: i32 = 275;
+pub(super) const CURLOPT_UPKEEP_INTERVAL_MS: i32 = 281;
+pub(super) const CURLOPT_MAXAGE_CONN: i32 = 288;
+pub(super) const CURLOPT_MAXLIFETIME_CONN: i32 = 314;
 pub(super) const CURLOPT_PROTOCOLS_STR: i32 = 10318;
 pub(super) const CURLOPT_REDIR_PROTOCOLS_STR: i32 = 10319;
 
@@ -158,34 +199,59 @@ pub(super) const CURLINFO_CONTENT_TYPE: i32 = 0x10_0012;
 pub(super) const CURLINFO_PRIVATE: i32 = 0x10_0015;
 pub(super) const CURLINFO_REDIRECT_URL: i32 = 0x10_001f;
 pub(super) const CURLINFO_PRIMARY_IP: i32 = 0x10_0020;
+pub(super) const CURLINFO_LOCAL_IP: i32 = 0x10_0029;
+pub(super) const CURLINFO_SCHEME: i32 = 0x10_0031;
+pub(super) const CURLINFO_EFFECTIVE_METHOD: i32 = 0x10_003a;
 
 pub(super) const CURLINFO_RESPONSE_CODE: i32 = 0x20_0002;
 pub(super) const CURLINFO_HEADER_SIZE: i32 = 0x20_000b;
 pub(super) const CURLINFO_REQUEST_SIZE: i32 = 0x20_000c;
 pub(super) const CURLINFO_SSL_VERIFYRESULT: i32 = 0x20_000d;
+pub(super) const CURLINFO_FILETIME: i32 = 0x20_000e;
 pub(super) const CURLINFO_REDIRECT_COUNT: i32 = 0x20_0014;
 pub(super) const CURLINFO_HTTP_CONNECTCODE: i32 = 0x20_0016;
+pub(super) const CURLINFO_HTTPAUTH_AVAIL: i32 = 0x20_0017;
+pub(super) const CURLINFO_PROXYAUTH_AVAIL: i32 = 0x20_0018;
 pub(super) const CURLINFO_OS_ERRNO: i32 = 0x20_0019;
 pub(super) const CURLINFO_NUM_CONNECTS: i32 = 0x20_001a;
+pub(super) const CURLINFO_LASTSOCKET: i32 = 0x20_001d;
+pub(super) const CURLINFO_CONDITION_UNMET: i32 = 0x20_0023;
+pub(super) const CURLINFO_PRIMARY_PORT: i32 = 0x20_0028;
+pub(super) const CURLINFO_LOCAL_PORT: i32 = 0x20_002a;
+pub(super) const CURLINFO_PROTOCOL: i32 = 0x20_002b;
 pub(super) const CURLINFO_HTTP_VERSION: i32 = 0x20_002e;
 
 pub(super) const CURLINFO_TOTAL_TIME: i32 = 0x30_0003;
 pub(super) const CURLINFO_NAMELOOKUP_TIME: i32 = 0x30_0004;
 pub(super) const CURLINFO_CONNECT_TIME: i32 = 0x30_0005;
+pub(super) const CURLINFO_PRETRANSFER_TIME: i32 = 0x30_0006;
 pub(super) const CURLINFO_SIZE_UPLOAD: i32 = 0x30_0007;
 pub(super) const CURLINFO_SIZE_DOWNLOAD: i32 = 0x30_0008;
 pub(super) const CURLINFO_SPEED_DOWNLOAD: i32 = 0x30_0009;
 pub(super) const CURLINFO_SPEED_UPLOAD: i32 = 0x30_000a;
 pub(super) const CURLINFO_CONTENT_LENGTH_DOWNLOAD: i32 = 0x30_000f;
 pub(super) const CURLINFO_CONTENT_LENGTH_UPLOAD: i32 = 0x30_0010;
+pub(super) const CURLINFO_STARTTRANSFER_TIME: i32 = 0x30_0011;
+pub(super) const CURLINFO_REDIRECT_TIME: i32 = 0x30_0013;
+pub(super) const CURLINFO_APPCONNECT_TIME: i32 = 0x30_0021;
+
+pub(super) const CURLINFO_ACTIVESOCKET: i32 = 0x50_002c;
 
 pub(super) const CURLINFO_SIZE_UPLOAD_T: i32 = 0x60_0007;
 pub(super) const CURLINFO_SIZE_DOWNLOAD_T: i32 = 0x60_0008;
 pub(super) const CURLINFO_SPEED_DOWNLOAD_T: i32 = 0x60_0009;
 pub(super) const CURLINFO_SPEED_UPLOAD_T: i32 = 0x60_000a;
+pub(super) const CURLINFO_FILETIME_T: i32 = 0x60_000e;
 pub(super) const CURLINFO_CONTENT_LENGTH_DOWNLOAD_T: i32 = 0x60_000f;
 pub(super) const CURLINFO_CONTENT_LENGTH_UPLOAD_T: i32 = 0x60_0010;
 pub(super) const CURLINFO_TOTAL_TIME_T: i32 = 0x60_0032;
+pub(super) const CURLINFO_NAMELOOKUP_TIME_T: i32 = 0x60_0033;
+pub(super) const CURLINFO_CONNECT_TIME_T: i32 = 0x60_0034;
+pub(super) const CURLINFO_PRETRANSFER_TIME_T: i32 = 0x60_0035;
+pub(super) const CURLINFO_STARTTRANSFER_TIME_T: i32 = 0x60_0036;
+pub(super) const CURLINFO_REDIRECT_TIME_T: i32 = 0x60_0037;
+pub(super) const CURLINFO_APPCONNECT_TIME_T: i32 = 0x60_0038;
+pub(super) const CURLINFO_RETRY_AFTER: i32 = 0x60_0039;
 
 // Version feature bits
 pub(super) const CURL_VERSION_IPV6: i32 = 1 << 0;
@@ -367,7 +433,25 @@ pub(super) struct CurlEasyOptions {
     pub(super) userpwd: Option<String>,
     pub(super) username: Option<String>,
     pub(super) password: Option<String>,
+    pub(super) bearer_token: Option<String>,
+    pub(super) unrestricted_auth: bool,
+    pub(super) httpauth: i32,
     pub(super) tcp_nodelay: bool,
+    pub(super) tcp_keepalive: bool,
+    pub(super) tcp_keepidle: u32,
+    pub(super) tcp_keepintvl: u32,
+    pub(super) ipresolve: i32,
+    pub(super) allowed_protocols: u32,
+    pub(super) redir_protocols: u32,
+    pub(super) max_filesize: i64,
+    pub(super) resume_from: i64,
+    pub(super) default_protocol: Option<String>,
+    pub(super) request_target: Option<String>,
+    pub(super) resolve_ptr: usize,
+    pub(super) buffer_size: usize,
+    pub(super) noprogress: bool,
+    pub(super) xferinfo_fn: usize,
+    pub(super) xferinfo_data: usize,
 }
 
 impl Default for CurlEasyOptions {
@@ -413,7 +497,25 @@ impl Default for CurlEasyOptions {
             userpwd: None,
             username: None,
             password: None,
+            bearer_token: None,
+            unrestricted_auth: false,
+            httpauth: CURLAUTH_BASIC,
             tcp_nodelay: true,
+            tcp_keepalive: false,
+            tcp_keepidle: 60,
+            tcp_keepintvl: 60,
+            ipresolve: CURL_IPRESOLVE_WHATEVER,
+            allowed_protocols: CURLPROTO_ALL,
+            redir_protocols: CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            max_filesize: 0,
+            resume_from: 0,
+            default_protocol: None,
+            request_target: None,
+            resolve_ptr: 0,
+            buffer_size: 16384,
+            noprogress: true,
+            xferinfo_fn: 0,
+            xferinfo_data: 0,
         }
     }
 }
@@ -424,9 +526,17 @@ pub(super) struct CurlEasyInfo {
     pub(super) request_size: i32,
     pub(super) redirect_count: i32,
     pub(super) http_connectcode: i32,
+    pub(super) httpauth_avail: i32,
+    pub(super) proxyauth_avail: i32,
     pub(super) ssl_verifyresult: i32,
     pub(super) os_errno: i32,
     pub(super) num_connects: i32,
+    pub(super) primary_port: i32,
+    pub(super) local_port: i32,
+    pub(super) protocol: i32,
+    pub(super) condition_unmet: i32,
+    pub(super) filetime: i64,
+    pub(super) retry_after: i64,
     pub(super) size_download: i64,
     pub(super) size_upload: i64,
     pub(super) content_length_download: i64,
@@ -434,10 +544,17 @@ pub(super) struct CurlEasyInfo {
     pub(super) total_time: f64,
     pub(super) namelookup_time: f64,
     pub(super) connect_time: f64,
+    pub(super) appconnect_time: f64,
+    pub(super) pretransfer_time: f64,
+    pub(super) starttransfer_time: f64,
+    pub(super) redirect_time: f64,
     pub(super) effective_url_cstr: Option<Box<[u8]>>,
     pub(super) content_type_cstr: Option<Box<[u8]>>,
     pub(super) redirect_url_cstr: Option<Box<[u8]>>,
     pub(super) primary_ip_cstr: Option<Box<[u8]>>,
+    pub(super) local_ip_cstr: Option<Box<[u8]>>,
+    pub(super) scheme_cstr: Option<Box<[u8]>>,
+    pub(super) effective_method_cstr: Option<Box<[u8]>>,
 }
 
 impl Default for CurlEasyInfo {
@@ -448,9 +565,17 @@ impl Default for CurlEasyInfo {
             request_size: 0,
             redirect_count: 0,
             http_connectcode: 0,
+            httpauth_avail: 0,
+            proxyauth_avail: 0,
             ssl_verifyresult: 0,
             os_errno: 0,
             num_connects: 0,
+            primary_port: 0,
+            local_port: 0,
+            protocol: 0,
+            condition_unmet: 0,
+            filetime: -1,
+            retry_after: 0,
             size_download: 0,
             size_upload: 0,
             content_length_download: -1,
@@ -458,10 +583,17 @@ impl Default for CurlEasyInfo {
             total_time: 0.0,
             namelookup_time: 0.0,
             connect_time: 0.0,
+            appconnect_time: 0.0,
+            pretransfer_time: 0.0,
+            starttransfer_time: 0.0,
+            redirect_time: 0.0,
             effective_url_cstr: None,
             content_type_cstr: None,
             redirect_url_cstr: None,
             primary_ip_cstr: None,
+            local_ip_cstr: None,
+            scheme_cstr: None,
+            effective_method_cstr: None,
         }
     }
 }
@@ -493,6 +625,9 @@ pub(super) struct CallbackConfig {
     pub(super) writedata: usize,
     pub(super) header_fn: usize,
     pub(super) headerdata: usize,
+    pub(super) xferinfo_fn: usize,
+    pub(super) xferinfo_data: usize,
+    pub(super) noprogress: bool,
     pub(super) include_header_in_body: bool,
     pub(super) error_buffer: usize,
 }
@@ -512,6 +647,8 @@ pub(super) struct TransferRequest {
     pub(super) cookie: Option<String>,
     pub(super) range: Option<String>,
     pub(super) basic_auth: Option<String>,
+    pub(super) bearer_token: Option<String>,
+    pub(super) unrestricted_auth: bool,
     pub(super) accept_encoding: Option<String>,
     pub(super) http_content_decoding: bool,
     pub(super) follow_location: bool,
@@ -524,6 +661,17 @@ pub(super) struct TransferRequest {
     pub(super) ssl_verifypeer: bool,
     pub(super) ssl_verifyhost: bool,
     pub(super) tcp_nodelay: bool,
+    pub(super) tcp_keepalive: bool,
+    pub(super) tcp_keepidle: u32,
+    pub(super) tcp_keepintvl: u32,
+    pub(super) ipresolve: i32,
+    pub(super) allowed_protocols: u32,
+    pub(super) redir_protocols: u32,
+    pub(super) max_filesize: i64,
+    pub(super) default_protocol: Option<String>,
+    pub(super) request_target: Option<String>,
+    pub(super) resolve_entries: Vec<String>,
+    pub(super) buffer_size: usize,
 }
 
 #[derive(Clone)]
@@ -533,13 +681,27 @@ pub(super) struct HeadMeta {
     pub(super) request_size: i32,
     pub(super) redirect_count: i32,
     pub(super) num_connects: i32,
+    pub(super) primary_port: i32,
+    pub(super) local_port: i32,
+    pub(super) protocol: i32,
+    pub(super) condition_unmet: i32,
+    pub(super) httpauth_avail: i32,
+    pub(super) proxyauth_avail: i32,
+    pub(super) retry_after: i64,
     pub(super) content_length_download: i64,
     pub(super) effective_url: String,
     pub(super) content_type: Option<String>,
     pub(super) redirect_url: Option<String>,
     pub(super) primary_ip: Option<String>,
+    pub(super) local_ip: Option<String>,
+    pub(super) scheme: String,
+    pub(super) effective_method: String,
     pub(super) namelookup_time: f64,
     pub(super) connect_time: f64,
+    pub(super) appconnect_time: f64,
+    pub(super) pretransfer_time: f64,
+    pub(super) starttransfer_time: f64,
+    pub(super) redirect_time: f64,
 }
 
 pub(super) struct TransferOutcome {
@@ -567,13 +729,27 @@ pub(super) fn apply_head_meta(easy: &Arc<Mutex<CurlEasy>>, meta: HeadMeta) {
     e.info.request_size = meta.request_size;
     e.info.redirect_count = meta.redirect_count;
     e.info.num_connects = meta.num_connects;
+    e.info.primary_port = meta.primary_port;
+    e.info.local_port = meta.local_port;
+    e.info.protocol = meta.protocol;
+    e.info.condition_unmet = meta.condition_unmet;
+    e.info.httpauth_avail = meta.httpauth_avail;
+    e.info.proxyauth_avail = meta.proxyauth_avail;
+    e.info.retry_after = meta.retry_after;
     e.info.content_length_download = meta.content_length_download;
     e.info.effective_url_cstr = Some(make_cstr_box(&meta.effective_url));
     e.info.content_type_cstr = meta.content_type.as_deref().map(make_cstr_box);
     e.info.redirect_url_cstr = meta.redirect_url.as_deref().map(make_cstr_box);
     e.info.primary_ip_cstr = meta.primary_ip.as_deref().map(make_cstr_box);
+    e.info.local_ip_cstr = meta.local_ip.as_deref().map(make_cstr_box);
+    e.info.scheme_cstr = Some(make_cstr_box(&meta.scheme));
+    e.info.effective_method_cstr = Some(make_cstr_box(&meta.effective_method));
     e.info.namelookup_time = meta.namelookup_time;
     e.info.connect_time = meta.connect_time;
+    e.info.appconnect_time = meta.appconnect_time;
+    e.info.pretransfer_time = meta.pretransfer_time;
+    e.info.starttransfer_time = meta.starttransfer_time;
+    e.info.redirect_time = meta.redirect_time;
 }
 
 pub(super) unsafe fn write_error_buffer(buf: usize, msg: &str) {
@@ -634,6 +810,9 @@ pub(super) unsafe fn prepare_transfer(
         writedata: opts.writedata,
         header_fn: opts.header_fn,
         headerdata: opts.headerdata,
+        xferinfo_fn: opts.xferinfo_fn,
+        xferinfo_data: opts.xferinfo_data,
+        noprogress: opts.noprogress,
         include_header_in_body: opts.include_header_in_body,
         error_buffer: opts.error_buffer,
     };
@@ -716,6 +895,20 @@ pub(super) unsafe fn prepare_transfer(
         None
     };
 
+    let resolve_entries = if opts.resolve_ptr != 0 {
+        read_slist_strings(opts.resolve_ptr as *const CurlSlist)
+    } else {
+        Vec::new()
+    };
+
+    let effective_range = opts.range.clone().or_else(|| {
+        if opts.resume_from > 0 {
+            Some(format!("{}-", opts.resume_from))
+        } else {
+            None
+        }
+    });
+
     let is_post_default_ct = opts.post && !opts.upload && !opts.nobody;
 
     Ok((
@@ -732,8 +925,10 @@ pub(super) unsafe fn prepare_transfer(
             referer: opts.referer,
             autoreferer: opts.autoreferer,
             cookie: opts.cookie,
-            range: opts.range,
+            range: effective_range,
             basic_auth,
+            bearer_token: opts.bearer_token,
+            unrestricted_auth: opts.unrestricted_auth,
             accept_encoding: opts.accept_encoding,
             http_content_decoding: opts.http_content_decoding,
             follow_location: opts.follow_location,
@@ -746,6 +941,17 @@ pub(super) unsafe fn prepare_transfer(
             ssl_verifypeer: opts.ssl_verifypeer,
             ssl_verifyhost: opts.ssl_verifyhost,
             tcp_nodelay: opts.tcp_nodelay,
+            tcp_keepalive: opts.tcp_keepalive,
+            tcp_keepidle: opts.tcp_keepidle,
+            tcp_keepintvl: opts.tcp_keepintvl,
+            ipresolve: opts.ipresolve,
+            allowed_protocols: opts.allowed_protocols,
+            redir_protocols: opts.redir_protocols,
+            max_filesize: opts.max_filesize,
+            default_protocol: opts.default_protocol,
+            request_target: opts.request_target,
+            resolve_entries,
+            buffer_size: opts.buffer_size.clamp(1024, 512 * 1024),
         },
         cb,
     ))
@@ -861,6 +1067,67 @@ pub(super) unsafe fn invoke_write_callback(cb: CallbackConfig, data: &[u8]) -> R
         return Err(CURLE_WRITE_ERROR);
     }
     Ok(())
+}
+
+pub(super) unsafe fn invoke_xferinfo_callback(
+    cb: CallbackConfig,
+    dltotal: i64,
+    dlnow: i64,
+    ultotal: i64,
+    ulnow: i64,
+) -> Result<(), i32> {
+    if cb.noprogress || cb.xferinfo_fn == 0 {
+        return Ok(());
+    }
+    let rc = crate::call_guest8(
+        cb.xferinfo_fn,
+        cb.xferinfo_data as u64,
+        dltotal as u64,
+        dlnow as u64,
+        ultotal as u64,
+        ulnow as u64,
+        0,
+        0,
+        0,
+    ) as i32;
+    if rc != 0 {
+        return Err(CURLE_ABORTED_BY_CALLBACK);
+    }
+    Ok(())
+}
+
+fn parse_protocols_str(s: &str) -> Result<u32, i32> {
+    let mut mask = 0u32;
+    for tok in s.split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.eq_ignore_ascii_case("all") {
+            mask |= CURLPROTO_ALL;
+        } else if t.eq_ignore_ascii_case("http") {
+            mask |= CURLPROTO_HTTP;
+        } else if t.eq_ignore_ascii_case("https") {
+            mask |= CURLPROTO_HTTPS;
+        } else if t.starts_with('-') || t.starts_with('+') {
+            let (neg, name) = (t.starts_with('-'), t[1..].trim());
+            let bit = if name.eq_ignore_ascii_case("http") {
+                CURLPROTO_HTTP
+            } else if name.eq_ignore_ascii_case("https") {
+                CURLPROTO_HTTPS
+            } else if name.eq_ignore_ascii_case("all") {
+                CURLPROTO_ALL
+            } else {
+                0
+            };
+            if neg {
+                mask &= !bit;
+            } else {
+                mask |= bit;
+            }
+        }
+    }
+    Ok(mask)
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,36 +1364,125 @@ pub(super) unsafe fn easy_setopt(easy: usize, option: i32, param: usize) -> i32 
         CURLOPT_TCP_NODELAY => {
             opts.tcp_nodelay = long_val != 0;
         }
-        CURLOPT_SSL_CTX_FUNCTION => {
-            // Matches Windows Schannel libcurl: SSL_CTX_FUNCTION is OpenSSL-only.
+        CURLOPT_TCP_KEEPALIVE => {
+            opts.tcp_keepalive = long_val != 0;
+        }
+        CURLOPT_TCP_KEEPIDLE => {
+            if long_val > 0 {
+                opts.tcp_keepidle = long_val as u32;
+            }
+        }
+        CURLOPT_TCP_KEEPINTVL => {
+            if long_val > 0 {
+                opts.tcp_keepintvl = long_val as u32;
+            }
+        }
+        CURLOPT_IPRESOLVE => {
+            if !matches!(
+                long_val,
+                CURL_IPRESOLVE_WHATEVER | CURL_IPRESOLVE_V4 | CURL_IPRESOLVE_V6
+            ) {
+                return CURLE_BAD_FUNCTION_ARGUMENT;
+            }
+            opts.ipresolve = long_val;
+        }
+        CURLOPT_PROTOCOLS => {
+            opts.allowed_protocols = param as u32;
+        }
+        CURLOPT_REDIR_PROTOCOLS => {
+            opts.redir_protocols = param as u32;
+        }
+        CURLOPT_PROTOCOLS_STR => {
+            if let Some(s) = crate::strings::from_ansi_opt(param as *const u8) {
+                opts.allowed_protocols = parse_protocols_str(&s).unwrap_or(0);
+            } else {
+                opts.allowed_protocols = CURLPROTO_ALL;
+            }
+        }
+        CURLOPT_REDIR_PROTOCOLS_STR => {
+            if let Some(s) = crate::strings::from_ansi_opt(param as *const u8) {
+                opts.redir_protocols = parse_protocols_str(&s).unwrap_or(0);
+            } else {
+                opts.redir_protocols = CURLPROTO_HTTP | CURLPROTO_HTTPS;
+            }
+        }
+        CURLOPT_UNRESTRICTED_AUTH => {
+            opts.unrestricted_auth = long_val != 0;
+        }
+        CURLOPT_HTTPAUTH => {
+            opts.httpauth = long_val;
+        }
+        CURLOPT_XOAUTH2_BEARER => {
+            opts.bearer_token = crate::strings::from_ansi_opt(param as *const u8);
+        }
+        CURLOPT_MAXFILESIZE => {
+            opts.max_filesize = long_val.max(0) as i64;
+        }
+        CURLOPT_MAXFILESIZE_LARGE => {
+            opts.max_filesize = off_val.max(0);
+        }
+        CURLOPT_RESUME_FROM => {
+            opts.resume_from = long_val.max(0) as i64;
+        }
+        CURLOPT_RESUME_FROM_LARGE => {
+            opts.resume_from = off_val.max(0);
+        }
+        CURLOPT_DEFAULT_PROTOCOL => {
+            opts.default_protocol = crate::strings::from_ansi_opt(param as *const u8);
+        }
+        CURLOPT_REQUEST_TARGET => {
+            opts.request_target = crate::strings::from_ansi_opt(param as *const u8);
+        }
+        CURLOPT_RESOLVE => {
+            opts.resolve_ptr = param;
+        }
+        CURLOPT_BUFFERSIZE => {
+            if long_val > 0 {
+                opts.buffer_size = long_val as usize;
+            }
+        }
+        CURLOPT_NOPROGRESS => {
+            opts.noprogress = long_val != 0;
+        }
+        CURLOPT_XFERINFOFUNCTION => {
+            opts.xferinfo_fn = param;
+        }
+        CURLOPT_XFERINFODATA => {
+            opts.xferinfo_data = param;
+        }
+        CURLOPT_SSL_CTX_FUNCTION
+        | CURLOPT_FTPPORT
+        | CURLOPT_TELNETOPTIONS
+        | CURLOPT_SSH_AUTH_TYPES
+        | CURLOPT_MAIL_FROM
+        | CURLOPT_MAIL_RCPT
+        | CURLOPT_RTSP_REQUEST => {
+            // Matches upstream libcurl built with HTTP/HTTPS-only + rustls (no OpenSSL/FTP/SSH/SMTP/RTSP).
             return CURLE_NOT_BUILT_IN;
         }
         CURLOPT_NOSIGNAL
-        | CURLOPT_NOPROGRESS
         | CURLOPT_HTTP_VERSION
         | CURLOPT_DNS_CACHE_TIMEOUT
-        | CURLOPT_BUFFERSIZE
         | CURLOPT_FRESH_CONNECT
         | CURLOPT_FORBID_REUSE
         | CURLOPT_MAXCONNECTS
         | CURLOPT_LOW_SPEED_LIMIT
         | CURLOPT_LOW_SPEED_TIME
         | CURLOPT_SSLVERSION
-        | CURLOPT_IPRESOLVE
         | CURLOPT_SSL_OPTIONS
         | CURLOPT_SSL_SESSIONID_CACHE
-        | CURLOPT_TCP_KEEPALIVE
-        | CURLOPT_TCP_KEEPIDLE
-        | CURLOPT_TCP_KEEPINTVL
+        | CURLOPT_SSL_FALSESTART
         | CURLOPT_EXPECT_100_TIMEOUT_MS
         | CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS
+        | CURLOPT_DNS_SHUFFLE_ADDRESSES
+        | CURLOPT_TCP_FASTOPEN
+        | CURLOPT_KEEP_SENDING_ON_ERROR
+        | CURLOPT_UPKEEP_INTERVAL_MS
+        | CURLOPT_MAXAGE_CONN
+        | CURLOPT_MAXLIFETIME_CONN
         | CURLOPT_PIPEWAIT
         | CURLOPT_PATH_AS_IS
         | CURLOPT_HTTP_TRANSFER_DECODING
-        | CURLOPT_PROTOCOLS
-        | CURLOPT_REDIR_PROTOCOLS
-        | CURLOPT_PROTOCOLS_STR
-        | CURLOPT_REDIR_PROTOCOLS_STR
         | CURLOPT_SHARE
         | CURLOPT_CAPATH
         | CURLOPT_COOKIEFILE
@@ -1141,8 +1497,6 @@ pub(super) unsafe fn easy_setopt(easy: usize, option: i32, param: usize) -> i32 
         | CURLOPT_DEBUGFUNCTION
         | CURLOPT_DEBUGDATA
         | CURLOPT_PROGRESSFUNCTION
-        | CURLOPT_XFERINFOFUNCTION
-        | CURLOPT_XFERINFODATA
         | CURLOPT_SSL_CTX_DATA
         | CURLOPT_SOCKOPTFUNCTION
         | CURLOPT_SOCKOPTDATA
@@ -1152,10 +1506,11 @@ pub(super) unsafe fn easy_setopt(easy: usize, option: i32, param: usize) -> i32 
         | CURLOPT_CLOSESOCKETDATA
         | CURLOPT_SEEKFUNCTION
         | CURLOPT_SEEKDATA => {
-            log::trace!("libcurl: accepted no-op/tuning curl_easy_setopt({option}, {param:#x})");
+            log::trace!("libcurl: accepted tuning curl_easy_setopt({option}, {param:#x})");
         }
         other => {
-            stub!("libcurl: unsupported curl_easy_setopt(option={other}, param={param:#x})");
+            // Standard libcurl behavior: unrecognized CURLOPT_* ID returns CURLE_UNKNOWN_OPTION (48).
+            log::debug!("libcurl: unknown curl_easy_setopt(option={other}, param={param:#x}) -> CURLE_UNKNOWN_OPTION");
             return CURLE_UNKNOWN_OPTION;
         }
     }
@@ -1232,6 +1587,30 @@ pub(super) unsafe fn easy_getinfo(easy: usize, info: i32, out: *mut c_void) -> i
                 .unwrap_or_else(|| b"\0".as_ptr() as usize);
             std::ptr::write_unaligned(out as *mut usize, p);
         }
+        CURLINFO_LOCAL_IP => {
+            let p = st
+                .local_ip_cstr
+                .as_ref()
+                .map(|b| b.as_ptr() as usize)
+                .unwrap_or_else(|| b"\0".as_ptr() as usize);
+            std::ptr::write_unaligned(out as *mut usize, p);
+        }
+        CURLINFO_SCHEME => {
+            let p = st
+                .scheme_cstr
+                .as_ref()
+                .map(|b| b.as_ptr() as usize)
+                .unwrap_or(0);
+            std::ptr::write_unaligned(out as *mut usize, p);
+        }
+        CURLINFO_EFFECTIVE_METHOD => {
+            let p = st
+                .effective_method_cstr
+                .as_ref()
+                .map(|b| b.as_ptr() as usize)
+                .unwrap_or(0);
+            std::ptr::write_unaligned(out as *mut usize, p);
+        }
 
         // Long infos (4-byte `long` = `i32` on Win64 LLP64)
         CURLINFO_RESPONSE_CODE => {
@@ -1246,17 +1625,42 @@ pub(super) unsafe fn easy_getinfo(easy: usize, info: i32, out: *mut c_void) -> i
         CURLINFO_SSL_VERIFYRESULT => {
             std::ptr::write_unaligned(out as *mut i32, st.ssl_verifyresult);
         }
+        CURLINFO_FILETIME => {
+            std::ptr::write_unaligned(out as *mut i32, st.filetime as i32);
+        }
         CURLINFO_REDIRECT_COUNT => {
             std::ptr::write_unaligned(out as *mut i32, st.redirect_count);
         }
         CURLINFO_HTTP_CONNECTCODE => {
             std::ptr::write_unaligned(out as *mut i32, st.http_connectcode);
         }
+        CURLINFO_HTTPAUTH_AVAIL => {
+            std::ptr::write_unaligned(out as *mut i32, st.httpauth_avail);
+        }
+        CURLINFO_PROXYAUTH_AVAIL => {
+            std::ptr::write_unaligned(out as *mut i32, st.proxyauth_avail);
+        }
         CURLINFO_OS_ERRNO => {
             std::ptr::write_unaligned(out as *mut i32, st.os_errno);
         }
         CURLINFO_NUM_CONNECTS => {
             std::ptr::write_unaligned(out as *mut i32, st.num_connects);
+        }
+        CURLINFO_LASTSOCKET => {
+            // Connection: close — no socket remains open after transfer completes.
+            std::ptr::write_unaligned(out as *mut i32, -1);
+        }
+        CURLINFO_CONDITION_UNMET => {
+            std::ptr::write_unaligned(out as *mut i32, st.condition_unmet);
+        }
+        CURLINFO_PRIMARY_PORT => {
+            std::ptr::write_unaligned(out as *mut i32, st.primary_port);
+        }
+        CURLINFO_LOCAL_PORT => {
+            std::ptr::write_unaligned(out as *mut i32, st.local_port);
+        }
+        CURLINFO_PROTOCOL => {
+            std::ptr::write_unaligned(out as *mut i32, st.protocol);
         }
         CURLINFO_HTTP_VERSION => {
             let v = if st.response_code != 0 {
@@ -1265,6 +1669,11 @@ pub(super) unsafe fn easy_getinfo(easy: usize, info: i32, out: *mut c_void) -> i
                 0
             };
             std::ptr::write_unaligned(out as *mut i32, v);
+        }
+
+        // Socket info (Win64 curl_socket_t = SOCKET = usize; CURL_SOCKET_BAD = usize::MAX)
+        CURLINFO_ACTIVESOCKET => {
+            std::ptr::write_unaligned(out as *mut usize, usize::MAX);
         }
 
         // Double infos (8-byte `f64`)
@@ -1276,6 +1685,18 @@ pub(super) unsafe fn easy_getinfo(easy: usize, info: i32, out: *mut c_void) -> i
         }
         CURLINFO_CONNECT_TIME => {
             std::ptr::write_unaligned(out as *mut f64, st.connect_time);
+        }
+        CURLINFO_APPCONNECT_TIME => {
+            std::ptr::write_unaligned(out as *mut f64, st.appconnect_time);
+        }
+        CURLINFO_PRETRANSFER_TIME => {
+            std::ptr::write_unaligned(out as *mut f64, st.pretransfer_time);
+        }
+        CURLINFO_STARTTRANSFER_TIME => {
+            std::ptr::write_unaligned(out as *mut f64, st.starttransfer_time);
+        }
+        CURLINFO_REDIRECT_TIME => {
+            std::ptr::write_unaligned(out as *mut f64, st.redirect_time);
         }
         CURLINFO_SIZE_UPLOAD => {
             std::ptr::write_unaligned(out as *mut f64, st.size_upload as f64);
@@ -1329,6 +1750,9 @@ pub(super) unsafe fn easy_getinfo(easy: usize, info: i32, out: *mut c_void) -> i
             };
             std::ptr::write_unaligned(out as *mut i64, spd);
         }
+        CURLINFO_FILETIME_T => {
+            std::ptr::write_unaligned(out as *mut i64, st.filetime);
+        }
         CURLINFO_CONTENT_LENGTH_DOWNLOAD_T => {
             std::ptr::write_unaligned(out as *mut i64, st.content_length_download);
         }
@@ -1336,12 +1760,33 @@ pub(super) unsafe fn easy_getinfo(easy: usize, info: i32, out: *mut c_void) -> i
             std::ptr::write_unaligned(out as *mut i64, st.content_length_upload);
         }
         CURLINFO_TOTAL_TIME_T => {
-            let us = (st.total_time * 1_000_000.0) as i64;
-            std::ptr::write_unaligned(out as *mut i64, us);
+            std::ptr::write_unaligned(out as *mut i64, (st.total_time * 1_000_000.0) as i64);
+        }
+        CURLINFO_NAMELOOKUP_TIME_T => {
+            std::ptr::write_unaligned(out as *mut i64, (st.namelookup_time * 1_000_000.0) as i64);
+        }
+        CURLINFO_CONNECT_TIME_T => {
+            std::ptr::write_unaligned(out as *mut i64, (st.connect_time * 1_000_000.0) as i64);
+        }
+        CURLINFO_PRETRANSFER_TIME_T => {
+            std::ptr::write_unaligned(out as *mut i64, (st.pretransfer_time * 1_000_000.0) as i64);
+        }
+        CURLINFO_STARTTRANSFER_TIME_T => {
+            std::ptr::write_unaligned(out as *mut i64, (st.starttransfer_time * 1_000_000.0) as i64);
+        }
+        CURLINFO_REDIRECT_TIME_T => {
+            std::ptr::write_unaligned(out as *mut i64, (st.redirect_time * 1_000_000.0) as i64);
+        }
+        CURLINFO_APPCONNECT_TIME_T => {
+            std::ptr::write_unaligned(out as *mut i64, (st.appconnect_time * 1_000_000.0) as i64);
+        }
+        CURLINFO_RETRY_AFTER => {
+            std::ptr::write_unaligned(out as *mut i64, st.retry_after);
         }
 
         other => {
-            stub!("libcurl: unsupported curl_easy_getinfo(info={other:#x})");
+            // Standard libcurl behavior: unrecognized CURLINFO_* ID returns CURLE_UNKNOWN_OPTION (48).
+            log::debug!("libcurl: unknown curl_easy_getinfo(info={other:#x}) -> CURLE_UNKNOWN_OPTION");
             return CURLE_UNKNOWN_OPTION;
         }
     }
@@ -1383,6 +1828,7 @@ pub(super) fn easy_strerror(code: i32) -> *const u8 {
         CURLE_BAD_CONTENT_ENCODING => {
             b"Unrecognized or bad HTTP Content or Transfer-Encoding\0".as_ptr()
         }
+        CURLE_FILESIZE_EXCEEDED => b"Maximum file size exceeded\0".as_ptr(),
         _ => b"Unknown CURL error\0".as_ptr(),
     }
 }
