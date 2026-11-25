@@ -7047,3 +7047,135 @@ fn strong_sign_para_rejects_sha1_self_issued_rollover_ca() {
         CertFreeCertificateContext(leaf_ctx);
     }
 }
+
+#[test]
+fn cert_archived_prop_skips_enumeration_but_allows_explicit_find_and_enum_archived_flag() {
+    use super::store::{
+        CERT_ARCHIVED_PROP_ID, CERT_FIND_ANY, CERT_FIND_EXISTING, CERT_STORE_ENUM_ARCHIVED_FLAG,
+        CERT_STORE_PROV_MEMORY,
+    };
+
+    unsafe {
+        let st = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert!(!st.is_null());
+        let mut c1: *mut c_void = std::ptr::null_mut();
+        let mut c2: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                st,
+                X509_ASN_ENCODING,
+                crate::misc::secur32::tests::TEST_CA_DER.as_ptr(),
+                crate::misc::secur32::tests::TEST_CA_DER.len() as u32,
+                CERT_STORE_ADD_NEW,
+                &mut c1,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                st,
+                X509_ASN_ENCODING,
+                crate::misc::secur32::tests::TEST_LEAF_DER.as_ptr(),
+                crate::misc::secur32::tests::TEST_LEAF_DER.len() as u32,
+                CERT_STORE_ADD_NEW,
+                &mut c2,
+            ),
+            TRUE
+        );
+
+        // Archive c1 via empty CRYPT_DATA_BLOB on CERT_ARCHIVED_PROP_ID (19).
+        let empty_blob = CryptDataBlob {
+            cb_data: 0,
+            pb_data: std::ptr::null(),
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                c1,
+                CERT_ARCHIVED_PROP_ID,
+                0,
+                &empty_blob as *const _ as *const c_void,
+            ),
+            TRUE
+        );
+
+        // Ordinary CertEnumCertificatesInStore MUST skip archived c1 and yield only c2.
+        let mut enum_seen = Vec::new();
+        let mut cur = CertEnumCertificatesInStore(st, std::ptr::null_mut());
+        while !cur.is_null() {
+            enum_seen.push(cur);
+            cur = CertEnumCertificatesInStore(st, cur);
+        }
+        assert_eq!(enum_seen, vec![c2], "archived cert must be skipped during ordinary enumeration");
+
+        // CERT_FIND_ANY without CERT_STORE_ENUM_ARCHIVED_FLAG also skips archived c1.
+        let any_hit = CertFindCertificateInStore(
+            st,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_ANY,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(any_hit, c2);
+        let any_next = CertFindCertificateInStore(
+            st,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_ANY,
+            std::ptr::null(),
+            any_hit,
+        );
+        assert!(any_next.is_null());
+
+        // Explicit search (CERT_FIND_EXISTING) MUST still find archived c1.
+        let explicit_hit = CertFindCertificateInStore(
+            st,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_EXISTING,
+            c1,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(explicit_hit, c1, "archived cert must remain discoverable via explicit search");
+        CertFreeCertificateContext(explicit_hit);
+
+        // Store opened with CERT_STORE_ENUM_ARCHIVED_FLAG MUST include archived certificates.
+        let st_arch = CertOpenStore(
+            CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            CERT_STORE_ENUM_ARCHIVED_FLAG,
+            std::ptr::null(),
+        );
+        let mut copied_c1: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertAddCertificateContextToStore(st_arch, c1, CERT_STORE_ADD_NEW, &mut copied_c1),
+            TRUE
+        );
+        let first_arch = CertEnumCertificatesInStore(st_arch, std::ptr::null_mut());
+        assert_eq!(
+            first_arch, copied_c1,
+            "CERT_STORE_ENUM_ARCHIVED_FLAG must expose archived certs during enumeration"
+        );
+        CertFreeCertificateContext(first_arch);
+        CertFreeCertificateContext(copied_c1);
+        CertCloseStore(st_arch, 0);
+
+        // Removing CERT_ARCHIVED_PROP_ID makes c1 visible in enumeration again.
+        assert_eq!(
+            CertSetCertificateContextProperty(c1, CERT_ARCHIVED_PROP_ID, 0, std::ptr::null()),
+            TRUE
+        );
+        let mut unarchived_seen = Vec::new();
+        let mut cur2 = CertEnumCertificatesInStore(st, std::ptr::null_mut());
+        while !cur2.is_null() {
+            unarchived_seen.push(cur2);
+            cur2 = CertEnumCertificatesInStore(st, cur2);
+        }
+        assert_eq!(unarchived_seen, vec![c1, c2]);
+
+        CertFreeCertificateContext(c2);
+        CertFreeCertificateContext(c1);
+        CertCloseStore(st, 0);
+    }
+}

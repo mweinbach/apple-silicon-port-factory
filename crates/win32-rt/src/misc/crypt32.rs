@@ -83,10 +83,10 @@ pub unsafe extern "win64" fn CertOpenStore(
     lpsz_store_provider: *const u8,
     _dw_encoding_type: u32,
     _h_crypt_prov: usize,
-    _dw_flags: u32,
+    dw_flags: u32,
     pv_para: *const c_void,
 ) -> *mut c_void {
-    store::cert_open_store_impl(lpsz_store_provider, pv_para)
+    store::cert_open_store_with_flags_impl(lpsz_store_provider, dw_flags, pv_para)
 }
 
 pub unsafe extern "win64" fn CertOpenSystemStoreA(

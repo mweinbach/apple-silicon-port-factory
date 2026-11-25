@@ -80,6 +80,8 @@ pub(super) const CERT_ISSUER_PUBLIC_KEY_MD5_HASH_PROP_ID: u32 = 24;
 pub(super) const CERT_SUBJECT_PUBLIC_KEY_MD5_HASH_PROP_ID: u32 = 25;
 pub(super) const CERT_DATE_STAMP_PROP_ID: u32 = 27;
 pub(super) const CERT_SUBJECT_NAME_MD5_HASH_PROP_ID: u32 = 29;
+pub(super) const CERT_STORE_ENUM_ARCHIVED_FLAG: u32 = 0x0000_0200;
+pub(super) const CERT_ARCHIVED_PROP_ID: u32 = 19;
 pub(super) const CERT_NCRYPT_KEY_HANDLE_PROP_ID: u32 = 78;
 const CERT_NCRYPT_KEY_HANDLE_TRANSFER_PROP_ID: u32 = 99;
 pub(super) const CERT_SHA256_HASH_PROP_ID: u32 = 107;
@@ -142,6 +144,7 @@ struct RegisteredStore {
     refcount: usize,
     certs: Vec<usize>,
     is_ntauth: bool,
+    enum_archived: bool,
 }
 
 #[derive(Default)]
@@ -453,6 +456,7 @@ pub(crate) fn register_peer_cert_chain(
             refcount: 1,
             certs: store_certs,
             is_ntauth: false,
+            enum_archived: false,
         },
     );
 
@@ -534,7 +538,7 @@ pub(super) fn cert_free_certificate_context_impl(ctx: *mut c_void) -> BOOL {
     TRUE
 }
 
-fn open_named_system_store(store_name: &str) -> *mut c_void {
+fn open_named_system_store(store_name: &str, enum_archived: bool) -> *mut c_void {
     let upper = store_name.trim().to_ascii_uppercase();
     let seed_roots = matches!(upper.as_str(), "ROOT" | "AUTHROOT" | "CA");
     let is_ntauth = upper == "NTAUTH";
@@ -579,7 +583,15 @@ fn open_named_system_store(store_name: &str) -> *mut c_void {
             }
         }
     }
-    st.stores.insert(id, RegisteredStore { refcount: 1, certs, is_ntauth });
+    st.stores.insert(
+        id,
+        RegisteredStore {
+            refcount: 1,
+            certs,
+            is_ntauth,
+            enum_archived,
+        },
+    );
     log::debug!("CertOpenStore(system={store_name:?}) -> {id:#x} (seeded={seed_roots})");
     id as *mut c_void
 }
@@ -593,6 +605,15 @@ pub(super) unsafe fn cert_open_store_impl(
     lpsz_store_provider: *const u8,
     pv_para: *const c_void,
 ) -> *mut c_void {
+    cert_open_store_with_flags_impl(lpsz_store_provider, 0, pv_para)
+}
+
+pub(super) unsafe fn cert_open_store_with_flags_impl(
+    lpsz_store_provider: *const u8,
+    dw_flags: u32,
+    pv_para: *const c_void,
+) -> *mut c_void {
+    let enum_archived = (dw_flags & CERT_STORE_ENUM_ARCHIVED_FLAG) != 0;
     let prov = lpsz_store_provider as usize;
     let prov_str = if prov > 0xFFFF {
         Some(crate::strings::from_ansi(lpsz_store_provider))
@@ -614,6 +635,7 @@ pub(super) unsafe fn cert_open_store_impl(
                 refcount: 1,
                 certs: Vec::new(),
                 is_ntauth: false,
+                enum_archived,
             },
         );
         return id as *mut c_void;
@@ -630,7 +652,7 @@ pub(super) unsafe fn cert_open_store_impl(
             return std::ptr::null_mut();
         }
         let name = crate::strings::from_ansi(pv_para as *const u8);
-        return open_named_system_store(&name);
+        return open_named_system_store(&name, enum_archived);
     }
 
     let is_system_w = prov == CERT_STORE_PROV_SYSTEM_W
@@ -647,7 +669,7 @@ pub(super) unsafe fn cert_open_store_impl(
             return std::ptr::null_mut();
         }
         let name = crate::strings::from_wide(pv_para as *const u16);
-        return open_named_system_store(&name);
+        return open_named_system_store(&name, enum_archived);
     }
 
     stub!("CertOpenStore(provider={prov:#x}) -> NULL");
@@ -917,10 +939,10 @@ pub(super) fn cert_enum_certificates_in_store_impl(
     p_prev_cert_context: *mut c_void,
 ) -> *mut c_void {
     let mut st = STORE_STATE.lock().unwrap();
-    let Some(certs) = st
+    let Some((certs, enum_archived)) = st
         .stores
         .get(&(h_cert_store as usize))
-        .map(|s| s.certs.clone())
+        .map(|s| (s.certs.clone(), s.enum_archived))
     else {
         if !p_prev_cert_context.is_null() {
             release_cert_locked(&mut st, p_prev_cert_context as usize);
@@ -943,14 +965,17 @@ pub(super) fn cert_enum_certificates_in_store_impl(
             }
         }
     };
-    let Some(&next_h) = certs.get(next_idx) else {
-        crate::teb::set_last_error(CRYPT_E_NOT_FOUND);
-        return std::ptr::null_mut();
-    };
-    if let Some(c) = st.certs.get_mut(&next_h) {
-        c.refcount += 1;
+    for &cert_h in &certs[next_idx..] {
+        if let Some(c) = st.certs.get_mut(&cert_h) {
+            if !enum_archived && c.properties.contains_key(&CERT_ARCHIVED_PROP_ID) {
+                continue;
+            }
+            c.refcount += 1;
+            return cert_h as *mut c_void;
+        }
     }
-    next_h as *mut c_void
+    crate::teb::set_last_error(CRYPT_E_NOT_FOUND);
+    std::ptr::null_mut()
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,10 +1324,10 @@ pub(super) unsafe fn cert_find_certificate_in_store_impl(
     p_prev_cert_context: *mut c_void,
 ) -> *mut c_void {
     let mut st = STORE_STATE.lock().unwrap();
-    let Some(certs) = st
+    let Some((certs, enum_archived)) = st
         .stores
         .get(&(h_cert_store as usize))
-        .map(|s| s.certs.clone())
+        .map(|s| (s.certs.clone(), s.enum_archived))
     else {
         if !p_prev_cert_context.is_null() {
             release_cert_locked(&mut st, p_prev_cert_context as usize);
@@ -1326,6 +1351,15 @@ pub(super) unsafe fn cert_find_certificate_in_store_impl(
     };
     for &cert_h in &certs[start_idx..] {
         if let Some(entry) = st.certs.get(&cert_h) {
+            // Per MSDN CERT_ARCHIVED_PROP_ID: skip archived certs during CERT_FIND_ANY
+            // enumeration unless CERT_STORE_ENUM_ARCHIVED_FLAG was set, while keeping them
+            // discoverable via explicit searches.
+            if dw_find_type == CERT_FIND_ANY
+                && !enum_archived
+                && entry.properties.contains_key(&CERT_ARCHIVED_PROP_ID)
+            {
+                continue;
+            }
             if cert_matches_find(&entry.owned, dw_find_type, pv_find_para) {
                 st.certs.get_mut(&cert_h).unwrap().refcount += 1;
                 return cert_h as *mut c_void;
