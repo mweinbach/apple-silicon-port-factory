@@ -20,6 +20,8 @@ const ALT_STACK: usize = 2 * 1024 * 1024;
 const UC_MCONTEXT: usize = 48;
 const MC_ES: usize = 0; // trapno u16, cpu u16, err u32, faultvaddr u64
 const MC_SS: usize = 16; // 21 x u64
+#[cfg(target_arch = "aarch64")]
+const MC_NS_ARM64: usize = 288; // offsetof(struct __darwin_mcontext64, __ns), 32 x u128 __v at +0
 
 // __ss register order.
 const SS_RCX: usize = 2;
@@ -492,10 +494,65 @@ unsafe fn try_emulate_kuser_read(fault_addr: u64, ss: *mut u64) -> bool {
     true
 }
 
-/// Decode a single AArch64 general-purpose store instruction (no writeback) so
-/// writes to a logically writable 4 KiB subpage sharing a `PROT_NONE` 16 KiB host
-/// page with a `PAGE_GUARD`/`PAGE_NOACCESS` sibling can complete without exposing
-/// the protected siblings. Returns `(rt, bytes)`.
+/// Decoded AArch64 memory load or store (GPR scalar, SIMD&FP scalar/128-bit vector,
+/// or non-writeback pair `LDP`/`STP`) for subpage access emulation on 16 KiB Apple Silicon pages.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug)]
+enum Arm64MemOp {
+    GprLoad { rt: usize, bytes: usize, signed_64: bool, signed_32: bool },
+    GprStore { rt: usize, bytes: usize },
+    SimdLoad { vt: usize, bytes: usize },
+    SimdStore { vt: usize, bytes: usize },
+    GprPairLoad { rt1: usize, rt2: usize, rn: usize, imm: i64, elem_bytes: usize, signed_64: bool },
+    GprPairStore { rt1: usize, rt2: usize, rn: usize, imm: i64, elem_bytes: usize },
+    SimdPairLoad { vt1: usize, vt2: usize, rn: usize, imm: i64, elem_bytes: usize },
+    SimdPairStore { vt1: usize, vt2: usize, rn: usize, imm: i64, elem_bytes: usize },
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Arm64MemOp {
+    fn is_write(self) -> bool {
+        matches!(
+            self,
+            Self::GprStore { .. } | Self::SimdStore { .. } | Self::GprPairStore { .. } | Self::SimdPairStore { .. }
+        )
+    }
+    fn total_bytes(self) -> usize {
+        match self {
+            Self::GprLoad { bytes, .. }
+            | Self::GprStore { bytes, .. }
+            | Self::SimdLoad { bytes, .. }
+            | Self::SimdStore { bytes, .. } => bytes,
+            Self::GprPairLoad { elem_bytes, .. }
+            | Self::GprPairStore { elem_bytes, .. }
+            | Self::SimdPairLoad { elem_bytes, .. }
+            | Self::SimdPairStore { elem_bytes, .. } => elem_bytes * 2,
+        }
+    }
+    unsafe fn effective_addr(self, fault_addr: u64, ss: *const u64) -> Option<usize> {
+        match self {
+            Self::GprPairLoad { rn, imm, elem_bytes, .. }
+            | Self::GprPairStore { rn, imm, elem_bytes, .. }
+            | Self::SimdPairLoad { rn, imm, elem_bytes, .. }
+            | Self::SimdPairStore { rn, imm, elem_bytes, .. } => {
+                // `ss[0..=30]` are X0..X30, `ss[31]` is SP.
+                let base = *ss.add(rn);
+                let ea = base.wrapping_add(imm as u64) as usize;
+                let total = elem_bytes * 2;
+                let f = fault_addr as usize;
+                if f >= ea && f < ea.saturating_add(total) {
+                    Some(ea)
+                } else {
+                    None
+                }
+            }
+            _ => Some(fault_addr as usize),
+        }
+    }
+}
+
+/// Decode a single AArch64 general-purpose store instruction (no writeback).
+/// Returns `(rt, bytes)`.
 #[cfg(target_arch = "aarch64")]
 fn decode_arm64_store(insn: u32) -> Option<(usize, usize)> {
     let rt = (insn & 0x1F) as usize;
@@ -524,18 +581,106 @@ fn decode_arm64_store(insn: u32) -> Option<(usize, usize)> {
     None
 }
 
-/// Decode the byte width (1/2/4/8) of an AArch64 GPR load or store at `pc`.
+/// Decode an AArch64 scalar GPR, SIMD&FP (`B`/`H`/`S`/`D`/`Q`), or non-writeback
+/// pair (`LDP`/`STP`) load or store instruction.
 #[cfg(target_arch = "aarch64")]
-unsafe fn decoded_access_bytes(pc: u64, is_write: bool) -> Option<usize> {
+fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
+    // 1. SIMD&FP single-register unsigned-offset (`LDR`/`STR {B,H,S,D,Q}t, [Xn, #pimm]`)
+    //    or unscaled/register-offset without writeback (`LDUR`/`STUR`, `LDR`/`STR [Xn, Xm]`).
+    let is_simd_ui = (insn & 0x3F00_0000) == 0x3D00_0000;
+    let is_simd_ur_or_reg = (insn & 0x3F00_0000) == 0x3C00_0000
+        && ((insn & 0x0020_0C00) == 0x0000_0000 || (insn & 0x0020_0C00) == 0x0020_0800);
+    if is_simd_ui || is_simd_ur_or_reg {
+        let size = (insn >> 30) & 3;
+        let opc = (insn >> 22) & 3;
+        let vt = (insn & 0x1F) as usize;
+        return match (size, opc) {
+            (0, 0) => Some(Arm64MemOp::SimdStore { vt, bytes: 1 }),
+            (0, 1) => Some(Arm64MemOp::SimdLoad { vt, bytes: 1 }),
+            (0, 2) => Some(Arm64MemOp::SimdStore { vt, bytes: 16 }),
+            (0, 3) => Some(Arm64MemOp::SimdLoad { vt, bytes: 16 }),
+            (1, 0) => Some(Arm64MemOp::SimdStore { vt, bytes: 2 }),
+            (1, 1) => Some(Arm64MemOp::SimdLoad { vt, bytes: 2 }),
+            (2, 0) => Some(Arm64MemOp::SimdStore { vt, bytes: 4 }),
+            (2, 1) => Some(Arm64MemOp::SimdLoad { vt, bytes: 4 }),
+            (3, 0) => Some(Arm64MemOp::SimdStore { vt, bytes: 8 }),
+            (3, 1) => Some(Arm64MemOp::SimdLoad { vt, bytes: 8 }),
+            _ => None,
+        };
+    }
+
+    // 2. Non-writeback SIMD&FP signed-offset pair `LDP`/`STP {S,D,Q}t1, t2, [Xn, #imm]`.
+    if (insn & 0x3F80_0000) == 0x2D00_0000 {
+        let opc = (insn >> 30) & 3;
+        let elem_bytes = match opc {
+            0 => 4usize,
+            1 => 8,
+            2 => 16,
+            _ => return None,
+        };
+        let is_load = ((insn >> 22) & 1) != 0;
+        let imm7 = (((insn >> 15) & 0x7F) as i32) << 25 >> 25;
+        let imm = (imm7 as i64) * (elem_bytes as i64);
+        let vt2 = ((insn >> 10) & 0x1F) as usize;
+        let rn = ((insn >> 5) & 0x1F) as usize;
+        let vt1 = (insn & 0x1F) as usize;
+        return Some(if is_load {
+            Arm64MemOp::SimdPairLoad { vt1, vt2, rn, imm, elem_bytes }
+        } else {
+            Arm64MemOp::SimdPairStore { vt1, vt2, rn, imm, elem_bytes }
+        });
+    }
+
+    // 3. Non-writeback GPR signed-offset pair `LDP`/`STP`/`LDPSW {W,X}t1, t2, [Xn, #imm]`.
+    if (insn & 0x3F80_0000) == 0x2900_0000 {
+        let opc = (insn >> 30) & 3;
+        let is_load = ((insn >> 22) & 1) != 0;
+        let (elem_bytes, signed_64) = match (opc, is_load) {
+            (0, _) => (4usize, false),
+            (1, true) => (4usize, true),
+            (2, _) => (8usize, false),
+            _ => return None,
+        };
+        let imm7 = (((insn >> 15) & 0x7F) as i32) << 25 >> 25;
+        let imm = (imm7 as i64) * (elem_bytes as i64);
+        let rt2 = ((insn >> 10) & 0x1F) as usize;
+        let rn = ((insn >> 5) & 0x1F) as usize;
+        let rt1 = (insn & 0x1F) as usize;
+        return Some(if is_load {
+            Arm64MemOp::GprPairLoad { rt1, rt2, rn, imm, elem_bytes, signed_64 }
+        } else {
+            Arm64MemOp::GprPairStore { rt1, rt2, rn, imm, elem_bytes }
+        });
+    }
+
+    // 4. Scalar GPR load or store.
+    if let Some((rt, bytes)) = decode_arm64_store(insn) {
+        return Some(Arm64MemOp::GprStore { rt, bytes });
+    }
+    if let Some(ld) = decode_arm64_load(insn) {
+        return Some(Arm64MemOp::GprLoad {
+            rt: ld.rt,
+            bytes: ld.bytes,
+            signed_64: ld.signed_64,
+            signed_32: ld.signed_32,
+        });
+    }
+    None
+}
+
+/// Decode the `(start_addr, byte_len)` of the faulting AArch64 memory instruction at `pc`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn decoded_access_span(fault_addr: u64, pc: u64, is_write: bool, ss: *const u64) -> Option<(usize, usize)> {
     if pc < 0x10000 || (pc & 3) != 0 {
         return None;
     }
     let insn = std::ptr::read_unaligned(pc as *const u32);
-    if is_write {
-        decode_arm64_store(insn).map(|(_, bytes)| bytes)
-    } else {
-        decode_arm64_load(insn).map(|ld| ld.bytes)
+    let op = decode_arm64_mem_op(insn)?;
+    if op.is_write() != is_write {
+        return None;
     }
+    let ea = op.effective_addr(fault_addr, ss)?;
+    Some((ea, op.total_bytes()))
 }
 
 /// Returns `true` iff the 4 KiB page containing `addr` is logically committed and
@@ -562,109 +707,230 @@ fn subpage_allows_access(addr: usize, is_write: bool) -> bool {
     }
 }
 
-/// Emulate one AArch64 GPR load or store against logically accessible 4 KiB subpage(s)
-/// inside a 16 KiB host page that is kept `PROT_NONE` because a sibling 4 KiB subpage
-/// is still `PAGE_GUARD` or `PAGE_NOACCESS`. Validates EVERY 4 KiB subpage touched by
-/// the decoded access `[fault_addr, fault_addr + bytes)`. Caller MUST hold `HPAGE_LOCKS[hpage]`.
+/// Returns the first 4 KiB subpage in `[start_addr, start_addr + len)` that does not allow
+/// the requested access, or `None` if every touched subpage permits it.
 #[cfg(target_arch = "aarch64")]
-unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, ss: *mut u64) -> bool {
+fn first_blocked_subpage(start_addr: usize, len: usize, is_write: bool) -> Option<usize> {
+    let end_addr = start_addr.checked_add(len.checked_sub(1)?)?;
+    let mut p = start_addr & !0xFFF;
+    let last_p = end_addr & !0xFFF;
+    while p <= last_p {
+        if !subpage_allows_access(p, is_write) {
+            return Some(p);
+        }
+        p = match p.checked_add(0x1000) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    None
+}
+
+/// Transfer `buf` bytes at guest address `[start_addr, start_addr + buf.len())` through an
+/// isolated ephemeral `mach_vm_remap` alias mapping so the guest virtual address stays
+/// strictly `PROT_NONE` for the entire operation — concurrent threads touching `PAGE_GUARD`
+/// or `PAGE_NOACCESS` sibling subpages on the same 16 KiB host page are never exposed to a
+/// transient readable/writable window.
+#[cfg(target_arch = "aarch64")]
+unsafe fn isolated_hpage_transfer(start_addr: usize, buf: &mut [u8], is_write: bool) -> bool {
+    extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_remap(
+            target_task: libc::mach_port_t,
+            target_address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: i32,
+            src_task: libc::mach_port_t,
+            src_address: u64,
+            copy: i32,
+            cur_protection: *mut i32,
+            max_protection: *mut i32,
+            inheritance: i32,
+        ) -> i32;
+        fn mach_vm_protect(
+            target_task: libc::mach_port_t,
+            address: u64,
+            size: u64,
+            set_maximum: i32,
+            new_protection: i32,
+        ) -> i32;
+        fn mach_vm_deallocate(
+            target_task: libc::mach_port_t,
+            address: u64,
+            size: u64,
+        ) -> i32;
+    }
+    const VM_FLAGS_ANYWHERE: i32 = 1;
+    const VM_INHERIT_NONE: i32 = 2;
+    const VM_PROT_READ: i32 = 1;
+    const VM_PROT_WRITE: i32 = 2;
+
+    let task = mach_task_self_;
+    let len = buf.len();
+    let mut done = 0usize;
+    while done < len {
+        let cur_addr = start_addr + done;
+        let hpage = cur_addr & !0x3FFF;
+        let off = cur_addr - hpage;
+        let chunk = (len - done).min(0x4000 - off);
+
+        let mut alias: u64 = 0;
+        let mut cur_prot: i32 = 0;
+        let mut max_prot: i32 = 0;
+        let kr = mach_vm_remap(
+            task,
+            &mut alias,
+            0x4000,
+            0,
+            VM_FLAGS_ANYWHERE,
+            task,
+            hpage as u64,
+            0, // copy = FALSE: share the exact underlying physical page frame.
+            &mut cur_prot,
+            &mut max_prot,
+            VM_INHERIT_NONE,
+        );
+        if kr != 0 {
+            return false;
+        }
+        let want_prot = if is_write { VM_PROT_READ | VM_PROT_WRITE } else { VM_PROT_READ };
+        if mach_vm_protect(task, alias, 0x4000, 0, want_prot) != 0 {
+            let _ = mach_vm_deallocate(task, alias, 0x4000);
+            return false;
+        }
+        let alias_ptr = (alias as usize + off) as *mut u8;
+        if is_write {
+            core::sync::atomic::fence(Ordering::Release);
+            std::ptr::copy_nonoverlapping(buf.as_ptr().add(done), alias_ptr, chunk);
+        } else {
+            std::ptr::copy_nonoverlapping(alias_ptr as *const u8, buf.as_mut_ptr().add(done), chunk);
+            core::sync::atomic::fence(Ordering::Acquire);
+        }
+        let _ = mach_vm_deallocate(task, alias, 0x4000);
+        done += chunk;
+    }
+    true
+}
+
+/// Emulate one AArch64 GPR, SIMD&FP, or pair load/store against logically accessible 4 KiB
+/// subpage(s) inside a 16 KiB host page kept `PROT_NONE` for a `PAGE_GUARD`/`PAGE_NOACCESS`
+/// sibling. Validates EVERY 4 KiB subpage touched by `[ea, ea + total_bytes)` and performs
+/// the memory transfer through an isolated `mach_vm_remap` alias so the guest VA remains
+/// `PROT_NONE` throughout. Caller MUST hold `HPAGE_LOCKS[hpage]`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, mc: *mut u8, ss: *mut u64) -> bool {
     let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
     if pc < 0x10000 || (pc & 3) != 0 {
         return false;
     }
     let insn = std::ptr::read_unaligned(pc as *const u32);
-    let bytes = if is_write {
-        let Some((_, b)) = decode_arm64_store(insn) else {
-            return false;
-        };
-        b
-    } else {
-        let Some(ld) = decode_arm64_load(insn) else {
-            return false;
-        };
-        ld.bytes
-    };
-    let start_addr = fault_addr as usize;
-    let Some(end_addr) = start_addr.checked_add(bytes - 1) else {
+    let Some(op) = decode_arm64_mem_op(insn) else {
         return false;
     };
-    let p0 = start_addr & !0xFFF;
-    let p1 = end_addr & !0xFFF;
-    let hpage = start_addr & !0x3FFF;
-    let hpage1 = end_addr & !0x3FFF;
-    if !subpage_allows_access(p0, is_write) {
+    if op.is_write() != is_write {
         return false;
     }
-    if p1 != p0 {
-        if !subpage_allows_access(p1, is_write) {
-            return false;
-        }
-        // If the unaligned access straddles into a second 16 KiB host page that also
-        // contains a protected sibling (and is therefore PROT_NONE), we do not hold
-        // its HPAGE_LOCKS slot here.
-        if hpage1 != hpage {
-            use win32_rt::kernel32::memory::{self, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
-            let next_has_prot = (0..4).any(|i| {
-                memory::query(hpage1 + i * 0x1000).is_some_and(|m| {
-                    m.state == MEM_COMMIT && (m.protect == PAGE_NOACCESS || (m.protect & PAGE_GUARD) != 0)
-                })
-            });
-            if next_has_prot {
-                return false;
-            }
-        }
+    let Some(start_addr) = op.effective_addr(fault_addr, ss) else {
+        return false;
+    };
+    let total_bytes = op.total_bytes();
+    if total_bytes == 0 || total_bytes > 32 {
+        return false;
     }
-    let p = start_addr as *mut u8;
+    if first_blocked_subpage(start_addr, total_bytes, is_write).is_some() {
+        return false;
+    }
+
+    let ns_v = mc.add(MC_NS_ARM64) as *mut u128;
+    let mut buf = [0u8; 32];
+
     if is_write {
-        let Some((rt, bytes)) = decode_arm64_store(insn) else {
-            return false;
-        };
-        let val = if rt == 31 { 0u64 } else { *ss.add(rt) };
-        if libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_READ | libc::PROT_WRITE) != 0 {
-            return false;
-        }
-        core::sync::atomic::fence(Ordering::Release);
-        match bytes {
-            1 => std::ptr::write_unaligned(p, val as u8),
-            2 => std::ptr::write_unaligned(p as *mut u16, val as u16),
-            4 => std::ptr::write_unaligned(p as *mut u32, val as u32),
-            8 => std::ptr::write_unaligned(p as *mut u64, val),
-            _ => {
-                let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
-                return false;
+        match op {
+            Arm64MemOp::GprStore { rt, bytes } => {
+                let val = if rt == 31 { 0u64 } else { *ss.add(rt) };
+                buf[..bytes].copy_from_slice(&val.to_le_bytes()[..bytes]);
             }
+            Arm64MemOp::SimdStore { vt, bytes } => {
+                let v = std::ptr::read_unaligned(ns_v.add(vt)).to_le_bytes();
+                buf[..bytes].copy_from_slice(&v[..bytes]);
+            }
+            Arm64MemOp::GprPairStore { rt1, rt2, elem_bytes, .. } => {
+                let v1 = if rt1 == 31 { 0u64 } else { *ss.add(rt1) };
+                let v2 = if rt2 == 31 { 0u64 } else { *ss.add(rt2) };
+                buf[..elem_bytes].copy_from_slice(&v1.to_le_bytes()[..elem_bytes]);
+                buf[elem_bytes..elem_bytes * 2].copy_from_slice(&v2.to_le_bytes()[..elem_bytes]);
+            }
+            Arm64MemOp::SimdPairStore { vt1, vt2, elem_bytes, .. } => {
+                let v1 = std::ptr::read_unaligned(ns_v.add(vt1)).to_le_bytes();
+                let v2 = std::ptr::read_unaligned(ns_v.add(vt2)).to_le_bytes();
+                buf[..elem_bytes].copy_from_slice(&v1[..elem_bytes]);
+                buf[elem_bytes..elem_bytes * 2].copy_from_slice(&v2[..elem_bytes]);
+            }
+            _ => return false,
         }
-        let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
+        if !isolated_hpage_transfer(start_addr, &mut buf[..total_bytes], true) {
+            return false;
+        }
+        let end_addr = start_addr + total_bytes - 1;
         win32_rt::kernel32::memory::mark_write_watch_dirty(start_addr);
-        if hpage1 != hpage {
+        if (end_addr & !0x3FFF) != (start_addr & !0x3FFF) {
             win32_rt::kernel32::memory::mark_write_watch_dirty(end_addr);
         }
     } else {
-        let Some(ld) = decode_arm64_load(insn) else {
-            return false;
-        };
-        if libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_READ) != 0 {
+        if !isolated_hpage_transfer(start_addr, &mut buf[..total_bytes], false) {
             return false;
         }
-        let val: u64 = match (ld.bytes, ld.signed_64, ld.signed_32) {
-            (1, false, false) => std::ptr::read_unaligned(p) as u64,
-            (1, true, false) => std::ptr::read_unaligned(p as *const i8) as i64 as u64,
-            (1, false, true) => std::ptr::read_unaligned(p as *const i8) as i32 as u32 as u64,
-            (2, false, false) => std::ptr::read_unaligned(p as *const u16) as u64,
-            (2, true, false) => std::ptr::read_unaligned(p as *const i16) as i64 as u64,
-            (2, false, true) => std::ptr::read_unaligned(p as *const i16) as i32 as u32 as u64,
-            (4, false, false) => std::ptr::read_unaligned(p as *const u32) as u64,
-            (4, true, false) => std::ptr::read_unaligned(p as *const i32) as i64 as u64,
-            (8, false, false) => std::ptr::read_unaligned(p as *const u64),
-            _ => {
-                let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
-                return false;
+        match op {
+            Arm64MemOp::GprLoad { rt, bytes, signed_64, signed_32 } => {
+                let val: u64 = match (bytes, signed_64, signed_32) {
+                    (1, false, false) => buf[0] as u64,
+                    (1, true, false) => (buf[0] as i8) as i64 as u64,
+                    (1, false, true) => (buf[0] as i8) as i32 as u32 as u64,
+                    (2, false, false) => u16::from_le_bytes([buf[0], buf[1]]) as u64,
+                    (2, true, false) => i16::from_le_bytes([buf[0], buf[1]]) as i64 as u64,
+                    (2, false, true) => i16::from_le_bytes([buf[0], buf[1]]) as i32 as u32 as u64,
+                    (4, false, false) => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64,
+                    (4, true, false) => i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64 as u64,
+                    (8, false, false) => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                    _ => return false,
+                };
+                if rt < 31 {
+                    *ss.add(rt) = val;
+                }
             }
-        };
-        core::sync::atomic::fence(Ordering::Acquire);
-        let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
-        if ld.rt < 31 {
-            *ss.add(ld.rt) = val;
+            Arm64MemOp::SimdLoad { vt, bytes } => {
+                let mut v128 = [0u8; 16];
+                v128[..bytes].copy_from_slice(&buf[..bytes]);
+                std::ptr::write_unaligned(ns_v.add(vt), u128::from_le_bytes(v128));
+            }
+            Arm64MemOp::GprPairLoad { rt1, rt2, elem_bytes, signed_64, .. } => {
+                let decode_elem = |slice: &[u8]| -> u64 {
+                    match (elem_bytes, signed_64) {
+                        (4, false) => u32::from_le_bytes(slice.try_into().unwrap()) as u64,
+                        (4, true) => i32::from_le_bytes(slice.try_into().unwrap()) as i64 as u64,
+                        (8, false) => u64::from_le_bytes(slice.try_into().unwrap()),
+                        _ => 0,
+                    }
+                };
+                let v1 = decode_elem(&buf[..elem_bytes]);
+                let v2 = decode_elem(&buf[elem_bytes..elem_bytes * 2]);
+                if rt1 < 31 {
+                    *ss.add(rt1) = v1;
+                }
+                if rt2 < 31 {
+                    *ss.add(rt2) = v2;
+                }
+            }
+            Arm64MemOp::SimdPairLoad { vt1, vt2, elem_bytes, .. } => {
+                let mut v1 = [0u8; 16];
+                let mut v2 = [0u8; 16];
+                v1[..elem_bytes].copy_from_slice(&buf[..elem_bytes]);
+                v2[..elem_bytes].copy_from_slice(&buf[elem_bytes..elem_bytes * 2]);
+                std::ptr::write_unaligned(ns_v.add(vt1), u128::from_le_bytes(v1));
+                std::ptr::write_unaligned(ns_v.add(vt2), u128::from_le_bytes(v2));
+            }
+            _ => return false,
         }
     }
     *ss.add(32) = (*ss.add(32) & !0x0000_FFFF_FFFF_FFFF) | pc.wrapping_add(4);
@@ -807,7 +1073,7 @@ static HPAGE_LOCKS: std::sync::LazyLock<[std::sync::Mutex<()>; 64]> =
 /// eagerly unlock every `PAGE_NOACCESS` 4 KiB sibling inside the same 16 KiB host
 /// page so no thread can ever race into a still-encrypted sibling sub-page.
 #[cfg(target_arch = "aarch64")]
-unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool, ss: *mut u64) -> bool {
+unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool, mc: *mut u8, ss: *mut u64) -> bool {
     use win32_rt::kernel32::memory::{self, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     thread_local! {
         static IN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -816,17 +1082,13 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     if IN_FAULT.with(|f| f.get()) {
         return false;
     }
-    let addr = fault_addr as usize;
-    let access_bytes = decoded_access_bytes(pc, is_write).unwrap_or(1);
-    let p0 = addr & !0xFFF;
-    let p1 = addr.saturating_add(access_bytes - 1) & !0xFFF;
-    // If an unaligned multi-byte access starts on an accessible 4 KiB subpage (`p0`)
-    // and spans into a protected or non-writable sibling 4 KiB subpage (`p1`), report
-    // and handle the fault at `p1` (matching x86-64 hardware CR2 on straddling faults).
-    let eff_fault_addr = if subpage_allows_access(p0, is_write) && p1 != p0 && !subpage_allows_access(p1, is_write) {
-        p1 as u64
-    } else {
-        fault_addr
+    let (span_start, span_bytes) = decoded_access_span(fault_addr, pc, is_write, ss).unwrap_or((fault_addr as usize, 1));
+    // If an unaligned multi-byte scalar or SIMD access starts on an accessible 4 KiB subpage
+    // and spans into a protected or non-writable sibling 4 KiB subpage, report and handle the
+    // fault at that protected subpage boundary (matching x86-64 hardware CR2).
+    let eff_fault_addr = match first_blocked_subpage(span_start, span_bytes, is_write) {
+        Some(blocked_p) if blocked_p != (span_start & !0xFFF) => blocked_p as u64,
+        _ => fault_addr,
     };
     let eff_addr = eff_fault_addr as usize;
     let hpage = eff_addr & !0x3FFF;
@@ -846,8 +1108,8 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     let initial_any_sibling_prot = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
     // If every 4 KiB subpage touched by the access is logically accessible but shares a
     // `PROT_NONE` 16 KiB host page with a `PAGE_GUARD` or non-guest `PAGE_NOACCESS` sibling,
-    // emulate the access transparently (even if no VEH handler is currently registered) so
-    // sibling protections stay intact.
+    // emulate the access transparently through an isolated alias mapping so sibling protections
+    // stay intact even under concurrent threads.
     if !initial_fault_prot && initial_any_sibling_prot {
         let _hpage_guard = HPAGE_LOCKS[(hpage >> 14) & 63].lock().unwrap();
         if let Some(mbi) = memory::query(eff_addr) {
@@ -868,7 +1130,7 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
                         && memory::query(sub).is_some_and(|m| m.state == MEM_COMMIT && m.protect == PAGE_NOACCESS)
                 });
                 if (any_sibling_guard || !any_guest_pe_noaccess_sibling || !unwind::has_guest_exception_handler())
-                    && try_emulate_subpage_access(fault_addr, is_write, ss)
+                    && try_emulate_subpage_access(fault_addr, is_write, mc, ss)
                 {
                     return true;
                 }
@@ -941,10 +1203,10 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         if handled {
             let _emul_guard = hpage_lock.lock().unwrap();
             let now_any_sibling = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
-            if now_any_sibling && subpage_allows_access(p0, is_write) && subpage_allows_access(p1, is_write) {
+            if now_any_sibling && first_blocked_subpage(span_start, span_bytes, is_write).is_none() {
                 // Sibling 4 KiB subpages remain guarded/noaccess (host page stays PROT_NONE):
-                // emulate this single faulting instruction without exposing sibling subpages.
-                handled = try_emulate_subpage_access(fault_addr, is_write, ss);
+                // emulate this single faulting instruction through an isolated alias.
+                handled = try_emulate_subpage_access(fault_addr, is_write, mc, ss);
             }
         }
         IN_FAULT.with(|f| f.set(false));
@@ -1025,7 +1287,7 @@ extern "C" fn handler(sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut li
                 return;
             }
             let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
-            if try_dispatch_guest_page_fault(clean_fault, pc, is_write, ss) {
+            if try_dispatch_guest_page_fault(clean_fault, pc, is_write, mc, ss) {
                 return;
             }
         }
@@ -1184,5 +1446,112 @@ mod tests {
             "expected >= 8 emulated LSE2 SIGBUS traps, got {}",
             lse2_unaligned_trap_count() - before
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn arm64_mem_op_decodes_simd_scalar_and_pair() {
+        // Unsigned-offset SIMD LDR/STR Q, D, S, H, B
+        assert!(matches!(decode_arm64_mem_op(0x3DC0_0003), Some(Arm64MemOp::SimdLoad { vt: 3, bytes: 16 })));
+        assert!(matches!(decode_arm64_mem_op(0x3D80_0005), Some(Arm64MemOp::SimdStore { vt: 5, bytes: 16 })));
+        assert!(matches!(decode_arm64_mem_op(0xFD40_0007), Some(Arm64MemOp::SimdLoad { vt: 7, bytes: 8 })));
+        assert!(matches!(decode_arm64_mem_op(0xFD00_0008), Some(Arm64MemOp::SimdStore { vt: 8, bytes: 8 })));
+        assert!(matches!(decode_arm64_mem_op(0xBD40_0009), Some(Arm64MemOp::SimdLoad { vt: 9, bytes: 4 })));
+        assert!(matches!(decode_arm64_mem_op(0xBD00_000A), Some(Arm64MemOp::SimdStore { vt: 10, bytes: 4 })));
+        // Unscaled LDUR/STUR Q, D, S
+        assert!(matches!(decode_arm64_mem_op(0x3CC0_0004), Some(Arm64MemOp::SimdLoad { vt: 4, bytes: 16 })));
+        assert!(matches!(decode_arm64_mem_op(0x3C80_0006), Some(Arm64MemOp::SimdStore { vt: 6, bytes: 16 })));
+        assert!(matches!(decode_arm64_mem_op(0xFC40_000B), Some(Arm64MemOp::SimdLoad { vt: 11, bytes: 8 })));
+        assert!(matches!(decode_arm64_mem_op(0xBC00_000C), Some(Arm64MemOp::SimdStore { vt: 12, bytes: 4 })));
+        // Non-writeback pair LDP/STP Q and X
+        assert!(matches!(
+            decode_arm64_mem_op(0xAD40_0401),
+            Some(Arm64MemOp::SimdPairLoad { vt1: 1, vt2: 1, elem_bytes: 16, .. })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0xAD00_0802),
+            Some(Arm64MemOp::SimdPairStore { vt1: 2, vt2: 2, elem_bytes: 16, .. })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0xA940_0C03),
+            Some(Arm64MemOp::GprPairLoad { rt1: 3, rt2: 3, elem_bytes: 8, signed_64: false, .. })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0xA900_1004),
+            Some(Arm64MemOp::GprPairStore { rt1: 4, rt2: 4, elem_bytes: 8, .. })
+        ));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn isolated_hpage_transfer_keeps_guest_va_prot_none() {
+        unsafe {
+            // Allocate two contiguous 16 KiB host pages and lock them PROT_NONE.
+            let raw = libc::mmap(
+                std::ptr::null_mut(),
+                0x8000,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(raw, libc::MAP_FAILED);
+            assert_eq!(libc::mprotect(raw, 0x8000, libc::PROT_NONE), 0);
+
+            // Write 16 bytes straddling the 16 KiB host-page boundary (0x3FF8..0x4007)
+            // through isolated mach_vm_remap aliases without ever unprotecting `raw`.
+            let mut pat = [0x10u8, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xA9, 0xBA, 0xCB, 0xDC, 0xED, 0xFE, 0x0F];
+            let straddle = (raw as usize) + 0x3FF8;
+            assert!(isolated_hpage_transfer(straddle, &mut pat, true));
+
+            // Read back through isolated aliases and verify exact round-trip.
+            let mut got = [0u8; 16];
+            assert!(isolated_hpage_transfer(straddle, &mut got, false));
+            assert_eq!(got, pat);
+
+            // Verify via mach_vm_region that `raw` is STILL VM_PROT_NONE (0).
+            #[repr(C)]
+            #[derive(Default)]
+            struct VmRegionBasicInfo64 {
+                protection: i32,
+                max_protection: i32,
+                inheritance: u32,
+                shared: u32,
+                reserved: u32,
+                offset: u64,
+                behavior: i32,
+                user_wired_count: u16,
+            }
+            extern "C" {
+                static mach_task_self_: libc::mach_port_t;
+                fn mach_vm_region(
+                    task: libc::mach_port_t,
+                    address: *mut u64,
+                    size: *mut u64,
+                    flavor: i32,
+                    info: *mut i32,
+                    count: *mut u32,
+                    object_name: *mut libc::mach_port_t,
+                ) -> i32;
+            }
+            let mut qaddr = raw as u64;
+            let mut qsize = 0u64;
+            let mut info = VmRegionBasicInfo64::default();
+            let mut cnt = (std::mem::size_of::<VmRegionBasicInfo64>() / 4) as u32;
+            let mut obj: libc::mach_port_t = 0;
+            assert_eq!(
+                mach_vm_region(mach_task_self_, &mut qaddr, &mut qsize, 9, &mut info as *mut _ as *mut i32, &mut cnt, &mut obj),
+                0
+            );
+            assert_eq!(info.protection, 0, "guest VA must remain VM_PROT_NONE during and after isolated transfer");
+
+            // Restore read permission and confirm bytes landed in the original mapping.
+            assert_eq!(libc::mprotect(raw, 0x8000, libc::PROT_READ), 0);
+            let mut direct = [0u8; 16];
+            std::ptr::copy_nonoverlapping(straddle as *const u8, direct.as_mut_ptr(), 16);
+            assert_eq!(direct, pat);
+
+            libc::munmap(raw, 0x8000);
+        }
     }
 }

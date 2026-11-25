@@ -1681,6 +1681,7 @@ fn guest_kernel_core_guard_page_and_write_watch() {
 const KERNEL_CORE_VM_C: &str = r##"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <emmintrin.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -1698,6 +1699,36 @@ static volatile ULONG_PTR g_guard_kind = 99;
 static volatile DWORD g_guard_prot_in_veh = 0;
 
 static volatile uint32_t g_guard_val_in_veh = 0;
+static volatile LONG g_emul_stop = 0;
+
+struct EmulWorkerArg {
+    uint8_t *base;
+    HANDLE ready_ev;
+};
+
+static DWORD WINAPI sibling_emul_worker(LPVOID param) {
+    struct EmulWorkerArg *arg = (struct EmulWorkerArg *)param;
+    uint8_t *p = arg->base;
+    SetEvent(arg->ready_ev);
+    uint32_t iter = 0;
+    while (InterlockedCompareExchange(&g_emul_stop, 0, 0) == 0) {
+        *(volatile uint32_t *)(p + 0x80) = 0xA0000000u ^ iter;
+        uint32_t r = *(volatile uint32_t *)(p + 0x80);
+        if (r != (0xA0000000u ^ iter)) {
+            return 2;
+        }
+        __m128i v = _mm_set_epi32((int)(iter + 3), (int)(iter + 2), (int)(iter + 1), (int)iter);
+        _mm_storeu_si128((__m128i *)(p + 0x100), v);
+        __m128i got = _mm_loadu_si128((const __m128i *)(p + 0x100));
+        uint32_t lanes[4];
+        _mm_storeu_si128((__m128i *)lanes, got);
+        if (lanes[0] != iter || lanes[3] != iter + 3) {
+            return 3;
+        }
+        iter++;
+    }
+    return 0;
+}
 
 static LONG CALLBACK guard_veh(PEXCEPTION_POINTERS ep) {
     if (ep->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
@@ -1742,24 +1773,66 @@ int main(void) {
     CHECK(VirtualQuery(gp + 0x1000, &mbi_sib, sizeof(mbi_sib)) != 0, "VirtualQuery sibling subpage 1");
     CHECK(mbi_sib.Protect == (PAGE_READWRITE | PAGE_GUARD), "sibling subpage 1 still PAGE_GUARD");
 
-    /* Second access to subpage 0 must NOT fault again, even while subpage 1 stays guarded. */
+    /* Second access to subpage 0 (both scalar AND 128-bit SIMD!) must NOT fault again,
+       even while subpages 1..3 remain guarded on the same 16 KiB host page! */
     *(volatile uint32_t *)(gp + 0x44) = 0x24681357u;
     CHECK(g_guard_hits == 1, "subpage 0 did not fire a second time");
     CHECK(*(volatile uint32_t *)(gp + 0x44) == 0x24681357u, "second write to subpage 0 succeeded");
 
-    /* First write to sibling 4 KiB subpage 1 via an unaligned 2-byte store at offset 0xFFF
-       (spanning accessible subpage 0 and guarded subpage 1) MUST fire STATUS_GUARD_PAGE_VIOLATION
-       for subpage 1 (at gp + 0x1000) rather than silently writing across the boundary! */
-    *(volatile uint16_t *)(gp + 0x0FFF) = 0xCAFEu;
-    CHECK(g_guard_hits == 2, "straddling write at 0xFFF fired guard violation on subpage 1");
-    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x1000), "straddling guard fault reported subpage 1 boundary");
-    CHECK(*(volatile uint16_t *)(gp + 0x0FFF) == 0xCAFEu, "straddling 2-byte write landed across 0xFFF..0x1000");
+    __m128i simd_in = _mm_set_epi32(0x11223344, 0x55667788, (int)0x99AABBCCu, (int)0xDDEEFF01u);
+    _mm_storeu_si128((__m128i *)(gp + 0x60), simd_in);
+    __m128i simd_out = _mm_loadu_si128((const __m128i *)(gp + 0x60));
+    uint32_t simd_lanes[4] = {0, 0, 0, 0};
+    _mm_storeu_si128((__m128i *)simd_lanes, simd_out);
+    CHECK(g_guard_hits == 1, "128-bit SIMD store+load on subpage 0 did not trip sibling guards");
+    CHECK(simd_lanes[0] == 0xDDEEFF01u && simd_lanes[1] == 0x99AABBCCu
+          && simd_lanes[2] == 0x55667788u && simd_lanes[3] == 0x11223344u,
+          "128-bit SIMD store+load round-trip matched on shared host page");
+
+    /* Unaligned 16-byte SIMD store at offset 0xFF8 (spanning accessible subpage 0 and
+       guarded subpage 1) MUST fire STATUS_GUARD_PAGE_VIOLATION at gp + 0x1000 and then
+       complete all 16 bytes across the boundary! */
+    __m128i straddle_v = _mm_set_epi32(0xCAFE0004, 0xCAFE0003, 0xCAFE0002, 0xCAFE0001);
+    _mm_storeu_si128((__m128i *)(gp + 0x0FF8), straddle_v);
+    CHECK(g_guard_hits == 2, "straddling 16-byte SIMD store at 0xFF8 fired guard violation on subpage 1");
+    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x1000), "straddling SIMD guard fault reported subpage 1 boundary");
+    __m128i straddle_got = _mm_loadu_si128((const __m128i *)(gp + 0x0FF8));
+    uint32_t sl[4] = {0, 0, 0, 0};
+    _mm_storeu_si128((__m128i *)sl, straddle_got);
+    CHECK(sl[0] == 0xCAFE0001u && sl[1] == 0xCAFE0002u && sl[2] == 0xCAFE0003u && sl[3] == 0xCAFE0004u,
+          "straddling 16-byte SIMD store+load landed across 0xFF8..0x1007");
 
     /* Sibling 4 KiB subpage 2 MUST still be independently guarded! */
     *(volatile uint32_t *)(gp + 0x2040) = 0x89ABCDEFu;
     CHECK(g_guard_hits == 3, "sibling subpage 2 fired its own guard violation");
     CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x2040), "sibling subpage 2 fault address matches");
     CHECK(*(volatile uint32_t *)(gp + 0x2040) == 0x89ABCDEFu, "sibling subpage 2 write completed");
+
+    /* Concurrent 2-thread isolation test: while worker thread hammers scalar + SIMD
+       emulations on subpage 0, main thread repeatedly arms PAGE_GUARD on subpage 2 and
+       reads it; EVERY single read must fire STATUS_GUARD_PAGE_VIOLATION (proving the
+       guest VA is never transiently unprotected during emulation). */
+    HANDLE ready_ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    CHECK(ready_ev != NULL, "CreateEventW ready_ev");
+    struct EmulWorkerArg warg = { gp, ready_ev };
+    InterlockedExchange(&g_emul_stop, 0);
+    HANDLE worker = CreateThread(NULL, 0, sibling_emul_worker, &warg, 0, NULL);
+    CHECK(worker != NULL, "CreateThread sibling_emul_worker");
+    CHECK(WaitForSingleObject(ready_ev, 5000) == WAIT_OBJECT_0, "worker ready");
+    for (int i = 0; i < 40; ++i) {
+        CHECK(VirtualProtect(gp + 0x2000, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old_prot), "re-arm subpage 2");
+        LONG before = InterlockedCompareExchange(&g_guard_hits, 0, 0);
+        volatile uint32_t v = *(volatile uint32_t *)(gp + 0x2040);
+        CHECK(v == 0x89ABCDEFu, "guarded sibling value intact under concurrency");
+        LONG after = InterlockedCompareExchange(&g_guard_hits, 0, 0);
+        CHECK(after == before + 1, "sibling guard MUST fire 100% of the time under concurrent emulation");
+    }
+    InterlockedExchange(&g_emul_stop, 1);
+    CHECK(WaitForSingleObject(worker, 5000) == WAIT_OBJECT_0, "worker joined");
+    DWORD wcode = 99;
+    CHECK(GetExitCodeThread(worker, &wcode) && wcode == 0, "worker exited cleanly with 0");
+    CloseHandle(worker);
+    CloseHandle(ready_ev);
     CHECK(VirtualFree(gp, 0, MEM_RELEASE), "VirtualFree guard region");
     printf("CORPUS_KCORE: page_guard_oneshot ok\n");
 

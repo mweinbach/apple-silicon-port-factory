@@ -598,7 +598,7 @@ pub unsafe extern "win64" fn CreateThreadpoolTimer(cb: WorkCb, ctx: *mut c_void,
 
 /// `due`: FILETIME; negative = relative 100ns, positive = absolute UTC; NULL = cancel.
 pub unsafe extern "win64" fn SetThreadpoolTimer(t: *mut TpTimer, due: *const FILETIME, period: u32, _window: u32) {
-    if t.is_null() {
+    if t.is_null() || (*t).closed.load(Ordering::Acquire) {
         return;
     }
     let arc = clone_arc_from_raw(t);
@@ -885,7 +885,7 @@ pub unsafe extern "win64" fn CreateThreadpoolWait(cb: WaitCb, ctx: *mut c_void, 
 }
 
 pub unsafe extern "win64" fn SetThreadpoolWait(w: *mut TpWait, h: HANDLE, timeout: *const FILETIME) {
-    if w.is_null() {
+    if w.is_null() || (*w).closed.load(Ordering::Acquire) {
         return;
     }
     let arc = clone_arc_from_raw(w);
@@ -1048,12 +1048,15 @@ pub unsafe extern "win64" fn CloseThreadpoolCleanupGroupMembers(
                     continue;
                 }
                 let ptr = Arc::as_ptr(&arc) as *mut TpTimer;
-                WaitForThreadpoolTimerCallbacks(ptr, cancel_pending);
+                // Disarm future timer firings first without bumping `generation` yet so any
+                // callback already queued/running finishes when `cancel_pending == FALSE`.
                 {
                     let mut st = arc.state.lock().unwrap();
-                    arc.generation.fetch_add(1, Ordering::AcqRel);
                     st.1 = false;
                 }
+                timers().heap.lock().unwrap().retain(|e| !Arc::ptr_eq(&e.timer, &arc));
+                WaitForThreadpoolTimerCallbacks(ptr, cancel_pending);
+                arc.generation.fetch_add(1, Ordering::AcqRel);
                 timers().heap.lock().unwrap().retain(|e| !Arc::ptr_eq(&e.timer, &arc));
                 if cancel && entry.cancel_cb != 0 {
                     crate::call_guest8(entry.cancel_cb, entry.obj_ctx.0 as u64, cleanup_ctx as u64, 0, 0, 0, 0, 0, 0);
@@ -1065,6 +1068,10 @@ pub unsafe extern "win64" fn CloseThreadpoolCleanupGroupMembers(
                     continue;
                 }
                 let ptr = Arc::as_ptr(&arc) as *mut TpWait;
+                // Disarm any still-armed registration BEFORE draining callbacks so an armed
+                // wait on an unsignaled handle with no timeout does not block `cancel_pending == FALSE`,
+                // while leaving `generation` intact until after drain so already-queued callbacks run.
+                disarm_wait(wait_dispatcher(), ptr);
                 WaitForThreadpoolWaitCallbacks(ptr, cancel_pending);
                 arc.generation.fetch_add(1, Ordering::AcqRel);
                 disarm_wait(wait_dispatcher(), ptr);
@@ -2191,6 +2198,79 @@ mod tests {
             // Second call is an empty no-op; closing group frees it cleanly.
             CloseThreadpoolCleanupGroupMembers(cg, FALSE, std::ptr::null_mut());
             CloseThreadpoolCleanupGroup(cg);
+        }
+    }
+
+    #[test]
+    fn threadpool_cleanup_group_disarms_unsignaled_wait_and_drains_queued_wait_when_cancel_false() {
+        use std::sync::atomic::AtomicU32;
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, SetEvent, WaitForSingleObject};
+
+        struct WaitCgCtx {
+            unsignaled_runs: AtomicU32,
+            signaled_runs: AtomicU32,
+            started_ev: usize,
+            release_ev: usize,
+        }
+        unsafe extern "win64" fn never_wait(_inst: *mut c_void, ctx: *mut c_void, _w: *mut c_void, _res: u32) {
+            let c = &*(ctx as *const WaitCgCtx);
+            c.unsignaled_runs.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe extern "win64" fn slow_signaled_wait(_inst: *mut c_void, ctx: *mut c_void, _w: *mut c_void, _res: u32) {
+            let c = &*(ctx as *const WaitCgCtx);
+            SetEvent(c.started_ev as HANDLE);
+            WaitForSingleObject(c.release_ev as HANDLE, 5_000);
+            c.signaled_runs.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            let cg = CreateThreadpoolCleanupGroup();
+            assert!(!cg.is_null());
+            let mut env = [0u8; 72];
+            std::ptr::write_unaligned(env.as_mut_ptr() as *mut u32, 3u32);
+            std::ptr::write_unaligned(env.as_mut_ptr().add(0x10) as *mut *mut c_void, cg);
+
+            let unsignaled_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let signaled_ev = CreateEventW(std::ptr::null_mut(), TRUE, TRUE, std::ptr::null());
+            let started_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let release_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+
+            let ctx = Box::new(WaitCgCtx {
+                unsignaled_runs: AtomicU32::new(0),
+                signaled_runs: AtomicU32::new(0),
+                started_ev: started_ev as usize,
+                release_ev: release_ev as usize,
+            });
+            let ctx_ptr = &*ctx as *const WaitCgCtx as *mut c_void;
+
+            // Member 1: armed on an unsignaled event with NO timeout (must be disarmed, not hang!).
+            let w_unsig = CreateThreadpoolWait(never_wait, ctx_ptr, env.as_mut_ptr() as *mut c_void);
+            SetThreadpoolWait(w_unsig, unsignaled_ev, std::ptr::null());
+
+            // Member 2: armed on an already-signaled event (already running callback must finish
+            // before CloseThreadpoolCleanupGroupMembers(cg, FALSE, NULL) returns).
+            let w_sig = CreateThreadpoolWait(slow_signaled_wait, ctx_ptr, env.as_mut_ptr() as *mut c_void);
+            SetThreadpoolWait(w_sig, signaled_ev, std::ptr::null());
+            assert_eq!(WaitForSingleObject(started_ev, 5_000), WAIT_OBJECT_0);
+
+            let rel_u = release_ev as usize;
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                SetEvent(rel_u as HANDLE);
+            });
+
+            // Must NOT hang on `w_unsig` and MUST wait for `w_sig`'s in-flight callback to finish!
+            CloseThreadpoolCleanupGroupMembers(cg, FALSE, std::ptr::null_mut());
+            releaser.join().unwrap();
+
+            assert_eq!(ctx.unsignaled_runs.load(Ordering::Acquire), 0);
+            assert_eq!(ctx.signaled_runs.load(Ordering::Acquire), 1);
+
+            CloseThreadpoolCleanupGroup(cg);
+            assert_eq!(CloseHandle(unsignaled_ev), TRUE);
+            assert_eq!(CloseHandle(signaled_ev), TRUE);
+            assert_eq!(CloseHandle(started_ev), TRUE);
+            assert_eq!(CloseHandle(release_ev), TRUE);
         }
     }
 }
