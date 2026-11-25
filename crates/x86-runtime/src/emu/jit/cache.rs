@@ -931,6 +931,17 @@ impl JitCache {
         self.translate(e.ip, bc)
     }
 
+    /// True when `code` points inside this thread's runtime `MAP_JIT` translation buffer
+    /// (as opposed to an installed AOT or static Mach-O AOT image).
+    #[inline(always)]
+    pub(in crate::emu) fn owns_code(&self, code: usize) -> bool {
+        if self.mem.is_null() {
+            return false;
+        }
+        let lo = self.mem as usize;
+        code >= lo && code < lo + CODE_SIZE
+    }
+
     /// Run translated code at `code` with an instruction budget; returns the exit code and
     /// the number of guest instructions executed.
     #[inline(always)]
@@ -1253,6 +1264,18 @@ impl JitCache {
         let r = self.translate_jit(ip, bc);
         let ns = t0.elapsed().as_nanos() as u64;
         self.compile_ns += ns;
+        if r.is_some() {
+            let reason = if !crate::emu::aot::active() {
+                "aot_disabled"
+            } else if mem::in_jit(to_mapped_addr(ip)) {
+                "smc_or_dyn_code"
+            } else if crate::emu::aot::was_killed_at(ip) {
+                "revalidation_dead"
+            } else {
+                "aot_miss"
+            };
+            crate::emu::aot_strict::record_jit_compile(ip, reason);
+        }
         if crate::emu::jit_stats::enabled() {
             crate::emu::jit_stats::compile(ns, r.is_some());
             if r.is_some() && crate::emu::aot::active() {
@@ -1368,6 +1391,12 @@ impl JitCache {
         self.tr_scratch.patched = patched;
         if gen == 0 {
             crate::emu::aot::profile_note(ip);
+            if crate::emu::aot::active() {
+                crate::emu::aot::record_runtime_callback(
+                    ip,
+                    crate::emu::aot::CallbackKind::GenericCallback,
+                );
+            }
         }
         self.translated += 1;
         TOTAL_JIT_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

@@ -663,9 +663,25 @@ fn multi_module_aot_prewarm_and_shifted_reload_under_port_aot_verify() {
             check_verified(&logs1, "integ_app.exe", exe1_rep.blocks);
             check_verified(&logs1, "integ_helper.dll", dll1_rep.blocks);
 
-            // Execute twice so AOT/JIT runs every block cleanly and confirm exact results.
+            // Execute twice under `PORT_AOT_STRICT=fail` to prove zero runtime JIT compiles,
+            // zero interpreter steps, and zero software-FP fallbacks across all switch cases,
+            // cross-module IAT calls, and host builtin calls!
+            x86_runtime::emu::reset_aot_fallback_counters();
+            x86_runtime::emu::set_aot_strict_mode(x86_runtime::emu::AotStrictMode::Fail);
             assert_eq!(run_matrix(exe1.base() as u64 + 0x1000), expected);
             assert_eq!(run_matrix(exe1.base() as u64 + 0x1000), expected);
+            let strict_rep = x86_runtime::emu::aot_fallback_report();
+            x86_runtime::emu::clear_aot_strict_mode_override();
+            assert_eq!(strict_rep.runtime_jit_compiles, 0, "expected 0 runtime JIT compiles");
+            assert_eq!(strict_rep.interp_fast_steps, 0, "expected 0 interp fast steps");
+            assert_eq!(strict_rep.interp_generic_steps, 0, "expected 0 interp generic steps");
+            assert_eq!(strict_rep.interp_mmx_steps, 0, "expected 0 interp mmx steps");
+            assert_eq!(strict_rep.soft_fp_steps, 0, "expected 0 soft-fp steps");
+            assert_eq!(strict_rep.total_fallbacks, 0, "expected 0 total fallbacks");
+            assert!(
+                strict_rep.aot_insns > 0,
+                "expected >0 guest instructions executed in prewarmed AOT blocks"
+            );
 
             // --- Phase 2: Reload BOTH modules at shifted/relocated base addresses ---
             let mut dll2 = MappedBuf::alloc(0x8000, 0x2_4500_0000);
@@ -738,4 +754,40 @@ fn multi_module_aot_prewarm_and_shifted_reload_under_port_aot_verify() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn aot_strict_fail_aborts_with_exit_code_87_on_runtime_jit_fallback() {
+    // Subprocess pattern: when invoked with `PORT_AOT_STRICT=fail`, run an un-prewarmed
+    // guest block so the process terminates with EXIT_AOT_FALLBACK (87).
+    if x86_runtime::emu::aot_strict_mode() == x86_runtime::emu::AotStrictMode::Fail {
+        let mut buf = MappedBuf::alloc(0x4000, 0x2_4800_0000);
+        // `mov eax, 42; ret` — valid guest block, NOT in any AOT cache.
+        buf.as_slice_mut()[0x1000..0x1006].copy_from_slice(&[0xB8, 42, 0, 0, 0, 0xC3]);
+        let _ = unsafe { x86_runtime::emu::emu_run(buf.base() as u64 + 0x1000, [0; 8]) };
+        panic!("expected PORT_AOT_STRICT=fail to abort before returning");
+    }
+
+    let exe = std::env::current_exe().expect("current test binary");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "aot_strict_fail_aborts_with_exit_code_87_on_runtime_jit_fallback",
+            "--nocapture",
+        ])
+        .env("PORT_AOT_STRICT", "fail")
+        .output()
+        .expect("spawn child test");
+    assert_eq!(
+        out.status.code(),
+        Some(x86_runtime::emu::EXIT_AOT_FALLBACK as i32),
+        "expected exit code 87 (EXIT_AOT_FALLBACK), got status={:?}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("emu aot-strict: FAIL"),
+        "expected diagnostic failure message on stderr, got:\n{stderr}"
+    );
 }

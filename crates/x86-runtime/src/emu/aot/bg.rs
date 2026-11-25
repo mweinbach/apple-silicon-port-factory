@@ -303,7 +303,13 @@ pub(super) fn bg_job(
         );
         return None;
     }
-    let prof = read_profile(name, &key.image_hash);
+    let mut prof = read_profile(name, &key.image_hash);
+    let replayed = unsafe { super::callbacks::load_replayed_callback_roots(name, base, size) };
+    if !replayed.is_empty() {
+        prof.extend(replayed.into_iter().map(|c| c.rva));
+        prof.sort_unstable();
+        prof.dedup();
+    }
     if prof.is_empty() {
         log::info!(
             "emu aot: {name}: no profile yet (recording; AW2_DLL_AOT=2 builds at a later start)"
