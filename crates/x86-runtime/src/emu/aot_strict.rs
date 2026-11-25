@@ -16,7 +16,7 @@
 use iced_x86::Mnemonic;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 
 /// Documented process exit code when `PORT_AOT_STRICT=fail` observes a runtime JIT compile,
@@ -153,6 +153,24 @@ pub fn aot_strict_mode() -> AotStrictMode {
 #[inline]
 pub(super) fn is_active() -> bool {
     aot_strict_mode() != AotStrictMode::Off
+}
+
+/// Set when a caller (such as `--report-json`) requests translated-instruction tier totals
+/// (`aot_insns` vs `runtime_jit_insns`) even while `PORT_AOT_STRICT=off` and `AW2_JIT_STATS=0`.
+static TRACK_TRANSLATED_INSNS: AtomicBool = AtomicBool::new(false);
+
+/// Enable AOT vs runtime-JIT translated instruction accounting (used by `--report-json`).
+pub fn enable_translated_accounting() {
+    TRACK_TRANSLATED_INSNS.store(true, Ordering::Release);
+}
+
+/// True whenever AOT vs runtime-JIT translated instruction counts must be collected and
+/// cross-tier chaining must be prevented so each tier's instruction count is exact.
+#[inline]
+pub fn translated_accounting_enabled() -> bool {
+    TRACK_TRANSLATED_INSNS.load(Ordering::Relaxed)
+        || is_active()
+        || super::jit_stats::enabled()
 }
 
 // Fast atomic totals (always updated on cold fallback paths so `--report-json` always has counts).

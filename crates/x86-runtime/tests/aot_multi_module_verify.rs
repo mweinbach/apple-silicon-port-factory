@@ -736,6 +736,65 @@ fn multi_module_aot_prewarm_and_shifted_reload_under_port_aot_verify() {
             assert_eq!(run_matrix(exe2.base() as u64 + 0x1000), expected);
             assert_eq!(run_matrix(exe2.base() as u64 + 0x1000), expected);
 
+            // Verify ordinary `--report-json` accounting (`enable_translated_accounting()` with
+            // `PORT_AOT_STRICT=off` and `AW2_JIT_STATS` unset) still collects real AOT totals.
+            x86_runtime::emu::clear_aot_strict_mode_override();
+            x86_runtime::emu::reset_aot_fallback_counters();
+            x86_runtime::emu::enable_translated_accounting();
+            assert_eq!(run_matrix(exe2.base() as u64 + 0x1000), expected);
+            let report_only = x86_runtime::emu::aot_fallback_report();
+            assert_eq!(report_only.strict_mode, "off");
+            assert!(
+                report_only.aot_insns > 0,
+                "enable_translated_accounting() must record aot_insns even with PORT_AOT_STRICT=off"
+            );
+            assert_eq!(
+                report_only.runtime_jit_insns, 0,
+                "prewarmed matrix should execute zero runtime-JIT instructions"
+            );
+
+            // Verify cross-tier chains (runtime-JIT <-> AOT) split instruction counts accurately:
+            // build an un-prewarmed runtime-JIT wrapper with a small backedge loop (so budget_light
+            // decrements inside runtime-JIT) that calls prewarmed AOT `dll2::switch_c` (`dll2 + 0x1200`)
+            // and returns.
+            let mut jit_wrap = MappedBuf::alloc(0x4000, 0x2_4700_0000);
+            let mut a = CodeAssembler::new(64).unwrap();
+            let mut loop_lbl = a.create_label();
+            a.sub(rsp, 0x28).unwrap();
+            a.mov(r9d, 5).unwrap();
+            a.set_label(&mut loop_lbl).unwrap();
+            a.dec(r9d).unwrap();
+            a.jnz(loop_lbl).unwrap();
+            a.mov(rax, rdx).unwrap(); // rax = AOT target (`dll2 + 0x1200`)
+            a.call(rax).unwrap(); // cross-tier call: runtime-JIT -> AOT -> ret -> runtime-JIT
+            a.add(rax, 1).unwrap();
+            a.add(rsp, 0x28).unwrap();
+            a.ret().unwrap();
+            let wrap_code = a.assemble(jit_wrap.base() as u64 + 0x1000).unwrap();
+            jit_wrap.as_slice_mut()[0x1000..0x1000 + wrap_code.len()].copy_from_slice(&wrap_code);
+            let wrap_ip = jit_wrap.base() as u64 + 0x1000;
+            let aot_target = dll2.base() as u64 + 0x1200; // switch_c(0) -> 700
+
+            // Warm up `jit_wrap` so it is compiled by the runtime JIT.
+            for _ in 0..4 {
+                let got = unsafe { x86_runtime::emu::emu_run(wrap_ip, [0, aot_target, 0, 0, 0, 0, 0, 0]) };
+                assert_eq!(got, 701);
+            }
+            x86_runtime::emu::set_aot_strict_mode(x86_runtime::emu::AotStrictMode::Report);
+            x86_runtime::emu::reset_aot_fallback_counters();
+            for _ in 0..10 {
+                let got = unsafe { x86_runtime::emu::emu_run(wrap_ip, [0, aot_target, 0, 0, 0, 0, 0, 0]) };
+                assert_eq!(got, 701);
+            }
+            let cross = x86_runtime::emu::aot_fallback_report();
+            x86_runtime::emu::clear_aot_strict_mode_override();
+            assert!(
+                cross.runtime_jit_insns > 0 && cross.aot_insns > 0,
+                "cross-tier runtime-JIT <-> AOT chain must credit both tiers (aot={}, runtime_jit={})",
+                cross.aot_insns,
+                cross.runtime_jit_insns
+            );
+
             // The same reloaded blocks must switch clock mode at execution time.
             let entries = [0x1400, 0x1410].map(|rva| dll2.base() as u64 + rva);
             assert!(entries.iter().all(|&ip| x86_runtime::emu::aot_has_block(ip)));
@@ -790,4 +849,48 @@ fn aot_strict_fail_aborts_with_exit_code_87_on_runtime_jit_fallback() {
         stderr.contains("emu aot-strict: FAIL"),
         "expected diagnostic failure message on stderr, got:\n{stderr}"
     );
+}
+
+#[test]
+fn aot_strict_report_attributes_each_fast_interp_instruction_individually() {
+    std::thread::Builder::new()
+        .name("aot-strict-fast-attr".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let mut buf = MappedBuf::alloc(0x4000, 0x2_4900_0000);
+            let entry = buf.base() as u64 + 0x1000;
+            // `cpuid` (2B) + `mov eax, 0x1234` (5B) + `add eax, 0x56` (3B) + `ret` (1B)
+            // `cpuid` is a non-JIT fast op; in `PORT_AOT_STRICT=report` mode the following
+            // fast ops must NOT be folded into `cpuid`'s count/site.
+            let code: [u8; 11] = [
+                0x0F, 0xA2, // cpuid @ +0x1000
+                0xB8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234 @ +0x1002
+                0x83, 0xC0, 0x56, // add eax, 0x56 @ +0x1007
+                0xC3, // ret @ +0x100a
+            ];
+            buf.as_slice_mut()[0x1000..0x1000 + code.len()].copy_from_slice(&code);
+
+            x86_runtime::emu::set_aot_strict_mode(x86_runtime::emu::AotStrictMode::Report);
+            x86_runtime::emu::reset_aot_fallback_counters();
+            let got = unsafe { x86_runtime::emu::emu_run(entry, [0; 8]) };
+            let rep = x86_runtime::emu::aot_fallback_report();
+            x86_runtime::emu::clear_aot_strict_mode_override();
+
+            assert_eq!(got, 0x1234 + 0x56);
+            assert_eq!(rep.interp_fast_steps, 4, "report: {rep:?}");
+            let site_count = |ip: u64, mn: &str| -> u64 {
+                rep.top_sites
+                    .iter()
+                    .find(|s| s.ip == ip && s.mnemonic == mn)
+                    .map(|s| s.count)
+                    .unwrap_or(0)
+            };
+            assert_eq!(site_count(entry, "cpuid"), 1, "top_sites: {:?}", rep.top_sites);
+            assert_eq!(site_count(entry + 2, "mov"), 1, "top_sites: {:?}", rep.top_sites);
+            assert_eq!(site_count(entry + 7, "add"), 1, "top_sites: {:?}", rep.top_sites);
+            assert_eq!(site_count(entry + 10, "ret"), 1, "top_sites: {:?}", rep.top_sites);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

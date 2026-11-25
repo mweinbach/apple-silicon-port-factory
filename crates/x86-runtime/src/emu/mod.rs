@@ -98,8 +98,9 @@ pub(crate) use dispatch::{call_host_dispatched_in, call_lean_in, shadow_lean_xmm
 
 pub use aot_strict::{
     aot_fallback_report, aot_strict_mode, clear_aot_strict_mode_override,
-    format_aot_fallback_summary, reset_aot_fallback_counters, set_aot_strict_mode,
-    AotFallbackReport, AotFallbackSite, AotStrictMode, EXIT_AOT_FALLBACK,
+    enable_translated_accounting, format_aot_fallback_summary, reset_aot_fallback_counters,
+    set_aot_strict_mode, translated_accounting_enabled, AotFallbackReport, AotFallbackSite,
+    AotStrictMode, EXIT_AOT_FALLBACK,
 };
 
 pub use interp::{

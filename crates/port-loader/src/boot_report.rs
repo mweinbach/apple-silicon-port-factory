@@ -42,6 +42,7 @@ pub fn configure(path: PathBuf, exe: String, game_dir: String, manifest: Option<
         started_at,
     });
     drop(g);
+    x86_runtime::emu::enable_translated_accounting();
     win32_rt::process::register_exit_hook(write_exit_report);
 }
 

@@ -866,8 +866,7 @@ unsafe fn emu_run_region(
                     budget = budget.min(4096);
                 }
                 let (ex, executed) = (*jit_ptr).run(&mut cpu, code, budget);
-                let strict_on = aot_strict::is_active();
-                if jstats || strict_on {
+                if aot_strict::translated_accounting_enabled() {
                     let from_aot = !(*jit_ptr).owns_code(code);
                     aot_strict::record_translated_insns(executed, from_aot);
                     if jstats {
@@ -944,8 +943,8 @@ unsafe fn emu_run_region(
             }
             if !verify || !fast::verifiable(op.kind) {
                 let fx;
-                if !verify && !prof_mnem_fast && !precise && !nan_step && !soft_flush {
-                    let burst_ok = if !prof_mnem && !jstats && !strict_active && !skipped_jit {
+                if !verify && !prof_mnem_fast && !precise && !nan_step && !soft_flush && !strict_active {
+                    let burst_ok = if !prof_mnem && !jstats && !skipped_jit {
                         if let Some((slot, blk_len)) = head_slot {
                             let mflags = burst_mode_flags_from_base(burst_base_flags, jit_ptr);
                             let fast_gen = (*blocks_ptr).sync_fast_gen(mflags);
@@ -1058,7 +1057,18 @@ unsafe fn emu_run_region(
                     }
                     if let fast::Fx::FuseJcc = f {
                         // `fuse` guarantees the next slot of this block is the jcc.
-                        let j = &*ops_base.add(blk_off);
+                        let j_off = blk_off;
+                        let j = &*ops_base.add(j_off);
+                        if jit_on || strict_active {
+                            aot_strict::record_interp_fast(
+                                j.ip,
+                                (*ins_base.add(j_off)).mnemonic(),
+                                1,
+                            );
+                        }
+                        if jstats {
+                            jit_stats::interp(j.ip, (*ins_base.add(j_off)).mnemonic(), false);
+                        }
                         blk_off += 1;
                         blk_left -= 1;
                         g.steps += 1;
