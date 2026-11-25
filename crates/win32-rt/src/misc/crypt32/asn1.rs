@@ -1,7 +1,10 @@
 //! ASN.1 DER parsing, X.509 encoding (`CryptEncodeObjectEx`), and string-to-binary
 //! decoding (`CryptStringToBinaryA/W`) for `crypt32.dll`.
 
-use super::store::ERROR_CALL_NOT_IMPLEMENTED;
+use super::decode::{
+    CNG_RSA_PUBLIC_KEY_BLOB, PKCS_ATTRIBUTE, PKCS_ATTRIBUTES, PKCS_CONTENT_INFO, PKCS_UTC_TIME,
+    X509_ALGORITHM_IDENTIFIER, X509_AUTHORITY_KEY_ID2, X509_ENUMERATED,
+};
 use crate::misc::wintrust::{
     self, CertInfo, CertPublicKeyInfo, CryptAlgId, CryptBitBlob, CryptDataBlob,
 };
@@ -49,6 +52,7 @@ pub(super) const CRYPT_STRING_HEXADDR: u32 = 0x0000_000A;
 pub(super) const CRYPT_STRING_HEXASCIIADDR: u32 = 0x0000_000B;
 pub(super) const CRYPT_STRING_HEXRAW: u32 = 0x0000_000C;
 pub(super) const CRYPT_STRING_BASE64URI: u32 = 0x0000_000D;
+pub(super) const CRYPT_STRING_PERCENTESCAPE: u32 = 0x0000_000E;
 const CRYPT_STRING_STRICT: u32 = 0x2000_0000;
 
 // ---------------------------------------------------------------------------
@@ -670,6 +674,7 @@ unsafe fn encode_x509_object(
             "2.5.29.15" => X509_KEY_USAGE,
             "2.5.29.17" | "2.5.29.18" => X509_ALTERNATE_NAME,
             "2.5.29.19" => X509_BASIC_CONSTRAINTS2,
+            "2.5.29.35" => X509_AUTHORITY_KEY_ID2,
             "2.5.29.37" => X509_ENHANCED_KEY_USAGE,
             _ => 0,
         }
@@ -937,9 +942,145 @@ unsafe fn encode_x509_object(
             }
             Ok(encode_der_tlv(0x30, &tbs))
         }
+        X509_ENUMERATED => {
+            let v = std::ptr::read_unaligned(pv_struct_info as *const i32);
+            let mut der = encode_der_i32(v);
+            der[0] = 0x0A; // ASN.1 ENUMERATED tag
+            Ok(der)
+        }
+        PKCS_UTC_TIME => {
+            let ft = std::ptr::read_unaligned(pv_struct_info as *const u64);
+            encode_der_filetime(ft).ok_or(err::ERROR_INVALID_DATA)
+        }
+        X509_ALGORITHM_IDENTIFIER => {
+            let alg = std::ptr::read_unaligned(pv_struct_info as *const CryptAlgId);
+            encode_alg_id(&alg).ok_or(err::ERROR_INVALID_DATA)
+        }
+        PKCS_CONTENT_INFO => {
+            #[repr(C)]
+            struct CryptContentInfo {
+                psz_obj_id: *const u8,
+                content: CryptDataBlob,
+            }
+            let ci = std::ptr::read_unaligned(pv_struct_info as *const CryptContentInfo);
+            if ci.psz_obj_id.is_null() {
+                return Err(err::ERROR_INVALID_DATA);
+            }
+            let oid_s = crate::strings::from_ansi(ci.psz_obj_id);
+            let oid_val = wintrust::encode_oid_str(&oid_s).ok_or(err::ERROR_INVALID_DATA)?;
+            let mut inner = encode_der_tlv(0x06, &oid_val);
+            if !ci.content.pb_data.is_null() && ci.content.cb_data > 0 {
+                let c = std::slice::from_raw_parts(ci.content.pb_data, ci.content.cb_data as usize);
+                inner.extend_from_slice(&encode_der_tlv(0xA0, c));
+            }
+            Ok(encode_der_tlv(0x30, &inner))
+        }
+        PKCS_ATTRIBUTE => {
+            #[repr(C)]
+            struct CryptAttr {
+                psz_obj_id: *const u8,
+                c_value: u32,
+                rg_value: *const CryptDataBlob,
+            }
+            let a = std::ptr::read_unaligned(pv_struct_info as *const CryptAttr);
+            if a.psz_obj_id.is_null() || (a.c_value > 0 && a.rg_value.is_null()) {
+                return Err(err::ERROR_INVALID_DATA);
+            }
+            let oid_s = crate::strings::from_ansi(a.psz_obj_id);
+            let oid_val = wintrust::encode_oid_str(&oid_s).ok_or(err::ERROR_INVALID_DATA)?;
+            let mut set_inner = Vec::new();
+            for i in 0..a.c_value as usize {
+                let b = std::ptr::read_unaligned(a.rg_value.add(i));
+                if !b.pb_data.is_null() && b.cb_data > 0 {
+                    set_inner.extend_from_slice(std::slice::from_raw_parts(
+                        b.pb_data,
+                        b.cb_data as usize,
+                    ));
+                }
+            }
+            let mut inner = encode_der_tlv(0x06, &oid_val);
+            inner.extend_from_slice(&encode_der_tlv(0x31, &set_inner));
+            Ok(encode_der_tlv(0x30, &inner))
+        }
+        PKCS_ATTRIBUTES => {
+            #[repr(C)]
+            struct CryptAttr {
+                psz_obj_id: *const u8,
+                c_value: u32,
+                rg_value: *const CryptDataBlob,
+            }
+            #[repr(C)]
+            struct CryptAttrs {
+                c_attr: u32,
+                rg_attr: *const CryptAttr,
+            }
+            let list = std::ptr::read_unaligned(pv_struct_info as *const CryptAttrs);
+            if list.c_attr > 0 && list.rg_attr.is_null() {
+                return Err(err::ERROR_INVALID_DATA);
+            }
+            let mut inner = Vec::new();
+            for i in 0..list.c_attr as usize {
+                let attr_ptr = list.rg_attr.add(i) as *const c_void;
+                let enc = encode_x509_object(PKCS_ATTRIBUTE as *const u8, attr_ptr)?;
+                inner.extend_from_slice(&enc);
+            }
+            Ok(encode_der_tlv(0x31, &inner))
+        }
+        X509_AUTHORITY_KEY_ID2 => {
+            #[repr(C)]
+            struct CertAuthorityKeyId2Info {
+                key_id: CryptDataBlob,
+                authority_cert_issuer: CertAltNameInfo,
+                authority_cert_serial_number: CryptDataBlob,
+            }
+            let aki = std::ptr::read_unaligned(pv_struct_info as *const CertAuthorityKeyId2Info);
+            let mut inner = Vec::new();
+            if !aki.key_id.pb_data.is_null() && aki.key_id.cb_data > 0 {
+                let b = std::slice::from_raw_parts(aki.key_id.pb_data, aki.key_id.cb_data as usize);
+                inner.extend_from_slice(&encode_der_tlv(0x80, b));
+            }
+            if aki.authority_cert_issuer.c_alt_entry > 0
+                && !aki.authority_cert_issuer.rg_alt_entry.is_null()
+            {
+                let san_der = encode_x509_object(
+                    X509_ALTERNATE_NAME as *const u8,
+                    &aki.authority_cert_issuer as *const _ as *const c_void,
+                )?;
+                if let Some((seq, _)) = parse_der_item(&san_der) {
+                    inner.extend_from_slice(&encode_der_tlv(0xA1, seq.val));
+                }
+            }
+            if !aki.authority_cert_serial_number.pb_data.is_null()
+                && aki.authority_cert_serial_number.cb_data > 0
+            {
+                let mut be = std::slice::from_raw_parts(
+                    aki.authority_cert_serial_number.pb_data,
+                    aki.authority_cert_serial_number.cb_data as usize,
+                )
+                .to_vec();
+                be.reverse();
+                inner.extend_from_slice(&encode_der_tlv(0x82, &be));
+            }
+            Ok(encode_der_tlv(0x30, &inner))
+        }
+        CNG_RSA_PUBLIC_KEY_BLOB => {
+            // BCRYPT_RSAKEY_BLOB (24B) + BE exponent + BE modulus
+            let p = pv_struct_info as *const u8;
+            let magic = std::ptr::read_unaligned(p as *const u32);
+            let cb_exp = std::ptr::read_unaligned(p.add(8) as *const u32) as usize;
+            let cb_mod = std::ptr::read_unaligned(p.add(12) as *const u32) as usize;
+            if (magic != 0x3141_5352 && magic != 0x3241_5352) || cb_exp == 0 || cb_mod == 0 {
+                return Err(err::ERROR_INVALID_DATA);
+            }
+            let exp_be = std::slice::from_raw_parts(p.add(24), cb_exp);
+            let mod_be = std::slice::from_raw_parts(p.add(24 + cb_exp), cb_mod);
+            let mut inner = encode_der_uint_be(mod_be);
+            inner.extend_from_slice(&encode_der_uint_be(exp_be));
+            Ok(encode_der_tlv(0x30, &inner))
+        }
         _ => {
-            stub!("CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE");
-            Err(ERROR_CALL_NOT_IMPLEMENTED)
+            log::debug!("CryptEncodeObjectEx: unknown struct_type={raw_stype:#x} -> ERROR_FILE_NOT_FOUND");
+            Err(err::ERROR_FILE_NOT_FOUND)
         }
     }
 }
@@ -952,7 +1093,7 @@ pub(super) unsafe fn crypt_encode_object_ex_impl(
     pv_encoded: *mut c_void,
     pcb_encoded: *mut u32,
 ) -> BOOL {
-    if (dw_cert_encoding_type & X509_ASN_ENCODING) == 0
+    if (dw_cert_encoding_type & (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING)) == 0
         || pv_struct_info.is_null()
         || pcb_encoded.is_null()
     {
@@ -1272,8 +1413,38 @@ unsafe fn crypt_string_to_binary_impl(
             .or_else(|| decode_hex_dump(text, true, false).map(|b| (b, 0, CRYPT_STRING_HEXADDR)))
             .or_else(|| decode_hex_bytes(text, false, false).map(|b| (b, 0, CRYPT_STRING_HEX)))
             .or_else(|| decode_hex_dump(text, false, true).map(|b| (b, 0, CRYPT_STRING_HEXASCII))),
+        CRYPT_STRING_PERCENTESCAPE => {
+            // Percent-decode UTF-8/ASCII bytes per Windows CRYPT_STRING_PERCENTESCAPE (0x0E)
+            let bytes = text.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0usize;
+            let mut ok = true;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    if i + 2 >= bytes.len() {
+                        ok = false;
+                        break;
+                    }
+                    let Some(hi) = hex_nibble(bytes[i + 1]) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(lo) = hex_nibble(bytes[i + 2]) else {
+                        ok = false;
+                        break;
+                    };
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            ok.then_some((out, 0, CRYPT_STRING_PERCENTESCAPE))
+        }
         _ => {
-            stub!("CryptStringToBinary unsupported flags {flags:#x}");
+            // Invalid dwFlags value outside wincrypt.h CRYPT_STRING_* constants -> ERROR_INVALID_DATA.
+            log::debug!("CryptStringToBinary: invalid flags {flags:#x} -> ERROR_INVALID_DATA");
             None
         }
     };

@@ -62,6 +62,24 @@ const CERT_STORE_ADD_USE_EXISTING: u32 = 2;
 const CERT_STORE_ADD_REPLACE_EXISTING: u32 = 3;
 const CERT_STORE_ADD_ALWAYS: u32 = 4;
 
+// Certificate context property IDs (wincrypt.h)
+pub(super) const CERT_KEY_PROV_HANDLE_PROP_ID: u32 = 1;
+pub(super) const CERT_KEY_PROV_INFO_PROP_ID: u32 = 2;
+pub(super) const CERT_SHA1_HASH_PROP_ID: u32 = 3;
+pub(super) const CERT_MD5_HASH_PROP_ID: u32 = 4;
+pub(super) const CERT_KEY_SPEC_PROP_ID: u32 = 6;
+pub(super) const CERT_ENHKEY_USAGE_PROP_ID: u32 = 9;
+pub(super) const CERT_FRIENDLY_NAME_PROP_ID: u32 = 11;
+pub(super) const CERT_DESCRIPTION_PROP_ID: u32 = 13;
+pub(super) const CERT_ACCESS_STATE_PROP_ID: u32 = 14;
+pub(super) const CERT_SIGNATURE_HASH_PROP_ID: u32 = 15;
+pub(super) const CERT_KEY_IDENTIFIER_PROP_ID: u32 = 20;
+pub(super) const CERT_PUBKEY_ALG_PARA_PROP_ID: u32 = 22;
+pub(super) const CERT_ISSUER_PUBLIC_KEY_MD5_HASH_PROP_ID: u32 = 24;
+pub(super) const CERT_SUBJECT_PUBLIC_KEY_MD5_HASH_PROP_ID: u32 = 25;
+pub(super) const CERT_SUBJECT_NAME_MD5_HASH_PROP_ID: u32 = 29;
+pub(super) const CERT_SHA256_HASH_PROP_ID: u32 = 107;
+
 // ---------------------------------------------------------------------------
 // Internal registries for certificates, stores, and PKCS#7 messages
 // ---------------------------------------------------------------------------
@@ -82,6 +100,10 @@ struct RegisteredCert {
     peer_verify: Option<PeerCertVerifyResult>,
     /// Memory store owned by this peer cert (released when refcount hits 0).
     owned_store: usize,
+    /// Arbitrary certificate context properties (`CertSetCertificateContextProperty` / PFX).
+    properties: HashMap<u32, Vec<u8>>,
+    /// Associated PKCS#8 DER private key (from `PFXImportCertStore` or `attach_cert_private_key`).
+    private_key_pkcs8: Option<Vec<u8>>,
 }
 
 struct RegisteredStore {
@@ -224,9 +246,95 @@ fn insert_cert_locked(
             peer_chain_der,
             peer_verify,
             owned_store,
+            properties: HashMap::new(),
+            private_key_pkcs8: None,
         },
     );
     ptr
+}
+
+pub(super) fn create_cert_context_from_der(der: &[u8]) -> *mut c_void {
+    let Some(owned) = wintrust::build_owned_cert_context(der, std::ptr::null_mut()) else {
+        return std::ptr::null_mut();
+    };
+    let mut st = STORE_STATE.lock().unwrap();
+    insert_cert_locked(&mut st, owned, vec![der.to_vec()], None, 0) as *mut c_void
+}
+
+pub(super) fn add_der_with_meta_to_store(
+    h_cert_store: *mut c_void,
+    der: &[u8],
+    props: Vec<(u32, Vec<u8>)>,
+    private_key_pkcs8: Option<Vec<u8>>,
+) -> *mut c_void {
+    let Some(owned) = wintrust::build_owned_cert_context(der, h_cert_store) else {
+        return std::ptr::null_mut();
+    };
+    let mut st = STORE_STATE.lock().unwrap();
+    let store_key = h_cert_store as usize;
+    if !st.stores.contains_key(&store_key) {
+        return std::ptr::null_mut();
+    }
+    let h = insert_cert_locked(&mut st, owned, vec![der.to_vec()], None, 0);
+    if let Some(entry) = st.certs.get_mut(&h) {
+        for (id, val) in props {
+            entry.properties.insert(id, val);
+        }
+        entry.private_key_pkcs8 = private_key_pkcs8;
+    }
+    st.stores.get_mut(&store_key).unwrap().certs.push(h);
+    h as *mut c_void
+}
+
+/// Associate a PKCS#8 DER private key with a registered `PCCERT_CONTEXT` (for server-side Schannel).
+#[allow(dead_code)]
+pub(crate) fn attach_cert_private_key_pkcs8(cert_ctx: *mut c_void, pkcs8_der: Vec<u8>) -> bool {
+    if cert_ctx.is_null() {
+        return false;
+    }
+    let mut st = STORE_STATE.lock().unwrap();
+    if let Some(entry) = st.certs.get_mut(&(cert_ctx as usize)) {
+        entry.private_key_pkcs8 = Some(pkcs8_der);
+        true
+    } else {
+        false
+    }
+}
+
+/// Look up the certificate chain (leaf + any intermediates in its store) and attached PKCS#8 private key
+/// for a `PCCERT_CONTEXT` passed to Schannel (`SCHANNEL_CRED.paCred`).
+pub(crate) fn lookup_cert_private_key_and_chain(
+    cert_ctx: *const c_void,
+) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    if cert_ctx.is_null() {
+        return None;
+    }
+    let st = STORE_STATE.lock().unwrap();
+    let entry = st.certs.get(&(cert_ctx as usize))?;
+    let key = entry.private_key_pkcs8.clone()?;
+    let mut chain = vec![entry.owned.raw_der().to_vec()];
+    let store_h = unsafe { (*entry.owned.as_ptr()).h_cert_store as usize };
+    if store_h != 0 {
+        if let Some(store) = st.stores.get(&store_h) {
+            for &ch in &store.certs {
+                if ch == cert_ctx as usize {
+                    continue;
+                }
+                if let Some(other) = st.certs.get(&ch) {
+                    let der = other.owned.raw_der().to_vec();
+                    if !chain.iter().any(|c| c == &der) {
+                        chain.push(der);
+                    }
+                }
+            }
+        }
+    }
+    Some((chain, key))
+}
+
+/// Duplicate a registered `PCCERT_CONTEXT` by raw DER bytes (or register a fresh context).
+pub(crate) fn duplicate_or_create_cert_context_der(der: &[u8]) -> *mut c_void {
+    create_cert_context_from_der(der)
 }
 
 fn release_cert_locked(st: &mut StoreState, handle: usize) -> bool {
@@ -396,10 +504,24 @@ fn open_named_system_store(store_name: &str) -> *mut c_void {
     st.next_store_id += 1;
     let mut certs = Vec::new();
     if seed_roots {
+        let mut seen_subjects: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // Seed real macOS Security.framework system/admin/user roots first, then webpki-roots.
+        for der in super::chain::macos_system_roots_der() {
+            if let Some(owned) = wintrust::build_owned_cert_context(der, id as *mut c_void) {
+                let key = owned.spki_raw_der().to_vec();
+                if seen_subjects.insert(key) {
+                    let h = insert_cert_locked(&mut st, owned, vec![der.clone()], None, 0);
+                    certs.push(h);
+                }
+            }
+        }
         for der in WEBPKI_ROOT_CERTS_DER.iter() {
             if let Some(owned) = wintrust::build_owned_cert_context(der, id as *mut c_void) {
-                let h = insert_cert_locked(&mut st, owned, vec![der.clone()], None, 0);
-                certs.push(h);
+                let key = owned.spki_raw_der().to_vec();
+                if seen_subjects.insert(key) {
+                    let h = insert_cert_locked(&mut st, owned, vec![der.clone()], None, 0);
+                    certs.push(h);
+                }
             }
         }
     }
@@ -1142,8 +1264,11 @@ pub(super) unsafe fn cert_get_subject_certificate_from_store_impl(
 // ---------------------------------------------------------------------------
 
 pub(super) fn crypt_msg_close_impl(h_msg: *mut c_void) -> BOOL {
-    if !h_msg.is_null() && MSGS.remove(h_msg as usize).is_none() {
-        stub!("CryptMsgClose({h_msg:p}): foreign message ignored");
+    if !h_msg.is_null() {
+        let key = h_msg as usize;
+        if MSGS.remove(key).is_none() && !super::pkcs::try_close_decode_msg(key) {
+            stub!("CryptMsgClose({h_msg:p}): foreign message ignored");
+        }
     }
     TRUE
 }
@@ -1287,6 +1412,15 @@ pub(super) unsafe fn crypt_msg_get_param_impl(
     if h_crypt_msg.is_null() || pcb_data.is_null() {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return FALSE;
+    }
+    if let Some(res) = super::pkcs::try_get_decode_msg_param(
+        h_crypt_msg as usize,
+        dw_param_type,
+        dw_index,
+        pv_data,
+        pcb_data,
+    ) {
+        return res;
     }
     let write_bytes = |src: &[u8]| -> BOOL {
         let need = src.len() as u32;
@@ -1437,4 +1571,465 @@ pub(super) unsafe fn crypt_msg_get_param_impl(
             FALSE
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Certificate Context Properties (CertGet/SetCertificateContextProperty)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct CryptKeyProvInfo {
+    pwsz_container_name: *mut u16,
+    pwsz_prov_name: *mut u16,
+    dw_prov_type: u32,
+    dw_flags: u32,
+    c_prov_param: u32,
+    rg_prov_param: *mut c_void,
+    dw_key_spec: u32,
+}
+const _: () = assert!(std::mem::size_of::<CryptKeyProvInfo>() == 48);
+
+pub(super) unsafe fn cert_get_certificate_context_property_impl(
+    p_cert_context: *const c_void,
+    dw_prop_id: u32,
+    pv_data: *mut c_void,
+    pcb_data: *mut u32,
+) -> BOOL {
+    if p_cert_context.is_null() || pcb_data.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let cc = std::ptr::read_unaligned(p_cert_context as *const CertContext);
+    let der_bytes: Vec<u8> = if !cc.pb_cert_encoded.is_null() && cc.cb_cert_encoded > 0 {
+        std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize).to_vec()
+    } else {
+        Vec::new()
+    };
+
+    // Check explicit stored properties and private key state on registered contexts first.
+    let (stored_prop, has_priv_key) = {
+        let st = STORE_STATE.lock().unwrap();
+        if let Some(entry) = st.certs.get(&(p_cert_context as usize)) {
+            (
+                entry.properties.get(&dw_prop_id).cloned(),
+                entry.private_key_pkcs8.is_some(),
+            )
+        } else {
+            (None, false)
+        }
+    };
+
+    // Special case: CERT_KEY_PROV_INFO_PROP_ID (2) contains internal pointers into the caller buffer.
+    if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID && stored_prop.is_none() && has_priv_key {
+        let container_w: Vec<u16> = format!("PFX-{:x}\0", p_cert_context as usize)
+            .encode_utf16()
+            .collect();
+        let prov_w: Vec<u16> = "Microsoft Enhanced RSA and AES Cryptographic Provider\0"
+            .encode_utf16()
+            .collect();
+        let hdr_sz = std::mem::size_of::<CryptKeyProvInfo>();
+        let total = hdr_sz + container_w.len() * 2 + prov_w.len() * 2;
+        let need = total as u32;
+        if pv_data.is_null() {
+            std::ptr::write_unaligned(pcb_data, need);
+            return TRUE;
+        }
+        let cap = std::ptr::read_unaligned(pcb_data);
+        if cap < need {
+            std::ptr::write_unaligned(pcb_data, need);
+            crate::teb::set_last_error(err::ERROR_MORE_DATA);
+            return FALSE;
+        }
+        let base = pv_data as *mut u8;
+        let cont_ptr = base.add(hdr_sz) as *mut u16;
+        for (i, &u) in container_w.iter().enumerate() {
+            std::ptr::write_unaligned(cont_ptr.add(i), u);
+        }
+        let prov_ptr = cont_ptr.add(container_w.len());
+        for (i, &u) in prov_w.iter().enumerate() {
+            std::ptr::write_unaligned(prov_ptr.add(i), u);
+        }
+        std::ptr::write_unaligned(
+            pv_data as *mut CryptKeyProvInfo,
+            CryptKeyProvInfo {
+                pwsz_container_name: cont_ptr,
+                pwsz_prov_name: prov_ptr,
+                dw_prov_type: 24, // PROV_RSA_AES
+                dw_flags: 0,
+                c_prov_param: 0,
+                rg_prov_param: std::ptr::null_mut(),
+                dw_key_spec: 1, // AT_KEYEXCHANGE
+            },
+        );
+        std::ptr::write_unaligned(pcb_data, need);
+        return TRUE;
+    }
+
+    let computed: Option<Vec<u8>> = if let Some(p) = stored_prop {
+        Some(p)
+    } else {
+        match dw_prop_id {
+            CERT_SHA1_HASH_PROP_ID => (!der_bytes.is_empty())
+                .then(|| crate::misc::bcrypt::Digest::Sha1.hash(&der_bytes)),
+            CERT_MD5_HASH_PROP_ID => (!der_bytes.is_empty())
+                .then(|| crate::misc::bcrypt::Digest::Md5.hash(&der_bytes)),
+            CERT_SHA256_HASH_PROP_ID => (!der_bytes.is_empty())
+                .then(|| crate::misc::bcrypt::Digest::Sha256.hash(&der_bytes)),
+            CERT_SIGNATURE_HASH_PROP_ID => parse_cert_der_parts(&der_bytes).map(|parts| {
+                // Hash TBS with the cert's signature digest algorithm (default SHA-256).
+                let dig = if let Some((oid, _)) = super::asn1::parse_der_item(parts.sig_alg_inner) {
+                    match oid.val {
+                        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04] => {
+                            crate::misc::bcrypt::Digest::Md5
+                        }
+                        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05]
+                        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x01] => {
+                            crate::misc::bcrypt::Digest::Sha1
+                        }
+                        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C]
+                        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03] => {
+                            crate::misc::bcrypt::Digest::Sha384
+                        }
+                        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D]
+                        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04] => {
+                            crate::misc::bcrypt::Digest::Sha512
+                        }
+                        _ => crate::misc::bcrypt::Digest::Sha256,
+                    }
+                } else {
+                    crate::misc::bcrypt::Digest::Sha256
+                };
+                dig.hash(parts.tbs_raw)
+            }),
+            CERT_KEY_IDENTIFIER_PROP_ID => parse_cert_der_parts(&der_bytes).map(|parts| {
+                const OID_SKI: &[u8] = &[0x55, 0x1D, 0x0E];
+                for (oid, _, val) in &parts.extensions {
+                    if *oid == OID_SKI {
+                        if let Some((oct, _)) = super::asn1::parse_der_item(val) {
+                            if oct.tag == 0x04 {
+                                return oct.val.to_vec();
+                            }
+                        }
+                    }
+                }
+                crate::misc::bcrypt::Digest::Sha1.hash(parts.spki_key_bits)
+            }),
+            CERT_SUBJECT_PUBLIC_KEY_MD5_HASH_PROP_ID => parse_cert_der_parts(&der_bytes)
+                .map(|parts| crate::misc::bcrypt::Digest::Md5.hash(parts.spki_key_bits)),
+            CERT_ISSUER_PUBLIC_KEY_MD5_HASH_PROP_ID => parse_cert_der_parts(&der_bytes).and_then(|parts| {
+                (parts.issuer_inner == parts.subject_inner)
+                    .then(|| crate::misc::bcrypt::Digest::Md5.hash(parts.spki_key_bits))
+            }),
+            CERT_SUBJECT_NAME_MD5_HASH_PROP_ID => parse_cert_der_parts(&der_bytes)
+                .map(|parts| crate::misc::bcrypt::Digest::Md5.hash(parts.subject_raw)),
+            CERT_ENHKEY_USAGE_PROP_ID => parse_cert_der_parts(&der_bytes).and_then(|parts| {
+                const OID_EKU: &[u8] = &[0x55, 0x1D, 0x25];
+                parts
+                    .extensions
+                    .iter()
+                    .find(|(oid, _, _)| *oid == OID_EKU)
+                    .map(|(_, _, val)| val.to_vec())
+            }),
+            CERT_PUBKEY_ALG_PARA_PROP_ID => {
+                if !cc.p_cert_info.is_null() {
+                    let ci = std::ptr::read_unaligned(cc.p_cert_info);
+                    let params = ci.subject_public_key_info.algorithm.parameters;
+                    if !params.pb_data.is_null() && params.cb_data > 0 {
+                        Some(
+                            std::slice::from_raw_parts(params.pb_data, params.cb_data as usize)
+                                .to_vec(),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            CERT_ACCESS_STATE_PROP_ID => Some(0u32.to_le_bytes().to_vec()),
+            CERT_KEY_SPEC_PROP_ID if has_priv_key => Some(1u32.to_le_bytes().to_vec()),
+            CERT_KEY_PROV_HANDLE_PROP_ID | CERT_DESCRIPTION_PROP_ID | CERT_FRIENDLY_NAME_PROP_ID => None,
+            _ => None,
+        }
+    };
+
+    let Some(bytes) = computed else {
+        crate::teb::set_last_error(CRYPT_E_NOT_FOUND);
+        return FALSE;
+    };
+    let need = bytes.len() as u32;
+    if pv_data.is_null() {
+        std::ptr::write_unaligned(pcb_data, need);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pcb_data);
+    if cap < need {
+        std::ptr::write_unaligned(pcb_data, need);
+        crate::teb::set_last_error(err::ERROR_MORE_DATA);
+        return FALSE;
+    }
+    if !bytes.is_empty() {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pv_data as *mut u8, bytes.len());
+    }
+    std::ptr::write_unaligned(pcb_data, need);
+    TRUE
+}
+
+pub(super) unsafe fn cert_set_certificate_context_property_impl(
+    p_cert_context: *const c_void,
+    dw_prop_id: u32,
+    _dw_flags: u32,
+    pv_data: *const c_void,
+) -> BOOL {
+    if p_cert_context.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let mut st = STORE_STATE.lock().unwrap();
+    let Some(entry) = st.certs.get_mut(&(p_cert_context as usize)) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if pv_data.is_null() {
+        entry.properties.remove(&dw_prop_id);
+        return TRUE;
+    }
+    let val = match dw_prop_id {
+        CERT_KEY_SPEC_PROP_ID | CERT_ACCESS_STATE_PROP_ID => {
+            std::ptr::read_unaligned(pv_data as *const u32).to_le_bytes().to_vec()
+        }
+        CERT_KEY_PROV_HANDLE_PROP_ID => {
+            std::ptr::read_unaligned(pv_data as *const usize).to_le_bytes().to_vec()
+        }
+        _ => {
+            // CRYPT_DATA_BLOB pointer
+            let blob = std::ptr::read_unaligned(pv_data as *const CryptDataBlob);
+            if blob.cb_data > 0 && blob.pb_data.is_null() {
+                crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            if blob.cb_data == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(blob.pb_data, blob.cb_data as usize).to_vec()
+            }
+        }
+    };
+    entry.properties.insert(dw_prop_id, val);
+    TRUE
+}
+
+// ---------------------------------------------------------------------------
+// CRL & CTL Contexts (CertCreate/Duplicate/Free CRL & CTL Context)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub(super) struct CrlContext {
+    pub(super) dw_cert_encoding_type: u32,
+    pub(super) pb_crl_encoded: *const u8,
+    pub(super) cb_crl_encoded: u32,
+    pub(super) p_crl_info: *mut c_void,
+    pub(super) h_cert_store: *mut c_void,
+}
+const _: () = assert!(std::mem::size_of::<CrlContext>() == 40);
+
+#[repr(C)]
+pub(super) struct CtlContext {
+    pub(super) dw_msg_and_cert_encoding_type: u32,
+    pub(super) pb_ctl_encoded: *const u8,
+    pub(super) cb_ctl_encoded: u32,
+    pub(super) p_ctl_info: *mut c_void,
+    pub(super) h_cert_store: *mut c_void,
+    pub(super) h_crypt_msg: *mut c_void,
+    pub(super) pb_ctl_content: *const u8,
+    pub(super) cb_ctl_content: u32,
+}
+const _: () = assert!(std::mem::size_of::<CtlContext>() == 64);
+
+struct RegisteredCrl {
+    _der: Box<[u8]>,
+    _info_buf: *mut c_void,
+    _ctx: Box<CrlContext>,
+    refcount: usize,
+}
+unsafe impl Send for RegisteredCrl {}
+impl Drop for RegisteredCrl {
+    fn drop(&mut self) {
+        if !self._info_buf.is_null() {
+            unsafe {
+                crate::kernel32::memory::LocalFree(self._info_buf);
+            }
+        }
+    }
+}
+
+struct RegisteredCtl {
+    _der: Box<[u8]>,
+    _ctx: Box<CtlContext>,
+    refcount: usize,
+}
+unsafe impl Send for RegisteredCtl {}
+
+static CRLS: LazyLock<Mutex<HashMap<usize, RegisteredCrl>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CTLS: LazyLock<Mutex<HashMap<usize, RegisteredCtl>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(super) unsafe fn cert_create_crl_context_impl(
+    dw_cert_encoding_type: u32,
+    pb_crl_encoded: *const u8,
+    cb_crl_encoded: u32,
+) -> *mut c_void {
+    if (dw_cert_encoding_type & X509_ASN_ENCODING) == 0
+        || pb_crl_encoded.is_null()
+        || cb_crl_encoded == 0
+    {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let slice = std::slice::from_raw_parts(pb_crl_encoded, cb_crl_encoded as usize);
+    let Some((seq, _)) = super::asn1::parse_der_item(slice) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    };
+    if seq.tag != 0x30 {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    }
+    // Attempt to decode tbsCertList (first child of CertificateList) into CRL_INFO.
+    let mut info_ptr: *mut c_void = std::ptr::null_mut();
+    if let Some(kids) = super::asn1::der_item_children(seq.val) {
+        if let Some(tbs) = kids.first() {
+            let mut info_sz = 0u32;
+            let _ = super::decode::crypt_decode_object_ex_impl(
+                X509_ASN_ENCODING,
+                super::decode::X509_CERT_CRL_TO_BE_SIGNED as *const u8,
+                tbs.raw.as_ptr(),
+                tbs.raw.len() as u32,
+                0x8000, // CRYPT_DECODE_ALLOC_FLAG
+                &mut info_ptr as *mut *mut c_void as *mut c_void,
+                &mut info_sz,
+            );
+        }
+    }
+    let der = slice.to_vec().into_boxed_slice();
+    let ctx = Box::new(CrlContext {
+        dw_cert_encoding_type: X509_ASN_ENCODING,
+        pb_crl_encoded: der.as_ptr(),
+        cb_crl_encoded: der.len() as u32,
+        p_crl_info: info_ptr,
+        h_cert_store: std::ptr::null_mut(),
+    });
+    let ptr = &*ctx as *const CrlContext as usize;
+    CRLS.lock().unwrap().insert(
+        ptr,
+        RegisteredCrl {
+            _der: der,
+            _info_buf: info_ptr,
+            _ctx: ctx,
+            refcount: 1,
+        },
+    );
+    ptr as *mut c_void
+}
+
+pub(super) fn cert_duplicate_crl_context_impl(ctx: *const c_void) -> *mut c_void {
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut map = CRLS.lock().unwrap();
+    if let Some(e) = map.get_mut(&(ctx as usize)) {
+        e.refcount += 1;
+    }
+    ctx as *mut c_void
+}
+
+pub(super) fn cert_free_crl_context_impl(ctx: *mut c_void) -> BOOL {
+    if ctx.is_null() {
+        return TRUE;
+    }
+    let mut map = CRLS.lock().unwrap();
+    let key = ctx as usize;
+    if let Some(e) = map.get_mut(&key) {
+        if e.refcount > 1 {
+            e.refcount -= 1;
+        } else {
+            map.remove(&key);
+        }
+    } else {
+        log::debug!("CertFreeCRLContext({ctx:p}): unknown/already-freed context");
+    }
+    TRUE
+}
+
+pub(super) unsafe fn cert_create_ctl_context_impl(
+    dw_msg_and_cert_encoding_type: u32,
+    pb_ctl_encoded: *const u8,
+    cb_ctl_encoded: u32,
+) -> *mut c_void {
+    if (dw_msg_and_cert_encoding_type & (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING)) == 0
+        || pb_ctl_encoded.is_null()
+        || cb_ctl_encoded == 0
+    {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let slice = std::slice::from_raw_parts(pb_ctl_encoded, cb_ctl_encoded as usize);
+    let Some((seq, _)) = super::asn1::parse_der_item(slice) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    };
+    if seq.tag != 0x30 {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    }
+    let der = slice.to_vec().into_boxed_slice();
+    let ctx = Box::new(CtlContext {
+        dw_msg_and_cert_encoding_type: dw_msg_and_cert_encoding_type,
+        pb_ctl_encoded: der.as_ptr(),
+        cb_ctl_encoded: der.len() as u32,
+        p_ctl_info: std::ptr::null_mut(),
+        h_cert_store: std::ptr::null_mut(),
+        h_crypt_msg: std::ptr::null_mut(),
+        pb_ctl_content: der.as_ptr(),
+        cb_ctl_content: der.len() as u32,
+    });
+    let ptr = &*ctx as *const CtlContext as usize;
+    CTLS.lock().unwrap().insert(
+        ptr,
+        RegisteredCtl {
+            _der: der,
+            _ctx: ctx,
+            refcount: 1,
+        },
+    );
+    ptr as *mut c_void
+}
+
+pub(super) fn cert_duplicate_ctl_context_impl(ctx: *const c_void) -> *mut c_void {
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut map = CTLS.lock().unwrap();
+    if let Some(e) = map.get_mut(&(ctx as usize)) {
+        e.refcount += 1;
+    }
+    ctx as *mut c_void
+}
+
+pub(super) fn cert_free_ctl_context_impl(ctx: *mut c_void) -> BOOL {
+    if ctx.is_null() {
+        return TRUE;
+    }
+    let mut map = CTLS.lock().unwrap();
+    let key = ctx as usize;
+    if let Some(e) = map.get_mut(&key) {
+        if e.refcount > 1 {
+            e.refcount -= 1;
+        } else {
+            map.remove(&key);
+        }
+    } else {
+        log::debug!("CertFreeCTLContext({ctx:p}): unknown/already-freed context");
+    }
+    TRUE
 }

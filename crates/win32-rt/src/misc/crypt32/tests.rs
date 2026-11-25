@@ -1,3 +1,6 @@
+#[path = "test_vectors.rs"]
+pub(crate) mod test_vectors;
+
 use super::asn1::{
     encode_der_tlv, CertAltNameEntry, CertAltNameInfo, CertBasicConstraints2Info, CertEccSignature,
     CertEnhkeyUsage, CertNameInfo, CertRdn, CertRdnAttr, CRYPT_STRING_BASE64,
@@ -542,7 +545,8 @@ fn cert_open_store_system_and_find_all_types() {
             }
             count += 1;
         }
-        assert_eq!(count, webpki_roots::TLS_SERVER_ROOTS.len());
+        // Verify ROOT includes at least all embedded webpki-roots (plus macOS system roots on macOS)
+        assert!(count >= webpki_roots::TLS_SERVER_ROOTS.len());
         assert!(count > 100);
 
         // CERT_FIND_ANY
@@ -1554,5 +1558,1026 @@ fn dpapi_uses_0600_host_secrets_and_isolates_secrets_and_machine_scope() {
 
         crate::kernel32::memory::LocalFree(user_ct.pb_data as *mut c_void);
         crate::kernel32::memory::LocalFree(mach_ct.pb_data as *mut c_void);
+    }
+}
+
+#[test]
+fn crypt_find_oid_info_all_key_types_and_groups() {
+    use super::decode::{
+        CryptOidInfo, CRYPT_HASH_ALG_OID_GROUP_ID, CRYPT_OID_INFO_ALGID_KEY,
+        CRYPT_OID_INFO_CNG_ALGID_KEY, CRYPT_OID_INFO_CNG_SIGN_KEY, CRYPT_OID_INFO_NAME_KEY,
+        CRYPT_OID_INFO_OID_KEY, CRYPT_OID_INFO_SIGN_KEY, CRYPT_RDN_ATTR_OID_GROUP_ID,
+        CRYPT_SIGN_ALG_OID_GROUP_ID,
+    };
+    unsafe {
+        // 1. Lookup by OID string
+        let p = CryptFindOIDInfo(
+            CRYPT_OID_INFO_OID_KEY,
+            b"1.2.840.113549.1.1.11\0".as_ptr() as *const c_void,
+            0,
+        ) as *const CryptOidInfo;
+        assert!(!p.is_null());
+        let info = std::ptr::read_unaligned(p);
+        assert_eq!(info.cb_size, 64);
+        assert_eq!(info.dw_group_id, CRYPT_SIGN_ALG_OID_GROUP_ID);
+        assert_eq!(info.dw_value, 0x800C); // CALG_SHA_256
+        assert_eq!(crate::strings::from_wide(info.pwsz_name), "sha256RSA");
+        assert_eq!(crate::strings::from_wide(info.pwsz_cng_algid), "SHA256");
+        assert_eq!(crate::strings::from_wide(info.pwsz_cng_extra_algid), "RSA");
+
+        // 2. Lookup by wide friendly name (case-insensitive)
+        let name_w = crate::strings::to_wide_z("cn");
+        let p2 = CryptFindOIDInfo(
+            CRYPT_OID_INFO_NAME_KEY,
+            name_w.as_ptr() as *const c_void,
+            CRYPT_RDN_ATTR_OID_GROUP_ID,
+        ) as *const CryptOidInfo;
+        assert!(!p2.is_null());
+        assert_eq!(crate::strings::from_ansi((*p2).psz_oid), "2.5.4.3");
+
+        // 3. Lookup by ALGID
+        let algid = 0x800Cu32; // CALG_SHA_256
+        let p3 = CryptFindOIDInfo(
+            CRYPT_OID_INFO_ALGID_KEY,
+            &algid as *const u32 as *const c_void,
+            CRYPT_HASH_ALG_OID_GROUP_ID,
+        ) as *const CryptOidInfo;
+        assert!(!p3.is_null());
+        assert_eq!(crate::strings::from_ansi((*p3).psz_oid), "2.16.840.1.101.3.4.2.1");
+
+        // 4. Lookup by SIGN key [CALG_SHA_256, CALG_RSA_SIGN]
+        let sign_pair = [0x800Cu32, 0x2400u32];
+        let p4 = CryptFindOIDInfo(
+            CRYPT_OID_INFO_SIGN_KEY,
+            sign_pair.as_ptr() as *const c_void,
+            0,
+        ) as *const CryptOidInfo;
+        assert!(!p4.is_null());
+        assert_eq!(crate::strings::from_ansi((*p4).psz_oid), "1.2.840.113549.1.1.11");
+
+        // 5. Lookup by CNG ALGID and CNG SIGN key
+        let sha384_w = crate::strings::to_wide_z("SHA384");
+        let ecdsa_w = crate::strings::to_wide_z("ECDSA");
+        let p5 = CryptFindOIDInfo(
+            CRYPT_OID_INFO_CNG_ALGID_KEY,
+            sha384_w.as_ptr() as *const c_void,
+            CRYPT_HASH_ALG_OID_GROUP_ID,
+        ) as *const CryptOidInfo;
+        assert!(!p5.is_null());
+        assert_eq!(crate::strings::from_ansi((*p5).psz_oid), "2.16.840.1.101.3.4.2.2");
+
+        let cng_pair = [sha384_w.as_ptr(), ecdsa_w.as_ptr()];
+        let p6 = CryptFindOIDInfo(
+            CRYPT_OID_INFO_CNG_SIGN_KEY,
+            cng_pair.as_ptr() as *const c_void,
+            0,
+        ) as *const CryptOidInfo;
+        assert!(!p6.is_null());
+        assert_eq!(crate::strings::from_ansi((*p6).psz_oid), "1.2.840.10045.4.3.3");
+
+        // 6. Unknown OID returns NULL
+        assert!(CryptFindOIDInfo(
+            CRYPT_OID_INFO_OID_KEY,
+            b"1.2.3.4.5.99999\0".as_ptr() as *const c_void,
+            0,
+        )
+        .is_null());
+    }
+}
+
+#[test]
+fn cert_str_to_name_roundtrip_and_errors() {
+    unsafe {
+        // 1. ANSI X.500 DN with quoted comma & roundtrip via CertNameToStrA
+        let dn_in = b"CN=\"Acme, Inc.\", O=PortFactory, C=US\0";
+        let mut cb = 0u32;
+        assert_eq!(
+            CertStrToNameA(
+                X509_ASN_ENCODING,
+                dn_in.as_ptr(),
+                3, // CERT_X500_NAME_STR
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut cb,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        assert!(cb > 20);
+        // Too-small buffer -> ERROR_MORE_DATA
+        let mut small = [0u8; 4];
+        let mut small_cb = 4u32;
+        assert_eq!(
+            CertStrToNameA(
+                X509_ASN_ENCODING,
+                dn_in.as_ptr(),
+                3,
+                std::ptr::null_mut(),
+                small.as_mut_ptr(),
+                &mut small_cb,
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_MORE_DATA);
+        assert_eq!(small_cb, cb);
+
+        let mut der = vec![0u8; cb as usize];
+        assert_eq!(
+            CertStrToNameA(
+                X509_ASN_ENCODING,
+                dn_in.as_ptr(),
+                3,
+                std::ptr::null_mut(),
+                der.as_mut_ptr(),
+                &mut cb,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let blob = CryptDataBlob {
+            cb_data: cb,
+            pb_data: der.as_ptr(),
+        };
+        let mut out_a = [0u8; 128];
+        let written = CertNameToStrA(
+            X509_ASN_ENCODING,
+            &blob as *const _ as *const c_void,
+            3,
+            out_a.as_mut_ptr(),
+            out_a.len() as u32,
+        );
+        assert!(written > 10);
+        let formatted = crate::strings::from_ansi(out_a.as_ptr());
+        assert!(formatted.contains("CN=Acme, Inc."));
+        assert!(formatted.contains("O=PortFactory"));
+        assert!(formatted.contains("C=US"));
+
+        // 2. Wide version + CERT_NAME_STR_REVERSE_FLAG
+        let dn_w = crate::strings::to_wide_z("CN=Leaf, O=Root");
+        let mut cb_w = 0u32;
+        assert_eq!(
+            CertStrToNameW(
+                X509_ASN_ENCODING,
+                dn_w.as_ptr(),
+                3 | 0x0200_0000, // REVERSE
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut cb_w,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut der_w = vec![0u8; cb_w as usize];
+        assert_eq!(
+            CertStrToNameW(
+                X509_ASN_ENCODING,
+                dn_w.as_ptr(),
+                3 | 0x0200_0000,
+                std::ptr::null_mut(),
+                der_w.as_mut_ptr(),
+                &mut cb_w,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let rev_str = wintrust::format_dn(&der_w).unwrap();
+        assert_eq!(rev_str, "O=Root, CN=Leaf");
+
+        // 3. Syntax error reports exact ppszError pointer + CRYPT_E_INVALID_X500_STRING
+        let bad = b"CN=Ok, BADKEY=foo\0";
+        let mut err_ptr: LPCSTR = std::ptr::null();
+        let mut bad_cb = 0u32;
+        assert_eq!(
+            CertStrToNameA(
+                X509_ASN_ENCODING,
+                bad.as_ptr(),
+                3,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bad_cb,
+                &mut err_ptr,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_2023);
+        assert_eq!(err_ptr as usize - bad.as_ptr() as usize, 7);
+    }
+}
+
+#[test]
+fn crypt_decode_object_and_ex_roundtrip_all_types() {
+    use super::asn1::{
+        CRYPT_STRING_PERCENTESCAPE, X509_INTEGER, X509_MULTI_BYTE_UINT, X509_OBJECT_IDENTIFIER,
+        X509_OCTET_STRING, X509_PUBLIC_KEY_INFO, X509_UNICODE_NAME, RSA_CSP_PUBLICKEYBLOB,
+    };
+    use super::decode::{CNG_RSA_PUBLIC_KEY_BLOB, X509_AUTHORITY_KEY_ID2, X509_ENUMERATED};
+    unsafe {
+        // 1. Encode -> Decode BasicConstraints2 via CryptDecodeObjectEx(ALLOC)
+        let bc_in = CertBasicConstraints2Info {
+            f_ca: 1,
+            f_path_len_constraint: 1,
+            dw_path_len_constraint: 3,
+        };
+        let mut der_ptr: *mut u8 = std::ptr::null_mut();
+        let mut der_len = 0u32;
+        assert_eq!(
+            CryptEncodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_BASIC_CONSTRAINTS2 as *const u8,
+                &bc_in as *const _ as *const c_void,
+                0x8000,
+                std::ptr::null(),
+                &mut der_ptr as *mut _ as *mut c_void,
+                &mut der_len,
+            ),
+            TRUE
+        );
+        let mut bc_out_ptr: *mut CertBasicConstraints2Info = std::ptr::null_mut();
+        let mut bc_out_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                b"2.5.29.19\0".as_ptr(),
+                der_ptr,
+                der_len,
+                0x8000,
+                std::ptr::null(),
+                &mut bc_out_ptr as *mut _ as *mut c_void,
+                &mut bc_out_len,
+            ),
+            TRUE
+        );
+        assert_eq!((*bc_out_ptr).f_ca, 1);
+        assert_eq!((*bc_out_ptr).f_path_len_constraint, 1);
+        assert_eq!((*bc_out_ptr).dw_path_len_constraint, 3);
+        crate::kernel32::memory::LocalFree(der_ptr as *mut c_void);
+        crate::kernel32::memory::LocalFree(bc_out_ptr as *mut c_void);
+
+        // 2. X509_UNICODE_NAME via CryptDecodeObject (caller buffer + two-call sizing)
+        let dn_w = crate::strings::to_wide_z("CN=DecodeTest, O=PortFactory");
+        let mut dn_der_len = 0u32;
+        assert_eq!(
+            CertStrToNameW(
+                X509_ASN_ENCODING,
+                dn_w.as_ptr(),
+                3,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dn_der_len,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut dn_der = vec![0u8; dn_der_len as usize];
+        assert_eq!(
+            CertStrToNameW(
+                X509_ASN_ENCODING,
+                dn_w.as_ptr(),
+                3,
+                std::ptr::null_mut(),
+                dn_der.as_mut_ptr(),
+                &mut dn_der_len,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut need = 0u32;
+        assert_eq!(
+            CryptDecodeObject(
+                X509_ASN_ENCODING,
+                X509_UNICODE_NAME as *const u8,
+                dn_der.as_ptr(),
+                dn_der_len,
+                0,
+                std::ptr::null_mut(),
+                &mut need,
+            ),
+            TRUE
+        );
+        let mut buf = vec![0u8; need as usize];
+        assert_eq!(
+            CryptDecodeObject(
+                X509_ASN_ENCODING,
+                X509_UNICODE_NAME as *const u8,
+                dn_der.as_ptr(),
+                dn_der_len,
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut need,
+            ),
+            TRUE
+        );
+        let ni = std::ptr::read_unaligned(buf.as_ptr() as *const CertNameInfo);
+        assert_eq!(ni.c_rdn, 2);
+        let rdn0 = std::ptr::read_unaligned(ni.rg_rdn);
+        assert_eq!(rdn0.c_rdn_attr, 1);
+        let attr0 = std::ptr::read_unaligned(rdn0.rg_rdn_attr);
+        assert_eq!(crate::strings::from_ansi(attr0.psz_obj_id), "2.5.4.3");
+        assert_eq!(
+            crate::strings::from_wide(attr0.value.pb_data as *const u16),
+            "DecodeTest"
+        );
+
+        // 3. X509_ENHANCED_KEY_USAGE + X509_INTEGER + X509_ENUMERATED + X509_OBJECT_IDENTIFIER + X509_OCTET_STRING
+        let eku_oids = [b"1.3.6.1.5.5.7.3.1\0".as_ptr(), b"1.3.6.1.5.5.7.3.3\0".as_ptr()];
+        let eku_in = CertEnhkeyUsage {
+            c_usage_identifier: 2,
+            rgpsz_usage_identifier: eku_oids.as_ptr(),
+        };
+        let mut eku_der = [0u8; 64];
+        let mut eku_der_len = eku_der.len() as u32;
+        assert_eq!(
+            CryptEncodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_ENHANCED_KEY_USAGE as *const u8,
+                &eku_in as *const _ as *const c_void,
+                0,
+                std::ptr::null(),
+                eku_der.as_mut_ptr() as *mut c_void,
+                &mut eku_der_len,
+            ),
+            TRUE
+        );
+        let mut eku_dec: *mut CertEnhkeyUsage = std::ptr::null_mut();
+        let mut eku_dec_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                b"2.5.29.37\0".as_ptr(),
+                eku_der.as_ptr(),
+                eku_der_len,
+                0x8000,
+                std::ptr::null(),
+                &mut eku_dec as *mut _ as *mut c_void,
+                &mut eku_dec_len,
+            ),
+            TRUE
+        );
+        assert_eq!((*eku_dec).c_usage_identifier, 2);
+        assert_eq!(
+            crate::strings::from_ansi(*(*eku_dec).rgpsz_usage_identifier),
+            "1.3.6.1.5.5.7.3.1"
+        );
+        assert_eq!(
+            crate::strings::from_ansi(*(*eku_dec).rgpsz_usage_identifier.add(1)),
+            "1.3.6.1.5.5.7.3.3"
+        );
+        crate::kernel32::memory::LocalFree(eku_dec as *mut c_void);
+
+        // X509_ENUMERATED & X509_INTEGER
+        let enum_in = 5i32;
+        let mut enum_der = [0u8; 16];
+        let mut enum_der_len = 16u32;
+        assert_eq!(
+            CryptEncodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_ENUMERATED as *const u8,
+                &enum_in as *const _ as *const c_void,
+                0,
+                std::ptr::null(),
+                enum_der.as_mut_ptr() as *mut c_void,
+                &mut enum_der_len,
+            ),
+            TRUE
+        );
+        assert_eq!(enum_der[0], 0x0A);
+        let mut enum_out = 0i32;
+        let mut enum_out_len = 4u32;
+        assert_eq!(
+            CryptDecodeObject(
+                X509_ASN_ENCODING,
+                X509_ENUMERATED as *const u8,
+                enum_der.as_ptr(),
+                enum_der_len,
+                0,
+                &mut enum_out as *mut _ as *mut c_void,
+                &mut enum_out_len,
+            ),
+            TRUE
+        );
+        assert_eq!(enum_out, 5);
+
+        let int_der = encode_der_tlv(0x02, &[0xFF, 0x80]); // -128
+        let mut int_out = 0i32;
+        let mut int_out_len = 4u32;
+        assert_eq!(
+            CryptDecodeObject(
+                X509_ASN_ENCODING,
+                X509_INTEGER as *const u8,
+                int_der.as_ptr(),
+                int_der.len() as u32,
+                0,
+                &mut int_out as *mut _ as *mut c_void,
+                &mut int_out_len,
+            ),
+            TRUE
+        );
+        assert_eq!(int_out, -128);
+
+        // RSA_CSP_PUBLICKEYBLOB & CNG_RSA_PUBLIC_KEY_BLOB roundtrip + SPKI conversion
+        let rsa_pub_der = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x02, &[0x00, 0xC1, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
+                encode_der_tlv(0x02, &[0x01, 0x00, 0x01]),
+            ]
+            .concat(),
+        );
+        let mut csp_ptr: *mut u8 = std::ptr::null_mut();
+        let mut csp_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                RSA_CSP_PUBLICKEYBLOB as *const u8,
+                rsa_pub_der.as_ptr(),
+                rsa_pub_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut csp_ptr as *mut _ as *mut c_void,
+                &mut csp_len,
+            ),
+            TRUE
+        );
+        assert_eq!(csp_len, 28);
+        assert_eq!(std::ptr::read_unaligned(csp_ptr.add(8) as *const u32), 0x3141_5352);
+        assert_eq!(std::ptr::read_unaligned(csp_ptr.add(12) as *const u32), 64);
+        assert_eq!(std::ptr::read_unaligned(csp_ptr.add(16) as *const u32), 65537);
+        assert_eq!(*csp_ptr.add(20), 0x08); // LE modulus
+        crate::kernel32::memory::LocalFree(csp_ptr as *mut c_void);
+
+        let mut cng_ptr: *mut u8 = std::ptr::null_mut();
+        let mut cng_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                CNG_RSA_PUBLIC_KEY_BLOB as *const u8,
+                rsa_pub_der.as_ptr(),
+                rsa_pub_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut cng_ptr as *mut _ as *mut c_void,
+                &mut cng_len,
+            ),
+            TRUE
+        );
+        assert_eq!(cng_len, 24 + 3 + 8);
+        crate::kernel32::memory::LocalFree(cng_ptr as *mut c_void);
+
+        // X509_OCTET_STRING, X509_MULTI_BYTE_UINT, X509_OBJECT_IDENTIFIER, X509_AUTHORITY_KEY_ID2, X509_PUBLIC_KEY_INFO
+        let oct_der = encode_der_tlv(0x04, b"hello");
+        let mut oct_out: *mut CryptDataBlob = std::ptr::null_mut();
+        let mut oct_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_OCTET_STRING as *const u8,
+                oct_der.as_ptr(),
+                oct_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut oct_out as *mut _ as *mut c_void,
+                &mut oct_len,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            std::slice::from_raw_parts((*oct_out).pb_data, (*oct_out).cb_data as usize),
+            b"hello"
+        );
+        crate::kernel32::memory::LocalFree(oct_out as *mut c_void);
+
+        let uint_der = encode_der_tlv(0x02, &[0x00, 0xAB, 0xCD]);
+        let mut uint_out: *mut CryptDataBlob = std::ptr::null_mut();
+        let mut uint_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_MULTI_BYTE_UINT as *const u8,
+                uint_der.as_ptr(),
+                uint_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut uint_out as *mut _ as *mut c_void,
+                &mut uint_len,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            std::slice::from_raw_parts((*uint_out).pb_data, (*uint_out).cb_data as usize),
+            &[0xCD, 0xAB]
+        );
+        crate::kernel32::memory::LocalFree(uint_out as *mut c_void);
+
+        let oid_der = encode_der_tlv(0x06, &[0x55, 0x04, 0x03]);
+        let mut oid_out: *mut *const u8 = std::ptr::null_mut();
+        let mut oid_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_OBJECT_IDENTIFIER as *const u8,
+                oid_der.as_ptr(),
+                oid_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut oid_out as *mut _ as *mut c_void,
+                &mut oid_len,
+            ),
+            TRUE
+        );
+        assert_eq!(crate::strings::from_ansi(*oid_out), "2.5.4.3");
+        crate::kernel32::memory::LocalFree(oid_out as *mut c_void);
+
+        let aki_der = encode_der_tlv(0x30, &encode_der_tlv(0x80, &[0x11, 0x22, 0x33, 0x44]));
+        let mut aki_out: *mut CryptDataBlob = std::ptr::null_mut();
+        let mut aki_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_AUTHORITY_KEY_ID2 as *const u8,
+                aki_der.as_ptr(),
+                aki_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut aki_out as *mut _ as *mut c_void,
+                &mut aki_len,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            std::slice::from_raw_parts((*aki_out).pb_data, (*aki_out).cb_data as usize),
+            &[0x11, 0x22, 0x33, 0x44]
+        );
+        crate::kernel32::memory::LocalFree(aki_out as *mut c_void);
+
+        // X509_PUBLIC_KEY_INFO decode + spki_to_capi_public_key_blob
+        let spki_der = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(
+                    0x30,
+                    &[
+                        encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]),
+                        encode_der_tlv(0x05, &[]),
+                    ]
+                    .concat(),
+                ),
+                encode_der_tlv(0x03, &[&[0x00u8][..], rsa_pub_der.as_slice()].concat()),
+            ]
+            .concat(),
+        );
+        let mut spki_out: *mut c_void = std::ptr::null_mut();
+        let mut spki_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_PUBLIC_KEY_INFO as *const u8,
+                spki_der.as_ptr(),
+                spki_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut spki_out as *mut _ as *mut c_void,
+                &mut spki_len,
+            ),
+            TRUE
+        );
+        let capi_blob = super::decode::spki_to_capi_public_key_blob(spki_out).unwrap();
+        assert_eq!(capi_blob.len(), 28);
+        assert_eq!(u32::from_le_bytes(capi_blob[8..12].try_into().unwrap()), 0x3141_5352);
+        crate::kernel32::memory::LocalFree(spki_out);
+
+        // Unknown struct type -> ERROR_FILE_NOT_FOUND
+        let mut dummy_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                9999 as *const u8,
+                oct_der.as_ptr(),
+                oct_der.len() as u32,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut dummy_len,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+
+        // CryptStringToBinaryA: CRYPT_STRING_PERCENTESCAPE (0x0E) + invalid flag -> ERROR_INVALID_DATA
+        let pct = b"Hi%20There%21\0";
+        let mut pout = [0u8; 32];
+        let mut plen = 32u32;
+        assert_eq!(
+            CryptStringToBinaryA(
+                pct.as_ptr(),
+                0,
+                CRYPT_STRING_PERCENTESCAPE,
+                pout.as_mut_ptr(),
+                &mut plen,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        assert_eq!(&pout[..plen as usize], b"Hi There!");
+
+        assert_eq!(
+            CryptStringToBinaryA(
+                pct.as_ptr(),
+                0,
+                0x9999,
+                pout.as_mut_ptr(),
+                &mut plen,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_DATA);
+    }
+}
+
+#[test]
+fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
+    use super::pkcs::{
+        CMSG_CERT_COUNT_PARAM, CMSG_CONTENT_PARAM, CMSG_SIGNER_AUTH_ATTR_PARAM,
+        CMSG_SIGNER_CERT_INFO_PARAM, CMSG_TYPE_PARAM,
+    };
+    use super::store::{
+        CERT_FRIENDLY_NAME_PROP_ID, CERT_KEY_IDENTIFIER_PROP_ID, CERT_KEY_PROV_INFO_PROP_ID,
+        CERT_MD5_HASH_PROP_ID, CERT_SHA1_HASH_PROP_ID, CERT_SHA256_HASH_PROP_ID,
+        CERT_SUBJECT_NAME_MD5_HASH_PROP_ID,
+    };
+    use self::test_vectors::{PFX_PBES1_LEGACY, PFX_PBES2_AES256, PKCS7_SIGNED_DER};
+
+    unsafe {
+        // 1. PFXImportCertStore: modern PBES2 AES-256-CBC + SHA-256 MAC
+        let blob_aes = CryptDataBlob {
+            cb_data: PFX_PBES2_AES256.len() as u32,
+            pb_data: PFX_PBES2_AES256.as_ptr(),
+        };
+        let wrong_pw = crate::strings::to_wide_z("wrongpass");
+        assert!(PFXImportCertStore(&blob_aes as *const _ as *const c_void, wrong_pw.as_ptr(), 0).is_null());
+        assert_eq!(crate::teb::last_error(), 86); // ERROR_INVALID_PASSWORD
+
+        let good_pw = crate::strings::to_wide_z("testpass123");
+        let st_aes = PFXImportCertStore(&blob_aes as *const _ as *const c_void, good_pw.as_ptr(), 0);
+        assert!(!st_aes.is_null(), "PBES2 AES-256 PFX import must succeed");
+        let cert = CertEnumCertificatesInStore(st_aes, std::ptr::null_mut());
+        assert!(!cert.is_null());
+
+        // Verify CertGetCertificateContextProperty: friendlyName, SHA1, MD5, SHA256, SKI, KEY_PROV_INFO
+        let mut fname_buf = [0u16; 64];
+        let mut fname_cb = (fname_buf.len() * 2) as u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                cert,
+                CERT_FRIENDLY_NAME_PROP_ID,
+                fname_buf.as_mut_ptr() as *mut c_void,
+                &mut fname_cb,
+            ),
+            TRUE
+        );
+        assert_eq!(crate::strings::from_wide(fname_buf.as_ptr()), "PortFactory Friendly");
+
+        let mut sha1 = [0u8; 20];
+        let mut sha1_len = 20u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(cert, CERT_SHA1_HASH_PROP_ID, sha1.as_mut_ptr() as *mut c_void, &mut sha1_len),
+            TRUE
+        );
+        assert_eq!(sha1_len, 20);
+        let mut md5 = [0u8; 16];
+        let mut md5_len = 16u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(cert, CERT_MD5_HASH_PROP_ID, md5.as_mut_ptr() as *mut c_void, &mut md5_len),
+            TRUE
+        );
+        assert_eq!(md5_len, 16);
+        let mut sha256 = [0u8; 32];
+        let mut sha256_len = 32u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(cert, CERT_SHA256_HASH_PROP_ID, sha256.as_mut_ptr() as *mut c_void, &mut sha256_len),
+            TRUE
+        );
+        assert_eq!(sha256_len, 32);
+
+        let mut ski_len = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(cert, CERT_KEY_IDENTIFIER_PROP_ID, std::ptr::null_mut(), &mut ski_len),
+            TRUE
+        );
+        assert_eq!(ski_len, 20);
+
+        let mut subj_md5_len = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(cert, CERT_SUBJECT_NAME_MD5_HASH_PROP_ID, std::ptr::null_mut(), &mut subj_md5_len),
+            TRUE
+        );
+        assert_eq!(subj_md5_len, 16);
+
+        // Private key was matched -> CERT_KEY_PROV_INFO_PROP_ID succeeds
+        let mut kpi_len = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(cert, CERT_KEY_PROV_INFO_PROP_ID, std::ptr::null_mut(), &mut kpi_len),
+            TRUE
+        );
+        assert!(kpi_len >= 48);
+        assert!(lookup_cert_private_key_and_chain(cert).is_some());
+
+        // CertVerifySubjectCertificateContext: self-signed cert verifies its own signature & validity
+        let mut flags = 0x1 | 0x2 | 0x4; // SIG | TIME | REVOCATION
+        assert_eq!(CertVerifySubjectCertificateContext(cert, cert, &mut flags), TRUE);
+        assert_eq!(flags & 0x1, 0, "valid self-signed signature must clear SIGNATURE_FLAG");
+        assert_eq!(flags & 0x2, 0, "valid cert time must clear TIME_VALIDITY_FLAG");
+        assert_eq!(flags & 0x0001_0004, 0x0001_0004, "no CRL sets REVOCATION | NO_CRL");
+
+        CertFreeCertificateContext(cert);
+        CertCloseStore(st_aes, 0);
+
+        // 2. PFXImportCertStore: legacy PBES1 3DES-CBC + RC2-40-CBC + SHA-1 MAC
+        let blob_leg = CryptDataBlob {
+            cb_data: PFX_PBES1_LEGACY.len() as u32,
+            pb_data: PFX_PBES1_LEGACY.as_ptr(),
+        };
+        let leg_pw = crate::strings::to_wide_z("legacy456");
+        let st_leg = PFXImportCertStore(&blob_leg as *const _ as *const c_void, leg_pw.as_ptr(), 0);
+        assert!(!st_leg.is_null(), "Legacy PBES1 PFX import must succeed");
+        let c_leg = CertEnumCertificatesInStore(st_leg, std::ptr::null_mut());
+        assert!(!c_leg.is_null());
+        let mut lf_buf = [0u16; 64];
+        let mut lf_cb = (lf_buf.len() * 2) as u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(c_leg, CERT_FRIENDLY_NAME_PROP_ID, lf_buf.as_mut_ptr() as *mut c_void, &mut lf_cb),
+            TRUE
+        );
+        assert_eq!(crate::strings::from_wide(lf_buf.as_ptr()), "Legacy Friendly");
+        assert!(lookup_cert_private_key_and_chain(c_leg).is_some());
+        CertFreeCertificateContext(c_leg);
+        CertCloseStore(st_leg, 0);
+
+        // 3. CryptMsgOpenToDecode + chunked CryptMsgUpdate + CryptMsgGetParam
+        let h_msg = CryptMsgOpenToDecode(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(!h_msg.is_null());
+        let mid = PKCS7_SIGNED_DER.len() / 2;
+        assert_eq!(CryptMsgUpdate(h_msg, PKCS7_SIGNED_DER.as_ptr(), mid as u32, FALSE), TRUE);
+        assert_eq!(
+            CryptMsgUpdate(
+                h_msg,
+                PKCS7_SIGNED_DER[mid..].as_ptr(),
+                (PKCS7_SIGNED_DER.len() - mid) as u32,
+                TRUE,
+            ),
+            TRUE
+        );
+        let mut mtype = 0u32;
+        let mut mtype_len = 4u32;
+        assert_eq!(
+            CryptMsgGetParam(h_msg, CMSG_TYPE_PARAM, 0, &mut mtype as *mut _ as *mut c_void, &mut mtype_len),
+            TRUE
+        );
+        assert_eq!(mtype, 2); // CMSG_SIGNED
+        let mut ccnt = 0u32;
+        let mut ccnt_len = 4u32;
+        assert_eq!(
+            CryptMsgGetParam(h_msg, CMSG_CERT_COUNT_PARAM, 0, &mut ccnt as *mut _ as *mut c_void, &mut ccnt_len),
+            TRUE
+        );
+        assert_eq!(ccnt, 1);
+        let mut content = [0u8; 64];
+        let mut clen = 64u32;
+        assert_eq!(
+            CryptMsgGetParam(h_msg, CMSG_CONTENT_PARAM, 0, content.as_mut_ptr() as *mut c_void, &mut clen),
+            TRUE
+        );
+        assert_eq!(&content[..clen as usize], b"Hello PKCS7 Signed World!");
+        let mut sci_len = 0u32;
+        assert_eq!(
+            CryptMsgGetParam(h_msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, std::ptr::null_mut(), &mut sci_len),
+            TRUE
+        );
+        assert!(sci_len >= std::mem::size_of::<CertInfo>() as u32);
+        let mut aa_len = 0u32;
+        assert_eq!(
+            CryptMsgGetParam(h_msg, CMSG_SIGNER_AUTH_ATTR_PARAM, 0, std::ptr::null_mut(), &mut aa_len),
+            TRUE
+        );
+        assert!(aa_len > 16);
+        assert_eq!(CryptMsgClose(h_msg), TRUE);
+
+        // 4. CryptVerifyMessageSignature (valid + tampered rejection)
+        #[repr(C)]
+        struct VerifyPara {
+            cb_size: u32,
+            encoding: u32,
+            h_prov: usize,
+            pfn: usize,
+            arg: *mut c_void,
+        }
+        let vp = VerifyPara {
+            cb_size: std::mem::size_of::<VerifyPara>() as u32,
+            encoding: X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            h_prov: 0,
+            pfn: 0,
+            arg: std::ptr::null_mut(),
+        };
+        let mut dec = [0u8; 64];
+        let mut dec_len = 64u32;
+        let mut signer_cert: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                PKCS7_SIGNED_DER.as_ptr(),
+                PKCS7_SIGNED_DER.len() as u32,
+                dec.as_mut_ptr(),
+                &mut dec_len,
+                &mut signer_cert,
+            ),
+            TRUE
+        );
+        assert_eq!(&dec[..dec_len as usize], b"Hello PKCS7 Signed World!");
+        assert!(!signer_cert.is_null());
+        CertFreeCertificateContext(signer_cert);
+
+        // Tamper signature byte -> fails with NTE_BAD_SIGNATURE
+        let mut bad_sig = PKCS7_SIGNED_DER.to_vec();
+        let last = bad_sig.len() - 1;
+        bad_sig[last] ^= 0xFF;
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                bad_sig.as_ptr(),
+                bad_sig.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_0006);
+
+        // 5. Real CRL & CTL context lifecycle
+        let minimal_seq = encode_der_tlv(0x30, &[]);
+        let crl = CertCreateCRLContext(X509_ASN_ENCODING, minimal_seq.as_ptr(), minimal_seq.len() as u32);
+        assert!(!crl.is_null());
+        let crl_dup = CertDuplicateCRLContext(crl);
+        assert_eq!(crl_dup, crl);
+        assert_eq!(CertFreeCRLContext(crl_dup), TRUE);
+        assert_eq!(CertFreeCRLContext(crl), TRUE);
+
+        let ctl = CertCreateCTLContext(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            minimal_seq.as_ptr(),
+            minimal_seq.len() as u32,
+        );
+        assert!(!ctl.is_null());
+        let ctl_dup = CertDuplicateCTLContext(ctl);
+        assert_eq!(ctl_dup, ctl);
+        assert_eq!(CertFreeCTLContext(ctl_dup), TRUE);
+        assert_eq!(CertFreeCTLContext(ctl), TRUE);
+    }
+}
+
+#[test]
+fn macos_trust_store_and_extended_chain_policies() {
+    use super::chain::{
+        CERT_CHAIN_POLICY_BASIC_CONSTRAINTS, CERT_CHAIN_POLICY_EV,
+        CERT_CHAIN_POLICY_MICROSOFT_ROOT, CERT_CHAIN_POLICY_NT_AUTH,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let sys_roots = super::chain::macos_system_roots_der();
+        assert!(!sys_roots.is_empty(), "macOS Security.framework must return system root certs");
+    }
+    unsafe {
+        // HCCE_LOCAL_MACHINE pseudo-handle (1) is a valid no-op on CertFreeCertificateChainEngine.
+        CertFreeCertificateChainEngine(1usize as *mut c_void);
+
+        // Build a chain from the PFX self-signed CA cert (which has BasicConstraints cA=TRUE)
+        let blob = CryptDataBlob {
+            cb_data: self::test_vectors::PFX_PBES2_AES256.len() as u32,
+            pb_data: self::test_vectors::PFX_PBES2_AES256.as_ptr(),
+        };
+        let pw = crate::strings::to_wide_z("testpass123");
+        let st = PFXImportCertStore(&blob as *const _ as *const c_void, pw.as_ptr(), 0);
+        let cert = CertEnumCertificatesInStore(st, std::ptr::null_mut());
+        let mut chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                cert,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut chain,
+            ),
+            TRUE
+        );
+        let dup = CertDuplicateCertificateChain(chain);
+        assert_eq!(dup, chain);
+
+        // BASIC_CONSTRAINTS with END_ENTITY flag fails on CA cert (TRUST_E_BASIC_CONSTRAINTS)
+        let para_ee = CertChainPolicyPara {
+            cb_size: std::mem::size_of::<CertChainPolicyPara>() as u32,
+            dw_flags: 0x4000_0000, // BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG
+            pv_extra_policy_para: std::ptr::null(),
+        };
+        let mut status = CertChainPolicyStatus {
+            cb_size: std::mem::size_of::<CertChainPolicyStatus>() as u32,
+            dw_error: 0,
+            l_chain_index: -1,
+            l_element_index: -1,
+            pv_extra_policy_status: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                chain,
+                &para_ee as *const _ as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0x8009_6019);
+
+        // BASIC_CONSTRAINTS with CA flag passes on CA cert
+        let para_ca = CertChainPolicyPara {
+            cb_size: std::mem::size_of::<CertChainPolicyPara>() as u32,
+            dw_flags: 0x8000_0000,
+            pv_extra_policy_para: std::ptr::null(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                chain,
+                &para_ca as *const _ as *const c_void,
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0);
+
+        // MICROSOFT_ROOT fails with CERT_E_UNTRUSTEDROOT on non-Microsoft cert
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_MICROSOFT_ROOT as *const u8,
+                chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, CERT_E_UNTRUSTEDROOT);
+
+        // NT_AUTH & EV return TRUE with appropriate policy status
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_NT_AUTH as *const u8,
+                chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, CERT_E_UNTRUSTEDROOT);
+
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_EV as *const u8,
+                chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, CERT_E_UNTRUSTEDROOT);
+
+        // Unknown policy OID returns FALSE with ERROR_FILE_NOT_FOUND
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                999 as *const u8,
+                chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+
+        CertFreeCertificateChain(dup);
+        CertFreeCertificateChain(chain);
+        CertFreeCertificateContext(cert);
+        CertCloseStore(st, 0);
     }
 }

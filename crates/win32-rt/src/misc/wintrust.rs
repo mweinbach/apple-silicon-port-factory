@@ -33,8 +33,27 @@ const CERT_E_CHAINING: i32 = 0x800B_010Au32 as i32;
 const WINTRUST_ACTION_GENERIC_VERIFY_V2: [u8; 16] = [
     0x6B, 0xC5, 0xAA, 0x00, 0x44, 0xCD, 0xD0, 0x11, 0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE,
 ];
+const WINTRUST_ACTION_TRUSTPROVIDER_TEST: [u8; 16] = [
+    0xF8, 0x31, 0x3E, 0x57, 0xBA, 0xDD, 0xD0, 0x11, 0x8C, 0xCB, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE,
+];
+const WINTRUST_ACTION_GENERIC_CERT_VERIFY: [u8; 16] = [
+    0x42, 0x38, 0x9A, 0x18, 0x41, 0x30, 0xD1, 0x11, 0x85, 0xE1, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE,
+];
+const WINTRUST_ACTION_GENERIC_CHAIN_VERIFY: [u8; 16] = [
+    0x16, 0x1C, 0x45, 0xFC, 0x75, 0xAC, 0xD1, 0x11, 0xB4, 0xB8, 0x00, 0xC0, 0x4F, 0xB6, 0x6E, 0xA0,
+];
+const DRIVER_ACTION_VERIFY: [u8; 16] = [
+    0xC3, 0xE6, 0x50, 0xF7, 0xEE, 0x38, 0xD1, 0x11, 0x85, 0xE5, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE,
+];
+const HTTPSPROV_ACTION: [u8; 16] = [
+    0xF8, 0x31, 0x3E, 0x57, 0xBA, 0xAA, 0xD0, 0x11, 0x8C, 0xCB, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE,
+];
 
 const WTD_CHOICE_FILE: u32 = 1;
+const WTD_CHOICE_CATALOG: u32 = 2;
+const WTD_CHOICE_BLOB: u32 = 3;
+const WTD_CHOICE_SIGNER: u32 = 4;
+const WTD_CHOICE_CERT: u32 = 5;
 const WTD_STATEACTION_VERIFY: u32 = 1;
 const WTD_STATEACTION_CLOSE: u32 = 2;
 
@@ -140,7 +159,7 @@ fn strip_der_int_sign(mut b: &[u8]) -> &[u8] {
     b
 }
 
-fn decode_oid_str(oid: &[u8]) -> String {
+pub(crate) fn decode_oid_str(oid: &[u8]) -> String {
     if oid.is_empty() {
         return String::new();
     }
@@ -161,6 +180,10 @@ fn decode_oid_str(oid: &[u8]) -> String {
         parts.push(val.to_string());
     }
     parts.join(".")
+}
+
+pub(crate) fn parse_asn1_time_filetime_raw(tag: u8, val: &[u8]) -> u64 {
+    parse_asn1_time_filetime(DerElem { tag, raw: val, val })
 }
 
 fn parse_asn1_time_filetime(elem: DerElem<'_>) -> u64 {
@@ -1404,15 +1427,260 @@ fn alloc_provider_state(verified: VerifiedAuthenticode, wintrust_data: *mut c_vo
     handle as *mut c_void
 }
 
+/// Verify a standalone DER PKCS#7 SignedData blob (and optional detached payload) for
+/// `WTD_CHOICE_BLOB` / `WTD_CHOICE_CATALOG`.
+fn verify_standalone_pkcs7(pkcs7_raw: &[u8], detached_content: Option<&[u8]>) -> Result<VerifiedAuthenticode, i32> {
+    let (ci, _) = parse_der_elem(pkcs7_raw).ok_or(TRUST_E_NOSIGNATURE)?;
+    if ci.tag != 0x30 {
+        return Err(TRUST_E_NOSIGNATURE);
+    }
+    let ci_kids = der_children(ci.val).ok_or(TRUST_E_NOSIGNATURE)?;
+    if ci_kids.len() < 2
+        || ci_kids[0].tag != 0x06
+        || ci_kids[0].val != OID_SIGNED_DATA
+        || ci_kids[1].tag != 0xA0
+    {
+        return Err(TRUST_E_NOSIGNATURE);
+    }
+    let (sd_seq, _) = parse_der_elem(ci_kids[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+    if sd_seq.tag != 0x30 {
+        return Err(TRUST_E_BAD_DIGEST);
+    }
+    let sd_kids = der_children(sd_seq.val).ok_or(TRUST_E_BAD_DIGEST)?;
+    if sd_kids.len() < 4 || sd_kids[2].tag != 0x30 {
+        return Err(TRUST_E_BAD_DIGEST);
+    }
+
+    let eci_kids = der_children(sd_kids[2].val).ok_or(TRUST_E_BAD_DIGEST)?;
+    let content_bytes: Vec<u8> = if let Some(d) = detached_content {
+        d.to_vec()
+    } else if let Some(ec) = eci_kids.get(1).filter(|e| e.tag == 0xA0) {
+        if let Some((inner, _)) = parse_der_elem(ec.val) {
+            inner.val.to_vec()
+        } else {
+            ec.val.to_vec()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut certs: Vec<ParsedCert<'_>> = Vec::new();
+    let mut signer_infos_elem: Option<DerElem<'_>> = None;
+    for &elem in &sd_kids[3..] {
+        if elem.tag == 0xA0 {
+            for ce in der_children(elem.val).ok_or(TRUST_E_BAD_DIGEST)? {
+                if let Some(c) = parse_x509_cert(ce) {
+                    certs.push(c);
+                }
+            }
+        } else if elem.tag == 0x31 {
+            signer_infos_elem = Some(elem);
+        }
+    }
+    let si_set = signer_infos_elem.ok_or(TRUST_E_BAD_DIGEST)?;
+    let si_list = der_children(si_set.val).ok_or(TRUST_E_BAD_DIGEST)?;
+    if si_list.is_empty() || certs.is_empty() {
+        return Err(TRUST_E_BAD_DIGEST);
+    }
+
+    let mut verified_signer: Option<(usize, VerifiedSigner)> = None;
+    for si in si_list {
+        if si.tag != 0x30 {
+            continue;
+        }
+        let kids = der_children(si.val).ok_or(TRUST_E_BAD_DIGEST)?;
+        if kids.len() < 5 || kids[1].tag != 0x30 {
+            continue;
+        }
+        let ias = der_children(kids[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+        if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
+            continue;
+        }
+        let Some(cert_idx) = certs
+            .iter()
+            .position(|c| c.issuer_raw == ias[0].raw && strip_der_int_sign(c.serial_val) == strip_der_int_sign(ias[1].val))
+        else {
+            continue;
+        };
+        let Some(ref rsa_pub) = certs[cert_idx].rsa_pub else {
+            continue;
+        };
+        let hash_alg_oid = parse_alg_id_oid(kids[2]).ok_or(TRUST_E_BAD_DIGEST)?;
+        let si_digest = digest_from_oid(hash_alg_oid).ok_or(TRUST_E_BAD_DIGEST)?;
+        let mut pos = 3usize;
+        let auth_attrs = if kids.get(pos).is_some_and(|e| e.tag == 0xA0) {
+            pos += 1;
+            Some(kids[pos - 1])
+        } else {
+            None
+        };
+        let enc_alg = *kids.get(pos).ok_or(TRUST_E_BAD_DIGEST)?;
+        let enc_alg_oid = parse_alg_id_oid(enc_alg).unwrap_or(OID_RSA_ENCRYPTION);
+        let enc_digest = *kids.get(pos + 1).ok_or(TRUST_E_BAD_DIGEST)?;
+        if enc_digest.tag != 0x04 {
+            return Err(TRUST_E_BAD_DIGEST);
+        }
+
+        if let Some(aa) = auth_attrs {
+            let mut found_md = false;
+            for attr in der_children(aa.val).ok_or(TRUST_E_BAD_DIGEST)? {
+                if attr.tag != 0x30 {
+                    continue;
+                }
+                let ak = der_children(attr.val).ok_or(TRUST_E_BAD_DIGEST)?;
+                if ak.len() >= 2 && ak[0].tag == 0x06 && ak[0].val == OID_MESSAGE_DIGEST && ak[1].tag == 0x31 {
+                    let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+                    if vals.len() == 1 && vals[0].tag == 0x04 {
+                        if vals[0].val != si_digest.hash(&content_bytes).as_slice() {
+                            return Err(TRUST_E_BAD_DIGEST);
+                        }
+                        found_md = true;
+                    }
+                }
+            }
+            if !found_md {
+                return Err(TRUST_E_BAD_DIGEST);
+            }
+            let mut set_der = Vec::with_capacity(aa.raw.len());
+            set_der.push(0x31);
+            set_der.extend_from_slice(&aa.raw[1..]);
+            let attr_hash = si_digest.hash(&set_der);
+            if !rsa_pub.verify_pkcs1(Some(si_digest), &attr_hash, enc_digest.val) {
+                return Err(TRUST_E_BAD_DIGEST);
+            }
+        } else {
+            let content_hash = si_digest.hash(&content_bytes);
+            if !rsa_pub.verify_pkcs1(Some(si_digest), &content_hash, enc_digest.val) {
+                return Err(TRUST_E_BAD_DIGEST);
+            }
+        }
+        verified_signer = Some((
+            cert_idx,
+            VerifiedSigner {
+                hash_alg_oid_str: decode_oid_str(hash_alg_oid),
+                enc_alg_oid_str: decode_oid_str(enc_alg_oid),
+                encrypted_hash: enc_digest.val.to_vec(),
+            },
+        ));
+        break;
+    }
+
+    let Some((cur_idx, signer)) = verified_signer else {
+        return Err(TRUST_E_BAD_DIGEST);
+    };
+    let c = &certs[cur_idx];
+    let vc = VerifiedCert {
+        version: c.version,
+        raw_der: c.raw_der.to_vec(),
+        serial_val: c.serial_val.to_vec(),
+        sig_alg_oid_str: decode_oid_str(c.sig_alg_oid),
+        issuer_raw: c.issuer_raw.to_vec(),
+        not_before: c.not_before,
+        not_after: c.not_after,
+        subject_raw: c.subject_raw.to_vec(),
+        spki_alg_oid_str: decode_oid_str(c.spki_alg_oid),
+        spki_key_bytes: c.spki_key_bytes.to_vec(),
+        spki_unused_bits: c.spki_unused_bits,
+        self_signed: c.issuer_raw == c.subject_raw,
+    };
+    Ok(VerifiedAuthenticode { certs: vec![vc], signer })
+}
+
+unsafe fn verify_cert_via_chain_policy(
+    cert_ctx: *const c_void,
+    ch_stores: u32,
+    pah_stores: *const *mut c_void,
+    p_time: *const c_void,
+    policy_oid: usize,
+) -> i32 {
+    if cert_ctx.is_null() {
+        return TRUST_E_NOSIGNATURE;
+    }
+    let extra_store = if ch_stores > 0 && !pah_stores.is_null() {
+        let mem = super::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+        if !mem.is_null() {
+            for i in 0..ch_stores as usize {
+                let s = std::ptr::read_unaligned(pah_stores.add(i));
+                for der in super::crypt32::store_certs_der(s) {
+                    let _ = super::crypt32::CertAddEncodedCertificateToStore(
+                        mem,
+                        X509_ASN_ENCODING,
+                        der.as_ptr(),
+                        der.len() as u32,
+                        4,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+        mem
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let mut chain_ctx: *mut c_void = std::ptr::null_mut();
+    let ok = super::crypt32::CertGetCertificateChain(
+        std::ptr::null_mut(),
+        cert_ctx,
+        p_time,
+        extra_store,
+        std::ptr::null(),
+        0,
+        std::ptr::null_mut(),
+        &mut chain_ctx,
+    );
+    if !extra_store.is_null() {
+        super::crypt32::CertCloseStore(extra_store, 0);
+    }
+    if ok == 0 || chain_ctx.is_null() {
+        return CERT_E_CHAINING;
+    }
+
+    #[repr(C)]
+    struct PolicyStatus {
+        cb_size: u32,
+        dw_error: u32,
+        l_chain_index: i32,
+        l_element_index: i32,
+        pv_extra: *mut c_void,
+    }
+    let mut status = PolicyStatus {
+        cb_size: std::mem::size_of::<PolicyStatus>() as u32,
+        dw_error: 0,
+        l_chain_index: -1,
+        l_element_index: -1,
+        pv_extra: std::ptr::null_mut(),
+    };
+    let pok = super::crypt32::CertVerifyCertificateChainPolicy(
+        policy_oid as *const u8,
+        chain_ctx,
+        std::ptr::null(),
+        &mut status as *mut PolicyStatus as *mut c_void,
+    );
+    super::crypt32::CertFreeCertificateChain(chain_ctx);
+    if pok == 0 {
+        return CERT_E_CHAINING;
+    }
+    status.dw_error as i32
+}
+
 pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u8, data: *mut c_void) -> i32 {
     if action.is_null() || data.is_null() {
         return TRUST_E_PROVIDER_UNKNOWN;
     }
     let mut guid = [0u8; 16];
     std::ptr::copy_nonoverlapping(action, guid.as_mut_ptr(), 16);
-    if guid != WINTRUST_ACTION_GENERIC_VERIFY_V2 {
+
+    let is_known_action = guid == WINTRUST_ACTION_GENERIC_VERIFY_V2
+        || guid == WINTRUST_ACTION_TRUSTPROVIDER_TEST
+        || guid == WINTRUST_ACTION_GENERIC_CERT_VERIFY
+        || guid == WINTRUST_ACTION_GENERIC_CHAIN_VERIFY
+        || guid == DRIVER_ACTION_VERIFY
+        || guid == HTTPSPROV_ACTION;
+    if !is_known_action {
+        // Per MSDN: unknown trust action GUIDs return TRUST_E_ACTION_UNKNOWN.
         let a = super::guid_string(action);
-        stub!("WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN");
+        log::debug!("WinVerifyTrust(unknown action={a}) -> TRUST_E_ACTION_UNKNOWN");
         return TRUST_E_ACTION_UNKNOWN;
     }
 
@@ -1422,7 +1690,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
         return TRUST_E_PROVIDER_UNKNOWN;
     }
     let union_choice = std::ptr::read_unaligned(base.add(0x20) as *const u32);
-    let p_file = std::ptr::read_unaligned(base.add(0x28) as *const *const u8);
+    let p_union = std::ptr::read_unaligned(base.add(0x28) as *const *const u8);
     let state_action = std::ptr::read_unaligned(base.add(0x30) as *const u32);
     let state_data_slot = (data as *mut u8).add(0x38) as *mut *mut c_void;
     let cur_state = std::ptr::read_unaligned(state_data_slot);
@@ -1435,54 +1703,207 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
         return ERROR_SUCCESS;
     }
 
-    if union_choice != WTD_CHOICE_FILE || p_file.is_null() {
-        stub!("WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE");
+    if p_union.is_null() {
         return TRUST_E_NOSIGNATURE;
     }
 
-    let pcwsz_path = std::ptr::read_unaligned(p_file.add(0x08) as *const *const u16);
-    let h_file = std::ptr::read_unaligned(p_file.add(0x10) as *const crate::types::HANDLE);
-
-    let (label, host_path) = if !pcwsz_path.is_null() {
-        let win = crate::strings::from_wide(pcwsz_path);
-        let abs = crate::path::absolute(&win);
-        let hp = crate::path::to_host(&abs);
-        (win, hp)
-    } else if !h_file.is_null() && h_file != crate::types::INVALID_HANDLE_VALUE {
-        match crate::kernel32::file::get_file(h_file) {
-            Some(f) => (f.win_path.clone(), f.host_path.clone()),
-            None => (String::from("<handle>"), None),
-        }
+    let chain_policy_oid: usize = if guid == HTTPSPROV_ACTION {
+        4 // CERT_CHAIN_POLICY_SSL
+    } else if guid == WINTRUST_ACTION_GENERIC_CERT_VERIFY
+        || guid == WINTRUST_ACTION_GENERIC_CHAIN_VERIFY
+    {
+        1 // CERT_CHAIN_POLICY_BASE
     } else {
-        return CRYPT_E_FILE_ERROR;
+        2 // CERT_CHAIN_POLICY_AUTHENTICODE
     };
 
-    let Some(host_path) = host_path else {
-        log::warn!("WinVerifyTrust({label:?}): cannot map path -> CRYPT_E_FILE_ERROR");
-        return CRYPT_E_FILE_ERROR;
-    };
+    match union_choice {
+        WTD_CHOICE_FILE => {
+            let pcwsz_path = std::ptr::read_unaligned(p_union.add(0x08) as *const *const u16);
+            let h_file = std::ptr::read_unaligned(p_union.add(0x10) as *const crate::types::HANDLE);
 
-    let bytes = match std::fs::read(&host_path) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("WinVerifyTrust({label:?}): read {}: {e} -> CRYPT_E_FILE_ERROR", host_path.display());
-            return CRYPT_E_FILE_ERROR;
-        }
-    };
+            let (label, host_path) = if !pcwsz_path.is_null() {
+                let win = crate::strings::from_wide(pcwsz_path);
+                let abs = crate::path::absolute(&win);
+                let hp = crate::path::to_host(&abs);
+                (win, hp)
+            } else if !h_file.is_null() && h_file != crate::types::INVALID_HANDLE_VALUE {
+                match crate::kernel32::file::get_file(h_file) {
+                    Some(f) => (f.win_path.clone(), f.host_path.clone()),
+                    None => (String::from("<handle>"), None),
+                }
+            } else {
+                return CRYPT_E_FILE_ERROR;
+            };
 
-    match verify_pe_authenticode(&bytes) {
-        Ok(verified) => {
-            let ncerts = verified.certs.len();
-            if state_action == WTD_STATEACTION_VERIFY {
-                let h = alloc_provider_state(verified, data);
-                std::ptr::write_unaligned(state_data_slot, h);
+            let Some(host_path) = host_path else {
+                log::warn!("WinVerifyTrust({label:?}): cannot map path -> CRYPT_E_FILE_ERROR");
+                return CRYPT_E_FILE_ERROR;
+            };
+
+            let bytes = match std::fs::read(&host_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!(
+                        "WinVerifyTrust({label:?}): read {}: {e} -> CRYPT_E_FILE_ERROR",
+                        host_path.display()
+                    );
+                    return CRYPT_E_FILE_ERROR;
+                }
+            };
+
+            match verify_pe_authenticode(&bytes) {
+                Ok(verified) => {
+                    let ncerts = verified.certs.len();
+                    if state_action == WTD_STATEACTION_VERIFY {
+                        let h = alloc_provider_state(verified, data);
+                        std::ptr::write_unaligned(state_data_slot, h);
+                    }
+                    log::info!("WinVerifyTrust({label:?}): verified PE Authenticode digest + PKCS#7 RSA signature ({ncerts} cert(s))");
+                    ERROR_SUCCESS
+                }
+                Err(code) => {
+                    log::warn!("WinVerifyTrust({label:?}): Authenticode verification failed ({code:#010x})");
+                    code
+                }
             }
-            log::info!("WinVerifyTrust({label:?}): verified PE Authenticode digest + PKCS#7 RSA signature ({ncerts} cert(s))");
-            ERROR_SUCCESS
         }
-        Err(code) => {
-            log::warn!("WinVerifyTrust({label:?}): Authenticode verification failed ({code:#010x})");
-            code
+        WTD_CHOICE_CATALOG => {
+            // WINTRUST_CATALOG_INFO (Win64): pcwszCatalogFilePath @ +0x08, pcwszMemberFilePath @ +0x18,
+            // hMemberFile @ +0x20, pbCalculatedFileHash @ +0x28, cbCalculatedFileHash @ +0x30
+            let cat_path_w = std::ptr::read_unaligned(p_union.add(0x08) as *const *const u16);
+            if cat_path_w.is_null() {
+                return TRUST_E_NOSIGNATURE;
+            }
+            let win = crate::strings::from_wide(cat_path_w);
+            let abs = crate::path::absolute(&win);
+            let Some(host) = crate::path::to_host(&abs) else {
+                return CRYPT_E_FILE_ERROR;
+            };
+            let Ok(cat_bytes) = std::fs::read(&host) else {
+                return CRYPT_E_FILE_ERROR;
+            };
+            match verify_standalone_pkcs7(&cat_bytes, None) {
+                Ok(verified) => {
+                    if state_action == WTD_STATEACTION_VERIFY {
+                        let h = alloc_provider_state(verified, data);
+                        std::ptr::write_unaligned(state_data_slot, h);
+                    }
+                    ERROR_SUCCESS
+                }
+                Err(code) => code,
+            }
+        }
+        WTD_CHOICE_BLOB => {
+            // WINTRUST_BLOB_INFO (Win64): cbMemObject @ +0x20, pbMemObject @ +0x28,
+            // cbMemSignedMsg @ +0x30, pbMemSignedMsg @ +0x38
+            let cb_struct_b = std::ptr::read_unaligned(p_union as *const u32);
+            if cb_struct_b < 0x30 {
+                return TRUST_E_SUBJECT_FORM_UNKNOWN;
+            }
+            let cb_obj = std::ptr::read_unaligned(p_union.add(0x20) as *const u32) as usize;
+            let pb_obj = std::ptr::read_unaligned(p_union.add(0x28) as *const *const u8);
+            let (cb_sig, pb_sig) = if cb_struct_b >= 0x40 {
+                (
+                    std::ptr::read_unaligned(p_union.add(0x30) as *const u32) as usize,
+                    std::ptr::read_unaligned(p_union.add(0x38) as *const *const u8),
+                )
+            } else {
+                (0, std::ptr::null())
+            };
+            let result = if cb_sig > 0 && !pb_sig.is_null() {
+                let sig_slice = std::slice::from_raw_parts(pb_sig, cb_sig);
+                let obj_opt = (cb_obj > 0 && !pb_obj.is_null())
+                    .then(|| std::slice::from_raw_parts(pb_obj, cb_obj));
+                verify_standalone_pkcs7(sig_slice, obj_opt)
+            } else if cb_obj > 0 && !pb_obj.is_null() {
+                let obj_slice = std::slice::from_raw_parts(pb_obj, cb_obj);
+                if obj_slice.len() >= 2 && &obj_slice[..2] == b"MZ" {
+                    verify_pe_authenticode(obj_slice)
+                } else {
+                    verify_standalone_pkcs7(obj_slice, None)
+                }
+            } else {
+                Err(TRUST_E_NOSIGNATURE)
+            };
+            match result {
+                Ok(verified) => {
+                    if state_action == WTD_STATEACTION_VERIFY {
+                        let h = alloc_provider_state(verified, data);
+                        std::ptr::write_unaligned(state_data_slot, h);
+                    }
+                    ERROR_SUCCESS
+                }
+                Err(code) => code,
+            }
+        }
+        WTD_CHOICE_SIGNER => {
+            // WINTRUST_SGNR_INFO (Win64): psSignerInfo @ +0x10, chStores @ +0x18, pahStores @ +0x20
+            let ps_signer = std::ptr::read_unaligned(p_union.add(0x10) as *const *const CmsgSignerInfo);
+            let ch_stores = std::ptr::read_unaligned(p_union.add(0x18) as *const u32);
+            let pah_stores = std::ptr::read_unaligned(p_union.add(0x20) as *const *const *mut c_void);
+            if ps_signer.is_null() || ch_stores == 0 || pah_stores.is_null() {
+                return TRUST_E_NOSIGNATURE;
+            }
+            let si = std::ptr::read_unaligned(ps_signer);
+            let mut query_ci: CertInfo = std::mem::zeroed();
+            query_ci.issuer = si.issuer;
+            query_ci.serial_number = si.serial_number;
+            let mut found_cert: *mut c_void = std::ptr::null_mut();
+            for i in 0..ch_stores as usize {
+                let st = std::ptr::read_unaligned(pah_stores.add(i));
+                let c = super::crypt32::CertGetSubjectCertificateFromStore(
+                    st,
+                    X509_ASN_ENCODING,
+                    &query_ci as *const CertInfo as *const c_void,
+                );
+                if !c.is_null() {
+                    found_cert = c;
+                    break;
+                }
+            }
+            if found_cert.is_null() {
+                return TRUST_E_NOSIGNATURE;
+            }
+            let rc = verify_cert_via_chain_policy(
+                found_cert,
+                ch_stores,
+                pah_stores,
+                std::ptr::null(),
+                chain_policy_oid,
+            );
+            super::crypt32::CertFreeCertificateContext(found_cert);
+            rc
+        }
+        WTD_CHOICE_CERT => {
+            // WINTRUST_CERT_INFO (Win64): psCertContext @ +0x10, chStores @ +0x18, pahStores @ +0x20,
+            // dwFlags @ +0x28, psftVerifyAsOf @ +0x30
+            let cb_ci = std::ptr::read_unaligned(p_union as *const u32);
+            if cb_ci < 0x18 {
+                return TRUST_E_SUBJECT_FORM_UNKNOWN;
+            }
+            let cert_ctx = std::ptr::read_unaligned(p_union.add(0x10) as *const *const c_void);
+            let ch_stores = if cb_ci >= 0x20 {
+                std::ptr::read_unaligned(p_union.add(0x18) as *const u32)
+            } else {
+                0
+            };
+            let pah_stores = if cb_ci >= 0x28 {
+                std::ptr::read_unaligned(p_union.add(0x20) as *const *const *mut c_void)
+            } else {
+                std::ptr::null()
+            };
+            let p_time = if cb_ci >= 0x38 {
+                std::ptr::read_unaligned(p_union.add(0x30) as *const *const c_void)
+            } else {
+                std::ptr::null()
+            };
+            verify_cert_via_chain_policy(cert_ctx, ch_stores, pah_stores, p_time, chain_policy_oid)
+        }
+        other => {
+            // Per MSDN: unrecognized dwUnionChoice returns TRUST_E_SUBJECT_FORM_UNKNOWN.
+            log::debug!("WinVerifyTrust: invalid dwUnionChoice={other} -> TRUST_E_SUBJECT_FORM_UNKNOWN");
+            TRUST_E_SUBJECT_FORM_UNKNOWN
         }
     }
 }
@@ -1627,6 +2048,12 @@ pub unsafe extern "win64" fn SfcIsFileProtected(
 const TBS_E_INVALID_CONTEXT: u32 = 0x8028_4004;
 const TBS_E_TPM_NOT_FOUND: u32 = 0x8028_400F;
 
+// TPM Base Services (TBS, `tbs.h`): Apple Silicon has no TCG TPM 2.0 device or Windows
+// TBS kernel driver (`tbs.sys`). Per Microsoft Learn (`Tbsi_Context_Create`,
+// `Tbsip_Context_Close`, `Tbsip_Submit_Command`, `Tbsi_GetDeviceInfo`), Windows machines
+// without a TPM return `TBS_E_TPM_NOT_FOUND` (0x8028400F) on context creation, device
+// queries, and command submission, and `TBS_E_INVALID_CONTEXT` (0x80284004) when closing
+// any handle since no valid TBS context can exist.
 pub unsafe extern "win64" fn Tbsi_Context_Create(
     _context_params: *const c_void,
     ph_context: *mut *mut c_void,
@@ -1638,12 +2065,8 @@ pub unsafe extern "win64" fn Tbsi_Context_Create(
 }
 
 pub unsafe extern "win64" fn Tbsip_Context_Close(h_context: *mut c_void) -> u32 {
-    if h_context.is_null() {
-        TBS_E_INVALID_CONTEXT
-    } else {
-        stub!("Tbsip_Context_Close({h_context:p}) -> TBS_E_INVALID_CONTEXT");
-        TBS_E_INVALID_CONTEXT
-    }
+    log::debug!("Tbsip_Context_Close({h_context:p}) -> TBS_E_INVALID_CONTEXT (no TPM on Apple Silicon)");
+    TBS_E_INVALID_CONTEXT
 }
 
 pub unsafe extern "win64" fn Tbsip_Submit_Command(
@@ -1658,7 +2081,7 @@ pub unsafe extern "win64" fn Tbsip_Submit_Command(
     if !result_buf_len.is_null() {
         std::ptr::write_unaligned(result_buf_len, 0);
     }
-    stub!("Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND");
+    log::debug!("Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND (no TPM on Apple Silicon)");
     TBS_E_TPM_NOT_FOUND
 }
 
@@ -1736,6 +2159,167 @@ mod tests {
         pe[0x80..0x84].copy_from_slice(b"PE\0\0");
         pe[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes());
         assert_eq!(verify_pe_authenticode(&pe).err(), Some(TRUST_E_NOSIGNATURE));
+    }
+
+    #[test]
+    fn win_verify_trust_actions_and_choices_and_tbs() {
+        unsafe {
+            // Non-null TBS handle still returns TBS_E_INVALID_CONTEXT (no TPM on Apple Silicon)
+            assert_eq!(Tbsip_Context_Close(0x1234usize as *mut c_void), TBS_E_INVALID_CONTEXT);
+            assert_eq!(Tbsi_GetDeviceInfo(0, std::ptr::null_mut()), TBS_E_TPM_NOT_FOUND);
+
+            // Unknown action GUID returns TRUST_E_ACTION_UNKNOWN
+            let unknown_guid = [0xAAu8; 16];
+            let mut wtd = [0u8; 0x58];
+            std::ptr::write_unaligned(wtd.as_mut_ptr() as *mut u32, wtd.len() as u32);
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    unknown_guid.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                TRUST_E_ACTION_UNKNOWN
+            );
+
+            // WTD_CHOICE_BLOB with real OpenSSL PKCS#7 SignedData verifies cryptographically!
+            let pkcs7 = crate::misc::crypt32::tests::test_vectors::PKCS7_SIGNED_DER;
+            let mut blob_info = [0u8; 0x40];
+            std::ptr::write_unaligned(blob_info.as_mut_ptr() as *mut u32, blob_info.len() as u32);
+            std::ptr::write_unaligned(blob_info.as_mut_ptr().add(0x20) as *mut u32, pkcs7.len() as u32);
+            std::ptr::write_unaligned(blob_info.as_mut_ptr().add(0x28) as *mut *const u8, pkcs7.as_ptr());
+
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_BLOB);
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x28) as *mut *const u8, blob_info.as_ptr());
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x30) as *mut u32, WTD_STATEACTION_VERIFY);
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS
+            );
+            let st_handle = std::ptr::read_unaligned(wtd.as_ptr().add(0x38) as *const *mut c_void);
+            assert!(!st_handle.is_null());
+            let prov = WTHelperProvDataFromStateData(st_handle);
+            assert!(!prov.is_null());
+            let sgnr = WTHelperGetProvSignerFromChain(prov, 0, 0, 0);
+            assert!(!sgnr.is_null());
+            let cert_el = WTHelperGetProvCertFromChain(sgnr, 0);
+            assert!(!cert_el.is_null());
+            // Close provider state
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x30) as *mut u32, WTD_STATEACTION_CLOSE);
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS
+            );
+
+            // Tampered blob fails with TRUST_E_BAD_DIGEST (also exercises DRIVER_ACTION_VERIFY)
+            let mut bad_p7 = pkcs7.to_vec();
+            let last = bad_p7.len() - 1;
+            bad_p7[last] ^= 0xFF;
+            std::ptr::write_unaligned(blob_info.as_mut_ptr().add(0x28) as *mut *const u8, bad_p7.as_ptr());
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x30) as *mut u32, 0);
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    DRIVER_ACTION_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                TRUST_E_BAD_DIGEST
+            );
+
+            // WTD_CHOICE_CERT with WINTRUST_ACTION_GENERIC_CERT_VERIFY, GENERIC_CHAIN_VERIFY, and HTTPSPROV_ACTION
+            let pfx_blob = CryptDataBlob {
+                cb_data: crate::misc::crypt32::tests::test_vectors::PFX_PBES2_AES256.len() as u32,
+                pb_data: crate::misc::crypt32::tests::test_vectors::PFX_PBES2_AES256.as_ptr(),
+            };
+            let pw = crate::strings::to_wide_z("testpass123");
+            let st = crate::misc::crypt32::PFXImportCertStore(&pfx_blob as *const _ as *const c_void, pw.as_ptr(), 0);
+            let cert = crate::misc::crypt32::CertEnumCertificatesInStore(st, std::ptr::null_mut());
+            let mut cert_info = [0u8; 0x38];
+            std::ptr::write_unaligned(cert_info.as_mut_ptr() as *mut u32, cert_info.len() as u32);
+            std::ptr::write_unaligned(cert_info.as_mut_ptr().add(0x10) as *mut *const c_void, cert);
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_CERT);
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x28) as *mut *const u8, cert_info.as_ptr());
+            for action in [
+                &WINTRUST_ACTION_GENERIC_CERT_VERIFY,
+                &WINTRUST_ACTION_GENERIC_CHAIN_VERIFY,
+                &HTTPSPROV_ACTION,
+            ] {
+                assert_eq!(
+                    WinVerifyTrust(
+                        std::ptr::null_mut(),
+                        action.as_ptr(),
+                        wtd.as_mut_ptr() as *mut c_void,
+                    ),
+                    crate::misc::crypt32::CERT_E_UNTRUSTEDROOT as i32
+                );
+            }
+
+            // WTD_CHOICE_SIGNER with real CMSG_SIGNER_INFO matching the cert in `st`
+            let cctx = std::ptr::read_unaligned(cert as *const CertContext);
+            let ci = std::ptr::read_unaligned(cctx.p_cert_info);
+            let mut si: CmsgSignerInfo = std::mem::zeroed();
+            si.issuer = ci.issuer;
+            si.serial_number = ci.serial_number;
+            let stores = [st];
+            let mut sgnr_info = [0u8; 0x28];
+            std::ptr::write_unaligned(sgnr_info.as_mut_ptr() as *mut u32, sgnr_info.len() as u32);
+            std::ptr::write_unaligned(sgnr_info.as_mut_ptr().add(0x10) as *mut *const CmsgSignerInfo, &si);
+            std::ptr::write_unaligned(sgnr_info.as_mut_ptr().add(0x18) as *mut u32, 1);
+            std::ptr::write_unaligned(sgnr_info.as_mut_ptr().add(0x20) as *mut *const *mut c_void, stores.as_ptr());
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_SIGNER);
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x28) as *mut *const u8, sgnr_info.as_ptr());
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                crate::misc::crypt32::CERT_E_UNTRUSTEDROOT as i32
+            );
+
+            // WTD_CHOICE_CATALOG with a temporary PKCS#7 file on disk verifies cryptographically
+            let tmp_dir = std::env::temp_dir().join(format!("wintrust_cat_{}", std::process::id()));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+            let tmp_cat = tmp_dir.join("test.cat");
+            std::fs::write(&tmp_cat, pkcs7).unwrap();
+            crate::path::add_mount("T:\\", &tmp_dir);
+            let cat_w = crate::strings::to_wide_z("T:\\test.cat");
+            let mut cat_info = [0u8; 0x38];
+            std::ptr::write_unaligned(cat_info.as_mut_ptr() as *mut u32, cat_info.len() as u32);
+            std::ptr::write_unaligned(cat_info.as_mut_ptr().add(0x08) as *mut *const u16, cat_w.as_ptr());
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_CATALOG);
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x28) as *mut *const u8, cat_info.as_ptr());
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS
+            );
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+
+            crate::misc::crypt32::CertFreeCertificateContext(cert);
+            crate::misc::crypt32::CertCloseStore(st, 0);
+
+            // Invalid union choice returns TRUST_E_SUBJECT_FORM_UNKNOWN
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, 99);
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_TRUSTPROVIDER_TEST.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                TRUST_E_SUBJECT_FORM_UNKNOWN
+            );
+        }
     }
 }
 

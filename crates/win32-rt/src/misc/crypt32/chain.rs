@@ -4,7 +4,7 @@
 use super::asn1::{
     cert_eku_oids, der_item_children, parse_cert_der_parts, parse_der_item, CertDerParts,
 };
-use super::store::{lookup_cert_for_chain, store_certs_der, ERROR_CALL_NOT_IMPLEMENTED};
+use super::store::{lookup_cert_for_chain, store_certs_der};
 use crate::handles::HandleTable;
 use crate::misc::wintrust::{
     self, CertChainContext, CertChainElement, CertContext, CertInfo, CertSimpleChain,
@@ -18,12 +18,303 @@ use crate::types::*;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 pub(super) const CERT_CHAIN_POLICY_BASE: usize = 1;
 pub(super) const CERT_CHAIN_POLICY_AUTHENTICODE: usize = 2;
 const CERT_CHAIN_POLICY_AUTHENTICODE_TS: usize = 3;
 pub(super) const CERT_CHAIN_POLICY_SSL: usize = 4;
+pub(super) const CERT_CHAIN_POLICY_BASIC_CONSTRAINTS: usize = 5;
+pub(super) const CERT_CHAIN_POLICY_NT_AUTH: usize = 6;
+pub(super) const CERT_CHAIN_POLICY_MICROSOFT_ROOT: usize = 7;
+pub(super) const CERT_CHAIN_POLICY_EV: usize = 8;
+pub(super) const CERT_CHAIN_POLICY_SSL_F12: usize = 9;
+pub(super) const CERT_CHAIN_POLICY_SSL_HPKP_HEADER: usize = 10;
+pub(super) const CERT_CHAIN_POLICY_THIRD_PARTY_ROOT: usize = 11;
+pub(super) const CERT_CHAIN_POLICY_SSL_KEY_PIN: usize = 12;
+
+const TRUST_E_BASIC_CONSTRAINTS: u32 = 0x8009_6019;
+const BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG: u32 = 0x8000_0000;
+const BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG: u32 = 0x4000_0000;
+
+// ---------------------------------------------------------------------------
+// Apple Security.framework system trust store (macOS & iOS)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod apple_trust {
+    use std::ffi::c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFAllocatorDefault: *const c_void;
+        static kCFTypeArrayCallBacks: c_void;
+        fn CFRelease(cf: *const c_void);
+        #[cfg(target_os = "macos")]
+        fn CFArrayGetCount(the_array: *const c_void) -> isize;
+        #[cfg(target_os = "macos")]
+        fn CFArrayGetValueAtIndex(the_array: *const c_void, idx: isize) -> *const c_void;
+        fn CFArrayCreate(
+            allocator: *const c_void,
+            values: *const *const c_void,
+            num_values: isize,
+            callbacks: *const u8,
+        ) -> *const c_void;
+        fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
+        #[cfg(target_os = "macos")]
+        fn CFDataGetLength(the_data: *const c_void) -> isize;
+        #[cfg(target_os = "macos")]
+        fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
+        fn CFDateCreate(allocator: *const c_void, at: f64) -> *const c_void;
+        fn CFStringCreateWithBytes(
+            alloc: *const c_void,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> *const c_void;
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecCertificateCreateWithData(
+            allocator: *const c_void,
+            data: *const c_void,
+        ) -> *const c_void;
+        #[cfg(target_os = "macos")]
+        fn SecCertificateCopyData(certificate: *const c_void) -> *const c_void;
+        fn SecPolicyCreateBasicX509() -> *const c_void;
+        fn SecPolicyCreateSSL(server: u8, hostname: *const c_void) -> *const c_void;
+        fn SecTrustCreateWithCertificates(
+            certificates: *const c_void,
+            policies: *const c_void,
+            trust: *mut *const c_void,
+        ) -> i32;
+        fn SecTrustSetVerifyDate(trust: *const c_void, verify_date: *const c_void) -> i32;
+        fn SecTrustSetAnchorCertificates(
+            trust: *const c_void,
+            anchor_certificates: *const c_void,
+        ) -> i32;
+        fn SecTrustSetAnchorCertificatesOnly(trust: *const c_void, anchor_certs_only: u8) -> i32;
+        fn SecTrustEvaluateWithError(trust: *const c_void, error: *mut *const c_void) -> u8;
+
+        #[cfg(target_os = "macos")]
+        fn SecTrustCopyAnchorCertificates(anchors: *mut *const c_void) -> i32;
+        #[cfg(target_os = "macos")]
+        fn SecTrustSettingsCopyCertificates(domain: u32, certs_out: *mut *const c_void) -> i32;
+    }
+
+    struct CfRef(*const c_void);
+    impl Drop for CfRef {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn cert_ref_to_der(cert_ref: *const c_void) -> Option<Vec<u8>> {
+        if cert_ref.is_null() {
+            return None;
+        }
+        let data = SecCertificateCopyData(cert_ref);
+        if data.is_null() {
+            return None;
+        }
+        let _g = CfRef(data);
+        let len = CFDataGetLength(data);
+        if len <= 0 {
+            return None;
+        }
+        let ptr = CFDataGetBytePtr(data);
+        if ptr.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(ptr, len as usize).to_vec())
+    }
+
+    /// Copy trusted root certificates from the macOS System/Admin/User trust stores.
+    #[cfg(target_os = "macos")]
+    pub fn load_macos_trust_anchors_der() -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        unsafe {
+            let mut anchors: *const c_void = std::ptr::null();
+            if SecTrustCopyAnchorCertificates(&mut anchors) == 0 && !anchors.is_null() {
+                let _g = CfRef(anchors);
+                let count = CFArrayGetCount(anchors);
+                for i in 0..count {
+                    let cert = CFArrayGetValueAtIndex(anchors, i);
+                    if let Some(der) = cert_ref_to_der(cert) {
+                        out.push(der);
+                    }
+                }
+            }
+            // Also include Admin (1) and User (0) trust-settings certificates (deduped by bytes).
+            for domain in [1u32, 0u32] {
+                let mut arr: *const c_void = std::ptr::null();
+                if SecTrustSettingsCopyCertificates(domain, &mut arr) == 0 && !arr.is_null() {
+                    let _g = CfRef(arr);
+                    let count = CFArrayGetCount(arr);
+                    for i in 0..count {
+                        let cert = CFArrayGetValueAtIndex(arr, i);
+                        if let Some(der) = cert_ref_to_der(cert) {
+                            if !out.iter().any(|existing| existing == &der) {
+                                out.push(der);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn load_macos_trust_anchors_der() -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// Evaluate a certificate chain against the Apple Security.framework trust engine.
+    /// `exclusive_anchors`: if `Some`, trust ONLY those anchors; otherwise combine `extra_anchors`
+    /// with the macOS/iOS system trust store.
+    pub fn evaluate_sec_trust(
+        chain_der: &[Vec<u8>],
+        exclusive_anchors: Option<&[Vec<u8>]>,
+        extra_anchors: &[Vec<u8>],
+        ssl_hostname: Option<&str>,
+        verify_unix_secs: Option<f64>,
+    ) -> Option<bool> {
+        if chain_der.is_empty() {
+            return Some(false);
+        }
+        unsafe {
+            let mut cert_guards = Vec::with_capacity(chain_der.len());
+            let mut cert_ptrs = Vec::with_capacity(chain_der.len());
+            for der in chain_der {
+                let d = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len() as isize);
+                if d.is_null() {
+                    continue;
+                }
+                let _dg = CfRef(d);
+                let c = SecCertificateCreateWithData(kCFAllocatorDefault, d);
+                if !c.is_null() {
+                    cert_ptrs.push(c);
+                    cert_guards.push(CfRef(c));
+                }
+            }
+            if cert_ptrs.is_empty() {
+                return Some(false);
+            }
+            let cf_certs = CFArrayCreate(
+                kCFAllocatorDefault,
+                cert_ptrs.as_ptr(),
+                cert_ptrs.len() as isize,
+                std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+            );
+            if cf_certs.is_null() {
+                return None;
+            }
+            let _certs_g = CfRef(cf_certs);
+
+            let policy = if let Some(host) = ssl_hostname {
+                let cf_host = CFStringCreateWithBytes(
+                    kCFAllocatorDefault,
+                    host.as_ptr(),
+                    host.len() as isize,
+                    0x0800_0100, // kCFStringEncodingUTF8
+                    0,
+                );
+                let _hg = CfRef(cf_host);
+                SecPolicyCreateSSL(1, cf_host)
+            } else {
+                SecPolicyCreateBasicX509()
+            };
+            if policy.is_null() {
+                return None;
+            }
+            let _pol_g = CfRef(policy);
+
+            let mut trust: *const c_void = std::ptr::null();
+            if SecTrustCreateWithCertificates(cf_certs, policy, &mut trust) != 0 || trust.is_null() {
+                return None;
+            }
+            let _trust_g = CfRef(trust);
+
+            if let Some(unix_s) = verify_unix_secs {
+                // CFAbsoluteTime epoch is 2001-01-01 (978307200 seconds after Unix epoch).
+                let cf_abs = unix_s - 978_307_200.0;
+                let date = CFDateCreate(kCFAllocatorDefault, cf_abs);
+                if !date.is_null() {
+                    let _dg = CfRef(date);
+                    let _ = SecTrustSetVerifyDate(trust, date);
+                }
+            }
+
+            let anchor_slice = exclusive_anchors.unwrap_or(extra_anchors);
+            if exclusive_anchors.is_some() || !anchor_slice.is_empty() {
+                let mut a_guards = Vec::with_capacity(anchor_slice.len());
+                let mut a_ptrs = Vec::with_capacity(anchor_slice.len());
+                for der in anchor_slice {
+                    let d = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len() as isize);
+                    if d.is_null() {
+                        continue;
+                    }
+                    let _dg = CfRef(d);
+                    let c = SecCertificateCreateWithData(kCFAllocatorDefault, d);
+                    if !c.is_null() {
+                        a_ptrs.push(c);
+                        a_guards.push(CfRef(c));
+                    }
+                }
+                let cf_anchors = CFArrayCreate(
+                    kCFAllocatorDefault,
+                    a_ptrs.as_ptr(),
+                    a_ptrs.len() as isize,
+                    std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+                );
+                if !cf_anchors.is_null() {
+                    let _ag = CfRef(cf_anchors);
+                    let _ = SecTrustSetAnchorCertificates(trust, cf_anchors);
+                    let _ = SecTrustSetAnchorCertificatesOnly(
+                        trust,
+                        u8::from(exclusive_anchors.is_some()),
+                    );
+                }
+            }
+
+            let mut err: *const c_void = std::ptr::null();
+            let ok = SecTrustEvaluateWithError(trust, &mut err);
+            let _eg = CfRef(err);
+            Some(ok != 0)
+        }
+    }
+}
+
+pub(super) fn macos_system_roots_der() -> &'static [Vec<u8>] {
+    static ROOTS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            apple_trust::load_macos_trust_anchors_der()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            Vec::new()
+        }
+    });
+    &ROOTS
+}
+
+fn combined_default_root_store() -> Arc<rustls::RootCertStore> {
+    static COMBINED: LazyLock<Arc<rustls::RootCertStore>> = LazyLock::new(|| {
+        let mut s = (*net_tls::root_cert_store()).clone();
+        for der in macos_system_roots_der() {
+            let _ = s.add(CertificateDer::from(der.as_slice()));
+        }
+        Arc::new(s)
+    });
+    Arc::clone(&COMBINED)
+}
 
 // CERT_CHAIN_POLICY_PARA.dwFlags
 pub(super) const CERT_CHAIN_POLICY_IGNORE_NOT_TIME_VALID_FLAG: u32 = 0x0000_0001;
@@ -57,6 +348,7 @@ struct RegisteredEngine {
 }
 
 struct RegisteredChain {
+    refcount: usize,
     _certs: Vec<OwnedCertContext>,
     _elements: Vec<Box<CertChainElement>>,
     _element_ptrs: Box<[*const CertChainElement]>,
@@ -240,6 +532,9 @@ fn verify_chain_signatures_to_roots(
         for der in extra_roots_der {
             push_root_der(&mut root_parts, der);
         }
+        for der in macos_system_roots_der() {
+            push_root_der(&mut root_parts, der);
+        }
         for ta in webpki_roots::TLS_SERVER_ROOTS {
             if let Ok(kids) = der_item_children(ta.subject_public_key_info.as_ref()).ok_or(()) {
                 if kids.len() >= 2
@@ -369,9 +664,9 @@ fn verify_chain_webpki_at(
         }
         Arc::new(s)
     } else if extra_roots_der.is_empty() {
-        net_tls::root_cert_store()
+        combined_default_root_store()
     } else {
-        let mut s = (*net_tls::root_cert_store()).clone();
+        let mut s = (*combined_default_root_store()).clone();
         for der in extra_roots_der {
             let _ = s.add(CertificateDer::from(der.as_slice()));
         }
@@ -586,11 +881,13 @@ pub(super) unsafe fn cert_create_certificate_chain_engine_impl(
 }
 
 pub(super) fn cert_free_certificate_chain_engine_impl(engine: *mut c_void) {
-    if engine.is_null() {
+    // HCCE_CURRENT_USER (NULL / 0) and HCCE_LOCAL_MACHINE (1) are predefined pseudo-handles.
+    let raw = engine as usize;
+    if raw == 0 || raw == 1 {
         return;
     }
-    if ENGINES.remove(engine as usize).is_none() {
-        stub!("CertFreeCertificateChainEngine({engine:p}): foreign engine ignored");
+    if ENGINES.remove(raw).is_none() {
+        log::debug!("CertFreeCertificateChainEngine({engine:p}): unknown/already-freed engine");
     }
 }
 
@@ -761,6 +1058,7 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
     let _ = CHAINS.insert_at(
         ctx_ptr,
         RegisteredChain {
+            refcount: 1,
             _certs: owned_certs,
             _elements: elements,
             _element_ptrs: element_ptrs,
@@ -779,12 +1077,38 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
     TRUE
 }
 
+pub(super) fn cert_duplicate_certificate_chain_impl(chain: *const c_void) -> *mut c_void {
+    if chain.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _ = CHAINS.with_mut(chain as usize, |c| {
+        c.refcount += 1;
+    });
+    chain as *mut c_void
+}
+
 pub(super) fn cert_free_certificate_chain_impl(chain: *mut c_void) {
     if chain.is_null() {
         return;
     }
-    if CHAINS.remove(chain as usize).is_none() {
-        stub!("CertFreeCertificateChain({chain:p}): foreign chain ignored");
+    let key = chain as usize;
+    let should_remove = CHAINS
+        .with_mut(key, |c| {
+            if c.refcount > 1 {
+                c.refcount -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    match should_remove {
+        Some(true) => {
+            let _ = CHAINS.remove(key);
+        }
+        Some(false) => {}
+        None => {
+            log::debug!("CertFreeCertificateChain({chain:p}): unknown/already-freed chain");
+        }
     }
 }
 
@@ -799,13 +1123,24 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         return FALSE;
     }
     let policy_id = psz_policy_oid as usize;
-    if policy_id != CERT_CHAIN_POLICY_BASE
-        && policy_id != CERT_CHAIN_POLICY_AUTHENTICODE
-        && policy_id != CERT_CHAIN_POLICY_AUTHENTICODE_TS
-        && policy_id != CERT_CHAIN_POLICY_SSL
-    {
-        stub!("CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE");
-        crate::teb::set_last_error(ERROR_CALL_NOT_IMPLEMENTED);
+    if !matches!(
+        policy_id,
+        CERT_CHAIN_POLICY_BASE
+            | CERT_CHAIN_POLICY_AUTHENTICODE
+            | CERT_CHAIN_POLICY_AUTHENTICODE_TS
+            | CERT_CHAIN_POLICY_SSL
+            | CERT_CHAIN_POLICY_BASIC_CONSTRAINTS
+            | CERT_CHAIN_POLICY_NT_AUTH
+            | CERT_CHAIN_POLICY_MICROSOFT_ROOT
+            | CERT_CHAIN_POLICY_EV
+            | CERT_CHAIN_POLICY_SSL_F12
+            | CERT_CHAIN_POLICY_SSL_HPKP_HEADER
+            | CERT_CHAIN_POLICY_THIRD_PARTY_ROOT
+            | CERT_CHAIN_POLICY_SSL_KEY_PIN
+    ) {
+        // Per MSDN/Wine: unknown chain policy OID returns FALSE with ERROR_FILE_NOT_FOUND.
+        log::debug!("CertVerifyCertificateChainPolicy: unknown policy oid={policy_id:#x}");
+        crate::teb::set_last_error(err::ERROR_FILE_NOT_FOUND);
         return FALSE;
     }
 
@@ -838,7 +1173,14 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
 
     let mut fdw_checks = 0u32;
     let mut server_name: Option<String> = None;
-    if policy_id == CERT_CHAIN_POLICY_SSL && !extra_ptr.is_null() {
+    if matches!(
+        policy_id,
+        CERT_CHAIN_POLICY_SSL
+            | CERT_CHAIN_POLICY_SSL_F12
+            | CERT_CHAIN_POLICY_SSL_HPKP_HEADER
+            | CERT_CHAIN_POLICY_SSL_KEY_PIN
+    ) && !extra_ptr.is_null()
+    {
         let ssl = std::ptr::read_unaligned(extra_ptr as *const SslExtraCertChainPolicyPara);
         fdw_checks = ssl.fdw_checks;
         if ssl.cb_size >= 0x18 && !ssl.pwsz_server_name.is_null() {
@@ -868,7 +1210,10 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         .position(|&(nb, na)| (nb > 0 && check_ft < nb) || (na > 0 && check_ft > na));
 
     let (err_code, elem_idx): (u32, i32) = match policy_id {
-        CERT_CHAIN_POLICY_SSL => {
+        CERT_CHAIN_POLICY_SSL
+        | CERT_CHAIN_POLICY_SSL_F12
+        | CERT_CHAIN_POLICY_SSL_HPKP_HEADER
+        | CERT_CHAIN_POLICY_SSL_KEY_PIN => {
             let mut raw = verify_chain_webpki_at(
                 &chain_der,
                 server_name.as_deref(),
@@ -877,6 +1222,23 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                 ignore_cn,
                 verify_unix,
             );
+            // Fall back to Apple Security.framework SecTrust when WebPKI rejects with untrusted root
+            // (handles system-installed macOS roots or non-WebPKI chains trusted by Apple's trust store).
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if raw == CERT_E_UNTRUSTEDROOT {
+                let verify_secs = Some(verify_unix.as_secs() as f64);
+                let host_arg = if ignore_cn { None } else { server_name.as_deref() };
+                if apple_trust::evaluate_sec_trust(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                    host_arg,
+                    verify_secs,
+                ) == Some(true)
+                {
+                    raw = 0;
+                }
+            }
             if (raw == CERT_E_UNTRUSTEDROOT && ignore_ca)
                 || (raw == CERT_E_EXPIRED && ignore_date)
                 || (raw == CERT_E_CN_NO_MATCH && ignore_cn)
@@ -944,12 +1306,22 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                                 .iter()
                                 .any(|o| o.as_slice() == req_eku || o.as_slice() == OID_ANY_EKU)
                     });
-            let trust_ok = default_chain_error == 0
+            let mut trust_ok = default_chain_error == 0
                 || verify_chain_signatures_to_roots(
                     &chain_der,
                     exclusive_roots.as_deref(),
                     &extra_roots,
                 );
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if !trust_ok {
+                trust_ok = apple_trust::evaluate_sec_trust(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                    None,
+                    Some(verify_unix.as_secs() as f64),
+                ) == Some(true);
+            }
             if default_chain_error == CERT_E_REVOKED {
                 (CERT_E_REVOKED, 0)
             } else if usage_bad {
@@ -969,13 +1341,162 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                 (0, -1)
             }
         }
-        CERT_CHAIN_POLICY_BASE => {
+        CERT_CHAIN_POLICY_BASIC_CONSTRAINTS => {
+            // Check Basic Constraints extension (2.5.29.19) across the chain.
+            const OID_BC: &[u8] = &[0x55, 0x1D, 0x13];
+            let require_ca_leaf = (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG) != 0;
+            let require_ee_leaf =
+                (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG) != 0;
+            let mut violation: Option<(u32, i32)> = None;
+            for (idx, der) in chain_der.iter().enumerate() {
+                let Some(parts) = parse_cert_der_parts(der) else {
+                    continue;
+                };
+                let mut is_ca = false;
+                let mut path_len: Option<usize> = None;
+                for (oid, _, val) in &parts.extensions {
+                    if *oid == OID_BC {
+                        if let Some((seq, _)) = parse_der_item(val) {
+                            if let Some(kids) = der_item_children(seq.val) {
+                                for k in kids {
+                                    if k.tag == 0x01 {
+                                        is_ca = k.val.first().copied().unwrap_or(0) != 0;
+                                    } else if k.tag == 0x02 && !k.val.is_empty() {
+                                        let mut v = 0usize;
+                                        for &b in k.val {
+                                            v = (v << 8) | (b as usize);
+                                        }
+                                        path_len = Some(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if idx == 0 {
+                    if require_ca_leaf && !is_ca {
+                        violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
+                        break;
+                    }
+                    if require_ee_leaf && is_ca {
+                        violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
+                        break;
+                    }
+                } else {
+                    if !is_ca {
+                        violation = Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
+                        break;
+                    }
+                    // Number of non-self-issued intermediate CA certs below this CA is (idx - 1).
+                    if let Some(max_inter) = path_len {
+                        if idx.saturating_sub(1) > max_inter {
+                            violation = Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
+                            break;
+                        }
+                    }
+                }
+            }
+            violation.unwrap_or((0, -1))
+        }
+        CERT_CHAIN_POLICY_NT_AUTH => {
+            const OID_CLIENT_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+            const OID_SMARTCARD_LOGON: &[u8] =
+                &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x14, 0x02, 0x02];
+            const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
+            let usage_bad = !ignore_usage
+                && chain_der
+                    .first()
+                    .and_then(|d| cert_eku_oids(d))
+                    .is_some_and(|oids| {
+                        !oids.is_empty()
+                            && !oids.iter().any(|o| {
+                                o.as_slice() == OID_CLIENT_AUTH
+                                    || o.as_slice() == OID_SMARTCARD_LOGON
+                                    || o.as_slice() == OID_ANY_EKU
+                            })
+                    });
             let trust_ok = default_chain_error == 0
                 || verify_chain_signatures_to_roots(
                     &chain_der,
                     exclusive_roots.as_deref(),
                     &extra_roots,
                 );
+            if default_chain_error == CERT_E_REVOKED {
+                (CERT_E_REVOKED, 0)
+            } else if usage_bad {
+                (CERT_E_WRONG_USAGE, 0)
+            } else if !ignore_date && first_time_invalid_idx.is_some() {
+                (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
+            } else if !trust_ok && !ignore_ca {
+                (CERT_E_UNTRUSTEDROOT, 0)
+            } else {
+                (0, -1)
+            }
+        }
+        CERT_CHAIN_POLICY_MICROSOFT_ROOT => {
+            let root_is_ms = chain_der.last().is_some_and(|root_der| {
+                parse_cert_der_parts(root_der).is_some_and(|p| {
+                    wintrust::extract_dn_attr(p.subject_raw, &[0x55, 0x04, 0x0A])
+                        .is_some_and(|org| org.to_ascii_lowercase().contains("microsoft"))
+                        || wintrust::extract_dn_attr(p.subject_raw, &[0x55, 0x04, 0x03])
+                            .is_some_and(|cn| cn.to_ascii_lowercase().contains("microsoft"))
+                })
+            });
+            let trust_ok = default_chain_error == 0
+                || verify_chain_signatures_to_roots(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                );
+            if !root_is_ms || (!trust_ok && !ignore_ca) {
+                (CERT_E_UNTRUSTEDROOT, chain_der.len().saturating_sub(1) as i32)
+            } else if !ignore_date && first_time_invalid_idx.is_some() {
+                (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
+            } else {
+                (0, -1)
+            }
+        }
+        CERT_CHAIN_POLICY_EV => {
+            const OID_CERT_POLICIES: &[u8] = &[0x55, 0x1D, 0x20];
+            let has_policy_ext = chain_der.first().is_some_and(|d| {
+                parse_cert_der_parts(d)
+                    .is_some_and(|p| p.extensions.iter().any(|(oid, _, _)| *oid == OID_CERT_POLICIES))
+            });
+            let trust_ok = default_chain_error == 0
+                || verify_chain_signatures_to_roots(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                );
+            if default_chain_error == CERT_E_REVOKED {
+                (CERT_E_REVOKED, 0)
+            } else if !ignore_date && first_time_invalid_idx.is_some() {
+                (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
+            } else if !trust_ok && !ignore_ca {
+                (CERT_E_UNTRUSTEDROOT, 0)
+            } else if !has_policy_ext {
+                (CERT_E_WRONG_USAGE, 0)
+            } else {
+                (0, -1)
+            }
+        }
+        CERT_CHAIN_POLICY_BASE | CERT_CHAIN_POLICY_THIRD_PARTY_ROOT => {
+            let mut trust_ok = default_chain_error == 0
+                || verify_chain_signatures_to_roots(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                );
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if !trust_ok {
+                trust_ok = apple_trust::evaluate_sec_trust(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                    None,
+                    Some(verify_unix.as_secs() as f64),
+                ) == Some(true);
+            }
             if default_chain_error == CERT_E_REVOKED {
                 (CERT_E_REVOKED, 0)
             } else if !ignore_date && first_time_invalid_idx.is_some() {
@@ -1027,4 +1548,122 @@ pub(super) unsafe fn cert_verify_time_validity_impl(
     } else {
         0
     }
+}
+
+pub(super) unsafe fn cert_verify_subject_certificate_context_impl(
+    p_subject: *const c_void,
+    p_issuer: *const c_void,
+    pdw_flags: *mut u32,
+) -> BOOL {
+    const CERT_STORE_SIGNATURE_FLAG: u32 = 0x0000_0001;
+    const CERT_STORE_TIME_VALIDITY_FLAG: u32 = 0x0000_0002;
+    const CERT_STORE_REVOCATION_FLAG: u32 = 0x0000_0004;
+    const CERT_STORE_NO_CRL_FLAG: u32 = 0x0001_0000;
+    const E_INVALIDARG: u32 = 0x8007_0057;
+
+    if p_subject.is_null() || pdw_flags.is_null() {
+        crate::teb::set_last_error(E_INVALIDARG);
+        return FALSE;
+    }
+    let req = std::ptr::read_unaligned(pdw_flags);
+    let subj_cc = std::ptr::read_unaligned(p_subject as *const CertContext);
+    let mut out_flags = 0u32;
+
+    if (req & CERT_STORE_SIGNATURE_FLAG) != 0 {
+        if p_issuer.is_null() {
+            // Per MSDN: pIssuer must be non-NULL when CERT_STORE_SIGNATURE_FLAG is requested.
+            out_flags |= CERT_STORE_SIGNATURE_FLAG;
+        } else {
+            let iss_cc = std::ptr::read_unaligned(p_issuer as *const CertContext);
+            let sig_ok = if !subj_cc.pb_cert_encoded.is_null()
+                && subj_cc.cb_cert_encoded > 0
+                && !iss_cc.pb_cert_encoded.is_null()
+                && iss_cc.cb_cert_encoded > 0
+            {
+                let s_der = std::slice::from_raw_parts(
+                    subj_cc.pb_cert_encoded,
+                    subj_cc.cb_cert_encoded as usize,
+                );
+                let i_der = std::slice::from_raw_parts(
+                    iss_cc.pb_cert_encoded,
+                    iss_cc.cb_cert_encoded as usize,
+                );
+                match (parse_cert_der_parts(s_der), parse_cert_der_parts(i_der)) {
+                    (Some(sp), Some(ip)) => {
+                        verify_cert_sig_with_spki(&sp, ip.spki_alg_inner, ip.spki_key_bits)
+                            || verify_rsa_cert_sig_fallback(&sp, ip.spki_alg_inner, ip.spki_key_bits)
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !sig_ok {
+                out_flags |= CERT_STORE_SIGNATURE_FLAG;
+            }
+        }
+    }
+
+    if (req & CERT_STORE_TIME_VALIDITY_FLAG) != 0 {
+        if subj_cc.p_cert_info.is_null()
+            || cert_verify_time_validity_impl(std::ptr::null(), subj_cc.p_cert_info as *const c_void)
+                != 0
+        {
+            out_flags |= CERT_STORE_TIME_VALIDITY_FLAG;
+        }
+    }
+
+    if (req & CERT_STORE_REVOCATION_FLAG) != 0 {
+        // No local CRL available for the issuer -> Windows sets both REVOCATION and NO_CRL flags.
+        out_flags |= CERT_STORE_REVOCATION_FLAG | CERT_STORE_NO_CRL_FLAG;
+    }
+
+    std::ptr::write_unaligned(pdw_flags, out_flags);
+    TRUE
+}
+
+fn verify_rsa_cert_sig_fallback(
+    child: &CertDerParts<'_>,
+    spki_alg_inner: &[u8],
+    spki_key_bits: &[u8],
+) -> bool {
+    const OID_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+    let Some((alg_oid, _)) = parse_der_item(spki_alg_inner) else {
+        return false;
+    };
+    if alg_oid.tag != 0x06 || alg_oid.val != OID_RSA {
+        return false;
+    }
+    let Some((sig_oid, _)) = parse_der_item(child.sig_alg_inner) else {
+        return false;
+    };
+    let digest = match sig_oid.val {
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04] => crate::misc::bcrypt::Digest::Md5,
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05] => crate::misc::bcrypt::Digest::Sha1,
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B] => crate::misc::bcrypt::Digest::Sha256,
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C] => crate::misc::bcrypt::Digest::Sha384,
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D] => crate::misc::bcrypt::Digest::Sha512,
+        _ => return false,
+    };
+    let Some((pub_seq, _)) = parse_der_item(spki_key_bits) else {
+        return false;
+    };
+    let Some(pk) = der_item_children(pub_seq.val) else {
+        return false;
+    };
+    if pk.len() < 2 || pk[0].tag != 0x02 || pk[1].tag != 0x02 {
+        return false;
+    }
+    let strip = |mut b: &[u8]| -> Vec<u8> {
+        while b.len() > 1 && b[0] == 0 {
+            b = &b[1..];
+        }
+        b.to_vec()
+    };
+    let rsa = crate::misc::bcrypt::RsaPublicKey {
+        n: strip(pk[0].val),
+        e: strip(pk[1].val),
+    };
+    let h = digest.hash(child.tbs_raw);
+    rsa.verify_pkcs1(Some(digest), &h, child.sig_bits)
 }
