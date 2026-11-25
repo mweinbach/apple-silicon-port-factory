@@ -8241,7 +8241,7 @@ pub unsafe extern "win64" fn DeviceIoControl(
             let prop = std::ptr::read_unaligned(inp as *const u32);
             let qtype = std::ptr::read_unaligned((inp as *const u8).add(4) as *const u32);
             log::debug!("DeviceIoControl(IOCTL_STORAGE_QUERY_PROPERTY, prop={prop}, type={qtype})");
-            let supported = matches!(prop, 0 | 1 | 2 | 3 | 4 | 6 | 7 | 8 | 9 | 11 | 12 | 14 | 17);
+            let supported = matches!(prop, 0 | 1 | 2 | 3 | 4 | 6 | 7 | 8 | 9 | 12 | 13 | 15 | 48);
             if qtype == 1 {
                 // PropertyExistsQuery
                 return if supported { put_exact(&[]) } else { fail_not_supported() };
@@ -8369,7 +8369,7 @@ pub unsafe extern "win64" fn DeviceIoControl(
                     d[8] = 1; // BenefitsFromWriteAggregation
                     put(&d)
                 }
-                11 => {
+                12 => {
                     // StorageDevicePowerProperty -> DEVICE_POWER_DESCRIPTOR (20 bytes)
                     let mut d = [0u8; 20];
                     d[0..4].copy_from_slice(&20u32.to_le_bytes());
@@ -8377,7 +8377,7 @@ pub unsafe extern "win64" fn DeviceIoControl(
                     d[8] = 1; // DeviceAttentionSupported
                     put(&d)
                 }
-                12 => {
+                13 => {
                     // StorageDeviceCopyOffloadProperty -> DEVICE_COPY_OFFLOAD_DESCRIPTOR (40 bytes)
                     let mut d = [0u8; 40];
                     d[0..4].copy_from_slice(&40u32.to_le_bytes());
@@ -8385,7 +8385,7 @@ pub unsafe extern "win64" fn DeviceIoControl(
                     d[8..12].copy_from_slice(&vol.max_transfer_length.to_le_bytes());
                     put(&d)
                 }
-                14 => {
+                15 => {
                     // StorageDeviceMediumProductType -> STORAGE_MEDIUM_PRODUCT_TYPE_DESCRIPTOR (12 bytes)
                     let mut d = [0u8; 12];
                     d[0..4].copy_from_slice(&12u32.to_le_bytes());
@@ -8394,7 +8394,7 @@ pub unsafe extern "win64" fn DeviceIoControl(
                     d[8..12].copy_from_slice(&(if vol.incurs_seek_penalty { 0u32 } else { 4u32 }).to_le_bytes());
                     put(&d)
                 }
-                17 => {
+                48 => {
                     // StorageDeviceIoCapabilityProperty -> STORAGE_DEVICE_IO_CAPABILITY_DESCRIPTOR (16 bytes)
                     let mut d = [0u8; 16];
                     d[0..4].copy_from_slice(&16u32.to_le_bytes());
@@ -11865,8 +11865,21 @@ mod tests {
             let hdev = CreateFileW(dev_w.as_ptr(), 0, 3, std::ptr::null_mut(), OPEN_EXISTING, 0, std::ptr::null_mut());
             assert_ne!(hdev, INVALID_HANDLE_VALUE);
 
-            // IOCTL_STORAGE_QUERY_PROPERTY: StorageDeviceProperty (0), WriteCache (4), IoCapability (17)
-            for (prop, min_sz) in [(0u32, 40u32), (1, 32), (4, 28), (6, 28), (7, 12), (8, 12), (17, 16)] {
+            // IOCTL_STORAGE_QUERY_PROPERTY: StorageDeviceProperty (0), Adapter (1), WriteCache (4),
+            // AccessAlignment (6), SeekPenalty (7), Trim (8), Power (12), CopyOffload (13),
+            // MediumProductType (15), IoCapability (48).
+            for (prop, min_sz) in [
+                (0u32, 40u32),
+                (1, 32),
+                (4, 28),
+                (6, 28),
+                (7, 12),
+                (8, 12),
+                (12, 20),
+                (13, 40),
+                (15, 12),
+                (48, 16),
+            ] {
                 let query = [prop, 0u32, 0u32]; // PropertyStandardQuery
                 let mut out = [0u8; 256];
                 let mut ret = 0u32;
@@ -11885,26 +11898,29 @@ mod tests {
                     "IOCTL_STORAGE_QUERY_PROPERTY prop={prop}"
                 );
                 assert!(ret >= min_sz, "prop={prop} ret={ret} < {min_sz}");
+                assert_eq!((out.as_ptr() as *const u32).read_unaligned(), min_sz, "prop={prop} Version");
             }
 
-            // Unsupported property ID returns FALSE + ERROR_NOT_SUPPORTED.
-            let bad_q = [50u32, 0, 0];
+            // Unsupported property IDs (including old misnumbered 11, 17, and 50) return ERROR_NOT_SUPPORTED.
             let mut out = [0u8; 64];
             let mut ret = 0u32;
-            assert_eq!(
-                DeviceIoControl(
-                    hdev,
-                    IOCTL_STORAGE_QUERY_PROPERTY,
-                    bad_q.as_ptr() as *const c_void,
-                    12,
-                    out.as_mut_ptr() as *mut c_void,
-                    64,
-                    &mut ret,
-                    std::ptr::null_mut(),
-                ),
-                FALSE
-            );
-            assert_eq!(teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            for bad_prop in [11u32, 17, 50] {
+                let bad_q = [bad_prop, 0, 0];
+                assert_eq!(
+                    DeviceIoControl(
+                        hdev,
+                        IOCTL_STORAGE_QUERY_PROPERTY,
+                        bad_q.as_ptr() as *const c_void,
+                        12,
+                        out.as_mut_ptr() as *mut c_void,
+                        64,
+                        &mut ret,
+                        std::ptr::null_mut(),
+                    ),
+                    FALSE
+                );
+                assert_eq!(teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            }
 
             // IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS returns real volume size > 0
             let mut ext = [0u8; 32];
