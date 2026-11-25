@@ -163,6 +163,9 @@ fn va_table_insert(t: &[(std::sync::atomic::AtomicU64, AtomicUsize)], va: u64, p
         let (k, v) = &t[idx];
         let cur = k.load(Ordering::Relaxed);
         if cur == va {
+            if v.load(Ordering::Acquire) == ptr {
+                return false;
+            }
             let old = v.swap(ptr, Ordering::Release);
             return old != ptr;
         }
@@ -231,6 +234,14 @@ pub fn in_host_text(addr: usize) -> bool {
     let s = HOST_TEXT_START.load(Ordering::Acquire);
     let e = HOST_TEXT_END.load(Ordering::Acquire);
     s < e && addr >= s && addr < e
+}
+
+/// True if `addr` lies inside host `__TEXT,__text` and is NOT registered in `VA_DISPATCH`.
+/// Used by `win32-rt` escape audits to detect unregistered host function pointers before
+/// they reach guest code or `call_va8`.
+#[inline]
+pub fn is_unregistered_host_text(addr: usize) -> bool {
+    in_host_text(addr) && lookup_native_va(addr as u64).is_none()
 }
 
 /// Register a native host function pointer `ptr` for preferred-base `va`.

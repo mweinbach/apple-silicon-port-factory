@@ -294,6 +294,7 @@ pub unsafe extern "win64" fn GetProcAddress(h: HMODULE, name: LPCSTR) -> *const 
     let h = if h.is_null() { crate::loader().get_module_handle(None).unwrap_or(0) } else { h as usize };
     match crate::loader().get_proc_address(h, pn) {
         Some(p) => {
+            crate::debug_assert_guest_callable(p, "kernel32::GetProcAddress");
             log::trace!("GetProcAddress(0x{h:x}, {pn}) -> 0x{p:x}");
             p as *const c_void
         }

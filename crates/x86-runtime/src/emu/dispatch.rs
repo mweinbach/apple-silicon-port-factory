@@ -132,6 +132,87 @@ pub(crate) unsafe fn call_lean_in(
     (r_gpr, r_xmm)
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static UNREGISTERED_HOST_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+std::thread_local! {
+    static STRICT_HOST_THUNK_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// RAII test/diagnostic guard that turns any unregistered host `__TEXT` refusal on the
+/// current thread into an immediate panic with the `dladdr` symbol name.
+pub struct StrictHostThunkGuard(());
+
+impl StrictHostThunkGuard {
+    pub fn enter() -> Self {
+        STRICT_HOST_THUNK_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        Self(())
+    }
+}
+
+impl Drop for StrictHostThunkGuard {
+    fn drop(&mut self) {
+        STRICT_HOST_THUNK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Total number of unregistered host `__TEXT` call attempts refused across `call_va8*`.
+#[inline]
+pub fn unregistered_host_refusal_count() -> u64 {
+    UNREGISTERED_HOST_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Resolve a host code address to `<image>!<demangled_symbol>+<offset>` via `dladdr`.
+#[cold]
+#[inline(never)]
+pub fn describe_host_addr(addr: usize) -> String {
+    #[cfg(unix)]
+    unsafe {
+        let mut info: win32_rt::libc::Dl_info = core::mem::zeroed();
+        if win32_rt::libc::dladdr(addr as *const core::ffi::c_void, &mut info) != 0 {
+            let img = if !info.dli_fname.is_null() {
+                let full = std::ffi::CStr::from_ptr(info.dli_fname).to_string_lossy();
+                full.rsplit('/').next().unwrap_or(&full).to_string()
+            } else {
+                String::new()
+            };
+            if !info.dli_sname.is_null() {
+                let raw = std::ffi::CStr::from_ptr(info.dli_sname).to_string_lossy();
+                let sym = crate::pc_sample::demangle(&raw);
+                let off = addr.saturating_sub(info.dli_saddr as usize);
+                return if img.is_empty() {
+                    format!("{sym}+{off:#x}")
+                } else {
+                    format!("{img}!{sym}+{off:#x}")
+                };
+            }
+            if !img.is_empty() {
+                let off = addr.saturating_sub(info.dli_fbase as usize);
+                return format!("{img}+{off:#x}");
+            }
+        }
+    }
+    "<unknown>".to_string()
+}
+
+/// Log and account for a refused call to an unregistered host `__TEXT` target.
+#[cold]
+#[inline(never)]
+pub(crate) fn refuse_unregistered_host_text(site: &'static str, target: u64) {
+    UNREGISTERED_HOST_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    let sym = describe_host_addr(target as usize);
+    log::error!("{site}: refused unregistered host __TEXT target {target:#x} ({sym})");
+    let strict_env = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PORT_STRICT_HOST_THUNK").is_ok_and(|v| v.trim() == "1"))
+    };
+    let strict_tls = STRICT_HOST_THUNK_DEPTH.with(|d| d.get() > 0);
+    if strict_env || strict_tls {
+        panic!("{site}: refused unregistered host __TEXT target {target:#x} ({sym})");
+    }
+}
+
 /// Call a guest or native function at `va_or_addr` with up to 8 Win64 integer/pointer arguments.
 ///
 /// - On `x86_64`, calls the target directly via `extern "win64"`.
@@ -156,9 +237,7 @@ pub unsafe fn call_va8(
             Some(h) => h,
             None => {
                 if crate::exe::in_host_text(va_or_addr as usize) {
-                    log::error!(
-                        "emu::call_va8: refused unregistered host __TEXT target {va_or_addr:#x}"
-                    );
+                    refuse_unregistered_host_text("emu::call_va8", va_or_addr);
                     return 0;
                 }
                 to_mapped_addr(va_or_addr)
@@ -275,7 +354,7 @@ unsafe fn call_va8_bridge(
         }
     }
     if crate::exe::in_host_text(clean_va as usize) {
-        log::error!("emu::call_va8: refused unregistered host __TEXT target {clean_va:#x}");
+        refuse_unregistered_host_text("emu::call_va8", clean_va);
         c.rax_in.set(prev_rax);
         return 0;
     }
