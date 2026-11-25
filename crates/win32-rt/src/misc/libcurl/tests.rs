@@ -1502,3 +1502,142 @@ fn easy_idle_network_io_invokes_progress_callback_and_aborts() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn easy_gzip_progress_reports_transferred_bytes_not_decompressed() {
+    use super::easy::{
+        CURLOPT_ACCEPT_ENCODING, CURLOPT_NOPROGRESS, CURLOPT_XFERINFODATA,
+        CURLOPT_XFERINFOFUNCTION,
+    };
+    use crate::misc::zlib1::ZlibStream;
+
+    struct ProgressLog {
+        samples: Vec<(i64, i64)>,
+    }
+
+    unsafe extern "win64" fn record_progress_cb(
+        clientp: *mut c_void,
+        dltotal: i64,
+        dlnow: i64,
+        _ultotal: i64,
+        _ulnow: i64,
+    ) -> i32 {
+        let log = &mut *(clientp as *mut ProgressLog);
+        log.samples.push((dltotal, dlnow));
+        0
+    }
+
+    // 32 KiB highly compressible payload compresses to ~80 bytes of gzip.
+    let plain = vec![b'Z'; 32 * 1024];
+    let gzipped = ZlibStream::deflate_all(&plain, 6, 15 + 16).expect("gzip compress");
+    assert!(
+        gzipped.len() < 1024,
+        "expected strong gzip compression, got {} bytes",
+        gzipped.len()
+    );
+    let wire_len = gzipped.len() as i64;
+    let gzipped_srv = gzipped.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let (req_head, _) = read_http_request(&mut sock);
+        assert!(
+            req_head.to_ascii_lowercase().contains("accept-encoding:"),
+            "expected Accept-Encoding header: {req_head}"
+        );
+        let hdr = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            gzipped_srv.len()
+        );
+        sock.write_all(hdr.as_bytes()).unwrap();
+        // Send compressed payload in two parts (body + final trailer) to exercise streaming progress.
+        let split = gzipped_srv.len().saturating_sub(8);
+        sock.write_all(&gzipped_srv[..split]).unwrap();
+        sock.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        sock.write_all(&gzipped_srv[split..]).unwrap();
+        sock.flush().unwrap();
+    });
+
+    unsafe {
+        crate::register_native_va(
+            record_progress_cb as *const () as u64,
+            record_progress_cb as *const () as usize,
+        );
+        let easy = curl_easy_init();
+        let url = format!("http://{addr}/compressed\0");
+        let mut body: Vec<u8> = Vec::new();
+        let mut plog = ProgressLog { samples: Vec::new() };
+
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, b"\0".as_ptr() as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_NOPROGRESS, 0), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(
+                easy,
+                CURLOPT_XFERINFOFUNCTION,
+                record_progress_cb as *const () as usize
+            ),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(
+                easy,
+                CURLOPT_XFERINFODATA,
+                (&mut plog as *mut ProgressLog) as usize
+            ),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, vec_write_cb as *const () as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_WRITEDATA, (&mut body as *mut Vec<u8>) as usize),
+            CURLE_OK
+        );
+
+        assert_eq!(curl_easy_perform(easy), CURLE_OK);
+        // Write callback still receives the full 32 KiB decompressed body.
+        assert_eq!(body.len(), plain.len());
+        assert_eq!(body, plain);
+
+        // Every progress callback must report transferred wire bytes (dlnow <= dltotal == wire_len).
+        assert!(!plog.samples.is_empty());
+        let mut prev_dlnow = 0i64;
+        for &(dltotal, dlnow) in &plog.samples {
+            assert_eq!(dltotal, wire_len, "dltotal must equal compressed Content-Length");
+            assert!(
+                dlnow >= prev_dlnow && dlnow <= dltotal,
+                "dlnow ({dlnow}) must be monotonic and <= dltotal ({dltotal})"
+            );
+            prev_dlnow = dlnow;
+        }
+        assert_eq!(
+            plog.samples.last().copied(),
+            Some((wire_len, wire_len)),
+            "final progress sample must reach dlnow == dltotal == wire_len"
+        );
+
+        let mut size_dl = 0i64;
+        assert_eq!(
+            curl_easy_getinfo(
+                easy,
+                CURLINFO_SIZE_DOWNLOAD_T,
+                &mut size_dl as *mut i64 as *mut c_void
+            ),
+            CURLE_OK
+        );
+        assert_eq!(size_dl, wire_len);
+
+        curl_easy_cleanup(easy);
+    }
+
+    server.join().unwrap();
+}

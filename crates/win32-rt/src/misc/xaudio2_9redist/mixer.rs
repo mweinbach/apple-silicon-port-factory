@@ -441,8 +441,23 @@ fn decode_ms_adpcm(
     samples_per_block: usize,
     coefs: &[(i16, i16)],
 ) -> (Vec<f32>, usize) {
+    // Match FFmpeg's `libavcodec/adpcm.c` upper bound (`INT_MAX / 768`) so sustained
+    // max-magnitude nibbles cannot overflow `adaptation_table[nibble] * delta`.
+    const MS_ADPCM_MAX_DELTA: i64 = (i32::MAX / 768) as i64;
+
     let num_blocks = raw.len() / block_align.max(1);
-    let mut out = Vec::with_capacity(num_blocks * samples_per_block * channels);
+    let max_spb = 2usize.saturating_add(
+        block_align
+            .saturating_sub(7 * channels)
+            .saturating_mul(2)
+            / channels.max(1),
+    );
+    let cap_frames = samples_per_block.min(max_spb);
+    let mut out = Vec::with_capacity(
+        num_blocks
+            .saturating_mul(cap_frames)
+            .saturating_mul(channels),
+    );
     let mut total_frames = 0usize;
 
     for blk_idx in 0..num_blocks {
@@ -492,13 +507,17 @@ fn decode_ms_adpcm(
                     break;
                 }
                 let nib_u = ((byte >> shift) & 0x0F) as usize;
-                let nib_s = if nib_u >= 8 { nib_u as i32 - 16 } else { nib_u as i32 };
+                let nib_s = if nib_u >= 8 { nib_u as i64 - 16 } else { nib_u as i64 };
                 let (c1, c2) = coefs[pred[ch_cur]];
-                let predicted = ((samp1[ch_cur] * c1 as i32) + (samp2[ch_cur] * c2 as i32)) >> 8;
-                let new_samp = (predicted + nib_s * delta[ch_cur]).clamp(-32768, 32767);
+                let predicted =
+                    ((samp1[ch_cur] as i64 * c1 as i64) + (samp2[ch_cur] as i64 * c2 as i64)) >> 8;
+                let new_samp = (predicted + nib_s * delta[ch_cur] as i64).clamp(-32768, 32767) as i32;
                 samp2[ch_cur] = samp1[ch_cur];
                 samp1[ch_cur] = new_samp;
-                delta[ch_cur] = ((MS_ADPCM_ADAPTATION_TABLE[nib_u] * delta[ch_cur]) >> 8).max(16);
+                delta[ch_cur] = (((MS_ADPCM_ADAPTATION_TABLE[nib_u] as i64)
+                    * (delta[ch_cur] as i64))
+                    >> 8)
+                .clamp(16, MS_ADPCM_MAX_DELTA) as i32;
                 out.push((new_samp as f32) / 32768.0);
                 ch_cur += 1;
                 if ch_cur == channels {

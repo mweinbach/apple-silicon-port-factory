@@ -806,19 +806,35 @@ fn emit_body_bytes(
     if raw.is_empty() {
         return Ok(());
     }
-    let mut decoded = Vec::new();
-    let payload: &[u8] = if let Some(ref mut inf) = inflater {
-        decoded.reserve(raw.len().saturating_mul(2));
+    if let Some(ref mut inf) = inflater {
+        // Track transferred (wire/encoded) bytes separately from decompressed output
+        // so `dlnow` matches `dltotal` (Content-Length) and `CURLINFO_SIZE_DOWNLOAD_T`
+        // per libcurl's progress and transfer-size contracts.
+        *size_download += raw.len() as i64;
+        if max_filesize > 0 && *size_download > max_filesize {
+            return Err((
+                CURLE_FILESIZE_EXCEEDED,
+                format!("Maximum file size ({max_filesize}) exceeded"),
+                0,
+            ));
+        }
+        let mut decoded = Vec::with_capacity(raw.len().saturating_mul(2));
         inf.decompress(raw, &mut decoded)
             .map_err(|code| (code, "Content-Encoding decompression failed".to_string(), 0))?;
         if decoded.is_empty() {
+            sink.on_progress(dltotal, *size_download, ultotal, ultotal)
+                .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
             return Ok(());
         }
-        &decoded
-    } else {
-        raw
-    };
-    for chunk in payload.chunks(CURL_MAX_WRITE_SIZE) {
+        for chunk in decoded.chunks(CURL_MAX_WRITE_SIZE) {
+            sink.on_body_chunk(chunk.to_vec())
+                .map_err(|code| (code, "Write callback aborted transfer".to_string(), 0))?;
+            sink.on_progress(dltotal, *size_download, ultotal, ultotal)
+                .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+        }
+        return Ok(());
+    }
+    for chunk in raw.chunks(CURL_MAX_WRITE_SIZE) {
         *size_download += chunk.len() as i64;
         if max_filesize > 0 && *size_download > max_filesize {
             return Err((

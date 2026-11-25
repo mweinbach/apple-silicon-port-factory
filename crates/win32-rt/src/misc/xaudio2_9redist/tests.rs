@@ -2502,3 +2502,59 @@ fn adpcm_ima_alaw_mulaw_wave_formats_and_rejection() {
         );
     }
 }
+
+#[test]
+fn ms_adpcm_sustained_large_nibbles_bounds_delta_without_overflow() {
+    unsafe {
+        #[repr(C, packed(2))]
+        struct AdpcmWfx {
+            wfx: WAVEFORMATEX,
+            samples_per_block: u16,
+            num_coef: u16,
+            coefs: [(i16, i16); 2],
+        }
+        // 32-byte mono block: 7-byte header + 25 payload bytes = 50 nibbles -> 52 samples.
+        let hdr = AdpcmWfx {
+            wfx: WAVEFORMATEX {
+                wFormatTag: 0x0002,
+                nChannels: 1,
+                nSamplesPerSec: 44_100,
+                nAvgBytesPerSec: 22_050,
+                nBlockAlign: 32,
+                wBitsPerSample: 4,
+                cbSize: 12,
+            },
+            samples_per_block: 52,
+            num_coef: 2,
+            coefs: [(256, 0), (i16::MIN, i16::MIN)],
+        };
+        let fmt = parse_wave_format(&hdr.wfx).expect("MS-ADPCM format must parse");
+
+        // Sustained 0x77 nibbles (+7) with initial delta=32767: previously overflowed i32.
+        let mut blk_pos = Vec::with_capacity(32);
+        blk_pos.push(0u8);
+        blk_pos.extend_from_slice(&i16::MAX.to_le_bytes()); // delta = 32767
+        blk_pos.extend_from_slice(&i16::MAX.to_le_bytes()); // samp1 = 32767
+        blk_pos.extend_from_slice(&0i16.to_le_bytes()); // samp2 = 0
+        blk_pos.resize(32, 0x77);
+        let (out_pos, frames_pos) = decode_pcm_to_f32(&fmt, &blk_pos);
+        assert_eq!(frames_pos, 52);
+        assert_eq!(out_pos.len(), 52);
+        assert!(out_pos.iter().all(|s| s.is_finite() && (-1.0..=1.0).contains(s)));
+        // Positive nibbles saturate cleanly to +32767/32768 without wrapping negative.
+        assert!(out_pos[2..].iter().all(|&s| s > 0.99));
+
+        // Sustained 0x88 nibbles (-8, table factor 768) with extreme coefs (i16::MIN, i16::MIN)
+        // and extreme samp1/samp2 = i16::MIN must also decode cleanly without overflow.
+        let mut blk_neg = Vec::with_capacity(32);
+        blk_neg.push(1u8);
+        blk_neg.extend_from_slice(&i16::MAX.to_le_bytes());
+        blk_neg.extend_from_slice(&i16::MIN.to_le_bytes());
+        blk_neg.extend_from_slice(&i16::MIN.to_le_bytes());
+        blk_neg.resize(32, 0x88);
+        let (out_neg, frames_neg) = decode_pcm_to_f32(&fmt, &blk_neg);
+        assert_eq!(frames_neg, 52);
+        assert_eq!(out_neg.len(), 52);
+        assert!(out_neg.iter().all(|s| s.is_finite() && (-1.0..=1.0).contains(s)));
+    }
+}
