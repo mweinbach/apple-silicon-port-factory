@@ -8,6 +8,8 @@
 //! auto-reset wake event so arming/cancelling/re-arming waits never leaks OS
 //! threads, stacks, or waiter slots.
 
+mod cleanup;
+use cleanup::{Kind, Membership};
 use crate::handles;
 use crate::thread;
 use crate::types::*;
@@ -30,7 +32,7 @@ const MAX_POOL_WORKERS: usize = 32;
 const OVERFLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct PoolInner {
-    q: VecDeque<Job>,
+    q: VecDeque<(usize, Job)>,
     total_workers: usize,
     idle_workers: usize,
     min_workers: usize,
@@ -46,7 +48,7 @@ fn spawn_pool_worker(p: &'static Pool) -> std::io::Result<()> {
         let job = {
             let mut st = p.state.lock().unwrap();
             loop {
-                if let Some(j) = st.q.pop_front() {
+                if let Some((_, j)) = st.q.pop_front() {
                     break Some(j);
                 }
                 st.idle_workers += 1;
@@ -115,11 +117,29 @@ fn maybe_spawn_overflow(p: &'static Pool) {
     }
 }
 
-fn submit(job: Job) {
+fn submit(job: Job) { submit_for(0, job); }
+
+fn cancel_queued(owner: usize, pending: &Pending) -> usize {
+    let mut queue = pool().state.lock().unwrap();
+    let before = queue.q.len();
+    queue.q.retain(|(key, _)| *key != owner);
+    let removed = before - queue.q.len();
+    drop(queue);
+    if removed != 0 { pending.sub(removed); }
+    removed
+}
+
+fn submit_for(owner: usize, job: Job) {
+    enqueue(owner, job, || {});
+}
+
+fn enqueue(owner: usize, job: Job, on_enqueue: impl FnOnce()) {
     let p = pool();
     let should_spawn = {
         let mut st = p.state.lock().unwrap();
-        st.q.push_back(job);
+        // Publish automatic cleanup membership atomically with admission to the queue.
+        on_enqueue();
+        st.q.push_back((owner, job));
         let need_overflow = st.q.len() > st.idle_workers && st.total_workers < MAX_POOL_WORKERS;
         if need_overflow {
             st.total_workers += 1;
@@ -202,8 +222,11 @@ impl Pending {
         *self.n.lock().unwrap() += 1;
     }
     fn dec(&self) {
+        self.sub(1);
+    }
+    fn sub(&self, count: usize) {
         let mut n = self.n.lock().unwrap();
-        *n = n.saturating_sub(1);
+        *n -= count;
         if *n == 0 {
             self.cv.notify_all();
         }
@@ -231,59 +254,66 @@ unsafe fn clone_arc_from_raw<T>(ptr: *const T) -> Arc<T> {
 // ---------------------------------------------------------------------------
 
 pub struct TpWork {
-    cb: WorkCb,
+    cb: usize,
+    membership: Membership,
     ctx: SendPtr,
     pending: Pending,
 }
 
-pub unsafe extern "win64" fn CreateThreadpoolWork(cb: WorkCb, ctx: *mut c_void, _env: *mut c_void) -> *mut TpWork {
-    Arc::into_raw(Arc::new(TpWork { cb, ctx: SendPtr(ctx), pending: Pending::new() })) as *mut TpWork
+pub unsafe extern "win64" fn CreateThreadpoolWork(cb: WorkCb, ctx: *mut c_void, env: *mut c_void) -> *mut TpWork {
+    let work = Arc::new(TpWork { cb: cb as usize, ctx: SendPtr(ctx), pending: Pending::new(), membership: Membership::from_env(env) });
+    // Publish the guest's reference before the group can drain it.
+    let ptr = Arc::into_raw(work.clone()) as *mut TpWork;
+    work.membership.register(ptr as usize, Kind::Work, work.ctx);
+    ptr
+}
+
+unsafe fn enqueue_work(arc: Arc<TpWork>, automatic: bool) {
+    let addr = Arc::as_ptr(&arc) as usize;
+    let work = Arc::clone(&arc);
+    let job = Box::new(move || {
+        with_callback_instance(|inst| {
+            let handle = if automatic { 0 } else { addr as u64 };
+            crate::call_guest8(work.cb, inst as u64, work.ctx.0 as u64, handle, 0, 0, 0, 0, 0);
+        });
+        if automatic && work.membership.take(addr) {
+            drop(Arc::from_raw(addr as *const TpWork));
+        }
+        work.pending.dec();
+    });
+    enqueue(addr, job, || {
+        if automatic {
+            let ptr = Arc::into_raw(arc.clone());
+            arc.membership.register(ptr as usize, Kind::Simple, arc.ctx);
+        }
+    });
 }
 
 pub unsafe extern "win64" fn SubmitThreadpoolWork(w: *mut TpWork) {
-    if w.is_null() {
-        return;
+    if !w.is_null() {
+        let work = clone_arc_from_raw(w);
+        work.pending.inc();
+        enqueue_work(work, false);
     }
-    let arc = clone_arc_from_raw(w);
-    let raw = w as u64;
-    arc.pending.inc();
-    submit(Box::new(move || {
-        unsafe {
-            with_callback_instance(|inst| {
-                crate::call_guest8(arc.cb as usize, inst as u64, arc.ctx.0 as u64, raw, 0, 0, 0, 0, 0);
-            });
-        }
-        arc.pending.dec();
-    }));
 }
 
 pub unsafe extern "win64" fn WaitForThreadpoolWorkCallbacks(w: *mut TpWork, cancel: BOOL) {
-    if w.is_null() {
-        return;
+    if !w.is_null() {
+        if cancel != 0 { cancel_queued(w as usize, &(*w).pending); }
+        (*w).pending.wait_zero();
     }
-    if cancel != 0 {
-        log::debug!("WaitForThreadpoolWorkCallbacks: cancel of queued items not supported; waiting instead");
-    }
-    (*w).pending.wait_zero();
 }
 
 pub unsafe extern "win64" fn CloseThreadpoolWork(w: *mut TpWork) {
-    if !w.is_null() {
+    if !w.is_null() && (*w).membership.take(w as usize) {
         drop(Arc::from_raw(w));
     }
 }
 
-pub unsafe extern "win64" fn TrySubmitThreadpoolCallback(cb: SimpleCb, ctx: *mut c_void, _env: *mut c_void) -> BOOL {
-    let cb_addr = cb as usize;
-    let c = SendPtr(ctx);
-    submit(Box::new(move || {
-        let c = c;
-        unsafe {
-            with_callback_instance(|inst| {
-                crate::call_guest8(cb_addr, inst as u64, c.0 as u64, 0, 0, 0, 0, 0, 0);
-            });
-        }
-    }));
+pub unsafe extern "win64" fn TrySubmitThreadpoolCallback(cb: SimpleCb, ctx: *mut c_void, env: *mut c_void) -> BOOL {
+    let work = Arc::new(TpWork { cb: cb as usize, ctx: SendPtr(ctx), pending: Pending::new(), membership: Membership::from_env(env) });
+    work.pending.inc();
+    enqueue_work(work, true);
     TRUE
 }
 
@@ -304,6 +334,7 @@ pub unsafe extern "win64" fn QueueUserWorkItem(f: StartRoutine, ctx: *mut c_void
 // ---------------------------------------------------------------------------
 
 pub struct TpTimer {
+    membership: Membership,
     cb: WorkCb,
     ctx: SendPtr,
     pending: Pending,
@@ -378,6 +409,7 @@ fn fire_timer(tq: &TimerQueue, e: TimerEntry) {
         if !st.1 || e.timer.generation.load(Ordering::Acquire) != e.generation {
             return;
         }
+        e.timer.pending.inc();
         let period = st.0;
         if period > 0 {
             Some((e.due + Duration::from_millis(period as u64)).max(Instant::now()))
@@ -389,8 +421,7 @@ fn fire_timer(tq: &TimerQueue, e: TimerEntry) {
     let t_arc = Arc::clone(&e.timer);
     let raw = Arc::as_ptr(&t_arc) as u64;
     let gen = e.generation;
-    t_arc.pending.inc();
-    submit(Box::new(move || {
+    submit_for(raw as usize, Box::new(move || {
         if t_arc.generation.load(Ordering::Acquire) == gen {
             unsafe {
                 with_callback_instance(|inst| {
@@ -401,28 +432,30 @@ fn fire_timer(tq: &TimerQueue, e: TimerEntry) {
         t_arc.pending.dec();
     }));
     if let Some(due) = next_due {
-        if e.timer.generation.load(Ordering::Acquire) == e.generation {
-            let mut h = tq.heap.lock().unwrap();
-            if e.timer.generation.load(Ordering::Acquire) == e.generation {
-                h.push(TimerEntry { due, timer: e.timer, generation: e.generation });
-            }
+        let state = e.timer.state.lock().unwrap();
+        if state.1 && e.timer.generation.load(Ordering::Acquire) == e.generation {
+            tq.heap.lock().unwrap().push(TimerEntry { due, timer: e.timer.clone(), generation: e.generation });
         }
     }
 }
 
-fn create_timer_inner(cb: WorkCb, ctx: *mut c_void, owner: Option<Arc<dyn Any + Send + Sync>>) -> *mut TpTimer {
-    Arc::into_raw(Arc::new(TpTimer {
+fn create_timer_inner(cb: WorkCb, ctx: *mut c_void, membership: Membership, owner: Option<Arc<dyn Any + Send + Sync>>) -> *mut TpTimer {
+    let obj = Arc::new(TpTimer {
+        membership,
         cb,
         ctx: SendPtr(ctx),
         pending: Pending::new(),
         generation: AtomicU64::new(0),
         state: Mutex::new((0, false)),
         _owner: owner,
-    })) as *mut TpTimer
+    });
+    let ptr = Arc::into_raw(obj.clone()) as *mut TpTimer;
+    obj.membership.register(ptr as usize, Kind::Timer, obj.ctx);
+    ptr
 }
 
-pub unsafe extern "win64" fn CreateThreadpoolTimer(cb: WorkCb, ctx: *mut c_void, _env: *mut c_void) -> *mut TpTimer {
-    create_timer_inner(cb, ctx, None)
+pub unsafe extern "win64" fn CreateThreadpoolTimer(cb: WorkCb, ctx: *mut c_void, env: *mut c_void) -> *mut TpTimer {
+    create_timer_inner(cb, ctx, Membership::from_env(env), None)
 }
 
 /// `due`: FILETIME; negative = relative 100ns, positive = absolute UTC; NULL = cancel.
@@ -486,7 +519,7 @@ pub unsafe extern "win64" fn WaitForThreadpoolTimerCallbacks(t: *mut TpTimer, ca
 }
 
 pub unsafe extern "win64" fn CloseThreadpoolTimer(t: *mut TpTimer) {
-    if t.is_null() {
+    if t.is_null() || !(*t).membership.take(t as usize) {
         return;
     }
     let arc = Arc::from_raw(t);
@@ -505,6 +538,7 @@ pub unsafe extern "win64" fn CloseThreadpoolTimer(t: *mut TpTimer) {
 // ---------------------------------------------------------------------------
 
 pub struct TpWait {
+    membership: Membership,
     cb: WaitCb,
     ctx: SendPtr,
     pending: Pending,
@@ -526,7 +560,7 @@ struct WaitDispatcher {
 
 fn submit_wait_callback(wait: Arc<TpWait>, generation: u64, res: u32) {
     let raw = Arc::as_ptr(&wait) as u64;
-    submit(Box::new(move || {
+    submit_for(raw as usize, Box::new(move || {
         if wait.generation.load(Ordering::Acquire) == generation {
             unsafe {
                 with_callback_instance(|inst| {
@@ -678,18 +712,22 @@ fn disarm_wait(disp: &WaitDispatcher, ptr: *const TpWait) {
     }
 }
 
-fn create_wait_inner(cb: WaitCb, ctx: *mut c_void, owner: Option<Arc<dyn Any + Send + Sync>>) -> *mut TpWait {
-    Arc::into_raw(Arc::new(TpWait {
+fn create_wait_inner(cb: WaitCb, ctx: *mut c_void, membership: Membership, owner: Option<Arc<dyn Any + Send + Sync>>) -> *mut TpWait {
+    let obj = Arc::new(TpWait {
+        membership,
         cb,
         ctx: SendPtr(ctx),
         pending: Pending::new(),
         generation: AtomicU64::new(0),
         _owner: owner,
-    })) as *mut TpWait
+    });
+    let ptr = Arc::into_raw(obj.clone()) as *mut TpWait;
+    obj.membership.register(ptr as usize, Kind::Wait, obj.ctx);
+    ptr
 }
 
-pub unsafe extern "win64" fn CreateThreadpoolWait(cb: WaitCb, ctx: *mut c_void, _env: *mut c_void) -> *mut TpWait {
-    create_wait_inner(cb, ctx, None)
+pub unsafe extern "win64" fn CreateThreadpoolWait(cb: WaitCb, ctx: *mut c_void, env: *mut c_void) -> *mut TpWait {
+    create_wait_inner(cb, ctx, Membership::from_env(env), None)
 }
 
 pub unsafe extern "win64" fn SetThreadpoolWait(w: *mut TpWait, h: HANDLE, timeout: *const FILETIME) {
@@ -750,7 +788,7 @@ pub unsafe extern "win64" fn WaitForThreadpoolWaitCallbacks(w: *mut TpWait, canc
 }
 
 pub unsafe extern "win64" fn CloseThreadpoolWait(w: *mut TpWait) {
-    if w.is_null() {
+    if w.is_null() || !(*w).membership.take(w as usize) {
         return;
     }
     let arc = Arc::from_raw(w);
@@ -802,15 +840,13 @@ pub unsafe extern "win64" fn SetThreadpoolThreadMinimum(_p: *mut c_void, _n: u32
     TRUE
 }
 pub unsafe extern "win64" fn CreateThreadpoolCleanupGroup() -> *mut c_void {
-    Box::into_raw(Box::new(0u64)) as *mut c_void
+    Arc::into_raw(Arc::new(cleanup::Group::default())) as *mut c_void
 }
-pub unsafe extern "win64" fn CloseThreadpoolCleanupGroupMembers(_g: *mut c_void, _cancel: BOOL, _ctx: *mut c_void) {
-    stub!("cleanup groups do not track members");
+pub unsafe extern "win64" fn CloseThreadpoolCleanupGroupMembers(g: *mut c_void, cancel: BOOL, ctx: *mut c_void) {
+    if !g.is_null() { (*g.cast::<cleanup::Group>()).drain(cancel, ctx); }
 }
 pub unsafe extern "win64" fn CloseThreadpoolCleanupGroup(g: *mut c_void) {
-    if !g.is_null() {
-        drop(Box::from_raw(g as *mut u64));
-    }
+    if !g.is_null() { drop(Arc::from_raw(g.cast::<cleanup::Group>())); }
 }
 
 // ---------------------------------------------------------------------------
@@ -859,7 +895,7 @@ pub unsafe extern "win64" fn CreateTimerQueueTimer(
     });
     let ctx_ptr = Arc::as_ptr(&ctx) as *mut c_void;
     let owner: Arc<dyn std::any::Any + Send + Sync> = ctx.clone();
-    let tp = create_timer_inner(legacy_timer_trampoline, ctx_ptr, Some(owner));
+    let tp = create_timer_inner(legacy_timer_trampoline, ctx_ptr, Membership::default(), Some(owner));
     ctx.tp_timer.store(tp, Ordering::Release);
     let due_100ns = -((due_time as i64) * 10_000);
     let ft = FILETIME::from_u64(due_100ns as u64);
@@ -959,7 +995,7 @@ pub unsafe extern "win64" fn RegisterWaitForSingleObject(
     });
     let ctx_ptr = Arc::as_ptr(&ctx) as *mut c_void;
     let owner: Arc<dyn std::any::Any + Send + Sync> = ctx.clone();
-    let tp = create_wait_inner(legacy_wait_trampoline, ctx_ptr, Some(owner));
+    let tp = create_wait_inner(legacy_wait_trampoline, ctx_ptr, Membership::default(), Some(owner));
     ctx.tp_wait.store(tp, Ordering::Release);
     let ft;
     let p_ft = if milliseconds == INFINITE {
@@ -1023,6 +1059,7 @@ impl TpIoState {
 }
 
 pub struct TpIo {
+    membership: Membership,
     file: SendPtr,
     cb: usize,
     ctx: SendPtr,
@@ -1108,13 +1145,14 @@ pub unsafe extern "win64" fn CreateThreadpoolIo(
     fl: HANDLE,
     pfnio: *const c_void,
     pv: *mut c_void,
-    _pcbe: *mut c_void,
+    pcbe: *mut c_void,
 ) -> *mut TpIo {
     if fl.is_null() || fl == INVALID_HANDLE_VALUE || pfnio.is_null() {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
     let arc = Arc::new(TpIo {
+        membership: Membership::from_env(pcbe),
         file: SendPtr(fl),
         cb: pfnio as usize,
         ctx: SendPtr(pv),
@@ -1131,7 +1169,9 @@ pub unsafe extern "win64" fn CreateThreadpoolIo(
         crate::teb::set_last_error(e);
         return std::ptr::null_mut();
     }
-    Arc::into_raw(arc) as *mut TpIo
+    let ptr = Arc::into_raw(arc.clone()) as *mut TpIo;
+    arc.membership.register(ptr as usize, Kind::Io, arc.ctx);
+    ptr
 }
 
 pub unsafe extern "win64" fn StartThreadpoolIo(pio: *mut TpIo) {
@@ -1177,7 +1217,7 @@ pub unsafe extern "win64" fn WaitForThreadpoolIoCallbacks(pio: *mut TpIo, cancel
 }
 
 pub unsafe extern "win64" fn CloseThreadpoolIo(pio: *mut TpIo) {
-    if !pio.is_null() {
+    if !pio.is_null() && (*pio).membership.take(pio as usize) {
         let arc = Arc::from_raw(pio);
         crate::kernel32::file::unbind_threadpool_io(arc.file.0, &arc);
         drop(arc);

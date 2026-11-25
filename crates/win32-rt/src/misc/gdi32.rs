@@ -845,16 +845,22 @@ pub unsafe extern "win64" fn GetTextExtentPoint32A(hdc: usize, s: LPCSTR, n: i32
 }
 
 pub unsafe extern "win64" fn GetDeviceCaps(_hdc: usize, index: i32) -> i32 {
-    let mon = crate::user32::monitor::primary_rect();
+    let displays = crate::macos::display::get();
+    let primary = &displays.monitors[0];
+    let mon = primary.rect;
     match index {
+        0 => 0x400,                                                    // DRIVERVERSION
+        2 => 1,                                                        // DT_RASDISPLAY
+        16 | 18 => -1,                                                 // NUMBRUSHES, NUMPENS
+        38 => 1,                                                       // RASTERCAPS: RC_BITBLT
         8 | 118 => mon.width(),                                        // HORZRES, DESKTOPHORZRES
         10 | 117 => mon.height(),                                      // VERTRES, DESKTOPVERTRES
         12 => 32,                                                      // BITSPIXEL
         14 => 1,                                                       // PLANES
         88 | 90 => crate::user32::window::dpi() as i32,                // LOGPIXELSX/Y
-        116 => crate::macos::display::monitors()[0].refresh_hz as i32, // VREFRESH
-        4 => (mon.width() as f64 / 96.0 * 25.4) as i32,                // HORZSIZE (mm)
-        6 => (mon.height() as f64 / 96.0 * 25.4) as i32,               // VERTSIZE (mm)
+        116 => primary.refresh_hz as i32, // VREFRESH
+        4 => displays.primary_mm.map_or_else(|| (mon.width() as f64 / 96.0 * 25.4) as i32, |mm| mm.0),                // HORZSIZE (mm)
+        6 => displays.primary_mm.map_or_else(|| (mon.height() as f64 / 96.0 * 25.4) as i32, |mm| mm.1),               // VERTSIZE (mm)
         24 => -1,                                                      // NUMCOLORS (>8bpp)
         _ => {
             stub!("GetDeviceCaps({index}) -> 0");

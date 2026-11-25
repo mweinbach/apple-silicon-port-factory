@@ -64,6 +64,8 @@ pub struct ThreadObj {
     resume_cv: Condvar,
     pub pthread: AtomicUsize,
     pub priority: std::sync::atomic::AtomicI32,
+    /// Guest processor-group mask. Darwin schedules the pthread independently.
+    pub affinity: AtomicUsize,
     /// Current activity kind (`hitch::ActKind as u8`; 0 = idle). Lock-free for watchdog inspection.
     pub act_kind: AtomicU8,
     /// Monotonic timestamp (ns) when current activity began.
@@ -91,6 +93,7 @@ impl ThreadObj {
             resume_cv: Condvar::new(),
             pthread: AtomicUsize::new(0),
             priority: std::sync::atomic::AtomicI32::new(0),
+            affinity: AtomicUsize::new(crate::process::active_processor_mask()),
             act_kind: AtomicU8::new(0),
             act_start_ns: AtomicU64::new(0),
             act_arg: AtomicU64::new(0),

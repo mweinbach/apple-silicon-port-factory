@@ -1720,15 +1720,15 @@ pub unsafe extern "win64" fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> 
     const WIN_FIONBIO: u32 = 0x8004_667E;
     const WIN_FIONREAD: u32 = 0x4004_667F;
     const WIN_SIOCATMARK: u32 = 0x4004_7307;
-    let mut val = std::ptr::read_unaligned(argp) as i32;
     match cmd as u32 {
         WIN_FIONBIO => {
             if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
-                m.guest_nonblocking = val != 0;
+                m.guest_nonblocking = argp.read_unaligned() != 0;
             }
             return 0;
         }
         WIN_FIONREAD => {
+            let mut val = 0i32;
             if libc::ioctl(fd, libc::FIONREAD, &mut val) != 0 {
                 return err(last_errno_wsa(), SOCKET_ERROR);
             }
@@ -1736,6 +1736,7 @@ pub unsafe extern "win64" fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> 
             0
         }
         WIN_SIOCATMARK => {
+            let mut val = 0i32;
             if libc::ioctl(fd, libc::SIOCATMARK, &mut val) != 0 {
                 return err(last_errno_wsa(), SOCKET_ERROR);
             }
@@ -1996,8 +1997,8 @@ pub unsafe extern "win64" fn WSAIoctl(
     out_buf: *mut c_void,
     out_len: u32,
     bytes_returned: *mut u32,
-    _overlapped: *mut c_void,
-    _completion: *mut c_void,
+    overlapped: *mut c_void,
+    completion: *mut c_void,
 ) -> i32 {
     let Some(meta) = lookup_meta(s) else {
         return err(WSAENOTSOCK, SOCKET_ERROR);
@@ -2017,7 +2018,8 @@ pub unsafe extern "win64" fn WSAIoctl(
     if !bytes_returned.is_null() {
         std::ptr::write_unaligned(bytes_returned, 0);
     }
-    match io_control_code {
+    let mut transferred = 0;
+    let rc = match io_control_code {
         SIO_GET_EXTENSION_FUNCTION_POINTER => {
             if in_buf.is_null() || in_len < 16 || out_buf.is_null() || out_len < 8 {
                 return err(WSAEFAULT, SOCKET_ERROR);
@@ -2032,17 +2034,36 @@ pub unsafe extern "win64" fn WSAIoctl(
                 return err(WSAEOPNOTSUPP, SOCKET_ERROR);
             };
             std::ptr::write_unaligned(out_buf as *mut usize, thunk_va);
-            if !bytes_returned.is_null() {
-                std::ptr::write_unaligned(bytes_returned, std::mem::size_of::<usize>() as u32);
-            }
+            transferred = size_of::<usize>() as u32;
             0
         }
         SIO_KEEPALIVE_VALS => {
+            if meta.sock_type != libc::SOCK_STREAM {
+                return err(WSAEOPNOTSUPP, SOCKET_ERROR);
+            }
             if in_buf.is_null() || (in_len as usize) < std::mem::size_of::<WinTcpKeepalive>() {
                 return err(WSAEFAULT, SOCKET_ERROR);
             }
             let ka = std::ptr::read_unaligned(in_buf as *const WinTcpKeepalive);
             let on: i32 = i32::from(ka.onoff != 0);
+            if on != 0 {
+                let idle_secs = ka.keepalivetime.div_ceil(1000).max(1) as i32;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPALIVE,
+                    &idle_secs as *const i32 as *const c_void,
+                    std::mem::size_of::<i32>() as libc::socklen_t,
+                );
+                let intvl_secs = ka.keepaliveinterval.div_ceil(1000).max(1) as i32;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPINTVL,
+                    &intvl_secs as *const i32 as *const c_void,
+                    std::mem::size_of::<i32>() as libc::socklen_t,
+                );
+            }
             if libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
@@ -2052,24 +2073,6 @@ pub unsafe extern "win64" fn WSAIoctl(
             ) != 0
             {
                 return err(last_errno_wsa(), SOCKET_ERROR);
-            }
-            if on != 0 {
-                let idle_secs = ((ka.keepalivetime / 1000).max(1)) as i32;
-                let _ = libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPALIVE,
-                    &idle_secs as *const i32 as *const c_void,
-                    std::mem::size_of::<i32>() as libc::socklen_t,
-                );
-                let intvl_secs = ((ka.keepaliveinterval / 1000).max(1)) as i32;
-                let _ = libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPINTVL,
-                    &intvl_secs as *const i32 as *const c_void,
-                    std::mem::size_of::<i32>() as libc::socklen_t,
-                );
             }
             0
         }
@@ -2089,30 +2092,65 @@ pub unsafe extern "win64" fn WSAIoctl(
             );
             let ideal = (sndbuf.max(65536) as u32).min(4 * 1024 * 1024);
             std::ptr::write_unaligned(out_buf as *mut u32, ideal);
-            if !bytes_returned.is_null() {
-                std::ptr::write_unaligned(bytes_returned, 4);
-            }
+            transferred = 4;
             0
         }
-        SIO_GET_INTERFACE_LIST => wsa_ioctl_get_interface_list(out_buf, out_len, bytes_returned),
-        SIO_ADDRESS_LIST_QUERY => wsa_ioctl_address_list_query(meta.family, out_buf, out_len, bytes_returned),
+        SIO_GET_INTERFACE_LIST => {
+            let r = wsa_ioctl_get_interface_list(out_buf, out_len, &mut transferred);
+            if !bytes_returned.is_null() {
+                bytes_returned.write_unaligned(transferred);
+            }
+            r
+        }
+        SIO_ADDRESS_LIST_QUERY => {
+            let r = wsa_ioctl_address_list_query(meta.family, out_buf, out_len, &mut transferred);
+            if !bytes_returned.is_null() {
+                bytes_returned.write_unaligned(transferred);
+            }
+            r
+        }
         SIO_ROUTING_INTERFACE_QUERY => {
-            wsa_ioctl_routing_interface_query(in_buf, in_len, out_buf, out_len, bytes_returned)
+            let r = wsa_ioctl_routing_interface_query(in_buf, in_len, out_buf, out_len, &mut transferred);
+            if !bytes_returned.is_null() {
+                bytes_returned.write_unaligned(transferred);
+            }
+            r
         }
         WIN_FIONBIO if !in_buf.is_null() && in_len >= 4 => ioctlsocket(s, io_control_code as i32, in_buf as *mut u32),
         WIN_FIONREAD | WIN_SIOCATMARK if !out_buf.is_null() && out_len >= 4 => {
             let r = ioctlsocket(s, io_control_code as i32, out_buf as *mut u32);
-            if r == 0 && !bytes_returned.is_null() {
-                std::ptr::write_unaligned(bytes_returned, 4);
-            }
+            if r == 0 { transferred = 4; }
             r
         }
+        WIN_FIONREAD | WIN_FIONBIO => err(WSAEFAULT, SOCKET_ERROR),
         _ => {
             // Standard Winsock2 behavior for unrecognized or provider-unsupported IOCTL codes.
             log::debug!("WSAIoctl: unrecognized/unsupported code={io_control_code:#x} -> WSAEOPNOTSUPP");
             err(WSAEOPNOTSUPP, SOCKET_ERROR)
         }
+    };
+    if rc == 0 {
+        if !bytes_returned.is_null() {
+            bytes_returned.write_unaligned(transferred);
+        }
+        if !overlapped.is_null() {
+            let thread = (!completion.is_null()).then(crate::thread::ensure_current_thread_object);
+            let binding = lookup_io_completion_binding(s as HANDLE);
+            finish_overlapped_op(
+                s,
+                overlapped as usize,
+                completion as usize,
+                binding.as_deref(),
+                thread.as_ref(),
+                crate::teb::thread_id(),
+                STATUS_SUCCESS,
+                transferred as usize,
+                0,
+                true,
+            );
+        }
     }
+    rc
 }
 
 pub unsafe extern "win64" fn send(s: usize, buf: *const u8, len: i32, flags: i32) -> i32 {
@@ -2405,15 +2443,6 @@ unsafe fn sendmsg_bufs_from(
     libc::sendmsg(fd, &msg, pflags)
 }
 
-unsafe fn sendmsg_bufs(
-    fd: i32,
-    bufs: &[(usize, usize)],
-    pflags: i32,
-    to: Option<&(libc::sockaddr_storage, libc::socklen_t)>,
-) -> isize {
-    sendmsg_bufs_from(fd, bufs, 0, pflags, to)
-}
-
 enum OverlappedSendStep {
     Complete(usize),
     Pending,
@@ -2679,55 +2708,7 @@ pub unsafe extern "win64" fn WSASend(
     overlapped: *mut c_void,
     completion: *mut c_void,
 ) -> i32 {
-    let Some(meta) = lookup_meta(s) else {
-        return err(WSAENOTSOCK, SOCKET_ERROR);
-    };
-    let fd = meta.fd;
-    let bufs = match collect_wsa_bufs(buffers, count) {
-        Ok(b) => b,
-        Err(e) => return err(e, SOCKET_ERROR),
-    };
-    let pflags = win_msg_flags_to_posix(flags);
-    let mcast_dest = if !meta.connected { meta.mcast_dest } else { None };
-    if overlapped.is_null() {
-        let n = loop {
-            let r = sendmsg_bufs(fd, &bufs, pflags, mcast_dest.as_ref());
-            if r >= 0 {
-                break r;
-            }
-            let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
-            if raw_e == libc::EINTR {
-                continue;
-            }
-            if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
-                if let Err(we) = wait_socket_ready(fd, libc::POLLOUT, Some(libc::SO_SNDTIMEO)) {
-                    return err(errno_to_wsa(we), SOCKET_ERROR);
-                }
-                continue;
-            }
-            let wsa = errno_to_wsa(raw_e);
-            if wsa == WSAEWOULDBLOCK {
-                event_select_rearm_write(s);
-            }
-            return err(wsa, SOCKET_ERROR);
-        };
-        if !sent.is_null() {
-            std::ptr::write_unaligned(sent, n as u32);
-        }
-        return 0;
-    }
-
-    submit_overlapped_send(
-        s,
-        fd,
-        bufs,
-        sent,
-        meta.sock_type == libc::SOCK_STREAM,
-        pflags,
-        mcast_dest,
-        overlapped as *mut OVERLAPPED,
-        completion,
-    )
+    send_to(s, buffers, count, sent, flags, std::ptr::null(), 0, overlapped, completion)
 }
 
 pub unsafe extern "win64" fn WSASendTo(
@@ -2741,9 +2722,14 @@ pub unsafe extern "win64" fn WSASendTo(
     overlapped: *mut c_void,
     completion: *mut c_void,
 ) -> i32 {
-    if to.is_null() || tolen == 0 {
-        return WSASend(s, buffers, count, sent, flags, overlapped, completion);
-    }
+    send_to(s, buffers, count, sent, flags, to, tolen, overlapped, completion)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn send_to(
+    s: usize, buffers: *const WsaBuf, count: u32, sent: *mut u32, flags: u32, to: *const u8,
+    tolen: i32, overlapped: *mut c_void, completion: *mut c_void,
+) -> i32 {
     let Some(meta) = lookup_meta(s) else {
         return err(WSAENOTSOCK, SOCKET_ERROR);
     };
@@ -2757,16 +2743,20 @@ pub unsafe extern "win64" fn WSASendTo(
     let is_stream = meta.sock_type == libc::SOCK_STREAM;
     let dest = if is_stream {
         None
-    } else {
+    } else if !to.is_null() && tolen > 0 {
         match win_to_posix_sockaddr(to, tolen) {
             Ok(v) => Some(v),
             Err(e) => return err(e, SOCKET_ERROR),
         }
+    } else if !meta.connected {
+        meta.mcast_dest
+    } else {
+        None
     };
     let pflags = win_msg_flags_to_posix(flags);
     if overlapped.is_null() {
         let n = loop {
-            let r = sendmsg_bufs(fd, &bufs, pflags, dest.as_ref());
+            let r = sendmsg_bufs_from(fd, &bufs, 0, pflags, dest.as_ref());
             if r >= 0 {
                 break r;
             }
@@ -3843,17 +3833,18 @@ unsafe fn translate_win_cmsg_to_posix(win_buf: *const u8, win_len: usize) -> Vec
 }
 
 /// Convert Darwin `msghdr.msg_control` back into a Windows `WSAMSG.Control` buffer.
-/// Returns `(bytes_written, truncated)`.
+/// Returns `(bytes_written, truncated, extra_win_flags)`.
 unsafe fn translate_posix_cmsg_to_win(
     posix_msg: &libc::msghdr,
     win_buf: *mut u8,
     win_cap: usize,
-) -> (usize, bool) {
+) -> (usize, bool, u32) {
     if win_buf.is_null() || win_cap == 0 || posix_msg.msg_control.is_null() || posix_msg.msg_controllen == 0 {
-        return (0, false);
+        return (0, false, 0);
     }
     let mut off = 0usize;
     let mut truncated = (posix_msg.msg_flags & libc::MSG_CTRUNC) != 0;
+    let mut extra_flags = 0u32;
     let mut cmsg = libc::CMSG_FIRSTHDR(posix_msg);
     while !cmsg.is_null() {
         let level = (*cmsg).cmsg_level;
@@ -3866,6 +3857,12 @@ unsafe fn translate_posix_cmsg_to_win(
         let translated: Option<(i32, i32, Vec<u8>)> = match (level, ty) {
             (libc::IPPROTO_IP, libc::IP_PKTINFO) if data_len >= std::mem::size_of::<DarwinInPktinfo>() => {
                 let dar_pi = std::ptr::read_unaligned(data.as_ptr() as *const DarwinInPktinfo);
+                let ip = u32::from_be_bytes(dar_pi.ipi_addr);
+                if ip == u32::MAX {
+                    extra_flags |= WIN_MSG_BCAST;
+                } else if (ip >> 28) == 14 {
+                    extra_flags |= WIN_MSG_MCAST;
+                }
                 let win_pi = WinInPktinfo {
                     ipi_addr: dar_pi.ipi_addr,
                     ipi_ifindex: dar_pi.ipi_ifindex,
@@ -3897,6 +3894,9 @@ unsafe fn translate_posix_cmsg_to_win(
                 Some((WIN_IPPROTO_IP_CMSG, WIN_IP_TOS_CMSG, tos.to_ne_bytes().to_vec()))
             }
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) if data_len >= 20 => {
+                if data[0] == 0xff {
+                    extra_flags |= WIN_MSG_MCAST;
+                }
                 Some((WIN_IPPROTO_IPV6_CMSG, WIN_IPV6_PKTINFO_CMSG, data[..20].to_vec()))
             }
             (libc::IPPROTO_IPV6, libc::IPV6_HOPLIMIT) => {
@@ -3934,11 +3934,11 @@ unsafe fn translate_posix_cmsg_to_win(
         }
         cmsg = libc::CMSG_NXTHDR(posix_msg, cmsg);
     }
-    (off, truncated)
+    (off, truncated, extra_flags)
 }
 
-fn posix_recvmsg_flags_to_win(pflags: i32, ctrunc: bool) -> u32 {
-    let mut out = 0u32;
+fn posix_recvmsg_flags_to_win(pflags: i32, ctrunc: bool, extra_flags: u32) -> u32 {
+    let mut out = extra_flags;
     if (pflags & libc::MSG_OOB) != 0 {
         out |= WIN_MSG_OOB;
     }
@@ -3948,8 +3948,6 @@ fn posix_recvmsg_flags_to_win(pflags: i32, ctrunc: bool) -> u32 {
     if ctrunc || (pflags & libc::MSG_CTRUNC) != 0 {
         out |= WIN_MSG_CTRUNC;
     }
-    // Darwin <sys/socket.h> does not define MSG_BCAST / MSG_MCAST.
-    let _ = (WIN_MSG_BCAST, WIN_MSG_MCAST);
     out
 }
 
@@ -4032,18 +4030,21 @@ unsafe fn try_wsa_recvmsg_once(
         };
         return Ok((0, status, 0));
     }
-    let ctrunc = if want_ctrl {
-        let (written, trunc) = translate_posix_cmsg_to_win(&pmsg, wmsg.control.buf, wmsg.control.len as usize);
+    let (ctrunc, extra_flags) = if want_ctrl {
+        let (written, trunc, extra) =
+            translate_posix_cmsg_to_win(&pmsg, wmsg.control.buf, wmsg.control.len as usize);
         wmsg.control.len = written as u32;
-        trunc
+        (trunc, extra)
     } else {
-        false
+        (false, 0)
     };
-    let wsa_flags = posix_recvmsg_flags_to_win(pmsg.msg_flags, ctrunc);
+    let wsa_flags = posix_recvmsg_flags_to_win(pmsg.msg_flags, ctrunc, extra_flags);
     wmsg.dw_flags = wsa_flags;
     std::ptr::write_unaligned(lp_msg, wmsg);
 
-    let nt_status = if !is_stream && (pmsg.msg_flags & libc::MSG_TRUNC) != 0 {
+    let nt_status = if !is_stream
+        && ((pmsg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 || ctrunc)
+    {
         win32_to_ntstatus(WSAEMSGSIZE)
     } else {
         STATUS_SUCCESS
@@ -5511,9 +5512,9 @@ const WSAID_GETACCEPTEXSOCKADDRS: [u8; 16] = [
 const WSAID_WSARECVMSG: [u8; 16] = [
     0xc8, 0xd7, 0x89, 0xf6, 0x1f, 0x6f, 0x6b, 0x43, 0x8a, 0x53, 0xe5, 0x4f, 0xe3, 0x51, 0xc3, 0x22,
 ];
-/// WSAID_WSASENDMSG: {a441e712-754f-43ca-84a7-0d44cf606b92}
+/// WSAID_WSASENDMSG: {a441e712-754f-43ca-84a7-0dee44cf606d}
 const WSAID_WSASENDMSG: [u8; 16] = [
-    0x12, 0xe7, 0x41, 0xa4, 0x4f, 0x75, 0xca, 0x43, 0x84, 0xa7, 0x0d, 0x44, 0xcf, 0x60, 0x6b, 0x92,
+    0x12, 0xe7, 0x41, 0xa4, 0x4f, 0x75, 0xca, 0x43, 0x84, 0xa7, 0x0d, 0xee, 0x44, 0xcf, 0x60, 0x6d,
 ];
 
 fn lookup_extension_kind(guid: &[u8; 16]) -> Option<crate::WsaExtension> {
@@ -5528,9 +5529,9 @@ fn lookup_extension_kind(guid: &[u8; 16]) -> Option<crate::WsaExtension> {
     } else if guid == &WSAID_GETACCEPTEXSOCKADDRS {
         Some(crate::WsaExtension::GetAcceptExSockaddrs)
     } else if guid == &WSAID_WSARECVMSG {
-        Some(crate::WsaExtension::WSARecvMsg)
+        Some(crate::WsaExtension::RecvMsg)
     } else if guid == &WSAID_WSASENDMSG {
-        Some(crate::WsaExtension::WSASendMsg)
+        Some(crate::WsaExtension::SendMsg)
     } else {
         None
     }
@@ -5546,8 +5547,8 @@ pub fn wsa_extension_target(ext: crate::WsaExtension) -> usize {
         crate::WsaExtension::DisconnectEx => ext_disconnect_ex as *const () as usize,
         crate::WsaExtension::TransmitFile => ext_transmit_file as *const () as usize,
         crate::WsaExtension::GetAcceptExSockaddrs => ext_get_accept_ex_sockaddrs as *const () as usize,
-        crate::WsaExtension::WSARecvMsg => WSARecvMsg as *const () as usize,
-        crate::WsaExtension::WSASendMsg => WSASendMsg as *const () as usize,
+        crate::WsaExtension::RecvMsg => WSARecvMsg as *const () as usize,
+        crate::WsaExtension::SendMsg => WSASendMsg as *const () as usize,
     }
 }
 
@@ -11444,7 +11445,7 @@ mod tests {
                 crate::kernel32::time::SleepEx(20, TRUE);
             }
             assert_eq!(APC_CALLS.load(Ordering::Acquire), 1);
-            assert_eq!(APC_LAST_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(APC_LAST_ERR.load(Ordering::Acquire), WSAEMSGSIZE);
             assert_eq!(APC_LAST_BYTES.load(Ordering::Acquire), 11);
             assert_ne!(
                 APC_LAST_FLAGS.load(Ordering::Acquire) & WIN_MSG_CTRUNC,
@@ -11455,7 +11456,8 @@ mod tests {
             for _ in 0..2 {
                 let mut xfer = 0u32;
                 let mut fl = 0u32;
-                assert_eq!(WSAGetOverlappedResult(rx, &mut ov, &mut xfer, FALSE, &mut fl), TRUE);
+                assert_eq!(WSAGetOverlappedResult(rx, &mut ov, &mut xfer, FALSE, &mut fl), FALSE);
+                assert_eq!(WSAGetLastError(), WSAEMSGSIZE as i32);
                 assert_eq!(xfer, 11);
                 assert_ne!(
                     fl & WIN_MSG_CTRUNC,
@@ -11465,7 +11467,8 @@ mod tests {
             }
 
             // 2. Immediate overlapped WSARecvMsg (datagram already queued) with undersized control
-            //    buffer must also preserve WIN_MSG_CTRUNC in both APC arg4 and WSAGetOverlappedResult.
+            //    buffer fails synchronously with WSAEMSGSIZE and sets WIN_MSG_CTRUNC without
+            //    queuing a completion routine.
             send_dgram(b"ctrunc-imm");
             std::thread::sleep(std::time::Duration::from_millis(10));
             rmsg.control = WsaBuf { len: tiny_ctrl.len() as u32, buf: tiny_ctrl.as_mut_ptr() };
@@ -11478,17 +11481,13 @@ mod tests {
                     &mut ov as *mut _ as *mut c_void,
                     recvmsg_apc as *const () as *mut c_void,
                 ),
-                0
+                SOCKET_ERROR
             );
+            assert_eq!(WSAGetLastError(), WSAEMSGSIZE as i32);
             assert_eq!(recvd, 10);
+            assert_ne!(rmsg.dw_flags & WIN_MSG_CTRUNC, 0);
             crate::kernel32::time::SleepEx(0, TRUE);
-            assert_eq!(APC_CALLS.load(Ordering::Acquire), 2);
-            assert_ne!(APC_LAST_FLAGS.load(Ordering::Acquire) & WIN_MSG_CTRUNC, 0);
-            let mut xfer2 = 0u32;
-            let mut fl2 = 0u32;
-            assert_eq!(WSAGetOverlappedResult(rx, &mut ov, &mut xfer2, FALSE, &mut fl2), TRUE);
-            assert_eq!(xfer2, 10);
-            assert_ne!(fl2 & WIN_MSG_CTRUNC, 0);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 1);
 
             // 3. Reusing the same OVERLAPPED with a full 128-byte control buffer must clear flags to 0
             //    (no stale WIN_MSG_CTRUNC carried over).
@@ -11508,10 +11507,11 @@ mod tests {
             assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
             send_dgram(b"ctrl-ok");
             let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while APC_CALLS.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline2 {
+            while APC_CALLS.load(Ordering::Acquire) < 2 && std::time::Instant::now() < deadline2 {
                 crate::kernel32::time::SleepEx(20, TRUE);
             }
-            assert_eq!(APC_CALLS.load(Ordering::Acquire), 3);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 2);
+            assert_eq!(APC_LAST_ERR.load(Ordering::Acquire), 0);
             assert_eq!(APC_LAST_FLAGS.load(Ordering::Acquire), 0);
             assert_eq!(rmsg.dw_flags, 0);
             let mut xfer3 = 0u32;
