@@ -1848,3 +1848,146 @@ fn easy_gzip_large_buffer_streams_bounded_and_enforces_max_filesize() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn easy_upload_dispatches_progress_and_aborts_on_stalled_receiver() {
+    use super::easy::{
+        CURLE_ABORTED_BY_CALLBACK, CURLOPT_COPYPOSTFIELDS, CURLOPT_NOPROGRESS, CURLOPT_POST,
+        CURLOPT_POSTFIELDSIZE, CURLOPT_XFERINFODATA, CURLOPT_XFERINFOFUNCTION,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct UploadProg {
+        samples: Vec<(i64, i64)>,
+        abort_when_stalled: bool,
+        stalled_repeats: usize,
+    }
+
+    unsafe extern "win64" fn upload_prog_cb(
+        clientp: *mut c_void,
+        _dltotal: i64,
+        _dlnow: i64,
+        ultotal: i64,
+        ulnow: i64,
+    ) -> i32 {
+        let st = &mut *(clientp as *mut UploadProg);
+        let prev = st.samples.last().copied();
+        st.samples.push((ultotal, ulnow));
+        if st.abort_when_stalled {
+            if prev == Some((ultotal, ulnow)) && ulnow < ultotal {
+                st.stalled_repeats += 1;
+                if st.stalled_repeats >= 1 {
+                    return 1; // Abort stalled upload!
+                }
+            }
+        }
+        0
+    }
+
+    // Part 1: Successful 256 KiB POST dispatches initial (total, 0), intermediate (0 < ulnow < total),
+    // and final (total, total) progress samples monotonically.
+    let body1 = vec![b'P'; 256 * 1024];
+    let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr1 = listener1.local_addr().unwrap();
+    let srv1 = std::thread::spawn(move || {
+        let (mut sock, _) = listener1.accept().unwrap();
+        let (_h, b) = read_http_request(&mut sock);
+        assert_eq!(b.len(), 256 * 1024);
+        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    });
+
+    // Part 2: Stalled receiver (never reads) with a 4 MiB POST and NO CURLOPT_TIMEOUT must still
+    // invoke XFERINFOFUNCTION periodically on write timeouts and abort promptly.
+    let body2 = vec![b'S'; 4 * 1024 * 1024];
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    let release_srv2 = Arc::new(AtomicBool::new(false));
+    let release_srv2_bg = release_srv2.clone();
+    let srv2 = std::thread::spawn(move || {
+        let (_sock, _) = listener2.accept().unwrap();
+        // Deliberately do not read from `_sock` so the client's send buffer fills and stalls.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !release_srv2_bg.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    unsafe {
+        crate::register_native_va(
+            upload_prog_cb as *const () as u64,
+            upload_prog_cb as *const () as usize,
+        );
+
+        let easy1 = curl_easy_init();
+        let url1 = format!("http://{addr1}/upload\0");
+        let mut prog1 = UploadProg {
+            samples: Vec::new(),
+            abort_when_stalled: false,
+            stalled_repeats: 0,
+        };
+        assert_eq!(curl_easy_setopt(easy1, CURLOPT_URL, url1.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy1, CURLOPT_POST, 1), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy1, CURLOPT_POSTFIELDSIZE, body1.len()), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy1, CURLOPT_COPYPOSTFIELDS, body1.as_ptr() as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_setopt(easy1, CURLOPT_NOPROGRESS, 0), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy1, CURLOPT_XFERINFOFUNCTION, upload_prog_cb as *const () as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy1, CURLOPT_XFERINFODATA, &mut prog1 as *mut UploadProg as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_perform(easy1), CURLE_OK);
+        let want_total = body1.len() as i64;
+        assert_eq!(prog1.samples.first().copied(), Some((want_total, 0)));
+        assert!(
+            prog1.samples.iter().any(|&(t, n)| t == want_total && n > 0 && n < want_total),
+            "expected intermediate upload progress samples, got {:?}",
+            prog1.samples
+        );
+        assert_eq!(prog1.samples.last().copied(), Some((want_total, want_total)));
+        curl_easy_cleanup(easy1);
+
+        let easy2 = curl_easy_init();
+        let url2 = format!("http://{addr2}/stalled\0");
+        let mut prog2 = UploadProg {
+            samples: Vec::new(),
+            abort_when_stalled: true,
+            stalled_repeats: 0,
+        };
+        assert_eq!(curl_easy_setopt(easy2, CURLOPT_URL, url2.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy2, CURLOPT_POST, 1), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy2, CURLOPT_POSTFIELDSIZE, body2.len()), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy2, CURLOPT_COPYPOSTFIELDS, body2.as_ptr() as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_setopt(easy2, CURLOPT_NOPROGRESS, 0), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy2, CURLOPT_XFERINFOFUNCTION, upload_prog_cb as *const () as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy2, CURLOPT_XFERINFODATA, &mut prog2 as *mut UploadProg as usize),
+            CURLE_OK
+        );
+        let t0 = std::time::Instant::now();
+        assert_eq!(curl_easy_perform(easy2), CURLE_ABORTED_BY_CALLBACK);
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "stalled upload must abort promptly via periodic progress callbacks, took {:?}",
+            t0.elapsed()
+        );
+        assert!(prog2.stalled_repeats >= 1);
+        curl_easy_cleanup(easy2);
+    }
+
+    release_srv2.store(true, Ordering::Release);
+    srv1.join().unwrap();
+    srv2.join().unwrap();
+}

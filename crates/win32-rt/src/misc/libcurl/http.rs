@@ -1292,25 +1292,153 @@ pub(super) fn execute_http_transfer(
             );
         }
         total_request_size += wire_req.len() as i32;
-        total_size_upload = current_body.len() as i64;
+        let req_header_len = wire_req.len().saturating_sub(current_body.len());
+        let upload_total = current_body.len() as i64;
+        total_size_upload = 0;
 
+        // Dispatch initial upload progress before sending any request bytes so a caller
+        // uploading a body can observe (ultotal, 0) or abort before request I/O begins.
+        if sink.is_cancelled() {
+            return TransferOutcome {
+                code: CURLE_ABORTED_BY_CALLBACK,
+                error_msg: Some("Transfer cancelled".to_string()),
+                size_download: total_size_download,
+                size_upload: total_size_upload,
+                content_length_upload: upload_total,
+                total_time: start.elapsed().as_secs_f64(),
+                os_errno: 0,
+                ssl_verifyresult: 0,
+            };
+        }
+        if upload_total > 0 {
+            if let Err(code) = sink.on_progress(0, total_size_download, upload_total, 0) {
+                return TransferOutcome {
+                    code,
+                    error_msg: Some("Progress callback aborted transfer".to_string()),
+                    size_download: total_size_download,
+                    size_upload: total_size_upload,
+                    content_length_upload: upload_total,
+                    total_time: start.elapsed().as_secs_f64(),
+                    os_errno: 0,
+                    ssl_verifyresult: 0,
+                };
+            }
+        }
+
+        const UPLOAD_WRITE_CHUNK: usize = 64 * 1024;
         let mut written = 0usize;
         while written < wire_req.len() {
-            match stream.write(&wire_req[written..]) {
+            if sink.is_cancelled() {
+                return TransferOutcome {
+                    code: CURLE_ABORTED_BY_CALLBACK,
+                    error_msg: Some("Transfer cancelled".to_string()),
+                    size_download: total_size_download,
+                    size_upload: total_size_upload,
+                    content_length_upload: upload_total,
+                    total_time: start.elapsed().as_secs_f64(),
+                    os_errno: 0,
+                    ssl_verifyresult: 0,
+                };
+            }
+            let slice = match bounded_read_timeout(deadline) {
+                Ok(d) => d,
+                Err((code, msg, os_errno)) => {
+                    return TransferOutcome {
+                        code,
+                        error_msg: Some(msg),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: upload_total,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno,
+                        ssl_verifyresult: 0,
+                    };
+                }
+            };
+            let _ = stream.set_timeouts(Some(slice), Some(slice));
+            let end = (written + UPLOAD_WRITE_CHUNK).min(wire_req.len());
+            match stream.write(&wire_req[written..end]) {
                 Ok(0) => {
                     return TransferOutcome {
                         code: CURLE_SEND_ERROR,
                         error_msg: Some("Failed writing request: connection closed".to_string()),
                         size_download: total_size_download,
                         size_upload: total_size_upload,
-                        content_length_upload: current_body.len() as i64,
+                        content_length_upload: upload_total,
                         total_time: start.elapsed().as_secs_f64(),
                         os_errno: 0,
                         ssl_verifyresult: 0,
                     };
                 }
-                Ok(n) => written += n,
+                Ok(n) => {
+                    let prev_upload = total_size_upload;
+                    written += n;
+                    total_size_upload = written.saturating_sub(req_header_len) as i64;
+                    if total_size_upload > prev_upload {
+                        if let Err(code) = sink.on_progress(
+                            0,
+                            total_size_download,
+                            upload_total,
+                            total_size_upload,
+                        ) {
+                            return TransferOutcome {
+                                code,
+                                error_msg: Some("Progress callback aborted transfer".to_string()),
+                                size_download: total_size_download,
+                                size_upload: total_size_upload,
+                                content_length_upload: upload_total,
+                                total_time: start.elapsed().as_secs_f64(),
+                                os_errno: 0,
+                                ssl_verifyresult: 0,
+                            };
+                        }
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if let Err((code, msg, os_errno)) = remaining_timeout(deadline) {
+                        return TransferOutcome {
+                            code,
+                            error_msg: Some(msg),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    if sink.is_cancelled() {
+                        return TransferOutcome {
+                            code: CURLE_ABORTED_BY_CALLBACK,
+                            error_msg: Some("Transfer cancelled".to_string()),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno: 0,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    if let Err(code) =
+                        sink.on_progress(0, total_size_download, upload_total, total_size_upload)
+                    {
+                        return TransferOutcome {
+                            code,
+                            error_msg: Some("Progress callback aborted transfer".to_string()),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno: 0,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    continue;
+                }
                 Err(e) => {
                     let (code, msg, os_errno) = map_io_err(&e, CURLE_SEND_ERROR);
                     return TransferOutcome {
@@ -1318,7 +1446,7 @@ pub(super) fn execute_http_transfer(
                         error_msg: Some(format!("Failed sending HTTP request: {msg}")),
                         size_download: total_size_download,
                         size_upload: total_size_upload,
-                        content_length_upload: current_body.len() as i64,
+                        content_length_upload: upload_total,
                         total_time: start.elapsed().as_secs_f64(),
                         os_errno,
                         ssl_verifyresult: 0,
@@ -1326,7 +1454,85 @@ pub(super) fn execute_http_transfer(
                 }
             }
         }
-        let _ = stream.flush();
+        loop {
+            let slice = match bounded_read_timeout(deadline) {
+                Ok(d) => d,
+                Err((code, msg, os_errno)) => {
+                    return TransferOutcome {
+                        code,
+                        error_msg: Some(msg),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: upload_total,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno,
+                        ssl_verifyresult: 0,
+                    };
+                }
+            };
+            let _ = stream.set_timeouts(Some(slice), Some(slice));
+            match stream.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if let Err((code, msg, os_errno)) = remaining_timeout(deadline) {
+                        return TransferOutcome {
+                            code,
+                            error_msg: Some(msg),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    if sink.is_cancelled() {
+                        return TransferOutcome {
+                            code: CURLE_ABORTED_BY_CALLBACK,
+                            error_msg: Some("Transfer cancelled".to_string()),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno: 0,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    if let Err(code) =
+                        sink.on_progress(0, total_size_download, upload_total, total_size_upload)
+                    {
+                        return TransferOutcome {
+                            code,
+                            error_msg: Some("Progress callback aborted transfer".to_string()),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno: 0,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    let (code, msg, os_errno) = map_io_err(&e, CURLE_SEND_ERROR);
+                    return TransferOutcome {
+                        code,
+                        error_msg: Some(format!("Failed flushing HTTP request: {msg}")),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: upload_total,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno,
+                        ssl_verifyresult: 0,
+                    };
+                }
+            }
+        }
 
         // 5. Read response head (skipping 1xx interim responses except 101)
         let is_tls = stream.is_tls();
