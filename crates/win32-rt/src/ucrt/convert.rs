@@ -692,10 +692,6 @@ pub(super) fn wc_encode_slice_cp(cp: u32, units: &[u16]) -> Result<Vec<u8>, ()> 
     }
 }
 
-pub(super) fn wc_encode_slice(units: &[u16]) -> Result<Vec<u8>, ()> {
-    wc_encode_slice_cp(mb_cp(), units)
-}
-
 unsafe fn mbs_to_wcs(dst: *mut u16, src: *const u8, n: usize) -> usize {
     let bytes = crate::strings::cstr_slice(src);
     let mut out: Vec<u16> = Vec::new();

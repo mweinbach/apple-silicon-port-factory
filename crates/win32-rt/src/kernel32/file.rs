@@ -8672,10 +8672,10 @@ pub unsafe extern "win64" fn DeviceIoControl(
                     let mut d = [0u8; 28];
                     d[0..4].copy_from_slice(&28u32.to_le_bytes()); // Version
                     d[4..8].copy_from_slice(&28u32.to_le_bytes()); // Size
-                    d[8..12].copy_from_slice(&2u32.to_le_bytes()); // WriteCacheTypeWriteBack
-                    d[12..16].copy_from_slice(&1u32.to_le_bytes()); // WriteCacheEnableEnabled
-                    d[16..20].copy_from_slice(&0u32.to_le_bytes()); // WriteCacheChangeUnknown
-                    d[20..24].copy_from_slice(&1u32.to_le_bytes()); // WriteThroughSupported
+                    d[8..12].copy_from_slice(&2u32.to_le_bytes()); // WriteCacheTypeWriteBack (2)
+                    d[12..16].copy_from_slice(&2u32.to_le_bytes()); // WriteCacheEnabled (2)
+                    d[16..20].copy_from_slice(&0u32.to_le_bytes()); // WriteCacheChangeUnknown (0)
+                    d[20..24].copy_from_slice(&2u32.to_le_bytes()); // WriteThroughSupported (2)
                     d[24] = 1; // FlushCacheSupported
                     put(&d)
                 }
@@ -12295,6 +12295,15 @@ mod tests {
                 if prop == 1 {
                     assert_eq!((out.as_ptr().add(4) as *const u32).read_unaligned(), 32);
                     assert_ne!(out[24], 0, "STORAGE_ADAPTER_DESCRIPTOR.BusType at @24");
+                }
+                if prop == 4 {
+                    assert_eq!(ret, 28);
+                    assert_eq!((out.as_ptr().add(4) as *const u32).read_unaligned(), 28);
+                    assert_eq!((out.as_ptr().add(8) as *const u32).read_unaligned(), 2); // WriteCacheTypeWriteBack
+                    assert_eq!((out.as_ptr().add(12) as *const u32).read_unaligned(), 2); // WriteCacheEnabled
+                    assert_eq!((out.as_ptr().add(16) as *const u32).read_unaligned(), 0); // WriteCacheChangeUnknown
+                    assert_eq!((out.as_ptr().add(20) as *const u32).read_unaligned(), 2); // WriteThroughSupported
+                    assert_eq!(out[24], 1); // FlushCacheSupported
                 }
                 if prop == 13 {
                     assert_eq!(ret, 48);

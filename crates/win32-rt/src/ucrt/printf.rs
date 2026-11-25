@@ -942,8 +942,9 @@ pub unsafe extern "win64" fn __stdio_common_vfwprintf(
     loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
+    let cp = super::locale::locale_obj_cp(loc);
     match fmt_wide(opts, fmt, loc, va) {
-        Some(r) => super::stdio::write_stream_wide(stream, &r),
+        Some(r) => super::stdio::write_stream_wide_cp(stream, &r, cp),
         None => -1,
     }
 }
@@ -1318,6 +1319,63 @@ mod tests {
             );
 
             assert_eq!(libc::munmap(mem, page * 2), 0);
+
+            // 6. Explicit _locale_t is preserved through wide stream encoding (__stdio_common_vfwprintf{,_s}).
+            //    With global C locale and explicit de-DE (CP1252), L"€" encodes as 0x80 instead of EILSEQ.
+            crate::ucrt::locale::setlocale(0 /* LC_ALL */, b"C\0".as_ptr());
+            let dir = std::env::temp_dir().join(format!(
+                "win32rt_vfwprintf_loc_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            crate::path::add_mount("V:\\", &dir);
+            let fp = crate::ucrt::stdio::fopen(b"V:\\euro.txt\0".as_ptr(), b"wb\0".as_ptr());
+            assert!(!fp.is_null());
+            let loc_de_stream = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"de-DE\0".as_ptr());
+            assert!(!loc_de_stream.is_null());
+            let fmt_euro: Vec<u16> = "€\0".encode_utf16().collect();
+            let empty_va = [0u64; 1];
+            assert_eq!(
+                __stdio_common_vfwprintf(
+                    0,
+                    fp as *mut c_void,
+                    fmt_euro.as_ptr(),
+                    loc_de_stream,
+                    empty_va.as_ptr() as *const u8,
+                ),
+                1
+            );
+            assert_eq!(
+                __stdio_common_vfwprintf_s(
+                    0,
+                    fp as *mut c_void,
+                    fmt_euro.as_ptr(),
+                    loc_de_stream,
+                    empty_va.as_ptr() as *const u8,
+                ),
+                1
+            );
+            // Global C locale (loc = null) still rejects U+20AC with EILSEQ.
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vfwprintf(
+                    0,
+                    fp as *mut c_void,
+                    fmt_euro.as_ptr(),
+                    std::ptr::null_mut(),
+                    empty_va.as_ptr() as *const u8,
+                ),
+                -1
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EILSEQ);
+            assert_eq!(crate::ucrt::stdio::fclose(fp), 0);
+            crate::ucrt::locale::_free_locale(loc_de_stream);
+            assert_eq!(std::fs::read(dir.join("euro.txt")).unwrap(), vec![0x80, 0x80]);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

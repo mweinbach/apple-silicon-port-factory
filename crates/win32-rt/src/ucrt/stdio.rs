@@ -2321,10 +2321,11 @@ fn stream_is_unicode(fp: *mut FILE) -> bool {
     with_stream(fp as *mut c_void, |s| fd_info(s.fd).mode.is_unicode()).unwrap_or(false)
 }
 
-/// Write wide code units to a `FILE*` stream (used by `fputws` and `vfwprintf`).
+/// Write wide code units to a `FILE*` stream using an explicit `LC_CTYPE` code page
+/// (used by `_fwprintf_l` / `__stdio_common_vfwprintf*`).
 /// Unicode streams (`_O_WTEXT`/`_O_U16TEXT`/`_O_U8TEXT`) receive UTF-16LE bytes;
-/// narrow text/binary streams encode via the active CRT `LC_CTYPE` code page.
-pub unsafe fn write_stream_wide(fp: *mut c_void, units: &[u16]) -> i32 {
+/// narrow text/binary streams encode via `cp`.
+pub unsafe fn write_stream_wide_cp(fp: *mut c_void, units: &[u16], cp: u32) -> i32 {
     let _l = Locked::new();
     with_stream(fp, |st| {
         let bytes = if fd_info(st.fd).mode.is_unicode() {
@@ -2334,7 +2335,7 @@ pub unsafe fn write_stream_wide(fp: *mut c_void, units: &[u16]) -> i32 {
             }
             out
         } else {
-            match super::convert::wc_encode_slice(units) {
+            match super::convert::wc_encode_slice_cp(cp, units) {
                 Ok(b) => b,
                 Err(()) => {
                     st.err = true;
@@ -2350,6 +2351,13 @@ pub unsafe fn write_stream_wide(fp: *mut c_void, units: &[u16]) -> i32 {
         }
     })
     .unwrap_or(-1)
+}
+
+/// Write wide code units to a `FILE*` stream (used by `fputws`).
+/// Unicode streams (`_O_WTEXT`/`_O_U16TEXT`/`_O_U8TEXT`) receive UTF-16LE bytes;
+/// narrow text/binary streams encode via the active CRT `LC_CTYPE` code page.
+pub unsafe fn write_stream_wide(fp: *mut c_void, units: &[u16]) -> i32 {
+    write_stream_wide_cp(fp, units, super::locale::mb_cp())
 }
 
 pub unsafe extern "win64" fn fputwc(c: u16, fp: *mut FILE) -> u32 {
