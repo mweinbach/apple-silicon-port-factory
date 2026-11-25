@@ -2589,21 +2589,18 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    // Capture and validate all guest input buffers BEFORE acquiring `job_affinity_lock()`
+    // or `j.state`, so a `PAGE_GUARD` fault whose VEH re-enters job APIs cannot deadlock
+    // on either lock.
     let bytes = info as *const u8;
-    let updates_affinity = matches!(class, 2 | 9 | 14);
-    let _aff_guard = updates_affinity.then(|| crate::thread::defer_lock(job_affinity_lock()));
-    let other_aff = if updates_affinity {
-        other_self_jobs_affinity_constraint(&j)
-    } else {
-        Ok(None)
-    };
-    let other_prio = if matches!(class, 2 | 9) {
-        other_self_jobs_priority_constraint(&j)
-    } else {
-        Ok(None)
-    };
-    let mut st = crate::thread::defer_lock(&j.state);
-    match class {
+    enum SetJobInput {
+        BasicLimits([u8; 64]),
+        AssociateCompletionPort(usize, HANDLE),
+        ExtendedLimits([u8; 64]),
+        GroupIds(Vec<u16>),
+        GroupAffinities(Vec<[u8; 16]>, usize),
+    }
+    let parsed = match class {
         2 => {
             // JobObjectBasicLimitInformation (64 bytes on x64)
             if len != 64 {
@@ -2612,6 +2609,152 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             }
             let mut buf = [0u8; 64];
             std::ptr::copy_nonoverlapping(bytes, buf.as_mut_ptr(), 64);
+            SetJobInput::BasicLimits(buf)
+        }
+        4 => {
+            // JobObjectBasicUIRestrictions (4 bytes): accepting 0 (no restrictions) is truthful;
+            // non-zero UI restrictions are not enforced by user32.
+            if len != 4 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let mask = std::ptr::read_unaligned(bytes as *const u32);
+            if mask != 0 {
+                log::warn!("SetInformationJobObject(JobObjectBasicUIRestrictions, mask=0x{mask:x}): UI restrictions are not enforced");
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            return TRUE;
+        }
+        6 => {
+            // JobObjectEndOfJobTimeInformation (4 bytes): job time-limit expiry actions are not enforced.
+            if len != 4 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            log::warn!("SetInformationJobObject(JobObjectEndOfJobTimeInformation): end-of-job-time actions are not enforced");
+            set_err(err::ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
+        7 => {
+            // JobObjectAssociateCompletionPortInformation (16 bytes on x64):
+            // +0: PVOID CompletionKey, +8: HANDLE CompletionPort.
+            if len != 16 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let key = std::ptr::read_unaligned(bytes as *const usize);
+            let port = std::ptr::read_unaligned(bytes.add(8) as *const HANDLE);
+            SetJobInput::AssociateCompletionPort(key, port)
+        }
+        9 => {
+            // JobObjectExtendedLimitInformation (144 bytes on x64)
+            if len != 144 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let mut full = [0u8; 144];
+            std::ptr::copy_nonoverlapping(bytes, full.as_mut_ptr(), 144);
+            let mut basic = [0u8; 64];
+            basic.copy_from_slice(&full[..64]);
+            SetJobInput::ExtendedLimits(basic)
+        }
+        11 => {
+            // JobObjectGroupInformation (array of WORD group numbers)
+            if len == 0 || (len % 2) != 0 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let count = (len / 2) as usize;
+            let mut groups = Vec::with_capacity(count);
+            for i in 0..count {
+                let g = std::ptr::read_unaligned(bytes.add(i * 2) as *const u16);
+                if g != 0 {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+                groups.push(g);
+            }
+            SetJobInput::GroupIds(groups)
+        }
+        12 => {
+            // JobObjectNotificationLimitInformation (72 bytes on x64): threshold notifications
+            // are not enforced; return an honest unsupported failure rather than silently storing.
+            if len != 72 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            log::warn!("SetInformationJobObject(JobObjectNotificationLimitInformation): notification limits are not enforced");
+            set_err(err::ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
+        14 => {
+            // JobObjectGroupInformationEx (array of GROUP_AFFINITY, 16 bytes each)
+            if len == 0 || (len % 16) != 0 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let count = (len / 16) as usize;
+            let sm = system_affinity_mask();
+            let mut out = Vec::with_capacity(count);
+            let mut combined_mask = 0usize;
+            for i in 0..count {
+                let mut ga = [0u8; 16];
+                std::ptr::copy_nonoverlapping(bytes.add(i * 16), ga.as_mut_ptr(), 16);
+                let mask = usize::from_le_bytes(ga[0..8].try_into().unwrap());
+                let group = u16::from_le_bytes(ga[8..10].try_into().unwrap());
+                if group != 0 || mask == 0 || (mask & !sm) != 0 {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+                combined_mask |= mask;
+                out.push(ga);
+            }
+            SetJobInput::GroupAffinities(out, combined_mask)
+        }
+        15 => {
+            // JobObjectCpuRateControlInformation (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION: 8 bytes:
+            // DWORD ControlFlags + 4-byte union CpuRate/Weight/{MinRate,MaxRate}).
+            // Disabling (ControlFlags == 0) is truthful; enabling caps/weights is not enforced
+            // by the host scheduler and must fail honestly rather than pretending to cap CPU.
+            if len != 8 {
+                set_err(err::ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            let control_flags = std::ptr::read_unaligned(bytes as *const u32);
+            if control_flags != 0 {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectCpuRateControlInformation, flags=0x{control_flags:x}): CPU rate controls are not enforced on macOS/iOS"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            return TRUE;
+        }
+        _ => {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    };
+
+    let updates_affinity = matches!(
+        parsed,
+        SetJobInput::BasicLimits(_) | SetJobInput::ExtendedLimits(_) | SetJobInput::GroupAffinities(_, _)
+    );
+    let _aff_guard = updates_affinity.then(|| crate::thread::defer_lock(job_affinity_lock()));
+    let other_aff = if updates_affinity {
+        other_self_jobs_affinity_constraint(&j)
+    } else {
+        Ok(None)
+    };
+    let other_prio = if matches!(parsed, SetJobInput::BasicLimits(_) | SetJobInput::ExtendedLimits(_)) {
+        other_self_jobs_priority_constraint(&j)
+    } else {
+        Ok(None)
+    };
+    let mut st = crate::thread::defer_lock(&j.state);
+    match parsed {
+        SetJobInput::BasicLimits(buf) => {
             let flags = u32::from_le_bytes(buf[16..20].try_into().unwrap());
             if (flags & UNENFORCED_JOB_LIMIT_FLAGS) != 0 {
                 log::warn!(
@@ -2681,40 +2824,7 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             }
             TRUE
         }
-        4 => {
-            // JobObjectBasicUIRestrictions (4 bytes): accepting 0 (no restrictions) is truthful;
-            // non-zero UI restrictions are not enforced by user32.
-            if len != 4 {
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            let mask = std::ptr::read_unaligned(bytes as *const u32);
-            if mask != 0 {
-                log::warn!("SetInformationJobObject(JobObjectBasicUIRestrictions, mask=0x{mask:x}): UI restrictions are not enforced");
-                set_err(err::ERROR_NOT_SUPPORTED);
-                return FALSE;
-            }
-            TRUE
-        }
-        6 => {
-            // JobObjectEndOfJobTimeInformation (4 bytes): job time-limit expiry actions are not enforced.
-            if len != 4 {
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            log::warn!("SetInformationJobObject(JobObjectEndOfJobTimeInformation): end-of-job-time actions are not enforced");
-            set_err(err::ERROR_NOT_SUPPORTED);
-            FALSE
-        }
-        7 => {
-            // JobObjectAssociateCompletionPortInformation (16 bytes on x64):
-            // +0: PVOID CompletionKey, +8: HANDLE CompletionPort.
-            if len != 16 {
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            let key = std::ptr::read_unaligned(bytes as *const usize);
-            let port = std::ptr::read_unaligned(bytes.add(8) as *const HANDLE);
+        SetJobInput::AssociateCompletionPort(key, port) => {
             if port.is_null() {
                 st.completion_port = None;
                 return TRUE;
@@ -2740,14 +2850,7 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             st.completion_port = Some(cp);
             TRUE
         }
-        9 => {
-            // JobObjectExtendedLimitInformation (144 bytes on x64)
-            if len != 144 {
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            let mut basic = [0u8; 64];
-            std::ptr::copy_nonoverlapping(bytes, basic.as_mut_ptr(), 64);
+        SetJobInput::ExtendedLimits(basic) => {
             let flags = u32::from_le_bytes(basic[16..20].try_into().unwrap());
             if (flags & UNENFORCED_JOB_LIMIT_FLAGS) != 0 {
                 log::warn!(
@@ -2817,58 +2920,11 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             }
             TRUE
         }
-        11 => {
-            // JobObjectGroupInformation (array of WORD group numbers)
-            if len == 0 || (len % 2) != 0 {
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            let count = (len / 2) as usize;
-            let mut groups = Vec::with_capacity(count);
-            for i in 0..count {
-                let g = std::ptr::read_unaligned(bytes.add(i * 2) as *const u16);
-                if g != 0 {
-                    set_err(err::ERROR_INVALID_PARAMETER);
-                    return FALSE;
-                }
-                groups.push(g);
-            }
+        SetJobInput::GroupIds(groups) => {
             st.group_ids = groups;
             TRUE
         }
-        12 => {
-            // JobObjectNotificationLimitInformation (72 bytes on x64): threshold notifications
-            // are not enforced; return an honest unsupported failure rather than silently storing.
-            if len != 72 {
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            log::warn!("SetInformationJobObject(JobObjectNotificationLimitInformation): notification limits are not enforced");
-            set_err(err::ERROR_NOT_SUPPORTED);
-            FALSE
-        }
-        14 => {
-            // JobObjectGroupInformationEx (array of GROUP_AFFINITY, 16 bytes each)
-            if len == 0 || (len % 16) != 0 {
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            let count = (len / 16) as usize;
-            let sm = system_affinity_mask();
-            let mut out = Vec::with_capacity(count);
-            let mut combined_mask = 0usize;
-            for i in 0..count {
-                let mut ga = [0u8; 16];
-                std::ptr::copy_nonoverlapping(bytes.add(i * 16), ga.as_mut_ptr(), 16);
-                let mask = usize::from_le_bytes(ga[0..8].try_into().unwrap());
-                let group = u16::from_le_bytes(ga[8..10].try_into().unwrap());
-                if group != 0 || mask == 0 || (mask & !sm) != 0 {
-                    set_err(err::ERROR_INVALID_PARAMETER);
-                    return FALSE;
-                }
-                combined_mask |= mask;
-                out.push(ga);
-            }
+        SetJobInput::GroupAffinities(out, combined_mask) => {
             if (st.limit_flags() & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
                 let basic_aff = usize::from_le_bytes(st.basic_limits[48..56].try_into().unwrap());
                 if basic_aff != 0 && (basic_aff & combined_mask) == 0 {
@@ -2905,29 +2961,6 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 apply_job_affinity_limit(aff, allow_subset);
             }
             TRUE
-        }
-        15 => {
-            // JobObjectCpuRateControlInformation (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION: 8 bytes:
-            // DWORD ControlFlags + 4-byte union CpuRate/Weight/{MinRate,MaxRate}).
-            // Disabling (ControlFlags == 0) is truthful; enabling caps/weights is not enforced
-            // by the host scheduler and must fail honestly rather than pretending to cap CPU.
-            if len != 8 {
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            let control_flags = std::ptr::read_unaligned(bytes as *const u32);
-            if control_flags != 0 {
-                log::warn!(
-                    "SetInformationJobObject(JobObjectCpuRateControlInformation, flags=0x{control_flags:x}): CPU rate controls are not enforced on macOS/iOS"
-                );
-                set_err(err::ERROR_NOT_SUPPORTED);
-                return FALSE;
-            }
-            TRUE
-        }
-        _ => {
-            set_err(err::ERROR_INVALID_PARAMETER);
-            FALSE
         }
     }
 }
@@ -2975,7 +3008,9 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
         }
     };
     let out = info as *mut u8;
-    let st = crate::thread::defer_lock(&j.state);
+    // Snapshot all required job state under `j.state`, then drop the lock BEFORE touching
+    // guest pointers (`info` / `ret_len`) so a `PAGE_GUARD` fault whose VEH re-enters
+    // `QueryInformationJobObject` / `SetInformationJobObject` cannot deadlock on `j.state`.
     match class {
         1 => {
             // JobObjectBasicAccountingInformation (48 bytes):
@@ -2983,7 +3018,18 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
             // +16: ThisPeriodTotalUserTime (u64), +24: ThisPeriodTotalKernelTime (u64),
             // +32: TotalPageFaultCount (u32), +36: TotalProcesses (u32),
             // +40: ActiveProcesses (u32), +44: TotalTerminatedProcesses (u32).
-            if st.members.iter().any(|m| matches!(m, JobMember::Child(_))) {
+            let (has_child, self_assign_rusage, self_period_rusage, total_processes, active_count, total_terminated) = {
+                let st = crate::thread::defer_lock(&j.state);
+                (
+                    st.members.iter().any(|m| matches!(m, JobMember::Child(_))),
+                    st.self_assign_rusage,
+                    st.self_period_rusage,
+                    st.total_processes,
+                    st.active_count(),
+                    st.total_terminated,
+                )
+            };
+            if has_child {
                 // Per-child CPU/fault accounting is not aggregated across waitpid; fail honestly
                 // rather than omitting child resource usage.
                 put_ret(0);
@@ -2996,9 +3042,9 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
                 return FALSE;
             }
             std::ptr::write_bytes(out, 0, 48);
-            if let Some((u0, k0, f0)) = st.self_assign_rusage {
+            if let Some((u0, k0, f0)) = self_assign_rusage {
                 let (u_now, k_now, f_now) = self_rusage_snapshot();
-                let (pu0, pk0) = st.self_period_rusage.unwrap_or((u0, k0));
+                let (pu0, pk0) = self_period_rusage.unwrap_or((u0, k0));
                 std::ptr::write_unaligned(out.add(0) as *mut u64, u_now.saturating_sub(u0));
                 std::ptr::write_unaligned(out.add(8) as *mut u64, k_now.saturating_sub(k0));
                 std::ptr::write_unaligned(out.add(16) as *mut u64, u_now.saturating_sub(pu0));
@@ -3008,20 +3054,21 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
                     f_now.saturating_sub(f0).min(u32::MAX as u64) as u32,
                 );
             }
-            std::ptr::write_unaligned(out.add(36) as *mut u32, st.total_processes);
-            std::ptr::write_unaligned(out.add(40) as *mut u32, st.active_count());
-            std::ptr::write_unaligned(out.add(44) as *mut u32, st.total_terminated);
+            std::ptr::write_unaligned(out.add(36) as *mut u32, total_processes);
+            std::ptr::write_unaligned(out.add(40) as *mut u32, active_count);
+            std::ptr::write_unaligned(out.add(44) as *mut u32, total_terminated);
             put_ret(48);
             TRUE
         }
         2 => {
             // JobObjectBasicLimitInformation (64 bytes)
+            let basic = crate::thread::defer_lock(&j.state).basic_limits;
             if len < 64 {
                 put_ret(64);
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            std::ptr::copy_nonoverlapping(st.basic_limits.as_ptr(), out, 64);
+            std::ptr::copy_nonoverlapping(basic.as_ptr(), out, 64);
             put_ret(64);
             TRUE
         }
@@ -3032,7 +3079,10 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            let pids: Vec<usize> = st.members.iter().filter(|m| m.is_active()).map(|m| m.pid() as usize).collect();
+            let pids: Vec<usize> = {
+                let st = crate::thread::defer_lock(&j.state);
+                st.members.iter().filter(|m| m.is_active()).map(|m| m.pid() as usize).collect()
+            };
             let cap = ((len as usize) - 8) / std::mem::size_of::<usize>();
             let copy_n = pids.len().min(cap);
             std::ptr::write_unaligned(out as *mut u32, pids.len() as u32);
@@ -3076,7 +3126,15 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
         9 => {
             // JobObjectExtendedLimitInformation (144 bytes on x64).
             // Per Microsoft Learn, `IoInfo` (+64..112) is "Reserved for future use" and left zeroed.
-            if st.members.iter().any(|m| matches!(m, JobMember::Child(_))) {
+            let (has_child, basic, contains_self) = {
+                let st = crate::thread::defer_lock(&j.state);
+                (
+                    st.members.iter().any(|m| matches!(m, JobMember::Child(_))),
+                    st.basic_limits,
+                    st.contains_pid(std::process::id()),
+                )
+            };
+            if has_child {
                 // Per-child peak memory usage is not aggregated across child processes;
                 // fail honestly rather than reporting incomplete job/process peaks.
                 log::warn!("QueryInformationJobObject(JobObjectExtendedLimitInformation): child peak memory accounting is not available");
@@ -3090,8 +3148,8 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
                 return FALSE;
             }
             std::ptr::write_bytes(out, 0, 144);
-            std::ptr::copy_nonoverlapping(st.basic_limits.as_ptr(), out, 64);
-            let self_peak = if st.contains_pid(std::process::id()) {
+            std::ptr::copy_nonoverlapping(basic.as_ptr(), out, 64);
+            let self_peak = if contains_self {
                 task_memory().1 as usize
             } else {
                 0
@@ -3103,13 +3161,14 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
         }
         11 => {
             // JobObjectGroupInformation
-            let needed = (st.group_ids.len() * 2) as u32;
+            let group_ids = crate::thread::defer_lock(&j.state).group_ids.clone();
+            let needed = (group_ids.len() * 2) as u32;
             put_ret(needed);
             if len < needed {
                 set_err(err::ERROR_MORE_DATA);
                 return FALSE;
             }
-            for (i, &g) in st.group_ids.iter().enumerate() {
+            for (i, &g) in group_ids.iter().enumerate() {
                 std::ptr::write_unaligned(out.add(i * 2) as *mut u16, g);
             }
             TRUE
@@ -3122,12 +3181,15 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
         }
         14 => {
             // JobObjectGroupInformationEx
-            let entries: Vec<[u8; 16]> = if st.group_affinities.is_empty() {
-                let mut def = [0u8; 16];
-                def[0..8].copy_from_slice(&current_process_affinity_mask().to_le_bytes());
-                vec![def]
-            } else {
-                st.group_affinities.clone()
+            let entries: Vec<[u8; 16]> = {
+                let st = crate::thread::defer_lock(&j.state);
+                if st.group_affinities.is_empty() {
+                    let mut def = [0u8; 16];
+                    def[0..8].copy_from_slice(&current_process_affinity_mask().to_le_bytes());
+                    vec![def]
+                } else {
+                    st.group_affinities.clone()
+                }
             };
             let needed = (entries.len() * 16) as u32;
             put_ret(needed);
@@ -3272,15 +3334,17 @@ unsafe fn process_entry(h: HANDLE, out: *mut u8, first: bool, wide: bool) -> BOO
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let mut pos = s.proc_pos.lock().unwrap();
-    if first {
-        *pos = 0;
+    {
+        let mut pos = crate::thread::defer_lock(&s.proc_pos);
+        if first {
+            *pos = 0;
+        }
+        if (s.flags & TH32CS_SNAPPROCESS) == 0 || *pos >= 1 {
+            set_err(err::ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        *pos += 1;
     }
-    if (s.flags & TH32CS_SNAPPROCESS) == 0 || *pos >= 1 {
-        set_err(err::ERROR_NO_MORE_FILES);
-        return FALSE;
-    }
-    *pos += 1;
     let size = if wide { 568 } else { 304 };
     std::ptr::write_bytes(out.add(4), 0, size - 4);
     (out.add(8) as *mut u32).write_unaligned(std::process::id());
@@ -3321,15 +3385,18 @@ unsafe fn thread_entry(h: HANDLE, out: *mut u8, first: bool) -> BOOL {
         set_err(24); // ERROR_BAD_LENGTH
         return FALSE;
     }
-    let mut pos = s.thread_pos.lock().unwrap();
-    if first {
-        *pos = 0;
-    }
-    let Some(&(tid, base_pri)) = s.threads.get(*pos) else {
-        set_err(err::ERROR_NO_MORE_FILES);
-        return FALSE;
+    let (tid, base_pri) = {
+        let mut pos = crate::thread::defer_lock(&s.thread_pos);
+        if first {
+            *pos = 0;
+        }
+        let Some(&entry) = s.threads.get(*pos) else {
+            set_err(err::ERROR_NO_MORE_FILES);
+            return FALSE;
+        };
+        *pos += 1;
+        entry
     };
-    *pos += 1;
     // THREADENTRY32 (28 bytes):
     // +0x00 dwSize, +0x04 cntUsage, +0x08 th32ThreadID, +0x0C th32OwnerProcessID,
     // +0x10 tpBasePri, +0x14 tpDeltaPri, +0x18 dwFlags
@@ -3365,15 +3432,20 @@ unsafe fn module_entry(h: HANDLE, out: *mut u8, first: bool, wide: bool) -> BOOL
         set_err(24); // ERROR_BAD_LENGTH
         return FALSE;
     }
-    let mut pos = s.mod_pos.lock().unwrap();
-    if first {
-        *pos = 0;
-    }
-    let Some((base, size, path)) = s.modules.get(*pos) else {
-        set_err(err::ERROR_NO_MORE_FILES);
-        return FALSE;
+    let idx = {
+        let mut pos = crate::thread::defer_lock(&s.mod_pos);
+        if first {
+            *pos = 0;
+        }
+        if *pos >= s.modules.len() {
+            set_err(err::ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        let cur = *pos;
+        *pos += 1;
+        cur
     };
-    *pos += 1;
+    let (base, size, path) = &s.modules[idx];
     std::ptr::write_bytes(out.add(4), 0, (expected as usize) - 4);
     // Win64 MODULEENTRY32 / MODULEENTRY32W:
     // +0x00 dwSize, +0x04 th32ModuleID, +0x08 th32ProcessID,

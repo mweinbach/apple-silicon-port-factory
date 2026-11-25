@@ -2594,4 +2594,105 @@ mod tests {
             assert_eq!(memory::VirtualFree(ww, 0, MEM_RELEASE), 1);
         }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn job_query_and_set_with_page_guard_reentrant_veh_do_not_deadlock() {
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+        use win32_rt::kernel32::memory::{self, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_READWRITE};
+        use win32_rt::kernel32::process::{CreateJobObjectW, QueryInformationJobObject, SetInformationJobObject};
+        use win32_rt::kernel32::threads::CloseHandle;
+        use win32_rt::types::HANDLE;
+
+        static VEH_JOB: AtomicUsize = AtomicUsize::new(0);
+        static VEH_HITS: AtomicU32 = AtomicU32::new(0);
+        static VEH_NESTED_LIMIT: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn reentrant_job_veh(ptrs: *mut [*mut std::ffi::c_void; 2]) -> i32 {
+            let rec = (*ptrs)[0] as *const u32;
+            let code = rec.read_unaligned();
+            if code != win32_rt::unwind::STATUS_GUARD_PAGE_VIOLATION {
+                return 0; // EXCEPTION_CONTINUE_SEARCH
+            }
+            let h = VEH_JOB.load(Ordering::Acquire) as HANDLE;
+            if !h.is_null() {
+                let mut nested = [0u8; 64];
+                let mut ret = 0u32;
+                let ok = QueryInformationJobObject(
+                    h,
+                    2,
+                    nested.as_mut_ptr() as *mut std::ffi::c_void,
+                    64,
+                    &mut ret,
+                );
+                assert_eq!(ok, 1, "re-entrant QueryInformationJobObject from VEH must not deadlock");
+                assert_eq!(ret, 64);
+                let lim = u32::from_le_bytes(nested[20..24].try_into().unwrap());
+                VEH_NESTED_LIMIT.store(lim, Ordering::Release);
+                VEH_HITS.fetch_add(1, Ordering::AcqRel);
+            }
+            -1 // EXCEPTION_CONTINUE_EXECUTION
+        }
+
+        install_handlers();
+        unsafe {
+            let _ = win32_rt::teb::current();
+            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            assert!(!job.is_null());
+            VEH_JOB.store(job as usize, Ordering::Release);
+            VEH_HITS.store(0, Ordering::Release);
+            VEH_NESTED_LIMIT.store(0, Ordering::Release);
+
+            // Seed basic limits: JOB_OBJECT_LIMIT_ACTIVE_PROCESS (0x8), limit = 3.
+            let mut init_buf = [0u8; 64];
+            init_buf[16..20].copy_from_slice(&0x8u32.to_le_bytes());
+            init_buf[20..24].copy_from_slice(&3u32.to_le_bytes());
+            assert_eq!(
+                SetInformationJobObject(job, 2, init_buf.as_ptr() as *const std::ffi::c_void, 64),
+                1
+            );
+
+            let veh = win32_rt::unwind::AddVectoredExceptionHandler(1, reentrant_job_veh);
+            assert!(!veh.is_null());
+
+            let buf = memory::VirtualAlloc(std::ptr::null_mut(), 0x4000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!buf.is_null());
+
+            // 1. Query into a PAGE_GUARD output buffer: VEH re-enters QueryInformationJobObject
+            //    on the same job handle without deadlocking on `j.state`.
+            let mut old = 0u32;
+            assert_eq!(memory::VirtualProtect(buf, 0x4000, PAGE_READWRITE | PAGE_GUARD, &mut old), 1);
+            let mut ret = 0u32;
+            assert_eq!(QueryInformationJobObject(job, 2, buf, 64, &mut ret), 1);
+            assert_eq!(ret, 64);
+            assert_eq!(VEH_HITS.load(Ordering::Acquire), 1);
+            assert_eq!(VEH_NESTED_LIMIT.load(Ordering::Acquire), 3);
+            let got = std::slice::from_raw_parts(buf as *const u8, 64);
+            assert_eq!(u32::from_le_bytes(got[16..20].try_into().unwrap()), 0x8);
+            assert_eq!(u32::from_le_bytes(got[20..24].try_into().unwrap()), 3);
+
+            // 2. Set from a PAGE_GUARD input buffer: VEH re-enters QueryInformationJobObject
+            //    while `SetInformationJobObject` has not yet acquired `j.state` or `job_affinity_lock`.
+            std::ptr::write_bytes(buf as *mut u8, 0, 64);
+            std::ptr::copy_nonoverlapping(0x8u32.to_le_bytes().as_ptr(), (buf as *mut u8).add(16), 4);
+            std::ptr::copy_nonoverlapping(5u32.to_le_bytes().as_ptr(), (buf as *mut u8).add(20), 4);
+            assert_eq!(memory::VirtualProtect(buf, 0x4000, PAGE_READWRITE | PAGE_GUARD, &mut old), 1);
+            assert_eq!(SetInformationJobObject(job, 2, buf as *const std::ffi::c_void, 64), 1);
+            assert_eq!(VEH_HITS.load(Ordering::Acquire), 2);
+            assert_eq!(VEH_NESTED_LIMIT.load(Ordering::Acquire), 3);
+
+            // Confirm the new limit (5) was applied.
+            let mut verify = [0u8; 64];
+            assert_eq!(
+                QueryInformationJobObject(job, 2, verify.as_mut_ptr() as *mut std::ffi::c_void, 64, &mut ret),
+                1
+            );
+            assert_eq!(u32::from_le_bytes(verify[20..24].try_into().unwrap()), 5);
+
+            VEH_JOB.store(0, Ordering::Release);
+            win32_rt::unwind::RemoveVectoredExceptionHandler(veh);
+            assert_eq!(memory::VirtualFree(buf, 0, MEM_RELEASE), 1);
+            assert_eq!(CloseHandle(job), 1);
+        }
+    }
 }
