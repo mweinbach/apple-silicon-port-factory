@@ -1899,6 +1899,10 @@ pub(super) fn control_destroy(hwnd: usize) {
             if is_control_first_responder(&ctrl, &p.window) {
                 p.window.makeFirstResponder(Some(&p.view));
             }
+            let any_left = CONTROLS.with(|m| m.borrow().values().any(|c| c.parent_hwnd == ctrl.parent_hwnd));
+            if !any_left {
+                p.has_controls.set(false);
+            }
         });
         ctrl.view.root_view().removeFromSuperview();
     }
@@ -2511,11 +2515,35 @@ pub(super) fn sync_focused_edit_selection(ev: &NSEvent, mtm: MainThreadMarker) {
     }
 }
 
-/// True when the event targets one of our windows that hosts native child controls.
-pub(super) fn window_has_native_controls(ev: &NSEvent, mtm: MainThreadMarker) -> bool {
+/// True when a wheel event lands on a visible, enabled scrollable native child
+/// control (`MultiLineEdit` / `NSScrollView`) so AppKit handles scrolling only
+/// for that control while non-scrollable areas keep Win32 `WM_MOUSEWHEEL`.
+pub(super) fn wheel_targets_native_control(ev: &NSEvent, mtm: MainThreadMarker) -> bool {
     let Some(win) = ev.window(mtm) else { return false };
-    let Some(hwnd) = hwnd_for_window(&win) else { return false };
-    with_win(hwnd, |w| w.has_controls.get()).unwrap_or(false)
+    let Some(parent_hwnd) = hwnd_for_window(&win) else { return false };
+    if !with_win(parent_hwnd, |w| w.has_controls.get()).unwrap_or(false) {
+        return false;
+    }
+    let loc = ev.locationInWindow();
+    CONTROLS.with(|m| {
+        m.borrow().values().any(|c| {
+            if c.parent_hwnd != parent_hwnd {
+                return false;
+            }
+            match &c.view {
+                NativeControlView::MultiLineEdit { scroll, enabled, .. } => {
+                    enabled.get() && !scroll.isHidden() && {
+                        let f = scroll.frame();
+                        loc.x >= f.origin.x
+                            && loc.x <= f.origin.x + f.size.width
+                            && loc.y >= f.origin.y
+                            && loc.y <= f.origin.y + f.size.height
+                    }
+                }
+                _ => false,
+            }
+        })
+    })
 }
 
 /// If a left mouse-down lands on a visible `SS_NOTIFY` `STATIC` control, queue `STN_CLICKED`.

@@ -100,7 +100,7 @@ pub(super) fn handle(app: &NSApplication, ev: &NSEvent, mtm: MainThreadMarker) {
             }
         }
         NSEventType::ScrollWheel => {
-            if super::appkit::window_has_native_controls(ev, mtm) {
+            if super::appkit::wheel_targets_native_control(ev, mtm) {
                 app.sendEvent(ev);
                 return;
             }

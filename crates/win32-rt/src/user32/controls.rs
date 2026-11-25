@@ -461,8 +461,13 @@ pub fn native_button_clicked(hwnd: usize, native_check_state: Option<u32>) {
     let Some(w) = window::get(hwnd) else { return };
     let Some(q) = message::queue_of(w.tid) else { return };
     q.call(move || {
-        let enabled = window::get(hwnd).is_some_and(|w| w.data().enabled);
-        if enabled {
+        if !window::effective_child_enabled(hwnd) || !window::effective_child_visible(hwnd) {
+            return;
+        }
+        if input::focus_window() != hwnd {
+            input::set_focus(hwnd);
+        }
+        if window::effective_child_enabled(hwnd) {
             activate_button_click(hwnd, native_check_state);
         }
     });
@@ -484,7 +489,7 @@ pub fn native_edit_text_changed(hwnd: usize, text: String, sel_start: usize, sel
             let d = w.data();
             (d.style, d.native_control, d.text.clone())
         };
-        if (style & ES_READONLY) != 0 {
+        if (style & ES_READONLY) != 0 || !window::effective_child_enabled(hwnd) {
             return;
         }
         let next_units: Vec<u16> = text.encode_utf16().collect();
@@ -560,10 +565,9 @@ pub fn native_static_clicked(hwnd: usize) {
     let Some(w) = window::get(hwnd) else { return };
     let Some(q) = message::queue_of(w.tid) else { return };
     q.call(move || {
-        let should_notify = window::get(hwnd).is_some_and(|w| {
-            let d = w.data();
-            d.enabled && (d.style & SS_NOTIFY) != 0
-        });
+        let should_notify = window::effective_child_enabled(hwnd)
+            && window::effective_child_visible(hwnd)
+            && window::get(hwnd).is_some_and(|w| (w.data().style & SS_NOTIFY) != 0);
         if should_notify {
             notify_parent_command(hwnd, STN_CLICKED);
         }
@@ -1067,7 +1071,7 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
             let insert = if lparam == 0 {
                 Vec::new()
             } else {
-                crate::strings::wide_slice(lparam as *const u16).to_vec()
+                crate::strings::wide_vec_unaligned(lparam as *const u16)
             };
             edit_replace_selection(h, &insert, false);
             0
@@ -2512,6 +2516,147 @@ mod tests {
             });
             assert!(ops.is_empty());
             assert_eq!(SendMessageW(multiline_edit, wm::EM_GETPASSWORDCHAR, 0, 0), 0);
+
+            // 6. EM_REPLACESEL must safely read odd-addressed (unaligned) UTF-16 guest buffers.
+            let mut raw = [0u8; 32];
+            let payload = crate::strings::to_wide_z("XYZ");
+            for (i, unit) in payload.iter().enumerate() {
+                let bytes = unit.to_le_bytes();
+                raw[1 + i * 2] = bytes[0];
+                raw[1 + i * 2 + 1] = bytes[1];
+            }
+            let odd_ptr = raw.as_ptr().add(1);
+            assert_eq!((odd_ptr as usize) % 2, 1, "pointer must be odd-addressed");
+            SendMessageW(edit, wm::EM_SETSEL, 0, -1);
+            SendMessageW(edit, wm::EM_REPLACESEL, 0, odd_ptr as LPARAM);
+            let n = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "XYZ");
+
+            // 7. Clicking a native BUTTON synchronizes Win32 focus before BN_CLICKED.
+            let btn = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("BUTTON").as_ptr(),
+                crate::strings::to_wide_z("Click Me").as_ptr(),
+                ws::CHILD | ws::VISIBLE | BS_PUSHBUTTON,
+                10,
+                170,
+                100,
+                28,
+                parent,
+                503,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!btn.is_null());
+            window::get(btn as usize).unwrap().data().native_control = true;
+            super::super::input::SetFocus(edit);
+            assert_eq!(super::super::input::GetFocus(), edit);
+            COMMAND_LOG.lock().unwrap().clear();
+            native_button_clicked(btn as usize, None);
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            assert_eq!(super::super::input::GetFocus(), btn);
+            assert_eq!(
+                *COMMAND_LOG.lock().unwrap(),
+                vec![
+                    (501, EN_KILLFOCUS as u16, edit as usize),
+                    (503, BN_CLICKED as u16, btn as usize),
+                ]
+            );
+
+            // 8. Disabling a child container propagates effective enabled state to native descendants
+            //    while preserving each child's own enabled flag and blocking native clicks/edits.
+            let container = CreateWindowExW(
+                0,
+                parent_cls.as_ptr(),
+                std::ptr::null(),
+                ws::CHILD | ws::VISIBLE,
+                220,
+                10,
+                160,
+                160,
+                parent,
+                510,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let nested_btn = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("BUTTON").as_ptr(),
+                crate::strings::to_wide_z("Nested").as_ptr(),
+                ws::CHILD | ws::VISIBLE | BS_PUSHBUTTON,
+                8,
+                8,
+                100,
+                28,
+                container,
+                511,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let individually_disabled = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("BUTTON").as_ptr(),
+                crate::strings::to_wide_z("Off").as_ptr(),
+                ws::CHILD | ws::VISIBLE | ws::DISABLED | BS_PUSHBUTTON,
+                8,
+                44,
+                100,
+                28,
+                container,
+                512,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let nested_edit = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("keep").as_ptr(),
+                ws::CHILD | ws::VISIBLE,
+                8,
+                80,
+                120,
+                24,
+                container,
+                513,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!container.is_null() && !nested_btn.is_null() && !individually_disabled.is_null() && !nested_edit.is_null());
+            window::get(nested_btn as usize).unwrap().data().native_control = true;
+            window::get(individually_disabled as usize).unwrap().data().native_control = true;
+            window::get(nested_edit as usize).unwrap().data().native_control = true;
+
+            let (_, ops) = capture_control_ops(|| {
+                EnableWindow(container, FALSE);
+            });
+            assert!(ops.contains(&RecordedControlOp::SetEnabled(nested_btn as usize, false)));
+            assert!(ops.contains(&RecordedControlOp::SetEnabled(individually_disabled as usize, false)));
+            assert!(ops.contains(&RecordedControlOp::SetEnabled(nested_edit as usize, false)));
+            // Own IsWindowEnabled state of nested_btn stays TRUE, while effective state is false.
+            assert_eq!(window::IsWindowEnabled(nested_btn), TRUE);
+            assert!(!window::effective_child_enabled(nested_btn as usize));
+            assert!(!window::effective_child_enabled(nested_edit as usize));
+
+            // Native clicks and edits inside the disabled container are ignored.
+            COMMAND_LOG.lock().unwrap().clear();
+            native_button_clicked(nested_btn as usize, None);
+            native_edit_text_changed(nested_edit as usize, "mutated".to_string(), 7, 7);
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            assert!(COMMAND_LOG.lock().unwrap().is_empty());
+            let n = GetWindowTextW(nested_edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "keep");
+
+            // Re-enabling the container re-enables nested_btn and nested_edit,
+            // while individually_disabled stays disabled.
+            let (_, ops) = capture_control_ops(|| {
+                EnableWindow(container, TRUE);
+            });
+            assert!(ops.contains(&RecordedControlOp::SetEnabled(nested_btn as usize, true)));
+            assert!(ops.contains(&RecordedControlOp::SetEnabled(nested_edit as usize, true)));
+            assert!(ops.contains(&RecordedControlOp::SetEnabled(individually_disabled as usize, false)));
+            assert!(window::effective_child_enabled(nested_btn as usize));
+            assert!(!window::effective_child_enabled(individually_disabled as usize));
 
             assert_eq!(DestroyWindow(parent), TRUE);
             assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);

@@ -447,7 +447,14 @@ async_ctrl_op!(control_destroy() => control_destroy);
 async_ctrl_op!(control_set_frame(rect: RECT) => control_set_frame);
 async_ctrl_op!(control_set_text(text: String) => control_set_text);
 async_ctrl_op!(control_set_visible(visible: bool) => control_set_visible);
-async_ctrl_op!(control_set_enabled(enabled: bool) => control_set_enabled);
+pub fn control_set_enabled(hwnd: usize, enabled: bool) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::SetEnabled(hwnd, enabled));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::control_set_enabled(hwnd, enabled));
+    #[cfg(not(target_os = "macos"))]
+    let _ = (hwnd, enabled);
+}
 async_ctrl_op!(control_set_readonly(readonly: bool) => control_set_readonly);
 async_ctrl_op!(control_set_selection(start: usize, end: usize) => control_set_selection);
 async_ctrl_op!(control_set_limit(limit: usize) => control_set_limit);
@@ -676,6 +683,7 @@ pub(crate) enum RecordedControlOp {
     Unfocus(usize),
     ClearWindowFocus(usize),
     SetPasswordMode(usize, bool),
+    SetEnabled(usize, bool),
 }
 
 #[cfg(test)]
