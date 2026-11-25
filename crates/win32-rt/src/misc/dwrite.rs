@@ -6,6 +6,7 @@ mod analysis;
 mod font;
 mod layout;
 mod sfnt;
+mod shaping;
 
 pub use abi::*;
 pub(crate) use font::{font_face_from_ptr, FontFaceInner};

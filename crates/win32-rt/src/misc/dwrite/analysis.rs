@@ -421,13 +421,13 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     text_len: u32,
     font_face: *mut c_void,
     _is_sideways: BOOL,
-    _is_rtl: BOOL,
-    _script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
+    is_rtl: BOOL,
+    script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     _locale_name: *const u16,
     _number_substitution: *mut c_void,
-    _features: *const *const c_void,
+    features: *const *const c_void,
     _feature_range_lengths: *const u32,
-    _feature_ranges: u32,
+    feature_ranges: u32,
     max_glyph_count: u32,
     cluster_map: *mut u16,
     text_props: *mut DWRITE_SHAPING_TEXT_PROPERTIES,
@@ -454,14 +454,53 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     for i in 0..text_len as usize {
         units.push(text_string.add(i).read_unaligned());
     }
+    let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
+    let feat_settings = super::shaping::read_feature_settings(features, feature_ranges);
+    let complex = super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_settings.is_empty());
 
-    // Count resulting glyphs (handling UTF-16 surrogate pairs).
+    if let Some(shaped) = super::shaping::shape_run_platform(
+        &face,
+        &units,
+        face.meta.metrics.designUnitsPerEm.max(1) as f32,
+        is_rtl != 0,
+        no_visual,
+        &feat_settings,
+    ) {
+        actual_glyph_count.write_unaligned(shaped.glyphs.len() as u32);
+        if shaped.glyphs.len() > max_glyph_count as usize {
+            return E_NOT_SUFFICIENT_BUFFER;
+        }
+        for (i, &cm) in shaped.cluster_map.iter().enumerate() {
+            cluster_map.add(i).write_unaligned(cm);
+        }
+        for (i, &tp) in shaped.text_props.iter().enumerate() {
+            text_props.add(i).write_unaligned(tp);
+        }
+        for (gi, g) in shaped.glyphs.iter().enumerate() {
+            glyph_indices.add(gi).write_unaligned(g.gid);
+            glyph_props.add(gi).write_unaligned(g.props);
+        }
+        return S_OK;
+    }
+
+    if complex {
+        log::warn!(
+            "dwrite: IDWriteTextAnalyzer::GetGlyphs cannot shape complex/RTL/featured run (len={}, family={:?}) without backing SFNT shaper",
+            units.len(),
+            face.meta.family_name,
+        );
+        actual_glyph_count.write_unaligned(0);
+        return E_NOTIMPL;
+    }
+
+    // Simple LTR ASCII/Latin fallback when no backing SFNT bytes exist (e.g. built-in 8x8
+    // fallback face or minimal synthetic unit-test TTF rejected by CoreText).
     let mut glyphs: Vec<(u16, u16, usize, usize)> = Vec::with_capacity(units.len()); // (gid, props_bits, start_u16, step)
     let mut i = 0usize;
     while i < units.len() {
         let (ch, step) = decode_u16_at(&units, i);
         let gid = face.codepoint_to_glyph(ch as u32);
-        let is_zws = ch == '\u{200B}';
+        let is_zws = no_visual || ch == '\u{200B}';
         let justification: u16 = if ch == ' ' { 2 } else { 1 }; // BLANK vs CHARACTER
         let gprops = (justification & 0xF) | (1 << 4) /* isClusterStart */ | ((is_zws as u16) << 6);
         glyphs.push((gid, gprops, i, step));
@@ -493,22 +532,22 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
     this: PTextAnalyzer,
-    _text_string: *const u16,
+    text_string: *const u16,
     _cluster_map: *const u16,
     _text_props: *const DWRITE_SHAPING_TEXT_PROPERTIES,
-    _text_len: u32,
+    text_len: u32,
     glyph_indices: *const u16,
     _glyph_props: *const DWRITE_SHAPING_GLYPH_PROPERTIES,
     glyph_count: u32,
     font_face: *mut c_void,
     font_em_size_bits: u32,
     _is_sideways: BOOL,
-    _is_rtl: BOOL,
-    _script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
+    is_rtl: BOOL,
+    script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     _locale_name: *const u16,
-    _features: *const *const c_void,
+    features: *const *const c_void,
     _feature_range_lengths: *const u32,
-    _feature_ranges: u32,
+    feature_ranges: u32,
     glyph_advances: *mut f32,
     glyph_offsets: *mut DWRITE_GLYPH_OFFSET,
 ) -> HRESULT {
@@ -525,9 +564,44 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
     if !em_size.is_finite() || em_size < 0.0 {
         return E_INVALIDARG;
     }
+    let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
+    if text_len > 0 && !text_string.is_null() && glyph_count > 0 {
+        let mut units = Vec::with_capacity(text_len as usize);
+        for i in 0..text_len as usize {
+            units.push(text_string.add(i).read_unaligned());
+        }
+        let feat_settings = super::shaping::read_feature_settings(features, feature_ranges);
+        if let Some(shaped) = super::shaping::shape_run_platform(
+            &face,
+            &units,
+            em_size,
+            is_rtl != 0,
+            no_visual,
+            &feat_settings,
+        ) {
+            if shaped.glyphs.len() == glyph_count as usize
+                && (0..glyph_count as usize)
+                    .all(|i| shaped.glyphs[i].gid == glyph_indices.add(i).read_unaligned())
+            {
+                for (i, g) in shaped.glyphs.iter().enumerate() {
+                    glyph_advances.add(i).write_unaligned(g.advance);
+                    glyph_offsets.add(i).write_unaligned(g.offset);
+                }
+                return S_OK;
+            }
+        } else if super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_settings.is_empty()) {
+            log::warn!(
+                "dwrite: IDWriteTextAnalyzer::GetGlyphPlacements cannot position complex run (len={}, family={:?})",
+                units.len(),
+                face.meta.family_name,
+            );
+            return E_NOTIMPL;
+        }
+    }
     for i in 0..glyph_count as usize {
         let gid = glyph_indices.add(i).read_unaligned();
-        glyph_advances.add(i).write_unaligned(face.scaled_advance(gid, em_size));
+        let adv = if no_visual { 0.0 } else { face.scaled_advance(gid, em_size) };
+        glyph_advances.add(i).write_unaligned(adv);
         glyph_offsets.add(i).write_unaligned(DWRITE_GLYPH_OFFSET::default());
     }
     S_OK
@@ -538,10 +612,10 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     this: PTextAnalyzer,
-    _text_string: *const u16,
+    text_string: *const u16,
     _cluster_map: *const u16,
     _text_props: *const DWRITE_SHAPING_TEXT_PROPERTIES,
-    _text_len: u32,
+    text_len: u32,
     glyph_indices: *const u16,
     _glyph_props: *const DWRITE_SHAPING_GLYPH_PROPERTIES,
     glyph_count: u32,
@@ -551,12 +625,12 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     _transform: *const DWRITE_MATRIX,
     use_gdi_natural: BOOL,
     _is_sideways: BOOL,
-    _is_rtl: BOOL,
-    _script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
+    is_rtl: BOOL,
+    script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     _locale_name: *const u16,
-    _features: *const *const c_void,
+    features: *const *const c_void,
     _feature_range_lengths: *const u32,
-    _feature_ranges: u32,
+    feature_ranges: u32,
     glyph_advances: *mut f32,
     glyph_offsets: *mut DWRITE_GLYPH_OFFSET,
 ) -> HRESULT {
@@ -574,9 +648,47 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     if !em_size.is_finite() || em_size < 0.0 || !ppd.is_finite() || ppd <= 0.0 {
         return E_INVALIDARG;
     }
+    let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
+    if text_len > 0 && !text_string.is_null() && glyph_count > 0 {
+        let mut units = Vec::with_capacity(text_len as usize);
+        for i in 0..text_len as usize {
+            units.push(text_string.add(i).read_unaligned());
+        }
+        let feat_settings = super::shaping::read_feature_settings(features, feature_ranges);
+        if let Some(shaped) = super::shaping::shape_run_platform(
+            &face,
+            &units,
+            em_size,
+            is_rtl != 0,
+            no_visual,
+            &feat_settings,
+        ) {
+            if shaped.glyphs.len() == glyph_count as usize
+                && (0..glyph_count as usize)
+                    .all(|i| shaped.glyphs[i].gid == glyph_indices.add(i).read_unaligned())
+            {
+                for (i, g) in shaped.glyphs.iter().enumerate() {
+                    let mut adv = g.advance;
+                    if use_gdi_natural == FALSE {
+                        adv = (adv * ppd).round() / ppd;
+                    }
+                    glyph_advances.add(i).write_unaligned(adv);
+                    glyph_offsets.add(i).write_unaligned(g.offset);
+                }
+                return S_OK;
+            }
+        } else if super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_settings.is_empty()) {
+            log::warn!(
+                "dwrite: IDWriteTextAnalyzer::GetGdiCompatibleGlyphPlacements cannot position complex run (len={}, family={:?})",
+                units.len(),
+                face.meta.family_name,
+            );
+            return E_NOTIMPL;
+        }
+    }
     for i in 0..glyph_count as usize {
         let gid = glyph_indices.add(i).read_unaligned();
-        let mut adv = face.scaled_advance(gid, em_size);
+        let mut adv = if no_visual { 0.0 } else { face.scaled_advance(gid, em_size) };
         if use_gdi_natural == FALSE {
             adv = (adv * ppd).round() / ppd;
         }

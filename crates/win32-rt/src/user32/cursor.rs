@@ -564,6 +564,148 @@ fn rank_group_icon_entries(entries: &[GrpIconDirEntry], want_w: u32, want_h: u32
     ranked
 }
 
+/// Decode a PNG image buffer into straight BGRA8 pixels and a 1bpp DDB AND mask
+/// via Apple ImageIO + CoreGraphics (works on macOS and iOS, thread-safe).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn decode_png_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>, Vec<u8>)> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
+        fn CFRelease(cf: *const c_void);
+    }
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        fn CGImageSourceCreateWithData(data: *const c_void, options: *const c_void) -> *mut c_void;
+        fn CGImageSourceCreateImageAtIndex(
+            isrc: *mut c_void,
+            index: usize,
+            options: *const c_void,
+        ) -> *mut c_void;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGImageGetWidth(img: *mut c_void) -> usize;
+        fn CGImageGetHeight(img: *mut c_void) -> usize;
+        fn CGImageRelease(img: *mut c_void);
+        fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+        fn CGColorSpaceRelease(cs: *mut c_void);
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *mut c_void,
+            bitmap_info: u32,
+        ) -> *mut c_void;
+        fn CGContextDrawImage(c: *mut c_void, rect: CGRect, image: *mut c_void);
+        fn CGContextRelease(c: *mut c_void);
+    }
+
+    unsafe {
+        let cf_data = CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as isize);
+        if cf_data.is_null() {
+            return None;
+        }
+        let src = CGImageSourceCreateWithData(cf_data, std::ptr::null());
+        CFRelease(cf_data);
+        if src.is_null() {
+            return None;
+        }
+        let img = CGImageSourceCreateImageAtIndex(src, 0, std::ptr::null());
+        CFRelease(src as *const c_void);
+        if img.is_null() {
+            return None;
+        }
+        let w = CGImageGetWidth(img);
+        let h = CGImageGetHeight(img);
+        if w == 0 || h == 0 || w > 4096 || h > 4096 {
+            CGImageRelease(img);
+            return None;
+        }
+        let byte_len = w.checked_mul(h)?.checked_mul(4)?;
+        let mut bgra = vec![0u8; byte_len];
+        let cs = CGColorSpaceCreateDeviceRGB();
+        if cs.is_null() {
+            CGImageRelease(img);
+            return None;
+        }
+        // kCGBitmapByteOrder32Little (0x2000) | kCGImageAlphaPremultipliedFirst (2) -> BGRA8 premultiplied
+        let bitmap_info: u32 = 0x2000 | 2;
+        let ctx = CGBitmapContextCreate(
+            bgra.as_mut_ptr() as *mut c_void,
+            w,
+            h,
+            8,
+            w * 4,
+            cs,
+            bitmap_info,
+        );
+        CGColorSpaceRelease(cs);
+        if ctx.is_null() {
+            CGImageRelease(img);
+            return None;
+        }
+        CGContextDrawImage(
+            ctx,
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: w as f64, height: h as f64 },
+            },
+            img,
+        );
+        CGContextRelease(ctx);
+        CGImageRelease(img);
+
+        let ddb_and_stride = ((w + 15) & !15) / 8;
+        let mut and_mask = vec![0u8; ddb_and_stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let p = (y * w + x) * 4;
+                let a = bgra[p + 3];
+                if a == 0 {
+                    bgra[p] = 0;
+                    bgra[p + 1] = 0;
+                    bgra[p + 2] = 0;
+                    and_mask[y * ddb_and_stride + x / 8] |= 1u8 << (7 - (x % 8));
+                } else if a < 255 {
+                    let a32 = a as u32;
+                    bgra[p] = (((bgra[p] as u32) * 255 + a32 / 2) / a32).min(255) as u8;
+                    bgra[p + 1] = (((bgra[p + 1] as u32) * 255 + a32 / 2) / a32).min(255) as u8;
+                    bgra[p + 2] = (((bgra[p + 2] as u32) * 255 + a32 / 2) / a32).min(255) as u8;
+                }
+            }
+        }
+        Some((w as u32, h as u32, bgra, and_mask))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn decode_png_to_bgra(_bytes: &[u8]) -> Option<(u32, u32, Vec<u8>, Vec<u8>)> {
+    None
+}
+
 fn decode_icon_resource_bytes(
     bytes: &[u8],
     f_icon: bool,
@@ -575,7 +717,7 @@ fn decode_icon_resource_bytes(
     if bytes.is_empty() {
         return None;
     }
-    // PNG-encoded icon (Vista+ 256x256 or arbitrary PNG resource).
+    // PNG-encoded icon/cursor (Vista+ 256x256 icons or PNG-backed RT_CURSOR resources).
     if bytes.len() >= 26 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" && &bytes[12..16] == b"IHDR" {
         let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
         let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
@@ -591,18 +733,25 @@ fn decode_icon_resource_bytes(
             _ => bit_depth,
         }
         .max(1);
-        let and_stride = (((width as usize) + 15) & !15) / 8;
+        let Some((dec_w, dec_h, bgra_pixels, and_mask)) = decode_png_to_bgra(bytes) else {
+            log::warn!(
+                "user32: failed to decode PNG {} resource ({width}x{height}, {} bytes)",
+                if f_icon { "icon" } else { "cursor" },
+                bytes.len(),
+            );
+            return None;
+        };
         return Some(IconData {
             f_icon,
-            x_hotspot: width / 2,
-            y_hotspot: height / 2,
-            width,
-            height,
+            x_hotspot: dec_w / 2,
+            y_hotspot: dec_h / 2,
+            width: dec_w,
+            height: dec_h,
             bpp,
             is_png: true,
             raw_data: bytes.to_vec(),
-            bgra_pixels: vec![0u8; (width as usize).saturating_mul(height as usize).saturating_mul(4)],
-            and_mask: vec![0u8; and_stride.saturating_mul(height as usize)],
+            bgra_pixels,
+            and_mask,
             shared,
         });
     }
@@ -1475,18 +1624,65 @@ mod tests {
         out
     }
 
-    fn build_png_stub(w: u32, h: u32) -> Vec<u8> {
+    fn build_valid_png_rgba(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    crc = if (crc & 1) != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                }
+            }
+            !crc
+        }
+        fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend_from_slice(tag);
+            out.extend_from_slice(payload);
+            let crc = crc32(&out[start..]);
+            out.extend_from_slice(&crc.to_be_bytes());
+        }
+        // Build raw PNG scanlines (filter byte 0 + RGBA pixels per row) and deflate via system libz.
+        #[link(name = "z")]
+        extern "C" {
+            fn compress(
+                dest: *mut u8,
+                dest_len: *mut libc::c_ulong,
+                source: *const u8,
+                source_len: libc::c_ulong,
+            ) -> i32;
+        }
+        let mut raw = Vec::with_capacity(h as usize * (1 + w as usize * 4));
+        for _ in 0..h {
+            raw.push(0); // filter = None
+            for _ in 0..w {
+                raw.extend_from_slice(&rgba);
+            }
+        }
+        let mut zlen: libc::c_ulong = (raw.len() + raw.len() / 100 + 64) as libc::c_ulong;
+        let mut zbuf = vec![0u8; zlen as usize];
+        let rc = unsafe { compress(zbuf.as_mut_ptr(), &mut zlen, raw.as_ptr(), raw.len() as libc::c_ulong) };
+        assert_eq!(rc, 0, "libz compress failed");
+        zbuf.truncate(zlen as usize);
+
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.push(8); // bit depth
+        ihdr.push(6); // RGBA
+        ihdr.extend_from_slice(&[0, 0, 0]);
+
         let mut out = Vec::new();
         out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-        out.extend_from_slice(&13u32.to_be_bytes());
-        out.extend_from_slice(b"IHDR");
-        out.extend_from_slice(&w.to_be_bytes());
-        out.extend_from_slice(&h.to_be_bytes());
-        out.push(8); // bit depth
-        out.push(6); // RGBA
-        out.extend_from_slice(&[0, 0, 0]);
-        out.extend_from_slice(&[0u8; 4]); // CRC placeholder
+        push_chunk(&mut out, b"IHDR", &ihdr);
+        push_chunk(&mut out, b"IDAT", &zbuf);
+        push_chunk(&mut out, b"IEND", &[]);
         out
+    }
+
+    fn build_png_stub(w: u32, h: u32) -> Vec<u8> {
+        build_valid_png_rgba(w, h, [0x44, 0x88, 0xCC, 0xFF])
     }
 
     /// Build a minimal valid PE32+ image in memory containing `.rsrc` with:
@@ -1842,6 +2038,37 @@ mod tests {
                 other => panic!("expected Shape::Custom from RT_CURSOR, got {other:?}"),
             }
             assert_eq!(DestroyCursor(h_pe_cur), TRUE);
+
+            // 4. PNG-backed RT_CURSOR must decode real pixels into Shape::Custom (never Shape::Blank),
+            //    and a corrupt/undecodable PNG cursor resource must fail cleanly rather than returning a blank cursor.
+            let png_bytes = build_valid_png_rgba(8, 8, [0x12, 0x34, 0x56, 0xFF]);
+            let mut png_cur_res = Vec::with_capacity(4 + png_bytes.len());
+            png_cur_res.extend_from_slice(&2u16.to_le_bytes()); // xHotSpot
+            png_cur_res.extend_from_slice(&4u16.to_le_bytes()); // yHotSpot
+            png_cur_res.extend_from_slice(&png_bytes);
+            let mut png_img = img.clone();
+            png_img[RSRC_RVA + cur_off..RSRC_RVA + cur_off + png_cur_res.len()].copy_from_slice(&png_cur_res);
+            png_img[RSRC_RVA + 0x204..RSRC_RVA + 0x208].copy_from_slice(&(png_cur_res.len() as u32).to_le_bytes());
+            let h_png_cur = LoadImageW(png_img.as_ptr() as HINSTANCE, 202 as LPCWSTR, 2, 0, 0, 0);
+            assert_ne!(h_png_cur, 0);
+            match cursors().lock().unwrap().get(&h_png_cur).unwrap().shape.clone() {
+                Shape::Custom(ci) => {
+                    assert_eq!((ci.width, ci.height, ci.hotspot_x, ci.hotspot_y), (8, 8, 2, 4));
+                    assert_eq!(&ci.rgba[0..4], &[0x12, 0x34, 0x56, 0xFF]);
+                }
+                other => panic!("expected Shape::Custom for PNG RT_CURSOR, got {other:?}"),
+            }
+            assert_eq!(DestroyCursor(h_png_cur), TRUE);
+            assert!(!cursors().lock().unwrap().contains_key(&h_png_cur));
+            assert!(!icons().lock().unwrap().contains_key(&h_png_cur));
+
+            // Truncated/corrupt PNG cursor resource must fail cleanly (return 0), never Shape::Blank.
+            let mut bad_png_cur = vec![2, 0, 4, 0];
+            bad_png_cur.extend_from_slice(&png_bytes[..28]); // header only, no IDAT/IEND
+            let mut bad_img = img.clone();
+            bad_img[RSRC_RVA + cur_off..RSRC_RVA + cur_off + bad_png_cur.len()].copy_from_slice(&bad_png_cur);
+            bad_img[RSRC_RVA + 0x204..RSRC_RVA + 0x208].copy_from_slice(&(bad_png_cur.len() as u32).to_le_bytes());
+            assert_eq!(LoadImageW(bad_img.as_ptr() as HINSTANCE, 202 as LPCWSTR, 2, 0, 0, 0), 0);
         }
     }
 }

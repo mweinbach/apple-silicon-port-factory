@@ -1603,3 +1603,258 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
         release_com(fac);
     }
 }
+
+#[test]
+fn text_analyzer_shapes_complex_arabic_and_combining_marks_and_rejects_unshapeable_fallback() {
+    use super::analysis::{ta_get_glyph_placements, ta_get_glyphs, PTextAnalyzer};
+    use super::sfnt::FontMeta;
+    use std::collections::HashMap;
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &G_IDWRITE_FACTORY as *const _ as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // 1. Find a real system font with Arabic contextual shaping (e.g. Geeza Pro or Arial on macOS).
+        let sys = system_font_collection_data(false);
+        let arabic_meta = ["geeza pro", "arial", "damascus", "baghdad", "times new roman"]
+            .iter()
+            .find_map(|&fam_name| {
+                let idx = sys.find_family_index(fam_name)?;
+                sys.families[idx]
+                    .fonts
+                    .iter()
+                    .find(|m| m.file_path.is_some())
+                    .cloned()
+            });
+
+        if let Some(meta) = arabic_meta {
+            let face_inner = FontFaceInner::from_meta(meta, 0);
+            // Connected Arabic word "سلام" (Seen + Lam + Alef + Meem): contextual joining + Lam-Alef ligature.
+            let arabic_u16: Vec<u16> = "\u{0633}\u{0644}\u{0627}\u{0645}".encode_utf16().collect();
+            let raw_cmap_gids: Vec<u16> = [0x0633u32, 0x0644, 0x0627, 0x0645]
+                .iter()
+                .map(|&cp| face_inner.codepoint_to_glyph(cp))
+                .collect();
+            let face = new_font_face(face_inner);
+
+            let mut cmap = [0xFFFFu16; 4];
+            let mut tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 4];
+            let mut gids = [0u16; 16];
+            let mut gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 16];
+            let mut actual = 0u32;
+            let sa = DWRITE_SCRIPT_ANALYSIS { script: 1, shapes: 0 };
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    arabic_u16.as_ptr(),
+                    arabic_u16.len() as u32,
+                    face,
+                    FALSE,
+                    TRUE, // isRightToLeft
+                    &sa,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    gids.len() as u32,
+                    cmap.as_mut_ptr(),
+                    tprops.as_mut_ptr(),
+                    gids.as_mut_ptr(),
+                    gprops.as_mut_ptr(),
+                    &mut actual,
+                ),
+                S_OK
+            );
+            assert!(actual > 0 && actual <= 4, "expected shaped Arabic glyphs, got {actual}");
+            let shaped_slice = &gids[..actual as usize];
+            assert_ne!(
+                shaped_slice,
+                raw_cmap_gids.as_slice(),
+                "Arabic run must undergo contextual shaping rather than returning isolated cmap glyphs"
+            );
+            // Monotonic logical clusterMap covering all 4 UTF-16 code units.
+            for w in cmap.windows(2) {
+                assert!(w[0] <= w[1], "clusterMap must be monotonically non-decreasing: {cmap:?}");
+            }
+            assert!((cmap[3] as u32) < actual);
+            // If Lam+Alef formed a ligature (3 glyphs for 4 chars), indices 1 & 2 share one cluster.
+            if actual == 3 {
+                assert_eq!(cmap[1], cmap[2], "Lam+Alef ligature should share one cluster: {cmap:?}");
+            }
+
+            let mut adv = [0.0f32; 16];
+            let mut offs = [DWRITE_GLYPH_OFFSET::default(); 16];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    arabic_u16.as_ptr(),
+                    cmap.as_ptr(),
+                    tprops.as_ptr(),
+                    arabic_u16.len() as u32,
+                    gids.as_ptr(),
+                    gprops.as_ptr(),
+                    actual,
+                    face,
+                    24.0f32.to_bits(),
+                    FALSE,
+                    TRUE,
+                    &sa,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    offs.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            assert!(adv[..actual as usize].iter().any(|&a| a > 0.0));
+            release_com(face);
+        }
+
+        // 2. Combining mark ("e" + U+0301 combining acute) with a real Latin system font.
+        let latin_meta = ["arial", "helvetica", "times new roman"]
+            .iter()
+            .find_map(|&fam_name| {
+                let idx = sys.find_family_index(fam_name)?;
+                sys.families[idx]
+                    .fonts
+                    .iter()
+                    .find(|m| m.file_path.is_some())
+                    .cloned()
+            });
+        if let Some(meta) = latin_meta {
+            let face_inner = FontFaceInner::from_meta(meta, 0);
+            let face = new_font_face(face_inner);
+            let comb_u16: Vec<u16> = "e\u{0301}".encode_utf16().collect();
+            let mut cmap = [0xFFFFu16; 2];
+            let mut tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 2];
+            let mut gids = [0u16; 8];
+            let mut gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 8];
+            let mut actual = 0u32;
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    comb_u16.as_ptr(),
+                    comb_u16.len() as u32,
+                    face,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    gids.len() as u32,
+                    cmap.as_mut_ptr(),
+                    tprops.as_mut_ptr(),
+                    gids.as_mut_ptr(),
+                    gprops.as_mut_ptr(),
+                    &mut actual,
+                ),
+                S_OK
+            );
+            let mut adv = [0.0f32; 8];
+            let mut offs = [DWRITE_GLYPH_OFFSET::default(); 8];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    comb_u16.as_ptr(),
+                    cmap.as_ptr(),
+                    tprops.as_ptr(),
+                    comb_u16.len() as u32,
+                    gids.as_ptr(),
+                    gprops.as_ptr(),
+                    actual,
+                    face,
+                    24.0f32.to_bits(),
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    offs.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            // Either composed into 1 glyph (clusterMap=[0,0]) or 2 glyphs with zero-advance combining mark.
+            if actual == 1 {
+                assert_eq!(cmap, [0, 0]);
+                assert!(adv[0] > 0.0);
+            } else {
+                assert_eq!(actual, 2);
+                assert!(adv[0] > 0.0);
+                assert!(adv[1].abs() < 1e-3, "combining mark advance should be 0, got {}", adv[1]);
+            }
+            release_com(face);
+        }
+
+        // 3. Built-in fallback face (no backing SFNT bytes) must honestly return E_NOTIMPL for
+        //    complex Arabic runs rather than returning S_OK with isolated cmap glyphs.
+        let fallback_meta = Arc::new(FontMeta {
+            family_name: "FallbackOnly".to_string(),
+            face_name: "Regular".to_string(),
+            weight: DWRITE_FONT_WEIGHT_NORMAL,
+            stretch: DWRITE_FONT_STRETCH_NORMAL,
+            style: DWRITE_FONT_STYLE_NORMAL,
+            is_symbol: false,
+            is_monospace: false,
+            face_type: DWRITE_FONT_FACE_TYPE_TRUETYPE,
+            face_index: 0,
+            glyph_count: 256,
+            metrics: super::sfnt::default_fallback_metrics(),
+            info_strings: HashMap::new(),
+            file_path: None,
+            raw_bytes: None,
+            custom_file: None,
+        });
+        let fb_face = new_font_face(FontFaceInner::from_meta(fallback_meta, 0));
+        let arabic_u16: Vec<u16> = "\u{0633}\u{0644}\u{0627}\u{0645}".encode_utf16().collect();
+        let mut cmap = [0u16; 4];
+        let mut tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 4];
+        let mut gids = [0u16; 8];
+        let mut gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 8];
+        let mut actual = 99u32;
+        assert_eq!(
+            ta_get_glyphs(
+                ta as PTextAnalyzer,
+                arabic_u16.as_ptr(),
+                arabic_u16.len() as u32,
+                fb_face,
+                FALSE,
+                TRUE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gids.len() as u32,
+                cmap.as_mut_ptr(),
+                tprops.as_mut_ptr(),
+                gids.as_mut_ptr(),
+                gprops.as_mut_ptr(),
+                &mut actual,
+            ),
+            E_NOTIMPL
+        );
+        assert_eq!(actual, 0);
+        release_com(fb_face);
+
+        release_com(ta);
+        release_com(fac);
+    }
+}
