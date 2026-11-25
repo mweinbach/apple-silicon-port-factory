@@ -264,6 +264,8 @@ struct ActiveTaskDialog {
     session_id: u64,
     modal_open: bool,
     hinst: usize,
+    pf_callback: usize,
+    lp_callback_data: isize,
     caption: String,
     main_inst: String,
     content: String,
@@ -382,32 +384,78 @@ unsafe extern "win64" fn task_dialog_wndproc(
             0
         }
         TDM_CLICK_RADIO_BUTTON => {
-            let push = {
+            let (push, cb_notify) = {
                 let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
-                map.get_mut(&h).and_then(|dlg| {
-                    if let Some(idx) = dlg.radios.iter().position(|(id, _)| *id == w_param as i32) {
-                        dlg.selected_radio_idx = Some(idx);
-                    }
-                    dlg.live_update(None)
-                })
+                map.get_mut(&h)
+                    .map(|dlg| {
+                        let matched = dlg.radios.iter().position(|(id, _)| *id == w_param as i32);
+                        let notify = if let Some(idx) = matched {
+                            dlg.selected_radio_idx = Some(idx);
+                            (dlg.pf_callback != 0).then_some((
+                                dlg.pf_callback,
+                                dlg.lp_callback_data,
+                                w_param as u64,
+                            ))
+                        } else {
+                            None
+                        };
+                        (dlg.live_update(None), notify)
+                    })
+                    .unwrap_or((None, None))
             };
             if let Some((sid, upd)) = push {
                 crate::macos::task_dialog_alert_update(sid, upd);
             }
+            if let Some((cb, ref_data, rid)) = cb_notify {
+                let _ = crate::call_guest8(
+                    cb,
+                    h as u64,
+                    TDN_RADIO_BUTTON_CLICKED as u64,
+                    rid,
+                    0,
+                    ref_data as u64,
+                    0,
+                    0,
+                    0,
+                );
+            }
             0
         }
         TDM_CLICK_VERIFICATION => {
-            let push = {
+            let (push, cb_notify) = {
                 let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
-                map.get_mut(&h).and_then(|dlg| {
-                    if dlg.has_verification {
-                        dlg.verified = w_param != 0;
-                    }
-                    dlg.live_update(None)
-                })
+                map.get_mut(&h)
+                    .map(|dlg| {
+                        let notify = if dlg.has_verification {
+                            let checked = w_param != 0;
+                            dlg.verified = checked;
+                            (dlg.pf_callback != 0).then_some((
+                                dlg.pf_callback,
+                                dlg.lp_callback_data,
+                                if checked { 1u64 } else { 0u64 },
+                            ))
+                        } else {
+                            None
+                        };
+                        (dlg.live_update(None), notify)
+                    })
+                    .unwrap_or((None, None))
             };
             if let Some((sid, upd)) = push {
                 crate::macos::task_dialog_alert_update(sid, upd);
+            }
+            if let Some((cb, ref_data, checked_u64)) = cb_notify {
+                let _ = crate::call_guest8(
+                    cb,
+                    h as u64,
+                    TDN_VERIFICATION_CLICKED as u64,
+                    checked_u64,
+                    0,
+                    ref_data as u64,
+                    0,
+                    0,
+                    0,
+                );
             }
             0
         }
@@ -596,6 +644,8 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 session_id,
                 modal_open: false,
                 hinst: hinst as usize,
+                pf_callback: cfg.pf_callback,
+                lp_callback_data: cfg.lp_callback_data,
                 caption,
                 main_inst,
                 content,
@@ -1404,6 +1454,7 @@ mod tests {
 
             const WM_TD_PING: u32 = crate::user32::wm::USER + 42;
             static SEEN_HWNDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+            static SEEN_NOTIFS: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
             static SUB_PINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
             unsafe extern "win64" fn td_subclass(
@@ -1424,17 +1475,18 @@ mod tests {
             unsafe extern "win64" fn td_init_cb(
                 hwnd: HWND,
                 msg: u32,
-                _wp: usize,
+                wp: usize,
                 _lp: isize,
                 _ref_data: isize,
             ) -> HRESULT {
                 assert!(!hwnd.is_null(), "callback must always receive a non-NULL dialog HWND");
                 assert_eq!(crate::user32::window::IsWindow(hwnd), TRUE);
                 SEEN_HWNDS.lock().unwrap().push(hwnd as usize);
+                SEEN_NOTIFS.lock().unwrap().push((msg, wp));
                 if msg == TDN_CREATED {
                     let new_title = crate::strings::to_wide_z("Callback Title");
                     assert_eq!(crate::user32::window::SetWindowTextW(hwnd, new_title.as_ptr()), TRUE);
-                    let new_body = crate::strings::to_wide_z("Updated Body");
+                    let new_body = crate::strings::to_wide_z("Initial Callback Body");
                     let _ = crate::user32::message::SendMessageW(
                         hwnd,
                         TDM_SET_ELEMENT_TEXT,
@@ -1443,8 +1495,19 @@ mod tests {
                     );
                     let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_RADIO_BUTTON, 201, 0);
                     let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_VERIFICATION, 0, 0);
+                    // Unknown radio ID must not trigger TDN_RADIO_BUTTON_CLICKED.
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_RADIO_BUTTON, 999, 0);
                     assert_eq!(SetWindowSubclass(hwnd, td_subclass as *const () as usize, 1, 0xCAFE), TRUE);
                     assert_eq!(crate::user32::message::SendMessageW(hwnd, WM_TD_PING, 0, 0), 777);
+                } else if msg == TDN_RADIO_BUTTON_CLICKED && wp == 201 {
+                    // Callback invoked outside mutex can mutate dialog content reentrantly.
+                    let new_body = crate::strings::to_wide_z("Updated Body");
+                    let _ = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_SET_ELEMENT_TEXT,
+                        TDE_CONTENT,
+                        new_body.as_ptr() as isize,
+                    );
                 }
                 S_OK
             }
@@ -1474,6 +1537,7 @@ mod tests {
             cfg.pf_callback = td_init_cb as *const () as usize;
 
             SEEN_HWNDS.lock().unwrap().clear();
+            SEEN_NOTIFS.lock().unwrap().clear();
             SUB_PINGS.store(0, std::sync::atomic::Ordering::SeqCst);
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
                 |cap, body, _btns, _def_btn, _rads, def_rad, _ver_txt, ver_chk, _emit| {
@@ -1502,6 +1566,19 @@ mod tests {
             assert_eq!(hr, S_OK);
             assert_eq!((btn, radio, verified), (1, 201, FALSE));
             assert_eq!(SUB_PINGS.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let notifs = SEEN_NOTIFS.lock().unwrap().clone();
+            assert!(
+                notifs.contains(&(TDN_RADIO_BUTTON_CLICKED, 201)),
+                "TDM_CLICK_RADIO_BUTTON must invoke TDN_RADIO_BUTTON_CLICKED: {notifs:?}"
+            );
+            assert!(
+                !notifs.iter().any(|&(m, wp)| m == TDN_RADIO_BUTTON_CLICKED && wp == 999),
+                "unknown radio ID must not trigger TDN_RADIO_BUTTON_CLICKED: {notifs:?}"
+            );
+            assert!(
+                notifs.contains(&(TDN_VERIFICATION_CLICKED, 0)),
+                "TDM_CLICK_VERIFICATION must invoke TDN_VERIFICATION_CLICKED: {notifs:?}"
+            );
 
             let seen = SEEN_HWNDS.lock().unwrap().clone();
             assert!(!seen.is_empty());
@@ -1651,6 +1728,8 @@ mod tests {
                         session_id: sid,
                         modal_open: true,
                         hinst: 0,
+                        pf_callback: 0,
+                        lp_callback_data: 0,
                         caption: "WaitTitle".to_string(),
                         main_inst: String::new(),
                         content: "Before".to_string(),
