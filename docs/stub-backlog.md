@@ -236,8 +236,8 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `AssignProcessToJobObject` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1655` | `"job objects have no effect"` |
 | `CreateProcessW` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1283` | `"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)` |
 | `CreateRemoteThread` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:60` | `"CreateRemoteThread into another process"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7127` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7155` | `"DeviceIoControl code {code:#x} unsupported"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7135` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7163` | `"DeviceIoControl code {code:#x} unsupported"` |
 | `FlushProcessWriteBuffers` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:1045` | `"FlushProcessWriteBuffers approximated by a local fence"` |
 | `GetCalendarInfoEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1354` | `"GetCalendarInfoEx type {ty:#x}"` |
 | `GetFileInformationByHandleEx` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2137` | `"GetFileInformationByHandleEx class {class} not supported"` |
@@ -246,7 +246,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `GetNumberFormatEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1323` | `"custom NUMBERFMT ignored"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:552` | `"LCMAP_HASH unsupported"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:578` | `"LCMapString flags {flags:#x} partially honoured"` |
-| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6918` | `"MapViewOfFile3 on another process"` |
+| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6926` | `"MapViewOfFile3 on another process"` |
 | `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2596` | `"MoveFileExA delete-on-reboot ignored"` |
 | `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2589` | `"MoveFileExW delete-on-reboot ignored"` |
 | `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2268` | `"SetFileInformationByHandle class {class} not supported"` |
@@ -644,7 +644,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `SHCreateItemFromParsingName` | `stub` | `crates/win32-rt/src/misc/shell32.rs:1733` | `"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"` |
+| `SHCreateItemFromParsingName` | `stub` | `crates/win32-rt/src/misc/shell32.rs:1748` | `"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"` |
 
 ### `xinput1_4.dll` (1)
 

@@ -3244,7 +3244,7 @@ pub unsafe extern "win64" fn BCryptGetProperty(h: *mut c_void, prop: *const u16,
                 u32v(if a.effective_key_len == 0 { 128 } else { a.effective_key_len })
             }
             ("AuthTagLength", AlgKind::Symmetric(SymAlg::Aes)) => auth_tag_lengths_bytes(a.mode).unwrap(),
-            ("KeyLengths", AlgKind::Rsa) => key_lengths(512, 16384, 64),
+            ("KeyLengths", AlgKind::Rsa) => key_lengths(1024, 4096, 64),
             ("PaddingSchemes", AlgKind::Rsa) => u32v(
                 BCRYPT_SUPPORTED_PAD_PKCS1_ENC
                     | BCRYPT_SUPPORTED_PAD_PKCS1_SIG
@@ -3308,7 +3308,7 @@ pub unsafe extern "win64" fn BCryptGetProperty(h: *mut c_void, prop: *const u16,
             (KeyData::Symmetric { .. }, "PrimitiveType") => u32v(BCRYPT_CIPHER_INTERFACE),
             (KeyData::Rsa(r), "KeyLength" | "KeyStrength" | "PublicKeyLength") => u32v(r.pub_key.bits() as u32),
             (KeyData::Rsa(r), "BlockLength" | "SignatureLength") => u32v(r.pub_key.k() as u32),
-            (KeyData::Rsa(_), "KeyLengths") => key_lengths(512, 16384, 64),
+            (KeyData::Rsa(_), "KeyLengths") => key_lengths(1024, 4096, 64),
             (KeyData::Rsa(_), "PaddingSchemes") => u32v(
                 BCRYPT_SUPPORTED_PAD_PKCS1_ENC
                     | BCRYPT_SUPPORTED_PAD_PKCS1_SIG
@@ -4942,6 +4942,12 @@ mod tests {
 
             let mut hr = std::ptr::null_mut();
             assert_eq!(BCryptOpenAlgorithmProvider(&mut hr, w("RSA").as_ptr(), std::ptr::null(), 0), 0);
+            let mut rsa_kl = [0u32; 3];
+            assert_eq!(
+                BCryptGetProperty(hr, w("KeyLengths").as_ptr(), rsa_kl.as_mut_ptr() as *mut u8, 12, &mut got, 0),
+                STATUS_SUCCESS
+            );
+            assert_eq!((got, rsa_kl), (12, [1024, 4096, 64]));
             let mut b = blob();
             let mut hk = std::ptr::null_mut();
             assert_eq!(BCryptImportKeyPair(hr, std::ptr::null_mut(), w("RSAPUBLICBLOB").as_ptr(), &mut hk, b.as_mut_ptr(), b.len() as u32, 0), 0);

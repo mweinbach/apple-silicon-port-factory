@@ -441,6 +441,18 @@ pub fn is_host_private_keystore_path(host: &Path) -> bool {
     path_eq_or_under_ci(&parent_join, &ks_root)
 }
 
+/// True if `host` is an ancestor directory of the host-private CAPI keystore
+/// (so a recursive traversal/copy rooted at `host` would descend into it).
+pub fn is_host_private_keystore_ancestor(host: &Path) -> bool {
+    let ks_root = resolve_canonical_host(&capi_keystore_dir());
+    let canon = resolve_canonical_host(host);
+    if path_is_ancestor_of_ci(&canon, &ks_root) {
+        return true;
+    }
+    let parent_join = resolve_parent_canonical_host(host);
+    path_is_ancestor_of_ci(&parent_join, &ks_root)
+}
+
 /// Map a Windows path to a host path. Returns `None` for paths outside every
 /// mount (e.g. a drive letter we do not provide), for device paths, and for
 /// host-private keystore paths.
