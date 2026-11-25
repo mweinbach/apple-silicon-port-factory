@@ -2891,4 +2891,41 @@ fn mmx_and_gather_invalidate_xa_address_cache_in_same_block() {
         assert_eq!(rd64(96), 0x1234_5678_9ABC_DEF0);
         assert_eq!(rd64(104), 0x1234_5678_9ABC_DEF0);
     });
+
+    // Also verify upper-lane XMM liveness (`compute_xmm_hi_live`) treats MMX memory forms
+    // (`K_MMX_VSHUF_RM` / `K_MMX_VINT_RM`) as potential side-exits under software range checks:
+    // `movss xmm0, xmm1; paddq mm0, [rcx]; pxor xmm0, xmm0` with `rcx = 0x1000` must preserve
+    // `xmm0[127:32]` when `paddq` side-exits on the invalid guest address.
+    use super::jit::JitCache;
+    let mut b = CodeAssembler::new(64).unwrap();
+    b.movss(xmm0, xmm1).unwrap();
+    b.paddq(mm0, qword_ptr(rcx)).unwrap();
+    b.pxor(xmm0, xmm0).unwrap();
+    b.ret().unwrap();
+    let bytes = b.assemble(0).unwrap();
+    let code_ptr = jit_tests::arena_alloc(bytes.len() + 16, 16);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), code_ptr, bytes.len());
+        std::ptr::write_bytes(code_ptr.add(bytes.len()), 0xcc, 16);
+    }
+    jit::test_set_knobs(jit::TestKnobs {
+        hw_range: Some(false),
+        xmmreg: Some(true),
+        ..jit::TestKnobs::NONE
+    });
+    let mut jc = Box::new(JitCache::new());
+    let mut bc = Box::new(BlockCache::new());
+    let jc_addr = unsafe { jc.compile_single_for_verify(code_ptr as u64, &mut *bc) }
+        .expect("compile movss+paddq_rm+pxor");
+    let mut cpu = Cpu::new_zeroed();
+    cpu.rip = code_ptr as u64;
+    cpu.gpr[1] = 0x1000; // invalid guest address -> triggers software range-check side-exit
+    cpu.xmm[0] = 0xDEAD_BEEF_CAFE_BABE_1234_5678_0000_0000u128;
+    cpu.xmm[1] = 0x0000_0000_0000_0000_0000_0000_3F80_0000u128;
+    let (ex, _) = unsafe { jc.run_code_for_verify(&mut cpu, &mut *bc, None, jc_addr, 64) };
+    assert_eq!(ex, jit::EXIT_SIDE, "paddq mm0,[0x1000] must side-exit");
+    assert_eq!(
+        cpu.xmm[0], 0xDEAD_BEEF_CAFE_BABE_1234_5678_3F80_0000u128,
+        "movss must preserve xmm0[127:32] across faulting MMX memory op"
+    );
 }

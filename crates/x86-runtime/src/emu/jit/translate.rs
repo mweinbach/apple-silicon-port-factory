@@ -771,6 +771,8 @@ impl Tr<'_> {
                         | K_VFP_RM
                         | K_VINT_RM
                         | K_VST
+                        | K_MMX_VSHUF_RM
+                        | K_MMX_VINT_RM
                 );
                 if is_mem {
                     live32 = 0xFFFF;
