@@ -1846,3 +1846,69 @@ fn x87_frndint_power_of_two_carry() {
     assert_eq!(rd_m80(112), (0x8000_0000_0000_0000, 0x4000), "frndint(1.5+2^-60) == 2.0");
     assert_eq!(rd_m80(128), (0x8000_0000_0000_0000, 0x403E), "frndint(2^63-0.5) == 2^63");
 }
+
+/// 15. Regression: `fyl2x` and `fyl2xp1` must preserve extended 80-bit exponents outside the
+/// `f64` range (e.g. `ST(0) = 2^1024, ST(1) = 1 -> 1024.0`, `2^-2000 * 3 -> -6000.0`,
+/// `y = 2^5000 * log2(2^1024) -> 2^5010`, and `fyl2xp1(2^-5000, 2^5000) -> log2(e)`).
+#[test]
+fn x87_fyl2x_extended_exponent() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 256];
+    let wr_m80 = |buf: &mut [u8], off: usize, sig: u64, se: u16| {
+        buf[off..off + 8].copy_from_slice(&sig.to_le_bytes());
+        buf[off + 8..off + 10].copy_from_slice(&se.to_le_bytes());
+    };
+    wr_m80(&mut init, 0, 0x8000_0000_0000_0000, (16383 + 1024) as u16); // 2^1024
+    wr_m80(&mut init, 16, 0x8000_0000_0000_0000, (16383 - 2000) as u16); // 2^-2000
+    wr_m80(&mut init, 32, 0xC000_0000_0000_0000, (16383 + 1024) as u16); // 1.5 * 2^1024
+    wr_m80(&mut init, 48, 0x8000_0000_0000_0000, (16383 + 5000) as u16); // 2^5000
+    wr_m80(&mut init, 64, 0x8000_0000_0000_0000, (16383 - 5000) as u16); // 2^-5000
+    init[80..88].copy_from_slice(&3.0f64.to_bits().to_le_bytes());
+
+    let code = assemble(|a| {
+        a.fninit().unwrap();
+        // 1 * log2(2^1024) = 1024.0
+        a.fld1().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fyl2x().unwrap();
+        a.fstp(qword_ptr(rcx + 96)).unwrap();
+
+        // 3 * log2(2^-2000) = -6000.0
+        a.fld(qword_ptr(rcx + 80)).unwrap();
+        a.fld(tbyte_ptr(rcx + 16)).unwrap();
+        a.fyl2x().unwrap();
+        a.fstp(qword_ptr(rcx + 104)).unwrap();
+
+        // 1 * log2(1.5 * 2^1024) = 1024 + log2(1.5)
+        a.fld1().unwrap();
+        a.fld(tbyte_ptr(rcx + 32)).unwrap();
+        a.fyl2x().unwrap();
+        a.fstp(qword_ptr(rcx + 112)).unwrap();
+
+        // 2^5000 * log2(2^1024) = 2^5010 (m80: sig=0x8000..0, se=16383+5010)
+        a.fld(tbyte_ptr(rcx + 48)).unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fyl2x().unwrap();
+        a.fstp(tbyte_ptr(rcx + 128)).unwrap();
+
+        // 2^5000 * log2(1 + 2^-5000) ~= log2(e)
+        a.fld(tbyte_ptr(rcx + 48)).unwrap();
+        a.fld(tbyte_ptr(rcx + 64)).unwrap();
+        a.fyl2xp1().unwrap();
+        a.fstp(qword_ptr(rcx + 144)).unwrap();
+    });
+
+    let r = run_diff_x87("fyl2x_extended_exponent", &code, &init);
+    let rd_f64 = |off: usize| f64::from_bits(u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()));
+    let rd_m80 = |off: usize| -> (u64, u16) {
+        (
+            u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()),
+            u16::from_le_bytes(r.data[off + 8..off + 10].try_into().unwrap()),
+        )
+    };
+    assert_eq!(rd_f64(96), 1024.0, "1 * log2(2^1024)");
+    assert_eq!(rd_f64(104), -6000.0, "3 * log2(2^-2000)");
+    assert!((rd_f64(112) - (1024.0 + 1.5f64.log2())).abs() < 1e-12, "1 * log2(1.5 * 2^1024)");
+    assert_eq!(rd_m80(128), (0x8000_0000_0000_0000, (16383 + 5010) as u16), "2^5000 * log2(2^1024)");
+    assert!((rd_f64(144) - core::f64::consts::LOG2_E).abs() < 1e-12, "2^5000 * log2(1 + 2^-5000)");
+}

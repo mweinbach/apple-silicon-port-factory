@@ -2130,9 +2130,7 @@ impl X87State {
                     if self.raw_denormal(p0) || self.raw_denormal(p1) {
                         sw |= SW_DE;
                     }
-                    let mut dummy = 0u16;
-                    let xf = f64::from_bits(x.to_f64_bits(RC_RN, &mut dummy));
-                    let yf = f64::from_bits(y.to_f64_bits(RC_RN, &mut dummy));
+                    let ext_cw = (self.cw & !0x0300) | 0x0300;
                     if !is_p1 {
                         if x.kind == Fp80Kind::Zero {
                             if y.kind == Fp80Kind::Zero {
@@ -2153,16 +2151,23 @@ impl X87State {
                                 Fp80::inf(y.sign)
                             }
                         } else {
-                            let r = yf * xf.log2();
-                            if r.is_nan() {
-                                sw |= SW_IE;
-                                Fp80::QNAN_INDEF
+                            // Positive finite extended x = (1 + mant_frac * 2^-63) * 2^(x.exp):
+                            // compute log2(x) directly from (x.exp, x.sig) so extended exponents
+                            // outside f64 range (e.g. 2^1024, 2^-2000) stay exact and finite.
+                            let mant_frac = x.sig & 0x7FFF_FFFF_FFFF_FFFF;
+                            let mut dummy = 0u16;
+                            let log2_x = if mant_frac == 0 {
+                                Fp80::from_i64(x.exp as i64)
                             } else {
-                                if r != 0.0 && r.is_finite() {
-                                    sw |= SW_PE;
-                                }
-                                Fp80::from_f64_raw(r)
+                                let frac = (mant_frac as f64) * f64::from_bits(0x3C00_0000_0000_0000);
+                                let log2_m = Fp80::from_f64_raw(frac.ln_1p() * core::f64::consts::LOG2_E);
+                                Fp80::add(Fp80::from_i64(x.exp as i64), log2_m, 0x037F, &mut dummy)
+                            };
+                            let r = Fp80::mul(y, log2_x, ext_cw, &mut sw);
+                            if mant_frac != 0 && r.kind == Fp80Kind::Finite {
+                                sw |= SW_PE;
                             }
+                            r
                         }
                     } else {
                         // fyl2xp1: y * log2(x + 1.0)
@@ -2173,10 +2178,17 @@ impl X87State {
                             } else {
                                 Fp80::zero(x.sign ^ y.sign)
                             }
-                        } else if xf < -1.0 {
+                        } else if x.kind == Fp80Kind::Inf {
+                            if x.sign != 0 || y.kind == Fp80Kind::Zero {
+                                sw |= SW_IE;
+                                Fp80::QNAN_INDEF
+                            } else {
+                                Fp80::inf(y.sign)
+                            }
+                        } else if x.sign != 0 && (x.exp > 0 || (x.exp == 0 && x.sig > (1u64 << 63))) {
                             sw |= SW_IE;
                             Fp80::QNAN_INDEF
-                        } else if xf == -1.0 {
+                        } else if x.sign != 0 && x.exp == 0 && x.sig == (1u64 << 63) {
                             if y.kind == Fp80Kind::Zero {
                                 sw |= SW_IE;
                                 Fp80::QNAN_INDEF
@@ -2185,16 +2197,23 @@ impl X87State {
                                 Fp80::inf(y.sign ^ 1)
                             }
                         } else {
-                            let r = yf * (xf.ln_1p() * core::f64::consts::LOG2_E);
-                            if r.is_nan() {
-                                sw |= SW_IE;
-                                Fp80::QNAN_INDEF
+                            let mut dummy = 0u16;
+                            let log2_1px = if x.exp <= -64 {
+                                Fp80::mul(x, Fp80::from_f64_raw(core::f64::consts::LOG2_E), 0x037F, &mut dummy)
+                            } else if x.exp >= 64 {
+                                let mant_frac = x.sig & 0x7FFF_FFFF_FFFF_FFFF;
+                                let frac = (mant_frac as f64) * f64::from_bits(0x3C00_0000_0000_0000);
+                                let log2_m = Fp80::from_f64_raw(frac.ln_1p() * core::f64::consts::LOG2_E);
+                                Fp80::add(Fp80::from_i64(x.exp as i64), log2_m, 0x037F, &mut dummy)
                             } else {
-                                if r != 0.0 && r.is_finite() {
-                                    sw |= SW_PE;
-                                }
-                                Fp80::from_f64_raw(r)
+                                let xf = f64::from_bits(x.to_f64_bits(RC_RN, &mut dummy));
+                                Fp80::from_f64_raw(xf.ln_1p() * core::f64::consts::LOG2_E)
+                            };
+                            let r = Fp80::mul(y, log2_1px, ext_cw, &mut sw);
+                            if r.kind == Fp80Kind::Finite {
+                                sw |= SW_PE;
                             }
+                            r
                         }
                     }
                 };
