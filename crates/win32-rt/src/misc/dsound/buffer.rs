@@ -408,6 +408,7 @@ impl BufferEffect {
         let cap = match kind {
             DsFxKind::Echo | DsFxKind::WavesReverb | DsFxKind::I3dl2Reverb => 96_000,
             DsFxKind::Chorus | DsFxKind::Flanger => 4_096,
+            DsFxKind::Compressor => 1_024,
             _ => 0,
         };
         Self {
@@ -501,17 +502,44 @@ impl BufferEffect {
             }
             DsFxKind::Compressor => {
                 let gain = 10.0f32.powf(self.param_f32(0).clamp(-60.0, 60.0) / 20.0);
+                let attack_s = self.param_f32(4).clamp(0.01, 500.0) * 0.001;
+                let release_s = self.param_f32(8).clamp(50.0, 3000.0) * 0.001;
                 let thresh = 10.0f32.powf(self.param_f32(12).clamp(-60.0, 0.0) / 20.0);
                 let ratio = self.param_f32(16).clamp(1.0, 100.0);
+                let predelay_ms = self.param_f32(20).clamp(0.0, 4.0);
+                let attack_coeff = (1.0 - (-1.0 / (attack_s * sr)).exp()).clamp(0.0, 1.0);
+                let release_coeff = (1.0 - (-1.0 / (release_s * sr)).exp()).clamp(0.0, 1.0);
                 let peak = l.abs().max(r.abs());
-                let coeff = if peak > self.env { 0.01 } else { 0.001 };
+                let coeff = if peak > self.env { attack_coeff } else { release_coeff };
                 self.env += coeff * (peak - self.env);
                 let comp = if self.env > thresh && self.env > 1e-6 {
                     (thresh + (self.env - thresh) / ratio) / self.env
                 } else {
                     1.0
                 };
-                (l * comp * gain, r * comp * gain)
+                let cap = self.delay_l.len();
+                let predelay_samples = if cap > 1 {
+                    ((predelay_ms * 0.001 * sr).round() as usize).min(cap - 1)
+                } else {
+                    0
+                };
+                let (sig_l, sig_r) = if predelay_samples > 0 {
+                    let read_pos = (self.delay_pos + cap - predelay_samples) % cap;
+                    let dl = self.delay_l[read_pos];
+                    let dr = self.delay_r[read_pos];
+                    self.delay_l[self.delay_pos] = l;
+                    self.delay_r[self.delay_pos] = r;
+                    self.delay_pos = (self.delay_pos + 1) % cap;
+                    (dl, dr)
+                } else {
+                    if cap > 0 {
+                        self.delay_l[self.delay_pos] = l;
+                        self.delay_r[self.delay_pos] = r;
+                        self.delay_pos = (self.delay_pos + 1) % cap;
+                    }
+                    (l, r)
+                };
+                (sig_l * comp * gain, sig_r * comp * gain)
             }
             DsFxKind::ParamEq => {
                 let fc = self.param_f32(0).clamp(80.0, (sr * 0.45).min(16_000.0));

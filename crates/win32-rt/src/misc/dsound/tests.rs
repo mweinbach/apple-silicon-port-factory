@@ -1619,3 +1619,78 @@ fn dsound8_i3dl2_reverb_full_vtable_preset_and_quality() {
         assert_eq!(ds_release(ds), 0);
     }
 }
+
+#[test]
+fn dsound8_compressor_honors_attack_release_predelay_and_sample_rate() {
+    let make_comp = |attack_ms: f32, release_ms: f32, predelay_ms: f32| -> BufferEffect {
+        let mut fx = BufferEffect::new(DsFxKind::Compressor);
+        let mut raw = Vec::with_capacity(24);
+        for f in [0.0f32, attack_ms, release_ms, -20.0, 10.0, predelay_ms] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        fx.params = raw;
+        fx
+    };
+
+    // 1. Faster fAttack compresses a 1.0 step more strongly after 2 ms (96 samples @ 48 kHz).
+    let mut fast_atk = make_comp(1.0, 200.0, 0.0);
+    let mut slow_atk = make_comp(200.0, 200.0, 0.0);
+    let mut out_fast = 0.0f32;
+    let mut out_slow = 0.0f32;
+    for _ in 0..96 {
+        out_fast = fast_atk.process_sample(1.0, 1.0, 48_000.0).0;
+        out_slow = slow_atk.process_sample(1.0, 1.0, 48_000.0).0;
+    }
+    assert!(
+        out_fast < out_slow * 0.4,
+        "fast attack ({out_fast}) should attenuate much more than slow attack ({out_slow})"
+    );
+
+    // 2. Faster fRelease recovers gain much more quickly after signal drops to 0.05 (below -20 dB).
+    let mut fast_rel = make_comp(0.5, 50.0, 0.0);
+    let mut slow_rel = make_comp(0.5, 2000.0, 0.0);
+    for _ in 0..480 {
+        fast_rel.process_sample(1.0, 1.0, 48_000.0);
+        slow_rel.process_sample(1.0, 1.0, 48_000.0);
+    }
+    // 50 ms at 48 kHz = 2400 samples: fast release should recover well above slow release.
+    let mut rel_fast = 0.0f32;
+    let mut rel_slow = 0.0f32;
+    for _ in 0..2400 {
+        rel_fast = fast_rel.process_sample(0.05, 0.05, 48_000.0).0;
+        rel_slow = slow_rel.process_sample(0.05, 0.05, 48_000.0).0;
+    }
+    assert!(
+        rel_fast > rel_slow * 1.5,
+        "fast release ({rel_fast}) should recover much faster than slow release ({rel_slow})"
+    );
+
+    // 3. Attack time constant is sample-rate independent: 10 ms at 24 kHz vs 48 kHz matches.
+    let mut fx_24k = make_comp(10.0, 200.0, 0.0);
+    let mut fx_48k = make_comp(10.0, 200.0, 0.0);
+    let mut y_24k = 0.0f32;
+    let mut y_48k = 0.0f32;
+    for _ in 0..240 {
+        y_24k = fx_24k.process_sample(1.0, 1.0, 24_000.0).0;
+    }
+    for _ in 0..480 {
+        y_48k = fx_48k.process_sample(1.0, 1.0, 48_000.0).0;
+    }
+    assert!(
+        (y_24k - y_48k).abs() < 1e-3,
+        "10 ms attack should be sample-rate independent (24k={y_24k}, 48k={y_48k})"
+    );
+
+    // 4. Non-zero fPredelay delays the audio path by round(predelay_ms * sr / 1000) samples.
+    let mut fx_pre = make_comp(10.0, 200.0, 1.0);
+    let first = fx_pre.process_sample(0.05, 0.05, 48_000.0).0;
+    assert!(first.abs() < 1e-6, "1 ms predelay should delay sample 0, got {first}");
+    let mut delayed = 0.0f32;
+    for _ in 0..48 {
+        delayed = fx_pre.process_sample(0.0, 0.0, 48_000.0).0;
+    }
+    assert!(
+        (delayed - 0.05).abs() < 1e-4,
+        "impulse should emerge after 48 samples (1 ms @ 48 kHz), got {delayed}"
+    );
+}
