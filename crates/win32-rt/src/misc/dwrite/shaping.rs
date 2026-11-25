@@ -294,6 +294,12 @@ mod coretext {
         fn CTRunGetStringIndices(run: *const c_void, range: CFRange, buffer: *mut isize);
         fn CTRunGetAdvances(run: *const c_void, range: CFRange, buffer: *mut CGSize);
         fn CTRunGetPositions(run: *const c_void, range: CFRange, buffer: *mut CGPoint);
+        fn CTFontGetVerticalTranslationsForGlyphs(
+            font: *const c_void,
+            glyphs: *const u16,
+            translations: *mut CGSize,
+            count: isize,
+        );
     }
 
     struct CfGuard(*const c_void);
@@ -615,13 +621,100 @@ mod coretext {
                 CTRunGetPositions(run, range, positions.as_mut_ptr());
 
                 let run_rtl = (CTRunGetStatus(run) & CT_RUN_STATUS_RIGHT_TO_LEFT) != 0;
-                let run_adv: f64 = advances.iter().map(|a| a.width).sum();
                 let mut items = Vec::with_capacity(n);
                 let mut min_str_idx = usize::MAX;
 
-                if run_rtl {
+                if is_sideways {
+                    // In CoreText vertical layout, glyph positions advance downward along `-Y`
+                    // and include each glyph's horizontal-to-vertical origin translation `vtr`.
+                    // Subtracting `vtr` yields vertical-origin coordinates `vpos`, where
+                    // `vis_adv = -vpos.y` increases along DirectWrite's advance axis and
+                    // `vpos.x` lies along DirectWrite's perpendicular ascender axis.
+                    // CoreText's `CTRunGetAdvances[0]` also folds `vpos[0].y` (leading vertical
+                    // placement such as `vpal` top trim) into the first advance, so remove the
+                    // leading offset delta from glyph 0 so `sum(adv)` matches the run's true
+                    // typographic advance while `pen + advanceOffset` hits `vis_adv[v]` exactly.
+                    let mut vtr = vec![CGSize { width: 0.0, height: 0.0 }; n];
+                    CTFontGetVerticalTranslationsForGlyphs(
+                        base_ct_font.0,
+                        gids.as_ptr(),
+                        vtr.as_mut_ptr(),
+                        gc,
+                    );
+                    let vis_advs: Vec<f64> = (0..n).map(|v| -(positions[v].y - vtr[v].height)).collect();
+                    let run_end = vis_advs[n - 1] + advances[n - 1].width;
+                    let mut logical_pen = 0.0f64;
+
+                    if run_rtl {
+                        for v in (0..n).rev() {
+                            let str_idx = (indices[v].max(0) as usize).min(units.len() - 1);
+                            min_str_idx = min_str_idx.min(str_idx);
+                            let raw_adv = if v == 0 {
+                                advances[0].width + (vis_advs[0] - line_pen_x)
+                            } else {
+                                advances[v].width
+                            };
+                            let adv = if no_visual { 0.0 } else { raw_adv.max(0.0) };
+                            let expected_vis_adv = run_end - logical_pen - adv;
+                            let adv_off = if no_visual {
+                                0.0
+                            } else {
+                                (expected_vis_adv - vis_advs[v]) as f32
+                            };
+                            let asc_off = if no_visual {
+                                0.0
+                            } else {
+                                (positions[v].x - vtr[v].width) as f32
+                            };
+                            logical_pen += adv;
+                            items.push((
+                                str_idx,
+                                gids[v],
+                                (adv as f32) * scale_back,
+                                DWRITE_GLYPH_OFFSET {
+                                    advanceOffset: adv_off * scale_back,
+                                    ascenderOffset: asc_off * scale_back,
+                                },
+                            ));
+                        }
+                    } else {
+                        for v in 0..n {
+                            let str_idx = (indices[v].max(0) as usize).min(units.len() - 1);
+                            min_str_idx = min_str_idx.min(str_idx);
+                            let raw_adv = if v == 0 {
+                                advances[0].width + (vis_advs[0] - line_pen_x)
+                            } else {
+                                advances[v].width
+                            };
+                            let adv = if no_visual { 0.0 } else { raw_adv.max(0.0) };
+                            let expected_vis_adv = line_pen_x + logical_pen;
+                            let adv_off = if no_visual {
+                                0.0
+                            } else {
+                                (vis_advs[v] - expected_vis_adv) as f32
+                            };
+                            let asc_off = if no_visual {
+                                0.0
+                            } else {
+                                (positions[v].x - vtr[v].width) as f32
+                            };
+                            logical_pen += adv;
+                            items.push((
+                                str_idx,
+                                gids[v],
+                                (adv as f32) * scale_back,
+                                DWRITE_GLYPH_OFFSET {
+                                    advanceOffset: adv_off * scale_back,
+                                    ascenderOffset: asc_off * scale_back,
+                                },
+                            ));
+                        }
+                    }
+                    line_pen_x += logical_pen;
+                } else if run_rtl {
                     // Visual order is right-to-left reversed; walk from right to left to recover
                     // DirectWrite logical order with exact RTL advanceOffset polarity.
+                    let run_adv: f64 = advances.iter().map(|a| a.width).sum();
                     let run_right_x = line_pen_x + run_adv;
                     let mut logical_pen = 0.0f64;
                     for v in (0..n).rev() {
@@ -642,7 +735,9 @@ mod coretext {
                             },
                         ));
                     }
+                    line_pen_x += run_adv;
                 } else {
+                    let run_adv: f64 = advances.iter().map(|a| a.width).sum();
                     let mut logical_pen = 0.0f64;
                     for v in 0..n {
                         let str_idx = (indices[v].max(0) as usize).min(units.len() - 1);
@@ -662,9 +757,9 @@ mod coretext {
                             },
                         ));
                     }
+                    line_pen_x += run_adv;
                 }
 
-                line_pen_x += run_adv;
                 parsed_runs.push(RawRun { min_str_idx, items });
             }
 

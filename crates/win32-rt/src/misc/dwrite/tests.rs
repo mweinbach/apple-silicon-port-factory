@@ -3482,7 +3482,10 @@ fn factory_retains_registered_font_and_collection_loaders_until_unregistered_or_
 
 #[test]
 fn text_analyzer_get_glyphs_honors_is_sideways_vertical_alternates_and_fallback_rejection() {
-    use super::analysis::{ta_get_glyph_placements, ta_get_glyphs, PTextAnalyzer};
+    use super::analysis::{
+        ta_get_gdi_compatible_glyph_placements, ta_get_glyph_placements, ta_get_glyphs,
+        PTextAnalyzer,
+    };
     use super::sfnt::FontMeta;
     use std::collections::HashMap;
 
@@ -3618,6 +3621,143 @@ fn text_analyzer_get_glyphs_honors_is_sideways_vertical_alternates_and_fallback_
                 S_OK
             );
             assert!(adv.iter().all(|&a| a > 0.0), "vertical advances must be positive: {adv:?}");
+            // Default un-adjusted vertical CJK glyphs must have ~0 offsets (CoreText vertical
+            // origin translations stripped cleanly rather than leaking into glyphOffsets).
+            for (idx, o) in off.iter().enumerate() {
+                assert!(
+                    o.advanceOffset.abs() < 1e-3 && o.ascenderOffset.abs() < 1e-3,
+                    "default vertical glyph {idx} offset should be ~0, got {o:?}"
+                );
+            }
+
+            // Verify OpenType `vpal` (vertical proportional alternates) adjusts sideways
+            // advances and offsets in both GetGlyphPlacements and GetGdiCompatibleGlyphPlacements.
+            #[repr(C)]
+            struct FontFeature {
+                tag: u32,
+                param: u32,
+            }
+            #[repr(C)]
+            struct TypoFeatures {
+                features: *const FontFeature,
+                count: u32,
+            }
+            let vpal_feat = FontFeature {
+                tag: u32::from_le_bytes(*b"vpal"),
+                param: 1,
+            };
+            let vpal_set = TypoFeatures {
+                features: &vpal_feat,
+                count: 1,
+            };
+            let feat_ptrs = [&vpal_set as *const TypoFeatures as *const c_void];
+            let feat_lens = [text.len() as u32];
+            let mut adv_vpal = [0.0f32; 4];
+            let mut off_vpal = [DWRITE_GLYPH_OFFSET::default(); 4];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    vert_cm.as_ptr(),
+                    vert_tp.as_ptr(),
+                    text.len() as u32,
+                    vert_gids.as_ptr(),
+                    vert_gp.as_ptr(),
+                    vert_gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    TRUE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    1,
+                    adv_vpal.as_mut_ptr(),
+                    off_vpal.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            let default_sum: f32 = adv.iter().sum();
+            let vpal_sum: f32 = adv_vpal.iter().sum();
+            assert!(
+                vpal_sum < default_sum - 1.0,
+                "vpal=1 must tighten vertical total advance on CJK brackets: default={adv:?} (sum={default_sum}), vpal={adv_vpal:?} (sum={vpal_sum}), off={off_vpal:?}"
+            );
+            assert!(
+                off_vpal[0].advanceOffset < -1.0 && off_vpal[1].advanceOffset.abs() < 1e-3,
+                "vpal=1 should apply top-trim offset to opening bracket without drifting subsequent glyphs: {off_vpal:?}"
+            );
+
+            // GetGdiCompatibleGlyphPlacements must also apply sideways shaping features
+            // (natural mode matches GetGlyphPlacements exactly; classic snaps to pixel grid).
+            let mut gdi_adv_nat = [0.0f32; 4];
+            let mut gdi_off_nat = [DWRITE_GLYPH_OFFSET::default(); 4];
+            assert_eq!(
+                ta_get_gdi_compatible_glyph_placements(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    vert_cm.as_ptr(),
+                    vert_tp.as_ptr(),
+                    text.len() as u32,
+                    vert_gids.as_ptr(),
+                    vert_gp.as_ptr(),
+                    vert_gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    std::ptr::null(),
+                    TRUE,
+                    TRUE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    1,
+                    gdi_adv_nat.as_mut_ptr(),
+                    gdi_off_nat.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            for i in 0..4 {
+                assert!((gdi_adv_nat[i] - adv_vpal[i]).abs() < 1e-4);
+                assert!((gdi_off_nat[i].advanceOffset - off_vpal[i].advanceOffset).abs() < 1e-4);
+            }
+
+            let mut gdi_adv_classic = [0.0f32; 4];
+            let mut gdi_off_classic = [DWRITE_GLYPH_OFFSET::default(); 4];
+            assert_eq!(
+                ta_get_gdi_compatible_glyph_placements(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    vert_cm.as_ptr(),
+                    vert_tp.as_ptr(),
+                    text.len() as u32,
+                    vert_gids.as_ptr(),
+                    vert_gp.as_ptr(),
+                    vert_gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    std::ptr::null(),
+                    FALSE,
+                    TRUE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    1,
+                    gdi_adv_classic.as_mut_ptr(),
+                    gdi_off_classic.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            assert!(
+                gdi_adv_classic.iter().all(|&a| (a - a.round()).abs() < 1e-5),
+                "classic GDI sideways placement should snap advances to whole pixels: {gdi_adv_classic:?}"
+            );
 
             let _ = release_com(face);
             let _ = release_com(ffile);
@@ -3673,6 +3813,84 @@ fn text_analyzer_get_glyphs_honors_is_sideways_vertical_alternates_and_fallback_
             E_NOTIMPL
         );
         assert_eq!(actual, 0);
+
+        // Fallback face without SFNT bytes must also reject featured sideways placement
+        // (e.g. `vpal`) honestly with E_NOTIMPL in both GetGlyphPlacements and
+        // GetGdiCompatibleGlyphPlacements.
+        #[repr(C)]
+        struct FbFontFeature {
+            tag: u32,
+            param: u32,
+        }
+        #[repr(C)]
+        struct FbTypoFeatures {
+            features: *const FbFontFeature,
+            count: u32,
+        }
+        let fb_vpal = FbFontFeature {
+            tag: u32::from_le_bytes(*b"vpal"),
+            param: 1,
+        };
+        let fb_fset = FbTypoFeatures {
+            features: &fb_vpal,
+            count: 1,
+        };
+        let fb_fptrs = [&fb_fset as *const FbTypoFeatures as *const c_void];
+        let fb_flens = [latin.len() as u32];
+        let fb_gids = [1u16, 2u16];
+        let mut fb_adv = [0.0f32; 2];
+        let mut fb_off = [DWRITE_GLYPH_OFFSET::default(); 2];
+        assert_eq!(
+            ta_get_glyph_placements(
+                ta as PTextAnalyzer,
+                latin.as_ptr(),
+                cm.as_ptr(),
+                tp.as_ptr(),
+                latin.len() as u32,
+                fb_gids.as_ptr(),
+                gp.as_ptr(),
+                fb_gids.len() as u32,
+                fb_face,
+                24.0f32.to_bits(),
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                fb_fptrs.as_ptr(),
+                fb_flens.as_ptr(),
+                1,
+                fb_adv.as_mut_ptr(),
+                fb_off.as_mut_ptr(),
+            ),
+            E_NOTIMPL
+        );
+        assert_eq!(
+            ta_get_gdi_compatible_glyph_placements(
+                ta as PTextAnalyzer,
+                latin.as_ptr(),
+                cm.as_ptr(),
+                tp.as_ptr(),
+                latin.len() as u32,
+                fb_gids.as_ptr(),
+                gp.as_ptr(),
+                fb_gids.len() as u32,
+                fb_face,
+                24.0f32.to_bits(),
+                1.0f32.to_bits(),
+                std::ptr::null(),
+                FALSE,
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                fb_fptrs.as_ptr(),
+                fb_flens.as_ptr(),
+                1,
+                fb_adv.as_mut_ptr(),
+                fb_off.as_mut_ptr(),
+            ),
+            E_NOTIMPL
+        );
 
         let _ = release_com(fb_face);
         let _ = release_com(ta);

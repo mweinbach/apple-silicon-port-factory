@@ -1390,6 +1390,7 @@ unsafe fn try_position_glyphs_platform(
     glyph_indices: *const u16,
     glyph_count: u32,
     em_size: f32,
+    is_sideways: bool,
     is_rtl: bool,
     no_visual: bool,
     locale_name: *const u16,
@@ -1424,7 +1425,7 @@ unsafe fn try_position_glyphs_platform(
         feature_ranges,
         orig_units.len(),
     );
-    let shape_units = lookup_substituted_run(&orig_units, &caller_gids, is_rtl, false)
+    let shape_units = lookup_substituted_run(&orig_units, &caller_gids, is_rtl, is_sideways)
         .unwrap_or(orig_units);
 
     if let Some(shaped) = super::shaping::shape_run_platform(
@@ -1432,7 +1433,7 @@ unsafe fn try_position_glyphs_platform(
         &shape_units,
         em_size,
         is_rtl,
-        false,
+        is_sideways,
         no_visual,
         locale.as_deref(),
         &feat_ranges,
@@ -1457,10 +1458,16 @@ unsafe fn try_position_glyphs_platform(
             }
             return Some(S_OK);
         }
-    } else if super::shaping::needs_complex_shaping(&shape_units, is_rtl, false, !feat_ranges.is_empty()) {
+    } else if super::shaping::needs_complex_shaping(
+        &shape_units,
+        is_rtl,
+        false,
+        !feat_ranges.is_empty(),
+    ) {
         log::warn!(
-            "dwrite: IDWriteTextAnalyzer::GetGlyphPlacements cannot position complex run (len={}, family={:?})",
+            "dwrite: IDWriteTextAnalyzer::GetGlyphPlacements cannot position complex/featured run (len={}, sideways={}, family={:?})",
             shape_units.len(),
+            is_sideways,
             face.meta.family_name,
         );
         return Some(E_NOTIMPL);
@@ -1507,26 +1514,25 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
     }
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
     let sideways = is_sideways != FALSE;
-    if !sideways {
-        if let Some(hr) = try_position_glyphs_platform(
-            &face,
-            text_string,
-            text_len,
-            glyph_indices,
-            glyph_count,
-            em_size,
-            is_rtl != 0,
-            no_visual,
-            locale_name,
-            features,
-            feature_range_lengths,
-            feature_ranges,
-            None,
-            glyph_advances,
-            glyph_offsets,
-        ) {
-            return hr;
-        }
+    if let Some(hr) = try_position_glyphs_platform(
+        &face,
+        text_string,
+        text_len,
+        glyph_indices,
+        glyph_count,
+        em_size,
+        sideways,
+        is_rtl != 0,
+        no_visual,
+        locale_name,
+        features,
+        feature_range_lengths,
+        feature_ranges,
+        None,
+        glyph_advances,
+        glyph_offsets,
+    ) {
+        return hr;
     }
     for i in 0..glyph_count as usize {
         let gid = glyph_indices.add(i).read_unaligned();
@@ -1612,26 +1618,25 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     let gdi_snap = (use_gdi_natural == FALSE).then_some((eff_ppd_x, eff_ppd_y));
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
     let sideways = is_sideways != FALSE;
-    if !sideways {
-        if let Some(hr) = try_position_glyphs_platform(
-            &face,
-            text_string,
-            text_len,
-            glyph_indices,
-            glyph_count,
-            em_size,
-            is_rtl != 0,
-            no_visual,
-            locale_name,
-            features,
-            feature_range_lengths,
-            feature_ranges,
-            gdi_snap,
-            glyph_advances,
-            glyph_offsets,
-        ) {
-            return hr;
-        }
+    if let Some(hr) = try_position_glyphs_platform(
+        &face,
+        text_string,
+        text_len,
+        glyph_indices,
+        glyph_count,
+        em_size,
+        sideways,
+        is_rtl != 0,
+        no_visual,
+        locale_name,
+        features,
+        feature_range_lengths,
+        feature_ranges,
+        gdi_snap,
+        glyph_advances,
+        glyph_offsets,
+    ) {
+        return hr;
     }
     for i in 0..glyph_count as usize {
         let gid = glyph_indices.add(i).read_unaligned();
