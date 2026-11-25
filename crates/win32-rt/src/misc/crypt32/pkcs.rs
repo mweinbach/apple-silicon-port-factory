@@ -1211,10 +1211,24 @@ pub(super) unsafe fn crypt_verify_message_signature_impl(
 // RFC 7292 PKCS#12 / PFXImportCertStore (CommonCrypto PBES1 + PBES2 + HMAC)
 // ---------------------------------------------------------------------------
 
-/// Upper bound on PFX KDF iteration counts across MacData, PBES1, and PBES2.
+/// Upper bound on a single PFX KDF iteration count across MacData, PBES1, and PBES2.
 /// Comfortably above OWASP PBKDF2 recommendations (600,000) while rejecting
 /// attacker-crafted 32-bit counts (e.g. `0xffffffff`) before entering any KDF loop.
 pub(super) const MAX_PFX_KDF_ITERATIONS: u32 = 2_000_000;
+
+/// Upper bound on cumulative KDF work (total hash/PRF block iterations) across an entire
+/// `PFXImportCertStore` import, covering `MacData`, encrypted `SafeContents`, and
+/// `pkcs8ShroudedKeyBag` entries (including PBES1 key+IV derivations and multi-block KDF outputs).
+pub(super) const MAX_PFX_TOTAL_KDF_ITERATIONS: u64 = 4_000_000;
+
+#[inline]
+fn consume_kdf_budget(kdf_budget: &mut u64, work: u64) -> Result<(), u32> {
+    if work == 0 || work > *kdf_budget {
+        return Err(err::ERROR_INVALID_DATA);
+    }
+    *kdf_budget -= work;
+    Ok(())
+}
 
 /// RFC 7292 Appendix B.2 PKCS#12 key/IV/MAC derivation.
 fn pkcs12_kdf(
@@ -1224,15 +1238,19 @@ fn pkcs12_kdf(
     iters: u32,
     id: u8,
     out_len: usize,
-) -> Option<Vec<u8>> {
-    if iters == 0 || iters > MAX_PFX_KDF_ITERATIONS {
-        return None;
+    kdf_budget: &mut u64,
+) -> Result<Vec<u8>, u32> {
+    if iters == 0 || iters > MAX_PFX_KDF_ITERATIONS || out_len == 0 {
+        return Err(err::ERROR_INVALID_DATA);
     }
     let v = match digest {
         Digest::Sha384 | Digest::Sha512 => 128usize,
         _ => 64usize,
     };
     let u = digest.len();
+    let c = (out_len + u - 1) / u;
+    let work = (iters as u64).saturating_mul(c as u64);
+    consume_kdf_budget(kdf_budget, work)?;
     let d = vec![id; v];
 
     let repeat_pad = |src: &[u8]| -> Vec<u8> {
@@ -1255,7 +1273,6 @@ fn pkcs12_kdf(
     i_buf.extend_from_slice(&p_buf);
 
     let mut derived = Vec::with_capacity(out_len);
-    let c = (out_len + u - 1) / u;
     for block_idx in 0..c {
         let mut a = digest.hash_slices(&[&d, &i_buf]);
         for _ in 1..iters {
@@ -1281,7 +1298,7 @@ fn pkcs12_kdf(
         }
     }
     derived.truncate(out_len);
-    Some(derived)
+    Ok(derived)
 }
 
 fn password_to_bmp_string(pass: Option<&str>) -> Vec<u8> {
@@ -1340,9 +1357,10 @@ unsafe fn decrypt_pbe(
     ciphertext: &[u8],
     password_utf8: &str,
     pass_bmp: &[u8],
-) -> Option<Vec<u8>> {
-    let (alg_oid, params_opt) = parse_alg_id(alg_elem)?;
-    let params = params_opt?;
+    kdf_budget: &mut u64,
+) -> Result<Vec<u8>, u32> {
+    let (alg_oid, params_opt) = parse_alg_id(alg_elem).ok_or(err::ERROR_INVALID_DATA)?;
+    let params = params_opt.ok_or(err::ERROR_INVALID_DATA)?;
 
     // PBES1 (PKCS#12 PBE with SHA-1)
     if matches!(
@@ -1350,16 +1368,16 @@ unsafe fn decrypt_pbe(
         OID_PBE_SHA1_3DES_CBC | OID_PBE_SHA1_RC2_128_CBC | OID_PBE_SHA1_RC2_40_CBC
     ) {
         if params.tag != 0x30 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
-        let pk = der_item_children(params.val)?;
+        let pk = der_item_children(params.val).ok_or(err::ERROR_INVALID_DATA)?;
         if pk.len() < 2 || pk[0].tag != 0x04 || pk[1].tag != 0x02 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
         let salt = pk[0].val;
-        let iters = parse_der_u32_val(pk[1].val)?;
+        let iters = parse_der_u32_val(pk[1].val).ok_or(err::ERROR_INVALID_DATA)?;
         if iters == 0 || iters > MAX_PFX_KDF_ITERATIONS {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
         let (cc_alg, key_len) = match alg_oid {
             OID_PBE_SHA1_3DES_CBC => (K_CC_ALGORITHM_3DES, 24usize),
@@ -1367,58 +1385,67 @@ unsafe fn decrypt_pbe(
             OID_PBE_SHA1_RC2_40_CBC => (K_CC_ALGORITHM_RC2, 5usize),
             _ => unreachable!(),
         };
-        let key = pkcs12_kdf(Digest::Sha1, pass_bmp, salt, iters, 1, key_len)?;
-        let iv = pkcs12_kdf(Digest::Sha1, pass_bmp, salt, iters, 2, 8)?;
-        return cc_decrypt_cbc(cc_alg, &key, &iv, ciphertext);
+        // Check combined key + IV KDF work upfront before running either derivation.
+        let sha1_len = Digest::Sha1.len();
+        let key_blocks = (key_len + sha1_len - 1) / sha1_len;
+        let iv_blocks = (8 + sha1_len - 1) / sha1_len;
+        let combined_work = (iters as u64).saturating_mul((key_blocks + iv_blocks) as u64);
+        if combined_work == 0 || combined_work > *kdf_budget {
+            return Err(err::ERROR_INVALID_DATA);
+        }
+        let key = pkcs12_kdf(Digest::Sha1, pass_bmp, salt, iters, 1, key_len, kdf_budget)?;
+        let iv = pkcs12_kdf(Digest::Sha1, pass_bmp, salt, iters, 2, 8, kdf_budget)?;
+        return cc_decrypt_cbc(cc_alg, &key, &iv, ciphertext).ok_or(ERROR_INVALID_PASSWORD);
     }
 
     // PBES2 (RFC 8018)
     if alg_oid == OID_PBES2 {
         if params.tag != 0x30 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
-        let pk = der_item_children(params.val)?;
+        let pk = der_item_children(params.val).ok_or(err::ERROR_INVALID_DATA)?;
         if pk.len() < 2 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
         // keyDerivationFunc (PBKDF2)
-        let (kdf_oid, kdf_params) = parse_alg_id(pk[0])?;
+        let (kdf_oid, kdf_params) = parse_alg_id(pk[0]).ok_or(err::ERROR_INVALID_DATA)?;
         if kdf_oid != OID_PBKDF2 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
-        let kp_elem = kdf_params?;
+        let kp_elem = kdf_params.ok_or(err::ERROR_INVALID_DATA)?;
         if kp_elem.tag != 0x30 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
-        let kp = der_item_children(kp_elem.val)?;
+        let kp = der_item_children(kp_elem.val).ok_or(err::ERROR_INVALID_DATA)?;
         if kp.len() < 2 || kp[0].tag != 0x04 || kp[1].tag != 0x02 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
         let salt = kp[0].val;
-        let iters = parse_der_u32_val(kp[1].val)?;
+        let iters = parse_der_u32_val(kp[1].val).ok_or(err::ERROR_INVALID_DATA)?;
         let mut explicit_key_len: Option<usize> = None;
         let mut prf_cc = K_CC_PRF_HMAC_SHA1;
+        let mut prf_len = 20usize;
         for extra in kp.iter().skip(2) {
             if extra.tag == 0x02 {
-                explicit_key_len = parse_der_u32_val(extra.val).map(|n| n as usize);
+                let len = parse_der_u32_val(extra.val).ok_or(err::ERROR_INVALID_DATA)?;
+                explicit_key_len = Some(len as usize);
             } else if extra.tag == 0x30 {
-                if let Some((prf_oid, _)) = parse_alg_id(*extra) {
-                    prf_cc = match prf_oid {
-                        OID_HMAC_SHA1 => K_CC_PRF_HMAC_SHA1,
-                        OID_HMAC_SHA256 => K_CC_PRF_HMAC_SHA256,
-                        OID_HMAC_SHA384 => K_CC_PRF_HMAC_SHA384,
-                        OID_HMAC_SHA512 => K_CC_PRF_HMAC_SHA512,
-                        _ => return None,
-                    };
-                }
+                let (prf_oid, _) = parse_alg_id(*extra).ok_or(err::ERROR_INVALID_DATA)?;
+                (prf_cc, prf_len) = match prf_oid {
+                    OID_HMAC_SHA1 => (K_CC_PRF_HMAC_SHA1, 20),
+                    OID_HMAC_SHA256 => (K_CC_PRF_HMAC_SHA256, 32),
+                    OID_HMAC_SHA384 => (K_CC_PRF_HMAC_SHA384, 48),
+                    OID_HMAC_SHA512 => (K_CC_PRF_HMAC_SHA512, 64),
+                    _ => return Err(err::ERROR_INVALID_DATA),
+                };
             }
         }
 
         // encryptionScheme
-        let (enc_oid, enc_params) = parse_alg_id(pk[1])?;
-        let iv_elem = enc_params?;
+        let (enc_oid, enc_params) = parse_alg_id(pk[1]).ok_or(err::ERROR_INVALID_DATA)?;
+        let iv_elem = enc_params.ok_or(err::ERROR_INVALID_DATA)?;
         if iv_elem.tag != 0x04 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
         let iv = iv_elem.val;
         let (cc_alg, default_key_len, expected_iv_len) = match enc_oid {
@@ -1426,15 +1453,19 @@ unsafe fn decrypt_pbe(
             OID_AES_192_CBC => (K_CC_ALGORITHM_AES, 24usize, 16usize),
             OID_AES_256_CBC => (K_CC_ALGORITHM_AES, 32usize, 16usize),
             OID_3DES_CBC => (K_CC_ALGORITHM_3DES, 24usize, 8usize),
-            _ => return None,
+            _ => return Err(err::ERROR_INVALID_DATA),
         };
         if iv.len() != expected_iv_len {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
         let key_len = explicit_key_len.unwrap_or(default_key_len);
         if key_len != default_key_len || iters == 0 || iters > MAX_PFX_KDF_ITERATIONS {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
+        let blocks = (key_len + prf_len - 1) / prf_len;
+        let work = (iters as u64).saturating_mul(blocks as u64);
+        consume_kdf_budget(kdf_budget, work)?;
+
         let mut key = vec![0u8; key_len];
         let pw_bytes = password_utf8.as_bytes();
         let st = CCKeyDerivationPBKDF(
@@ -1449,12 +1480,12 @@ unsafe fn decrypt_pbe(
             key.len(),
         );
         if st != 0 {
-            return None;
+            return Err(err::ERROR_INVALID_DATA);
         }
-        return cc_decrypt_cbc(cc_alg, &key, iv, ciphertext);
+        return cc_decrypt_cbc(cc_alg, &key, iv, ciphertext).ok_or(ERROR_INVALID_PASSWORD);
     }
 
-    None
+    Err(err::ERROR_INVALID_DATA)
 }
 
 struct PfxBagCert {
@@ -1521,6 +1552,7 @@ unsafe fn parse_safe_contents(
     certs: &mut Vec<PfxBagCert>,
     keys: &mut Vec<PfxBagKey>,
     bag_count: &mut usize,
+    kdf_budget: &mut u64,
 ) -> Result<(), u32> {
     let mut worklist: Vec<(&[u8], usize)> = vec![(der, 0)];
     while let Some((cur_der, depth)) = worklist.pop() {
@@ -1587,8 +1619,7 @@ unsafe fn parse_safe_contents(
                 if ek.len() < 2 || ek[1].tag != 0x04 {
                     return Err(err::ERROR_INVALID_DATA);
                 }
-                let pkcs8 = decrypt_pbe(ek[0], ek[1].val, password_utf8, pass_bmp)
-                    .ok_or(ERROR_INVALID_PASSWORD)?;
+                let pkcs8 = decrypt_pbe(ek[0], ek[1].val, password_utf8, pass_bmp, kdf_budget)?;
                 keys.push(PfxBagKey {
                     pkcs8_der: pkcs8,
                     local_key_id,
@@ -1759,6 +1790,9 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         return std::ptr::null_mut();
     };
 
+    // Shared cumulative KDF work budget across MacData, encrypted SafeContents, and shrouded key bags.
+    let mut kdf_budget: u64 = MAX_PFX_TOTAL_KDF_ITERATIONS;
+
     // Verify MacData if present
     if let Some(mac_elem) = pfx_kids.get(2) {
         if mac_elem.tag != 0x30 {
@@ -1806,14 +1840,19 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
             }
         };
 
-        let check_mac = |bmp: &[u8]| -> bool {
-            let Some(mac_key) = pkcs12_kdf(mac_digest, bmp, salt, iters, 3, mac_digest.len()) else {
-                return false;
-            };
+        let check_mac = |bmp: &[u8], budget: &mut u64| -> Result<bool, u32> {
+            let mac_key = pkcs12_kdf(mac_digest, bmp, salt, iters, 3, mac_digest.len(), budget)?;
             let computed = mac_digest.hmac(&mac_key, &auth_safe_bytes);
-            computed.as_slice() == expected_mac
+            Ok(computed.as_slice() == expected_mac)
         };
-        if !check_mac(&pass_bmp) {
+        let mac_ok = match check_mac(&pass_bmp, &mut kdf_budget) {
+            Ok(ok) => ok,
+            Err(code) => {
+                crate::teb::set_last_error(code);
+                return std::ptr::null_mut();
+            }
+        };
+        if !mac_ok {
             // Windows / OpenSSL compatibility: empty password may be encoded as 0-byte or 2-byte NUL BMPString.
             let alt = if pass_bmp.is_empty() && pass_opt.is_none() {
                 Some(vec![0u8, 0u8])
@@ -1823,11 +1862,16 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
                 None
             };
             if let Some(alt_bmp) = alt {
-                if check_mac(&alt_bmp) {
-                    pass_bmp = alt_bmp;
-                } else {
-                    crate::teb::set_last_error(ERROR_INVALID_PASSWORD);
-                    return std::ptr::null_mut();
+                match check_mac(&alt_bmp, &mut kdf_budget) {
+                    Ok(true) => pass_bmp = alt_bmp,
+                    Ok(false) => {
+                        crate::teb::set_last_error(ERROR_INVALID_PASSWORD);
+                        return std::ptr::null_mut();
+                    }
+                    Err(code) => {
+                        crate::teb::set_last_error(code);
+                        return std::ptr::null_mut();
+                    }
                 }
             } else {
                 crate::teb::set_last_error(ERROR_INVALID_PASSWORD);
@@ -1883,6 +1927,7 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
                 &mut certs,
                 &mut keys,
                 &mut bag_count,
+                &mut kdf_budget,
             ) {
                 crate::teb::set_last_error(code);
                 return std::ptr::null_mut();
@@ -1922,9 +1967,18 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
             } else {
                 continue;
             };
-            let Some(plain) = decrypt_pbe(ecik[1], &enc_bytes, password_utf8, &pass_bmp) else {
-                crate::teb::set_last_error(ERROR_INVALID_PASSWORD);
-                return std::ptr::null_mut();
+            let plain = match decrypt_pbe(
+                ecik[1],
+                &enc_bytes,
+                password_utf8,
+                &pass_bmp,
+                &mut kdf_budget,
+            ) {
+                Ok(p) => p,
+                Err(code) => {
+                    crate::teb::set_last_error(code);
+                    return std::ptr::null_mut();
+                }
             };
             if let Err(code) = parse_safe_contents(
                 &plain,
@@ -1933,6 +1987,7 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
                 &mut certs,
                 &mut keys,
                 &mut bag_count,
+                &mut kdf_budget,
             ) {
                 crate::teb::set_last_error(code);
                 return std::ptr::null_mut();
@@ -1997,4 +2052,46 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
     }
 
     store
+}
+
+#[cfg(test)]
+pub(super) unsafe fn test_encrypt_pbes2_aes128_sha1(
+    password_utf8: &str,
+    salt: &[u8],
+    iters: u32,
+    iv: &[u8; 16],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let mut key = [0u8; 16];
+    let pw_bytes = password_utf8.as_bytes();
+    let st = CCKeyDerivationPBKDF(
+        K_CC_PBKDF2,
+        pw_bytes.as_ptr(),
+        pw_bytes.len(),
+        salt.as_ptr(),
+        salt.len(),
+        K_CC_PRF_HMAC_SHA1,
+        iters,
+        key.as_mut_ptr(),
+        key.len(),
+    );
+    assert_eq!(st, 0, "CCKeyDerivationPBKDF failed in test helper");
+    let mut out = vec![0u8; plaintext.len() + 32];
+    let mut moved = 0usize;
+    let st2 = CCCrypt(
+        0, // kCCEncrypt
+        K_CC_ALGORITHM_AES,
+        K_CC_OPTION_PKCS7_PADDING,
+        key.as_ptr() as *const c_void,
+        key.len(),
+        iv.as_ptr() as *const c_void,
+        plaintext.as_ptr() as *const c_void,
+        plaintext.len(),
+        out.as_mut_ptr() as *mut c_void,
+        out.len(),
+        &mut moved,
+    );
+    assert_eq!(st2, 0, "CCCrypt encrypt failed in test helper");
+    out.truncate(moved);
+    out
 }

@@ -5955,5 +5955,116 @@ fn pfx_rejects_unbounded_kdf_iteration_counts() {
         );
         CertFreeCertificateContext(first_c);
         CertCloseStore(h_many, 0);
+
+        // 6. Cumulative PFX KDF work cap across EncryptedData ContentInfos, PBES1, and
+        //    pkcs8ShroudedKeyBag entries (each individually <= MAX_PFX_KDF_ITERATIONS):
+        //    (a) PBES1 3DES-CBC with iters=1_500_000 (2 key blocks + 1 IV block = 4.5M > 4M cap)
+        //        is rejected immediately with ERROR_INVALID_DATA before running any KDF loop.
+        {
+            let mut pbe_params = Vec::new();
+            pbe_params.extend_from_slice(&der_tlv(0x04, &[2u8; 8]));
+            pbe_params.extend_from_slice(&der_u32(1_500_000));
+            let mut alg = Vec::new();
+            alg.extend_from_slice(&oid_pbe_sha1_3des);
+            alg.extend_from_slice(&der_tlv(0x30, &pbe_params));
+            let pfx = build_pfx(&build_enc_auth_safe(&der_tlv(0x30, &alg)), None);
+            let t0 = std::time::Instant::now();
+            let (h, le) = import(&pfx);
+            assert!(h.is_null(), "PBES1 exceeding cumulative KDF budget must fail");
+            assert_eq!(le, err::ERROR_INVALID_DATA);
+            assert!(
+                t0.elapsed() < std::time::Duration::from_millis(500),
+                "PBES1 combined-work check must reject before running KDF"
+            );
+        }
+
+        //    (b) Repeating valid PBES2-encrypted empty SafeContents ContentInfos (each 1.5M iters,
+        //        valid ciphertext for 0x30 0x00): 2 copies (3.0M total) succeed, whereas 3 copies
+        //        (4.5M > MAX_PFX_TOTAL_KDF_ITERATIONS) fail with ERROR_INVALID_DATA without spinning.
+        let kdf_salt = [7u8; 8];
+        let kdf_iv = [9u8; 16];
+        let per_bag_iters = 1_500_000u32;
+        let valid_empty_sc_ct = super::pkcs::test_encrypt_pbes2_aes128_sha1(
+            "pw",
+            &kdf_salt,
+            per_bag_iters,
+            &kdf_iv,
+            &der_tlv(0x30, &[]),
+        );
+        let pbes2_alg_1500k = {
+            let mut pbkdf2_params = Vec::new();
+            pbkdf2_params.extend_from_slice(&der_tlv(0x04, &kdf_salt));
+            pbkdf2_params.extend_from_slice(&der_u32(per_bag_iters));
+            let mut kdf_alg = Vec::new();
+            kdf_alg.extend_from_slice(&oid_pbkdf2);
+            kdf_alg.extend_from_slice(&der_tlv(0x30, &pbkdf2_params));
+            let mut enc_alg = Vec::new();
+            enc_alg.extend_from_slice(&oid_aes128_cbc);
+            enc_alg.extend_from_slice(&der_tlv(0x04, &kdf_iv));
+            let mut pbes2_params = Vec::new();
+            pbes2_params.extend_from_slice(&der_tlv(0x30, &kdf_alg));
+            pbes2_params.extend_from_slice(&der_tlv(0x30, &enc_alg));
+            let mut alg = Vec::new();
+            alg.extend_from_slice(&oid_pbes2);
+            alg.extend_from_slice(&der_tlv(0x30, &pbes2_params));
+            der_tlv(0x30, &alg)
+        };
+        let one_enc_ci = {
+            let mut eci = Vec::new();
+            eci.extend_from_slice(&oid_data);
+            eci.extend_from_slice(&pbes2_alg_1500k);
+            eci.extend_from_slice(&der_tlv(0x80, &valid_empty_sc_ct));
+            let mut ed = Vec::new();
+            ed.extend_from_slice(&der_u32(0));
+            ed.extend_from_slice(&der_tlv(0x30, &eci));
+            let mut ci = Vec::new();
+            ci.extend_from_slice(&oid_enc_data);
+            ci.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x30, &ed)));
+            der_tlv(0x30, &ci)
+        };
+        let mut two_enc_cis = Vec::new();
+        two_enc_cis.extend_from_slice(&one_enc_ci);
+        two_enc_cis.extend_from_slice(&one_enc_ci);
+        let pfx_two_ok = build_pfx(&der_tlv_long(0x30, &two_enc_cis), None);
+        let (h_two, _) = import(&pfx_two_ok);
+        assert!(!h_two.is_null(), "2 x 1.5M = 3.0M KDF work within budget must succeed");
+        CertCloseStore(h_two, 0);
+
+        let mut three_enc_cis = two_enc_cis;
+        three_enc_cis.extend_from_slice(&one_enc_ci);
+        let pfx_three_over = build_pfx(&der_tlv_long(0x30, &three_enc_cis), None);
+        let (h_three, le_three) = import(&pfx_three_over);
+        assert!(
+            h_three.is_null(),
+            "3 x 1.5M = 4.5M cumulative KDF work across EncryptedData must be rejected"
+        );
+        assert_eq!(le_three, err::ERROR_INVALID_DATA);
+
+        //    (c) Repeating valid pkcs8ShroudedKeyBag entries (3 x 1.5M = 4.5M > 4.0M cap)
+        //        must also be rejected with ERROR_INVALID_DATA.
+        let oid_shrouded_key_bag = der_tlv(
+            0x06,
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x0C, 0x0A, 0x01, 0x02],
+        );
+        let one_shrouded_bag = {
+            let mut epki = Vec::new();
+            epki.extend_from_slice(&pbes2_alg_1500k);
+            epki.extend_from_slice(&der_tlv(0x04, &valid_empty_sc_ct));
+            let mut bag = Vec::new();
+            bag.extend_from_slice(&oid_shrouded_key_bag);
+            bag.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x30, &epki)));
+            der_tlv(0x30, &bag)
+        };
+        let mut three_shrouded = Vec::new();
+        for _ in 0..3 {
+            three_shrouded.extend_from_slice(&one_shrouded_bag);
+        }
+        let pfx_shrouded_over = build_flat_pfx(&three_shrouded);
+        let (h_shr, le_shr) = import(&pfx_shrouded_over);
+        assert!(
+            h_shr.is_null(),
+            "3 x 1.5M = 4.5M cumulative KDF work across pkcs8ShroudedKeyBag must be rejected"
+        );
+        assert_eq!(le_shr, err::ERROR_INVALID_DATA);
     }
 }

@@ -3535,3 +3535,268 @@ fn schannel_both_cred_enforces_independent_client_and_server_protocols() {
         crypt32::CertCloseStore(ca_store, 0);
     }
 }
+
+#[test]
+fn schannel_pacred_updates_local_cert_when_usable_key_follows_keyless_cert() {
+    use super::schannel::{
+        SecPkgContextBindings, ASC_REQ_ALLOCATE_MEMORY, ASC_REQ_STREAM,
+        ISC_REQ_MANUAL_CRED_VALIDATION, SECPKG_ATTR_ENDPOINT_BINDINGS,
+        SECPKG_ATTR_LOCAL_CERT_CONTEXT, SECPKG_CRED_INBOUND,
+    };
+
+    unsafe {
+        // First cert in paCred has NO private key (TEST_CA_DER); second cert has a usable
+        // private key (TEST_LEAF_DER + TEST_LEAF_KEY_PKCS8_DER). Schannel MUST select the
+        // second cert for BOTH the TLS server chain AND local_cert_der (so LOCAL_CERT_CONTEXT
+        // and ENDPOINT_BINDINGS match what the server actually transmits on the wire).
+        let keyless_cert = crypt32::CertCreateCertificateContext(
+            1,
+            TEST_CA_DER.as_ptr(),
+            TEST_CA_DER.len() as u32,
+        );
+        assert!(!keyless_cert.is_null());
+
+        let usable_cert = crypt32::CertCreateCertificateContext(
+            1,
+            TEST_LEAF_DER.as_ptr(),
+            TEST_LEAF_DER.len() as u32,
+        );
+        assert!(!usable_cert.is_null());
+        assert!(crypt32::attach_cert_private_key_pkcs8(
+            usable_cert,
+            TEST_LEAF_KEY_PKCS8_DER.to_vec()
+        ));
+
+        let pa_creds: [*const c_void; 2] = [keyless_cert, usable_cert];
+        let mut srv_auth = [0u8; 0x50];
+        std::ptr::write_unaligned(srv_auth.as_mut_ptr() as *mut u32, SCHANNEL_CRED_VERSION);
+        std::ptr::write_unaligned(srv_auth.as_mut_ptr().add(0x04) as *mut u32, 2u32);
+        std::ptr::write_unaligned(
+            srv_auth.as_mut_ptr().add(0x08) as *mut *const *const c_void,
+            pa_creds.as_ptr(),
+        );
+
+        let pkg = b"Microsoft Unified Security Protocol Provider\0";
+        let mut srv_cred = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_INBOUND,
+                std::ptr::null_mut(),
+                srv_auth.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut srv_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+
+        let mut cli_cred = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_OUTBOUND,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut cli_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+
+        let target = b"test.example.com\0";
+        let mut c_ctx = SecHandle::default();
+        let mut s_ctx = SecHandle::default();
+        let mut first_cli = true;
+        let mut first_srv = true;
+        let mut to_srv = Vec::new();
+        let mut to_cli = Vec::new();
+        let mut cli_done = false;
+        let mut srv_done = false;
+
+        for _ in 0..8 {
+            if !cli_done {
+                let mut in_buf = SecBuffer {
+                    cb_buffer: to_cli.len() as u32,
+                    buffer_type: SECBUFFER_TOKEN,
+                    pv_buffer: to_cli.as_mut_ptr() as *mut c_void,
+                };
+                let mut in_desc = SecBufferDesc {
+                    ul_version: 0,
+                    c_buffers: 1,
+                    p_buffers: &mut in_buf,
+                };
+                let mut ob = SecBuffer {
+                    cb_buffer: 0,
+                    buffer_type: SECBUFFER_TOKEN,
+                    pv_buffer: std::ptr::null_mut(),
+                };
+                let mut od = SecBufferDesc {
+                    ul_version: 0,
+                    c_buffers: 1,
+                    p_buffers: &mut ob,
+                };
+                let st = InitializeSecurityContextA(
+                    &mut cli_cred as *mut _ as *mut c_void,
+                    if first_cli {
+                        std::ptr::null_mut()
+                    } else {
+                        &mut c_ctx as *mut _ as *mut c_void
+                    },
+                    target.as_ptr(),
+                    ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM | ISC_REQ_MANUAL_CRED_VALIDATION,
+                    0,
+                    0,
+                    if first_cli {
+                        std::ptr::null_mut()
+                    } else {
+                        &mut in_desc as *mut _ as *mut c_void
+                    },
+                    0,
+                    &mut c_ctx as *mut _ as *mut c_void,
+                    &mut od as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                first_cli = false;
+                to_cli.clear();
+                if !ob.pv_buffer.is_null() && ob.cb_buffer > 0 {
+                    to_srv.extend_from_slice(std::slice::from_raw_parts(
+                        ob.pv_buffer as *const u8,
+                        ob.cb_buffer as usize,
+                    ));
+                    FreeContextBuffer(ob.pv_buffer);
+                }
+                if st == SEC_E_OK {
+                    cli_done = true;
+                } else {
+                    assert_eq!(st, SEC_I_CONTINUE_NEEDED);
+                }
+            }
+            if !srv_done && !to_srv.is_empty() {
+                let mut in_buf = SecBuffer {
+                    cb_buffer: to_srv.len() as u32,
+                    buffer_type: SECBUFFER_TOKEN,
+                    pv_buffer: to_srv.as_mut_ptr() as *mut c_void,
+                };
+                let mut in_desc = SecBufferDesc {
+                    ul_version: 0,
+                    c_buffers: 1,
+                    p_buffers: &mut in_buf,
+                };
+                let mut ob = SecBuffer {
+                    cb_buffer: 0,
+                    buffer_type: SECBUFFER_TOKEN,
+                    pv_buffer: std::ptr::null_mut(),
+                };
+                let mut od = SecBufferDesc {
+                    ul_version: 0,
+                    c_buffers: 1,
+                    p_buffers: &mut ob,
+                };
+                let mut attr = 0u32;
+                let st = AcceptSecurityContext(
+                    &mut srv_cred as *mut _ as *mut c_void,
+                    if first_srv {
+                        std::ptr::null_mut()
+                    } else {
+                        &mut s_ctx as *mut _ as *mut c_void
+                    },
+                    &mut in_desc as *mut _ as *mut c_void,
+                    ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_STREAM,
+                    0,
+                    &mut s_ctx as *mut _ as *mut c_void,
+                    &mut od as *mut _ as *mut c_void,
+                    &mut attr,
+                    std::ptr::null_mut(),
+                );
+                first_srv = false;
+                to_srv.clear();
+                if !ob.pv_buffer.is_null() && ob.cb_buffer > 0 {
+                    to_cli.extend_from_slice(std::slice::from_raw_parts(
+                        ob.pv_buffer as *const u8,
+                        ob.cb_buffer as usize,
+                    ));
+                    FreeContextBuffer(ob.pv_buffer);
+                }
+                if st == SEC_E_OK {
+                    srv_done = true;
+                } else {
+                    assert_eq!(st, SEC_I_CONTINUE_NEEDED);
+                }
+            }
+            if cli_done && srv_done {
+                break;
+            }
+        }
+        assert!(cli_done && srv_done, "handshake must complete");
+
+        // SECPKG_ATTR_LOCAL_CERT_CONTEXT must return TEST_LEAF_DER (the selected cert with key),
+        // NOT TEST_CA_DER (the keyless first entry in paCred).
+        let mut lcert: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut s_ctx as *mut _ as *mut c_void,
+                SECPKG_ATTR_LOCAL_CERT_CONTEXT,
+                &mut lcert as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        assert!(!lcert.is_null());
+        let cc = std::ptr::read_unaligned(lcert as *const crate::misc::wintrust::CertContext);
+        let local_der = std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize);
+        assert_eq!(
+            local_der, TEST_LEAF_DER,
+            "SECPKG_ATTR_LOCAL_CERT_CONTEXT must report the selected usable leaf cert"
+        );
+        crypt32::CertFreeCertificateContext(lcert);
+
+        // SECPKG_ATTR_ENDPOINT_BINDINGS must match identically between client and server.
+        let mut cb_cli = SecPkgContextBindings {
+            bindings_length: 0,
+            bindings: std::ptr::null_mut(),
+        };
+        let mut cb_srv = SecPkgContextBindings {
+            bindings_length: 0,
+            bindings: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut c_ctx as *mut _ as *mut c_void,
+                SECPKG_ATTR_ENDPOINT_BINDINGS,
+                &mut cb_cli as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut s_ctx as *mut _ as *mut c_void,
+                SECPKG_ATTR_ENDPOINT_BINDINGS,
+                &mut cb_srv as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        let b_cli =
+            std::slice::from_raw_parts(cb_cli.bindings as *const u8, cb_cli.bindings_length as usize);
+        let b_srv =
+            std::slice::from_raw_parts(cb_srv.bindings as *const u8, cb_srv.bindings_length as usize);
+        assert_eq!(
+            b_cli, b_srv,
+            "server endpoint bindings must hash the transmitted leaf cert, not a keyless fallback cert"
+        );
+        FreeContextBuffer(cb_cli.bindings);
+        FreeContextBuffer(cb_srv.bindings);
+
+        DeleteSecurityContext(&mut c_ctx as *mut _ as *mut c_void);
+        DeleteSecurityContext(&mut s_ctx as *mut _ as *mut c_void);
+        FreeCredentialsHandle(&mut cli_cred as *mut _ as *mut c_void);
+        FreeCredentialsHandle(&mut srv_cred as *mut _ as *mut c_void);
+        crypt32::CertFreeCertificateContext(usable_cert);
+        crypt32::CertFreeCertificateContext(keyless_cert);
+    }
+}

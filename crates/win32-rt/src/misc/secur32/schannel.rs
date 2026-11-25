@@ -1121,8 +1121,8 @@ pub(super) unsafe fn acquire_credentials_impl(
                     }
                     if let Some((chain, key)) = crypt32::lookup_cert_private_key_and_chain(cert_ctx)
                     {
-                        if local_cert_der.is_none() {
-                            local_cert_der = chain.first().cloned();
+                        if let Some(leaf_der) = chain.first() {
+                            local_cert_der = Some(leaf_der.clone());
                         }
                         server_cert_chain = chain;
                         server_private_key_pkcs8 = Some(key);
