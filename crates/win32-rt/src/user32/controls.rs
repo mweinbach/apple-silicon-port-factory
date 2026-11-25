@@ -69,7 +69,21 @@ pub const EN_KILLFOCUS: usize = 0x0200;
 pub const EN_CHANGE: usize = 0x0300;
 pub const EN_UPDATE: usize = 0x0400;
 
-const DEFAULT_EDIT_LIMIT: usize = 30_000;
+pub const DEFAULT_EDIT_LIMIT: usize = 30_000;
+
+/// Truncate UTF-16 code units to `limit` without splitting a UTF-16 surrogate pair.
+/// Returns `true` if truncation occurred.
+pub(crate) fn truncate_utf16_at_limit(units: &mut Vec<u16>, limit: usize) -> bool {
+    if limit == 0 || units.len() <= limit {
+        return false;
+    }
+    let mut new_len = limit;
+    if new_len > 0 && (0xD800..=0xDBFF).contains(&units[new_len - 1]) {
+        new_len -= 1;
+    }
+    units.truncate(new_len);
+    true
+}
 
 // ---------------------------------------------------------------------------
 // Static styles and notifications
@@ -346,13 +360,21 @@ pub fn native_button_clicked(hwnd: usize, native_check_state: Option<u32>) {
     });
 }
 
-/// Queue a native AppKit `NSTextField` / `NSTextView` text edit onto the owning Win32 thread.
-pub fn native_edit_text_changed(hwnd: usize, text: String) {
+/// Queue a native AppKit `NSTextField` / `NSTextView` text edit and its live
+/// UTF-16 selection range onto the owning Win32 thread.
+///
+/// If the text exceeds the control's `EM_LIMITTEXT` limit, the stored Win32
+/// text is truncated at a valid UTF-16 boundary and reconciled back to the
+/// native AppKit control so displayed text and `GetWindowText` always match.
+pub fn native_edit_text_changed(hwnd: usize, text: String, sel_start: usize, sel_end: usize) {
     let Some(w) = window::get(hwnd) else { return };
     let Some(q) = message::queue_of(w.tid) else { return };
     q.call(move || {
         let Some(w) = window::get(hwnd) else { return };
-        let style = w.data().style;
+        let (style, native) = {
+            let d = w.data();
+            (d.style, d.native_control)
+        };
         if (style & ES_READONLY) != 0 {
             return;
         }
@@ -363,20 +385,56 @@ pub fn native_edit_text_changed(hwnd: usize, text: String) {
             .get(&hwnd)
             .map(|s| s.limit)
             .unwrap_or(DEFAULT_EDIT_LIMIT);
-        if limit > 0 && units.len() > limit {
-            units.truncate(limit);
-        }
+        let truncated = truncate_utf16_at_limit(&mut units, limit);
         let len = units.len();
-        window::set_internal_text_from_native(hwnd, units);
+        let lo = sel_start.min(sel_end).min(len);
+        let hi = sel_start.max(sel_end).min(len);
+        if truncated {
+            // Reconcile the displayed native AppKit text + selection with the truncated Win32 text.
+            window::set_internal_text(hwnd, units);
+            if native {
+                crate::macos::control_set_selection(hwnd, lo, hi);
+            }
+        } else {
+            window::set_internal_text_from_native(hwnd, units);
+        }
         {
             let mut map = edit_states().lock().unwrap_or_else(|e| e.into_inner());
             let st = map.entry(hwnd).or_default();
             st.modified = true;
-            st.sel_start = st.sel_start.min(len);
-            st.sel_end = st.sel_end.min(len);
+            st.sel_start = lo;
+            st.sel_end = hi;
         }
         notify_parent_command(hwnd, EN_UPDATE);
         notify_parent_command(hwnd, EN_CHANGE);
+    });
+}
+
+/// Queue a native AppKit caret/selection change (without text modification) onto
+/// the owning Win32 thread so `EM_GETSEL` and `EM_REPLACESEL` track the native caret.
+pub fn native_edit_selection_changed(hwnd: usize, sel_start: usize, sel_end: usize) {
+    let Some(w) = window::get(hwnd) else { return };
+    let Some(q) = message::queue_of(w.tid) else { return };
+    q.call(move || {
+        let Some(len) = window::internal_text(hwnd).map(|t| t.len()) else { return };
+        let lo = sel_start.min(sel_end).min(len);
+        let hi = sel_start.max(sel_end).min(len);
+        let mut map = edit_states().lock().unwrap_or_else(|e| e.into_inner());
+        let st = map.entry(hwnd).or_default();
+        st.sel_start = lo;
+        st.sel_end = hi;
+    });
+}
+
+/// Queue a native AppKit focus gain on a child control onto the owning Win32 thread
+/// so `GetFocus()` and `IsDialogMessage` target the focused control.
+pub fn native_control_focused(hwnd: usize) {
+    let Some(w) = window::get(hwnd) else { return };
+    let Some(q) = message::queue_of(w.tid) else { return };
+    q.call(move || {
+        if window::exists(hwnd) && input::focus_window() != hwnd {
+            input::set_focus(hwnd);
+        }
     });
 }
 
@@ -633,6 +691,9 @@ fn edit_replace_selection(hwnd: usize, insert: &[u16], respect_limit: bool) {
         st.sel_end = new_caret;
         st.modified = true;
     }
+    if is_native_control(hwnd) {
+        crate::macos::control_set_selection(hwnd, new_caret, new_caret);
+    }
     notify_parent_command(hwnd, EN_UPDATE);
     notify_parent_command(hwnd, EN_CHANGE);
 }
@@ -663,6 +724,9 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
                 st.sel_start = 0;
                 st.sel_end = 0;
                 st.modified = false;
+            }
+            if is_native_control(h) {
+                crate::macos::control_set_selection(h, 0, 0);
             }
             notify_parent_command(h, EN_UPDATE);
             notify_parent_command(h, EN_CHANGE);
@@ -700,6 +764,9 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
                         st.sel_start = lo;
                         st.sel_end = lo;
                         st.modified = true;
+                    }
+                    if is_native_control(h) {
+                        crate::macos::control_set_selection(h, lo, lo);
                     }
                     notify_parent_command(h, EN_UPDATE);
                     notify_parent_command(h, EN_CHANGE);
@@ -755,6 +822,9 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
                 st.sel_end = lo;
                 st.modified = true;
             }
+            if is_native_control(h) {
+                crate::macos::control_set_selection(h, lo, lo);
+            }
             notify_parent_command(h, EN_UPDATE);
             notify_parent_command(h, EN_CHANGE);
             0
@@ -785,23 +855,29 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
         }
         wm::EM_SETSEL => {
             let len = window::internal_text(h).map(|t| t.len()).unwrap_or(0);
-            let mut map = edit_states().lock().unwrap_or_else(|e| e.into_inner());
-            let st = map.entry(h).or_default();
-            let wp = wparam as isize;
-            if wp == -1 {
-                // Remove selection, keep caret at previous end.
-                let caret = st.sel_end.min(len);
-                st.sel_start = caret;
-                st.sel_end = caret;
-            } else {
-                let start = (wp.max(0) as usize).min(len);
-                let end = if lparam == -1 {
-                    len
+            let (sel_start, sel_end) = {
+                let mut map = edit_states().lock().unwrap_or_else(|e| e.into_inner());
+                let st = map.entry(h).or_default();
+                let wp = wparam as isize;
+                if wp == -1 {
+                    // Remove selection, keep caret at previous end.
+                    let caret = st.sel_end.min(len);
+                    st.sel_start = caret;
+                    st.sel_end = caret;
                 } else {
-                    (lparam.max(0) as usize).min(len)
-                };
-                st.sel_start = start.min(end);
-                st.sel_end = start.max(end);
+                    let start = (wp.max(0) as usize).min(len);
+                    let end = if lparam == -1 {
+                        len
+                    } else {
+                        (lparam.max(0) as usize).min(len)
+                    };
+                    st.sel_start = start.min(end);
+                    st.sel_end = start.max(end);
+                }
+                (st.sel_start, st.sel_end)
+            };
+            if is_native_control(h) {
+                crate::macos::control_set_selection(h, sel_start, sel_end);
             }
             0
         }
@@ -908,6 +984,9 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
                 .entry(h)
                 .or_default()
                 .limit = limit;
+            if is_native_control(h) {
+                crate::macos::control_set_limit(h, limit);
+            }
             0
         }
         wm::EM_GETLIMITTEXT => {
@@ -1551,14 +1630,18 @@ mod tests {
             assert_eq!(len3, len2, "read-only EDIT must ignore WM_CHAR");
             assert_eq!(SendMessageW(h_edit, wm::EM_SETREADONLY, 0, 0), 1);
 
-            // Native AppKit text-change bridge updates Win32 text & sends EN_CHANGE on queue poll.
+            // Native AppKit text-change bridge updates Win32 text, selection, and sends EN_CHANGE on queue poll.
             COMMAND_LOG.lock().unwrap().clear();
-            native_edit_text_changed(h_edit as usize, "Typed via AppKit".to_string());
+            native_edit_text_changed(h_edit as usize, "Typed via AppKit".to_string(), 16, 16);
             let mut msg = MSG::default();
             let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
             let len4 = GetWindowTextW(h_edit, txt.as_mut_ptr(), 64) as usize;
             assert_eq!(String::from_utf16_lossy(&txt[..len4]), "Typed via AppKit");
             assert!(COMMAND_LOG.lock().unwrap().contains(&(200, EN_CHANGE as u16, h_edit as usize)));
+            let mut ns0 = 0u32;
+            let mut ns1 = 0u32;
+            SendMessageW(h_edit, wm::EM_GETSEL, &mut ns0 as *mut u32 as usize, &mut ns1 as *mut u32 as LPARAM);
+            assert_eq!((ns0, ns1), (16, 16));
 
             // WM_SETTEXT clears modified flag.
             assert_eq!(SetWindowTextW(h_edit, crate::strings::to_wide_z("Reset").as_ptr()), TRUE);
@@ -1815,6 +1898,82 @@ mod tests {
             assert_eq!(IsWindow(h_close), FALSE);
 
             assert_eq!(UnregisterClassW(dlg_cls.as_ptr(), std::ptr::null_mut()), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn native_edit_selection_sync_and_limit_reconciliation() {
+        // Surrogate-pair-safe UTF-16 truncation.
+        let mut emoji_units: Vec<u16> = "a😀b".encode_utf16().collect(); // ['a', 0xD83D, 0xDE00, 'b']
+        assert!(truncate_utf16_at_limit(&mut emoji_units, 2));
+        assert_eq!(String::from_utf16_lossy(&emoji_units), "a");
+
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            COMMAND_LOG.lock().unwrap().clear();
+            let (parent, parent_cls) = make_parent("TestEditSelLimitParent");
+
+            let h_edit = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("").as_ptr(),
+                ws::CHILD | ws::VISIBLE,
+                10,
+                10,
+                240,
+                24,
+                parent,
+                250,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!h_edit.is_null());
+
+            // 1. User types "abc" in AppKit (caret moves to offset 3); subsequent EM_REPLACESEL
+            //    must append at offset 3 ("abcdef"), not insert at offset 0 ("defabc").
+            native_edit_text_changed(h_edit as usize, "abc".to_string(), 3, 3);
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            let (mut s0, mut s1) = (0u32, 0u32);
+            SendMessageW(h_edit, wm::EM_GETSEL, &mut s0 as *mut u32 as usize, &mut s1 as *mut u32 as LPARAM);
+            assert_eq!((s0, s1), (3, 3));
+
+            let suffix = crate::strings::to_wide_z("def");
+            SendMessageW(h_edit, wm::EM_REPLACESEL, 0, suffix.as_ptr() as LPARAM);
+            let mut buf = [0u16; 32];
+            let n = GetWindowTextW(h_edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "abcdef");
+            SendMessageW(h_edit, wm::EM_GETSEL, &mut s0 as *mut u32 as usize, &mut s1 as *mut u32 as LPARAM);
+            assert_eq!((s0, s1), (6, 6));
+
+            // 2. Native caret/selection move without text edit syncs to EM_GETSEL & EM_REPLACESEL.
+            native_edit_selection_changed(h_edit as usize, 2, 5);
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            SendMessageW(h_edit, wm::EM_GETSEL, &mut s0 as *mut u32 as usize, &mut s1 as *mut u32 as LPARAM);
+            assert_eq!((s0, s1), (2, 5));
+            let repl = crate::strings::to_wide_z("X");
+            SendMessageW(h_edit, wm::EM_REPLACESEL, 0, repl.as_ptr() as LPARAM);
+            let n2 = GetWindowTextW(h_edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n2]), "abXf");
+
+            // 3. EM_LIMITTEXT truncates overlong native edits and clamps selection cleanly.
+            SendMessageW(h_edit, wm::EM_LIMITTEXT, 5, 0);
+            native_edit_text_changed(h_edit as usize, "123456789".to_string(), 9, 9);
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            let n3 = GetWindowTextW(h_edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n3]), "12345");
+            SendMessageW(h_edit, wm::EM_GETSEL, &mut s0 as *mut u32 as usize, &mut s1 as *mut u32 as LPARAM);
+            assert_eq!((s0, s1), (5, 5));
+
+            // 4. Native focus bridge updates Win32 GetFocus().
+            native_control_focused(h_edit as usize);
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            assert_eq!(input::GetFocus(), h_edit);
+
+            assert_eq!(DestroyWindow(parent), TRUE);
+            assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);
         })
         .join()
         .unwrap();

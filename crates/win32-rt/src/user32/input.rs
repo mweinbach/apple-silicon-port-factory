@@ -107,6 +107,9 @@ pub fn set_focus(hwnd: usize) -> usize {
         message::send_message(old, wm::KILLFOCUS, hwnd, 0);
     }
     if hwnd != 0 && FOCUS.load(Ordering::Acquire) == hwnd {
+        if window::get(hwnd).is_some_and(|w| w.data().native_control) {
+            crate::macos::control_focus(hwnd);
+        }
         message::send_message(hwnd, wm::SETFOCUS, old, 0);
         super::misc::dispatch_win_event(0x8005 /* EVENT_OBJECT_FOCUS */, hwnd, 0, 0);
     }
@@ -864,6 +867,42 @@ pub(crate) fn filter_posted_msg(m: &MSG, remove: bool) -> bool {
 }
 
 pub fn native_key(k: NativeKey) {
+    native_key_with_target(k, None);
+}
+
+/// Deliver a native key event directly to `target_hwnd` (e.g. a focused native
+/// `EDIT` control's dialog navigation/cancel key) while updating Win32 key state.
+pub fn native_key_for_hwnd(target_hwnd: usize, k: NativeKey) {
+    native_key_with_target(k, Some(target_hwnd));
+}
+
+/// Update Win32 async and synchronous key state (`GetAsyncKeyState` /
+/// `GetKeyState` / `GetKeyboardState`) without posting a duplicate `WM_KEYDOWN`
+/// / `WM_CHAR` message. Used when a native AppKit text field handles the text
+/// edit directly and reports the updated string via its delegate.
+pub fn native_key_state_only(k: NativeKey) {
+    let Some(key) = keymap::from_mac(k.mac) else {
+        return;
+    };
+    set_async_key(key, k.down);
+    let mut s = SYNC.lock().unwrap();
+    for v in [key.vk, key.vk_lr] {
+        if v == 0 {
+            continue;
+        }
+        let e = &mut s[v as usize];
+        if k.down {
+            if *e & 0x80 == 0 {
+                *e ^= 1;
+            }
+            *e |= 0x80;
+        } else {
+            *e &= !0x80;
+        }
+    }
+}
+
+fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
     let Some(key) = keymap::from_mac(k.mac) else {
         log::trace!("unmapped mac key code {:#x}", k.mac);
         return;
@@ -891,7 +930,7 @@ pub fn native_key(k: NativeKey) {
     };
     set_async_key(key, k.down);
     let alt = async_down(VK_MENU);
-    let target = FOCUS.load(Ordering::Acquire);
+    let target = target_override.filter(|&h| h != 0).unwrap_or_else(|| FOCUS.load(Ordering::Acquire));
     if target == 0 {
         return;
     }
