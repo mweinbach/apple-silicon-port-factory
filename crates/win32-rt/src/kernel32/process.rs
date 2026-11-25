@@ -2018,19 +2018,23 @@ impl JobState {
                 }
             }
         }
-        if !self.group_affinities.is_empty() {
-            let mut ga_mask = 0usize;
-            for ga in &self.group_affinities {
-                ga_mask |= usize::from_le_bytes(ga[0..8].try_into().unwrap());
-            }
-            if ga_mask != 0 {
-                mask = Some(match mask {
-                    Some(m) => m & ga_mask,
-                    None => ga_mask,
-                });
-            }
+        if let Some(ga_mask) = self.group_affinity_mask() {
+            mask = Some(match mask {
+                Some(m) => m & ga_mask,
+                None => ga_mask,
+            });
         }
         mask.filter(|&m| m != 0).map(|m| (m, allow_subset))
+    }
+    fn group_affinity_mask(&self) -> Option<usize> {
+        if self.group_affinities.is_empty() {
+            return None;
+        }
+        let mut ga_mask = 0usize;
+        for ga in &self.group_affinities {
+            ga_mask |= usize::from_le_bytes(ga[0..8].try_into().unwrap());
+        }
+        (ga_mask != 0).then_some(ga_mask)
     }
 }
 
@@ -2360,7 +2364,10 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
                 let aff = usize::from_le_bytes(buf[48..56].try_into().unwrap());
                 let sm = system_affinity_mask();
-                if aff == 0 || (aff & !sm) != 0 {
+                if aff == 0
+                    || (aff & !sm) != 0
+                    || st.group_affinity_mask().is_some_and(|gm| (aff & gm) == 0)
+                {
                     set_err(err::ERROR_INVALID_PARAMETER);
                     return FALSE;
                 }
@@ -2448,7 +2455,10 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 {
                 let aff = usize::from_le_bytes(basic[48..56].try_into().unwrap());
                 let sm = system_affinity_mask();
-                if aff == 0 || (aff & !sm) != 0 {
+                if aff == 0
+                    || (aff & !sm) != 0
+                    || st.group_affinity_mask().is_some_and(|gm| (aff & gm) == 0)
+                {
                     set_err(err::ERROR_INVALID_PARAMETER);
                     return FALSE;
                 }
@@ -4416,6 +4426,26 @@ pub(crate) mod tests {
                 assert_eq!(pm_now, 0x1);
                 assert_eq!(crate::kernel32::threads::SetThreadAffinityMask(handles::CURRENT_THREAD, 0x2), 0);
                 assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+                // Setting JOB_OBJECT_LIMIT_AFFINITY (class 2 or class 9) to a mask disjoint from
+                // the existing JobObjectGroupInformationEx mask (0x1) must be rejected instead of
+                // clearing the effective affinity constraint.
+                std::ptr::write_unaligned(
+                    aff_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_AFFINITY,
+                );
+                std::ptr::write_unaligned(aff_basic.as_mut_ptr().add(48) as *mut usize, 0x2usize);
+                assert_eq!(SetInformationJobObject(job, 2, aff_basic.as_ptr() as *const c_void, 64), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                let mut disjoint_ext = [0u8; 144];
+                disjoint_ext[..64].copy_from_slice(&aff_basic);
+                assert_eq!(SetInformationJobObject(job, 9, disjoint_ext.as_ptr() as *const c_void, 144), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                // Existing group affinity restriction (0x1) remains intact after the rejected updates.
+                assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut pm_now, &mut sm_now), TRUE);
+                assert_eq!(pm_now, 0x1);
                 assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
                 assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
 

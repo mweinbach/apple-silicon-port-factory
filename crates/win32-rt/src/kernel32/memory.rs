@@ -266,12 +266,13 @@ impl VmState {
     }
     /// Recompute and apply host page protection for `hp` from its surviving committed
     /// 4 KiB subpages: keeps `PROT_NONE` when no subpages are committed or any sibling
-    /// is `PAGE_GUARD`/`PAGE_NOACCESS`, and strips `PROT_WRITE` when a clean
-    /// `MEM_WRITE_WATCH` writable subpage needs write trapping armed.
-    unsafe fn restore_host_page_prot(&self, hp: usize) {
+    /// is `PAGE_GUARD`/`PAGE_NOACCESS`, unions host permissions across all committed
+    /// subpages so a read-only subpage never revokes write access from a `PAGE_READWRITE`
+    /// sibling, and strips `PROT_WRITE` when a clean `MEM_WRITE_WATCH` writable subpage
+    /// needs write trapping armed.
+    unsafe fn restore_host_page_prot(&self, hp: usize) -> i32 {
         if self.has_protected_subpage(hp, None) {
-            let _ = host_mprotect(hp, HOST_PAGE, libc::PROT_NONE);
-            return;
+            return host_mprotect(hp, HOST_PAGE, libc::PROT_NONE);
         }
         let mut has_committed = false;
         let mut host_prot = 0i32;
@@ -300,7 +301,7 @@ impl VmState {
         } else {
             host_prot
         };
-        let _ = host_mprotect(hp, HOST_PAGE, final_prot);
+        host_mprotect(hp, HOST_PAGE, final_prot)
     }
     /// Returns `true` if any committed 4 KiB subpage in the enclosing `HOST_PAGE`
     /// outside `exclude_range` (if given) has `PAGE_NOACCESS` or `PAGE_GUARD`.
@@ -355,9 +356,10 @@ impl VmState {
 
 /// Apply host protection for `[start, end)` inside `vm`, preserving `PROT_NONE` on
 /// any enclosing 16 KiB host page that contains a `PAGE_GUARD` or `PAGE_NOACCESS`
-/// sibling subpage outside `[start, end)`, and stripping `PROT_WRITE` on clean
-/// (not-yet-written) host pages of `MEM_WRITE_WATCH` allocations so the first store
-/// triggers `try_handle_write_watch_fault`.
+/// sibling subpage outside `[start, end)`, unioning host permissions with surviving
+/// committed siblings on the same 16 KiB host page (so a `PAGE_READONLY` subpage does
+/// not strip write access from a `PAGE_READWRITE` sibling), and stripping `PROT_WRITE`
+/// on clean (not-yet-written) host pages with a writable `MEM_WRITE_WATCH` subpage.
 unsafe fn apply_range_host_prot(vm: &VmState, start: usize, end: usize, prot: u32, write_watch: bool) -> i32 {
     let base_host = win_prot_to_host(prot);
     let wants_none = (prot & 0xFF) == PAGE_NOACCESS || (prot & PAGE_GUARD) != 0;
@@ -369,10 +371,34 @@ unsafe fn apply_range_host_prot(vm: &VmState, start: usize, end: usize, prot: u3
     while hp < hend {
         let p = if vm.has_protected_subpage(hp, Some((start, end))) {
             libc::PROT_NONE
-        } else if write_watch && is_writable_prot(prot) && !vm.write_watch_dirty.contains(&hp) {
-            base_host & !libc::PROT_WRITE
         } else {
-            base_host
+            let is_dirty = vm.write_watch_dirty.contains(&hp);
+            let mut host_prot = base_host;
+            let mut arm_write_watch = !is_dirty && write_watch && is_writable_prot(prot);
+            if HOST_PAGE > PAGE {
+                let mut sub = hp;
+                while sub < hp + HOST_PAGE {
+                    if sub < start || sub >= end {
+                        if let Some((&_s, seg)) = vm.segs.range(..=sub).next_back() {
+                            if sub < seg.end && seg.state == MEM_COMMIT {
+                                host_prot |= win_prot_to_host(seg.prot);
+                                if !is_dirty
+                                    && is_writable_prot(seg.prot)
+                                    && vm.alloc_containing(sub).is_some_and(|(_, a)| a.write_watch)
+                                {
+                                    arm_write_watch = true;
+                                }
+                            }
+                        }
+                    }
+                    sub += PAGE;
+                }
+            }
+            if arm_write_watch {
+                host_prot & !libc::PROT_WRITE
+            } else {
+                host_prot
+            }
         };
         let rc = host_mprotect(hp, HOST_PAGE, p);
         if rc != 0 {
@@ -441,7 +467,7 @@ pub unsafe fn try_handle_write_watch_fault(fault_addr: usize, is_write: bool) ->
         return false;
     }
     vm.write_watch_dirty.insert(hpage);
-    host_mprotect(hpage, HOST_PAGE, win_prot_to_host(seg.prot)) == 0
+    vm.restore_host_page_prot(hpage) == 0
 }
 
 /// Outcome of consuming a one-shot `PAGE_GUARD` bit on a faulting 4 KiB page.
@@ -466,7 +492,6 @@ pub unsafe fn consume_guard_page(fault_addr: usize) -> Option<GuardConsumeResult
     let page = fault_addr & !(PAGE - 1);
     let hpage = fault_addr & !(HOST_PAGE - 1);
     let mut vm = VM.lock().unwrap();
-    let write_watch = vm.alloc_containing(page).is_some_and(|(_, a)| a.write_watch);
     let (&_s, &seg) = vm.segs.range(..=page).next_back()?;
     if page >= seg.end || seg.state != MEM_COMMIT || (seg.prot & PAGE_GUARD) == 0 {
         return None;
@@ -478,12 +503,7 @@ pub unsafe fn consume_guard_page(fault_addr: usize) -> Option<GuardConsumeResult
     let sibling_protected = vm.has_protected_subpage(hpage, Some((page, page + PAGE)));
 
     if !sibling_protected {
-        let host_p = if write_watch && is_writable_prot(new_prot) && !vm.write_watch_dirty.contains(&hpage) {
-            win_prot_to_host(new_prot) & !libc::PROT_WRITE
-        } else {
-            win_prot_to_host(new_prot)
-        };
-        let _ = host_mprotect(page, PAGE, host_p);
+        let _ = vm.restore_host_page_prot(hpage);
     }
     note_hpage_prot_change(page, page + PAGE);
     Some(GuardConsumeResult {
@@ -1924,6 +1944,68 @@ mod tests {
                 let r = consume_guard_page(p as usize).expect("consume next to PAGE_NOACCESS");
                 assert!(r.host_kept_none, "PAGE_NOACCESS sibling must remain protected");
                 assert_eq!(VirtualProtect((p as usize + PAGE) as *mut c_void, PAGE, PAGE_READWRITE, &mut old), TRUE);
+
+                // Consuming a PAGE_READONLY | PAGE_GUARD subpage next to a PAGE_READWRITE sibling
+                // must restore subpage 0 to PAGE_READONLY logically while preserving write access
+                // to the PAGE_READWRITE sibling on the shared 16 KiB host page.
+                assert_eq!(VirtualProtect(p, PAGE, PAGE_READONLY | PAGE_GUARD, &mut old), TRUE);
+                let ro_res = consume_guard_page(p as usize).expect("consume PAGE_READONLY|PAGE_GUARD next to RW sibling");
+                assert_eq!(ro_res.old_prot, PAGE_READONLY | PAGE_GUARD);
+                assert!(!ro_res.host_kept_none);
+                assert_eq!(query(p as usize).unwrap().protect, PAGE_READONLY);
+                assert_eq!(query((p as usize) + PAGE).unwrap().protect, PAGE_READWRITE);
+                *((p as usize + PAGE) as *mut u32) = 0xDEAD_BEEF;
+                assert_eq!(*((p as usize + PAGE) as *const u32), 0xDEAD_BEEF);
+                // Restore subpage 0 back to PAGE_READWRITE.
+                assert_eq!(VirtualProtect(p, PAGE, PAGE_READWRITE, &mut old), TRUE);
+
+                // In a clean MEM_WRITE_WATCH allocation, consuming a PAGE_READONLY | PAGE_GUARD
+                // subpage next to a PAGE_READWRITE sibling must keep PROT_WRITE stripped so
+                // write-watch trapping on the writable sibling remains armed.
+                let ww = VirtualAlloc(
+                    std::ptr::null_mut(),
+                    HOST_PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                );
+                assert!(!ww.is_null());
+                assert_eq!(VirtualProtect(ww, PAGE, PAGE_READONLY | PAGE_GUARD, &mut old), TRUE);
+                let ww_res = consume_guard_page(ww as usize).expect("consume RO guard in clean write-watch");
+                assert!(!ww_res.host_kept_none);
+                assert_eq!(query(ww as usize).unwrap().protect, PAGE_READONLY);
+                #[cfg(target_vendor = "apple")]
+                {
+                    extern "C" {
+                        fn mach_task_self() -> u32;
+                        fn mach_vm_region(
+                            target_task: u32,
+                            address: *mut u64,
+                            size: *mut u64,
+                            flavor: i32,
+                            info: *mut i32,
+                            info_cnt: *mut u32,
+                            object_name: *mut u32,
+                        ) -> i32;
+                    }
+                    let mut qaddr = ww as u64;
+                    let mut qsize = 0u64;
+                    let mut info = [0i32; 9];
+                    let mut cnt = 9u32;
+                    let mut obj = 0u32;
+                    assert_eq!(
+                        mach_vm_region(mach_task_self(), &mut qaddr, &mut qsize, 9, info.as_mut_ptr(), &mut cnt, &mut obj),
+                        0
+                    );
+                    assert_eq!(
+                        info[0] & libc::PROT_WRITE,
+                        0,
+                        "clean write-watch host page must keep PROT_WRITE stripped after RO guard consumption"
+                    );
+                }
+                assert!(try_handle_write_watch_fault((ww as usize) + PAGE + 4, true));
+                *((ww as usize + PAGE) as *mut u32) = 0x55AA_33CC;
+                assert_eq!(*((ww as usize + PAGE) as *const u32), 0x55AA_33CC);
+                assert_eq!(VirtualFree(ww, 0, MEM_RELEASE), TRUE);
             }
 
             // VirtualAlloc with MEM_COMMIT | PAGE_GUARD directly (single 4 KiB page).
