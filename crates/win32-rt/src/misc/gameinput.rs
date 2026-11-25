@@ -525,9 +525,9 @@ pub(crate) fn on_keyboard_changed() {
     if !GAMEINPUT_ACTIVE.load(Ordering::Acquire) {
         return;
     }
+    let mut st = runtime_state().lock().unwrap();
     let ts = current_timestamp_us();
     let payload = ReadingPayload::Keyboard(snapshot_keyboard());
-    let mut st = runtime_state().lock().unwrap();
     let _ = st.record_or_reuse_at(DeviceKind::Keyboard, GAME_INPUT_KIND_KEYBOARD, payload, ts);
 }
 
@@ -537,9 +537,9 @@ pub(crate) fn on_mouse_changed() {
     if !GAMEINPUT_ACTIVE.load(Ordering::Acquire) {
         return;
     }
+    let mut st = runtime_state().lock().unwrap();
     let ts = current_timestamp_us();
     let payload = ReadingPayload::Mouse(snapshot_mouse());
-    let mut st = runtime_state().lock().unwrap();
     let _ = st.record_or_reuse_at(DeviceKind::Mouse, GAME_INPUT_KIND_MOUSE, payload, ts);
 }
 
@@ -851,13 +851,11 @@ impl RuntimeState {
         payload: ReadingPayload,
         timestamp_us: u64,
     ) -> ReadingSnapshot {
-        if let Some(latest) = self
-            .ring(device_kind)
-            .iter()
-            .rev()
-            .find(|e| e.input_kind == input_kind)
-        {
-            if latest.payload == payload {
+        if let Some(latest) = self.ring(device_kind).back() {
+            if timestamp_us < latest.timestamp_us {
+                return latest.clone();
+            }
+            if latest.input_kind == input_kind && latest.payload == payload {
                 return latest.clone();
             }
         }
@@ -880,6 +878,11 @@ impl RuntimeState {
         payload: ReadingPayload,
         timestamp_us: u64,
     ) -> ReadingSnapshot {
+        if let Some(latest) = self.ring(device_kind).back() {
+            if timestamp_us < latest.timestamp_us {
+                return latest.clone();
+            }
+        }
         self.next_history_id = self.next_history_id.wrapping_add(1).max(1);
         let seq = self.next_seq(device_kind);
         let snap = ReadingSnapshot {
@@ -937,6 +940,8 @@ fn device_status_for(kind: DeviceKind) -> u32 {
     }
 }
 
+/// Caller must invoke `ensure_gamepad_started()` before acquiring `runtime_state()`
+/// when gamepad/controller input may be polled.
 fn poll_matching_live(
     input_kind: u32,
     device_filter: Option<DeviceKind>,
@@ -964,7 +969,6 @@ fn poll_matching_live(
                 if input_kind & (GAME_INPUT_KIND_GAMEPAD | GAME_INPUT_KIND_CONTROLLER) == 0 {
                     return None;
                 }
-                ensure_gamepad_started();
                 let (pad, _) = xinput1_4::slot_state(slot)?;
                 Some((
                     dk,
@@ -976,7 +980,6 @@ fn poll_matching_live(
     }
 
     if input_kind & (GAME_INPUT_KIND_GAMEPAD | GAME_INPUT_KIND_CONTROLLER) != 0 {
-        ensure_gamepad_started();
         for slot in 0..xinput1_4::XUSER_MAX_COUNT {
             if let Some((pad, _)) = xinput1_4::slot_state(slot) {
                 return Some((
@@ -1949,13 +1952,15 @@ unsafe extern "win64" fn gi_get_current_reading(
         }
     };
 
+    if input_kind & (GAME_INPUT_KIND_GAMEPAD | GAME_INPUT_KIND_CONTROLLER) != 0 {
+        ensure_gamepad_started();
+    }
+    let mut st = runtime_state().lock().unwrap();
     let Some((dev_kind, actual_kind, payload)) = poll_matching_live(input_kind, device_filter) else {
         return GAMEINPUT_E_READING_NOT_FOUND;
     };
-    let snap = runtime_state()
-        .lock()
-        .unwrap()
-        .record_or_reuse(dev_kind, actual_kind, payload);
+    let snap = st.record_or_reuse(dev_kind, actual_kind, payload);
+    drop(st);
     std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
     S_OK
 }
@@ -1985,47 +1990,48 @@ unsafe extern "win64" fn gi_get_next_reading(
     let ref_id = (*ref_reading).snapshot.history_id;
     let ref_dev = (*ref_reading).snapshot.device_kind;
 
-    {
-        let st = runtime_state().lock().unwrap();
-        let found = match device_filter {
-            Some(dk) => st
-                .ring(dk)
-                .iter()
-                .find(|e| e.history_id > ref_id && kind_matches_filter(e.input_kind, input_kind))
-                .cloned(),
-            None => st
-                .histories
-                .iter()
-                .filter_map(|ring| {
-                    ring.iter()
-                        .find(|e| e.history_id > ref_id && kind_matches_filter(e.input_kind, input_kind))
-                })
-                .min_by_key(|e| e.history_id)
-                .cloned(),
-        };
-        if let Some(snap) = found {
-            std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
-            return S_OK;
-        }
-        if let Some(oldest) = st.ring(ref_dev).front() {
-            if ref_id < oldest.history_id {
-                return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
-            }
+    if input_kind & (GAME_INPUT_KIND_GAMEPAD | GAME_INPUT_KIND_CONTROLLER) != 0 {
+        ensure_gamepad_started();
+    }
+    let mut st = runtime_state().lock().unwrap();
+    let found = match device_filter {
+        Some(dk) => st
+            .ring(dk)
+            .iter()
+            .find(|e| e.history_id > ref_id && kind_matches_filter(e.input_kind, input_kind))
+            .cloned(),
+        None => st
+            .histories
+            .iter()
+            .filter_map(|ring| {
+                ring.iter()
+                    .find(|e| e.history_id > ref_id && kind_matches_filter(e.input_kind, input_kind))
+            })
+            .min_by_key(|e| e.history_id)
+            .cloned(),
+    };
+    if let Some(snap) = found {
+        drop(st);
+        std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
+        return S_OK;
+    }
+    if let Some(oldest) = st.ring(ref_dev).front() {
+        if ref_id < oldest.history_id {
+            return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
         }
     }
 
-    // At the newest boundary: check once if live input changed since the latest recorded snapshot.
+    // At the newest boundary: check once under the same lock if live input changed since
+    // the latest recorded snapshot.
     if let Some((dev_kind, actual_kind, live_payload)) = poll_matching_live(input_kind, device_filter) {
-        let mut st = runtime_state().lock().unwrap();
         let unchanged = st
             .ring(dev_kind)
-            .iter()
-            .rev()
-            .find(|e| e.input_kind == actual_kind)
-            .is_some_and(|latest| latest.payload == live_payload);
+            .back()
+            .is_some_and(|latest| latest.input_kind == actual_kind && latest.payload == live_payload);
         if !unchanged {
             let snap = st.push_snapshot(dev_kind, actual_kind, live_payload);
             if snap.history_id > ref_id {
+                drop(st);
                 std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
                 return S_OK;
             }
@@ -2444,16 +2450,14 @@ pub extern "win64" fn GameInputCreate(game_input_out: *mut usize) -> i32 {
     ensure_vtbls_registered();
     ensure_gamepad_started();
     let _ = persistent_devices();
-    GAMEINPUT_ACTIVE.store(true, Ordering::Release);
-    let now = current_timestamp_us();
-    let kbd_snap = snapshot_keyboard();
-    let mouse_snap = snapshot_mouse();
-    let gamepad_snaps: [Option<GameInputGamepadState>; xinput1_4::XUSER_MAX_COUNT] =
-        std::array::from_fn(|slot| {
-            xinput1_4::slot_state(slot).map(|(pad, _)| xinput_to_gamepad_state(&pad))
-        });
     {
+        // Serialize enabling event hooks with initial baseline capture so concurrent
+        // native input cannot record a newer transition before these snapshots land.
         let mut st = runtime_state().lock().unwrap();
+        GAMEINPUT_ACTIVE.store(true, Ordering::Release);
+        let now = current_timestamp_us();
+        let kbd_snap = snapshot_keyboard();
+        let mouse_snap = snapshot_mouse();
         let _ = st.record_or_reuse_at(
             DeviceKind::Keyboard,
             GAME_INPUT_KIND_KEYBOARD,
@@ -2466,8 +2470,9 @@ pub extern "win64" fn GameInputCreate(game_input_out: *mut usize) -> i32 {
             ReadingPayload::Mouse(mouse_snap),
             now,
         );
-        for (slot, maybe_gp) in gamepad_snaps.into_iter().enumerate() {
-            if let Some(gp) = maybe_gp {
+        for slot in 0..xinput1_4::XUSER_MAX_COUNT {
+            if let Some((pad, _)) = xinput1_4::slot_state(slot) {
+                let gp = xinput_to_gamepad_state(&pad);
                 let _ = st.record_or_reuse_at(
                     DeviceKind::Gamepad(slot),
                     GAME_INPUT_KIND_GAMEPAD,
@@ -3447,6 +3452,64 @@ mod tests {
             assert_eq!(rd_release(out), 0);
 
             assert_eq!(gi_release(gi), 0);
+        }
+
+        reset_test_state();
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_overwrite_newer_history_entry() {
+        let _g = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_test_state();
+
+        let pressed = GameInputGamepadState {
+            buttons: GAME_INPUT_GAMEPAD_A,
+            ..Default::default()
+        };
+        let idle = GameInputGamepadState::default();
+
+        {
+            let mut st = runtime_state().lock().unwrap();
+            let newest = st.record_or_reuse_at(
+                DeviceKind::Gamepad(0),
+                GAME_INPUT_KIND_GAMEPAD,
+                ReadingPayload::Gamepad(pressed),
+                200,
+            );
+            assert_eq!(newest.timestamp_us, 200);
+
+            // An out-of-order older baseline (t=100) must not append after t=200.
+            let rejected_reuse = st.record_or_reuse_at(
+                DeviceKind::Gamepad(0),
+                GAME_INPUT_KIND_GAMEPAD,
+                ReadingPayload::Gamepad(idle),
+                100,
+            );
+            assert_eq!(rejected_reuse.timestamp_us, 200);
+            assert_eq!(rejected_reuse.payload, ReadingPayload::Gamepad(pressed));
+
+            let rejected_push = st.push_snapshot_at(
+                DeviceKind::Gamepad(0),
+                GAME_INPUT_KIND_GAMEPAD,
+                ReadingPayload::Gamepad(idle),
+                100,
+            );
+            assert_eq!(rejected_push.timestamp_us, 200);
+            assert_eq!(rejected_push.payload, ReadingPayload::Gamepad(pressed));
+            assert_eq!(st.ring(DeviceKind::Gamepad(0)).len(), 1);
+        }
+
+        unsafe {
+            let dev0 = device_ptr(DeviceKind::Gamepad(0));
+            let mut out: *mut ReadingObj = std::ptr::null_mut();
+            let mut gs = GameInputGamepadState::default();
+            assert_eq!(gi_get_temporal_reading(std::ptr::null_mut(), 300, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(
+                gs.buttons, GAME_INPUT_GAMEPAD_A,
+                "temporal query at 300 must see the pressed reading at 200, not a stale idle baseline at 100"
+            );
+            assert_eq!(rd_release(out), 0);
         }
 
         reset_test_state();
