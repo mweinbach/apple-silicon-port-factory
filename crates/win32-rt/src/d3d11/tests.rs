@@ -3920,8 +3920,27 @@ fn dxgi_device_create_surface_and_gdi_interop_get_dc_on_metal() {
         // ReleaseDC without GetDC -> DXGI_ERROR_INVALID_CALL.
         assert_eq!(rel_dc(gdi_surf, std::ptr::null()), DXGI_ERROR_INVALID_CALL);
 
+        // Bind gdi_tex as an RTV; successful GetDC must unbind it from the output merger.
+        let create_rtv_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const D3D11_RENDER_TARGET_VIEW_DESC, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 9));
+        let om_set_rts: unsafe extern "win64" fn(*mut c_void, u32, *const *mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 33));
+        let om_get_rts: unsafe extern "win64" fn(*mut c_void, u32, *mut *mut c_void, *mut *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 89));
+        let mut gdi_rtv: *mut c_void = std::ptr::null_mut();
+        assert_eq!(create_rtv_fn(dev, gdi_tex, std::ptr::null(), &mut gdi_rtv), S_OK);
+        om_set_rts(ctx, 1, &gdi_rtv, std::ptr::null_mut());
+        let mut bound_rtv: *mut c_void = std::ptr::null_mut();
+        om_get_rts(ctx, 1, &mut bound_rtv, std::ptr::null_mut());
+        assert_eq!(bound_rtv, gdi_rtv);
+        com_release(bound_rtv);
+
         assert_eq!(get_dc(gdi_surf, TRUE, &mut hdc), S_OK);
         assert!(!hdc.is_null());
+        bound_rtv = 0x1 as *mut c_void;
+        om_get_rts(ctx, 1, &mut bound_rtv, std::ptr::null_mut());
+        assert!(bound_rtv.is_null(), "GetDC must unbind the surface from OM render targets");
+        com_release(gdi_rtv);
         // Double GetDC fails while active.
         let mut hdc2: *mut c_void = std::ptr::null_mut();
         assert_eq!(get_dc(gdi_surf, TRUE, &mut hdc2), DXGI_ERROR_INVALID_CALL);
@@ -4108,7 +4127,8 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
     }
 
     // 4. Pipeline statistics:
-    //    - Non-indexed draws accurately count IA/VS/GS/HS (skipping GSInvocations when HS is bound).
+    //    - Non-indexed draws accurately count IA/VS/GS/HS (including GS `[instance(N)]`, and
+    //      skipping GSInvocations when HS is bound).
     //    - Indexed draws do not fabricate VSInvocations from submitted index counts (vertex cache
     //      reuse makes VSInvocations GPU-dependent), and indexed strips do not guess cut counts.
     {
@@ -4119,7 +4139,7 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
             6,
             2,
             false,
-            true,
+            Some(1),
             false,
         );
         assert_eq!(s_gs_only.IAVertices, 12);
@@ -4128,6 +4148,19 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
         assert_eq!(s_gs_only.GSInvocations, 4);
         assert_eq!(s_gs_only.HSInvocations, 0);
 
+        let mut s_gs_instanced = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
+        super::context::accumulate_draw_pipeline_stats(
+            &mut s_gs_instanced,
+            topology::TRIANGLELIST,
+            6,
+            2,
+            false,
+            Some(4),
+            false,
+        );
+        assert_eq!(s_gs_instanced.IAPrimitives, 4);
+        assert_eq!(s_gs_instanced.GSInvocations, 16, "GS `[instance(4)]` must multiply invocations by 4");
+
         let mut s_tess_gs = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
         super::context::accumulate_draw_pipeline_stats(
             &mut s_tess_gs,
@@ -4135,7 +4168,7 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
             9,
             2,
             false,
-            true,
+            Some(2),
             true,
         );
         assert_eq!(s_tess_gs.IAVertices, 18);
@@ -4151,7 +4184,7 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
             6,
             2,
             true,
-            false,
+            None,
             false,
         );
         assert_eq!(s_indexed.IAVertices, 12);
@@ -4165,7 +4198,7 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
             6,
             1,
             true,
-            true,
+            Some(1),
             false,
         );
         assert_eq!(s_indexed_strip.IAVertices, 0);

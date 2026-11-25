@@ -187,6 +187,27 @@ impl DeviceCore {
         Ok(())
     }
 
+    /// Unbind any output-merger render target views referencing `resource` on the immediate
+    /// context (required by `IDXGISurface1::GetDC`).
+    pub(crate) fn unbind_rtv_resource(&self, resource: &Arc<ResourceCore>) {
+        let p = self.imm_ctx_com.load(Ordering::Acquire) as *mut Obj<super::context::D3d11Context>;
+        if p.is_null() {
+            return;
+        }
+        let mut released = Vec::new();
+        {
+            let ctx = unsafe { Obj::get(p) };
+            let mut st = ctx.state.lock().unwrap();
+            for slot in &mut st.rtvs {
+                if slot.rtv.as_ref().is_some_and(|v| Arc::ptr_eq(&v.resource, resource)) {
+                    released.push(std::mem::take(&mut slot.com));
+                    slot.rtv = None;
+                }
+            }
+        }
+        drop(released);
+    }
+
     /// Upload initial texture subresources (`pInitialData[0..subresource_count]`).
     pub unsafe fn upload_initial_texture(
         &self,

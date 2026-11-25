@@ -1450,6 +1450,9 @@ unsafe extern "win64" fn surf_get_dc(
         byte_len,
     );
     *surf.dc_state.lock().unwrap() = Some(SurfaceDcState { hdc, hbmp, width, height });
+    // Per IDXGISurface1::GetDC contract, acquiring a DC unbinds the surface from the
+    // output merger so OMGetRenderTargets and context-state swaps no longer observe it.
+    surf.device.unbind_rtv_resource(core);
     std::ptr::write_unaligned(hdc_out, hdc as *mut c_void);
     S_OK
 }

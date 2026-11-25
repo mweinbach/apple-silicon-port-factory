@@ -1364,7 +1364,7 @@ pub(super) fn accumulate_draw_pipeline_stats(
     count: u32,
     instances: u32,
     indexed: bool,
-    has_gs: bool,
+    gs_instances: Option<u32>,
     has_hs: bool,
 ) {
     use d3d12_metal::topology::d3d;
@@ -1388,11 +1388,16 @@ pub(super) fn accumulate_draw_pipeline_stats(
     if !indexed {
         stats.VSInvocations = stats.VSInvocations.saturating_add(verts);
     }
-    // Without tessellation, each IA primitive invokes the GS once. When tessellation is active,
-    // the number of primitives reaching GS depends on GPU tessellation factors, so do not
-    // fabricate GSInvocations from the input-assembler patch count.
-    if has_gs && !has_hs {
-        stats.GSInvocations = stats.GSInvocations.saturating_add(prims);
+    // Without tessellation, each IA primitive invokes the GS `gs_instance_count` times
+    // (1 unless `[instance(N)]` is declared). When tessellation is active, the number of
+    // primitives reaching GS depends on GPU tessellation factors, so do not fabricate
+    // GSInvocations from the input-assembler patch count.
+    if let Some(gs_inst) = gs_instances {
+        if !has_hs {
+            stats.GSInvocations = stats
+                .GSInvocations
+                .saturating_add(prims.saturating_mul(gs_inst.max(1) as u64));
+        }
     }
     if has_hs {
         stats.HSInvocations = stats.HSInvocations.saturating_add(prims);
@@ -1421,6 +1426,13 @@ unsafe fn exec_draw(
         exec.cl.draw(count, instances, start_vertex, start_instance)?;
     }
     if !exec.active_pipeline_stats.is_empty() {
+        let gs_instances = exec
+            .cl
+            .gfx
+            .pso
+            .as_ref()
+            .and_then(|p| p.gs_emu.as_ref())
+            .map(|g| g.instance_count.max(1));
         for q in &exec.active_pipeline_stats {
             let mut rt = q.rt.lock().unwrap();
             accumulate_draw_pipeline_stats(
@@ -1429,7 +1441,7 @@ unsafe fn exec_draw(
                 count,
                 instances,
                 indexed_start.is_some(),
-                st.gs.is_some(),
+                gs_instances,
                 st.hs.is_some(),
             );
         }
