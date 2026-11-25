@@ -863,6 +863,9 @@ impl Tr<'_> {
                             let a = self.addr_into(op, XA);
                             self.load(k, T0, a, sw, Self::chk_of(op));
                             T0
+                        } else if op.r1 & 0x80 != 0 {
+                            self.a.ubfx(T0, g(op.r1 & 15), 8, 8);
+                            T0
                         } else {
                             self.ua(op.r1, sw)
                         };
@@ -1082,7 +1085,7 @@ impl Tr<'_> {
                     }
                 }
             }
-            K_VAES_RR..=K_VSHA_RM => self.emit_more_op(k, op),
+            K_VAES_RR..=K_VVNNI_RM => self.emit_more_op(k, op),
             _ => unreachable!("unsupported op kind {}", op.kind),
         }
     }

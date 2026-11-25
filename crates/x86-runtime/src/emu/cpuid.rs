@@ -21,7 +21,8 @@ pub(crate) fn query(leaf: u32, subleaf: u32) -> [u32; 4] {
                 | (u32::from(features.has(HostFeatures::CRC32)) << 20) // SSE4.2
                 | (1 << 22) | (1 << 23) // MOVBE, POPCNT
                 | (u32::from(features.has(HostFeatures::AES)) << 25)
-                | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29); // XSAVE, OSXSAVE, AVX, F16C
+                | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) // XSAVE, OSXSAVE, AVX, F16C
+                | (1 << 30); // RDRAND (OS CSPRNG via getentropy)
             let edx = (1 << 4) | (1 << 8) | (1 << 15) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26) // TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2
                 | (u32::from(cores > 1) << 28);
             [0x0009_06ea, (apic() << 24) | (cores << 16), ecx, edx]
@@ -38,10 +39,16 @@ pub(crate) fn query(leaf: u32, subleaf: u32) -> [u32; 4] {
             [eax, (7 << 22) | 127, size / (8 * 128) - 1, 0]
         }
         (7, 0) => {
-            let ebx = (1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 13) | (1 << 19) // BMI1, AVX2, BMI2, ERMS, deprecated FCS/FDS, ADX
+            let ebx = (1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 13) // BMI1, AVX2, BMI2, ERMS, deprecated FCS/FDS
+                | (1 << 18) | (1 << 19) // RDSEED, ADX
                 | (u32::from(features.has(HostFeatures::SHA1 | HostFeatures::SHA256)) << 29);
-            [0, ebx, 0, 0]
+            let ecx = (1 << 8) // GFNI (legacy + VEX 128/256)
+                | (u32::from(features.has(HostFeatures::AES)) << 9) // VAES (VEX 256)
+                | (u32::from(features.has(HostFeatures::PMULL)) << 10); // VPCLMULQDQ (VEX 256)
+            let edx = 1 << 14; // SERIALIZE
+            [1, ebx, ecx, edx]
         }
+        (7, 1) => [1 << 4, 0, 0, 0], // AVX-VNNI (VEX 128/256)
         (0xb | 0x1f, 0) => [0, 1, 1 << 8, apic()],
         (0xb | 0x1f, 1) => [cores.next_power_of_two().ilog2(), cores, (2 << 8) | 1, apic()],
         (0xb | 0x1f, _) => [0, 0, subleaf & 0xff, apic()],
@@ -70,3 +77,7 @@ impl Cpu {
         self.last_bits[..4].fill(64);
     }
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "cpuid_audit_tests.rs"]
+mod audit_tests;

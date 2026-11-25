@@ -1067,7 +1067,8 @@ fn lower_ext(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
         M::Leave => {
             f.kind = K_LEAVE;
         }
-        M::Clc | M::Stc | M::Cmc | M::Cld | M::Std | M::Mfence | M::Sfence | M::Lfence => {
+        M::Clc | M::Stc | M::Cmc | M::Cld | M::Std | M::Mfence | M::Sfence | M::Lfence
+        | M::Serialize => {
             f.kind = K_FLAG_OP;
             f.x = match mn {
                 M::Clc => 0,
@@ -1075,6 +1076,7 @@ fn lower_ext(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
                 M::Cmc => 2,
                 M::Cld => 3,
                 M::Std => 4,
+                M::Serialize => 6,
                 _ => 5,
             };
         }
@@ -1115,7 +1117,7 @@ fn lower_inner(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
         Some(())
     };
     match mn {
-        Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Endbr64 | Mnemonic::Endbr32
+        Mnemonic::Nop | Mnemonic::Reservednop | Mnemonic::Pause | Mnemonic::Endbr64 | Mnemonic::Endbr32
         | Mnemonic::Clflush | Mnemonic::Prefetch | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1
         | Mnemonic::Prefetcht2 | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Prefetchwt1
         | Mnemonic::Wait | Mnemonic::Rdsspd | Mnemonic::Rdsspq => {

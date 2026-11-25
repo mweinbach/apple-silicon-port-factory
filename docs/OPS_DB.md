@@ -268,3 +268,66 @@ cargo opsdb -- isa-coverage          # human-readable summary by CpuidFeature an
 cargo opsdb -- isa-coverage --json   # versioned JSON envelope for dashboards/CI
 cargo opsdb -- isa-coverage --sync   # refresh db/isa_coverage.tsv
 ```
+
+---
+
+## 5. Guest CPUID Contract & ISA Extension Decision Table
+
+`crates/x86-runtime/src/emu/cpuid.rs` enforces an **honest-CPUID contract**, verified by
+`crates/x86-runtime/src/emu/cpuid_audit_tests.rs` and `crates/port-factory/src/isa_coverage.rs`:
+
+- Every set CPUID feature bit on leaves `1`, `7.0`, `7.1`, `0xD.1`, `0x8000_0001`, and
+  `0x8000_0008` is explicitly mapped and audited against `x86_runtime::emu::instruction_lowering()`.
+- `XCR0` (`xgetbv` with `ECX=0`, Leaf `0xD.0`, and `GetEnabledXStateFeatures()`) is strictly `0x7`
+  (`x87 | SSE | AVX`, 832-byte XSAVE image with YMM upper halves at offset `576`).
+- Host-accelerated extensions (`AES` + `VAES`, `PCLMULQDQ` + `VPCLMULQDQ`, `SSE4.2`, `SHA-NI`) are
+  dynamically gated on the host's detected ARM64 feature bits (`HostFeatures`).
+- Any extension that is not natively implemented in JIT/AOT stays **unadvertised** (CPUID bit = `0`).
+
+### ISA Extension Decision Table
+
+| Extension | CPUID Bit | Decision | Native JIT/AOT Lowering & Rationale |
+|---|---|---|---|
+| **GFNI** (`gf2p8mulb`, `gf2p8affineqb`, `gf2p8affineinvqb`, Legacy + VEX 128/256) | Leaf `7.0` ECX:8 | **Implemented & Advertised** | Baseline ARMv8.0 NEON (`cmlt`/`shl`/`and`/`eor` GF(2⁸) mod `0x11B` mul & `x^254` inversion; `tbl`+`cnt.16b` 8×8 bit-matrix affine transform). Preserves YMM[255:128] on Legacy SSE, zeroes on VEX.128. |
+| **AVX-VNNI** (`vpdpbusd`, `vpdpbusds`, `vpdpwssd`, `vpdpwssds`, VEX 128/256) | Leaf `7.1` EAX:4 (`7.0` EAX=1) | **Implemented & Advertised** | Baseline ARMv8.0 NEON (`uxtl`/`sxtl`+`mul.8h`+`saddlp.4s`+`addp.4s`+`add`/`sqadd`; `vpdpwssds` widens `smull`/`smull2` via `saddlp.2d`+`sxtl.2d`+`sqxtn.4s` so `(-32768)²+(-32768)² = +2³¹` saturates accurately). |
+| **VAES (256-bit)** (`vaesenc`, `vaesenclast`, `vaesdec`, `vaesdeclast`, VEX 256) | Leaf `7.0` ECX:9 (host `AES`) | **Implemented & Advertised** | Dual-lane 128-bit hardware `aese`/`aesmc`/`aesd`/`aesimc` + `eor`, gated on `HostFeatures::AES`. |
+| **VPCLMULQDQ (256-bit)** (`vpclmulqdq`, VEX 256) | Leaf `7.0` ECX:10 (host `PMULL`) | **Implemented & Advertised** | Dual-lane 128-bit hardware `pmull.1q`, gated on `HostFeatures::PMULL`. |
+| **SERIALIZE** (`serialize`) | Leaf `7.0` EDX:14 | **Implemented & Advertised** | Full instruction + memory serialization via `dsb ish; isb` with zero GPR/flag/vector side effects. |
+| **RDRAND / RDSEED** (`r16`/`r32`/`r64`) | Leaf `1` ECX:30 (`RDRAND`), Leaf `7.0` EBX:18 (`RDSEED`) | **Implemented & Advertised** | Backed by Darwin `getentropy(2)` (kernel CSPRNG / hardware TRNG; Apple Silicon M-series lacks ARM `FEAT_RNG`/`RNDR`) via zero-relocation `JitScratch::entropy_fn` helper. Sets `CF=1` on success, `dst=0`/`CF=0` on failure, and always clears `OF=SF=ZF=PF=0`. |
+| **BMI1 / BMI2 / LZCNT / POPCNT / ADX / MOVBE / SHA / AES / PCLMULQDQ / SSE3 / F16C / FMA** | Leaves `1`, `7.0`, `0x8000_0001` | **Implemented & Advertised** | Audited across all 64-bit operand sizes, reg/mem variants, and high-8 register forms (`crc32 r32, ah/ch/dh/bh` and `reservednop` closed in this slice). Zero non-`Arm64` forms remain. |
+| **FSGSBASE** (`rdfsbase`, `rdgsbase`, `wrfsbase`, `wrgsbase`) | Leaf `7.0` EBX:0 | **Unimplemented & Unadvertised** | On Windows x64, `GS` points to the Win32 TEB (`JitScratch::teb`), and `Cpu` has no guest `FS` base field. Allowing arbitrary user-mode `wrgsbase` would corrupt TEB/TLS/SEH invariants across `win32-rt` thunks and JIT `%gs:` loads. |
+| **WAITPKG** (`umonitor`, `umwait`, `tpause`) | Leaf `7.0` ECX:5 | **Unimplemented & Unadvertised** | Apple Silicon user mode has no equivalent to x86 address-monitored store wakeups or `IA32_UMWAIT_CONTROL` C-state deadline capping; emulating with `wfe`/`yield` would expose dishonest timing/wakeup behavior. |
+| **PKU / OSPKE** (`rdpkru`, `wrpkru`) | Leaf `7.0` ECX:3,4 | **Unimplemented & Unadvertised** | Darwin/ARM64 does not expose x86-style per-page 4-bit user protection keys (PKRU) in hardware page tables; implementing dummy register read/write without MMU enforcement would be dishonest. |
+| **AVX-IFMA** (`vpmadd52luq`/`huq`, VEX) | Leaf `7.1` EAX:23 | **Unimplemented & Unadvertised** | Post-2024 Sierra Forest / Arrow Lake extension with no shipping PC game demand; remains cleanly unadvertised. |
+| **AVX-VNNI-INT8** (`vpdpb{u,s}{u,s}d[s]`, VEX) | Leaf `7.1` EDX:4 | **Unimplemented & Unadvertised** | Post-2024 Sierra Forest / Arrow Lake extension with no shipping PC game demand; remains cleanly unadvertised. |
+| **AVX-NE-CONVERT** (`vcvtne*`/`vbcstne*`, VEX) | Leaf `7.1` EDX:5 | **Unimplemented & Unadvertised** | Post-2024 BF16/FP16 inference conversion extension with no shipping PC game demand; remains cleanly unadvertised. |
+| **AVX-512 (all subsets)** (`AVX512F`/`DQ`/`BW`/`VL`/`CD`/`IFMA`/`VBMI*`/`VNNI`/`FP16`/`BF16`, etc.) | Leaf `7.0` EBX/ECX/EDX, `7.1` EAX, `XCR0[7:5]` | **Unimplemented & Unadvertised** | `XCR0` opmask (bit 5), `ZMM_Hi256` (bit 6), and `Hi16_ZMM` (bit 7) are all `0`. See rationale below. |
+
+### Why AVX-512 Stays Unimplemented & Unadvertised (and Future Requirements)
+
+Apple Silicon (M1–M4) provides 32× 128-bit NEON registers (`v0..v31`) and does **not** implement
+ARM SVE/SVE2 (only SME for matrix tiles, which is non-general-purpose and switches streaming state).
+Emulating 512-bit AVX-512 honestly requires:
+
+1. **4× vector splitting and severe register pressure**: Each `zmm0..zmm31` register spans four
+   128-bit NEON vectors (512 bits × 32 registers = 2,048 bytes of architectural state, vs. the
+   current 512 bytes for `ymm0..ymm15`), exceeding the entire ARM64 FP/SIMD register file (`v0..v31`)
+   by 4× and forcing spill/reload traffic into `Cpu` on nearly every instruction.
+2. **Per-lane opmask (`k0..k7`) merging & zeroing**: Almost every EVEX instruction supports
+   predicated merge-masking (`{k1}`) and zero-masking (`{k1}{z}`), embedded broadcast (`{1to16}`),
+   and per-instruction static rounding/SAE (`{rn-sae}`..`{rz-sae}`), requiring dynamic mask
+   expansion, FPCR override save/restore, and fault suppression on masked-off memory lanes.
+3. **XSAVE / `CONTEXT` ABI expansion**: Advertising `XCR0[7:5] = 0b111` grows the guest XSAVE area
+   from 832 bytes to **2,688 bytes** (opmask 64B + `ZMM_Hi256` 512B + `Hi16_ZMM` 1,024B), requiring
+   full `xstate.rs`, SEH/VEH `CONTEXT_XSTATE`, and `RtlCaptureContext` / `GetEnabledXStateFeatures`
+   updates across `x86-runtime` and `win32-rt`.
+4. **EVEX decoder & JIT surface area**: Hundreds of EVEX-only opcodes (`vpermt2*`, `vcompress*`,
+   `vexpand*`, `vconflict*`, `vternlog*`, `vscatter*`, `kadd*`/`kand*`/`kshift*`) plus strict
+   zero-extension of `xmm`/`ymm` results into `zmm[511:128/256]`.
+
+Because shipping PC games always provide AVX2/SSE4.2 dispatch paths when `CPUID` leaves AVX-512 and
+`XCR0[7:5]` clear, keeping AVX-512 unadvertised avoids massive complexity and code-size bloat with
+zero compatibility loss. A future AVX-512 track would start by extending `Cpu` + `xstate.rs` +
+`win32-rt` XSTATE context frames to 2,688 bytes, adding EVEX decoding in `fast/decode.rs`, and
+implementing `k0..k7` mask registers and 4-lane NEON splitting behind an explicit opt-in gate before
+flipping `XCR0[7:5]` and CPUID bits.

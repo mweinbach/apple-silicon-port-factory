@@ -161,6 +161,8 @@ pub(super) struct JitScratch {
     /// allowing AOT & signed static Mach-O blocks to call soft-float80 / transcendental helpers
     /// with zero runtime relocations.
     pub x87_helpers: usize,
+    /// Native OS entropy helper (`super::cpu::guest_entropy_raw`) for `RDRAND`/`RDSEED`.
+    pub entropy_fn: usize,
     /// Test-only: dynamic `DF_PLAIN` / pure-float-math / inline-QPC calls served directly in
     /// `lookup_call` / `lookup_jmp` from `table`.
     #[cfg(test)]
@@ -193,6 +195,7 @@ impl Default for JitScratch {
             ymm_dirty: 0,
             mxcsr: 0x1F80,
             host_fpcr: 0,
+            entropy_fn: super::cpu::guest_entropy_raw as *const () as usize,
             #[cfg(test)]
             plain_call_hits: 0,
         }
@@ -825,6 +828,7 @@ const OFF_PROBEHITS: u32 = OFF_JX + offset_of!(JitScratch, aot_probe_hits) as u3
 const OFF_TSC_MODE: u32 = OFF_JX + offset_of!(JitScratch, tsc_mode) as u32;
 const OFF_YMM_DIRTY: u32 = OFF_JX + offset_of!(JitScratch, ymm_dirty) as u32;
 const OFF_HOST_FPCR: u32 = OFF_JX + offset_of!(JitScratch, host_fpcr) as u32;
+const OFF_ENTROPY_FN: u32 = OFF_JX + offset_of!(JitScratch, entropy_fn) as u32;
 const OFF_MXCSR: u32 = OFF_JX + offset_of!(JitScratch, mxcsr) as u32;
 #[cfg(test)]
 const OFF_PLAINHITS: u32 = OFF_JX + offset_of!(JitScratch, plain_call_hits) as u32;
@@ -835,6 +839,8 @@ const _: () = assert!(
         && OFF_X87_STATE < 8 * 4096
         && OFF_X87_HELPERS % 8 == 0
         && OFF_X87_HELPERS < 8 * 4096
+        && OFF_ENTROPY_FN % 8 == 0
+        && OFF_ENTROPY_FN < 8 * 4096
         && OFF_AOTDIR % 8 == 0
         && OFF_PROBEHITS % 8 == 0
         && OFF_PROBEHITS < 8 * 4096
