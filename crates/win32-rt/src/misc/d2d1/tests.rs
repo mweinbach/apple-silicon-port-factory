@@ -1116,6 +1116,32 @@ fn geometry_tessellate_rect_concave_l_shape_and_ellipse() {
         assert!((tri_area_sum(&sink.tris) - 150.0).abs() < 1e-2, "overlapping WINDING area {}", tri_area_sum(&sink.tris));
         assert!(tris_contain_pt(&sink.tris, 7.5, 5.0), "overlap region must be filled under WINDING");
 
+        // 4g. Multi-hole polygon where ear-clipping after bridging hits a stuck corner
+        //     must fall back cleanly to scanline-slab tessellation (exact area = 10000 - 12 - 12 = 9976).
+        let mut multi_hole: *mut c_void = std::ptr::null_mut();
+        let mut mh_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut multi_hole), S_OK);
+        assert_eq!(path_geom_open(multi_hole as PGeom, &mut mh_sink), S_OK);
+        set_fill_mode(mh_sink, D2D1_FILL_MODE_ALTERNATE);
+        add_ring(mh_sink as PGeomSink, &[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]);
+        add_ring(mh_sink as PGeomSink, &[(26.9, 37.7), (29.9, 37.7), (29.9, 41.7), (26.9, 41.7)]);
+        add_ring(mh_sink as PGeomSink, &[(32.8, 52.2), (35.8, 52.2), (35.8, 56.2), (32.8, 56.2)]);
+        assert_eq!(gsink_close(mh_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(multi_hole as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!(
+            (tri_area_sum(&sink.tris) - 9976.0).abs() < 1e-1,
+            "multi-hole area must equal 9976.0 without overlapping triangles, got {}",
+            tri_area_sum(&sink.tris)
+        );
+        assert!(!tris_contain_pt(&sink.tris, 28.4, 39.7), "first hole interior must remain empty");
+        assert!(!tris_contain_pt(&sink.tris, 34.3, 54.2), "second hole interior must remain empty");
+        assert!(tris_contain_pt(&sink.tris, 10.0, 10.0), "outer interior must be filled");
+        assert!(tris_contain_pt(&sink.tris, 31.0, 47.0), "region between holes must be filled");
+
+        release_com(mh_sink);
+        release_com(multi_hole);
         release_com(ovw_sink);
         release_com(ov_wind);
         release_com(ova_sink);

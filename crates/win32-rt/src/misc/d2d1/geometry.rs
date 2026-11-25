@@ -1257,10 +1257,15 @@ fn splice_holes_into_outer(mut poly: Vec<(f32, f32)>, mut holes: Vec<Vec<(f32, f
     poly
 }
 
-fn triangulate_ccw_polygon(pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
+/// Ear-clip a simple CCW polygon into triangles. Returns `false` (leaving `out`
+/// unmodified) if no valid ear exists or a degenerate/inverted remainder is reached,
+/// so the caller can fall back to exact scanline-slab tessellation instead of
+/// emitting overlapping or out-of-bounds triangles.
+fn triangulate_ccw_polygon(pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) -> bool {
     if pts.len() < 3 {
-        return;
+        return true;
     }
+    let start_len = out.len();
     let pt_in_tri = |p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)| -> bool {
         let c1 = poly_cross(a, b, p);
         let c2 = poly_cross(b, c, p);
@@ -1304,21 +1309,14 @@ fn triangulate_ccw_polygon(pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
                 break;
             }
         }
-        // Fallback for degenerate / self-touching polygons: clip the best convex (or first) corner
-        // so triangulation always makes progress and terminates in O(n^2).
-        let pos = ear_pos.unwrap_or_else(|| {
-            (0..n)
-                .max_by(|&i, &j| {
-                    let ci = poly_cross(pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]);
-                    let cj = poly_cross(pts[idx[(j + n - 1) % n]], pts[idx[j]], pts[idx[(j + 1) % n]]);
-                    ci.total_cmp(&cj)
-                })
-                .unwrap_or(0)
-        });
+        let Some(pos) = ear_pos else {
+            out.truncate(start_len);
+            return false;
+        };
         let a = pts[idx[(pos + n - 1) % n]];
         let b = pts[idx[pos]];
         let c = pts[idx[(pos + 1) % n]];
-        if poly_cross(a, b, c).abs() > 1e-8 {
+        if poly_cross(a, b, c) > 1e-8 {
             out.push(D2D1_TRIANGLE {
                 point1: D2D1_POINT_2F { x: a.0, y: a.1 },
                 point2: D2D1_POINT_2F { x: b.0, y: b.1 },
@@ -1331,7 +1329,12 @@ fn triangulate_ccw_polygon(pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
         let a = pts[idx[0]];
         let b = pts[idx[1]];
         let c = pts[idx[2]];
-        if poly_cross(a, b, c).abs() > 1e-8 {
+        let cross = poly_cross(a, b, c);
+        if cross < -1e-7 {
+            out.truncate(start_len);
+            return false;
+        }
+        if cross > 1e-8 {
             out.push(D2D1_TRIANGLE {
                 point1: D2D1_POINT_2F { x: a.0, y: a.1 },
                 point2: D2D1_POINT_2F { x: b.0, y: b.1 },
@@ -1339,6 +1342,7 @@ fn triangulate_ccw_polygon(pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
             });
         }
     }
+    true
 }
 
 /// Intersection, T-junction, or collinear overlap point between non-adjacent
@@ -1570,7 +1574,9 @@ fn tessellate_flattened(fg: &FlattenedGeometry, out: &mut Vec<D2D1_TRIANGLE>) {
         if poly_signed_area2(&pts) < 0.0 {
             pts.reverse();
         }
-        triangulate_ccw_polygon(&pts, out);
+        if !triangulate_ccw_polygon(&pts, out) {
+            tessellate_scanline_slabs(&[pts], &[], fg.fill_mode, out);
+        }
         return;
     }
 
@@ -1648,7 +1654,14 @@ fn tessellate_flattened(fg: &FlattenedGeometry, out: &mut Vec<D2D1_TRIANGLE>) {
         } else {
             splice_holes_into_outer(outer, holes)
         };
-        triangulate_ccw_polygon(&combined, out);
+        if !triangulate_ccw_polygon(&combined, out) {
+            let mut comp: Vec<Vec<(f32, f32)>> = Vec::with_capacity(1 + holes_of[i].len());
+            comp.push(rings[i].pts.clone());
+            for &h_idx in &holes_of[i] {
+                comp.push(rings[h_idx].pts.clone());
+            }
+            tessellate_scanline_slabs(&comp, &[], D2D1_FILL_MODE_ALTERNATE, out);
+        }
     }
 }
 
