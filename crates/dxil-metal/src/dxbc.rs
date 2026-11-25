@@ -117,11 +117,18 @@ impl<'a> Container<'a> {
     }
 
     /// Entry point of a non-library shader: `PSV0` (v3+), else the single function the
-    /// bitcode defines.
+    /// bitcode defines (skipped for Hull shaders, whose pass-through control-point phase
+    /// defines only the patch-constant function such as `pc_main` while the DXIL entry
+    /// point name remains `main`).
     pub fn entry_point(&self) -> Option<String> {
-        self.psv_entry_point().or_else(|| match self.defined_functions() {
-            Some(mut f) if f.len() == 1 => f.pop(),
-            _ => None,
+        self.psv_entry_point().or_else(|| {
+            if self.program().is_some_and(|p| p.kind == ProgramKind::Hull) {
+                return None;
+            }
+            match self.defined_functions() {
+                Some(mut f) if f.len() == 1 => f.pop(),
+                _ => None,
+            }
         })
     }
 

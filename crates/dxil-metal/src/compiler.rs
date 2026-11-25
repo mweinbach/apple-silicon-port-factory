@@ -465,7 +465,11 @@ pub fn compile_uncached(req: &CompileRequest) -> Result<CompiledShader, Error> {
         // `Error::Load`, which the cache doesn't persist, so installing it later takes effect.
         // The result keeps the key of the original DXBC bytes.
         let dxil = crate::dxilconv::convert_signed(req.dxil)?;
-        let mut s = compile_uncached(&CompileRequest { dxil: &dxil, ..*req })?;
+        let mut s = compile_uncached(&CompileRequest {
+            dxil: &dxil,
+            entry_point: req.entry_point.or(Some("main")),
+            ..*req
+        })?;
         s.key = req.cache_key(&api.fingerprint);
         return Ok(s);
     }
