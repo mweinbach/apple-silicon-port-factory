@@ -3962,6 +3962,12 @@ unsafe fn try_wsa_recvmsg_once(
     pflags: i32,
 ) -> Result<(usize, usize, u32), i32> {
     let mut wmsg = std::ptr::read_unaligned(lp_msg);
+    if (wmsg.control.len > 0 && wmsg.control.buf.is_null())
+        || (wmsg.namelen > 0 && wmsg.name.is_null())
+        || wmsg.namelen < 0
+    {
+        return Err(libc::EFAULT);
+    }
     let mut iovecs: Vec<libc::iovec> = bufs
         .iter()
         .map(|&(addr, len)| libc::iovec {
@@ -4108,6 +4114,12 @@ pub unsafe extern "win64" fn WSARecvMsg(
         return err(WSAEFAULT, SOCKET_ERROR);
     }
     let wmsg = std::ptr::read_unaligned(lp_msg);
+    if (wmsg.control.len > 0 && wmsg.control.buf.is_null())
+        || (wmsg.namelen > 0 && wmsg.name.is_null())
+        || wmsg.namelen < 0
+    {
+        return err(WSAEFAULT, SOCKET_ERROR);
+    }
     let bufs = match collect_wsa_bufs(wmsg.lp_buffers, wmsg.dw_buffer_count) {
         Ok(b) => b,
         Err(e) => return err(e, SOCKET_ERROR),
@@ -4255,6 +4267,12 @@ pub unsafe extern "win64" fn WSASendMsg(
         return err(WSAEFAULT, SOCKET_ERROR);
     }
     let wmsg = std::ptr::read_unaligned(lp_msg);
+    if (wmsg.control.len > 0 && wmsg.control.buf.is_null())
+        || (wmsg.namelen > 0 && wmsg.name.is_null())
+        || wmsg.namelen < 0
+    {
+        return err(WSAEFAULT, SOCKET_ERROR);
+    }
     let bufs = match collect_wsa_bufs(wmsg.lp_buffers, wmsg.dw_buffer_count) {
         Ok(b) => b,
         Err(e) => return err(e, SOCKET_ERROR),
@@ -11519,6 +11537,119 @@ mod tests {
             assert_eq!(WSAGetOverlappedResult(rx, &mut ov, &mut xfer3, FALSE, &mut fl3), TRUE);
             assert_eq!(xfer3, 7);
             assert_eq!(fl3, 0);
+
+            assert_eq!(closesocket(rx), 0);
+            assert_eq!(closesocket(tx), 0);
+        }
+    }
+
+    #[test]
+    fn wsarecvmsg_and_wsasendmsg_reject_null_control_or_name_with_nonzero_len_without_consuming_dgram() {
+        unsafe {
+            let rx = socket(AF_INET as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            let tx = socket(AF_INET as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            assert_ne!(rx, INVALID_SOCKET);
+            assert_ne!(tx, INVALID_SOCKET);
+
+            let sa_bind = loopback_sa(0);
+            assert_eq!(bind(rx, sa_bind.as_ptr(), 16), 0);
+            let mut rx_sa = [0u8; 16];
+            let mut rx_sa_len = 16i32;
+            assert_eq!(getsockname(rx, rx_sa.as_mut_ptr(), &mut rx_sa_len), 0);
+
+            // WSASendMsg with null Control.buf and nonzero Control.len must fail with WSAEFAULT.
+            let mut payload = *b"keep-me";
+            let mut swb = WsaBuf { len: payload.len() as u32, buf: payload.as_mut_ptr() };
+            let bad_sm = WsaMsg {
+                name: rx_sa.as_mut_ptr(),
+                namelen: 16,
+                _pad0: 0,
+                lp_buffers: &mut swb,
+                dw_buffer_count: 1,
+                _pad1: 0,
+                control: WsaBuf { len: 32, buf: std::ptr::null_mut() },
+                dw_flags: 0,
+                _pad2: 0,
+            };
+            let mut sent = 0u32;
+            assert_eq!(
+                WSASendMsg(tx, &bad_sm, 0, &mut sent, std::ptr::null_mut(), std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+
+            // Queue a valid datagram onto `rx`.
+            let good_sm = WsaMsg {
+                control: WsaBuf { len: 0, buf: std::ptr::null_mut() },
+                ..bad_sm
+            };
+            assert_eq!(
+                WSASendMsg(tx, &good_sm, 0, &mut sent, std::ptr::null_mut(), std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(sent as usize, payload.len());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            // Sync and overlapped WSARecvMsg with null Control.buf + nonzero len (or null name +
+            // nonzero namelen) must fail immediately with WSAEFAULT without consuming the datagram.
+            let mut rbuf = [0u8; 32];
+            let mut rwb = WsaBuf { len: rbuf.len() as u32, buf: rbuf.as_mut_ptr() };
+            let mut bad_ctrl_msg = WsaMsg {
+                name: std::ptr::null_mut(),
+                namelen: 0,
+                _pad0: 0,
+                lp_buffers: &mut rwb,
+                dw_buffer_count: 1,
+                _pad1: 0,
+                control: WsaBuf { len: 32, buf: std::ptr::null_mut() },
+                dw_flags: 0,
+                _pad2: 0,
+            };
+            let mut recvd = 0u32;
+            assert_eq!(
+                WSARecvMsg(rx, &mut bad_ctrl_msg, &mut recvd, std::ptr::null_mut(), std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                WSARecvMsg(
+                    rx,
+                    &mut bad_ctrl_msg,
+                    &mut recvd,
+                    &mut ov as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+
+            let mut bad_name_msg = WsaMsg {
+                name: std::ptr::null_mut(),
+                namelen: 16,
+                control: WsaBuf { len: 0, buf: std::ptr::null_mut() },
+                ..bad_ctrl_msg
+            };
+            assert_eq!(
+                WSARecvMsg(rx, &mut bad_name_msg, &mut recvd, std::ptr::null_mut(), std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+
+            // Retrying with a valid control buffer must still receive the original queued datagram.
+            let mut ctrl = [0u8; 64];
+            let mut good_msg = WsaMsg {
+                name: std::ptr::null_mut(),
+                namelen: 0,
+                control: WsaBuf { len: ctrl.len() as u32, buf: ctrl.as_mut_ptr() },
+                ..bad_ctrl_msg
+            };
+            assert_eq!(
+                WSARecvMsg(rx, &mut good_msg, &mut recvd, std::ptr::null_mut(), std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(&rbuf[..recvd as usize], b"keep-me");
 
             assert_eq!(closesocket(rx), 0);
             assert_eq!(closesocket(tx), 0);
