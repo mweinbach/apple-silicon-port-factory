@@ -853,7 +853,13 @@ extern "win64" fn xess_set_context_parameter_f_impl(
     if !value.is_finite() {
         return XESS_RESULT_ERROR_INVALID_ARGUMENT;
     }
-    crate::stub!("xessSetContextParameterF(param={param:#x}, value={value}) -> NOT_IMPLEMENTED");
+    // Native-unsupported (Intel XeSS SDK `xess.h`): retail non-Intel XeSS runtimes
+    // do not expose Intel-driver-internal float context parameter hooks and return
+    // `XESS_RESULT_ERROR_NOT_IMPLEMENTED` (-7).
+    log::debug!(
+        target: "d3d",
+        "xessSetContextParameterF(param={param:#x}, value={value}) -> XESS_RESULT_ERROR_NOT_IMPLEMENTED"
+    );
     XESS_RESULT_ERROR_NOT_IMPLEMENTED
 }
 crate::win64_bridge!(fn xess_set_context_parameter_f_impl(usize, u32, f32) -> i32);
@@ -925,7 +931,10 @@ pub extern "win64" fn xessStartDump(
     if dp.path.is_null() {
         return XESS_RESULT_ERROR_INVALID_ARGUMENT;
     }
-    crate::stub!("xessStartDump -> XESS_RESULT_ERROR_NOT_IMPLEMENTED");
+    // Native-unsupported (Intel XeSS SDK `xess_debug.h`): retail `libxess_dx11.dll`
+    // builds do not ship Intel's internal debug frame-dump capture facility and return
+    // `XESS_RESULT_ERROR_NOT_IMPLEMENTED` (-7).
+    log::debug!(target: "d3d", "xessStartDump -> XESS_RESULT_ERROR_NOT_IMPLEMENTED");
     XESS_RESULT_ERROR_NOT_IMPLEMENTED
 }
 
@@ -1154,13 +1163,15 @@ pub extern "win64" fn INTC_D3D11_XessForceLegacyScaleFactors(
 
 // ---------------------------------------------------------------------------
 // Intel D3D12 Driver Extension Crash-Dump / Callback Exports (`INTC_D3D12_*`)
+// Native-unsupported on non-Intel GPUs (Intel Graphics Extensions `igdext64.dll` /
+// `IntelExtensionsFramework`): no Intel `INTCExtensionContext` exists on Apple Silicon.
 // ---------------------------------------------------------------------------
 
 pub extern "win64" fn INTC_D3D12_GetApplicationInfo(
     _ext_ctx: usize,
     _app_info: *mut c_void,
 ) -> i32 {
-    crate::stub!("INTC_D3D12_GetApplicationInfo -> E_NOINTERFACE");
+    log::debug!(target: "d3d", "INTC_D3D12_GetApplicationInfo -> E_NOINTERFACE (non-Intel GPU)");
     E_NOINTERFACE
 }
 
@@ -1168,32 +1179,32 @@ pub extern "win64" fn INTC_D3D12_GetGpuCrashDumpBufferInfo(
     _ext_ctx: usize,
     _buffer_info: *mut c_void,
 ) {
-    crate::stub!("INTC_D3D12_GetGpuCrashDumpBufferInfo (no-op)");
+    log::debug!(target: "d3d", "INTC_D3D12_GetGpuCrashDumpBufferInfo: no-op on non-Intel GPU");
 }
 
 pub extern "win64" fn INTC_D3D12_GpuCrashDumpOnCommandListCreate(
     _ext_ctx: usize,
     _cmd_list: usize,
 ) {
-    crate::stub!("INTC_D3D12_GpuCrashDumpOnCommandListCreate (no-op)");
+    log::debug!(target: "d3d", "INTC_D3D12_GpuCrashDumpOnCommandListCreate: no-op on non-Intel GPU");
 }
 
 pub extern "win64" fn INTC_D3D12_GpuCrashDumpOnCommandListDestroy(
     _ext_ctx: usize,
     _cmd_list: usize,
 ) {
-    crate::stub!("INTC_D3D12_GpuCrashDumpOnCommandListDestroy (no-op)");
+    log::debug!(target: "d3d", "INTC_D3D12_GpuCrashDumpOnCommandListDestroy: no-op on non-Intel GPU");
 }
 
 pub extern "win64" fn INTC_D3D12_GpuCrashDumpOnDeviceDestroy(_ext_ctx: usize) {
-    crate::stub!("INTC_D3D12_GpuCrashDumpOnDeviceDestroy (no-op)");
+    log::debug!(target: "d3d", "INTC_D3D12_GpuCrashDumpOnDeviceDestroy: no-op on non-Intel GPU");
 }
 
 pub extern "win64" fn INTC_D3D12_RegisterDriverCallbacks(
     _ext_ctx: usize,
     _callbacks: *const c_void,
 ) {
-    crate::stub!("INTC_D3D12_RegisterDriverCallbacks (no-op)");
+    log::debug!(target: "d3d", "INTC_D3D12_RegisterDriverCallbacks: no-op on non-Intel GPU");
 }
 
 #[cfg(test)]

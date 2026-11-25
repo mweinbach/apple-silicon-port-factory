@@ -971,6 +971,26 @@ impl CommandList {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn upscale_resource_with(
+        &mut self,
+        dst: &Resource,
+        src: &Resource,
+        render_size: [u32; 2],
+        upscale_size: [u32; 2],
+        tight_stages: bool,
+    ) -> Result<(), String> {
+        self.upscale_resource_with_origins(
+            dst,
+            src,
+            render_size,
+            upscale_size,
+            [0, 0],
+            [0, 0],
+            tight_stages,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn upscale_resource_with_origins(
         &mut self,

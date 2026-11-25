@@ -263,8 +263,11 @@ pub unsafe extern "win64" fn ffxCreateContext(
             FFX_API_RETURN_OK
         }
         FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION => {
-            crate::stub!(
-                "ffxCreateContext(FRAMEGENERATION): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`, `ffx_api_types.h`):
+            // returns `FFX_API_RETURN_NO_PROVIDER` (4) when no frame-generation provider is installed.
+            log::debug!(
+                target: "d3d",
+                "ffxCreateContext(FRAMEGENERATION): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
             );
             FFX_API_RETURN_NO_PROVIDER
         }
@@ -391,7 +394,12 @@ pub unsafe extern "win64" fn ffxConfigure(context: *mut usize, header: *const Ff
     match ty & FFX_API_EFFECT_MASK {
         FFX_API_EFFECT_ID_UPSCALE | FFX_API_EFFECT_ID_FRAMEGENERATIONSWAPCHAIN => FFX_API_RETURN_OK,
         FFX_API_EFFECT_ID_FRAMEGENERATION => {
-            crate::stub!("ffxConfigure(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER");
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`): returns
+            // `FFX_API_RETURN_NO_PROVIDER` (4) when no frame-generation provider exists.
+            log::debug!(
+                target: "d3d",
+                "ffxConfigure(ty={ty:#x}): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
+            );
             FFX_API_RETURN_NO_PROVIDER
         }
         _ => FFX_API_RETURN_NO_PROVIDER,
@@ -577,8 +585,11 @@ pub unsafe extern "win64" fn ffxDispatch(context: *mut usize, header: *const Ffx
             FFX_API_RETURN_OK
         }
         _ if (ty & FFX_API_EFFECT_MASK) == FFX_API_EFFECT_ID_FRAMEGENERATION => {
-            crate::stub!(
-                "ffxDispatch(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`): returns
+            // `FFX_API_RETURN_NO_PROVIDER` (4) when no frame-generation provider exists.
+            log::debug!(
+                target: "d3d",
+                "ffxDispatch(ty={ty:#x}): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
             );
             FFX_API_RETURN_NO_PROVIDER
         }
@@ -639,8 +650,11 @@ pub unsafe extern "win64" fn ffxQuery(context: *mut usize, header: *mut FfxApiHe
             if !out_cmd.is_null() {
                 std::ptr::write_unaligned(out_cmd, 0);
             }
-            crate::stub!(
-                "ffxQuery(INTERPOLATIONCOMMANDLIST_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`): no frame-generation
+            // swapchain provider is installed -> `FFX_API_RETURN_NO_PROVIDER` (4).
+            log::debug!(
+                target: "d3d",
+                "ffxQuery(INTERPOLATIONCOMMANDLIST_DX12): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
             );
             return FFX_API_RETURN_NO_PROVIDER;
         }
@@ -649,8 +663,11 @@ pub unsafe extern "win64" fn ffxQuery(context: *mut usize, header: *mut FfxApiHe
             if !out_tex.is_null() {
                 std::ptr::write_unaligned(out_tex, [0; 6]);
             }
-            crate::stub!(
-                "ffxQuery(INTERPOLATIONTEXTURE_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`): no frame-generation
+            // swapchain provider is installed -> `FFX_API_RETURN_NO_PROVIDER` (4).
+            log::debug!(
+                target: "d3d",
+                "ffxQuery(INTERPOLATIONTEXTURE_DX12): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
             );
             return FFX_API_RETURN_NO_PROVIDER;
         }
