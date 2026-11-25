@@ -8,8 +8,9 @@ use crate::com::{
 };
 use crate::types::*;
 use crate::user32::RECT;
+use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ============================================================================
 // IDWriteTextAnalyzer (10 slots)
@@ -818,20 +819,30 @@ unsafe extern "win64" fn ta_analyze_line_breakpoints(
         let mut is_soft_hyphen = false;
         match u {
             0x000A => {
-                // LF: must break after; do not break between CR and LF.
-                if idx > 0 && units[idx - 1] == 0x000D {
-                    before = 2;
-                }
+                // LF: must break after; never break before (LB6) including CR+LF.
+                before = 2;
                 after = 3;
                 is_ws = true;
             }
             0x000D => {
+                before = 2;
                 after = if idx + 1 < units.len() && units[idx + 1] == 0x000A { 2 } else { 3 };
                 is_ws = true;
             }
-            0x0020 | 0x0009 => {
+            // Unicode UAX #14 mandatory line/paragraph break characters (BK):
+            // VT (U+000B), FF (U+000C), NEL (U+0085), LS (U+2028), PS (U+2029).
+            0x000B | 0x000C | 0x0085 | 0x2028 | 0x2029 => {
+                before = 2; // MAY_NOT_BREAK before mandatory break char (LB6)
+                after = 3;  // MUST_BREAK after (LB4/LB5)
+                is_ws = true;
+            }
+            0x0020 | 0x0009 | 0x1680 | 0x2000..=0x200A | 0x205F | 0x3000 => {
                 after = 1; // CAN_BREAK
                 is_ws = true;
+            }
+            0x200B => {
+                // Zero-width space allows break after without counting as whitespace.
+                after = 1;
             }
             0x002D => {
                 after = 1; // hyphen allows break after
@@ -840,11 +851,16 @@ unsafe extern "win64" fn ta_analyze_line_breakpoints(
                 after = 1;
                 is_soft_hyphen = true;
             }
-            0x00A0 => {
-                // NBSP: may not break before or after
+            0x00A0 | 0x202F => {
+                // NBSP / NNBSP: may not break before or after
                 before = 2;
                 after = 2;
                 is_ws = true;
+            }
+            0x2060 | 0xFEFF => {
+                // Word joiner / ZWNBSP: may not break before or after
+                before = 2;
+                after = 2;
             }
             _ => {}
         }
@@ -971,6 +987,47 @@ fn apply_number_substitution(
     }
 }
 
+/// Bounded LRU cache mapping `(orig_units, shaped_gids, is_rtl)` -> `substituted_units`
+/// produced when `GetGlyphs` applies `IDWriteNumberSubstitution`. `GetGlyphPlacements` and
+/// `GetGdiCompatibleGlyphPlacements` receive the original unsubstituted text per the
+/// DirectWrite ABI, so this lets them reshape the exact substituted text and preserve
+/// CoreText kerning and combining-mark offsets.
+struct SubstitutedRunEntry {
+    orig_units: Vec<u16>,
+    gids: Vec<u16>,
+    is_rtl: bool,
+    substituted_units: Vec<u16>,
+}
+
+const SUBSTITUTED_RUN_CACHE_CAP: usize = 64;
+
+fn substituted_run_cache() -> &'static Mutex<VecDeque<SubstitutedRunEntry>> {
+    static C: OnceLock<Mutex<VecDeque<SubstitutedRunEntry>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn cache_substituted_run(orig_units: Vec<u16>, gids: Vec<u16>, is_rtl: bool, substituted_units: Vec<u16>) {
+    let mut cache = substituted_run_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = cache
+        .iter()
+        .position(|e| e.is_rtl == is_rtl && e.orig_units == orig_units && e.gids == gids)
+    {
+        cache.remove(pos);
+    } else if cache.len() >= SUBSTITUTED_RUN_CACHE_CAP {
+        cache.pop_front();
+    }
+    cache.push_back(SubstitutedRunEntry { orig_units, gids, is_rtl, substituted_units });
+}
+
+fn lookup_substituted_run(orig_units: &[u16], gids: &[u16], is_rtl: bool) -> Option<Vec<u16>> {
+    let cache = substituted_run_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .iter()
+        .rev()
+        .find(|e| e.is_rtl == is_rtl && e.orig_units == orig_units && e.gids == gids)
+        .map(|e| e.substituted_units.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "win64" fn ta_get_glyphs(
     this: PTextAnalyzer,
@@ -1022,13 +1079,15 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
             }
         }
     };
-    let mut units = Vec::with_capacity(text_len as usize);
+    let mut orig_units = Vec::with_capacity(text_len as usize);
     for i in 0..text_len as usize {
-        units.push(text_string.add(i).read_unaligned());
+        orig_units.push(text_string.add(i).read_unaligned());
     }
+    let mut units = orig_units.clone();
     if let Some(ref ns) = num_sub {
         apply_number_substitution(&mut units, ns, is_rtl != 0);
     }
+    let was_substituted = units != orig_units;
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
     let feat_ranges = super::shaping::read_feature_ranges(
         features,
@@ -1056,9 +1115,20 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
         for (i, &tp) in shaped.text_props.iter().enumerate() {
             text_props.add(i).write_unaligned(tp);
         }
+        let mut out_gids = if was_substituted {
+            Vec::with_capacity(shaped.glyphs.len())
+        } else {
+            Vec::new()
+        };
         for (gi, g) in shaped.glyphs.iter().enumerate() {
             glyph_indices.add(gi).write_unaligned(g.gid);
             glyph_props.add(gi).write_unaligned(g.props);
+            if was_substituted {
+                out_gids.push(g.gid);
+            }
+        }
+        if was_substituted {
+            cache_substituted_run(orig_units, out_gids, is_rtl != 0, units);
         }
         return S_OK;
     }
@@ -1107,6 +1177,83 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     S_OK
 }
 
+/// Shared CoreText positioning path for `GetGlyphPlacements` and
+/// `GetGdiCompatibleGlyphPlacements`. Checks the substituted-run cache first so runs whose
+/// digits were localized during `GetGlyphs` retain full CoreText kerning and combining-mark
+/// positioning even though placement receives the original unsubstituted text.
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_position_glyphs_platform(
+    face: &FontFaceInner,
+    text_string: *const u16,
+    text_len: u32,
+    glyph_indices: *const u16,
+    glyph_count: u32,
+    em_size: f32,
+    is_rtl: bool,
+    no_visual: bool,
+    features: *const *const c_void,
+    feature_range_lengths: *const u32,
+    feature_ranges: u32,
+    snap_ppd: Option<f32>,
+    glyph_advances: *mut f32,
+    glyph_offsets: *mut DWRITE_GLYPH_OFFSET,
+) -> Option<HRESULT> {
+    if text_len == 0 || text_string.is_null() || glyph_count == 0 {
+        return None;
+    }
+    let mut orig_units = Vec::with_capacity(text_len as usize);
+    for i in 0..text_len as usize {
+        orig_units.push(text_string.add(i).read_unaligned());
+    }
+    let mut caller_gids = Vec::with_capacity(glyph_count as usize);
+    for i in 0..glyph_count as usize {
+        caller_gids.push(glyph_indices.add(i).read_unaligned());
+    }
+    let feat_ranges = super::shaping::read_feature_ranges(
+        features,
+        feature_range_lengths,
+        feature_ranges,
+        orig_units.len(),
+    );
+    let shape_units = lookup_substituted_run(&orig_units, &caller_gids, is_rtl)
+        .unwrap_or(orig_units);
+
+    if let Some(shaped) = super::shaping::shape_run_platform(
+        face,
+        &shape_units,
+        em_size,
+        is_rtl,
+        no_visual,
+        &feat_ranges,
+    ) {
+        if shaped.glyphs.len() == caller_gids.len()
+            && shaped
+                .glyphs
+                .iter()
+                .zip(caller_gids.iter())
+                .all(|(g, &want)| g.gid == want)
+        {
+            for (i, g) in shaped.glyphs.iter().enumerate() {
+                let mut adv = g.advance;
+                if let Some(ppd) = snap_ppd {
+                    adv = (adv * ppd).round() / ppd;
+                }
+                glyph_advances.add(i).write_unaligned(adv);
+                glyph_offsets.add(i).write_unaligned(g.offset);
+            }
+            return Some(S_OK);
+        }
+    } else if super::shaping::needs_complex_shaping(&shape_units, is_rtl, !feat_ranges.is_empty()) {
+        log::warn!(
+            "dwrite: IDWriteTextAnalyzer::GetGlyphPlacements cannot position complex run (len={}, family={:?})",
+            shape_units.len(),
+            face.meta.family_name,
+        );
+        return Some(E_NOTIMPL);
+    }
+    None
+}
+
 /// `IDWriteTextAnalyzer::GetGlyphPlacements` (19 parameters).
 /// `font_em_size_bits` is argument #9 (always passed in a Win64 stack slot, never XMM0..3).
 #[allow(clippy::too_many_arguments)]
@@ -1146,42 +1293,24 @@ pub(super) unsafe extern "win64" fn ta_get_glyph_placements(
     }
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
     let sideways = is_sideways != FALSE;
-    if !sideways && text_len > 0 && !text_string.is_null() && glyph_count > 0 {
-        let mut units = Vec::with_capacity(text_len as usize);
-        for i in 0..text_len as usize {
-            units.push(text_string.add(i).read_unaligned());
-        }
-        let feat_ranges = super::shaping::read_feature_ranges(
-            features,
-            feature_range_lengths,
-            feature_ranges,
-            units.len(),
-        );
-        if let Some(shaped) = super::shaping::shape_run_platform(
+    if !sideways {
+        if let Some(hr) = try_position_glyphs_platform(
             &face,
-            &units,
+            text_string,
+            text_len,
+            glyph_indices,
+            glyph_count,
             em_size,
             is_rtl != 0,
             no_visual,
-            &feat_ranges,
+            features,
+            feature_range_lengths,
+            feature_ranges,
+            None,
+            glyph_advances,
+            glyph_offsets,
         ) {
-            if shaped.glyphs.len() == glyph_count as usize
-                && (0..glyph_count as usize)
-                    .all(|i| shaped.glyphs[i].gid == glyph_indices.add(i).read_unaligned())
-            {
-                for (i, g) in shaped.glyphs.iter().enumerate() {
-                    glyph_advances.add(i).write_unaligned(g.advance);
-                    glyph_offsets.add(i).write_unaligned(g.offset);
-                }
-                return S_OK;
-            }
-        } else if super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_ranges.is_empty()) {
-            log::warn!(
-                "dwrite: IDWriteTextAnalyzer::GetGlyphPlacements cannot position complex run (len={}, family={:?})",
-                units.len(),
-                face.meta.family_name,
-            );
-            return E_NOTIMPL;
+            return hr;
         }
     }
     for i in 0..glyph_count as usize {
@@ -1242,46 +1371,25 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     }
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
     let sideways = is_sideways != FALSE;
-    if !sideways && text_len > 0 && !text_string.is_null() && glyph_count > 0 {
-        let mut units = Vec::with_capacity(text_len as usize);
-        for i in 0..text_len as usize {
-            units.push(text_string.add(i).read_unaligned());
-        }
-        let feat_ranges = super::shaping::read_feature_ranges(
-            features,
-            feature_range_lengths,
-            feature_ranges,
-            units.len(),
-        );
-        if let Some(shaped) = super::shaping::shape_run_platform(
+    if !sideways {
+        let snap_ppd = (use_gdi_natural == FALSE).then_some(ppd);
+        if let Some(hr) = try_position_glyphs_platform(
             &face,
-            &units,
+            text_string,
+            text_len,
+            glyph_indices,
+            glyph_count,
             em_size,
             is_rtl != 0,
             no_visual,
-            &feat_ranges,
+            features,
+            feature_range_lengths,
+            feature_ranges,
+            snap_ppd,
+            glyph_advances,
+            glyph_offsets,
         ) {
-            if shaped.glyphs.len() == glyph_count as usize
-                && (0..glyph_count as usize)
-                    .all(|i| shaped.glyphs[i].gid == glyph_indices.add(i).read_unaligned())
-            {
-                for (i, g) in shaped.glyphs.iter().enumerate() {
-                    let mut adv = g.advance;
-                    if use_gdi_natural == FALSE {
-                        adv = (adv * ppd).round() / ppd;
-                    }
-                    glyph_advances.add(i).write_unaligned(adv);
-                    glyph_offsets.add(i).write_unaligned(g.offset);
-                }
-                return S_OK;
-            }
-        } else if super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_ranges.is_empty()) {
-            log::warn!(
-                "dwrite: IDWriteTextAnalyzer::GetGdiCompatibleGlyphPlacements cannot position complex run (len={}, family={:?})",
-                units.len(),
-                face.meta.family_name,
-            );
-            return E_NOTIMPL;
+            return hr;
         }
     }
     for i in 0..glyph_count as usize {

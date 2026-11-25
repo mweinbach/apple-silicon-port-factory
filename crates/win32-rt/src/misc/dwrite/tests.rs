@@ -2377,7 +2377,10 @@ fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
 
 #[test]
 fn text_analyzer_honors_number_substitution_for_localized_digits() {
-    use super::analysis::{ta_get_glyphs, PTextAnalyzer};
+    use super::analysis::{
+        ta_get_gdi_compatible_glyph_placements, ta_get_glyph_placements, ta_get_glyphs,
+        PTextAnalyzer,
+    };
     use super::font::{
         DWRITE_NUMBER_SUBSTITUTION_METHOD_CONTEXTUAL,
         DWRITE_NUMBER_SUBSTITUTION_METHOD_NATIONAL,
@@ -2519,11 +2522,142 @@ fn text_analyzer_honors_number_substitution_for_localized_digits() {
             "CONTEXTUAL after Arabic must substitute Arabic-Indic digits: got={g_ctx_ar:?}, expected={arabic_123:?}"
         );
 
-        // 4. Unrecognized/bogus non-null number_substitution pointer must fail instead of silently ignoring.
+        // 4. GetGlyphPlacements and GetGdiCompatibleGlyphPlacements must preserve CoreText
+        //    shaped positioning (combining-mark offsets / zero-advance marks) when GetGlyphs
+        //    substituted localized digits and placement is called with the original text.
+        let orig_ar_mark = "\u{0633}\u{064E}12"; // Seen + Fatha + ASCII "12"
+        let pre_sub_ar_mark = "\u{0633}\u{064E}\u{0661}\u{0662}"; // Seen + Fatha + Arabic-Indic "١٢"
+        let (hr_m_sub, g_m_sub) = shape_with_ns(orig_ar_mark, TRUE, ns_national);
+        let (hr_m_ref, g_m_ref) = shape_with_ns(pre_sub_ar_mark, TRUE, std::ptr::null_mut());
+        assert_eq!(hr_m_sub, S_OK);
+        assert_eq!(hr_m_ref, S_OK);
+        assert_eq!(g_m_sub, g_m_ref);
+
+        let place_run = |text: &str, gids: &[u16], gdi: bool| -> (Vec<f32>, Vec<DWRITE_GLYPH_OFFSET>) {
+            let u16s: Vec<u16> = text.encode_utf16().collect();
+            let cm = vec![0u16; u16s.len()];
+            let tp = vec![DWRITE_SHAPING_TEXT_PROPERTIES::default(); u16s.len()];
+            let gp = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); gids.len()];
+            let mut adv = vec![0.0f32; gids.len()];
+            let mut off = vec![DWRITE_GLYPH_OFFSET::default(); gids.len()];
+            let hr = if gdi {
+                ta_get_gdi_compatible_glyph_placements(
+                    ta as PTextAnalyzer,
+                    u16s.as_ptr(),
+                    cm.as_ptr(),
+                    tp.as_ptr(),
+                    u16s.len() as u32,
+                    gids.as_ptr(),
+                    gp.as_ptr(),
+                    gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    std::ptr::null(),
+                    TRUE,
+                    FALSE,
+                    TRUE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    off.as_mut_ptr(),
+                )
+            } else {
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    u16s.as_ptr(),
+                    cm.as_ptr(),
+                    tp.as_ptr(),
+                    u16s.len() as u32,
+                    gids.as_ptr(),
+                    gp.as_ptr(),
+                    gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    FALSE,
+                    TRUE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    off.as_mut_ptr(),
+                )
+            };
+            assert_eq!(hr, S_OK);
+            (adv, off)
+        };
+        let (adv_sub, off_sub) = place_run(orig_ar_mark, &g_m_sub, false);
+        let (adv_ref, off_ref) = place_run(pre_sub_ar_mark, &g_m_ref, false);
+        assert_eq!(adv_sub, adv_ref, "GetGlyphPlacements must preserve shaped advances after digit substitution");
+        for (a, b) in off_sub.iter().zip(off_ref.iter()) {
+            assert_eq!((a.advanceOffset, a.ascenderOffset), (b.advanceOffset, b.ascenderOffset));
+        }
+        let (gadv_sub, goff_sub) = place_run(orig_ar_mark, &g_m_sub, true);
+        let (gadv_ref, goff_ref) = place_run(pre_sub_ar_mark, &g_m_ref, true);
+        assert_eq!(gadv_sub, gadv_ref, "GetGdiCompatibleGlyphPlacements must preserve shaped advances");
+        for (a, b) in goff_sub.iter().zip(goff_ref.iter()) {
+            assert_eq!((a.advanceOffset, a.ascenderOffset), (b.advanceOffset, b.ascenderOffset));
+        }
+
+        // 5. Unrecognized/bogus non-null number_substitution pointer must fail instead of silently ignoring.
         let mut fake_vtbl = [0usize; 3];
         let mut fake_obj = fake_vtbl.as_mut_ptr();
         let (hr_bad, _) = shape_with_ns("123", FALSE, &mut fake_obj as *mut _ as *mut c_void);
         assert_eq!(hr_bad, E_INVALIDARG);
+
+        // 6. AnalyzeLineBreakpoints must report mandatory breaks (MUST_BREAK + isWhitespace)
+        //    for Unicode line/paragraph separators U+2028, U+2029, VT, FF, and NEL.
+        #[repr(C)]
+        struct BpSource {
+            vtbl: *const [usize; 8],
+            text: Vec<u16>,
+        }
+        #[repr(C)]
+        struct BpSink {
+            vtbl: *const [usize; 7],
+            bps: Vec<u8>,
+        }
+        unsafe extern "win64" fn bp_get_text(this: *mut BpSource, pos: u32, out_str: *mut *const u16, out_len: *mut u32) -> HRESULT {
+            let p = pos as usize;
+            if p >= (*this).text.len() {
+                out_str.write_unaligned(std::ptr::null());
+                out_len.write_unaligned(0);
+            } else {
+                out_str.write_unaligned((*this).text.as_ptr().add(p));
+                out_len.write_unaligned(((*this).text.len() - p) as u32);
+            }
+            S_OK
+        }
+        unsafe extern "win64" fn bp_set_bps(this: *mut BpSink, _pos: u32, len: u32, bps: *const DWRITE_LINE_BREAKPOINT) -> HRESULT {
+            for i in 0..len as usize {
+                (*this).bps.push(bps.add(i).read_unaligned().bits);
+            }
+            S_OK
+        }
+        let bp_src_vtbl = [0, 0, 0, bp_get_text as *const () as usize, 0, 0, 0, 0];
+        let bp_snk_vtbl = [0, 0, 0, 0, bp_set_bps as *const () as usize, 0, 0];
+        let sample_u16: Vec<u16> = "a\u{2028}b\u{2029}c\u{000B}d\u{000C}e\u{0085}f".encode_utf16().collect();
+        let mut bp_src = BpSource { vtbl: &bp_src_vtbl, text: sample_u16.clone() };
+        let mut bp_snk = BpSink { vtbl: &bp_snk_vtbl, bps: Vec::new() };
+        let an_lb_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute((*(ta as *const *const usize)).add(6).read_unaligned());
+        assert_eq!(
+            an_lb_fn(ta, &mut bp_src as *mut _ as *mut c_void, 0, sample_u16.len() as u32, &mut bp_snk as *mut _ as *mut c_void),
+            S_OK
+        );
+        assert_eq!(bp_snk.bps.len(), sample_u16.len());
+        for &sep_idx in &[1usize, 3, 5, 7, 9] {
+            let bits = bp_snk.bps[sep_idx];
+            let before = bits & 0x3;
+            let after = (bits >> 2) & 0x3;
+            let is_ws = (bits >> 4) & 0x1;
+            assert_eq!((before, after, is_ws), (2, 3, 1), "mandatory separator at idx {sep_idx} (u={:#x}) had bits={bits:#x}", sample_u16[sep_idx]);
+        }
 
         release_com(ns_ctx);
         release_com(ns_none);
