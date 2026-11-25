@@ -15,8 +15,8 @@ Related docs: [End Goal](END_GOAL.md) · [What's Needed](WHATS_NEEDED.md) ·
 <!-- opsdb:catalog -->
 
 - x86-64 operations — 54 families (1 FAST_INTERP, 6 GENERIC_INTERP, 46 JIT_ARM64, 1 TRAP_BOUNDARY), 1017 distinct mnemonics, 4979 cataloged vectors.
-- Win32 — 4337 exports across 90 DLLs (4250 real, 38 partial, 20 stub, 29 failing).
-- Stub inventory — 164 sites across 30 DLLs.
+- Win32 — 4349 exports across 90 DLLs (4280 real, 27 partial, 20 stub, 22 failing).
+- Stub inventory — 136 sites across 28 DLLs.
 - A64 emitter — 1104 test words checked against 4743 encoding forms.
 
 <!-- /opsdb:catalog -->
