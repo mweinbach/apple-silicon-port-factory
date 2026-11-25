@@ -17,5 +17,6 @@ iced-x86.workspace = true
 log.workspace = true
 
 [dev-dependencies]
-# Randomized translator-vs-interpreter tests assemble guest code with the code assembler.
-iced-x86 = { workspace = true, features = ["code_asm"] }
+# Randomized translator-vs-interpreter tests assemble guest code with the code assembler,
+# and the honest-CPUID audit enumerates every 64-bit-mode Code form via op_code_info.
+iced-x86 = { workspace = true, features = ["code_asm", "op_code_info"] }

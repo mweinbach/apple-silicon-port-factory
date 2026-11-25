@@ -884,6 +884,10 @@ fn register_loads_stores_barriers_sysregs(cases: &mut Cases) {
         a.dmb_ishst();
     });
 
+    cases.check("dsb_ish", &[("dsb", "dsb ish")], |a| {
+        a.dsb_ish();
+    });
+
     cases.check("dsb_ishld", &[("dsb", "dsb ishld")], |a| {
         a.dsb_ishld();
     });

@@ -60,6 +60,8 @@ mod sse_tests;
 mod jit_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
 mod cpu_basics_tests;
+#[cfg(all(test, target_arch = "aarch64"))]
+mod isa_extensions_tests;
 #[cfg(test)]
 mod mod_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
