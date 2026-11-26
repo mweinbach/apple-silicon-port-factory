@@ -8808,18 +8808,28 @@ pub unsafe extern "win64" fn DeviceIoControl(
         IOCTL_STORAGE_GET_MEDIA_TYPES_EX => {
             let vol = query_volume_storage_info(&f);
             // GET_MEDIA_TYPES (8 byte header + 1 DEVICE_MEDIA_INFO = 32 bytes -> 40 bytes)
+            const MEDIA_READ_ONLY: u32 = 0x0000_0004;
+            const MEDIA_READ_WRITE: u32 = 0x0000_0008;
+            const MEDIA_WRITE_PROTECTED: u32 = 0x0000_0100;
+            const MEDIA_CURRENTLY_MOUNTED: u32 = 0x8000_0000;
             let bps = vol.logical_sector_size.max(512);
             let cyls = (vol.volume_size_bytes / (bps as u64 * 255 * 63)).max(1);
             let mut d = [0u8; 40];
             d[0..4].copy_from_slice(&7u32.to_le_bytes()); // FILE_DEVICE_DISK
             d[4..8].copy_from_slice(&1u32.to_le_bytes()); // MediaInfoCount = 1
             d[8..16].copy_from_slice(&cyls.to_le_bytes());
-            d[16..20].copy_from_slice(&12u32.to_le_bytes()); // FixedMedia
+            d[16..20].copy_from_slice(&(if vol.removable { 11u32 } else { 12u32 }).to_le_bytes()); // RemovableMedia / FixedMedia
             d[20..24].copy_from_slice(&255u32.to_le_bytes());
             d[24..28].copy_from_slice(&63u32.to_le_bytes());
             d[28..32].copy_from_slice(&bps.to_le_bytes());
             d[32..36].copy_from_slice(&1u32.to_le_bytes()); // NumberMediaSides
-            d[36..40].copy_from_slice(&(0x2u32 | if vol.writable { 0x4 } else { 0 }).to_le_bytes());
+            let media_chars = MEDIA_CURRENTLY_MOUNTED
+                | if vol.writable {
+                    MEDIA_READ_WRITE
+                } else {
+                    MEDIA_READ_ONLY | MEDIA_WRITE_PROTECTED
+                };
+            d[36..40].copy_from_slice(&media_chars.to_le_bytes());
             put(&d)
         }
         IOCTL_STORAGE_GET_HOTPLUG_INFO => {
@@ -12403,6 +12413,19 @@ mod tests {
             );
             let vol_len = (ext.as_ptr().add(24) as *const u64).read_unaligned();
             assert!(vol_len > 0);
+
+            // IOCTL_STORAGE_GET_MEDIA_TYPES_EX returns documented DEVICE_MEDIA_INFO flags
+            // (MEDIA_CURRENTLY_MOUNTED | MEDIA_READ_WRITE on a writable volume, never WRITE_ONCE/READ_ONLY).
+            let mut mtypes = [0u8; 40];
+            assert_eq!(
+                DeviceIoControl(hdev, IOCTL_STORAGE_GET_MEDIA_TYPES_EX, std::ptr::null(), 0, mtypes.as_mut_ptr() as _, 40, &mut ret, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(ret, 40);
+            assert_eq!((mtypes.as_ptr() as *const u32).read_unaligned(), 7); // FILE_DEVICE_DISK
+            assert_eq!((mtypes.as_ptr().add(4) as *const u32).read_unaligned(), 1); // MediaInfoCount
+            let mchars = (mtypes.as_ptr().add(36) as *const u32).read_unaligned();
+            assert_eq!(mchars, 0x8000_0000 | 0x0000_0008, "writable volume must report MEDIA_CURRENTLY_MOUNTED | MEDIA_READ_WRITE");
 
             // IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO, FSCTL_GET_NTFS_VOLUME_DATA
             let mut gex = [0u8; 32];
