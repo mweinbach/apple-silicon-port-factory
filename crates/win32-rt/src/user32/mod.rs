@@ -364,10 +364,12 @@ pub mod wm {
     pub const KEYFIRST: u32 = 0x0100;
     pub const KEYLAST: u32 = 0x0109;
     pub const CAPTURECHANGED: u32 = 0x0215;
+    pub const POWERBROADCAST: u32 = 0x0218;
     pub const DEVICECHANGE: u32 = 0x0219;
     pub const ENTERSIZEMOVE: u32 = 0x0231;
     pub const EXITSIZEMOVE: u32 = 0x0232;
     pub const DPICHANGED: u32 = 0x02E0;
+    pub const HOTKEY: u32 = 0x0312;
     pub const USER: u32 = 0x0400;
     pub const APP: u32 = 0x8000;
 }
@@ -416,6 +418,9 @@ pub mod e {
     pub const RESOURCE_NAME_NOT_FOUND: u32 = 1814;
     pub const TIMEOUT: u32 = 1460;
     pub const INVALID_CURSOR_HANDLE: u32 = 1402;
+    pub const HOTKEY_ALREADY_REGISTERED: u32 = 1409;
+    pub const HOTKEY_NOT_REGISTERED: u32 = 1419;
+    pub const REQUIRES_INTERACTIVE_WINDOWSTATION: u32 = 1459;
 }
 
 pub(crate) fn set_error(code: u32) {

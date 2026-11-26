@@ -2457,15 +2457,7 @@ pub unsafe extern "win64" fn NtWaitForSingleObject(
         }
         return 0x0000_0102; // STATUS_TIMEOUT
     }
-    let Some(obj) = crate::handles::get(handle) else {
-        return STATUS_INVALID_HANDLE;
-    };
-    let r = crate::handles::wait_for_duration(
-        std::slice::from_ref(&obj),
-        false,
-        dur,
-        alertable != 0,
-    );
+    let r = crate::handles::wait_single_handle(handle, dur, alertable != 0);
     match r {
         crate::handles::WaitResult::Object(_) => STATUS_SUCCESS,
         crate::handles::WaitResult::Abandoned(_) => 0x0000_0080, // STATUS_ABANDONED_WAIT_0

@@ -863,3 +863,303 @@ fn draw_text_layout_with_underline_and_drawing_effect() {
         release_com(dc);
     }
 }
+
+#[test]
+fn geometry_tessellate_rect_concave_l_shape_and_ellipse() {
+    use super::geometry::{
+        geom_tessellate, gsink_add_line, gsink_begin_figure, gsink_close, gsink_end_figure,
+        path_geom_open, PGeom, PGeomSink,
+    };
+
+    #[repr(C)]
+    struct MockTessSink {
+        vtbl: *const [usize; 5],
+        tris: Vec<D2D1_TRIANGLE>,
+    }
+    unsafe extern "win64" fn mock_qi(_this: *mut MockTessSink, _riid: *const u8, ppv: *mut *mut c_void) -> HRESULT {
+        if !ppv.is_null() { ppv.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn mock_addref(_this: *mut MockTessSink) -> u32 { 1 }
+    unsafe extern "win64" fn mock_release(_this: *mut MockTessSink) -> u32 { 1 }
+    unsafe extern "win64" fn mock_add_tris(this: *mut MockTessSink, tris: *const D2D1_TRIANGLE, count: u32) {
+        let sink = &mut *this;
+        for i in 0..count as usize {
+            sink.tris.push(tris.add(i).read_unaligned());
+        }
+    }
+    unsafe extern "win64" fn mock_close(_this: *mut MockTessSink) -> HRESULT { S_OK }
+
+    fn tri_area_sum(tris: &[D2D1_TRIANGLE]) -> f32 {
+        tris.iter()
+            .map(|t| {
+                let ax = t.point2.x - t.point1.x;
+                let ay = t.point2.y - t.point1.y;
+                let bx = t.point3.x - t.point1.x;
+                let by = t.point3.y - t.point1.y;
+                0.5 * (ax * by - ay * bx).abs()
+            })
+            .sum()
+    }
+
+    unsafe {
+        let vtbl: [usize; 5] = [
+            mock_qi as *const () as usize,
+            mock_addref as *const () as usize,
+            mock_release as *const () as usize,
+            mock_add_tris as *const () as usize,
+            mock_close as *const () as usize,
+        ];
+        crate::com::register_vtable_ptrs(&vtbl);
+
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            D2D1CreateFactory(
+                D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                &IID_ID2D1_FACTORY as *const GUID as *const u8,
+                std::ptr::null(),
+                &mut fac,
+            ),
+            S_OK
+        );
+
+        // 1. Rectangle (10x20 -> 2 triangles, area 200; scaled by 2x -> area 800).
+        let rect = D2D1_RECT_F { left: 0.0, top: 0.0, right: 10.0, bottom: 20.0 };
+        let mut rgeom: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_rect_geom(fac as PFactory, &rect, &mut rgeom), S_OK);
+        let mut sink = MockTessSink { vtbl: &vtbl, tris: Vec::new() };
+        assert_eq!(geom_tessellate(rgeom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert_eq!(sink.tris.len(), 2);
+        assert!((tri_area_sum(&sink.tris) - 200.0).abs() < 1e-2);
+
+        sink.tris.clear();
+        let scale2 = D2D1_MATRIX_3X2_F { m11: 2.0, m12: 0.0, m21: 0.0, m22: 2.0, dx: 5.0, dy: 5.0 };
+        assert_eq!(geom_tessellate(rgeom as PGeom, &scale2, 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert_eq!(sink.tris.len(), 2);
+        assert!((tri_area_sum(&sink.tris) - 800.0).abs() < 1e-2);
+
+        // 2. Concave L-shape polygon (6 vertices -> 4 triangles, area = 10*10 - 5*5 = 75).
+        let mut pgeom: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut pgeom), S_OK);
+        let mut psink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(path_geom_open(pgeom as PGeom, &mut psink), S_OK);
+        gsink_begin_figure(psink as PGeomSink, D2D1_POINT_2F { x: 0.0, y: 0.0 }.to_u64(), D2D1_FIGURE_BEGIN_FILLED);
+        for &(x, y) in &[(10.0, 0.0), (10.0, 5.0), (5.0, 5.0), (5.0, 10.0), (0.0, 10.0)] {
+            gsink_add_line(psink as PGeomSink, D2D1_POINT_2F { x, y }.to_u64());
+        }
+        gsink_end_figure(psink as PGeomSink, D2D1_FIGURE_END_CLOSED);
+        assert_eq!(gsink_close(psink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(pgeom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert_eq!(sink.tris.len(), 4);
+        assert!((tri_area_sum(&sink.tris) - 75.0).abs() < 1e-2, "L-shape area {}", tri_area_sum(&sink.tris));
+
+        // 3. Ellipse (r=10 -> area ~ pi*100 = 314.16).
+        let el = D2D1_ELLIPSE { point: D2D1_POINT_2F { x: 0.0, y: 0.0 }, radiusX: 10.0, radiusY: 10.0 };
+        let mut egeom: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_ellipse_geom(fac as PFactory, &el, &mut egeom), S_OK);
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(egeom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!(sink.tris.len() >= 20);
+        let el_area = tri_area_sum(&sink.tris);
+        assert!((el_area - std::f32::consts::PI * 100.0).abs() < 10.0, "ellipse area {el_area}");
+
+        // Null sink returns E_POINTER.
+        assert_eq!(geom_tessellate(rgeom as PGeom, std::ptr::null(), 0.25, std::ptr::null_mut()), E_POINTER);
+
+        // 4. Compound contours with fill rules (ALTERNATE holes, WINDING opposite vs same winding,
+        //    and island-inside-hole) must match `geom_fill_contains_pt`.
+        let tris_contain_pt = |tris: &[D2D1_TRIANGLE], x: f32, y: f32| -> bool {
+            tris.iter().any(|t| {
+                let (a, b, c) = (t.point1, t.point2, t.point3);
+                let cross = |p: D2D1_POINT_2F, q: D2D1_POINT_2F, r: D2D1_POINT_2F| -> f32 {
+                    (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x)
+                };
+                let c1 = cross(a, b, D2D1_POINT_2F { x, y });
+                let c2 = cross(b, c, D2D1_POINT_2F { x, y });
+                let c3 = cross(c, a, D2D1_POINT_2F { x, y });
+                (c1 >= -1e-4 && c2 >= -1e-4 && c3 >= -1e-4)
+                    || (c1 <= 1e-4 && c2 <= 1e-4 && c3 <= 1e-4)
+            })
+        };
+        let add_ring = |ps: PGeomSink, pts: &[(f32, f32)]| {
+            gsink_begin_figure(ps, D2D1_POINT_2F { x: pts[0].0, y: pts[0].1 }.to_u64(), D2D1_FIGURE_BEGIN_FILLED);
+            for &(x, y) in &pts[1..] {
+                gsink_add_line(ps, D2D1_POINT_2F { x, y }.to_u64());
+            }
+            gsink_end_figure(ps, D2D1_FIGURE_END_CLOSED);
+        };
+        let set_fill_mode = |ps: *mut c_void, mode: u32| {
+            let f: unsafe extern "win64" fn(*mut c_void, u32) =
+                std::mem::transmute(vtbl_of(ps).add(3).read_unaligned());
+            f(ps, mode);
+        };
+        let outer_ccw = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)];
+        let inner_ccw = [(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)];
+        let inner_cw = [(5.0, 5.0), (5.0, 15.0), (15.0, 15.0), (15.0, 5.0)];
+
+        // 4a. ALTERNATE donut (same winding -> inner contour cuts a 10x10 hole: area = 400 - 100 = 300).
+        let mut alt_donut: *mut c_void = std::ptr::null_mut();
+        let mut alt_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut alt_donut), S_OK);
+        assert_eq!(path_geom_open(alt_donut as PGeom, &mut alt_sink), S_OK);
+        set_fill_mode(alt_sink, D2D1_FILL_MODE_ALTERNATE);
+        add_ring(alt_sink as PGeomSink, &outer_ccw);
+        add_ring(alt_sink as PGeomSink, &inner_ccw);
+        assert_eq!(gsink_close(alt_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(alt_donut as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 300.0).abs() < 1e-2, "ALTERNATE donut area {}", tri_area_sum(&sink.tris));
+        assert!(!tris_contain_pt(&sink.tris, 10.0, 10.0), "hole center must not be covered under ALTERNATE");
+        assert!(tris_contain_pt(&sink.tris, 2.0, 10.0), "donut rim must be covered under ALTERNATE");
+        let mut hit = TRUE;
+        assert_eq!(geom_fill_contains_pt(alt_donut as PGeom, D2D1_POINT_2F { x: 10.0, y: 10.0 }.to_u64(), std::ptr::null(), 0.25, &mut hit), S_OK);
+        assert_eq!(hit, FALSE);
+
+        // 4b. WINDING donut with opposite-wound hole (CCW outer + CW inner -> area = 300, center empty).
+        let mut wind_hole: *mut c_void = std::ptr::null_mut();
+        let mut wh_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut wind_hole), S_OK);
+        assert_eq!(path_geom_open(wind_hole as PGeom, &mut wh_sink), S_OK);
+        set_fill_mode(wh_sink, D2D1_FILL_MODE_WINDING);
+        add_ring(wh_sink as PGeomSink, &outer_ccw);
+        add_ring(wh_sink as PGeomSink, &inner_cw);
+        assert_eq!(gsink_close(wh_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(wind_hole as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 300.0).abs() < 1e-2, "WINDING hole area {}", tri_area_sum(&sink.tris));
+        assert!(!tris_contain_pt(&sink.tris, 10.0, 10.0), "opposite-wound hole must stay empty under WINDING");
+        assert!(tris_contain_pt(&sink.tris, 18.0, 10.0));
+
+        // 4c. WINDING nested same-direction contour (CCW outer + CCW inner -> solid area = 400, center filled).
+        let mut wind_solid: *mut c_void = std::ptr::null_mut();
+        let mut ws_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut wind_solid), S_OK);
+        assert_eq!(path_geom_open(wind_solid as PGeom, &mut ws_sink), S_OK);
+        set_fill_mode(ws_sink, D2D1_FILL_MODE_WINDING);
+        add_ring(ws_sink as PGeomSink, &outer_ccw);
+        add_ring(ws_sink as PGeomSink, &inner_ccw);
+        assert_eq!(gsink_close(ws_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(wind_solid as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 400.0).abs() < 1e-2, "WINDING same-winding area {}", tri_area_sum(&sink.tris));
+        assert!(tris_contain_pt(&sink.tris, 10.0, 10.0), "same-wound inner contour must be filled under WINDING");
+        assert_eq!(geom_fill_contains_pt(wind_solid as PGeom, D2D1_POINT_2F { x: 10.0, y: 10.0 }.to_u64(), std::ptr::null(), 0.25, &mut hit), S_OK);
+        assert_eq!(hit, TRUE);
+
+        // 4d. ALTERNATE nested island inside hole (30x30 - 20x20 + 10x10 = 600).
+        let mut island_geom: *mut c_void = std::ptr::null_mut();
+        let mut isl_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut island_geom), S_OK);
+        assert_eq!(path_geom_open(island_geom as PGeom, &mut isl_sink), S_OK);
+        set_fill_mode(isl_sink, D2D1_FILL_MODE_ALTERNATE);
+        add_ring(isl_sink as PGeomSink, &[(0.0, 0.0), (30.0, 0.0), (30.0, 30.0), (0.0, 30.0)]);
+        add_ring(isl_sink as PGeomSink, &[(5.0, 5.0), (25.0, 5.0), (25.0, 25.0), (5.0, 25.0)]);
+        add_ring(isl_sink as PGeomSink, &[(10.0, 10.0), (20.0, 10.0), (20.0, 20.0), (10.0, 20.0)]);
+        assert_eq!(gsink_close(isl_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(island_geom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 600.0).abs() < 1e-2, "island-in-hole area {}", tri_area_sum(&sink.tris));
+        assert!(tris_contain_pt(&sink.tris, 2.0, 15.0), "outer rim must be filled");
+        assert!(!tris_contain_pt(&sink.tris, 7.5, 15.0), "middle ring must be empty");
+        assert!(tris_contain_pt(&sink.tris, 15.0, 15.0), "inner island must be filled");
+
+        // 4e. Self-intersecting zero-signed-area bowtie: (0,0)->(10,10)->(0,10)->(10,0)
+        //     must NOT be discarded; both lobes are filled (area = 25 + 25 = 50).
+        let mut bowtie_geom: *mut c_void = std::ptr::null_mut();
+        let mut bt_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut bowtie_geom), S_OK);
+        assert_eq!(path_geom_open(bowtie_geom as PGeom, &mut bt_sink), S_OK);
+        set_fill_mode(bt_sink, D2D1_FILL_MODE_ALTERNATE);
+        add_ring(bt_sink as PGeomSink, &[(0.0, 0.0), (10.0, 10.0), (0.0, 10.0), (10.0, 0.0)]);
+        assert_eq!(gsink_close(bt_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(bowtie_geom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 50.0).abs() < 1e-2, "bowtie area {}", tri_area_sum(&sink.tris));
+        assert!(tris_contain_pt(&sink.tris, 5.0, 2.0), "lower bowtie lobe must be covered");
+        assert!(tris_contain_pt(&sink.tris, 5.0, 8.0), "upper bowtie lobe must be covered");
+        assert!(!tris_contain_pt(&sink.tris, 1.0, 5.0), "outside left of bowtie must be empty");
+        assert!(!tris_contain_pt(&sink.tris, 9.0, 5.0), "outside right of bowtie must be empty");
+
+        // 4f. Two overlapping squares under ALTERNATE (XOR area = 100) vs WINDING (union area = 150).
+        let mut ov_alt: *mut c_void = std::ptr::null_mut();
+        let mut ova_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut ov_alt), S_OK);
+        assert_eq!(path_geom_open(ov_alt as PGeom, &mut ova_sink), S_OK);
+        set_fill_mode(ova_sink, D2D1_FILL_MODE_ALTERNATE);
+        add_ring(ova_sink as PGeomSink, &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+        add_ring(ova_sink as PGeomSink, &[(5.0, 0.0), (15.0, 0.0), (15.0, 10.0), (5.0, 10.0)]);
+        assert_eq!(gsink_close(ova_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(ov_alt as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 100.0).abs() < 1e-2, "overlapping ALTERNATE area {}", tri_area_sum(&sink.tris));
+        assert!(!tris_contain_pt(&sink.tris, 7.5, 5.0), "overlap region must be empty under ALTERNATE");
+
+        let mut ov_wind: *mut c_void = std::ptr::null_mut();
+        let mut ovw_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut ov_wind), S_OK);
+        assert_eq!(path_geom_open(ov_wind as PGeom, &mut ovw_sink), S_OK);
+        set_fill_mode(ovw_sink, D2D1_FILL_MODE_WINDING);
+        add_ring(ovw_sink as PGeomSink, &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+        add_ring(ovw_sink as PGeomSink, &[(5.0, 0.0), (15.0, 0.0), (15.0, 10.0), (5.0, 10.0)]);
+        assert_eq!(gsink_close(ovw_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(ov_wind as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 150.0).abs() < 1e-2, "overlapping WINDING area {}", tri_area_sum(&sink.tris));
+        assert!(tris_contain_pt(&sink.tris, 7.5, 5.0), "overlap region must be filled under WINDING");
+
+        // 4g. Multi-hole polygon where ear-clipping after bridging hits a stuck corner
+        //     must fall back cleanly to scanline-slab tessellation (exact area = 10000 - 12 - 12 = 9976).
+        let mut multi_hole: *mut c_void = std::ptr::null_mut();
+        let mut mh_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut multi_hole), S_OK);
+        assert_eq!(path_geom_open(multi_hole as PGeom, &mut mh_sink), S_OK);
+        set_fill_mode(mh_sink, D2D1_FILL_MODE_ALTERNATE);
+        add_ring(mh_sink as PGeomSink, &[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]);
+        add_ring(mh_sink as PGeomSink, &[(26.9, 37.7), (29.9, 37.7), (29.9, 41.7), (26.9, 41.7)]);
+        add_ring(mh_sink as PGeomSink, &[(32.8, 52.2), (35.8, 52.2), (35.8, 56.2), (32.8, 56.2)]);
+        assert_eq!(gsink_close(mh_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(multi_hole as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!(
+            (tri_area_sum(&sink.tris) - 9976.0).abs() < 1e-1,
+            "multi-hole area must equal 9976.0 without overlapping triangles, got {}",
+            tri_area_sum(&sink.tris)
+        );
+        assert!(!tris_contain_pt(&sink.tris, 28.4, 39.7), "first hole interior must remain empty");
+        assert!(!tris_contain_pt(&sink.tris, 34.3, 54.2), "second hole interior must remain empty");
+        assert!(tris_contain_pt(&sink.tris, 10.0, 10.0), "outer interior must be filled");
+        assert!(tris_contain_pt(&sink.tris, 31.0, 47.0), "region between holes must be filled");
+
+        release_com(mh_sink);
+        release_com(multi_hole);
+        release_com(ovw_sink);
+        release_com(ov_wind);
+        release_com(ova_sink);
+        release_com(ov_alt);
+        release_com(bt_sink);
+        release_com(bowtie_geom);
+        release_com(isl_sink);
+        release_com(island_geom);
+        release_com(ws_sink);
+        release_com(wind_solid);
+        release_com(wh_sink);
+        release_com(wind_hole);
+        release_com(alt_sink);
+        release_com(alt_donut);
+        release_com(egeom);
+        release_com(psink);
+        release_com(pgeom);
+        release_com(rgeom);
+        release_com(fac);
+    }
+}

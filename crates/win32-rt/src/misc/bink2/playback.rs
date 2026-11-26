@@ -2,7 +2,10 @@
 //! telemetry, and per-track audio controls/PCM extraction for `bink2w64.dll`.
 
 use super::audio as bink2_audio;
-use super::player::{decode_frame_into_buffers, ensure_frame_packet_loaded, BinkInstance};
+use super::player::{
+    decode_frame_into_buffers, drain_async_decode, ensure_frame_packet_loaded,
+    try_commit_async_decode, BinkInstance,
+};
 use super::types::{
     BinkRealtime, BinkSummary, BinkTrack, BINKBGIORESUME, BINKBGIOSUSPEND,
 };
@@ -17,7 +20,8 @@ pub(crate) unsafe fn get_summary(bink: *mut c_void, sum: *mut BinkSummary) {
     if bink.is_null() || sum.is_null() {
         return;
     }
-    let inst = &*(bink as *const BinkInstance);
+    let inst = &mut *(bink as *mut BinkInstance);
+    try_commit_async_decode(inst);
     let width = inst.rd_u32(0x000);
     let height = inst.rd_u32(0x004);
     let frames = inst.rd_u32(0x008).max(1);
@@ -65,7 +69,8 @@ pub(crate) unsafe fn get_realtime(bink: *mut c_void, run: *mut BinkRealtime, fra
     if bink.is_null() || run.is_null() {
         return;
     }
-    let inst = &*(bink as *const BinkInstance);
+    let inst = &mut *(bink as *mut BinkInstance);
+    try_commit_async_decode(inst);
     let frame_num = inst.rd_u32(0x00c);
     let fps_num = inst.rd_u32(0x014).max(1);
     let fps_den = inst.rd_u32(0x018).max(1);
@@ -185,6 +190,7 @@ pub(crate) unsafe fn next_frame(bink: *mut c_void) {
         return;
     }
     let inst = &mut *(bink as *mut BinkInstance);
+    drain_async_decode(inst);
     let frames = inst.rd_u32(0x008).max(1);
     let cur = inst.rd_u32(0x00c).max(1);
     let will_loop = inst.rd_u32(0x3b8) != 0 || (inst.rd_u32(0x020) & 0x80) != 0;
@@ -344,6 +350,7 @@ pub(crate) unsafe fn goto(bink: *mut c_void, frame: u32, flags: i32) {
         get_key_frame(bink, frame, 0).max(1)
     };
     let inst = &mut *(bink as *mut BinkInstance);
+    drain_async_decode(inst);
     let frames = inst.rd_u32(0x008).max(1);
     let cur = inst.rd_u32(0x00c).max(1);
     let target = frame.clamp(1, frames);

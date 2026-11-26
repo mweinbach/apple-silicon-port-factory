@@ -205,8 +205,17 @@ pub unsafe extern "win64" fn _wtoi64(s: *const u16) -> i64 {
 // Floating point parsing
 // ---------------------------------------------------------------------------
 
-/// Parse the longest valid floating-point prefix. Returns (value, consumed).
+/// Parse the longest valid floating-point prefix using ASCII `'.'` as decimal separator.
 pub fn scan_float(get: &dyn Fn(usize) -> u32) -> (f64, usize, bool) {
+    scan_float_with_dec(get, &[b'.' as u32])
+}
+
+/// Parse the longest valid floating-point prefix recognizing `dec` as the `LC_NUMERIC`
+/// radix separator (for both decimal and hexadecimal floats). Returns `(value, consumed, range_err)`.
+pub fn scan_float_with_dec(get: &dyn Fn(usize) -> u32, dec: &[u32]) -> (f64, usize, bool) {
+    let matches_dec = |k: usize| -> bool {
+        !dec.is_empty() && dec.iter().enumerate().all(|(idx, &u)| get(k + idx) == u)
+    };
     let mut i = 0;
     while is_space(get(i)) {
         i += 1;
@@ -265,9 +274,9 @@ pub fn scan_float(get: &dyn Fn(usize) -> u32) -> (f64, usize, bool) {
                     exp += 4;
                 }
                 j += 1;
-            } else if c == b'.' as u32 && !seen_dot {
+            } else if !seen_dot && matches_dec(j) {
                 seen_dot = true;
-                j += 1;
+                j += dec.len();
             } else {
                 break;
             }
@@ -309,8 +318,8 @@ pub fn scan_float(get: &dyn Fn(usize) -> u32) -> (f64, usize, bool) {
         j += 1;
         digits += 1;
     }
-    if get(j) == b'.' as u32 {
-        let mut k = j + 1;
+    if matches_dec(j) {
+        let mut k = j + dec.len();
         let mut frac = String::from(".");
         while (get(k) as u8).is_ascii_digit() && get(k) < 0x80 {
             frac.push(get(k) as u8 as char);
@@ -348,13 +357,19 @@ pub fn scan_float(get: &dyn Fn(usize) -> u32) -> (f64, usize, bool) {
     (v, j, range)
 }
 
-pub unsafe extern "win64" fn strtod(s: *const u8, end: *mut *const u8) -> f64 {
+unsafe fn strtod_impl(s: *const u8, end: *mut *const u8, loc: *mut c_void) -> f64 {
     if s.is_null() {
         errno::set(EINVAL);
         invalid_parameter("strtod");
         return 0.0;
     }
-    let (v, n, range) = scan_float(&nget(s));
+    let dec_bytes = super::locale::numeric_decimal_narrow(loc);
+    let mut dec_buf = [0u32; 8];
+    let dec_len = dec_bytes.len().min(dec_buf.len());
+    for (idx, &b) in dec_bytes[..dec_len].iter().enumerate() {
+        dec_buf[idx] = b as u32;
+    }
+    let (v, n, range) = scan_float_with_dec(&nget(s), &dec_buf[..dec_len]);
     if range {
         errno::set(ERANGE);
     }
@@ -363,8 +378,34 @@ pub unsafe extern "win64" fn strtod(s: *const u8, end: *mut *const u8) -> f64 {
     }
     v
 }
+
+unsafe fn wcstod_impl(s: *const u16, end: *mut *const u16, loc: *mut c_void) -> f64 {
+    if s.is_null() {
+        errno::set(EINVAL);
+        invalid_parameter("wcstod");
+        return 0.0;
+    }
+    let dec_units = super::locale::numeric_decimal_wide(loc);
+    let mut dec_buf = [0u32; 8];
+    let dec_len = dec_units.len().min(dec_buf.len());
+    for (idx, &u) in dec_units[..dec_len].iter().enumerate() {
+        dec_buf[idx] = u as u32;
+    }
+    let (v, n, range) = scan_float_with_dec(&wget(s), &dec_buf[..dec_len]);
+    if range {
+        errno::set(ERANGE);
+    }
+    if !end.is_null() {
+        *end = s.add(n);
+    }
+    v
+}
+
+pub unsafe extern "win64" fn strtod(s: *const u8, end: *mut *const u8) -> f64 {
+    strtod_impl(s, end, std::ptr::null_mut())
+}
 pub unsafe extern "win64" fn strtof(s: *const u8, end: *mut *const u8) -> f32 {
-    let v = strtod(s, end);
+    let v = strtod_impl(s, end, std::ptr::null_mut());
     let f = v as f32;
     if (f.is_infinite() && !v.is_infinite()) || (f == 0.0 && v != 0.0) {
         errno::set(ERANGE);
@@ -372,43 +413,41 @@ pub unsafe extern "win64" fn strtof(s: *const u8, end: *mut *const u8) -> f32 {
     f
 }
 pub unsafe extern "win64" fn strtold(s: *const u8, end: *mut *const u8) -> f64 {
-    strtod(s, end)
+    strtod_impl(s, end, std::ptr::null_mut())
 }
-pub unsafe extern "win64" fn _strtod_l(s: *const u8, end: *mut *const u8, _l: *mut c_void) -> f64 {
-    strtod(s, end)
+pub unsafe extern "win64" fn _strtod_l(s: *const u8, end: *mut *const u8, l: *mut c_void) -> f64 {
+    strtod_impl(s, end, l)
 }
-pub unsafe extern "win64" fn _strtof_l(s: *const u8, end: *mut *const u8, _l: *mut c_void) -> f32 {
-    strtof(s, end)
-}
-pub unsafe extern "win64" fn atof(s: *const u8) -> f64 {
-    strtod(s, std::ptr::null_mut())
-}
-pub unsafe extern "win64" fn _atof_l(s: *const u8, _l: *mut c_void) -> f64 {
-    atof(s)
-}
-pub unsafe extern "win64" fn wcstod(s: *const u16, end: *mut *const u16) -> f64 {
-    if s.is_null() {
-        errno::set(EINVAL);
-        invalid_parameter("wcstod");
-        return 0.0;
-    }
-    let (v, n, range) = scan_float(&wget(s));
-    if range {
+pub unsafe extern "win64" fn _strtof_l(s: *const u8, end: *mut *const u8, l: *mut c_void) -> f32 {
+    let v = strtod_impl(s, end, l);
+    let f = v as f32;
+    if (f.is_infinite() && !v.is_infinite()) || (f == 0.0 && v != 0.0) {
         errno::set(ERANGE);
     }
-    if !end.is_null() {
-        *end = s.add(n);
-    }
-    v
+    f
+}
+pub unsafe extern "win64" fn atof(s: *const u8) -> f64 {
+    strtod_impl(s, std::ptr::null_mut(), std::ptr::null_mut())
+}
+pub unsafe extern "win64" fn _atof_l(s: *const u8, l: *mut c_void) -> f64 {
+    strtod_impl(s, std::ptr::null_mut(), l)
+}
+pub unsafe extern "win64" fn wcstod(s: *const u16, end: *mut *const u16) -> f64 {
+    wcstod_impl(s, end, std::ptr::null_mut())
 }
 pub unsafe extern "win64" fn wcstof(s: *const u16, end: *mut *const u16) -> f32 {
-    wcstod(s, end) as f32
+    let v = wcstod_impl(s, end, std::ptr::null_mut());
+    let f = v as f32;
+    if (f.is_infinite() && !v.is_infinite()) || (f == 0.0 && v != 0.0) {
+        errno::set(ERANGE);
+    }
+    f
 }
 pub unsafe extern "win64" fn wcstold(s: *const u16, end: *mut *const u16) -> f64 {
-    wcstod(s, end)
+    wcstod_impl(s, end, std::ptr::null_mut())
 }
 pub unsafe extern "win64" fn _wtof(s: *const u16) -> f64 {
-    wcstod(s, std::ptr::null_mut())
+    wcstod_impl(s, std::ptr::null_mut(), std::ptr::null_mut())
 }
 
 // ---------------------------------------------------------------------------
@@ -545,45 +584,110 @@ pub unsafe extern "win64" fn _ui64tow_s(v: u64, buf: *mut u16, sz: usize, r: i32
 // Multibyte <-> wide (CRT locale code page: 0 = "C" byte mapping, 65001 = UTF-8)
 // ---------------------------------------------------------------------------
 
-/// Decode one multibyte char. Ok((wchar(s), bytes)) / Err(()) = EILSEQ / Ok(None) incomplete.
-fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
+/// Decode one multibyte char using `cp` (`0` = "C" 1:1 bytes, `65001` = UTF-8, else Windows code page).
+/// Ok((wchar(s), bytes)) / Err(()) = EILSEQ / Ok(None) incomplete.
+pub(super) fn mb_decode_cp(cp: u32, bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    if mb_cp() == 0 {
+    if cp == 0 {
         return Ok(Some((vec![bytes[0] as u16], 1)));
     }
-    let b0 = bytes[0];
-    let len = match b0 {
-        0x00..=0x7F => 1,
-        0xC2..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF4 => 4,
-        _ => return Err(()),
-    };
-    if bytes.len() < len {
-        if bytes[1..].iter().all(|&b| b & 0xC0 == 0x80) {
-            return Ok(None);
+    if cp == 65001 {
+        let b0 = bytes[0];
+        let len = match b0 {
+            0x00..=0x7F => 1,
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return Err(()),
+        };
+        if bytes.len() < len {
+            if bytes[1..].iter().all(|&b| b & 0xC0 == 0x80) {
+                return Ok(None);
+            }
+            return Err(());
         }
+        return match std::str::from_utf8(&bytes[..len]) {
+            Ok(s) => Ok(Some((s.encode_utf16().collect(), len))),
+            Err(_) => Err(()),
+        };
+    }
+    let is_lead = unsafe { crate::kernel32::string::IsDBCSLeadByteEx(cp, bytes[0]) != 0 };
+    let len = if is_lead { 2 } else { 1 };
+    if bytes.len() < len {
+        return Ok(None);
+    }
+    let w = crate::kernel32::string::decode_cp_to_utf16_strict(cp, &bytes[..len], true).map_err(|_| ())?;
+    if w.is_empty() || w.contains(&0xFFFD) {
         return Err(());
     }
-    match std::str::from_utf8(&bytes[..len]) {
-        Ok(s) => Ok(Some((s.encode_utf16().collect(), len))),
-        Err(_) => Err(()),
-    }
+    Ok(Some((w, len)))
 }
 
-fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
-    if mb_cp() == 0 {
+/// Decode one multibyte char using the active CRT `LC_CTYPE` code page.
+/// Ok((wchar(s), bytes)) / Err(()) = EILSEQ / Ok(None) incomplete.
+fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
+    mb_decode_cp(mb_cp(), bytes)
+}
+
+pub(super) fn wc_encode_cp(cp: u32, c: u16) -> Result<Vec<u8>, ()> {
+    if cp == 0 {
         if c < 256 {
             Ok(vec![c as u8])
         } else {
             Err(())
         }
-    } else {
+    } else if cp == 65001 {
         match char::from_u32(c as u32) {
             Some(ch) => Ok(ch.to_string().into_bytes()),
             None => Err(()),
+        }
+    } else {
+        let (bytes, used_default) =
+            crate::kernel32::string::encode_utf16_to_cp(cp, &[c], None).map_err(|_| ())?;
+        if used_default || bytes.is_empty() {
+            Err(())
+        } else {
+            Ok(bytes)
+        }
+    }
+}
+
+pub(super) fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
+    wc_encode_cp(mb_cp(), c)
+}
+
+pub(super) fn wc_encode_slice_cp(cp: u32, units: &[u16]) -> Result<Vec<u8>, ()> {
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cp == 0 {
+        let mut out = Vec::with_capacity(units.len());
+        for &u in units {
+            if u < 256 {
+                out.push(u as u8);
+            } else {
+                return Err(());
+            }
+        }
+        Ok(out)
+    } else if cp == 65001 {
+        let mut out = String::with_capacity(units.len());
+        for r in char::decode_utf16(units.iter().copied()) {
+            match r {
+                Ok(ch) => out.push(ch),
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(out.into_bytes())
+    } else {
+        let (bytes, used_default) =
+            crate::kernel32::string::encode_utf16_to_cp(cp, units, None).map_err(|_| ())?;
+        if used_default {
+            Err(())
+        } else {
+            Ok(bytes)
         }
     }
 }
@@ -1074,6 +1178,52 @@ mod tests {
             assert!(strtod(b"nan(ind)\0".as_ptr(), std::ptr::null_mut()).is_nan());
             assert_eq!(strtod(b"1.\0".as_ptr(), &mut e), 1.0);
             assert_eq!(strtod(b".5\0".as_ptr(), std::ptr::null_mut()), 0.5);
+
+            // LC_NUMERIC = de-DE uses ',' as decimal point for strtod/strtof/atof/wcstod/_wtof.
+            assert!(!crate::ucrt::locale::setlocale(4 /* LC_NUMERIC */, b"de-DE\0".as_ptr()).is_null());
+            let de = b"1,5rest\0";
+            assert_eq!(strtod(de.as_ptr(), &mut e), 1.5);
+            assert_eq!(e.offset_from(de.as_ptr()), 3);
+            assert_eq!(strtod(b"0x1,8p1\0".as_ptr(), std::ptr::null_mut()), 3.0);
+            assert_eq!(strtof(b"2,25\0".as_ptr(), std::ptr::null_mut()), 2.25);
+            assert_eq!(atof(b"3,5\0".as_ptr()), 3.5);
+            // Under de-DE, '.' is no longer the decimal separator.
+            let dot = b"1.5\0";
+            assert_eq!(strtod(dot.as_ptr(), &mut e), 1.0);
+            assert_eq!(e.offset_from(dot.as_ptr()), 1);
+            let wde: Vec<u16> = "1,5x\0".encode_utf16().collect();
+            let mut we = std::ptr::null();
+            assert_eq!(wcstod(wde.as_ptr(), &mut we), 1.5);
+            assert_eq!(we.offset_from(wde.as_ptr()), 3);
+            let whalf: Vec<u16> = ",5\0".encode_utf16().collect();
+            assert_eq!(_wtof(whalf.as_ptr()), 0.5);
+            // Restore global "C" and verify explicit _locale_t honors LC_NUMERIC independently.
+            assert!(!crate::ucrt::locale::setlocale(4, b"C\0".as_ptr()).is_null());
+            let loc_de = crate::ucrt::locale::_create_locale(4, b"de-DE\0".as_ptr());
+            assert!(!loc_de.is_null());
+            assert_eq!(_strtod_l(de.as_ptr(), &mut e, loc_de), 1.5);
+            assert_eq!(e.offset_from(de.as_ptr()), 3);
+            assert_eq!(_strtof_l(b"2,5\0".as_ptr(), std::ptr::null_mut(), loc_de), 2.5);
+            assert_eq!(_atof_l(b"4,25\0".as_ptr(), loc_de), 4.25);
+            assert_eq!(strtod(b"1.5\0".as_ptr(), std::ptr::null_mut()), 1.5);
+            crate::ucrt::locale::_free_locale(loc_de);
+
+            // Strict multibyte decoding under ja-JP (CP932): invalid lead+trail [0x81, 0x20]
+            // must fail with EILSEQ in mbtowc / mbstowcs rather than silently substituting U+001A.
+            assert!(!crate::ucrt::locale::setlocale(2 /* LC_CTYPE */, b"ja-JP\0".as_ptr()).is_null());
+            let mut wc = 0u16;
+            let valid_sjis = [0x82u8, 0xA0, 0]; // 'あ'
+            assert_eq!(mbtowc(&mut wc, valid_sjis.as_ptr(), 2), 2);
+            assert_eq!(wc, 'あ' as u16);
+            let bad_sjis = [0x81u8, 0x20, 0];
+            errno::set(0);
+            assert_eq!(mbtowc(&mut wc, bad_sjis.as_ptr(), 2), -1);
+            assert_eq!(errno::get(), EILSEQ);
+            let mut wout = [0u16; 8];
+            errno::set(0);
+            assert_eq!(mbstowcs(wout.as_mut_ptr(), bad_sjis.as_ptr(), wout.len()), usize::MAX);
+            assert_eq!(errno::get(), EILSEQ);
+            assert!(!crate::ucrt::locale::setlocale(2, b"C\0".as_ptr()).is_null());
         }
     }
     #[test]

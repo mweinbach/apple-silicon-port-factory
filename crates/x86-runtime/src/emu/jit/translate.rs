@@ -225,6 +225,33 @@ pub(super) struct SlowMem {
     pub(super) lo: i32,
 }
 
+/// Out-of-line 2-way inline-cache miss / budget / RAS-miss tails for indirect branches.
+#[derive(Clone, Copy)]
+pub(super) enum IcCold {
+    /// Indirect `jmp` or non-RAS `ret`: probes way 1 at `[XA, #16]`, else populates via `lookup_stub`.
+    Branch {
+        miss_ne: usize,
+        miss_zero: usize,
+        hot_hit: usize,
+        bud_fix: Option<usize>,
+        lookup_stub: usize,
+    },
+    /// Indirect `call`: probes way 1 at `[XA, #16]`, else calls/branches `lookup_call_ic`.
+    Call {
+        miss_ne: usize,
+        miss_zero: usize,
+        hot_hit: usize,
+        bud_fix: Option<usize>,
+        unal_fix: Option<usize>,
+        hot_landing: Option<usize>,
+    },
+    /// RAS-enabled `ret` miss: loads `&ic_table[slot]` into `T4` and branches to `ras_miss_ic`.
+    RetRasMiss {
+        miss_fix: usize,
+        slot_byte_off: u32,
+    },
+}
+
 pub(super) struct Tr<'a> {
     pub(super) a: Asm,
     pub(super) ops: &'a [FastOp],
@@ -245,6 +272,10 @@ pub(super) struct Tr<'a> {
     pub(super) lookup_rip: usize,
     pub(super) lookup_jmp: usize,
     pub(super) lookup_call: usize,
+    pub(super) lookup_rip_ic: usize,
+    pub(super) lookup_jmp_ic: usize,
+    pub(super) lookup_call_ic: usize,
+    pub(super) ras_miss_ic: usize,
     /// See `JitCache::host_xfer`.
     pub(super) host_xfer: usize,
     /// Shared XMM spill/reload stubs (0 when `PORT_JIT_XMM_PIN=0`) and `clear_ymm_hi` stub.
@@ -284,6 +315,8 @@ pub(super) struct Tr<'a> {
     pub(super) tsc_colds: Vec<(usize, usize, bool)>,
     /// Deferred cold paths for system/state ops (`#GP(0)`, non-AFP `ldmxcsr`, XSTATE abnormal exit).
     pub(super) sys_colds: Vec<SysCold>,
+    /// Deferred cold paths for per-site indirect-branch inline caches.
+    pub(super) ic_colds: Vec<IcCold>,
     /// Bitmasks of guest `xmm0..15` whose upper bits `[127:32]` / `[127:64]` are known 0.
     pub(super) xmm_hi32_zero: u16,
     pub(super) xmm_hi64_zero: u16,
@@ -603,6 +636,7 @@ impl Tr<'_> {
         self.emit_cold_nan();
         self.emit_x87_colds();
         self.emit_sys_colds();
+        self.emit_ic_colds();
         let mut ses = core::mem::take(&mut self.side_exits);
         for se in &ses {
             if se.fix == usize::MAX {
@@ -657,6 +691,7 @@ impl Tr<'_> {
         self.ymm_colds.clear();
         self.tsc_colds.clear();
         self.sys_colds.clear();
+        self.ic_colds.clear();
         self.cold.clear();
         self.x87_colds.clear();
         self.x87_tramp_calls.clear();
@@ -674,6 +709,7 @@ impl Tr<'_> {
         sc.ymm_colds = self.ymm_colds;
         sc.tsc_colds = self.tsc_colds;
         sc.sys_colds = self.sys_colds;
+        sc.ic_colds = self.ic_colds;
         sc.cold = self.cold;
         sc.x87_colds = self.x87_colds;
         sc.x87_tramp_calls = self.x87_tramp_calls;
@@ -719,6 +755,233 @@ impl Tr<'_> {
             self.exit_to(fall);
         } else {
             self.a.b_to(self.lookup_call);
+        }
+    }
+
+    /// Indirect guest call (`T0` = dynamic target, `fall` = return address) with a per-site
+    /// 2-way polymorphic inline cache backed by `Cpu::jx.ic_table` (W^X & shifted-base safe).
+    /// Way 0 is checked inline in the hot path with a dedicated `blr x2`/`br x2` BTB entry;
+    /// way 1 and miss populate live out-of-line in [`Self::emit_ic_colds`].
+    pub(super) fn call_ic_or_lookup(&mut self, op_ip: u64, fall: u64) {
+        if !ic_enabled() || self.lookup_call_ic == 0 {
+            self.call_lookup(fall);
+            return;
+        }
+        self.mov_lit(T3, fall);
+        let off = super::cache::ic_slot_byte_off(op_ip);
+        self.a.ldr(64, XA, XCPU, OFF_IC_TABLE);
+        if off != 0 {
+            self.a.movz(true, XS, off, 0);
+            self.a.addsub_rr(true, false, false, XA, XA, XS, 0);
+        }
+        self.a.ldp_x(T1, T2, XA, 0);
+        self.a.addsub_rr(true, true, true, ZR, T1, T0, 0); // cmp x1, x0
+        let miss_ne = self.a.bcond(NE);
+        let miss_zero = self.a.cbz(true, T2);
+        let hot_hit = self.a.pos;
+        let unal_fix = if pushpop_enabled() {
+            self.a.str_pre(T3, g(4), -8);
+            None
+        } else {
+            self.a.addsub_ri(true, true, false, XA, g(4), 8, false);
+            self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(7, true).unwrap());
+            let unal = self.a.cbnz(true, XS);
+            if mem::tso() && stack_tso() {
+                self.a.stlr(64, T3, XA);
+            } else {
+                self.a.str(64, T3, XA, 0);
+            }
+            self.a.mov_rr(true, g(4), XA);
+            Some(unal)
+        };
+        let adr = if self.ras_miss != 0 {
+            let a_pos = self.a.adr(T1);
+            super::stubs::ras_push(&mut self.a, T3, T1);
+            Some(a_pos)
+        } else {
+            None
+        };
+        let bud_fix = if budget_backedge_enabled() {
+            if budget_light_enabled() {
+                self.a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
+            }
+            Some(self.a.tbnz(XBUD, 63))
+        } else {
+            None
+        };
+        let hot_landing = if let Some(adr_pos) = adr {
+            self.a.blr(T2);
+            let land = self.a.pos;
+            self.a.patch_adr(adr_pos, land);
+            self.exit_to(fall);
+            Some(land)
+        } else {
+            self.a.br(T2);
+            None
+        };
+        self.ic_colds.push(IcCold::Call {
+            miss_ne,
+            miss_zero,
+            hot_hit,
+            bud_fix,
+            unal_fix,
+            hot_landing,
+        });
+    }
+
+    /// Indirect guest jump (`T0` = dynamic target) with a per-site 2-way polymorphic IC.
+    pub(super) fn jmp_ic_or_lookup(&mut self, op_ip: u64) {
+        if !ic_enabled() || self.lookup_jmp_ic == 0 {
+            self.a.b_to(self.lookup_jmp);
+            return;
+        }
+        self.emit_branch_ic(op_ip, self.lookup_jmp_ic, false);
+    }
+
+    /// Non-RAS `ret` (`T0` = return target) with a per-site 2-way polymorphic IC.
+    pub(super) fn ret_no_ras_ic_or_lookup(&mut self, op_ip: u64) {
+        if !ic_enabled() || self.lookup_rip_ic == 0 {
+            self.a.b_to(self.lookup_rip);
+            return;
+        }
+        self.emit_branch_ic(op_ip, self.lookup_rip_ic, true);
+    }
+
+    fn emit_branch_ic(&mut self, op_ip: u64, lookup_stub: usize, rip_bud_light: bool) {
+        let off = super::cache::ic_slot_byte_off(op_ip);
+        self.a.ldr(64, XA, XCPU, OFF_IC_TABLE);
+        if off != 0 {
+            self.a.movz(true, XS, off, 0);
+            self.a.addsub_rr(true, false, false, XA, XA, XS, 0);
+        }
+        self.a.ldp_x(T1, T2, XA, 0);
+        self.a.addsub_rr(true, true, true, ZR, T1, T0, 0); // cmp x1, x0
+        let miss_ne = self.a.bcond(NE);
+        let miss_zero = self.a.cbz(true, T2);
+        let hot_hit = self.a.pos;
+        let bud = budget_backedge_enabled();
+        let bud_light = budget_light_enabled();
+        if bud_light && (rip_bud_light || bud) {
+            self.a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
+        }
+        let bud_fix = bud.then(|| self.a.tbnz(XBUD, 63));
+        self.a.br(T2);
+        self.ic_colds.push(IcCold::Branch {
+            miss_ne,
+            miss_zero,
+            hot_hit,
+            bud_fix,
+            lookup_stub,
+        });
+    }
+
+    /// Emit out-of-line 2-way IC way-1 probes, miss stub calls, and budget exits.
+    pub(super) fn emit_ic_colds(&mut self) {
+        let mut ic_colds = core::mem::take(&mut self.ic_colds);
+        for &ic in &ic_colds {
+            match ic {
+                IcCold::Branch { miss_ne, miss_zero, hot_hit, bud_fix, lookup_stub } => {
+                    self.a.bind(miss_ne);
+                    self.a.bind(miss_zero);
+                    self.a.ldp_x(T1, T2, XA, 16);
+                    self.a.addsub_rr(true, true, true, ZR, T1, T0, 0); // cmp x1, x0
+                    let miss_w1 = self.a.bcond(NE);
+                    let hit_w1 = self.a.cbnz(true, T2);
+                    self.a.patch(hit_w1, hot_hit);
+                    self.a.bind(miss_w1);
+                    self.a.mov_rr(true, T4, XA);
+                    self.a.b_to(lookup_stub);
+                    if let Some(bf) = bud_fix {
+                        self.a.bind(bf);
+                        self.a.str(64, T0, XCPU, OFF_RIP);
+                        self.a.movz(false, T0, EXIT_RIP as u32, 0);
+                        self.a.b_to(self.exit);
+                    }
+                }
+                IcCold::Call { miss_ne, miss_zero, hot_hit, bud_fix, unal_fix, hot_landing } => {
+                    self.a.bind(miss_ne);
+                    self.a.bind(miss_zero);
+                    self.a.ldp_x(T1, T2, XA, 16);
+                    self.a.addsub_rr(true, true, true, ZR, T1, T0, 0); // cmp x1, x0
+                    let miss_w1 = self.a.bcond(NE);
+                    let hit_w1 = self.a.cbnz(true, T2);
+                    self.a.patch(hit_w1, hot_hit);
+                    self.a.bind(miss_w1);
+                    self.a.mov_rr(true, T4, XA);
+                    if let Some(land) = hot_landing {
+                        self.a.bl_to(self.lookup_call_ic);
+                        let b_land = self.a.b();
+                        self.a.patch(b_land, land);
+                    } else {
+                        self.a.b_to(self.lookup_call_ic);
+                    }
+                    if let Some(uf) = unal_fix {
+                        self.a.bind(uf);
+                        if let Some(land) = hot_landing {
+                            self.a.bl_to(self.lookup_call);
+                            let b_land = self.a.b();
+                            self.a.patch(b_land, land);
+                        } else {
+                            self.a.b_to(self.lookup_call);
+                        }
+                    }
+                    if let Some(bf) = bud_fix {
+                        self.a.bind(bf);
+                        self.a.str(64, T0, XCPU, OFF_RIP);
+                        self.a.movz(false, T0, EXIT_RIP as u32, 0);
+                        self.a.b_to(self.exit);
+                    }
+                }
+                IcCold::RetRasMiss { miss_fix, slot_byte_off } => {
+                    self.a.bind(miss_fix);
+                    self.a.ldr(64, T4, XCPU, OFF_IC_TABLE);
+                    if slot_byte_off != 0 {
+                        self.a.movz(true, XS, slot_byte_off, 0);
+                        self.a.addsub_rr(true, false, false, T4, T4, XS, 0);
+                    }
+                    self.a.b_to(self.ras_miss_ic);
+                }
+            }
+        }
+        ic_colds.clear();
+        self.ic_colds = ic_colds;
+    }
+
+    /// Emit a tail-jump transfer to a statically host/routed target (`Term::Jmp` or taken
+    /// `Term::Jcc` when `target_host` is true): tries inline `plain_call`, guarded IAT
+    /// `plain_call`, or `host_xfer` (keeping execution in translated code instead of leaving
+    /// with `EXIT_JMP`/`EXIT_JCC`).
+    pub(super) fn emit_tail_target(&mut self, t: u64, fall: u64, lbk: [u8; 4], exit_code: u64) {
+        if let Some((h, bail, needs_xmm)) = super::cache::inline_host_fn_kind(t) {
+            self.plain_call(h, t, lbk, true, bail.then_some((t, fall)), 0, needs_xmm);
+        } else if let Some((slot, v, h, bail, needs_xmm)) = super::cache::iat_slot_plain(t) {
+            self.mov_lit(XA, slot);
+            self.a.ldr(64, T0, XA, 0);
+            self.mov_slot_val(XS, v, slot);
+            self.a.addsub_rr(true, true, true, ZR, T0, XS, 0); // cmp x0, x17
+            let slow = self.a.bcond(NE);
+            self.plain_call(h, v, lbk, true, bail.then_some((v, fall)), slot, needs_xmm);
+            self.a.bind(slow);
+            if self.host_xfer != 0 {
+                self.xfer_to(t, fall, 1);
+            } else {
+                self.exit_code(exit_code, fall, t);
+            }
+        } else if !super::stubs::plaincall_enabled()
+            && self.host_xfer != 0
+            && t != 0
+            && !is_chkstk(t)
+            && !crate::emu::is_routed_dll_chkstk(t)
+            && !crate::emu::is_routed_dll_stack_pos(t)
+            && !crate::emu::is_routed_regfile(t)
+            && !crate::emu::is_routed_dll_stub(t)
+        {
+            self.mov_lit(T0, t);
+            self.a.b_to(self.lookup_jmp);
+        } else if self.host_xfer != 0 {
+            self.xfer_to(t, fall, 1);
+        } else {
+            self.exit_code(exit_code, fall, t);
         }
     }
 
@@ -1079,33 +1342,14 @@ impl Tr<'_> {
             self.a.str(64, T0, XCPU, OFF_RIP);
             self.a.add_imm(true, g(4), g(4), 8);
         }
-        // Fast inline `QueryPerformanceCounter`: reads hardware `cntvct_el0` + Q64 scale
-        // directly in ~10 instructions with zero XMM/GPR spills and zero `blr`, falling back
-        // to the regular `plain_call` if uninitialized / mach fallback / shadow clock freeze.
-        let qpc_fn = win32_rt::kernel32::time::QueryPerformanceCounter as *const () as usize;
-        let rtl_qpc_fn = win32_rt::ntdll::RtlQueryPerformanceCounter as *const () as usize;
-        let mut qpc_done = None;
-        if bail.is_none() && (h == qpc_fn || h == rtl_qpc_fn) {
-            self.mov_qpc_lit(XA);
-            self.a.ldp_x(T0, T1, XA, 0); // x0 = mode, x1 = mult
-            self.a.addsub_ri(true, true, true, ZR, T0, 1, false); // cmp x0, #1
-            let slow = self.a.bcond(NE);
-            self.a.mrs_cntvct(T0);
-            self.a.ldr(64, T2, XA, 16); // offset
-            self.a.umulh(T0, T0, T1);
-            self.a.addsub_rr(true, false, false, T0, T0, T2, 0);
-            self.a.str(64, T0, g(1), 0); // *lpPerformanceCount = result
-            self.a.movz(false, g(0), 1, 0); // return TRUE
-            self.set_lb(0, 64);
-            self.flush_lb();
-            if tail {
-                self.a.ldr(64, T0, XCPU, OFF_RIP);
-                self.a.b_to(self.lookup_rip);
-            } else {
-                qpc_done = Some(self.a.b());
-            }
-            self.a.bind(slow);
-        }
+        // Zero-spill inline fast paths for the hottest Win32 leaf calls (no XMM/GPR spills,
+        // no FPCR save/restore, no `blr`), falling back to the regular `plain_call` on any
+        // slow-path condition (uninitialized clock/backend, contention, unaligned CS, etc.).
+        let fast_done = if bail.is_none() {
+            self.emit_inline_plain_fast_path(h, tail)
+        } else {
+            None
+        };
         // AAPCS64 designates `v16..v31` as caller-saved; even integer-only `DF_PLAIN` builtins
         // (e.g. NEON `memcpy`/`memset` or LLVM auto-vectorized Rust) can clobber `v16..v31`,
         // so pinned XMM registers must always be spilled before `blr` and reloaded afterward.
@@ -1171,9 +1415,251 @@ impl Tr<'_> {
             self.a.ldr(64, T0, XCPU, OFF_RIP);
             self.a.b_to(self.lookup_rip);
         }
-        if let Some(d) = qpc_done {
+        if let Some(d) = fast_done {
             self.a.bind(d);
         }
+    }
+
+    /// Emit a zero-spill inline ARM64 fast path inside [`Self::plain_call`] for the hottest
+    /// Win32 leaf exports (`QueryPerformanceCounter`, `timeGetTime`/`GetTickCount*`,
+    /// `EnterCriticalSection`/`LeaveCriticalSection`, `XInputGetState*`, `SwitchToThread`).
+    /// Returns a branch fixup to bind at the end of `plain_call` (or `None` when not matched
+    /// or `tail == true`, in which case the fast path jumps straight to `lookup_rip`).
+    fn emit_inline_plain_fast_path(&mut self, h: usize, tail: bool) -> Option<usize> {
+        #[derive(Clone, Copy)]
+        enum InlineKind {
+            Qpc,
+            TimeMs32,
+            TimeMs64,
+            EnterCs,
+            LeaveCs,
+            XInput { ex: bool },
+            SwitchToThread,
+        }
+        struct Table {
+            qpc: [usize; 4],
+            time_ms32: [usize; 4],
+            time_ms64: [usize; 2],
+            enter_cs: [usize; 4],
+            leave_cs: [usize; 4],
+            xinput: [usize; 2],
+            xinput_ex: [usize; 2],
+            switch_thread: [usize; 4],
+        }
+        static TABLE: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+        let t = TABLE.get_or_init(|| {
+            let lk = |dll: &str, sym: &str| win32_rt::lookup(dll, sym).map_or(0, |p| p as usize);
+            Table {
+                qpc: [
+                    win32_rt::kernel32::time::QueryPerformanceCounter as *const () as usize,
+                    win32_rt::ntdll::RtlQueryPerformanceCounter as *const () as usize,
+                    lk("kernel32.dll", "QueryPerformanceCounter"),
+                    lk("ntdll.dll", "RtlQueryPerformanceCounter"),
+                ],
+                time_ms32: [
+                    win32_rt::misc::winmm::timeGetTime as *const () as usize,
+                    win32_rt::kernel32::time::GetTickCount as *const () as usize,
+                    lk("winmm.dll", "timeGetTime"),
+                    lk("kernel32.dll", "GetTickCount"),
+                ],
+                time_ms64: [
+                    win32_rt::kernel32::time::GetTickCount64 as *const () as usize,
+                    lk("kernel32.dll", "GetTickCount64"),
+                ],
+                enter_cs: [
+                    win32_rt::sync::EnterCriticalSection as *const () as usize,
+                    win32_rt::ntdll::RtlEnterCriticalSection as *const () as usize,
+                    lk("kernel32.dll", "EnterCriticalSection"),
+                    lk("ntdll.dll", "RtlEnterCriticalSection"),
+                ],
+                leave_cs: [
+                    win32_rt::sync::LeaveCriticalSection as *const () as usize,
+                    win32_rt::ntdll::RtlLeaveCriticalSection as *const () as usize,
+                    lk("kernel32.dll", "LeaveCriticalSection"),
+                    lk("ntdll.dll", "RtlLeaveCriticalSection"),
+                ],
+                xinput: [
+                    win32_rt::misc::xinput1_4::XInputGetState as *const () as usize,
+                    lk("xinput1_4.dll", "XInputGetState"),
+                ],
+                xinput_ex: [
+                    win32_rt::misc::xinput1_4::XInputGetStateEx as *const () as usize,
+                    lk("xinput1_4.dll", "XInputGetStateEx"),
+                ],
+                switch_thread: [
+                    win32_rt::kernel32::time::SwitchToThread as *const () as usize,
+                    win32_rt::misc::msvcp140::_Thrd_yield as *const () as usize,
+                    lk("kernel32.dll", "SwitchToThread"),
+                    lk("msvcp140.dll", "_Thrd_yield"),
+                ],
+            }
+        });
+        let kind = if t.qpc.contains(&h) {
+            InlineKind::Qpc
+        } else if t.time_ms32.contains(&h) {
+            InlineKind::TimeMs32
+        } else if t.time_ms64.contains(&h) {
+            InlineKind::TimeMs64
+        } else if t.enter_cs.contains(&h) {
+            InlineKind::EnterCs
+        } else if t.leave_cs.contains(&h) {
+            InlineKind::LeaveCs
+        } else if t.xinput.contains(&h) {
+            InlineKind::XInput { ex: false }
+        } else if t.xinput_ex.contains(&h) {
+            InlineKind::XInput { ex: true }
+        } else if t.switch_thread.contains(&h) {
+            InlineKind::SwitchToThread
+        } else {
+            return None;
+        };
+
+        let mut slow_branches: Vec<usize> = Vec::new();
+        let mut fast_join: Vec<usize> = Vec::new();
+        match kind {
+            InlineKind::Qpc => {
+                self.mov_qpc_lit(XA);
+                self.a.ldp_x(T0, T1, XA, 0); // x0 = mode, x1 = mult
+                self.a.addsub_ri(true, true, true, ZR, T0, 1, false); // cmp x0, #1
+                slow_branches.push(self.a.bcond(NE));
+                self.a.mrs_cntvct(T0);
+                self.a.ldr(64, T2, XA, 16); // offset
+                self.a.umulh(T0, T0, T1);
+                self.a.addsub_rr(true, false, false, T0, T0, T2, 0);
+                self.a.str(64, T0, g(1), 0); // *lpPerformanceCount = result
+                self.a.movz(false, g(0), 1, 0); // return TRUE
+            }
+            InlineKind::TimeMs32 | InlineKind::TimeMs64 => {
+                self.mov_qpc_lit(XA);
+                self.a.ldp_x(T0, T1, XA, 0); // x0 = mode, x1 = mult
+                self.a.addsub_ri(true, true, true, ZR, T0, 1, false);
+                slow_branches.push(self.a.bcond(NE));
+                self.a.mrs_cntvct(T0);
+                self.a.ldr(64, T2, XA, 16); // offset
+                self.a.umulh(T0, T0, T1);
+                self.a.addsub_rr(true, false, false, T0, T0, T2, 0);
+                self.a.movz(false, T1, 10_000, 0);
+                self.a.udiv(true, T0, T0, T1);
+                let is64 = matches!(kind, InlineKind::TimeMs64);
+                self.a.mov_rr(is64, g(0), T0);
+            }
+            InlineKind::EnterCs => {
+                slow_branches.push(self.a.cbz(true, g(1)));
+                self.a.logic_ri(true, 3, ZR, g(1), enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.ldr(64, XA, XCPU, OFF_TEB);
+                slow_branches.push(self.a.cbz(true, XA));
+                self.a.ldr(32, XA, XA, 0x48); // w16 = tid (zero-extended)
+                slow_branches.push(self.a.cbz(false, XA));
+                self.a.ldr(64, XS, g(1), 0x10); // owning_thread
+                self.a.addsub_rr(true, true, true, ZR, XS, XA, 0);
+                let rec = self.a.bcond(EQ);
+                self.a.addsub_ri(true, false, false, XS, g(1), 8, false);
+                self.a.movn(false, T2, 0, 0); // w2 = -1
+                self.a.casa(32, T2, ZR, XS); // Acquire CAS -1 -> 0
+                self.a.addsub_ri(false, false, true, ZR, T2, 1, false); // cmn w2, #1
+                slow_branches.push(self.a.bcond(NE));
+                self.a.str(64, XA, g(1), 0x10); // owning_thread = tid
+                self.a.movz(false, T2, 1, 0);
+                self.a.str(32, T2, g(1), 0x0c); // recursion_count = 1
+                self.a.movz(false, g(0), 0, 0);
+                fast_join.push(self.a.b());
+                self.a.bind(rec);
+                self.a.ldr(32, T2, g(1), 0x0c);
+                self.a.addsub_ri(false, true, true, ZR, T2, 0, false);
+                slow_branches.push(self.a.bcond(LE));
+                self.a.addsub_ri(false, false, true, T2, T2, 1, false);
+                slow_branches.push(self.a.bcond(VS));
+                self.a.str(32, T2, g(1), 0x0c);
+                self.a.movz(false, g(0), 0, 0);
+            }
+            InlineKind::LeaveCs => {
+                slow_branches.push(self.a.cbz(true, g(1)));
+                self.a.logic_ri(true, 3, ZR, g(1), enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.ldr(32, T2, g(1), 0x0c);
+                self.a.addsub_ri(false, true, true, ZR, T2, 1, false);
+                slow_branches.push(self.a.bcond(LT));
+                let rec = self.a.bcond(GT);
+                self.a.ldr(64, XA, g(1), 0x10); // save owning_thread
+                self.a.str(32, ZR, g(1), 0x0c); // recursion_count = 0
+                self.a.str(64, ZR, g(1), 0x10); // owning_thread = 0
+                self.a.addsub_ri(true, false, false, XS, g(1), 8, false);
+                self.a.movz(false, T2, 0, 0); // expected = 0
+                self.a.movn(false, T0, 0, 0); // desired = -1
+                self.a.casl(32, T2, T0, XS); // Release CAS 0 -> -1
+                let contended = self.a.cbnz(false, T2);
+                self.a.movz(false, g(0), 0, 0);
+                fast_join.push(self.a.b());
+                self.a.bind(contended);
+                self.a.movz(false, T2, 1, 0);
+                self.a.str(32, T2, g(1), 0x0c);
+                self.a.str(64, XA, g(1), 0x10);
+                slow_branches.push(self.a.b());
+                self.a.bind(rec);
+                self.a.addsub_ri(false, true, false, T2, T2, 1, false);
+                self.a.str(32, T2, g(1), 0x0c);
+                self.a.movz(false, g(0), 0, 0);
+            }
+            InlineKind::XInput { ex } => {
+                slow_branches.push(self.a.cbz(true, g(2)));
+                self.a.addsub_ri(false, true, true, ZR, g(1), 4, false);
+                slow_branches.push(self.a.bcond(HS));
+                self.mov_xinput_lit(XA);
+                self.a.ldr(64, T2, XA, 0); // ready
+                slow_branches.push(self.a.cbz(true, T2));
+                self.a.addsub_ri(true, false, false, XA, XA, 32, false);
+                self.a.mov_rr(false, T2, g(1)); // zero-extend u32 user
+                self.a.addsub_rr(true, false, false, XA, XA, T2, 5); // &slots[user]
+                self.a.ldar(32, T2, XA); // seq1
+                slow_branches.push(self.a.tbnz(T2, 0));
+                self.a.ldr(32, XS, XA, 4); // connected
+                let conn = self.a.cbnz(false, XS);
+                self.a.dmb_ishld();
+                self.a.ldr(32, XS, XA, 0); // seq2
+                self.a.addsub_rr(false, true, true, ZR, T2, XS, 0);
+                slow_branches.push(self.a.bcond(NE));
+                self.a.movz(false, g(0), 1167, 0); // ERROR_DEVICE_NOT_CONNECTED
+                fast_join.push(self.a.b());
+                self.a.bind(conn);
+                self.a.ldp_x(T0, T1, XA, 8); // w0, w1
+                self.a.dmb_ishld();
+                self.a.ldr(32, XS, XA, 0); // seq2
+                self.a.addsub_rr(false, true, true, ZR, T2, XS, 0);
+                slow_branches.push(self.a.bcond(NE));
+                if !ex {
+                    self.a.logic_ri(true, 0, T0, T0, enc_logic_imm(!(1u64 << 42), true).unwrap());
+                }
+                self.a.str(64, T0, g(2), 0);
+                self.a.str(64, T1, g(2), 8);
+                self.a.movz(false, g(0), 0, 0); // ERROR_SUCCESS
+            }
+            InlineKind::SwitchToThread => {
+                self.a.ldr(32, T2, XCPU, OFF_SWITCH_YIELD);
+                self.a.addsub_ri(false, false, false, T2, T2, 1, false);
+                self.a.str(32, T2, XCPU, OFF_SWITCH_YIELD);
+                self.a.logic_ri(false, 3, ZR, T2, enc_logic_imm(63, false).unwrap());
+                slow_branches.push(self.a.bcond(EQ));
+                self.a.isb();
+                self.a.movz(false, g(0), 0, 0); // FALSE
+            }
+        }
+        for f in fast_join {
+            self.a.bind(f);
+        }
+        self.set_lb(0, 64);
+        self.flush_lb();
+        let done = if tail {
+            self.a.ldr(64, T0, XCPU, OFF_RIP);
+            self.a.b_to(self.lookup_rip);
+            None
+        } else {
+            Some(self.a.b())
+        };
+        for f in slow_branches {
+            self.a.bind(f);
+        }
+        done
     }
 
     pub(super) fn side_exit_here(&mut self, k: usize) -> usize {

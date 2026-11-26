@@ -31,6 +31,7 @@ pub(super) struct JitScratch {
     pub host_fpcr: u64,
     pub x87_state: usize,
     pub x87_helpers: usize,
+    pub switch_yield_ctr: u32,
 }
 
 impl Default for JitScratch {
@@ -58,9 +59,23 @@ impl Default for JitScratch {
             ymm_dirty: 0,
             mxcsr: 0x1F80,
             host_fpcr: 0,
+            switch_yield_ctr: 0,
         }
     }
 }
+
+#[allow(dead_code)]
+pub(super) const FAST_KIND_QPC: u64 = 0;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_TIME_MS: u64 = 1;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_ENTER_CS: u64 = 2;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_LEAVE_CS: u64 = 3;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_XINPUT: u64 = 4;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_SWITCH_TO_THREAD: u64 = 5;
 
 pub(super) const EXIT_RIP: u64 = 0;
 pub(super) const EXIT_CALL: u64 = 1;
@@ -71,6 +86,11 @@ pub(super) const EXIT_SIDE: u64 = 4;
 pub(super) fn force(_mode: u8) {}
 
 pub(super) fn enabled() -> bool {
+    false
+}
+
+#[allow(dead_code)]
+pub(super) fn plaincall_enabled() -> bool {
     false
 }
 
@@ -106,6 +126,17 @@ impl JitCache {
     #[allow(dead_code)]
     #[inline(always)]
     pub(super) unsafe fn cache_qpc_host(_table: usize, _target: u64, _qpc_state: usize) {}
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(super) unsafe fn cache_fast_thunk(
+        _table: usize,
+        _target: u64,
+        _kind: u64,
+        _sub_bit1: bool,
+        _payload: usize,
+    ) {
+    }
 
     #[inline(always)]
     pub(super) unsafe fn lookup_fast_hit(&self, _ip: u64) -> Option<usize> {

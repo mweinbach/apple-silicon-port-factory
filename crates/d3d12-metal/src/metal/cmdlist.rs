@@ -164,7 +164,7 @@ pub struct CommandList {
     /// (or flushed in `close()` if MetalFX was the last operation on the command buffer).
     pending_mfx_wait_fence: Option<Retained<ProtocolObject<dyn MTLFence>>>,
     rt_keep: Option<Arc<Mutex<Vec<crate::rt::accel::Retired>>>>,
-    /// Per-encoder GPU timestamps of this recording (`AW2_PASS_TIMING`), lazily acquired on first `pt_open`.
+    /// Per-encoder GPU timestamps of this recording (`PORT_PASS_TIMING`), lazily acquired on first `pt_open`.
     pt: Option<pt::PassLog>,
     pt_armed: bool,
     /// Last shader recorded on this list (for `PORT_DIAG_GPU_NAN` pass attribution; zero overhead when off).

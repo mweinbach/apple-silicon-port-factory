@@ -8,6 +8,8 @@
 
 pub mod codec;
 pub mod dsp;
+#[cfg(target_arch = "aarch64")]
+mod dsp_neon;
 pub mod hevc_container;
 pub mod stream;
 pub mod tables;

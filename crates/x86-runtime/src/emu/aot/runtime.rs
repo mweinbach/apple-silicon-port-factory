@@ -24,7 +24,9 @@ use crate::emu::exec_mem::{
     alloc_jit, bind_static_aot_module, free_jit, has_bound_static_aot, icache_invalidate,
     jit_writable, jit_write_protect, lookup_static_aot, static_probe_table,
 };
-use crate::emu::jit::{self, AOT_STUBS_BYTES, RELOC_HOST_FN, RELOC_QPC_STATE, RELOC_SLOT_VAL};
+use crate::emu::jit::{
+    self, AOT_STUBS_BYTES, RELOC_HOST_FN, RELOC_QPC_STATE, RELOC_SLOT_VAL, RELOC_XINPUT_STATE,
+};
 use crate::emu::BlockCache;
 
 pub(super) struct Module {
@@ -404,6 +406,14 @@ unsafe fn check_block(
         }
         if r.kind == RELOC_QPC_STATE {
             let h = win32_rt::kernel32::time::qpc_fast_state_ptr() as u64;
+            let slot = m.host_addr(r.slot_off);
+            if (*(slot as *const AtomicU64)).load(Ordering::Relaxed) != h {
+                rewrites.push((slot, h));
+            }
+            continue;
+        }
+        if r.kind == RELOC_XINPUT_STATE {
+            let h = win32_rt::misc::xinput1_4::xinput_fast_table_ptr() as u64;
             let slot = m.host_addr(r.slot_off);
             if (*(slot as *const AtomicU64)).load(Ordering::Relaxed) != h {
                 rewrites.push((slot, h));

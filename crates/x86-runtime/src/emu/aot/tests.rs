@@ -11,7 +11,7 @@ use super::cfg_discover::{discover, discover_pe_roots, discover_with_threads, Fu
 use super::format::{
     codegen_hash, decode, encode, encode_with_version, module_key, read_cache_file,
     read_cache_file_in, read_cached_preferred_base_in, set_flags, AotKey, Image, BUILD_VBASE,
-    FLAG_VERIFY_PENDING, FORMAT_VERSION_V5, FORMAT_VERSION_V6, MAX_CODE,
+    FLAG_VERIFY_PENDING, FORMAT_VERSION_V5, FORMAT_VERSION_V6, FORMAT_VERSION_V7, MAX_CODE,
 };
 use super::runtime::{
     install_image, load_module, load_verify, Verify, DIR, FIRST_LOAD_FULL_MAX,
@@ -1975,7 +1975,7 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
                                     "stub branch exceeded bank span: {}",
                                     imm26 * 4
                                 );
-                                if let Some(op) = img_1.stubs[10..].iter().position(|&s| s == stub_w) {
+                                if let Some(op) = img_1.stubs[10..12].iter().position(|&s| s == stub_w) {
                                     timestamp_calls[bi][op] = true;
                                 }
                                 *count += 1;
@@ -2036,7 +2036,13 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
             let (_, _, v6_img, _) = decode(&v6_bytes).expect("decode legacy multi-bank header");
             assert_eq!(v6_img.stub_banks, img_1.stub_banks);
             assert_eq!(&v6_img.stubs[..10], &img_1.stubs[..10]);
-            assert_eq!(&v6_img.stubs[10..], &[u32::MAX; 2]);
+            assert_eq!(&v6_img.stubs[10..], &[u32::MAX; 6]);
+
+            let v7_bytes = encode_with_version("legacy_v7.dll", &key, &img_1, 0, FORMAT_VERSION_V7);
+            let (_, _, v7_img, _) = decode(&v7_bytes).expect("decode legacy v7 header");
+            assert_eq!(v7_img.stub_banks, img_1.stub_banks);
+            assert_eq!(&v7_img.stubs[..12], &img_1.stubs[..12]);
+            assert_eq!(&v7_img.stubs[12..], &[u32::MAX; 4]);
 
             let single_img = unsafe { build_image(pool1.get_one(), &ips[..4], BUILD_VBASE) }.expect("single-bank");
             let v5_bytes = encode_with_version("legacy_v5.dll", &key, &single_img, FLAG_VERIFY_PENDING, FORMAT_VERSION_V5);

@@ -354,6 +354,7 @@ fn setup() {
     ONCE.call_once(|| {
         win32_rt::set_guest_dispatcher(crate::exe::call_va8);
         win32_rt::set_native_va_registrar(crate::exe::register_native_va);
+        win32_rt::set_incoming_rsp_reader(crate::emu::peek_incoming_rsp);
         chain::register_hooks();
     });
 }

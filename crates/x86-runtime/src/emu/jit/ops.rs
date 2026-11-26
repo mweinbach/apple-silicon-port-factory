@@ -1530,6 +1530,7 @@ impl Tr<'_> {
             Term::Jcc { cc, target, fall, near } if self.lazy => self.jcc_lazy(cc, target, fall, near),
             Term::Jcc { cc, target, fall, near } => {
                 self.flush_flags(live_out);
+                let lbk = self.abi_lb();
                 self.flush_lb();
                 let c = self.cond(cc);
                 let taken_host = near && self.target_host;
@@ -1570,7 +1571,7 @@ impl Tr<'_> {
                     self.exit_to(fall);
                     self.a.bind(f);
                 }
-                self.exit_code(EXIT_JCC, fall, target);
+                self.emit_tail_target(target, fall, lbk, EXIT_JCC);
             }
             Term::JccPair { cc1, t1, cc2, t2, fall2 } => {
                 self.flush_flags(live_out);
@@ -1633,37 +1634,7 @@ impl Tr<'_> {
                     self.flush_lb();
                 }
                 if self.target_host {
-                    if let Some((h, bail, needs_xmm)) = inline_host_fn_kind(t) {
-                        self.plain_call(h, t, lbk, true, bail.then_some((t, fall)), 0, needs_xmm);
-                    } else if let Some((slot, v, h, bail, needs_xmm)) = iat_slot_plain(t) {
-                        self.mov_lit(XA, slot);
-                        self.a.ldr(64, T0, XA, 0);
-                        self.mov_slot_val(XS, v, slot);
-                        self.a.addsub_rr(true, true, true, ZR, T0, XS, 0); // cmp x0, x17
-                        let slow = self.a.bcond(NE);
-                        self.plain_call(h, v, lbk, true, bail.then_some((v, fall)), slot, needs_xmm);
-                        self.a.bind(slow);
-                        if self.host_xfer != 0 {
-                            self.xfer_to(t, fall, 1);
-                        } else {
-                            self.exit_code(EXIT_JMP, fall, t);
-                        }
-                    } else if !plaincall_enabled()
-                        && self.host_xfer != 0
-                        && t != 0
-                        && !is_chkstk(t)
-                        && !crate::emu::is_routed_dll_chkstk(t)
-                        && !crate::emu::is_routed_dll_stack_pos(t)
-                        && !crate::emu::is_routed_regfile(t)
-                        && !crate::emu::is_routed_dll_stub(t)
-                    {
-                        self.mov_lit(T0, t);
-                        self.a.b_to(self.lookup_jmp);
-                    } else if self.host_xfer != 0 {
-                        self.xfer_to(t, fall, 1);
-                    } else {
-                        self.exit_code(EXIT_JMP, fall, t);
-                    }
+                    self.emit_tail_target(t, fall, lbk, EXIT_JMP);
                 } else {
                     self.exit_to(t);
                 }
@@ -1740,9 +1711,9 @@ impl Tr<'_> {
                 self.flush_lb();
                 self.a.mov_rr(true, T0, g(op.r0));
                 if matches!(term, Term::CallR) {
-                    self.call_lookup(fall);
+                    self.call_ic_or_lookup(op.ip, fall);
                 } else {
-                    self.a.b_to(self.lookup_jmp);
+                    self.jmp_ic_or_lookup(op.ip);
                 }
             }
             Term::CallM | Term::JmpM => {
@@ -1767,8 +1738,12 @@ impl Tr<'_> {
                 }
                 if generic.is_none() {
                     self.load_op(k, T0, &op, 64);
-                }
-                if is_call {
+                    if is_call {
+                        self.call_ic_or_lookup(op.ip, fall);
+                    } else {
+                        self.jmp_ic_or_lookup(op.ip);
+                    }
+                } else if is_call {
                     self.call_lookup(fall);
                 } else {
                     self.a.b_to(self.lookup_jmp);
@@ -1787,7 +1762,7 @@ impl Tr<'_> {
                 }
                 if self.ras_miss != 0 {
                     // Pop pinned `XRAS` top if its guest address matches the return target and
-                    // return to its landing pad; otherwise `ras_miss` (x0 = target, XRAS = top).
+                    // return to its landing pad; otherwise `ras_miss[_ic]` (x0 = target, XRAS = top).
                     if !self.ret_preloaded {
                         self.a.ldp_x(1, 2, XRAS, 0);
                     }
@@ -1796,10 +1771,17 @@ impl Tr<'_> {
                     let miss = self.a.cbnz(true, 1);
                     self.a.bfxil0(XRAS, XA, 16);
                     self.a.ret_r(2);
-                    self.a.bind(miss);
-                    self.a.b_to(self.ras_miss);
+                    if ic_enabled() && self.ras_miss_ic != 0 {
+                        self.ic_colds.push(super::translate::IcCold::RetRasMiss {
+                            miss_fix: miss,
+                            slot_byte_off: super::cache::ic_slot_byte_off(op.ip),
+                        });
+                    } else {
+                        self.a.bind(miss);
+                        self.a.b_to(self.ras_miss);
+                    }
                 } else {
-                    self.a.b_to(self.lookup_rip);
+                    self.ret_no_ras_ic_or_lookup(op.ip);
                 }
             }
             Term::Loop { sub, target, fall } => {

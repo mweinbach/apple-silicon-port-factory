@@ -950,21 +950,152 @@ pub unsafe extern "win64" fn _cputs(s: *const u8) -> i32 {
 }
 
 pub unsafe extern "win64" fn _getch() -> i32 {
-    stub!("_getch returns EOF");
-    -1
+    let fd = crate::kernel32::file::console_input_fd();
+    let is_tty = libc::isatty(fd) != 0;
+    let mut saved: libc::termios = std::mem::zeroed();
+    let changed_termios = if is_tty && libc::tcgetattr(fd, &mut saved) == 0 {
+        let mut raw = saved;
+        raw.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IGNCR | libc::IXON | libc::ISTRIP);
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::IEXTEN);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        libc::tcsetattr(fd, libc::TCSANOW, &raw) == 0
+    } else {
+        false
+    };
+    let mut b = 0u8;
+    let r = loop {
+        let n = libc::read(fd, &mut b as *mut u8 as *mut c_void, 1);
+        if n < 0 && *libc::__error() == libc::EINTR {
+            continue;
+        }
+        break n;
+    };
+    if changed_termios {
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &saved);
+    }
+    if r == 1 {
+        b as i32
+    } else {
+        -1
+    }
 }
 
 pub unsafe extern "win64" fn _kbhit() -> i32 {
-    0
+    let fd = crate::kernel32::file::console_input_fd();
+    let is_tty = libc::isatty(fd) != 0;
+    let mut saved: libc::termios = std::mem::zeroed();
+    let changed_termios =
+        if is_tty && libc::tcgetattr(fd, &mut saved) == 0 && (saved.c_lflag & libc::ICANON) != 0 {
+            let mut noncanon = saved;
+            noncanon.c_lflag &= !libc::ICANON;
+            noncanon.c_cc[libc::VMIN] = 1;
+            noncanon.c_cc[libc::VTIME] = 0;
+            libc::tcsetattr(fd, libc::TCSANOW, &noncanon) == 0
+        } else {
+            false
+        };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let r = loop {
+        let n = libc::poll(&mut pfd, 1, 0);
+        if n < 0 && *libc::__error() == libc::EINTR {
+            continue;
+        }
+        break n;
+    };
+    if changed_termios {
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &saved);
+    }
+    if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Resolve the Windows command interpreter (`%COMSPEC%`, defaulting to
+/// `C:\Windows\System32\cmd.exe`) if a real guest executable exists at that path.
+fn resolve_comspec() -> Option<String> {
+    #[cfg(target_os = "ios")]
+    {
+        return None;
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let comspec = pr::get_env("COMSPEC")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "C:\\Windows\\System32\\cmd.exe".into());
+        let host = crate::path::to_host(&comspec)?;
+        if host.is_file() && !crate::path::is_protected_host_write(&host) {
+            Some(comspec)
+        } else {
+            None
+        }
+    }
 }
 
 pub unsafe extern "win64" fn system(cmd: *const u8) -> i32 {
+    super::stdio::flush_all();
+    let comspec = resolve_comspec();
     if cmd.is_null() {
-        return 0; // no command processor
+        // Microsoft Learn (`system`): when `command` is NULL, returns nonzero if a command
+        // interpreter (`%COMSPEC%` / `cmd.exe`) is found, and 0 if none is available.
+        return if comspec.is_some() { 1 } else { 0 };
     }
-    stub!("system({:?}) refused", from_ansi(cmd));
-    errno::set(errno::ENOENT);
-    -1
+    let cmd_str = from_ansi(cmd);
+    if cmd_str.len() > 32767 {
+        errno::set(7); // E2BIG
+        return -1;
+    }
+    let Some(interp) = comspec else {
+        // Microsoft Learn (`system`): if the command interpreter cannot be found, returns -1
+        // and sets `errno` to `ENOENT`. We never escape to the host POSIX `/bin/sh`.
+        log::debug!("system({cmd_str:?}): COMSPEC/cmd.exe not present in virtual drive -> ENOENT");
+        errno::set(errno::ENOENT);
+        return -1;
+    };
+    #[cfg(not(target_os = "ios"))]
+    {
+        let app_w = to_wide_z(&interp);
+        let mut cmdline_w = to_wide_z(&format!("\"{interp}\" /c {cmd_str}"));
+        let mut si = [0u8; 104];
+        (si.as_mut_ptr() as *mut u32).write_unaligned(104);
+        let mut pi = [0u8; 24];
+        let ok = crate::kernel32::process::CreateProcessW(
+            app_w.as_ptr(),
+            cmdline_w.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            FALSE,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            si.as_mut_ptr() as *mut c_void,
+            pi.as_mut_ptr() as *mut c_void,
+        );
+        if ok == 0 {
+            errno::set(errno::ENOENT);
+            return -1;
+        }
+        let h_proc = (pi.as_ptr() as *const HANDLE).read_unaligned();
+        let h_thr = (pi.as_ptr().add(8) as *const HANDLE).read_unaligned();
+        let _ = crate::kernel32::threads::WaitForSingleObject(h_proc, INFINITE);
+        let mut code = 0u32;
+        let _ = crate::kernel32::process::GetExitCodeProcess(h_proc, &mut code);
+        let _ = crate::kernel32::threads::CloseHandle(h_thr);
+        let _ = crate::kernel32::threads::CloseHandle(h_proc);
+        code as i32
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = interp;
+        errno::set(errno::ENOENT);
+        -1
+    }
 }
 
 pub unsafe extern "win64" fn __threadid() -> u32 {
@@ -1128,6 +1259,136 @@ mod tests {
             assert_eq!(fesetround(0x100), 0); // FE_DOWNWARD
             assert_eq!(__fpe_flt_rounds(), 3);
             assert_eq!(fesetround(saved), 0);
+        }
+    }
+
+    #[test]
+    fn getch_kbhit_reads_from_console_pipe_and_eof() {
+        use crate::kernel32::file::{GetStdHandle, SetStdHandle};
+        use crate::kernel32::threads::CloseHandle;
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        unsafe {
+            let mut fds = [0i32; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let old_in = GetStdHandle(STD_INPUT_HANDLE);
+            let h_read = crate::kernel32::file::wrap_owned_fd(
+                std::os::fd::FromRawFd::from_raw_fd(fds[0]),
+                crate::kernel32::file::FileKind::Pipe,
+                "test-getch-pipe".into(),
+                0x8000_0000,
+            );
+            assert_eq!(SetStdHandle(STD_INPUT_HANDLE, h_read), TRUE);
+
+            assert_eq!(_kbhit(), 0);
+            assert_eq!(libc::write(fds[1], b"Az".as_ptr() as *const c_void, 2), 2);
+            assert_eq!(_kbhit(), 1);
+            assert_eq!(_getch(), b'A' as i32);
+            assert_eq!(_getch(), b'z' as i32);
+            assert_eq!(_kbhit(), 0);
+            libc::close(fds[1]);
+            assert_eq!(_getch(), -1);
+
+            assert_eq!(SetStdHandle(STD_INPUT_HANDLE, old_in), TRUE);
+            CloseHandle(h_read);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kbhit_and_getch_detect_single_keystroke_on_canonical_pty() {
+        use crate::kernel32::file::{GetStdHandle, SetStdHandle};
+        use crate::kernel32::threads::CloseHandle;
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0);
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let slave_name = libc::ptsname(master);
+            assert!(!slave_name.is_null());
+            let slave = libc::open(slave_name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(slave >= 0);
+
+            // Ensure canonical input + CR->NL translation are enabled (normal host terminal state).
+            let mut tio: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut tio), 0);
+            tio.c_iflag |= libc::ICRNL;
+            tio.c_lflag |= libc::ICANON | libc::ECHO;
+            assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &tio), 0);
+
+            let old_in = GetStdHandle(STD_INPUT_HANDLE);
+            let h_tty = crate::kernel32::file::wrap_owned_fd(
+                std::os::fd::FromRawFd::from_raw_fd(slave),
+                crate::kernel32::file::FileKind::Console,
+                "test-kbhit-pty".into(),
+                0x8000_0000,
+            );
+            assert_eq!(SetStdHandle(STD_INPUT_HANDLE, h_tty), TRUE);
+
+            // Empty canonical PTY reports 0.
+            assert_eq!(_kbhit(), 0);
+            // Write a single character WITHOUT newline; _kbhit must report 1 and preserve ICANON.
+            assert_eq!(libc::write(master, b"A".as_ptr() as *const c_void, 1), 1);
+            // Allow kernel PTY line discipline to deliver byte to slave queue.
+            let mut ready = 0;
+            for _ in 0..20 {
+                ready = _kbhit();
+                if ready != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(ready, 1, "_kbhit must detect single keystroke on ICANON PTY before Enter");
+
+            let mut after_kbhit: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut after_kbhit), 0);
+            assert_ne!(after_kbhit.c_lflag & libc::ICANON, 0, "_kbhit must restore ICANON");
+
+            assert_eq!(_getch(), b'A' as i32);
+            assert_eq!(_kbhit(), 0);
+
+            let mut after_getch: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut after_getch), 0);
+            assert_ne!(after_getch.c_lflag & libc::ICANON, 0, "_getch must restore ICANON");
+            assert_ne!(after_getch.c_iflag & libc::ICRNL, 0, "_getch must restore ICRNL");
+
+            // Enter key (0x0D) arriving while _getch() is active must NOT be translated to LF (0x0A).
+            let writer = std::thread::spawn(move || {
+                let mut cur: libc::termios = std::mem::zeroed();
+                for _ in 0..200 {
+                    if libc::tcgetattr(slave, &mut cur) == 0 && (cur.c_iflag & libc::ICRNL) == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                assert_eq!(libc::write(master, b"\r".as_ptr() as *const c_void, 1), 1);
+            });
+            assert_eq!(_getch(), b'\r' as i32, "_getch must return CR (0x0D) for Enter on ICRNL PTY");
+            writer.join().unwrap();
+
+            let mut after_cr: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut after_cr), 0);
+            assert_ne!(after_cr.c_lflag & libc::ICANON, 0, "_getch must restore ICANON after CR");
+            assert_ne!(after_cr.c_iflag & libc::ICRNL, 0, "_getch must restore ICRNL after CR");
+
+            assert_eq!(SetStdHandle(STD_INPUT_HANDLE, old_in), TRUE);
+            CloseHandle(h_tty);
+            libc::close(master);
+        }
+    }
+
+    #[test]
+    fn system_matches_windows_comspec_contract() {
+        unsafe {
+            let prev = pr::get_env("COMSPEC");
+            pr::set_env("COMSPEC", Some("C:\\NonExistent\\cmd.exe"));
+            assert_eq!(system(std::ptr::null()), 0);
+            assert_eq!(system(b"echo hello\0".as_ptr()), -1);
+            assert_eq!(errno::get(), errno::ENOENT);
+            let huge = format!("{}\0", "a".repeat(33000));
+            assert_eq!(system(huge.as_ptr()), -1);
+            assert_eq!(errno::get(), 7); // E2BIG
+            pr::set_env("COMSPEC", prev.as_deref());
         }
     }
 }
