@@ -2659,7 +2659,7 @@ unsafe fn collect_dir_enum_entries_fd(dir_fd: libc::c_int) -> std::io::Result<Ve
             times: stat_times(&m),
             size: len,
             alloc_size,
-            ino: m.st_ino as u64,
+            ino: sm.st_ino as u64,
             reparse_tag,
         });
     }
@@ -12131,10 +12131,19 @@ mod tests {
             let wd = to_wide_z("K:\\");
             let hd = CreateFileW(wd.as_ptr(), GENERIC_READ, 7, std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut());
             assert_ne!(hd, INVALID_HANDLE_VALUE);
-            for (restart_cls, next_cls, name_off) in [(11u32, 10u32, 104usize), (15, 14, 68), (20, 19, 88)] {
+            let sample_ino = std::fs::symlink_metadata(&file_p).unwrap().ino();
+            let sym_ino = std::fs::symlink_metadata(&link_p).unwrap().ino();
+            assert_ne!(sample_ino, sym_ino);
+            for (restart_cls, next_cls, name_off, id_off) in [
+                (11u32, 10u32, 104usize, Some(96usize)),
+                (15, 14, 68, None),
+                (20, 19, 88, Some(72usize)),
+            ] {
                 let mut dbuf = vec![0u8; 4096];
                 let mut names = Vec::new();
                 let mut sparse_record: Option<(u64, u64)> = None;
+                let mut sample_id: Option<u64> = None;
+                let mut sym_id: Option<u64> = None;
                 let mut cls = restart_cls;
                 while GetFileInformationByHandleEx(hd, cls, dbuf.as_mut_ptr(), dbuf.len() as u32) != 0 {
                     let mut off = 0usize;
@@ -12147,6 +12156,14 @@ mod tests {
                         let name = String::from_utf16_lossy(&u);
                         if name == "sparse_stream.dat" {
                             sparse_record = Some((eof, alloc));
+                        }
+                        if let Some(ioff) = id_off {
+                            let fid = (dbuf.as_ptr().add(off + ioff) as *const u64).read_unaligned();
+                            if name == "sample.dat" {
+                                sample_id = Some(fid);
+                            } else if name == "sym.dat" {
+                                sym_id = Some(fid);
+                            }
                         }
                         names.push(name);
                         if next_off == 0 {
@@ -12163,6 +12180,11 @@ mod tests {
                     Some((16 * 1024 * 1024, expected_sparse_alloc)),
                     "class {restart_cls} must preserve sparse AllocationSize",
                 );
+                if id_off.is_some() {
+                    assert_eq!(sample_id, Some(sample_ino), "class {restart_cls} sample.dat FileId");
+                    assert_eq!(sym_id, Some(sym_ino), "class {restart_cls} sym.dat must keep symlink FileId");
+                    assert_ne!(sample_id, sym_id, "class {restart_cls} symlink must not share target FileId");
+                }
             }
 
             // Class 22: FileRenameInfoEx relative to RootDirectory
