@@ -74,19 +74,15 @@ mod icu {
 
     pub const UCAL_FIRST_DAY_OF_WEEK: i32 = 1;
 
-    pub const UCOL_ALTERNATE_HANDLING: i32 = 1;
     pub const UCOL_CASE_FIRST: i32 = 2;
     pub const UCOL_STRENGTH: i32 = 5;
     pub const UCOL_NUMERIC_COLLATION: i32 = 7;
 
     pub const UCOL_PRIMARY: i32 = 0;
     pub const UCOL_SECONDARY: i32 = 1;
-    pub const UCOL_TERTIARY: i32 = 2;
     pub const UCOL_QUATERNARY: i32 = 3;
     pub const UCOL_ON: i32 = 17;
-    pub const UCOL_SHIFTED: i32 = 20;
     pub const UCOL_LOWER_FIRST: i32 = 24;
-    pub const UCOL_REORDER_CODE_CURRENCY: i32 = 0x1003;
 
     pub const ULOC_LAYOUT_RTL: i32 = 1;
     pub const UMS_US: i32 = 1;
@@ -147,7 +143,6 @@ mod icu {
         pub ucurr_get_name: unsafe extern "C" fn(*const u16, *const c_char, i32, *mut i8, *mut i32, *mut i32) -> *const u16,
         pub ucol_open: unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void,
         pub ucol_set_attribute: unsafe extern "C" fn(*mut c_void, i32, i32, *mut i32),
-        pub ucol_set_max_variable: unsafe extern "C" fn(*mut c_void, i32, *mut i32),
         pub ucol_strcoll: unsafe extern "C" fn(*const c_void, *const u16, i32, *const u16, i32) -> i32,
         pub ucol_get_sort_key: unsafe extern "C" fn(*const c_void, *const u16, i32, *mut u8, i32) -> i32,
         pub ucol_close: unsafe extern "C" fn(*mut c_void),
@@ -247,7 +242,6 @@ mod icu {
                 ucurr_get_name: sym!(c"ucurr_getName", unsafe extern "C" fn(*const u16, *const c_char, i32, *mut i8, *mut i32, *mut i32) -> *const u16),
                 ucol_open: sym!(c"ucol_open", unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void),
                 ucol_set_attribute: sym!(c"ucol_setAttribute", unsafe extern "C" fn(*mut c_void, i32, i32, *mut i32)),
-                ucol_set_max_variable: sym!(c"ucol_setMaxVariable", unsafe extern "C" fn(*mut c_void, i32, *mut i32)),
                 ucol_strcoll: sym!(c"ucol_strcoll", unsafe extern "C" fn(*const c_void, *const u16, i32, *const u16, i32) -> i32),
                 ucol_get_sort_key: sym!(c"ucol_getSortKey", unsafe extern "C" fn(*const c_void, *const u16, i32, *mut u8, i32) -> i32),
                 ucol_close: sym!(c"ucol_close", unsafe extern "C" fn(*mut c_void)),
@@ -1116,34 +1110,20 @@ const NORM_IGNOREWIDTH: u32 = 0x0002_0000;
 /// `LCMapStringEx(..., LCMAP_SORTKEY, ...)` always produce identical ordering.
 unsafe fn configure_ucollator(a: &icu::IcuNls, col: *mut c_void, flags: u32) {
     let norm_ignore_case = (flags & NORM_IGNORECASE) != 0;
-    let ignore_symbols = (flags & NORM_IGNORESYMBOLS) != 0;
     // `NORM_IGNORECASE` suppresses tertiary distinctions (ICU `UCOL_SECONDARY`), whereas
-    // `LINGUISTIC_IGNORECASE` (`u_strFoldCase`) and diacritic suppression (`NORM_IGNORENONSPACE` /
-    // `LINGUISTIC_IGNOREDIACRITIC`, via NFD mark stripping) are applied in
-    // `normalize_collation_input` so non-diacritic tertiary/quaternary distinctions such as case,
-    // width (`A` vs `Ａ`), and kana type (`か` vs `カ`) remain intact.
-    // In CLDR Japanese collation (`ja_JP`), Hiragana/Katakana and kana width are quaternary
-    // distinctions, so use `UCOL_QUATERNARY` when full comparison is requested without shifted
-    // punctuation.
+    // `LINGUISTIC_IGNORECASE` (`u_strFoldCase`), diacritic suppression (`NORM_IGNORENONSPACE` /
+    // `LINGUISTIC_IGNOREDIACRITIC`), and symbol/punctuation suppression (`NORM_IGNORESYMBOLS`)
+    // are applied in `normalize_collation_input` so non-requested tertiary/quaternary distinctions
+    // such as case, width (`A` vs `Ａ`), and Japanese kana type (`か` vs `カ`) remain intact.
     let strength = if norm_ignore_case {
         icu::UCOL_SECONDARY
-    } else if !ignore_symbols {
-        icu::UCOL_QUATERNARY
     } else {
-        icu::UCOL_TERTIARY
+        icu::UCOL_QUATERNARY
     };
     let mut ast = 0i32;
     (a.ucol_set_attribute)(col, icu::UCOL_STRENGTH, strength, &mut ast);
     ast = 0;
     (a.ucol_set_attribute)(col, icu::UCOL_CASE_FIRST, icu::UCOL_LOWER_FIRST, &mut ast);
-    if (flags & NORM_IGNORESYMBOLS) != 0 {
-        ast = 0;
-        (a.ucol_set_attribute)(col, icu::UCOL_ALTERNATE_HANDLING, icu::UCOL_SHIFTED, &mut ast);
-        // Extend variable elements through currency so whitespace, punctuation, math symbols,
-        // and currency symbols (`-`, `+`, `$`, `€`, etc.) are all shifted/ignored consistently.
-        ast = 0;
-        (a.ucol_set_max_variable)(col, icu::UCOL_REORDER_CODE_CURRENCY, &mut ast);
-    }
     if (flags & SORT_DIGITSASNUMBERS) != 0 {
         ast = 0;
         (a.ucol_set_attribute)(col, icu::UCOL_NUMERIC_COLLATION, icu::UCOL_ON, &mut ast);
@@ -1351,11 +1331,32 @@ fn icu_strip_diacritics(icu_locale: &str, src: &[u16], linguistic_only: bool) ->
     }
 }
 
+/// Strip Unicode separators (`Z*`), ASCII/Unicode control whitespace (`\t`, `\n`, `\r`, etc.),
+/// punctuation (`P*`), and symbols (`S*` — math, currency, modifier, other) via ICU `u_charType`
+/// so `NORM_IGNORESYMBOLS` ignores symbols & punctuation while preserving quaternary Japanese kana
+/// and width distinctions (`か` vs `カ`, `A` vs `Ａ`).
+fn icu_strip_symbols(src: &[u16]) -> Option<Vec<u16>> {
+    let a = icu::api()?;
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        let (cp, len) = next_utf16_cp(src, i);
+        let cat = unsafe { (a.u_char_type)(cp as i32) };
+        let is_symbol_or_punct = matches!(cat, 12..=14 | 19..=29)
+            || (cat == 15 && matches!(cp, 0x09..=0x0D | 0x85));
+        if !is_symbol_or_punct {
+            out.extend_from_slice(&src[i..i + len]);
+        }
+        i += len;
+    }
+    Some(out)
+}
+
 /// Normalize width (`NORM_IGNOREWIDTH`), kana type (`NORM_IGNOREKANATYPE`), linguistic
-/// case folding (`LINGUISTIC_IGNORECASE` / `NORM_IGNORECASE | NORM_LINGUISTIC_CASING`), and
-/// diacritic suppression (`NORM_IGNORENONSPACE` / `LINGUISTIC_IGNOREDIACRITIC`) before
-/// collation and sort-key generation so `CompareStringEx`/`CompareStringW`, `LCMAP_SORTKEY`,
-/// and `LCMAP_HASH` agree across all flag combinations.
+/// case folding (`LINGUISTIC_IGNORECASE` / `NORM_IGNORECASE | NORM_LINGUISTIC_CASING`),
+/// diacritic suppression (`NORM_IGNORENONSPACE` / `LINGUISTIC_IGNOREDIACRITIC`), and
+/// symbol/punctuation suppression (`NORM_IGNORESYMBOLS`) before collation and sort-key generation
+/// so `CompareStringEx`/`CompareStringW`, `LCMAP_SORTKEY`, and `LCMAP_HASH` agree across all flags.
 fn normalize_collation_input<'a>(icu_locale: &str, s: &'a [u16], flags: u32) -> Cow<'a, [u16]> {
     let ignore_width = (flags & NORM_IGNOREWIDTH) != 0;
     let ignore_kana = (flags & NORM_IGNOREKANATYPE) != 0;
@@ -1364,7 +1365,8 @@ fn normalize_collation_input<'a>(icu_locale: &str, s: &'a [u16], flags: u32) -> 
     let ignore_diacritics = (flags & (NORM_IGNORENONSPACE | LINGUISTIC_IGNOREDIACRITIC)) != 0;
     let linguistic_diacritics =
         (flags & LINGUISTIC_IGNOREDIACRITIC) != 0 && (flags & NORM_IGNORENONSPACE) == 0;
-    if !ignore_width && !ignore_kana && !linguistic_case && !ignore_diacritics {
+    let ignore_symbols = (flags & NORM_IGNORESYMBOLS) != 0;
+    if !ignore_width && !ignore_kana && !linguistic_case && !ignore_diacritics && !ignore_symbols {
         return Cow::Borrowed(s);
     }
     let mut out: Vec<u16> = if ignore_width {
@@ -1442,6 +1444,12 @@ fn normalize_collation_input<'a>(icu_locale: &str, s: &'a [u16], flags: u32) -> 
 
     if ignore_diacritics {
         if let Some(stripped) = icu_strip_diacritics(icu_locale, &out, linguistic_diacritics) {
+            out = stripped;
+        }
+    }
+
+    if ignore_symbols {
+        if let Some(stripped) = icu_strip_symbols(&out) {
             out = stripped;
         }
     }
@@ -4781,6 +4789,20 @@ mod tests {
             let a1b = to_wide_z("a1b");
             assert_ne!(CompareStringEx(en.as_ptr(), NORM_IGNORESYMBOLS, a1b.as_ptr(), -1, ab.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
             assert_ne!(get_sort_key(&en, &a1b, NORM_IGNORESYMBOLS), get_sort_key(&en, &ab, NORM_IGNORESYMBOLS));
+            // NORM_IGNORESYMBOLS preserves width (A != Ａ in en-US) and Japanese kana (か != カ
+            // in en-US and ja-JP) while ignoring punctuation/math/currency symbols around kana.
+            assert_ne!(CompareStringEx(en.as_ptr(), NORM_IGNORESYMBOLS, a_up.as_ptr(), -1, a_fw.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_ne!(get_sort_key(&en, &a_up, NORM_IGNORESYMBOLS), get_sort_key(&en, &a_fw, NORM_IGNORESYMBOLS));
+            assert_ne!(CompareStringEx(en.as_ptr(), NORM_IGNORESYMBOLS, ka_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_ne!(get_sort_key(&en, &ka_hira, NORM_IGNORESYMBOLS), get_sort_key(&en, &ka_kata, NORM_IGNORESYMBOLS));
+            assert_ne!(CompareStringEx(ja.as_ptr(), NORM_IGNORESYMBOLS, ka_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_ne!(get_sort_key(&ja, &ka_hira, NORM_IGNORESYMBOLS), get_sort_key(&ja, &ka_kata, NORM_IGNORESYMBOLS));
+            let kaki = to_wide_z("かき");
+            for ja_sym in ["か-き", "か+き", "か$き", "か　き"] {
+                let js_w = to_wide_z(ja_sym);
+                assert_eq!(CompareStringEx(ja.as_ptr(), NORM_IGNORESYMBOLS, js_w.as_ptr(), -1, kaki.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+                assert_eq!(get_sort_key(&ja, &js_w, NORM_IGNORESYMBOLS), get_sort_key(&ja, &kaki, NORM_IGNORESYMBOLS));
+            }
         }
     }
 
