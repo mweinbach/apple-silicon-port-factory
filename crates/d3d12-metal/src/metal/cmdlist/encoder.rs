@@ -1951,6 +1951,9 @@ impl CommandList {
             };
             unsafe { e.setVisibilityResultMode_offset(mode, o.index as usize * 8) };
             let q_buf_ptr = &*o.buffer as *const crate::metal::resource::MtlBuffer as usize;
+            // `begin_barrier` above just consumed any pending `Blit -> Fragment` wait for this
+            // visibility buffer, so clear its resolve-read WAR marker now that a render pass opened.
+            self.bar.vis_buf_blit_read.retain(|&p| p != q_buf_ptr);
             self.enc_vis_buf = Some(q_buf_ptr);
             self.enc_vis_reset = use_vis_reset;
             self.enc_vis_used_indices.clear();

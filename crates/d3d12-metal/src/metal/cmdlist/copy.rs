@@ -722,10 +722,15 @@ impl CommandList {
                         MTLVisibilityResultMode::Counting
                     };
                     let had_blit_read = self.bar.vis_buf_blit_read.contains(&q_buf_ptr);
+                    let slot_previously_written =
+                        self.bar.vis_buf_written.contains(&(q_buf_ptr, q.index));
                     // Reuse the open `Reset` render pass when it already has this visibility
                     // buffer attached, targets have not changed, no Blit read intervened, and
-                    // this query slot has not been used yet in the current pass.
+                    // this query slot has neither been written in an earlier pass nor used in
+                    // the current pass (reusing a slot written in an earlier pass on another
+                    // target requires closing and emitting `Fragment -> Fragment` sync).
                     if !had_blit_read
+                        && !slot_previously_written
                         && self.enc_vis_buf == Some(q_buf_ptr)
                         && self.enc_vis_reset
                         && !self.gfx.had_target_rebind
@@ -746,11 +751,13 @@ impl CommandList {
                     if matches!(self.enc, Encoder::Render(_)) {
                         self.end_encoder();
                     }
+                    // Preserve `vis_buf_blit_read` until either a render pass actually opens
+                    // and consumes `Blit -> Fragment`, or a 0-draw `EndQuery` consumes it with
+                    // a `Blit -> Blit` barrier before zero-filling the slot.
                     if had_blit_read {
-                        self.bar.vis_buf_blit_read.retain(|&p| p != q_buf_ptr);
                         self.add_pend(MTLStages::Blit, MTLStages::Fragment);
                     }
-                    if self.bar.vis_buf_written.contains(&(q_buf_ptr, q.index)) {
+                    if slot_previously_written {
                         self.add_pend(MTLStages::Fragment, MTLStages::Fragment);
                     }
                     self.occl_drew = false;
@@ -784,8 +791,12 @@ impl CommandList {
                 }
                 let prev = self.occlusion.take();
                 let drew = std::mem::replace(&mut self.occl_drew, false);
-                if let Encoder::Render(e) = &self.enc {
-                    unsafe { e.setVisibilityResultMode_offset(MTLVisibilityResultMode::Disabled, 0) };
+                if self.enc_vis_buf.is_some() {
+                    if let Encoder::Render(e) = &self.enc {
+                        unsafe {
+                            e.setVisibilityResultMode_offset(MTLVisibilityResultMode::Disabled, 0)
+                        };
+                    }
                 } else if masked && !drew {
                     // `BeginQuery..EndQuery` completed with zero draws and no render pass ever
                     // opened for it: zero the 8-byte slot in `Blit` with stage-masked sync.
@@ -797,6 +808,13 @@ impl CommandList {
                         if self.bar.vis_buf_blit_read.contains(&q_buf_ptr) {
                             self.bar.vis_buf_blit_read.retain(|&p| p != q_buf_ptr);
                             self.add_pend(MTLStages::Blit, MTLStages::Blit);
+                            if matches!(self.enc, Encoder::Compute(_)) {
+                                if self.ib_tight_active() {
+                                    self.ib_add_obl_tight(0, MTLStages::Blit, MTLStages::Blit);
+                                } else {
+                                    self.ib_note(0);
+                                }
+                            }
                         }
                         let e = self.compute_blit_touch(&[]).ok_or("compute encoder")?;
                         self.pt_note_util(pt::synth::FILL_OCCL, 0);

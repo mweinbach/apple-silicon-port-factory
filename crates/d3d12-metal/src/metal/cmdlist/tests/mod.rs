@@ -3840,4 +3840,108 @@ fn occlusion_query_same_pass_reset_coalescing_and_resolve_on_gpu() {
     assert_eq!(got[3], 0, "0-draw slot 3 in Reset pass must reset to 0, got {got:?}");
     assert_eq!(got[4], 32, "multi-pass slot 4 (Reset + Accumulate) must count 32 samples, got {got:?}");
     assert_eq!(got[5], 0, "0-draw slot 5 outside render pass must zero via Blit, got {got:?}");
+
+    // Case 2 (slot reuse across distinct targets + Resolve -> 0-draw EndQuery WAR hazard):
+    // 1) Query slot 1 on target A (`rt`), close pass.
+    // 2) Open a new pass on a *different* target B (`rt2`) querying slot 0 (no attachment sync
+    //    orders Pass 2 after Pass 1).
+    // 3) While Pass 2 is open, begin querying slot 1 again: must NOT coalesce into Pass 2, must
+    //    close Pass 2 and arm `Fragment -> Fragment` before resetting slot 1.
+    // 4) Resolve slot 1 into `dst_rb2[0]`, then immediately run 0-draw `BeginQuery(1)..EndQuery(1)`
+    //    (same open compute encoder!) and resolve slot 1 again into `dst_rb2[1]`: must preserve
+    //    `vis_buf_blit_read` across `BeginQuery`, emit an intra-encoder `Blit -> Blit` barrier
+    //    before the zero-fill so `dst_rb2[0] == 16` is not clobbered, and produce `dst_rb2[1] == 0`.
+    let rt2 = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let dst_rb2 = test_buffer(16, heap_type::READBACK, 0);
+    rt2.register_ptr();
+    dst_rb2.register_ptr();
+    let rtv1 = TargetView::rtv(&rt, None).unwrap();
+    let rtv2 = TargetView::rtv(&rt2, None).unwrap();
+    let mut l2 = CommandList::new(ListType::Direct).unwrap();
+    l2.begin(&alloc).unwrap();
+    l2.gfx_root.set_root_signature(rs.clone()).unwrap();
+    l2.gfx_root.set_descriptor(0, cb_up.gpu_va).unwrap();
+    l2.gfx_root.set_descriptor(1, buf_srv.gpu_va).unwrap();
+    l2.gfx.topology = 4;
+    l2.set_graphics_pipeline(pso.clone());
+    l2.set_viewports(vec![MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: 4.0,
+        height: 4.0,
+        znear: 0.0,
+        zfar: 1.0,
+    }]);
+    l2.set_render_targets(vec![rtv1], None);
+    l2.begin_occlusion(&qh, 1, false).unwrap();
+    l2.draw(3, 1, 0, 0).unwrap();
+    l2.end_occlusion(&qh, 1).unwrap();
+    l2.end_encoder();
+
+    // Switch to distinct target `rt2` and open Pass 2 on unused slot 0.
+    l2.set_render_targets(vec![rtv2], None);
+    l2.begin_occlusion(&qh, 0, false).unwrap();
+    l2.draw(3, 1, 0, 0).unwrap();
+    l2.end_occlusion(&qh, 0).unwrap();
+    assert!(matches!(l2.enc, Encoder::Render(_)), "Pass 2 on rt2 should be open");
+
+    // Reusing slot 1 (written on rt in Pass 1) must NOT coalesce into Pass 2: must split and
+    // arm `Fragment -> Fragment` sync.
+    l2.begin_occlusion(&qh, 1, false).unwrap();
+    assert!(
+        matches!(l2.enc, Encoder::None),
+        "reusing a query slot written in an earlier pass must close the open pass instead of coalescing"
+    );
+    assert!(
+        l2.bar.split_pend.frag_after.contains(MTLStages::Fragment)
+            || l2.bar.pend_after.contains(MTLStages::Fragment),
+        "reusing a query slot written in an earlier pass must arm Fragment -> Fragment sync"
+    );
+    l2.draw(3, 1, 0, 0).unwrap();
+    l2.end_occlusion(&qh, 1).unwrap();
+
+    // Resolve slot 1 into dst_rb2[0] (leaves Encoder::Compute open and marks vis_buf_blit_read).
+    l2.resolve_occlusion(&qh, 1, 1, &dst_rb2, 0).unwrap();
+    let q_buf_ptr = &**vis_buf as *const crate::metal::resource::MtlBuffer as usize;
+    assert!(
+        l2.bar.vis_buf_blit_read.contains(&q_buf_ptr),
+        "ResolveQueryData must mark vis_buf_blit_read"
+    );
+    assert!(matches!(l2.enc, Encoder::Compute(_)));
+
+    // BeginQuery(1) with 0 draws must keep vis_buf_blit_read armed until EndQuery consumes it
+    // with a Blit -> Blit barrier (intra-encoder here since Compute stays open).
+    let eb_before = stats::c::enc_barrier.load(Relaxed);
+    l2.begin_occlusion(&qh, 1, false).unwrap();
+    assert!(
+        l2.bar.vis_buf_blit_read.contains(&q_buf_ptr),
+        "BeginQuery must preserve vis_buf_blit_read until a render pass or 0-draw fill consumes it"
+    );
+    l2.end_occlusion(&qh, 1).unwrap();
+    assert!(
+        !l2.bar.vis_buf_blit_read.contains(&q_buf_ptr),
+        "0-draw EndQuery fill must consume vis_buf_blit_read"
+    );
+    assert!(
+        stats::c::enc_barrier.load(Relaxed) > eb_before,
+        "0-draw EndQuery fill in the same compute encoder as ResolveQueryData must emit an intra-encoder Blit -> Blit barrier"
+    );
+
+    // Resolve slot 1 again into dst_rb2[1] -> must read 0 while dst_rb2[0] retains 16.
+    l2.resolve_occlusion(&qh, 1, 1, &dst_rb2, 8).unwrap();
+    l2.close().unwrap();
+
+    q.submit(&[&l2.cb]);
+    q.wait_idle();
+    alloc.reset();
+
+    let got2: [u64; 2] = unsafe {
+        let p = dst_rb2.buffer().unwrap().contents().as_ptr() as *const u64;
+        [*p.add(0), *p.add(1)]
+    };
+    assert_eq!(
+        got2,
+        [16, 0],
+        "first resolve must observe 16 before 0-draw fill and second resolve must observe 0, got {got2:?}"
+    );
 }
