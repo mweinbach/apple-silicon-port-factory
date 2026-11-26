@@ -75,6 +75,11 @@ pub(super) fn enabled() -> bool {
 }
 
 #[allow(dead_code)]
+pub(super) fn plaincall_enabled() -> bool {
+    false
+}
+
+#[allow(dead_code)]
 pub(super) fn inline_host_fn_kind(_t: u64) -> Option<(usize, bool, bool)> {
     None
 }

@@ -259,17 +259,24 @@ pub fn note_code_region(lo: usize, hi: usize) {
         // Merge with an existing region if overlapping or close (V8 commits code pages
         // piecewise inside one reservation).
         const SLACK: usize = 16 << 20;
+        let mut grew = false;
         let mut merged = false;
         for r in &JIT_REGIONS[..n.min(MAX_JIT_REGIONS)] {
             let (a, b) = (r.lo.load(Ordering::Relaxed), r.hi.load(Ordering::Relaxed));
             if lo <= b.saturating_add(SLACK) && hi.saturating_add(SLACK) >= a {
-                r.lo.store(a.min(lo), Ordering::Relaxed);
-                r.hi.store(b.max(hi), Ordering::Relaxed);
+                let nlo = a.min(lo);
+                let nhi = b.max(hi);
+                if nlo != a || nhi != b {
+                    r.lo.store(nlo, Ordering::Relaxed);
+                    r.hi.store(nhi, Ordering::Relaxed);
+                    grew = true;
+                }
                 merged = true;
                 break;
             }
         }
         if !merged {
+            grew = true;
             if n < MAX_JIT_REGIONS {
                 JIT_REGIONS[n].lo.store(lo, Ordering::Relaxed);
                 JIT_REGIONS[n].hi.store(hi, Ordering::Relaxed);
@@ -279,6 +286,12 @@ pub fn note_code_region(lo: usize, hi: usize) {
                 let last = &JIT_REGIONS[MAX_JIT_REGIONS - 1];
                 last.lo.store(last.lo.load(Ordering::Relaxed).min(lo), Ordering::Relaxed);
                 last.hi.store(last.hi.load(Ordering::Relaxed).max(hi), Ordering::Relaxed);
+            }
+        }
+        if grew {
+            let g = JIT_REGIONS_GEN.fetch_add(1, Ordering::Release).wrapping_add(1);
+            if g == 0 {
+                JIT_REGIONS_GEN.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -319,6 +332,19 @@ pub(super) fn jit_overlaps(lo: usize, hi: usize) -> bool {
         return false;
     }
     jit_overlaps_slow(lo, hi)
+}
+
+/// Monotonic counter bumped whenever a new guest JIT/SMC region is added or expanded.
+/// Used by per-thread translation caches to flush inline caches and direct links that may
+/// have targeted an address before it became dynamic/self-modifying code.
+static JIT_REGIONS_GEN: AtomicU32 = AtomicU32::new(1);
+
+/// Current tracked-JIT-regions generation (never 0).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[inline(always)]
+pub(super) fn jit_regions_gen() -> u32 {
+    let g = JIT_REGIONS_GEN.load(Ordering::Acquire);
+    if g == 0 { 1 } else { g }
 }
 
 /// Current executable-memory generation (never 0).

@@ -3,7 +3,7 @@
 mod opcode_encodings;
 mod x87_tests;
 
-use super::cache::{jslot, MAX_LSE2_REGIONS, NOJIT};
+use super::cache::{jset_base, MAX_LSE2_REGIONS, NOJIT};
 use super::*;
 use crate::emu::exec_mem::{
     bind_static_aot_module, jit_writable, register_static_aot_desc, register_static_aot_module,
@@ -92,7 +92,7 @@ fn static_only_negative_cache_and_rebind_invalidation() {
         // Host-callable entry caches code != 0 with fast == 0.
         assert_eq!(jc.lookup(host_ip, &mut *bc), Some(0x7_0000_0200));
         assert_eq!(test_static_lookups(), 2);
-        let h_ent = jc.index[jslot(host_ip)];
+        let h_ent = jc.index[jset_base(host_ip)];
         assert_eq!(h_ent.ip, host_ip);
         assert_eq!(h_ent.code, 0x7_0000_0200);
         assert_eq!(h_ent.fast, 0);
@@ -100,7 +100,7 @@ fn static_only_negative_cache_and_rebind_invalidation() {
         // Miss populates a NOJIT negative entry; repeated lookups MUST NOT re-query registry.
         assert_eq!(jc.lookup(miss_ip, &mut *bc), None);
         assert_eq!(test_static_lookups(), 3);
-        let neg = jc.index[jslot(miss_ip)];
+        let neg = jc.index[jset_base(miss_ip)];
         assert_eq!(neg.ip, miss_ip);
         assert_eq!(neg.code, 0);
         assert_eq!(neg.fast, 0);
@@ -303,6 +303,10 @@ fn sys_state_arm64_emitter_encodes_all_ops_with_zero_relocs() {
         clear_ymm_hi: 0x1800,
         rdtsc_slow: 0x1900,
         rdtscp_slow: 0x1a00,
+        lookup_rip_ic: 0x1104,
+        lookup_jmp_ic: 0x1204,
+        lookup_call_ic: 0x1304,
+        ras_miss_ic: 0x1504,
     };
 
     for disable_mask in [0u8, HostFeatures::AFP] {
@@ -382,4 +386,148 @@ fn sys_state_arm64_emitter_encodes_all_ops_with_zero_relocs() {
             assert_eq!(count, 22);
         });
     }
+}
+
+#[test]
+fn indirect_branch_ic_emitter_encodes_zero_relocs_and_uses_ic_table() {
+    use super::cache::{new_tr, Prep, StubAddrs, TrScratch};
+    use super::emit::Asm;
+    use super::lazy::Edges;
+    use super::stubs::{emit_stubs_cfg, StubCfg};
+    use crate::emu::fast::{lower, FastOp};
+    use crate::emu::BLK_MAX_INSNS;
+    use iced_x86::code_asm::*;
+    use iced_x86::{Decoder, DecoderOptions};
+
+    // 1. Verify shared stub table invariants for IC entry points.
+    for ras in [false, true] {
+        let mut sbuf = vec![0u32; AOT_STUBS_BYTES / 4];
+        let mut sa = Asm::new(sbuf.as_mut_ptr(), 0x1000, sbuf.len());
+        let mut cfg = StubCfg::live(ras);
+        cfg.static_pic = false;
+        let (st, _) = emit_stubs_cfg(&mut sa, cfg);
+        assert!(!sa.overflow, "stubs overflowed AOT_STUBS_BYTES with ras={ras}");
+        assert_eq!(st.lookup_rip_ic, st.lookup_rip + 1);
+        assert_eq!(st.lookup_jmp_ic, st.lookup_jmp + 1);
+        assert_eq!(st.lookup_call_ic, st.lookup_call + 1);
+        if ras {
+            assert_eq!(st.ras_miss_ic, st.ras_miss.map(|p| p + 1));
+        } else {
+            assert_eq!(st.ras_miss_ic, None);
+        }
+        // First word of each non-IC entry must be `movz x4, #0` (`0xD280_0004`).
+        assert_eq!(sbuf[st.lookup_rip], 0xD280_0004);
+        assert_eq!(sbuf[st.lookup_jmp], 0xD280_0004);
+        assert_eq!(sbuf[st.lookup_call], 0xD280_0004);
+        if let Some(rm) = st.ras_miss {
+            assert_eq!(sbuf[rm], 0xD280_0004);
+        }
+    }
+
+    // 2. Verify in-block IC codegen for CallR, CallM, JmpR, JmpM, Ret (RAS on & off, IC on & off).
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.call(rax).unwrap();
+    a.call(qword_ptr(rcx)).unwrap();
+    a.jmp(rax).unwrap();
+    a.jmp(qword_ptr(rcx)).unwrap();
+    a.ret().unwrap();
+    let bytes = a.assemble(0x1_0000_0000).unwrap();
+
+    let stubs_ras = StubAddrs {
+        exit: 0x1000,
+        lookup_rip: 0x1100,
+        lookup_jmp: 0x1200,
+        lookup_call: 0x1300,
+        lookup_rip_ic: 0x1104,
+        lookup_jmp_ic: 0x1204,
+        lookup_call_ic: 0x1304,
+        host_xfer: 0x1400,
+        ras_miss: 0x1500,
+        ras_miss_ic: 0x1504,
+        spill_xmm: 0x1600,
+        reload_xmm: 0x1700,
+        clear_ymm_hi: 0x1800,
+        rdtsc_slow: 0x1900,
+        rdtscp_slow: 0x1a00,
+    };
+    let stubs_noras = StubAddrs { ras_miss: 0, ras_miss_ic: 0, ..stubs_ras };
+
+    let want_ldr_ic_xa = 0xF940_0000 | ((OFF_IC_TABLE / 8) << 10) | (XCPU << 5) | XA;
+    let want_ldr_ic_t4 = 0xF940_0000 | ((OFF_IC_TABLE / 8) << 10) | (XCPU << 5) | T4;
+    let want_blr_x2 = 0xD63F_0000 | (T2 << 5);
+    let want_br_x2 = 0xD61F_0000 | (T2 << 5);
+
+    for (ic_on, ras_on) in [(true, true), (true, false), (false, true), (false, false)] {
+        test_set_knobs(TestKnobs { ic: Some(ic_on), ras: Some(ras_on), ..TestKnobs::NONE });
+        let stubs = if ras_on { &stubs_ras } else { &stubs_noras };
+        let mut scratch = TrScratch::new();
+        let mut dec = Decoder::with_ip(64, &bytes, 0x1_0000_0000, DecoderOptions::NONE);
+        let mut idx = 0usize;
+        while dec.can_decode() {
+            let ins = dec.decode();
+            let op = lower(&ins);
+            let term = match idx {
+                0 => Term::CallR,
+                1 => Term::CallM,
+                2 => Term::JmpR,
+                3 => Term::JmpM,
+                _ => Term::Ret,
+            };
+            let mut prep = Prep {
+                ops: [FastOp::default(); BLK_MAX_INSNS],
+                k: 1,
+                host: false,
+                wr: [0; BLK_MAX_INSNS],
+                term,
+                target_host: false,
+                lazy: false,
+                edge: Edges { live: [0; 2], kill: [0; 2] },
+                live_out: 0,
+            };
+            prep.ops[0] = op;
+            let mut buf = vec![0u32; 512];
+            let asm = Asm::new(buf.as_mut_ptr(), 0x2000, buf.len());
+            let mut tr = new_tr(asm, &prep.ops[..1], &prep, stubs, true, &mut scratch);
+            let main = tr.translate(term, 0);
+            assert!(!tr.a.overflow, "overflow translating `{ins}` (ic={ic_on}, ras={ras_on})");
+            assert!(
+                tr.relocs.is_empty(),
+                "`{ins}` emitted runtime relocs ({:?}), breaking shifted-base AOT / static Mach-O",
+                tr.relocs
+            );
+            let hot = &buf[..main];
+            let cold = &buf[main..tr.cold_code_end];
+            if ic_on {
+                match term {
+                    Term::CallR | Term::CallM => {
+                        assert!(hot.contains(&want_ldr_ic_xa), "{ins}: hot path must load OFF_IC_TABLE");
+                        let want_br = if ras_on { want_blr_x2 } else { want_br_x2 };
+                        assert!(hot.contains(&want_br), "{ins}: hot path must emit per-site blr/br x2");
+                        assert!(!cold.is_empty(), "{ins}: IC way-1/miss tail must live in cold section");
+                    }
+                    Term::JmpR | Term::JmpM => {
+                        assert!(hot.contains(&want_ldr_ic_xa), "{ins}: hot path must load OFF_IC_TABLE");
+                        assert!(hot.contains(&want_br_x2), "{ins}: hot path must emit per-site br x2");
+                        assert!(!cold.is_empty(), "{ins}: IC way-1/miss tail must live in cold section");
+                    }
+                    Term::Ret if ras_on => {
+                        assert!(!hot.contains(&want_ldr_ic_xa), "RAS ret hot path must stay IC-load-free");
+                        assert!(cold.contains(&want_ldr_ic_t4), "RAS ret cold miss must load OFF_IC_TABLE into x4");
+                    }
+                    Term::Ret => {
+                        assert!(hot.contains(&want_ldr_ic_xa), "non-RAS ret hot path must load OFF_IC_TABLE");
+                        assert!(hot.contains(&want_br_x2), "non-RAS ret hot path must emit per-site br x2");
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                assert!(!hot.contains(&want_ldr_ic_xa) && !cold.contains(&want_ldr_ic_t4),
+                    "PORT_JIT_IC=0 must not emit IC table loads for `{ins}`");
+            }
+            tr.return_scratch(&mut scratch);
+            idx += 1;
+        }
+        assert_eq!(idx, 5);
+    }
+    test_set_knobs(TestKnobs::NONE);
 }

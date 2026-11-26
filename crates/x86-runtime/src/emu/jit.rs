@@ -57,7 +57,7 @@ pub(super) use aot::{
 #[allow(unused_imports)]
 pub(super) use aot::{emit_static_stubs, test_emit_stubs_and_veneer_for_knobs};
 pub(super) use cache::{
-    inline_host_fn, inline_host_fn_kind, patch_lse2_unaligned, prep_block, register_lse2_region,
+    inline_host_fn, patch_lse2_unaligned, prep_block, register_lse2_region,
     unregister_lse2_region, JitCache, TrScratch, JMUL,
 };
 #[cfg(test)]
@@ -65,8 +65,6 @@ pub(super) use cache::{test_aot_installs, test_probe_hits};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use lazy::{flaglazy_enabled, Edges};
-#[cfg(test)]
-#[allow(unused_imports)]
 pub(super) use stubs::plaincall_enabled;
 pub(super) use translate::{supported, Term};
 #[cfg(test)]
@@ -169,6 +167,8 @@ pub(super) struct JitScratch {
     pub sys_helpers: usize,
     /// Pointer to this thread's `X87State::cw` field for inline `fldcw`/`fnstcw`/`fstcw`.
     pub x87_cw: usize,
+    /// Per-thread 2-way polymorphic indirect-branch inline cache (`IcSet[IC_SETS]`, 32 KiB).
+    pub ic_table: usize,
     /// Test-only: dynamic `DF_PLAIN` / pure-float-math / inline-QPC calls served directly in
     /// `lookup_call` / `lookup_jmp` from `table`.
     #[cfg(test)]
@@ -204,6 +204,7 @@ impl Default for JitScratch {
             entropy_fn: super::cpu::guest_entropy_raw as *const () as usize,
             sys_helpers: super::cpu::sys_helpers_ptr(),
             x87_cw: super::regfile_ext::x87_cw_ptr(),
+            ic_table: 0,
             #[cfg(test)]
             plain_call_hits: 0,
         }
@@ -462,6 +463,8 @@ pub(super) struct TestKnobs {
     pub lse2_trap: Option<bool>,
     /// `PORT_JIT_HW_RANGE` ([`hw_range_enabled`]).
     pub hw_range: Option<bool>,
+    /// `PORT_JIT_IC` ([`ic_enabled`]).
+    pub ic: Option<bool>,
 }
 
 #[cfg(test)]
@@ -484,6 +487,7 @@ impl TestKnobs {
         last_bits: None,
         lse2_trap: None,
         hw_range: None,
+        ic: None,
     };
 }
 
@@ -768,6 +772,30 @@ pub(super) fn hw_range_enabled() -> bool {
     }
 }
 
+/// `PORT_JIT_IC` (default 1): emit per-site 2-way polymorphic inline caches for indirect
+/// `call`/`jmp`/`ret` transfers backed by the per-thread RW `ic_table` (W^X & shifted-base
+/// relocation safe). `0` routes every indirect transfer directly through `lookup_*` / `ras_miss`.
+pub(super) fn ic_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_KNOBS.with(|c| c.get().ic) {
+        return v;
+    }
+    #[cfg(test)]
+    {
+        if let Ok(s) = std::env::var("PORT_JIT_IC") {
+            if let Ok(v) = s.trim().parse::<u32>() {
+                return v != 0;
+            }
+        }
+        return true;
+    }
+    #[cfg(not(test))]
+    {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| env_knob("PORT_JIT_IC", 1) != 0)
+    }
+}
+
 #[cfg(test)]
 fn test_budget_cap(b: i64) -> i64 {
     TEST_KNOBS.with(|c| c.get().budget_cap).map_or(b, |cap| b.min(cap))
@@ -825,6 +853,7 @@ const OFF_JX: u32 = offset_of!(Cpu, jx) as u32;
 const OFF_BUDGET: u32 = OFF_JX + offset_of!(JitScratch, budget) as u32;
 const OFF_TARGET: u32 = OFF_JX + offset_of!(JitScratch, target) as u32;
 const OFF_TABLE: u32 = OFF_JX + offset_of!(JitScratch, table) as u32;
+const OFF_IC_TABLE: u32 = OFF_JX + offset_of!(JitScratch, ic_table) as u32;
 const OFF_CODEGEN: u32 = OFF_JX + offset_of!(JitScratch, codegen) as u32;
 const OFF_ATOMIC_LOCKS: u32 = OFF_JX + offset_of!(JitScratch, atomic_locks) as u32;
 const OFF_X87_STATE: u32 = OFF_JX + offset_of!(JitScratch, x87_state) as u32;
@@ -873,6 +902,8 @@ const _: () = assert!(
         && OFF_SYS_HELPERS < 8 * 4096
         && OFF_X87_CW % 8 == 0
         && OFF_X87_CW < 8 * 4096
+        && OFF_IC_TABLE % 8 == 0
+        && OFF_IC_TABLE < 8 * 4096
         && OFF_YMM_HI % 8 == 0
         && OFF_YMM_HI <= 504
 );
