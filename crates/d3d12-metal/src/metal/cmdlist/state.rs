@@ -856,7 +856,7 @@ impl CsBindCache {
         desc_gen: u64,
         root_gen: u64,
         heap0_base: u64,
-        tokens: &[u64],
+        tokens: &mut Vec<u64>,
         uav_exact: bool,
         full_read_exact: bool,
         bounded_read_exact: bool,
@@ -873,8 +873,7 @@ impl CsBindCache {
         self.desc_gen = desc_gen;
         self.root_gen = root_gen;
         self.heap0_base = heap0_base;
-        self.tokens.clear();
-        self.tokens.extend_from_slice(tokens);
+        std::mem::swap(&mut self.tokens, tokens);
         self.uav_exact = uav_exact;
         self.full_read_exact = full_read_exact;
         self.bounded_read_exact = bounded_read_exact;

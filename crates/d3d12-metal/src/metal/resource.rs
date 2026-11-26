@@ -96,6 +96,11 @@ pub fn push_subrange(spans: &mut Vec<SubRange>, mut s: SubRange) {
     while i < spans.len() {
         let e = spans[i];
         if e.r == s.r && e.lo <= s.hi && s.lo <= e.hi {
+            if e.lo <= s.lo && s.hi <= e.hi {
+                // Already fully covered by an existing disjoint span: keep hot
+                // entries in place and exit immediately.
+                return;
+            }
             s.lo = s.lo.min(e.lo);
             s.hi = s.hi.max(e.hi);
             spans.swap_remove(i);

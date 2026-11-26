@@ -113,11 +113,11 @@ pub struct Queue {
     commit_epoch: AtomicU64,
     has_deferred_signals: AtomicBool,
     deferred_signals: Mutex<Vec<DeferredFenceSig>>,
-    /// Buffered closed `MTL4CommandBuffer`s from adjacent `submit_d3d_lists` calls
-    /// coalesced into a single `MTL4CommandQueue::commit:count:` batch when ordering,
-    /// fence, and signal semantics allow.
+    /// Buffered closed `(MTL4CommandBuffer, alloc_key)` pairs from adjacent
+    /// `submit_d3d_lists` calls coalesced into a single `MTL4CommandQueue::commit:count:`
+    /// batch when ordering, fence, and signal semantics allow.
     has_pending_cbs: AtomicBool,
-    pending_cbs: Mutex<Vec<Retained<MtlCommandBuffer>>>,
+    pending_cbs: Mutex<Vec<(Retained<MtlCommandBuffer>, usize)>>,
 }
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
@@ -471,7 +471,7 @@ impl Queue {
         if cbs.len() <= STACK_CAP {
             let mut stack: [std::mem::MaybeUninit<&MtlCommandBuffer>; STACK_CAP] =
                 [const { std::mem::MaybeUninit::uninit() }; STACK_CAP];
-            for (dst, cb) in stack.iter_mut().zip(cbs.iter()) {
+            for (dst, (cb, _)) in stack.iter_mut().zip(cbs.iter()) {
                 dst.write(&**cb);
             }
             // SAFETY: the first `cbs.len()` slots were just initialized above, and `cbs`
@@ -481,7 +481,7 @@ impl Queue {
             };
             commit_cbs(&self.q, slice, self.kind);
         } else {
-            let refs: Vec<&MtlCommandBuffer> = cbs.iter().map(|cb| &**cb).collect();
+            let refs: Vec<&MtlCommandBuffer> = cbs.iter().map(|(cb, _)| &**cb).collect();
             commit_cbs(&self.q, &refs, self.kind);
         }
     }
@@ -501,7 +501,31 @@ impl Queue {
                 let _g = q.submit.lock().unwrap();
                 let found = {
                     let pc = q.pending_cbs.lock().unwrap();
-                    pc.iter().any(|c| Retained::as_ptr(c) as usize == target)
+                    pc.iter().any(|(c, _)| Retained::as_ptr(c) as usize == target)
+                };
+                if found {
+                    q.flush_pending_cbs_locked();
+                }
+            }
+        }
+    }
+
+    /// Flush buffered command buffers on whichever live queue holds a CB recorded
+    /// with `alloc_key` (or an unknown `0` alloc_key) before `CommandAllocator::reset()`
+    /// or `Drop`, avoiding spurious flushes when resetting an unrelated free allocator.
+    pub(crate) fn flush_if_alloc_pending(alloc_key: usize) {
+        if !has_pending_cbs() {
+            return;
+        }
+        let aq = active_queues().lock().unwrap();
+        for &p in aq.iter() {
+            // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+            let q = unsafe { &*(p as *const Queue) };
+            if q.has_pending_cbs.load(Ordering::Acquire) {
+                let _g = q.submit.lock().unwrap();
+                let found = {
+                    let pc = q.pending_cbs.lock().unwrap();
+                    pc.iter().any(|(_, ak)| *ak == 0 || *ak == alloc_key)
                 };
                 if found {
                     q.flush_pending_cbs_locked();
@@ -726,12 +750,12 @@ impl Queue {
                     self.commit_epoch.fetch_add(1, Ordering::AcqRel);
                     SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
                 } else if cbs.is_empty() {
-                    let refs: Vec<&MtlCommandBuffer> = pending.iter().map(|c| &**c).collect();
+                    let refs: Vec<&MtlCommandBuffer> = pending.iter().map(|(c, _)| &**c).collect();
                     commit_cbs(&self.q, &refs, self.kind);
                 } else {
                     let mut combined: Vec<&MtlCommandBuffer> =
                         Vec::with_capacity(pending.len() + cbs.len());
-                    combined.extend(pending.iter().map(|c| &**c));
+                    combined.extend(pending.iter().map(|(c, _)| &**c));
                     combined.extend_from_slice(cbs);
                     commit_cbs(&self.q, &combined, self.kind);
                     self.commit_epoch.fetch_add(1, Ordering::AcqRel);
@@ -759,12 +783,13 @@ impl Queue {
     /// or demand boundary (`signal`, non-elided `wait`, `flush_timeline`, `Present`,
     /// `wait_idle`, `submit`, CB reuse, `MAX_COALESCED_CBS`, or 8 pending `PassLog`s).
     pub fn submit_d3d_lists(&self, cbs: &[&MtlCommandBuffer], logs: Vec<super::passtiming::PassLog>) -> u64 {
-        self.submit_d3d_lists_inner(cbs, logs, false)
+        self.submit_d3d_lists_inner(cbs, None, logs, false)
     }
 
     fn submit_d3d_lists_inner(
         &self,
         cbs: &[&MtlCommandBuffer],
+        alloc_keys: Option<&[usize]>,
         logs: Vec<super::passtiming::PassLog>,
         eager_flush: bool,
     ) -> u64 {
@@ -791,7 +816,7 @@ impl Queue {
                             pc.len() + cbs.len() > MAX_COALESCED_CBS
                                 || cbs.iter().any(|&cb| {
                                     let ptr = cb as *const MtlCommandBuffer as usize;
-                                    pc.iter().any(|c| Retained::as_ptr(c) as usize == ptr)
+                                    pc.iter().any(|(c, _)| Retained::as_ptr(c) as usize == ptr)
                                 })
                         };
                         if need_flush {
@@ -802,8 +827,9 @@ impl Queue {
                         let mut pc = self.pending_cbs.lock().unwrap();
                         let had = !pc.is_empty();
                         pc.reserve(cbs.len());
-                        for &cb in cbs {
-                            pc.push(cb.retain());
+                        for (idx, &cb) in cbs.iter().enumerate() {
+                            let ak = alloc_keys.and_then(|ks| ks.get(idx).copied()).unwrap_or(0);
+                            pc.push((cb.retain(), ak));
                         }
                         self.has_pending_cbs.store(true, Ordering::Release);
                         (had, pc.len())
@@ -866,8 +892,10 @@ impl Queue {
         let mut wait_sampled: Option<u8> = None;
         let mut stack_cbs: [std::mem::MaybeUninit<&MtlCommandBuffer>; STACK_CAP] =
             [const { std::mem::MaybeUninit::uninit() }; STACK_CAP];
+        let mut stack_aks: [usize; STACK_CAP] = [0; STACK_CAP];
         let mut stack_len = 0usize;
         let mut heap_cbs: Vec<&MtlCommandBuffer> = Vec::new();
+        let mut heap_aks: Vec<usize> = Vec::new();
         let mut any_ml_work = false;
         let n_lists = lists.len();
         for (i, list) in lists.iter_mut().enumerate() {
@@ -894,13 +922,16 @@ impl Queue {
             }
             if list.has_commands() {
                 any_ml_work |= list.has_ml_work_recorded();
+                let ak = list.alloc_key();
                 let cb: &MtlCommandBuffer = &*list.cb;
                 if heap_cbs.is_empty() && stack_len < STACK_CAP {
                     stack_cbs[stack_len].write(cb);
+                    stack_aks[stack_len] = ak;
                     stack_len += 1;
                 } else {
                     if heap_cbs.is_empty() {
                         heap_cbs.reserve(n_lists);
+                        heap_aks.reserve(n_lists);
                         // SAFETY: `stack_cbs[..stack_len]` were initialized above.
                         let init = unsafe {
                             std::slice::from_raw_parts(
@@ -909,21 +940,29 @@ impl Queue {
                             )
                         };
                         heap_cbs.extend_from_slice(init);
+                        heap_aks.extend_from_slice(&stack_aks[..stack_len]);
                     }
                     heap_cbs.push(cb);
+                    heap_aks.push(ak);
                 }
             }
         }
-        let cbs: &[&MtlCommandBuffer] = if !heap_cbs.is_empty() {
-            &heap_cbs
+        let (cbs, aks): (&[&MtlCommandBuffer], &[usize]) = if !heap_cbs.is_empty() {
+            (&heap_cbs, &heap_aks)
         } else {
             // SAFETY: `stack_cbs[..stack_len]` were initialized above.
-            unsafe {
-                std::slice::from_raw_parts(stack_cbs.as_ptr() as *const &MtlCommandBuffer, stack_len)
-            }
+            (
+                unsafe {
+                    std::slice::from_raw_parts(
+                        stack_cbs.as_ptr() as *const &MtlCommandBuffer,
+                        stack_len,
+                    )
+                },
+                &stack_aks[..stack_len],
+            )
         };
         let submitted_cbs = cbs.len();
-        let timeline_value = self.submit_d3d_lists_inner(cbs, pass_logs, any_ml_work);
+        let timeline_value = self.submit_d3d_lists_inner(cbs, Some(aks), pass_logs, any_ml_work);
         ExecuteResult { submitted_cbs, timeline_value }
     }
 
@@ -1733,7 +1772,31 @@ mod tests {
         assert_eq!(TEST_COMMIT_CBS.load(Ordering::Relaxed) - cbs_sig0, 2);
         assert_eq!(unsafe { *(rb_sig.cpu_ptr().unwrap() as *const u32) }, 0xDEAD_BEEF);
 
-        // 6) A command list flagged with `has_ml_work` coalesces with prior buffered CBs
+        // 6) Resetting an unrelated free `CommandAllocator` MUST NOT flush `pending_cbs`,
+        //    whereas resetting the allocator backing a buffered CB MUST flush before `reset()`.
+        let a_free = CommandAllocator::new(ListType::Direct).unwrap();
+        let a_used = CommandAllocator::new(ListType::Direct).unwrap();
+        l6.begin(&a_used).unwrap();
+        l6.copy_buffer(&rb_sig, 0, &up0, 0, 16).unwrap();
+        l6.close().unwrap();
+        let calls_alloc0 = TEST_COMMIT_CALLS.load(Ordering::Relaxed);
+        let _ = q.execute_command_lists(&mut [&mut l6]);
+        assert!(q.has_pending_cbs.load(Ordering::Acquire));
+        a_free.reset();
+        assert!(
+            q.has_pending_cbs.load(Ordering::Acquire),
+            "resetting an unrelated allocator must preserve pending_cbs coalescing"
+        );
+        assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_alloc0, 0);
+        a_used.reset();
+        assert!(
+            !q.has_pending_cbs.load(Ordering::Acquire),
+            "resetting the backing allocator must flush pending_cbs first"
+        );
+        assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_alloc0, 1);
+        q.wait_idle();
+
+        // 7) A command list flagged with `has_ml_work` coalesces with prior buffered CBs
         //    and flushes eagerly inside `execute_command_lists` instead of staying buffered.
         l6.begin(&a8).unwrap();
         l6.copy_buffer(&rb_sig, 0, &up0, 0, 16).unwrap();

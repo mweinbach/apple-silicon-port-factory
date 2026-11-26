@@ -385,7 +385,7 @@ impl CommandList {
                                 desc_gen,
                                 root_gen,
                                 heap0_base,
-                                &tokens,
+                                &mut tokens,
                                 ue,
                                 fre,
                                 bre,

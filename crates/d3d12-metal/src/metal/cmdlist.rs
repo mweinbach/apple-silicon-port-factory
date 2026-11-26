@@ -112,7 +112,7 @@ impl CommandAllocator {
     /// `ID3D12CommandAllocator::Reset` (the app guarantees GPU completion).
     pub fn reset(&self) {
         if super::queue::has_pending_cbs() {
-            super::queue::Queue::flush_all_pending_cbs();
+            super::queue::Queue::flush_if_alloc_pending(Retained::as_ptr(&self.a) as usize);
         }
         self.a.reset();
         self.ring.lock().unwrap().reset();
@@ -125,7 +125,7 @@ impl CommandAllocator {
 impl Drop for CommandAllocator {
     fn drop(&mut self) {
         if super::queue::has_pending_cbs() {
-            super::queue::Queue::flush_all_pending_cbs();
+            super::queue::Queue::flush_if_alloc_pending(Retained::as_ptr(&self.a) as usize);
         }
     }
 }
@@ -158,6 +158,8 @@ pub struct CommandList {
     /// `preCommit` runs ANE evaluation (flush immediately on submit instead of
     /// deferring into `Present` / `cs::flush`).
     pub(super) has_ml_work: bool,
+    /// Raw pointer identity of the `MTL4CommandAllocator` backing the current/most-recent recording.
+    alloc_key: usize,
     enc: Encoder,
     ring: Option<Arc<Mutex<UploadRing>>>,
     table: Retained<MtlArgumentTable>,
@@ -214,6 +216,7 @@ impl CommandList {
             open: false,
             recorded: false,
             has_ml_work: false,
+            alloc_key: 0,
             enc: Encoder::None,
             ring: None,
             table: new_argument_table("aw2 command list")?,
@@ -271,6 +274,12 @@ impl CommandList {
         self.has_ml_work
     }
 
+    /// Raw pointer identity of the `MTL4CommandAllocator` used for the current/most-recent recording.
+    #[inline]
+    pub(super) fn alloc_key(&self) -> usize {
+        self.alloc_key
+    }
+
     /// `Reset(allocator, pso)` / creation: begin recording (all list state
     /// is reset, D3D12 semantics).
     pub fn begin(&mut self, alloc: &CommandAllocator) -> Result<(), String> {
@@ -290,6 +299,7 @@ impl CommandList {
         self.open = true;
         self.recorded = true;
         self.has_ml_work = false;
+        self.alloc_key = Retained::as_ptr(&alloc.a) as usize;
         let list_tight = self.list_barrier_tight_active();
         self.bar.reset_for_begin(list_tight);
         self.ib.ib_obl.clear();
