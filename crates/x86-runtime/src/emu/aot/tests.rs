@@ -3229,3 +3229,60 @@ fn runtime_callback_replay_triggers_bg_rebuild() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A large `.pdata` function whose intra-function CFG extends past `DEFAULT_AOT_CLOSURE`
+/// (128 hops) must still admit direct calls and tail-jumps to `.pdata`-less leaf helpers.
+#[test]
+fn aot_deep_pdata_function_discovers_leaf_callees_past_default_depth() {
+    use iced_x86::code_asm::*;
+
+    let mut pe = TestMappedBuf::alloc(0x8000, 0x2_3F10_0000);
+    let base = pe.base();
+    let base64 = base as u64;
+    let buf = pe.as_slice_mut();
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+
+    // .text @ 0x1000..0x5000, .rdata @ 0x5000..0x7000, .pdata @ 0x6000 (1 entry = 12 bytes)
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x4000, 0x5000, 0x2000, None, Some((0x6000, 12)));
+
+    // 140-hop chain (> DEFAULT_AOT_CLOSURE = 128) ending in call 0x4000; jmp 0x4100.
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut exit_lbl = a.create_label();
+    for i in 0..140 {
+        a.cmp(ecx, i as i32).unwrap();
+        a.je(exit_lbl).unwrap();
+    }
+    a.call(base64 + 0x4000).unwrap();
+    a.jmp(base64 + 0x4100).unwrap();
+    a.set_label(&mut exit_lbl).unwrap();
+    a.xor(eax, eax).unwrap();
+    a.ret().unwrap();
+    let fn0 = a.assemble(base64 + 0x1000).unwrap();
+    assert!(0x1000 + fn0.len() < 0x3F00);
+    buf[0x1000..0x1000 + fn0.len()].copy_from_slice(&fn0);
+
+    // .pdata entry covering only [0x1000, 0x1000 + fn0.len())
+    w32(buf, 0x6000, 0x1000);
+    w32(buf, 0x6004, 0x1000 + fn0.len() as u32);
+    w32(buf, 0x6008, 0);
+
+    // Two `.pdata`-less leaf helpers at 0x4000 (direct call) and 0x4100 (tail jump).
+    buf[0x4000..0x4006].copy_from_slice(&[0xB8, 0x11, 0, 0, 0, 0xC3]);
+    buf[0x4100..0x4106].copy_from_slice(&[0xB8, 0x22, 0, 0, 0, 0xC3]);
+
+    let mut bc = Box::new(BlockCache::new());
+    let (ips, closure) = unsafe { discover(&mut *bc, base, pe.len, &[0x1000], DEFAULT_AOT_CLOSURE) };
+    assert!(
+        ips.contains(&(base64 + 0x4000)),
+        "deep .pdata function (>128 hops) must discover direct-called .pdata-less leaf"
+    );
+    assert!(
+        ips.contains(&(base64 + 0x4100)),
+        "deep .pdata function (>128 hops) must discover tail-jumped .pdata-less leaf"
+    );
+    assert!(
+        closure.leaf_callees >= 2,
+        "expected >=2 leaf callees, got {}",
+        closure.leaf_callees
+    );
+}

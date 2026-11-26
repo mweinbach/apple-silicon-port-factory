@@ -448,32 +448,6 @@ fn try_parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> anyhow::Resul
     Ok(a)
 }
 
-/// Fast header-only peek of a PE32+ file's `(image_base, page_aligned_size_of_image, is_dll)`.
-fn peek_pe_preferred_window(path: &std::path::Path) -> Option<(usize, usize, bool)> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = [0u8; 4096];
-    let n = f.read(&mut buf).ok()?;
-    if n < 0x40 || &buf[0..2] != b"MZ" {
-        return None;
-    }
-    let lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().ok()?) as usize;
-    if lfanew.checked_add(24 + 64)? > n || &buf[lfanew..lfanew + 4] != b"PE\0\0" {
-        return None;
-    }
-    let characteristics = u16::from_le_bytes(buf[lfanew + 22..lfanew + 24].try_into().ok()?);
-    let is_dll = (characteristics & 0x2000) != 0;
-    let opt = lfanew + 24;
-    let magic = u16::from_le_bytes(buf[opt..opt + 2].try_into().ok()?);
-    if magic != 0x20B {
-        return None;
-    }
-    let image_base = u64::from_le_bytes(buf[opt + 24..opt + 32].try_into().ok()?) as usize;
-    let size_of_image = u32::from_le_bytes(buf[opt + 56..opt + 60].try_into().ok()?) as usize;
-    let aligned_size = (size_of_image + loader::PAGE - 1) & !(loader::PAGE - 1);
-    (image_base != 0 && aligned_size != 0).then_some((image_base, aligned_size, is_dll))
-}
-
 /// Rosetta only advertises AVX/AVX2/FMA/BMI in CPUID when this variable is
 /// set at process start, so re-exec ourselves with it. Also probes the target
 /// EXE's preferred base window `(probe_base, probe_size)` when deterministic
@@ -1350,7 +1324,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             .pe_path
             .clone()
             .unwrap_or_else(|| args.game_dir.join(&args.exe));
-        let pe_win = peek_pe_preferred_window(&probe_pe_path);
+        let pe_win = loader::peek_pe_preferred_window(&probe_pe_path);
         let probe_window = match pe_win {
             Some((pe_base, pe_size, false)) => {
                 let aot_base = x86_runtime::emu::exec_mem::static_aot_preferred_base(&norm)
@@ -1697,6 +1671,13 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             log::info!(
                 "prewarm: mapped {} bundled plugin(s) without running TLS/DllMain",
                 bundled.len()
+            );
+        }
+    } else if !args.no_run && !args.list_exports && !args.ops_report && !args.diff_test {
+        let reserved = l.reserve_bundled_plugin_aot_slots(&exe_host, manifest.as_ref());
+        if reserved > 0 {
+            log::info!(
+                "loader: reserved {reserved} cached AOT virtual address slot(s) for bundled plugins"
             );
         }
     }
