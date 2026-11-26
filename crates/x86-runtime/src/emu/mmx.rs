@@ -204,10 +204,12 @@ pub(super) unsafe fn execute(cpu: &mut Cpu, ins: &Instruction) -> bool {
         if let Some(value) = value {
             let reg = &mut st.regs[slot(dest)];
             reg[..8].copy_from_slice(&value.to_le_bytes());
-            reg[8..].fill(0xff);
+            reg[8..10].fill(0xff);
+            reg[10..16].fill(0);
         }
         st.valid_mask = 0xff;
         st.top = 0;
+        st.sync_top();
         super::regfile_ext::x87_restore(st);
     }
     true

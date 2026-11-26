@@ -40,6 +40,7 @@ mod simd_fp;
 mod simd_kernels;
 mod simd_mov;
 mod tsc;
+mod x87;
 mod xstate;
 #[cfg(target_arch = "aarch64")]
 mod jit;

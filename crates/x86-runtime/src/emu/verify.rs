@@ -1237,6 +1237,48 @@ fn compare_states(
     }
 }
 
+fn compare_x87_states(got: &super::x87::X87State, want: &super::x87::X87State) -> DiffResult {
+    if got.cw != want.cw {
+        return DiffResult::Critical("x87_cw", format!("got={:#06x} want={:#06x}", got.cw, want.cw));
+    }
+    if got.status_word() != want.status_word() {
+        return DiffResult::Critical(
+            "x87_sw",
+            format!("got={:#06x} want={:#06x}", got.status_word(), want.status_word()),
+        );
+    }
+    if got.top != want.top || got.valid_mask != want.valid_mask {
+        return DiffResult::Critical(
+            "x87_tag",
+            format!(
+                "top got={} want={}, valid got={:#04x} want={:#04x}",
+                got.top, want.top, got.valid_mask, want.valid_mask
+            ),
+        );
+    }
+    for p in 0..8usize {
+        if (want.valid_mask & (1 << p)) != 0 && got.regs[p][..10] != want.regs[p][..10] {
+            return DiffResult::Critical(
+                "x87_reg",
+                format!(
+                    "slot[{p}] got={:02x?} want={:02x?}",
+                    &got.regs[p][..10],
+                    &want.regs[p][..10]
+                ),
+            );
+        }
+    }
+    DiffResult::Match
+}
+
+fn merge_diff(a: DiffResult, b: DiffResult) -> DiffResult {
+    match (a, b) {
+        (c @ DiffResult::Critical(..), _) | (_, c @ DiffResult::Critical(..)) => c,
+        (DiffResult::NanPayloadOnly, _) | (_, DiffResult::NanPayloadOnly) => DiffResult::NanPayloadOnly,
+        _ => DiffResult::Match,
+    }
+}
+
 /// Normalize JIT/AOT `EXIT_CALL` (where `lookup_call` exited before pushing `fall` onto `rsp`)
 /// so its architectural post-state matches `step_generic_one`'s `Call` post-state.
 unsafe fn normalize_jit_exit(cpu: &mut Cpu, exit_code: u64, sb: &Sandbox) -> bool {
@@ -1399,6 +1441,13 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
         }
     }
     let _fpcr_restore = VerifyFpcrRestore(saved_host_fpcr);
+    struct VerifyX87Restore(super::x87::X87State);
+    impl Drop for VerifyX87Restore {
+        fn drop(&mut self) {
+            super::x87::x87_restore(self.0);
+        }
+    }
+    let _x87_restore = VerifyX87Restore(super::x87::x87_snapshot());
 
     let mut sb = Sandbox::new()?;
     let mut bc = Box::new(BlockCache::new());
@@ -1473,6 +1522,7 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
 
                 // 1) Generic iced-x86 interpreter reference run (also validates every memory access!)
                 super::apply_guest_mxcsr_hw(init_cpu.jx.mxcsr);
+                super::x87::x87_reset();
                 unsafe { sb.load_snapshot() };
                 let mut gen_cpu = clone_cpu(&init_cpu);
                 let mut ok = true;
@@ -1529,6 +1579,7 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                     continue;
                 }
                 let gen_mem = unsafe { sb.capture() };
+                let gen_x87 = super::x87::x87_snapshot();
                 block_ran_any = true;
                 rep.trials_executed += 1;
 
@@ -1581,18 +1632,23 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                 // 2) FastOp vs Generic
                 if cfg.check_fast {
                     super::apply_guest_mxcsr_hw(init_cpu.jx.mxcsr);
+                    super::x87::x87_reset();
                     unsafe { sb.load_snapshot() };
                     let mut fast_cpu = clone_cpu(&init_cpu);
                     unsafe { run_fast_ops(&mut fast_cpu, ops, jcc_pair_extra.as_ref().map(|x| x.0)) };
                     let fast_mem = unsafe { sb.capture() };
-                    let d = compare_states(
-                        &fast_cpu,
-                        &gen_cpu,
-                        &fast_mem,
-                        &gen_mem,
-                        FALL,
-                        has_approx,
-                        cfg.strict_nan_payload,
+                    let fast_x87 = super::x87::x87_snapshot();
+                    let d = merge_diff(
+                        compare_states(
+                            &fast_cpu,
+                            &gen_cpu,
+                            &fast_mem,
+                            &gen_mem,
+                            FALL,
+                            has_approx,
+                            cfg.strict_nan_payload,
+                        ),
+                        compare_x87_states(&fast_x87, &gen_x87),
                     );
                     let mut c = 0;
                     record_diff("fast", d, &mut c);
@@ -1611,6 +1667,7 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                 if let Some(code) = jit_code {
                     if !null_indirect_call && !taken_self_loop {
                         super::apply_guest_mxcsr_hw(init_cpu.jx.mxcsr);
+                        super::x87::x87_reset();
                         unsafe { sb.load_snapshot() };
                         let mut jcpu = clone_cpu(&init_cpu);
                         let run_res = unsafe { run_guarded(|| jit_cache.run_code_for_verify(&mut jcpu, bcp, None, code, 256)) };
@@ -1623,14 +1680,18 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                             Ok((ex, _)) => {
                                 if unsafe { normalize_jit_exit(&mut jcpu, ex, &sb) } {
                                     let jmem = unsafe { sb.capture() };
-                                    let d = compare_states(
-                                        &jcpu,
-                                        &gen_cpu,
-                                        &jmem,
-                                        &gen_mem,
-                                        jit_flag_mask,
-                                        has_approx,
-                                        cfg.strict_nan_payload,
+                                    let jx87 = super::x87::x87_snapshot();
+                                    let d = merge_diff(
+                                        compare_states(
+                                            &jcpu,
+                                            &gen_cpu,
+                                            &jmem,
+                                            &gen_mem,
+                                            jit_flag_mask,
+                                            has_approx,
+                                            cfg.strict_nan_payload,
+                                        ),
+                                        compare_x87_states(&jx87, &gen_x87),
                                     );
                                     let mut c = 0;
                                     record_diff("jit", d, &mut c);
@@ -1645,6 +1706,7 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                 if let Some((enter, code)) = aot_entry {
                     if !null_indirect_call {
                         super::apply_guest_mxcsr_hw(init_cpu.jx.mxcsr);
+                        super::x87::x87_reset();
                         unsafe { sb.load_snapshot() };
                         let mut acpu = clone_cpu(&init_cpu);
                         let run_res = unsafe { run_guarded(|| jit_cache.run_code_for_verify(&mut acpu, bcp, Some(enter), code, 256)) };
@@ -1657,14 +1719,18 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                             Ok((ex, _)) => {
                                 if unsafe { normalize_jit_exit(&mut acpu, ex, &sb) } {
                                     let amem = unsafe { sb.capture() };
-                                    let d = compare_states(
-                                        &acpu,
-                                        &gen_cpu,
-                                        &amem,
-                                        &gen_mem,
-                                        jit_flag_mask,
-                                        has_approx,
-                                        cfg.strict_nan_payload,
+                                    let ax87 = super::x87::x87_snapshot();
+                                    let d = merge_diff(
+                                        compare_states(
+                                            &acpu,
+                                            &gen_cpu,
+                                            &amem,
+                                            &gen_mem,
+                                            jit_flag_mask,
+                                            has_approx,
+                                            cfg.strict_nan_payload,
+                                        ),
+                                        compare_x87_states(&ax87, &gen_x87),
                                     );
                                     let mut c = 0;
                                     record_diff("aot", d, &mut c);
@@ -1698,6 +1764,7 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                     // Walk up to 6 linked blocks in Generic Interpreter FIRST to ensure the entire
                     // linked CFG trace exits the batch cleanly with zero unsafe memory accesses or loops.
                     super::apply_guest_mxcsr_hw(init_cpu.jx.mxcsr);
+                    super::x87::x87_reset();
                     unsafe { sb.load_snapshot() };
                     let mut gen_cpu = clone_cpu(&init_cpu);
                     let mut cur_ip = start_ip;
@@ -1792,7 +1859,9 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                         continue;
                     }
                     let gen_mem = unsafe { sb.capture() };
+                    let gen_x87 = super::x87::x87_snapshot();
                     super::apply_guest_mxcsr_hw(init_cpu.jx.mxcsr);
+                    super::x87::x87_reset();
                     unsafe { sb.load_snapshot() };
                     let mut acpu = clone_cpu(&init_cpu);
                     let run_res = unsafe { run_guarded(|| jit_cache.run_code_for_verify(&mut acpu, bcp, Some(enter), code, 1024)) };
@@ -1820,15 +1889,19 @@ fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryV
                         continue;
                     }
                     let amem = unsafe { sb.capture() };
+                    let ax87 = super::x87::x87_snapshot();
                     rep.linked_traces_tested += 1;
-                    match compare_states(
-                        &acpu,
-                        &gen_cpu,
-                        &amem,
-                        &gen_mem,
-                        last_flag_mask,
-                        trace_approx,
-                        cfg.strict_nan_payload,
+                    match merge_diff(
+                        compare_states(
+                            &acpu,
+                            &gen_cpu,
+                            &amem,
+                            &gen_mem,
+                            last_flag_mask,
+                            trace_approx,
+                            cfg.strict_nan_payload,
+                        ),
+                        compare_x87_states(&ax87, &gen_x87),
                     ) {
                         DiffResult::Match => {}
                         DiffResult::NanPayloadOnly => {

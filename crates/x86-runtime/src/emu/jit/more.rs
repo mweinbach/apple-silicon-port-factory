@@ -151,6 +151,7 @@ impl Tr<'_> {
     /// `Cpu::jx.mxcsr`, and update hardware `FPCR` (`RMode`, `FZ`, plus `FEAT_AFP` `AH`/`FIZ`
     /// when present) without clobbering `NZCV` or exiting to the interpreter.
     fn emit_ldmxcsr(&mut self, k: usize, op: &FastOp) {
+        self.flush_x87_top();
         self.load_op(k, T0, op, 32);
         // Reserved bits [31:16] must be zero; check flag-free via `lsr` + `cbnz`.
         self.a.lsr_i(false, T1, T0, 16);
@@ -263,6 +264,7 @@ impl Tr<'_> {
 
     /// Inline `xgetbv`: `#GP(0)` if `ecx != 0`; otherwise `eax = XCR0 (7)`, `edx = 0`.
     fn emit_xgetbv(&mut self, k: usize) {
+        self.flush_x87_top();
         let gp_fix = self.a.cbnz(false, g(1));
         self.sys_colds.push(SysCold {
             fix: gp_fix,
@@ -281,6 +283,7 @@ impl Tr<'_> {
 
     /// Native `FXSAVE*`/`FXRSTOR*`/`XSAVE*`/`XRSTOR*` via `Cpu::jx.sys_helpers.xstate`.
     fn emit_xstate(&mut self, k: usize, op: &FastOp) {
+        self.flush_x87_top();
         self.flush_flags(FALL);
         self.fs.host = 0;
         self.flush_lb();
@@ -335,6 +338,9 @@ impl Tr<'_> {
             self.a.cset(XS, NE);
             self.a.bfxil0(XBUD, XS, 1);
             self.ymm_clean = 0;
+            self.x87_top_known = None;
+            self.x87_top_dirty = false;
+            self.x87_sw_top_dirty = false;
         }
     }
 
