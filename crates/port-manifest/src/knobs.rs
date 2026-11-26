@@ -2095,6 +2095,15 @@ pub const KNOBS: &[KnobSpec] = &[
         crates: &["win32-rt"],
     },
     KnobSpec {
+        name: "PORT_FRAME_CSV",
+        aliases: &[],
+        kind: KnobType::Path,
+        default: "",
+        description: "Write per-frame Present timing CSV (frame, elapsed_ms, dt_ms, present_ms, sync, gpu_busy_ms) to this path.",
+        affects_aot_key: false,
+        crates: &["win32-rt"],
+    },
+    KnobSpec {
         name: "PORT_FULLSCREEN",
         aliases: &["AW2_FULLSCREEN"],
         kind: KnobType::Bool,
