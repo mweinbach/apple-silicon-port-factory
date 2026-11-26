@@ -820,3 +820,3091 @@ fn text_layout_alignments_nowrap_min_width_and_clusters() {
         release_com(fac);
     }
 }
+
+#[test]
+fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis() {
+    use super::analysis::{
+        gra_create_alpha_texture, gra_get_alpha_blend_params, gra_get_alpha_texture_bounds,
+        ta_get_gdi_compatible_glyph_placements, ta_get_glyph_placements, ta_get_glyphs,
+        PGlyphRunAnalysis, PTextAnalyzer,
+    };
+    use crate::user32::RECT;
+
+    // Mock IDWriteFontFileStream + IDWriteFontFileLoader + IDWriteFontFileEnumerator + IDWriteFontCollectionLoader
+    #[repr(C)]
+    struct MockStream {
+        vtbl: *const [usize; 7],
+        bytes: Vec<u8>,
+    }
+    unsafe extern "win64" fn ms_qi(_t: *mut MockStream, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn ms_addref(_t: *mut MockStream) -> u32 { 1 }
+    unsafe extern "win64" fn ms_release(t: *mut MockStream) -> u32 {
+        drop(Box::from_raw(t));
+        0
+    }
+    unsafe extern "win64" fn ms_read_frag(
+        t: *mut MockStream,
+        frag_start: *mut *const c_void,
+        off: u64,
+        size: u64,
+        frag_ctx: *mut *mut c_void,
+    ) -> HRESULT {
+        let s = &*t;
+        if (off + size) as usize > s.bytes.len() {
+            return E_INVALIDARG;
+        }
+        frag_start.write_unaligned(s.bytes.as_ptr().add(off as usize) as *const c_void);
+        frag_ctx.write_unaligned(std::ptr::null_mut());
+        S_OK
+    }
+    unsafe extern "win64" fn ms_rel_frag(_t: *mut MockStream, _ctx: *mut c_void) {}
+    unsafe extern "win64" fn ms_get_size(t: *mut MockStream, sz: *mut u64) -> HRESULT {
+        sz.write_unaligned((*t).bytes.len() as u64);
+        S_OK
+    }
+    unsafe extern "win64" fn ms_get_time(_t: *mut MockStream, tm: *mut u64) -> HRESULT {
+        tm.write_unaligned(0);
+        S_OK
+    }
+
+    #[repr(C)]
+    struct MockFileLoader {
+        vtbl: *const [usize; 4],
+        stream_vtbl: *const [usize; 7],
+        ttf: Vec<u8>,
+    }
+    unsafe extern "win64" fn mfl_qi(_t: *mut MockFileLoader, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn mfl_addref(_t: *mut MockFileLoader) -> u32 { 1 }
+    unsafe extern "win64" fn mfl_release(_t: *mut MockFileLoader) -> u32 { 1 }
+    unsafe extern "win64" fn mfl_create_stream(
+        t: *mut MockFileLoader,
+        _key: *const c_void,
+        _key_sz: u32,
+        out_stream: *mut *mut c_void,
+    ) -> HRESULT {
+        let l = &*t;
+        let st = Box::into_raw(Box::new(MockStream { vtbl: l.stream_vtbl, bytes: l.ttf.clone() }));
+        out_stream.write_unaligned(st as *mut c_void);
+        S_OK
+    }
+
+    #[repr(C)]
+    struct MockEnum {
+        vtbl: *const [usize; 5],
+        fac: PFactory,
+        file_loader: *mut c_void,
+        idx: usize,
+    }
+    unsafe extern "win64" fn me_qi(_t: *mut MockEnum, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn me_addref(_t: *mut MockEnum) -> u32 { 1 }
+    unsafe extern "win64" fn me_release(t: *mut MockEnum) -> u32 {
+        drop(Box::from_raw(t));
+        0
+    }
+    unsafe extern "win64" fn me_move_next(t: *mut MockEnum, has: *mut BOOL) -> HRESULT {
+        let e = &mut *t;
+        if e.idx == 0 {
+            e.idx = 1;
+            has.write_unaligned(TRUE);
+        } else {
+            has.write_unaligned(FALSE);
+        }
+        S_OK
+    }
+    unsafe extern "win64" fn me_get_cur(t: *mut MockEnum, out: *mut *mut c_void) -> HRESULT {
+        let e = &*t;
+        let key = 42u32;
+        fac_create_custom_font_file_reference(
+            e.fac,
+            &key as *const u32 as *const c_void,
+            4,
+            e.file_loader,
+            out,
+        )
+    }
+
+    #[repr(C)]
+    struct MockColLoader {
+        vtbl: *const [usize; 4],
+        enum_vtbl: *const [usize; 5],
+        file_loader: *mut c_void,
+    }
+    unsafe extern "win64" fn mcl_qi(_t: *mut MockColLoader, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn mcl_addref(_t: *mut MockColLoader) -> u32 { 1 }
+    unsafe extern "win64" fn mcl_release(_t: *mut MockColLoader) -> u32 { 1 }
+    unsafe extern "win64" fn mcl_create_enum(
+        t: *mut MockColLoader,
+        fac: *mut c_void,
+        _key: *const c_void,
+        _key_sz: u32,
+        out_enum: *mut *mut c_void,
+    ) -> HRESULT {
+        let l = &*t;
+        let en = Box::into_raw(Box::new(MockEnum {
+            vtbl: l.enum_vtbl,
+            fac: fac as PFactory,
+            file_loader: l.file_loader,
+            idx: 0,
+        }));
+        out_enum.write_unaligned(en as *mut c_void);
+        S_OK
+    }
+
+    // Mock IDWriteTextAnalysisSource + IDWriteTextAnalysisSink
+    #[repr(C)]
+    struct MockSource {
+        vtbl: *const [usize; 8],
+        text: Vec<u16>,
+    }
+    unsafe extern "win64" fn src_qi(_t: *mut MockSource, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn src_addref(_t: *mut MockSource) -> u32 { 1 }
+    unsafe extern "win64" fn src_release(_t: *mut MockSource) -> u32 { 1 }
+    unsafe extern "win64" fn src_get_at(t: *mut MockSource, pos: u32, ptr: *mut *const u16, len: *mut u32) -> HRESULT {
+        let s = &*t;
+        if pos as usize >= s.text.len() {
+            ptr.write_unaligned(std::ptr::null());
+            len.write_unaligned(0);
+        } else {
+            ptr.write_unaligned(s.text.as_ptr().add(pos as usize));
+            len.write_unaligned((s.text.len() - pos as usize) as u32);
+        }
+        S_OK
+    }
+    unsafe extern "win64" fn src_get_before(_t: *mut MockSource, _pos: u32, ptr: *mut *const u16, len: *mut u32) -> HRESULT {
+        ptr.write_unaligned(std::ptr::null());
+        len.write_unaligned(0);
+        S_OK
+    }
+    unsafe extern "win64" fn src_get_dir(_t: *mut MockSource) -> u32 { 0 }
+    unsafe extern "win64" fn src_get_loc(_t: *mut MockSource, _pos: u32, len: *mut u32, loc: *mut *const u16) -> HRESULT {
+        len.write_unaligned(0);
+        loc.write_unaligned(std::ptr::null());
+        S_OK
+    }
+    unsafe extern "win64" fn src_get_ns(_t: *mut MockSource, _pos: u32, len: *mut u32, ns: *mut *mut c_void) -> HRESULT {
+        len.write_unaligned(0);
+        ns.write_unaligned(std::ptr::null_mut());
+        S_OK
+    }
+
+    #[repr(C)]
+    struct MockSink {
+        vtbl: *const [usize; 7],
+        scripts: Vec<(u32, u32, u16)>,
+        bps: Vec<u8>,
+        bidis: Vec<(u32, u32, u8, u8)>,
+    }
+    unsafe extern "win64" fn snk_qi(_t: *mut MockSink, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn snk_addref(_t: *mut MockSink) -> u32 { 1 }
+    unsafe extern "win64" fn snk_release(_t: *mut MockSink) -> u32 { 1 }
+    unsafe extern "win64" fn snk_set_script(t: *mut MockSink, pos: u32, len: u32, sa: *const DWRITE_SCRIPT_ANALYSIS) -> HRESULT {
+        (*t).scripts.push((pos, len, (*sa).script));
+        S_OK
+    }
+    unsafe extern "win64" fn snk_set_bps(t: *mut MockSink, _pos: u32, len: u32, bps: *const DWRITE_LINE_BREAKPOINT) -> HRESULT {
+        for i in 0..len as usize {
+            (*t).bps.push(bps.add(i).read_unaligned().bits);
+        }
+        S_OK
+    }
+    unsafe extern "win64" fn snk_set_bidi(t: *mut MockSink, pos: u32, len: u32, exp: u8, res: u8) -> HRESULT {
+        (*t).bidis.push((pos, len, exp, res));
+        S_OK
+    }
+    unsafe extern "win64" fn snk_set_ns(_t: *mut MockSink, _pos: u32, _len: u32, _ns: *mut c_void) -> HRESULT {
+        S_OK
+    }
+
+    unsafe {
+        let stream_vtbl: [usize; 7] = [
+            ms_qi as *const () as usize,
+            ms_addref as *const () as usize,
+            ms_release as *const () as usize,
+            ms_read_frag as *const () as usize,
+            ms_rel_frag as *const () as usize,
+            ms_get_size as *const () as usize,
+            ms_get_time as *const () as usize,
+        ];
+        let fl_vtbl: [usize; 4] = [
+            mfl_qi as *const () as usize,
+            mfl_addref as *const () as usize,
+            mfl_release as *const () as usize,
+            mfl_create_stream as *const () as usize,
+        ];
+        let en_vtbl: [usize; 5] = [
+            me_qi as *const () as usize,
+            me_addref as *const () as usize,
+            me_release as *const () as usize,
+            me_move_next as *const () as usize,
+            me_get_cur as *const () as usize,
+        ];
+        let cl_vtbl: [usize; 4] = [
+            mcl_qi as *const () as usize,
+            mcl_addref as *const () as usize,
+            mcl_release as *const () as usize,
+            mcl_create_enum as *const () as usize,
+        ];
+        let src_vtbl: [usize; 8] = [
+            src_qi as *const () as usize,
+            src_addref as *const () as usize,
+            src_release as *const () as usize,
+            src_get_at as *const () as usize,
+            src_get_before as *const () as usize,
+            src_get_dir as *const () as usize,
+            src_get_loc as *const () as usize,
+            src_get_ns as *const () as usize,
+        ];
+        let snk_vtbl: [usize; 7] = [
+            snk_qi as *const () as usize,
+            snk_addref as *const () as usize,
+            snk_release as *const () as usize,
+            snk_set_script as *const () as usize,
+            snk_set_bps as *const () as usize,
+            snk_set_bidi as *const () as usize,
+            snk_set_ns as *const () as usize,
+        ];
+        crate::com::register_vtable_ptrs(&stream_vtbl);
+        crate::com::register_vtable_ptrs(&fl_vtbl);
+        crate::com::register_vtable_ptrs(&en_vtbl);
+        crate::com::register_vtable_ptrs(&cl_vtbl);
+        crate::com::register_vtable_ptrs(&src_vtbl);
+        crate::com::register_vtable_ptrs(&snk_vtbl);
+
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+
+        let ttf = build_synthetic_ttf();
+        let mut fl = MockFileLoader { vtbl: &fl_vtbl, stream_vtbl: &stream_vtbl, ttf };
+        assert_eq!(fac_register_font_file_loader(fac as PFactory, &mut fl as *mut _ as *mut c_void), S_OK);
+        assert_eq!(
+            fac_register_font_file_loader(fac as PFactory, &mut fl as *mut _ as *mut c_void),
+            DWRITE_E_ALREADYREGISTERED
+        );
+
+        // 1. CreateCustomFontFileReference -> Analyze -> CreateFontFace
+        let key = 0x1234u32;
+        let mut ffile: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_custom_font_file_reference(
+                fac as PFactory,
+                &key as *const u32 as *const c_void,
+                4,
+                &mut fl as *mut _ as *mut c_void,
+                &mut ffile,
+            ),
+            S_OK
+        );
+        let mut supported = FALSE;
+        let mut ftype = 0u32;
+        let mut face_type = 0u32;
+        let mut nfaces = 0u32;
+        assert_eq!(
+            ff_file_analyze(ffile as PFontFile, &mut supported, &mut ftype, &mut face_type, &mut nfaces),
+            S_OK
+        );
+        assert_eq!((supported, ftype, nfaces), (TRUE, DWRITE_FONT_FILE_TYPE_TRUETYPE, 1));
+
+        let mut face: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_font_face(
+                fac as PFactory,
+                DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                1,
+                &ffile,
+                0,
+                DWRITE_FONT_SIMULATIONS_NONE,
+                &mut face,
+            ),
+            S_OK
+        );
+        assert_eq!(face_get_glyph_count(face as PFontFace), 2);
+
+        // 1b. IDWriteFontFace::GetFiles must retain the custom backing file's loader & reference key.
+        let face_get_files_fn: unsafe extern "win64" fn(*mut c_void, *mut u32, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(face).add(4).read_unaligned());
+        let mut fcount = 0u32;
+        assert_eq!(face_get_files_fn(face, &mut fcount, std::ptr::null_mut()), S_OK);
+        assert_eq!(fcount, 1, "custom font face must report its backing font file");
+        let mut out_file: *mut c_void = std::ptr::null_mut();
+        assert_eq!(face_get_files_fn(face, &mut fcount, &mut out_file), S_OK);
+        assert_eq!(fcount, 1);
+        assert!(!out_file.is_null());
+        let ff_get_key: unsafe extern "win64" fn(*mut c_void, *mut *const c_void, *mut u32) -> HRESULT =
+            std::mem::transmute(vtbl_of(out_file).add(3).read_unaligned());
+        let ff_get_loader: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(out_file).add(4).read_unaligned());
+        let mut rk_ptr: *const c_void = std::ptr::null();
+        let mut rk_sz = 0u32;
+        assert_eq!(ff_get_key(out_file, &mut rk_ptr, &mut rk_sz), S_OK);
+        assert_eq!(rk_sz, 4);
+        assert_eq!(std::ptr::read_unaligned(rk_ptr as *const u32), key);
+        let mut got_loader: *mut c_void = std::ptr::null_mut();
+        assert_eq!(ff_get_loader(out_file, &mut got_loader), S_OK);
+        assert_eq!(got_loader, &mut fl as *mut _ as *mut c_void);
+        release_com(got_loader);
+        release_com(out_file);
+
+        // 2. CreateCustomFontCollection
+        let mut cl = MockColLoader {
+            vtbl: &cl_vtbl,
+            enum_vtbl: &en_vtbl,
+            file_loader: &mut fl as *mut _ as *mut c_void,
+        };
+        assert_eq!(fac_register_font_collection_loader(fac as PFactory, &mut cl as *mut _ as *mut c_void), S_OK);
+        let mut col: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_custom_font_collection(
+                fac as PFactory,
+                &mut cl as *mut _ as *mut c_void,
+                &key as *const u32 as *const c_void,
+                4,
+                &mut col,
+            ),
+            S_OK
+        );
+        let get_cnt: unsafe extern "win64" fn(*mut c_void) -> u32 =
+            std::mem::transmute(vtbl_of(col).add(3).read_unaligned());
+        assert_eq!(get_cnt(col), 1);
+
+        // 3. CreateTextAnalyzer: AnalyzeScript, AnalyzeBidi, AnalyzeLineBreakpoints, GetGlyphs, GetGlyphPlacements
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+        let text_u16: Vec<u16> = "A \u{05D0}".encode_utf16().collect(); // Latin 'A', space, Hebrew Alef
+        let mut src = MockSource { vtbl: &src_vtbl, text: text_u16.clone() };
+        let mut snk = MockSink { vtbl: &snk_vtbl, scripts: Vec::new(), bps: Vec::new(), bidis: Vec::new() };
+
+        let an_script: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(ta).add(3).read_unaligned());
+        let an_bidi: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(ta).add(4).read_unaligned());
+        let an_bp: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(ta).add(6).read_unaligned());
+        assert_eq!(an_script(ta, &mut src as *mut _ as *mut c_void, 0, text_u16.len() as u32, &mut snk as *mut _ as *mut c_void), S_OK);
+        assert_eq!(snk.scripts.len(), 2); // Latin run + Hebrew run
+        assert_eq!(an_bidi(ta, &mut src as *mut _ as *mut c_void, 0, text_u16.len() as u32, &mut snk as *mut _ as *mut c_void), S_OK);
+        assert!(snk.bidis.iter().any(|&(_, _, _, res)| res == 1)); // Hebrew resolved level 1
+        assert_eq!(an_bp(ta, &mut src as *mut _ as *mut c_void, 0, text_u16.len() as u32, &mut snk as *mut _ as *mut c_void), S_OK);
+        assert_eq!(snk.bps.len(), 3);
+        assert_ne!(snk.bps[1] & (1 << 4), 0); // space isWhitespace
+
+        let a_u16 = [b'A' as u16];
+        let mut cmap = [0u16; 1];
+        let mut tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 1];
+        let mut gids = [0u16; 1];
+        let mut gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 1];
+        let mut actual = 0u32;
+        assert_eq!(
+            ta_get_glyphs(
+                ta as PTextAnalyzer,
+                a_u16.as_ptr(),
+                1,
+                face,
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                1,
+                cmap.as_mut_ptr(),
+                tprops.as_mut_ptr(),
+                gids.as_mut_ptr(),
+                gprops.as_mut_ptr(),
+                &mut actual,
+            ),
+            S_OK
+        );
+        assert_eq!((actual, gids[0], cmap[0]), (1, 1, 0));
+
+        let mut adv = [0.0f32; 1];
+        let mut offs = [DWRITE_GLYPH_OFFSET::default(); 1];
+        assert_eq!(
+            ta_get_glyph_placements(
+                ta as PTextAnalyzer,
+                a_u16.as_ptr(),
+                cmap.as_ptr(),
+                tprops.as_ptr(),
+                1,
+                gids.as_ptr(),
+                gprops.as_ptr(),
+                1,
+                face,
+                20.0f32.to_bits(),
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                adv.as_mut_ptr(),
+                offs.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert!((adv[0] - 14.4).abs() < 1e-2, "expected 720*20/1000=14.4, got {}", adv[0]);
+
+        let mut gdi_adv = [0.0f32; 1];
+        assert_eq!(
+            ta_get_gdi_compatible_glyph_placements(
+                ta as PTextAnalyzer,
+                a_u16.as_ptr(),
+                cmap.as_ptr(),
+                tprops.as_ptr(),
+                1,
+                gids.as_ptr(),
+                gprops.as_ptr(),
+                1,
+                face,
+                20.0f32.to_bits(),
+                1.0f32.to_bits(),
+                std::ptr::null(),
+                FALSE,
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gdi_adv.as_mut_ptr(),
+                offs.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert_eq!(gdi_adv[0], 14.0);
+
+        // 3b. Exercise the actual COM vtable entry thunks (slots 7, 8, 9) using the real
+        //     guest-ABI path (16 u64 slots + Win64 incoming_rsp stack window for args 16..21).
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TEST_RSP_LO: AtomicU64 = AtomicU64::new(0);
+            static TEST_RSP_HI: AtomicU64 = AtomicU64::new(0);
+            fn test_incoming_rsp() -> (u64, u64) {
+                (TEST_RSP_LO.load(Ordering::Acquire), TEST_RSP_HI.load(Ordering::Acquire))
+            }
+            type Vtbl16Fn = unsafe extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64,
+                u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> HRESULT;
+
+            let call_vtbl_win64 = |slot: usize, args: &[u64]| -> HRESULT {
+                // Build a Win64 stack frame: [rsp+0x00..0x20] = shadow space,
+                // [rsp+0x20 + (i-4)*8] = arg i for i >= 4.
+                let mut stack = [0u64; 32]; // 0x100 bytes
+                for (i, &v) in args.iter().enumerate().skip(4) {
+                    stack[4 + (i - 4)] = v;
+                }
+                let lo = stack.as_ptr() as u64;
+                let hi = lo + (stack.len() * 8) as u64;
+                TEST_RSP_LO.store(lo, Ordering::Release);
+                TEST_RSP_HI.store(hi, Ordering::Release);
+                crate::set_incoming_rsp_reader(test_incoming_rsp);
+                let a = |i: usize| args.get(i).copied().unwrap_or(0);
+                let f: Vtbl16Fn = std::mem::transmute(vtbl_of(ta).add(slot).read_unaligned());
+                let hr = f(
+                    a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7),
+                    a(8), a(9), a(10), a(11), a(12), a(13), a(14), a(15),
+                );
+                TEST_RSP_LO.store(0, Ordering::Release);
+                TEST_RSP_HI.store(0, Ordering::Release);
+                hr
+            };
+
+            // Slot 7: GetGlyphs (18 args: glyphProps @ #16, actualGlyphCount @ #17)
+            let mut v_cmap = [0xFFFFu16; 1];
+            let mut v_tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 1];
+            let mut v_gids = [0u16; 1];
+            let mut v_gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 1];
+            let mut v_actual = 0u32;
+            assert_eq!(
+                call_vtbl_win64(
+                    7,
+                    &[
+                        ta as u64,
+                        a_u16.as_ptr() as u64,
+                        1,
+                        face as u64,
+                        FALSE as u64,
+                        FALSE as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1, // maxGlyphCount (#12)
+                        v_cmap.as_mut_ptr() as u64,
+                        v_tprops.as_mut_ptr() as u64,
+                        v_gids.as_mut_ptr() as u64,
+                        v_gprops.as_mut_ptr() as u64, // #16 -> [rsp+0x80]
+                        &mut v_actual as *mut u32 as u64, // #17 -> [rsp+0x88]
+                    ],
+                ),
+                S_OK
+            );
+            assert_eq!((v_actual, v_gids[0], v_cmap[0]), (1, 1, 0));
+            assert_ne!(v_gprops[0].bits, 0);
+
+            // Slot 8: GetGlyphPlacements (19 args: fontEmSize @ #9, glyphAdvances @ #17, glyphOffsets @ #18)
+            let mut v_adv = [0.0f32; 1];
+            let mut v_offs = [DWRITE_GLYPH_OFFSET { advanceOffset: 99.0, ascenderOffset: 99.0 }; 1];
+            assert_eq!(
+                call_vtbl_win64(
+                    8,
+                    &[
+                        ta as u64,
+                        a_u16.as_ptr() as u64,
+                        v_cmap.as_ptr() as u64,
+                        v_tprops.as_ptr() as u64,
+                        1,
+                        v_gids.as_ptr() as u64,
+                        v_gprops.as_ptr() as u64,
+                        1,
+                        face as u64,
+                        20.0f32.to_bits() as u64,
+                        FALSE as u64,
+                        FALSE as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0, // featureRanges (#16)
+                        v_adv.as_mut_ptr() as u64, // #17 -> [rsp+0x88]
+                        v_offs.as_mut_ptr() as u64, // #18 -> [rsp+0x90]
+                    ],
+                ),
+                S_OK
+            );
+            assert!((v_adv[0] - 14.4).abs() < 1e-2, "vtable GetGlyphPlacements adv={}", v_adv[0]);
+            assert_eq!((v_offs[0].advanceOffset, v_offs[0].ascenderOffset), (0.0, 0.0));
+
+            // Slot 9: GetGdiCompatibleGlyphPlacements (22 args: glyphAdvances @ #20, glyphOffsets @ #21)
+            let mut v_gdi_adv = [0.0f32; 1];
+            v_offs[0] = DWRITE_GLYPH_OFFSET { advanceOffset: 77.0, ascenderOffset: 77.0 };
+            assert_eq!(
+                call_vtbl_win64(
+                    9,
+                    &[
+                        ta as u64,
+                        a_u16.as_ptr() as u64,
+                        v_cmap.as_ptr() as u64,
+                        v_tprops.as_ptr() as u64,
+                        1,
+                        v_gids.as_ptr() as u64,
+                        v_gprops.as_ptr() as u64,
+                        1,
+                        face as u64,
+                        20.0f32.to_bits() as u64,
+                        1.0f32.to_bits() as u64,
+                        0,
+                        FALSE as u64,
+                        FALSE as u64,
+                        FALSE as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        v_gdi_adv.as_mut_ptr() as u64, // #20 -> [rsp+0xA0]
+                        v_offs.as_mut_ptr() as u64,    // #21 -> [rsp+0xA8]
+                    ],
+                ),
+                S_OK
+            );
+            assert_eq!(v_gdi_adv[0], 14.0);
+            assert_eq!((v_offs[0].advanceOffset, v_offs[0].ascenderOffset), (0.0, 0.0));
+        }
+
+        // 4. CreateGlyphRunAnalysis: GetAlphaTextureBounds + CreateAlphaTexture (1x1 & 3x1) + GetAlphaBlendParams
+        let run = DWRITE_GLYPH_RUN {
+            fontFace: face,
+            fontEmSize: 32.0,
+            glyphCount: 1,
+            glyphIndices: gids.as_ptr(),
+            glyphAdvances: adv.as_ptr(),
+            glyphOffsets: offs.as_ptr(),
+            isSideways: FALSE,
+            bidiLevel: 0,
+        };
+        let mut gra: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                32.0,
+                &mut gra,
+            ),
+            S_OK
+        );
+        let mut bounds = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut bounds), S_OK);
+        let w = (bounds.right - bounds.left) as usize;
+        let h = (bounds.bottom - bounds.top) as usize;
+        assert!(w >= 15 && h >= 15, "bounds={bounds:?}");
+
+        // ClearType/Default run has empty bounds and zero pixels when queried as ALIASED_1X1.
+        let mut empty_aliased = RECT { left: 1, top: 2, right: 3, bottom: 4 };
+        assert_eq!(gra_get_alpha_texture_bounds(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut empty_aliased), S_OK);
+        assert_eq!((empty_aliased.left, empty_aliased.top, empty_aliased.right, empty_aliased.bottom), (0, 0, 0, 0));
+        let mut mismatched_tex1 = vec![0xAAu8; w * h];
+        assert_eq!(
+            gra_create_alpha_texture(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &bounds, mismatched_tex1.as_mut_ptr(), mismatched_tex1.len() as u32),
+            S_OK
+        );
+        assert!(mismatched_tex1.iter().all(|&a| a == 0), "ClearType run must not emit pixels into ALIASED_1X1 texture");
+
+        let mut tex3 = vec![0u8; w * h * 3];
+        assert_eq!(
+            gra_create_alpha_texture(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &bounds, tex3.as_mut_ptr(), tex3.len() as u32),
+            S_OK
+        );
+        assert!(tex3.iter().filter(|&&a| a >= 200).count() >= 180);
+
+        // Aliased run reports nonempty ALIASED_1X1 bounds/binary pixels and empty CLEARTYPE_3X1 bounds/zeros.
+        let mut gra_aliased: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_ALIASED,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                32.0,
+                &mut gra_aliased,
+            ),
+            S_OK
+        );
+        let mut b_al = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_aliased as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_al), S_OK);
+        assert_eq!((b_al.left, b_al.top, b_al.right, b_al.bottom), (bounds.left, bounds.top, bounds.right, bounds.bottom));
+        let mut empty_ct = RECT { left: 1, top: 2, right: 3, bottom: 4 };
+        assert_eq!(gra_get_alpha_texture_bounds(gra_aliased as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut empty_ct), S_OK);
+        assert_eq!((empty_ct.left, empty_ct.top, empty_ct.right, empty_ct.bottom), (0, 0, 0, 0));
+        let mut tex1 = vec![0u8; w * h];
+        assert_eq!(
+            gra_create_alpha_texture(gra_aliased as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &b_al, tex1.as_mut_ptr(), tex1.len() as u32),
+            S_OK
+        );
+        assert!(tex1.iter().filter(|&&a| a == 255).count() >= 60);
+        assert!(tex1.iter().all(|&a| a == 0 || a == 255), "aliased 1x1 texture must be binary");
+        let mut mismatched_tex3 = vec![0xBBu8; w * h * 3];
+        assert_eq!(
+            gra_create_alpha_texture(gra_aliased as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &b_al, mismatched_tex3.as_mut_ptr(), mismatched_tex3.len() as u32),
+            S_OK
+        );
+        assert!(mismatched_tex3.iter().all(|&a| a == 0), "aliased run must not emit pixels into CLEARTYPE_3X1 texture");
+        release_com(gra_aliased);
+
+        // 4b. Non-uniform scale (m11=2, m22=1) and 90-degree rotation must transform glyph
+        //     coverage & bounds, not only glyph origins.
+        let wide_mat = DWRITE_MATRIX { m11: 2.0, m12: 0.0, m21: 0.0, m22: 1.0, dx: 0.0, dy: 0.0 };
+        let mut gra_wide: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run,
+                1.0,
+                &wide_mat,
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                32.0,
+                &mut gra_wide,
+            ),
+            S_OK
+        );
+        let mut b_wide = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_wide as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_wide), S_OK);
+        let w_wide = (b_wide.right - b_wide.left) as usize;
+        let h_wide = (b_wide.bottom - b_wide.top) as usize;
+        assert!(w_wide >= w * 2 - 4 && w_wide <= w * 2 + 4, "expected 2x width: base={w}, wide={w_wide}");
+        assert!((h_wide as i32 - h as i32).abs() <= 2, "expected unchanged height: base={h}, wide={h_wide}");
+        let mut tex_wide = vec![0u8; w_wide * h_wide * 3];
+        assert_eq!(
+            gra_create_alpha_texture(gra_wide as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &b_wide, tex_wide.as_mut_ptr(), tex_wide.len() as u32),
+            S_OK
+        );
+        let lit_base = tex3.iter().filter(|&&a| a >= 200).count();
+        let lit_wide = tex_wide.iter().filter(|&&a| a >= 200).count();
+        assert!(lit_wide >= lit_base * 3 / 2, "expected ~2x lit pixels under 2x X-scale: base={lit_base}, wide={lit_wide}");
+
+        // 90-degree CW rotation (m11=0, m12=1, m21=-1, m22=0) on a 2x-wide rectangle swaps aspect ratio.
+        let rot90_wide = DWRITE_MATRIX { m11: 0.0, m12: 2.0, m21: -1.0, m22: 0.0, dx: 0.0, dy: 0.0 };
+        let mut gra_rot: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run,
+                1.0,
+                &rot90_wide,
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                32.0,
+                &mut gra_rot,
+            ),
+            S_OK
+        );
+        let mut b_rot = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_rot as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_rot), S_OK);
+        let w_rot = (b_rot.right - b_rot.left) as usize;
+        let h_rot = (b_rot.bottom - b_rot.top) as usize;
+        assert!((w_rot as i32 - h_wide as i32).abs() <= 3, "rotated width {w_rot} should match unrotated height {h_wide}");
+        assert!((h_rot as i32 - w_wide as i32).abs() <= 3, "rotated height {h_rot} should match unrotated width {w_wide}");
+        release_com(gra_rot);
+        release_com(gra_wide);
+
+        // 4c. RTL glyph run (odd bidiLevel) must subtract each glyph's advance BEFORE placing
+        //     its left-origin outline, so a glyph with baseline_x=100 sits to the LEFT of 100.
+        let rtl_adv = [25.0f32];
+        let rtl_run = DWRITE_GLYPH_RUN {
+            fontFace: face,
+            fontEmSize: 32.0,
+            glyphCount: 1,
+            glyphIndices: gids.as_ptr(),
+            glyphAdvances: rtl_adv.as_ptr(),
+            glyphOffsets: offs.as_ptr(),
+            isSideways: FALSE,
+            bidiLevel: 1,
+        };
+        let mut gra_rtl: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &rtl_run,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                100.0,
+                32.0,
+                &mut gra_rtl,
+            ),
+            S_OK
+        );
+        let mut b_rtl = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_rtl as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_rtl), S_OK);
+        // LTR bounds at baseline_x=0 were [bounds.left..bounds.right]; RTL at 100 with adv=25
+        // places the glyph origin at 100 - 25 = 75, so bounds shift by +75 (strictly left of 100+bounds.left).
+        assert_eq!(b_rtl.left, bounds.left + 75, "RTL left bound: ltr={bounds:?}, rtl={b_rtl:?}");
+        assert_eq!(b_rtl.right, bounds.right + 75, "RTL right bound: ltr={bounds:?}, rtl={b_rtl:?}");
+        release_com(gra_rtl);
+
+        let mut rp: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_custom_rendering_params(fac as PFactory, 2.2, 0.75, 0.9, DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE_DEFAULT, &mut rp), S_OK);
+        let (mut g, mut ec, mut ct) = (0.0f32, 0.0f32, 0.0f32);
+        assert_eq!(gra_get_alpha_blend_params(gra as PGlyphRunAnalysis, rp, &mut g, &mut ec, &mut ct), S_OK);
+        assert_eq!((g, ec, ct), (2.2, 0.75, 0.9));
+
+        assert_eq!(fac_unregister_font_collection_loader(fac as PFactory, &mut cl as *mut _ as *mut c_void), S_OK);
+        assert_eq!(fac_unregister_font_file_loader(fac as PFactory, &mut fl as *mut _ as *mut c_void), S_OK);
+
+        release_com(rp);
+        release_com(gra);
+        release_com(ta);
+        release_com(col);
+        release_com(face);
+        release_com(ffile);
+        release_com(fac);
+    }
+}
+
+#[test]
+fn text_analyzer_shapes_complex_arabic_and_combining_marks_and_rejects_unshapeable_fallback() {
+    use super::analysis::{ta_get_glyph_placements, ta_get_glyphs, PTextAnalyzer};
+    use super::sfnt::FontMeta;
+    use std::collections::HashMap;
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &G_IDWRITE_FACTORY as *const _ as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // 1. Find a real system font with Arabic contextual shaping (e.g. Geeza Pro or Arial on macOS).
+        let sys = system_font_collection_data(false);
+        let arabic_meta = ["geeza pro", "arial", "damascus", "baghdad", "times new roman"]
+            .iter()
+            .find_map(|&fam_name| {
+                let idx = sys.find_family_index(fam_name)?;
+                sys.families[idx]
+                    .fonts
+                    .iter()
+                    .find(|m| m.file_path.is_some())
+                    .cloned()
+            });
+
+        if let Some(meta) = arabic_meta {
+            let face_inner = FontFaceInner::from_meta(meta, 0);
+            // Connected Arabic word "سلام" (Seen + Lam + Alef + Meem): contextual joining + Lam-Alef ligature.
+            let arabic_u16: Vec<u16> = "\u{0633}\u{0644}\u{0627}\u{0645}".encode_utf16().collect();
+            let raw_cmap_gids: Vec<u16> = [0x0633u32, 0x0644, 0x0627, 0x0645]
+                .iter()
+                .map(|&cp| face_inner.codepoint_to_glyph(cp))
+                .collect();
+            let face = new_font_face(face_inner);
+
+            let mut cmap = [0xFFFFu16; 4];
+            let mut tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 4];
+            let mut gids = [0u16; 16];
+            let mut gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 16];
+            let mut actual = 0u32;
+            let sa = DWRITE_SCRIPT_ANALYSIS { script: 1, shapes: 0 };
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    arabic_u16.as_ptr(),
+                    arabic_u16.len() as u32,
+                    face,
+                    FALSE,
+                    TRUE, // isRightToLeft
+                    &sa,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    gids.len() as u32,
+                    cmap.as_mut_ptr(),
+                    tprops.as_mut_ptr(),
+                    gids.as_mut_ptr(),
+                    gprops.as_mut_ptr(),
+                    &mut actual,
+                ),
+                S_OK
+            );
+            assert!(actual > 0 && actual <= 4, "expected shaped Arabic glyphs, got {actual}");
+            let shaped_slice = &gids[..actual as usize];
+            assert_ne!(
+                shaped_slice,
+                raw_cmap_gids.as_slice(),
+                "Arabic run must undergo contextual shaping rather than returning isolated cmap glyphs"
+            );
+            // Monotonic logical clusterMap covering all 4 UTF-16 code units.
+            for w in cmap.windows(2) {
+                assert!(w[0] <= w[1], "clusterMap must be monotonically non-decreasing: {cmap:?}");
+            }
+            assert!((cmap[3] as u32) < actual);
+            // If Lam+Alef formed a ligature (3 glyphs for 4 chars), indices 1 & 2 share one cluster.
+            if actual == 3 {
+                assert_eq!(cmap[1], cmap[2], "Lam+Alef ligature should share one cluster: {cmap:?}");
+            }
+            // Contextually joined Arabic characters must not be marked isShapedAlone (bit 0);
+            // cluster starts are represented in clusterMap and glyphProperties.isClusterStart (bit 4).
+            assert!(
+                tprops.iter().all(|tp| (tp.bits & 1) == 0),
+                "contextually shaped Arabic run must not set isShapedAlone: {tprops:?}"
+            );
+            assert_ne!(
+                gprops[0].bits & (1 << 4),
+                0,
+                "first glyph of shaped run must still set isClusterStart"
+            );
+
+            let mut adv = [0.0f32; 16];
+            let mut offs = [DWRITE_GLYPH_OFFSET::default(); 16];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    arabic_u16.as_ptr(),
+                    cmap.as_ptr(),
+                    tprops.as_ptr(),
+                    arabic_u16.len() as u32,
+                    gids.as_ptr(),
+                    gprops.as_ptr(),
+                    actual,
+                    face,
+                    24.0f32.to_bits(),
+                    FALSE,
+                    TRUE,
+                    &sa,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    offs.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            assert!(adv[..actual as usize].iter().any(|&a| a > 0.0));
+            release_com(face);
+        }
+
+        // 2. Combining mark ("e" + U+0301 combining acute) with a real Latin system font.
+        let latin_meta = ["arial", "helvetica", "times new roman"]
+            .iter()
+            .find_map(|&fam_name| {
+                let idx = sys.find_family_index(fam_name)?;
+                sys.families[idx]
+                    .fonts
+                    .iter()
+                    .find(|m| m.file_path.is_some())
+                    .cloned()
+            });
+        if let Some(meta) = latin_meta {
+            let face_inner = FontFaceInner::from_meta(meta, 0);
+            let face = new_font_face(face_inner);
+            let comb_u16: Vec<u16> = "e\u{0301}".encode_utf16().collect();
+            let mut cmap = [0xFFFFu16; 2];
+            let mut tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 2];
+            let mut gids = [0u16; 8];
+            let mut gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 8];
+            let mut actual = 0u32;
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    comb_u16.as_ptr(),
+                    comb_u16.len() as u32,
+                    face,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    gids.len() as u32,
+                    cmap.as_mut_ptr(),
+                    tprops.as_mut_ptr(),
+                    gids.as_mut_ptr(),
+                    gprops.as_mut_ptr(),
+                    &mut actual,
+                ),
+                S_OK
+            );
+            let mut adv = [0.0f32; 8];
+            let mut offs = [DWRITE_GLYPH_OFFSET::default(); 8];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    comb_u16.as_ptr(),
+                    cmap.as_ptr(),
+                    tprops.as_ptr(),
+                    comb_u16.len() as u32,
+                    gids.as_ptr(),
+                    gprops.as_ptr(),
+                    actual,
+                    face,
+                    24.0f32.to_bits(),
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    offs.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            // Either composed into 1 glyph (clusterMap=[0,0]) or 2 glyphs with zero-advance combining mark.
+            if actual == 1 {
+                assert_eq!(cmap, [0, 0]);
+                assert!(adv[0] > 0.0);
+            } else {
+                assert_eq!(actual, 2);
+                assert!(adv[0] > 0.0);
+                assert!(adv[1].abs() < 1e-3, "combining mark advance should be 0, got {}", adv[1]);
+            }
+            release_com(face);
+        }
+
+        // 3. Built-in fallback face (no backing SFNT bytes) must honestly return E_NOTIMPL for
+        //    complex Arabic runs rather than returning S_OK with isolated cmap glyphs.
+        let fallback_meta = Arc::new(FontMeta {
+            family_name: "FallbackOnly".to_string(),
+            face_name: "Regular".to_string(),
+            weight: DWRITE_FONT_WEIGHT_NORMAL,
+            stretch: DWRITE_FONT_STRETCH_NORMAL,
+            style: DWRITE_FONT_STYLE_NORMAL,
+            is_symbol: false,
+            is_monospace: false,
+            face_type: DWRITE_FONT_FACE_TYPE_TRUETYPE,
+            face_index: 0,
+            glyph_count: 256,
+            metrics: super::sfnt::default_fallback_metrics(),
+            info_strings: HashMap::new(),
+            file_path: None,
+            raw_bytes: None,
+            custom_file: None,
+        });
+        let fb_face = new_font_face(FontFaceInner::from_meta(fallback_meta, 0));
+        let arabic_u16: Vec<u16> = "\u{0633}\u{0644}\u{0627}\u{0645}".encode_utf16().collect();
+        let mut cmap = [0u16; 4];
+        let mut tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 4];
+        let mut gids = [0u16; 8];
+        let mut gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 8];
+        let mut actual = 99u32;
+        assert_eq!(
+            ta_get_glyphs(
+                ta as PTextAnalyzer,
+                arabic_u16.as_ptr(),
+                arabic_u16.len() as u32,
+                fb_face,
+                FALSE,
+                TRUE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gids.len() as u32,
+                cmap.as_mut_ptr(),
+                tprops.as_mut_ptr(),
+                gids.as_mut_ptr(),
+                gprops.as_mut_ptr(),
+                &mut actual,
+            ),
+            E_NOTIMPL
+        );
+        assert_eq!(actual, 0);
+        release_com(fb_face);
+
+        // 4. Bidi numeric resolution (UAX #9 I2): "אב12ג" in an RTL paragraph must resolve
+        //    to levels [1, 1, 2, 2, 1] rather than assigning digits the odd base level.
+        #[repr(C)]
+        struct RtlSource {
+            vtbl: *const [usize; 8],
+            text: Vec<u16>,
+        }
+        #[repr(C)]
+        struct BidiSink {
+            vtbl: *const [usize; 7],
+            bidis: Vec<(u32, u32, u8, u8)>,
+        }
+        unsafe extern "win64" fn rtl_get_text(this: *mut RtlSource, pos: u32, out_str: *mut *const u16, out_len: *mut u32) -> HRESULT {
+            let p = pos as usize;
+            if p >= (*this).text.len() {
+                out_str.write_unaligned(std::ptr::null());
+                out_len.write_unaligned(0);
+            } else {
+                out_str.write_unaligned((*this).text.as_ptr().add(p));
+                out_len.write_unaligned(((*this).text.len() - p) as u32);
+            }
+            S_OK
+        }
+        unsafe extern "win64" fn rtl_get_dir(_this: *mut RtlSource) -> u32 {
+            1 // DWRITE_READING_DIRECTION_RIGHT_TO_LEFT
+        }
+        unsafe extern "win64" fn bidi_set_level(this: *mut BidiSink, pos: u32, len: u32, expl: u8, res: u8) -> HRESULT {
+            (*this).bidis.push((pos, len, expl, res));
+            S_OK
+        }
+        let rtl_vtbl = [0, 0, 0, rtl_get_text as *const () as usize, 0, rtl_get_dir as *const () as usize, 0, 0];
+        let bidi_vtbl = [0, 0, 0, 0, 0, bidi_set_level as *const () as usize, 0];
+        let hebrew_digits: Vec<u16> = "\u{05D0}\u{05D1}12\u{05D2}".encode_utf16().collect();
+        let mut rsrc = RtlSource { vtbl: &rtl_vtbl, text: hebrew_digits.clone() };
+        let mut bsink = BidiSink { vtbl: &bidi_vtbl, bidis: Vec::new() };
+        let an_bidi: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute((*(ta as *const *const usize)).add(4).read_unaligned());
+        assert_eq!(
+            an_bidi(
+                ta,
+                &mut rsrc as *mut _ as *mut c_void,
+                0,
+                hebrew_digits.len() as u32,
+                &mut bsink as *mut _ as *mut c_void,
+            ),
+            S_OK
+        );
+        assert_eq!(bsink.bidis, vec![(0, 2, 1, 1), (2, 2, 1, 2), (4, 1, 1, 1)]);
+
+        // Devanagari ("אב कख ג") and Hangul ("אב 한글 ג") in RTL paragraphs must resolve to
+        // [1, 1, 1, 2, 2, 1, 1] -> runs (0, 3, 1, 1), (3, 2, 1, 2), (5, 2, 1, 1).
+        for sample in ["\u{05D0}\u{05D1} \u{0915}\u{0916} \u{05D2}", "\u{05D0}\u{05D1} \u{D55C}\u{AE00} \u{05D2}"] {
+            let u16s: Vec<u16> = sample.encode_utf16().collect();
+            rsrc.text = u16s.clone();
+            bsink.bidis.clear();
+            assert_eq!(
+                an_bidi(
+                    ta,
+                    &mut rsrc as *mut _ as *mut c_void,
+                    0,
+                    u16s.len() as u32,
+                    &mut bsink as *mut _ as *mut c_void,
+                ),
+                S_OK
+            );
+            assert_eq!(bsink.bidis, vec![(0, 3, 1, 1), (3, 2, 1, 2), (5, 2, 1, 1)], "sample={sample:?}");
+        }
+
+        // Explicit bidi controls (RLO, LRO, LRE, RLI, FSI, paragraph reset) in an LTR paragraph.
+        unsafe extern "win64" fn ltr_get_dir(_this: *mut RtlSource) -> u32 {
+            0 // DWRITE_READING_DIRECTION_LEFT_TO_RIGHT
+        }
+        let ltr_vtbl = [0, 0, 0, rtl_get_text as *const () as usize, 0, ltr_get_dir as *const () as usize, 0, 0];
+        let mut lsrc = RtlSource { vtbl: &ltr_vtbl, text: Vec::new() };
+        let expand_levels = |runs: &[(u32, u32, u8, u8)], total: usize| -> (Vec<u8>, Vec<u8>) {
+            let mut exp = vec![0xFFu8; total];
+            let mut res = vec![0xFFu8; total];
+            for &(pos, len, e, r) in runs {
+                for k in (pos as usize)..((pos + len) as usize) {
+                    exp[k] = e;
+                    res[k] = r;
+                }
+            }
+            (exp, res)
+        };
+
+        // 4a. RLO override: "abc\u202Edef\u202C" -> "def" has explicit=1, resolved=1.
+        let rlo_u16: Vec<u16> = "abc\u{202E}def\u{202C}".encode_utf16().collect();
+        lsrc.text = rlo_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, rlo_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (rlo_exp, rlo_res) = expand_levels(&bsink.bidis, rlo_u16.len());
+        assert_eq!(rlo_exp, vec![0, 0, 0, 1, 1, 1, 1, 0]);
+        assert_eq!(rlo_res, vec![0, 0, 0, 1, 1, 1, 1, 0]);
+
+        // 4b. LRE embedding with Hebrew: "abc\u202Aאב\u202C" -> Hebrew has explicit=2, resolved=3.
+        let lre_u16: Vec<u16> = "abc\u{202A}\u{05D0}\u{05D1}\u{202C}".encode_utf16().collect();
+        lsrc.text = lre_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, lre_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (lre_exp, lre_res) = expand_levels(&bsink.bidis, lre_u16.len());
+        assert_eq!(lre_exp, vec![0, 0, 0, 2, 2, 2, 0]);
+        assert_eq!(lre_res, vec![0, 0, 0, 3, 3, 3, 0]);
+
+        // 4c. RLI isolate with Hebrew + digits: "hi \u2067אב 12\u2069 ok" -> אב at level 1, 12 at level 2.
+        let rli_u16: Vec<u16> = "hi \u{2067}\u{05D0}\u{05D1} 12\u{2069} ok".encode_utf16().collect();
+        lsrc.text = rli_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, rli_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (rli_exp, rli_res) = expand_levels(&bsink.bidis, rli_u16.len());
+        assert_eq!(rli_exp, vec![0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(rli_res, vec![0, 0, 0, 0, 1, 1, 1, 2, 2, 0, 0, 0, 0]);
+
+        // 4d. FSI isolate auto-detecting RTL Hebrew + newline resetting RLO stack.
+        let fsi_u16: Vec<u16> = "a\u{2068}\u{05D0}\u{05D1}\u{2069}b".encode_utf16().collect();
+        lsrc.text = fsi_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, fsi_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (fsi_exp, fsi_res) = expand_levels(&bsink.bidis, fsi_u16.len());
+        assert_eq!(fsi_exp, vec![0, 0, 1, 1, 0, 0]);
+        assert_eq!(fsi_res, vec![0, 0, 1, 1, 0, 0]);
+
+        let nl_u16: Vec<u16> = "a\u{202E}bc\nde".encode_utf16().collect();
+        lsrc.text = nl_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, nl_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (nl_exp, nl_res) = expand_levels(&bsink.bidis, nl_u16.len());
+        assert_eq!(nl_exp, vec![0, 1, 1, 1, 0, 0, 0]);
+        assert_eq!(nl_res, vec![0, 1, 1, 1, 0, 0, 0]);
+
+        // 5. Per-range OpenType features: "fifi" with range 0 (len 2) disabling `liga` and
+        //    range 1 (len 2) enabling `liga` on a font with an `fi` ligature produces 2 glyphs
+        //    for range 0 and 1 ligature glyph for range 1 (total 3 glyphs, clusterMap [0,1,2,2]).
+        #[repr(C)]
+        struct DWriteFontFeature {
+            name_tag: u32,
+            parameter: u32,
+        }
+        #[repr(C)]
+        struct DWriteTypographicFeatures {
+            features: *const DWriteFontFeature,
+            feature_count: u32,
+        }
+        let liga_tag = u32::from_le_bytes(*b"liga");
+        let f_off = DWriteFontFeature { name_tag: liga_tag, parameter: 0 };
+        let f_on = DWriteFontFeature { name_tag: liga_tag, parameter: 1 };
+        let set_off = DWriteTypographicFeatures { features: &f_off, feature_count: 1 };
+        let set_on = DWriteTypographicFeatures { features: &f_on, feature_count: 1 };
+        let feat_ptrs = [
+            &set_off as *const _ as *const c_void,
+            &set_on as *const _ as *const c_void,
+        ];
+        let feat_lens = [2u32, 2u32];
+
+        let lig_meta = ["georgia", "times new roman", "helvetica", "palatino", "baskerville"]
+            .iter()
+            .find_map(|&fam_name| {
+                let idx = sys.find_family_index(fam_name)?;
+                let meta = sys.families[idx].fonts.iter().find(|m| m.file_path.is_some())?.clone();
+                // Probe whether this font supports the standard `fi` ligature when `liga=1`.
+                let probe_face = new_font_face(FontFaceInner::from_meta(meta.clone(), 0));
+                let fi_u16 = [b'f' as u16, b'i' as u16];
+                let mut cm = [0u16; 2];
+                let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 2];
+                let mut gi = [0u16; 4];
+                let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 4];
+                let mut cnt = 0u32;
+                let on_ptr = [&set_on as *const _ as *const c_void];
+                let on_len = [2u32];
+                let hr = ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    fi_u16.as_ptr(),
+                    2,
+                    probe_face,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    on_ptr.as_ptr(),
+                    on_len.as_ptr(),
+                    1,
+                    4,
+                    cm.as_mut_ptr(),
+                    tp.as_mut_ptr(),
+                    gi.as_mut_ptr(),
+                    gp.as_mut_ptr(),
+                    &mut cnt,
+                );
+                release_com(probe_face);
+                (hr == S_OK && cnt == 1).then_some(meta)
+            });
+
+        if let Some(meta) = lig_meta {
+            let lig_face = new_font_face(FontFaceInner::from_meta(meta, 0));
+            let fifi_u16 = [b'f' as u16, b'i' as u16, b'f' as u16, b'i' as u16];
+            let mut cm = [0xFFFFu16; 4];
+            let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 4];
+            let mut gi = [0u16; 8];
+            let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 8];
+            let mut cnt = 0u32;
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    fifi_u16.as_ptr(),
+                    4,
+                    lig_face,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    2,
+                    8,
+                    cm.as_mut_ptr(),
+                    tp.as_mut_ptr(),
+                    gi.as_mut_ptr(),
+                    gp.as_mut_ptr(),
+                    &mut cnt,
+                ),
+                S_OK
+            );
+            assert_eq!(cnt, 3, "range 0 (liga=0) -> 2 glyphs, range 1 (liga=1) -> 1 ligature glyph");
+            assert_eq!(cm, [0, 1, 2, 2]);
+            let mut adv = [0.0f32; 8];
+            let mut offs = [DWRITE_GLYPH_OFFSET::default(); 8];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    fifi_u16.as_ptr(),
+                    cm.as_ptr(),
+                    tp.as_ptr(),
+                    4,
+                    gi.as_ptr(),
+                    gp.as_ptr(),
+                    cnt,
+                    lig_face,
+                    20.0f32.to_bits(),
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    2,
+                    adv.as_mut_ptr(),
+                    offs.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            assert!(adv[0] > 0.0 && adv[1] > 0.0 && adv[2] > 0.0);
+            release_com(lig_face);
+        }
+
+        release_com(ta);
+        release_com(fac);
+    }
+}
+
+#[test]
+fn glyph_run_analysis_applies_sideways_rotation_and_vertical_metrics() {
+    use super::analysis::{
+        gra_create_alpha_texture, gra_get_alpha_texture_bounds, ta_get_glyph_placements,
+        PGlyphRunAnalysis, PTextAnalyzer,
+    };
+    use crate::user32::RECT;
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &G_IDWRITE_FACTORY as *const _ as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        // Use a non-square glyph ('I' or built-in fallback 'H' / 'I') whose height != width
+        // so 90-degree rotation is unmistakably observable in alpha-texture bounds.
+        let sys = system_font_collection_data(false);
+        let face_inner = sys.resolve_face(
+            "Segoe UI",
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+        );
+        let gid_i = face_inner.codepoint_to_glyph('I' as u32);
+        let em_size = 40.0f32;
+        let horiz_adv = face_inner.scaled_advance(gid_i, em_size);
+        let vert_adv = face_inner.scaled_vertical_advance(gid_i, em_size);
+        assert!(vert_adv > horiz_adv, "expected vertical advance > horizontal advance for 'I': h={horiz_adv}, v={vert_adv}");
+
+        let face = new_font_face(face_inner);
+
+        // Verify GetGlyphPlacements returns vertical advance when isSideways == TRUE.
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+        let text_i = ['I' as u16];
+        let cmap = [0u16];
+        let tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default()];
+        let gids1 = [gid_i];
+        let gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default()];
+        let mut placed_adv = [0.0f32; 1];
+        let mut placed_off = [DWRITE_GLYPH_OFFSET::default(); 1];
+        assert_eq!(
+            ta_get_glyph_placements(
+                ta as PTextAnalyzer,
+                text_i.as_ptr(),
+                cmap.as_ptr(),
+                tprops.as_ptr(),
+                1,
+                gids1.as_ptr(),
+                gprops.as_ptr(),
+                1,
+                face,
+                em_size.to_bits(),
+                TRUE, // isSideways
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                placed_adv.as_mut_ptr(),
+                placed_off.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert!(
+            (placed_adv[0] - vert_adv).abs() < 1e-3,
+            "sideways GetGlyphPlacements should return vertical advance {vert_adv}, got {}",
+            placed_adv[0]
+        );
+
+        // 1. Baseline horizontal upright single glyph (isSideways = FALSE, identity).
+        let run_horiz = DWRITE_GLYPH_RUN {
+            fontFace: face,
+            fontEmSize: em_size,
+            glyphCount: 1,
+            glyphIndices: gids1.as_ptr(),
+            glyphAdvances: std::ptr::null(),
+            glyphOffsets: std::ptr::null(),
+            isSideways: FALSE,
+            bidiLevel: 0,
+        };
+        let mut gra_h: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run_horiz,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                40.0,
+                &mut gra_h,
+            ),
+            S_OK
+        );
+        let mut b_h = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_h as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_h), S_OK);
+        let w_h = b_h.right - b_h.left;
+        let h_h = b_h.bottom - b_h.top;
+        assert!(h_h > w_h + 4, "upright 'I' should be taller than wide: {b_h:?}");
+
+        // 2. Sideways run with identity transform: rotated 90° left (width <-> height swapped).
+        let run_sw = DWRITE_GLYPH_RUN { isSideways: TRUE, ..run_horiz };
+        let mut gra_sw: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run_sw,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                40.0,
+                &mut gra_sw,
+            ),
+            S_OK
+        );
+        let mut b_sw = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_sw as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_sw), S_OK);
+        let w_sw = b_sw.right - b_sw.left;
+        let h_sw = b_sw.bottom - b_sw.top;
+        assert!((w_sw - h_h).abs() <= 3, "sideways width {w_sw} should match upright height {h_h}");
+        assert!((h_sw - w_h).abs() <= 3, "sideways height {h_sw} should match upright width {w_h}");
+
+        // 3. Documented vertical writing: isSideways = TRUE + 90° CW compensating world transform
+        //    (m11=0, m12=1, m21=-1, m22=0) restores upright orientation AND stacks 2 glyphs vertically.
+        let rot_cw = DWRITE_MATRIX { m11: 0.0, m12: 1.0, m21: -1.0, m22: 0.0, dx: 0.0, dy: 0.0 };
+        let mut gra_v1: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run_sw,
+                1.0,
+                &rot_cw,
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                10.0,
+                -50.0, // maps under rot_cw to x = +50, y = +10
+                &mut gra_v1,
+            ),
+            S_OK
+        );
+        let mut b_v1 = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_v1 as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_v1), S_OK);
+        let w_v1 = b_v1.right - b_v1.left;
+        let h_v1 = b_v1.bottom - b_v1.top;
+        assert!((w_v1 - w_h).abs() <= 3, "compensated vertical width {w_v1} should match upright width {w_h}");
+        assert!((h_v1 - h_h).abs() <= 3, "compensated vertical height {h_v1} should match upright height {h_h}");
+
+        let gids2 = [gid_i, gid_i];
+        let run_sw2 = DWRITE_GLYPH_RUN {
+            glyphCount: 2,
+            glyphIndices: gids2.as_ptr(),
+            ..run_sw
+        };
+        let mut gra_v2: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run_sw2,
+                1.0,
+                &rot_cw,
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                10.0,
+                -50.0,
+                &mut gra_v2,
+            ),
+            S_OK
+        );
+        let mut b_v2 = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_v2 as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut b_v2), S_OK);
+        assert_eq!(b_v2.left, b_v1.left, "vertical 2-glyph run must stay horizontally aligned");
+        assert_eq!(b_v2.right, b_v1.right, "vertical 2-glyph run must stay horizontally aligned");
+        assert!(
+            b_v2.bottom >= b_v1.bottom + (vert_adv.round() as i32) - 2,
+            "second vertical glyph must advance downward by vertical advance {vert_adv}: v1={b_v1:?}, v2={b_v2:?}"
+        );
+        // Ensure alpha texture actually renders non-zero pixels for the vertical run.
+        let tex_w = (b_v2.right - b_v2.left) as usize;
+        let tex_h = (b_v2.bottom - b_v2.top) as usize;
+        let mut tex = vec![0u8; tex_w * tex_h * 3];
+        assert_eq!(
+            gra_create_alpha_texture(gra_v2 as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &b_v2, tex.as_mut_ptr(), tex.len() as u32),
+            S_OK
+        );
+        assert!(tex.iter().any(|&a| a >= 128), "vertical alpha texture must contain lit glyph pixels");
+
+        release_com(gra_v2);
+        release_com(gra_v1);
+        release_com(gra_sw);
+        release_com(gra_h);
+        release_com(ta);
+        release_com(face);
+        release_com(fac);
+    }
+}
+
+#[test]
+fn text_analyzer_honors_number_substitution_for_localized_digits() {
+    use super::analysis::{
+        ta_get_gdi_compatible_glyph_placements, ta_get_glyph_placements, ta_get_glyphs,
+        PTextAnalyzer,
+    };
+    use super::font::{
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_CONTEXTUAL,
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_NATIONAL,
+        DWRITE_NUMBER_SUBSTITUTION_METHOD_NONE,
+    };
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &G_IDWRITE_FACTORY as *const _ as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // Find a system font that has both ASCII '0'..'9' and Arabic-Indic '٠'..'٩' (U+0660..U+0669).
+        let sys = system_font_collection_data(false);
+        let font_meta = ["geeza pro", "arial", "times new roman", "damascus"]
+            .iter()
+            .find_map(|&fam_name| {
+                let idx = sys.find_family_index(fam_name)?;
+                sys.families[idx]
+                    .fonts
+                    .iter()
+                    .find(|m| {
+                        if m.file_path.is_none() {
+                            return false;
+                        }
+                        let fi = FontFaceInner::from_meta((*m).clone(), 0);
+                        fi.codepoint_to_glyph('1' as u32) != 0
+                            && fi.codepoint_to_glyph(0x0661) != 0
+                            && fi.codepoint_to_glyph('1' as u32) != fi.codepoint_to_glyph(0x0661)
+                    })
+                    .cloned()
+            })
+            .expect("expected a macOS system font with distinct Latin and Arabic-Indic digits");
+
+        let face_inner = FontFaceInner::from_meta(font_meta, 0);
+        let latin_123 = [
+            face_inner.codepoint_to_glyph('1' as u32),
+            face_inner.codepoint_to_glyph('2' as u32),
+            face_inner.codepoint_to_glyph('3' as u32),
+        ];
+        let arabic_123 = [
+            face_inner.codepoint_to_glyph(0x0661),
+            face_inner.codepoint_to_glyph(0x0662),
+            face_inner.codepoint_to_glyph(0x0663),
+        ];
+        assert_ne!(latin_123, arabic_123);
+        let face = new_font_face(face_inner);
+
+        let ar_sa = wide("ar-SA");
+        let mut ns_national: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_number_substitution(
+                fac as PFactory,
+                DWRITE_NUMBER_SUBSTITUTION_METHOD_NATIONAL,
+                ar_sa.as_ptr(),
+                TRUE,
+                &mut ns_national,
+            ),
+            S_OK
+        );
+        let mut ns_none: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_number_substitution(
+                fac as PFactory,
+                DWRITE_NUMBER_SUBSTITUTION_METHOD_NONE,
+                ar_sa.as_ptr(),
+                TRUE,
+                &mut ns_none,
+            ),
+            S_OK
+        );
+        let mut ns_ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_number_substitution(
+                fac as PFactory,
+                DWRITE_NUMBER_SUBSTITUTION_METHOD_CONTEXTUAL,
+                ar_sa.as_ptr(),
+                TRUE,
+                &mut ns_ctx,
+            ),
+            S_OK
+        );
+
+        let shape_with_ns = |text: &str, rtl: BOOL, ns: *mut c_void| -> (HRESULT, Vec<u16>) {
+            let u16s: Vec<u16> = text.encode_utf16().collect();
+            let mut cm = vec![0u16; u16s.len()];
+            let mut tp = vec![DWRITE_SHAPING_TEXT_PROPERTIES::default(); u16s.len()];
+            let mut gi = vec![0u16; u16s.len() * 2 + 4];
+            let mut gp = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); gi.len()];
+            let mut actual = 0u32;
+            let hr = ta_get_glyphs(
+                ta as PTextAnalyzer,
+                u16s.as_ptr(),
+                u16s.len() as u32,
+                face,
+                FALSE,
+                rtl,
+                std::ptr::null(),
+                std::ptr::null(),
+                ns,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gi.len() as u32,
+                cm.as_mut_ptr(),
+                tp.as_mut_ptr(),
+                gi.as_mut_ptr(),
+                gp.as_mut_ptr(),
+                &mut actual,
+            );
+            (hr, gi[..actual as usize].to_vec())
+        };
+
+        // 1. NATIONAL ar-SA converts ASCII "123" to Arabic-Indic glyphs.
+        let (hr_nat, g_nat) = shape_with_ns("123", FALSE, ns_national);
+        assert_eq!(hr_nat, S_OK);
+        assert_eq!(g_nat, arabic_123, "NATIONAL ar-SA must produce Arabic-Indic digit glyphs");
+
+        // 2. NONE ar-SA keeps nominal Latin digits.
+        let (hr_none, g_none) = shape_with_ns("123", FALSE, ns_none);
+        assert_eq!(hr_none, S_OK);
+        assert_eq!(g_none, latin_123, "NONE must keep nominal Latin digit glyphs");
+
+        // 3. CONTEXTUAL ar-SA: keeps Latin digits after Latin letters, substitutes after Arabic letters.
+        let (hr_ctx_ltr, g_ctx_ltr) = shape_with_ns("A123", FALSE, ns_ctx);
+        assert_eq!(hr_ctx_ltr, S_OK);
+        assert_eq!(&g_ctx_ltr[1..], &latin_123, "CONTEXTUAL after Latin must keep Latin digits");
+
+        let (hr_ctx_ar, g_ctx_ar) = shape_with_ns("\u{0633}123", TRUE, ns_ctx);
+        assert_eq!(hr_ctx_ar, S_OK);
+        assert!(
+            arabic_123.iter().all(|g| g_ctx_ar.contains(g)),
+            "CONTEXTUAL after Arabic must substitute Arabic-Indic digits: got={g_ctx_ar:?}, expected={arabic_123:?}"
+        );
+
+        // 4. GetGlyphPlacements and GetGdiCompatibleGlyphPlacements must preserve CoreText
+        //    shaped positioning (combining-mark offsets / zero-advance marks) when GetGlyphs
+        //    substituted localized digits and placement is called with the original text.
+        let orig_ar_mark = "\u{0633}\u{064E}12"; // Seen + Fatha + ASCII "12"
+        let pre_sub_ar_mark = "\u{0633}\u{064E}\u{0661}\u{0662}"; // Seen + Fatha + Arabic-Indic "١٢"
+        let (hr_m_sub, g_m_sub) = shape_with_ns(orig_ar_mark, TRUE, ns_national);
+        let (hr_m_ref, g_m_ref) = shape_with_ns(pre_sub_ar_mark, TRUE, std::ptr::null_mut());
+        assert_eq!(hr_m_sub, S_OK);
+        assert_eq!(hr_m_ref, S_OK);
+        assert_eq!(g_m_sub, g_m_ref);
+
+        let place_run = |text: &str, gids: &[u16], gdi: bool| -> (Vec<f32>, Vec<DWRITE_GLYPH_OFFSET>) {
+            let u16s: Vec<u16> = text.encode_utf16().collect();
+            let cm = vec![0u16; u16s.len()];
+            let tp = vec![DWRITE_SHAPING_TEXT_PROPERTIES::default(); u16s.len()];
+            let gp = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); gids.len()];
+            let mut adv = vec![0.0f32; gids.len()];
+            let mut off = vec![DWRITE_GLYPH_OFFSET::default(); gids.len()];
+            let hr = if gdi {
+                ta_get_gdi_compatible_glyph_placements(
+                    ta as PTextAnalyzer,
+                    u16s.as_ptr(),
+                    cm.as_ptr(),
+                    tp.as_ptr(),
+                    u16s.len() as u32,
+                    gids.as_ptr(),
+                    gp.as_ptr(),
+                    gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    std::ptr::null(),
+                    TRUE,
+                    FALSE,
+                    TRUE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    off.as_mut_ptr(),
+                )
+            } else {
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    u16s.as_ptr(),
+                    cm.as_ptr(),
+                    tp.as_ptr(),
+                    u16s.len() as u32,
+                    gids.as_ptr(),
+                    gp.as_ptr(),
+                    gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    FALSE,
+                    TRUE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    off.as_mut_ptr(),
+                )
+            };
+            assert_eq!(hr, S_OK);
+            (adv, off)
+        };
+        let (adv_sub, off_sub) = place_run(orig_ar_mark, &g_m_sub, false);
+        let (adv_ref, off_ref) = place_run(pre_sub_ar_mark, &g_m_ref, false);
+        assert_eq!(adv_sub, adv_ref, "GetGlyphPlacements must preserve shaped advances after digit substitution");
+        for (a, b) in off_sub.iter().zip(off_ref.iter()) {
+            assert_eq!((a.advanceOffset, a.ascenderOffset), (b.advanceOffset, b.ascenderOffset));
+        }
+        let (gadv_sub, goff_sub) = place_run(orig_ar_mark, &g_m_sub, true);
+        let (gadv_ref, goff_ref) = place_run(pre_sub_ar_mark, &g_m_ref, true);
+        assert_eq!(gadv_sub, gadv_ref, "GetGdiCompatibleGlyphPlacements must preserve shaped advances");
+        for (a, b) in goff_sub.iter().zip(goff_ref.iter()) {
+            assert_eq!((a.advanceOffset, a.ascenderOffset), (b.advanceOffset, b.ascenderOffset));
+        }
+
+        // 5. Unrecognized/bogus non-null number_substitution pointer must fail instead of silently ignoring.
+        let mut fake_vtbl = [0usize; 3];
+        let mut fake_obj = fake_vtbl.as_mut_ptr();
+        let (hr_bad, _) = shape_with_ns("123", FALSE, &mut fake_obj as *mut _ as *mut c_void);
+        assert_eq!(hr_bad, E_INVALIDARG);
+
+        // 6. AnalyzeLineBreakpoints must report mandatory breaks (MUST_BREAK + isWhitespace)
+        //    for Unicode line/paragraph separators U+2028, U+2029, VT, FF, and NEL.
+        #[repr(C)]
+        struct BpSource {
+            vtbl: *const [usize; 8],
+            text: Vec<u16>,
+        }
+        #[repr(C)]
+        struct BpSink {
+            vtbl: *const [usize; 7],
+            bps: Vec<u8>,
+        }
+        unsafe extern "win64" fn bp_get_text(this: *mut BpSource, pos: u32, out_str: *mut *const u16, out_len: *mut u32) -> HRESULT {
+            let p = pos as usize;
+            if p >= (*this).text.len() {
+                out_str.write_unaligned(std::ptr::null());
+                out_len.write_unaligned(0);
+            } else {
+                out_str.write_unaligned((*this).text.as_ptr().add(p));
+                out_len.write_unaligned(((*this).text.len() - p) as u32);
+            }
+            S_OK
+        }
+        unsafe extern "win64" fn bp_set_bps(this: *mut BpSink, _pos: u32, len: u32, bps: *const DWRITE_LINE_BREAKPOINT) -> HRESULT {
+            for i in 0..len as usize {
+                (*this).bps.push(bps.add(i).read_unaligned().bits);
+            }
+            S_OK
+        }
+        let bp_src_vtbl = [0, 0, 0, bp_get_text as *const () as usize, 0, 0, 0, 0];
+        let bp_snk_vtbl = [0, 0, 0, 0, bp_set_bps as *const () as usize, 0, 0];
+        let sample_u16: Vec<u16> = "a\u{2028}b\u{2029}c\u{000B}d\u{000C}e\u{0085}f".encode_utf16().collect();
+        let mut bp_src = BpSource { vtbl: &bp_src_vtbl, text: sample_u16.clone() };
+        let mut bp_snk = BpSink { vtbl: &bp_snk_vtbl, bps: Vec::new() };
+        let an_lb_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute((*(ta as *const *const usize)).add(6).read_unaligned());
+        assert_eq!(
+            an_lb_fn(ta, &mut bp_src as *mut _ as *mut c_void, 0, sample_u16.len() as u32, &mut bp_snk as *mut _ as *mut c_void),
+            S_OK
+        );
+        assert_eq!(bp_snk.bps.len(), sample_u16.len());
+        for &sep_idx in &[1usize, 3, 5, 7, 9] {
+            let bits = bp_snk.bps[sep_idx];
+            let before = bits & 0x3;
+            let after = (bits >> 2) & 0x3;
+            let is_ws = (bits >> 4) & 0x1;
+            assert_eq!((before, after, is_ws), (2, 3, 1), "mandatory separator at idx {sep_idx} (u={:#x}) had bits={bits:#x}", sample_u16[sep_idx]);
+        }
+
+        // 7. Word-internal boundaries must be marked MAY_NOT_BREAK (2), while space/hyphen/CJK
+        //    boundaries allow breaking (CAN_BREAK = 1) and CR+LF breaks only after LF (MUST_BREAK = 3).
+        let analyze_bps = |s: &str| -> Vec<(u8, u8, u8, u8)> {
+            let u16s: Vec<u16> = s.encode_utf16().collect();
+            let mut src = BpSource { vtbl: &bp_src_vtbl, text: u16s.clone() };
+            let mut snk = BpSink { vtbl: &bp_snk_vtbl, bps: Vec::new() };
+            assert_eq!(
+                an_lb_fn(ta, &mut src as *mut _ as *mut c_void, 0, u16s.len() as u32, &mut snk as *mut _ as *mut c_void),
+                S_OK
+            );
+            snk.bps
+                .into_iter()
+                .map(|b| (b & 0x3, (b >> 2) & 0x3, (b >> 4) & 0x1, (b >> 5) & 0x1))
+                .collect()
+        };
+        let hello_bps = analyze_bps("a hello");
+        assert_eq!(hello_bps.len(), 7);
+        // 'a' -> ' ' prohibited; ' ' -> 'h' allowed; all boundaries inside "hello" prohibited.
+        assert_eq!(hello_bps[0].1, 2, "must not break between 'a' and space: {hello_bps:?}");
+        assert_eq!((hello_bps[1].0, hello_bps[1].1, hello_bps[1].2), (2, 1, 1), "space must allow break after: {hello_bps:?}");
+        assert_eq!(hello_bps[2].0, 1, "'h' after space allows break before: {hello_bps:?}");
+        for idx in 2..6 {
+            assert_eq!(hello_bps[idx].1, 2, "word-internal break after idx {idx} in 'hello' must be MAY_NOT_BREAK: {hello_bps:?}");
+            assert_eq!(hello_bps[idx + 1].0, 2, "word-internal break before idx {} in 'hello' must be MAY_NOT_BREAK: {hello_bps:?}", idx + 1);
+        }
+
+        let hyp_nbsp = analyze_bps("foo-bar\u{00A0}baz");
+        // Break allowed after '-' (idx 3 -> 4), prohibited around NBSP (idx 7) and inside words.
+        assert_eq!((hyp_nbsp[3].1, hyp_nbsp[4].0), (1, 1), "hyphen allows break after: {hyp_nbsp:?}");
+        assert_eq!((hyp_nbsp[6].1, hyp_nbsp[7].0, hyp_nbsp[7].1, hyp_nbsp[8].0), (2, 2, 2, 2), "NBSP prohibits break before and after: {hyp_nbsp:?}");
+        assert_eq!((hyp_nbsp[0].1, hyp_nbsp[1].0), (2, 2), "word-internal 'fo' must prohibit break: {hyp_nbsp:?}");
+
+        let crlf_bps = analyze_bps("a\r\nb");
+        assert_eq!((crlf_bps[1].1, crlf_bps[2].0, crlf_bps[2].1), (2, 2, 3), "CR+LF must not break between CR and LF and must break after LF: {crlf_bps:?}");
+
+        let cjk_bps = analyze_bps("日本語");
+        assert_eq!((cjk_bps[0].1, cjk_bps[1].0, cjk_bps[1].1, cjk_bps[2].0), (1, 1, 1, 1), "CJK ideographs allow breaks between chars: {cjk_bps:?}");
+
+        release_com(ns_ctx);
+        release_com(ns_none);
+        release_com(ns_national);
+        release_com(face);
+        release_com(ta);
+        release_com(fac);
+    }
+}
+
+#[test]
+fn glyph_run_analysis_preserves_fractional_subpixel_origins() {
+    use super::analysis::{gra_create_alpha_texture, gra_get_alpha_texture_bounds, PGlyphRunAnalysis};
+    use super::sfnt::{fallback_cp_to_gid, parse_font_bytes_metadata, SfntFace};
+    use crate::user32::RECT;
+
+    unsafe {
+            let mut fac: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                DWriteCreateFactory(
+                    DWRITE_FACTORY_TYPE_SHARED,
+                    &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                    &mut fac,
+                ),
+                S_OK
+            );
+
+            // Build a TrueType contour font face (gid 1 = solid rectangle outline).
+            let ttf = build_synthetic_ttf();
+            let raw = Arc::new(ttf);
+            let metas = parse_font_bytes_metadata(Arc::clone(&raw), "SubpixelTest");
+            assert!(!metas.is_empty());
+            let sfnt = SfntFace::from_bytes(Arc::clone(&raw), 0).map(Arc::new);
+            let tt_face = new_font_face(Arc::new(FontFaceInner {
+                meta: Arc::new(metas[0].clone()),
+                simulations: 0,
+                sfnt,
+            }));
+
+            let render_centroid = |face_ptr: *mut c_void, mode: u32, tex_ty: u32, bx: f32, by: f32| -> (RECT, Vec<u8>, f64, f64) {
+                let gids = [1u16];
+                let adv = [20.0f32];
+                let offs = [DWRITE_GLYPH_OFFSET::default()];
+                let run = DWRITE_GLYPH_RUN {
+                    fontFace: face_ptr,
+                    fontEmSize: 32.0,
+                    glyphCount: 1,
+                    glyphIndices: gids.as_ptr(),
+                    glyphAdvances: adv.as_ptr(),
+                    glyphOffsets: offs.as_ptr(),
+                    isSideways: FALSE,
+                    bidiLevel: 0,
+                };
+                let mut gra: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    fac_create_glyph_run_analysis(
+                        fac as PFactory,
+                        &run,
+                        1.0,
+                        std::ptr::null(),
+                        mode,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                        bx,
+                        by,
+                        &mut gra,
+                    ),
+                    S_OK
+                );
+                let mut rc = RECT::default();
+                assert_eq!(gra_get_alpha_texture_bounds(gra as PGlyphRunAnalysis, tex_ty, &mut rc), S_OK);
+                let w = (rc.right - rc.left) as usize;
+                let h = (rc.bottom - rc.top) as usize;
+                let bpp = if tex_ty == DWRITE_TEXTURE_ALIASED_1X1 { 1usize } else { 3usize };
+                let mut buf = vec![0u8; w * h * bpp];
+                assert_eq!(
+                    gra_create_alpha_texture(gra as PGlyphRunAnalysis, tex_ty, &rc, buf.as_mut_ptr(), buf.len() as u32),
+                    S_OK
+                );
+                release_com(gra);
+
+                let mut sum = 0.0f64;
+                let mut sum_x = 0.0f64;
+                let mut sum_y = 0.0f64;
+                for y in 0..h {
+                    for x in 0..w {
+                        let cov = buf[(y * w + x) * bpp] as f64;
+                        sum += cov;
+                        sum_x += cov * (rc.left as f64 + x as f64 + 0.5);
+                        sum_y += cov * (rc.top as f64 + y as f64 + 0.5);
+                    }
+                }
+                assert!(sum > 0.0, "expected non-empty coverage for mode={mode}, bx={bx}, by={by}");
+                (rc, buf, sum_x / sum, sum_y / sum)
+            };
+
+            // 1. Natural mode preserves fractional X origins: 0.0 -> 0.4 -> 0.6 shifts coverage smoothly,
+            //    never producing identical coverage for 0.0 and 0.4.
+            let (_, tex_0, cx_0, cy_0) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.0, 32.0);
+            let (_, tex_04, cx_04, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.4, 32.0);
+            let (_, _, cx_06, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.6, 32.0);
+            assert_ne!(tex_0, tex_04, "NATURAL mode must produce distinct coverage at baseline_x 0.0 vs 0.4");
+            assert!(((cx_04 - cx_0) - 0.4).abs() < 0.06, "expected +0.4px X shift: cx_0={cx_0}, cx_04={cx_04}");
+            assert!(((cx_06 - cx_0) - 0.6).abs() < 0.06, "expected +0.6px X shift: cx_0={cx_0}, cx_06={cx_06}");
+
+            // NATURAL snaps vertical baseline to whole pixel; NATURAL_SYMMETRIC preserves fractional Y too.
+            let (_, _, _, cy_nat_04) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.0, 32.4);
+            assert!((cy_nat_04 - cy_0).abs() < 1e-4, "NATURAL mode snaps baseline Y: cy_0={cy_0}, cy_nat_04={cy_nat_04}");
+            let (_, _, _, cy_sym_04) = render_centroid(tt_face, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.0, 32.4);
+            assert!(((cy_sym_04 - cy_0) - 0.4).abs() < 0.15, "NATURAL_SYMMETRIC must preserve fractional Y: cy_0={cy_0}, cy_sym_04={cy_sym_04}");
+
+            // 2. ALIASED and GDI_CLASSIC snap origins to whole pixels (0.0 and 0.4 match).
+            let (rc_al_0, tex_al_0, _, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_ALIASED, DWRITE_TEXTURE_ALIASED_1X1, 0.0, 32.0);
+            let (rc_al_04, tex_al_04, _, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_ALIASED, DWRITE_TEXTURE_ALIASED_1X1, 0.4, 32.0);
+            assert_eq!((rc_al_0.left, rc_al_0.top, rc_al_0.right, rc_al_0.bottom), (rc_al_04.left, rc_al_04.top, rc_al_04.right, rc_al_04.bottom));
+            assert_eq!(tex_al_0, tex_al_04, "ALIASED mode must snap 0.0 and 0.4 to the same whole pixel");
+
+            let (rc_gdi_0, tex_gdi_0, _, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_GDI_CLASSIC, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.0, 32.0);
+            let (rc_gdi_04, tex_gdi_04, _, _) = render_centroid(tt_face, DWRITE_RENDERING_MODE_GDI_CLASSIC, DWRITE_TEXTURE_CLEARTYPE_3X1, 0.4, 32.0);
+            assert_eq!((rc_gdi_0.left, rc_gdi_0.top, rc_gdi_0.right, rc_gdi_0.bottom), (rc_gdi_04.left, rc_gdi_04.top, rc_gdi_04.right, rc_gdi_04.bottom));
+            assert_eq!(tex_gdi_0, tex_gdi_04, "GDI_CLASSIC mode must snap 0.0 and 0.4 to the same whole pixel");
+
+            // 3. Fallback 8x8 bitmap rasterizer also preserves fractional X origins under NATURAL mode.
+            let fb_face = new_font_face(Arc::new(FontFaceInner {
+                meta: Arc::new(metas[0].clone()),
+                simulations: 0,
+                sfnt: None,
+            }));
+            let gids_h = [fallback_cp_to_gid('H' as u32)];
+            let adv_h = [20.0f32];
+            let offs_h = [DWRITE_GLYPH_OFFSET::default()];
+            let render_fb = |bx: f32| -> (Vec<u8>, f64) {
+                let run = DWRITE_GLYPH_RUN {
+                    fontFace: fb_face,
+                    fontEmSize: 32.0,
+                    glyphCount: 1,
+                    glyphIndices: gids_h.as_ptr(),
+                    glyphAdvances: adv_h.as_ptr(),
+                    glyphOffsets: offs_h.as_ptr(),
+                    isSideways: FALSE,
+                    bidiLevel: 0,
+                };
+                let mut gra: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    fac_create_glyph_run_analysis(
+                        fac as PFactory,
+                        &run,
+                        1.0,
+                        std::ptr::null(),
+                        DWRITE_RENDERING_MODE_NATURAL,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                        bx,
+                        32.0,
+                        &mut gra,
+                    ),
+                    S_OK
+                );
+                let mut rc = RECT::default();
+                assert_eq!(gra_get_alpha_texture_bounds(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut rc), S_OK);
+                let w = (rc.right - rc.left) as usize;
+                let h = (rc.bottom - rc.top) as usize;
+                let mut buf = vec![0u8; w * h * 3];
+                assert_eq!(
+                    gra_create_alpha_texture(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &rc, buf.as_mut_ptr(), buf.len() as u32),
+                    S_OK
+                );
+                release_com(gra);
+                let mut sum = 0.0f64;
+                let mut sum_x = 0.0f64;
+                for y in 0..h {
+                    for x in 0..w {
+                        let cov = buf[(y * w + x) * 3] as f64;
+                        sum += cov;
+                        sum_x += cov * (rc.left as f64 + x as f64 + 0.5);
+                    }
+                }
+                (buf, sum_x / sum)
+            };
+            let (fb_tex_0, fb_cx_0) = render_fb(0.0);
+            let (fb_tex_04, fb_cx_04) = render_fb(0.4);
+            assert_ne!(fb_tex_0, fb_tex_04, "fallback 8x8 glyph must differ at baseline_x 0.0 vs 0.4");
+            assert!(((fb_cx_04 - fb_cx_0) - 0.4).abs() < 0.2, "fallback X shift expected ~0.4: 0={fb_cx_0}, 0.4={fb_cx_04}");
+
+            release_com(fb_face);
+            release_com(tt_face);
+            release_com(fac);
+    }
+}
+
+#[test]
+fn text_analyzer_forwards_locale_to_coretext_shaping() {
+    use super::analysis::{
+        ta_get_gdi_compatible_glyph_placements, ta_get_glyph_placements, ta_get_glyphs,
+        PTextAnalyzer,
+    };
+
+    let sfns_path = "/System/Library/Fonts/SFNS.ttf";
+    if !std::path::Path::new(sfns_path).exists() {
+        return;
+    }
+
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ffile: *mut c_void = std::ptr::null_mut();
+        let path_w = wide(sfns_path);
+        assert_eq!(
+            fac_create_font_file_reference(fac as PFactory, path_w.as_ptr(), std::ptr::null(), &mut ffile),
+            S_OK
+        );
+        let mut face: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_font_face(
+                fac as PFactory,
+                DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                1,
+                &ffile,
+                0,
+                DWRITE_FONT_SIMULATIONS_NONE,
+                &mut face,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // Cyrillic small letter Be (U+0431) has distinct OpenType `locl` forms for Russian vs Serbian in SFNS.
+        let text = [0x0431u16];
+        let shape_locale = |loc: &str| -> Vec<u16> {
+            let loc_w = wide(loc);
+            let mut cm = [0u16; 1];
+            let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 1];
+            let mut gi = [0u16; 4];
+            let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 4];
+            let mut actual = 0u32;
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    text.len() as u32,
+                    face,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    gi.len() as u32,
+                    cm.as_mut_ptr(),
+                    tp.as_mut_ptr(),
+                    gi.as_mut_ptr(),
+                    gp.as_mut_ptr(),
+                    &mut actual,
+                ),
+                S_OK
+            );
+            gi[..actual as usize].to_vec()
+        };
+
+        let g_ru = shape_locale("ru-RU");
+        let g_sr = shape_locale("sr-Cyrl");
+        assert_eq!(g_ru.len(), 1);
+        assert_eq!(g_sr.len(), 1);
+        assert_ne!(
+            g_ru, g_sr,
+            "localeName must be forwarded to CoreText so Serbian and Russian Cyrillic 'б' select distinct locl glyphs"
+        );
+
+        // Verify GetGlyphPlacements and GetGdiCompatibleGlyphPlacements also forward localeName cleanly.
+        let sr_w = wide("sr-Cyrl");
+        let cm = [0u16; 1];
+        let tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 1];
+        let gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 1];
+        let mut adv = [0.0f32; 1];
+        let mut off = [DWRITE_GLYPH_OFFSET::default(); 1];
+        assert_eq!(
+            ta_get_glyph_placements(
+                ta as PTextAnalyzer,
+                text.as_ptr(),
+                cm.as_ptr(),
+                tp.as_ptr(),
+                1,
+                g_sr.as_ptr(),
+                gp.as_ptr(),
+                1,
+                face,
+                24.0f32.to_bits(),
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                sr_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                adv.as_mut_ptr(),
+                off.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert!(adv[0] > 0.0, "expected positive advance for sr-Cyrl glyph, got {}", adv[0]);
+
+        let mut gdi_adv = [0.0f32; 1];
+        assert_eq!(
+            ta_get_gdi_compatible_glyph_placements(
+                ta as PTextAnalyzer,
+                text.as_ptr(),
+                cm.as_ptr(),
+                tp.as_ptr(),
+                1,
+                g_sr.as_ptr(),
+                gp.as_ptr(),
+                1,
+                face,
+                24.0f32.to_bits(),
+                1.0f32.to_bits(),
+                std::ptr::null(),
+                TRUE,
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                sr_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gdi_adv.as_mut_ptr(),
+                off.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert!(gdi_adv[0] > 0.0);
+
+        release_com(ta);
+        release_com(face);
+        release_com(ffile);
+        release_com(fac);
+    }
+}
+
+#[test]
+fn gdi_compatible_glyph_placements_honors_transform() {
+    use super::analysis::{ta_get_gdi_compatible_glyph_placements, ta_get_glyphs, PTextAnalyzer};
+
+    unsafe {
+        let ttf_bytes = build_synthetic_ttf();
+        let tmp_path = std::env::temp_dir().join(format!(
+            "win32_rt_dwrite_gdi_xform_{}.ttf",
+            std::process::id()
+        ));
+        fs::write(&tmp_path, &ttf_bytes).expect("write synthetic ttf");
+
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ffile: *mut c_void = std::ptr::null_mut();
+        let wpath = wide(&tmp_path.to_string_lossy());
+        assert_eq!(
+            fac_create_font_file_reference(fac as PFactory, wpath.as_ptr(), std::ptr::null(), &mut ffile),
+            S_OK
+        );
+        let mut face: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_font_face(
+                fac as PFactory,
+                DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                1,
+                &ffile,
+                0,
+                DWRITE_FONT_SIMULATIONS_NONE,
+                &mut face,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // Synthetic 'A' (gid 1) has advanceWidth = 720 / 1000 upem -> 14.4 DIPs at em_size = 20.0.
+        let text = [b'A' as u16];
+        let gids = [1u16];
+        let cm = [0u16];
+        let tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default()];
+        let gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default()];
+
+        let measure = |use_text: bool, xform: Option<DWRITE_MATRIX>| -> (HRESULT, f32) {
+            let mut adv = [0.0f32; 1];
+            let mut off = [DWRITE_GLYPH_OFFSET::default(); 1];
+            let xform_ptr = xform
+                .as_ref()
+                .map_or(std::ptr::null(), |m| m as *const DWRITE_MATRIX);
+            let hr = ta_get_gdi_compatible_glyph_placements(
+                ta as PTextAnalyzer,
+                if use_text { text.as_ptr() } else { std::ptr::null() },
+                cm.as_ptr(),
+                tp.as_ptr(),
+                if use_text { 1 } else { 0 },
+                gids.as_ptr(),
+                gp.as_ptr(),
+                1,
+                face,
+                20.0f32.to_bits(),
+                1.0f32.to_bits(),
+                xform_ptr,
+                FALSE, // GDI classic
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                adv.as_mut_ptr(),
+                off.as_mut_ptr(),
+            );
+            (hr, adv[0])
+        };
+
+        // Test both the CoreText path (`use_text = true`) and the nominal-metrics fallback (`use_text = false`).
+        for use_text in [true, false] {
+            // 1. Identity / NULL transform: round(14.4 * 1.0) / 1.0 = 14.0 DIPs.
+            let (hr, adv_id) = measure(use_text, None);
+            assert_eq!(hr, S_OK);
+            assert!((adv_id - 14.0).abs() < 1e-4, "use_text={use_text}: expected 14.0, got {adv_id}");
+
+            // 2. 2x scaling transform: round(14.4 * 2.0) / 2.0 = 29.0 / 2.0 = 14.5 DIPs (= 29.0 dev px).
+            let scale2 = DWRITE_MATRIX { m11: 2.0, m12: 0.0, m21: 0.0, m22: 2.0, dx: 0.0, dy: 0.0 };
+            let (hr, adv_2x) = measure(use_text, Some(scale2));
+            assert_eq!(hr, S_OK);
+            assert!((adv_2x - 14.5).abs() < 1e-4, "use_text={use_text}: expected 14.5, got {adv_2x}");
+
+            // 3. Non-uniform 1.5x X scaling: round(14.4 * 1.5) / 1.5 = 22.0 / 1.5 DIPs (= 22.0 dev px).
+            let scale_nonunif = DWRITE_MATRIX { m11: 1.5, m12: 0.0, m21: 0.0, m22: 1.0, dx: 0.0, dy: 0.0 };
+            let (hr, adv_15x) = measure(use_text, Some(scale_nonunif));
+            assert_eq!(hr, S_OK);
+            assert!(
+                (adv_15x * 1.5 - 22.0).abs() < 1e-4,
+                "use_text={use_text}: expected adv*1.5 == 22.0, got {}",
+                adv_15x * 1.5
+            );
+
+            // 4. 90-degree rotation + 2x scale: advance-axis scale hypot(0, 2) = 2.0 -> 14.5 DIPs.
+            let rot2 = DWRITE_MATRIX { m11: 0.0, m12: 2.0, m21: -2.0, m22: 0.0, dx: 0.0, dy: 0.0 };
+            let (hr, adv_rot2) = measure(use_text, Some(rot2));
+            assert_eq!(hr, S_OK);
+            assert!((adv_rot2 - 14.5).abs() < 1e-4, "use_text={use_text}: expected 14.5, got {adv_rot2}");
+        }
+
+        // 5. Invalid (NaN) and singular (zero determinant) transforms are rejected with E_INVALIDARG.
+        let nan_m = DWRITE_MATRIX { m11: f32::NAN, m12: 0.0, m21: 0.0, m22: 1.0, dx: 0.0, dy: 0.0 };
+        assert_eq!(measure(true, Some(nan_m)).0, E_INVALIDARG);
+        let zero_m = DWRITE_MATRIX { m11: 0.0, m12: 0.0, m21: 0.0, m22: 0.0, dx: 0.0, dy: 0.0 };
+        assert_eq!(measure(true, Some(zero_m)).0, E_INVALIDARG);
+
+        // 6. Real system font through CoreText: 2x transform snaps to 0.5-DIP (1-device-px) increments.
+        let sfns_path = "/System/Library/Fonts/SFNS.ttf";
+        if std::path::Path::new(sfns_path).exists() {
+            let mut sfile: *mut c_void = std::ptr::null_mut();
+            let sw = wide(sfns_path);
+            assert_eq!(
+                fac_create_font_file_reference(fac as PFactory, sw.as_ptr(), std::ptr::null(), &mut sfile),
+                S_OK
+            );
+            let mut sface: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                fac_create_font_face(
+                    fac as PFactory,
+                    DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                    1,
+                    &sfile,
+                    0,
+                    DWRITE_FONT_SIMULATIONS_NONE,
+                    &mut sface,
+                ),
+                S_OK
+            );
+            let sample: Vec<u16> = "Hello, world! 0123456789".encode_utf16().collect();
+            let mut scm = vec![0u16; sample.len()];
+            let mut stp = vec![DWRITE_SHAPING_TEXT_PROPERTIES::default(); sample.len()];
+            let mut sgi = vec![0u16; sample.len() * 2];
+            let mut sgp = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); sample.len() * 2];
+            let mut sactual = 0u32;
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    sample.as_ptr(),
+                    sample.len() as u32,
+                    sface,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    sgi.len() as u32,
+                    scm.as_mut_ptr(),
+                    stp.as_mut_ptr(),
+                    sgi.as_mut_ptr(),
+                    sgp.as_mut_ptr(),
+                    &mut sactual,
+                ),
+                S_OK
+            );
+            let n = sactual as usize;
+            let mut sadv = vec![0.0f32; n];
+            let mut soff = vec![DWRITE_GLYPH_OFFSET::default(); n];
+            let scale2 = DWRITE_MATRIX { m11: 2.0, m12: 0.0, m21: 0.0, m22: 2.0, dx: 0.0, dy: 0.0 };
+            assert_eq!(
+                ta_get_gdi_compatible_glyph_placements(
+                    ta as PTextAnalyzer,
+                    sample.as_ptr(),
+                    scm.as_ptr(),
+                    stp.as_ptr(),
+                    sample.len() as u32,
+                    sgi.as_ptr(),
+                    sgp.as_ptr(),
+                    sactual,
+                    sface,
+                    17.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    &scale2,
+                    FALSE,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    sadv.as_mut_ptr(),
+                    soff.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            for &a in &sadv {
+                assert!(
+                    (a * 2.0 - (a * 2.0).round()).abs() < 1e-4,
+                    "expected transformed device-pixel integer advance, got {a} (a*2={})",
+                    a * 2.0
+                );
+            }
+            assert!(
+                sadv.iter().any(|&a| (a - a.round()).abs() > 0.25),
+                "expected at least one 0.5-DIP glyph advance under 2x transform in {sadv:?}"
+            );
+            release_com(sface);
+            release_com(sfile);
+        }
+
+        release_com(ta);
+        release_com(face);
+        release_com(ffile);
+        release_com(fac);
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+#[test]
+fn factory_retains_registered_font_and_collection_loaders_until_unregistered_or_dropped() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    #[repr(C)]
+    struct CountingLoader {
+        vtbl: *const [usize; 4],
+        refs: AtomicU32,
+        destroyed: Arc<AtomicBool>,
+        stream_vtbl: *const [usize; 7],
+        ttf: Vec<u8>,
+    }
+
+    #[repr(C)]
+    struct CountingStream {
+        vtbl: *const [usize; 7],
+        data: Vec<u8>,
+    }
+
+    unsafe extern "win64" fn cs_qi(_: *mut CountingStream, _: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() {
+            p.write_unaligned(std::ptr::null_mut());
+        }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn cs_addref(_: *mut CountingStream) -> u32 { 1 }
+    unsafe extern "win64" fn cs_release(t: *mut CountingStream) -> u32 {
+        drop(Box::from_raw(t));
+        0
+    }
+    unsafe extern "win64" fn cs_read_frag(
+        t: *mut CountingStream,
+        frag_start: *mut *const c_void,
+        offset: u64,
+        size: u64,
+        ctx: *mut *mut c_void,
+    ) -> HRESULT {
+        let s = &*t;
+        if (offset + size) as usize > s.data.len() {
+            return E_INVALIDARG;
+        }
+        frag_start.write_unaligned(s.data.as_ptr().add(offset as usize) as *const c_void);
+        ctx.write_unaligned(std::ptr::null_mut());
+        S_OK
+    }
+    unsafe extern "win64" fn cs_rel_frag(_: *mut CountingStream, _: *mut c_void) {}
+    unsafe extern "win64" fn cs_get_size(t: *mut CountingStream, out: *mut u64) -> HRESULT {
+        out.write_unaligned((*t).data.len() as u64);
+        S_OK
+    }
+    unsafe extern "win64" fn cs_get_time(_: *mut CountingStream, out: *mut u64) -> HRESULT {
+        out.write_unaligned(0);
+        S_OK
+    }
+
+    unsafe extern "win64" fn cl_qi(_: *mut CountingLoader, _: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() {
+            p.write_unaligned(std::ptr::null_mut());
+        }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn cl_addref(t: *mut CountingLoader) -> u32 {
+        (*t).refs.fetch_add(1, Ordering::AcqRel) + 1
+    }
+    unsafe extern "win64" fn cl_release(t: *mut CountingLoader) -> u32 {
+        let prev = (*t).refs.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 1 {
+            (*t).destroyed.store(true, Ordering::Release);
+            drop(Box::from_raw(t));
+            0
+        } else {
+            prev - 1
+        }
+    }
+    unsafe extern "win64" fn cl_create_stream(
+        t: *mut CountingLoader,
+        _key: *const c_void,
+        _key_sz: u32,
+        out_stream: *mut *mut c_void,
+    ) -> HRESULT {
+        let l = &*t;
+        let st = Box::into_raw(Box::new(CountingStream {
+            vtbl: l.stream_vtbl,
+            data: l.ttf.clone(),
+        }));
+        out_stream.write_unaligned(st as *mut c_void);
+        S_OK
+    }
+
+    unsafe {
+        let stream_vtbl: [usize; 7] = [
+            cs_qi as *const () as usize,
+            cs_addref as *const () as usize,
+            cs_release as *const () as usize,
+            cs_read_frag as *const () as usize,
+            cs_rel_frag as *const () as usize,
+            cs_get_size as *const () as usize,
+            cs_get_time as *const () as usize,
+        ];
+        let loader_vtbl: [usize; 4] = [
+            cl_qi as *const () as usize,
+            cl_addref as *const () as usize,
+            cl_release as *const () as usize,
+            cl_create_stream as *const () as usize,
+        ];
+        crate::com::register_vtable_ptrs(&stream_vtbl);
+        crate::com::register_vtable_ptrs(&loader_vtbl);
+
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+
+        let ttf = build_synthetic_ttf();
+
+        // 1. FontFileLoader: register increments refcount so releasing caller's construction
+        //    ref keeps it alive for CreateCustomFontFileReference; unregister releases it.
+        let fl_destroyed = Arc::new(AtomicBool::new(false));
+        let fl = Box::into_raw(Box::new(CountingLoader {
+            vtbl: &loader_vtbl,
+            refs: AtomicU32::new(1),
+            destroyed: Arc::clone(&fl_destroyed),
+            stream_vtbl: &stream_vtbl,
+            ttf: ttf.clone(),
+        }));
+        assert_eq!(fac_register_font_file_loader(fac as PFactory, fl as *mut c_void), S_OK);
+        assert_eq!((*fl).refs.load(Ordering::Acquire), 2);
+        // Duplicate registration must fail without leaking an extra reference.
+        assert_eq!(
+            fac_register_font_file_loader(fac as PFactory, fl as *mut c_void),
+            DWRITE_E_ALREADYREGISTERED
+        );
+        assert_eq!((*fl).refs.load(Ordering::Acquire), 2);
+
+        // Caller drops its own construction reference; factory must keep loader alive.
+        assert_eq!(release_com(fl as *mut c_void), 1);
+        assert!(!fl_destroyed.load(Ordering::Acquire));
+
+        let key = 7u32;
+        let mut ffile: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_custom_font_file_reference(
+                fac as PFactory,
+                &key as *const u32 as *const c_void,
+                4,
+                fl as *mut c_void,
+                &mut ffile,
+            ),
+            S_OK
+        );
+        assert!(!ffile.is_null());
+        assert_eq!(release_com(ffile), 0);
+        assert!(!fl_destroyed.load(Ordering::Acquire), "factory must still hold registered file loader");
+
+        // Unregister releases the factory's reference and destroys the loader.
+        assert_eq!(fac_unregister_font_file_loader(fac as PFactory, fl as *mut c_void), S_OK);
+        assert!(fl_destroyed.load(Ordering::Acquire), "unregister must release font file loader");
+
+        // 2. FontCollectionLoader: same retain/release lifecycle on unregister.
+        let cl1_destroyed = Arc::new(AtomicBool::new(false));
+        let cl1 = Box::into_raw(Box::new(CountingLoader {
+            vtbl: &loader_vtbl,
+            refs: AtomicU32::new(1),
+            destroyed: Arc::clone(&cl1_destroyed),
+            stream_vtbl: &stream_vtbl,
+            ttf: Vec::new(),
+        }));
+        assert_eq!(fac_register_font_collection_loader(fac as PFactory, cl1 as *mut c_void), S_OK);
+        assert_eq!((*cl1).refs.load(Ordering::Acquire), 2);
+        assert_eq!(
+            fac_register_font_collection_loader(fac as PFactory, cl1 as *mut c_void),
+            DWRITE_E_ALREADYREGISTERED
+        );
+        assert_eq!((*cl1).refs.load(Ordering::Acquire), 2);
+        assert_eq!(release_com(cl1 as *mut c_void), 1);
+        assert!(!cl1_destroyed.load(Ordering::Acquire));
+        assert_eq!(fac_unregister_font_collection_loader(fac as PFactory, cl1 as *mut c_void), S_OK);
+        assert!(cl1_destroyed.load(Ordering::Acquire), "unregister must release collection loader");
+
+        // 3. Loaders still registered when the factory is released are released on factory Drop.
+        let fl2_destroyed = Arc::new(AtomicBool::new(false));
+        let fl2 = Box::into_raw(Box::new(CountingLoader {
+            vtbl: &loader_vtbl,
+            refs: AtomicU32::new(1),
+            destroyed: Arc::clone(&fl2_destroyed),
+            stream_vtbl: &stream_vtbl,
+            ttf: Vec::new(),
+        }));
+        let cl2_destroyed = Arc::new(AtomicBool::new(false));
+        let cl2 = Box::into_raw(Box::new(CountingLoader {
+            vtbl: &loader_vtbl,
+            refs: AtomicU32::new(1),
+            destroyed: Arc::clone(&cl2_destroyed),
+            stream_vtbl: &stream_vtbl,
+            ttf: Vec::new(),
+        }));
+        assert_eq!(fac_register_font_file_loader(fac as PFactory, fl2 as *mut c_void), S_OK);
+        assert_eq!(fac_register_font_collection_loader(fac as PFactory, cl2 as *mut c_void), S_OK);
+        assert_eq!(release_com(fl2 as *mut c_void), 1);
+        assert_eq!(release_com(cl2 as *mut c_void), 1);
+        assert!(!fl2_destroyed.load(Ordering::Acquire));
+        assert!(!cl2_destroyed.load(Ordering::Acquire));
+
+        assert_eq!(release_com(fac), 0);
+        assert!(fl2_destroyed.load(Ordering::Acquire), "factory drop must release registered file loader");
+        assert!(cl2_destroyed.load(Ordering::Acquire), "factory drop must release registered collection loader");
+    }
+}
+
+#[test]
+fn text_analyzer_get_glyphs_honors_is_sideways_vertical_alternates_and_fallback_rejection() {
+    use super::analysis::{
+        ta_get_gdi_compatible_glyph_placements, ta_get_glyph_placements, ta_get_glyphs,
+        PTextAnalyzer,
+    };
+    use super::sfnt::FontMeta;
+    use std::collections::HashMap;
+
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // 1. With a real CJK system font that provides vertical alternates (`vert`),
+        //    `GetGlyphs(..., isSideways = TRUE)` must select vertical glyph forms for
+        //    Japanese brackets/prolonged-sound mark (`「あー」`) rather than returning
+        //    the horizontal glyphs.
+        let cjk_candidates = [
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/CJKSymbolsFallback.ttc",
+        ];
+        if let Some(font_path) = cjk_candidates
+            .iter()
+            .copied()
+            .find(|p| std::path::Path::new(p).exists())
+        {
+            let mut ffile: *mut c_void = std::ptr::null_mut();
+            let path_w = wide(font_path);
+            assert_eq!(
+                fac_create_font_file_reference(fac as PFactory, path_w.as_ptr(), std::ptr::null(), &mut ffile),
+                S_OK
+            );
+            let mut face: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                fac_create_font_face(
+                    fac as PFactory,
+                    DWRITE_FONT_FACE_TYPE_TRUETYPE_COLLECTION,
+                    1,
+                    &ffile,
+                    0,
+                    DWRITE_FONT_SIMULATIONS_NONE,
+                    &mut face,
+                ),
+                S_OK
+            );
+
+            // "「あー」" = LEFT CORNER BRACKET, HIRAGANA A, PROLONGED SOUND MARK, RIGHT CORNER BRACKET
+            let text: [u16; 4] = [0x300C, 0x3042, 0x30FC, 0x300D];
+            let loc_w = wide("ja-JP");
+            let shape = |sideways: BOOL| -> (Vec<u16>, Vec<u16>, Vec<DWRITE_SHAPING_TEXT_PROPERTIES>, Vec<DWRITE_SHAPING_GLYPH_PROPERTIES>) {
+                let mut cm = [0u16; 4];
+                let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 4];
+                let mut gi = [0u16; 8];
+                let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 8];
+                let mut actual = 0u32;
+                assert_eq!(
+                    ta_get_glyphs(
+                        ta as PTextAnalyzer,
+                        text.as_ptr(),
+                        text.len() as u32,
+                        face,
+                        sideways,
+                        FALSE,
+                        std::ptr::null(),
+                        loc_w.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        gi.len() as u32,
+                        cm.as_mut_ptr(),
+                        tp.as_mut_ptr(),
+                        gi.as_mut_ptr(),
+                        gp.as_mut_ptr(),
+                        &mut actual,
+                    ),
+                    S_OK
+                );
+                assert_eq!(actual, 4);
+                (gi[..4].to_vec(), cm.to_vec(), tp.to_vec(), gp[..4].to_vec())
+            };
+
+            let (horiz_gids, horiz_cm, _, _) = shape(FALSE);
+            let (vert_gids, vert_cm, vert_tp, vert_gp) = shape(TRUE);
+            assert_eq!(horiz_cm, vec![0, 1, 2, 3]);
+            assert_eq!(vert_cm, vec![0, 1, 2, 3]);
+            assert!(vert_gids.iter().all(|&g| g != 0), "vertical glyph IDs must be mapped: {vert_gids:?}");
+            // Corner brackets and prolonged sound mark must substitute to vertical alternates.
+            assert_ne!(
+                vert_gids[0], horiz_gids[0],
+                "isSideways=TRUE must select vertical alternate for '「' (h={}, v={})",
+                horiz_gids[0], vert_gids[0]
+            );
+            assert_ne!(
+                vert_gids[2], horiz_gids[2],
+                "isSideways=TRUE must select vertical alternate for 'ー' (h={}, v={})",
+                horiz_gids[2], vert_gids[2]
+            );
+            assert_ne!(
+                vert_gids[3], horiz_gids[3],
+                "isSideways=TRUE must select vertical alternate for '」' (h={}, v={})",
+                horiz_gids[3], vert_gids[3]
+            );
+
+            let mut adv = [0.0f32; 4];
+            let mut off = [DWRITE_GLYPH_OFFSET::default(); 4];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    vert_cm.as_ptr(),
+                    vert_tp.as_ptr(),
+                    text.len() as u32,
+                    vert_gids.as_ptr(),
+                    vert_gp.as_ptr(),
+                    vert_gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    TRUE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    off.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            assert!(adv.iter().all(|&a| a > 0.0), "vertical advances must be positive: {adv:?}");
+            // Default un-adjusted vertical CJK glyphs must have ~0 offsets (CoreText vertical
+            // origin translations stripped cleanly rather than leaking into glyphOffsets).
+            for (idx, o) in off.iter().enumerate() {
+                assert!(
+                    o.advanceOffset.abs() < 1e-3 && o.ascenderOffset.abs() < 1e-3,
+                    "default vertical glyph {idx} offset should be ~0, got {o:?}"
+                );
+            }
+
+            // Verify OpenType `vpal` (vertical proportional alternates) adjusts sideways
+            // advances and offsets in both GetGlyphPlacements and GetGdiCompatibleGlyphPlacements.
+            #[repr(C)]
+            struct FontFeature {
+                tag: u32,
+                param: u32,
+            }
+            #[repr(C)]
+            struct TypoFeatures {
+                features: *const FontFeature,
+                count: u32,
+            }
+            let vpal_feat = FontFeature {
+                tag: u32::from_le_bytes(*b"vpal"),
+                param: 1,
+            };
+            let vpal_set = TypoFeatures {
+                features: &vpal_feat,
+                count: 1,
+            };
+            let feat_ptrs = [&vpal_set as *const TypoFeatures as *const c_void];
+            let feat_lens = [text.len() as u32];
+            let mut adv_vpal = [0.0f32; 4];
+            let mut off_vpal = [DWRITE_GLYPH_OFFSET::default(); 4];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    vert_cm.as_ptr(),
+                    vert_tp.as_ptr(),
+                    text.len() as u32,
+                    vert_gids.as_ptr(),
+                    vert_gp.as_ptr(),
+                    vert_gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    TRUE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    1,
+                    adv_vpal.as_mut_ptr(),
+                    off_vpal.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            let default_sum: f32 = adv.iter().sum();
+            let vpal_sum: f32 = adv_vpal.iter().sum();
+            assert!(
+                vpal_sum < default_sum - 1.0,
+                "vpal=1 must tighten vertical total advance on CJK brackets: default={adv:?} (sum={default_sum}), vpal={adv_vpal:?} (sum={vpal_sum}), off={off_vpal:?}"
+            );
+            assert!(
+                off_vpal[0].advanceOffset < -1.0 && off_vpal[1].advanceOffset.abs() < 1e-3,
+                "vpal=1 should apply top-trim offset to opening bracket without drifting subsequent glyphs: {off_vpal:?}"
+            );
+
+            // GetGdiCompatibleGlyphPlacements must also apply sideways shaping features
+            // (natural mode matches GetGlyphPlacements exactly; classic snaps to pixel grid).
+            let mut gdi_adv_nat = [0.0f32; 4];
+            let mut gdi_off_nat = [DWRITE_GLYPH_OFFSET::default(); 4];
+            assert_eq!(
+                ta_get_gdi_compatible_glyph_placements(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    vert_cm.as_ptr(),
+                    vert_tp.as_ptr(),
+                    text.len() as u32,
+                    vert_gids.as_ptr(),
+                    vert_gp.as_ptr(),
+                    vert_gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    std::ptr::null(),
+                    TRUE,
+                    TRUE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    1,
+                    gdi_adv_nat.as_mut_ptr(),
+                    gdi_off_nat.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            for i in 0..4 {
+                assert!((gdi_adv_nat[i] - adv_vpal[i]).abs() < 1e-4);
+                assert!((gdi_off_nat[i].advanceOffset - off_vpal[i].advanceOffset).abs() < 1e-4);
+            }
+
+            let mut gdi_adv_classic = [0.0f32; 4];
+            let mut gdi_off_classic = [DWRITE_GLYPH_OFFSET::default(); 4];
+            assert_eq!(
+                ta_get_gdi_compatible_glyph_placements(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    vert_cm.as_ptr(),
+                    vert_tp.as_ptr(),
+                    text.len() as u32,
+                    vert_gids.as_ptr(),
+                    vert_gp.as_ptr(),
+                    vert_gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    std::ptr::null(),
+                    FALSE,
+                    TRUE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    feat_ptrs.as_ptr(),
+                    feat_lens.as_ptr(),
+                    1,
+                    gdi_adv_classic.as_mut_ptr(),
+                    gdi_off_classic.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            assert!(
+                gdi_adv_classic.iter().all(|&a| (a - a.round()).abs() < 1e-5),
+                "classic GDI sideways placement should snap advances to whole pixels: {gdi_adv_classic:?}"
+            );
+
+            let _ = release_com(face);
+            let _ = release_com(ffile);
+        }
+
+        // 2. Built-in fallback face (no backing SFNT bytes) must honestly return E_NOTIMPL for
+        //    isSideways=TRUE runs rather than silently returning horizontal cmap glyphs.
+        let fallback_meta = Arc::new(FontMeta {
+            family_name: "FallbackOnly".to_string(),
+            face_name: "Regular".to_string(),
+            weight: DWRITE_FONT_WEIGHT_NORMAL,
+            stretch: DWRITE_FONT_STRETCH_NORMAL,
+            style: DWRITE_FONT_STYLE_NORMAL,
+            is_symbol: false,
+            is_monospace: false,
+            face_type: DWRITE_FONT_FACE_TYPE_TRUETYPE,
+            face_index: 0,
+            glyph_count: 256,
+            metrics: super::sfnt::default_fallback_metrics(),
+            info_strings: HashMap::new(),
+            file_path: None,
+            raw_bytes: None,
+            custom_file: None,
+        });
+        let fb_face = new_font_face(FontFaceInner::from_meta(fallback_meta, 0));
+        let latin = ['A' as u16, 'B' as u16];
+        let mut cm = [0u16; 2];
+        let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 2];
+        let mut gi = [0u16; 4];
+        let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 4];
+        let mut actual = 99u32;
+        assert_eq!(
+            ta_get_glyphs(
+                ta as PTextAnalyzer,
+                latin.as_ptr(),
+                latin.len() as u32,
+                fb_face,
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gi.len() as u32,
+                cm.as_mut_ptr(),
+                tp.as_mut_ptr(),
+                gi.as_mut_ptr(),
+                gp.as_mut_ptr(),
+                &mut actual,
+            ),
+            E_NOTIMPL
+        );
+        assert_eq!(actual, 0);
+
+        // Fallback face without SFNT bytes must also reject featured sideways placement
+        // (e.g. `vpal`) honestly with E_NOTIMPL in both GetGlyphPlacements and
+        // GetGdiCompatibleGlyphPlacements.
+        #[repr(C)]
+        struct FbFontFeature {
+            tag: u32,
+            param: u32,
+        }
+        #[repr(C)]
+        struct FbTypoFeatures {
+            features: *const FbFontFeature,
+            count: u32,
+        }
+        let fb_vpal = FbFontFeature {
+            tag: u32::from_le_bytes(*b"vpal"),
+            param: 1,
+        };
+        let fb_fset = FbTypoFeatures {
+            features: &fb_vpal,
+            count: 1,
+        };
+        let fb_fptrs = [&fb_fset as *const FbTypoFeatures as *const c_void];
+        let fb_flens = [latin.len() as u32];
+        let fb_gids = [1u16, 2u16];
+        let mut fb_adv = [0.0f32; 2];
+        let mut fb_off = [DWRITE_GLYPH_OFFSET::default(); 2];
+        assert_eq!(
+            ta_get_glyph_placements(
+                ta as PTextAnalyzer,
+                latin.as_ptr(),
+                cm.as_ptr(),
+                tp.as_ptr(),
+                latin.len() as u32,
+                fb_gids.as_ptr(),
+                gp.as_ptr(),
+                fb_gids.len() as u32,
+                fb_face,
+                24.0f32.to_bits(),
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                fb_fptrs.as_ptr(),
+                fb_flens.as_ptr(),
+                1,
+                fb_adv.as_mut_ptr(),
+                fb_off.as_mut_ptr(),
+            ),
+            E_NOTIMPL
+        );
+        assert_eq!(
+            ta_get_gdi_compatible_glyph_placements(
+                ta as PTextAnalyzer,
+                latin.as_ptr(),
+                cm.as_ptr(),
+                tp.as_ptr(),
+                latin.len() as u32,
+                fb_gids.as_ptr(),
+                gp.as_ptr(),
+                fb_gids.len() as u32,
+                fb_face,
+                24.0f32.to_bits(),
+                1.0f32.to_bits(),
+                std::ptr::null(),
+                FALSE,
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                fb_fptrs.as_ptr(),
+                fb_flens.as_ptr(),
+                1,
+                fb_adv.as_mut_ptr(),
+                fb_off.as_mut_ptr(),
+            ),
+            E_NOTIMPL
+        );
+
+        let _ = release_com(fb_face);
+        let _ = release_com(ta);
+        let _ = release_com(fac);
+    }
+}

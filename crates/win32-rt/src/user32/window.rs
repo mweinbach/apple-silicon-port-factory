@@ -820,6 +820,7 @@ fn free_window(hwnd: usize) {
     }
     super::input::forget_window(hwnd);
     super::misc::forget_device_notifications(hwnd);
+    super::misc::forget_hotkeys(hwnd);
     crate::misc::uxtheme::forget_window_subclasses(hwnd);
     super::dialog::forget_dialog(hwnd);
     super::controls::forget_control(hwnd);
@@ -2372,6 +2373,72 @@ pub unsafe extern "win64" fn GetDpiForWindow(hwnd: HWND) -> u32 {
 
 pub unsafe extern "win64" fn GetDpiForSystem() -> u32 {
     dpi()
+}
+
+/// Allocate a lightweight dialog-owned Win32 `HWND` for native modal alerts
+/// (such as `comctl32!TaskDialogIndirect`) without spawning an extra `NSWindow`.
+/// Callers must tear it down with [`DestroyWindow`] on the creating thread.
+pub(crate) fn create_virtual_dialog_hwnd(
+    class_name: &str,
+    title: &str,
+    owner: usize,
+    wndproc: usize,
+) -> usize {
+    let cls_key = ClassName::Name(class_name.to_string());
+    let cls = match class::find(&cls_key) {
+        Some(c) => c,
+        None => {
+            let _ = class::register(class::ClassDesc {
+                name: class_name.to_string(),
+                style: 0,
+                wndproc,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                unicode: true,
+            });
+            class::find(&cls_key).expect("virtual dialog class registration failed")
+        }
+    };
+    let tid = crate::teb::thread_id();
+    let _ = message::current_queue();
+    let hwnd = NEXT_HWND.fetch_add(4, Ordering::Relaxed);
+    let style = ws::POPUP | ws::CAPTION;
+    let rect = RECT::new(0, 0, 320, 160);
+    let win = Arc::new(Window {
+        hwnd,
+        tid,
+        class: cls,
+        d: Mutex::new(WinData {
+            wndproc,
+            style,
+            exstyle: 0,
+            parent: 0,
+            owner: if owner != 0 && exists(owner) { owner } else { 0 },
+            id: 0,
+            instance: 0,
+            userdata: 0,
+            extra: Vec::new(),
+            text: title.encode_utf16().collect(),
+            rect,
+            client: rect,
+            normal: rect,
+            visible: false,
+            minimized: false,
+            maximized: false,
+            enabled: true,
+            topmost: false,
+            native: false,
+            native_control: false,
+            destroying: false,
+            erase_pending: false,
+        }),
+    });
+    table().write().unwrap().map.insert(hwnd, win);
+    hwnd
 }
 
 #[cfg(test)]
