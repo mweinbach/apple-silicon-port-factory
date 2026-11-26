@@ -110,6 +110,11 @@ impl Asm {
         let imm5 = 1u32 << (size & 3);
         self.emit(0x4E00_0C00 | imm5 << 16 | rn << 5 | vd);
     }
+    /// `dup vd.16b, vn.b[lane]` (broadcast 8-bit lane across 128-bit vector).
+    pub(super) fn v_dup_lane_b(&mut self, vd: u32, vn: u32, lane: u32) {
+        let imm5 = ((lane & 15) << 1) | 0b0001;
+        self.emit(0x4E00_0400 | imm5 << 16 | vn << 5 | vd);
+    }
     /// `dup vd.4s, vn.s[lane]` (broadcast 32-bit lane across 128-bit vector).
     pub(super) fn v_dup_lane_s(&mut self, vd: u32, vn: u32, lane: u32) {
         let imm5 = ((lane & 3) << 3) | 0b0100;
@@ -377,7 +382,13 @@ impl Tr<'_> {
         use fast::*;
         let mem_form = matches!(
             op.kind,
-            K_VSHUF_RM | K_VINT_RM | K_VFP_RM | K_VAES_RM | K_VGFNI_RM | K_VVNNI_RM
+            K_VSHUF_RM
+                | K_VINT_RM
+                | K_VFP_RM
+                | K_VAES_RM
+                | K_VGFNI_RM
+                | K_VVNNI_RM
+                | K_VEXT_RM
         );
         let is_256 = (op.w & 3) == VM_V256;
         if !mem_form {
