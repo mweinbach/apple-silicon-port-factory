@@ -11,11 +11,11 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **42** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 26 |
+| Total remaining stub sites | **21** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 5 |
 | `failing` (honest-failing macro exports) | 1 |
 | `middleware_stub` (third-party/engine middleware fallbacks) | 15 |
-| DLLs with remaining stubs | 8 |
+| DLLs with remaining stubs | 6 |
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
@@ -27,6 +27,7 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 | [`graphics.md`](stub-backlog.d/graphics.md) | Stub Backlog — D3D11, D3D12 and DXGI (`stubs/graphics`) |
 | [`guest-corpus-bench.md`](stub-backlog.d/guest-corpus-bench.md) | Stub & API Gap Backlog — `toolkit/guest-corpus-bench` |
 | [`kernel-core.md`](stub-backlog.d/kernel-core.md) | Stub Backlog — `stubs/kernel-core` |
+| [`kernel-files-nls.md`](stub-backlog.d/kernel-files-nls.md) | Stub Backlog — `stubs/kernel-files-nls` |
 | [`middleware.md`](stub-backlog.d/middleware.md) | Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions) |
 | [`window-input-ui.md`](stub-backlog.d/window-input-ui.md) | Stub Backlog — Window, Input, UI & Text DLLs (`stubs/window-input-ui`) |
 
@@ -331,6 +332,50 @@ Scope: 28 stub sites across `crates/win32-rt/src/kernel32/{memory,threads,proces
 
 None — all 28 stub sites in scope have been resolved.
 
+### From `docs/stub-backlog.d/kernel-files-nls.md`
+
+# Stub Backlog — `stubs/kernel-files-nls`
+
+Scope: `crates/win32-rt/src/kernel32/file.rs` (8), `crates/win32-rt/src/kernel32/string.rs` (7), and `crates/win32-rt/src/ucrt/{locale,runtime,stdio}.rs` (6). **21 sites before → 0 sites after** (18 made real, 3 native-unsupported matching Windows without the privilege/capability, 0 leftovers).
+
+## Removed Sites
+
+| DLL!API | Disposition | File | Summary |
+|---|---|---|---|
+| `kernel32.dll!AllocConsole` | Made real | `crates/win32-rt/src/kernel32/file.rs` | Allocates a real POSIX PTY-backed console session on macOS (dup'd stdio on iOS) with background master-to-stderr drain, binds `FileKind::Console` std handles, tracks console mode/codepages/title, and rejects a second `AllocConsole` with `ERROR_ACCESS_DENIED` until `FreeConsole`. |
+| `kernel32.dll!GetFileInformationByHandleEx` | Made real | `crates/win32-rt/src/kernel32/file.rs` | Implemented all documented read classes: `FileStreamInfo` (7, `::$DATA`), `FileCompressionInfo` (8), `FileAttributeTagInfo` (9 with symlink tag), `FileIdBothDirectoryInfo`/`Restart` (10/11), `FileRemoteProtocolInfo` (13 via `fstatfs` `MNT_LOCAL`), `FileFullDirectoryInfo`/`Restart` (14/15), `FileStorageInfo` (16 via `statfs`/IOKit), `FileIdExtdDirectoryInfo`/`Restart` (19/20), `FileCaseSensitiveInfo` (23 via `fpathconf(_PC_CASE_SENSITIVE)`), and `FileNormalizedNameInfo` (24). |
+| `kernel32.dll!SetFileInformationByHandle` | Made real | `crates/win32-rt/src/kernel32/file.rs` | Implemented all documented write classes: `FileBasicInfo` (0 with read-only attribute update), `FileRenameInfo` (3) & `FileRenameInfoEx` (22 with `RootDirectory` resolution), `FileDispositionInfo`/`Ex` (4/21), `FileAllocationInfo` (5 with `F_PREALLOCATE` / shrink), `FileEndOfFileInfo` (6), `FileIoPriorityHintInfo` (12), and `FileCaseSensitiveInfo` (23). |
+| `kernel32.dll!MoveFileExW` | Native-unsupported | `crates/win32-rt/src/kernel32/file.rs` | Validates `MOVEFILE_DELAY_UNTIL_REBOOT` / `MOVEFILE_COPY_ALLOWED` conflict (`ERROR_INVALID_PARAMETER`) and non-null `dst` requirement; returns `FALSE` + `ERROR_ACCESS_DENIED` for `MOVEFILE_DELAY_UNTIL_REBOOT` matching non-admin Windows behavior; adds `MOVEFILE_WRITE_THROUGH` `sync_all`. |
+| `kernel32.dll!MoveFileExA` | Native-unsupported | `crates/win32-rt/src/kernel32/file.rs` | Delegates to shared `move_file_ex` with identical `MOVEFILE_DELAY_UNTIL_REBOOT` and `NULL` destination validation. |
+| `kernel32.dll!MapViewOfFile3` | Native-unsupported | `crates/win32-rt/src/kernel32/file.rs` | Allows `NULL`, `CURRENT_PROCESS`, and `ProcessObj` (own process from `OpenProcess`); returns `ERROR_INVALID_HANDLE` for invalid handles and `ERROR_ACCESS_DENIED` for another OS process (`ChildProcessObj`), matching Windows without `PROCESS_VM_OPERATION`. |
+| `kernel32.dll!DeviceIoControl` (`IOCTL_STORAGE_QUERY_PROPERTY`) | Made real | `crates/win32-rt/src/kernel32/file.rs` | Queries real volume/disk properties via `statfs` + macOS IOKit (`IOBSDNameMatching` / `IORegistryEntrySearchCFProperty`), implementing property IDs `0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 14, 17` and `PropertyExistsQuery`, returning `ERROR_NOT_SUPPORTED` for properties not exposed by the hardware. |
+| `kernel32.dll!DeviceIoControl` (control codes) | Made real | `crates/win32-rt/src/kernel32/file.rs` | Implemented `IOCTL_STORAGE_GET_DEVICE_NUMBER`, `IOCTL_STORAGE_CHECK_VERIFY`/`2`, `IOCTL_STORAGE_GET_MEDIA_TYPES_EX`, `IOCTL_STORAGE_GET_HOTPLUG_INFO`, `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`, `IOCTL_VOLUME_IS_OFFLINE`, `IOCTL_DISK_GET_DRIVE_GEOMETRY`/`EX`, `IOCTL_DISK_GET_LENGTH_INFO`, `IOCTL_DISK_IS_WRITABLE`, `IOCTL_DISK_GET_PARTITION_INFO_EX`, `FSCTL_GET_REPARSE_POINT` (POSIX symlinks), `FSCTL_SET_SPARSE`, `FSCTL_QUERY_ALLOCATED_RANGES` (`SEEK_DATA`/`SEEK_HOLE`), `FSCTL_SET_ZERO_DATA`, `FSCTL_GET_COMPRESSION`/`SET_COMPRESSION`, `FSCTL_IS_VOLUME_MOUNTED`, `FSCTL_GET_NTFS_VOLUME_DATA`, and `FSCTL_LOCK_VOLUME`/`UNLOCK_VOLUME`; unrecognized codes return `ERROR_INVALID_FUNCTION`. |
+| `kernel32.dll!LCMapStringEx` (`LCMAP_HASH`) | Made real | `crates/win32-rt/src/kernel32/string.rs` | Computes a deterministic 32-bit FNV-1a hash over ICU locale-aware sort-weight bytes (`cchDest` in bytes = 4), matching case/norm equivalence. |
+| `kernel32.dll!LCMapStringEx` (flags) | Made real | `crates/win32-rt/src/kernel32/string.rs` | Implements full ICU-backed casing (`LCMAP_LINGUISTIC_CASING`), `LCMAP_SORTKEY`, `LCMAP_HIRAGANA`/`KATAKANA`, `LCMAP_HALFWIDTH`/`FULLWIDTH`, `LCMAP_SIMPLIFIED_CHINESE`/`TRADITIONAL_CHINESE`, `LCMAP_BYTEREV`, and strict `ERROR_INVALID_FLAGS` validation. |
+| `kernel32.dll!get_locale_info` (`LCTYPE`) | Made real | `crates/win32-rt/src/kernel32/string.rs` | Implements full Windows `LCTYPE` catalog (`0x01..=0x7F`, `0x1001..=0x1018`, including `LOCALE_FONTSIGNATURE`) via Apple `/usr/lib/libicucore.A.dylib`; invalid `LCTYPE` returns `ERROR_INVALID_FLAGS`. |
+| `kernel32.dll!GetLocaleInfoW` | Made real | `crates/win32-rt/src/kernel32/string.rs` | Resolves real Windows LCIDs and BCP-47 locale names through ICU (`uloc_getLocaleForLCID` / `uloc_forLanguageTag`) instead of answering en-US; invalid LCIDs fail with `ERROR_INVALID_PARAMETER`. |
+| `kernel32.dll!GetGeoInfoW` | Made real | `crates/win32-rt/src/kernel32/string.rs` | Maps Windows GeoIDs to ISO-3166-1 countries and answers `GEO_*` queries (localized names, ISO2/ISO3, UN numeric, dialing code, lat/lon, currency, LCID) via ICU; invalid GeoIDs return `ERROR_INVALID_PARAMETER`. |
+| `kernel32.dll!GetNumberFormatEx` | Made real | `crates/win32-rt/src/kernel32/string.rs` | Honors custom `NUMBERFMTW` (`NumDigits`, `LeadingZero`, multi-level `Grouping`, `lpDecimalSep`, `lpThousandSep`, `NegativeOrder` 0–4, half-up rounding, flag validation) and ICU locale defaults when `lpFormat == NULL`. |
+| `kernel32.dll!GetCalendarInfoEx` | Made real | `crates/win32-rt/src/kernel32/string.rs` | Implements all documented `CALTYPE` constants (`0x01..=0x3C`, `CAL_RETURN_NUMBER`) backed by ICU calendar/date symbols for the requested locale. |
+| `ucrtbase.dll!setlocale` | Made real | `crates/win32-rt/src/ucrt/locale.rs` | Per-category (`LC_ALL..LC_TIME`) locale state supporting BCP-47, legacy CRT (`German_Germany.1252`), `.codepage`, and composite locale strings via ICU, with dynamic `localeconv()` and `___lc_*` queries; invalid locales return `NULL`. |
+| `ucrtbase.dll!_setmbcp` | Made real | `crates/win32-rt/src/ucrt/locale.rs` | Tracks active multibyte codepage supporting `_MB_CP_SBCS`, `_MB_CP_OEM`, `_MB_CP_ANSI`, `_MB_CP_LOCALE`, and all valid Windows SBCS/DBCS/UTF-8 codepages via ICU; invalid codepages fail with `-1` and `EINVAL`. |
+| `ucrtbase.dll!_getch` | Made real | `crates/win32-rt/src/ucrt/runtime.rs` | Reads 1 character directly from the active console input fd using raw `termios` (`~ICANON & ~ECHO`) when attached to a TTY, or POSIX `read(1)` on pipes/files, returning `-1` on EOF (paired with `poll`-based `_kbhit`). |
+| `ucrtbase.dll!system` | Made real | `crates/win32-rt/src/ucrt/runtime.rs` | Flushes all `FILE` streams, checks `%COMSPEC%` (`C:\Windows\System32\cmd.exe`), executes `%COMSPEC% /c <cmd>` via `CreateProcessW` if a real guest interpreter exists, and returns `0` (for `NULL`) or `-1` + `ENOENT` (for non-null) when no Windows command interpreter is installed without host shell escape. |
+| `ucrtbase.dll!open_host_path` | Made real | `crates/win32-rt/src/ucrt/stdio.rs` | Full `_O_WTEXT`, `_O_U16TEXT`, and `_O_U8TEXT` translation in `_read`/`_write` (UTF-16LE and UTF-8 ↔ UTF-16LE with CRLF ↔ LF, BOM handling for `_O_WTEXT`, even-byte `EINVAL`, exact `_setmode` tracking). |
+| `ucrtbase.dll!parse_mode` | Made real | `crates/win32-rt/src/ucrt/stdio.rs` | Full `fopen(..., "..., ccs=UTF-16LE|UTF-8|UNICODE")` support with MSVC BOM precedence, BOM emission on new/truncated files, and UTF-16 wide stream I/O (`fgetwc`, `fputwc`, `fgetws`, `fputws`, `ungetwc`). |
+
+## Native-Unsupported (Matches Windows Without the Feature)
+
+| DLL!API | Trigger / Condition | Returned Behavior | Windows Documentation Citation |
+|---|---|---|---|
+| `kernel32.dll!MoveFileExW` | `dwFlags & MOVEFILE_DELAY_UNTIL_REBOOT` | Returns `FALSE` with `ERROR_ACCESS_DENIED` (5), or `ERROR_INVALID_PARAMETER` (87) if combined with `MOVEFILE_COPY_ALLOWED`. | Microsoft Learn, `MoveFileExW`: `MOVEFILE_DELAY_UNTIL_REBOOT` writes `HKLM\...\Session Manager\PendingFileRenameOperations` and "can be used only if the process is in the context of a user who belongs to the administrators group or the LocalSystem account" (non-admin callers receive `ERROR_ACCESS_DENIED`). |
+| `kernel32.dll!MoveFileExA` | `dwFlags & MOVEFILE_DELAY_UNTIL_REBOOT` | Returns `FALSE` with `ERROR_ACCESS_DENIED` (5), or `ERROR_INVALID_PARAMETER` (87) if combined with `MOVEFILE_COPY_ALLOWED`. | Microsoft Learn, `MoveFileExA`: identical non-admin privilege rule as `MoveFileExW`. |
+| `kernel32.dll!MapViewOfFile3` | `Process` handle refers to a different OS process (`ChildProcessObj`) | Returns `NULL` with `ERROR_ACCESS_DENIED` (5) (`ERROR_INVALID_HANDLE` for invalid handles; own `ProcessObj` succeeds). | Microsoft Learn, `MapViewOfFile3`: requires `PROCESS_VM_OPERATION` on `Process` and fails with `ERROR_ACCESS_DENIED` when mapping into another process is denied (macOS SIP / hardened runtime and iOS forbid `task_for_pid` foreign address-space mapping). |
+
+## Remaining Sites in Scope
+
+None — 0 stub sites remain across all 5 files in scope.
+
 ### From `docs/stub-backlog.d/middleware.md`
 
 # Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions)
@@ -505,37 +550,12 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | DLL | Count | Reason | Next Step |
 |---|---:|---|---|
-| `kernel32.dll` | 15 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
 | `physx3common_x64.dll` | 12 | PhysX 3.4 geometry/mesh query path without cooked mesh payload | Prefer shipping PhysX3*.dll under ARM64 JIT, or decode cooked BVH/triangle mesh payloads in physx3common_x64. |
-| `ucrtbase.dll` | 6 | Uncommon CRT locale, multibyte codepage, UTF-16 stream encoding, or interactive console/shell call | Add UTF-16 FILE stream translation and locale/codepage tables; keep system() safely sandboxed/refused. |
 | `d3d11.dll` | 4 | Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop) | Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them. |
 | `nri.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `crypt32.dll` | 1 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
 | `directml.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `shell32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-
-### `kernel32.dll` (15)
-
-- **Reason:** Partial Windows kernel/file/memory/locale/job/threadpool sub-feature
-- **Next step:** Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `AllocConsole` | `stub` | `crates/win32-rt/src/kernel32/file.rs:477` | `"no separate console window; stdout/stderr of the loader act as the console"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7291` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7319` | `"DeviceIoControl code {code:#x} unsupported"` |
-| `GetCalendarInfoEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1354` | `"GetCalendarInfoEx type {ty:#x}"` |
-| `GetFileInformationByHandleEx` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2287` | `"GetFileInformationByHandleEx class {class} not supported"` |
-| `GetGeoInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1125` | `"GetGeoInfo for geo id {geo} answered with US data"` |
-| `GetLocaleInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:918` | `"locale {lcid:#x} not available; answering with en-US data"` |
-| `GetNumberFormatEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1323` | `"custom NUMBERFMT ignored"` |
-| `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:552` | `"LCMAP_HASH unsupported"` |
-| `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:578` | `"LCMapString flags {flags:#x} partially honoured"` |
-| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7082` | `"MapViewOfFile3 on another process"` |
-| `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2746` | `"MoveFileExA delete-on-reboot ignored"` |
-| `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2739` | `"MoveFileExW delete-on-reboot ignored"` |
-| `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2418` | `"SetFileInformationByHandle class {class} not supported"` |
-| `get_locale_info` | `stub` | `crates/win32-rt/src/kernel32/string.rs:865` | `"GetLocaleInfo LCTYPE {lctype:#x} unknown"` |
 
 ### `physx3common_x64.dll` (12)
 
@@ -556,20 +576,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `mesh_find_overlap_triangle_mesh` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2614` | `"PxMeshQuery::findOverlapTriangleMesh without cooked triangle mesh payload"` |
 | `mesh_get_triangle` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2629` | `"PxMeshQuery::getTriangle without cooked triangle mesh payload"` |
 | `mesh_sweep` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2642` | `"PxMeshQuery::sweep without cooked triangle mesh payload"` |
-
-### `ucrtbase.dll` (6)
-
-- **Reason:** Uncommon CRT locale, multibyte codepage, UTF-16 stream encoding, or interactive console/shell call
-- **Next step:** Add UTF-16 FILE stream translation and locale/codepage tables; keep system() safely sandboxed/refused.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `_getch` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:953` | `"_getch returns EOF"` |
-| `_setmbcp` | `stub` | `crates/win32-rt/src/ucrt/locale.rs:274` | `"_setmbcp({cp}) unsupported"` |
-| `open_host_path` | `stub` | `crates/win32-rt/src/ucrt/stdio.rs:210` | `"Unicode text modes (0x{oflag:x}) treated as plain text mode"` |
-| `parse_mode` | `stub` | `crates/win32-rt/src/ucrt/stdio.rs:1097` | `"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"` |
-| `setlocale` | `stub` | `crates/win32-rt/src/ucrt/locale.rs:64` | `"setlocale({cat}, {n:?}): locale not available"` |
-| `system` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:965` | `"system({:?}) refused", from_ansi(cmd)` |
 
 ### `d3d11.dll` (4)
 

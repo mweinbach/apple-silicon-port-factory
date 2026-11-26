@@ -1,4 +1,4 @@
-//! Job/ECS-system timeline profiler (`AW2_JOB_PROF=<secs>[,<dur_secs>]`, diagnostic only).
+//! Job/ECS-system timeline profiler (`PORT_JOB_PROF=<secs>[,<dur_secs>]`, legacy alias `AW2_JOB_PROF`, diagnostic only).
 //!
 //! Records one event per ECS system call, scheduler job and `start_scheduling` graph run
 //! for a window starting `<secs>` seconds after the first recorded call (default length
@@ -78,20 +78,52 @@ static MODE: AtomicU32 = AtomicU32::new(0);
 static STATE: OnceLock<Option<State>> = OnceLock::new();
 static NEXT_THR: AtomicU16 = AtomicU16::new(1);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
-/// `AW2_JOB_PROF_KINDS=<hex>`: bit `1 << K_*` per event kind to record (default all).
+/// `PORT_JOB_PROF_KINDS=<hex>` (legacy alias `AW2_JOB_PROF_KINDS`): bit `1 << K_*`
+/// per event kind to record (default all).
 static KINDS: AtomicU32 = AtomicU32::new(u32::MAX);
 
 thread_local! {
     static THR: u16 = NEXT_THR.fetch_add(1, Ordering::Relaxed);
 }
 
+fn job_prof_window_from_env() -> Option<(f64, f64)> {
+    let v = port_manifest::knobs::get_str("PORT_JOB_PROF");
+    let mut it = v.split(',').map(|s| s.trim().parse::<f64>().ok());
+    let start = it.next().flatten()?;
+    let dur = it.next().flatten().unwrap_or(2.0);
+    Some((start, dur))
+}
+
+fn job_prof_kinds_from_env() -> u32 {
+    let v = port_manifest::knobs::get_str("PORT_JOB_PROF_KINDS");
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
+        return u32::MAX;
+    }
+    u32::from_str_radix(
+        trimmed.trim_start_matches("0x").trim_start_matches("0X"),
+        16,
+    )
+    .unwrap_or(u32::MAX)
+}
+
+fn job_mark_vas_from_env() -> Vec<u64> {
+    let v = port_manifest::knobs::get_str("PORT_JOB_MARK");
+    v.split(',')
+        .filter_map(|s| {
+            u64::from_str_radix(
+                s.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            )
+            .ok()
+        })
+        .collect()
+}
+
 #[cold]
 fn init() -> bool {
     let st = STATE.get_or_init(|| {
-        let v = std::env::var("AW2_JOB_PROF").ok()?;
-        let mut it = v.split(',').map(|s| s.trim().parse::<f64>().ok());
-        let start = it.next().flatten()?;
-        let dur = it.next().flatten().unwrap_or(2.0);
+        let (start, dur) = job_prof_window_from_env()?;
         let buf = (0..CAP)
             .map(|_| core::cell::UnsafeCell::new(Event { t0: 0, t1: 0, id: 0, sys: 0, gid: 0, thr: 0, kind: 0 }))
             .collect::<Vec<_>>()
@@ -108,10 +140,7 @@ fn init() -> bool {
     });
     let on = st.is_some();
     if on {
-        let kinds = std::env::var("AW2_JOB_PROF_KINDS")
-            .ok()
-            .and_then(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
-            .unwrap_or(u32::MAX);
+        let kinds = job_prof_kinds_from_env();
         KINDS.store(kinds, Ordering::Relaxed);
         if kinds & (1 << K_EXT) != 0 {
             win32_rt::hitch::set_span_hook(ext_span);
@@ -153,20 +182,12 @@ fn gpu_commit(kind: u32, ncb: u32, commit: u64, start: u64, end: u64) {
     }
 }
 
-/// `AW2_JOB_MARK=<hex va>[,<hex va>...]`: guest call targets the call bridges record as
-/// [`K_MARK`] spans (`sys` = 0xffff). Consulted only when a dispatch-cache slot is filled.
+/// `PORT_JOB_MARK=<hex va>[,<hex va>...]` (legacy alias `AW2_JOB_MARK`): guest
+/// call targets the call bridges record as [`K_MARK`] spans (`sys` = 0xffff).
+/// Consulted only when a dispatch-cache slot is filled.
 pub fn marked(va: u64) -> bool {
     static SET: OnceLock<Vec<u64>> = OnceLock::new();
-    SET.get_or_init(|| {
-        std::env::var("AW2_JOB_MARK")
-            .map(|v| {
-                v.split(',')
-                    .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-    .contains(&va)
+    SET.get_or_init(job_mark_vas_from_env).contains(&va)
 }
 
 /// Start timestamp for an event, or `None` when profiling is off.
@@ -248,5 +269,78 @@ fn dump(s: &State) {
     match std::fs::write(&path, &out) {
         Ok(()) => log::warn!("jobprof: wrote {n} events to {path}"),
         Err(e) => log::warn!("jobprof: write {path} failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
+            for &k in keys {
+                std::env::remove_var(k);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn port_job_prof_precedence_canonical_beats_alias() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::capture(&[
+            "PORT_JOB_PROF",
+            "AW2_JOB_PROF",
+            "PORT_JOB_PROF_KINDS",
+            "AW2_JOB_PROF_KINDS",
+            "PORT_JOB_MARK",
+            "AW2_JOB_MARK",
+        ]);
+
+        assert_eq!(job_prof_window_from_env(), None);
+        assert_eq!(job_prof_kinds_from_env(), u32::MAX);
+        assert!(job_mark_vas_from_env().is_empty());
+
+        // Legacy aliases still work when canonical names are unset.
+        std::env::set_var("AW2_JOB_PROF", "1.5,3.0");
+        std::env::set_var("AW2_JOB_PROF_KINDS", "0x2f");
+        std::env::set_var("AW2_JOB_MARK", "0x140001000,140002000");
+        assert_eq!(job_prof_window_from_env(), Some((1.5, 3.0)));
+        assert_eq!(job_prof_kinds_from_env(), 0x2f);
+        assert_eq!(job_mark_vas_from_env(), vec![0x14000_1000, 0x14000_2000]);
+
+        // Canonical PORT_* names beat legacy AW2_* aliases.
+        std::env::set_var("PORT_JOB_PROF", "4.0");
+        std::env::set_var("PORT_JOB_PROF_KINDS", "0x10");
+        std::env::set_var("PORT_JOB_MARK", "0x140009000");
+        assert_eq!(job_prof_window_from_env(), Some((4.0, 2.0)));
+        assert_eq!(job_prof_kinds_from_env(), 0x10);
+        assert_eq!(job_mark_vas_from_env(), vec![0x14000_9000]);
+
+        // Empty canonical falls back to legacy alias.
+        std::env::set_var("PORT_JOB_PROF", "");
+        std::env::set_var("PORT_JOB_PROF_KINDS", "");
+        std::env::set_var("PORT_JOB_MARK", "");
+        assert_eq!(job_prof_window_from_env(), Some((1.5, 3.0)));
+        assert_eq!(job_prof_kinds_from_env(), 0x2f);
+        assert_eq!(job_mark_vas_from_env(), vec![0x14000_1000, 0x14000_2000]);
     }
 }
