@@ -2865,7 +2865,7 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             (out as *mut u32).write_unaligned(0); // NextEntryOffset (last stream)
             (out.add(4) as *mut u32).write_unaligned(name_bytes as u32);
             put_ft(out.add(8), m.len());
-            put_ft(out.add(16), (m.blocks() * 512).max(m.len()));
+            put_ft(out.add(16), m.blocks() * 512);
             std::ptr::copy_nonoverlapping(stream_name.as_ptr().cast::<u8>(), out.add(24), name_bytes);
         }
         8 => {
@@ -12047,6 +12047,23 @@ mod tests {
             let sname_u16 = crate::strings::read_wide_slice(sbuf.as_ptr().add(24) as *const u16, name_len / 2);
             assert_eq!(String::from_utf16_lossy(&sname_u16), "::$DATA");
             assert_eq!(stream_sz, 16);
+
+            // Sparse file: FileStreamInfo preserves actual allocated bytes (not clamped to StreamSize).
+            let sparse_p = dir.join("sparse_stream.dat");
+            {
+                let sf = std::fs::File::create(&sparse_p).unwrap();
+                sf.set_len(16 * 1024 * 1024).unwrap();
+            }
+            let expected_sparse_alloc = std::fs::metadata(&sparse_p).unwrap().blocks() * 512;
+            let wsp = to_wide_z("K:\\sparse_stream.dat");
+            let hsp = CreateFileW(wsp.as_ptr(), GENERIC_READ, 7, std::ptr::null_mut(), OPEN_EXISTING, 0x80, std::ptr::null_mut());
+            assert_ne!(hsp, INVALID_HANDLE_VALUE);
+            let mut spbuf = [0u8; 64];
+            assert_eq!(GetFileInformationByHandleEx(hsp, 7, spbuf.as_mut_ptr(), spbuf.len() as u32), TRUE);
+            assert_eq!((spbuf.as_ptr().add(8) as *const u64).read_unaligned(), 16 * 1024 * 1024);
+            assert_eq!((spbuf.as_ptr().add(16) as *const u64).read_unaligned(), expected_sparse_alloc);
+            assert!(expected_sparse_alloc < 16 * 1024 * 1024);
+            crate::kernel32::threads::CloseHandle(hsp);
 
             // Class 8: FileCompressionInfo
             let mut cbuf = [0u8; 16];
