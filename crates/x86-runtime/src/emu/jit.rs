@@ -160,6 +160,10 @@ pub(super) struct JitScratch {
     pub host_fpcr: u64,
     /// Native OS entropy helper (`super::cpu::guest_entropy_raw`) for `RDRAND`/`RDSEED`.
     pub entropy_fn: usize,
+    /// Pointer to static [`crate::emu::cpu::SysHelpers`] table (CPUID, XSTATE, `#GP` dispatch).
+    pub sys_helpers: usize,
+    /// Pointer to this thread's `X87State::cw` field for inline `fldcw`/`fnstcw`/`fstcw`.
+    pub x87_cw: usize,
     /// Test-only: dynamic `DF_PLAIN` / pure-float-math / inline-QPC calls served directly in
     /// `lookup_call` / `lookup_jmp` from `table`.
     #[cfg(test)]
@@ -192,6 +196,8 @@ impl Default for JitScratch {
             mxcsr: 0x1F80,
             host_fpcr: 0,
             entropy_fn: super::cpu::guest_entropy_raw as *const () as usize,
+            sys_helpers: super::cpu::sys_helpers_ptr(),
+            x87_cw: super::regfile_ext::x87_cw_ptr(),
             #[cfg(test)]
             plain_call_hits: 0,
         }
@@ -828,6 +834,11 @@ const OFF_YMM_DIRTY: u32 = OFF_JX + offset_of!(JitScratch, ymm_dirty) as u32;
 const OFF_HOST_FPCR: u32 = OFF_JX + offset_of!(JitScratch, host_fpcr) as u32;
 const OFF_ENTROPY_FN: u32 = OFF_JX + offset_of!(JitScratch, entropy_fn) as u32;
 const OFF_MXCSR: u32 = OFF_JX + offset_of!(JitScratch, mxcsr) as u32;
+const OFF_SYS_HELPERS: u32 = OFF_JX + offset_of!(JitScratch, sys_helpers) as u32;
+const OFF_X87_CW: u32 = OFF_JX + offset_of!(JitScratch, x87_cw) as u32;
+const SYS_CPUID_OFF: u32 = offset_of!(super::cpu::SysHelpers, cpuid) as u32;
+const SYS_XSTATE_OFF: u32 = offset_of!(super::cpu::SysHelpers, xstate) as u32;
+const SYS_FAULT_GP_OFF: u32 = offset_of!(super::cpu::SysHelpers, fault_gp) as u32;
 #[cfg(test)]
 const OFF_PLAINHITS: u32 = OFF_JX + offset_of!(JitScratch, plain_call_hits) as u32;
 const _: () = assert!(
@@ -849,6 +860,10 @@ const _: () = assert!(
         && OFF_YMM_DIRTY < 2 * 4096
         && OFF_MXCSR % 4 == 0
         && OFF_MXCSR < 4 * 4096
+        && OFF_SYS_HELPERS % 8 == 0
+        && OFF_SYS_HELPERS < 8 * 4096
+        && OFF_X87_CW % 8 == 0
+        && OFF_X87_CW < 8 * 4096
         && OFF_YMM_HI % 8 == 0
         && OFF_YMM_HI <= 504
 );

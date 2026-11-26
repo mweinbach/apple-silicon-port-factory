@@ -1011,6 +1011,7 @@ unsafe fn run_fast_ops(cpu: &mut Cpu, ops: &[fast::FastOp], jcc_pair_f1: Option<
             fast::Fx::Done => {
                 i += 1;
             }
+            fast::Fx::Yield => break,
             fast::Fx::FuseJcc => {
                 i += 1;
                 if i < ops.len() {

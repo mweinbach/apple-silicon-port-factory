@@ -196,19 +196,27 @@ mod tests {
                 0x0f, 0x70, 0xc1, 0x1b, // pshufw mm0, mm1, 0x1b
                 0x0f, 0xe7, 0x00, // movntq [rax], mm0
                 0x0f, 0x0f, 0xc1, 0x9e, // pfadd mm0, mm1 (unsupported 3DNow!)
-                0x0f, 0xae, 0x30, // xsaveopt [rax]
-                0x0f, 0xa2, // cpuid
+                0x0f, 0xae, 0x30, // xsaveopt [rax] (native ARM64 JIT/AOT)
+                0x0f, 0xa2, // cpuid (native ARM64 JIT/AOT)
+                0x0f, 0x01, 0xd0, // xgetbv (native ARM64 JIT/AOT)
+                0x0f, 0xae, 0x10, // ldmxcsr [rax] (native ARM64 JIT/AOT)
+                0xd9, 0x28, // fldcw [rax] (native ARM64 JIT/AOT)
+                0xd9, 0x38, // fnstcw [rax] (native ARM64 JIT/AOT)
             ],
             0x1000,
         );
-        assert_eq!(scan.decoded, 6);
+        assert_eq!(scan.decoded, 10);
         for (mnemonic, expected) in [
             ("cvtpi2ps", None),
             ("pshufw", None),
             ("movntq", None),
             ("pfadd", Some(Finding::Unimplemented)),
-            ("xsaveopt", Some(Finding::Interpreter)),
-            ("cpuid", Some(Finding::Interpreter)),
+            ("xsaveopt", None),
+            ("cpuid", None),
+            ("xgetbv", None),
+            ("ldmxcsr", None),
+            ("fldcw", None),
+            ("fnstcw", None),
         ] {
             let kind = scan
                 .findings

@@ -1351,30 +1351,6 @@ pub const ADVERTISED_NON_ARM64_ALLOWLIST: &[(CpuidFeature, &str)] = &[
         CpuidFeature::X64,
         "far call/jmp/retf/iretq, segment-reg moves, descriptor/system misc (sldt/str/lar/lsl/verr/verw)",
     ),
-    (
-        CpuidFeature::AVX,
-        "vldmxcsr (MXCSR control-register load)",
-    ),
-    (
-        CpuidFeature::FXSR,
-        "fxsave/fxsave64/fxrstor/fxrstor64 x87/SSE state save/restore",
-    ),
-    (
-        CpuidFeature::SSE,
-        "ldmxcsr (MXCSR control-register load)",
-    ),
-    (
-        CpuidFeature::XSAVE,
-        "xgetbv, xsave/xsave64/xrstor/xrstor64 XSTATE control/save/restore",
-    ),
-    (
-        CpuidFeature::XSAVEC,
-        "xsavec/xsavec64 compacted XSTATE save",
-    ),
-    (
-        CpuidFeature::XSAVEOPT,
-        "xsaveopt/xsaveopt64 optimized XSTATE save",
-    ),
 ];
 
 #[cfg(test)]

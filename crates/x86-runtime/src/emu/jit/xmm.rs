@@ -110,7 +110,7 @@ pub(super) enum XClass {
 pub(super) fn xmm_class(op: &FastOp) -> XClass {
     use fast::*;
     match op.kind {
-        K_SYS_MISC if (op.x & 0x3F) == 13 => XClass::Barrier,
+        K_SYS_MISC if matches!(op.x & 0x3F, 9 | 13 | 16) => XClass::Barrier,
         K_NOP..=K_CMPJ_RM
         | K_IMUL_RR..=K_MOVBE_MR
         | K_BMI_RR
@@ -1071,7 +1071,7 @@ impl Tr<'_> {
         if trunc {
             self.a.frintz_d(0, src);
         } else {
-            self.a.frintn_d(0, src);
+            self.a.s_frint(true, 4, 0, src);
         }
         let x = w == 64;
         self.a.fcvtzs_d(x, T0, 0);

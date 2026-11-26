@@ -18,7 +18,7 @@ pub(super) fn gpr_of(r: Register) -> Option<(u8, u8)> {
 /// doesn't handle (non-GS segment overrides, 16-bit addressing, ...).
 pub(super) fn mem_of(ins: &Instruction) -> Option<(u8, u8, u8, i64)> {
     let gs = match ins.segment_prefix() {
-        Register::None => 0u8,
+        Register::None | Register::CS | Register::DS | Register::ES | Register::SS => 0u8,
         Register::GS => B_GS,
         _ => return None,
     };
