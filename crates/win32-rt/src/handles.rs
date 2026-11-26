@@ -24,7 +24,7 @@ use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -1256,13 +1256,13 @@ fn try_satisfy_locked(
     if wait_all {
         if objs.iter().all(|o| o.waitable().unwrap().is_signaled(g, tid)) {
             // Lock-free objects (Semaphore, auto-reset Event) can change without
-            // WAIT_LOCK: acquire them first, all-or-nothing with rollback.
+            // WAIT_LOCK: reserve/acquire them first, all-or-nothing with rollback.
             let mut taken_sems = 0usize;
             let mut taken_evs = 0usize;
             let mut ok = true;
             for o in objs {
                 if let Some(s) = o.as_any().downcast_ref::<Semaphore>() {
-                    if !s.try_take() {
+                    if !s.try_reserve() {
                         ok = false;
                         break;
                     }
@@ -1280,7 +1280,9 @@ fn try_satisfy_locked(
             if ok {
                 let mut abandoned = false;
                 for o in objs {
-                    if !o.as_any().is::<Semaphore>() && !o.as_any().is::<Event>() {
+                    if let Some(s) = o.as_any().downcast_ref::<Semaphore>() {
+                        s.commit_reserve();
+                    } else if !o.as_any().is::<Event>() {
                         abandoned |= o.waitable().unwrap().acquire(g, tid);
                     }
                 }
@@ -1293,7 +1295,7 @@ fn try_satisfy_locked(
                 }
                 if taken_sems > 0 {
                     if let Some(s) = o.as_any().downcast_ref::<Semaphore>() {
-                        s.untake(g);
+                        s.rollback_reserve();
                         taken_sems -= 1;
                         continue;
                     }
@@ -2036,9 +2038,14 @@ impl MutexObj {
 
 /// Lock-free semaphore with capped adaptive spin, per-object intrusive LIFO wait
 /// queue, per-thread 128B-aligned `Parker`, and coalesced/cascaded wakes.
+///
+/// `state` packs `(count: u32 [low 32] | reserved: u32 [high 32])` with the
+/// invariant `count + reserved <= max`: `wait_all` reserves units tentatively so
+/// concurrent `ReleaseSemaphore` calls cannot over-fill past `max - reserved`
+/// and rollback always restores the exact unit without losing it.
 #[repr(align(128))]
 pub struct Semaphore {
-    count: AtomicI32,
+    state: AtomicU64,
     /// Active spinning waiters in `wait_single_fast` (capped at `MAX_CONCURRENT_SPINNERS`).
     spinners: AtomicU32,
     /// Waiters currently linked in `queue` (updated under `queue.lock`).
@@ -2066,7 +2073,7 @@ impl KObject for Semaphore {
 
 impl Waitable for Semaphore {
     fn is_signaled(&self, _g: &WaitGuard, _tid: u32) -> bool {
-        self.count.load(Ordering::Acquire) > 0
+        self.available_count(Ordering::Acquire) > 0
     }
     fn acquire(&self, _g: &WaitGuard, _tid: u32) -> bool {
         self.try_take();
@@ -2080,7 +2087,7 @@ impl Waitable for Semaphore {
 impl Semaphore {
     pub fn new(initial: i32, max: i32, name: Option<String>) -> Self {
         Semaphore {
-            count: AtomicI32::new(initial.max(0)),
+            state: AtomicU64::new(initial.max(0) as u32 as u64),
             spinners: AtomicU32::new(0),
             sleepers: AtomicU32::new(0),
             in_flight: AtomicU32::new(0),
@@ -2091,20 +2098,70 @@ impl Semaphore {
         }
     }
 
+    #[inline(always)]
+    fn available_count(&self, order: Ordering) -> u32 {
+        self.state.load(order) as u32
+    }
+
     /// Take one unit if available (no lock, single CAS).
     #[inline]
     pub fn try_take(&self) -> bool {
-        let mut c = self.count.load(Ordering::Relaxed);
-        while c > 0 {
+        let mut s = self.state.load(Ordering::Relaxed);
+        while (s as u32) > 0 {
             match self
-                .count
-                .compare_exchange_weak(c, c - 1, Ordering::Acquire, Ordering::Relaxed)
+                .state
+                .compare_exchange_weak(s, s - 1, Ordering::Acquire, Ordering::Relaxed)
             {
                 Ok(_) => return true,
-                Err(v) => c = v,
+                Err(v) => s = v,
             }
         }
         false
+    }
+
+    /// Tentatively reserve one unit for `wait_all` (`count -= 1, reserved += 1`),
+    /// preserving `count + reserved <= max` against concurrent `release()` calls.
+    #[inline]
+    fn try_reserve(&self) -> bool {
+        let mut s = self.state.load(Ordering::Relaxed);
+        while (s as u32) > 0 {
+            let next = (s - 1).wrapping_add(1u64 << 32);
+            match self
+                .state
+                .compare_exchange_weak(s, next, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(v) => s = v,
+            }
+        }
+        false
+    }
+
+    /// Commit a tentative `wait_all` reservation once all objects have been acquired.
+    #[inline]
+    fn commit_reserve(&self) {
+        self.state.fetch_sub(1u64 << 32, Ordering::Release);
+    }
+
+    /// Roll back a tentative `wait_all` reservation (`count += 1, reserved -= 1`),
+    /// guaranteed never to fail against `self.max`, and notify any waiting threads.
+    #[inline]
+    fn rollback_reserve(&self) {
+        let mut s = self.state.load(Ordering::Relaxed);
+        loop {
+            let count = s as u32;
+            let reserved = (s >> 32) as u32;
+            debug_assert!(reserved > 0);
+            let next = ((count + 1) as u64) | (((reserved - 1) as u64) << 32);
+            match self
+                .state
+                .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(v) => s = v,
+            }
+        }
+        self.notify_after_release(1);
     }
 
     #[inline]
@@ -2144,134 +2201,8 @@ impl Semaphore {
         }
     }
 
-    /// Direct per-object LIFO queue + capped adaptive spin single-object wait.
-    pub(crate) fn wait_single_fast(&self, timeout: Option<Duration>) -> WaitResult {
-        if self.try_take() {
-            return WaitResult::Object(0);
-        }
-        if matches!(timeout, Some(d) if d.is_zero()) {
-            return WaitResult::Timeout;
-        }
-        let deadline = timeout.map(|d| Instant::now() + d);
-
-        // Capped adaptive bounded spin (at most `MAX_CONCURRENT_SPINNERS` per semaphore).
-        if park::spin_enabled() && try_claim_spinner(&self.spinners) {
-            let hit = park::spin_until(deadline, u64::MAX, || {
-                self.count.load(Ordering::Relaxed) > 0 && self.try_take()
-            });
-            self.spinners.fetch_sub(1, Ordering::Release);
-            if hit {
-                return WaitResult::Object(0);
-            }
-        }
-
-        let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, 1);
-        let _term_defer = crate::thread::TerminateDeferGuard::enter();
-        let waiter = WAITER.try_with(Arc::clone).unwrap_or_else(|_| Arc::new(Waiter::new()));
-        let cascade = sem_cascade();
-        let node = UnsafeCell::new(LocalNode::new(Arc::as_ptr(&waiter)));
-        let node_ptr = node.get();
-        let mut holds_in_flight = false;
-
-        loop {
-            if self.try_take() {
-                if holds_in_flight {
-                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                    std::sync::atomic::fence(Ordering::SeqCst);
-                }
-                if cascade && self.count.load(Ordering::Acquire) > 0 {
-                    self.wake_after_take(true);
-                }
-                return WaitResult::Object(0);
-            }
-
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                if holds_in_flight {
-                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                    std::sync::atomic::fence(Ordering::SeqCst);
-                    if self.count.load(Ordering::Acquire) > 0 {
-                        self.wake_after_take(cascade);
-                    }
-                }
-                return WaitResult::Timeout;
-            }
-
-            waiter.park.arm();
-            self.queue.lock.lock();
-            if holds_in_flight {
-                self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                holds_in_flight = false;
-            }
-            unsafe { self.queue.push_tail_locked(node_ptr) };
-            self.sleepers.fetch_add(1, Ordering::SeqCst);
-            self.queue.lock.unlock();
-
-            // StoreLoad barrier pairing with `release()`'s `count` CAS + `fence(SeqCst)`.
-            std::sync::atomic::fence(Ordering::SeqCst);
-
-            if self.count.load(Ordering::Acquire) > 0 {
-                self.queue.lock.lock();
-                unsafe {
-                    if (*node_ptr).in_queue {
-                        self.queue.unlink_locked(node_ptr);
-                        self.sleepers.fetch_sub(1, Ordering::Relaxed);
-                    } else if (*node_ptr).popped_by_wake {
-                        holds_in_flight = true;
-                    }
-                }
-                self.queue.lock.unlock();
-                continue;
-            }
-
-            let interrupted = waiter.park.park_sleep_only(deadline);
-
-            self.queue.lock.lock();
-            unsafe {
-                if (*node_ptr).in_queue {
-                    self.queue.unlink_locked(node_ptr);
-                    self.sleepers.fetch_sub(1, Ordering::Relaxed);
-                } else if (*node_ptr).popped_by_wake {
-                    holds_in_flight = true;
-                }
-            }
-            self.queue.lock.unlock();
-            if interrupted {
-                if holds_in_flight {
-                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                    std::sync::atomic::fence(Ordering::SeqCst);
-                    if self.count.load(Ordering::Acquire) > 0 {
-                        self.wake_after_take(cascade);
-                    }
-                }
-                return WaitResult::Timeout;
-            }
-        }
-    }
-
-    /// Return a unit taken by a wait-all that could not complete (lock held).
-    fn untake(&self, _g: &WaitGuard) {
-        let _ = self.release(1);
-    }
-
-    /// Returns previous count or None if it would exceed max.
-    pub fn release(&self, n: i32) -> Option<i32> {
-        if n <= 0 {
-            return None;
-        }
-        let mut c = self.count.load(Ordering::Relaxed);
-        let prev_count = loop {
-            let next = c.checked_add(n)?;
-            if next > self.max {
-                return None;
-            }
-            match self
-                .count
-                .compare_exchange_weak(c, next, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => break c,
-                Err(v) => c = v,
-            }
-        };
+    #[inline]
+    fn notify_after_release(&self, n: i32) {
         std::sync::atomic::fence(Ordering::SeqCst);
         let cascade = sem_cascade();
         if self.sleepers.load(Ordering::Acquire) > 0 {
@@ -2310,6 +2241,136 @@ impl Semaphore {
                 notify_object_key(obj_key(self), n as usize);
             }
         }
+    }
+
+    /// Direct per-object LIFO queue + capped adaptive spin single-object wait.
+    pub(crate) fn wait_single_fast(&self, timeout: Option<Duration>) -> WaitResult {
+        if self.try_take() {
+            return WaitResult::Object(0);
+        }
+        if matches!(timeout, Some(d) if d.is_zero()) {
+            return WaitResult::Timeout;
+        }
+        let deadline = timeout.map(|d| Instant::now() + d);
+
+        // Capped adaptive bounded spin (at most `MAX_CONCURRENT_SPINNERS` per semaphore).
+        if park::spin_enabled() && try_claim_spinner(&self.spinners) {
+            let hit = park::spin_until(deadline, u64::MAX, || {
+                self.available_count(Ordering::Relaxed) > 0 && self.try_take()
+            });
+            self.spinners.fetch_sub(1, Ordering::Release);
+            if hit {
+                return WaitResult::Object(0);
+            }
+        }
+
+        let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, 1);
+        let _term_defer = crate::thread::TerminateDeferGuard::enter();
+        let waiter = WAITER.try_with(Arc::clone).unwrap_or_else(|_| Arc::new(Waiter::new()));
+        let cascade = sem_cascade();
+        let node = UnsafeCell::new(LocalNode::new(Arc::as_ptr(&waiter)));
+        let node_ptr = node.get();
+        let mut holds_in_flight = false;
+
+        loop {
+            if self.try_take() {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                }
+                if cascade && self.available_count(Ordering::Acquire) > 0 {
+                    self.wake_after_take(true);
+                }
+                return WaitResult::Object(0);
+            }
+
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.available_count(Ordering::Acquire) > 0 {
+                        self.wake_after_take(cascade);
+                    }
+                }
+                return WaitResult::Timeout;
+            }
+
+            waiter.park.arm();
+            self.queue.lock.lock();
+            if holds_in_flight {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                holds_in_flight = false;
+            }
+            unsafe { self.queue.push_tail_locked(node_ptr) };
+            self.sleepers.fetch_add(1, Ordering::SeqCst);
+            self.queue.lock.unlock();
+
+            // StoreLoad barrier pairing with `release()`'s `state` CAS + `fence(SeqCst)`.
+            std::sync::atomic::fence(Ordering::SeqCst);
+
+            if self.available_count(Ordering::Acquire) > 0 {
+                self.queue.lock.lock();
+                unsafe {
+                    if (*node_ptr).in_queue {
+                        self.queue.unlink_locked(node_ptr);
+                        self.sleepers.fetch_sub(1, Ordering::Relaxed);
+                    } else if (*node_ptr).popped_by_wake {
+                        holds_in_flight = true;
+                    }
+                }
+                self.queue.lock.unlock();
+                continue;
+            }
+
+            let interrupted = waiter.park.park_sleep_only(deadline);
+
+            self.queue.lock.lock();
+            unsafe {
+                if (*node_ptr).in_queue {
+                    self.queue.unlink_locked(node_ptr);
+                    self.sleepers.fetch_sub(1, Ordering::Relaxed);
+                } else if (*node_ptr).popped_by_wake {
+                    holds_in_flight = true;
+                }
+            }
+            self.queue.lock.unlock();
+            if interrupted {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.available_count(Ordering::Acquire) > 0 {
+                        self.wake_after_take(cascade);
+                    }
+                }
+                return WaitResult::Timeout;
+            }
+        }
+    }
+
+    /// Returns previous count or None if it would exceed max (accounting for any
+    /// tentative `wait_all` reservations).
+    pub fn release(&self, n: i32) -> Option<i32> {
+        if n <= 0 {
+            return None;
+        }
+        let mut s = self.state.load(Ordering::Relaxed);
+        let prev_count = loop {
+            let count = (s as u32) as i32;
+            let reserved = ((s >> 32) as u32) as i32;
+            let total = count.checked_add(reserved).and_then(|t| t.checked_add(n))?;
+            if total > self.max {
+                return None;
+            }
+            let next = ((count + n) as u32 as u64) | (s & 0xFFFF_FFFF_0000_0000);
+            match self
+                .state
+                .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => break count,
+                Err(v) => s = v,
+            }
+        };
+        self.notify_after_release(n);
         Some(prev_count)
     }
 }
@@ -2696,6 +2757,18 @@ mod tests {
         assert!(matches!(wait_for(&objs, true, 0, false), WaitResult::Timeout));
         assert!(ev1.try_take(), "auto-reset event must remain signaled after wait_all rollback");
         assert!(sem.try_take(), "semaphore unit must remain available after wait_all rollback");
+
+        // Tentative semaphore reservation during wait_all must prevent a concurrent ReleaseSemaphore
+        // from over-filling past `max`, and rollback must always restore the unit without loss.
+        let sem_res = Arc::new(Semaphore::new(1, 1, None));
+        assert!(sem_res.try_reserve());
+        assert_eq!(sem_res.release(1), None, "release must honor live wait_all reservation against max");
+        sem_res.rollback_reserve();
+        assert!(sem_res.try_take(), "rollback must preserve the reserved unit");
+        assert_eq!(sem_res.release(1), Some(0));
+        assert!(sem_res.try_reserve());
+        sem_res.commit_reserve();
+        assert_eq!(sem_res.release(1), Some(0), "commit must free reservation for later releases");
     }
 
     #[test]
