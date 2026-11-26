@@ -180,14 +180,22 @@ impl CommandList {
                 } else {
                     let mut tokens = std::mem::take(&mut self.binds.cs_bind_tokens);
                     tokens.clear();
-                    let u_ok = uav_slots.is_none_or(|s| {
-                        Self::extract_compute_slot_tokens(
-                            s,
+                    let uav_plan_idx = uav_slots.and_then(|s| {
+                        (!s.is_empty()).then(|| {
+                            self.binds
+                                .slot_plans
+                                .get_or_compile(pso_ptr, 0, s, &self.compute_root)
+                        })
+                    });
+                    let u_ok = match uav_plan_idx {
+                        Some(idx) => self.binds.slot_plans.plan(idx).extract_tokens(
                             &self.compute_root,
                             self.heap0_cpu,
                             &mut tokens,
-                        )
-                    });
+                        ),
+                        None => true,
+                    };
+                    let uav_tok_end = tokens.len();
                     let r_slots_opt: &[ComputeBind] = if let Some(s) = read_slots {
                         s
                     } else if want_bounded {
@@ -195,13 +203,25 @@ impl CommandList {
                     } else {
                         &[]
                     };
-                    let r_ok = u_ok
-                        && Self::extract_compute_slot_tokens(
+                    let read_plan_idx = (u_ok && !r_slots_opt.is_empty()).then(|| {
+                        self.binds.slot_plans.get_or_compile(
+                            pso_ptr,
+                            1,
                             r_slots_opt,
+                            &self.compute_root,
+                        )
+                    });
+                    let r_ok = if !u_ok {
+                        false
+                    } else if let Some(idx) = read_plan_idx {
+                        self.binds.slot_plans.plan(idx).extract_tokens(
                             &self.compute_root,
                             self.heap0_cpu,
                             &mut tokens,
-                        );
+                        )
+                    } else {
+                        true
+                    };
                     let res = if r_ok
                         && self.binds.cs_bind_cache.matches_tokens(
                             pso_ptr,
@@ -247,23 +267,78 @@ impl CommandList {
                         )
                     } else {
                         let (ue, fre, bre, resolved_gen) = if has_any_slots {
+                            let va_cache = &mut *self.binds.buf_va_cache;
+                            let slot_plans = &self.binds.slot_plans;
+                            let compute_root = &self.compute_root;
+                            let heap0 = self.heap0_cpu;
                             resource::with_resource_registry(|reg| {
-                                let ue = uav_slots.is_some_and(|s| {
-                                    Self::resolve_slots_with_reg(
-                                        reg,
-                                        s,
-                                        &self.compute_root,
-                                        self.heap0_cpu,
-                                        &mut scratch_uav,
-                                        want_spans.then_some(&mut scratch_uav_spans),
-                                    )
-                                });
+                                let ue = if let Some(s) = uav_slots {
+                                    if s.is_empty() {
+                                        scratch_uav.clear();
+                                        if want_spans {
+                                            scratch_uav_spans.clear();
+                                        }
+                                        true
+                                    } else if u_ok {
+                                        uav_plan_idx.is_some_and(|idx| {
+                                            slot_plans.plan(idx).resolve_from_tokens(
+                                                reg,
+                                                va_cache,
+                                                &tokens[..uav_tok_end],
+                                                &mut scratch_uav,
+                                                want_spans.then_some(&mut scratch_uav_spans),
+                                            )
+                                        })
+                                    } else {
+                                        Self::resolve_slots_with_reg(
+                                            reg,
+                                            va_cache,
+                                            s,
+                                            compute_root,
+                                            heap0,
+                                            &mut scratch_uav,
+                                            want_spans.then_some(&mut scratch_uav_spans),
+                                        )
+                                    }
+                                } else {
+                                    false
+                                };
+                                let mut resolve_reads =
+                                    |s: &[ComputeBind],
+                                     out: &mut Vec<usize>,
+                                     sp: Option<&mut Vec<crate::metal::resource::SubRange>>|
+                                     -> bool {
+                                        if s.is_empty() {
+                                            out.clear();
+                                            if let Some(sp) = sp {
+                                                sp.clear();
+                                            }
+                                            true
+                                        } else if r_ok {
+                                            read_plan_idx.is_some_and(|idx| {
+                                                slot_plans.plan(idx).resolve_from_tokens(
+                                                    reg,
+                                                    va_cache,
+                                                    &tokens[uav_tok_end..],
+                                                    out,
+                                                    sp,
+                                                )
+                                            })
+                                        } else {
+                                            Self::resolve_slots_with_reg(
+                                                reg,
+                                                va_cache,
+                                                s,
+                                                compute_root,
+                                                heap0,
+                                                out,
+                                                sp,
+                                            )
+                                        }
+                                    };
                                 let fre = read_slots.is_some_and(|s| {
-                                    Self::resolve_slots_with_reg(
-                                        reg,
+                                    resolve_reads(
                                         s,
-                                        &self.compute_root,
-                                        self.heap0_cpu,
                                         &mut scratch_read,
                                         want_spans.then_some(&mut scratch_read_spans),
                                     )
@@ -271,11 +346,8 @@ impl CommandList {
                                 let bre = if fre {
                                     true
                                 } else if want_bounded {
-                                    Self::resolve_slots_with_reg(
-                                        reg,
+                                    resolve_reads(
                                         &pso.access.bounded_read_slots,
-                                        &self.compute_root,
-                                        self.heap0_cpu,
                                         &mut scratch_read,
                                         want_spans.then_some(&mut scratch_read_spans),
                                     )
@@ -335,13 +407,17 @@ impl CommandList {
                     || read_slots.is_some_and(|s| !s.is_empty())
                     || (want_bounded && !pso.access.bounded_read_slots.is_empty());
                 if need_reg {
+                    let va_cache = &mut *self.binds.buf_va_cache;
+                    let compute_root = &self.compute_root;
+                    let heap0 = self.heap0_cpu;
                     resource::with_resource_registry(|reg| {
                         let ue = uav_slots.is_some_and(|s| {
                             Self::resolve_slots_with_reg(
                                 reg,
+                                va_cache,
                                 s,
-                                &self.compute_root,
-                                self.heap0_cpu,
+                                compute_root,
+                                heap0,
                                 &mut scratch_uav,
                                 want_spans.then_some(&mut scratch_uav_spans),
                             )
@@ -349,9 +425,10 @@ impl CommandList {
                         let fre = read_slots.is_some_and(|s| {
                             Self::resolve_slots_with_reg(
                                 reg,
+                                va_cache,
                                 s,
-                                &self.compute_root,
-                                self.heap0_cpu,
+                                compute_root,
+                                heap0,
                                 &mut scratch_read,
                                 want_spans.then_some(&mut scratch_read_spans),
                             )
@@ -361,9 +438,10 @@ impl CommandList {
                         } else if want_bounded {
                             Self::resolve_slots_with_reg(
                                 reg,
+                                va_cache,
                                 &pso.access.bounded_read_slots,
-                                &self.compute_root,
-                                self.heap0_cpu,
+                                compute_root,
+                                heap0,
                                 &mut scratch_read,
                                 want_spans.then_some(&mut scratch_read_spans),
                             )

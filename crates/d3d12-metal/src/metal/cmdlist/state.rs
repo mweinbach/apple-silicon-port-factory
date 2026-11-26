@@ -1,9 +1,9 @@
 //! Command list state types, barrier tracking primitives, and extracted sub-structs.
 
-use crate::metal::binding::UploadRing;
+use crate::metal::binding::{RootState, UploadRing};
 use crate::metal::encstats as stats;
-use crate::metal::pipeline::{GraphicsPipeline, HandleKindProfile, MAX_VERTEX_SLOTS};
-use crate::metal::resource::{MtlTexture, Resource, SubRange};
+use crate::metal::pipeline::{ComputeBind, GraphicsPipeline, HandleKindProfile, MAX_VERTEX_SLOTS};
+use crate::metal::resource::{push_subrange, BufVaCache, MtlTexture, ResRegistry, Resource, SubRange};
 use crate::types::Rect;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -668,6 +668,93 @@ impl StageSync {
     }
 }
 
+/// Inline-backed buffer sub-range list avoiding heap allocation for the common
+/// 1–2 sub-range case per intra-compute buffer barrier obligation.
+#[derive(Clone, Debug)]
+pub(super) enum SmallSpans {
+    Inline {
+        buf: [SubRange; 2],
+        len: u8,
+    },
+    Heap(Vec<SubRange>),
+}
+
+impl SmallSpans {
+    #[inline]
+    pub(super) const fn new() -> Self {
+        Self::Inline {
+            buf: [SubRange::whole(0); 2],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            Self::Inline { len, .. } => *len == 0,
+            Self::Heap(v) => v.is_empty(),
+        }
+    }
+
+    #[inline]
+    pub(super) fn as_slice(&self) -> &[SubRange] {
+        match self {
+            Self::Inline { buf, len } => &buf[..(*len as usize)],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub(super) fn push_coalesced(&mut self, mut s: SubRange) {
+        if s.lo >= s.hi {
+            return;
+        }
+        match self {
+            Self::Inline { buf, len } => {
+                let mut n = *len as usize;
+                let mut i = 0;
+                while i < n {
+                    let e = buf[i];
+                    if e.r == s.r && e.lo <= s.hi && s.lo <= e.hi {
+                        s.lo = s.lo.min(e.lo);
+                        s.hi = s.hi.max(e.hi);
+                        n -= 1;
+                        buf[i] = buf[n];
+                    } else {
+                        i += 1;
+                    }
+                }
+                if n < 2 {
+                    buf[n] = s;
+                    *len = (n + 1) as u8;
+                } else {
+                    let mut v = Vec::with_capacity(4);
+                    v.extend_from_slice(&buf[..n]);
+                    v.push(s);
+                    *self = Self::Heap(v);
+                }
+            }
+            Self::Heap(v) => push_subrange(v, s),
+        }
+    }
+
+    #[inline]
+    pub(super) fn extend_coalesced(&mut self, src: &Self) {
+        for &s in src.as_slice() {
+            self.push_coalesced(s);
+        }
+    }
+}
+
+impl std::ops::Deref for SmallSpans {
+    type Target = [SubRange];
+
+    #[inline]
+    fn deref(&self) -> &[SubRange] {
+        self.as_slice()
+    }
+}
+
 /// One pending intra-compute obligation (`AW2_IB_TIGHT=1`).
 #[derive(Clone, Debug)]
 pub(super) struct IbObl {
@@ -675,7 +762,7 @@ pub(super) struct IbObl {
     pub(super) after: MTLStages,
     pub(super) before: MTLStages,
     pub(super) kind: OblKind,
-    pub(super) spans: Option<Vec<SubRange>>,
+    pub(super) spans: Option<SmallSpans>,
 }
 
 #[derive(Clone, Copy)]
@@ -1023,23 +1110,81 @@ pub(super) fn merge_req_all(dst: &mut [u32; 7], src: &[u32; 7]) {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub(super) fn merge_req_for_after(dst: &mut [u32; 7], after: MTLStages, src: &[u32; 7]) {
     if after.is_empty() {
         return;
     }
-    let all = after == MTLStages::All;
-    for (pi, &bit) in STAGE_BITS.iter().enumerate() {
-        if all || after.contains(bit) {
-            dst[pi] = dst[pi].max(src[pi]);
-        }
+    if after == MTLStages::All {
+        dst[0] = dst[0].max(src[0]);
+        dst[1] = dst[1].max(src[1]);
+        dst[2] = dst[2].max(src[2]);
+        dst[3] = dst[3].max(src[3]);
+        dst[4] = dst[4].max(src[4]);
+        dst[5] = dst[5].max(src[5]);
+        dst[6] = dst[6].max(src[6]);
+        return;
+    }
+    if after.contains(STAGE_BITS[0]) {
+        dst[0] = dst[0].max(src[0]);
+    }
+    if after.contains(STAGE_BITS[1]) {
+        dst[1] = dst[1].max(src[1]);
+    }
+    if after.contains(STAGE_BITS[2]) {
+        dst[2] = dst[2].max(src[2]);
+    }
+    if after.contains(STAGE_BITS[3]) {
+        dst[3] = dst[3].max(src[3]);
+    }
+    if after.contains(STAGE_BITS[4]) {
+        dst[4] = dst[4].max(src[4]);
+    }
+    if after.contains(STAGE_BITS[5]) {
+        dst[5] = dst[5].max(src[5]);
+    }
+    if after.contains(STAGE_BITS[6]) {
+        dst[6] = dst[6].max(src[6]);
     }
 }
 
 impl SplitPend {
     #[inline]
     pub(super) fn add(&mut self, after: MTLStages, before: MTLStages, soft: [MTLStages; 2]) {
-        self.add_with_req(after, before, soft, [0; 7]);
+        if after.is_empty() || (before | soft[0] | soft[1]).is_empty() {
+            return;
+        }
+        if before == MTLStages::All {
+            self.vtx_after |= after;
+            self.frag_after |= after;
+            self.disp_after |= after;
+            self.blit_after |= after;
+            self.as_after |= after;
+            return;
+        }
+        if before.intersects(PRE_RASTER) {
+            self.vtx_after |= after;
+        }
+        if before.contains(MTLStages::Fragment) {
+            self.frag_after |= after;
+        }
+        if before.contains(MTLStages::Dispatch) {
+            self.disp_after |= after;
+        }
+        if before.contains(MTLStages::Blit) {
+            self.blit_after |= after;
+        }
+        if before.contains(MTLStages::AccelerationStructure) {
+            self.as_after |= after;
+        }
+        if !soft[0].is_empty() {
+            self.soft_after[0] |= after;
+            self.soft_before[0] |= soft[0];
+        }
+        if !soft[1].is_empty() {
+            self.soft_after[1] |= after;
+            self.soft_before[1] |= soft[1];
+        }
     }
 
     #[inline]
@@ -1283,28 +1428,32 @@ pub(super) struct CsMidResObl {
     pub(super) req: [u32; 7],
 }
 
-/// Zero-reallocation replacement for `Option<Vec<T>>`.
+/// Zero-reallocation replacement for `Option<Vec<T>>`, with a 64-bit bloom filter
+/// for fast O(1) negative membership checks on `TrackedSet<usize>` resource sets.
 #[derive(Clone, Debug)]
 pub(super) struct TrackedSet<T> {
     pub(super) exact: bool,
+    pub(super) bloom: u64,
     pub(super) items: Vec<T>,
 }
 
 impl<T> TrackedSet<T> {
     #[inline]
     pub(super) fn new_exact() -> Self {
-        Self { exact: true, items: Vec::new() }
+        Self { exact: true, bloom: 0, items: Vec::new() }
     }
 
     #[inline]
     pub(super) fn clear_exact(&mut self) {
         self.exact = true;
+        self.bloom = 0;
         self.items.clear();
     }
 
     #[inline]
     pub(super) fn invalidate(&mut self) {
         self.exact = false;
+        self.bloom = 0;
         self.items.clear();
     }
 
@@ -1329,9 +1478,43 @@ impl<T> TrackedSet<T> {
         T: Copy,
     {
         self.exact = other.exact;
+        self.bloom = other.bloom;
         self.items.clear();
         if other.exact {
             self.items.extend_from_slice(&other.items);
+        }
+    }
+}
+
+impl TrackedSet<usize> {
+    #[inline(always)]
+    fn res_bloom_bit(r: usize) -> u64 {
+        1u64 << (((r as u64 >> 6).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 58)
+    }
+
+    /// Insert `r` into an exact resource set, skipping the linear scan when its bloom bit is 0.
+    #[inline(always)]
+    pub(super) fn insert_res(&mut self, r: usize) {
+        let bit = Self::res_bloom_bit(r);
+        if (self.bloom & bit) == 0 {
+            self.bloom |= bit;
+            self.items.push(r);
+        } else if !self.items.contains(&r) {
+            self.items.push(r);
+        }
+    }
+
+    /// Exact resource hit test (`true` when non-exact / poisoned, `!items.is_empty()` for `r == 0`,
+    /// or bloom-filtered exact membership for `r != 0`).
+    #[inline(always)]
+    pub(super) fn hits_res(&self, r: usize) -> bool {
+        if !self.exact {
+            return true;
+        }
+        if r == 0 {
+            !self.items.is_empty()
+        } else {
+            (self.bloom & Self::res_bloom_bit(r)) != 0 && self.items.contains(&r)
         }
     }
 }
@@ -1661,9 +1844,9 @@ pub(super) struct BarrierState {
     pub(super) bar_scratch_n_cs_mid: Vec<(usize, MTLStages, MTLStages, MTLStages)>,
     pub(super) bar_scratch_exact_pt: Vec<(usize, MTLStages)>,
     pub(super) bar_scratch_rp_pt: Vec<(usize, MTLStages)>,
-    pub(super) bar_scratch_ib_adds: Vec<(MTLStages, MTLStages, OblKind, Option<Vec<SubRange>>)>,
+    pub(super) bar_scratch_ib_adds: Vec<(MTLStages, MTLStages, OblKind, Option<SmallSpans>)>,
     pub(super) bar_scratch_ib_uav_adds:
-        Vec<(usize, MTLStages, MTLStages, OblKind, Option<Vec<SubRange>>)>,
+        Vec<(usize, MTLStages, MTLStages, OblKind, Option<SmallSpans>)>,
 }
 
 impl BarrierState {
@@ -2120,6 +2303,316 @@ impl IcbBatchState {
     }
 }
 
+/// One compiled slot-extraction operation inside a [`SlotPlan`].
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SlotOp {
+    /// Root CBV/SRV/UAV virtual address from root parameter `param` (1 u64 token).
+    RootVa { param: u16 },
+    /// Coalesced run of consecutive descriptor-table entries sharing `param`, with
+    /// precomputed `[min_off, max_end_off)` bounds so heap0 range checks and root
+    /// parameter reads happen ONCE per table run instead of once per descriptor.
+    TableRun {
+        param: u16,
+        min_off: u64,
+        max_end_off: u64,
+        off_start: u32,
+        off_len: u32,
+    },
+}
+
+/// Compiled root-signature + PSO slot-lookup plan eliminating repeated root-parameter
+/// lookups, per-slot heap bounds checks, and double descriptor reads on bind-cache misses.
+#[derive(Clone, Default)]
+pub(super) struct SlotPlan {
+    pub(super) valid: bool,
+    pub(super) total_tokens: usize,
+    pub(super) ops: Vec<SlotOp>,
+    pub(super) offsets: Vec<u64>,
+}
+
+impl SlotPlan {
+    pub(super) fn compile_into(&mut self, slots: &[ComputeBind], root: &RootState) {
+        self.ops.clear();
+        self.offsets.clear();
+        self.total_tokens = 0;
+        self.valid = true;
+        for &slot in slots {
+            match slot {
+                ComputeBind::RootVa { param } => {
+                    if root.param_u64(param as usize).is_none() {
+                        self.valid = false;
+                        return;
+                    }
+                    self.ops.push(SlotOp::RootVa { param });
+                    self.total_tokens += 1;
+                }
+                ComputeBind::TableEntry { param, byte_offset } => {
+                    if root.param_u64(param as usize).is_none() {
+                        self.valid = false;
+                        return;
+                    }
+                    let Some(end_off) = byte_offset.checked_add(24) else {
+                        self.valid = false;
+                        return;
+                    };
+                    if let Some(SlotOp::TableRun {
+                        param: prev_p,
+                        min_off,
+                        max_end_off,
+                        off_len,
+                        ..
+                    }) = self.ops.last_mut()
+                    {
+                        if *prev_p == param {
+                            *min_off = (*min_off).min(byte_offset);
+                            *max_end_off = (*max_end_off).max(end_off);
+                            *off_len += 1;
+                            self.offsets.push(byte_offset);
+                            self.total_tokens += 3;
+                            continue;
+                        }
+                    }
+                    let off_start = self.offsets.len() as u32;
+                    self.offsets.push(byte_offset);
+                    self.ops.push(SlotOp::TableRun {
+                        param,
+                        min_off: byte_offset,
+                        max_end_off: end_off,
+                        off_start,
+                        off_len: 1,
+                    });
+                    self.total_tokens += 3;
+                }
+            }
+        }
+    }
+
+    /// Extract descriptor-table / root-VA tokens into `tokens`, preserving exact
+    /// token order and failure semantics of `extract_compute_slot_tokens`.
+    #[inline]
+    pub(super) fn extract_tokens(
+        &self,
+        root: &RootState,
+        heap0: Option<(u64, u64, usize)>,
+        tokens: &mut Vec<u64>,
+    ) -> bool {
+        if !self.valid {
+            return false;
+        }
+        tokens.reserve(self.total_tokens);
+        for &op in &self.ops {
+            match op {
+                SlotOp::RootVa { param } => {
+                    let Some(va) = root.param_u64(param as usize) else {
+                        return false;
+                    };
+                    tokens.push(va);
+                }
+                SlotOp::TableRun {
+                    param,
+                    min_off,
+                    max_end_off,
+                    off_start,
+                    off_len,
+                } => {
+                    let Some(base_gpu) = root.param_u64(param as usize) else {
+                        return false;
+                    };
+                    let n = off_len as usize;
+                    if base_gpu == 0 {
+                        tokens.resize(tokens.len() + n * 3, 0);
+                        continue;
+                    }
+                    let Some((hbase, hlen, hcpu)) = heap0 else {
+                        return false;
+                    };
+                    let h_end = hbase.saturating_add(hlen);
+                    let Some(lo_gpu) = base_gpu.checked_add(min_off) else {
+                        return false;
+                    };
+                    let Some(hi_gpu) = base_gpu.checked_add(max_end_off) else {
+                        return false;
+                    };
+                    if lo_gpu < hbase || hi_gpu > h_end {
+                        return false;
+                    }
+                    let base_lo_cpu = hcpu + (lo_gpu - hbase) as usize;
+                    let offs = &self.offsets[off_start as usize..off_start as usize + n];
+                    // SAFETY: `tokens.reserve(self.total_tokens)` reserved enough space for
+                    // every op in `self.ops`, and `lo_gpu >= hbase && hi_gpu <= h_end` ensures
+                    // every `[base_gpu + byte_offset, +24)` lies inside `[hbase, h_end)`.
+                    unsafe {
+                        let cur_len = tokens.len();
+                        let mut dst = tokens.as_mut_ptr().add(cur_len);
+                        for &byte_offset in offs {
+                            let p = (base_lo_cpu + (byte_offset - min_off) as usize) as *const u64;
+                            let gpu_va = p.read_unaligned();
+                            let tex_id = p.add(1).read_unaligned();
+                            let meta = p.add(2).read_unaligned() & 0xffff_ffff;
+                            dst.write(gpu_va);
+                            dst.add(1).write(tex_id);
+                            dst.add(2).write(meta);
+                            dst = dst.add(3);
+                        }
+                        tokens.set_len(cur_len + n * 3);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Resolve resource keys (and optional buffer sub-ranges) directly from the exact
+    /// token slice previously produced by [`Self::extract_tokens`], avoiding re-reading
+    /// `RootState` and descriptor-heap memory on bind-cache misses.
+    #[inline]
+    pub(super) fn resolve_from_tokens(
+        &self,
+        reg: &ResRegistry,
+        va_cache: &mut BufVaCache,
+        toks: &[u64],
+        out: &mut Vec<usize>,
+        mut spans: Option<&mut Vec<SubRange>>,
+    ) -> bool {
+        out.clear();
+        if let Some(sp) = spans.as_deref_mut() {
+            sp.clear();
+        }
+        if !self.valid || toks.len() != self.total_tokens {
+            return false;
+        }
+        let mut pos = 0usize;
+        for &op in &self.ops {
+            match op {
+                SlotOp::RootVa { .. } => {
+                    let va = toks[pos];
+                    pos += 1;
+                    if va != 0 {
+                        let ok = match spans.as_deref_mut() {
+                            Some(sp) => reg.push_buffer_span_cached(va_cache, va, 0, out, sp),
+                            None => reg.push_buffer_va_cached(va_cache, va, out),
+                        };
+                        if !ok {
+                            return false;
+                        }
+                    }
+                }
+                SlotOp::TableRun { off_len, .. } => {
+                    let end = pos + (off_len as usize) * 3;
+                    while pos < end {
+                        let gpu_va = toks[pos];
+                        let tex_id = toks[pos + 1];
+                        let meta_lo = toks[pos + 2];
+                        pos += 3;
+                        if gpu_va != 0 {
+                            let found = match spans.as_deref_mut() {
+                                Some(sp) => {
+                                    reg.push_buffer_span_cached(va_cache, gpu_va, meta_lo, out, sp)
+                                }
+                                None => reg.push_buffer_va_cached(va_cache, gpu_va, out),
+                            };
+                            if !found {
+                                return false;
+                            }
+                        } else if tex_id != 0 {
+                            let Some(rk) = reg.lookup_texture_id(tex_id) else {
+                                return false;
+                            };
+                            if out.last() != Some(&rk) && !out.contains(&rk) {
+                                out.push(rk);
+                            }
+                            if let Some(sp) = spans.as_deref_mut() {
+                                push_subrange(sp, SubRange::whole(rk));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct SlotPlanKey {
+    epoch: u64,
+    pso_ptr: usize,
+    rs_hash: u128,
+    slots_ptr: usize,
+    slots_len: usize,
+    first_slot: Option<ComputeBind>,
+    last_slot: Option<ComputeBind>,
+}
+
+#[derive(Default)]
+struct SlotPlanEntry {
+    key: SlotPlanKey,
+    plan: SlotPlan,
+}
+
+const SLOT_PLAN_CACHE_SIZE: usize = 128;
+
+/// Per-command-list direct-mapped cache of compiled [`SlotPlan`]s keyed by
+/// `(epoch, pso_ptr, rs_hash, slots_ptr, slots_len, first_slot, last_slot)`.
+/// Low 2 bits of index are reserved for `stage_tag` (`0..4`) so a draw/dispatch's
+/// UAV and read plans never evict one another.
+pub(super) struct SlotPlanCache {
+    epoch: u64,
+    entries: Box<[SlotPlanEntry; SLOT_PLAN_CACHE_SIZE]>,
+}
+
+impl SlotPlanCache {
+    pub(super) fn new() -> Self {
+        let v: Vec<SlotPlanEntry> = (0..SLOT_PLAN_CACHE_SIZE)
+            .map(|_| SlotPlanEntry::default())
+            .collect();
+        let entries: Box<[SlotPlanEntry; SLOT_PLAN_CACHE_SIZE]> = v
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
+        Self { epoch: 1, entries }
+    }
+
+    #[inline]
+    pub(super) fn invalidate(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1).max(1);
+    }
+
+    #[inline]
+    pub(super) fn get_or_compile(
+        &mut self,
+        pso_ptr: usize,
+        stage_tag: usize,
+        slots: &[ComputeBind],
+        root: &RootState,
+    ) -> usize {
+        let key = SlotPlanKey {
+            epoch: self.epoch,
+            pso_ptr,
+            rs_hash: root.rs_hash,
+            slots_ptr: slots.as_ptr() as usize,
+            slots_len: slots.len(),
+            first_slot: slots.first().copied(),
+            last_slot: slots.last().copied(),
+        };
+        let h = ((pso_ptr as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (key.rs_hash as u64)
+            ^ ((key.slots_ptr as u64) >> 4)) as usize;
+        let idx = ((h << 2) | (stage_tag & 3)) & (SLOT_PLAN_CACHE_SIZE - 1);
+        let entry = &mut self.entries[idx];
+        if entry.key != key {
+            entry.plan.compile_into(slots, root);
+            entry.key = key;
+        }
+        idx
+    }
+
+    #[inline(always)]
+    pub(super) fn plan(&self, idx: usize) -> &SlotPlan {
+        &self.entries[idx].plan
+    }
+}
+
 /// Dirty-tracked `MTL4ArgumentTable` addresses/VBs plus token-validated compute & graphics bind caches.
 pub(super) struct BindTableCache {
     pub(super) bound_table_addrs: [u64; 7],
@@ -2128,6 +2621,10 @@ pub(super) struct BindTableCache {
     pub(super) cs_bind_tokens: Vec<u64>,
     pub(super) gfx_bind_cache: GfxBindCache,
     pub(super) gfx_bind_tokens: Vec<u64>,
+    /// Per-command-list buffer VA -> resource key cache (replaces TLS `BUF_VA_CACHE`).
+    pub(super) buf_va_cache: Box<BufVaCache>,
+    /// Per-(root signature, PSO) compiled slot-lookup plan cache.
+    pub(super) slot_plans: SlotPlanCache,
 }
 
 impl BindTableCache {
@@ -2139,6 +2636,8 @@ impl BindTableCache {
             cs_bind_tokens: Vec::new(),
             gfx_bind_cache: GfxBindCache::default(),
             gfx_bind_tokens: Vec::new(),
+            buf_va_cache: BufVaCache::new_boxed(),
+            slot_plans: SlotPlanCache::new(),
         }
     }
 }

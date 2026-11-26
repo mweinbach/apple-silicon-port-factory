@@ -526,7 +526,6 @@ pub fn static_sampler_table(rs: &RootSignature) -> Result<Option<u64>, String> {
 // ---------------------------------------------------------------------------
 
 /// One pipeline's (compute or graphics) root signature + argument image.
-#[derive(Default)]
 pub struct RootState {
     pub rs: Option<Arc<RootSignature>>,
     args: Option<TopLevelArgumentBuffer>,
@@ -535,9 +534,32 @@ pub struct RootState {
     pub bound: u64,
     /// Monotonic generation bumped whenever root signature, table handle, or root VA mutates.
     pub bind_gen: u64,
+    /// Cached `RootSignature::hash()` (0 when no root signature is set) for fast cache keying.
+    pub rs_hash: u128,
+    /// Fast inline cache of 8-byte root parameter values (`param < 64`), avoiding
+    /// `Arc<RootSignature>` + `layout().parameters` + byte-slice indirection per slot.
+    param_u64_vals: [u64; 64],
+    /// Bit `i` is set iff root parameter `i` exists and has `size == 8` within `args.bytes`.
+    param_u64_mask: u64,
     /// `AW2_FAST_ENC_STATE=1`: skip dirtying `args` when a root parameter write
     /// produces identical TLAB bytes.
     pub(crate) dedup: bool,
+}
+
+impl Default for RootState {
+    fn default() -> Self {
+        Self {
+            rs: None,
+            args: None,
+            dirty: false,
+            bound: 0,
+            bind_gen: 0,
+            rs_hash: 0,
+            param_u64_vals: [0; 64],
+            param_u64_mask: 0,
+            dedup: false,
+        }
+    }
 }
 
 impl RootState {
@@ -551,6 +573,16 @@ impl RootState {
         if let Some(t) = static_sampler_table(&rs)? {
             args.set_static_sampler_table(rs.layout(), t);
         }
+        let mut mask = 0u64;
+        let bytes_len = args.bytes.len();
+        for (i, p) in rs.layout().parameters.iter().take(64).enumerate() {
+            if p.size == 8 && (p.offset as usize) + 8 <= bytes_len {
+                mask |= 1u64 << i;
+            }
+        }
+        self.param_u64_vals = [0; 64];
+        self.param_u64_mask = mask;
+        self.rs_hash = rs.hash();
         self.args = Some(args);
         self.rs = Some(rs);
         self.dirty = true;
@@ -578,6 +610,9 @@ impl RootState {
             }
         }
         args.set_descriptor_table(rs.layout(), idx, gpu_handle);
+        if idx < 64 {
+            self.param_u64_vals[idx] = gpu_handle;
+        }
         self.dirty = true;
         self.bind_gen = self.bind_gen.wrapping_add(1);
         Ok(())
@@ -603,6 +638,9 @@ impl RootState {
             }
         }
         args.set_root_descriptor(rs.layout(), idx, va);
+        if idx < 64 {
+            self.param_u64_vals[idx] = va;
+        }
         self.dirty = true;
         self.bind_gen = self.bind_gen.wrapping_add(1);
         Ok(())
@@ -638,15 +676,18 @@ impl RootState {
             }
         }
         args.set_constants(rs.layout(), idx, dest, values);
+        if idx < 64 && (self.param_u64_mask & (1u64 << idx)) != 0 {
+            let off = p.offset as usize;
+            if let Some(slice) = args.bytes.get(off..off + 8) {
+                self.param_u64_vals[idx] = u64::from_le_bytes(slice.try_into().unwrap());
+            }
+        }
         self.dirty = true;
         Ok(())
     }
 
-    /// Read the raw 64-bit GPU address / descriptor-table GPU handle stored for
-    /// root parameter `i` (returns `None` when no root signature is set or `i`
-    /// is out of range / not an 8-byte parameter).
-    #[inline]
-    pub fn param_u64(&self, i: usize) -> Option<u64> {
+    #[cold]
+    fn param_u64_slow(&self, i: usize) -> Option<u64> {
         let (rs, args) = (self.rs.as_deref()?, self.args.as_ref()?);
         let p = rs.layout().parameters.get(i)?;
         if p.size != 8 {
@@ -655,6 +696,33 @@ impl RootState {
         let off = p.offset as usize;
         let b: [u8; 8] = args.bytes.get(off..off + 8)?.try_into().ok()?;
         Some(u64::from_le_bytes(b))
+    }
+
+    /// Read the raw 64-bit GPU address / descriptor-table GPU handle stored for
+    /// root parameter `i` (returns `None` when no root signature is set or `i`
+    /// is out of range / not an 8-byte parameter).
+    #[inline(always)]
+    pub fn param_u64(&self, i: usize) -> Option<u64> {
+        if i < 64 {
+            if (self.param_u64_mask & (1u64 << i)) != 0 {
+                return Some(self.param_u64_vals[i]);
+            }
+            return None;
+        }
+        self.param_u64_slow(i)
+    }
+
+    /// Bitmask of root parameters `< 64` that are valid 8-byte parameters.
+    #[inline(always)]
+    pub fn param_u64_mask(&self) -> u64 {
+        self.param_u64_mask
+    }
+
+    /// Fast unchecked read of root parameter `i < 64` when `(self.param_u64_mask() & (1 << i)) != 0`.
+    #[inline(always)]
+    pub fn param_u64_fast(&self, i: usize) -> u64 {
+        debug_assert!(i < 64 && (self.param_u64_mask & (1u64 << i)) != 0);
+        self.param_u64_vals[i]
     }
 
     #[inline]

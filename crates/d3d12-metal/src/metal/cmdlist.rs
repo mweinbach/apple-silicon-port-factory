@@ -111,11 +111,22 @@ impl CommandAllocator {
 
     /// `ID3D12CommandAllocator::Reset` (the app guarantees GPU completion).
     pub fn reset(&self) {
+        if super::queue::has_pending_cbs() {
+            super::queue::Queue::flush_all_pending_cbs();
+        }
         self.a.reset();
         self.ring.lock().unwrap().reset();
         self.icb_scratch.lock().unwrap().reset();
         self.rt_keep.lock().unwrap().clear();
         self.icbs.lock().unwrap().reset();
+    }
+}
+
+impl Drop for CommandAllocator {
+    fn drop(&mut self) {
+        if super::queue::has_pending_cbs() {
+            super::queue::Queue::flush_all_pending_cbs();
+        }
     }
 }
 
@@ -254,6 +265,9 @@ impl CommandList {
         if self.open {
             return Err("command list is already open".into());
         }
+        if super::queue::has_pending_cbs() {
+            super::queue::Queue::flush_if_cb_pending(&self.cb);
+        }
         self.cb.beginCommandBufferWithAllocator(&alloc.a);
         if !self.label.is_empty() {
             self.cb.setLabel(Some(&objc2_foundation::NSString::from_str(&self.label)));
@@ -280,6 +294,7 @@ impl CommandList {
         self.icb.reset_for_begin(alloc.icb_scratch.clone(), alloc.icbs.clone());
         self.binds.cs_bind_cache.valid = false;
         self.binds.gfx_bind_cache.valid = false;
+        self.binds.slot_plans.invalidate();
         self.pending_mfx_wait_fence = None;
         self.compute_root = RootState::default();
         self.gfx_root = RootState::default();
@@ -303,6 +318,7 @@ impl CommandList {
         self.rp_sync.cur_draw_exact_valid = false;
         self.binds.cs_bind_cache.valid = false;
         self.binds.gfx_bind_cache.valid = false;
+        self.binds.slot_plans.invalidate();
         self.rp_sync.cs_hk_profile = super::pipeline::HandleKindProfile::OPAQUE;
         self.compute_root = RootState::default();
         self.gfx_root = RootState::default();
