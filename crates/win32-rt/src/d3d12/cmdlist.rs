@@ -339,12 +339,15 @@ unsafe extern "win64" fn resource_barrier(this: PL, n: u32, b: *const ResourceBa
         }
     };
     let parse = |rb: ResourceBarrier| -> Option<Barrier> {
-        // D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY: the split barrier completes later.
-        if rb.Flags & 1 != 0 {
-            return None;
-        }
         Some(match rb.Type {
             // u[1] = Subresource | StateBefore << 32; u[2] low half = StateAfter.
+            // Flags bit 0 = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY, bit 1 = END_ONLY.
+            0 if rb.Flags & 1 != 0 => {
+                Barrier::SplitBegin(res_id(rb.u[0]), (rb.u[1] >> 32) as u32, rb.u[2] as u32)
+            }
+            0 if rb.Flags & 2 != 0 => {
+                Barrier::SplitEnd(res_id(rb.u[0]), (rb.u[1] >> 32) as u32, rb.u[2] as u32)
+            }
             0 => Barrier::Transition(res_id(rb.u[0]), (rb.u[1] >> 32) as u32, rb.u[2] as u32),
             2 => Barrier::Uav(res_id(rb.u[0])),
             _ => Barrier::Full,

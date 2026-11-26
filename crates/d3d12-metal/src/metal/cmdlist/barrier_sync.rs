@@ -3086,6 +3086,87 @@ impl CommandList {
         }
     }
 
+    #[inline]
+    pub(super) fn cur_pre_raster_stages(&self) -> MTLStages {
+        if legacy_barriers() || !barrier_masks() {
+            return PRE_RASTER;
+        }
+        let st = self.bar.opening_pre_raster_stages & PRE_RASTER;
+        if st.is_empty() { PRE_RASTER } else { st }
+    }
+
+    pub(super) fn ensure_pre_raster_stage_synced(
+        &mut self,
+        e: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+        pre_b: MTLStages,
+    ) {
+        let need_st = self.bar.enc_pre_unwaited_stages & pre_b;
+        if need_st.is_empty() || self.bar.enc_pre_unwaited_after.is_empty() {
+            return;
+        }
+        let after = self.bar.enc_pre_unwaited_after;
+        let req = self.bar.enc_pre_unwaited_req;
+        let mid_on = self.mid_qb_stagesync_active();
+        let eff_after = if self.render_dom_exact_active() {
+            let u = self.unsatisfied_enc_after_for_req(after, need_st, &req, mid_on);
+            self.fold_dominated_after(u, &req)
+        } else {
+            self.unsatisfied_mid_qb_after(after, need_st)
+        };
+        if !eff_after.is_empty() {
+            e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                eff_after,
+                need_st,
+                MTL4VisibilityOptions::Device,
+            );
+            let rec_after = if self.opts.opt_rp_keep_write_exact {
+                eff_after
+            } else {
+                after
+            };
+            self.record_enc_queue_sync(rec_after, need_st);
+            stats::inc(&stats::c::rb_mid_qb);
+        }
+        self.bar.enc_pre_unwaited_stages -= need_st;
+        if self.bar.enc_pre_unwaited_stages.is_empty() {
+            self.bar.enc_pre_unwaited_after = MTLStages::empty();
+            self.bar.enc_pre_unwaited_req = [0; 7];
+        }
+    }
+
+    pub(super) fn collect_pre_raster_stage_sync(&mut self, pre_b: MTLStages) {
+        let need_st = self.bar.enc_pre_unwaited_stages & pre_b;
+        if need_st.is_empty() || self.bar.enc_pre_unwaited_after.is_empty() {
+            return;
+        }
+        let after = self.bar.enc_pre_unwaited_after;
+        let req = self.bar.enc_pre_unwaited_req;
+        let mid_on = self.mid_qb_stagesync_active();
+        let eff_after = if self.render_dom_exact_active() {
+            let u = self.unsatisfied_enc_after_for_req(after, need_st, &req, mid_on);
+            self.fold_dominated_after(u, &req)
+        } else {
+            self.unsatisfied_mid_qb_after(after, need_st)
+        };
+        if !eff_after.is_empty() {
+            self.push_batch_qbarrier(eff_after, need_st);
+            if mid_on {
+                let rec_after = if self.opts.opt_rp_keep_write_exact {
+                    eff_after
+                } else {
+                    after
+                };
+                self.record_enc_queue_sync(rec_after, need_st);
+            }
+            stats::inc(&stats::c::rb_mid_qb);
+        }
+        self.bar.enc_pre_unwaited_stages -= need_st;
+        if self.bar.enc_pre_unwaited_stages.is_empty() {
+            self.bar.enc_pre_unwaited_after = MTLStages::empty();
+            self.bar.enc_pre_unwaited_req = [0; 7];
+        }
+    }
+
     /// A draw is about to be encoded: the pass's deferred pre-raster
     /// barriers for the resource classes its pre-raster stages may read
     /// (`reads`, [`crate::metal::pipeline::stage_reads_resources`]) land here.
@@ -3093,7 +3174,14 @@ impl CommandList {
         &mut self,
         e: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
         reads: u8,
+        pre_b: MTLStages,
     ) {
+        let pre_b = if legacy_barriers() || !barrier_masks() {
+            PRE_RASTER
+        } else {
+            let st = pre_b & PRE_RASTER;
+            if st.is_empty() { PRE_RASTER } else { st }
+        };
         if reads == 0 || self.bar.vtx_defer == NO_VTX {
             self.finish_post_draw0_list_frag();
             return;
@@ -3138,16 +3226,26 @@ impl CommandList {
             }
         }
         if let Some((after, before)) = sync {
+            let emit_before = {
+                let narrowed = before & pre_b;
+                if narrowed.is_empty() { before } else { narrowed }
+            };
+            let omitted = before - emit_before;
+            if !omitted.is_empty() && !after.is_empty() {
+                self.bar.enc_pre_unwaited_stages |= omitted;
+                self.bar.enc_pre_unwaited_after |= after;
+                merge_req_for_after(&mut self.bar.enc_pre_unwaited_req, after, &sync_req);
+            }
             let mid_on = self.mid_qb_stagesync_active();
             let eff_after = if self.render_dom_exact_active() {
-                let u = self.unsatisfied_enc_after_for_req(after, before, &sync_req, mid_on);
+                let u = self.unsatisfied_enc_after_for_req(after, emit_before, &sync_req, mid_on);
                 let f = self.fold_dominated_after(u, &sync_req);
-                if stats::active() && f != self.unsatisfied_mid_qb_after(after, before) {
+                if stats::active() && f != self.unsatisfied_mid_qb_after(after, emit_before) {
                     stats::inc(&stats::c::render_dom_fold);
                 }
                 f
             } else {
-                self.unsatisfied_mid_qb_after(after, before)
+                self.unsatisfied_mid_qb_after(after, emit_before)
             };
             if eff_after.is_empty() {
                 stats::inc(&stats::c::stagesync_skip);
@@ -3159,7 +3257,7 @@ impl CommandList {
             }
             e.barrierAfterQueueStages_beforeStages_visibilityOptions(
                 eff_after,
-                before,
+                emit_before,
                 MTL4VisibilityOptions::Device,
             );
             let rec_after = if self.opts.opt_rp_keep_write_exact {
@@ -3167,7 +3265,7 @@ impl CommandList {
             } else {
                 after
             };
-            self.record_enc_queue_sync(rec_after, before);
+            self.record_enc_queue_sync(rec_after, emit_before);
             if (self.opts.opt_cs_to_ps_overlap_v2 || self.list_rsplit_v2_active())
                 && self.render_dom_exact_active()
             {
@@ -3536,7 +3634,8 @@ impl CommandList {
         let mut pending_uav_adds = std::mem::take(&mut self.bar.bar_scratch_ib_uav_adds);
         for b in items {
             match *b {
-                Barrier::Transition(r, s0, s1) => {
+                Barrier::SplitBegin(..) => {}
+                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
                     if elide_r2r
                         && (s0 == s1
                             || (is_read_to_read_transition(s0, s1)
@@ -4676,7 +4775,23 @@ impl CommandList {
         let open_dsv = self.active_dsv();
         self.gfx.draw_pass
             && items.iter().all(|b| match *b {
-                Barrier::Transition(r, s0, s1) => {
+                Barrier::SplitBegin(r, s0, s1) => {
+                    if elide_r2r
+                        && (s0 == s1
+                            || (is_read_to_read_transition(s0, s1)
+                                && !self.clears.pending_clears.iter().any(|p| p.view.resource == r)
+                                && (!self.ps_to_cs_active()
+                                    || self.cs_disp_passthrough_for(r).is_empty())))
+                    {
+                        return true;
+                    }
+                    r != 0
+                        && !self.bar.pass_targets.contains(&r)
+                        && !open_rtvs.iter().any(|v| v.resource == r)
+                        && !open_dsv.is_some_and(|v| v.resource == r)
+                        && !self.clears.pending_clears.iter().any(|p| p.view.resource == r)
+                }
+                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
                     if elide_r2r
                         && (s0 == s1
                             || (is_read_to_read_transition(s0, s1)
@@ -4784,7 +4899,8 @@ impl CommandList {
         let mut any = false;
         for b in items {
             match *b {
-                Barrier::Transition(r, s0, s1) => {
+                Barrier::SplitBegin(..) => {}
+                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
                     if elide_r2r
                         && (s0 == s1
                             || (is_read_to_read_transition(s0, s1)

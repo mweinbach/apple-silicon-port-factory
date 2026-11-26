@@ -1,7 +1,9 @@
 //! `ExecuteIndirect`, GPU ICB batching & expansion, and ICB scratch/param allocation.
 
 use super::exact_binds::mark_and_extend_unique;
-use super::opts::{icb_reuse_enabled, ios_icb_pass_cap, IOS_ICB_PASS_SPLITS};
+use super::opts::{
+    barrier_masks, icb_reuse_enabled, ios_icb_pass_cap, legacy_barriers, IOS_ICB_PASS_SPLITS,
+};
 use super::state::{
     merge_req_all, merge_req_for_after, merge_vtx, sub_stages_preserving_all, DirectBind,
     DispatchExact, DrawOp, DrawSeg, DynSnapshot, Encoder, FullWhy, GfxState, COMPUTE_STAGES,
@@ -73,7 +75,7 @@ impl CommandList {
         idx
     }
 
-    fn push_batch_qbarrier(&mut self, after: MTLStages, before: MTLStages) {
+    pub(super) fn push_batch_qbarrier(&mut self, after: MTLStages, before: MTLStages) {
         if after.is_empty() || before.is_empty() {
             return;
         }
@@ -93,7 +95,15 @@ impl CommandList {
         self.icb.icb_qbarriers.push((after, before));
     }
 
-    pub(super) fn collect_batch_qbarriers(&mut self, reads: u8) {
+    pub(super) fn collect_batch_qbarriers(&mut self, reads: u8, pre_b: MTLStages) {
+        let pre_b = if legacy_barriers() || !barrier_masks() {
+            PRE_RASTER
+        } else {
+            let st = pre_b & PRE_RASTER;
+            if st.is_empty() { PRE_RASTER } else { st }
+        };
+        let omitted_pre = PRE_RASTER - pre_b;
+        self.collect_pre_raster_stage_sync(pre_b);
         let dom_exact = self.render_dom_exact_active();
         if self.render_split_sync_active() {
             if !self.bar.split_pend.is_empty() {
@@ -182,6 +192,11 @@ impl CommandList {
                 }
                 self.sync_legacy_from_split();
                 if !(orig_vtx | orig_frag).is_empty() {
+                    if !orig_vtx.is_empty() && !omitted_pre.is_empty() {
+                        self.bar.enc_pre_unwaited_stages |= omitted_pre;
+                        self.bar.enc_pre_unwaited_after |= orig_vtx;
+                        merge_req_for_after(&mut self.bar.enc_pre_unwaited_req, orig_vtx, &vtx_req);
+                    }
                     if !(orig_frag - orig_vtx).is_empty() {
                         stats::inc(&stats::c::render_split_sync);
                     }
@@ -192,7 +207,7 @@ impl CommandList {
                         } else {
                             let u = self.unsatisfied_enc_after_for_req(
                                 orig_vtx,
-                                PRE_RASTER,
+                                pre_b,
                                 &vtx_req,
                                 mid_on,
                             );
@@ -213,7 +228,7 @@ impl CommandList {
                             let base_vtx = if orig_vtx.is_empty() {
                                 MTLStages::empty()
                             } else {
-                                self.unsatisfied_mid_qb_after(orig_vtx, PRE_RASTER)
+                                self.unsatisfied_mid_qb_after(orig_vtx, pre_b)
                             };
                             let base_frag = if orig_frag.is_empty() {
                                 MTLStages::empty()
@@ -229,7 +244,7 @@ impl CommandList {
                         let base_vtx = if orig_vtx.is_empty() {
                             MTLStages::empty()
                         } else {
-                            self.unsatisfied_mid_qb_after(orig_vtx, PRE_RASTER)
+                            self.unsatisfied_mid_qb_after(orig_vtx, pre_b)
                         };
                         let base_frag = if orig_frag.is_empty() {
                             MTLStages::empty()
@@ -248,10 +263,10 @@ impl CommandList {
                         let vtx_only = eff_vtx - both;
                         let frag_only = eff_frag - both;
                         if !both.is_empty() {
-                            self.push_batch_qbarrier(both, PRE_RASTER | MTLStages::Fragment);
+                            self.push_batch_qbarrier(both, pre_b | MTLStages::Fragment);
                         }
                         if !vtx_only.is_empty() {
-                            self.push_batch_qbarrier(vtx_only, PRE_RASTER);
+                            self.push_batch_qbarrier(vtx_only, pre_b);
                         }
                         if !frag_only.is_empty() {
                             self.push_batch_qbarrier(frag_only, MTLStages::Fragment);
@@ -262,7 +277,7 @@ impl CommandList {
                             let rec_frag =
                                 if self.opts.opt_rp_keep_write_exact { eff_frag } else { orig_frag };
                             if !rec_vtx.is_empty() {
-                                self.record_enc_queue_sync(rec_vtx, PRE_RASTER);
+                                self.record_enc_queue_sync(rec_vtx, pre_b);
                                 if rec_vtx.contains(MTLStages::Fragment)
                                     || rec_vtx == MTLStages::All
                                 {
@@ -452,16 +467,27 @@ impl CommandList {
                 }
             }
             if let Some((after, before)) = sync {
+                let emit_before = {
+                    let narrowed = before & pre_b;
+                    if narrowed.is_empty() { before } else { narrowed }
+                };
+                let omitted = before - emit_before;
+                if !omitted.is_empty() && !after.is_empty() {
+                    self.bar.enc_pre_unwaited_stages |= omitted;
+                    self.bar.enc_pre_unwaited_after |= after;
+                    merge_req_for_after(&mut self.bar.enc_pre_unwaited_req, after, &sync_req);
+                }
                 let mid_on = self.mid_qb_stagesync_active();
                 let eff_after = if dom_exact {
-                    let u = self.unsatisfied_enc_after_for_req(after, before, &sync_req, mid_on);
+                    let u =
+                        self.unsatisfied_enc_after_for_req(after, emit_before, &sync_req, mid_on);
                     let f = self.fold_dominated_after(u, &sync_req);
-                    if stats::active() && f != self.unsatisfied_mid_qb_after(after, before) {
+                    if stats::active() && f != self.unsatisfied_mid_qb_after(after, emit_before) {
                         stats::inc(&stats::c::render_dom_fold);
                     }
                     f
                 } else {
-                    self.unsatisfied_mid_qb_after(after, before)
+                    self.unsatisfied_mid_qb_after(after, emit_before)
                 };
                 if eff_after.is_empty() {
                     stats::inc(&stats::c::stagesync_skip);
@@ -469,15 +495,15 @@ impl CommandList {
                     if eff_after != after {
                         stats::inc(&stats::c::stagesync_narrow);
                     }
-                    self.push_batch_qbarrier(eff_after, before);
+                    self.push_batch_qbarrier(eff_after, emit_before);
                     if eff_after.contains(MTLStages::Fragment) || eff_after == MTLStages::All {
                         self.rp_sync.gfx_ps_overlap_chain = 0;
                     }
                     if mid_on {
                         if self.opts.opt_rp_keep_write_exact {
-                            self.record_enc_queue_sync(eff_after, before);
+                            self.record_enc_queue_sync(eff_after, emit_before);
                         } else if eff_after != after {
-                            self.record_enc_queue_sync(after, before);
+                            self.record_enc_queue_sync(after, emit_before);
                         }
                     }
                     stats::inc(&stats::c::dv_hit);
@@ -867,7 +893,9 @@ impl CommandList {
                 && (!self.has_frag_buf_write()
                     || ((self.opts.opt_queue_start_stage_exact || self.list_rsplit_v2_active())
                         && self.occlusion.is_none()));
+            self.bar.opening_pre_raster_stages = MTLStages::Vertex;
             let enc_res = unsafe { self.draw_encoder_for(first_eff_reads) };
+            self.bar.opening_pre_raster_stages = PRE_RASTER;
             self.bar.opening_render_split_ok = false;
             self.icb.icb_prepass_flushing = false;
             self.rp_sync.cur_draw_exact_valid = false;
@@ -936,7 +964,7 @@ impl CommandList {
                         self.rp_sync.cur_draw_ps_exact.extend_from_slice(&meta.ps_exact);
                         self.rp_sync.cur_draw_exact_valid = true;
                     }
-                    self.collect_batch_qbarriers(eff_reads);
+                    self.collect_batch_qbarriers(eff_reads, MTLStages::Vertex);
                     self.rp_sync.cur_draw_exact_valid = false;
                 }
                 if let Some(m) = self.pt_cur() {
@@ -2163,18 +2191,22 @@ impl CommandList {
             self.end_encoder();
         }
         let eff_reads = p.pre_raster_reads | READS_BUF;
-        let (e, size) = unsafe { self.draw_encoder_for(eff_reads)? };
+        let emu_pre = MTLStages::Object | MTLStages::Mesh;
+        self.bar.opening_pre_raster_stages = emu_pre;
+        let enc_res = unsafe { self.draw_encoder_for(eff_reads) };
+        self.bar.opening_pre_raster_stages = PRE_RASTER;
+        let (e, size) = enc_res?;
         self.rp_sync.enc_pre_raster_reads |= eff_reads;
         self.rp_sync.enc_ps_reads |= p.ps_read_classes;
         self.rp_sync.enc_uav_used |= writes_uav || p.uses_uav;
-        self.render_mid_barrier(&e);
+        self.render_mid_barrier(&e, emu_pre);
         self.record_gfx_draw_uav_writes(
             writes_uav,
             p.vs_writes_uav,
             p.ps_writes_uav,
-            MTLStages::Object | MTLStages::Mesh,
+            emu_pre,
         );
-        self.sync_pre_raster(&e, eff_reads);
+        self.sync_pre_raster(&e, eff_reads, emu_pre);
         self.apply_dynamic(&e, &p, size);
         let fast = self.opts.opt_fast_enc_state;
         if !(fast && self.rp_sync.enc_render_cache.mesh_stages_bound) {
@@ -2547,7 +2579,9 @@ impl CommandList {
                 && (!self.has_frag_buf_write()
                     || ((self.opts.opt_queue_start_stage_exact || self.list_rsplit_v2_active())
                         && self.occlusion.is_none()));
+            self.bar.opening_pre_raster_stages = MTLStages::Vertex;
             let enc_res = unsafe { self.draw_encoder_for(eff_reads) };
+            self.bar.opening_pre_raster_stages = PRE_RASTER;
             self.bar.opening_render_split_ok = false;
             let (_e, _size) = match enc_res {
                 Ok(v) => v,
@@ -2571,7 +2605,7 @@ impl CommandList {
                 p.ps_writes_uav,
                 MTLStages::Vertex,
             );
-            self.collect_batch_qbarriers(eff_reads);
+            self.collect_batch_qbarriers(eff_reads, MTLStages::Vertex);
             self.rp_sync.cur_draw_exact_valid = false;
             if let Some(m) = self.pt_cur() {
                 m.draws += 1;

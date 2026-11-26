@@ -1,7 +1,7 @@
 //! Copy, blit, mipmap generation, multisample resolve, query timestamps,
 //! occlusion queries, and counter resolution commands.
 
-use super::opts::timestamp_granularity;
+use super::opts::{barrier_masks, legacy_barriers, timestamp_granularity};
 use super::state::{note_frag_resolve_dst, Encoder, FullWhy};
 use super::CommandList;
 use crate::metal::encstats as stats;
@@ -693,17 +693,71 @@ impl CommandList {
         self.need_full(FullWhy::Internal);
     }
 
-    /// Arm (`Some`, zeroing its slot) or disarm the occlusion query that
+    /// Arm (`Some`, resetting its slot) or disarm (`None`) the occlusion query that
     /// render passes count into.
+    ///
+    /// Under stage-masked barriers, consecutive occlusion queries on the same
+    /// `visibilityResultBuffer` reuse the open `MTLVisibilityResultType::Reset`
+    /// render pass without closing the encoder, running a `fillBuffer` compute pass,
+    /// or emitting a `FullWhy::Internal` (`All -> All`) barrier. If a query closes
+    /// with zero draws and no render pass opened for it, a Blit-scoped `fillBuffer`
+    /// zeroes that single 8-byte slot with stage-masked `Blit -> Fragment | Blit`.
     pub(crate) fn set_occlusion(
         &mut self,
         o: Option<crate::metal::query::ActiveOcclusion>,
     ) -> Result<(), String> {
-        match &o {
+        let masked = !legacy_barriers() && barrier_masks();
+        match o {
             Some(q) => {
                 stats::inc(&stats::c::occl_begin);
                 crate::metal::pipeline::note_frag_buf_write();
-                // The visibility buffer is fixed per render pass: start a new one.
+                if masked {
+                    if !self.icb.icb_segs.is_empty() {
+                        self.flush_draw_batch(true);
+                    }
+                    let q_buf_ptr = &*q.buffer as *const MtlBuffer as usize;
+                    let mode = if q.binary {
+                        MTLVisibilityResultMode::Boolean
+                    } else {
+                        MTLVisibilityResultMode::Counting
+                    };
+                    let had_blit_read = self.bar.vis_buf_blit_read.contains(&q_buf_ptr);
+                    // Reuse the open `Reset` render pass when it already has this visibility
+                    // buffer attached, targets have not changed, no Blit read intervened, and
+                    // this query slot has not been used yet in the current pass.
+                    if !had_blit_read
+                        && self.enc_vis_buf == Some(q_buf_ptr)
+                        && self.enc_vis_reset
+                        && !self.gfx.had_target_rebind
+                        && !self.enc_vis_used_indices.contains(&q.index)
+                    {
+                        if let Encoder::Render(e) = &self.enc {
+                            unsafe { e.setVisibilityResultMode_offset(mode, q.index as usize * 8) };
+                            self.enc_vis_used_indices.push(q.index);
+                            if !self.bar.vis_buf_written.contains(&(q_buf_ptr, q.index)) {
+                                self.bar.vis_buf_written.push((q_buf_ptr, q.index));
+                            }
+                            self.occl_drew = true;
+                            self.occlusion = Some(q);
+                            return Ok(());
+                        }
+                    }
+                    // Otherwise open a new render pass on the next draw with `Reset`.
+                    if matches!(self.enc, Encoder::Render(_)) {
+                        self.end_encoder();
+                    }
+                    if had_blit_read {
+                        self.bar.vis_buf_blit_read.retain(|&p| p != q_buf_ptr);
+                        self.add_pend(MTLStages::Blit, MTLStages::Fragment);
+                    }
+                    if self.bar.vis_buf_written.contains(&(q_buf_ptr, q.index)) {
+                        self.add_pend(MTLStages::Fragment, MTLStages::Fragment);
+                    }
+                    self.occl_drew = false;
+                    self.occlusion = Some(q);
+                    return Ok(());
+                }
+                // Legacy barrier mode: close render pass, zero via Blit, arm full barrier.
                 if !self.icb.icb_segs.is_empty() {
                     self.flush_draw_batch(false);
                 }
@@ -721,31 +775,89 @@ impl CommandList {
                 };
                 self.note_stage_ran(MTLStages::Blit);
                 self.need_full(FullWhy::Internal);
+                self.occl_drew = true;
+                self.occlusion = Some(q);
             }
             None => {
                 if !self.icb.icb_segs.is_empty() {
                     self.flush_draw_batch(true);
                 }
+                let prev = self.occlusion.take();
+                let drew = std::mem::replace(&mut self.occl_drew, false);
                 if let Encoder::Render(e) = &self.enc {
                     unsafe { e.setVisibilityResultMode_offset(MTLVisibilityResultMode::Disabled, 0) };
+                } else if masked && !drew {
+                    // `BeginQuery..EndQuery` completed with zero draws and no render pass ever
+                    // opened for it: zero the 8-byte slot in `Blit` with stage-masked sync.
+                    if let Some(prev_q) = prev {
+                        let q_buf_ptr = &*prev_q.buffer as *const MtlBuffer as usize;
+                        if self.bar.vis_buf_written.contains(&(q_buf_ptr, prev_q.index)) {
+                            self.add_pend(MTLStages::Fragment, MTLStages::Blit);
+                        }
+                        if self.bar.vis_buf_blit_read.contains(&q_buf_ptr) {
+                            self.bar.vis_buf_blit_read.retain(|&p| p != q_buf_ptr);
+                            self.add_pend(MTLStages::Blit, MTLStages::Blit);
+                        }
+                        let e = self.compute_blit_touch(&[]).ok_or("compute encoder")?;
+                        self.pt_note_util(pt::synth::FILL_OCCL, 0);
+                        unsafe {
+                            e.fillBuffer_range_value(
+                                &prev_q.buffer,
+                                objc2_foundation::NSRange::new(prev_q.index as usize * 8, 8),
+                                0,
+                            )
+                        };
+                        self.note_stage_ran(MTLStages::Blit);
+                        if self.ib_tight_active() {
+                            self.ib_add_obl_tight(0, MTLStages::Blit, MTLStages::Blit);
+                        } else {
+                            self.ib_note(0);
+                        }
+                        self.add_pend(MTLStages::Blit, MTLStages::Fragment | MTLStages::Blit);
+                    }
                 }
             }
         }
-        self.occlusion = o;
         Ok(())
     }
 
-    /// Buffer copy ordered after all earlier work (including render pass
-    /// visibility results).
+    /// Buffer copy ordered after render-pass visibility results (`ResolveQueryData`).
     pub(crate) fn copy_after_render(
         &mut self,
         src: &MtlBuffer,
         src_off: u64,
-        dst: &MtlBuffer,
+        dst: &Resource,
         dst_off: u64,
         n: u64,
     ) -> Result<(), String> {
         if n == 0 {
+            return Ok(());
+        }
+        let d = dst.buffer().ok_or("resolve destination is not a buffer")?;
+        dst.register_ptr();
+        let dst_id = dst as *const Resource as usize;
+        let src_ptr = src as *const MtlBuffer as usize;
+        if !legacy_barriers() && barrier_masks() {
+            self.flush_clears_for(&[dst_id])?;
+            if matches!(self.enc, Encoder::Render(_)) {
+                self.end_encoder();
+            }
+            self.add_pend(MTLStages::Fragment | MTLStages::Blit, MTLStages::Blit);
+            let e = self.compute_blit_touch(&[dst_id]).ok_or("compute encoder")?;
+            self.pt_note_util(pt::synth::COPY_BLIT, 0);
+            unsafe {
+                e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    src,
+                    src_off as usize,
+                    d,
+                    dst_off as usize,
+                    n as usize,
+                )
+            };
+            self.note_stage_ran(MTLStages::Blit);
+            if !self.bar.vis_buf_blit_read.contains(&src_ptr) {
+                self.bar.vis_buf_blit_read.push(src_ptr);
+            }
             return Ok(());
         }
         self.end_encoder();
@@ -756,7 +868,7 @@ impl CommandList {
             e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                 src,
                 src_off as usize,
-                dst,
+                d,
                 dst_off as usize,
                 n as usize,
             )

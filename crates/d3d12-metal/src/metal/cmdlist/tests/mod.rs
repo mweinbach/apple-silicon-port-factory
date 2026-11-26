@@ -3204,3 +3204,630 @@ fn fast_enc_state_deduplicates_tlab_uploads_draw_params_and_cross_pso_render_sta
         }
     }
 }
+
+#[test]
+fn partial_barrier_stage_selection_and_fallbacks_on_gpu() {
+    use crate::mesh::{MeshDesc, MeshPipeline};
+    use crate::state::{BlendDesc, DepthStencilState, RasterState};
+    use dxil_metal::root_signature::RootSignature;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let Some((vs_rs, vs_pso)) = build_g48_vs_srv_ps_cb0_pso("partial_bar_vs") else { return };
+    let as_dxil = sign_dxil(include_bytes!("../../../../tests/fixtures/mesh.as.dxil"));
+    let ms_dxil = sign_dxil(include_bytes!("../../../../tests/fixtures/mesh.ms.dxil"));
+    let ms_direct_dxil = sign_dxil(include_bytes!("../../../../tests/fixtures/mesh_direct.ms.dxil"));
+    let ps_dxil = sign_dxil(include_bytes!("../../../../tests/fixtures/mesh.ps.dxil"));
+    let mesh_rs = RootSignature::from_blob(&as_dxil).unwrap();
+    let mut blend = BlendDesc::default();
+    blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
+    let ms_only_pso = Arc::new(
+        MeshPipeline::new(
+            mesh_rs.clone(),
+            &MeshDesc {
+                amplification: None,
+                mesh: &ms_direct_dxil,
+                pixel: Some(&ps_dxil),
+                blend,
+                sample_mask: u32::MAX,
+                raster: RasterState { cull: MTLCullMode::None, ..Default::default() },
+                depth_stencil: DepthStencilState::default(),
+                rtv_formats: vec![RGBA8_UNORM],
+                dsv_format: 0,
+                sample_count: 1,
+            },
+            "partial_bar_ms_only",
+        )
+        .unwrap(),
+    );
+    let as_ms_pso = Arc::new(
+        MeshPipeline::new(
+            mesh_rs.clone(),
+            &MeshDesc {
+                amplification: Some(&as_dxil),
+                mesh: &ms_dxil,
+                pixel: Some(&ps_dxil),
+                blend,
+                sample_mask: u32::MAX,
+                raster: RasterState { cull: MTLCullMode::None, ..Default::default() },
+                depth_stencil: DepthStencilState::default(),
+                rtv_formats: vec![RGBA8_UNORM],
+                dsv_format: 0,
+                sample_count: 1,
+            },
+            "partial_bar_as_ms",
+        )
+        .unwrap(),
+    );
+
+    let q = Queue::new(ListType::Direct, "partial_bar queue").unwrap();
+    let alloc = CommandAllocator::new(ListType::Direct).unwrap();
+    let cb_up = test_buffer(256, heap_type::UPLOAD, 0);
+    let buf_uav = test_buffer(64, heap_type::DEFAULT, resource_flags::ALLOW_UNORDERED_ACCESS);
+    let rt = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let tex_uav = test_texture(
+        4,
+        4,
+        RGBA8_UNORM,
+        resource_flags::ALLOW_UNORDERED_ACCESS | resource_flags::ALLOW_RENDER_TARGET,
+    );
+    let rb = test_buffer(256 * 4, heap_type::READBACK, 0);
+    for r in [&cb_up, &buf_uav, &rt, &tex_uav, &rb] {
+        r.register_ptr();
+    }
+    let buf_id = &buf_uav as *const Resource as usize;
+    let rt_id = &rt as *const Resource as usize;
+    let tex_id = &tex_uav as *const Resource as usize;
+    let rtv = TargetView::rtv(&rt, None).unwrap();
+    let raw_uav_desc = {
+        let mut d = [0u8; 40];
+        d[0..4].copy_from_slice(&39u32.to_le_bytes());
+        d[4..8].copy_from_slice(&1u32.to_le_bytes());
+        d[16..20].copy_from_slice(&16u32.to_le_bytes());
+        d[32..36].copy_from_slice(&1u32.to_le_bytes());
+        d
+    };
+
+    let _guard = gpu_stats_lock();
+    let mut l = CommandList::new(ListType::Direct).unwrap();
+    l.begin(&alloc).unwrap();
+
+    // 1) Compute -> Vertex: VS draw narrows pre-raster sync to `Vertex` (omits `Object | Mesh`)
+    //    and records omitted stages in `enc_pre_unwaited_stages`.
+    l.clear_uav(&buf_uav, Some(&raw_uav_desc), ClearValue::Uint([1; 4]), &[]).unwrap();
+    l.barrier_list_with(&[Barrier::Transition(buf_id, STATE_UAV, STATE_NON_PIXEL_SRV)], true, false);
+    l.gfx_root.set_root_signature(vs_rs.clone()).unwrap();
+    l.gfx_root.set_descriptor(0, cb_up.gpu_va).unwrap();
+    l.gfx_root.set_descriptor(1, buf_uav.gpu_va).unwrap();
+    l.set_render_targets(vec![rtv], None);
+    l.gfx.topology = 4;
+    l.set_graphics_pipeline(vs_pso.clone());
+    l.set_viewports(vec![MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: 4.0,
+        height: 4.0,
+        znear: 0.0,
+        zfar: 1.0,
+    }]);
+    l.draw(3, 1, 0, 0).unwrap();
+    assert!(
+        l.bar.enc_sync_before.contains(MTLStages::Vertex)
+            && !l.bar.enc_sync_before.intersects(MTLStages::Object | MTLStages::Mesh),
+        "VS draw must narrow pre-raster barrier to Vertex, got {:?}",
+        l.bar.enc_sync_before
+    );
+    assert!(
+        l.bar.enc_pre_unwaited_stages.contains(MTLStages::Object | MTLStages::Mesh),
+        "omitted Object|Mesh stages must be tracked for mid-pass mesh draw sync"
+    );
+
+    // 2) Switching from VS draw to Mesh-only draw inside the SAME render pass triggers
+    //    `ensure_pre_raster_stage_synced` for `Mesh` (leaving `Object` unwaited until AS+MS!).
+    let mid0 = stats::c::rb_mid_qb.load(Relaxed);
+    l.gfx_root.set_root_signature(mesh_rs.clone()).unwrap();
+    l.gfx_root.set_constants(0, 0, &[0, 128, 0, 0]).unwrap();
+    l.set_mesh_pipeline(ms_only_pso.clone());
+    l.dispatch_mesh(1, 1, 1).unwrap();
+    assert!(
+        stats::c::rb_mid_qb.load(Relaxed) > mid0,
+        "switching to Mesh draw in same pass must sync omitted Mesh stage"
+    );
+    assert!(
+        !l.bar.enc_pre_unwaited_stages.contains(MTLStages::Mesh)
+            && l.bar.enc_pre_unwaited_stages.contains(MTLStages::Object),
+        "Mesh-only draw must consume Mesh and leave Object unwaited, got {:?}",
+        l.bar.enc_pre_unwaited_stages
+    );
+
+    // 3) Switching to AS+MS draw inside the SAME render pass consumes `Object` too.
+    l.set_mesh_pipeline(as_ms_pso.clone());
+    l.dispatch_mesh(1, 1, 1).unwrap();
+    assert!(
+        l.bar.enc_pre_unwaited_stages.is_empty(),
+        "AS+MS draw must consume remaining Object stage"
+    );
+
+    // 4) Compute -> Fragment only: `UAV -> PIXEL_SRV` targets Fragment without stalling Vertex.
+    l.end_encoder();
+    l.clear_uav(&tex_uav, None, ClearValue::Float([0.25, 0.5, 0.75, 1.0]), &[]).unwrap();
+    l.barrier_list_with(&[Barrier::Transition(tex_id, STATE_UAV, STATE_PIXEL_SRV)], true, false);
+    assert!(
+        l.bar.split_pend.frag_after.contains(MTLStages::Dispatch)
+            && l.bar.split_pend.vtx_after.is_empty(),
+        "UAV -> PIXEL_SRV must target Fragment without pre-raster stall"
+    );
+    l.gfx_root.set_root_signature(vs_rs.clone()).unwrap();
+    l.gfx_root.set_descriptor(0, cb_up.gpu_va).unwrap();
+    l.gfx_root.set_descriptor(1, buf_uav.gpu_va).unwrap();
+    l.set_graphics_pipeline(vs_pso.clone());
+    l.draw(3, 1, 0, 0).unwrap();
+    assert_eq!(
+        l.bar.enc_sync_before,
+        MTLStages::Fragment,
+        "Compute -> Fragment draw must narrow before-mask to Fragment only"
+    );
+
+    // 5) Compute -> Mesh-only opening a fresh render pass narrows before-mask to `Mesh` only;
+    //    Compute -> AS+MS narrows to `Object | Mesh`.
+    //    Use `begin_mesh(true)` (indirect) so pre-raster buffer reads consume the Compute->Mesh sync.
+    l.end_encoder();
+    l.clear_uav(&buf_uav, Some(&raw_uav_desc), ClearValue::Uint([2; 4]), &[]).unwrap();
+    l.barrier_list_with(&[Barrier::Transition(buf_id, STATE_UAV, STATE_NON_PIXEL_SRV)], true, false);
+    l.gfx_root.set_root_signature(mesh_rs.clone()).unwrap();
+    l.gfx_root.set_constants(0, 0, &[0, 200, 0, 0]).unwrap();
+    l.set_mesh_pipeline(ms_only_pso.clone());
+    let (e_ms, p_ms) = l.begin_mesh(true).unwrap();
+    crate::mesh::encode_dispatch(&e_ms, &p_ms, 1, 1, 1).unwrap();
+    assert!(
+        l.bar.enc_sync_before.contains(MTLStages::Mesh)
+            && !l.bar.enc_sync_before.intersects(MTLStages::Vertex | MTLStages::Object),
+        "Mesh-only pass must narrow before-mask to Mesh, got {:?}",
+        l.bar.enc_sync_before
+    );
+    l.end_encoder();
+    l.clear_uav(&buf_uav, Some(&raw_uav_desc), ClearValue::Uint([3; 4]), &[]).unwrap();
+    l.barrier_list_with(&[Barrier::Transition(buf_id, STATE_UAV, STATE_NON_PIXEL_SRV)], true, false);
+    l.set_mesh_pipeline(as_ms_pso.clone());
+    let (e_as, p_as) = l.begin_mesh(true).unwrap();
+    crate::mesh::encode_dispatch(&e_as, &p_as, 1, 1, 1).unwrap();
+    assert!(
+        l.bar.enc_sync_before.contains(MTLStages::Object | MTLStages::Mesh)
+            && !l.bar.enc_sync_before.contains(MTLStages::Vertex),
+        "AS+MS pass must narrow before-mask to Object|Mesh, got {:?}",
+        l.bar.enc_sync_before
+    );
+
+    // 6) Draw -> Compute (Blit vs Dispatch) + read->read / same-state no-hazard elision.
+    //    Consume step 5's leftover NON_PIXEL_SRV Dispatch obligation first so step 6 starts clean.
+    l.end_encoder();
+    l.bar.split_pend.disp_after = MTLStages::empty();
+    l.barrier_list_with(
+        &[Barrier::Transition(rt_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    assert!(
+        l.bar.split_pend.blit_after.contains(MTLStages::Fragment)
+            && l.bar.split_pend.disp_after.is_empty(),
+        "RT -> COPY_SOURCE must target Blit without stalling Dispatch"
+    );
+    let fp = PlacedFootprint {
+        offset: 0,
+        format: RGBA8_UNORM,
+        width: 4,
+        height: 4,
+        depth: 1,
+        row_pitch: 256,
+        _pad: 0,
+    };
+    l.copy_texture_region(CopyLoc::Footprint(&rb, fp), [0, 0, 0], CopyLoc::Subresource(&rt, 0), None)
+        .unwrap();
+    l.end_encoder();
+    l.barrier_list_with(
+        &[Barrier::Transition(rt_id, STATE_RENDER_TARGET, STATE_NON_PIXEL_SRV)],
+        true,
+        false,
+    );
+    assert!(
+        l.bar.split_pend.disp_after.contains(MTLStages::Fragment)
+            && l.bar.split_pend.blit_after.is_empty(),
+        "RT -> NON_PIXEL_SRV must target Dispatch without stalling Blit"
+    );
+    let r2r0 = stats::c::rb_r2r_elided.load(Relaxed);
+    let noop0 = stats::c::rb_noop.load(Relaxed);
+    l.barrier_list_with(
+        &[
+            Barrier::Transition(tex_id, STATE_PIXEL_SRV, STATE_NON_PIXEL_SRV),
+            Barrier::Transition(tex_id, STATE_PIXEL_SRV, STATE_PIXEL_SRV),
+        ],
+        true,
+        false,
+    );
+    assert!(stats::c::rb_r2r_elided.load(Relaxed) > r2r0, "read->read must be elided");
+    assert!(stats::c::rb_noop.load(Relaxed) > noop0, "same-state transition must be elided");
+
+    // 7) Fallbacks: `Barrier::Uav`, `Barrier::Full` (aliasing), and unknown `COMMON` (`s0 == 0`) / `r == 0`.
+    l.barrier_list_with(&[Barrier::Transition(0, STATE_COMMON, STATE_COPY_DEST)], true, false);
+    assert_eq!(l.bar.split_pend.blit_after, MTLStages::All, "COMMON / r==0 must fall back to All");
+    l.barrier_list_with(&[Barrier::Uav(buf_id)], true, false);
+    assert!(!l.bar.split_pend.disp_after.is_empty(), "Barrier::Uav must arm Dispatch sync");
+    l.barrier_list_with(&[Barrier::Full], true, false);
+    assert!(l.bar.needs_barrier, "Barrier::Full (aliasing) must arm full barrier");
+
+    l.close().unwrap();
+    q.submit(&[&l.cb]);
+    q.wait_idle();
+    alloc.reset();
+}
+
+#[test]
+fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
+    let Some((rs, pso)) = build_g48_vs_srv_ps_cb0_pso("split_bar") else { return };
+    let q = Queue::new(ListType::Direct, "split_bar queue").unwrap();
+    let alloc1 = CommandAllocator::new(ListType::Direct).unwrap();
+    let alloc2 = CommandAllocator::new(ListType::Direct).unwrap();
+    let cb_up = test_buffer(256, heap_type::UPLOAD, 0);
+    let buf_srv = test_buffer(64, heap_type::UPLOAD, 0);
+    let rt1 = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let rt2 = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let rb1 = test_buffer(256 * 4, heap_type::READBACK, 0);
+    let rb2 = test_buffer(256 * 4, heap_type::READBACK, 0);
+    for r in [&cb_up, &buf_srv, &rt1, &rt2, &rb1, &rb2] {
+        r.register_ptr();
+    }
+    unsafe {
+        let cp = cb_up.buffer().unwrap().contents().as_ptr() as *mut f32;
+        *cp.add(0) = 0.0;
+        *cp.add(1) = 1.0;
+        *cp.add(2) = 0.0;
+        *cp.add(3) = 1.0;
+    }
+    let rt1_id = &rt1 as *const Resource as usize;
+    let rt2_id = &rt2 as *const Resource as usize;
+    let rtv1 = TargetView::rtv(&rt1, None).unwrap();
+    let rtv2 = TargetView::rtv(&rt2, None).unwrap();
+    let fp = PlacedFootprint {
+        offset: 0,
+        format: RGBA8_UNORM,
+        width: 4,
+        height: 4,
+        depth: 1,
+        row_pitch: 256,
+        _pad: 0,
+    };
+
+    // List 1: draw rt1 -> SplitBegin(rt1, RT->COPY_SOURCE) -> draw rt2 -> SplitEnd(rt1) -> copy rt1 ->
+    //         SplitBegin(rt2, RT->COPY_SOURCE) (cross-list split!) -> close().
+    let mut l1 = CommandList::new(ListType::Direct).unwrap();
+    l1.begin(&alloc1).unwrap();
+    l1.gfx_root.set_root_signature(rs.clone()).unwrap();
+    l1.gfx_root.set_descriptor(0, cb_up.gpu_va).unwrap();
+    l1.gfx_root.set_descriptor(1, buf_srv.gpu_va).unwrap();
+    l1.set_render_targets(vec![rtv1], None);
+    l1.gfx.topology = 4;
+    l1.set_graphics_pipeline(pso.clone());
+    l1.set_viewports(vec![MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: 4.0,
+        height: 4.0,
+        znear: 0.0,
+        zfar: 1.0,
+    }]);
+    l1.draw(3, 1, 0, 0).unwrap();
+    l1.barrier_list_with(
+        &[Barrier::SplitBegin(rt1_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    assert_eq!(l1.bar.split_barriers.len(), 1, "SplitBegin must record pending split transition");
+    assert!(
+        l1.bar.split_pend.blit_after.is_empty(),
+        "SplitBegin must not emit consumer barrier before SplitEnd"
+    );
+    // Unrelated render pass on rt2 runs between SplitBegin(rt1) and SplitEnd(rt1).
+    l1.set_render_targets(vec![rtv2], None);
+    l1.draw(3, 1, 0, 0).unwrap();
+    // Unattached read-to-read SplitBegin must elide without splitting the open render pass!
+    l1.barrier_list_with(
+        &[Barrier::SplitBegin(rt1_id, STATE_PIXEL_SRV, STATE_NON_PIXEL_SRV)],
+        true,
+        false,
+    );
+    assert!(matches!(l1.enc, Encoder::Render(_)), "r2r SplitBegin must keep render pass open");
+    // Now SplitEnd(rt1) consumes the recorded SplitBegin(rt1) with rt1's earlier gen!
+    l1.barrier_list_with(
+        &[Barrier::SplitEnd(rt1_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    assert!(l1.bar.split_barriers.is_empty(), "SplitEnd must consume matching SplitBegin");
+    assert!(
+        l1.bar.split_pend.blit_after.contains(MTLStages::Fragment),
+        "SplitEnd must arm Fragment -> Blit"
+    );
+    l1.copy_texture_region(CopyLoc::Footprint(&rb1, fp), [0, 0, 0], CopyLoc::Subresource(&rt1, 0), None)
+        .unwrap();
+    // Cross-list split: SplitBegin(rt2) at end of L1, SplitEnd(rt2) at start of L2.
+    l1.barrier_list_with(
+        &[Barrier::SplitBegin(rt2_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    l1.close().unwrap();
+
+    let mut l2 = CommandList::new(ListType::Direct).unwrap();
+    l2.begin(&alloc2).unwrap();
+    l2.barrier_list_with(
+        &[Barrier::SplitEnd(rt2_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    l2.copy_texture_region(CopyLoc::Footprint(&rb2, fp), [0, 0, 0], CopyLoc::Subresource(&rt2, 0), None)
+        .unwrap();
+    l2.close().unwrap();
+
+    q.submit(&[&l1.cb, &l2.cb]);
+    q.wait_idle();
+    assert_eq!(buf_words(&rb1, 1)[0], 0xff00_ff00, "same-list split barrier copy must read green");
+    assert_eq!(buf_words(&rb2, 1)[0], 0xff00_ff00, "cross-list split barrier copy must read green");
+    alloc1.reset();
+    alloc2.reset();
+}
+
+#[test]
+fn list_start_explicit_blit_narrowing_and_cross_list_trailing_guard_on_gpu() {
+    let q = Queue::new(ListType::Direct, "list_start_blit queue").unwrap();
+    let alloc1 = CommandAllocator::new(ListType::Direct).unwrap();
+    let alloc2 = CommandAllocator::new(ListType::Direct).unwrap();
+    let alloc3 = CommandAllocator::new(ListType::Direct).unwrap();
+    let alloc4 = CommandAllocator::new(ListType::Direct).unwrap();
+
+    let up_tex = test_buffer(256 * 4, heap_type::UPLOAD, 0);
+    let rt1 = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let rt2 = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let tex_common = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let tex_simul = test_texture(
+        4,
+        4,
+        RGBA8_UNORM,
+        resource_flags::ALLOW_RENDER_TARGET | resource_flags::ALLOW_SIMULTANEOUS_ACCESS,
+    );
+    let uav_buf = test_buffer(64, heap_type::DEFAULT, resource_flags::ALLOW_UNORDERED_ACCESS);
+    let rb_tex = test_buffer(256 * 4, heap_type::READBACK, 0);
+    let rb_buf = test_buffer(64, heap_type::READBACK, 0);
+    for r in [&up_tex, &rt1, &rt2, &tex_common, &tex_simul, &uav_buf, &rb_tex, &rb_buf] {
+        r.register_ptr();
+    }
+    unsafe {
+        let p = up_tex.buffer().unwrap().contents().as_ptr() as *mut u32;
+        for row in 0..4 {
+            for col in 0..4 {
+                *p.add(row * 64 + col) = 0xff33_6699;
+            }
+        }
+    }
+    let rt1_id = &rt1 as *const Resource as usize;
+    let rt2_id = &rt2 as *const Resource as usize;
+    let common_id = &tex_common as *const Resource as usize;
+    let simul_id = &tex_simul as *const Resource as usize;
+    let uav_id = &uav_buf as *const Resource as usize;
+    let fp = PlacedFootprint {
+        offset: 0,
+        format: RGBA8_UNORM,
+        width: 4,
+        height: 4,
+        depth: 1,
+        row_pitch: 256,
+        _pad: 0,
+    };
+    let raw_uav_desc = {
+        let mut d = [0u8; 40];
+        d[0..4].copy_from_slice(&39u32.to_le_bytes());
+        d[4..8].copy_from_slice(&1u32.to_le_bytes());
+        d[16..20].copy_from_slice(&16u32.to_le_bytes());
+        d[32..36].copy_from_slice(&1u32.to_le_bytes());
+        d
+    };
+
+    // Part A: `L1` runs `Dispatch` (`clear_uav`), closes with a trailing narrowing transition
+    // `Transition(uav_buf, UAV -> RENDER_TARGET)` (not consumed in `L1`).
+    // `emit_close_trailing_producer_barriers()` MUST publish `Dispatch -> Blit` at `L1.close()`.
+    let mut l1 = CommandList::new(ListType::Direct).unwrap();
+    l1.begin(&alloc1).unwrap();
+    l1.clear_uav(&uav_buf, Some(&raw_uav_desc), ClearValue::Uint([0xdead_beef; 4]), &[]).unwrap();
+    l1.barrier_list_with(&[Barrier::Transition(uav_id, STATE_UAV, STATE_RENDER_TARGET)], true, false);
+    l1.close().unwrap();
+
+    // Part B: `L2` starts with `Transition(rt1, RENDER_TARGET -> COPY_DEST)` + `Transition(rt2, RENDER_TARGET -> COPY_DEST)`
+    // + `Transition(uav_buf, RENDER_TARGET -> COPY_SOURCE)`.
+    // Opening Blit (`rt1 <- up_tex`) MUST narrow `ListStart` to `Fragment -> Blit` (omitting `Dispatch`!).
+    let mut l2 = CommandList::new(ListType::Direct).unwrap();
+    l2.begin(&alloc2).unwrap();
+    l2.barrier_list_with(
+        &[
+            Barrier::Transition(rt1_id, STATE_RENDER_TARGET, STATE_COPY_DEST),
+            Barrier::Transition(rt2_id, STATE_RENDER_TARGET, STATE_COPY_DEST),
+            Barrier::Transition(uav_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE),
+        ],
+        true,
+        false,
+    );
+    l2.copy_texture_region(CopyLoc::Subresource(&rt1, 0), [0, 0, 0], CopyLoc::Footprint(&up_tex, fp), None)
+        .unwrap();
+    assert_eq!(
+        l2.bar.enc_sync_after,
+        MTLStages::Fragment,
+        "explicit RT->COPY_DEST list-start Blit must narrow after-mask to Fragment only"
+    );
+    assert_eq!(l2.bar.enc_sync_before, MTLStages::Blit);
+    assert!(
+        l2.bar.list_blit_unwaited_stages.contains(MTLStages::Dispatch),
+        "omitted Dispatch stage must be tracked in list_blit_unwaited_stages"
+    );
+    // Second explicit RT->COPY_DEST Blit stays narrowed; copying `uav_buf` reads back `0xdead_beef`
+    // safely because L1 emitted the trailing producer barrier at close!
+    l2.copy_texture_region(CopyLoc::Subresource(&rt2, 0), [0, 0, 0], CopyLoc::Footprint(&up_tex, fp), None)
+        .unwrap();
+    assert!(l2.bar.list_blit_unwaited_stages.contains(MTLStages::Dispatch));
+    l2.copy_buffer(&rb_buf, 0, &uav_buf, 0, 64).unwrap();
+    // Copy rt1 back to readback to verify upload pixels too.
+    l2.barrier_list_with(&[Barrier::Transition(rt1_id, STATE_COPY_DEST, STATE_COPY_SOURCE)], true, false);
+    l2.copy_texture_region(CopyLoc::Footprint(&rb_tex, fp), [0, 0, 0], CopyLoc::Subresource(&rt1, 0), None)
+        .unwrap();
+    l2.close().unwrap();
+
+    // Part C: `COMMON` (`s0 == 0`) and `ALLOW_SIMULTANEOUS_ACCESS` must taint and fall back to `All -> Blit`.
+    let mut l3 = CommandList::new(ListType::Direct).unwrap();
+    l3.begin(&alloc3).unwrap();
+    l3.barrier_list_with(&[Barrier::Transition(common_id, STATE_COMMON, STATE_COPY_DEST)], true, false);
+    l3.copy_texture_region(CopyLoc::Subresource(&tex_common, 0), [0, 0, 0], CopyLoc::Footprint(&up_tex, fp), None)
+        .unwrap();
+    assert_eq!(l3.bar.enc_sync_after, MTLStages::All, "COMMON s0 must fall back to All -> Blit");
+    l3.close().unwrap();
+
+    let mut l4 = CommandList::new(ListType::Direct).unwrap();
+    l4.begin(&alloc4).unwrap();
+    l4.barrier_list_with(
+        &[Barrier::Transition(simul_id, STATE_RENDER_TARGET, STATE_COPY_DEST)],
+        true,
+        false,
+    );
+    l4.copy_texture_region(CopyLoc::Subresource(&tex_simul, 0), [0, 0, 0], CopyLoc::Footprint(&up_tex, fp), None)
+        .unwrap();
+    assert_eq!(
+        l4.bar.enc_sync_after,
+        MTLStages::All,
+        "ALLOW_SIMULTANEOUS_ACCESS must fall back to All -> Blit"
+    );
+    l4.close().unwrap();
+
+    q.submit(&[&l1.cb, &l2.cb, &l3.cb, &l4.cb]);
+    q.wait_idle();
+    assert_eq!(
+        buf_words(&rb_buf, 1)[0],
+        0xdead_beef,
+        "trailing producer barrier must order L1 Dispatch before L2 narrowed Blit"
+    );
+    assert_eq!(buf_words(&rb_tex, 1)[0], 0xff33_6699, "narrowed list-start texture copy must match");
+    alloc1.reset();
+    alloc2.reset();
+    alloc3.reset();
+    alloc4.reset();
+}
+
+#[test]
+fn occlusion_query_same_pass_reset_coalescing_and_resolve_on_gpu() {
+    use crate::metal::query::{heap_type as qh_type, QueryHeap};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let Some((rs, pso)) = build_g48_vs_srv_ps_cb0_pso("occl_coalesce") else { return };
+    let q = Queue::new(ListType::Direct, "occl_coalesce queue").unwrap();
+    let alloc = CommandAllocator::new(ListType::Direct).unwrap();
+    let cb_up = test_buffer(256, heap_type::UPLOAD, 0);
+    let buf_srv = test_buffer(64, heap_type::UPLOAD, 0);
+    let rt = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let dst_rb = test_buffer(64, heap_type::READBACK, 0);
+    for r in [&cb_up, &buf_srv, &rt, &dst_rb] {
+        r.register_ptr();
+    }
+    let rtv = TargetView::rtv(&rt, None).unwrap();
+    let qh = QueryHeap::new(qh_type::OCCLUSION, 8).unwrap();
+    let vis_buf = qh.visibility.as_ref().unwrap();
+    unsafe {
+        let vp = vis_buf.contents().as_ptr() as *mut u64;
+        for i in 0..6 {
+            *vp.add(i) = 555 + i as u64;
+        }
+    }
+
+    let _guard = gpu_stats_lock();
+    let qb_int0 = stats::c::qb_internal.load(Relaxed);
+    let cs_enc0 = stats::c::compute_enc.load(Relaxed);
+
+    let mut l = CommandList::new(ListType::Direct).unwrap();
+    l.begin(&alloc).unwrap();
+    l.gfx_root.set_root_signature(rs.clone()).unwrap();
+    l.gfx_root.set_descriptor(0, cb_up.gpu_va).unwrap();
+    l.gfx_root.set_descriptor(1, buf_srv.gpu_va).unwrap();
+    l.set_render_targets(vec![rtv], None);
+    l.gfx.topology = 4;
+    l.set_graphics_pipeline(pso.clone());
+    l.set_viewports(vec![MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: 4.0,
+        height: 4.0,
+        znear: 0.0,
+        zfar: 1.0,
+    }]);
+
+    // Queries 0, 1, 3 run consecutively on the same targets -> must coalesce into ONE Reset pass
+    // with zero `FullWhy::Internal` barriers and zero `FILL_OCCL` compute encoders!
+    // Slot 2 is untouched (must stay 557!).
+    l.begin_occlusion(&qh, 0, false).unwrap();
+    l.draw(3, 1, 0, 0).unwrap();
+    l.draw(3, 1, 0, 0).unwrap();
+    l.end_occlusion(&qh, 0).unwrap();
+
+    let enc_ptr_0 = match &l.enc {
+        Encoder::Render(e) => &**e as *const _ as usize,
+        _ => panic!("expected open render pass after query 0"),
+    };
+    l.begin_occlusion(&qh, 1, false).unwrap();
+    l.draw(3, 1, 0, 0).unwrap();
+    l.end_occlusion(&qh, 1).unwrap();
+    let enc_ptr_1 = match &l.enc {
+        Encoder::Render(e) => &**e as *const _ as usize,
+        _ => panic!("expected same render pass after query 1"),
+    };
+    assert_eq!(enc_ptr_0, enc_ptr_1, "consecutive occlusion queries must coalesce into one render pass");
+
+    // Slot 3: enabled and disabled inside the same Reset pass with 0 draws -> resets to 0.
+    l.begin_occlusion(&qh, 3, false).unwrap();
+    l.end_occlusion(&qh, 3).unwrap();
+
+    // Slot 4: spans TWO render passes (`Reset` pass 1 + `Accumulate` pass 2) -> accumulates 2 draws!
+    l.begin_occlusion(&qh, 4, false).unwrap();
+    l.draw(3, 1, 0, 0).unwrap();
+    l.end_encoder();
+    l.draw(3, 1, 0, 0).unwrap();
+    l.end_occlusion(&qh, 4).unwrap();
+    l.end_encoder();
+
+    assert_eq!(
+        stats::c::compute_enc.load(Relaxed) - cs_enc0,
+        0,
+        "coalesced occlusion queries must not open FILL_OCCL compute encoders"
+    );
+
+    // Slot 5: 0-draw BeginQuery..EndQuery while NO render pass is open -> zeroes slot via Blit
+    // without emitting `FullWhy::Internal`.
+    l.begin_occlusion(&qh, 5, false).unwrap();
+    l.end_occlusion(&qh, 5).unwrap();
+
+    // Resolve all 6 slots to readback buffer via stage-masked Blit (zero `FullWhy::Internal`).
+    l.resolve_occlusion(&qh, 0, 6, &dst_rb, 0).unwrap();
+    l.close().unwrap();
+
+    assert_eq!(
+        stats::c::qb_internal.load(Relaxed) - qb_int0,
+        0,
+        "occlusion queries and ResolveQueryData must emit zero FullWhy::Internal barriers"
+    );
+
+    q.submit(&[&l.cb]);
+    q.wait_idle();
+    alloc.reset();
+
+    let got: [u64; 6] = unsafe {
+        let p = dst_rb.buffer().unwrap().contents().as_ptr() as *const u64;
+        [*p.add(0), *p.add(1), *p.add(2), *p.add(3), *p.add(4), *p.add(5)]
+    };
+    assert_eq!(got[1], 16, "slot 1 (1 draw on 4x4 RT) must count 16 samples, got {got:?}");
+    assert_eq!(got[0], 32, "slot 0 (2 draws in same Reset pass) must count 32 samples, got {got:?}");
+    assert_eq!(got[2], 557, "untouched slot 2 must remain 557, got {got:?}");
+    assert_eq!(got[3], 0, "0-draw slot 3 in Reset pass must reset to 0, got {got:?}");
+    assert_eq!(got[4], 32, "multi-pass slot 4 (Reset + Accumulate) must count 32 samples, got {got:?}");
+    assert_eq!(got[5], 0, "0-draw slot 5 outside render pass must zero via Blit, got {got:?}");
+}
