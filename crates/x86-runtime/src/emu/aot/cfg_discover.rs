@@ -354,7 +354,7 @@ unsafe fn discover_inner(
                             }
                         }
                         EdgeKind::DirectCall => {
-                            if past_base_depth {
+                            if past_base_depth && f.is_none() {
                                 continue;
                             }
                             if sf.is_some() && sf != f {
@@ -368,7 +368,10 @@ unsafe fn discover_inner(
                         }
                         EdgeKind::TailBranch => {
                             if sf != f {
-                                if !past_base_depth && sf.is_none() && valid_code_target(s, &text) {
+                                if (!past_base_depth || f.is_some())
+                                    && sf.is_none()
+                                    && valid_code_target(s, &text)
+                                {
                                     // Direct tail-jump from a `.pdata` function into a
                                     // `.pdata`-less leaf helper: follow cleanly without leaking
                                     // caller switch hints.

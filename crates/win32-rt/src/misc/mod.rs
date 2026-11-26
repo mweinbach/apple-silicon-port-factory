@@ -42,6 +42,7 @@ pub mod libxess_dx11;
 pub mod lz4;
 pub(crate) mod mediadecoders;
 pub mod mediadecoders_windowsdesktop;
+pub mod mfc140u;
 pub mod mfplat;
 pub mod mmdevapi;
 pub mod mono_2_0_bdwgc;

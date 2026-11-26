@@ -165,6 +165,7 @@ pub fn has_native_va_registrar() -> bool {
 pub fn register_internal_host_thunks() {
     ucrt::runtime::register_host_thunks();
     misc::msvcp140::register_static_vtables();
+    misc::mfc140u::register_static_vtables();
     misc::mediadecoders_windowsdesktop::register_static_vtables();
     #[cfg(feature = "wwise-bridge")]
     audio::akrec::register_static_vtables();
