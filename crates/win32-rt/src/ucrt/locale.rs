@@ -201,7 +201,7 @@ fn time_names_for_entry(e: &LocaleEntry) -> &'static TimeLocaleNames {
         return t;
     }
     let cdef = c_time_names();
-    let Some(loc) = kstr::resolve_locale_tag(&e.bcp47) else {
+    let Some(loc) = kstr::resolve_locale_tag(&e.bcp47).map(|l| l.with_gregorian_calendar()) else {
         return cdef;
     };
     let q = |lctype: u32, fallback: &str| -> String {
@@ -1144,6 +1144,32 @@ mod tests {
             assert_eq!(_setmbcp(999999), -1);
             assert_eq!(errno::get(), EINVAL);
             assert_eq!(_getmbcp(), ACP as i32);
+
+            // Locales whose default ICU calendar is non-Gregorian (e.g. ar-SA Islamic,
+            // th-TH Buddhist) must still supply Gregorian month names and date patterns for
+            // CRT `strftime`/`wcsftime`, which index `tm_mon` on the Gregorian calendar.
+            assert!(!setlocale(LC_TIME, b"ar-SA\0".as_ptr()).is_null());
+            let jan = super::super::time::Tm {
+                tm_sec: 0,
+                tm_min: 0,
+                tm_hour: 12,
+                tm_mday: 15,
+                tm_mon: 0,
+                tm_year: 126,
+                tm_wday: 4,
+                tm_yday: 14,
+                tm_isdst: 0,
+            };
+            let mut wbuf = [0u16; 64];
+            let wn = super::super::time::wcsftime(wbuf.as_mut_ptr(), wbuf.len(), crate::strings::to_wide_z("%B").as_ptr(), &jan);
+            assert!(wn > 0);
+            let ar_jan = String::from_utf16_lossy(&wbuf[..wn]);
+            assert_eq!(ar_jan, "يناير", "ar-SA LC_TIME must use Gregorian January, not Islamic Muharram");
+            assert!(!setlocale(LC_TIME, b"ar-SA.utf8\0".as_ptr()).is_null());
+            let mut abuf = [0u8; 64];
+            let an = super::super::time::strftime(abuf.as_mut_ptr(), abuf.len(), b"%B\0".as_ptr(), &jan);
+            assert!(an > 0);
+            assert_eq!(std::str::from_utf8(&abuf[..an]).unwrap(), "يناير");
 
             // Restore default C locale for subsequent serial tests
             assert!(!setlocale(LC_ALL, b"C\0".as_ptr()).is_null());

@@ -2021,6 +2021,27 @@ impl ResolvedLocale {
             bcp47: "en-US".into(),
         }
     }
+    pub(crate) fn with_gregorian_calendar(&self) -> Self {
+        let mut out = self.clone();
+        if !out.invariant {
+            out.icu_id = gregorian_icu_id(&out.icu_id);
+        }
+        out
+    }
+}
+
+fn gregorian_icu_id(icu_id: &str) -> String {
+    let base = if icu_id.is_empty() { "en_US" } else { icu_id };
+    if let Some((head, kws)) = base.split_once('@') {
+        let mut kept: Vec<&str> = kws
+            .split(';')
+            .filter(|kv| !kv.is_empty() && !kv.to_ascii_lowercase().starts_with("calendar="))
+            .collect();
+        kept.push("calendar=gregorian");
+        format!("{head}@{}", kept.join(";"))
+    } else {
+        format!("{base}@calendar=gregorian")
+    }
 }
 
 fn icu_to_bcp47(icu_id: &str) -> String {
@@ -2392,6 +2413,10 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
         return locale_info_en_or_inv(lctype, false).map(|c| c.into_owned());
     };
     let cloc = icu::c_str(&loc.icu_id);
+    // `LOCALE_ICALENDARTYPE` (`0x1009`) reports Gregorian (`1`), so date symbols and patterns
+    // must query `@calendar=gregorian` rather than a locale's non-Gregorian ICU default
+    // (e.g. Islamic for `ar-SA` or Buddhist for `th-TH`). Keep `cloc` clean for display names.
+    let date_cloc = icu::c_str(&gregorian_icu_id(&loc.icu_id));
     let en_us = c"en_US";
 
     let num_sym = |style: i32, sym: i32| -> Option<String> {
@@ -2435,7 +2460,7 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
     let date_pat = |tstyle: i32, dstyle: i32, force4y: bool| -> Option<String> {
         unsafe {
             let mut st = 0i32;
-            let df = (a.udat_open)(tstyle, dstyle, cloc.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0, &mut st);
+            let df = (a.udat_open)(tstyle, dstyle, date_cloc.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0, &mut st);
             if df.is_null() || st > 0 {
                 return None;
             }
@@ -2447,7 +2472,7 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
     let best_pat = |skel: &str| -> Option<String> {
         unsafe {
             let mut st = 0i32;
-            let pg = (a.udatpg_open)(cloc.as_ptr(), &mut st);
+            let pg = (a.udatpg_open)(date_cloc.as_ptr(), &mut st);
             if pg.is_null() || st > 0 {
                 return None;
             }
@@ -2462,7 +2487,7 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
     let date_sym = |sym_type: i32, idx: i32| -> Option<String> {
         unsafe {
             let mut st = 0i32;
-            let df = (a.udat_open)(icu::UDAT_NONE, icu::UDAT_SHORT, cloc.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0, &mut st);
+            let df = (a.udat_open)(icu::UDAT_NONE, icu::UDAT_SHORT, date_cloc.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0, &mut st);
             if df.is_null() || st > 0 {
                 return None;
             }
@@ -3863,12 +3888,7 @@ pub unsafe extern "win64" fn GetCalendarInfoEx(
             return 0;
         }
     };
-    let base_icu = if cal_loc.invariant { "en_US" } else { cal_loc.icu_id.as_str() };
-    cal_loc.icu_id = if base_icu.contains('@') {
-        format!("{base_icu};calendar=gregorian")
-    } else {
-        format!("{base_icu}@calendar=gregorian")
-    };
+    cal_loc.icu_id = gregorian_icu_id(if cal_loc.invariant { "en_US" } else { cal_loc.icu_id.as_str() });
     let cal_id = cal;
     let return_num = (ty & CAL_RETURN_NUMBER) != 0;
     let base = ty & 0xFFFF;
