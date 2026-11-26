@@ -21,8 +21,8 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
@@ -376,7 +376,128 @@ static VIRTUAL_PAD: Mutex<VirtualPadState> = Mutex::new(VirtualPadState {
     held_vks: Vec::new(),
 });
 static ENABLED: AtomicBool = AtomicBool::new(true);
-static STARTED: AtomicBool = AtomicBool::new(false);
+static START_ONCE: Once = Once::new();
+
+/// Bit position of `btn::GUIDE` (`0x0400`) inside packed `XInputFastSlot::w0`
+/// (`packet: u32` in bits `0..32`, `buttons: u16` in bits `32..48`).
+const GUIDE_W0_BIT: u64 = (btn::GUIDE as u64) << 32;
+
+/// Lock-free seqlock snapshot for one XInput user slot, read directly by both
+/// Rust `XInputGetState`/`XInputGetStateEx` and inline ARM64 JIT/AOT fast thunks.
+#[repr(C, align(32))]
+pub struct XInputFastSlot {
+    /// Seqlock counter: odd while a writer is updating, even when quiescent.
+    pub seq: AtomicU32,
+    /// `0` = disconnected (`ERROR_DEVICE_NOT_CONNECTED`), `1` = connected (`ERROR_SUCCESS`).
+    pub connected: AtomicU32,
+    /// Low 8 bytes of `XINPUT_STATE` (with `btn::GUIDE` intact and `ENABLED` applied):
+    /// `packet (0..32) | buttons (32..48) | left_trigger (48..56) | right_trigger (56..64)`.
+    pub w0: AtomicU64,
+    /// High 8 bytes of `XINPUT_STATE`:
+    /// `thumb_lx (0..16) | thumb_ly (16..32) | thumb_rx (32..48) | thumb_ry (48..64)`.
+    pub w1: AtomicU64,
+    _pad: u64,
+}
+const _: () = assert!(std::mem::size_of::<XInputFastSlot>() == 32);
+const _: () = assert!(std::mem::offset_of!(XInputFastSlot, seq) == 0);
+const _: () = assert!(std::mem::offset_of!(XInputFastSlot, connected) == 4);
+const _: () = assert!(std::mem::offset_of!(XInputFastSlot, w0) == 8);
+const _: () = assert!(std::mem::offset_of!(XInputFastSlot, w1) == 16);
+
+/// Process-wide lock-free XInput state table for inline ARM64 fast thunks.
+#[repr(C, align(32))]
+pub struct XInputFastTable {
+    /// `0` = gamepad backend not yet started (must take slow path to run `ensure_started`),
+    /// `1` = backend started and fast-path reads are valid.
+    pub ready: AtomicU64,
+    _pad: [u64; 3],
+    pub slots: [XInputFastSlot; XUSER_MAX_COUNT],
+}
+const _: () = assert!(std::mem::offset_of!(XInputFastTable, ready) == 0);
+const _: () = assert!(std::mem::offset_of!(XInputFastTable, slots) == 32);
+
+impl XInputFastSlot {
+    const fn new() -> Self {
+        Self {
+            seq: AtomicU32::new(0),
+            connected: AtomicU32::new(0),
+            w0: AtomicU64::new(0),
+            w1: AtomicU64::new(0),
+            _pad: 0,
+        }
+    }
+}
+
+static FAST_TABLE: XInputFastTable = XInputFastTable {
+    ready: AtomicU64::new(0),
+    _pad: [0; 3],
+    slots: [
+        XInputFastSlot::new(),
+        XInputFastSlot::new(),
+        XInputFastSlot::new(),
+        XInputFastSlot::new(),
+    ],
+};
+
+/// Address of the process-wide [`XInputFastTable`] for inlined ARM64 `XInputGetState` /
+/// `XInputGetStateEx` thunks.
+pub fn xinput_fast_table_ptr() -> usize {
+    &FAST_TABLE as *const XInputFastTable as usize
+}
+
+#[inline]
+fn pack_state_words(packet: u32, pad: Gamepad) -> (u64, u64) {
+    let w0 = (packet as u64)
+        | ((pad.buttons as u64) << 32)
+        | ((pad.left_trigger as u64) << 48)
+        | ((pad.right_trigger as u64) << 56);
+    let w1 = ((pad.thumb_lx as u16) as u64)
+        | (((pad.thumb_ly as u16) as u64) << 16)
+        | (((pad.thumb_rx as u16) as u64) << 32)
+        | (((pad.thumb_ry as u16) as u64) << 48);
+    (w0, w1)
+}
+
+/// Recompute and publish `FAST_TABLE.slots[user]` under the `SLOTS` mutex (lock order:
+/// `SLOTS` -> `VIRTUAL_PAD`, matching `slot_state` and `connected`).
+fn publish_fast_slot(user: usize) {
+    if user >= XUSER_MAX_COUNT {
+        return;
+    }
+    let s = SLOTS.lock().unwrap();
+    let phys = s[user].as_ref().filter(|sl| sl.connected).map(|sl| (sl.pad, sl.packet));
+    let effective = if user == 0 {
+        let v = VIRTUAL_PAD.lock().unwrap();
+        match (phys, v.connected) {
+            (Some((p, pkt)), true) => {
+                let merged = if v.pad != Gamepad::default() { merge_gamepad(p, v.pad) } else { p };
+                Some((merged, pkt.wrapping_add(v.packet)))
+            }
+            (Some(st), false) => Some(st),
+            (None, true) => Some((v.pad, v.packet)),
+            (None, false) => None,
+        }
+    } else {
+        phys
+    };
+    let (conn, w0, w1) = match effective {
+        Some((raw_pad, pkt)) => {
+            let pad = if ENABLED.load(Ordering::Acquire) { raw_pad } else { Gamepad::default() };
+            let (w0, w1) = pack_state_words(pkt, pad);
+            (1u32, w0, w1)
+        }
+        None => (0u32, 0u64, 0u64),
+    };
+    let dst = &FAST_TABLE.slots[user];
+    let seq = dst.seq.load(Ordering::Relaxed);
+    dst.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+    fence(Ordering::AcqRel);
+    dst.connected.store(conn, Ordering::Relaxed);
+    dst.w0.store(w0, Ordering::Relaxed);
+    dst.w1.store(w1, Ordering::Relaxed);
+    dst.seq.store(seq.wrapping_add(2), Ordering::Release);
+    drop(s);
+}
 
 fn with_slot<R>(user: usize, f: impl FnOnce(&mut Slot) -> R) -> R {
     let mut s = SLOTS.lock().unwrap();
@@ -509,6 +630,7 @@ pub fn backend_connect(user: usize, info: DeviceInfo) {
             Slot0Transition::Disconnected | Slot0Transition::None => {}
         }
     }
+    publish_fast_slot(user);
     crate::user32::misc::notify_device_change(true);
 }
 
@@ -538,6 +660,7 @@ pub fn backend_disconnect(user: usize) {
             (was, Slot0Transition::Disconnected)
         })
     };
+    publish_fast_slot(user);
     if user == 0 {
         emit_slot0_transition(transition);
     } else {
@@ -552,18 +675,21 @@ pub fn backend_disconnect(user: usize) {
 pub fn backend_update(user: usize, pad: Gamepad) {
     let now = Instant::now();
     if user == 0 {
-        let transition = {
+        let (changed, transition) = {
             let mut slots = SLOTS.lock().unwrap();
             let slot = slots[0].get_or_insert_with(Slot::default);
             if slot.connected && slot.pad != pad {
                 slot.pad = pad;
                 slot.packet = slot.packet.wrapping_add(1);
                 let mut v = VIRTUAL_PAD.lock().unwrap();
-                sync_slot0_keystrokes(&slots, &mut v, now)
+                (true, sync_slot0_keystrokes(&slots, &mut v, now))
             } else {
-                Slot0Transition::None
+                (false, Slot0Transition::None)
             }
         };
+        if changed {
+            publish_fast_slot(0);
+        }
         emit_slot0_transition(transition);
     } else {
         let updated_pad = with_slot(user, |s| {
@@ -578,6 +704,7 @@ pub fn backend_update(user: usize, pad: Gamepad) {
             }
         });
         if let Some(effective) = updated_pad {
+            publish_fast_slot(user);
             crate::misc::gameinput::on_gamepad_state_changed(user, &effective);
         }
     }
@@ -639,6 +766,7 @@ pub fn set_virtual_gamepad(connected: bool, pad: Gamepad) {
         };
         (conn_changed, stop_phone, transition)
     };
+    publish_fast_slot(0);
     if stop_phone {
         crate::macos::uikit::dispatch_host_rumble(0, 0);
     }
@@ -758,9 +886,13 @@ impl GcPad {
 // ---------------------------------------------------------------------------
 
 fn ensure_started() {
-    if !STARTED.swap(true, Ordering::AcqRel) {
-        crate::macos::gamepad::start();
+    if FAST_TABLE.ready.load(Ordering::Acquire) != 0 {
+        return;
     }
+    START_ONCE.call_once(|| {
+        crate::macos::gamepad::start();
+        FAST_TABLE.ready.store(1, Ordering::Release);
+    });
 }
 
 /// Validate `user` and return the slot if connected.
@@ -817,28 +949,48 @@ fn connected(user: u32) -> Result<Slot, u32> {
     phys.ok_or(ERROR_DEVICE_NOT_CONNECTED)
 }
 
+#[inline(always)]
 unsafe fn get_state(user: u32, out: *mut State, guide: bool) -> u32 {
-    if out.is_null() {
+    if out.is_null() || user as usize >= XUSER_MAX_COUNT {
         return ERROR_BAD_ARGUMENTS;
     }
-    let s = match connected(user) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let mut pad = if ENABLED.load(Ordering::Acquire) { s.pad } else { Gamepad::default() };
-    if !guide {
-        pad.buttons &= !btn::GUIDE;
+    if FAST_TABLE.ready.load(Ordering::Acquire) == 0 {
+        ensure_started();
     }
-    // Only the 16-byte XINPUT_STATE is written, also for GetStateEx (its
-    // trailing reserved dword is left untouched).
-    out.write_unaligned(State { packet: s.packet, gamepad: pad });
-    ERROR_SUCCESS
+    let slot = &FAST_TABLE.slots[user as usize];
+    loop {
+        let seq1 = slot.seq.load(Ordering::Acquire);
+        if seq1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let conn = slot.connected.load(Ordering::Relaxed);
+        let mut w0 = slot.w0.load(Ordering::Relaxed);
+        let w1 = slot.w1.load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        if slot.seq.load(Ordering::Relaxed) != seq1 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if conn == 0 {
+            return ERROR_DEVICE_NOT_CONNECTED;
+        }
+        if !guide {
+            w0 &= !GUIDE_W0_BIT;
+        }
+        let dst = out as *mut u8;
+        std::ptr::write_unaligned(dst as *mut u64, w0);
+        std::ptr::write_unaligned(dst.add(8) as *mut u64, w1);
+        return ERROR_SUCCESS;
+    }
 }
 
+#[inline(never)]
 pub unsafe extern "win64" fn XInputGetState(user: u32, s: *mut State) -> u32 {
     get_state(user, s, false)
 }
 
+#[inline(never)]
 pub unsafe extern "win64" fn XInputGetStateEx(user: u32, s: *mut State) -> u32 {
     get_state(user, s, true)
 }
@@ -920,6 +1072,9 @@ pub unsafe extern "win64" fn XInputGetCapabilities(user: u32, flags: u32, c: *mu
 
 pub unsafe extern "win64" fn XInputEnable(enable: i32) {
     ENABLED.store(enable != 0, Ordering::Release);
+    for u in 0..XUSER_MAX_COUNT {
+        publish_fast_slot(u);
+    }
     if enable == 0 {
         // Windows stops vibration while disabled.
         for u in 0..XUSER_MAX_COUNT {
@@ -1190,6 +1345,139 @@ mod tests {
             set_virtual_gamepad(false, Gamepad::default());
             crate::macos::uikit::set_rumble_callback(None);
         }
+    }
+
+    #[test]
+    fn fast_table_concurrent_updates_and_seqlock_reads() {
+        use std::sync::Arc;
+
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        backend_disconnect(2);
+        unsafe { XInputEnable(1) };
+
+        // Null pointer and out-of-range user index return ERROR_BAD_ARGUMENTS.
+        unsafe {
+            let mut sentinel = State {
+                packet: 0xDEAD_BEEF,
+                gamepad: Gamepad {
+                    buttons: 0x5A5A,
+                    left_trigger: 11,
+                    right_trigger: 22,
+                    thumb_lx: 333,
+                    thumb_ly: -444,
+                    thumb_rx: 555,
+                    thumb_ry: -666,
+                },
+            };
+            assert_eq!(XInputGetState(0, std::ptr::null_mut()), ERROR_BAD_ARGUMENTS);
+            assert_eq!(XInputGetStateEx(4, &mut sentinel), ERROR_BAD_ARGUMENTS);
+            // Disconnected slot must return ERROR_DEVICE_NOT_CONNECTED and leave output untouched.
+            assert_eq!(XInputGetState(2, &mut sentinel), ERROR_DEVICE_NOT_CONNECTED);
+            assert_eq!(sentinel.packet, 0xDEAD_BEEF);
+            assert_eq!(sentinel.gamepad.buttons, 0x5A5A);
+
+            // Unaligned output buffer write test.
+            backend_connect(2, DeviceInfo { name: "seqlock".into(), wireless: false, rumble: false, battery: None });
+            let pad0 = Gamepad {
+                buttons: btn::A | btn::GUIDE,
+                left_trigger: 77,
+                right_trigger: 88,
+                thumb_lx: -12345,
+                thumb_ly: 23456,
+                thumb_rx: -32768,
+                thumb_ry: 32767,
+            };
+            backend_update(2, pad0);
+            let mut raw = [0xAAu8; 24];
+            let unaligned = raw.as_mut_ptr().add(3) as *mut State;
+            assert_eq!(XInputGetState(2, unaligned), ERROR_SUCCESS);
+            let st_non_ex = std::ptr::read_unaligned(unaligned);
+            assert_eq!(st_non_ex.gamepad.buttons, btn::A);
+            assert_eq!((st_non_ex.gamepad.left_trigger, st_non_ex.gamepad.right_trigger), (77, 88));
+            assert_eq!((st_non_ex.gamepad.thumb_lx, st_non_ex.gamepad.thumb_ly), (-12345, 23456));
+            assert_eq!((st_non_ex.gamepad.thumb_rx, st_non_ex.gamepad.thumb_ry), (-32768, 32767));
+            assert_eq!(XInputGetStateEx(2, unaligned), ERROR_SUCCESS);
+            let st_ex = std::ptr::read_unaligned(unaligned);
+            assert_eq!(st_ex.gamepad.buttons, btn::A | btn::GUIDE);
+            assert_eq!(st_ex.packet, st_non_ex.packet);
+        }
+
+        // Seed slot 2 with a snapshot satisfying the reader invariant before starting readers.
+        backend_update(
+            2,
+            Gamepad {
+                buttons: btn::A | btn::GUIDE,
+                left_trigger: 0,
+                right_trigger: 0xFF,
+                thumb_lx: 0,
+                thumb_ly: 0,
+                thumb_rx: 0,
+                thumb_ry: 0,
+            },
+        );
+        // Concurrent writer hammering slot 2 while 4 reader threads verify zero torn snapshots.
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for tid in 0..4usize {
+            let stop_r = Arc::clone(&stop);
+            readers.push(std::thread::spawn(move || {
+                let mut st = State::default();
+                let mut last_pkt = 0u32;
+                let mut samples = 0u64;
+                while !stop_r.load(Ordering::Acquire) {
+                    let rc = unsafe {
+                        if tid % 2 == 0 {
+                            XInputGetState(2, &mut st)
+                        } else {
+                            XInputGetStateEx(2, &mut st)
+                        }
+                    };
+                    assert_eq!(rc, ERROR_SUCCESS);
+                    // Invariant established by writer: thumb_lx == thumb_ly == -thumb_rx == -thumb_ry
+                    // and left_trigger == (thumb_lx as u8), right_trigger == left_trigger ^ 0xFF.
+                    let v = st.gamepad.thumb_lx;
+                    assert_eq!(st.gamepad.thumb_ly, v, "torn snapshot: lx={v} ly={}", st.gamepad.thumb_ly);
+                    assert_eq!(st.gamepad.thumb_rx, -v, "torn snapshot: lx={v} rx={}", st.gamepad.thumb_rx);
+                    assert_eq!(st.gamepad.thumb_ry, -v, "torn snapshot: lx={v} ry={}", st.gamepad.thumb_ry);
+                    let lt = v as u8;
+                    assert_eq!(st.gamepad.left_trigger, lt, "torn trigger: lx={v} lt={}", st.gamepad.left_trigger);
+                    assert_eq!(st.gamepad.right_trigger, lt ^ 0xFF, "torn trigger: lx={v} rt={}", st.gamepad.right_trigger);
+                    if tid % 2 == 0 {
+                        assert_eq!(st.gamepad.buttons & btn::GUIDE, 0, "XInputGetState leaked GUIDE bit");
+                    }
+                    if last_pkt != 0 {
+                        assert!(
+                            st.packet.wrapping_sub(last_pkt) < 0x8000_0000,
+                            "packet moved backwards: {last_pkt} -> {}",
+                            st.packet
+                        );
+                    }
+                    last_pkt = st.packet;
+                    samples += 1;
+                }
+                assert!(samples > 0);
+            }));
+        }
+        for i in 1i16..=4000 {
+            let lt = i as u8;
+            backend_update(
+                2,
+                Gamepad {
+                    buttons: btn::A | btn::GUIDE,
+                    left_trigger: lt,
+                    right_trigger: lt ^ 0xFF,
+                    thumb_lx: i,
+                    thumb_ly: i,
+                    thumb_rx: -i,
+                    thumb_ry: -i,
+                },
+            );
+        }
+        stop.store(true, Ordering::Release);
+        for r in readers {
+            r.join().unwrap();
+        }
+        backend_disconnect(2);
     }
 
     #[test]

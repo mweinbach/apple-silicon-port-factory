@@ -3,6 +3,7 @@
 
 use crate::emu::jit::{
     self, AotReloc, AotStubOffs, AOT_STUBS_BYTES, RELOC_HOST_FN, RELOC_QPC_STATE,
+    RELOC_XINPUT_STATE,
 };
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -624,8 +625,11 @@ impl Image {
                 && (l.cond_off == u32::MAX || in_code(l.cond_off, 4, 4))
         }) && self.relocs.iter().all(|r| {
             in_code(r.slot_off, 8, 8)
-                && r.kind <= RELOC_QPC_STATE
-                && (r.kind == RELOC_HOST_FN || r.kind == RELOC_QPC_STATE || r.src != 0)
+                && r.kind <= RELOC_XINPUT_STATE
+                && (r.kind == RELOC_HOST_FN
+                    || r.kind == RELOC_QPC_STATE
+                    || r.kind == RELOC_XINPUT_STATE
+                    || r.src != 0)
         })
     }
 }
