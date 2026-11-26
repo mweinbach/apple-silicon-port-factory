@@ -479,8 +479,18 @@ const DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME: u32 = 1;
 const DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME: u32 = 2;
 const DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE: u32 = 3;
 const DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME: u32 = 4;
+const DISPLAYCONFIG_DEVICE_INFO_SET_TARGET_PERSISTENCE: u32 = 5;
+const DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE: u32 = 6;
+const DISPLAYCONFIG_DEVICE_INFO_GET_SUPPORT_VIRTUAL_RESOLUTION: u32 = 7;
+const DISPLAYCONFIG_DEVICE_INFO_SET_SUPPORT_VIRTUAL_RESOLUTION: u32 = 8;
 const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO: u32 = 9;
+const DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE: u32 = 10;
 const DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL: u32 = 11;
+const DISPLAYCONFIG_DEVICE_INFO_GET_MONITOR_SPECIALIZATION: u32 = 12;
+const DISPLAYCONFIG_DEVICE_INFO_SET_MONITOR_SPECIALIZATION: u32 = 13;
+const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: u32 = 15;
+const DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE: u32 = 16;
+const DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE: u32 = (-3i32) as u32;
 
 unsafe fn write_wide_fixed(dst: *mut u16, cap: usize, s: &str) {
     if cap == 0 {
@@ -664,12 +674,30 @@ pub unsafe extern "win64" fn DisplayConfigGetDeviceInfo(pkt: *mut u8) -> i32 {
             write_wide_fixed(pkt.add(20) as *mut u16, 128, "\\\\?\\PCI#VEN_106B&DEV_0001&SUBSYS_00000000&REV_00#3&11583659&0&00");
             0
         }
+        DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE => {
+            // DISPLAYCONFIG_TARGET_BASE_TYPE (24 bytes): header @0..20, baseOutputTechnology @20.
+            if sz < 24 {
+                return e::INSUFFICIENT_BUFFER as i32;
+            }
+            let is_builtin = mon.is_some_and(|m| m.name.contains("Built-in") || m.name.contains("Retina"));
+            let tech: u32 = if is_builtin { 0x8000_0000 } else { 10 }; // INTERNAL vs DISPLAYPORT_EXTERNAL
+            (pkt.add(20) as *mut u32).write_unaligned(tech);
+            0
+        }
+        DISPLAYCONFIG_DEVICE_INFO_GET_SUPPORT_VIRTUAL_RESOLUTION => {
+            // DISPLAYCONFIG_SUPPORT_VIRTUAL_RESOLUTION (24 bytes): header @0..20, disableMonitorVirtualResolution @20.
+            if sz < 24 {
+                return e::INSUFFICIENT_BUFFER as i32;
+            }
+            (pkt.add(20) as *mut u32).write_unaligned(0);
+            0
+        }
         DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO => {
             if sz < 32 {
                 return e::INSUFFICIENT_BUFFER as i32;
             }
             (pkt.add(20) as *mut u32).write_unaligned(0); // HDR off
-            (pkt.add(24) as *mut u32).write_unaligned(0); // RGB
+            (pkt.add(24) as *mut u32).write_unaligned(0); // DISPLAYCONFIG_COLOR_ENCODING_RGB
             (pkt.add(28) as *mut u32).write_unaligned(8); // 8 bpc
             0
         }
@@ -680,17 +708,74 @@ pub unsafe extern "win64" fn DisplayConfigGetDeviceInfo(pkt: *mut u8) -> i32 {
             (pkt.add(20) as *mut u32).write_unaligned(1000); // 80 nits standard SDR white
             0
         }
+        DISPLAYCONFIG_DEVICE_INFO_GET_MONITOR_SPECIALIZATION => {
+            // DISPLAYCONFIG_GET_MONITOR_SPECIALIZATION (24 bytes): header @0..20, flags @20.
+            if sz < 24 {
+                return e::INSUFFICIENT_BUFFER as i32;
+            }
+            (pkt.add(20) as *mut u32).write_unaligned(0);
+            0
+        }
+        DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2 => {
+            // DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 (36 bytes, Win11 24H2):
+            // header @0..20, colorCapabilities @20, colorEncoding @24, bitsPerColorChannel @28, activeColorMode @32.
+            if sz < 36 {
+                return e::INSUFFICIENT_BUFFER as i32;
+            }
+            (pkt.add(20) as *mut u32).write_unaligned(0); // SDR only
+            (pkt.add(24) as *mut u32).write_unaligned(0); // RGB
+            (pkt.add(28) as *mut u32).write_unaligned(8); // 8 bpc
+            (pkt.add(32) as *mut u32).write_unaligned(0); // DISPLAYCONFIG_ADVANCED_COLOR_MODE_SDR
+            0
+        }
+        DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE => {
+            // Undocumented CCD DPI scale query (32 bytes: header @0..20, minScaleRel @20, curScaleRel @24, maxScaleRel @28).
+            if sz < 32 {
+                return e::INSUFFICIENT_BUFFER as i32;
+            }
+            let dpi = mon.map_or(96u32, |m| m.dpi().max(96));
+            // Relative steps from recommended 100% (96 DPI): 0 = 100%, 1 = 125%, 2 = 150%, 3 = 175%, 4 = 200%.
+            let steps = ((dpi.saturating_sub(96) + 12) / 24).min(4) as i32;
+            (pkt.add(20) as *mut i32).write_unaligned(-steps);
+            (pkt.add(24) as *mut i32).write_unaligned(0);
+            (pkt.add(28) as *mut i32).write_unaligned(4 - steps);
+            0
+        }
         _ => {
-            stub!("DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED");
-            e::NOT_SUPPORTED as i32
+            // Microsoft Learn DisplayConfigGetDeviceInfo: unrecognized request types return ERROR_INVALID_PARAMETER.
+            e::INVALID_PARAMETER as i32
         }
     }
 }
 
+/// Native-unsupported on macOS/iOS: WDDM/CCD display hardware state mutations
+/// (`SET_TARGET_PERSISTENCE`, `SET_SUPPORT_VIRTUAL_RESOLUTION`, `SET_ADVANCED_COLOR_STATE`,
+/// `SET_MONITOR_SPECIALIZATION`, `SET_HDR_STATE`) have no global app-writable equivalent on
+/// macOS (Metal configures EDR per-layer). Matches Microsoft Learn `DisplayConfigSetDeviceInfo`:
+/// returns `ERROR_INVALID_PARAMETER` for null/undersized/unknown packets and `ERROR_NOT_SUPPORTED`
+/// when the display driver does not support the requested set operation.
 pub unsafe extern "win64" fn DisplayConfigSetDeviceInfo(pkt: *const u32) -> i32 {
-    let ty = if pkt.is_null() { 0 } else { *pkt };
-    stub!("DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED");
-    e::NOT_SUPPORTED as i32
+    if pkt.is_null() {
+        return e::INVALID_PARAMETER as i32;
+    }
+    let ty = pkt.read_unaligned();
+    let sz = pkt.add(1).read_unaligned() as usize;
+    if sz < 20 {
+        return e::INVALID_PARAMETER as i32;
+    }
+    match ty {
+        DISPLAYCONFIG_DEVICE_INFO_SET_TARGET_PERSISTENCE
+        | DISPLAYCONFIG_DEVICE_INFO_SET_SUPPORT_VIRTUAL_RESOLUTION
+        | DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE
+        | DISPLAYCONFIG_DEVICE_INFO_SET_MONITOR_SPECIALIZATION
+        | DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE => {
+            if sz < 24 {
+                return e::INVALID_PARAMETER as i32;
+            }
+            e::NOT_SUPPORTED as i32
+        }
+        _ => e::INVALID_PARAMETER as i32,
+    }
 }
 
 #[cfg(test)]
@@ -952,5 +1037,58 @@ mod tests {
             .join()
             .unwrap();
         });
+    }
+
+    #[test]
+    fn display_config_get_and_set_device_info() {
+        unsafe {
+            // GET_TARGET_BASE_TYPE (6)
+            let mut base_pkt = [0u32; 6];
+            base_pkt[0] = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE;
+            base_pkt[1] = 24;
+            assert_eq!(DisplayConfigGetDeviceInfo(base_pkt.as_mut_ptr() as *mut u8), 0);
+            assert!(base_pkt[5] == 10 || base_pkt[5] == 0x8000_0000);
+
+            // GET_SUPPORT_VIRTUAL_RESOLUTION (7)
+            let mut vr_pkt = [0u32; 6];
+            vr_pkt[0] = DISPLAYCONFIG_DEVICE_INFO_GET_SUPPORT_VIRTUAL_RESOLUTION;
+            vr_pkt[1] = 24;
+            assert_eq!(DisplayConfigGetDeviceInfo(vr_pkt.as_mut_ptr() as *mut u8), 0);
+
+            // GET_MONITOR_SPECIALIZATION (12)
+            let mut spec_pkt = [0u32; 6];
+            spec_pkt[0] = DISPLAYCONFIG_DEVICE_INFO_GET_MONITOR_SPECIALIZATION;
+            spec_pkt[1] = 24;
+            assert_eq!(DisplayConfigGetDeviceInfo(spec_pkt.as_mut_ptr() as *mut u8), 0);
+
+            // GET_ADVANCED_COLOR_INFO_2 (15)
+            let mut ac2_pkt = [0u32; 9];
+            ac2_pkt[0] = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
+            ac2_pkt[1] = 36;
+            assert_eq!(DisplayConfigGetDeviceInfo(ac2_pkt.as_mut_ptr() as *mut u8), 0);
+            assert_eq!(ac2_pkt[7], 8); // 8 bpc
+
+            // GET_DPI_SCALE (-3)
+            let mut dpi_pkt = [0u32; 8];
+            dpi_pkt[0] = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
+            dpi_pkt[1] = 32;
+            assert_eq!(DisplayConfigGetDeviceInfo(dpi_pkt.as_mut_ptr() as *mut u8), 0);
+
+            // Unknown GET type returns ERROR_INVALID_PARAMETER.
+            let mut bad_pkt = [0u32; 8];
+            bad_pkt[0] = 9999;
+            bad_pkt[1] = 32;
+            assert_eq!(DisplayConfigGetDeviceInfo(bad_pkt.as_mut_ptr() as *mut u8), e::INVALID_PARAMETER as i32);
+
+            // SET_* returns ERROR_NOT_SUPPORTED (native-unsupported on macOS) for valid CCD packets,
+            // and ERROR_INVALID_PARAMETER for null/undersized/unknown packets.
+            assert_eq!(DisplayConfigSetDeviceInfo(std::ptr::null()), e::INVALID_PARAMETER as i32);
+            let mut set_hdr = [0u32; 6];
+            set_hdr[0] = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+            set_hdr[1] = 24;
+            assert_eq!(DisplayConfigSetDeviceInfo(set_hdr.as_ptr()), e::NOT_SUPPORTED as i32);
+            set_hdr[1] = 16; // undersized
+            assert_eq!(DisplayConfigSetDeviceInfo(set_hdr.as_ptr()), e::INVALID_PARAMETER as i32);
+        }
     }
 }

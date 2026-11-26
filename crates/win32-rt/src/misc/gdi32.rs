@@ -888,28 +888,61 @@ pub unsafe extern "win64" fn GetTextExtentPoint32A(hdc: usize, s: LPCSTR, n: i32
     TRUE
 }
 
-pub unsafe extern "win64" fn GetDeviceCaps(_hdc: usize, index: i32) -> i32 {
+pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
+    let _ = hdc;
     let displays = crate::macos::display::get();
     let primary = &displays.monitors[0];
     let mon = primary.rect;
+    let dpi = crate::user32::window::dpi().max(1) as i32;
+    let refresh = (primary.refresh_hz as i32).max(1);
+
+    // Per Microsoft Learn GetDeviceCaps: HORZRES/VERTRES/HORZSIZE/VERTSIZE/BITSPIXEL/PLANES
+    // describe the display device capabilities (inherited by compatible memory DCs), never
+    // the currently selected bitmap object (which is queried via GetObject).
+    let (w, h, bpp, planes) = (mon.width(), mon.height(), 32, 1);
     match index {
-        0 => 0x400,                                                    // DRIVERVERSION
-        2 => 1,                                                        // DT_RASDISPLAY
-        16 | 18 => -1,                                                 // NUMBRUSHES, NUMPENS
-        38 => 1,                                                       // RASTERCAPS: RC_BITBLT
-        8 | 118 => mon.width(),                                        // HORZRES, DESKTOPHORZRES
-        10 | 117 => mon.height(),                                      // VERTRES, DESKTOPVERTRES
-        12 => 32,                                                      // BITSPIXEL
-        14 => 1,                                                       // PLANES
-        88 | 90 => crate::user32::window::dpi() as i32,                // LOGPIXELSX/Y
-        116 => primary.refresh_hz as i32, // VREFRESH
-        4 => displays.primary_mm.map_or_else(|| (mon.width() as f64 / 96.0 * 25.4) as i32, |mm| mm.0),                // HORZSIZE (mm)
-        6 => displays.primary_mm.map_or_else(|| (mon.height() as f64 / 96.0 * 25.4) as i32, |mm| mm.1),               // VERTSIZE (mm)
-        24 => -1,                                                      // NUMCOLORS (>8bpp)
-        _ => {
-            stub!("GetDeviceCaps({index}) -> 0");
-            0
-        }
+        0 => 0x4000,                                                 // DRIVERVERSION (4.0)
+        2 => 1,                                                      // TECHNOLOGY (DT_RASDISPLAY)
+        4 => displays
+            .primary_mm
+            .map_or_else(|| ((w as f64) / (dpi as f64) * 25.4).round() as i32, |mm| mm.0), // HORZSIZE (mm)
+        6 => displays
+            .primary_mm
+            .map_or_else(|| ((h as f64) / (dpi as f64) * 25.4).round() as i32, |mm| mm.1), // VERTSIZE (mm)
+        8 => w,                                                      // HORZRES
+        10 => h,                                                     // VERTRES
+        12 => bpp,                                                   // BITSPIXEL
+        14 => planes,                                                // PLANES
+        16 => -1,                                                    // NUMBRUSHES
+        18 => -1,                                                    // NUMPENS
+        20 => 0,                                                     // NUMMARKERS
+        22 => 0,                                                     // NUMFONTS
+        24 => if bpp <= 8 { 1 << bpp } else { -1 },                  // NUMCOLORS
+        26 => 0,                                                     // PDEVICESIZE
+        28 => 0,                                                     // CURVECAPS (CC_NONE)
+        30 => 0,                                                     // LINECAPS (LC_NONE)
+        32 => 0x0002,                                                // POLYGONALCAPS (PC_RECTANGLE)
+        34 => 0x2000,                                                // TEXTCAPS (TC_RA_ABLE)
+        36 => 0,                                                     // CLIPCAPS (CP_NONE)
+        // RASTERCAPS: only advertise operations backed by real exports in this module:
+        // RC_BITBLT (0x0001) | RC_BITMAP64 (0x0008) | RC_DI_BITMAP (0x0080) | RC_STRETCHBLT (0x0800).
+        // Keep RC_DIBTODEV, RC_STRETCHDIB, RC_FLOODFILL, etc. clear until implemented.
+        38 => 0x0001 | 0x0008 | 0x0080 | 0x0800,
+        40 => 36,                                                    // ASPECTX
+        42 => 36,                                                    // ASPECTY
+        44 => 51,                                                    // ASPECTXY
+        88 | 90 => dpi,                                              // LOGPIXELSX / LOGPIXELSY
+        104 => 0,                                                    // SIZEPALETTE
+        106 => 20,                                                   // NUMRESERVED
+        108 => bpp.min(24),                                          // COLORRES
+        110..=115 => 0,                                              // PHYSICAL*, SCALINGFACTOR*
+        116 => refresh,                                              // VREFRESH
+        117 => mon.height(),                                         // DESKTOPVERTRES
+        118 => mon.width(),                                          // DESKTOPHORZRES
+        119 => 0,                                                    // BLTALIGNMENT
+        120 => 0,                                                    // SHADEBLENDCAPS (SB_NONE: AlphaBlend/GradientFill unimplemented)
+        121 => 0,                                                    // COLORMGMTCAPS (CM_NONE)
+        _ => 0,                                                      // Windows returns 0 for unknown indices
     }
 }
 
@@ -1966,6 +1999,63 @@ mod tests {
             assert_eq!(GetDeviceGammaRamp(0, got.as_mut_ptr()), FALSE);
             assert_eq!(SetDeviceGammaRamp(0, custom.as_ptr()), FALSE);
 
+            DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn get_device_caps_display_and_memdc_indices() {
+        unsafe {
+            assert_eq!(GetDeviceCaps(0, 0), 0x4000); // DRIVERVERSION
+            assert_eq!(GetDeviceCaps(0, 2), 1); // TECHNOLOGY == DT_RASDISPLAY
+            assert!(GetDeviceCaps(0, 8) > 0); // HORZRES
+            assert!(GetDeviceCaps(0, 10) > 0); // VERTRES
+            assert_eq!(GetDeviceCaps(0, 12), 32); // BITSPIXEL
+            assert_eq!(GetDeviceCaps(0, 14), 1); // PLANES
+            assert_eq!(GetDeviceCaps(0, 24), -1); // NUMCOLORS
+            assert_eq!(GetDeviceCaps(0, 28), 0); // CURVECAPS == CC_NONE
+            assert_eq!(GetDeviceCaps(0, 30), 0); // LINECAPS == LC_NONE
+            assert_eq!(GetDeviceCaps(0, 32), 0x0002); // POLYGONALCAPS == PC_RECTANGLE
+            assert_eq!(GetDeviceCaps(0, 34), 0x2000); // TEXTCAPS == TC_RA_ABLE
+            assert_eq!(GetDeviceCaps(0, 36), 0); // CLIPCAPS == CP_NONE
+            let rc = GetDeviceCaps(0, 38); // RASTERCAPS
+            assert_eq!(rc, 0x0001 | 0x0008 | 0x0080 | 0x0800);
+            assert_eq!(rc & 0x0200, 0, "RC_DIBTODEV must stay clear while SetDIBitsToDevice is unimplemented");
+            assert_eq!(rc & 0x2000, 0, "RC_STRETCHDIB must stay clear while StretchDIBits is unimplemented");
+            assert_eq!(rc & 0x1000, 0, "RC_FLOODFILL must stay clear while FloodFill is unimplemented");
+            assert_eq!(GetDeviceCaps(0, 45), 0); // unused index -> 0
+            assert!(GetDeviceCaps(0, 88) >= 96); // LOGPIXELSX
+            assert_eq!(GetDeviceCaps(0, 108), 24); // COLORRES
+            assert!(GetDeviceCaps(0, 116) >= 30); // VREFRESH
+            assert_eq!(GetDeviceCaps(0, 120), 0); // SHADEBLENDCAPS == SB_NONE
+            assert_eq!(GetDeviceCaps(0, 9999), 0); // unknown index -> 0
+
+            // Selecting a 64x32 24bpp DIB into a compatible memory DC must NOT override the
+            // display device capabilities reported by GetDeviceCaps (bitmap dimensions come
+            // from GetObject instead).
+            let screen_w = GetDeviceCaps(0, 8);
+            let screen_h = GetDeviceCaps(0, 10);
+            let screen_mm_w = GetDeviceCaps(0, 4);
+            let screen_mm_h = GetDeviceCaps(0, 6);
+            let dc = CreateCompatibleDC(0);
+            let bmi = make_bmi_header(64, -32, 24);
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbm = CreateDIBSection(dc, bmi.as_ptr(), 0, &mut bits, std::ptr::null_mut(), 0);
+            let old = SelectObject(dc, hbm);
+            assert_eq!(GetDeviceCaps(dc, 8), screen_w);
+            assert_eq!(GetDeviceCaps(dc, 10), screen_h);
+            assert_eq!(GetDeviceCaps(dc, 4), screen_mm_w);
+            assert_eq!(GetDeviceCaps(dc, 6), screen_mm_h);
+            assert_eq!(GetDeviceCaps(dc, 12), 32);
+            assert_eq!(GetDeviceCaps(dc, 14), 1);
+            assert_eq!(GetDeviceCaps(dc, 108), 24);
+            let mut bm_buf = [0u8; 32];
+            assert_eq!(GetObjectW(hbm, 32, bm_buf.as_mut_ptr()), 32);
+            assert_eq!(i32::from_le_bytes(bm_buf[4..8].try_into().unwrap()), 64);
+            assert_eq!(i32::from_le_bytes(bm_buf[8..12].try_into().unwrap()), 32);
+            assert_eq!(u16::from_le_bytes(bm_buf[18..20].try_into().unwrap()), 24);
+            SelectObject(dc, old);
+            DeleteObject(hbm);
             DeleteDC(dc);
         }
     }

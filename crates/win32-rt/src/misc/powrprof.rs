@@ -3,8 +3,10 @@
 use crate::types::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
@@ -13,14 +15,81 @@ pub static ORDINALS: &[(u16, &str)] = &[];
 const PLATFORM_ROLE_DESKTOP: u32 = 1;
 const PLATFORM_ROLE_MOBILE: u32 = 2;
 
-// POWER_INFORMATION_LEVEL values
+// POWER_INFORMATION_LEVEL values (winnt.h)
+const SYSTEM_POWER_POLICY_AC: u32 = 0;
+const SYSTEM_POWER_POLICY_DC: u32 = 1;
+const VERIFY_SYSTEM_POLICY_AC: u32 = 2;
+const VERIFY_SYSTEM_POLICY_DC: u32 = 3;
 const SYSTEM_POWER_CAPABILITIES: u32 = 4;
 const SYSTEM_BATTERY_STATE: u32 = 5;
+const SYSTEM_POWER_STATE_HANDLER: u32 = 6;
+const PROCESSOR_STATE_HANDLER: u32 = 7;
+const SYSTEM_POWER_POLICY_CURRENT: u32 = 8;
+const ADMINISTRATOR_POWER_POLICY: u32 = 9;
+const SYSTEM_RESERVE_HIBER_FILE: u32 = 10;
 const PROCESSOR_INFORMATION: u32 = 11;
+const SYSTEM_POWER_INFORMATION: u32 = 12;
+const PROCESSOR_STATE_HANDLER2: u32 = 13;
+const LAST_WAKE_TIME: u32 = 14;
+const LAST_SLEEP_TIME: u32 = 15;
+const SYSTEM_EXECUTION_STATE: u32 = 16;
+const SYSTEM_POWER_STATE_NOTIFY_HANDLER: u32 = 17;
+const PROCESSOR_POWER_POLICY_AC: u32 = 18;
+const PROCESSOR_POWER_POLICY_DC: u32 = 19;
+const VERIFY_PROCESSOR_POLICY_AC: u32 = 20;
+const VERIFY_PROCESSOR_POLICY_DC: u32 = 21;
+const PROCESSOR_POWER_POLICY_CURRENT: u32 = 22;
+const SYSTEM_POWER_STATE_LOGGING: u32 = 23;
+const SYSTEM_POWER_LOGGING_ENTRY: u32 = 24;
+const SET_POWER_SETTING_VALUE: u32 = 25;
+const SYSTEM_WAKE_SOURCE: u32 = 35;
+const SYSTEM_HIBER_FILE_SIZE: u32 = 51;
+const SYSTEM_HIBER_FILE_INFORMATION: u32 = 68;
+const POWER_INFORMATION_LEVEL_MAX: u32 = 100;
 
 const STATUS_SUCCESS: i32 = 0;
-const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 const STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
+
+const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0;
+const DEVICE_NOTIFY_SERVICE_HANDLE: u32 = 1;
+const DEVICE_NOTIFY_CALLBACK: u32 = 2;
+
+#[cfg(any(target_os = "macos", test))]
+const PBT_APMSUSPEND: u32 = 0x0004;
+#[cfg(any(target_os = "macos", test))]
+const PBT_APMRESUMESUSPEND: u32 = 0x0007;
+#[cfg(any(target_os = "macos", test))]
+const PBT_APMRESUMEAUTOMATIC: u32 = 0x0012;
+const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
+
+// Standard Windows Power Setting GUIDs (winnt.h)
+// GUID_ACDC_POWER_SOURCE: {5d3e9a59-e9d5-4b00-a6bd-ff34ff516548}
+const GUID_ACDC_POWER_SOURCE: [u8; 16] = [
+    0x59, 0x9A, 0x3E, 0x5D, 0xD5, 0xE9, 0x00, 0x4B, 0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48,
+];
+// GUID_BATTERY_PERCENTAGE_REMAINING: {a7ad8041-b45a-4cae-87a3-eecbb468a9e1}
+const GUID_BATTERY_PERCENTAGE_REMAINING: [u8; 16] = [
+    0x41, 0x80, 0xAD, 0xA7, 0x5A, 0xB4, 0xAE, 0x4C, 0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1,
+];
+// GUID_POWERSCHEME_PERSONALITY: {245d8541-3943-4422-b025-13a784f679b7}
+const GUID_POWERSCHEME_PERSONALITY: [u8; 16] = [
+    0x41, 0x85, 0x5D, 0x24, 0x43, 0x39, 0x22, 0x44, 0xB0, 0x25, 0x13, 0xA7, 0x84, 0xF6, 0x79, 0xB7,
+];
+// GUID_CONSOLE_DISPLAY_STATE: {6fe69556-704a-47a0-8f24-c28d936fda47}
+const GUID_CONSOLE_DISPLAY_STATE: [u8; 16] = [
+    0x56, 0x95, 0xE6, 0x6F, 0x4A, 0x70, 0xA0, 0x47, 0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47,
+];
+// GUID_MONITOR_POWER_ON: {02731015-4510-4526-99e6-e5a17ebd1aea}
+const GUID_MONITOR_POWER_ON: [u8; 16] = [
+    0x15, 0x10, 0x73, 0x02, 0x10, 0x45, 0x26, 0x45, 0x99, 0xE6, 0xE5, 0xA1, 0x7E, 0xBD, 0x1A, 0xEA,
+];
+// GUID_POWER_SAVING_STATUS: {e00958c0-c213-4ace-ac77-fecced2eeea5}
+const GUID_POWER_SAVING_STATUS: [u8; 16] = [
+    0xC0, 0x58, 0x09, 0xE0, 0x13, 0xC2, 0xCE, 0x4A, 0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5,
+];
 
 const BATTERY_UNKNOWN_TIME: u32 = 0xFFFF_FFFF;
 
@@ -49,17 +118,78 @@ enum PowerNotifyKind {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
+enum PowerNotifyTarget {
+    Window(usize),
+    Service,
+    Callback { func: usize, context: usize },
+}
+
+struct NotifyLifecycle {
+    cancelled: bool,
+    in_flight_threads: Vec<std::thread::ThreadId>,
+}
+
 struct PowerNotification {
     kind: PowerNotifyKind,
-    flags: u32,
-    recipient: usize,
+    target: PowerNotifyTarget,
+    lifecycle: Mutex<NotifyLifecycle>,
+    done_cv: Condvar,
+}
+
+impl PowerNotification {
+    fn new(kind: PowerNotifyKind, target: PowerNotifyTarget) -> Arc<Self> {
+        Arc::new(Self {
+            kind,
+            target,
+            lifecycle: Mutex::new(NotifyLifecycle {
+                cancelled: false,
+                in_flight_threads: Vec::new(),
+            }),
+            done_cv: Condvar::new(),
+        })
+    }
+
+    fn try_begin_delivery(self: &Arc<Self>) -> Option<DeliveryGuard> {
+        let mut st = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if st.cancelled {
+            return None;
+        }
+        let tid = std::thread::current().id();
+        st.in_flight_threads.push(tid);
+        Some(DeliveryGuard { entry: Arc::clone(self), tid })
+    }
+
+    /// Mark cancelled and wait until all in-flight deliveries on OTHER threads finish
+    /// (never deadlocks if invoked reentrantly from inside the callback itself).
+    fn cancel_and_wait(&self) {
+        let me = std::thread::current().id();
+        let mut st = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        st.cancelled = true;
+        while st.in_flight_threads.iter().any(|&tid| tid != me) {
+            st = self.done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+struct DeliveryGuard {
+    entry: Arc<PowerNotification>,
+    tid: std::thread::ThreadId,
+}
+
+impl Drop for DeliveryGuard {
+    fn drop(&mut self) {
+        let mut st = self.entry.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = st.in_flight_threads.iter().rposition(|&t| t == self.tid) {
+            st.in_flight_threads.remove(pos);
+        }
+        self.entry.done_cv.notify_all();
+    }
 }
 
 static NEXT_NOTIFY_HANDLE: AtomicUsize = AtomicUsize::new(0x7050_0004);
 
-fn notifications() -> &'static Mutex<HashMap<usize, PowerNotification>> {
-    static M: OnceLock<Mutex<HashMap<usize, PowerNotification>>> = OnceLock::new();
+fn notifications() -> &'static Mutex<HashMap<usize, Arc<PowerNotification>>> {
+    static M: OnceLock<Mutex<HashMap<usize, Arc<PowerNotification>>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -304,6 +434,312 @@ mod macos_power {
             found
         }
     }
+
+    pub(super) fn query_display_power_on() -> Option<bool> {
+        #[derive(Clone, Copy)]
+        struct CgDisplayApis {
+            main_display_id: unsafe extern "C" fn() -> u32,
+            display_is_asleep: unsafe extern "C" fn(u32) -> u32,
+        }
+        static CG: OnceLock<Option<CgDisplayApis>> = OnceLock::new();
+        let cg = CG
+            .get_or_init(|| unsafe {
+                let lib = libc::dlopen(
+                    c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics".as_ptr(),
+                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                );
+                if lib.is_null() {
+                    return None;
+                }
+                let p_main = libc::dlsym(lib, c"CGMainDisplayID".as_ptr());
+                let p_asleep = libc::dlsym(lib, c"CGDisplayIsAsleep".as_ptr());
+                if p_main.is_null() || p_asleep.is_null() {
+                    return None;
+                }
+                Some(CgDisplayApis {
+                    main_display_id: std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> u32>(p_main),
+                    display_is_asleep: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> u32>(p_asleep),
+                })
+            })
+            .as_ref()?;
+        unsafe {
+            let did = (cg.main_display_id)();
+            if did == 0 {
+                return Some(false);
+            }
+            Some((cg.display_is_asleep)(did) == 0)
+        }
+    }
+
+    // Background IOKit power-event, display-power, & power-source notification loop.
+    // Runs on its own dedicated thread + CFRunLoop so it never contends with
+    // the AppKit main thread or any Win32 thread lock.
+    pub(super) fn ensure_power_monitor_started() {
+        if cfg!(test) {
+            return;
+        }
+        static STARTED: OnceLock<()> = OnceLock::new();
+        STARTED.get_or_init(|| {
+            let _ = std::thread::Builder::new()
+                .name("win32-power-monitor".into())
+                .spawn(|| unsafe { run_iokit_power_loop() });
+        });
+    }
+
+    unsafe fn run_iokit_power_loop() {
+        // Adopt this dedicated monitor thread into the Windows runtime (TEB + static TLS + GS slots)
+        // before IOKit can deliver any guest power callbacks.
+        let _ = crate::teb::current();
+        let iokit = libc::dlopen(
+            c"/System/Library/Frameworks/IOKit.framework/IOKit".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
+        let cf = libc::dlopen(
+            c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
+        let cg = libc::dlopen(
+            c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
+        if iokit.is_null() || cf.is_null() {
+            return;
+        }
+        macro_rules! sym_opt {
+            ($lib:expr, $name:expr, $ty:ty) => {{
+                let p = libc::dlsym($lib, $name.as_ptr());
+                if p.is_null() { None } else { Some(std::mem::transmute::<*mut c_void, $ty>(p)) }
+            }};
+        }
+
+        type IoRegFn = unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void),
+            *mut u32,
+        ) -> u32;
+        type IoAllowFn = unsafe extern "C" fn(u32, isize) -> i32;
+        type IoPortSourceFn = unsafe extern "C" fn(*mut c_void) -> *const c_void;
+        type IoServiceMatchingFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+        type IoServiceGetMatchingFn = unsafe extern "C" fn(u32, *mut c_void) -> u32;
+        type IoAddInterestFn = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            *const c_char,
+            unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void),
+            *mut c_void,
+            *mut u32,
+        ) -> i32;
+        type IoObjectReleaseFn = unsafe extern "C" fn(u32) -> i32;
+        type IopsNotifySourceFn =
+            unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> *const c_void;
+        type CgRegReconfigFn =
+            unsafe extern "C" fn(unsafe extern "C" fn(u32, u32, *mut c_void), *mut c_void) -> i32;
+        type CfRunLoopCurFn = unsafe extern "C" fn() -> *mut c_void;
+        type CfRunLoopAddSrcFn = unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void);
+        type CfRunLoopRunFn = unsafe extern "C" fn();
+        type CfNotifGetLocalFn = unsafe extern "C" fn() -> *mut c_void;
+        type CfNotifAddObserverFn = unsafe extern "C" fn(
+            *mut c_void,
+            *const c_void,
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *const c_void, *const c_void),
+            *const c_void,
+            *const c_void,
+            isize,
+        );
+        type CfStrCreateFn = unsafe extern "C" fn(*const c_void, *const c_char, u32) -> *const c_void;
+        type CfReleaseFn = unsafe extern "C" fn(*const c_void);
+
+        let (Some(io_reg), Some(io_allow), Some(io_port_src), Some(cf_cur), Some(cf_add), Some(cf_run)) = (
+            sym_opt!(iokit, c"IORegisterForSystemPower", IoRegFn),
+            sym_opt!(iokit, c"IOAllowPowerChange", IoAllowFn),
+            sym_opt!(iokit, c"IONotificationPortGetRunLoopSource", IoPortSourceFn),
+            sym_opt!(cf, c"CFRunLoopGetCurrent", CfRunLoopCurFn),
+            sym_opt!(cf, c"CFRunLoopAddSource", CfRunLoopAddSrcFn),
+            sym_opt!(cf, c"CFRunLoopRun", CfRunLoopRunFn),
+        ) else {
+            return;
+        };
+        let default_mode_sym = libc::dlsym(cf, c"kCFRunLoopDefaultMode".as_ptr());
+        if default_mode_sym.is_null() {
+            return;
+        }
+        let default_mode = *(default_mode_sym as *const *const c_void);
+
+        struct RootCtx {
+            root_port: u32,
+            io_allow: IoAllowFn,
+        }
+        unsafe extern "C" fn sleep_cb(ctx: *mut c_void, _svc: u32, msg_type: u32, msg_arg: *mut c_void) {
+            const K_IO_MSG_CAN_SYSTEM_SLEEP: u32 = 0xE000_0270;
+            const K_IO_MSG_SYSTEM_WILL_SLEEP: u32 = 0xE000_0280;
+            const K_IO_MSG_SYSTEM_HAS_POWERED_ON: u32 = 0xE000_0300;
+            let r = &*(ctx as *const RootCtx);
+            match msg_type {
+                K_IO_MSG_CAN_SYSTEM_SLEEP => {
+                    (r.io_allow)(r.root_port, msg_arg as isize);
+                }
+                K_IO_MSG_SYSTEM_WILL_SLEEP => {
+                    super::dispatch_display_power_state(false);
+                    super::dispatch_suspend_resume_event(super::PBT_APMSUSPEND);
+                    (r.io_allow)(r.root_port, msg_arg as isize);
+                }
+                K_IO_MSG_SYSTEM_HAS_POWERED_ON => {
+                    super::dispatch_suspend_resume_event(super::PBT_APMRESUMEAUTOMATIC);
+                    super::dispatch_suspend_resume_event(super::PBT_APMRESUMESUSPEND);
+                    if let Some(on) = query_display_power_on() {
+                        super::dispatch_display_power_state(on);
+                    }
+                }
+                _ => {}
+            }
+        }
+        unsafe extern "C" fn display_interest_cb(
+            _ctx: *mut c_void,
+            _svc: u32,
+            msg_type: u32,
+            _msg_arg: *mut c_void,
+        ) {
+            // Exact Apple SDK <IOKit/IOMessage.h> display power-state constants.
+            const K_IO_MSG_DEVICE_WILL_POWER_OFF: u32 = 0xE000_0210;
+            const K_IO_MSG_DEVICE_HAS_POWERED_OFF: u32 = 0xE000_0225;
+            const K_IO_MSG_DEVICE_HAS_POWERED_ON: u32 = 0xE000_0230;
+            match msg_type {
+                K_IO_MSG_DEVICE_WILL_POWER_OFF | K_IO_MSG_DEVICE_HAS_POWERED_OFF => {
+                    super::dispatch_display_power_state(false);
+                }
+                K_IO_MSG_DEVICE_HAS_POWERED_ON => {
+                    super::dispatch_display_power_state(true);
+                }
+                _ => {
+                    if let Some(on) = query_display_power_on() {
+                        super::dispatch_display_power_state(on);
+                    }
+                }
+            }
+        }
+        unsafe extern "C" fn cg_display_reconfig_cb(_display: u32, _flags: u32, _ctx: *mut c_void) {
+            if let Some(on) = query_display_power_on() {
+                super::dispatch_display_power_state(on);
+            }
+        }
+        unsafe extern "C" fn low_power_mode_cb(
+            _center: *mut c_void,
+            _observer: *mut c_void,
+            _name: *const c_void,
+            _object: *const c_void,
+            _user_info: *const c_void,
+        ) {
+            if let Some(saving) = super::query_low_power_mode() {
+                super::dispatch_low_power_mode(saving);
+            }
+        }
+        unsafe extern "C" fn ps_change_cb(_ctx: *mut c_void) {
+            if let Some(snap) = query_battery() {
+                let ac_val: u32 = if snap.ac_online { 0 } else { 1 };
+                super::dispatch_power_setting_change(super::GUID_ACDC_POWER_SOURCE, &ac_val.to_le_bytes());
+                let pct: u32 = if snap.battery_present && snap.max_capacity > 0 {
+                    ((snap.remaining_capacity as u64 * 100) / snap.max_capacity as u64).min(100) as u32
+                } else {
+                    100
+                };
+                super::dispatch_power_setting_change(
+                    super::GUID_BATTERY_PERCENTAGE_REMAINING,
+                    &pct.to_le_bytes(),
+                );
+            }
+            if let Some(saving) = super::query_low_power_mode() {
+                super::dispatch_low_power_mode(saving);
+            }
+        }
+
+        // Seed initial display and low-power state before observing changes.
+        if let Some(on) = query_display_power_on() {
+            super::seed_display_power_state(on);
+        }
+        if let Some(saving) = super::query_low_power_mode() {
+            super::seed_low_power_mode(saving);
+        }
+
+        let ctx = Box::into_raw(Box::new(RootCtx { root_port: 0, io_allow }));
+        let mut notify_port: *mut c_void = std::ptr::null_mut();
+        let mut notifier: u32 = 0;
+        let root_port = io_reg(ctx as *mut c_void, &mut notify_port, sleep_cb, &mut notifier);
+        let rl = cf_cur();
+        let mut any_source = false;
+        let mut _display_notifier: u32 = 0;
+        if root_port != 0 && !notify_port.is_null() {
+            (*ctx).root_port = root_port;
+            let src = io_port_src(notify_port);
+            if !src.is_null() {
+                cf_add(rl, src, default_mode);
+                any_source = true;
+            }
+            // Subscribe to IODisplayWrangler general interest for display-only sleep/wake
+            // transitions (independent of full system sleep).
+            if let (Some(io_match), Some(io_get), Some(io_interest), Some(io_release)) = (
+                sym_opt!(iokit, c"IOServiceMatching", IoServiceMatchingFn),
+                sym_opt!(iokit, c"IOServiceGetMatchingService", IoServiceGetMatchingFn),
+                sym_opt!(iokit, c"IOServiceAddInterestNotification", IoAddInterestFn),
+                sym_opt!(iokit, c"IOObjectRelease", IoObjectReleaseFn),
+            ) {
+                let matching = io_match(c"IODisplayWrangler".as_ptr());
+                if !matching.is_null() {
+                    let wrangler = io_get(0, matching);
+                    if wrangler != 0 {
+                        let _ = io_interest(
+                            notify_port,
+                            wrangler,
+                            c"IOGeneralInterest".as_ptr(),
+                            display_interest_cb,
+                            std::ptr::null_mut(),
+                            &mut _display_notifier,
+                        );
+                        let _ = io_release(wrangler);
+                    }
+                }
+            }
+        }
+        if !cg.is_null() {
+            if let Some(reg_reconfig) = sym_opt!(cg, c"CGDisplayRegisterReconfigurationCallback", CgRegReconfigFn) {
+                let _ = reg_reconfig(cg_display_reconfig_cb, std::ptr::null_mut());
+            }
+        }
+        if let (Some(get_local), Some(add_obs), Some(cf_str), Some(cf_rel)) = (
+            sym_opt!(cf, c"CFNotificationCenterGetLocalCenter", CfNotifGetLocalFn),
+            sym_opt!(cf, c"CFNotificationCenterAddObserver", CfNotifAddObserverFn),
+            sym_opt!(cf, c"CFStringCreateWithCString", CfStrCreateFn),
+            sym_opt!(cf, c"CFRelease", CfReleaseFn),
+        ) {
+            let center = get_local();
+            let name = cf_str(
+                std::ptr::null(),
+                c"NSProcessInfoPowerStateDidChangeNotification".as_ptr(),
+                K_CFSTRING_ENCODING_UTF8,
+            );
+            if !center.is_null() && !name.is_null() {
+                add_obs(
+                    center,
+                    ctx as *const c_void,
+                    low_power_mode_cb,
+                    name,
+                    std::ptr::null(),
+                    4, // CFNotificationSuspensionBehaviorDeliverImmediately
+                );
+                cf_rel(name);
+            }
+        }
+        if let Some(iops_src_fn) = sym_opt!(iokit, c"IOPSNotificationCreateRunLoopSource", IopsNotifySourceFn) {
+            let ps_src = iops_src_fn(ps_change_cb, std::ptr::null_mut());
+            if !ps_src.is_null() {
+                cf_add(rl, ps_src, default_mode);
+                any_source = true;
+            }
+        }
+        if any_source {
+            cf_run();
+        }
+    }
 }
 
 #[cfg(target_os = "ios")]
@@ -407,14 +843,128 @@ pub unsafe extern "win64" fn GetPwrCapabilities(out: *mut c_void) -> u8 {
     1
 }
 
+/// Convert a Unix-epoch calendar `(tv_sec, tv_usec)` timestamp into the current
+/// interrupt-time clock domain (`0` if unset or in the future).
+fn calendar_timeval_to_interrupt_100ns(
+    tv_sec: i64,
+    tv_usec: i32,
+    now_unix_100ns: u64,
+    now_interrupt_100ns: u64,
+) -> u64 {
+    if tv_sec <= 0 {
+        return 0;
+    }
+    let ev_unix_100ns = (tv_sec as u64)
+        .saturating_mul(10_000_000)
+        .saturating_add((tv_usec.max(0) as u64).saturating_mul(10));
+    if ev_unix_100ns > now_unix_100ns {
+        return 0;
+    }
+    let elapsed_100ns = now_unix_100ns - ev_unix_100ns;
+    now_interrupt_100ns.saturating_sub(elapsed_100ns)
+}
+
+fn query_power_event_interrupt_100ns(
+    abs_sysctl: &std::ffi::CStr,
+    cal_sysctl: &std::ffi::CStr,
+) -> u64 {
+    let now_int = crate::kernel32::time::interrupt_time_100ns();
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut abs_ticks: u64 = 0;
+        let mut sz = std::mem::size_of::<u64>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                abs_sysctl.as_ptr(),
+                &mut abs_ticks as *mut u64 as *mut c_void,
+                &mut sz,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 {
+            return crate::kernel32::time::mach_abs_to_100ns(abs_ticks).min(now_int);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let _ = abs_sysctl;
+
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: i64,
+        tv_usec: i32,
+        _pad: i32,
+    }
+    let mut tv = Timeval { tv_sec: 0, tv_usec: 0, _pad: 0 };
+    let mut sz = std::mem::size_of::<Timeval>();
+    unsafe {
+        if libc::sysctlbyname(
+            cal_sysctl.as_ptr(),
+            &mut tv as *mut Timeval as *mut c_void,
+            &mut sz,
+            std::ptr::null_mut(),
+            0,
+        ) == 0
+            && tv.tv_sec > 0
+        {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            if libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) == 0 && ts.tv_sec > 0 {
+                let now_unix_100ns = (ts.tv_sec as u64)
+                    .saturating_mul(10_000_000)
+                    .saturating_add((ts.tv_nsec.max(0) as u64) / 100);
+                return calendar_timeval_to_interrupt_100ns(
+                    tv.tv_sec,
+                    tv.tv_usec,
+                    now_unix_100ns,
+                    now_int,
+                );
+            }
+        }
+    }
+    0
+}
+
+const SYSTEM_POWER_POLICY_SIZE: u32 = 232;
+const PROCESSOR_POWER_POLICY_SIZE: u32 = 76;
+
 pub unsafe extern "win64" fn CallNtPowerInformation(
     info_level: u32,
-    _in_buf: *const c_void,
-    _in_len: u32,
+    in_buf: *const c_void,
+    in_len: u32,
     out_buf: *mut c_void,
     out_len: u32,
 ) -> i32 {
     match info_level {
+        SYSTEM_POWER_POLICY_AC | SYSTEM_POWER_POLICY_DC => {
+            if !in_buf.is_null() || in_len != 0 {
+                if in_buf.is_null() || in_len < SYSTEM_POWER_POLICY_SIZE {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                log::warn!(
+                    "powrprof: CallNtPowerInformation cannot apply system power policy update (level={info_level}) from user space"
+                );
+                return STATUS_ACCESS_DENIED;
+            }
+            log::warn!(
+                "powrprof: CallNtPowerInformation(SystemPowerPolicy level={info_level}) read is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
+        }
+        SYSTEM_POWER_POLICY_CURRENT => {
+            if !in_buf.is_null() || in_len != 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            log::warn!(
+                "powrprof: CallNtPowerInformation(SystemPowerPolicyCurrent) read is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
+        }
+        VERIFY_SYSTEM_POLICY_AC | VERIFY_SYSTEM_POLICY_DC => {
+            log::warn!(
+                "powrprof: CallNtPowerInformation(VerifySystemPolicy level={info_level}) is unsupported"
+            );
+            STATUS_NOT_IMPLEMENTED
+        }
         SYSTEM_POWER_CAPABILITIES => {
             if out_buf.is_null() || out_len < 76 {
                 return STATUS_BUFFER_TOO_SMALL;
@@ -464,10 +1014,86 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             }
             STATUS_SUCCESS
         }
-        _ => {
-            stub!("CallNtPowerInformation(level={info_level}) -> STATUS_NOT_IMPLEMENTED");
+        SYSTEM_POWER_INFORMATION => {
+            log::warn!(
+                "powrprof: CallNtPowerInformation(SystemPowerInformation) is unsupported on host OS"
+            );
             STATUS_NOT_IMPLEMENTED
         }
+        LAST_WAKE_TIME => {
+            if out_buf.is_null() || out_len < 8 {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            let t = query_power_event_interrupt_100ns(c"kern.wake_abs_time", c"kern.waketime");
+            std::ptr::write_unaligned(out_buf as *mut u64, t);
+            STATUS_SUCCESS
+        }
+        LAST_SLEEP_TIME => {
+            if out_buf.is_null() || out_len < 8 {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            let t = query_power_event_interrupt_100ns(c"kern.sleep_abs_time", c"kern.sleeptime");
+            std::ptr::write_unaligned(out_buf as *mut u64, t);
+            STATUS_SUCCESS
+        }
+        SYSTEM_EXECUTION_STATE => {
+            if !in_buf.is_null() || in_len != 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if out_buf.is_null() || out_len < 4 {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            let state = crate::kernel32::process::current_system_execution_state();
+            std::ptr::write_unaligned(out_buf as *mut u32, state);
+            STATUS_SUCCESS
+        }
+        PROCESSOR_POWER_POLICY_AC | PROCESSOR_POWER_POLICY_DC => {
+            if !in_buf.is_null() || in_len != 0 {
+                if in_buf.is_null() || in_len < PROCESSOR_POWER_POLICY_SIZE {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                log::warn!(
+                    "powrprof: CallNtPowerInformation cannot apply processor power policy update (level={info_level}) from user space"
+                );
+                return STATUS_ACCESS_DENIED;
+            }
+            log::warn!(
+                "powrprof: CallNtPowerInformation(ProcessorPowerPolicy level={info_level}) read is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
+        }
+        PROCESSOR_POWER_POLICY_CURRENT => {
+            if !in_buf.is_null() || in_len != 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            log::warn!(
+                "powrprof: CallNtPowerInformation(ProcessorPowerPolicyCurrent) read is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
+        }
+        VERIFY_PROCESSOR_POLICY_AC | VERIFY_PROCESSOR_POLICY_DC => {
+            log::warn!(
+                "powrprof: CallNtPowerInformation(VerifyProcessorPolicy level={info_level}) is unsupported"
+            );
+            STATUS_NOT_IMPLEMENTED
+        }
+        SYSTEM_WAKE_SOURCE | SYSTEM_HIBER_FILE_SIZE | SYSTEM_HIBER_FILE_INFORMATION => {
+            log::warn!(
+                "powrprof: CallNtPowerInformation(level={info_level}) is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
+        }
+        SYSTEM_POWER_STATE_HANDLER
+        | PROCESSOR_STATE_HANDLER
+        | ADMINISTRATOR_POWER_POLICY
+        | SYSTEM_RESERVE_HIBER_FILE
+        | PROCESSOR_STATE_HANDLER2
+        | SYSTEM_POWER_STATE_NOTIFY_HANDLER
+        | SYSTEM_POWER_STATE_LOGGING
+        | SYSTEM_POWER_LOGGING_ENTRY
+        | SET_POWER_SETTING_VALUE => STATUS_ACCESS_DENIED,
+        lvl if lvl < POWER_INFORMATION_LEVEL_MAX => STATUS_INVALID_PARAMETER,
+        _ => STATUS_INVALID_PARAMETER,
     }
 }
 
@@ -513,6 +1139,215 @@ pub unsafe extern "win64" fn PowerReadDCValueIndex(
     err::ERROR_FILE_NOT_FOUND
 }
 
+unsafe fn parse_notify_target(flags: u32, recipient: HANDLE) -> Result<PowerNotifyTarget, u32> {
+    if recipient.is_null() {
+        return Err(err::ERROR_INVALID_PARAMETER);
+    }
+    match flags {
+        DEVICE_NOTIFY_WINDOW_HANDLE => Ok(PowerNotifyTarget::Window(recipient as usize)),
+        DEVICE_NOTIFY_SERVICE_HANDLE => Ok(PowerNotifyTarget::Service),
+        DEVICE_NOTIFY_CALLBACK => {
+            // DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS: { PDEVICE_NOTIFY_CALLBACK_ROUTINE Callback; PVOID Context; }
+            let p = recipient as *const usize;
+            let func = std::ptr::read_unaligned(p);
+            let context = std::ptr::read_unaligned(p.add(1));
+            if func == 0 {
+                return Err(err::ERROR_INVALID_PARAMETER);
+            }
+            Ok(PowerNotifyTarget::Callback { func, context })
+        }
+        _ => Err(err::ERROR_INVALID_PARAMETER),
+    }
+}
+
+fn build_powerbroadcast_setting(guid: [u8; 16], data: &[u8]) -> Vec<u8> {
+    // POWERBROADCAST_SETTING: GUID PowerSetting (@0, 16B), DWORD DataLength (@16, 4B), UCHAR Data[] (@20)
+    let mut buf = Vec::with_capacity(20 + data.len().max(1));
+    buf.extend_from_slice(&guid);
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+    if data.is_empty() {
+        buf.push(0);
+    }
+    buf
+}
+
+#[cfg(target_os = "macos")]
+fn query_display_power_on() -> Option<bool> {
+    macos_power::query_display_power_on()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_display_power_on() -> Option<bool> {
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn query_low_power_mode() -> Option<bool> {
+    Some(objc2_foundation::NSProcessInfo::processInfo().isLowPowerModeEnabled())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn query_low_power_mode() -> Option<bool> {
+    None
+}
+
+// 2 = unknown, 0 = off/disabled, 1 = on/enabled
+#[cfg(any(target_os = "macos", test))]
+static LAST_DISPLAY_POWER_STATE: AtomicU8 = AtomicU8::new(2);
+#[cfg(any(target_os = "macos", test))]
+static LAST_LOW_POWER_MODE: AtomicU8 = AtomicU8::new(2);
+
+#[cfg(any(target_os = "macos", test))]
+fn seed_display_power_state(on: bool) {
+    let val = if on { 1u8 } else { 0u8 };
+    let _ = LAST_DISPLAY_POWER_STATE.compare_exchange(2, val, Ordering::AcqRel, Ordering::Acquire);
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn seed_low_power_mode(saving: bool) {
+    let val = if saving { 1u8 } else { 0u8 };
+    let _ = LAST_LOW_POWER_MODE.compare_exchange(2, val, Ordering::AcqRel, Ordering::Acquire);
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn dispatch_display_power_state(on: bool) {
+    let val = if on { 1u8 } else { 0u8 };
+    if LAST_DISPLAY_POWER_STATE.swap(val, Ordering::AcqRel) == val {
+        return;
+    }
+    let payload = (val as u32).to_le_bytes();
+    dispatch_power_setting_change(GUID_CONSOLE_DISPLAY_STATE, &payload);
+    dispatch_power_setting_change(GUID_MONITOR_POWER_ON, &payload);
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn dispatch_low_power_mode(saving: bool) {
+    let val = if saving { 1u8 } else { 0u8 };
+    if LAST_LOW_POWER_MODE.swap(val, Ordering::AcqRel) == val {
+        return;
+    }
+    let payload = (val as u32).to_le_bytes();
+    dispatch_power_setting_change(GUID_POWER_SAVING_STATUS, &payload);
+}
+
+fn current_power_setting_value(guid: [u8; 16]) -> Option<Vec<u8>> {
+    if guid == GUID_ACDC_POWER_SOURCE {
+        let snap = query_battery_state().unwrap_or_else(fallback_battery_state);
+        let v: u32 = if snap.ac_online { 0 } else { 1 };
+        Some(v.to_le_bytes().to_vec())
+    } else if guid == GUID_BATTERY_PERCENTAGE_REMAINING {
+        let snap = query_battery_state().unwrap_or_else(fallback_battery_state);
+        let pct: u32 = if snap.battery_present && snap.max_capacity > 0 {
+            ((snap.remaining_capacity as u64 * 100) / snap.max_capacity as u64).min(100) as u32
+        } else {
+            100
+        };
+        Some(pct.to_le_bytes().to_vec())
+    } else if guid == GUID_POWERSCHEME_PERSONALITY {
+        Some(GUID_TYPICAL_POWER_SAVINGS.to_vec())
+    } else if guid == GUID_CONSOLE_DISPLAY_STATE || guid == GUID_MONITOR_POWER_ON {
+        let on = query_display_power_on()?;
+        #[cfg(any(target_os = "macos", test))]
+        seed_display_power_state(on);
+        let v: u32 = if on { 1 } else { 0 };
+        Some(v.to_le_bytes().to_vec())
+    } else if guid == GUID_POWER_SAVING_STATUS {
+        let saving = query_low_power_mode()?;
+        #[cfg(any(target_os = "macos", test))]
+        seed_low_power_mode(saving);
+        let v: u32 = if saving { 1 } else { 0 };
+        Some(v.to_le_bytes().to_vec())
+    } else {
+        None
+    }
+}
+
+unsafe fn deliver_to_entry(entry: &Arc<PowerNotification>, pbt_type: u32, setting_buf: Option<&[u8]>) {
+    match entry.target {
+        PowerNotifyTarget::Callback { func, context } => {
+            let Some(_guard) = entry.try_begin_delivery() else {
+                return;
+            };
+            // Ensure foreign OS callback threads (e.g. IOKit power monitor) have an
+            // initialized TEB and static TLS before entering guest code.
+            let _ = crate::teb::current();
+            let setting_ptr = setting_buf.map_or(0u64, |b| b.as_ptr() as u64);
+            let _ = crate::call_guest8(
+                func,
+                context as u64,
+                pbt_type as u64,
+                setting_ptr,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+        PowerNotifyTarget::Window(hwnd) => {
+            if entry.lifecycle.lock().unwrap_or_else(|e| e.into_inner()).cancelled {
+                return;
+            }
+            if let Some(w) = crate::user32::window::get(hwnd) {
+                // Keep an owned copy of `POWERBROADCAST_SETTING` alive until the owning Win32
+                // thread finishes running the window procedure (Windows delivers WM_POWERBROADCAST
+                // as a sent notification so lParam stays valid across the WndProc call).
+                let owned_pkt = setting_buf.map(|b| b.to_vec());
+                let entry_ref = Arc::clone(entry);
+                let q = crate::user32::message::queue_for(w.tid);
+                q.call(move || {
+                    let Some(_guard) = entry_ref.try_begin_delivery() else {
+                        return;
+                    };
+                    if crate::user32::window::exists(hwnd) {
+                        let lp = owned_pkt.as_ref().map_or(0isize, |b| b.as_ptr() as isize);
+                        crate::user32::window::call_window_proc(
+                            hwnd,
+                            crate::user32::wm::POWERBROADCAST,
+                            pbt_type as usize,
+                            lp,
+                        );
+                    }
+                });
+            }
+        }
+        PowerNotifyTarget::Service => {}
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn dispatch_suspend_resume_event(pbt_type: u32) {
+    let entries: Vec<Arc<PowerNotification>> = {
+        let map = notifications().lock().unwrap();
+        map.values()
+            .filter(|n| matches!(n.kind, PowerNotifyKind::SuspendResume))
+            .cloned()
+            .collect()
+    };
+    for entry in entries {
+        unsafe { deliver_to_entry(&entry, pbt_type, None) };
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn dispatch_power_setting_change(guid: [u8; 16], data: &[u8]) {
+    let entries: Vec<Arc<PowerNotification>> = {
+        let map = notifications().lock().unwrap();
+        map.values()
+            .filter(|n| matches!(n.kind, PowerNotifyKind::Setting(g) if g == guid))
+            .cloned()
+            .collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let pkt = build_powerbroadcast_setting(guid, data);
+    for entry in entries {
+        unsafe { deliver_to_entry(&entry, PBT_POWERSETTINGCHANGE, Some(&pkt)) };
+    }
+}
+
 pub unsafe extern "win64" fn PowerRegisterSuspendResumeNotification(
     flags: u32,
     recipient: HANDLE,
@@ -521,18 +1356,17 @@ pub unsafe extern "win64" fn PowerRegisterSuspendResumeNotification(
     if registration_handle.is_null() {
         return err::ERROR_INVALID_PARAMETER;
     }
+    let target = match parse_notify_target(flags, recipient) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let handle = NEXT_NOTIFY_HANDLE.fetch_add(4, Ordering::Relaxed);
     notifications().lock().unwrap().insert(
         handle,
-        PowerNotification {
-            kind: PowerNotifyKind::SuspendResume,
-            flags,
-            recipient: recipient as usize,
-        },
+        PowerNotification::new(PowerNotifyKind::SuspendResume, target),
     );
-    stub!(
-        "PowerRegisterSuspendResumeNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS wake callback not armed)"
-    );
+    #[cfg(target_os = "macos")]
+    macos_power::ensure_power_monitor_started();
     std::ptr::write_unaligned(registration_handle, handle as *mut c_void);
     0 // ERROR_SUCCESS
 }
@@ -544,12 +1378,19 @@ pub unsafe extern "win64" fn PowerUnregisterSuspendResumeNotification(
         return err::ERROR_INVALID_PARAMETER;
     }
     let handle = registration_handle as usize;
-    let mut map = notifications().lock().unwrap();
-    if matches!(
-        map.get(&handle),
-        Some(PowerNotification { kind: PowerNotifyKind::SuspendResume, .. })
-    ) {
-        map.remove(&handle);
+    let removed = {
+        let mut map = notifications().lock().unwrap();
+        if matches!(
+            map.get(&handle).map(|n| &n.kind),
+            Some(PowerNotifyKind::SuspendResume)
+        ) {
+            map.remove(&handle)
+        } else {
+            None
+        }
+    };
+    if let Some(entry) = removed {
+        entry.cancel_and_wait();
         0
     } else {
         err::ERROR_INVALID_HANDLE
@@ -590,21 +1431,24 @@ pub unsafe extern "win64" fn PowerSettingRegisterNotification(
     if setting_guid.is_null() || registration_handle.is_null() {
         return err::ERROR_INVALID_PARAMETER;
     }
+    let target = match parse_notify_target(flags, recipient) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let mut guid = [0u8; 16];
     std::ptr::copy_nonoverlapping(setting_guid as *const u8, guid.as_mut_ptr(), 16);
     let handle = NEXT_NOTIFY_HANDLE.fetch_add(4, Ordering::Relaxed);
-    notifications().lock().unwrap().insert(
-        handle,
-        PowerNotification {
-            kind: PowerNotifyKind::Setting(guid),
-            flags,
-            recipient: recipient as usize,
-        },
-    );
-    stub!(
-        "PowerSettingRegisterNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS setting callback not armed)"
-    );
+    let entry = PowerNotification::new(PowerNotifyKind::Setting(guid), target);
+    notifications().lock().unwrap().insert(handle, Arc::clone(&entry));
+    #[cfg(target_os = "macos")]
+    macos_power::ensure_power_monitor_started();
     std::ptr::write_unaligned(registration_handle, handle as *mut c_void);
+
+    // Windows immediately delivers the initial value of the registered power setting.
+    if let Some(val) = current_power_setting_value(guid) {
+        let pkt = build_powerbroadcast_setting(guid, &val);
+        deliver_to_entry(&entry, PBT_POWERSETTINGCHANGE, Some(&pkt));
+    }
     0
 }
 
@@ -615,12 +1459,19 @@ pub unsafe extern "win64" fn PowerSettingUnregisterNotification(
         return err::ERROR_INVALID_PARAMETER;
     }
     let handle = registration_handle as usize;
-    let mut map = notifications().lock().unwrap();
-    if matches!(
-        map.get(&handle),
-        Some(PowerNotification { kind: PowerNotifyKind::Setting(_), .. })
-    ) {
-        map.remove(&handle);
+    let removed = {
+        let mut map = notifications().lock().unwrap();
+        if matches!(
+            map.get(&handle).map(|n| &n.kind),
+            Some(PowerNotifyKind::Setting(_))
+        ) {
+            map.remove(&handle)
+        } else {
+            None
+        }
+    };
+    if let Some(entry) = removed {
+        entry.cancel_and_wait();
         0
     } else {
         err::ERROR_INVALID_HANDLE
@@ -727,6 +1578,871 @@ mod tests {
             assert_eq!(PowerUnregisterSuspendResumeNotification(h1), err::ERROR_INVALID_HANDLE);
             assert_eq!(PowerSettingUnregisterNotification(h2), 0);
             assert_eq!(PowerSettingUnregisterNotification(h2), err::ERROR_INVALID_HANDLE);
+        }
+    }
+
+    #[test]
+    fn call_nt_power_information_levels_and_callback_notifications() {
+        unsafe {
+            // 1. Additional CallNtPowerInformation levels: policy reads must report
+            //    STATUS_NOT_IMPLEMENTED honestly instead of fabricating default timeouts.
+            for lvl in [SYSTEM_POWER_POLICY_AC, SYSTEM_POWER_POLICY_DC, SYSTEM_POWER_POLICY_CURRENT] {
+                let mut pol = [0xCCu8; 232];
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        std::ptr::null(),
+                        0,
+                        pol.as_mut_ptr() as *mut c_void,
+                        pol.len() as u32,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert!(pol.iter().all(|&b| b == 0xCC), "unsupported system power policy read must not invent values");
+            }
+
+            let mut spi = [0xAAu8; 16];
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_POWER_INFORMATION,
+                    std::ptr::null(),
+                    0,
+                    spi.as_mut_ptr() as *mut c_void,
+                    spi.len() as u32,
+                ),
+                STATUS_NOT_IMPLEMENTED
+            );
+            assert!(spi.iter().all(|&b| b == 0xAA), "unsupported SystemPowerInformation must not fabricate telemetry");
+
+            let mut wake_t = 0u64;
+            assert_eq!(
+                CallNtPowerInformation(
+                    LAST_WAKE_TIME,
+                    std::ptr::null(),
+                    0,
+                    &mut wake_t as *mut u64 as *mut c_void,
+                    8,
+                ),
+                STATUS_SUCCESS
+            );
+            let mut sleep_t = 0u64;
+            assert_eq!(
+                CallNtPowerInformation(
+                    LAST_SLEEP_TIME,
+                    std::ptr::null(),
+                    0,
+                    &mut sleep_t as *mut u64 as *mut c_void,
+                    8,
+                ),
+                STATUS_SUCCESS
+            );
+            // Both LastWakeTime and LastSleepTime must be in the interrupt-time clock domain
+            // (never a larger Unix-epoch calendar timestamp that underflows elapsed-time math).
+            let now_int = crate::kernel32::time::interrupt_time_100ns();
+            assert!(wake_t <= now_int, "LastWakeTime ({wake_t}) exceeded interrupt_time_100ns ({now_int})");
+            assert!(sleep_t <= now_int, "LastSleepTime ({sleep_t}) exceeded interrupt_time_100ns ({now_int})");
+            // Calendar fallback helper must convert Unix timestamps to interrupt-time elapsed offsets.
+            // Event at 1_700_000_000.500000s (17_000_000_005_000_000 * 100ns); 60s later -> 400_000_000.
+            assert_eq!(
+                calendar_timeval_to_interrupt_100ns(1_700_000_000, 500_000, 17_000_000_605_000_000, 1_000_000_000),
+                400_000_000
+            );
+            assert_eq!(calendar_timeval_to_interrupt_100ns(0, 0, 17_000_000_650_000_000, 1_000_000_000), 0);
+
+            for lvl in [
+                PROCESSOR_POWER_POLICY_AC,
+                PROCESSOR_POWER_POLICY_DC,
+                PROCESSOR_POWER_POLICY_CURRENT,
+            ] {
+                let mut ppol = [0xDDu8; 76];
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        std::ptr::null(),
+                        0,
+                        ppol.as_mut_ptr() as *mut c_void,
+                        ppol.len() as u32,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert!(
+                    ppol.iter().all(|&b| b == 0xDD),
+                    "unsupported processor power policy read must not invent values"
+                );
+            }
+
+            // Policy write attempts must NOT echo unapplied policies back as STATUS_SUCCESS:
+            // AC/DC policy updates require host OS privileges (STATUS_ACCESS_DENIED), undersized
+            // inputs return STATUS_INVALID_PARAMETER, and *_CURRENT levels are read-only.
+            let mut custom_sys = [0xAAu8; 232];
+            custom_sys[0..4].copy_from_slice(&1u32.to_le_bytes());
+            let mut out_sys = [0x55u8; 232];
+            for lvl in [SYSTEM_POWER_POLICY_AC, SYSTEM_POWER_POLICY_DC] {
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_sys.as_ptr() as *const c_void,
+                        custom_sys.len() as u32,
+                        out_sys.as_mut_ptr() as *mut c_void,
+                        out_sys.len() as u32,
+                    ),
+                    STATUS_ACCESS_DENIED
+                );
+                assert!(out_sys.iter().all(|&b| b == 0x55), "rejected write must not overwrite out_buf");
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_sys.as_ptr() as *const c_void,
+                        16,
+                        out_sys.as_mut_ptr() as *mut c_void,
+                        out_sys.len() as u32,
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+            }
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_POWER_POLICY_CURRENT,
+                    custom_sys.as_ptr() as *const c_void,
+                    custom_sys.len() as u32,
+                    out_sys.as_mut_ptr() as *mut c_void,
+                    out_sys.len() as u32,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let custom_proc = [0xBBu8; 76];
+            let mut out_proc = [0x44u8; 76];
+            for lvl in [PROCESSOR_POWER_POLICY_AC, PROCESSOR_POWER_POLICY_DC] {
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_proc.as_ptr() as *const c_void,
+                        custom_proc.len() as u32,
+                        out_proc.as_mut_ptr() as *mut c_void,
+                        out_proc.len() as u32,
+                    ),
+                    STATUS_ACCESS_DENIED
+                );
+                assert!(out_proc.iter().all(|&b| b == 0x44));
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_proc.as_ptr() as *const c_void,
+                        8,
+                        out_proc.as_mut_ptr() as *mut c_void,
+                        out_proc.len() as u32,
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+            }
+            assert_eq!(
+                CallNtPowerInformation(
+                    PROCESSOR_POWER_POLICY_CURRENT,
+                    custom_proc.as_ptr() as *const c_void,
+                    custom_proc.len() as u32,
+                    out_proc.as_mut_ptr() as *mut c_void,
+                    out_proc.len() as u32,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+
+            // Verify*Policy* levels are documented as unsupported by CallNtPowerInformation
+            // and must fail with STATUS_NOT_IMPLEMENTED without echoing input into out_buf.
+            for lvl in [VERIFY_SYSTEM_POLICY_AC, VERIFY_SYSTEM_POLICY_DC] {
+                let mut verify_out = [0x66u8; 232];
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_sys.as_ptr() as *const c_void,
+                        custom_sys.len() as u32,
+                        verify_out.as_mut_ptr() as *mut c_void,
+                        verify_out.len() as u32,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert!(
+                    verify_out.iter().all(|&b| b == 0x66),
+                    "unsupported VerifySystemPolicy level {lvl} must not echo input into out_buf"
+                );
+            }
+            for lvl in [VERIFY_PROCESSOR_POLICY_AC, VERIFY_PROCESSOR_POLICY_DC] {
+                let mut verify_out = [0x77u8; 76];
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_proc.as_ptr() as *const c_void,
+                        custom_proc.len() as u32,
+                        verify_out.as_mut_ptr() as *mut c_void,
+                        verify_out.len() as u32,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert!(
+                    verify_out.iter().all(|&b| b == 0x77),
+                    "unsupported VerifyProcessorPolicy level {lvl} must not echo input into out_buf"
+                );
+            }
+
+            // SystemExecutionState must reflect live continuous SetThreadExecutionState flags
+            // across threads and clear them on release or thread exit.
+            const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+            const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+            const ES_CONTINUOUS: u32 = 0x8000_0000;
+            let mut exec_state = 0xFFFF_FFFFu32;
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, 0);
+            let prev = crate::kernel32::process::SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
+            );
+            assert_eq!(prev, ES_CONTINUOUS);
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            // A non-continuous call must not clear the thread's continuous state.
+            let prev2 = crate::kernel32::process::SetThreadExecutionState(ES_SYSTEM_REQUIRED);
+            assert_eq!(prev2, ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            // Clearing continuous flags restores SystemExecutionState to 0.
+            let prev3 = crate::kernel32::process::SetThreadExecutionState(ES_CONTINUOUS);
+            assert_eq!(prev3, ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, 0);
+            // Flags set on a worker thread are aggregated while alive and cleared on exit.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                crate::kernel32::process::SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+                let _ = tx.send(());
+                let _ = done_rx.recv();
+            });
+            rx.recv().unwrap();
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, ES_DISPLAY_REQUIRED);
+            let _ = done_tx.send(());
+            worker.join().unwrap();
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, 0);
+
+            // Unsupported wake-source / hiberfile levels must report STATUS_NOT_IMPLEMENTED.
+            for lvl in [SYSTEM_WAKE_SOURCE, SYSTEM_HIBER_FILE_SIZE, SYSTEM_HIBER_FILE_INFORMATION] {
+                let mut sentinel = 0x5A5A_5A5Au32;
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        std::ptr::null(),
+                        0,
+                        &mut sentinel as *mut u32 as *mut c_void,
+                        4,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert_eq!(sentinel, 0x5A5A_5A5A);
+            }
+
+            // Privileged admin-only level returns STATUS_ACCESS_DENIED; unknown returns STATUS_INVALID_PARAMETER.
+            assert_eq!(
+                CallNtPowerInformation(SYSTEM_RESERVE_HIBER_FILE, std::ptr::null(), 0, std::ptr::null_mut(), 0),
+                STATUS_ACCESS_DENIED
+            );
+            assert_eq!(
+                CallNtPowerInformation(999, std::ptr::null(), 0, std::ptr::null_mut(), 0),
+                STATUS_INVALID_PARAMETER
+            );
+
+            // 2. DEVICE_NOTIFY_CALLBACK for PowerSettingRegisterNotification (immediate initial delivery)
+            //    and PowerRegisterSuspendResumeNotification (dispatched suspend/resume events).
+            static EVENTS: Mutex<Vec<(usize, u32, Option<u32>)>> = Mutex::new(Vec::new());
+            unsafe extern "win64" fn power_cb(ctx: *mut c_void, pbt_type: u32, setting: *const u8) -> u32 {
+                let val = if !setting.is_null() && pbt_type == PBT_POWERSETTINGCHANGE {
+                    let len = std::ptr::read_unaligned(setting.add(16) as *const u32);
+                    if len >= 4 {
+                        Some(std::ptr::read_unaligned(setting.add(20) as *const u32))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                EVENTS.lock().unwrap().push((ctx as usize, pbt_type, val));
+                0
+            }
+            crate::com::register_vtable_ptrs(&[power_cb as *const () as usize]);
+
+            EVENTS.lock().unwrap().clear();
+            let params: [usize; 2] = [power_cb as *const () as usize, 0xCAFE_BABE];
+            let mut h_set: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_ACDC_POWER_SOURCE.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_set,
+                ),
+                0
+            );
+            // Initial setting value must have been delivered immediately.
+            {
+                let evs = EVENTS.lock().unwrap();
+                assert_eq!(evs.len(), 1);
+                assert_eq!(evs[0].0, 0xCAFE_BABE);
+                assert_eq!(evs[0].1, PBT_POWERSETTINGCHANGE);
+                assert!(matches!(evs[0].2, Some(0) | Some(1)));
+            }
+
+            // Dispatch a battery percentage setting change and suspend/resume event.
+            let mut h_sr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_sr,
+                ),
+                0
+            );
+            dispatch_suspend_resume_event(PBT_APMSUSPEND);
+            dispatch_suspend_resume_event(PBT_APMRESUMEAUTOMATIC);
+            dispatch_power_setting_change(GUID_ACDC_POWER_SOURCE, &1u32.to_le_bytes());
+
+            let evs = EVENTS.lock().unwrap().clone();
+            assert_eq!(evs.len(), 4);
+            assert_eq!(evs[1], (0xCAFE_BABE, PBT_APMSUSPEND, None));
+            assert_eq!(evs[2], (0xCAFE_BABE, PBT_APMRESUMEAUTOMATIC, None));
+            assert_eq!(evs[3], (0xCAFE_BABE, PBT_POWERSETTINGCHANGE, Some(1)));
+
+            assert_eq!(PowerUnregisterSuspendResumeNotification(h_sr), 0);
+            assert_eq!(PowerSettingUnregisterNotification(h_set), 0);
+        }
+    }
+
+    #[test]
+    fn window_power_setting_payload_stays_alive_until_wndproc_delivery() {
+        static RECEIVED: Mutex<Vec<(usize, Option<([u8; 16], Vec<u8>)>)>> = Mutex::new(Vec::new());
+
+        unsafe extern "win64" fn power_wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize {
+            if msg == crate::user32::wm::POWERBROADCAST {
+                let setting = if wparam as u32 == PBT_POWERSETTINGCHANGE && lparam != 0 {
+                    let p = lparam as *const u8;
+                    let mut guid = [0u8; 16];
+                    std::ptr::copy_nonoverlapping(p, guid.as_mut_ptr(), 16);
+                    let len = std::ptr::read_unaligned(p.add(16) as *const u32) as usize;
+                    let mut data = vec![0u8; len];
+                    if len > 0 {
+                        std::ptr::copy_nonoverlapping(p.add(20), data.as_mut_ptr(), len);
+                    }
+                    Some((guid, data))
+                } else {
+                    None
+                };
+                RECEIVED.lock().unwrap().push((wparam, setting));
+                return 1;
+            }
+            crate::user32::defproc::DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        std::thread::spawn(|| unsafe {
+            let wndproc_handle = crate::user32::register_typed_host_wndproc(power_wndproc);
+            RECEIVED.lock().unwrap().clear();
+
+            let cls = crate::strings::to_wide_z("PowerNotifyPayloadTestWnd");
+            let wc = crate::user32::class::WNDCLASSEX {
+                cb_size: std::mem::size_of::<crate::user32::class::WNDCLASSEX>() as u32,
+                style: 0,
+                wndproc: wndproc_handle,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+                icon_sm: 0,
+            };
+            let _ = crate::user32::class::RegisterClassExW(&wc);
+            let hwnd = crate::user32::window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                crate::user32::ws::POPUP,
+                0,
+                0,
+                40,
+                40,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+
+            // 1. Register window-based power-setting notification. Its local packet in
+            //    PowerSettingRegisterNotification goes out of scope immediately upon return.
+            let mut h_set: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_ACDC_POWER_SOURCE.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                    hwnd as HANDLE,
+                    &mut h_set,
+                ),
+                0
+            );
+            // Clobber recently freed small heap blocks to expose any use-after-free.
+            let _churn: Vec<Vec<u8>> = (0..64).map(|_| vec![0xDEu8; 24]).collect();
+
+            let mut msg = crate::user32::MSG::default();
+            let _ = crate::user32::message::PeekMessageW(
+                &mut msg,
+                hwnd,
+                0,
+                0,
+                crate::user32::message::PM_REMOVE,
+            );
+            {
+                let got = RECEIVED.lock().unwrap();
+                assert_eq!(got.len(), 1, "expected initial WM_POWERBROADCAST delivery");
+                assert_eq!(got[0].0, PBT_POWERSETTINGCHANGE as usize);
+                let (guid, data) = got[0].1.as_ref().expect("missing POWERBROADCAST_SETTING");
+                assert_eq!(*guid, GUID_ACDC_POWER_SOURCE);
+                assert_eq!(data.len(), 4);
+                let val = u32::from_le_bytes(data[..4].try_into().unwrap());
+                assert!(val == 0 || val == 1, "unexpected initial AC/DC value {val:#x}");
+            }
+
+            // 2. Dispatch a subsequent change from another thread (mirrors IOKit callback thread).
+            let payload_val = 0x1357_2468u32;
+            std::thread::spawn(move || {
+                dispatch_power_setting_change(GUID_ACDC_POWER_SOURCE, &payload_val.to_le_bytes());
+            })
+            .join()
+            .unwrap();
+            let _churn2: Vec<Vec<u8>> = (0..64).map(|_| vec![0xCCu8; 24]).collect();
+
+            let _ = crate::user32::message::PeekMessageW(
+                &mut msg,
+                hwnd,
+                0,
+                0,
+                crate::user32::message::PM_REMOVE,
+            );
+            {
+                let got = RECEIVED.lock().unwrap();
+                assert_eq!(got.len(), 2, "expected dispatched WM_POWERBROADCAST delivery");
+                assert_eq!(got[1].0, PBT_POWERSETTINGCHANGE as usize);
+                let (guid, data) = got[1].1.as_ref().expect("missing POWERBROADCAST_SETTING");
+                assert_eq!(*guid, GUID_ACDC_POWER_SOURCE);
+                assert_eq!(data, &payload_val.to_le_bytes());
+            }
+
+            // 3. Window-based suspend/resume notification delivers with lParam == 0.
+            let mut h_sr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                    hwnd as HANDLE,
+                    &mut h_sr,
+                ),
+                0
+            );
+            dispatch_suspend_resume_event(PBT_APMSUSPEND);
+            let _ = crate::user32::message::PeekMessageW(
+                &mut msg,
+                hwnd,
+                0,
+                0,
+                crate::user32::message::PM_REMOVE,
+            );
+            {
+                let got = RECEIVED.lock().unwrap();
+                assert_eq!(got.len(), 3);
+                assert_eq!(got[2], (PBT_APMSUSPEND as usize, None));
+            }
+
+            assert_eq!(PowerUnregisterSuspendResumeNotification(h_sr), 0);
+            assert_eq!(PowerSettingUnregisterNotification(h_set), 0);
+            let _ = crate::user32::window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn unregister_synchronizes_in_flight_and_cancels_pending_snapshot_callbacks() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // 1. Cross-thread unregistration must wait until an in-flight callback exits
+        //    before returning ERROR_SUCCESS (prevents context UAF / DLL unload race).
+        struct InFlightSync {
+            entered_tx: Mutex<Option<mpsc::Sender<()>>>,
+            release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+            exited: AtomicBool,
+        }
+        unsafe extern "win64" fn blocking_cb(ctx: *mut c_void, _ty: u32, _setting: *mut c_void) -> u32 {
+            let sync = &*(ctx as *const InFlightSync);
+            if let Some(tx) = sync.entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = sync.release_rx.lock().unwrap().take() {
+                let _ = rx.recv_timeout(Duration::from_secs(3));
+            }
+            sync.exited.store(true, Ordering::Release);
+            0
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let sync = Box::new(InFlightSync {
+            entered_tx: Mutex::new(Some(entered_tx)),
+            release_rx: Mutex::new(Some(release_rx)),
+            exited: AtomicBool::new(false),
+        });
+        let sync_ptr = &*sync as *const InFlightSync as usize;
+        let sub_params: [usize; 2] = [blocking_cb as *const () as usize, sync_ptr];
+        let mut h_block: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_CALLBACK,
+                    sub_params.as_ptr() as HANDLE,
+                    &mut h_block,
+                ),
+                0
+            );
+        }
+
+        let dispatcher = std::thread::spawn(|| {
+            dispatch_suspend_resume_event(PBT_APMSUSPEND);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).expect("callback entered");
+
+        let (unreg_done_tx, unreg_done_rx) = mpsc::channel::<u32>();
+        let h_block_addr = h_block as usize;
+        let unreg_thread = std::thread::spawn(move || {
+            let rc = unsafe { PowerUnregisterSuspendResumeNotification(h_block_addr as *mut c_void) };
+            let _ = unreg_done_tx.send(rc);
+        });
+
+        // While callback is still blocked, unregistration MUST NOT return yet.
+        assert!(
+            unreg_done_rx.recv_timeout(Duration::from_millis(60)).is_err(),
+            "PowerUnregisterSuspendResumeNotification must wait for in-flight callback to finish"
+        );
+        assert!(!sync.exited.load(Ordering::Acquire));
+
+        // Release callback -> unregistration completes strictly AFTER callback exits.
+        let _ = release_tx.send(());
+        assert_eq!(unreg_done_rx.recv_timeout(Duration::from_secs(2)), Ok(0));
+        assert!(sync.exited.load(Ordering::Acquire));
+        dispatcher.join().unwrap();
+        unreg_thread.join().unwrap();
+
+        // 2. Canceling another registration that is ALREADY in the same dispatch snapshot
+        //    must prevent that canceled callback from ever being invoked.
+        struct MutualCancel {
+            other_handle: AtomicUsize,
+            invoked: AtomicUsize,
+        }
+        unsafe extern "win64" fn cancel_other_cb(ctx: *mut c_void, _ty: u32, _setting: *mut c_void) -> u32 {
+            let st = &*(ctx as *const MutualCancel);
+            st.invoked.fetch_add(1, Ordering::AcqRel);
+            let other = st.other_handle.load(Ordering::Acquire);
+            if other != 0 {
+                let _ = PowerUnregisterSuspendResumeNotification(other as *mut c_void);
+            }
+            0
+        }
+
+        let mc_a = Box::new(MutualCancel { other_handle: AtomicUsize::new(0), invoked: AtomicUsize::new(0) });
+        let mc_b = Box::new(MutualCancel { other_handle: AtomicUsize::new(0), invoked: AtomicUsize::new(0) });
+        let params_a: [usize; 2] = [cancel_other_cb as *const () as usize, &*mc_a as *const MutualCancel as usize];
+        let params_b: [usize; 2] = [cancel_other_cb as *const () as usize, &*mc_b as *const MutualCancel as usize];
+        let (mut h_a, mut h_b) = (std::ptr::null_mut(), std::ptr::null_mut());
+        unsafe {
+            assert_eq!(PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, params_a.as_ptr() as HANDLE, &mut h_a), 0);
+            assert_eq!(PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, params_b.as_ptr() as HANDLE, &mut h_b), 0);
+        }
+        mc_a.other_handle.store(h_b as usize, Ordering::Release);
+        mc_b.other_handle.store(h_a as usize, Ordering::Release);
+
+        dispatch_suspend_resume_event(PBT_APMRESUMESUSPEND);
+        // Whichever ran first canceled the other while it was still pending in the snapshot.
+        let total_calls = mc_a.invoked.load(Ordering::Acquire) + mc_b.invoked.load(Ordering::Acquire);
+        assert_eq!(total_calls, 1, "canceled pending snapshot callback must not be invoked");
+        // Clean up the surviving handle.
+        unsafe {
+            let _ = PowerUnregisterSuspendResumeNotification(h_a);
+            let _ = PowerUnregisterSuspendResumeNotification(h_b);
+        }
+
+        // 3. Reentrant self-unregistration from inside a power-setting callback must not deadlock
+        //    and prevents subsequent dispatch_power_setting_change calls from invoking it.
+        struct SelfCancel {
+            handle: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        unsafe extern "win64" fn self_cancel_cb(ctx: *mut c_void, _ty: u32, _setting: *mut c_void) -> u32 {
+            let sc = &*(ctx as *const SelfCancel);
+            sc.calls.fetch_add(1, Ordering::AcqRel);
+            let h = sc.handle.load(Ordering::Acquire);
+            if h != 0 {
+                let _ = PowerSettingUnregisterNotification(h as *mut c_void);
+            }
+            0
+        }
+        let sc = Box::new(SelfCancel { handle: AtomicUsize::new(0), calls: AtomicUsize::new(0) });
+        let sc_params: [usize; 2] = [self_cancel_cb as *const () as usize, &*sc as *const SelfCancel as usize];
+        let mut h_sc: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_POWER_SAVING_STATUS.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    sc_params.as_ptr() as HANDLE,
+                    &mut h_sc,
+                ),
+                0
+            );
+        }
+        sc.handle.store(h_sc as usize, Ordering::Release);
+        dispatch_power_setting_change(GUID_POWER_SAVING_STATUS, &1u32.to_le_bytes());
+        dispatch_power_setting_change(GUID_POWER_SAVING_STATUS, &0u32.to_le_bytes());
+        // 1 initial delivery + 1 dispatched delivery (which self-unregistered); 2nd dispatch suppressed.
+        assert_eq!(sc.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn foreign_dispatch_thread_adopts_teb_before_guest_power_callback() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct TebProbe {
+            teb_ptr: AtomicUsize,
+            peb_ptr: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        unsafe extern "win64" fn probe_cb(ctx: *mut c_void, _ty: u32, _setting: *mut c_void) -> u32 {
+            let p = &*(ctx as *const TebProbe);
+            p.teb_ptr
+                .store(crate::teb::gs_read(crate::teb::off::SELF), Ordering::Release);
+            p.peb_ptr
+                .store(crate::teb::gs_read(crate::teb::off::PEB), Ordering::Release);
+            p.calls.fetch_add(1, Ordering::AcqRel);
+            0
+        }
+
+        let probe = Box::new(TebProbe {
+            teb_ptr: AtomicUsize::new(0),
+            peb_ptr: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        });
+        let params: [usize; 2] = [
+            probe_cb as *const () as usize,
+            &*probe as *const TebProbe as usize,
+        ];
+        let mut h_sr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_sr,
+                ),
+                0
+            );
+        }
+
+        // Dispatch from a brand-new unadopted OS thread (mirrors the macOS IOKit monitor thread).
+        std::thread::spawn(|| {
+            assert!(
+                crate::teb::current_raw().is_null(),
+                "fresh Rust thread must start without a TEB before power delivery"
+            );
+            dispatch_suspend_resume_event(PBT_APMSUSPEND);
+            assert!(
+                !crate::teb::current_raw().is_null(),
+                "power delivery must adopt the foreign thread into the Windows runtime"
+            );
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+        assert_ne!(probe.teb_ptr.load(Ordering::Acquire), 0, "gs:[0x30] TEB self must be initialized");
+        assert_ne!(probe.peb_ptr.load(Ordering::Acquire), 0, "gs:[0x60] PEB must be initialized");
+        unsafe {
+            assert_eq!(PowerUnregisterSuspendResumeNotification(h_sr), 0);
+        }
+    }
+
+    #[test]
+    fn display_power_and_low_power_mode_settings_query_host_and_dispatch_transitions() {
+        static RECEIVED: Mutex<Vec<([u8; 16], u32)>> = Mutex::new(Vec::new());
+        unsafe extern "win64" fn setting_cb(_ctx: *mut c_void, pbt_type: u32, setting: *const u8) -> u32 {
+            if pbt_type == PBT_POWERSETTINGCHANGE && !setting.is_null() {
+                let mut guid = [0u8; 16];
+                std::ptr::copy_nonoverlapping(setting, guid.as_mut_ptr(), 16);
+                let len = std::ptr::read_unaligned(setting.add(16) as *const u32);
+                if len >= 4 {
+                    let val = std::ptr::read_unaligned(setting.add(20) as *const u32);
+                    RECEIVED.lock().unwrap().push((guid, val));
+                }
+            }
+            0
+        }
+
+        // Reset deduplication caches for deterministic testing.
+        LAST_DISPLAY_POWER_STATE.store(2, Ordering::Release);
+        LAST_LOW_POWER_MODE.store(2, Ordering::Release);
+        RECEIVED.lock().unwrap().clear();
+
+        let host_display_on = query_display_power_on();
+        let host_low_power = query_low_power_mode();
+        #[cfg(target_os = "macos")]
+        {
+            assert!(host_display_on.is_some(), "macOS must query real display state via CoreGraphics");
+            assert!(host_low_power.is_some(), "macOS must query real Low Power Mode via NSProcessInfo");
+        }
+
+        let params: [usize; 2] = [setting_cb as *const () as usize, 0];
+        let (mut h_console, mut h_mon, mut h_lpm) =
+            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        unsafe {
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_CONSOLE_DISPLAY_STATE.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_console,
+                ),
+                0
+            );
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_MONITOR_POWER_ON.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_mon,
+                ),
+                0
+            );
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_POWER_SAVING_STATUS.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_lpm,
+                ),
+                0
+            );
+        }
+
+        // Initial delivery must match the real host query values (not fabricated constants).
+        {
+            let got = RECEIVED.lock().unwrap();
+            if let Some(on) = host_display_on {
+                let want = if on { 1u32 } else { 0u32 };
+                assert!(got.contains(&(GUID_CONSOLE_DISPLAY_STATE, want)));
+                assert!(got.contains(&(GUID_MONITOR_POWER_ON, want)));
+            }
+            if let Some(saving) = host_low_power {
+                let want = if saving { 1u32 } else { 0u32 };
+                assert!(got.contains(&(GUID_POWER_SAVING_STATUS, want)));
+            }
+        }
+
+        // Live display power transitions (off -> off dedup -> on) deliver to BOTH display GUIDs.
+        RECEIVED.lock().unwrap().clear();
+        LAST_DISPLAY_POWER_STATE.store(1, Ordering::Release);
+        dispatch_display_power_state(false);
+        dispatch_display_power_state(false); // duplicate suppressed
+        dispatch_display_power_state(true);
+        let disp_evs = RECEIVED.lock().unwrap().clone();
+        assert_eq!(
+            disp_evs,
+            vec![
+                (GUID_CONSOLE_DISPLAY_STATE, 0),
+                (GUID_MONITOR_POWER_ON, 0),
+                (GUID_CONSOLE_DISPLAY_STATE, 1),
+                (GUID_MONITOR_POWER_ON, 1),
+            ]
+        );
+
+        // Live Low Power Mode transitions deliver to GUID_POWER_SAVING_STATUS with deduplication.
+        RECEIVED.lock().unwrap().clear();
+        LAST_LOW_POWER_MODE.store(0, Ordering::Release);
+        dispatch_low_power_mode(true);
+        dispatch_low_power_mode(true);
+        dispatch_low_power_mode(false);
+        assert_eq!(
+            RECEIVED.lock().unwrap().clone(),
+            vec![(GUID_POWER_SAVING_STATUS, 1), (GUID_POWER_SAVING_STATUS, 0)]
+        );
+
+        unsafe {
+            assert_eq!(PowerSettingUnregisterNotification(h_console), 0);
+            assert_eq!(PowerSettingUnregisterNotification(h_mon), 0);
+            assert_eq!(PowerSettingUnregisterNotification(h_lpm), 0);
         }
     }
 }

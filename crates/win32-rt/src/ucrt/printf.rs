@@ -10,7 +10,7 @@
 //! 4 LEGACY_WIDE_SPECIFIERS, 8 LEGACY_MSVCRT_COMPATIBILITY,
 //! 0x10 LEGACY_THREE_DIGIT_EXPONENTS.
 
-use crate::strings::{strlen, wcslen};
+use crate::strings::strlen;
 use crate::va::VaList;
 use std::ffi::c_void;
 
@@ -31,7 +31,7 @@ impl Fmt {
     unsafe fn at(&self, i: usize) -> u32 {
         match self {
             Fmt::Narrow(p) => *p.add(i) as u32,
-            Fmt::Wide(p) => *p.add(i) as u32,
+            Fmt::Wide(p) => std::ptr::read_unaligned(p.add(i)) as u32,
         }
     }
     fn wide(&self) -> bool {
@@ -425,11 +425,13 @@ pub unsafe fn format(fmt: Fmt, out_wide: bool, opts: u64, args: &mut VaList) -> 
                     if p == 0 {
                         str_units("(null)", out.wide)
                     } else {
-                        let len = *(p as *const u16) as usize;
-                        let buf = *((p + 8) as *const usize);
-                        if is_wide {
-                            let s = std::slice::from_raw_parts(buf as *const u16, len / 2);
-                            conv_wide(s, out.wide)
+                        let len = std::ptr::read_unaligned(p as *const u16) as usize;
+                        let buf = std::ptr::read_unaligned((p + 8) as *const usize);
+                        if buf == 0 {
+                            str_units("(null)", out.wide)
+                        } else if is_wide {
+                            let s = read_wide_exact_unaligned(buf as *const u16, len / 2);
+                            conv_wide(&s, out.wide)
                         } else {
                             let s = std::slice::from_raw_parts(buf as *const u8, len);
                             conv_narrow(s, out.wide)
@@ -438,11 +440,8 @@ pub unsafe fn format(fmt: Fmt, out_wide: bool, opts: u64, args: &mut VaList) -> 
                 } else if p == 0 {
                     str_units("(null)", out.wide)
                 } else if is_wide {
-                    let n = match sp.prec {
-                        Some(pr) => (0..pr).take_while(|&k| *((p as *const u16).add(k)) != 0).count(),
-                        None => wcslen(p as *const u16),
-                    };
-                    conv_wide(std::slice::from_raw_parts(p as *const u16, n), out.wide)
+                    let s = read_wide_unaligned(p as *const u16, sp.prec);
+                    conv_wide(&s, out.wide)
                 } else {
                     let n = match sp.prec {
                         Some(pr) => (0..pr).take_while(|&k| *((p as *const u8).add(k)) != 0).count(),
@@ -476,6 +475,29 @@ pub unsafe fn format(fmt: Fmt, out_wide: bool, opts: u64, args: &mut VaList) -> 
     Some(out.units)
 }
 
+unsafe fn read_wide_unaligned(p: *const u16, max_units: Option<usize>) -> Vec<u16> {
+    let mut v = Vec::new();
+    let limit = max_units.unwrap_or(usize::MAX);
+    let mut k = 0usize;
+    while k < limit {
+        let c = std::ptr::read_unaligned(p.add(k));
+        if c == 0 {
+            break;
+        }
+        v.push(c);
+        k += 1;
+    }
+    v
+}
+
+unsafe fn read_wide_exact_unaligned(p: *const u16, count: usize) -> Vec<u16> {
+    let mut v = Vec::with_capacity(count);
+    for k in 0..count {
+        v.push(std::ptr::read_unaligned(p.add(k)));
+    }
+    v
+}
+
 fn conv_wide(s: &[u16], out_wide: bool) -> Vec<u32> {
     if out_wide {
         s.iter().map(|&c| c as u32).collect()
@@ -506,7 +528,7 @@ pub fn units_to_bytes(u: &[u32]) -> Vec<u8> {
 // Buffer variants
 // ---------------------------------------------------------------------------
 
-/// Copy `res` into `buf[..count]` with `vsnprintf`-style semantics.
+/// Copy `res` into `buf[..count]` with `vsnprintf`-style semantics without assuming alignment.
 unsafe fn store<T: Copy + From<u8>>(res: &[T], buf: *mut T, count: usize, opts: u64) -> i32 {
     let n = res.len();
     let zero: T = T::from(0u8);
@@ -514,15 +536,15 @@ unsafe fn store<T: Copy + From<u8>>(res: &[T], buf: *mut T, count: usize, opts: 
         return if count == 0 { n as i32 } else { -1 };
     }
     if n < count {
-        std::ptr::copy_nonoverlapping(res.as_ptr(), buf, n);
-        *buf.add(n) = zero;
+        std::ptr::copy_nonoverlapping(res.as_ptr() as *const u8, buf as *mut u8, n * std::mem::size_of::<T>());
+        std::ptr::write_unaligned(buf.add(n), zero);
         return n as i32;
     }
     // Truncation (n >= count).
-    std::ptr::copy_nonoverlapping(res.as_ptr(), buf, count);
+    std::ptr::copy_nonoverlapping(res.as_ptr() as *const u8, buf as *mut u8, count * std::mem::size_of::<T>());
     if opts & STANDARD_SNPRINTF_BEHAVIOR != 0 {
         if count > 0 {
-            *buf.add(count - 1) = zero;
+            std::ptr::write_unaligned(buf.add(count - 1), zero);
         }
         return n as i32;
     }
@@ -530,7 +552,7 @@ unsafe fn store<T: Copy + From<u8>>(res: &[T], buf: *mut T, count: usize, opts: 
         return if n == count { n as i32 } else { -1 };
     }
     if count > 0 {
-        *buf.add(count - 1) = zero;
+        std::ptr::write_unaligned(buf.add(count - 1), zero);
     }
     -1
 }
@@ -553,6 +575,28 @@ unsafe fn fmt_wide(opts: u64, fmt: *const u16, va: *const u8) -> Option<Vec<u16>
     }
     let mut a = VaList::new(va);
     format(Fmt::Wide(fmt), true, opts, &mut a).map(|u| u.iter().map(|&c| c as u16).collect())
+}
+
+/// Format a narrow Win32 printf format string using `va_list` without triggering
+/// CRT invalid-parameter handlers (used by `user32!wsprintfA`).
+pub(crate) unsafe fn format_narrow_va(fmt: *const u8, va: *const u8) -> Option<Vec<u8>> {
+    if fmt.is_null() {
+        return None;
+    }
+    let mut a = VaList::new(va);
+    format(Fmt::Narrow(fmt), false, 0, &mut a).map(|u| units_to_bytes(&u))
+}
+
+/// Format a wide Win32 printf format string using `va_list` without triggering
+/// CRT invalid-parameter handlers (used by `user32!wsprintfW`, where `%s`/`%c`
+/// are wide and `%S`/`%C` are narrow).
+pub(crate) unsafe fn format_wide_va(fmt: *const u16, va: *const u8) -> Option<Vec<u16>> {
+    if fmt.is_null() {
+        return None;
+    }
+    let mut a = VaList::new(va);
+    format(Fmt::Wide(fmt), true, LEGACY_WIDE_SPECIFIERS, &mut a)
+        .map(|u| u.iter().map(|&c| c as u16).collect())
 }
 
 pub unsafe extern "win64" fn __stdio_common_vsprintf(
@@ -590,13 +634,13 @@ unsafe fn store_s<T: Copy + From<u8>>(res: &[T], buf: *mut T, size: usize) -> i3
         return -1;
     }
     if res.len() >= size {
-        *buf = T::from(0u8);
+        std::ptr::write_unaligned(buf, T::from(0u8));
         super::errno::set(super::errno::ERANGE);
         super::runtime::invalid_parameter("sprintf_s: buffer too small");
         return -1;
     }
-    std::ptr::copy_nonoverlapping(res.as_ptr(), buf, res.len());
-    *buf.add(res.len()) = T::from(0u8);
+    std::ptr::copy_nonoverlapping(res.as_ptr() as *const u8, buf as *mut u8, res.len() * std::mem::size_of::<T>());
+    std::ptr::write_unaligned(buf.add(res.len()), T::from(0u8));
     res.len() as i32
 }
 

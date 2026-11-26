@@ -11,22 +11,24 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **101** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 74 |
-| `failing` (honest-failing macro exports) | 12 |
+| Total remaining stub sites | **42** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 26 |
+| `failing` (honest-failing macro exports) | 1 |
 | `middleware_stub` (third-party/engine middleware fallbacks) | 15 |
-| DLLs with remaining stubs | 21 |
+| DLLs with remaining stubs | 8 |
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
 | File | Summary |
 |---|---|
 | [`com-audio-net.md`](stub-backlog.d/com-audio-net.md) | Stubs 7: COM/OLE, Audio, Winsock, libcurl and DbgHelp (`stubs/com-audio-net`) |
+| [`crypto-certs.md`](stub-backlog.d/crypto-certs.md) | Stubs 4: crypt32, Schannel and WinVerifyTrust |
 | [`crypto-cng-capi.md`](stub-backlog.d/crypto-cng-capi.md) | Stub & API Gap Backlog — `stubs/crypto-cng-capi` |
 | [`graphics.md`](stub-backlog.d/graphics.md) | Stub Backlog — D3D11, D3D12 and DXGI (`stubs/graphics`) |
 | [`guest-corpus-bench.md`](stub-backlog.d/guest-corpus-bench.md) | Stub & API Gap Backlog — `toolkit/guest-corpus-bench` |
 | [`kernel-core.md`](stub-backlog.d/kernel-core.md) | Stub Backlog — `stubs/kernel-core` |
 | [`middleware.md`](stub-backlog.d/middleware.md) | Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions) |
+| [`window-input-ui.md`](stub-backlog.d/window-input-ui.md) | Stub Backlog — Window, Input, UI & Text DLLs (`stubs/window-input-ui`) |
 
 ### From `docs/stub-backlog.d/com-audio-net.md`
 
@@ -84,6 +86,68 @@ Scope: **37** stub sites across 7 DLLs (`ole32.dll`, `dbghelp.dll`, `mmdevapi.dl
 ## Leftovers
 
 None — **0** remaining stub sites in scope.
+
+### From `docs/stub-backlog.d/crypto-certs.md`
+
+# Stubs 4: crypt32, Schannel and WinVerifyTrust
+
+Scope: 27 stub sites across `crates/win32-rt/src/misc/crypt32.rs`, `crypt32/asn1.rs`, `crypt32/chain.rs`, `secur32/schannel.rs`, and `wintrust.rs`.
+
+- **Sites in scope before**: 27 (12 `failing!` + 15 `stub!`)
+- **Sites in scope after**: 1 (1 `failing!`, 0 `stub!`)
+- **Disposition**: 24 made real, 2 native-unsupported (matching Windows without TPM hardware), 1 honest leftover (blocked on parallel branch `stubs/crypto-cng-capi`)
+
+## DPAPI Key Derivation Audit Note
+
+The earlier review flag about DPAPI deriving keys from public constants in `crates/win32-rt/src/misc/crypt32/asn1.rs` was verified to be **already resolved on `origin/main`**: `dpapi_host_secret()` generates a 32-byte random key via `arc4random_buf`, atomically persists it with `0o600` permissions in per-user (`dpapi_user_<user>.key`) or machine (`dpapi_machine.key`) state files, never falls back to hardcoded/public constants, and is covered by `dpapi_uses_0600_host_secrets_and_isolates_secrets_and_machine_scope`.
+
+---
+
+## Remaining Sites in Scope (1)
+
+| DLL!API | Kind | Why Not Implemented Yet | Next Step |
+|---|---|---|---|
+| `crypt32.dll!CryptImportPublicKeyInfo` | `failing` | Returns a CryptoAPI `HCRYPTKEY` handle associated with an `advapi32.dll` `HCRYPTPROV`, which must be usable by `advapi32.dll!CryptDestroyKey`, `CryptVerifySignature`, `CryptEncrypt`, and `CryptExportKey`. In `crates/win32-rt/src/advapi32.rs` (owned by parallel branch `stubs/crypto-cng-capi`, outside this branch's scope), `CryptImportKey`/`CryptDestroyKey`/`CryptExportKey` are currently 0-arg `failing!` macros. The `CERT_PUBLIC_KEY_INFO` -> CAPI `PUBLICKEYBLOB` (`RSA1` `BLOBHEADER` + `RSAPUBKEY` + little-endian modulus) converter (`crypt32::decode::spki_to_capi_public_key_blob`) is already implemented and unit-tested. | Once `stubs/crypto-cng-capi` lands real `advapi32::CryptImportKey`, replace the `failing!` line in `crates/win32-rt/src/misc/crypt32.rs` with a call to `decode::spki_to_capi_public_key_blob` followed by `advapi32::CryptImportKey(h_crypt_prov, blob.as_ptr(), blob.len() as u32, 0, 0, ph_key)`. |
+
+---
+
+## Native-Unsupported (Matches Windows Without the Feature) (2)
+
+| DLL!API | Return Value / Error | Capability Absent on Apple Silicon | Microsoft Learn Reference |
+|---|---|---|---|
+| `wintrust.dll!Tbsip_Context_Close` | `TBS_E_INVALID_CONTEXT` (`0x80284004`) | Apple Silicon Macs have no TCG TPM 1.2/2.0 hardware device and no Windows TPM Base Services (TBS) daemon. Because `Tbsi_Context_Create` returns `TBS_E_TPM_NOT_FOUND` and never issues a valid `TBS_HCONTEXT`, any handle passed to `Tbsip_Context_Close` is invalid, matching Windows on a machine without a TPM. | [Tbsip_Context_Close (tbs.h)](https://learn.microsoft.com/en-us/windows/win32/api/tbs/nf-tbs-tbsip_context_close) |
+| `wintrust.dll!Tbsip_Submit_Command` | `TBS_E_TPM_NOT_FOUND` (`0x8028400F`, zeroes `*pResultBufSize`) | No TPM device is present to receive TPM command buffers; matches Windows TBS when no compatible TPM is found on the host. | [Tbsip_Submit_Command (tbs.h)](https://learn.microsoft.com/en-us/windows/win32/api/tbs/nf-tbs-tbsip_submit_command) |
+
+---
+
+## Sites Made Real (24)
+
+| DLL!API | File | Implementation Summary |
+|---|---|---|
+| `crypt32.dll!CryptFindOIDInfo` | `misc/crypt32/decode.rs` | Win64 ABI-exact 64-byte static `CRYPT_OID_INFO` catalog supporting all 6 key types (`OID`, `NAME`, `ALGID`, `SIGN`, `CNG_ALGID`, `CNG_SIGN`) and all 10 OID groups. |
+| `crypt32.dll!CertStrToNameA` | `misc/crypt32/decode.rs` | RFC 1779/2253 X.500 DN string parser (`CN`, `O`, `OU`, `C`, `L`, `S`/`ST`, `E`, `DC`, `SN`, `SERIALNUMBER`, dotted OIDs, quotes/escapes, `+` multi-valued RDNs, `#hex` DER, `CERT_NAME_STR_REVERSE_FLAG`, `ppszError` + `CRYPT_E_INVALID_X500_STRING`). |
+| `crypt32.dll!CertStrToNameW` | `misc/crypt32/decode.rs` | UTF-16 counterpart to `CertStrToNameA` with UTF-16 character error offset calculation. |
+| `crypt32.dll!CryptDecodeObject` | `misc/crypt32/decode.rs` | Single-buffer relocating `DecodeArena` decoder for 25+ X.509/PKCS#7 struct types and OID aliases with Windows size-query and `ERROR_MORE_DATA` semantics. |
+| `crypt32.dll!CryptDecodeObjectEx` | `misc/crypt32/decode.rs` | Extended decoder adding `CRYPT_DECODE_ALLOC_FLAG` (`LocalAlloc`), `CRYPT_DECODE_NOCOPY_FLAG`, `CRYPT_DECODE_SHARE_OID_STRING_FLAG`, and `ERROR_FILE_NOT_FOUND` for unknown struct types. |
+| `crypt32.dll!CryptEncodeObjectEx` (`encode_x509_object`) | `misc/crypt32/asn1.rs` | Added `X509_ENUMERATED`, `PKCS_UTC_TIME`, `X509_ALGORITHM_IDENTIFIER`, `PKCS_CONTENT_INFO`, `PKCS_ATTRIBUTE`, `PKCS_ATTRIBUTES`, `X509_AUTHORITY_KEY_ID2` (`2.5.29.35`), `CNG_RSA_PUBLIC_KEY_BLOB`, `PKCS_7_ASN_ENCODING`, and `ERROR_FILE_NOT_FOUND` for unknown struct types. |
+| `crypt32.dll!CryptStringToBinaryA/W` (`crypt_string_to_binary_impl`) | `misc/crypt32/asn1.rs` | Added `CRYPT_STRING_PERCENTESCAPE` (`0x0E`) decoder and returns `ERROR_INVALID_DATA` for unsupported flag values. |
+| `crypt32.dll!CertGetCertificateContextProperty` | `misc/crypt32/store.rs` | Real computed and stored properties (`SHA1_HASH`, `MD5_HASH`, `SHA256_HASH`, `SIGNATURE_HASH`, `KEY_IDENTIFIER`, `SUBJECT_PUBLIC_KEY_MD5_HASH`, `ISSUER_PUBLIC_KEY_MD5_HASH`, `SUBJECT_NAME_MD5_HASH`, `ENHKEY_USAGE`, `PUBKEY_ALG_PARA`, `ACCESS_STATE`, `KEY_SPEC`, `KEY_PROV_INFO`, `FRIENDLY_NAME`, custom properties) plus `CertSetCertificateContextProperty`. |
+| `crypt32.dll!CertFreeCRLContext` | `misc/crypt32/store.rs` | Real refcounted `CRL_CONTEXT` registry with `CertCreateCRLContext`, `CertDuplicateCRLContext`, and `CertFreeCRLContext` (returns `TRUE` on null/unregistered per Windows). |
+| `crypt32.dll!CertFreeCTLContext` | `misc/crypt32/store.rs` | Real refcounted `CTL_CONTEXT` registry with `CertCreateCTLContext`, `CertDuplicateCTLContext`, and `CertFreeCTLContext`. |
+| `crypt32.dll!CryptMsgOpenToDecode` | `misc/crypt32/pkcs.rs` | Real PKCS#7/CMS decode message handle creation (attached & detached `CMSG_DETACHED_FLAG`). |
+| `crypt32.dll!CryptMsgUpdate` | `misc/crypt32/pkcs.rs` | Streaming/chunked DER `ContentInfo` accumulation and finalization with `CryptMsgGetParam` support (`TYPE`, `VERSION`, `CONTENT`, `BARE_CONTENT`, `INNER_CONTENT_TYPE`, `ENCODED_MESSAGE`, `SIGNER_COUNT`, `SIGNER_INFO`, `SIGNER_CERT_INFO`, `CERT_COUNT`, `CERT`, `SIGNER_AUTH_ATTR`, `SIGNER_UNAUTH_ATTR`). |
+| `crypt32.dll!CryptVerifyMessageSignature` | `misc/crypt32/pkcs.rs` | Real RSA PKCS#1 v1.5, ECDSA, and Ed25519 signature verification over `signedAttrs` (SET-retagged `0x31` + `messageDigest` match) or direct content, with payload decoding and signer `PCCERT_CONTEXT` output. |
+| `crypt32.dll!PFXImportCertStore` | `misc/crypt32/pkcs.rs` | Real RFC 7292 PKCS#12 parser backed by Apple CommonCrypto (`CCCrypt`, `CCKeyDerivationPBKDF`, `Digest::hmac`) supporting PBES2 (PBKDF2 + AES-128/192/256-CBC, 3DES-CBC) and legacy PBES1 (SHA1-3DES-CBC, SHA1-RC2-128/40-CBC), MAC verification (`ERROR_INVALID_PASSWORD`), `friendlyName`/`localKeyId` attributes, and PKCS#8 private key attachment. |
+| `crypt32.dll!CertVerifySubjectCertificateContext` | `misc/crypt32/chain.rs` | Real RSA/ECDSA/Ed25519 signature verification against issuer SPKI, time validity check (`NotBefore`/`NotAfter`), and revocation/flag masking semantics. |
+| `crypt32.dll!CertFreeCertificateChainEngine` | `misc/crypt32/chain.rs` | Proper handling of `NULL`, `HCCE_LOCAL_MACHINE` (`1`), and custom engine handles without stub warning. |
+| `crypt32.dll!CertFreeCertificateChain` | `misc/crypt32/chain.rs` | Refcounted chain handles with `CertDuplicateCertificateChain` and safe cleanup. |
+| `crypt32.dll!CertVerifyCertificateChainPolicy` | `misc/crypt32/chain.rs` | Added Apple `Security.framework` macOS root store integration (`SecTrustCopyAnchorCertificates` + `SecTrustSettingsCopyCertificates` + `SecTrustEvaluateWithError`) and implemented policies `BASIC_CONSTRAINTS` (5), `NT_AUTH` (6), `MICROSOFT_ROOT` (7), `EV` (8), `SSL_F12` (9), `SSL_HPKP_HEADER` (10), `THIRD_PARTY_ROOT` (11), `SSL_KEY_PIN` (12), returning `ERROR_FILE_NOT_FOUND` for unknown policy OIDs. |
+| `secur32.dll!AcquireCredentialsHandleA/W` | `misc/secur32/schannel.rs` | Real inbound (`SECPKG_CRED_INBOUND`) and bidirectional (`SECPKG_CRED_BOTH`) Schannel credentials reading cert chain + PKCS#8 private key from `SCHANNEL_CRED`/`SCH_CREDENTIALS` `paCred`, returning `SEC_E_NO_CREDENTIALS` if missing, paired with `AcceptSecurityContext` (`rustls::ServerConnection`). |
+| `secur32.dll!ApplyControlToken` | `misc/secur32/schannel.rs` | Real `SCHANNEL_SHUTDOWN` (1), `SCHANNEL_ALERT` (2, warning and fatal), and `SCHANNEL_SESSION` (3, enable/disable reconnects); returns `SEC_E_INVALID_TOKEN` for unknown token types. |
+| `secur32.dll!QueryContextAttributesA/W` | `misc/secur32/schannel.rs` | Added `LIFESPAN`, `KEY_INFO`, `AUTHORITY`, `PROTO_INFO`, `NEGOTIATION_INFO`, `FLAGS`, `UNIQUE_BINDINGS`/`ENDPOINT_BINDINGS` (RFC 5929 `tls-server-end-point:` SHA-256), `CLIENT_SPECIFIED_TARGET`, `LOCAL_CERT_CONTEXT`, `ROOT_STORE`, `SUPPORTED_ALGS`, `CIPHER_STRENGTHS`, `SUPPORTED_PROTOCOLS`, `EAP_KEY_BLOCK` (`export_keying_material`), `SESSION_INFO`, `REMOTE_CERT_CHAIN`, `LOCAL_CERT_CHAIN`. |
+| `secur32.dll!QueryCredentialsAttributesA/W` | `misc/secur32/schannel.rs` | Added `SUPPORTED_ALGS`, `CIPHER_STRENGTHS`, and server protocol flags in `SUPPORTED_PROTOCOLS`. |
+| `wintrust.dll!WinVerifyTrust` (action dispatch) | `misc/wintrust.rs` | Implemented all 6 standard action GUIDs (`GENERIC_VERIFY_V2`, `TRUSTPROVIDER_TEST`, `GENERIC_CERT_VERIFY`, `GENERIC_CHAIN_VERIFY`, `DRIVER_ACTION_VERIFY`, `HTTPSPROV_ACTION`), returning `TRUST_E_ACTION_UNKNOWN` for unknown GUIDs. |
+| `wintrust.dll!WinVerifyTrust` (union choice) | `misc/wintrust.rs` | Implemented all 5 `WINTRUST_DATA.dwUnionChoice` modes (`FILE`, `CATALOG`, `BLOB`, `SIGNER`, `CERT`) backed by real Authenticode/PKCS#7/cert-chain verification, returning `TRUST_E_SUBJECT_FORM_UNKNOWN` for invalid choices. |
 
 ### From `docs/stub-backlog.d/crypto-cng-capi.md`
 
@@ -360,6 +424,76 @@ Per Rule 4, games shipping these proprietary DLLs execute their real Windows x86
 | `nri.dll!core_cmd_set_sample_positions` | `middleware_stub` | `crates/win32-rt/src/misc/nri/cmdlist.rs` | `ID3D12GraphicsCommandList1::SetSamplePositions` is not yet wired to Metal's `MTLRenderPassDescriptor::setSamplePositions:count:` (`D3D12_OPTIONS2.ProgrammableSamplePositionsTier` currently reports `0`). | Wire `SetSamplePositions` in `d3d12-metal` (`MTL4RenderPassDescriptor` / `MTLRenderPassDescriptor` programmable sample positions on Apple GPU family 7+) and `win32-rt/src/d3d12`, then forward `CmdSetSamplePositions` to it. |
 | `nri.dll!core_create_query_pool` | `middleware_stub` | `crates/win32-rt/src/misc/nri/device.rs` | `QueryType::PIPELINE_STATISTICS` (`2`) and `QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE` (`3`) return `NRI_RESULT_UNSUPPORTED` (`TIMESTAMP` and `OCCLUSION` are implemented). | Back `ACCELERATION_STRUCTURE_COMPACTED_SIZE` with a readback buffer + `EmitRaytracingAccelerationStructurePostbuildInfo` (`COMPACTED_SIZE`), and wire `PIPELINE_STATISTICS` once `d3d12-metal` exposes `MTL4CounterHeap` pipeline-statistics queries. |
 
+### From `docs/stub-backlog.d/window-input-ui.md`
+
+# Stub Backlog — Window, Input, UI & Text DLLs (`stubs/window-input-ui`)
+
+Scope: 34 `stub!` sites in `db/stub_inventory.tsv` across `user32`, `dinput8`, `xinput1_4`, `gameinput`, `hid`, `uxtheme`, `msctf`, `dwrite`, `d2d1`, `gdi32`, `shell32`, and `powrprof`, plus 2 `user32` guest-corpus gaps (`wsprintfA` varargs and `wsprintfW` export, plus `NONCLIENTMETRICS` layout verification).
+
+## Summary
+
+| Category | Count |
+|---|---|
+| `stub!` sites in scope (before) | 34 |
+| `stub!` sites in scope (after) | 1 |
+| Removed — made real (incl. 2 `wsprintf` guest-corpus gaps) | 30 (28 `stub!` sites + `wsprintfA`/`wsprintfW`) |
+| Removed — native-unsupported (matches Windows without feature) | 5 |
+| Remaining honest leftovers | 1 |
+
+---
+
+## Removed Sites (Made Real)
+
+| DLL!API | File | What was implemented |
+|---|---|---|
+| `user32.dll!LoadCursorA/W` | `crates/win32-rt/src/user32/cursor.rs`, `macos/appkit.rs` | Parses PE `RT_GROUP_CURSOR` (12) + `RT_CURSOR` (1) resources with 4-byte `(xHotSpot, yHotSpot)` prefix and DIB/PNG decoding; renders custom `Shape::Custom` cursors natively via CoreGraphics + `NSImage` + `NSCursor`. |
+| `user32.dll!CreateCursor` | `crates/win32-rt/src/user32/cursor.rs`, `macos/appkit.rs` | Decodes 1bpp AND/XOR monochrome cursor masks with hotspot into RGBA/BGRA `IconData` and custom `NSCursor`. |
+| `user32.dll!DefWindowProcA/W` (`WM_SYSCOMMAND`) | `crates/win32-rt/src/user32/defproc.rs` | Handles all documented `SC_*` codes (`SC_HOTKEY`, `SC_NEXTWINDOW`/`SC_PREVWINDOW`, standard WindowServer-owned no-ops) and ignores unknown codes as Windows does. |
+| `user32.dll!RegisterRawInputDevices` (`RIDEV_NOLEGACY`) | `crates/win32-rt/src/user32/input.rs` | Enforces `RIDEV_NOLEGACY` for mouse `(1,2)` and keyboard `(1,6)` (suppressing legacy `WM_MOUSE*`/`WM_KEY*` while continuing to deliver `WM_INPUT` and update async key state); rejects `RIDEV_NOLEGACY` on non-legacy usages with `ERROR_INVALID_PARAMETER`. |
+| `user32.dll!ReplyMessage` | `crates/win32-rt/src/user32/message.rs` | Unblocks waiting cross-thread `SendMessage` callers early via thread-local reply stack and RAII `Drop` guard. |
+| `user32.dll!GetSystemMetrics` / `GetSystemMetricsForDpi` | `crates/win32-rt/src/user32/misc.rs` | Complete `SM_*` table with DPI scaling; returns `0` for undefined indices matching Windows. |
+| `user32.dll!SystemParametersInfoA/W/ForDpi` | `crates/win32-rt/src/user32/misc.rs` | Persistent `SpiState` across all standard SPI getters/setters, DPI-scaled `NONCLIENTMETRICS` with compile-time layout assertions (`344B`/`504B`), and `FALSE` + `ERROR_INVALID_PARAMETER` for unknown actions. |
+| `user32.dll!GetUserObjectInformationA/W` (handles & indices) | `crates/win32-rt/src/user32/misc.rs` | Added desktop handle APIs (`GetThreadDesktop`, `OpenInputDesktop`, `OpenDesktopA/W`, `CloseDesktop`, `CloseWindowStation`) and all 6 `UOI_*` queries (`UOI_FLAGS`, `UOI_NAME`, `UOI_TYPE`, `UOI_USER_SID`, `UOI_HEAPSIZE`, `UOI_IO`). |
+| `user32.dll!RegisterHotKey` / `UnregisterHotKey` | `crates/win32-rt/src/user32/misc.rs`, `input.rs`, `window.rs` | Per-thread/per-HWND global hotkey table with duplicate detection (`ERROR_HOTKEY_ALREADY_REGISTERED`), `WM_HOTKEY` dispatch on keydown, and automatic cleanup on window destruction. |
+| `user32.dll!wsprintfA` / `wsprintfW` | `crates/win32-rt/src/user32/misc.rs`, `ucrt/printf.rs` | Column-0 `win64_varargs_thunk!` varargs formatting backed by `ucrt::printf` with Windows 1024-char cap (1023 + NUL) and `LEGACY_WIDE_SPECIFIERS` for `wsprintfW`; un-ignored `guest_user32_wsprintf_backlog`. |
+| `user32.dll!DisplayConfigGetDeviceInfo` | `crates/win32-rt/src/user32/monitor.rs` | Implemented remaining CCD GET packets (`GET_TARGET_BASE_TYPE`, `GET_SUPPORT_VIRTUAL_RESOLUTION`, `GET_MONITOR_SPECIALIZATION`, `GET_ADVANCED_COLOR_INFO_2`, `GET_DPI_SCALE`); unknown types return `ERROR_INVALID_PARAMETER`. |
+| `dinput8.dll!IDirectInputDevice8::GetProperty` / `SetProperty` | `crates/win32-rt/src/misc/dinput8.rs` | Implemented `DIPROP_FFGAIN`, `DIPROP_FFLOAD`, `DIPROP_AUTOCENTER`, `DIPROP_CALIBRATIONMODE`, `DIPROP_CALIBRATION`, `DIPROP_GUIDANDPATH` (Xbox `IG_` path), `DIPROP_GETPORTDISPLAYNAME`, `DIPROP_KEYNAME`, `DIPROP_APPDATA` (wired to `DIDEVICEOBJECTDATA.uAppData`), `DIPROP_TYPENAME`, `DIPROP_USERNAME`. |
+| `xinput1_4.dll!XInputGetKeystroke` | `crates/win32-rt/src/misc/xinput1_4.rs` | Real per-slot and `XUSER_INDEX_ANY` (`0xFF`) `XINPUT_KEYSTROKE` ring queue populated on button, trigger, and thumbstick edge transitions. |
+| `gameinput.dll!IGameInput::GetTemporalReading` | `crates/win32-rt/src/misc/gameinput.rs` | Searches device reading history for the newest snapshot with `timestamp_us <= timestamp`, returning `GAMEINPUT_E_READING_NOT_FOUND` when none precedes it. |
+| `hid.dll!HidD_SetNumInputBuffers` | `crates/win32-rt/src/misc/hid.rs` | Per-handle input report ring-buffer capacity (`2..=512`), enforced on report delivery, trimmed on shrink, and returned by `HidD_GetNumInputBuffers`. |
+| `uxtheme.dll!DrawThemeBackground` | `crates/win32-rt/src/misc/uxtheme.rs` | Matches Windows Classic / unthemed desktop (`IsThemeActive() == FALSE`, zero open `HTHEME` handles): `ValidateHandle` rejects any unopened handle with `E_HANDLE`. |
+| `uxtheme.dll!TaskDialogIndirect` | `crates/win32-rt/src/misc/uxtheme.rs` | Parses 1-byte-packed x64 `TASKDIALOGCONFIG` (160B) and `TASKDIALOG_BUTTON` (12B), resolves `IS_INTRESOURCE` strings via `LoadStringW`, supports custom/common buttons, radio defaults, verification flag, and callback notifications, and displays via native `NSAlert`/`UIAlertController` (with honest headless handling). |
+| `msctf.dll!ITfContext::TrackProperties` | `crates/win32-rt/src/misc/msctf/{context,range,abi}.rs` | Returns a composite `ITfReadOnlyProperty` whose `GetValue` yields `VT_UNKNOWN` -> `IEnumTfPropertyValue` enumerating `TF_PROPERTYVAL` entries for all tracked properties. |
+| `dwrite.dll!IDWriteFactory::CreateCustomFontFileReference` | `crates/win32-rt/src/misc/dwrite{,.rs,/font.rs,/sfnt.rs}` | Invokes `IDWriteFontFileLoader::CreateStreamFromKey` + `IDWriteFontFileStream::{GetFileSize, ReadFileFragment, ReleaseFileFragment}` to build a memory-backed SFNT `IDWriteFontFile` usable with `Analyze` and `CreateFontFace`. |
+| `dwrite.dll!IDWriteFactory::CreateCustomFontCollection` | `crates/win32-rt/src/misc/dwrite{,.rs,/font.rs}` | Invokes `IDWriteFontCollectionLoader::CreateEnumeratorFromKey` + `IDWriteFontFileEnumerator::{MoveNext, GetCurrentFontFile}` to assemble a real `IDWriteFontCollection`. |
+| `dwrite.dll!IDWriteFactory::CreateTextAnalyzer` | `crates/win32-rt/src/misc/dwrite/analysis.rs` | Full 10-slot `IDWriteTextAnalyzer` (`AnalyzeScript`, `AnalyzeBidi`, `AnalyzeNumberSubstitution`, `AnalyzeLineBreakpoints`, `GetGlyphs`, `GetGlyphPlacements`, `GetGdiCompatibleGlyphPlacements`). |
+| `dwrite.dll!IDWriteFactory::CreateGlyphRunAnalysis` | `crates/win32-rt/src/misc/dwrite/analysis.rs` | Full 6-slot `IDWriteGlyphRunAnalysis` (`GetAlphaTextureBounds`, `CreateAlphaTexture` for `ALIASED_1x1` and `CLEARTYPE_3x1`, `GetAlphaBlendParams`). |
+| `d2d1.dll!ID2D1Geometry::Tessellate` | `crates/win32-rt/src/misc/d2d1/{geometry,abi}.rs` | Flattens geometry with transform/tolerance, triangulates convex and concave filled subpaths via ear-clipping, and emits `D2D1_TRIANGLE` arrays to `ID2D1TessellationSink::AddTriangles`. |
+| `gdi32.dll!GetDeviceCaps` | `crates/win32-rt/src/misc/gdi32.rs` | Covers all standard `wingdi.h` capability indices, honoring selected bitmap dimensions/depth on memory DCs and returning `0` for unknown indices. |
+| `powrprof.dll!CallNtPowerInformation` | `crates/win32-rt/src/misc/powrprof.rs` | Implements standard read-only `POWER_INFORMATION_LEVEL`s (including `LastWakeTime`/`LastSleepTime` via macOS `sysctlbyname`), returns `STATUS_ACCESS_DENIED` for privileged admin levels and `STATUS_INVALID_PARAMETER` for unknown levels. |
+| `powrprof.dll!PowerRegisterSuspendResumeNotification` | `crates/win32-rt/src/misc/powrprof.rs` | Arms a dedicated background macOS IOKit `IORegisterForSystemPower` `CFRunLoop` delivering `PBT_APMSUSPEND`/`PBT_APMRESUME*` to `DEVICE_NOTIFY_CALLBACK` and `WM_POWERBROADCAST` recipients. |
+| `powrprof.dll!PowerSettingRegisterNotification` | `crates/win32-rt/src/misc/powrprof.rs` | Arms macOS IOKit `IOPSNotificationCreateRunLoopSource`, delivers the immediate initial `PBT_POWERSETTINGCHANGE` value upon registration, and dispatches `POWERBROADCAST_SETTING` packets on power-source/battery changes. |
+
+---
+
+## Native-unsupported (matches Windows without the feature)
+
+| DLL!API | File | Behavior Returned | Windows Documentation Citation |
+|---|---|---|---|
+| `user32.dll!MessageBoxA/W` (headless multi-button branch) | `crates/win32-rt/src/user32/misc.rs` | Returns `0` with `SetLastError(ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION)` (`1459`) when no interactive desktop session is active (interactive macOS/iOS displays a real `NSAlert`/`UIAlertController`). | Microsoft Learn — [MessageBox function](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-messagebox) & Windows Services / non-interactive window station behavior (`ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION`, `1459`). |
+| `user32.dll!DisplayConfigSetDeviceInfo` | `crates/win32-rt/src/user32/monitor.rs` | Validates packet pointer/size/type (`ERROR_INVALID_PARAMETER`) and returns `ERROR_NOT_SUPPORTED` (`50`) for valid WDDM/CCD `SET_*` packets (`5, 8, 10, 13, 16`), because Apple Silicon macOS has no Windows WDDM/CCD display driver. | Microsoft Learn — [DisplayConfigSetDeviceInfo function](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-displayconfigsetdeviceinfo) (`ERROR_NOT_SUPPORTED` when the display driver/system does not support the requested configuration change). |
+| `dinput8.dll!IDirectInputDevice8::RunControlPanel` | `crates/win32-rt/src/misc/dinput8.rs` | Validates `dwFlags == 0` (`DIERR_INVALIDPARAM`) and returns `DIERR_UNSUPPORTED` (`E_NOTIMPL`), because Windows `joy.cpl` does not exist on macOS/iOS. | Microsoft Learn — [IDirectInputDevice8::RunControlPanel](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee417909(v=vs.85)) (optional control-panel UI; returns `DIERR_UNSUPPORTED` when unsupported). |
+| `dinput8.dll!IDirectInput8::RunControlPanel` | `crates/win32-rt/src/misc/dinput8.rs` | Validates `dwFlags == 0` (`DIERR_INVALIDPARAM`) and returns `DIERR_UNSUPPORTED` (`E_NOTIMPL`), because Windows `joy.cpl` does not exist on macOS/iOS. | Microsoft Learn — [IDirectInput8::RunControlPanel](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee417816(v=vs.85)) (returns `DIERR_UNSUPPORTED` when control panel launch is unsupported). |
+| `dinput8.dll!IDirectInput8::ConfigureDevices` | `crates/win32-rt/src/misc/dinput8.rs` | Returns `DIERR_UNSUPPORTED` (`E_NOTIMPL`), matching Windows Vista and all later Windows releases where the DirectInput action-mapper UI was removed. | Microsoft Learn — [IDirectInput8::ConfigureDevices](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee417799(v=vs.85)) (deprecated and unsupported starting with Windows Vista). |
+
+---
+
+## Remaining Honest Leftovers
+
+| DLL!API | File | What works now | What is still missing & next step |
+|---|---|---|---|
+| `shell32.dll!SHCreateItemFromParsingName` | `crates/win32-rt/src/misc/shell32.rs` | Local VFS paths (including `\\?\` extended paths), `file:///` URLs (percent-decoded), `shell:<KnownFolderName>`, and filesystem-backed `::{<FOLDERID>}` / `shell:::{<FOLDERID>}` parsing names now resolve to real `IShellItem` COM objects. | Non-filesystem virtual Explorer shell namespaces (e.g. `shell:::{20D04FE0-...}` This PC, `::{645FF040-...}` Recycle Bin), `ms-settings:` URIs, `http://` URLs, and SMB/UNC network shares (`\\server\share\...`) still hit `stub!` and return `E_NOTIMPL`. Next step: implement a virtual `IShellFolder`/`IShellItem` namespace tree for `CLSID_MyComputer` / `CLSID_RecycleBin` (backed by mounted drives / `~/.Trash`) and an SMB/UNC resolver if a title requests them. |
+
 ## Proprietary & Vendor Middleware (Legal / Architectural Limits)
 
 These modules wrap proprietary third-party SDKs or GPU-vendor-specific extensions. Where a game ships its own Windows x86-64 PE DLL (e.g., Oodle `oo2core_*_win64.dll`, PhysX 4/5 `PhysX_64.dll`, `zstd.dll`), `port-runner` executes the real shipping PE through the ARM64 JIT rather than overriding it.
@@ -371,54 +505,14 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | DLL | Count | Reason | Next Step |
 |---|---:|---|---|
-| `crypt32.dll` | 19 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
 | `kernel32.dll` | 15 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
-| `user32.dll` | 13 | Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature | Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation. |
 | `physx3common_x64.dll` | 12 | PhysX 3.4 geometry/mesh query path without cooked mesh payload | Prefer shipping PhysX3*.dll under ARM64 JIT, or decode cooked BVH/triangle mesh payloads in physx3common_x64. |
 | `ucrtbase.dll` | 6 | Uncommon CRT locale, multibyte codepage, UTF-16 stream encoding, or interactive console/shell call | Add UTF-16 FILE stream translation and locale/codepage tables; keep system() safely sandboxed/refused. |
-| `dinput8.dll` | 5 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `d3d11.dll` | 4 | Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop) | Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them. |
-| `dwrite.dll` | 4 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `secur32.dll` | 4 | Server-side Schannel (INBOUND) or uncommon context/credential attribute | Add server-side TLS or missing SECPKG_ATTR_* queries if a game hosts local TLS sockets. |
-| `wintrust.dll` | 4 | Unimplemented WinVerifyTrust action/choice or TPM Base Services (TBS) | Keep TPM TBS returning TBS_E_TPM_NOT_FOUND honestly; extend WinVerifyTrust for additional catalog/blob choices as needed. |
-| `powrprof.dll` | 3 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `nri.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `uxtheme.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `d2d1.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
+| `crypt32.dll` | 1 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
 | `directml.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `gameinput.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `gdi32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `hid.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `msctf.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `shell32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `xinput1_4.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-
-### `crypt32.dll` (19)
-
-- **Reason:** Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property
-- **Next step:** Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `CertFreeCRLContext` | `stub` | `crates/win32-rt/src/misc/crypt32.rs:355` | `"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"` |
-| `CertFreeCTLContext` | `stub` | `crates/win32-rt/src/misc/crypt32.rs:362` | `"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"` |
-| `CertGetCertificateContextProperty` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertStrToNameA` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertStrToNameW` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertVerifySubjectCertificateContext` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDecodeObject` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDecodeObjectEx` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptFindOIDInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:42` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `CryptImportPublicKeyInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptMsgOpenToDecode` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:42` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `CryptMsgUpdate` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptVerifyMessageSignature` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `PFXImportCertStore` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:42` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `cert_free_certificate_chain_engine_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:593` | `"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"` |
-| `cert_free_certificate_chain_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:787` | `"CertFreeCertificateChain({chain:p}): foreign chain ignored"` |
-| `cert_verify_certificate_chain_policy_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:807` | `"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"` |
-| `crypt_string_to_binary_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:1276` | `"CryptStringToBinary unsupported flags {flags:#x}"` |
-| `encode_x509_object` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:941` | `"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"` |
 
 ### `kernel32.dll` (15)
 
@@ -442,27 +536,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2739` | `"MoveFileExW delete-on-reboot ignored"` |
 | `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2418` | `"SetFileInformationByHandle class {class} not supported"` |
 | `get_locale_info` | `stub` | `crates/win32-rt/src/kernel32/string.rs:865` | `"GetLocaleInfo LCTYPE {lctype:#x} unknown"` |
-
-### `user32.dll` (13)
-
-- **Reason:** Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature
-- **Next step:** Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `CreateCursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:1024` | `"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"` |
-| `DisplayConfigGetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:684` | `"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
-| `DisplayConfigSetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:692` | `"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
-| `GetSystemMetrics` | `stub` | `crates/win32-rt/src/user32/misc.rs:239` | `"GetSystemMetrics({index}) -> 0"` |
-| `RegisterHotKey` | `stub` | `crates/win32-rt/src/user32/misc.rs:770` | `"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize` |
-| `RegisterRawInputDevices` | `stub` | `crates/win32-rt/src/user32/input.rs:1442` | `"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"` |
-| `ReplyMessage` | `stub` | `crates/win32-rt/src/user32/message.rs:897` | `"ReplyMessage: early reply not supported"` |
-| `def_window_proc` | `stub` | `crates/win32-rt/src/user32/defproc.rs:154` | `"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"` |
-| `load_cursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:87` | `"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"` |
-| `message_box` | `stub` | `crates/win32-rt/src/user32/misc.rs:1887` | `"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"` |
-| `spi` | `stub` | `crates/win32-rt/src/user32/misc.rs:576` | `"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }` |
-| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:611` | `"GetUserObjectInformation on handle {h:#x} (only the window station is known)"` |
-| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:633` | `"GetUserObjectInformation index {index} not supported"` |
 
 ### `physx3common_x64.dll` (12)
 
@@ -498,19 +571,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `setlocale` | `stub` | `crates/win32-rt/src/ucrt/locale.rs:64` | `"setlocale({cat}, {n:?}): locale not available"` |
 | `system` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:965` | `"system({:?}) refused", from_ansi(cmd)` |
 
-### `dinput8.dll` (5)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `configure_devices` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1862` | `"IDirectInput8::ConfigureDevices -> DIERR_UNSUPPORTED"` |
-| `dev_get_property` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1239` | `"IDirectInputDevice8::GetProperty({other:#x}) -> DIERR_UNSUPPORTED"` |
-| `dev_run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1557` | `"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"` |
-| `dev_set_property` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1331` | `"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"` |
-| `run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1822` | `"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"` |
-
 ### `d3d11.dll` (4)
 
 - **Reason:** Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop)
@@ -523,53 +583,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `draw_auto` | `stub` | `crates/win32-rt/src/d3d11/context.rs:2913` | `"ID3D11DeviceContext::DrawAuto not implemented"` |
 | `get_data` | `stub` | `crates/win32-rt/src/d3d11/context.rs:3094` | `"GetData(PIPELINE_STATISTICS): GPU-side counters (PS/Clipper/GSPrimitives/DS/indirect) unavailable on Apple Silicon"` |
 
-### `dwrite.dll` (4)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `fac_create_custom_font_collection` | `stub` | `crates/win32-rt/src/misc/dwrite.rs:76` | `"IDWriteFactory::CreateCustomFontCollection -> E_NOTIMPL"` |
-| `fac_create_custom_font_file_reference` | `stub` | `crates/win32-rt/src/misc/dwrite.rs:119` | `"IDWriteFactory::CreateCustomFontFileReference -> E_NOTIMPL"` |
-| `fac_create_glyph_run_analysis` | `stub` | `crates/win32-rt/src/misc/dwrite.rs:365` | `"IDWriteFactory::CreateGlyphRunAnalysis -> E_NOTIMPL"` |
-| `fac_create_text_analyzer` | `stub` | `crates/win32-rt/src/misc/dwrite.rs:336` | `"IDWriteFactory::CreateTextAnalyzer -> E_NOTIMPL"` |
-
-### `secur32.dll` (4)
-
-- **Reason:** Server-side Schannel (INBOUND) or uncommon context/credential attribute
-- **Next step:** Add server-side TLS or missing SECPKG_ATTR_* queries if a game hosts local TLS sockets.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `acquire_credentials_impl` | `stub` | `crates/win32-rt/src/misc/secur32/schannel.rs:594` | `"AcquireCredentialsHandle(pkg={package_name:?}, use={f_credential_use:#x}): inbound unsupported"` |
-| `apply_control_token_impl` | `stub` | `crates/win32-rt/src/misc/secur32/schannel.rs:1025` | `"ApplyControlToken(ctx={id}, token={token_val:?}) -> SEC_E_UNSUPPORTED_FUNCTION"` |
-| `query_context_attributes_impl` | `stub` | `crates/win32-rt/src/misc/secur32/schannel.rs:1787` | `"QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION"` |
-| `query_credentials_attributes_impl` | `stub` | `crates/win32-rt/src/misc/secur32/schannel.rs:1849` | `"QueryCredentialsAttributes{}(attr={ul_attribute:#x}) -> SEC_E_UNSUPPORTED_FUNCTION", if wide { "W" } else { "A" }` |
-
-### `wintrust.dll` (4)
-
-- **Reason:** Unimplemented WinVerifyTrust action/choice or TPM Base Services (TBS)
-- **Next step:** Keep TPM TBS returning TBS_E_TPM_NOT_FOUND honestly; extend WinVerifyTrust for additional catalog/blob choices as needed.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `Tbsip_Context_Close` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1644` | `"Tbsip_Context_Close({h_context:p}) -> TBS_E_INVALID_CONTEXT"` |
-| `Tbsip_Submit_Command` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1661` | `"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"` |
-| `WinVerifyTrust` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1415` | `"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"` |
-| `WinVerifyTrust` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1439` | `"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"` |
-
-### `powrprof.dll` (3)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `CallNtPowerInformation` | `stub` | `crates/win32-rt/src/misc/powrprof.rs:468` | `"CallNtPowerInformation(level={info_level}) -> STATUS_NOT_IMPLEMENTED"` |
-| `PowerRegisterSuspendResumeNotification` | `stub` | `crates/win32-rt/src/misc/powrprof.rs:533` | `"PowerRegisterSuspendResumeNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS wake callback not armed)"` |
-| `PowerSettingRegisterNotification` | `stub` | `crates/win32-rt/src/misc/powrprof.rs:604` | `"PowerSettingRegisterNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS setting callback not armed)"` |
-
 ### `nri.dll` (2)
 
 - **Reason:** Partial or unimplemented Windows/middleware sub-feature
@@ -580,24 +593,14 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `core_cmd_set_sample_positions` | `middleware_stub` | `crates/win32-rt/src/misc/nri/cmdlist.rs:965` | `"CmdSetSamplePositions: programmable sample positions not supported on Metal"` |
 | `core_create_query_pool` | `middleware_stub` | `crates/win32-rt/src/misc/nri/device.rs:1383` | `"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type` |
 
-### `uxtheme.dll` (2)
+### `crypt32.dll` (1)
 
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `DrawThemeBackground` | `stub` | `crates/win32-rt/src/misc/uxtheme.rs:111` | `"DrawThemeBackground(htheme={htheme:#x}) -> E_NOTIMPL"` |
-| `TaskDialogIndirect` | `stub` | `crates/win32-rt/src/misc/uxtheme.rs:203` | `"TaskDialogIndirect -> E_NOTIMPL (native task dialogs not implemented)"` |
-
-### `d2d1.dll` (1)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
+- **Reason:** Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property
+- **Next step:** Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring.
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `geom_tessellate` | `stub` | `crates/win32-rt/src/misc/d2d1/geometry.rs:1038` | `"ID2D1Geometry::Tessellate -> E_NOTIMPL"` |
+| `CryptImportPublicKeyInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:55` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
 
 ### `directml.dll` (1)
 
@@ -608,42 +611,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 |---|---|---|---|
 | `parse` | `middleware_stub` | `crates/win32-rt/src/misc/directml/ops.rs:1048` | `"DirectML CreateOperator: unsupported operator type {other}"` |
 
-### `gameinput.dll` (1)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `gi_get_temporal_reading` | `stub` | `crates/win32-rt/src/misc/gameinput.rs:1968` | `"IGameInput::GetTemporalReading -> E_NOTIMPL"` |
-
-### `gdi32.dll` (1)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `GetDeviceCaps` | `stub` | `crates/win32-rt/src/misc/gdi32.rs:910` | `"GetDeviceCaps({index}) -> 0"` |
-
-### `hid.dll` (1)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `HidD_SetNumInputBuffers` | `stub` | `crates/win32-rt/src/misc/hid.rs:887` | `"ring size stays {INPUT_BUFFERS} (asked {n})"` |
-
-### `msctf.dll` (1)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `ctx_track_properties` | `stub` | `crates/win32-rt/src/misc/msctf/context.rs:809` | `"ITfContext::TrackProperties -> E_NOTIMPL"` |
-
 ### `shell32.dll` (1)
 
 - **Reason:** Partial or unimplemented Windows/middleware sub-feature
@@ -651,14 +618,5 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `SHCreateItemFromParsingName` | `stub` | `crates/win32-rt/src/misc/shell32.rs:1748` | `"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"` |
-
-### `xinput1_4.dll` (1)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `XInputGetKeystroke` | `stub` | `crates/win32-rt/src/misc/xinput1_4.rs:608` | `"XInputGetKeystroke: keystroke events not generated (ERROR_EMPTY)"` |
+| `SHCreateItemFromParsingName` | `stub` | `crates/win32-rt/src/misc/shell32.rs:1863` | `"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"` |
 

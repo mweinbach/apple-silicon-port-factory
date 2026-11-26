@@ -690,3 +690,284 @@ pub(super) fn new_property_obj(
         PropertyInner { read_only, data, ctx_state },
     )
 }
+
+// ---------------------------------------------------------------------------
+// `IEnumTfPropertyValue` (7 slots) & tracked composite `ITfReadOnlyProperty`
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub(super) struct IEnumTfPropertyValueVtbl {
+    pub(super) query_interface:
+        unsafe extern "win64" fn(*mut EnumTfPropValObj, *const u8, *mut *mut c_void) -> HRESULT,
+    pub(super) add_ref: unsafe extern "win64" fn(*mut EnumTfPropValObj) -> u32,
+    pub(super) release: unsafe extern "win64" fn(*mut EnumTfPropValObj) -> u32,
+    pub(super) clone: unsafe extern "win64" fn(*mut EnumTfPropValObj, *mut *mut c_void) -> HRESULT,
+    pub(super) next:
+        unsafe extern "win64" fn(*mut EnumTfPropValObj, u32, *mut TF_PROPERTYVAL, *mut u32) -> HRESULT,
+    pub(super) reset: unsafe extern "win64" fn(*mut EnumTfPropValObj) -> HRESULT,
+    pub(super) skip: unsafe extern "win64" fn(*mut EnumTfPropValObj, u32) -> HRESULT,
+}
+const _: () =
+    assert!(std::mem::size_of::<IEnumTfPropertyValueVtbl>() == 7 * std::mem::size_of::<usize>());
+
+pub(super) struct EnumTfPropValInner {
+    items: Vec<(Guid, OwnedVariant)>,
+    pos: Mutex<usize>,
+}
+
+pub(super) type EnumTfPropValObj = ComObj<EnumTfPropValInner>;
+
+impl_single_qi!(enum_pv_qi, EnumTfPropValObj, IID_IENUMTFPROPERTYVALUE);
+
+unsafe extern "win64" fn enum_pv_clone(
+    this: *mut EnumTfPropValObj,
+    pp_enum: *mut *mut c_void,
+) -> HRESULT {
+    if pp_enum.is_null() {
+        return E_INVALIDARG;
+    }
+    write_null_out(pp_enum);
+    let inner = ComObj::inner(this);
+    let pos = *inner.pos.lock().unwrap();
+    let cloned_items: Vec<(Guid, OwnedVariant)> = inner
+        .items
+        .iter()
+        .map(|(g, v)| (*g, v.clone_owned()))
+        .collect();
+    let cloned = new_enum_tf_prop_val(cloned_items, pos);
+    std::ptr::write_unaligned(pp_enum, cloned as *mut c_void);
+    S_OK
+}
+
+unsafe extern "win64" fn enum_pv_next(
+    this: *mut EnumTfPropValObj,
+    ul_count: u32,
+    rg_values: *mut TF_PROPERTYVAL,
+    pc_fetched: *mut u32,
+) -> HRESULT {
+    if !pc_fetched.is_null() {
+        std::ptr::write_unaligned(pc_fetched, 0);
+    }
+    if ul_count > 1 && pc_fetched.is_null() {
+        return E_INVALIDARG;
+    }
+    if ul_count > 0 && rg_values.is_null() {
+        return E_INVALIDARG;
+    }
+    let inner = ComObj::inner(this);
+    let (start, n) = {
+        let mut pos = inner.pos.lock().unwrap();
+        let avail = inner.items.len().saturating_sub(*pos);
+        let n = (ul_count as usize).min(avail);
+        let start = *pos;
+        *pos += n;
+        (start, n)
+    };
+    for i in 0..n {
+        let (guid, ref var) = inner.items[start + i];
+        let mut out_val = TF_PROPERTYVAL { guid_id: guid, var_value: [0u8; 24] };
+        var.write_copy_to(out_val.var_value.as_mut_ptr());
+        std::ptr::write_unaligned(rg_values.add(i), out_val);
+    }
+    if !pc_fetched.is_null() {
+        std::ptr::write_unaligned(pc_fetched, n as u32);
+    }
+    if n == ul_count as usize { S_OK } else { S_FALSE }
+}
+
+unsafe extern "win64" fn enum_pv_reset(this: *mut EnumTfPropValObj) -> HRESULT {
+    *ComObj::inner(this).pos.lock().unwrap() = 0;
+    S_OK
+}
+
+unsafe extern "win64" fn enum_pv_skip(this: *mut EnumTfPropValObj, ul_count: u32) -> HRESULT {
+    let inner = ComObj::inner(this);
+    let mut pos = inner.pos.lock().unwrap();
+    let avail = inner.items.len().saturating_sub(*pos);
+    let step = (ul_count as usize).min(avail);
+    *pos += step;
+    if step == ul_count as usize { S_OK } else { S_FALSE }
+}
+
+static IENUM_TF_PROP_VAL_VTBL: IEnumTfPropertyValueVtbl = IEnumTfPropertyValueVtbl {
+    query_interface: enum_pv_qi,
+    add_ref: com_add_ref::<EnumTfPropValInner>,
+    release: com_release::<EnumTfPropValInner>,
+    clone: enum_pv_clone,
+    next: enum_pv_next,
+    reset: enum_pv_reset,
+    skip: enum_pv_skip,
+};
+
+fn new_enum_tf_prop_val(items: Vec<(Guid, OwnedVariant)>, pos: usize) -> *mut EnumTfPropValObj {
+    register_vtable_ptrs(&[
+        enum_pv_qi as *const () as usize,
+        com_add_ref::<EnumTfPropValInner> as *const () as usize,
+        com_release::<EnumTfPropValInner> as *const () as usize,
+        enum_pv_clone as *const () as usize,
+        enum_pv_next as *const () as usize,
+        enum_pv_reset as *const () as usize,
+        enum_pv_skip as *const () as usize,
+    ]);
+    ComObj::new(
+        &IENUM_TF_PROP_VAL_VTBL as *const IEnumTfPropertyValueVtbl as *const usize,
+        EnumTfPropValInner { items, pos: Mutex::new(pos) },
+    )
+}
+
+#[repr(C)]
+pub(super) struct ITfReadOnlyPropertyVtbl {
+    pub(super) query_interface:
+        unsafe extern "win64" fn(*mut TrackedPropertyObj, *const u8, *mut *mut c_void) -> HRESULT,
+    pub(super) add_ref: unsafe extern "win64" fn(*mut TrackedPropertyObj) -> u32,
+    pub(super) release: unsafe extern "win64" fn(*mut TrackedPropertyObj) -> u32,
+    pub(super) get_type: unsafe extern "win64" fn(*mut TrackedPropertyObj, *mut u8) -> HRESULT,
+    pub(super) enum_ranges: unsafe extern "win64" fn(
+        *mut TrackedPropertyObj,
+        TfEditCookie,
+        *mut *mut c_void,
+        *mut c_void,
+    ) -> HRESULT,
+    pub(super) get_value: unsafe extern "win64" fn(
+        *mut TrackedPropertyObj,
+        TfEditCookie,
+        *mut c_void,
+        *mut u8,
+    ) -> HRESULT,
+    pub(super) get_context:
+        unsafe extern "win64" fn(*mut TrackedPropertyObj, *mut *mut c_void) -> HRESULT,
+}
+const _: () =
+    assert!(std::mem::size_of::<ITfReadOnlyPropertyVtbl>() == 7 * std::mem::size_of::<usize>());
+
+pub(super) struct TrackedPropertyInner {
+    props: Vec<Arc<PropertyData>>,
+    ctx_state: Arc<Mutex<ContextInner>>,
+}
+
+pub(super) type TrackedPropertyObj = ComObj<TrackedPropertyInner>;
+
+impl_single_qi!(tprop_qi, TrackedPropertyObj, IID_ITFREADONLYPROPERTY);
+
+unsafe extern "win64" fn tprop_get_type(
+    _this: *mut TrackedPropertyObj,
+    pguid: *mut u8,
+) -> HRESULT {
+    if pguid.is_null() {
+        return E_INVALIDARG;
+    }
+    write_guid(pguid as *mut Guid, GUID_NULL);
+    S_OK
+}
+
+unsafe extern "win64" fn tprop_enum_ranges(
+    this: *mut TrackedPropertyObj,
+    ec: TfEditCookie,
+    pp_enum: *mut *mut c_void,
+    p_target: *mut c_void,
+) -> HRESULT {
+    if pp_enum.is_null() {
+        return E_INVALIDARG;
+    }
+    write_null_out(pp_enum);
+    if ec == TF_INVALID_EDIT_COOKIE {
+        return TF_E_NOLOCK;
+    }
+    let inner = ComObj::inner(this);
+    let any_set = inner.props.iter().any(|p| !p.value.lock().unwrap().is_empty());
+    let items = if any_set {
+        let r = if !p_target.is_null() {
+            let mut cloned: *mut c_void = std::ptr::null_mut();
+            if com_call_slot(p_target, 23, &mut cloned as *mut *mut c_void as u64, 0, 0) == S_OK
+                && !cloned.is_null()
+            {
+                cloned as usize
+            } else {
+                new_range_obj(Arc::clone(&inner.ctx_state), (0, 0)) as usize
+            }
+        } else {
+            new_range_obj(Arc::clone(&inner.ctx_state), (0, 0)) as usize
+        };
+        vec![r]
+    } else {
+        Vec::new()
+    };
+    let en = new_enum_tf_com(IID_IENUMTFRANGES, items, 0);
+    std::ptr::write_unaligned(pp_enum, en as *mut c_void);
+    S_OK
+}
+
+unsafe extern "win64" fn tprop_get_value(
+    this: *mut TrackedPropertyObj,
+    ec: TfEditCookie,
+    _p_range: *mut c_void,
+    pvar_value: *mut u8,
+) -> HRESULT {
+    if pvar_value.is_null() {
+        return E_INVALIDARG;
+    }
+    std::ptr::write_bytes(pvar_value, 0, 24);
+    if ec == TF_INVALID_EDIT_COOKIE {
+        return TF_E_NOLOCK;
+    }
+    let inner = ComObj::inner(this);
+    let mut items = Vec::with_capacity(inner.props.len());
+    for prop in &inner.props {
+        let guard = prop.value.lock().unwrap();
+        items.push((prop.guid_type, guard.clone_owned()));
+    }
+    let enumerator = new_enum_tf_prop_val(items, 0);
+    std::ptr::write_unaligned(pvar_value as *mut u16, VT_UNKNOWN);
+    std::ptr::write_unaligned(pvar_value.add(8) as *mut usize, enumerator as usize);
+    S_OK
+}
+
+unsafe extern "win64" fn tprop_get_context(
+    this: *mut TrackedPropertyObj,
+    pp_context: *mut *mut c_void,
+) -> HRESULT {
+    if pp_context.is_null() {
+        return E_INVALIDARG;
+    }
+    write_null_out(pp_context);
+    let maybe_ctx = {
+        let st = ComObj::inner(this).ctx_state.lock().unwrap();
+        try_add_ref_context(st.live_self)
+    };
+    match maybe_ctx {
+        Some(ptr) => {
+            std::ptr::write_unaligned(pp_context, ptr as *mut c_void);
+            S_OK
+        }
+        None => TF_E_DISCONNECTED,
+    }
+}
+
+static ITF_TRACKED_PROPERTY_VTBL: ITfReadOnlyPropertyVtbl = ITfReadOnlyPropertyVtbl {
+    query_interface: tprop_qi,
+    add_ref: com_add_ref::<TrackedPropertyInner>,
+    release: com_release::<TrackedPropertyInner>,
+    get_type: tprop_get_type,
+    enum_ranges: tprop_enum_ranges,
+    get_value: tprop_get_value,
+    get_context: tprop_get_context,
+};
+
+pub(super) fn new_tracked_property_obj(
+    props: Vec<Arc<PropertyData>>,
+    ctx_state: Arc<Mutex<ContextInner>>,
+) -> *mut TrackedPropertyObj {
+    register_vtable_ptrs(&[
+        tprop_qi as *const () as usize,
+        com_add_ref::<TrackedPropertyInner> as *const () as usize,
+        com_release::<TrackedPropertyInner> as *const () as usize,
+        tprop_get_type as *const () as usize,
+        tprop_enum_ranges as *const () as usize,
+        tprop_get_value as *const () as usize,
+        tprop_get_context as *const () as usize,
+    ]);
+    ComObj::new(
+        &ITF_TRACKED_PROPERTY_VTBL as *const ITfReadOnlyPropertyVtbl as *const usize,
+        TrackedPropertyInner { props, ctx_state },
+    )
+}

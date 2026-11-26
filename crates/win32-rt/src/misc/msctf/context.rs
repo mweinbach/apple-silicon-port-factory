@@ -2,7 +2,7 @@
 //! and document managers (`ITfDocumentMgr`).
 
 use super::abi::*;
-use super::range::{new_property_obj, new_range_obj, PropertyData};
+use super::range::{new_property_obj, new_range_obj, new_tracked_property_obj, PropertyData};
 use super::thread_mgr::ThreadMgrState;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -798,16 +798,56 @@ unsafe extern "win64" fn ctx_get_app_property(
 }
 
 unsafe extern "win64" fn ctx_track_properties(
-    _this: *mut c_void,
-    _prg_prop: *const *const u8,
-    _c_prop: u32,
-    _prg_app_prop: *const *const u8,
-    _c_app_prop: u32,
+    this: *mut c_void,
+    prg_prop: *const *const u8,
+    c_prop: u32,
+    prg_app_prop: *const *const u8,
+    c_app_prop: u32,
     pp_property: *mut *mut c_void,
 ) -> HRESULT {
     write_null_out(pp_property);
-    stub!("ITfContext::TrackProperties -> E_NOTIMPL");
-    E_NOTIMPL
+    if pp_property.is_null() {
+        return E_INVALIDARG;
+    }
+    if (c_prop == 0 && c_app_prop == 0)
+        || (c_prop > 0 && prg_prop.is_null())
+        || (c_app_prop > 0 && prg_app_prop.is_null())
+    {
+        return E_INVALIDARG;
+    }
+    let mut guids = Vec::with_capacity((c_prop as usize).saturating_add(c_app_prop as usize));
+    for i in 0..c_prop as usize {
+        let gp = std::ptr::read_unaligned(prg_prop.add(i));
+        let Some(g) = read_guid_from_bytes(gp) else {
+            return E_INVALIDARG;
+        };
+        guids.push(g);
+    }
+    for i in 0..c_app_prop as usize {
+        let gp = std::ptr::read_unaligned(prg_app_prop.add(i));
+        let Some(g) = read_guid_from_bytes(gp) else {
+            return E_INVALIDARG;
+        };
+        guids.push(g);
+    }
+    let obj = &*(this as *const ContextObj);
+    let props: Vec<Arc<PropertyData>> = {
+        let mut st = obj.inner.lock().unwrap();
+        guids
+            .into_iter()
+            .map(|g| {
+                Arc::clone(st.properties.entry(g).or_insert_with(|| {
+                    Arc::new(PropertyData {
+                        guid_type: g,
+                        value: Mutex::new(OwnedVariant::default()),
+                    })
+                }))
+            })
+            .collect()
+    };
+    let tracked = new_tracked_property_obj(props, Arc::clone(&obj.inner));
+    std::ptr::write_unaligned(pp_property, tracked as *mut c_void);
+    S_OK
 }
 
 unsafe extern "win64" fn ctx_enum_properties(this: *mut c_void, pp_enum: *mut *mut c_void) -> HRESULT {
