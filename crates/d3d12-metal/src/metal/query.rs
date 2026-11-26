@@ -130,7 +130,7 @@ impl super::cmdlist::CommandList {
         if offset + n as u64 * 8 > d.length() as u64 {
             return Err("resolve destination too small".into());
         }
-        self.copy_after_render(&v, start as u64 * 8, d, offset, n as u64 * 8)
+        self.copy_after_render(&v, start as u64 * 8, dst, offset, n as u64 * 8)
     }
 
     /// `EndQuery(TIMESTAMP)`.

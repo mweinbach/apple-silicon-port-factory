@@ -6,6 +6,7 @@ use super::state::{
     view_flags, ClearKind, DirectBind, DrawOp, DrawSeg, DrawSegExact, DynSnapshot, Encoder,
     PendingClear, TargetView, GFX_DIRTY_ALL, GFX_DIRTY_BLEND, GFX_DIRTY_DEPTH_BOUNDS,
     GFX_DIRTY_PSO, GFX_DIRTY_SCISSORS, GFX_DIRTY_SHARED, GFX_DIRTY_STENCIL, GFX_DIRTY_VIEWPORTS,
+    PRE_RASTER,
 };
 use super::CommandList;
 use dxil_metal::runtime::{
@@ -803,7 +804,9 @@ impl CommandList {
             && (!self.has_frag_buf_write()
                 || ((self.opts.opt_queue_start_stage_exact || self.list_rsplit_v2_active())
                     && self.occlusion.is_none()));
+        self.bar.opening_pre_raster_stages = MTLStages::Vertex;
         let enc_res = unsafe { self.draw_encoder_for(eff_reads) };
+        self.bar.opening_pre_raster_stages = PRE_RASTER;
         self.bar.opening_render_split_ok = false;
         let (_e, _size) = match enc_res {
             Ok(v) => v,
@@ -814,7 +817,7 @@ impl CommandList {
         };
         self.record_gfx_draw_pre_barrier(&p, eff_reads, writes_uav, false);
         self.record_gfx_draw_uav_writes(writes_uav, p.vs_writes_uav, p.ps_writes_uav, MTLStages::Vertex);
-        self.collect_batch_qbarriers(eff_reads);
+        self.collect_batch_qbarriers(eff_reads, MTLStages::Vertex);
         self.rp_sync.cur_draw_exact_valid = false;
         if let Some(m) = self.pt_cur() {
             m.draws += 1;
@@ -918,7 +921,9 @@ impl CommandList {
             && (!self.has_frag_buf_write()
                 || ((self.opts.opt_queue_start_stage_exact || self.list_rsplit_v2_active())
                     && self.occlusion.is_none()));
+        self.bar.opening_pre_raster_stages = MTLStages::Vertex;
         let enc_res = unsafe { self.draw_encoder_for(eff_reads) };
+        self.bar.opening_pre_raster_stages = PRE_RASTER;
         self.bar.opening_render_split_ok = false;
         let (e, size) = match enc_res {
             Ok(v) => v,
@@ -928,9 +933,9 @@ impl CommandList {
             }
         };
         self.record_gfx_draw_pre_barrier(&p, eff_reads, writes_uav, indirect);
-        self.render_mid_barrier(&e);
+        self.render_mid_barrier(&e, MTLStages::Vertex);
         self.record_gfx_draw_uav_writes(writes_uav, p.vs_writes_uav, p.ps_writes_uav, MTLStages::Vertex);
-        self.sync_pre_raster(&e, eff_reads);
+        self.sync_pre_raster(&e, eff_reads, MTLStages::Vertex);
         self.rp_sync.cur_draw_exact_valid = false;
         self.apply_dynamic(&e, &p, size);
         if let Some(m) = self.pt_cur() {
@@ -1138,18 +1143,22 @@ impl CommandList {
             self.end_encoder();
         }
         let eff_reads = p.pre_raster_reads | READS_BUF;
-        let (e, size) = unsafe { self.draw_encoder_for(eff_reads)? };
+        let emu_pre = MTLStages::Object | MTLStages::Mesh;
+        self.bar.opening_pre_raster_stages = emu_pre;
+        let enc_res = unsafe { self.draw_encoder_for(eff_reads) };
+        self.bar.opening_pre_raster_stages = PRE_RASTER;
+        let (e, size) = enc_res?;
         self.rp_sync.enc_pre_raster_reads |= eff_reads;
         self.rp_sync.enc_ps_reads |= p.ps_read_classes;
         self.rp_sync.enc_uav_used |= writes_uav || p.uses_uav;
-        self.render_mid_barrier(&e);
+        self.render_mid_barrier(&e, emu_pre);
         self.record_gfx_draw_uav_writes(
             writes_uav,
             p.vs_writes_uav,
             p.ps_writes_uav,
-            MTLStages::Object | MTLStages::Mesh,
+            emu_pre,
         );
-        self.sync_pre_raster(&e, eff_reads);
+        self.sync_pre_raster(&e, eff_reads, emu_pre);
         self.apply_dynamic(&e, &p, size);
         let fast = self.opts.opt_fast_enc_state;
         if !(fast && self.rp_sync.enc_render_cache.mesh_stages_bound) {
@@ -1268,18 +1277,22 @@ impl CommandList {
             self.end_encoder();
         }
         let eff_reads = p.pre_raster_reads | READS_BUF;
-        let (e, size) = unsafe { self.draw_encoder_for(eff_reads)? };
+        let emu_pre = MTLStages::Object | MTLStages::Mesh;
+        self.bar.opening_pre_raster_stages = emu_pre;
+        let enc_res = unsafe { self.draw_encoder_for(eff_reads) };
+        self.bar.opening_pre_raster_stages = PRE_RASTER;
+        let (e, size) = enc_res?;
         self.rp_sync.enc_pre_raster_reads |= eff_reads;
         self.rp_sync.enc_ps_reads |= p.ps_read_classes;
         self.rp_sync.enc_uav_used |= writes_uav || p.uses_uav;
-        self.render_mid_barrier(&e);
+        self.render_mid_barrier(&e, emu_pre);
         self.record_gfx_draw_uav_writes(
             writes_uav,
             p.vs_writes_uav,
             p.ps_writes_uav,
-            MTLStages::Object | MTLStages::Mesh,
+            emu_pre,
         );
-        self.sync_pre_raster(&e, eff_reads);
+        self.sync_pre_raster(&e, eff_reads, emu_pre);
         self.apply_dynamic(&e, &p, size);
         let fast = self.opts.opt_fast_enc_state;
         if !(fast && self.rp_sync.enc_render_cache.mesh_stages_bound) {
@@ -1594,7 +1607,14 @@ impl CommandList {
             && (!self.has_frag_buf_write()
                 || ((self.opts.opt_queue_start_stage_exact || self.list_rsplit_v2_active())
                     && self.occlusion.is_none()));
+        let mesh_pre = if p.object_threads.is_some() {
+            MTLStages::Object | MTLStages::Mesh
+        } else {
+            MTLStages::Mesh
+        };
+        self.bar.opening_pre_raster_stages = mesh_pre;
         let enc_res = unsafe { self.draw_encoder_for(eff_reads) };
+        self.bar.opening_pre_raster_stages = PRE_RASTER;
         self.bar.opening_render_split_ok = false;
         let (e, size) = match enc_res {
             Ok(v) => v,
@@ -1627,14 +1647,14 @@ impl CommandList {
         if writes_uav && self.opts.opt_rp_split_exact_keep {
             self.record_mesh_uav_write_exact(&p, indirect);
         }
-        self.render_mid_barrier(&e);
+        self.render_mid_barrier(&e, mesh_pre);
         self.record_gfx_draw_uav_writes(
             writes_uav,
             p.ms_as_writes_uav,
             p.ps_writes_uav,
-            MTLStages::Object | MTLStages::Mesh,
+            mesh_pre,
         );
-        self.sync_pre_raster(&e, eff_reads);
+        self.sync_pre_raster(&e, eff_reads, mesh_pre);
         self.rp_sync.cur_draw_exact_valid = false;
         if let Some(m) = self.pt_cur() {
             m.draws += 1;

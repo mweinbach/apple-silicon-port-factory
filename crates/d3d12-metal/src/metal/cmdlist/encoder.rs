@@ -224,10 +224,25 @@ impl CommandList {
             self.pt_stamp(i, true);
         }
         self.icb.enc_icb_war_done = false;
+        // Preserve `enc_pre_unwaited_*` across render-pass boundaries: if a render pass narrowed
+        // a consumed `PRE_RASTER` barrier to `Vertex` (leaving `Object | Mesh` unwaited) and then
+        // closed (e.g. target change), a subsequent render pass drawing with `Mesh`/`Object` still
+        // needs `ensure_pre_raster_stage_synced` / `collect_pre_raster_stage_sync` to wait on the
+        // earlier producer. Cleared only when drained, on a full `All -> PRE_RASTER` barrier, or
+        // on `BarrierState::reset()`.
+        self.bar.list_blit_unwaited_stages = MTLStages::empty();
         match std::mem::replace(&mut self.enc, Encoder::None) {
             Encoder::None => return,
             Encoder::Render(e) => {
+                let had_open_occl = self.occlusion.is_some() && self.enc_vis_buf.is_some();
+                self.enc_vis_buf = None;
+                self.enc_vis_reset = false;
+                self.enc_vis_used_indices.clear();
                 e.endEncoding();
+                if had_open_occl {
+                    self.occl_drew = true;
+                    self.add_pend(MTLStages::Fragment, MTLStages::Fragment);
+                }
                 self.icb.enc_icb_cmds = 0;
                 if std::mem::replace(&mut self.icb.enc_used_icb, false) && icb_reuse_enabled() {
                     if let Some(icbs) = &self.icb.icbs {
@@ -781,6 +796,183 @@ impl CommandList {
         self.bar.written.clear();
     }
 
+    /// Emit a Metal 4 producer barrier for trailing unconsumed barriers at command-list
+    /// close whose producer stages are not already covered by their destination stages
+    /// (e.g. a trailing `UAV -> RENDER_TARGET` transition or unmatched `SplitBegin`).
+    ///
+    /// This guarantees that a subsequent command list starting with an explicit-transition
+    /// `Blit` copy can narrow its `ListStart` barrier to `state_stages(s0) -> Blit` without
+    /// missing earlier producers whose state already transitioned away in a prior list.
+    pub(super) fn emit_close_trailing_producer_barriers(&mut self) {
+        self.flush_draw_batch(true);
+        self.flush_enc_cs_soft_disp_all();
+        self.flush_cs_uav_deferred();
+        self.flush_cs_end_after();
+        self.flush_cs_mid_res_all();
+        self.flush_clear_tex_cs_all();
+        if !self.bar.clear_tex_gfx_before.is_empty()
+            || self.bar.clear_tex_gfx_soft != [MTLStages::empty(); 2]
+        {
+            let b = std::mem::replace(&mut self.bar.clear_tex_gfx_before, MTLStages::empty());
+            let s = std::mem::replace(&mut self.bar.clear_tex_gfx_soft, [MTLStages::empty(); 2]);
+            self.add_pend_with_soft(MTLStages::Fragment, b, s);
+        }
+        let mut extra = MTLStages::empty();
+        let mut has_unknown_narrow_r = false;
+        let mut unsat_narrow_res: Vec<usize> = Vec::new();
+        if self.bar.needs_barrier && self.bar.full_why != FullWhy::ListStart {
+            extra = MTLStages::All;
+            has_unknown_narrow_r = true;
+        } else {
+            for &(r, narrow, s1_full, req) in &self.bar.trail_narrow_items {
+                let sync_covers = |sync: &StageSync| -> bool {
+                    let pre_ok = sync.pre_list_all
+                        || (narrow != MTLStages::All && sync.pre_list_stages.contains(narrow));
+                    if !pre_ok {
+                        return false;
+                    }
+                    STAGE_BITS.iter().enumerate().all(|(pi, &pbit)| {
+                        !(narrow == MTLStages::All || narrow.contains(pbit))
+                            || sync.gen[pi] >= req[pi]
+                    })
+                };
+                let satisfied = STAGE_BITS.iter().enumerate().any(|(si, &bit)| {
+                    if !s1_full.contains(bit) {
+                        return false;
+                    }
+                    let done_closed =
+                        self.bar.stage_gen[si] > 0 && sync_covers(&self.bar.stage_sync[si]);
+                    let done_open = self.bar.enc_ran_stages.contains(bit)
+                        && sync_covers(&self.bar.enc_cur_sync[si]);
+                    done_closed || done_open
+                });
+                if !satisfied {
+                    extra |= narrow;
+                    if r == 0 {
+                        has_unknown_narrow_r = true;
+                    } else if !unsat_narrow_res.contains(&r) {
+                        unsat_narrow_res.push(r);
+                    }
+                }
+            }
+            for &(r, _, s0, _, _) in &self.bar.split_barriers {
+                extra |= state_stages_for_res(r, s0);
+                if r == 0 {
+                    has_unknown_narrow_r = true;
+                } else if !unsat_narrow_res.contains(&r) {
+                    unsat_narrow_res.push(r);
+                }
+            }
+        }
+        if extra.is_empty() {
+            return;
+        }
+        if self.opts.opt_empty_enc_elide && !self.bar.has_gpu_work && !has_unknown_narrow_r {
+            for r in unsat_narrow_res {
+                note_elided_narrow_barrier(r);
+            }
+            return;
+        }
+        let in_open_only = extra != MTLStages::All
+            && (extra & self.bar.enc_ran_stages) == extra
+            && STAGE_BITS.iter().enumerate().all(|(pi, &b)| {
+                !extra.contains(b)
+                    || (self.bar.stage_gen[pi] == 0
+                        && (self.bar.enc_cur_sync[pi].pre_list_all
+                            || self.bar.enc_cur_sync[pi].pre_list_stages.contains(b)))
+            });
+        match &self.enc {
+            Encoder::Render(e) if in_open_only => {
+                e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                    extra,
+                    MTLStages::Blit,
+                    MTL4VisibilityOptions::Device,
+                );
+                stats::inc(&stats::c::qb_list_trail);
+            }
+            Encoder::Compute(e) if in_open_only => {
+                e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                    extra,
+                    MTLStages::Blit,
+                    MTL4VisibilityOptions::Device,
+                );
+                stats::inc(&stats::c::qb_list_trail);
+            }
+            Encoder::Compute(e) => {
+                e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                    extra,
+                    MTLStages::Blit,
+                    MTL4VisibilityOptions::Device,
+                );
+                e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                    MTLStages::Blit,
+                    MTLStages::Blit,
+                    MTL4VisibilityOptions::Device,
+                );
+                stats::inc(&stats::c::qb_list_trail);
+            }
+            _ => {
+                self.end_encoder();
+                if let Some(e) = self.cb.computeCommandEncoder() {
+                    self.bar.has_gpu_work = true;
+                    e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                        extra,
+                        MTLStages::Blit,
+                        MTL4VisibilityOptions::Device,
+                    );
+                    e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                        MTLStages::Blit,
+                        MTLStages::Blit,
+                        MTL4VisibilityOptions::Device,
+                    );
+                    e.endEncoding();
+                    stats::inc(&stats::c::qb_list_trail);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn explicit_list_start_blit_after(&self, touch: &[usize]) -> Option<MTLStages> {
+        if touch.is_empty()
+            || legacy_barriers()
+            || !barrier_masks()
+            || self.is_copy_queue_light()
+            || self.list_barrier_tight_active()
+            || self.bar.list_start_blit_tainted.contains(&0)
+        {
+            return None;
+        }
+        let mut after = MTLStages::empty();
+        for &r in touch {
+            if r == 0
+                || self.bar.list_start_blit_tainted.contains(&r)
+                || is_elided_narrow_barrier(r)
+            {
+                return None;
+            }
+            let res = unsafe { &*(r as *const Resource) };
+            if res.desc.is_buffer() && res.heap.Type == crate::types::heap_type::UPLOAD {
+                continue;
+            }
+            if res.desc.is_buffer() && res.heap.Type == crate::types::heap_type::READBACK {
+                after |= MTLStages::Blit;
+                continue;
+            }
+            if let Some(&(_, st)) = self.bar.list_start_blit_explicit.iter().find(|e| e.0 == r) {
+                after |= st;
+            } else {
+                return None;
+            }
+        }
+        if after == MTLStages::All
+            || (after.contains(MTLStages::Fragment) && after.contains(MTLStages::Dispatch))
+        {
+            return None;
+        }
+        Some(after)
+    }
+
     #[inline]
     pub(super) fn is_blit_touch_nonfrag_safe(&self, touch: &[usize]) -> bool {
         !touch.is_empty()
@@ -809,11 +1001,15 @@ impl CommandList {
         &mut self,
         e: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
     ) {
-        if self.bar.enc_blit_only_sync || self.bar.list_cs_unwaited_frag {
+        if self.bar.enc_blit_only_sync
+            || self.bar.list_cs_unwaited_frag
+            || !self.bar.list_blit_unwaited_stages.is_empty()
+        {
             let (up_after, up_before, narrowed) = if (self.opts.opt_list_start_render_split
                 || self.opts.opt_list_boundary_overlap
                 || self.opts.opt_queue_start_stage_exact)
                 && !self.bar.list_cs_unwaited_frag
+                && self.bar.list_blit_unwaited_stages.is_empty()
                 && self.bar.enc_cur_sync[5].pre_list_all
             {
                 let anchor = if self.opts.opt_list_start_substage {
@@ -850,6 +1046,7 @@ impl CommandList {
             self.bar.enc_sync_before = COMPUTE_STAGES;
             self.bar.enc_blit_only_sync = false;
             self.bar.list_cs_unwaited_frag = false;
+            self.bar.list_blit_unwaited_stages = MTLStages::empty();
             self.bar.list_unwaited_cs = false;
             if up_after.contains(MTLStages::Fragment) {
                 self.bar.written.clear();
@@ -1436,8 +1633,56 @@ impl CommandList {
                 }
             }
         }
+        let explicit_after = if !self.bar.has_gpu_work || !self.bar.list_blit_unwaited_stages.is_empty()
+        {
+            self.explicit_list_start_blit_after(touch)
+        } else {
+            None
+        };
         if let Encoder::Compute(e) = &self.enc {
-            if self.bar.list_cs_unwaited_frag && !nonfrag_safe {
+            if !self.bar.list_blit_unwaited_stages.is_empty() {
+                let need = match explicit_after {
+                    Some(st) => {
+                        let eff = if nonfrag_safe {
+                            st & (COMPUTE_STAGES | PRE_RASTER)
+                        } else {
+                            st
+                        };
+                        eff & self.bar.list_blit_unwaited_stages
+                    }
+                    None if nonfrag_safe => {
+                        self.bar.list_blit_unwaited_stages & (COMPUTE_STAGES | PRE_RASTER)
+                    }
+                    None => self.bar.list_blit_unwaited_stages,
+                };
+                if !need.is_empty() {
+                    let e = e.clone();
+                    e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                        need,
+                        MTLStages::Blit,
+                        MTL4VisibilityOptions::Device,
+                    );
+                    self.record_enc_queue_sync(need, MTLStages::Blit);
+                    self.bar.enc_cur_sync[STAGE_BLIT].pre_list_stages |= need;
+                    self.bar.enc_completed_sync[STAGE_BLIT].pre_list_stages |= need;
+                    self.bar.list_blit_unwaited_stages -= need;
+                    if self.bar.list_blit_unwaited_stages.is_empty() {
+                        self.bar.enc_cur_sync[STAGE_BLIT].pre_list_all = true;
+                        self.bar.enc_cur_sync[STAGE_BLIT].pre_list_stages = MTLStages::All;
+                        self.bar.enc_completed_sync[STAGE_BLIT].pre_list_all = true;
+                        self.bar.enc_completed_sync[STAGE_BLIT].pre_list_stages = MTLStages::All;
+                        self.bar.list_cs_unwaited_frag = false;
+                    } else if need.contains(MTLStages::Fragment) {
+                        self.bar.list_cs_unwaited_frag = false;
+                    }
+                    stats::inc(&stats::c::cs_mid_qb);
+                    self.bar.enc_sync_after |= need;
+                    self.bar.enc_sync_before |= MTLStages::Blit;
+                    if need.contains(MTLStages::Fragment) {
+                        self.bar.written.clear();
+                    }
+                }
+            } else if self.bar.list_cs_unwaited_frag && !nonfrag_safe {
                 let e = e.clone();
                 e.barrierAfterQueueStages_beforeStages_visibilityOptions(
                     MTLStages::Fragment,
@@ -1458,6 +1703,7 @@ impl CommandList {
         }
         self.bar.opening_compute_stage = MTLStages::Blit;
         self.bar.opening_blit_nonfrag_safe = nonfrag_safe;
+        self.bar.opening_blit_explicit_after = explicit_after;
         let out = if self.ib_tight_active() {
             self.compute_op_tight(MTLStages::Blit, None, Some(touch), Some(touch))
         } else {
@@ -1465,6 +1711,7 @@ impl CommandList {
         };
         self.bar.opening_compute_stage = COMPUTE_STAGES;
         self.bar.opening_blit_nonfrag_safe = false;
+        self.bar.opening_blit_explicit_after = None;
         if let Some(e) = &out {
             for &r in touch {
                 if r != 0 {
@@ -1678,9 +1925,14 @@ impl CommandList {
                 }
             }
         }
+        let use_vis_reset = !legacy_barriers() && barrier_masks() && !self.occl_drew;
         if let Some(o) = &self.occlusion {
             unsafe { rp.setVisibilityResultBuffer(Some(&o.buffer)) };
-            rp.setVisibilityResultType(MTLVisibilityResultType::Accumulate);
+            rp.setVisibilityResultType(if use_vis_reset {
+                MTLVisibilityResultType::Reset
+            } else {
+                MTLVisibilityResultType::Accumulate
+            });
         }
         let e = self.cb.renderCommandEncoderWithDescriptor(rp)?;
         self.bar.has_gpu_work = true;
@@ -1701,9 +1953,21 @@ impl CommandList {
                 MTLVisibilityResultMode::Counting
             };
             unsafe { e.setVisibilityResultMode_offset(mode, o.index as usize * 8) };
+            let q_buf_ptr = &*o.buffer as *const crate::metal::resource::MtlBuffer as usize;
+            // `begin_barrier` above just consumed any pending `Blit -> Fragment` wait for this
+            // visibility buffer, so clear its resolve-read WAR marker now that a render pass opened.
+            self.bar.vis_buf_blit_read.retain(|&p| p != q_buf_ptr);
+            self.enc_vis_buf = Some(q_buf_ptr);
+            self.enc_vis_reset = use_vis_reset;
+            self.enc_vis_used_indices.clear();
+            self.enc_vis_used_indices.push(o.index);
+            if !self.bar.vis_buf_written.contains(&(q_buf_ptr, o.index)) {
+                self.bar.vis_buf_written.push((q_buf_ptr, o.index));
+            }
+            self.occl_drew = true;
         }
         self.enc = Encoder::Render(e.clone());
-        if !sync_targets.is_empty() || !write_targets.is_empty() {
+        if !sync_targets.is_empty() || !write_targets.is_empty() || self.occlusion.is_some() {
             self.note_stage_ran(MTLStages::Fragment);
         }
         self.pt_open(pt::kind::DRAW);
