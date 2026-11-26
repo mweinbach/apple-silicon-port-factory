@@ -1,10 +1,10 @@
-//! Schannel SSPI client-side TLS 1.2 / 1.3 implementation backed by `crate::net_tls`.
+//! Schannel SSPI client- and server-side TLS 1.2 / 1.3 implementation backed by `crate::net_tls`.
 
 use crate::handles::HandleTable;
 use crate::misc::crypt32::{self, PeerCertVerifyResult};
 use crate::net_tls::{self, SelectiveCertVerifier, TlsVerifyPolicy};
-use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, ProtocolVersion};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, Connection, ProtocolVersion, ServerConfig, ServerConnection};
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::sync::{Arc, OnceLock};
@@ -38,15 +38,27 @@ pub(super) const SEC_E_ENCRYPT_FAILURE: i32 = 0x8009_0329u32 as i32;
 pub(super) const SEC_E_DECRYPT_FAILURE: i32 = 0x8009_0330u32 as i32;
 pub(super) const SEC_E_ALGORITHM_MISMATCH: i32 = 0x8009_0331u32 as i32;
 
+pub(super) const SECPKG_CRED_INBOUND: u32 = 0x0000_0001;
 pub(super) const SECPKG_CRED_OUTBOUND: u32 = 0x0000_0002;
+pub(super) const SECPKG_CRED_BOTH: u32 = 0x0000_0003;
 
 pub(super) const SCHANNEL_CRED_VERSION: u32 = 4;
 pub(super) const SCH_CREDENTIALS_VERSION: u32 = 5;
 
 pub(super) const SCH_CRED_NO_SERVERNAME_CHECK: u32 = 0x0000_0004;
 pub(super) const SCH_CRED_MANUAL_CRED_VALIDATION: u32 = 0x0000_0008;
+pub(super) const SCH_CRED_DISABLE_RECONNECTS: u32 = 0x0000_0080;
+pub(super) const SCH_CRED_REVOCATION_CHECK_END_CERT: u32 = 0x0000_0100;
+pub(super) const SCH_CRED_REVOCATION_CHECK_CHAIN: u32 = 0x0000_0200;
+pub(super) const SCH_CRED_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT: u32 = 0x0000_0400;
+pub(super) const SCH_CRED_IGNORE_NO_REVOCATION_CHECK: u32 = 0x0000_0800;
+pub(super) const SCH_CRED_IGNORE_REVOCATION_OFFLINE: u32 = 0x0000_1000;
 
+pub(super) const SSL_SESSION_RECONNECT: u32 = 1;
+
+pub(super) const SP_PROT_TLS1_2_SERVER: u32 = 0x0000_0400;
 pub(super) const SP_PROT_TLS1_2_CLIENT: u32 = 0x0000_0800;
+pub(super) const SP_PROT_TLS1_3_SERVER: u32 = 0x0000_1000;
 pub(super) const SP_PROT_TLS1_3_CLIENT: u32 = 0x0000_2000;
 
 pub(super) const ISC_REQ_REPLAY_DETECT: u32 = 0x0000_0004;
@@ -57,6 +69,16 @@ pub(super) const ISC_REQ_ALLOCATE_MEMORY: u32 = 0x0000_0100;
 pub(super) const ISC_REQ_EXTENDED_ERROR: u32 = 0x0000_4000;
 pub(super) const ISC_REQ_STREAM: u32 = 0x0000_8000;
 pub(super) const ISC_REQ_MANUAL_CRED_VALIDATION: u32 = 0x0008_0000;
+
+// Server-side AcceptSecurityContext request/return flags (sspi.h).
+// Note: ASC_REQ_EXTENDED_ERROR (0x8000) and ASC_REQ_STREAM (0x10000) differ from ISC_REQ_*!
+pub(super) const ASC_REQ_MUTUAL_AUTH: u32 = 0x0000_0002;
+pub(super) const ASC_REQ_REPLAY_DETECT: u32 = 0x0000_0004;
+pub(super) const ASC_REQ_SEQUENCE_DETECT: u32 = 0x0000_0008;
+pub(super) const ASC_REQ_CONFIDENTIALITY: u32 = 0x0000_0010;
+pub(super) const ASC_REQ_ALLOCATE_MEMORY: u32 = 0x0000_0100;
+pub(super) const ASC_REQ_EXTENDED_ERROR: u32 = 0x0000_8000;
+pub(super) const ASC_REQ_STREAM: u32 = 0x0001_0000;
 
 const SECBUFFER_ATTRMASK: u32 = 0xF000_0000;
 pub(super) const SECBUFFER_EMPTY: u32 = 0;
@@ -70,22 +92,43 @@ pub(super) const SECBUFFER_APPLICATION_PROTOCOLS: u32 = 18;
 
 pub(super) const SECPKG_ATTR_SIZES: u32 = 0;
 pub(super) const SECPKG_ATTR_NAMES: u32 = 1;
+pub(super) const SECPKG_ATTR_LIFESPAN: u32 = 2;
 pub(super) const SECPKG_ATTR_STREAM_SIZES: u32 = 4;
+pub(super) const SECPKG_ATTR_KEY_INFO: u32 = 5;
+pub(super) const SECPKG_ATTR_AUTHORITY: u32 = 6;
+pub(super) const SECPKG_ATTR_PROTO_INFO: u32 = 7;
 pub(super) const SECPKG_ATTR_PACKAGE_INFO: u32 = 10;
+pub(super) const SECPKG_ATTR_NEGOTIATION_INFO: u32 = 12;
+pub(super) const SECPKG_ATTR_FLAGS: u32 = 14;
+pub(super) const SECPKG_ATTR_UNIQUE_BINDINGS: u32 = 25;
+pub(super) const SECPKG_ATTR_ENDPOINT_BINDINGS: u32 = 26;
+pub(super) const SECPKG_ATTR_CLIENT_SPECIFIED_TARGET: u32 = 27;
 pub(super) const SECPKG_ATTR_APPLICATION_PROTOCOL: u32 = 0x23;
 pub(super) const SECPKG_ATTR_REMOTE_CERT_CONTEXT: u32 = 0x53;
+pub(super) const SECPKG_ATTR_LOCAL_CERT_CONTEXT: u32 = 0x54;
+pub(super) const SECPKG_ATTR_ROOT_STORE: u32 = 0x55;
+pub(super) const SECPKG_ATTR_SUPPORTED_ALGS: u32 = 0x56;
+pub(super) const SECPKG_ATTR_CIPHER_STRENGTHS: u32 = 0x57;
+pub(super) const SECPKG_ATTR_SUPPORTED_PROTOCOLS: u32 = 0x58;
 pub(super) const SECPKG_ATTR_ISSUER_LIST_EX: u32 = 0x59;
 pub(super) const SECPKG_ATTR_CONNECTION_INFO: u32 = 0x5A;
+pub(super) const SECPKG_ATTR_EAP_KEY_BLOCK: u32 = 0x5B;
+pub(super) const SECPKG_ATTR_SESSION_INFO: u32 = 0x5D;
+pub(super) const SECPKG_ATTR_REMOTE_CERTIFICATES: u32 = 0x5F;
 pub(super) const SECPKG_ATTR_CIPHER_INFO: u32 = 0x64;
+pub(super) const SECPKG_ATTR_REMOTE_CERT_CHAIN: u32 = 0x67;
 
 pub(super) const SECPKG_CRED_ATTR_NAMES: u32 = 1;
-pub(super) const SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS: u32 = 0x11;
 
 pub(super) const SECPKGCONTEXT_CIPHERINFO_V1: u32 = 1;
 pub(super) const SZ_ALG_MAX_SIZE: usize = 64;
 
 pub(super) const SCHANNEL_SHUTDOWN: u32 = 1;
-const SCHANNEL_ALERT: u32 = 2;
+pub(super) const SCHANNEL_ALERT: u32 = 2;
+pub(super) const SCHANNEL_SESSION: u32 = 3;
+
+const CALG_RSA_SIGN: u32 = 0x0000_2400;
+const CALG_ECDSA: u32 = 0x0000_2203;
 
 pub(super) const STREAM_HEADER_SIZE: u32 = 5;
 pub(super) const STREAM_TRAILER_SIZE: u32 = 64;
@@ -216,6 +259,106 @@ pub(super) struct SecPkgCredSupportedProtocols {
 
 #[repr(C)]
 #[allow(dead_code)]
+pub(super) struct SecPkgCredSupportedAlgs {
+    pub(super) c_supported_algs: u32,
+    pub(super) palg_supported_algs: *mut u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgCredCipherStrengths {
+    pub(super) dw_minimum_cipher_strength: u32,
+    pub(super) dw_maximum_cipher_strength: u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextCertificates {
+    pub(super) c_certs: u32,
+    pub(super) cb_cert_chain: u32,
+    pub(super) pb_certificate_chain: *mut u8,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextLifespan {
+    pub(super) ts_start: i64,
+    pub(super) ts_expiry: i64,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextKeyInfoA {
+    pub(super) s_signature_algorithm_name: *mut u8,
+    pub(super) s_encrypt_algorithm_name: *mut u8,
+    pub(super) key_size: u32,
+    pub(super) signature_algorithm: u32,
+    pub(super) encrypt_algorithm: u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextKeyInfoW {
+    pub(super) s_signature_algorithm_name: *mut u16,
+    pub(super) s_encrypt_algorithm_name: *mut u16,
+    pub(super) key_size: u32,
+    pub(super) signature_algorithm: u32,
+    pub(super) encrypt_algorithm: u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextProtoInfoA {
+    pub(super) s_protocol_name: *mut u8,
+    pub(super) major_version: u32,
+    pub(super) minor_version: u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextProtoInfoW {
+    pub(super) s_protocol_name: *mut u16,
+    pub(super) major_version: u32,
+    pub(super) minor_version: u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextNegotiationInfo {
+    pub(super) package_info: *mut c_void,
+    pub(super) negotiation_state: u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextFlags {
+    pub(super) flags: u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextBindings {
+    pub(super) bindings_length: u32,
+    pub(super) bindings: *mut c_void,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextEapKeyBlock {
+    pub(super) rgb_keys: [u8; 128],
+    pub(super) rgb_ivs: [u8; 64],
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextSessionInfo {
+    pub(super) dw_flags: u32,
+    pub(super) cb_session_id: u32,
+    pub(super) rgb_session_id: [u8; 32],
+}
+
+#[repr(C)]
+#[allow(dead_code)]
 struct SecPkgInfoA {
     f_capabilities: u32,
     w_version: u16,
@@ -240,27 +383,63 @@ struct SecPkgInfoW {
 // Internal credential / context tables & shared rustls TLS configuration
 // ---------------------------------------------------------------------------
 
+type ClientConfigCacheKey = (bool, bool, bool, Vec<Vec<u8>>);
+
+#[derive(Clone, Debug)]
+struct TlsParamRule {
+    /// Empty means default/wildcard (`cAlpnIds == 0`); non-empty lists ALPN protocol IDs.
+    alpn_ids: Vec<Vec<u8>>,
+    disabled_protocols: u32,
+}
+
 #[derive(Clone)]
 struct SchannelCred {
     principal: String,
+    cred_use: u32,
     flags: u32,
-    enable_tls12: bool,
-    enable_tls13: bool,
+    client_enable_tls12: bool,
+    client_enable_tls13: bool,
+    server_enable_tls12: bool,
+    server_enable_tls13: bool,
+    tls_param_rules: Vec<TlsParamRule>,
+    has_root_store: bool,
     extra_roots_der: Vec<Vec<u8>>,
+    server_cert_chain: Vec<Vec<u8>>,
+    server_private_key_pkcs8: Option<Vec<u8>>,
+    local_cert_der: Option<Vec<u8>>,
+    client_configs: Arc<std::sync::Mutex<Vec<(ClientConfigCacheKey, Arc<ClientConfig>)>>>,
+    // Partition server resumption state by client-authentication policy so a session or ticket
+    // issued without ASC_REQ_MUTUAL_AUTH can never be resumed into an mTLS context.
+    server_session_cache_no_auth: Arc<rustls::server::ServerSessionMemoryCache>,
+    server_ticketer_no_auth: Option<Arc<dyn rustls::server::ProducesTickets>>,
+    server_session_cache_mtls: Arc<rustls::server::ServerSessionMemoryCache>,
+    server_ticketer_mtls: Option<Arc<dyn rustls::server::ProducesTickets>>,
 }
 
 struct SchannelContext {
-    conn: ClientConnection,
+    conn: Connection,
+    is_server: bool,
     manual_validation: bool,
     no_servername_check: bool,
     extra_roots_der: Vec<Vec<u8>>,
+    local_cert_der: Option<Vec<u8>>,
     target_name: String,
     context_req: u32,
+    context_attr: u32,
     shutdown_pending: bool,
     shutdown_sent: bool,
     pending_shutdown_bytes: Vec<u8>,
+    pending_handshake_out: Vec<u8>,
+    pending_handshake_consumed: Option<usize>,
     pending_eof: bool,
     pending_plaintext: Vec<u8>,
+    client_hello_hs_buf: Vec<u8>,
+    client_hello_parsed: bool,
+    tls_client_random: Option<[u8; 32]>,
+    server_hello_hs_buf: Vec<u8>,
+    server_hello_parsed: bool,
+    tls_server_random: Option<[u8; 32]>,
+    tls12_session_id: Vec<u8>,
 }
 
 static CRED_TABLE: HandleTable<SchannelCred> = HandleTable::new(1, 2);
@@ -301,6 +480,147 @@ unsafe fn write_handle(p: *mut SecHandle, magic: usize, id: usize) {
     }
 }
 
+/// Resolve `(enable_tls12, enable_tls13)` for a connection with `active_alpn` against any
+/// `SCH_CREDENTIALS` v5 `TLS_PARAMETERS` rules (falling back to the credential's base flags).
+/// When multiple rules can match `active_alpn`, conservatively union their disabled masks so
+/// no protocol restriction from any applicable entry can ever be bypassed.
+fn resolve_effective_protocols(
+    cred: &SchannelCred,
+    is_server: bool,
+    active_alpn: &[Vec<u8>],
+) -> (bool, bool) {
+    let (base12, base13) = if is_server {
+        (cred.server_enable_tls12, cred.server_enable_tls13)
+    } else {
+        (cred.client_enable_tls12, cred.client_enable_tls13)
+    };
+    if cred.tls_param_rules.is_empty() {
+        return (base12, base13);
+    }
+    let (bit12, bit13) = if is_server {
+        (SP_PROT_TLS1_2_SERVER, SP_PROT_TLS1_3_SERVER)
+    } else {
+        (SP_PROT_TLS1_2_CLIENT, SP_PROT_TLS1_3_CLIENT)
+    };
+
+    let mut disabled = 0u32;
+    let mut matched_any = false;
+    // Per Windows TLS_PARAMETERS contract, zero-ALPN (`cAlpnIds == 0`) restrictions apply
+    // unconditionally regardless of the negotiated application protocol, so always union them
+    // with any matching ALPN-specific restrictions.
+    for r in &cred.tls_param_rules {
+        if r.alpn_ids.is_empty() {
+            disabled |= r.disabled_protocols;
+            matched_any = true;
+        }
+    }
+    for proto in active_alpn {
+        for r in &cred.tls_param_rules {
+            if !r.alpn_ids.is_empty() && r.alpn_ids.iter().any(|id| id == proto) {
+                disabled |= r.disabled_protocols;
+                matched_any = true;
+            }
+        }
+    }
+    if !matched_any {
+        return (base12, base13);
+    }
+    (
+        base12 && (disabled & bit12) == 0,
+        base13 && (disabled & bit13) == 0,
+    )
+}
+
+/// Parse offered ALPN protocol IDs from a complete TLS ClientHello record.
+/// Returns `Some(protos)` if a complete ClientHello was parsed (possibly empty if no ALPN
+/// extension is present), or `None` if the input is incomplete/fragmented/not a ClientHello.
+fn parse_client_hello_alpn(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if buf.len() < 5 || buf[0] != 0x16 {
+        return None;
+    }
+    let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    let rec_end = 5usize.checked_add(rec_len)?;
+    if rec_end > buf.len() {
+        return None;
+    }
+    let hs = &buf[5..rec_end];
+    if hs.len() < 4 || hs[0] != 0x01 {
+        return None;
+    }
+    let hs_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
+    let ch_end = 4usize.checked_add(hs_len)?;
+    if ch_end > hs.len() {
+        return None;
+    }
+    let ch = &hs[4..ch_end];
+    // legacy_version (2) + random (32)
+    let mut off = 34usize;
+    if off >= ch.len() {
+        return None;
+    }
+    // session_id (1-byte len)
+    let sid_len = ch[off] as usize;
+    off = off.checked_add(1 + sid_len)?;
+    // cipher_suites (2-byte len)
+    if off + 2 > ch.len() {
+        return None;
+    }
+    let cs_len = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
+    off = off.checked_add(2 + cs_len)?;
+    // compression_methods (1-byte len)
+    if off >= ch.len() {
+        return None;
+    }
+    let cm_len = ch[off] as usize;
+    off = off.checked_add(1 + cm_len)?;
+    if off == ch.len() {
+        return Some(Vec::new());
+    }
+    // extensions (2-byte len)
+    if off + 2 > ch.len() {
+        return None;
+    }
+    let ext_len = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
+    off += 2;
+    let ext_end = off.checked_add(ext_len)?;
+    if ext_end > ch.len() {
+        return None;
+    }
+    while off + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([ch[off], ch[off + 1]]);
+        let ed_len = u16::from_be_bytes([ch[off + 2], ch[off + 3]]) as usize;
+        off += 4;
+        let ed_end = off.checked_add(ed_len)?;
+        if ed_end > ext_end {
+            return None;
+        }
+        if ext_type == 0x0010 {
+            if ed_len < 2 {
+                return None;
+            }
+            let list_len = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
+            let mut p = off + 2;
+            let list_end = p.checked_add(list_len)?;
+            if list_end > ed_end {
+                return None;
+            }
+            let mut protos = Vec::new();
+            while p < list_end {
+                let plen = ch[p] as usize;
+                p += 1;
+                if plen == 0 || p + plen > list_end {
+                    return None;
+                }
+                protos.push(ch[p..p + plen].to_vec());
+                p += plen;
+            }
+            return Some(protos);
+        }
+        off = ed_end;
+    }
+    Some(Vec::new())
+}
+
 fn build_schannel_tls_config(
     cred: &SchannelCred,
     manual_validation: bool,
@@ -310,18 +630,41 @@ fn build_schannel_tls_config(
 ) -> Result<Arc<ClientConfig>, i32> {
     let policy = TlsVerifyPolicy::from_schannel(manual_validation, no_servername_check);
 
+    let has_client_cert =
+        !cred.server_cert_chain.is_empty() && cred.server_private_key_pkcs8.is_some();
+
     // Fast path onto shared cached `crate::net_tls::build_tls_config` when using
-    // default roots, both TLS 1.2 + 1.3, and standard SNI.
-    if cred.extra_roots_der.is_empty() && cred.enable_tls12 && cred.enable_tls13 && enable_sni {
+    // default roots, both TLS 1.2 + 1.3, standard SNI, reconnects enabled, and no client cert.
+    let (enable_tls12, enable_tls13) = resolve_effective_protocols(cred, false, &alpn);
+    let disable_reconnects = (cred.flags & SCH_CRED_DISABLE_RECONNECTS) != 0;
+    if cred.extra_roots_der.is_empty()
+        && enable_tls12
+        && enable_tls13
+        && enable_sni
+        && !has_client_cert
+        && !disable_reconnects
+    {
         let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
         return Ok(net_tls::build_tls_config(policy, &alpn_refs));
     }
 
+    // Reuse a cached ClientConfig on this credential when parameters match so rustls keeps the
+    // same ServerCertVerifier / ResolvesClientCert Arc identity required for session resumption.
+    let cache_key: ClientConfigCacheKey =
+        (manual_validation, no_servername_check, enable_sni, alpn.clone());
+    if !disable_reconnects {
+        if let Ok(guard) = cred.client_configs.lock() {
+            if let Some((_, existing)) = guard.iter().find(|(k, _)| *k == cache_key) {
+                return Ok(existing.clone());
+            }
+        }
+    }
+
     let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::with_capacity(2);
-    if cred.enable_tls13 {
+    if enable_tls13 {
         versions.push(&rustls::version::TLS13);
     }
-    if cred.enable_tls12 {
+    if enable_tls12 {
         versions.push(&rustls::version::TLS12);
     }
     if versions.is_empty() {
@@ -342,23 +685,59 @@ fn build_schannel_tls_config(
         .with_protocol_versions(&versions)
         .map_err(|_| SEC_E_ALGORITHM_MISMATCH)?;
 
+    let client_auth_pair = if has_client_cert {
+        let chain: Vec<CertificateDer<'static>> = cred
+            .server_cert_chain
+            .iter()
+            .map(|d| CertificateDer::from(d.clone()))
+            .collect();
+        let key = PrivateKeyDer::Pkcs8(cred.server_private_key_pkcs8.clone().unwrap().into());
+        Some((chain, key))
+    } else {
+        None
+    };
+
     let mut config = if policy.is_strict() {
-        builder.with_root_certificates(roots).with_no_client_auth()
+        let wants_auth = builder.with_root_certificates(roots);
+        if let Some((chain, key)) = client_auth_pair {
+            wants_auth
+                .with_client_auth_cert(chain, key)
+                .map_err(|_| SEC_E_NO_CREDENTIALS)?
+        } else {
+            wants_auth.with_no_client_auth()
+        }
     } else {
         let verifier = Arc::new(
             SelectiveCertVerifier::with_roots(roots, policy)
                 .map_err(|_| SEC_E_INTERNAL_ERROR)?,
         );
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth()
+        let wants_auth = builder.dangerous().with_custom_certificate_verifier(verifier);
+        if let Some((chain, key)) = client_auth_pair {
+            wants_auth
+                .with_client_auth_cert(chain, key)
+                .map_err(|_| SEC_E_NO_CREDENTIALS)?
+        } else {
+            wants_auth.with_no_client_auth()
+        }
     };
     config.enable_sni = enable_sni;
+    if disable_reconnects {
+        config.resumption = rustls::client::Resumption::disabled();
+    } else {
+        config.resumption = rustls::client::Resumption::in_memory_sessions(64);
+    }
     if !alpn.is_empty() {
         config.alpn_protocols = alpn;
     }
-    Ok(Arc::new(config))
+    let cfg = Arc::new(config);
+    if !disable_reconnects {
+        if let Ok(mut guard) = cred.client_configs.lock() {
+            if guard.len() < 16 {
+                guard.push((cache_key, cfg.clone()));
+            }
+        }
+    }
+    Ok(cfg)
 }
 
 fn map_rustls_error_to_sec(err: &rustls::Error) -> i32 {
@@ -370,16 +749,22 @@ fn map_rustls_error_to_sec(err: &rustls::Error) -> i32 {
             | rustls::CertificateError::NotValidYetContext { .. } => SEC_E_CERT_EXPIRED,
             rustls::CertificateError::NotValidForName
             | rustls::CertificateError::NotValidForNameContext { .. } => SEC_E_WRONG_PRINCIPAL,
-            rustls::CertificateError::UnknownIssuer
-            | rustls::CertificateError::BadSignature
-            | rustls::CertificateError::UnknownRevocationStatus => SEC_E_UNTRUSTED_ROOT,
+            rustls::CertificateError::UnknownIssuer | rustls::CertificateError::BadSignature => {
+                SEC_E_UNTRUSTED_ROOT
+            }
+            rustls::CertificateError::Revoked => crypt32::CERT_E_REVOKED as i32,
+            rustls::CertificateError::UnknownRevocationStatus => {
+                crypt32::CRYPT_E_NO_REVOCATION_CHECK as i32
+            }
             _ => SEC_E_CERT_UNKNOWN,
         },
+        rustls::Error::NoCertificatesPresented => SEC_E_NO_CREDENTIALS,
         rustls::Error::AlertReceived(alert) => match alert {
             rustls::AlertDescription::HandshakeFailure
             | rustls::AlertDescription::ProtocolVersion
             | rustls::AlertDescription::InsufficientSecurity => SEC_E_ALGORITHM_MISMATCH,
             rustls::AlertDescription::CertificateExpired => SEC_E_CERT_EXPIRED,
+            rustls::AlertDescription::CertificateRequired => SEC_E_NO_CREDENTIALS,
             rustls::AlertDescription::UnknownCA
             | rustls::AlertDescription::BadCertificate
             | rustls::AlertDescription::UnsupportedCertificate => SEC_E_UNTRUSTED_ROOT,
@@ -415,7 +800,175 @@ fn inspect_tls_record(buf: &[u8]) -> Result<Option<usize>, usize> {
     Ok(Some(total))
 }
 
-fn drain_tls_out(conn: &mut ClientConnection) -> Vec<u8> {
+/// Sniff `ClientHello.random` (32 bytes) from TLS handshake records so TLS 1.2
+/// `SECPKG_ATTR_EAP_KEY_BLOCK` can derive RFC 5216 §2.3 IVs with the empty-secret PRF.
+fn capture_client_hello_random(ctx: &mut SchannelContext, tls_records: &[u8]) {
+    if ctx.client_hello_parsed {
+        return;
+    }
+    let mut off = 0usize;
+    while off + 5 <= tls_records.len() {
+        let ctype = tls_records[off];
+        let rec_len = u16::from_be_bytes([tls_records[off + 3], tls_records[off + 4]]) as usize;
+        let end = off + 5 + rec_len;
+        if end > tls_records.len() {
+            break;
+        }
+        if ctype == 22 {
+            let payload = &tls_records[off + 5..end];
+            let cap = 256usize.saturating_sub(ctx.client_hello_hs_buf.len());
+            if cap > 0 {
+                let take = payload.len().min(cap);
+                ctx.client_hello_hs_buf.extend_from_slice(&payload[..take]);
+            }
+        }
+        off = end;
+    }
+    let mut pos = 0usize;
+    while pos + 4 <= ctx.client_hello_hs_buf.len() {
+        let hs_type = ctx.client_hello_hs_buf[pos];
+        let hs_len = u32::from_be_bytes([
+            0,
+            ctx.client_hello_hs_buf[pos + 1],
+            ctx.client_hello_hs_buf[pos + 2],
+            ctx.client_hello_hs_buf[pos + 3],
+        ]) as usize;
+        let body_start = pos + 4;
+        if hs_type == 0x01 {
+            if body_start + 34 > ctx.client_hello_hs_buf.len() {
+                return;
+            }
+            if let Ok(rand) = <[u8; 32]>::try_from(&ctx.client_hello_hs_buf[body_start + 2..body_start + 34]) {
+                ctx.tls_client_random = Some(rand);
+            }
+            ctx.client_hello_parsed = true;
+            ctx.client_hello_hs_buf.clear();
+            return;
+        }
+        let next = body_start.saturating_add(hs_len);
+        if next > ctx.client_hello_hs_buf.len() {
+            return;
+        }
+        pos = next;
+    }
+}
+
+/// Sniff `ServerHello.random` (32 bytes) and `ServerHello.session_id` (up to 32 bytes) from TLS
+/// handshake records so `SECPKG_ATTR_SESSION_INFO` and `SECPKG_ATTR_EAP_KEY_BLOCK` have the
+/// negotiated TLS 1.2 session ID and server random. Skips TLS 1.3 HelloRetryRequest messages.
+fn capture_server_hello_session_id(ctx: &mut SchannelContext, tls_records: &[u8]) {
+    if ctx.server_hello_parsed {
+        return;
+    }
+    const HRR_RANDOM: [u8; 32] = [
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
+        0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
+        0x33, 0x9C,
+    ];
+    let mut off = 0usize;
+    while off + 5 <= tls_records.len() {
+        let ctype = tls_records[off];
+        let rec_len = u16::from_be_bytes([tls_records[off + 3], tls_records[off + 4]]) as usize;
+        let end = off + 5 + rec_len;
+        if end > tls_records.len() {
+            break;
+        }
+        if ctype == 22 {
+            let payload = &tls_records[off + 5..end];
+            let cap = 512usize.saturating_sub(ctx.server_hello_hs_buf.len());
+            if cap > 0 {
+                let take = payload.len().min(cap);
+                ctx.server_hello_hs_buf.extend_from_slice(&payload[..take]);
+            }
+        }
+        off = end;
+    }
+    let mut pos = 0usize;
+    while pos + 4 <= ctx.server_hello_hs_buf.len() {
+        let hs_type = ctx.server_hello_hs_buf[pos];
+        let hs_len = u32::from_be_bytes([
+            0,
+            ctx.server_hello_hs_buf[pos + 1],
+            ctx.server_hello_hs_buf[pos + 2],
+            ctx.server_hello_hs_buf[pos + 3],
+        ]) as usize;
+        let body_start = pos + 4;
+        if hs_type == 0x02 {
+            if body_start + 35 > ctx.server_hello_hs_buf.len() {
+                return;
+            }
+            let random = &ctx.server_hello_hs_buf[body_start + 2..body_start + 34];
+            let sid_len = ctx.server_hello_hs_buf[body_start + 34] as usize;
+            if sid_len > 32 {
+                ctx.server_hello_parsed = true;
+                ctx.server_hello_hs_buf.clear();
+                return;
+            }
+            if body_start + 35 + sid_len > ctx.server_hello_hs_buf.len() {
+                return;
+            }
+            if random != HRR_RANDOM {
+                if let Ok(rand) = <[u8; 32]>::try_from(random) {
+                    ctx.tls_server_random = Some(rand);
+                }
+                ctx.tls12_session_id =
+                    ctx.server_hello_hs_buf[body_start + 35..body_start + 35 + sid_len].to_vec();
+                ctx.server_hello_parsed = true;
+                ctx.server_hello_hs_buf.clear();
+                return;
+            }
+        }
+        let next = body_start.saturating_add(hs_len);
+        if next > ctx.server_hello_hs_buf.len() {
+            return;
+        }
+        pos = next;
+    }
+}
+
+/// RFC 5246 §5 TLS 1.2 PRF: `PRF(secret, label, seed) = P_<hash>(secret, label + seed)`.
+pub(super) fn tls12_prf(
+    digest: crate::misc::bcrypt::Digest,
+    secret: &[u8],
+    label: &[u8],
+    seed: &[u8],
+    out: &mut [u8],
+) {
+    let mut label_seed = Vec::with_capacity(label.len() + seed.len());
+    label_seed.extend_from_slice(label);
+    label_seed.extend_from_slice(seed);
+    let mut a = digest.hmac(secret, &label_seed);
+    let mut pos = 0usize;
+    while pos < out.len() {
+        let mut block_in = Vec::with_capacity(a.len() + label_seed.len());
+        block_in.extend_from_slice(&a);
+        block_in.extend_from_slice(&label_seed);
+        let block = digest.hmac(secret, &block_in);
+        let take = (out.len() - pos).min(block.len());
+        out[pos..pos + take].copy_from_slice(&block[..take]);
+        pos += take;
+        if pos < out.len() {
+            a = digest.hmac(secret, &a);
+        }
+    }
+}
+
+fn tls12_prf_digest_for_suite(
+    suite: Option<rustls::SupportedCipherSuite>,
+) -> crate::misc::bcrypt::Digest {
+    use crate::misc::bcrypt::Digest;
+    match suite.map(|s| s.suite()) {
+        Some(
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384
+            | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+        ) => Digest::Sha384,
+        _ => Digest::Sha256,
+    }
+}
+
+fn drain_tls_out(conn: &mut Connection) -> Vec<u8> {
     let mut out = Vec::new();
     while conn.wants_write() {
         match conn.write_tls(&mut out) {
@@ -425,6 +978,206 @@ fn drain_tls_out(conn: &mut ClientConnection) -> Vec<u8> {
         }
     }
     out
+}
+
+pub(super) fn build_inbound_client_root_store(
+    has_root_store: bool,
+    extra_roots_der: &[Vec<u8>],
+) -> Arc<rustls::RootCertStore> {
+    if has_root_store {
+        // When the server supplies a private hRootStore, scope mutual-TLS client trust
+        // strictly to the CAs in that store (never merge public WebPKI roots, and never
+        // fall back to public roots if the supplied store is empty).
+        let mut s = rustls::RootCertStore::empty();
+        for der in extra_roots_der {
+            let _ = s.add(CertificateDer::from(der.as_slice()));
+        }
+        Arc::new(s)
+    } else {
+        net_tls::root_cert_store()
+    }
+}
+
+fn schannel_revocation_chain_flags(cred_flags: u32) -> u32 {
+    let mut out = 0u32;
+    if (cred_flags & SCH_CRED_REVOCATION_CHECK_END_CERT) != 0 {
+        out |= 0x1000_0000; // CERT_CHAIN_REVOCATION_CHECK_END_CERT
+    }
+    if (cred_flags & SCH_CRED_REVOCATION_CHECK_CHAIN) != 0 {
+        out |= 0x2000_0000; // CERT_CHAIN_REVOCATION_CHECK_CHAIN
+    }
+    if (cred_flags & SCH_CRED_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT) != 0 {
+        out |= 0x4000_0000; // CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT
+    }
+    out
+}
+
+/// Wraps `WebPkiClientVerifier` to enforce `SCH_CRED_REVOCATION_CHECK_*` on inbound mTLS
+/// client certificates via macOS `Security.framework`, failing closed when revocation status
+/// cannot be positively verified (unless explicitly ignored via `SCH_CRED_IGNORE_*`).
+#[derive(Debug)]
+struct RevocationClientCertVerifier {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    has_root_store: bool,
+    extra_roots_der: Vec<Vec<u8>>,
+    cred_flags: u32,
+    chain_revocation_flags: u32,
+}
+
+impl rustls::server::danger::ClientCertVerifier for RevocationClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let verified = self.inner.verify_client_cert(end_entity, intermediates, now)?;
+        let mut chain_der = Vec::with_capacity(1 + intermediates.len());
+        chain_der.push(end_entity.as_ref().to_vec());
+        for ic in intermediates {
+            chain_der.push(ic.as_ref().to_vec());
+        }
+        let rev_err = crypt32::check_chain_revocation_error(
+            &chain_der,
+            self.has_root_store.then_some(self.extra_roots_der.as_slice()),
+            &[],
+            Some(now.as_secs() as f64),
+            self.chain_revocation_flags,
+        );
+        if rev_err == 0 {
+            return Ok(verified);
+        }
+        if rev_err == crypt32::CERT_E_REVOKED {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked,
+            ));
+        }
+        let ignore_no_rev = (self.cred_flags & SCH_CRED_IGNORE_NO_REVOCATION_CHECK) != 0;
+        let ignore_offline = (self.cred_flags & SCH_CRED_IGNORE_REVOCATION_OFFLINE) != 0;
+        if (rev_err == crypt32::CRYPT_E_NO_REVOCATION_CHECK && ignore_no_rev)
+            || (rev_err == crypt32::CRYPT_E_REVOCATION_OFFLINE && ignore_offline)
+        {
+            return Ok(verified);
+        }
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownRevocationStatus,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn build_schannel_server_config(
+    cred: &SchannelCred,
+    alpn: Vec<Vec<u8>>,
+    effective_alpn: &[Vec<u8>],
+    require_client_auth: bool,
+) -> Result<Arc<ServerConfig>, i32> {
+    let Some(ref key_pkcs8) = cred.server_private_key_pkcs8 else {
+        return Err(SEC_E_NO_CREDENTIALS);
+    };
+    if cred.server_cert_chain.is_empty() {
+        return Err(SEC_E_NO_CREDENTIALS);
+    }
+    let (enable_tls12, enable_tls13) = resolve_effective_protocols(cred, true, effective_alpn);
+    let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::with_capacity(2);
+    if enable_tls13 {
+        versions.push(&rustls::version::TLS13);
+    }
+    if enable_tls12 {
+        versions.push(&rustls::version::TLS12);
+    }
+    if versions.is_empty() {
+        return Err(SEC_E_ALGORITHM_MISMATCH);
+    }
+    let chain: Vec<CertificateDer<'static>> = cred
+        .server_cert_chain
+        .iter()
+        .map(|d| CertificateDer::from(d.clone()))
+        .collect();
+    let key = PrivateKeyDer::Pkcs8(key_pkcs8.clone().into());
+    let provider = net_tls::crypto_provider();
+    let builder = ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&versions)
+        .map_err(|_| SEC_E_ALGORITHM_MISMATCH)?;
+    let mut cfg = if require_client_auth {
+        let roots = build_inbound_client_root_store(cred.has_root_store, &cred.extra_roots_der);
+        let base_verifier =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider)
+                .build()
+                .map_err(|_| SEC_E_NO_CREDENTIALS)?;
+        let rev_flags = schannel_revocation_chain_flags(cred.flags);
+        let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = if rev_flags != 0 {
+            Arc::new(RevocationClientCertVerifier {
+                inner: base_verifier,
+                has_root_store: cred.has_root_store,
+                extra_roots_der: cred.extra_roots_der.clone(),
+                cred_flags: cred.flags,
+                chain_revocation_flags: rev_flags,
+            })
+        } else {
+            base_verifier
+        };
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(chain, key)
+            .map_err(|_| SEC_E_NO_CREDENTIALS)?
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .map_err(|_| SEC_E_NO_CREDENTIALS)?
+    };
+    if (cred.flags & SCH_CRED_DISABLE_RECONNECTS) != 0 {
+        cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        cfg.send_tls13_tickets = 0;
+    } else if require_client_auth {
+        cfg.session_storage = cred.server_session_cache_mtls.clone();
+        if let Some(ref ticketer) = cred.server_ticketer_mtls {
+            cfg.ticketer = ticketer.clone();
+        }
+    } else {
+        cfg.session_storage = cred.server_session_cache_no_auth.clone();
+        if let Some(ref ticketer) = cred.server_ticketer_no_auth {
+            cfg.ticketer = ticketer.clone();
+        }
+    }
+    if !alpn.is_empty() {
+        cfg.alpn_protocols = alpn;
+    }
+    Ok(Arc::new(cfg))
 }
 
 unsafe fn emit_token_output(
@@ -500,6 +1253,26 @@ unsafe fn emit_token_output(
         std::ptr::write_unaligned(slot, sb);
         Ok(())
     }
+}
+
+unsafe fn find_input_token(p_input: *mut SecBufferDesc) -> (*const u8, usize) {
+    if p_input.is_null() {
+        return (std::ptr::null(), 0);
+    }
+    let desc = std::ptr::read_unaligned(p_input);
+    if desc.p_buffers.is_null() {
+        return (std::ptr::null(), 0);
+    }
+    for i in 0..desc.c_buffers as usize {
+        let sb = std::ptr::read_unaligned(desc.p_buffers.add(i));
+        if (sb.buffer_type & !SECBUFFER_ATTRMASK) == SECBUFFER_TOKEN
+            && !sb.pv_buffer.is_null()
+            && sb.cb_buffer > 0
+        {
+            return (sb.pv_buffer as *const u8, sb.cb_buffer as usize);
+        }
+    }
+    (std::ptr::null(), 0)
 }
 
 unsafe fn set_input_aux_buffer(
@@ -590,54 +1363,203 @@ pub(super) unsafe fn acquire_credentials_impl(
         log::debug!("AcquireCredentialsHandle(pkg={package_name:?}) -> SEC_E_SECPKG_NOT_FOUND");
         return SEC_E_SECPKG_NOT_FOUND;
     }
-    if (f_credential_use & SECPKG_CRED_OUTBOUND) == 0 {
-        stub!("AcquireCredentialsHandle(pkg={package_name:?}, use={f_credential_use:#x}): inbound unsupported");
-        return SEC_E_UNSUPPORTED_FUNCTION;
+    let want_inbound = (f_credential_use & SECPKG_CRED_INBOUND) != 0;
+    let want_outbound = (f_credential_use & SECPKG_CRED_OUTBOUND) != 0;
+    if (f_credential_use & SECPKG_CRED_BOTH) == 0 {
+        log::debug!("AcquireCredentialsHandle(pkg={package_name:?}, use={f_credential_use:#x}) -> SEC_E_NO_CREDENTIALS");
+        return SEC_E_NO_CREDENTIALS;
     }
 
     let mut flags = 0u32;
-    let mut enable_tls12 = true;
-    let mut enable_tls13 = true;
+    let mut client_enable_tls12 = true;
+    let mut client_enable_tls13 = true;
+    let mut server_enable_tls12 = true;
+    let mut server_enable_tls13 = true;
+    let mut tls_param_rules: Vec<TlsParamRule> = Vec::new();
+    let mut has_root_store = false;
     let mut extra_roots_der = Vec::new();
+    let mut server_cert_chain = Vec::new();
+    let mut server_private_key_pkcs8 = None;
+    let mut local_cert_der = None;
 
     if !p_auth_data.is_null() {
         let base = p_auth_data as *const u8;
         let dw_version = std::ptr::read_unaligned(base as *const u32);
+        let mut extract_creds = |c_creds: u32, pa_cred: *const *const c_void| {
+            if c_creds > 0 && !pa_cred.is_null() {
+                for i in 0..c_creds as usize {
+                    let cert_ctx = std::ptr::read_unaligned(pa_cred.add(i));
+                    if cert_ctx.is_null() {
+                        continue;
+                    }
+                    if let Some((chain, key)) = crypt32::lookup_cert_private_key_and_chain(cert_ctx)
+                    {
+                        if let Some(leaf_der) = chain.first() {
+                            local_cert_der = Some(leaf_der.clone());
+                        }
+                        server_cert_chain = chain;
+                        server_private_key_pkcs8 = Some(key);
+                        break;
+                    } else if local_cert_der.is_none() {
+                        let cc = std::ptr::read_unaligned(
+                            cert_ctx as *const crate::misc::wintrust::CertContext,
+                        );
+                        if !cc.pb_cert_encoded.is_null() && cc.cb_cert_encoded > 0 {
+                            local_cert_der = Some(
+                                std::slice::from_raw_parts(
+                                    cc.pb_cert_encoded,
+                                    cc.cb_cert_encoded as usize,
+                                )
+                                .to_vec(),
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
         match dw_version {
             SCHANNEL_CRED_VERSION => {
-                // SCHANNEL_CRED (Win64): hRootStore @ +0x10, grbitEnabledProtocols @ +0x38, dwFlags @ +0x48
+                // SCHANNEL_CRED (Win64): cCreds @ +0x04, paCred @ +0x08, hRootStore @ +0x10,
+                // grbitEnabledProtocols @ +0x38, dwFlags @ +0x48
+                let c_creds = std::ptr::read_unaligned(base.add(0x04) as *const u32);
+                let pa_cred = std::ptr::read_unaligned(base.add(0x08) as *const *const *const c_void);
                 let h_root_store = std::ptr::read_unaligned(base.add(0x10) as *const *mut c_void);
                 let enabled = std::ptr::read_unaligned(base.add(0x38) as *const u32);
                 flags = std::ptr::read_unaligned(base.add(0x48) as *const u32);
+                extract_creds(c_creds, pa_cred);
                 if !h_root_store.is_null() {
+                    has_root_store = true;
                     extra_roots_der = crypt32::store_certs_der(h_root_store);
                 }
                 if enabled != 0 {
-                    let want_12 = (enabled & SP_PROT_TLS1_2_CLIENT) != 0;
-                    let want_13 = (enabled & SP_PROT_TLS1_3_CLIENT) != 0;
-                    if want_12 || want_13 {
-                        enable_tls12 = want_12;
-                        enable_tls13 = want_13;
+                    // Per SCHANNEL_CRED docs, only a zero mask selects system defaults. Any
+                    // nonzero mask explicitly selects the enabled protocols; if none of the
+                    // supported TLS 1.2 / 1.3 bits for the requested direction are enabled,
+                    // fail with SEC_E_ALGORITHM_MISMATCH rather than silently falling back.
+                    client_enable_tls12 = (enabled & SP_PROT_TLS1_2_CLIENT) != 0;
+                    client_enable_tls13 = (enabled & SP_PROT_TLS1_3_CLIENT) != 0;
+                    server_enable_tls12 = (enabled & SP_PROT_TLS1_2_SERVER) != 0;
+                    server_enable_tls13 = (enabled & SP_PROT_TLS1_3_SERVER) != 0;
+                    if (want_outbound && !client_enable_tls12 && !client_enable_tls13)
+                        || (want_inbound && !server_enable_tls12 && !server_enable_tls13)
+                    {
+                        return SEC_E_ALGORITHM_MISMATCH;
                     }
                 }
             }
             SCH_CREDENTIALS_VERSION => {
-                // SCH_CREDENTIALS (Win64): hRootStore @ +0x18, dwFlags @ +0x34,
-                // cTlsParameters @ +0x38, pTlsParameters @ +0x40
+                // SCH_CREDENTIALS (Win64): cCreds @ +0x08, paCred @ +0x10, hRootStore @ +0x18,
+                // dwFlags @ +0x34, cTlsParameters @ +0x38, pTlsParameters @ +0x40
+                let c_creds = std::ptr::read_unaligned(base.add(0x08) as *const u32);
+                let pa_cred = std::ptr::read_unaligned(base.add(0x10) as *const *const *const c_void);
                 let h_root_store = std::ptr::read_unaligned(base.add(0x18) as *const *mut c_void);
                 flags = std::ptr::read_unaligned(base.add(0x34) as *const u32);
                 let c_params = std::ptr::read_unaligned(base.add(0x38) as *const u32);
                 let p_params = std::ptr::read_unaligned(base.add(0x40) as *const *const u8);
+                extract_creds(c_creds, pa_cred);
                 if !h_root_store.is_null() {
+                    has_root_store = true;
                     extra_roots_der = crypt32::store_certs_der(h_root_store);
                 }
-                if c_params > 0 && !p_params.is_null() {
-                    // TLS_PARAMETERS.grbitDisabledProtocols @ +0x10
-                    let disabled = std::ptr::read_unaligned(p_params.add(0x10) as *const u32);
-                    enable_tls12 = (disabled & SP_PROT_TLS1_2_CLIENT) == 0;
-                    enable_tls13 = (disabled & SP_PROT_TLS1_3_CLIENT) == 0;
-                    if !enable_tls12 && !enable_tls13 {
-                        return SEC_E_ALGORITHM_MISMATCH;
+                if c_params > 0 {
+                    const MAX_TLS_PARAMETERS: usize = 32;
+                    const MAX_ALPN_IDS_PER_PARAM: usize = 32;
+                    const TLS_PARAMETERS_SIZE: usize = 0x28;
+                    const TLS_PARAMS_OPTIONAL: u32 = 0x0000_0001;
+                    if p_params.is_null() || (c_params as usize) > MAX_TLS_PARAMETERS {
+                        return SEC_E_INTERNAL_ERROR;
+                    }
+                    let mut wildcard_disabled = 0u32;
+                    let mut has_wildcard = false;
+                    let mut any_client_12 = false;
+                    let mut any_client_13 = false;
+                    let mut any_server_12 = false;
+                    let mut any_server_13 = false;
+                    for i in 0..c_params as usize {
+                        // TLS_PARAMETERS (Win64, 0x28 bytes):
+                        //   +0x00 cAlpnIds (u32), +0x08 rgstrAlpnIds (PUNICODE_STRING),
+                        //   +0x10 grbitDisabledProtocols (u32), +0x14 cDisabledCrypto (u32),
+                        //   +0x18 pDisabledCrypto (PCRYPTO_SETTINGS), +0x20 dwFlags (u32)
+                        let entry = p_params.add(i * TLS_PARAMETERS_SIZE);
+                        let c_alpn_ids = std::ptr::read_unaligned(entry as *const u32) as usize;
+                        let rgstr_alpn_ids =
+                            std::ptr::read_unaligned(entry.add(0x08) as *const *const u8);
+                        let disabled = std::ptr::read_unaligned(entry.add(0x10) as *const u32);
+                        let c_disabled_crypto =
+                            std::ptr::read_unaligned(entry.add(0x14) as *const u32);
+                        let p_disabled_crypto =
+                            std::ptr::read_unaligned(entry.add(0x18) as *const *const c_void);
+                        let param_flags = std::ptr::read_unaligned(entry.add(0x20) as *const u32);
+                        if c_disabled_crypto > 0 {
+                            if p_disabled_crypto.is_null() {
+                                return SEC_E_INTERNAL_ERROR;
+                            }
+                            if (param_flags & TLS_PARAMS_OPTIONAL) != 0 {
+                                log::debug!(
+                                    "AcquireCredentialsHandle(SCH_CREDENTIALS): skipping optional TLS_PARAMETERS[{i}] with cDisabledCrypto={c_disabled_crypto}"
+                                );
+                                continue;
+                            }
+                            log::warn!(
+                                "AcquireCredentialsHandle(SCH_CREDENTIALS): rejecting mandatory TLS_PARAMETERS[{i}] with unsupported cDisabledCrypto={c_disabled_crypto}"
+                            );
+                            return SEC_E_ALGORITHM_MISMATCH;
+                        }
+                        let mut alpn_ids = Vec::with_capacity(c_alpn_ids.min(MAX_ALPN_IDS_PER_PARAM));
+                        if c_alpn_ids > 0 {
+                            if rgstr_alpn_ids.is_null() || c_alpn_ids > MAX_ALPN_IDS_PER_PARAM {
+                                return SEC_E_INTERNAL_ERROR;
+                            }
+                            for j in 0..c_alpn_ids {
+                                // UNICODE_STRING (Win64, 0x10 bytes): Length (u16) @ +0, Buffer (*const u16) @ +8
+                                let us = rgstr_alpn_ids.add(j * 0x10);
+                                let byte_len = std::ptr::read_unaligned(us as *const u16) as usize;
+                                let buf_ptr =
+                                    std::ptr::read_unaligned(us.add(0x08) as *const *const u16);
+                                if byte_len == 0 || (byte_len % 2) != 0 || buf_ptr.is_null() {
+                                    return SEC_E_INTERNAL_ERROR;
+                                }
+                                let u16_len = byte_len / 2;
+                                let mut units = Vec::with_capacity(u16_len);
+                                for k in 0..u16_len {
+                                    units.push(std::ptr::read_unaligned(buf_ptr.add(k)));
+                                }
+                                let Ok(s) = String::from_utf16(&units) else {
+                                    return SEC_E_INTERNAL_ERROR;
+                                };
+                                alpn_ids.push(s.into_bytes());
+                            }
+                        } else {
+                            has_wildcard = true;
+                            wildcard_disabled |= disabled;
+                        }
+                        any_client_12 |= (disabled & SP_PROT_TLS1_2_CLIENT) == 0;
+                        any_client_13 |= (disabled & SP_PROT_TLS1_3_CLIENT) == 0;
+                        any_server_12 |= (disabled & SP_PROT_TLS1_2_SERVER) == 0;
+                        any_server_13 |= (disabled & SP_PROT_TLS1_3_SERVER) == 0;
+                        tls_param_rules.push(TlsParamRule {
+                            alpn_ids,
+                            disabled_protocols: disabled,
+                        });
+                    }
+                    if !tls_param_rules.is_empty() {
+                        if has_wildcard {
+                            client_enable_tls12 = (wildcard_disabled & SP_PROT_TLS1_2_CLIENT) == 0;
+                            client_enable_tls13 = (wildcard_disabled & SP_PROT_TLS1_3_CLIENT) == 0;
+                            server_enable_tls12 = (wildcard_disabled & SP_PROT_TLS1_2_SERVER) == 0;
+                            server_enable_tls13 = (wildcard_disabled & SP_PROT_TLS1_3_SERVER) == 0;
+                        } else {
+                            client_enable_tls12 = any_client_12;
+                            client_enable_tls13 = any_client_13;
+                            server_enable_tls12 = any_server_12;
+                            server_enable_tls13 = any_server_13;
+                        }
+                        if (want_outbound && !client_enable_tls12 && !client_enable_tls13)
+                            || (want_inbound && !server_enable_tls12 && !server_enable_tls13)
+                        {
+                            return SEC_E_ALGORITHM_MISMATCH;
+                        }
                     }
                 }
             }
@@ -647,19 +1569,37 @@ pub(super) unsafe fn acquire_credentials_impl(
         }
     }
 
+    if want_inbound && !want_outbound && server_private_key_pkcs8.is_none() {
+        log::debug!("AcquireCredentialsHandle(INBOUND): no server cert/key in paCred -> SEC_E_NO_CREDENTIALS");
+        return SEC_E_NO_CREDENTIALS;
+    }
+
     let id = CRED_TABLE.insert(SchannelCred {
         principal,
+        cred_use: f_credential_use,
         flags,
-        enable_tls12,
-        enable_tls13,
+        client_enable_tls12,
+        client_enable_tls13,
+        server_enable_tls12,
+        server_enable_tls13,
+        tls_param_rules,
+        has_root_store,
         extra_roots_der,
+        server_cert_chain,
+        server_private_key_pkcs8,
+        local_cert_der,
+        client_configs: Arc::new(std::sync::Mutex::new(Vec::new())),
+        server_session_cache_no_auth: rustls::server::ServerSessionMemoryCache::new(64),
+        server_ticketer_no_auth: rustls::crypto::ring::Ticketer::new().ok(),
+        server_session_cache_mtls: rustls::server::ServerSessionMemoryCache::new(64),
+        server_ticketer_mtls: rustls::crypto::ring::Ticketer::new().ok(),
     });
     write_handle(ph_credential, MAGIC_CRED, id);
     if !pts_expiry.is_null() {
         std::ptr::write_unaligned(pts_expiry, i64::MAX);
     }
     log::debug!(
-        "AcquireCredentialsHandle(pkg={package_name:?}, tls12={enable_tls12}, tls13={enable_tls13}, flags={flags:#x}) -> id={id}"
+        "AcquireCredentialsHandle(pkg={package_name:?}, cli=({client_enable_tls12},{client_enable_tls13}), srv=({server_enable_tls12},{server_enable_tls13}), flags={flags:#x}) -> id={id}"
     );
     SEC_E_OK
 }
@@ -709,6 +1649,9 @@ pub(super) unsafe fn initialize_security_context_impl(
         let Some(cred) = CRED_TABLE.get_cloned(cred_id) else {
             return SEC_E_INVALID_HANDLE;
         };
+        if (cred.cred_use & SECPKG_CRED_OUTBOUND) == 0 {
+            return SEC_E_NO_CREDENTIALS;
+        }
         if ph_new_context.is_null() {
             return SEC_E_INVALID_HANDLE;
         }
@@ -760,7 +1703,7 @@ pub(super) unsafe fn initialize_security_context_impl(
         };
 
         let mut conn = match ClientConnection::new(config, server_name) {
-            Ok(c) => c,
+            Ok(c) => Connection::Client(c),
             Err(ref e) => return map_rustls_error_to_sec(e),
         };
 
@@ -770,19 +1713,33 @@ pub(super) unsafe fn initialize_security_context_impl(
         }
 
         let stored_target = target_name.clone().unwrap_or_default();
-        let ctx_id = CTXT_TABLE.insert(SchannelContext {
+        let mut new_ctx = SchannelContext {
             conn,
+            is_server: false,
             manual_validation,
             no_servername_check,
             extra_roots_der: cred.extra_roots_der,
+            local_cert_der: cred.local_cert_der,
             target_name: stored_target,
             context_req: f_context_req,
+            context_attr: ret_attr,
             shutdown_pending: false,
             shutdown_sent: false,
             pending_shutdown_bytes: Vec::new(),
+            pending_handshake_out: Vec::new(),
+            pending_handshake_consumed: None,
             pending_eof: false,
             pending_plaintext: Vec::new(),
-        });
+            client_hello_hs_buf: Vec::new(),
+            client_hello_parsed: false,
+            tls_client_random: None,
+            server_hello_hs_buf: Vec::new(),
+            server_hello_parsed: false,
+            tls_server_random: None,
+            tls12_session_id: Vec::new(),
+        };
+        capture_client_hello_random(&mut new_ctx, &client_hello);
+        let ctx_id = CTXT_TABLE.insert(new_ctx);
         write_handle(ph_new_context, MAGIC_CTXT, ctx_id);
         if !pf_context_attr.is_null() {
             std::ptr::write_unaligned(pf_context_attr, ret_attr);
@@ -827,32 +1784,48 @@ pub(super) unsafe fn initialize_security_context_impl(
                 return SEC_E_OK;
             }
 
-            // Find SECBUFFER_TOKEN in p_input.
-            let mut token_ptr: *const u8 = std::ptr::null();
-            let mut token_len: usize = 0;
-            if !p_input.is_null() {
-                unsafe {
-                    let desc = std::ptr::read_unaligned(p_input);
-                    if !desc.p_buffers.is_null() {
-                        for i in 0..desc.c_buffers as usize {
-                            let sb = std::ptr::read_unaligned(desc.p_buffers.add(i));
-                            if (sb.buffer_type & !SECBUFFER_ATTRMASK) == SECBUFFER_TOKEN
-                                && !sb.pv_buffer.is_null()
-                                && sb.cb_buffer > 0
-                            {
-                                token_ptr = sb.pv_buffer as *const u8;
-                                token_len = sb.cb_buffer as usize;
-                                break;
-                            }
+            // Flush any previously drained handshake flight that failed to fit in an earlier
+            // caller-provided output buffer (SEC_E_BUFFER_TOO_SMALL) before reading new input,
+            // preserving any unconsumed trailing input as SECBUFFER_EXTRA on retry.
+            if !ctx.pending_handshake_out.is_empty() {
+                if let Err(code) =
+                    unsafe { emit_token_output(p_output, &ctx.pending_handshake_out, allocate_mem) }
+                {
+                    return code;
+                }
+                ctx.pending_handshake_out.clear();
+                if let Some(prev_consumed) = ctx.pending_handshake_consumed.take() {
+                    let (tok_ptr, tok_len) = unsafe { find_input_token(p_input) };
+                    if !tok_ptr.is_null() && tok_len > prev_consumed {
+                        let extra = tok_len - prev_consumed;
+                        unsafe {
+                            set_input_aux_buffer(
+                                p_input,
+                                SECBUFFER_EXTRA,
+                                tok_ptr.add(prev_consumed) as *mut c_void,
+                                extra as u32,
+                            );
                         }
                     }
                 }
+                if !pf_context_attr.is_null() {
+                    unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
+                }
+                return if ctx.conn.is_handshaking() {
+                    SEC_I_CONTINUE_NEEDED
+                } else {
+                    SEC_E_OK
+                };
             }
+
+            // Find SECBUFFER_TOKEN in p_input.
+            let (token_ptr, token_len) = unsafe { find_input_token(p_input) };
 
             if token_ptr.is_null() || token_len == 0 {
                 let out = drain_tls_out(&mut ctx.conn);
                 if !out.is_empty() {
                     if let Err(code) = unsafe { emit_token_output(p_output, &out, allocate_mem) } {
+                        ctx.pending_handshake_out = out;
                         return code;
                     }
                     if !pf_context_attr.is_null() {
@@ -885,7 +1858,13 @@ pub(super) unsafe fn initialize_security_context_impl(
                         return SEC_E_INVALID_TOKEN;
                     }
                     Ok(Some(rec_total)) => {
-                        let mut rec = &input[consumed..consumed + rec_total];
+                        let rec_slice = &input[consumed..consumed + rec_total];
+                        if ctx.is_server {
+                            capture_client_hello_random(ctx, rec_slice);
+                        } else {
+                            capture_server_hello_session_id(ctx, rec_slice);
+                        }
+                        let mut rec = rec_slice;
                         while !rec.is_empty() {
                             match ctx.conn.read_tls(&mut rec) {
                                 Ok(0) => break,
@@ -927,7 +1906,14 @@ pub(super) unsafe fn initialize_security_context_impl(
             }
 
             let out_bytes = drain_tls_out(&mut ctx.conn);
+            if ctx.is_server && !out_bytes.is_empty() {
+                capture_server_hello_session_id(ctx, &out_bytes);
+            }
             if let Err(code) = unsafe { emit_token_output(p_output, &out_bytes, allocate_mem) } {
+                if !out_bytes.is_empty() {
+                    ctx.pending_handshake_out = out_bytes;
+                    ctx.pending_handshake_consumed = Some(consumed);
+                }
                 return code;
             }
 
@@ -961,6 +1947,290 @@ pub(super) unsafe fn initialize_security_context_impl(
             }
         })
         .unwrap_or(SEC_E_INVALID_HANDLE)
+}
+
+pub(super) unsafe fn accept_security_context_impl(
+    ph_credential: *mut SecHandle,
+    ph_context: *mut SecHandle,
+    p_input: *mut SecBufferDesc,
+    f_context_req: u32,
+    ph_new_context: *mut SecHandle,
+    p_output: *mut SecBufferDesc,
+    pf_context_attr: *mut u32,
+    pts_expiry: *mut i64,
+) -> i32 {
+    let allocate_mem = (f_context_req & ASC_REQ_ALLOCATE_MEMORY) != 0;
+    let require_client_auth = (f_context_req & ASC_REQ_MUTUAL_AUTH) != 0;
+    if !pts_expiry.is_null() {
+        std::ptr::write_unaligned(pts_expiry, i64::MAX);
+    }
+    let ret_attr = ASC_REQ_REPLAY_DETECT
+        | ASC_REQ_SEQUENCE_DETECT
+        | ASC_REQ_CONFIDENTIALITY
+        | ASC_REQ_STREAM
+        | (f_context_req & (ASC_REQ_MUTUAL_AUTH | ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_EXTENDED_ERROR));
+
+    // Create a fresh server context on initial call (ph_context == NULL).
+    let (ctx_id, created_new) = if ph_context.is_null() {
+        let Some(cred_id) = read_handle(ph_credential, MAGIC_CRED) else {
+            return SEC_E_INVALID_HANDLE;
+        };
+        let Some(cred) = CRED_TABLE.get_cloned(cred_id) else {
+            return SEC_E_INVALID_HANDLE;
+        };
+        if (cred.cred_use & SECPKG_CRED_INBOUND) == 0 {
+            return SEC_E_NO_CREDENTIALS;
+        }
+        if ph_new_context.is_null() {
+            return SEC_E_INVALID_HANDLE;
+        }
+        let alpn = parse_alpn_protocols(p_input);
+        let effective_alpn: Vec<Vec<u8>> = if alpn.is_empty() || cred.tls_param_rules.is_empty() {
+            Vec::new()
+        } else {
+            // Inspect the initial ClientHello token (when present and complete) to match the
+            // exact ALPN rustls will negotiate; if fragmented/unavailable, fall back
+            // conservatively to the full server ALPN list so every matching TLS_PARAMETERS
+            // restriction is enforced.
+            let mut token_slice: Option<&[u8]> = None;
+            if !p_input.is_null() {
+                let desc = std::ptr::read_unaligned(p_input);
+                if !desc.p_buffers.is_null() {
+                    for i in 0..desc.c_buffers as usize {
+                        let sb = std::ptr::read_unaligned(desc.p_buffers.add(i));
+                        if (sb.buffer_type & !SECBUFFER_ATTRMASK) == SECBUFFER_TOKEN
+                            && !sb.pv_buffer.is_null()
+                            && sb.cb_buffer > 0
+                        {
+                            token_slice = Some(std::slice::from_raw_parts(
+                                sb.pv_buffer as *const u8,
+                                sb.cb_buffer as usize,
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            match token_slice.and_then(parse_client_hello_alpn) {
+                Some(client_alpns) => alpn
+                    .iter()
+                    .find(|s| client_alpns.iter().any(|c| c == *s))
+                    .cloned()
+                    .into_iter()
+                    .collect(),
+                None => alpn.clone(),
+            }
+        };
+        let cfg = match build_schannel_server_config(&cred, alpn, &effective_alpn, require_client_auth) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let srv = match ServerConnection::new(cfg) {
+            Ok(s) => Connection::Server(s),
+            Err(ref e) => return map_rustls_error_to_sec(e),
+        };
+        let id = CTXT_TABLE.insert(SchannelContext {
+            conn: srv,
+            is_server: true,
+            manual_validation: false,
+            no_servername_check: false,
+            extra_roots_der: cred.extra_roots_der,
+            local_cert_der: cred.local_cert_der,
+            target_name: String::new(),
+            context_req: f_context_req,
+            context_attr: ret_attr,
+            shutdown_pending: false,
+            shutdown_sent: false,
+            pending_shutdown_bytes: Vec::new(),
+            pending_handshake_out: Vec::new(),
+            pending_handshake_consumed: None,
+            pending_eof: false,
+            pending_plaintext: Vec::new(),
+            client_hello_hs_buf: Vec::new(),
+            client_hello_parsed: false,
+            tls_client_random: None,
+            server_hello_hs_buf: Vec::new(),
+            server_hello_parsed: false,
+            tls_server_random: None,
+            tls12_session_id: Vec::new(),
+        });
+        (id, true)
+    } else {
+        let Some(id) = read_handle(ph_context, MAGIC_CTXT) else {
+            return SEC_E_INVALID_HANDLE;
+        };
+        (id, false)
+    };
+
+    let status = CTXT_TABLE
+        .with_mut(ctx_id, |ctx| {
+            if ctx.shutdown_pending {
+                if ctx.pending_shutdown_bytes.is_empty() && !ctx.shutdown_sent {
+                    ctx.conn.send_close_notify();
+                    ctx.pending_shutdown_bytes = drain_tls_out(&mut ctx.conn);
+                }
+                let alert_bytes = ctx.pending_shutdown_bytes.clone();
+                if let Err(code) = unsafe { emit_token_output(p_output, &alert_bytes, allocate_mem) }
+                {
+                    return code;
+                }
+                ctx.shutdown_pending = false;
+                ctx.shutdown_sent = true;
+                ctx.pending_shutdown_bytes.clear();
+                if !pf_context_attr.is_null() {
+                    unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
+                }
+                return SEC_E_OK;
+            }
+
+            // Flush any previously drained server handshake flight that did not fit in an earlier
+            // caller-provided output buffer (SEC_E_BUFFER_TOO_SMALL) before reading new input,
+            // preserving any unconsumed trailing input as SECBUFFER_EXTRA on retry.
+            if !ctx.pending_handshake_out.is_empty() {
+                if let Err(code) =
+                    unsafe { emit_token_output(p_output, &ctx.pending_handshake_out, allocate_mem) }
+                {
+                    return code;
+                }
+                ctx.pending_handshake_out.clear();
+                if let Some(prev_consumed) = ctx.pending_handshake_consumed.take() {
+                    let (tok_ptr, tok_len) = unsafe { find_input_token(p_input) };
+                    if !tok_ptr.is_null() && tok_len > prev_consumed {
+                        let extra = tok_len - prev_consumed;
+                        unsafe {
+                            set_input_aux_buffer(
+                                p_input,
+                                SECBUFFER_EXTRA,
+                                tok_ptr.add(prev_consumed) as *mut c_void,
+                                extra as u32,
+                            );
+                        }
+                    }
+                }
+                if !pf_context_attr.is_null() {
+                    unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
+                }
+                return if ctx.conn.is_handshaking() {
+                    SEC_I_CONTINUE_NEEDED
+                } else {
+                    SEC_E_OK
+                };
+            }
+
+            let (token_ptr, token_len) = unsafe { find_input_token(p_input) };
+            if token_ptr.is_null() || token_len == 0 {
+                unsafe {
+                    let _ = emit_token_output(p_output, &[], allocate_mem);
+                    set_input_aux_buffer(p_input, SECBUFFER_MISSING, std::ptr::null_mut(), 5);
+                }
+                return SEC_E_INCOMPLETE_MESSAGE;
+            }
+
+            let input = unsafe { std::slice::from_raw_parts(token_ptr, token_len) };
+            let mut consumed = 0usize;
+            let mut missing_bytes = 0usize;
+            while consumed < input.len() && ctx.conn.is_handshaking() {
+                match inspect_tls_record(&input[consumed..]) {
+                    Err(missing) => {
+                        missing_bytes = missing;
+                        break;
+                    }
+                    Ok(None) => return SEC_E_INVALID_TOKEN,
+                    Ok(Some(rec_total)) => {
+                        let rec_slice = &input[consumed..consumed + rec_total];
+                        if ctx.is_server {
+                            capture_client_hello_random(ctx, rec_slice);
+                        } else {
+                            capture_server_hello_session_id(ctx, rec_slice);
+                        }
+                        let mut rec = rec_slice;
+                        while !rec.is_empty() {
+                            match ctx.conn.read_tls(&mut rec) {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(_) => return SEC_E_INVALID_TOKEN,
+                            }
+                        }
+                        consumed += rec_total;
+                        if let Err(ref e) = ctx.conn.process_new_packets() {
+                            let sec_err = map_rustls_error_to_sec(e);
+                            if (ctx.context_req & ASC_REQ_EXTENDED_ERROR) != 0 {
+                                let alert = drain_tls_out(&mut ctx.conn);
+                                if !alert.is_empty() {
+                                    unsafe {
+                                        let _ = emit_token_output(p_output, &alert, allocate_mem);
+                                    }
+                                }
+                            }
+                            return sec_err;
+                        }
+                        if ctx.target_name.is_empty() {
+                            if let Connection::Server(ref sc) = ctx.conn {
+                                if let Some(sni) = sc.server_name() {
+                                    ctx.target_name = sni.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if consumed == 0 && ctx.conn.is_handshaking() && !ctx.conn.wants_write() {
+                unsafe {
+                    let _ = emit_token_output(p_output, &[], allocate_mem);
+                    set_input_aux_buffer(
+                        p_input,
+                        SECBUFFER_MISSING,
+                        std::ptr::null_mut(),
+                        missing_bytes.max(1) as u32,
+                    );
+                }
+                return SEC_E_INCOMPLETE_MESSAGE;
+            }
+
+            let out_bytes = drain_tls_out(&mut ctx.conn);
+            if ctx.is_server && !out_bytes.is_empty() {
+                capture_server_hello_session_id(ctx, &out_bytes);
+            }
+            if let Err(code) = unsafe { emit_token_output(p_output, &out_bytes, allocate_mem) } {
+                if !out_bytes.is_empty() {
+                    ctx.pending_handshake_out = out_bytes;
+                    ctx.pending_handshake_consumed = Some(consumed);
+                }
+                return code;
+            }
+            if consumed < input.len() {
+                let extra = input.len() - consumed;
+                unsafe {
+                    set_input_aux_buffer(
+                        p_input,
+                        SECBUFFER_EXTRA,
+                        token_ptr.add(consumed) as *mut c_void,
+                        extra as u32,
+                    );
+                }
+            }
+            if !pf_context_attr.is_null() {
+                unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
+            }
+            if ctx.conn.is_handshaking() {
+                SEC_I_CONTINUE_NEEDED
+            } else {
+                SEC_E_OK
+            }
+        })
+        .unwrap_or(SEC_E_INVALID_HANDLE);
+
+    if created_new {
+        if status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED {
+            write_handle(ph_new_context, MAGIC_CTXT, ctx_id);
+        } else {
+            let _ = CTXT_TABLE.remove(ctx_id);
+        }
+    } else if !ph_new_context.is_null() {
+        write_handle(ph_new_context, MAGIC_CTXT, ctx_id);
+    }
+    status
 }
 
 pub(super) unsafe fn complete_auth_token_impl(ph_context: *mut c_void) -> i32 {
@@ -1000,6 +2270,7 @@ pub(super) unsafe fn apply_control_token_impl(
         return SEC_E_INVALID_TOKEN;
     }
     let mut token_val: Option<u32> = None;
+    let mut second_word: Option<u32> = None;
     let mut alert_num: Option<u32> = None;
     for i in 0..desc.c_buffers as usize {
         let sb = std::ptr::read_unaligned(desc.p_buffers.add(i));
@@ -1010,7 +2281,12 @@ pub(super) unsafe fn apply_control_token_impl(
         {
             let tv = std::ptr::read_unaligned(sb.pv_buffer as *const u32);
             token_val = Some(tv);
-            if tv == SCHANNEL_ALERT && sb.cb_buffer >= 12 {
+            if sb.cb_buffer >= 8 {
+                second_word = Some(std::ptr::read_unaligned(
+                    (sb.pv_buffer as *const u8).add(4) as *const u32,
+                ));
+            }
+            if sb.cb_buffer >= 12 {
                 // SCHANNEL_ALERT_TOKEN { dwTokenType(0), dwAlertType(4), dwAlertNumber(8) }
                 alert_num = Some(std::ptr::read_unaligned(
                     (sb.pv_buffer as *const u8).add(8) as *const u32,
@@ -1019,22 +2295,61 @@ pub(super) unsafe fn apply_control_token_impl(
             break;
         }
     }
-    let is_close_notify = token_val == Some(SCHANNEL_SHUTDOWN)
-        || (token_val == Some(SCHANNEL_ALERT) && alert_num == Some(0));
-    if !is_close_notify {
-        stub!("ApplyControlToken(ctx={id}, token={token_val:?}) -> SEC_E_UNSUPPORTED_FUNCTION");
-        return SEC_E_UNSUPPORTED_FUNCTION;
-    }
-    CTXT_TABLE
-        .with_mut(id, |ctx| {
-            if !ctx.shutdown_sent && !ctx.shutdown_pending {
-                ctx.conn.send_close_notify();
-                ctx.pending_shutdown_bytes = drain_tls_out(&mut ctx.conn);
-                ctx.shutdown_pending = true;
+    match token_val {
+        Some(SCHANNEL_SHUTDOWN) => CTXT_TABLE
+            .with_mut(id, |ctx| {
+                if !ctx.shutdown_sent && !ctx.shutdown_pending {
+                    ctx.conn.send_close_notify();
+                    ctx.pending_shutdown_bytes = drain_tls_out(&mut ctx.conn);
+                    ctx.shutdown_pending = true;
+                }
+                SEC_E_OK
+            })
+            .unwrap_or(SEC_E_INVALID_HANDLE),
+        Some(SCHANNEL_ALERT) => {
+            // SCHANNEL_ALERT_TOKEN { dwTokenType(2), dwAlertType(1=WARNING|2=FATAL), dwAlertNumber }
+            let (Some(alert_type), Some(num)) = (second_word, alert_num) else {
+                return SEC_E_INVALID_TOKEN;
+            };
+            if alert_type != 1 && alert_type != 2 {
+                return SEC_E_INVALID_TOKEN;
             }
-            SEC_E_OK
-        })
-        .unwrap_or(SEC_E_INVALID_HANDLE)
+            // rustls only exposes emitting a TLS warning close_notify (type=1, number=0);
+            // honestly reject fatal or other custom alerts rather than silently emitting
+            // close_notify or discarding the requested alert.
+            if alert_type != 1 || num != 0 {
+                return SEC_E_UNSUPPORTED_FUNCTION;
+            }
+            CTXT_TABLE
+                .with_mut(id, |ctx| {
+                    if !ctx.shutdown_sent && !ctx.shutdown_pending {
+                        ctx.conn.send_close_notify();
+                        ctx.pending_shutdown_bytes = drain_tls_out(&mut ctx.conn);
+                        ctx.shutdown_pending = true;
+                    }
+                    SEC_E_OK
+                })
+                .unwrap_or(SEC_E_INVALID_HANDLE)
+        }
+        Some(SCHANNEL_SESSION) => {
+            // SCHANNEL_SESSION_TOKEN { dwTokenType(3), dwFlags(1=enable, 2=disable reconnects) }
+            // Per MSDN this controls TLS session-ID resumption cache invalidation; until per-context
+            // session-cache control is wired into rustls, honestly report SEC_E_UNSUPPORTED_FUNCTION
+            // rather than claiming success without disabling reconnections.
+            let Some(flags) = second_word else {
+                return SEC_E_INVALID_TOKEN;
+            };
+            if flags != 1 && flags != 2 {
+                return SEC_E_INVALID_TOKEN;
+            }
+            SEC_E_UNSUPPORTED_FUNCTION
+        }
+        other => {
+            // Per MSDN: unrecognized Schannel control token types return SEC_E_UNSUPPORTED_FUNCTION.
+            log::debug!("ApplyControlToken(ctx={id}, token={other:?}) -> SEC_E_UNSUPPORTED_FUNCTION");
+            SEC_E_UNSUPPORTED_FUNCTION
+        }
+    }
 }
 
 pub(super) unsafe fn encrypt_message_impl(
@@ -1410,13 +2725,32 @@ unsafe fn alloc_sec_string(s: &str, wide: bool) -> *mut c_void {
     }
 }
 
-fn kx_strength(conn: &ClientConnection) -> u32 {
+fn kx_strength(conn: &Connection) -> u32 {
     match conn.negotiated_key_exchange_group().map(|g| g.name()) {
         Some(rustls::NamedGroup::secp384r1) => 384,
         Some(rustls::NamedGroup::secp521r1) => 521,
         _ => 256,
     }
 }
+
+fn negotiated_protocol_bits(conn: &Connection, is_server: bool) -> u32 {
+    match (conn.protocol_version(), is_server) {
+        (Some(ProtocolVersion::TLSv1_3), true) => SP_PROT_TLS1_3_SERVER,
+        (Some(ProtocolVersion::TLSv1_3), false) => SP_PROT_TLS1_3_CLIENT,
+        (_, true) => SP_PROT_TLS1_2_SERVER,
+        (_, false) => SP_PROT_TLS1_2_CLIENT,
+    }
+}
+
+const SUPPORTED_SCHANNEL_ALGS: &[u32] = &[
+    CALG_AES_128,
+    CALG_AES_256,
+    CALG_SHA_256,
+    CALG_SHA_384,
+    CALG_ECDH_EPHEM,
+    CALG_RSA_SIGN,
+    CALG_ECDSA,
+];
 
 fn cipher_suite_metadata(
     suite: Option<rustls::CipherSuite>,
@@ -1636,7 +2970,10 @@ pub(super) unsafe fn query_context_attributes_impl(
                 unsafe { std::ptr::write_unaligned(p_buffer as *mut *mut c_void, pkg_ptr) };
                 SEC_E_OK
             }
-            SECPKG_ATTR_REMOTE_CERT_CONTEXT => {
+            SECPKG_ATTR_REMOTE_CERT_CONTEXT | SECPKG_ATTR_REMOTE_CERT_CHAIN => {
+                // Both SECPKG_ATTR_REMOTE_CERT_CONTEXT (0x53) and SECPKG_ATTR_REMOTE_CERT_CHAIN
+                // (0x67) return a PCCERT_CONTEXT whose hCertStore contains the peer's certificate
+                // chain (freed via CertFreeCertificateContext).
                 let Some(certs) = ctx.conn.peer_certificates() else {
                     return SEC_E_NO_CREDENTIALS;
                 };
@@ -1667,12 +3004,455 @@ pub(super) unsafe fn query_context_attributes_impl(
                 unsafe { std::ptr::write_unaligned(p_buffer as *mut *mut c_void, cert_ptr) };
                 SEC_E_OK
             }
-            SECPKG_ATTR_CONNECTION_INFO => {
-                let dw_protocol = match ctx.conn.protocol_version() {
-                    Some(ProtocolVersion::TLSv1_3) => SP_PROT_TLS1_3_CLIENT,
-                    Some(ProtocolVersion::TLSv1_2) => SP_PROT_TLS1_2_CLIENT,
-                    _ => SP_PROT_TLS1_2_CLIENT,
+            SECPKG_ATTR_LIFESPAN => {
+                let mut start = 0i64;
+                let mut expiry = i64::MAX;
+                if let Some(cert_der) = ctx
+                    .conn
+                    .peer_certificates()
+                    .and_then(|c| c.first())
+                    .map(|c| c.as_ref())
+                    .or(ctx.local_cert_der.as_deref())
+                {
+                    if let Some(owned) =
+                        crate::misc::wintrust::build_owned_cert_context(cert_der, std::ptr::null_mut())
+                    {
+                        unsafe {
+                            let ci = &*(*owned.as_ptr()).p_cert_info;
+                            start = ci.not_before as i64;
+                            expiry = ci.not_after as i64;
+                        }
+                    }
+                }
+                unsafe {
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgContextLifespan,
+                        SecPkgContextLifespan {
+                            ts_start: start,
+                            ts_expiry: expiry,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_KEY_INFO => {
+                let suite = ctx.conn.negotiated_cipher_suite().map(|s| s.suite());
+                let (_, _, cipher_name, cipher_len, _, hash_name, _, _, _) =
+                    cipher_suite_metadata(suite);
+                let sig_ptr = unsafe { alloc_sec_string(hash_name, wide) };
+                let enc_ptr = unsafe { alloc_sec_string(cipher_name, wide) };
+                if sig_ptr.is_null() || enc_ptr.is_null() {
+                    return SEC_E_INSUFFICIENT_MEMORY;
+                }
+                let ai_cipher = if cipher_len >= 256 { CALG_AES_256 } else { CALG_AES_128 };
+                let ai_hash = if hash_name == "SHA384" { CALG_SHA_384 } else { CALG_SHA_256 };
+                unsafe {
+                    if wide {
+                        std::ptr::write_unaligned(
+                            p_buffer as *mut SecPkgContextKeyInfoW,
+                            SecPkgContextKeyInfoW {
+                                s_signature_algorithm_name: sig_ptr as *mut u16,
+                                s_encrypt_algorithm_name: enc_ptr as *mut u16,
+                                key_size: cipher_len,
+                                signature_algorithm: ai_hash,
+                                encrypt_algorithm: ai_cipher,
+                            },
+                        );
+                    } else {
+                        std::ptr::write_unaligned(
+                            p_buffer as *mut SecPkgContextKeyInfoA,
+                            SecPkgContextKeyInfoA {
+                                s_signature_algorithm_name: sig_ptr as *mut u8,
+                                s_encrypt_algorithm_name: enc_ptr as *mut u8,
+                                key_size: cipher_len,
+                                signature_algorithm: ai_hash,
+                                encrypt_algorithm: ai_cipher,
+                            },
+                        );
+                    }
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_AUTHORITY => {
+                let auth_name = ctx
+                    .conn
+                    .peer_certificates()
+                    .and_then(|c| c.first())
+                    .and_then(|c| {
+                        let owned = crate::misc::wintrust::build_owned_cert_context(
+                            c.as_ref(),
+                            std::ptr::null_mut(),
+                        )?;
+                        unsafe {
+                            let ci = &*(*owned.as_ptr()).p_cert_info;
+                            if ci.issuer.pb_data.is_null() || ci.issuer.cb_data == 0 {
+                                return None;
+                            }
+                            let der = std::slice::from_raw_parts(
+                                ci.issuer.pb_data,
+                                ci.issuer.cb_data as usize,
+                            );
+                            crate::misc::wintrust::format_dn(der)
+                        }
+                    })
+                    .unwrap_or_else(|| "Schannel".to_string());
+                let s_ptr = unsafe { alloc_sec_string(&auth_name, wide) };
+                if s_ptr.is_null() {
+                    return SEC_E_INSUFFICIENT_MEMORY;
+                }
+                unsafe {
+                    if wide {
+                        std::ptr::write_unaligned(
+                            p_buffer as *mut SecPkgContextNamesW,
+                            SecPkgContextNamesW {
+                                s_user_name: s_ptr as *mut u16,
+                            },
+                        );
+                    } else {
+                        std::ptr::write_unaligned(
+                            p_buffer as *mut SecPkgContextNamesA,
+                            SecPkgContextNamesA {
+                                s_user_name: s_ptr as *mut u8,
+                            },
+                        );
+                    }
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_PROTO_INFO => {
+                let (pname, minor) = match ctx.conn.protocol_version() {
+                    Some(ProtocolVersion::TLSv1_3) => ("TLS 1.3", 4u32),
+                    _ => ("TLS 1.2", 3u32),
                 };
+                let s_ptr = unsafe { alloc_sec_string(pname, wide) };
+                if s_ptr.is_null() {
+                    return SEC_E_INSUFFICIENT_MEMORY;
+                }
+                unsafe {
+                    if wide {
+                        std::ptr::write_unaligned(
+                            p_buffer as *mut SecPkgContextProtoInfoW,
+                            SecPkgContextProtoInfoW {
+                                s_protocol_name: s_ptr as *mut u16,
+                                major_version: 3,
+                                minor_version: minor,
+                            },
+                        );
+                    } else {
+                        std::ptr::write_unaligned(
+                            p_buffer as *mut SecPkgContextProtoInfoA,
+                            SecPkgContextProtoInfoA {
+                                s_protocol_name: s_ptr as *mut u8,
+                                major_version: 3,
+                                minor_version: minor,
+                            },
+                        );
+                    }
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_NEGOTIATION_INFO => {
+                let mut pkg_ptr: *mut c_void = std::ptr::null_mut();
+                let rc = unsafe {
+                    if wide {
+                        let w: Vec<u16> = "Schannel\0".encode_utf16().collect();
+                        query_security_package_info_w_impl(w.as_ptr(), &mut pkg_ptr)
+                    } else {
+                        query_security_package_info_a_impl(b"Schannel\0".as_ptr(), &mut pkg_ptr)
+                    }
+                };
+                if rc != SEC_E_OK {
+                    return rc;
+                }
+                let state = if ctx.conn.is_handshaking() { 2u32 } else { 0u32 };
+                unsafe {
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgContextNegotiationInfo,
+                        SecPkgContextNegotiationInfo {
+                            package_info: pkg_ptr,
+                            negotiation_state: state,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_FLAGS => {
+                unsafe {
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgContextFlags,
+                        SecPkgContextFlags {
+                            flags: ctx.context_attr,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_UNIQUE_BINDINGS => {
+                // RFC 5929 §3 `tls-unique` requires the raw TLS 1.2 first Finished verify_data
+                // bytes and is undefined in TLS 1.3 (RFC 8446 / RFC 9266, where Windows Schannel
+                // returns SEC_E_UNSUPPORTED_FUNCTION). rustls intentionally does not expose TLS 1.2
+                // Finished bytes, so report SEC_E_UNSUPPORTED_FUNCTION rather than returning
+                // endpoint-binding data under the unique-bindings attribute.
+                SEC_E_UNSUPPORTED_FUNCTION
+            }
+            SECPKG_ATTR_ENDPOINT_BINDINGS => {
+                // RFC 5929 §4.1 tls-server-end-point channel binding: hash the server leaf cert
+                // DER with its signature algorithm's digest (substituting SHA-256 for MD5/SHA-1).
+                let server_cert_der = if ctx.is_server {
+                    ctx.local_cert_der.as_deref()
+                } else {
+                    ctx.conn
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .map(|c| c.as_ref())
+                };
+                let Some(cert_der) = server_cert_der else {
+                    return SEC_E_NO_CREDENTIALS;
+                };
+                let hash = rfc5929_endpoint_binding_digest(cert_der).hash(cert_der);
+                let mut app_data = Vec::with_capacity(21 + hash.len());
+                app_data.extend_from_slice(b"tls-server-end-point:");
+                app_data.extend_from_slice(&hash);
+                let total = 32 + app_data.len();
+                let mem = crate::heap::alloc(total, true) as *mut u8;
+                if mem.is_null() {
+                    return SEC_E_INSUFFICIENT_MEMORY;
+                }
+                unsafe {
+                    // SEC_CHANNEL_BINDINGS: cbApplicationDataLength @ +24, dwApplicationDataOffset @ +28
+                    std::ptr::write_unaligned(mem.add(24) as *mut u32, app_data.len() as u32);
+                    std::ptr::write_unaligned(mem.add(28) as *mut u32, 32u32);
+                    std::ptr::copy_nonoverlapping(app_data.as_ptr(), mem.add(32), app_data.len());
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgContextBindings,
+                        SecPkgContextBindings {
+                            bindings_length: total as u32,
+                            bindings: mem as *mut c_void,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_CLIENT_SPECIFIED_TARGET => {
+                let s_ptr = unsafe { alloc_sec_string(&ctx.target_name, wide) };
+                if s_ptr.is_null() {
+                    return SEC_E_INSUFFICIENT_MEMORY;
+                }
+                unsafe {
+                    if wide {
+                        std::ptr::write_unaligned(
+                            p_buffer as *mut SecPkgContextNamesW,
+                            SecPkgContextNamesW {
+                                s_user_name: s_ptr as *mut u16,
+                            },
+                        );
+                    } else {
+                        std::ptr::write_unaligned(
+                            p_buffer as *mut SecPkgContextNamesA,
+                            SecPkgContextNamesA {
+                                s_user_name: s_ptr as *mut u8,
+                            },
+                        );
+                    }
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_LOCAL_CERT_CONTEXT => {
+                let Some(ref der) = ctx.local_cert_der else {
+                    return SEC_E_NO_CREDENTIALS;
+                };
+                let cert_ptr = crypt32::duplicate_or_create_cert_context_der(der);
+                if cert_ptr.is_null() {
+                    return SEC_E_INTERNAL_ERROR;
+                }
+                unsafe { std::ptr::write_unaligned(p_buffer as *mut *mut c_void, cert_ptr) };
+                SEC_E_OK
+            }
+            SECPKG_ATTR_ROOT_STORE => {
+                let store = unsafe { crypt32::CertOpenSystemStoreA(0, b"ROOT\0".as_ptr()) };
+                if store.is_null() {
+                    return SEC_E_INTERNAL_ERROR;
+                }
+                unsafe { std::ptr::write_unaligned(p_buffer as *mut *mut c_void, store) };
+                SEC_E_OK
+            }
+            SECPKG_ATTR_SUPPORTED_ALGS => {
+                let bytes = SUPPORTED_SCHANNEL_ALGS.len() * 4;
+                let mem = crate::heap::alloc(bytes, false) as *mut u32;
+                if mem.is_null() {
+                    return SEC_E_INSUFFICIENT_MEMORY;
+                }
+                unsafe {
+                    for (i, &alg) in SUPPORTED_SCHANNEL_ALGS.iter().enumerate() {
+                        std::ptr::write_unaligned(mem.add(i), alg);
+                    }
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgCredSupportedAlgs,
+                        SecPkgCredSupportedAlgs {
+                            c_supported_algs: SUPPORTED_SCHANNEL_ALGS.len() as u32,
+                            palg_supported_algs: mem,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_CIPHER_STRENGTHS => {
+                unsafe {
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgCredCipherStrengths,
+                        SecPkgCredCipherStrengths {
+                            dw_minimum_cipher_strength: 128,
+                            dw_maximum_cipher_strength: 256,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_SUPPORTED_PROTOCOLS => {
+                let prot = if ctx.is_server {
+                    SP_PROT_TLS1_2_SERVER | SP_PROT_TLS1_3_SERVER
+                } else {
+                    SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT
+                };
+                unsafe {
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgCredSupportedProtocols,
+                        SecPkgCredSupportedProtocols {
+                            grbit_protocol: prot,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_EAP_KEY_BLOCK => {
+                let mut kb = SecPkgContextEapKeyBlock {
+                    rgb_keys: [0u8; 128],
+                    rgb_ivs: [0u8; 64],
+                };
+                match ctx.conn.protocol_version() {
+                    Some(ProtocolVersion::TLSv1_3) => {
+                        // RFC 9190 §2.3 (EAP-TLS 1.3):
+                        // Key_Material = TLS-Exporter("EXPORTER_EAP_TLS_Key_Material", 0x0D, 128)
+                        if ctx
+                            .conn
+                            .export_keying_material(
+                                &mut kb.rgb_keys,
+                                b"EXPORTER_EAP_TLS_Key_Material",
+                                Some(&[0x0Du8]),
+                            )
+                            .is_err()
+                        {
+                            return SEC_E_INVALID_HANDLE;
+                        }
+                    }
+                    Some(ProtocolVersion::TLSv1_2) => {
+                        // RFC 5216 §2.3 (EAP-TLS 1.2):
+                        //   Key_Material = TLS-PRF-128(master_secret, "client EAP encryption",
+                        //                              client.random || server.random)
+                        //   IV           = TLS-PRF-64("", "client EAP encryption",
+                        //                             client.random || server.random)
+                        if ctx
+                            .conn
+                            .export_keying_material(&mut kb.rgb_keys, b"client EAP encryption", None)
+                            .is_err()
+                        {
+                            return SEC_E_INVALID_HANDLE;
+                        }
+                        let (Some(client_random), Some(server_random)) =
+                            (ctx.tls_client_random, ctx.tls_server_random)
+                        else {
+                            return SEC_E_INVALID_HANDLE;
+                        };
+                        let mut seed = [0u8; 64];
+                        seed[..32].copy_from_slice(&client_random);
+                        seed[32..64].copy_from_slice(&server_random);
+                        let prf_digest = tls12_prf_digest_for_suite(ctx.conn.negotiated_cipher_suite());
+                        tls12_prf(
+                            prf_digest,
+                            &[],
+                            b"client EAP encryption",
+                            &seed,
+                            &mut kb.rgb_ivs,
+                        );
+                    }
+                    _ => return SEC_E_INVALID_HANDLE,
+                }
+                unsafe {
+                    std::ptr::write_unaligned(p_buffer as *mut SecPkgContextEapKeyBlock, kb);
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_SESSION_INFO => {
+                let Some(kind) = ctx.conn.handshake_kind() else {
+                    return SEC_E_INVALID_HANDLE;
+                };
+                let dw_flags = match kind {
+                    rustls::HandshakeKind::Resumed => SSL_SESSION_RECONNECT,
+                    rustls::HandshakeKind::Full
+                    | rustls::HandshakeKind::FullWithHelloRetryRequest => 0,
+                };
+                let mut rgb_session_id = [0u8; 32];
+                let cb_session_id = if ctx.conn.protocol_version() == Some(ProtocolVersion::TLSv1_2)
+                    && !ctx.tls12_session_id.is_empty()
+                {
+                    let n = ctx.tls12_session_id.len().min(32);
+                    rgb_session_id[..n].copy_from_slice(&ctx.tls12_session_id[..n]);
+                    n as u32
+                } else {
+                    0
+                };
+                unsafe {
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgContextSessionInfo,
+                        SecPkgContextSessionInfo {
+                            dw_flags,
+                            cb_session_id,
+                            rgb_session_id,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_REMOTE_CERTIFICATES => {
+                // Windows SDK schannel.h: 0x5F returns SecPkgContext_Certificates where
+                // pbCertificateChain (freed via FreeContextBuffer) packs each DER cert as
+                // <DWORD length (LE)> <cert DER bytes>.
+                let Some(certs) = ctx.conn.peer_certificates() else {
+                    return SEC_E_NO_CREDENTIALS;
+                };
+                if certs.is_empty() {
+                    return SEC_E_NO_CREDENTIALS;
+                }
+                let total_bytes: usize = certs.iter().map(|c| 4 + c.as_ref().len()).sum();
+                let mem = crate::heap::alloc(total_bytes, false) as *mut u8;
+                if mem.is_null() {
+                    return SEC_E_INSUFFICIENT_MEMORY;
+                }
+                let mut off = 0usize;
+                for c in certs {
+                    let der = c.as_ref();
+                    let len_le = (der.len() as u32).to_le_bytes();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(len_le.as_ptr(), mem.add(off), 4);
+                        off += 4;
+                        std::ptr::copy_nonoverlapping(der.as_ptr(), mem.add(off), der.len());
+                        off += der.len();
+                    }
+                }
+                unsafe {
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgContextCertificates,
+                        SecPkgContextCertificates {
+                            c_certs: certs.len() as u32,
+                            cb_cert_chain: total_bytes as u32,
+                            pb_certificate_chain: mem,
+                        },
+                    );
+                }
+                SEC_E_OK
+            }
+            SECPKG_ATTR_CONNECTION_INFO => {
+                let dw_protocol = negotiated_protocol_bits(&ctx.conn, ctx.is_server);
                 let (ai_cipher, dw_cipher_strength, ai_hash, dw_hash_strength) =
                     match ctx.conn.negotiated_cipher_suite().map(|s| s.suite()) {
                         Some(
@@ -1704,11 +3484,7 @@ pub(super) unsafe fn query_context_attributes_impl(
                 SEC_E_OK
             }
             SECPKG_ATTR_CIPHER_INFO => {
-                let dw_protocol = match ctx.conn.protocol_version() {
-                    Some(ProtocolVersion::TLSv1_3) => SP_PROT_TLS1_3_CLIENT,
-                    Some(ProtocolVersion::TLSv1_2) => SP_PROT_TLS1_2_CLIENT,
-                    _ => SP_PROT_TLS1_2_CLIENT,
-                };
+                let dw_protocol = negotiated_protocol_bits(&ctx.conn, ctx.is_server);
                 let suite = ctx.conn.negotiated_cipher_suite().map(|s| s.suite());
                 let (
                     code,
@@ -1784,7 +3560,8 @@ pub(super) unsafe fn query_context_attributes_impl(
                 SEC_E_OK
             }
             other => {
-                stub!("QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION");
+                // Per MSDN: attributes not supported by Schannel return SEC_E_UNSUPPORTED_FUNCTION.
+                log::debug!("QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION");
                 SEC_E_UNSUPPORTED_FUNCTION
             }
         })
@@ -1829,13 +3606,51 @@ pub(super) unsafe fn query_credentials_attributes_impl(
             }
             SEC_E_OK
         }
-        SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS => {
-            let mut prot = 0u32;
-            if cred.enable_tls12 {
-                prot |= SP_PROT_TLS1_2_CLIENT;
+        SECPKG_ATTR_SUPPORTED_ALGS => {
+            let bytes = SUPPORTED_SCHANNEL_ALGS.len() * 4;
+            let mem = crate::heap::alloc(bytes, false) as *mut u32;
+            if mem.is_null() {
+                return SEC_E_INSUFFICIENT_MEMORY;
             }
-            if cred.enable_tls13 {
-                prot |= SP_PROT_TLS1_3_CLIENT;
+            for (i, &alg) in SUPPORTED_SCHANNEL_ALGS.iter().enumerate() {
+                std::ptr::write_unaligned(mem.add(i), alg);
+            }
+            std::ptr::write_unaligned(
+                p_buffer as *mut SecPkgCredSupportedAlgs,
+                SecPkgCredSupportedAlgs {
+                    c_supported_algs: SUPPORTED_SCHANNEL_ALGS.len() as u32,
+                    palg_supported_algs: mem,
+                },
+            );
+            SEC_E_OK
+        }
+        SECPKG_ATTR_CIPHER_STRENGTHS => {
+            std::ptr::write_unaligned(
+                p_buffer as *mut SecPkgCredCipherStrengths,
+                SecPkgCredCipherStrengths {
+                    dw_minimum_cipher_strength: 128,
+                    dw_maximum_cipher_strength: 256,
+                },
+            );
+            SEC_E_OK
+        }
+        SECPKG_ATTR_SUPPORTED_PROTOCOLS => {
+            let mut prot = 0u32;
+            if (cred.cred_use & SECPKG_CRED_OUTBOUND) != 0 {
+                if cred.client_enable_tls12 {
+                    prot |= SP_PROT_TLS1_2_CLIENT;
+                }
+                if cred.client_enable_tls13 {
+                    prot |= SP_PROT_TLS1_3_CLIENT;
+                }
+            }
+            if (cred.cred_use & SECPKG_CRED_INBOUND) != 0 {
+                if cred.server_enable_tls12 {
+                    prot |= SP_PROT_TLS1_2_SERVER;
+                }
+                if cred.server_enable_tls13 {
+                    prot |= SP_PROT_TLS1_3_SERVER;
+                }
             }
             std::ptr::write_unaligned(
                 p_buffer as *mut SecPkgCredSupportedProtocols,
@@ -1846,7 +3661,8 @@ pub(super) unsafe fn query_credentials_attributes_impl(
             SEC_E_OK
         }
         _ => {
-            stub!(
+            // Per MSDN: attributes not supported by Schannel credentials return SEC_E_UNSUPPORTED_FUNCTION.
+            log::debug!(
                 "QueryCredentialsAttributes{}(attr={ul_attribute:#x}) -> SEC_E_UNSUPPORTED_FUNCTION",
                 if wide { "W" } else { "A" }
             );
@@ -1919,4 +3735,84 @@ pub(super) unsafe fn query_security_package_info_w_impl(
     );
     std::ptr::write_unaligned(pp_package_info, mem as *mut c_void);
     SEC_E_OK
+}
+
+fn parse_der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    if input.len() < 2 {
+        return None;
+    }
+    let tag = input[0];
+    let b1 = input[1];
+    let (len, hdr) = if b1 < 0x80 {
+        (b1 as usize, 2usize)
+    } else {
+        let n = (b1 & 0x7F) as usize;
+        if n == 0 || n > 4 || 2 + n > input.len() {
+            return None;
+        }
+        let mut l = 0usize;
+        for i in 0..n {
+            l = (l << 8) | input[2 + i] as usize;
+        }
+        (l, 2 + n)
+    };
+    if hdr.checked_add(len)? > input.len() {
+        return None;
+    }
+    Some((tag, &input[hdr..hdr + len], &input[hdr + len..]))
+}
+
+/// Select the channel-binding hash algorithm for `tls-server-end-point` per RFC 5929 §4.1:
+/// use the hash algorithm from the server certificate's outer `signatureAlgorithm`, substituting
+/// SHA-256 for MD5 or SHA-1 (and for signature schemes without a single legacy digest).
+pub(super) fn rfc5929_endpoint_binding_digest(cert_der: &[u8]) -> crate::misc::bcrypt::Digest {
+    use crate::misc::bcrypt::Digest;
+
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    let Some((0x30, cert_body, _)) = parse_der_tlv(cert_der) else {
+        return Digest::Sha256;
+    };
+    // Skip tbsCertificate
+    let Some((_, _, after_tbs)) = parse_der_tlv(cert_body) else {
+        return Digest::Sha256;
+    };
+    // signatureAlgorithm ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }
+    let Some((0x30, alg_body, _)) = parse_der_tlv(after_tbs) else {
+        return Digest::Sha256;
+    };
+    let Some((0x06, alg_oid, params_rest)) = parse_der_tlv(alg_body) else {
+        return Digest::Sha256;
+    };
+
+    const OID_SHA384_WITH_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C];
+    const OID_SHA512_WITH_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D];
+    const OID_ECDSA_WITH_SHA384: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03];
+    const OID_ECDSA_WITH_SHA512: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04];
+    const OID_RSASSA_PSS: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
+    const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+    const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+
+    match alg_oid {
+        OID_SHA384_WITH_RSA | OID_ECDSA_WITH_SHA384 => Digest::Sha384,
+        OID_SHA512_WITH_RSA | OID_ECDSA_WITH_SHA512 => Digest::Sha512,
+        OID_RSASSA_PSS => {
+            // RSASSA-PSS-params ::= SEQUENCE { [0] hashAlgorithm AlgorithmIdentifier DEFAULT sha1, ... }
+            if let Some((0x30, pss_body, _)) = parse_der_tlv(params_rest) {
+                if let Some((0xA0, hash_ctx, _)) = parse_der_tlv(pss_body) {
+                    if let Some((0x30, hash_alg_seq, _)) = parse_der_tlv(hash_ctx) {
+                        if let Some((0x06, hash_oid, _)) = parse_der_tlv(hash_alg_seq) {
+                            return match hash_oid {
+                                OID_SHA384 => Digest::Sha384,
+                                OID_SHA512 => Digest::Sha512,
+                                _ => Digest::Sha256,
+                            };
+                        }
+                    }
+                }
+            }
+            Digest::Sha256
+        }
+        // MD5, SHA-1 (RFC 5929 §4.1 substitute SHA-256), SHA-256, or default
+        _ => Digest::Sha256,
+    }
 }

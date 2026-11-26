@@ -9,21 +9,32 @@
 
 mod asn1;
 mod chain;
+mod decode;
+mod pkcs;
 mod store;
 
 use crate::types::*;
 use std::ffi::c_void;
 use std::sync::Arc;
-use store::{CRYPT_E_NOT_FOUND, ERROR_CALL_NOT_IMPLEMENTED};
+use store::ERROR_CALL_NOT_IMPLEMENTED;
 
-pub(crate) use asn1::{dpapi_protect_bytes, dpapi_unprotect_bytes};
-pub(crate) use chain::verify_peer_chain_error;
+pub(crate) use asn1::{cert_eku_oids, dpapi_protect_bytes, dpapi_unprotect_bytes};
+pub(crate) use chain::{
+    check_chain_revocation_error, verify_cert_signed_by_der, verify_peer_chain_error,
+};
+pub(crate) use pkcs::verify_cmsg_signer_info_signature;
 #[allow(unused_imports)]
 pub(crate) use chain::{
-    map_rustls_cert_error, CERT_E_CHAINING, CERT_E_CN_NO_MATCH, CERT_E_EXPIRED, CERT_E_REVOKED,
-    CERT_E_UNTRUSTEDROOT, CERT_E_WRONG_USAGE,
+    map_rustls_cert_error, CERT_E_CHAINING, CERT_E_CN_NO_MATCH, CERT_E_EXPIRED,
+    CERT_E_INVALID_POLICY, CERT_E_REVOKED, CERT_E_UNTRUSTEDROOT, CERT_E_WRONG_USAGE,
+    CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE,
 };
-pub(crate) use store::{register_peer_cert_chain, store_certs_der, PeerCertVerifyResult};
+#[allow(unused_imports)]
+pub(crate) use store::{
+    attach_cert_private_key_pkcs8, copy_store_certs_with_properties,
+    duplicate_or_create_cert_context_der, lookup_cert_private_key_and_chain,
+    register_peer_cert_chain, store_certs_der, PeerCertVerifyResult,
+};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
@@ -38,19 +49,11 @@ pub(crate) fn default_root_store() -> Arc<rustls::RootCertStore> {
     crate::net_tls::root_cert_store()
 }
 
-// @exports PFXImportCertStore CryptMsgOpenToDecode CryptFindOIDInfo
-failing!(*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND;
-    PFXImportCertStore,
-    CryptMsgOpenToDecode, CryptFindOIDInfo);
-
-// @exports CertGetCertificateContextProperty CertStrToNameA CertStrToNameW CertVerifySubjectCertificateContext CryptDecodeObject CryptDecodeObjectEx CryptImportPublicKeyInfo CryptMsgUpdate CryptVerifyMessageSignature
+// Blocked on advapi32::CryptImportKey (owned by parallel branch stubs/crypto-cng-capi);
+// SPKI -> Win32 PUBLICKEYBLOB conversion is implemented in `decode::spki_to_capi_public_key_blob`.
+// @exports CryptImportPublicKeyInfo
 failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
-    CertGetCertificateContextProperty,
-    CertStrToNameA, CertStrToNameW,
-    CertVerifySubjectCertificateContext,
-    CryptDecodeObject, CryptDecodeObjectEx,
-    CryptImportPublicKeyInfo, CryptMsgUpdate,
-    CryptVerifyMessageSignature);
+    CryptImportPublicKeyInfo);
 
 // ---------------------------------------------------------------------------
 // Certificate Contexts & Stores
@@ -80,10 +83,10 @@ pub unsafe extern "win64" fn CertOpenStore(
     lpsz_store_provider: *const u8,
     _dw_encoding_type: u32,
     _h_crypt_prov: usize,
-    _dw_flags: u32,
+    dw_flags: u32,
     pv_para: *const c_void,
 ) -> *mut c_void {
-    store::cert_open_store_impl(lpsz_store_provider, pv_para)
+    store::cert_open_store_with_flags_impl(lpsz_store_provider, dw_flags, pv_para)
 }
 
 pub unsafe extern "win64" fn CertOpenSystemStoreA(
@@ -171,8 +174,8 @@ pub unsafe extern "win64" fn CertGetCertificateChain(
     p_cert_context: *const c_void,
     p_time: *const c_void,
     h_additional_store: *mut c_void,
-    _p_chain_para: *const c_void,
-    _dw_flags: u32,
+    p_chain_para: *const c_void,
+    dw_flags: u32,
     _pv_reserved: *mut c_void,
     pp_chain_context: *mut *mut c_void,
 ) -> BOOL {
@@ -181,8 +184,14 @@ pub unsafe extern "win64" fn CertGetCertificateChain(
         p_cert_context,
         p_time,
         h_additional_store,
+        p_chain_para,
+        dw_flags,
         pp_chain_context,
     )
+}
+
+pub unsafe extern "win64" fn CertDuplicateCertificateChain(chain_h: *const c_void) -> *mut c_void {
+    chain::cert_duplicate_certificate_chain_impl(chain_h)
 }
 
 pub unsafe extern "win64" fn CertFreeCertificateChain(chain_h: *mut c_void) {
@@ -223,6 +232,96 @@ pub unsafe extern "win64" fn CryptEncodeObjectEx(
         dw_flags,
         pv_encoded,
         pcb_encoded,
+    )
+}
+
+pub unsafe extern "win64" fn CryptDecodeObject(
+    dw_cert_encoding_type: u32,
+    lpsz_struct_type: *const u8,
+    pb_encoded: *const u8,
+    cb_encoded: u32,
+    dw_flags: u32,
+    pv_struct_info: *mut c_void,
+    pcb_struct_info: *mut u32,
+) -> BOOL {
+    decode::crypt_decode_object_impl(
+        dw_cert_encoding_type,
+        lpsz_struct_type,
+        pb_encoded,
+        cb_encoded,
+        dw_flags,
+        pv_struct_info,
+        pcb_struct_info,
+    )
+}
+
+pub unsafe extern "win64" fn CryptDecodeObjectEx(
+    dw_cert_encoding_type: u32,
+    lpsz_struct_type: *const u8,
+    pb_encoded: *const u8,
+    cb_encoded: u32,
+    dw_flags: u32,
+    p_decode_para: *const c_void,
+    pv_struct_info: *mut c_void,
+    pcb_struct_info: *mut u32,
+) -> BOOL {
+    decode::crypt_decode_object_ex_impl(
+        dw_cert_encoding_type,
+        lpsz_struct_type,
+        pb_encoded,
+        cb_encoded,
+        dw_flags,
+        p_decode_para,
+        pv_struct_info,
+        pcb_struct_info,
+    )
+}
+
+pub unsafe extern "win64" fn CryptFindOIDInfo(
+    dw_key_type: u32,
+    pv_key: *const c_void,
+    dw_group_id: u32,
+) -> *mut c_void {
+    decode::crypt_find_oid_info_impl(dw_key_type, pv_key, dw_group_id)
+}
+
+pub unsafe extern "win64" fn CertStrToNameA(
+    dw_cert_encoding_type: u32,
+    psz_x500: LPCSTR,
+    dw_str_type: u32,
+    pv_reserved: *mut c_void,
+    pb_encoded: *mut u8,
+    pcb_encoded: *mut u32,
+    ppsz_error: *mut LPCSTR,
+) -> BOOL {
+    decode::cert_str_to_name_a_impl(
+        dw_cert_encoding_type,
+        psz_x500,
+        dw_str_type,
+        pv_reserved,
+        pb_encoded,
+        pcb_encoded,
+        ppsz_error,
+    )
+}
+
+pub unsafe extern "win64" fn CertStrToNameW(
+    dw_cert_encoding_type: u32,
+    psz_x500: LPCWSTR,
+    dw_str_type: u32,
+    pv_reserved: *mut c_void,
+    pb_encoded: *mut u8,
+    pcb_encoded: *mut u32,
+    ppsz_error: *mut LPCWSTR,
+) -> BOOL {
+    decode::cert_str_to_name_w_impl(
+        dw_cert_encoding_type,
+        psz_x500,
+        dw_str_type,
+        pv_reserved,
+        pb_encoded,
+        pcb_encoded,
+        ppsz_error,
     )
 }
 
@@ -350,18 +449,117 @@ pub unsafe extern "win64" fn CertVerifyTimeValidity(
     chain::cert_verify_time_validity_impl(p_time_to_verify, p_cert_info)
 }
 
+pub unsafe extern "win64" fn CertVerifySubjectCertificateContext(
+    p_subject: *const c_void,
+    p_issuer: *const c_void,
+    pdw_flags: *mut u32,
+) -> BOOL {
+    chain::cert_verify_subject_certificate_context_impl(p_subject, p_issuer, pdw_flags)
+}
+
+pub unsafe extern "win64" fn CertGetCertificateContextProperty(
+    p_cert_context: *const c_void,
+    dw_prop_id: u32,
+    pv_data: *mut c_void,
+    pcb_data: *mut u32,
+) -> BOOL {
+    store::cert_get_certificate_context_property_impl(p_cert_context, dw_prop_id, pv_data, pcb_data)
+}
+
+pub unsafe extern "win64" fn CertSetCertificateContextProperty(
+    p_cert_context: *const c_void,
+    dw_prop_id: u32,
+    dw_flags: u32,
+    pv_data: *const c_void,
+) -> BOOL {
+    store::cert_set_certificate_context_property_impl(p_cert_context, dw_prop_id, dw_flags, pv_data)
+}
+
+pub unsafe extern "win64" fn CertCreateCRLContext(
+    dw_cert_encoding_type: u32,
+    pb_crl_encoded: *const u8,
+    cb_crl_encoded: u32,
+) -> *mut c_void {
+    store::cert_create_crl_context_impl(dw_cert_encoding_type, pb_crl_encoded, cb_crl_encoded)
+}
+
+pub unsafe extern "win64" fn CertDuplicateCRLContext(ctx: *const c_void) -> *mut c_void {
+    store::cert_duplicate_crl_context_impl(ctx)
+}
+
 pub unsafe extern "win64" fn CertFreeCRLContext(ctx: *mut c_void) -> BOOL {
-    if !ctx.is_null() {
-        stub!("CertFreeCRLContext({ctx:p}): foreign CRL context ignored");
-    }
-    TRUE
+    store::cert_free_crl_context_impl(ctx)
+}
+
+pub unsafe extern "win64" fn CertCreateCTLContext(
+    dw_msg_and_cert_encoding_type: u32,
+    pb_ctl_encoded: *const u8,
+    cb_ctl_encoded: u32,
+) -> *mut c_void {
+    store::cert_create_ctl_context_impl(dw_msg_and_cert_encoding_type, pb_ctl_encoded, cb_ctl_encoded)
+}
+
+pub unsafe extern "win64" fn CertDuplicateCTLContext(ctx: *const c_void) -> *mut c_void {
+    store::cert_duplicate_ctl_context_impl(ctx)
 }
 
 pub unsafe extern "win64" fn CertFreeCTLContext(ctx: *mut c_void) -> BOOL {
-    if !ctx.is_null() {
-        stub!("CertFreeCTLContext({ctx:p}): foreign CTL context ignored");
-    }
-    TRUE
+    store::cert_free_ctl_context_impl(ctx)
+}
+
+pub unsafe extern "win64" fn CryptMsgOpenToDecode(
+    dw_msg_encoding_type: u32,
+    dw_flags: u32,
+    dw_msg_type: u32,
+    h_crypt_prov: usize,
+    p_recipient_info: *mut c_void,
+    p_stream_info: *mut c_void,
+) -> *mut c_void {
+    pkcs::crypt_msg_open_to_decode_impl(
+        dw_msg_encoding_type,
+        dw_flags,
+        dw_msg_type,
+        h_crypt_prov,
+        p_recipient_info,
+        p_stream_info,
+    )
+}
+
+pub unsafe extern "win64" fn CryptMsgUpdate(
+    h_crypt_msg: *mut c_void,
+    pb_data: *const u8,
+    cb_data: u32,
+    f_final: BOOL,
+) -> BOOL {
+    pkcs::crypt_msg_update_impl(h_crypt_msg, pb_data, cb_data, f_final)
+}
+
+pub unsafe extern "win64" fn CryptVerifyMessageSignature(
+    p_verify_para: *const c_void,
+    dw_signer_index: u32,
+    pb_signed_blob: *const u8,
+    cb_signed_blob: u32,
+    pb_decoded: *mut u8,
+    pcb_decoded: *mut u32,
+    pp_signer_cert: *mut *mut c_void,
+) -> BOOL {
+    pkcs::crypt_verify_message_signature_impl(
+        p_verify_para,
+        dw_signer_index,
+        pb_signed_blob,
+        cb_signed_blob,
+        pb_decoded,
+        pcb_decoded,
+        pp_signer_cert,
+    )
+}
+
+pub unsafe extern "win64" fn PFXImportCertStore(
+    p_pfx: *const c_void,
+    sz_password: LPCWSTR,
+    dw_flags: u32,
+) -> *mut c_void {
+    pkcs::pfx_import_cert_store_impl(p_pfx, sz_password, dw_flags)
 }
 
 pub unsafe extern "win64" fn CertGetNameStringW(
@@ -510,4 +708,4 @@ pub unsafe extern "win64" fn CryptUnprotectData(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
