@@ -538,6 +538,370 @@ pub fn cursor_warp(p: POINT) {
 // Modal alert (MessageBox)
 // ---------------------------------------------------------------------------
 
+/// Result returned by [`task_dialog_alert`] when displayed interactively.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskDialogAlertResult {
+    pub button_index: usize,
+    pub radio_index: Option<usize>,
+    pub verified: bool,
+}
+
+/// Outcome of presenting a modal TaskDialog alert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskDialogOutcome {
+    /// Interactive dialog was dismissed by a button click or `TDM_CLICK_BUTTON`.
+    Completed(TaskDialogAlertResult),
+    /// User cancelled the dialog via Escape / close button under
+    /// `TDF_ALLOW_DIALOG_CANCELLATION` (without clicking a configured button),
+    /// yielding `IDCANCEL` while preserving the latest radio/verification state.
+    Cancelled {
+        radio_index: Option<usize>,
+        verified: bool,
+    },
+    /// Active modal alert was torn down because `TDM_NAVIGATE_PAGE` replaced the
+    /// dialog's page configuration while open; caller should immediately re-present
+    /// the new page.
+    Navigated,
+    /// The dialog-owning Win32 thread received `WM_QUIT`; the native modal
+    /// session has been cancelled/unwound and `PostQuitMessage` has been
+    /// preserved for the outer message loop.
+    Quit,
+    /// No interactive desktop is available (headless / iOS).
+    Unavailable,
+}
+
+/// Live events emitted by an open interactive TaskDialog alert while its modal
+/// session is running, forwarded to the owning Win32 thread immediately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskDialogEvent {
+    RadioSelected(usize),
+    VerificationToggled(bool),
+    HyperlinkClicked(String),
+    ButtonClicked(TaskDialogAlertResult),
+    Cancelled {
+        radio_index: Option<usize>,
+        verified: bool,
+    },
+    Navigated,
+}
+
+/// Progress bar state for `TaskDialogIndirect` (`TDF_SHOW_PROGRESS_BAR` /
+/// `TDF_SHOW_MARQUEE_PROGRESS_BAR` and `TDM_SET_PROGRESS_BAR_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskDialogProgressState {
+    pub marquee: bool,
+    pub marquee_running: bool,
+    pub min: u16,
+    pub max: u16,
+    pub pos: i32,
+    /// `PBST_NORMAL` (1), `PBST_ERROR` (2), or `PBST_PAUSED` (3).
+    pub state: u32,
+}
+
+/// Live content/selection/enabled/hyperlink/progress/dismissal update pushed
+/// from a Win32 TaskDialog callback back to the currently open native `NSAlert`.
+#[derive(Clone, Debug)]
+pub struct TaskDialogLiveUpdate {
+    pub caption: String,
+    pub text: String,
+    pub links: Vec<(String, String)>,
+    pub progress: Option<TaskDialogProgressState>,
+    pub button_enabled: Vec<bool>,
+    pub radio_enabled: Vec<bool>,
+    pub selected_radio_idx: Option<usize>,
+    pub verification_checked: Option<bool>,
+    pub click_button_idx: Option<usize>,
+    pub navigate_page: bool,
+}
+
+/// Service the owning Win32 thread's full window-message queue (cross-thread
+/// `SendMessageW` sent items, posted messages for the dialog and any other
+/// windows owned by the thread such as the parent/owner HWND, and `WM_TIMER`)
+/// plus optional periodic `TDF_CALLBACK_TIMER` ticks while waiting for live
+/// native modal events on `rx`.
+/// `on_timer` receives elapsed milliseconds since `timer_origin` and returns
+/// `true` to reset `timer_origin` (matching `TDN_TIMER` returning `S_FALSE`).
+///
+/// If `WM_QUIT` arrives on the owning thread while waiting, its exit code is
+/// re-posted via `PostQuitMessage` for the outer message loop, `on_cancel` is
+/// invoked to dismiss/unwind the native modal session, and
+/// [`TaskDialogOutcome::Quit`] is returned.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn pump_task_dialog_wait_loop<F, T, C>(
+    _dialog_hwnd: usize,
+    rx: std::sync::mpsc::Receiver<TaskDialogEvent>,
+    timer_origin: &mut std::time::Instant,
+    timer_interval: Option<std::time::Duration>,
+    on_event: &mut F,
+    on_timer: &mut T,
+    mut on_cancel: C,
+) -> TaskDialogOutcome
+where
+    F: FnMut(TaskDialogEvent),
+    T: FnMut(u32) -> bool,
+    C: FnMut(),
+{
+    let mut next_tick = timer_interval.map(|iv| std::time::Instant::now() + iv);
+    loop {
+        let mut quit_code: Option<i32> = None;
+        unsafe {
+            let mut msg = crate::user32::MSG::default();
+            // Pump the owning thread's full queue (hWnd == NULL) like a Windows
+            // modal-dialog loop so cross-thread sent messages, owner-window posted
+            // completion messages, and timers are delivered while the dialog is open.
+            // Cap each burst so a perpetually invalid WM_PAINT cannot starve `rx`
+            // or `TDF_CALLBACK_TIMER`.
+            for _ in 0..64 {
+                if crate::user32::message::PeekMessageW(
+                    &mut msg,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    crate::user32::message::PM_REMOVE,
+                ) == 0
+                {
+                    break;
+                }
+                if msg.message == crate::user32::wm::QUIT {
+                    quit_code = Some(msg.wparam as i32);
+                    break;
+                }
+                let _ = crate::user32::message::TranslateMessage(&msg);
+                crate::user32::message::DispatchMessageW(&msg);
+            }
+        }
+        if let Some(code) = quit_code {
+            // Preserve WM_QUIT and its exit code for the outer message loop,
+            // then cancel/unwind the native modal dialog session.
+            unsafe {
+                crate::user32::message::PostQuitMessage(code);
+            }
+            on_cancel();
+            return TaskDialogOutcome::Quit;
+        }
+        let mut wait = std::time::Duration::from_millis(5);
+        if let (Some(interval), Some(due)) = (timer_interval, next_tick) {
+            let now = std::time::Instant::now();
+            if now >= due {
+                let elapsed_ms = now
+                    .saturating_duration_since(*timer_origin)
+                    .as_millis()
+                    .min(u32::MAX as u128) as u32;
+                if on_timer(elapsed_ms) {
+                    *timer_origin = std::time::Instant::now();
+                }
+                next_tick = Some(std::time::Instant::now() + interval);
+                // Re-drain any messages sent by the timer callback (e.g. TDM_CLICK_BUTTON
+                // or PostQuitMessage) before sleeping on `rx`.
+                continue;
+            }
+            let remaining = due.saturating_duration_since(now);
+            if remaining < wait {
+                wait = remaining;
+            }
+        }
+        match rx.recv_timeout(wait) {
+            Ok(TaskDialogEvent::ButtonClicked(res)) => return TaskDialogOutcome::Completed(res),
+            Ok(TaskDialogEvent::Cancelled { radio_index, verified }) => {
+                return TaskDialogOutcome::Cancelled { radio_index, verified };
+            }
+            Ok(TaskDialogEvent::Navigated) => return TaskDialogOutcome::Navigated,
+            Ok(other) => on_event(other),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if crate::user32::message::has_pending_quit() {
+                    return TaskDialogOutcome::Quit;
+                }
+                return TaskDialogOutcome::Unavailable;
+            }
+        }
+    }
+}
+
+/// Show a modal task-dialog alert with push buttons plus optional radio buttons
+/// and verification checkbox, forwarding radio/checkbox selection changes live
+/// to `on_event` and optional `TDF_CALLBACK_TIMER` ticks to `on_timer` on the
+/// calling Win32 thread while the modal session is open.
+/// Also pumps cross-thread Win32 messages targeting `dialog_hwnd` while waiting.
+/// Returns [`TaskDialogOutcome::Unavailable`] when headless / on iOS, or
+/// [`TaskDialogOutcome::Quit`] when the owning thread receives `WM_QUIT`.
+#[allow(clippy::too_many_arguments)]
+pub fn task_dialog_alert<F, T>(
+    session_id: u64,
+    dialog_hwnd: usize,
+    caption: String,
+    text: String,
+    links: Vec<(String, String)>,
+    progress: Option<TaskDialogProgressState>,
+    buttons: Vec<String>,
+    button_enabled: Vec<bool>,
+    default_button_idx: Option<usize>,
+    cancel_button_idx: Option<usize>,
+    allow_cancellation: bool,
+    radios: Vec<String>,
+    radio_enabled: Vec<bool>,
+    default_radio_idx: Option<usize>,
+    verification_text: Option<String>,
+    verification_checked: bool,
+    verification_enabled: bool,
+    critical: bool,
+    timer_origin: &mut std::time::Instant,
+    timer_interval: Option<std::time::Duration>,
+    mut on_event: F,
+    mut on_timer: T,
+) -> TaskDialogOutcome
+where
+    F: FnMut(TaskDialogEvent),
+    T: FnMut(u32) -> bool,
+{
+    if crate::user32::message::has_pending_quit() {
+        return TaskDialogOutcome::Quit;
+    }
+    #[cfg(test)]
+    {
+        if let Some(res) = invoke_test_task_dialog_presenter(
+            &caption,
+            &text,
+            &links,
+            progress,
+            &buttons,
+            &button_enabled,
+            default_button_idx,
+            cancel_button_idx,
+            allow_cancellation,
+            &radios,
+            &radio_enabled,
+            default_radio_idx,
+            verification_text.as_deref(),
+            verification_checked,
+            verification_enabled,
+            &mut on_event,
+        ) {
+            return res;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !active() {
+            return TaskDialogOutcome::Unavailable;
+        }
+        if is_main_thread() {
+            return appkit::task_dialog_alert_inline(
+                session_id,
+                &caption,
+                &text,
+                &links,
+                progress,
+                &buttons,
+                &button_enabled,
+                default_button_idx,
+                cancel_button_idx,
+                allow_cancellation,
+                &radios,
+                &radio_enabled,
+                default_radio_idx,
+                verification_text.as_deref(),
+                verification_checked,
+                verification_enabled,
+                critical,
+                timer_origin,
+                timer_interval,
+                &mut on_event,
+                &mut on_timer,
+            );
+        }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_main = cancelled.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<TaskDialogEvent>();
+        appkit::schedule_task_dialog_present(move || {
+            appkit::task_dialog_alert_channel(
+                session_id,
+                &caption,
+                &text,
+                &links,
+                progress,
+                &buttons,
+                &button_enabled,
+                default_button_idx,
+                cancel_button_idx,
+                allow_cancellation,
+                &radios,
+                &radio_enabled,
+                default_radio_idx,
+                verification_text.as_deref(),
+                verification_checked,
+                verification_enabled,
+                critical,
+                tx,
+                cancelled_main,
+            );
+        });
+        let cancel_flag = cancelled;
+        pump_task_dialog_wait_loop(
+            dialog_hwnd,
+            rx,
+            timer_origin,
+            timer_interval,
+            &mut on_event,
+            &mut on_timer,
+            move || {
+                cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+                appkit::schedule_task_dialog_update(move || {
+                    appkit::task_dialog_alert_cancel(session_id);
+                });
+            },
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session_id,
+            dialog_hwnd,
+            caption,
+            text,
+            links,
+            progress,
+            buttons,
+            button_enabled,
+            default_button_idx,
+            cancel_button_idx,
+            allow_cancellation,
+            radios,
+            radio_enabled,
+            default_radio_idx,
+            verification_text,
+            verification_checked,
+            verification_enabled,
+            critical,
+            timer_origin,
+            timer_interval,
+            &mut on_event,
+            &mut on_timer,
+        );
+        TaskDialogOutcome::Unavailable
+    }
+}
+
+/// Push a live content/selection/dismissal update to an open native TaskDialog
+/// alert (`session_id`) from a Win32 callback (`SetWindowTextW`, `TDM_*`).
+pub fn task_dialog_alert_update(session_id: u64, update: TaskDialogLiveUpdate) {
+    #[cfg(test)]
+    invoke_test_task_dialog_updater(session_id, &update);
+
+    #[cfg(target_os = "macos")]
+    if active() {
+        if is_main_thread() {
+            appkit::task_dialog_alert_update(session_id, &update);
+        } else {
+            appkit::schedule_task_dialog_update(move || {
+                appkit::task_dialog_alert_update(session_id, &update);
+            });
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (session_id, update);
+}
+
 /// Show a modal alert with the given buttons; returns the index of the
 /// button pressed, or `None` when headless / on iOS.
 pub fn alert(caption: String, text: String, buttons: Vec<String>, critical: bool) -> Option<usize> {
@@ -674,6 +1038,120 @@ pub fn progress_window_close() {
     if active() {
         let _ = run_sync(appkit::progress_window_close);
     }
+}
+
+#[cfg(test)]
+pub(crate) type TestTaskDialogPresenter = Box<
+    dyn FnMut(
+        &str,
+        &str,
+        &[(String, String)],
+        Option<TaskDialogProgressState>,
+        &[String],
+        &[bool],
+        Option<usize>,
+        &[String],
+        &[bool],
+        Option<usize>,
+        Option<&str>,
+        bool,
+        &mut dyn FnMut(TaskDialogEvent),
+    ) -> TaskDialogOutcome,
+>;
+
+#[cfg(test)]
+pub(crate) type TestTaskDialogUpdater = Box<dyn FnMut(u64, &TaskDialogLiveUpdate)>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TASK_DIALOG_PRESENTER: std::cell::RefCell<Option<TestTaskDialogPresenter>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_TASK_DIALOG_UPDATER: std::cell::RefCell<Option<TestTaskDialogUpdater>> =
+        const { std::cell::RefCell::new(None) };
+    static LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static LAST_TEST_TASK_DIALOG_VERIFICATION_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static LAST_TEST_TASK_DIALOG_CANCEL_BUTTON_IDX: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_task_dialog_presenter(hook: Option<TestTaskDialogPresenter>) {
+    TEST_TASK_DIALOG_PRESENTER.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_task_dialog_updater(hook: Option<TestTaskDialogUpdater>) {
+    TEST_TASK_DIALOG_UPDATER.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn last_test_task_dialog_allow_cancellation() -> bool {
+    LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn last_test_task_dialog_verification_enabled() -> bool {
+    LAST_TEST_TASK_DIALOG_VERIFICATION_ENABLED.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn last_test_task_dialog_cancel_button_idx() -> Option<usize> {
+    LAST_TEST_TASK_DIALOG_CANCEL_BUTTON_IDX.with(|c| c.get())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn invoke_test_task_dialog_presenter(
+    caption: &str,
+    text: &str,
+    links: &[(String, String)],
+    progress: Option<TaskDialogProgressState>,
+    buttons: &[String],
+    button_enabled: &[bool],
+    default_button_idx: Option<usize>,
+    cancel_button_idx: Option<usize>,
+    allow_cancellation: bool,
+    radios: &[String],
+    radio_enabled: &[bool],
+    default_radio_idx: Option<usize>,
+    verification_text: Option<&str>,
+    verification_checked: bool,
+    verification_enabled: bool,
+    on_event: &mut dyn FnMut(TaskDialogEvent),
+) -> Option<TaskDialogOutcome> {
+    LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION.with(|c| c.set(allow_cancellation));
+    LAST_TEST_TASK_DIALOG_VERIFICATION_ENABLED.with(|c| c.set(verification_enabled));
+    LAST_TEST_TASK_DIALOG_CANCEL_BUTTON_IDX.with(|c| c.set(cancel_button_idx));
+    TEST_TASK_DIALOG_PRESENTER.with(|cell| {
+        cell.borrow_mut().as_mut().map(|f| {
+            f(
+                caption,
+                text,
+                links,
+                progress,
+                buttons,
+                button_enabled,
+                default_button_idx,
+                radios,
+                radio_enabled,
+                default_radio_idx,
+                verification_text,
+                verification_checked,
+                on_event,
+            )
+        })
+    })
+}
+
+#[cfg(test)]
+fn invoke_test_task_dialog_updater(session_id: u64, update: &TaskDialogLiveUpdate) {
+    TEST_TASK_DIALOG_UPDATER.with(|cell| {
+        if let Some(f) = cell.borrow_mut().as_mut() {
+            f(session_id, update);
+        }
+    });
 }
 
 #[cfg(test)]

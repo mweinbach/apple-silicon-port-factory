@@ -195,6 +195,7 @@ static PERF_METER: Mutex<PerfMeterState> = Mutex::new(PerfMeterState {
     submits: 0,
     cbs: 0,
 });
+static PERF_METER_TOTAL_BUSY_NS: AtomicU64 = AtomicU64::new(0);
 
 fn perf_meter_callback(queue_kind: u32, n_cbs: u32, _commit_ns: u64, gpu_start_ns: u64, gpu_end_ns: u64) {
     // Track merged non-overlapping GPU busy time on Direct queues (`ListType::Direct as u32 == 0`).
@@ -204,7 +205,9 @@ fn perf_meter_callback(queue_kind: u32, n_cbs: u32, _commit_ns: u64, gpu_start_n
     if let Ok(mut st) = PERF_METER.lock() {
         let start = gpu_start_ns.max(st.last_end_ns);
         if gpu_end_ns > start {
-            st.busy_ns = st.busy_ns.saturating_add(gpu_end_ns - start);
+            let delta = gpu_end_ns - start;
+            st.busy_ns = st.busy_ns.saturating_add(delta);
+            PERF_METER_TOTAL_BUSY_NS.fetch_add(delta, Ordering::Relaxed);
             st.last_end_ns = gpu_end_ns;
         }
         st.submits = st.submits.saturating_add(1);
@@ -221,6 +224,17 @@ pub fn enable_perf_meter() {
         Ordering::AcqRel,
         Ordering::Acquire,
     );
+}
+
+/// Non-destructively read the monotonic cumulative Direct-queue GPU busy time in
+/// nanoseconds when the built-in perf meter is active, or `None` if GPU busy
+/// metering is disabled or another feedback hook owns the slot.
+pub fn perf_meter_total_busy_ns() -> Option<u64> {
+    if FEEDBACK_HOOK.load(Ordering::Relaxed) == (perf_meter_callback as GpuFeedbackHook) as usize {
+        Some(PERF_METER_TOTAL_BUSY_NS.load(Ordering::Relaxed))
+    } else {
+        None
+    }
 }
 
 /// Return and reset `(gpu_busy_ns, submits, cbs)` accumulated since the previous call.

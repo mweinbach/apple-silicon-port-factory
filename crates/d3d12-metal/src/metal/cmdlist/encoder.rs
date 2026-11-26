@@ -654,7 +654,7 @@ impl CommandList {
         self.pt.as_mut().map(|p| p.cur())
     }
 
-    /// Pass timing split mode (`AW2_PASS_TIMING=2`): close the open encoder
+    /// Pass timing split mode (`PORT_PASS_TIMING=2`): close the open encoder
     /// before the next dispatch/draw when it already holds one, and fence the
     /// next one behind it (independent encoders overlap on the GPU, which
     /// would put other work inside each interval).

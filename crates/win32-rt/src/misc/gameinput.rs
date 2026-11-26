@@ -480,6 +480,67 @@ pub fn record_mouse_wheel(dx: i64, dy: i64) {
     if dy != 0 {
         MOUSE_WHEEL_Y.fetch_add(dy, Ordering::Relaxed);
     }
+    if dx != 0 || dy != 0 {
+        on_mouse_changed();
+    }
+}
+
+static GAMEINPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Record a gamepad's initial reading directly into chronological reading history
+/// at connection/reconnection time so `GetCurrentReading`, `GetNextReading`,
+/// `GetPreviousReading`, and `GetTemporalReading` share a single ordered stream.
+pub(crate) fn on_gamepad_connected(slot: usize, initial_pad: &xinput1_4::Gamepad) {
+    if slot >= xinput1_4::XUSER_MAX_COUNT {
+        return;
+    }
+    let ts = current_timestamp_us();
+    let payload = ReadingPayload::Gamepad(xinput_to_gamepad_state(initial_pad));
+    let mut st = runtime_state().lock().unwrap();
+    let _ = st.push_snapshot_at(DeviceKind::Gamepad(slot), GAME_INPUT_KIND_GAMEPAD, payload, ts);
+}
+
+/// Disconnect hook: retained readings stay in `history` for historical
+/// `GetTemporalReading` lookups, while `GetCurrentReading` checks live device
+/// connectivity via `poll_matching_live` and a later reconnect pushes a new
+/// chronological entry via `on_gamepad_connected`.
+pub(crate) fn on_gamepad_disconnected(_slot: usize) {}
+
+/// Record a gamepad input transition with its event timestamp immediately when
+/// the backend updates so subsequent `GetCurrentTimestamp()` → `GetTemporalReading()`
+/// queries find the transition without requiring a future timestamp offset.
+pub(crate) fn on_gamepad_state_changed(slot: usize, pad: &xinput1_4::Gamepad) {
+    if slot >= xinput1_4::XUSER_MAX_COUNT || !GAMEINPUT_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let ts = current_timestamp_us();
+    let payload = ReadingPayload::Gamepad(xinput_to_gamepad_state(pad));
+    let mut st = runtime_state().lock().unwrap();
+    let _ = st.record_or_reuse_at(DeviceKind::Gamepad(slot), GAME_INPUT_KIND_GAMEPAD, payload, ts);
+}
+
+/// Record a keyboard state transition with its event timestamp when `user32::input`
+/// processes a key event.
+pub(crate) fn on_keyboard_changed() {
+    if !GAMEINPUT_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut st = runtime_state().lock().unwrap();
+    let ts = current_timestamp_us();
+    let payload = ReadingPayload::Keyboard(snapshot_keyboard());
+    let _ = st.record_or_reuse_at(DeviceKind::Keyboard, GAME_INPUT_KIND_KEYBOARD, payload, ts);
+}
+
+/// Record a mouse state transition with its event timestamp when `user32::input`
+/// processes a mouse move, button, or wheel event.
+pub(crate) fn on_mouse_changed() {
+    if !GAMEINPUT_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut st = runtime_state().lock().unwrap();
+    let ts = current_timestamp_us();
+    let payload = ReadingPayload::Mouse(snapshot_mouse());
+    let _ = st.record_or_reuse_at(DeviceKind::Mouse, GAME_INPUT_KIND_MOUSE, payload, ts);
 }
 
 fn current_timestamp_us() -> u64 {
@@ -599,12 +660,12 @@ fn dpad_to_switch(buttons: u32) -> u32 {
 fn snapshot_keyboard() -> Vec<GameInputKeyState> {
     let shift = crate::user32::input::shift_down();
     let caps = crate::user32::input::caps_on();
-    let lshift = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_LSHIFT as i32) < 0 };
-    let rshift = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_RSHIFT as i32) < 0 };
-    let lctrl = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_LCONTROL as i32) < 0 };
-    let rctrl = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_RCONTROL as i32) < 0 };
-    let lalt = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_LMENU as i32) < 0 };
-    let ralt = unsafe { crate::user32::input::GetAsyncKeyState(keymap::VK_RMENU as i32) < 0 };
+    let lshift = crate::user32::input::async_down(keymap::VK_LSHIFT);
+    let rshift = crate::user32::input::async_down(keymap::VK_RSHIFT);
+    let lctrl = crate::user32::input::async_down(keymap::VK_LCONTROL);
+    let rctrl = crate::user32::input::async_down(keymap::VK_RCONTROL);
+    let lalt = crate::user32::input::async_down(keymap::VK_LMENU);
+    let ralt = crate::user32::input::async_down(keymap::VK_RMENU);
 
     let mut keys = Vec::new();
     for vk in 0x08u8..=0xFEu8 {
@@ -621,7 +682,7 @@ fn snapshot_keyboard() -> Vec<GameInputKeyState> {
             keymap::VK_RCONTROL => rctrl,
             keymap::VK_LMENU => lalt,
             keymap::VK_RMENU => ralt,
-            _ => unsafe { crate::user32::input::GetAsyncKeyState(vk as i32) < 0 },
+            _ => crate::user32::input::async_down(vk),
         };
         if !down {
             continue;
@@ -641,22 +702,20 @@ fn snapshot_keyboard() -> Vec<GameInputKeyState> {
 
 fn snapshot_mouse() -> GameInputMouseState {
     let mut buttons = GAME_INPUT_MOUSE_NONE;
-    unsafe {
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_LBUTTON as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_LEFT_BUTTON;
-        }
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_RBUTTON as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_RIGHT_BUTTON;
-        }
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_MBUTTON as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_MIDDLE_BUTTON;
-        }
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_XBUTTON1 as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_BUTTON_4;
-        }
-        if crate::user32::input::GetAsyncKeyState(keymap::VK_XBUTTON2 as i32) < 0 {
-            buttons |= GAME_INPUT_MOUSE_BUTTON_5;
-        }
+    if crate::user32::input::async_down(keymap::VK_LBUTTON) {
+        buttons |= GAME_INPUT_MOUSE_LEFT_BUTTON;
+    }
+    if crate::user32::input::async_down(keymap::VK_RBUTTON) {
+        buttons |= GAME_INPUT_MOUSE_RIGHT_BUTTON;
+    }
+    if crate::user32::input::async_down(keymap::VK_MBUTTON) {
+        buttons |= GAME_INPUT_MOUSE_MIDDLE_BUTTON;
+    }
+    if crate::user32::input::async_down(keymap::VK_XBUTTON1) {
+        buttons |= GAME_INPUT_MOUSE_BUTTON_4;
+    }
+    if crate::user32::input::async_down(keymap::VK_XBUTTON2) {
+        buttons |= GAME_INPUT_MOUSE_BUTTON_5;
     }
     let pt = crate::user32::cursor::cursor_pos();
     GameInputMouseState {
@@ -674,12 +733,23 @@ fn snapshot_mouse() -> GameInputMouseState {
 // ---------------------------------------------------------------------------
 
 const READING_HISTORY_CAP: usize = 128;
+const DEVICE_RING_COUNT: usize = 2 + xinput1_4::XUSER_MAX_COUNT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceKind {
     Keyboard,
     Mouse,
     Gamepad(usize),
+}
+
+impl DeviceKind {
+    fn index(self) -> usize {
+        match self {
+            DeviceKind::Keyboard => 0,
+            DeviceKind::Mouse => 1,
+            DeviceKind::Gamepad(slot) => 2 + slot,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -713,7 +783,10 @@ struct CallbackEntry {
 }
 
 struct RuntimeState {
-    history: VecDeque<ReadingSnapshot>,
+    /// Per-device chronological reading history rings (Keyboard, Mouse, Gamepad 0..3)
+    /// so noisy activity on one device (e.g. high-rate mouse movement) never evicts
+    /// the active readings of quiet devices.
+    histories: [VecDeque<ReadingSnapshot>; DEVICE_RING_COUNT],
     next_history_id: u64,
     seq_gamepad: [u64; xinput1_4::XUSER_MAX_COUNT],
     seq_keyboard: u64,
@@ -726,7 +799,7 @@ struct RuntimeState {
 impl RuntimeState {
     fn new() -> Self {
         Self {
-            history: VecDeque::with_capacity(READING_HISTORY_CAP),
+            histories: std::array::from_fn(|_| VecDeque::with_capacity(READING_HISTORY_CAP)),
             next_history_id: 0,
             seq_gamepad: [0; xinput1_4::XUSER_MAX_COUNT],
             seq_keyboard: 0,
@@ -737,33 +810,16 @@ impl RuntimeState {
         }
     }
 
-    fn record_or_reuse(
-        &mut self,
-        device_kind: DeviceKind,
-        input_kind: u32,
-        payload: ReadingPayload,
-    ) -> ReadingSnapshot {
-        if let Some(latest) = self
-            .history
-            .iter()
-            .rev()
-            .find(|e| e.device_kind == device_kind && e.input_kind == input_kind)
-        {
-            if latest.payload == payload {
-                return latest.clone();
-            }
-        }
-        self.push_snapshot(device_kind, input_kind, payload)
+    fn ring(&self, device_kind: DeviceKind) -> &VecDeque<ReadingSnapshot> {
+        &self.histories[device_kind.index()]
     }
 
-    fn push_snapshot(
-        &mut self,
-        device_kind: DeviceKind,
-        input_kind: u32,
-        payload: ReadingPayload,
-    ) -> ReadingSnapshot {
-        self.next_history_id = self.next_history_id.wrapping_add(1).max(1);
-        let seq = match device_kind {
+    fn ring_mut(&mut self, device_kind: DeviceKind) -> &mut VecDeque<ReadingSnapshot> {
+        &mut self.histories[device_kind.index()]
+    }
+
+    fn next_seq(&mut self, device_kind: DeviceKind) -> u64 {
+        match device_kind {
             DeviceKind::Keyboard => {
                 self.seq_keyboard = self.seq_keyboard.wrapping_add(1).max(1);
                 self.seq_keyboard
@@ -776,19 +832,72 @@ impl RuntimeState {
                 self.seq_gamepad[slot] = self.seq_gamepad[slot].wrapping_add(1).max(1);
                 self.seq_gamepad[slot]
             }
-        };
+        }
+    }
+
+    fn record_or_reuse(
+        &mut self,
+        device_kind: DeviceKind,
+        input_kind: u32,
+        payload: ReadingPayload,
+    ) -> ReadingSnapshot {
+        self.record_or_reuse_at(device_kind, input_kind, payload, current_timestamp_us())
+    }
+
+    fn record_or_reuse_at(
+        &mut self,
+        device_kind: DeviceKind,
+        input_kind: u32,
+        payload: ReadingPayload,
+        timestamp_us: u64,
+    ) -> ReadingSnapshot {
+        if let Some(latest) = self.ring(device_kind).back() {
+            if timestamp_us < latest.timestamp_us {
+                return latest.clone();
+            }
+            if latest.input_kind == input_kind && latest.payload == payload {
+                return latest.clone();
+            }
+        }
+        self.push_snapshot_at(device_kind, input_kind, payload, timestamp_us)
+    }
+
+    fn push_snapshot(
+        &mut self,
+        device_kind: DeviceKind,
+        input_kind: u32,
+        payload: ReadingPayload,
+    ) -> ReadingSnapshot {
+        self.push_snapshot_at(device_kind, input_kind, payload, current_timestamp_us())
+    }
+
+    fn push_snapshot_at(
+        &mut self,
+        device_kind: DeviceKind,
+        input_kind: u32,
+        payload: ReadingPayload,
+        timestamp_us: u64,
+    ) -> ReadingSnapshot {
+        if let Some(latest) = self.ring(device_kind).back() {
+            if timestamp_us < latest.timestamp_us {
+                return latest.clone();
+            }
+        }
+        self.next_history_id = self.next_history_id.wrapping_add(1).max(1);
+        let seq = self.next_seq(device_kind);
         let snap = ReadingSnapshot {
             history_id: self.next_history_id,
             sequence_number: seq,
-            timestamp_us: current_timestamp_us(),
+            timestamp_us,
             input_kind,
             device_kind,
             payload,
         };
-        if self.history.len() >= READING_HISTORY_CAP {
-            self.history.pop_front();
+        let ring = self.ring_mut(device_kind);
+        if ring.len() >= READING_HISTORY_CAP {
+            ring.pop_front();
         }
-        self.history.push_back(snap.clone());
+        ring.push_back(snap.clone());
         snap
     }
 
@@ -831,6 +940,8 @@ fn device_status_for(kind: DeviceKind) -> u32 {
     }
 }
 
+/// Caller must invoke `ensure_gamepad_started()` before acquiring `runtime_state()`
+/// when gamepad/controller input may be polled.
 fn poll_matching_live(
     input_kind: u32,
     device_filter: Option<DeviceKind>,
@@ -858,7 +969,6 @@ fn poll_matching_live(
                 if input_kind & (GAME_INPUT_KIND_GAMEPAD | GAME_INPUT_KIND_CONTROLLER) == 0 {
                     return None;
                 }
-                ensure_gamepad_started();
                 let (pad, _) = xinput1_4::slot_state(slot)?;
                 Some((
                     dk,
@@ -870,7 +980,6 @@ fn poll_matching_live(
     }
 
     if input_kind & (GAME_INPUT_KIND_GAMEPAD | GAME_INPUT_KIND_CONTROLLER) != 0 {
-        ensure_gamepad_started();
         for slot in 0..xinput1_4::XUSER_MAX_COUNT {
             if let Some((pad, _)) = xinput1_4::slot_state(slot) {
                 return Some((
@@ -1843,13 +1952,15 @@ unsafe extern "win64" fn gi_get_current_reading(
         }
     };
 
+    if input_kind & (GAME_INPUT_KIND_GAMEPAD | GAME_INPUT_KIND_CONTROLLER) != 0 {
+        ensure_gamepad_started();
+    }
+    let mut st = runtime_state().lock().unwrap();
     let Some((dev_kind, actual_kind, payload)) = poll_matching_live(input_kind, device_filter) else {
         return GAMEINPUT_E_READING_NOT_FOUND;
     };
-    let snap = runtime_state()
-        .lock()
-        .unwrap()
-        .record_or_reuse(dev_kind, actual_kind, payload);
+    let snap = st.record_or_reuse(dev_kind, actual_kind, payload);
+    drop(st);
     std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
     S_OK
 }
@@ -1877,36 +1988,50 @@ unsafe extern "win64" fn gi_get_next_reading(
         }
     };
     let ref_id = (*ref_reading).snapshot.history_id;
+    let ref_dev = (*ref_reading).snapshot.device_kind;
 
-    {
-        let st = runtime_state().lock().unwrap();
-        if let Some(found) = st.history.iter().find(|e| {
-            e.history_id > ref_id
-                && kind_matches_filter(e.input_kind, input_kind)
-                && device_filter.map_or(true, |dk| e.device_kind == dk)
-        }) {
-            std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
-            return S_OK;
-        }
-        if let Some(oldest) = st.history.front() {
-            if ref_id < oldest.history_id {
-                return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
-            }
+    if input_kind & (GAME_INPUT_KIND_GAMEPAD | GAME_INPUT_KIND_CONTROLLER) != 0 {
+        ensure_gamepad_started();
+    }
+    let mut st = runtime_state().lock().unwrap();
+    let found = match device_filter {
+        Some(dk) => st
+            .ring(dk)
+            .iter()
+            .find(|e| e.history_id > ref_id && kind_matches_filter(e.input_kind, input_kind))
+            .cloned(),
+        None => st
+            .histories
+            .iter()
+            .filter_map(|ring| {
+                ring.iter()
+                    .find(|e| e.history_id > ref_id && kind_matches_filter(e.input_kind, input_kind))
+            })
+            .min_by_key(|e| e.history_id)
+            .cloned(),
+    };
+    if let Some(snap) = found {
+        drop(st);
+        std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
+        return S_OK;
+    }
+    if let Some(oldest) = st.ring(ref_dev).front() {
+        if ref_id < oldest.history_id {
+            return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
         }
     }
 
-    // At the newest boundary: check once if live input changed since the latest recorded snapshot.
+    // At the newest boundary: check once under the same lock if live input changed since
+    // the latest recorded snapshot.
     if let Some((dev_kind, actual_kind, live_payload)) = poll_matching_live(input_kind, device_filter) {
-        let mut st = runtime_state().lock().unwrap();
         let unchanged = st
-            .history
-            .iter()
-            .rev()
-            .find(|e| e.device_kind == dev_kind && e.input_kind == actual_kind)
-            .is_some_and(|latest| latest.payload == live_payload);
+            .ring(dev_kind)
+            .back()
+            .is_some_and(|latest| latest.input_kind == actual_kind && latest.payload == live_payload);
         if !unchanged {
             let snap = st.push_snapshot(dev_kind, actual_kind, live_payload);
             if snap.history_id > ref_id {
+                drop(st);
                 std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
                 return S_OK;
             }
@@ -1938,17 +2063,32 @@ unsafe extern "win64" fn gi_get_previous_reading(
         }
     };
     let ref_id = (*ref_reading).snapshot.history_id;
+    let ref_dev = (*ref_reading).snapshot.device_kind;
 
     let st = runtime_state().lock().unwrap();
-    if let Some(found) = st.history.iter().rev().find(|e| {
-        e.history_id < ref_id
-            && kind_matches_filter(e.input_kind, input_kind)
-            && device_filter.map_or(true, |dk| e.device_kind == dk)
-    }) {
-        std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
+    let found = match device_filter {
+        Some(dk) => st
+            .ring(dk)
+            .iter()
+            .rev()
+            .find(|e| e.history_id < ref_id && kind_matches_filter(e.input_kind, input_kind))
+            .cloned(),
+        None => st
+            .histories
+            .iter()
+            .filter_map(|ring| {
+                ring.iter()
+                    .rev()
+                    .find(|e| e.history_id < ref_id && kind_matches_filter(e.input_kind, input_kind))
+            })
+            .max_by_key(|e| e.history_id)
+            .cloned(),
+    };
+    if let Some(snap) = found {
+        std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
         return S_OK;
     }
-    if let Some(oldest) = st.history.front() {
+    if let Some(oldest) = st.ring(ref_dev).front() {
         if ref_id < oldest.history_id {
             return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
         }
@@ -1958,15 +2098,36 @@ unsafe extern "win64" fn gi_get_previous_reading(
 
 unsafe extern "win64" fn gi_get_temporal_reading(
     _this: *mut GameInputObj,
-    _timestamp: u64,
-    _device: *mut DeviceObj,
+    timestamp: u64,
+    device: *mut DeviceObj,
     reading_out: *mut *mut ReadingObj,
 ) -> i32 {
-    if !reading_out.is_null() {
-        std::ptr::write_unaligned(reading_out, std::ptr::null_mut());
+    if reading_out.is_null() {
+        return E_POINTER;
     }
-    crate::stub!("IGameInput::GetTemporalReading -> E_NOTIMPL");
-    E_NOTIMPL
+    std::ptr::write_unaligned(reading_out, std::ptr::null_mut());
+    // Per Microsoft Learn IGameInput::GetTemporalReading: device must be non-null.
+    if device.is_null() {
+        return E_INVALIDARG;
+    }
+    let Some(dev_kind) = lookup_device_kind(device) else {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    };
+
+    // Search the device's own chronological history ring for the latest reading active at
+    // `timestamp` (`timestamp_us <= timestamp`). Each device keeps its own bounded ring so
+    // high-rate activity on another device (e.g. mouse movement) never evicts quiet devices.
+    let st = runtime_state().lock().unwrap();
+    if let Some(found) = st
+        .ring(dev_kind)
+        .iter()
+        .rev()
+        .find(|e| e.timestamp_us <= timestamp)
+    {
+        std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
+        return S_OK;
+    }
+    GAMEINPUT_E_READING_NOT_FOUND
 }
 
 unsafe extern "win64" fn gi_register_reading_callback(
@@ -2289,6 +2450,38 @@ pub extern "win64" fn GameInputCreate(game_input_out: *mut usize) -> i32 {
     ensure_vtbls_registered();
     ensure_gamepad_started();
     let _ = persistent_devices();
+    {
+        // Serialize enabling event hooks with initial baseline capture so concurrent
+        // native input cannot record a newer transition before these snapshots land.
+        let mut st = runtime_state().lock().unwrap();
+        GAMEINPUT_ACTIVE.store(true, Ordering::Release);
+        let now = current_timestamp_us();
+        let kbd_snap = snapshot_keyboard();
+        let mouse_snap = snapshot_mouse();
+        let _ = st.record_or_reuse_at(
+            DeviceKind::Keyboard,
+            GAME_INPUT_KIND_KEYBOARD,
+            ReadingPayload::Keyboard(kbd_snap),
+            now,
+        );
+        let _ = st.record_or_reuse_at(
+            DeviceKind::Mouse,
+            GAME_INPUT_KIND_MOUSE,
+            ReadingPayload::Mouse(mouse_snap),
+            now,
+        );
+        for slot in 0..xinput1_4::XUSER_MAX_COUNT {
+            if let Some((pad, _)) = xinput1_4::slot_state(slot) {
+                let gp = xinput_to_gamepad_state(&pad);
+                let _ = st.record_or_reuse_at(
+                    DeviceKind::Gamepad(slot),
+                    GAME_INPUT_KIND_GAMEPAD,
+                    ReadingPayload::Gamepad(gp),
+                    now,
+                );
+            }
+        }
+    }
     let obj = Box::into_raw(Box::new(GameInputObj {
         vtbl: &GAMEINPUT_VTBL,
         refs: AtomicU32::new(1),
@@ -2318,8 +2511,11 @@ mod tests {
         crate::platform::uikit::set_rumble_callback(None);
         MOUSE_WHEEL_X.store(0, Ordering::Relaxed);
         MOUSE_WHEEL_Y.store(0, Ordering::Relaxed);
+        GAMEINPUT_ACTIVE.store(false, Ordering::Release);
         let mut st = runtime_state().lock().unwrap();
-        st.history.clear();
+        for ring in &mut st.histories {
+            ring.clear();
+        }
         st.next_history_id = 0;
         st.seq_gamepad = [0; xinput1_4::XUSER_MAX_COUNT];
         st.seq_keyboard = 0;
@@ -2731,15 +2927,21 @@ mod tests {
             assert_eq!(get_cur(gi, GAME_INPUT_KIND_GAMEPAD, gdev, &mut r2), S_OK);
             assert!(get_seq(r2, GAME_INPUT_KIND_GAMEPAD) > get_seq(r1, GAME_INPUT_KIND_GAMEPAD));
 
-            // Walk backward: GetPreviousReading(r2) -> r1, then boundary -> NOT_FOUND
+            // Walk backward: GetPreviousReading(r2) -> r1 -> initial connect idle -> NOT_FOUND
             let mut prev: *mut ReadingObj = std::ptr::null_mut();
             assert_eq!(get_prev(gi, r2, GAME_INPUT_KIND_GAMEPAD, gdev, &mut prev), S_OK);
             let mut gp_prev = GameInputGamepadState::default();
             assert_eq!(get_gp(prev, &mut gp_prev), 1);
             assert_eq!(gp_prev.buttons, GAME_INPUT_GAMEPAD_A | GAME_INPUT_GAMEPAD_DPAD_UP);
-            let mut before_r1: *mut ReadingObj = std::ptr::null_mut();
-            assert_eq!(get_prev(gi, prev, GAME_INPUT_KIND_GAMEPAD, gdev, &mut before_r1), GAMEINPUT_E_READING_NOT_FOUND);
-            assert!(before_r1.is_null());
+            let mut initial_idle: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(get_prev(gi, prev, GAME_INPUT_KIND_GAMEPAD, gdev, &mut initial_idle), S_OK);
+            let mut gp_init = GameInputGamepadState::default();
+            assert_eq!(get_gp(initial_idle, &mut gp_init), 1);
+            assert_eq!(gp_init.buttons, 0);
+            let mut before_init: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(get_prev(gi, initial_idle, GAME_INPUT_KIND_GAMEPAD, gdev, &mut before_init), GAMEINPUT_E_READING_NOT_FOUND);
+            assert!(before_init.is_null());
+            assert_eq!(rd_rel(initial_idle), 0);
 
             // Walk forward: GetNextReading(r1) -> r2, then boundary -> NOT_FOUND
             let mut next: *mut ReadingObj = std::ptr::null_mut();
@@ -2906,6 +3108,408 @@ mod tests {
             assert_eq!(disp_rel(disp), 0);
 
             assert_eq!(gi_release(gi), 0);
+        }
+
+        reset_test_state();
+    }
+
+    #[test]
+    fn get_temporal_reading_finds_matching_history_snapshot() {
+        let _g = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _u = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_test_state();
+
+        unsafe {
+            let t_before_connect = current_timestamp_us();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_connect(
+                0,
+                xinput1_4::DeviceInfo { name: "TemporalPad".into(), wireless: false, rumble: false, battery: None },
+            );
+            let mut gi_raw = 0usize;
+            assert_eq!(GameInputCreate(&mut gi_raw), S_OK);
+            let gi = gi_raw as *mut GameInputObj;
+            let dev0 = device_ptr(DeviceKind::Gamepad(0));
+            let kdev = device_ptr(DeviceKind::Keyboard);
+
+            // Null device -> E_INVALIDARG.
+            let mut out: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(gi_get_temporal_reading(gi, 1000, std::ptr::null_mut(), &mut out), E_INVALIDARG);
+
+            // Timestamp before device existed -> GAMEINPUT_E_READING_NOT_FOUND.
+            assert_eq!(gi_get_temporal_reading(gi, t_before_connect, dev0, &mut out), GAMEINPUT_E_READING_NOT_FOUND);
+
+            // Save t0 BEFORE any reading query, then press A without polling first.
+            // Historical lookup at t0 must still resolve the initial idle baseline captured
+            // at connection time (never returning GAMEINPUT_E_READING_NOT_FOUND).
+            let t0 = gi_get_current_timestamp(gi);
+            let mut gs = GameInputGamepadState::default();
+
+            // Input transitions recorded independently of GetCurrentReading must be returned by
+            // exact GetCurrentTimestamp() -> GetTemporalReading() with zero future offset.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            let t1 = gi_get_current_timestamp(gi);
+            assert!(t1 > t0);
+
+            // First ever reading query is for t0 (pre-press) AFTER A was already pressed:
+            assert_eq!(gi_get_temporal_reading(gi, t0, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0, "baseline at t0 must remain queryable after later input transitions");
+            let mut prev_from_base: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(
+                gi_get_previous_reading(gi, out, GAME_INPUT_KIND_GAMEPAD, dev0, &mut prev_from_base),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            let mut next_from_base: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(
+                gi_get_next_reading(gi, out, GAME_INPUT_KIND_GAMEPAD, dev0, &mut next_from_base),
+                S_OK
+            );
+            assert_eq!(rd_get_gamepad_state(next_from_base, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(next_from_base), 0);
+            assert_eq!(rd_release(out), 0);
+
+            assert_eq!(gi_get_temporal_reading(gi, t1, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(out), 0);
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::B, ..Default::default() });
+            let t2 = gi_get_current_timestamp(gi);
+            assert!(t2 > t1);
+            assert_eq!(gi_get_temporal_reading(gi, t2, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::X, ..Default::default() });
+            let t3 = gi_get_current_timestamp(gi);
+            assert!(t3 > t2);
+            assert_eq!(gi_get_temporal_reading(gi, t3, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_X);
+            assert_eq!(rd_release(out), 0);
+
+            // Historical queries at t1 and t2 still resolve to A and B respectively.
+            assert_eq!(gi_get_temporal_reading(gi, t1, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(out), 0);
+
+            assert_eq!(gi_get_temporal_reading(gi, t2, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            // Keyboard transition via user32::input -> exact GetCurrentTimestamp() -> GetTemporalReading(),
+            // while historical lookup at t0 (before keypress) still resolves the initial baseline,
+            // and GetAsyncKeyState's pressed-since bit (bit 0) is NOT consumed by GameInput snapshots.
+            let _ = crate::user32::input::GetAsyncKeyState(b'A' as i32);
+            let _ = crate::user32::input::GetAsyncKeyState(keymap::VK_LBUTTON as i32);
+            crate::user32::input::native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            let tk = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, tk, kdev, &mut out), S_OK);
+            let mut keys = [GameInputKeyState::default(); 8];
+            let n_keys = rd_get_key_state(out, keys.len() as u32, keys.as_mut_ptr()) as usize;
+            assert!(
+                keys[..n_keys].iter().any(|k| k.virtual_key == b'A'),
+                "keyboard GetTemporalReading(GetCurrentTimestamp()) must include pressed 'A'"
+            );
+            assert_eq!(rd_release(out), 0);
+            assert_eq!(gi_get_temporal_reading(gi, t0, kdev, &mut out), S_OK);
+            let n_base_keys = rd_get_key_state(out, keys.len() as u32, keys.as_mut_ptr()) as usize;
+            assert!(
+                !keys[..n_base_keys].iter().any(|k| k.virtual_key == b'A'),
+                "keyboard baseline at t0 must reflect pre-press state"
+            );
+            assert_eq!(rd_release(out), 0);
+            let async_a = crate::user32::input::GetAsyncKeyState(b'A' as i32);
+            assert!(async_a < 0 && (async_a & 1) != 0, "GameInput snapshot must not consume GetAsyncKeyState pressed-since bit for keyboard");
+            crate::user32::input::native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+
+            crate::user32::input::native_mouse(NativeMouse::Button {
+                hwnd: 0,
+                client: None,
+                screen: POINT { x: 100, y: 100 },
+                button: MouseButton::Left,
+                down: true,
+                clicks: 1,
+            });
+            let async_lbtn = crate::user32::input::GetAsyncKeyState(keymap::VK_LBUTTON as i32);
+            assert!(async_lbtn < 0 && (async_lbtn & 1) != 0, "GameInput snapshot must not consume GetAsyncKeyState pressed-since bit for mouse");
+
+            // Focus-loss release (`release_all_keys`) while both a key and mouse button are held
+            // must record the released keyboard and mouse snapshots in GameInput history immediately.
+            let mdev = device_ptr(DeviceKind::Mouse);
+            crate::user32::input::native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            let t_held = gi_get_current_timestamp(gi);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            crate::user32::input::release_all_keys();
+            let t_released = gi_get_current_timestamp(gi);
+            assert!(t_released > t_held);
+
+            assert_eq!(gi_get_temporal_reading(gi, t_released, kdev, &mut out), S_OK);
+            let n_rel_keys = rd_get_key_state(out, keys.len() as u32, keys.as_mut_ptr()) as usize;
+            assert!(
+                !keys[..n_rel_keys].iter().any(|k| k.virtual_key == b'A'),
+                "focus-loss release_all_keys must record keyboard release in GameInput history"
+            );
+            assert_eq!(rd_release(out), 0);
+
+            assert_eq!(gi_get_temporal_reading(gi, t_released, mdev, &mut out), S_OK);
+            let mut ms_rel = GameInputMouseState::default();
+            assert_eq!(rd_get_mouse_state(out, &mut ms_rel), 1);
+            assert_eq!(
+                ms_rel.buttons & GAME_INPUT_MOUSE_LEFT_BUTTON,
+                0,
+                "focus-loss release_all_keys must record mouse button release in GameInput history"
+            );
+            assert_eq!(rd_release(out), 0);
+
+            // Historical lookup before focus loss still sees both held.
+            assert_eq!(gi_get_temporal_reading(gi, t_held, kdev, &mut out), S_OK);
+            let n_held_keys = rd_get_key_state(out, keys.len() as u32, keys.as_mut_ptr()) as usize;
+            assert!(keys[..n_held_keys].iter().any(|k| k.virtual_key == b'A'));
+            assert_eq!(rd_release(out), 0);
+            assert_eq!(gi_get_temporal_reading(gi, t_held, mdev, &mut out), S_OK);
+            let mut ms_held = GameInputMouseState::default();
+            assert_eq!(rd_get_mouse_state(out, &mut ms_held), 1);
+            assert_ne!(ms_held.buttons & GAME_INPUT_MOUSE_LEFT_BUTTON, 0);
+            assert_eq!(rd_release(out), 0);
+
+            // >128 mouse state transitions must NOT evict quiet keyboard or gamepad readings.
+            for step in 0..(READING_HISTORY_CAP + 32) as i64 {
+                record_mouse_wheel(0, 1 + (step & 1));
+            }
+            let t_after_mouse_flood = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_mouse_flood, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_X, "quiet gamepad reading must survive mouse flood");
+            assert_eq!(rd_release(out), 0);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_mouse_flood, kdev, &mut out), S_OK);
+            assert_eq!(rd_release(out), 0);
+
+            assert_eq!(gi_release(gi), 0);
+        }
+
+        reset_test_state();
+    }
+
+    #[test]
+    fn temporal_reading_records_merged_slot0_disconnect_transitions() {
+        let _g = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_test_state();
+
+        unsafe {
+            let mut gi_raw = 0usize;
+            assert_eq!(GameInputCreate(&mut gi_raw), S_OK);
+            let gi = gi_raw as *mut GameInputObj;
+            let dev0 = device_ptr(DeviceKind::Gamepad(0));
+            let mut out: *mut ReadingObj = std::ptr::null_mut();
+            let mut gs = GameInputGamepadState::default();
+
+            // 1. Physical slot 0 holds A while virtual touch pad is connected and idle.
+            xinput1_4::set_virtual_gamepad(true, xinput1_4::Gamepad::default());
+            xinput1_4::backend_connect(
+                0,
+                xinput1_4::DeviceInfo { name: "PhysPad".into(), wireless: false, rumble: false, battery: None },
+            );
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            let t_phys_a = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_phys_a, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(out), 0);
+
+            // Disconnecting the physical controller while the virtual pad remains connected & idle
+            // must immediately record the merged release transition at event time.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_disconnect(0);
+            let t_after_phys_disc = gi_get_current_timestamp(gi);
+            assert!(t_after_phys_disc > t_phys_a);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_phys_disc, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0, "disconnecting physical pad must record release of A");
+            assert_eq!(rd_release(out), 0);
+            // Historical timestamp still sees A held.
+            assert_eq!(gi_get_temporal_reading(gi, t_phys_a, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(out), 0);
+
+            // 2. Physical slot 0 holds A while virtual pad holds B; disconnecting virtual pad
+            // must immediately transition merged state from A|B to A.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_connect(
+                0,
+                xinput1_4::DeviceInfo { name: "PhysPad".into(), wireless: false, rumble: false, battery: None },
+            );
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            xinput1_4::set_virtual_gamepad(true, xinput1_4::Gamepad { buttons: xinput1_4::btn::B, ..Default::default() });
+            let t_merged_ab = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_merged_ab, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A | GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::set_virtual_gamepad(false, xinput1_4::Gamepad::default());
+            let t_after_virt_disc = gi_get_current_timestamp(gi);
+            assert!(t_after_virt_disc > t_merged_ab);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_virt_disc, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A, "disconnecting virtual pad must record release of B");
+            assert_eq!(rd_release(out), 0);
+
+            // Historical timestamp still sees A|B held.
+            assert_eq!(gi_get_temporal_reading(gi, t_merged_ab, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A | GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            // 3. Physical idle + virtual holding B -> disconnecting virtual pad transitions to idle.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad::default());
+            xinput1_4::set_virtual_gamepad(true, xinput1_4::Gamepad { buttons: xinput1_4::btn::B, ..Default::default() });
+            let t_virt_b = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_virt_b, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::set_virtual_gamepad(false, xinput1_4::Gamepad::default());
+            let t_after_virt_idle = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_virt_idle, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0, "disconnecting virtual pad over idle physical pad must record idle");
+            assert_eq!(rd_release(out), 0);
+
+            // 4. Full disconnect while holding a button followed by idle reconnect in the same
+            //    slot must not resurrect the stale pre-disconnect press, and pressing the same
+            //    button again afterwards must record a fresh transition.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            let t_before_full_disc = gi_get_current_timestamp(gi);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_disconnect(0);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_connect(
+                0,
+                xinput1_4::DeviceInfo { name: "PhysPad".into(), wireless: false, rumble: false, battery: None },
+            );
+            let t_reconnected_idle = gi_get_current_timestamp(gi);
+            assert!(t_reconnected_idle > t_before_full_disc);
+            assert_eq!(gi_get_temporal_reading(gi, t_reconnected_idle, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0, "idle reconnect must override older pressed history");
+            assert_eq!(rd_release(out), 0);
+
+            // GetCurrentReading on the reconnected slot must have a chronological history_id:
+            // GetNextReading must return NOT_FOUND (not an older pre-disconnect entry) and
+            // GetPreviousReading must walk back to the pre-disconnect A reading.
+            let mut cur_reconn: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(gi_get_current_reading(gi, GAME_INPUT_KIND_GAMEPAD, dev0, &mut cur_reconn), S_OK);
+            assert_eq!(rd_get_gamepad_state(cur_reconn, &mut gs), 1);
+            assert_eq!(gs.buttons, 0);
+            let mut after_reconn: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(
+                gi_get_next_reading(gi, cur_reconn, GAME_INPUT_KIND_GAMEPAD, dev0, &mut after_reconn),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert!(after_reconn.is_null());
+            let mut before_reconn: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(
+                gi_get_previous_reading(gi, cur_reconn, GAME_INPUT_KIND_GAMEPAD, dev0, &mut before_reconn),
+                S_OK
+            );
+            assert_eq!(rd_get_gamepad_state(before_reconn, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(before_reconn), 0);
+            assert_eq!(rd_release(cur_reconn), 0);
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            let t_repressed_a = gi_get_current_timestamp(gi);
+            assert!(t_repressed_a > t_reconnected_idle);
+            assert_eq!(gi_get_temporal_reading(gi, t_repressed_a, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A, "re-pressing A after idle reconnect must record a fresh reading");
+            assert_eq!(rd_release(out), 0);
+
+            // Historical lookup at reconnect still sees idle, and pre-disconnect still sees A.
+            assert_eq!(gi_get_temporal_reading(gi, t_reconnected_idle, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0);
+            assert_eq!(rd_release(out), 0);
+            assert_eq!(gi_get_temporal_reading(gi, t_before_full_disc, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(out), 0);
+
+            assert_eq!(gi_release(gi), 0);
+        }
+
+        reset_test_state();
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_overwrite_newer_history_entry() {
+        let _g = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_test_state();
+
+        let pressed = GameInputGamepadState {
+            buttons: GAME_INPUT_GAMEPAD_A,
+            ..Default::default()
+        };
+        let idle = GameInputGamepadState::default();
+
+        {
+            let mut st = runtime_state().lock().unwrap();
+            let newest = st.record_or_reuse_at(
+                DeviceKind::Gamepad(0),
+                GAME_INPUT_KIND_GAMEPAD,
+                ReadingPayload::Gamepad(pressed),
+                200,
+            );
+            assert_eq!(newest.timestamp_us, 200);
+
+            // An out-of-order older baseline (t=100) must not append after t=200.
+            let rejected_reuse = st.record_or_reuse_at(
+                DeviceKind::Gamepad(0),
+                GAME_INPUT_KIND_GAMEPAD,
+                ReadingPayload::Gamepad(idle),
+                100,
+            );
+            assert_eq!(rejected_reuse.timestamp_us, 200);
+            assert_eq!(rejected_reuse.payload, ReadingPayload::Gamepad(pressed));
+
+            let rejected_push = st.push_snapshot_at(
+                DeviceKind::Gamepad(0),
+                GAME_INPUT_KIND_GAMEPAD,
+                ReadingPayload::Gamepad(idle),
+                100,
+            );
+            assert_eq!(rejected_push.timestamp_us, 200);
+            assert_eq!(rejected_push.payload, ReadingPayload::Gamepad(pressed));
+            assert_eq!(st.ring(DeviceKind::Gamepad(0)).len(), 1);
+        }
+
+        unsafe {
+            let dev0 = device_ptr(DeviceKind::Gamepad(0));
+            let mut out: *mut ReadingObj = std::ptr::null_mut();
+            let mut gs = GameInputGamepadState::default();
+            assert_eq!(gi_get_temporal_reading(std::ptr::null_mut(), 300, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(
+                gs.buttons, GAME_INPUT_GAMEPAD_A,
+                "temporal query at 300 must see the pressed reading at 200, not a stale idle baseline at 100"
+            );
+            assert_eq!(rd_release(out), 0);
         }
 
         reset_test_state();

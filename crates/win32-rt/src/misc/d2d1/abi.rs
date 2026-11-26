@@ -509,6 +509,15 @@ pub struct D2D1_DRAWING_STATE_DESCRIPTION {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct D2D1_TRIANGLE {
+    pub point1: D2D1_POINT_2F,
+    pub point2: D2D1_POINT_2F,
+    pub point3: D2D1_POINT_2F,
+}
+const _: () = assert!(std::mem::size_of::<D2D1_TRIANGLE>() == 24);
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct D2D1_LAYER_PARAMETERS {
     pub contentBounds: D2D1_RECT_F,
