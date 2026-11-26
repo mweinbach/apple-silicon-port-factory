@@ -17,6 +17,18 @@ pub const ZIGZAG: [usize; 64] = [
     46, 39, 47, 54, 61, 62, 55, 63,
 ];
 
+/// Compact 64-byte (single cache line) copy of [`ZIGZAG`] for hot AC decoding.
+pub(crate) const ZIGZAG_U8: [u8; 64] = [
+     0,  8,  1,  2,  9, 16, 24, 17,
+    10,  3,  4, 11, 18, 25, 32, 40,
+    33, 26, 19, 12,  5,  6, 13, 20,
+    27, 34, 41, 48, 56, 49, 42, 35,
+    28, 21, 14,  7, 15, 22, 29, 36,
+    43, 50, 57, 58, 51, 44, 37, 30,
+    23, 31, 38, 45, 52, 59, 60, 53,
+    46, 39, 47, 54, 61, 62, 55, 63,
+];
+
 /// DC dequantization scale table (37 entries, indexed by `q`: `1024 * 2^(q/4)`).
 pub const DC_QUANT: [u32; 37] = [
       1024,   1218,   1448,   1722,   2048,   2435,   2896,   3444,

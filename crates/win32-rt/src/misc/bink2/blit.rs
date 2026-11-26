@@ -1,7 +1,7 @@
 //! Planar YCrCb(A/H) buffer clearing and CPU pixel-format conversion blitter
 //! (`BinkCopyToBuffer` / `BinkCopyToBufferRect`) for `bink2w64.dll`.
 
-use super::player::BinkInstance;
+use super::player::{drain_async_decode, BinkInstance};
 use super::types::{
     BinkFrameBuffers, BINKSURFACE24, BINKSURFACE24R, BINKSURFACE32, BINKSURFACE32A, BINKSURFACE32R,
     BINKSURFACE32RA, BINKSURFACE4444, BINKSURFACE555, BINKSURFACE5551, BINKSURFACE555R,
@@ -110,6 +110,104 @@ impl YuvToRgbCoeffs {
     }
 }
 
+/// ARM64 NEON 8-pixel-at-a-time YCrCb(A) -> 32-bit BGRA/RGBA row converter,
+/// bit-exact with [`YuvToRgbCoeffs::convert`].
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn convert_row_32_neon(
+    coeffs: &YuvToRgbCoeffs,
+    y_row: *const u8,
+    cr_row: *const u8,
+    cb_row: *const u8,
+    a_row: *const u8,
+    dst_row: *mut u8,
+    srcx: usize,
+    count_px: usize,
+    is_rgba: bool,
+    use_alpha: bool,
+) {
+    use core::arch::aarch64::*;
+
+    let r_off = vdupq_n_s32(coeffs.r_off);
+    let g_off = vdupq_n_s32(coeffs.g_off);
+    let b_off = vdupq_n_s32(coeffs.b_off);
+    let a_opaque = vdup_n_u8(0xFF);
+
+    let mut col = 0usize;
+    while col + 8 <= count_px {
+        let sx = srcx + col;
+        let cx = sx >> 1;
+
+        let y8 = vld1_u8(y_row.add(sx));
+        let y16 = vmovl_u8(y8);
+        let y_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(y16)));
+        let y_hi = vreinterpretq_s32_u32(vmovl_high_u16(y16));
+
+        // Load 4 chroma samples and duplicate each across its 2 horizontal luma pixels.
+        let cr4 = std::ptr::read_unaligned(cr_row.add(cx) as *const u32);
+        let cb4 = std::ptr::read_unaligned(cb_row.add(cx) as *const u32);
+        let cr_raw = vreinterpret_u8_u32(vdup_n_u32(cr4));
+        let cb_raw = vreinterpret_u8_u32(vdup_n_u32(cb4));
+        let cr8 = vzip1_u8(cr_raw, cr_raw);
+        let cb8 = vzip1_u8(cb_raw, cb_raw);
+
+        let cr16 = vmovl_u8(cr8);
+        let cb16 = vmovl_u8(cb8);
+        let cr_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(cr16)));
+        let cr_hi = vreinterpretq_s32_u32(vmovl_high_u16(cr16));
+        let cb_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(cb16)));
+        let cb_hi = vreinterpretq_s32_u32(vmovl_high_u16(cb16));
+
+        let r_lo = vshrq_n_s32::<10>(vmlaq_n_s32(
+            vmlaq_n_s32(vmlaq_n_s32(r_off, y_lo, coeffs.r_y), cr_lo, coeffs.r_cr),
+            cb_lo,
+            coeffs.r_cb,
+        ));
+        let r_hi = vshrq_n_s32::<10>(vmlaq_n_s32(
+            vmlaq_n_s32(vmlaq_n_s32(r_off, y_hi, coeffs.r_y), cr_hi, coeffs.r_cr),
+            cb_hi,
+            coeffs.r_cb,
+        ));
+        let g_lo = vshrq_n_s32::<10>(vmlaq_n_s32(
+            vmlaq_n_s32(vmlaq_n_s32(g_off, y_lo, coeffs.g_y), cr_lo, coeffs.g_cr),
+            cb_lo,
+            coeffs.g_cb,
+        ));
+        let g_hi = vshrq_n_s32::<10>(vmlaq_n_s32(
+            vmlaq_n_s32(vmlaq_n_s32(g_off, y_hi, coeffs.g_y), cr_hi, coeffs.g_cr),
+            cb_hi,
+            coeffs.g_cb,
+        ));
+        let b_lo = vshrq_n_s32::<10>(vmlaq_n_s32(
+            vmlaq_n_s32(vmlaq_n_s32(b_off, y_lo, coeffs.b_y), cr_lo, coeffs.b_cr),
+            cb_lo,
+            coeffs.b_cb,
+        ));
+        let b_hi = vshrq_n_s32::<10>(vmlaq_n_s32(
+            vmlaq_n_s32(vmlaq_n_s32(b_off, y_hi, coeffs.b_y), cr_hi, coeffs.b_cr),
+            cb_hi,
+            coeffs.b_cb,
+        ));
+
+        let r8 = vqmovun_s16(vcombine_s16(vqmovn_s32(r_lo), vqmovn_s32(r_hi)));
+        let g8 = vqmovun_s16(vcombine_s16(vqmovn_s32(g_lo), vqmovn_s32(g_hi)));
+        let b8 = vqmovun_s16(vcombine_s16(vqmovn_s32(b_lo), vqmovn_s32(b_hi)));
+        let a8 = if use_alpha && !a_row.is_null() {
+            vld1_u8(a_row.add(sx))
+        } else {
+            a_opaque
+        };
+
+        let out = if is_rgba {
+            uint8x8x4_t(r8, g8, b8, a8)
+        } else {
+            uint8x8x4_t(b8, g8, r8, a8)
+        };
+        vst4_u8(dst_row.add(col * 4), out);
+        col += 8;
+    }
+}
+
 pub(crate) unsafe fn copy_to_buffer(
     bink: *mut c_void,
     dest: *mut c_void,
@@ -149,6 +247,12 @@ pub(crate) unsafe fn copy_to_buffer_rect(
     let inst = &mut *(bink as *mut BinkInstance);
     if !inst.video_on {
         return 1;
+    }
+    // Single-buffered videos decode into slot 0 directly; drain any in-flight decode to avoid
+    // reading a half-written frame. Multi-buffered videos safely read the front buffer (`prev_idx`)
+    // while the worker writes the back buffer (`dst_idx`).
+    if inst.pending_async.as_ref().is_some_and(|p| p.same_buf) {
+        drain_async_decode(inst);
     }
 
     let fb_raw = inst.rd_u64(0x0b0) as *const BinkFrameBuffers;
@@ -347,7 +451,35 @@ pub(crate) unsafe fn copy_to_buffer_rect(
                 std::ptr::null()
             };
 
-            for col in 0..copy_w {
+            let mut col_start = 0usize;
+            #[cfg(target_arch = "aarch64")]
+            {
+                let is_32bit_fmt = matches!(
+                    fmt,
+                    BINKSURFACE32 | BINKSURFACE32R | BINKSURFACE32A | BINKSURFACE32RA
+                );
+                let sx0 = srcx as usize;
+                if is_32bit_fmt
+                    && (sx0 & 1) == 0
+                    && !cr_row.is_null()
+                    && !cb_row.is_null()
+                    && crcb_w > 0
+                {
+                    let max_chroma_px = (crcb_w.saturating_sub(sx0 >> 1)) * 2;
+                    let simd_px = copy_w.min(max_chroma_px) & !7;
+                    if simd_px >= 8 {
+                        let is_rgba = matches!(fmt, BINKSURFACE32R | BINKSURFACE32RA);
+                        let use_alpha = matches!(fmt, BINKSURFACE32A | BINKSURFACE32RA);
+                        convert_row_32_neon(
+                            &coeffs, y_row, cr_row, cb_row, a_row, dst_row, sx0, simd_px, is_rgba,
+                            use_alpha,
+                        );
+                        col_start = simd_px;
+                    }
+                }
+            }
+
+            for col in col_start..copy_w {
                 let sx = (srcx as usize) + col;
                 let y = *y_row.add(sx);
                 if fmt == BINKSURFACE8P {
@@ -488,4 +620,73 @@ pub(crate) unsafe fn copy_to_buffer_rect(
         last.blit_us = last.blit_us.saturating_add(blit_us);
     }
     0
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) unsafe fn verify_neon_yuv_to_rgb32_matches_scalar() {
+    for matrix in [&DEFAULT_BINK_COLORSPACE, &FULLRANGE_BINK_COLORSPACE] {
+        let coeffs = YuvToRgbCoeffs::from_matrix(matrix);
+        let width = 40usize;
+        let mut y = vec![0u8; width];
+        let mut cr = vec![0u8; width / 2];
+        let mut cb = vec![0u8; width / 2];
+        let mut a = vec![0u8; width];
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next_u8 = || -> u8 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        };
+        for i in 0..width {
+            y[i] = next_u8();
+            a[i] = next_u8();
+        }
+        for i in 0..(width / 2) {
+            cr[i] = next_u8();
+            cb[i] = next_u8();
+        }
+        // Include extreme corner samples.
+        y[0] = 0;
+        y[1] = 255;
+        cr[0] = 0;
+        cb[0] = 255;
+        y[2] = 16;
+        y[3] = 235;
+        cr[1] = 255;
+        cb[1] = 0;
+
+        for is_rgba in [false, true] {
+            for use_alpha in [false, true] {
+                let mut dst_neon = vec![0u8; width * 4];
+                let mut dst_scalar = vec![0u8; width * 4];
+                convert_row_32_neon(
+                    &coeffs,
+                    y.as_ptr(),
+                    cr.as_ptr(),
+                    cb.as_ptr(),
+                    a.as_ptr(),
+                    dst_neon.as_mut_ptr(),
+                    0,
+                    width,
+                    is_rgba,
+                    use_alpha,
+                );
+                for col in 0..width {
+                    let (r, g, b) = coeffs.convert(y[col], cr[col >> 1], cb[col >> 1]);
+                    let av = if use_alpha { a[col] } else { 0xFF };
+                    let px = if is_rgba {
+                        [r, g, b, av]
+                    } else {
+                        [b, g, r, av]
+                    };
+                    dst_scalar[col * 4..col * 4 + 4].copy_from_slice(&px);
+                }
+                assert_eq!(
+                    dst_neon, dst_scalar,
+                    "NEON YUV->RGB32 mismatch (is_rgba={is_rgba}, use_alpha={use_alpha})"
+                );
+            }
+        }
+    }
 }

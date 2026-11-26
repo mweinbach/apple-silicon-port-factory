@@ -7,6 +7,7 @@
 use super::tables::{DEBLOCK_RESIDUAL_MASK, DEBLOCK_WEIGHTS};
 
 /// 1D 8-point integer IDCT butterfly using `i16` wrapping arithmetic and arithmetic right shifts.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
 fn idct1d(x: [i16; 8]) -> [i16; 8] {
     let a0 = x[0].wrapping_add(x[4]);
@@ -42,11 +43,14 @@ fn idct1d(x: [i16; 8]) -> [i16; 8] {
     ]
 }
 
-/// 8x8 integer IDCT.
-///
-/// `coeffs` is indexed as `[u * 8 + v]` where `u` is X-frequency and `v` is Y-frequency.
-/// Writes spatial `[y][x]` outputs (shifted by `>> 6`, no rounding bias) to `out`.
-pub fn idct8x8(coeffs: &[i16; 64], out: &mut [i16], out_off: usize, out_stride: usize) {
+/// 8x8 integer IDCT (scalar reference).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn idct8x8_scalar(
+    coeffs: &[i16; 64],
+    out: &mut [i16],
+    out_off: usize,
+    out_stride: usize,
+) {
     let mut p1 = [[0i16; 8]; 8];
     for v in 0..8 {
         let col_in = [
@@ -73,8 +77,24 @@ pub fn idct8x8(coeffs: &[i16; 64], out: &mut [i16], out_off: usize, out_stride: 
     }
 }
 
-/// Fast-path DC-only 8x8 IDCT: fills an 8x8 tile with `dc >> 6`.
-pub fn idct8x8_dc(dc: i16, out: &mut [i16], out_off: usize, out_stride: usize) {
+/// 8x8 integer IDCT.
+///
+/// `coeffs` is indexed as `[u * 8 + v]` where `u` is X-frequency and `v` is Y-frequency.
+/// Writes spatial `[y][x]` outputs (shifted by `>> 6`, no rounding bias) to `out`.
+pub fn idct8x8(coeffs: &[i16; 64], out: &mut [i16], out_off: usize, out_stride: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::idct8x8_neon(coeffs, out, out_off, out_stride);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        idct8x8_scalar(coeffs, out, out_off, out_stride);
+    }
+}
+
+/// Fast-path DC-only 8x8 IDCT (scalar reference).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn idct8x8_dc_scalar(dc: i16, out: &mut [i16], out_off: usize, out_stride: usize) {
     let val = dc >> 6;
     for y in 0..8 {
         let row_start = out_off + y * out_stride;
@@ -82,8 +102,21 @@ pub fn idct8x8_dc(dc: i16, out: &mut [i16], out_off: usize, out_stride: usize) {
     }
 }
 
-/// Clamps a 16x8 `i16` block to `0..=255` and stores it into `dst`.
-pub fn clamp_store_16x8(
+/// Fast-path DC-only 8x8 IDCT: fills an 8x8 tile with `dc >> 6`.
+pub fn idct8x8_dc(dc: i16, out: &mut [i16], out_off: usize, out_stride: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::idct8x8_dc_neon(dc, out, out_off, out_stride);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        idct8x8_dc_scalar(dc, out, out_off, out_stride);
+    }
+}
+
+/// Clamps a 16x8 `i16` block to `0..=255` and stores it into `dst` (scalar reference).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn clamp_store_16x8_scalar(
     dst: &mut [u8],
     dst_off: usize,
     dst_stride: usize,
@@ -102,9 +135,29 @@ pub fn clamp_store_16x8(
     }
 }
 
-/// Adds a 16x8 `i16` residual to an 8-bit prediction block (wrapping in `i16`), clamps to
-/// `0..=255`, and stores into `dst`.
-pub fn add_clamp_16x8(
+/// Clamps a 16x8 `i16` block to `0..=255` and stores it into `dst`.
+pub fn clamp_store_16x8(
+    dst: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+    src: &[i16],
+    src_off: usize,
+    src_stride: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::clamp_store_16x8_neon(dst, dst_off, dst_stride, src, src_off, src_stride);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        clamp_store_16x8_scalar(dst, dst_off, dst_stride, src, src_off, src_stride);
+    }
+}
+
+/// Adds a 16x8 `i16` residual to an 8-bit prediction block (scalar reference).
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn add_clamp_16x8_scalar(
     dst: &mut [u8],
     dst_off: usize,
     dst_stride: usize,
@@ -128,6 +181,66 @@ pub fn add_clamp_16x8(
     }
 }
 
+/// Adds a 16x8 `i16` residual to an 8-bit prediction block (wrapping in `i16`), clamps to
+/// `0..=255`, and stores into `dst`.
+#[allow(clippy::too_many_arguments)]
+pub fn add_clamp_16x8(
+    dst: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+    res: &[i16],
+    res_off: usize,
+    res_stride: usize,
+    pred: &[u8],
+    pred_off: usize,
+    pred_stride: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::add_clamp_16x8_neon(
+            dst,
+            dst_off,
+            dst_stride,
+            res,
+            res_off,
+            res_stride,
+            pred,
+            pred_off,
+            pred_stride,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        add_clamp_16x8_scalar(
+            dst,
+            dst_off,
+            dst_stride,
+            res,
+            res_off,
+            res_stride,
+            pred,
+            pred_off,
+            pred_stride,
+        );
+    }
+}
+
+/// Copies a 16x16 byte block from `src` to `dst` (scalar reference).
+pub(crate) fn copy_16x16_scalar(
+    src: &[u8],
+    src_off: usize,
+    src_stride: usize,
+    dst: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+) {
+    for r in 0..16 {
+        let s = src_off + r * src_stride;
+        let d = dst_off + r * dst_stride;
+        dst[d..d + 16].copy_from_slice(&src[s..s + 16]);
+    }
+}
+
 /// Copies a 16x16 byte block from `src` to `dst`.
 pub fn copy_16x16(
     src: &[u8],
@@ -137,7 +250,27 @@ pub fn copy_16x16(
     dst_off: usize,
     dst_stride: usize,
 ) {
-    for r in 0..16 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::copy_16x16_neon(src, src_off, src_stride, dst, dst_off, dst_stride);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        copy_16x16_scalar(src, src_off, src_stride, dst, dst_off, dst_stride);
+    }
+}
+
+/// Copies a 16x8 byte block from `src` to `dst` (scalar reference).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn copy_16x8_scalar(
+    src: &[u8],
+    src_off: usize,
+    src_stride: usize,
+    dst: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+) {
+    for r in 0..8 {
         let s = src_off + r * src_stride;
         let d = dst_off + r * dst_stride;
         dst[d..d + 16].copy_from_slice(&src[s..s + 16]);
@@ -153,10 +286,29 @@ pub fn copy_16x8(
     dst_off: usize,
     dst_stride: usize,
 ) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::copy_16x8_neon(src, src_off, src_stride, dst, dst_off, dst_stride);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        copy_16x8_scalar(src, src_off, src_stride, dst, dst_off, dst_stride);
+    }
+}
+
+/// Copies an 8x8 byte block from `src` to `dst` (scalar reference).
+pub(crate) fn copy_8x8_scalar(
+    src: &[u8],
+    src_off: usize,
+    src_stride: usize,
+    dst: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+) {
     for r in 0..8 {
         let s = src_off + r * src_stride;
         let d = dst_off + r * dst_stride;
-        dst[d..d + 16].copy_from_slice(&src[s..s + 16]);
+        dst[d..d + 8].copy_from_slice(&src[s..s + 8]);
     }
 }
 
@@ -169,10 +321,13 @@ pub fn copy_8x8(
     dst_off: usize,
     dst_stride: usize,
 ) {
-    for r in 0..8 {
-        let s = src_off + r * src_stride;
-        let d = dst_off + r * dst_stride;
-        dst[d..d + 8].copy_from_slice(&src[s..s + 8]);
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::copy_8x8_neon(src, src_off, src_stride, dst, dst_off, dst_stride);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        copy_8x8_scalar(src, src_off, src_stride, dst, dst_off, dst_stride);
     }
 }
 
@@ -195,10 +350,9 @@ fn filter6_i16(a: i16, b: i16, c: i16, d: i16, e: i16, f: i16) -> i16 {
         >> 4
 }
 
-/// 16x16 luma motion compensation with 6-tap half-pel interpolation.
-///
-/// Out-of-bounds reference coordinates are defensively clamped to the source plane extents.
-pub fn mc_luma_16x16(
+/// 16x16 luma motion compensation with 6-tap half-pel interpolation (scalar reference).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mc_luma_16x16_scalar(
     src: &[u8],
     src_stride: usize,
     src_x: i32,
@@ -227,7 +381,7 @@ pub fn mc_luma_16x16(
                 && (src_y as usize) + 16 <= src_h
             {
                 let src_off = (src_y as usize) * src_stride + (src_x as usize);
-                copy_16x16(src, src_off, src_stride, dst, dst_off, dst_stride);
+                copy_16x16_scalar(src, src_off, src_stride, dst, dst_off, dst_stride);
             } else {
                 for r in 0..16 {
                     let d_off = dst_off + r * dst_stride;
@@ -390,6 +544,35 @@ pub fn mc_luma_16x16(
     }
 }
 
+/// 16x16 luma motion compensation with 6-tap half-pel interpolation.
+///
+/// Out-of-bounds reference coordinates are defensively clamped to the source plane extents.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_luma_16x16(
+    src: &[u8],
+    src_stride: usize,
+    src_x: i32,
+    src_y: i32,
+    dst: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+    hx: bool,
+    hy: bool,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::mc_luma_16x16_neon(
+            src, src_stride, src_x, src_y, dst, dst_off, dst_stride, hx, hy,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        mc_luma_16x16_scalar(
+            src, src_stride, src_x, src_y, dst, dst_off, dst_stride, hx, hy,
+        );
+    }
+}
+
 /// Exact fixed-point `.4` 1D quarter-pel interpolation (`0..4` fraction).
 #[inline]
 fn qpel_lerp(a: i16, b: i16, frac: u32) -> i16 {
@@ -401,11 +584,9 @@ fn qpel_lerp(a: i16, b: i16, frac: u32) -> i16 {
     }
 }
 
-/// 8x8 chroma quarter-pel bilinear motion compensation.
-///
-/// `dx` and `dy` are X and Y quarter-pel fractions (`0..4`, masked with `& 3`).
-/// Out-of-bounds reference coordinates are defensively clamped to the source plane extents.
-pub fn mc_chroma_8x8(
+/// 8x8 chroma quarter-pel bilinear motion compensation (scalar reference).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mc_chroma_8x8_scalar(
     src: &[u8],
     src_stride: usize,
     src_x: i32,
@@ -435,7 +616,7 @@ pub fn mc_chroma_8x8(
             && (src_y as usize) + 8 <= src_h
         {
             let src_off = (src_y as usize) * src_stride + (src_x as usize);
-            copy_8x8(src, src_off, src_stride, dst, dst_off, dst_stride);
+            copy_8x8_scalar(src, src_off, src_stride, dst, dst_off, dst_stride);
         } else {
             for r in 0..8 {
                 let d_off = dst_off + r * dst_stride;
@@ -501,13 +682,45 @@ pub fn mc_chroma_8x8(
     }
 }
 
+/// 8x8 chroma quarter-pel bilinear motion compensation.
+///
+/// `dx` and `dy` are X and Y quarter-pel fractions (`0..4`, masked with `& 3`).
+/// Out-of-bounds reference coordinates are defensively clamped to the source plane extents.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_chroma_8x8(
+    src: &[u8],
+    src_stride: usize,
+    src_x: i32,
+    src_y: i32,
+    dst: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+    dx: u32,
+    dy: u32,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::mc_chroma_8x8_neon(
+            src, src_stride, src_x, src_y, dst, dst_off, dst_stride, dx, dy,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        mc_chroma_8x8_scalar(
+            src, src_stride, src_x, src_y, dst, dst_off, dst_stride, dx, dy,
+        );
+    }
+}
+
 /// Signed 16x16 -> high 16 bits (`PMULHW`).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
 fn pmulhw(a: i16, b: i16) -> i16 {
     ((a as i32 * b as i32) >> 16) as i16
 }
 
 /// 8-tap smooth DC interpolation kernel matching SSE2 `pmulhw` + `psraw`.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
 fn interp8(base: i16, d_prev: i16, d_next: i16) -> [i16; 8] {
     [
@@ -528,6 +741,7 @@ fn interp8(base: i16, d_prev: i16, d_next: i16) -> [i16; 8] {
     ]
 }
 
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
 fn gate_dc_neighbor(n_raw: i16, c_raw: i16, thresh: i16, fallback: i16) -> i16 {
     let d1 = n_raw.wrapping_sub(c_raw);
@@ -539,8 +753,10 @@ fn gate_dc_neighbor(n_raw: i16, c_raw: i16, thresh: i16, fallback: i16) -> i16 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
-fn smooth_dc_block(
+pub(crate) fn smooth_dc_block_scalar(
     row_above: [u16; 4],
     row_curr: [u16; 4],
     row_below: [u16; 4],
@@ -583,6 +799,32 @@ fn smooth_dc_block(
         for y in 0..8 {
             dst[block_off + y * dst_stride + x] = (col[y] >> 3).clamp(0, 255) as u8;
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn smooth_dc_block(
+    row_above: [u16; 4],
+    row_curr: [u16; 4],
+    row_below: [u16; 4],
+    k: usize,
+    thresh: i16,
+    dst: &mut [u8],
+    block_off: usize,
+    dst_stride: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::smooth_dc_block_neon(
+            row_above, row_curr, row_below, k, thresh, dst, block_off, dst_stride,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        smooth_dc_block_scalar(
+            row_above, row_curr, row_below, k, thresh, dst, block_off, dst_stride,
+        );
     }
 }
 
@@ -646,10 +888,9 @@ pub fn deblock_vert_8(dst: &mut [u8], dst_off: usize, dst_stride: usize, weight_
     }
 }
 
-/// Horizontal edge deblocking filter across 16 columns (two 8-column halves).
-///
-/// `dst_off` points to `(x_left, y_boundary - 2)`; modifies rows `y - 2, y - 1, y, y + 1`.
-pub fn deblock_horiz_16(
+/// Horizontal edge deblocking filter across 16 columns (scalar reference).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn deblock_horiz_16_scalar(
     dst: &mut [u8],
     dst_off: usize,
     dst_stride: usize,
@@ -688,6 +929,38 @@ pub fn deblock_horiz_16(
 
     apply_half(dst, dst_off, wl);
     apply_half(dst, dst_off + 8, wr);
+}
+
+/// Horizontal edge deblocking filter across 16 columns (two 8-column halves).
+///
+/// `dst_off` points to `(x_left, y_boundary - 2)`; modifies rows `y - 2, y - 1, y, y + 1`.
+pub fn deblock_horiz_16(
+    dst: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+    left_weight_idx: usize,
+    right_weight_idx: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::deblock_horiz_16_neon(
+            dst,
+            dst_off,
+            dst_stride,
+            left_weight_idx,
+            right_weight_idx,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        deblock_horiz_16_scalar(
+            dst,
+            dst_off,
+            dst_stride,
+            left_weight_idx,
+            right_weight_idx,
+        );
+    }
 }
 
 #[inline]
@@ -747,10 +1020,9 @@ pub fn smooth_inter_horiz(
     }
 }
 
-/// Smooths a horizontal boundary between two 8x8 inter-residual blocks vertically across 8 columns.
-///
-/// `off` points to row `y_boundary - 2`; modifies rows `r0, r1, r2, r3` separated by `stride`.
-pub fn smooth_inter_vert(
+/// Smooths a horizontal boundary between two 8x8 inter-residual blocks vertically (scalar reference).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn smooth_inter_vert_scalar(
     buf: &mut [i16],
     off: usize,
     stride: usize,
@@ -793,13 +1065,38 @@ pub fn smooth_inter_vert(
     }
 }
 
+/// Smooths a horizontal boundary between two 8x8 inter-residual blocks vertically across 8 columns.
+///
+/// `off` points to row `y_boundary - 2`; modifies rows `r0, r1, r2, r3` separated by `stride`.
+pub fn smooth_inter_vert(
+    buf: &mut [i16],
+    off: usize,
+    stride: usize,
+    info_top: u16,
+    info_bot: u16,
+) {
+    if !should_smooth_inter(info_top, info_bot) {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::smooth_inter_vert_neon(buf, off, stride, info_top, info_bot);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        smooth_inter_vert_scalar(buf, off, stride, info_top, info_bot);
+    }
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
 fn pavgb(a: u8, b: u8) -> u8 {
     ((a as u16 + b as u16 + 1) >> 1) as u8
 }
 
-/// Computes the 8x8 block average using the exact hierarchical `pavgb` tree (`0..=2040`).
-pub fn avg_8x8_pavgb(src: &[u8], off: usize, stride: usize) -> i32 {
+/// Computes the 8x8 block average using the exact hierarchical `pavgb` tree (scalar reference).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn avg_8x8_pavgb_scalar(src: &[u8], off: usize, stride: usize) -> i32 {
     let r0 = &src[off..off + 8];
     let r1 = &src[off + stride..off + stride + 8];
     let r2 = &src[off + 2 * stride..off + 2 * stride + 8];
@@ -822,22 +1119,48 @@ pub fn avg_8x8_pavgb(src: &[u8], off: usize, stride: usize) -> i32 {
     sum
 }
 
+/// Computes the 8x8 block average using the exact hierarchical `pavgb` tree (`0..=2040`).
+pub fn avg_8x8_pavgb(src: &[u8], off: usize, stride: usize) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::avg_8x8_pavgb_neon(src, off, stride)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        avg_8x8_pavgb_scalar(src, off, stride)
+    }
+}
+
 /// Computes `pavgb`-tree averages for two adjacent 8x8 blocks (16x8).
 pub fn avg_16x8_pavgb(src: &[u8], off: usize, stride: usize) -> [i32; 2] {
-    [
-        avg_8x8_pavgb(src, off, stride),
-        avg_8x8_pavgb(src, off + 8, stride),
-    ]
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::avg_16x8_pavgb_neon(src, off, stride)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        [
+            avg_8x8_pavgb_scalar(src, off, stride),
+            avg_8x8_pavgb_scalar(src, off + 8, stride),
+        ]
+    }
 }
 
 /// Computes `pavgb`-tree averages for four adjacent 8x8 blocks (32x8).
 pub fn avg_32x8_pavgb(src: &[u8], off: usize, stride: usize) -> [i32; 4] {
-    [
-        avg_8x8_pavgb(src, off, stride),
-        avg_8x8_pavgb(src, off + 8, stride),
-        avg_8x8_pavgb(src, off + 16, stride),
-        avg_8x8_pavgb(src, off + 24, stride),
-    ]
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dsp_neon::avg_32x8_pavgb_neon(src, off, stride)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        [
+            avg_8x8_pavgb_scalar(src, off, stride),
+            avg_8x8_pavgb_scalar(src, off + 8, stride),
+            avg_8x8_pavgb_scalar(src, off + 16, stride),
+            avg_8x8_pavgb_scalar(src, off + 24, stride),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -1201,5 +1524,338 @@ mod tests {
         }
         assert_eq!(avg_16x8_pavgb(&wide, 0, 32), [80, 160]);
         assert_eq!(avg_32x8_pavgb(&wide, 0, 32), [80, 160, 240, 320]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    mod neon_equivalence {
+        use super::super::super::dsp_neon;
+        use super::*;
+
+        struct XorShift64(u64);
+
+        impl XorShift64 {
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn next_u8(&mut self) -> u8 {
+                self.next_u64() as u8
+            }
+            fn next_i16(&mut self) -> i16 {
+                self.next_u64() as i16
+            }
+            fn next_u16(&mut self) -> u16 {
+                self.next_u64() as u16
+            }
+        }
+
+        #[test]
+        fn idct8x8_neon_matches_scalar_random_and_edges() {
+            let mut rng = XorShift64(0xB14C_1DC7_0000_0001);
+            let edge_blocks: Vec<[i16; 64]> = vec![
+                [0; 64],
+                [i16::MAX; 64],
+                [i16::MIN; 64],
+                [1; 64],
+                [-1; 64],
+                std::array::from_fn(|i| if i % 2 == 0 { i16::MAX } else { i16::MIN }),
+                std::array::from_fn(|i| ((i as i16).wrapping_mul(1021)).wrapping_sub(16000)),
+            ];
+
+            for (case_idx, coeffs) in edge_blocks.iter().enumerate() {
+                let mut out_s = [0x3333i16; 24 * 10];
+                let mut out_n = [0x3333i16; 24 * 10];
+                idct8x8_scalar(coeffs, &mut out_s, 17, 24);
+                dsp_neon::idct8x8_neon(coeffs, &mut out_n, 17, 24);
+                assert_eq!(out_n, out_s, "idct8x8 edge case {case_idx}");
+            }
+
+            for iter in 0..512 {
+                let coeffs: [i16; 64] = std::array::from_fn(|_| {
+                    if iter % 3 == 0 {
+                        rng.next_i16()
+                    } else {
+                        (rng.next_i16() >> 4).wrapping_mul(3)
+                    }
+                });
+                let stride = 8 + (iter % 19);
+                let off = iter % 7;
+                let len = off + 8 * stride + 8;
+                let mut out_s = vec![0x7777i16; len];
+                let mut out_n = vec![0x7777i16; len];
+                idct8x8_scalar(&coeffs, &mut out_s, off, stride);
+                dsp_neon::idct8x8_neon(&coeffs, &mut out_n, off, stride);
+                assert_eq!(out_n, out_s, "idct8x8 random iter {iter}");
+            }
+
+            for dc in [0i16, 1, -1, 63, 64, -64, -65, i16::MIN, i16::MAX] {
+                let mut out_s = [0x1234i16; 16 * 10];
+                let mut out_n = [0x1234i16; 16 * 10];
+                idct8x8_dc_scalar(dc, &mut out_s, 13, 16);
+                dsp_neon::idct8x8_dc_neon(dc, &mut out_n, 13, 16);
+                assert_eq!(out_n, out_s, "idct8x8_dc dc={dc}");
+            }
+        }
+
+        #[test]
+        fn clamp_and_add_clamp_neon_matches_scalar() {
+            let mut rng = XorShift64(0xB14C_C1A4_0000_0002);
+            for iter in 0..256 {
+                let d_stride = 16 + (iter % 17);
+                let s_stride = 16 + (iter % 13);
+                let p_stride = 16 + (iter % 11);
+                let d_off = iter % 5;
+                let s_off = iter % 7;
+                let p_off = iter % 3;
+
+                let mut src: Vec<i16> = (0..s_off + 8 * s_stride + 16)
+                    .map(|_| rng.next_i16())
+                    .collect();
+                if iter == 0 {
+                    for (i, v) in [i16::MIN, -300, -1, 0, 1, 255, 256, i16::MAX]
+                        .iter()
+                        .enumerate()
+                    {
+                        src[s_off + i] = *v;
+                    }
+                }
+                let pred: Vec<u8> = (0..p_off + 8 * p_stride + 16)
+                    .map(|_| rng.next_u8())
+                    .collect();
+
+                let mut dst_s = vec![0x5Au8; d_off + 8 * d_stride + 16];
+                let mut dst_n = dst_s.clone();
+                clamp_store_16x8_scalar(&mut dst_s, d_off, d_stride, &src, s_off, s_stride);
+                dsp_neon::clamp_store_16x8_neon(&mut dst_n, d_off, d_stride, &src, s_off, s_stride);
+                assert_eq!(dst_n, dst_s, "clamp_store iter {iter}");
+
+                dst_s.fill(0xA5);
+                dst_n.fill(0xA5);
+                add_clamp_16x8_scalar(
+                    &mut dst_s, d_off, d_stride, &src, s_off, s_stride, &pred, p_off, p_stride,
+                );
+                dsp_neon::add_clamp_16x8_neon(
+                    &mut dst_n, d_off, d_stride, &src, s_off, s_stride, &pred, p_off, p_stride,
+                );
+                assert_eq!(dst_n, dst_s, "add_clamp iter {iter}");
+            }
+        }
+
+        #[test]
+        fn mc_luma_16x16_neon_matches_scalar_all_modes_and_edges() {
+            let mut rng = XorShift64(0xB14C_104A_0000_0003);
+            let stride = 48usize;
+            let height = 40usize;
+            let mut src = vec![0u8; stride * height];
+            for b in &mut src {
+                *b = rng.next_u8();
+            }
+
+            // Extreme checkerboard pattern to stress filter6 rounding/clamping.
+            let mut checker = vec![0u8; stride * height];
+            for y in 0..height {
+                for x in 0..stride {
+                    checker[y * stride + x] = if (x ^ y) & 1 == 0 { 0 } else { 255 };
+                }
+            }
+
+            let coords = [
+                (8, 8),
+                (2, 2),
+                (0, 0),
+                (1, 1),
+                (-3, -2),
+                (29, 21),
+                (30, 22),
+                (40, 35),
+                (15, 11),
+            ];
+
+            for plane in [&src, &checker] {
+                for &(hx, hy) in &[(false, false), (false, true), (true, false), (true, true)] {
+                    for &(sx, sy) in &coords {
+                        let dst_stride = 23usize;
+                        let dst_off = 5usize;
+                        let mut dst_s = vec![0xCCu8; dst_off + 16 * dst_stride + 16];
+                        let mut dst_n = dst_s.clone();
+                        mc_luma_16x16_scalar(
+                            plane, stride, sx, sy, &mut dst_s, dst_off, dst_stride, hx, hy,
+                        );
+                        dsp_neon::mc_luma_16x16_neon(
+                            plane, stride, sx, sy, &mut dst_n, dst_off, dst_stride, hx, hy,
+                        );
+                        assert_eq!(
+                            dst_n, dst_s,
+                            "mc_luma mismatch hx={hx} hy={hy} sx={sx} sy={sy}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn mc_chroma_8x8_neon_matches_scalar_all_qpel_and_edges() {
+            let mut rng = XorShift64(0xB14C_C40A_0000_0004);
+            let stride = 32usize;
+            let height = 28usize;
+            let mut src = vec![0u8; stride * height];
+            for b in &mut src {
+                *b = rng.next_u8();
+            }
+            let mut extremes = vec![0u8; stride * height];
+            for (i, b) in extremes.iter_mut().enumerate() {
+                *b = match i % 4 {
+                    0 => 0,
+                    1 => 1,
+                    2 => 254,
+                    _ => 255,
+                };
+            }
+
+            let coords = [(0, 0), (5, 7), (23, 19), (24, 20), (-2, 3), (30, 26)];
+            for plane in [&src, &extremes] {
+                for dx in 0..4 {
+                    for dy in 0..4 {
+                        for &(sx, sy) in &coords {
+                            let dst_stride = 19usize;
+                            let dst_off = 3usize;
+                            let mut dst_s = vec![0x99u8; dst_off + 8 * dst_stride + 8];
+                            let mut dst_n = dst_s.clone();
+                            mc_chroma_8x8_scalar(
+                                plane, stride, sx, sy, &mut dst_s, dst_off, dst_stride, dx, dy,
+                            );
+                            dsp_neon::mc_chroma_8x8_neon(
+                                plane, stride, sx, sy, &mut dst_n, dst_off, dst_stride, dx, dy,
+                            );
+                            assert_eq!(
+                                dst_n, dst_s,
+                                "mc_chroma mismatch dx={dx} dy={dy} sx={sx} sy={sy}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn smooth_dc_block_neon_matches_scalar_random_and_edges() {
+            let mut rng = XorShift64(0xB14C_DC50_0000_0005);
+            for iter in 0..512 {
+                let above: [u16; 4] = std::array::from_fn(|_| {
+                    if iter % 4 == 0 {
+                        rng.next_u16()
+                    } else {
+                        0x6000 | (rng.next_u16() & 0x07ff)
+                    }
+                });
+                let curr: [u16; 4] = std::array::from_fn(|_| {
+                    if iter % 4 == 0 {
+                        rng.next_u16()
+                    } else {
+                        0x6000 | (rng.next_u16() & 0x07ff)
+                    }
+                });
+                let below: [u16; 4] = std::array::from_fn(|_| {
+                    if iter % 4 == 0 {
+                        rng.next_u16()
+                    } else {
+                        0x6000 | (rng.next_u16() & 0x07ff)
+                    }
+                });
+                let thresh = match iter % 5 {
+                    0 => 0,
+                    1 => 128,
+                    2 => 512,
+                    3 => 2040,
+                    _ => i16::MAX,
+                };
+                for k in [1usize, 2] {
+                    let stride = 16 + (iter % 13);
+                    let off = iter % 9;
+                    let mut dst_s = vec![0x42u8; off + 8 * stride + 8];
+                    let mut dst_n = dst_s.clone();
+                    smooth_dc_block_scalar(above, curr, below, k, thresh, &mut dst_s, off, stride);
+                    dsp_neon::smooth_dc_block_neon(
+                        above, curr, below, k, thresh, &mut dst_n, off, stride,
+                    );
+                    assert_eq!(dst_n, dst_s, "smooth_dc iter={iter} k={k} thresh={thresh}");
+                }
+            }
+        }
+
+        #[test]
+        fn deblock_inter_smooth_and_pavgb_neon_match_scalar() {
+            let mut rng = XorShift64(0xB14C_DEB0_0000_0006);
+
+            // deblock_horiz_16 across all 16x16 weight pairs
+            for lw in 0..16 {
+                for rw in 0..16 {
+                    let stride = 24usize;
+                    let off = 3usize;
+                    let mut buf_s: Vec<u8> =
+                        (0..off + 4 * stride + 16).map(|_| rng.next_u8()).collect();
+                    let mut buf_n = buf_s.clone();
+                    deblock_horiz_16_scalar(&mut buf_s, off, stride, lw, rw);
+                    dsp_neon::deblock_horiz_16_neon(&mut buf_n, off, stride, lw, rw);
+                    assert_eq!(buf_n, buf_s, "deblock_horiz lw={lw} rw={rw}");
+                }
+            }
+
+            // smooth_inter_vert across all sparsity combinations & wrapping i16 edges
+            for st in 0..4u16 {
+                for sb in 0..4u16 {
+                    let info_top = (st << 13) | 0x0100;
+                    let info_bot = (sb << 13) | 0x0500;
+                    let stride = 13usize;
+                    let off = 2usize;
+                    let mut buf_s: Vec<i16> =
+                        (0..off + 4 * stride + 8).map(|_| rng.next_i16()).collect();
+                    buf_s[off + stride] = i16::MIN;
+                    buf_s[off + 2 * stride] = i16::MAX;
+                    let mut buf_n = buf_s.clone();
+                    smooth_inter_vert_scalar(&mut buf_s, off, stride, info_top, info_bot);
+                    if should_smooth_inter(info_top, info_bot) {
+                        dsp_neon::smooth_inter_vert_neon(
+                            &mut buf_n, off, stride, info_top, info_bot,
+                        );
+                    }
+                    assert_eq!(buf_n, buf_s, "smooth_inter_vert st={st} sb={sb}");
+                }
+            }
+
+            // avg_8x8 / 16x8 / 32x8 pavgb
+            for iter in 0..128 {
+                let stride = 32 + (iter % 17);
+                let off = iter % 9;
+                let src: Vec<u8> = (0..off + 8 * stride + 32).map(|_| rng.next_u8()).collect();
+                assert_eq!(
+                    dsp_neon::avg_8x8_pavgb_neon(&src, off, stride),
+                    avg_8x8_pavgb_scalar(&src, off, stride),
+                    "avg_8x8 iter={iter}"
+                );
+                assert_eq!(
+                    dsp_neon::avg_16x8_pavgb_neon(&src, off, stride),
+                    [
+                        avg_8x8_pavgb_scalar(&src, off, stride),
+                        avg_8x8_pavgb_scalar(&src, off + 8, stride),
+                    ],
+                    "avg_16x8 iter={iter}"
+                );
+                assert_eq!(
+                    dsp_neon::avg_32x8_pavgb_neon(&src, off, stride),
+                    [
+                        avg_8x8_pavgb_scalar(&src, off, stride),
+                        avg_8x8_pavgb_scalar(&src, off + 8, stride),
+                        avg_8x8_pavgb_scalar(&src, off + 16, stride),
+                        avg_8x8_pavgb_scalar(&src, off + 24, stride),
+                    ],
+                    "avg_32x8 iter={iter}"
+                );
+            }
+        }
     }
 }
