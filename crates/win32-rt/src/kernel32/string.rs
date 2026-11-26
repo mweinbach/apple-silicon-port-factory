@@ -2274,6 +2274,216 @@ fn default_oem_cp_for(lang: &str, country: &str, script: &str) -> u32 {
     }
 }
 
+/// Infer the ISO 15924 script tag for a locale when `uloc_getScript` does not carry an explicit
+/// subtag (ICU omits implicit scripts unless maximized).
+fn infer_script(lang: &str, country: &str, explicit_script: &str) -> String {
+    if !explicit_script.is_empty() {
+        return explicit_script.to_string();
+    }
+    match lang {
+        "ja" => "Jpan",
+        "zh" => match country {
+            "TW" | "HK" | "MO" => "Hant",
+            _ => "Hans",
+        },
+        "ko" => "Kore",
+        "ru" | "uk" | "bg" | "be" | "mk" | "kk" | "ky" | "tt" | "ba" | "sah" | "tg" | "sr" | "mn" => "Cyrl",
+        "el" => "Grek",
+        "ar" | "fa" | "ur" | "ps" | "ug" | "prs" | "ckb" | "sd" | "ku" => "Arab",
+        "he" | "iw" | "yi" => "Hebr",
+        "th" => "Thai",
+        "hi" | "mr" | "ne" | "sa" | "kok" => "Deva",
+        "bn" | "as" => "Beng",
+        "pa" => "Guru",
+        "gu" => "Gujr",
+        "or" => "Orya",
+        "ta" => "Taml",
+        "te" => "Telu",
+        "kn" => "Knda",
+        "ml" => "Mlym",
+        "si" => "Sinh",
+        "lo" => "Laoo",
+        "my" => "Mymr",
+        "km" => "Khmr",
+        "ka" => "Geor",
+        "hy" => "Armn",
+        "am" | "ti" => "Ethi",
+        "bo" | "dz" => "Tibt",
+        "dv" => "Thaa",
+        "syr" => "Syrc",
+        "chr" => "Cher",
+        "iu" => "Cans",
+        _ => "Latn",
+    }
+    .to_string()
+}
+
+/// Map a Windows ANSI or OEM code page to its documented 64-bit `LOCALESIGNATURE` /
+/// `FONTSIGNATURE` code-page bitfield `(word_index, mask)` (`0` = bits 0..31, `1` = bits 32..63).
+fn csb_bit_for_cp(cp: u32) -> Option<(usize, u32)> {
+    match cp {
+        1252 => Some((0, 1 << 0)),
+        1250 => Some((0, 1 << 1)),
+        1251 => Some((0, 1 << 2)),
+        1253 => Some((0, 1 << 3)),
+        1254 => Some((0, 1 << 4)),
+        1255 => Some((0, 1 << 5)),
+        1256 => Some((0, 1 << 6)),
+        1257 => Some((0, 1 << 7)),
+        1258 => Some((0, 1 << 8)),
+        874 => Some((0, 1 << 16)),
+        932 => Some((0, 1 << 17)),
+        936 => Some((0, 1 << 18)),
+        949 => Some((0, 1 << 19)),
+        950 => Some((0, 1 << 20)),
+        869 => Some((1, 1 << 16)), // bit 48
+        866 => Some((1, 1 << 17)), // bit 49
+        865 => Some((1, 1 << 18)), // bit 50
+        864 => Some((1, 1 << 19)), // bit 51
+        863 => Some((1, 1 << 20)), // bit 52
+        862 => Some((1, 1 << 21)), // bit 53
+        861 => Some((1, 1 << 22)), // bit 54
+        860 => Some((1, 1 << 23)), // bit 55
+        857 => Some((1, 1 << 24)), // bit 56
+        855 => Some((1, 1 << 25)), // bit 57
+        852 => Some((1, 1 << 26)), // bit 58
+        775 => Some((1, 1 << 27)), // bit 59
+        737 => Some((1, 1 << 28)), // bit 60
+        708 | 720 => Some((1, 1 << 29)), // bit 61
+        850 => Some((1, 1 << 30)), // bit 62
+        437 => Some((1, 1 << 31)), // bit 63
+        _ => None,
+    }
+}
+
+/// Populate a 32-byte `LOCALESIGNATURE` (`lsUsb[4]`, `lsCsbDefault[2]`, `lsCsbSupported[2]`)
+/// for `loc`. Returns `None` if neither a known Windows code page nor a mapped Unicode script
+/// bit is available so callers never receive fabricated Latin-1/CP1252 coverage.
+fn build_locale_signature(loc: &ResolvedLocale) -> Option<[u32; 8]> {
+    let (lang, country, explicit_script) = if loc.invariant {
+        ("en".to_string(), "US".to_string(), String::new())
+    } else if let Some(a) = icu::api() {
+        let cloc = icu::c_str(&loc.icu_id);
+        let l = unsafe { icu::call_ascii_str(|b, cap, s| (a.uloc_get_language)(cloc.as_ptr(), b, cap, s)) }
+            .unwrap_or_default();
+        let c = unsafe { icu::call_ascii_str(|b, cap, s| (a.uloc_get_country)(cloc.as_ptr(), b, cap, s)) }
+            .unwrap_or_default();
+        let sc = unsafe { icu::call_ascii_str(|b, cap, s| (a.uloc_get_script)(cloc.as_ptr(), b, cap, s)) }
+            .unwrap_or_default();
+        (l, c, sc)
+    } else {
+        let mut parts = loc.bcp47.split('-');
+        let l = parts.next().unwrap_or("en").to_ascii_lowercase();
+        let mut sc = String::new();
+        let mut c = String::new();
+        for p in parts {
+            if p.len() == 4 && p.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                sc = p.to_string();
+            } else if p.len() == 2 && p.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                c = p.to_ascii_uppercase();
+            }
+        }
+        (l, c, sc)
+    };
+    let script = infer_script(&lang, &country, &explicit_script);
+    let ansi_cp = default_ansi_cp_for(&lang, &country, &explicit_script);
+    let oem_cp = default_oem_cp_for(&lang, &country, &explicit_script);
+
+    let mut sig = [0u32; 8];
+    let set_usb = |s: &mut [u32; 8], bit: u32| {
+        s[(bit / 32) as usize] |= 1u32 << (bit % 32);
+    };
+    // Per Microsoft Learn LOCALESIGNATURE: bit 127 (MSB of lsUsb[3]) is always 1.
+    set_usb(&mut sig, 127);
+    set_usb(&mut sig, 0); // Basic Latin
+
+    let mut mapped_script = true;
+    match script.as_str() {
+        "Latn" => {
+            set_usb(&mut sig, 1); // Latin-1 Supplement
+            if matches!(ansi_cp, 1250 | 1254 | 1257 | 1258) {
+                set_usb(&mut sig, 2); // Latin Extended-A
+                set_usb(&mut sig, 3); // Latin Extended-B
+            }
+            if ansi_cp == 1258 {
+                set_usb(&mut sig, 29); // Latin Extended Additional (Vietnamese)
+            }
+        }
+        "Grek" => set_usb(&mut sig, 7),
+        "Cyrl" => set_usb(&mut sig, 9),
+        "Armn" => set_usb(&mut sig, 10),
+        "Hebr" => set_usb(&mut sig, 11),
+        "Arab" => set_usb(&mut sig, 13),
+        "Deva" => set_usb(&mut sig, 15),
+        "Beng" => set_usb(&mut sig, 16),
+        "Guru" => set_usb(&mut sig, 17),
+        "Gujr" => set_usb(&mut sig, 18),
+        "Orya" => set_usb(&mut sig, 19),
+        "Taml" => set_usb(&mut sig, 20),
+        "Telu" => set_usb(&mut sig, 21),
+        "Knda" => set_usb(&mut sig, 22),
+        "Mlym" => set_usb(&mut sig, 23),
+        "Thai" => set_usb(&mut sig, 24),
+        "Laoo" => set_usb(&mut sig, 25),
+        "Geor" => set_usb(&mut sig, 26),
+        "Jpan" => {
+            for b in [48, 49, 50, 59, 68] {
+                set_usb(&mut sig, b);
+            }
+        }
+        "Hans" => {
+            for b in [48, 59, 68] {
+                set_usb(&mut sig, b);
+            }
+        }
+        "Hant" => {
+            for b in [48, 51, 59, 61, 68] {
+                set_usb(&mut sig, b);
+            }
+        }
+        "Kore" => {
+            for b in [28, 52, 56, 59, 68] {
+                set_usb(&mut sig, b);
+            }
+        }
+        "Tibt" => set_usb(&mut sig, 70),
+        "Syrc" => set_usb(&mut sig, 71),
+        "Thaa" => set_usb(&mut sig, 72),
+        "Sinh" => set_usb(&mut sig, 73),
+        "Mymr" => set_usb(&mut sig, 74),
+        "Ethi" => set_usb(&mut sig, 75),
+        "Cher" => set_usb(&mut sig, 76),
+        "Cans" => set_usb(&mut sig, 77),
+        "Khmr" => set_usb(&mut sig, 80),
+        "Mong" => set_usb(&mut sig, 81),
+        _ => {
+            mapped_script = false;
+        }
+    }
+    if !mapped_script && ansi_cp == 0 {
+        return None;
+    }
+
+    if let Some((w, mask)) = csb_bit_for_cp(ansi_cp) {
+        sig[4 + w] |= mask;
+        sig[6 + w] |= mask;
+    }
+    if let Some((w, mask)) = csb_bit_for_cp(oem_cp) {
+        sig[4 + w] |= mask;
+        sig[6 + w] |= mask;
+    }
+    if ansi_cp == 1252 {
+        // Western European / US locales support both OEM 437 and OEM 850.
+        if let Some((w, mask)) = csb_bit_for_cp(437) {
+            sig[6 + w] |= mask;
+        }
+        if let Some((w, mask)) = csb_bit_for_cp(850) {
+            sig[6 + w] |= mask;
+        }
+    }
+    Some(sig)
+}
+
 fn extract_sep(pat: &str, fallback: &str) -> String {
     let mut in_quote = false;
     for ch in pat.chars() {
@@ -2642,22 +2852,10 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
             let inf = num_sym(icu::UNUM_DECIMAL, icu::UNUM_INFINITY_SYMBOL).unwrap_or_else(|| "Infinity".into());
             format!("{neg}{inf}")
         }
-        0x6C => unsafe {
-            let sc = icu::call_ascii_str(|b, cap, s| (a.uloc_get_script)(cloc.as_ptr(), b, cap, s))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| match lang.as_str() {
-                    "ja" => "Jpan".into(),
-                    "zh" => "Hans".into(),
-                    "ko" => "Kore".into(),
-                    "ru" | "uk" | "bg" | "sr" => "Cyrl".into(),
-                    "el" => "Grek".into(),
-                    "ar" | "fa" | "ur" => "Arab".into(),
-                    "he" => "Hebr".into(),
-                    "th" => "Thai".into(),
-                    _ => "Latn".into(),
-                });
+        0x6C => {
+            let sc = infer_script(&lang, &country, &script);
             format!("{sc};")
-        },
+        }
         0x6D => unsafe {
             icu::call_ascii_str(|b, cap, s| (a.uloc_get_parent)(cloc.as_ptr(), b, cap, s))
                 .map(|p| if p.is_empty() || p == "root" { String::new() } else { icu_to_bcp47(&p) })
@@ -2857,7 +3055,11 @@ unsafe fn get_locale_info_resolved(loc: &ResolvedLocale, lctype: u32, out: *mut 
     }
     let base_type = lctype & 0x0FFF_FFFF & !0x0800_0000;
     if base_type == LOCALE_FONTSIGNATURE {
-        // LOCALESIGNATURE is 16 WCHARs (32 bytes): 4 DWORD USB + 2 DWORD CSB + 2 DWORD default CSB.
+        // LOCALESIGNATURE is 16 WCHARs (32 bytes): lsUsb[4], lsCsbDefault[2], lsCsbSupported[2].
+        let Some(sig) = build_locale_signature(loc) else {
+            set_err(err::ERROR_INVALID_FLAGS);
+            return 0;
+        };
         if cap == 0 {
             return 16;
         }
@@ -2865,10 +3067,6 @@ unsafe fn get_locale_info_resolved(loc: &ResolvedLocale, lctype: u32, out: *mut 
             set_err(err::ERROR_INSUFFICIENT_BUFFER);
             return 0;
         }
-        let mut sig = [0u32; 8];
-        sig[0] = 0x0000_0003; // Basic Latin + Latin-1 Supplement
-        sig[4] = 0x0000_0001; // CP1252 bit
-        sig[6] = 0x0000_0001;
         std::ptr::copy_nonoverlapping(sig.as_ptr() as *const u8, out as *mut u8, 32);
         return 16;
     }
@@ -4883,8 +5081,37 @@ mod tests {
             assert_eq!(GetLocaleInfoW(0x0409, 0x7FFF, buf.as_mut_ptr(), 128), 0);
             assert_eq!(teb::last_error(), err::ERROR_INVALID_FLAGS);
 
-            // LOCALE_FONTSIGNATURE (0x58) returns 16 WCHARs
+            // LOCALE_FONTSIGNATURE (0x58) returns a 16-WCHAR locale-specific LOCALESIGNATURE
+            // with MSB bit 127 set, script-specific USB bits, and locale default/supported CSBs.
+            let read_sig = |tag: &str| -> [u32; 8] {
+                let mut raw = [0u16; 16];
+                assert_eq!(GetLocaleInfoEx(to_wide_z(tag).as_ptr(), 0x58, raw.as_mut_ptr(), 16), 16);
+                let mut dwords = [0u32; 8];
+                std::ptr::copy_nonoverlapping(raw.as_ptr() as *const u8, dwords.as_mut_ptr() as *mut u8, 32);
+                dwords
+            };
             assert_eq!(GetLocaleInfoW(0x0409, 0x58, buf.as_mut_ptr(), 128), 16);
+            let en_sig = read_sig("en-US");
+            assert_ne!(en_sig[3] & 0x8000_0000, 0, "en-US lsUsb MSB bit 127 must be set");
+            assert_eq!(en_sig[4], 1 << 0, "en-US default ANSI CSB must be CP1252");
+            assert_eq!(en_sig[5], 1 << 31, "en-US default OEM CSB must be CP437");
+
+            let ja_sig = read_sig("ja-JP");
+            assert_ne!(ja_sig[3] & 0x8000_0000, 0, "ja-JP lsUsb MSB bit 127 must be set");
+            assert_eq!(ja_sig[4], 1 << 17, "ja-JP default CSB must be CP932 (not CP1252)");
+            assert_eq!(ja_sig[6], 1 << 17, "ja-JP supported CSB must be CP932");
+            assert_ne!(ja_sig[1] & ((1 << 17) | (1 << 18) | (1 << 27)), 0, "ja-JP USB must mark Hiragana/Katakana/CJK");
+
+            let ru_sig = read_sig("ru-RU");
+            assert_ne!(ru_sig[3] & 0x8000_0000, 0);
+            assert_ne!(ru_sig[0] & (1 << 9), 0, "ru-RU USB must mark Cyrillic");
+            assert_eq!(ru_sig[4], 1 << 2, "ru-RU default ANSI CSB must be CP1251");
+            assert_eq!(ru_sig[5], 1 << 17, "ru-RU default OEM CSB must be CP866");
+
+            let hi_sig = read_sig("hi-IN");
+            assert_ne!(hi_sig[3] & 0x8000_0000, 0);
+            assert_ne!(hi_sig[0] & (1 << 15), 0, "hi-IN USB must mark Devanagari");
+            assert_eq!([hi_sig[4], hi_sig[5], hi_sig[6], hi_sig[7]], [0, 0, 0, 0], "Unicode-only hi-IN has zero legacy CSB bits");
 
             // GetLocaleInfoA encodes with the locale's default ANSI code page unless LOCALE_USE_CP_ACP.
             let mut abuf = [0u8; 8];
