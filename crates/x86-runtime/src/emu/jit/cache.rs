@@ -6,7 +6,7 @@ use super::emit::Asm;
 use super::lazy::{flaglazy_enabled, succ_lb_kill, Edges, FLAGLAZY_DEPTH, PF_NONE};
 use super::stubs::{emit_stubs, plaincall_enabled};
 use super::translate::{
-    classify, op_flags, supported, FlagState, Grp, SideExit, SlowMem, Src, SysCold, Term, Tr,
+    classify, op_flags, supported, FlagState, Grp, IcCold, SideExit, SlowMem, Src, SysCold, Term, Tr,
 };
 use super::x87::X87Cold;
 use super::xmm::{fast_nan_enabled, retlit_enabled, xmm_pin_enabled, xmmreg_enabled, ColdNan};
@@ -392,8 +392,44 @@ pub(in crate::emu) unsafe fn patch_lse2_unaligned(pc: usize, insn: u32) -> bool 
 pub(super) const MAX_BLOCK_BYTES: usize = 256 << 10;
 pub(super) const STUBS_BYTES: usize = 4096;
 pub(super) const JBITS: u32 = 18;
+pub(super) const JSET_BITS: u32 = JBITS - 1;
 const JLEN: usize = 1 << JBITS;
 pub(in crate::emu) const JMUL: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Per-thread 2-way polymorphic indirect-branch inline cache dimensions (1024 sets × 32B = 32 KiB).
+pub(super) const IC_BITS: u32 = 10;
+pub(super) const IC_SETS: usize = 1 << IC_BITS;
+
+/// One 2-way inline-cache set (32 bytes, layout read directly by translated ARM64 code).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub(super) struct IcSet {
+    pub(super) ip0: u64,
+    pub(super) code0: u64,
+    pub(super) ip1: u64,
+    pub(super) code1: u64,
+}
+const _: () = assert!(core::mem::size_of::<IcSet>() == 32);
+
+/// Byte offset (`0..32768`, fits in ARM64 `movz imm16`) into `IcSet[IC_SETS]` for an indirect
+/// branch at guest instruction `ip`. Pure integer immediate: zero baked host addresses and
+/// invariant under shifted-base AOT / static Mach-O reload.
+#[inline(always)]
+pub(super) fn ic_slot_byte_off(ip: u64) -> u32 {
+    ((ip.wrapping_mul(JMUL) >> (64 - IC_BITS)) as u32) * 32
+}
+
+/// One direct-link site in `JitCache` (either pending target compilation or already patched).
+#[derive(Clone, Copy)]
+struct JitLink {
+    /// Host address of the `b` / `bl` site.
+    site: usize,
+    /// Optional hot conditional branch (`b.cond`/`cbz`/`cbnz`) pointing at `site` when unlinked
+    /// and patched directly to the target when within ±1 MiB.
+    cond_site: Option<usize>,
+    /// Host address of the out-of-line `lookup_rip` fallback `site` restores to on unlinking.
+    fallback: usize,
+}
 
 /// Translation index entry (layout read by the `lookup_*` stubs).
 #[derive(Clone, Copy, Default)]
@@ -414,13 +450,78 @@ pub(super) const NOJIT: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct JMeta {
-    hash: u64,
-    len: u32,
+    pub(super) hash: u64,
+    pub(super) len: u32,
 }
 
+/// Base index (even, `0..JLEN`) of the 2-way set for guest `ip`.
+/// Way 0 is `base`, way 1 is `base | 1` (same 64-byte cache line).
 #[inline(always)]
-pub(super) fn jslot(ip: u64) -> usize {
-    (ip.wrapping_mul(JMUL) >> (64 - JBITS)) as usize
+pub(super) fn jset_base(ip: u64) -> usize {
+    ((ip.wrapping_mul(JMUL) >> (64 - JSET_BITS)) as usize) << 1
+}
+
+/// Find the slot (`base` or `base | 1`) matching `ip` in a 2-way `JEnt` table.
+#[inline(always)]
+fn jset_find(tab: &[JEnt], ip: u64) -> Option<usize> {
+    let b = jset_base(ip);
+    unsafe {
+        if tab.get_unchecked(b).ip == ip {
+            Some(b)
+        } else if tab.get_unchecked(b | 1).ip == ip {
+            Some(b | 1)
+        } else {
+            None
+        }
+    }
+}
+
+/// Insert `ent` (and optional `m`) into `tab`'s 2-way set for `ent.ip`: updates an existing
+/// matching way in place, otherwise FIFO-shifts way 0 -> way 1 and installs at way 0 (matching
+/// `aot_probe` in `stubs.rs`).
+#[inline(always)]
+fn jset_insert(tab: &mut [JEnt], meta: Option<&mut [JMeta]>, ent: JEnt, m: JMeta) -> usize {
+    let b = jset_base(ent.ip);
+    unsafe {
+        if tab.get_unchecked(b).ip == ent.ip {
+            *tab.get_unchecked_mut(b) = ent;
+            if let Some(meta) = meta {
+                *meta.get_unchecked_mut(b) = m;
+            }
+            return b;
+        }
+        if tab.get_unchecked(b | 1).ip == ent.ip {
+            *tab.get_unchecked_mut(b | 1) = ent;
+            if let Some(meta) = meta {
+                *meta.get_unchecked_mut(b | 1) = m;
+            }
+            return b | 1;
+        }
+        let old0 = *tab.get_unchecked(b);
+        *tab.get_unchecked_mut(b | 1) = old0;
+        *tab.get_unchecked_mut(b) = ent;
+        if let Some(meta) = meta {
+            let oldm0 = *meta.get_unchecked(b);
+            *meta.get_unchecked_mut(b | 1) = oldm0;
+            *meta.get_unchecked_mut(b) = m;
+        }
+        b
+    }
+}
+
+/// Clear any entry for `ip` from a 2-way `JEnt` table.
+#[inline(always)]
+fn jset_clear_ip(tab: &mut [JEnt], ip: u64) {
+    if tab.is_empty() {
+        return;
+    }
+    let b = jset_base(ip);
+    if tab[b].ip == ip {
+        tab[b] = JEnt::default();
+    }
+    if tab[b | 1].ip == ip {
+        tab[b | 1] = JEnt::default();
+    }
 }
 
 /// Per-thread translation cache.
@@ -444,6 +545,9 @@ pub(in crate::emu) struct JitCache {
     pub(super) lookup_rip: usize,
     lookup_jmp: usize,
     lookup_call: usize,
+    lookup_rip_ic: usize,
+    lookup_jmp_ic: usize,
+    lookup_call_ic: usize,
     /// Host call/jmp stub ([`crate::emu::jit_host_xfer`]); 0 when `AW2_JIT_HOSTCALL=0`.
     host_xfer: usize,
     /// Shared XMM spill/reload stubs (0 when `PORT_JIT_XMM_PIN=0`) and `clear_ymm_hi` stub.
@@ -454,24 +558,33 @@ pub(in crate::emu) struct JitCache {
     rdtscp_slow: usize,
     pub(super) index: Box<[JEnt]>,
     pub(super) meta: Box<[JMeta]>,
+    /// Per-thread 2-way polymorphic indirect-branch inline cache (32 KiB, W^X clean).
+    ic_table: Box<[IcSet]>,
     /// Lazy tier-isolated lookup tables used only when `translated_accounting_enabled()` is true:
     /// `aot_table` holds only AOT + `DF_PLAIN` host entries and `jit_table` holds only runtime-JIT
     /// + `DF_PLAIN` host entries, preventing cross-tier chaining so AOT vs runtime-JIT instruction
     /// counts stay exact.
     aot_table: Box<[JEnt]>,
     jit_table: Box<[JEnt]>,
+    /// Lazy tier-isolated IC tables paired with `aot_table` / `jit_table`.
+    aot_ic: Box<[IcSet]>,
+    jit_ic: Box<[IcSet]>,
     /// True if a runtime-JIT block was ever direct-linked to an AOT target before tier accounting
     /// was enabled (triggers one flush if accounting is turned on later in the same process).
     cross_tier_linked: bool,
-    /// All blocks compiled since the last flush, so direct-mapped `index` collisions can
-    /// swap a previously compiled block back into its slot without re-translating.
+    /// All blocks compiled since the last flush, so `index` evictions can swap a previously
+    /// compiled block back into its set without re-translating.
     compiled: std::collections::HashMap<u64, (JEnt, JMeta)>,
     /// Unpatched direct-link sites, by target IP.
-    links: std::collections::HashMap<u64, Vec<usize>>,
+    links: std::collections::HashMap<u64, Vec<JitLink>>,
+    /// Patched direct-link sites (including hot conditional branches), by target IP, so
+    /// single-target invalidation / SMC can unlink cleanly back to their fallbacks.
+    linked_incoming: std::collections::HashMap<u64, Vec<JitLink>>,
     /// Branch islands (`ldr x16, .+8; br x16; .quad target`) inside `self.mem` for far
     /// `JIT -> AOT` direct links outside ±128 MiB `b`/`bl` range.
     far_islands: std::collections::HashMap<usize, usize>,
     va_gen: u32,
+    jit_regions_gen: u32,
     hot: u32,
     translated: u64,
     flushes: u64,
@@ -483,8 +596,9 @@ pub(in crate::emu) struct JitCache {
     /// Top entry address while no translated code of this thread is running
     /// ([`JitScratch::ras`] / [`JitScratch::ctx_ras_cell`]).
     ras_top: u64,
-    /// `ras_miss` stub (0 when the RAS is off).
+    /// `ras_miss` / `ras_miss_ic` stubs (0 when the RAS is off).
     ras_miss: usize,
+    ras_miss_ic: usize,
     /// Wall time spent in [`Self::translate`] on this thread (ns).
     compile_ns: u64,
     /// [`crate::emu::aot::epoch`] this cache was last flushed for (AOT module kills).
@@ -546,6 +660,9 @@ impl JitCache {
             lookup_rip: 0,
             lookup_jmp: 0,
             lookup_call: 0,
+            lookup_rip_ic: 0,
+            lookup_jmp_ic: 0,
+            lookup_call_ic: 0,
             host_xfer: 0,
             spill_xmm: 0,
             reload_xmm: 0,
@@ -554,19 +671,25 @@ impl JitCache {
             rdtscp_slow: 0,
             index: Box::new([]),
             meta: Box::new([]),
+            ic_table: Box::new([]),
             aot_table: Box::new([]),
             jit_table: Box::new([]),
+            aot_ic: Box::new([]),
+            jit_ic: Box::new([]),
             cross_tier_linked: false,
             compiled: std::collections::HashMap::new(),
             links: std::collections::HashMap::new(),
+            linked_incoming: std::collections::HashMap::new(),
             far_islands: std::collections::HashMap::new(),
             va_gen: 0,
+            jit_regions_gen: 0,
             hot: 2,
             translated: 0,
             flushes: 0,
             ras_ring: core::ptr::null_mut(),
             ras_top: 0,
             ras_miss: 0,
+            ras_miss_ic: 0,
             compile_ns: 0,
             aot_epoch: 0,
             lse2_slot: None,
@@ -597,11 +720,23 @@ impl JitCache {
         if self.va_gen != crate::exe::va_gen()
             || self.aot_epoch != crate::emu::aot::epoch()
             || self.static_aot_gen != crate::emu::exec_mem::static_aot_gen()
+            || self.jit_regions_gen != mem::jit_regions_gen()
         {
             return None;
         }
-        let e = self.index.get_unchecked(jslot(ip));
-        if e.ip == ip && e.code != 0 && (e.gen == 0 || e.gen == mem::code_gen()) {
+        let b = jset_base(ip);
+        let e0 = self.index.get_unchecked(b);
+        let e = if e0.ip == ip {
+            e0
+        } else {
+            let e1 = self.index.get_unchecked(b | 1);
+            if e1.ip == ip {
+                e1
+            } else {
+                return None;
+            }
+        };
+        if e.code != 0 && (e.gen == 0 || e.gen == mem::code_gen()) {
             Some(e.code as usize)
         } else {
             None
@@ -634,8 +769,11 @@ impl JitCache {
         if self.index.is_empty() {
             return false;
         }
-        let e = unsafe { self.index.get_unchecked(jslot(ip)) };
-        e.ip == ip && e.code == 0 && e.hits == NOJIT
+        let Some(s) = jset_find(&self.index, ip) else {
+            return false;
+        };
+        let e = unsafe { self.index.get_unchecked(s) };
+        e.code == 0 && e.hits == NOJIT
     }
 
     /// Force zero-`MAP_JIT` `static_only` mode on this cache (unit tests).
@@ -659,6 +797,12 @@ impl JitCache {
             } else {
                 self.index.fill(JEnt::default());
             }
+            if self.ic_table.is_empty() {
+                self.ic_table = unsafe { crate::emu::zeroed_slice::<IcSet>(IC_SETS) };
+            } else {
+                self.ic_table.fill(IcSet::default());
+            }
+            self.jit_regions_gen = mem::jit_regions_gen();
             // Read generation BEFORE reading static stubs so concurrent binds cannot be missed.
             self.static_aot_gen = crate::emu::exec_mem::static_aot_gen();
             if let Some((enter, lookup_rip, has_ras)) = crate::emu::exec_mem::static_aot_enter_stub() {
@@ -703,10 +847,16 @@ impl JitCache {
         } else {
             self.index.fill(JEnt::default());
         }
+        if self.ic_table.is_empty() {
+            self.ic_table = crate::emu::zeroed_slice::<IcSet>(IC_SETS);
+        } else {
+            self.ic_table.fill(IcSet::default());
+        }
         // Static AOT blocks live in immutable signed `__TEXT` (`gen == 0`) and never need
         // dynamic-code revalidation metadata; skip allocating the 4 MiB `self.meta` slab.
         self.va_gen = crate::exe::va_gen();
         self.aot_epoch = crate::emu::aot::epoch();
+        self.jit_regions_gen = mem::jit_regions_gen();
         self.enter = enter;
         self.lookup_rip = lookup_rip;
         self.static_only = true;
@@ -747,8 +897,14 @@ impl JitCache {
             } else {
                 self.index.fill(JEnt::default());
             }
+            if self.ic_table.is_empty() {
+                self.ic_table = crate::emu::zeroed_slice::<IcSet>(IC_SETS);
+            } else {
+                self.ic_table.fill(IcSet::default());
+            }
             self.va_gen = crate::exe::va_gen();
             self.aot_epoch = crate::emu::aot::epoch();
+            self.jit_regions_gen = mem::jit_regions_gen();
             self.enter = enter;
             self.lookup_rip = lookup_rip;
             self.static_only = true;
@@ -767,6 +923,7 @@ impl JitCache {
             if !self.index.is_empty() {
                 self.index.fill(JEnt::default());
             }
+            self.clear_ic_tables();
             self.enter = 0;
             self.lookup_rip = 0;
             self.ras_clear();
@@ -807,8 +964,10 @@ impl JitCache {
         self.mem = p;
         self.index = crate::emu::zeroed_slice::<JEnt>(JLEN);
         self.meta = crate::emu::zeroed_slice::<JMeta>(JLEN);
+        self.ic_table = crate::emu::zeroed_slice::<IcSet>(IC_SETS);
         self.va_gen = crate::exe::va_gen();
         self.aot_epoch = crate::emu::aot::epoch();
+        self.jit_regions_gen = mem::jit_regions_gen();
         self.hot = hot_threshold();
         let ring = if ras_enabled() {
             // Released in `Drop for JitCache` along with the `MAP_JIT` code buffer.
@@ -830,6 +989,9 @@ impl JitCache {
         self.lookup_rip = b + lr * 4;
         self.lookup_jmp = b + lj * 4;
         self.lookup_call = b + lc * 4;
+        self.lookup_rip_ic = b + st.lookup_rip_ic * 4;
+        self.lookup_jmp_ic = b + st.lookup_jmp_ic * 4;
+        self.lookup_call_ic = b + st.lookup_call_ic * 4;
         self.host_xfer = st.host_xfer.map_or(0, |p| b + p * 4);
         self.spill_xmm = st.spill_xmm.map_or(0, |p| b + p * 4);
         self.reload_xmm = st.reload_xmm.map_or(0, |p| b + p * 4);
@@ -841,9 +1003,23 @@ impl JitCache {
             self.ras_ring = ring;
             self.ras_top = ring as u64;
             self.ras_miss = b + m * 4;
+            self.ras_miss_ic = st.ras_miss_ic.map_or(0, |p| b + p * 4);
             self.ras_clear();
         }
         true
+    }
+
+    #[inline]
+    fn clear_ic_tables(&mut self) {
+        if !self.ic_table.is_empty() {
+            self.ic_table.fill(IcSet::default());
+        }
+        if !self.aot_ic.is_empty() {
+            self.aot_ic.fill(IcSet::default());
+        }
+        if !self.jit_ic.is_empty() {
+            self.jit_ic.fill(IcSet::default());
+        }
     }
 
     /// Reset every RAS entry to `(0, lookup_rip)`: a hit then just probes the target.
@@ -864,6 +1040,7 @@ impl JitCache {
             if !self.jit_table.is_empty() {
                 self.jit_table.fill(JEnt::default());
             }
+            self.clear_ic_tables();
             self.cross_tier_linked = false;
             self.ras_clear();
             self.flushes += 1;
@@ -877,9 +1054,11 @@ impl JitCache {
         if !self.jit_table.is_empty() {
             self.jit_table.fill(JEnt::default());
         }
+        self.clear_ic_tables();
         self.cross_tier_linked = false;
         self.compiled.clear();
         self.links.clear();
+        self.linked_incoming.clear();
         self.far_islands.clear();
         if let Some(slot) = self.lse2_slot {
             reset_lse2_slab(slot, self.mem as usize + CODE_LIMIT);
@@ -890,6 +1069,35 @@ impl JitCache {
         if self.flushes <= 8 || self.flushes.is_power_of_two() {
             log::info!("emu jit: flushed translation cache (#{}, {} blocks translated so far)", self.flushes, self.translated);
         }
+    }
+
+    /// Unlink every patched direct link (including hot `b.cond`/`cbz`/`cbnz` sites) pointing
+    /// at `target`, restoring them to their out-of-line `lookup_rip` fallbacks and purging
+    /// `target` from `ic_table` (called on single-block SMC invalidation and module unloads).
+    pub(super) unsafe fn unlink_target(&mut self, target: u64) -> usize {
+        let mut unlinked_n = 0usize;
+        if let Some(sites) = self.linked_incoming.remove(&target) {
+            if !self.mem.is_null() {
+                let mut patched = Vec::with_capacity(sites.len() * 2);
+                jit_write_protect(false);
+                for link in &sites {
+                    write_b(link.site, link.fallback);
+                    patched.push(link.site);
+                    if let Some(cs) = link.cond_site {
+                        write_cond(cs, link.site);
+                        patched.push(cs);
+                    }
+                }
+                jit_write_protect(true);
+                for site in patched {
+                    icache_invalidate(site as *mut u8, 4);
+                }
+            }
+            unlinked_n = sites.len();
+            self.links.entry(target).or_default().extend(sites);
+        }
+        self.clear_ic_tables();
+        unlinked_n
     }
 
     /// Code to run for guest `ip`, translating the block if it became hot; `None` to
@@ -905,12 +1113,16 @@ impl JitCache {
         if crate::emu::exec_mem::static_aot_gen() != self.static_aot_gen {
             self.sync_static_aot();
         }
+        let jrgen = mem::jit_regions_gen();
+        if self.jit_regions_gen != jrgen && (!self.mem.is_null() || self.static_only) {
+            self.jit_regions_gen = jrgen;
+            self.flush();
+        }
         if self.mem.is_null() && !self.static_only {
             return None;
         }
-        let s = jslot(ip);
-        let e = self.index.get_unchecked_mut(s);
-        if e.ip == ip {
+        if let Some(s) = jset_find(&self.index, ip) {
+            let e = self.index.get_unchecked_mut(s);
             if e.code != 0 {
                 if e.gen == 0 || e.gen == mem::code_gen() {
                     return Some(e.code as usize);
@@ -926,23 +1138,23 @@ impl JitCache {
             }
             self.translate(ip, bc)
         } else {
-            self.miss(s, ip, bc)
+            self.miss(ip, bc)
         }
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn miss(&mut self, s: usize, ip: u64, bc: *mut BlockCache) -> Option<usize> {
+    unsafe fn miss(&mut self, ip: u64, bc: *mut BlockCache) -> Option<usize> {
         if self.static_only {
             if let Some((code, host)) = crate::emu::exec_mem::lookup_static_aot(ip) {
                 let ent = JEnt { ip, fast: if host { 0 } else { code as u64 }, gen: 0, hits: 0, code: code as u64 };
-                self.index[s] = ent;
+                jset_insert(&mut self.index, None, ent, JMeta::default());
                 if !self.aot_table.is_empty() {
-                    self.aot_table[s] = ent;
+                    jset_insert(&mut self.aot_table, None, ent, JMeta::default());
                 }
                 return Some(code);
             }
-            self.index[s] = JEnt { ip, fast: 0, gen: 0, hits: NOJIT, code: 0 };
+            jset_insert(&mut self.index, None, JEnt { ip, fast: 0, gen: 0, hits: NOJIT, code: 0 }, JMeta::default());
             return None;
         }
         if let Some(&(mut ent, meta)) = self.compiled.get(&ip) {
@@ -954,30 +1166,35 @@ impl JitCache {
                 if ent.gen != gen {
                     if mem::code_hash(to_mapped_addr(ip), meta.len as usize) != meta.hash {
                         self.compiled.remove(&ip);
-                        self.index[s] = JEnt { ip, ..JEnt::default() };
-                        if !self.jit_table.is_empty() {
-                            self.jit_table[s] = JEnt::default();
-                        }
+                        self.unlink_target(ip);
+                        jset_clear_ip(&mut self.index, ip);
+                        jset_clear_ip(&mut self.jit_table, ip);
                         return self.translate(ip, bc);
                     }
                     ent.gen = gen;
                     self.compiled.insert(ip, (ent, meta));
                 }
             }
-            self.index[s] = ent;
-            self.meta[s] = meta;
+            jset_insert(&mut self.index, Some(&mut self.meta), ent, meta);
             if !self.jit_table.is_empty() {
-                self.jit_table[s] = ent;
+                jset_insert(&mut self.jit_table, None, ent, JMeta::default());
             }
             return Some(ent.code as usize);
         }
-        if let Some(code) = self.install_aot(s, ip) {
+        if let Some(code) = self.install_aot(ip) {
             return Some(code);
         }
-        let e = &mut self.index[s];
+        let b = jset_base(ip);
+        let victim = if self.index[b].ip == 0 || (self.index[b].code == 0 && (self.index[b].fast & 1) == 0) {
+            b
+        } else if self.index[b | 1].ip == 0 || (self.index[b | 1].code == 0 && (self.index[b | 1].fast & 1) == 0) {
+            b | 1
+        } else {
+            b | 1
+        };
+        let e = &mut self.index[victim];
         if e.code != 0 && self.hot > 1 {
-            // Occupied by another compiled block: count challenger visits in `hits` before
-            // evicting the resident entry.
+            // Both ways occupied by compiled blocks: count challenger visits before evicting way 1.
             e.hits = e.hits.saturating_add(1);
             if e.hits < self.hot {
                 return None;
@@ -995,21 +1212,34 @@ impl JitCache {
     #[inline(never)]
     unsafe fn revalidate(&mut self, s: usize, bc: *mut BlockCache) -> Option<usize> {
         let e = self.index[s];
-        let m = self.meta[s];
+        // Inline 2-way rotations (`aot_probe`, `cache_plain_host`, `cache_qpc_host`) move `JEnt`
+        // from way 0 to way 1 without moving `self.meta`; always recover authoritative SMC
+        // validation metadata from `self.compiled` rather than trusting `self.meta[s]`.
+        let m = match self.compiled.get(&e.ip) {
+            Some(&(comp_ent, m)) if comp_ent.code == e.code => {
+                self.meta[s] = m;
+                m
+            }
+            _ => {
+                self.unlink_target(e.ip);
+                self.index[s] = JEnt { ip: e.ip, ..JEnt::default() };
+                jset_clear_ip(&mut self.jit_table, e.ip);
+                return self.translate(e.ip, bc);
+            }
+        };
         let gen = mem::code_gen();
         if mem::code_hash(to_mapped_addr(e.ip), m.len as usize) == m.hash {
             self.index[s].gen = gen;
-            if !self.jit_table.is_empty() && self.jit_table[s].ip == e.ip {
-                self.jit_table[s].gen = gen;
+            if let Some(js) = (!self.jit_table.is_empty()).then(|| jset_find(&self.jit_table, e.ip)).flatten() {
+                self.jit_table[js].gen = gen;
             }
             self.compiled.insert(e.ip, (self.index[s], m));
             return Some(e.code as usize);
         }
         self.compiled.remove(&e.ip);
+        self.unlink_target(e.ip);
         self.index[s] = JEnt { ip: e.ip, ..JEnt::default() };
-        if !self.jit_table.is_empty() && self.jit_table[s].ip == e.ip {
-            self.jit_table[s] = JEnt::default();
-        }
+        jset_clear_ip(&mut self.jit_table, e.ip);
         self.translate(e.ip, bc)
     }
 
@@ -1038,12 +1268,18 @@ impl JitCache {
         let vg = crate::exe::va_gen();
         let ep = crate::emu::aot::epoch();
         let sgen = crate::emu::exec_mem::static_aot_gen();
-        if vg != self.va_gen || ep != self.aot_epoch || sgen != self.static_aot_gen {
+        let jrgen = mem::jit_regions_gen();
+        if vg != self.va_gen
+            || ep != self.aot_epoch
+            || sgen != self.static_aot_gen
+            || jrgen != self.jit_regions_gen
+        {
             // Host dispatch changed: translations may embed stale host-callable decisions
-            // (or an AOT/static-AOT module this cache may link into changed).
+            // (or an AOT/static-AOT module or guest JIT/SMC region this cache may link into changed).
             let vg_changed = vg != self.va_gen;
             self.va_gen = vg;
             self.aot_epoch = ep;
+            self.jit_regions_gen = jrgen;
             if sgen != self.static_aot_gen {
                 self.sync_static_aot();
             } else {
@@ -1091,7 +1327,11 @@ impl JitCache {
                         }
                     }
                 }
+                if self.aot_ic.is_empty() {
+                    self.aot_ic = crate::emu::zeroed_slice::<IcSet>(IC_SETS);
+                }
                 cpu.jx.table = self.aot_table.as_ptr() as usize;
+                cpu.jx.ic_table = self.aot_ic.as_ptr() as usize;
                 cpu.jx.aot_dir = aot_dir;
             } else {
                 if self.jit_table.is_empty() {
@@ -1104,7 +1344,11 @@ impl JitCache {
                         }
                     }
                 }
+                if self.jit_ic.is_empty() {
+                    self.jit_ic = crate::emu::zeroed_slice::<IcSet>(IC_SETS);
+                }
                 cpu.jx.table = self.jit_table.as_ptr() as usize;
+                cpu.jx.ic_table = self.jit_ic.as_ptr() as usize;
                 cpu.jx.aot_dir = 0;
                 // Clear RAS before entering runtime-JIT so a `ret` cannot jump straight back
                 // to an AOT caller landing pad without accounting the tier transition.
@@ -1112,6 +1356,7 @@ impl JitCache {
             }
         } else {
             cpu.jx.table = self.index.as_ptr() as usize;
+            cpu.jx.ic_table = self.ic_table.as_ptr() as usize;
             cpu.jx.aot_dir = aot_dir;
         }
         cpu.jx.mul = JMUL;
@@ -1181,14 +1426,19 @@ impl JitCache {
                 return None;
             }
         }
-        // Keep the index empty so no unlinked target (including self-loops) chains implicitly.
+        // Keep the index and IC empty so no unlinked target (including self-loops) chains implicitly.
         self.compiled.clear();
         self.links.clear();
-        let s = jslot(ip);
+        self.linked_incoming.clear();
+        self.clear_ic_tables();
+        let b = jset_base(ip);
         let code = self.translate_jit(ip, bc)?;
-        self.index[s] = JEnt::default();
+        self.index[b] = JEnt::default();
+        self.index[b | 1] = JEnt::default();
         self.compiled.clear();
         self.links.clear();
+        self.linked_incoming.clear();
+        self.clear_ic_tables();
         Some(code)
     }
 
@@ -1218,6 +1468,7 @@ impl JitCache {
         cpu.jx.ctx_prof = 0;
         cpu.jx.ctx_entry = 0;
         cpu.jx.table = self.index.as_ptr() as usize;
+        cpu.jx.ic_table = self.ic_table.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
         cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
@@ -1271,13 +1522,12 @@ impl JitCache {
     }
 
     /// Install a cached `DF_PLAIN` or pure-float-math host function pointer into the running
-    /// thread's direct-mapped `table`:
+    /// thread's 2-way `table`:
     /// - bit 0 = 1, bit 1 = 0, bit 63 = 0: pure-integer `DF_PLAIN` (`(host_fn as u64) | 1`)
     /// - bit 0 = 1, bit 1 = 1, bit 63 = 0: pure-float-math (`(host_fn as u64) | 3`)
     ///
-    /// Unconditionally installs with `code = 0, hits = NOJIT` so `JitCache::lookup` never
-    /// mistakes it for translated guest code while any evicted guest block recovers in O(1)
-    /// via `aot_probe` / `self.compiled`.
+    /// Installs with `code = 0, hits = NOJIT` so `JitCache::lookup` never mistakes it for
+    /// translated guest code while the 2-way set keeps co-hashed guest blocks resident.
     #[inline(always)]
     pub(in crate::emu) unsafe fn cache_plain_host(table: usize, target: u64, host_fn: usize, needs_xmm: bool) {
         let addr = host_fn as u64;
@@ -1285,13 +1535,23 @@ impl JitCache {
             return;
         }
         let tag = if needs_xmm { 3u64 } else { 1u64 };
-        let s = jslot(target);
-        let cur = &mut *(table as *mut JEnt).add(s);
-        *cur = JEnt { ip: target, fast: addr | tag, gen: 0, hits: NOJIT, code: 0 };
+        let b = jset_base(target);
+        let base = (table as *mut JEnt).add(b);
+        let e0 = &mut *base;
+        let e1 = &mut *base.add(1);
+        let ent = JEnt { ip: target, fast: addr | tag, gen: 0, hits: NOJIT, code: 0 };
+        if e0.ip == target {
+            *e0 = ent;
+        } else if e1.ip == target {
+            *e1 = ent;
+        } else {
+            *e1 = *e0;
+            *e0 = ent;
+        }
     }
 
     /// Install an inline zero-spill `QueryPerformanceCounter` / `RtlQueryPerformanceCounter`
-    /// entry into the running thread's direct-mapped `table` (`fast = qpc_state | (1 << 63) | 1`,
+    /// entry into the running thread's 2-way `table` (`fast = qpc_state | (1 << 63) | 1`,
     /// `code = 0`, `hits = NOJIT`).
     #[cfg(test)]
     #[inline(always)]
@@ -1300,7 +1560,7 @@ impl JitCache {
     }
 
     /// Install a zero-spill inline fast-thunk entry (`FAST_KIND_*`) into the running thread's
-    /// direct-mapped `table`:
+    /// 2-way `table`:
     /// `fast = payload | (1 << 63) | (kind << 60) | ((sub_bit1 as u64) << 1) | 1`,
     /// `code = 0`, `hits = NOJIT`.
     #[inline(always)]
@@ -1316,9 +1576,19 @@ impl JitCache {
             return;
         }
         let fast = addr | (1u64 << 63) | (kind << 60) | ((sub_bit1 as u64) << 1) | 1;
-        let s = jslot(target);
-        let cur = &mut *(table as *mut JEnt).add(s);
-        *cur = JEnt { ip: target, fast, gen: 0, hits: NOJIT, code: 0 };
+        let b = jset_base(target);
+        let base = (table as *mut JEnt).add(b);
+        let e0 = &mut *base;
+        let e1 = &mut *base.add(1);
+        let ent = JEnt { ip: target, fast, gen: 0, hits: NOJIT, code: 0 };
+        if e0.ip == target {
+            *e0 = ent;
+        } else if e1.ip == target {
+            *e1 = ent;
+        } else {
+            *e1 = *e0;
+            *e0 = ent;
+        }
     }
 
     #[cfg(test)]
@@ -1331,7 +1601,8 @@ impl JitCache {
         if self.index.is_empty() {
             return None;
         }
-        let e = self.index[jslot(target)];
+        let idx = jset_find(&self.index, target).unwrap_or_else(|| jset_base(target));
+        let e = self.index[idx];
         Some((e.ip, e.fast, e.gen, e.hits, e.code))
     }
 
@@ -1340,7 +1611,22 @@ impl JitCache {
         if self.index.is_empty() {
             self.index = unsafe { crate::emu::zeroed_slice::<JEnt>(JLEN) };
         }
-        self.index[jslot(ip)] = JEnt { ip, fast: code, gen: 0, hits: 0, code };
+        jset_insert(&mut self.index, None, JEnt { ip, fast: code, gen: 0, hits: 0, code }, JMeta::default());
+    }
+
+    #[cfg(test)]
+    pub(in crate::emu) fn test_ic_set(&self, site_ip: u64) -> Option<(u64, u64, u64, u64)> {
+        if self.ic_table.is_empty() {
+            return None;
+        }
+        let idx = (ic_slot_byte_off(site_ip) / 32) as usize;
+        let s = self.ic_table[idx];
+        Some((s.ip0, s.code0, s.ip1, s.code1))
+    }
+
+    #[cfg(test)]
+    pub(in crate::emu) unsafe fn test_unlink_target(&mut self, target: u64) -> usize {
+        self.unlink_target(target)
     }
 
     fn linkable(&self, target: u64) -> Option<usize> {
@@ -1351,11 +1637,13 @@ impl JitCache {
             return None;
         }
         let split = self.tier_split_active();
-        let e = &self.index[jslot(target)];
-        if e.ip == target && e.code != 0 && e.fast != 0 && e.gen == 0 {
-            let tc = e.code as usize;
-            if !split || self.owns_code(tc) {
-                return Some(tc);
+        if let Some(s) = jset_find(&self.index, target) {
+            let e = &self.index[s];
+            if e.code != 0 && e.fast != 0 && e.gen == 0 {
+                let tc = e.code as usize;
+                if !split || self.owns_code(tc) {
+                    return Some(tc);
+                }
             }
         }
         if let Some(&(e, _)) = self.compiled.get(&target) {
@@ -1366,35 +1654,50 @@ impl JitCache {
         None
     }
 
-    /// Install the shared AOT code for `ip` (if any) in index slot `s`, linking this cache's
-    /// direct-link sites waiting for it (when within `b` range).
-    unsafe fn install_aot(&mut self, s: usize, ip: u64) -> Option<usize> {
+    /// Install the shared AOT code for `ip` (if any) in `self.index`, linking this cache's
+    /// direct-link sites (including hot conditional branches) waiting for it.
+    unsafe fn install_aot(&mut self, ip: u64) -> Option<usize> {
         let (code, host) = crate::emu::aot::find(ip)?;
         let ent = JEnt { ip, fast: if host { 0 } else { code as u64 }, gen: 0, hits: 0, code: code as u64 };
-        self.index[s] = ent;
+        jset_insert(&mut self.index, Some(&mut self.meta), ent, JMeta::default());
         if !self.aot_table.is_empty() {
-            self.aot_table[s] = ent;
+            jset_insert(&mut self.aot_table, None, ent, JMeta::default());
         }
-        self.meta[s] = JMeta::default();
         if !host && !self.tier_split_active() {
             if let Some(sites) = self.links.remove(&ip) {
                 let mut unlinked = Vec::new();
+                let mut linked_now = Vec::new();
                 let mut patched = Vec::new();
                 jit_write_protect(false);
-                for site in sites {
-                    if b_reach(site, code) {
-                        write_b(site, code);
-                        patched.push(site);
+                for link in sites {
+                    if b_reach(link.site, code) {
+                        write_b(link.site, code);
+                        patched.push(link.site);
+                        if let Some(cs) = link.cond_site {
+                            if cond_reach(cs, code) {
+                                write_cond(cs, code);
+                                patched.push(cs);
+                            }
+                        }
+                        linked_now.push(link);
                     } else if let Some(isl) = self.far_island(code) {
-                        write_b(site, isl);
-                        patched.push(site);
+                        write_b(link.site, isl);
+                        patched.push(link.site);
+                        if let Some(cs) = link.cond_site {
+                            if cond_reach(cs, isl) {
+                                write_cond(cs, isl);
+                                patched.push(cs);
+                            }
+                        }
+                        linked_now.push(link);
                     } else {
-                        unlinked.push(site);
+                        unlinked.push(link);
                     }
                 }
                 jit_write_protect(true);
-                if !patched.is_empty() {
+                if !linked_now.is_empty() {
                     self.cross_tier_linked = true;
+                    self.linked_incoming.entry(ip).or_default().extend(linked_now);
                 }
                 for site in patched {
                     icache_invalidate(site as *mut u8, 4);
@@ -1422,8 +1725,12 @@ impl JitCache {
             lookup_rip: self.lookup_rip,
             lookup_jmp: self.lookup_jmp,
             lookup_call: self.lookup_call,
+            lookup_rip_ic: self.lookup_rip_ic,
+            lookup_jmp_ic: self.lookup_jmp_ic,
+            lookup_call_ic: self.lookup_call_ic,
             host_xfer: self.host_xfer,
             ras_miss: self.ras_miss,
+            ras_miss_ic: self.ras_miss_ic,
             spill_xmm: self.spill_xmm,
             reload_xmm: self.reload_xmm,
             clear_ymm_hi: self.clear_ymm_hi,
@@ -1437,7 +1744,7 @@ impl JitCache {
     #[cold]
     #[inline(never)]
     unsafe fn translate(&mut self, ip: u64, bc: *mut BlockCache) -> Option<usize> {
-        if let Some(code) = self.install_aot(jslot(ip), ip) {
+        if let Some(code) = self.install_aot(ip) {
             return Some(code);
         }
         let t0 = std::time::Instant::now();
@@ -1466,10 +1773,9 @@ impl JitCache {
     }
 
     unsafe fn translate_jit(&mut self, ip: u64, bc: *mut BlockCache) -> Option<usize> {
-        let s = jslot(ip);
         let Some(p) = prep_block_with(bc, ip, &mut self.tr_scratch.info_factory) else {
             let ent = JEnt { ip, hits: NOJIT, ..JEnt::default() };
-            self.index[s] = ent;
+            jset_insert(&mut self.index, Some(&mut self.meta), ent, JMeta::default());
             self.compiled.insert(ip, (ent, JMeta::default()));
             return None;
         };
@@ -1490,6 +1796,7 @@ impl JitCache {
         let words = tr.a.pos;
         let overflow = tr.a.overflow;
         let mut links = core::mem::take(&mut tr.links);
+        let mut link_conds = core::mem::take(&mut tr.link_conds);
         tr.return_scratch(&mut self.tr_scratch);
         #[cfg(test)]
         if !overflow {
@@ -1502,11 +1809,13 @@ impl JitCache {
         }
         if overflow {
             links.clear();
+            link_conds.clear();
             self.tr_scratch.links = links;
+            self.tr_scratch.link_conds = link_conds;
             jit_write_protect(true);
             log::warn!("emu jit: block at {ip:#x} exceeded the per-block code limit; interpreting it");
             let ent = JEnt { ip, hits: NOJIT, ..JEnt::default() };
-            self.index[s] = ent;
+            jset_insert(&mut self.index, Some(&mut self.meta), ent, JMeta::default());
             self.compiled.insert(ip, (ent, JMeta::default()));
             return None;
         }
@@ -1514,14 +1823,30 @@ impl JitCache {
         self.cursor = (start + words * 4 + 15) & !15;
         let mut patched = core::mem::take(&mut self.tr_scratch.patched);
         patched.clear();
-        // This block's own direct links (far AOT targets go through a 16-byte branch island).
+        // This block's own direct links (including hot conditional branches within ±1 MiB;
+        // far AOT targets go through a 16-byte branch island).
         let mut far_sites = 0u64;
         for &(site_pos, target) in &links {
             let site = code + site_pos * 4;
+            let w = *(site as *const u32);
+            let off_w = (((w << 6) as i32) >> 6) as i64;
+            let fallback = (site as i64 + off_w * 4) as usize;
+            let cond_site = link_conds
+                .iter()
+                .find(|&&(s, _)| s == site_pos)
+                .map(|&(_, c)| code + c * 4);
+            let link = JitLink { site, cond_site, fallback };
             match self.linkable(target) {
                 Some(tc) if b_reach(site, tc) => {
                     write_b(site, tc);
                     patched.push(site);
+                    if let Some(cs) = cond_site {
+                        if cond_reach(cs, tc) {
+                            write_cond(cs, tc);
+                            patched.push(cs);
+                        }
+                    }
+                    self.linked_incoming.entry(target).or_default().push(link);
                     if !self.owns_code(tc) {
                         self.cross_tier_linked = true;
                     }
@@ -1530,21 +1855,30 @@ impl JitCache {
                     if let Some(isl) = self.far_island(tc) {
                         write_b(site, isl);
                         patched.push(site);
+                        if let Some(cs) = cond_site {
+                            if cond_reach(cs, isl) {
+                                write_cond(cs, isl);
+                                patched.push(cs);
+                            }
+                        }
+                        self.linked_incoming.entry(target).or_default().push(link);
                         if !self.owns_code(tc) {
                             self.cross_tier_linked = true;
                         }
                     } else {
                         far_sites += 1;
-                        self.links.entry(target).or_default().push(site);
+                        self.links.entry(target).or_default().push(link);
                     }
                 }
                 None => {
-                    self.links.entry(target).or_default().push(site);
+                    self.links.entry(target).or_default().push(link);
                 }
             }
         }
         links.clear();
+        link_conds.clear();
         self.tr_scratch.links = links;
+        self.tr_scratch.link_conds = link_conds;
         if far_sites != 0 && crate::emu::jit_stats::enabled() {
             crate::emu::jit_stats::aot_event(crate::emu::jit_stats::TW_FAR, far_sites);
         }
@@ -1557,19 +1891,27 @@ impl JitCache {
         } else {
             if !host {
                 if let Some(sites) = self.links.remove(&ip) {
-                    for site in sites {
-                        write_b(site, code);
-                        patched.push(site);
+                    let mut linked_now = Vec::with_capacity(sites.len());
+                    for link in sites {
+                        write_b(link.site, code);
+                        patched.push(link.site);
+                        if let Some(cs) = link.cond_site {
+                            if cond_reach(cs, code) {
+                                write_cond(cs, code);
+                                patched.push(cs);
+                            }
+                        }
+                        linked_now.push(link);
                     }
+                    self.linked_incoming.entry(ip).or_default().extend(linked_now);
                 }
             }
             JMeta::default()
         };
-        self.index[s] = ent;
+        jset_insert(&mut self.index, Some(&mut self.meta), ent, meta);
         if !self.jit_table.is_empty() {
-            self.jit_table[s] = ent;
+            jset_insert(&mut self.jit_table, None, ent, JMeta::default());
         }
-        self.meta[s] = meta;
         self.compiled.insert(ip, (ent, meta));
         jit_write_protect(true);
         icache_invalidate(code as *mut u8, words * 4);
@@ -1609,6 +1951,25 @@ fn b_reach(site: usize, target: usize) -> bool {
     (-(128i64 << 20)..(128i64 << 20)).contains(&d)
 }
 
+/// `b.cond`/`cbz`/`cbnz` at `site` can reach `target` (±1 MiB).
+#[inline]
+fn cond_reach(site: usize, target: usize) -> bool {
+    let d = target as i64 - site as i64;
+    (-(1i64 << 20)..(1i64 << 20)).contains(&d)
+}
+
+/// Rewrite the `imm19` displacement of a `b.cond`, `cbz`, or `cbnz` instruction at `site`
+/// to target `target` (code memory must be writable).
+unsafe fn write_cond(site: usize, target: usize) {
+    let off = (target as i64 - site as i64) / 4;
+    let w = *(site as *const u32);
+    debug_assert!(
+        (w & 0xFF00_0010) == 0x5400_0000 || (w & 0x7E00_0000) == 0x3400_0000,
+        "write_cond on non-B.cond/CBZ/CBNZ word {w:#x}"
+    );
+    *(site as *mut u32) = (w & 0xFF00_001F) | (((off as u32) & 0x7_FFFF) << 5);
+}
+
 /// Absolute addresses of the stubs a translated block branches to.
 #[derive(Clone, Copy)]
 pub(super) struct StubAddrs {
@@ -1616,8 +1977,12 @@ pub(super) struct StubAddrs {
     pub(super) lookup_rip: usize,
     pub(super) lookup_jmp: usize,
     pub(super) lookup_call: usize,
+    pub(super) lookup_rip_ic: usize,
+    pub(super) lookup_jmp_ic: usize,
+    pub(super) lookup_call_ic: usize,
     pub(super) host_xfer: usize,
     pub(super) ras_miss: usize,
+    pub(super) ras_miss_ic: usize,
     pub(super) spill_xmm: usize,
     pub(super) reload_xmm: usize,
     pub(super) clear_ymm_hi: usize,
@@ -1799,6 +2164,7 @@ pub(in crate::emu) struct TrScratch {
     pub(super) ymm_colds: Vec<(usize, usize, u16)>,
     pub(super) tsc_colds: Vec<(usize, usize, bool)>,
     pub(super) sys_colds: Vec<SysCold>,
+    pub(super) ic_colds: Vec<IcCold>,
     pub(super) cold: Vec<ColdNan>,
     pub(super) x87_colds: Vec<X87Cold>,
     pub(super) x87_tramp_calls: Vec<usize>,
@@ -1823,6 +2189,7 @@ impl TrScratch {
             ymm_colds: Vec::new(),
             tsc_colds: Vec::new(),
             sys_colds: Vec::new(),
+            ic_colds: Vec::new(),
             cold: Vec::new(),
             x87_colds: Vec::new(),
             x87_tramp_calls: Vec::new(),
@@ -1856,6 +2223,7 @@ pub(super) fn new_tr<'a>(
     let mut ymm_colds = core::mem::take(&mut sc.ymm_colds);
     let tsc_colds = core::mem::take(&mut sc.tsc_colds);
     let mut sys_colds = core::mem::take(&mut sc.sys_colds);
+    let mut ic_colds = core::mem::take(&mut sc.ic_colds);
     let mut cold = core::mem::take(&mut sc.cold);
     let mut x87_colds = core::mem::take(&mut sc.x87_colds);
     let mut x87_tramp_calls = core::mem::take(&mut sc.x87_tramp_calls);
@@ -1872,6 +2240,7 @@ pub(super) fn new_tr<'a>(
     link_conds.clear();
     ymm_colds.clear();
     sys_colds.clear();
+    ic_colds.clear();
     cold.clear();
     x87_colds.clear();
     x87_tramp_calls.clear();
@@ -1897,6 +2266,10 @@ pub(super) fn new_tr<'a>(
         lookup_rip: st.lookup_rip,
         lookup_jmp: st.lookup_jmp,
         lookup_call: st.lookup_call,
+        lookup_rip_ic: st.lookup_rip_ic,
+        lookup_jmp_ic: st.lookup_jmp_ic,
+        lookup_call_ic: st.lookup_call_ic,
+        ras_miss_ic: st.ras_miss_ic,
         host_xfer: st.host_xfer,
         spill_xmm: st.spill_xmm,
         reload_xmm: st.reload_xmm,
@@ -1918,6 +2291,7 @@ pub(super) fn new_tr<'a>(
         ymm_colds,
         tsc_colds,
         sys_colds,
+        ic_colds,
         xmm_hi32_zero: 0,
         xmm_hi64_zero: 0,
         xmm_hi32_live: [0xFFFF; BLK_MAX_INSNS + 1],
@@ -2029,6 +2403,9 @@ pub(in crate::emu) fn inline_host_fn_kind(t: u64) -> Option<(usize, bool, bool)>
     }
     if f == crate::emu::DF_VALID | crate::emu::DF_HOST | crate::emu::DF_PLAIN {
         return Some((h, false, false));
+    }
+    if f == crate::emu::DF_VALID | crate::emu::DF_HOST | crate::emu::DF_PLAIN | crate::emu::DF_PLAIN_XMM {
+        return Some((h, false, true));
     }
     if f == crate::emu::DF_VALID | crate::emu::DF_HOST {
         return crate::emu::inline_variant(h).map(|(f2, bail)| (f2, bail, true));

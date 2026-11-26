@@ -14,13 +14,14 @@ use super::routes::{dll_stack_pos_va8, resolve_dispatch_in};
 #[cfg(target_arch = "x86_64")]
 use super::routes::resolve_host_callable;
 #[cfg(target_arch = "aarch64")]
-use super::routes::{DF_SHADOW, LEAN_FLAGS};
+use super::routes::LEAN_FLAGS;
 use super::routes::{
     dll_chkstk_call, dll_chkstk_tail, dll_stack_pos_call, dll_stack_pos_tail,
     exe_import_thunk_target, exe_route_gate, exe_route_off, exe_routed_inc, in_exe_gate,
-    is_routed_dll_chkstk, is_routed_dll_stack_pos, lookup_routed_regfile, resolve_dispatch,
-    resolve_dll_stub_target, to_mapped_addr, ExeRoute, DF_FLOAT_RET, DF_GAME_REPL, DF_HOST,
-    DF_MARK, DF_PLAIN, DF_TRACE, DF_VALID,
+    inline_variant, is_routed_dll_chkstk, is_routed_dll_stack_pos, lookup_routed_regfile,
+    resolve_dispatch, resolve_dll_stub_target, to_mapped_addr, ExeRoute, DF_FLOAT_RET,
+    DF_GAME_REPL, DF_HOST, DF_MARK, DF_PLAIN, DF_PLAIN_STACK, DF_PLAIN_XMM, DF_SHADOW, DF_TRACE,
+    DF_VALID,
 };
 use super::{eh, fast, jit, jit_stats, note_null_call, regfile};
 use crate::exe::{rd, wr};
@@ -453,27 +454,30 @@ pub(crate) unsafe fn shadow_run_lean(
 }
 
 /// Call a native host function from guest code, timing it for the profiler when enabled.
+/// Caller must already hold [`HostFpcrGuard`] or [`ClearFpcrGuard`], and passes pre-resolved
+/// `flags` from [`resolve_dispatch`] (avoiding duplicate lookups and nested FPCR guards).
 #[inline(always)]
 unsafe fn call_host_profiled(
     prof: Option<&'static crate::emu_prof::ThreadProf>,
     ret_ip: u64,
     target_va: u64,
     host_fn: usize,
+    flags: u32,
     gpr: [u64; 8],
     xmm: [u128; 4],
     stack_args: [u64; 8],
 ) -> (u64, u128) {
+    let c = crate::callctx::ctx();
     let r = match prof {
-        None => call_host_for_va(target_va, host_fn, gpr, xmm, stack_args),
+        None => call_host_dispatched_in(c, target_va, host_fn, flags, &gpr, &xmm, &stack_args),
         Some(p) => {
             let t0 = crate::emu_prof::now_ns();
-            let r = call_host_for_va(target_va, host_fn, gpr, xmm, stack_args);
+            let r = call_host_dispatched_in(c, target_va, host_fn, flags, &gpr, &xmm, &stack_args);
             p.host_call(host_fn, ret_ip, crate::emu_prof::now_ns().saturating_sub(t0));
             r
         }
     };
     if crate::diag::nan_trace_installed() && crate::diag::nan_trace_active() {
-        let (_, flags) = resolve_dispatch(target_va);
         crate::diag::check_host_call(target_va, ret_ip, flags, &gpr, &xmm, r.0, r.1);
     }
     r
@@ -516,7 +520,8 @@ unsafe fn host_tail_call(
     // narrow-int guards) rely on `last_bits` argument masking; real Win32/CRT `extern "win64"`
     // functions already mask `u8`/`u16`/`bool` params via `win64-abi` and must see full 64-bit
     // guest registers even after partial-register ops (`mov cl, cl`, `add cl, imm8`).
-    let mask_args = resolve_dispatch(target_va).1 & DF_GAME_REPL != 0;
+    let (_, flags) = resolve_dispatch(target_va);
+    let mask_args = flags & DF_GAME_REPL != 0;
     let gpr = if mask_args {
         [cpu.abi_gpr(1), cpu.abi_gpr(2), cpu.abi_gpr(8), cpu.abi_gpr(9), s5, s6, s7, s8]
     } else {
@@ -528,7 +533,7 @@ unsafe fn host_tail_call(
     let r = {
         let _fpcr = HostFpcrGuard::enter(mxcsr_ptr);
         eh::callout(cpu, host_fn, *sp_ptr, move || {
-            call_host_profiled(prof, ret_addr, target_va, host_fn, gpr, xmm, s_extra)
+            call_host_profiled(prof, ret_addr, target_va, host_fn, flags, gpr, xmm, s_extra)
         })
     };
     crate::lstack::anchor_leave(crate::callctx::ctx(), lsa);
@@ -585,7 +590,8 @@ unsafe fn host_call(
     set_incoming_rsp(rsp, rsp.wrapping_add(0x100));
     let prev_rax = crate::simd_ops::replace_rax_in(cpu.gpr[0]);
     let ret_ip = cpu.rip;
-    let mask_args = resolve_dispatch(target_va).1 & DF_GAME_REPL != 0;
+    let (_, flags) = resolve_dispatch(target_va);
+    let mask_args = flags & DF_GAME_REPL != 0;
     let gpr = if mask_args {
         [cpu.abi_gpr(1), cpu.abi_gpr(2), cpu.abi_gpr(8), cpu.abi_gpr(9), s5, s6, s7, s8]
     } else {
@@ -597,7 +603,7 @@ unsafe fn host_call(
     let r = {
         let _fpcr = HostFpcrGuard::enter(mxcsr_ptr);
         eh::callout(cpu, host_fn, *sp_ptr, move || {
-            call_host_profiled(prof, ret_ip, target_va, host_fn, gpr, xmm, s_extra)
+            call_host_profiled(prof, ret_ip, target_va, host_fn, flags, gpr, xmm, s_extra)
         })
     };
     crate::lstack::anchor_leave(crate::callctx::ctx(), lsa);
@@ -656,6 +662,7 @@ pub(crate) unsafe fn call_host_dispatched_in(
 ) -> (u64, u128) {
     let is_game_repl = flags & DF_GAME_REPL != 0;
     let is_float_ret = flags & DF_FLOAT_RET != 0;
+    let is_plain_xmm = flags & DF_PLAIN_XMM != 0;
     // == simd_ops::set_tls_xmm_in(xmm)
     c.xmm_in.set(*xmm);
     c.xmm_in_set.set(true);
@@ -674,7 +681,7 @@ pub(crate) unsafe fn call_host_dispatched_in(
     if is_game_repl && is_float_ret {
         r_gpr = c.rax_in.get();
     }
-    let r_xmm = if is_float_ret {
+    let r_xmm = if is_float_ret || is_plain_xmm {
         raw_q0
     } else {
         match tls_xmm {
@@ -819,11 +826,173 @@ std::thread_local! {
     pub(super) static TEST_PLAIN_HOST_CALLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
-/// Direct leaf call into a `DF_VALID | DF_HOST | DF_PLAIN` integer builtin via
-/// [`host_call_asm`], skipping `eh::callout`, `lstack` anchoring, `CallCtx` XMM/RSP window
-/// setup, and extra stack-arg loads (`s_extra`). Only used when `prof.is_none() && !precise`.
+/// Direct AAPCS64 leaf call for pure-integer `DF_PLAIN` builtins (`<= 8` args): avoids
+/// `host_call_asm`'s `x19..x28` fence, XMM register setup, and 8-slot stack-arg copy.
 #[inline(always)]
-unsafe fn plain_host_call_asm(cpu: &mut Cpu, host_fn: usize, args_rsp: u64) {
+unsafe fn plain_call_int8(host_fn: usize, gpr: &[u64; 8]) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let f: unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            core::mem::transmute(host_fn);
+        f(gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], gpr[6], gpr[7])
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        host_call_asm(host_fn, gpr, &[0u128; 4], &[0u64; 8]).0
+    }
+}
+
+/// Direct AAPCS64 leaf call for `DF_PLAIN | DF_PLAIN_XMM` / `inline_variant` builtins
+/// (`<= 8` GPR args + `xmm0..3` -> `(rax, xmm0)`): avoids `host_call_asm`'s `x19..x28` fence
+/// and 8-slot stack-arg copy.
+#[inline(always)]
+unsafe fn plain_call_xmm8(host_fn: usize, gpr: &[u64; 8], xmm: &[u128; 4]) -> (u64, u128) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::uint64x2_t;
+        #[inline(always)]
+        fn q(v: u128) -> uint64x2_t {
+            unsafe { core::mem::transmute(v) }
+        }
+        let r_x0: u64;
+        let r_q0: uint64x2_t;
+        core::arch::asm!(
+            "blr x16",
+            inout("x16") host_fn => _,
+            inout("x0") gpr[0] => r_x0,
+            inout("x1") gpr[1] => _, inout("x2") gpr[2] => _, inout("x3") gpr[3] => _,
+            inout("x4") gpr[4] => _, inout("x5") gpr[5] => _, inout("x6") gpr[6] => _,
+            inout("x7") gpr[7] => _,
+            inout("v0") q(xmm[0]) => r_q0,
+            inout("v1") q(xmm[1]) => _, inout("v2") q(xmm[2]) => _, inout("v3") q(xmm[3]) => _,
+            clobber_abi("C"),
+        );
+        (r_x0, core::mem::transmute::<uint64x2_t, u128>(r_q0))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        host_call_asm(host_fn, gpr, xmm, &[0u64; 8])
+    }
+}
+
+/// Direct AAPCS64 leaf call for `DF_PLAIN | DF_PLAIN_STACK` builtins (args 1..16 + optional
+/// `xmm0..3`): avoids `host_call_asm`'s `x19..x28` fence and bridge TLS/EH scaffolding.
+#[inline(always)]
+unsafe fn plain_call_wide16(
+    host_fn: usize,
+    gpr: &[u64; 8],
+    xmm: &[u128; 4],
+    stack_args: &[u64; 8],
+    needs_xmm: bool,
+) -> (u64, u128) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !needs_xmm {
+            let f: unsafe extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64,
+                u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = core::mem::transmute(host_fn);
+            let r = f(
+                gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], gpr[6], gpr[7],
+                stack_args[0], stack_args[1], stack_args[2], stack_args[3],
+                stack_args[4], stack_args[5], stack_args[6], stack_args[7],
+            );
+            return (r, 0);
+        }
+        use core::arch::aarch64::uint64x2_t;
+        #[inline(always)]
+        fn q(v: u128) -> uint64x2_t {
+            unsafe { core::mem::transmute(v) }
+        }
+        let r_x0: u64;
+        let r_q0: uint64x2_t;
+        core::arch::asm!(
+            "sub sp, sp, #0x40",
+            "ldp x9, x10, [x17, #0x00]",
+            "stp x9, x10, [sp, #0x00]",
+            "ldp x9, x10, [x17, #0x10]",
+            "stp x9, x10, [sp, #0x10]",
+            "ldp x9, x10, [x17, #0x20]",
+            "stp x9, x10, [sp, #0x20]",
+            "ldp x9, x10, [x17, #0x30]",
+            "stp x9, x10, [sp, #0x30]",
+            "blr x16",
+            "add sp, sp, #0x40",
+            inout("x16") host_fn => _,
+            inout("x17") stack_args.as_ptr() => _,
+            inout("x0") gpr[0] => r_x0,
+            inout("x1") gpr[1] => _, inout("x2") gpr[2] => _, inout("x3") gpr[3] => _,
+            inout("x4") gpr[4] => _, inout("x5") gpr[5] => _, inout("x6") gpr[6] => _,
+            inout("x7") gpr[7] => _,
+            inout("v0") q(xmm[0]) => r_q0,
+            inout("v1") q(xmm[1]) => _, inout("v2") q(xmm[2]) => _, inout("v3") q(xmm[3]) => _,
+            clobber_abi("C"),
+        );
+        (r_x0, core::mem::transmute::<uint64x2_t, u128>(r_q0))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = needs_xmm;
+        host_call_asm(host_fn, gpr, xmm, stack_args)
+    }
+}
+
+/// Resolved leaf call shape for [`xfer_plain`] / [`plain_host_call_leaf`].
+#[derive(Clone, Copy)]
+struct PlainLeafSpec {
+    host_fn: usize,
+    bail: bool,
+    needs_xmm: bool,
+    needs_stack: bool,
+    cacheable: bool,
+}
+
+/// Classify `target` for the widened leaf fast path per its `DF_*` ABI flags.
+#[inline(always)]
+fn classify_plain_leaf(
+    target: u64,
+    host_fn: usize,
+    prof: Option<&'static crate::emu_prof::ThreadProf>,
+) -> Option<PlainLeafSpec> {
+    if prof.is_some() || precise_faults() || crate::diag::nan_trace_installed() || host_fn == 0 {
+        return None;
+    }
+    let (h, flags) = resolve_dispatch(target);
+    if h != host_fn || (flags & (DF_TRACE | DF_MARK | DF_SHADOW | DF_GAME_REPL)) != 0 {
+        return None;
+    }
+    if (flags & DF_PLAIN) != 0 {
+        let needs_xmm = (flags & (DF_PLAIN_XMM | DF_FLOAT_RET)) != 0;
+        let needs_stack = (flags & DF_PLAIN_STACK) != 0;
+        return Some(PlainLeafSpec {
+            host_fn: h,
+            bail: false,
+            needs_xmm,
+            needs_stack,
+            cacheable: !needs_stack,
+        });
+    }
+    if flags == DF_VALID | DF_HOST {
+        if let Some((f2, bail)) = inline_variant(h) {
+            return Some(PlainLeafSpec {
+                host_fn: f2,
+                bail,
+                needs_xmm: true,
+                needs_stack: false,
+                cacheable: !bail,
+            });
+        }
+    }
+    None
+}
+
+/// Execute a classified leaf host call directly without `eh::callout`, `lstack` anchoring, or
+/// `CallCtx` setup. Returns `false` if a `bail` variant returned 0 or `args_rsp` is out of range.
+#[inline(always)]
+unsafe fn invoke_plain_leaf(cpu: &mut Cpu, spec: PlainLeafSpec, args_rsp: u64) -> bool {
+    if !(0x1_0000..0x8000_0000_0000).contains(&args_rsp) {
+        return false;
+    }
     let r = args_rsp as usize;
     let gpr = [
         cpu.gpr[1],
@@ -836,30 +1005,61 @@ unsafe fn plain_host_call_asm(cpu: &mut Cpu, host_fn: usize, args_rsp: u64) {
         rd::<u64>(r + 0x38),
     ];
     let _fpcr = ClearFpcrGuard::enter();
-    let (rax, _q0) = host_call_asm(host_fn, &gpr, &[0u128; 4], &[0u64; 8]);
+    let (rax, q0) = if !spec.needs_stack {
+        if !spec.needs_xmm {
+            (plain_call_int8(spec.host_fn, &gpr), 0u128)
+        } else {
+            let xmm = [cpu.xmm[0], cpu.xmm[1], cpu.xmm[2], cpu.xmm[3]];
+            plain_call_xmm8(spec.host_fn, &gpr, &xmm)
+        }
+    } else {
+        let s_extra = [
+            rd::<u64>(r + 0x40),
+            rd::<u64>(r + 0x48),
+            rd::<u64>(r + 0x50),
+            rd::<u64>(r + 0x58),
+            rd::<u64>(r + 0x60),
+            rd::<u64>(r + 0x68),
+            rd::<u64>(r + 0x70),
+            rd::<u64>(r + 0x78),
+        ];
+        let xmm = if spec.needs_xmm {
+            [cpu.xmm[0], cpu.xmm[1], cpu.xmm[2], cpu.xmm[3]]
+        } else {
+            [0u128; 4]
+        };
+        plain_call_wide16(spec.host_fn, &gpr, &xmm, &s_extra, spec.needs_xmm)
+    };
+    if spec.bail && rax == 0 {
+        return false;
+    }
     cpu.gpr[0] = rax;
+    if spec.needs_xmm {
+        cpu.xmm[0] = q0;
+    }
     cpu.last_bits[0] = 64;
-    #[cfg(test)]
-    TEST_PLAIN_HOST_CALLS.with(|c| c.set(c.get().wrapping_add(1)));
+    true
 }
 
-/// Check if `target` resolves to a pure-integer `DF_VALID | DF_HOST | DF_PLAIN` leaf builtin
-/// eligible for [`plain_host_call_asm`] (when profiling and precise-fault mode are both off).
+/// Direct leaf call into a classified `DF_PLAIN*` builtin from the interpreter (`JIT = false`),
+/// skipping `eh::callout`, `lstack` anchoring, and `CallCtx` setup.
 #[inline(always)]
-fn plain_leaf_fn(
+unsafe fn plain_host_call_leaf(
+    cpu: &mut Cpu,
     target: u64,
     host_fn: usize,
+    args_rsp: u64,
     prof: Option<&'static crate::emu_prof::ThreadProf>,
-) -> Option<usize> {
-    if prof.is_some() || precise_faults() || crate::diag::nan_trace_installed() {
-        return None;
+) -> bool {
+    let Some(spec) = classify_plain_leaf(target, host_fn, prof) else {
+        return false;
+    };
+    if !invoke_plain_leaf(cpu, spec, args_rsp) {
+        return false;
     }
-    let (h, flags) = resolve_dispatch(target);
-    if flags == DF_VALID | DF_HOST | DF_PLAIN && h == host_fn && h != 0 {
-        Some(h)
-    } else {
-        None
-    }
+    #[cfg(test)]
+    TEST_PLAIN_HOST_CALLS.with(|c| c.set(c.get().wrapping_add(1)));
+    true
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1095,20 +1295,21 @@ unsafe fn xfer_tail_loop<const JIT: bool>(
                         jit_stats::host_xfer(target, true, dynamic, cpu.read_mem(cpu.gpr[4], 64));
                     }
                     let ret_addr = cpu.read_mem(cpu.gpr[4], 64);
-                    if xfer_plain(cpu, target, cpu.gpr[4].wrapping_add(8)) {
+                    if xfer_plain(cpu, target, host_fn, cpu.gpr[4].wrapping_add(8), prof) {
                         cpu.gpr[4] = cpu.gpr[4].wrapping_add(8);
                         ret_addr
                     } else {
                         jit_ras_publish(cpu);
                         host_tail_call(cpu, sp_ptr, prof, target, host_fn)
                     }
-                } else if let Some(h) = plain_leaf_fn(target, host_fn, prof) {
-                    let ret_addr = cpu.read_mem(cpu.gpr[4], 64);
-                    cpu.gpr[4] = cpu.gpr[4].wrapping_add(8);
-                    plain_host_call_asm(cpu, h, cpu.gpr[4]);
-                    ret_addr
                 } else {
-                    host_tail_call(cpu, sp_ptr, prof, target, host_fn)
+                    let ret_addr = cpu.read_mem(cpu.gpr[4], 64);
+                    if plain_host_call_leaf(cpu, target, host_fn, cpu.gpr[4].wrapping_add(8), prof) {
+                        cpu.gpr[4] = cpu.gpr[4].wrapping_add(8);
+                        ret_addr
+                    } else {
+                        host_tail_call(cpu, sp_ptr, prof, target, host_fn)
+                    }
                 };
                 if ret_addr == RET_SENTINEL || ret_addr == 0 {
                     if JIT {
@@ -1231,16 +1432,14 @@ unsafe fn xfer_call<const JIT: bool>(
             if jit_stats::enabled() {
                 jit_stats::host_xfer(target, false, dynamic, cpu.rip);
             }
-            if xfer_plain(cpu, target, cpu.gpr[4]) {
+            if xfer_plain(cpu, target, host_fn, cpu.gpr[4], prof) {
                 return XferOutcome::Continue { check_vagen: true };
             }
             jit_ras_publish(cpu);
             host_call(cpu, sp_ptr, prof, target, host_fn);
             return XferOutcome::Continue { check_vagen: true };
         }
-        if let Some(h) = plain_leaf_fn(target, host_fn, prof) {
-            plain_host_call_asm(cpu, h, cpu.gpr[4]);
-        } else {
+        if !plain_host_call_leaf(cpu, target, host_fn, cpu.gpr[4], prof) {
             host_call(cpu, sp_ptr, prof, target, host_fn);
         }
         return XferOutcome::Continue { check_vagen: false };
@@ -1514,45 +1713,34 @@ fn classify_fast_thunk(h: usize) -> Option<(u64, bool, usize)> {
     None
 }
 
-/// `host_xfer` fast path for the targets the translator calls inline when they are static
-/// (`jit::inline_host_fn`: `DF_PLAIN` builtins and `inline_variant`s) but that arrive
-/// here through a register/memory-indirect call or jmp (`call rax`, `call [rbx+8]`, CFG
-/// dispatch, ...): calls the function directly with the translator's inline `plain_call`
-/// register contract (args = `abi_gpr` rcx/rdx/r8/r9 + `[rsp+0x20..0x40]` (`rsp` = `args_rsp`,
-/// i.e. after popping the return address for tail jumps), xmm0..3; rax = x0, xmm0 = q0,
-/// `last_bits[rax]` = full), without the bridge's per-thread setup, which these functions
-/// never use (they never run guest code). Returns false (nothing done) when `target` has no
-/// such function or a bail-out variant returned 0 (then make the real call).
+/// Widened `host_xfer` fast path for leaf host builtins (`DF_PLAIN`, `DF_PLAIN | DF_PLAIN_XMM`,
+/// `DF_PLAIN | DF_PLAIN_STACK`, `DF_PLAIN | DF_FLOAT_RET`, and `inline_variant`s) arriving via
+/// indirect or non-inlined transfers: invokes the builtin directly with the exact Win64 register,
+/// XMM0..3, and stack-arg (1..8 or 9..16) shape required by its `DF_*` flags, without `eh::callout`,
+/// `lstack` anchoring, `CallCtx` TLS churn, or `host_call_asm`'s `x19..x28` fence. Caches 1..8-arg
+/// non-bail targets into `cpu.jx.table` so subsequent indirect calls hit directly in `lookup_call`
+/// / `lookup_jmp`. Returns `false` (leaving state untouched) if the target is ineligible or a bail
+/// variant returned 0.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
-unsafe fn xfer_plain(cpu: &mut Cpu, target: u64, args_rsp: u64) -> bool {
-    let Some((h, bail, needs_xmm)) = jit::inline_host_fn_kind(target) else { return false };
-    let r = args_rsp as usize;
-    let gpr = [
-        cpu.gpr[1],
-        cpu.gpr[2],
-        cpu.gpr[8],
-        cpu.gpr[9],
-        rd::<u64>(r + 0x20),
-        rd::<u64>(r + 0x28),
-        rd::<u64>(r + 0x30),
-        rd::<u64>(r + 0x38),
-    ];
-    let xmm = if needs_xmm {
-        [cpu.xmm[0], cpu.xmm[1], cpu.xmm[2], cpu.xmm[3]]
-    } else {
-        [0u128; 4]
+unsafe fn xfer_plain(
+    cpu: &mut Cpu,
+    target: u64,
+    host_fn: usize,
+    args_rsp: u64,
+    prof: Option<&'static crate::emu_prof::ThreadProf>,
+) -> bool {
+    let Some(spec) = classify_plain_leaf(target, host_fn, prof) else {
+        return false;
     };
-    let _fpcr = ClearFpcrGuard::enter();
-    let (rax, q0) = host_call_asm(h, &gpr, &xmm, &[0; 8]);
-    if bail && rax == 0 {
+    if !invoke_plain_leaf(cpu, spec, args_rsp) {
         return false;
     }
-    if !bail {
-        if let Some((kind, sub_bit1, payload)) = classify_fast_thunk(h) {
+    if spec.cacheable && jit::plaincall_enabled() {
+        if let Some((kind, sub_bit1, payload)) = classify_fast_thunk(spec.host_fn) {
             jit::JitCache::cache_fast_thunk(cpu.jx.table, target, kind, sub_bit1, payload);
         } else {
-            jit::JitCache::cache_plain_host(cpu.jx.table, target, h, needs_xmm);
+            jit::JitCache::cache_plain_host(cpu.jx.table, target, spec.host_fn, spec.needs_xmm);
         }
     }
     if jit_stats::enabled() {
@@ -1560,11 +1748,6 @@ unsafe fn xfer_plain(cpu: &mut Cpu, target: u64, args_rsp: u64) -> bool {
     }
     #[cfg(test)]
     TEST_XFER_PLAIN.with(|c| c.set(c.get() + 1));
-    cpu.gpr[0] = rax;
-    if needs_xmm {
-        cpu.xmm[0] = q0;
-    }
-    cpu.last_bits[0] = 64;
     true
 }
 

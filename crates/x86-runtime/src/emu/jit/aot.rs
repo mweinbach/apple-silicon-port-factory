@@ -24,8 +24,9 @@ use crate::emu::{mem, to_mapped_addr, BlockCache};
 
 /// Word offsets of the shared stubs at the start of an AOT region: enter, exit,
 /// lookup_rip, lookup_jmp, lookup_call, host_xfer, ras_miss, spill_xmm, reload_xmm,
-/// clear_ymm_hi, rdtsc_slow, rdtscp_slow (`u32::MAX` = not emitted).
-pub(in crate::emu) type AotStubOffs = [u32; 12];
+/// clear_ymm_hi, rdtsc_slow, rdtscp_slow, lookup_rip_ic, lookup_jmp_ic, lookup_call_ic,
+/// ras_miss_ic (`u32::MAX` = not emitted).
+pub(in crate::emu) type AotStubOffs = [u32; 16];
 
 /// Bytes reserved for the stubs at the start of an AOT region.
 pub(in crate::emu) const AOT_STUBS_BYTES: usize = STUBS_BYTES;
@@ -231,6 +232,10 @@ fn aot_stub_addrs(vbase: usize, o: &AotStubOffs) -> StubAddrs {
         clear_ymm_hi: at(o[9]),
         rdtsc_slow: at(o[10]),
         rdtscp_slow: at(o[11]),
+        lookup_rip_ic: at(o[12]),
+        lookup_jmp_ic: at(o[13]),
+        lookup_call_ic: at(o[14]),
+        ras_miss_ic: at(o[15]),
     }
 }
 

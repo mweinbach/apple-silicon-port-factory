@@ -1144,7 +1144,7 @@ case_id	case_word	word	assembly	page	encodings
 549	timestamp_stubs[27]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
 549	timestamp_stubs[28]	d65f03c0	ret	ret	RET_64R_branch_reg
 550	static_host_call_relocation[0]	94000000	bl #0	bl	BL_only_branch_imm
-551	static_host_call_to_veneer[0]	94000014	bl #80	bl	BL_only_branch_imm
+551	static_host_call_to_veneer[0]	94000016	bl #88	bl	BL_only_branch_imm
 552	static_host_call_veneer[0]	90000010	adrp x16, #0	adrp	ADRP_only_pcreladdr
 552	static_host_call_veneer[1]	f9400210	ldr x16, [x16]	ldr_imm_gen	LDR_64_ldst_pos
 552	static_host_call_veneer[2]	d61f0200	br x16	br	BR_64_branch_reg
