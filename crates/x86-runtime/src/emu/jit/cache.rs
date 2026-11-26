@@ -1122,7 +1122,7 @@ impl JitCache {
         cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
         cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
         if cpu.jx.teb == 0 {
-            cpu.jx.teb = crate::emu::teb_self() as u64;
+            cpu.jx.teb = crate::exe::teb_self() as u64;
         }
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         // `cpu.jx.ymm_dirty` is maintained incrementally across interpreter and translated writes;
@@ -1226,7 +1226,7 @@ impl JitCache {
         cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
         cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
         if cpu.jx.teb == 0 {
-            cpu.jx.teb = crate::emu::teb_self() as u64;
+            cpu.jx.teb = crate::exe::teb_self() as u64;
         }
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = 0;
@@ -1293,6 +1293,7 @@ impl JitCache {
     /// Install an inline zero-spill `QueryPerformanceCounter` / `RtlQueryPerformanceCounter`
     /// entry into the running thread's direct-mapped `table` (`fast = qpc_state | (1 << 63) | 1`,
     /// `code = 0`, `hits = NOJIT`).
+    #[cfg(test)]
     #[inline(always)]
     pub(in crate::emu) unsafe fn cache_qpc_host(table: usize, target: u64, qpc_state: usize) {
         Self::cache_fast_thunk(table, target, FAST_KIND_QPC, false, qpc_state);
