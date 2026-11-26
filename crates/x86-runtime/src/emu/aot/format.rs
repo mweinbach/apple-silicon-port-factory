@@ -3,6 +3,7 @@
 
 use crate::emu::jit::{
     self, AotReloc, AotStubOffs, AOT_STUBS_BYTES, RELOC_HOST_FN, RELOC_QPC_STATE,
+    RELOC_XINPUT_STATE,
 };
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -19,7 +20,7 @@ pub(super) const FORMAT_VERSION_V6: u32 = 6;
 pub(super) const FORMAT_VERSION: u32 = 7;
 const LEGACY_STUB_COUNT: usize = 10;
 /// Bump on any codegen-relevant change the source hash can't see.
-const AOT_CODEGEN_VERSION: u64 = 3;
+const AOT_CODEGEN_VERSION: u64 = 4;
 
 /// Small 128-bit streaming hash (cache keys / file checksums, not cryptographic).
 pub(super) struct H128 {
@@ -621,8 +622,11 @@ impl Image {
                 && (l.cond_off == u32::MAX || in_code(l.cond_off, 4, 4))
         }) && self.relocs.iter().all(|r| {
             in_code(r.slot_off, 8, 8)
-                && r.kind <= RELOC_QPC_STATE
-                && (r.kind == RELOC_HOST_FN || r.kind == RELOC_QPC_STATE || r.src != 0)
+                && r.kind <= RELOC_XINPUT_STATE
+                && (r.kind == RELOC_HOST_FN
+                    || r.kind == RELOC_QPC_STATE
+                    || r.kind == RELOC_XINPUT_STATE
+                    || r.src != 0)
         })
     }
 }

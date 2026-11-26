@@ -312,4 +312,19 @@ fn register_ext(cases: &mut Cases) {
     check_words!(cases, crc32c(16, 5, 12, 19) => "crc32c", "crc32ch w5, w12, w19");
     check_words!(cases, crc32c(32, 6, 13, 20) => "crc32c", "crc32cw w6, w13, w20");
     check_words!(cases, crc32c(64, 7, 14, 21) => "crc32c", "crc32cx w7, w14, x21");
+
+    check_words!(cases, casa(8, 3, 5, 19) => "casb", "casab w3, w5, [x19]");
+    check_words!(cases, casa(16, 4, 6, 20) => "cash", "casah w4, w6, [x20]");
+    check_words!(cases, casa(32, 2, 31, 17) => "cas", "casa w2, wzr, [x17]");
+    check_words!(cases, casa(64, 6, 8, 22) => "cas", "casa x6, x8, [x22]");
+
+    check_words!(cases, casl(8, 3, 5, 19) => "casb", "caslb w3, w5, [x19]");
+    check_words!(cases, casl(16, 4, 6, 20) => "cash", "caslh w4, w6, [x20]");
+    check_words!(cases, casl(32, 2, 0, 17) => "cas", "casl w2, w0, [x17]");
+    check_words!(cases, casl(64, 6, 8, 22) => "cas", "casl x6, x8, [x22]");
+
+    check_words!(cases, ldar(8, 2, 17) => "ldarb", "ldarb w2, [x17]");
+    check_words!(cases, ldar(16, 2, 17) => "ldarh", "ldarh w2, [x17]");
+    check_words!(cases, ldar(32, 2, 17) => "ldar", "ldar w2, [x17]");
+    check_words!(cases, ldar(64, 2, 17) => "ldar", "ldar x2, [x17]");
 }

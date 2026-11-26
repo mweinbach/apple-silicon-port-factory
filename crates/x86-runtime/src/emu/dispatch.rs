@@ -1417,15 +1417,101 @@ pub(super) fn note_test_xfer_plain(n: u64) {
 
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
-fn is_qpc_host_fn(h: usize) -> bool {
-    static QPC_FNS: std::sync::OnceLock<[usize; 4]> = std::sync::OnceLock::new();
-    let fns = QPC_FNS.get_or_init(|| [
-        win32_rt::kernel32::time::QueryPerformanceCounter as *const () as usize,
-        win32_rt::ntdll::RtlQueryPerformanceCounter as *const () as usize,
-        win32_rt::lookup("kernel32.dll", "QueryPerformanceCounter").map_or(0, |p| p as usize),
-        win32_rt::lookup("ntdll.dll", "RtlQueryPerformanceCounter").map_or(0, |p| p as usize),
-    ]);
-    h != 0 && (h == fns[0] || h == fns[1] || h == fns[2] || h == fns[3])
+fn classify_fast_thunk(h: usize) -> Option<(u64, bool, usize)> {
+    if h == 0 {
+        return None;
+    }
+    struct FastThunkTable {
+        qpc: [usize; 4],
+        time_ms32: [usize; 4],
+        time_ms64: [usize; 2],
+        enter_cs: [usize; 4],
+        leave_cs: [usize; 4],
+        xinput: [usize; 2],
+        xinput_ex: [usize; 2],
+        switch_thread: [usize; 4],
+    }
+    static TABLE: std::sync::OnceLock<FastThunkTable> = std::sync::OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        let lk = |dll: &str, sym: &str| win32_rt::lookup(dll, sym).map_or(0, |p| p as usize);
+        FastThunkTable {
+            qpc: [
+                win32_rt::kernel32::time::QueryPerformanceCounter as *const () as usize,
+                win32_rt::ntdll::RtlQueryPerformanceCounter as *const () as usize,
+                lk("kernel32.dll", "QueryPerformanceCounter"),
+                lk("ntdll.dll", "RtlQueryPerformanceCounter"),
+            ],
+            time_ms32: [
+                win32_rt::misc::winmm::timeGetTime as *const () as usize,
+                win32_rt::kernel32::time::GetTickCount as *const () as usize,
+                lk("winmm.dll", "timeGetTime"),
+                lk("kernel32.dll", "GetTickCount"),
+            ],
+            time_ms64: [
+                win32_rt::kernel32::time::GetTickCount64 as *const () as usize,
+                lk("kernel32.dll", "GetTickCount64"),
+            ],
+            enter_cs: [
+                win32_rt::sync::EnterCriticalSection as *const () as usize,
+                win32_rt::ntdll::RtlEnterCriticalSection as *const () as usize,
+                lk("kernel32.dll", "EnterCriticalSection"),
+                lk("ntdll.dll", "RtlEnterCriticalSection"),
+            ],
+            leave_cs: [
+                win32_rt::sync::LeaveCriticalSection as *const () as usize,
+                win32_rt::ntdll::RtlLeaveCriticalSection as *const () as usize,
+                lk("kernel32.dll", "LeaveCriticalSection"),
+                lk("ntdll.dll", "RtlLeaveCriticalSection"),
+            ],
+            xinput: [
+                win32_rt::misc::xinput1_4::XInputGetState as *const () as usize,
+                lk("xinput1_4.dll", "XInputGetState"),
+            ],
+            xinput_ex: [
+                win32_rt::misc::xinput1_4::XInputGetStateEx as *const () as usize,
+                lk("xinput1_4.dll", "XInputGetStateEx"),
+            ],
+            switch_thread: [
+                win32_rt::kernel32::time::SwitchToThread as *const () as usize,
+                win32_rt::misc::msvcp140::_Thrd_yield as *const () as usize,
+                lk("kernel32.dll", "SwitchToThread"),
+                lk("msvcp140.dll", "_Thrd_yield"),
+            ],
+        }
+    });
+    if t.qpc.contains(&h) {
+        return Some((jit::FAST_KIND_QPC, false, win32_rt::kernel32::time::qpc_fast_state_ptr()));
+    }
+    if t.time_ms32.contains(&h) {
+        return Some((jit::FAST_KIND_TIME_MS, false, win32_rt::kernel32::time::qpc_fast_state_ptr()));
+    }
+    if t.time_ms64.contains(&h) {
+        return Some((jit::FAST_KIND_TIME_MS, true, win32_rt::kernel32::time::qpc_fast_state_ptr()));
+    }
+    if t.enter_cs.contains(&h) {
+        return Some((jit::FAST_KIND_ENTER_CS, false, 0));
+    }
+    if t.leave_cs.contains(&h) {
+        return Some((jit::FAST_KIND_LEAVE_CS, false, 0));
+    }
+    if t.xinput.contains(&h) {
+        return Some((
+            jit::FAST_KIND_XINPUT,
+            false,
+            win32_rt::misc::xinput1_4::xinput_fast_table_ptr(),
+        ));
+    }
+    if t.xinput_ex.contains(&h) {
+        return Some((
+            jit::FAST_KIND_XINPUT,
+            true,
+            win32_rt::misc::xinput1_4::xinput_fast_table_ptr(),
+        ));
+    }
+    if t.switch_thread.contains(&h) {
+        return Some((jit::FAST_KIND_SWITCH_TO_THREAD, false, 0));
+    }
+    None
 }
 
 /// `host_xfer` fast path for the targets the translator calls inline when they are static
@@ -1463,8 +1549,8 @@ unsafe fn xfer_plain(cpu: &mut Cpu, target: u64, args_rsp: u64) -> bool {
         return false;
     }
     if !bail {
-        if is_qpc_host_fn(h) {
-            jit::JitCache::cache_qpc_host(cpu.jx.table, target, win32_rt::kernel32::time::qpc_fast_state_ptr());
+        if let Some((kind, sub_bit1, payload)) = classify_fast_thunk(h) {
+            jit::JitCache::cache_fast_thunk(cpu.jx.table, target, kind, sub_bit1, payload);
         } else {
             jit::JitCache::cache_plain_host(cpu.jx.table, target, h, needs_xmm);
         }

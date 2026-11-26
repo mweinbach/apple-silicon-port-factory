@@ -39,6 +39,8 @@ pub(in crate::emu) const RELOC_HOST_FN: u8 = 0;
 pub(in crate::emu) const RELOC_SLOT_VAL: u8 = 1;
 /// [`AotReloc::kind`]: the slot holds `win32_rt::kernel32::time::qpc_fast_state_ptr()`.
 pub(in crate::emu) const RELOC_QPC_STATE: u8 = 2;
+/// [`AotReloc::kind`]: the slot holds `win32_rt::misc::xinput1_4::xinput_fast_table_ptr()`.
+pub(in crate::emu) const RELOC_XINPUT_STATE: u8 = 3;
 
 /// A relocated 8-byte literal-pool slot of an AOT block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

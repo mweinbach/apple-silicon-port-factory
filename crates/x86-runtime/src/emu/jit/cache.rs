@@ -517,6 +517,18 @@ const RAS_LEN: usize = 4096;
 const RAS_BYTES: usize = RAS_LEN * 16;
 const _: () = assert!(RAS_BYTES == 1 << 16);
 
+/// Zero-spill inline fast-thunk kinds stored in bits `62..60` of `JEnt::fast` when
+/// bit 63 and bit 0 are both set (`fast = payload | (1 << 63) | (kind << 60) | sub_bit1 | 1`).
+/// Bit 59 is reserved as a transient scratch bit (`lookup_jmp` vs `lookup_call`) inside `stubs.rs`.
+pub(in crate::emu) const FAST_KIND_QPC: u64 = 0;
+pub(in crate::emu) const FAST_KIND_TIME_MS: u64 = 1;
+pub(in crate::emu) const FAST_KIND_ENTER_CS: u64 = 2;
+pub(in crate::emu) const FAST_KIND_LEAVE_CS: u64 = 3;
+pub(in crate::emu) const FAST_KIND_XINPUT: u64 = 4;
+pub(in crate::emu) const FAST_KIND_SWITCH_TO_THREAD: u64 = 5;
+
+const FAST_PTR_FORBIDDEN_BITS: u64 = 0xFFFF_0000_0000_0003;
+
 impl JitCache {
     pub(in crate::emu) fn new() -> Self {
         Self {
@@ -1109,6 +1121,9 @@ impl JitCache {
         cpu.jx.x87_helpers = crate::emu::x87::x87_helpers_ptr();
         cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
         cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
+        if cpu.jx.teb == 0 {
+            cpu.jx.teb = crate::emu::teb_self() as u64;
+        }
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         // `cpu.jx.ymm_dirty` is maintained incrementally across interpreter and translated writes;
         // skip the 256-byte `cpu.ymm_hi` scan on every `JitCache::run()`.
@@ -1210,6 +1225,9 @@ impl JitCache {
         cpu.jx.x87_helpers = crate::emu::x87::x87_helpers_ptr();
         cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
         cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
+        if cpu.jx.teb == 0 {
+            cpu.jx.teb = crate::emu::teb_self() as u64;
+        }
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = 0;
         // Verifier trials (`verify.rs::seed_trial`) seed `cpu.ymm_hi` directly; compute `ymm_dirty` here.
@@ -1277,13 +1295,29 @@ impl JitCache {
     /// `code = 0`, `hits = NOJIT`).
     #[inline(always)]
     pub(in crate::emu) unsafe fn cache_qpc_host(table: usize, target: u64, qpc_state: usize) {
-        let addr = qpc_state as u64;
-        if table == 0 || (addr & ((1u64 << 63) | 3)) != 0 {
+        Self::cache_fast_thunk(table, target, FAST_KIND_QPC, false, qpc_state);
+    }
+
+    /// Install a zero-spill inline fast-thunk entry (`FAST_KIND_*`) into the running thread's
+    /// direct-mapped `table`:
+    /// `fast = payload | (1 << 63) | (kind << 60) | ((sub_bit1 as u64) << 1) | 1`,
+    /// `code = 0`, `hits = NOJIT`.
+    #[inline(always)]
+    pub(in crate::emu) unsafe fn cache_fast_thunk(
+        table: usize,
+        target: u64,
+        kind: u64,
+        sub_bit1: bool,
+        payload: usize,
+    ) {
+        let addr = payload as u64;
+        if table == 0 || kind > 7 || (addr & FAST_PTR_FORBIDDEN_BITS) != 0 {
             return;
         }
+        let fast = addr | (1u64 << 63) | (kind << 60) | ((sub_bit1 as u64) << 1) | 1;
         let s = jslot(target);
         let cur = &mut *(table as *mut JEnt).add(s);
-        *cur = JEnt { ip: target, fast: addr | (1u64 << 63) | 1, gen: 0, hits: NOJIT, code: 0 };
+        *cur = JEnt { ip: target, fast, gen: 0, hits: NOJIT, code: 0 };
     }
 
     #[cfg(test)]
