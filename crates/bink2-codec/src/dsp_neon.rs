@@ -336,12 +336,16 @@ unsafe fn filter6_neon(
 }
 
 #[inline(always)]
-unsafe fn load_row16_s16(ptr: *const u8) -> (int16x8_t, int16x8_t) {
-    let v = vld1q_u8(ptr);
+unsafe fn widen_u8_to_s16(v: uint8x16_t) -> (int16x8_t, int16x8_t) {
     (
         vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v))),
         vreinterpretq_s16_u16(vmovl_high_u8(v)),
     )
+}
+
+#[inline(always)]
+unsafe fn load_row16_s16(ptr: *const u8) -> (int16x8_t, int16x8_t) {
+    widen_u8_to_s16(vld1q_u8(ptr))
 }
 
 #[inline(always)]
@@ -350,12 +354,22 @@ unsafe fn filter6_horiz_row16(
     c19: int16x8_t,
     c8: int16x8_t,
 ) -> (int16x8_t, int16x8_t) {
-    let (a_lo, a_hi) = load_row16_s16(ptr);
-    let (b_lo, b_hi) = load_row16_s16(ptr.add(1));
-    let (c_lo, c_hi) = load_row16_s16(ptr.add(2));
-    let (d_lo, d_hi) = load_row16_s16(ptr.add(3));
-    let (e_lo, e_hi) = load_row16_s16(ptr.add(4));
-    let (f_lo, f_hi) = load_row16_s16(ptr.add(5));
+    // Load the 21-byte window `[0..21)` with just 2 vector loads (`[0..16)` and `[5..21)`)
+    // and extract intermediate tap windows via single-cycle `vextq_u8` shifts.
+    let v0 = vld1q_u8(ptr);
+    let v5 = vld1q_u8(ptr.add(5));
+    let v_tail = vextq_u8::<11>(v5, v5); // lanes 0..5 hold bytes 16..21
+    let v1 = vextq_u8::<1>(v0, v_tail);
+    let v2 = vextq_u8::<2>(v0, v_tail);
+    let v3 = vextq_u8::<3>(v0, v_tail);
+    let v4 = vextq_u8::<4>(v0, v_tail);
+
+    let (a_lo, a_hi) = widen_u8_to_s16(v0);
+    let (b_lo, b_hi) = widen_u8_to_s16(v1);
+    let (c_lo, c_hi) = widen_u8_to_s16(v2);
+    let (d_lo, d_hi) = widen_u8_to_s16(v3);
+    let (e_lo, e_hi) = widen_u8_to_s16(v4);
+    let (f_lo, f_hi) = widen_u8_to_s16(v5);
     (
         filter6_neon(a_lo, b_lo, c_lo, d_lo, e_lo, f_lo, c19, c8),
         filter6_neon(a_hi, b_hi, c_hi, d_hi, e_hi, f_hi, c19, c8),

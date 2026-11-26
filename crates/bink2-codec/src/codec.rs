@@ -99,6 +99,19 @@ pub fn compute_slices(fourcc: u32, open_flags: u32, _width: u32, height: u32) ->
     info
 }
 
+#[cold]
+#[inline(never)]
+fn read_tail_word(data: &[u8], off: usize) -> u32 {
+    if off < data.len() {
+        let mut b = [0u8; 4];
+        let rem = data.len() - off;
+        b[..rem].copy_from_slice(&data[off..]);
+        u32::from_le_bytes(b)
+    } else {
+        0
+    }
+}
+
 /// LSB-first 64-bit buffered word-oriented bitstream reader matching Bink 2's reader layout.
 pub struct BitReader<'a> {
     data: &'a [u8],
@@ -110,8 +123,13 @@ pub struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8], byte_offset: usize) -> Self {
+        let slice = if byte_offset <= data.len() {
+            &data[byte_offset..]
+        } else {
+            &[]
+        };
         Self {
-            data,
+            data: slice,
             base_offset: byte_offset,
             next_word_idx: 0,
             bit_buf: 0,
@@ -119,22 +137,9 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    #[cold]
-    #[inline(never)]
-    fn word_at_tail(&self, off: usize) -> u32 {
-        if off < self.data.len() {
-            let mut b = [0u8; 4];
-            let rem = self.data.len() - off;
-            b[..rem].copy_from_slice(&self.data[off..]);
-            u32::from_le_bytes(b)
-        } else {
-            0
-        }
-    }
-
     #[inline(always)]
     fn word_at(&self, widx: usize) -> u32 {
-        let off = self.base_offset + (widx << 2);
+        let off = widx << 2;
         if off + 4 <= self.data.len() {
             // SAFETY: `off + 4 <= self.data.len()` guarantees 4 valid readable bytes.
             unsafe {
@@ -142,7 +147,7 @@ impl<'a> BitReader<'a> {
                 u32::from_le_bytes(std::ptr::read_unaligned(ptr))
             }
         } else {
-            self.word_at_tail(off)
+            read_tail_word(self.data, off)
         }
     }
 
@@ -709,11 +714,9 @@ fn decode_dc4(
     dc[3] = v3 as i32;
 }
 
-/// Decode AC coefficients for a 4-block (16x16) quad (`1800123a0`).
-///
-/// Returns packed 4 bytes of `last_nz` (byte `b` = last nonzero zigzag index in block `b`,
-/// or `0` if DC-only).
-fn decode_ac_quad(
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn decode_ac_quad_inner<const USE_ALT: bool>(
     mut cbp_bits: u32,
     coeffs: &mut [i16; 256],
     bs: &mut BitReader,
@@ -723,18 +726,6 @@ fn decode_ac_quad(
     info_out: &mut [u16; 4],
     base_flag: u16,
 ) -> u32 {
-    if (cbp_bits & 0xf) == 0 {
-        for b in 0..4 {
-            let dc = dcs[b] as u16;
-            coeffs[b * 64] = dc.wrapping_add(4).wrapping_mul(8) as i16;
-            info_out[b] = (dc & 0x1fff) | base_flag | 0x6000;
-        }
-        return 0;
-    }
-
-    let use_alt = (cbp_bits & 0xffff_0000) != 0;
-    let vlc_table: &[u8] = if use_alt { &AC_VLC2 } else { &AC_VLC1 };
-    let vlc_mask: usize = if use_alt { 0xff } else { 0x1ff };
     let q_phase = (q & 3) as usize;
     let q_shift = (q >> 2) & 31;
     let qm = &qmat[q_phase];
@@ -752,8 +743,12 @@ fn decode_ac_quad(
                 rem_nz -= 1;
                 let pos = if rem_nz < 1 {
                     bs.refill();
-                    let entry = vlc_table[(bs.bit_buf as usize) & vlc_mask];
-                    let sym = (entry >> 4) as usize;
+                    let entry = if USE_ALT {
+                        AC_VLC2[(bs.bit_buf as usize) & 0xff]
+                    } else {
+                        AC_VLC1[(bs.bit_buf as usize) & 0x1ff]
+                    };
+                    let sym = ((entry >> 4) & 0xf) as usize;
                     let blen = (entry & 0xf) as u32;
                     bs.consume_fast(blen);
                     let mut run = AC_RUN[sym];
@@ -787,10 +782,8 @@ fn decode_ac_quad(
                 let sign = (bs.bit_buf as u32) & 1;
                 bs.consume_fast(1);
                 let signed = if sign != 0 { -(mag as i32) } else { mag as i32 };
-                let zz = ZIGZAG_U8[pos] as usize;
-                let deq = ((signed.wrapping_mul(qm[zz] as i32)) << q_shift)
-                    .wrapping_add(0x40)
-                    >> 7;
+                let zz = (ZIGZAG_U8[pos] as usize) & 63;
+                let deq = ((signed.wrapping_mul(qm[zz] as i32)) << q_shift).wrapping_add(0x40) >> 7;
                 blk[zz] = deq as i16;
                 nz_count += 1;
                 last_nz = pos as u32;
@@ -800,13 +793,44 @@ fn decode_ac_quad(
         let dc = dcs[b] as u16;
         blk[0] = dc.wrapping_add(4).wrapping_mul(8) as i16;
         last_nz_packed = (last_nz << 24) | (last_nz_packed >> 8);
-        let sp = (u16::from(nz_count < 4) + u16::from(nz_count < 8) + u16::from(nz_count == 0))
-            * 0x2000;
+        let sp =
+            (u16::from(nz_count < 4) + u16::from(nz_count < 8) + u16::from(nz_count == 0)) * 0x2000;
         info_out[b] = sp | (dc & 0x1fff) | base_flag;
         cbp_bits = (cbp_bits >> 1) & 0x7fff_ffff;
     }
 
     last_nz_packed
+}
+
+/// Decode AC coefficients for a 4-block (16x16) quad (`1800123a0`).
+///
+/// Returns packed 4 bytes of `last_nz` (byte `b` = last nonzero zigzag index in block `b`,
+/// or `0` if DC-only).
+#[allow(clippy::too_many_arguments)]
+fn decode_ac_quad(
+    cbp_bits: u32,
+    coeffs: &mut [i16; 256],
+    bs: &mut BitReader,
+    q: u32,
+    qmat: &[[u16; 64]; 4],
+    dcs: &[i32; 4],
+    info_out: &mut [u16; 4],
+    base_flag: u16,
+) -> u32 {
+    if (cbp_bits & 0xf) == 0 {
+        for b in 0..4 {
+            let dc = dcs[b] as u16;
+            coeffs[b * 64] = dc.wrapping_add(4).wrapping_mul(8) as i16;
+            info_out[b] = (dc & 0x1fff) | base_flag | 0x6000;
+        }
+        return 0;
+    }
+
+    if (cbp_bits & 0xffff_0000) != 0 {
+        decode_ac_quad_inner::<true>(cbp_bits, coeffs, bs, q, qmat, dcs, info_out, base_flag)
+    } else {
+        decode_ac_quad_inner::<false>(cbp_bits, coeffs, bs, q, qmat, dcs, info_out, base_flag)
+    }
 }
 
 /// Transform a 4-block (16x16) coefficient quad into a 16x16 `i16` buffer (stride `out_stride` in `i16`s).
