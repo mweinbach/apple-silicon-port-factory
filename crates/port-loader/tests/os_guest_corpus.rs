@@ -1981,7 +1981,6 @@ int main(void) {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "expected failure: docs/stub-backlog.d/guest-corpus-bench.md (user32.dll!wsprintfW, user32.dll!wsprintfA)"]
 fn guest_user32_wsprintf_backlog() {
     let Some(zig) = find_zig() else {
         eprintln!("skipping guest_user32_wsprintf_backlog: zig not found");
@@ -2024,7 +2023,236 @@ int main(void) {
         fprintf(stderr, "FAIL: wsprintfW mismatch\n");
         ExitProcess(2);
     }
+
+    // %c / %C with 0 must emit an embedded NUL, count it in the return length, and not end early.
+    memset(abuf, 0x7F, sizeof(abuf));
+    int na = wsprintfA(abuf, "a%cb", 0);
+    if (na != 3 || abuf[0] != 'a' || abuf[1] != '\0' || abuf[2] != 'b' || abuf[3] != '\0') {
+        fprintf(stderr, "FAIL: wsprintfA %%c NUL (ret=%d)\n", na);
+        ExitProcess(3);
+    }
+    memset(abuf, 0x7F, sizeof(abuf));
+    int nac = wsprintfA(abuf, "a%Cb", 0);
+    if (nac != 3 || abuf[0] != 'a' || abuf[1] != '\0' || abuf[2] != 'b' || abuf[3] != '\0') {
+        fprintf(stderr, "FAIL: wsprintfA %%C NUL (ret=%d)\n", nac);
+        ExitProcess(4);
+    }
+    memset(wbuf, 0x7F, sizeof(wbuf));
+    int nw = wsprintfW(wbuf, L"a%cb", 0);
+    if (nw != 3 || wbuf[0] != L'a' || wbuf[1] != 0 || wbuf[2] != L'b' || wbuf[3] != 0) {
+        fprintf(stderr, "FAIL: wsprintfW %%c NUL (ret=%d)\n", nw);
+        ExitProcess(5);
+    }
+    memset(wbuf, 0x7F, sizeof(wbuf));
+    int nwc = wsprintfW(wbuf, L"a%Cb", 0);
+    if (nwc != 3 || wbuf[0] != L'a' || wbuf[1] != 0 || wbuf[2] != L'b' || wbuf[3] != 0) {
+        fprintf(stderr, "FAIL: wsprintfW %%C NUL (ret=%d)\n", nwc);
+        ExitProcess(6);
+    }
+
+    // Precision must not limit %c / %C output.
+    int npa = wsprintfA(abuf, "%.0c|%.0C|%4.0c|%-4.0C", 'X', (WCHAR)L'Y', 'Z', (WCHAR)L'W');
+    if (npa != 13 || strcmp(abuf, "X|Y|   Z|W   ") != 0) {
+        fprintf(stderr, "FAIL: wsprintfA precision on %%c/%%C (ret=%d, '%s')\n", npa, abuf);
+        ExitProcess(7);
+    }
+    int npw = wsprintfW(wbuf, L"%.0c|%.0C|%4.0c|%-4.0C", (WCHAR)L'X', 'Y', (WCHAR)L'Z', 'W');
+    if (npw != 13 || wcscmp(wbuf, L"X|Y|   Z|W   ") != 0) {
+        fprintf(stderr, "FAIL: wsprintfW precision on %%c/%%C (ret=%d)\n", npw);
+        ExitProcess(8);
+    }
+
+    // >10 formatting arguments (>12 total Win64 args, including 11th+ %s pointer) must all be read
+    // from the guest Win64 stack rather than truncated at 12 slots on ARM64.
+    char big_a[128];
+    int n_many_a = wsprintfA(
+        big_a,
+        "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%d,%s,%d,%s",
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "eleven", 12, "thirteen", 14, "fifteen"
+    );
+    const char *exp_a = "1,2,3,4,5,6,7,8,9,10,eleven,12,thirteen,14,fifteen";
+    if (n_many_a != (int)strlen(exp_a) || strcmp(big_a, exp_a) != 0) {
+        fprintf(stderr, "FAIL: wsprintfA >12 args (ret=%d, '%s')\n", n_many_a, big_a);
+        ExitProcess(9);
+    }
+    WCHAR big_w[128];
+    int n_many_w = wsprintfW(
+        big_w,
+        L"%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%d,%s,%d,%s",
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, L"eleven", 12, L"thirteen", 14, L"fifteen"
+    );
+    const WCHAR *exp_w = L"1,2,3,4,5,6,7,8,9,10,eleven,12,thirteen,14,fifteen";
+    if (n_many_w != (int)wcslen(exp_w) || wcscmp(big_w, exp_w) != 0) {
+        fprintf(stderr, "FAIL: wsprintfW >12 args (ret=%d)\n", n_many_w);
+        ExitProcess(10);
+    }
+
     printf("CORPUS_WSPRINTF: PASS ALL\n");
+    fflush(stdout);
+    return 0;
+}
+"##;
+
+// ---------------------------------------------------------------------------
+// DirectWrite IDWriteTextAnalyzer (>16 Win64 args through guest-to-host ABI)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn guest_dwrite_text_analyzer_many_args() {
+    let Some(zig) = find_zig() else {
+        eprintln!("skipping guest_dwrite_text_analyzer_many_args: zig not found");
+        return;
+    };
+    let tmp = TempDir::new("dwrite-text-analyzer");
+    let exe = compile_c_guest(
+        &zig,
+        tmp.path(),
+        "dwrite_text_analyzer",
+        DWRITE_TEXT_ANALYZER_C,
+        &["kernel32"],
+    );
+    run_guest_both_modes(
+        "dwrite_text_analyzer",
+        &exe,
+        tmp.path(),
+        &["CORPUS_DWRITE_TA: PASS ALL"],
+        DEFAULT_TIMEOUT,
+    );
+}
+
+const DWRITE_TEXT_ANALYZER_C: &str = r##"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <math.h>
+
+typedef struct { uint16_t script; uint32_t shapes; } DW_SCRIPT_ANALYSIS;
+typedef struct { uint16_t bits; } DW_SHAPING_TEXT_PROPS;
+typedef struct { uint16_t bits; } DW_SHAPING_GLYPH_PROPS;
+typedef struct { float advanceOffset; float ascenderOffset; } DW_GLYPH_OFFSET;
+typedef struct { float m11, m12, m21, m22, dx, dy; } DW_MATRIX;
+
+typedef HRESULT (WINAPI *PFN_DWriteCreateFactory)(UINT32, const GUID*, void**);
+
+typedef struct { void **vtbl; } ComIface;
+
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL: %s (line %d)\n", (msg), __LINE__); \
+        fflush(stderr); \
+        ExitProcess(1); \
+    } \
+} while (0)
+
+int main(void) {
+    HMODULE dw = LoadLibraryA("dwrite.dll");
+    CHECK(dw != NULL, "LoadLibraryA(dwrite.dll)");
+    PFN_DWriteCreateFactory pCreate =
+        (PFN_DWriteCreateFactory)GetProcAddress(dw, "DWriteCreateFactory");
+    CHECK(pCreate != NULL, "GetProcAddress(DWriteCreateFactory)");
+
+    // IID_IDWriteFactory = {b859ee5a-d838-4b5b-a2e8-1adc7d93db48}
+    static const GUID IID_IDWriteFactory = {
+        0xb859ee5a, 0xd838, 0x4b5b, {0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48}
+    };
+    ComIface *fac = NULL;
+    CHECK(pCreate(0, &IID_IDWriteFactory, (void**)&fac) == S_OK && fac != NULL, "DWriteCreateFactory");
+
+    // GetSystemFontCollection (slot 3) -> FindFamilyName(L"Segoe UI") (slot 5) -> GetFontFamily (slot 4)
+    // -> GetFirstMatchingFont (slot 7) -> CreateFontFace (slot 13)
+    typedef HRESULT (WINAPI *PFN_GetSysCol)(void*, void**, BOOL);
+    typedef HRESULT (WINAPI *PFN_FindFam)(void*, const WCHAR*, UINT32*, BOOL*);
+    typedef HRESULT (WINAPI *PFN_GetFam)(void*, UINT32, void**);
+    typedef HRESULT (WINAPI *PFN_GetMatch)(void*, UINT32, UINT32, UINT32, void**);
+    typedef HRESULT (WINAPI *PFN_CreateFace)(void*, void**);
+    typedef HRESULT (WINAPI *PFN_CreateTA)(void*, void**);
+    typedef ULONG (WINAPI *PFN_Release)(void*);
+
+    ComIface *col = NULL, *fam = NULL, *font = NULL, *face = NULL, *ta = NULL;
+    CHECK(((PFN_GetSysCol)fac->vtbl[3])(fac, (void**)&col, FALSE) == S_OK && col != NULL, "GetSystemFontCollection");
+    UINT32 fam_idx = 0;
+    BOOL fam_exists = FALSE;
+    CHECK(((PFN_FindFam)col->vtbl[5])(col, L"Segoe UI", &fam_idx, &fam_exists) == S_OK && fam_exists, "FindFamilyName(Segoe UI)");
+    CHECK(((PFN_GetFam)col->vtbl[4])(col, fam_idx, (void**)&fam) == S_OK && fam != NULL, "GetFontFamily");
+    CHECK(((PFN_GetMatch)fam->vtbl[7])(fam, 400, 5, 0, (void**)&font) == S_OK && font != NULL, "GetFirstMatchingFont");
+    CHECK(((PFN_CreateFace)font->vtbl[13])(font, (void**)&face) == S_OK && face != NULL, "CreateFontFace");
+    CHECK(((PFN_CreateTA)fac->vtbl[21])(fac, (void**)&ta) == S_OK && ta != NULL, "CreateTextAnalyzer");
+
+    // Slot 7: GetGlyphs (18 parameters)
+    typedef HRESULT (WINAPI *PFN_GetGlyphs)(
+        void*, const WCHAR*, UINT32, void*, BOOL, BOOL,
+        const DW_SCRIPT_ANALYSIS*, const WCHAR*, void*, const void**,
+        const UINT32*, UINT32, UINT32, UINT16*, DW_SHAPING_TEXT_PROPS*,
+        UINT16*, DW_SHAPING_GLYPH_PROPS*, UINT32*
+    );
+    const WCHAR text[] = L"Hi!";
+    UINT16 cmap[3] = { 99, 99, 99 };
+    DW_SHAPING_TEXT_PROPS tprops[3] = { {0}, {0}, {0} };
+    UINT16 gids[3] = { 0, 0, 0 };
+    DW_SHAPING_GLYPH_PROPS gprops[3] = { {0}, {0}, {0} };
+    UINT32 actual = 0;
+    HRESULT hr = ((PFN_GetGlyphs)ta->vtbl[7])(
+        ta, text, 3, face, FALSE, FALSE,
+        NULL, NULL, NULL, NULL, NULL, 0,
+        3, cmap, tprops, gids, gprops, &actual
+    );
+    CHECK(hr == S_OK, "GetGlyphs hr");
+    CHECK(actual == 3, "GetGlyphs actualGlyphCount == 3");
+    CHECK(cmap[0] == 0 && cmap[1] == 1 && cmap[2] == 2, "GetGlyphs clusterMap");
+    CHECK(gids[0] != 0 && gids[1] != 0 && gids[2] != 0, "GetGlyphs glyphIndices");
+    CHECK(gprops[0].bits != 0 && gprops[1].bits != 0, "GetGlyphs glyphProps");
+
+    // Slot 8: GetGlyphPlacements (19 parameters)
+    typedef HRESULT (WINAPI *PFN_GetGlyphPlacements)(
+        void*, const WCHAR*, const UINT16*, const DW_SHAPING_TEXT_PROPS*, UINT32,
+        const UINT16*, const DW_SHAPING_GLYPH_PROPS*, UINT32,
+        void*, float, BOOL, BOOL,
+        const DW_SCRIPT_ANALYSIS*, const WCHAR*, const void**, const UINT32*, UINT32,
+        float*, DW_GLYPH_OFFSET*
+    );
+    float adv[3] = { -1.0f, -1.0f, -1.0f };
+    DW_GLYPH_OFFSET offs[3] = { {9.0f, 9.0f}, {9.0f, 9.0f}, {9.0f, 9.0f} };
+    hr = ((PFN_GetGlyphPlacements)ta->vtbl[8])(
+        ta, text, cmap, tprops, 3,
+        gids, gprops, 3,
+        face, 16.0f, FALSE, FALSE,
+        NULL, NULL, NULL, NULL, 0,
+        adv, offs
+    );
+    CHECK(hr == S_OK, "GetGlyphPlacements hr");
+    CHECK(adv[0] > 0.0f && adv[1] > 0.0f && adv[2] > 0.0f, "GetGlyphPlacements advances > 0");
+    CHECK(offs[0].advanceOffset == 0.0f && offs[2].ascenderOffset == 0.0f, "GetGlyphPlacements offsets zeroed");
+
+    // Slot 9: GetGdiCompatibleGlyphPlacements (22 parameters)
+    typedef HRESULT (WINAPI *PFN_GetGdiPlacements)(
+        void*, const WCHAR*, const UINT16*, const DW_SHAPING_TEXT_PROPS*, UINT32,
+        const UINT16*, const DW_SHAPING_GLYPH_PROPS*, UINT32,
+        void*, float, float, const DW_MATRIX*, BOOL, BOOL, BOOL,
+        const DW_SCRIPT_ANALYSIS*, const WCHAR*, const void**, const UINT32*, UINT32,
+        float*, DW_GLYPH_OFFSET*
+    );
+    float gdi_adv[3] = { -1.0f, -1.0f, -1.0f };
+    offs[0].advanceOffset = 7.0f;
+    hr = ((PFN_GetGdiPlacements)ta->vtbl[9])(
+        ta, text, cmap, tprops, 3,
+        gids, gprops, 3,
+        face, 16.0f, 1.0f, NULL, FALSE, FALSE, FALSE,
+        NULL, NULL, NULL, NULL, 0,
+        gdi_adv, offs
+    );
+    CHECK(hr == S_OK, "GetGdiCompatibleGlyphPlacements hr");
+    CHECK(gdi_adv[0] > 0.0f && fabsf(gdi_adv[0] - roundf(gdi_adv[0])) < 1e-4f, "GDI snapped advance");
+    CHECK(offs[0].advanceOffset == 0.0f, "GetGdiCompatibleGlyphPlacements offsets zeroed");
+
+    ((PFN_Release)ta->vtbl[2])(ta);
+    ((PFN_Release)face->vtbl[2])(face);
+    ((PFN_Release)font->vtbl[2])(font);
+    ((PFN_Release)fam->vtbl[2])(fam);
+    ((PFN_Release)col->vtbl[2])(col);
+    ((PFN_Release)fac->vtbl[2])(fac);
+
+    printf("CORPUS_DWRITE_TA: PASS ALL\n");
     fflush(stdout);
     return 0;
 }

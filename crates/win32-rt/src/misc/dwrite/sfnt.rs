@@ -99,6 +99,23 @@ fn parse_name_table(tbl: &[u8]) -> HashMap<u16, String> {
     best.into_iter().map(|(k, (_, v))| (k, v)).collect()
 }
 
+/// Provenance for an in-memory custom `IDWriteFontFile` created via
+/// `CreateCustomFontFileReference`, retained on `FontMeta` so `IDWriteFontFace::GetFiles`
+/// can return a real backing `IDWriteFontFile` carrying the caller's loader and key.
+pub(super) struct CustomFontFileRef {
+    pub(super) loader: Option<crate::com::ComPtr>,
+    pub(super) key: Vec<u8>,
+}
+
+impl std::fmt::Debug for CustomFontFileRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomFontFileRef")
+            .field("has_loader", &self.loader.is_some())
+            .field("key_len", &self.key.len())
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct FontMeta {
     pub(super) family_name: String,
@@ -114,6 +131,8 @@ pub(super) struct FontMeta {
     pub(super) metrics: DWRITE_FONT_METRICS,
     pub(super) info_strings: HashMap<u32, String>,
     pub(super) file_path: Option<PathBuf>,
+    pub(super) raw_bytes: Option<Arc<Vec<u8>>>,
+    pub(super) custom_file: Option<Arc<CustomFontFileRef>>,
 }
 
 fn parse_sfnt_face_meta(
@@ -331,7 +350,206 @@ fn parse_sfnt_face_meta(
         },
         info_strings,
         file_path: Some(path.to_path_buf()),
+        raw_bytes: None,
+        custom_file: None,
     })
+}
+
+fn parse_sfnt_face_meta_slice(
+    raw: &Arc<Vec<u8>>,
+    sfnt_offset: usize,
+    face_index: u32,
+    is_ttc: bool,
+    default_stem: &str,
+) -> Option<FontMeta> {
+    let b = raw.as_slice();
+    let hdr = b.get(sfnt_offset..sfnt_offset.checked_add(12)?)?;
+    let sfnt_ver = be_u32(hdr, 0)?;
+    let face_type = match sfnt_ver {
+        0x0001_0000 | 0x7472_7565 => {
+            if is_ttc {
+                DWRITE_FONT_FACE_TYPE_TRUETYPE_COLLECTION
+            } else {
+                DWRITE_FONT_FACE_TYPE_TRUETYPE
+            }
+        }
+        0x4F54_544F => DWRITE_FONT_FACE_TYPE_CFF,
+        _ => return None,
+    };
+    let num_tables = be_u16(hdr, 4)? as usize;
+    if num_tables == 0 || num_tables > 256 {
+        return None;
+    }
+    let dir = b.get(sfnt_offset + 12..sfnt_offset + 12 + num_tables * 16)?;
+    let mut tables: HashMap<[u8; 4], (usize, usize)> = HashMap::with_capacity(num_tables);
+    for i in 0..num_tables {
+        let base = i * 16;
+        let tag = [dir[base], dir[base + 1], dir[base + 2], dir[base + 3]];
+        let off = be_u32(dir, base + 8)? as usize;
+        let len = be_u32(dir, base + 12)? as usize;
+        if off.saturating_add(len) <= b.len() {
+            tables.insert(tag, (off, len));
+        }
+    }
+    let load_tbl = |tag: &[u8; 4]| -> Option<&[u8]> {
+        let &(off, len) = tables.get(tag)?;
+        b.get(off..off + len.min(256 * 1024))
+    };
+
+    let head = load_tbl(b"head")?;
+    let upem = be_u16(head, 18).unwrap_or(2048).max(16);
+    let mac_style = be_u16(head, 44).unwrap_or(0);
+    let hhea = load_tbl(b"hhea");
+    let maxp = load_tbl(b"maxp");
+    let os2 = load_tbl(b"OS/2");
+    let post = load_tbl(b"post");
+    let name_tbl = load_tbl(b"name");
+
+    let glyph_count = maxp.and_then(|t| be_u16(t, 4)).unwrap_or(256).max(1);
+    let hhea_asc = hhea.and_then(|t| be_i16(t, 4)).unwrap_or(((upem as i32 * 80) / 100) as i16);
+    let hhea_desc = hhea.and_then(|t| be_i16(t, 6)).unwrap_or(-((upem as i32 * 20) / 100) as i16);
+    let hhea_gap = hhea.and_then(|t| be_i16(t, 8)).unwrap_or(0);
+
+    let mut weight = if (mac_style & 1) != 0 { DWRITE_FONT_WEIGHT_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
+    let mut stretch = DWRITE_FONT_STRETCH_NORMAL;
+    let mut style = if (mac_style & 2) != 0 { DWRITE_FONT_STYLE_ITALIC } else { DWRITE_FONT_STYLE_NORMAL };
+    let mut ascent = hhea_asc.max(0) as u16;
+    let mut descent = hhea_desc.unsigned_abs();
+    let mut line_gap = hhea_gap;
+    let mut cap_height = ((upem as u32 * 70) / 100) as u16;
+    let mut x_height = ((upem as u32 * 50) / 100) as u16;
+    let mut strike_pos = ((upem as i32 * 26) / 100) as i16;
+    let mut strike_thick = ((upem as u32 * 5) / 100).max(1) as u16;
+
+    if let Some(t) = os2 {
+        let ver = be_u16(t, 0).unwrap_or(0);
+        if let Some(w) = be_u16(t, 4) {
+            if (100..=999).contains(&w) { weight = w as u32; }
+        }
+        if let Some(st) = be_u16(t, 6) {
+            if (1..=9).contains(&st) { stretch = st as u32; }
+        }
+        if let Some(ss) = be_i16(t, 26) { if ss > 0 { strike_thick = ss as u16; } }
+        if let Some(sp) = be_i16(t, 28) { strike_pos = sp; }
+        let fs_sel = be_u16(t, 62).unwrap_or(0);
+        if (fs_sel & 1) != 0 {
+            style = DWRITE_FONT_STYLE_ITALIC;
+        } else if (fs_sel & (1 << 9)) != 0 {
+            style = DWRITE_FONT_STYLE_OBLIQUE;
+        }
+        if (fs_sel & (1 << 5)) != 0 && weight < 600 {
+            weight = DWRITE_FONT_WEIGHT_BOLD;
+        }
+        if (fs_sel & (1 << 7)) != 0 {
+            if let Some(ta) = be_i16(t, 68) { ascent = ta.max(0) as u16; }
+            if let Some(td) = be_i16(t, 70) { descent = td.unsigned_abs(); }
+            if let Some(tg) = be_i16(t, 72) { line_gap = tg; }
+        } else {
+            if let Some(wa) = be_u16(t, 74) { if wa > 0 { ascent = wa; } }
+            if let Some(wd) = be_u16(t, 76) { if wd > 0 { descent = wd; } }
+        }
+        if ver >= 2 {
+            if let Some(xh) = be_i16(t, 86) { if xh > 0 { x_height = xh as u16; } }
+            if let Some(ch) = be_i16(t, 88) { if ch > 0 { cap_height = ch as u16; } }
+        }
+    }
+
+    let mut underline_pos = -((upem as i32 * 10) / 100) as i16;
+    let mut underline_thick = ((upem as u32 * 5) / 100).max(1) as u16;
+    let mut is_monospace = false;
+    if let Some(t) = post {
+        if let Some(up) = be_i16(t, 8) { underline_pos = up; }
+        if let Some(ut) = be_i16(t, 10) { if ut > 0 { underline_thick = ut as u16; } }
+        if let Some(fp) = be_u32(t, 12) { is_monospace = fp != 0; }
+    }
+
+    let names = name_tbl.map(parse_name_table).unwrap_or_default();
+    let family_name = names
+        .get(&16)
+        .or_else(|| names.get(&1))
+        .cloned()
+        .unwrap_or_else(|| default_stem.to_string());
+    let face_name = names
+        .get(&17)
+        .or_else(|| names.get(&2))
+        .cloned()
+        .unwrap_or_else(|| "Regular".to_string());
+    let lower_fam = family_name.to_ascii_lowercase();
+    if lower_fam.contains("mono")
+        || lower_fam.contains("courier")
+        || lower_fam.contains("menlo")
+        || lower_fam.contains("consolas")
+    {
+        is_monospace = true;
+    }
+    let is_symbol = lower_fam.contains("symbol")
+        || lower_fam.contains("wingding")
+        || lower_fam.contains("webding");
+
+    let mut info_strings = HashMap::new();
+    for &(name_id, info_id) in &[
+        (0u16, DWRITE_INFO_COPYRIGHT_NOTICE),
+        (5, DWRITE_INFO_VERSION_STRINGS),
+        (7, DWRITE_INFO_TRADEMARK),
+        (8, DWRITE_INFO_MANUFACTURER),
+        (9, DWRITE_INFO_DESIGNER),
+        (10, DWRITE_INFO_DESCRIPTION),
+        (13, DWRITE_INFO_LICENSE_DESCRIPTION),
+        (4, DWRITE_INFO_FULL_NAME),
+        (6, DWRITE_INFO_POSTSCRIPT_NAME),
+    ] {
+        if let Some(v) = names.get(&name_id) {
+            info_strings.insert(info_id, v.clone());
+        }
+    }
+
+    Some(FontMeta {
+        family_name,
+        face_name,
+        weight,
+        stretch,
+        style,
+        is_symbol,
+        is_monospace,
+        face_type,
+        face_index,
+        glyph_count,
+        metrics: DWRITE_FONT_METRICS {
+            designUnitsPerEm: upem,
+            ascent,
+            descent,
+            lineGap: line_gap,
+            capHeight: cap_height,
+            xHeight: x_height,
+            underlinePosition: underline_pos,
+            underlineThickness: underline_thick,
+            strikethroughPosition: strike_pos,
+            strikethroughThickness: strike_thick,
+        },
+        info_strings,
+        file_path: None,
+        raw_bytes: Some(Arc::clone(raw)),
+        custom_file: None,
+    })
+}
+
+pub(super) fn parse_font_bytes_metadata(raw: Arc<Vec<u8>>, default_stem: &str) -> Vec<FontMeta> {
+    let b = raw.as_slice();
+    let Some(tag) = be_u32(b, 0) else { return Vec::new() };
+    if tag == 0x7474_6366 {
+        let num_fonts = be_u32(b, 8).unwrap_or(0).min(32) as usize;
+        let mut out = Vec::with_capacity(num_fonts);
+        for i in 0..num_fonts {
+            if let Some(off) = be_u32(b, 12 + i * 4) {
+                if let Some(meta) = parse_sfnt_face_meta_slice(&raw, off as usize, i as u32, true, default_stem) {
+                    out.push(meta);
+                }
+            }
+        }
+        out
+    } else {
+        parse_sfnt_face_meta_slice(&raw, 0, 0, false, default_stem).into_iter().collect()
+    }
 }
 
 pub(super) fn parse_font_file_metadata(path: &Path) -> Vec<FontMeta> {
@@ -365,6 +583,7 @@ pub(super) struct SfntFace {
     upem: u16,
     index_to_loc_format: i16,
     num_hmetrics: u16,
+    num_vmetrics: u16,
     cmap_subtable: Option<(u16, usize)>, // (format, byte offset into raw)
     /// Reverse map from glyph ID to Unicode codepoint for CFF fallback rendering.
     glyph_to_char: HashMap<u16, char>,
@@ -419,6 +638,11 @@ impl SfntFace {
             .and_then(|t| be_u16(t, 34))
             .unwrap_or(1)
             .max(1);
+        let num_vmetrics = tables
+            .get(b"vhea")
+            .and_then(|&(o, l)| b.get(o..o + l))
+            .and_then(|t| be_u16(t, 34))
+            .unwrap_or(0);
 
         let cmap_subtable = Self::pick_cmap(b, &tables);
         let mut face = Self {
@@ -427,6 +651,7 @@ impl SfntFace {
             upem,
             index_to_loc_format,
             num_hmetrics,
+            num_vmetrics,
             cmap_subtable,
             glyph_to_char: HashMap::new(),
         };
@@ -560,6 +785,26 @@ impl SfntFace {
             let lsb_off = nh * 4 + (g - nh) * 2;
             let lsb = be_i16(tbl, lsb_off).unwrap_or(0);
             Some((adv, lsb))
+        }
+    }
+
+    pub(super) fn vmtx(&self, gid: u16) -> Option<(u16, i16)> {
+        if self.num_vmetrics == 0 {
+            return None;
+        }
+        let &(off, len) = self.tables.get(b"vmtx")?;
+        let tbl = self.raw.get(off..off + len)?;
+        let nv = self.num_vmetrics as usize;
+        let g = gid as usize;
+        if g < nv {
+            let adv = be_u16(tbl, g * 4)?;
+            let tsb = be_i16(tbl, g * 4 + 2)?;
+            Some((adv, tsb))
+        } else {
+            let adv = be_u16(tbl, nv.saturating_sub(1) * 4)?;
+            let tsb_off = nv * 4 + (g - nv) * 2;
+            let tsb = be_i16(tbl, tsb_off).unwrap_or(0);
+            Some((adv, tsb))
         }
     }
 
@@ -926,14 +1171,27 @@ pub(super) fn flatten_quad_contour(
     scale: f32,
     italic_shear: f32,
 ) -> Vec<(f32, f32)> {
+    flatten_quad_contour_transformed(contour, scale, italic_shear, (1.0, 0.0, 0.0, 1.0), (0.0, 0.0))
+}
+
+fn flatten_quad_contour_transformed(
+    contour: &[(f32, f32, bool)],
+    scale: f32,
+    italic_shear: f32,
+    mat: (f32, f32, f32, f32),
+    subpixel_offset: (f32, f32),
+) -> Vec<(f32, f32)> {
     let n = contour.len();
     if n < 2 {
         return Vec::new();
     }
     let tx = |x: f32, y: f32| -> (f32, f32) {
-        let sx = (x + y * italic_shear) * scale;
-        let sy = -y * scale;
-        (sx, sy)
+        let dx = (x + y * italic_shear) * scale;
+        let dy = -y * scale;
+        (
+            dx * mat.0 + dy * mat.2 + subpixel_offset.0,
+            dx * mat.1 + dy * mat.3 + subpixel_offset.1,
+        )
     };
     // Find an explicit or implied starting on-curve point.
     let first_on = contour.iter().position(|p| p.2);
@@ -989,7 +1247,13 @@ pub(super) fn flatten_quad_contour(
     poly
 }
 
-fn rasterize_contours(contours: &[Vec<(f32, f32, bool)>], scale: f32, italic_shear: f32) -> RasterizedGlyph {
+fn rasterize_contours(
+    contours: &[Vec<(f32, f32, bool)>],
+    scale: f32,
+    italic_shear: f32,
+    mat: (f32, f32, f32, f32),
+    subpixel_offset: (f32, f32),
+) -> RasterizedGlyph {
     let mut polys: Vec<Vec<(f32, f32)>> = Vec::with_capacity(contours.len());
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
@@ -997,7 +1261,7 @@ fn rasterize_contours(contours: &[Vec<(f32, f32, bool)>], scale: f32, italic_she
     let mut max_y = f32::NEG_INFINITY;
 
     for c in contours {
-        let poly = flatten_quad_contour(c, scale, italic_shear);
+        let poly = flatten_quad_contour_transformed(c, scale, italic_shear, mat, subpixel_offset);
         if poly.len() >= 3 {
             for &(x, y) in &poly {
                 if x < min_x { min_x = x; }
@@ -1134,8 +1398,131 @@ fn rasterize_fallback_8x8(ch: Option<char>, em_size: f32, bold: bool, italic: bo
     RasterizedGlyph { offset_x: 0, offset_y: -ascent_px, width: out_w, height: out_h, alpha }
 }
 
+fn rasterize_fallback_8x8_transformed(
+    ch: Option<char>,
+    em_size: f32,
+    bold: bool,
+    italic: bool,
+    mat: (f32, f32, f32, f32),
+    subpixel_offset: (f32, f32),
+) -> RasterizedGlyph {
+    let is_identity = (mat.0 - 1.0).abs() < 1e-5
+        && mat.1.abs() < 1e-5
+        && mat.2.abs() < 1e-5
+        && (mat.3 - 1.0).abs() < 1e-5
+        && subpixel_offset.0.abs() < 1e-5
+        && subpixel_offset.1.abs() < 1e-5;
+    if is_identity {
+        return rasterize_fallback_8x8(ch, em_size, bold, italic);
+    }
+    let det = mat.0 * mat.3 - mat.1 * mat.2;
+    if !det.is_finite() || det.abs() < 1e-6 {
+        return RasterizedGlyph { offset_x: 0, offset_y: 0, width: 0, height: 0, alpha: Vec::new() };
+    }
+    if ch == Some(' ') || ch == Some('\t') || ch == Some('\r') || ch == Some('\n') {
+        return RasterizedGlyph { offset_x: 0, offset_y: 0, width: 0, height: 0, alpha: Vec::new() };
+    }
+    let bitmap = match ch {
+        Some(c) if (0x20..=0x7E).contains(&(c as u32)) => &FALLBACK_FONT_8X8[(c as u32 - 0x20) as usize],
+        _ => &FALLBACK_NOTDEF_8X8,
+    };
+    let gw = (em_size * 0.62).max(1.0);
+    let gh = (em_size * 0.88).max(1.0);
+    let shear_dip = if italic { em_size * 0.16 } else { 0.0 };
+    let ascent_dip = em_size * 0.78;
+    let local_w = gw + shear_dip;
+    let corners = [
+        (0.0f32, -ascent_dip),
+        (local_w, -ascent_dip),
+        (0.0, gh - ascent_dip),
+        (local_w, gh - ascent_dip),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &(lx, ly) in &corners {
+        let px = lx * mat.0 + ly * mat.2 + subpixel_offset.0;
+        let py = lx * mat.1 + ly * mat.3 + subpixel_offset.1;
+        min_x = min_x.min(px);
+        min_y = min_y.min(py);
+        max_x = max_x.max(px);
+        max_y = max_y.max(py);
+    }
+    let ix0 = min_x.floor() as i32 - 1;
+    let iy0 = min_y.floor() as i32 - 1;
+    let ix1 = max_x.ceil() as i32 + 1;
+    let iy1 = max_y.ceil() as i32 + 1;
+    let out_w = (ix1 - ix0).clamp(0, 512) as u32;
+    let out_h = (iy1 - iy0).clamp(0, 512) as u32;
+    if out_w == 0 || out_h == 0 {
+        return RasterizedGlyph { offset_x: 0, offset_y: 0, width: 0, height: 0, alpha: Vec::new() };
+    }
+    // Inverse of row-vector transform (lx*m11 + ly*m21 + sub_x, lx*m12 + ly*m22 + sub_y):
+    // lx = ((px - sub_x)*m22 - (py - sub_y)*m21) / det,
+    // ly = (-(px - sub_x)*m12 + (py - sub_y)*m11) / det.
+    let inv_det = 1.0 / det;
+    let sample_bit = |u: f32, v: f32| -> f32 {
+        let bx = (u * 8.0).floor() as i32;
+        let by = (v * 8.0).floor() as i32;
+        if !(0..8).contains(&bx) || !(0..8).contains(&by) {
+            return 0.0;
+        }
+        let hit = (bitmap[by as usize] & (0x80u8 >> bx)) != 0;
+        if hit {
+            1.0
+        } else if bold && bx > 0 && (bitmap[by as usize] & (0x80u8 >> (bx - 1))) != 0 {
+            0.85
+        } else {
+            0.0
+        }
+    };
+    let mut alpha = vec![0u8; (out_w * out_h) as usize];
+    for py in 0..out_h {
+        for px in 0..out_w {
+            let mut acc = 0.0f32;
+            for sy in 0..4 {
+                let oy = (iy0 + py as i32) as f32 + (sy as f32 + 0.5) * 0.25 - subpixel_offset.1;
+                for sx in 0..4 {
+                    let ox = (ix0 + px as i32) as f32 + (sx as f32 + 0.5) * 0.25 - subpixel_offset.0;
+                    let lx = (ox * mat.3 - oy * mat.2) * inv_det;
+                    let ly = (-ox * mat.1 + oy * mat.0) * inv_det;
+                    let ly_box = ly + ascent_dip;
+                    let v = ly_box / gh;
+                    let row_shear = if italic { (1.0 - v) * shear_dip } else { 0.0 };
+                    let u = (lx - row_shear) / gw;
+                    acc += sample_bit(u, v);
+                }
+            }
+            alpha[(py * out_w + px) as usize] = ((acc * 0.0625).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    RasterizedGlyph { offset_x: ix0, offset_y: iy0, width: out_w, height: out_h, alpha }
+}
+
 pub(crate) fn rasterize_glyph(face: &FontFaceInner, glyph_id: u16, em_size: f32) -> RasterizedGlyph {
-    if em_size <= 0.5 || !em_size.is_finite() {
+    rasterize_glyph_transformed(face, glyph_id, em_size, 1.0, &DWRITE_MATRIX::default(), (0.0, 0.0))
+}
+
+pub(crate) fn rasterize_glyph_transformed(
+    face: &FontFaceInner,
+    glyph_id: u16,
+    em_size: f32,
+    pixels_per_dip: f32,
+    m: &DWRITE_MATRIX,
+    subpixel_offset: (f32, f32),
+) -> RasterizedGlyph {
+    if em_size <= 0.0 || !em_size.is_finite() || pixels_per_dip <= 0.0 || !pixels_per_dip.is_finite() {
+        return RasterizedGlyph { offset_x: 0, offset_y: 0, width: 0, height: 0, alpha: Vec::new() };
+    }
+    let mat = (
+        m.m11 * pixels_per_dip,
+        m.m12 * pixels_per_dip,
+        m.m21 * pixels_per_dip,
+        m.m22 * pixels_per_dip,
+    );
+    let max_scale = mat.0.hypot(mat.1).max(mat.2.hypot(mat.3));
+    if !max_scale.is_finite() || em_size * max_scale <= 0.5 {
         return RasterizedGlyph { offset_x: 0, offset_y: 0, width: 0, height: 0, alpha: Vec::new() };
     }
     let italic_shear = if (face.simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE) != 0 { 0.21 } else { 0.0 };
@@ -1143,7 +1530,7 @@ pub(crate) fn rasterize_glyph(face: &FontFaceInner, glyph_id: u16, em_size: f32)
         if let Some(contours) = sfnt.glyph_contours(glyph_id, 0) {
             if !contours.is_empty() {
                 let scale = em_size / (sfnt.upem as f32);
-                return rasterize_contours(&contours, scale, italic_shear);
+                return rasterize_contours(&contours, scale, italic_shear, mat, subpixel_offset);
             }
             // Space or empty TrueType glyph (e.g. ' ' has valid empty glyf slice, or no outline).
             if sfnt.glyph_to_char.get(&glyph_id) == Some(&' ') {
@@ -1155,12 +1542,12 @@ pub(crate) fn rasterize_glyph(face: &FontFaceInner, glyph_id: u16, em_size: f32)
         let bold = face.meta.weight >= 650 || (face.simulations & DWRITE_FONT_SIMULATIONS_BOLD) != 0;
         let italic = face.meta.style != DWRITE_FONT_STYLE_NORMAL
             || (face.simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE) != 0;
-        return rasterize_fallback_8x8(ch, em_size, bold, italic);
+        return rasterize_fallback_8x8_transformed(ch, em_size, bold, italic, mat, subpixel_offset);
     }
 
     let ch = fallback_gid_to_char(glyph_id);
     let bold = face.meta.weight >= 650 || (face.simulations & DWRITE_FONT_SIMULATIONS_BOLD) != 0;
     let italic = face.meta.style != DWRITE_FONT_STYLE_NORMAL
         || (face.simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE) != 0;
-    rasterize_fallback_8x8(ch, em_size, bold, italic)
+    rasterize_fallback_8x8_transformed(ch, em_size, bold, italic, mat, subpixel_offset)
 }

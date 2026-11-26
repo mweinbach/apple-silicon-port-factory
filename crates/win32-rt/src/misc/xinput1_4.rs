@@ -19,9 +19,11 @@
 //! * no deadzone is applied (games apply their own),
 //! * `dwPacketNumber` changes only when the state changes.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[
@@ -111,6 +113,206 @@ pub struct BatteryInformation {
     pub level: u8,
 }
 
+/// `XINPUT_KEYSTROKE` (8 bytes, `Xinput.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Keystroke {
+    pub virtual_key: u16,
+    pub unicode: u16,
+    pub flags: u16,
+    pub user_index: u8,
+    pub hid_code: u8,
+}
+const _: () = assert!(std::mem::size_of::<Keystroke>() == 8);
+
+pub const XINPUT_KEYSTROKE_KEYDOWN: u16 = 0x0001;
+pub const XINPUT_KEYSTROKE_KEYUP: u16 = 0x0002;
+pub const XINPUT_KEYSTROKE_REPEAT: u16 = 0x0004;
+
+/// Standard Windows XInput keystroke repeat timings (initial delay + repeat interval).
+const KEYSTROKE_REPEAT_INITIAL: Duration = Duration::from_millis(400);
+const KEYSTROKE_REPEAT_INTERVAL: Duration = Duration::from_millis(100);
+
+pub mod vk_pad {
+    pub const A: u16 = 0x5800;
+    pub const B: u16 = 0x5801;
+    pub const X: u16 = 0x5802;
+    pub const Y: u16 = 0x5803;
+    pub const RSHOULDER: u16 = 0x5804;
+    pub const LSHOULDER: u16 = 0x5805;
+    pub const LTRIGGER: u16 = 0x5806;
+    pub const RTRIGGER: u16 = 0x5807;
+    pub const DPAD_UP: u16 = 0x5810;
+    pub const DPAD_DOWN: u16 = 0x5811;
+    pub const DPAD_LEFT: u16 = 0x5812;
+    pub const DPAD_RIGHT: u16 = 0x5813;
+    pub const START: u16 = 0x5814;
+    pub const BACK: u16 = 0x5815;
+    pub const LTHUMB_PRESS: u16 = 0x5816;
+    pub const RTHUMB_PRESS: u16 = 0x5817;
+    pub const LTHUMB_UP: u16 = 0x5820;
+    pub const LTHUMB_DOWN: u16 = 0x5821;
+    pub const LTHUMB_RIGHT: u16 = 0x5822;
+    pub const LTHUMB_LEFT: u16 = 0x5823;
+    pub const LTHUMB_UPLEFT: u16 = 0x5824;
+    pub const LTHUMB_UPRIGHT: u16 = 0x5825;
+    pub const LTHUMB_DOWNRIGHT: u16 = 0x5826;
+    pub const LTHUMB_DOWNLEFT: u16 = 0x5827;
+    pub const RTHUMB_UP: u16 = 0x5830;
+    pub const RTHUMB_DOWN: u16 = 0x5831;
+    pub const RTHUMB_RIGHT: u16 = 0x5832;
+    pub const RTHUMB_LEFT: u16 = 0x5833;
+    pub const RTHUMB_UPLEFT: u16 = 0x5834;
+    pub const RTHUMB_UPRIGHT: u16 = 0x5835;
+    pub const RTHUMB_DOWNRIGHT: u16 = 0x5836;
+    pub const RTHUMB_DOWNLEFT: u16 = 0x5837;
+}
+
+const XINPUT_GAMEPAD_TRIGGER_THRESHOLD: u8 = 30;
+const XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE: i32 = 7849;
+const XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE: i32 = 8689;
+const KEYSTROKE_QUEUE_CAP: usize = 64;
+
+fn thumb_vk(x: i16, y: i16, deadzone: i32, base: u16) -> Option<u16> {
+    let xi = x as i32;
+    let yi = y as i32;
+    let pos_x = xi > deadzone;
+    let neg_x = xi < -deadzone;
+    let pos_y = yi > deadzone;
+    let neg_y = yi < -deadzone;
+    match (pos_y, neg_y, pos_x, neg_x) {
+        (true, false, false, false) => Some(base),     // UP
+        (false, true, false, false) => Some(base + 1), // DOWN
+        (false, false, true, false) => Some(base + 2), // RIGHT
+        (false, false, false, true) => Some(base + 3), // LEFT
+        (true, false, false, true) => Some(base + 4),  // UPLEFT
+        (true, false, true, false) => Some(base + 5),  // UPRIGHT
+        (false, true, true, false) => Some(base + 6),  // DOWNRIGHT
+        (false, true, false, true) => Some(base + 7),  // DOWNLEFT
+        _ => None,
+    }
+}
+
+fn push_keystroke(q: &mut VecDeque<Keystroke>, ks: Keystroke) {
+    if q.len() >= KEYSTROKE_QUEUE_CAP {
+        q.pop_front();
+    }
+    q.push_back(ks);
+}
+
+fn record_key_transition(
+    user: u8,
+    vk: u16,
+    down: bool,
+    now: Instant,
+    q: &mut VecDeque<Keystroke>,
+    held: &mut Vec<(u16, Instant)>,
+) {
+    push_keystroke(
+        q,
+        Keystroke {
+            virtual_key: vk,
+            unicode: 0,
+            flags: if down { XINPUT_KEYSTROKE_KEYDOWN } else { XINPUT_KEYSTROKE_KEYUP },
+            user_index: user,
+            hid_code: 0,
+        },
+    );
+    if down {
+        let next_due = now + KEYSTROKE_REPEAT_INITIAL;
+        if let Some((_, due)) = held.iter_mut().find(|(k, _)| *k == vk) {
+            *due = next_due;
+        } else {
+            held.push((vk, next_due));
+        }
+    } else {
+        held.retain(|(k, _)| *k != vk);
+    }
+}
+
+fn emit_due_repeats(
+    user: u8,
+    now: Instant,
+    q: &mut VecDeque<Keystroke>,
+    held: &mut [(u16, Instant)],
+) {
+    for (vk, next_due) in held.iter_mut() {
+        if now >= *next_due {
+            push_keystroke(
+                q,
+                Keystroke {
+                    virtual_key: *vk,
+                    unicode: 0,
+                    flags: XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT,
+                    user_index: user,
+                    hid_code: 0,
+                },
+            );
+            *next_due = now + KEYSTROKE_REPEAT_INTERVAL;
+        }
+    }
+}
+
+fn diff_gamepad_keystrokes(
+    user: u8,
+    prev: Gamepad,
+    next: Gamepad,
+    now: Instant,
+    q: &mut VecDeque<Keystroke>,
+    held: &mut Vec<(u16, Instant)>,
+) {
+    const BUTTON_MAP: &[(u16, u16)] = &[
+        (btn::A, vk_pad::A),
+        (btn::B, vk_pad::B),
+        (btn::X, vk_pad::X),
+        (btn::Y, vk_pad::Y),
+        (btn::RIGHT_SHOULDER, vk_pad::RSHOULDER),
+        (btn::LEFT_SHOULDER, vk_pad::LSHOULDER),
+        (btn::DPAD_UP, vk_pad::DPAD_UP),
+        (btn::DPAD_DOWN, vk_pad::DPAD_DOWN),
+        (btn::DPAD_LEFT, vk_pad::DPAD_LEFT),
+        (btn::DPAD_RIGHT, vk_pad::DPAD_RIGHT),
+        (btn::START, vk_pad::START),
+        (btn::BACK, vk_pad::BACK),
+        (btn::LEFT_THUMB, vk_pad::LTHUMB_PRESS),
+        (btn::RIGHT_THUMB, vk_pad::RTHUMB_PRESS),
+    ];
+    for &(mask, vk) in BUTTON_MAP {
+        let was = (prev.buttons & mask) != 0;
+        let is_down = (next.buttons & mask) != 0;
+        if was != is_down {
+            record_key_transition(user, vk, is_down, now, q, held);
+        }
+    }
+    for (was_t, now_t, vk) in [
+        (prev.left_trigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD, next.left_trigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD, vk_pad::LTRIGGER),
+        (prev.right_trigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD, next.right_trigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD, vk_pad::RTRIGGER),
+    ] {
+        if was_t != now_t {
+            record_key_transition(user, vk, now_t, now, q, held);
+        }
+    }
+    for (prev_dir, next_dir) in [
+        (
+            thumb_vk(prev.thumb_lx, prev.thumb_ly, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, vk_pad::LTHUMB_UP),
+            thumb_vk(next.thumb_lx, next.thumb_ly, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, vk_pad::LTHUMB_UP),
+        ),
+        (
+            thumb_vk(prev.thumb_rx, prev.thumb_ry, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, vk_pad::RTHUMB_UP),
+            thumb_vk(next.thumb_rx, next.thumb_ry, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, vk_pad::RTHUMB_UP),
+        ),
+    ] {
+        if prev_dir != next_dir {
+            if let Some(old_vk) = prev_dir {
+                record_key_transition(user, old_vk, false, now, q, held);
+            }
+            if let Some(new_vk) = next_dir {
+                record_key_transition(user, new_vk, true, now, q, held);
+            }
+        }
+    }
+}
+
 /// Static facts about a connected device (from the backend).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeviceInfo {
@@ -128,6 +330,8 @@ struct Slot {
     pad: Gamepad,
     packet: u32,
     vibration: (u16, u16),
+    keystrokes: VecDeque<Keystroke>,
+    held_vks: Vec<(u16, Instant)>,
 }
 
 #[derive(Clone, Default)]
@@ -136,6 +340,12 @@ struct VirtualPadState {
     pad: Gamepad,
     packet: u32,
     vibration: (u16, u16),
+    /// Authoritative merged slot-0 connection/pad state used to generate slot-0 keystrokes
+    /// and repeats without duplicating or prematurely releasing overlapped physical+virtual inputs.
+    merged_connected: bool,
+    merged_pad: Gamepad,
+    keystrokes: VecDeque<Keystroke>,
+    held_vks: Vec<(u16, Instant)>,
 }
 
 static SLOTS: Mutex<[Option<Slot>; XUSER_MAX_COUNT]> = Mutex::new([None, None, None, None]);
@@ -152,6 +362,18 @@ static VIRTUAL_PAD: Mutex<VirtualPadState> = Mutex::new(VirtualPadState {
     },
     packet: 0,
     vibration: (0, 0),
+    merged_connected: false,
+    merged_pad: Gamepad {
+        buttons: 0,
+        left_trigger: 0,
+        right_trigger: 0,
+        thumb_lx: 0,
+        thumb_ly: 0,
+        thumb_rx: 0,
+        thumb_ry: 0,
+    },
+    keystrokes: VecDeque::new(),
+    held_vks: Vec::new(),
 });
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -161,6 +383,79 @@ fn with_slot<R>(user: usize, f: impl FnOnce(&mut Slot) -> R) -> R {
     f(s[user].get_or_insert_with(Slot::default))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot0Transition {
+    None,
+    Connected(Gamepad),
+    Disconnected,
+    StateChanged(Gamepad),
+}
+
+fn emit_slot0_transition(transition: Slot0Transition) {
+    match transition {
+        Slot0Transition::None => {}
+        Slot0Transition::Connected(initial_pad) => {
+            crate::misc::gameinput::on_gamepad_connected(0, &initial_pad);
+        }
+        Slot0Transition::Disconnected => {
+            crate::misc::gameinput::on_gamepad_disconnected(0);
+        }
+        Slot0Transition::StateChanged(pad) => {
+            crate::misc::gameinput::on_gamepad_state_changed(0, &pad);
+        }
+    }
+}
+
+/// Recompute the merged slot-0 controller state from physical `slots[0]` and `virt`,
+/// generating keystroke transitions and repeat tracking exclusively from the merged state,
+/// and return the resulting GameInput transition to emit after releasing locks.
+/// Caller MUST hold `SLOTS` first, then `VIRTUAL_PAD` (global lock ordering).
+fn sync_slot0_keystrokes(
+    slots: &[Option<Slot>; XUSER_MAX_COUNT],
+    virt: &mut VirtualPadState,
+    now: Instant,
+) -> Slot0Transition {
+    let prev_connected = virt.merged_connected;
+    let prev_pad = virt.merged_pad;
+    let phys = slots[0].as_ref().filter(|s| s.connected).map(|s| s.pad);
+    let merged = match (phys, virt.connected) {
+        (Some(p), true) => Some(if virt.pad != Gamepad::default() { merge_gamepad(p, virt.pad) } else { p }),
+        (Some(p), false) => Some(p),
+        (None, true) => Some(virt.pad),
+        (None, false) => None,
+    };
+    match merged {
+        Some(next_pad) => {
+            let prev = if prev_connected { prev_pad } else { Gamepad::default() };
+            let changed = !prev_connected || prev != next_pad;
+            virt.merged_connected = true;
+            virt.merged_pad = next_pad;
+            if changed {
+                let VirtualPadState { keystrokes, held_vks, .. } = virt;
+                diff_gamepad_keystrokes(0, prev, next_pad, now, keystrokes, held_vks);
+            }
+            if !prev_connected {
+                Slot0Transition::Connected(next_pad)
+            } else if prev_pad != next_pad {
+                Slot0Transition::StateChanged(next_pad)
+            } else {
+                Slot0Transition::None
+            }
+        }
+        None => {
+            virt.merged_connected = false;
+            virt.merged_pad = Gamepad::default();
+            virt.keystrokes.clear();
+            virt.held_vks.clear();
+            if prev_connected {
+                Slot0Transition::Disconnected
+            } else {
+                Slot0Transition::None
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Backend interface (main thread or tests)
 // ---------------------------------------------------------------------------
@@ -168,19 +463,50 @@ fn with_slot<R>(user: usize, f: impl FnOnce(&mut Slot) -> R) -> R {
 pub fn backend_connect(user: usize, info: DeviceInfo) {
     log::info!("xinput: user {user} connected: {} (wireless={}, rumble={})", info.name, info.wireless, info.rumble);
     let phys_rumble = info.rumble;
-    with_slot(user, |s| {
-        *s = Slot { connected: true, info, packet: s.packet.wrapping_add(1), ..Default::default() };
-    });
-    // If a physical controller with its own rumble takes over slot 0, stop any active phone vibration.
-    if user == 0 && phys_rumble {
-        let stop_phone = {
-            let mut v = VIRTUAL_PAD.lock().unwrap();
-            let had = v.vibration != (0, 0);
+    let (stop_phone, transition) = if user == 0 {
+        let now = Instant::now();
+        let mut slots = SLOTS.lock().unwrap();
+        let slot = slots[0].get_or_insert_with(Slot::default);
+        *slot = Slot { connected: true, info, packet: slot.packet.wrapping_add(1), ..Default::default() };
+        let mut v = VIRTUAL_PAD.lock().unwrap();
+        let had = if phys_rumble {
+            let h = v.vibration != (0, 0);
             v.vibration = (0, 0);
-            had
+            h
+        } else {
+            false
         };
-        if stop_phone {
-            crate::macos::uikit::dispatch_host_rumble(0, 0);
+        let transition = sync_slot0_keystrokes(&slots, &mut v, now);
+        (had, transition)
+    } else {
+        let transition = with_slot(user, |s| {
+            let was_connected = s.connected;
+            let prev_pad = s.pad;
+            *s = Slot { connected: true, info, packet: s.packet.wrapping_add(1), ..Default::default() };
+            if !was_connected {
+                Slot0Transition::Connected(Gamepad::default())
+            } else if prev_pad != Gamepad::default() {
+                Slot0Transition::StateChanged(Gamepad::default())
+            } else {
+                Slot0Transition::None
+            }
+        });
+        (false, transition)
+    };
+    if stop_phone {
+        crate::macos::uikit::dispatch_host_rumble(0, 0);
+    }
+    if user == 0 {
+        emit_slot0_transition(transition);
+    } else {
+        match transition {
+            Slot0Transition::Connected(initial_pad) => {
+                crate::misc::gameinput::on_gamepad_connected(user, &initial_pad);
+            }
+            Slot0Transition::StateChanged(pad) => {
+                crate::misc::gameinput::on_gamepad_state_changed(user, &pad);
+            }
+            Slot0Transition::Disconnected | Slot0Transition::None => {}
         }
     }
     crate::user32::misc::notify_device_change(true);
@@ -188,13 +514,35 @@ pub fn backend_connect(user: usize, info: DeviceInfo) {
 
 pub fn backend_disconnect(user: usize) {
     log::info!("xinput: user {user} disconnected");
-    let was_connected = with_slot(user, |s| {
-        let was = s.connected;
-        s.connected = false;
-        s.pad = Gamepad::default();
-        s.vibration = (0, 0);
-        was
-    });
+    let (was_connected, transition) = if user == 0 {
+        let now = Instant::now();
+        let mut slots = SLOTS.lock().unwrap();
+        let slot = slots[0].get_or_insert_with(Slot::default);
+        let was = slot.connected;
+        slot.connected = false;
+        slot.pad = Gamepad::default();
+        slot.vibration = (0, 0);
+        slot.keystrokes.clear();
+        slot.held_vks.clear();
+        let mut v = VIRTUAL_PAD.lock().unwrap();
+        let transition = sync_slot0_keystrokes(&slots, &mut v, now);
+        (was, transition)
+    } else {
+        with_slot(user, |s| {
+            let was = s.connected;
+            s.connected = false;
+            s.pad = Gamepad::default();
+            s.vibration = (0, 0);
+            s.keystrokes.clear();
+            s.held_vks.clear();
+            (was, Slot0Transition::Disconnected)
+        })
+    };
+    if user == 0 {
+        emit_slot0_transition(transition);
+    } else {
+        crate::misc::gameinput::on_gamepad_disconnected(user);
+    }
     if was_connected {
         crate::user32::misc::notify_device_change(false);
     }
@@ -202,12 +550,37 @@ pub fn backend_disconnect(user: usize) {
 
 /// New input state. `dwPacketNumber` only changes when the state did.
 pub fn backend_update(user: usize, pad: Gamepad) {
-    with_slot(user, |s| {
-        if s.connected && s.pad != pad {
-            s.pad = pad;
-            s.packet = s.packet.wrapping_add(1);
+    let now = Instant::now();
+    if user == 0 {
+        let transition = {
+            let mut slots = SLOTS.lock().unwrap();
+            let slot = slots[0].get_or_insert_with(Slot::default);
+            if slot.connected && slot.pad != pad {
+                slot.pad = pad;
+                slot.packet = slot.packet.wrapping_add(1);
+                let mut v = VIRTUAL_PAD.lock().unwrap();
+                sync_slot0_keystrokes(&slots, &mut v, now)
+            } else {
+                Slot0Transition::None
+            }
+        };
+        emit_slot0_transition(transition);
+    } else {
+        let updated_pad = with_slot(user, |s| {
+            if s.connected && s.pad != pad {
+                let prev = s.pad;
+                s.pad = pad;
+                s.packet = s.packet.wrapping_add(1);
+                diff_gamepad_keystrokes(user as u8, prev, pad, now, &mut s.keystrokes, &mut s.held_vks);
+                Some(pad)
+            } else {
+                None
+            }
+        });
+        if let Some(effective) = updated_pad {
+            crate::misc::gameinput::on_gamepad_state_changed(user, &effective);
         }
-    });
+    }
 }
 
 pub fn backend_battery(user: usize, level: Option<f32>) {
@@ -239,7 +612,9 @@ pub fn slot_state(user: usize) -> Option<(Gamepad, u32)> {
 /// Exposed on XInput user slot 0 when no physical controller occupies slot 0,
 /// and seamlessly merged onto slot 0 whenever virtual touch controls are active.
 pub fn set_virtual_gamepad(connected: bool, pad: Gamepad) {
-    let (conn_changed, stop_phone) = {
+    let (conn_changed, stop_phone, transition) = {
+        let now = Instant::now();
+        let slots = SLOTS.lock().unwrap();
         let mut v = VIRTUAL_PAD.lock().unwrap();
         let conn_changed = v.connected != connected;
         let changed = conn_changed || (connected && v.pad != pad);
@@ -250,20 +625,24 @@ pub fn set_virtual_gamepad(connected: bool, pad: Gamepad) {
         }
         v.connected = connected;
         v.pad = if connected { pad } else { Gamepad::default() };
-        if changed {
+        let transition = if changed {
             v.packet = v.packet.wrapping_add(1);
-        }
+            sync_slot0_keystrokes(&slots, &mut v, now)
+        } else {
+            Slot0Transition::None
+        };
         let stop_phone = if !connected && v.vibration != (0, 0) {
             v.vibration = (0, 0);
             true
         } else {
             false
         };
-        (conn_changed, stop_phone)
+        (conn_changed, stop_phone, transition)
     };
     if stop_phone {
         crate::macos::uikit::dispatch_host_rumble(0, 0);
     }
+    emit_slot0_transition(transition);
     if conn_changed {
         crate::user32::misc::notify_device_change(connected);
     }
@@ -428,6 +807,8 @@ fn connected(user: u32) -> Result<Slot, u32> {
                     pad: v.pad,
                     packet: v.packet,
                     vibration: v.vibration,
+                    keystrokes: VecDeque::new(),
+                    held_vks: Vec::new(),
                 });
             }
             (None, false) => return Err(ERROR_DEVICE_NOT_CONNECTED),
@@ -595,17 +976,48 @@ pub unsafe extern "win64" fn XInputGetBatteryInformation(user: u32, dev_type: u8
     ERROR_SUCCESS
 }
 
-pub unsafe extern "win64" fn XInputGetKeystroke(user: u32, _r: u32, _k: *mut c_void) -> u32 {
-    if user as usize >= XUSER_MAX_COUNT && user != 0xFF {
+pub unsafe extern "win64" fn XInputGetKeystroke(user: u32, _r: u32, k: *mut c_void) -> u32 {
+    if k.is_null() || (user as usize >= XUSER_MAX_COUNT && user != 0xFF) {
         return ERROR_BAD_ARGUMENTS;
     }
     ensure_started();
-    let any_phys = SLOTS.lock().unwrap().iter().enumerate().any(|(i, s)| (user == 0xFF || i == user as usize) && s.as_ref().is_some_and(|s| s.connected));
-    let any_virt = (user == 0xFF || user == 0) && VIRTUAL_PAD.lock().unwrap().connected;
+    let mut slots = SLOTS.lock().unwrap();
+    let mut virt = VIRTUAL_PAD.lock().unwrap();
+    let any_phys = slots
+        .iter()
+        .enumerate()
+        .any(|(i, s)| (user == 0xFF || i == user as usize) && s.as_ref().is_some_and(|s| s.connected));
+    let any_virt = (user == 0xFF || user == 0) && virt.connected;
     if !any_phys && !any_virt {
         return ERROR_DEVICE_NOT_CONNECTED;
     }
-    stub!("XInputGetKeystroke: keystroke events not generated (ERROR_EMPTY)");
+    if !ENABLED.load(Ordering::Acquire) {
+        return ERROR_EMPTY;
+    }
+    let now = Instant::now();
+    let range = if user == 0xFF { 0..XUSER_MAX_COUNT } else { (user as usize)..(user as usize + 1) };
+    for idx in range {
+        if idx == 0 {
+            if virt.merged_connected {
+                if virt.keystrokes.is_empty() && !virt.held_vks.is_empty() {
+                    let VirtualPadState { keystrokes, held_vks, .. } = &mut *virt;
+                    emit_due_repeats(0, now, keystrokes, held_vks);
+                }
+                if let Some(ks) = virt.keystrokes.pop_front() {
+                    (k as *mut Keystroke).write_unaligned(ks);
+                    return ERROR_SUCCESS;
+                }
+            }
+        } else if let Some(slot) = slots[idx].as_mut().filter(|s| s.connected) {
+            if slot.keystrokes.is_empty() && !slot.held_vks.is_empty() {
+                emit_due_repeats(idx as u8, now, &mut slot.keystrokes, &mut slot.held_vks);
+            }
+            if let Some(ks) = slot.keystrokes.pop_front() {
+                (k as *mut Keystroke).write_unaligned(ks);
+                return ERROR_SUCCESS;
+            }
+        }
+    }
     ERROR_EMPTY
 }
 
@@ -676,7 +1088,33 @@ mod tests {
             let mut bi = BatteryInformation::default();
             assert_eq!(XInputGetBatteryInformation(3, 0, &mut bi), ERROR_SUCCESS);
             assert_eq!((bi.ty, bi.level), (BATTERY_TYPE_NIMH, 1)); // 0.3 -> LOW
+
+            // XInputGetKeystroke returns queued button, trigger, and thumbstick events.
+            let mut ks = Keystroke::default();
+            // Drain events queued by earlier update(s) on slot 3: A + LTRIGGER + LTHUMB_LEFT
+            let mut got_vks = Vec::new();
+            while XInputGetKeystroke(3, 0, &mut ks as *mut _ as *mut c_void) == ERROR_SUCCESS {
+                assert_eq!(ks.user_index, 3);
+                got_vks.push((ks.virtual_key, ks.flags));
+            }
+            assert!(got_vks.contains(&(vk_pad::A, XINPUT_KEYSTROKE_KEYDOWN)));
+            assert!(got_vks.contains(&(vk_pad::LTRIGGER, XINPUT_KEYSTROKE_KEYDOWN)));
+            assert!(got_vks.contains(&(vk_pad::LTHUMB_LEFT, XINPUT_KEYSTROKE_KEYDOWN)));
+            assert_eq!(XInputGetKeystroke(3, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            // Release all -> KEYUP events delivered via XUSER_INDEX_ANY (0xFF).
+            backend_update(3, Gamepad::default());
+            let mut up_vks = Vec::new();
+            while XInputGetKeystroke(0xFF, 0, &mut ks as *mut _ as *mut c_void) == ERROR_SUCCESS {
+                assert_eq!(ks.user_index, 3);
+                up_vks.push((ks.virtual_key, ks.flags));
+            }
+            assert!(up_vks.contains(&(vk_pad::A, XINPUT_KEYSTROKE_KEYUP)));
+            assert!(up_vks.contains(&(vk_pad::LTRIGGER, XINPUT_KEYSTROKE_KEYUP)));
+            assert!(up_vks.contains(&(vk_pad::LTHUMB_LEFT, XINPUT_KEYSTROKE_KEYUP)));
+
             backend_disconnect(3);
+            assert_eq!(XInputGetKeystroke(3, 0, &mut ks as *mut _ as *mut c_void), ERROR_DEVICE_NOT_CONNECTED);
             assert_eq!(XInputGetState(3, &mut st), ERROR_DEVICE_NOT_CONNECTED);
             assert_eq!(XInputSetState(3, &mut v), ERROR_DEVICE_NOT_CONNECTED);
         }
@@ -751,6 +1189,138 @@ mod tests {
             backend_disconnect(0);
             set_virtual_gamepad(false, Gamepad::default());
             crate::macos::uikit::set_rumble_callback(None);
+        }
+    }
+
+    #[test]
+    fn keystroke_repeats_for_held_inputs_on_physical_and_virtual_slots() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        backend_disconnect(2);
+        backend_disconnect(0);
+        set_virtual_gamepad(false, Gamepad::default());
+        unsafe { XInputEnable(1) };
+
+        let backdate_phys = |slot_idx: usize, delta: Duration| {
+            let mut s = SLOTS.lock().unwrap();
+            if let Some(slot) = s[slot_idx].as_mut() {
+                for (_, due) in &mut slot.held_vks {
+                    *due = due.checked_sub(delta).unwrap_or(*due);
+                }
+            }
+        };
+        let backdate_virt = |delta: Duration| {
+            let mut v = VIRTUAL_PAD.lock().unwrap();
+            for (_, due) in &mut v.held_vks {
+                *due = due.checked_sub(delta).unwrap_or(*due);
+            }
+        };
+
+        unsafe {
+            // 1. Physical controller on slot 2: hold DPAD_DOWN + left thumbstick up.
+            backend_connect(2, DeviceInfo { name: "repeat-test".into(), wireless: false, rumble: false, battery: None });
+            let held_pad = Gamepad {
+                buttons: btn::DPAD_DOWN,
+                thumb_ly: 24_000,
+                ..Default::default()
+            };
+            backend_update(2, held_pad);
+
+            let mut ks = Keystroke::default();
+            let mut initial = Vec::new();
+            while XInputGetKeystroke(2, 0, &mut ks as *mut _ as *mut c_void) == ERROR_SUCCESS {
+                initial.push((ks.virtual_key, ks.flags, ks.user_index));
+            }
+            assert_eq!(initial.len(), 2);
+            assert!(initial.contains(&(vk_pad::DPAD_DOWN, XINPUT_KEYSTROKE_KEYDOWN, 2)));
+            assert!(initial.contains(&(vk_pad::LTHUMB_UP, XINPUT_KEYSTROKE_KEYDOWN, 2)));
+            // Before initial repeat delay expires, polling returns ERROR_EMPTY.
+            assert_eq!(XInputGetKeystroke(2, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            // Simulate holding past initial repeat delay (400 ms) without any new backend update.
+            backdate_phys(2, KEYSTROKE_REPEAT_INITIAL + Duration::from_millis(10));
+            let mut repeats1 = Vec::new();
+            while XInputGetKeystroke(2, 0, &mut ks as *mut _ as *mut c_void) == ERROR_SUCCESS {
+                repeats1.push((ks.virtual_key, ks.flags, ks.user_index));
+            }
+            assert_eq!(repeats1.len(), 2);
+            assert!(repeats1.contains(&(vk_pad::DPAD_DOWN, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT, 2)));
+            assert!(repeats1.contains(&(vk_pad::LTHUMB_UP, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT, 2)));
+            // Immediately after repeat emission, next poll is empty until repeat interval elapses.
+            assert_eq!(XInputGetKeystroke(2, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            // Simulate repeat interval (100 ms) elapsing -> fires again via XUSER_INDEX_ANY (0xFF).
+            backdate_phys(2, KEYSTROKE_REPEAT_INTERVAL + Duration::from_millis(10));
+            let mut repeats2 = Vec::new();
+            while XInputGetKeystroke(0xFF, 0, &mut ks as *mut _ as *mut c_void) == ERROR_SUCCESS {
+                repeats2.push((ks.virtual_key, ks.flags, ks.user_index));
+            }
+            assert!(repeats2.contains(&(vk_pad::DPAD_DOWN, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT, 2)));
+            assert!(repeats2.contains(&(vk_pad::LTHUMB_UP, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT, 2)));
+
+            // Release DPAD_DOWN while keeping LTHUMB_UP held -> only LTHUMB_UP continues repeating.
+            backend_update(2, Gamepad { thumb_ly: 24_000, ..Default::default() });
+            assert_eq!(XInputGetKeystroke(2, 0, &mut ks as *mut _ as *mut c_void), ERROR_SUCCESS);
+            assert_eq!((ks.virtual_key, ks.flags), (vk_pad::DPAD_DOWN, XINPUT_KEYSTROKE_KEYUP));
+
+            backdate_phys(2, KEYSTROKE_REPEAT_INTERVAL + Duration::from_millis(10));
+            let mut repeats3 = Vec::new();
+            while XInputGetKeystroke(2, 0, &mut ks as *mut _ as *mut c_void) == ERROR_SUCCESS {
+                repeats3.push((ks.virtual_key, ks.flags));
+            }
+            assert_eq!(repeats3, vec![(vk_pad::LTHUMB_UP, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT)]);
+
+            backend_disconnect(2);
+
+            // 2. Virtual touch gamepad on slot 0: held button repeats and stops on disconnect.
+            set_virtual_gamepad(true, Gamepad { buttons: btn::A, ..Default::default() });
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_SUCCESS);
+            assert_eq!((ks.virtual_key, ks.flags, ks.user_index), (vk_pad::A, XINPUT_KEYSTROKE_KEYDOWN, 0));
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            backdate_virt(KEYSTROKE_REPEAT_INITIAL + Duration::from_millis(10));
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_SUCCESS);
+            assert_eq!(
+                (ks.virtual_key, ks.flags, ks.user_index),
+                (vk_pad::A, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT, 0)
+            );
+
+            set_virtual_gamepad(false, Gamepad::default());
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_DEVICE_NOT_CONNECTED);
+
+            // 3. Merged slot-0 physical + virtual overlay: pressing A on both and releasing only
+            //    the physical button must NOT produce duplicate KEYDOWN or premature KEYUP.
+            backend_connect(0, DeviceInfo { name: "phys0".into(), wireless: false, rumble: false, battery: None });
+            set_virtual_gamepad(true, Gamepad::default());
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            // Press A physically -> single KEYDOWN(A).
+            backend_update(0, Gamepad { buttons: btn::A, ..Default::default() });
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_SUCCESS);
+            assert_eq!((ks.virtual_key, ks.flags, ks.user_index), (vk_pad::A, XINPUT_KEYSTROKE_KEYDOWN, 0));
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            // Press A on touch overlay while physical A is held -> NO duplicate KEYDOWN.
+            set_virtual_gamepad(true, Gamepad { buttons: btn::A, ..Default::default() });
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            // Release physical A while touch overlay still holds A -> NO premature KEYUP, and repeats continue.
+            backend_update(0, Gamepad::default());
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+            backdate_virt(KEYSTROKE_REPEAT_INITIAL + Duration::from_millis(10));
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_SUCCESS);
+            assert_eq!(
+                (ks.virtual_key, ks.flags, ks.user_index),
+                (vk_pad::A, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT, 0)
+            );
+
+            // Release touch overlay A -> single KEYUP(A).
+            set_virtual_gamepad(true, Gamepad::default());
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_SUCCESS);
+            assert_eq!((ks.virtual_key, ks.flags, ks.user_index), (vk_pad::A, XINPUT_KEYSTROKE_KEYUP, 0));
+            assert_eq!(XInputGetKeystroke(0, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            backend_disconnect(0);
+            set_virtual_gamepad(false, Gamepad::default());
         }
     }
 }
