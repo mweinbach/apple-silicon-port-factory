@@ -7,20 +7,24 @@
 //! hazard pointers, with synchronous `on_handle_close()` and `Drop` on `close()`.
 //!
 //! Single-object non-alertable waits on `Semaphore` and `Event` run directly on
-//! each object's packed atomic futex word (adaptive bounded spin + Darwin
-//! `__ulock_wait` / `__ulock_wake` with wake coalescing and `ULF_WAKE_ALL`
+//! each object's atomic state with a capped per-object adaptive spin (at most 2
+//! concurrent spinners) and an intrusive LIFO per-object wait queue backed by
+//! each thread's own 128B-aligned [`Parker`] (`__ulock_wait` / `__ulock_wake`
+//! with zero kernel ulock-bucket contention, wake coalescing, and `WakeBatch`
 //! batching), avoiding `WAIT_LOCK`, wait buckets, and `Arc` refcount bouncing.
 //! Multi-object, alertable, mutex, timer, and thread waits use sharded
 //! cache-line-aligned wait buckets with LIFO wake selection preferring spinning
 //! waiters and a stack-allocated [`WakeBatch`].
 
-use crate::park::{self, Parker, WakeOp, WordLock};
+use crate::park::{self, Parker, WordLock};
 use crate::types::*;
 use std::any::Any;
-use std::cell::{Cell, UnsafeCell};
+#[cfg(debug_assertions)]
+use std::cell::Cell;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -1382,16 +1386,12 @@ pub fn wait_for_duration(
             }
             return res;
         }
-        if crate::thread::is_current_terminate_requested() {
-            return WaitResult::Timeout;
-        }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return WaitResult::Timeout;
         }
         let park = Arc::clone(&reg.waiter);
         drop(g);
-        park.park.park(deadline);
-        if crate::thread::is_current_terminate_requested() {
+        if park.park.park(deadline) {
             return WaitResult::Timeout;
         }
         g = wait_lock();
@@ -1431,14 +1431,10 @@ pub fn alertable_sleep_duration(timeout: Option<Duration>) -> bool {
             crate::thread::run_pending_apcs();
             return true;
         }
-        if crate::thread::is_current_terminate_requested() {
-            return false;
-        }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return false;
         }
-        reg.waiter.park.park(deadline);
-        if crate::thread::is_current_terminate_requested() {
+        if reg.waiter.park.park(deadline) {
             return false;
         }
     }
@@ -1451,33 +1447,180 @@ pub fn alertable_sleep(timeout_ms: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Per-object intrusive LIFO wait queue + capped spinner helper
+// ---------------------------------------------------------------------------
+
+/// Cap on concurrent spinning waiters per `Event` / `Semaphore` object (Go
+/// `nmspinning` pattern): keeps hot worker-pool latency low while preventing
+/// 16+ idle workers from burning CPU at the tail of a frame's job burst.
+const MAX_CONCURRENT_SPINNERS: u32 = 2;
+
+#[inline]
+fn try_claim_spinner(spinners: &AtomicU32) -> bool {
+    let mut cur = spinners.load(Ordering::Relaxed);
+    while cur < MAX_CONCURRENT_SPINNERS {
+        match spinners.compare_exchange_weak(
+            cur,
+            cur + 1,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(v) => cur = v,
+        }
+    }
+    false
+}
+
+/// Stack-allocated doubly-linked intrusive node for a single-object direct wait.
+/// All fields except `waiter` are strictly owned by the enclosing `LocalWaitQueue`'s
+/// `WordLock` while `in_queue == true` (and until the waiter observes `in_queue == false`
+/// under that lock).
+struct LocalNode {
+    prev: *mut LocalNode,
+    next: *mut LocalNode,
+    in_queue: bool,
+    popped_by_wake: bool,
+    pulsed: bool,
+    waiter: *const Waiter,
+}
+
+impl LocalNode {
+    #[inline]
+    const fn new(waiter: *const Waiter) -> Self {
+        LocalNode {
+            prev: std::ptr::null_mut(),
+            next: std::ptr::null_mut(),
+            in_queue: false,
+            popped_by_wake: false,
+            pulsed: false,
+            waiter,
+        }
+    }
+}
+
+/// Cache-line-aligned per-object LIFO intrusive wait queue (O(1) push/pop/unlink,
+/// zero heap allocation, zero global bucket lock or cross-object contention).
+#[repr(align(128))]
+struct LocalWaitQueue {
+    lock: WordLock,
+    head: UnsafeCell<*mut LocalNode>,
+    tail: UnsafeCell<*mut LocalNode>,
+}
+
+unsafe impl Send for LocalWaitQueue {}
+unsafe impl Sync for LocalWaitQueue {}
+
+impl LocalWaitQueue {
+    const fn new() -> Self {
+        LocalWaitQueue {
+            lock: WordLock::new(),
+            head: UnsafeCell::new(std::ptr::null_mut()),
+            tail: UnsafeCell::new(std::ptr::null_mut()),
+        }
+    }
+
+    #[inline]
+    unsafe fn push_tail_locked(&self, node: *mut LocalNode) {
+        let head = &mut *self.head.get();
+        let tail = &mut *self.tail.get();
+        (*node).prev = *tail;
+        (*node).next = std::ptr::null_mut();
+        (*node).in_queue = true;
+        (*node).popped_by_wake = false;
+        (*node).pulsed = false;
+        if !(*tail).is_null() {
+            (**tail).next = node;
+        } else {
+            *head = node;
+        }
+        *tail = node;
+    }
+
+    #[inline]
+    unsafe fn unlink_locked(&self, node: *mut LocalNode) {
+        let head = &mut *self.head.get();
+        let tail = &mut *self.tail.get();
+        let prev = (*node).prev;
+        let next = (*node).next;
+        if !prev.is_null() {
+            (*prev).next = next;
+        } else {
+            *head = next;
+        }
+        if !next.is_null() {
+            (*next).prev = prev;
+        } else {
+            *tail = prev;
+        }
+        (*node).prev = std::ptr::null_mut();
+        (*node).next = std::ptr::null_mut();
+        (*node).in_queue = false;
+    }
+
+    /// Pop the most recently queued waiter (LIFO for warm caches) and clone its
+    /// `Arc<Waiter>` while still holding `self.lock` so `unpark()` can run safely
+    /// outside the lock.
+    #[inline]
+    unsafe fn pop_tail_locked(&self, mark_pulsed: bool) -> Option<Arc<Waiter>> {
+        let tail = *self.tail.get();
+        if tail.is_null() {
+            return None;
+        }
+        self.unlink_locked(tail);
+        if mark_pulsed {
+            (*tail).pulsed = true;
+        } else {
+            (*tail).popped_by_wake = true;
+        }
+        Arc::increment_strong_count((*tail).waiter);
+        Some(Arc::from_raw((*tail).waiter))
+    }
+
+    /// Drain every queued waiter LIFO into `batch`, returning how many were drained.
+    #[inline]
+    unsafe fn drain_all_locked(&self, mark_pulsed: bool, batch: &mut WakeBatch) -> u32 {
+        let mut cur = *self.tail.get();
+        *self.head.get() = std::ptr::null_mut();
+        *self.tail.get() = std::ptr::null_mut();
+        let mut count = 0u32;
+        while !cur.is_null() {
+            let prev = (*cur).prev;
+            (*cur).prev = std::ptr::null_mut();
+            (*cur).next = std::ptr::null_mut();
+            (*cur).in_queue = false;
+            if mark_pulsed {
+                (*cur).pulsed = true;
+            }
+            Arc::increment_strong_count((*cur).waiter);
+            batch.push(Arc::from_raw((*cur).waiter));
+            count += 1;
+            cur = prev;
+        }
+        count
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Basic waitable objects
 // ---------------------------------------------------------------------------
 
-// Packed Event::state (AtomicU32):
-//   bit   0:     EV_SIGNALED
-//   bits  1..16: sleepers (15 bits, up to 32767 threads in `__ulock_wait`)
-//   bits 16..31: waking   (15 bits, in-flight kernel wakes)
-const EV_SIGNALED: u32 = 1;
-const EV_SLEEPER_SHIFT: u32 = 1;
-const EV_SLEEPER_INC: u32 = 1 << EV_SLEEPER_SHIFT;
-const EV_SLEEPER_MAX: u32 = 0x7FFF;
-const EV_SLEEPER_MASK: u32 = EV_SLEEPER_MAX << EV_SLEEPER_SHIFT;
-const EV_WAKING_SHIFT: u32 = 16;
-const EV_WAKING_MASK: u32 = 0x7FFF << EV_WAKING_SHIFT;
-
-#[inline(always)]
-fn ev_pack(signaled: bool, sleepers: u32, waking: u32) -> u32 {
-    (signaled as u32) | (sleepers << EV_SLEEPER_SHIFT) | (waking << EV_WAKING_SHIFT)
-}
-
+#[repr(align(128))]
 pub struct Event {
     pub manual_reset: bool,
-    state: AtomicU32,
-    /// Packed `(gen: u32 [low 32] | claimed: u32 [high 32])` for race-free `PulseEvent`.
+    signaled: AtomicBool,
+    /// Active spinning waiters in `wait_single_fast` (capped at `MAX_CONCURRENT_SPINNERS`).
+    spinners: AtomicU32,
+    /// Waiters currently linked in `queue` (updated under `queue.lock`).
+    sleepers: AtomicU32,
+    /// Popped auto-reset waiters whose wakes are in flight (always 0 for manual-reset).
+    in_flight: AtomicU32,
+    /// Packed `(gen: u32 [low 32] | claimed: u32 [high 32])` for race-free `PulseEvent`
+    /// with spinning waiters (queued sleepers receive `node.pulsed = true` directly).
     pulse_word: AtomicU64,
     /// Active multi-object or alertable waiters registered in `BUCKETS`/`ANY_WAITERS`.
     complex_waiters: AtomicU32,
+    queue: LocalWaitQueue,
     pub name: Option<String>,
 }
 
@@ -1485,9 +1628,13 @@ impl Event {
     pub fn new(manual_reset: bool, initial: bool, name: Option<String>) -> Self {
         Event {
             manual_reset,
-            state: AtomicU32::new(if initial { EV_SIGNALED } else { 0 }),
+            signaled: AtomicBool::new(initial),
+            spinners: AtomicU32::new(0),
+            sleepers: AtomicU32::new(0),
+            in_flight: AtomicU32::new(0),
             pulse_word: AtomicU64::new(0),
             complex_waiters: AtomicU32::new(0),
+            queue: LocalWaitQueue::new(),
             name,
         }
     }
@@ -1495,21 +1642,9 @@ impl Event {
     #[inline]
     pub fn try_take(&self) -> bool {
         if self.manual_reset {
-            (self.state.load(Ordering::Acquire) & EV_SIGNALED) != 0
+            self.signaled.load(Ordering::Acquire)
         } else {
-            let mut s = self.state.load(Ordering::Relaxed);
-            while (s & EV_SIGNALED) != 0 {
-                match self.state.compare_exchange_weak(
-                    s,
-                    s & !EV_SIGNALED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return true,
-                    Err(v) => s = v,
-                }
-            }
-            false
+            self.signaled.load(Ordering::Relaxed) && self.signaled.swap(false, Ordering::AcqRel)
         }
     }
 
@@ -1542,7 +1677,27 @@ impl Event {
         }
     }
 
-    /// Direct futex + adaptive bounded spin single-object non-alertable wait.
+    #[inline]
+    fn wake_one_auto_if_idle(&self) {
+        if self.sleepers.load(Ordering::Acquire) == 0 || self.in_flight.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        self.queue.lock.lock();
+        let w = if self.in_flight.load(Ordering::Acquire) == 0 {
+            unsafe { self.queue.pop_tail_locked(false) }.inspect(|_| {
+                self.sleepers.fetch_sub(1, Ordering::Relaxed);
+                self.in_flight.fetch_add(1, Ordering::AcqRel);
+            })
+        } else {
+            None
+        };
+        self.queue.lock.unlock();
+        if let Some(w) = w {
+            w.park.unpark();
+        }
+    }
+
+    /// Direct per-object LIFO queue + capped adaptive spin single-object wait.
     pub(crate) fn wait_single_fast(&self, timeout: Option<Duration>) -> WaitResult {
         if self.try_take() {
             return WaitResult::Object(0);
@@ -1553,142 +1708,127 @@ impl Event {
         let my_gen = self.pulse_word.load(Ordering::Acquire) as u32;
         let deadline = timeout.map(|d| Instant::now() + d);
 
-        // Adaptive bounded spin directly on `self.state` (zero registration, zero locks).
-        if !crate::thread::is_current_terminate_requested()
-            && park::spin_until_u32_bit0(&self.state, deadline, || {
+        // Capped adaptive bounded spin (at most `MAX_CONCURRENT_SPINNERS` per event).
+        if park::spin_enabled() && try_claim_spinner(&self.spinners) {
+            let hit = park::spin_until(deadline, u64::MAX, || {
                 self.try_take() || self.try_claim_pulse(my_gen)
-            })
-        {
-            return WaitResult::Object(0);
+            });
+            self.spinners.fetch_sub(1, Ordering::Release);
+            if hit {
+                return WaitResult::Object(0);
+            }
         }
 
         let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, 1);
         let _term_defer = crate::thread::TerminateDeferGuard::enter();
-        let mut sleeping = false;
+        let waiter = WAITER.try_with(Arc::clone).unwrap_or_else(|_| Arc::new(Waiter::new()));
+        let node = UnsafeCell::new(LocalNode::new(Arc::as_ptr(&waiter)));
+        let node_ptr = node.get();
+        let mut holds_in_flight = false;
 
         loop {
-            let s = self.state.load(Ordering::Acquire);
-            let signaled = (s & EV_SIGNALED) != 0;
-            let sleepers = (s & EV_SLEEPER_MASK) >> EV_SLEEPER_SHIFT;
-            let waking = (s & EV_WAKING_MASK) >> EV_WAKING_SHIFT;
+            if self.try_take() {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.signaled.load(Ordering::Acquire) {
+                        self.wake_one_auto_if_idle();
+                    }
+                }
+                return WaitResult::Object(0);
+            }
 
-            if signaled {
-                let new_signaled = self.manual_reset;
-                let new_sleepers = if sleeping { sleepers - 1 } else { sleepers };
-                let new_waking = if sleeping {
-                    waking.saturating_sub(1).min(new_sleepers)
-                } else {
-                    waking
-                };
-                let next = ev_pack(new_signaled, new_sleepers, new_waking);
-                if next == s
-                    || self
-                        .state
-                        .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                {
+            if self.try_claim_pulse(my_gen) {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.signaled.load(Ordering::Acquire) {
+                        self.wake_one_auto_if_idle();
+                    }
+                }
+                return WaitResult::Object(0);
+            }
+
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.signaled.load(Ordering::Acquire) {
+                        self.wake_one_auto_if_idle();
+                    }
+                }
+                return WaitResult::Timeout;
+            }
+
+            waiter.park.arm();
+            self.queue.lock.lock();
+            if holds_in_flight {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                holds_in_flight = false;
+            }
+            unsafe { self.queue.push_tail_locked(node_ptr) };
+            self.sleepers.fetch_add(1, Ordering::SeqCst);
+            self.queue.lock.unlock();
+
+            // StoreLoad barrier pairing with `set_returning_prev()` and `pulse()`.
+            std::sync::atomic::fence(Ordering::SeqCst);
+
+            let got_pulse = self.try_claim_pulse(my_gen);
+            if got_pulse || self.signaled.load(Ordering::Acquire) {
+                let mut node_pulsed = false;
+                self.queue.lock.lock();
+                unsafe {
+                    if (*node_ptr).in_queue {
+                        self.queue.unlink_locked(node_ptr);
+                        self.sleepers.fetch_sub(1, Ordering::Relaxed);
+                    } else if (*node_ptr).pulsed {
+                        node_pulsed = true;
+                    } else if (*node_ptr).popped_by_wake {
+                        holds_in_flight = true;
+                    }
+                }
+                self.queue.lock.unlock();
+                if got_pulse || node_pulsed {
+                    if holds_in_flight {
+                        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                        std::sync::atomic::fence(Ordering::SeqCst);
+                        if self.signaled.load(Ordering::Acquire) {
+                            self.wake_one_auto_if_idle();
+                        }
+                    }
                     return WaitResult::Object(0);
                 }
                 continue;
             }
 
-            if self.try_claim_pulse(my_gen) {
-                if sleeping {
-                    self.unregister_sleeper();
+            let interrupted = waiter.park.park_sleep_only(deadline);
+
+            let mut node_pulsed = false;
+            self.queue.lock.lock();
+            unsafe {
+                if (*node_ptr).in_queue {
+                    self.queue.unlink_locked(node_ptr);
+                    self.sleepers.fetch_sub(1, Ordering::Relaxed);
+                } else if (*node_ptr).pulsed {
+                    node_pulsed = true;
+                } else if (*node_ptr).popped_by_wake {
+                    holds_in_flight = true;
                 }
+            }
+            self.queue.lock.unlock();
+            if node_pulsed {
                 return WaitResult::Object(0);
             }
-
-            let timed_out = crate::thread::is_current_terminate_requested()
-                || deadline.is_some_and(|d| Instant::now() >= d);
-            if timed_out {
-                if sleeping {
-                    self.unregister_sleeper();
+            if interrupted {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.signaled.load(Ordering::Acquire) {
+                        self.wake_one_auto_if_idle();
+                    }
                 }
                 return WaitResult::Timeout;
             }
-
-            let expected = if !sleeping {
-                if sleepers >= EV_SLEEPER_MAX {
-                    std::thread::yield_now();
-                    continue;
-                }
-                let next = s + EV_SLEEPER_INC;
-                if self
-                    .state
-                    .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_err()
-                {
-                    continue;
-                }
-                sleeping = true;
-                // StoreLoad barrier pairing with `pulse()`'s `pulse_word` update before
-                // checking `sleepers` on `self.state`.
-                std::sync::atomic::fence(Ordering::SeqCst);
-                if self.try_claim_pulse(my_gen) {
-                    self.unregister_sleeper();
-                    return WaitResult::Object(0);
-                }
-                next
-            } else if waking > 0 {
-                let next = ev_pack(false, sleepers, waking - 1);
-                if self
-                    .state
-                    .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_err()
-                {
-                    continue;
-                }
-                next
-            } else {
-                s
-            };
-
-            match park::ulock_wait32(&self.state, expected, deadline) {
-                Some(sleep_us) => {
-                    let hit_deadline = deadline.is_some_and(|d| Instant::now() >= d);
-                    park::record_sleep_outcome(sleep_us, hit_deadline);
-                }
-                None => {
-                    self.unregister_sleeper();
-                    return WaitResult::Timeout;
-                }
-            }
-        }
-    }
-
-    /// Unregister one direct sleeper cleanly; if the event became signaled while a
-    /// wake was in flight and other sleepers remain, pass the wake on.
-    fn unregister_sleeper(&self) {
-        let mut s = self.state.load(Ordering::Acquire);
-        loop {
-            let signaled = (s & EV_SIGNALED) != 0;
-            let sleepers = (s & EV_SLEEPER_MASK) >> EV_SLEEPER_SHIFT;
-            let waking = (s & EV_WAKING_MASK) >> EV_WAKING_SHIFT;
-            let new_sleepers = sleepers.saturating_sub(1);
-            let mut new_waking = waking.saturating_sub(1).min(new_sleepers);
-            let mut wake_op = WakeOp::None;
-            if signaled && new_sleepers > 0 && new_waking == 0 {
-                if self.manual_reset {
-                    new_waking = new_sleepers;
-                    wake_op = WakeOp::All;
-                } else {
-                    new_waking = 1;
-                    wake_op = WakeOp::One;
-                }
-            }
-            let next = ev_pack(signaled, new_sleepers, new_waking);
-            if self
-                .state
-                .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                if !matches!(wake_op, WakeOp::None) {
-                    park::execute_ulock_wake32(&self.state, wake_op);
-                }
-                return;
-            }
-            s = self.state.load(Ordering::Acquire);
         }
     }
 
@@ -1705,41 +1845,29 @@ impl Event {
 
     /// Set the event and return whether it was previously signaled (`NtSetEvent`).
     /// Redundant `SetEvent` calls on an already-signaled event return immediately
-    /// without redundant `__ulock_wake` syscalls or bucket locks.
+    /// without redundant `__ulock_wake` syscalls or queue locks.
     pub fn set_returning_prev(&self) -> bool {
-        let mut s = self.state.load(Ordering::Relaxed);
-        let wake_op;
-        loop {
-            if (s & EV_SIGNALED) != 0 {
-                park::record_coalesced_wake_stat();
-                return true;
-            }
-            let sleepers = (s & EV_SLEEPER_MASK) >> EV_SLEEPER_SHIFT;
-            let waking = (s & EV_WAKING_MASK) >> EV_WAKING_SHIFT;
-            let (next, op) = if sleepers == 0 {
-                (ev_pack(true, 0, 0), WakeOp::None)
-            } else if self.manual_reset {
-                // Batch-wake every sleeping waiter in one `ULF_WAKE_ALL` syscall.
-                (ev_pack(true, sleepers, sleepers), WakeOp::All)
-            } else if waking > 0 {
-                // An earlier wake is still in flight; coalesce without a duplicate syscall.
-                (ev_pack(true, sleepers, waking), WakeOp::Coalesced)
-            } else {
-                (ev_pack(true, sleepers, 1), WakeOp::One)
-            };
-            match self
-                .state
-                .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    wake_op = op;
-                    break;
+        if self.signaled.swap(true, Ordering::AcqRel) {
+            park::record_coalesced_wake_stat();
+            return true;
+        }
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.sleepers.load(Ordering::Acquire) > 0 {
+            if self.manual_reset {
+                let mut batch = WakeBatch::new();
+                self.queue.lock.lock();
+                let drained = unsafe { self.queue.drain_all_locked(false, &mut batch) };
+                if drained > 0 {
+                    self.sleepers.fetch_sub(drained, Ordering::Relaxed);
                 }
-                Err(v) => s = v,
+                self.queue.lock.unlock();
+                batch.unpark_all();
+            } else if self.in_flight.load(Ordering::Acquire) > 0 {
+                park::record_coalesced_wake_stat();
+            } else {
+                self.wake_one_auto_if_idle();
             }
         }
-        park::execute_ulock_wake32(&self.state, wake_op);
-        std::sync::atomic::fence(Ordering::SeqCst);
         if self.complex_waiters.load(Ordering::Acquire) != 0
             || ANY_WAITERS.count.load(Ordering::Acquire) != 0
         {
@@ -1749,83 +1877,86 @@ impl Event {
     }
 
     pub fn reset(&self) {
-        self.state.fetch_and(!EV_SIGNALED, Ordering::Release);
+        self.signaled.store(false, Ordering::Release);
     }
 
     /// Reset the event and return whether it was previously signaled (`NtResetEvent`).
     pub fn reset_returning_prev(&self) -> bool {
-        (self.state.fetch_and(!EV_SIGNALED, Ordering::AcqRel) & EV_SIGNALED) != 0
+        self.signaled.swap(false, Ordering::AcqRel)
     }
 
-    /// PulseEvent: release currently waiting threads (all for manual-reset, one
-    /// for auto-reset) and leave the event non-signaled.
-    pub fn pulse(&self) {
-        // 1. Advance pulse generation so any currently waiting single-object thread
-        //    succeeds race-free even after `EV_SIGNALED` is cleared.
+    fn bump_pulse_word(&self) {
         let mut pw = self.pulse_word.load(Ordering::Relaxed);
         loop {
             let cur_gen = pw as u32;
             let next_gen = cur_gen.wrapping_add(1);
             let next_claimed = if self.manual_reset { 0 } else { cur_gen };
             let next = (next_gen as u64) | ((next_claimed as u64) << 32);
-            match self
-                .pulse_word
-                .compare_exchange_weak(pw, next, Ordering::AcqRel, Ordering::Relaxed)
-            {
+            match self.pulse_word.compare_exchange_weak(
+                pw,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(v) => pw = v,
             }
         }
+    }
+
+    /// PulseEvent: release currently waiting threads (all for manual-reset, one
+    /// for auto-reset) and leave the event non-signaled.
+    pub fn pulse(&self) {
+        self.signaled.store(false, Ordering::Release);
         std::sync::atomic::fence(Ordering::SeqCst);
 
-        // 2. Clear `EV_SIGNALED` (invalidating any ARM64 WFE monitor on `self.state`)
-        //    and wake sleeping direct waiters.
-        let mut s = self.state.load(Ordering::Relaxed);
-        let wake_op;
-        loop {
-            let sleepers = (s & EV_SLEEPER_MASK) >> EV_SLEEPER_SHIFT;
-            let waking = (s & EV_WAKING_MASK) >> EV_WAKING_SHIFT;
-            let (next, op) = if sleepers == 0 {
-                (s & !EV_SIGNALED, WakeOp::None)
-            } else if self.manual_reset {
-                (ev_pack(false, sleepers, sleepers), WakeOp::All)
-            } else if waking > 0 {
-                (ev_pack(false, sleepers, waking), WakeOp::Coalesced)
-            } else {
-                (ev_pack(false, sleepers, 1), WakeOp::One)
-            };
-            if next == s {
-                // Force an RMW store to invalidate any spinning core's exclusive monitor.
-                let cur = self.state.fetch_and(!EV_SIGNALED, Ordering::AcqRel);
-                if cur == s {
-                    wake_op = op;
-                    break;
+        if self.manual_reset {
+            self.bump_pulse_word();
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if self.sleepers.load(Ordering::Acquire) > 0 {
+                let mut batch = WakeBatch::new();
+                self.queue.lock.lock();
+                let drained = unsafe { self.queue.drain_all_locked(true, &mut batch) };
+                if drained > 0 {
+                    self.sleepers.fetch_sub(drained, Ordering::Relaxed);
                 }
-                s = cur;
-                continue;
+                self.queue.lock.unlock();
+                batch.unpark_all();
             }
-            match self
-                .state
-                .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
+            if self.complex_waiters.load(Ordering::Acquire) != 0
+                || ANY_WAITERS.count.load(Ordering::Acquire) != 0
             {
-                Ok(_) => {
-                    wake_op = op;
-                    break;
-                }
-                Err(v) => s = v,
+                self.signaled.store(true, Ordering::Release);
+                notify_object_key(obj_key(self), usize::MAX);
+                std::thread::yield_now();
+                self.signaled.store(false, Ordering::Release);
+            }
+            return;
+        }
+
+        // Auto-reset PulseEvent: release AT MOST ONE currently waiting thread.
+        if self.sleepers.load(Ordering::Acquire) > 0 {
+            self.queue.lock.lock();
+            let w = unsafe { self.queue.pop_tail_locked(true) }.inspect(|_| {
+                self.sleepers.fetch_sub(1, Ordering::Relaxed);
+            });
+            self.queue.lock.unlock();
+            if let Some(w) = w {
+                w.park.unpark();
+                return;
             }
         }
-        park::execute_ulock_wake32(&self.state, wake_op);
-
-        // 3. Also wake any multi-object / alertable complex waiters.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.spinners.load(Ordering::Acquire) > 0 {
+            self.bump_pulse_word();
+            return;
+        }
         if self.complex_waiters.load(Ordering::Acquire) != 0
             || ANY_WAITERS.count.load(Ordering::Acquire) != 0
         {
-            self.state.fetch_or(EV_SIGNALED, Ordering::Release);
-            notify_object_key(obj_key(self), if self.manual_reset { usize::MAX } else { 1 });
+            self.signaled.store(true, Ordering::Release);
+            notify_object_key(obj_key(self), 1);
             std::thread::yield_now();
-            self.state.fetch_and(!EV_SIGNALED, Ordering::Release);
+            self.signaled.store(false, Ordering::Release);
         }
     }
 }
@@ -1844,7 +1975,7 @@ impl KObject for Event {
 
 impl Waitable for Event {
     fn is_signaled(&self, _g: &WaitGuard, _tid: u32) -> bool {
-        (self.state.load(Ordering::Acquire) & EV_SIGNALED) != 0
+        self.signaled.load(Ordering::Acquire)
     }
     fn acquire(&self, _g: &WaitGuard, _tid: u32) -> bool {
         self.try_take();
@@ -1903,30 +2034,20 @@ impl MutexObj {
     }
 }
 
-// Packed Semaphore::state (AtomicU64):
-//   bits  0..32: count    (u32, 0..=i32::MAX)
-//   bits 32..48: sleepers (u16, threads actively sleeping in `__ulock_wait`)
-//   bits 48..64: waking   (u16, in-flight kernel wakes not yet observed by a sleeper)
-const SEM_COUNT_MASK: u64 = 0x0000_0000_FFFF_FFFF;
-const SEM_SLEEPER_SHIFT: u32 = 32;
-const SEM_SLEEPER_INC: u64 = 1u64 << SEM_SLEEPER_SHIFT;
-const SEM_SLEEPER_MASK: u64 = 0x0000_FFFF_0000_0000;
-const SEM_WAKING_SHIFT: u32 = 48;
-const SEM_WAKING_MASK: u64 = 0xFFFF_0000_0000_0000;
-
-#[inline(always)]
-fn sem_pack(count: u32, sleepers: u16, waking: u16) -> u64 {
-    (count as u64) | ((sleepers as u64) << SEM_SLEEPER_SHIFT) | ((waking as u64) << SEM_WAKING_SHIFT)
-}
-
-/// Lock-free semaphore with packed 64-bit `(count, sleepers, waking)` futex state:
-/// single-object waits spin adaptively and block directly on `state` via
-/// `UL_COMPARE_AND_WAIT64`, coalescing burst `ReleaseSemaphore` wakes and batching
-/// multi-unit wakes with `ULF_WAKE_ALL` when `n >= sleepers`.
+/// Lock-free semaphore with capped adaptive spin, per-object intrusive LIFO wait
+/// queue, per-thread 128B-aligned `Parker`, and coalesced/cascaded wakes.
+#[repr(align(128))]
 pub struct Semaphore {
-    state: AtomicU64,
+    count: AtomicI32,
+    /// Active spinning waiters in `wait_single_fast` (capped at `MAX_CONCURRENT_SPINNERS`).
+    spinners: AtomicU32,
+    /// Waiters currently linked in `queue` (updated under `queue.lock`).
+    sleepers: AtomicU32,
+    /// Popped waiters whose wakes are currently in flight.
+    in_flight: AtomicU32,
     /// Active multi-object or alertable waiters registered in `BUCKETS`/`ANY_WAITERS`.
     complex_waiters: AtomicU32,
+    queue: LocalWaitQueue,
     pub max: i32,
     pub name: Option<String>,
 }
@@ -1945,7 +2066,7 @@ impl KObject for Semaphore {
 
 impl Waitable for Semaphore {
     fn is_signaled(&self, _g: &WaitGuard, _tid: u32) -> bool {
-        (self.state.load(Ordering::Acquire) & SEM_COUNT_MASK) > 0
+        self.count.load(Ordering::Acquire) > 0
     }
     fn acquire(&self, _g: &WaitGuard, _tid: u32) -> bool {
         self.try_take();
@@ -1959,8 +2080,12 @@ impl Waitable for Semaphore {
 impl Semaphore {
     pub fn new(initial: i32, max: i32, name: Option<String>) -> Self {
         Semaphore {
-            state: AtomicU64::new(initial.max(0) as u64),
+            count: AtomicI32::new(initial.max(0)),
+            spinners: AtomicU32::new(0),
+            sleepers: AtomicU32::new(0),
+            in_flight: AtomicU32::new(0),
             complex_waiters: AtomicU32::new(0),
+            queue: LocalWaitQueue::new(),
             max,
             name,
         }
@@ -1969,20 +2094,57 @@ impl Semaphore {
     /// Take one unit if available (no lock, single CAS).
     #[inline]
     pub fn try_take(&self) -> bool {
-        let mut s = self.state.load(Ordering::Relaxed);
-        while (s & SEM_COUNT_MASK) != 0 {
+        let mut c = self.count.load(Ordering::Relaxed);
+        while c > 0 {
             match self
-                .state
-                .compare_exchange_weak(s, s - 1, Ordering::Acquire, Ordering::Relaxed)
+                .count
+                .compare_exchange_weak(c, c - 1, Ordering::Acquire, Ordering::Relaxed)
             {
                 Ok(_) => return true,
-                Err(v) => s = v,
+                Err(v) => c = v,
             }
         }
         false
     }
 
-    /// Direct futex + adaptive bounded spin single-object non-alertable wait.
+    #[inline]
+    fn wake_one_local(&self, respect_in_flight: bool) {
+        if self.sleepers.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if respect_in_flight && self.in_flight.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        self.queue.lock.lock();
+        let w = if !respect_in_flight || self.in_flight.load(Ordering::Acquire) == 0 {
+            unsafe { self.queue.pop_tail_locked(false) }.inspect(|_| {
+                self.sleepers.fetch_sub(1, Ordering::Relaxed);
+                self.in_flight.fetch_add(1, Ordering::AcqRel);
+            })
+        } else {
+            None
+        };
+        self.queue.lock.unlock();
+        if let Some(w) = w {
+            w.park.unpark();
+        }
+    }
+
+    #[inline]
+    fn wake_after_take(&self, cascade: bool) {
+        self.wake_one_local(cascade);
+        if self.complex_waiters.load(Ordering::Acquire) != 0
+            || ANY_WAITERS.count.load(Ordering::Acquire) != 0
+        {
+            if cascade {
+                notify_semaphore_complex(obj_key(self));
+            } else {
+                notify_object_key(obj_key(self), 1);
+            }
+        }
+    }
+
+    /// Direct per-object LIFO queue + capped adaptive spin single-object wait.
     pub(crate) fn wait_single_fast(&self, timeout: Option<Duration>) -> WaitResult {
         if self.try_take() {
             return WaitResult::Object(0);
@@ -1992,151 +2154,97 @@ impl Semaphore {
         }
         let deadline = timeout.map(|d| Instant::now() + d);
 
-        // Adaptive bounded spin directly on `self.state` (zero registration, zero locks).
-        if !crate::thread::is_current_terminate_requested()
-            && park::spin_until_u64_low32(&self.state, deadline, || {
-                (self.state.load(Ordering::Relaxed) & SEM_COUNT_MASK) != 0 && self.try_take()
-            })
-        {
-            return WaitResult::Object(0);
+        // Capped adaptive bounded spin (at most `MAX_CONCURRENT_SPINNERS` per semaphore).
+        if park::spin_enabled() && try_claim_spinner(&self.spinners) {
+            let hit = park::spin_until(deadline, u64::MAX, || {
+                self.count.load(Ordering::Relaxed) > 0 && self.try_take()
+            });
+            self.spinners.fetch_sub(1, Ordering::Release);
+            if hit {
+                return WaitResult::Object(0);
+            }
         }
 
         let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, 1);
         let _term_defer = crate::thread::TerminateDeferGuard::enter();
-        let mut sleeping = false;
+        let waiter = WAITER.try_with(Arc::clone).unwrap_or_else(|_| Arc::new(Waiter::new()));
         let cascade = sem_cascade();
+        let node = UnsafeCell::new(LocalNode::new(Arc::as_ptr(&waiter)));
+        let node_ptr = node.get();
+        let mut holds_in_flight = false;
 
         loop {
-            let s = self.state.load(Ordering::Acquire);
-            let count = (s & SEM_COUNT_MASK) as u32;
-            let sleepers = ((s & SEM_SLEEPER_MASK) >> SEM_SLEEPER_SHIFT) as u16;
-            let waking = ((s & SEM_WAKING_MASK) >> SEM_WAKING_SHIFT) as u16;
-
-            if count > 0 {
-                let new_count = count - 1;
-                let new_sleepers = if sleeping { sleepers - 1 } else { sleepers };
-                let mut new_waking = if sleeping {
-                    waking.saturating_sub(1).min(new_sleepers)
-                } else {
-                    waking
-                };
-                let mut wake_op = WakeOp::None;
-                if sleeping && cascade && new_count > 0 && new_sleepers > 0 && new_waking == 0 {
-                    if new_count >= new_sleepers as u32 && new_sleepers > 1 {
-                        new_waking = new_sleepers;
-                        wake_op = WakeOp::All;
-                    } else {
-                        new_waking = 1;
-                        wake_op = WakeOp::One;
-                    }
+            if self.try_take() {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
                 }
-                let next = sem_pack(new_count, new_sleepers, new_waking);
-                if self
-                    .state
-                    .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    if !matches!(wake_op, WakeOp::None) {
-                        park::execute_ulock_wake64(&self.state, wake_op);
-                    }
-                    if sleeping && cascade && new_count > 0 {
-                        std::sync::atomic::fence(Ordering::SeqCst);
-                        if self.complex_waiters.load(Ordering::Acquire) != 0
-                            || ANY_WAITERS.count.load(Ordering::Acquire) != 0
-                        {
-                            notify_semaphore_complex(obj_key(self));
-                        }
-                    }
-                    return WaitResult::Object(0);
+                if cascade && self.count.load(Ordering::Acquire) > 0 {
+                    self.wake_after_take(true);
                 }
-                continue;
+                return WaitResult::Object(0);
             }
 
-            let timed_out = crate::thread::is_current_terminate_requested()
-                || deadline.is_some_and(|d| Instant::now() >= d);
-            if timed_out {
-                if sleeping {
-                    self.unregister_sleeper();
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.count.load(Ordering::Acquire) > 0 {
+                        self.wake_after_take(cascade);
+                    }
                 }
                 return WaitResult::Timeout;
             }
 
-            let expected = if !sleeping {
-                if sleepers == u16::MAX {
-                    std::thread::yield_now();
-                    continue;
-                }
-                let next = s + SEM_SLEEPER_INC;
-                if self
-                    .state
-                    .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_err()
-                {
-                    continue;
-                }
-                sleeping = true;
-                next
-            } else if waking > 0 {
-                // Woke from `__ulock_wait` but count was already taken (e.g. by a spinner):
-                // clear our waking token before sleeping again so future releases wake us.
-                let next = sem_pack(0, sleepers, waking - 1);
-                if self
-                    .state
-                    .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_err()
-                {
-                    continue;
-                }
-                next
-            } else {
-                s
-            };
+            waiter.park.arm();
+            self.queue.lock.lock();
+            if holds_in_flight {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                holds_in_flight = false;
+            }
+            unsafe { self.queue.push_tail_locked(node_ptr) };
+            self.sleepers.fetch_add(1, Ordering::SeqCst);
+            self.queue.lock.unlock();
 
-            match park::ulock_wait64(&self.state, expected, deadline) {
-                Some(sleep_us) => {
-                    let hit_deadline = deadline.is_some_and(|d| Instant::now() >= d);
-                    park::record_sleep_outcome(sleep_us, hit_deadline);
-                }
-                None => {
-                    self.unregister_sleeper();
-                    return WaitResult::Timeout;
-                }
-            }
-        }
-    }
+            // StoreLoad barrier pairing with `release()`'s `count` CAS + `fence(SeqCst)`.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
-    /// Unregister one direct sleeper on timeout/termination, passing on a wake if
-    /// units and other sleepers remain.
-    fn unregister_sleeper(&self) {
-        let mut s = self.state.load(Ordering::Acquire);
-        loop {
-            let count = (s & SEM_COUNT_MASK) as u32;
-            let sleepers = ((s & SEM_SLEEPER_MASK) >> SEM_SLEEPER_SHIFT) as u16;
-            let waking = ((s & SEM_WAKING_MASK) >> SEM_WAKING_SHIFT) as u16;
-            let new_sleepers = sleepers.saturating_sub(1);
-            let mut new_waking = waking.saturating_sub(1).min(new_sleepers);
-            let mut wake_op = WakeOp::None;
-            if count > 0 && new_sleepers > 0 && new_waking == 0 {
-                if count >= new_sleepers as u32 && new_sleepers > 1 {
-                    new_waking = new_sleepers;
-                    wake_op = WakeOp::All;
-                } else {
-                    new_waking = 1;
-                    wake_op = WakeOp::One;
+            if self.count.load(Ordering::Acquire) > 0 {
+                self.queue.lock.lock();
+                unsafe {
+                    if (*node_ptr).in_queue {
+                        self.queue.unlink_locked(node_ptr);
+                        self.sleepers.fetch_sub(1, Ordering::Relaxed);
+                    } else if (*node_ptr).popped_by_wake {
+                        holds_in_flight = true;
+                    }
+                }
+                self.queue.lock.unlock();
+                continue;
+            }
+
+            let interrupted = waiter.park.park_sleep_only(deadline);
+
+            self.queue.lock.lock();
+            unsafe {
+                if (*node_ptr).in_queue {
+                    self.queue.unlink_locked(node_ptr);
+                    self.sleepers.fetch_sub(1, Ordering::Relaxed);
+                } else if (*node_ptr).popped_by_wake {
+                    holds_in_flight = true;
                 }
             }
-            let next = sem_pack(count, new_sleepers, new_waking);
-            if self
-                .state
-                .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                if !matches!(wake_op, WakeOp::None) {
-                    park::execute_ulock_wake64(&self.state, wake_op);
+            self.queue.lock.unlock();
+            if interrupted {
+                if holds_in_flight {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.count.load(Ordering::Acquire) > 0 {
+                        self.wake_after_take(cascade);
+                    }
                 }
-                return;
+                return WaitResult::Timeout;
             }
-            s = self.state.load(Ordering::Acquire);
         }
     }
 
@@ -2150,59 +2258,49 @@ impl Semaphore {
         if n <= 0 {
             return None;
         }
+        let mut c = self.count.load(Ordering::Relaxed);
+        let prev_count = loop {
+            let next = c.checked_add(n)?;
+            if next > self.max {
+                return None;
+            }
+            match self
+                .count
+                .compare_exchange_weak(c, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => break c,
+                Err(v) => c = v,
+            }
+        };
+        std::sync::atomic::fence(Ordering::SeqCst);
         let cascade = sem_cascade();
-        let mut s = self.state.load(Ordering::Relaxed);
-        let prev_count;
-        let wake_op;
-        loop {
-            let cur = (s & SEM_COUNT_MASK) as i32;
-            let new_count = match cur.checked_add(n) {
-                Some(v) if v <= self.max => v as u32,
-                _ => return None,
-            };
-            let sleepers = ((s & SEM_SLEEPER_MASK) >> SEM_SLEEPER_SHIFT) as u16;
-            let waking = ((s & SEM_WAKING_MASK) >> SEM_WAKING_SHIFT) as u16;
-            let (new_waking, op) = if sleepers == 0 {
-                (0, WakeOp::None)
-            } else if cascade {
-                if waking > 0 {
-                    // Coalesce burst releases: a wake is already in flight and will
-                    // cascade if units remain when that sleeper runs.
-                    (waking, WakeOp::Coalesced)
-                } else if (n as u32) >= sleepers as u32 && sleepers > 1 {
-                    // Batch-wake all sleepers in one `ULF_WAKE_ALL` syscall.
-                    (sleepers, WakeOp::All)
+        if self.sleepers.load(Ordering::Acquire) > 0 {
+            if cascade {
+                if self.in_flight.load(Ordering::Acquire) > 0 {
+                    park::record_coalesced_wake_stat();
                 } else {
-                    (1, WakeOp::One)
+                    self.wake_one_local(true);
                 }
             } else {
-                let avail = sleepers.saturating_sub(waking) as usize;
-                let need = (n as usize).min(avail);
-                if need == 0 {
-                    (waking, WakeOp::Coalesced)
-                } else if need == avail && sleepers > 1 && (n as u32) >= sleepers as u32 {
-                    (sleepers, WakeOp::All)
-                } else if need == 1 {
-                    (waking + 1, WakeOp::One)
-                } else {
-                    (waking + need as u16, WakeOp::Many(need))
+                let mut batch = WakeBatch::new();
+                let mut popped = 0u32;
+                self.queue.lock.lock();
+                for _ in 0..(n as usize) {
+                    if let Some(w) = unsafe { self.queue.pop_tail_locked(false) } {
+                        batch.push(w);
+                        popped += 1;
+                    } else {
+                        break;
+                    }
                 }
-            };
-            let next = sem_pack(new_count, sleepers, new_waking);
-            match self
-                .state
-                .compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    prev_count = cur;
-                    wake_op = op;
-                    break;
+                if popped > 0 {
+                    self.sleepers.fetch_sub(popped, Ordering::Relaxed);
+                    self.in_flight.fetch_add(popped, Ordering::AcqRel);
                 }
-                Err(v) => s = v,
+                self.queue.lock.unlock();
+                batch.unpark_all();
             }
         }
-        park::execute_ulock_wake64(&self.state, wake_op);
-        std::sync::atomic::fence(Ordering::SeqCst);
         if self.complex_waiters.load(Ordering::Acquire) != 0
             || ANY_WAITERS.count.load(Ordering::Acquire) != 0
         {

@@ -3970,7 +3970,7 @@ pub const KNOBS: &[KnobSpec] = &[
         name: "PORT_WAIT_SPIN_US",
         aliases: &["AW2_WAIT_SPIN_US"],
         kind: KnobType::U64,
-        default: "40",
+        default: "16",
         description: "Maximum adaptive spin duration in microseconds before parking Win32 wait objects (0 disables spin).",
         affects_aot_key: false,
         crates: &["win32-rt"],

@@ -1,14 +1,16 @@
-//! Per-thread parking word, adaptive bounded spinning, and Darwin ulock helpers
-//! for kernel-object waits (`handles`) and user-mode sync (`sync`).
+//! Per-thread parking word, adaptive bounded spinning, and `WordLock` for
+//! kernel-object waits (`handles`) and user-mode sync (`sync`).
 //!
-//! A waiter arms its word, runs a short adaptive bounded spin (using ARM64
-//! `isb` + `ldaxr`/`wfe` bounded by both iteration count and monotonic wall
-//! time), and only then advertises `SLEEPING` and blocks in `__ulock_wait`.
-//! Threads that repeatedly enter long sleeps rapidly decay their spin budget
-//! to 0 so idle CPU is never regressed, with an occasional 2 µs probe to
-//! re-engage if the thread becomes active again.
+//! Each OS thread owns a 128-byte cache-line-aligned [`Parker`] word so
+//! `__ulock_wait` / `__ulock_wake` operate on distinct per-thread addresses with
+//! zero XNU kernel ulock-bucket contention. Before entering `__ulock_wait`,
+//! callers run a short, per-thread adaptive bounded spin (bounded by both
+//! iteration count and monotonic cycle time via `CNTVCT_EL0` on ARM64, and
+//! capped per wait object to at most 2 concurrent spinners to keep idle and
+//! burst-tail CPU minimal). Threads that repeatedly enter long sleeps rapidly
+//! decay their spin budget to `0` so idle CPU never regresses.
 //!
-//! `PORT_WAIT_SPIN_US` (alias `AW2_WAIT_SPIN_US`, default `40`, `0` = off):
+//! `PORT_WAIT_SPIN_US` (alias `AW2_WAIT_SPIN_US`, default `16`, `0` = off):
 //! maximum adaptive spin budget in microseconds before parking.
 //! `PORT_WAKE_STATS=1` (alias `AW2_WAKE_STATS=1`): log wake/sleep/spin stats
 //! every ~2 s.
@@ -24,23 +26,16 @@ extern "C" {
     fn __ulock_wake(op: u32, addr: *mut c_void, wake_value: u64) -> i32;
 }
 
-pub(crate) const UL_COMPARE_AND_WAIT: u32 = 1;
-pub(crate) const UL_COMPARE_AND_WAIT64: u32 = 5;
-pub(crate) const ULF_WAKE_ALL: u32 = 0x0000_0100;
-pub(crate) const ULF_NO_ERRNO: u32 = 0x0100_0000;
+const UL_COMPARE_AND_WAIT: u32 = 1;
+const ULF_NO_ERRNO: u32 = 0x0100_0000;
 
 /// Default maximum adaptive spin budget (µs) before parking in `__ulock_wait`.
-pub(crate) const DEFAULT_WAIT_SPIN_US: u64 = 40;
+pub(crate) const DEFAULT_WAIT_SPIN_US: u64 = 16;
 /// Hard upper bound on spin loop iterations regardless of clock speed.
-const MAX_SPIN_ITERS: u32 = 2048;
-/// Initial tight `spin_loop()` iterations before entering low-power `wfe` on ARM64.
-const TIGHT_SPIN_ITERS: u32 = 32;
-/// Minimum remaining deadline (µs) required before issuing a hardware `wfe`,
-/// preventing `wfe` event-stream granularity from overshooting short timeouts.
-const WFE_MIN_DEADLINE_US: u64 = 250;
+const MAX_SPIN_ITERS: u32 = 1024;
 /// Sleep duration (µs) above which a wait is considered an idle/long sleep for
 /// adaptive decay.
-const LONG_SLEEP_US: u64 = 250;
+const LONG_SLEEP_US: u64 = 200;
 /// Number of long sleeps between brief 2 µs probes once an idle thread has
 /// decayed to 0 spin budget.
 const IDLE_PROBE_INTERVAL: u16 = 16;
@@ -48,21 +43,6 @@ const IDLE_PROBE_INTERVAL: u16 = 16;
 const IDLE: u32 = 0;
 const NOTIFIED: u32 = 1;
 const SLEEPING: u32 = 2;
-
-/// Kernel wake action decided atomically by a notifier (`Event`/`Semaphore`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WakeOp {
-    /// No sleeping waiters exist (or all waiters are spinning in user space).
-    None,
-    /// A wake was already in flight; this signal was coalesced with zero syscall.
-    Coalesced,
-    /// Wake one sleeping waiter via `__ulock_wake`.
-    One,
-    /// Wake `n` sleeping waiters via `__ulock_wake`.
-    Many(usize),
-    /// Wake all sleeping waiters in one batched `ULF_WAKE_ALL` syscall.
-    All,
-}
 
 /// Cache-line aligned (128 B on Apple Silicon) per-thread parking word.
 #[repr(align(128))]
@@ -103,7 +83,6 @@ static KERNEL_WAKES: AtomicU64 = AtomicU64::new(0);
 static KERNEL_WAKE_NS: AtomicU64 = AtomicU64::new(0);
 static CHEAP_WAKES: AtomicU64 = AtomicU64::new(0);
 static COALESCED_WAKES: AtomicU64 = AtomicU64::new(0);
-static BATCH_WAKES: AtomicU64 = AtomicU64::new(0);
 static SLEEPS: AtomicU64 = AtomicU64::new(0);
 static SPIN_HITS: AtomicU64 = AtomicU64::new(0);
 static NEXT_REPORT_NS: AtomicU64 = AtomicU64::new(0);
@@ -125,14 +104,13 @@ fn maybe_report(now: u64) {
     let kw = KERNEL_WAKES.swap(0, Ordering::Relaxed);
     let ns = KERNEL_WAKE_NS.swap(0, Ordering::Relaxed);
     log::info!(
-        "wake-stats: kernel_wakes={} ({:.2} us avg) cheap_wakes={} sleeps={} spin_hits={} coalesced={} batch_wakes={}",
+        "wake-stats: kernel_wakes={} ({:.2} us avg) cheap_wakes={} sleeps={} spin_hits={} coalesced={}",
         kw,
         if kw > 0 { ns as f64 / kw as f64 / 1000.0 } else { 0.0 },
         CHEAP_WAKES.swap(0, Ordering::Relaxed),
         SLEEPS.swap(0, Ordering::Relaxed),
         SPIN_HITS.swap(0, Ordering::Relaxed),
         COALESCED_WAKES.swap(0, Ordering::Relaxed),
-        BATCH_WAKES.swap(0, Ordering::Relaxed),
     );
 }
 
@@ -217,68 +195,6 @@ pub(crate) fn ticks_to_us(ticks: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// ARM64 WFE exclusive-monitor pause helpers
-// ---------------------------------------------------------------------------
-
-/// Monitor `ptr` with `ldaxr` and enter low-power `wfe` if `*ptr == expected`.
-/// Any remote store to `ptr`'s cache line clears the exclusive monitor and wakes
-/// `wfe` in ~15 ns without spinning the pipeline or thrashing coherence traffic.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-pub(crate) unsafe fn wfe_while_u32_eq(ptr: *const AtomicU32, expected: u32) -> u32 {
-    let val: u32;
-    std::arch::asm!(
-        "ldaxr {val:w}, [{ptr}]",
-        "cmp {val:w}, {exp:w}",
-        "b.ne 1f",
-        "wfe",
-        "1:",
-        "clrex",
-        ptr = in(reg) ptr,
-        exp = in(reg) expected,
-        val = out(reg) val,
-        options(nostack),
-    );
-    val
-}
-
-/// Monitor `ptr` with `ldaxr` and enter low-power `wfe` while bit 0 is zero.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-pub(crate) unsafe fn wfe_while_u32_bit0_zero(ptr: *const AtomicU32) -> u32 {
-    let val: u32;
-    std::arch::asm!(
-        "ldaxr {val:w}, [{ptr}]",
-        "tbnz {val:w}, #0, 1f",
-        "wfe",
-        "1:",
-        "clrex",
-        ptr = in(reg) ptr,
-        val = out(reg) val,
-        options(nostack),
-    );
-    val
-}
-
-/// Monitor `ptr` with `ldaxr` and enter low-power `wfe` while the low 32 bits are zero.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-pub(crate) unsafe fn wfe_while_u64_low32_zero(ptr: *const AtomicU64) -> u64 {
-    let val: u64;
-    std::arch::asm!(
-        "ldaxr {val}, [{ptr}]",
-        "cbnz {val:w}, 1f",
-        "wfe",
-        "1:",
-        "clrex",
-        ptr = in(reg) ptr,
-        val = out(reg) val,
-        options(nostack),
-    );
-    val
-}
-
-// ---------------------------------------------------------------------------
 // Per-thread adaptive bounded spin controller
 // ---------------------------------------------------------------------------
 
@@ -344,9 +260,9 @@ impl ThreadSpinState {
                 self.budget_us /= 2;
             }
         } else if sleep_us < cap_us.saturating_mul(2) {
-            // Very short kernel sleep that just missed our spin window: gently expand.
+            // Very short sleep that just missed our spin window: gently expand.
             self.miss_streak = 0;
-            self.budget_us = self.budget_us.saturating_add(4).min(cap32);
+            self.budget_us = self.budget_us.saturating_add(2).min(cap32);
         } else {
             self.miss_streak = self.miss_streak.saturating_add(1);
             self.budget_us = (self.budget_us * 3) / 4;
@@ -358,13 +274,18 @@ thread_local! {
     static SPIN_STATE: Cell<ThreadSpinState> = const { Cell::new(ThreadSpinState::new()) };
 }
 
+#[inline(always)]
+pub(crate) fn spin_enabled() -> bool {
+    config().spin_max_us > 0
+}
+
 /// Compute the current thread's adaptive spin budget (µs), capped by `cap_us`
-/// and by any remaining time before `deadline`. Returns `(budget_us, allow_wfe)`.
+/// and by any remaining time before `deadline`.
 #[inline]
-pub(crate) fn adaptive_spin_budget(deadline: Option<Instant>, cap_us: u64) -> (u64, bool) {
+pub(crate) fn adaptive_spin_budget_us(deadline: Option<Instant>, cap_us: u64) -> u64 {
     let eff_cap = config().spin_max_us.min(cap_us);
     if eff_cap == 0 {
-        return (0, false);
+        return 0;
     }
     let mut budget = SPIN_STATE
         .try_with(|c| {
@@ -375,24 +296,20 @@ pub(crate) fn adaptive_spin_budget(deadline: Option<Instant>, cap_us: u64) -> (u
         })
         .unwrap_or(0);
     if budget == 0 {
-        return (0, false);
+        return 0;
     }
-    let allow_wfe = match deadline {
-        None => true,
-        Some(d) => {
-            let now = Instant::now();
-            if now >= d {
-                return (0, false);
-            }
-            let rem_us = (d - now).as_micros().min(u64::MAX as u128) as u64;
-            if rem_us == 0 {
-                return (0, false);
-            }
-            budget = budget.min(rem_us);
-            rem_us >= WFE_MIN_DEADLINE_US
+    if let Some(d) = deadline {
+        let now = Instant::now();
+        if now >= d {
+            return 0;
         }
-    };
-    (budget, allow_wfe)
+        let rem_us = (d - now).as_micros().min(u64::MAX as u128) as u64;
+        if rem_us == 0 {
+            return 0;
+        }
+        budget = budget.min(rem_us);
+    }
+    budget
 }
 
 #[inline]
@@ -416,15 +333,16 @@ pub(crate) fn record_sleep_outcome(sleep_us: u64, timed_out: bool) {
     });
 }
 
-/// Bounded adaptive spin for generic predicates (condvars, `WaitOnAddress`, SRW locks).
-/// Returns `true` if `check()` succeeded within the thread's adaptive spin budget.
+/// Bounded adaptive spin for wait predicates (events, semaphores, condvars,
+/// `WaitOnAddress`, SRW locks). Strictly bounded by both `MAX_SPIN_ITERS` and
+/// `budget_us` using zero-syscall `CNTVCT_EL0` ticks on ARM64.
 #[inline]
 pub(crate) fn spin_until(
     deadline: Option<Instant>,
     cap_us: u64,
     mut check: impl FnMut() -> bool,
 ) -> bool {
-    let (budget_us, _allow_wfe) = adaptive_spin_budget(deadline, cap_us);
+    let budget_us = adaptive_spin_budget_us(deadline, cap_us);
     if budget_us == 0 {
         return false;
     }
@@ -436,123 +354,12 @@ pub(crate) fn spin_until(
             return true;
         }
         std::hint::spin_loop();
-        if (i & 15) == 15 {
-            if crate::thread::is_current_terminate_requested() {
-                return false;
-            }
-            if ticks_now().wrapping_sub(start) >= max_ticks {
-                return false;
-            }
+        if (i & 15) == 15 && ticks_now().wrapping_sub(start) >= max_ticks {
+            return false;
         }
     }
     false
 }
-
-/// Bounded adaptive spin watching `u32` `word` until `check()` succeeds, using
-/// `ldaxr`/`wfe` after an initial tight `spin_loop()` phase on ARM64.
-#[inline]
-pub(crate) fn spin_until_u32_bit0(
-    word: &AtomicU32,
-    deadline: Option<Instant>,
-    mut check: impl FnMut() -> bool,
-) -> bool {
-    let (budget_us, allow_wfe) = adaptive_spin_budget(deadline, u64::MAX);
-    if budget_us == 0 {
-        return false;
-    }
-    let start = ticks_now();
-    let max_ticks = us_to_ticks(budget_us);
-    for i in 0..MAX_SPIN_ITERS {
-        if check() {
-            record_spin_hit();
-            return true;
-        }
-        #[cfg(target_arch = "aarch64")]
-        if allow_wfe && i >= TIGHT_SPIN_ITERS {
-            unsafe {
-                let _ = wfe_while_u32_bit0_zero(word as *const AtomicU32);
-            }
-            if crate::thread::is_current_terminate_requested() {
-                return false;
-            }
-            if ticks_now().wrapping_sub(start) >= max_ticks {
-                if check() {
-                    record_spin_hit();
-                    return true;
-                }
-                return false;
-            }
-            continue;
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        let _ = (word, allow_wfe);
-        std::hint::spin_loop();
-        if (i & 15) == 15 {
-            if crate::thread::is_current_terminate_requested() {
-                return false;
-            }
-            if ticks_now().wrapping_sub(start) >= max_ticks {
-                return false;
-            }
-        }
-    }
-    false
-}
-
-/// Bounded adaptive spin watching `u64` `word` until `check()` succeeds, using
-/// `ldaxr`/`wfe` on low-32-zero after an initial tight `spin_loop()` phase on ARM64.
-#[inline]
-pub(crate) fn spin_until_u64_low32(
-    word: &AtomicU64,
-    deadline: Option<Instant>,
-    mut check: impl FnMut() -> bool,
-) -> bool {
-    let (budget_us, allow_wfe) = adaptive_spin_budget(deadline, u64::MAX);
-    if budget_us == 0 {
-        return false;
-    }
-    let start = ticks_now();
-    let max_ticks = us_to_ticks(budget_us);
-    for i in 0..MAX_SPIN_ITERS {
-        if check() {
-            record_spin_hit();
-            return true;
-        }
-        #[cfg(target_arch = "aarch64")]
-        if allow_wfe && i >= TIGHT_SPIN_ITERS {
-            unsafe {
-                let _ = wfe_while_u64_low32_zero(word as *const AtomicU64);
-            }
-            if crate::thread::is_current_terminate_requested() {
-                return false;
-            }
-            if ticks_now().wrapping_sub(start) >= max_ticks {
-                if check() {
-                    record_spin_hit();
-                    return true;
-                }
-                return false;
-            }
-            continue;
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        let _ = (word, allow_wfe);
-        std::hint::spin_loop();
-        if (i & 15) == 15 {
-            if crate::thread::is_current_terminate_requested() {
-                return false;
-            }
-            if ticks_now().wrapping_sub(start) >= max_ticks {
-                return false;
-            }
-        }
-    }
-    false
-}
-
-// ---------------------------------------------------------------------------
-// Direct Darwin __ulock_wait / __ulock_wake wrappers (32-bit and 64-bit)
-// ---------------------------------------------------------------------------
 
 #[inline]
 fn deadline_timeout_us(deadline: Option<Instant>) -> Option<u32> {
@@ -569,116 +376,8 @@ fn deadline_timeout_us(deadline: Option<Instant>) -> Option<u32> {
     }
 }
 
-/// Block once in `__ulock_wait(UL_COMPARE_AND_WAIT)` while `*word == expected`.
-/// Returns elapsed sleep duration in microseconds (`None` if deadline already passed).
-#[inline]
-pub(crate) fn ulock_wait32(word: &AtomicU32, expected: u32, deadline: Option<Instant>) -> Option<u64> {
-    let timeout_us = deadline_timeout_us(deadline)?;
-    if config().stats {
-        SLEEPS.fetch_add(1, Ordering::Relaxed);
-    }
-    let t0 = ticks_now();
-    unsafe {
-        __ulock_wait(
-            UL_COMPARE_AND_WAIT | ULF_NO_ERRNO,
-            word.as_ptr() as *mut c_void,
-            expected as u64,
-            timeout_us,
-        );
-    }
-    Some(ticks_to_us(ticks_now().wrapping_sub(t0)))
-}
-
-/// Block once in `__ulock_wait(UL_COMPARE_AND_WAIT64)` while `*word == expected`.
-/// Returns elapsed sleep duration in microseconds (`None` if deadline already passed).
-#[inline]
-pub(crate) fn ulock_wait64(word: &AtomicU64, expected: u64, deadline: Option<Instant>) -> Option<u64> {
-    let timeout_us = deadline_timeout_us(deadline)?;
-    if config().stats {
-        SLEEPS.fetch_add(1, Ordering::Relaxed);
-    }
-    let t0 = ticks_now();
-    unsafe {
-        __ulock_wait(
-            UL_COMPARE_AND_WAIT64 | ULF_NO_ERRNO,
-            word.as_ptr() as *mut c_void,
-            expected,
-            timeout_us,
-        );
-    }
-    Some(ticks_to_us(ticks_now().wrapping_sub(t0)))
-}
-
-#[inline]
-fn ulock_wake_raw(op: u32, addr: *mut c_void, wake_op: WakeOp) {
-    let stats = config().stats;
-    match wake_op {
-        WakeOp::None => {
-            if stats {
-                CHEAP_WAKES.fetch_add(1, Ordering::Relaxed);
-                maybe_report(now_ns());
-            }
-        }
-        WakeOp::Coalesced => {
-            if stats {
-                COALESCED_WAKES.fetch_add(1, Ordering::Relaxed);
-                maybe_report(now_ns());
-            }
-        }
-        WakeOp::One => {
-            let t0 = stats.then(now_ns);
-            unsafe {
-                __ulock_wake(op | ULF_NO_ERRNO, addr, 0);
-            }
-            if let Some(t0) = t0 {
-                let t1 = now_ns();
-                KERNEL_WAKES.fetch_add(1, Ordering::Relaxed);
-                KERNEL_WAKE_NS.fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
-                maybe_report(t1);
-            }
-        }
-        WakeOp::Many(n) => {
-            let t0 = stats.then(now_ns);
-            for _ in 0..n {
-                unsafe {
-                    __ulock_wake(op | ULF_NO_ERRNO, addr, 0);
-                }
-            }
-            if let Some(t0) = t0 {
-                let t1 = now_ns();
-                KERNEL_WAKES.fetch_add(n as u64, Ordering::Relaxed);
-                KERNEL_WAKE_NS.fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
-                maybe_report(t1);
-            }
-        }
-        WakeOp::All => {
-            let t0 = stats.then(now_ns);
-            unsafe {
-                __ulock_wake(op | ULF_WAKE_ALL | ULF_NO_ERRNO, addr, 0);
-            }
-            if let Some(t0) = t0 {
-                let t1 = now_ns();
-                KERNEL_WAKES.fetch_add(1, Ordering::Relaxed);
-                BATCH_WAKES.fetch_add(1, Ordering::Relaxed);
-                KERNEL_WAKE_NS.fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
-                maybe_report(t1);
-            }
-        }
-    }
-}
-
-#[inline]
-pub(crate) fn execute_ulock_wake32(word: &AtomicU32, wake_op: WakeOp) {
-    ulock_wake_raw(UL_COMPARE_AND_WAIT, word.as_ptr() as *mut c_void, wake_op);
-}
-
-#[inline]
-pub(crate) fn execute_ulock_wake64(word: &AtomicU64, wake_op: WakeOp) {
-    ulock_wake_raw(UL_COMPARE_AND_WAIT64, word.as_ptr() as *mut c_void, wake_op);
-}
-
 // ---------------------------------------------------------------------------
-// Per-thread Parker (used for multi-object, alertable, mutex, timer, thread waits)
+// Per-thread Parker
 // ---------------------------------------------------------------------------
 
 impl Default for Parker {
@@ -697,83 +396,50 @@ impl Parker {
     }
 
     /// True if the owning thread is currently advertised as `SLEEPING` in `__ulock_wait`.
-    /// Used by LIFO wake selection to prefer waking an already-spinning thread first.
     #[inline]
     pub fn is_sleeping(&self) -> bool {
         self.word.load(Ordering::Relaxed) == SLEEPING
     }
 
-    /// Reset before re-checking/sleeping. Call before clearing `Waiter::notified`
-    /// and checking condition, so a notifier that observes `notified == false` is
-    /// guaranteed to call `unpark` strictly after `IDLE` is stored.
+    /// Reset before re-checking/sleeping.
     #[inline]
     pub fn arm(&self) {
         self.word.store(IDLE, Ordering::Release);
     }
 
-    /// Block until [`unpark`](Self::unpark), a spurious wake, or `deadline`.
-    /// Call without `WAIT_LOCK`; the caller re-checks its condition after.
-    pub fn park(&self, deadline: Option<Instant>) {
+    /// Block with adaptive bounded spin before sleeping in `__ulock_wait`.
+    /// Returns `true` if `__ulock_wait` was interrupted by `EINTR` for a pending
+    /// `TerminateThread` request.
+    pub fn park(&self, deadline: Option<Instant>) -> bool {
         if self.word.load(Ordering::Acquire) == NOTIFIED {
-            return;
+            return false;
         }
-        let (budget_us, allow_wfe) = adaptive_spin_budget(deadline, u64::MAX);
-        if budget_us > 0 {
-            let start = ticks_now();
-            let max_ticks = us_to_ticks(budget_us);
-            for i in 0..MAX_SPIN_ITERS {
-                if self.word.load(Ordering::Acquire) == NOTIFIED {
-                    record_spin_hit();
-                    return;
-                }
-                #[cfg(target_arch = "aarch64")]
-                if allow_wfe && i >= TIGHT_SPIN_ITERS {
-                    let v = unsafe { wfe_while_u32_eq(&self.word, IDLE) };
-                    if v == NOTIFIED || self.word.load(Ordering::Acquire) == NOTIFIED {
-                        record_spin_hit();
-                        return;
-                    }
-                    if crate::thread::is_current_terminate_requested() {
-                        return;
-                    }
-                    if ticks_now().wrapping_sub(start) >= max_ticks {
-                        break;
-                    }
-                    continue;
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                let _ = allow_wfe;
-                std::hint::spin_loop();
-                if (i & 15) == 15 {
-                    if crate::thread::is_current_terminate_requested() {
-                        return;
-                    }
-                    if ticks_now().wrapping_sub(start) >= max_ticks {
-                        break;
-                    }
-                }
-            }
+        if spin_until(deadline, u64::MAX, || self.word.load(Ordering::Acquire) == NOTIFIED) {
+            return false;
         }
-        if crate::thread::is_current_terminate_requested() {
-            return;
+        self.park_sleep_only(deadline)
+    }
+
+    /// Block directly in `__ulock_wait` without an additional spin phase (used
+    /// when the caller already performed its object-level capped spin).
+    /// Returns `true` if `__ulock_wait` was interrupted by `EINTR` for a pending
+    /// `TerminateThread` request.
+    pub fn park_sleep_only(&self, deadline: Option<Instant>) -> bool {
+        if self.word.load(Ordering::Acquire) == NOTIFIED {
+            return false;
         }
         if self
             .word
             .compare_exchange(IDLE, SLEEPING, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            if budget_us > 0 {
-                record_spin_hit();
-            }
-            return; // already notified
+            return false; // already notified
         }
         let cfg = config();
         let sleep_start = ticks_now();
         let mut timed_out = false;
+        let mut interrupted = false;
         loop {
-            if crate::thread::is_current_terminate_requested() {
-                break;
-            }
             let Some(timeout_us) = deadline_timeout_us(deadline) else {
                 timed_out = true;
                 break;
@@ -781,18 +447,22 @@ impl Parker {
             if cfg.stats {
                 SLEEPS.fetch_add(1, Ordering::Relaxed);
             }
-            unsafe {
+            let rc = unsafe {
                 __ulock_wait(
                     UL_COMPARE_AND_WAIT | ULF_NO_ERRNO,
                     self.addr(),
                     SLEEPING as u64,
                     timeout_us,
-                );
-            }
+                )
+            };
             if self.word.load(Ordering::Acquire) != SLEEPING {
                 let sleep_us = ticks_to_us(ticks_now().wrapping_sub(sleep_start));
                 record_sleep_outcome(sleep_us, false);
-                return;
+                return false;
+            }
+            if rc == -libc::EINTR && crate::thread::is_current_terminate_requested() {
+                interrupted = true;
+                break;
             }
         }
         // Timed out or interrupted for termination: stop advertising SLEEPING so later notifiers skip the syscall.
@@ -801,6 +471,7 @@ impl Parker {
             .compare_exchange(SLEEPING, IDLE, Ordering::AcqRel, Ordering::Acquire);
         let sleep_us = ticks_to_us(ticks_now().wrapping_sub(sleep_start));
         record_sleep_outcome(sleep_us, timed_out);
+        interrupted
     }
 
     /// Wake the owner; enters the kernel only if it is actually asleep.
@@ -829,7 +500,7 @@ impl Parker {
 }
 
 /// Minimal mutex word for very short critical sections (`handles::WAIT_LOCK`, wait
-/// buckets): CAS fast path, bounded exponential-backoff spin while the holder is
+/// queues): CAS fast path, bounded exponential-backoff spin while the holder is
 /// running, then `__ulock_wait` (Drepper's three-state futex mutex).
 pub struct WordLock {
     /// 0 unlocked, 1 locked, 2 locked with (possible) sleepers.
@@ -949,48 +620,27 @@ mod tests {
     }
 
     #[test]
-    fn ulock64_wait_and_wake_all() {
-        let word = Arc::new(AtomicU64::new(0));
-        let mut threads = Vec::new();
-        for _ in 0..4 {
-            let w = Arc::clone(&word);
-            threads.push(std::thread::spawn(move || {
-                while w.load(Ordering::Acquire) == 0 {
-                    let _ = ulock_wait64(&w, 0, Some(Instant::now() + Duration::from_secs(2)));
-                }
-                assert_eq!(w.load(Ordering::Acquire), 1);
-            }));
-        }
-        std::thread::sleep(Duration::from_millis(15));
-        word.store(1, Ordering::Release);
-        execute_ulock_wake64(&word, WakeOp::All);
-        for t in threads {
-            t.join().unwrap();
-        }
-    }
-
-    #[test]
     fn adaptive_spin_decays_to_zero_on_long_sleeps_and_ramps_on_hits() {
         let mut st = ThreadSpinState::new();
-        assert_eq!(st.next_budget_us(40), 4);
+        assert_eq!(st.next_budget_us(16), 4);
         // Three long sleeps must decay budget to 0.
-        st.on_sleep_done(500, false, 40);
+        st.on_sleep_done(500, false, 16);
         assert_eq!(st.budget_us, 2);
-        st.on_sleep_done(500, false, 40);
+        st.on_sleep_done(500, false, 16);
         assert_eq!(st.budget_us, 1);
-        st.on_sleep_done(500, false, 40);
+        st.on_sleep_done(500, false, 16);
         assert_eq!(st.budget_us, 0);
         // Next 16 calls return 0 (no spinning while idle), then one 2 us probe.
         for _ in 0..IDLE_PROBE_INTERVAL {
-            assert_eq!(st.next_budget_us(40), 0);
+            assert_eq!(st.next_budget_us(16), 0);
         }
-        assert_eq!(st.next_budget_us(40), 2);
-        // A spin hit immediately ramps up.
-        st.on_spin_hit(40);
+        assert_eq!(st.next_budget_us(16), 2);
+        // A spin hit immediately ramps up to cap.
+        st.on_spin_hit(16);
         assert!(st.budget_us >= 4);
-        for _ in 0..5 {
-            st.on_spin_hit(40);
+        for _ in 0..4 {
+            st.on_spin_hit(16);
         }
-        assert_eq!(st.budget_us, 40);
+        assert_eq!(st.budget_us, 16);
     }
 }
