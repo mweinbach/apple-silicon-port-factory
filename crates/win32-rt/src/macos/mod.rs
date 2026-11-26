@@ -736,6 +736,7 @@ pub fn task_dialog_alert<F, T>(
     buttons: Vec<String>,
     button_enabled: Vec<bool>,
     default_button_idx: Option<usize>,
+    cancel_button_idx: Option<usize>,
     allow_cancellation: bool,
     radios: Vec<String>,
     radio_enabled: Vec<bool>,
@@ -766,6 +767,7 @@ where
             &buttons,
             &button_enabled,
             default_button_idx,
+            cancel_button_idx,
             allow_cancellation,
             &radios,
             &radio_enabled,
@@ -793,6 +795,7 @@ where
                 &buttons,
                 &button_enabled,
                 default_button_idx,
+                cancel_button_idx,
                 allow_cancellation,
                 &radios,
                 &radio_enabled,
@@ -820,6 +823,7 @@ where
                 &buttons,
                 &button_enabled,
                 default_button_idx,
+                cancel_button_idx,
                 allow_cancellation,
                 &radios,
                 &radio_enabled,
@@ -860,6 +864,7 @@ where
             buttons,
             button_enabled,
             default_button_idx,
+            cancel_button_idx,
             allow_cancellation,
             radios,
             radio_enabled,
@@ -1067,6 +1072,8 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static LAST_TEST_TASK_DIALOG_VERIFICATION_ENABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static LAST_TEST_TASK_DIALOG_CANCEL_BUTTON_IDX: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -1090,6 +1097,11 @@ pub(crate) fn last_test_task_dialog_verification_enabled() -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn last_test_task_dialog_cancel_button_idx() -> Option<usize> {
+    LAST_TEST_TASK_DIALOG_CANCEL_BUTTON_IDX.with(|c| c.get())
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn invoke_test_task_dialog_presenter(
     caption: &str,
@@ -1099,6 +1111,7 @@ fn invoke_test_task_dialog_presenter(
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
+    cancel_button_idx: Option<usize>,
     allow_cancellation: bool,
     radios: &[String],
     radio_enabled: &[bool],
@@ -1110,6 +1123,7 @@ fn invoke_test_task_dialog_presenter(
 ) -> Option<TaskDialogOutcome> {
     LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION.with(|c| c.set(allow_cancellation));
     LAST_TEST_TASK_DIALOG_VERIFICATION_ENABLED.with(|c| c.set(verification_enabled));
+    LAST_TEST_TASK_DIALOG_CANCEL_BUTTON_IDX.with(|c| c.set(cancel_button_idx));
     TEST_TASK_DIALOG_PRESENTER.with(|cell| {
         cell.borrow_mut().as_mut().map(|f| {
             f(

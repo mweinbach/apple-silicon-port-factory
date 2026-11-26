@@ -1415,29 +1415,33 @@ enum DeferredModalStop {
 }
 
 /// Compute the replacement `NSButton` key equivalent for a TaskDialog action button
-/// when `nDefaultButton` selects an explicit default button.
+/// based on explicit default and `IDCANCEL` button indices (never by inspecting caption text).
 ///
-/// Moves Return (`"\r"`) to `def_idx` and clears Return from any other button that
-/// AppKit defaulted to Return, while preserving AppKit's automatic Escape (`"\u{1b}"`)
-/// binding on Cancel buttons (and restoring Escape if Cancel was at index 0).
+/// - Assigns Return (`"\r"`) to `custom_default` and strips AppKit's default Return from
+///   non-default buttons.
+/// - Assigns Escape (`"\u{1b}"`) to `cancel_idx` (unless `cancel_idx` is the effective default
+///   button) regardless of its localized caption.
+/// - Strips AppKit's title-based Escape binding from any button that is not `cancel_idx`.
 fn task_dialog_button_key_equivalent(
     idx: usize,
-    title: &str,
     existing_key_equiv: &str,
     custom_default: Option<usize>,
+    cancel_idx: Option<usize>,
 ) -> Option<&'static str> {
-    let def_idx = custom_default?;
-    if idx == def_idx {
-        Some("\r")
-    } else if existing_key_equiv == "\r" {
-        if title.eq_ignore_ascii_case("cancel") {
-            Some("\u{1b}")
-        } else {
-            Some("")
-        }
-    } else {
-        None
+    let effective_default = custom_default.unwrap_or(0);
+    if custom_default == Some(idx) {
+        return Some("\r");
     }
+    if cancel_idx == Some(idx) && idx != effective_default {
+        return if existing_key_equiv == "\u{1b}" { None } else { Some("\u{1b}") };
+    }
+    if custom_default.is_some() && existing_key_equiv == "\r" {
+        return Some("");
+    }
+    if existing_key_equiv == "\u{1b}" {
+        return Some("");
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -1590,6 +1594,7 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
     let mut noop = |_ev: super::TaskDialogEvent| {};
     let mut noop_timer = |_ms: u32| false;
     let mut origin = std::time::Instant::now();
+    let cancel_idx = buttons.iter().position(|b| b.eq_ignore_ascii_case("cancel"));
     match task_dialog_alert_inline(
         0,
         caption,
@@ -1599,6 +1604,7 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         buttons,
         &[],
         None,
+        cancel_idx,
         false,
         &[],
         &[],
@@ -1855,6 +1861,7 @@ fn run_task_dialog_alert(
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
+    cancel_button_idx: Option<usize>,
     allow_cancellation: bool,
     radios: &[String],
     radio_enabled: &[bool],
@@ -1882,13 +1889,14 @@ fn run_task_dialog_alert(
     a.setInformativeText(&NSString::from_str(text));
     a.setAlertStyle(if critical { NSAlertStyle::Critical } else { NSAlertStyle::Warning });
     let custom_default = default_button_idx.filter(|&idx| idx < buttons.len());
+    let cancel_idx = cancel_button_idx.filter(|&idx| idx < buttons.len());
     let mut action_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(buttons.len());
     let mut has_escape_button = false;
     for (idx, b) in buttons.iter().enumerate() {
         let btn = a.addButtonWithTitle(&NSString::from_str(b));
         let existing_eq = btn.keyEquivalent().to_string();
         if let Some(new_eq) =
-            task_dialog_button_key_equivalent(idx, b, &existing_eq, custom_default)
+            task_dialog_button_key_equivalent(idx, &existing_eq, custom_default, cancel_idx)
         {
             let eq = NSString::from_str(new_eq);
             let _: () = unsafe { msg_send![&*btn, setKeyEquivalent: &*eq] };
@@ -2145,6 +2153,7 @@ pub(super) fn task_dialog_alert_channel(
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
+    cancel_button_idx: Option<usize>,
     allow_cancellation: bool,
     radios: &[String],
     radio_enabled: &[bool],
@@ -2165,6 +2174,7 @@ pub(super) fn task_dialog_alert_channel(
         buttons,
         button_enabled,
         default_button_idx,
+        cancel_button_idx,
         allow_cancellation,
         radios,
         radio_enabled,
@@ -2247,6 +2257,7 @@ pub(super) fn task_dialog_alert_inline(
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
+    cancel_button_idx: Option<usize>,
     allow_cancellation: bool,
     radios: &[String],
     radio_enabled: &[bool],
@@ -2314,6 +2325,7 @@ pub(super) fn task_dialog_alert_inline(
         buttons,
         button_enabled,
         default_button_idx,
+        cancel_button_idx,
         allow_cancellation,
         radios,
         radio_enabled,
@@ -4114,45 +4126,53 @@ mod tests {
 
     #[test]
     fn task_dialog_default_button_preserves_cancel_escape_shortcut() {
-        // OK + Cancel with explicit nDefaultButton = IDOK (idx 0):
+        // OK (IDOK) + Cancel (IDCANCEL) with explicit nDefaultButton = IDOK (idx 0):
         // OK keeps Return, Cancel keeps AppKit's automatic Escape ("\u{1b}").
         assert_eq!(
-            task_dialog_button_key_equivalent(0, "OK", "\r", Some(0)),
+            task_dialog_button_key_equivalent(0, "\r", Some(0), Some(1)),
             Some("\r")
         );
         assert_eq!(
-            task_dialog_button_key_equivalent(1, "Cancel", "\u{1b}", Some(0)),
+            task_dialog_button_key_equivalent(1, "\u{1b}", Some(0), Some(1)),
             None
         );
 
-        // Yes + No + Cancel with explicit nDefaultButton = IDNO (idx 1):
-        // Yes loses Return, No gets Return, Cancel preserves Escape.
+        // Localized "Abbrechen" with IDCANCEL (idx 2) and explicit nDefaultButton = IDNO (idx 1):
+        // Yes loses Return, No gets Return, Abbrechen receives Escape even though its caption != "Cancel".
         assert_eq!(
-            task_dialog_button_key_equivalent(0, "Yes", "\r", Some(1)),
+            task_dialog_button_key_equivalent(0, "\r", Some(1), Some(2)),
             Some("")
         );
         assert_eq!(
-            task_dialog_button_key_equivalent(1, "No", "", Some(1)),
+            task_dialog_button_key_equivalent(1, "", Some(1), Some(2)),
             Some("\r")
         );
         assert_eq!(
-            task_dialog_button_key_equivalent(2, "Cancel", "\u{1b}", Some(1)),
-            None
+            task_dialog_button_key_equivalent(2, "", Some(1), Some(2)),
+            Some("\u{1b}")
         );
+
+        // Localized "Abbrechen" with IDCANCEL (idx 1) and NO explicit default button:
+        // idx 0 keeps Return, idx 1 gets Escape.
+        assert_eq!(task_dialog_button_key_equivalent(0, "\r", None, Some(1)), None);
+        assert_eq!(task_dialog_button_key_equivalent(1, "", None, Some(1)), Some("\u{1b}"));
 
         // Cancel placed first (idx 0, AppKit defaulted it to "\r") with nDefaultButton = IDOK (idx 1):
         // Cancel moves from Return to Escape, OK gets Return.
         assert_eq!(
-            task_dialog_button_key_equivalent(0, "Cancel", "\r", Some(1)),
+            task_dialog_button_key_equivalent(0, "\r", Some(1), Some(0)),
             Some("\u{1b}")
         );
         assert_eq!(
-            task_dialog_button_key_equivalent(1, "OK", "", Some(1)),
+            task_dialog_button_key_equivalent(1, "", Some(1), Some(0)),
             Some("\r")
         );
 
-        // No explicit default button: AppKit's native Return/Escape assignments stay untouched.
-        assert_eq!(task_dialog_button_key_equivalent(0, "OK", "\r", None), None);
-        assert_eq!(task_dialog_button_key_equivalent(1, "Cancel", "\u{1b}", None), None);
+        // Unrelated custom button titled "Cancel" (nButtonID != IDCANCEL, so cancel_idx = None):
+        // AppKit's title-based Escape binding must be stripped so Escape does not click it.
+        assert_eq!(task_dialog_button_key_equivalent(0, "\r", None, None), None);
+        assert_eq!(task_dialog_button_key_equivalent(1, "\u{1b}", None, None), Some(""));
+        assert_eq!(task_dialog_button_key_equivalent(1, "\u{1b}", Some(0), Some(2)), Some(""));
+        assert_eq!(task_dialog_button_key_equivalent(2, "", Some(0), Some(2)), Some("\u{1b}"));
     }
 }

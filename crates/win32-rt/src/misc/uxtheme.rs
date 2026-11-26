@@ -1309,6 +1309,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         }
 
         let labels: Vec<String> = snap.buttons.iter().map(|(_, l)| l.clone()).collect();
+        let cancel_button_idx = snap.buttons.iter().position(|(id, _)| *id == IDCANCEL);
         let has_selection_controls =
             !snap.radio_labels.is_empty() || snap.verification_text.is_some();
         let timer_interval = snap.callback_timer.then_some(TASK_DIALOG_TIMER_INTERVAL);
@@ -1324,6 +1325,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             labels,
             snap.button_enabled.clone(),
             snap.default_button_idx,
+            cancel_button_idx,
             snap.allow_cancellation,
             snap.radio_labels,
             snap.radio_enabled,
@@ -3965,6 +3967,83 @@ mod tests {
                 2,
                 "enabled verification checkbox must deliver both TDM_CLICK_VERIFICATION and toggle events"
             );
+
+            // 3. Localized custom button with nButtonID = IDCANCEL ("Abbrechen") forwards
+            //    cancel_button_idx = Some(1), while a custom action titled "Cancel" with a
+            //    non-IDCANCEL button ID forwards cancel_button_idx = None.
+            let ok_lbl = crate::strings::to_wide_z("Weiter");
+            let de_cancel_lbl = crate::strings::to_wide_z("Abbrechen");
+            let custom_cancel_lbl = crate::strings::to_wide_z("Cancel");
+            let localized_btns = [
+                TaskDialogButton { button_id: 100, button_text: ok_lbl.as_ptr() },
+                TaskDialogButton { button_id: IDCANCEL, button_text: de_cancel_lbl.as_ptr() },
+            ];
+            let mut lcfg: TaskDialogConfig = std::mem::zeroed();
+            lcfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            lcfg.psz_window_title = title.as_ptr();
+            lcfg.c_buttons = localized_btns.len() as u32;
+            lcfg.p_buttons = localized_btns.as_ptr();
+            lcfg.n_default_button = 100;
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                |_cap, _body, _links, _prog, btns, _be, db, _rads, _re, _dr, _vt, _vc, _emit| {
+                    assert_eq!(btns, &["Weiter".to_string(), "Abbrechen".to_string()]);
+                    assert_eq!(db, Some(0));
+                    assert_eq!(
+                        crate::macos::last_test_task_dialog_cancel_button_idx(),
+                        Some(1),
+                        "localized IDCANCEL button must be identified by ID, not caption"
+                    );
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 1,
+                        radio_index: None,
+                        verified: false,
+                    })
+                },
+            )));
+            let mut lbtn = 0;
+            assert_eq!(
+                TaskDialogIndirect(
+                    &lcfg as *const TaskDialogConfig as *const u8,
+                    &mut lbtn,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                S_OK
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(lbtn, IDCANCEL);
+
+            let non_cancel_btns = [
+                TaskDialogButton { button_id: 100, button_text: ok_lbl.as_ptr() },
+                TaskDialogButton { button_id: 101, button_text: custom_cancel_lbl.as_ptr() },
+            ];
+            lcfg.p_buttons = non_cancel_btns.as_ptr();
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                |_cap, _body, _links, _prog, btns, _be, _db, _rads, _re, _dr, _vt, _vc, _emit| {
+                    assert_eq!(btns, &["Weiter".to_string(), "Cancel".to_string()]);
+                    assert_eq!(
+                        crate::macos::last_test_task_dialog_cancel_button_idx(),
+                        None,
+                        "custom button titled 'Cancel' with ID != IDCANCEL must not get cancel_button_idx"
+                    );
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: None,
+                        verified: false,
+                    })
+                },
+            )));
+            assert_eq!(
+                TaskDialogIndirect(
+                    &lcfg as *const TaskDialogConfig as *const u8,
+                    &mut lbtn,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                S_OK
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(lbtn, 100);
         })
         .join()
         .unwrap();
