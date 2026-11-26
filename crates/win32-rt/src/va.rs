@@ -71,6 +71,18 @@ macro_rules! win64_varargs_thunk {
             a4: u64, a5: u64, a6: u64, a7: u64,
             a8: u64, a9: u64, a10: u64, a11: u64,
         ) -> i32 {
+            // When invoked from translated x86-64 guest code, home the 4 register args
+            // into the caller's Win64 32-byte shadow space at `[rsp_lo + 0x00..0x20]` so
+            // `[rsp_lo..]` exposes the complete, unbounded Win64 variadic argument list
+            // (identical to the x86_64 naked thunk, not truncated at 12 slots).
+            let (rsp_lo, rsp_hi) = crate::incoming_rsp();
+            if rsp_lo != 0 && rsp_hi.saturating_sub(rsp_lo) >= 0x20 {
+                std::ptr::write_unaligned(rsp_lo as *mut u64, a0);
+                std::ptr::write_unaligned((rsp_lo + 8) as *mut u64, a1);
+                std::ptr::write_unaligned((rsp_lo + 16) as *mut u64, a2);
+                std::ptr::write_unaligned((rsp_lo + 24) as *mut u64, a3);
+                return $imp(rsp_lo as *const u64);
+            }
             let args = [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11];
             $imp(args.as_ptr())
         }

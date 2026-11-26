@@ -1020,6 +1020,8 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
 /// Thread teardown: FLS callbacks, DLL_THREAD_DETACH, signal waiters, release
 /// the borrowed TSD slots, and schedule custom stack reclamation.
 pub fn finish_current_thread(code: u32) {
+    crate::user32::misc::forget_thread_hotkeys(teb::thread_id());
+    crate::kernel32::process::clear_current_thread_execution_state();
     ACT_SLOT.with(|c| c.set(std::ptr::null()));
     let obj = current_thread_object();
     if let Some(ref obj) = obj {
