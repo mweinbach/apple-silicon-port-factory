@@ -1,4 +1,4 @@
-//! FastOp lowering and execution for the x87 FPU instruction family (`K_X87 = 131`).
+//! FastOp lowering and execution for the x87 FPU instruction family (`K_X87 = 140`).
 //!
 //! Covers all 92 mnemonics in `X87_FPU_STATE_ARITH` (with `fnop`/`fneni`/`fndisi`/`fnsetpm`
 //! lowered to `K_NOP`) plus the x87 control/init ops (`fninit`, `finit`, `fldcw`, `fnstcw`,
@@ -19,7 +19,7 @@ use crate::emu::{Cpu, OpKind, Register};
 use iced_x86::{Instruction, MemorySize, Mnemonic};
 
 /// Pre-decoded x87 FPU instruction (`FastOp::x & 0x3F` holds the `X87_*` sub-op).
-pub(in crate::emu) const K_X87: u8 = 131;
+pub(in crate::emu) const K_X87: u8 = 140;
 
 /// Bit flags in `FastOp::imm` for `K_X87` environment bookkeeping (`FIP`/`FDP`/`FOP`):
 /// low 11 bits hold the x87 opcode (`((escape & 7) << 8) | modrm`).

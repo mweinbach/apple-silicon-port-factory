@@ -1156,6 +1156,7 @@ impl Tr<'_> {
                 }
                 self.vstore_dst(op);
             }
+            K_VEXT_RR..=K_MMX_MISC => self.emit_mmx_gather_op(k, op),
             _ => unreachable!("unsupported op kind {}", op.kind),
         }
     }
@@ -2109,6 +2110,7 @@ impl Tr<'_> {
         let is_exp = (op.x & 1) != 0;
         let is_msk = (op.x & 2) != 0;
         let is_vex = (op.x & 4) != 0;
+        let is_long = (op.x & 8) != 0;
         let mem = (op.x & 0x20) != 0;
         let imm = op.imm as u8;
         let is_words = (imm & 1) != 0;
@@ -2148,13 +2150,23 @@ impl Tr<'_> {
         // Compute T0 = a_len, T1 = b_len.
         if is_exp {
             for (dst, src_g) in [(T0, g(0)), (T1, g(2))] {
-                self.a.sbfm(false, dst, src_g, 0, 31);
-                let pos = self.a.tbz(dst, 31);
-                self.a.addsub_rr(false, true, false, dst, ZR, dst, 0);
-                self.a.bind(pos);
-                self.a.movz(false, T2, n_elems, 0);
-                self.a.addsub_rr(false, true, true, ZR, dst, T2, 0);
-                self.a.csel(false, dst, T2, dst, HI);
+                if is_long {
+                    self.a.mov_rr(true, dst, src_g);
+                    let pos = self.a.tbz(dst, 63);
+                    self.a.addsub_rr(true, true, false, dst, ZR, dst, 0);
+                    self.a.bind(pos);
+                    self.a.movz(true, T2, n_elems, 0);
+                    self.a.addsub_rr(true, true, true, ZR, dst, T2, 0);
+                    self.a.csel(true, dst, T2, dst, HI);
+                } else {
+                    self.a.sbfm(false, dst, src_g, 0, 31);
+                    let pos = self.a.tbz(dst, 31);
+                    self.a.addsub_rr(false, true, false, dst, ZR, dst, 0);
+                    self.a.bind(pos);
+                    self.a.movz(false, T2, n_elems, 0);
+                    self.a.addsub_rr(false, true, true, ZR, dst, T2, 0);
+                    self.a.csel(false, dst, T2, dst, HI);
+                }
             }
         } else {
             for (dst, base_ptr) in [(T0, XA), (T1, XS)] {

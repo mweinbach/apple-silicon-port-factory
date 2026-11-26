@@ -60,7 +60,7 @@ pub(in crate::emu) fn supported(op: &FastOp) -> bool {
             | K_CMPJ_RR
             | K_CMPJ_RI
             | K_CMPJ_RM
-            | K_VSHUF_RR..=K_VVNNI_RM
+            | K_VSHUF_RR..=K_MMX_MISC
             | K_X87
     )
 }
@@ -408,8 +408,17 @@ pub(super) fn op_flags(op: &FastOp) -> (u8, u8) {
                 (0, 0)
             }
         }
-        K_VAES_RR | K_VAES_RM | K_VSHA_RR | K_VSHA_RM | K_VGFNI_RR | K_VGFNI_RM | K_VVNNI_RR
-        | K_VVNNI_RM | K_VCVT_PH | K_VMASKMOV => (0, 0),
+        K_VAES_RR
+        | K_VAES_RM
+        | K_VSHA_RR
+        | K_VSHA_RM
+        | K_VGFNI_RR
+        | K_VGFNI_RM
+        | K_VVNNI_RR
+        | K_VVNNI_RM
+        | K_VCVT_PH
+        | K_VMASKMOV
+        | K_VEXT_RR..=K_MMX_MISC => (0, 0),
         K_SYS_MISC => match op.x & 0x3F {
             0 => (FC | FZ | FS | FP, 0),
             1 => (0, FC | FZ | FS | FP),
@@ -749,15 +758,15 @@ impl Tr<'_> {
         for op in &self.ops[..body] {
             let mode = op.w & 3;
             let reads_ymm = match op.kind {
-                K_YMM_LANE | K_INSN | K_VMASKMOV => true,
+                K_YMM_LANE | K_INSN | K_VMASKMOV | K_VGATHER => true,
                 K_SYS_MISC if matches!(op.x & 0x3F, 4 | 5 | 7 | 14 | 15 | 16) => true,
                 K_VST => (op.w >> 4) >= 5,
                 K_MOVMSK => (op.x & 1) != 0,
                 K_VCVT_PD => mode == VM_V256 || (op.w & 4) != 0,
                 K_VCVT_PH => mode == VM_V256 || ((op.x & 0x1F) != 0 && op.w != 0),
                 K_VSHUF_RR | K_VSHUF_RM | K_VINT_RR | K_VINT_RM | K_VFP_RR | K_VFP_RM
-                | K_VTEST_RR | K_VTEST_RM | K_VBROADCAST | K_PMOVX | K_VBLENDV_RR
-                | K_VBLENDV_RM | K_VFMA_RR | K_VFMA_RM
+                | K_VEXT_RR | K_VEXT_RM | K_VTEST_RR | K_VTEST_RM | K_VBROADCAST | K_PMOVX
+                | K_VBLENDV_RR | K_VBLENDV_RM | K_VFMA_RR | K_VFMA_RM
                 | K_VAES_RR | K_VAES_RM | K_VSHA_RR | K_VSHA_RM | K_VGFNI_RR | K_VGFNI_RM
                 | K_VVNNI_RR | K_VVNNI_RM => mode == VM_V256,
                 _ => false,
@@ -767,8 +776,8 @@ impl Tr<'_> {
             }
             match op.kind {
                 K_VSHUF_RR | K_VSHUF_RM | K_VINT_RR | K_VINT_RM | K_VFP_RR | K_VFP_RM
-                | K_MOVD_XG | K_CVTSI_R | K_CVTSI_M | K_VBROADCAST | K_PMOVX
-                | K_VBLENDV_RR | K_VBLENDV_RM
+                | K_VEXT_RR | K_VEXT_RM | K_MOVD_XG | K_CVTSI_R | K_CVTSI_M | K_VBROADCAST
+                | K_PMOVX | K_VBLENDV_RR | K_VBLENDV_RM
                     if mode == VM_V128 =>
                 {
                     mask |= 1u16 << (op.r0 & 15);
@@ -831,6 +840,8 @@ impl Tr<'_> {
                         | K_VFP_RM
                         | K_VINT_RM
                         | K_VST
+                        | K_MMX_VSHUF_RM
+                        | K_MMX_VINT_RM
                 );
                 if is_mem {
                     live32 = 0xFFFF;

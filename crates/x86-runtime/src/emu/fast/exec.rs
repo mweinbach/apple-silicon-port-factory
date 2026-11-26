@@ -1302,6 +1302,7 @@ pub(in crate::emu) fn verifiable(kind: u8) -> bool {
             | K_INSN
             | K_LOOP
             | K_VCVT_PH..=K_PCMPSTR
+            | K_MASKMOV_B..=K_MMX_MISC
             | K_X87
     )
 }

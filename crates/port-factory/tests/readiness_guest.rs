@@ -109,6 +109,9 @@ void mainCRTStartup(void) {
     __asm__ volatile ("movd %1, %%mm0; cvtpi2ps %%mm0, %%xmm0; movd %%xmm0, %0; emms"
         : "=r"(converted) : "r"(2) : "mm0", "xmm0");
     if (converted != 0x40000000u) ExitProcess(43); // float32 2.0
+    unsigned shld_mem = 0x12345678u;
+    __asm__ volatile ("shldl $4, %1, %0" : "+m"(shld_mem) : "r"(0x9ABCDEF0u) : "cc");
+    if (shld_mem != 0x23456789u) ExitProcess(44);
 #ifdef EXERCISE_ABORT
     __asm__ volatile ("rdpkru" : : "c"(0) : "eax", "edx");
 #endif
@@ -133,7 +136,10 @@ void mainCRTStartup(void) {
         };
         assert!(!reports("fld1", "interpreter_only"));
         assert!(!reports("fld1", "unimplemented"));
-        assert!(reports("cvtpi2ps", "interpreter_only"));
+        assert!(!ops
+            .iter()
+            .any(|op| op.get("mnemonic").and_then(|v| v.as_str()) == Some("cvtpi2ps")));
+        assert!(reports("shld", "interpreter_only"));
         assert_eq!(reports("rdpkru", "unimplemented"), abort);
         let aot = dir.join(format!("{name}-aot"));
         for mode in ["jit", "prewarm", "aot"] {

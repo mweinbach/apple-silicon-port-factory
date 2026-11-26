@@ -209,6 +209,7 @@ pub(super) unsafe fn execute(cpu: &mut Cpu, ins: &Instruction) -> bool {
         }
         st.valid_mask = 0xff;
         st.top = 0;
+        st.sync_top();
         super::regfile_ext::x87_restore(st);
     }
     true

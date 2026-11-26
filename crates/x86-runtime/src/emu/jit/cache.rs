@@ -101,7 +101,22 @@ fn fast_gpr_writes(op: &FastOp, ins: &iced_x86::Instruction) -> Option<u16> {
         | K_VGFNI_RR
         | K_VGFNI_RM
         | K_VVNNI_RR
-        | K_VVNNI_RM => 0,
+        | K_VVNNI_RM
+        | K_VEXT_RR
+        | K_VEXT_RM
+        | K_MASKMOV_B
+        | K_VGATHER
+        | K_MMX_VSHUF_RR
+        | K_MMX_VSHUF_RM
+        | K_MMX_VINT_RR
+        | K_MMX_VINT_RM => 0,
+        K_MMX_MISC => {
+            if matches!(op.x & 0x3F, MMX_MOVD_GM | MMX_MOVQ_GM | MMX_PEXTRW | MMX_PMOVMSKB) {
+                r0
+            } else {
+                0
+            }
+        }
         K_ALU_RR | K_ALU_RI | K_ALU_RM => {
             if matches!(op.x & 0x3F, A_CMP | A_TEST) {
                 0

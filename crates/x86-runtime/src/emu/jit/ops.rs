@@ -790,7 +790,7 @@ impl Tr<'_> {
                 }
             }
             K_VSHUF_RR | K_VSHUF_RM | K_VINT_RR | K_VINT_RM | K_VFP_RR | K_VFP_RM => self.vop(k, &op),
-            K_BSWAP_R..=K_VVNNI_RM => self.ext_op(k, &op),
+            K_BSWAP_R..=K_MMX_MISC => self.ext_op(k, &op),
             K_X87 => self.emit_x87_op(k, &op),
             _ => unreachable!("unsupported op kind {}", op.kind),
         }

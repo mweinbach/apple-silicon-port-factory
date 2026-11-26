@@ -23,6 +23,7 @@
 mod decode;
 mod exec;
 mod ext;
+mod mmx_gather;
 mod more;
 mod x87;
 #[cfg(test)]
@@ -34,6 +35,16 @@ pub(super) use exec::{exec, run_chain, verifiable};
 pub(super) use ext::{
     K_BMI_RM, K_BMI_RR, K_INSN, K_LOOP, K_PMOVX, K_VBLENDV_RM, K_VBLENDV_RR, K_VBROADCAST,
     K_VCVT_PD, K_VFMA_RM, K_VFMA_RR, K_VTEST_RM, K_VTEST_RR, K_YMM_LANE,
+};
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_imports))]
+pub(super) use mmx_gather::{
+    K_MASKMOV_B, K_MMX_MISC, K_MMX_VINT_RM, K_MMX_VINT_RR, K_MMX_VSHUF_RM, K_MMX_VSHUF_RR,
+    K_VEXT_RM, K_VEXT_RR, K_VGATHER, MMX_CVTPD2PI_R, MMX_CVTPI2PD_M, MMX_CVTPI2PD_R,
+    MMX_CVTPI2PS_M, MMX_CVTPI2PS_R, MMX_CVTPS2PI_R, MMX_CVTTPD2PI_M, MMX_CVTTPD2PI_R,
+    MMX_CVTTPS2PI_M, MMX_CVTTPS2PI_R, MMX_EMMS, MMX_MOVD_GM, MMX_MOVD_MEM_M, MMX_MOVD_MG,
+    MMX_MOVD_MM, MMX_MOVDQ2Q, MMX_MOVQ2DQ, MMX_MOVQ_GM, MMX_MOVQ_MEM_M, MMX_MOVQ_MG, MMX_MOVQ_MM,
+    MMX_MOVQ_MR, MMX_PEXTRW, MMX_PINSRW_M, MMX_PINSRW_R, MMX_PMOVMSKB, MMX_VI_PHADDSW,
+    MMX_VI_PHSUBSW, VX_MPSADBW, VX_PHADDSW, VX_PHMINPOSUW, VX_PHSUBSW,
 };
 #[cfg_attr(not(target_arch = "aarch64"), allow(unused_imports))]
 pub(super) use more::{

@@ -37,6 +37,7 @@ pub(super) use cache::total_jit_blocks_compiled;
 mod emit;
 mod ext;
 mod lazy;
+mod mmx_gather;
 mod more;
 mod ops;
 mod stubs;
@@ -123,6 +124,9 @@ pub(super) struct JitScratch {
     /// Address of the shared sharded spinlock table ([`crate::emu::cpu::atomic_locks_ptr`])
     /// for 16-byte-boundary-crossing LOCK operations.
     pub atomic_locks: usize,
+    /// Address of this thread's architectural [`crate::emu::regfile_ext::X87State`] (`TLS_X87`)
+    /// for direct native ARM64 MMX/x87 state aliasing without host function relocations.
+    pub x87_state: usize,
     /// Cached TEB self pointer (`gs:[0x30]`) for `%gs:` segment-prefixed memory accesses.
     pub teb: u64,
     /// `emu_run_full` context for [`super::jit_host_xfer`] (host calls made from translated
@@ -155,8 +159,6 @@ pub(super) struct JitScratch {
     pub mxcsr: u32,
     /// Embedding thread FPCR for native calls made directly by generated code.
     pub host_fpcr: u64,
-    /// Per-thread x87 FPU state pointer ([`crate::emu::x87::x87_state_ptr`]), refreshed on entry.
-    pub x87_state: usize,
     /// Static native Rust x87 helper function table ([`crate::emu::x87::x87_helpers_ptr`]),
     /// allowing AOT & signed static Mach-O blocks to call soft-float80 / transcendental helpers
     /// with zero runtime relocations.
@@ -182,7 +184,7 @@ impl Default for JitScratch {
             mul: 0,
             codegen: 0,
             atomic_locks: super::cpu::atomic_locks_ptr(),
-            x87_state: 0,
+            x87_state: super::x87::x87_state_ptr(),
             x87_helpers: super::x87::x87_helpers_ptr(),
             teb: 0,
             ctx_sp: 0,
@@ -827,6 +829,9 @@ const OFF_CODEGEN: u32 = OFF_JX + offset_of!(JitScratch, codegen) as u32;
 const OFF_ATOMIC_LOCKS: u32 = OFF_JX + offset_of!(JitScratch, atomic_locks) as u32;
 const OFF_X87_STATE: u32 = OFF_JX + offset_of!(JitScratch, x87_state) as u32;
 const OFF_X87_HELPERS: u32 = OFF_JX + offset_of!(JitScratch, x87_helpers) as u32;
+const X87_OFF_REGS: i32 = offset_of!(super::regfile_ext::X87State, regs) as i32;
+const X87_OFF_TOP: u32 = offset_of!(super::regfile_ext::X87State, top) as u32;
+const X87_OFF_VALID_MASK: u32 = offset_of!(super::regfile_ext::X87State, valid_mask) as u32;
 const OFF_TEB: u32 = OFF_JX + offset_of!(JitScratch, teb) as u32;
 const OFF_RAS: u32 = OFF_JX + offset_of!(JitScratch, ras) as u32;
 const OFF_AOTDIR: u32 = OFF_JX + offset_of!(JitScratch, aot_dir) as u32;
@@ -850,6 +855,10 @@ const _: () = assert!(
         && OFF_X87_STATE < 8 * 4096
         && OFF_X87_HELPERS % 8 == 0
         && OFF_X87_HELPERS < 8 * 4096
+        && X87_OFF_REGS >= 0
+        && X87_OFF_REGS + 128 <= 255
+        && X87_OFF_TOP < 4096
+        && X87_OFF_VALID_MASK < 4096
         && OFF_ENTROPY_FN % 8 == 0
         && OFF_ENTROPY_FN < 8 * 4096
         && OFF_AOTDIR % 8 == 0
