@@ -36,737 +36,19 @@ pub fn is_valid_guest_range(addr: u64, bytes: usize) -> bool {
 }
 
 // =================================================================================================
-// 80-bit extended-precision x87 FPU stack + status word (`fld m64`, `fprem`, `fnstsw ax`,
-// `fstp st(i)`, `fstp m64`)
+// Shared 80-bit extended-precision x87 FPU state (re-exported from `emu::x87`)
 // =================================================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-enum Fp80Kind {
-    #[default]
-    Zero,
-    Finite,
-    Inf,
-    Nan,
-}
-
-/// Exact 80-bit x87 extended-precision register value (`1` sign bit, unbiased exponent, `64`-bit
-/// explicit-integer significand with bit 63 = integer bit `J`).
-///
-/// Retaining all 64 significand bits across `fprem` iterations is required for bit-exactness when
-/// `exp(ST(0)) - exp(ST(1)) >= 64` (`C2 = 1` partial remainder loop): intermediate remainders can
-/// carry up to 54 significant bits before the final step reduces below `|ST(1)|`, whereas rounding
-/// intermediates to `f64` (53 bits) loses the low bit.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-struct Fp80 {
-    kind: Fp80Kind,
-    sign: u8,
-    exp: i32,
-    sig: u64,
-}
-
-impl Fp80 {
-    /// Convert IEEE-754 `f64` bits to 80-bit extended precision, setting `SW.IE` (bit 0) and
-    /// quieting on signaling NaN, or setting `SW.DE` (bit 1) and normalizing on subnormal input,
-    /// matching `fld qword ptr [mem]` on x86-64 hardware.
-    #[inline]
-    fn from_f64_bits(bits: u64, sw: &mut u16) -> Self {
-        let sign = (bits >> 63) as u8;
-        let e = ((bits >> 52) & 0x7FF) as u32;
-        let f = bits & 0x000F_FFFF_FFFF_FFFF;
-        if e == 0x7FF {
-            if f == 0 {
-                Self { kind: Fp80Kind::Inf, sign, exp: 0, sig: 1u64 << 63 }
-            } else {
-                if (f & 0x0008_0000_0000_0000) == 0 {
-                    *sw |= 0x0001; // IE: signaling NaN loaded by `fld m64`
-                }
-                Self {
-                    kind: Fp80Kind::Nan,
-                    sign,
-                    exp: 0,
-                    sig: (1u64 << 63) | (1u64 << 62) | (f << 11),
-                }
-            }
-        } else if e == 0 {
-            if f == 0 {
-                Self { kind: Fp80Kind::Zero, sign, exp: 0, sig: 0 }
-            } else {
-                *sw |= 0x0002; // DE: denormal operand normalized on `fld m64`
-                let clz = f.leading_zeros() as i32; // f in 1..2^52 -> clz in 12..=63
-                Self {
-                    kind: Fp80Kind::Finite,
-                    sign,
-                    exp: -1011 - clz,
-                    sig: f << (clz as u32),
-                }
-            }
-        } else {
-            Self {
-                kind: Fp80Kind::Finite,
-                sign,
-                exp: (e as i32) - 1023,
-                sig: (1u64 << 63) | (f << 11),
-            }
-        }
-    }
-
-    fn is_signaling_nan(self) -> bool {
-        self.kind == Fp80Kind::Nan && self.sig & (1 << 62) == 0
-    }
-
-    /// Round 80-bit extended precision back to IEEE-754 `f64` bits (round-to-nearest, ties-to-even),
-    /// matching `fstp qword ptr [mem]` under the default x87 control word (`0x037F`).
-    #[inline]
-    fn to_f64_bits(self, sw: &mut u16) -> u64 {
-        let s = (self.sign as u64) << 63;
-        match self.kind {
-            Fp80Kind::Zero => s,
-            Fp80Kind::Inf => s | 0x7FF0_0000_0000_0000,
-            Fp80Kind::Nan => {
-                if self.is_signaling_nan() {
-                    *sw |= 0x0001; // IE
-                }
-                let f = ((self.sig >> 11) & 0x000F_FFFF_FFFF_FFFF) | 0x0008_0000_0000_0000;
-                s | 0x7FF0_0000_0000_0000 | f
-            }
-            Fp80Kind::Finite => {
-                let mut exp = self.exp;
-                let sig = self.sig;
-                if exp > 1023 {
-                    *sw |= 0x0028; // OE | PE
-                    return s | 0x7FF0_0000_0000_0000;
-                }
-                if exp >= -1022 {
-                    let mut hi = sig >> 11;
-                    let rem = sig & 0x7FF;
-                    if rem != 0 {
-                        *sw |= 0x0020; // PE
-                    }
-                    if rem > 0x400 || (rem == 0x400 && (hi & 1) != 0) {
-                        hi += 1;
-                        if hi == (1u64 << 53) {
-                            hi >>= 1;
-                            exp += 1;
-                            if exp > 1023 {
-                                *sw |= 0x0008; // OE
-                                return s | 0x7FF0_0000_0000_0000;
-                            }
-                        }
-                    }
-                    s | (((exp + 1023) as u64) << 52) | (hi & 0x000F_FFFF_FFFF_FFFF)
-                } else {
-                    let shr = -1011 - exp;
-                    if shr >= 64 {
-                        *sw |= 0x0030; // UE | PE
-                        if shr == 64 && (sig & 0x7FFF_FFFF_FFFF_FFFF) != 0 {
-                            return s | 1;
-                        }
-                        return s;
-                    }
-                    let shr_u = shr as u32;
-                    let mut hi = sig >> shr_u;
-                    let half = 1u64 << (shr_u - 1);
-                    let rem = sig & ((1u64 << shr_u) - 1);
-                    if rem != 0 {
-                        *sw |= 0x0030; // UE | PE
-                    }
-                    if rem > half || (rem == half && (hi & 1) != 0) {
-                        hi += 1;
-                    }
-                    s | hi
-                }
-            }
-        }
-    }
-
-    /// Decode a raw x87 slot without quieting signaling NaNs. Each instruction applies its own exceptions.
-    #[inline]
-    fn from_f80_bytes(b: [u8; 10]) -> Self {
-        let sig = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        let se = u16::from_le_bytes([b[8], b[9]]);
-        let sign = (se >> 15) as u8;
-        let e = (se & 0x7FFF) as i32;
-        if e == 0x7FFF {
-            if (sig & 0x7FFF_FFFF_FFFF_FFFF) == 0 {
-                Self { kind: Fp80Kind::Inf, sign, exp: 0, sig: 1u64 << 63 }
-            } else {
-                Self { kind: Fp80Kind::Nan, sign, exp: 0, sig }
-            }
-        } else if e == 0 {
-            if sig == 0 {
-                Self { kind: Fp80Kind::Zero, sign, exp: 0, sig: 0 }
-            } else {
-                let clz = sig.leading_zeros() as i32;
-                Self { kind: Fp80Kind::Finite, sign, exp: -16382 - clz, sig: sig << (clz as u32) }
-            }
-        } else if sig == 0 {
-            Self { kind: Fp80Kind::Zero, sign, exp: 0, sig: 0 }
-        } else {
-            let clz = sig.leading_zeros() as i32;
-            Self { kind: Fp80Kind::Finite, sign, exp: (e - 16383) - clz, sig: sig << (clz as u32) }
-        }
-    }
-
-    /// Encode [`Fp80`] into 10 little-endian bytes (`m80fp`).
-    #[inline]
-    fn to_f80_bytes(self) -> [u8; 10] {
-        let s = (self.sign as u16) << 15;
-        let (sig, se) = match self.kind {
-            Fp80Kind::Zero => (0u64, s),
-            Fp80Kind::Inf => (1u64 << 63, s | 0x7FFF),
-            Fp80Kind::Nan => (self.sig | (1u64 << 63), s | 0x7FFF),
-            Fp80Kind::Finite => {
-                let biased = self.exp + 16383;
-                if biased >= 0x7FFF {
-                    (1u64 << 63, s | 0x7FFF)
-                } else if biased > 0 {
-                    (self.sig, s | (biased as u16))
-                } else {
-                    let shr = (1 - biased) as u32;
-                    let sub_sig = if shr >= 64 { 0 } else { self.sig >> shr };
-                    (sub_sig, s)
-                }
-            }
-        };
-        let mut out = [0u8; 10];
-        out[0..8].copy_from_slice(&sig.to_le_bytes());
-        out[8..10].copy_from_slice(&se.to_le_bytes());
-        out
-    }
-
-    /// Exact conversion of a signed 64-bit integer to [`Fp80`] (all 64 significand bits preserved).
-    #[inline]
-    fn from_i64(v: i64) -> Self {
-        if v == 0 {
-            return Self { kind: Fp80Kind::Zero, sign: 0, exp: 0, sig: 0 };
-        }
-        let sign = (v < 0) as u8;
-        let mag = v.unsigned_abs();
-        let clz = mag.leading_zeros() as i32;
-        Self { kind: Fp80Kind::Finite, sign, exp: 63 - clz, sig: mag << (clz as u32) }
-    }
-
-    /// Convert [`Fp80`] to a signed `bits`-bit (`16`, `32`, or `64`) integer for `fist`/`fistp`/`fisttp`.
-    /// Returns the Intel integer indefinite (`1 << (bits - 1)`) and sets `SW.IE` on NaN/Inf/overflow.
-    #[inline]
-    fn to_int_bits(self, bits: u32, truncate: bool, sw: &mut u16) -> u64 {
-        let indef = 1u64 << (bits - 1);
-        let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-        match self.kind {
-            Fp80Kind::Zero => 0,
-            Fp80Kind::Inf | Fp80Kind::Nan => {
-                *sw |= 0x0001; // IE
-                indef
-            }
-            Fp80Kind::Finite => {
-                let mag = if self.exp < 0 {
-                    *sw |= 0x0020; // PE
-                    if !truncate && self.exp == -1 && self.sig > (1u64 << 63) {
-                        1u64
-                    } else {
-                        0u64
-                    }
-                } else if self.exp >= 63 {
-                    if bits == 64 && self.sign != 0 && self.exp == 63 && self.sig == (1u64 << 63) {
-                        return indef; // exact i64::MIN, no IE
-                    }
-                    *sw |= 0x0001; // IE
-                    return indef;
-                } else {
-                    let shift = (63 - self.exp) as u32;
-                    let mut m = self.sig >> shift;
-                    let frac = self.sig & ((1u64 << shift) - 1);
-                    if frac != 0 {
-                        *sw |= 0x0020; // PE
-                        if !truncate {
-                            let half = 1u64 << (shift - 1);
-                            if frac > half || (frac == half && (m & 1) != 0) {
-                                m += 1;
-                            }
-                        }
-                    }
-                    m
-                };
-                let max_pos = (1u64 << (bits - 1)) - 1;
-                let max_neg = 1u64 << (bits - 1);
-                if self.sign == 0 {
-                    if mag > max_pos {
-                        *sw |= 0x0001; // IE
-                        indef
-                    } else {
-                        mag & mask
-                    }
-                } else if mag > max_neg {
-                    *sw |= 0x0001; // IE
-                    indef
-                } else {
-                    0u64.wrapping_sub(mag) & mask
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum X87Source {
-    St(u8),
-    Value(f64),
-}
-
-/// Architectural x87 register-stack state (`ST(0)..ST(7)` around `top`, `SW` status word, `tag`
-/// mask where bit `phys` is `1` iff physical slot `phys` is non-empty).
-///
-/// `#[repr(C)]`: translated ARM64 MMX/x87 code addresses `regs`, `top`, and `valid_mask` by
-/// compile-time `offset_of!` via `Cpu::jx.x87_state`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(C)]
-pub struct X87State {
-    // Store the architectural bytes so state transfers preserve SNaNs, unsupported encodings,
-    // and the contents of empty slots without an arithmetic conversion.
-    pub(super) regs: [[u8; 10]; 8],
-    pub(super) cw: u16,
-    pub(super) fop: u16,
-    pub(super) fip: u64,
-    pub(super) fdp: u64,
-    pub(super) top: u8,
-    pub(super) sw: u16,
-    pub(super) valid_mask: u8,
-}
-
-impl Default for X87State {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl X87State {
-    #[inline]
-    pub const fn new() -> Self {
-        Self {
-            regs: [[0; 10]; 8],
-            cw: 0x037f,
-            fop: 0,
-            fip: 0,
-            fdp: 0,
-            top: 0,
-            sw: 0,
-            valid_mask: 0,
-        }
-    }
-
-    #[inline(always)]
-    pub(super) fn phys(&self, i: u8) -> usize {
-        (self.top.wrapping_add(i) & 7) as usize
-    }
-
-    fn value(&self, slot: usize) -> Fp80 {
-        Fp80::from_f80_bytes(self.regs[slot])
-    }
-
-    fn raw_denormal(&self, slot: usize) -> bool {
-        let raw = &self.regs[slot];
-        self.valid_mask & (1 << slot) != 0 && raw[8] == 0 && raw[9] & 0x7f == 0 && raw[..8] != [0; 8]
-    }
-
-    #[inline(always)]
-    fn sync_top(&mut self) {
-        self.sw = (self.sw & !(7u16 << 11)) | (((self.top & 7) as u16) << 11);
-    }
-
-    #[inline]
-    pub fn status_word(&self) -> u16 {
-        (self.sw & !(7u16 << 11)) | (((self.top & 7) as u16) << 11)
-    }
-
-    /// Read `ST(idx)` as IEEE-754 f64 bits without mutating the x87 stack or status word.
-    #[inline]
-    pub fn peek_f64_bits(&self, idx: u8) -> Option<u64> {
-        let p = self.phys(idx);
-        if (self.valid_mask & (1 << p)) == 0 {
-            return None;
-        }
-        let mut sw = self.sw;
-        Some(self.value(p).to_f64_bits(&mut sw))
-    }
-
-    #[inline]
-    pub fn push_f64_bits(&mut self, bits: u64) {
-        let mut sw = self.sw & !0x0200; // C1 cleared on non-overflow push
-        let val = Fp80::from_f64_bits(bits, &mut sw);
-        self.push_fp80(val, sw);
-    }
-
-    #[inline]
-    pub fn pop_to_st(&mut self, idx: u8) {
-        let p0 = self.phys(0);
-        let pi = self.phys(idx);
-        let v = self.regs[p0];
-        if idx != 0 {
-            self.regs[pi] = v;
-            self.valid_mask |= 1 << pi;
-        }
-        self.valid_mask &= !(1 << p0);
-        self.top = self.top.wrapping_add(1) & 7;
-        self.sw &= !0x0200; // C1 = 0
-        self.sync_top();
-    }
-
-    #[inline]
-    pub fn pop_f64_bits(&mut self) -> u64 {
-        let p0 = self.phys(0);
-        let mut sw = self.sw & !0x0200; // C1 = 0
-        let out = if (self.valid_mask & (1 << p0)) == 0 {
-            // Stack underflow (`SF | IE`): store QNaN Indefinite.
-            sw |= 0x0041;
-            0xFFF8_0000_0000_0000
-        } else {
-            let v = self.value(p0);
-            self.valid_mask &= !(1 << p0);
-            v.to_f64_bits(&mut sw)
-        };
-        self.top = self.top.wrapping_add(1) & 7;
-        self.sw = sw;
-        self.sync_top();
-        out
-    }
-
-    /// Execute x87 `fprem` (`D9 F8`): `ST(0) <- remainder(ST(0), ST(1))` truncated toward zero,
-    /// updating `C0` (`Q2`, bit 8), `C1` (`Q0`, bit 9), `C2` (incomplete flag, bit 10), and `C3`
-    /// (`Q1`, bit 14) in `SW`.
-    ///
-    /// Matches Intel SDM Vol. 2A `FPREM` and x86-64 hardware / Rosetta 2 bit-for-bit:
-    /// - `d = exp(ST(0)) - exp(ST(1)) < 64`: complete reduction in one step (`C2 = 0`,
-    ///   `(C0, C3, C1) = (Q2, Q1, Q0)`, zero remainder preserves `ST(0)` sign).
-    /// - `d >= 64`: partial reduction by `N = 32 + (d & 31)` (`32..=63`), setting `C2 = 1` and
-    ///   clearing `C0 = C1 = C3 = 0` so `fnstsw ax; shr eax, 8; push rax; popfq; jp loop`
-    ///   (`PF = C2`) repeats until `d < 64`.
-    #[inline]
-    pub fn fprem(&mut self) {
-        const C_MASK: u16 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14);
-        self.sw &= !C_MASK;
-        let p0 = self.phys(0);
-        let p1 = self.phys(1);
-        if (self.valid_mask & (1 << p0)) == 0 || (self.valid_mask & (1 << p1)) == 0 {
-            self.sw |= 0x0041; // SF | IE (stack underflow)
-            self.regs[p0] = Fp80 {
-                kind: Fp80Kind::Nan,
-                sign: 1,
-                exp: 0,
-                sig: 0xC000_0000_0000_0000,
-            }.to_f80_bytes();
-            self.valid_mask |= 1 << p0;
-            self.sync_top();
-            return;
-        }
-        let a = self.value(p0);
-        let b = self.value(p1);
-
-        if a.kind == Fp80Kind::Nan || b.kind == Fp80Kind::Nan {
-            if a.is_signaling_nan() || b.is_signaling_nan() {
-                self.sw |= 0x0001; // IE before quieting the selected NaN.
-            }
-            let mut res = if a.kind == Fp80Kind::Nan && b.kind == Fp80Kind::Nan {
-                let pa = a.sig & 0x3FFF_FFFF_FFFF_FFFF;
-                let pb = b.sig & 0x3FFF_FFFF_FFFF_FFFF;
-                if pa > pb {
-                    a
-                } else if pb > pa {
-                    b
-                } else {
-                    Fp80 { sign: a.sign & b.sign, ..a }
-                }
-            } else if a.kind == Fp80Kind::Nan {
-                a
-            } else {
-                b
-            };
-            res.sig |= 1u64 << 62;
-            self.regs[p0] = res.to_f80_bytes();
-            self.sync_top();
-            return;
-        }
-
-        if a.kind == Fp80Kind::Inf || b.kind == Fp80Kind::Zero {
-            self.sw |= 0x0001; // IE -> QNaN Indefinite (`0xFFF8_0000_0000_0000` in f64)
-            self.regs[p0] = Fp80 {
-                kind: Fp80Kind::Nan,
-                sign: 1,
-                exp: 0,
-                sig: 0xC000_0000_0000_0000,
-            }.to_f80_bytes();
-            self.sync_top();
-            return;
-        }
-
-        // A NaN or invalid remainder takes priority over a denormal operand.
-        if self.raw_denormal(p0) || self.raw_denormal(p1) {
-            self.sw |= 0x0002;
-        }
-        if a.kind == Fp80Kind::Zero || b.kind == Fp80Kind::Inf {
-            // Exact remainder is `a` (including `-0.0` sign); quotient Q = 0 -> C0=C1=C2=C3=0.
-            self.sync_top();
-            return;
-        }
-
-        let d = a.exp - b.exp;
-        if d < 0 {
-            // |a| < |b|: Q = 0, ST(0) unchanged (sign preserved), C0=C1=C2=C3=0.
-            self.sync_top();
-            return;
-        }
-
-        if d < 64 {
-            let num = (a.sig as u128) << (d as u32);
-            let den = b.sig as u128;
-            let q = num / den;
-            let rem = (num % den) as u64;
-            let q3 = (q & 7) as u32;
-            if (q3 & 1) != 0 {
-                self.sw |= 1 << 9; // C1 = Q0
-            }
-            if (q3 & 2) != 0 {
-                self.sw |= 1 << 14; // C3 = Q1
-            }
-            if (q3 & 4) != 0 {
-                self.sw |= 1 << 8; // C0 = Q2
-            }
-            if rem == 0 {
-                self.regs[p0] = Fp80 { kind: Fp80Kind::Zero, sign: a.sign, exp: 0, sig: 0 }.to_f80_bytes();
-            } else {
-                let clz = rem.leading_zeros() as i32;
-                self.regs[p0] = Fp80 {
-                    kind: Fp80Kind::Finite,
-                    sign: a.sign,
-                    exp: b.exp - clz,
-                    sig: rem << (clz as u32),
-                }.to_f80_bytes();
-            }
-        } else {
-            let n = 32 + (d & 31);
-            let num = (a.sig as u128) << (n as u32);
-            let rem = (num % (b.sig as u128)) as u64;
-            self.sw |= 1 << 10; // C2 = 1 (incomplete reduction; PF=1 after shr eax,8; push rax; popfq)
-            if rem == 0 {
-                self.regs[p0] = Fp80 { kind: Fp80Kind::Zero, sign: a.sign, exp: 0, sig: 0 }.to_f80_bytes();
-            } else {
-                let clz = rem.leading_zeros() as i32;
-                self.regs[p0] = Fp80 {
-                    kind: Fp80Kind::Finite,
-                    sign: a.sign,
-                    exp: (a.exp - n) - clz,
-                    sig: rem << (clz as u32),
-                }.to_f80_bytes();
-            }
-        }
-        self.sync_top();
-    }
-
-    #[inline]
-    fn push_fp80(&mut self, val: Fp80, extra_sw: u16) {
-        self.push_bytes(val.to_f80_bytes(), extra_sw);
-    }
-
-    fn push_bytes(&mut self, val: [u8; 10], extra_sw: u16) {
-        let mut sw = (self.sw & !0x0200) | extra_sw;
-        let new_top = self.top.wrapping_sub(1) & 7;
-        let p = new_top as usize;
-        if (self.valid_mask & (1 << p)) != 0 {
-            sw |= 0x0241; // SF | IE | C1
-            self.regs[p] = Fp80 {
-                kind: Fp80Kind::Nan,
-                sign: 1,
-                exp: 0,
-                sig: 0xC000_0000_0000_0000,
-            }.to_f80_bytes();
-        } else {
-            self.regs[p] = val;
-            self.valid_mask |= 1 << p;
-        }
-        self.top = new_top;
-        self.sw = sw;
-        self.sync_top();
-    }
-
-    #[inline]
-    pub fn pop_discard(&mut self) {
-        let p0 = self.phys(0);
-        self.valid_mask &= !(1 << p0);
-        self.top = self.top.wrapping_add(1) & 7;
-        self.sw &= !0x0200;
-        self.sync_top();
-    }
-
-    #[inline]
-    pub fn clear_exceptions(&mut self) {
-        self.sw &= !0x80FF;
-        self.sync_top();
-    }
-
-    #[inline]
-    pub fn free_st(&mut self, idx: u8) {
-        let pi = self.phys(idx & 7);
-        self.valid_mask &= !(1 << pi);
-    }
-
-    #[inline]
-    pub fn freep_st(&mut self, idx: u8) {
-        let pi = self.phys(idx & 7);
-        self.valid_mask &= !(1 << pi);
-        self.top = self.top.wrapping_add(1) & 7;
-        self.sync_top();
-    }
-
-    #[inline]
-    pub fn fxam(&mut self) {
-        const C_MASK: u16 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14);
-        self.sw &= !C_MASK;
-        let p0 = self.phys(0);
-        if (self.valid_mask & (1 << p0)) == 0 {
-            // Empty: C3=1, C2=0, C0=1, C1=0
-            self.sw |= (1 << 14) | (1 << 8);
-            self.sync_top();
-            return;
-        }
-        let v = self.value(p0);
-        if v.sign != 0 {
-            self.sw |= 1 << 9; // C1 = sign bit
-        }
-        match v.kind {
-            Fp80Kind::Nan => self.sw |= 1 << 8,                  // C3=0, C2=0, C0=1
-            Fp80Kind::Finite if self.raw_denormal(p0) => self.sw |= (1 << 14) | (1 << 10),
-            Fp80Kind::Finite => self.sw |= 1 << 10,              // C3=0, C2=1, C0=0
-            Fp80Kind::Inf => self.sw |= (1 << 10) | (1 << 8),    // C3=0, C2=1, C0=1
-            Fp80Kind::Zero => self.sw |= 1 << 14,                // C3=1, C2=0, C0=0
-        }
-        self.sync_top();
-    }
-
-    #[inline]
-    pub fn fxch(&mut self, idx: u8) {
-        let p0 = self.phys(0);
-        let pi = self.phys(idx & 7);
-        self.regs.swap(p0, pi);
-        let v0 = (self.valid_mask >> p0) & 1;
-        let vi = (self.valid_mask >> pi) & 1;
-        self.valid_mask &= !((1 << p0) | (1 << pi));
-        self.valid_mask |= (vi << p0) | (v0 << pi);
-        self.sw &= !0x0200;
-        self.sync_top();
-    }
-
-    /// Record DE from the encoded operands before the arithmetic backend narrows them to f64.
-    /// Empty slots, unsupported encodings and NaNs take priority, as do zero divisors and
-    /// invalid square roots/remainders. Previously raised exceptions stay sticky.
-    fn arithmetic_inputs(&mut self, mn: Mnemonic, dst: u8, src: X87Source) -> (f64, f64) {
-        use Mnemonic::*;
-        let left = self.phys(dst);
-        let right = match src {
-            X87Source::St(i) => Some(self.phys(i)),
-            X87Source::Value(_) => None,
-        };
-        if self.raw_denormal(left) || right.is_some_and(|i| self.raw_denormal(i)) {
-            let class = |slot: usize| {
-                let raw = &self.regs[slot];
-                let unsupported = (raw[8] != 0 || raw[9] & 0x7f != 0) && raw[7] & 0x80 == 0;
-                (self.valid_mask & (1 << slot) != 0 && !unsupported).then(|| self.value(slot).kind)
-            };
-            let rhs = match src {
-                X87Source::St(i) => class(self.phys(i)),
-                X87Source::Value(v) => Some(match v.classify() {
-                    std::num::FpCategory::Zero => Fp80Kind::Zero,
-                    std::num::FpCategory::Infinite => Fp80Kind::Inf,
-                    std::num::FpCategory::Nan => Fp80Kind::Nan,
-                    _ => Fp80Kind::Finite,
-                }),
-            };
-            if let (Some(a), Some(b)) = (class(left), rhs) {
-                let suppressed = a == Fp80Kind::Nan || b == Fp80Kind::Nan || match mn {
-                    Fdiv | Fdivp | Fidiv => b == Fp80Kind::Zero,
-                    Fdivr | Fdivrp | Fidivr => a == Fp80Kind::Zero,
-                    Fprem1 => a == Fp80Kind::Inf || b == Fp80Kind::Zero,
-                    Fsqrt => self.regs[left][9] & 0x80 != 0,
-                    _ => false,
-                };
-                if !suppressed {
-                    self.sw |= 0x0002;
-                }
-            }
-        }
-        let a = self.read_st_f64(dst);
-        let b = match src {
-            X87Source::St(i) => self.read_st_f64(i),
-            X87Source::Value(v) => v,
-        };
-        (a, b)
-    }
-
-    #[inline]
-    fn read_st_f64(&mut self, idx: u8) -> f64 {
-        let pi = self.phys(idx & 7);
-        if (self.valid_mask & (1 << pi)) == 0 {
-            self.sw |= 0x0041; // SF | IE
-            return f64::from_bits(0xFFF8_0000_0000_0000);
-        }
-        let mut sw = self.sw;
-        let bits = self.value(pi).to_f64_bits(&mut sw);
-        self.sw = sw;
-        f64::from_bits(bits)
-    }
-
-    #[inline]
-    fn write_st_f64(&mut self, idx: u8, val: f64) {
-        let pi = self.phys(idx & 7);
-        let mut sw = self.sw;
-        self.regs[pi] = Fp80::from_f64_bits(val.to_bits(), &mut sw).to_f80_bytes();
-        self.valid_mask |= 1 << pi;
-        self.sw = sw;
-        self.sync_top();
-    }
-
-    #[inline(always)]
-    fn compare_sw(&mut self, a: f64, b: f64) {
-        const C_MASK: u16 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14);
-        let c0 = (!(a >= b) as u16) << 8;               // C0=1 on < or Unordered
-        let c2 = ((!(a <= b) & !(a > b)) as u16) << 10; // C2=1 on Unordered
-        let c3 = ((!(a < b) & !(a > b)) as u16) << 14;  // C3=1 on == or Unordered
-        self.sw = (self.sw & !C_MASK) | c0 | c2 | c3;
-        self.sync_top();
-    }
-}
-
-std::thread_local! {
-    static TLS_X87: core::cell::UnsafeCell<X87State> =
-        const { core::cell::UnsafeCell::new(X87State::new()) };
-}
-
-/// Scoped immutable access to this thread's x87 state without copying `X87State` or paying
-/// `RefCell` runtime borrow checks.
-///
-/// Safety invariant for callers: `f` must be a leaf closure that never re-enters `with_x87_mut`
-/// and never invokes guest callbacks.
-#[inline(always)]
-fn with_x87_ref<R>(f: impl FnOnce(&X87State) -> R) -> R {
-    TLS_X87.with(|cell| unsafe { f(&*cell.get()) })
-}
-
-/// Scoped exclusive mutable access to this thread's x87 state in place (avoids 136-byte copies
-/// on every x87 instruction).
-///
-/// Safety invariant for callers: `f` must be a leaf closure that never re-enters `with_x87_ref` /
-/// `with_x87_mut` and never invokes guest callbacks or memory helpers that could fault/dispatch.
-#[inline(always)]
-pub(super) fn with_x87_mut<R>(f: impl FnOnce(&mut X87State) -> R) -> R {
-    TLS_X87.with(|cell| unsafe { f(&mut *cell.get()) })
-}
-
-/// Stable pointer to this thread's architectural [`X87State`] (`TLS_X87`), exposed to translated
-/// ARM64/AOT code via `Cpu::jx.x87_state` for direct zero-relocation MMX/x87 aliasing.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-#[inline(always)]
-pub(super) fn x87_state_ptr() -> usize {
-    TLS_X87.with(|cell| cell.get() as usize)
-}
+pub(super) use super::x87::{
+    with_x87_mut, with_x87_ref, Fp80, X87_CONST_L2E, X87_CONST_L2T, X87_CONST_LG2, X87_CONST_LN2, X87_CONST_ONE, X87_CONST_PI, X87_CONST_ZERO, X87_OP_ADD, X87_OP_DIV,
+    X87_OP_DIVR, X87_OP_MUL, X87_OP_SUB, X87_OP_SUBR, X87_UNARY_2XM1, X87_UNARY_COS,
+    X87_UNARY_PATAN, X87_UNARY_PREM1, X87_UNARY_PTAN, X87_UNARY_RNDINT, X87_UNARY_SCALE,
+    X87_UNARY_SIN, X87_UNARY_SINCOS, X87_UNARY_SQRT, X87_UNARY_XTRACT, X87_UNARY_YL2X,
+    X87_UNARY_YL2XP1,
+};
+#[cfg(target_arch = "aarch64")]
+pub(super) use super::x87::x87_cw_ptr;
+pub use super::x87::{x87_reset, x87_restore, x87_snapshot, X87State};
 
 /// Retire a decoded x87 data instruction. FOP is the low 3 bits of the escape
 /// opcode followed by ModRM, independently of legacy, address-size and REX prefixes.
@@ -776,7 +58,26 @@ pub(super) unsafe fn record_x87_environment(cpu: &Cpu, ins: &Instruction) {
     if !ins.cpuid_features().iter().any(|f| matches!(f, FPU | FPU287 | FPU387 | CMOV))
         || matches!(
             ins.mnemonic(),
-            Fldcw | Fnstcw | Fstcw | Fninit | Finit | Fnclex | Fclex | Fnstsw | Fstsw | Wait
+            Fldcw
+                | Fnstcw
+                | Fstcw
+                | Fninit
+                | Finit
+                | Fnclex
+                | Fclex
+                | Fnstsw
+                | Fstsw
+                | Wait
+                | Fnop
+                | Fneni
+                | Fndisi
+                | Fnsetpm
+                | Fldenv
+                | Fnstenv
+                | Fstenv
+                | Frstor
+                | Fnsave
+                | Fsave
         )
         || (super::precise_faults() && super::FAULT_PENDING.with(|p| p.get().is_some()))
     {
@@ -799,32 +100,6 @@ pub(super) unsafe fn record_x87_environment(cpu: &Cpu, ins: &Instruction) {
             st.fdp = addr;
         }
     });
-}
-
-/// Snapshot this thread's x87 state (used by `run_oracle` rollback and differential tests).
-#[inline]
-pub fn x87_snapshot() -> X87State {
-    with_x87_ref(|st| *st)
-}
-
-/// Restore this thread's x87 state.
-#[inline]
-pub fn x87_restore(st: X87State) {
-    with_x87_mut(|cur| *cur = st);
-}
-
-/// Reset this thread's x87 state (`fninit` equivalent: empty stack, `TOP = 0`, `SW = 0`).
-#[inline]
-pub fn x87_reset() {
-    with_x87_mut(|cur| *cur = X87State::new());
-}
-
-/// Address of this thread's `X87State::cw` field for inline `fldcw`/`fnstcw`/`fstcw`
-/// in translated ARM64 code.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-pub(super) fn x87_cw_ptr() -> usize {
-    TLS_X87.with(|cell| unsafe { core::ptr::addr_of_mut!((*cell.get()).cw) as usize })
 }
 
 // =================================================================================================
@@ -1152,6 +427,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
         Some(raw)
     };
     match mn {
+        Mnemonic::Fnop | Mnemonic::Fneni | Mnemonic::Fndisi | Mnemonic::Fnsetpm => true,
         Mnemonic::Fninit | Mnemonic::Finit => {
             x87_reset();
             true
@@ -1215,6 +491,31 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
             with_x87_mut(|st| st.fxch(idx));
             true
         }
+        Mnemonic::Fcmovb
+        | Mnemonic::Fcmove
+        | Mnemonic::Fcmovbe
+        | Mnemonic::Fcmovu
+        | Mnemonic::Fcmovnb
+        | Mnemonic::Fcmovne
+        | Mnemonic::Fcmovnbe
+        | Mnemonic::Fcmovnu => {
+            let reg_op = if ins.op_count() >= 2 { 1 } else { 0 };
+            let Some(idx) = st_reg_index(ins.op_register(reg_op)) else {
+                return false;
+            };
+            let cond = match mn {
+                Mnemonic::Fcmovb => cpu.cf,
+                Mnemonic::Fcmove => cpu.zf,
+                Mnemonic::Fcmovbe => cpu.cf || cpu.zf,
+                Mnemonic::Fcmovu => cpu.pf(),
+                Mnemonic::Fcmovnb => !cpu.cf,
+                Mnemonic::Fcmovne => !cpu.zf,
+                Mnemonic::Fcmovnbe => !cpu.cf && !cpu.zf,
+                _ => !cpu.pf(),
+            };
+            with_x87_mut(|st| st.fcmov(idx, cond));
+            true
+        }
         Mnemonic::Fldz
         | Mnemonic::Fld1
         | Mnemonic::Fldpi
@@ -1222,16 +523,16 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
         | Mnemonic::Fldl2t
         | Mnemonic::Fldlg2
         | Mnemonic::Fldln2 => {
-            let v: f64 = match mn {
-                Mnemonic::Fldz => 0.0,
-                Mnemonic::Fld1 => 1.0,
-                Mnemonic::Fldpi => core::f64::consts::PI,
-                Mnemonic::Fldl2e => core::f64::consts::LOG2_E,
-                Mnemonic::Fldl2t => core::f64::consts::LOG2_10,
-                Mnemonic::Fldlg2 => core::f64::consts::LOG10_2,
-                _ => core::f64::consts::LN_2,
+            let cid = match mn {
+                Mnemonic::Fldz => X87_CONST_ZERO,
+                Mnemonic::Fld1 => X87_CONST_ONE,
+                Mnemonic::Fldpi => X87_CONST_PI,
+                Mnemonic::Fldl2e => X87_CONST_L2E,
+                Mnemonic::Fldl2t => X87_CONST_L2T,
+                Mnemonic::Fldlg2 => X87_CONST_LG2,
+                _ => X87_CONST_LN2,
             };
-            with_x87_mut(|st| st.push_f64_bits(v.to_bits()));
+            with_x87_mut(|st| st.push_const(cid));
             true
         }
         Mnemonic::Fld => match ins.op_kind(0) {
@@ -1239,18 +540,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                 let Some(idx) = st_reg_index(ins.op_register(0)) else {
                     return false;
                 };
-                with_x87_mut(|st| {
-                    let pi = st.phys(idx);
-                    if (st.valid_mask & (1 << pi)) == 0 {
-                        st.push_fp80(
-                            Fp80 { kind: Fp80Kind::Nan, sign: 1, exp: 0, sig: 0xC000_0000_0000_0000 },
-                            0x0041,
-                        );
-                    } else {
-                        let val = st.regs[pi];
-                        st.push_bytes(val, 0);
-                    }
-                });
+                with_x87_mut(|st| st.fld_st(idx));
                 true
             }
             OpKind::Memory => {
@@ -1265,20 +555,18 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                         true
                     }
                     4 => {
-                        let bits = (f32::from_bits(cpu.read_mem(addr, 32) as u32) as f64).to_bits();
+                        let bits = cpu.read_mem(addr, 32) as u32;
                         if faulted() {
                             return true;
                         }
-                        with_x87_mut(|st| st.push_f64_bits(bits));
+                        with_x87_mut(|st| st.push_f32_bits(bits));
                         true
                     }
                     10 => {
                         let Some(bytes) = read_f80(cpu, addr) else {
                             return true;
                         };
-                        with_x87_mut(|st| {
-                            st.push_bytes(bytes, 0);
-                        });
+                        with_x87_mut(|st| st.push_bytes(bytes, 0));
                         true
                     }
                     _ => false,
@@ -1296,37 +584,44 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
             with_x87_mut(|st| st.push_fp80(Fp80::from_i64(v), 0));
             true
         }
+        Mnemonic::Fbld => {
+            if ins.op_kind(0) != OpKind::Memory {
+                return false;
+            }
+            let addr = cpu.eff_addr(ins);
+            let Some(bytes) = read_f80(cpu, addr) else {
+                return true;
+            };
+            with_x87_mut(|st| st.push_bcd(bytes));
+            true
+        }
+        Mnemonic::Fbstp => {
+            if ins.op_kind(0) != OpKind::Memory {
+                return false;
+            }
+            let addr = cpu.eff_addr(ins);
+            if !precheck_write(cpu, addr, 10) {
+                return true;
+            }
+            let snap = if precise { Some(x87_snapshot()) } else { None };
+            let bytes = with_x87_mut(|st| st.pop_bcd());
+            cpu.write_mem(addr, 64, u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
+            if !faulted() {
+                cpu.write_mem(addr.wrapping_add(8), 16, u16::from_le_bytes([bytes[8], bytes[9]]) as u64);
+            }
+            if let Some(s) = snap {
+                if faulted() {
+                    x87_restore(s);
+                }
+            }
+            true
+        }
         Mnemonic::Fprem => {
             fprem(cpu);
             true
         }
         Mnemonic::Fprem1 => {
-            with_x87_mut(|st| {
-                let (a, b) = st.arithmetic_inputs(mn, 0, X87Source::St(1));
-                const C_MASK: u16 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14);
-                st.sw &= !C_MASK;
-                if a.is_nan() || b.is_nan() || a.is_infinite() || b == 0.0 {
-                    st.sw |= 0x0001;
-                    st.write_st_f64(0, f64::from_bits(0xFFF8_0000_0000_0000));
-                } else if a == 0.0 || b.is_infinite() {
-                    st.sync_top();
-                } else {
-                    let qf = (a / b).round_ties_even();
-                    let rem = a - qf * b;
-                    let q = (qf.abs() as u64) & 7;
-                    if (q & 1) != 0 {
-                        st.sw |= 1 << 9;
-                    }
-                    if (q & 2) != 0 {
-                        st.sw |= 1 << 14;
-                    }
-                    if (q & 4) != 0 {
-                        st.sw |= 1 << 8;
-                    }
-                    let res = if rem == 0.0 { 0.0f64.copysign(a) } else { rem };
-                    st.write_st_f64(0, res);
-                }
-            });
+            with_x87_mut(|st| st.exec_unary(X87_UNARY_PREM1));
             true
         }
         Mnemonic::Fnstsw | Mnemonic::Fstsw => {
@@ -1344,20 +639,70 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                 _ => false,
             }
         }
+        Mnemonic::Fldenv | Mnemonic::Fnstenv | Mnemonic::Fstenv | Mnemonic::Frstor | Mnemonic::Fnsave | Mnemonic::Fsave => {
+            if ins.op_kind(0) != OpKind::Memory {
+                return false;
+            }
+            let addr = cpu.eff_addr(ins);
+            let is_save = matches!(mn, Mnemonic::Frstor | Mnemonic::Fnsave | Mnemonic::Fsave);
+            let is_load = matches!(mn, Mnemonic::Fldenv | Mnemonic::Frstor);
+            let msz = ins.memory_size().size();
+            let size16 = if is_save { msz == 94 } else { msz == 14 };
+            let len = if is_save {
+                if size16 { 94 } else { 108 }
+            } else if size16 {
+                14
+            } else {
+                28
+            };
+            if is_load {
+                let mut buf = [0u8; 108];
+                for i in 0..len {
+                    buf[i] = cpu.read_mem(addr.wrapping_add(i as u64), 8) as u8;
+                    if faulted() {
+                        return true;
+                    }
+                }
+                with_x87_mut(|st| {
+                    if is_save {
+                        st.frstor(&buf[..len], size16);
+                    } else {
+                        st.decode_env(&buf[..len], size16);
+                    }
+                });
+            } else {
+                if !precheck_write(cpu, addr, len) {
+                    return true;
+                }
+                let snap = if precise { Some(x87_snapshot()) } else { None };
+                let mut buf = [0u8; 108];
+                with_x87_mut(|st| {
+                    if is_save {
+                        st.fsave(&mut buf[..len], size16);
+                    } else {
+                        st.stenv(&mut buf[..len], size16);
+                    }
+                });
+                for i in 0..len {
+                    cpu.write_mem(addr.wrapping_add(i as u64), 8, buf[i] as u64);
+                    if faulted() {
+                        break;
+                    }
+                }
+                if let Some(s) = snap {
+                    if faulted() {
+                        x87_restore(s);
+                    }
+                }
+            }
+            true
+        }
         Mnemonic::Fst => match ins.op_kind(0) {
             OpKind::Register => {
                 let Some(idx) = st_reg_index(ins.op_register(0)) else {
                     return false;
                 };
-                with_x87_mut(|st| {
-                    let p0 = st.phys(0);
-                    let pi = st.phys(idx);
-                    let v = st.regs[p0];
-                    st.regs[pi] = v;
-                    st.valid_mask |= 1 << pi;
-                    st.sw &= !0x0200;
-                    st.sync_top();
-                });
+                with_x87_mut(|st| st.fst_st(idx));
                 true
             }
             OpKind::Memory => {
@@ -1370,23 +715,12 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                     return true;
                 }
                 let snap = if precise { Some(x87_snapshot()) } else { None };
-                let bits64 = with_x87_mut(|st| {
-                    let p0 = st.phys(0);
-                    let mut sw = st.sw & !0x0200;
-                    let out = if (st.valid_mask & (1 << p0)) == 0 {
-                        sw |= 0x0041;
-                        0xFFF8_0000_0000_0000
-                    } else {
-                        st.value(p0).to_f64_bits(&mut sw)
-                    };
-                    st.sw = sw;
-                    st.sync_top();
-                    out
-                });
                 if sz == 8 {
+                    let bits64 = with_x87_mut(|st| st.store_f64_bits(false));
                     cpu.write_mem(addr, 64, bits64);
                 } else {
-                    cpu.write_mem(addr, 32, (f64::from_bits(bits64) as f32).to_bits() as u64);
+                    let bits32 = with_x87_mut(|st| st.store_f32_bits(false));
+                    cpu.write_mem(addr, 32, bits32 as u64);
                 }
                 if let Some(s) = snap {
                     if faulted() {
@@ -1416,33 +750,17 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                 }
                 let snap = if precise { Some(x87_snapshot()) } else { None };
                 if sz == 10 {
-                    let bytes = with_x87_mut(|st| {
-                        let p0 = st.phys(0);
-                        let val = if (st.valid_mask & (1 << p0)) == 0 {
-                            st.sw |= 0x0041;
-                            Fp80 { kind: Fp80Kind::Nan, sign: 1, exp: 0, sig: 0xC000_0000_0000_0000 }.to_f80_bytes()
-                        } else {
-                            let v = st.regs[p0];
-                            st.valid_mask &= !(1 << p0);
-                            v
-                        };
-                        st.top = st.top.wrapping_add(1) & 7;
-                        st.sw &= !0x0200;
-                        st.sync_top();
-                        val
-                    });
+                    let bytes = with_x87_mut(|st| st.pop_f80_bytes());
                     cpu.write_mem(addr, 64, u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
                     if !faulted() {
                         cpu.write_mem(addr.wrapping_add(8), 16, u16::from_le_bytes([bytes[8], bytes[9]]) as u64);
                     }
+                } else if sz == 8 {
+                    let bits64 = with_x87_mut(|st| st.store_f64_bits(true));
+                    cpu.write_mem(addr, 64, bits64);
                 } else {
-                    let bits64 = with_x87_mut(|st| st.pop_f64_bits());
-                    if sz == 8 {
-                        cpu.write_mem(addr, 64, bits64);
-                    } else {
-                        let f = f64::from_bits(bits64) as f32;
-                        cpu.write_mem(addr, 32, f.to_bits() as u64);
-                    }
+                    let bits32 = with_x87_mut(|st| st.store_f32_bits(true));
+                    cpu.write_mem(addr, 32, bits32 as u64);
                 }
                 if let Some(s) = snap {
                     if faulted() {
@@ -1469,23 +787,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
             let trunc = mn == Mnemonic::Fisttp;
             let bits = (sz * 8) as u32;
             let snap = if precise { Some(x87_snapshot()) } else { None };
-            let out = with_x87_mut(|st| {
-                let p0 = st.phys(0);
-                let mut sw = st.sw & !0x0200;
-                let v = if (st.valid_mask & (1 << p0)) == 0 {
-                    sw |= 0x0041; // SF | IE
-                    1u64 << (bits - 1)
-                } else {
-                    st.value(p0).to_int_bits(bits, trunc, &mut sw)
-                };
-                if pop {
-                    st.valid_mask &= !(1 << p0);
-                    st.top = st.top.wrapping_add(1) & 7;
-                }
-                st.sw = sw;
-                st.sync_top();
-                v
-            });
+            let out = with_x87_mut(|st| st.store_int_bits(bits, pop, trunc));
             cpu.write_mem(addr, bits, out);
             if let Some(s) = snap {
                 if faulted() {
@@ -1530,47 +832,44 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                     | Mnemonic::Fidiv
                     | Mnemonic::Fidivr
             );
-            let apply = |dst_val: f64, src_val: f64| -> f64 {
-                match mn {
-                    Mnemonic::Fadd | Mnemonic::Faddp | Mnemonic::Fiadd => dst_val + src_val,
-                    Mnemonic::Fsub | Mnemonic::Fsubp | Mnemonic::Fisub => dst_val - src_val,
-                    Mnemonic::Fsubr | Mnemonic::Fsubrp | Mnemonic::Fisubr => src_val - dst_val,
-                    Mnemonic::Fmul | Mnemonic::Fmulp | Mnemonic::Fimul => dst_val * src_val,
-                    Mnemonic::Fdiv | Mnemonic::Fdivp | Mnemonic::Fidiv => dst_val / src_val,
-                    _ => src_val / dst_val, // Fdivr | Fdivrp | Fidivr
-                }
+            let op_code = match mn {
+                Mnemonic::Fadd | Mnemonic::Faddp | Mnemonic::Fiadd => X87_OP_ADD,
+                Mnemonic::Fsub | Mnemonic::Fsubp | Mnemonic::Fisub => X87_OP_SUB,
+                Mnemonic::Fsubr | Mnemonic::Fsubrp | Mnemonic::Fisubr => X87_OP_SUBR,
+                Mnemonic::Fmul | Mnemonic::Fmulp | Mnemonic::Fimul => X87_OP_MUL,
+                Mnemonic::Fdiv | Mnemonic::Fdivp | Mnemonic::Fidiv => X87_OP_DIV,
+                _ => X87_OP_DIVR,
             };
             if ins.op_count() == 0 {
-                with_x87_mut(|st| {
-                    let (d, s) = st.arithmetic_inputs(mn, 1, X87Source::St(0));
-                    st.write_st_f64(1, apply(d, s));
-                    if pop {
-                        st.pop_discard();
-                    }
-                });
+                with_x87_mut(|st| st.binop_st(op_code, 1, 0, pop));
                 true
             } else if ins.op_kind(0) == OpKind::Memory {
-                let src_val = if is_int {
+                let (rhs, rhs_de) = if is_int {
                     let Some(iv) = read_int_mem(cpu, ins) else {
                         return faulted();
                     };
-                    iv as f64
+                    (Fp80::from_i64(iv), false)
                 } else {
                     let addr = cpu.eff_addr(ins);
-                    let v = match ins.memory_size().size() {
-                        8 => f64::from_bits(cpu.read_mem(addr, 64)),
-                        4 => f32::from_bits(cpu.read_mem(addr, 32) as u32) as f64,
+                    match ins.memory_size().size() {
+                        8 => {
+                            let bits = cpu.read_mem(addr, 64);
+                            if faulted() {
+                                return true;
+                            }
+                            Fp80::from_f64_bits_raw(bits)
+                        }
+                        4 => {
+                            let bits = cpu.read_mem(addr, 32) as u32;
+                            if faulted() {
+                                return true;
+                            }
+                            Fp80::from_f32_bits_raw(bits)
+                        }
                         _ => return false,
-                    };
-                    if faulted() {
-                        return true;
                     }
-                    v
                 };
-                with_x87_mut(|st| {
-                    let (d, s) = st.arithmetic_inputs(mn, 0, X87Source::Value(src_val));
-                    st.write_st_f64(0, apply(d, s));
-                });
+                with_x87_mut(|st| st.binop_val(op_code, rhs, rhs_de));
                 true
             } else if ins.op_kind(0) == OpKind::Register {
                 let Some(d_idx) = st_reg_index(ins.op_register(0)) else {
@@ -1584,48 +883,60 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                 } else {
                     0
                 };
-                with_x87_mut(|st| {
-                    let (d, s) = st.arithmetic_inputs(mn, d_idx, X87Source::St(s_idx));
-                    st.write_st_f64(d_idx, apply(d, s));
-                    if pop {
-                        st.pop_discard();
-                    }
-                });
+                with_x87_mut(|st| st.binop_st(op_code, d_idx, s_idx, pop));
                 true
             } else {
                 false
             }
         }
-        Mnemonic::Fabs | Mnemonic::Fchs | Mnemonic::Fsqrt | Mnemonic::Frndint => {
+        Mnemonic::Fabs | Mnemonic::Fchs => {
             with_x87_mut(|st| {
-                match mn {
-                    Mnemonic::Fabs => {
-                        let p0 = st.phys(0);
-                        st.regs[p0][9] &= 0x7f;
-                    }
-                    Mnemonic::Fchs => {
-                        let p0 = st.phys(0);
-                        st.regs[p0][9] ^= 0x80;
-                    }
-                    Mnemonic::Fsqrt => {
-                        let (v, _) = st.arithmetic_inputs(mn, 0, X87Source::Value(0.0));
-                        st.write_st_f64(0, v.sqrt());
-                    }
-                    _ => {
-                        let (v, _) = st.arithmetic_inputs(mn, 0, X87Source::Value(0.0));
-                        st.write_st_f64(0, v.round_ties_even());
-                    }
+                let p0 = st.phys(0);
+                if (st.valid_mask & (1 << p0)) == 0 {
+                    st.sw |= 0x0041;
+                    st.set_slot_bytes(p0, Fp80::QNAN_INDEF_BYTES);
+                    st.valid_mask |= 1 << p0;
+                } else if mn == Mnemonic::Fabs {
+                    st.regs[p0][9] &= 0x7f;
+                } else {
+                    st.regs[p0][9] ^= 0x80;
                 }
                 st.sw &= !0x0200;
                 st.sync_top();
             });
             true
         }
+        Mnemonic::Fsqrt
+        | Mnemonic::Frndint
+        | Mnemonic::Fsin
+        | Mnemonic::Fcos
+        | Mnemonic::Fsincos
+        | Mnemonic::Fptan
+        | Mnemonic::Fpatan
+        | Mnemonic::Fscale
+        | Mnemonic::Fxtract
+        | Mnemonic::F2xm1
+        | Mnemonic::Fyl2x
+        | Mnemonic::Fyl2xp1 => {
+            let uop = match mn {
+                Mnemonic::Fsqrt => X87_UNARY_SQRT,
+                Mnemonic::Frndint => X87_UNARY_RNDINT,
+                Mnemonic::Fsin => X87_UNARY_SIN,
+                Mnemonic::Fcos => X87_UNARY_COS,
+                Mnemonic::Fsincos => X87_UNARY_SINCOS,
+                Mnemonic::Fptan => X87_UNARY_PTAN,
+                Mnemonic::Fpatan => X87_UNARY_PATAN,
+                Mnemonic::Fscale => X87_UNARY_SCALE,
+                Mnemonic::Fxtract => X87_UNARY_XTRACT,
+                Mnemonic::F2xm1 => X87_UNARY_2XM1,
+                Mnemonic::Fyl2x => X87_UNARY_YL2X,
+                _ => X87_UNARY_YL2XP1,
+            };
+            with_x87_mut(|st| st.exec_unary(uop));
+            true
+        }
         Mnemonic::Ftst => {
-            with_x87_mut(|st| {
-                let (a, zero) = st.arithmetic_inputs(mn, 0, X87Source::Value(0.0));
-                st.compare_sw(a, zero);
-            });
+            with_x87_mut(|st| st.compare_val(Fp80::zero(0), false, true, 0));
             true
         }
         Mnemonic::Fcom
@@ -1636,46 +947,45 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
         | Mnemonic::Fucompp
         | Mnemonic::Ficom
         | Mnemonic::Ficomp => {
-            let pops = match mn {
+            let pops: u8 = match mn {
                 Mnemonic::Fcompp | Mnemonic::Fucompp => 2,
                 Mnemonic::Fcomp | Mnemonic::Fucomp | Mnemonic::Ficomp => 1,
                 _ => 0,
             };
             let is_int = matches!(mn, Mnemonic::Ficom | Mnemonic::Ficomp);
+            let signaling = !matches!(mn, Mnemonic::Fucom | Mnemonic::Fucomp | Mnemonic::Fucompp);
             if ins.op_count() == 0 {
                 with_x87_mut(|st| {
-                    let (a, rhs) = st.arithmetic_inputs(mn, 0, X87Source::St(1));
-                    st.compare_sw(a, rhs);
-                    for _ in 0..pops {
-                        st.pop_discard();
-                    }
+                    st.compare_st(1, signaling, true, pops);
                 });
                 true
             } else if ins.op_kind(0) == OpKind::Memory {
-                let rhs = if is_int {
+                let (rhs, rhs_de) = if is_int {
                     let Some(iv) = read_int_mem(cpu, ins) else {
                         return faulted();
                     };
-                    iv as f64
+                    (Fp80::from_i64(iv), false)
                 } else {
                     let addr = cpu.eff_addr(ins);
-                    let v = match ins.memory_size().size() {
-                        8 => f64::from_bits(cpu.read_mem(addr, 64)),
-                        4 => f32::from_bits(cpu.read_mem(addr, 32) as u32) as f64,
+                    match ins.memory_size().size() {
+                        8 => {
+                            let bits = cpu.read_mem(addr, 64);
+                            if faulted() {
+                                return true;
+                            }
+                            Fp80::from_f64_bits_raw(bits)
+                        }
+                        4 => {
+                            let bits = cpu.read_mem(addr, 32) as u32;
+                            if faulted() {
+                                return true;
+                            }
+                            Fp80::from_f32_bits_raw(bits)
+                        }
                         _ => return false,
-                    };
-                    if faulted() {
-                        return true;
                     }
-                    v
                 };
-                with_x87_mut(|st| {
-                    let (a, rhs) = st.arithmetic_inputs(mn, 0, X87Source::Value(rhs));
-                    st.compare_sw(a, rhs);
-                    for _ in 0..pops {
-                        st.pop_discard();
-                    }
-                });
+                with_x87_mut(|st| st.compare_val(rhs, rhs_de, signaling, pops));
                 true
             } else if ins.op_kind(0) == OpKind::Register {
                 let reg_op = if ins.op_count() >= 2 && ins.op_kind(1) == OpKind::Register { 1 } else { 0 };
@@ -1683,11 +993,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                     return false;
                 };
                 with_x87_mut(|st| {
-                    let (a, rhs) = st.arithmetic_inputs(mn, 0, X87Source::St(idx));
-                    st.compare_sw(a, rhs);
-                    for _ in 0..pops {
-                        st.pop_discard();
-                    }
+                    st.compare_st(idx, signaling, true, pops);
                 });
                 true
             } else {
@@ -1708,27 +1014,14 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
             } else {
                 return false;
             };
-            let pop = matches!(mn, Mnemonic::Fcomip | Mnemonic::Fucomip);
-            let (a, b) = with_x87_mut(|st| {
-                let (a, b) = st.arithmetic_inputs(mn, 0, X87Source::St(idx));
-                if pop {
-                    st.pop_discard();
-                }
-                (a, b)
-            });
-            // Branchless x86 FCOMI/FUCOMI flags:
-            // - ordered a > b: ZF=0, PF=0, CF=0
-            // - ordered a < b: ZF=0, PF=0, CF=1
-            // - ordered a == b: ZF=1, PF=0, CF=0
-            // - unordered (NaN): ZF=1, PF=1, CF=1
-            // Note: `cpu.pfv` encodes PF via even byte parity (`pf() == (pfv.count_ones() & 1 == 0)`),
-            // so `pfv = 0` means PF=1 and `pfv = 1` means PF=0.
-            let unord = !(a <= b) & !(a > b);
+            let pop = u8::from(matches!(mn, Mnemonic::Fcomip | Mnemonic::Fucomip));
+            let signaling = matches!(mn, Mnemonic::Fcomi | Mnemonic::Fcomip);
+            let code = with_x87_mut(|st| st.compare_st(idx, signaling, false, pop));
             cpu.sf = false;
             cpu.of = false;
-            cpu.zf = !(a < b) & !(a > b);
-            cpu.cf = !(a >= b);
-            cpu.pfv = (!unord) as u8;
+            cpu.zf = (code & 2) != 0;
+            cpu.cf = (code & 1) != 0;
+            cpu.pfv = u8::from(code != 3);
             true
         }
         _ => false,

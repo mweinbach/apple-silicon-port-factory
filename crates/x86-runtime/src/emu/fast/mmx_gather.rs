@@ -648,10 +648,12 @@ fn mmx_commit_if_ok(dest: Option<(usize, u64)>) {
             if let Some((slot, val)) = dest {
                 let reg = &mut st.regs[slot & 7];
                 reg[..8].copy_from_slice(&val.to_le_bytes());
-                reg[8..].fill(0xff);
+                reg[8..10].fill(0xff);
+                reg[10..16].fill(0);
             }
             st.valid_mask = 0xff;
             st.top = 0;
+            st.sync_top();
         });
     }
 }
