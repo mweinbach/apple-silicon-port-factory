@@ -579,6 +579,7 @@ impl CommandList {
                 let want_spans = self.opts.opt_subrange_uav_barrier;
                 let mut exp_reads: Vec<usize> = Vec::with_capacity(icb_count * 2);
                 let mut exp_spans: Vec<SubRange> = Vec::new();
+                let va_cache = &mut *self.binds.buf_va_cache;
                 let exp_ok = resource::with_resource_registry(|reg| {
                     let mut ok = true;
                     for seg in &segs {
@@ -586,14 +587,15 @@ impl CommandList {
                         {
                             if *args_va != 0 {
                                 let aok = if want_spans {
-                                    reg.push_buffer_span(
+                                    reg.push_buffer_span_cached(
+                                        va_cache,
                                         *args_va,
                                         *args_bytes,
                                         &mut exp_reads,
                                         &mut exp_spans,
                                     )
                                 } else {
-                                    reg.push_buffer_va(*args_va, &mut exp_reads)
+                                    reg.push_buffer_va_cached(va_cache, *args_va, &mut exp_reads)
                                 };
                                 if !aok {
                                     ok = false;
@@ -601,14 +603,15 @@ impl CommandList {
                             }
                             if *count_va != 0 {
                                 let cok = if want_spans {
-                                    reg.push_buffer_span(
+                                    reg.push_buffer_span_cached(
+                                        va_cache,
                                         *count_va,
                                         4,
                                         &mut exp_reads,
                                         &mut exp_spans,
                                     )
                                 } else {
-                                    reg.push_buffer_va(*count_va, &mut exp_reads)
+                                    reg.push_buffer_va_cached(va_cache, *count_va, &mut exp_reads)
                                 };
                                 if !cok {
                                     ok = false;
@@ -616,14 +619,15 @@ impl CommandList {
                             }
                             if *pred_va != 0 {
                                 let pok = if want_spans {
-                                    reg.push_buffer_span(
+                                    reg.push_buffer_span_cached(
+                                        va_cache,
                                         *pred_va,
                                         8,
                                         &mut exp_reads,
                                         &mut exp_spans,
                                     )
                                 } else {
-                                    reg.push_buffer_va(*pred_va, &mut exp_reads)
+                                    reg.push_buffer_va_cached(va_cache, *pred_va, &mut exp_reads)
                                 };
                                 if !pok {
                                     ok = false;
@@ -1380,12 +1384,19 @@ impl CommandList {
                 let mut exp_reads: Vec<usize> = Vec::with_capacity(3);
                 let mut exp_spans: Vec<SubRange> = Vec::new();
                 let arg_bytes = (max_count as u64).saturating_mul(l.stride as u64);
+                let va_cache = &mut *self.binds.buf_va_cache;
                 let exp_ok = resource::with_resource_registry(|reg| {
                     let mut ok = if args != 0 {
                         if want_spans {
-                            reg.push_buffer_span(args, arg_bytes, &mut exp_reads, &mut exp_spans)
+                            reg.push_buffer_span_cached(
+                                va_cache,
+                                args,
+                                arg_bytes,
+                                &mut exp_reads,
+                                &mut exp_spans,
+                            )
                         } else {
-                            reg.push_buffer_va(args, &mut exp_reads)
+                            reg.push_buffer_va_cached(va_cache, args, &mut exp_reads)
                         }
                     } else {
                         true
@@ -1393,18 +1404,30 @@ impl CommandList {
                     if ok {
                         if let Some(c_va) = count.filter(|&v| v != 0) {
                             ok = if want_spans {
-                                reg.push_buffer_span(c_va, 4, &mut exp_reads, &mut exp_spans)
+                                reg.push_buffer_span_cached(
+                                    va_cache,
+                                    c_va,
+                                    4,
+                                    &mut exp_reads,
+                                    &mut exp_spans,
+                                )
                             } else {
-                                reg.push_buffer_va(c_va, &mut exp_reads)
+                                reg.push_buffer_va_cached(va_cache, c_va, &mut exp_reads)
                             };
                         }
                     }
                     if ok {
                         if let Some(p_va) = pred.map(|pr| pr.gpu_va).filter(|&v| v != 0) {
                             ok = if want_spans {
-                                reg.push_buffer_span(p_va, 8, &mut exp_reads, &mut exp_spans)
+                                reg.push_buffer_span_cached(
+                                    va_cache,
+                                    p_va,
+                                    8,
+                                    &mut exp_reads,
+                                    &mut exp_spans,
+                                )
                             } else {
-                                reg.push_buffer_va(p_va, &mut exp_reads)
+                                reg.push_buffer_va_cached(va_cache, p_va, &mut exp_reads)
                             };
                         }
                     }
@@ -1567,71 +1590,82 @@ impl CommandList {
                         })
                     })
                 });
-                let (uav_exact, mut full_read_exact, mut bounded_read_exact) = if !non_const_patch {
-                    let ue = pso.access.uav_slots.as_deref().is_some_and(|s| {
-                        Self::resolve_compute_binds_spans(
-                            s,
-                            &self.compute_root,
-                            self.heap0_cpu,
-                            &mut scratch_uav,
-                            want_spans.then_some(&mut scratch_uav_spans),
-                        )
-                    });
-                    let fre = pso.access.read_slots.as_deref().is_some_and(|s| {
-                        Self::resolve_compute_binds_spans(
-                            s,
-                            &self.compute_root,
-                            self.heap0_cpu,
-                            &mut scratch_read,
-                            want_spans.then_some(&mut scratch_read_spans),
-                        )
-                    });
-                    let bre = if fre {
-                        true
-                    } else if (self.opts.opt_ib_bindless_war
-                        || self.opts.opt_ib_exact_obl
-                        || self.opts.opt_subrange_uav_barrier
-                        || self.opts.opt_desc_table_res_exact
-                        || self.opts.opt_desc_table_cs_fast
-                        || self.opts.opt_cs_intra_barrier_exact
-                        || self.ps_to_cs_active()
-                        || self.opts.opt_cs_intra_barrier_v2
-                        || self.opts.opt_cs_fast_bind_exact)
-                        && !pso.access.heap_indexed_or_unknown
-                    {
-                        Self::resolve_compute_binds_spans(
-                            &pso.access.bounded_read_slots,
-                            &self.compute_root,
-                            self.heap0_cpu,
-                            &mut scratch_read,
-                            want_spans.then_some(&mut scratch_read_spans),
-                        )
-                    } else {
-                        false
-                    };
-                    (ue, fre, bre)
+                let want_bounded_ind = (self.opts.opt_ib_bindless_war
+                    || self.opts.opt_ib_exact_obl
+                    || self.opts.opt_subrange_uav_barrier
+                    || self.opts.opt_desc_table_res_exact
+                    || self.opts.opt_desc_table_cs_fast
+                    || self.opts.opt_cs_intra_barrier_exact
+                    || self.ps_to_cs_active()
+                    || self.opts.opt_cs_intra_barrier_v2
+                    || self.opts.opt_cs_fast_bind_exact)
+                    && !pso.access.heap_indexed_or_unknown;
+                let va_cache = &mut *self.binds.buf_va_cache;
+                let compute_root = &self.compute_root;
+                let heap0 = self.heap0_cpu;
+                let (uav_exact, full_read_exact, bounded_read_exact) = if !non_const_patch {
+                    resource::with_resource_registry(|reg| {
+                        let ue = pso.access.uav_slots.as_deref().is_some_and(|s| {
+                            Self::resolve_slots_with_reg(
+                                reg,
+                                va_cache,
+                                s,
+                                compute_root,
+                                heap0,
+                                &mut scratch_uav,
+                                want_spans.then_some(&mut scratch_uav_spans),
+                            )
+                        });
+                        let fre = pso.access.read_slots.as_deref().is_some_and(|s| {
+                            Self::resolve_slots_with_reg(
+                                reg,
+                                va_cache,
+                                s,
+                                compute_root,
+                                heap0,
+                                &mut scratch_read,
+                                want_spans.then_some(&mut scratch_read_spans),
+                            )
+                        });
+                        let bre = if fre {
+                            true
+                        } else if want_bounded_ind {
+                            Self::resolve_slots_with_reg(
+                                reg,
+                                va_cache,
+                                &pso.access.bounded_read_slots,
+                                compute_root,
+                                heap0,
+                                &mut scratch_read,
+                                want_spans.then_some(&mut scratch_read_spans),
+                            )
+                        } else {
+                            false
+                        };
+                        let (mut fre_out, mut bre_out) = (fre, bre);
+                        if !expanded && (fre_out || bre_out) && work_addr != 0 {
+                            let work_bytes = (max_count as u64).saturating_mul(work_stride);
+                            let arg_ok = if want_spans {
+                                reg.push_buffer_span_cached(
+                                    va_cache,
+                                    work_addr,
+                                    work_bytes,
+                                    &mut scratch_read,
+                                    &mut scratch_read_spans,
+                                )
+                            } else {
+                                reg.push_buffer_va_cached(va_cache, work_addr, &mut scratch_read)
+                            };
+                            if !arg_ok {
+                                fre_out = false;
+                                bre_out = false;
+                            }
+                        }
+                        (ue, fre_out, bre_out)
+                    })
                 } else {
                     (false, false, false)
                 };
-                if !expanded && (full_read_exact || bounded_read_exact) && work_addr != 0 {
-                    let work_bytes = (max_count as u64).saturating_mul(work_stride);
-                    let arg_ok = resource::with_resource_registry(|reg| {
-                        if want_spans {
-                            reg.push_buffer_span(
-                                work_addr,
-                                work_bytes,
-                                &mut scratch_read,
-                                &mut scratch_read_spans,
-                            )
-                        } else {
-                            reg.push_buffer_va(work_addr, &mut scratch_read)
-                        }
-                    });
-                    if !arg_ok {
-                        full_read_exact = false;
-                        bounded_read_exact = false;
-                    }
-                }
                 let msc_class = self.msc_class_active();
                 if msc_class && pso.access.msc_refined {
                     stats::inc(&stats::c::msc_access_exact);

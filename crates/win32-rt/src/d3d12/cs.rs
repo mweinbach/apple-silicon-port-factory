@@ -176,7 +176,20 @@ fn run_thread() {
                 if let Some(j) = st.jobs.pop_front() {
                     break j;
                 }
-                st = cs.work.wait(st).unwrap();
+                if d3d12_metal::metal::queue::has_pending_work() {
+                    let (new_st, timeout) = cs
+                        .work
+                        .wait_timeout(st, std::time::Duration::from_millis(2))
+                        .unwrap();
+                    st = new_st;
+                    if timeout.timed_out() && st.jobs.is_empty() {
+                        drop(st);
+                        d3d12_metal::metal::queue::Queue::flush_all_pending_work();
+                        st = cs.q.lock().unwrap();
+                    }
+                } else {
+                    st = cs.work.wait(st).unwrap();
+                }
             }
         };
         let t0 = crate::hitch::now_ns();
@@ -200,9 +213,15 @@ pub fn submit(job: impl FnOnce() + Send + 'static) {
 }
 
 /// Block until every job submitted so far has run (no-op on the CS thread
-/// itself or when the CS thread is disabled).
+/// itself; when the CS thread is disabled, still flushes any buffered GPU work).
 pub fn flush() {
-    if !enabled() || ON_CS.with(|c| c.get()) {
+    if !enabled() {
+        if d3d12_metal::metal::queue::has_pending_work() {
+            d3d12_metal::metal::queue::Queue::flush_all_pending_work();
+        }
+        return;
+    }
+    if ON_CS.with(|c| c.get()) {
         return;
     }
     let cs = cs();
@@ -216,6 +235,10 @@ pub fn flush() {
         }
         st.waiters -= 1;
         CS_FLUSH_WAIT_NS.fetch_add(crate::hitch::now_ns().saturating_sub(t0), std::sync::atomic::Ordering::Relaxed);
+    }
+    drop(st);
+    if d3d12_metal::metal::queue::has_pending_cbs() {
+        d3d12_metal::metal::queue::Queue::flush_all_pending_cbs();
     }
 }
 

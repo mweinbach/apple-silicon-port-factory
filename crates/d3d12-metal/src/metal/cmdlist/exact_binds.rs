@@ -1,7 +1,7 @@
 //! Exact descriptor-table / root-argument bind resolution and caching for
 //! compute, graphics, and mesh pipelines.
 
-use super::state::{res_class, DrawSegExact};
+use super::state::{res_class, DrawSegExact, SlotPlan};
 use super::CommandList;
 use crate::metal::binding::RootState;
 use crate::metal::pipeline::{
@@ -9,8 +9,8 @@ use crate::metal::pipeline::{
     MAX_VERTEX_SLOTS, READS_BUF, READS_TEX,
 };
 use crate::metal::resource::{
-    push_subrange, res_registry_gen, with_buf_va_cache, with_resource_registry, ResRegistry,
-    Resource, SubRange, HK_ALL, HK_CBV_BUF, HK_RAW_STRUCT_BUF, HK_TYPED_BUF,
+    push_subrange, res_registry_gen, with_resource_registry, BufVaCache, ResRegistry, Resource,
+    SubRange, HK_ALL, HK_CBV_BUF, HK_RAW_STRUCT_BUF, HK_TYPED_BUF,
 };
 
 const ALL_BUF_HK: u32 = HK_RAW_STRUCT_BUF | HK_TYPED_BUF | HK_CBV_BUF;
@@ -41,8 +41,10 @@ pub(super) fn mark_and_extend_unique(src: &[usize], dst: &mut Vec<usize>) {
 }
 
 impl CommandList {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_stage_access_with_reg(
         reg: &ResRegistry,
+        va_cache: &mut BufVaCache,
         access: &ComputeAccess,
         root: &RootState,
         heap0: Option<(u64, u64, usize)>,
@@ -61,7 +63,8 @@ impl CommandList {
         match &access.uav_slots {
             Some(slots) => {
                 if !slots.is_empty() {
-                    if Self::resolve_slots_with_reg(reg, slots, root, heap0, scratch, None) {
+                    if Self::resolve_slots_with_reg(reg, va_cache, slots, root, heap0, scratch, None)
+                    {
                         for &r in scratch.iter() {
                             if r != 0 && !dst.contains(&r) {
                                 dst.push(r);
@@ -86,6 +89,7 @@ impl CommandList {
         } else if !access.bounded_read_slots.is_empty() {
             if Self::resolve_slots_with_reg(
                 reg,
+                va_cache,
                 &access.bounded_read_slots,
                 root,
                 heap0,
@@ -105,8 +109,85 @@ impl CommandList {
         (unbounded, slot_failed)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_stage_access_from_tokens(
+        reg: &ResRegistry,
+        va_cache: &mut BufVaCache,
+        access: &ComputeAccess,
+        uav_plan: Option<(&SlotPlan, &[u64])>,
+        read_plan: Option<(&SlotPlan, &[u64])>,
+        patch_root_invalid: bool,
+        scratch: &mut Vec<usize>,
+        dst: &mut Vec<usize>,
+        mut uav_dst: Option<&mut Vec<usize>>,
+    ) -> (u8, bool, bool) {
+        if access.heap_indexed_or_unknown {
+            return (READS_BUF | READS_TEX, true, true);
+        }
+        if patch_root_invalid {
+            return (access.uav_classes | access.read_classes, true, true);
+        }
+        let mut unbounded = access.unbounded_srv_classes;
+        let mut slot_failed = false;
+        let mut uav_failed = false;
+        match &access.uav_slots {
+            Some(slots) => {
+                if !slots.is_empty() {
+                    let ok = uav_plan.is_some_and(|(pl, toks)| {
+                        pl.resolve_from_tokens(reg, va_cache, toks, scratch, None)
+                    });
+                    if ok {
+                        for &r in scratch.iter() {
+                            if r != 0 {
+                                if !dst.contains(&r) {
+                                    dst.push(r);
+                                }
+                                if let Some(ud) = uav_dst.as_deref_mut() {
+                                    if !ud.contains(&r) {
+                                        ud.push(r);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        unbounded |= access.uav_classes;
+                        slot_failed = true;
+                        uav_failed = true;
+                    }
+                }
+            }
+            None => {
+                unbounded |= access.uav_classes;
+                uav_failed = true;
+            }
+        }
+        if access.read_slots.is_none()
+            && access.unbounded_srv_classes == 0
+            && access.bounded_read_slots.is_empty()
+            && access.read_classes != 0
+        {
+            unbounded |= access.read_classes;
+        } else if !access.bounded_read_slots.is_empty() {
+            let ok = read_plan.is_some_and(|(pl, toks)| {
+                pl.resolve_from_tokens(reg, va_cache, toks, scratch, None)
+            });
+            if ok {
+                for &r in scratch.iter() {
+                    if r != 0 && !dst.contains(&r) {
+                        dst.push(r);
+                    }
+                }
+            } else {
+                unbounded |= access.read_classes;
+                slot_failed = true;
+            }
+        }
+        (unbounded, slot_failed, uav_failed)
+    }
+
     pub(super) fn resolve_uav_write_with_reg(
         reg: &ResRegistry,
+        va_cache: &mut BufVaCache,
         access: &ComputeAccess,
         root: &RootState,
         heap0: Option<(u64, u64, usize)>,
@@ -120,7 +201,9 @@ impl CommandList {
             Some(slots) => {
                 if slots.is_empty() {
                     false
-                } else if Self::resolve_slots_with_reg(reg, slots, root, heap0, scratch, None) {
+                } else if Self::resolve_slots_with_reg(
+                    reg, va_cache, slots, root, heap0, scratch, None,
+                ) {
                     for &r in scratch.iter() {
                         if r != 0 && !dst.contains(&r) {
                             dst.push(r);
@@ -135,8 +218,10 @@ impl CommandList {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn stage_access_overlaps_hazard(
         reg: &ResRegistry,
+        va_cache: &mut BufVaCache,
         access: &ComputeAccess,
         root: &RootState,
         heap0: Option<(u64, u64, usize)>,
@@ -153,7 +238,9 @@ impl CommandList {
         match &access.uav_slots {
             Some(slots) => {
                 if !slots.is_empty() {
-                    if Self::resolve_slots_with_reg(reg, slots, root, heap0, scratch, None) {
+                    if Self::resolve_slots_with_reg(
+                        reg, va_cache, slots, root, heap0, scratch, None,
+                    ) {
                         if scratch.iter().any(|r| *r != 0 && hazard_res.contains(r)) {
                             return true;
                         }
@@ -177,6 +264,7 @@ impl CommandList {
         } else if !access.bounded_read_slots.is_empty() {
             if Self::resolve_slots_with_reg(
                 reg,
+                va_cache,
                 &access.bounded_read_slots,
                 root,
                 heap0,
@@ -191,30 +279,6 @@ impl CommandList {
             }
         }
         false
-    }
-
-    fn extract_stage_bind_tokens(
-        access: &ComputeAccess,
-        root: &RootState,
-        heap0: Option<(u64, u64, usize)>,
-        include_reads: bool,
-        tokens: &mut Vec<u64>,
-    ) -> bool {
-        if access.heap_indexed_or_unknown {
-            return true;
-        }
-        if let Some(slots) = &access.uav_slots {
-            if !slots.is_empty() && !Self::extract_compute_slot_tokens(slots, root, heap0, tokens) {
-                return false;
-            }
-        }
-        if include_reads
-            && !access.bounded_read_slots.is_empty()
-            && !Self::extract_compute_slot_tokens(&access.bounded_read_slots, root, heap0, tokens)
-        {
-            return false;
-        }
-        true
     }
 
     /// Compute the effective `(pre_unb_hk, ps_unb_hk)` masks from `self.binds.gfx_bind_cache`
@@ -267,26 +331,93 @@ impl CommandList {
         let mut tokens = std::mem::take(&mut self.binds.gfx_bind_tokens);
         tokens.clear();
         let mut tokens_ok = true;
+        let mut vs_uav_span: Option<(usize, usize, usize)> = None;
+        let mut vs_read_span: Option<(usize, usize, usize)> = None;
+        let mut ps_uav_span: Option<(usize, usize, usize)> = None;
+        let mut ps_read_span: Option<(usize, usize, usize)> = None;
         if !patch_root_invalid {
-            if do_gfx || (do_uav_eff && p.vs_writes_uav) {
-                tokens_ok &= Self::extract_stage_bind_tokens(
-                    &p.vs_access,
-                    &self.gfx_root,
-                    self.heap0_cpu,
-                    do_gfx,
-                    &mut tokens,
-                );
+            if (do_gfx || (do_uav_eff && p.vs_writes_uav)) && !p.vs_access.heap_indexed_or_unknown {
+                if let Some(slots) = &p.vs_access.uav_slots {
+                    if !slots.is_empty() {
+                        let lo = tokens.len();
+                        let idx = self.binds.slot_plans.get_or_compile(
+                            pso_ptr,
+                            0,
+                            slots,
+                            &self.gfx_root,
+                        );
+                        if self.binds.slot_plans.plan(idx).extract_tokens(
+                            &self.gfx_root,
+                            self.heap0_cpu,
+                            &mut tokens,
+                        ) {
+                            vs_uav_span = Some((idx, lo, tokens.len()));
+                        } else {
+                            tokens_ok = false;
+                        }
+                    }
+                }
+                if tokens_ok && do_gfx && !p.vs_access.bounded_read_slots.is_empty() {
+                    let lo = tokens.len();
+                    let idx = self.binds.slot_plans.get_or_compile(
+                        pso_ptr,
+                        1,
+                        &p.vs_access.bounded_read_slots,
+                        &self.gfx_root,
+                    );
+                    if self.binds.slot_plans.plan(idx).extract_tokens(
+                        &self.gfx_root,
+                        self.heap0_cpu,
+                        &mut tokens,
+                    ) {
+                        vs_read_span = Some((idx, lo, tokens.len()));
+                    } else {
+                        tokens_ok = false;
+                    }
+                }
             }
             if tokens_ok {
                 if let Some(ps_acc) = &p.ps_access {
-                    if do_gfx || (do_uav_eff && p.ps_writes_uav) {
-                        tokens_ok &= Self::extract_stage_bind_tokens(
-                            ps_acc,
-                            &self.gfx_root,
-                            self.heap0_cpu,
-                            do_gfx,
-                            &mut tokens,
-                        );
+                    if (do_gfx || (do_uav_eff && p.ps_writes_uav)) && !ps_acc.heap_indexed_or_unknown
+                    {
+                        if let Some(slots) = &ps_acc.uav_slots {
+                            if !slots.is_empty() {
+                                let lo = tokens.len();
+                                let idx = self.binds.slot_plans.get_or_compile(
+                                    pso_ptr,
+                                    2,
+                                    slots,
+                                    &self.gfx_root,
+                                );
+                                if self.binds.slot_plans.plan(idx).extract_tokens(
+                                    &self.gfx_root,
+                                    self.heap0_cpu,
+                                    &mut tokens,
+                                ) {
+                                    ps_uav_span = Some((idx, lo, tokens.len()));
+                                } else {
+                                    tokens_ok = false;
+                                }
+                            }
+                        }
+                        if tokens_ok && do_gfx && !ps_acc.bounded_read_slots.is_empty() {
+                            let lo = tokens.len();
+                            let idx = self.binds.slot_plans.get_or_compile(
+                                pso_ptr,
+                                3,
+                                &ps_acc.bounded_read_slots,
+                                &self.gfx_root,
+                            );
+                            if self.binds.slot_plans.plan(idx).extract_tokens(
+                                &self.gfx_root,
+                                self.heap0_cpu,
+                                &mut tokens,
+                            ) {
+                                ps_read_span = Some((idx, lo, tokens.len()));
+                            } else {
+                                tokens_ok = false;
+                            }
+                        }
                     }
                 }
             }
@@ -333,6 +464,8 @@ impl CommandList {
         let vbs = self.gfx.vbs;
         let ib = self.gfx.ib;
         let pred = self.predication;
+        let va_cache = &mut *self.binds.buf_va_cache;
+        let slot_plans = &self.binds.slot_plans;
         let cache = &mut self.binds.gfx_bind_cache;
         cache.pre_exact.clear();
         cache.ps_exact.clear();
@@ -378,18 +511,48 @@ impl CommandList {
 
         let resolved_gen = if has_slots || has_vas {
             with_resource_registry(|reg| {
+                let mut handled_vs_uav = false;
+                let mut handled_ps_uav = false;
                 if do_gfx {
-                    let (pu, pf) = Self::resolve_stage_access_with_reg(
-                        reg,
-                        &p.vs_access,
-                        gfx_root,
-                        heap0,
-                        patch_root_invalid,
-                        &mut scratch,
-                        &mut cache.pre_exact,
-                    );
-                    pre_unb = pu;
-                    pre_slot_failed = pf;
+                    if tokens_ok {
+                        let vs_uav_arg =
+                            vs_uav_span.map(|(idx, lo, hi)| (slot_plans.plan(idx), &tokens[lo..hi]));
+                        let vs_read_arg =
+                            vs_read_span.map(|(idx, lo, hi)| (slot_plans.plan(idx), &tokens[lo..hi]));
+                        let want_vs_uav = do_uav_eff && p.vs_writes_uav;
+                        let (pu, pf, uf) = Self::resolve_stage_access_from_tokens(
+                            reg,
+                            va_cache,
+                            &p.vs_access,
+                            vs_uav_arg,
+                            vs_read_arg,
+                            patch_root_invalid,
+                            &mut scratch,
+                            &mut cache.pre_exact,
+                            want_vs_uav.then_some(&mut cache.uav_exact),
+                        );
+                        pre_unb = pu;
+                        pre_slot_failed = pf;
+                        if want_vs_uav {
+                            if uf {
+                                uav_unb = true;
+                            }
+                            handled_vs_uav = true;
+                        }
+                    } else {
+                        let (pu, pf) = Self::resolve_stage_access_with_reg(
+                            reg,
+                            va_cache,
+                            &p.vs_access,
+                            gfx_root,
+                            heap0,
+                            patch_root_invalid,
+                            &mut scratch,
+                            &mut cache.pre_exact,
+                        );
+                        pre_unb = pu;
+                        pre_slot_failed = pf;
+                    }
                     if p.vertex_slots != 0 {
                         if patch_vb {
                             pre_unb |= READS_BUF;
@@ -401,7 +564,13 @@ impl CommandList {
                                 vm &= vm - 1;
                                 if slot < MAX_VERTEX_SLOTS as usize {
                                     let (va, _, _) = vbs[slot];
-                                    if va != 0 && !reg.push_buffer_va(va, &mut cache.pre_exact) {
+                                    if va != 0
+                                        && !reg.push_buffer_va_cached(
+                                            va_cache,
+                                            va,
+                                            &mut cache.pre_exact,
+                                        )
+                                    {
                                         pre_unb |= READS_BUF;
                                         pre_va_failed = true;
                                     }
@@ -414,7 +583,9 @@ impl CommandList {
                             pre_unb |= READS_BUF;
                             pre_va_failed = true;
                         } else if let Some((va, _, _)) = ib {
-                            if va != 0 && !reg.push_buffer_va(va, &mut cache.pre_exact) {
+                            if va != 0
+                                && !reg.push_buffer_va_cached(va_cache, va, &mut cache.pre_exact)
+                            {
                                 pre_unb |= READS_BUF;
                                 pre_va_failed = true;
                             }
@@ -423,7 +594,13 @@ impl CommandList {
                     if indirect {
                         if let Some(vas) = indirect_vas {
                             for &va in vas {
-                                if va != 0 && !reg.push_buffer_va(va, &mut cache.pre_exact) {
+                                if va != 0
+                                    && !reg.push_buffer_va_cached(
+                                        va_cache,
+                                        va,
+                                        &mut cache.pre_exact,
+                                    )
+                                {
                                     pre_unb |= READS_BUF;
                                     pre_va_failed = true;
                                 }
@@ -434,15 +611,48 @@ impl CommandList {
                         }
                     }
                     if let Some(pr) = pred {
-                        if pr.gpu_va != 0 && !reg.push_buffer_va(pr.gpu_va, &mut cache.pre_exact) {
+                        if pr.gpu_va != 0
+                            && !reg.push_buffer_va_cached(
+                                va_cache,
+                                pr.gpu_va,
+                                &mut cache.pre_exact,
+                            )
+                        {
                             pre_unb |= READS_BUF;
                             pre_va_failed = true;
                         }
                     }
                     match &p.ps_access {
+                        Some(ps_acc) if tokens_ok => {
+                            let ps_uav_arg = ps_uav_span
+                                .map(|(idx, lo, hi)| (slot_plans.plan(idx), &tokens[lo..hi]));
+                            let ps_read_arg = ps_read_span
+                                .map(|(idx, lo, hi)| (slot_plans.plan(idx), &tokens[lo..hi]));
+                            let want_ps_uav = do_uav_eff && p.ps_writes_uav;
+                            let (psu, psf, uf) = Self::resolve_stage_access_from_tokens(
+                                reg,
+                                va_cache,
+                                ps_acc,
+                                ps_uav_arg,
+                                ps_read_arg,
+                                patch_root_invalid,
+                                &mut scratch,
+                                &mut cache.ps_exact,
+                                want_ps_uav.then_some(&mut cache.uav_exact),
+                            );
+                            ps_unb = psu;
+                            ps_slot_failed = psf;
+                            if want_ps_uav {
+                                if uf {
+                                    uav_unb = true;
+                                }
+                                handled_ps_uav = true;
+                            }
+                        }
                         Some(ps_acc) => {
                             let (psu, psf) = Self::resolve_stage_access_with_reg(
                                 reg,
+                                va_cache,
                                 ps_acc,
                                 gfx_root,
                                 heap0,
@@ -460,29 +670,99 @@ impl CommandList {
                     ps_slot_failed = true;
                 }
                 if do_uav_eff {
-                    if p.vs_writes_uav
-                        && Self::resolve_uav_write_with_reg(
-                            reg,
-                            &p.vs_access,
-                            gfx_root,
-                            heap0,
-                            &mut scratch,
-                            &mut cache.uav_exact,
-                        )
-                    {
-                        uav_unb = true;
+                    if p.vs_writes_uav && !handled_vs_uav {
+                        let failed = if tokens_ok {
+                            if p.vs_access.heap_indexed_or_unknown {
+                                true
+                            } else {
+                                match &p.vs_access.uav_slots {
+                                    Some(slots) if slots.is_empty() => false,
+                                    Some(_) => {
+                                        if let Some((idx, lo, hi)) = vs_uav_span {
+                                            if slot_plans.plan(idx).resolve_from_tokens(
+                                                reg,
+                                                va_cache,
+                                                &tokens[lo..hi],
+                                                &mut scratch,
+                                                None,
+                                            ) {
+                                                for &r in scratch.iter() {
+                                                    if r != 0 && !cache.uav_exact.contains(&r) {
+                                                        cache.uav_exact.push(r);
+                                                    }
+                                                }
+                                                false
+                                            } else {
+                                                true
+                                            }
+                                        } else {
+                                            true
+                                        }
+                                    }
+                                    None => true,
+                                }
+                            }
+                        } else {
+                            Self::resolve_uav_write_with_reg(
+                                reg,
+                                va_cache,
+                                &p.vs_access,
+                                gfx_root,
+                                heap0,
+                                &mut scratch,
+                                &mut cache.uav_exact,
+                            )
+                        };
+                        if failed {
+                            uav_unb = true;
+                        }
                     }
-                    if p.ps_writes_uav {
+                    if p.ps_writes_uav && !handled_ps_uav {
                         match &p.ps_access {
                             Some(ps_acc) => {
-                                if Self::resolve_uav_write_with_reg(
-                                    reg,
-                                    ps_acc,
-                                    gfx_root,
-                                    heap0,
-                                    &mut scratch,
-                                    &mut cache.uav_exact,
-                                ) {
+                                let failed = if tokens_ok {
+                                    if ps_acc.heap_indexed_or_unknown {
+                                        true
+                                    } else {
+                                        match &ps_acc.uav_slots {
+                                            Some(slots) if slots.is_empty() => false,
+                                            Some(_) => {
+                                                if let Some((idx, lo, hi)) = ps_uav_span {
+                                                    if slot_plans.plan(idx).resolve_from_tokens(
+                                                        reg,
+                                                        va_cache,
+                                                        &tokens[lo..hi],
+                                                        &mut scratch,
+                                                        None,
+                                                    ) {
+                                                        for &r in scratch.iter() {
+                                                            if r != 0 && !cache.uav_exact.contains(&r) {
+                                                                cache.uav_exact.push(r);
+                                                            }
+                                                        }
+                                                        false
+                                                    } else {
+                                                        true
+                                                    }
+                                                } else {
+                                                    true
+                                                }
+                                            }
+                                            None => true,
+                                        }
+                                    }
+                                } else {
+                                    Self::resolve_uav_write_with_reg(
+                                        reg,
+                                        va_cache,
+                                        ps_acc,
+                                        gfx_root,
+                                        heap0,
+                                        &mut scratch,
+                                        &mut cache.uav_exact,
+                                    )
+                                };
+                                if failed {
                                     uav_unb = true;
                                 }
                             }
@@ -667,9 +947,11 @@ impl CommandList {
         let gfx_root = &self.gfx_root;
         let heap0 = self.heap0_cpu;
         let hazard_res = &self.rp_sync.pass_uav_hazard_res;
+        let va_cache = &mut *self.binds.buf_va_cache;
         let hit = with_resource_registry(|reg| {
             if Self::stage_access_overlaps_hazard(
                 reg,
+                va_cache,
                 &p.ms_access,
                 gfx_root,
                 heap0,
@@ -682,6 +964,7 @@ impl CommandList {
             if let Some(as_acc) = &p.as_access {
                 if Self::stage_access_overlaps_hazard(
                     reg,
+                    va_cache,
                     as_acc,
                     gfx_root,
                     heap0,
@@ -696,6 +979,7 @@ impl CommandList {
                 Some(ps_acc) => {
                     if Self::stage_access_overlaps_hazard(
                         reg,
+                        va_cache,
                         ps_acc,
                         gfx_root,
                         heap0,
@@ -731,11 +1015,13 @@ impl CommandList {
         let gfx_root = &self.gfx_root;
         let heap0 = self.heap0_cpu;
         let dst = &mut self.rp_sync.enc_uav_write_exact_res;
+        let va_cache = &mut *self.binds.buf_va_cache;
         let unb = with_resource_registry(|reg| {
             let mut u = false;
             if p.ms_as_writes_uav {
                 if Self::resolve_uav_write_with_reg(
                     reg,
+                    va_cache,
                     &p.ms_access,
                     gfx_root,
                     heap0,
@@ -747,6 +1033,7 @@ impl CommandList {
                 if let Some(as_acc) = &p.as_access {
                     if Self::resolve_uav_write_with_reg(
                         reg,
+                        va_cache,
                         as_acc,
                         gfx_root,
                         heap0,
@@ -762,6 +1049,7 @@ impl CommandList {
                     Some(ps_acc) => {
                         if Self::resolve_uav_write_with_reg(
                             reg,
+                            va_cache,
                             ps_acc,
                             gfx_root,
                             heap0,
@@ -957,6 +1245,7 @@ impl CommandList {
         gfx_root: &RootState,
         heap0: Option<(u64, u64, usize)>,
         pred: Option<super::state::Predication>,
+        va_cache: &mut BufVaCache,
         scratch: &mut Vec<usize>,
         exact_pre: &mut Vec<usize>,
         exact_ps: &mut Vec<usize>,
@@ -968,6 +1257,7 @@ impl CommandList {
         let (pre_unb, ps_unb) = with_resource_registry(|reg| {
             let (mut pre_u, mf) = Self::resolve_stage_access_with_reg(
                 reg,
+                va_cache,
                 &p.ms_access,
                 gfx_root,
                 heap0,
@@ -979,6 +1269,7 @@ impl CommandList {
             if let Some(as_acc) = &p.as_access {
                 let (au, af) = Self::resolve_stage_access_with_reg(
                     reg,
+                    va_cache,
                     as_acc,
                     gfx_root,
                     heap0,
@@ -993,7 +1284,7 @@ impl CommandList {
                 pre_u |= READS_BUF;
             }
             if let Some(pr) = pred {
-                if pr.gpu_va != 0 && !reg.push_buffer_va(pr.gpu_va, exact_pre) {
+                if pr.gpu_va != 0 && !reg.push_buffer_va_cached(va_cache, pr.gpu_va, exact_pre) {
                     pre_u |= READS_BUF;
                     pre_va_failed = true;
                 }
@@ -1002,6 +1293,7 @@ impl CommandList {
                 Some(ps_acc) => {
                     let (psu, psf) = Self::resolve_stage_access_with_reg(
                         reg,
+                        va_cache,
                         ps_acc,
                         gfx_root,
                         heap0,
@@ -1048,6 +1340,7 @@ impl CommandList {
             &self.gfx_root,
             self.heap0_cpu,
             self.predication,
+            &mut self.binds.buf_va_cache,
             &mut scratch,
             &mut self.rp_sync.cur_draw_pre_exact,
             &mut self.rp_sync.cur_draw_ps_exact,
@@ -1092,6 +1385,7 @@ impl CommandList {
             &self.gfx_root,
             self.heap0_cpu,
             self.predication,
+            &mut self.binds.buf_va_cache,
             &mut scratch,
             &mut self.rp_sync.enc_pre_raster_exact_res,
             &mut self.rp_sync.enc_ps_exact_res,
@@ -1113,18 +1407,9 @@ impl CommandList {
         self.ib.ib_scratch_op = scratch;
     }
 
-    #[allow(dead_code)]
-    pub(super) fn resolve_compute_binds(
-        slots: &[ComputeBind],
-        root: &RootState,
-        heap0: Option<(u64, u64, usize)>,
-        out: &mut Vec<usize>,
-    ) -> bool {
-        Self::resolve_compute_binds_spans(slots, root, heap0, out, None)
-    }
-
     pub(super) fn resolve_slots_with_reg(
         reg: &ResRegistry,
+        cache: &mut BufVaCache,
         slots: &[ComputeBind],
         root: &RootState,
         heap0: Option<(u64, u64, usize)>,
@@ -1138,80 +1423,80 @@ impl CommandList {
         if slots.is_empty() {
             return true;
         }
-        with_buf_va_cache(|cache| {
-            for &slot in slots {
-                match slot {
-                    ComputeBind::RootVa { param } => {
-                        let Some(va) = root.param_u64(param as usize) else {
-                            return false;
+        for &slot in slots {
+            match slot {
+                ComputeBind::RootVa { param } => {
+                    let Some(va) = root.param_u64(param as usize) else {
+                        return false;
+                    };
+                    if va != 0 {
+                        let ok = match spans.as_deref_mut() {
+                            Some(sp) => reg.push_buffer_span_cached(cache, va, 0, out, sp),
+                            None => reg.push_buffer_va_cached(cache, va, out),
                         };
-                        if va != 0 {
-                            let ok = match spans.as_deref_mut() {
-                                Some(sp) => reg.push_buffer_span_cached(cache, va, 0, out, sp),
-                                None => reg.push_buffer_va_cached(cache, va, out),
-                            };
-                            if !ok {
-                                return false;
-                            }
+                        if !ok {
+                            return false;
                         }
                     }
-                    ComputeBind::TableEntry { param, byte_offset } => {
-                        let Some(base_gpu) = root.param_u64(param as usize) else {
-                            return false;
+                }
+                ComputeBind::TableEntry { param, byte_offset } => {
+                    let Some(base_gpu) = root.param_u64(param as usize) else {
+                        return false;
+                    };
+                    if base_gpu == 0 {
+                        continue;
+                    }
+                    let Some((hbase, hlen, hcpu)) = heap0 else {
+                        return false;
+                    };
+                    let Some(entry_gpu) = base_gpu.checked_add(byte_offset) else {
+                        return false;
+                    };
+                    if entry_gpu < hbase || entry_gpu.saturating_add(24) > hbase.saturating_add(hlen)
+                    {
+                        return false;
+                    }
+                    let entry_off = (entry_gpu - hbase) as usize;
+                    let (gpu_va, tex_id, meta) = unsafe {
+                        let p = (hcpu + entry_off) as *const u64;
+                        (
+                            p.read_unaligned(),
+                            p.add(1).read_unaligned(),
+                            p.add(2).read_unaligned(),
+                        )
+                    };
+                    if gpu_va != 0 {
+                        let found = match spans.as_deref_mut() {
+                            Some(sp) => reg.push_buffer_span_cached(
+                                cache,
+                                gpu_va,
+                                meta & 0xffff_ffff,
+                                out,
+                                sp,
+                            ),
+                            None => reg.push_buffer_va_cached(cache, gpu_va, out),
                         };
-                        if base_gpu == 0 {
-                            continue;
+                        if !found {
+                            return false;
                         }
-                        let Some((hbase, hlen, hcpu)) = heap0 else {
+                    } else if tex_id != 0 {
+                        let Some(rk) = reg.lookup_texture_id(tex_id) else {
                             return false;
                         };
-                        let Some(entry_gpu) = base_gpu.checked_add(byte_offset) else {
-                            return false;
-                        };
-                        if entry_gpu < hbase || entry_gpu.saturating_add(24) > hbase.saturating_add(hlen) {
-                            return false;
+                        if out.last() != Some(&rk) && !out.contains(&rk) {
+                            out.push(rk);
                         }
-                        let entry_off = (entry_gpu - hbase) as usize;
-                        let (gpu_va, tex_id, meta) = unsafe {
-                            let p = (hcpu + entry_off) as *const u64;
-                            (
-                                p.read_unaligned(),
-                                p.add(1).read_unaligned(),
-                                p.add(2).read_unaligned(),
-                            )
-                        };
-                        if gpu_va != 0 {
-                            let found = match spans.as_deref_mut() {
-                                Some(sp) => reg.push_buffer_span_cached(
-                                    cache,
-                                    gpu_va,
-                                    meta & 0xffff_ffff,
-                                    out,
-                                    sp,
-                                ),
-                                None => reg.push_buffer_va_cached(cache, gpu_va, out),
-                            };
-                            if !found {
-                                return false;
-                            }
-                        } else if tex_id != 0 {
-                            let Some(rk) = reg.lookup_texture_id(tex_id) else {
-                                return false;
-                            };
-                            if !out.contains(&rk) {
-                                out.push(rk);
-                            }
-                            if let Some(sp) = spans.as_deref_mut() {
-                                push_subrange(sp, SubRange::whole(rk));
-                            }
+                        if let Some(sp) = spans.as_deref_mut() {
+                            push_subrange(sp, SubRange::whole(rk));
                         }
                     }
                 }
             }
-            true
-        })
+        }
+        true
     }
 
+    #[allow(dead_code)]
     pub(super) fn extract_compute_slot_tokens(
         slots: &[ComputeBind],
         root: &RootState,
@@ -1240,7 +1525,8 @@ impl CommandList {
                     let Some(entry_gpu) = base_gpu.checked_add(byte_offset) else {
                         return false;
                     };
-                    if entry_gpu < hbase || entry_gpu.saturating_add(24) > hbase.saturating_add(hlen) {
+                    if entry_gpu < hbase || entry_gpu.saturating_add(24) > hbase.saturating_add(hlen)
+                    {
                         return false;
                     }
                     let entry_off = (entry_gpu - hbase) as usize;
@@ -1258,23 +1544,221 @@ impl CommandList {
         }
         true
     }
+}
 
-    pub(super) fn resolve_compute_binds_spans(
-        slots: &[ComputeBind],
-        root: &RootState,
-        heap0: Option<(u64, u64, usize)>,
-        out: &mut Vec<usize>,
-        mut spans: Option<&mut Vec<SubRange>>,
-    ) -> bool {
-        if slots.is_empty() {
-            out.clear();
-            if let Some(sp) = spans.as_deref_mut() {
-                sp.clear();
-            }
-            return true;
-        }
-        with_resource_registry(|reg| {
-            Self::resolve_slots_with_reg(reg, slots, root, heap0, out, spans)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metal::cmdlist::state::SlotPlanCache;
+    use dxil_metal::root_signature::{
+        flags, DescriptorRange, DescriptorRangeType, RootDescriptor, RootDescriptorKind,
+        RootParameter, RootParameterKind, RootSignatureDesc, RootSignatureVersion,
+    };
+    use dxil_metal::RootSignature;
+    use std::sync::Arc;
+
+    fn make_rs_a() -> Arc<RootSignature> {
+        let range = |rt: DescriptorRangeType, n: u32, reg: u32| DescriptorRange {
+            range_type: rt,
+            num_descriptors: n,
+            base_shader_register: reg,
+            register_space: 0,
+            flags: flags::RANGE_V1_0_DEFAULT_CBV_SRV_UAV,
+            offset_in_descriptors_from_table_start: u32::MAX,
+        };
+        RootSignature::new_deferred(RootSignatureDesc {
+            version: RootSignatureVersion::V1_1,
+            parameters: vec![
+                // param 0: root CBV descriptor (u64)
+                RootParameter {
+                    kind: RootParameterKind::Descriptor(
+                        RootDescriptorKind::Cbv,
+                        RootDescriptor { shader_register: 0, register_space: 0, flags: 0 },
+                    ),
+                    visibility: 0,
+                },
+                // param 1: SRV/UAV descriptor table (u64)
+                RootParameter {
+                    kind: RootParameterKind::DescriptorTable(vec![range(
+                        DescriptorRangeType::Srv,
+                        8,
+                        0,
+                    )]),
+                    visibility: 0,
+                },
+                // param 2: 4x32-bit root constants (16 bytes -> param_u64 is None)
+                RootParameter {
+                    kind: RootParameterKind::Constants {
+                        shader_register: 1,
+                        register_space: 0,
+                        num_32bit_values: 4,
+                    },
+                    visibility: 0,
+                },
+                // param 3: second descriptor table (u64)
+                RootParameter {
+                    kind: RootParameterKind::DescriptorTable(vec![range(
+                        DescriptorRangeType::Uav,
+                        4,
+                        0,
+                    )]),
+                    visibility: 0,
+                },
+            ],
+            static_samplers: vec![],
+            flags: 0,
         })
+    }
+
+    fn make_rs_b() -> Arc<RootSignature> {
+        // Different layout: param 0 = CBV, param 1 = 4x32-bit constants (NOT a u64 slot!).
+        RootSignature::new_deferred(RootSignatureDesc {
+            version: RootSignatureVersion::V1_1,
+            parameters: vec![
+                RootParameter {
+                    kind: RootParameterKind::Descriptor(
+                        RootDescriptorKind::Cbv,
+                        RootDescriptor { shader_register: 0, register_space: 0, flags: 0 },
+                    ),
+                    visibility: 0,
+                },
+                RootParameter {
+                    kind: RootParameterKind::Constants {
+                        shader_register: 1,
+                        register_space: 0,
+                        num_32bit_values: 4,
+                    },
+                    visibility: 0,
+                },
+            ],
+            static_samplers: vec![],
+            flags: 0,
+        })
+    }
+
+    #[test]
+    fn slot_plan_cache_matches_reference_and_keys_by_rs_pso_and_epoch() {
+        let rs_a = make_rs_a();
+        let rs_b = make_rs_b();
+        assert_ne!(rs_a.hash(), rs_b.hash());
+
+        let mut root = RootState::default();
+        root.set_root_signature(rs_a.clone()).unwrap();
+
+        // Backing fake descriptor heap with 16 entries (24 bytes each = 384 bytes).
+        let mut heap_mem = vec![0u64; 16 * 3];
+        let hbase: u64 = 0x1_0000_0000;
+        let hlen: u64 = (heap_mem.len() * 8) as u64;
+        let hcpu: usize = heap_mem.as_ptr() as usize;
+        let heap0 = Some((hbase, hlen, hcpu));
+
+        let write_entry = |mem: &mut [u64], idx: usize, va: u64, tex_id: u64, meta: u64| {
+            mem[idx * 3] = va;
+            mem[idx * 3 + 1] = tex_id;
+            mem[idx * 3 + 2] = meta;
+        };
+        // Buffer descriptors and texture descriptors (with upper 32 bits of meta set to verify masking).
+        write_entry(&mut heap_mem, 1, 0x10_0100, 0, (0xABCDu64 << 32) | 0x400);
+        write_entry(&mut heap_mem, 4, 0, 0x7777, (0x1234u64 << 32) | 0x20);
+        write_entry(&mut heap_mem, 2, 0x20_0200, 0, 0x800);
+        write_entry(&mut heap_mem, 8, 0x30_0000, 0, 0x100);
+
+        root.set_descriptor(0, 0x10_0000).unwrap();
+        root.set_table(1, hbase + 24).unwrap(); // starts at entry 1
+        root.set_table(3, hbase + 8 * 24).unwrap(); // starts at entry 8
+
+        let mut reg = ResRegistry::default();
+        reg.insert_buffer(0x10_0000, 0x12_0000, 11);
+        reg.insert_buffer(0x20_0000, 0x22_0000, 22);
+        reg.insert_buffer(0x30_0000, 0x31_0000, 33);
+        reg.insert_tex_id(0x7777, 44);
+
+        // Coalesced out-of-order TableRun on param 1 + RootVa on param 0 + TableRun on param 3.
+        let slots_a = vec![
+            ComputeBind::RootVa { param: 0 },
+            ComputeBind::TableEntry { param: 1, byte_offset: 3 * 24 }, // entry 4 (tex 44)
+            ComputeBind::TableEntry { param: 1, byte_offset: 0 },      // entry 1 (buf 11, len 0x400)
+            ComputeBind::TableEntry { param: 1, byte_offset: 24 },     // entry 2 (buf 22, len 0x800)
+            ComputeBind::TableEntry { param: 3, byte_offset: 0 },      // entry 8 (buf 33, len 0x100)
+        ];
+        let slots_uav = vec![ComputeBind::TableEntry { param: 3, byte_offset: 0 }];
+
+        let mut cache = SlotPlanCache::new();
+        let pso_a: usize = 0x1000;
+        let pso_b: usize = 0x2000;
+
+        // 1) Token extraction and resource resolution match reference identically (with and without spans).
+        let idx_read = cache.get_or_compile(pso_a, 1, &slots_a, &root);
+        let idx_uav = cache.get_or_compile(pso_a, 0, &slots_uav, &root);
+        assert_ne!(idx_read, idx_uav, "distinct stage_tags for same PSO must not collide");
+
+        let mut plan_toks = Vec::new();
+        let mut ref_toks = Vec::new();
+        assert!(cache.plan(idx_read).extract_tokens(&root, heap0, &mut plan_toks));
+        assert!(CommandList::extract_compute_slot_tokens(&slots_a, &root, heap0, &mut ref_toks));
+        assert_eq!(plan_toks, ref_toks);
+
+        let mut va_cache_plan = BufVaCache::new();
+        let mut va_cache_ref = BufVaCache::new();
+        let mut out_plan = Vec::new();
+        let mut out_ref = Vec::new();
+        let mut spans_plan = Vec::new();
+        let mut spans_ref = Vec::new();
+        assert!(cache.plan(idx_read).resolve_from_tokens(
+            &reg,
+            &mut va_cache_plan,
+            &plan_toks,
+            &mut out_plan,
+            Some(&mut spans_plan),
+        ));
+        assert!(CommandList::resolve_slots_with_reg(
+            &reg,
+            &mut va_cache_ref,
+            &slots_a,
+            &root,
+            heap0,
+            &mut out_ref,
+            Some(&mut spans_ref),
+        ));
+        assert_eq!(out_plan, out_ref);
+        assert_eq!(spans_plan, spans_ref);
+
+        // 2) `base_gpu == 0` emits zeroed triples identically to reference.
+        root.set_table(1, 0).unwrap();
+        plan_toks.clear();
+        ref_toks.clear();
+        assert!(cache.plan(idx_read).extract_tokens(&root, heap0, &mut plan_toks));
+        assert!(CommandList::extract_compute_slot_tokens(&slots_a, &root, heap0, &mut ref_toks));
+        assert_eq!(plan_toks, ref_toks);
+
+        // 3) Out-of-bounds heap0 fails identically to reference.
+        root.set_table(1, hbase + hlen - 24).unwrap(); // offset 3*24 exceeds h_end
+        plan_toks.clear();
+        ref_toks.clear();
+        assert!(!cache.plan(idx_read).extract_tokens(&root, heap0, &mut plan_toks));
+        assert!(!CommandList::extract_compute_slot_tokens(&slots_a, &root, heap0, &mut ref_toks));
+        assert!(!cache.plan(idx_read).extract_tokens(&root, None, &mut plan_toks));
+
+        // 4) Switching root signature (`rs_a` -> `rs_b`) changes `rs_hash` and invalidates the
+        //    cached plan (param 1 is now 16-byte constants -> plan must compile as invalid).
+        root.set_root_signature(rs_b).unwrap();
+        root.set_descriptor(0, 0x10_0000).unwrap();
+        let idx_rs_b = cache.get_or_compile(pso_a, 1, &slots_a, &root);
+        plan_toks.clear();
+        assert!(!cache.plan(idx_rs_b).extract_tokens(&root, heap0, &mut plan_toks));
+
+        // 5) Distinct PSOs with the same RS can each cache their own valid plans, and
+        //    `invalidate()` (as called on `CommandList::begin()`) bumps the epoch.
+        let slots_root_only = vec![ComputeBind::RootVa { param: 0 }];
+        let idx_pso_b = cache.get_or_compile(pso_b, 1, &slots_root_only, &root);
+        plan_toks.clear();
+        assert!(cache.plan(idx_pso_b).extract_tokens(&root, heap0, &mut plan_toks));
+        assert_eq!(plan_toks, vec![0x10_0000]);
+
+        cache.invalidate();
+        let idx_after_inv = cache.get_or_compile(pso_b, 1, &slots_root_only, &root);
+        plan_toks.clear();
+        assert!(cache.plan(idx_after_inv).extract_tokens(&root, heap0, &mut plan_toks));
+        assert_eq!(plan_toks, vec![0x10_0000]);
     }
 }

@@ -73,7 +73,8 @@ impl CommandList {
             self.clear_all_pend();
             self.bar.vtx_carry = NO_VTX;
             self.bar.vtx_carry_req = [[0; 7]; 2];
-            self.bar.vtx_carry_items = [Vec::new(), Vec::new()];
+            self.bar.vtx_carry_items[0].clear();
+            self.bar.vtx_carry_items[1].clear();
             self.bar.vtx_carry_poisoned = [false; 2];
             if !full && !has_pend {
                 self.bar.enc_sync_after = MTLStages::empty();
@@ -408,7 +409,7 @@ impl CommandList {
                     let c_items = std::mem::take(&mut self.bar.vtx_carry_items[i]);
                     let c_poison = std::mem::replace(&mut self.bar.vtx_carry_poisoned[i], false);
                     let mut comb_req = [0u32; 7];
-                    let mut comb_items = Vec::new();
+                    let mut comb_items = SoftOblVec::new();
                     let mut comb_poison = false;
                     if !sa.is_empty() && !sb.is_empty() {
                         merge_req_for_after(&mut comb_req, sa, &sr);
@@ -516,7 +517,7 @@ impl CommandList {
             let mut deferred = false;
             let mut merged_soft: [Option<(MTLStages, MTLStages)>; 2] = NO_VTX;
             let mut merged_soft_req: [[u32; 7]; 2] = [[0; 7]; 2];
-            let mut merged_soft_items: [Vec<SoftPreResObl>; 2] = [Vec::new(), Vec::new()];
+            let mut merged_soft_items: [SoftOblVec; 2] = [SoftOblVec::new(), SoftOblVec::new()];
             let mut merged_soft_poison = [false; 2];
             if let Some((cap_frag, cap_req)) = clear_cap {
                 if !self.bar.split_pend.vtx_after.is_empty()
@@ -562,7 +563,7 @@ impl CommandList {
                     let c_items = std::mem::take(&mut self.bar.vtx_carry_items[i]);
                     let c_poison = std::mem::replace(&mut self.bar.vtx_carry_poisoned[i], false);
                     let mut comb_req = [0u32; 7];
-                    let mut comb_items = Vec::new();
+                    let mut comb_items = SoftOblVec::new();
                     let mut comb_poison = false;
                     if !sa.is_empty() && !sb.is_empty() {
                         merge_req_for_after(&mut comb_req, sa, &sr);
@@ -1004,12 +1005,14 @@ impl CommandList {
             self.clear_all_pend();
             self.bar.vtx_carry = NO_VTX;
             self.bar.vtx_carry_req = [[0; 7]; 2];
-            self.bar.vtx_carry_items = [Vec::new(), Vec::new()];
+            self.bar.vtx_carry_items[0].clear();
+            self.bar.vtx_carry_items[1].clear();
             self.bar.vtx_carry_poisoned = [false; 2];
             self.bar.vtx_carry_list_frag = false;
             self.bar.vtx_defer = NO_VTX;
             self.bar.vtx_defer_req = [[0; 7]; 2];
-            self.bar.vtx_defer_items = [Vec::new(), Vec::new()];
+            self.bar.vtx_defer_items[0].clear();
+            self.bar.vtx_defer_items[1].clear();
             self.bar.vtx_defer_poisoned = [false; 2];
             self.bar.arm_post_draw0_list_frag = [false; 2];
             if (opening_pre_raster_reads & READS_TEX) == 0 {
@@ -2206,18 +2209,20 @@ impl CommandList {
         let copy_light = self.is_copy_queue_light();
         let shader =
             S::Vertex | S::Object | S::Mesh | S::Fragment | S::Dispatch | S::AccelerationStructure;
+        let track_read_only =
+            matches!(self.enc, Encoder::Render(_)) && self.opts.opt_rp_keep_write;
         let (mut after, mut before, mut all_res) = (S::empty(), S::empty(), false);
         let mut soft = [S::empty(); 2];
-        let mut local_split = SplitPend::default();
+        let mut local_split = SplitMasks::default();
         let (mut read_after, mut read_before) = (S::empty(), S::empty());
         let mut read_soft = [S::empty(); 2];
-        let mut read_split = SplitPend::default();
-        let add_soft = |soft: &mut [S; 2], r: usize, st: S| {
-            let c = res_class(r);
-            for (i, s) in soft.iter_mut().enumerate() {
-                if c & (1 << i) != 0 {
-                    *s |= st;
-                }
+        let mut read_split = SplitMasks::default();
+        let add_soft_cls = |soft: &mut [S; 2], cls: u8, st: S| {
+            if cls & 1 != 0 {
+                soft[0] |= st;
+            }
+            if cls & 2 != 0 {
+                soft[1] |= st;
             }
         };
         let mut uav_all = false;
@@ -2263,17 +2268,32 @@ impl CommandList {
             && masked_mode
             && !copy_light;
         let track_frag_rt = self.clear_isolate_active() && masked_mode && !copy_light;
-        let mut local_rt_frag = std::mem::take(&mut self.bar.bar_scratch_rt_frag);
-        local_rt_frag.clear();
+        let mut local_rt_frag = if track_frag_rt {
+            let mut v = std::mem::take(&mut self.bar.bar_scratch_rt_frag);
+            v.clear();
+            v
+        } else {
+            Vec::new()
+        };
         let mut local_non_rt_frag = S::empty();
         let mut local_rt_poison = false;
-        let mut local_soft_items = std::mem::take(&mut self.bar.bar_scratch_soft);
-        local_soft_items[0].clear();
-        local_soft_items[1].clear();
+        let mut local_soft_items = if track_soft_items {
+            let mut v = std::mem::take(&mut self.bar.bar_scratch_soft);
+            v[0].clear();
+            v[1].clear();
+            v
+        } else {
+            [Vec::new(), Vec::new()]
+        };
         let mut local_soft_poison = [false; 2];
-        let mut read_soft_items = std::mem::take(&mut self.bar.bar_scratch_read_soft);
-        read_soft_items[0].clear();
-        read_soft_items[1].clear();
+        let mut read_soft_items = if track_read_only && track_soft_items {
+            let mut v = std::mem::take(&mut self.bar.bar_scratch_read_soft);
+            v[0].clear();
+            v[1].clear();
+            v
+        } else {
+            [Vec::new(), Vec::new()]
+        };
         let mut read_soft_poison = [false; 2];
         let allow_all_soft = self.opts.opt_cs_to_ps_overlap_v2
             || self.gfx_to_ps_overlap_active()
@@ -2283,7 +2303,7 @@ impl CommandList {
                                 r: usize,
                                 ia: S,
                                 isoft: [S; 2]| {
-            if !track_soft_items || ia.is_empty() {
+            if !track_soft_items || ia.is_empty() || (isoft[0] | isoft[1]).is_empty() {
                 return;
             }
             const SIMUL: u32 = crate::types::resource_flags::ALLOW_SIMULTANEOUS_ACCESS;
@@ -2300,20 +2320,38 @@ impl CommandList {
                 }
             }
         };
-        let mut cs_mid_items = std::mem::take(&mut self.bar.bar_scratch_cs_mid);
-        cs_mid_items.clear();
-        let mut read_cs_mid_items = std::mem::take(&mut self.bar.bar_scratch_read_cs_mid);
-        read_cs_mid_items.clear();
+        let need_cs_mid = defer_cs_mid || collect_cs_soft;
+        let mut cs_mid_items = if need_cs_mid {
+            let mut v = std::mem::take(&mut self.bar.bar_scratch_cs_mid);
+            v.clear();
+            v
+        } else {
+            Vec::new()
+        };
+        let mut read_cs_mid_items = if track_read_only && collect_cs_soft {
+            let mut v = std::mem::take(&mut self.bar.bar_scratch_read_cs_mid);
+            v.clear();
+            v
+        } else {
+            Vec::new()
+        };
         let mut uav0_disp_after = S::empty();
         let track_exact_clear = self.opts.opt_clear_overlap_exact
             && masked_mode
             && !copy_light
             && !self.bar.in_list_gfx_non_clear;
-        let mut active_items = std::mem::take(&mut self.bar.bar_scratch_active);
-        active_items.clear();
+        let mut active_items = if track_exact_clear {
+            let mut v = std::mem::take(&mut self.bar.bar_scratch_active);
+            v.clear();
+            v
+        } else {
+            Vec::new()
+        };
         let mut batch_pt = std::mem::take(&mut self.bar.bar_scratch_pt);
         batch_pt.clear();
-        batch_pt.extend_from_slice(&self.bar.uav_passthrough);
+        if !self.bar.uav_passthrough.is_empty() {
+            batch_pt.extend_from_slice(&self.bar.uav_passthrough);
+        }
         let mut split_begin_res: Vec<usize> = Vec::new();
         let mut split_begin_all = false;
         let mut split_begin_keys: Vec<(usize, u32, u32, u32)> = Vec::new();
@@ -2328,6 +2366,9 @@ impl CommandList {
             && !copy_light;
         const SRV_UAV: u32 = 0x8 | 0x40;
         const VS_BUF_SOFT: u32 = 0x1 | 0x2 | 0x200;
+        const BUF_ONLY_BITS: u32 = 0x1 | 0x2 | 0x100 | 0x200 | 0x40_0000;
+        const TEX_ONLY_BITS: u32 = 0x4 | 0x10 | 0x20 | 0x1000 | 0x2000;
+        let filter_bits = self.opts.opt_split_res_soft_sync || self.opts.opt_barrier_tight_v2;
         for b in items {
             match *b {
                 Barrier::SplitBegin(r, sub, s0, s1) => {
@@ -2410,9 +2451,31 @@ impl CommandList {
                     } else {
                         all_matched_split_end = false;
                     }
-                    if ib_tight && r != 0 {
-                        unsafe { (*(r as *const Resource)).register_ptr() };
-                    }
+                    let (is_buf, cls) = if r == 0 {
+                        (false, READS_TEX | READS_BUF)
+                    } else {
+                        let res_ref = unsafe { &*(r as *const Resource) };
+                        if ib_tight {
+                            res_ref.register_ptr();
+                        }
+                        if res_ref.desc.Dimension == crate::types::dim::BUFFER {
+                            (true, READS_BUF)
+                        } else {
+                            (false, READS_TEX)
+                        }
+                    };
+                    let filter_state = |s: u32| -> u32 {
+                        if r == 0 || s == 0 {
+                            return s;
+                        }
+                        let f = if is_buf { s & !TEX_ONLY_BITS } else { s & !BUF_ONLY_BITS };
+                        if f != 0 { f } else { s }
+                    };
+                    let (filt_s0, filt_s1) = if track_blit_safe || filter_bits {
+                        (filter_state(s0), filter_state(s1))
+                    } else {
+                        (s0, s1)
+                    };
                     if track_list_start_blit {
                         const SIMUL: u32 = crate::types::resource_flags::ALLOW_SIMULTANEOUS_ACCESS;
                         if r == 0 {
@@ -2450,32 +2513,26 @@ impl CommandList {
                         }
                     }
                     if track_blit_safe && r != 0 {
-                        let eff_s0_b = filter_res_state_bits(r, s0);
-                        let eff_s1_b = filter_res_state_bits(r, s1);
+                        let eff_s0_b = filt_s0;
+                        let eff_s1_b = filt_s1;
                         if s0 == 0
                             && self.opts.opt_queue_start_stage_exact
                             && (!self.bar.has_gpu_work || self.bar.list_cs_unwaited_frag)
-                            && !self.bar.blit_frag_tainted.contains(&r)
+                            && !self.bar.is_blit_tainted(r)
                             && unsafe { (*(r as *const Resource)).is_fresh_nonfrag_blit_safe() }
                         {
-                            if eff_s1_b != 0
-                                && (eff_s1_b & !(0x400 | 0x800)) == 0
-                                && !self.bar.blit_safe_resources.contains(&r)
-                            {
-                                self.bar.blit_safe_resources.push(r);
+                            if eff_s1_b != 0 && (eff_s1_b & !(0x400 | 0x800)) == 0 {
+                                self.bar.mark_blit_safe(r);
                             }
                         } else if s0 == 0 || state_stages(eff_s0_b).contains(S::Fragment) {
-                            if !self.bar.blit_frag_tainted.contains(&r) {
-                                self.bar.blit_frag_tainted.push(r);
-                            }
-                            self.bar.blit_safe_resources.retain(|&x| x != r);
+                            self.bar.mark_blit_tainted(r);
+                            self.bar.remove_blit_safe(r);
                         } else if (!self.bar.has_gpu_work || self.bar.list_cs_unwaited_frag)
                             && eff_s1_b != 0
                             && (eff_s1_b & !(0x400 | 0x800)) == 0
-                            && !self.bar.blit_frag_tainted.contains(&r)
-                            && !self.bar.blit_safe_resources.contains(&r)
+                            && !self.bar.is_blit_tainted(r)
                         {
-                            self.bar.blit_safe_resources.push(r);
+                            self.bar.mark_blit_safe(r);
                         }
                     }
                     if s0 == s1 {
@@ -2498,17 +2555,14 @@ impl CommandList {
                     if track_exact_clear {
                         active_items.push(*b);
                     }
-                    let (eff_s0, eff_s1) =
-                        if self.opts.opt_split_res_soft_sync || self.opts.opt_barrier_tight_v2 {
-                            let e0 = filter_res_state_bits(r, s0);
-                            let e1 = filter_res_state_bits(r, s1);
-                            if self.opts.opt_split_res_soft_sync && (e0 != s0 || e1 != s1) {
-                                stats::inc(&stats::c::res_soft_sync);
-                            }
-                            (e0, e1)
-                        } else {
-                            (s0, s1)
-                        };
+                    let (eff_s0, eff_s1) = if filter_bits {
+                        if self.opts.opt_split_res_soft_sync && (filt_s0 != s0 || filt_s1 != s1) {
+                            stats::inc(&stats::c::res_soft_sync);
+                        }
+                        (filt_s0, filt_s1)
+                    } else {
+                        (s0, s1)
+                    };
                     let st_after = if s0 == 0
                         && self.opts.opt_queue_start_stage_exact
                         && r != 0
@@ -2518,7 +2572,7 @@ impl CommandList {
                         && !self.bar.in_list_gfx_non_clear
                         && self.bar.cs_disp_gen == 0
                         && self.bar.cs_as_gen == 0
-                        && !self.bar.blit_frag_tainted.contains(&r)
+                        && !self.bar.is_blit_tainted(r)
                         && unsafe { (*(r as *const Resource)).is_fresh_nonfrag_blit_safe() }
                         && (!self.bar.has_gpu_work
                             || self.bar.enc_cur_sync[STAGE_BLIT]
@@ -2536,11 +2590,11 @@ impl CommandList {
                     if (eff_s1 & 0x8) != 0 {
                         Self::pt_insert(&mut batch_pt, r, st_after);
                     }
-                    let is_read_dst = s1 != 0 && (eff_s1 & D3D12_WRITE_STATES) == 0;
+                    let is_read_dst =
+                        track_read_only && s1 != 0 && (eff_s1 & D3D12_WRITE_STATES) == 0;
                     // Vertex/object/mesh reads through SRV/UAV states (and buffer
                     // VB_CB/IB/INDIRECT_ARG states under `AW2_VS_BUF_DEFER_EXACT=1`)
                     // can be ordered at the first draw that reads in those stages.
-                    let is_buf = r != 0 && res_class(r) == READS_BUF;
                     let soft_mask = if vs_buf_defer && is_buf {
                         SRV_UAV | VS_BUF_SOFT
                     } else {
@@ -2551,7 +2605,7 @@ impl CommandList {
                     let mut item_soft = [S::empty(); 2];
                     if eff_s1 & soft_mask != 0 {
                         let st = state_stages(eff_s1 & soft_mask);
-                        add_soft(&mut item_soft, r, st & PRE_RASTER);
+                        add_soft_cls(&mut item_soft, cls, st & PRE_RASTER);
                         item_before |= st - PRE_RASTER;
                     }
                     if hard != 0 || s1 == 0 {
@@ -2561,7 +2615,7 @@ impl CommandList {
                             && self.opts.opt_ps_srv_class_exact
                             && unsafe { (*(r as *const Resource)).desc.Flags & SIMUL == 0 }
                         {
-                            add_soft(&mut item_soft, r, PRE_RASTER);
+                            add_soft_cls(&mut item_soft, cls, PRE_RASTER);
                             item_before |= S::All - PRE_RASTER;
                         } else if s1 == 0
                             && !is_buf
@@ -2570,7 +2624,7 @@ impl CommandList {
                                 || self.gfx_to_ps_overlap_active())
                             && unsafe { (*(r as *const Resource)).desc.Flags & SIMUL == 0 }
                         {
-                            add_soft(&mut item_soft, r, PRE_RASTER);
+                            add_soft_cls(&mut item_soft, cls, PRE_RASTER);
                             item_before |= S::All - PRE_RASTER;
                             if self.opts.opt_icb_enc_barrier_exact {
                                 stats::inc(&stats::c::icb_enc_barrier_exact);
@@ -2580,7 +2634,9 @@ impl CommandList {
                             item_before |= st_hard;
                         }
                     }
-                    item_before = strip_nonbuf_accel(r, item_before);
+                    if r != 0 && !is_buf && item_before != S::All {
+                        item_before -= S::AccelerationStructure;
+                    }
                     if item_before == S::All {
                         item_soft = [S::empty(); 2];
                     } else if vs_buf_defer
@@ -2637,7 +2693,7 @@ impl CommandList {
                         st_after,
                         item_soft,
                     );
-                    if (defer_cs_mid || collect_cs_soft)
+                    if need_cs_mid
                         && r != 0
                         && (item_before != S::All || allow_all_cs_mid)
                     {
@@ -2701,16 +2757,30 @@ impl CommandList {
                         }
                     }
                     had_uav_item = true;
-                    if ib_tight && r != 0 {
-                        unsafe { (*(r as *const Resource)).register_ptr() };
-                    }
+                    let cls = if r == 0 {
+                        READS_TEX | READS_BUF
+                    } else {
+                        let res_ref = unsafe { &*(r as *const Resource) };
+                        if ib_tight {
+                            res_ref.register_ptr();
+                        }
+                        if res_ref.desc.Dimension == crate::types::dim::BUFFER {
+                            READS_BUF
+                        } else {
+                            READS_TEX
+                        }
+                    };
                     if track_exact_clear {
                         active_items.push(*b);
                     }
                     let uav_after = self.source_stages_for_uav_with(r, shader, true, &batch_pt);
                     let mut item_soft = [S::empty(); 2];
-                    add_soft(&mut item_soft, r, PRE_RASTER);
-                    let uav_hard = strip_nonbuf_accel(r, shader - PRE_RASTER);
+                    add_soft_cls(&mut item_soft, cls, PRE_RASTER);
+                    let uav_hard = if r != 0 && cls == READS_TEX {
+                        (shader - PRE_RASTER) - S::AccelerationStructure
+                    } else {
+                        shader - PRE_RASTER
+                    };
                     if track_frag_rt
                         && !uav_after.is_empty()
                         && (uav_hard == S::All || uav_hard.contains(S::Fragment))
@@ -2746,7 +2816,7 @@ impl CommandList {
                         uav_after,
                         item_soft,
                     );
-                    if (defer_cs_mid || collect_cs_soft) && r != 0 {
+                    if need_cs_mid && r != 0 {
                         let da = if uav_hard.contains(S::Dispatch) {
                             uav_after
                         } else {
@@ -2791,7 +2861,7 @@ impl CommandList {
             after = S::All;
             before = S::All;
             all_res = true;
-            local_split = SplitPend::default();
+            local_split = SplitMasks::default();
             local_split.add(S::All, S::All, [S::empty(); 2]);
             local_soft_poison = [true; 2];
             local_rt_poison = true;
@@ -3077,14 +3147,14 @@ impl CommandList {
             after = S::Blit;
             before = S::Blit;
             soft = [S::empty(); 2];
-            local_split = SplitPend::default();
+            local_split = SplitMasks::default();
             local_split.add(S::Blit, S::Blit, [S::empty(); 2]);
             stats::inc(&stats::c::copy_q_light);
         } else {
             if let Some(cs_after) = pre_uav_overlap_cs {
                 if matches!(self.enc, Encoder::None) {
                     after = cs_after;
-                    local_split = SplitPend::default();
+                    local_split = SplitMasks::default();
                     local_split.add(cs_after, before, soft);
                     local_rt_poison = true;
                     for v in &mut local_soft_items {
@@ -3126,7 +3196,7 @@ impl CommandList {
                     let mut na = S::empty();
                     let mut nb = S::empty();
                     let mut nsoft = [S::empty(); 2];
-                    let mut nsplit = SplitPend::default();
+                    let mut nsplit = SplitMasks::default();
                     let mut n_soft_items = std::mem::take(&mut self.bar.bar_scratch_n_soft);
                     n_soft_items[0].clear();
                     n_soft_items[1].clear();
@@ -3188,7 +3258,7 @@ impl CommandList {
                                         | if in_synced_cs { S::empty() } else { anchor },
                                 );
                                 let mut isoft = [S::empty(); 2];
-                                add_soft(&mut isoft, r, PRE_RASTER);
+                                add_soft_cls(&mut isoft, res_class(r), PRE_RASTER);
                                 let uav_hard = strip_nonbuf_accel(r, shader - PRE_RASTER);
                                 na |= ia;
                                 nb |= uav_hard;
@@ -3232,7 +3302,7 @@ impl CommandList {
                                 let hard = eff_s1 & !soft_mask;
                                 if eff_s1 & soft_mask != 0 {
                                     let st = state_stages(eff_s1 & soft_mask);
-                                    add_soft(&mut st_soft, r, st & PRE_RASTER);
+                                    add_soft_cls(&mut st_soft, res_class(r), st & PRE_RASTER);
                                     st_before |= st - PRE_RASTER;
                                 }
                                 if hard != 0 || s1 == 0 {
@@ -3524,8 +3594,7 @@ impl CommandList {
                         merge_req_for_after(&mut self.bar.frag_non_rt_req, read_after, &req);
                     }
                 }
-                read_split.stamp_all_req(req);
-                self.bar.split_pend.merge(read_split);
+                self.bar.split_pend.merge_masks(&read_split, &req);
                 if track_soft_items {
                     for i in 0..2 {
                         if read_soft_poison[i] {
@@ -3583,8 +3652,7 @@ impl CommandList {
             local_split.disp_after = S::empty();
             local_split.blit_after = S::empty();
             local_split.as_after = S::empty();
-            local_split.stamp_all_req(req);
-            self.bar.split_pend.merge(local_split);
+            self.bar.split_pend.merge_masks(&local_split, &req);
             self.sync_legacy_from_split();
             if track_frag_rt {
                 if local_rt_poison {
@@ -3653,8 +3721,7 @@ impl CommandList {
             local_split.disp_after = S::empty();
             local_split.blit_after = S::empty();
             local_split.as_after = S::empty();
-            local_split.stamp_all_req(req);
-            self.bar.split_pend.merge(local_split);
+            self.bar.split_pend.merge_masks(&local_split, &req);
             self.sync_legacy_from_split();
             if track_frag_rt {
                 if local_rt_poison {
@@ -3706,8 +3773,7 @@ impl CommandList {
             } else {
                 self.cur_producer_gen()
             };
-            local_split.stamp_all_req(req);
-            self.bar.split_pend.merge(local_split);
+            self.bar.split_pend.merge_masks(&local_split, &req);
             if track_frag_rt {
                 if self.bar.needs_barrier || all_res || local_rt_poison {
                     self.bar.frag_rt_poisoned = true;
@@ -3833,7 +3899,8 @@ impl CommandList {
                                 self.bar.cs_uav_soft[0] |= shader & PRE_RASTER;
                                 self.bar.cs_uav_soft[1] |= shader & PRE_RASTER;
                                 self.bar.cs_uav_soft_poisoned = [true; 2];
-                                self.bar.cs_uav_soft_items = [Vec::new(), Vec::new()];
+                                self.bar.cs_uav_soft_items[0].clear();
+                                self.bar.cs_uav_soft_items[1].clear();
                             }
                         } else {
                             self.bar.pend_cs_poisoned[0] = true;
@@ -3931,7 +3998,8 @@ impl CommandList {
                         self.bar.cs_uav_soft[0] |= shader & PRE_RASTER;
                         self.bar.cs_uav_soft[1] |= shader & PRE_RASTER;
                         self.bar.cs_uav_soft_poisoned = [true; 2];
-                        self.bar.cs_uav_soft_items = [Vec::new(), Vec::new()];
+                        self.bar.cs_uav_soft_items[0].clear();
+                        self.bar.cs_uav_soft_items[1].clear();
                     }
                 }
             }
@@ -3962,22 +4030,34 @@ impl CommandList {
         mut batch_pt: Vec<(usize, MTLStages)>,
     ) {
         res.clear();
-        local_rt_frag.clear();
-        local_soft_items[0].clear();
-        local_soft_items[1].clear();
-        read_soft_items[0].clear();
-        read_soft_items[1].clear();
-        cs_mid_items.clear();
-        read_cs_mid_items.clear();
-        active_items.clear();
-        batch_pt.clear();
         self.bar.bar_scratch_res = res;
-        self.bar.bar_scratch_rt_frag = local_rt_frag;
-        self.bar.bar_scratch_soft = local_soft_items;
-        self.bar.bar_scratch_read_soft = read_soft_items;
-        self.bar.bar_scratch_cs_mid = cs_mid_items;
-        self.bar.bar_scratch_read_cs_mid = read_cs_mid_items;
-        self.bar.bar_scratch_active = active_items;
+        if local_rt_frag.capacity() > 0 {
+            local_rt_frag.clear();
+            self.bar.bar_scratch_rt_frag = local_rt_frag;
+        }
+        if local_soft_items[0].capacity() > 0 || local_soft_items[1].capacity() > 0 {
+            local_soft_items[0].clear();
+            local_soft_items[1].clear();
+            self.bar.bar_scratch_soft = local_soft_items;
+        }
+        if read_soft_items[0].capacity() > 0 || read_soft_items[1].capacity() > 0 {
+            read_soft_items[0].clear();
+            read_soft_items[1].clear();
+            self.bar.bar_scratch_read_soft = read_soft_items;
+        }
+        if cs_mid_items.capacity() > 0 {
+            cs_mid_items.clear();
+            self.bar.bar_scratch_cs_mid = cs_mid_items;
+        }
+        if read_cs_mid_items.capacity() > 0 {
+            read_cs_mid_items.clear();
+            self.bar.bar_scratch_read_cs_mid = read_cs_mid_items;
+        }
+        if active_items.capacity() > 0 {
+            active_items.clear();
+            self.bar.bar_scratch_active = active_items;
+        }
+        batch_pt.clear();
         self.bar.bar_scratch_pt = batch_pt;
     }
 
