@@ -2534,16 +2534,9 @@ unsafe fn verify_cert_via_chain_policy(
         if !mem.is_null() {
             for i in 0..ch_stores as usize {
                 let s = std::ptr::read_unaligned(pah_stores.add(i));
-                for der in super::crypt32::store_certs_der(s) {
-                    let _ = super::crypt32::CertAddEncodedCertificateToStore(
-                        mem,
-                        X509_ASN_ENCODING,
-                        der.as_ptr(),
-                        der.len() as u32,
-                        4,
-                        std::ptr::null_mut(),
-                    );
-                }
+                // Preserve certificate context properties (including CERT_ENHKEY_USAGE_PROP_ID)
+                // when consolidating caller-supplied verification stores.
+                super::crypt32::copy_store_certs_with_properties(s, mem);
             }
         }
         mem
@@ -5680,6 +5673,197 @@ mod tests {
 
             crate::misc::crypt32::CertFreeCertificateChainEngine(eng);
             crate::misc::crypt32::CertCloseStore(root_st, 0);
+        }
+    }
+
+    #[test]
+    fn wtd_choice_cert_preserves_store_eku_restrictions() {
+        fn der_tlv(tag: u8, val: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if val.len() < 0x80 {
+                out.push(val.len() as u8);
+            } else if val.len() <= 0xFF {
+                out.push(0x81);
+                out.push(val.len() as u8);
+            } else {
+                out.push(0x82);
+                out.push((val.len() >> 8) as u8);
+                out.push((val.len() & 0xFF) as u8);
+            }
+            out.extend_from_slice(val);
+            out
+        }
+
+        let pk_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(
+                crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER.to_vec(),
+            ),
+        );
+        let signing_key = crate::net_tls::crypto_provider()
+            .key_provider
+            .load_private_key(pk_der)
+            .expect("load Ed25519 key");
+        let spki = signing_key.public_key().expect("spki").as_ref().to_vec();
+        let alg = der_tlv(0x30, &der_tlv(0x06, &[0x2B, 0x65, 0x70]));
+        let mk_dn = |cn: &str| {
+            let mut atv = der_tlv(0x06, &[0x55, 0x04, 0x03]);
+            atv.extend_from_slice(&der_tlv(0x0C, cn.as_bytes()));
+            der_tlv(0x30, &der_tlv(0x31, &der_tlv(0x30, &atv)))
+        };
+        let sign_cert = |serial: u8, subj: &str, iss: &str, is_ca: bool| -> Vec<u8> {
+            let mut val = der_tlv(0x17, b"240101000000Z");
+            val.extend_from_slice(&der_tlv(0x17, b"350101000000Z"));
+            let mut exts = Vec::new();
+            let mut bc_val = Vec::new();
+            if is_ca {
+                bc_val.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+            }
+            let mut bc = der_tlv(0x06, &[0x55, 0x1D, 0x13]);
+            bc.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+            bc.extend_from_slice(&der_tlv(0x04, &der_tlv(0x30, &bc_val)));
+            exts.extend_from_slice(&der_tlv(0x30, &bc));
+            if is_ca {
+                let mut ku = der_tlv(0x06, &[0x55, 0x1D, 0x0F]);
+                ku.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+                ku.extend_from_slice(&der_tlv(0x04, &der_tlv(0x03, &[0x02, 0x04])));
+                exts.extend_from_slice(&der_tlv(0x30, &ku));
+            } else {
+                let mut san = der_tlv(0x06, &[0x55, 0x1D, 0x11]);
+                san.extend_from_slice(&der_tlv(0x04, &der_tlv(0x30, &der_tlv(0x82, b"wtd-eku.test"))));
+                exts.extend_from_slice(&der_tlv(0x30, &san));
+            }
+            let mut tbs_body = der_tlv(0xA0, &der_tlv(0x02, &[0x02]));
+            tbs_body.extend_from_slice(&der_tlv(0x02, &[serial]));
+            tbs_body.extend_from_slice(&alg);
+            tbs_body.extend_from_slice(&mk_dn(iss));
+            tbs_body.extend_from_slice(&der_tlv(0x30, &val));
+            tbs_body.extend_from_slice(&mk_dn(subj));
+            tbs_body.extend_from_slice(&spki);
+            tbs_body.extend_from_slice(&der_tlv(0xA3, &der_tlv(0x30, &exts)));
+            let tbs = der_tlv(0x30, &tbs_body);
+            let sig = signing_key
+                .choose_scheme(&[rustls::SignatureScheme::ED25519])
+                .unwrap()
+                .sign(&tbs)
+                .unwrap();
+            let mut sb = vec![0u8];
+            sb.extend_from_slice(&sig);
+            let mut body = tbs;
+            body.extend_from_slice(&alg);
+            body.extend_from_slice(&der_tlv(0x03, &sb));
+            der_tlv(0x30, &body)
+        };
+
+        let root_der = sign_cert(1, "WtdEkuRoot", "WtdEkuRoot", true);
+        let inter_der = sign_cert(2, "WtdEkuInter", "WtdEkuRoot", true);
+        let leaf_der = sign_cert(3, "wtd-eku.test", "WtdEkuInter", false);
+        let oid_code_signing: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+
+        unsafe {
+            let leaf_ctx = crate::misc::crypt32::CertCreateCertificateContext(
+                X509_ASN_ENCODING,
+                leaf_der.as_ptr(),
+                leaf_der.len() as u32,
+            );
+            assert!(!leaf_ctx.is_null());
+
+            let inter_store = crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            let mut inter_ctx: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    inter_store,
+                    X509_ASN_ENCODING,
+                    inter_der.as_ptr(),
+                    inter_der.len() as u32,
+                    4,
+                    &mut inter_ctx,
+                ),
+                1
+            );
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    inter_store,
+                    X509_ASN_ENCODING,
+                    root_der.as_ptr(),
+                    root_der.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+
+            let server_w: Vec<u16> = "wtd-eku.test\0".encode_utf16().collect();
+            let mut ssl_extra = [0u8; 0x18];
+            std::ptr::write_unaligned(ssl_extra.as_mut_ptr() as *mut u32, 0x18u32);
+            std::ptr::write_unaligned(ssl_extra.as_mut_ptr().add(0x04) as *mut u32, 2u32); // AUTHTYPE_SERVER
+            std::ptr::write_unaligned(ssl_extra.as_mut_ptr().add(0x08) as *mut u32, 0x0000_0100u32); // SECURITY_FLAG_IGNORE_UNKNOWN_CA
+            std::ptr::write_unaligned(
+                ssl_extra.as_mut_ptr().add(0x10) as *mut *const u16,
+                server_w.as_ptr(),
+            );
+
+            let stores = [inter_store];
+            let mut cert_info = [0u8; 0x38];
+            std::ptr::write_unaligned(cert_info.as_mut_ptr() as *mut u32, 0x38u32);
+            std::ptr::write_unaligned(cert_info.as_mut_ptr().add(0x10) as *mut *mut c_void, leaf_ctx);
+            std::ptr::write_unaligned(cert_info.as_mut_ptr().add(0x18) as *mut u32, 1u32); // chStores
+            std::ptr::write_unaligned(
+                cert_info.as_mut_ptr().add(0x20) as *mut *const *mut c_void,
+                stores.as_ptr(),
+            );
+
+            let mut wtd = [0u8; 0x58];
+            std::ptr::write_unaligned(wtd.as_mut_ptr() as *mut u32, 0x58u32);
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
+                ssl_extra.as_ptr() as *const c_void,
+            );
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_CERT);
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x28) as *mut *const u8,
+                cert_info.as_ptr(),
+            );
+
+            // 1. Before restricting the intermediate's CERT_ENHKEY_USAGE_PROP_ID, HTTPS verification passes.
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS
+            );
+
+            // 2. Restrict the intermediate in `pahStores` to codeSigning via CERT_ENHKEY_USAGE_PROP_ID (9).
+            let cs_eku_der = der_tlv(0x30, &der_tlv(0x06, oid_code_signing));
+            let cs_blob = CryptDataBlob {
+                cb_data: cs_eku_der.len() as u32,
+                pb_data: cs_eku_der.as_ptr(),
+            };
+            assert_eq!(
+                crate::misc::crypt32::CertSetCertificateContextProperty(
+                    inter_ctx,
+                    9, // CERT_ENHKEY_USAGE_PROP_ID
+                    0,
+                    &cs_blob as *const CryptDataBlob as *const c_void,
+                ),
+                1
+            );
+
+            // HTTPS verification MUST preserve the intermediate's EKU property and reject with CERT_E_WRONG_USAGE!
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                0x800B_0110u32 as i32,
+                "WinVerifyTrust(WTD_CHOICE_CERT, HTTPSPROV_ACTION) must preserve CERT_ENHKEY_USAGE_PROP_ID from pahStores"
+            );
+
+            crate::misc::crypt32::CertFreeCertificateContext(inter_ctx);
+            crate::misc::crypt32::CertCloseStore(inter_store, 0);
+            crate::misc::crypt32::CertFreeCertificateContext(leaf_ctx);
         }
     }
 }

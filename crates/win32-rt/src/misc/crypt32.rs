@@ -31,9 +31,9 @@ pub(crate) use chain::{
 };
 #[allow(unused_imports)]
 pub(crate) use store::{
-    attach_cert_private_key_pkcs8, duplicate_or_create_cert_context_der,
-    lookup_cert_private_key_and_chain, register_peer_cert_chain, store_certs_der,
-    PeerCertVerifyResult,
+    attach_cert_private_key_pkcs8, copy_store_certs_with_properties,
+    duplicate_or_create_cert_context_der, lookup_cert_private_key_and_chain,
+    register_peer_cert_chain, store_certs_der, PeerCertVerifyResult,
 };
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];

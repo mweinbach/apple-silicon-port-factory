@@ -603,6 +603,41 @@ pub(crate) fn store_certs_der(h_cert_store: *mut c_void) -> Vec<Vec<u8>> {
     store_certs_with_eku_props(h_cert_store).0
 }
 
+/// Copy every certificate context from `src_store` into `dst_store`, preserving metadata
+/// properties such as `CERT_ENHKEY_USAGE_PROP_ID` (excluding key-handle properties).
+pub(crate) unsafe fn copy_store_certs_with_properties(
+    src_store: *mut c_void,
+    dst_store: *mut c_void,
+) {
+    if src_store.is_null() || dst_store.is_null() {
+        return;
+    }
+    let items: Vec<(Vec<u8>, usize)> = {
+        let st = STORE_STATE.lock().unwrap();
+        let Some(store) = st.stores.get(&(src_store as usize)) else {
+            return;
+        };
+        store
+            .certs
+            .iter()
+            .filter_map(|&h| {
+                st.certs
+                    .get(&h)
+                    .map(|c| (c.owned.raw_der().to_vec(), h))
+            })
+            .collect()
+    };
+    for (der, src_h) in items {
+        let _ = add_der_to_store_with_source(
+            dst_store,
+            &der,
+            4, // CERT_STORE_ADD_ALWAYS
+            std::ptr::null_mut(),
+            Some(src_h),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Certificate Context & Store implementations
 // ---------------------------------------------------------------------------
