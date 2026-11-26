@@ -1,7 +1,10 @@
 //! ASN.1 DER parsing, X.509 encoding (`CryptEncodeObjectEx`), and string-to-binary
 //! decoding (`CryptStringToBinaryA/W`) for `crypt32.dll`.
 
-use super::store::ERROR_CALL_NOT_IMPLEMENTED;
+use super::decode::{
+    CNG_RSA_PUBLIC_KEY_BLOB, PKCS_ATTRIBUTE, PKCS_ATTRIBUTES, PKCS_CONTENT_INFO, PKCS_UTC_TIME,
+    X509_ALGORITHM_IDENTIFIER, X509_AUTHORITY_KEY_ID2, X509_ENUMERATED,
+};
 use crate::misc::wintrust::{
     self, CertInfo, CertPublicKeyInfo, CryptAlgId, CryptBitBlob, CryptDataBlob,
 };
@@ -29,8 +32,8 @@ pub(super) const X509_INTEGER: usize = 27;
 pub(super) const X509_MULTI_BYTE_INTEGER: usize = 28;
 pub(super) const X509_CHOICE_OF_TIME: usize = 30;
 pub(super) const X509_SEQUENCE_OF_ANY: usize = 34;
-pub(super) const X509_MULTI_BYTE_UINT: usize = 35;
 pub(super) const X509_ENHANCED_KEY_USAGE: usize = 36;
+pub(super) const X509_MULTI_BYTE_UINT: usize = 38;
 pub(super) const X509_ECC_SIGNATURE: usize = 47;
 pub(super) const X509_OBJECT_IDENTIFIER: usize = 73;
 const CRYPT_ENCODE_ALLOC_FLAG: u32 = 0x0000_8000;
@@ -49,6 +52,7 @@ pub(super) const CRYPT_STRING_HEXADDR: u32 = 0x0000_000A;
 pub(super) const CRYPT_STRING_HEXASCIIADDR: u32 = 0x0000_000B;
 pub(super) const CRYPT_STRING_HEXRAW: u32 = 0x0000_000C;
 pub(super) const CRYPT_STRING_BASE64URI: u32 = 0x0000_000D;
+pub(super) const CRYPT_STRING_PERCENTESCAPE: u32 = 0x0000_000E;
 const CRYPT_STRING_STRICT: u32 = 0x2000_0000;
 
 // ---------------------------------------------------------------------------
@@ -95,10 +99,108 @@ pub(super) fn parse_der_item(buf: &[u8]) -> Option<(DerItem<'_>, &[u8])> {
     ))
 }
 
-pub(super) fn der_item_children(mut buf: &[u8]) -> Option<Vec<DerItem<'_>>> {
+pub(super) fn der_item_children(buf: &[u8]) -> Option<Vec<DerItem<'_>>> {
+    der_item_children_bounded(buf, MAX_BER_ITEMS)
+}
+
+/// Parse at most `max_items` sibling DER TLV items, returning `None` before parsing or
+/// inserting item `max_items + 1` so crafted payloads with millions of tiny TLVs cannot
+/// trigger unbounded `Vec<DerItem>` allocations before a caller-side count check.
+pub(super) fn der_item_children_bounded(
+    mut buf: &[u8],
+    max_items: usize,
+) -> Option<Vec<DerItem<'_>>> {
     let mut out = Vec::new();
     while !buf.is_empty() {
+        if out.len() >= max_items {
+            return None;
+        }
         let (it, rest) = parse_der_item(buf)?;
+        out.push(it);
+        buf = rest;
+    }
+    Some(out)
+}
+
+const MAX_BER_DEPTH: usize = 32;
+const MAX_BER_ITEMS: usize = 4096;
+
+/// Parse a single BER TLV item, accepting both definite lengths and indefinite-length constructed
+/// containers (`0x80` length terminated by EOC `0x00 0x00`), with hard depth and item-count caps.
+pub(super) fn parse_ber_item(buf: &[u8]) -> Option<(DerItem<'_>, &[u8])> {
+    let mut budget = MAX_BER_ITEMS;
+    parse_ber_item_inner(buf, 0, &mut budget)
+}
+
+fn parse_ber_item_inner<'a>(
+    buf: &'a [u8],
+    depth: usize,
+    budget: &mut usize,
+) -> Option<(DerItem<'a>, &'a [u8])> {
+    if depth > MAX_BER_DEPTH || *budget == 0 || buf.len() < 2 {
+        return None;
+    }
+    *budget -= 1;
+    let tag = buf[0];
+    let lb = buf[1];
+    if lb == 0x80 {
+        // X.690 §8.1.3.6: indefinite length is valid only for constructed encodings (bit 5 set).
+        if (tag & 0x20) == 0 {
+            return None;
+        }
+        let mut cur = &buf[2..];
+        loop {
+            if cur.len() < 2 {
+                return None;
+            }
+            if cur[0] == 0x00 && cur[1] == 0x00 {
+                let val_len = cur.as_ptr() as usize - buf[2..].as_ptr() as usize;
+                let end = 2 + val_len + 2;
+                return Some((
+                    DerItem {
+                        tag,
+                        raw: &buf[..end],
+                        val: &buf[2..2 + val_len],
+                    },
+                    &buf[end..],
+                ));
+            }
+            let (_, next) = parse_ber_item_inner(cur, depth + 1, budget)?;
+            cur = next;
+        }
+    }
+    let (hdr, len) = if (lb & 0x80) == 0 {
+        (2usize, lb as usize)
+    } else {
+        let n = (lb & 0x7F) as usize;
+        if n == 0 || n > 4 || buf.len() < 2 + n {
+            return None;
+        }
+        let mut v = 0usize;
+        for &b in &buf[2..2 + n] {
+            v = (v << 8) | (b as usize);
+        }
+        (2 + n, v)
+    };
+    let end = hdr.checked_add(len)?;
+    if end > buf.len() {
+        return None;
+    }
+    Some((
+        DerItem {
+            tag,
+            raw: &buf[..end],
+            val: &buf[hdr..end],
+        },
+        &buf[end..],
+    ))
+}
+
+pub(super) fn ber_item_children(mut buf: &[u8]) -> Option<Vec<DerItem<'_>>> {
+    let mut out = Vec::new();
+    let mut budget = MAX_BER_ITEMS;
+    while !buf.is_empty() {
+        let (it, rest) = parse_ber_item_inner(buf, 0, &mut budget)?;
         out.push(it);
         buf = rest;
     }
@@ -200,8 +302,26 @@ pub(super) fn parse_cert_der_parts(der: &[u8]) -> Option<CertDerParts<'_>> {
     })
 }
 
+/// Parse a DER-encoded `CERT_ENHKEY_USAGE` / `CTL_USAGE` (`SEQUENCE OF OBJECT IDENTIFIER`).
+/// Returns `Some(vec![])` for an empty sequence (valid for no usages) and `None` on malformed DER.
+pub(super) fn parse_eku_der_oids(der: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let (seq, rem) = parse_der_item(der)?;
+    if !rem.is_empty() || seq.tag != 0x30 {
+        return None;
+    }
+    let kids = der_item_children(seq.val)?;
+    let mut oids = Vec::with_capacity(kids.len());
+    for k in kids {
+        if k.tag != 0x06 || k.val.is_empty() {
+            return None;
+        }
+        oids.push(k.val.to_vec());
+    }
+    Some(oids)
+}
+
 /// Extract EKU OIDs from extension `2.5.29.37`, or `None` if the cert has no EKU extension.
-pub(super) fn cert_eku_oids(der: &[u8]) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn cert_eku_oids(der: &[u8]) -> Option<Vec<Vec<u8>>> {
     let parts = parse_cert_der_parts(der)?;
     const OID_EKU: &[u8] = &[0x55, 0x1D, 0x25];
     for (oid, _, val) in &parts.extensions {
@@ -566,25 +686,43 @@ unsafe fn encode_rdn_value(
         return Some(encode_der_tlv(0x04, data));
     }
 
-    let text: String = if unicode {
-        if blob.pb_data.is_null() {
-            String::new()
+    // Per MSDN CERT_RDN_ATTR: CERT_RDN_BMP_STRING (12) and CERT_RDN_UTF8_STRING (13) are
+    // ALWAYS supplied as 16-bit Unicode (UTF-16LE) arrays, even for X509_NAME / X509_ANY_STRING.
+    let is_utf16_value = unicode || matches!(raw_ty, CERT_RDN_BMP_STRING | CERT_RDN_UTF8_STRING);
+    if !is_utf16_value {
+        // Preserve raw 8-bit octets verbatim for non-Unicode string types (e.g. T61String).
+        let raw_bytes: Vec<u8> = if blob.pb_data.is_null() {
+            Vec::new()
         } else if blob.cb_data == 0 {
-            crate::strings::from_wide(blob.pb_data as *const u16)
+            let mut len = 0usize;
+            while *blob.pb_data.add(len) != 0 {
+                len += 1;
+            }
+            std::slice::from_raw_parts(blob.pb_data, len).to_vec()
         } else {
-            let units = crate::strings::read_wide_slice(
-                blob.pb_data as *const u16,
-                (blob.cb_data as usize) / 2,
-            );
-            String::from_utf16_lossy(&units)
-        }
-    } else if blob.pb_data.is_null() {
+            std::slice::from_raw_parts(blob.pb_data, blob.cb_data as usize).to_vec()
+        };
+        let tag = match raw_ty {
+            CERT_RDN_NUMERIC_STRING => 0x12,
+            CERT_RDN_PRINTABLE_STRING => 0x13,
+            CERT_RDN_TELETEX_STRING => 0x14,
+            CERT_RDN_IA5_STRING => 0x16,
+            CERT_RDN_VISIBLE_STRING => 0x1A,
+            _ => 0x0C,
+        };
+        return Some(encode_der_tlv(tag, &raw_bytes));
+    }
+
+    let text: String = if blob.pb_data.is_null() {
         String::new()
     } else if blob.cb_data == 0 {
-        crate::strings::from_ansi(blob.pb_data)
+        crate::strings::from_wide(blob.pb_data as *const u16)
     } else {
-        let s = std::slice::from_raw_parts(blob.pb_data, blob.cb_data as usize);
-        String::from_utf8_lossy(s).into_owned()
+        let units = crate::strings::read_wide_slice(
+            blob.pb_data as *const u16,
+            (blob.cb_data as usize) / 2,
+        );
+        String::from_utf16_lossy(&units)
     };
 
     match raw_ty {
@@ -670,6 +808,7 @@ unsafe fn encode_x509_object(
             "2.5.29.15" => X509_KEY_USAGE,
             "2.5.29.17" | "2.5.29.18" => X509_ALTERNATE_NAME,
             "2.5.29.19" => X509_BASIC_CONSTRAINTS2,
+            "2.5.29.35" => X509_AUTHORITY_KEY_ID2,
             "2.5.29.37" => X509_ENHANCED_KEY_USAGE,
             _ => 0,
         }
@@ -937,9 +1076,153 @@ unsafe fn encode_x509_object(
             }
             Ok(encode_der_tlv(0x30, &tbs))
         }
+        X509_ENUMERATED => {
+            let v = std::ptr::read_unaligned(pv_struct_info as *const i32);
+            let mut der = encode_der_i32(v);
+            der[0] = 0x0A; // ASN.1 ENUMERATED tag
+            Ok(der)
+        }
+        PKCS_UTC_TIME => {
+            let ft = std::ptr::read_unaligned(pv_struct_info as *const u64);
+            encode_der_filetime(ft).ok_or(err::ERROR_INVALID_DATA)
+        }
+        X509_ALGORITHM_IDENTIFIER => {
+            let alg = std::ptr::read_unaligned(pv_struct_info as *const CryptAlgId);
+            encode_alg_id(&alg).ok_or(err::ERROR_INVALID_DATA)
+        }
+        PKCS_CONTENT_INFO => {
+            #[repr(C)]
+            struct CryptContentInfo {
+                psz_obj_id: *const u8,
+                content: CryptDataBlob,
+            }
+            let ci = std::ptr::read_unaligned(pv_struct_info as *const CryptContentInfo);
+            if ci.psz_obj_id.is_null() {
+                return Err(err::ERROR_INVALID_DATA);
+            }
+            let oid_s = crate::strings::from_ansi(ci.psz_obj_id);
+            let oid_val = wintrust::encode_oid_str(&oid_s).ok_or(err::ERROR_INVALID_DATA)?;
+            let mut inner = encode_der_tlv(0x06, &oid_val);
+            if !ci.content.pb_data.is_null() && ci.content.cb_data > 0 {
+                let c = std::slice::from_raw_parts(ci.content.pb_data, ci.content.cb_data as usize);
+                inner.extend_from_slice(&encode_der_tlv(0xA0, c));
+            }
+            Ok(encode_der_tlv(0x30, &inner))
+        }
+        PKCS_ATTRIBUTE => {
+            #[repr(C)]
+            struct CryptAttr {
+                psz_obj_id: *const u8,
+                c_value: u32,
+                rg_value: *const CryptDataBlob,
+            }
+            let a = std::ptr::read_unaligned(pv_struct_info as *const CryptAttr);
+            if a.psz_obj_id.is_null() || (a.c_value > 0 && a.rg_value.is_null()) {
+                return Err(err::ERROR_INVALID_DATA);
+            }
+            let oid_s = crate::strings::from_ansi(a.psz_obj_id);
+            let oid_val = wintrust::encode_oid_str(&oid_s).ok_or(err::ERROR_INVALID_DATA)?;
+            let mut vals: Vec<&[u8]> = Vec::with_capacity(a.c_value as usize);
+            for i in 0..a.c_value as usize {
+                let b = std::ptr::read_unaligned(a.rg_value.add(i));
+                if !b.pb_data.is_null() && b.cb_data > 0 {
+                    vals.push(std::slice::from_raw_parts(b.pb_data, b.cb_data as usize));
+                }
+            }
+            // X.690 §11.6 / RFC 5652 §5.4: DER SET OF elements must be sorted lexicographically.
+            vals.sort_unstable();
+            let mut set_inner = Vec::new();
+            for v in vals {
+                set_inner.extend_from_slice(v);
+            }
+            let mut inner = encode_der_tlv(0x06, &oid_val);
+            inner.extend_from_slice(&encode_der_tlv(0x31, &set_inner));
+            Ok(encode_der_tlv(0x30, &inner))
+        }
+        PKCS_ATTRIBUTES => {
+            #[repr(C)]
+            struct CryptAttr {
+                psz_obj_id: *const u8,
+                c_value: u32,
+                rg_value: *const CryptDataBlob,
+            }
+            #[repr(C)]
+            struct CryptAttrs {
+                c_attr: u32,
+                rg_attr: *const CryptAttr,
+            }
+            let list = std::ptr::read_unaligned(pv_struct_info as *const CryptAttrs);
+            if list.c_attr > 0 && list.rg_attr.is_null() {
+                return Err(err::ERROR_INVALID_DATA);
+            }
+            let mut encoded_attrs: Vec<Vec<u8>> = Vec::with_capacity(list.c_attr as usize);
+            for i in 0..list.c_attr as usize {
+                let attr_ptr = list.rg_attr.add(i) as *const c_void;
+                encoded_attrs.push(encode_x509_object(PKCS_ATTRIBUTE as *const u8, attr_ptr)?);
+            }
+            // X.690 §11.6 / RFC 5652 §5.4: DER SET OF Attribute must be sorted lexicographically.
+            encoded_attrs.sort_unstable();
+            let mut inner = Vec::new();
+            for enc in encoded_attrs {
+                inner.extend_from_slice(&enc);
+            }
+            Ok(encode_der_tlv(0x31, &inner))
+        }
+        X509_AUTHORITY_KEY_ID2 => {
+            #[repr(C)]
+            struct CertAuthorityKeyId2Info {
+                key_id: CryptDataBlob,
+                authority_cert_issuer: CertAltNameInfo,
+                authority_cert_serial_number: CryptDataBlob,
+            }
+            let aki = std::ptr::read_unaligned(pv_struct_info as *const CertAuthorityKeyId2Info);
+            let mut inner = Vec::new();
+            if !aki.key_id.pb_data.is_null() && aki.key_id.cb_data > 0 {
+                let b = std::slice::from_raw_parts(aki.key_id.pb_data, aki.key_id.cb_data as usize);
+                inner.extend_from_slice(&encode_der_tlv(0x80, b));
+            }
+            if aki.authority_cert_issuer.c_alt_entry > 0
+                && !aki.authority_cert_issuer.rg_alt_entry.is_null()
+            {
+                let san_der = encode_x509_object(
+                    X509_ALTERNATE_NAME as *const u8,
+                    &aki.authority_cert_issuer as *const _ as *const c_void,
+                )?;
+                if let Some((seq, _)) = parse_der_item(&san_der) {
+                    inner.extend_from_slice(&encode_der_tlv(0xA1, seq.val));
+                }
+            }
+            if !aki.authority_cert_serial_number.pb_data.is_null()
+                && aki.authority_cert_serial_number.cb_data > 0
+            {
+                let mut be = std::slice::from_raw_parts(
+                    aki.authority_cert_serial_number.pb_data,
+                    aki.authority_cert_serial_number.cb_data as usize,
+                )
+                .to_vec();
+                be.reverse();
+                inner.extend_from_slice(&encode_der_tlv(0x82, &be));
+            }
+            Ok(encode_der_tlv(0x30, &inner))
+        }
+        CNG_RSA_PUBLIC_KEY_BLOB => {
+            // BCRYPT_RSAKEY_BLOB (24B) + BE exponent + BE modulus
+            let p = pv_struct_info as *const u8;
+            let magic = std::ptr::read_unaligned(p as *const u32);
+            let cb_exp = std::ptr::read_unaligned(p.add(8) as *const u32) as usize;
+            let cb_mod = std::ptr::read_unaligned(p.add(12) as *const u32) as usize;
+            if (magic != 0x3141_5352 && magic != 0x3241_5352) || cb_exp == 0 || cb_mod == 0 {
+                return Err(err::ERROR_INVALID_DATA);
+            }
+            let exp_be = std::slice::from_raw_parts(p.add(24), cb_exp);
+            let mod_be = std::slice::from_raw_parts(p.add(24 + cb_exp), cb_mod);
+            let mut inner = encode_der_uint_be(mod_be);
+            inner.extend_from_slice(&encode_der_uint_be(exp_be));
+            Ok(encode_der_tlv(0x30, &inner))
+        }
         _ => {
-            stub!("CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE");
-            Err(ERROR_CALL_NOT_IMPLEMENTED)
+            log::debug!("CryptEncodeObjectEx: unknown struct_type={raw_stype:#x} -> ERROR_FILE_NOT_FOUND");
+            Err(err::ERROR_FILE_NOT_FOUND)
         }
     }
 }
@@ -952,7 +1235,7 @@ pub(super) unsafe fn crypt_encode_object_ex_impl(
     pv_encoded: *mut c_void,
     pcb_encoded: *mut u32,
 ) -> BOOL {
-    if (dw_cert_encoding_type & X509_ASN_ENCODING) == 0
+    if (dw_cert_encoding_type & (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING)) == 0
         || pv_struct_info.is_null()
         || pcb_encoded.is_null()
     {
@@ -1272,8 +1555,38 @@ unsafe fn crypt_string_to_binary_impl(
             .or_else(|| decode_hex_dump(text, true, false).map(|b| (b, 0, CRYPT_STRING_HEXADDR)))
             .or_else(|| decode_hex_bytes(text, false, false).map(|b| (b, 0, CRYPT_STRING_HEX)))
             .or_else(|| decode_hex_dump(text, false, true).map(|b| (b, 0, CRYPT_STRING_HEXASCII))),
+        CRYPT_STRING_PERCENTESCAPE => {
+            // Percent-decode UTF-8/ASCII bytes per Windows CRYPT_STRING_PERCENTESCAPE (0x0E)
+            let bytes = text.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0usize;
+            let mut ok = true;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    if i + 2 >= bytes.len() {
+                        ok = false;
+                        break;
+                    }
+                    let Some(hi) = hex_nibble(bytes[i + 1]) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(lo) = hex_nibble(bytes[i + 2]) else {
+                        ok = false;
+                        break;
+                    };
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            ok.then_some((out, 0, CRYPT_STRING_PERCENTESCAPE))
+        }
         _ => {
-            stub!("CryptStringToBinary unsupported flags {flags:#x}");
+            // Invalid dwFlags value outside wincrypt.h CRYPT_STRING_* constants -> ERROR_INVALID_DATA.
+            log::debug!("CryptStringToBinary: invalid flags {flags:#x} -> ERROR_INVALID_DATA");
             None
         }
     };

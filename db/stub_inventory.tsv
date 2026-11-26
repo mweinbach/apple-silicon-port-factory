@@ -1,23 +1,5 @@
 dll	api	kind	file	line	detail
-crypt32.dll	CertFreeCRLContext	stub	crates/win32-rt/src/misc/crypt32.rs	355	"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"
-crypt32.dll	CertFreeCTLContext	stub	crates/win32-rt/src/misc/crypt32.rs	362	"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"
-crypt32.dll	CertGetCertificateContextProperty	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertStrToNameA	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertStrToNameW	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertVerifySubjectCertificateContext	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptDecodeObject	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptDecodeObjectEx	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptFindOIDInfo	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptMsgOpenToDecode	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CryptMsgUpdate	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptVerifyMessageSignature	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	PFXImportCertStore	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	cert_free_certificate_chain_engine_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	593	"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"
-crypt32.dll	cert_free_certificate_chain_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	787	"CertFreeCertificateChain({chain:p}): foreign chain ignored"
-crypt32.dll	cert_verify_certificate_chain_policy_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	807	"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"
-crypt32.dll	crypt_string_to_binary_impl	stub	crates/win32-rt/src/misc/crypt32/asn1.rs	1276	"CryptStringToBinary unsupported flags {flags:#x}"
-crypt32.dll	encode_x509_object	stub	crates/win32-rt/src/misc/crypt32/asn1.rs	941	"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"
+crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	55	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 d2d1.dll	geom_tessellate	stub	crates/win32-rt/src/misc/d2d1/geometry.rs	1038	"ID2D1Geometry::Tessellate -> E_NOTIMPL"
 d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	794	"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"
 d3d11.dll	create_geometry_shader_so	stub	crates/win32-rt/src/d3d11/device.rs	748	"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"
@@ -69,10 +51,6 @@ physx3common_x64.dll	mesh_sweep	middleware_stub	crates/win32-rt/src/misc/physx3c
 powrprof.dll	CallNtPowerInformation	stub	crates/win32-rt/src/misc/powrprof.rs	468	"CallNtPowerInformation(level={info_level}) -> STATUS_NOT_IMPLEMENTED"
 powrprof.dll	PowerRegisterSuspendResumeNotification	stub	crates/win32-rt/src/misc/powrprof.rs	533	"PowerRegisterSuspendResumeNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS wake callback not armed)"
 powrprof.dll	PowerSettingRegisterNotification	stub	crates/win32-rt/src/misc/powrprof.rs	604	"PowerSettingRegisterNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS setting callback not armed)"
-secur32.dll	acquire_credentials_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	594	"AcquireCredentialsHandle(pkg={package_name:?}, use={f_credential_use:#x}): inbound unsupported"
-secur32.dll	apply_control_token_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1025	"ApplyControlToken(ctx={id}, token={token_val:?}) -> SEC_E_UNSUPPORTED_FUNCTION"
-secur32.dll	query_context_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1787	"QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION"
-secur32.dll	query_credentials_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1849	"QueryCredentialsAttributes{}(attr={ul_attribute:#x}) -> SEC_E_UNSUPPORTED_FUNCTION", if wide { "W" } else { "A" }
 shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1748	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
 ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	953	"_getch returns EOF"
 ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
@@ -95,8 +73,4 @@ user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	611	"GetUser
 user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	633	"GetUserObjectInformation index {index} not supported"
 uxtheme.dll	DrawThemeBackground	stub	crates/win32-rt/src/misc/uxtheme.rs	111	"DrawThemeBackground(htheme={htheme:#x}) -> E_NOTIMPL"
 uxtheme.dll	TaskDialogIndirect	stub	crates/win32-rt/src/misc/uxtheme.rs	203	"TaskDialogIndirect -> E_NOTIMPL (native task dialogs not implemented)"
-wintrust.dll	Tbsip_Context_Close	stub	crates/win32-rt/src/misc/wintrust.rs	1644	"Tbsip_Context_Close({h_context:p}) -> TBS_E_INVALID_CONTEXT"
-wintrust.dll	Tbsip_Submit_Command	stub	crates/win32-rt/src/misc/wintrust.rs	1661	"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"
-wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1415	"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"
-wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1439	"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"
 xinput1_4.dll	XInputGetKeystroke	stub	crates/win32-rt/src/misc/xinput1_4.rs	608	"XInputGetKeystroke: keystroke events not generated (ERROR_EMPTY)"
