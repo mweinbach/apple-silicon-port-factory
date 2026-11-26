@@ -1353,15 +1353,11 @@ pub const ADVERTISED_NON_ARM64_ALLOWLIST: &[(CpuidFeature, &str)] = &[
     ),
     (
         CpuidFeature::AVX,
-        "vdppd, vldmxcsr/vstmxcsr, vmaskmovdqu, vmpsadbw, vphaddsw/vphsubsw, vphminposuw, vmovntdqa, vzeroall/vzeroupper",
+        "vdppd, vmaskmovdqu, vmpsadbw, vphaddsw/vphsubsw, vphminposuw, vmovntdqa, vzeroall/vzeroupper",
     ),
     (
         CpuidFeature::AVX2,
         "vpgather*/vgather* (16 gather forms) and 256-bit vphaddsw/vphsubsw/vmpsadbw/vmovntdqa",
-    ),
-    (
-        CpuidFeature::FXSR,
-        "fxsave/fxsave64/fxrstor/fxrstor64 x87/SSE state save/restore",
     ),
     (
         CpuidFeature::MMX,
@@ -1369,7 +1365,7 @@ pub const ADVERTISED_NON_ARM64_ALLOWLIST: &[(CpuidFeature, &str)] = &[
     ),
     (
         CpuidFeature::SSE,
-        "MMX-aliased SSE ops (cvtpi2ps/cvtps2pi/pshufw/pinsrw/pextrw/etc., MmxDispatch) plus ldmxcsr",
+        "MMX-aliased SSE ops (cvtpi2ps/cvtps2pi/pshufw/pinsrw/pextrw/etc., MmxDispatch)",
     ),
     (
         CpuidFeature::SSE2,
@@ -1386,18 +1382,6 @@ pub const ADVERTISED_NON_ARM64_ALLOWLIST: &[(CpuidFeature, &str)] = &[
     (
         CpuidFeature::SSSE3,
         "MMX-aliased SSSE3 ops (MmxDispatch) plus phaddsw/phsubsw xmm",
-    ),
-    (
-        CpuidFeature::XSAVE,
-        "xgetbv, xsave/xsave64/xrstor/xrstor64 XSTATE control/save/restore",
-    ),
-    (
-        CpuidFeature::XSAVEC,
-        "xsavec/xsavec64 compacted XSTATE save",
-    ),
-    (
-        CpuidFeature::XSAVEOPT,
-        "xsaveopt/xsaveopt64 optimized XSTATE save",
     ),
 ];
 
