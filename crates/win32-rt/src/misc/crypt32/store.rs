@@ -4,7 +4,9 @@ use super::asn1::{
     all_dn_values_lower, encode_der_tlv, parse_cert_der_parts, parse_eku_der_oids,
     PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
-use super::chain::{cert_verify_time_validity_impl, verify_cert_sig_with_spki};
+use super::chain::{
+    cert_verify_time_validity_impl, verify_cert_sig_with_spki, verify_cert_signed_by_der,
+};
 use crate::handles::HandleTable;
 use crate::misc::wintrust::{
     self, CertContext, CertInfo, CertPublicKeyInfo, CmsgSignerInfo, CryptAlgId, CryptDataBlob,
@@ -342,34 +344,96 @@ pub(crate) fn attach_cert_private_key_pkcs8(cert_ctx: *mut c_void, pkcs8_der: Ve
     }
 }
 
-/// Look up the certificate chain (leaf + any intermediates in its store) and attached PKCS#8 private key
-/// for a `PCCERT_CONTEXT` passed to Schannel (`SCHANNEL_CRED.paCred`).
+/// Order a TLS local credential's certification path per RFC 5246 §7.4.2 (leaf first, each
+/// subsequent certificate cryptographically certifying its predecessor), excluding unrelated
+/// certificates present in the same `HCERTSTORE`.
+fn build_ordered_tls_cert_chain(leaf_der: Vec<u8>, candidates: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut chain = vec![leaf_der];
+    for _ in 0..16 {
+        let cur = chain.last().unwrap().as_slice();
+        let Some(cur_parts) = parse_cert_der_parts(cur) else {
+            break;
+        };
+        if cur_parts.subject_inner == cur_parts.issuer_inner && verify_cert_signed_by_der(cur, cur)
+        {
+            break;
+        }
+        let verified_issuers: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, cand)| {
+                !chain.iter().any(|seen| seen == *cand)
+                    && parse_cert_der_parts(cand)
+                        .is_some_and(|p| p.subject_inner == cur_parts.issuer_inner)
+                    && verify_cert_signed_by_der(cur, cand)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        let next_idx = verified_issuers
+            .iter()
+            .copied()
+            .find(|&idx| {
+                parse_cert_der_parts(&candidates[idx]).is_some_and(|p| {
+                    p.subject_inner != p.issuer_inner
+                        && candidates.iter().any(|parent| {
+                            parent != &candidates[idx]
+                                && parse_cert_der_parts(parent)
+                                    .is_some_and(|pp| pp.subject_inner == p.issuer_inner)
+                                && verify_cert_signed_by_der(&candidates[idx], parent)
+                        })
+                })
+            })
+            .or_else(|| {
+                verified_issuers.iter().copied().find(|&idx| {
+                    parse_cert_der_parts(&candidates[idx]).is_some_and(|p| {
+                        p.subject_inner == p.issuer_inner
+                            && verify_cert_signed_by_der(&candidates[idx], &candidates[idx])
+                    })
+                })
+            })
+            .or_else(|| verified_issuers.first().copied());
+        let Some(idx) = next_idx else {
+            break;
+        };
+        chain.push(candidates[idx].clone());
+    }
+    chain
+}
+
+/// Look up the ordered RFC 5246 §7.4.2 certificate chain (`[leaf, issuer1, ...]`) and attached
+/// PKCS#8 private key for a `PCCERT_CONTEXT` passed to Schannel (`SCHANNEL_CRED.paCred`),
+/// excluding unrelated certificates present in the same store.
 pub(crate) fn lookup_cert_private_key_and_chain(
     cert_ctx: *const c_void,
 ) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
     if cert_ctx.is_null() {
         return None;
     }
-    let st = STORE_STATE.lock().unwrap();
-    let entry = st.certs.get(&(cert_ctx as usize))?;
-    let key = entry.private_key_pkcs8.clone()?;
-    let mut chain = vec![entry.owned.raw_der().to_vec()];
-    let store_h = unsafe { (*entry.owned.as_ptr()).h_cert_store as usize };
-    if store_h != 0 {
-        if let Some(store) = st.stores.get(&store_h) {
-            for &ch in &store.certs {
-                if ch == cert_ctx as usize {
-                    continue;
-                }
-                if let Some(other) = st.certs.get(&ch) {
-                    let der = other.owned.raw_der().to_vec();
-                    if !chain.iter().any(|c| c == &der) {
-                        chain.push(der);
+    let (leaf_der, key, candidates) = {
+        let st = STORE_STATE.lock().unwrap();
+        let entry = st.certs.get(&(cert_ctx as usize))?;
+        let key = entry.private_key_pkcs8.clone()?;
+        let leaf_der = entry.owned.raw_der().to_vec();
+        let mut candidates = Vec::new();
+        let store_h = unsafe { (*entry.owned.as_ptr()).h_cert_store as usize };
+        if store_h != 0 {
+            if let Some(store) = st.stores.get(&store_h) {
+                for &ch in &store.certs {
+                    if ch == cert_ctx as usize {
+                        continue;
+                    }
+                    if let Some(other) = st.certs.get(&ch) {
+                        let der = other.owned.raw_der().to_vec();
+                        if der != leaf_der && !candidates.iter().any(|c| c == &der) {
+                            candidates.push(der);
+                        }
                     }
                 }
             }
         }
-    }
+        (leaf_der, key, candidates)
+    };
+    let chain = build_ordered_tls_cert_chain(leaf_der, candidates);
     Some((chain, key))
 }
 

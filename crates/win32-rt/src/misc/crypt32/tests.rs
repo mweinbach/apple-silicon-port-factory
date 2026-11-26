@@ -9093,3 +9093,112 @@ fn x509_object_identifier_decodes_and_encodes_multibyte_first_subid() {
         assert_eq!(crate::teb::last_error(), 0x8009_310B);
     }
 }
+
+#[test]
+fn lookup_cert_private_key_and_chain_orders_issuers_and_excludes_unrelated_store_certs() {
+    use super::asn1::encode_der_tlv as tlv;
+    use super::store::CERT_STORE_PROV_MEMORY;
+
+    let pk_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(
+            crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER.to_vec(),
+        ),
+    );
+    let key = crate::net_tls::crypto_provider()
+        .key_provider
+        .load_private_key(pk_der)
+        .expect("load Ed25519 key");
+    let spki = key.public_key().expect("spki").as_ref().to_vec();
+    let alg = tlv(0x30, &tlv(0x06, &[0x2B, 0x65, 0x70]));
+    let mk_dn = |cn: &str| {
+        let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+        atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+        tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+    };
+    let sign_cert = |serial: u8, subj: &str, iss: &str, is_ca: bool| -> Vec<u8> {
+        let mut val = tlv(0x17, b"240101000000Z");
+        val.extend_from_slice(&tlv(0x17, b"350101000000Z"));
+        let mut bc = tlv(0x06, &[0x55, 0x1D, 0x13]);
+        bc.extend_from_slice(&tlv(0x01, &[0xFF]));
+        let bc_v = if is_ca { tlv(0x01, &[0xFF]) } else { Vec::new() };
+        bc.extend_from_slice(&tlv(0x04, &tlv(0x30, &bc_v)));
+        let mut tbs_body = tlv(0xA0, &tlv(0x02, &[0x02]));
+        tbs_body.extend_from_slice(&tlv(0x02, &[serial]));
+        tbs_body.extend_from_slice(&alg);
+        tbs_body.extend_from_slice(&mk_dn(iss));
+        tbs_body.extend_from_slice(&tlv(0x30, &val));
+        tbs_body.extend_from_slice(&mk_dn(subj));
+        tbs_body.extend_from_slice(&spki);
+        tbs_body.extend_from_slice(&tlv(0xA3, &tlv(0x30, &tlv(0x30, &bc))));
+        let tbs = tlv(0x30, &tbs_body);
+        let sig = key
+            .choose_scheme(&[rustls::SignatureScheme::ED25519])
+            .unwrap()
+            .sign(&tbs)
+            .unwrap();
+        let mut sb = vec![0u8];
+        sb.extend_from_slice(&sig);
+        let mut body = tbs;
+        body.extend_from_slice(&alg);
+        body.extend_from_slice(&tlv(0x03, &sb));
+        tlv(0x30, &body)
+    };
+
+    let root = sign_cert(1, "TlsOrderRoot", "TlsOrderRoot", true);
+    let inter = sign_cert(2, "TlsOrderInter", "TlsOrderRoot", true);
+    let leaf = sign_cert(3, "TlsOrderLeaf", "TlsOrderInter", false);
+    let unrelated_leaf = sign_cert(4, "UnrelatedIdentity", "UnrelatedCA", false);
+    let unrelated_ca = sign_cert(5, "UnrelatedCA", "UnrelatedCA", true);
+
+    unsafe {
+        // 1. Store inserted out of order with unrelated certs: [leaf, unrelated_leaf, root, unrelated_ca, inter]
+        //    MUST return exact RFC 5246 §7.4.2 order [leaf, inter, root].
+        let st = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let mut leaf_ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertAddEncodedCertificateToStore(st, X509_ASN_ENCODING, leaf.as_ptr(), leaf.len() as u32, 4, &mut leaf_ctx),
+            TRUE
+        );
+        for extra in [&unrelated_leaf, &root, &unrelated_ca, &inter] {
+            assert_eq!(
+                CertAddEncodedCertificateToStore(st, X509_ASN_ENCODING, extra.as_ptr(), extra.len() as u32, 4, std::ptr::null_mut()),
+                TRUE
+            );
+        }
+        assert!(super::attach_cert_private_key_pkcs8(
+            leaf_ctx,
+            crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER.to_vec()
+        ));
+        let (chain, _key) = super::lookup_cert_private_key_and_chain(leaf_ctx).expect("key + chain");
+        assert_eq!(
+            chain,
+            vec![leaf.clone(), inter.clone(), root.clone()],
+            "TLS cert chain must be ordered [leaf, intermediate, root] and exclude unrelated store certs"
+        );
+        CertFreeCertificateContext(leaf_ctx);
+        CertCloseStore(st, 0);
+
+        // 2. Store without root CA: [leaf, unrelated_leaf, inter] MUST return [leaf, inter]
+        //    (preserving intermediate while excluding unrelated certs).
+        let st2 = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let mut leaf_ctx2: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertAddEncodedCertificateToStore(st2, X509_ASN_ENCODING, leaf.as_ptr(), leaf.len() as u32, 4, &mut leaf_ctx2),
+            TRUE
+        );
+        for extra in [&unrelated_leaf, &inter] {
+            assert_eq!(
+                CertAddEncodedCertificateToStore(st2, X509_ASN_ENCODING, extra.as_ptr(), extra.len() as u32, 4, std::ptr::null_mut()),
+                TRUE
+            );
+        }
+        assert!(super::attach_cert_private_key_pkcs8(
+            leaf_ctx2,
+            crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER.to_vec()
+        ));
+        let (chain2, _) = super::lookup_cert_private_key_and_chain(leaf_ctx2).expect("key + chain2");
+        assert_eq!(chain2, vec![leaf, inter]);
+        CertFreeCertificateContext(leaf_ctx2);
+        CertCloseStore(st2, 0);
+    }
+}
