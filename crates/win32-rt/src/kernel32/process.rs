@@ -4078,9 +4078,80 @@ pub unsafe extern "win64" fn RegisterApplicationRestart(_c: LPCWSTR, _f: u32) ->
     S_OK
 }
 
+const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+const ES_USER_PRESENT: u32 = 0x0000_0004;
+const ES_AWAYMODE_REQUIRED: u32 = 0x0000_0040;
+const ES_CONTINUOUS: u32 = 0x8000_0000;
+const ES_ACTIVE_MASK: u32 =
+    ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_USER_PRESENT | ES_AWAYMODE_REQUIRED;
+const ES_VALID_MASK: u32 = ES_ACTIVE_MASK | ES_CONTINUOUS;
+
+fn thread_execution_states() -> &'static std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u32>> {
+    static STATES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u32>>> =
+        std::sync::OnceLock::new();
+    STATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+struct ExecStateThreadGuard(std::thread::ThreadId);
+
+impl Drop for ExecStateThreadGuard {
+    fn drop(&mut self) {
+        thread_execution_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+thread_local! {
+    static EXEC_STATE_THREAD_GUARD: std::cell::RefCell<Option<ExecStateThreadGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Remove the calling thread's continuous execution-state requirements on exit.
+pub(crate) fn clear_current_thread_execution_state() {
+    let tid = std::thread::current().id();
+    thread_execution_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&tid);
+}
+
+/// Aggregate active continuous execution-state flags across all live threads
+/// (used by `powrprof::CallNtPowerInformation(SystemExecutionState)`).
+pub(crate) fn current_system_execution_state() -> u32 {
+    thread_execution_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .fold(0u32, |acc, &v| acc | (v & ES_ACTIVE_MASK))
+}
+
 pub unsafe extern "win64" fn SetThreadExecutionState(f: u32) -> u32 {
-    static PREV: AtomicU32 = AtomicU32::new(0x8000_0000);
-    PREV.swap(f, Ordering::Relaxed)
+    if (f & !ES_VALID_MASK) != 0 {
+        return 0;
+    }
+    let tid = std::thread::current().id();
+    let mut states = thread_execution_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let prev = states.get(&tid).copied().unwrap_or(ES_CONTINUOUS);
+    if (f & ES_CONTINUOUS) != 0 {
+        let next = f & ES_VALID_MASK;
+        if (next & ES_ACTIVE_MASK) == 0 {
+            states.remove(&tid);
+        } else {
+            states.insert(tid, next);
+            EXEC_STATE_THREAD_GUARD.with(|cell| {
+                let mut g = cell.borrow_mut();
+                if g.is_none() {
+                    *g = Some(ExecStateThreadGuard(tid));
+                }
+            });
+        }
+    }
+    prev
 }
 
 pub unsafe extern "win64" fn GetSystemPowerStatus(out: *mut u8) -> BOOL {

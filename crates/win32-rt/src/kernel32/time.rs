@@ -67,10 +67,16 @@ struct Clock {
     raw: bool,
 }
 
-fn mach_100ns() -> u64 {
-    let t = unsafe { mach_absolute_time() };
+pub(crate) fn mach_abs_to_100ns(ticks: u64) -> u64 {
+    if ticks == 0 {
+        return 0;
+    }
     let (n, d) = timebase();
-    ((t as u128 * n as u128 / d as u128) / 100) as u64
+    ((ticks as u128 * n as u128 / d.max(1) as u128) / 100) as u64
+}
+
+fn mach_100ns() -> u64 {
+    mach_abs_to_100ns(unsafe { mach_absolute_time() })
 }
 
 fn clock() -> &'static Clock {
