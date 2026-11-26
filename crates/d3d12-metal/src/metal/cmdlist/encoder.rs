@@ -231,8 +231,13 @@ impl CommandList {
         // earlier producer. Cleared only when drained, on a full `All -> PRE_RASTER` barrier, or
         // on `BarrierState::reset()`.
         self.bar.list_blit_unwaited_stages = MTLStages::empty();
-        match std::mem::replace(&mut self.enc, Encoder::None) {
-            Encoder::None => return,
+        let enc = std::mem::replace(&mut self.enc, Encoder::None);
+        if matches!(enc, Encoder::None) {
+            return;
+        }
+        self.finish_mfx_fence_on_encoder_end();
+        match enc {
+            Encoder::None => unreachable!(),
             Encoder::Render(e) => {
                 let had_open_occl = self.occlusion.is_some() && self.enc_vis_buf.is_some();
                 self.enc_vis_buf = None;

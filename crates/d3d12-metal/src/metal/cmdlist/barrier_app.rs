@@ -27,28 +27,12 @@ impl CommandList {
         opening_pre_raster_reads: u8,
     ) {
         if self.pending_mfx_wait_fence.is_some() {
-            let full_mfx = self.bar.needs_barrier;
-            let wait_stages = super::metalfx_rt::metalfx_enc_fence_wait_stages(
-                self.pending_mfx_wait_stages,
+            self.consume_pending_mfx_fence_on_enc_open(
+                enc,
                 render,
-                full_mfx,
+                self.bar.needs_barrier,
                 opening_pre_raster_reads,
-                self.split_compute_exact_active(),
-                self.bar.opening_compute_stage,
             );
-            if full_mfx {
-                if let Some(f) = self.pending_mfx_wait_fence.take() {
-                    self.pending_mfx_wait_stages = MTLStages::empty();
-                    enc.waitForFence_beforeEncoderStages(&f, wait_stages);
-                    enc.barrierAfterStages_beforeQueueStages_visibilityOptions(
-                        wait_stages,
-                        MTLStages::All,
-                        MTL4VisibilityOptions::Device,
-                    );
-                }
-            } else {
-                self.wait_pending_mfx_fence(enc, wait_stages);
-            }
         }
         let clear_cap = if render {
             self.bar.opening_clear_frag_cap.take()
