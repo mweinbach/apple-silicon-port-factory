@@ -172,6 +172,14 @@ pub struct CommandList {
     compute_pso_bound: bool,
     rt_pso: Option<Arc<crate::rt::pipeline::StateObject>>,
     occlusion: Option<super::query::ActiveOcclusion>,
+    /// True once a render pass has opened/enabled the current `occlusion` query slot.
+    occl_drew: bool,
+    /// `MtlBuffer` pointer attached as `visibilityResultBuffer` on the open render pass.
+    enc_vis_buf: Option<usize>,
+    /// True if the open render pass uses `MTLVisibilityResultType::Reset`.
+    enc_vis_reset: bool,
+    /// Query slot indices already enabled in the open `Reset` render pass.
+    enc_vis_used_indices: Vec<u32>,
     predication: Option<Predication>,
     /// Argument table of utility kernels (ClearUAV, RT), created on first use.
     util_table: Option<Retained<MtlArgumentTable>>,
@@ -226,6 +234,10 @@ impl CommandList {
             compute_pso_bound: false,
             rt_pso: None,
             occlusion: None,
+            occl_drew: false,
+            enc_vis_buf: None,
+            enc_vis_reset: false,
+            enc_vis_used_indices: Vec::new(),
             predication: None,
             util_table: None,
             mfx_fence: None,
@@ -328,6 +340,10 @@ impl CommandList {
         self.compute_pso_bound = false;
         self.rt_pso = None;
         self.occlusion = None;
+        self.occl_drew = false;
+        self.enc_vis_buf = None;
+        self.enc_vis_reset = false;
+        self.enc_vis_used_indices.clear();
         self.predication = None;
         self.gfx = GfxState::default();
         Ok(())
@@ -367,6 +383,11 @@ impl CommandList {
         self.flush_pending_mfx_wait_fence();
         if self.list_barrier_tight_active() {
             self.emit_close_producer_barriers();
+        } else if !opts::legacy_barriers()
+            && opts::barrier_masks()
+            && !self.is_copy_queue_light()
+        {
+            self.emit_close_trailing_producer_barriers();
         }
         self.end_encoder();
         self.cb.endCommandBuffer();

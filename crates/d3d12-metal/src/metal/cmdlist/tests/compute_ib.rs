@@ -3032,7 +3032,7 @@ fn g43_stage_d_rp_keep_write_exact_eliminates_rp1_false_poisoning_and_enforces_d
             test_sp.add_with_req(MTLStages::Fragment, MTLStages::Fragment, [MTLStages::empty(); 2], req1);
             let saved_sp = std::mem::replace(&mut l.bar.split_pend, test_sp);
             l.sync_legacy_from_split();
-            l.collect_batch_qbarriers(0);
+            l.collect_batch_qbarriers(0, MTLStages::Vertex);
             assert!(
                 l.bar.written.contains(&ds_rp1_id),
                 "D3 invariant: elided gen-1 Fragment barrier must NOT clear gen-2 written target"

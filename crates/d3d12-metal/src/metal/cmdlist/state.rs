@@ -211,6 +211,12 @@ impl PendingClear {
 pub enum Barrier {
     /// (`*const Resource`, 0 = unknown; StateBefore; StateAfter).
     Transition(usize, u32, u32),
+    /// Split transition begin (`D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY`):
+    /// `(resource_ptr_id, subresource, state_before, state_after)`.
+    SplitBegin(usize, u32, u32, u32),
+    /// Split transition end (`D3D12_RESOURCE_BARRIER_FLAG_END_ONLY`):
+    /// `(resource_ptr_id, subresource, state_before, state_after)`.
+    SplitEnd(usize, u32, u32, u32),
     /// UAV barrier on a resource (0 = all UAV accesses).
     Uav(usize),
     /// Aliasing or anything else: full barrier.
@@ -325,6 +331,31 @@ pub(super) fn note_frag_resolve_dst(r: usize) {
 pub(super) fn is_frag_resolve_dst(r: usize) -> bool {
     ANY_FRAG_RESOLVE_DST.load(std::sync::atomic::Ordering::Relaxed)
         && FRAG_RESOLVE_DST_SET
+            .get()
+            .is_some_and(|m| m.lock().unwrap_or_else(|e| e.into_inner()).contains(&r))
+}
+
+static ANY_ELIDED_NARROW_BARRIER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static ELIDED_NARROW_BARRIER_SET: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> =
+    std::sync::OnceLock::new();
+
+#[inline]
+pub(super) fn note_elided_narrow_barrier(r: usize) {
+    if r != 0 {
+        ELIDED_NARROW_BARRIER_SET
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(r);
+        ANY_ELIDED_NARROW_BARRIER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(super) fn is_elided_narrow_barrier(r: usize) -> bool {
+    ANY_ELIDED_NARROW_BARRIER.load(std::sync::atomic::Ordering::Relaxed)
+        && ELIDED_NARROW_BARRIER_SET
             .get()
             .is_some_and(|m| m.lock().unwrap_or_else(|e| e.into_inner()).contains(&r))
 }
@@ -1926,6 +1957,18 @@ pub(super) struct BarrierState {
     pub(super) has_gpu_work: bool,
     pub(super) opening_compute_stage: MTLStages,
     pub(super) opening_blit_nonfrag_safe: bool,
+    pub(super) opening_blit_explicit_after: Option<MTLStages>,
+    pub(super) list_blit_unwaited_stages: MTLStages,
+    pub(super) list_start_blit_explicit: Vec<(usize, MTLStages)>,
+    pub(super) list_start_blit_tainted: Vec<usize>,
+    pub(super) trail_narrow_items: Vec<(usize, MTLStages, MTLStages, [u32; 7])>,
+    pub(super) opening_pre_raster_stages: MTLStages,
+    pub(super) enc_pre_unwaited_stages: MTLStages,
+    pub(super) enc_pre_unwaited_after: MTLStages,
+    pub(super) enc_pre_unwaited_req: [u32; 7],
+    pub(super) vis_buf_written: Vec<(usize, u32)>,
+    pub(super) vis_buf_blit_read: Vec<usize>,
+    pub(super) split_barriers: Vec<(usize, u32, u32, u32, [u32; 7])>,
     pub(super) opening_render_split_ok: bool,
     pub(super) opening_clear_frag_cap: Option<(MTLStages, [u32; 7])>,
     pub(super) clear_rp_unwaited_blit: Vec<usize>,
@@ -2031,6 +2074,18 @@ impl BarrierState {
             has_gpu_work: false,
             opening_compute_stage: COMPUTE_STAGES,
             opening_blit_nonfrag_safe: false,
+            opening_blit_explicit_after: None,
+            list_blit_unwaited_stages: MTLStages::empty(),
+            list_start_blit_explicit: Vec::new(),
+            list_start_blit_tainted: Vec::new(),
+            trail_narrow_items: Vec::new(),
+            opening_pre_raster_stages: PRE_RASTER,
+            enc_pre_unwaited_stages: MTLStages::empty(),
+            enc_pre_unwaited_after: MTLStages::empty(),
+            enc_pre_unwaited_req: [0; 7],
+            vis_buf_written: Vec::new(),
+            vis_buf_blit_read: Vec::new(),
+            split_barriers: Vec::new(),
             opening_render_split_ok: false,
             opening_clear_frag_cap: None,
             clear_rp_unwaited_blit: Vec::new(),
@@ -2104,6 +2159,18 @@ impl BarrierState {
         self.has_gpu_work = false;
         self.opening_compute_stage = COMPUTE_STAGES;
         self.opening_blit_nonfrag_safe = false;
+        self.opening_blit_explicit_after = None;
+        self.list_blit_unwaited_stages = MTLStages::empty();
+        self.list_start_blit_explicit.clear();
+        self.list_start_blit_tainted.clear();
+        self.trail_narrow_items.clear();
+        self.opening_pre_raster_stages = PRE_RASTER;
+        self.enc_pre_unwaited_stages = MTLStages::empty();
+        self.enc_pre_unwaited_after = MTLStages::empty();
+        self.enc_pre_unwaited_req = [0; 7];
+        self.vis_buf_written.clear();
+        self.vis_buf_blit_read.clear();
+        self.split_barriers.clear();
         self.opening_render_split_ok = false;
         self.enc_blit_only_sync = false;
         self.list_cs_unwaited_frag = false;
