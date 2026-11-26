@@ -11,7 +11,7 @@ use super::dsp::{
 use super::tables::{
     AC_COUNT, AC_RUN, AC_VLC1, AC_VLC2, CBP4_DEFAULT, DC_QUANT, DEBLOCK_LUT_A, DEBLOCK_LUT_B,
     DEBLOCK_LUT_C, MV_CLAMP, MV_VLC, QDELTA_LUT, QMAT_INTER, QMAT_INTRA_CHROMA, QMAT_INTRA_LUMA,
-    SLICE_COUNT, ZIGZAG,
+    SLICE_COUNT, ZIGZAG_U8,
 };
 
 /// Planar destination/reference view for one Bink 2 frame decode.
@@ -99,126 +99,152 @@ pub fn compute_slices(fourcc: u32, open_flags: u32, _width: u32, height: u32) ->
     info
 }
 
-/// LSB-first 32-bit word-oriented bitstream reader matching Bink 2's reader layout.
+#[cold]
+#[inline(never)]
+fn read_tail_word(data: &[u8], off: usize) -> u32 {
+    if off < data.len() {
+        let mut b = [0u8; 4];
+        let rem = data.len() - off;
+        b[..rem].copy_from_slice(&data[off..]);
+        u32::from_le_bytes(b)
+    } else {
+        0
+    }
+}
+
+/// LSB-first 64-bit buffered word-oriented bitstream reader matching Bink 2's reader layout.
 pub struct BitReader<'a> {
     data: &'a [u8],
     base_offset: usize,
-    word_idx: usize,
-    bit_buf: u32,
+    next_word_idx: usize,
+    bit_buf: u64,
     bits_left: u32,
 }
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8], byte_offset: usize) -> Self {
+        let slice = if byte_offset <= data.len() {
+            &data[byte_offset..]
+        } else {
+            &[]
+        };
         Self {
-            data,
+            data: slice,
             base_offset: byte_offset,
-            word_idx: 0,
+            next_word_idx: 0,
             bit_buf: 0,
             bits_left: 0,
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn word_at(&self, widx: usize) -> u32 {
-        let off = self.base_offset + widx * 4;
+        let off = widx << 2;
         if off + 4 <= self.data.len() {
-            u32::from_le_bytes([
-                self.data[off],
-                self.data[off + 1],
-                self.data[off + 2],
-                self.data[off + 3],
-            ])
-        } else if off < self.data.len() {
-            let mut b = [0u8; 4];
-            let rem = self.data.len() - off;
-            b[..rem].copy_from_slice(&self.data[off..]);
-            u32::from_le_bytes(b)
+            // SAFETY: `off + 4 <= self.data.len()` guarantees 4 valid readable bytes.
+            unsafe {
+                let ptr = self.data.as_ptr().add(off) as *const [u8; 4];
+                u32::from_le_bytes(std::ptr::read_unaligned(ptr))
+            }
         } else {
-            0
+            read_tail_word(self.data, off)
         }
     }
 
-    #[inline]
-    fn next_u32(&mut self) -> u32 {
-        let w = self.word_at(self.word_idx);
-        self.word_idx += 1;
-        w
+    /// Ensure at least 32 valid bits are buffered in `bit_buf`.
+    #[inline(always)]
+    fn refill(&mut self) {
+        if self.bits_left < 32 {
+            let w = self.word_at(self.next_word_idx) as u64;
+            self.bit_buf |= w << self.bits_left;
+            self.next_word_idx += 1;
+            self.bits_left += 32;
+        }
     }
 
     #[inline]
     pub fn byte_pos(&self) -> usize {
-        self.base_offset + self.word_idx * 4
+        let unread_words = (self.bits_left >> 5) as usize;
+        self.base_offset + (self.next_word_idx - unread_words) * 4
     }
 
     #[inline]
     pub fn align_u32(&mut self) {
-        if (self.bits_left & 31) != 0 {
-            self.bits_left = 0;
-            self.bit_buf = 0;
+        let rem = self.bits_left & 31;
+        if rem != 0 {
+            self.bit_buf >>= rem;
+            self.bits_left -= rem;
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_bit(&mut self) -> u32 {
         if self.bits_left == 0 {
-            let w = self.next_u32();
+            let w = self.word_at(self.next_word_idx) as u64;
+            self.next_word_idx += 1;
             self.bit_buf = w >> 1;
             self.bits_left = 31;
-            w & 1
+            (w as u32) & 1
         } else {
-            let b = self.bit_buf & 1;
+            let b = (self.bit_buf as u32) & 1;
             self.bit_buf >>= 1;
             self.bits_left -= 1;
             b
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_bits(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
-        let mut v = self.bit_buf as u64;
         if self.bits_left < n {
-            let next = self.next_u32() as u64;
-            v |= next << self.bits_left;
+            let w = self.word_at(self.next_word_idx) as u64;
+            self.bit_buf |= w << self.bits_left;
+            self.next_word_idx += 1;
             self.bits_left += 32;
         }
+        let v = self.bit_buf as u32;
+        self.bit_buf >>= n;
         self.bits_left -= n;
-        self.bit_buf = (v >> n) as u32;
         let mask = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
-        (v as u32) & mask
+        v & mask
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn peek_bits(&self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
-        let mut v = self.bit_buf as u64;
+        let mut v = self.bit_buf;
         if self.bits_left < n {
-            let next = self.word_at(self.word_idx) as u64;
+            let next = self.word_at(self.next_word_idx) as u64;
             v |= next << self.bits_left;
         }
         let mask = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
         (v as u32) & mask
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn skip_bits(&mut self, n: u32) {
         if n == 0 {
             return;
         }
         if self.bits_left < n {
-            let next = self.next_u32();
-            let shift = n - self.bits_left;
-            self.bit_buf = if shift >= 32 { 0 } else { next >> shift };
-            self.bits_left = 32 - shift;
-        } else {
-            self.bit_buf = if n >= 32 { 0 } else { self.bit_buf >> n };
-            self.bits_left -= n;
+            let w = self.word_at(self.next_word_idx) as u64;
+            self.bit_buf |= w << self.bits_left;
+            self.next_word_idx += 1;
+            self.bits_left += 32;
         }
+        self.bit_buf >>= n;
+        self.bits_left -= n;
+    }
+
+    /// Consume `n` bits (`n <= 32`) when caller already ensured `bits_left >= n` via `refill()`.
+    #[inline(always)]
+    fn consume_fast(&mut self, n: u32) {
+        self.bit_buf >>= n;
+        self.bits_left -= n;
     }
 }
 
@@ -353,20 +379,21 @@ fn decode_rle_bitmap(out: &mut [u8], mut bit_pos: u32, bs: &mut BitReader, mut c
 /// Move-to-front macroblock mode decoder (`180022ac0`).
 #[inline]
 fn decode_mode_mtf(bs: &mut BitReader, mtf: &mut [u8; 4]) -> u8 {
-    let v = bs.peek_bits(3);
+    bs.refill();
+    let v = (bs.bit_buf as u32) & 7;
     if (v & 1) != 0 {
-        bs.skip_bits(1);
+        bs.consume_fast(1);
         mtf[0]
     } else if (v & 2) != 0 {
-        bs.skip_bits(2);
+        bs.consume_fast(2);
         mtf.swap(0, 1);
         mtf[0]
-    } else if (v & 7) == 0 {
-        bs.skip_bits(3);
+    } else if v == 0 {
+        bs.consume_fast(3);
         mtf.swap(1, 2);
         mtf[1]
     } else {
-        bs.skip_bits(3);
+        bs.consume_fast(3);
         mtf.swap(2, 3);
         mtf[2]
     }
@@ -375,20 +402,25 @@ fn decode_mode_mtf(bs: &mut BitReader, mtf: &mut [u8; 4]) -> u8 {
 /// Decode quantizer delta (`180014ae0`).
 #[inline]
 fn decode_qdelta(bs: &mut BitReader, prev_q: i32) -> i32 {
-    let v = bs.peek_bits(9);
+    bs.refill();
+    let v = (bs.bit_buf as u32) & 0x1ff;
     let mut mag: i32 = if (v & 7) != 0 {
         let m = QDELTA_LUT[(v & 7) as usize] as i32;
-        bs.skip_bits((m + 1) as u32);
+        bs.consume_fast((m + 1) as u32);
         m
     } else if (v & 0xf) == 0 {
-        bs.skip_bits(9);
+        bs.consume_fast(9);
         ((v >> 4) + 5) as i32
     } else {
-        bs.skip_bits(5);
+        bs.consume_fast(5);
         (((v >> 4) & 1) + 3) as i32
     };
-    if mag != 0 && bs.read_bit() != 0 {
-        mag = -mag;
+    if mag != 0 {
+        let sign = (bs.bit_buf as u32) & 1;
+        bs.consume_fast(1);
+        if sign != 0 {
+            mag = -mag;
+        }
     }
     prev_q.wrapping_add(mag)
 }
@@ -465,18 +497,21 @@ fn decode_dc_deltas<const N: usize>(bs: &mut BitReader, q: u32) -> ([i16; N], bo
     let q_idx = (q.max(8) as usize).min(DC_QUANT.len() - 1);
     let scale = DC_QUANT[q_idx] as i32;
     for slot in &mut out {
-        let peek = bs.peek_bits(11);
+        bs.refill();
+        let peek = (bs.bit_buf as u32) & 0x7ff;
         let k = (!peek).trailing_zeros();
-        bs.skip_bits(k + 1);
+        bs.consume_fast(k + 1);
         if k != 0 {
             let level = if k > 3 {
                 let eb = k - 3;
-                let extra = bs.read_bits(eb);
+                let extra = (bs.bit_buf as u32) & ((1u32 << eb) - 1);
+                bs.consume_fast(eb);
                 (extra + 2 + (1u32 << eb)) as i32
             } else {
                 k as i32
             };
-            let sign = bs.read_bit();
+            let sign = (bs.bit_buf as u32) & 1;
+            bs.consume_fast(1);
             let mag = (level.wrapping_mul(scale).wrapping_add(0x200)) >> 10;
             *slot = if sign != 0 { -mag } else { mag } as i16;
         }
@@ -679,12 +714,101 @@ fn decode_dc4(
     dc[3] = v3 as i32;
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn decode_ac_quad_inner<const USE_ALT: bool>(
+    mut cbp_bits: u32,
+    coeffs: &mut [i16; 256],
+    bs: &mut BitReader,
+    q: u32,
+    qmat: &[[u16; 64]; 4],
+    dcs: &[i32; 4],
+    info_out: &mut [u16; 4],
+    base_flag: u16,
+) -> u32 {
+    let q_phase = (q & 3) as usize;
+    let q_shift = (q >> 2) & 31;
+    let qm = &qmat[q_phase];
+    let mut last_nz_packed = 0u32;
+
+    for b in 0..4 {
+        let blk = &mut coeffs[b * 64..(b + 1) * 64];
+        let mut nz_count = 0u32;
+        let mut last_nz = 0u32;
+        if (cbp_bits & 1) != 0 {
+            blk.fill(0);
+            let mut rem_nz = 0i32;
+            let mut idx = 1usize;
+            while idx < 64 {
+                rem_nz -= 1;
+                let pos = if rem_nz < 1 {
+                    bs.refill();
+                    let entry = if USE_ALT {
+                        AC_VLC2[(bs.bit_buf as usize) & 0xff]
+                    } else {
+                        AC_VLC1[(bs.bit_buf as usize) & 0x1ff]
+                    };
+                    let sym = ((entry >> 4) & 0xf) as usize;
+                    let blen = (entry & 0xf) as u32;
+                    bs.consume_fast(blen);
+                    let mut run = AC_RUN[sym];
+                    rem_nz = AC_COUNT[sym] as i32;
+                    if run == 11 {
+                        run = (bs.bit_buf as usize) & 0x3f;
+                        bs.consume_fast(6);
+                    }
+                    let p = idx + run;
+                    if p >= 64 {
+                        break;
+                    }
+                    p
+                } else {
+                    idx
+                };
+
+                bs.refill();
+                let peek = (bs.bit_buf as u32) & 0x7ff;
+                let k = (!peek).trailing_zeros();
+                let n = k + 1;
+                bs.consume_fast(n);
+                let mag = if n > 3 {
+                    let eb = k - 2;
+                    let extra = (bs.bit_buf as u32) & ((1u32 << eb) - 1);
+                    bs.consume_fast(eb);
+                    extra + 2 + (1u32 << eb)
+                } else {
+                    n
+                };
+                let sign = (bs.bit_buf as u32) & 1;
+                bs.consume_fast(1);
+                let signed = if sign != 0 { -(mag as i32) } else { mag as i32 };
+                let zz = (ZIGZAG_U8[pos] as usize) & 63;
+                let deq = ((signed.wrapping_mul(qm[zz] as i32)) << q_shift).wrapping_add(0x40) >> 7;
+                blk[zz] = deq as i16;
+                nz_count += 1;
+                last_nz = pos as u32;
+                idx = pos + 1;
+            }
+        }
+        let dc = dcs[b] as u16;
+        blk[0] = dc.wrapping_add(4).wrapping_mul(8) as i16;
+        last_nz_packed = (last_nz << 24) | (last_nz_packed >> 8);
+        let sp =
+            (u16::from(nz_count < 4) + u16::from(nz_count < 8) + u16::from(nz_count == 0)) * 0x2000;
+        info_out[b] = sp | (dc & 0x1fff) | base_flag;
+        cbp_bits = (cbp_bits >> 1) & 0x7fff_ffff;
+    }
+
+    last_nz_packed
+}
+
 /// Decode AC coefficients for a 4-block (16x16) quad (`1800123a0`).
 ///
 /// Returns packed 4 bytes of `last_nz` (byte `b` = last nonzero zigzag index in block `b`,
 /// or `0` if DC-only).
+#[allow(clippy::too_many_arguments)]
 fn decode_ac_quad(
-    mut cbp_bits: u32,
+    cbp_bits: u32,
     coeffs: &mut [i16; 256],
     bs: &mut BitReader,
     q: u32,
@@ -702,78 +826,11 @@ fn decode_ac_quad(
         return 0;
     }
 
-    let use_alt = (cbp_bits & 0xffff_0000) != 0;
-    let q_phase = (q & 3) as usize;
-    let q_shift = (q >> 2) & 31;
-    let qm = &qmat[q_phase];
-    let mut last_nz_packed = 0u32;
-
-    for b in 0..4 {
-        let blk = &mut coeffs[b * 64..(b + 1) * 64];
-        let mut nz_count = 0u32;
-        let mut last_nz = 0u32;
-        if (cbp_bits & 1) != 0 {
-            blk.fill(0);
-            let mut rem_nz = 0i32;
-            let mut idx = 1usize;
-            while idx < 64 {
-                rem_nz -= 1;
-                let pos = if rem_nz < 1 {
-                    let entry = if use_alt {
-                        AC_VLC2[bs.peek_bits(8) as usize]
-                    } else {
-                        AC_VLC1[bs.peek_bits(9) as usize]
-                    };
-                    let sym = (entry >> 4) as usize;
-                    let blen = (entry & 0xf) as u32;
-                    bs.skip_bits(blen);
-                    let mut run = AC_RUN[sym];
-                    rem_nz = AC_COUNT[sym] as i32;
-                    if run == 11 {
-                        run = bs.read_bits(6) as usize;
-                    }
-                    let p = idx + run;
-                    if p >= 64 {
-                        break;
-                    }
-                    p
-                } else {
-                    idx
-                };
-
-                let peek = bs.peek_bits(11);
-                let k = (!peek).trailing_zeros();
-                let n = k + 1;
-                bs.skip_bits(n);
-                let mag = if n > 3 {
-                    let eb = k - 2;
-                    let extra = bs.read_bits(eb);
-                    extra + 2 + (1u32 << eb)
-                } else {
-                    n
-                };
-                let sign = bs.read_bit();
-                let signed = if sign != 0 { -(mag as i32) } else { mag as i32 };
-                let zz = ZIGZAG[pos];
-                let deq = ((signed.wrapping_mul(qm[zz] as i32)) << q_shift)
-                    .wrapping_add(0x40)
-                    >> 7;
-                blk[zz] = deq as i16;
-                nz_count += 1;
-                last_nz = pos as u32;
-                idx = pos + 1;
-            }
-        }
-        let dc = dcs[b] as u16;
-        blk[0] = dc.wrapping_add(4).wrapping_mul(8) as i16;
-        last_nz_packed = (last_nz << 24) | (last_nz_packed >> 8);
-        let sp = (u16::from(nz_count < 4) + u16::from(nz_count < 8) + u16::from(nz_count == 0))
-            * 0x2000;
-        info_out[b] = sp | (dc & 0x1fff) | base_flag;
-        cbp_bits = (cbp_bits >> 1) & 0x7fff_ffff;
+    if (cbp_bits & 0xffff_0000) != 0 {
+        decode_ac_quad_inner::<true>(cbp_bits, coeffs, bs, q, qmat, dcs, info_out, base_flag)
+    } else {
+        decode_ac_quad_inner::<false>(cbp_bits, coeffs, bs, q, qmat, dcs, info_out, base_flag)
     }
-
-    last_nz_packed
 }
 
 /// Transform a 4-block (16x16) coefficient quad into a 16x16 `i16` buffer (stride `out_stride` in `i16`s).
@@ -1140,20 +1197,22 @@ fn decode_mvs(
     for axis in 0..2usize {
         let mut deltas = [0i32; 4];
         for slot in deltas.iter_mut().take(count) {
-            let v = bs.peek_bits(16);
+            bs.refill();
+            let v = (bs.bit_buf as u32) & 0xffff;
             if (v & 0xf) != 0 {
                 let e = MV_VLC[(v & 0x7f) as usize];
                 let blen = (e as u8 & 7) as u32;
-                bs.skip_bits(blen);
+                bs.consume_fast(blen);
                 *slot = (e >> 3) as i32;
             } else {
                 let raw: u32 = if v == 0 {
-                    bs.skip_bits(16);
+                    bs.consume_fast(16);
                     bs.read_bits(16).wrapping_add(0xffff)
                 } else {
                     let tz = v.trailing_zeros(); // 4..=15
                     let total_bits = tz * 2 + 1;
-                    let w = bs.read_bits(total_bits);
+                    let w = (bs.bit_buf as u32) & ((1u32 << total_bits) - 1);
+                    bs.consume_fast(total_bits);
                     (w >> (tz + 1)).wrapping_add((1u32 << tz) - 1)
                 };
                 let unzz = ((raw >> 1) as i32) ^ -((raw & 1) as i32);
@@ -3808,7 +3867,7 @@ mod tests {
 
     #[test]
     fn bit_reader_cross_word_and_align() {
-        let data = [0xAA, 0x55, 0xF0, 0x0F, 0x12, 0x34, 0x56, 0x78];
+        let data = [0xAA, 0x55, 0xF0, 0x0F, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF1];
         let mut bs = BitReader::new(&data, 0);
         assert_eq!(bs.read_bits(4), 0xA);
         assert_eq!(bs.peek_bits(8), 0x5A);
@@ -3816,5 +3875,17 @@ mod tests {
         assert_eq!(bs.read_bits(20), 0x20FF0);
         bs.align_u32();
         assert_eq!(bs.byte_pos(), 8);
+
+        // Verify refill() followed by align_u32() preserves unread full word and exact byte_pos.
+        let mut bs2 = BitReader::new(&data, 0);
+        assert_eq!(bs2.read_bits(5), 0x0A);
+        bs2.refill(); // loads second 32-bit word while first is partially consumed
+        bs2.align_u32(); // discards remaining 27 bits of word 0, preserves word 1
+        assert_eq!(bs2.byte_pos(), 4);
+        assert_eq!(bs2.read_bits(8), 0x12);
+        assert_eq!(bs2.read_bits(24), 0x785634);
+        assert_eq!(bs2.byte_pos(), 8);
+        assert_eq!(bs2.read_bits(32), 0xF1DEBC9A);
+        assert_eq!(bs2.byte_pos(), 12);
     }
 }

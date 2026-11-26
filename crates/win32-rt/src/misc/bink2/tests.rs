@@ -773,10 +773,11 @@ fn bink_async_threads_multi_coordination() {
         assert_eq!(BinkDoFrameAsyncWait(hbink, -1), 1);
 
         // Simulate an in-flight decode on thread 1 and verify BinkWaitStopAsyncThreadsMulti
-        // blocks until the in-flight decode guard drops.
+        // blocks until the in-flight decode guard drops, while an unrelated handle's Wait(0)
+        // does not falsely stall.
         let guard = AsyncDecodeGuard::acquire(&[1]);
         assert_eq!(BinkRequestStopAsyncThreadsMulti(tids.as_ptr(), 3), 1);
-        assert_eq!(BinkDoFrameAsyncWait(hbink, 0), 0);
+        assert_eq!(BinkDoFrameAsyncWait(hbink, 0), 1);
 
         let finished = Arc::new(AtomicBool::new(false));
         let finished_bg = finished.clone();
@@ -1096,5 +1097,165 @@ fn bink_subtitles_and_preopen_setters() {
         let _ = std::fs::remove_file(&tmp_srt);
         BinkClose(hbink);
         BinkFreeGlobals();
+    }
+}
+
+/// Build a minimal valid multi-frame in-memory `KB2n` buffer for async API ordering tests.
+fn make_test_kb2n_multiframe(frames: u32, width: u32, height: u32) -> Vec<u8> {
+    let hdr_size = 0x2cusize;
+    let extra_hdr = 4usize; // KB2n extended header
+    let table_bytes = ((frames as usize) + 1) * 4;
+    let payload_start = hdr_size + extra_hdr + table_bytes;
+    let frame_pkt_size = 16usize;
+    let total_size = payload_start + (frames as usize) * frame_pkt_size;
+    let mut buf = vec![0u8; total_size];
+
+    let hdr = Bk2FileHeader {
+        magic: *b"KB2n",
+        file_size_minus_8: (total_size - 8) as u32,
+        frames,
+        largest_frame_size: frame_pkt_size as u32,
+        frames_dup: frames,
+        width,
+        height,
+        fps_num: 30,
+        fps_den: 1,
+        video_flags: 0,
+        num_tracks: 0,
+    };
+    unsafe {
+        std::ptr::write_unaligned(buf.as_mut_ptr() as *mut Bk2FileHeader, hdr);
+    }
+    let fo_base = hdr_size + extra_hdr;
+    for f in 0..=(frames as usize) {
+        let mut off = (payload_start + f * frame_pkt_size) as u32;
+        if f == 0 {
+            off |= 1; // frame 1 is a keyframe
+        }
+        buf[fo_base + f * 4..fo_base + f * 4 + 4].copy_from_slice(&off.to_le_bytes());
+    }
+    buf
+}
+
+#[test]
+fn bink_async_wait_semantics_multi_handle_and_close_in_flight() {
+    use std::sync::{Condvar, Mutex};
+
+    unsafe {
+        let stream1 = make_test_kb2n_multiframe(4, 64, 32);
+        let stream2 = make_test_kb2n_multiframe(4, 64, 32);
+        let h1 = BinkOpen(stream1.as_ptr(), 0x0400_0000);
+        let h2 = BinkOpen(stream2.as_ptr(), 0x0400_0000);
+        assert!(!h1.is_null() && !h2.is_null());
+
+        // 1. Wait semantics: poll (us=0) and finite timeout (us>0) return 0 while in flight;
+        //    independent handle h2 returns 1 immediately; once released, wait returns 1 and
+        //    publishes fb.frame_num.
+        let gate1 = Arc::new((Mutex::new(false), Condvar::new()));
+        let done1 = Arc::new(AtomicBool::new(false));
+        let inst1 = &*(h1 as *const BinkInstance);
+        let fb1_before = inst1.default_frame_buffers.frame_num;
+
+        super::bink2::player::start_gated_async_job_for_test(
+            h1,
+            &[0, 1],
+            gate1.clone(),
+            done1.clone(),
+        );
+
+        // Non-blocking poll and short timeout both see in-flight status.
+        assert_eq!(BinkDoFrameAsyncWait(h1, 0), 0);
+        assert_eq!(BinkDoFrameAsyncWait(h1, 5_000), 0);
+        // Frame buffer index must NOT flip until completion is committed.
+        assert_eq!((&*(h1 as *const BinkInstance)).default_frame_buffers.frame_num, fb1_before);
+
+        // Handle 2 is completely independent: poll returns 1 immediately and can decode concurrently.
+        assert_eq!(BinkDoFrameAsyncWait(h2, 0), 1);
+        assert_eq!(BinkDoFrameAsync(h2, 2, 3), 1);
+        assert_eq!(BinkDoFrameAsyncWait(h2, -1), 1);
+        assert_eq!((&*(h2 as *const BinkInstance)).played_frames, 1);
+
+        // Release handle 1's worker on a background thread while main thread blocks in Wait(-1).
+        let gate1_rel = gate1.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            let (lock, cvar) = &*gate1_rel;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        });
+        assert_eq!(BinkDoFrameAsyncWait(h1, -1), 1);
+        releaser.join().unwrap();
+        assert!(done1.load(Ordering::Acquire));
+        assert_ne!(
+            (&*(h1 as *const BinkInstance)).default_frame_buffers.frame_num,
+            fb1_before
+        );
+        assert_eq!((&*(h1 as *const BinkInstance)).played_frames, 1);
+
+        // 2. BinkNextFrame while in flight must drain the worker before advancing FrameNum.
+        BinkNextFrame(h1);
+        let gate_nf = Arc::new((Mutex::new(false), Condvar::new()));
+        let done_nf = Arc::new(AtomicBool::new(false));
+        super::bink2::player::start_gated_async_job_for_test(
+            h1,
+            &[0],
+            gate_nf.clone(),
+            done_nf.clone(),
+        );
+        let gate_nf_rel = gate_nf.clone();
+        let nf_rel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            let (lock, cvar) = &*gate_nf_rel;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        });
+        BinkNextFrame(h1);
+        nf_rel.join().unwrap();
+        assert!(done_nf.load(Ordering::Acquire));
+        assert_eq!(std::ptr::read_unaligned((h1 as *const u8).add(0x0c) as *const u32), 3);
+
+        // 3. BinkClose while an async decode is still in flight must wait for completion
+        //    before freeing the BinkInstance (no use-after-free).
+        let gate_close = Arc::new((Mutex::new(false), Condvar::new()));
+        let done_close = Arc::new(AtomicBool::new(false));
+        super::bink2::player::start_gated_async_job_for_test(
+            h1,
+            &[0, 1],
+            gate_close.clone(),
+            done_close.clone(),
+        );
+        let gate_close_rel = gate_close.clone();
+        let close_rel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            let (lock, cvar) = &*gate_close_rel;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        });
+        BinkClose(h1);
+        assert!(
+            done_close.load(Ordering::Acquire),
+            "BinkClose must not return until in-flight worker completes"
+        );
+        close_rel.join().unwrap();
+
+        // 4. Multi-frame real async decode loop on handle 2.
+        for expected_frame in 2..=4u32 {
+            BinkNextFrame(h2);
+            assert_eq!(BinkDoFrameAsync(h2, 0, 1), 1);
+            assert_eq!(BinkDoFrameAsyncWait(h2, -1), 1);
+            assert_eq!(
+                std::ptr::read_unaligned((h2 as *const u8).add(0x0c) as *const u32),
+                expected_frame
+            );
+        }
+        BinkClose(h2);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn bink_blit_neon_yuv_to_rgb32_bit_exact() {
+    unsafe {
+        super::bink2::blit::verify_neon_yuv_to_rgb32_matches_scalar();
     }
 }
