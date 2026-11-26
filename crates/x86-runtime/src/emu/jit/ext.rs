@@ -76,7 +76,7 @@ impl Tr<'_> {
                 vn
             }
         } else {
-            self.a.v_frint(true, 0, 5, vn);
+            self.a.v_frint(true, 4, 5, vn);
             5
         };
         self.a.v_fcvtzs_2d(vd, src);

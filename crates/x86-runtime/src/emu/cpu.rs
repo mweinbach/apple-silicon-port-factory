@@ -1264,11 +1264,34 @@ pub(super) fn sse_sqrt64(a: f64) -> f64 {
     x86_nan64(a, a, a.sqrt())
 }
 
+/// Round `f` to an integer using the active hardware rounding mode (`FPCR.RMode`, installed from
+/// guest `MXCSR.RC`). Avoids `pure` so LLVM never hoists across `write_fpcr`.
+#[inline(always)]
+fn round_current_f64(f: f64) -> f64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let out: f64;
+        unsafe {
+            core::arch::asm!(
+                "frinti {:d}, {:d}",
+                out(vreg) out,
+                in(vreg) f,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        out
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        f.round_ties_even()
+    }
+}
+
 /// `cvt(t)ss2si` / `cvt(t)sd2si` to a 32-bit integer: NaN and out-of-range inputs produce the
-/// "integer indefinite" value `0x80000000`. Non-truncating forms round to nearest-even (MXCSR).
+/// "integer indefinite" value `0x80000000`. Non-truncating forms round according to `MXCSR.RC`.
 #[inline(always)]
 pub(super) fn sse_cvt_i32(f: f64, trunc: bool) -> u32 {
-    let r = if trunc { f.trunc() } else { f.round_ties_even() };
+    let r = if trunc { f.trunc() } else { round_current_f64(f) };
     if r.is_nan() || r >= 2147483648.0 || r < -2147483648.0 {
         0x8000_0000
     } else {
@@ -1279,7 +1302,7 @@ pub(super) fn sse_cvt_i32(f: f64, trunc: bool) -> u32 {
 /// 64-bit counterpart of [`sse_cvt_i32`] (indefinite = `0x8000000000000000`).
 #[inline(always)]
 pub(super) fn sse_cvt_i64(f: f64, trunc: bool) -> u64 {
-    let r = if trunc { f.trunc() } else { f.round_ties_even() };
+    let r = if trunc { f.trunc() } else { round_current_f64(f) };
     if r.is_nan() || r >= 9223372036854775808.0 || r < -9223372036854775808.0 {
         0x8000_0000_0000_0000
     } else {
@@ -1374,6 +1397,66 @@ static ATOMIC_LOCKS: [AtomicLockShard; ATOMIC_LOCK_SHARDS] =
 #[inline(always)]
 pub(super) fn atomic_locks_ptr() -> usize {
     ATOMIC_LOCKS.as_ptr() as usize
+}
+
+/// Native Rust helpers reachable from position-independent JIT, dynamic `.aot`, and signed
+/// static Mach-O `.aot.o` code via `Cpu::jx.sys_helpers` (zero baked host addresses or relocs).
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+pub(super) struct SysHelpers {
+    pub cpuid: unsafe extern "C" fn(leaf: u32, subleaf: u32, out: *mut [u32; 4]),
+    pub xstate: unsafe extern "C" fn(cpu: *mut Cpu, flags: u32, addr: u64, ip: u64) -> u64,
+    pub fault_gp: unsafe extern "C" fn(cpu: *mut Cpu, ip: u64),
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" fn jit_helper_cpuid(leaf: u32, subleaf: u32, out: *mut [u32; 4]) {
+    *out = super::cpuid::query(leaf, subleaf);
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" fn jit_helper_xstate(cpu: *mut Cpu, flags: u32, addr: u64, ip: u64) -> u64 {
+    let cpu = &mut *cpu;
+    match cpu.exec_xstate_mem(addr, flags as u8) {
+        Ok(()) => {
+            apply_guest_mxcsr_hw(cpu.jx.mxcsr);
+            if (flags as u8) & super::xstate::XS_FLAG_RESTORE != 0
+                && super::denorm::software_mode(cpu.jx.mxcsr)
+            {
+                1
+            } else {
+                0
+            }
+        }
+        Err(fault) => {
+            super::dispatch::jit_ras_publish(cpu);
+            fault.dispatch(cpu, ip);
+            apply_guest_mxcsr_hw(cpu.jx.mxcsr);
+            2
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" fn jit_helper_fault_gp(cpu: *mut Cpu, ip: u64) {
+    let cpu = &mut *cpu;
+    super::dispatch::jit_ras_publish(cpu);
+    super::xstate::Fault::gp().dispatch(cpu, ip);
+    apply_guest_mxcsr_hw(cpu.jx.mxcsr);
+}
+
+#[cfg(target_arch = "aarch64")]
+static SYS_HELPERS: SysHelpers = SysHelpers {
+    cpuid: jit_helper_cpuid,
+    xstate: jit_helper_xstate,
+    fault_gp: jit_helper_fault_gp,
+};
+
+/// Base address of [`SYS_HELPERS`] exposed to translated code via `Cpu::jx.sys_helpers`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(super) fn sys_helpers_ptr() -> usize {
+    core::ptr::addr_of!(SYS_HELPERS) as usize
 }
 
 /// RAII guard for one shard in [`ATOMIC_LOCKS`].
