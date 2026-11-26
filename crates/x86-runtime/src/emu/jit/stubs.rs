@@ -1,7 +1,7 @@
 //! Shared JIT/AOT trampoline stubs (`enter`, `exit`, `lookup_rip`, `lookup_jmp`, `lookup_call`,
 //! `host_xfer`, `ras_miss`, `spill_xmm`, `reload_xmm`, `clear_ymm_hi`).
 
-use super::cache::JBITS;
+use super::cache::JSET_BITS;
 use super::emit::{enc_logic_imm, Asm};
 use super::translate::stack_tso;
 use super::xmm::xmm_pin_enabled;
@@ -242,17 +242,23 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
 
     let (rdtsc_slow, rdtscp_slow) = emit_timestamp_stubs(a);
 
-    // Hash probe of x0 -> on hit branches to the code (x1); on miss falls through.
-    // Clobbers x1, x2, x16, x17 and NZCV.
+    // 2-way set-associative hash probe of x0 -> on hit falls through with x1 = fast and
+    // w17 = gen (0 for static/AOT blocks, != 0 for SMC); on miss branches to the returned
+    // fixups. Clobbers x1, x2, x16, x17 and NZCV; preserves x0, x3 (T3), x4 (T4), x30.
     let probe = |a: &mut Asm| -> [usize; 3] {
         a.ldr(64, XA, XCPU, OFF_TABLE);
         a.ldr(64, XS, XCPU, OFF_TABLE + 8);
         a.mul(true, XS, 0, XS);
-        a.lsr_i(true, XS, XS, 64 - JBITS);
-        a.addsub_rr(true, false, false, XA, XA, XS, 5);
+        a.lsr_i(true, XS, XS, 64 - JSET_BITS);
+        a.addsub_rr(true, false, false, XA, XA, XS, 6); // 64B set (2 x 32B JEnt)
+        a.ldp_x(XS, 1, XA, 0); // way 0: (ip, fast)
+        a.addsub_rr(true, true, true, ZR, XS, 0, 0); // cmp x17, x0
+        let hit0 = a.bcond(EQ);
+        a.addsub_ri(true, false, false, XA, XA, 32, false); // way 1
         a.ldp_x(XS, 1, XA, 0);
         a.addsub_rr(true, true, true, ZR, XS, 0, 0); // cmp x17, x0
         let m1 = a.bcond(NE);
+        a.bind(hit0);
         let m2 = a.cbz(true, 1);
         a.ldr(32, XS, XA, 16);
         let ok = a.cbz(false, XS);
@@ -264,9 +270,22 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         [m1, m2, m3]
     };
 
+    // Populate the per-site 2-way IC at `[T4]` (x4) on a static/AOT (`w17 == 0`) guest block
+    // hit (`x0` = target guest IP, `x1` = host code addr). FIFO-rotates way 0 -> way 1 so
+    // 2-target polymorphic sites stay read-only in steady state.
+    let emit_ic_populate = |a: &mut Asm| {
+        let skip_null = a.cbz(true, T4);
+        let skip_smc = a.cbnz(false, XS);
+        a.ldp_x(2, XS, T4, 0);
+        a.stp_x(2, XS, T4, 16);
+        a.stp_x(0, 1, T4, 0);
+        a.bind(skip_null);
+        a.bind(skip_smc);
+    };
+
     // Shared AOT probe table (`aot_probe_enabled`; layout: `aot::probe_table`) search of x0
     // after a `probe` miss: on a live entry branches to `hit` (word position of the stub's
-    // hit path, x1 = code); otherwise falls through (and returns the branches to bind
+    // hit path, x1 = code, w17 = 0); otherwise falls through (and returns the branches to bind
     // there). Same clobbers as `probe`. Emits nothing when the knob is off.
     let aot_on = cfg.aot_on;
     let count_probe_hits = cfg.count_probe_hits;
@@ -293,15 +312,20 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.patch(back, lp);
         a.bind(found);
         let m2 = a.cbz(true, 1);
-        // Populate this thread's direct-mapped `table[jslot(x0)]` inline (`gen = 0, hits = 0,
-        // code = x1`) so repeated indirect calls/jmps/rets hit in O(1) without probing again.
+        // Populate this thread's 2-way `table[jset_base(x0)]` inline (FIFO rotate way 0 -> way 1;
+        // install `gen = 0, hits = 0, code = x1` in way 0) so repeated transfers hit in O(1).
         a.ldr(64, XA, XCPU, OFF_TABLE);
         a.ldr(64, XS, XCPU, OFF_TABLE + 8);
         a.mul(true, XS, 0, XS);
-        a.lsr_i(true, XS, XS, 64 - JBITS);
-        a.addsub_rr(true, false, false, XA, XA, XS, 5);
+        a.lsr_i(true, XS, XS, 64 - JSET_BITS);
+        a.addsub_rr(true, false, false, XA, XA, XS, 6);
+        a.ldp_x(2, XS, XA, 0);
+        a.stp_x(2, XS, XA, 32);
+        a.ldp_x(2, XS, XA, 16);
+        a.stp_x(2, XS, XA, 48);
         a.stp_x(0, 1, XA, 0);
         a.stp_x(ZR, 1, XA, 16);
+        a.movz(false, XS, 0, 0); // gen = 0 so `hit` may populate `[T4]`
         if count_probe_hits {
             a.ldr(64, 2, XCPU, OFF_PROBEHITS);
             a.addsub_ri(true, false, false, 2, 2, 1, false);
@@ -317,11 +341,15 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     // paths: x0 is a translated guest IP, so leaving with EXIT_RIP there is exact).
     let bud = cfg.bud;
 
-    // lookup_rip(x0 = guest rip): continue there, or exit with EXIT_RIP.
+    // lookup_rip(x0 = guest rip) / lookup_rip_ic(x0 = guest rip, x4 = &ic_table[slot]):
+    // continue there (populating `[x4]` on static hit), or exit with EXIT_RIP.
     let lookup_rip = a.pos;
+    a.movz(true, T4, 0, 0);
+    let lookup_rip_ic = a.pos;
     let miss = probe(a);
     let m_plain_rip = a.tbnz(1, 0);
     let hit = a.pos;
+    emit_ic_populate(a);
     if bud_light {
         a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
     }
@@ -343,13 +371,16 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     let e = a.addr_of(exit);
     a.b_to(e);
 
-    // lookup_jmp(x0 = target)
+    // lookup_jmp(x0 = target) / lookup_jmp_ic(x0 = target, x4 = &ic_table[slot])
     // Entries in `table` with bit 0 of `fast` set are cached `DF_PLAIN` / pure-float-math /
     // inline-QPC host functions dispatched directly in `is_plain_jmp` / `is_qpc_jmp`.
     let lookup_jmp = a.pos;
+    a.movz(true, T4, 0, 0);
+    let lookup_jmp_ic = a.pos;
     let miss = probe(a);
     let is_plain_jmp = a.tbnz(1, 0);
     let hit = a.pos;
+    emit_ic_populate(a);
     if bud {
         if bud_light {
             a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
@@ -378,14 +409,19 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.b_to(e);
     }
 
-    // lookup_call(x0 = target, x3 = return address): push + continue, or EXIT_CALL.
-    // With the RAS, call sites enter with `bl lookup_call` (x30 = their landing pad).
+    // lookup_call(x0 = target, x3 = return address) /
+    // lookup_call_ic(x0 = target, x3 = return address, x4 = &ic_table[slot]):
+    // push + continue (populating `[x4]` on static hit), or EXIT_CALL.
+    // With the RAS, call sites enter with `bl lookup_call[_ic]` (x30 = their landing pad).
     // Entries in `table` with bit 0 of `fast` set are cached `DF_PLAIN` / pure-float-math /
     // inline-QPC host functions dispatched directly here.
     let lookup_call = a.pos;
+    a.movz(true, T4, 0, 0);
+    let lookup_call_ic = a.pos;
     let miss = probe(a);
     let is_plain = a.tbnz(1, 0);
     let hit = a.pos;
+    emit_ic_populate(a);
     let unal = if cfg.pushpop {
         // Plain pre-indexed push (see `pushpop_enabled`): no alignment check.
         a.str_pre(T3, HG[4], -8);
@@ -762,7 +798,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     // stack as is (the return has no entry, e.g. its call was interpreted) and probe.
     // Any entry whose guest address equals the target is a correct continuation: its
     // landing pad transfers to exactly that guest IP.
-    let ras_miss = if ras {
+    let (ras_miss, ras_miss_ic) = if ras {
         if let Some(want) = cfg.target_ras_miss {
             while a.pos < want && !a.overflow {
                 a.emit(0xD503_201F); // nop padding to match .aot stub table offset exactly
@@ -772,6 +808,8 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         for f in to_ras_miss {
             a.patch(f, p);
         }
+        a.movz(true, T4, 0, 0);
+        let p_ic = a.pos;
         let mut found = Vec::new();
         for i in 1..=3u32 {
             a.addsub_ri(true, true, false, XA, XRAS, 16 * i, false);
@@ -781,8 +819,31 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
             a.logic_rr(true, 2, 2, 2, 0, 0, 0); // eor x2, x2, x0
             found.push(a.cbz(true, 2));
         }
-        let lr = a.addr_of(lookup_rip);
-        a.b_to(lr);
+        // Depth 1..3 missed: probe the per-site 2-way IC at `[T4]` before `lookup_rip_ic`.
+        let no_ic = a.cbz(true, T4);
+        a.ldp_x(1, 2, T4, 0);
+        a.addsub_rr(true, true, true, ZR, 1, 0, 0);
+        let try_w1 = a.bcond(NE);
+        let ic_hit0 = a.cbnz(true, 2);
+        a.bind(try_w1);
+        a.ldp_x(1, 2, T4, 16);
+        a.addsub_rr(true, true, true, ZR, 1, 0, 0);
+        let miss_w1 = a.bcond(NE);
+        let ic_hit1 = a.cbnz(true, 2);
+        a.bind(no_ic);
+        a.bind(miss_w1);
+        let lr_ic = a.addr_of(lookup_rip_ic);
+        a.b_to(lr_ic);
+        a.bind(ic_hit0);
+        a.bind(ic_hit1);
+        if bud_light {
+            a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
+        }
+        if bud {
+            let f = a.tbnz(XBUD, 63);
+            a.patch(f, rip_out);
+        }
+        a.br(2);
         for f in found {
             a.bind(f);
         }
@@ -792,13 +853,30 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.mov_rr(true, XRAS, 1);
         a.bfxil0(XRAS, XA, 16);
         a.br(2);
-        Some(p)
+        (Some(p), Some(p_ic))
     } else {
-        None
+        (None, None)
     };
 
     (
-        Stubs { enter, exit, lookup_rip, lookup_jmp, lookup_call, host_xfer, ras_miss, spill_xmm, reload_xmm, clear_ymm_hi, rdtsc_slow, rdtscp_slow },
+        Stubs {
+            enter,
+            exit,
+            lookup_rip,
+            lookup_jmp,
+            lookup_call,
+            host_xfer,
+            ras_miss,
+            spill_xmm,
+            reload_xmm,
+            clear_ymm_hi,
+            rdtsc_slow,
+            rdtscp_slow,
+            lookup_rip_ic,
+            lookup_jmp_ic,
+            lookup_call_ic,
+            ras_miss_ic,
+        },
         host_xfer_bl,
     )
 }
@@ -825,17 +903,32 @@ pub(super) struct Stubs {
     pub(super) clear_ymm_hi: usize,
     pub(super) rdtsc_slow: usize,
     pub(super) rdtscp_slow: usize,
+    pub(super) lookup_rip_ic: usize,
+    pub(super) lookup_jmp_ic: usize,
+    pub(super) lookup_call_ic: usize,
+    pub(super) ras_miss_ic: Option<usize>,
 }
 
 impl Stubs {
     pub(super) fn offsets(&self) -> AotStubOffs {
         let word = |p: usize| p as u32;
         [
-            word(self.enter), word(self.exit), word(self.lookup_rip), word(self.lookup_jmp),
-            word(self.lookup_call), self.host_xfer.map_or(u32::MAX, word),
-            self.ras_miss.map_or(u32::MAX, word), self.spill_xmm.map_or(u32::MAX, word),
-            self.reload_xmm.map_or(u32::MAX, word), word(self.clear_ymm_hi),
-            word(self.rdtsc_slow), word(self.rdtscp_slow),
+            word(self.enter),
+            word(self.exit),
+            word(self.lookup_rip),
+            word(self.lookup_jmp),
+            word(self.lookup_call),
+            self.host_xfer.map_or(u32::MAX, word),
+            self.ras_miss.map_or(u32::MAX, word),
+            self.spill_xmm.map_or(u32::MAX, word),
+            self.reload_xmm.map_or(u32::MAX, word),
+            word(self.clear_ymm_hi),
+            word(self.rdtsc_slow),
+            word(self.rdtscp_slow),
+            word(self.lookup_rip_ic),
+            word(self.lookup_jmp_ic),
+            word(self.lookup_call_ic),
+            self.ras_miss_ic.map_or(u32::MAX, word),
         ]
     }
 }

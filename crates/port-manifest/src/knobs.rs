@@ -2662,6 +2662,15 @@ pub const KNOBS: &[KnobSpec] = &[
         crates: &["x86-runtime"],
     },
     KnobSpec {
+        name: "PORT_JIT_IC",
+        aliases: &[],
+        kind: KnobType::Bool,
+        default: "1",
+        description: "Enable per-site 2-way polymorphic inline caches for indirect call/jmp/ret.",
+        affects_aot_key: true,
+        crates: &["x86-runtime"],
+    },
+    KnobSpec {
         name: "PORT_JIT_LAST_BITS",
         aliases: &[],
         kind: KnobType::Bool,
