@@ -86,6 +86,7 @@ mod icu {
     pub const UCOL_ON: i32 = 17;
     pub const UCOL_SHIFTED: i32 = 20;
     pub const UCOL_LOWER_FIRST: i32 = 24;
+    pub const UCOL_REORDER_CODE_CURRENCY: i32 = 0x1003;
 
     pub const ULOC_LAYOUT_RTL: i32 = 1;
     pub const UMS_US: i32 = 1;
@@ -146,6 +147,7 @@ mod icu {
         pub ucurr_get_name: unsafe extern "C" fn(*const u16, *const c_char, i32, *mut i8, *mut i32, *mut i32) -> *const u16,
         pub ucol_open: unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void,
         pub ucol_set_attribute: unsafe extern "C" fn(*mut c_void, i32, i32, *mut i32),
+        pub ucol_set_max_variable: unsafe extern "C" fn(*mut c_void, i32, *mut i32),
         pub ucol_strcoll: unsafe extern "C" fn(*const c_void, *const u16, i32, *const u16, i32) -> i32,
         pub ucol_get_sort_key: unsafe extern "C" fn(*const c_void, *const u16, i32, *mut u8, i32) -> i32,
         pub ucol_close: unsafe extern "C" fn(*mut c_void),
@@ -245,6 +247,7 @@ mod icu {
                 ucurr_get_name: sym!(c"ucurr_getName", unsafe extern "C" fn(*const u16, *const c_char, i32, *mut i8, *mut i32, *mut i32) -> *const u16),
                 ucol_open: sym!(c"ucol_open", unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void),
                 ucol_set_attribute: sym!(c"ucol_setAttribute", unsafe extern "C" fn(*mut c_void, i32, i32, *mut i32)),
+                ucol_set_max_variable: sym!(c"ucol_setMaxVariable", unsafe extern "C" fn(*mut c_void, i32, *mut i32)),
                 ucol_strcoll: sym!(c"ucol_strcoll", unsafe extern "C" fn(*const c_void, *const u16, i32, *const u16, i32) -> i32),
                 ucol_get_sort_key: sym!(c"ucol_getSortKey", unsafe extern "C" fn(*const c_void, *const u16, i32, *mut u8, i32) -> i32),
                 ucol_close: sym!(c"ucol_close", unsafe extern "C" fn(*mut c_void)),
@@ -1136,6 +1139,10 @@ unsafe fn configure_ucollator(a: &icu::IcuNls, col: *mut c_void, flags: u32) {
     if (flags & NORM_IGNORESYMBOLS) != 0 {
         ast = 0;
         (a.ucol_set_attribute)(col, icu::UCOL_ALTERNATE_HANDLING, icu::UCOL_SHIFTED, &mut ast);
+        // Extend variable elements through currency so whitespace, punctuation, math symbols,
+        // and currency symbols (`-`, `+`, `$`, `€`, etc.) are all shifted/ignored consistently.
+        ast = 0;
+        (a.ucol_set_max_variable)(col, icu::UCOL_REORDER_CODE_CURRENCY, &mut ast);
     }
     if (flags & SORT_DIGITSASNUMBERS) != 0 {
         ast = 0;
@@ -4754,6 +4761,26 @@ mod tests {
             assert!(get_sort_key(&sv, &ae, LINGUISTIC_IGNOREDIACRITIC) > get_sort_key(&sv, &zz, LINGUISTIC_IGNOREDIACRITIC));
             assert_eq!(CompareStringEx(sv.as_ptr(), LINGUISTIC_IGNOREDIACRITIC, e_acc.as_ptr(), -1, e_plain.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
             assert_eq!(get_sort_key(&sv, &e_acc, LINGUISTIC_IGNOREDIACRITIC), get_sort_key(&sv, &e_plain, LINGUISTIC_IGNOREDIACRITIC));
+
+            // NORM_IGNORESYMBOLS suppresses punctuation, whitespace, math, and currency symbols
+            // consistently across CompareStringEx and LCMAP_SORTKEY, while preserving digits.
+            let ab = to_wide_z("ab");
+            for sym_str in ["a-b", "a+b", "a$b", "a€b", "a b"] {
+                let s_w = to_wide_z(sym_str);
+                assert_eq!(
+                    CompareStringEx(en.as_ptr(), NORM_IGNORESYMBOLS, s_w.as_ptr(), -1, ab.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0),
+                    CSTR_EQUAL,
+                    "NORM_IGNORESYMBOLS should equate {sym_str:?} and \"ab\""
+                );
+                assert_eq!(
+                    get_sort_key(&en, &s_w, NORM_IGNORESYMBOLS),
+                    get_sort_key(&en, &ab, NORM_IGNORESYMBOLS),
+                    "LCMAP_SORTKEY with NORM_IGNORESYMBOLS should match for {sym_str:?}"
+                );
+            }
+            let a1b = to_wide_z("a1b");
+            assert_ne!(CompareStringEx(en.as_ptr(), NORM_IGNORESYMBOLS, a1b.as_ptr(), -1, ab.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_ne!(get_sort_key(&en, &a1b, NORM_IGNORESYMBOLS), get_sort_key(&en, &ab, NORM_IGNORESYMBOLS));
         }
     }
 
