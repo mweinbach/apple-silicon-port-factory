@@ -4032,4 +4032,53 @@ fn occlusion_query_same_pass_reset_coalescing_and_resolve_on_gpu() {
         [16, 0],
         "first resolve must observe 16 before 0-draw fill and second resolve must observe 0, got {got2:?}"
     );
+
+    // Case 3 (cross-list list-start ResolveQueryData into a READBACK buffer):
+    // List A writes slot 6 via Fragment; List B begins with `resolve_occlusion` directly into a
+    // READBACK destination. Must NOT narrow List B's opening barrier to `Blit`-only and drop
+    // cross-list `Fragment -> Blit` sync for the visibility source buffer.
+    let alloc_b = CommandAllocator::new(ListType::Direct).unwrap();
+    let dst_rb3 = test_buffer(8, heap_type::READBACK, 0);
+    dst_rb3.register_ptr();
+    unsafe {
+        *(dst_rb3.buffer().unwrap().contents().as_ptr() as *mut u64) = 0xdead_beef;
+    }
+    let mut l_a = CommandList::new(ListType::Direct).unwrap();
+    l_a.begin(&alloc).unwrap();
+    l_a.gfx_root.set_root_signature(rs).unwrap();
+    l_a.gfx_root.set_descriptor(0, cb_up.gpu_va).unwrap();
+    l_a.gfx_root.set_descriptor(1, buf_srv.gpu_va).unwrap();
+    l_a.gfx.topology = 4;
+    l_a.set_graphics_pipeline(pso);
+    l_a.set_viewports(vec![MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: 4.0,
+        height: 4.0,
+        znear: 0.0,
+        zfar: 1.0,
+    }]);
+    l_a.set_render_targets(vec![TargetView::rtv(&rt, None).unwrap()], None);
+    l_a.begin_occlusion(&qh, 6, false).unwrap();
+    l_a.draw(3, 1, 0, 0).unwrap();
+    l_a.end_occlusion(&qh, 6).unwrap();
+    l_a.close().unwrap();
+
+    let mut l_b = CommandList::new(ListType::Direct).unwrap();
+    l_b.begin(&alloc_b).unwrap();
+    l_b.resolve_occlusion(&qh, 6, 1, &dst_rb3, 0).unwrap();
+    assert!(
+        l_b.bar.enc_sync_after.contains(MTLStages::Fragment),
+        "list-start ResolveQueryData into READBACK buffer must wait on prior lists' Fragment stage, got {:?}",
+        l_b.bar.enc_sync_after
+    );
+    l_b.close().unwrap();
+
+    q.submit(&[&l_a.cb, &l_b.cb]);
+    q.wait_idle();
+    alloc.reset();
+    alloc_b.reset();
+
+    let got3 = unsafe { *(dst_rb3.buffer().unwrap().contents().as_ptr() as *const u64) };
+    assert_eq!(got3, 16, "cross-list list-start ResolveQueryData must read 16 samples, got {got3}");
 }

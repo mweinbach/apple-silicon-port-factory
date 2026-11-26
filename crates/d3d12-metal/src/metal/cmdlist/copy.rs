@@ -861,7 +861,11 @@ impl CommandList {
                 self.end_encoder();
             }
             self.add_pend(MTLStages::Fragment | MTLStages::Blit, MTLStages::Blit);
-            let e = self.compute_blit_touch(&[dst_id]).ok_or("compute encoder")?;
+            // Include `0` alongside `dst_id` because `src` is a visibility-result `MtlBuffer`
+            // (not a tracked `Resource`) written by `Fragment`, potentially in an earlier list;
+            // this prevents destination-only list-start `READBACK` narrowing from dropping
+            // cross-list `Fragment -> Blit` synchronization.
+            let e = self.compute_blit_touch(&[dst_id, 0]).ok_or("compute encoder")?;
             self.pt_note_util(pt::synth::COPY_BLIT, 0);
             unsafe {
                 e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
