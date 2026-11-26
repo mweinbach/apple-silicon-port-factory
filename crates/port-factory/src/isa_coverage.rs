@@ -1351,38 +1351,6 @@ pub const ADVERTISED_NON_ARM64_ALLOWLIST: &[(CpuidFeature, &str)] = &[
         CpuidFeature::X64,
         "far call/jmp/retf/iretq, segment-reg moves, descriptor/system misc (sldt/str/lar/lsl/verr/verw)",
     ),
-    (
-        CpuidFeature::AVX,
-        "vdppd, vmaskmovdqu, vmpsadbw, vphaddsw/vphsubsw, vphminposuw, vmovntdqa, vzeroall/vzeroupper",
-    ),
-    (
-        CpuidFeature::AVX2,
-        "vpgather*/vgather* (16 gather forms) and 256-bit vphaddsw/vphsubsw/vmpsadbw/vmovntdqa",
-    ),
-    (
-        CpuidFeature::MMX,
-        "legacy MMX packed-integer ops routed through emu/mmx.rs (MmxDispatch) plus emms",
-    ),
-    (
-        CpuidFeature::SSE,
-        "MMX-aliased SSE ops (cvtpi2ps/cvtps2pi/pshufw/pinsrw/pextrw/etc., MmxDispatch)",
-    ),
-    (
-        CpuidFeature::SSE2,
-        "MMX-aliased SSE2 ops (cvtpd2pi/movdq2q/pmuludq/psubq/etc., MmxDispatch) plus maskmovdqu",
-    ),
-    (
-        CpuidFeature::SSE4_1,
-        "dppd, mpsadbw, phminposuw (generic interpreter forms pending ARM64 promotion)",
-    ),
-    (
-        CpuidFeature::SSE4_2,
-        "pcmpestri64/pcmpestrm64 64-bit REX.W string-compare variants (generic interpreter)",
-    ),
-    (
-        CpuidFeature::SSSE3,
-        "MMX-aliased SSSE3 ops (MmxDispatch) plus phaddsw/phsubsw xmm",
-    ),
 ];
 
 #[cfg(test)]

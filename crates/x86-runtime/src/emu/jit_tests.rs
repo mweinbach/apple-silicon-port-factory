@@ -7273,3 +7273,170 @@ fn sys_state_ops_aot_image_and_shifted_base_reload() {
         assert_eq!(&aot_out[2432..2496], &init[64..128], "YMM0/YMM15 round-trip in AOT");
     }
 }
+
+/// AOT inclusion, shifted-base reload, and zero-relocation static Mach-O (macOS & iOS) test
+/// covering all 3 Slice 4 families: `MMX_ALIASED`, `SIMD_LEGACY_FALLBACK`, and `AVX2_GATHER`.
+#[test]
+fn aot_mmx_legacy_simd_gather_inclusion_shifted_reload_and_static_macho() {
+    use crate::emu::static_macho::{emit_macho_object_from_aot_bytes, MachoPlatform};
+    use iced_x86::code_asm::*;
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(r11, rcx).unwrap();
+    // 1. MMX_ALIASED: movq, pshufw, phaddsw, pshufb, palignr, psllw, cvtpi2ps, cvtps2pi, maskmovq, emms
+    a.movq(mm0, qword_ptr(r11)).unwrap();
+    a.movq(mm1, qword_ptr(r11 + 8)).unwrap();
+    a.pshufw(mm2, mm0, 0x1B).unwrap();
+    a.phaddsw(mm2, mm1).unwrap();
+    a.pshufb(mm2, qword_ptr(r11 + 16)).unwrap();
+    a.palignr(mm2, mm1, 3).unwrap();
+    a.psllw(mm2, 2).unwrap();
+    a.movq(qword_ptr(r11 + 128), mm2).unwrap();
+    a.movups(xmm0, xmmword_ptr(r11 + 32)).unwrap();
+    a.cvtpi2ps(xmm0, mm2).unwrap();
+    a.movups(xmmword_ptr(r11 + 136), xmm0).unwrap();
+    a.cvtps2pi(mm3, xmm0).unwrap();
+    a.movq(qword_ptr(r11 + 152), mm3).unwrap();
+    a.lea(rdi, ptr(r11 + 160)).unwrap();
+    a.movq(mm4, qword_ptr(r11 + 24)).unwrap();
+    a.db(&[0x0f, 0xf7, 0xd4]).unwrap(); // maskmovq mm2, mm4
+    a.emms().unwrap();
+
+    // 2. SIMD_LEGACY_FALLBACK: vphaddsw (256), vphsubsw (128), vphminposuw, vmpsadbw (256), vdppd, vpcmpestri64, vmaskmovdqu
+    a.vmovdqu(ymm4, ymmword_ptr(r11)).unwrap();
+    a.vmovdqu(ymm5, ymmword_ptr(r11 + 32)).unwrap();
+    a.vphaddsw(ymm6, ymm4, ymm5).unwrap();
+    a.vmovdqu(ymmword_ptr(r11 + 176), ymm6).unwrap();
+    a.vphsubsw(xmm6, xmm4, xmm5).unwrap();
+    a.vmovdqu(ymmword_ptr(r11 + 208), ymm6).unwrap();
+    a.vphminposuw(xmm6, xmm4).unwrap();
+    a.vmovdqu(ymmword_ptr(r11 + 240), ymm6).unwrap();
+    a.vmpsadbw(ymm6, ymm4, ymm5, 0x2D).unwrap();
+    a.vmovdqu(ymmword_ptr(r11 + 272), ymm6).unwrap();
+    a.vdppd(xmm6, xmm4, xmm5, 0x33).unwrap();
+    a.movupd(xmmword_ptr(r11 + 304), xmm6).unwrap();
+    a.mov(rax, 0x0000_0001_0000_0004u64 as i64).unwrap();
+    a.mov(rdx, 8u64 as i64).unwrap();
+    a.movdqu(xmm0, xmm4).unwrap();
+    a.movdqu(xmm1, xmm5).unwrap();
+    a.db(&[0xc4, 0xe3, 0xf9, 0x61, 0xc1, 0x08]).unwrap(); // vpcmpestri64 xmm0, xmm1, 8
+    a.mov(qword_ptr(r11 + 320), rcx).unwrap();
+    a.lea(rdi, ptr(r11 + 336)).unwrap();
+    a.db(&[0xc5, 0xf9, 0xf7, 0xc1]).unwrap(); // vmaskmovdqu xmm0, xmm1
+
+    // 3. AVX2_GATHER: vpgatherdd (256) & vgatherqpd (256)
+    a.lea(rdx, ptr(r11 + 64)).unwrap();
+    a.vmovdqu(ymm1, ymmword_ptr(r11 + 96)).unwrap();
+    a.vmovdqu(ymm2, ymmword_ptr(r11 + 32)).unwrap(); // mask (mixed MSBs)
+    a.vmovdqu(ymm0, ymmword_ptr(r11)).unwrap();
+    a.vpgatherdd_3(ymm0, dword_ptr(rdx + ymm1 * 4), ymm2).unwrap();
+    a.vmovdqu(ymmword_ptr(r11 + 352), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(r11 + 384), ymm2).unwrap();
+
+    a.vzeroupper().unwrap();
+    a.mov(rax, qword_ptr(r11 + 128)).unwrap();
+    a.ret().unwrap();
+
+    let data_len = 512usize;
+    let code_cap = 0x2000usize;
+    let code_a = arena_alloc(code_cap, 16);
+    let code_b = arena_alloc(code_cap, 16); // shifted guest base!
+    assert_ne!(code_a, code_b);
+    let bytes = a.assemble(code_a as u64).unwrap();
+    assert!(bytes.len() + 16 <= code_cap);
+    for c in [code_a, code_b] {
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), c, bytes.len());
+            core::ptr::write_bytes(c.add(bytes.len()), 0xCC, 16);
+        }
+    }
+
+    let mut init = vec![0u8; data_len];
+    for (i, b) in init.iter_mut().take(96).enumerate() {
+        *b = ((i as u8).wrapping_mul(53)).wrapping_add(17);
+    }
+    // Safe small indices [0, 1, 2, 3, 4, 5, 6, 7] at +96..128 for vpgatherdd into [r11 + 64..96]
+    for i in 0..8i32 {
+        init[96 + (i as usize) * 4..100 + (i as usize) * 4].copy_from_slice(&i.to_le_bytes());
+    }
+
+    let d_interp = arena_alloc(data_len, 64);
+    let d_jit = arena_alloc(data_len, 64);
+    let d_aot_a = arena_alloc(data_len, 64);
+    let d_aot_b = arena_alloc(data_len, 64);
+
+    let interp = unsafe { run_mode(code_a, d_interp, &init, 2) };
+
+    // Collect block entry IPs for code_a and code_b
+    let collect_ips = |base: u64| {
+        let mut ips = vec![base];
+        let mut dec = iced_x86::Decoder::with_ip(64, &bytes, base, iced_x86::DecoderOptions::NONE);
+        let mut ins_cnt = 0usize;
+        while dec.can_decode() {
+            let ins = dec.decode();
+            ins_cnt += 1;
+            if ins_cnt >= BLK_MAX_INSNS {
+                ips.push(ins.next_ip());
+                ins_cnt = 0;
+            }
+        }
+        ips.retain(|&ip| ip >= base && ip < base + bytes.len() as u64);
+        ips.sort_unstable();
+        ips.dedup();
+        ips
+    };
+    let ips_a = collect_ips(code_a as u64);
+    let ips_b = collect_ips(code_b as u64);
+
+    // 1. Build AOT image, assert zero relocations, encode/decode round-trip, emit static Mach-O (macOS & iOS).
+    let mut bc = Box::new(BlockCache::new());
+    let img = unsafe { aot::build_image_for_test(&mut *bc, &ips_a) }.expect("build AOT image for Slice 4");
+    assert!(!img.blocks.is_empty());
+    assert!(img.relocs.is_empty(), "Slice 4 AOT blocks must have zero runtime relocations");
+    let key = aot::AotKey {
+        image_hash: [0x4433_2211_8877_6655, 0xCCBB_AA99_00FF_EEDD],
+        image_base: code_a as u64,
+        image_size: code_cap as u64,
+        codegen_hash: aot::codegen_hash(),
+        knobs: jit::aot_knob_bits(),
+    };
+    let aot_bytes = aot::encode_for_test("slice4_mmx_simd_gather.dll", &key, &img);
+    let (dec_name, dec_key, dec_img, dec_flags) = aot::decode(&aot_bytes).expect("decode Slice 4 AOT bytes");
+    assert_eq!(dec_name, "slice4_mmx_simd_gather.dll");
+    assert_eq!(dec_key, key);
+    assert_eq!(dec_flags, 0);
+    assert_eq!(dec_img.blocks.len(), img.blocks.len());
+    for plat in [MachoPlatform::MacOs, MachoPlatform::Ios] {
+        let (_obj, rep) = emit_macho_object_from_aot_bytes(&aot_bytes, plat)
+            .unwrap_or_else(|e| panic!("static Mach-O emit ({plat}) failed: {e}"));
+        assert_eq!(rep.skipped_reloc_blocks, 0, "Slice 4 blocks must have zero relocs for static Mach-O ({plat})");
+        assert_eq!(rep.emitted_blocks, img.blocks.len());
+    }
+
+    // 2. Execute Disk AOT at base A and shifted base B (before live-JIT populates those IPs),
+    // verifying AOT install hits and exact parity with the interpreter.
+    for (c_ptr, d_ptr, ips, label) in [
+        (code_a, d_aot_a, &ips_a, "base A"),
+        (code_b, d_aot_b, &ips_b, "shifted base B"),
+    ] {
+        let before = jit::test_aot_installs();
+        let (live, relocs, _links) = unsafe { aot::test_install(ips, || {}) };
+        assert!(live > 0, "AOT must install live blocks at {label}");
+        assert_eq!(relocs, 0, "AOT must have zero relocations at {label}");
+        let aot_out = unsafe { run_mode(c_ptr, d_ptr, &init, 1) };
+        aot::test_uninstall();
+        assert!(jit::test_aot_installs() > before, "AOT must execute installed blocks at {label}");
+        assert_eq!(aot_out, interp, "Disk AOT differs from interpreter at {label}");
+    }
+
+    // 3. Also run Live JIT on a fresh copy and verify parity.
+    let code_c = arena_alloc(code_cap, 16);
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), code_c, bytes.len());
+        core::ptr::write_bytes(code_c.add(bytes.len()), 0xCC, 16);
+    }
+    let jit_before = jit::test_executed();
+    let jit_out = unsafe { run_mode(code_c, d_jit, &init, 1) };
+    assert!(jit::test_executed() > jit_before, "Slice 4 test block must execute in Live JIT");
+    assert_eq!(jit_out, interp, "Live JIT differs from FastOp interpreter on Slice 4 ops");
+}

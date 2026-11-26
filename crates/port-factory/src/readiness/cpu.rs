@@ -207,9 +207,9 @@ mod tests {
         );
         assert_eq!(scan.decoded, 10);
         for (mnemonic, expected) in [
-            ("cvtpi2ps", Some(Finding::Interpreter)),
-            ("pshufw", Some(Finding::Interpreter)),
-            ("movntq", Some(Finding::Interpreter)),
+            ("cvtpi2ps", None),
+            ("pshufw", None),
+            ("movntq", None),
             ("pfadd", Some(Finding::Unimplemented)),
             ("xsaveopt", None),
             ("cpuid", None),
