@@ -450,8 +450,8 @@ pub(super) const NOJIT: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct JMeta {
-    hash: u64,
-    len: u32,
+    pub(super) hash: u64,
+    pub(super) len: u32,
 }
 
 /// Base index (even, `0..JLEN`) of the 2-way set for guest `ip`.
@@ -1200,7 +1200,21 @@ impl JitCache {
     #[inline(never)]
     unsafe fn revalidate(&mut self, s: usize, bc: *mut BlockCache) -> Option<usize> {
         let e = self.index[s];
-        let m = self.meta[s];
+        // Inline 2-way rotations (`aot_probe`, `cache_plain_host`, `cache_qpc_host`) move `JEnt`
+        // from way 0 to way 1 without moving `self.meta`; always recover authoritative SMC
+        // validation metadata from `self.compiled` rather than trusting `self.meta[s]`.
+        let m = match self.compiled.get(&e.ip) {
+            Some(&(comp_ent, m)) if comp_ent.code == e.code => {
+                self.meta[s] = m;
+                m
+            }
+            _ => {
+                self.unlink_target(e.ip);
+                self.index[s] = JEnt { ip: e.ip, ..JEnt::default() };
+                jset_clear_ip(&mut self.jit_table, e.ip);
+                return self.translate(e.ip, bc);
+            }
+        };
         let gen = mem::code_gen();
         if mem::code_hash(to_mapped_addr(e.ip), m.len as usize) == m.hash {
             self.index[s].gen = gen;

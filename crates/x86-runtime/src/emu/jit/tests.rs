@@ -531,3 +531,68 @@ fn indirect_branch_ic_emitter_encodes_zero_relocs_and_uses_ic_table() {
     }
     test_set_knobs(TestKnobs::NONE);
 }
+
+#[test]
+fn rotated_smc_entry_revalidates_with_authoritative_meta() {
+    use crate::emu::jit::cache::JMeta;
+    use crate::emu::jit_tests::arena_alloc;
+    use crate::emu::mem;
+
+    let mut jc = JitCache::new();
+    let mut bc = Box::new(BlockCache::new());
+    let ip_ptr = arena_alloc(64, 16);
+    let ip_smc = ip_ptr as u64;
+    // `mov eax, 0x11223344; ret`
+    let body_v1: [u8; 6] = [0xb8, 0x44, 0x33, 0x22, 0x11, 0xc3];
+    let body_v2: [u8; 6] = [0xb8, 0x88, 0x77, 0x66, 0x55, 0xc3];
+    unsafe {
+        core::ptr::copy_nonoverlapping(body_v1.as_ptr(), ip_ptr, body_v1.len());
+    }
+    let lo = ip_ptr as usize;
+    let hi = lo + 64;
+    mem::note_code_region(lo, hi);
+
+    unsafe {
+        // Trigger translation into way 0 with `gen != 0`.
+        let mut code1 = None;
+        for _ in 0..8 {
+            if let Some(c) = jc.lookup(ip_smc, &mut *bc) {
+                code1 = Some(c);
+                break;
+            }
+        }
+        let code1 = code1.expect("SMC block must compile");
+        let b = jset_base(ip_smc);
+        assert_eq!(jc.index[b].ip, ip_smc);
+        assert_ne!(jc.index[b].gen, 0, "dynamic region block must carry non-zero gen");
+
+        // Poison way 1's `meta` with an unrelated oversized length/hash (simulating another block
+        // previously occupying way 1) and rotate `ip_smc` from way 0 -> way 1 via `cache_plain_host`
+        // (same meta-untouched rotation performed by `aot_probe` and `cache_qpc_host`).
+        jc.meta[b | 1] = JMeta { hash: 0xDEAD_BEEF_CAFE_BABE, len: 0x7FFF_FFFF };
+        let mut peer = ip_smc + 0x1000;
+        while jset_base(peer) != b {
+            peer += 16;
+        }
+        let tbl = jc.test_table_ptr();
+        JitCache::cache_plain_host(tbl, peer, 0x1000_0000, false);
+        assert_eq!(jc.index[b].ip, peer);
+        assert_eq!(jc.index[b | 1].ip, ip_smc);
+
+        // Bump CODE_GEN without growing JIT_REGIONS_GEN and without modifying `ip_smc`'s bytes:
+        // `revalidate()` must recover the authoritative `JMeta` from `compiled`, keep `code1`
+        // (no spurious retranslation), and avoid reading the poisoned 2 GiB length.
+        mem::note_code_region(lo, hi);
+        let code2 = jc.lookup(ip_smc, &mut *bc).expect("unchanged rotated SMC block must revalidate");
+        assert_eq!(code2, code1, "unchanged rotated SMC block must not spuriously retranslate");
+        assert_eq!(jc.index[b | 1].gen, mem::code_gen());
+        assert_eq!(jc.meta[b | 1].len, body_v1.len() as u32);
+
+        // Now actually overwrite `ip_smc`'s bytes and bump CODE_GEN: `revalidate()` must detect
+        // the real code change and produce a fresh translation.
+        core::ptr::copy_nonoverlapping(body_v2.as_ptr(), ip_ptr, body_v2.len());
+        mem::note_code_region(lo, hi);
+        let code3 = jc.lookup(ip_smc, &mut *bc).expect("modified rotated SMC block must retranslate");
+        assert_ne!(code3, code1, "modified SMC block must retranslate to new code");
+    }
+}
