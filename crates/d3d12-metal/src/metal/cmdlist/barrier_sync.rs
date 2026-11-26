@@ -6,9 +6,17 @@ use super::state::*;
 use super::CommandList;
 use crate::metal::encstats as stats;
 use crate::metal::pipeline::{GraphicsPipeline, READS_BUF, READS_TEX};
-use crate::metal::resource::{push_subrange, Resource, SubRange, HK_ALL, HK_CBV_BUF};
+use crate::metal::resource::{Resource, SubRange, HK_ALL, HK_CBV_BUF};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
+
+const KNOWN_ALL_STAGES: MTLStages = MTLStages::Vertex
+    .union(MTLStages::Object)
+    .union(MTLStages::Mesh)
+    .union(MTLStages::Fragment)
+    .union(MTLStages::Dispatch)
+    .union(MTLStages::Blit)
+    .union(MTLStages::AccelerationStructure);
 
 impl CommandList {
     #[inline]
@@ -28,10 +36,7 @@ impl CommandList {
         if qa.is_empty() || !sync.pre_list_all {
             return qa;
         }
-        let mut known_all = MTLStages::empty();
-        for &bit in &STAGE_BITS {
-            known_all |= bit;
-        }
+        let known_all = KNOWN_ALL_STAGES;
         let check_all = qa == MTLStages::All;
         let mut out = if check_all {
             MTLStages::empty()
@@ -511,12 +516,12 @@ impl CommandList {
         if r == 0 || ia.is_empty() {
             return;
         }
-        let mut r_req = [0u32; 7];
-        merge_req_for_after(&mut r_req, ia, req);
         if let Some(ex) = self.bar.frag_rt_pend.iter_mut().find(|e| e.0 == r) {
             ex.1 |= ia;
-            merge_req_for_after(&mut ex.2, ia, &r_req);
+            merge_req_for_after(&mut ex.2, ia, req);
         } else {
+            let mut r_req = [0u32; 7];
+            merge_req_for_after(&mut r_req, ia, req);
             self.bar.frag_rt_pend.push((r, ia, r_req));
         }
     }
@@ -1882,65 +1887,90 @@ impl CommandList {
         if !enabled || qa.is_empty() || qb.is_empty() {
             return qa;
         }
-        let mut any_consumer = false;
+        let mut cons = [0usize; 7];
+        let mut n_cons = 0usize;
         let mut all_pre_list = true;
         for (ci, &cbit) in STAGE_BITS.iter().enumerate() {
             if qb.contains(cbit) {
-                any_consumer = true;
+                cons[n_cons] = ci;
+                n_cons += 1;
                 if !self.bar.enc_cur_sync[ci].pre_list_all {
                     all_pre_list = false;
-                    break;
                 }
             }
         }
-        if !any_consumer {
+        if n_cons == 0 {
             return qa;
         }
         if !all_pre_list && (!self.opts.opt_list_boundary_overlap || qa == MTLStages::All) {
             return qa;
         }
-        let mut known_all = MTLStages::empty();
-        for &bit in &STAGE_BITS {
-            known_all |= bit;
-        }
         let check_all = qa == MTLStages::All;
         let mut out = if check_all {
             MTLStages::empty()
         } else {
-            qa - known_all
+            qa - KNOWN_ALL_STAGES
         };
-        for (pi, &pbit) in STAGE_BITS.iter().enumerate() {
-            if !check_all && !qa.contains(pbit) {
-                continue;
+        if n_cons == 1 {
+            let sync = &self.bar.enc_cur_sync[cons[0]];
+            let check_pre = !all_pre_list && !sync.pre_list_all;
+            for (pi, &pbit) in STAGE_BITS.iter().enumerate() {
+                if !check_all && !qa.contains(pbit) {
+                    continue;
+                }
+                if !all_pre_list && pbit == MTLStages::Fragment {
+                    out |= pbit;
+                    continue;
+                }
+                let gen_unsat = match req {
+                    Some(r) => {
+                        let target_gen = if check_all {
+                            self.bar.stage_gen[pi]
+                        } else {
+                            r[pi].min(self.bar.stage_gen[pi])
+                        };
+                        sync.gen[pi] < target_gen
+                    }
+                    None => sync.gen[pi] != self.bar.stage_gen[pi],
+                };
+                if gen_unsat || (check_pre && !sync.pre_list_stages.contains(pbit)) {
+                    out |= pbit;
+                }
             }
-            if !all_pre_list && pbit == MTLStages::Fragment {
-                out |= pbit;
-                continue;
-            }
-            let target_gen = match req {
-                Some(r) if !check_all => r[pi].min(self.bar.stage_gen[pi]),
-                _ => self.bar.stage_gen[pi],
-            };
-            let mut synced = true;
-            for (ci, &cbit) in STAGE_BITS.iter().enumerate() {
-                if qb.contains(cbit) {
+        } else {
+            let active_cons = &cons[..n_cons];
+            for (pi, &pbit) in STAGE_BITS.iter().enumerate() {
+                if !check_all && !qa.contains(pbit) {
+                    continue;
+                }
+                if !all_pre_list && pbit == MTLStages::Fragment {
+                    out |= pbit;
+                    continue;
+                }
+                let target_gen = match req {
+                    Some(r) if !check_all => r[pi].min(self.bar.stage_gen[pi]),
+                    _ => self.bar.stage_gen[pi],
+                };
+                let mut synced = true;
+                for &ci in active_cons {
+                    let sync = &self.bar.enc_cur_sync[ci];
                     let gen_unsat = if req.is_some() {
-                        self.bar.enc_cur_sync[ci].gen[pi] < target_gen
+                        sync.gen[pi] < target_gen
                     } else {
-                        self.bar.enc_cur_sync[ci].gen[pi] != target_gen
+                        sync.gen[pi] != target_gen
                     };
                     if gen_unsat
                         || (!all_pre_list
-                            && !self.bar.enc_cur_sync[ci].pre_list_all
-                            && !self.bar.enc_cur_sync[ci].pre_list_stages.contains(pbit))
+                            && !sync.pre_list_all
+                            && !sync.pre_list_stages.contains(pbit))
                     {
                         synced = false;
                         break;
                     }
                 }
-            }
-            if !synced {
-                out |= pbit;
+                if !synced {
+                    out |= pbit;
+                }
             }
         }
         if !all_pre_list && out != qa {
@@ -2470,10 +2500,10 @@ impl CommandList {
     pub(super) fn ib_merge_set(dst: &mut TrackedSet<usize>, src: Option<&[usize]>) {
         match src {
             Some(s) => {
-                if let Some(v) = dst.as_mut_vec() {
+                if dst.is_exact() {
                     for &r in s {
-                        if r != 0 && !v.contains(&r) {
-                            v.push(r);
+                        if r != 0 {
+                            dst.insert_res(r);
                         }
                     }
                 }
@@ -2485,10 +2515,10 @@ impl CommandList {
     pub(super) fn ib_merge_spans_whole(dst: &mut TrackedSet<SubRange>, src: Option<&[usize]>) {
         match src {
             Some(s) => {
-                if let Some(v) = dst.as_mut_vec() {
+                if dst.is_exact() {
                     for &r in s {
                         if r != 0 {
-                            push_subrange(v, SubRange::whole(r));
+                            dst.insert_span(SubRange::whole(r));
                         }
                     }
                 }
@@ -2498,9 +2528,9 @@ impl CommandList {
     }
 
     pub(super) fn ib_merge_spans_exact(dst: &mut TrackedSet<SubRange>, src: &[SubRange]) {
-        if let Some(v) = dst.as_mut_vec() {
+        if dst.is_exact() {
             for &s in src {
-                push_subrange(v, s);
+                dst.insert_span(s);
             }
         }
     }
@@ -2525,7 +2555,7 @@ impl CommandList {
         after: MTLStages,
         before: MTLStages,
         kind: OblKind,
-        spans: Option<Vec<SubRange>>,
+        spans: Option<SmallSpans>,
     ) {
         let before = before & COMPUTE_STAGES;
         if before.is_empty() {
@@ -2557,11 +2587,7 @@ impl CommandList {
                         existing.spans = None;
                     } else {
                         match (&mut existing.spans, sub_spans) {
-                            (Some(dst), Some(src)) => {
-                                for s in src {
-                                    push_subrange(dst, s);
-                                }
-                            }
+                            (Some(dst), Some(src)) => dst.extend_coalesced(&src),
                             (dst, _) => *dst = None,
                         }
                     }
@@ -2594,11 +2620,7 @@ impl CommandList {
                 existing.spans = None;
             } else {
                 match (&mut existing.spans, spans) {
-                    (Some(dst), Some(src)) => {
-                        for s in src {
-                            push_subrange(dst, s);
-                        }
-                    }
+                    (Some(dst), Some(src)) => dst.extend_coalesced(&src),
                     (dst, _) => *dst = None,
                 }
             }
@@ -2626,49 +2648,23 @@ impl CommandList {
                 let mut sub_after = S::empty();
                 let sub = &self.ib.ib_sub[ci];
                 if sub.stages.contains(S::Dispatch) {
-                    let uav_hit = sub.disp_uav.as_slice().is_none_or(|v| {
-                        if r == 0 {
-                            !v.is_empty()
+                    let uav_hit = sub.disp_uav.hits_res(r);
+                    let read_hit = !uav_hit && sub.disp_read.hits_res(r);
+                    let cs_hit = !uav_hit
+                        && !read_hit
+                        && if r == 0 {
+                            !sub.cs_cleared.is_empty()
                         } else {
-                            v.contains(&r)
-                        }
-                    });
-                    let read_hit = sub.disp_read.as_slice().is_none_or(|v| {
-                        if r == 0 {
-                            !v.is_empty()
-                        } else {
-                            v.contains(&r)
-                        }
-                    });
-                    let cs_hit = if r == 0 {
-                        !sub.cs_cleared.is_empty()
-                    } else {
-                        sub.cs_cleared.contains(&r)
-                    };
+                            sub.cs_cleared.contains(&r)
+                        };
                     if uav_hit || read_hit || cs_hit {
                         sub_after |= S::Dispatch;
                     }
                 }
-                if sub.stages.contains(S::Blit)
-                    && sub.blit_touch.as_slice().is_none_or(|v| {
-                        if r == 0 {
-                            !v.is_empty()
-                        } else {
-                            v.contains(&r)
-                        }
-                    })
-                {
+                if sub.stages.contains(S::Blit) && sub.blit_touch.hits_res(r) {
                     sub_after |= S::Blit;
                 }
-                if sub.stages.contains(S::AccelerationStructure)
-                    && sub.as_touch.as_slice().is_none_or(|v| {
-                        if r == 0 {
-                            !v.is_empty()
-                        } else {
-                            v.contains(&r)
-                        }
-                    })
-                {
+                if sub.stages.contains(S::AccelerationStructure) && sub.as_touch.hits_res(r) {
                     sub_after |= S::AccelerationStructure;
                 }
                 self.ib_add_obl_tight(r, sub_after, cbit);
@@ -2677,49 +2673,23 @@ impl CommandList {
         }
         let mut after = S::empty();
         if self.ib.ib_stages.contains(S::Dispatch) {
-            let uav_hit = self.ib.ib_disp_uav.as_slice().is_none_or(|v| {
-                if r == 0 {
-                    !v.is_empty()
+            let uav_hit = self.ib.ib_disp_uav.hits_res(r);
+            let read_hit = !uav_hit && self.ib.ib_disp_read.hits_res(r);
+            let cs_hit = !uav_hit
+                && !read_hit
+                && if r == 0 {
+                    !self.ib.ib_cs_cleared.is_empty()
                 } else {
-                    v.contains(&r)
-                }
-            });
-            let read_hit = self.ib.ib_disp_read.as_slice().is_none_or(|v| {
-                if r == 0 {
-                    !v.is_empty()
-                } else {
-                    v.contains(&r)
-                }
-            });
-            let cs_hit = if r == 0 {
-                !self.ib.ib_cs_cleared.is_empty()
-            } else {
-                self.ib.ib_cs_cleared.contains(&r)
-            };
+                    self.ib.ib_cs_cleared.contains(&r)
+                };
             if uav_hit || read_hit || cs_hit {
                 after |= S::Dispatch;
             }
         }
-        if self.ib.ib_stages.contains(S::Blit)
-            && self.ib.ib_blit_touch.as_slice().is_none_or(|v| {
-                if r == 0 {
-                    !v.is_empty()
-                } else {
-                    v.contains(&r)
-                }
-            })
-        {
+        if self.ib.ib_stages.contains(S::Blit) && self.ib.ib_blit_touch.hits_res(r) {
             after |= S::Blit;
         }
-        if self.ib.ib_stages.contains(S::AccelerationStructure)
-            && self.ib.ib_as_touch.as_slice().is_none_or(|v| {
-                if r == 0 {
-                    !v.is_empty()
-                } else {
-                    v.contains(&r)
-                }
-            })
-        {
+        if self.ib.ib_stages.contains(S::AccelerationStructure) && self.ib.ib_as_touch.hits_res(r) {
             after |= S::AccelerationStructure;
         }
         self.ib_add_obl_tight(r, after, before);
@@ -2727,7 +2697,7 @@ impl CommandList {
 
     #[inline]
     pub(super) fn push_soft_obl_into(
-        list: &mut Vec<SoftPreResObl>,
+        list: &mut SoftOblVec,
         r: usize,
         ia: MTLStages,
         ib: MTLStages,
@@ -2737,14 +2707,27 @@ impl CommandList {
         if r == 0 || ia.is_empty() || ib.is_empty() {
             return;
         }
-        let mut item_req = [0u32; 7];
-        merge_req_for_after(&mut item_req, ia, &req);
-        if let Some(ex) = list.iter_mut().find(|o| o.r == r) {
+        let bit = res_bloom_bit(r);
+        if (list.bloom & bit) == 0 {
+            list.bloom |= bit;
+            let mut item_req = [0u32; 7];
+            merge_req_for_after(&mut item_req, ia, &req);
+            list.items.push(SoftPreResObl {
+                r,
+                after: ia,
+                before: ib,
+                req: item_req,
+            });
+            return;
+        }
+        if let Some(ex) = list.items.iter_mut().find(|o| o.r == r) {
             ex.after |= ia;
             ex.before |= ib;
-            merge_req_for_after(&mut ex.req, ia, &item_req);
+            merge_req_for_after(&mut ex.req, ia, &req);
         } else {
-            list.push(SoftPreResObl {
+            let mut item_req = [0u32; 7];
+            merge_req_for_after(&mut item_req, ia, &req);
+            list.items.push(SoftPreResObl {
                 r,
                 after: ia,
                 before: ib,
@@ -2754,14 +2737,18 @@ impl CommandList {
     }
 
     #[inline]
-    pub(super) fn extend_soft_items(dst: &mut Vec<SoftPreResObl>, src: Vec<SoftPreResObl>) {
-        for it in src {
+    pub(super) fn extend_soft_items(dst: &mut SoftOblVec, src: SoftOblVec) {
+        if dst.items.is_empty() {
+            *dst = src;
+            return;
+        }
+        for it in src.items {
             Self::push_soft_obl_into(dst, it.r, it.after, it.before, it.req);
         }
     }
 
     #[inline]
-    pub(super) fn strip_soft_items_after(items: &mut Vec<SoftPreResObl>, strip: MTLStages) {
+    pub(super) fn strip_soft_items_after(items: &mut SoftOblVec, strip: MTLStages) {
         if strip.is_empty() {
             return;
         }
@@ -2782,7 +2769,7 @@ impl CommandList {
     pub(super) fn partition_soft_items_for_cur_draw(
         &mut self,
         class_idx: usize,
-        items: &mut Vec<SoftPreResObl>,
+        items: &mut SoftOblVec,
         poisoned: bool,
         total_after: MTLStages,
         total_before: MTLStages,
@@ -3349,8 +3336,8 @@ impl CommandList {
                             slot.invalidate();
                             return;
                         }
-                        if (res_class(r) & rc) != 0 && !slot.items.contains(&r) {
-                            slot.items.push(r);
+                        if (res_class(r) & rc) != 0 {
+                            slot.insert_res(r);
                         }
                     }
                 };
@@ -3567,17 +3554,25 @@ impl CommandList {
         subrange_on: bool,
         disp_uav_spans: &TrackedSet<SubRange>,
         rk: usize,
-    ) -> Option<Vec<SubRange>> {
+    ) -> Option<SmallSpans> {
         const SIMUL: u32 = crate::types::resource_flags::ALLOW_SIMULTANEOUS_ACCESS;
         if !subrange_on || rk == 0 {
+            return None;
+        }
+        let us = disp_uav_spans.as_slice()?;
+        if !disp_uav_spans.maybe_contains_res(rk) {
             return None;
         }
         let res = unsafe { &*(rk as *const Resource) };
         if !res.desc.is_buffer() || (res.desc.Flags & SIMUL) != 0 {
             return None;
         }
-        let us = disp_uav_spans.as_slice()?;
-        let out: Vec<SubRange> = us.iter().copied().filter(|s| s.r == rk).collect();
+        let mut out = SmallSpans::new();
+        for &s in us {
+            if s.r == rk {
+                out.push_coalesced(s);
+            }
+        }
         (!out.is_empty()).then_some(out)
     }
 
@@ -3589,7 +3584,7 @@ impl CommandList {
         unbounded_read_classes: u8,
         rk: usize,
         include_read: bool,
-    ) -> Option<Vec<SubRange>> {
+    ) -> Option<SmallSpans> {
         const SIMUL: u32 = crate::types::resource_flags::ALLOW_SIMULTANEOUS_ACCESS;
         if !subrange_on || rk == 0 || cs_cleared.contains(&rk) {
             return None;
@@ -3599,15 +3594,24 @@ impl CommandList {
             return None;
         }
         let us = disp_uav_spans.as_slice()?;
-        let mut out: Vec<SubRange> = us.iter().copied().filter(|s| s.r == rk).collect();
+        let mut out = SmallSpans::new();
+        if disp_uav_spans.maybe_contains_res(rk) {
+            for &s in us {
+                if s.r == rk {
+                    out.push_coalesced(s);
+                }
+            }
+        }
         if include_read {
             if (unbounded_read_classes & READS_BUF) != 0 {
                 return None;
             }
             let rs = disp_read_spans.as_slice()?;
-            for &s in rs {
-                if s.r == rk {
-                    push_subrange(&mut out, s);
+            if disp_read_spans.maybe_contains_res(rk) {
+                for &s in rs {
+                    if s.r == rk {
+                        out.push_coalesced(s);
+                    }
                 }
             }
         }
@@ -3723,37 +3727,20 @@ impl CommandList {
                             if active_cand.contains(S::Dispatch) {
                                 let mut disp_hit = false;
                                 if s0_stages.contains(S::Dispatch) {
-                                    let base_uav_hit = sub.disp_uav.as_slice().is_none_or(|v| {
-                                        if r == 0 {
-                                            !v.is_empty()
-                                        } else {
-                                            v.contains(&r)
-                                        }
-                                    });
-                                    let base_read_hit = s0_non_uav_disp
-                                        && sub.disp_read.as_slice().is_none_or(|v| {
-                                            if r == 0 {
-                                                !v.is_empty()
-                                            } else {
-                                                v.contains(&r)
-                                            }
-                                        });
+                                    let base_uav_hit = sub.disp_uav.hits_res(r);
+                                    let base_read_hit = s0_non_uav_disp && sub.disp_read.hits_res(r);
                                     let (uav_hit, read_hit) = if self.opts.opt_cs_intra_barrier_v2
                                         || self.cs_intra_safe_active()
                                     {
                                         let uh = s0_uav_disp
                                             && if non_simul {
-                                                sub.disp_uav_cls[cls_idx]
-                                                    .as_slice()
-                                                    .is_none_or(|v| v.contains(&r))
+                                                sub.disp_uav_cls[cls_idx].hits_res(r)
                                             } else {
                                                 base_uav_hit
                                             };
                                         let rh = s0_non_uav_disp
                                             && if non_simul {
-                                                sub.disp_read_cls[cls_idx]
-                                                    .as_slice()
-                                                    .is_none_or(|v| v.contains(&r))
+                                                sub.disp_read_cls[cls_idx].hits_res(r)
                                             } else {
                                                 base_read_hit
                                             };
@@ -3820,25 +3807,11 @@ impl CommandList {
                                     item_after |= S::Dispatch;
                                 }
                             }
-                            if active_cand.contains(S::Blit)
-                                && sub.blit_touch.as_slice().is_none_or(|v| {
-                                    if r == 0 {
-                                        !v.is_empty()
-                                    } else {
-                                        v.contains(&r)
-                                    }
-                                })
-                            {
+                            if active_cand.contains(S::Blit) && sub.blit_touch.hits_res(r) {
                                 item_after |= S::Blit;
                             }
                             if active_cand.contains(S::AccelerationStructure)
-                                && sub.as_touch.as_slice().is_none_or(|v| {
-                                    if r == 0 {
-                                        !v.is_empty()
-                                    } else {
-                                        v.contains(&r)
-                                    }
-                                })
+                                && sub.as_touch.hits_res(r)
                             {
                                 item_after |= S::AccelerationStructure;
                             }

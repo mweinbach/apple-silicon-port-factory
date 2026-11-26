@@ -28,6 +28,15 @@ pub struct Fence {
     pub(crate) pending_sig_ns: AtomicU64,
     pub(crate) poll_epoch: AtomicU64,
     pub(crate) poll_count: AtomicU32,
+    /// Highest fence value waited on by a non-elided `Queue::wait_with`,
+    /// `Fence::wait_cpu`, or `Fence::on_completion`.
+    /// When `emitted_sig_value < wait_target`, `Queue::signal` flushes eagerly
+    /// instead of deferring so GPU and CPU waits registered before their
+    /// producer signals always make forward progress (including with `AW2_D3D_CS=0`).
+    pub(crate) wait_target: AtomicU64,
+    /// Highest fence value actually emitted to Metal (`signalEvent_value` or
+    /// `setSignaledValue`), excluding still-deferred coalesced signals.
+    pub(crate) emitted_sig_value: AtomicU64,
 }
 unsafe impl Send for Fence {}
 unsafe impl Sync for Fence {}
@@ -55,6 +64,8 @@ impl Fence {
             pending_sig_ns: Default::default(),
             poll_epoch: Default::default(),
             poll_count: Default::default(),
+            wait_target: Default::default(),
+            emitted_sig_value: AtomicU64::new(initial),
         })
     }
 
@@ -70,9 +81,15 @@ impl Fence {
 
     #[inline]
     fn flush_pending_for(&self, target_v: u64) {
-        let q_addr = self.pending_sig_queue.load(Ordering::Acquire);
+        let q_addr = self.pending_sig_queue.load(Ordering::SeqCst);
         if q_addr != 0 && self.ev.signaledValue() < target_v {
             super::queue::Queue::flush_fence_signals_by_addr(q_addr);
+        }
+        // If this fence is still incomplete, flush any buffered CBs / deferred
+        // signals across live queues so transitive cross-queue dependencies
+        // always make progress even when the CS thread is disabled (`AW2_D3D_CS=0`).
+        if self.ev.signaledValue() < target_v && super::queue::has_pending_work() {
+            super::queue::Queue::flush_all_pending_work();
         }
     }
 
@@ -121,6 +138,7 @@ impl Fence {
         self.pending_sig_value.store(0, Ordering::Release);
         self.poll_count.store(0, Ordering::Release);
         self.sig_queue.store(0, Ordering::Release);
+        self.emitted_sig_value.fetch_max(v, Ordering::AcqRel);
         self.ev.setSignaledValue(v);
     }
 
@@ -130,6 +148,11 @@ impl Fence {
         if self.completed_raw() >= v {
             return true;
         }
+        // Publish CPU wait target before reading `pending_sig_queue` (Dekker
+        // `SeqCst` handshake with `Queue::signal`) so a signal issued on
+        // another thread concurrently or later flushes eagerly even with
+        // `AW2_D3D_CS=0`.
+        self.wait_target.fetch_max(v, Ordering::SeqCst);
         self.flush_pending_for(v);
         if self.completed_raw() >= v {
             return true;
@@ -151,7 +174,18 @@ impl Fence {
             f();
             return;
         }
+        // Publish CPU callback wait target before reading `pending_sig_queue`
+        // (Dekker `SeqCst` handshake with `Queue::signal`) so registering
+        // `SetEventOnCompletion(f, v, event)` before `Queue::signal(f, v)`
+        // flushes eagerly even with `AW2_D3D_CS=0`.
+        self.wait_target.fetch_max(v, Ordering::SeqCst);
         self.flush_pending_for(v);
+        self.on_completion_no_flush(v, f);
+    }
+
+    /// Internal variant for `Queue`'s own `timeline` fence called while holding
+    /// `Queue::submit` (cannot re-enter queue flush locks).
+    pub(crate) fn on_completion_no_flush(&self, v: u64, f: Box<dyn FnOnce() + Send>) {
         if self.completed_raw() >= v {
             f();
             return;

@@ -96,6 +96,11 @@ pub fn push_subrange(spans: &mut Vec<SubRange>, mut s: SubRange) {
     while i < spans.len() {
         let e = spans[i];
         if e.r == s.r && e.lo <= s.hi && s.lo <= e.hi {
+            if e.lo <= s.lo && s.hi <= e.hi {
+                // Already fully covered by an existing disjoint span: keep hot
+                // entries in place and exit immediately.
+                return;
+            }
             s.lo = s.lo.min(e.lo);
             s.hi = s.hi.max(e.hi);
             spans.swap_remove(i);
@@ -130,8 +135,12 @@ impl Hasher for U64MixHasher {
     }
 }
 
-/// Thread-local cache of strictly non-aliasing `[start, end) -> key` buffer ranges,
-/// invalidated whenever [`ResRegistry::buf_gen`] changes. Only populated for buffers
+/// Per-command-list cache of strictly non-aliasing `[start, end) -> key` buffer ranges,
+/// invalidated in O(1) whenever [`ResRegistry::buf_gen`] changes (resource destruction,
+/// recreation at the same VA, or overlapping/aliasing placed-buffer insertion).
+/// Only populated for buffers mathematically proven disjoint from all neighbors in
+/// [`ResRegistry::buffers`].
+///
 /// Per-entry generation-tagged cache entry (32 bytes = power-of-2 stride so index
 /// arithmetic compiles to a single shift and generation bumps require zero memset).
 #[derive(Clone, Copy)]
@@ -146,20 +155,25 @@ impl BufVaEntry {
     const EMPTY: Self = Self { start: 0, end: 0, key: 0, gen: 0 };
 }
 
-/// mathematically proven disjoint from all neighbors in [`ResRegistry::buffers`].
 pub(crate) struct BufVaCache {
+    last: BufVaEntry,
     mru_cursor: usize,
     mru: [BufVaEntry; 4],
     page: [BufVaEntry; 256],
 }
 
 impl BufVaCache {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
+            last: BufVaEntry::EMPTY,
             mru_cursor: 0,
             mru: [BufVaEntry::EMPTY; 4],
             page: [BufVaEntry::EMPTY; 256],
         }
+    }
+
+    pub(crate) fn new_boxed() -> Box<Self> {
+        Box::new(Self::new())
     }
 
     #[inline(always)]
@@ -168,18 +182,27 @@ impl BufVaCache {
     }
 
     #[inline(always)]
-    fn lookup(&self, buf_gen: u64, va: u64) -> Option<(u64, u64, usize)> {
+    fn lookup(&mut self, buf_gen: u64, va: u64) -> Option<(u64, u64, usize)> {
         if buf_gen == 0 {
             return None;
         }
-        // Check O(1) direct-mapped page table first before the 4-entry collision MRU.
+        // Fast 1-entry MRU front check for consecutive slots into the same buffer
+        // (even across 64 KiB page boundaries) on the same cache line as `mru_cursor`.
+        let l = self.last;
+        if l.gen == buf_gen && va >= l.start && va < l.end {
+            return Some((l.start, l.end, l.key));
+        }
+        // Check O(1) direct-mapped page table before the 4-entry collision MRU.
         let p = self.page[Self::page_slot(va)];
         if p.gen == buf_gen && va >= p.start && va < p.end {
+            self.last = p;
             return Some((p.start, p.end, p.key));
         }
         for e in &self.mru {
             if e.gen == buf_gen && va >= e.start && va < e.end {
-                return Some((e.start, e.end, e.key));
+                let hit = *e;
+                self.last = hit;
+                return Some((hit.start, hit.end, hit.key));
             }
         }
         None
@@ -191,28 +214,19 @@ impl BufVaCache {
             return;
         }
         let entry = BufVaEntry { start, end, key, gen: buf_gen };
+        self.last = entry;
         let slot = Self::page_slot(va);
         let prev = self.page[slot];
         self.page[slot] = entry;
         // Spill displaced live entry into the 4-entry MRU so hash collisions stay hot.
-        if prev.gen == buf_gen && prev.key != key {
-            if !self.mru.iter().any(|e| e.gen == buf_gen && e.start == prev.start && e.end == prev.end) {
-                self.mru[self.mru_cursor & 3] = prev;
-                self.mru_cursor = self.mru_cursor.wrapping_add(1);
-            }
+        if prev.gen == buf_gen
+            && prev.key != key
+            && !self.mru.iter().any(|e| e.gen == buf_gen && e.start == prev.start && e.end == prev.end)
+        {
+            self.mru[self.mru_cursor & 3] = prev;
+            self.mru_cursor = self.mru_cursor.wrapping_add(1);
         }
     }
-}
-
-thread_local! {
-    static BUF_VA_CACHE: std::cell::UnsafeCell<BufVaCache> = const { std::cell::UnsafeCell::new(BufVaCache::new()) };
-}
-
-/// Borrow the calling thread's [`BufVaCache`] once across a batch of slot lookups,
-/// avoiding repeated TLS accessor (`_tlv_get_addr`) calls per descriptor slot.
-#[inline]
-pub(crate) fn with_buf_va_cache<R>(f: impl FnOnce(&mut BufVaCache) -> R) -> R {
-    BUF_VA_CACHE.with(|c| f(unsafe { &mut *c.get() }))
 }
 
 /// Live resource registry mapping buffer GPU virtual address ranges and
@@ -246,7 +260,7 @@ impl ResRegistry {
         }
     }
 
-    fn insert_buffer(&mut self, start: u64, end: u64, key: usize) {
+    pub(crate) fn insert_buffer(&mut self, start: u64, end: u64, key: usize) {
         if start == 0 || end <= start {
             return;
         }
@@ -286,7 +300,7 @@ impl ResRegistry {
     }
 
     #[inline]
-    fn insert_tex_id(&mut self, id: u64, key: usize) {
+    pub(crate) fn insert_tex_id(&mut self, id: u64, key: usize) {
         if self.tex_ids.insert(id, key) != Some(key) {
             bump_res_registry_gen();
         }
@@ -303,14 +317,30 @@ impl ResRegistry {
     /// contains `va`. Returns `true` if at least one live buffer matched.
     #[inline]
     pub fn push_buffer_va(&self, va: u64, out: &mut Vec<usize>) -> bool {
-        with_buf_va_cache(|cache| self.push_buffer_va_cached(cache, va, out))
+        let idx = self.buffers.partition_point(|b| b.start <= va);
+        let mut match_count = 0usize;
+        let mut i = idx;
+        while i > 0 {
+            i -= 1;
+            let b = &self.buffers[i];
+            if b.max_end <= va {
+                break;
+            }
+            if va < b.end {
+                match_count += 1;
+                if out.last() != Some(&b.key) && !out.contains(&b.key) {
+                    out.push(b.key);
+                }
+            }
+        }
+        match_count != 0
     }
 
     #[inline]
     pub(crate) fn push_buffer_va_cached(&self, cache: &mut BufVaCache, va: u64, out: &mut Vec<usize>) -> bool {
         let bg = self.buf_gen;
         if let Some((_, _, key)) = cache.lookup(bg, va) {
-            if !out.contains(&key) {
+            if out.last() != Some(&key) && !out.contains(&key) {
                 out.push(key);
             }
             return true;
@@ -328,7 +358,7 @@ impl ResRegistry {
             if va < b.end {
                 match_count += 1;
                 last_idx = i;
-                if !out.contains(&b.key) {
+                if out.last() != Some(&b.key) && !out.contains(&b.key) {
                     out.push(b.key);
                 }
             }
@@ -352,7 +382,7 @@ impl ResRegistry {
         out: &mut Vec<usize>,
         spans: &mut Vec<SubRange>,
     ) -> bool {
-        with_buf_va_cache(|cache| self.push_buffer_span_cached(cache, va, byte_len, out, spans))
+        self.push_buffer_span_inner(None, va, byte_len, out, spans)
     }
 
     #[inline]
@@ -371,12 +401,25 @@ impl ResRegistry {
             } else {
                 va.saturating_add(byte_len).min(end)
             };
-            if !out.contains(&key) {
+            if out.last() != Some(&key) && !out.contains(&key) {
                 out.push(key);
             }
             push_subrange(spans, SubRange { r: key, lo: va, hi });
             return true;
         }
+        self.push_buffer_span_inner(Some(cache), va, byte_len, out, spans)
+    }
+
+    #[inline]
+    fn push_buffer_span_inner(
+        &self,
+        cache: Option<&mut BufVaCache>,
+        va: u64,
+        byte_len: u64,
+        out: &mut Vec<usize>,
+        spans: &mut Vec<SubRange>,
+    ) -> bool {
+        let bg = self.buf_gen;
         let idx = self.buffers.partition_point(|b| b.start <= va);
         let mut eff_hi = 0u64;
         let mut match_count = 0usize;
@@ -406,10 +449,12 @@ impl ResRegistry {
         }
         if match_count == 1 && self.buffers.get(idx).is_none_or(|next| next.start >= eff_hi) {
             let (key, start, end) = single;
-            if bg != 0 && self.is_strictly_disjoint(single_idx) {
-                cache.insert(bg, va, start, end, key);
+            if let Some(c) = cache {
+                if bg != 0 && self.is_strictly_disjoint(single_idx) {
+                    c.insert(bg, va, start, end, key);
+                }
             }
-            if !out.contains(&key) {
+            if out.last() != Some(&key) && !out.contains(&key) {
                 out.push(key);
             }
             push_subrange(
@@ -431,7 +476,7 @@ impl ResRegistry {
                 break;
             }
             if va < b.end && b.start < eff_hi {
-                if !out.contains(&b.key) {
+                if out.last() != Some(&b.key) && !out.contains(&b.key) {
                     out.push(b.key);
                 }
                 push_subrange(
@@ -985,7 +1030,9 @@ impl Resource {
 
     #[inline]
     pub fn mark_gpu_used(&self) {
-        self.gpu_used.store(true, Ordering::Relaxed);
+        if !self.gpu_used.load(Ordering::Relaxed) {
+            self.gpu_used.store(true, Ordering::Relaxed);
+        }
     }
 
     /// True when this standalone committed resource has never been recorded into prior
@@ -1459,5 +1506,71 @@ mod tests {
         out.clear();
         assert!(!reg.push_buffer_va(0x21_0000, &mut out));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn buf_va_cache_per_cmdlist_invalidation_on_recreate_same_va_and_aliasing() {
+        let mut reg = ResRegistry::default();
+        let mut cache_a = BufVaCache::new();
+        let mut cache_b = BufVaCache::new();
+        reg.insert_buffer(0x10_0000, 0x12_0000, 101);
+        reg.insert_buffer(0x20_0000, 0x24_0000, 202);
+
+        let mut out = Vec::new();
+        let mut spans = Vec::new();
+
+        // Prime both per-command-list caches (tests `last` MRU hit, `page` table hit, and `mru[4]`).
+        assert!(reg.push_buffer_va_cached(&mut cache_a, 0x10_0040, &mut out));
+        assert_eq!(out, vec![101]);
+        assert!(reg.push_buffer_va_cached(&mut cache_a, 0x10_0800, &mut out));
+        assert_eq!(out, vec![101], "duplicate key should dedup via out.last() fast check");
+        out.clear();
+        assert!(reg.push_buffer_span_cached(&mut cache_a, 0x11_F000, 0x2000, &mut out, &mut spans));
+        assert_eq!(out, vec![101]);
+        assert_eq!(spans, vec![SubRange { r: 101, lo: 0x11_F000, hi: 0x12_0000 }]);
+
+        out.clear();
+        assert!(reg.push_buffer_va_cached(&mut cache_b, 0x20_0100, &mut out));
+        assert_eq!(out, vec![202]);
+
+        // Destroy resource 101 and recreate a DIFFERENT resource 909 at the EXACT same VA range.
+        // Both `last` and `page`/`mru` entries in `cache_a` MUST invalidate via `buf_gen`.
+        reg.remove_buffer(0x10_0000, 101);
+        reg.insert_buffer(0x10_0000, 0x12_0000, 909);
+        out.clear();
+        spans.clear();
+        assert!(reg.push_buffer_va_cached(&mut cache_a, 0x10_0040, &mut out));
+        assert_eq!(out, vec![909], "recreated resource at identical VA must not return stale key 101");
+        out.clear();
+        assert!(reg.push_buffer_span_cached(&mut cache_a, 0x10_1000, 0x400, &mut out, &mut spans));
+        assert_eq!(out, vec![909]);
+        assert_eq!(spans, vec![SubRange { r: 909, lo: 0x10_1000, hi: 0x10_1400 }]);
+
+        // Insert an overlapping/aliasing placed buffer inside [0x20_0000, 0x24_0000).
+        // `cache_b` (primed with disjoint 202) MUST invalidate and return BOTH 202 and 404.
+        reg.insert_buffer(0x20_0000, 0x22_0000, 404);
+        out.clear();
+        spans.clear();
+        assert!(reg.push_buffer_va_cached(&mut cache_b, 0x20_0100, &mut out));
+        out.sort_unstable();
+        assert_eq!(out, vec![202, 404]);
+        out.clear();
+        assert!(reg.push_buffer_span_cached(&mut cache_b, 0x21_8000, 0x1_0000, &mut out, &mut spans));
+        out.sort_unstable();
+        spans.sort_unstable_by_key(|s| (s.r, s.lo, s.hi));
+        assert_eq!(out, vec![202, 404]);
+        assert_eq!(
+            spans,
+            vec![
+                SubRange { r: 202, lo: 0x21_8000, hi: 0x22_8000 },
+                SubRange { r: 404, lo: 0x21_8000, hi: 0x22_0000 },
+            ]
+        );
+
+        // Removing the aliasing resource restores single-buffer disjoint caching for 202.
+        reg.remove_buffer(0x20_0000, 404);
+        out.clear();
+        assert!(reg.push_buffer_va_cached(&mut cache_b, 0x20_0100, &mut out));
+        assert_eq!(out, vec![202]);
     }
 }

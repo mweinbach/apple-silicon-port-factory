@@ -111,11 +111,22 @@ impl CommandAllocator {
 
     /// `ID3D12CommandAllocator::Reset` (the app guarantees GPU completion).
     pub fn reset(&self) {
+        if super::queue::has_pending_cbs() {
+            super::queue::Queue::flush_if_alloc_pending(Retained::as_ptr(&self.a) as usize);
+        }
         self.a.reset();
         self.ring.lock().unwrap().reset();
         self.icb_scratch.lock().unwrap().reset();
         self.rt_keep.lock().unwrap().clear();
         self.icbs.lock().unwrap().reset();
+    }
+}
+
+impl Drop for CommandAllocator {
+    fn drop(&mut self) {
+        if super::queue::has_pending_cbs() {
+            super::queue::Queue::flush_if_alloc_pending(Retained::as_ptr(&self.a) as usize);
+        }
     }
 }
 
@@ -143,6 +154,12 @@ pub struct CommandList {
     open: bool,
     /// Begun at least once (an executable command buffer exists).
     recorded: bool,
+    /// True when the current recording encoded an opaque MetalFX ML pass whose
+    /// `preCommit` runs ANE evaluation (flush immediately on submit instead of
+    /// deferring into `Present` / `cs::flush`).
+    pub(super) has_ml_work: bool,
+    /// Raw pointer identity of the `MTL4CommandAllocator` backing the current/most-recent recording.
+    alloc_key: usize,
     enc: Encoder,
     ring: Option<Arc<Mutex<UploadRing>>>,
     table: Retained<MtlArgumentTable>,
@@ -206,6 +223,8 @@ impl CommandList {
             binds: BindTableCache::new(),
             open: false,
             recorded: false,
+            has_ml_work: false,
+            alloc_key: 0,
             enc: Encoder::None,
             ring: None,
             table: new_argument_table("aw2 command list")?,
@@ -260,11 +279,27 @@ impl CommandList {
         self.bar.has_gpu_work
     }
 
+    /// Whether the current/most-recent recording encoded an opaque MetalFX ML pass
+    /// whose `preCommit` runs ANE evaluation.
+    #[inline]
+    pub fn has_ml_work_recorded(&self) -> bool {
+        self.has_ml_work
+    }
+
+    /// Raw pointer identity of the `MTL4CommandAllocator` used for the current/most-recent recording.
+    #[inline]
+    pub(super) fn alloc_key(&self) -> usize {
+        self.alloc_key
+    }
+
     /// `Reset(allocator, pso)` / creation: begin recording (all list state
     /// is reset, D3D12 semantics).
     pub fn begin(&mut self, alloc: &CommandAllocator) -> Result<(), String> {
         if self.open {
             return Err("command list is already open".into());
+        }
+        if super::queue::has_pending_cbs() {
+            super::queue::Queue::flush_if_cb_pending(&self.cb);
         }
         self.cb.beginCommandBufferWithAllocator(&alloc.a);
         if !self.label.is_empty() {
@@ -275,6 +310,8 @@ impl CommandList {
         stats::inc(&stats::c::lists);
         self.open = true;
         self.recorded = true;
+        self.has_ml_work = false;
+        self.alloc_key = Retained::as_ptr(&alloc.a) as usize;
         let list_tight = self.list_barrier_tight_active();
         self.bar.reset_for_begin(list_tight);
         self.ib.ib_obl.clear();

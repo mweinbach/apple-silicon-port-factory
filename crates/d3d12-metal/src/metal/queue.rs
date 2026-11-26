@@ -7,6 +7,7 @@
 use super::fence::{Fence, MtlEvent};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::Message;
 use objc2_metal::*;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -43,14 +44,19 @@ pub fn submit_coalesce() -> bool {
     *ON.get_or_init(|| std::env::var_os("AW2_SUBMIT_COALESCE").is_none_or(|v| v != "0"))
 }
 
-/// `AW2_FENCE_SIGNAL_COALESCE`: coalesce mid-frame D3D12 `ID3D12CommandQueue::Signal`
-/// calls on `ListType::Direct` (`q0`) (`fence_sig_coalesced`), flushing eagerly on
-/// cross-queue `Wait`, CPU `Wait` / `SetEventOnCompletion`, `signal_cpu`, `Present` /
-/// `last_submitted`, `wait_idle`, and `GetCompletedValue` spin-polls. Default **off**
-/// (`AW2_FENCE_SIGNAL_COALESCE=1` enables).
+/// `PORT_FENCE_SIGNAL_COALESCE` (legacy alias `AW2_FENCE_SIGNAL_COALESCE`):
+/// coalesce mid-frame D3D12 `ID3D12CommandQueue::Signal` calls on `ListType::Direct`
+/// (`q0`) (`fence_sig_coalesced`) alongside buffered `submit_d3d_lists` commits,
+/// flushing eagerly on cross-queue `Wait`, CPU `Wait` / `SetEventOnCompletion`,
+/// `signal_cpu`, `Present` / `flush_timeline`, `wait_idle`, CS idle timeout, and
+/// `GetCompletedValue` spin-polls. Default **on** (`=0` disables).
 pub fn fence_signal_coalesce() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var_os("PORT_FENCE_SIGNAL_COALESCE")
+            .or_else(|| std::env::var_os("AW2_FENCE_SIGNAL_COALESCE"))
+            .is_none_or(|v| v != "0")
+    })
 }
 
 /// `D3D12_COMMAND_LIST_TYPE`.
@@ -107,9 +113,36 @@ pub struct Queue {
     commit_epoch: AtomicU64,
     has_deferred_signals: AtomicBool,
     deferred_signals: Mutex<Vec<DeferredFenceSig>>,
+    /// Buffered closed `(MTL4CommandBuffer, alloc_key)` pairs from adjacent
+    /// `submit_d3d_lists` calls coalesced into a single `MTL4CommandQueue::commit:count:`
+    /// batch when ordering, fence, and signal semantics allow.
+    has_pending_cbs: AtomicBool,
+    pending_cbs: Mutex<Vec<(Retained<MtlCommandBuffer>, usize)>>,
 }
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
+
+/// Maximum buffered `MTL4CommandBuffer`s per queue before forcing a batched commit
+/// (keeps GPU execution overlapping CPU encoding while cutting per-frame commits ~2-3x).
+const MAX_COALESCED_CBS: usize = 4;
+
+/// Total uncommitted command buffers currently buffered across all live queues.
+static GLOBAL_PENDING_CBS: AtomicUsize = AtomicUsize::new(0);
+/// Total live queues currently holding deferred fence signals.
+static GLOBAL_PENDING_SIGS: AtomicUsize = AtomicUsize::new(0);
+
+/// Lock-free check for whether any queue currently holds buffered uncommitted command buffers.
+#[inline]
+pub fn has_pending_cbs() -> bool {
+    GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
+}
+
+/// Lock-free check for whether any queue currently holds buffered command buffers or deferred signals.
+#[inline]
+pub fn has_pending_work() -> bool {
+    GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
+        || GLOBAL_PENDING_SIGS.load(Ordering::Acquire) > 0
+}
 
 fn active_queues() -> &'static Mutex<Vec<usize>> {
     static Q: std::sync::OnceLock<Mutex<Vec<usize>>> = std::sync::OnceLock::new();
@@ -278,10 +311,20 @@ fn commit_with_feedback(q: &MtlQueue, ptrs: &mut [NonNull<MtlCommandBuffer>], ki
     }
 }
 
+#[cfg(test)]
+static TEST_COMMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_COMMIT_CBS: AtomicUsize = AtomicUsize::new(0);
+
 /// Commit `cbs` to `q` using a stack-allocated pointer array for `<= 32` command
 /// buffers (falling back to heap allocation only for larger batches).
 #[inline]
 fn commit_cbs(q: &MtlQueue, cbs: &[&MtlCommandBuffer], kind: ListType) {
+    #[cfg(test)]
+    {
+        TEST_COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        TEST_COMMIT_CBS.fetch_add(cbs.len(), Ordering::Relaxed);
+    }
     const STACK_CAP: usize = 32;
     let hook = FEEDBACK_HOOK.load(Ordering::Relaxed);
     if cbs.len() <= STACK_CAP {
@@ -351,6 +394,8 @@ impl Queue {
             commit_epoch: AtomicU64::new(0),
             has_deferred_signals: AtomicBool::new(false),
             deferred_signals: Mutex::new(Vec::new()),
+            has_pending_cbs: AtomicBool::new(false),
+            pending_cbs: Mutex::new(Vec::new()),
         })
     }
 
@@ -404,6 +449,138 @@ impl Queue {
         });
     }
 
+    /// Flush any buffered uncommitted command buffers on `self.q` in a single
+    /// `MTL4CommandQueue::commit:count:` call. Caller must hold `self.submit`.
+    fn flush_pending_cbs_locked(&self) {
+        if !self.has_pending_cbs.load(Ordering::Acquire) {
+            return;
+        }
+        let cbs = {
+            let mut pc = self.pending_cbs.lock().unwrap();
+            self.has_pending_cbs.store(false, Ordering::Release);
+            std::mem::take(&mut *pc)
+        };
+        if cbs.is_empty() {
+            return;
+        }
+        GLOBAL_PENDING_CBS.fetch_sub(cbs.len(), Ordering::AcqRel);
+        if let Some(d) = super::device() {
+            d.commit_residency();
+        }
+        const STACK_CAP: usize = 32;
+        if cbs.len() <= STACK_CAP {
+            let mut stack: [std::mem::MaybeUninit<&MtlCommandBuffer>; STACK_CAP] =
+                [const { std::mem::MaybeUninit::uninit() }; STACK_CAP];
+            for (dst, (cb, _)) in stack.iter_mut().zip(cbs.iter()) {
+                dst.write(&**cb);
+            }
+            // SAFETY: the first `cbs.len()` slots were just initialized above, and `cbs`
+            // keeps every `MTL4CommandBuffer` alive across `commit_cbs`.
+            let slice = unsafe {
+                std::slice::from_raw_parts(stack.as_ptr() as *const &MtlCommandBuffer, cbs.len())
+            };
+            commit_cbs(&self.q, slice, self.kind);
+        } else {
+            let refs: Vec<&MtlCommandBuffer> = cbs.iter().map(|(cb, _)| &**cb).collect();
+            commit_cbs(&self.q, &refs, self.kind);
+        }
+    }
+
+    /// Flush buffered command buffers on whichever live queue holds `cb` (if any) before
+    /// `CommandList::begin()` re-begins that `MTL4CommandBuffer`.
+    pub(crate) fn flush_if_cb_pending(cb: &MtlCommandBuffer) {
+        if !has_pending_cbs() {
+            return;
+        }
+        let target = cb as *const MtlCommandBuffer as usize;
+        let aq = active_queues().lock().unwrap();
+        for &p in aq.iter() {
+            // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+            let q = unsafe { &*(p as *const Queue) };
+            if q.has_pending_cbs.load(Ordering::Acquire) {
+                let _g = q.submit.lock().unwrap();
+                let found = {
+                    let pc = q.pending_cbs.lock().unwrap();
+                    pc.iter().any(|(c, _)| Retained::as_ptr(c) as usize == target)
+                };
+                if found {
+                    q.flush_pending_cbs_locked();
+                }
+            }
+        }
+    }
+
+    /// Flush buffered command buffers on whichever live queue holds a CB recorded
+    /// with `alloc_key` (or an unknown `0` alloc_key) before `CommandAllocator::reset()`
+    /// or `Drop`, avoiding spurious flushes when resetting an unrelated free allocator.
+    pub(crate) fn flush_if_alloc_pending(alloc_key: usize) {
+        if !has_pending_cbs() {
+            return;
+        }
+        let aq = active_queues().lock().unwrap();
+        for &p in aq.iter() {
+            // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+            let q = unsafe { &*(p as *const Queue) };
+            if q.has_pending_cbs.load(Ordering::Acquire) {
+                let _g = q.submit.lock().unwrap();
+                let found = {
+                    let pc = q.pending_cbs.lock().unwrap();
+                    pc.iter().any(|(_, ak)| *ak == 0 || *ak == alloc_key)
+                };
+                if found {
+                    q.flush_pending_cbs_locked();
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn set_has_deferred_signals(&self, on: bool) {
+        let prev = self.has_deferred_signals.swap(on, Ordering::AcqRel);
+        if on && !prev {
+            GLOBAL_PENDING_SIGS.fetch_add(1, Ordering::AcqRel);
+        } else if !on && prev {
+            GLOBAL_PENDING_SIGS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Flush buffered uncommitted command buffers on every live queue (called before
+    /// `CommandAllocator::reset()` or on `cs::flush()`).
+    pub fn flush_all_pending_cbs() {
+        if !has_pending_cbs() {
+            return;
+        }
+        let aq = active_queues().lock().unwrap();
+        for &p in aq.iter() {
+            // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+            let q = unsafe { &*(p as *const Queue) };
+            if q.has_pending_cbs.load(Ordering::Acquire) {
+                let _g = q.submit.lock().unwrap();
+                q.flush_pending_cbs_locked();
+            }
+        }
+    }
+
+    /// Flush buffered command buffers AND deferred fence signals on every live queue
+    /// (called when the CS thread idles so no pending GPU commit or signal stays buffered).
+    pub fn flush_all_pending_work() {
+        if !has_pending_work() {
+            return;
+        }
+        let aq = active_queues().lock().unwrap();
+        for &p in aq.iter() {
+            // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+            let q = unsafe { &*(p as *const Queue) };
+            if q.has_pending_cbs.load(Ordering::Acquire)
+                || q.has_deferred_signals.load(Ordering::Acquire)
+            {
+                let _g = q.submit.lock().unwrap();
+                q.flush_pending_cbs_locked();
+                q.flush_fence_signals_locked();
+            }
+        }
+    }
+
     /// Resolve any pending deferred GPU signal on `q_addr` for `ev_key` before a CPU
     /// `Fence::signal_cpu(v)`: cancels stale `<= v` GPU signals so a later GPU flush
     /// can never overwrite `v` backward, or emits `> v` onto `q_addr` after setting `v`.
@@ -427,16 +604,22 @@ impl Queue {
                     true
                 }
             });
-            q.has_deferred_signals.store(!ds.is_empty(), Ordering::Release);
+            q.set_has_deferred_signals(!ds.is_empty());
             drop(ds);
             if fence_ptr != 0 {
                 let f = unsafe { &*(fence_ptr as *const Fence) };
                 f.pending_sig_queue.store(0, Ordering::Release);
                 f.pending_sig_value.store(0, Ordering::Release);
                 f.poll_count.store(0, Ordering::Release);
+                f.emitted_sig_value.fetch_max(v, Ordering::AcqRel);
                 f.ev.setSignaledValue(v);
             }
             if let Some((ev, gv)) = greater_sig {
+                q.flush_pending_cbs_locked();
+                if fence_ptr != 0 {
+                    let f = unsafe { &*(fence_ptr as *const Fence) };
+                    f.emitted_sig_value.fetch_max(gv, Ordering::AcqRel);
+                }
                 q.q.signalEvent_value(ProtocolObject::from_ref(&*ev), gv);
             }
             true
@@ -459,9 +642,10 @@ impl Queue {
     /// Emit all deferred `ID3D12CommandQueue::Signal` events in enqueue order.
     /// Caller must hold `self.submit`.
     fn flush_fence_signals_locked(&self) {
-        if !self.has_deferred_signals.swap(false, Ordering::AcqRel) {
+        if !self.has_deferred_signals.load(Ordering::Acquire) {
             return;
         }
+        self.set_has_deferred_signals(false);
         let entries = {
             let mut ds = self.deferred_signals.lock().unwrap();
             std::mem::take(&mut *ds)
@@ -469,6 +653,8 @@ impl Queue {
         if entries.is_empty() {
             return;
         }
+        // Any buffered CBs submitted prior to these signals MUST commit before signaling.
+        self.flush_pending_cbs_locked();
         let cur_epoch = self.commit_epoch.load(Ordering::Acquire);
         let me = self as *const Queue as usize;
         for entry in entries {
@@ -482,6 +668,7 @@ impl Queue {
                 );
                 f.pending_sig_value.store(0, Ordering::Release);
                 f.poll_count.store(0, Ordering::Release);
+                f.emitted_sig_value.fetch_max(entry.val, Ordering::AcqRel);
             }
             if entry.enqueued_epoch < cur_epoch {
                 super::encstats::inc(&super::encstats::c::fence_sig_coalesced);
@@ -505,6 +692,7 @@ impl Queue {
     /// or `PassLog`s are awaiting a timeline value. Caller must hold `self.submit` and
     /// run [`Self::collect`] AFTER releasing `self.submit`.
     fn flush_timeline_locked(&self) -> u64 {
+        self.flush_pending_cbs_locked();
         self.flush_fence_signals_locked();
         let logs = if self.pending_log_count.load(Ordering::Acquire) > 0 {
             let mut pl = self.pending_pass_logs.lock().unwrap();
@@ -521,7 +709,8 @@ impl Queue {
         self.timeline_state
             .store(Self::pack_timeline_state(v + 1, false), Ordering::Release);
         if !logs.is_empty() {
-            self.timeline.on_completion(v, Box::new(move || super::passtiming::resolve(logs)));
+            self.timeline
+                .on_completion_no_flush(v, Box::new(move || super::passtiming::resolve(logs)));
         }
         v
     }
@@ -548,13 +737,37 @@ impl Queue {
                     logs = std::mem::take(&mut *pl);
                 }
             }
-            if let Some(d) = super::device() {
-                d.commit_residency();
-            }
-            if !cbs.is_empty() {
-                commit_cbs(&self.q, cbs, self.kind);
-                self.commit_epoch.fetch_add(1, Ordering::AcqRel);
-                SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
+            let pending = if self.has_pending_cbs.load(Ordering::Acquire) {
+                let mut pc = self.pending_cbs.lock().unwrap();
+                self.has_pending_cbs.store(false, Ordering::Release);
+                let taken = std::mem::take(&mut *pc);
+                if !taken.is_empty() {
+                    GLOBAL_PENDING_CBS.fetch_sub(taken.len(), Ordering::AcqRel);
+                }
+                taken
+            } else {
+                Vec::new()
+            };
+            if !pending.is_empty() || !cbs.is_empty() {
+                if let Some(d) = super::device() {
+                    d.commit_residency();
+                }
+                if pending.is_empty() {
+                    commit_cbs(&self.q, cbs, self.kind);
+                    self.commit_epoch.fetch_add(1, Ordering::AcqRel);
+                    SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
+                } else if cbs.is_empty() {
+                    let refs: Vec<&MtlCommandBuffer> = pending.iter().map(|(c, _)| &**c).collect();
+                    commit_cbs(&self.q, &refs, self.kind);
+                } else {
+                    let mut combined: Vec<&MtlCommandBuffer> =
+                        Vec::with_capacity(pending.len() + cbs.len());
+                    combined.extend(pending.iter().map(|(c, _)| &**c));
+                    combined.extend_from_slice(cbs);
+                    commit_cbs(&self.q, &combined, self.kind);
+                    self.commit_epoch.fetch_add(1, Ordering::AcqRel);
+                    SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
+                }
             }
             self.flush_fence_signals_locked();
             let (v, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
@@ -562,7 +775,8 @@ impl Queue {
             self.timeline_state
                 .store(Self::pack_timeline_state(v + 1, false), Ordering::Release);
             if !logs.is_empty() {
-                self.timeline.on_completion(v, Box::new(move || super::passtiming::resolve(logs)));
+                self.timeline
+                    .on_completion_no_flush(v, Box::new(move || super::passtiming::resolve(logs)));
             }
             v
         };
@@ -571,11 +785,25 @@ impl Queue {
     }
 
     /// Submit D3D12 `ExecuteCommandLists` command buffers. When `AW2_SUBMIT_COALESCE=1`
-    /// is enabled on a `ListType::Direct` queue (`q0`), skips per-call `signalEvent_value`
-    /// timeline drains (`submit_nosig`) and batches `PassLog` callbacks until demand
-    /// (`flush_timeline`, `Present`, `wait_idle`, `submit`, or 8 pending `PassLog`s).
+    /// is enabled on a `ListType::Direct` queue (`q0`), buffers adjacent command buffers
+    /// into a single Metal `commit:count:` batch, skips per-call `signalEvent_value`
+    /// timeline drains (`submit_nosig`), and batches `PassLog` callbacks until an ordering
+    /// or demand boundary (`signal`, non-elided `wait`, `flush_timeline`, `Present`,
+    /// `wait_idle`, `submit`, CB reuse, `MAX_COALESCED_CBS`, or 8 pending `PassLog`s).
     pub fn submit_d3d_lists(&self, cbs: &[&MtlCommandBuffer], logs: Vec<super::passtiming::PassLog>) -> u64 {
-        let coalesce = self.kind == ListType::Direct && self.opt_submit_coalesce.load(Ordering::Relaxed);
+        self.submit_d3d_lists_inner(cbs, None, logs, false)
+    }
+
+    fn submit_d3d_lists_inner(
+        &self,
+        cbs: &[&MtlCommandBuffer],
+        alloc_keys: Option<&[usize]>,
+        logs: Vec<super::passtiming::PassLog>,
+        eager_flush: bool,
+    ) -> u64 {
+        let coalesce = self.kind == ListType::Direct
+            && !self.is_swapchain_internal
+            && self.opt_submit_coalesce.load(Ordering::Relaxed);
         if !coalesce {
             return self.submit_with_logs(cbs, logs);
         }
@@ -588,15 +816,44 @@ impl Queue {
                 next - 1
             } else {
                 if !cbs.is_empty() {
-                    if let Some(d) = super::device() {
-                        d.commit_residency();
+                    // Flush first if any incoming CB is already buffered (re-execution of the
+                    // same command buffer) or appending would exceed our batch cap.
+                    if self.has_pending_cbs.load(Ordering::Acquire) {
+                        let need_flush = {
+                            let pc = self.pending_cbs.lock().unwrap();
+                            pc.len() + cbs.len() > MAX_COALESCED_CBS
+                                || cbs.iter().any(|&cb| {
+                                    let ptr = cb as *const MtlCommandBuffer as usize;
+                                    pc.iter().any(|(c, _)| Retained::as_ptr(c) as usize == ptr)
+                                })
+                        };
+                        if need_flush {
+                            self.flush_pending_cbs_locked();
+                        }
                     }
-                    commit_cbs(&self.q, cbs, self.kind);
+                    let (had_existing, new_len) = {
+                        let mut pc = self.pending_cbs.lock().unwrap();
+                        let had = !pc.is_empty();
+                        pc.reserve(cbs.len());
+                        for (idx, &cb) in cbs.iter().enumerate() {
+                            let ak = alloc_keys.and_then(|ks| ks.get(idx).copied()).unwrap_or(0);
+                            pc.push((cb.retain(), ak));
+                        }
+                        self.has_pending_cbs.store(true, Ordering::Release);
+                        (had, pc.len())
+                    };
+                    GLOBAL_PENDING_CBS.fetch_add(cbs.len(), Ordering::AcqRel);
+                    if had_existing {
+                        super::encstats::inc(&super::encstats::c::submit_coalesced);
+                    }
                     self.commit_epoch.fetch_add(1, Ordering::AcqRel);
                     SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
                     let (next, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
                     self.timeline_state
                         .store(Self::pack_timeline_state(next, true), Ordering::Release);
+                    if eager_flush || new_len >= MAX_COALESCED_CBS {
+                        self.flush_pending_cbs_locked();
+                    }
                 }
                 let total_logs = if !logs.is_empty() {
                     let mut pl = self.pending_pass_logs.lock().unwrap();
@@ -643,8 +900,11 @@ impl Queue {
         let mut wait_sampled: Option<u8> = None;
         let mut stack_cbs: [std::mem::MaybeUninit<&MtlCommandBuffer>; STACK_CAP] =
             [const { std::mem::MaybeUninit::uninit() }; STACK_CAP];
+        let mut stack_aks: [usize; STACK_CAP] = [0; STACK_CAP];
         let mut stack_len = 0usize;
         let mut heap_cbs: Vec<&MtlCommandBuffer> = Vec::new();
+        let mut heap_aks: Vec<usize> = Vec::new();
+        let mut any_ml_work = false;
         let n_lists = lists.len();
         for (i, list) in lists.iter_mut().enumerate() {
             if list.is_open() {
@@ -669,13 +929,17 @@ impl Queue {
                 }
             }
             if list.has_commands() {
+                any_ml_work |= list.has_ml_work_recorded();
+                let ak = list.alloc_key();
                 let cb: &MtlCommandBuffer = &*list.cb;
                 if heap_cbs.is_empty() && stack_len < STACK_CAP {
                     stack_cbs[stack_len].write(cb);
+                    stack_aks[stack_len] = ak;
                     stack_len += 1;
                 } else {
                     if heap_cbs.is_empty() {
                         heap_cbs.reserve(n_lists);
+                        heap_aks.reserve(n_lists);
                         // SAFETY: `stack_cbs[..stack_len]` were initialized above.
                         let init = unsafe {
                             std::slice::from_raw_parts(
@@ -684,21 +948,29 @@ impl Queue {
                             )
                         };
                         heap_cbs.extend_from_slice(init);
+                        heap_aks.extend_from_slice(&stack_aks[..stack_len]);
                     }
                     heap_cbs.push(cb);
+                    heap_aks.push(ak);
                 }
             }
         }
-        let cbs: &[&MtlCommandBuffer] = if !heap_cbs.is_empty() {
-            &heap_cbs
+        let (cbs, aks): (&[&MtlCommandBuffer], &[usize]) = if !heap_cbs.is_empty() {
+            (&heap_cbs, &heap_aks)
         } else {
             // SAFETY: `stack_cbs[..stack_len]` were initialized above.
-            unsafe {
-                std::slice::from_raw_parts(stack_cbs.as_ptr() as *const &MtlCommandBuffer, stack_len)
-            }
+            (
+                unsafe {
+                    std::slice::from_raw_parts(
+                        stack_cbs.as_ptr() as *const &MtlCommandBuffer,
+                        stack_len,
+                    )
+                },
+                &stack_aks[..stack_len],
+            )
         };
         let submitted_cbs = cbs.len();
-        let timeline_value = self.submit_d3d_lists(cbs, pass_logs);
+        let timeline_value = self.submit_d3d_lists_inner(cbs, Some(aks), pass_logs, any_ml_work);
         ExecuteResult { submitted_cbs, timeline_value }
     }
 
@@ -724,7 +996,8 @@ impl Queue {
     /// signals onto `self.q` and return the timeline value guaranteed to be
     /// signaled once all submitted work completes on GPU.
     pub fn flush_timeline(&self) -> u64 {
-        if self.is_unsignaled()
+        if self.has_pending_cbs.load(Ordering::Acquire)
+            || self.is_unsignaled()
             || self.pending_log_count.load(Ordering::Acquire) > 0
             || self.has_deferred_signals.load(Ordering::Acquire)
         {
@@ -758,9 +1031,14 @@ impl Queue {
         } else {
             f.sig_value.fetch_max(v, O::AcqRel);
         }
+        let has_unmet_wait = {
+            let wt = f.wait_target.load(O::SeqCst);
+            wt != 0 && f.emitted_sig_value.load(O::Acquire) < wt
+        };
         if self.kind == ListType::Direct
             && !self.is_swapchain_internal
             && self.opt_fence_signal_coalesce.load(O::Relaxed)
+            && !has_unmet_wait
         {
             let ev_key = f.ev_key();
             let f_ptr = f as *const Fence as usize;
@@ -774,7 +1052,7 @@ impl Queue {
                 let max_v = existing.val;
                 drop(ds);
                 f.pending_sig_value.store(max_v, O::Release);
-                f.pending_sig_queue.store(me, O::Release);
+                f.pending_sig_queue.store(me, O::SeqCst);
             } else {
                 ds.push(DeferredFenceSig {
                     ev_key,
@@ -783,16 +1061,27 @@ impl Queue {
                     val: v,
                     enqueued_epoch: cur_epoch,
                 });
-                self.has_deferred_signals.store(true, O::Release);
+                self.set_has_deferred_signals(true);
                 drop(ds);
                 f.pending_sig_ns.store(now_ns, O::Release);
                 f.poll_epoch.store(cur_epoch, O::Release);
                 f.poll_count.store(0, O::Release);
                 f.pending_sig_value.store(v, O::Release);
-                f.pending_sig_queue.store(me, O::Release);
+                f.pending_sig_queue.store(me, O::SeqCst);
+            }
+            // Dekker `SeqCst` handshake with `Queue::wait_with`, `Fence::wait_cpu`,
+            // and `Fence::on_completion`: if a concurrent GPU or CPU waiter
+            // published `wait_target` while we were deferring, flush immediately so
+            // it can never deadlock even with `AW2_D3D_CS=0`.
+            let wt_after = f.wait_target.load(O::SeqCst);
+            if wt_after != 0 && f.emitted_sig_value.load(O::Acquire) < wt_after {
+                self.flush_fence_signals_locked();
             }
             return;
         }
+        self.flush_pending_cbs_locked();
+        self.flush_fence_signals_locked();
+        f.emitted_sig_value.fetch_max(v, O::AcqRel);
         self.q.signalEvent_value(ProtocolObject::from_ref(&*f.ev), v);
     }
 
@@ -809,11 +1098,21 @@ impl Queue {
     pub(crate) fn wait_with(&self, f: &Fence, v: u64, list_barrier_tight: bool) {
         use std::sync::atomic::Ordering as O;
         let me = self as *const Queue as usize;
+        let same_q_elided = !list_barrier_tight
+            && f.sig_queue.load(O::Acquire) == me
+            && f.sig_value.load(O::Acquire) >= v;
+        if !same_q_elided && f.completed_raw() < v {
+            // Publish the pending GPU wait before reading `pending_sig_queue`
+            // (Dekker `SeqCst` handshake with `Queue::signal`) so a producer
+            // signaling `f` concurrently or later flushes eagerly instead of
+            // deferring behind this wait (including when `AW2_D3D_CS=0`).
+            f.wait_target.fetch_max(v, O::SeqCst);
+        }
         // Cross-queue wait (or `AW2_LIST_BARRIER_TIGHT=1` same-queue event wait):
         // flush `sig_q`'s deferred fence signals BEFORE acquiring `self.submit` so we
         // never lock `sig_q.submit` inside `self.submit` and `f.ev` is guaranteed to be
         // signaled on `sig_q` prior to `self.q.waitForEvent_value(&f.ev, v)`.
-        let pending_q = f.pending_sig_queue.load(O::Acquire);
+        let pending_q = f.pending_sig_queue.load(O::SeqCst);
         if pending_q != 0
             && (pending_q != me || list_barrier_tight)
             && f.pending_sig_value.load(O::Acquire) >= v
@@ -837,6 +1136,8 @@ impl Queue {
         } else {
             3
         };
+        self.flush_pending_cbs_locked();
+        self.flush_fence_signals_locked();
         self.pending_wait.fetch_max(kind, O::Relaxed);
         self.q.waitForEvent_value(ProtocolObject::from_ref(&*f.ev), v);
     }
@@ -886,7 +1187,8 @@ impl Drop for Queue {
     fn drop(&mut self) {
         let addr = self as *const Queue as usize;
         active_queues().lock().unwrap().retain(|&p| p != addr);
-        if self.is_unsignaled()
+        if self.has_pending_cbs.load(Ordering::Acquire)
+            || self.is_unsignaled()
             || self.pending_log_count.load(Ordering::Acquire) > 0
             || self.has_deferred_signals.load(Ordering::Acquire)
         {
@@ -1113,8 +1415,10 @@ mod tests {
         if super::super::device().is_none() {
             return;
         }
-        if std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_none() {
-            assert!(!fence_signal_coalesce(), "AW2_FENCE_SIGNAL_COALESCE must default OFF");
+        if std::env::var_os("PORT_FENCE_SIGNAL_COALESCE").is_none()
+            && std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_none()
+        {
+            assert!(fence_signal_coalesce(), "PORT_FENCE_SIGNAL_COALESCE must default ON");
         }
         let _stats_guard = super::super::encstats::test_lock();
         let make_buf = |ty: u32| {
@@ -1320,6 +1624,384 @@ mod tests {
         q.wait_idle();
         let word = unsafe { *(rb.cpu_ptr().unwrap() as *const u32) };
         assert_eq!(word, 0x1357_2468);
+    }
+
+    #[test]
+    fn submit_d3d_lists_coalesces_adjacent_commits_and_preserves_fence_signal_wait_and_cb_reuse() {
+        use super::super::cmdlist::{Barrier, CommandAllocator, CommandList};
+        use super::super::resource::Resource;
+        use crate::types::{dim, heap_type, HeapProperties, ResourceDesc};
+
+        if super::super::device().is_none() {
+            return;
+        }
+        let _stats_guard = super::super::encstats::test_lock();
+        let make_buf = |ty: u32| {
+            let d = ResourceDesc {
+                Dimension: dim::BUFFER,
+                Width: 64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleCount: 1,
+                Layout: 1,
+                ..Default::default()
+            };
+            let hp = HeapProperties { Type: ty, ..Default::default() };
+            Resource::new_committed_default(&d, &hp, "submit coalesce cb test buf").unwrap()
+        };
+
+        let q = Queue::new(ListType::Direct, "submit coalesce cb test queue").unwrap();
+        q.set_submit_coalesce(true);
+        q.set_fence_signal_coalesce(false);
+
+        let up0 = make_buf(heap_type::UPLOAD);
+        let up1 = make_buf(heap_type::UPLOAD);
+        let mid0 = make_buf(heap_type::DEFAULT);
+        let mid1 = make_buf(heap_type::DEFAULT);
+        let rb0 = make_buf(heap_type::READBACK);
+        let rb1 = make_buf(heap_type::READBACK);
+        let rb_reuse = make_buf(heap_type::READBACK);
+        unsafe {
+            *(up0.cpu_ptr().unwrap() as *mut u32) = 0x1122_3344;
+            *(up1.cpu_ptr().unwrap() as *mut u32) = 0xDEAD_BEEF;
+        }
+
+        let a0 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a1 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a2 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a3 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a4 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a5 = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l0 = CommandList::new(ListType::Direct).unwrap();
+        let mut l1 = CommandList::new(ListType::Direct).unwrap();
+        let mut l2 = CommandList::new(ListType::Direct).unwrap();
+        let mut l3 = CommandList::new(ListType::Direct).unwrap();
+
+        l0.begin(&a0).unwrap();
+        l0.copy_buffer(&mid0, 0, &up0, 0, 16).unwrap();
+        l0.close().unwrap();
+
+        l1.begin(&a1).unwrap();
+        l1.barrier_list(&[Barrier::Transition(&mid0 as *const Resource as usize, 0x400, 0x800)]);
+        l1.copy_buffer(&mid1, 0, &mid0, 0, 16).unwrap();
+        l1.close().unwrap();
+
+        l2.begin(&a2).unwrap();
+        l2.barrier_list(&[Barrier::Transition(&mid1 as *const Resource as usize, 0x400, 0x800)]);
+        l2.copy_buffer(&rb0, 0, &mid1, 0, 16).unwrap();
+        l2.close().unwrap();
+
+        l3.begin(&a3).unwrap();
+        l3.copy_buffer(&rb1, 0, &up1, 0, 16).unwrap();
+        l3.close().unwrap();
+
+        // Snapshot commit counters so we can count exact Metal `commit_cbs` calls.
+        let calls0 = TEST_COMMIT_CALLS.load(Ordering::Relaxed);
+        let cbs0 = TEST_COMMIT_CBS.load(Ordering::Relaxed);
+
+        // 1) Three adjacent `submit_d3d_lists` calls buffer into `pending_cbs` with ZERO Metal commits yet.
+        assert_eq!(q.submit_d3d_lists(&[&l0.cb], Vec::new()), 0);
+        assert_eq!(q.submit_d3d_lists(&[&l1.cb], Vec::new()), 0);
+        assert_eq!(q.submit_d3d_lists(&[&l2.cb], Vec::new()), 0);
+        assert!(q.has_pending_cbs.load(Ordering::Acquire));
+        assert_eq!(q.pending_cbs.lock().unwrap().len(), 3);
+        assert_eq!(
+            TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls0,
+            0,
+            "adjacent submits must stay buffered until boundary"
+        );
+        assert_eq!(TEST_COMMIT_CBS.load(Ordering::Relaxed) - cbs0, 0);
+
+        // 2) `q.signal(&f, 1)` MUST flush all 3 buffered CBs in a SINGLE Metal commit BEFORE signaling.
+        let f = Fence::new(0).unwrap();
+        q.signal(&f, 1);
+        assert!(!q.has_pending_cbs.load(Ordering::Acquire));
+        assert_eq!(
+            TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls0,
+            1,
+            "3 adjacent submits must coalesce into 1 Metal commit"
+        );
+        assert_eq!(TEST_COMMIT_CBS.load(Ordering::Relaxed) - cbs0, 3);
+
+        // Wait on fence `f == 1` — `rb0` MUST already contain the result of `l0 -> l1 -> l2`.
+        f.wait_cpu(1, u64::MAX);
+        assert_eq!(unsafe { *(rb0.cpu_ptr().unwrap() as *const u32) }, 0x1122_3344);
+
+        // 3) Same-queue elided `wait_with(&f, 1, false)` preserves buffering, whereas
+        //    non-elided `wait_with(&f_ext, 1, false)` flushes BEFORE encoding `waitForEvent`.
+        assert_eq!(q.submit_d3d_lists(&[&l3.cb], Vec::new()), 0);
+        assert!(q.has_pending_cbs.load(Ordering::Acquire));
+        q.wait_with(&f, 1, false);
+        assert!(
+            q.has_pending_cbs.load(Ordering::Acquire),
+            "elided same-queue wait must not break submit coalescing"
+        );
+        let f_ext = Fence::new(1).unwrap();
+        q.wait_with(&f_ext, 1, false);
+        assert!(
+            !q.has_pending_cbs.load(Ordering::Acquire),
+            "non-elided fence wait must flush pending CBs before waiting"
+        );
+
+        // 4) Re-beginning a `CommandList` whose `cb` is still buffered in `pending_cbs`
+        //    MUST flush `pending_cbs` before `beginCommandBufferWithAllocator` (no Metal error).
+        l3.begin(&a4).unwrap();
+        l3.copy_buffer(&rb1, 0, &up1, 0, 16).unwrap();
+        l3.close().unwrap();
+        assert_eq!(q.submit_d3d_lists(&[&l3.cb], Vec::new()), 0);
+        assert!(q.has_pending_cbs.load(Ordering::Acquire));
+        l3.begin(&a5).unwrap();
+        assert!(
+            !q.has_pending_cbs.load(Ordering::Acquire),
+            "CommandList::begin on a buffered CB must flush pending_cbs first"
+        );
+        l3.copy_buffer(&rb_reuse, 0, &up1, 0, 16).unwrap();
+        l3.close().unwrap();
+        let _ = q.submit_d3d_lists(&[&l3.cb], Vec::new());
+        q.wait_idle();
+        assert_eq!(unsafe { *(rb1.cpu_ptr().unwrap() as *const u32) }, 0xDEAD_BEEF);
+        assert_eq!(unsafe { *(rb_reuse.cpu_ptr().unwrap() as *const u32) }, 0xDEAD_BEEF);
+
+        // 5) With `fence_signal_coalesce(true)` (default ON), interleaved
+        //    `submit_d3d_lists` + `signal` calls on `q` coalesce BOTH command buffers
+        //    and fence signals into ONE single Metal commit while preserving fence order.
+        q.set_fence_signal_coalesce(true);
+        let a6 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a7 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a8 = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l4 = CommandList::new(ListType::Direct).unwrap();
+        let mut l5 = CommandList::new(ListType::Direct).unwrap();
+        let mut l6 = CommandList::new(ListType::Direct).unwrap();
+        let rb_sig = make_buf(heap_type::READBACK);
+        let f_sig = Fence::new(0).unwrap();
+
+        l4.begin(&a6).unwrap();
+        l4.copy_buffer(&mid0, 0, &up1, 0, 16).unwrap();
+        l4.close().unwrap();
+        l5.begin(&a7).unwrap();
+        l5.barrier_list(&[Barrier::Transition(&mid0 as *const Resource as usize, 0x400, 0x800)]);
+        l5.copy_buffer(&rb_sig, 0, &mid0, 0, 16).unwrap();
+        l5.close().unwrap();
+
+        let calls_sig0 = TEST_COMMIT_CALLS.load(Ordering::Relaxed);
+        let cbs_sig0 = TEST_COMMIT_CBS.load(Ordering::Relaxed);
+        let tl_before = q.last_submitted();
+        assert_eq!(q.submit_d3d_lists(&[&l4.cb], Vec::new()), tl_before);
+        q.signal(&f_sig, 1);
+        assert_eq!(q.submit_d3d_lists(&[&l5.cb], Vec::new()), tl_before);
+        q.signal(&f_sig, 2);
+        assert!(q.has_pending_cbs.load(Ordering::Acquire));
+        assert!(q.has_deferred_signals.load(Ordering::Acquire));
+        assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_sig0, 0);
+
+        // CPU wait on `f_sig == 2` flushes both CBs in ONE Metal commit and signals `f_sig = 2`.
+        f_sig.wait_cpu(2, u64::MAX);
+        assert_eq!(
+            TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_sig0,
+            1,
+            "interleaved ECL+Signal pairs must coalesce into 1 Metal commit"
+        );
+        assert_eq!(TEST_COMMIT_CBS.load(Ordering::Relaxed) - cbs_sig0, 2);
+        assert_eq!(unsafe { *(rb_sig.cpu_ptr().unwrap() as *const u32) }, 0xDEAD_BEEF);
+
+        // 6) Resetting an unrelated free `CommandAllocator` MUST NOT flush `pending_cbs`,
+        //    whereas resetting the allocator backing a buffered CB MUST flush before `reset()`.
+        let a_free = CommandAllocator::new(ListType::Direct).unwrap();
+        let a_used = CommandAllocator::new(ListType::Direct).unwrap();
+        l6.begin(&a_used).unwrap();
+        l6.copy_buffer(&rb_sig, 0, &up0, 0, 16).unwrap();
+        l6.close().unwrap();
+        let calls_alloc0 = TEST_COMMIT_CALLS.load(Ordering::Relaxed);
+        let _ = q.execute_command_lists(&mut [&mut l6]);
+        assert!(q.has_pending_cbs.load(Ordering::Acquire));
+        a_free.reset();
+        assert!(
+            q.has_pending_cbs.load(Ordering::Acquire),
+            "resetting an unrelated allocator must preserve pending_cbs coalescing"
+        );
+        assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_alloc0, 0);
+        a_used.reset();
+        assert!(
+            !q.has_pending_cbs.load(Ordering::Acquire),
+            "resetting the backing allocator must flush pending_cbs first"
+        );
+        assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_alloc0, 1);
+        q.wait_idle();
+
+        // 7) A command list flagged with `has_ml_work` coalesces with prior buffered CBs
+        //    and flushes eagerly inside `execute_command_lists` instead of staying buffered.
+        l6.begin(&a8).unwrap();
+        l6.copy_buffer(&rb_sig, 0, &up0, 0, 16).unwrap();
+        l6.has_ml_work = true;
+        l6.close().unwrap();
+        let calls_ml0 = TEST_COMMIT_CALLS.load(Ordering::Relaxed);
+        let _ = q.execute_command_lists(&mut [&mut l6]);
+        assert!(
+            !q.has_pending_cbs.load(Ordering::Acquire),
+            "ML command list must flush eagerly on ExecuteCommandLists"
+        );
+        assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_ml0, 1);
+        q.wait_idle();
+        assert_eq!(unsafe { *(rb_sig.cpu_ptr().unwrap() as *const u32) }, 0x1122_3344);
+    }
+
+    /// Regression test for cross-queue waits enqueued BEFORE their producer signal
+    /// when fence-signal coalescing is ON and no CS worker thread is running
+    /// (`AW2_D3D_CS=0` inline mode):
+    /// `copy.Wait(f, v)` -> `copy.Signal(g, v)` -> `direct.Signal(f, v)` -> CPU wait / poll `g`.
+    #[test]
+    fn cross_queue_wait_before_signal_makes_progress_without_cs_thread_on_gpu() {
+        use super::super::cmdlist::{CommandAllocator, CommandList};
+        use super::super::resource::Resource;
+        use crate::types::{dim, heap_type, HeapProperties, ResourceDesc};
+        use std::sync::Arc;
+
+        if super::super::device().is_none() {
+            return;
+        }
+        let direct = Queue::new(ListType::Direct, "cross-q wait-before-sig direct").unwrap();
+        let copy = Queue::new(ListType::Copy, "cross-q wait-before-sig copy").unwrap();
+        direct.set_submit_coalesce(true);
+        direct.set_fence_signal_coalesce(true);
+
+        let f = Fence::new(0).unwrap();
+        let g = Fence::new(0).unwrap();
+
+        let make_buf = |ty: u32| -> Resource {
+            let d = ResourceDesc {
+                Dimension: dim::BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleCount: 1,
+                Layout: 1,
+                ..Default::default()
+            };
+            let hp = HeapProperties { Type: ty, ..Default::default() };
+            Resource::new_committed_default(&d, &hp, "cross-q wait-before-sig buf").unwrap()
+        };
+        let up = make_buf(heap_type::UPLOAD);
+        let rb = make_buf(heap_type::READBACK);
+        unsafe { *(up.cpu_ptr().unwrap() as *mut u32) = 0xCAFE_BABE };
+        let a = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l = CommandList::new(ListType::Direct).unwrap();
+        l.begin(&a).unwrap();
+        l.copy_buffer(&rb, 0, &up, 0, 16).unwrap();
+        l.close().unwrap();
+
+        // 1) CPU spin-poll on `g.completed()` after `copy.Wait(f, 1)` -> `copy.Signal(g, 1)`
+        //    -> `direct.Execute([l])` -> `direct.Signal(f, 1)`.
+        copy.wait_with(&f, 1, false);
+        copy.signal(&g, 1);
+        let _ = direct.execute_command_lists(&mut [&mut l]);
+        direct.signal(&f, 1);
+        assert!(
+            !direct.has_pending_cbs.load(Ordering::Acquire)
+                && !direct.has_deferred_signals.load(Ordering::Acquire),
+            "direct.signal(f, 1) must flush eagerly when copy already waits on f >= 1"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while g.completed() < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cross-queue wait-before-signal deadlocked on g.completed()"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(unsafe { *(rb.cpu_ptr().unwrap() as *const u32) }, 0xCAFE_BABE);
+
+        // 2) Blocking `g.wait_cpu(2, 5000)` on a wait-before-signal chain.
+        copy.wait_with(&f, 2, false);
+        copy.signal(&g, 2);
+        direct.signal(&f, 2);
+        assert!(
+            g.wait_cpu(2, 5000),
+            "cross-queue wait-before-signal deadlocked on g.wait_cpu(2)"
+        );
+
+        // 3) `g.on_completion(3, ...)` callback (`SetEventOnCompletion`) on a wait-before-signal chain.
+        copy.wait_with(&f, 3, false);
+        copy.signal(&g, 3);
+        direct.signal(&f, 3);
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_c = fired.clone();
+        g.on_completion(3, Box::new(move || fired_c.store(true, Ordering::Release)));
+        let deadline3 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline3,
+                "cross-queue wait-before-signal deadlocked on g.on_completion(3)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // 4) Once `f` has reached `wait_target` (3), subsequent signals without new
+        //    external waiters resume coalescing normally.
+        assert!(f.wait_cpu(3, 5000));
+        direct.signal(&f, 4);
+        direct.signal(&f, 5);
+        assert!(
+            direct.has_deferred_signals.load(Ordering::Acquire),
+            "fence signals must resume coalescing once prior wait_target is satisfied"
+        );
+        assert!(f.wait_cpu(5, 5000));
+
+        // 5) CPU `SetEventOnCompletion` (`on_completion`) registered BEFORE `direct.signal`
+        //    must publish `wait_target` so the subsequent signal flushes eagerly with no CS thread.
+        let fired6 = Arc::new(AtomicBool::new(false));
+        let fired6_c = fired6.clone();
+        f.on_completion(6, Box::new(move || fired6_c.store(true, Ordering::Release)));
+        direct.signal(&f, 6);
+        assert!(
+            !direct.has_deferred_signals.load(Ordering::Acquire),
+            "direct.signal(f, 6) must flush eagerly when on_completion(6) was registered first"
+        );
+        let deadline6 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired6.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline6,
+                "on_completion(6) registered before direct.signal(f, 6) deadlocked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // 6) Blocking `wait_cpu(7)` started on another thread BEFORE `direct.signal(f, 7)`
+        //    must also publish `wait_target` so `direct.signal(f, 7)` flushes eagerly.
+        let f_shared = Arc::new(Fence::new(0).unwrap());
+        let f_bg = f_shared.clone();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_bg = entered.clone();
+        let waiter = std::thread::spawn(move || {
+            entered_bg.store(true, Ordering::Release);
+            f_bg.wait_cpu(7, 5000)
+        });
+        // Wait until background thread has entered `wait_cpu` and published `wait_target = 7`.
+        let wait_pub = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !entered.load(Ordering::Acquire) || f_shared.wait_target.load(Ordering::Acquire) < 7 {
+            assert!(std::time::Instant::now() < wait_pub);
+            std::thread::yield_now();
+        }
+        direct.signal(&f_shared, 7);
+        assert!(
+            !direct.has_deferred_signals.load(Ordering::Acquire),
+            "direct.signal(f_shared, 7) must flush eagerly when wait_cpu(7) is already waiting"
+        );
+        // Once `emitted_sig_value` reaches `wait_target` (7), subsequent signals resume coalescing.
+        direct.signal(&f_shared, 8);
+        assert!(
+            direct.has_deferred_signals.load(Ordering::Acquire),
+            "subsequent signals must resume coalescing once waited value is emitted"
+        );
+        assert!(
+            waiter.join().unwrap(),
+            "background wait_cpu(7) registered before direct.signal(7) deadlocked"
+        );
+        assert!(f_shared.wait_cpu(8, 5000));
+
+        direct.wait_idle();
+        copy.wait_idle();
     }
 }
 

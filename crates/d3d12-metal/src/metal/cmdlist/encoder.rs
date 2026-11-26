@@ -977,10 +977,10 @@ impl CommandList {
     pub(super) fn is_blit_touch_nonfrag_safe(&self, touch: &[usize]) -> bool {
         !touch.is_empty()
             && touch.iter().all(|&r| {
-                if r == 0 || self.bar.blit_frag_tainted.contains(&r) {
+                if r == 0 || self.bar.is_blit_tainted(r) {
                     return false;
                 }
-                if self.bar.blit_safe_resources.contains(&r) {
+                if self.bar.is_blit_safe(r) {
                     return true;
                 }
                 let res = unsafe { &*(r as *const Resource) };
@@ -1628,8 +1628,8 @@ impl CommandList {
             && nonfrag_safe
         {
             for &r in touch {
-                if r != 0 && !self.bar.blit_safe_resources.contains(&r) {
-                    self.bar.blit_safe_resources.push(r);
+                if r != 0 {
+                    self.bar.mark_blit_safe(r);
                 }
             }
         }
