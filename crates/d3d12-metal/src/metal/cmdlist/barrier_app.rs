@@ -26,17 +26,12 @@ impl CommandList {
         render: bool,
         opening_pre_raster_reads: u8,
     ) {
-        if let Some(f) = self.pending_mfx_wait_fence.take() {
-            let wait_stages = if render {
-                PRE_RASTER | MTLStages::Fragment
-            } else {
-                COMPUTE_STAGES
-            };
-            enc.waitForFence_beforeEncoderStages(&f, wait_stages);
-            enc.barrierAfterStages_beforeQueueStages_visibilityOptions(
-                wait_stages,
-                MTLStages::All,
-                MTL4VisibilityOptions::Device,
+        if self.pending_mfx_wait_fence.is_some() {
+            self.consume_pending_mfx_fence_on_enc_open(
+                enc,
+                render,
+                self.bar.needs_barrier,
+                opening_pre_raster_reads,
             );
         }
         let clear_cap = if render {
@@ -1393,6 +1388,14 @@ impl CommandList {
         op_touch: Option<&[usize]>,
         exact: Option<DispatchExact<'_>>,
     ) {
+        if self.pending_mfx_wait_fence.is_some() {
+            let mfx_cs = if !(op_stage & COMPUTE_STAGES).is_empty() {
+                op_stage & COMPUTE_STAGES
+            } else {
+                COMPUTE_STAGES
+            };
+            self.wait_pending_mfx_fence(ProtocolObject::from_ref(e), mfx_cs);
+        }
         if full {
             self.bar.cs_mid_v3_items.clear();
             self.bar.cs_mid_v3_poisoned = [false; 3];

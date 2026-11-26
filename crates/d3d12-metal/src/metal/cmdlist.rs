@@ -188,6 +188,13 @@ pub struct CommandList {
     /// Deferred post-MetalFX fence wait folded into the next encoder's `begin_barrier`
     /// (or flushed in `close()` if MetalFX was the last operation on the command buffer).
     pending_mfx_wait_fence: Option<Retained<ProtocolObject<dyn MTLFence>>>,
+    /// Consumer stages on the open/next encoder that still need to wait on `pending_mfx_wait_fence`.
+    pending_mfx_wait_stages: MTLStages,
+    /// Producer stages of the MetalFX pass awaiting device-memory visibility.
+    pending_mfx_after: MTLStages,
+    /// True once the first post-MetalFX encoder has emitted a stage-scoped
+    /// producer barrier releasing the MetalFX fence to all subsequent encoders.
+    pending_mfx_cross_enc_released: bool,
     rt_keep: Option<Arc<Mutex<Vec<crate::rt::accel::Retired>>>>,
     /// Per-encoder GPU timestamps of this recording (`PORT_PASS_TIMING`), lazily acquired on first `pt_open`.
     pt: Option<pt::PassLog>,
@@ -242,6 +249,9 @@ impl CommandList {
             util_table: None,
             mfx_fence: None,
             pending_mfx_wait_fence: None,
+            pending_mfx_wait_stages: MTLStages::empty(),
+            pending_mfx_after: MTLStages::empty(),
+            pending_mfx_cross_enc_released: false,
             rt_keep: None,
             pt: None,
             pt_armed: false,
@@ -330,6 +340,9 @@ impl CommandList {
         self.binds.cs_bind_cache.valid = false;
         self.binds.gfx_bind_cache.valid = false;
         self.pending_mfx_wait_fence = None;
+        self.pending_mfx_wait_stages = MTLStages::empty();
+        self.pending_mfx_after = MTLStages::empty();
+        self.pending_mfx_cross_enc_released = false;
         self.compute_root = RootState::default();
         self.gfx_root = RootState::default();
         self.compute_root.dedup = self.opts.opt_fast_enc_state;
@@ -380,7 +393,7 @@ impl CommandList {
             return Err("command list is not open".into());
         }
         let flushed = self.flush_clears(&stats::c::cf_close, |_| true);
-        self.flush_pending_mfx_wait_fence();
+        self.flush_pending_mfx_wait_fence_on_close();
         if self.list_barrier_tight_active() {
             self.emit_close_producer_barriers();
         } else if !opts::legacy_barriers()

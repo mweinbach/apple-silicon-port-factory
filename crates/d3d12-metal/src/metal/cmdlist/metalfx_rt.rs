@@ -1,7 +1,7 @@
 //! MetalFX spatial & temporal upscaling and DXR raytracing commands.
 
 use super::opts::{barrier_masks, barrier_tight_stages, legacy_barriers};
-use super::state::{Encoder, FullWhy, StageSync, COMPUTE_STAGES, PRE_RASTER};
+use super::state::{Encoder, FullWhy, StageSync, COMPUTE_STAGES, PRE_RASTER, STAGE_BITS};
 use super::CommandList;
 use crate::metal::binding::MtlArgumentTable;
 use crate::metal::encstats as stats;
@@ -13,11 +13,139 @@ use objc2::Message;
 use objc2_metal::*;
 use std::sync::Arc;
 
-const UTIL_STAGES: MTLStages = PRE_RASTER
+pub(super) const UTIL_STAGES: MTLStages = PRE_RASTER
     .union(MTLStages::Fragment)
     .union(MTLStages::Dispatch)
     .union(MTLStages::Blit)
     .union(MTLStages::AccelerationStructure);
+
+/// Compute/ML stages executed internally by an opaque `MTL4FX*Scaler` pass.
+pub(crate) const MFX_COMPUTE_ML_STAGES: MTLStages = MTLStages::Dispatch
+    .union(MTLStages::Blit)
+    .union(MTLStages::MachineLearning);
+
+/// Producer stages of an opaque `MTL4FX*Scaler` pass keyed off the hardware
+/// output texture usage requirements (never off pass indices).
+#[inline]
+pub(crate) fn metalfx_producer_stages(output_usage: MTLTextureUsage) -> MTLStages {
+    if output_usage.contains(MTLTextureUsage::RenderTarget) {
+        MFX_COMPUTE_ML_STAGES | MTLStages::Fragment
+    } else {
+        MFX_COMPUTE_ML_STAGES
+    }
+}
+
+/// Consumer stages of an opaque `MTL4FX*Scaler` pass keyed off its output usage
+/// (when a scaler renders into an RT output, its internal fragment pass samples
+/// the input textures in `Fragment`; otherwise inputs are read in compute/ML/blit).
+#[inline]
+pub(crate) fn metalfx_consumer_stages(output_usage: MTLTextureUsage) -> MTLStages {
+    metalfx_producer_stages(output_usage)
+}
+
+/// Pre-MetalFX producer barrier `(after_stages, before_queue_stages)` emitted
+/// on the fence-updating encoder before an opaque `MTL4FX*Scaler` pass.
+#[inline]
+pub(crate) fn metalfx_pre_producer_barrier(
+    fence_stage: MTLStages,
+    output_usage: MTLTextureUsage,
+    has_fence: bool,
+    tight_stages: bool,
+    legacy: bool,
+    masks: bool,
+) -> (MTLStages, MTLStages) {
+    if tight_stages && !legacy && masks && has_fence {
+        (fence_stage, metalfx_consumer_stages(output_usage))
+    } else {
+        (MTLStages::All, MTLStages::All)
+    }
+}
+
+/// Post-MetalFX synchronization policy for the encoder(s) following an opaque
+/// `MTL4FX*Scaler` pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MetalFxPostSync {
+    /// Stage-scoped synchronization: wait on `MTLFence` per consumer stage plus
+    /// `after -> hard_before` queue barriers for device cache visibility (and an
+    /// optional per-resource soft `PRE_RASTER` obligation on the upscaled output).
+    Scoped {
+        after: MTLStages,
+        hard_before: MTLStages,
+        soft_pre_raster: bool,
+    },
+    /// Conservative full barrier (`FullWhy::ClearUav` -> `All -> All`) when
+    /// legacy barriers are enabled, masks are disabled, or the scaler does not
+    /// expose `setFence:`.
+    FullFallback,
+}
+
+/// Compute the post-MetalFX sync policy from scaler capabilities and barrier mode.
+#[inline]
+pub(crate) fn metalfx_post_sync_policy(
+    output_usage: MTLTextureUsage,
+    has_fence: bool,
+    has_scratch_blit: bool,
+    tight_stages: bool,
+    legacy: bool,
+    masks: bool,
+) -> MetalFxPostSync {
+    if !tight_stages || legacy || !masks || !has_fence {
+        return MetalFxPostSync::FullFallback;
+    }
+    let after = metalfx_producer_stages(output_usage);
+    if has_scratch_blit {
+        MetalFxPostSync::Scoped {
+            after,
+            hard_before: MTLStages::Blit,
+            soft_pre_raster: false,
+        }
+    } else {
+        MetalFxPostSync::Scoped {
+            after,
+            hard_before: MTLStages::Fragment | COMPUTE_STAGES,
+            soft_pre_raster: true,
+        }
+    }
+}
+
+/// Compute which encoder stages should wait on `pending_mfx_wait_fence` when
+/// opening a render or compute encoder.
+#[inline]
+pub(crate) fn metalfx_enc_fence_wait_stages(
+    pending_stages: MTLStages,
+    render: bool,
+    full: bool,
+    opening_pre_raster_reads: u8,
+    split_compute_exact: bool,
+    opening_compute_stage: MTLStages,
+) -> MTLStages {
+    if render {
+        let want = if full || opening_pre_raster_reads != 0 {
+            PRE_RASTER | MTLStages::Fragment
+        } else {
+            MTLStages::Fragment
+        };
+        if full {
+            want
+        } else {
+            pending_stages & want
+        }
+    } else {
+        let want = if !full
+            && split_compute_exact
+            && !(opening_compute_stage & COMPUTE_STAGES).is_empty()
+        {
+            opening_compute_stage & COMPUTE_STAGES
+        } else {
+            COMPUTE_STAGES
+        };
+        if full {
+            want
+        } else {
+            pending_stages & want
+        }
+    }
+}
 
 impl CommandList {
     /// 2D temporal upscale using Apple MetalFX (`MTL4FXTemporalScaler`) when
@@ -425,8 +553,9 @@ impl CommandList {
             if touch[0] != 0 && !self.bar.written.contains(&touch[0]) {
                 self.bar.written.push(touch[0]);
             }
-            // Keep `self.bar.needs_barrier == true` (armed by `finish_opaque_metalfx_pass`)
-            // so the next encoder unconditionally waits on `MTLStages::All`.
+            // Post-pass synchronization (stage-scoped fence + queue barrier, or
+            // conservative `FullWhy::ClearUav` fallback) was armed by
+            // `finish_opaque_metalfx_pass`.
         }
         Ok(())
     }
@@ -772,8 +901,13 @@ impl CommandList {
                 tight_stages,
             )?;
         }
-        let mfx_fence = self.sync_queue_before_metalfx();
+        let output_usage = scaler.output_usage;
+        let has_fence = scaler.has_fence();
+        let has_scratch_blit = scratch.is_some();
+        let (mfx_fence, pre_sync, was_full) =
+            self.sync_queue_before_metalfx(output_usage, has_fence, tight_stages);
         let used_fence = params.fence.or(mfx_fence.as_deref());
+        let effective_has_fence = has_fence && used_fence.is_some();
 
         let mfx_dst: &MtlTexture = scratch.as_deref().unwrap_or(dv);
         let inputs = crate::metal::metalfx::TemporalEncodeInputs {
@@ -795,7 +929,16 @@ impl CommandList {
         scaler.encode(&self.cb, &inputs);
         self.has_ml_work = true;
         drop(scaler);
-        self.finish_opaque_metalfx_pass(used_fence);
+        self.finish_opaque_metalfx_pass(
+            used_fence,
+            output_usage,
+            effective_has_fence,
+            has_scratch_blit,
+            touch[0],
+            pre_sync,
+            was_full,
+            tight_stages,
+        );
 
         self.finish_metalfx_output_blit(
             scratch,
@@ -810,27 +953,49 @@ impl CommandList {
         Ok(true)
     }
 
-    /// Emit a full Metal 4 queue consumer barrier + `MTLFence` update + producer barrier
-    /// before an opaque `MTL4FX*Scaler` pass.
-    fn sync_queue_before_metalfx(&mut self) -> Option<Retained<ProtocolObject<dyn MTLFence>>> {
+    /// Emit Metal 4 queue consumer barrier + `MTLFence` update + stage-scoped
+    /// producer barrier before an opaque `MTL4FX*Scaler` pass.
+    fn sync_queue_before_metalfx(
+        &mut self,
+        output_usage: MTLTextureUsage,
+        has_fence: bool,
+        tight_stages: bool,
+    ) -> (Option<Retained<ProtocolObject<dyn MTLFence>>>, StageSync, bool) {
         if !self.icb.icb_segs.is_empty() {
             self.flush_draw_batch(false);
         }
         if self.mfx_fence.is_none() {
             self.mfx_fence = crate::metal::device().and_then(|d| d.dev.newFence());
         }
+        let legacy = legacy_barriers();
+        let masks = barrier_masks();
+        let masked = tight_stages && !legacy && masks;
+        let effective_has_fence = has_fence && self.mfx_fence.is_some();
+        let was_full = self.bar.needs_barrier;
+        let need_all_before =
+            !masked || was_full || self.bar.list_unwaited_cs || self.bar.list_unwaited_gfx;
         let pending_wait = self.pending_mfx_wait_fence.take();
+        self.pending_mfx_wait_stages = MTLStages::empty();
+
         match &self.enc {
             Encoder::Compute(e) => {
                 let e = e.clone();
                 if let Some(wf) = pending_wait {
                     e.waitForFence_beforeEncoderStages(&wf, MTLStages::Dispatch);
                 }
-                e.barrierAfterQueueStages_beforeStages_visibilityOptions(
-                    MTLStages::All,
-                    MTLStages::Dispatch,
-                    MTL4VisibilityOptions::Device,
-                );
+                let pre_after = if need_all_before {
+                    MTLStages::All
+                } else {
+                    self.unsatisfied_enc_after_for(UTIL_STAGES, MTLStages::Dispatch, true)
+                };
+                if !pre_after.is_empty() {
+                    e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                        pre_after,
+                        MTLStages::Dispatch,
+                        MTL4VisibilityOptions::Device,
+                    );
+                    self.record_enc_queue_sync(pre_after, MTLStages::Dispatch);
+                }
                 e.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                     COMPUTE_STAGES,
                     MTLStages::Dispatch,
@@ -839,9 +1004,18 @@ impl CommandList {
                 if let Some(f) = &self.mfx_fence {
                     e.updateFence_afterEncoderStages(f, MTLStages::Dispatch);
                 }
+                self.note_stage_ran(MTLStages::Dispatch);
+                let (prod_after, prod_before) = metalfx_pre_producer_barrier(
+                    MTLStages::Dispatch,
+                    output_usage,
+                    effective_has_fence,
+                    tight_stages,
+                    legacy,
+                    masks,
+                );
                 e.barrierAfterStages_beforeQueueStages_visibilityOptions(
-                    MTLStages::All,
-                    MTLStages::All,
+                    prod_after,
+                    prod_before,
                     MTL4VisibilityOptions::Device,
                 );
                 self.end_encoder();
@@ -851,17 +1025,41 @@ impl CommandList {
                 if let Some(wf) = pending_wait {
                     e.waitForFence_beforeEncoderStages(&wf, MTLStages::Fragment);
                 }
-                e.barrierAfterQueueStages_beforeStages_visibilityOptions(
-                    MTLStages::All,
-                    MTLStages::Fragment,
-                    MTL4VisibilityOptions::Device,
-                );
+                let pre_after = if need_all_before {
+                    MTLStages::All
+                } else {
+                    self.unsatisfied_enc_after_for(UTIL_STAGES, MTLStages::Fragment, true)
+                };
+                if !pre_after.is_empty() {
+                    e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                        pre_after,
+                        MTLStages::Fragment,
+                        MTL4VisibilityOptions::Device,
+                    );
+                    self.record_enc_queue_sync(pre_after, MTLStages::Fragment);
+                }
+                if self.gfx.pass_uav {
+                    e.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                        PRE_RASTER,
+                        MTLStages::Fragment,
+                        MTL4VisibilityOptions::Device,
+                    );
+                }
                 if let Some(f) = &self.mfx_fence {
                     e.updateFence_afterEncoderStages(f, MTLStages::Fragment);
                 }
+                self.note_stage_ran(MTLStages::Fragment);
+                let (prod_after, prod_before) = metalfx_pre_producer_barrier(
+                    MTLStages::Fragment,
+                    output_usage,
+                    effective_has_fence,
+                    tight_stages,
+                    legacy,
+                    masks,
+                );
                 e.barrierAfterStages_beforeQueueStages_visibilityOptions(
-                    MTLStages::All,
-                    MTLStages::All,
+                    prod_after,
+                    prod_before,
                     MTL4VisibilityOptions::Device,
                 );
                 self.end_encoder();
@@ -871,34 +1069,193 @@ impl CommandList {
                     if let Some(wf) = pending_wait {
                         e.waitForFence_beforeEncoderStages(&wf, MTLStages::Dispatch);
                     }
+                    let pre_after = if need_all_before {
+                        MTLStages::All
+                    } else {
+                        UTIL_STAGES
+                    };
                     e.barrierAfterQueueStages_beforeStages_visibilityOptions(
-                        MTLStages::All,
+                        pre_after,
                         MTLStages::Dispatch,
                         MTL4VisibilityOptions::Device,
                     );
                     if let Some(f) = &self.mfx_fence {
                         e.updateFence_afterEncoderStages(f, MTLStages::Dispatch);
                     }
+                    let (prod_after, prod_before) = metalfx_pre_producer_barrier(
+                        MTLStages::Dispatch,
+                        output_usage,
+                        effective_has_fence,
+                        tight_stages,
+                        legacy,
+                        masks,
+                    );
                     e.barrierAfterStages_beforeQueueStages_visibilityOptions(
-                        MTLStages::All,
-                        MTLStages::All,
+                        prod_after,
+                        prod_before,
                         MTL4VisibilityOptions::Device,
                     );
                     e.endEncoding();
                 }
             }
         }
-        self.mfx_fence.clone()
+        let pre_sync = self.sync_from_after(if need_all_before {
+            MTLStages::All
+        } else {
+            UTIL_STAGES
+        });
+        (self.mfx_fence.clone(), pre_sync, was_full)
+    }
+
+    /// Wait on `pending_mfx_wait_fence` for the subset of `stages` that has not
+    /// yet synchronized with the post-MetalFX fence, clearing those stage bits.
+    #[inline]
+    pub(super) fn wait_pending_mfx_fence(
+        &mut self,
+        enc: &ProtocolObject<dyn MTL4CommandEncoder>,
+        stages: MTLStages,
+    ) -> MTLStages {
+        let wait = self.pending_mfx_wait_stages & stages;
+        if wait.is_empty() {
+            return MTLStages::empty();
+        }
+        if let Some(f) = self.pending_mfx_wait_fence.clone() {
+            enc.waitForFence_beforeEncoderStages(&f, wait);
+            self.pending_mfx_wait_stages -= wait;
+            if self.pending_mfx_wait_stages.is_empty() {
+                self.pending_mfx_wait_fence = None;
+                self.pending_mfx_after = MTLStages::empty();
+            }
+            wait
+        } else {
+            self.pending_mfx_wait_stages = MTLStages::empty();
+            self.pending_mfx_after = MTLStages::empty();
+            MTLStages::empty()
+        }
+    }
+
+    /// Consume `pending_mfx_wait_fence` at the start of the first post-MetalFX
+    /// encoder (`begin_barrier`).
+    ///
+    /// In stage-scoped mode (`!full_mfx`), the encoder waits on the fence only
+    /// for the stages that actually read MetalFX output on opening (e.g.
+    /// `Fragment` on a render pass without pre-raster reads, letting `PRE_RASTER`
+    /// overlap with MetalFX), then emits a single stage-scoped producer barrier
+    /// `wait_stages -> UTIL_STAGES` so every subsequent encoder (and subsequent
+    /// command buffer) is transitively ordered after MetalFX without extra
+    /// per-encoder fence waits or close-time barriers. Any unwaited intra-encoder
+    /// stages (such as `PRE_RASTER` on the same render encoder) keep the fence
+    /// only until `end_encoder()`.
+    pub(super) fn consume_pending_mfx_fence_on_enc_open(
+        &mut self,
+        enc: &ProtocolObject<dyn MTL4CommandEncoder>,
+        render: bool,
+        full_mfx: bool,
+        opening_pre_raster_reads: u8,
+    ) {
+        let wait_stages = metalfx_enc_fence_wait_stages(
+            self.pending_mfx_wait_stages,
+            render,
+            full_mfx,
+            opening_pre_raster_reads,
+            self.split_compute_exact_active(),
+            self.bar.opening_compute_stage,
+        );
+        if full_mfx {
+            if let Some(f) = self.pending_mfx_wait_fence.take() {
+                self.pending_mfx_wait_stages = MTLStages::empty();
+                self.pending_mfx_after = MTLStages::empty();
+                self.pending_mfx_cross_enc_released = false;
+                enc.waitForFence_beforeEncoderStages(&f, wait_stages);
+                enc.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                    wait_stages,
+                    MTLStages::All,
+                    MTL4VisibilityOptions::Device,
+                );
+            }
+            return;
+        }
+        if wait_stages.is_empty() {
+            return;
+        }
+        if let Some(f) = self.pending_mfx_wait_fence.clone() {
+            enc.waitForFence_beforeEncoderStages(&f, wait_stages);
+            enc.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                wait_stages,
+                UTIL_STAGES,
+                MTL4VisibilityOptions::Device,
+            );
+            self.pending_mfx_cross_enc_released = true;
+            let same_enc_stages = if render {
+                PRE_RASTER | MTLStages::Fragment
+            } else {
+                COMPUTE_STAGES
+            };
+            self.pending_mfx_wait_stages = (self.pending_mfx_wait_stages - wait_stages) & same_enc_stages;
+            if self.pending_mfx_wait_stages.is_empty() {
+                self.pending_mfx_wait_fence = None;
+                self.pending_mfx_after = MTLStages::empty();
+            }
+        }
+    }
+
+    /// Once the first post-MetalFX encoder closes, its `barrierAfterStages`
+    /// producer barrier (`wait_stages -> UTIL_STAGES`) has transitively ordered
+    /// and made visible MetalFX's writes for all subsequent encoders. Clear any
+    /// remaining intra-encoder fence state and strip `MTLStages::MachineLearning`
+    /// (which is outside 7-bit `STAGE_BITS` tracking) so it does not linger into
+    /// unrelated later passes.
+    pub(super) fn finish_mfx_fence_on_encoder_end(&mut self) {
+        if !self.pending_mfx_cross_enc_released {
+            return;
+        }
+        self.pending_mfx_cross_enc_released = false;
+        self.pending_mfx_wait_fence = None;
+        self.pending_mfx_wait_stages = MTLStages::empty();
+        self.pending_mfx_after = MTLStages::empty();
+        let ml = MTLStages::MachineLearning;
+        self.bar.pend_after -= ml;
+        self.bar.split_pend.vtx_after -= ml;
+        self.bar.split_pend.frag_after -= ml;
+        self.bar.split_pend.disp_after -= ml;
+        self.bar.split_pend.blit_after -= ml;
+        self.bar.split_pend.as_after -= ml;
+        for i in 0..2 {
+            self.bar.split_pend.soft_after[i] -= ml;
+            if let Some((a, b)) = self.bar.vtx_carry[i] {
+                let na = a - ml;
+                self.bar.vtx_carry[i] = if na.is_empty() { None } else { Some((na, b)) };
+            }
+            self.bar.vtx_carry_items[i].retain_mut(|it| {
+                it.after -= ml;
+                !it.after.is_empty()
+            });
+        }
     }
 
     /// Flush any deferred post-MetalFX fence wait into a minimal fallback compute encoder.
     pub(super) fn flush_pending_mfx_wait_fence(&mut self) {
         if let Some(f) = self.pending_mfx_wait_fence.take() {
+            let after = std::mem::replace(&mut self.pending_mfx_after, MTLStages::empty());
+            self.pending_mfx_wait_stages = MTLStages::empty();
+            self.pending_mfx_cross_enc_released = false;
+            let scoped = !after.is_empty()
+                && after != MTLStages::All
+                && !legacy_barriers()
+                && barrier_masks();
+            let before_q = if scoped { UTIL_STAGES } else { MTLStages::All };
             if let Some(e) = self.cb.computeCommandEncoder() {
                 e.waitForFence_beforeEncoderStages(&f, MTLStages::Dispatch);
+                if scoped {
+                    e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                        after,
+                        MTLStages::Dispatch,
+                        MTL4VisibilityOptions::Device,
+                    );
+                }
                 e.barrierAfterStages_beforeQueueStages_visibilityOptions(
                     MTLStages::Dispatch,
-                    MTLStages::All,
+                    before_q,
                     MTL4VisibilityOptions::Device,
                 );
                 e.endEncoding();
@@ -906,28 +1263,118 @@ impl CommandList {
         }
     }
 
-    /// Record that an opaque `MTL4FX*Scaler` pass ran directly on `self.cb`.
-    fn finish_opaque_metalfx_pass(&mut self, fence: Option<&ProtocolObject<dyn MTLFence>>) {
-        self.pending_mfx_wait_fence = fence.map(|f| f.retain());
-        self.bar.has_gpu_work = true;
-        self.bar.stage_sync = [StageSync::default(); 7];
-        for g in &mut self.bar.stage_gen {
-            *g = g.wrapping_add(1);
+    /// Flush any unwaited post-MetalFX fence on `CommandList::close()`.
+    /// When an encoder already opened after MetalFX and emitted its stage-scoped
+    /// `barrierAfterStages(wait_stages, UTIL_STAGES, Device)` producer barrier,
+    /// no extra close-time barrier or fallback compute encoder is needed.
+    pub(super) fn flush_pending_mfx_wait_fence_on_close(&mut self) {
+        if self.pending_mfx_wait_fence.is_none() || self.pending_mfx_cross_enc_released {
+            return;
         }
+        self.flush_pending_mfx_wait_fence();
+    }
+
+    /// Record that an opaque `MTL4FX*Scaler` pass ran directly on `self.cb`,
+    /// arming stage-scoped post-pass synchronization (or a conservative full
+    /// barrier fallback when legacy barriers / no fence apply).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_opaque_metalfx_pass(
+        &mut self,
+        fence: Option<&ProtocolObject<dyn MTLFence>>,
+        output_usage: MTLTextureUsage,
+        has_fence: bool,
+        has_scratch_blit: bool,
+        dst_res: usize,
+        pre_sync: StageSync,
+        was_full: bool,
+        tight_stages: bool,
+    ) {
+        self.bar.has_gpu_work = true;
         self.bar.uav_passthrough.clear();
         self.bar.cs_disp_passthrough.clear();
-        self.need_full(FullWhy::ClearUav);
+        let policy = metalfx_post_sync_policy(
+            output_usage,
+            has_fence,
+            has_scratch_blit,
+            tight_stages,
+            legacy_barriers(),
+            barrier_masks(),
+        );
+        match policy {
+            MetalFxPostSync::Scoped {
+                after,
+                hard_before,
+                soft_pre_raster,
+            } => {
+                self.pending_mfx_wait_fence = fence.map(|f| f.retain());
+                self.pending_mfx_wait_stages = if has_scratch_blit {
+                    MTLStages::Blit
+                } else {
+                    UTIL_STAGES
+                };
+                self.pending_mfx_after = after;
+                self.pending_mfx_cross_enc_released = false;
+                for (i, &bit) in STAGE_BITS.iter().enumerate() {
+                    if after.contains(bit) {
+                        self.bar.stage_sync[i] = pre_sync;
+                        self.bar.stage_gen[i] = self.bar.stage_gen[i].wrapping_add(1);
+                    }
+                }
+                if after.contains(MTLStages::Dispatch) {
+                    self.bar.cs_disp_gen = self.bar.cs_disp_gen.wrapping_add(1);
+                }
+                if was_full {
+                    self.bar.needs_barrier = false;
+                    self.bar.list_unwaited_cs = false;
+                    self.bar.list_unwaited_gfx = false;
+                }
+                if soft_pre_raster && !was_full && dst_res != 0 {
+                    self.add_pend_with_soft_res(after, hard_before, &[dst_res]);
+                } else {
+                    let before = if soft_pre_raster {
+                        hard_before | PRE_RASTER
+                    } else {
+                        hard_before
+                    };
+                    self.add_pend(after, before);
+                }
+                if !has_scratch_blit {
+                    stats::inc(&stats::c::qb_upscale_masked);
+                }
+            }
+            MetalFxPostSync::FullFallback => {
+                self.pending_mfx_wait_fence = fence.map(|f| f.retain());
+                self.pending_mfx_wait_stages = UTIL_STAGES;
+                self.pending_mfx_after = MTLStages::All;
+                self.pending_mfx_cross_enc_released = false;
+                self.bar.stage_sync = [StageSync::default(); 7];
+                for g in &mut self.bar.stage_gen {
+                    *g = g.wrapping_add(1);
+                }
+                self.need_full(FullWhy::ClearUav);
+            }
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn metalfx_post_sync_clean(&self) -> bool {
-        self.bar.needs_barrier
-            && self.bar.full_why == FullWhy::ClearUav
-            && self
-                .bar
-                .stage_sync
-                .iter()
-                .all(|s| !s.pre_list_all && s.gen == [0; 7])
+        if self.bar.needs_barrier {
+            // Conservative fallback mode (`FullWhy::ClearUav`).
+            self.bar.full_why == FullWhy::ClearUav
+                && self
+                    .bar
+                    .stage_sync
+                    .iter()
+                    .all(|s| !s.pre_list_all && s.gen == [0; 7])
+        } else {
+            // Stage-scoped mode: fence armed for consumer stages and `MachineLearning`
+            // producer stage queued in `split_pend` without escalating to `FullWhy::ClearUav`.
+            self.pending_mfx_wait_fence.is_some()
+                && !self.pending_mfx_wait_stages.is_empty()
+                && self.bar.split_pend.frag_after.contains(MTLStages::MachineLearning)
+                && self.bar.split_pend.disp_after.contains(MTLStages::MachineLearning)
+                && self.bar.split_pend.blit_after.contains(MTLStages::MachineLearning)
+        }
     }
 
     /// 2D upscale from `src` (`render_size`) into `dst` (`upscale_size`), using
@@ -1420,13 +1867,27 @@ impl CommandList {
         } else {
             None
         };
-        let mfx_fence = self.sync_queue_before_metalfx();
+        let output_usage = scaler.output_usage;
+        let has_fence = scaler.has_fence();
+        let has_scratch_blit = scratch.is_some();
+        let (mfx_fence, pre_sync, was_full) =
+            self.sync_queue_before_metalfx(output_usage, has_fence, tight_stages);
+        let effective_has_fence = has_fence && mfx_fence.is_some();
 
         let mfx_src: &MtlTexture = staged_src.as_deref().unwrap_or(sv);
         let mfx_dst: &MtlTexture = scratch.as_deref().unwrap_or(dv);
         scaler.encode(&self.cb, mfx_src, mfx_dst, x0, y0, mfx_fence.as_deref());
         drop(scaler);
-        self.finish_opaque_metalfx_pass(mfx_fence.as_deref());
+        self.finish_opaque_metalfx_pass(
+            mfx_fence.as_deref(),
+            output_usage,
+            effective_has_fence,
+            has_scratch_blit,
+            touch[0],
+            pre_sync,
+            was_full,
+            tight_stages,
+        );
 
         self.finish_metalfx_output_blit(
             scratch,
@@ -1579,5 +2040,419 @@ impl CommandList {
         );
         self.note_stage_ran(MTLStages::Dispatch);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::PlacedFootprint;
+    use crate::metal::cmdlist::{CommandAllocator, CopyLoc, TargetView};
+    use crate::metal::metalfx::{is_temporal_enabled, TemporalUpscaleParams, UpscaleBackend};
+    use crate::metal::queue::{ListType, Queue};
+    use crate::types::{dim, heap_type, resource_flags, HeapProperties, ResourceDesc};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    const RGBA16_FLOAT: u32 = 10;
+    const RG16_FLOAT: u32 = 34;
+    const D32_FLOAT: u32 = 40;
+
+    fn make_tex(w: u32, h: u32, fmt: u32, flags: u32, label: &str) -> Resource {
+        let desc = ResourceDesc {
+            Dimension: dim::TEXTURE2D,
+            Width: w as u64,
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: fmt,
+            SampleCount: 1,
+            Flags: flags,
+            ..Default::default()
+        };
+        let hp = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+        Resource::new_committed_default(&desc, &hp, label).unwrap()
+    }
+
+    fn make_readback(bytes: u64) -> Resource {
+        let desc = ResourceDesc {
+            Dimension: dim::BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleCount: 1,
+            Layout: 1,
+            ..Default::default()
+        };
+        let hp = HeapProperties { Type: heap_type::READBACK, ..Default::default() };
+        Resource::new_committed_default(&desc, &hp, "metalfx barrier readback").unwrap()
+    }
+
+    fn f16_to_f32(h: u16) -> f32 {
+        let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let e = ((h >> 10) & 0x1f) as i32;
+        let m = (h & 0x3ff) as f32;
+        s * match e {
+            0 => m * 2f32.powi(-24),
+            31 => {
+                if m == 0.0 {
+                    f32::INFINITY
+                } else {
+                    f32::NAN
+                }
+            }
+            _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+        }
+    }
+
+    #[test]
+    fn metalfx_barrier_translation_stage_scoping_and_fallbacks() {
+        // 1) Pure compute/ML MetalFX output (no RenderTarget) scopes to Dispatch|Blit|MachineLearning.
+        let cs_only_usage = MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
+        assert_eq!(metalfx_producer_stages(cs_only_usage), MFX_COMPUTE_ML_STAGES);
+        assert_eq!(metalfx_consumer_stages(cs_only_usage), MFX_COMPUTE_ML_STAGES);
+        assert!(!metalfx_producer_stages(cs_only_usage).contains(MTLStages::Fragment));
+        assert!(metalfx_producer_stages(cs_only_usage).contains(MTLStages::MachineLearning));
+
+        // 2) RenderTarget-backed MetalFX output includes Fragment alongside Dispatch|Blit|MachineLearning,
+        //    never escalating to MTLStages::All or PRE_RASTER.
+        let rt_usage = MTLTextureUsage::ShaderRead
+            | MTLTextureUsage::ShaderWrite
+            | MTLTextureUsage::RenderTarget;
+        let rt_stages = metalfx_producer_stages(rt_usage);
+        assert_eq!(rt_stages, MFX_COMPUTE_ML_STAGES | MTLStages::Fragment);
+        assert_ne!(rt_stages, MTLStages::All);
+        assert!(!rt_stages.intersects(PRE_RASTER));
+
+        // 3) Pre-MetalFX producer barrier narrows from All->All to fence_stage->mfx_consumer_stages
+        //    when tight_stages + masks + fence are available, and falls back to All->All otherwise.
+        assert_eq!(
+            metalfx_pre_producer_barrier(MTLStages::Fragment, rt_usage, true, true, false, true),
+            (MTLStages::Fragment, MFX_COMPUTE_ML_STAGES | MTLStages::Fragment),
+        );
+        assert_eq!(
+            metalfx_pre_producer_barrier(MTLStages::Dispatch, cs_only_usage, true, true, false, true),
+            (MTLStages::Dispatch, MFX_COMPUTE_ML_STAGES),
+        );
+        for (has_fence, tight, legacy, masks) in [
+            (false, true, false, true),
+            (true, false, false, true),
+            (true, true, true, true),
+            (true, true, false, false),
+        ] {
+            assert_eq!(
+                metalfx_pre_producer_barrier(
+                    MTLStages::Fragment,
+                    rt_usage,
+                    has_fence,
+                    tight,
+                    legacy,
+                    masks,
+                ),
+                (MTLStages::All, MTLStages::All),
+                "fallback pre-barrier for has_fence={has_fence} tight={tight} legacy={legacy} masks={masks}"
+            );
+        }
+
+        // 4) Post-MetalFX policy: direct output uses stage-scoped hard Fragment|COMPUTE_STAGES
+        //    plus deferred soft PRE_RASTER; scratch-blit narrows strictly to Blit; missing fence or
+        //    legacy/unmasked flags fall back conservatively to FullFallback.
+        assert_eq!(
+            metalfx_post_sync_policy(rt_usage, true, false, true, false, true),
+            MetalFxPostSync::Scoped {
+                after: MFX_COMPUTE_ML_STAGES | MTLStages::Fragment,
+                hard_before: MTLStages::Fragment | COMPUTE_STAGES,
+                soft_pre_raster: true,
+            },
+        );
+        assert_eq!(
+            metalfx_post_sync_policy(cs_only_usage, true, false, true, false, true),
+            MetalFxPostSync::Scoped {
+                after: MFX_COMPUTE_ML_STAGES,
+                hard_before: MTLStages::Fragment | COMPUTE_STAGES,
+                soft_pre_raster: true,
+            },
+        );
+        assert_eq!(
+            metalfx_post_sync_policy(rt_usage, true, true, true, false, true),
+            MetalFxPostSync::Scoped {
+                after: MFX_COMPUTE_ML_STAGES | MTLStages::Fragment,
+                hard_before: MTLStages::Blit,
+                soft_pre_raster: false,
+            },
+        );
+        for (has_fence, tight, legacy, masks) in [
+            (false, true, false, true),
+            (true, false, false, true),
+            (true, true, true, true),
+            (true, true, false, false),
+        ] {
+            assert_eq!(
+                metalfx_post_sync_policy(rt_usage, has_fence, false, tight, legacy, masks),
+                MetalFxPostSync::FullFallback,
+                "fallback post-sync for has_fence={has_fence} tight={tight} legacy={legacy} masks={masks}"
+            );
+        }
+
+        // 5) Per-encoder fence wait stage selection:
+        //    - Render pass with no pre-raster reads waits only on Fragment (not PRE_RASTER).
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(UTIL_STAGES, true, false, 0, true, MTLStages::empty()),
+            MTLStages::Fragment,
+        );
+        //    - Render pass with pre-raster reads waits on PRE_RASTER | Fragment.
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(UTIL_STAGES, true, false, 1, true, MTLStages::empty()),
+            PRE_RASTER | MTLStages::Fragment,
+        );
+        //    - Subsequent render pass after Fragment already waited only waits if pre-raster reads occur.
+        let after_frag = UTIL_STAGES - MTLStages::Fragment;
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(after_frag, true, false, 0, true, MTLStages::empty()),
+            MTLStages::empty(),
+        );
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(after_frag, true, false, 1, true, MTLStages::empty()),
+            PRE_RASTER,
+        );
+        //    - Compute pass with split_compute_exact scopes fence wait to the opening compute stage.
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(after_frag, false, false, 0, true, MTLStages::Blit),
+            MTLStages::Blit,
+        );
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(after_frag, false, false, 0, true, MTLStages::Dispatch),
+            MTLStages::Dispatch,
+        );
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(after_frag, false, false, 0, false, MTLStages::Blit),
+            COMPUTE_STAGES,
+        );
+        //    - Full fallback waits on all encoder stages.
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(
+                MTLStages::empty(),
+                true,
+                true,
+                0,
+                true,
+                MTLStages::empty(),
+            ),
+            PRE_RASTER | MTLStages::Fragment,
+        );
+        assert_eq!(
+            metalfx_enc_fence_wait_stages(
+                MTLStages::empty(),
+                false,
+                true,
+                0,
+                true,
+                MTLStages::Blit,
+            ),
+            COMPUTE_STAGES,
+        );
+    }
+
+    #[test]
+    fn metalfx_post_pass_avoids_full_queue_barrier_and_preserves_multi_encoder_coherence_on_gpu() {
+        if crate::metal::device().is_none() || !is_temporal_enabled() {
+            return;
+        }
+        let q = Queue::new(ListType::Direct, "mfx narrow barrier gpu test").unwrap();
+        let alloc = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l = CommandList::new(ListType::Direct).unwrap();
+
+        let color = make_tex(64, 64, RGBA16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "nb c");
+        let depth = make_tex(64, 64, D32_FLOAT, resource_flags::ALLOW_DEPTH_STENCIL, "nb d");
+        let motion = make_tex(64, 64, RG16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "nb m");
+        let out = make_tex(
+            128,
+            128,
+            RGBA16_FLOAT,
+            resource_flags::ALLOW_RENDER_TARGET | resource_flags::ALLOW_UNORDERED_ACCESS,
+            "nb out",
+        );
+        let aux = make_tex(128, 128, RGBA16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "nb aux");
+        let rb = make_readback(128 * 8 * 128);
+        let rtv_c = TargetView::rtv(&color, None).unwrap();
+        let dsv_d = TargetView::dsv(&depth, None).unwrap();
+        let rtv_m = TargetView::rtv(&motion, None).unwrap();
+        let rtv_aux = TargetView::rtv(&aux, None).unwrap();
+        let fp = PlacedFootprint {
+            offset: 0,
+            format: RGBA16_FLOAT,
+            width: 128,
+            height: 128,
+            depth: 1,
+            row_pitch: 1024,
+            _pad: 0,
+        };
+
+        // 1) Direct temporal MetalFX -> Render pass (Fragment wait) -> Blit copy (Blit wait)
+        //    must emit ZERO `qb_clear_uav` / `q_barrier_all` after MetalFX while keeping GPU
+        //    output coherent and free of Metal validation errors.
+        l.begin(&alloc).unwrap();
+        unsafe {
+            l.clear_rtv(&rtv_c, [0.9, 0.4, 0.2, 1.0], &[]).unwrap();
+            l.clear_dsv(&dsv_d, true, 0.5, false, 0, &[]).unwrap();
+            l.clear_rtv(&rtv_m, [0.0, 0.0, 0.0, 0.0], &[]).unwrap();
+        }
+        // Flush list-start clears before sampling q_barrier_all so only post-MetalFX barriers are counted.
+        l.flush_clears_for(&[
+            &color as *const Resource as usize,
+            &depth as *const Resource as usize,
+            &motion as *const Resource as usize,
+        ])
+        .unwrap();
+
+        let qba0 = stats::c::q_barrier_all.load(Relaxed);
+        let qbc0 = stats::c::qb_clear_uav.load(Relaxed);
+        let qbf0 = stats::c::q_barrier_frag.load(Relaxed);
+
+        let mut p = TemporalUpscaleParams::new(&out, &color, &depth, &motion, [64, 64], [128, 128]);
+        p.reset = true;
+        p.auto_exposure = true;
+        assert_eq!(l.upscale_temporal_with_backend(&p).unwrap(), UpscaleBackend::TemporalMetalFx);
+        assert!(l.metalfx_post_sync_clean());
+        assert!(
+            !l.bar.needs_barrier,
+            "scoped temporal MetalFX must not arm a full-stage queue barrier"
+        );
+
+        // Intervening render pass consumes Fragment wait and releases the fence to subsequent
+        // encoders; closing the render pass must clear pending_mfx_wait_fence and strip
+        // MachineLearning from split_pend so it does not linger, while the subsequent Blit copy
+        // reads back exact upscaled pixels.
+        unsafe {
+            l.clear_rtv(
+                &rtv_aux,
+                [0.1, 0.1, 0.1, 1.0],
+                &[crate::types::Rect { left: 0, top: 0, right: 32, bottom: 32 }],
+            )
+            .unwrap();
+        }
+        assert!(
+            l.pending_mfx_wait_fence.is_none() && !l.pending_mfx_cross_enc_released,
+            "closing the first post-MetalFX render pass must finalize fence release"
+        );
+        assert!(!l.bar.split_pend.disp_after.contains(MTLStages::MachineLearning));
+        assert!(!l.bar.split_pend.blit_after.contains(MTLStages::MachineLearning));
+        l.copy_texture_region(
+            CopyLoc::Footprint(&rb, fp),
+            [0, 0, 0],
+            CopyLoc::Subresource(&out, 0),
+            None,
+        )
+        .unwrap();
+        l.close().unwrap();
+
+        assert_eq!(
+            stats::c::q_barrier_all.load(Relaxed) - qba0,
+            0,
+            "post-MetalFX render + blit sequence must emit 0 q_barrier_all"
+        );
+        assert_eq!(
+            stats::c::qb_clear_uav.load(Relaxed) - qbc0,
+            0,
+            "post-MetalFX render + blit sequence must emit 0 qb_clear_uav"
+        );
+        assert!(
+            stats::c::q_barrier_frag.load(Relaxed) - qbf0 >= 1,
+            "post-MetalFX consumers must emit stage-masked queue barriers"
+        );
+
+        q.execute_command_lists(&mut [&mut l]);
+        q.wait_idle();
+
+        let px = unsafe { std::slice::from_raw_parts(rb.cpu_ptr().unwrap() as *const u16, 128 * 512) };
+        let base = (64 * 128 + 64) * 4;
+        let r = f16_to_f32(px[base]);
+        let g = f16_to_f32(px[base + 1]);
+        let b = f16_to_f32(px[base + 2]);
+        assert!(
+            (r - 0.9).abs() < 0.15 && (g - 0.4).abs() < 0.15 && (b - 0.2).abs() < 0.15,
+            "multi-encoder post-MetalFX readback corrupted: ({r}, {g}, {b})"
+        );
+
+        // 1b) Closing the command list while a post-MetalFX render encoder is still open must
+        //     not emit invalid compute/ML stages on the render encoder or spawn a fallback encoder.
+        let mut l_close_render = CommandList::new(ListType::Direct).unwrap();
+        l_close_render.begin(&alloc).unwrap();
+        unsafe {
+            l_close_render.clear_rtv(&rtv_c, [0.3, 0.8, 0.1, 1.0], &[]).unwrap();
+            l_close_render.clear_dsv(&dsv_d, true, 0.5, false, 0, &[]).unwrap();
+            l_close_render.clear_rtv(&rtv_m, [0.0, 0.0, 0.0, 0.0], &[]).unwrap();
+        }
+        l_close_render
+            .flush_clears_for(&[
+                &color as *const Resource as usize,
+                &depth as *const Resource as usize,
+                &motion as *const Resource as usize,
+            ])
+            .unwrap();
+        let qba_r = stats::c::q_barrier_all.load(Relaxed);
+        assert_eq!(
+            l_close_render.upscale_temporal_with_backend(&p).unwrap(),
+            UpscaleBackend::TemporalMetalFx
+        );
+        let rp = MTL4RenderPassDescriptor::new();
+        let ca = unsafe { rp.colorAttachments().objectAtIndexedSubscript(0) };
+        ca.setTexture(Some(aux.texture().unwrap()));
+        ca.setLoadAction(MTLLoadAction::Clear);
+        ca.setClearColor(MTLClearColor { red: 0.2, green: 0.2, blue: 0.2, alpha: 1.0 });
+        ca.setStoreAction(MTLStoreAction::Store);
+        let aux_id = &aux as *const Resource as usize;
+        let _e = l_close_render.util_render_pass(&rp, &[aux_id], pt::kind::DRAW).unwrap();
+        assert!(matches!(l_close_render.enc, Encoder::Render(_)));
+        assert!(l_close_render.pending_mfx_cross_enc_released);
+        l_close_render.close().unwrap();
+        assert_eq!(stats::c::q_barrier_all.load(Relaxed) - qba_r, 0);
+        assert!(l_close_render.pending_mfx_wait_fence.is_none());
+        assert!(!l_close_render.pending_mfx_cross_enc_released);
+        q.execute_command_lists(&mut [&mut l_close_render]);
+        q.wait_idle();
+
+        // 2) Conservative fallback (`tight_stages = false`) must still arm FullWhy::ClearUav
+        //    and emit a full queue barrier on the following encoder.
+        l.begin(&alloc).unwrap();
+        unsafe {
+            l.clear_rtv(&rtv_c, [0.2, 0.7, 0.5, 1.0], &[]).unwrap();
+            l.clear_dsv(&dsv_d, true, 0.5, false, 0, &[]).unwrap();
+            l.clear_rtv(&rtv_m, [0.0, 0.0, 0.0, 0.0], &[]).unwrap();
+        }
+        l.flush_clears_for(&[
+            &color as *const Resource as usize,
+            &depth as *const Resource as usize,
+            &motion as *const Resource as usize,
+        ])
+        .unwrap();
+        let qba1 = stats::c::q_barrier_all.load(Relaxed);
+        let qbc1 = stats::c::qb_clear_uav.load(Relaxed);
+        let mut p2 = TemporalUpscaleParams::new(&out, &color, &depth, &motion, [64, 64], [128, 128]);
+        p2.reset = true;
+        p2.auto_exposure = true;
+        assert_eq!(l.upscale_temporal_with(&p2, false).unwrap(), UpscaleBackend::TemporalMetalFx);
+        assert!(l.bar.needs_barrier, "tight_stages=false fallback must arm FullWhy::ClearUav");
+        l.copy_texture_region(
+            CopyLoc::Footprint(&rb, fp),
+            [0, 0, 0],
+            CopyLoc::Subresource(&out, 0),
+            None,
+        )
+        .unwrap();
+        l.close().unwrap();
+        assert_eq!(stats::c::qb_clear_uav.load(Relaxed) - qbc1, 1);
+        assert_eq!(stats::c::q_barrier_all.load(Relaxed) - qba1, 1);
+        q.execute_command_lists(&mut [&mut l]);
+        q.wait_idle();
+
+        let px2 = unsafe { std::slice::from_raw_parts(rb.cpu_ptr().unwrap() as *const u16, 128 * 512) };
+        let r2 = f16_to_f32(px2[base]);
+        let g2 = f16_to_f32(px2[base + 1]);
+        let b2 = f16_to_f32(px2[base + 2]);
+        assert!(
+            (r2 - 0.2).abs() < 0.15 && (g2 - 0.7).abs() < 0.15 && (b2 - 0.5).abs() < 0.15,
+            "fallback post-MetalFX readback corrupted: ({r2}, {g2}, {b2})"
+        );
     }
 }
