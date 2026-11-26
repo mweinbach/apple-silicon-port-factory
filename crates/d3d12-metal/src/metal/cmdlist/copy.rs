@@ -752,13 +752,22 @@ impl CommandList {
                         self.end_encoder();
                     }
                     // Preserve `vis_buf_blit_read` until either a render pass actually opens
-                    // and consumes `Blit -> Fragment`, or a 0-draw `EndQuery` consumes it with
-                    // a `Blit -> Blit` barrier before zero-filling the slot.
+                    // and consumes `Blit -> PRE_RASTER | Fragment`, or a 0-draw `EndQuery`
+                    // consumes it with a `Blit -> Blit` barrier before zero-filling the slot.
+                    // Wait before `PRE_RASTER | Fragment` (not `Fragment` alone) so the next
+                    // render pass's `MTLVisibilityResultType::Reset` prologue cannot race an
+                    // earlier pass's `Fragment` write or `ResolveQueryData`'s `Blit` read.
                     if had_blit_read {
-                        self.add_pend(MTLStages::Blit, MTLStages::Fragment);
+                        self.add_pend(
+                            MTLStages::Blit,
+                            super::state::PRE_RASTER | MTLStages::Fragment,
+                        );
                     }
                     if slot_previously_written {
-                        self.add_pend(MTLStages::Fragment, MTLStages::Fragment);
+                        self.add_pend(
+                            MTLStages::Fragment,
+                            super::state::PRE_RASTER | MTLStages::Fragment,
+                        );
                     }
                     self.occl_drew = false;
                     self.occlusion = Some(q);

@@ -3635,7 +3635,7 @@ impl CommandList {
         for b in items {
             match *b {
                 Barrier::SplitBegin(..) => {}
-                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
+                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, _, s0, s1) => {
                     if elide_r2r
                         && (s0 == s1
                             || (is_read_to_read_transition(s0, s1)
@@ -4775,7 +4775,7 @@ impl CommandList {
         let open_dsv = self.active_dsv();
         self.gfx.draw_pass
             && items.iter().all(|b| match *b {
-                Barrier::SplitBegin(r, s0, s1) => {
+                Barrier::SplitBegin(r, _, s0, s1) => {
                     if elide_r2r
                         && (s0 == s1
                             || (is_read_to_read_transition(s0, s1)
@@ -4791,7 +4791,7 @@ impl CommandList {
                         && !open_dsv.is_some_and(|v| v.resource == r)
                         && !self.clears.pending_clears.iter().any(|p| p.view.resource == r)
                 }
-                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
+                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, _, s0, s1) => {
                     if elide_r2r
                         && (s0 == s1
                             || (is_read_to_read_transition(s0, s1)
@@ -4900,7 +4900,7 @@ impl CommandList {
         for b in items {
             match *b {
                 Barrier::SplitBegin(..) => {}
-                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
+                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, _, s0, s1) => {
                     if elide_r2r
                         && (s0 == s1
                             || (is_read_to_read_transition(s0, s1)

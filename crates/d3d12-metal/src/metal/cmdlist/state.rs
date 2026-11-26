@@ -211,10 +211,12 @@ impl PendingClear {
 pub enum Barrier {
     /// (`*const Resource`, 0 = unknown; StateBefore; StateAfter).
     Transition(usize, u32, u32),
-    /// Split transition begin (`D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY`).
-    SplitBegin(usize, u32, u32),
-    /// Split transition end (`D3D12_RESOURCE_BARRIER_FLAG_END_ONLY`).
-    SplitEnd(usize, u32, u32),
+    /// Split transition begin (`D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY`):
+    /// `(resource_ptr_id, subresource, state_before, state_after)`.
+    SplitBegin(usize, u32, u32, u32),
+    /// Split transition end (`D3D12_RESOURCE_BARRIER_FLAG_END_ONLY`):
+    /// `(resource_ptr_id, subresource, state_before, state_after)`.
+    SplitEnd(usize, u32, u32, u32),
     /// UAV barrier on a resource (0 = all UAV accesses).
     Uav(usize),
     /// Aliasing or anything else: full barrier.
@@ -1639,7 +1641,7 @@ pub(super) struct BarrierState {
     pub(super) enc_pre_unwaited_req: [u32; 7],
     pub(super) vis_buf_written: Vec<(usize, u32)>,
     pub(super) vis_buf_blit_read: Vec<usize>,
-    pub(super) split_barriers: Vec<(usize, u32, u32, [u32; 7])>,
+    pub(super) split_barriers: Vec<(usize, u32, u32, u32, [u32; 7])>,
     pub(super) opening_render_split_ok: bool,
     pub(super) opening_clear_frag_cap: Option<(MTLStages, [u32; 7])>,
     pub(super) clear_rp_unwaited_blit: Vec<usize>,

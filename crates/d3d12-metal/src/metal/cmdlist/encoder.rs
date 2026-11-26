@@ -224,9 +224,12 @@ impl CommandList {
             self.pt_stamp(i, true);
         }
         self.icb.enc_icb_war_done = false;
-        self.bar.enc_pre_unwaited_stages = MTLStages::empty();
-        self.bar.enc_pre_unwaited_after = MTLStages::empty();
-        self.bar.enc_pre_unwaited_req = [0; 7];
+        // Preserve `enc_pre_unwaited_*` across render-pass boundaries: if a render pass narrowed
+        // a consumed `PRE_RASTER` barrier to `Vertex` (leaving `Object | Mesh` unwaited) and then
+        // closed (e.g. target change), a subsequent render pass drawing with `Mesh`/`Object` still
+        // needs `ensure_pre_raster_stage_synced` / `collect_pre_raster_stage_sync` to wait on the
+        // earlier producer. Cleared only when drained, on a full `All -> PRE_RASTER` barrier, or
+        // on `BarrierState::reset()`.
         self.bar.list_blit_unwaited_stages = MTLStages::empty();
         match std::mem::replace(&mut self.enc, Encoder::None) {
             Encoder::None => return,
@@ -852,7 +855,7 @@ impl CommandList {
                     }
                 }
             }
-            for &(r, s0, _, _) in &self.bar.split_barriers {
+            for &(r, _, s0, _, _) in &self.bar.split_barriers {
                 extra |= state_stages_for_res(r, s0);
                 if r == 0 {
                     has_unknown_narrow_r = true;

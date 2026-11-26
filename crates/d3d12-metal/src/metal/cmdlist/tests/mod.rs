@@ -3347,6 +3347,45 @@ fn partial_barrier_stage_selection_and_fallbacks_on_gpu() {
         "AS+MS draw must consume remaining Object stage"
     );
 
+    // 3b) Omitted pre-raster waits MUST survive render-pass closure (e.g. target change) so a
+    //     subsequent render pass executing a Mesh draw still synchronizes against the compute write!
+    l.end_encoder();
+    l.clear_uav(&buf_uav, Some(&raw_uav_desc), ClearValue::Uint([0x3344_5566, 0, 0, 0]), &[]).unwrap();
+    l.barrier_list_with(&[Barrier::Transition(buf_id, STATE_UAV, STATE_NON_PIXEL_SRV)], true, false);
+    l.gfx_root.set_root_signature(vs_rs.clone()).unwrap();
+    l.gfx_root.set_descriptor(0, cb_up.gpu_va).unwrap();
+    l.gfx_root.set_descriptor(1, buf_uav.gpu_va).unwrap();
+    l.set_graphics_pipeline(vs_pso.clone());
+    l.draw(3, 1, 0, 0).unwrap();
+    assert!(
+        l.bar.enc_pre_unwaited_stages.contains(MTLStages::Object | MTLStages::Mesh),
+        "VS draw must leave Object|Mesh unwaited"
+    );
+    let rt_other = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    rt_other.register_ptr();
+    l.set_render_targets(vec![TargetView::rtv(&rt_other, None).unwrap()], None);
+    l.end_encoder();
+    assert!(
+        l.bar.enc_pre_unwaited_stages.contains(MTLStages::Object | MTLStages::Mesh),
+        "closing Pass 1 on target change must preserve omitted Object|Mesh waits for Pass 2"
+    );
+    let mid_cross0 = stats::c::rb_mid_qb.load(Relaxed);
+    l.gfx_root.set_root_signature(mesh_rs.clone()).unwrap();
+    l.gfx_root.set_constants(0, 0, &[0, 128, 0, 0]).unwrap();
+    l.set_mesh_pipeline(ms_only_pso.clone());
+    l.dispatch_mesh(1, 1, 1).unwrap();
+    assert!(
+        stats::c::rb_mid_qb.load(Relaxed) > mid_cross0,
+        "Mesh draw in Pass 2 must emit Dispatch -> Mesh wait carried across Pass 1 closure"
+    );
+    assert!(
+        !l.bar.enc_pre_unwaited_stages.contains(MTLStages::Mesh)
+            && l.bar.enc_pre_unwaited_stages.contains(MTLStages::Object),
+        "Pass 2 Mesh draw must drain Mesh and keep Object pending, got {:?}",
+        l.bar.enc_pre_unwaited_stages
+    );
+    l.set_render_targets(vec![TargetView::rtv(&rt, None).unwrap()], None);
+
     // 4) Compute -> Fragment only: `UAV -> PIXEL_SRV` targets Fragment without stalling Vertex.
     l.end_encoder();
     l.clear_uav(&tex_uav, None, ClearValue::Float([0.25, 0.5, 0.75, 1.0]), &[]).unwrap();
@@ -3514,9 +3553,10 @@ fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
         znear: 0.0,
         zfar: 1.0,
     }]);
+    const ALL_SUB: u32 = 0xffff_ffff;
     l1.draw(3, 1, 0, 0).unwrap();
     l1.barrier_list_with(
-        &[Barrier::SplitBegin(rt1_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        &[Barrier::SplitBegin(rt1_id, ALL_SUB, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
         true,
         false,
     );
@@ -3530,14 +3570,14 @@ fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
     l1.draw(3, 1, 0, 0).unwrap();
     // Unattached read-to-read SplitBegin must elide without splitting the open render pass!
     l1.barrier_list_with(
-        &[Barrier::SplitBegin(rt1_id, STATE_PIXEL_SRV, STATE_NON_PIXEL_SRV)],
+        &[Barrier::SplitBegin(rt1_id, ALL_SUB, STATE_PIXEL_SRV, STATE_NON_PIXEL_SRV)],
         true,
         false,
     );
     assert!(matches!(l1.enc, Encoder::Render(_)), "r2r SplitBegin must keep render pass open");
     // Now SplitEnd(rt1) consumes the recorded SplitBegin(rt1) with rt1's earlier gen!
     l1.barrier_list_with(
-        &[Barrier::SplitEnd(rt1_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        &[Barrier::SplitEnd(rt1_id, ALL_SUB, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
         true,
         false,
     );
@@ -3550,7 +3590,7 @@ fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
         .unwrap();
     // Cross-list split: SplitBegin(rt2) at end of L1, SplitEnd(rt2) at start of L2.
     l1.barrier_list_with(
-        &[Barrier::SplitBegin(rt2_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        &[Barrier::SplitBegin(rt2_id, ALL_SUB, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
         true,
         false,
     );
@@ -3559,7 +3599,7 @@ fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
     let mut l2 = CommandList::new(ListType::Direct).unwrap();
     l2.begin(&alloc2).unwrap();
     l2.barrier_list_with(
-        &[Barrier::SplitEnd(rt2_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        &[Barrier::SplitEnd(rt2_id, ALL_SUB, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
         true,
         false,
     );
@@ -3612,7 +3652,7 @@ fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
     unsafe { l3.clear_rtv(&rtv_def, [0.0, 0.0, 1.0, 1.0], &[]).unwrap() };
     assert!(!l3.clears.pending_clears.is_empty(), "second clear should be deferred");
     l3.barrier_list_with(
-        &[Barrier::SplitBegin(rt_def_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        &[Barrier::SplitBegin(rt_def_id, ALL_SUB, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
         true,
         false,
     );
@@ -3626,16 +3666,16 @@ fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
         .bar
         .split_barriers
         .iter()
-        .find(|&&(r, _, _, _)| r == rt_def_id)
+        .find(|&&(r, _, _, _, _)| r == rt_def_id)
         .expect("SplitBegin entry recorded")
-        .3;
+        .4;
     assert!(
         rec_req[STAGE_FRAGMENT] >= frag_gen_after,
         "SplitBegin must snapshot post-flush Fragment generation {frag_gen_after}, got {}",
         rec_req[STAGE_FRAGMENT]
     );
     l3.barrier_list_with(
-        &[Barrier::SplitEnd(rt_def_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        &[Barrier::SplitEnd(rt_def_id, ALL_SUB, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
         true,
         false,
     );
@@ -3651,6 +3691,49 @@ fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
         None,
     )
     .unwrap();
+
+    // Overlapping split transitions on two distinct subresources (sub 0 vs sub 1) of the SAME
+    // resource with identical before/after states: ending subresource 1 first must match sub 1's
+    // later generation snapshot, NOT sub 0's earlier one.
+    l3.end_encoder();
+    let gen_sub0 = l3.bar.stage_gen[STAGE_FRAGMENT];
+    l3.barrier_list_with(
+        &[Barrier::SplitBegin(rt_def_id, 0, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    // Advance Fragment generation (another clear pass) before SplitBegin on subresource 1.
+    unsafe { l3.clear_rtv(&rtv_def, [0.0, 0.0, 1.0, 1.0], &[]).unwrap() };
+    l3.barrier_list_with(
+        &[Barrier::SplitBegin(rt_def_id, 1, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    let gen_sub1 = l3.bar.stage_gen[STAGE_FRAGMENT];
+    assert!(gen_sub1 > gen_sub0, "sub 1 must have a newer Fragment gen ({gen_sub0} -> {gen_sub1})");
+    l3.bar.split_pend.blit_req = [0; 7];
+    l3.barrier_list_with(
+        &[Barrier::SplitEnd(rt_def_id, 1, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    assert!(
+        l3.bar.split_pend.blit_req[STAGE_FRAGMENT] >= gen_sub1,
+        "SplitEnd(sub=1) must match sub 1's gen {gen_sub1}, not sub 0's {gen_sub0}, got {}",
+        l3.bar.split_pend.blit_req[STAGE_FRAGMENT]
+    );
+    assert_eq!(
+        l3.bar.split_barriers.len(),
+        1,
+        "sub 0's SplitBegin entry must remain pending after sub 1 ends"
+    );
+    assert_eq!(l3.bar.split_barriers[0].1, 0, "remaining split entry must be subresource 0");
+    l3.barrier_list_with(
+        &[Barrier::SplitEnd(rt_def_id, 0, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    assert!(l3.bar.split_barriers.is_empty(), "sub 0's SplitEnd must consume remaining entry");
     l3.close().unwrap();
 
     q.submit(&[&l3.cb]);

@@ -1207,6 +1207,9 @@ impl CommandList {
             self.bar.list_blit_unwaited_stages = MTLStages::empty();
             self.bar.list_unwaited_cs = false;
             self.bar.list_unwaited_gfx = false;
+            self.bar.enc_pre_unwaited_stages = MTLStages::empty();
+            self.bar.enc_pre_unwaited_after = MTLStages::empty();
+            self.bar.enc_pre_unwaited_req = [0; 7];
             (MTLStages::All, MTLStages::All)
         } else {
             let (mut a, mut b) = (self.bar.pend_after, self.bar.pend_before);
@@ -2009,7 +2012,7 @@ impl CommandList {
             // state (SRV/CopySource), or on explicit UAV barriers — skip RT<->UAV ping-pong
             // transitions where a subsequent RT/UAV->SRV transition will sanitize once.
             let r = match *item {
-                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1)
+                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, _, s0, s1)
                     if r != 0 && (s0 & (0x4 | 0x8)) != 0 && (s1 & (0x40 | 0x80 | 0x800)) != 0 =>
                 {
                     r
@@ -2143,7 +2146,7 @@ impl CommandList {
             let mut scanned_any = false;
             for item in items {
                 match *item {
-                    Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1)
+                    Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, _, s0, s1)
                         if r != 0 && (s0 & (0x4 | 0x8)) != 0 =>
                     {
                         let res = unsafe { &*(r as *const Resource) };
@@ -2310,7 +2313,7 @@ impl CommandList {
         batch_pt.extend_from_slice(&self.bar.uav_passthrough);
         let mut split_begin_res: Vec<usize> = Vec::new();
         let mut split_begin_all = false;
-        let mut split_begin_keys: Vec<(usize, u32, u32)> = Vec::new();
+        let mut split_begin_keys: Vec<(usize, u32, u32, u32)> = Vec::new();
         let mut local_narrow_trail: Vec<(usize, S, S)> = Vec::new();
         let mut all_matched_split_end = true;
         let mut any_matched_split_end = false;
@@ -2324,7 +2327,7 @@ impl CommandList {
         const VS_BUF_SOFT: u32 = 0x1 | 0x2 | 0x200;
         for b in items {
             match *b {
-                Barrier::SplitBegin(r, s0, s1) => {
+                Barrier::SplitBegin(r, sub, s0, s1) => {
                     if ib_tight && r != 0 {
                         unsafe { (*(r as *const Resource)).register_ptr() };
                     }
@@ -2371,21 +2374,33 @@ impl CommandList {
                         }
                     }
                     let begin_req = self.cur_producer_gen();
-                    self.bar.split_barriers.push((r, s0, s1, begin_req));
-                    split_begin_keys.push((r, s0, s1));
+                    self.bar.split_barriers.push((r, sub, s0, s1, begin_req));
+                    split_begin_keys.push((r, sub, s0, s1));
                     continue;
                 }
-                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
-                    if matches!(*b, Barrier::SplitEnd(..)) {
-                        if let Some(idx) = self
-                            .bar
-                            .split_barriers
-                            .iter()
-                            .position(|&(sr, ss0, ss1, _)| sr == r && ss0 == s0 && ss1 == s1)
+                Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, _, s0, s1) => {
+                    if let Barrier::SplitEnd(_, sub, _, _) = *b {
+                        let mut match_idx: Option<usize> = None;
+                        let mut ambiguous = false;
+                        for (i, &(sr, ssub, ss0, ss1, _)) in
+                            self.bar.split_barriers.iter().enumerate()
                         {
-                            let (_, _, _, breq) = self.bar.split_barriers.remove(idx);
-                            any_matched_split_end = true;
-                            merge_req_all(&mut matched_split_req, &breq);
+                            if sr == r && ssub == sub && ss0 == s0 && ss1 == s1 {
+                                if match_idx.is_some() {
+                                    ambiguous = true;
+                                } else {
+                                    match_idx = Some(i);
+                                }
+                            }
+                        }
+                        if let Some(idx) = match_idx {
+                            let (_, _, _, _, breq) = self.bar.split_barriers.remove(idx);
+                            if ambiguous {
+                                all_matched_split_end = false;
+                            } else {
+                                any_matched_split_end = true;
+                                merge_req_all(&mut matched_split_req, &breq);
+                            }
                         } else {
                             all_matched_split_end = false;
                         }
@@ -2808,8 +2823,8 @@ impl CommandList {
                 if self.clears.pending_clears.len() != pre_len {
                     let post_req = self.cur_producer_gen();
                     for entry in &mut self.bar.split_barriers {
-                        if split_begin_keys.contains(&(entry.0, entry.1, entry.2)) {
-                            entry.3 = post_req;
+                        if split_begin_keys.contains(&(entry.0, entry.1, entry.2, entry.3)) {
+                            entry.4 = post_req;
                         }
                     }
                 }
@@ -2883,7 +2898,7 @@ impl CommandList {
                 for b in items {
                     match *b {
                         Barrier::SplitBegin(..) => {}
-                        Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
+                        Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, _, s0, s1) => {
                             if elide_r2r
                                 && (s0 == s1
                                     || (is_read_to_read_transition(s0, s1)
@@ -3050,8 +3065,8 @@ impl CommandList {
         if had_flushed_clears && !split_begin_keys.is_empty() {
             let post_req = self.cur_producer_gen();
             for entry in &mut self.bar.split_barriers {
-                if split_begin_keys.contains(&(entry.0, entry.1, entry.2)) {
-                    entry.3 = post_req;
+                if split_begin_keys.contains(&(entry.0, entry.1, entry.2, entry.3)) {
+                    entry.4 = post_req;
                 }
             }
         }
@@ -3189,7 +3204,7 @@ impl CommandList {
                                     n_uav0_disp_after |= ia;
                                 }
                             }
-                            Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
+                            Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, _, s0, s1) => {
                                 let (eff_s0, eff_s1) = if self.opts.opt_split_res_soft_sync
                                     || self.opts.opt_barrier_tight_v2
                                 {
