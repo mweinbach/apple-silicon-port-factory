@@ -611,10 +611,15 @@ impl Queue {
                 f.pending_sig_queue.store(0, Ordering::Release);
                 f.pending_sig_value.store(0, Ordering::Release);
                 f.poll_count.store(0, Ordering::Release);
+                f.emitted_sig_value.fetch_max(v, Ordering::AcqRel);
                 f.ev.setSignaledValue(v);
             }
             if let Some((ev, gv)) = greater_sig {
                 q.flush_pending_cbs_locked();
+                if fence_ptr != 0 {
+                    let f = unsafe { &*(fence_ptr as *const Fence) };
+                    f.emitted_sig_value.fetch_max(gv, Ordering::AcqRel);
+                }
                 q.q.signalEvent_value(ProtocolObject::from_ref(&*ev), gv);
             }
             true
@@ -663,6 +668,7 @@ impl Queue {
                 );
                 f.pending_sig_value.store(0, Ordering::Release);
                 f.poll_count.store(0, Ordering::Release);
+                f.emitted_sig_value.fetch_max(entry.val, Ordering::AcqRel);
             }
             if entry.enqueued_epoch < cur_epoch {
                 super::encstats::inc(&super::encstats::c::fence_sig_coalesced);
@@ -1027,7 +1033,7 @@ impl Queue {
         }
         let has_unmet_wait = {
             let wt = f.wait_target.load(O::SeqCst);
-            wt != 0 && f.completed_raw() < wt
+            wt != 0 && f.emitted_sig_value.load(O::Acquire) < wt
         };
         if self.kind == ListType::Direct
             && !self.is_swapchain_internal
@@ -1063,17 +1069,19 @@ impl Queue {
                 f.pending_sig_value.store(v, O::Release);
                 f.pending_sig_queue.store(me, O::SeqCst);
             }
-            // Dekker `SeqCst` handshake with `Queue::wait_with`: if a concurrent
-            // cross-queue wait published `wait_target` while we were deferring,
-            // flush immediately so it can never deadlock even with `AW2_D3D_CS=0`.
+            // Dekker `SeqCst` handshake with `Queue::wait_with`, `Fence::wait_cpu`,
+            // and `Fence::on_completion`: if a concurrent GPU or CPU waiter
+            // published `wait_target` while we were deferring, flush immediately so
+            // it can never deadlock even with `AW2_D3D_CS=0`.
             let wt_after = f.wait_target.load(O::SeqCst);
-            if wt_after != 0 && f.completed_raw() < wt_after {
+            if wt_after != 0 && f.emitted_sig_value.load(O::Acquire) < wt_after {
                 self.flush_fence_signals_locked();
             }
             return;
         }
         self.flush_pending_cbs_locked();
         self.flush_fence_signals_locked();
+        f.emitted_sig_value.fetch_max(v, O::AcqRel);
         self.q.signalEvent_value(ProtocolObject::from_ref(&*f.ev), v);
     }
 
@@ -1939,6 +1947,59 @@ mod tests {
             "fence signals must resume coalescing once prior wait_target is satisfied"
         );
         assert!(f.wait_cpu(5, 5000));
+
+        // 5) CPU `SetEventOnCompletion` (`on_completion`) registered BEFORE `direct.signal`
+        //    must publish `wait_target` so the subsequent signal flushes eagerly with no CS thread.
+        let fired6 = Arc::new(AtomicBool::new(false));
+        let fired6_c = fired6.clone();
+        f.on_completion(6, Box::new(move || fired6_c.store(true, Ordering::Release)));
+        direct.signal(&f, 6);
+        assert!(
+            !direct.has_deferred_signals.load(Ordering::Acquire),
+            "direct.signal(f, 6) must flush eagerly when on_completion(6) was registered first"
+        );
+        let deadline6 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired6.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline6,
+                "on_completion(6) registered before direct.signal(f, 6) deadlocked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // 6) Blocking `wait_cpu(7)` started on another thread BEFORE `direct.signal(f, 7)`
+        //    must also publish `wait_target` so `direct.signal(f, 7)` flushes eagerly.
+        let f_shared = Arc::new(Fence::new(0).unwrap());
+        let f_bg = f_shared.clone();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_bg = entered.clone();
+        let waiter = std::thread::spawn(move || {
+            entered_bg.store(true, Ordering::Release);
+            f_bg.wait_cpu(7, 5000)
+        });
+        // Wait until background thread has entered `wait_cpu` and published `wait_target = 7`.
+        let wait_pub = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !entered.load(Ordering::Acquire) || f_shared.wait_target.load(Ordering::Acquire) < 7 {
+            assert!(std::time::Instant::now() < wait_pub);
+            std::thread::yield_now();
+        }
+        direct.signal(&f_shared, 7);
+        assert!(
+            !direct.has_deferred_signals.load(Ordering::Acquire),
+            "direct.signal(f_shared, 7) must flush eagerly when wait_cpu(7) is already waiting"
+        );
+        // Once `emitted_sig_value` reaches `wait_target` (7), subsequent signals resume coalescing.
+        direct.signal(&f_shared, 8);
+        assert!(
+            direct.has_deferred_signals.load(Ordering::Acquire),
+            "subsequent signals must resume coalescing once waited value is emitted"
+        );
+        assert!(
+            waiter.join().unwrap(),
+            "background wait_cpu(7) registered before direct.signal(7) deadlocked"
+        );
+        assert!(f_shared.wait_cpu(8, 5000));
+
         direct.wait_idle();
         copy.wait_idle();
     }
