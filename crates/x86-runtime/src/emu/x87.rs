@@ -2580,6 +2580,14 @@ pub(super) fn x87_state_ptr() -> usize {
     TLS_X87.with(|cell| cell.get() as usize)
 }
 
+/// Address of this thread's `X87State::cw` field for inline `fldcw`/`fnstcw`/`fstcw`
+/// in translated ARM64 code.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(super) fn x87_cw_ptr() -> usize {
+    TLS_X87.with(|cell| unsafe { core::ptr::addr_of_mut!((*cell.get()).cw) as usize })
+}
+
 #[inline(always)]
 pub(super) fn with_x87_ref<R>(f: impl FnOnce(&X87State) -> R) -> R {
     TLS_X87.with(|cell| unsafe { f(&*cell.get()) })

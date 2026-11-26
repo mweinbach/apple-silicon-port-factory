@@ -2136,3 +2136,31 @@ fn x87_env14_uses_selector_layout_not_fop() {
     assert_eq!(rd_u16(64 + 8), 0, "14B fnstenv bytes 8..10 must write FCS=0, not FOP");
     assert_eq!(rd_u16(64 + 12), 0, "14B fnstenv bytes 12..14 must write FDS=0");
 }
+
+/// 20. Regression: `fxsave`/`fxrstor` in the same basic block as x87 pushes/pops must flush
+///     dirty static `TOP` before `fxsave` and invalidate cached `x87_top_known` after `fxrstor`.
+#[test]
+fn x87_same_block_fxsave_fxrstor_coherency() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 640];
+    init[528..536].copy_from_slice(&42.5f64.to_bits().to_le_bytes());
+
+    let code = assemble(|a| {
+        a.fninit().unwrap();
+        a.fld(qword_ptr(rcx + 528)).unwrap(); // TOP = 7 (dirty!), ST(0) = 42.5
+        a.fxsave(ptr(rcx)).unwrap();          // must flush TOP=7 before saving
+        a.fldz().unwrap();                    // TOP = 6, ST(0) = 0.0
+        a.fld1().unwrap();                    // TOP = 5, ST(0) = 1.0
+        a.fxrstor(ptr(rcx)).unwrap();         // restores TOP = 7, ST(0) = 42.5
+        a.fstp(qword_ptr(rcx + 512)).unwrap(); // must read ST(0) = 42.5 (not stale TOP=5)
+        a.fnstsw(word_ptr(rcx + 520)).unwrap();
+    });
+
+    let r = run_diff_x87("same_block_fxsave_fxrstor", &code, &init);
+    let saved_sw = u16::from_le_bytes(r.data[2..4].try_into().unwrap());
+    assert_eq!((saved_sw >> 11) & 7, 7, "fxsave must observe flushed TOP=7");
+    let got = f64::from_bits(u64::from_le_bytes(r.data[512..520].try_into().unwrap()));
+    assert_eq!(got, 42.5, "fstp after fxrstor must read restored ST(0)");
+    let final_sw = u16::from_le_bytes(r.data[520..522].try_into().unwrap());
+    assert_eq!((final_sw >> 11) & 7, 0, "final TOP after popping restored ST(0) must be 0");
+}

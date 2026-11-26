@@ -46,6 +46,8 @@ pub(super) use super::x87::{
     X87_UNARY_PTAN, X87_UNARY_RNDINT, X87_UNARY_SCALE, X87_UNARY_SIN, X87_UNARY_SINCOS,
     X87_UNARY_SQRT, X87_UNARY_XTRACT, X87_UNARY_YL2X, X87_UNARY_YL2XP1,
 };
+#[cfg(target_arch = "aarch64")]
+pub(super) use super::x87::x87_cw_ptr;
 pub use super::x87::{x87_reset, x87_restore, x87_snapshot, X87State};
 
 /// Retire a decoded x87 data instruction. FOP is the low 3 bits of the escape

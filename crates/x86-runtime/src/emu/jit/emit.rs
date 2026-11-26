@@ -258,6 +258,7 @@ impl Asm {
     pub(super) fn fcvt_s_d(&mut self, vd: u32, vn: u32) {
         self.emit(0x1E62_4000 | vn << 5 | vd);
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn frintn_d(&mut self, vd: u32, vn: u32) {
         self.emit(0x1E64_4000 | vn << 5 | vd);
     }

@@ -483,4 +483,7 @@ pub(super) enum Fx {
     Call(u64),
     /// Compare done; the caller must now execute the next arena slot (a [`K_JCC`]).
     FuseJcc,
+    /// State-changing or fault-dispatched op finished; leave fast burst/chain and re-enter the
+    /// outer loop at `cpu.rip` (e.g. after `#GP`/`#PF` VEH resume or non-AFP mixed MXCSR).
+    Yield,
 }

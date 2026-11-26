@@ -429,7 +429,7 @@ impl Tr<'_> {
                 if trunc {
                     self.a.frintz_d(0, 0);
                 } else {
-                    self.a.frintn_d(0, 0);
+                    self.a.s_frint(true, 4, 0, 0);
                 }
                 let x = w == 64;
                 self.a.fcvtzs_d(x, T0, 0);
