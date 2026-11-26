@@ -632,7 +632,7 @@ pub const DF_TRACE: u32 = 16;
 /// `host_fn` is an integer-only win32-rt builtin (at most 8 args, no XMM or stack
 /// args, never calls back into guest code): `call_va8` calls it directly.
 pub const DF_PLAIN: u32 = 32;
-/// `AW2_JOB_MARK` target: the bridges record the call as a `jobprof::K_MARK` span.
+/// `PORT_JOB_MARK` target: the bridges record the call as a `jobprof::K_MARK` span.
 pub const DF_MARK: u32 = 64;
 /// `host_fn` is a compiled game replacement and the call needs no other ABI fixup (no
 /// `DF_FLOAT_RET` / `DF_MARK` / `DF_TRACE`; see [`LEAN_FLAGS`]). `call_va8` and
