@@ -1444,6 +1444,18 @@ fn task_dialog_button_key_equivalent(
     None
 }
 
+/// True when `run_task_dialog_alert` must attach a hidden Escape (`"\u{1b}"`) shortcut
+/// button because no visible action button carries Escape, yet cancellation is permitted
+/// either by `TDF_ALLOW_DIALOG_CANCELLATION` or by an `IDCANCEL` button that is also the
+/// effective default button (holding Return `"\r"`).
+fn task_dialog_needs_hidden_escape_shortcut(
+    allow_cancellation: bool,
+    cancel_idx: Option<usize>,
+    has_escape_button: bool,
+) -> bool {
+    !has_escape_button && (allow_cancellation || cancel_idx.is_some())
+}
+
 #[derive(Clone)]
 enum TaskDialogEventSink {
     Channel(std::sync::mpsc::Sender<super::TaskDialogEvent>),
@@ -1966,24 +1978,34 @@ fn run_task_dialog_alert(
 
     // Under `TDF_ALLOW_DIALOG_CANCELLATION`, allow Escape, Cmd+W, and the window's
     // title-bar close button to cancel the dialog with `IDCANCEL` even when no
-    // `TDCBF_CANCEL_BUTTON` / Cancel button is configured.
+    // `TDCBF_CANCEL_BUTTON` / Cancel button is configured. Also, when an `IDCANCEL`
+    // button is the effective default button (so it carries Return `"\r"` instead of
+    // Escape), attach a separate hidden Escape shortcut targeting that Cancel button so
+    // Escape remains bound to `IDCANCEL` even without `TDF_ALLOW_DIALOG_CANCELLATION`.
     let mut cancel_shortcut_buttons: Vec<Retained<NSButton>> = Vec::new();
     let mut attached_close_delegate_win: Option<Retained<NSWindow>> = None;
-    if allow_cancellation {
+    let need_hidden_escape =
+        task_dialog_needs_hidden_escape_shortcut(allow_cancellation, cancel_idx, has_escape_button);
+    if allow_cancellation || need_hidden_escape {
         let _: () = unsafe { msg_send![&*a, layout] };
         let win = a.window();
-        win.setStyleMask(win.styleMask() | NSWindowStyleMask::Closable);
-        if win.delegate().is_none() {
-            win.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-            attached_close_delegate_win = Some(win.clone());
+        if allow_cancellation {
+            win.setStyleMask(win.styleMask() | NSWindowStyleMask::Closable);
+            if win.delegate().is_none() {
+                win.setDelegate(Some(ProtocolObject::from_ref(&*target)));
+                attached_close_delegate_win = Some(win.clone());
+            }
         }
         if let Some(cv) = win.contentView() {
-            let add_hidden_cancel = |key: &str, mods: Option<NSEventModifierFlags>| {
+            let add_hidden_shortcut = |key: &str,
+                                       mods: Option<NSEventModifierFlags>,
+                                       btn_target: &AnyObject,
+                                       action: objc2::runtime::Sel| {
                 let btn = unsafe {
                     NSButton::buttonWithTitle_target_action(
                         &NSString::from_str(""),
-                        Some(&target),
-                        Some(sel!(cancelDialog:)),
+                        Some(btn_target),
+                        Some(action),
                         mtm,
                     )
                 };
@@ -1998,11 +2020,33 @@ fn run_task_dialog_alert(
                 cv.addSubview(&btn);
                 btn
             };
-            if !has_escape_button {
-                cancel_shortcut_buttons.push(add_hidden_cancel("\u{1b}", None));
+            if need_hidden_escape {
+                if allow_cancellation {
+                    cancel_shortcut_buttons.push(add_hidden_shortcut(
+                        "\u{1b}",
+                        None,
+                        &*target,
+                        sel!(cancelDialog:),
+                    ));
+                } else if let Some(cidx) = cancel_idx {
+                    if let Some(cancel_btn) = action_buttons.get(cidx) {
+                        cancel_shortcut_buttons.push(add_hidden_shortcut(
+                            "\u{1b}",
+                            None,
+                            &**cancel_btn,
+                            sel!(performClick:),
+                        ));
+                    }
+                }
             }
-            cancel_shortcut_buttons
-                .push(add_hidden_cancel("w", Some(NSEventModifierFlags::Command)));
+            if allow_cancellation {
+                cancel_shortcut_buttons.push(add_hidden_shortcut(
+                    "w",
+                    Some(NSEventModifierFlags::Command),
+                    &*target,
+                    sel!(cancelDialog:),
+                ));
+            }
         }
     }
 
@@ -4174,5 +4218,21 @@ mod tests {
         assert_eq!(task_dialog_button_key_equivalent(1, "\u{1b}", None, None), Some(""));
         assert_eq!(task_dialog_button_key_equivalent(1, "\u{1b}", Some(0), Some(2)), Some(""));
         assert_eq!(task_dialog_button_key_equivalent(2, "", Some(0), Some(2)), Some("\u{1b}"));
+
+        // Localized IDCANCEL button also chosen as default (nDefaultButton = IDCANCEL, idx 1)
+        // with TDF_ALLOW_DIALOG_CANCELLATION unset: Cancel keeps Return AND requires a separate
+        // hidden Escape shortcut targeting Cancel so Escape still cancels.
+        assert_eq!(task_dialog_button_key_equivalent(0, "\r", Some(1), Some(1)), Some(""));
+        assert_eq!(task_dialog_button_key_equivalent(1, "", Some(1), Some(1)), Some("\r"));
+        assert!(task_dialog_needs_hidden_escape_shortcut(false, Some(1), false));
+        // When Cancel is idx 0 and default is implicit (None), idx 0 keeps Return so hidden Escape is also needed.
+        assert_eq!(task_dialog_button_key_equivalent(0, "\r", None, Some(0)), None);
+        assert!(task_dialog_needs_hidden_escape_shortcut(false, Some(0), false));
+        // When a visible Cancel button already carries Escape, no hidden Escape shortcut is needed.
+        assert!(!task_dialog_needs_hidden_escape_shortcut(false, Some(1), true));
+        assert!(!task_dialog_needs_hidden_escape_shortcut(true, Some(1), true));
+        // Without an IDCANCEL button, hidden Escape is only installed under TDF_ALLOW_DIALOG_CANCELLATION.
+        assert!(!task_dialog_needs_hidden_escape_shortcut(false, None, false));
+        assert!(task_dialog_needs_hidden_escape_shortcut(true, None, false));
     }
 }
