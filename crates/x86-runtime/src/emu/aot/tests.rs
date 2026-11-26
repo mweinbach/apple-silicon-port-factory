@@ -2972,21 +2972,21 @@ fn closure_discovers_mid_block_resume_after_non_jit_op() {
     w32(&mut img, sec1 + 20, 0x2000);
     w32(&mut img, sec1 + 36, 0x4000_0040);
 
-    // Function 1 @ 0x1000: mov eax, 1 (5B); dppd xmm0, xmm1, 0x31 (6B: 66 0F 3A 41 C1 31); add eax, 2 (3B); ret (1B)
-    let f1: [u8; 15] = [
+    // Function 1 @ 0x1000: mov eax, 1 (5B); fld1 (2B: D9 E8, generic x87); add eax, 2 (3B); ret (1B)
+    let f1: [u8; 11] = [
         0xB8, 1, 0, 0, 0, // +0x1000: mov eax, 1
-        0x66, 0x0F, 0x3A, 0x41, 0xC1, 0x31, // +0x1005: dppd xmm0, xmm1, 0x31 (generic interpreter)
-        0x83, 0xC0, 0x02, // +0x100B: add eax, 2 (resume IP!)
-        0xC3, // +0x100E: ret
+        0xD9, 0xE8, // +0x1005: fld1 (generic interpreter)
+        0x83, 0xC0, 0x02, // +0x1007: add eax, 2 (resume IP!)
+        0xC3, // +0x100A: ret
     ];
     img[0x1000..0x1000 + f1.len()].copy_from_slice(&f1);
 
-    // Function 2 @ 0x1040: xor ecx, ecx (2B); emms (2B: 0F 77); add eax, 7 (3B); ret (1B)
-    let f2: [u8; 8] = [
+    // Function 2 @ 0x1040: xor ecx, ecx (2B); mov rax, fs:[rax] (4B: 64 48 8B 00, generic FS); add eax, 7 (3B); ret (1B)
+    let f2: [u8; 10] = [
         0x31, 0xC9, // +0x1040: xor ecx, ecx
-        0x0F, 0x77, // +0x1042: emms (generic interpreter)
-        0x83, 0xC0, 0x07, // +0x1044: add eax, 7 (resume IP!)
-        0xC3, // +0x1047: ret
+        0x64, 0x48, 0x8B, 0x00, // +0x1042: mov rax, fs:[rax] (generic interpreter)
+        0x83, 0xC0, 0x07, // +0x1046: add eax, 7 (resume IP!)
+        0xC3, // +0x1049: ret
     ];
     img[0x1040..0x1040 + f2.len()].copy_from_slice(&f2);
 
@@ -3001,12 +3001,12 @@ fn closure_discovers_mid_block_resume_after_non_jit_op() {
     let mut bc = Box::new(BlockCache::new());
     let (ips, _) = unsafe { discover(&mut *bc, base, img.len(), &[0x1000, 0x1040], DEFAULT_AOT_CLOSURE) };
     assert!(
-        ips.contains(&(base as u64 + 0x100B)),
-        "expected post-dppd resume IP +0x100B in discovered blocks: {ips:#x?}"
+        ips.contains(&(base as u64 + 0x1007)),
+        "expected post-fld1 resume IP +0x1007 in discovered blocks: {ips:#x?}"
     );
     assert!(
-        ips.contains(&(base as u64 + 0x1044)),
-        "expected post-emms resume IP +0x1044 in discovered blocks: {ips:#x?}"
+        ips.contains(&(base as u64 + 0x1046)),
+        "expected post-fs-mov resume IP +0x1046 in discovered blocks: {ips:#x?}"
     );
 }
 
