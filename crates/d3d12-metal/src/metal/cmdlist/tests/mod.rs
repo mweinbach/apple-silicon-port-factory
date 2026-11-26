@@ -3633,11 +3633,15 @@ fn list_start_explicit_blit_narrowing_and_cross_list_trailing_guard_on_gpu() {
     // Part A: `L1` runs `Dispatch` (`clear_uav`), closes with a trailing narrowing transition
     // `Transition(uav_buf, UAV -> RENDER_TARGET)` (not consumed in `L1`).
     // `emit_close_trailing_producer_barriers()` MUST publish `Dispatch -> Blit` at `L1.close()`.
+    let _guard = gpu_stats_lock();
+    let trail0 = stats::c::qb_list_trail.load(std::sync::atomic::Ordering::Relaxed);
     let mut l1 = CommandList::new(ListType::Direct).unwrap();
     l1.begin(&alloc1).unwrap();
     l1.clear_uav(&uav_buf, Some(&raw_uav_desc), ClearValue::Uint([0xdead_beef; 4]), &[]).unwrap();
     l1.barrier_list_with(&[Barrier::Transition(uav_id, STATE_UAV, STATE_RENDER_TARGET)], true, false);
     l1.close().unwrap();
+    let trail1 = stats::c::qb_list_trail.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(trail1 - trail0, 1, "unconsumed UAV->RT at L1.close() must emit trailing producer barrier");
 
     // Part B: `L2` starts with `Transition(rt1, RENDER_TARGET -> COPY_DEST)` + `Transition(rt2, RENDER_TARGET -> COPY_DEST)`
     // + `Transition(uav_buf, RENDER_TARGET -> COPY_SOURCE)`.
@@ -3676,6 +3680,12 @@ fn list_start_explicit_blit_narrowing_and_cross_list_trailing_guard_on_gpu() {
     l2.copy_texture_region(CopyLoc::Footprint(&rb_tex, fp), [0, 0, 0], CopyLoc::Subresource(&rt1, 0), None)
         .unwrap();
     l2.close().unwrap();
+    let trail2 = stats::c::qb_list_trail.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        trail2 - trail1,
+        0,
+        "L2 consumed all RT->COPY_* narrowing transitions in its narrowed Blit encoder, so close() must emit zero trailing producer barriers"
+    );
 
     // Part C: `COMMON` (`s0 == 0`) and `ALLOW_SIMULTANEOUS_ACCESS` must taint and fall back to `All -> Blit`.
     let mut l3 = CommandList::new(ListType::Direct).unwrap();

@@ -822,16 +822,25 @@ impl CommandList {
             has_unknown_narrow_r = true;
         } else {
             for &(r, narrow, s1_full, req) in &self.bar.trail_narrow_items {
+                let sync_covers = |sync: &StageSync| -> bool {
+                    let pre_ok = sync.pre_list_all
+                        || (narrow != MTLStages::All && sync.pre_list_stages.contains(narrow));
+                    if !pre_ok {
+                        return false;
+                    }
+                    STAGE_BITS.iter().enumerate().all(|(pi, &pbit)| {
+                        !(narrow == MTLStages::All || narrow.contains(pbit))
+                            || sync.gen[pi] >= req[pi]
+                    })
+                };
                 let satisfied = STAGE_BITS.iter().enumerate().any(|(si, &bit)| {
                     if !s1_full.contains(bit) {
                         return false;
                     }
-                    let done_closed = self.bar.stage_gen[si] > 0
-                        && Self::unsatisfied_sync_after(narrow, &self.bar.stage_sync[si], &req)
-                            .is_empty();
+                    let done_closed =
+                        self.bar.stage_gen[si] > 0 && sync_covers(&self.bar.stage_sync[si]);
                     let done_open = self.bar.enc_ran_stages.contains(bit)
-                        && Self::unsatisfied_sync_after(narrow, &self.bar.enc_cur_sync[si], &req)
-                            .is_empty();
+                        && sync_covers(&self.bar.enc_cur_sync[si]);
                     done_closed || done_open
                 });
                 if !satisfied {
