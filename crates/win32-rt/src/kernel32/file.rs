@@ -8138,9 +8138,6 @@ struct VolumeStorageInfo {
     partition_number: u32,
     partition_offset: u64,
     volume_size_bytes: u64,
-    volume_free_bytes: u64,
-    cluster_size: u32,
-    volume_serial: u64,
     media_uuid: String,
 }
 
@@ -8165,9 +8162,6 @@ impl Default for VolumeStorageInfo {
             partition_number: 1,
             partition_offset: 0,
             volume_size_bytes: 0,
-            volume_free_bytes: 0,
-            cluster_size: 4096,
-            volume_serial: 0,
             media_uuid: String::new(),
         }
     }
@@ -8474,14 +8468,10 @@ unsafe fn query_volume_storage_info(f: &FileObj) -> VolumeStorageInfo {
     };
     if got_sfs {
         let bsize = (sfs.f_bsize as u64).max(512);
-        info.cluster_size = bsize as u32;
         info.logical_sector_size = (bsize as u32).min(4096);
         info.physical_sector_size = bsize as u32;
         info.volume_size_bytes = (sfs.f_blocks as u64).saturating_mul(bsize);
-        info.volume_free_bytes = (sfs.f_bfree as u64).saturating_mul(bsize);
         info.writable = (sfs.f_flags & libc::MNT_RDONLY as u32) == 0;
-        let fsid_words = std::ptr::read_unaligned(&sfs.f_fsid as *const libc::fsid_t as *const [u32; 2]);
-        info.volume_serial = ((fsid_words[1] as u64) << 32) | (fsid_words[0] as u64);
 
         let mnt_from = std::ffi::CStr::from_ptr(sfs.f_mntfromname.as_ptr()).to_string_lossy();
         if let Some(bsd) = mnt_from.strip_prefix("/dev/") {
@@ -8571,6 +8561,9 @@ pub unsafe extern "win64" fn DeviceIoControl(
     ret: *mut u32,
     ov: *mut OVERLAPPED,
 ) -> BOOL {
+    if !ret.is_null() {
+        std::ptr::write_unaligned(ret, 0);
+    }
     let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
@@ -9091,23 +9084,12 @@ pub unsafe extern "win64" fn DeviceIoControl(
         }
         FSCTL_IS_VOLUME_MOUNTED => put_exact(&[]),
         FSCTL_GET_NTFS_VOLUME_DATA => {
-            let vol = query_volume_storage_info(&f);
-            let bps = vol.logical_sector_size.max(512) as u64;
-            let bpc = vol.cluster_size.max(bps as u32) as u64;
-            let total_sectors = vol.volume_size_bytes / bps;
-            let total_clusters = vol.volume_size_bytes / bpc;
-            let free_clusters = vol.volume_free_bytes / bpc;
-            // NTFS_VOLUME_DATA_BUFFER (96 bytes)
-            let mut d = [0u8; 96];
-            d[0..8].copy_from_slice(&vol.volume_serial.to_le_bytes());
-            d[8..16].copy_from_slice(&(total_sectors as i64).to_le_bytes());
-            d[16..24].copy_from_slice(&(total_clusters as i64).to_le_bytes());
-            d[24..32].copy_from_slice(&(free_clusters as i64).to_le_bytes());
-            d[40..44].copy_from_slice(&(bps as u32).to_le_bytes());
-            d[44..48].copy_from_slice(&(bpc as u32).to_le_bytes());
-            d[48..52].copy_from_slice(&1024u32.to_le_bytes()); // BytesPerFileRecordSegment
-            d[52..56].copy_from_slice(&0u32.to_le_bytes()); // ClustersPerFileRecordSegment
-            put_exact(&d)
+            // Host APFS/HFS+ volumes have no NTFS MFT/filesystem metadata; reject honestly
+            // with ERROR_INVALID_FUNCTION (matching Windows on non-NTFS volumes) rather than
+            // returning a fabricated NTFS_VOLUME_DATA_BUFFER with zeroed MFT fields.
+            log::debug!("DeviceIoControl: FSCTL_GET_NTFS_VOLUME_DATA unsupported on non-NTFS host volume -> ERROR_INVALID_FUNCTION");
+            set_err(err::ERROR_INVALID_FUNCTION);
+            FALSE
         }
         FSCTL_LOCK_VOLUME | FSCTL_UNLOCK_VOLUME => {
             // Locking/dismounting a mounted OS volume requires exclusive admin access on Windows.
@@ -12531,12 +12513,15 @@ mod tests {
             );
             assert_eq!((gex.as_ptr().add(24) as *const i64).read_unaligned() as u64, vol_len);
 
+            // FSCTL_GET_NTFS_VOLUME_DATA is rejected honestly on non-NTFS host volumes.
             let mut ntfs = [0u8; 96];
+            ret = 0xDEAD;
             assert_eq!(
                 DeviceIoControl(hdev, FSCTL_GET_NTFS_VOLUME_DATA, std::ptr::null(), 0, ntfs.as_mut_ptr() as _, 96, &mut ret, std::ptr::null_mut()),
-                TRUE
+                FALSE
             );
-            assert_eq!(ret, 96);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_FUNCTION);
+            assert_eq!(ret, 0);
 
             // Unrecognized IOCTL returns FALSE + ERROR_INVALID_FUNCTION
             assert_eq!(
