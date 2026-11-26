@@ -2,9 +2,9 @@
 //! frame buffer management, and Bink 2 / VideoToolbox HEVC decode pipeline.
 
 use super::async_threads::{
-    set_bink_error, AsyncDecodeGuard, MAX_ASYNC_THREADS, OS_CLOSE, OS_OPEN, OS_READ, OS_SEEK,
-    PREOPEN_FILE_OFFSET, PREOPEN_FRAME_RATE_DEN, PREOPEN_FRAME_RATE_NUM, PREOPEN_IO_SIZE,
-    PREOPEN_SIMULATE, PREOPEN_USER_IO, SOUND_DISABLED, SOUND_TRACK_SELECTION,
+    set_bink_error, spawn_async_job, AsyncDecodeGuard, MAX_ASYNC_THREADS, OS_CLOSE, OS_OPEN,
+    OS_READ, OS_SEEK, PREOPEN_FILE_OFFSET, PREOPEN_FRAME_RATE_DEN, PREOPEN_FRAME_RATE_NUM,
+    PREOPEN_IO_SIZE, PREOPEN_SIMULATE, PREOPEN_USER_IO, SOUND_DISABLED, SOUND_TRACK_SELECTION,
 };
 use super::audio as bink2_audio;
 use super::blit::fill_plane_set_black;
@@ -23,7 +23,105 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// Completion payload produced by an asynchronous worker decode and committed back onto
+/// `BinkInstance` on the calling thread when `BinkDoFrameAsyncWait` (or a synchronizing API)
+/// observes completion.
+struct AsyncDecodeResult {
+    video_us: u64,
+    video_buf: Vec<u8>,
+    hevc_decoder: Option<bink2_vt::VtHevcDecoder>,
+}
+
+struct AsyncJobInner {
+    done: bool,
+    result: Option<AsyncDecodeResult>,
+}
+
+/// Per-handle in-flight asynchronous video decode state.
+pub(crate) struct PendingAsyncDecode {
+    sync: Arc<(Mutex<AsyncJobInner>, Condvar)>,
+    cur_frame: u32,
+    fb_ptr: usize,
+    dst_idx: usize,
+    pub(crate) same_buf: bool,
+    read_us: u64,
+    audio_us: u64,
+    packet_bytes: u64,
+}
+
+/// Snapshotted destination/reference plane addresses handed to the background worker.
+///
+/// Safety invariant:
+/// - `dst_*` points to the back-buffer slot `dst_idx` exclusively owned by this in-flight job.
+/// - `ref_*` points to the read-only front-buffer slot `prev_idx` (or `0` when `ref_owned` is used
+///   for single-frame `same_buf` streams).
+/// - Every handle-mutating API (`BinkClose`, `BinkNextFrame`, `BinkGoto`,
+///   `BinkRegisterFrameBuffers`, `BinkDoFrame*`) drains this job before freeing or reassigning
+///   buffers.
+struct WorkerPlaneJob {
+    cur_frame: u32,
+    fourcc: u32,
+    video_flags: u32,
+    slices: SliceInfo,
+    is_key: bool,
+    has_video_payload: bool,
+    ya_w: usize,
+    ya_h: usize,
+    ya_pitch: usize,
+    crcb_pitch: usize,
+    ya_bytes: usize,
+    crcb_bytes: usize,
+    dst_y: usize,
+    dst_cr: usize,
+    dst_cb: usize,
+    dst_a: usize,
+    dst_h: usize,
+    dst_y_alloc: bool,
+    dst_cr_alloc: bool,
+    dst_cb_alloc: bool,
+    dst_a_alloc: bool,
+    dst_h_alloc: bool,
+    ref_y: usize,
+    ref_cr: usize,
+    ref_cb: usize,
+    ref_a: usize,
+    ref_h: usize,
+    ref_owned: Option<OwnedRefPlanes>,
+    video_buf: Vec<u8>,
+    hevc_decoder: Option<bink2_vt::VtHevcDecoder>,
+}
+
+struct OwnedRefPlanes {
+    y: Vec<u8>,
+    cr: Vec<u8>,
+    cb: Vec<u8>,
+    a: Option<Vec<u8>>,
+    h: Option<Vec<u8>>,
+}
+
+/// Ensures the waiting caller is always unblocked even if a decode task unexpectedly unwinds.
+struct AsyncCompletionSignal {
+    sync: Arc<(Mutex<AsyncJobInner>, Condvar)>,
+    result: Option<AsyncDecodeResult>,
+    guard: Option<AsyncDecodeGuard>,
+}
+
+impl Drop for AsyncCompletionSignal {
+    fn drop(&mut self) {
+        // Release the thread-pool slot before waking `BinkDoFrameAsyncWait` so callers observing
+        // completion also observe `in_flight == 0` with zero lock nesting.
+        drop(self.guard.take());
+        let (lock, cvar) = &*self.sync;
+        let mut inner = lock.lock().unwrap_or_else(|e| e.into_inner());
+        inner.result = self.result.take();
+        inner.done = true;
+        drop(inner);
+        cvar.notify_all();
+    }
+}
 
 /// Heap-allocated Bink handle whose prefix `[0..0x800]` matches the binary layout
 /// of `BINK` in `bink2w64.dll` (`0x6e8` bytes).
@@ -71,6 +169,8 @@ pub struct BinkInstance {
     pub(crate) frame_timings: VecDeque<FrameTimingSample>,
     pub(crate) subtitles: Vec<SubtitleEntry>,
     pub(crate) hevc_decoder: Option<bink2_vt::VtHevcDecoder>,
+    pub(crate) pending_async: Option<PendingAsyncDecode>,
+    pub(crate) async_video_buf: Vec<u8>,
 }
 
 impl BinkInstance {
@@ -421,6 +521,8 @@ pub(crate) unsafe fn open_with_options(
         frame_timings: VecDeque::new(),
         subtitles: Vec::new(),
         hevc_decoder: None,
+        pending_async: None,
+        async_video_buf: Vec::new(),
     });
 
     let hbink_ptr = inst.raw.as_mut_ptr();
@@ -1005,6 +1107,9 @@ pub(crate) unsafe fn close(bink: *mut c_void) {
         return;
     }
     let mut inst = Box::from_raw(bink as *mut BinkInstance);
+    // Ensure any in-flight worker decode finishes writing plane buffers before releasing I/O,
+    // owned planes, or the BinkInstance itself.
+    drain_async_decode(&mut inst);
     if inst.is_user_io {
         let close_fn = inst.rd_u64(0x238) as usize;
         if close_fn != 0 {
@@ -1132,6 +1237,7 @@ pub(crate) unsafe fn register_frame_buffers(bink: *mut c_void, fbset: *mut BinkF
         return;
     }
     let inst = &mut *(bink as *mut BinkInstance);
+    drain_async_decode(inst);
     let ptr = if fbset.is_null() {
         (&raw mut inst.default_frame_buffers) as u64
     } else {
@@ -1510,11 +1616,473 @@ pub(crate) unsafe fn decode_frame_into_buffers(inst: &mut BinkInstance, decode_a
     }
 }
 
+unsafe fn execute_worker_plane_job(mut job: WorkerPlaneJob) -> AsyncDecodeResult {
+    let t_vid = Instant::now();
+    let mut decoded = false;
+
+    if job.has_video_payload {
+        if is_kb2v_magic(job.fourcc) && !job.video_buf.is_empty() {
+            if job.dst_y != 0
+                && job.dst_cr != 0
+                && job.dst_cb != 0
+                && job.ya_bytes > 0
+                && job.crcb_bytes > 0
+            {
+                let dst_y = std::slice::from_raw_parts_mut(job.dst_y as *mut u8, job.ya_bytes);
+                let dst_cr = std::slice::from_raw_parts_mut(job.dst_cr as *mut u8, job.crcb_bytes);
+                let dst_cb = std::slice::from_raw_parts_mut(job.dst_cb as *mut u8, job.crcb_bytes);
+                if let Some(ref mut hevc) = job.hevc_decoder {
+                    match hevc.decode_hvcc_frame(
+                        &job.video_buf,
+                        job.ya_w,
+                        job.ya_h,
+                        job.ya_pitch,
+                        job.crcb_pitch,
+                        dst_y,
+                        dst_cr,
+                        dst_cb,
+                    ) {
+                        Ok(()) => decoded = true,
+                        Err(e) => {
+                            log::warn!(
+                                "bink2w64 (KB2v HEVC): frame {} decode failed: {e}",
+                                job.cur_frame
+                            );
+                        }
+                    }
+                }
+            }
+        } else if is_bink2_magic(job.fourcc)
+            && job.video_buf.len() >= 8
+            && job.dst_y != 0
+            && job.dst_cr != 0
+            && job.dst_cb != 0
+            && job.ya_bytes > 0
+            && job.crcb_bytes > 0
+        {
+            let has_alpha = (job.video_flags & 0x0010_0000) != 0;
+            let has_hdr = (job.video_flags & 0x0000_0004) != 0;
+
+            let refs_valid = job.ref_owned.is_some()
+                || (job.ref_y != 0 && job.ref_cr != 0 && job.ref_cb != 0);
+            if refs_valid {
+                let (ref_y, ref_cr, ref_cb, ref_a, ref_h) = if let Some(ref owned) = job.ref_owned {
+                    (
+                        owned.y.as_slice(),
+                        owned.cr.as_slice(),
+                        owned.cb.as_slice(),
+                        owned.a.as_deref(),
+                        owned.h.as_deref(),
+                    )
+                } else {
+                    let ra = if has_alpha && job.ref_a != 0 {
+                        Some(std::slice::from_raw_parts(
+                            job.ref_a as *const u8,
+                            job.ya_bytes,
+                        ))
+                    } else {
+                        None
+                    };
+                    let rh = if has_hdr && job.ref_h != 0 {
+                        Some(std::slice::from_raw_parts(
+                            job.ref_h as *const u8,
+                            job.ya_bytes,
+                        ))
+                    } else {
+                        None
+                    };
+                    (
+                        std::slice::from_raw_parts(job.ref_y as *const u8, job.ya_bytes),
+                        std::slice::from_raw_parts(job.ref_cr as *const u8, job.crcb_bytes),
+                        std::slice::from_raw_parts(job.ref_cb as *const u8, job.crcb_bytes),
+                        ra,
+                        rh,
+                    )
+                };
+
+                let dst_y = std::slice::from_raw_parts_mut(job.dst_y as *mut u8, job.ya_bytes);
+                let dst_cr = std::slice::from_raw_parts_mut(job.dst_cr as *mut u8, job.crcb_bytes);
+                let dst_cb = std::slice::from_raw_parts_mut(job.dst_cb as *mut u8, job.crcb_bytes);
+                let dst_a = if has_alpha && job.dst_a != 0 {
+                    Some(std::slice::from_raw_parts_mut(
+                        job.dst_a as *mut u8,
+                        job.ya_bytes,
+                    ))
+                } else {
+                    None
+                };
+                let dst_h = if has_hdr && job.dst_h != 0 {
+                    Some(std::slice::from_raw_parts_mut(
+                        job.dst_h as *mut u8,
+                        job.ya_bytes,
+                    ))
+                } else {
+                    None
+                };
+
+                let mut planes = FramePlanes {
+                    ya_width: job.ya_w,
+                    ya_height: job.ya_h,
+                    ya_pitch: job.ya_pitch,
+                    crcb_pitch: job.crcb_pitch,
+                    dst_y,
+                    dst_cr,
+                    dst_cb,
+                    dst_a,
+                    dst_h,
+                    ref_y,
+                    ref_cr,
+                    ref_cb,
+                    ref_a,
+                    ref_h,
+                };
+                match decode_frame(
+                    &job.video_buf,
+                    &job.slices,
+                    job.is_key,
+                    has_alpha,
+                    has_hdr,
+                    &mut planes,
+                ) {
+                    Ok(()) => decoded = true,
+                    Err(e) => {
+                        log::warn!("bink2w64: frame {} decode failed: {e}", job.cur_frame);
+                    }
+                }
+            }
+        }
+    }
+
+    if !decoded {
+        if job.dst_y_alloc && job.dst_y != 0 && job.ya_bytes > 0 {
+            std::ptr::write_bytes(job.dst_y as *mut u8, 0x10, job.ya_bytes);
+        }
+        if job.dst_cr_alloc && job.dst_cr != 0 && job.crcb_bytes > 0 {
+            std::ptr::write_bytes(job.dst_cr as *mut u8, 0x80, job.crcb_bytes);
+        }
+        if job.dst_cb_alloc && job.dst_cb != 0 && job.crcb_bytes > 0 {
+            std::ptr::write_bytes(job.dst_cb as *mut u8, 0x80, job.crcb_bytes);
+        }
+        if job.dst_a_alloc && job.dst_a != 0 && job.ya_bytes > 0 {
+            std::ptr::write_bytes(job.dst_a as *mut u8, 0xFF, job.ya_bytes);
+        }
+        if job.dst_h_alloc && job.dst_h != 0 && job.ya_bytes > 0 {
+            std::ptr::write_bytes(job.dst_h as *mut u8, 0x00, job.ya_bytes);
+        }
+    }
+
+    AsyncDecodeResult {
+        video_us: t_vid.elapsed().as_micros() as u64,
+        video_buf: job.video_buf,
+        hevc_decoder: job.hevc_decoder,
+    }
+}
+
+unsafe fn commit_async_decode(
+    inst: &mut BinkInstance,
+    pending: PendingAsyncDecode,
+    result: Option<AsyncDecodeResult>,
+) {
+    let video_us = if let Some(res) = result {
+        inst.async_video_buf = res.video_buf;
+        if res.hevc_decoder.is_some() {
+            inst.hevc_decoder = res.hevc_decoder;
+        }
+        res.video_us
+    } else {
+        0
+    };
+
+    if pending.fb_ptr != 0 {
+        let fb = pending.fb_ptr as *mut BinkFrameBuffers;
+        std::ptr::write_unaligned(
+            std::ptr::addr_of_mut!((*fb).frame_num),
+            pending.dst_idx as u32,
+        );
+    }
+
+    inst.total_video_decomp_us = inst.total_video_decomp_us.saturating_add(video_us);
+    if inst.frame_timings.len() >= 120 {
+        inst.frame_timings.pop_front();
+    }
+    inst.frame_timings.push_back(FrameTimingSample {
+        video_us,
+        audio_us: pending.audio_us,
+        read_us: pending.read_us,
+        blit_us: 0,
+        packet_bytes: pending.packet_bytes,
+    });
+
+    inst.last_decoded_frame = pending.cur_frame;
+    inst.wr_u32(0x010, pending.cur_frame);
+    inst.played_frames = inst.played_frames.saturating_add(1);
+    if inst.playback_start.is_none() {
+        inst.playback_start = Some(Instant::now());
+        inst.playback_base_frame = inst.played_frames.saturating_sub(1);
+    }
+}
+
+/// Wait up to `us` microseconds (`< 0` = infinite, `0` = non-blocking poll) for this handle's
+/// in-flight async decode to finish. Commits frame-buffer publication & stats on completion.
+/// Returns `1` if complete (or no async decode is in flight), `0` if still in flight.
+pub(crate) unsafe fn wait_and_commit_async_decode(inst: &mut BinkInstance, us: i32) -> i32 {
+    let Some(ref pending) = inst.pending_async else {
+        return 1;
+    };
+    let (lock, cvar) = &*pending.sync;
+    let mut inner = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.done {
+        if us == 0 {
+            return 0;
+        }
+        if us < 0 {
+            while !inner.done {
+                inner = cvar.wait(inner).unwrap_or_else(|e| e.into_inner());
+            }
+        } else {
+            let deadline = Instant::now() + Duration::from_micros(us as u64);
+            while !inner.done {
+                let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                    return 0;
+                };
+                let (next_inner, wait_res) = cvar
+                    .wait_timeout(inner, rem)
+                    .unwrap_or_else(|e| e.into_inner());
+                inner = next_inner;
+                if inner.done {
+                    break;
+                }
+                if wait_res.timed_out() {
+                    return 0;
+                }
+            }
+        }
+    }
+    let result = inner.result.take();
+    drop(inner);
+
+    let pending = inst.pending_async.take().unwrap();
+    commit_async_decode(inst, pending, result);
+    1
+}
+
+/// Synchronously wait for and commit any in-flight async decode on `inst`.
+#[inline]
+pub(crate) unsafe fn drain_async_decode(inst: &mut BinkInstance) {
+    if inst.pending_async.is_some() {
+        let _ = wait_and_commit_async_decode(inst, -1);
+    }
+}
+
+/// Non-blocking commit if an in-flight async decode on `inst` has already completed.
+#[inline]
+pub(crate) unsafe fn try_commit_async_decode(inst: &mut BinkInstance) {
+    if inst.pending_async.is_some() {
+        let _ = wait_and_commit_async_decode(inst, 0);
+    }
+}
+
+unsafe fn dispatch_frame_async(inst: &mut BinkInstance, thread_ids: &[u32]) -> i32 {
+    // If an earlier async decode is still pending on this handle, synchronize it first so
+    // back-to-back calls without an intervening wait never race on frame buffers.
+    drain_async_decode(inst);
+
+    let cur_frame = inst.rd_u32(0x00c).max(1);
+    if inst.last_decoded_frame == cur_frame {
+        return 1;
+    }
+
+    // Phase 1: Packet I/O runs on the caller's Win32 thread so guest custom I/O callbacks
+    // (`user_io`, `OS_READ`, `OS_SEEK`) always execute with valid guest TLS/TEB state.
+    let t_read = Instant::now();
+    let pkt_loaded = ensure_frame_packet_loaded(inst, cur_frame);
+    let read_us = t_read.elapsed().as_micros() as u64;
+    let packet_bytes = if pkt_loaded {
+        inst.cached_packet_len as u64
+    } else {
+        0
+    };
+    inst.total_read_us = inst.total_read_us.saturating_add(read_us);
+    inst.total_bytes_read = inst.total_bytes_read.saturating_add(packet_bytes);
+
+    // Phase 2: Submit lightweight Bink audio chunks on the calling thread.
+    let mut audio_us = 0u64;
+    if pkt_loaded && inst.file_num_tracks > 0 {
+        let t0 = Instant::now();
+        let pkt_len = inst.cached_packet_len;
+        inst.audio_player.submit_frame_packets(
+            &inst.frame_packet_buf[..pkt_len],
+            &inst.cached_track_spans,
+        );
+        audio_us = t0.elapsed().as_micros() as u64;
+        inst.total_audio_decomp_us = inst.total_audio_decomp_us.saturating_add(audio_us);
+    }
+
+    let fb = inst.rd_u64(0x0b0) as *mut BinkFrameBuffers;
+    if !inst.video_on || fb.is_null() {
+        if inst.frame_timings.len() >= 120 {
+            inst.frame_timings.pop_front();
+        }
+        inst.frame_timings.push_back(FrameTimingSample {
+            video_us: 0,
+            audio_us,
+            read_us,
+            blit_us: 0,
+            packet_bytes,
+        });
+        inst.last_decoded_frame = cur_frame;
+        inst.wr_u32(0x010, cur_frame);
+        inst.played_frames = inst.played_frames.saturating_add(1);
+        if inst.playback_start.is_none() {
+            inst.playback_start = Some(Instant::now());
+            inst.playback_base_frame = inst.played_frames.saturating_sub(1);
+        }
+        return 1;
+    }
+
+    let fb_val = std::ptr::read_unaligned(fb);
+    let total = (fb_val.total_frames.max(1) as u32).min(3);
+    let prev_idx = (fb_val.frame_num % total) as usize;
+    let dst_idx = ((fb_val.frame_num + 1) % total) as usize;
+    let dst_ps = fb_val.frames[dst_idx];
+    let ref_ps = fb_val.frames[prev_idx];
+
+    let ya_w = fb_val.ya_buffer_width as usize;
+    let ya_h = fb_val.ya_buffer_height as usize;
+    let crcb_h = fb_val.crcb_buffer_height as usize;
+    let ya_pitch = dst_ps.y_plane.buffer_pitch as usize;
+    let crcb_pitch = dst_ps.cr_plane.buffer_pitch as usize;
+    let ya_bytes = ya_pitch.saturating_mul(ya_h);
+    let crcb_bytes = crcb_pitch.saturating_mul(crcb_h);
+
+    let video_flags = inst.rd_u32(0x024);
+    let fourcc = inst.rd_u32(0x118);
+    let has_alpha = (video_flags & 0x0010_0000) != 0;
+    let has_hdr = (video_flags & 0x0000_0004) != 0;
+    let same_buf = dst_idx == prev_idx || dst_ps.y_plane.buffer == ref_ps.y_plane.buffer;
+
+    let mut video_buf = std::mem::take(&mut inst.async_video_buf);
+    video_buf.clear();
+    let has_video_payload = pkt_loaded && inst.cached_video_offset < inst.cached_packet_len;
+    if has_video_payload {
+        video_buf.extend_from_slice(
+            &inst.frame_packet_buf[inst.cached_video_offset..inst.cached_packet_len],
+        );
+    }
+
+    let ref_owned = if same_buf
+        && has_video_payload
+        && is_bink2_magic(fourcc)
+        && !ref_ps.y_plane.buffer.is_null()
+        && !ref_ps.cr_plane.buffer.is_null()
+        && !ref_ps.cb_plane.buffer.is_null()
+        && ya_bytes > 0
+        && crcb_bytes > 0
+    {
+        Some(OwnedRefPlanes {
+            y: std::slice::from_raw_parts(ref_ps.y_plane.buffer as *const u8, ya_bytes).to_vec(),
+            cr: std::slice::from_raw_parts(ref_ps.cr_plane.buffer as *const u8, crcb_bytes)
+                .to_vec(),
+            cb: std::slice::from_raw_parts(ref_ps.cb_plane.buffer as *const u8, crcb_bytes)
+                .to_vec(),
+            a: if has_alpha && !ref_ps.a_plane.buffer.is_null() {
+                Some(
+                    std::slice::from_raw_parts(ref_ps.a_plane.buffer as *const u8, ya_bytes)
+                        .to_vec(),
+                )
+            } else {
+                None
+            },
+            h: if has_hdr && !ref_ps.h_plane.buffer.is_null() {
+                Some(
+                    std::slice::from_raw_parts(ref_ps.h_plane.buffer as *const u8, ya_bytes)
+                        .to_vec(),
+                )
+            } else {
+                None
+            },
+        })
+    } else {
+        None
+    };
+
+    let hevc_decoder = if is_kb2v_magic(fourcc) {
+        inst.hevc_decoder.take()
+    } else {
+        None
+    };
+
+    let job = WorkerPlaneJob {
+        cur_frame,
+        fourcc,
+        video_flags,
+        slices: inst.slices,
+        is_key: inst.cached_packet_is_key,
+        has_video_payload,
+        ya_w,
+        ya_h,
+        ya_pitch,
+        crcb_pitch,
+        ya_bytes,
+        crcb_bytes,
+        dst_y: dst_ps.y_plane.buffer as usize,
+        dst_cr: dst_ps.cr_plane.buffer as usize,
+        dst_cb: dst_ps.cb_plane.buffer as usize,
+        dst_a: dst_ps.a_plane.buffer as usize,
+        dst_h: dst_ps.h_plane.buffer as usize,
+        dst_y_alloc: dst_ps.y_plane.allocate != 0,
+        dst_cr_alloc: dst_ps.cr_plane.allocate != 0,
+        dst_cb_alloc: dst_ps.cb_plane.allocate != 0,
+        dst_a_alloc: dst_ps.a_plane.allocate != 0,
+        dst_h_alloc: dst_ps.h_plane.allocate != 0,
+        ref_y: ref_ps.y_plane.buffer as usize,
+        ref_cr: ref_ps.cr_plane.buffer as usize,
+        ref_cb: ref_ps.cb_plane.buffer as usize,
+        ref_a: ref_ps.a_plane.buffer as usize,
+        ref_h: ref_ps.h_plane.buffer as usize,
+        ref_owned,
+        video_buf,
+        hevc_decoder,
+    };
+
+    let guard = AsyncDecodeGuard::acquire(thread_ids);
+    let sync = Arc::new((
+        Mutex::new(AsyncJobInner {
+            done: false,
+            result: None,
+        }),
+        Condvar::new(),
+    ));
+
+    inst.pending_async = Some(PendingAsyncDecode {
+        sync: sync.clone(),
+        cur_frame,
+        fb_ptr: fb as usize,
+        dst_idx,
+        same_buf,
+        read_us,
+        audio_us,
+        packet_bytes,
+    });
+
+    spawn_async_job(move || {
+        let mut signal = AsyncCompletionSignal {
+            sync,
+            result: None,
+            guard: Some(guard),
+        };
+        signal.result = Some(execute_worker_plane_job(job));
+    });
+
+    1
+}
+
 pub(crate) unsafe fn do_frame(bink: *mut c_void) -> i32 {
     if bink.is_null() {
         return 0;
     }
     let inst = &mut *(bink as *mut BinkInstance);
+    drain_async_decode(inst);
     decode_frame_into_buffers(inst, true);
     0
 }
@@ -1524,6 +2092,7 @@ pub(crate) unsafe fn do_frame_plane(bink: *mut c_void, which_planes: u32) -> i32
         return 0;
     }
     let inst = &mut *(bink as *mut BinkInstance);
+    drain_async_decode(inst);
     decode_frame_into_buffers(inst, true);
     0
 }
@@ -1532,10 +2101,8 @@ pub(crate) unsafe fn do_frame_async(bink: *mut c_void, thread_one: u32, thread_t
     if bink.is_null() {
         return 0;
     }
-    let _guard = AsyncDecodeGuard::acquire(&[thread_one, thread_two]);
     let inst = &mut *(bink as *mut BinkInstance);
-    decode_frame_into_buffers(inst, true);
-    1
+    dispatch_frame_async(inst, &[thread_one, thread_two])
 }
 
 pub(crate) unsafe fn do_frame_async_multi(
@@ -1554,8 +2121,71 @@ pub(crate) unsafe fn do_frame_async_multi(
             tids.push(std::ptr::read_unaligned(threads.add(i)));
         }
     }
-    let _guard = AsyncDecodeGuard::acquire(&tids);
     let inst = &mut *(bink as *mut BinkInstance);
-    decode_frame_into_buffers(inst, true);
-    1
+    dispatch_frame_async(inst, &tids)
+}
+
+/// Test-only helper to deterministically stage an in-flight async worker job that blocks on a
+/// caller-controlled gate, enabling race-free tests of wait timeouts, multi-handle independence,
+/// `BinkClose`-while-in-flight, and `BinkNextFrame`/`BinkGoto` synchronization.
+#[cfg(test)]
+pub(crate) unsafe fn start_gated_async_job_for_test(
+    bink: *mut c_void,
+    thread_ids: &[u32],
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    worker_finished: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let inst = &mut *(bink as *mut BinkInstance);
+    drain_async_decode(inst);
+
+    let cur_frame = inst.rd_u32(0x00c).max(1);
+    let fb = inst.rd_u64(0x0b0) as *mut BinkFrameBuffers;
+    let (fb_ptr, dst_idx, same_buf) = if !fb.is_null() {
+        let fb_val = std::ptr::read_unaligned(fb);
+        let total = (fb_val.total_frames.max(1) as u32).min(3);
+        let prev_idx = (fb_val.frame_num % total) as usize;
+        let next_idx = ((fb_val.frame_num + 1) % total) as usize;
+        (fb as usize, next_idx, next_idx == prev_idx)
+    } else {
+        (0, 0, false)
+    };
+
+    let guard = AsyncDecodeGuard::acquire(thread_ids);
+    let sync = Arc::new((
+        Mutex::new(AsyncJobInner {
+            done: false,
+            result: None,
+        }),
+        Condvar::new(),
+    ));
+    inst.pending_async = Some(PendingAsyncDecode {
+        sync: sync.clone(),
+        cur_frame,
+        fb_ptr,
+        dst_idx,
+        same_buf,
+        read_us: 0,
+        audio_us: 0,
+        packet_bytes: 0,
+    });
+
+    spawn_async_job(move || {
+        let mut signal = AsyncCompletionSignal {
+            sync,
+            result: None,
+            guard: Some(guard),
+        };
+        let (glock, gcvar) = &*gate;
+        let mut released = glock.lock().unwrap_or_else(|e| e.into_inner());
+        while !*released {
+            released = gcvar.wait(released).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(released);
+        worker_finished.store(true, Ordering::Release);
+        signal.result = Some(AsyncDecodeResult {
+            video_us: 100,
+            video_buf: Vec::new(),
+            hevc_decoder: None,
+        });
+    });
 }

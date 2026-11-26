@@ -307,8 +307,9 @@ pub unsafe extern "win64" fn _Thrd_detach(thr: *const ThrdT) -> i32 {
     if CloseHandle((*thr).hnd) != 0 { 0 } else { 4 }
 }
 
+#[inline(never)]
 pub unsafe extern "win64" fn _Thrd_yield() {
-    let _ = libc::sched_yield();
+    let _ = crate::kernel32::time::SwitchToThread();
 }
 
 pub unsafe extern "win64" fn _Thrd_sleep(target: *const Xtime) {

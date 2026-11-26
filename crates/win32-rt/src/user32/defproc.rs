@@ -9,9 +9,21 @@ pub const SC_SIZE: usize = 0xF000;
 pub const SC_MOVE: usize = 0xF010;
 pub const SC_MINIMIZE: usize = 0xF020;
 pub const SC_MAXIMIZE: usize = 0xF030;
+pub const SC_NEXTWINDOW: usize = 0xF040;
+pub const SC_PREVWINDOW: usize = 0xF050;
 pub const SC_CLOSE: usize = 0xF060;
+pub const SC_VSCROLL: usize = 0xF070;
+pub const SC_HSCROLL: usize = 0xF080;
+pub const SC_MOUSEMENU: usize = 0xF090;
 pub const SC_KEYMENU: usize = 0xF100;
+pub const SC_ARRANGE: usize = 0xF110;
 pub const SC_RESTORE: usize = 0xF120;
+pub const SC_TASKLIST: usize = 0xF130;
+pub const SC_SCREENSAVE: usize = 0xF140;
+pub const SC_HOTKEY: usize = 0xF150;
+pub const SC_DEFAULT: usize = 0xF160;
+pub const SC_MONITORPOWER: usize = 0xF170;
+pub const SC_CONTEXTHELP: usize = 0xF180;
 
 pub const HTCLIENT: isize = 1;
 pub const HTCAPTION: isize = 2;
@@ -150,8 +162,44 @@ pub unsafe fn def_window_proc(hwnd: usize, msg: u32, wparam: WPARAM, lparam: LPA
                 SC_RESTORE => {
                     window::ShowWindow(hwnd as HWND, window::SW_RESTORE);
                 }
-                SC_KEYMENU => {} // no menu bar
-                other => stub!("DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"),
+                SC_NEXTWINDOW | SC_PREVWINDOW => {
+                    let wins = window::top_level_windows();
+                    if wins.len() > 1 {
+                        let pos = wins.iter().position(|&h| h == hwnd).unwrap_or(0);
+                        let next_idx = if (wparam & 0xFFF0) == SC_NEXTWINDOW {
+                            (pos + 1) % wins.len()
+                        } else {
+                            (pos + wins.len() - 1) % wins.len()
+                        };
+                        let target = wins[next_idx];
+                        if target != hwnd {
+                            super::input::SetForegroundWindow(target as HWND);
+                        }
+                    }
+                }
+                SC_HOTKEY => {
+                    if lparam != 0 && window::exists(lparam as usize) {
+                        super::input::SetForegroundWindow(lparam as usize as HWND);
+                    }
+                }
+                // Window-manager / desktop shell commands: WindowServer owns drag/resize,
+                // scrollbars, menus, screensaver, and display power on macOS/iOS, so
+                // DefWindowProc returns 0 cleanly (matching Windows when disabled/unhandled).
+                SC_SIZE
+                | SC_MOVE
+                | SC_VSCROLL
+                | SC_HSCROLL
+                | SC_MOUSEMENU
+                | SC_KEYMENU
+                | SC_ARRANGE
+                | SC_TASKLIST
+                | SC_SCREENSAVE
+                | SC_DEFAULT
+                | SC_MONITORPOWER
+                | SC_CONTEXTHELP => {}
+                // Application-defined or unknown SC_* values: Windows DefWindowProc ignores
+                // them and returns 0.
+                _ => {}
             }
             0
         }
@@ -180,5 +228,57 @@ pub unsafe extern "win64" fn DefWindowProcA(hwnd: HWND, msg: u32, wparam: WPARAM
             def_window_proc(hwnd as usize, msg, wparam, w.as_ptr() as LPARAM)
         }
         _ => def_window_proc(hwnd as usize, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defproc_syscommand_handles_all_standard_and_unknown_codes() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            let cls = crate::strings::to_wide_z("DefProcSysCmdTest");
+            let wc = super::super::class::WNDCLASSEX {
+                cb_size: std::mem::size_of::<super::super::class::WNDCLASSEX>() as u32,
+                style: 0,
+                wndproc: super::super::WNDPROC_HANDLE_DEF_WINDOW_W,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+                icon_sm: 0,
+            };
+            let _ = super::super::class::RegisterClassExW(&wc);
+            let h1 = window::CreateWindowExW(
+                0, cls.as_ptr(), std::ptr::null(), ws::POPUP | ws::VISIBLE,
+                0, 0, 100, 100, std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(),
+            );
+            let h2 = window::CreateWindowExW(
+                0, cls.as_ptr(), std::ptr::null(), ws::POPUP | ws::VISIBLE,
+                10, 10, 100, 100, std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(),
+            );
+            assert!(!h1.is_null() && !h2.is_null());
+
+            // Documented no-op commands return 0 cleanly.
+            for cmd in [SC_SIZE, SC_MOVE, SC_SCREENSAVE, SC_MONITORPOWER, SC_CONTEXTHELP, SC_VSCROLL, SC_HSCROLL, 0x1230] {
+                assert_eq!(DefWindowProcW(h1, wm::SYSCOMMAND, cmd, 0), 0);
+            }
+            // SC_HOTKEY activates target HWND in lParam.
+            assert_eq!(DefWindowProcW(h1, wm::SYSCOMMAND, SC_HOTKEY, h2 as usize as LPARAM), 0);
+            // SC_NEXTWINDOW / SC_PREVWINDOW return 0 without panicking.
+            assert_eq!(DefWindowProcW(h1, wm::SYSCOMMAND, SC_NEXTWINDOW, 0), 0);
+            assert_eq!(DefWindowProcW(h1, wm::SYSCOMMAND, SC_PREVWINDOW, 0), 0);
+
+            let _ = window::DestroyWindow(h1);
+            let _ = window::DestroyWindow(h2);
+        })
+        .join()
+        .unwrap();
     }
 }

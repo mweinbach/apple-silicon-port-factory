@@ -3,6 +3,7 @@
 
 use crate::emu::jit::{
     self, AotReloc, AotStubOffs, AOT_STUBS_BYTES, RELOC_HOST_FN, RELOC_QPC_STATE,
+    RELOC_XINPUT_STATE,
 };
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -16,10 +17,13 @@ pub(super) const FORMAT_VERSION_V5: u32 = 5;
 /// Multi-bank format version (stores `stub_banks` table for >112 MiB executables).
 pub(super) const FORMAT_VERSION_V6: u32 = 6;
 /// Includes both shared timestamp entry points in each bank's stub table.
-pub(super) const FORMAT_VERSION: u32 = 7;
-const LEGACY_STUB_COUNT: usize = 10;
+pub(super) const FORMAT_VERSION_V7: u32 = 7;
+/// Includes per-site IC lookup/RAS-miss stub entries (`[u32; 16]`) and 2-way table/IC codegen.
+pub(super) const FORMAT_VERSION: u32 = 8;
+const LEGACY_STUB_COUNT_V6: usize = 10;
+const LEGACY_STUB_COUNT_V7: usize = 12;
 /// Bump on any codegen-relevant change the source hash can't see.
-const AOT_CODEGEN_VERSION: u64 = 3;
+const AOT_CODEGEN_VERSION: u64 = 4;
 
 /// Small 128-bit streaming hash (cache keys / file checksums, not cryptographic).
 pub(super) struct H128 {
@@ -621,8 +625,11 @@ impl Image {
                 && (l.cond_off == u32::MAX || in_code(l.cond_off, 4, 4))
         }) && self.relocs.iter().all(|r| {
             in_code(r.slot_off, 8, 8)
-                && r.kind <= RELOC_QPC_STATE
-                && (r.kind == RELOC_HOST_FN || r.kind == RELOC_QPC_STATE || r.src != 0)
+                && r.kind <= RELOC_XINPUT_STATE
+                && (r.kind == RELOC_HOST_FN
+                    || r.kind == RELOC_QPC_STATE
+                    || r.kind == RELOC_XINPUT_STATE
+                    || r.src != 0)
         })
     }
 }
@@ -691,7 +698,13 @@ pub(super) fn encode_with_version(
     }
     put32(&mut w, name.len() as u32);
     w.extend_from_slice(name.as_bytes());
-    let stub_count = if version <= FORMAT_VERSION_V6 { LEGACY_STUB_COUNT } else { img.stubs.len() };
+    let stub_count = if version <= FORMAT_VERSION_V6 {
+        LEGACY_STUB_COUNT_V6
+    } else if version == FORMAT_VERSION_V7 {
+        LEGACY_STUB_COUNT_V7
+    } else {
+        img.stubs.len()
+    };
     for &s in &img.stubs[..stub_count] {
         put32(&mut w, s);
     }
@@ -803,7 +816,13 @@ pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32
     let nlen = r.u32()? as usize;
     let name = String::from_utf8(r.take(nlen)?.to_vec()).ok()?;
     let mut img = Image::default();
-    let stub_count = if version <= FORMAT_VERSION_V6 { LEGACY_STUB_COUNT } else { img.stubs.len() };
+    let stub_count = if version <= FORMAT_VERSION_V6 {
+        LEGACY_STUB_COUNT_V6
+    } else if version == FORMAT_VERSION_V7 {
+        LEGACY_STUB_COUNT_V7
+    } else {
+        img.stubs.len()
+    };
     img.stubs[stub_count..].fill(u32::MAX);
     for s in &mut img.stubs[..stub_count] {
         *s = r.u32()?;

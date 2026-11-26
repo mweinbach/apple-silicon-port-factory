@@ -164,6 +164,11 @@ pub struct Loader {
     pub traps: AtomicU32,
     /// `dll!name` of every unresolved static import.
     pub unresolved: Mutex<std::collections::BTreeSet<String>>,
+    /// Pre-reserved `PROT_NONE` virtual address windows for dynamically loaded bundled
+    /// plugins that have a cached `.aot` (or static/pinned) preferred base, preventing
+    /// later `VirtualAlloc` / `malloc` / Metal mappings from claiming those low-VA slots
+    /// before `LoadLibrary` runs.
+    reserved_aot_slots: Mutex<HashMap<String, (usize, usize)>>,
 }
 
 static LOADER: OnceLock<Loader> = OnceLock::new();
@@ -202,8 +207,47 @@ impl Loader {
             wsa_ext_thunks: OnceLock::new(),
             traps: AtomicU32::new(0),
             unresolved: Mutex::new(Default::default()),
+            reserved_aot_slots: Mutex::new(HashMap::new()),
         }
     }
+}
+
+impl Drop for Loader {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.reserved_aot_slots.lock() {
+            for (_, (base, size)) in slots.drain() {
+                unsafe {
+                    libc::munmap(base as *mut libc::c_void, size);
+                }
+            }
+        }
+    }
+}
+
+/// Fast header-only peek of a PE32+ file's `(image_base, page_aligned_size_of_image, is_dll)`.
+pub(crate) fn peek_pe_preferred_window(path: &Path) -> Option<(usize, usize, bool)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 4096];
+    let n = f.read(&mut buf).ok()?;
+    if n < 0x40 || &buf[0..2] != b"MZ" {
+        return None;
+    }
+    let lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().ok()?) as usize;
+    if lfanew.checked_add(24 + 64)? > n || &buf[lfanew..lfanew + 4] != b"PE\0\0" {
+        return None;
+    }
+    let characteristics = u16::from_le_bytes(buf[lfanew + 22..lfanew + 24].try_into().ok()?);
+    let is_dll = (characteristics & 0x2000) != 0;
+    let opt = lfanew + 24;
+    let magic = u16::from_le_bytes(buf[opt..opt + 2].try_into().ok()?);
+    if magic != 0x20B {
+        return None;
+    }
+    let image_base = u64::from_le_bytes(buf[opt + 24..opt + 32].try_into().ok()?) as usize;
+    let size_of_image = u32::from_le_bytes(buf[opt + 56..opt + 60].try_into().ok()?) as usize;
+    let aligned_size = (size_of_image + PAGE - 1) & !(PAGE - 1);
+    (image_base != 0 && aligned_size != 0).then_some((image_base, aligned_size, is_dll))
 }
 
 pub fn init_with_routing(
@@ -959,6 +1003,113 @@ impl Loader {
         mapped
     }
 
+    /// Reserve `PROT_NONE` virtual address windows at boot for discovered bundled plugins
+    /// that already have a cached `.aot` (or static/pinned) preferred base address.
+    ///
+    /// Dynamic `LoadLibrary` plugins often load after the game has allocated gigabytes of
+    /// heap/GPU buffers that consume the low `0x1_5000_0000..0x1_7F00_0000` window used by
+    /// offline `--prewarm-aot`. Holding a zero-RAM `PROT_NONE` reservation until the plugin
+    /// is loaded lets `load_pe_with_opts` upgrade it in place via `mprotect` and hit its
+    /// prewarmed `.aot` cache with zero fallbacks.
+    pub fn reserve_bundled_plugin_aot_slots(
+        &self,
+        primary_exe: &Path,
+        manifest: Option<&port_manifest::GameManifest>,
+    ) -> usize {
+        let _g = self.lock.lock();
+        let plugin_dirs = manifest.map_or(&[][..], |m| m.plugin_dirs.as_slice());
+        let bundled_plugins = manifest.map_or(&[][..], |m| m.bundled_plugins.as_slice());
+        let discovered = port_manifest::discover_bundled_plugins(
+            &self.game_dir,
+            Some(&self.routing),
+            |target| w::find_builtin(target).is_some(),
+            plugin_dirs,
+            bundled_plugins,
+            Some(primary_exe),
+        );
+        let mut count = 0usize;
+        for host in discovered {
+            if self.find_loaded_by_host_path(&host).is_some() {
+                continue;
+            }
+            let Some(fname) = host.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let norm = pe_image::normalize_dll_name(fname);
+            if self.find_loaded(&norm).is_some() {
+                continue;
+            }
+            let Some((_, size, is_dll)) = peek_pe_preferred_window(&host) else {
+                continue;
+            };
+            if !is_dll {
+                continue;
+            }
+            let Some(pref) = x86_runtime::dll_native::pinned_base(&norm)
+                .or_else(|| x86_runtime::emu::exec_mem::static_aot_preferred_base(&norm))
+                .or_else(|| x86_runtime::emu::aot_cached_preferred_base(&norm, size))
+            else {
+                continue;
+            };
+            if self.reserve_aot_slot(&norm, pref, size) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn reserve_aot_slot(&self, norm: &str, pref: usize, size: usize) -> bool {
+        if pref == 0 || size == 0 {
+            return false;
+        }
+        let mut slots = self.reserved_aot_slots.lock().unwrap();
+        if slots.contains_key(norm) {
+            return false;
+        }
+        let p = unsafe {
+            libc::mmap(
+                pref as *mut libc::c_void,
+                size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return false;
+        }
+        if p as usize != pref {
+            unsafe { libc::munmap(p, size) };
+            log::debug!(
+                "loader: could not reserve cached AOT slot for {norm} at 0x{pref:x}+0x{size:x} (got 0x{:x})",
+                p as usize
+            );
+            return false;
+        }
+        slots.insert(norm.to_string(), (pref, size));
+        log::debug!("loader: reserved cached AOT slot for {norm} at 0x{pref:x}-0x{:x}", pref + size);
+        true
+    }
+
+    fn take_reserved_aot_slot(&self, norm: &str, pref: usize, size: usize) -> Option<usize> {
+        let (res_base, res_size) = self.reserved_aot_slots.lock().unwrap().remove(norm)?;
+        if res_base == pref && res_size == size {
+            let rc = unsafe {
+                libc::mprotect(
+                    res_base as *mut libc::c_void,
+                    res_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            if rc == 0 {
+                return Some(res_base);
+            }
+        }
+        unsafe { libc::munmap(res_base as *mut libc::c_void, res_size) };
+        None
+    }
+
     /// Verify before mapping that every static dependency DLL of `pe` (recursively for
     /// guest PE dependencies) exists either as an already-loaded module, on disk in the
     /// active DLL search path, or as a builtin. Matches Windows `LoadLibrary` returning
@@ -1034,7 +1185,9 @@ impl Loader {
             .or_else(|| x86_runtime::emu::exec_mem::static_aot_preferred_base(norm))
             .or_else(|| x86_runtime::emu::aot_cached_preferred_base(norm, size))
             .unwrap_or(h.image_base as usize);
-        let base = unsafe { map_image_memory(pref, size, !h.relocs_stripped()) }
+        let base = self
+            .take_reserved_aot_slot(norm, pref, size)
+            .or_else(|| unsafe { map_image_memory(pref, size, !h.relocs_stripped()) })
             .ok_or_else(|| anyhow!("{norm}: cannot map 0x{size:x} bytes (preferred 0x{pref:x})"))?;
         let img = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, size) };
         // Headers + sections.
@@ -2715,6 +2868,84 @@ plugin_dirs = ["plugins/py"]
             unsafe { std::ptr::read_unaligned(data_by_name as *const u32) },
             0x1234_5678
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reserved_aot_slot_holds_preferred_base_until_plugin_loads() {
+        let root = std::env::temp_dir().join(format!(
+            "port-loader-reserve-slot-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dll_path = root.join("late_plugin.dll");
+        let pe_bytes = build_synthetic_plugin_pe(
+            "late_plugin.dll",
+            0x1_7500_0000,
+            true,
+            None,
+            None,
+            false,
+        );
+        std::fs::write(&dll_path, &pe_bytes).unwrap();
+        let (_, img_size, is_dll) = peek_pe_preferred_window(&dll_path).expect("peek PE");
+        assert!(is_dll);
+        assert!(img_size > 0);
+
+        // Pick a free aligned virtual address to simulate a prewarmed AOT preferred base.
+        let pref = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                img_size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED);
+            libc::munmap(p, img_size);
+            p as usize
+        };
+
+        let l = Loader::new_instance(
+            root.clone(),
+            "C:\\ReserveTest".into(),
+            false,
+            port_manifest::DllRoutingTable::default(),
+            false,
+        );
+        assert!(l.reserve_aot_slot("late_plugin.dll", pref, img_size));
+
+        // While reserved, another mmap at the same preferred address must not steal `pref`.
+        unsafe {
+            let probe = libc::mmap(
+                pref as *mut libc::c_void,
+                img_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(probe, libc::MAP_FAILED);
+            assert_ne!(probe as usize, pref, "reserved slot was stolen before LoadLibrary");
+            libc::munmap(probe, img_size);
+        }
+
+        // Loading the plugin with matching `pref` upgrades the reservation in place.
+        let m = l
+            .load_pe(
+                &dll_path,
+                "late_plugin.dll",
+                "C:\\ReserveTest\\late_plugin.dll".into(),
+                Some(pref),
+            )
+            .expect("load_pe into reserved slot");
+        assert_eq!(m.base, pref);
+        assert_eq!(m.size, img_size);
+        assert!(l.reserved_aot_slots.lock().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }

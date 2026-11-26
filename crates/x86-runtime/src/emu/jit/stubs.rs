@@ -1,7 +1,7 @@
 //! Shared JIT/AOT trampoline stubs (`enter`, `exit`, `lookup_rip`, `lookup_jmp`, `lookup_call`,
 //! `host_xfer`, `ras_miss`, `spill_xmm`, `reload_xmm`, `clear_ymm_hi`).
 
-use super::cache::JBITS;
+use super::cache::JSET_BITS;
 use super::emit::{enc_logic_imm, Asm};
 use super::translate::stack_tso;
 use super::xmm::xmm_pin_enabled;
@@ -242,17 +242,23 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
 
     let (rdtsc_slow, rdtscp_slow) = emit_timestamp_stubs(a);
 
-    // Hash probe of x0 -> on hit branches to the code (x1); on miss falls through.
-    // Clobbers x1, x2, x16, x17 and NZCV.
+    // 2-way set-associative hash probe of x0 -> on hit falls through with x1 = fast and
+    // w17 = gen (0 for static/AOT blocks, != 0 for SMC); on miss branches to the returned
+    // fixups. Clobbers x1, x2, x16, x17 and NZCV; preserves x0, x3 (T3), x4 (T4), x30.
     let probe = |a: &mut Asm| -> [usize; 3] {
         a.ldr(64, XA, XCPU, OFF_TABLE);
         a.ldr(64, XS, XCPU, OFF_TABLE + 8);
         a.mul(true, XS, 0, XS);
-        a.lsr_i(true, XS, XS, 64 - JBITS);
-        a.addsub_rr(true, false, false, XA, XA, XS, 5);
+        a.lsr_i(true, XS, XS, 64 - JSET_BITS);
+        a.addsub_rr(true, false, false, XA, XA, XS, 6); // 64B set (2 x 32B JEnt)
+        a.ldp_x(XS, 1, XA, 0); // way 0: (ip, fast)
+        a.addsub_rr(true, true, true, ZR, XS, 0, 0); // cmp x17, x0
+        let hit0 = a.bcond(EQ);
+        a.addsub_ri(true, false, false, XA, XA, 32, false); // way 1
         a.ldp_x(XS, 1, XA, 0);
         a.addsub_rr(true, true, true, ZR, XS, 0, 0); // cmp x17, x0
         let m1 = a.bcond(NE);
+        a.bind(hit0);
         let m2 = a.cbz(true, 1);
         a.ldr(32, XS, XA, 16);
         let ok = a.cbz(false, XS);
@@ -264,9 +270,22 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         [m1, m2, m3]
     };
 
+    // Populate the per-site 2-way IC at `[T4]` (x4) on a static/AOT (`w17 == 0`) guest block
+    // hit (`x0` = target guest IP, `x1` = host code addr). FIFO-rotates way 0 -> way 1 so
+    // 2-target polymorphic sites stay read-only in steady state.
+    let emit_ic_populate = |a: &mut Asm| {
+        let skip_null = a.cbz(true, T4);
+        let skip_smc = a.cbnz(false, XS);
+        a.ldp_x(2, XS, T4, 0);
+        a.stp_x(2, XS, T4, 16);
+        a.stp_x(0, 1, T4, 0);
+        a.bind(skip_null);
+        a.bind(skip_smc);
+    };
+
     // Shared AOT probe table (`aot_probe_enabled`; layout: `aot::probe_table`) search of x0
     // after a `probe` miss: on a live entry branches to `hit` (word position of the stub's
-    // hit path, x1 = code); otherwise falls through (and returns the branches to bind
+    // hit path, x1 = code, w17 = 0); otherwise falls through (and returns the branches to bind
     // there). Same clobbers as `probe`. Emits nothing when the knob is off.
     let aot_on = cfg.aot_on;
     let count_probe_hits = cfg.count_probe_hits;
@@ -293,15 +312,20 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.patch(back, lp);
         a.bind(found);
         let m2 = a.cbz(true, 1);
-        // Populate this thread's direct-mapped `table[jslot(x0)]` inline (`gen = 0, hits = 0,
-        // code = x1`) so repeated indirect calls/jmps/rets hit in O(1) without probing again.
+        // Populate this thread's 2-way `table[jset_base(x0)]` inline (FIFO rotate way 0 -> way 1;
+        // install `gen = 0, hits = 0, code = x1` in way 0) so repeated transfers hit in O(1).
         a.ldr(64, XA, XCPU, OFF_TABLE);
         a.ldr(64, XS, XCPU, OFF_TABLE + 8);
         a.mul(true, XS, 0, XS);
-        a.lsr_i(true, XS, XS, 64 - JBITS);
-        a.addsub_rr(true, false, false, XA, XA, XS, 5);
+        a.lsr_i(true, XS, XS, 64 - JSET_BITS);
+        a.addsub_rr(true, false, false, XA, XA, XS, 6);
+        a.ldp_x(2, XS, XA, 0);
+        a.stp_x(2, XS, XA, 32);
+        a.ldp_x(2, XS, XA, 16);
+        a.stp_x(2, XS, XA, 48);
         a.stp_x(0, 1, XA, 0);
         a.stp_x(ZR, 1, XA, 16);
+        a.movz(false, XS, 0, 0); // gen = 0 so `hit` may populate `[T4]`
         if count_probe_hits {
             a.ldr(64, 2, XCPU, OFF_PROBEHITS);
             a.addsub_ri(true, false, false, 2, 2, 1, false);
@@ -317,11 +341,15 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     // paths: x0 is a translated guest IP, so leaving with EXIT_RIP there is exact).
     let bud = cfg.bud;
 
-    // lookup_rip(x0 = guest rip): continue there, or exit with EXIT_RIP.
+    // lookup_rip(x0 = guest rip) / lookup_rip_ic(x0 = guest rip, x4 = &ic_table[slot]):
+    // continue there (populating `[x4]` on static hit), or exit with EXIT_RIP.
     let lookup_rip = a.pos;
+    a.movz(true, T4, 0, 0);
+    let lookup_rip_ic = a.pos;
     let miss = probe(a);
     let m_plain_rip = a.tbnz(1, 0);
     let hit = a.pos;
+    emit_ic_populate(a);
     if bud_light {
         a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
     }
@@ -343,13 +371,16 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     let e = a.addr_of(exit);
     a.b_to(e);
 
-    // lookup_jmp(x0 = target)
+    // lookup_jmp(x0 = target) / lookup_jmp_ic(x0 = target, x4 = &ic_table[slot])
     // Entries in `table` with bit 0 of `fast` set are cached `DF_PLAIN` / pure-float-math /
     // inline-QPC host functions dispatched directly in `is_plain_jmp` / `is_qpc_jmp`.
     let lookup_jmp = a.pos;
+    a.movz(true, T4, 0, 0);
+    let lookup_jmp_ic = a.pos;
     let miss = probe(a);
     let is_plain_jmp = a.tbnz(1, 0);
     let hit = a.pos;
+    emit_ic_populate(a);
     if bud {
         if bud_light {
             a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
@@ -378,14 +409,19 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.b_to(e);
     }
 
-    // lookup_call(x0 = target, x3 = return address): push + continue, or EXIT_CALL.
-    // With the RAS, call sites enter with `bl lookup_call` (x30 = their landing pad).
+    // lookup_call(x0 = target, x3 = return address) /
+    // lookup_call_ic(x0 = target, x3 = return address, x4 = &ic_table[slot]):
+    // push + continue (populating `[x4]` on static hit), or EXIT_CALL.
+    // With the RAS, call sites enter with `bl lookup_call[_ic]` (x30 = their landing pad).
     // Entries in `table` with bit 0 of `fast` set are cached `DF_PLAIN` / pure-float-math /
     // inline-QPC host functions dispatched directly here.
     let lookup_call = a.pos;
+    a.movz(true, T4, 0, 0);
+    let lookup_call_ic = a.pos;
     let miss = probe(a);
     let is_plain = a.tbnz(1, 0);
     let hit = a.pos;
+    emit_ic_populate(a);
     let unal = if cfg.pushpop {
         // Plain pre-indexed push (see `pushpop_enabled`): no alignment check.
         a.str_pre(T3, HG[4], -8);
@@ -437,9 +473,9 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     a.b_to(e);
 
     // Fast path (`lookup_call`) for tagged `DF_PLAIN` (bit 0), pure-float-math (bits 0..1),
-    // and inline zero-spill QPC (bit 63 | bit 0) host entries cached in `table`.
+    // and zero-spill inline fast thunks (bit 63 | kind<<60 | bit 0) cached in `table`.
     a.bind(is_plain);
-    let is_qpc = a.tbnz(1, 63);
+    let is_inline_call = a.tbnz(1, 63);
     a.logic_ri(true, 0, XA, 1, enc_logic_imm(!3u64, true).unwrap());
     a.addsub_ri(true, true, false, 31, 31, 96, false); // sub sp, sp, #96
     a.stp_x(8, 9, 31, 0);
@@ -528,45 +564,14 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         None
     };
 
-    // Zero-spill inline QPC (`lookup_call`): `x0` = target, `T3` = return address, `x30` = landing pad.
-    a.bind(is_qpc);
-    a.logic_ri(true, 0, XA, 1, enc_logic_imm(!((1u64 << 63) | 3), true).unwrap());
-    a.ldp_x(2, XS, XA, 0); // x2 = mode, x17 = mult
-    a.addsub_ri(true, true, true, ZR, 2, 1, false); // cmp x2, #1
-    let qpc_slow = a.bcond(NE);
-    a.patch(qpc_slow, call_slow);
-    a.mrs_cntvct(2);
-    a.ldr(64, XA, XA, 16); // x16 = offset
-    a.umulh(2, 2, XS);
-    a.addsub_rr(true, false, false, 2, 2, XA, 0);
-    a.str(64, 2, g(1), 0); // *lpPerformanceCount = result
-    a.movz(false, g(0), 1, 0); // eax = 1 (TRUE, zero-extended to rax)
-    if lb_on {
-        a.str(8, ZR, XCPU, OFF_LB);
-    }
-    #[cfg(test)]
-    if cfg.count_plain_hits {
-        a.ldr(64, 2, XCPU, OFF_PLAINHITS);
-        a.addsub_ri(true, false, false, 2, 2, 1, false);
-        a.str(64, 2, XCPU, OFF_PLAINHITS);
-    }
-    if ras {
-        if let Some(out) = call_bud_out {
-            let f = a.tbnz(XBUD, 63);
-            a.patch(f, out);
-        }
-        a.ret();
-    } else {
-        a.mov_rr(true, 0, T3);
-        let lr = a.addr_of(lookup_rip);
-        a.b_to(lr);
-    }
-
-    // Fast path (`lookup_jmp`) for tail jumps to tagged `DF_PLAIN` / pure-float-math / inline-QPC
-    // host entries cached in `table`.
+    // Fast path (`lookup_jmp`) for tail jumps to tagged `DF_PLAIN` / pure-float-math /
+    // zero-spill inline fast-thunk host entries cached in `table`.
     let mut to_ras_miss: Vec<usize> = Vec::new();
     a.bind(is_plain_jmp);
-    let is_qpc_jmp = a.tbnz(1, 63);
+    let not_inline_jmp = a.tbz(1, 63);
+    a.logic_ri(true, 1, 1, 1, enc_logic_imm(1u64 << 59, true).unwrap()); // bit 59 = lookup_jmp
+    let is_inline_jmp = a.b();
+    a.bind(not_inline_jmp);
     a.ldr_post(T3, g(4), 8); // pop guest return address; g(4) now points to Win64 shadow space
     a.logic_ri(true, 0, XA, 1, enc_logic_imm(!3u64, true).unwrap());
     a.addsub_ri(true, true, false, 31, 31, 96, false); // sub sp, sp, #96
@@ -651,19 +656,169 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.b_to(lr);
     }
 
-    // Zero-spill inline QPC (`lookup_jmp`): `x0` = target, `[g(4)]` = guest return address.
-    a.bind(is_qpc_jmp);
-    a.logic_ri(true, 0, XA, 1, enc_logic_imm(!((1u64 << 63) | 3), true).unwrap());
+    // Shared zero-spill inline fast-thunk dispatcher for both `lookup_call` (bit 59 == 0)
+    // and `lookup_jmp` (bit 59 == 1). Preserves `x0` (target VA), `x1` (tag + bit 59),
+    // `T3` (return address for call), `x30` (landing pad for call), `g(1..15)`, and all XMMs.
+    // Free scratch: `x2`, `XA`, `XS` (and `g(0)` as volatile Win64 return register).
+    a.bind(is_inline_call);
+    a.bind(is_inline_jmp);
+    let mut to_inline_done: Vec<usize> = Vec::new();
+    let mut to_inline_bail: Vec<usize> = Vec::new();
+    let ptr_mask = enc_logic_imm(0x0000_FFFF_FFFF_FFFC, true).unwrap();
+    let align7 = enc_logic_imm(7, true).unwrap();
+    a.ubfx(2, 1, 60, 3); // x2 = FAST_KIND_* (0..=5)
+
+    // Kinds 0 (QPC) & 1 (TIME_MS): shared `cntvct_el0` + Q64 scale read.
+    a.addsub_ri(false, true, true, ZR, 2, 2, false); // cmp w2, #2
+    let not_time = a.bcond(HS);
+    a.logic_ri(true, 0, XA, 1, ptr_mask); // XA = &QpcFastState
     a.ldp_x(2, XS, XA, 0); // x2 = mode, x17 = mult
     a.addsub_ri(true, true, true, ZR, 2, 1, false); // cmp x2, #1
-    let qpc_jmp_slow = a.bcond(NE);
-    a.patch(qpc_jmp_slow, jmp_slow);
+    to_inline_bail.push(a.bcond(NE));
     a.mrs_cntvct(2);
     a.ldr(64, XA, XA, 16); // x16 = offset
     a.umulh(2, 2, XS);
-    a.addsub_rr(true, false, false, 2, 2, XA, 0);
-    a.str(64, 2, g(1), 0); // *lpPerformanceCount = result
-    a.movz(false, g(0), 1, 0); // eax = 1 (TRUE, zero-extended to rax)
+    a.addsub_rr(true, false, false, 2, 2, XA, 0); // x2 = interrupt_time_100ns
+    let is_time_ms = a.tbnz(1, 60);
+    // KIND_QPC (0): *lpPerformanceCount = x2; return TRUE.
+    a.str(64, 2, g(1), 0);
+    a.movz(false, g(0), 1, 0);
+    to_inline_done.push(a.b());
+    // KIND_TIME_MS (1): x2 / 10_000 (u32 for timeGetTime/GetTickCount, u64 for GetTickCount64).
+    a.bind(is_time_ms);
+    a.movz(false, XS, 10_000, 0);
+    a.udiv(true, 2, 2, XS);
+    let is_time_ms64 = a.tbnz(1, 1);
+    a.mov_rr(false, g(0), 2); // zero-extend u32 -> rax (wraps mod 2^32 ms)
+    to_inline_done.push(a.b());
+    a.bind(is_time_ms64);
+    a.mov_rr(true, g(0), 2);
+    to_inline_done.push(a.b());
+
+    // Kind 2: EnterCriticalSection / RtlEnterCriticalSection (`g(1)` = `cs`).
+    a.bind(not_time);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_ENTER_CS as u32, false);
+    let not_enter_cs = a.bcond(NE);
+    to_inline_bail.push(a.cbz(true, g(1)));
+    a.logic_ri(true, 3, ZR, g(1), align7); // tst cs, #7
+    to_inline_bail.push(a.bcond(NE));
+    a.ldr(64, XA, XCPU, OFF_TEB);
+    to_inline_bail.push(a.cbz(true, XA));
+    a.ldr(32, XA, XA, 0x48); // w16 = TEB.ClientId.UniqueThread (zero-extended)
+    to_inline_bail.push(a.cbz(false, XA));
+    a.ldr(64, XS, g(1), 0x10); // x17 = cs.owning_thread
+    a.addsub_rr(true, true, true, ZR, XS, XA, 0); // cmp owning_thread, tid
+    let enter_cs_rec = a.bcond(EQ);
+    a.addsub_ri(true, false, false, XS, g(1), 8, false); // x17 = &cs.lock_count
+    a.movn(false, 2, 0, 0); // w2 = -1 (expected)
+    a.casa(32, 2, ZR, XS); // Acquire CAS -1 -> 0
+    a.addsub_ri(false, false, true, ZR, 2, 1, false); // cmn w2, #1
+    to_inline_bail.push(a.bcond(NE));
+    a.str(64, XA, g(1), 0x10); // cs.owning_thread = tid
+    a.movz(false, 2, 1, 0);
+    a.str(32, 2, g(1), 0x0c); // cs.recursion_count = 1
+    a.movz(false, g(0), 0, 0); // STATUS_SUCCESS
+    to_inline_done.push(a.b());
+    a.bind(enter_cs_rec);
+    a.ldr(32, 2, g(1), 0x0c); // w2 = cs.recursion_count
+    a.addsub_ri(false, true, true, ZR, 2, 0, false); // cmp w2, #0
+    to_inline_bail.push(a.bcond(LE));
+    a.addsub_ri(false, false, true, 2, 2, 1, false); // adds w2, w2, #1
+    to_inline_bail.push(a.bcond(VS));
+    a.str(32, 2, g(1), 0x0c);
+    a.movz(false, g(0), 0, 0);
+    to_inline_done.push(a.b());
+
+    // Kind 3: LeaveCriticalSection / RtlLeaveCriticalSection (`g(1)` = `cs`).
+    a.bind(not_enter_cs);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_LEAVE_CS as u32, false);
+    let not_leave_cs = a.bcond(NE);
+    to_inline_bail.push(a.cbz(true, g(1)));
+    a.logic_ri(true, 3, ZR, g(1), align7); // tst cs, #7
+    to_inline_bail.push(a.bcond(NE));
+    a.ldr(32, 2, g(1), 0x0c); // w2 = cs.recursion_count
+    a.addsub_ri(false, true, true, ZR, 2, 1, false); // cmp w2, #1
+    to_inline_bail.push(a.bcond(LT));
+    let leave_cs_rec = a.bcond(GT);
+    // Outermost leave (recursion_count == 1): clear fields, Release CAS 0 -> -1.
+    // On contention (lock_count != 0), restore fields while lock stays held and bail to slow.
+    a.ldr(64, XA, g(1), 0x10); // save owning_thread
+    a.str(32, ZR, g(1), 0x0c); // recursion_count = 0
+    a.str(64, ZR, g(1), 0x10); // owning_thread = 0
+    a.addsub_ri(true, false, false, XS, g(1), 8, false); // &cs.lock_count
+    a.movz(false, 2, 0, 0); // expected = 0 (uncontended)
+    a.movn(false, g(0), 0, 0); // desired = -1 (free)
+    a.casl(32, 2, g(0), XS); // Release CAS 0 -> -1
+    let leave_cs_contended = a.cbnz(false, 2);
+    a.movz(false, g(0), 0, 0); // STATUS_SUCCESS
+    to_inline_done.push(a.b());
+    a.bind(leave_cs_contended);
+    a.movz(false, 2, 1, 0);
+    a.str(32, 2, g(1), 0x0c);
+    a.str(64, XA, g(1), 0x10);
+    to_inline_bail.push(a.b());
+    a.bind(leave_cs_rec);
+    a.addsub_ri(false, true, false, 2, 2, 1, false); // w2 -= 1
+    a.str(32, 2, g(1), 0x0c);
+    a.movz(false, g(0), 0, 0);
+    to_inline_done.push(a.b());
+
+    // Kind 4: XInputGetState (bit 1 == 0) / XInputGetStateEx (bit 1 == 1).
+    // `w_g1` = `user`, `g(2)` = `out: *mut State`.
+    a.bind(not_leave_cs);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_XINPUT as u32, false);
+    let not_xinput = a.bcond(NE);
+    to_inline_bail.push(a.cbz(true, g(2)));
+    a.addsub_ri(false, true, true, ZR, g(1), 4, false); // cmp w_user, #4
+    to_inline_bail.push(a.bcond(HS));
+    a.logic_ri(true, 0, XA, 1, ptr_mask); // XA = &XInputFastTable
+    a.ldr(64, 2, XA, 0); // ready
+    to_inline_bail.push(a.cbz(true, 2));
+    a.addsub_ri(true, false, false, XA, XA, 32, false); // &slots[0]
+    a.mov_rr(false, 2, g(1)); // zero-extend u32 user
+    a.addsub_rr(true, false, false, XA, XA, 2, 5); // &slots[user] (32B stride)
+    a.ldar(32, 2, XA); // w2 = seq1 (Acquire)
+    to_inline_bail.push(a.tbnz(2, 0)); // odd => writer active
+    a.ldr(32, XS, XA, 4); // connected
+    let xinput_conn = a.cbnz(false, XS);
+    a.dmb_ishld();
+    a.ldr(32, XS, XA, 0); // seq2
+    a.addsub_rr(false, true, true, ZR, 2, XS, 0);
+    to_inline_bail.push(a.bcond(NE));
+    a.movz(false, g(0), 1167, 0); // ERROR_DEVICE_NOT_CONNECTED
+    to_inline_done.push(a.b());
+    a.bind(xinput_conn);
+    a.ldp_x(XS, g(0), XA, 8); // XS = w0, g(0) = w1
+    a.dmb_ishld();
+    a.ldr(32, XA, XA, 0); // XA = seq2
+    a.addsub_rr(false, true, true, ZR, 2, XA, 0);
+    to_inline_bail.push(a.bcond(NE));
+    let xinput_keep_guide = a.tbnz(1, 1); // bit 1 == 1 -> XInputGetStateEx
+    a.logic_ri(true, 0, XS, XS, enc_logic_imm(!(1u64 << 42), true).unwrap());
+    a.bind(xinput_keep_guide);
+    a.str(64, XS, g(2), 0);
+    a.str(64, g(0), g(2), 8);
+    a.movz(false, g(0), 0, 0); // ERROR_SUCCESS
+    to_inline_done.push(a.b());
+
+    // Kind 5: SwitchToThread / _Thrd_yield (63 inline `isb` yields returning FALSE, every 64th
+    // bails to `SwitchToThread()` -> `libc::sched_yield()` returning TRUE).
+    a.bind(not_xinput);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_SWITCH_TO_THREAD as u32, false);
+    to_inline_bail.push(a.bcond(NE));
+    a.ldr(32, 2, XCPU, OFF_SWITCH_YIELD);
+    a.addsub_ri(false, false, false, 2, 2, 1, false);
+    a.str(32, 2, XCPU, OFF_SWITCH_YIELD);
+    a.logic_ri(false, 3, ZR, 2, enc_logic_imm(63, false).unwrap()); // tst w2, #63
+    to_inline_bail.push(a.bcond(EQ));
+    a.isb();
+    a.movz(false, g(0), 0, 0); // FALSE (no OS context switch occurred)
+
+    // Shared fast-path return epilogue (`lookup_call` vs `lookup_jmp` via bit 59 of x1).
+    let inline_fast_done = a.pos;
+    for f in to_inline_done {
+        a.patch(f, inline_fast_done);
+    }
     if lb_on {
         a.str(8, ZR, XCPU, OFF_LB);
     }
@@ -673,6 +828,19 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.addsub_ri(true, false, false, 2, 2, 1, false);
         a.str(64, 2, XCPU, OFF_PLAINHITS);
     }
+    let inline_ret_jmp = a.tbnz(1, 59);
+    if ras {
+        if let Some(out) = call_bud_out {
+            let f = a.tbnz(XBUD, 63);
+            a.patch(f, out);
+        }
+        a.ret();
+    } else {
+        a.mov_rr(true, 0, T3);
+        let lr = a.addr_of(lookup_rip);
+        a.b_to(lr);
+    }
+    a.bind(inline_ret_jmp);
     a.ldr_post(0, g(4), 8); // pop guest return address into x0
     if bud {
         let f = a.tbnz(XBUD, 63);
@@ -689,6 +857,16 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         let lr = a.addr_of(lookup_rip);
         a.b_to(lr);
     }
+
+    // Shared bailout path to `call_slow` / `jmp_slow`.
+    let inline_fast_bail = a.pos;
+    for f in to_inline_bail {
+        a.patch(f, inline_fast_bail);
+    }
+    let bail_to_jmp = a.tbnz(1, 59);
+    a.patch(bail_to_jmp, jmp_slow);
+    let bail_to_call = a.b();
+    a.patch(bail_to_call, call_slow);
 
     // host_xfer(x0 = target, x2 = kind: bit 0 = jmp (else call), bit 1 = dynamic target from
     // `lookup_call`/`lookup_jmp` (else a static target from `xfer_to`); cpu.rip = return
@@ -762,7 +940,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     // stack as is (the return has no entry, e.g. its call was interpreted) and probe.
     // Any entry whose guest address equals the target is a correct continuation: its
     // landing pad transfers to exactly that guest IP.
-    let ras_miss = if ras {
+    let (ras_miss, ras_miss_ic) = if ras {
         if let Some(want) = cfg.target_ras_miss {
             while a.pos < want && !a.overflow {
                 a.emit(0xD503_201F); // nop padding to match .aot stub table offset exactly
@@ -772,6 +950,8 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         for f in to_ras_miss {
             a.patch(f, p);
         }
+        a.movz(true, T4, 0, 0);
+        let p_ic = a.pos;
         let mut found = Vec::new();
         for i in 1..=3u32 {
             a.addsub_ri(true, true, false, XA, XRAS, 16 * i, false);
@@ -781,8 +961,31 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
             a.logic_rr(true, 2, 2, 2, 0, 0, 0); // eor x2, x2, x0
             found.push(a.cbz(true, 2));
         }
-        let lr = a.addr_of(lookup_rip);
-        a.b_to(lr);
+        // Depth 1..3 missed: probe the per-site 2-way IC at `[T4]` before `lookup_rip_ic`.
+        let no_ic = a.cbz(true, T4);
+        a.ldp_x(1, 2, T4, 0);
+        a.addsub_rr(true, true, true, ZR, 1, 0, 0);
+        let try_w1 = a.bcond(NE);
+        let ic_hit0 = a.cbnz(true, 2);
+        a.bind(try_w1);
+        a.ldp_x(1, 2, T4, 16);
+        a.addsub_rr(true, true, true, ZR, 1, 0, 0);
+        let miss_w1 = a.bcond(NE);
+        let ic_hit1 = a.cbnz(true, 2);
+        a.bind(no_ic);
+        a.bind(miss_w1);
+        let lr_ic = a.addr_of(lookup_rip_ic);
+        a.b_to(lr_ic);
+        a.bind(ic_hit0);
+        a.bind(ic_hit1);
+        if bud_light {
+            a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
+        }
+        if bud {
+            let f = a.tbnz(XBUD, 63);
+            a.patch(f, rip_out);
+        }
+        a.br(2);
         for f in found {
             a.bind(f);
         }
@@ -792,13 +995,30 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.mov_rr(true, XRAS, 1);
         a.bfxil0(XRAS, XA, 16);
         a.br(2);
-        Some(p)
+        (Some(p), Some(p_ic))
     } else {
-        None
+        (None, None)
     };
 
     (
-        Stubs { enter, exit, lookup_rip, lookup_jmp, lookup_call, host_xfer, ras_miss, spill_xmm, reload_xmm, clear_ymm_hi, rdtsc_slow, rdtscp_slow },
+        Stubs {
+            enter,
+            exit,
+            lookup_rip,
+            lookup_jmp,
+            lookup_call,
+            host_xfer,
+            ras_miss,
+            spill_xmm,
+            reload_xmm,
+            clear_ymm_hi,
+            rdtsc_slow,
+            rdtscp_slow,
+            lookup_rip_ic,
+            lookup_jmp_ic,
+            lookup_call_ic,
+            ras_miss_ic,
+        },
         host_xfer_bl,
     )
 }
@@ -825,17 +1045,32 @@ pub(super) struct Stubs {
     pub(super) clear_ymm_hi: usize,
     pub(super) rdtsc_slow: usize,
     pub(super) rdtscp_slow: usize,
+    pub(super) lookup_rip_ic: usize,
+    pub(super) lookup_jmp_ic: usize,
+    pub(super) lookup_call_ic: usize,
+    pub(super) ras_miss_ic: Option<usize>,
 }
 
 impl Stubs {
     pub(super) fn offsets(&self) -> AotStubOffs {
         let word = |p: usize| p as u32;
         [
-            word(self.enter), word(self.exit), word(self.lookup_rip), word(self.lookup_jmp),
-            word(self.lookup_call), self.host_xfer.map_or(u32::MAX, word),
-            self.ras_miss.map_or(u32::MAX, word), self.spill_xmm.map_or(u32::MAX, word),
-            self.reload_xmm.map_or(u32::MAX, word), word(self.clear_ymm_hi),
-            word(self.rdtsc_slow), word(self.rdtscp_slow),
+            word(self.enter),
+            word(self.exit),
+            word(self.lookup_rip),
+            word(self.lookup_jmp),
+            word(self.lookup_call),
+            self.host_xfer.map_or(u32::MAX, word),
+            self.ras_miss.map_or(u32::MAX, word),
+            self.spill_xmm.map_or(u32::MAX, word),
+            self.reload_xmm.map_or(u32::MAX, word),
+            word(self.clear_ymm_hi),
+            word(self.rdtsc_slow),
+            word(self.rdtscp_slow),
+            word(self.lookup_rip_ic),
+            word(self.lookup_jmp_ic),
+            word(self.lookup_call_ic),
+            self.ras_miss_ic.map_or(u32::MAX, word),
         ]
     }
 }

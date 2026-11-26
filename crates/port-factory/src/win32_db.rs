@@ -56,6 +56,7 @@ impl Win32Category {
             | "vcruntime140_1.dll"
             | "msvcp140.dll"
             | "msvcp140_codecvt_ids.dll"
+            | "mfc140u.dll"
             | "mscoree.dll"
             | "hostfxr.dll"
             | "coreclr.dll" => Self::CrtStl,
@@ -1366,7 +1367,26 @@ fn scan_extra_exports_and_ordinals(
     let cat = Win32Category::for_dll(dll_name);
     let ordinals = parse_ordinals(src);
 
-    // Attach ordinals to already-scanned exports or insert ordinal aliases.
+    for (sym, after_sym) in extra_exports(src) {
+        if !out.iter().any(|e| e.dll == dll_name && e.symbol == sym) {
+            let impl_kind = after_sym
+                .split_once("ptr:")
+                .and_then(|(_, ptr_tail)| extract_ptr_target_ident(ptr_tail))
+                .and_then(|ident| file_kinds.get(ident).copied())
+                .unwrap_or(ImplKind::Real);
+            out.push(Win32ApiEntry {
+                dll: dll_name.to_string(),
+                symbol: sym.to_string(),
+                ordinal: None,
+                category: cat,
+                impl_kind,
+                rust_path: format!("{mod_path}::EXTRA_EXPORTS[{sym}]"),
+                source_file: rel_file.clone(),
+            });
+        }
+    }
+
+    // Attach ordinals to already-scanned exports (including EXTRA_EXPORTS) or insert ordinal aliases.
     for (ord, sym) in &ordinals {
         if let Some(existing) = out
             .iter_mut()
@@ -1382,25 +1402,6 @@ fn scan_extra_exports_and_ordinals(
                 category: cat,
                 impl_kind,
                 rust_path: format!("{mod_path}::{sym}"),
-                source_file: rel_file.clone(),
-            });
-        }
-    }
-
-    for (sym, after_sym) in extra_exports(src) {
-        if !out.iter().any(|e| e.dll == dll_name && e.symbol == sym) {
-            let impl_kind = after_sym
-                .split_once("ptr:")
-                .and_then(|(_, ptr_tail)| extract_ptr_target_ident(ptr_tail))
-                .and_then(|ident| file_kinds.get(ident).copied())
-                .unwrap_or(ImplKind::Real);
-            out.push(Win32ApiEntry {
-                dll: dll_name.to_string(),
-                symbol: sym.to_string(),
-                ordinal: None,
-                category: cat,
-                impl_kind,
-                rust_path: format!("{mod_path}::EXTRA_EXPORTS[{sym}]"),
                 source_file: rel_file.clone(),
             });
         }
@@ -1448,7 +1449,12 @@ fn parse_ordinals(src: &str) -> Vec<(u16, String)> {
         let Ok(ord) = num_s.trim().parse::<u16>() else {
             continue;
         };
-        let name = name_s.trim().trim_matches('"').to_string();
+        let name = name_s
+            .trim()
+            .trim_end_matches(',')
+            .trim()
+            .trim_matches('"')
+            .to_string();
         if !name.is_empty() {
             out.push((ord, name));
         }
@@ -2059,5 +2065,37 @@ win64_stubs!(Win64StubMacroFn);
             .entries
             .iter()
             .any(|e| e.dll == "d2d1.dll" && e.symbol == "D2D1MakeRotateMatrix"));
+        let mfc_2327 = db
+            .resolve("mfc140u.dll", &ImportName::Ordinal(2327))
+            .expect("mfc140u.dll!#2327 must resolve in Win32Database");
+        assert_eq!(
+            mfc_2327.symbol,
+            "?AfxSetModuleState@@YAPEAVAFX_MODULE_STATE@@PEAV1@@Z"
+        );
+        assert_eq!(mfc_2327.impl_kind, ImplKind::Real);
+        assert!(mfc_2327.rust_path.contains("EXTRA_EXPORTS["));
+
+        let parsed = parse_ordinals(
+            r#"pub static ORDINALS: &[(u16, &str)] = &[
+                (
+                    324,
+                    "??0AFX_MODULE_STATE@@QEAA@HP6A_JPEAUHWND__@@I_K_J@ZKH@Z",
+                ),
+                (2327, "?AfxSetModuleState@@YAPEAVAFX_MODULE_STATE@@PEAV1@@Z"),
+            ];"#,
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    324,
+                    "??0AFX_MODULE_STATE@@QEAA@HP6A_JPEAUHWND__@@I_K_J@ZKH@Z".to_string()
+                ),
+                (
+                    2327,
+                    "?AfxSetModuleState@@YAPEAVAFX_MODULE_STATE@@PEAV1@@Z".to_string()
+                ),
+            ]
+        );
     }
 }

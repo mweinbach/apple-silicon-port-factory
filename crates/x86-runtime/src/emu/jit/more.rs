@@ -82,6 +82,18 @@ impl Asm {
         let sz = (bits / 8).trailing_zeros();
         self.emit(0x08E0_FC00 | sz << 30 | rs << 16 | rn << 5 | rt);
     }
+    pub(super) fn casa(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x08E0_7C00 | sz << 30 | rs << 16 | rn << 5 | rt);
+    }
+    pub(super) fn casl(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x08A0_FC00 | sz << 30 | rs << 16 | rn << 5 | rt);
+    }
+    pub(super) fn ldar(&mut self, bits: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x08DF_FC00 | sz << 30 | rn << 5 | rt);
+    }
     pub(super) fn caspal_x(&mut self, rs: u32, rt: u32, rn: u32) {
         debug_assert!(rs % 2 == 0 && rt % 2 == 0, "caspal register pair must be even");
         self.emit(0x4860_FC00 | rs << 16 | rn << 5 | rt);

@@ -11,7 +11,7 @@ use super::cfg_discover::{discover, discover_pe_roots, discover_with_threads, Fu
 use super::format::{
     codegen_hash, decode, encode, encode_with_version, module_key, read_cache_file,
     read_cache_file_in, read_cached_preferred_base_in, set_flags, AotKey, Image, BUILD_VBASE,
-    FLAG_VERIFY_PENDING, FORMAT_VERSION_V5, FORMAT_VERSION_V6, MAX_CODE,
+    FLAG_VERIFY_PENDING, FORMAT_VERSION_V5, FORMAT_VERSION_V6, FORMAT_VERSION_V7, MAX_CODE,
 };
 use super::runtime::{
     install_image, load_module, load_verify, Verify, DIR, FIRST_LOAD_FULL_MAX,
@@ -1975,7 +1975,7 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
                                     "stub branch exceeded bank span: {}",
                                     imm26 * 4
                                 );
-                                if let Some(op) = img_1.stubs[10..].iter().position(|&s| s == stub_w) {
+                                if let Some(op) = img_1.stubs[10..12].iter().position(|&s| s == stub_w) {
                                     timestamp_calls[bi][op] = true;
                                 }
                                 *count += 1;
@@ -2036,7 +2036,13 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
             let (_, _, v6_img, _) = decode(&v6_bytes).expect("decode legacy multi-bank header");
             assert_eq!(v6_img.stub_banks, img_1.stub_banks);
             assert_eq!(&v6_img.stubs[..10], &img_1.stubs[..10]);
-            assert_eq!(&v6_img.stubs[10..], &[u32::MAX; 2]);
+            assert_eq!(&v6_img.stubs[10..], &[u32::MAX; 6]);
+
+            let v7_bytes = encode_with_version("legacy_v7.dll", &key, &img_1, 0, FORMAT_VERSION_V7);
+            let (_, _, v7_img, _) = decode(&v7_bytes).expect("decode legacy v7 header");
+            assert_eq!(v7_img.stub_banks, img_1.stub_banks);
+            assert_eq!(&v7_img.stubs[..12], &img_1.stubs[..12]);
+            assert_eq!(&v7_img.stubs[12..], &[u32::MAX; 4]);
 
             let single_img = unsafe { build_image(pool1.get_one(), &ips[..4], BUILD_VBASE) }.expect("single-bank");
             let v5_bytes = encode_with_version("legacy_v5.dll", &key, &single_img, FLAG_VERIFY_PENDING, FORMAT_VERSION_V5);
@@ -3228,4 +3234,61 @@ fn runtime_callback_replay_triggers_bg_rebuild() {
         None => std::env::remove_var("AW2_DLL_AOT_DIR"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A large `.pdata` function whose intra-function CFG extends past `DEFAULT_AOT_CLOSURE`
+/// (128 hops) must still admit direct calls and tail-jumps to `.pdata`-less leaf helpers.
+#[test]
+fn aot_deep_pdata_function_discovers_leaf_callees_past_default_depth() {
+    use iced_x86::code_asm::*;
+
+    let mut pe = TestMappedBuf::alloc(0x8000, 0x2_3F10_0000);
+    let base = pe.base();
+    let base64 = base as u64;
+    let buf = pe.as_slice_mut();
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+
+    // .text @ 0x1000..0x5000, .rdata @ 0x5000..0x7000, .pdata @ 0x6000 (1 entry = 12 bytes)
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x4000, 0x5000, 0x2000, None, Some((0x6000, 12)));
+
+    // 140-hop chain (> DEFAULT_AOT_CLOSURE = 128) ending in call 0x4000; jmp 0x4100.
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut exit_lbl = a.create_label();
+    for i in 0..140 {
+        a.cmp(ecx, i as i32).unwrap();
+        a.je(exit_lbl).unwrap();
+    }
+    a.call(base64 + 0x4000).unwrap();
+    a.jmp(base64 + 0x4100).unwrap();
+    a.set_label(&mut exit_lbl).unwrap();
+    a.xor(eax, eax).unwrap();
+    a.ret().unwrap();
+    let fn0 = a.assemble(base64 + 0x1000).unwrap();
+    assert!(0x1000 + fn0.len() < 0x3F00);
+    buf[0x1000..0x1000 + fn0.len()].copy_from_slice(&fn0);
+
+    // .pdata entry covering only [0x1000, 0x1000 + fn0.len())
+    w32(buf, 0x6000, 0x1000);
+    w32(buf, 0x6004, 0x1000 + fn0.len() as u32);
+    w32(buf, 0x6008, 0);
+
+    // Two `.pdata`-less leaf helpers at 0x4000 (direct call) and 0x4100 (tail jump).
+    buf[0x4000..0x4006].copy_from_slice(&[0xB8, 0x11, 0, 0, 0, 0xC3]);
+    buf[0x4100..0x4106].copy_from_slice(&[0xB8, 0x22, 0, 0, 0, 0xC3]);
+
+    let mut bc = Box::new(BlockCache::new());
+    let (ips, closure) = unsafe { discover(&mut *bc, base, pe.len, &[0x1000], DEFAULT_AOT_CLOSURE) };
+    assert!(
+        ips.contains(&(base64 + 0x4000)),
+        "deep .pdata function (>128 hops) must discover direct-called .pdata-less leaf"
+    );
+    assert!(
+        ips.contains(&(base64 + 0x4100)),
+        "deep .pdata function (>128 hops) must discover tail-jumped .pdata-less leaf"
+    );
+    assert!(
+        closure.leaf_callees >= 2,
+        "expected >=2 leaf callees, got {}",
+        closure.leaf_callees
+    );
 }

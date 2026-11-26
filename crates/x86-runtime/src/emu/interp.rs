@@ -870,7 +870,14 @@ unsafe fn emu_run_region(
             }
             let after_rip_exit = core::mem::take(&mut jstats_rip);
             if let Some(code) = fast_jit_code.or_else(|| (*jit_ptr).lookup(cur_ip, blocks_ptr)) {
-                let mut budget = g.sample_left as i64 - 1;
+                let mut budget = if prof.is_some() {
+                    g.sample_left as i64 - 1
+                } else {
+                    // Without profiling, give translated code a 62-bit budget (safe for
+                    // `budget << 1` in `XBUD` and bounded by `MAX_STEPS`) so tight spin
+                    // loops don't trip `u32::MAX` budget `EXIT_SIDE` fallbacks after ~16s.
+                    (MAX_STEPS.saturating_sub(g.steps)).min((i64::MAX >> 2) as usize) as i64
+                };
                 if nan_inst {
                     budget = budget.min(4096);
                 }
@@ -887,7 +894,9 @@ unsafe fn emu_run_region(
                     }
                 }
                 g.steps = g.steps - 1 + executed as usize;
-                g.sample_left = (g.sample_left as i64 - executed).max(1) as u32;
+                if prof.is_some() {
+                    g.sample_left = (g.sample_left as i64 - executed).max(1) as u32;
+                }
                 blk_left = 0;
                 let fx = match ex {
                     jit::EXIT_CALL => fast::Fx::Call(cpu.jx.target),

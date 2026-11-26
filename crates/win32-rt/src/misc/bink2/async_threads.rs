@@ -4,7 +4,7 @@
 use crate::handles::HandleTable;
 use crate::strings::read_ansi_bytes_z;
 use crate::sync::ReentrantLock;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -81,6 +81,60 @@ static ASYNC_POOL: OnceLock<(Mutex<AsyncThreadPool>, Condvar)> = OnceLock::new()
 
 pub(crate) fn async_pool() -> &'static (Mutex<AsyncThreadPool>, Condvar) {
     ASYNC_POOL.get_or_init(|| (Mutex::new(AsyncThreadPool::new()), Condvar::new()))
+}
+
+type WorkerJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Persistent background worker pool executing asynchronous Bink 2 frame decodes off the caller
+/// (typically render) thread. Multiple `BinkInstance` handles decode concurrently across workers.
+struct BinkWorkerPool {
+    queue: Mutex<VecDeque<WorkerJob>>,
+    cvar: Condvar,
+}
+
+static WORKER_POOL: OnceLock<Arc<BinkWorkerPool>> = OnceLock::new();
+
+fn worker_pool() -> &'static Arc<BinkWorkerPool> {
+    WORKER_POOL.get_or_init(|| {
+        let pool = Arc::new(BinkWorkerPool {
+            queue: Mutex::new(VecDeque::new()),
+            cvar: Condvar::new(),
+        });
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 4))
+            .unwrap_or(2);
+        for idx in 0..worker_count {
+            let p = pool.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("bink2-async-{idx}"))
+                .spawn(move || loop {
+                    let job = {
+                        let mut q = p.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        while q.is_empty() {
+                            q = p.cvar.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                        q.pop_front()
+                    };
+                    if let Some(f) = job {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                    }
+                });
+        }
+        pool
+    })
+}
+
+/// Enqueue a decode task onto the persistent Bink 2 async worker pool.
+pub(crate) fn spawn_async_job<F>(job: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let pool = worker_pool();
+    {
+        let mut q = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back(Box::new(job));
+    }
+    pool.cvar.notify_one();
 }
 
 pub(crate) struct AsyncDecodeGuard {
@@ -425,39 +479,10 @@ pub(crate) unsafe fn wait_stop_async_threads_multi(
     1
 }
 
-pub(crate) fn wait_async_decode(bink: *mut c_void, us: i32) -> i32 {
+pub(crate) unsafe fn wait_async_decode(bink: *mut c_void, us: i32) -> i32 {
     if bink.is_null() {
         return 0;
     }
-    let (lock, cvar) = async_pool();
-    let mut pool = lock.lock().unwrap_or_else(|e| e.into_inner());
-    if !pool.in_flight.iter().any(|&n| n > 0) {
-        return 1;
-    }
-    if us == 0 {
-        return 0;
-    }
-    if us < 0 {
-        while pool.in_flight.iter().any(|&n| n > 0) {
-            pool = cvar.wait(pool).unwrap_or_else(|e| e.into_inner());
-        }
-        return 1;
-    }
-    let deadline = Instant::now() + Duration::from_micros(us as u64);
-    while pool.in_flight.iter().any(|&n| n > 0) {
-        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
-            return 0;
-        };
-        let (next_pool, res) = cvar
-            .wait_timeout(pool, rem)
-            .unwrap_or_else(|e| e.into_inner());
-        pool = next_pool;
-        if !pool.in_flight.iter().any(|&n| n > 0) {
-            return 1;
-        }
-        if res.timed_out() {
-            return 0;
-        }
-    }
-    1
+    let inst = &mut *(bink as *mut super::player::BinkInstance);
+    super::player::wait_and_commit_async_decode(inst, us)
 }

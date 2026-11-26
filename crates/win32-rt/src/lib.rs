@@ -99,11 +99,13 @@ pub fn register_export_override(dll: impl AsRef<str>, name: impl Into<String>, p
 
 type GuestDispatcherFn = unsafe fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
 type NativeVaRegistrarFn = fn(u64, usize);
+type IncomingRspReaderFn = fn() -> (u64, u64);
 type UnregisteredHostTextCheckerFn = fn(usize) -> bool;
 type BoundaryNanHookFn = fn(&str, usize, usize, &str);
 
 static GUEST_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_VA_REGISTRAR: AtomicUsize = AtomicUsize::new(0);
+static INCOMING_RSP_READER: AtomicUsize = AtomicUsize::new(0);
 static UNREGISTERED_HOST_TEXT_CHECKER: AtomicUsize = AtomicUsize::new(0);
 static BOUNDARY_NAN_HOOK: AtomicUsize = AtomicUsize::new(0);
 
@@ -163,6 +165,7 @@ pub fn has_native_va_registrar() -> bool {
 pub fn register_internal_host_thunks() {
     ucrt::runtime::register_host_thunks();
     misc::msvcp140::register_static_vtables();
+    misc::mfc140u::register_static_vtables();
     misc::mediadecoders_windowsdesktop::register_static_vtables();
     #[cfg(feature = "wwise-bridge")]
     audio::akrec::register_static_vtables();
@@ -175,6 +178,26 @@ pub fn register_native_va(va: u64, ptr: usize) {
     if r != 0 {
         let f: NativeVaRegistrarFn = unsafe { std::mem::transmute(r) };
         f(va, ptr);
+    }
+}
+
+/// Register the per-thread incoming guest Win64 RSP window reader
+/// (`x86_runtime::emu::peek_incoming_rsp`) so native COM/Win32 entry thunks with >16
+/// parameters can read Win64 stack slots beyond the 16 forwarded by `host_call_asm`.
+pub fn set_incoming_rsp_reader(f: IncomingRspReaderFn) {
+    INCOMING_RSP_READER.store(f as usize, Ordering::Release);
+}
+
+/// Read the active guest call's Win64 stack window `(rsp_lo, rsp_hi)` on the current thread,
+/// or `(0, 0)` when no guest-to-host call is active or no reader is registered.
+#[inline]
+pub fn incoming_rsp() -> (u64, u64) {
+    let r = INCOMING_RSP_READER.load(Ordering::Acquire);
+    if r != 0 {
+        let f: IncomingRspReaderFn = unsafe { std::mem::transmute(r) };
+        f()
+    } else {
+        (0, 0)
     }
 }
 
@@ -596,6 +619,7 @@ pub fn plain_builtin_fns() -> &'static [usize] {
             kernel32::process::GetLastError as *const () as usize,
             kernel32::process::SetLastError as *const () as usize,
             kernel32::time::SwitchToThread as *const () as usize,
+            misc::msvcp140::_Thrd_yield as *const () as usize,
             kernel32::time::QueryPerformanceCounter as *const () as usize,
             kernel32::time::QueryPerformanceFrequency as *const () as usize,
             kernel32::time::GetTickCount as *const () as usize,
@@ -603,6 +627,8 @@ pub fn plain_builtin_fns() -> &'static [usize] {
             kernel32::time::QueryInterruptTime as *const () as usize,
             kernel32::time::QueryUnbiasedInterruptTime as *const () as usize,
             misc::winmm::timeGetTime as *const () as usize,
+            misc::xinput1_4::XInputGetState as *const () as usize,
+            misc::xinput1_4::XInputGetStateEx as *const () as usize,
             sync::AcquireSRWLockExclusive as *const () as usize,
             sync::ReleaseSRWLockExclusive as *const () as usize,
             sync::TryAcquireSRWLockExclusive as *const () as usize,
@@ -1136,6 +1162,19 @@ mod tests {
             ("kernel32.dll", "WakeByAddressAll"),
             ("kernel32.dll", "SleepConditionVariableCS"),
             ("kernel32.dll", "SleepConditionVariableSRW"),
+            ("kernel32.dll", "EnterCriticalSection"),
+            ("kernel32.dll", "LeaveCriticalSection"),
+            ("kernel32.dll", "TryEnterCriticalSection"),
+            ("kernel32.dll", "SwitchToThread"),
+            ("kernel32.dll", "GetTickCount"),
+            ("kernel32.dll", "GetTickCount64"),
+            ("ntdll.dll", "RtlEnterCriticalSection"),
+            ("ntdll.dll", "RtlLeaveCriticalSection"),
+            ("ntdll.dll", "RtlTryEnterCriticalSection"),
+            ("winmm.dll", "timeGetTime"),
+            ("xinput1_4.dll", "XInputGetState"),
+            ("xinput1_4.dll", "XInputGetStateEx"),
+            ("msvcp140.dll", "_Thrd_yield"),
         ] {
             let p = lookup(dll, sym).unwrap_or_else(|| panic!("missing {dll}!{sym}")) as usize;
             assert!(plain.contains(&p), "{dll}!{sym} missing from plain_builtin_fns");

@@ -1,4 +1,4 @@
-//! Encoder/barrier counters for GPU submission diagnostics (`AW2_ENC_STATS=1`).
+//! Encoder/barrier counters for GPU submission diagnostics (`PORT_ENC_STATS=1`, legacy alias `AW2_ENC_STATS`).
 //!
 //! Relaxed atomic increments only; [`dump`] logs per-frame averages since the
 //! previous dump.
@@ -189,9 +189,9 @@ pub type Counter = AtomicU64;
 /// diagnostic re-evaluations run.
 ///
 /// Starts `true` under `#[cfg(test)]` so all unit tests observe exact counter
-/// increments; in non-test builds it is lazily initialized from `AW2_ENC_STATS`
-/// (`!= "0"`) so production runs avoid cross-core atomic RMW false sharing when
-/// encoder statistics are disabled.
+/// increments; in non-test builds it is lazily initialized from `PORT_ENC_STATS`
+/// (legacy alias `AW2_ENC_STATS`, `!= "0"`) so production runs avoid cross-core
+/// atomic RMW false sharing when encoder statistics are disabled.
 #[cfg(test)]
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(not(test))]
@@ -200,17 +200,22 @@ pub static ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
 static INIT_STATE: AtomicU8 = AtomicU8::new(0);
 
+fn enabled_from_env() -> bool {
+    super::env_canonical_or_alias("PORT_ENC_STATS", "AW2_ENC_STATS")
+        .is_some_and(|v| super::parse_bool_knob(&v))
+}
+
 #[cfg(not(test))]
 #[cold]
 #[inline(never)]
 fn init_enabled() -> bool {
-    let on = std::env::var_os("AW2_ENC_STATS").is_some_and(|v| v != "0");
+    let on = enabled_from_env();
     ENABLED.store(on, Relaxed);
     INIT_STATE.store(if on { 2 } else { 1 }, Relaxed);
     on
 }
 
-/// Fast-path check: true when `AW2_ENC_STATS` is enabled (or during unit tests).
+/// Fast-path check: true when `PORT_ENC_STATS` is enabled (or during unit tests).
 #[inline(always)]
 pub fn active() -> bool {
     #[cfg(test)]
@@ -244,7 +249,7 @@ pub fn add(c: &AtomicU64, n: u64) {
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("AW2_ENC_STATS").is_some_and(|v| v != "0");
+        let on = enabled_from_env();
         #[cfg(not(test))]
         {
             ENABLED.store(on, Relaxed);
@@ -303,5 +308,47 @@ mod tests {
         ENABLED.store(true, Relaxed);
         inc(&local);
         assert_eq!(local.load(Relaxed), 7);
+    }
+
+    #[test]
+    fn port_enc_stats_precedence_canonical_beats_alias() {
+        let _lock = super::super::env_test_lock();
+        let prev_p = std::env::var_os("PORT_ENC_STATS");
+        let prev_a = std::env::var_os("AW2_ENC_STATS");
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("PORT_ENC_STATS", v),
+                    None => std::env::remove_var("PORT_ENC_STATS"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("AW2_ENC_STATS", v),
+                    None => std::env::remove_var("AW2_ENC_STATS"),
+                }
+            }
+        }
+        let _restore = Restore(prev_p, prev_a);
+
+        std::env::remove_var("PORT_ENC_STATS");
+        std::env::remove_var("AW2_ENC_STATS");
+        assert!(!enabled_from_env());
+
+        // Legacy alias still works.
+        std::env::set_var("AW2_ENC_STATS", "1");
+        assert!(enabled_from_env());
+
+        // Canonical overrides alias.
+        std::env::set_var("PORT_ENC_STATS", "0");
+        assert!(!enabled_from_env());
+
+        std::env::set_var("AW2_ENC_STATS", "0");
+        std::env::set_var("PORT_ENC_STATS", "1");
+        assert!(enabled_from_env());
+
+        // Empty canonical falls back to alias.
+        std::env::set_var("PORT_ENC_STATS", "");
+        std::env::set_var("AW2_ENC_STATS", "true");
+        assert!(enabled_from_env());
     }
 }
