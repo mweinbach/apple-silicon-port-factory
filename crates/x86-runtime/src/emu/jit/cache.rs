@@ -5,7 +5,9 @@ use super::aot::AotReloc;
 use super::emit::Asm;
 use super::lazy::{flaglazy_enabled, succ_lb_kill, Edges, FLAGLAZY_DEPTH, PF_NONE};
 use super::stubs::{emit_stubs, plaincall_enabled};
-use super::translate::{classify, op_flags, supported, FlagState, Grp, SideExit, SlowMem, Src, Term, Tr};
+use super::translate::{
+    classify, op_flags, supported, FlagState, Grp, SideExit, SlowMem, Src, SysCold, Term, Tr,
+};
 use super::xmm::{fast_nan_enabled, retlit_enabled, xmm_pin_enabled, xmmreg_enabled, ColdNan};
 use super::*;
 use crate::emu::exec_mem::{alloc_jit, free_jit, icache_invalidate, jit_writable, jit_write_protect};
@@ -1080,6 +1082,8 @@ impl JitCache {
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
         cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
+        cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
+        cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         // `cpu.jx.ymm_dirty` is maintained incrementally across interpreter and translated writes;
         // skip the 256-byte `cpu.ymm_hi` scan on every `JitCache::run()`.
@@ -1177,6 +1181,8 @@ impl JitCache {
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
         cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
+        cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
+        cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = 0;
         // Verifier trials (`verify.rs::seed_trial`) seed `cpu.ymm_hi` directly; compute `ymm_dirty` here.
@@ -1730,6 +1736,7 @@ pub(in crate::emu) struct TrScratch {
     pub(super) link_conds: Vec<(usize, usize)>,
     pub(super) ymm_colds: Vec<(usize, usize, u16)>,
     pub(super) tsc_colds: Vec<(usize, usize, bool)>,
+    pub(super) sys_colds: Vec<SysCold>,
     pub(super) cold: Vec<ColdNan>,
     pub(super) lits: Vec<(usize, u64)>,
     pub(super) lits128: Vec<(usize, u64, u64)>,
@@ -1751,6 +1758,7 @@ impl TrScratch {
             link_conds: Vec::new(),
             ymm_colds: Vec::new(),
             tsc_colds: Vec::new(),
+            sys_colds: Vec::new(),
             cold: Vec::new(),
             lits: Vec::new(),
             lits128: Vec::new(),
@@ -1781,6 +1789,7 @@ pub(super) fn new_tr<'a>(
     let mut link_conds = core::mem::take(&mut sc.link_conds);
     let mut ymm_colds = core::mem::take(&mut sc.ymm_colds);
     let tsc_colds = core::mem::take(&mut sc.tsc_colds);
+    let mut sys_colds = core::mem::take(&mut sc.sys_colds);
     let mut cold = core::mem::take(&mut sc.cold);
     let mut lits = core::mem::take(&mut sc.lits);
     let mut lits128 = core::mem::take(&mut sc.lits128);
@@ -1794,6 +1803,7 @@ pub(super) fn new_tr<'a>(
     cond_links.clear();
     link_conds.clear();
     ymm_colds.clear();
+    sys_colds.clear();
     cold.clear();
     lits.clear();
     lits128.clear();
@@ -1837,6 +1847,7 @@ pub(super) fn new_tr<'a>(
         ymm_clean: 0,
         ymm_colds,
         tsc_colds,
+        sys_colds,
         xmm_hi32_zero: 0,
         xmm_hi64_zero: 0,
         xmm_hi32_live: [0xFFFF; BLK_MAX_INSNS + 1],

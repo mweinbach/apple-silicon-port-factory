@@ -12,6 +12,12 @@ const COMPACT: u64 = 1 << 63;
 const MXCSR_MASK: u32 = 0xffff;
 const DEFAULT_MXCSR: u32 = 0x1f80;
 
+/// Bitflags packed into `FastOp::w` for `K_SYS_MISC` sub-op 16 (`FXSAVE*`/`FXRSTOR*`/`XSAVE*`/`XRSTOR*`).
+pub(super) const XS_FLAG_LEGACY: u8 = 1 << 0;
+pub(super) const XS_FLAG_WIDE: u8 = 1 << 1;
+pub(super) const XS_FLAG_RESTORE: u8 = 1 << 2;
+pub(super) const XS_FLAG_COMPACT: u8 = 1 << 3;
+
 #[derive(Debug, PartialEq)]
 pub(super) struct Fault {
     code: u32,
@@ -157,14 +163,32 @@ impl Cpu {
             return Ok(());
         }
 
-        let area = Area(self.eff_addr(ins));
-        let legacy = matches!(mn, Fxsave | Fxsave64 | Fxrstor | Fxrstor64);
-        let wide = matches!(mn, Fxsave64 | Fxrstor64 | Xsave64 | Xsaveopt64 | Xsavec64 | Xrstor64);
+        let mut flags = 0u8;
+        if matches!(mn, Fxsave | Fxsave64 | Fxrstor | Fxrstor64) {
+            flags |= XS_FLAG_LEGACY;
+        }
+        if matches!(mn, Fxsave64 | Fxrstor64 | Xsave64 | Xsaveopt64 | Xsavec64 | Xrstor64) {
+            flags |= XS_FLAG_WIDE;
+        }
+        if matches!(mn, Fxrstor | Fxrstor64 | Xrstor | Xrstor64) {
+            flags |= XS_FLAG_RESTORE;
+        }
+        if matches!(mn, Xsavec | Xsavec64) {
+            flags |= XS_FLAG_COMPACT;
+        }
+        self.exec_xstate_mem(self.eff_addr(ins), flags)
+    }
+
+    pub(super) unsafe fn exec_xstate_mem(&mut self, addr: u64, flags: u8) -> Result<(), Fault> {
+        let area = Area(addr);
+        let legacy = flags & XS_FLAG_LEGACY != 0;
+        let wide = flags & XS_FLAG_WIDE != 0;
+        let restore = flags & XS_FLAG_RESTORE != 0;
+        let compact = flags & XS_FLAG_COMPACT != 0;
         let mask = if legacy { X87 | SSE } else { self.gpr[0] & u64::from(XCR0) };
         if area.0 & (if legacy { 15 } else { 63 }) != 0 {
             return Err(Fault::gp());
         }
-        let restore = matches!(mn, Fxrstor | Fxrstor64 | Xrstor | Xrstor64);
         if !is_valid_guest_range(area.0, 1) {
             return Err(Fault::pf(area.0, !restore));
         }
@@ -173,7 +197,6 @@ impl Cpu {
         }
         // We always track the three components as in-use and modified. The SDM permits
         // XSAVEOPT / XSAVEC to store every selected component, including initial values.
-        let compact = matches!(mn, Xsavec | Xsavec64);
         if mask & X87 != 0 {
             x87_snapshot().save(&area, wide)?;
         }
