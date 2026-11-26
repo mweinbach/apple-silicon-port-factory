@@ -574,6 +574,13 @@ fn register_bitfields_and_alu(cases: &mut Cases) {
         cset(22, LE) => "cset_csinc", "cset w22, le";
     );
 
+    check_words!(cases, "cneg";
+        cneg(false, 3, 5, EQ) => "cneg_csneg", "cneg w3, w5, eq";
+        cneg(false, 4, 6, NE) => "cneg_csneg", "cneg w4, w6, ne";
+        cneg(true, 19, 21, LT) => "cneg_csneg", "cneg x19, x21, lt";
+        cneg(true, 20, 22, MI) => "cneg_csneg", "cneg x20, x22, mi";
+    );
+
     check_words!(cases, "clz";
         clz(false, 3, 19) => "clz_int", "clz w3, w19";
         clz(true, 4, 22) => "clz_int", "clz x4, x22";
@@ -643,6 +650,31 @@ fn register_scalar_fp_and_add_imm(cases: &mut Cases) {
     check_words!(cases, "fcmp";
         fcmp(false, 5, 7) => "fcmp_float", "fcmp s5, s7";
         fcmp(true, 19, 23) => "fcmp_float", "fcmp d19, d23";
+    );
+
+    check_words!(cases, "fcmp_zero";
+        fcmp_zero(false, 5) => "fcmp_float", "fcmp s5, #0.0";
+        fcmp_zero(true, 19) => "fcmp_float", "fcmp d19, #0.0";
+    );
+
+    check_words!(cases, "s_fadd";
+        s_fadd(false, 3, 5, 7) => "fadd_float", "fadd s3, s5, s7";
+        s_fadd(true, 19, 21, 23) => "fadd_float", "fadd d19, d21, d23";
+    );
+
+    check_words!(cases, "s_fsub";
+        s_fsub(false, 3, 5, 7) => "fsub_float", "fsub s3, s5, s7";
+        s_fsub(true, 19, 21, 23) => "fsub_float", "fsub d19, d21, d23";
+    );
+
+    check_words!(cases, "s_fmul";
+        s_fmul(false, 3, 5, 7) => "fmul_float", "fmul s3, s5, s7";
+        s_fmul(true, 19, 21, 23) => "fmul_float", "fmul d19, d21, d23";
+    );
+
+    check_words!(cases, "s_fdiv";
+        s_fdiv(false, 3, 5, 7) => "fdiv_float", "fdiv s3, s5, s7";
+        s_fdiv(true, 19, 21, 23) => "fdiv_float", "fdiv d19, d21, d23";
     );
 
     check_words!(cases, "fcvt_d_s";
@@ -917,6 +949,26 @@ fn register_loads_stores_barriers_sysregs(cases: &mut Cases) {
     check_words!(cases, "msr_fpcr";
         msr_fpcr(7) => "msr_reg", "msr fpcr, x7";
         msr_fpcr(26) => "msr_reg", "msr fpcr, x26";
+    );
+
+    check_words!(cases, "mrs_fpsr";
+        mrs_fpsr(5) => "mrs", "mrs x5, fpsr";
+        mrs_fpsr(24) => "mrs", "mrs x24, fpsr";
+    );
+
+    check_words!(cases, "msr_fpsr";
+        msr_fpsr(7) => "msr_reg", "msr fpsr, x7";
+        msr_fpsr(26) => "msr_reg", "msr fpsr, x26";
+    );
+
+    check_words!(cases, "mrs_nzcv";
+        mrs_nzcv(5) => "mrs", "mrs x5, nzcv";
+        mrs_nzcv(24) => "mrs", "mrs x24, nzcv";
+    );
+
+    check_words!(cases, "msr_nzcv";
+        msr_nzcv(7) => "msr_reg", "msr nzcv, x7";
+        msr_nzcv(26) => "msr_reg", "msr nzcv, x26";
     );
 }
 

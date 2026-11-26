@@ -43,6 +43,7 @@ mod ops;
 mod stubs;
 mod translate;
 mod vec;
+mod x87;
 mod xmm;
 #[cfg(test)]
 mod tests;
@@ -158,6 +159,10 @@ pub(super) struct JitScratch {
     pub mxcsr: u32,
     /// Embedding thread FPCR for native calls made directly by generated code.
     pub host_fpcr: u64,
+    /// Static native Rust x87 helper function table ([`crate::emu::x87::x87_helpers_ptr`]),
+    /// allowing AOT & signed static Mach-O blocks to call soft-float80 / transcendental helpers
+    /// with zero runtime relocations.
+    pub x87_helpers: usize,
     /// Native OS entropy helper (`super::cpu::guest_entropy_raw`) for `RDRAND`/`RDSEED`.
     pub entropy_fn: usize,
     /// Pointer to static [`crate::emu::cpu::SysHelpers`] table (CPUID, XSTATE, `#GP` dispatch).
@@ -179,7 +184,8 @@ impl Default for JitScratch {
             mul: 0,
             codegen: 0,
             atomic_locks: super::cpu::atomic_locks_ptr(),
-            x87_state: super::regfile_ext::x87_state_ptr(),
+            x87_state: super::x87::x87_state_ptr(),
+            x87_helpers: super::x87::x87_helpers_ptr(),
             teb: 0,
             ctx_sp: 0,
             ctx_blocks: 0,
@@ -822,6 +828,7 @@ const OFF_TABLE: u32 = OFF_JX + offset_of!(JitScratch, table) as u32;
 const OFF_CODEGEN: u32 = OFF_JX + offset_of!(JitScratch, codegen) as u32;
 const OFF_ATOMIC_LOCKS: u32 = OFF_JX + offset_of!(JitScratch, atomic_locks) as u32;
 const OFF_X87_STATE: u32 = OFF_JX + offset_of!(JitScratch, x87_state) as u32;
+const OFF_X87_HELPERS: u32 = OFF_JX + offset_of!(JitScratch, x87_helpers) as u32;
 const X87_OFF_REGS: i32 = offset_of!(super::regfile_ext::X87State, regs) as i32;
 const X87_OFF_TOP: u32 = offset_of!(super::regfile_ext::X87State, top) as u32;
 const X87_OFF_VALID_MASK: u32 = offset_of!(super::regfile_ext::X87State, valid_mask) as u32;
@@ -846,8 +853,10 @@ const _: () = assert!(
         && OFF_ATOMIC_LOCKS < 8 * 4096
         && OFF_X87_STATE % 8 == 0
         && OFF_X87_STATE < 8 * 4096
+        && OFF_X87_HELPERS % 8 == 0
+        && OFF_X87_HELPERS < 8 * 4096
         && X87_OFF_REGS >= 0
-        && X87_OFF_REGS + 80 <= 255
+        && X87_OFF_REGS + 128 <= 255
         && X87_OFF_TOP < 4096
         && X87_OFF_VALID_MASK < 4096
         && OFF_ENTROPY_FN % 8 == 0

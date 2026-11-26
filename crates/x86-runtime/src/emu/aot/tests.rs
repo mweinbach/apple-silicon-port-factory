@@ -2972,12 +2972,12 @@ fn closure_discovers_mid_block_resume_after_non_jit_op() {
     w32(&mut img, sec1 + 20, 0x2000);
     w32(&mut img, sec1 + 36, 0x4000_0040);
 
-    // Function 1 @ 0x1000: mov eax, 1 (5B); fld1 (2B: D9 E8, generic x87); add eax, 2 (3B); ret (1B)
-    let f1: [u8; 11] = [
+    // Function 1 @ 0x1000: mov eax, 1 (5B); shld dword ptr [rax], ecx, 4 (4B: 0F A4 08 04, generic); add eax, 2 (3B); ret (1B)
+    let f1: [u8; 13] = [
         0xB8, 1, 0, 0, 0, // +0x1000: mov eax, 1
-        0xD9, 0xE8, // +0x1005: fld1 (generic interpreter)
-        0x83, 0xC0, 0x02, // +0x1007: add eax, 2 (resume IP!)
-        0xC3, // +0x100A: ret
+        0x0F, 0xA4, 0x08, 0x04, // +0x1005: shld dword ptr [rax], ecx, 4 (generic interpreter)
+        0x83, 0xC0, 0x02, // +0x1009: add eax, 2 (resume IP!)
+        0xC3, // +0x100C: ret
     ];
     img[0x1000..0x1000 + f1.len()].copy_from_slice(&f1);
 
@@ -3001,8 +3001,8 @@ fn closure_discovers_mid_block_resume_after_non_jit_op() {
     let mut bc = Box::new(BlockCache::new());
     let (ips, _) = unsafe { discover(&mut *bc, base, img.len(), &[0x1000, 0x1040], DEFAULT_AOT_CLOSURE) };
     assert!(
-        ips.contains(&(base as u64 + 0x1007)),
-        "expected post-fld1 resume IP +0x1007 in discovered blocks: {ips:#x?}"
+        ips.contains(&(base as u64 + 0x1009)),
+        "expected post-shld-mem resume IP +0x1009 in discovered blocks: {ips:#x?}"
     );
     assert!(
         ips.contains(&(base as u64 + 0x1046)),

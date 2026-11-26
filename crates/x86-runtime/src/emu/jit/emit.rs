@@ -193,6 +193,10 @@ impl Asm {
         // csinc wd, wzr, wzr, !cond
         self.emit(0x1A80_0400 | ZR << 16 | (cond ^ 1) << 12 | ZR << 5 | d);
     }
+    pub(super) fn cneg(&mut self, x: bool, d: u32, n: u32, cond: u32) {
+        // csneg d, n, n, !cond
+        self.emit(0x5A80_0400 | sf(x) | n << 16 | (cond ^ 1) << 12 | n << 5 | d);
+    }
     pub(super) fn clz(&mut self, x: bool, d: u32, n: u32) {
         self.emit(0x5AC0_1000 | sf(x) | n << 5 | d);
     }
@@ -232,6 +236,21 @@ impl Asm {
     }
     pub(super) fn fcmp(&mut self, is_f64: bool, vn: u32, vm: u32) {
         self.emit(0x1E20_2000 | (is_f64 as u32) << 22 | vm << 16 | vn << 5);
+    }
+    pub(super) fn fcmp_zero(&mut self, is_f64: bool, vn: u32) {
+        self.emit(0x1E20_2008 | (is_f64 as u32) << 22 | vn << 5);
+    }
+    pub(super) fn s_fadd(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x1E20_2800 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
+    }
+    pub(super) fn s_fsub(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x1E20_3800 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
+    }
+    pub(super) fn s_fmul(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x1E20_0800 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
+    }
+    pub(super) fn s_fdiv(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x1E20_1800 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
     }
     pub(super) fn fcvt_d_s(&mut self, vd: u32, vn: u32) {
         self.emit(0x1E22_C000 | vn << 5 | vd);
@@ -418,6 +437,22 @@ impl Asm {
     /// `msr fpcr, xt` (writes ARM64 floating-point control register).
     pub(super) fn msr_fpcr(&mut self, t: u32) {
         self.emit(0xD51B_4400 | t);
+    }
+    /// `mrs xt, fpsr` (reads ARM64 floating-point status register).
+    pub(super) fn mrs_fpsr(&mut self, t: u32) {
+        self.emit(0xD53B_4420 | t);
+    }
+    /// `msr fpsr, xt` (writes ARM64 floating-point status register).
+    pub(super) fn msr_fpsr(&mut self, t: u32) {
+        self.emit(0xD51B_4420 | t);
+    }
+    /// `mrs xt, nzcv` (reads ARM64 condition flags).
+    pub(super) fn mrs_nzcv(&mut self, t: u32) {
+        self.emit(0xD53B_4200 | t);
+    }
+    /// `msr nzcv, xt` (writes ARM64 condition flags).
+    pub(super) fn msr_nzcv(&mut self, t: u32) {
+        self.emit(0xD51B_4200 | t);
     }
 
     // --- branches (offsets patched later unless given) ---
