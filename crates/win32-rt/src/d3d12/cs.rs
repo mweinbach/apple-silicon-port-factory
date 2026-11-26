@@ -176,7 +176,7 @@ fn run_thread() {
                 if let Some(j) = st.jobs.pop_front() {
                     break j;
                 }
-                if d3d12_metal::metal::queue::has_pending_cbs() {
+                if d3d12_metal::metal::queue::has_pending_work() {
                     let (new_st, timeout) = cs
                         .work
                         .wait_timeout(st, std::time::Duration::from_millis(2))
@@ -184,7 +184,7 @@ fn run_thread() {
                     st = new_st;
                     if timeout.timed_out() && st.jobs.is_empty() {
                         drop(st);
-                        d3d12_metal::metal::queue::Queue::flush_all_pending_cbs();
+                        d3d12_metal::metal::queue::Queue::flush_all_pending_work();
                         st = cs.q.lock().unwrap();
                     }
                 } else {

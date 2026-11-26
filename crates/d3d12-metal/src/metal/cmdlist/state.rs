@@ -668,30 +668,26 @@ impl StageSync {
     }
 }
 
-/// Inline-backed buffer sub-range list avoiding heap allocation for the common
-/// 1–2 sub-range case per intra-compute buffer barrier obligation.
+/// Compact inline-backed buffer sub-range list avoiding heap allocation for the
+/// common 1-sub-range case while keeping `IbObl` compact (32 bytes for `Option<SmallSpans>`).
 #[derive(Clone, Debug)]
 pub(super) enum SmallSpans {
-    Inline {
-        buf: [SubRange; 2],
-        len: u8,
-    },
+    Empty,
+    Inline(SubRange),
     Heap(Vec<SubRange>),
 }
 
 impl SmallSpans {
     #[inline]
     pub(super) const fn new() -> Self {
-        Self::Inline {
-            buf: [SubRange::whole(0); 2],
-            len: 0,
-        }
+        Self::Empty
     }
 
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
         match self {
-            Self::Inline { len, .. } => *len == 0,
+            Self::Empty => true,
+            Self::Inline(_) => false,
             Self::Heap(v) => v.is_empty(),
         }
     }
@@ -699,37 +695,27 @@ impl SmallSpans {
     #[inline]
     pub(super) fn as_slice(&self) -> &[SubRange] {
         match self {
-            Self::Inline { buf, len } => &buf[..(*len as usize)],
+            Self::Empty => &[],
+            Self::Inline(s) => std::slice::from_ref(s),
             Self::Heap(v) => v.as_slice(),
         }
     }
 
     #[inline]
-    pub(super) fn push_coalesced(&mut self, mut s: SubRange) {
+    pub(super) fn push_coalesced(&mut self, s: SubRange) {
         if s.lo >= s.hi {
             return;
         }
         match self {
-            Self::Inline { buf, len } => {
-                let mut n = *len as usize;
-                let mut i = 0;
-                while i < n {
-                    let e = buf[i];
-                    if e.r == s.r && e.lo <= s.hi && s.lo <= e.hi {
-                        s.lo = s.lo.min(e.lo);
-                        s.hi = s.hi.max(e.hi);
-                        n -= 1;
-                        buf[i] = buf[n];
-                    } else {
-                        i += 1;
-                    }
-                }
-                if n < 2 {
-                    buf[n] = s;
-                    *len = (n + 1) as u8;
+            Self::Empty => *self = Self::Inline(s),
+            Self::Inline(e) => {
+                if e.r == s.r && e.lo <= s.hi && s.lo <= e.hi {
+                    e.lo = e.lo.min(s.lo);
+                    e.hi = e.hi.max(s.hi);
                 } else {
+                    let prev = *e;
                     let mut v = Vec::with_capacity(4);
-                    v.extend_from_slice(&buf[..n]);
+                    v.push(prev);
                     v.push(s);
                     *self = Self::Heap(v);
                 }
@@ -1064,6 +1050,75 @@ pub(super) fn res_class(r: usize) -> u8 {
     }
 }
 
+/// Lightweight stage-mask-only accumulator matching [`SplitPend`] (72 bytes vs 272 bytes)
+/// for stack-local barrier batch accumulation in `barrier_list_with`, avoiding per-call
+/// zeroing and copying of seven `[u32; 7]` requirement arrays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SplitMasks {
+    pub(super) vtx_after: MTLStages,
+    pub(super) frag_after: MTLStages,
+    pub(super) disp_after: MTLStages,
+    pub(super) blit_after: MTLStages,
+    pub(super) as_after: MTLStages,
+    pub(super) soft_after: [MTLStages; 2],
+    pub(super) soft_before: [MTLStages; 2],
+}
+
+impl Default for SplitMasks {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            vtx_after: MTLStages::empty(),
+            frag_after: MTLStages::empty(),
+            disp_after: MTLStages::empty(),
+            blit_after: MTLStages::empty(),
+            as_after: MTLStages::empty(),
+            soft_after: [MTLStages::empty(); 2],
+            soft_before: [MTLStages::empty(); 2],
+        }
+    }
+}
+
+impl SplitMasks {
+    #[inline]
+    pub(super) fn add(&mut self, after: MTLStages, before: MTLStages, soft: [MTLStages; 2]) {
+        if after.is_empty() || (before | soft[0] | soft[1]).is_empty() {
+            return;
+        }
+        if before == MTLStages::All {
+            self.vtx_after |= after;
+            self.frag_after |= after;
+            self.disp_after |= after;
+            self.blit_after |= after;
+            self.as_after |= after;
+            return;
+        }
+        if before.intersects(PRE_RASTER) {
+            self.vtx_after |= after;
+        }
+        if before.contains(MTLStages::Fragment) {
+            self.frag_after |= after;
+        }
+        if before.contains(MTLStages::Dispatch) {
+            self.disp_after |= after;
+        }
+        if before.contains(MTLStages::Blit) {
+            self.blit_after |= after;
+        }
+        if before.contains(MTLStages::AccelerationStructure) {
+            self.as_after |= after;
+        }
+        if !soft[0].is_empty() {
+            self.soft_after[0] |= after;
+            self.soft_before[0] |= soft[0];
+        }
+        if !soft[1].is_empty() {
+            self.soft_after[1] |= after;
+            self.soft_before[1] |= soft[1];
+        }
+    }
+}
+
 /// Per-consumer-stage producer stage masks (`AW2_RENDER_SPLIT_STAGE_SYNC=1`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SplitPend {
@@ -1150,44 +1205,6 @@ pub(super) fn merge_req_for_after(dst: &mut [u32; 7], after: MTLStages, src: &[u
 
 impl SplitPend {
     #[inline]
-    pub(super) fn add(&mut self, after: MTLStages, before: MTLStages, soft: [MTLStages; 2]) {
-        if after.is_empty() || (before | soft[0] | soft[1]).is_empty() {
-            return;
-        }
-        if before == MTLStages::All {
-            self.vtx_after |= after;
-            self.frag_after |= after;
-            self.disp_after |= after;
-            self.blit_after |= after;
-            self.as_after |= after;
-            return;
-        }
-        if before.intersects(PRE_RASTER) {
-            self.vtx_after |= after;
-        }
-        if before.contains(MTLStages::Fragment) {
-            self.frag_after |= after;
-        }
-        if before.contains(MTLStages::Dispatch) {
-            self.disp_after |= after;
-        }
-        if before.contains(MTLStages::Blit) {
-            self.blit_after |= after;
-        }
-        if before.contains(MTLStages::AccelerationStructure) {
-            self.as_after |= after;
-        }
-        if !soft[0].is_empty() {
-            self.soft_after[0] |= after;
-            self.soft_before[0] |= soft[0];
-        }
-        if !soft[1].is_empty() {
-            self.soft_after[1] |= after;
-            self.soft_before[1] |= soft[1];
-        }
-    }
-
-    #[inline]
     pub(super) fn add_with_req(
         &mut self,
         after: MTLStages,
@@ -1241,20 +1258,6 @@ impl SplitPend {
     }
 
     #[inline]
-    pub(super) fn stamp_all_req(&mut self, req: [u32; 7]) {
-        merge_req_for_after(&mut self.vtx_req, self.vtx_after, &req);
-        merge_req_for_after(&mut self.frag_req, self.frag_after, &req);
-        merge_req_for_after(&mut self.disp_req, self.disp_after, &req);
-        merge_req_for_after(&mut self.blit_req, self.blit_after, &req);
-        merge_req_for_after(&mut self.as_req, self.as_after, &req);
-        for i in 0..2 {
-            if !self.soft_before[i].is_empty() {
-                merge_req_for_after(&mut self.soft_req[i], self.soft_after[i], &req);
-            }
-        }
-    }
-
-    #[inline]
     pub(super) fn bump_for_ran(&mut self, ran: MTLStages, cur_gen: &[u32; 7]) {
         if ran.is_empty() {
             return;
@@ -1281,6 +1284,40 @@ impl SplitPend {
                     self.soft_req[i][pi] = self.soft_req[i][pi].max(g);
                 }
             }
+        }
+    }
+
+    #[inline]
+    pub(super) fn merge_masks(&mut self, other: &SplitMasks, req: &[u32; 7]) {
+        if !other.vtx_after.is_empty() {
+            self.vtx_after |= other.vtx_after;
+            merge_req_for_after(&mut self.vtx_req, other.vtx_after, req);
+        }
+        if !other.frag_after.is_empty() {
+            self.frag_after |= other.frag_after;
+            merge_req_for_after(&mut self.frag_req, other.frag_after, req);
+        }
+        if !other.disp_after.is_empty() {
+            self.disp_after |= other.disp_after;
+            merge_req_for_after(&mut self.disp_req, other.disp_after, req);
+        }
+        if !other.blit_after.is_empty() {
+            self.blit_after |= other.blit_after;
+            merge_req_for_after(&mut self.blit_req, other.blit_after, req);
+        }
+        if !other.as_after.is_empty() {
+            self.as_after |= other.as_after;
+            merge_req_for_after(&mut self.as_req, other.as_after, req);
+        }
+        if !other.soft_after[0].is_empty() && !other.soft_before[0].is_empty() {
+            self.soft_after[0] |= other.soft_after[0];
+            self.soft_before[0] |= other.soft_before[0];
+            merge_req_for_after(&mut self.soft_req[0], other.soft_after[0], req);
+        }
+        if !other.soft_after[1].is_empty() && !other.soft_before[1].is_empty() {
+            self.soft_after[1] |= other.soft_after[1];
+            self.soft_before[1] |= other.soft_before[1];
+            merge_req_for_after(&mut self.soft_req[1], other.soft_after[1], req);
         }
     }
 
@@ -1486,16 +1523,16 @@ impl<T> TrackedSet<T> {
     }
 }
 
-impl TrackedSet<usize> {
-    #[inline(always)]
-    fn res_bloom_bit(r: usize) -> u64 {
-        1u64 << (((r as u64 >> 6).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 58)
-    }
+#[inline(always)]
+pub(super) fn res_bloom_bit(r: usize) -> u64 {
+    1u64 << (((r as u64 >> 6).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 58)
+}
 
+impl TrackedSet<usize> {
     /// Insert `r` into an exact resource set, skipping the linear scan when its bloom bit is 0.
     #[inline(always)]
     pub(super) fn insert_res(&mut self, r: usize) {
-        let bit = Self::res_bloom_bit(r);
+        let bit = res_bloom_bit(r);
         if (self.bloom & bit) == 0 {
             self.bloom |= bit;
             self.items.push(r);
@@ -1514,8 +1551,32 @@ impl TrackedSet<usize> {
         if r == 0 {
             !self.items.is_empty()
         } else {
-            (self.bloom & Self::res_bloom_bit(r)) != 0 && self.items.contains(&r)
+            (self.bloom & res_bloom_bit(r)) != 0 && self.items.contains(&r)
         }
+    }
+}
+
+impl TrackedSet<SubRange> {
+    /// Insert a buffer sub-range into an exact span set, skipping the linear coalescing
+    /// scan when no entry with `s.r` can exist yet (`(bloom & bit) == 0`).
+    #[inline(always)]
+    pub(super) fn insert_span(&mut self, s: SubRange) {
+        if !self.exact || s.lo >= s.hi {
+            return;
+        }
+        let bit = res_bloom_bit(s.r);
+        if (self.bloom & bit) == 0 {
+            self.bloom |= bit;
+            self.items.push(s);
+        } else {
+            push_subrange(&mut self.items, s);
+        }
+    }
+
+    /// Fast O(1) bloom-filter check for whether `r` may appear in an exact span set.
+    #[inline(always)]
+    pub(super) fn maybe_contains_res(&self, r: usize) -> bool {
+        !self.items.is_empty() && (self.bloom & res_bloom_bit(r)) != 0
     }
 }
 
@@ -1671,6 +1732,90 @@ pub(super) struct SoftPreResObl {
     pub(super) req: [u32; 7],
 }
 
+/// Bloom-filtered vector of [`SoftPreResObl`]s so `push_soft_obl_into` skips O(N)
+/// deduplication scans on distinct resources while preserving exact `Vec` iteration/retain semantics.
+#[derive(Default, Clone, Debug)]
+pub(super) struct SoftOblVec {
+    pub(super) bloom: u64,
+    pub(super) items: Vec<SoftPreResObl>,
+}
+
+impl SoftOblVec {
+    #[inline]
+    pub(super) fn new() -> Self {
+        Self { bloom: 0, items: Vec::new() }
+    }
+
+    #[inline]
+    pub(super) fn clear(&mut self) {
+        self.bloom = 0;
+        self.items.clear();
+    }
+
+    #[inline]
+    pub(super) fn push(&mut self, item: SoftPreResObl) {
+        self.bloom |= res_bloom_bit(item.r);
+        self.items.push(item);
+    }
+
+    #[inline]
+    pub(super) fn retain_mut<F>(&mut self, f: F)
+    where
+        F: FnMut(&mut SoftPreResObl) -> bool,
+    {
+        self.items.retain_mut(f);
+        if self.items.is_empty() {
+            self.bloom = 0;
+        }
+    }
+}
+
+impl std::ops::Deref for SoftOblVec {
+    type Target = [SoftPreResObl];
+
+    #[inline]
+    fn deref(&self) -> &[SoftPreResObl] {
+        &self.items
+    }
+}
+
+impl std::ops::DerefMut for SoftOblVec {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [SoftPreResObl] {
+        &mut self.items
+    }
+}
+
+impl IntoIterator for SoftOblVec {
+    type Item = SoftPreResObl;
+    type IntoIter = std::vec::IntoIter<SoftPreResObl>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a SoftOblVec {
+    type Item = &'a SoftPreResObl;
+    type IntoIter = std::slice::Iter<'a, SoftPreResObl>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut SoftOblVec {
+    type Item = &'a mut SoftPreResObl;
+    type IntoIter = std::slice::IterMut<'a, SoftPreResObl>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter_mut()
+    }
+}
+
 /// Per-resource soft graphics (`Fragment | PRE_RASTER`) -> `Dispatch` obligation.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CsSoftDispObl {
@@ -1755,7 +1900,7 @@ pub(super) struct BarrierState {
     pub(super) pend_before: MTLStages,
     pub(super) pend_before_soft: [MTLStages; 2],
     pub(super) split_pend: SplitPend,
-    pub(super) soft_pend_items: [Vec<SoftPreResObl>; 2],
+    pub(super) soft_pend_items: [SoftOblVec; 2],
     pub(super) soft_pend_poisoned: [bool; 2],
     pub(super) cs_soft_disp_items: Vec<CsSoftDispObl>,
     pub(super) cs_soft_disp_hard_after: MTLStages,
@@ -1766,11 +1911,11 @@ pub(super) struct BarrierState {
     pub(super) cs_disp_passthrough: Vec<(usize, MTLStages, [u32; 7])>,
     pub(super) vtx_defer: [Option<(MTLStages, MTLStages)>; 2],
     pub(super) vtx_defer_req: [[u32; 7]; 2],
-    pub(super) vtx_defer_items: [Vec<SoftPreResObl>; 2],
+    pub(super) vtx_defer_items: [SoftOblVec; 2],
     pub(super) vtx_defer_poisoned: [bool; 2],
     pub(super) vtx_carry: [Option<(MTLStages, MTLStages)>; 2],
     pub(super) vtx_carry_req: [[u32; 7]; 2],
-    pub(super) vtx_carry_items: [Vec<SoftPreResObl>; 2],
+    pub(super) vtx_carry_items: [SoftOblVec; 2],
     pub(super) vtx_carry_poisoned: [bool; 2],
     pub(super) enc_sync_after: MTLStages,
     pub(super) enc_sync_before: MTLStages,
@@ -1795,7 +1940,9 @@ pub(super) struct BarrierState {
     pub(super) vtx_carry_list_frag: bool,
     pub(super) arm_post_draw0_list_frag: [bool; 2],
     pub(super) blit_safe_resources: Vec<usize>,
+    pub(super) blit_safe_bloom: u64,
     pub(super) blit_frag_tainted: Vec<usize>,
+    pub(super) blit_frag_tainted_bloom: u64,
     pub(super) uav_gfx_dirty: bool,
     pub(super) stage_sync: [StageSync; 7],
     pub(super) enc_cur_sync: [StageSync; 7],
@@ -1858,7 +2005,7 @@ impl BarrierState {
             pend_before: MTLStages::empty(),
             pend_before_soft: [MTLStages::empty(); 2],
             split_pend: SplitPend::default(),
-            soft_pend_items: [Vec::new(), Vec::new()],
+            soft_pend_items: [SoftOblVec::new(), SoftOblVec::new()],
             soft_pend_poisoned: [false; 2],
             cs_soft_disp_items: Vec::new(),
             cs_soft_disp_hard_after: MTLStages::empty(),
@@ -1869,11 +2016,11 @@ impl BarrierState {
             cs_disp_passthrough: Vec::new(),
             vtx_defer: NO_VTX,
             vtx_defer_req: [[0; 7]; 2],
-            vtx_defer_items: [Vec::new(), Vec::new()],
+            vtx_defer_items: [SoftOblVec::new(), SoftOblVec::new()],
             vtx_defer_poisoned: [false; 2],
             vtx_carry: NO_VTX,
             vtx_carry_req: [[0; 7]; 2],
-            vtx_carry_items: [Vec::new(), Vec::new()],
+            vtx_carry_items: [SoftOblVec::new(), SoftOblVec::new()],
             vtx_carry_poisoned: [false; 2],
             enc_sync_after: MTLStages::empty(),
             enc_sync_before: MTLStages::empty(),
@@ -1898,7 +2045,9 @@ impl BarrierState {
             vtx_carry_list_frag: false,
             arm_post_draw0_list_frag: [false; 2],
             blit_safe_resources: Vec::new(),
+            blit_safe_bloom: 0,
             blit_frag_tainted: Vec::new(),
+            blit_frag_tainted_bloom: 0,
             uav_gfx_dirty: false,
             stage_sync: [StageSync::default(); 7],
             enc_cur_sync: [StageSync::default(); 7],
@@ -1966,7 +2115,9 @@ impl BarrierState {
         self.vtx_carry_list_frag = false;
         self.arm_post_draw0_list_frag = [false; 2];
         self.blit_safe_resources.clear();
+        self.blit_safe_bloom = 0;
         self.blit_frag_tainted.clear();
+        self.blit_frag_tainted_bloom = 0;
         self.uav_gfx_dirty = false;
         self.stage_sync = [StageSync::default(); 7];
         self.stage_gen = [0; 7];
@@ -2046,6 +2197,49 @@ impl BarrierState {
         self.enc_sync_before = MTLStages::empty();
         self.pass_targets.clear();
         self.written.clear();
+    }
+
+    #[inline(always)]
+    pub(super) fn is_blit_tainted(&self, r: usize) -> bool {
+        (self.blit_frag_tainted_bloom & res_bloom_bit(r)) != 0
+            && self.blit_frag_tainted.contains(&r)
+    }
+
+    #[inline(always)]
+    pub(super) fn mark_blit_tainted(&mut self, r: usize) {
+        let bit = res_bloom_bit(r);
+        if (self.blit_frag_tainted_bloom & bit) == 0 {
+            self.blit_frag_tainted_bloom |= bit;
+            self.blit_frag_tainted.push(r);
+        } else if !self.blit_frag_tainted.contains(&r) {
+            self.blit_frag_tainted.push(r);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn is_blit_safe(&self, r: usize) -> bool {
+        (self.blit_safe_bloom & res_bloom_bit(r)) != 0 && self.blit_safe_resources.contains(&r)
+    }
+
+    #[inline(always)]
+    pub(super) fn mark_blit_safe(&mut self, r: usize) {
+        let bit = res_bloom_bit(r);
+        if (self.blit_safe_bloom & bit) == 0 {
+            self.blit_safe_bloom |= bit;
+            self.blit_safe_resources.push(r);
+        } else if !self.blit_safe_resources.contains(&r) {
+            self.blit_safe_resources.push(r);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn remove_blit_safe(&mut self, r: usize) {
+        if (self.blit_safe_bloom & res_bloom_bit(r)) != 0 {
+            self.blit_safe_resources.retain(|&x| x != r);
+            if self.blit_safe_resources.is_empty() {
+                self.blit_safe_bloom = 0;
+            }
+        }
     }
 }
 
@@ -2331,7 +2525,7 @@ pub(super) struct SlotPlan {
 }
 
 impl SlotPlan {
-    pub(super) fn compile_into(&mut self, slots: &[ComputeBind], root: &RootState) {
+    pub(super) fn compile_into(&mut self, slots: &[ComputeBind]) {
         self.ops.clear();
         self.offsets.clear();
         self.total_tokens = 0;
@@ -2339,18 +2533,10 @@ impl SlotPlan {
         for &slot in slots {
             match slot {
                 ComputeBind::RootVa { param } => {
-                    if root.param_u64(param as usize).is_none() {
-                        self.valid = false;
-                        return;
-                    }
                     self.ops.push(SlotOp::RootVa { param });
                     self.total_tokens += 1;
                 }
                 ComputeBind::TableEntry { param, byte_offset } => {
-                    if root.param_u64(param as usize).is_none() {
-                        self.valid = false;
-                        return;
-                    }
                     let Some(end_off) = byte_offset.checked_add(24) else {
                         self.valid = false;
                         return;
@@ -2535,11 +2721,11 @@ impl SlotPlan {
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct SlotPlanKey {
-    epoch: u64,
     pso_ptr: usize,
-    rs_hash: u128,
     slots_ptr: usize,
     slots_len: usize,
+    epoch: u64,
+    rs_hash: u128,
     first_slot: Option<ComputeBind>,
     last_slot: Option<ComputeBind>,
 }
@@ -2550,12 +2736,12 @@ struct SlotPlanEntry {
     plan: SlotPlan,
 }
 
-const SLOT_PLAN_CACHE_SIZE: usize = 128;
+const SLOT_PLAN_CACHE_SIZE: usize = 512;
 
 /// Per-command-list direct-mapped cache of compiled [`SlotPlan`]s keyed by
-/// `(epoch, pso_ptr, rs_hash, slots_ptr, slots_len, first_slot, last_slot)`.
+/// `(pso_ptr, slots_ptr, slots_len, epoch, rs_hash, first_slot, last_slot)`.
 /// Low 2 bits of index are reserved for `stage_tag` (`0..4`) so a draw/dispatch's
-/// UAV and read plans never evict one another.
+/// UAV and read plans never evict one another (128 PSO buckets x 4 stages).
 pub(super) struct SlotPlanCache {
     epoch: u64,
     entries: Box<[SlotPlanEntry; SLOT_PLAN_CACHE_SIZE]>,
@@ -2573,6 +2759,7 @@ impl SlotPlanCache {
         Self { epoch: 1, entries }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(super) fn invalidate(&mut self) {
         self.epoch = self.epoch.wrapping_add(1).max(1);
@@ -2587,11 +2774,11 @@ impl SlotPlanCache {
         root: &RootState,
     ) -> usize {
         let key = SlotPlanKey {
-            epoch: self.epoch,
             pso_ptr,
-            rs_hash: root.rs_hash,
             slots_ptr: slots.as_ptr() as usize,
             slots_len: slots.len(),
+            epoch: self.epoch,
+            rs_hash: root.rs_hash,
             first_slot: slots.first().copied(),
             last_slot: slots.last().copied(),
         };
@@ -2601,7 +2788,7 @@ impl SlotPlanCache {
         let idx = ((h << 2) | (stage_tag & 3)) & (SLOT_PLAN_CACHE_SIZE - 1);
         let entry = &mut self.entries[idx];
         if entry.key != key {
-            entry.plan.compile_into(slots, root);
+            entry.plan.compile_into(slots);
             entry.key = key;
         }
         idx

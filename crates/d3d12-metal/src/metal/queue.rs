@@ -44,14 +44,19 @@ pub fn submit_coalesce() -> bool {
     *ON.get_or_init(|| std::env::var_os("AW2_SUBMIT_COALESCE").is_none_or(|v| v != "0"))
 }
 
-/// `AW2_FENCE_SIGNAL_COALESCE`: coalesce mid-frame D3D12 `ID3D12CommandQueue::Signal`
-/// calls on `ListType::Direct` (`q0`) (`fence_sig_coalesced`), flushing eagerly on
-/// cross-queue `Wait`, CPU `Wait` / `SetEventOnCompletion`, `signal_cpu`, `Present` /
-/// `last_submitted`, `wait_idle`, and `GetCompletedValue` spin-polls. Default **off**
-/// (`AW2_FENCE_SIGNAL_COALESCE=1` enables).
+/// `PORT_FENCE_SIGNAL_COALESCE` (legacy alias `AW2_FENCE_SIGNAL_COALESCE`):
+/// coalesce mid-frame D3D12 `ID3D12CommandQueue::Signal` calls on `ListType::Direct`
+/// (`q0`) (`fence_sig_coalesced`) alongside buffered `submit_d3d_lists` commits,
+/// flushing eagerly on cross-queue `Wait`, CPU `Wait` / `SetEventOnCompletion`,
+/// `signal_cpu`, `Present` / `flush_timeline`, `wait_idle`, CS idle timeout, and
+/// `GetCompletedValue` spin-polls. Default **on** (`=0` disables).
 pub fn fence_signal_coalesce() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var_os("PORT_FENCE_SIGNAL_COALESCE")
+            .or_else(|| std::env::var_os("AW2_FENCE_SIGNAL_COALESCE"))
+            .is_none_or(|v| v != "0")
+    })
 }
 
 /// `D3D12_COMMAND_LIST_TYPE`.
@@ -117,16 +122,26 @@ pub struct Queue {
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
 
-/// Maximum buffered `MTL4CommandBuffer`s per queue before forcing a batched commit.
-const MAX_COALESCED_CBS: usize = 16;
+/// Maximum buffered `MTL4CommandBuffer`s per queue before forcing a batched commit
+/// (keeps GPU execution overlapping CPU encoding while cutting per-frame commits ~2-3x).
+const MAX_COALESCED_CBS: usize = 4;
 
 /// Total uncommitted command buffers currently buffered across all live queues.
 static GLOBAL_PENDING_CBS: AtomicUsize = AtomicUsize::new(0);
+/// Total live queues currently holding deferred fence signals.
+static GLOBAL_PENDING_SIGS: AtomicUsize = AtomicUsize::new(0);
 
 /// Lock-free check for whether any queue currently holds buffered uncommitted command buffers.
 #[inline]
 pub fn has_pending_cbs() -> bool {
     GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
+}
+
+/// Lock-free check for whether any queue currently holds buffered command buffers or deferred signals.
+#[inline]
+pub fn has_pending_work() -> bool {
+    GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
+        || GLOBAL_PENDING_SIGS.load(Ordering::Acquire) > 0
 }
 
 fn active_queues() -> &'static Mutex<Vec<usize>> {
@@ -495,8 +510,18 @@ impl Queue {
         }
     }
 
+    #[inline]
+    fn set_has_deferred_signals(&self, on: bool) {
+        let prev = self.has_deferred_signals.swap(on, Ordering::AcqRel);
+        if on && !prev {
+            GLOBAL_PENDING_SIGS.fetch_add(1, Ordering::AcqRel);
+        } else if !on && prev {
+            GLOBAL_PENDING_SIGS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     /// Flush buffered uncommitted command buffers on every live queue (called before
-    /// `CommandAllocator::reset()` or when the CS thread idles with pending commits).
+    /// `CommandAllocator::reset()` or on `cs::flush()`).
     pub fn flush_all_pending_cbs() {
         if !has_pending_cbs() {
             return;
@@ -508,6 +533,26 @@ impl Queue {
             if q.has_pending_cbs.load(Ordering::Acquire) {
                 let _g = q.submit.lock().unwrap();
                 q.flush_pending_cbs_locked();
+            }
+        }
+    }
+
+    /// Flush buffered command buffers AND deferred fence signals on every live queue
+    /// (called when the CS thread idles so no pending GPU commit or signal stays buffered).
+    pub fn flush_all_pending_work() {
+        if !has_pending_work() {
+            return;
+        }
+        let aq = active_queues().lock().unwrap();
+        for &p in aq.iter() {
+            // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+            let q = unsafe { &*(p as *const Queue) };
+            if q.has_pending_cbs.load(Ordering::Acquire)
+                || q.has_deferred_signals.load(Ordering::Acquire)
+            {
+                let _g = q.submit.lock().unwrap();
+                q.flush_pending_cbs_locked();
+                q.flush_fence_signals_locked();
             }
         }
     }
@@ -535,7 +580,7 @@ impl Queue {
                     true
                 }
             });
-            q.has_deferred_signals.store(!ds.is_empty(), Ordering::Release);
+            q.set_has_deferred_signals(!ds.is_empty());
             drop(ds);
             if fence_ptr != 0 {
                 let f = unsafe { &*(fence_ptr as *const Fence) };
@@ -568,9 +613,10 @@ impl Queue {
     /// Emit all deferred `ID3D12CommandQueue::Signal` events in enqueue order.
     /// Caller must hold `self.submit`.
     fn flush_fence_signals_locked(&self) {
-        if !self.has_deferred_signals.swap(false, Ordering::AcqRel) {
+        if !self.has_deferred_signals.load(Ordering::Acquire) {
             return;
         }
+        self.set_has_deferred_signals(false);
         let entries = {
             let mut ds = self.deferred_signals.lock().unwrap();
             std::mem::take(&mut *ds)
@@ -713,6 +759,15 @@ impl Queue {
     /// or demand boundary (`signal`, non-elided `wait`, `flush_timeline`, `Present`,
     /// `wait_idle`, `submit`, CB reuse, `MAX_COALESCED_CBS`, or 8 pending `PassLog`s).
     pub fn submit_d3d_lists(&self, cbs: &[&MtlCommandBuffer], logs: Vec<super::passtiming::PassLog>) -> u64 {
+        self.submit_d3d_lists_inner(cbs, logs, false)
+    }
+
+    fn submit_d3d_lists_inner(
+        &self,
+        cbs: &[&MtlCommandBuffer],
+        logs: Vec<super::passtiming::PassLog>,
+        eager_flush: bool,
+    ) -> u64 {
         let coalesce = self.kind == ListType::Direct
             && !self.is_swapchain_internal
             && self.opt_submit_coalesce.load(Ordering::Relaxed);
@@ -762,7 +817,7 @@ impl Queue {
                     let (next, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
                     self.timeline_state
                         .store(Self::pack_timeline_state(next, true), Ordering::Release);
-                    if new_len >= MAX_COALESCED_CBS {
+                    if eager_flush || new_len >= MAX_COALESCED_CBS {
                         self.flush_pending_cbs_locked();
                     }
                 }
@@ -813,6 +868,7 @@ impl Queue {
             [const { std::mem::MaybeUninit::uninit() }; STACK_CAP];
         let mut stack_len = 0usize;
         let mut heap_cbs: Vec<&MtlCommandBuffer> = Vec::new();
+        let mut any_ml_work = false;
         let n_lists = lists.len();
         for (i, list) in lists.iter_mut().enumerate() {
             if list.is_open() {
@@ -837,6 +893,7 @@ impl Queue {
                 }
             }
             if list.has_commands() {
+                any_ml_work |= list.has_ml_work_recorded();
                 let cb: &MtlCommandBuffer = &*list.cb;
                 if heap_cbs.is_empty() && stack_len < STACK_CAP {
                     stack_cbs[stack_len].write(cb);
@@ -866,7 +923,7 @@ impl Queue {
             }
         };
         let submitted_cbs = cbs.len();
-        let timeline_value = self.submit_d3d_lists(cbs, pass_logs);
+        let timeline_value = self.submit_d3d_lists_inner(cbs, pass_logs, any_ml_work);
         ExecuteResult { submitted_cbs, timeline_value }
     }
 
@@ -952,7 +1009,7 @@ impl Queue {
                     val: v,
                     enqueued_epoch: cur_epoch,
                 });
-                self.has_deferred_signals.store(true, O::Release);
+                self.set_has_deferred_signals(true);
                 drop(ds);
                 f.pending_sig_ns.store(now_ns, O::Release);
                 f.poll_epoch.store(cur_epoch, O::Release);
@@ -1286,8 +1343,10 @@ mod tests {
         if super::super::device().is_none() {
             return;
         }
-        if std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_none() {
-            assert!(!fence_signal_coalesce(), "AW2_FENCE_SIGNAL_COALESCE must default OFF");
+        if std::env::var_os("PORT_FENCE_SIGNAL_COALESCE").is_none()
+            && std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_none()
+        {
+            assert!(fence_signal_coalesce(), "PORT_FENCE_SIGNAL_COALESCE must default ON");
         }
         let _stats_guard = super::super::encstats::test_lock();
         let make_buf = |ty: u32| {
@@ -1631,6 +1690,64 @@ mod tests {
         q.wait_idle();
         assert_eq!(unsafe { *(rb1.cpu_ptr().unwrap() as *const u32) }, 0xDEAD_BEEF);
         assert_eq!(unsafe { *(rb_reuse.cpu_ptr().unwrap() as *const u32) }, 0xDEAD_BEEF);
+
+        // 5) With `fence_signal_coalesce(true)` (default ON), interleaved
+        //    `submit_d3d_lists` + `signal` calls on `q` coalesce BOTH command buffers
+        //    and fence signals into ONE single Metal commit while preserving fence order.
+        q.set_fence_signal_coalesce(true);
+        let a6 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a7 = CommandAllocator::new(ListType::Direct).unwrap();
+        let a8 = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l4 = CommandList::new(ListType::Direct).unwrap();
+        let mut l5 = CommandList::new(ListType::Direct).unwrap();
+        let mut l6 = CommandList::new(ListType::Direct).unwrap();
+        let rb_sig = make_buf(heap_type::READBACK);
+        let f_sig = Fence::new(0).unwrap();
+
+        l4.begin(&a6).unwrap();
+        l4.copy_buffer(&mid0, 0, &up1, 0, 16).unwrap();
+        l4.close().unwrap();
+        l5.begin(&a7).unwrap();
+        l5.barrier_list(&[Barrier::Transition(&mid0 as *const Resource as usize, 0x400, 0x800)]);
+        l5.copy_buffer(&rb_sig, 0, &mid0, 0, 16).unwrap();
+        l5.close().unwrap();
+
+        let calls_sig0 = TEST_COMMIT_CALLS.load(Ordering::Relaxed);
+        let cbs_sig0 = TEST_COMMIT_CBS.load(Ordering::Relaxed);
+        let tl_before = q.last_submitted();
+        assert_eq!(q.submit_d3d_lists(&[&l4.cb], Vec::new()), tl_before);
+        q.signal(&f_sig, 1);
+        assert_eq!(q.submit_d3d_lists(&[&l5.cb], Vec::new()), tl_before);
+        q.signal(&f_sig, 2);
+        assert!(q.has_pending_cbs.load(Ordering::Acquire));
+        assert!(q.has_deferred_signals.load(Ordering::Acquire));
+        assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_sig0, 0);
+
+        // CPU wait on `f_sig == 2` flushes both CBs in ONE Metal commit and signals `f_sig = 2`.
+        f_sig.wait_cpu(2, u64::MAX);
+        assert_eq!(
+            TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_sig0,
+            1,
+            "interleaved ECL+Signal pairs must coalesce into 1 Metal commit"
+        );
+        assert_eq!(TEST_COMMIT_CBS.load(Ordering::Relaxed) - cbs_sig0, 2);
+        assert_eq!(unsafe { *(rb_sig.cpu_ptr().unwrap() as *const u32) }, 0xDEAD_BEEF);
+
+        // 6) A command list flagged with `has_ml_work` coalesces with prior buffered CBs
+        //    and flushes eagerly inside `execute_command_lists` instead of staying buffered.
+        l6.begin(&a8).unwrap();
+        l6.copy_buffer(&rb_sig, 0, &up0, 0, 16).unwrap();
+        l6.has_ml_work = true;
+        l6.close().unwrap();
+        let calls_ml0 = TEST_COMMIT_CALLS.load(Ordering::Relaxed);
+        let _ = q.execute_command_lists(&mut [&mut l6]);
+        assert!(
+            !q.has_pending_cbs.load(Ordering::Acquire),
+            "ML command list must flush eagerly on ExecuteCommandLists"
+        );
+        assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_ml0, 1);
+        q.wait_idle();
+        assert_eq!(unsafe { *(rb_sig.cpu_ptr().unwrap() as *const u32) }, 0x1122_3344);
     }
 }
 

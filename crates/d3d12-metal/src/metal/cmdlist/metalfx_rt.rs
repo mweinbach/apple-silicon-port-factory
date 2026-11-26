@@ -793,6 +793,7 @@ impl CommandList {
             fence: used_fence,
         };
         scaler.encode(&self.cb, &inputs);
+        self.has_ml_work = true;
         drop(scaler);
         self.finish_opaque_metalfx_pass(used_fence);
 

@@ -1194,9 +1194,11 @@ fn g35_defaults_promote_g34_winners_and_keep_g35_knobs_opt_in() {
     if std::env::var_os("PORT_ICB_FAST_V3").is_none() && std::env::var_os("AW2_ICB_FAST_V3").is_none() {
         assert!(crate::metal::indirect_icb::fast_v3());
     }
-    // g37 non-promoted knob remains default OFF (`== "1"`).
-    if std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_none() {
-        assert!(!crate::metal::queue::fence_signal_coalesce());
+    // Promoted `PORT_FENCE_SIGNAL_COALESCE` / `AW2_FENCE_SIGNAL_COALESCE` defaults ON (`!= "0"`).
+    if std::env::var_os("PORT_FENCE_SIGNAL_COALESCE").is_none()
+        && std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_none()
+    {
+        assert!(crate::metal::queue::fence_signal_coalesce());
     }
     if std::env::var_os("PORT_RO_DSV_DONTCARE").is_none() && std::env::var_os("AW2_RO_DSV_DONTCARE").is_none() {
         assert!(opt_ro_dsv_dontcare_env());

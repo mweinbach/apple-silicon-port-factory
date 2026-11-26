@@ -154,6 +154,10 @@ pub struct CommandList {
     open: bool,
     /// Begun at least once (an executable command buffer exists).
     recorded: bool,
+    /// True when the current recording encoded an opaque MetalFX ML pass whose
+    /// `preCommit` runs ANE evaluation (flush immediately on submit instead of
+    /// deferring into `Present` / `cs::flush`).
+    pub(super) has_ml_work: bool,
     enc: Encoder,
     ring: Option<Arc<Mutex<UploadRing>>>,
     table: Retained<MtlArgumentTable>,
@@ -209,6 +213,7 @@ impl CommandList {
             binds: BindTableCache::new(),
             open: false,
             recorded: false,
+            has_ml_work: false,
             enc: Encoder::None,
             ring: None,
             table: new_argument_table("aw2 command list")?,
@@ -259,6 +264,13 @@ impl CommandList {
         self.bar.has_gpu_work
     }
 
+    /// Whether the current/most-recent recording encoded an opaque MetalFX ML pass
+    /// whose `preCommit` runs ANE evaluation.
+    #[inline]
+    pub fn has_ml_work_recorded(&self) -> bool {
+        self.has_ml_work
+    }
+
     /// `Reset(allocator, pso)` / creation: begin recording (all list state
     /// is reset, D3D12 semantics).
     pub fn begin(&mut self, alloc: &CommandAllocator) -> Result<(), String> {
@@ -277,6 +289,7 @@ impl CommandList {
         stats::inc(&stats::c::lists);
         self.open = true;
         self.recorded = true;
+        self.has_ml_work = false;
         let list_tight = self.list_barrier_tight_active();
         self.bar.reset_for_begin(list_tight);
         self.ib.ib_obl.clear();
@@ -294,7 +307,6 @@ impl CommandList {
         self.icb.reset_for_begin(alloc.icb_scratch.clone(), alloc.icbs.clone());
         self.binds.cs_bind_cache.valid = false;
         self.binds.gfx_bind_cache.valid = false;
-        self.binds.slot_plans.invalidate();
         self.pending_mfx_wait_fence = None;
         self.compute_root = RootState::default();
         self.gfx_root = RootState::default();
@@ -318,7 +330,6 @@ impl CommandList {
         self.rp_sync.cur_draw_exact_valid = false;
         self.binds.cs_bind_cache.valid = false;
         self.binds.gfx_bind_cache.valid = false;
-        self.binds.slot_plans.invalidate();
         self.rp_sync.cs_hk_profile = super::pipeline::HandleKindProfile::OPAQUE;
         self.compute_root = RootState::default();
         self.gfx_root = RootState::default();

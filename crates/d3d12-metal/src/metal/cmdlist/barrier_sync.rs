@@ -6,7 +6,7 @@ use super::state::*;
 use super::CommandList;
 use crate::metal::encstats as stats;
 use crate::metal::pipeline::{GraphicsPipeline, READS_BUF, READS_TEX};
-use crate::metal::resource::{push_subrange, Resource, SubRange, HK_ALL, HK_CBV_BUF};
+use crate::metal::resource::{Resource, SubRange, HK_ALL, HK_CBV_BUF};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
 
@@ -2515,10 +2515,10 @@ impl CommandList {
     pub(super) fn ib_merge_spans_whole(dst: &mut TrackedSet<SubRange>, src: Option<&[usize]>) {
         match src {
             Some(s) => {
-                if let Some(v) = dst.as_mut_vec() {
+                if dst.is_exact() {
                     for &r in s {
                         if r != 0 {
-                            push_subrange(v, SubRange::whole(r));
+                            dst.insert_span(SubRange::whole(r));
                         }
                     }
                 }
@@ -2528,9 +2528,9 @@ impl CommandList {
     }
 
     pub(super) fn ib_merge_spans_exact(dst: &mut TrackedSet<SubRange>, src: &[SubRange]) {
-        if let Some(v) = dst.as_mut_vec() {
+        if dst.is_exact() {
             for &s in src {
-                push_subrange(v, s);
+                dst.insert_span(s);
             }
         }
     }
@@ -2697,7 +2697,7 @@ impl CommandList {
 
     #[inline]
     pub(super) fn push_soft_obl_into(
-        list: &mut Vec<SoftPreResObl>,
+        list: &mut SoftOblVec,
         r: usize,
         ia: MTLStages,
         ib: MTLStages,
@@ -2707,14 +2707,27 @@ impl CommandList {
         if r == 0 || ia.is_empty() || ib.is_empty() {
             return;
         }
-        if let Some(ex) = list.iter_mut().find(|o| o.r == r) {
+        let bit = res_bloom_bit(r);
+        if (list.bloom & bit) == 0 {
+            list.bloom |= bit;
+            let mut item_req = [0u32; 7];
+            merge_req_for_after(&mut item_req, ia, &req);
+            list.items.push(SoftPreResObl {
+                r,
+                after: ia,
+                before: ib,
+                req: item_req,
+            });
+            return;
+        }
+        if let Some(ex) = list.items.iter_mut().find(|o| o.r == r) {
             ex.after |= ia;
             ex.before |= ib;
             merge_req_for_after(&mut ex.req, ia, &req);
         } else {
             let mut item_req = [0u32; 7];
             merge_req_for_after(&mut item_req, ia, &req);
-            list.push(SoftPreResObl {
+            list.items.push(SoftPreResObl {
                 r,
                 after: ia,
                 before: ib,
@@ -2724,14 +2737,18 @@ impl CommandList {
     }
 
     #[inline]
-    pub(super) fn extend_soft_items(dst: &mut Vec<SoftPreResObl>, src: Vec<SoftPreResObl>) {
-        for it in src {
+    pub(super) fn extend_soft_items(dst: &mut SoftOblVec, src: SoftOblVec) {
+        if dst.items.is_empty() {
+            *dst = src;
+            return;
+        }
+        for it in src.items {
             Self::push_soft_obl_into(dst, it.r, it.after, it.before, it.req);
         }
     }
 
     #[inline]
-    pub(super) fn strip_soft_items_after(items: &mut Vec<SoftPreResObl>, strip: MTLStages) {
+    pub(super) fn strip_soft_items_after(items: &mut SoftOblVec, strip: MTLStages) {
         if strip.is_empty() {
             return;
         }
@@ -2752,7 +2769,7 @@ impl CommandList {
     pub(super) fn partition_soft_items_for_cur_draw(
         &mut self,
         class_idx: usize,
-        items: &mut Vec<SoftPreResObl>,
+        items: &mut SoftOblVec,
         poisoned: bool,
         total_after: MTLStages,
         total_before: MTLStages,
@@ -3444,11 +3461,14 @@ impl CommandList {
         if !subrange_on || rk == 0 {
             return None;
         }
+        let us = disp_uav_spans.as_slice()?;
+        if !disp_uav_spans.maybe_contains_res(rk) {
+            return None;
+        }
         let res = unsafe { &*(rk as *const Resource) };
         if !res.desc.is_buffer() || (res.desc.Flags & SIMUL) != 0 {
             return None;
         }
-        let us = disp_uav_spans.as_slice()?;
         let mut out = SmallSpans::new();
         for &s in us {
             if s.r == rk {
@@ -3477,9 +3497,11 @@ impl CommandList {
         }
         let us = disp_uav_spans.as_slice()?;
         let mut out = SmallSpans::new();
-        for &s in us {
-            if s.r == rk {
-                out.push_coalesced(s);
+        if disp_uav_spans.maybe_contains_res(rk) {
+            for &s in us {
+                if s.r == rk {
+                    out.push_coalesced(s);
+                }
             }
         }
         if include_read {
@@ -3487,9 +3509,11 @@ impl CommandList {
                 return None;
             }
             let rs = disp_read_spans.as_slice()?;
-            for &s in rs {
-                if s.r == rk {
-                    out.push_coalesced(s);
+            if disp_read_spans.maybe_contains_res(rk) {
+                for &s in rs {
+                    if s.r == rk {
+                        out.push_coalesced(s);
+                    }
                 }
             }
         }

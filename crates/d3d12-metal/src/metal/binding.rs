@@ -541,6 +541,12 @@ pub struct RootState {
     param_u64_vals: [u64; 64],
     /// Bit `i` is set iff root parameter `i` exists and has `size == 8` within `args.bytes`.
     param_u64_mask: u64,
+    /// Bit `i` is set iff root parameter `i < 64` is a `DescriptorTable` (size 8).
+    param_table_mask: u64,
+    /// Bit `i` is set iff root parameter `i < 64` is a root `Descriptor` (size 8).
+    param_desc_mask: u64,
+    /// Cached byte offset into `args.bytes` for 8-byte root parameters `i < 64`.
+    param_offsets: [u16; 64],
     /// `AW2_FAST_ENC_STATE=1`: skip dirtying `args` when a root parameter write
     /// produces identical TLAB bytes.
     pub(crate) dedup: bool,
@@ -557,6 +563,9 @@ impl Default for RootState {
             rs_hash: 0,
             param_u64_vals: [0; 64],
             param_u64_mask: 0,
+            param_table_mask: 0,
+            param_desc_mask: 0,
+            param_offsets: [0; 64],
             dedup: false,
         }
     }
@@ -574,14 +583,30 @@ impl RootState {
             args.set_static_sampler_table(rs.layout(), t);
         }
         let mut mask = 0u64;
+        let mut table_mask = 0u64;
+        let mut desc_mask = 0u64;
+        let mut offsets = [0u16; 64];
         let bytes_len = args.bytes.len();
         for (i, p) in rs.layout().parameters.iter().take(64).enumerate() {
-            if p.size == 8 && (p.offset as usize) + 8 <= bytes_len {
-                mask |= 1u64 << i;
+            let off = p.offset as usize;
+            if p.size == 8 && off + 8 <= bytes_len {
+                let bit = 1u64 << i;
+                mask |= bit;
+                if off <= u16::MAX as usize {
+                    offsets[i] = off as u16;
+                    match p.kind {
+                        RootParameterLayoutKind::DescriptorTable { .. } => table_mask |= bit,
+                        RootParameterLayoutKind::Descriptor { .. } => desc_mask |= bit,
+                        _ => {}
+                    }
+                }
             }
         }
         self.param_u64_vals = [0; 64];
         self.param_u64_mask = mask;
+        self.param_table_mask = table_mask;
+        self.param_desc_mask = desc_mask;
+        self.param_offsets = offsets;
         self.rs_hash = rs.hash();
         self.args = Some(args);
         self.rs = Some(rs);
@@ -590,7 +615,28 @@ impl RootState {
         Ok(())
     }
 
+    #[inline]
     pub fn set_table(&mut self, i: u32, gpu_handle: u64) -> Result<(), String> {
+        let idx = i as usize;
+        if idx < 64 && (self.param_table_mask & (1u64 << idx)) != 0 {
+            if self.dedup && self.param_u64_vals[idx] == gpu_handle {
+                super::encstats::inc(&super::encstats::c::enc_state_skip);
+                return Ok(());
+            }
+            if let Some(args) = self.args.as_mut() {
+                let off = self.param_offsets[idx] as usize;
+                args.bytes[off..off + 8].copy_from_slice(&gpu_handle.to_le_bytes());
+                self.param_u64_vals[idx] = gpu_handle;
+                self.dirty = true;
+                self.bind_gen = self.bind_gen.wrapping_add(1);
+                return Ok(());
+            }
+        }
+        self.set_table_slow(i, gpu_handle)
+    }
+
+    #[cold]
+    fn set_table_slow(&mut self, i: u32, gpu_handle: u64) -> Result<(), String> {
         let dedup = self.dedup;
         let (Some(rs), Some(args)) = (self.rs.as_deref(), self.args.as_mut()) else {
             return Err("no root signature set".into());
@@ -618,7 +664,28 @@ impl RootState {
         Ok(())
     }
 
+    #[inline]
     pub fn set_descriptor(&mut self, i: u32, va: u64) -> Result<(), String> {
+        let idx = i as usize;
+        if idx < 64 && (self.param_desc_mask & (1u64 << idx)) != 0 {
+            if self.dedup && self.param_u64_vals[idx] == va {
+                super::encstats::inc(&super::encstats::c::enc_state_skip);
+                return Ok(());
+            }
+            if let Some(args) = self.args.as_mut() {
+                let off = self.param_offsets[idx] as usize;
+                args.bytes[off..off + 8].copy_from_slice(&va.to_le_bytes());
+                self.param_u64_vals[idx] = va;
+                self.dirty = true;
+                self.bind_gen = self.bind_gen.wrapping_add(1);
+                return Ok(());
+            }
+        }
+        self.set_descriptor_slow(i, va)
+    }
+
+    #[cold]
+    fn set_descriptor_slow(&mut self, i: u32, va: u64) -> Result<(), String> {
         let dedup = self.dedup;
         let (Some(rs), Some(args)) = (self.rs.as_deref(), self.args.as_mut()) else {
             return Err("no root signature set".into());

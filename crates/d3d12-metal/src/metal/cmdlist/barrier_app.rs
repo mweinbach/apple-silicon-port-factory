@@ -78,7 +78,8 @@ impl CommandList {
             self.clear_all_pend();
             self.bar.vtx_carry = NO_VTX;
             self.bar.vtx_carry_req = [[0; 7]; 2];
-            self.bar.vtx_carry_items = [Vec::new(), Vec::new()];
+            self.bar.vtx_carry_items[0].clear();
+            self.bar.vtx_carry_items[1].clear();
             self.bar.vtx_carry_poisoned = [false; 2];
             if !full && !has_pend {
                 self.bar.enc_sync_after = MTLStages::empty();
@@ -413,7 +414,7 @@ impl CommandList {
                     let c_items = std::mem::take(&mut self.bar.vtx_carry_items[i]);
                     let c_poison = std::mem::replace(&mut self.bar.vtx_carry_poisoned[i], false);
                     let mut comb_req = [0u32; 7];
-                    let mut comb_items = Vec::new();
+                    let mut comb_items = SoftOblVec::new();
                     let mut comb_poison = false;
                     if !sa.is_empty() && !sb.is_empty() {
                         merge_req_for_after(&mut comb_req, sa, &sr);
@@ -521,7 +522,7 @@ impl CommandList {
             let mut deferred = false;
             let mut merged_soft: [Option<(MTLStages, MTLStages)>; 2] = NO_VTX;
             let mut merged_soft_req: [[u32; 7]; 2] = [[0; 7]; 2];
-            let mut merged_soft_items: [Vec<SoftPreResObl>; 2] = [Vec::new(), Vec::new()];
+            let mut merged_soft_items: [SoftOblVec; 2] = [SoftOblVec::new(), SoftOblVec::new()];
             let mut merged_soft_poison = [false; 2];
             if let Some((cap_frag, cap_req)) = clear_cap {
                 if !self.bar.split_pend.vtx_after.is_empty()
@@ -567,7 +568,7 @@ impl CommandList {
                     let c_items = std::mem::take(&mut self.bar.vtx_carry_items[i]);
                     let c_poison = std::mem::replace(&mut self.bar.vtx_carry_poisoned[i], false);
                     let mut comb_req = [0u32; 7];
-                    let mut comb_items = Vec::new();
+                    let mut comb_items = SoftOblVec::new();
                     let mut comb_poison = false;
                     if !sa.is_empty() && !sb.is_empty() {
                         merge_req_for_after(&mut comb_req, sa, &sr);
@@ -1000,12 +1001,14 @@ impl CommandList {
             self.clear_all_pend();
             self.bar.vtx_carry = NO_VTX;
             self.bar.vtx_carry_req = [[0; 7]; 2];
-            self.bar.vtx_carry_items = [Vec::new(), Vec::new()];
+            self.bar.vtx_carry_items[0].clear();
+            self.bar.vtx_carry_items[1].clear();
             self.bar.vtx_carry_poisoned = [false; 2];
             self.bar.vtx_carry_list_frag = false;
             self.bar.vtx_defer = NO_VTX;
             self.bar.vtx_defer_req = [[0; 7]; 2];
-            self.bar.vtx_defer_items = [Vec::new(), Vec::new()];
+            self.bar.vtx_defer_items[0].clear();
+            self.bar.vtx_defer_items[1].clear();
             self.bar.vtx_defer_poisoned = [false; 2];
             self.bar.arm_post_draw0_list_frag = [false; 2];
             if (opening_pre_raster_reads & READS_TEX) == 0 {
@@ -2144,10 +2147,10 @@ impl CommandList {
             matches!(self.enc, Encoder::Render(_)) && self.opts.opt_rp_keep_write;
         let (mut after, mut before, mut all_res) = (S::empty(), S::empty(), false);
         let mut soft = [S::empty(); 2];
-        let mut local_split = SplitPend::default();
+        let mut local_split = SplitMasks::default();
         let (mut read_after, mut read_before) = (S::empty(), S::empty());
         let mut read_soft = [S::empty(); 2];
-        let mut read_split = SplitPend::default();
+        let mut read_split = SplitMasks::default();
         let add_soft_cls = |soft: &mut [S; 2], cls: u8, st: S| {
             if cls & 1 != 0 {
                 soft[0] |= st;
@@ -2322,27 +2325,21 @@ impl CommandList {
                         if s0 == 0
                             && self.opts.opt_queue_start_stage_exact
                             && (!self.bar.has_gpu_work || self.bar.list_cs_unwaited_frag)
-                            && !self.bar.blit_frag_tainted.contains(&r)
+                            && !self.bar.is_blit_tainted(r)
                             && unsafe { (*(r as *const Resource)).is_fresh_nonfrag_blit_safe() }
                         {
-                            if eff_s1_b != 0
-                                && (eff_s1_b & !(0x400 | 0x800)) == 0
-                                && !self.bar.blit_safe_resources.contains(&r)
-                            {
-                                self.bar.blit_safe_resources.push(r);
+                            if eff_s1_b != 0 && (eff_s1_b & !(0x400 | 0x800)) == 0 {
+                                self.bar.mark_blit_safe(r);
                             }
                         } else if s0 == 0 || state_stages(eff_s0_b).contains(S::Fragment) {
-                            if !self.bar.blit_frag_tainted.contains(&r) {
-                                self.bar.blit_frag_tainted.push(r);
-                            }
-                            self.bar.blit_safe_resources.retain(|&x| x != r);
+                            self.bar.mark_blit_tainted(r);
+                            self.bar.remove_blit_safe(r);
                         } else if (!self.bar.has_gpu_work || self.bar.list_cs_unwaited_frag)
                             && eff_s1_b != 0
                             && (eff_s1_b & !(0x400 | 0x800)) == 0
-                            && !self.bar.blit_frag_tainted.contains(&r)
-                            && !self.bar.blit_safe_resources.contains(&r)
+                            && !self.bar.is_blit_tainted(r)
                         {
-                            self.bar.blit_safe_resources.push(r);
+                            self.bar.mark_blit_safe(r);
                         }
                     }
                     if s0 == s1 {
@@ -2382,7 +2379,7 @@ impl CommandList {
                         && !self.bar.in_list_gfx_non_clear
                         && self.bar.cs_disp_gen == 0
                         && self.bar.cs_as_gen == 0
-                        && !self.bar.blit_frag_tainted.contains(&r)
+                        && !self.bar.is_blit_tainted(r)
                         && unsafe { (*(r as *const Resource)).is_fresh_nonfrag_blit_safe() }
                         && (!self.bar.has_gpu_work
                             || self.bar.enc_cur_sync[STAGE_BLIT]
@@ -2654,7 +2651,7 @@ impl CommandList {
             after = S::All;
             before = S::All;
             all_res = true;
-            local_split = SplitPend::default();
+            local_split = SplitMasks::default();
             local_split.add(S::All, S::All, [S::empty(); 2]);
             local_soft_poison = [true; 2];
             local_rt_poison = true;
@@ -2910,14 +2907,14 @@ impl CommandList {
             after = S::Blit;
             before = S::Blit;
             soft = [S::empty(); 2];
-            local_split = SplitPend::default();
+            local_split = SplitMasks::default();
             local_split.add(S::Blit, S::Blit, [S::empty(); 2]);
             stats::inc(&stats::c::copy_q_light);
         } else {
             if let Some(cs_after) = pre_uav_overlap_cs {
                 if matches!(self.enc, Encoder::None) {
                     after = cs_after;
-                    local_split = SplitPend::default();
+                    local_split = SplitMasks::default();
                     local_split.add(cs_after, before, soft);
                     local_rt_poison = true;
                     for v in &mut local_soft_items {
@@ -2959,7 +2956,7 @@ impl CommandList {
                     let mut na = S::empty();
                     let mut nb = S::empty();
                     let mut nsoft = [S::empty(); 2];
-                    let mut nsplit = SplitPend::default();
+                    let mut nsplit = SplitMasks::default();
                     let mut n_soft_items = std::mem::take(&mut self.bar.bar_scratch_n_soft);
                     n_soft_items[0].clear();
                     n_soft_items[1].clear();
@@ -3345,8 +3342,7 @@ impl CommandList {
                         merge_req_for_after(&mut self.bar.frag_non_rt_req, read_after, &req);
                     }
                 }
-                read_split.stamp_all_req(req);
-                self.bar.split_pend.merge(read_split);
+                self.bar.split_pend.merge_masks(&read_split, &req);
                 if track_soft_items {
                     for i in 0..2 {
                         if read_soft_poison[i] {
@@ -3404,8 +3400,7 @@ impl CommandList {
             local_split.disp_after = S::empty();
             local_split.blit_after = S::empty();
             local_split.as_after = S::empty();
-            local_split.stamp_all_req(req);
-            self.bar.split_pend.merge(local_split);
+            self.bar.split_pend.merge_masks(&local_split, &req);
             self.sync_legacy_from_split();
             if track_frag_rt {
                 if local_rt_poison {
@@ -3474,8 +3469,7 @@ impl CommandList {
             local_split.disp_after = S::empty();
             local_split.blit_after = S::empty();
             local_split.as_after = S::empty();
-            local_split.stamp_all_req(req);
-            self.bar.split_pend.merge(local_split);
+            self.bar.split_pend.merge_masks(&local_split, &req);
             self.sync_legacy_from_split();
             if track_frag_rt {
                 if local_rt_poison {
@@ -3525,8 +3519,7 @@ impl CommandList {
             } else {
                 self.cur_producer_gen()
             };
-            local_split.stamp_all_req(req);
-            self.bar.split_pend.merge(local_split);
+            self.bar.split_pend.merge_masks(&local_split, &req);
             if track_frag_rt {
                 if self.bar.needs_barrier || all_res || local_rt_poison {
                     self.bar.frag_rt_poisoned = true;

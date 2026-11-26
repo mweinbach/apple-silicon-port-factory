@@ -2080,7 +2080,7 @@ pub const KNOBS: &[KnobSpec] = &[
         name: "PORT_FENCE_SIGNAL_COALESCE",
         aliases: &["AW2_FENCE_SIGNAL_COALESCE"],
         kind: KnobType::Bool,
-        default: "0",
+        default: "1",
         description: "Coalesce mid-frame Direct queue ID3D12CommandQueue::Signal calls.",
         affects_aot_key: false,
         crates: &["d3d12-metal"],
