@@ -361,6 +361,7 @@ pub fn register_static_vtables() {
             &MODULE_STATE_VT[..],
             &DYN_LINK_LIBRARY_VT[..],
             &WIN_APP_VT[..],
+            &MFC_EXCEPTION_VT[..],
         ] {
             for entry in table {
                 let addr = entry.0 as usize;
@@ -426,8 +427,9 @@ unsafe fn alloc_owned_wide_string(src: *const u16) -> *mut u16 {
     if src.is_null() {
         return std::ptr::null_mut();
     }
+    let src_bytes = src.cast::<u8>();
     let mut len = 0usize;
-    while std::ptr::read_unaligned(src.add(len)) != 0 {
+    while std::ptr::read_unaligned(src_bytes.add(len * 2) as *const u16) != 0 {
         len += 1;
     }
     let bytes = (len + 1) * std::mem::size_of::<u16>();
@@ -435,7 +437,8 @@ unsafe fn alloc_owned_wide_string(src: *const u16) -> *mut u16 {
     if dst.is_null() {
         return std::ptr::null_mut();
     }
-    std::ptr::copy_nonoverlapping(src, dst, len + 1);
+    // Guest pointers may be unaligned; copy via `u8` to avoid aligned `u16` copy UB.
+    std::ptr::copy_nonoverlapping(src_bytes, dst.cast::<u8>(), bytes);
     OWNED_APP_STRINGS.lock().unwrap().insert(dst as usize);
     dst
 }
@@ -1085,14 +1088,329 @@ unsafe extern "win64" fn c_no_track_object_delete(ptr: *mut c_void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 3b. Typed MSVC x64 MFC Exception Objects & RTTI Throw Metadata
+// ---------------------------------------------------------------------------
+
+/// `CSimpleException` / `CMemoryException` / `CInvalidArgException` layout (x64):
+/// - `+0x00`: `vtable` (`*const Ptr`)
+/// - `+0x08`: `m_bAutoDelete` (`BOOL`)
+/// - `+0x0C`: `m_bReadyForDelete` (`BOOL`)
+/// - `+0x10`: `m_nResourceID` (`u32`)
+/// - `+0x14`: `m_bInitialized` (`BOOL`)
+/// - `+0x18`: `m_bLoaded` (`BOOL`)
+/// - `+0x1C`: `m_szMessage` (`[u16; 128]`)
+#[repr(C)]
+struct MfcSimpleException {
+    vtable: *const Ptr,
+    auto_delete: BOOL,
+    ready_for_delete: BOOL,
+    resource_id: u32,
+    initialized: BOOL,
+    loaded: BOOL,
+    message: [u16; 128],
+}
+
+unsafe extern "win64" fn mfc_exc_get_runtime_class(_this: *mut c_void) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+unsafe extern "win64" fn mfc_exc_scalar_dtor(this: *mut c_void, flags: u32) -> *mut c_void {
+    if !this.is_null() && (flags & 1) != 0 {
+        let slab = mfc_throw_slab();
+        let mem_addr = std::ptr::addr_of!(slab.memory_exc) as usize;
+        let inv_addr = std::ptr::addr_of!(slab.invalid_arg_exc) as usize;
+        let addr = this as usize;
+        if addr != mem_addr && addr != inv_addr {
+            operator_delete(this);
+        }
+    }
+    this
+}
+
+unsafe extern "win64" fn mfc_exc_noop(_this: *mut c_void) {}
+
+unsafe extern "win64" fn mfc_exc_get_error_message(
+    this: *const MfcSimpleException,
+    lpsz_error: *mut u16,
+    n_max_error: u32,
+    pn_help_context: *mut u32,
+) -> BOOL {
+    if !pn_help_context.is_null() {
+        std::ptr::write_unaligned(pn_help_context, 0);
+    }
+    if this.is_null() || lpsz_error.is_null() || n_max_error == 0 {
+        return 0;
+    }
+    let msg = std::ptr::read_unaligned(std::ptr::addr_of!((*this).message));
+    let cap = (n_max_error as usize).saturating_sub(1).min(msg.len());
+    let mut n = 0usize;
+    while n < cap && msg[n] != 0 {
+        std::ptr::write_unaligned(lpsz_error.cast::<u8>().add(n * 2) as *mut u16, msg[n]);
+        n += 1;
+    }
+    std::ptr::write_unaligned(lpsz_error.cast::<u8>().add(n * 2) as *mut u16, 0);
+    1
+}
+
+unsafe extern "win64" fn mfc_exc_report_error(
+    _this: *mut c_void,
+    _n_type: u32,
+    _n_message_id: u32,
+) -> i32 {
+    0
+}
+
+static MFC_EXCEPTION_VT: [Ptr; 8] = [
+    Ptr(mfc_exc_get_runtime_class as *const ()),
+    Ptr(mfc_exc_scalar_dtor as *const ()),
+    Ptr(mfc_exc_noop as *const ()), // Serialize
+    Ptr(mfc_exc_noop as *const ()), // AssertValid
+    Ptr(mfc_exc_noop as *const ()), // Dump
+    Ptr(mfc_exc_get_error_message as *const ()),
+    Ptr(mfc_exc_report_error as *const ()),
+    Ptr(std::ptr::null()),
+];
+
+/// MSVC x64 `_TypeDescriptor` with fixed 40-byte inline name buffer.
+#[repr(C)]
+struct MfcTypeDescriptor {
+    p_vftable: u64,
+    spare: u64,
+    name: [u8; 40],
+}
+
+impl MfcTypeDescriptor {
+    fn new(name: &[u8]) -> Self {
+        let mut buf = [0u8; 40];
+        let n = name.len().min(buf.len() - 1);
+        buf[..n].copy_from_slice(&name[..n]);
+        Self {
+            p_vftable: 0,
+            spare: 0,
+            name: buf,
+        }
+    }
+}
+
+/// MSVC x64 `_CatchableType` (28 bytes).
+#[repr(C)]
+struct MfcCatchableType {
+    properties: u32, // 0x01 = CT_IsSimpleType (pointer copy)
+    p_type: i32,     // RVA from throw_image_base to MfcTypeDescriptor
+    mdisp: i32,
+    pdisp: i32,
+    vdisp: i32,
+    size_or_offset: i32,
+    copy_fn: i32,
+}
+
+/// MSVC x64 `_CatchableTypeArray` for 5 pointer base types.
+#[repr(C)]
+struct MfcCatchableTypeArray5 {
+    n_catchable_types: i32,
+    types: [i32; 5],
+}
+
+/// MSVC x64 `_ThrowInfo` (28 bytes).
+#[repr(C)]
+struct MfcThrowInfo {
+    attributes: u32,
+    pmfn_unwind: i32,
+    p_forward_compat: i32,
+    p_catchable_type_array: i32,
+}
+
+/// Contiguous slab holding MSVC x64 EH/RTTI metadata and MFC preallocated singleton
+/// exception objects so every RVA inside `MfcThrowInfo` / `MfcCatchableTypeArray5` /
+/// `MfcCatchableType` resolves cleanly from `throw_image_base = &slab as *const _ as usize`.
+#[repr(C)]
+struct MfcThrowSlab {
+    td_memory: MfcTypeDescriptor,
+    td_invalid_arg: MfcTypeDescriptor,
+    td_simple: MfcTypeDescriptor,
+    td_exception: MfcTypeDescriptor,
+    td_object: MfcTypeDescriptor,
+    td_void_ptr: MfcTypeDescriptor,
+    ct_memory: MfcCatchableType,
+    ct_invalid_arg: MfcCatchableType,
+    ct_simple: MfcCatchableType,
+    ct_exception: MfcCatchableType,
+    ct_object: MfcCatchableType,
+    ct_void_ptr: MfcCatchableType,
+    cta_memory: MfcCatchableTypeArray5,
+    cta_invalid_arg: MfcCatchableTypeArray5,
+    ti_memory: MfcThrowInfo,
+    ti_invalid_arg: MfcThrowInfo,
+    memory_exc: MfcSimpleException,
+    invalid_arg_exc: MfcSimpleException,
+}
+
+struct SyncThrowSlab(Box<MfcThrowSlab>);
+unsafe impl Send for SyncThrowSlab {}
+unsafe impl Sync for SyncThrowSlab {}
+
+fn make_simple_exception(msg: &str) -> MfcSimpleException {
+    let mut wide = [0u16; 128];
+    for (dst, ch) in wide.iter_mut().take(127).zip(msg.encode_utf16()) {
+        *dst = ch;
+    }
+    MfcSimpleException {
+        vtable: MFC_EXCEPTION_VT.as_ptr(),
+        auto_delete: 0, // MFC preallocated singletons use m_bAutoDelete = FALSE
+        ready_for_delete: 0,
+        resource_id: 0,
+        initialized: 1,
+        loaded: 1,
+        message: wide,
+    }
+}
+
+static MFC_THROW_SLAB: LazyLock<SyncThrowSlab> = LazyLock::new(|| {
+    register_static_vtables();
+    let mk_ct = || MfcCatchableType {
+        properties: 0x01, // CT_IsSimpleType: 8-byte pointer copy
+        p_type: 0,
+        mdisp: 0,
+        pdisp: -1,
+        vdisp: 0,
+        size_or_offset: 8,
+        copy_fn: 0,
+    };
+    let mut slab = Box::new(MfcThrowSlab {
+        td_memory: MfcTypeDescriptor::new(b".PEAVCMemoryException@@"),
+        td_invalid_arg: MfcTypeDescriptor::new(b".PEAVCInvalidArgException@@"),
+        td_simple: MfcTypeDescriptor::new(b".PEAVCSimpleException@@"),
+        td_exception: MfcTypeDescriptor::new(b".PEAVCException@@"),
+        td_object: MfcTypeDescriptor::new(b".PEAVCObject@@"),
+        td_void_ptr: MfcTypeDescriptor::new(b".PEAX"),
+        ct_memory: mk_ct(),
+        ct_invalid_arg: mk_ct(),
+        ct_simple: mk_ct(),
+        ct_exception: mk_ct(),
+        ct_object: mk_ct(),
+        ct_void_ptr: mk_ct(),
+        cta_memory: MfcCatchableTypeArray5 {
+            n_catchable_types: 5,
+            types: [0; 5],
+        },
+        cta_invalid_arg: MfcCatchableTypeArray5 {
+            n_catchable_types: 5,
+            types: [0; 5],
+        },
+        ti_memory: MfcThrowInfo {
+            attributes: 0,
+            pmfn_unwind: 0,
+            p_forward_compat: 0,
+            p_catchable_type_array: 0,
+        },
+        ti_invalid_arg: MfcThrowInfo {
+            attributes: 0,
+            pmfn_unwind: 0,
+            p_forward_compat: 0,
+            p_catchable_type_array: 0,
+        },
+        memory_exc: make_simple_exception("Out of memory."),
+        invalid_arg_exc: make_simple_exception("Invalid argument."),
+    });
+
+    let base = &*slab as *const MfcThrowSlab as usize;
+    let rva = |p: *const u8| (p as usize - base) as i32;
+
+    slab.ct_memory.p_type = rva(std::ptr::addr_of!(slab.td_memory).cast());
+    slab.ct_invalid_arg.p_type = rva(std::ptr::addr_of!(slab.td_invalid_arg).cast());
+    slab.ct_simple.p_type = rva(std::ptr::addr_of!(slab.td_simple).cast());
+    slab.ct_exception.p_type = rva(std::ptr::addr_of!(slab.td_exception).cast());
+    slab.ct_object.p_type = rva(std::ptr::addr_of!(slab.td_object).cast());
+    slab.ct_void_ptr.p_type = rva(std::ptr::addr_of!(slab.td_void_ptr).cast());
+
+    let rva_ct_memory = rva(std::ptr::addr_of!(slab.ct_memory).cast());
+    let rva_ct_invalid_arg = rva(std::ptr::addr_of!(slab.ct_invalid_arg).cast());
+    let rva_ct_simple = rva(std::ptr::addr_of!(slab.ct_simple).cast());
+    let rva_ct_exception = rva(std::ptr::addr_of!(slab.ct_exception).cast());
+    let rva_ct_object = rva(std::ptr::addr_of!(slab.ct_object).cast());
+    let rva_ct_void_ptr = rva(std::ptr::addr_of!(slab.ct_void_ptr).cast());
+
+    slab.cta_memory.types = [
+        rva_ct_memory,
+        rva_ct_simple,
+        rva_ct_exception,
+        rva_ct_object,
+        rva_ct_void_ptr,
+    ];
+    slab.cta_invalid_arg.types = [
+        rva_ct_invalid_arg,
+        rva_ct_simple,
+        rva_ct_exception,
+        rva_ct_object,
+        rva_ct_void_ptr,
+    ];
+
+    slab.ti_memory.p_catchable_type_array = rva(std::ptr::addr_of!(slab.cta_memory).cast());
+    slab.ti_invalid_arg.p_catchable_type_array =
+        rva(std::ptr::addr_of!(slab.cta_invalid_arg).cast());
+
+    SyncThrowSlab(slab)
+});
+
+fn mfc_throw_slab() -> &'static MfcThrowSlab {
+    &MFC_THROW_SLAB.0
+}
+
+unsafe fn raise_typed_mfc_exception(
+    exc: *mut MfcSimpleException,
+    throw_info: *const MfcThrowInfo,
+    image_base: usize,
+) {
+    // MSVC throws MFC exceptions by pointer (`CMemoryException*` / `CInvalidArgException*`):
+    // `information[1]` points to the 8-byte pointer value on the stack, `information[2]` is
+    // the non-null `_ThrowInfo`, and `information[3]` is the base for all RVAs in the slab.
+    let mut exc_ptr = exc;
+    let args: [u64; 4] = [
+        0x1993_0520,
+        std::ptr::addr_of_mut!(exc_ptr) as u64,
+        throw_info as u64,
+        image_base as u64,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        type RaiseExceptionFn = unsafe extern "win64" fn(u32, u32, u32, *const u64);
+        let raise: RaiseExceptionFn =
+            std::mem::transmute(crate::unwind::RaiseException as *const ());
+        raise(
+            crate::unwind::CXX_EXCEPTION,
+            crate::unwind::EXCEPTION_NONCONTINUABLE,
+            4,
+            args.as_ptr(),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = crate::unwind::RaiseException(
+            crate::unwind::CXX_EXCEPTION as u64,
+            crate::unwind::EXCEPTION_NONCONTINUABLE as u64,
+            4,
+            args.as_ptr() as u64,
+            0,
+            0,
+        );
+    }
+}
+
 /// `#2346` — `void AfxThrowMemoryException()`.
 unsafe extern "win64" fn afx_throw_memory_exception() {
-    super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
+    let slab = mfc_throw_slab();
+    let base = slab as *const MfcThrowSlab as usize;
+    let exc = std::ptr::addr_of!(slab.memory_exc) as *mut MfcSimpleException;
+    raise_typed_mfc_exception(exc, std::ptr::addr_of!(slab.ti_memory), base);
 }
 
 /// `#2344` — `void AfxThrowInvalidArgException()`.
 unsafe extern "win64" fn afx_throw_invalid_arg_exception() {
-    super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
+    let slab = mfc_throw_slab();
+    let base = slab as *const MfcThrowSlab as usize;
+    let exc = std::ptr::addr_of!(slab.invalid_arg_exc) as *mut MfcSimpleException;
+    raise_typed_mfc_exception(exc, std::ptr::addr_of!(slab.ti_invalid_arg), base);
 }
 
 /// `#3728` — `void CException::Delete()`.
@@ -1453,6 +1771,126 @@ mod tests {
             assert!(!p.is_null());
             std::ptr::write_bytes(p as *mut u8, 0xAB, 64);
             operator_delete(p);
+        }
+    }
+
+    #[test]
+    fn c_win_app_copies_odd_aligned_wide_app_name() {
+        unsafe {
+            let mut mod_state: AfxModuleState = std::mem::zeroed();
+            afx_module_state_ctor(&mut mod_state, 1, afx_wnd_proc as *const c_void, 0x0e00, 0);
+            let saved = afx_set_module_state(&mut mod_state);
+
+            // Build a UTF-16LE string starting at an odd byte address (unaligned for u16).
+            let expected: Vec<u16> = "OddAlignedApp\0".encode_utf16().collect();
+            let mut raw = vec![0xFFu8; 1 + expected.len() * 2 + 1];
+            for (i, &ch) in expected.iter().enumerate() {
+                raw[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
+            }
+            let odd_ptr = raw.as_ptr().add(1) as *const u16;
+            assert_eq!((odd_ptr as usize) % 2, 1);
+
+            let mut app: CWinApp = std::mem::zeroed();
+            c_win_app_ctor(&mut app, odd_ptr);
+            assert!(!app.app_name.is_null());
+            for (i, &ch) in expected.iter().enumerate() {
+                assert_eq!(std::ptr::read_unaligned(app.app_name.add(i)), ch);
+            }
+
+            c_win_app_dtor(&mut app);
+            afx_module_state_dtor(&mut mod_state);
+            afx_set_module_state(saved);
+        }
+    }
+
+    #[test]
+    fn mfc_throw_metadata_matches_msvc_cxx_abi() {
+        unsafe {
+            let slab = mfc_throw_slab();
+            let base = slab as *const MfcThrowSlab as usize;
+
+            let check_throw = |ti: *const MfcThrowInfo, expected_types: &[&str]| {
+                assert!(!ti.is_null());
+                let attrs = std::ptr::read_unaligned(ti as *const u32);
+                let unwind_rva = std::ptr::read_unaligned((ti as *const u8).add(4) as *const i32);
+                let cta_rva = std::ptr::read_unaligned((ti as *const u8).add(12) as *const i32);
+                assert_eq!(attrs, 0);
+                assert_eq!(unwind_rva, 0);
+                assert!(cta_rva > 0);
+
+                let cta = (base as isize + cta_rva as isize) as *const i32;
+                let count = std::ptr::read_unaligned(cta) as usize;
+                assert_eq!(count, expected_types.len());
+
+                for (i, &want) in expected_types.iter().enumerate() {
+                    let ct_rva = std::ptr::read_unaligned(cta.add(1 + i));
+                    let ct = (base as isize + ct_rva as isize) as *const u8;
+                    let props = std::ptr::read_unaligned(ct as *const u32);
+                    let td_rva = std::ptr::read_unaligned(ct.add(4) as *const i32);
+                    let mdisp = std::ptr::read_unaligned(ct.add(8) as *const i32);
+                    let pdisp = std::ptr::read_unaligned(ct.add(12) as *const i32);
+                    let vdisp = std::ptr::read_unaligned(ct.add(16) as *const i32);
+                    let size = std::ptr::read_unaligned(ct.add(20) as *const i32);
+                    assert_eq!(props, 0x01, "expected CT_IsSimpleType for {want}");
+                    assert_eq!([mdisp, pdisp, vdisp], [0, -1, 0]);
+                    assert_eq!(size, 8);
+
+                    let td = (base as isize + td_rva as isize) as *const u8;
+                    let got = std::ffi::CStr::from_ptr(td.add(16) as *const libc::c_char)
+                        .to_str()
+                        .unwrap();
+                    assert_eq!(got, want);
+                }
+            };
+
+            check_throw(
+                std::ptr::addr_of!(slab.ti_memory),
+                &[
+                    ".PEAVCMemoryException@@",
+                    ".PEAVCSimpleException@@",
+                    ".PEAVCException@@",
+                    ".PEAVCObject@@",
+                    ".PEAX",
+                ],
+            );
+            check_throw(
+                std::ptr::addr_of!(slab.ti_invalid_arg),
+                &[
+                    ".PEAVCInvalidArgException@@",
+                    ".PEAVCSimpleException@@",
+                    ".PEAVCException@@",
+                    ".PEAVCObject@@",
+                    ".PEAX",
+                ],
+            );
+
+            // Verify preallocated singletons have m_bAutoDelete == FALSE (safe Delete())
+            // and GetErrorMessage works cleanly even on an odd-aligned destination buffer.
+            let mut raw = vec![0xEEu8; 1 + 64 * 2];
+            let odd_dst = raw.as_mut_ptr().add(1) as *mut u16;
+            let mut help_ctx = 99u32;
+            assert_eq!(
+                mfc_exc_get_error_message(
+                    std::ptr::addr_of!(slab.memory_exc),
+                    odd_dst,
+                    64,
+                    &mut help_ctx
+                ),
+                1
+            );
+            assert_eq!(help_ctx, 0);
+            let mut out = Vec::new();
+            for i in 0..64 {
+                let ch = std::ptr::read_unaligned(odd_dst.cast::<u8>().add(i * 2) as *const u16);
+                if ch == 0 {
+                    break;
+                }
+                out.push(ch);
+            }
+            assert_eq!(String::from_utf16(&out).unwrap(), "Out of memory.");
+
+            c_exception_delete(std::ptr::addr_of!(slab.memory_exc) as *mut u8);
+            c_exception_delete(std::ptr::addr_of!(slab.invalid_arg_exc) as *mut u8);
         }
     }
 }
