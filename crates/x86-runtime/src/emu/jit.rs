@@ -51,14 +51,15 @@ mod tests;
 pub(super) use aot::{
     aot_emit_stubs, aot_knob_bits, aot_translate, emit_static_stubs_with_veneer, AotBlock,
     AotReloc, AotStubOffs, AOT_MAX_BLOCK_BYTES, AOT_STUBS_BYTES, RELOC_HOST_FN, RELOC_QPC_STATE,
-    RELOC_SLOT_VAL,
+    RELOC_SLOT_VAL, RELOC_XINPUT_STATE,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use aot::{emit_static_stubs, test_emit_stubs_and_veneer_for_knobs};
 pub(super) use cache::{
-    inline_host_fn, patch_lse2_unaligned, prep_block, register_lse2_region,
-    unregister_lse2_region, JitCache, TrScratch, JMUL,
+    inline_host_fn, patch_lse2_unaligned, prep_block, register_lse2_region, unregister_lse2_region,
+    JitCache, TrScratch, FAST_KIND_ENTER_CS, FAST_KIND_LEAVE_CS, FAST_KIND_QPC,
+    FAST_KIND_SWITCH_TO_THREAD, FAST_KIND_TIME_MS, FAST_KIND_XINPUT, JMUL,
 };
 #[cfg(test)]
 pub(super) use cache::{test_aot_installs, test_probe_hits};
@@ -169,7 +170,10 @@ pub(super) struct JitScratch {
     pub x87_cw: usize,
     /// Per-thread 2-way polymorphic indirect-branch inline cache (`IcSet[IC_SETS]`, 32 KiB).
     pub ic_table: usize,
-    /// Test-only: dynamic `DF_PLAIN` / pure-float-math / inline-QPC calls served directly in
+    /// Per-thread spin-yield counter for inline `SwitchToThread` / `_Thrd_yield` fast thunks
+    /// (every 64th call yields to the OS scheduler via `sched_yield`).
+    pub switch_yield_ctr: u32,
+    /// Test-only: dynamic `DF_PLAIN` / pure-float-math / inline-fast-thunk calls served directly in
     /// `lookup_call` / `lookup_jmp` from `table`.
     #[cfg(test)]
     pub plain_call_hits: u64,
@@ -205,6 +209,7 @@ impl Default for JitScratch {
             sys_helpers: super::cpu::sys_helpers_ptr(),
             x87_cw: super::regfile_ext::x87_cw_ptr(),
             ic_table: 0,
+            switch_yield_ctr: 0,
             #[cfg(test)]
             plain_call_hits: 0,
         }
@@ -872,6 +877,7 @@ const OFF_ENTROPY_FN: u32 = OFF_JX + offset_of!(JitScratch, entropy_fn) as u32;
 const OFF_MXCSR: u32 = OFF_JX + offset_of!(JitScratch, mxcsr) as u32;
 const OFF_SYS_HELPERS: u32 = OFF_JX + offset_of!(JitScratch, sys_helpers) as u32;
 const OFF_X87_CW: u32 = OFF_JX + offset_of!(JitScratch, x87_cw) as u32;
+const OFF_SWITCH_YIELD: u32 = OFF_JX + offset_of!(JitScratch, switch_yield_ctr) as u32;
 const SYS_CPUID_OFF: u32 = offset_of!(super::cpu::SysHelpers, cpuid) as u32;
 const SYS_XSTATE_OFF: u32 = offset_of!(super::cpu::SysHelpers, xstate) as u32;
 const SYS_FAULT_GP_OFF: u32 = offset_of!(super::cpu::SysHelpers, fault_gp) as u32;
@@ -904,6 +910,8 @@ const _: () = assert!(
         && OFF_X87_CW < 8 * 4096
         && OFF_IC_TABLE % 8 == 0
         && OFF_IC_TABLE < 8 * 4096
+        && OFF_SWITCH_YIELD % 4 == 0
+        && OFF_SWITCH_YIELD < 4 * 4096
         && OFF_YMM_HI % 8 == 0
         && OFF_YMM_HI <= 504
 );

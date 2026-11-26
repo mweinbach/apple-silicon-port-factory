@@ -1,7 +1,7 @@
 //! Guest XMM register cache (`AW2_JIT_XMMREG` / `PORT_JIT_XMM_PIN`) and main-path
 //! 64-bit / 128-bit constant literal pools (`AW2_JIT_RETLIT`).
 
-use super::aot::{AotReloc, RELOC_HOST_FN, RELOC_QPC_STATE, RELOC_SLOT_VAL};
+use super::aot::{AotReloc, RELOC_HOST_FN, RELOC_QPC_STATE, RELOC_SLOT_VAL, RELOC_XINPUT_STATE};
 use super::emit::Asm;
 use super::lazy::PF_NONE;
 use super::translate::{stack_tso, Chk, FlagState, Grp, Src, Tr};
@@ -1157,6 +1157,17 @@ impl Tr<'_> {
         }
         let at = self.a.ldr_lit(reg);
         self.rlits.push((at, p, AotReloc { word: 0, kind: RELOC_QPC_STATE, bail: false, va: 0, src: 0 }));
+    }
+
+    /// `reg = win32_rt::misc::xinput1_4::xinput_fast_table_ptr()` (relocated via `RELOC_XINPUT_STATE` in AOT).
+    pub(super) fn mov_xinput_lit(&mut self, reg: u32) {
+        let p = win32_rt::misc::xinput1_4::xinput_fast_table_ptr() as u64;
+        if !self.aot {
+            self.mov_lit(reg, p);
+            return;
+        }
+        let at = self.a.ldr_lit(reg);
+        self.rlits.push((at, p, AotReloc { word: 0, kind: RELOC_XINPUT_STATE, bail: false, va: 0, src: 0 }));
     }
 
     /// Load a 128-bit constant `(lo, hi)` into vector register `vreg` via a 1-instruction

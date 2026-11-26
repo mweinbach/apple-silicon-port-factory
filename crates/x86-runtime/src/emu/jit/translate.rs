@@ -1342,33 +1342,14 @@ impl Tr<'_> {
             self.a.str(64, T0, XCPU, OFF_RIP);
             self.a.add_imm(true, g(4), g(4), 8);
         }
-        // Fast inline `QueryPerformanceCounter`: reads hardware `cntvct_el0` + Q64 scale
-        // directly in ~10 instructions with zero XMM/GPR spills and zero `blr`, falling back
-        // to the regular `plain_call` if uninitialized / mach fallback / shadow clock freeze.
-        let qpc_fn = win32_rt::kernel32::time::QueryPerformanceCounter as *const () as usize;
-        let rtl_qpc_fn = win32_rt::ntdll::RtlQueryPerformanceCounter as *const () as usize;
-        let mut qpc_done = None;
-        if bail.is_none() && (h == qpc_fn || h == rtl_qpc_fn) {
-            self.mov_qpc_lit(XA);
-            self.a.ldp_x(T0, T1, XA, 0); // x0 = mode, x1 = mult
-            self.a.addsub_ri(true, true, true, ZR, T0, 1, false); // cmp x0, #1
-            let slow = self.a.bcond(NE);
-            self.a.mrs_cntvct(T0);
-            self.a.ldr(64, T2, XA, 16); // offset
-            self.a.umulh(T0, T0, T1);
-            self.a.addsub_rr(true, false, false, T0, T0, T2, 0);
-            self.a.str(64, T0, g(1), 0); // *lpPerformanceCount = result
-            self.a.movz(false, g(0), 1, 0); // return TRUE
-            self.set_lb(0, 64);
-            self.flush_lb();
-            if tail {
-                self.a.ldr(64, T0, XCPU, OFF_RIP);
-                self.a.b_to(self.lookup_rip);
-            } else {
-                qpc_done = Some(self.a.b());
-            }
-            self.a.bind(slow);
-        }
+        // Zero-spill inline fast paths for the hottest Win32 leaf calls (no XMM/GPR spills,
+        // no FPCR save/restore, no `blr`), falling back to the regular `plain_call` on any
+        // slow-path condition (uninitialized clock/backend, contention, unaligned CS, etc.).
+        let fast_done = if bail.is_none() {
+            self.emit_inline_plain_fast_path(h, tail)
+        } else {
+            None
+        };
         // AAPCS64 designates `v16..v31` as caller-saved; even integer-only `DF_PLAIN` builtins
         // (e.g. NEON `memcpy`/`memset` or LLVM auto-vectorized Rust) can clobber `v16..v31`,
         // so pinned XMM registers must always be spilled before `blr` and reloaded afterward.
@@ -1434,9 +1415,251 @@ impl Tr<'_> {
             self.a.ldr(64, T0, XCPU, OFF_RIP);
             self.a.b_to(self.lookup_rip);
         }
-        if let Some(d) = qpc_done {
+        if let Some(d) = fast_done {
             self.a.bind(d);
         }
+    }
+
+    /// Emit a zero-spill inline ARM64 fast path inside [`Self::plain_call`] for the hottest
+    /// Win32 leaf exports (`QueryPerformanceCounter`, `timeGetTime`/`GetTickCount*`,
+    /// `EnterCriticalSection`/`LeaveCriticalSection`, `XInputGetState*`, `SwitchToThread`).
+    /// Returns a branch fixup to bind at the end of `plain_call` (or `None` when not matched
+    /// or `tail == true`, in which case the fast path jumps straight to `lookup_rip`).
+    fn emit_inline_plain_fast_path(&mut self, h: usize, tail: bool) -> Option<usize> {
+        #[derive(Clone, Copy)]
+        enum InlineKind {
+            Qpc,
+            TimeMs32,
+            TimeMs64,
+            EnterCs,
+            LeaveCs,
+            XInput { ex: bool },
+            SwitchToThread,
+        }
+        struct Table {
+            qpc: [usize; 4],
+            time_ms32: [usize; 4],
+            time_ms64: [usize; 2],
+            enter_cs: [usize; 4],
+            leave_cs: [usize; 4],
+            xinput: [usize; 2],
+            xinput_ex: [usize; 2],
+            switch_thread: [usize; 4],
+        }
+        static TABLE: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+        let t = TABLE.get_or_init(|| {
+            let lk = |dll: &str, sym: &str| win32_rt::lookup(dll, sym).map_or(0, |p| p as usize);
+            Table {
+                qpc: [
+                    win32_rt::kernel32::time::QueryPerformanceCounter as *const () as usize,
+                    win32_rt::ntdll::RtlQueryPerformanceCounter as *const () as usize,
+                    lk("kernel32.dll", "QueryPerformanceCounter"),
+                    lk("ntdll.dll", "RtlQueryPerformanceCounter"),
+                ],
+                time_ms32: [
+                    win32_rt::misc::winmm::timeGetTime as *const () as usize,
+                    win32_rt::kernel32::time::GetTickCount as *const () as usize,
+                    lk("winmm.dll", "timeGetTime"),
+                    lk("kernel32.dll", "GetTickCount"),
+                ],
+                time_ms64: [
+                    win32_rt::kernel32::time::GetTickCount64 as *const () as usize,
+                    lk("kernel32.dll", "GetTickCount64"),
+                ],
+                enter_cs: [
+                    win32_rt::sync::EnterCriticalSection as *const () as usize,
+                    win32_rt::ntdll::RtlEnterCriticalSection as *const () as usize,
+                    lk("kernel32.dll", "EnterCriticalSection"),
+                    lk("ntdll.dll", "RtlEnterCriticalSection"),
+                ],
+                leave_cs: [
+                    win32_rt::sync::LeaveCriticalSection as *const () as usize,
+                    win32_rt::ntdll::RtlLeaveCriticalSection as *const () as usize,
+                    lk("kernel32.dll", "LeaveCriticalSection"),
+                    lk("ntdll.dll", "RtlLeaveCriticalSection"),
+                ],
+                xinput: [
+                    win32_rt::misc::xinput1_4::XInputGetState as *const () as usize,
+                    lk("xinput1_4.dll", "XInputGetState"),
+                ],
+                xinput_ex: [
+                    win32_rt::misc::xinput1_4::XInputGetStateEx as *const () as usize,
+                    lk("xinput1_4.dll", "XInputGetStateEx"),
+                ],
+                switch_thread: [
+                    win32_rt::kernel32::time::SwitchToThread as *const () as usize,
+                    win32_rt::misc::msvcp140::_Thrd_yield as *const () as usize,
+                    lk("kernel32.dll", "SwitchToThread"),
+                    lk("msvcp140.dll", "_Thrd_yield"),
+                ],
+            }
+        });
+        let kind = if t.qpc.contains(&h) {
+            InlineKind::Qpc
+        } else if t.time_ms32.contains(&h) {
+            InlineKind::TimeMs32
+        } else if t.time_ms64.contains(&h) {
+            InlineKind::TimeMs64
+        } else if t.enter_cs.contains(&h) {
+            InlineKind::EnterCs
+        } else if t.leave_cs.contains(&h) {
+            InlineKind::LeaveCs
+        } else if t.xinput.contains(&h) {
+            InlineKind::XInput { ex: false }
+        } else if t.xinput_ex.contains(&h) {
+            InlineKind::XInput { ex: true }
+        } else if t.switch_thread.contains(&h) {
+            InlineKind::SwitchToThread
+        } else {
+            return None;
+        };
+
+        let mut slow_branches: Vec<usize> = Vec::new();
+        let mut fast_join: Vec<usize> = Vec::new();
+        match kind {
+            InlineKind::Qpc => {
+                self.mov_qpc_lit(XA);
+                self.a.ldp_x(T0, T1, XA, 0); // x0 = mode, x1 = mult
+                self.a.addsub_ri(true, true, true, ZR, T0, 1, false); // cmp x0, #1
+                slow_branches.push(self.a.bcond(NE));
+                self.a.mrs_cntvct(T0);
+                self.a.ldr(64, T2, XA, 16); // offset
+                self.a.umulh(T0, T0, T1);
+                self.a.addsub_rr(true, false, false, T0, T0, T2, 0);
+                self.a.str(64, T0, g(1), 0); // *lpPerformanceCount = result
+                self.a.movz(false, g(0), 1, 0); // return TRUE
+            }
+            InlineKind::TimeMs32 | InlineKind::TimeMs64 => {
+                self.mov_qpc_lit(XA);
+                self.a.ldp_x(T0, T1, XA, 0); // x0 = mode, x1 = mult
+                self.a.addsub_ri(true, true, true, ZR, T0, 1, false);
+                slow_branches.push(self.a.bcond(NE));
+                self.a.mrs_cntvct(T0);
+                self.a.ldr(64, T2, XA, 16); // offset
+                self.a.umulh(T0, T0, T1);
+                self.a.addsub_rr(true, false, false, T0, T0, T2, 0);
+                self.a.movz(false, T1, 10_000, 0);
+                self.a.udiv(true, T0, T0, T1);
+                let is64 = matches!(kind, InlineKind::TimeMs64);
+                self.a.mov_rr(is64, g(0), T0);
+            }
+            InlineKind::EnterCs => {
+                slow_branches.push(self.a.cbz(true, g(1)));
+                self.a.logic_ri(true, 3, ZR, g(1), enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.ldr(64, XA, XCPU, OFF_TEB);
+                slow_branches.push(self.a.cbz(true, XA));
+                self.a.ldr(32, XA, XA, 0x48); // w16 = tid (zero-extended)
+                slow_branches.push(self.a.cbz(false, XA));
+                self.a.ldr(64, XS, g(1), 0x10); // owning_thread
+                self.a.addsub_rr(true, true, true, ZR, XS, XA, 0);
+                let rec = self.a.bcond(EQ);
+                self.a.addsub_ri(true, false, false, XS, g(1), 8, false);
+                self.a.movn(false, T2, 0, 0); // w2 = -1
+                self.a.casa(32, T2, ZR, XS); // Acquire CAS -1 -> 0
+                self.a.addsub_ri(false, false, true, ZR, T2, 1, false); // cmn w2, #1
+                slow_branches.push(self.a.bcond(NE));
+                self.a.str(64, XA, g(1), 0x10); // owning_thread = tid
+                self.a.movz(false, T2, 1, 0);
+                self.a.str(32, T2, g(1), 0x0c); // recursion_count = 1
+                self.a.movz(false, g(0), 0, 0);
+                fast_join.push(self.a.b());
+                self.a.bind(rec);
+                self.a.ldr(32, T2, g(1), 0x0c);
+                self.a.addsub_ri(false, true, true, ZR, T2, 0, false);
+                slow_branches.push(self.a.bcond(LE));
+                self.a.addsub_ri(false, false, true, T2, T2, 1, false);
+                slow_branches.push(self.a.bcond(VS));
+                self.a.str(32, T2, g(1), 0x0c);
+                self.a.movz(false, g(0), 0, 0);
+            }
+            InlineKind::LeaveCs => {
+                slow_branches.push(self.a.cbz(true, g(1)));
+                self.a.logic_ri(true, 3, ZR, g(1), enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.ldr(32, T2, g(1), 0x0c);
+                self.a.addsub_ri(false, true, true, ZR, T2, 1, false);
+                slow_branches.push(self.a.bcond(LT));
+                let rec = self.a.bcond(GT);
+                self.a.ldr(64, XA, g(1), 0x10); // save owning_thread
+                self.a.str(32, ZR, g(1), 0x0c); // recursion_count = 0
+                self.a.str(64, ZR, g(1), 0x10); // owning_thread = 0
+                self.a.addsub_ri(true, false, false, XS, g(1), 8, false);
+                self.a.movz(false, T2, 0, 0); // expected = 0
+                self.a.movn(false, T0, 0, 0); // desired = -1
+                self.a.casl(32, T2, T0, XS); // Release CAS 0 -> -1
+                let contended = self.a.cbnz(false, T2);
+                self.a.movz(false, g(0), 0, 0);
+                fast_join.push(self.a.b());
+                self.a.bind(contended);
+                self.a.movz(false, T2, 1, 0);
+                self.a.str(32, T2, g(1), 0x0c);
+                self.a.str(64, XA, g(1), 0x10);
+                slow_branches.push(self.a.b());
+                self.a.bind(rec);
+                self.a.addsub_ri(false, true, false, T2, T2, 1, false);
+                self.a.str(32, T2, g(1), 0x0c);
+                self.a.movz(false, g(0), 0, 0);
+            }
+            InlineKind::XInput { ex } => {
+                slow_branches.push(self.a.cbz(true, g(2)));
+                self.a.addsub_ri(false, true, true, ZR, g(1), 4, false);
+                slow_branches.push(self.a.bcond(HS));
+                self.mov_xinput_lit(XA);
+                self.a.ldr(64, T2, XA, 0); // ready
+                slow_branches.push(self.a.cbz(true, T2));
+                self.a.addsub_ri(true, false, false, XA, XA, 32, false);
+                self.a.mov_rr(false, T2, g(1)); // zero-extend u32 user
+                self.a.addsub_rr(true, false, false, XA, XA, T2, 5); // &slots[user]
+                self.a.ldar(32, T2, XA); // seq1
+                slow_branches.push(self.a.tbnz(T2, 0));
+                self.a.ldr(32, XS, XA, 4); // connected
+                let conn = self.a.cbnz(false, XS);
+                self.a.dmb_ishld();
+                self.a.ldr(32, XS, XA, 0); // seq2
+                self.a.addsub_rr(false, true, true, ZR, T2, XS, 0);
+                slow_branches.push(self.a.bcond(NE));
+                self.a.movz(false, g(0), 1167, 0); // ERROR_DEVICE_NOT_CONNECTED
+                fast_join.push(self.a.b());
+                self.a.bind(conn);
+                self.a.ldp_x(T0, T1, XA, 8); // w0, w1
+                self.a.dmb_ishld();
+                self.a.ldr(32, XS, XA, 0); // seq2
+                self.a.addsub_rr(false, true, true, ZR, T2, XS, 0);
+                slow_branches.push(self.a.bcond(NE));
+                if !ex {
+                    self.a.logic_ri(true, 0, T0, T0, enc_logic_imm(!(1u64 << 42), true).unwrap());
+                }
+                self.a.str(64, T0, g(2), 0);
+                self.a.str(64, T1, g(2), 8);
+                self.a.movz(false, g(0), 0, 0); // ERROR_SUCCESS
+            }
+            InlineKind::SwitchToThread => {
+                self.a.ldr(32, T2, XCPU, OFF_SWITCH_YIELD);
+                self.a.addsub_ri(false, false, false, T2, T2, 1, false);
+                self.a.str(32, T2, XCPU, OFF_SWITCH_YIELD);
+                self.a.logic_ri(false, 3, ZR, T2, enc_logic_imm(63, false).unwrap());
+                slow_branches.push(self.a.bcond(EQ));
+                self.a.isb();
+                self.a.movz(false, g(0), 0, 0); // FALSE
+            }
+        }
+        for f in fast_join {
+            self.a.bind(f);
+        }
+        self.set_lb(0, 64);
+        self.flush_lb();
+        let done = if tail {
+            self.a.ldr(64, T0, XCPU, OFF_RIP);
+            self.a.b_to(self.lookup_rip);
+            None
+        } else {
+            Some(self.a.b())
+        };
+        for f in slow_branches {
+            self.a.bind(f);
+        }
+        done
     }
 
     pub(super) fn side_exit_here(&mut self, k: usize) -> usize {

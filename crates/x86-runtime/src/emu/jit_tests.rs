@@ -7441,6 +7441,810 @@ fn aot_mmx_legacy_simd_gather_inclusion_shifted_reload_and_static_macho() {
     assert_eq!(jit_out, interp, "Live JIT differs from FastOp interpreter on Slice 4 ops");
 }
 
+/// Dynamic `call rax` and tail `jmp rax` to `timeGetTime`, `GetTickCount`, `GetTickCount64`,
+/// `EnterCriticalSection`, `LeaveCriticalSection`, `RtlEnterCriticalSection`,
+/// `RtlLeaveCriticalSection`, `XInputGetState`, `XInputGetStateEx`, `SwitchToThread`, and
+/// `_Thrd_yield` must take the zero-spill `lookup_call`/`lookup_jmp` inline fast thunks,
+/// preserve all callee-saved GPRs and XMM registers, honour exact Win32 semantics (32-bit ms
+/// wrap, CS layout + recursion + TryEnterCriticalSection consistency, XInput packet numbers +
+/// GUIDE masking + ERROR_DEVICE_NOT_CONNECTED, SwitchToThread BOOL), and bail cleanly to the
+/// slow path on edge cases.
+#[test]
+fn lookup_call_and_jmp_fast_thunks_semantics_and_fallback() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use win32_rt::kernel32::time::QpcFastState;
+    use win32_rt::misc::xinput1_4::{self, btn, DeviceInfo, Gamepad, State, XInputFastTable};
+    use win32_rt::sync::{
+        CriticalSection, InitializeCriticalSection, TryEnterCriticalSection,
+    };
+
+    std::thread::Builder::new()
+        .name("fast_thunks_dyn".into())
+        .spawn(|| {
+            // Ensure this thread has a valid TEB so inline CS fast path sees a non-zero TID.
+            let _teb = win32_rt::teb::current();
+            let my_tid = win32_rt::teb::thread_id() as usize;
+            assert_ne!(my_tid, 0);
+
+            let exp = |dll: &str, name: &str| {
+                win32_rt::lookup(dll, name).unwrap_or_else(|| panic!("{dll}!{name}")) as usize
+            };
+            let f_tgt = exp("winmm.dll", "timeGetTime");
+            let f_gtc = exp("kernel32.dll", "GetTickCount");
+            let f_gtc64 = exp("kernel32.dll", "GetTickCount64");
+            let f_enter = exp("kernel32.dll", "EnterCriticalSection");
+            let f_leave = exp("kernel32.dll", "LeaveCriticalSection");
+            let f_rtl_enter = exp("ntdll.dll", "RtlEnterCriticalSection");
+            let f_rtl_leave = exp("ntdll.dll", "RtlLeaveCriticalSection");
+            let f_xinput = exp("xinput1_4.dll", "XInputGetState");
+            let f_xinput_ex = exp("xinput1_4.dll", "XInputGetStateEx");
+            let f_switch = exp("kernel32.dll", "SwitchToThread");
+            let f_yield = exp("msvcp140.dll", "_Thrd_yield");
+
+            let h = arena_alloc(256, 16);
+            unsafe { core::ptr::write_bytes(h, 0xCC, 256) };
+            let vas: [u64; 11] = core::array::from_fn(|i| h as u64 + (i as u64) * 16);
+            let fns = [
+                f_tgt, f_gtc, f_gtc64, f_enter, f_leave, f_rtl_enter, f_rtl_leave, f_xinput,
+                f_xinput_ex, f_switch, f_yield,
+            ];
+            for (&va, &f) in vas.iter().zip(fns.iter()) {
+                crate::exe::register_native_va(va, f);
+            }
+            let [
+                t_tgt,
+                t_gtc,
+                t_gtc64,
+                t_enter,
+                t_leave,
+                t_rtl_enter,
+                t_rtl_leave,
+                t_xinput,
+                t_xinput_ex,
+                t_switch,
+                t_yield,
+            ] = vas;
+
+            // Guest harness: fn(rcx = arg0, rdx = arg1, r8 = target_va, r9 = is_tail, [rsp+0x28] = sentinel_buf) -> rax
+            // Loads XMM6/XMM15 and callee-saved GPR sentinels, calls or tail-jumps target_va(arg0, arg1),
+            // and writes XMM6/XMM15 and callee-saved GPRs to sentinel_buf[0x20..].
+            let c = arena_alloc(0x400, 16);
+            let code = (|| -> Result<Vec<u8>, IcedError> {
+                let mut a = CodeAssembler::new(64)?;
+                let mut do_tail = a.create_label();
+                let mut done = a.create_label();
+                let mut tail_stub = a.create_label();
+                a.push(rbx)?;
+                a.push(rbp)?;
+                a.push(rsi)?;
+                a.push(rdi)?;
+                a.push(r12)?;
+                a.push(r13)?;
+                a.push(r14)?;
+                a.push(r15)?;
+                a.sub(rsp, 0x48)?;
+                // 8 pushes (0x40) + 0x48 = 0x88; Win64 5th arg was at caller [rsp+0x28] -> [rsp+0xB0]
+                a.mov(rbx, qword_ptr(rsp + 0xB0))?;
+                a.mov(rax, r8)?;
+                a.mov(r10, r9)?;
+                a.mov(rbp, 0x1122_3344_5566_7788u64)?;
+                a.mov(rsi, 0x8877_6655_4433_2211u64)?;
+                a.mov(rdi, 0xAAAA_BBBB_CCCC_DDDDu64)?;
+                a.mov(r12, 0x1234_5678_9ABC_DEF0u64)?;
+                a.mov(r13, 0x0FED_CBA9_8765_4321u64)?;
+                a.mov(r14, 0x5555_AAAA_3333_CCCCu64)?;
+                a.mov(r15, 0xCAFE_BABE_DEAD_BEEFu64)?;
+                a.movdqu(xmm6, xmmword_ptr(rbx + 0x00))?;
+                a.movdqu(xmm15, xmmword_ptr(rbx + 0x10))?;
+                a.test(r10d, r10d)?;
+                a.jne(do_tail)?;
+                a.call(rax)?;
+                a.jmp(done)?;
+                a.set_label(&mut do_tail)?;
+                a.call(tail_stub)?;
+                a.set_label(&mut done)?;
+                a.movdqu(xmmword_ptr(rbx + 0x20), xmm6)?;
+                a.movdqu(xmmword_ptr(rbx + 0x30), xmm15)?;
+                a.mov(qword_ptr(rbx + 0x40), rbp)?;
+                a.mov(qword_ptr(rbx + 0x48), rsi)?;
+                a.mov(qword_ptr(rbx + 0x50), rdi)?;
+                a.mov(qword_ptr(rbx + 0x58), r12)?;
+                a.mov(qword_ptr(rbx + 0x60), r13)?;
+                a.mov(qword_ptr(rbx + 0x68), r14)?;
+                a.mov(qword_ptr(rbx + 0x70), r15)?;
+                a.add(rsp, 0x48)?;
+                a.pop(r15)?;
+                a.pop(r14)?;
+                a.pop(r13)?;
+                a.pop(r12)?;
+                a.pop(rdi)?;
+                a.pop(rsi)?;
+                a.pop(rbp)?;
+                a.pop(rbx)?;
+                a.ret()?;
+                a.set_label(&mut tail_stub)?;
+                a.jmp(rax)?;
+                a.assemble(c as u64)
+            })()
+            .expect("assemble");
+
+            let sbuf = arena_alloc(0x100, 16);
+            let want_gprs: [u64; 7] = [
+                0x1122_3344_5566_7788,
+                0x8877_6655_4433_2211,
+                0xAAAA_BBBB_CCCC_DDDD,
+                0x1234_5678_9ABC_DEF0,
+                0x0FED_CBA9_8765_4321,
+                0x5555_AAAA_3333_CCCC,
+                0xCAFE_BABE_DEAD_BEEF,
+            ];
+            let plain = jit::plaincall_enabled();
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(code.as_ptr(), c, code.len());
+                let invoke = |target: u64, arg0: u64, arg1: u64, is_tail: u64| -> u64 {
+                    core::ptr::write_bytes(sbuf, 0, 0x100);
+                    for i in 0..0x20usize {
+                        *sbuf.add(i) = (0x30 + i) as u8;
+                    }
+                    jit::force(1);
+                    let (ret, _) = emu_run_full(
+                        c as u64,
+                        [arg0, arg1, target, is_tail, sbuf as u64, 0, 0, 0],
+                        [0; 4],
+                        [0; 8],
+                    );
+                    jit::force(0);
+                    assert_eq!(
+                        core::slice::from_raw_parts(sbuf.add(0x20), 0x20),
+                        core::slice::from_raw_parts(sbuf, 0x20),
+                        "XMM6/XMM15 clobbered (target={target:#x}, tail={is_tail})"
+                    );
+                    for (i, &want) in want_gprs.iter().enumerate() {
+                        let got = core::ptr::read_unaligned(sbuf.add(0x40 + 8 * i) as *const u64);
+                        assert_eq!(got, want, "GPR #{i} clobbered (target={target:#x}, tail={is_tail})");
+                    }
+                    ret
+                };
+
+                // --- 1. timeGetTime / GetTickCount / GetTickCount64 ---
+                // Warm both call and tail-jump paths so `do_tail -> tail_stub` is compiled & linked.
+                let m0 = invoke(t_tgt, 0, 0, 0);
+                let _ = invoke(t_tgt, 0, 0, 1);
+                let m1 = invoke(t_gtc, 0, 0, 0);
+                let m2 = invoke(t_gtc64, 0, 0, 0);
+                assert!(m0 <= u32::MAX as u64 && m1 <= u32::MAX as u64);
+                assert!(m2 >= m0);
+                let table = TLS_EMU.with(|cell| (*cell.get()).as_ref().map_or(0, |st| st.jit.test_table_ptr()));
+                assert_ne!(table, 0);
+                if plain {
+                    let s0 = jit::test_stub_plain_hits();
+                    let rm0 = jit::test_ras_moves();
+                    let a0 = invoke(t_tgt, 0, 0, 0);
+                    let a1 = invoke(t_tgt, 0, 0, 1);
+                    let a2 = invoke(t_gtc, 0, 0, 0);
+                    let a3 = invoke(t_gtc64, 0, 0, 1);
+                    assert!(a1.wrapping_sub(a0) < 10_000);
+                    assert!(a2.wrapping_sub(a1) < 10_000);
+                    assert!(a3 >= a2);
+                    assert_eq!(jit::test_stub_plain_hits() - s0, 4, "all 4 timeGetTime/GetTickCount calls hit inline stub");
+                    assert_eq!(jit::test_ras_moves() - rm0, 0, "RAS balanced on timeGetTime tail jump");
+
+                    // Deterministic 32-bit wraparound at 2^32 ms + 123 ms (`offset = ((1<<32)+123)*10_000 + 9999`).
+                    let wrap_100ns = (((1u64 << 32) + 123) * 10_000) + 9999;
+                    let local_wrap = QpcFastState {
+                        mode: AtomicU64::new(1),
+                        mult: AtomicU64::new(0),
+                        offset: AtomicU64::new(wrap_100ns),
+                    };
+                    jit::JitCache::cache_fast_thunk(
+                        table,
+                        t_tgt,
+                        jit::FAST_KIND_TIME_MS,
+                        false,
+                        &local_wrap as *const QpcFastState as usize,
+                    );
+                    jit::JitCache::cache_fast_thunk(
+                        table,
+                        t_gtc64,
+                        jit::FAST_KIND_TIME_MS,
+                        true,
+                        &local_wrap as *const QpcFastState as usize,
+                    );
+                    assert_eq!(invoke(t_tgt, 0, 0, 0), 123, "timeGetTime must wrap mod 2^32 ms");
+                    assert_eq!(invoke(t_tgt, 0, 0, 1), 123, "timeGetTime tail must wrap mod 2^32 ms");
+                    assert_eq!(
+                        invoke(t_gtc64, 0, 0, 0),
+                        (1u64 << 32) + 123,
+                        "GetTickCount64 must keep full 64-bit ms"
+                    );
+                    // mode != 1 falls back cleanly to slow path (`xfer_plain`).
+                    let local_slow = QpcFastState {
+                        mode: AtomicU64::new(2),
+                        mult: AtomicU64::new(0),
+                        offset: AtomicU64::new(0),
+                    };
+                    jit::JitCache::cache_fast_thunk(
+                        table,
+                        t_tgt,
+                        jit::FAST_KIND_TIME_MS,
+                        false,
+                        &local_slow as *const QpcFastState as usize,
+                    );
+                    let x0 = super::test_xfer_plain();
+                    let s_slow = jit::test_stub_plain_hits();
+                    let real_ms = invoke(t_tgt, 0, 0, 0);
+                    assert!(real_ms <= u32::MAX as u64);
+                    assert_eq!(jit::test_stub_plain_hits() - s_slow, 0);
+                    assert_eq!(super::test_xfer_plain() - x0, 1);
+                }
+
+                // --- 2. EnterCriticalSection / LeaveCriticalSection / Rtl* + TryEnterCriticalSection ---
+                let mut crit: CriticalSection = core::mem::zeroed();
+                InitializeCriticalSection(&mut crit);
+                let cs_va = &mut crit as *mut CriticalSection as u64;
+                // Warm caches (call #1 via xfer_plain).
+                invoke(t_enter, cs_va, 0, 0);
+                invoke(t_leave, cs_va, 0, 0);
+                assert_eq!(invoke(t_rtl_enter, cs_va, 0, 0), 0);
+                assert_eq!(invoke(t_rtl_leave, cs_va, 0, 0), 0);
+
+                if plain {
+                    let s0 = jit::test_stub_plain_hits();
+                    let rm0 = jit::test_ras_moves();
+                    // Acquire via EnterCriticalSection fast thunk -> check exact Windows CS layout.
+                    invoke(t_enter, cs_va, 0, 0);
+                    assert_eq!(crit.lock_count.load(Ordering::Acquire), 0);
+                    assert_eq!(crit.recursion_count.load(Ordering::Acquire), 1);
+                    assert_eq!(crit.owning_thread.load(Ordering::Acquire), my_tid);
+                    // Nested acquire via RtlEnterCriticalSection tail jump.
+                    assert_eq!(invoke(t_rtl_enter, cs_va, 0, 1), 0);
+                    assert_eq!(crit.recursion_count.load(Ordering::Acquire), 2);
+                    // Consistency with TryEnterCriticalSection on same thread -> recursion = 3.
+                    assert_eq!(TryEnterCriticalSection(&mut crit), 1);
+                    assert_eq!(crit.recursion_count.load(Ordering::Acquire), 3);
+                    // Another thread calling TryEnterCriticalSection sees FALSE.
+                    let cs_addr = cs_va as usize;
+                    let other_try = std::thread::spawn(move || TryEnterCriticalSection(cs_addr as *mut CriticalSection))
+                        .join()
+                        .unwrap();
+                    assert_eq!(other_try, 0);
+                    // Unwind 3 -> 2 -> 1 -> 0 via LeaveCriticalSection & RtlLeaveCriticalSection.
+                    invoke(t_leave, cs_va, 0, 0);
+                    assert_eq!(crit.recursion_count.load(Ordering::Acquire), 2);
+                    assert_eq!(crit.owning_thread.load(Ordering::Acquire), my_tid);
+                    assert_eq!(invoke(t_rtl_leave, cs_va, 0, 1), 0);
+                    assert_eq!(crit.recursion_count.load(Ordering::Acquire), 1);
+                    invoke(t_leave, cs_va, 0, 1);
+                    assert_eq!(crit.lock_count.load(Ordering::Acquire), -1);
+                    assert_eq!(crit.recursion_count.load(Ordering::Acquire), 0);
+                    assert_eq!(crit.owning_thread.load(Ordering::Acquire), 0);
+                    assert_eq!(jit::test_stub_plain_hits() - s0, 5, "all 5 CS ops hit inline fast thunk");
+                    assert_eq!(jit::test_ras_moves() - rm0, 0);
+
+                    // Unaligned CS falls back cleanly to slow path (`xfer_plain`).
+                    #[repr(align(16))]
+                    struct RawCs([u8; 64]);
+                    let mut raw_cs = RawCs([0u8; 64]);
+                    let unal_cs = raw_cs.0.as_mut_ptr().add(3) as *mut CriticalSection;
+                    InitializeCriticalSection(unal_cs);
+                    let x0 = super::test_xfer_plain();
+                    invoke(t_enter, unal_cs as u64, 0, 0);
+                    invoke(t_leave, unal_cs as u64, 0, 0);
+                    assert_eq!(super::test_xfer_plain() - x0, 2, "unaligned CS must fall back to slow path");
+                }
+
+                // --- 3. XInputGetState / XInputGetStateEx ---
+                let mut st = State {
+                    packet: 0x1357_2468,
+                    gamepad: Gamepad { buttons: 0xBEEF, ..Default::default() },
+                };
+                xinput1_4::backend_disconnect(1);
+                // Warm both targets (call #1 initializes backend + caches FAST_KIND_XINPUT).
+                assert_eq!(invoke(t_xinput, 1, &mut st as *mut State as u64, 0), 1167);
+                assert_eq!(invoke(t_xinput_ex, 1, &mut st as *mut State as u64, 0), 1167);
+                assert_eq!(st.packet, 0x1357_2468, "disconnected slot must not overwrite state");
+                assert_eq!(st.gamepad.buttons, 0xBEEF);
+
+                if plain {
+                    // Disconnected fast path (call + tail jump) with upper-32-bit garbage in rcx!
+                    let s0 = jit::test_stub_plain_hits();
+                    assert_eq!(
+                        invoke(t_xinput, 0xDEAD_0000_0000_0001, &mut st as *mut State as u64, 0),
+                        1167
+                    );
+                    assert_eq!(invoke(t_xinput, 1, &mut st as *mut State as u64, 1), 1167);
+                    assert_eq!(jit::test_stub_plain_hits() - s0, 2);
+
+                    // Connect slot 1 with Guide bit set and verify GUIDE masking & packet numbers.
+                    xinput1_4::backend_connect(
+                        1,
+                        DeviceInfo { name: "jit-pad".into(), wireless: false, rumble: false, battery: None },
+                    );
+                    let pad = Gamepad {
+                        buttons: btn::A | btn::X | btn::GUIDE,
+                        left_trigger: 120,
+                        right_trigger: 240,
+                        thumb_lx: -10000,
+                        thumb_ly: 20000,
+                        thumb_rx: -30000,
+                        thumb_ry: 15000,
+                    };
+                    xinput1_4::backend_update(1, pad);
+                    let s1 = jit::test_stub_plain_hits();
+                    let rm0 = jit::test_ras_moves();
+                    assert_eq!(invoke(t_xinput, 1, &mut st as *mut State as u64, 0), 0);
+                    let pkt = st.packet;
+                    assert_ne!(pkt, 0);
+                    assert_eq!(st.gamepad.buttons, btn::A | btn::X, "XInputGetState must clear GUIDE");
+                    assert_eq!((st.gamepad.left_trigger, st.gamepad.right_trigger), (120, 240));
+                    assert_eq!((st.gamepad.thumb_lx, st.gamepad.thumb_ly), (-10000, 20000));
+                    assert_eq!((st.gamepad.thumb_rx, st.gamepad.thumb_ry), (-30000, 15000));
+                    assert_eq!(invoke(t_xinput_ex, 1, &mut st as *mut State as u64, 1), 0);
+                    assert_eq!(st.packet, pkt);
+                    assert_eq!(
+                        st.gamepad.buttons,
+                        btn::A | btn::X | btn::GUIDE,
+                        "XInputGetStateEx must keep GUIDE"
+                    );
+                    assert_eq!(jit::test_stub_plain_hits() - s1, 2);
+                    assert_eq!(jit::test_ras_moves() - rm0, 0);
+
+                    // Bad args (null pointer / user >= 4) bail cleanly to slow returning 160.
+                    let x0 = super::test_xfer_plain();
+                    assert_eq!(invoke(t_xinput, 1, 0, 0), 160);
+                    assert_eq!(invoke(t_xinput, 4, &mut st as *mut State as u64, 0), 160);
+                    assert_eq!(super::test_xfer_plain() - x0, 2);
+
+                    // Local unready table (`ready == 0`) bails cleanly to slow path.
+                    let unready: XInputFastTable = core::mem::zeroed();
+                    jit::JitCache::cache_fast_thunk(
+                        table,
+                        t_xinput,
+                        jit::FAST_KIND_XINPUT,
+                        false,
+                        &unready as *const XInputFastTable as usize,
+                    );
+                    let x1 = super::test_xfer_plain();
+                    assert_eq!(invoke(t_xinput, 1, &mut st as *mut State as u64, 0), 0);
+                    assert_eq!(super::test_xfer_plain() - x1, 1);
+
+                    xinput1_4::backend_disconnect(1);
+                }
+
+                // --- 4. SwitchToThread / _Thrd_yield ---
+                assert_eq!(invoke(t_switch, 0, 0, 0), 1); // call #1 via xfer_plain -> caches FAST_KIND_SWITCH_TO_THREAD
+                invoke(t_yield, 0, 0, 0);
+                if plain {
+                    // Run 64 consecutive SwitchToThread calls inside a single guest loop (so
+                    // `cpu.jx.switch_yield_ctr` persists across iterations, matching real guest
+                    // spin-wait loops): 63 inline fast yields (FALSE) + 1 OS yield fallback (TRUE).
+                    let loop_code = arena_alloc(0x100, 16);
+                    let loop_bytes = (|| -> Result<Vec<u8>, IcedError> {
+                        let mut a = CodeAssembler::new(64)?;
+                        let mut lp = a.create_label();
+                        let mut use_tail = a.create_label();
+                        let mut next = a.create_label();
+                        let mut tail_sw = a.create_label();
+                        a.push(rbx)?;
+                        a.push(rsi)?;
+                        a.push(rdi)?;
+                        a.push(r12)?;
+                        a.sub(rsp, 0x28)?;
+                        a.mov(rbx, rcx)?; // target = t_switch
+                        a.mov(rsi, rdx)?; // count = 64
+                        a.xor(edi, edi)?; // falses
+                        a.xor(r12d, r12d)?; // trues
+                        a.set_label(&mut lp)?;
+                        a.mov(rax, rbx)?;
+                        a.test(esi, 1u32)?;
+                        a.jnz(use_tail)?;
+                        a.call(rax)?;
+                        a.jmp(next)?;
+                        a.set_label(&mut use_tail)?;
+                        a.call(tail_sw)?;
+                        a.set_label(&mut next)?;
+                        a.test(eax, eax)?;
+                        a.sete(cl)?;
+                        a.movzx(ecx, cl)?;
+                        a.add(edi, ecx)?;
+                        a.add(r12d, eax)?;
+                        a.sub(rsi, 1)?;
+                        a.jnz(lp)?;
+                        // Pack (trues << 32) | falses in rax.
+                        a.mov(eax, r12d)?;
+                        a.shl(rax, 32)?;
+                        a.or(rax, rdi)?;
+                        a.add(rsp, 0x28)?;
+                        a.pop(r12)?;
+                        a.pop(rdi)?;
+                        a.pop(rsi)?;
+                        a.pop(rbx)?;
+                        a.ret()?;
+                        a.set_label(&mut tail_sw)?;
+                        a.jmp(rax)?;
+                        a.assemble(loop_code as u64)
+                    })()
+                    .expect("assemble switch loop");
+                    core::ptr::copy_nonoverlapping(loop_bytes.as_ptr(), loop_code, loop_bytes.len());
+                    core::ptr::write_bytes(loop_code.add(loop_bytes.len()), 0xCC, 16);
+
+                    let s0 = jit::test_stub_plain_hits();
+                    let x0 = super::test_xfer_plain();
+                    jit::force(1);
+                    let (packed, _) = emu_run_full(
+                        loop_code as u64,
+                        [t_switch, 64, 0, 0, 0, 0, 0, 0],
+                        [0; 4],
+                        [0; 8],
+                    );
+                    jit::force(0);
+                    let falses = (packed & 0xFFFF_FFFF) as u32;
+                    let trues = (packed >> 32) as u32;
+                    assert_eq!(falses, 63, "63 of 64 SwitchToThread calls must take inline fast yield (FALSE)");
+                    assert_eq!(trues, 1, "1 of 64 SwitchToThread calls must fall back to OS yield (TRUE)");
+                    assert_eq!(jit::test_stub_plain_hits() - s0, 63);
+                    assert_eq!(
+                        super::test_xfer_plain() - x0,
+                        64,
+                        "63 inline stub hits + 1 slow xfer_plain OS yield = 64 total"
+                    );
+                }
+
+                for &va in &vas {
+                    crate::exe::unregister_native_va(va);
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Static `plain_call` fast thunks for `timeGetTime`, `EnterCriticalSection`,
+/// `LeaveCriticalSection`, `XInputGetState`, and `SwitchToThread` must execute inline in
+/// both Live JIT and Disk AOT (with `RELOC_QPC_STATE` and `RELOC_XINPUT_STATE` round-tripping
+/// cleanly through `.aot` encode/decode/install) with zero `host_xfer` transitions.
+#[test]
+fn static_plain_call_fast_thunks_jit_and_aot() {
+    use core::sync::atomic::Ordering;
+    use win32_rt::misc::xinput1_4::{self, btn, DeviceInfo, Gamepad, State};
+    use win32_rt::sync::{CriticalSection, InitializeCriticalSection};
+
+    if !jit::plaincall_enabled() {
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("fast_thunks_static_aot".into())
+        .spawn(|| {
+            let _teb = win32_rt::teb::current();
+            let my_tid = win32_rt::teb::thread_id() as usize;
+
+            let exp = |dll: &str, name: &str| {
+                win32_rt::lookup(dll, name).unwrap_or_else(|| panic!("{dll}!{name}")) as usize
+            };
+            let h = arena_alloc(128, 16);
+            unsafe { core::ptr::write_bytes(h, 0xCC, 128) };
+            let t_enter = h as u64;
+            let t_leave = h as u64 + 16;
+            let t_tgt = h as u64 + 32;
+            let t_xinput = h as u64 + 48;
+            let t_switch = h as u64 + 64;
+            crate::exe::register_native_va(t_enter, exp("kernel32.dll", "EnterCriticalSection"));
+            crate::exe::register_native_va(t_leave, exp("kernel32.dll", "LeaveCriticalSection"));
+            crate::exe::register_native_va(t_tgt, exp("winmm.dll", "timeGetTime"));
+            crate::exe::register_native_va(t_xinput, exp("xinput1_4.dll", "XInputGetState"));
+            crate::exe::register_native_va(t_switch, exp("kernel32.dll", "SwitchToThread"));
+
+            // Ensure XInput backend is started & slot 2 connected so static XInputGetState takes fast path.
+            xinput1_4::backend_connect(
+                2,
+                DeviceInfo { name: "aot-pad".into(), wireless: false, rumble: false, battery: None },
+            );
+            xinput1_4::backend_update(
+                2,
+                Gamepad { buttons: btn::B | btn::GUIDE, left_trigger: 55, ..Default::default() },
+            );
+            let mut warmup_st = State::default();
+            unsafe {
+                assert_eq!(xinput1_4::XInputGetState(2, &mut warmup_st), 0);
+            }
+
+            // Guest function: fn(rcx = cs, rdx = xinput_state, r8 = out_buf) -> u64
+            // Calls EnterCriticalSection(cs), captures [cs+0x08..0x18], calls timeGetTime(),
+            // calls XInputGetState(2, xinput_state), calls SwitchToThread(), calls LeaveCriticalSection(cs).
+            let c_jit = arena_alloc(0x400, 16);
+            let c_aot = arena_alloc(0x400, 16);
+            let assemble_at = |base: u64| -> (Vec<u8>, Vec<u64>) {
+                let mut a = CodeAssembler::new(64).unwrap();
+                let mut l1 = a.create_label();
+                let mut l2 = a.create_label();
+                let mut l3 = a.create_label();
+                let mut l4 = a.create_label();
+                let mut l5 = a.create_label();
+                a.push(rbx).unwrap();
+                a.push(rsi).unwrap();
+                a.push(rdi).unwrap();
+                a.sub(rsp, 0x20).unwrap();
+                a.mov(rbx, rcx).unwrap(); // cs
+                a.mov(rsi, rdx).unwrap(); // xinput_state
+                a.mov(rdi, r8).unwrap();  // out_buf
+                // EnterCriticalSection(cs)
+                a.mov(rcx, rbx).unwrap();
+                a.call(t_enter).unwrap();
+                a.set_label(&mut l1).unwrap();
+                // Snapshot LockCount/RecursionCount/OwningThread while held
+                a.mov(eax, dword_ptr(rbx + 0x08)).unwrap();
+                a.mov(dword_ptr(rdi + 0x00), eax).unwrap();
+                a.mov(eax, dword_ptr(rbx + 0x0c)).unwrap();
+                a.mov(dword_ptr(rdi + 0x04), eax).unwrap();
+                a.mov(rax, qword_ptr(rbx + 0x10)).unwrap();
+                a.mov(qword_ptr(rdi + 0x08), rax).unwrap();
+                // timeGetTime()
+                a.call(t_tgt).unwrap();
+                a.set_label(&mut l2).unwrap();
+                a.mov(qword_ptr(rdi + 0x10), rax).unwrap();
+                // XInputGetState(2, xinput_state)
+                a.mov(ecx, 2u32).unwrap();
+                a.mov(rdx, rsi).unwrap();
+                a.call(t_xinput).unwrap();
+                a.set_label(&mut l3).unwrap();
+                a.mov(qword_ptr(rdi + 0x18), rax).unwrap();
+                // SwitchToThread()
+                a.call(t_switch).unwrap();
+                a.set_label(&mut l4).unwrap();
+                a.mov(qword_ptr(rdi + 0x20), rax).unwrap();
+                // LeaveCriticalSection(cs)
+                a.mov(rcx, rbx).unwrap();
+                a.call(t_leave).unwrap();
+                a.set_label(&mut l5).unwrap();
+                a.mov(eax, 0x1234_5678u32).unwrap();
+                a.add(rsp, 0x20).unwrap();
+                a.pop(rdi).unwrap();
+                a.pop(rsi).unwrap();
+                a.pop(rbx).unwrap();
+                a.ret().unwrap();
+                let res = a
+                    .assemble_options(base, iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)
+                    .unwrap();
+                let mut ips = vec![base];
+                for lbl in [l1, l2, l3, l4, l5] {
+                    ips.push(res.label_ip(&lbl).unwrap());
+                }
+                (res.inner.code_buffer, ips)
+            };
+
+            let (bytes_jit, _ips_jit) = assemble_at(c_jit as u64);
+            let (bytes_aot, ips_aot) = assemble_at(c_aot as u64);
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes_jit.as_ptr(), c_jit, bytes_jit.len());
+                core::ptr::write_bytes(c_jit.add(bytes_jit.len()), 0xCC, 16);
+                core::ptr::copy_nonoverlapping(bytes_aot.as_ptr(), c_aot, bytes_aot.len());
+                core::ptr::write_bytes(c_aot.add(bytes_aot.len()), 0xCC, 16);
+
+                let check_run = |entry: u64, label: &str| {
+                    let mut crit: CriticalSection = core::mem::zeroed();
+                    InitializeCriticalSection(&mut crit);
+                    let mut st = State::default();
+                    let mut out = [0u64; 6];
+                    let x0 = super::test_xfer_plain();
+                    jit::force(1);
+                    let (ret, _) = emu_run_full(
+                        entry,
+                        [
+                            &mut crit as *mut CriticalSection as u64,
+                            &mut st as *mut State as u64,
+                            out.as_mut_ptr() as u64,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                        [0; 4],
+                        [0; 8],
+                    );
+                    jit::force(0);
+                    assert_eq!(ret, 0x1234_5678, "{label}: bad return");
+                    let lc = (out[0] & 0xFFFF_FFFF) as i32;
+                    let rc = (out[0] >> 32) as i32;
+                    assert_eq!(lc, 0, "{label}: LockCount while held");
+                    assert_eq!(rc, 1, "{label}: RecursionCount while held");
+                    assert_eq!(out[1] as usize, my_tid, "{label}: OwningThread while held");
+                    assert!(out[2] <= u32::MAX as u64, "{label}: timeGetTime u32");
+                    assert_eq!(out[3], 0, "{label}: XInputGetState ERROR_SUCCESS");
+                    assert_eq!(st.gamepad.buttons, btn::B, "{label}: GUIDE masked");
+                    assert_eq!(st.gamepad.left_trigger, 55, "{label}: trigger preserved");
+                    assert!(out[4] <= 1, "{label}: SwitchToThread BOOL");
+                    assert_eq!(crit.lock_count.load(Ordering::Acquire), -1, "{label}: CS unlocked");
+                    assert_eq!(crit.recursion_count.load(Ordering::Acquire), 0, "{label}: CS rec=0");
+                    assert_eq!(crit.owning_thread.load(Ordering::Acquire), 0, "{label}: CS owner=0");
+                    assert_eq!(
+                        super::test_xfer_plain() - x0,
+                        0,
+                        "{label}: static plain_call fast thunks must not fall through to xfer_plain"
+                    );
+                };
+
+                // 1. Live JIT static plain_call execution.
+                check_run(c_jit as u64, "Live JIT");
+
+                // 2. Disk AOT build -> encode -> decode -> install -> execute.
+                let mut bc = Box::new(BlockCache::new());
+                let img = aot::build_image_for_test(&mut *bc, &ips_aot).expect("build AOT image");
+                assert!(
+                    img.relocs.iter().any(|r| r.kind == jit::RELOC_QPC_STATE),
+                    "AOT image must record RELOC_QPC_STATE for inline timeGetTime"
+                );
+                assert!(
+                    img.relocs.iter().any(|r| r.kind == jit::RELOC_XINPUT_STATE),
+                    "AOT image must record RELOC_XINPUT_STATE for inline XInputGetState"
+                );
+                let key = aot::AotKey {
+                    image_hash: [0x1111_2222_3333_4444, 0x5555_6666_7777_8888],
+                    image_base: c_aot as u64,
+                    image_size: 0x400,
+                    codegen_hash: aot::codegen_hash(),
+                    knobs: jit::aot_knob_bits(),
+                };
+                let bytes = aot::encode_for_test("fast_thunks_static.dll", &key, &img);
+                let (_name, _k, dec, _fl) = aot::decode(&bytes).expect("decode AOT with RELOC_XINPUT_STATE");
+                assert_eq!(dec.relocs.len(), img.relocs.len());
+
+                let aot_before = jit::test_aot_installs();
+                let (live, _relocs, _links) = aot::test_install(&ips_aot, || {});
+                assert!(live > 0, "AOT must install block");
+                check_run(c_aot as u64, "Disk AOT");
+                aot::test_uninstall();
+                assert!(jit::test_aot_installs() > aot_before, "AOT block must have executed");
+
+                xinput1_4::backend_disconnect(2);
+                for va in [t_enter, t_leave, t_tgt, t_xinput, t_switch] {
+                    crate::exe::unregister_native_va(va);
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Multi-threaded contention stress test for JIT-translated `EnterCriticalSection` /
+/// `TryEnterCriticalSection` / `LeaveCriticalSection` fast thunks (covering both inline
+/// uncontended acquire/release, nested recursion, and contended slow-path handoff + wakeup).
+#[test]
+fn fast_thunk_critical_section_contention_stress() {
+    use core::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier};
+    use win32_rt::sync::{CriticalSection, InitializeCriticalSection};
+
+    let exp = |dll: &str, name: &str| {
+        win32_rt::lookup(dll, name).unwrap_or_else(|| panic!("{dll}!{name}")) as usize
+    };
+    let h = arena_alloc(64, 16);
+    unsafe { core::ptr::write_bytes(h, 0xCC, 64) };
+    let t_enter = h as u64;
+    let t_try = h as u64 + 16;
+    let t_leave = h as u64 + 32;
+    crate::exe::register_native_va(t_enter, exp("kernel32.dll", "EnterCriticalSection"));
+    crate::exe::register_native_va(t_try, exp("kernel32.dll", "TryEnterCriticalSection"));
+    crate::exe::register_native_va(t_leave, exp("kernel32.dll", "LeaveCriticalSection"));
+
+    // Guest worker: fn(rcx = cs, rdx = counter_ptr, r8 = iters)
+    // For each iteration: Enter(cs), nested Enter(cs) (or TryEnter(cs)), non-atomic *counter += 1,
+    // Leave(cs), Leave(cs).
+    let code_buf = arena_alloc(0x200, 16);
+    let bytes = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        let mut lp = a.create_label();
+        let mut use_enter = a.create_label();
+        let mut inner_ok = a.create_label();
+        a.push(rbx)?;
+        a.push(rsi)?;
+        a.push(rdi)?;
+        a.sub(rsp, 0x20)?;
+        a.mov(rbx, rcx)?; // cs
+        a.mov(rsi, rdx)?; // counter
+        a.mov(rdi, r8)?;  // iters
+        a.set_label(&mut lp)?;
+        a.mov(rcx, rbx)?;
+        a.call(t_enter)?;
+        a.test(edi, 1u32)?;
+        a.jz(use_enter)?;
+        a.mov(rcx, rbx)?;
+        a.call(t_try)?;
+        a.jmp(inner_ok)?;
+        a.set_label(&mut use_enter)?;
+        a.mov(rcx, rbx)?;
+        a.call(t_enter)?;
+        a.set_label(&mut inner_ok)?;
+        // Non-atomic read-modify-write inside critical section.
+        a.mov(rax, qword_ptr(rsi))?;
+        a.add(rax, 1)?;
+        a.mov(qword_ptr(rsi), rax)?;
+        a.mov(rcx, rbx)?;
+        a.call(t_leave)?;
+        a.mov(rcx, rbx)?;
+        a.call(t_leave)?;
+        a.sub(rdi, 1)?;
+        a.jnz(lp)?;
+        a.add(rsp, 0x20)?;
+        a.pop(rdi)?;
+        a.pop(rsi)?;
+        a.pop(rbx)?;
+        a.ret()?;
+        a.assemble(code_buf as u64)
+    })()
+    .expect("assemble");
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), code_buf, bytes.len());
+        core::ptr::write_bytes(code_buf.add(bytes.len()), 0xCC, 16);
+    }
+
+    #[repr(align(64))]
+    struct Shared {
+        cs: CriticalSection,
+        counter: core::cell::UnsafeCell<u64>,
+    }
+    unsafe impl Sync for Shared {}
+    let shared = Arc::new(Shared {
+        cs: unsafe { core::mem::zeroed() },
+        counter: core::cell::UnsafeCell::new(0),
+    });
+    unsafe { InitializeCriticalSection(&shared.cs as *const CriticalSection as *mut CriticalSection) };
+
+    const THREADS: usize = 6;
+    const ITERS: u64 = 2000;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let entry = code_buf as u64;
+    let mut handles = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        let s = Arc::clone(&shared);
+        let b = Arc::clone(&barrier);
+        handles.push(
+            std::thread::Builder::new()
+                .name("cs_stress".into())
+                .spawn(move || {
+                    let _teb = win32_rt::teb::current();
+                    b.wait();
+                    unsafe {
+                        jit::force(1);
+                        emu_run_full(
+                            entry,
+                            [
+                                &s.cs as *const CriticalSection as u64,
+                                s.counter.get() as u64,
+                                ITERS,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ],
+                            [0; 4],
+                            [0; 8],
+                        );
+                        jit::force(0);
+                    }
+                })
+                .unwrap(),
+        );
+    }
+    for jh in handles {
+        jh.join().unwrap();
+    }
+
+    assert_eq!(unsafe { *shared.counter.get() }, (THREADS as u64) * ITERS);
+    assert_eq!(shared.cs.lock_count.load(Ordering::Acquire), -1);
+    assert_eq!(shared.cs.recursion_count.load(Ordering::Acquire), 0);
+    assert_eq!(shared.cs.owning_thread.load(Ordering::Acquire), 0);
+
+    for va in [t_enter, t_try, t_leave] {
+        crate::exe::unregister_native_va(va);
+    }
+}
+
 /// Difftest (translator vs interpreter) for per-site 2-way indirect-branch inline caches:
 /// covers `call rax`, `call [rcx]`, `jmp rax`, `jmp [rcx]`, and `ret` (both RAS-on, RAS-desync
 /// `push target; ret`, and RAS-off), across monomorphic steady state, 2-way polymorphic
