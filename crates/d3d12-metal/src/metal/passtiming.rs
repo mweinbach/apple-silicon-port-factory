@@ -1,4 +1,4 @@
-//! Per-encoder GPU intervals (`AW2_PASS_TIMING=1`, diagnostics).
+//! Per-encoder GPU intervals (`PORT_PASS_TIMING=1`, legacy alias `AW2_PASS_TIMING`, diagnostics).
 //!
 //! Every encoder writes a relaxed-granularity timestamp when it opens and
 //! before it ends (relaxed timestamps snap to encoder boundaries and don't
@@ -251,16 +251,27 @@ pub fn frame_mark() {
     LIST_ORD.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_PASS_TIMING").is_some_and(|v| v != "0"))
+fn enabled_from_env() -> bool {
+    super::env_canonical_or_alias("PORT_PASS_TIMING", "AW2_PASS_TIMING")
+        .is_some_and(|v| super::parse_bool_knob(&v))
 }
 
-/// `AW2_PASS_TIMING=2`: give every dispatch/draw its own encoder so each is
-/// timed alone (serializes the GPU; per-shader cost ranking only).
+fn split_from_env() -> bool {
+    super::env_canonical_or_alias("PORT_PASS_TIMING", "AW2_PASS_TIMING")
+        .is_some_and(|v| v.trim() == "2")
+}
+
+pub fn enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(enabled_from_env)
+}
+
+/// `PORT_PASS_TIMING=2` (legacy alias `AW2_PASS_TIMING=2`): give every
+/// dispatch/draw its own encoder so each is timed alone (serializes the GPU;
+/// per-shader cost ranking only).
 pub fn split() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_PASS_TIMING").is_some_and(|v| v == "2"))
+    *ON.get_or_init(split_from_env)
 }
 
 impl PassLog {
@@ -862,5 +873,55 @@ mod tests {
             assert_eq!(heaps, 8, "passtiming must allocate strictly 8 MTL4CounterHeaps on AGX");
             assert_eq!(per_heap, 8, "each 4096-entry heap must expose 8 slices of 512 timestamps");
         }
+    }
+
+    #[test]
+    fn port_pass_timing_precedence_canonical_beats_alias() {
+        let _lock = super::super::env_test_lock();
+        let prev_p = std::env::var_os("PORT_PASS_TIMING");
+        let prev_a = std::env::var_os("AW2_PASS_TIMING");
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("PORT_PASS_TIMING", v),
+                    None => std::env::remove_var("PORT_PASS_TIMING"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("AW2_PASS_TIMING", v),
+                    None => std::env::remove_var("AW2_PASS_TIMING"),
+                }
+            }
+        }
+        let _restore = Restore(prev_p, prev_a);
+
+        std::env::remove_var("PORT_PASS_TIMING");
+        std::env::remove_var("AW2_PASS_TIMING");
+        assert!(!enabled_from_env());
+        assert!(!split_from_env());
+
+        // Legacy alias still works.
+        std::env::set_var("AW2_PASS_TIMING", "1");
+        assert!(enabled_from_env());
+        assert!(!split_from_env());
+        std::env::set_var("AW2_PASS_TIMING", "2");
+        assert!(enabled_from_env());
+        assert!(split_from_env());
+
+        // Canonical overrides alias (off beats split, split beats off).
+        std::env::set_var("PORT_PASS_TIMING", "0");
+        assert!(!enabled_from_env());
+        assert!(!split_from_env());
+
+        std::env::set_var("AW2_PASS_TIMING", "0");
+        std::env::set_var("PORT_PASS_TIMING", "2");
+        assert!(enabled_from_env());
+        assert!(split_from_env());
+
+        // Empty canonical falls back to alias.
+        std::env::set_var("PORT_PASS_TIMING", "");
+        std::env::set_var("AW2_PASS_TIMING", "1");
+        assert!(enabled_from_env());
+        assert!(!split_from_env());
     }
 }

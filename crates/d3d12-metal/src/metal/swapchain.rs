@@ -42,14 +42,16 @@ unsafe impl Sync for LayerRef {}
 
 const RING: usize = 4;
 
+/// Read `PORT_VSYNC` (legacy alias `AW2_VSYNC`; default on). Returns `true` when
+/// VSync is explicitly disabled (`0`, `false`, `no`, `off`).
+fn vsync_disabled_from_env() -> bool {
+    super::env_canonical_or_alias("PORT_VSYNC", "AW2_VSYNC")
+        .is_some_and(|v| !super::parse_bool_knob(&v))
+}
+
 fn vsync_disabled_by_env() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        matches!(
-            std::env::var("AW2_VSYNC").as_deref(),
-            Ok("0") | Ok("false") | Ok("off")
-        )
-    })
+    *V.get_or_init(vsync_disabled_from_env)
 }
 
 /// `AW2_PRESENT_OFF_MAIN`: offload sync-0 `present_async` back-buffer ->
@@ -1518,5 +1520,47 @@ mod tests {
 
         d.remove_resident(ProtocolObject::from_ref(&*src));
         d.remove_resident(ProtocolObject::from_ref(&*dst));
+    }
+
+    #[test]
+    fn port_vsync_precedence_canonical_beats_alias() {
+        let _lock = super::super::env_test_lock();
+        let prev_p = std::env::var_os("PORT_VSYNC");
+        let prev_a = std::env::var_os("AW2_VSYNC");
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("PORT_VSYNC", v),
+                    None => std::env::remove_var("PORT_VSYNC"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("AW2_VSYNC", v),
+                    None => std::env::remove_var("AW2_VSYNC"),
+                }
+            }
+        }
+        let _restore = Restore(prev_p, prev_a);
+
+        std::env::remove_var("PORT_VSYNC");
+        std::env::remove_var("AW2_VSYNC");
+        assert!(!vsync_disabled_from_env(), "VSync must default to enabled");
+
+        // Legacy alias still disables VSync.
+        std::env::set_var("AW2_VSYNC", "0");
+        assert!(vsync_disabled_from_env());
+
+        // Canonical overrides alias in both directions.
+        std::env::set_var("PORT_VSYNC", "1");
+        assert!(!vsync_disabled_from_env(), "PORT_VSYNC=1 must beat AW2_VSYNC=0");
+
+        std::env::set_var("AW2_VSYNC", "1");
+        std::env::set_var("PORT_VSYNC", "off");
+        assert!(vsync_disabled_from_env(), "PORT_VSYNC=off must beat AW2_VSYNC=1");
+
+        // Empty canonical falls back to alias.
+        std::env::set_var("PORT_VSYNC", "");
+        std::env::set_var("AW2_VSYNC", "false");
+        assert!(vsync_disabled_from_env());
     }
 }

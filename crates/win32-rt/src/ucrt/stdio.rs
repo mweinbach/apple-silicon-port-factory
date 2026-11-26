@@ -11,7 +11,7 @@
 //! * One process-wide recursive lock serializes all stream operations and
 //!   backs `_lock_file`/`_unlock_file` (simple, deadlock-free).
 
-use super::errno::{self, EACCES, EBADF, EINVAL, ENOENT, EPIPE};
+use super::errno::{self, EACCES, EBADF, EILSEQ, EINVAL, ENOENT, EPIPE};
 use crate::strings::{from_ansi, from_wide};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -96,9 +96,25 @@ pub const O_WTEXT: i32 = 0x10000;
 pub const O_U16TEXT: i32 = 0x20000;
 pub const O_U8TEXT: i32 = 0x40000;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextMode {
+    Binary,
+    AnsiText,
+    Utf16Le,
+    Utf8,
+}
+
+impl TextMode {
+    fn is_unicode(self) -> bool {
+        matches!(self, TextMode::Utf16Le | TextMode::Utf8)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FdInfo {
-    text: bool,
+    mode: TextMode,
+    /// Original Windows CRT mode constant (`O_BINARY`, `O_TEXT`, `O_WTEXT`, `O_U16TEXT`, `O_U8TEXT`).
+    win_mode: i32,
     /// Translation disabled for ttys/pipes.
     raw: bool,
     temporary: bool,
@@ -117,7 +133,44 @@ struct FdInfo {
     osf_handle: Option<usize>,
 }
 
+#[derive(Default)]
+struct U8Pending {
+    raw: Vec<u8>,
+    low_surrogate: Option<u16>,
+}
+
 static FDS: Mutex<Option<HashMap<i32, (FdInfo, Option<std::path::PathBuf>)>>> = Mutex::new(None);
+static FD_U8_PENDING: Mutex<Option<HashMap<i32, U8Pending>>> = Mutex::new(None);
+
+fn clear_u8_pending(fd: i32) {
+    if let Some(m) = FD_U8_PENDING.lock().unwrap().as_mut() {
+        m.remove(&fd);
+    }
+}
+
+fn take_u8_pending(fd: i32) -> U8Pending {
+    FD_U8_PENDING
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.remove(&fd))
+        .unwrap_or_default()
+}
+
+fn store_u8_pending(fd: i32, pending: U8Pending) {
+    if !pending.raw.is_empty() || pending.low_surrogate.is_some() {
+        FD_U8_PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(fd, pending);
+    }
+}
+
+fn has_u8_pending(fd: i32) -> bool {
+    FD_U8_PENDING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&fd))
+        .is_some_and(|p| !p.raw.is_empty() || p.low_surrogate.is_some())
+}
 static FMODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(O_TEXT);
 static COMMODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -132,7 +185,7 @@ fn fd_info(fd: i32) -> FdInfo {
         let mut st: libc::stat = std::mem::zeroed();
         libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFREG
     };
-    let i = FdInfo { text: true, raw, temporary: false, osf_handle: None };
+    let i = FdInfo { mode: TextMode::AnsiText, win_mode: O_TEXT, raw, temporary: false, osf_handle: None };
     if (0..=2).contains(&fd) {
         m.insert(fd, (i, None));
     }
@@ -152,18 +205,142 @@ fn bad_fd() -> i32 {
     -1
 }
 
+/// Write all of `buf` using `write_fn`, retrying `EINTR` and looping on short writes.
+/// Returns `Err(host_errno)` on error or zero-byte progress (`EIO`).
+fn write_all_with<F>(mut buf: &[u8], mut write_fn: F) -> Result<(), i32>
+where
+    F: FnMut(&[u8]) -> Result<usize, i32>,
+{
+    while !buf.is_empty() {
+        match write_fn(buf) {
+            Ok(0) => return Err(libc::EIO),
+            Ok(n) => buf = &buf[n..],
+            Err(libc::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Detect or emit BOM for Unicode text modes (`_O_WTEXT`, `fopen(..., "..., ccs=...")`).
+/// Matches MSVC UCRT BOM precedence: an existing BOM overrides the requested encoding;
+/// creating/truncating a new writable file with BOM enabled writes the UTF-16LE or UTF-8 BOM.
+/// When `ansi_if_no_bom` is true (low-level `_open(..., _O_WTEXT)`), an existing file without a
+/// BOM falls back to `TextMode::AnsiText`; for `fopen(..., "..., ccs=UNICODE")` it stays UTF-16LE.
+/// Returns `Err(host_errno)` if writing the BOM fails (truncating any partial BOM back to 0).
+unsafe fn apply_unicode_bom(
+    fd: i32,
+    oflag: i32,
+    requested: TextMode,
+    write_bom_on_new: bool,
+    detect_bom: bool,
+    ansi_if_no_bom: bool,
+) -> Result<TextMode, i32> {
+    let mut st: libc::stat = std::mem::zeroed();
+    if libc::fstat(fd, &mut st) != 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Ok(requested);
+    }
+    let acc = oflag & 3;
+    let can_write = acc == O_WRONLY || acc == O_RDWR;
+    let can_read = acc == O_RDONLY || acc == O_RDWR;
+    if st.st_size == 0 {
+        if can_write && write_bom_on_new {
+            let bom: &[u8] = match requested {
+                TextMode::Utf16Le => &[0xFF, 0xFE],
+                TextMode::Utf8 => &[0xEF, 0xBB, 0xBF],
+                _ => &[],
+            };
+            if !bom.is_empty() {
+                if let Err(e) = write_all_with(bom, |chunk| {
+                    let n = libc::write(fd, chunk.as_ptr() as *const c_void, chunk.len());
+                    if n < 0 {
+                        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+                    } else {
+                        Ok(n as usize)
+                    }
+                }) {
+                    let _ = libc::ftruncate(fd, 0);
+                    return Err(e);
+                }
+            }
+            return Ok(requested);
+        }
+        return Ok(if !can_write && ansi_if_no_bom { TextMode::AnsiText } else { requested });
+    }
+    if detect_bom {
+        let mut head = [0u8; 3];
+        let n = loop {
+            let r = libc::pread(fd, head.as_mut_ptr() as *mut c_void, 3, 0);
+            if r < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+                if e == libc::EINTR {
+                    continue;
+                }
+                return Err(e);
+            }
+            break r;
+        };
+        let is_append = (oflag & O_APPEND) != 0;
+        if n >= 2 && head[0] == 0xFF && head[1] == 0xFE {
+            if !is_append || can_read {
+                let _ = libc::lseek(fd, 2, libc::SEEK_SET);
+            }
+            return Ok(TextMode::Utf16Le);
+        }
+        if n >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF {
+            if !is_append || can_read {
+                let _ = libc::lseek(fd, 3, libc::SEEK_SET);
+            }
+            return Ok(TextMode::Utf8);
+        }
+        if ansi_if_no_bom {
+            return Ok(TextMode::AnsiText);
+        }
+    }
+    Ok(requested)
+}
+
 pub fn open_host(win_path: &str, oflag: i32, pmode: i32) -> i32 {
+    let wtext = (oflag & O_WTEXT) != 0;
+    open_host_bom(win_path, oflag, pmode, wtext, wtext, wtext)
+}
+
+fn open_host_bom(
+    win_path: &str,
+    oflag: i32,
+    pmode: i32,
+    write_bom: bool,
+    detect_bom: bool,
+    ansi_if_no_bom: bool,
+) -> i32 {
     let Some(host) = crate::path::to_host(win_path) else {
         if crate::path::device_name(win_path) == Some("NUL") {
-            return open_host_path(std::path::Path::new("/dev/null"), oflag, pmode);
+            return open_host_path(
+                std::path::Path::new("/dev/null"),
+                oflag,
+                pmode,
+                write_bom,
+                detect_bom,
+                ansi_if_no_bom,
+            );
         }
         errno::set(ENOENT);
         return -1;
     };
-    open_host_path(&host, oflag, pmode)
+    open_host_path(&host, oflag, pmode, write_bom, detect_bom, ansi_if_no_bom)
 }
 
-fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32) -> i32 {
+fn open_host_path(
+    host: &std::path::Path,
+    oflag: i32,
+    pmode: i32,
+    write_bom: bool,
+    detect_bom: bool,
+    ansi_if_no_bom: bool,
+) -> i32 {
     let acc = oflag & 3;
     let mutating = acc != O_RDONLY || (oflag & (O_APPEND | O_CREAT | O_TRUNC | O_TEMPORARY)) != 0;
     if mutating && crate::path::is_protected_host_write(host) {
@@ -191,25 +368,90 @@ fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32) -> i32 {
     if oflag & O_EXCL != 0 {
         f |= libc::O_EXCL;
     }
+    // If BOM detection is requested on a write-only append/existing file, open RDWR internally
+    // so `pread` can inspect the BOM at offset 0.
+    let mut upgraded_rdwr = false;
+    if detect_bom && acc == O_WRONLY && (oflag & O_TRUNC) == 0 {
+        f = (f & !libc::O_ACCMODE) | libc::O_RDWR;
+        upgraded_rdwr = true;
+    }
     f |= libc::O_CLOEXEC;
     let mode = if pmode & 0x80 != 0 { 0o644 } else { 0o444 }; // _S_IWRITE
     let c = std::ffi::CString::new(host.as_os_str().as_encoded_bytes()).unwrap();
-    let fd = unsafe { libc::open(c.as_ptr(), f, mode as libc::c_uint) };
+    let mut fd = unsafe { libc::open(c.as_ptr(), f, mode as libc::c_uint) };
+    let mut bom_readable = true;
+    if fd < 0 && upgraded_rdwr {
+        // Microsoft Learn `fopen(..., "a, ccs=...")`: if read/write open fails (e.g. a
+        // write-only file denying read access), retry with write-only access and keep the
+        // requested Unicode encoding without BOM inspection.
+        let wronly_f = (f & !libc::O_ACCMODE) | libc::O_WRONLY;
+        fd = unsafe { libc::open(c.as_ptr(), wronly_f, mode as libc::c_uint) };
+        bom_readable = false;
+    }
     if fd < 0 {
         errno::set_from_host();
         return -1;
     }
-    let text = if oflag & O_BINARY != 0 {
-        false
-    } else if oflag & (O_TEXT | O_WTEXT | O_U16TEXT | O_U8TEXT) != 0 {
-        true
+    let (req_mode, win_mode) = if (oflag & O_BINARY) != 0 {
+        (TextMode::Binary, O_BINARY)
+    } else if (oflag & O_U8TEXT) != 0 {
+        (TextMode::Utf8, O_U8TEXT)
+    } else if (oflag & O_U16TEXT) != 0 {
+        (TextMode::Utf16Le, O_U16TEXT)
+    } else if (oflag & O_WTEXT) != 0 {
+        (TextMode::Utf16Le, O_WTEXT)
+    } else if (oflag & O_TEXT) != 0 {
+        (TextMode::AnsiText, O_TEXT)
     } else {
-        FMODE.load(std::sync::atomic::Ordering::Relaxed) & O_TEXT != 0
+        let fm = FMODE.load(std::sync::atomic::Ordering::Relaxed);
+        if (fm & O_BINARY) != 0 {
+            (TextMode::Binary, O_BINARY)
+        } else if (fm & O_WTEXT) != 0 {
+            (TextMode::Utf16Le, O_WTEXT)
+        } else {
+            (TextMode::AnsiText, O_TEXT)
+        }
     };
-    if oflag & (O_WTEXT | O_U16TEXT | O_U8TEXT) != 0 {
-        stub!("Unicode text modes (0x{oflag:x}) treated as plain text mode");
-    }
-    set_fd_info(fd, FdInfo { text, raw: false, temporary: oflag & O_TEMPORARY != 0, osf_handle: None }, Some(host.to_path_buf()));
+    let final_mode = if req_mode.is_unicode() {
+        match unsafe {
+            apply_unicode_bom(
+                fd,
+                oflag,
+                req_mode,
+                write_bom,
+                detect_bom && bom_readable,
+                ansi_if_no_bom,
+            )
+        } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { libc::close(fd) };
+                errno::set(errno::from_host(e));
+                return -1;
+            }
+        }
+    } else {
+        req_mode
+    };
+    let final_win_mode = match (win_mode, final_mode) {
+        (O_WTEXT, TextMode::AnsiText) => O_TEXT,
+        (O_WTEXT, TextMode::Utf8) => O_U8TEXT,
+        (O_WTEXT, TextMode::Utf16Le) => O_WTEXT,
+        (O_U8TEXT, TextMode::Utf16Le) => O_U16TEXT,
+        (O_U16TEXT, TextMode::Utf8) => O_U8TEXT,
+        (w, _) => w,
+    };
+    set_fd_info(
+        fd,
+        FdInfo {
+            mode: final_mode,
+            win_mode: final_win_mode,
+            raw: false,
+            temporary: oflag & O_TEMPORARY != 0,
+            osf_handle: None,
+        },
+        Some(host.to_path_buf()),
+    );
     fd
 }
 
@@ -272,6 +514,7 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
         return bad_fd();
     }
     let ent = FDS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&fd);
+    clear_u8_pending(fd);
     if let Some((info, _)) = &ent {
         if let Some(h) = info.osf_handle {
             // Both `_open_osfhandle` and `_get_osfhandle` keep the CRT fd and the `FileObj`
@@ -330,18 +573,25 @@ pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i3
             let _ = libc::fcntl(crt_fd, libc::F_SETFL, cur | libc::O_APPEND);
         }
     }
-    let text = if (flags & O_BINARY) != 0 {
-        false
-    } else if (flags & (O_TEXT | O_WTEXT | O_U16TEXT | O_U8TEXT)) != 0 {
-        true
+    let (mode, win_mode) = if (flags & O_BINARY) != 0 {
+        (TextMode::Binary, O_BINARY)
+    } else if (flags & O_U8TEXT) != 0 {
+        (TextMode::Utf8, O_U8TEXT)
+    } else if (flags & O_U16TEXT) != 0 {
+        (TextMode::Utf16Le, O_U16TEXT)
+    } else if (flags & O_WTEXT) != 0 {
+        (TextMode::Utf16Le, O_WTEXT)
+    } else if (flags & O_TEXT) != 0 {
+        (TextMode::AnsiText, O_TEXT)
     } else {
-        false
+        (TextMode::Binary, O_BINARY)
     };
     let raw = kind != FileKind::Disk;
     set_fd_info(
         crt_fd,
         FdInfo {
-            text,
+            mode,
+            win_mode,
             raw,
             temporary: false,
             osf_handle: Some(osfhandle as usize),
@@ -388,7 +638,8 @@ pub unsafe extern "win64" fn _get_osfhandle(fd: i32) -> isize {
             fd,
             (
                 FdInfo {
-                    text: true,
+                    mode: TextMode::AnsiText,
+                    win_mode: O_TEXT,
                     raw,
                     temporary: false,
                     osf_handle: Some(h as usize),
@@ -423,103 +674,25 @@ unsafe fn wait_pipe_fd_ready(fd: i32, events: libc::c_short, orig_errno: i32) ->
     }
 }
 
-/// Raw read with CRLF->LF translation in text mode.
-pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
-    let info = fd_info(fd);
-    let stage_len = if crate::kernel32::memory::needs_io_write_staging(buf as usize, n) {
-        n.min(1024 * 1024)
-    } else {
-        0
-    };
-    let mut staging = if stage_len > 0 { vec![0u8; stage_len] } else { Vec::new() };
-    let (io_ptr, io_len) = if stage_len > 0 {
-        (staging.as_mut_ptr(), stage_len)
-    } else {
-        (buf, n)
-    };
-    let r = loop {
-        let k = libc::read(fd, io_ptr as *mut c_void, io_len);
+unsafe fn raw_read_retry(fd: i32, buf: *mut u8, n: usize) -> isize {
+    loop {
+        let k = libc::read(fd, buf as *mut c_void, n);
         if k >= 0 {
-            break k;
+            return k;
         }
         let e = *libc::__error();
         if e == libc::EINTR {
             continue;
         }
-        if (e == libc::EAGAIN || e == libc::EWOULDBLOCK)
-            && wait_pipe_fd_ready(fd, libc::POLLIN, e)
-        {
+        if (e == libc::EAGAIN || e == libc::EWOULDBLOCK) && wait_pipe_fd_ready(fd, libc::POLLIN, e) {
             continue;
         }
         errno::set_from_host();
         return -1;
-    };
-    if r == 0 || !info.text || info.raw {
-        if stage_len > 0 && r > 0 {
-            if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(buf, &staging[..r as usize]) {
-                *libc::__error() = e;
-                errno::set_from_host();
-                return -1;
-            }
-        }
-        return r;
     }
-    let s = std::slice::from_raw_parts_mut(io_ptr, r as usize);
-    let mut w = 0;
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] == b'\r' {
-            if i + 1 < s.len() {
-                if s[i + 1] == b'\n' {
-                    i += 1;
-                    continue;
-                }
-            } else {
-                // CR at end of buffer: peek one byte.
-                let mut nb = 0u8;
-                let k = libc::read(fd, &mut nb as *mut u8 as *mut c_void, 1);
-                if k == 1 {
-                    if nb == b'\n' {
-                        s[w] = b'\n';
-                        w += 1;
-                        i += 1;
-                        continue;
-                    }
-                    libc::lseek(fd, -1, libc::SEEK_CUR);
-                }
-            }
-        }
-        s[w] = s[i];
-        w += 1;
-        i += 1;
-    }
-    if stage_len > 0 && w > 0 {
-        if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(buf, &staging[..w]) {
-            *libc::__error() = e;
-            errno::set_from_host();
-            return -1;
-        }
-    }
-    w as isize
 }
 
-/// Raw write with LF->CRLF translation in text mode. Returns source bytes.
-pub unsafe fn write_fd(fd: i32, data: &[u8]) -> isize {
-    let info = fd_info(fd);
-    let tmp;
-    let out: &[u8] = if info.text && !info.raw && data.contains(&b'\n') {
-        let mut v = Vec::with_capacity(data.len() + 16);
-        for &b in data {
-            if b == b'\n' {
-                v.push(b'\r');
-            }
-            v.push(b);
-        }
-        tmp = v;
-        &tmp
-    } else {
-        data
-    };
+unsafe fn raw_write_all(fd: i32, out: &[u8]) -> bool {
     let mut off = 0;
     while off < out.len() {
         let r = libc::write(fd, out[off..].as_ptr() as *const c_void, out.len() - off);
@@ -528,21 +701,580 @@ pub unsafe fn write_fd(fd: i32, data: &[u8]) -> isize {
             if e == libc::EINTR {
                 continue;
             }
-            if (e == libc::EAGAIN || e == libc::EWOULDBLOCK)
-                && wait_pipe_fd_ready(fd, libc::POLLOUT, e)
-            {
+            if (e == libc::EAGAIN || e == libc::EWOULDBLOCK) && wait_pipe_fd_ready(fd, libc::POLLOUT, e) {
                 continue;
             }
             errno::set_from_host();
-            return -1;
+            return false;
         }
         if r == 0 {
             errno::set(EPIPE);
-            return -1;
+            return false;
         }
         off += r as usize;
     }
-    data.len() as isize
+    true
+}
+
+/// Raw read with CRLF->LF and Unicode (`_O_WTEXT`/`_O_U16TEXT`/`_O_U8TEXT`) translation.
+pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
+    read_fd_tracked(fd, buf, n, false).0
+}
+
+/// Like [`read_fd`], and when `track_pos` is true on a seekable translated descriptor,
+/// also returns a `len + 1` table mapping each translated buffer index to the physical
+/// file byte offset where its source character starts (with the final entry equal to the
+/// physical offset after the last translated byte).
+unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (isize, Vec<i64>) {
+    let info = fd_info(fd);
+    if n % 2 != 0 && matches!(info.mode, TextMode::Utf16Le | TextMode::Utf8) {
+        errno::set(EINVAL);
+        return (-1, Vec::new());
+    }
+    let stage_len = if crate::kernel32::memory::needs_io_write_staging(buf as usize, n) {
+        n.min(1024 * 1024)
+    } else {
+        0
+    };
+    if stage_len > 0 {
+        let mut staging = vec![0u8; stage_len];
+        let (r, pos) = read_fd_tracked_inner(fd, info, staging.as_mut_ptr(), stage_len, track_pos);
+        if r > 0 {
+            if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(buf, &staging[..r as usize]) {
+                *libc::__error() = e;
+                errno::set_from_host();
+                return (-1, Vec::new());
+            }
+        }
+        return (r, pos);
+    }
+    read_fd_tracked_inner(fd, info, buf, n, track_pos)
+}
+
+unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, track_pos: bool) -> (isize, Vec<i64>) {
+    read_fd_tracked_inner_with(fd, info, buf, n, track_pos, |f, b, l| unsafe { raw_read_retry(f, b, l) })
+}
+
+unsafe fn read_fd_tracked_inner_with(
+    fd: i32,
+    info: FdInfo,
+    buf: *mut u8,
+    n: usize,
+    track_pos: bool,
+    mut read_raw: impl FnMut(i32, *mut u8, usize) -> isize,
+) -> (isize, Vec<i64>) {
+    match info.mode {
+        TextMode::Binary => {
+            let mut pend = take_u8_pending(fd);
+            if pend.raw.is_empty() {
+                return (read_raw(fd, buf, n), Vec::new());
+            }
+            let take = pend.raw.len().min(n);
+            std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
+            pend.raw.drain(..take);
+            store_u8_pending(fd, pend);
+            (take as isize, Vec::new())
+        }
+        TextMode::AnsiText => {
+            let mut pend = take_u8_pending(fd);
+            if info.raw {
+                if pend.raw.is_empty() {
+                    return (read_raw(fd, buf, n), Vec::new());
+                }
+                let take = pend.raw.len().min(n);
+                std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
+                pend.raw.drain(..take);
+                store_u8_pending(fd, pend);
+                return (take as isize, Vec::new());
+            }
+            let raw_fd_pos = if track_pos { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
+            let start_pos = if raw_fd_pos >= 0 { (raw_fd_pos - pend.raw.len() as i64).max(0) } else { -1 };
+            let total = if !pend.raw.is_empty() {
+                let take = pend.raw.len().min(n);
+                std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
+                pend.raw.drain(..take);
+                take
+            } else {
+                let r = read_raw(fd, buf, n);
+                if r <= 0 {
+                    store_u8_pending(fd, pend);
+                    return (r, Vec::new());
+                }
+                r as usize
+            };
+            let mut src_pos = if start_pos >= 0 { Vec::with_capacity(total + 1) } else { Vec::new() };
+            let mut extra_fd = 0usize;
+            let s = std::slice::from_raw_parts_mut(buf, total);
+            let mut w = 0;
+            let mut i = 0;
+            while i < s.len() {
+                if s[i] == b'\r' {
+                    if i + 1 < s.len() {
+                        if s[i + 1] == b'\n' {
+                            if start_pos >= 0 {
+                                src_pos.push(start_pos + i as i64);
+                            }
+                            s[w] = b'\n';
+                            w += 1;
+                            i += 2;
+                            continue;
+                        }
+                    } else if !pend.raw.is_empty() {
+                        if pend.raw[0] == b'\n' {
+                            pend.raw.remove(0);
+                            if start_pos >= 0 {
+                                src_pos.push(start_pos + i as i64);
+                            }
+                            s[w] = b'\n';
+                            w += 1;
+                            i += 1;
+                            extra_fd = 1;
+                            continue;
+                        }
+                    } else {
+                        let mut nb = 0u8;
+                        let k = read_raw(fd, &mut nb, 1);
+                        if k == 1 {
+                            if nb == b'\n' {
+                                if start_pos >= 0 {
+                                    src_pos.push(start_pos + i as i64);
+                                }
+                                s[w] = b'\n';
+                                w += 1;
+                                i += 1;
+                                extra_fd = 1;
+                                continue;
+                            }
+                            if libc::lseek(fd, -1, libc::SEEK_CUR) < 0 {
+                                pend.raw.push(nb);
+                            }
+                        }
+                    }
+                }
+                if start_pos >= 0 {
+                    src_pos.push(start_pos + i as i64);
+                }
+                s[w] = s[i];
+                w += 1;
+                i += 1;
+            }
+            store_u8_pending(fd, pend);
+            if start_pos >= 0 {
+                src_pos.push(start_pos + (total + extra_fd) as i64);
+            }
+            (w as isize, src_pos)
+        }
+        TextMode::Utf16Le => {
+            // MSVC UCRT requires even byte count for UTF-16 Unicode modes.
+            if n % 2 != 0 {
+                errno::set(EINVAL);
+                return (-1, Vec::new());
+            }
+            if n == 0 {
+                return (0, Vec::new());
+            }
+            let mut pend = take_u8_pending(fd);
+            let raw_fd_pos = if track_pos && !info.raw { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
+            let start_pos = if raw_fd_pos >= 0 { (raw_fd_pos - pend.raw.len() as i64).max(0) } else { -1 };
+            let mut total = 0usize;
+            if !pend.raw.is_empty() {
+                let take = pend.raw.len().min(n);
+                std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
+                pend.raw.drain(..take);
+                total = take;
+            }
+            if total == 0 || (total < n && total % 2 == 1) {
+                let r = read_raw(fd, buf.add(total), n - total);
+                if r < 0 {
+                    let saved_err = errno::get();
+                    if total > 0 {
+                        let mut restored = Vec::with_capacity(total + pend.raw.len());
+                        restored.extend_from_slice(std::slice::from_raw_parts(buf, total));
+                        restored.extend_from_slice(&pend.raw);
+                        pend.raw = restored;
+                    }
+                    store_u8_pending(fd, pend);
+                    errno::set(saved_err);
+                    return (-1, Vec::new());
+                }
+                total += r as usize;
+            }
+            if total == 0 {
+                store_u8_pending(fd, pend);
+                return (0, Vec::new());
+            }
+            // If an odd byte arrived, read 1 more byte to complete the UTF-16LE code unit;
+            // on error with no complete code units yet, preserve the partial byte and propagate -1
+            // so callers see an error rather than false EOF.
+            if total % 2 == 1 {
+                let mut extra = 0u8;
+                let k = if total < n { read_raw(fd, &mut extra, 1) } else { 0 };
+                if k == 1 {
+                    *buf.add(total) = extra;
+                    total += 1;
+                } else {
+                    let saved_err = errno::get();
+                    let stray = *buf.add(total - 1);
+                    pend.raw.insert(0, stray);
+                    total -= 1;
+                    if k < 0 && total == 0 {
+                        store_u8_pending(fd, pend);
+                        errno::set(saved_err);
+                        return (-1, Vec::new());
+                    }
+                    if k < 0 {
+                        errno::set(saved_err);
+                    }
+                }
+            }
+            if info.raw {
+                store_u8_pending(fd, pend);
+                return (total as isize, Vec::new());
+            }
+            let units = total / 2;
+            let mut src_pos = if start_pos >= 0 { Vec::with_capacity(total + 1) } else { Vec::new() };
+            let mut extra_fd = 0usize;
+            let mut w = 0usize;
+            let mut i = 0usize;
+            while i < units {
+                let unit_phys = start_pos + (i * 2) as i64;
+                let u = u16::from_le_bytes([*buf.add(i * 2), *buf.add(i * 2 + 1)]);
+                if u == 0x000D {
+                    if i + 1 < units {
+                        let next_u = u16::from_le_bytes([*buf.add((i + 1) * 2), *buf.add((i + 1) * 2 + 1)]);
+                        if next_u == 0x000A {
+                            let lf = 0x000Au16.to_le_bytes();
+                            *buf.add(w * 2) = lf[0];
+                            *buf.add(w * 2 + 1) = lf[1];
+                            if start_pos >= 0 {
+                                src_pos.push(unit_phys);
+                                src_pos.push(unit_phys);
+                            }
+                            w += 1;
+                            i += 2;
+                            continue;
+                        }
+                    } else if pend.raw.len() >= 2 {
+                        if u16::from_le_bytes([pend.raw[0], pend.raw[1]]) == 0x000A {
+                            pend.raw.drain(..2);
+                            let lf = 0x000Au16.to_le_bytes();
+                            *buf.add(w * 2) = lf[0];
+                            *buf.add(w * 2 + 1) = lf[1];
+                            if start_pos >= 0 {
+                                src_pos.push(unit_phys);
+                                src_pos.push(unit_phys);
+                            }
+                            w += 1;
+                            i += 1;
+                            extra_fd += 2;
+                            continue;
+                        }
+                    } else {
+                        let mut peek = [0u8; 2];
+                        let pre = pend.raw.len();
+                        if pre == 1 {
+                            peek[0] = pend.raw[0];
+                        }
+                        let mut have = pre;
+                        let mut pk_total = 0usize;
+                        while have < 2 {
+                            let pk = read_raw(fd, peek.as_mut_ptr().add(have), 2 - have);
+                            if pk <= 0 {
+                                break;
+                            }
+                            have += pk as usize;
+                            pk_total += pk as usize;
+                        }
+                        if have == 2 && u16::from_le_bytes(peek) == 0x000A {
+                            pend.raw.clear();
+                            let lf = 0x000Au16.to_le_bytes();
+                            *buf.add(w * 2) = lf[0];
+                            *buf.add(w * 2 + 1) = lf[1];
+                            if start_pos >= 0 {
+                                src_pos.push(unit_phys);
+                                src_pos.push(unit_phys);
+                            }
+                            w += 1;
+                            i += 1;
+                            extra_fd += 2;
+                            continue;
+                        }
+                        // Non-LF lookahead (or partial 1-byte read): rewind seekable fd, or retain
+                        // in per-fd pending input when seeking is unavailable (e.g. pipes/FIFOs).
+                        if pk_total > 0 {
+                            let from_fd = &peek[pre..have];
+                            if pre > 0 || libc::lseek(fd, -(pk_total as i64), libc::SEEK_CUR) < 0 {
+                                pend.raw.extend_from_slice(from_fd);
+                            }
+                        }
+                    }
+                }
+                let bytes = u.to_le_bytes();
+                *buf.add(w * 2) = bytes[0];
+                *buf.add(w * 2 + 1) = bytes[1];
+                if start_pos >= 0 {
+                    src_pos.push(unit_phys);
+                    src_pos.push(unit_phys);
+                }
+                w += 1;
+                i += 1;
+            }
+            store_u8_pending(fd, pend);
+            if start_pos >= 0 {
+                src_pos.push(start_pos + (units * 2 + extra_fd) as i64);
+            }
+            ((w * 2) as isize, src_pos)
+        }
+        TextMode::Utf8 => {
+            if n % 2 != 0 {
+                errno::set(EINVAL);
+                return (-1, Vec::new());
+            }
+            if n == 0 {
+                return (0, Vec::new());
+            }
+            let max_u16 = n / 2;
+            let mut pend = take_u8_pending(fd);
+            let raw_fd_pos = if track_pos { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
+            let start_pos = if raw_fd_pos >= 0 { (raw_fd_pos - pend.raw.len() as i64).max(0) } else { -1 };
+            let mut src_pos = if start_pos >= 0 { Vec::with_capacity(n + 1) } else { Vec::new() };
+            let mut extra_fd = 0usize;
+            let mut out_u16: Vec<u16> = Vec::with_capacity(max_u16);
+            if let Some(lo) = pend.low_surrogate.take() {
+                out_u16.push(lo);
+                if start_pos >= 0 {
+                    src_pos.push(start_pos);
+                    src_pos.push(start_pos);
+                }
+            }
+            let mut raw_buf = std::mem::take(&mut pend.raw);
+            if out_u16.len() < max_u16 && raw_buf.is_empty() {
+                let mut tmp = vec![0u8; max_u16.max(4)];
+                let r = read_raw(fd, tmp.as_mut_ptr(), tmp.len());
+                if r < 0 {
+                    store_u8_pending(fd, U8Pending { raw: raw_buf, low_surrogate: None });
+                    return if out_u16.is_empty() {
+                        (-1, Vec::new())
+                    } else {
+                        for (idx, u) in out_u16.iter().enumerate() {
+                            let bytes = u.to_le_bytes();
+                            *buf.add(idx * 2) = bytes[0];
+                            *buf.add(idx * 2 + 1) = bytes[1];
+                        }
+                        if start_pos >= 0 {
+                            src_pos.push(start_pos);
+                        }
+                        ((out_u16.len() * 2) as isize, src_pos)
+                    };
+                }
+                raw_buf.extend_from_slice(&tmp[..r as usize]);
+            }
+            let mut consumed = 0usize;
+            while consumed < raw_buf.len() && out_u16.len() < max_u16 {
+                let char_phys = start_pos + (consumed + extra_fd) as i64;
+                let rem = &raw_buf[consumed..];
+                if !info.raw && rem[0] == b'\r' {
+                    if rem.len() >= 2 {
+                        if rem[1] == b'\n' {
+                            out_u16.push(b'\n' as u16);
+                            if start_pos >= 0 {
+                                src_pos.push(char_phys);
+                                src_pos.push(char_phys);
+                            }
+                            consumed += 2;
+                            continue;
+                        }
+                    } else {
+                        let mut nb = 0u8;
+                        let pk = read_raw(fd, &mut nb, 1);
+                        if pk == 1 {
+                            if nb == b'\n' {
+                                out_u16.push(b'\n' as u16);
+                                if start_pos >= 0 {
+                                    src_pos.push(char_phys);
+                                    src_pos.push(char_phys);
+                                }
+                                consumed += 1;
+                                extra_fd += 1;
+                                continue;
+                            }
+                            raw_buf.push(nb);
+                            out_u16.push(b'\r' as u16);
+                            if start_pos >= 0 {
+                                src_pos.push(char_phys);
+                                src_pos.push(char_phys);
+                            }
+                            consumed += 1;
+                            continue;
+                        }
+                    }
+                }
+                let (ch, step) = if rem[0] < 0x80 {
+                    (rem[0] as char, 1)
+                } else {
+                    // Validate at most 4 bytes per iteration (O(1) per character) so decoding
+                    // stays linear on large `_read`/`fread` buffers.
+                    let win = &rem[..rem.len().min(4)];
+                    match std::str::from_utf8(win) {
+                        Ok(s) => {
+                            let c = s.chars().next().unwrap();
+                            (c, c.len_utf8())
+                        }
+                        Err(e) if e.valid_up_to() > 0 => {
+                            let s = std::str::from_utf8(&win[..e.valid_up_to()]).unwrap();
+                            let c = s.chars().next().unwrap();
+                            (c, c.len_utf8())
+                        }
+                        Err(e) => match e.error_len() {
+                            Some(bad_len) => ('\u{FFFD}', bad_len),
+                            None => {
+                                if out_u16.is_empty() {
+                                    // Incomplete UTF-8 sequence at end of buffer: fetch up to
+                                    // 4 - rem.len() more bytes so a valid sequence spanning reads
+                                    // decodes cleanly.
+                                    let want = 4usize.saturating_sub(rem.len()).max(1);
+                                    let mut more = [0u8; 4];
+                                    let k = read_raw(fd, more.as_mut_ptr(), want);
+                                    if k > 0 {
+                                        raw_buf.extend_from_slice(&more[..k as usize]);
+                                        continue;
+                                    }
+                                    if k < 0 {
+                                        // Propagate read error (preserving the unread incomplete
+                                        // UTF-8 prefix so retries can complete it cleanly).
+                                        let saved_err = errno::get();
+                                        let left = raw_buf.len() - consumed;
+                                        if pend.low_surrogate.is_some()
+                                            || libc::lseek(fd, -(left as i64), libc::SEEK_CUR) < 0
+                                        {
+                                            pend.raw = raw_buf[consumed..].to_vec();
+                                        }
+                                        store_u8_pending(fd, pend);
+                                        errno::set(saved_err);
+                                        return (-1, Vec::new());
+                                    }
+                                    // True EOF mid-sequence: emit replacement char and consume truncated bytes.
+                                    out_u16.push(0xFFFD);
+                                    if start_pos >= 0 {
+                                        src_pos.push(char_phys);
+                                        src_pos.push(char_phys);
+                                    }
+                                    consumed = raw_buf.len();
+                                }
+                                break;
+                            }
+                        },
+                    }
+                };
+                let mut tmp = [0u16; 2];
+                let enc = ch.encode_utf16(&mut tmp);
+                if out_u16.len() + enc.len() > max_u16 {
+                    // Only happens when a surrogate pair (2 units) lands on the last 1-unit slot.
+                    // Emit the high surrogate now and retain the low surrogate for the next read
+                    // so small (2-byte) or unbuffered reads never stall with 0 bytes (false EOF).
+                    out_u16.push(enc[0]);
+                    if start_pos >= 0 {
+                        src_pos.push(char_phys);
+                        src_pos.push(char_phys);
+                    }
+                    pend.low_surrogate = Some(enc[1]);
+                    consumed += step;
+                    break;
+                }
+                out_u16.extend_from_slice(enc);
+                if start_pos >= 0 {
+                    for _ in 0..(enc.len() * 2) {
+                        src_pos.push(char_phys);
+                    }
+                }
+                consumed += step;
+            }
+            if consumed < raw_buf.len() {
+                let left = raw_buf.len() - consumed;
+                // Rewind seekable regular files so `_tell`/`ftell` stay accurate; on pipes/ttys
+                // where `lseek` fails with ESPIPE, retain the unread bytes in per-fd state.
+                if pend.low_surrogate.is_some() || libc::lseek(fd, -(left as i64), libc::SEEK_CUR) < 0 {
+                    pend.raw = raw_buf[consumed..].to_vec();
+                }
+            }
+            store_u8_pending(fd, pend);
+            for (idx, u) in out_u16.iter().enumerate() {
+                let bytes = u.to_le_bytes();
+                *buf.add(idx * 2) = bytes[0];
+                *buf.add(idx * 2 + 1) = bytes[1];
+            }
+            if start_pos >= 0 {
+                src_pos.push(start_pos + (consumed + extra_fd) as i64);
+            }
+            ((out_u16.len() * 2) as isize, src_pos)
+        }
+    }
+}
+
+/// Raw write with LF->CRLF and Unicode (`_O_WTEXT`/`_O_U16TEXT`/`_O_U8TEXT`) translation.
+/// Returns source byte count on success, or `-1` on error.
+pub unsafe fn write_fd(fd: i32, data: &[u8]) -> isize {
+    let info = fd_info(fd);
+    match info.mode {
+        TextMode::Binary => {
+            if raw_write_all(fd, data) { data.len() as isize } else { -1 }
+        }
+        TextMode::AnsiText => {
+            let tmp;
+            let out: &[u8] = if !info.raw && data.contains(&b'\n') {
+                let mut v = Vec::with_capacity(data.len() + 16);
+                for &b in data {
+                    if b == b'\n' {
+                        v.push(b'\r');
+                    }
+                    v.push(b);
+                }
+                tmp = v;
+                &tmp
+            } else {
+                data
+            };
+            if raw_write_all(fd, out) { data.len() as isize } else { -1 }
+        }
+        TextMode::Utf16Le => {
+            if data.len() % 2 != 0 {
+                errno::set(EINVAL);
+                return -1;
+            }
+            let tmp;
+            let out: &[u8] = if !info.raw {
+                let mut v = Vec::with_capacity(data.len() + 16);
+                for chunk in data.chunks_exact(2) {
+                    let u = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    if u == 0x000A {
+                        v.extend_from_slice(&0x000Du16.to_le_bytes());
+                    }
+                    v.extend_from_slice(chunk);
+                }
+                tmp = v;
+                &tmp
+            } else {
+                data
+            };
+            if raw_write_all(fd, out) { data.len() as isize } else { -1 }
+        }
+        TextMode::Utf8 => {
+            if data.len() % 2 != 0 {
+                errno::set(EINVAL);
+                return -1;
+            }
+            let units: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let s = String::from_utf16_lossy(&units);
+            let mut out = Vec::with_capacity(s.len() + 16);
+            for b in s.as_bytes() {
+                if !info.raw && *b == b'\n' {
+                    out.push(b'\r');
+                }
+                out.push(*b);
+            }
+            if raw_write_all(fd, &out) { data.len() as isize } else { -1 }
+        }
+    }
 }
 
 pub unsafe extern "win64" fn _read(fd: i32, buf: *mut c_void, n: u32) -> i32 {
@@ -574,10 +1306,23 @@ pub unsafe extern "win64" fn _lseeki64(fd: i32, off: i64, whence: i32) -> i64 {
         bad_fd();
         return -1;
     }
+    let is_tell = whence == libc::SEEK_CUR && off == 0;
     let r = libc::lseek(fd, off, whence);
     if r < 0 {
         errno::set_from_host();
+        return -1;
     }
+    if is_tell {
+        let pend_bytes = FD_U8_PENDING
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&fd))
+            .map(|p| p.raw.len() as i64)
+            .unwrap_or(0);
+        return (r - pend_bytes).max(0);
+    }
+    clear_u8_pending(fd);
     r
 }
 pub unsafe extern "win64" fn _lseek(fd: i32, off: i32, whence: i32) -> i32 {
@@ -612,6 +1357,9 @@ pub unsafe extern "win64" fn _eof(fd: i32) -> i32 {
     let end = _filelengthi64(fd);
     if cur < 0 || end < 0 {
         return -1;
+    }
+    if has_u8_pending(fd) {
+        return 0;
     }
     (cur >= end) as i32
 }
@@ -648,6 +1396,7 @@ pub unsafe extern "win64" fn _dup2(fd: i32, fd2: i32) -> i32 {
     // `_open_osfhandle` and `_get_osfhandle` keep the CRT fd and `FileObj` on distinct
     // duplicated POSIX fds, closing `old_h` never closes the newly duplicated `fd2`, and any
     // retained `DuplicateHandle` sibling keeps its own `FileObj` fd alive on the original file.
+    clear_u8_pending(fd2);
     let prev = FDS
         .lock()
         .unwrap()
@@ -678,10 +1427,12 @@ pub unsafe extern "win64" fn _setmode(fd: i32, mode: i32) -> i32 {
         return bad_fd();
     }
     let i = fd_info(fd);
-    let old = if i.text { O_TEXT } else { O_BINARY };
-    let text = match mode {
-        O_BINARY => false,
-        O_TEXT | O_WTEXT | O_U16TEXT | O_U8TEXT => true,
+    let old = i.win_mode;
+    let new_mode = match mode {
+        O_BINARY => TextMode::Binary,
+        O_TEXT => TextMode::AnsiText,
+        O_WTEXT | O_U16TEXT => TextMode::Utf16Le,
+        O_U8TEXT => TextMode::Utf8,
         _ => {
             errno::set(EINVAL);
             super::runtime::invalid_parameter("_setmode");
@@ -689,7 +1440,7 @@ pub unsafe extern "win64" fn _setmode(fd: i32, mode: i32) -> i32 {
         }
     };
     let path = FDS.lock().unwrap().get_or_insert_with(HashMap::new).get(&fd).and_then(|e| e.1.clone());
-    set_fd_info(fd, FdInfo { text, ..i }, path);
+    set_fd_info(fd, FdInfo { mode: new_mode, win_mode: mode, ..i }, path);
     old
 }
 
@@ -772,6 +1523,9 @@ struct Stream {
     wbuf: Vec<u8>,
     /// Read-ahead data (already translated); `rpos` = next byte.
     rbuf: Vec<u8>,
+    /// Physical file byte offset for each index in `rbuf` (length `rbuf.len() + 1`
+    /// when populated for seekable translated modes, empty otherwise).
+    rbuf_src_pos: Vec<i64>,
     rpos: usize,
     /// Pushed-back bytes (ungetc), LIFO.
     unget: Vec<u8>,
@@ -812,6 +1566,7 @@ fn with_table<R>(f: impl FnOnce(&mut StreamTable) -> R) -> R {
                     err: false,
                     wbuf: Vec::new(),
                     rbuf: Vec::new(),
+                    rbuf_src_pos: Vec::new(),
                     rpos: 0,
                     unget: Vec::new(),
                     // stderr unbuffered; stdout line-buffered on a tty.
@@ -853,15 +1608,38 @@ impl Stream {
         true
     }
 
+    /// Logical physical-file offset corresponding to the current read position,
+    /// using the per-byte source-offset table when `rbuf` holds translated input.
+    fn logical_read_pos(&self) -> Option<i64> {
+        if !self.rbuf_src_pos.is_empty() && self.rpos < self.rbuf_src_pos.len() {
+            if self.unget.is_empty() {
+                return Some(self.rbuf_src_pos[self.rpos]);
+            }
+            if self.unget.len() <= self.rpos {
+                return Some(self.rbuf_src_pos[self.rpos - self.unget.len()]);
+            }
+            let extra = (self.unget.len() - self.rpos) as i64;
+            return Some((self.rbuf_src_pos[0] - extra).max(0));
+        }
+        None
+    }
+
     /// Drop read-ahead, seeking the fd back so its position is logical.
     unsafe fn discard_read(&mut self) {
-        let pending = (self.rbuf.len() - self.rpos) + self.unget.len();
-        if pending > 0 {
-            // Translated data: exact only for binary streams (same as Windows'
-            // text-mode caveats for ftell).
-            libc::lseek(self.fd, -(pending as i64), libc::SEEK_CUR);
+        if let Some(target) = self.logical_read_pos() {
+            if self.rpos < self.rbuf.len() || !self.unget.is_empty() || has_u8_pending(self.fd) {
+                libc::lseek(self.fd, target, libc::SEEK_SET);
+                clear_u8_pending(self.fd);
+            }
+        } else {
+            let pending = (self.rbuf.len() - self.rpos) + self.unget.len();
+            if pending > 0 {
+                libc::lseek(self.fd, -(pending as i64), libc::SEEK_CUR);
+                clear_u8_pending(self.fd);
+            }
         }
         self.rbuf.clear();
+        self.rbuf_src_pos.clear();
         self.rpos = 0;
         self.unget.clear();
     }
@@ -904,12 +1682,18 @@ impl Stream {
             self.flush();
         }
         // Reading stdin flushes stdout (interactive convenience; Windows does too).
-        let cap = if self.mode == BufMode::None { 1 } else { self.bufsize.max(512) };
+        let cap = if self.mode == BufMode::None {
+            if fd_info(self.fd).mode.is_unicode() { 4 } else { 1 }
+        } else {
+            (self.bufsize.max(512)) & !1
+        };
         self.rbuf.resize(cap, 0);
+        self.rbuf_src_pos.clear();
         self.rpos = 0;
-        let n = read_fd(self.fd, self.rbuf.as_mut_ptr(), cap);
+        let (n, src_pos) = read_fd_tracked(self.fd, self.rbuf.as_mut_ptr(), cap, true);
         if n <= 0 {
             self.rbuf.clear();
+            self.rbuf_src_pos.clear();
             if n == 0 {
                 self.eof = true;
             } else {
@@ -918,6 +1702,7 @@ impl Stream {
             return false;
         }
         self.rbuf.truncate(n as usize);
+        self.rbuf_src_pos = src_pos;
         true
     }
 
@@ -962,6 +1747,9 @@ impl Stream {
                 if !self.wbuf.is_empty() {
                     self.flush();
                 }
+                self.rbuf.clear();
+                self.rbuf_src_pos.clear();
+                self.rpos = 0;
                 let r = read_fd(self.fd, out[n..].as_mut_ptr(), out.len() - n);
                 if r <= 0 {
                     if r == 0 {
@@ -982,12 +1770,25 @@ impl Stream {
     }
 
     unsafe fn tell(&mut self) -> i64 {
+        if !self.wbuf.is_empty() && !self.flush() {
+            return -1;
+        }
+        if let Some(p) = self.logical_read_pos() {
+            return p;
+        }
         let pos = libc::lseek(self.fd, 0, libc::SEEK_CUR);
         if pos < 0 {
             errno::set_from_host();
             return -1;
         }
-        pos + self.wbuf.len() as i64 - (self.rbuf.len() - self.rpos) as i64 - self.unget.len() as i64
+        let pend_u8 = FD_U8_PENDING
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&self.fd))
+            .map(|p| p.raw.len() as i64)
+            .unwrap_or(0);
+        pos - pend_u8 - (self.rbuf.len() - self.rpos) as i64 - self.unget.len() as i64
     }
 
     unsafe fn seek(&mut self, off: i64, whence: i32) -> i32 {
@@ -996,17 +1797,22 @@ impl Stream {
         }
         let (off, whence) = if whence == libc::SEEK_CUR {
             let cur = self.tell();
+            if cur < 0 {
+                return -1;
+            }
             (cur + off, libc::SEEK_SET)
         } else {
             (off, whence)
         };
-        self.rbuf.clear();
-        self.rpos = 0;
-        self.unget.clear();
         if libc::lseek(self.fd, off, whence) < 0 {
             errno::set_from_host();
             return -1;
         }
+        self.rbuf.clear();
+        self.rbuf_src_pos.clear();
+        self.rpos = 0;
+        self.unget.clear();
+        clear_u8_pending(self.fd);
         self.eof = false;
         0
     }
@@ -1047,6 +1853,8 @@ struct ModeFlags {
     oflag: i32,
     readable: bool,
     writable: bool,
+    write_bom: bool,
+    detect_bom: bool,
 }
 
 fn parse_mode(m: &str) -> Option<ModeFlags> {
@@ -1077,10 +1885,8 @@ fn parse_mode(m: &str) -> Option<ModeFlags> {
                 if c == 'x' {
                     oflag |= O_EXCL;
                 }
-                if c == 'D' || c == 'T' {
-                    if c == 'D' {
-                        oflag |= O_TEMPORARY;
-                    }
+                if c == 'D' {
+                    oflag |= O_TEMPORARY;
                 }
             }
             _ => return None,
@@ -1091,14 +1897,24 @@ fn parse_mode(m: &str) -> Option<ModeFlags> {
         Some(false) => oflag |= O_TEXT,
         None => {}
     }
+    let mut write_bom = false;
+    let mut detect_bom = false;
     if let Some(c) = ccs {
-        let c = c.to_ascii_uppercase().replace(' ', "");
-        if c.contains("UTF-16") || c.contains("UNICODE") {
-            stub!("fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead");
-        }
-        oflag = (oflag & !(O_TEXT)) | O_BINARY;
+        let norm = c.to_ascii_uppercase().replace(' ', "");
+        let enc = norm.strip_prefix("CCS=")?;
+        let unicode_flag = match enc {
+            "UTF-8" => O_U8TEXT,
+            "UTF-16LE" => O_U16TEXT,
+            "UNICODE" => O_WTEXT,
+            _ => return None,
+        };
+        // MSVC UCRT `fopen(..., "..., ccs=...")`: BOM takes precedence on existing files;
+        // newly created/truncated writable files receive the corresponding BOM.
+        oflag = (oflag & !(O_TEXT | O_BINARY | O_WTEXT | O_U16TEXT | O_U8TEXT)) | unicode_flag;
+        write_bom = w;
+        detect_bom = true;
     }
-    Some(ModeFlags { oflag, readable: r, writable: w })
+    Some(ModeFlags { oflag, readable: r, writable: w, write_bom, detect_bom })
 }
 
 fn new_stream(fd: i32, mf: &ModeFlags) -> *mut FILE {
@@ -1118,6 +1934,7 @@ fn new_stream(fd: i32, mf: &ModeFlags) -> *mut FILE {
                 err: false,
                 wbuf: Vec::new(),
                 rbuf: Vec::new(),
+                rbuf_src_pos: Vec::new(),
                 rpos: 0,
                 unget: Vec::new(),
                 mode: BufMode::Full,
@@ -1135,7 +1952,7 @@ unsafe fn fopen_str(path: &str, mode: &str) -> *mut FILE {
         super::runtime::invalid_parameter("fopen: bad mode");
         return std::ptr::null_mut();
     };
-    let fd = open_host(path, mf.oflag, 0x180);
+    let fd = open_host_bom(path, mf.oflag, 0x180, mf.write_bom, mf.detect_bom, false);
     if fd < 0 {
         log::debug!("fopen({path:?}, {mode:?}) failed: errno {}", errno::get());
         return std::ptr::null_mut();
@@ -1426,24 +2243,70 @@ const WEOF: u32 = 0xFFFF;
 pub unsafe extern "win64" fn fgetwc(fp: *mut FILE) -> u32 {
     let _l = Locked::new();
     let r = with_stream(fp as *mut c_void, |s| {
+        if fd_info(s.fd).mode.is_unicode() {
+            // Unicode stream (`_O_WTEXT` / `_O_U16TEXT` / `_O_U8TEXT`): `read_fd` yields UTF-16LE units.
+            let lo = s.getc()?;
+            let hi = s.getc()?;
+            return Some(u16::from_le_bytes([lo, hi]) as u32);
+        }
         let b0 = s.getc()?;
-        if b0 < 0x80 || super::locale::c_locale_active() {
+        let cp = super::locale::mb_cp();
+        if b0 < 0x80 || cp == 0 {
             return Some(b0 as u32);
         }
-        // UTF-8 multibyte (our locale's codepage is 65001).
-        let need = if b0 >= 0xF0 {
-            3
-        } else if b0 >= 0xE0 {
-            2
+        if cp == 65001 {
+            let need = match b0 {
+                0xC2..=0xDF => 1,
+                0xE0..=0xEF => 2,
+                0xF0..=0xF4 => 3,
+                _ => {
+                    s.err = true;
+                    errno::set(EILSEQ);
+                    return None;
+                }
+            };
+            let mut v = vec![b0];
+            for _ in 0..need {
+                match s.getc() {
+                    Some(b) => v.push(b),
+                    None => {
+                        s.err = true;
+                        errno::set(EILSEQ);
+                        return None;
+                    }
+                }
+            }
+            match std::str::from_utf8(&v) {
+                Ok(st) => st.encode_utf16().next().map(|c| c as u32),
+                Err(_) => {
+                    s.err = true;
+                    errno::set(EILSEQ);
+                    None
+                }
+            }
         } else {
-            1
-        };
-        let mut v = vec![b0];
-        for _ in 0..need {
-            v.push(s.getc()?);
+            let is_lead = crate::kernel32::string::IsDBCSLeadByteEx(cp, b0) != 0;
+            let bytes = if is_lead {
+                match s.getc() {
+                    Some(b1) => vec![b0, b1],
+                    None => {
+                        s.err = true;
+                        errno::set(EILSEQ);
+                        return None;
+                    }
+                }
+            } else {
+                vec![b0]
+            };
+            match crate::kernel32::string::decode_cp_to_utf16_strict(cp, &bytes, true) {
+                Ok(w) if !w.is_empty() && !w.contains(&0xFFFD) => Some(w[0] as u32),
+                _ => {
+                    s.err = true;
+                    errno::set(EILSEQ);
+                    None
+                }
+            }
         }
-        let st = String::from_utf8_lossy(&v);
-        st.encode_utf16().next().map(|c| c as u32)
     });
     r.flatten().unwrap_or(WEOF)
 }
@@ -1454,17 +2317,68 @@ pub unsafe extern "win64" fn _fgetwc_nolock(fp: *mut FILE) -> u32 {
     fgetwc(fp)
 }
 
+fn stream_is_unicode(fp: *mut FILE) -> bool {
+    with_stream(fp as *mut c_void, |s| fd_info(s.fd).mode.is_unicode()).unwrap_or(false)
+}
+
+/// Write wide code units to a `FILE*` stream using an explicit `LC_CTYPE` code page
+/// (used by `_fwprintf_l` / `__stdio_common_vfwprintf*`).
+/// Unicode streams (`_O_WTEXT`/`_O_U16TEXT`/`_O_U8TEXT`) receive UTF-16LE bytes;
+/// narrow text/binary streams encode via `cp`.
+pub unsafe fn write_stream_wide_cp(fp: *mut c_void, units: &[u16], cp: u32) -> i32 {
+    let _l = Locked::new();
+    with_stream(fp, |st| {
+        let bytes = if fd_info(st.fd).mode.is_unicode() {
+            let mut out = Vec::with_capacity(units.len() * 2);
+            for &u in units {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out
+        } else {
+            match super::convert::wc_encode_slice_cp(cp, units) {
+                Ok(b) => b,
+                Err(()) => {
+                    st.err = true;
+                    errno::set(EILSEQ);
+                    return -1;
+                }
+            }
+        };
+        if st.write(&bytes) == bytes.len() {
+            units.len() as i32
+        } else {
+            -1
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// Write wide code units to a `FILE*` stream (used by `fputws`).
+/// Unicode streams (`_O_WTEXT`/`_O_U16TEXT`/`_O_U8TEXT`) receive UTF-16LE bytes;
+/// narrow text/binary streams encode via the active CRT `LC_CTYPE` code page.
+pub unsafe fn write_stream_wide(fp: *mut c_void, units: &[u16]) -> i32 {
+    write_stream_wide_cp(fp, units, super::locale::mb_cp())
+}
+
 pub unsafe extern "win64" fn fputwc(c: u16, fp: *mut FILE) -> u32 {
-    let bytes: Vec<u8> = if c < 0x80 || super::locale::c_locale_active() && c < 0x100 {
-        vec![c as u8]
-    } else {
-        String::from_utf16_lossy(&[c]).into_bytes()
-    };
-    if write_stream_bytes(fp as *mut c_void, &bytes) < 0 {
-        WEOF
-    } else {
-        c as u32
-    }
+    let _l = Locked::new();
+    let ok = with_stream(fp as *mut c_void, |s| {
+        let bytes = if fd_info(s.fd).mode.is_unicode() {
+            c.to_le_bytes().to_vec()
+        } else {
+            match super::convert::wc_encode(c) {
+                Ok(b) => b,
+                Err(()) => {
+                    s.err = true;
+                    errno::set(EILSEQ);
+                    return false;
+                }
+            }
+        };
+        s.write(&bytes) == bytes.len()
+    })
+    .unwrap_or(false);
+    if ok { c as u32 } else { WEOF }
 }
 pub unsafe extern "win64" fn putwc(c: u16, fp: *mut FILE) -> u32 {
     fputwc(c, fp)
@@ -1474,20 +2388,28 @@ pub unsafe extern "win64" fn _fputwc_nolock(c: u16, fp: *mut FILE) -> u32 {
 }
 
 pub unsafe extern "win64" fn fputws(s: *const u16, fp: *mut FILE) -> i32 {
-    let st = from_wide(s);
-    if write_stream_bytes(fp as *mut c_void, st.as_bytes()) < 0 {
-        -1
-    } else {
-        0
+    if s.is_null() {
+        errno::set(EINVAL);
+        return -1;
     }
+    let units = crate::strings::read_wide_units_z(s, crate::strings::DEFAULT_MAX_STR_LEN);
+    if write_stream_wide(fp as *mut c_void, &units) < 0 { -1 } else { 0 }
 }
 
 pub unsafe extern "win64" fn ungetwc(c: u32, fp: *mut FILE) -> u32 {
     if c == WEOF {
         return WEOF;
     }
-    let bytes: Vec<u8> = if c < 0x80 { vec![c as u8] } else { String::from_utf16_lossy(&[c as u16]).into_bytes() };
     let _l = Locked::new();
+    let unicode = stream_is_unicode(fp);
+    let bytes: Vec<u8> = if unicode {
+        (c as u16).to_le_bytes().to_vec()
+    } else {
+        match super::convert::wc_encode(c as u16) {
+            Ok(b) => b,
+            Err(()) => return WEOF,
+        }
+    };
     with_stream(fp as *mut c_void, |s| {
         for b in bytes.iter().rev() {
             s.unget.push(*b);
@@ -1677,9 +2599,9 @@ pub unsafe extern "win64" fn tmpfile() -> *mut FILE {
         return std::ptr::null_mut();
     }
     libc::unlink(c.as_ptr());
-    set_fd_info(fd, FdInfo { text: false, raw: false, temporary: false, osf_handle: None }, None);
+    set_fd_info(fd, FdInfo { mode: TextMode::Binary, win_mode: O_BINARY, raw: false, temporary: false, osf_handle: None }, None);
     let _l = Locked::new();
-    new_stream(fd, &ModeFlags { oflag: O_RDWR | O_BINARY, readable: true, writable: true })
+    new_stream(fd, &ModeFlags { oflag: O_RDWR | O_BINARY, readable: true, writable: true, write_bom: false, detect_bom: false })
 }
 
 pub unsafe extern "win64" fn perror(s: *const u8) {
@@ -2446,6 +3368,556 @@ mod tests {
             assert_eq!(std::fs::read(dir.join("std_win.bin")).unwrap(), b"WIN-A+WIN-B");
             assert_eq!(std::fs::read(dir.join("fd1_a.bin")).unwrap(), b"FD1-A+DUP");
             assert_eq!(std::fs::read(dir.join("fd1_b.bin")).unwrap(), b"FD1-B");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unicode_text_modes_and_fopen_ccs_utf16le_utf8() {
+        let dir = std::env::temp_dir().join(format!("aw2_stdio_u16_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("U:\\", &dir);
+
+        unsafe {
+            // 1. fopen with ccs=UTF-16LE writes UTF-16LE BOM + CRLF-translated UTF-16LE.
+            let f = fopen(b"U:\\u16.txt\0".as_ptr(), b"w, ccs=UTF-16LE\0".as_ptr());
+            assert!(!f.is_null());
+            let wtext = crate::strings::to_wide_z("Hi\n世界");
+            assert_eq!(fputws(wtext.as_ptr(), f), 0);
+            assert_eq!(fclose(f), 0);
+
+            let raw = std::fs::read(dir.join("u16.txt")).unwrap();
+            let mut expected = vec![0xFFu8, 0xFE]; // UTF-16LE BOM
+            for u in "Hi\r\n世界".encode_utf16() {
+                expected.extend_from_slice(&u.to_le_bytes());
+            }
+            assert_eq!(raw, expected);
+
+            // 2. BOM precedence: opening UTF-16LE BOM file with ccs=UTF-8 decodes as UTF-16LE!
+            let f = fopen(b"U:\\u16.txt\0".as_ptr(), b"r, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            let mut line = [0u16; 32];
+            assert!(!fgetws(line.as_mut_ptr(), 32, f).is_null());
+            assert_eq!(from_wide(line.as_ptr()), "Hi\n");
+            let c0 = fgetwc(f);
+            assert_eq!(c0, '世' as u32);
+            assert_eq!(ungetwc(c0, f), c0);
+            assert!(!fgetws(line.as_mut_ptr(), 32, f).is_null());
+            assert_eq!(from_wide(line.as_ptr()), "世界");
+            assert_eq!(fclose(f), 0);
+
+            // 3. fopen with ccs=UTF-8 writes UTF-8 BOM + CRLF UTF-8 and reads wide chars back.
+            let f = fopen(b"U:\\u8.txt\0".as_ptr(), b"w, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            let w8 = crate::strings::to_wide_z("L1\nαβ");
+            assert_eq!(fputws(w8.as_ptr(), f), 0);
+            assert_eq!(fclose(f), 0);
+            assert_eq!(std::fs::read(dir.join("u8.txt")).unwrap(), "\u{FEFF}L1\r\nαβ".as_bytes());
+
+            let f = fopen(b"U:\\u8.txt\0".as_ptr(), b"r, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            assert!(!fgetws(line.as_mut_ptr(), 32, f).is_null());
+            assert_eq!(from_wide(line.as_ptr()), "L1\n");
+            assert!(!fgetws(line.as_mut_ptr(), 32, f).is_null());
+            assert_eq!(from_wide(line.as_ptr()), "αβ");
+            assert_eq!(fclose(f), 0);
+
+            // 4. Low-level _open(_O_U16TEXT) without BOM, CRLF translation, odd-count EINVAL, _setmode.
+            let fd = _open(b"U:\\low16.txt\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_U16TEXT, 0x180);
+            assert!(fd >= 0);
+            let payload: Vec<u8> = "A\nB".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            assert_eq!(_write(fd, payload.as_ptr() as *const c_void, payload.len() as u32), payload.len() as i32);
+            // Odd byte count fails with EINVAL in Unicode text mode.
+            assert_eq!(_write(fd, payload.as_ptr() as *const c_void, 3), -1);
+            assert_eq!(errno::get(), EINVAL);
+            assert_eq!(_lseek(fd, 0, 0), 0);
+            let mut rbuf = [0u8; 16];
+            let got = _read(fd, rbuf.as_mut_ptr() as *mut c_void, 16);
+            assert_eq!(got, payload.len() as i32);
+            assert_eq!(&rbuf[..got as usize], payload.as_slice());
+            assert_eq!(_setmode(fd, O_BINARY), O_U16TEXT);
+            assert_eq!(_setmode(fd, O_U8TEXT), O_BINARY);
+            assert_eq!(_close(fd), 0);
+
+            // 5. Invalid ccs value invokes invalid-parameter handler and fails with EINVAL.
+            unsafe extern "win64" fn noop_iph(_: *const u16, _: *const u16, _: *const u16, _: u32, _: usize) {}
+            let prev_iph = crate::ucrt::runtime::_set_invalid_parameter_handler(noop_iph as *const () as usize);
+            assert!(fopen(b"U:\\bad.txt\0".as_ptr(), b"w, ccs=BOGUS\0".as_ptr()).is_null());
+            assert_eq!(errno::get(), EINVAL);
+            crate::ucrt::runtime::_set_invalid_parameter_handler(prev_iph);
+
+            // 6. Unbuffered ccs=UTF-8 stream decodes supplementary UTF-16 surrogate pairs cleanly.
+            let f = fopen(b"U:\\surr.txt\0".as_ptr(), b"w, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            let w_surr = crate::strings::to_wide_z("A😀B");
+            assert_eq!(fputws(w_surr.as_ptr(), f), 0);
+            assert_eq!(fclose(f), 0);
+            let f = fopen(b"U:\\surr.txt\0".as_ptr(), b"r, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(setvbuf(f, std::ptr::null_mut(), 4, 0), 0); // _IONBF
+            let mut got_units = Vec::new();
+            loop {
+                let ch = fgetwc(f);
+                if ch == WEOF {
+                    break;
+                }
+                got_units.push(ch as u16);
+            }
+            assert_eq!(String::from_utf16_lossy(&got_units), "A😀B");
+            assert_eq!(fclose(f), 0);
+
+            // 7. Non-seekable pipe with _O_U8TEXT preserves unread bytes across small 2-byte reads
+            //    and splits/resumes surrogate pairs cleanly.
+            let mut pfds = [0i32; 2];
+            assert_eq!(libc::pipe(pfds.as_mut_ptr()), 0);
+            assert_eq!(libc::write(pfds[1], "ABCD😀".as_ptr() as *const c_void, 8), 8);
+            libc::close(pfds[1]);
+            assert_eq!(_setmode(pfds[0], O_U8TEXT), O_TEXT);
+            let mut pipe_units = Vec::new();
+            loop {
+                let mut one = [0u8; 2];
+                let n = _read(pfds[0], one.as_mut_ptr() as *mut c_void, 2);
+                if n <= 0 {
+                    break;
+                }
+                assert_eq!(n, 2);
+                pipe_units.push(u16::from_le_bytes(one));
+            }
+            assert_eq!(String::from_utf16_lossy(&pipe_units), "ABCD😀");
+            assert_eq!(_close(pfds[0]), 0);
+
+            // 8. Querying position via _telli64 and _eof mid-surrogate preserves pending low surrogate!
+            std::fs::write(dir.join("tell_surr.txt"), "😀B".as_bytes()).unwrap();
+            let fd_s = _open(b"U:\\tell_surr.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
+            assert!(fd_s >= 0);
+            let mut u = [0u8; 2];
+            assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
+            let hi = u16::from_le_bytes(u);
+            assert!(_telli64(fd_s) >= 0);
+            assert_eq!(_eof(fd_s), 0);
+            assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
+            let lo = u16::from_le_bytes(u);
+            assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
+            let b_ch = u16::from_le_bytes(u);
+            assert_eq!(String::from_utf16_lossy(&[hi, lo, b_ch]), "😀B");
+            assert_eq!(_eof(fd_s), 1);
+            assert_eq!(_close(fd_s), 0);
+
+            // File ending with a single supplementary char: _eof must stay 0 while low surrogate is pending.
+            std::fs::write(dir.join("eof_surr.txt"), "😀".as_bytes()).unwrap();
+            let fd_e = _open(b"U:\\eof_surr.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
+            assert!(fd_e >= 0);
+            let mut eof_units = Vec::new();
+            while _eof(fd_e) == 0 {
+                let mut one = [0u8; 2];
+                let n = _read(fd_e, one.as_mut_ptr() as *mut c_void, 2);
+                assert_eq!(n, 2);
+                eof_units.push(u16::from_le_bytes(one));
+            }
+            assert_eq!(String::from_utf16_lossy(&eof_units), "😀");
+            assert_eq!(_eof(fd_e), 1);
+            assert_eq!(_close(fd_e), 0);
+
+            // 9. Buffered ccs=UTF-8 ftell/fgetpos/fseek/fsetpos and read->write discard_read
+            //    track physical UTF-8 byte offsets accurately across BOM, multibyte, and CRLF.
+            std::fs::write(dir.join("bom_pos.txt"), "\u{FEFF}ABCDαβ\r\n😀Z".as_bytes()).unwrap();
+            let f = fopen(b"U:\\bom_pos.txt\0".as_ptr(), b"r+, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fgetwc(f), 'A' as u32);
+            let pos_b = ftell(f);
+            assert_eq!(pos_b, 4); // 3-byte BOM + 1-byte 'A'
+            let mut gpos_b = 0i64;
+            assert_eq!(fgetpos(f, &mut gpos_b), 0);
+            assert_eq!(gpos_b, 4);
+            assert_eq!(fgetwc(f), 'B' as u32);
+            assert_eq!(fgetwc(f), 'C' as u32);
+            assert_eq!(fgetwc(f), 'D' as u32);
+            assert_eq!(fgetwc(f), 'α' as u32);
+            let pos_beta = ftell(f);
+            assert_eq!(pos_beta, 9); // 3 + 4 + 2('α')
+            assert_eq!(fgetwc(f), 'β' as u32);
+            assert_eq!(fgetwc(f), '\n' as u32);
+            let pos_emoji = ftell(f);
+            assert_eq!(pos_emoji, 13); // 9 + 2('β') + 2("\r\n")
+            // Restore saved position before 'B' via fsetpos -> reads 'B' without BOM corruption.
+            assert_eq!(fsetpos(f, &gpos_b), 0);
+            assert_eq!(fgetwc(f), 'B' as u32);
+            // Restore saved position before '😀' via fseek -> reads surrogate pair + 'Z'.
+            assert_eq!(fseek(f, pos_emoji, 0), 0);
+            let em_hi = fgetwc(f) as u16;
+            let em_lo = fgetwc(f) as u16;
+            let z_ch = fgetwc(f) as u16;
+            assert_eq!(String::from_utf16_lossy(&[em_hi, em_lo, z_ch]), "😀Z");
+            // Read-then-write (discard_read) on r+ ccs=UTF-8 repositions at exact physical offset.
+            assert_eq!(fseek(f, pos_b, 0), 0);
+            assert_eq!(fgetwc(f), 'B' as u32); // consumes 'B' (offset 5), buffers rest
+            assert_eq!(fputwc('X' as u16, f), 'X' as u32); // overwrites 'C' at physical offset 5
+            assert_eq!(fclose(f), 0);
+            assert_eq!(std::fs::read(dir.join("bom_pos.txt")).unwrap(), "\u{FEFF}ABXDαβ\r\n😀Z".as_bytes());
+
+            // 10. Non-Unicode wide text stdio honors the active LC_CTYPE code page (CP1252 / CP932).
+            assert!(!crate::ucrt::locale::setlocale(0, b"de-DE\0".as_ptr()).is_null());
+            let f = fopen(b"U:\\cp1252.txt\0".as_ptr(), b"w\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fputwc('€' as u16, f), '€' as u32);
+            assert_eq!(fputwc('A' as u16, f), 'A' as u32);
+            let w_euro = crate::strings::to_wide_z("€B");
+            assert_eq!(fputws(w_euro.as_ptr(), f), 0);
+            assert_eq!(fclose(f), 0);
+            // CP1252 encodes '€' as single byte 0x80 (not UTF-8 E2 82 AC).
+            assert_eq!(std::fs::read(dir.join("cp1252.txt")).unwrap(), vec![0x80, b'A', 0x80, b'B']);
+
+            let f = fopen(b"U:\\cp1252.txt\0".as_ptr(), b"r\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fgetwc(f), '€' as u32);
+            assert_eq!(fgetwc(f), 'A' as u32);
+            assert_eq!(ungetwc('€' as u32, f), '€' as u32);
+            assert_eq!(fgetwc(f), '€' as u32);
+            assert_eq!(fgetwc(f), '€' as u32);
+            assert_eq!(fgetwc(f), 'B' as u32);
+            assert_eq!(fgetwc(f), WEOF);
+            assert_eq!(fclose(f), 0);
+
+            // DBCS locale (ja-JP -> CP932) roundtrip via fputwc/fgetwc, and unmappable char -> EILSEQ.
+            assert!(!crate::ucrt::locale::setlocale(0, b"ja-JP\0".as_ptr()).is_null());
+            let f = fopen(b"U:\\cp932.txt\0".as_ptr(), b"w\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fputwc('あ' as u16, f), 'あ' as u32);
+            assert_eq!(fputwc('€' as u16, f), WEOF); // unmappable in CP932 -> must reject, not emit FC FC
+            assert_eq!(errno::get(), EILSEQ);
+            clearerr(f);
+            assert_eq!(fputwc('Z' as u16, f), 'Z' as u32);
+            assert_eq!(fclose(f), 0);
+            assert_eq!(std::fs::read(dir.join("cp932.txt")).unwrap(), vec![0x82, 0xA0, b'Z']);
+            let f = fopen(b"U:\\cp932.txt\0".as_ptr(), b"r\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fgetwc(f), 'あ' as u32);
+            assert_eq!(fgetwc(f), 'Z' as u32);
+            assert_eq!(fclose(f), 0);
+
+            assert!(!crate::ucrt::locale::setlocale(0, b"C\0".as_ptr()).is_null());
+
+            // 11. Non-seekable FIFO with _O_U16TEXT preserves CR lookahead (full and partial units)
+            //     and translates CRLF across 2-byte reads without losing data.
+            let fifo_path = dir.join("u16_lookahead.fifo");
+            let fifo_c = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(libc::mkfifo(fifo_c.as_ptr(), 0o600), 0);
+            // Open O_RDWR on the FIFO via _open with O_U16TEXT (non-seekable, raw=false).
+            let fd_fifo = _open(b"U:\\u16_lookahead.fifo\0".as_ptr(), O_RDWR | O_U16TEXT, 0);
+            assert!(fd_fifo >= 0);
+            let w_fifo = libc::open(fifo_c.as_ptr(), libc::O_WRONLY);
+            assert!(w_fifo >= 0);
+
+            // Case A: UTF-16LE "\rAB" read 2 bytes at a time -> retains 'A' lookahead on ESPIPE.
+            let payload_rab: Vec<u8> = "\rAB".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            assert_eq!(
+                libc::write(w_fifo, payload_rab.as_ptr() as *const c_void, payload_rab.len()),
+                payload_rab.len() as isize
+            );
+            let mut got_rab = Vec::new();
+            for _ in 0..3 {
+                let mut u = [0u8; 2];
+                assert_eq!(_read(fd_fifo, u.as_mut_ptr() as *mut c_void, 2), 2);
+                got_rab.push(u16::from_le_bytes(u));
+            }
+            assert_eq!(String::from_utf16_lossy(&got_rab), "\rAB");
+
+            // Case B: UTF-16LE "\r\n\r\r\nC" read 2 bytes at a time -> "\n\r\nC".
+            let payload_crlf: Vec<u8> = "\r\n\r\r\nC".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            assert_eq!(
+                libc::write(w_fifo, payload_crlf.as_ptr() as *const c_void, payload_crlf.len()),
+                payload_crlf.len() as isize
+            );
+            let mut got_crlf = Vec::new();
+            for _ in 0..4 {
+                let mut u = [0u8; 2];
+                assert_eq!(_read(fd_fifo, u.as_mut_ptr() as *mut c_void, 2), 2);
+                got_crlf.push(u16::from_le_bytes(u));
+            }
+            assert_eq!(String::from_utf16_lossy(&got_crlf), "\n\r\nC");
+
+            // Case C: Partial UTF-16LE lookahead on closed pipe: "\r" + single byte 0x44, then EOF;
+            // and split partial delivery on a live pipe ("\r" + 0x44, then 0x00 -> "\rD").
+            let mut pfds16 = [0i32; 2];
+            assert_eq!(libc::pipe(pfds16.as_mut_ptr()), 0);
+            // Force raw=false on the pipe fd (matching open_host_path on a non-seekable descriptor).
+            set_fd_info(
+                pfds16[0],
+                FdInfo { mode: TextMode::Utf16Le, win_mode: O_U16TEXT, raw: false, temporary: false, osf_handle: None },
+                None,
+            );
+            let writer_fd = pfds16[1];
+            let writer = std::thread::spawn(move || {
+                // Send "\r" (2 bytes) + low byte of 'D' (0x44), pause, then send high byte (0x00) + close.
+                let part1 = [0x0Du8, 0x00, b'D'];
+                assert_eq!(libc::write(writer_fd, part1.as_ptr() as *const c_void, part1.len()), 3);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                let part2 = [0x00u8];
+                assert_eq!(libc::write(writer_fd, part2.as_ptr() as *const c_void, 1), 1);
+                libc::close(writer_fd);
+            });
+            let mut u1 = [0u8; 2];
+            let mut u2 = [0u8; 2];
+            assert_eq!(_read(pfds16[0], u1.as_mut_ptr() as *mut c_void, 2), 2);
+            assert_eq!(_read(pfds16[0], u2.as_mut_ptr() as *mut c_void, 2), 2);
+            assert_eq!(_read(pfds16[0], u2.as_mut_ptr() as *mut c_void, 2), 0);
+            writer.join().unwrap();
+            assert_eq!(String::from_utf16_lossy(&[u16::from_le_bytes(u1), u16::from_le_bytes(u2)]), "\rD");
+            assert_eq!(_close(pfds16[0]), 0);
+
+            libc::close(w_fifo);
+            assert_eq!(_close(fd_fifo), 0);
+
+            // Case D: Non-seekable ANSI text descriptor preserves CR lookahead ("\rXY").
+            let mut pfds_a = [0i32; 2];
+            assert_eq!(libc::pipe(pfds_a.as_mut_ptr()), 0);
+            set_fd_info(
+                pfds_a[0],
+                FdInfo { mode: TextMode::AnsiText, win_mode: O_TEXT, raw: false, temporary: false, osf_handle: None },
+                None,
+            );
+            assert_eq!(libc::write(pfds_a[1], b"\rXY".as_ptr() as *const c_void, 3), 3);
+            libc::close(pfds_a[1]);
+            let mut got_a = Vec::new();
+            loop {
+                let mut b = 0u8;
+                let k = _read(pfds_a[0], &mut b as *mut u8 as *mut c_void, 1);
+                if k <= 0 {
+                    break;
+                }
+                got_a.push(b);
+            }
+            assert_eq!(got_a, b"\rXY");
+            assert_eq!(_close(pfds_a[0]), 0);
+
+            // 12. BOM-less existing file: _open(_O_WTEXT) falls back to ANSI, whereas
+            //     fopen("r, ccs=UNICODE") stays UTF-16LE per Microsoft Learn; readable append
+            //     streams ("a+, ccs=UTF-8" / "a+, ccs=UTF-16LE") skip the BOM on read and append on write.
+            std::fs::write(dir.join("nobom_ansi.txt"), b"A\r\nB").unwrap();
+            let fd_w = _open(b"U:\\nobom_ansi.txt\0".as_ptr(), O_RDONLY | O_WTEXT, 0);
+            assert!(fd_w >= 0);
+            let mut ansi_buf = [0u8; 8];
+            let nr = _read(fd_w, ansi_buf.as_mut_ptr() as *mut c_void, 8);
+            assert_eq!(nr, 3);
+            assert_eq!(&ansi_buf[..3], b"A\nB");
+            assert_eq!(_close(fd_w), 0);
+
+            let nobom_u16: Vec<u8> = "AB".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            std::fs::write(dir.join("nobom_u16.txt"), &nobom_u16).unwrap();
+            let f_u = fopen(b"U:\\nobom_u16.txt\0".as_ptr(), b"r, ccs=UNICODE\0".as_ptr());
+            assert!(!f_u.is_null());
+            assert_eq!(fgetwc(f_u), 'A' as u32);
+            assert_eq!(fgetwc(f_u), 'B' as u32);
+            assert_eq!(fgetwc(f_u), WEOF);
+            assert_eq!(fclose(f_u), 0);
+
+            std::fs::write(dir.join("aplus_u8.txt"), "\u{FEFF}Hi".as_bytes()).unwrap();
+            let f_ap = fopen(b"U:\\aplus_u8.txt\0".as_ptr(), b"a+, ccs=UTF-8\0".as_ptr());
+            assert!(!f_ap.is_null());
+            assert_eq!(fgetwc(f_ap), 'H' as u32); // BOM skipped on readable append stream
+            assert_eq!(fgetwc(f_ap), 'i' as u32);
+            assert_eq!(fputwc('!' as u16, f_ap), '!' as u32);
+            assert_eq!(fclose(f_ap), 0);
+            assert_eq!(std::fs::read(dir.join("aplus_u8.txt")).unwrap(), "\u{FEFF}Hi!".as_bytes());
+
+            // 13. Write-only host file (mode 0200): fopen("a, ccs=UTF-8") retries O_WRONLY when
+            //     opportunistic O_RDWR BOM inspection gets EACCES and appends in requested UTF-8.
+            let wo_path = dir.join("writeonly_u8.txt");
+            std::fs::write(&wo_path, b"pre:").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wo_path, std::fs::Permissions::from_mode(0o200)).unwrap();
+            }
+            let f_wo = fopen(b"U:\\writeonly_u8.txt\0".as_ptr(), b"a, ccs=UTF-8\0".as_ptr());
+            assert!(!f_wo.is_null(), "write-only append with ccs=UTF-8 must fall back to O_WRONLY");
+            let w_app: Vec<u16> = "ok\0".encode_utf16().collect();
+            assert!(fputws(w_app.as_ptr(), f_wo) >= 0);
+            assert_eq!(fclose(f_wo), 0);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wo_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            assert_eq!(std::fs::read(&wo_path).unwrap(), b"pre:ok");
+
+            // 14. BOM write failure propagation + EINTR / short-write handling.
+            let mut written = Vec::new();
+            let mut calls = 0;
+            write_all_with(&[0xEF, 0xBB, 0xBF], |chunk| {
+                calls += 1;
+                if calls == 1 {
+                    return Err(libc::EINTR);
+                }
+                written.push(chunk[0]);
+                Ok(1)
+            })
+            .unwrap();
+            assert_eq!(written, vec![0xEF, 0xBB, 0xBF]);
+            assert_eq!(
+                write_all_with(&[0xEF, 0xBB, 0xBF], |_| Err(libc::ENOSPC)),
+                Err(libc::ENOSPC)
+            );
+            // Real libc::write failure (EBADF on O_RDONLY host fd) propagates Err instead of Ok.
+            let ro_empty = dir.join("bom_fail_empty.txt");
+            std::fs::write(&ro_empty, b"").unwrap();
+            let c_ro = std::ffi::CString::new(ro_empty.as_os_str().as_encoded_bytes()).unwrap();
+            let ro_fd = libc::open(c_ro.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            assert!(ro_fd >= 0);
+            assert_eq!(
+                apply_unicode_bom(ro_fd, O_WRONLY | O_U8TEXT, TextMode::Utf8, true, false, false),
+                Err(libc::EBADF)
+            );
+            libc::close(ro_fd);
+            assert_eq!(std::fs::metadata(&ro_empty).unwrap().len(), 0);
+
+            // 15. BOM inspection pread failure (EBADF on O_WRONLY fd) propagates Err instead of
+            //     silently treating the file as BOM-less.
+            let wo_nonempty = dir.join("bom_pread_fail.txt");
+            std::fs::write(&wo_nonempty, b"\xFF\xFEA\x00").unwrap();
+            let c_wo_ne = std::ffi::CString::new(wo_nonempty.as_os_str().as_encoded_bytes()).unwrap();
+            let wo_fd = libc::open(c_wo_ne.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            assert!(wo_fd >= 0);
+            assert_eq!(
+                apply_unicode_bom(wo_fd, O_WRONLY | O_APPEND | O_U8TEXT, TextMode::Utf8, false, true, false),
+                Err(libc::EBADF)
+            );
+            libc::close(wo_fd);
+
+            // 16. Malformed UTF-8 lead in _O_U8TEXT replaces only the invalid prefix (never
+            //     swallowing valid following ASCII bytes like "ABC").
+            let bad_u8 = dir.join("malformed_u8.txt");
+            std::fs::write(&bad_u8, b"\xE2ABC\xE2\x82D").unwrap();
+            let fd_bad = _open(b"U:\\malformed_u8.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
+            assert!(fd_bad >= 0);
+            let mut u16_out = [0u16; 16];
+            let got = _read(fd_bad, u16_out.as_mut_ptr() as *mut c_void, 32);
+            assert_eq!(got, 12);
+            assert_eq!(&u16_out[..6], &[0xFFFD, b'A' as u16, b'B' as u16, b'C' as u16, 0xFFFD, b'D' as u16]);
+            assert_eq!(_close(fd_bad), 0);
+
+            // 17. Incomplete UTF-8 refill error (EBADF on O_WRONLY fd with a pending leading byte)
+            //     propagates -1 + EBADF and retains the leading byte instead of emitting U+FFFD.
+            let err_u8 = dir.join("incomplete_err_u8.txt");
+            std::fs::write(&err_u8, b"").unwrap();
+            let c_err_u8 = std::ffi::CString::new(err_u8.as_os_str().as_encoded_bytes()).unwrap();
+            let wo_u8_fd = libc::open(c_err_u8.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            assert!(wo_u8_fd >= 0);
+            assert_eq!(_setmode(wo_u8_fd, O_U8TEXT), O_TEXT);
+            store_u8_pending(wo_u8_fd, U8Pending { raw: vec![0xE2], low_surrogate: None });
+            errno::set(0);
+            let mut u16_p = [0u16; 4];
+            assert_eq!(_read(wo_u8_fd, u16_p.as_mut_ptr() as *mut c_void, 8), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(take_u8_pending(wo_u8_fd).raw, vec![0xE2]);
+            assert_eq!(_close(wo_u8_fd), 0);
+
+            // 18. Large 64 KiB ASCII read in _O_U8TEXT stays O(n) and decodes accurately.
+            let big_u8 = dir.join("big_ascii_u8.txt");
+            let big_data = vec![b'Z'; 65536];
+            std::fs::write(&big_u8, &big_data).unwrap();
+            let fd_big = _open(b"U:\\big_ascii_u8.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
+            assert!(fd_big >= 0);
+            let mut big_out = vec![0u16; 65536];
+            let got_big = _read(fd_big, big_out.as_mut_ptr() as *mut c_void, 131072);
+            assert_eq!(got_big, 131072);
+            assert!(big_out.iter().all(|&u| u == b'Z' as u16));
+            assert_eq!(_close(fd_big), 0);
+
+            // 19. UTF-16LE odd-byte completion read error propagates -1 + errno and preserves
+            //     the partial byte instead of reporting 0 (false EOF).
+            let synth_fd = 999_991;
+            clear_u8_pending(synth_fd);
+            let u16_info = FdInfo {
+                mode: TextMode::Utf16Le,
+                win_mode: O_U16TEXT,
+                raw: false,
+                temporary: false,
+                osf_handle: None,
+            };
+            let mut out16 = [0u8; 8];
+            let mut step = 0usize;
+            errno::set(0);
+            let (rc_err, _) = read_fd_tracked_inner_with(
+                synth_fd,
+                u16_info,
+                out16.as_mut_ptr(),
+                out16.len(),
+                false,
+                |_fd, dst, _len| {
+                    step += 1;
+                    if step == 1 {
+                        *dst = b'A';
+                        1
+                    } else {
+                        errno::set(errno::EIO);
+                        -1
+                    }
+                },
+            );
+            assert_eq!(rc_err, -1);
+            assert_eq!(errno::get(), errno::EIO);
+            assert_eq!(take_u8_pending(synth_fd).raw, vec![b'A']);
+
+            // Recovery after transient error: re-seed the preserved byte and supply high byte 0x00.
+            store_u8_pending(synth_fd, U8Pending { raw: vec![b'A'], low_surrogate: None });
+            let (rc_ok, _) = read_fd_tracked_inner_with(
+                synth_fd,
+                u16_info,
+                out16.as_mut_ptr(),
+                out16.len(),
+                false,
+                |_fd, dst, _len| {
+                    *dst = 0x00;
+                    1
+                },
+            );
+            assert_eq!(rc_ok, 2);
+            assert_eq!(&out16[..2], &[b'A', 0x00]);
+            assert!(take_u8_pending(synth_fd).raw.is_empty());
+
+            // Partial complete unit + stray byte followed by EIO returns the complete unit first,
+            // preserves the stray byte, and surfaces EIO on the next read.
+            let mut step2 = 0usize;
+            let (rc_part, _) = read_fd_tracked_inner_with(
+                synth_fd,
+                u16_info,
+                out16.as_mut_ptr(),
+                out16.len(),
+                false,
+                |_fd, dst, _len| {
+                    step2 += 1;
+                    if step2 == 1 {
+                        *dst.add(0) = b'B';
+                        *dst.add(1) = 0x00;
+                        *dst.add(2) = b'C';
+                        3
+                    } else {
+                        errno::set(errno::EIO);
+                        -1
+                    }
+                },
+            );
+            assert_eq!(rc_part, 2);
+            assert_eq!(&out16[..2], &[b'B', 0x00]);
+            errno::set(0);
+            let (rc_next_err, _) = read_fd_tracked_inner_with(
+                synth_fd,
+                u16_info,
+                out16.as_mut_ptr(),
+                out16.len(),
+                false,
+                |_fd, _dst, _len| {
+                    errno::set(errno::EIO);
+                    -1
+                },
+            );
+            assert_eq!(rc_next_err, -1);
+            assert_eq!(errno::get(), errno::EIO);
+            assert_eq!(take_u8_pending(synth_fd).raw, vec![b'C']);
+            clear_u8_pending(synth_fd);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
