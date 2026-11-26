@@ -2652,7 +2652,7 @@ unsafe fn collect_dir_enum_entries_fd(dir_fd: libc::c_int) -> std::io::Result<Ve
             0
         };
         let len = if is_dir { 0 } else { m.st_size.max(0) as u64 };
-        let alloc_size = if is_dir { 0 } else { ((m.st_blocks.max(0) as u64) * 512).max(len) };
+        let alloc_size = if is_dir { 0 } else { (m.st_blocks.max(0) as u64) * 512 };
         children.push(DirEnumEntry {
             name,
             attrs,
@@ -2828,7 +2828,7 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
                 return FALSE;
             }
             std::ptr::write_bytes(out, 0, 24);
-            put_ft(out, (m.blocks() * 512).max(m.len()));
+            put_ft(out, m.blocks() * 512);
             put_ft(out.add(8), m.len());
             (out.add(16) as *mut u32).write_unaligned(m.nlink() as u32);
             *out.add(20) = *f.delete_on_close.lock().unwrap() as u8;
@@ -12063,6 +12063,11 @@ mod tests {
             assert_eq!((spbuf.as_ptr().add(8) as *const u64).read_unaligned(), 16 * 1024 * 1024);
             assert_eq!((spbuf.as_ptr().add(16) as *const u64).read_unaligned(), expected_sparse_alloc);
             assert!(expected_sparse_alloc < 16 * 1024 * 1024);
+            // Class 1: FileStandardInfo also preserves actual allocated bytes for sparse files.
+            let mut stdbuf = [0u8; 24];
+            assert_eq!(GetFileInformationByHandleEx(hsp, 1, stdbuf.as_mut_ptr(), stdbuf.len() as u32), TRUE);
+            assert_eq!((stdbuf.as_ptr() as *const u64).read_unaligned(), expected_sparse_alloc);
+            assert_eq!((stdbuf.as_ptr().add(8) as *const u64).read_unaligned(), 16 * 1024 * 1024);
             crate::kernel32::threads::CloseHandle(hsp);
 
             // Class 8: FileCompressionInfo
@@ -12119,14 +12124,21 @@ mod tests {
             for (restart_cls, next_cls, name_off) in [(11u32, 10u32, 104usize), (15, 14, 68), (20, 19, 88)] {
                 let mut dbuf = vec![0u8; 4096];
                 let mut names = Vec::new();
+                let mut sparse_record: Option<(u64, u64)> = None;
                 let mut cls = restart_cls;
                 while GetFileInformationByHandleEx(hd, cls, dbuf.as_mut_ptr(), dbuf.len() as u32) != 0 {
                     let mut off = 0usize;
                     loop {
                         let next_off = (dbuf.as_ptr().add(off) as *const u32).read_unaligned() as usize;
+                        let eof = (dbuf.as_ptr().add(off + 40) as *const u64).read_unaligned();
+                        let alloc = (dbuf.as_ptr().add(off + 48) as *const u64).read_unaligned();
                         let flen = (dbuf.as_ptr().add(off + 60) as *const u32).read_unaligned() as usize;
                         let u = crate::strings::read_wide_slice(dbuf.as_ptr().add(off + name_off) as *const u16, flen / 2);
-                        names.push(String::from_utf16_lossy(&u));
+                        let name = String::from_utf16_lossy(&u);
+                        if name == "sparse_stream.dat" {
+                            sparse_record = Some((eof, alloc));
+                        }
+                        names.push(name);
                         if next_off == 0 {
                             break;
                         }
@@ -12136,6 +12148,11 @@ mod tests {
                 }
                 assert_eq!(teb::last_error(), err::ERROR_NO_MORE_FILES);
                 assert!(names.iter().any(|n| n == "sample.dat"), "class {restart_cls} missed sample.dat: {names:?}");
+                assert_eq!(
+                    sparse_record,
+                    Some((16 * 1024 * 1024, expected_sparse_alloc)),
+                    "class {restart_cls} must preserve sparse AllocationSize",
+                );
             }
 
             // Class 22: FileRenameInfoEx relative to RootDirectory

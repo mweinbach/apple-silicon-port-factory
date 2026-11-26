@@ -955,7 +955,8 @@ pub unsafe extern "win64" fn _getch() -> i32 {
     let mut saved: libc::termios = std::mem::zeroed();
     let changed_termios = if is_tty && libc::tcgetattr(fd, &mut saved) == 0 {
         let mut raw = saved;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IGNCR | libc::IXON | libc::ISTRIP);
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::IEXTEN);
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         libc::tcsetattr(fd, libc::TCSANOW, &raw) == 0
@@ -1308,10 +1309,11 @@ mod tests {
             let slave = libc::open(slave_name, libc::O_RDWR | libc::O_NOCTTY);
             assert!(slave >= 0);
 
-            // Ensure ICANON is enabled on the PTY slave (normal host terminal state).
+            // Ensure canonical input + CR->NL translation are enabled (normal host terminal state).
             let mut tio: libc::termios = std::mem::zeroed();
             assert_eq!(libc::tcgetattr(slave, &mut tio), 0);
-            tio.c_lflag |= libc::ICANON;
+            tio.c_iflag |= libc::ICRNL;
+            tio.c_lflag |= libc::ICANON | libc::ECHO;
             assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &tio), 0);
 
             let old_in = GetStdHandle(STD_INPUT_HANDLE);
@@ -1348,6 +1350,26 @@ mod tests {
             let mut after_getch: libc::termios = std::mem::zeroed();
             assert_eq!(libc::tcgetattr(slave, &mut after_getch), 0);
             assert_ne!(after_getch.c_lflag & libc::ICANON, 0, "_getch must restore ICANON");
+            assert_ne!(after_getch.c_iflag & libc::ICRNL, 0, "_getch must restore ICRNL");
+
+            // Enter key (0x0D) arriving while _getch() is active must NOT be translated to LF (0x0A).
+            let writer = std::thread::spawn(move || {
+                let mut cur: libc::termios = std::mem::zeroed();
+                for _ in 0..200 {
+                    if libc::tcgetattr(slave, &mut cur) == 0 && (cur.c_iflag & libc::ICRNL) == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                assert_eq!(libc::write(master, b"\r".as_ptr() as *const c_void, 1), 1);
+            });
+            assert_eq!(_getch(), b'\r' as i32, "_getch must return CR (0x0D) for Enter on ICRNL PTY");
+            writer.join().unwrap();
+
+            let mut after_cr: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut after_cr), 0);
+            assert_ne!(after_cr.c_lflag & libc::ICANON, 0, "_getch must restore ICANON after CR");
+            assert_ne!(after_cr.c_iflag & libc::ICRNL, 0, "_getch must restore ICRNL after CR");
 
             assert_eq!(SetStdHandle(STD_INPUT_HANDLE, old_in), TRUE);
             CloseHandle(h_tty);
