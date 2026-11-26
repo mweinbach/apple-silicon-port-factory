@@ -3573,6 +3573,94 @@ fn split_barrier_begin_end_same_list_and_cross_list_on_gpu() {
     assert_eq!(buf_words(&rb2, 1)[0], 0xff00_ff00, "cross-list split barrier copy must read green");
     alloc1.reset();
     alloc2.reset();
+
+    // Deferred clear flushed by `SplitBegin` must snapshot the *post-flush* producer generation
+    // so `SplitEnd` does not suppress the wait against an older `stage_sync` record.
+    let rt_def = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
+    let rb_def = test_buffer(256 * 4, heap_type::READBACK, 0);
+    rt_def.register_ptr();
+    rb_def.register_ptr();
+    let rt_def_id = &rt_def as *const Resource as usize;
+    let rtv_def = TargetView::rtv(&rt_def, None).unwrap();
+
+    let mut l3 = CommandList::new(ListType::Direct).unwrap();
+    l3.begin(&alloc1).unwrap();
+    // Seed an earlier Fragment gen (1) and sync Blit against it so `stage_sync[Blit]` covers gen 1.
+    unsafe { l3.clear_rtv(&rtv_def, [1.0, 0.0, 0.0, 1.0], &[]).unwrap() };
+    l3.barrier_list_with(
+        &[Barrier::Transition(rt_def_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    l3.copy_texture_region(
+        CopyLoc::Footprint(&rb_def, fp),
+        [0, 0, 0],
+        CopyLoc::Subresource(&rt_def, 0),
+        None,
+    )
+    .unwrap();
+    l3.end_encoder();
+    let frag_gen_before = l3.bar.stage_gen[STAGE_FRAGMENT];
+    assert!(frag_gen_before >= 1);
+
+    // Defer a second clear (blue) into `pending_clears`, then issue `SplitBegin` which flushes it.
+    l3.barrier_list_with(
+        &[Barrier::Transition(rt_def_id, STATE_COPY_SOURCE, STATE_RENDER_TARGET)],
+        true,
+        false,
+    );
+    unsafe { l3.clear_rtv(&rtv_def, [0.0, 0.0, 1.0, 1.0], &[]).unwrap() };
+    assert!(!l3.clears.pending_clears.is_empty(), "second clear should be deferred");
+    l3.barrier_list_with(
+        &[Barrier::SplitBegin(rt_def_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    assert!(l3.clears.pending_clears.is_empty(), "SplitBegin must flush deferred clear");
+    let frag_gen_after = l3.bar.stage_gen[STAGE_FRAGMENT];
+    assert!(
+        frag_gen_after > frag_gen_before,
+        "flushed deferred clear must advance Fragment generation ({frag_gen_before} -> {frag_gen_after})"
+    );
+    let rec_req = l3
+        .bar
+        .split_barriers
+        .iter()
+        .find(|&&(r, _, _, _)| r == rt_def_id)
+        .expect("SplitBegin entry recorded")
+        .3;
+    assert!(
+        rec_req[STAGE_FRAGMENT] >= frag_gen_after,
+        "SplitBegin must snapshot post-flush Fragment generation {frag_gen_after}, got {}",
+        rec_req[STAGE_FRAGMENT]
+    );
+    l3.barrier_list_with(
+        &[Barrier::SplitEnd(rt_def_id, STATE_RENDER_TARGET, STATE_COPY_SOURCE)],
+        true,
+        false,
+    );
+    assert!(
+        l3.bar.split_pend.blit_req[STAGE_FRAGMENT] >= frag_gen_after,
+        "SplitEnd must require post-flush Fragment generation {frag_gen_after}, got {}",
+        l3.bar.split_pend.blit_req[STAGE_FRAGMENT]
+    );
+    l3.copy_texture_region(
+        CopyLoc::Footprint(&rb_def, fp),
+        [0, 0, 0],
+        CopyLoc::Subresource(&rt_def, 0),
+        None,
+    )
+    .unwrap();
+    l3.close().unwrap();
+
+    q.submit(&[&l3.cb]);
+    q.wait_idle();
+    assert_eq!(
+        buf_words(&rb_def, 1)[0],
+        0xffff_0000,
+        "copy after SplitBegin/SplitEnd of deferred clear must read blue (RGBA 0,0,255,255)"
+    );
+    alloc1.reset();
 }
 
 #[test]

@@ -2309,6 +2309,8 @@ impl CommandList {
         batch_pt.clear();
         batch_pt.extend_from_slice(&self.bar.uav_passthrough);
         let mut split_begin_res: Vec<usize> = Vec::new();
+        let mut split_begin_all = false;
+        let mut split_begin_keys: Vec<(usize, u32, u32)> = Vec::new();
         let mut local_narrow_trail: Vec<(usize, S, S)> = Vec::new();
         let mut all_matched_split_end = true;
         let mut any_matched_split_end = false;
@@ -2353,7 +2355,9 @@ impl CommandList {
                             continue;
                         }
                     }
-                    if r != 0 && !split_begin_res.contains(&r) {
+                    if r == 0 {
+                        split_begin_all = true;
+                    } else if !split_begin_res.contains(&r) {
                         split_begin_res.push(r);
                     }
                     if matches!(self.enc, Encoder::Render(_)) {
@@ -2368,6 +2372,7 @@ impl CommandList {
                     }
                     let begin_req = self.cur_producer_gen();
                     self.bar.split_barriers.push((r, s0, s1, begin_req));
+                    split_begin_keys.push((r, s0, s1));
                     continue;
                 }
                 Barrier::Transition(r, s0, s1) | Barrier::SplitEnd(r, s0, s1) => {
@@ -2793,11 +2798,20 @@ impl CommandList {
             None
         };
         if after.is_empty() || (before | soft[0] | soft[1]).is_empty() {
-            if !split_begin_res.is_empty() {
+            if split_begin_all || !split_begin_res.is_empty() {
+                let pre_len = self.clears.pending_clears.len();
                 if let Err(e) = self.flush_clears(&stats::c::cf_barrier_res, |p| {
-                    split_begin_res.contains(&p.view.resource)
+                    split_begin_all || split_begin_res.contains(&p.view.resource)
                 }) {
                     log::warn!(target: "d3d", "ResourceBarrier: deferred clear: {e}");
+                }
+                if self.clears.pending_clears.len() != pre_len {
+                    let post_req = self.cur_producer_gen();
+                    for entry in &mut self.bar.split_barriers {
+                        if split_begin_keys.contains(&(entry.0, entry.1, entry.2)) {
+                            entry.3 = post_req;
+                        }
+                    }
                 }
             }
             self.restore_bar_scratch(
@@ -2978,7 +2992,10 @@ impl CommandList {
                 stats::inc(&stats::c::clear_pass_fold_v2);
             }
             self.flush_clears(&stats::c::cf_barrier_uav0, |p| {
-                if res.contains(&p.view.resource) {
+                if res.contains(&p.view.resource)
+                    || split_begin_all
+                    || split_begin_res.contains(&p.view.resource)
+                {
                     return true;
                 }
                 if non_uav_uav0 && is_non_uav_clear(p) {
@@ -3021,13 +3038,23 @@ impl CommandList {
                 }
             }
             self.flush_clears(&stats::c::cf_barrier_res, |p| {
-                res.contains(&p.view.resource) || split_begin_res.contains(&p.view.resource)
+                res.contains(&p.view.resource)
+                    || split_begin_all
+                    || split_begin_res.contains(&p.view.resource)
             })
         };
         if let Err(e) = flushed {
             log::warn!(target: "d3d", "ResourceBarrier: deferred clear: {e}");
         }
         let had_flushed_clears = self.clears.pending_clears.len() != pre_clear_len;
+        if had_flushed_clears && !split_begin_keys.is_empty() {
+            let post_req = self.cur_producer_gen();
+            for entry in &mut self.bar.split_barriers {
+                if split_begin_keys.contains(&(entry.0, entry.1, entry.2)) {
+                    entry.3 = post_req;
+                }
+            }
+        }
         if copy_light {
             after = S::Blit;
             before = S::Blit;
