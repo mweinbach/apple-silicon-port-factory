@@ -917,11 +917,8 @@ pub unsafe extern "win64" fn OpenEventA(_a: u32, _i: BOOL, name: LPCSTR) -> HAND
 }
 
 fn with_event(h: HANDLE, f: impl FnOnce(&Event)) -> BOOL {
-    match handles::get_as::<Event>(h) {
-        Some(e) => {
-            f(&e);
-            TRUE
-        }
+    match handles::with_event(h, f) {
+        Some(()) => TRUE,
         None => {
             set_err(err::ERROR_INVALID_HANDLE);
             FALSE
@@ -996,19 +993,17 @@ pub unsafe extern "win64" fn OpenSemaphoreW(_a: u32, _i: BOOL, name: LPCWSTR) ->
     named_open::<Semaphore>(from_wide_opt(name))
 }
 pub unsafe extern "win64" fn ReleaseSemaphore(h: HANDLE, n: i32, prev: *mut i32) -> BOOL {
-    match handles::get_as::<Semaphore>(h) {
-        Some(s) => match s.release(n) {
-            Some(p) => {
-                if !prev.is_null() {
-                    *prev = p;
-                }
-                TRUE
+    match handles::with_semaphore(h, |s| s.release(n)) {
+        Some(Some(p)) => {
+            if !prev.is_null() {
+                std::ptr::write_unaligned(prev, p);
             }
-            None => {
-                set_err(err::ERROR_TOO_MANY_POSTS);
-                FALSE
-            }
-        },
+            TRUE
+        }
+        Some(None) => {
+            set_err(err::ERROR_TOO_MANY_POSTS);
+            FALSE
+        }
         None => {
             set_err(err::ERROR_INVALID_HANDLE);
             FALSE
@@ -1357,30 +1352,14 @@ pub unsafe extern "win64" fn WaitForSingleObjectEx(h: HANDLE, ms: u32, alertable
         crate::kernel32::time::sleep_ms(ms);
         return WAIT_TIMEOUT;
     }
-    match handles::get(h) {
-        Some(obj) => {
-            if alertable == 0 {
-                if let Some(s) = obj.as_any().downcast_ref::<Semaphore>() {
-                    if s.try_take() {
-                        return WAIT_OBJECT_0;
-                    }
-                } else if let Some(e) = obj.as_any().downcast_ref::<Event>() {
-                    if e.try_take() {
-                        return WAIT_OBJECT_0;
-                    }
-                }
-            }
-            let t0 = if ms != 0 { crate::hitch::span_begin() } else { 0 };
-            let r = wait_result_code(handles::wait_for(std::slice::from_ref(&obj), false, ms, alertable != 0));
-            crate::hitch::span_end(t0, crate::hitch::SPAN_OBJ_WAIT);
-            r
-        }
-        None => {
-            log::debug!("WaitForSingleObject on invalid handle {h:p}");
-            set_err(err::ERROR_INVALID_HANDLE);
-            WAIT_FAILED
-        }
+    let timeout = (ms != INFINITE).then(|| std::time::Duration::from_millis(ms as u64));
+    let t0 = if ms != 0 { crate::hitch::span_begin() } else { 0 };
+    let res = handles::wait_single_handle(h, timeout, alertable != 0);
+    crate::hitch::span_end(t0, crate::hitch::SPAN_OBJ_WAIT);
+    if matches!(res, WaitResult::Failed(err::ERROR_INVALID_HANDLE)) {
+        log::debug!("WaitForSingleObject on invalid handle {h:p}");
     }
+    wait_result_code(res)
 }
 
 pub unsafe extern "win64" fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32 {
