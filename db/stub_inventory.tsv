@@ -1,23 +1,5 @@
 dll	api	kind	file	line	detail
-crypt32.dll	CertFreeCRLContext	stub	crates/win32-rt/src/misc/crypt32.rs	355	"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"
-crypt32.dll	CertFreeCTLContext	stub	crates/win32-rt/src/misc/crypt32.rs	362	"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"
-crypt32.dll	CertGetCertificateContextProperty	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertStrToNameA	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertStrToNameW	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertVerifySubjectCertificateContext	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptDecodeObject	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptDecodeObjectEx	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptFindOIDInfo	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptMsgOpenToDecode	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CryptMsgUpdate	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptVerifyMessageSignature	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	PFXImportCertStore	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	cert_free_certificate_chain_engine_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	593	"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"
-crypt32.dll	cert_free_certificate_chain_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	787	"CertFreeCertificateChain({chain:p}): foreign chain ignored"
-crypt32.dll	cert_verify_certificate_chain_policy_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	807	"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"
-crypt32.dll	crypt_string_to_binary_impl	stub	crates/win32-rt/src/misc/crypt32/asn1.rs	1276	"CryptStringToBinary unsupported flags {flags:#x}"
-crypt32.dll	encode_x509_object	stub	crates/win32-rt/src/misc/crypt32/asn1.rs	941	"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"
+crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	55	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	794	"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"
 d3d11.dll	create_geometry_shader_so	stub	crates/win32-rt/src/d3d11/device.rs	748	"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"
 d3d11.dll	draw_auto	stub	crates/win32-rt/src/d3d11/context.rs	2913	"ID3D11DeviceContext::DrawAuto not implemented"
@@ -52,10 +34,6 @@ physx3common_x64.dll	geom_sweep	middleware_stub	crates/win32-rt/src/misc/physx3c
 physx3common_x64.dll	mesh_find_overlap_triangle_mesh	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2614	"PxMeshQuery::findOverlapTriangleMesh without cooked triangle mesh payload"
 physx3common_x64.dll	mesh_get_triangle	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2629	"PxMeshQuery::getTriangle without cooked triangle mesh payload"
 physx3common_x64.dll	mesh_sweep	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2642	"PxMeshQuery::sweep without cooked triangle mesh payload"
-secur32.dll	acquire_credentials_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	594	"AcquireCredentialsHandle(pkg={package_name:?}, use={f_credential_use:#x}): inbound unsupported"
-secur32.dll	apply_control_token_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1025	"ApplyControlToken(ctx={id}, token={token_val:?}) -> SEC_E_UNSUPPORTED_FUNCTION"
-secur32.dll	query_context_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1787	"QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION"
-secur32.dll	query_credentials_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1849	"QueryCredentialsAttributes{}(attr={ul_attribute:#x}) -> SEC_E_UNSUPPORTED_FUNCTION", if wide { "W" } else { "A" }
 shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1863	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
 ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	953	"_getch returns EOF"
 ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
@@ -63,7 +41,3 @@ ucrtbase.dll	open_host_path	stub	crates/win32-rt/src/ucrt/stdio.rs	210	"Unicode 
 ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1097	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
 ucrtbase.dll	setlocale	stub	crates/win32-rt/src/ucrt/locale.rs	64	"setlocale({cat}, {n:?}): locale not available"
 ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	965	"system({:?}) refused", from_ansi(cmd)
-wintrust.dll	Tbsip_Context_Close	stub	crates/win32-rt/src/misc/wintrust.rs	1644	"Tbsip_Context_Close({h_context:p}) -> TBS_E_INVALID_CONTEXT"
-wintrust.dll	Tbsip_Submit_Command	stub	crates/win32-rt/src/misc/wintrust.rs	1661	"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"
-wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1415	"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"
-wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1439	"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"

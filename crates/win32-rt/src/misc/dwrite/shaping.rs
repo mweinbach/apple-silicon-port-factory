@@ -218,7 +218,7 @@ mod coretext {
             bytes: *const u8,
             num_bytes: isize,
             encoding: u32,
-            is_external: bool,
+            is_external: u8,
         ) -> *const c_void;
         fn CFNumberCreate(
             allocator: *const c_void,
@@ -326,7 +326,7 @@ mod coretext {
                 f.tag.as_ptr(),
                 4,
                 CF_STRING_ENCODING_UTF8,
-                false,
+                0,
             ));
             let val_i32 = f.value as i32;
             let val_num = CfGuard(CFNumberCreate(
@@ -499,7 +499,7 @@ mod coretext {
                         loc.as_ptr(),
                         loc.len() as isize,
                         CF_STRING_ENCODING_UTF8,
-                        false,
+                        0,
                     ));
                     (!g.0.is_null()).then_some(g)
                 });
