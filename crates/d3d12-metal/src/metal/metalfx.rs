@@ -74,6 +74,11 @@ unsafe impl Send for SpatialScaler {}
 unsafe impl Sync for SpatialScaler {}
 
 impl SpatialScaler {
+    /// Whether the MetalFX scaler exposes `setFence:` on this OS/device.
+    pub(crate) fn has_fence(&self) -> bool {
+        self.has_fence_setter
+    }
+
     /// Encode MetalFX spatial upscaling directly into an open `MTL4CommandBuffer`
     /// (caller must ensure no active command encoder is open on `cb` and that
     /// prior/subsequent GPU stages are synchronized with Metal 4 queue barriers).
@@ -305,6 +310,11 @@ unsafe impl Send for TemporalScaler {}
 unsafe impl Sync for TemporalScaler {}
 
 impl TemporalScaler {
+    /// Whether the MetalFX temporal scaler exposes `setFence:` on this OS/device.
+    pub(crate) fn has_fence(&self) -> bool {
+        self.has_fence_setter
+    }
+
     /// Encode MetalFX temporal upscaling directly into an open `MTL4CommandBuffer`
     /// (caller must ensure no active command encoder is open on `cb` and that
     /// prior/subsequent GPU stages are synchronized with Metal 4 queue barriers).
@@ -1581,7 +1591,7 @@ mod tests {
             assert_eq!(l.upscale_temporal_with_backend(&p).unwrap(), UpscaleBackend::TemporalMetalFx);
             assert!(
                 l.metalfx_post_sync_clean(),
-                "direct MTL4FXTemporalScaler pass must arm a full post-pass queue barrier and clear stale stage_sync",
+                "direct MTL4FXTemporalScaler pass must arm stage-scoped post-pass sync (or clean fallback)",
             );
             l.copy_texture_region(CopyLoc::Footprint(&rb_2x, fp_2x), [0, 0, 0], CopyLoc::Subresource(&out_2x, 0), None).unwrap();
             l.close().unwrap();
@@ -1620,7 +1630,7 @@ mod tests {
             assert_eq!(l.upscale_temporal_with_backend(&p).unwrap(), UpscaleBackend::TemporalMetalFx);
             assert!(
                 l.metalfx_post_sync_clean(),
-                "direct MTL4FXTemporalScaler pass must arm a full post-pass queue barrier and clear stale stage_sync",
+                "direct MTL4FXTemporalScaler pass must arm stage-scoped post-pass sync (or clean fallback)",
             );
             l.copy_texture_region(CopyLoc::Footprint(&rb_2x, fp_2x), [0, 0, 0], CopyLoc::Subresource(&out_2x, 0), None).unwrap();
             l.close().unwrap();

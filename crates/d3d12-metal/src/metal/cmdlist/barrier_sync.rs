@@ -3157,6 +3157,7 @@ impl CommandList {
             if eff_after != after {
                 stats::inc(&stats::c::stagesync_narrow);
             }
+            self.wait_pending_mfx_fence(ProtocolObject::from_ref(e), before & PRE_RASTER);
             e.barrierAfterQueueStages_beforeStages_visibilityOptions(
                 eff_after,
                 before,
