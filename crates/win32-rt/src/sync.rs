@@ -392,6 +392,7 @@ unsafe fn srw_park_writer(lock: AtomicWord) -> bool {
     }
     let key = lock.addr();
     let _scope = crate::hitch::Scope::enter(crate::hitch::ActKind::LockWait, key as u64);
+    let t0 = crate::park::ticks_now();
     let r = park(
         key,
         || {
@@ -404,6 +405,10 @@ unsafe fn srw_park_writer(lock: AtomicWord) -> bool {
         SRW_TOKEN_WRITER,
         None,
     );
+    if !matches!(r, ParkResult::Invalid) {
+        let sleep_us = crate::park::ticks_to_us(crate::park::ticks_now().wrapping_sub(t0));
+        crate::park::record_sleep_outcome(sleep_us, false);
+    }
     matches!(r, ParkResult::Unparked(tok) if tok == SRW_UNPARK_WRITER_HANDOFF)
 }
 
@@ -417,6 +422,7 @@ unsafe fn srw_park_reader(lock: AtomicWord, block_mask: usize) -> bool {
     }
     let key = lock.addr();
     let _scope = crate::hitch::Scope::enter(crate::hitch::ActKind::LockWait, key as u64);
+    let t0 = crate::park::ticks_now();
     let r = park(
         key,
         || {
@@ -428,6 +434,10 @@ unsafe fn srw_park_reader(lock: AtomicWord, block_mask: usize) -> bool {
         SRW_TOKEN_READER,
         None,
     );
+    if !matches!(r, ParkResult::Invalid) {
+        let sleep_us = crate::park::ticks_to_us(crate::park::ticks_now().wrapping_sub(t0));
+        crate::park::record_sleep_outcome(sleep_us, false);
+    }
     matches!(r, ParkResult::Unparked(tok) if tok == SRW_UNPARK_ALLOW_READER)
 }
 
@@ -548,7 +558,6 @@ pub unsafe extern "win64" fn TryAcquireSRWLockExclusive(p: *mut c_void) -> BOOLE
 #[inline(never)]
 pub unsafe extern "win64" fn AcquireSRWLockExclusive(p: *mut c_void) {
     let l = srw(p);
-    let mut spins = 0;
     let mut owns_waiting_bit = false;
     loop {
         let s = l.load(Relaxed);
@@ -563,15 +572,23 @@ pub unsafe extern "win64" fn AcquireSRWLockExclusive(p: *mut c_void) {
             }
             continue;
         }
-        if spins < 100 {
-            spins += 1;
-            std::hint::spin_loop();
-            continue;
+        if crate::park::spin_until(None, 16, || {
+            let s = l.load(Relaxed);
+            if s & (SRW_WRITER | SRW_READERS_MASK) == 0 {
+                let next = if owns_waiting_bit && (s & SRW_PARKED == 0) {
+                    (s & !SRW_WAITING_WRITER) | SRW_WRITER
+                } else {
+                    s | SRW_WRITER
+                };
+                return l.compare_exchange_weak(s, next, Acquire, Relaxed).is_ok();
+            }
+            false
+        }) {
+            return;
         }
         if srw_park_writer(l) {
             owns_waiting_bit = true;
         }
-        spins = 0;
     }
 }
 
@@ -600,7 +617,6 @@ pub unsafe extern "win64" fn TryAcquireSRWLockShared(p: *mut c_void) -> BOOLEAN 
 #[inline(never)]
 pub unsafe extern "win64" fn AcquireSRWLockShared(p: *mut c_void) {
     let l = srw(p);
-    let mut spins = 0;
     let mut allow_bypass = false;
     loop {
         let block_mask = if allow_bypass {
@@ -615,13 +631,13 @@ pub unsafe extern "win64" fn AcquireSRWLockShared(p: *mut c_void) {
             }
             continue;
         }
-        if spins < 100 {
-            spins += 1;
-            std::hint::spin_loop();
-            continue;
+        if crate::park::spin_until(None, 16, || {
+            let s = l.load(Relaxed);
+            s & block_mask == 0 && l.compare_exchange_weak(s, s + SRW_READER, Acquire, Relaxed).is_ok()
+        }) {
+            return;
         }
         allow_bypass = srw_park_reader(l, block_mask);
-        spins = 0;
     }
 }
 
@@ -636,30 +652,58 @@ pub unsafe extern "win64" fn ReleaseSRWLockShared(p: *mut c_void) {
 
 // ---------------------------------------------------------------------------
 // CONDITION_VARIABLE (pointer-sized):
-//   low 24 bits: active waiter count (0-waiter fast path skips parking_lot_core)
-//   upper bits:  sequence counter
+//   bits  0..16: active waiter count (spinning + parked; 0 skips wake work)
+//   bits 16..32: parked waiter count (actually sleeping in parking_lot_core;
+//                0 skips unpark_one/unpark_all while still waking spinners via seq)
+//   bits 32..64: sequence counter
 // ---------------------------------------------------------------------------
 
-const CV_WAITERS_MASK: usize = 0x00FF_FFFF;
-const CV_SEQ_SHIFT: u32 = 24;
+const CV_ACTIVE_MASK: usize = 0x0000_FFFF;
+const CV_ACTIVE_INC: usize = 1;
+const CV_PARKED_SHIFT: u32 = 16;
+const CV_PARKED_MASK: usize = 0xFFFF_0000;
+const CV_PARKED_INC: usize = 1usize << CV_PARKED_SHIFT;
+const CV_SEQ_SHIFT: u32 = 32;
 const CV_SEQ_INC: usize = 1usize << CV_SEQ_SHIFT;
 
 unsafe fn cv_wait(cv: *mut c_void, ms: u32, release: impl FnOnce(), reacquire: impl FnOnce()) -> BOOL {
     let word = AtomicWord::from_ptr(cv);
-    let s0 = word.fetch_add(1, SeqCst);
+    let s0 = word.fetch_add(CV_ACTIVE_INC, SeqCst);
     let seq0 = s0 >> CV_SEQ_SHIFT;
     release();
+    let dl = deadline(ms);
+    if ms != 0
+        && crate::park::spin_until(dl, u64::MAX, || (word.load(Acquire) >> CV_SEQ_SHIFT) != seq0)
+    {
+        word.fetch_sub(CV_ACTIVE_INC, Release);
+        reacquire();
+        return TRUE;
+    }
+    // Advertise parked before entering `parking_lot_core::park`; total-ordered with
+    // `Wake*ConditionVariable`'s `fetch_add(CV_SEQ_INC, SeqCst)` on the same word.
+    let s1 = word.fetch_add(CV_PARKED_INC, SeqCst);
+    if (s1 >> CV_SEQ_SHIFT) != seq0 {
+        word.fetch_sub(CV_ACTIVE_INC + CV_PARKED_INC, Release);
+        reacquire();
+        return TRUE;
+    }
+    let t0 = crate::park::ticks_now();
     let r = park(
         cv as usize,
-        || (word.load(Relaxed) >> CV_SEQ_SHIFT) == seq0,
+        || (word.load(Acquire) >> CV_SEQ_SHIFT) == seq0,
         || {},
         |_, _| {},
         DEFAULT_PARK_TOKEN,
-        deadline(ms),
+        dl,
     );
-    word.fetch_sub(1, Release);
+    let timed_out = matches!(r, ParkResult::TimedOut);
+    if !matches!(r, ParkResult::Invalid) {
+        let sleep_us = crate::park::ticks_to_us(crate::park::ticks_now().wrapping_sub(t0));
+        crate::park::record_sleep_outcome(sleep_us, timed_out);
+    }
+    word.fetch_sub(CV_ACTIVE_INC + CV_PARKED_INC, Release);
     reacquire();
-    if let ParkResult::TimedOut = r {
+    if timed_out {
         crate::teb::set_last_error(err::ERROR_TIMEOUT);
         return FALSE;
     }
@@ -701,26 +745,34 @@ pub unsafe extern "win64" fn SleepConditionVariableSRW(cv: *mut c_void, lock: *m
 
 #[inline(never)]
 pub unsafe extern "win64" fn WakeConditionVariable(cv: *mut c_void) {
-    // Pair with waiter's `fetch_add(1, SeqCst)` even when caller wrote predicate
-    // without a SeqCst barrier.
+    // Pair with waiter's `fetch_add(CV_ACTIVE_INC, SeqCst)` even when caller wrote
+    // predicate without a SeqCst barrier.
     std::sync::atomic::fence(SeqCst);
     let w = AtomicWord::from_ptr(cv);
-    if (w.load(Acquire) & CV_WAITERS_MASK) == 0 {
+    if (w.load(Acquire) & (CV_ACTIVE_MASK | CV_PARKED_MASK)) == 0 {
         return;
     }
-    w.fetch_add(CV_SEQ_INC, Release);
-    unpark_one(cv as usize, |_| DEFAULT_UNPARK_TOKEN);
+    let prev = w.fetch_add(CV_SEQ_INC, SeqCst);
+    if (prev & CV_PARKED_MASK) != 0 {
+        unpark_one(cv as usize, |_| DEFAULT_UNPARK_TOKEN);
+    } else {
+        crate::park::record_cheap_wake_stat();
+    }
 }
 
 #[inline(never)]
 pub unsafe extern "win64" fn WakeAllConditionVariable(cv: *mut c_void) {
     std::sync::atomic::fence(SeqCst);
     let w = AtomicWord::from_ptr(cv);
-    if (w.load(Acquire) & CV_WAITERS_MASK) == 0 {
+    if (w.load(Acquire) & (CV_ACTIVE_MASK | CV_PARKED_MASK)) == 0 {
         return;
     }
-    w.fetch_add(CV_SEQ_INC, Release);
-    unpark_all(cv as usize, DEFAULT_UNPARK_TOKEN);
+    let prev = w.fetch_add(CV_SEQ_INC, SeqCst);
+    if (prev & CV_PARKED_MASK) != 0 {
+        unpark_all(cv as usize, DEFAULT_UNPARK_TOKEN);
+    } else {
+        crate::park::record_cheap_wake_stat();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -963,8 +1015,18 @@ pub unsafe extern "win64" fn WaitOnAddress(addr: *mut c_void, cmp: *const c_void
     if !mem_equal(addr, cmp, size) {
         return TRUE;
     }
-    let r = park(addr as usize, || mem_equal(addr, cmp, size), || {}, |_, _| {}, DEFAULT_PARK_TOKEN, deadline(ms));
-    if let ParkResult::TimedOut = r {
+    let dl = deadline(ms);
+    if ms != 0 && crate::park::spin_until(dl, u64::MAX, || !mem_equal(addr, cmp, size)) {
+        return TRUE;
+    }
+    let t0 = crate::park::ticks_now();
+    let r = park(addr as usize, || mem_equal(addr, cmp, size), || {}, |_, _| {}, DEFAULT_PARK_TOKEN, dl);
+    let timed_out = matches!(r, ParkResult::TimedOut);
+    if !matches!(r, ParkResult::Invalid) {
+        let sleep_us = crate::park::ticks_to_us(crate::park::ticks_now().wrapping_sub(t0));
+        crate::park::record_sleep_outcome(sleep_us, timed_out);
+    }
+    if timed_out {
         crate::teb::set_last_error(err::ERROR_TIMEOUT);
         return FALSE;
     }
@@ -1812,5 +1874,123 @@ mod tests {
             let v = final_ctx as usize;
             assert!([0x100, 0x200, 0x300, 0x400].contains(&v), "unexpected winning ctx {v:#x}");
         }
+    }
+
+    #[test]
+    fn cv_srw_and_wait_on_address_adaptive_spin_stress() {
+        use std::sync::atomic::AtomicU64;
+
+        // 1. Producer/consumer queue over SRWLock + CONDITION_VARIABLE exercising both
+        //    spinning wakes (CV_PARKED == 0) and parked wakes (CV_PARKED > 0) + timeouts.
+        struct SharedQueue {
+            lock: AtomicUsize,
+            cv: AtomicUsize,
+            items: AtomicU64,
+            done: AtomicU32,
+        }
+        let q = Arc::new(SharedQueue {
+            lock: AtomicUsize::new(0),
+            cv: AtomicUsize::new(0),
+            items: AtomicU64::new(0),
+            done: AtomicU32::new(0),
+        });
+        const CONSUMERS: usize = 6;
+        const TOTAL: u64 = 2_000;
+        let consumed = Arc::new(AtomicU64::new(0));
+        let mut hs = Vec::new();
+        for cid in 0..CONSUMERS {
+            let q = Arc::clone(&q);
+            let c = Arc::clone(&consumed);
+            hs.push(std::thread::spawn(move || unsafe {
+                let lp = &q.lock as *const AtomicUsize as *mut c_void;
+                let cvp = &q.cv as *const AtomicUsize as *mut c_void;
+                loop {
+                    AcquireSRWLockExclusive(lp);
+                    while q.items.load(Relaxed) == 0 && q.done.load(Relaxed) == 0 {
+                        let ms = if cid % 3 == 0 { 1 } else { INFINITE };
+                        let _ = SleepConditionVariableSRW(cvp, lp, ms, 0);
+                    }
+                    let got = if q.items.load(Relaxed) > 0 {
+                        q.items.fetch_sub(1, Relaxed);
+                        true
+                    } else {
+                        false
+                    };
+                    let finished = q.done.load(Relaxed) != 0 && q.items.load(Relaxed) == 0;
+                    ReleaseSRWLockExclusive(lp);
+                    if got {
+                        c.fetch_add(1, AcqRel);
+                    } else if finished {
+                        break;
+                    }
+                }
+                crate::teb::uninstall();
+            }));
+        }
+
+        unsafe {
+            let lp = &q.lock as *const AtomicUsize as *mut c_void;
+            let cvp = &q.cv as *const AtomicUsize as *mut c_void;
+            for i in 0..TOTAL {
+                AcquireSRWLockExclusive(lp);
+                q.items.fetch_add(1, Relaxed);
+                ReleaseSRWLockExclusive(lp);
+                if i % 16 == 0 {
+                    WakeAllConditionVariable(cvp);
+                } else {
+                    WakeConditionVariable(cvp);
+                }
+                if i % 200 == 0 {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            }
+            AcquireSRWLockExclusive(lp);
+            q.done.store(1, Release);
+            ReleaseSRWLockExclusive(lp);
+            WakeAllConditionVariable(cvp);
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(consumed.load(Acquire), TOTAL);
+        assert_eq!(q.lock.load(SeqCst), 0);
+        assert_eq!(
+            q.cv.load(SeqCst) & (CV_ACTIVE_MASK | CV_PARKED_MASK),
+            0,
+            "CV active and parked waiter counts must return to 0"
+        );
+
+        // 2. WaitOnAddress / WakeByAddressSingle / WakeByAddressAll rapid handoff + timeout.
+        let addr = Arc::new(AtomicU32::new(0));
+        let a2 = Arc::clone(&addr);
+        let waiter = std::thread::spawn(move || unsafe {
+            let p = &*a2 as *const AtomicU32 as *mut c_void;
+            for expected in 0u32..500 {
+                let cmp = expected;
+                while a2.load(Acquire) == expected {
+                    assert_eq!(WaitOnAddress(p, &cmp as *const u32 as *const c_void, 4, 5_000), TRUE);
+                }
+            }
+            // Timeout path on unchanged address.
+            let stay = 500u32;
+            assert_eq!(WaitOnAddress(p, &stay as *const u32 as *const c_void, 4, 5), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_TIMEOUT);
+            crate::teb::uninstall();
+        });
+        unsafe {
+            let p = &*addr as *const AtomicU32 as *mut c_void;
+            for next in 1u32..=500 {
+                addr.store(next, Release);
+                if next % 10 == 0 {
+                    WakeByAddressAll(p);
+                } else {
+                    WakeByAddressSingle(p);
+                }
+                if next % 50 == 0 {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+        }
+        waiter.join().unwrap();
     }
 }
