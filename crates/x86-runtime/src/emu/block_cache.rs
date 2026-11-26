@@ -69,6 +69,9 @@ pub(super) struct BlockCache {
     pub(super) fast_gen: u32,
     /// Epoch key `(va_gen, static_aot_gen, code_gen, aot_epoch, mode_flags)` for `fast_gen`.
     fast_key: (u32, u32, u32, u32, u32),
+    /// Last [`mem::jit_regions_gen`] observed by this cache: when a new guest SMC/JIT region
+    /// is registered or expanded, previously cached `gen == 0` blocks inside it are flushed.
+    jit_regions_gen: u32,
 }
 
 /// Host-callable resolution cache entry (see [`BlockCache::resolve`]).
@@ -137,6 +140,7 @@ impl BlockCache {
                 rcache: zeroed_slice::<RcEntry>(RC_LEN),
                 fast_gen: 0,
                 fast_key: (0, 0, 0, 0, 0),
+                jit_regions_gen: mem::jit_regions_gen(),
             }
         }
     }
@@ -200,10 +204,22 @@ impl BlockCache {
         ((ip as usize).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - BLK_INDEX_BITS)) & (BLK_INDEX_LEN - 1)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn flush_for_jit_regions(&mut self, jrgen: u32) {
+        self.jit_regions_gen = jrgen;
+        self.cursor = 0;
+        self.index.fill(BlkEntry::default());
+    }
+
     /// Return the block starting at `ip` as `(arena offset, length >= 1)`.
     #[inline(always)]
     pub(super) unsafe fn get(this: *mut BlockCache, ip: u64, misses: &mut u64) -> Result<(usize, usize), BlkErr> {
         let bc = &mut *this;
+        let jrgen = mem::jit_regions_gen();
+        if bc.jit_regions_gen != jrgen {
+            bc.flush_for_jit_regions(jrgen);
+        }
         let e = *bc.index.get_unchecked(Self::slot(ip));
         if e.ip == ip && e.len != 0 && bc.ops.get_unchecked(e.off as usize).ip == ip {
             if e.gen == 0 || e.gen == mem::code_gen() {

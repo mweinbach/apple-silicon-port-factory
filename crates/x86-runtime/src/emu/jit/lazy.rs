@@ -293,11 +293,12 @@ impl Tr<'_> {
             self.a.bind(f);
             (self.fs, self.lb, self.pf) = snap;
         }
+        let lbk = self.abi_lb();
         if split {
             self.flush_edge(0);
         }
         if taken_host {
-            self.exit_code(EXIT_JCC, fall, target);
+            self.emit_tail_target(target, fall, lbk, EXIT_JCC);
         } else {
             self.exit_to(target);
         }

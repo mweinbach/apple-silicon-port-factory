@@ -29,6 +29,10 @@ fn register_translated_instructions(cases: &mut Cases) {
         clear_ymm_hi: 0,
         rdtsc_slow: 0xc00,
         rdtscp_slow: 0xb00,
+        lookup_rip_ic: 0,
+        lookup_jmp_ic: 0,
+        lookup_call_ic: 0,
+        ras_miss_ic: 0,
     };
     let mut prep = Prep {
         ops: [FastOp::default(); BLK_MAX_INSNS],
