@@ -495,6 +495,21 @@ fn is_console(h: HANDLE) -> bool {
     get_file(h).is_some_and(|f| f.kind == FileKind::Console)
 }
 
+/// True when `f` is a console handle referring to the console input buffer (`CONIN$`) rather than
+/// an output screen buffer (`CONOUT$`), independent of its granted read/write access mask.
+fn is_console_input(f: &FileObj) -> bool {
+    if f.kind != FileKind::Console {
+        return false;
+    }
+    if f.win_path.eq_ignore_ascii_case("CONIN$") {
+        true
+    } else if f.win_path.eq_ignore_ascii_case("CONOUT$") {
+        false
+    } else {
+        (f.access & GENERIC_READ) != 0 && (f.access & GENERIC_WRITE) == 0
+    }
+}
+
 pub unsafe extern "win64" fn GetConsoleMode(h: HANDLE, mode: *mut u32) -> BOOL {
     let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
@@ -506,11 +521,7 @@ pub unsafe extern "win64" fn GetConsoleMode(h: HANDLE, mode: *mut u32) -> BOOL {
     }
     if !mode.is_null() {
         let st = console_session().lock().unwrap();
-        let val = if (f.access & GENERIC_READ) != 0 && (f.access & GENERIC_WRITE) == 0 {
-            st.in_mode
-        } else {
-            st.out_mode
-        };
+        let val = if is_console_input(&f) { st.in_mode } else { st.out_mode };
         std::ptr::write_unaligned(mode, val);
     }
     TRUE
@@ -526,7 +537,7 @@ pub unsafe extern "win64" fn SetConsoleMode(h: HANDLE, mode: u32) -> BOOL {
         return FALSE;
     }
     let mut st = console_session().lock().unwrap();
-    if (f.access & GENERIC_READ) != 0 && (f.access & GENERIC_WRITE) == 0 {
+    if is_console_input(&f) {
         st.in_mode = mode;
     } else {
         st.out_mode = mode;
@@ -543,7 +554,7 @@ pub unsafe extern "win64" fn GetNumberOfConsoleInputEvents(h: HANDLE, count: *mu
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    if f.kind != FileKind::Console || (f.access & GENERIC_READ) == 0 {
+    if !is_console_input(&f) || (f.access & GENERIC_READ) == 0 {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
@@ -1001,12 +1012,19 @@ fn create_file_inner(name: &str, access: u32, disposition: u32, flags: u32, hand
         return Ok(handles::insert_with_flags(Arc::new(o), handle_flags));
     }
     if let Some(dev) = path::device_name(name) {
-        let (file, kind) = match dev {
-            "NUL" => (null_file(), FileKind::Null),
-            "CONIN$" => (unsafe { File::from_raw_fd(libc::dup(0)) }, FileKind::Console),
-            _ => (unsafe { File::from_raw_fd(libc::dup(if wants_read && !wants_write { 0 } else { 1 })) }, FileKind::Console),
+        let (file, kind, canon) = match dev {
+            "NUL" => (null_file(), FileKind::Null, "NUL"),
+            "CONIN$" => (unsafe { File::from_raw_fd(libc::dup(0)) }, FileKind::Console, "CONIN$"),
+            "CONOUT$" => (unsafe { File::from_raw_fd(libc::dup(1)) }, FileKind::Console, "CONOUT$"),
+            _ => {
+                if wants_read && !wants_write {
+                    (unsafe { File::from_raw_fd(libc::dup(0)) }, FileKind::Console, "CONIN$")
+                } else {
+                    (unsafe { File::from_raw_fd(libc::dup(1)) }, FileKind::Console, "CONOUT$")
+                }
+            }
         };
-        let o = FileObj::new(file, kind, dev.into(), None, access, flags);
+        let o = FileObj::new(file, kind, canon.into(), None, access, flags);
         return Ok(handles::insert_with_flags(Arc::new(o), handle_flags));
     }
 
@@ -9917,6 +9935,62 @@ mod tests {
             // Readable console handle succeeds.
             assert_eq!(GetNumberOfConsoleInputEvents(h_conin, &mut count), TRUE);
             assert_eq!(count, 0);
+
+            // CONIN$ opened with GENERIC_READ | GENERIC_WRITE must read/write in_mode (not out_mode),
+            // and CONOUT$ opened with GENERIC_READ must read/write out_mode (not in_mode) and be
+            // rejected by GetNumberOfConsoleInputEvents.
+            let mut orig_in = 0u32;
+            let mut orig_out = 0u32;
+            assert_eq!(GetConsoleMode(h_conin, &mut orig_in), TRUE);
+            assert_eq!(GetConsoleMode(h_conout, &mut orig_out), TRUE);
+
+            let w_conin = to_wide_z("CONIN$");
+            let h_conin_rw = CreateFileW(
+                w_conin.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                3,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_conin_rw, INVALID_HANDLE_VALUE);
+            let w_conout = to_wide_z("CONOUT$");
+            let h_conout_ro = CreateFileW(
+                w_conout.as_ptr(),
+                GENERIC_READ,
+                3,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_conout_ro, INVALID_HANDLE_VALUE);
+
+            assert_eq!(SetConsoleMode(h_conin_rw, 0x0019), TRUE);
+            assert_eq!(GetConsoleMode(h_conin, &mut mode), TRUE);
+            assert_eq!(mode, 0x0019, "CONIN$ RW must update input mode");
+            assert_eq!(GetConsoleMode(h_conin_rw, &mut mode), TRUE);
+            assert_eq!(mode, 0x0019);
+            assert_eq!(GetConsoleMode(h_conout, &mut mode), TRUE);
+            assert_eq!(mode, orig_out, "CONIN$ RW must not overwrite output mode");
+
+            assert_eq!(SetConsoleMode(h_conout_ro, 0x0007), TRUE);
+            assert_eq!(GetConsoleMode(h_conout, &mut mode), TRUE);
+            assert_eq!(mode, 0x0007, "CONOUT$ RO must update output mode");
+            assert_eq!(GetConsoleMode(h_conout_ro, &mut mode), TRUE);
+            assert_eq!(mode, 0x0007);
+            assert_eq!(GetConsoleMode(h_conin, &mut mode), TRUE);
+            assert_eq!(mode, 0x0019, "CONOUT$ RO must not overwrite input mode");
+
+            assert_eq!(GetNumberOfConsoleInputEvents(h_conin_rw, &mut count), TRUE);
+            assert_eq!(GetNumberOfConsoleInputEvents(h_conout_ro, &mut count), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            assert_eq!(SetConsoleMode(h_conin, orig_in), TRUE);
+            assert_eq!(SetConsoleMode(h_conout, orig_out), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(h_conin_rw), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(h_conout_ro), TRUE);
 
             assert_eq!(crate::kernel32::threads::CloseHandle(h_conin), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(h_conout), TRUE);
