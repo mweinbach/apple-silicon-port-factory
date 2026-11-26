@@ -703,7 +703,8 @@ impl Queue {
         self.timeline_state
             .store(Self::pack_timeline_state(v + 1, false), Ordering::Release);
         if !logs.is_empty() {
-            self.timeline.on_completion(v, Box::new(move || super::passtiming::resolve(logs)));
+            self.timeline
+                .on_completion_no_flush(v, Box::new(move || super::passtiming::resolve(logs)));
         }
         v
     }
@@ -768,7 +769,8 @@ impl Queue {
             self.timeline_state
                 .store(Self::pack_timeline_state(v + 1, false), Ordering::Release);
             if !logs.is_empty() {
-                self.timeline.on_completion(v, Box::new(move || super::passtiming::resolve(logs)));
+                self.timeline
+                    .on_completion_no_flush(v, Box::new(move || super::passtiming::resolve(logs)));
             }
             v
         };
@@ -1023,9 +1025,14 @@ impl Queue {
         } else {
             f.sig_value.fetch_max(v, O::AcqRel);
         }
+        let has_unmet_wait = {
+            let wt = f.wait_target.load(O::SeqCst);
+            wt != 0 && f.completed_raw() < wt
+        };
         if self.kind == ListType::Direct
             && !self.is_swapchain_internal
             && self.opt_fence_signal_coalesce.load(O::Relaxed)
+            && !has_unmet_wait
         {
             let ev_key = f.ev_key();
             let f_ptr = f as *const Fence as usize;
@@ -1039,7 +1046,7 @@ impl Queue {
                 let max_v = existing.val;
                 drop(ds);
                 f.pending_sig_value.store(max_v, O::Release);
-                f.pending_sig_queue.store(me, O::Release);
+                f.pending_sig_queue.store(me, O::SeqCst);
             } else {
                 ds.push(DeferredFenceSig {
                     ev_key,
@@ -1054,11 +1061,19 @@ impl Queue {
                 f.poll_epoch.store(cur_epoch, O::Release);
                 f.poll_count.store(0, O::Release);
                 f.pending_sig_value.store(v, O::Release);
-                f.pending_sig_queue.store(me, O::Release);
+                f.pending_sig_queue.store(me, O::SeqCst);
+            }
+            // Dekker `SeqCst` handshake with `Queue::wait_with`: if a concurrent
+            // cross-queue wait published `wait_target` while we were deferring,
+            // flush immediately so it can never deadlock even with `AW2_D3D_CS=0`.
+            let wt_after = f.wait_target.load(O::SeqCst);
+            if wt_after != 0 && f.completed_raw() < wt_after {
+                self.flush_fence_signals_locked();
             }
             return;
         }
         self.flush_pending_cbs_locked();
+        self.flush_fence_signals_locked();
         self.q.signalEvent_value(ProtocolObject::from_ref(&*f.ev), v);
     }
 
@@ -1075,11 +1090,21 @@ impl Queue {
     pub(crate) fn wait_with(&self, f: &Fence, v: u64, list_barrier_tight: bool) {
         use std::sync::atomic::Ordering as O;
         let me = self as *const Queue as usize;
+        let same_q_elided = !list_barrier_tight
+            && f.sig_queue.load(O::Acquire) == me
+            && f.sig_value.load(O::Acquire) >= v;
+        if !same_q_elided && f.completed_raw() < v {
+            // Publish the pending GPU wait before reading `pending_sig_queue`
+            // (Dekker `SeqCst` handshake with `Queue::signal`) so a producer
+            // signaling `f` concurrently or later flushes eagerly instead of
+            // deferring behind this wait (including when `AW2_D3D_CS=0`).
+            f.wait_target.fetch_max(v, O::SeqCst);
+        }
         // Cross-queue wait (or `AW2_LIST_BARRIER_TIGHT=1` same-queue event wait):
         // flush `sig_q`'s deferred fence signals BEFORE acquiring `self.submit` so we
         // never lock `sig_q.submit` inside `self.submit` and `f.ev` is guaranteed to be
         // signaled on `sig_q` prior to `self.q.waitForEvent_value(&f.ev, v)`.
-        let pending_q = f.pending_sig_queue.load(O::Acquire);
+        let pending_q = f.pending_sig_queue.load(O::SeqCst);
         if pending_q != 0
             && (pending_q != me || list_barrier_tight)
             && f.pending_sig_value.load(O::Acquire) >= v
@@ -1811,6 +1836,111 @@ mod tests {
         assert_eq!(TEST_COMMIT_CALLS.load(Ordering::Relaxed) - calls_ml0, 1);
         q.wait_idle();
         assert_eq!(unsafe { *(rb_sig.cpu_ptr().unwrap() as *const u32) }, 0x1122_3344);
+    }
+
+    /// Regression test for cross-queue waits enqueued BEFORE their producer signal
+    /// when fence-signal coalescing is ON and no CS worker thread is running
+    /// (`AW2_D3D_CS=0` inline mode):
+    /// `copy.Wait(f, v)` -> `copy.Signal(g, v)` -> `direct.Signal(f, v)` -> CPU wait / poll `g`.
+    #[test]
+    fn cross_queue_wait_before_signal_makes_progress_without_cs_thread_on_gpu() {
+        use super::super::cmdlist::{CommandAllocator, CommandList};
+        use super::super::resource::Resource;
+        use crate::types::{dim, heap_type, HeapProperties, ResourceDesc};
+        use std::sync::Arc;
+
+        if super::super::device().is_none() {
+            return;
+        }
+        let direct = Queue::new(ListType::Direct, "cross-q wait-before-sig direct").unwrap();
+        let copy = Queue::new(ListType::Copy, "cross-q wait-before-sig copy").unwrap();
+        direct.set_submit_coalesce(true);
+        direct.set_fence_signal_coalesce(true);
+
+        let f = Fence::new(0).unwrap();
+        let g = Fence::new(0).unwrap();
+
+        let make_buf = |ty: u32| -> Resource {
+            let d = ResourceDesc {
+                Dimension: dim::BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleCount: 1,
+                Layout: 1,
+                ..Default::default()
+            };
+            let hp = HeapProperties { Type: ty, ..Default::default() };
+            Resource::new_committed_default(&d, &hp, "cross-q wait-before-sig buf").unwrap()
+        };
+        let up = make_buf(heap_type::UPLOAD);
+        let rb = make_buf(heap_type::READBACK);
+        unsafe { *(up.cpu_ptr().unwrap() as *mut u32) = 0xCAFE_BABE };
+        let a = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l = CommandList::new(ListType::Direct).unwrap();
+        l.begin(&a).unwrap();
+        l.copy_buffer(&rb, 0, &up, 0, 16).unwrap();
+        l.close().unwrap();
+
+        // 1) CPU spin-poll on `g.completed()` after `copy.Wait(f, 1)` -> `copy.Signal(g, 1)`
+        //    -> `direct.Execute([l])` -> `direct.Signal(f, 1)`.
+        copy.wait_with(&f, 1, false);
+        copy.signal(&g, 1);
+        let _ = direct.execute_command_lists(&mut [&mut l]);
+        direct.signal(&f, 1);
+        assert!(
+            !direct.has_pending_cbs.load(Ordering::Acquire)
+                && !direct.has_deferred_signals.load(Ordering::Acquire),
+            "direct.signal(f, 1) must flush eagerly when copy already waits on f >= 1"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while g.completed() < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cross-queue wait-before-signal deadlocked on g.completed()"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(unsafe { *(rb.cpu_ptr().unwrap() as *const u32) }, 0xCAFE_BABE);
+
+        // 2) Blocking `g.wait_cpu(2, 5000)` on a wait-before-signal chain.
+        copy.wait_with(&f, 2, false);
+        copy.signal(&g, 2);
+        direct.signal(&f, 2);
+        assert!(
+            g.wait_cpu(2, 5000),
+            "cross-queue wait-before-signal deadlocked on g.wait_cpu(2)"
+        );
+
+        // 3) `g.on_completion(3, ...)` callback (`SetEventOnCompletion`) on a wait-before-signal chain.
+        copy.wait_with(&f, 3, false);
+        copy.signal(&g, 3);
+        direct.signal(&f, 3);
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_c = fired.clone();
+        g.on_completion(3, Box::new(move || fired_c.store(true, Ordering::Release)));
+        let deadline3 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline3,
+                "cross-queue wait-before-signal deadlocked on g.on_completion(3)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // 4) Once `f` has reached `wait_target` (3), subsequent signals without new
+        //    external waiters resume coalescing normally.
+        assert!(f.wait_cpu(3, 5000));
+        direct.signal(&f, 4);
+        direct.signal(&f, 5);
+        assert!(
+            direct.has_deferred_signals.load(Ordering::Acquire),
+            "fence signals must resume coalescing once prior wait_target is satisfied"
+        );
+        assert!(f.wait_cpu(5, 5000));
+        direct.wait_idle();
+        copy.wait_idle();
     }
 }
 
