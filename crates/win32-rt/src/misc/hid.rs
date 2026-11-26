@@ -315,11 +315,22 @@ struct Pending {
     event: Option<Arc<Event>>,
 }
 
-#[derive(Default)]
 struct HState {
     queue: VecDeque<Vec<u8>>,
+    max_buffers: usize,
     pending: VecDeque<Pending>,
     next_token: u64,
+}
+
+impl Default for HState {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            max_buffers: INPUT_BUFFERS,
+            pending: VecDeque::new(),
+            next_token: 0,
+        }
+    }
 }
 
 pub struct HidHandle {
@@ -421,7 +432,8 @@ impl HidHandle {
             }
             return;
         }
-        if st.queue.len() >= INPUT_BUFFERS {
+        let cap = st.max_buffers.max(2);
+        while st.queue.len() >= cap {
             st.queue.pop_front();
         }
         st.queue.push_back(rep.to_vec());
@@ -871,20 +883,33 @@ pub unsafe extern "win64" fn HidD_FlushQueue(h: HANDLE) -> BOOLEAN {
 }
 
 pub unsafe extern "win64" fn HidD_GetNumInputBuffers(h: HANDLE, n: *mut u32) -> BOOLEAN {
-    if hid_handle(h).is_none() || n.is_null() {
+    let Some(hh) = hid_handle(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if n.is_null() {
         set_err(err::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    *n = INPUT_BUFFERS as u32;
+    let count = hh.st.lock().unwrap().max_buffers as u32;
+    std::ptr::write_unaligned(n, count);
     1
 }
 
 pub unsafe extern "win64" fn HidD_SetNumInputBuffers(h: HANDLE, n: u32) -> BOOLEAN {
-    if hid_handle(h).is_none() || !(2..=512).contains(&n) {
+    let Some(hh) = hid_handle(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if !(2..=512).contains(&n) {
         set_err(err::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    stub!("ring size stays {INPUT_BUFFERS} (asked {n})");
+    let mut st = hh.st.lock().unwrap();
+    st.max_buffers = n as usize;
+    while st.queue.len() > st.max_buffers {
+        st.queue.pop_front();
+    }
     1
 }
 
@@ -1091,6 +1116,28 @@ pub(crate) mod tests {
             assert_eq!(GetOverlappedResultEx(h, &mut ov, &mut n, 2000, FALSE), TRUE);
             assert_eq!(n, 48);
             assert_eq!(be.sent.lock().unwrap().last().unwrap(), &(ReportType::Output, out.to_vec()));
+
+            // HidD_GetNumInputBuffers / HidD_SetNumInputBuffers resize the live ring buffer.
+            let mut nbufs = 0u32;
+            assert_eq!(HidD_GetNumInputBuffers(h, &mut nbufs), 1);
+            assert_eq!(nbufs, INPUT_BUFFERS as u32);
+            assert_eq!(HidD_SetNumInputBuffers(h, 1), 0); // < 2 invalid
+            assert_eq!(HidD_SetNumInputBuffers(h, 513), 0); // > 512 invalid
+            assert_eq!(HidD_SetNumInputBuffers(h, 3), 1);
+            assert_eq!(HidD_GetNumInputBuffers(h, &mut nbufs), 1);
+            assert_eq!(nbufs, 3);
+            for seq in 1u8..=5u8 {
+                let mut r = [0u8; 64];
+                r[0] = 0x01;
+                r[1] = seq;
+                input_report(0xD5_0001, 1, &r);
+            }
+            // Ring cap 3 kept only the 3 most recent reports: seq = 3, 4, 5.
+            for expected in [3u8, 4, 5] {
+                assert_eq!(ReadFile(h, buf.as_mut_ptr().cast(), 64, &mut got, &mut ov), TRUE);
+                assert_eq!(buf[1], expected);
+            }
+            assert_eq!(HidD_SetNumInputBuffers(h, INPUT_BUFFERS as u32), 1);
 
             // Removal fails pending reads and later requests.
             assert_eq!(ReadFile(h, buf.as_mut_ptr().cast(), 64, &mut got, &mut ov), FALSE);
