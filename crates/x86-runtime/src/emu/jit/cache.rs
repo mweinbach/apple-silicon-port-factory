@@ -8,6 +8,7 @@ use super::stubs::{emit_stubs, plaincall_enabled};
 use super::translate::{
     classify, op_flags, supported, FlagState, Grp, SideExit, SlowMem, Src, SysCold, Term, Tr,
 };
+use super::x87::X87Cold;
 use super::xmm::{fast_nan_enabled, retlit_enabled, xmm_pin_enabled, xmmreg_enabled, ColdNan};
 use super::*;
 use crate::emu::exec_mem::{alloc_jit, free_jit, icache_invalidate, jit_writable, jit_write_protect};
@@ -178,6 +179,13 @@ fn fast_gpr_writes(op: &FastOp, ins: &iced_x86::Instruction) -> Option<u16> {
         K_POP_R => r0 | (1u16 << 4),
         K_LEAVE => (1u16 << 4) | (1u16 << 5),
         K_XCHG_RR | K_XADD_RR => r0 | (1u16 << (op.r1 & 15)),
+        K_X87 => {
+            if (op.x & 0x3F) == X87_FNSTSW_AX {
+                1u16 << 0
+            } else {
+                0
+            }
+        }
         _ => return None,
     })
 }
@@ -1097,7 +1105,8 @@ impl JitCache {
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
         cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
-        cpu.jx.x87_state = crate::emu::regfile_ext::x87_state_ptr();
+        cpu.jx.x87_state = crate::emu::x87::x87_state_ptr();
+        cpu.jx.x87_helpers = crate::emu::x87::x87_helpers_ptr();
         cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
         cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
@@ -1197,7 +1206,8 @@ impl JitCache {
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
         cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
-        cpu.jx.x87_state = crate::emu::regfile_ext::x87_state_ptr();
+        cpu.jx.x87_state = crate::emu::x87::x87_state_ptr();
+        cpu.jx.x87_helpers = crate::emu::x87::x87_helpers_ptr();
         cpu.jx.sys_helpers = crate::emu::cpu::sys_helpers_ptr();
         cpu.jx.x87_cw = crate::emu::regfile_ext::x87_cw_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
@@ -1755,6 +1765,8 @@ pub(in crate::emu) struct TrScratch {
     pub(super) tsc_colds: Vec<(usize, usize, bool)>,
     pub(super) sys_colds: Vec<SysCold>,
     pub(super) cold: Vec<ColdNan>,
+    pub(super) x87_colds: Vec<X87Cold>,
+    pub(super) x87_tramp_calls: Vec<usize>,
     pub(super) lits: Vec<(usize, u64)>,
     pub(super) lits128: Vec<(usize, u64, u64)>,
     pub(super) pool: Vec<(u64, usize)>,
@@ -1777,6 +1789,8 @@ impl TrScratch {
             tsc_colds: Vec::new(),
             sys_colds: Vec::new(),
             cold: Vec::new(),
+            x87_colds: Vec::new(),
+            x87_tramp_calls: Vec::new(),
             lits: Vec::new(),
             lits128: Vec::new(),
             pool: Vec::new(),
@@ -1808,6 +1822,8 @@ pub(super) fn new_tr<'a>(
     let tsc_colds = core::mem::take(&mut sc.tsc_colds);
     let mut sys_colds = core::mem::take(&mut sc.sys_colds);
     let mut cold = core::mem::take(&mut sc.cold);
+    let mut x87_colds = core::mem::take(&mut sc.x87_colds);
+    let mut x87_tramp_calls = core::mem::take(&mut sc.x87_tramp_calls);
     let mut lits = core::mem::take(&mut sc.lits);
     let mut lits128 = core::mem::take(&mut sc.lits128);
     let mut pool = core::mem::take(&mut sc.pool);
@@ -1822,6 +1838,8 @@ pub(super) fn new_tr<'a>(
     ymm_colds.clear();
     sys_colds.clear();
     cold.clear();
+    x87_colds.clear();
+    x87_tramp_calls.clear();
     lits.clear();
     lits128.clear();
     pool.clear();
@@ -1879,6 +1897,11 @@ pub(super) fn new_tr<'a>(
         xv: if xmm_pin_enabled() { 0xFFFF } else { 0 },
         xd: 0,
         cold,
+        x87_top_known: None,
+        x87_top_dirty: false,
+        x87_sw_top_dirty: false,
+        x87_colds,
+        x87_tramp_calls,
         retlit: retlit_enabled(),
         lits,
         lits128,

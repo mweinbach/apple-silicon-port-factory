@@ -1100,6 +1100,8 @@ pub(in crate::emu) fn lower(ins: &Instruction) -> FastOp {
         f = g;
     } else if let Some(g) = lower_more(ins, f) {
         f = g;
+    } else if let Some(g) = super::x87::lower_x87(ins, f) {
+        f = g;
     }
     f
 }

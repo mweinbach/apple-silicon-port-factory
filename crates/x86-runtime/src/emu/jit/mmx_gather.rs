@@ -23,7 +23,7 @@ impl Tr<'_> {
     /// (zero-extending bits `[127:64]` of `v(vd)`). Clobbers `XA` and invalidates `self.xa_key`.
     fn load_mmx_d(&mut self, vd: u32, mm: u8) {
         self.load_x87_ptr_into_xa();
-        self.a.ldur_stur_v(true, 64, vd, XA, X87_OFF_REGS + (mm as i32 & 7) * 10);
+        self.a.ldur_stur_v(true, 64, vd, XA, X87_OFF_REGS + (mm as i32 & 7) * 16);
     }
 
     /// Transition x87 state to MMX mode (`top = 0`, `valid_mask = 0xFF`). Clobbers `XA`, `XS`
@@ -33,19 +33,26 @@ impl Tr<'_> {
         self.a.str(8, ZR, XA, X87_OFF_TOP);
         self.a.movz(false, XS, 0xFF, 0);
         self.a.str(8, XS, XA, X87_OFF_VALID_MASK);
+        self.x87_top_known = Some(0);
+        self.x87_top_dirty = false;
+        self.x87_sw_top_dirty = true;
     }
 
-    /// Store `d(vd)` into `X87State::regs[mm][0..8]`, fill exponent bytes `[8..10]` with `0xFFFF`,
-    /// and set `top = 0`, `valid_mask = 0xFF`. Clobbers `XA`, `XS` and invalidates `self.xa_key`.
+    /// Store `d(vd)` into `X87State::regs[mm][0..8]`, fill exponent bytes `[8..10]` with `0xFFFF`
+    /// (zeroing slot padding `[10..16]`), and set `top = 0`, `valid_mask = 0xFF`. Clobbers `XA`,
+    /// `XS` and invalidates `self.xa_key`.
     fn store_mmx_d_and_tag(&mut self, vd: u32, mm: u8) {
-        let off = X87_OFF_REGS + (mm as i32 & 7) * 10;
+        let off = X87_OFF_REGS + (mm as i32 & 7) * 16;
         self.load_x87_ptr_into_xa();
         self.a.ldur_stur_v(false, 64, vd, XA, off);
         self.a.movz(false, XS, 0xFFFF, 0);
-        self.a.ldur_stur(false, 16, XS, XA, off + 8);
+        self.a.ldur_stur(false, 64, XS, XA, off + 8);
         self.a.str(8, ZR, XA, X87_OFF_TOP);
         self.a.movz(false, XS, 0xFF, 0);
         self.a.str(8, XS, XA, X87_OFF_VALID_MASK);
+        self.x87_top_known = Some(0);
+        self.x87_top_dirty = false;
+        self.x87_sw_top_dirty = true;
     }
 
     /// Emit one 128-bit lane of `K_VEXT_*` on `(v0 = a, v1 = b) -> v0`. Preserves `v6`, `v7`, NZCV.
@@ -363,8 +370,8 @@ impl Tr<'_> {
                 }
                 if is_mmx {
                     self.load_x87_ptr_into_xa();
-                    self.a.ldur_stur(true, 64, T1, XA, X87_OFF_REGS + (op.r0 as i32 & 7) * 10);
-                    self.a.ldur_stur(true, 64, T2, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
+                    self.a.ldur_stur(true, 64, T1, XA, X87_OFF_REGS + (op.r0 as i32 & 7) * 16);
+                    self.a.ldur_stur(true, 64, T2, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 16);
                     self.emit_maskmov_8bytes(k, false);
                     self.emit_mmx_tag_valid();
                 } else {
@@ -488,6 +495,7 @@ impl Tr<'_> {
             }
             K_MMX_MISC => match op.x & 0x3F {
                 MMX_EMMS => {
+                    self.flush_x87_top();
                     self.load_x87_ptr_into_xa();
                     self.a.str(8, ZR, XA, X87_OFF_VALID_MASK);
                 }
@@ -502,13 +510,13 @@ impl Tr<'_> {
                 }
                 MMX_MOVD_GM => {
                     self.load_x87_ptr_into_xa();
-                    self.a.ldur_stur(true, 32, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
+                    self.a.ldur_stur(true, 32, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 16);
                     self.wr_gpr(op.r0, 32, T0);
                     self.emit_mmx_tag_valid();
                 }
                 MMX_MOVD_MEM_M => {
                     self.load_x87_ptr_into_xa();
-                    self.a.ldur_stur(true, 32, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
+                    self.a.ldur_stur(true, 32, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 16);
                     self.store_op(k, T0, op, 32);
                     self.emit_mmx_tag_valid();
                 }
@@ -527,13 +535,13 @@ impl Tr<'_> {
                 }
                 MMX_MOVQ_GM => {
                     self.load_x87_ptr_into_xa();
-                    self.a.ldur_stur(true, 64, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
+                    self.a.ldur_stur(true, 64, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 16);
                     self.wr_gpr(op.r0, 64, T0);
                     self.emit_mmx_tag_valid();
                 }
                 MMX_MOVQ_MEM_M => {
                     self.load_x87_ptr_into_xa();
-                    self.a.ldur_stur(true, 64, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
+                    self.a.ldur_stur(true, 64, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 16);
                     self.store_op(k, T0, op, 64);
                     self.emit_mmx_tag_valid();
                 }

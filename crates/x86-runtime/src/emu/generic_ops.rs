@@ -30,7 +30,15 @@ impl Cpu {
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
             }
-            Mnemonic::Nop | Mnemonic::Reservednop | Mnemonic::Pause | Mnemonic::Fnop | Mnemonic::Endbr64 | Mnemonic::Endbr32
+            Mnemonic::Nop
+            | Mnemonic::Reservednop
+            | Mnemonic::Pause
+            | Mnemonic::Fnop
+            | Mnemonic::Fneni
+            | Mnemonic::Fndisi
+            | Mnemonic::Fnsetpm
+            | Mnemonic::Endbr64
+            | Mnemonic::Endbr32
             | Mnemonic::Clflush | Mnemonic::Prefetch | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1
             | Mnemonic::Prefetcht2 | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Prefetchwt1
             | Mnemonic::Wait | Mnemonic::Rdsspd | Mnemonic::Rdsspq => {}
