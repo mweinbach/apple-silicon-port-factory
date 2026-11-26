@@ -173,6 +173,111 @@ fn perf_log_enabled() -> bool {
     })
 }
 
+const FRAME_CSV_HEADER: &str = "frame,elapsed_ms,dt_ms,present_ms,sync,gpu_busy_ms\n";
+
+struct FrameCsvLogger<W: std::io::Write = std::fs::File> {
+    writer: W,
+    prev_ns: Option<u64>,
+    prev_gpu_busy_ns: Option<u64>,
+    line_buf: String,
+}
+
+impl<W: std::io::Write> FrameCsvLogger<W> {
+    fn new(mut writer: W, initial_gpu_busy_ns: Option<u64>) -> std::io::Result<Self> {
+        writer.write_all(FRAME_CSV_HEADER.as_bytes())?;
+        Ok(Self {
+            writer,
+            prev_ns: None,
+            prev_gpu_busy_ns: initial_gpu_busy_ns,
+            line_buf: String::with_capacity(96),
+        })
+    }
+
+    fn record_frame(
+        &mut self,
+        frame: u32,
+        now_ns: u64,
+        present_ns: u64,
+        sync: u32,
+        gpu_busy_total_ns: Option<u64>,
+    ) {
+        use std::fmt::Write as _;
+        let dt_ns = self
+            .prev_ns
+            .map_or(0, |prev| now_ns.saturating_sub(prev));
+        self.prev_ns = Some(now_ns);
+        let gpu_busy_delta_ns = gpu_busy_total_ns.map(|total| {
+            let prev = self.prev_gpu_busy_ns.replace(total).unwrap_or(0);
+            total.saturating_sub(prev)
+        });
+        self.line_buf.clear();
+        let elapsed_ms = now_ns as f64 / 1e6;
+        let dt_ms = dt_ns as f64 / 1e6;
+        let present_ms = present_ns as f64 / 1e6;
+        match gpu_busy_delta_ns {
+            Some(gpu_ns) => {
+                let gpu_ms = gpu_ns as f64 / 1e6;
+                let _ = writeln!(
+                    self.line_buf,
+                    "{frame},{elapsed_ms:.3},{dt_ms:.3},{present_ms:.3},{sync},{gpu_ms:.3}"
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    self.line_buf,
+                    "{frame},{elapsed_ms:.3},{dt_ms:.3},{present_ms:.3},{sync},"
+                );
+            }
+        }
+        let _ = self.writer.write_all(self.line_buf.as_bytes());
+    }
+}
+
+impl FrameCsvLogger<std::fs::File> {
+    fn create(path: &std::path::Path, initial_gpu_busy_ns: Option<u64>) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let file = std::fs::File::create(path)?;
+        Self::new(file, initial_gpu_busy_ns)
+    }
+}
+
+fn frame_csv_path_from_env() -> Option<std::path::PathBuf> {
+    let raw = port_manifest::knobs::get_str("PORT_FRAME_CSV");
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(trimmed))
+    }
+}
+
+/// Process-wide per-frame CSV logger (`PORT_FRAME_CSV=<path>`). Off by default;
+/// when unset this resolves once to `None` so steady-state `Present` pays only
+/// a single relaxed load and predicted branch.
+fn frame_csv_logger() -> Option<&'static Mutex<FrameCsvLogger>> {
+    static LOGGER: OnceLock<Option<Mutex<FrameCsvLogger>>> = OnceLock::new();
+    LOGGER
+        .get_or_init(|| {
+            let path = frame_csv_path_from_env()?;
+            let initial_gpu_busy = d3d12_metal::metal::queue::perf_meter_total_busy_ns();
+            match FrameCsvLogger::create(&path, initial_gpu_busy) {
+                Ok(logger) => {
+                    log::info!(target: "d3d", "PORT_FRAME_CSV: logging per-frame timing to {}", path.display());
+                    Some(Mutex::new(logger))
+                }
+                Err(e) => {
+                    log::warn!(target: "d3d", "PORT_FRAME_CSV: failed to create {}: {e}", path.display());
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 pub unsafe fn create(factory: *mut Obj<Factory>, queue: *mut c_void, hwnd: usize, desc: SwapChainDesc1, fs: Option<FullscreenDesc>, out: *mut *mut c_void) -> HRESULT {
     *out = std::ptr::null_mut();
     let Some(q) = super::queue::from_ptr(queue) else {
@@ -229,7 +334,10 @@ pub unsafe fn create(factory: *mut Obj<Factory>, queue: *mut c_void, hwnd: usize
     } else {
         3
     };
-    if perf_log_enabled() {
+    if frame_csv_path_from_env().is_some() {
+        d3d12_metal::metal::queue::enable_perf_meter();
+        let _ = frame_csv_logger();
+    } else if perf_log_enabled() {
         d3d12_metal::metal::queue::enable_perf_meter();
     }
     let latency = Arc::new(Semaphore::new(max_latency as i32, 16, None));
@@ -424,6 +532,13 @@ unsafe fn present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
                 }
             }
             drop(st);
+            if let Some(csv) = frame_csv_logger() {
+                let now_ns = crate::hitch::now_ns();
+                let gpu_busy_total_ns = d3d12_metal::metal::queue::perf_meter_total_busy_ns();
+                if let Ok(mut guard) = csv.lock() {
+                    guard.record_frame(n, now_ns, present_ns, sync, gpu_busy_total_ns);
+                }
+            }
             crate::present::on_present(crate::present::PresentApi::D3d12, s.hwnd, present_ns);
             S_OK
         }
@@ -976,5 +1091,73 @@ mod tests {
             Some(v) => std::env::set_var("PORT_HEADLESS", v),
             None => std::env::remove_var("PORT_HEADLESS"),
         }
+    }
+
+    #[test]
+    fn frame_csv_logger_formats_header_rows_and_gpu_busy_deltas() {
+        let mut logger = FrameCsvLogger::new(Vec::new(), Some(500_000)).expect("header write");
+        // Frame 1: dt_ms == 0.000, gpu_busy delta == 2.500 ms (3_000_000 - 500_000).
+        logger.record_frame(1, 10_000_000, 234_000, 1, Some(3_000_000));
+        // Frame 2: dt_ms == 16.500 ms, present_ms == 0.075 ms, sync == 0, gpu_busy delta == 9.750 ms.
+        logger.record_frame(2, 26_500_000, 75_000, 0, Some(12_750_000));
+        // Frame 3: GPU busy unavailable -> empty trailing column (no fabricated zero).
+        logger.record_frame(3, 39_000_000, 50_000, 0, None);
+
+        let csv = String::from_utf8(logger.writer).expect("valid utf8");
+        assert_eq!(
+            csv,
+            concat!(
+                "frame,elapsed_ms,dt_ms,present_ms,sync,gpu_busy_ms\n",
+                "1,10.000,0.000,0.234,1,2.500\n",
+                "2,26.500,16.500,0.075,0,9.750\n",
+                "3,39.000,12.500,0.050,0,\n",
+            )
+        );
+    }
+
+    #[test]
+    fn frame_csv_logger_create_writes_file_and_reads_env() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("PORT_FRAME_CSV");
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("PORT_FRAME_CSV", v),
+                    None => std::env::remove_var("PORT_FRAME_CSV"),
+                }
+            }
+        }
+        let _restore = Restore(prev);
+
+        std::env::remove_var("PORT_FRAME_CSV");
+        assert_eq!(frame_csv_path_from_env(), None, "PORT_FRAME_CSV must default off");
+
+        let dir = std::env::temp_dir().join(format!(
+            "port-frame-csv-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join("nested").join("frames.csv");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        std::env::set_var("PORT_FRAME_CSV", &path);
+        assert_eq!(frame_csv_path_from_env().as_deref(), Some(path.as_path()));
+
+        let mut logger = FrameCsvLogger::create(&path, None).expect("create csv file");
+        logger.record_frame(1, 1_500_000, 120_000, 1, None);
+        logger.record_frame(2, 18_167_000, 90_000, 1, Some(4_250_000));
+        drop(logger);
+
+        let body = std::fs::read_to_string(&path).expect("read csv file");
+        assert_eq!(
+            body,
+            concat!(
+                "frame,elapsed_ms,dt_ms,present_ms,sync,gpu_busy_ms\n",
+                "1,1.500,0.000,0.120,1,\n",
+                "2,18.167,16.667,0.090,1,4.250\n",
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

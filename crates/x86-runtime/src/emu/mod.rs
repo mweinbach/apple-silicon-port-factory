@@ -143,7 +143,8 @@ pub use mem::note_code_region;
 
 pub use routes::{
     resolve_dispatch, resolve_host_callable, to_mapped_addr, DF_FLOAT_RET, DF_GAME_REPL, DF_HOST,
-    DF_IAT, DF_LEAN, DF_MARK, DF_PLAIN, DF_SHADOW, DF_TRACE, DF_VALID, EXE_ROUTED, EXE_ROUTE_OFF,
+    DF_IAT, DF_LEAN, DF_MARK, DF_PLAIN, DF_PLAIN_STACK, DF_PLAIN_XMM, DF_SHADOW, DF_TRACE,
+    DF_VALID, EXE_ROUTED, EXE_ROUTE_OFF,
     LEAN_FLAGS,
 };
 #[cfg(target_arch = "aarch64")]

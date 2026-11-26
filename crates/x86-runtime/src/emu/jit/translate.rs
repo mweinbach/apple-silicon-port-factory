@@ -225,6 +225,33 @@ pub(super) struct SlowMem {
     pub(super) lo: i32,
 }
 
+/// Out-of-line 2-way inline-cache miss / budget / RAS-miss tails for indirect branches.
+#[derive(Clone, Copy)]
+pub(super) enum IcCold {
+    /// Indirect `jmp` or non-RAS `ret`: probes way 1 at `[XA, #16]`, else populates via `lookup_stub`.
+    Branch {
+        miss_ne: usize,
+        miss_zero: usize,
+        hot_hit: usize,
+        bud_fix: Option<usize>,
+        lookup_stub: usize,
+    },
+    /// Indirect `call`: probes way 1 at `[XA, #16]`, else calls/branches `lookup_call_ic`.
+    Call {
+        miss_ne: usize,
+        miss_zero: usize,
+        hot_hit: usize,
+        bud_fix: Option<usize>,
+        unal_fix: Option<usize>,
+        hot_landing: Option<usize>,
+    },
+    /// RAS-enabled `ret` miss: loads `&ic_table[slot]` into `T4` and branches to `ras_miss_ic`.
+    RetRasMiss {
+        miss_fix: usize,
+        slot_byte_off: u32,
+    },
+}
+
 pub(super) struct Tr<'a> {
     pub(super) a: Asm,
     pub(super) ops: &'a [FastOp],
@@ -245,6 +272,10 @@ pub(super) struct Tr<'a> {
     pub(super) lookup_rip: usize,
     pub(super) lookup_jmp: usize,
     pub(super) lookup_call: usize,
+    pub(super) lookup_rip_ic: usize,
+    pub(super) lookup_jmp_ic: usize,
+    pub(super) lookup_call_ic: usize,
+    pub(super) ras_miss_ic: usize,
     /// See `JitCache::host_xfer`.
     pub(super) host_xfer: usize,
     /// Shared XMM spill/reload stubs (0 when `PORT_JIT_XMM_PIN=0`) and `clear_ymm_hi` stub.
@@ -284,6 +315,8 @@ pub(super) struct Tr<'a> {
     pub(super) tsc_colds: Vec<(usize, usize, bool)>,
     /// Deferred cold paths for system/state ops (`#GP(0)`, non-AFP `ldmxcsr`, XSTATE abnormal exit).
     pub(super) sys_colds: Vec<SysCold>,
+    /// Deferred cold paths for per-site indirect-branch inline caches.
+    pub(super) ic_colds: Vec<IcCold>,
     /// Bitmasks of guest `xmm0..15` whose upper bits `[127:32]` / `[127:64]` are known 0.
     pub(super) xmm_hi32_zero: u16,
     pub(super) xmm_hi64_zero: u16,
@@ -603,6 +636,7 @@ impl Tr<'_> {
         self.emit_cold_nan();
         self.emit_x87_colds();
         self.emit_sys_colds();
+        self.emit_ic_colds();
         let mut ses = core::mem::take(&mut self.side_exits);
         for se in &ses {
             if se.fix == usize::MAX {
@@ -657,6 +691,7 @@ impl Tr<'_> {
         self.ymm_colds.clear();
         self.tsc_colds.clear();
         self.sys_colds.clear();
+        self.ic_colds.clear();
         self.cold.clear();
         self.x87_colds.clear();
         self.x87_tramp_calls.clear();
@@ -674,6 +709,7 @@ impl Tr<'_> {
         sc.ymm_colds = self.ymm_colds;
         sc.tsc_colds = self.tsc_colds;
         sc.sys_colds = self.sys_colds;
+        sc.ic_colds = self.ic_colds;
         sc.cold = self.cold;
         sc.x87_colds = self.x87_colds;
         sc.x87_tramp_calls = self.x87_tramp_calls;
@@ -719,6 +755,233 @@ impl Tr<'_> {
             self.exit_to(fall);
         } else {
             self.a.b_to(self.lookup_call);
+        }
+    }
+
+    /// Indirect guest call (`T0` = dynamic target, `fall` = return address) with a per-site
+    /// 2-way polymorphic inline cache backed by `Cpu::jx.ic_table` (W^X & shifted-base safe).
+    /// Way 0 is checked inline in the hot path with a dedicated `blr x2`/`br x2` BTB entry;
+    /// way 1 and miss populate live out-of-line in [`Self::emit_ic_colds`].
+    pub(super) fn call_ic_or_lookup(&mut self, op_ip: u64, fall: u64) {
+        if !ic_enabled() || self.lookup_call_ic == 0 {
+            self.call_lookup(fall);
+            return;
+        }
+        self.mov_lit(T3, fall);
+        let off = super::cache::ic_slot_byte_off(op_ip);
+        self.a.ldr(64, XA, XCPU, OFF_IC_TABLE);
+        if off != 0 {
+            self.a.movz(true, XS, off, 0);
+            self.a.addsub_rr(true, false, false, XA, XA, XS, 0);
+        }
+        self.a.ldp_x(T1, T2, XA, 0);
+        self.a.addsub_rr(true, true, true, ZR, T1, T0, 0); // cmp x1, x0
+        let miss_ne = self.a.bcond(NE);
+        let miss_zero = self.a.cbz(true, T2);
+        let hot_hit = self.a.pos;
+        let unal_fix = if pushpop_enabled() {
+            self.a.str_pre(T3, g(4), -8);
+            None
+        } else {
+            self.a.addsub_ri(true, true, false, XA, g(4), 8, false);
+            self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(7, true).unwrap());
+            let unal = self.a.cbnz(true, XS);
+            if mem::tso() && stack_tso() {
+                self.a.stlr(64, T3, XA);
+            } else {
+                self.a.str(64, T3, XA, 0);
+            }
+            self.a.mov_rr(true, g(4), XA);
+            Some(unal)
+        };
+        let adr = if self.ras_miss != 0 {
+            let a_pos = self.a.adr(T1);
+            super::stubs::ras_push(&mut self.a, T3, T1);
+            Some(a_pos)
+        } else {
+            None
+        };
+        let bud_fix = if budget_backedge_enabled() {
+            if budget_light_enabled() {
+                self.a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
+            }
+            Some(self.a.tbnz(XBUD, 63))
+        } else {
+            None
+        };
+        let hot_landing = if let Some(adr_pos) = adr {
+            self.a.blr(T2);
+            let land = self.a.pos;
+            self.a.patch_adr(adr_pos, land);
+            self.exit_to(fall);
+            Some(land)
+        } else {
+            self.a.br(T2);
+            None
+        };
+        self.ic_colds.push(IcCold::Call {
+            miss_ne,
+            miss_zero,
+            hot_hit,
+            bud_fix,
+            unal_fix,
+            hot_landing,
+        });
+    }
+
+    /// Indirect guest jump (`T0` = dynamic target) with a per-site 2-way polymorphic IC.
+    pub(super) fn jmp_ic_or_lookup(&mut self, op_ip: u64) {
+        if !ic_enabled() || self.lookup_jmp_ic == 0 {
+            self.a.b_to(self.lookup_jmp);
+            return;
+        }
+        self.emit_branch_ic(op_ip, self.lookup_jmp_ic, false);
+    }
+
+    /// Non-RAS `ret` (`T0` = return target) with a per-site 2-way polymorphic IC.
+    pub(super) fn ret_no_ras_ic_or_lookup(&mut self, op_ip: u64) {
+        if !ic_enabled() || self.lookup_rip_ic == 0 {
+            self.a.b_to(self.lookup_rip);
+            return;
+        }
+        self.emit_branch_ic(op_ip, self.lookup_rip_ic, true);
+    }
+
+    fn emit_branch_ic(&mut self, op_ip: u64, lookup_stub: usize, rip_bud_light: bool) {
+        let off = super::cache::ic_slot_byte_off(op_ip);
+        self.a.ldr(64, XA, XCPU, OFF_IC_TABLE);
+        if off != 0 {
+            self.a.movz(true, XS, off, 0);
+            self.a.addsub_rr(true, false, false, XA, XA, XS, 0);
+        }
+        self.a.ldp_x(T1, T2, XA, 0);
+        self.a.addsub_rr(true, true, true, ZR, T1, T0, 0); // cmp x1, x0
+        let miss_ne = self.a.bcond(NE);
+        let miss_zero = self.a.cbz(true, T2);
+        let hot_hit = self.a.pos;
+        let bud = budget_backedge_enabled();
+        let bud_light = budget_light_enabled();
+        if bud_light && (rip_bud_light || bud) {
+            self.a.addsub_ri(true, true, false, XBUD, XBUD, 2, false);
+        }
+        let bud_fix = bud.then(|| self.a.tbnz(XBUD, 63));
+        self.a.br(T2);
+        self.ic_colds.push(IcCold::Branch {
+            miss_ne,
+            miss_zero,
+            hot_hit,
+            bud_fix,
+            lookup_stub,
+        });
+    }
+
+    /// Emit out-of-line 2-way IC way-1 probes, miss stub calls, and budget exits.
+    pub(super) fn emit_ic_colds(&mut self) {
+        let mut ic_colds = core::mem::take(&mut self.ic_colds);
+        for &ic in &ic_colds {
+            match ic {
+                IcCold::Branch { miss_ne, miss_zero, hot_hit, bud_fix, lookup_stub } => {
+                    self.a.bind(miss_ne);
+                    self.a.bind(miss_zero);
+                    self.a.ldp_x(T1, T2, XA, 16);
+                    self.a.addsub_rr(true, true, true, ZR, T1, T0, 0); // cmp x1, x0
+                    let miss_w1 = self.a.bcond(NE);
+                    let hit_w1 = self.a.cbnz(true, T2);
+                    self.a.patch(hit_w1, hot_hit);
+                    self.a.bind(miss_w1);
+                    self.a.mov_rr(true, T4, XA);
+                    self.a.b_to(lookup_stub);
+                    if let Some(bf) = bud_fix {
+                        self.a.bind(bf);
+                        self.a.str(64, T0, XCPU, OFF_RIP);
+                        self.a.movz(false, T0, EXIT_RIP as u32, 0);
+                        self.a.b_to(self.exit);
+                    }
+                }
+                IcCold::Call { miss_ne, miss_zero, hot_hit, bud_fix, unal_fix, hot_landing } => {
+                    self.a.bind(miss_ne);
+                    self.a.bind(miss_zero);
+                    self.a.ldp_x(T1, T2, XA, 16);
+                    self.a.addsub_rr(true, true, true, ZR, T1, T0, 0); // cmp x1, x0
+                    let miss_w1 = self.a.bcond(NE);
+                    let hit_w1 = self.a.cbnz(true, T2);
+                    self.a.patch(hit_w1, hot_hit);
+                    self.a.bind(miss_w1);
+                    self.a.mov_rr(true, T4, XA);
+                    if let Some(land) = hot_landing {
+                        self.a.bl_to(self.lookup_call_ic);
+                        let b_land = self.a.b();
+                        self.a.patch(b_land, land);
+                    } else {
+                        self.a.b_to(self.lookup_call_ic);
+                    }
+                    if let Some(uf) = unal_fix {
+                        self.a.bind(uf);
+                        if let Some(land) = hot_landing {
+                            self.a.bl_to(self.lookup_call);
+                            let b_land = self.a.b();
+                            self.a.patch(b_land, land);
+                        } else {
+                            self.a.b_to(self.lookup_call);
+                        }
+                    }
+                    if let Some(bf) = bud_fix {
+                        self.a.bind(bf);
+                        self.a.str(64, T0, XCPU, OFF_RIP);
+                        self.a.movz(false, T0, EXIT_RIP as u32, 0);
+                        self.a.b_to(self.exit);
+                    }
+                }
+                IcCold::RetRasMiss { miss_fix, slot_byte_off } => {
+                    self.a.bind(miss_fix);
+                    self.a.ldr(64, T4, XCPU, OFF_IC_TABLE);
+                    if slot_byte_off != 0 {
+                        self.a.movz(true, XS, slot_byte_off, 0);
+                        self.a.addsub_rr(true, false, false, T4, T4, XS, 0);
+                    }
+                    self.a.b_to(self.ras_miss_ic);
+                }
+            }
+        }
+        ic_colds.clear();
+        self.ic_colds = ic_colds;
+    }
+
+    /// Emit a tail-jump transfer to a statically host/routed target (`Term::Jmp` or taken
+    /// `Term::Jcc` when `target_host` is true): tries inline `plain_call`, guarded IAT
+    /// `plain_call`, or `host_xfer` (keeping execution in translated code instead of leaving
+    /// with `EXIT_JMP`/`EXIT_JCC`).
+    pub(super) fn emit_tail_target(&mut self, t: u64, fall: u64, lbk: [u8; 4], exit_code: u64) {
+        if let Some((h, bail, needs_xmm)) = super::cache::inline_host_fn_kind(t) {
+            self.plain_call(h, t, lbk, true, bail.then_some((t, fall)), 0, needs_xmm);
+        } else if let Some((slot, v, h, bail, needs_xmm)) = super::cache::iat_slot_plain(t) {
+            self.mov_lit(XA, slot);
+            self.a.ldr(64, T0, XA, 0);
+            self.mov_slot_val(XS, v, slot);
+            self.a.addsub_rr(true, true, true, ZR, T0, XS, 0); // cmp x0, x17
+            let slow = self.a.bcond(NE);
+            self.plain_call(h, v, lbk, true, bail.then_some((v, fall)), slot, needs_xmm);
+            self.a.bind(slow);
+            if self.host_xfer != 0 {
+                self.xfer_to(t, fall, 1);
+            } else {
+                self.exit_code(exit_code, fall, t);
+            }
+        } else if !super::stubs::plaincall_enabled()
+            && self.host_xfer != 0
+            && t != 0
+            && !is_chkstk(t)
+            && !crate::emu::is_routed_dll_chkstk(t)
+            && !crate::emu::is_routed_dll_stack_pos(t)
+            && !crate::emu::is_routed_regfile(t)
+            && !crate::emu::is_routed_dll_stub(t)
+        {
+            self.mov_lit(T0, t);
+            self.a.b_to(self.lookup_jmp);
+        } else if self.host_xfer != 0 {
+            self.xfer_to(t, fall, 1);
+        } else {
+            self.exit_code(exit_code, fall, t);
         }
     }
 

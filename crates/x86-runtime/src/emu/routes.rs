@@ -632,7 +632,7 @@ pub const DF_TRACE: u32 = 16;
 /// `host_fn` is an integer-only win32-rt builtin (at most 8 args, no XMM or stack
 /// args, never calls back into guest code): `call_va8` calls it directly.
 pub const DF_PLAIN: u32 = 32;
-/// `AW2_JOB_MARK` target: the bridges record the call as a `jobprof::K_MARK` span.
+/// `PORT_JOB_MARK` target: the bridges record the call as a `jobprof::K_MARK` span.
 pub const DF_MARK: u32 = 64;
 /// `host_fn` is a compiled game replacement and the call needs no other ABI fixup (no
 /// `DF_FLOAT_RET` / `DF_MARK` / `DF_TRACE`; see [`LEAN_FLAGS`]). `call_va8` and
@@ -650,6 +650,13 @@ pub const DF_SHADOW: u32 = 256;
 /// address. Only [`resolve_dispatch_memo`] / [`resolve_dispatch_static`] return it;
 /// [`resolve_dispatch_in`] replaces it by the slot target's resolution at every call.
 pub const DF_IAT: u32 = 512;
+/// Leaf host builtin (`DF_PLAIN`) that takes/returns XMM0..3 (`q0..q3` / `q0`), such as
+/// pure floating-point math (`sinf`/`cosf`/`powf`/...) or XMM-using Win32/CRT leaves.
+pub const DF_PLAIN_XMM: u32 = 1024;
+/// Leaf host builtin (`DF_PLAIN`) that reads stack arguments 9..16 (`[rsp+0x40..0x80]`)
+/// in addition to register/stack args 1..8. Eligible for widened `xfer_plain` (not 8-arg
+/// in-block `plain_call` or `table` plain-host caching).
+pub const DF_PLAIN_STACK: u32 = 2048;
 
 /// ABI fixup flags of a call target (independent of which host fn implements it).
 #[cold]
@@ -703,8 +710,19 @@ fn resolve_dispatch_slow(va: u64) -> (usize, u32) {
             return (slot, f | DF_IAT);
         }
     }
-    if f == DF_VALID | DF_HOST && (is_plain_builtin(h) || crate::hooks::is_extra_plain_native(h)) {
-        f |= DF_PLAIN;
+    if f == DF_VALID | DF_HOST {
+        if is_plain_builtin(h) || crate::hooks::is_extra_plain_native(h) {
+            f |= DF_PLAIN;
+        } else if is_plain_xmm_builtin(h) {
+            f |= DF_PLAIN | DF_PLAIN_XMM;
+        }
+        #[cfg(test)]
+        {
+            let extra = test_extra_plain_flags(h);
+            if extra != 0 {
+                f |= extra;
+            }
+        }
     }
     #[cfg(target_arch = "aarch64")]
     if f == DF_VALID | DF_HOST | DF_GAME_REPL && lean_target(h) {
@@ -752,7 +770,8 @@ fn lean_target(h: usize) -> bool {
     h != 0 && set.as_ref().is_some_and(|v| v.binary_search(&h).is_ok())
 }
 
-/// Hot builtins safe to call without the Win64 bridge (see [`DF_PLAIN`]).
+/// Hot integer-only leaf builtins safe to call without the Win64 bridge (see [`DF_PLAIN`]):
+/// `<= 8` args, no XMM args/ret, never calls back into guest code, never raises SEH.
 fn is_plain_builtin(h: usize) -> bool {
     if h == 0 {
         return false;
@@ -760,12 +779,137 @@ fn is_plain_builtin(h: usize) -> bool {
     static SORTED: std::sync::OnceLock<Box<[usize]>> = std::sync::OnceLock::new();
     let table = SORTED.get_or_init(|| {
         let mut v = win32_rt::plain_builtin_fns().to_vec();
+        // Additional verified pure-host leaf exports (never call guest code, <= 8 int args).
+        const EXTRA_LEAF_EXPORTS: &[(&[&str], &[&str])] = &[
+            (
+                &["xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"],
+                &[
+                    "XInputGetState",
+                    "XInputGetStateEx",
+                    "XInputSetState",
+                    "XInputGetCapabilities",
+                    "XInputEnable",
+                    "XInputGetBatteryInformation",
+                ],
+            ),
+            (
+                &["ucrtbase.dll", "api-ms-win-crt-stdio-l1-1-0.dll", "msvcrt.dll"],
+                &[
+                    "__acrt_iob_func",
+                    "__stdio_common_vsprintf",
+                    "__stdio_common_vswprintf",
+                    "__stdio_common_vsprintf_s",
+                    "__stdio_common_vswprintf_s",
+                    "__stdio_common_vsnprintf_s",
+                    "__stdio_common_vsnwprintf_s",
+                    "__stdio_common_vsscanf",
+                    "__stdio_common_vswscanf",
+                ],
+            ),
+            (
+                &["kernel32.dll", "kernelbase.dll"],
+                &[
+                    "HeapAlloc",
+                    "HeapFree",
+                    "HeapReAlloc",
+                    "HeapSize",
+                    "HeapValidate",
+                    "HeapCompact",
+                    "HeapLock",
+                    "HeapUnlock",
+                    "GetProcessHeap",
+                    "GetSystemTimeAsFileTime",
+                    "GetSystemTimePreciseAsFileTime",
+                    "GetSystemTime",
+                    "GetLocalTime",
+                    "FileTimeToSystemTime",
+                    "SystemTimeToFileTime",
+                    "FileTimeToLocalFileTime",
+                    "LocalFileTimeToFileTime",
+                    "MultiByteToWideChar",
+                    "WideCharToMultiByte",
+                    "lstrlenA",
+                    "lstrlenW",
+                    "lstrcpyA",
+                    "lstrcpyW",
+                    "lstrcpynW",
+                    "GetACP",
+                    "GetOEMCP",
+                    "IsValidCodePage",
+                    "EncodePointer",
+                    "DecodePointer",
+                    "FlsGetValue",
+                    "FlsSetValue",
+                    "VirtualQuery",
+                    "VirtualQueryEx",
+                    "GetCurrentProcessId",
+                    "QueryPerformanceFrequency",
+                    "QueryInterruptTime",
+                    "QueryUnbiasedInterruptTime",
+                ],
+            ),
+        ];
+        for &(dlls, names) in EXTRA_LEAF_EXPORTS {
+            for &dll in dlls {
+                for &name in names {
+                    if let Some(p) = win32_rt::lookup(dll, name) {
+                        v.push(p as usize);
+                    }
+                }
+            }
+        }
         v.retain(|&p| p != 0);
         v.sort_unstable();
         v.dedup();
         v.into_boxed_slice()
     });
     table.binary_search(&h).is_ok()
+}
+
+/// Pure floating-point leaf builtins (`DF_PLAIN | DF_PLAIN_XMM`): `<= 8` GPR args + `xmm0..3`,
+/// returns `(rax, xmm0)`, never calls guest code or raises SEH.
+fn is_plain_xmm_builtin(h: usize) -> bool {
+    if h == 0 {
+        return false;
+    }
+    static SORTED: std::sync::OnceLock<Box<[usize]>> = std::sync::OnceLock::new();
+    let table = SORTED.get_or_init(|| {
+        let mut v = win32_rt::pure_float_math_fns().to_vec();
+        v.retain(|&p| p != 0);
+        v.sort_unstable();
+        v.dedup();
+        v.into_boxed_slice()
+    });
+    table.binary_search(&h).is_ok()
+}
+
+#[cfg(test)]
+static TEST_EXTRA_DF_FLAGS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, u32>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn test_extra_plain_flags(h: usize) -> u32 {
+    TEST_EXTRA_DF_FLAGS
+        .get()
+        .and_then(|m| m.lock().ok().and_then(|g| g.get(&h).copied()))
+        .unwrap_or(0)
+}
+
+/// Test-only: attach extra `DF_PLAIN*` flags (`DF_PLAIN`, `DF_PLAIN_XMM`, `DF_PLAIN_STACK`,
+/// `DF_FLOAT_RET`) to a synthetic host function pointer and bump `va_gen` so `resolve_dispatch`
+/// re-evaluates it. Pass `0` to clear.
+#[cfg(test)]
+pub(crate) fn test_set_extra_plain_flags(host_fn: usize, extra_flags: u32) {
+    let m = TEST_EXTRA_DF_FLAGS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    if extra_flags == 0 {
+        g.remove(&host_fn);
+    } else {
+        g.insert(host_fn, extra_flags);
+    }
+    drop(g);
+    crate::exe::invalidate_dispatch();
 }
 
 /// Host function the translator may call inline (no bridge, no TLS context) in place of

@@ -36,3 +36,25 @@ pub fn is_translated() -> bool {
     let r = unsafe { sysctlbyname(b"sysctl.proc_translated\0".as_ptr(), &mut v as *mut i32 as *mut _, &mut sz, std::ptr::null(), 0) };
     r == 0 && v == 1
 }
+
+/// Read an environment knob preferring the canonical `PORT_*` name over a legacy
+/// `AW2_*` alias, treating empty values as unset (matching `port-manifest::knobs`).
+pub(crate) fn env_canonical_or_alias(canonical: &str, alias: &str) -> Option<String> {
+    std::env::var(canonical)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var(alias).ok().filter(|v| !v.is_empty()))
+}
+
+/// Parse a boolean knob value (`"0"`, `"false"`, `"no"`, `"off"` => `false`; any
+/// other non-empty value => `true`), matching `port-manifest::knobs::get_bool`.
+pub(crate) fn parse_bool_knob(v: &str) -> bool {
+    let t = v.trim();
+    !t.is_empty() && !matches!(t.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+}
+
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
