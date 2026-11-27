@@ -1191,10 +1191,11 @@ pub(super) unsafe fn install_image(
         TEST_VERIFY_MISMATCHES.with(|c| c.set(c.get() + bad_verify));
     }
     // Machine code has already been copied into `MAP_JIT` and any initial load-time
-    // verification is complete. Free the redundant heap `Vec<u32>` unless `verify_mode() != 0`
-    // and there are revivable `DEAD_ASSUME` blocks (`bad_check > 0`) that `revalidate_dir`
-    // would later verify against `m.img.code`.
-    if !test && (verify_mode() == 0 || bad_check == 0) {
+    // verification is complete. Free the redundant heap `Vec<u32>` when `verify_mode() == 0`;
+    // retain it whenever `PORT_AOT_VERIFY` is active because `revalidate_dir` may later
+    // invalidate and revive blocks (even if `bad_check == 0` at initial load) and needs
+    // `m.img.code` for `verify_block`.
+    if !test && verify_mode() == 0 {
         m.img.release_code_heap();
     }
     let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
