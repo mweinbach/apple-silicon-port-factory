@@ -14,7 +14,7 @@ use d3d12_metal::metal::cmdlist::{Barrier, CommandAllocator, CommandList, CopyBo
 use d3d12_metal::metal::descriptor::{self, heap_kind, DescriptorHeap};
 use d3d12_metal::metal::fence::Fence;
 use d3d12_metal::metal::heap::Heap;
-use d3d12_metal::metal::indirect::{ArgumentDesc, IndirectLayout};
+use d3d12_metal::metal::indirect::{arg as indirect_arg, ArgumentDesc, IndirectLayout};
 use d3d12_metal::metal::pipeline::{ComputePipeline, GraphicsDesc, GraphicsPipeline};
 use d3d12_metal::metal::query::{self, QueryHeap};
 use d3d12_metal::metal::queue::{ListType, Queue};
@@ -38,7 +38,8 @@ use crate::golden::{self, FrameImage};
 use crate::pod::{self, IndexBufferView, VertexBufferView};
 use crate::replay::{Backend, Handled, Objects};
 
-const MAX_TIMESTAMPS: u32 = 4096;
+/// Maximum entries allowed by Metal 4's `MTL4CounterHeapDescriptor.count` (4096).
+pub(crate) const DEFAULT_MAX_TIMESTAMPS: u32 = 4096;
 
 /// Live descriptor heap paired with its recorded address space for safe handle remapping.
 struct LiveDescHeap {
@@ -124,22 +125,33 @@ struct LiveCommandList {
     open_ts_slot: Option<u32>,
 }
 
+#[derive(Clone)]
+struct LiveCmdSig {
+    layout: IndirectLayout,
+    /// Byte offsets within each indirect command stride that hold a 64-bit D3D12 GPU virtual
+    /// address (VB/IB views and root CBV/SRV/UAV arguments) requiring capture->live remapping.
+    va_offsets: Vec<u32>,
+}
+
 /// Hardware GPU timestamp state (`MTL4CounterHeap`) for `--bench` `gpu_busy` timing.
 struct GpuTimer {
     heap: QueryHeap,
     readback: Resource,
     alloc: CommandAllocator,
     cl: CommandList,
+    capacity: u32,
     cursor: u32,
+    overflowed: bool,
     pairs: Vec<(u32, u32)>,
 }
 
 impl GpuTimer {
-    fn new() -> Result<Self, String> {
-        let heap = QueryHeap::new(query::heap_type::TIMESTAMP, MAX_TIMESTAMPS)?;
+    fn with_capacity(capacity: u32) -> Result<Self, String> {
+        let cap = capacity.clamp(1, DEFAULT_MAX_TIMESTAMPS);
+        let heap = QueryHeap::new(query::heap_type::TIMESTAMP, cap)?;
         let rb_desc = ResourceDesc {
             Dimension: d3d12_metal::types::dim::BUFFER,
-            Width: MAX_TIMESTAMPS as u64 * 8,
+            Width: cap as u64 * 8,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -152,25 +164,50 @@ impl GpuTimer {
             .map_err(|e| format!("timestamp readback buffer: {e:?}"))?;
         let alloc = CommandAllocator::new(ListType::Direct).ok_or("timestamp resolve allocator")?;
         let cl = CommandList::new(ListType::Direct).ok_or("timestamp resolve command list")?;
-        Ok(Self { heap, readback, alloc, cl, cursor: 0, pairs: Vec::new() })
+        Ok(Self {
+            heap,
+            readback,
+            alloc,
+            cl,
+            capacity: cap,
+            cursor: 0,
+            overflowed: false,
+            pairs: Vec::new(),
+        })
     }
 
     fn reset(&mut self) {
         self.cursor = 0;
+        self.overflowed = false;
         self.pairs.clear();
     }
 
-    fn alloc_slot(&mut self) -> Option<u32> {
-        if self.cursor < MAX_TIMESTAMPS {
+    fn remaining(&self) -> u32 {
+        self.capacity.saturating_sub(self.cursor)
+    }
+
+    fn alloc_slot(&mut self) -> Result<u32, String> {
+        if self.cursor < self.capacity {
             let s = self.cursor;
             self.cursor += 1;
-            Some(s)
+            Ok(s)
         } else {
-            None
+            self.overflowed = true;
+            Err(format!(
+                "benchmark timestamp heap capacity exhausted ({} slots = {} timed command lists)",
+                self.capacity,
+                self.capacity / 2
+            ))
         }
     }
 
     fn resolve_all_iterations_ms(&mut self, queue: &Queue, ranges: &[(usize, usize)]) -> Result<Vec<f64>, String> {
+        if self.overflowed {
+            return Err(format!(
+                "benchmark timestamp heap overflowed ({} slots); timing results would be incomplete",
+                self.capacity
+            ));
+        }
         if self.cursor == 0 || ranges.is_empty() {
             return Ok(vec![0.0; ranges.len()]);
         }
@@ -214,7 +251,7 @@ pub struct MetalBackend {
     va_map: BTreeMap<u64, (u64, u64)>,
     root_sigs: HashMap<u64, Arc<RootSignature>>,
     psos: HashMap<u64, LivePso>,
-    cmd_sigs: HashMap<u64, IndirectLayout>,
+    cmd_sigs: HashMap<u64, LiveCmdSig>,
     fences: HashMap<u64, Arc<Fence>>,
     query_heaps: HashMap<u64, Arc<QueryHeap>>,
     swapchains: HashMap<u64, Swapchain>,
@@ -262,9 +299,15 @@ impl MetalBackend {
     }
 
     pub fn enable_gpu_timing(&mut self, enable: bool) -> Result<(), String> {
+        self.enable_gpu_timing_with_capacity(enable, DEFAULT_MAX_TIMESTAMPS)
+    }
+
+    pub(crate) fn enable_gpu_timing_with_capacity(&mut self, enable: bool, capacity: u32) -> Result<(), String> {
         if enable {
-            if self.gpu_timer.is_none() {
-                self.gpu_timer = Some(GpuTimer::new()?);
+            let cap = capacity.clamp(1, DEFAULT_MAX_TIMESTAMPS);
+            let need_new = self.gpu_timer.as_ref().is_none_or(|t| t.capacity != cap);
+            if need_new {
+                self.gpu_timer = Some(GpuTimer::with_capacity(cap)?);
             }
             self.timing_armed = true;
         } else {
@@ -297,6 +340,16 @@ impl MetalBackend {
     /// Number of completed command-buffer timestamp pairs recorded so far.
     pub fn gpu_timer_pair_count(&self) -> usize {
         self.gpu_timer.as_ref().map_or(0, |t| t.pairs.len())
+    }
+
+    /// Number of timestamp slots currently consumed in the active counter heap.
+    pub fn gpu_timer_used_slots(&self) -> u32 {
+        self.gpu_timer.as_ref().map_or(0, |t| t.cursor)
+    }
+
+    /// Number of unused timestamp slots remaining in the active counter heap.
+    pub fn gpu_timer_remaining_slots(&self) -> u32 {
+        self.gpu_timer.as_ref().map_or(0, |t| t.remaining())
     }
 
     /// Snapshot each live swapchain's current back-buffer index so repeated benchmark
@@ -341,10 +394,9 @@ impl MetalBackend {
             l.cl.begin(alloc)?;
             if self.timing_armed && matches!(l.cl.kind, ListType::Direct | ListType::Compute) {
                 if let Some(timer) = self.gpu_timer.as_mut() {
-                    if let Some(slot) = timer.alloc_slot() {
-                        l.cl.write_timestamp(&timer.heap, slot)?;
-                        ts_slot = Some(slot);
-                    }
+                    let slot = timer.alloc_slot()?;
+                    l.cl.write_timestamp(&timer.heap, slot)?;
+                    ts_slot = Some(slot);
                 }
             }
             l.open_ts_slot = ts_slot;
@@ -401,6 +453,51 @@ impl MetalBackend {
             }
         }
         rec_va
+    }
+
+    /// Copy `src_bytes` into a fresh `UPLOAD` buffer and relocate every 64-bit GPU virtual
+    /// address embedded in each indirect command stride so both GPU expansion kernels and
+    /// CPU-side VB/IB indirect binding observe live Metal buffer addresses.
+    fn build_relocated_indirect_args(
+        &self,
+        sig: &LiveCmdSig,
+        max_count: u32,
+        src_bytes: &[u8],
+    ) -> Result<Arc<Resource>, String> {
+        let len = src_bytes.len();
+        let desc = ResourceDesc {
+            Dimension: d3d12_metal::types::dim::BUFFER,
+            Width: (len as u64).max(16),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleCount: 1,
+            Layout: 1,
+            ..Default::default()
+        };
+        let hp = HeapProperties { Type: d3d12_metal::types::heap_type::UPLOAD, ..Default::default() };
+        let scratch = Arc::new(
+            Resource::new_committed(&desc, &hp, MTLTextureUsage::empty(), "replay relocated indirect args")
+                .map_err(|e| format!("relocated indirect args buffer: {e:?}"))?,
+        );
+        let ptr = scratch
+            .cpu_ptr()
+            .ok_or("relocated indirect args upload buffer missing CPU pointer")?;
+        let mut buf = src_bytes.to_vec();
+        let stride = sig.layout.stride as usize;
+        for cmd in 0..max_count as usize {
+            let base = cmd.saturating_mul(stride);
+            for &va_off in &sig.va_offsets {
+                let pos = base.saturating_add(va_off as usize);
+                if pos + 8 <= buf.len() {
+                    let rec_va = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+                    let live_va = self.translate_gpu_va(rec_va);
+                    buf[pos..pos + 8].copy_from_slice(&live_va.to_le_bytes());
+                }
+            }
+        }
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, len) };
+        Ok(scratch)
     }
 
     fn find_cpu_slot(&self, rec_cpu: u64) -> Option<(u64, usize)> {
@@ -556,10 +653,9 @@ impl Backend for MetalBackend {
                 let mut open_ts_slot = None;
                 if self.timing_armed && matches!(kind, ListType::Direct | ListType::Compute) {
                     if let Some(timer) = self.gpu_timer.as_mut() {
-                        if let Some(slot) = timer.alloc_slot() {
-                            cl.write_timestamp(&timer.heap, slot)?;
-                            open_ts_slot = Some(slot);
-                        }
+                        let slot = timer.alloc_slot()?;
+                        cl.write_timestamp(&timer.heap, slot)?;
+                        open_ts_slot = Some(slot);
                     }
                 }
                 if *initial_pso != 0 {
@@ -690,7 +786,8 @@ impl Backend for MetalBackend {
                     })
                     .collect();
                 let layout = IndirectLayout::new(*byte_stride, &args)?;
-                self.cmd_sigs.insert(*signature, layout);
+                let va_offsets = indirect_va_offsets(&args);
+                self.cmd_sigs.insert(*signature, LiveCmdSig { layout, va_offsets });
                 Ok(Handled::Done)
             }
             Call::CreateFence { fence, initial_value, .. } => {
@@ -942,10 +1039,9 @@ impl Backend for MetalBackend {
                 let mut open_ts_slot = None;
                 if self.timing_armed && matches!(l.cl.kind, ListType::Direct | ListType::Compute) {
                     if let Some(timer) = self.gpu_timer.as_mut() {
-                        if let Some(slot) = timer.alloc_slot() {
-                            l.cl.write_timestamp(&timer.heap, slot)?;
-                            open_ts_slot = Some(slot);
-                        }
+                        let slot = timer.alloc_slot()?;
+                        l.cl.write_timestamp(&timer.heap, slot)?;
+                        open_ts_slot = Some(slot);
                     }
                 }
                 l.open_ts_slot = open_ts_slot;
@@ -962,10 +1058,9 @@ impl Backend for MetalBackend {
                 if let Some(start_slot) = l.open_ts_slot.take() {
                     if self.timing_armed {
                         if let Some(timer) = self.gpu_timer.as_mut() {
-                            if let Some(end_slot) = timer.alloc_slot() {
-                                l.cl.write_timestamp(&timer.heap, end_slot)?;
-                                timer.pairs.push((start_slot, end_slot));
-                            }
+                            let end_slot = timer.alloc_slot()?;
+                            l.cl.write_timestamp(&timer.heap, end_slot)?;
+                            timer.pairs.push((start_slot, end_slot));
                         }
                     }
                 }
@@ -1378,7 +1473,7 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::ExecuteIndirect { list, signature, max_count, args, args_offset, count, count_offset } => {
-                let layout = self
+                let sig = self
                     .cmd_sigs
                     .get(signature)
                     .cloned()
@@ -1397,13 +1492,32 @@ impl Backend for MetalBackend {
                 } else {
                     None
                 };
-                let args_len = (*max_count as usize).saturating_mul(layout.stride as usize);
-                let args_cpu = args_res.shared_slice(*args_offset, args_len);
+                let args_len = (*max_count as usize)
+                    .checked_mul(sig.layout.stride as usize)
+                    .ok_or("ExecuteIndirect args byte length overflow")?;
+                let relocated_scratch = if !sig.va_offsets.is_empty() && args_len > 0 {
+                    let src_bytes = args_res.shared_slice(*args_offset, args_len).ok_or_else(|| {
+                        format!(
+                            "ExecuteIndirect signature {signature:#x} has {} embedded GPU VA field(s), \
+                             but argument buffer {args:#x} has no CPU-accessible or CPU-shadowed copy to relocate",
+                            sig.va_offsets.len()
+                        )
+                    })?;
+                    let scratch = self.build_relocated_indirect_args(&sig, *max_count, src_bytes)?;
+                    self.retired.push(Box::new(Arc::clone(&scratch)));
+                    Some(scratch)
+                } else {
+                    None
+                };
+                let (live_args_va, args_cpu) = match relocated_scratch.as_ref() {
+                    Some(s) => (s.gpu_va, s.shared_slice(0, args_len)),
+                    None => (args_res.gpu_va + args_offset, args_res.shared_slice(*args_offset, args_len)),
+                };
                 let l = self
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
-                l.cl.execute_indirect(&layout, *max_count, args_res.gpu_va + args_offset, args_cpu, count_va)?;
+                l.cl.execute_indirect(&sig.layout, *max_count, live_args_va, args_cpu, count_va)?;
                 Ok(Handled::Done)
             }
             Call::CopyBufferRegion { list, dst, dst_offset, src, src_offset, size } => {
@@ -1676,6 +1790,35 @@ fn bind_pso(cl: &mut CommandList, pso: LivePso) {
         LivePso::Mesh(p) => cl.set_mesh_pipeline(p),
         LivePso::Compute(p) => cl.set_compute_pipeline(p),
     }
+}
+
+/// Compute the byte offset within each indirect command stride of every 64-bit GPU virtual
+/// address field (`VERTEX_BUFFER_VIEW`, `INDEX_BUFFER_VIEW`, `CONSTANT_BUFFER_VIEW`,
+/// `SHADER_RESOURCE_VIEW`, `UNORDERED_ACCESS_VIEW`).
+pub(crate) fn indirect_va_offsets(args: &[ArgumentDesc]) -> Vec<u32> {
+    let mut off = 0u32;
+    let mut out = Vec::new();
+    for &(ty, u) in args {
+        match ty {
+            indirect_arg::DRAW => off = off.saturating_add(16),
+            indirect_arg::DRAW_INDEXED => off = off.saturating_add(20),
+            indirect_arg::DISPATCH | indirect_arg::DISPATCH_MESH => off = off.saturating_add(12),
+            indirect_arg::CONSTANT => off = off.saturating_add(4u32.saturating_mul(u[2])),
+            indirect_arg::CONSTANT_BUFFER_VIEW
+            | indirect_arg::SHADER_RESOURCE_VIEW
+            | indirect_arg::UNORDERED_ACCESS_VIEW => {
+                out.push(off);
+                off = off.saturating_add(8);
+            }
+            indirect_arg::INCREMENTING_CONSTANT => {}
+            indirect_arg::VERTEX_BUFFER_VIEW | indirect_arg::INDEX_BUFFER_VIEW => {
+                out.push(off);
+                off = off.saturating_add(16);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn decode_target_words(desc: Option<&[u8]>) -> Result<Option<[u32; 6]>, String> {

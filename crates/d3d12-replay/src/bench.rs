@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use d3d12_metal::trace::{Call, Reader, Record};
 
-use crate::metal_backend::MetalBackend;
+use crate::metal_backend::{MetalBackend, DEFAULT_MAX_TIMESTAMPS};
 use crate::replay::{Backend, Handled, Objects};
 
 #[derive(Debug, Clone)]
@@ -262,6 +262,14 @@ fn record_list_id(c: &Call) -> Option<u64> {
 /// Run a Metal 4 benchmark on `data`, returning `(BenchReport, MetalBackend)` so callers can
 /// optionally run `--golden` readback on the final rendered frame without replaying twice.
 pub fn run_bench(data: &[u8], opts: &BenchOptions) -> anyhow::Result<(BenchReport, MetalBackend)> {
+    run_bench_with_timer_capacity(data, opts, DEFAULT_MAX_TIMESTAMPS)
+}
+
+pub(crate) fn run_bench_with_timer_capacity(
+    data: &[u8],
+    opts: &BenchOptions,
+    timer_capacity: u32,
+) -> anyhow::Result<(BenchReport, MetalBackend)> {
     let reader = Reader::new(data).map_err(|e| anyhow::anyhow!("{}", e.0))?;
     let mut records = Vec::new();
     for r in reader {
@@ -291,7 +299,10 @@ pub fn run_bench(data: &[u8], opts: &BenchOptions) -> anyhow::Result<(BenchRepor
 
     // 2. Arm hardware GPU timing BEFORE warmup so the `MTL4CounterHeap` and timestamp
     //    paths are resident and warm before measured iteration 0 begins.
-    backend.enable_gpu_timing(true).map_err(|e| anyhow::anyhow!(e))?;
+    backend
+        .enable_gpu_timing_with_capacity(true, timer_capacity)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut max_slots_per_iter = 2u32;
     for iter in 0..opts.warmup {
         backend.reset_gpu_timer();
         objc2::rc::autoreleasepool(|_| -> anyhow::Result<()> {
@@ -307,17 +318,29 @@ pub fn run_bench(data: &[u8], opts: &BenchOptions) -> anyhow::Result<(BenchRepor
             backend.wait_all_idle();
             Ok(())
         })?;
+        max_slots_per_iter = max_slots_per_iter.max(backend.gpu_timer_used_slots());
     }
 
-    // 3. Measured steady-state iterations: accumulate hardware GPU timestamps in one
-    //    `MTL4CounterHeap` across all iterations and resolve once at the end so mid-loop
-    //    counter resolves never perturb GPU frequency or inter-frame timing.
+    // 3. Measured steady-state iterations: accumulate hardware GPU timestamps across
+    //    iterations and flush/recycle in bounded batches only if the counter heap would
+    //    otherwise run out of slots, so normal runs resolve once at the end while huge
+    //    multi-list traces never drop timestamps or report silent 0 ms samples.
     let measured = opts.iterations.max(1);
     backend.reset_gpu_timer();
     let mut frame_samples = Vec::with_capacity(measured);
+    let mut gpu_samples = Vec::with_capacity(measured);
     let mut pair_ranges = Vec::with_capacity(measured);
 
     for iter in 0..measured {
+        if !pair_ranges.is_empty() && backend.gpu_timer_remaining_slots() < max_slots_per_iter {
+            let batch = backend
+                .resolve_bench_gpu_busy_ms(&pair_ranges)
+                .map_err(|e| anyhow::anyhow!("resolve gpu timestamps batch: {e}"))?;
+            gpu_samples.extend(batch);
+            pair_ranges.clear();
+            backend.reset_gpu_timer();
+        }
+        let slots_before = backend.gpu_timer_used_slots();
         let (wall_ms, pair_lo, pair_hi) = objc2::rc::autoreleasepool(|_| -> anyhow::Result<(f64, usize, usize)> {
             backend
                 .prepare_bench_iteration(&reopen_lists, &swapchain_indices)
@@ -335,13 +358,18 @@ pub fn run_bench(data: &[u8], opts: &BenchOptions) -> anyhow::Result<(BenchRepor
             let pair_hi = backend.gpu_timer_pair_count();
             Ok((wall_ms, pair_lo, pair_hi))
         })?;
+        let slots_used = backend.gpu_timer_used_slots().saturating_sub(slots_before);
+        max_slots_per_iter = max_slots_per_iter.max(slots_used);
         pair_ranges.push((pair_lo, pair_hi));
         frame_samples.push(wall_ms);
     }
 
-    let gpu_samples = backend
-        .resolve_bench_gpu_busy_ms(&pair_ranges)
-        .map_err(|e| anyhow::anyhow!("resolve gpu timestamps: {e}"))?;
+    if !pair_ranges.is_empty() {
+        let batch = backend
+            .resolve_bench_gpu_busy_ms(&pair_ranges)
+            .map_err(|e| anyhow::anyhow!("resolve gpu timestamps: {e}"))?;
+        gpu_samples.extend(batch);
+    }
     backend.enable_gpu_timing(false).map_err(|e| anyhow::anyhow!(e))?;
 
     let report = BenchReport {

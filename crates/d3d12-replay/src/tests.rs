@@ -884,3 +884,265 @@ fn metal_backend_bench_repeatable_timing() {
     assert_eq!(pixel_at(&img, 1536, 1536), [192, 192, 192]);
 }
 
+#[test]
+fn indirect_va_offsets_tracks_all_address_bearing_arguments() {
+    use d3d12_metal::metal::indirect::arg as ia;
+
+    let args = [
+        (ia::CONSTANT, [0, 0, 2]),               // offset 0, size 8
+        (ia::VERTEX_BUFFER_VIEW, [0, 0, 0]),     // offset 8, size 16 (VA at 8)
+        (ia::INDEX_BUFFER_VIEW, [0, 0, 0]),      // offset 24, size 16 (VA at 24)
+        (ia::INCREMENTING_CONSTANT, [1, 0, 0]),  // offset 40, size 0
+        (ia::CONSTANT_BUFFER_VIEW, [2, 0, 0]),   // offset 40, size 8 (VA at 40)
+        (ia::SHADER_RESOURCE_VIEW, [3, 0, 0]),   // offset 48, size 8 (VA at 48)
+        (ia::UNORDERED_ACCESS_VIEW, [4, 0, 0]),  // offset 56, size 8 (VA at 56)
+        (ia::DRAW_INDEXED, [0, 0, 0]),           // offset 64, size 20
+    ];
+    assert_eq!(crate::metal_backend::indirect_va_offsets(&args), vec![8, 24, 40, 48, 56]);
+}
+
+#[test]
+fn metal_backend_indirect_args_remap_embedded_gpu_vas() {
+    if !metal_and_converter_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::layout::PlacedFootprint;
+    use d3d12_metal::metal::descriptor::{heap_kind, RESOURCE_DESCRIPTOR_SIZE};
+    use d3d12_metal::metal::indirect::arg as ia;
+    use d3d12_metal::metal::views::SamplerDesc;
+    use d3d12_metal::types::{
+        dim, heap_type, resource_flags, CommandQueueDesc, DescriptorHeapDesc, HeapProperties, ResourceDesc,
+    };
+    use dxil_metal::root_signature::flags::DESCRIPTOR_RANGE_OFFSET_APPEND;
+    use dxil_metal::{
+        DescriptorRange, DescriptorRangeType, RootDescriptor, RootDescriptorKind, RootParameter,
+        RootParameterKind, RootSignatureVersion,
+    };
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    const STATIC_CS: &[u8] = include_bytes!("../../dxil-metal/tests/fixtures/static_samplers.cs.dxil");
+    let cs = signed(STATIC_CS);
+    let srv_range = DescriptorRange {
+        range_type: DescriptorRangeType::Srv,
+        num_descriptors: 1,
+        base_shader_register: 0,
+        register_space: 0,
+        flags: 0,
+        offset_in_descriptors_from_table_start: DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let samp_range = DescriptorRange {
+        range_type: DescriptorRangeType::Sampler,
+        num_descriptors: 2,
+        base_shader_register: 0,
+        register_space: 0,
+        flags: 0,
+        offset_in_descriptors_from_table_start: DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let rs_blob = RootSignatureDesc {
+        version: RootSignatureVersion::V1_1,
+        parameters: vec![
+            RootParameter { kind: RootParameterKind::DescriptorTable(vec![srv_range]), visibility: 0 },
+            RootParameter {
+                kind: RootParameterKind::Descriptor(
+                    RootDescriptorKind::Uav,
+                    RootDescriptor { shader_register: 0, register_space: 0, flags: 0 },
+                ),
+                visibility: 0,
+            },
+            RootParameter { kind: RootParameterKind::DescriptorTable(vec![samp_range]), visibility: 0 },
+        ],
+        static_samplers: vec![],
+        flags: 0,
+    }
+    .to_blob();
+
+    const D: u64 = 0x5000;
+    const Q: u64 = 0x5100;
+    const A: u64 = 0x5200;
+    const L: u64 = 0x5300;
+    const R_SIG: u64 = 0x5400;
+    const P: u64 = 0x5500;
+    const CSIG: u64 = 0x5600;
+    const TEX: u64 = 0x5700;
+    const UP_TEX: u64 = 0x5701;
+    const OUT_BUF: u64 = 0x5702;
+    const ARGS_BUF: u64 = 0x5703;
+    const SRV_HEAP: u64 = 0x5800;
+    const SAMP_HEAP: u64 = 0x5801;
+    const SRV_CPU: u64 = 0x7a00_0000;
+    const SRV_GPU: u64 = 0x8a00_0000;
+    const SAMP_CPU: u64 = 0x7b00_0000;
+    const SAMP_GPU: u64 = 0x8b00_0000;
+    // Deliberately synthetic capture-time GPU VA (invalid in live Metal unless remapped).
+    const CAPTURED_OUT_VA: u64 = 0x4_9000_0000;
+    const CAPTURED_UP_VA: u64 = 0x4_9100_0000;
+    const CAPTURED_ARGS_VA: u64 = 0x4_9200_0000;
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let hp_def = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+    let hp_up = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+    let tdesc = ResourceDesc {
+        Dimension: dim::TEXTURE2D,
+        Width: 4,
+        Height: 4,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: 28,
+        SampleCount: 1,
+        ..Default::default()
+    };
+    let buf_desc = |sz: u64, flags: u32| ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: sz,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        Flags: flags,
+        ..Default::default()
+    };
+    let up_desc = buf_desc(256 * 4, 0);
+    let out_desc = buf_desc(1024, resource_flags::ALLOW_UNORDERED_ACCESS);
+    let args_desc = buf_desc(64, 0);
+
+    let srv_hd = DescriptorHeapDesc {
+        Type: heap_kind::CBV_SRV_UAV,
+        NumDescriptors: 2,
+        Flags: 1,
+        NodeMask: 0,
+    };
+    let samp_hd = DescriptorHeapDesc {
+        Type: heap_kind::SAMPLER,
+        NumDescriptors: 2,
+        Flags: 1,
+        NodeMask: 0,
+    };
+    let mut samp = SamplerDesc {
+        filter: 0,
+        address: [1, 1, 1],
+        mip_lod_bias: 0.0,
+        max_anisotropy: 1,
+        comparison: 1,
+        border: [0.0; 4],
+        min_lod: 0.0,
+        max_lod: 0.0,
+    };
+    let mut texels = vec![0u8; 256 * 4];
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let o = y * 256 + x * 4;
+            texels[o..o + 4].copy_from_slice(&[80, 160, 240, 255]);
+        }
+    }
+    // Command signature: root UAV at param 1 (8 bytes) + Dispatch (12 bytes) = 20-byte stride.
+    let mut sig_bytes = Vec::new();
+    for w in [ia::UNORDERED_ACCESS_VIEW, 1, 0, 0, ia::DISPATCH, 0, 0, 0] {
+        sig_bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    // Argument buffer embeds CAPTURED_OUT_VA + Dispatch(1, 1, 1).
+    let mut arg_bytes = Vec::with_capacity(20);
+    arg_bytes.extend_from_slice(&CAPTURED_OUT_VA.to_le_bytes());
+    for w in [1u32, 1, 1] {
+        arg_bytes.extend_from_slice(&w.to_le_bytes());
+    }
+
+    let mut dst_loc = vec![0u8; 48];
+    dst_loc[0..8].copy_from_slice(&TEX.to_le_bytes());
+    let mut src_loc = vec![0u8; 48];
+    src_loc[0..8].copy_from_slice(&UP_TEX.to_le_bytes());
+    src_loc[8..12].copy_from_slice(&1u32.to_le_bytes());
+    let fp = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256, _pad: 0 };
+    src_loc[16..48].copy_from_slice(bytes_of(&fp));
+
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateRootSignature { device: D, root_signature: R_SIG, blob: &rs_blob }, 0).unwrap();
+    w.write(&Call::CreateComputePipelineState { device: D, pso: P, root_signature: R_SIG, cs: &cs, flags: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandSignature { device: D, signature: CSIG, byte_stride: 20, root_signature: R_SIG, arguments: &sig_bytes }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: TEX, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&tdesc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: UP_TEX, heap_properties: bytes_of(&hp_up), heap_flags: 0, desc: bytes_of(&up_desc), initial_state: 0, clear_value: None, gpu_va: CAPTURED_UP_VA }, 0).unwrap();
+    w.write(&Call::WriteResource { resource: UP_TEX, subresource: 0, offset: 0, data: &texels }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: OUT_BUF, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&out_desc), initial_state: 0, clear_value: None, gpu_va: CAPTURED_OUT_VA }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: ARGS_BUF, heap_properties: bytes_of(&hp_up), heap_flags: 0, desc: bytes_of(&args_desc), initial_state: 0, clear_value: None, gpu_va: CAPTURED_ARGS_VA }, 0).unwrap();
+    w.write(&Call::WriteResource { resource: ARGS_BUF, subresource: 0, offset: 0, data: &arg_bytes }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: D, heap: SRV_HEAP, desc: bytes_of(&srv_hd), cpu_start: SRV_CPU, gpu_start: SRV_GPU }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: D, heap: SAMP_HEAP, desc: bytes_of(&samp_hd), cpu_start: SAMP_CPU, gpu_start: SAMP_GPU }, 0).unwrap();
+    w.write(&Call::CreateShaderResourceView { resource: TEX, desc: None, dest: SRV_CPU }, 0).unwrap();
+    w.write(&Call::CreateSampler { desc: bytes_of(&samp), dest: SAMP_CPU }, 0).unwrap();
+    samp.filter = 0x15;
+    w.write(&Call::CreateSampler { desc: bytes_of(&samp), dest: SAMP_CPU + RESOURCE_DESCRIPTOR_SIZE as u64 }, 0).unwrap();
+
+    let heaps = [SRV_HEAP, SAMP_HEAP];
+    let lists = [L];
+    w.write(&Call::CreateCommandList { device: D, list: L, list_type: 0, allocator: A, initial_pso: P }, 0).unwrap();
+    w.write(&Call::CopyTextureRegion { list: L, dst: &dst_loc, dst_x: 0, dst_y: 0, dst_z: 0, src: &src_loc, src_box: None }, 0).unwrap();
+    w.write(&Call::SetDescriptorHeaps { list: L, heaps: U64s::from_slice(&heaps) }, 0).unwrap();
+    w.write(&Call::SetComputeRootSignature { list: L, root_signature: R_SIG }, 0).unwrap();
+    w.write(&Call::SetRootDescriptorTable { list: L, compute: true, param: 0, gpu_handle: SRV_GPU }, 0).unwrap();
+    w.write(&Call::SetRootDescriptorTable { list: L, compute: true, param: 2, gpu_handle: SAMP_GPU }, 0).unwrap();
+    // Root UAV param 1 is NOT set via SetRootView — it comes strictly from the indirect argument buffer's embedded VA!
+    w.write(&Call::ExecuteIndirect { list: L, signature: CSIG, max_count: 1, args: ARGS_BUF, args_offset: 0, count: 0, count_offset: 0 }, 0).unwrap();
+    w.write(&Call::Close { list: L }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q, lists: U64s::from_slice(&lists) }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    assert_eq!(rep.warnings.total, 0, "{rep}");
+
+    let out_buf = backend.resource(OUT_BUF).expect("OUT_BUF live");
+    assert_ne!(out_buf.gpu_va, CAPTURED_OUT_VA, "live buffer VA should differ from captured VA");
+    let slice = out_buf.shared_slice(0, 512).expect("OUT_BUF CPU readable");
+    let floats: Vec<f32> = slice
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..32 {
+        assert!(
+            (floats[i * 4 + 3] - 1.0).abs() < 1e-3,
+            "sample {i} alpha={} (indirect embedded UAV VA was not relocated)",
+            floats[i * 4 + 3]
+        );
+    }
+}
+
+#[test]
+fn metal_backend_bench_recycles_timestamp_batches_and_reports_overflow() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::{bench, synthetic};
+
+    let trace = synthetic::clear_resolve(64);
+
+    // 1. Timer capacity = 6 slots (3 timed command lists per batch) across 8 iterations forces
+    //    multiple bounded batch resolves and must return real non-zero gpu_busy_ms for all 8.
+    let opts = bench::BenchOptions { iterations: 8, warmup: 2, until: None };
+    let (rep, _backend) = bench::run_bench_with_timer_capacity(&trace, &opts, 6).unwrap();
+    assert!(rep.failures.is_empty(), "{rep}");
+    assert_eq!(rep.gpu_busy.samples.len(), 8);
+    for (i, &ms) in rep.gpu_busy.samples.iter().enumerate() {
+        assert!(ms > 0.0, "iteration {i} reported non-positive gpu_busy_ms={ms}: {rep}");
+    }
+
+    // 2. Timer capacity = 1 slot (smaller than one Reset+Close pair) must fail explicitly
+    //    instead of silently dropping timestamps and returning 0 ms.
+    let small_opts = bench::BenchOptions { iterations: 2, warmup: 0, until: None };
+    let err = bench::run_bench_with_timer_capacity(&trace, &small_opts, 1)
+        .err()
+        .expect("expected explicit error when timestamp heap capacity is smaller than one command list");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timestamp") && (msg.contains("overflow") || msg.contains("capacity")),
+        "unexpected error message: {msg}"
+    );
+}
+
