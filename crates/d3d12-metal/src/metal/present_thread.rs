@@ -45,10 +45,24 @@ pub struct SendTex(pub Tex);
 unsafe impl Send for SendTex {}
 unsafe impl Sync for SendTex {}
 
+#[inline]
+pub(crate) fn srgb_linear_twin(fmt: MTLPixelFormat) -> Option<MTLPixelFormat> {
+    match fmt {
+        MTLPixelFormat::RGBA8Unorm_sRGB => Some(MTLPixelFormat::RGBA8Unorm),
+        MTLPixelFormat::BGRA8Unorm_sRGB => Some(MTLPixelFormat::BGRA8Unorm),
+        _ => None,
+    }
+}
+
 struct StagingSlot {
+    /// Staging texture in the back buffer's own pixel format so `q0`/`sq` performs
+    /// a pure hardware DMA `copyFromTexture` (zero compute work on the main queue),
+    /// while `pq` performs the single TBDR fullscreen render pass directly into a
+    /// `CAMetalLayer.framebufferOnly = true` drawable (handling channel swizzle,
+    /// format conversion, sRGB, and aspect-preserving resize scaling in one pass).
     tex: SendTex,
-    /// Pre-created linear UNORM view for `*_sRGB` staging textures so compute
-    /// present blits never allocate an ObjC texture view + `defer_release` per frame.
+    /// Pre-created linear UNORM view for `*_sRGB` staging textures so presenting
+    /// an sRGB back buffer onto a linear UNORM drawable never allocates a view per frame.
     linear_view: Option<SendTex>,
 }
 
@@ -78,7 +92,12 @@ pub struct PresentThread {
 }
 
 impl PresentThread {
-    pub fn new(layer: &LayerRef, pq: Arc<Queue>, main: Arc<Queue>, sq: Option<Arc<Queue>>) -> Result<PresentThread, String> {
+    pub fn new(
+        layer: &LayerRef,
+        pq: Arc<Queue>,
+        main: Arc<Queue>,
+        sq: Option<Arc<Queue>>,
+    ) -> Result<PresentThread, String> {
         let sh = Arc::new(Shared {
             layer: LayerRef(layer.0.clone()),
             pq,
@@ -102,15 +121,11 @@ impl PresentThread {
         self.sh.opt_present_blit_narrow.store(on, Ordering::Release);
     }
 
-    /// Replace the staging textures (`w`x`h`, the back buffers' format). The
-    /// thread must be drained.
+    /// Replace the staging textures (`w`x`h`, in the back buffers' pixel format).
+    /// The thread must be drained.
     pub fn set_staging(&self, w: u32, h: u32, fmt: MTLPixelFormat) -> Result<(), String> {
         let d = super::device().ok_or("no device")?;
-        let linear_fmt = match fmt {
-            MTLPixelFormat::RGBA8Unorm_sRGB => Some(MTLPixelFormat::RGBA8Unorm),
-            MTLPixelFormat::BGRA8Unorm_sRGB => Some(MTLPixelFormat::BGRA8Unorm),
-            _ => None,
-        };
+        let linear_fmt = srgb_linear_twin(fmt);
         let mut st = self.sh.staging.lock().unwrap();
         for s in st.drain(..) {
             d.remove_resident(ProtocolObject::from_ref(&*s.tex.0));
@@ -232,7 +247,7 @@ fn run(sh: Arc<Shared>) {
         ring.allocs.push(a);
         ring.cbs.push(cb);
     }
-    // Dedicated argument table for this thread so present blits never contend on a global mutex.
+    // Dedicated argument table for this thread so present passes never contend on a global mutex.
     let arg_table = {
         let atd = MTL4ArgumentTableDescriptor::new();
         atd.setMaxTextureBindCount(2);
@@ -304,22 +319,21 @@ fn present_one(
     };
     let cb = ring.cbs[i].clone();
     cb.beginCommandBufferWithAllocator(&ring.allocs[i].a);
-    let e = cb.computeCommandEncoder().ok_or("compute encoder")?;
     let after_stages = if sh.opt_present_blit_narrow.load(Ordering::Relaxed) {
         super::encstats::inc(&super::encstats::c::present_blit_narrow);
-        MTLStages::Blit
+        MTLStages::Fragment
     } else {
         MTLStages::All
     };
     let dst_tex = drawable.texture();
-    let before_stages = if needs_compute_blit(&src, &dst_tex) {
-        MTLStages::Dispatch
-    } else {
-        MTLStages::Blit
-    };
-    e.barrierAfterQueueStages_beforeStages_visibilityOptions(after_stages, before_stages, MTL4VisibilityOptions::Device);
-    let keep_views = blit_with(&e, &src, &dst_tex, src_linear.as_deref(), arg_table);
-    e.endEncoding();
+    let keep_views = render_present_pass(
+        &cb,
+        &src,
+        src_linear.as_deref(),
+        &dst_tex,
+        after_stages,
+        arg_table,
+    )?;
     cb.endCommandBuffer();
     let md: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
     let src_tl = match (job.from_sq, sh.sq.as_deref()) {
@@ -389,6 +403,231 @@ fn blit_arg_table() -> Option<&'static Mutex<BlitArgTable>> {
     .as_ref()
 }
 
+const PRESENT_RENDER_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct PresentOut {
+    float4 pos [[position]];
+    float2 uv;
+};
+
+vertex PresentOut port_present_tri_vs(uint vid [[vertex_id]]) {
+    float2 pos = float2((vid == 1) ? 3.0f : -1.0f, (vid == 2) ? -3.0f : 1.0f);
+    float2 uv  = float2((vid == 1) ? 2.0f :  0.0f, (vid == 2) ?  2.0f : 0.0f);
+    PresentOut o;
+    o.pos = float4(pos, 0.0f, 1.0f);
+    o.uv = uv;
+    return o;
+}
+
+fragment float4 port_present_copy_fs(
+    PresentOut in [[stage_in]],
+    texture2d<float, access::read> src [[texture(0)]]
+) {
+    uint2 g = uint2(in.pos.xy);
+    if (g.x < src.get_width() && g.y < src.get_height()) {
+        return src.read(g);
+    }
+    return float4(0.0f, 0.0f, 0.0f, 1.0f);
+}
+
+fragment float4 port_present_scale_fs(
+    PresentOut in [[stage_in]],
+    texture2d<float, access::sample> src [[texture(0)]]
+) {
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+    return src.sample(s, in.uv);
+}
+"#;
+
+struct PresentRenderPipelines {
+    lib: Result<Retained<ProtocolObject<dyn MTLLibrary>>, String>,
+    psos: Mutex<std::collections::HashMap<(bool, usize), Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
+}
+unsafe impl Send for PresentRenderPipelines {}
+unsafe impl Sync for PresentRenderPipelines {}
+
+fn present_render_pipelines() -> &'static PresentRenderPipelines {
+    static P: std::sync::OnceLock<PresentRenderPipelines> = std::sync::OnceLock::new();
+    P.get_or_init(|| PresentRenderPipelines {
+        lib: super::pipeline::library_from_source("port_present_render", PRESENT_RENDER_MSL),
+        psos: Mutex::new(std::collections::HashMap::new()),
+    })
+}
+
+fn present_render_pso(
+    scale: bool,
+    dst_fmt: MTLPixelFormat,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, String> {
+    let cache = present_render_pipelines();
+    let key = (scale, dst_fmt.0);
+    if let Some(p) = cache.psos.lock().unwrap().get(&key) {
+        return Ok(p.clone());
+    }
+    let lib = cache.lib.as_ref().map_err(Clone::clone)?;
+    let desc = MTL4RenderPipelineDescriptor::new();
+    desc.setVertexFunctionDescriptor(Some(&super::pipeline::function_descriptor(
+        lib,
+        "port_present_tri_vs",
+    )));
+    let fs_name = if scale {
+        "port_present_scale_fs"
+    } else {
+        "port_present_copy_fs"
+    };
+    desc.setFragmentFunctionDescriptor(Some(&super::pipeline::function_descriptor(lib, fs_name)));
+    unsafe { desc.setRasterSampleCount(1) };
+    desc.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
+    let ca = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
+    ca.setPixelFormat(dst_fmt);
+    let mut kh = dxil_metal::hash::KeyHasher::new("d3d12-metal present render pso v1");
+    kh.u32(scale as u32).u64(dst_fmt.0 as u64);
+    let pso = super::pipeline::pso_cache()?
+        .render_pipeline(Some(kh.finish()), &desc)
+        .map_err(|e| format!("present render PSO ({fs_name}, {dst_fmt:?}): {e}"))?;
+    let mut g = cache.psos.lock().unwrap();
+    Ok(g.entry(key).or_insert(pso).clone())
+}
+
+#[inline]
+fn aspect_fit_viewport(sw: usize, sh: usize, dw: usize, dh: usize) -> MTLViewport {
+    let fw = dw as f64;
+    let fh = dh as f64;
+    let fsw = sw.max(1) as f64;
+    let fsh = sh.max(1) as f64;
+    let scale = (fw / fsw).min(fh / fsh);
+    let rw = fsw * scale;
+    let rh = fsh * scale;
+    let ox = (fw - rw) * 0.5;
+    let oy = (fh - rh) * 0.5;
+    MTLViewport {
+        originX: ox,
+        originY: oy,
+        width: rw,
+        height: rh,
+        znear: 0.0,
+        zfar: 1.0,
+    }
+}
+
+/// Present `src` into a `CAMetalLayer.framebufferOnly = true` drawable texture `dst`
+/// via a single TBDR fullscreen-triangle `MTL4RenderCommandEncoder` pass.
+///
+/// * Metal 4 forbids `copyFromTexture` and compute `access::write` on `framebufferOnly`
+///   drawables; a fullscreen render pass writes `colorAttachments[0]` directly with
+///   hardware ROP swizzling (`RGBA8 -> BGRA8`), native sRGB roundtrip, and TBDR
+///   lossless compression with zero per-frame `dst_view` allocations.
+/// * Exact size (`sw == dw && sh == dh`): 1:1 `src.read` with `MTLLoadAction::DontCare`.
+/// * Mismatched size (live window resize): aspect-preserving centered bilinear fit
+///   via `setViewport` + `MTLLoadAction::Clear` opaque black letterbox margins.
+pub(crate) fn render_present_pass(
+    cb: &ProtocolObject<dyn MTL4CommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    cached_src_linear: Option<&ProtocolObject<dyn MTLTexture>>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    after_stages: MTLStages,
+    dedicated_table: Option<&ProtocolObject<dyn MTL4ArgumentTable>>,
+) -> Result<Vec<SendTex>, String> {
+    let (sw, sh) = (src.width(), src.height());
+    let (dw, dh) = (dst.width(), dst.height());
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return Ok(Vec::new());
+    }
+    let same_size = sw == dw && sh == dh;
+    let src_is_srgb = srgb_linear_twin(src.pixelFormat()).is_some();
+    let dst_is_srgb = srgb_linear_twin(dst.pixelFormat()).is_some();
+    // When presenting an `*_sRGB` back buffer to a non-sRGB UNORM target, read through
+    // the raw linear twin so already-sRGB-encoded bytes transfer without double-gamma
+    // darkening. When both are sRGB, read sRGB -> ROP encodes sRGB natively with zero views.
+    let mut keep = Vec::new();
+    let temp_src_view = if src_is_srgb && !dst_is_srgb && cached_src_linear.is_none() {
+        srgb_linear_twin(src.pixelFormat()).and_then(|lf| src.newTextureViewWithPixelFormat(lf))
+    } else {
+        None
+    };
+    let s_tex: &ProtocolObject<dyn MTLTexture> = if src_is_srgb && !dst_is_srgb {
+        cached_src_linear
+            .or(temp_src_view.as_deref())
+            .unwrap_or(src)
+    } else {
+        src
+    };
+    let pso = present_render_pso(!same_size, dst.pixelFormat())?;
+    let rpd = MTL4RenderPassDescriptor::new();
+    let ca = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
+    ca.setTexture(Some(dst));
+    if same_size {
+        ca.setLoadAction(MTLLoadAction::DontCare);
+    } else {
+        ca.setLoadAction(MTLLoadAction::Clear);
+        ca.setClearColor(MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        });
+    }
+    ca.setStoreAction(MTLStoreAction::Store);
+
+    let re = cb
+        .renderCommandEncoderWithDescriptor(&rpd)
+        .ok_or("present render encoder")?;
+    re.barrierAfterQueueStages_beforeStages_visibilityOptions(
+        after_stages,
+        MTLStages::Fragment,
+        MTL4VisibilityOptions::Device,
+    );
+    re.setRenderPipelineState(&pso);
+    if !same_size {
+        re.setViewport(aspect_fit_viewport(sw, sh, dw, dh));
+    }
+    let bind_and_draw = |table: &ProtocolObject<dyn MTL4ArgumentTable>| unsafe {
+        table.setTexture_atIndex(s_tex.gpuResourceID(), 0);
+        re.setArgumentTable_atStages(table, MTLRenderStages::Fragment);
+        re.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+    };
+    if let Some(table) = dedicated_table {
+        bind_and_draw(table);
+    } else if let Some(tbl_mtx) = blit_arg_table() {
+        let tbl = tbl_mtx.lock().unwrap();
+        bind_and_draw(&tbl.table);
+    } else {
+        re.endEncoding();
+        return Err("present argument table unavailable".into());
+    }
+    re.endEncoding();
+    if let Some(v) = temp_src_view {
+        keep.push(SendTex(v));
+    }
+    Ok(keep)
+}
+
+#[inline]
+fn copy_texture_full(
+    e: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+) {
+    let (dw, dh) = (dst.width(), dst.height());
+    if dw == 0 || dh == 0 {
+        return;
+    }
+    unsafe {
+        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+            src,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize { width: dw, height: dh, depth: 1 },
+            dst,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+    }
+}
+
 /// Copy `src` into the drawable texture `dst`.
 ///
 /// * Exact size + matching format: hardware `copyFromTexture`.
@@ -405,14 +644,15 @@ pub fn blit(
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
 ) -> Vec<SendTex> {
-    blit_with(e, src, dst, None, None)
+    blit_with_cached(e, src, dst, None, None, None)
 }
 
-fn blit_with(
+pub(crate) fn blit_with_cached(
     e: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
     cached_src_linear: Option<&ProtocolObject<dyn MTLTexture>>,
+    cached_dst_linear: Option<&ProtocolObject<dyn MTLTexture>>,
     dedicated_table: Option<&ProtocolObject<dyn MTL4ArgumentTable>>,
 ) -> Vec<SendTex> {
     let (sw, sh) = (src.width(), src.height());
@@ -422,19 +662,7 @@ fn blit_with(
     }
     let same_size = sw == dw && sh == dh;
     if same_size && src.pixelFormat() == dst.pixelFormat() {
-        unsafe {
-            e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                src,
-                0,
-                0,
-                MTLOrigin { x: 0, y: 0, z: 0 },
-                MTLSize { width: dw, height: dh, depth: 1 },
-                dst,
-                0,
-                0,
-                MTLOrigin { x: 0, y: 0, z: 0 },
-            );
-        }
+        copy_texture_full(e, src, dst);
         return Vec::new();
     }
     if needs_compute_blit(src, dst) {
@@ -445,19 +673,15 @@ fn blit_with(
         let src_view = if cached_src_linear.is_some() {
             None
         } else {
-            match src.pixelFormat() {
-                MTLPixelFormat::RGBA8Unorm_sRGB => src.newTextureViewWithPixelFormat(MTLPixelFormat::RGBA8Unorm),
-                MTLPixelFormat::BGRA8Unorm_sRGB => src.newTextureViewWithPixelFormat(MTLPixelFormat::BGRA8Unorm),
-                _ => None,
-            }
+            srgb_linear_twin(src.pixelFormat()).and_then(|lf| src.newTextureViewWithPixelFormat(lf))
         };
-        let dst_view = match dst.pixelFormat() {
-            MTLPixelFormat::BGRA8Unorm_sRGB => dst.newTextureViewWithPixelFormat(MTLPixelFormat::BGRA8Unorm),
-            MTLPixelFormat::RGBA8Unorm_sRGB => dst.newTextureViewWithPixelFormat(MTLPixelFormat::RGBA8Unorm),
-            _ => None,
+        let dst_view = if cached_dst_linear.is_some() {
+            None
+        } else {
+            srgb_linear_twin(dst.pixelFormat()).and_then(|lf| dst.newTextureViewWithPixelFormat(lf))
         };
         let s_tex: &ProtocolObject<dyn MTLTexture> = cached_src_linear.or(src_view.as_deref()).unwrap_or(src);
-        let d_tex: &ProtocolObject<dyn MTLTexture> = dst_view.as_deref().unwrap_or(dst);
+        let d_tex: &ProtocolObject<dyn MTLTexture> = cached_dst_linear.or(dst_view.as_deref()).unwrap_or(dst);
         let use_m41_b2 = same_size && super::m41::block_read_kernels_enabled();
         let kernel_name = if use_m41_b2 {
             "port_present_copy_2d_b2"
