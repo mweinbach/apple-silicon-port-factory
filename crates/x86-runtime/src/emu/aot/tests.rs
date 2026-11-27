@@ -3959,6 +3959,22 @@ fn tso_vec_and_tso_memcpy_independent_codegen_switches() {
     // PORT_JIT_TSO=0, PORT_JIT_TSO_MEMCPY=1: scalar drops TSO while rep movsq keeps TSO.
     crate::emu::mem::TEST_NO_TSO.with(|c| c.set(true));
     crate::emu::mem::TEST_TSO_VEC.with(|c| c.set(None));
+    crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(None));
+    let key_all_off = jit::aot_knob_bits();
+    crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(Some(true)));
+    let key_memcpy_on = jit::aot_knob_bits();
+    assert_ne!(
+        key_all_off, key_memcpy_on,
+        "PORT_JIT_TSO=0 with unset vs explicit PORT_JIT_TSO_MEMCPY=1 must produce distinct AOT keys"
+    );
+    crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(None));
+    crate::emu::mem::TEST_TSO_VEC.with(|c| c.set(Some(true)));
+    let key_vec_on = jit::aot_knob_bits();
+    assert_ne!(
+        key_all_off, key_vec_on,
+        "PORT_JIT_TSO=0 with unset vs explicit PORT_JIT_TSO_VEC=1 must produce distinct AOT keys"
+    );
+    crate::emu::mem::TEST_TSO_VEC.with(|c| c.set(None));
     crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(Some(true)));
     assert!(!crate::emu::mem::tso());
     assert!(!crate::emu::mem::tso_vec());
@@ -3970,4 +3986,56 @@ fn tso_vec_and_tso_memcpy_independent_codegen_switches() {
         w_rep_override.iter().any(|&w| is_tso_ld(w)) && w_rep_override.iter().any(|&w| is_tso_st(w)),
         "PORT_JIT_TSO=0 + PORT_JIT_TSO_MEMCPY=1 must preserve TSO on string/memcpy ops"
     );
+}
+
+/// `format::image_hash` must include parsed PE `IMAGE_VOLATILE_METADATA` so metadata-only PE
+/// updates invalidate stale cached `.aot` translations even when `.text` bytes are unchanged.
+#[test]
+fn image_hash_tracks_volatile_metadata_changes() {
+    use super::format::image_hash;
+
+    let mut pe = TestMappedBuf::alloc(0x4000, 0x2_3F54_0000);
+    let base = pe.base();
+    let len = pe.len;
+    let base64 = base as u64;
+    let buf = pe.as_slice_mut();
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x1000, 0x2000, 0x1000, None, None);
+    buf[0x1000..0x1006].copy_from_slice(&[0xB8, 0x01, 0, 0, 0, 0xC3]);
+
+    // DataDirectory[10] (Load Config) @ opt + 112 + 10*8
+    let pe_off = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
+    let dd10 = pe_off + 24 + 112 + 10 * 8;
+    w32(buf, dd10, 0x2000);
+    w32(buf, dd10 + 4, 0x118);
+
+    // Load Config @ 0x2000 with VolatileMetadataPointer (+0x100) -> base + 0x2200
+    w32(buf, 0x2000, 0x118);
+    buf[0x2000 + 0x100..0x2000 + 0x108].copy_from_slice(&(base64 + 0x2200).to_le_bytes());
+
+    // IMAGE_VOLATILE_METADATA @ 0x2200
+    w32(buf, 0x2200, 24);
+    w32(buf, 0x2204, 0x8003_8003);
+    w32(buf, 0x2208, 0x2240); // VolatileAccessTable RVA
+    w32(buf, 0x220C, 4);      // 1 entry
+    w32(buf, 0x2210, 0x2260); // VolatileInfoRangeTable RVA
+    w32(buf, 0x2214, 8);      // 1 range
+    w32(buf, 0x2240, 0x1000); // volatile RVA = 0x1000
+    w32(buf, 0x2260, 0x1000); // range start
+    w32(buf, 0x2264, 0x0100); // range len
+
+    let h1 = unsafe { image_hash(base, len) };
+    // Change only VolatileAccessTable RVA (without touching .text): hash must change!
+    w32(buf, 0x2240, 0x1004);
+    let h2 = unsafe { image_hash(base, len) };
+    assert_ne!(h1, h2, "changing VolatileAccessTable must invalidate AOT image_hash");
+
+    // Change only VolatileInfoRangeTable length (without touching .text): hash must change!
+    w32(buf, 0x2264, 0x0200);
+    let h3 = unsafe { image_hash(base, len) };
+    assert_ne!(h2, h3, "changing VolatileInfoRangeTable must invalidate AOT image_hash");
+
+    // Clear VolatileMetadataPointer (no metadata): hash must change!
+    buf[0x2000 + 0x100..0x2000 + 0x108].fill(0);
+    let h4 = unsafe { image_hash(base, len) };
+    assert_ne!(h3, h4, "removing VolatileMetadata must invalidate AOT image_hash");
 }

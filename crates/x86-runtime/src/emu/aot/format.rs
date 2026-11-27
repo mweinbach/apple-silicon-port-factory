@@ -257,6 +257,17 @@ pub(super) unsafe fn image_hash(base: usize, size: usize) -> [u64; 2] {
         h.word((s - base) as u64);
         h.bytes(core::slice::from_raw_parts(s as *const u8, e - s));
     }
+    if let Some(vm) = super::volatile::parse_mapped_volatile_metadata(base, size) {
+        h.word(0x564F_4C4D_4554_4131u64); // "VOLMETA1" domain separator
+        h.word(vm.ranges.len() as u64);
+        for &(s, e) in vm.ranges.iter() {
+            h.word(((s as u64) << 32) | (e as u64));
+        }
+        h.word(vm.access_rvas.len() as u64);
+        for &rva in vm.access_rvas.iter() {
+            h.word(rva as u64);
+        }
+    }
     h.finish()
 }
 
