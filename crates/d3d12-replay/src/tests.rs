@@ -1146,3 +1146,195 @@ fn metal_backend_bench_recycles_timestamp_batches_and_reports_overflow() {
     );
 }
 
+#[test]
+fn bench_slice_excludes_trailing_partial_frame_and_teardown() {
+    use crate::{bench, synthetic};
+    use d3d12_metal::trace::{Call, Reader};
+
+    // Append trailing partial-frame Reset + Release teardown after the complete frame.
+    let mut trace = synthetic::clear_resolve(64);
+    let base_count = Reader::new(&trace).unwrap().count();
+    {
+        let mut w = Writer::new(Vec::new()).unwrap();
+        for rec in Reader::new(&trace).unwrap() {
+            let r = rec.unwrap();
+            w.write(&r.call, r.thread).unwrap();
+        }
+        // Trailing partial frame + teardown Release that would break iteration 2 if included.
+        w.write(&Call::Reset { list: 0x1300, allocator: 0x1200, pso: 0 }, 0).unwrap();
+        w.write(&Call::Release { object: 0x1300 }, 0).unwrap();
+        w.write(&Call::Release { object: 0x1600 }, 0).unwrap();
+        trace = w.into_inner();
+    }
+    let recs: Vec<_> = Reader::new(&trace).unwrap().map(|r| r.unwrap()).collect();
+    let (start, end, _) = bench::find_frame_slice(&recs);
+    assert_eq!(end, base_count, "frame_end must stop at FrameEnd and exclude trailing partial/teardown records");
+    assert!(start < end);
+
+    if !metal_ready() {
+        return;
+    }
+    let opts = bench::BenchOptions { iterations: 4, warmup: 2, until: None };
+    let (rep, mut backend) = bench::run_bench(&trace, &opts).unwrap();
+    assert!(rep.failures.is_empty(), "{rep}");
+    assert_eq!(rep.frame_records, end - start);
+    let img = backend.capture_frame().unwrap();
+    assert_eq!((img.width, img.height), (64, 64));
+}
+
+#[test]
+fn metal_backend_write_resource_waits_for_pending_gpu_reads() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::types::{dim, heap_type, CommandQueueDesc, HeapProperties, ResourceDesc};
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    const D: u64 = 0x6000;
+    const Q: u64 = 0x6100;
+    const A1: u64 = 0x6200;
+    const A2: u64 = 0x6201;
+    const L1: u64 = 0x6300;
+    const L2: u64 = 0x6301;
+    const UP: u64 = 0x6400;
+    const DST1: u64 = 0x6401;
+    const DST2: u64 = 0x6402;
+    const SZ: usize = 64 * 1024;
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let hp_up = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+    let hp_rb = HeapProperties { Type: heap_type::READBACK, ..Default::default() };
+    let bdesc = ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: SZ as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        ..Default::default()
+    };
+    let pat_a = vec![0xAAu8; SZ];
+    let pat_b = vec![0xBBu8; SZ];
+    let l1s = [L1];
+    let l2s = [L2];
+
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A1, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A2, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: UP, heap_properties: bytes_of(&hp_up), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_a000_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: DST1, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_a100_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: DST2, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_a200_0000 }, 0).unwrap();
+    // Submission 1: write 0xAA to UP and copy UP -> DST1 asynchronously.
+    w.write(&Call::WriteResource { resource: UP, subresource: 0, offset: 0, data: &pat_a }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L1, list_type: 0, allocator: A1, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: L1, dst: DST1, dst_offset: 0, src: UP, src_offset: 0, size: SZ as u64 }, 0).unwrap();
+    w.write(&Call::Close { list: L1 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q, lists: U64s::from_slice(&l1s) }, 0).unwrap();
+    // Submission 2: immediately reuse UP with 0xBB (no CPU fence wait in trace) and copy UP -> DST2.
+    w.write(&Call::WriteResource { resource: UP, subresource: 0, offset: 0, data: &pat_b }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L2, list_type: 0, allocator: A2, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: L2, dst: DST2, dst_offset: 0, src: UP, src_offset: 0, size: SZ as u64 }, 0).unwrap();
+    w.write(&Call::Close { list: L2 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q, lists: U64s::from_slice(&l2s) }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    let d1 = backend.resource(DST1).unwrap().shared_slice(0, SZ).unwrap();
+    let d2 = backend.resource(DST2).unwrap().shared_slice(0, SZ).unwrap();
+    assert!(d1.iter().all(|&b| b == 0xAA), "DST1 corrupted by unsynchronized WriteResource reuse");
+    assert!(d2.iter().all(|&b| b == 0xBB), "DST2 did not receive second WriteResource payload");
+}
+
+#[test]
+fn metal_backend_bench_restores_fence_timelines_between_iterations() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::bench;
+    use d3d12_metal::types::{dim, heap_type, CommandQueueDesc, HeapProperties, ResourceDesc};
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    const D: u64 = 0x7000;
+    const Q_PROD: u64 = 0x7100;
+    const Q_CONS: u64 = 0x7101;
+    const A_PROD: u64 = 0x7200;
+    const A_CONS: u64 = 0x7201;
+    const L_PROD: u64 = 0x7300;
+    const L_CONS: u64 = 0x7301;
+    const F: u64 = 0x7400;
+    const SRC: u64 = 0x7500;
+    const MID: u64 = 0x7501;
+    const DST: u64 = 0x7502;
+    const SZ: usize = 4096;
+
+    let qd_direct = CommandQueueDesc { Type: 0, ..Default::default() };
+    let qd_compute = CommandQueueDesc { Type: 2, ..Default::default() };
+    let hp_up = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+    let hp_def = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+    let hp_rb = HeapProperties { Type: heap_type::READBACK, ..Default::default() };
+    let bdesc = ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: SZ as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        ..Default::default()
+    };
+    let payload = vec![0x5Au8; SZ];
+    let lp = [L_PROD];
+    let lc = [L_CONS];
+
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q_PROD, desc: bytes_of(&qd_compute) }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q_CONS, desc: bytes_of(&qd_direct) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A_PROD, list_type: 2 }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A_CONS, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateFence { device: D, fence: F, initial_value: 0, flags: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: SRC, heap_properties: bytes_of(&hp_up), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_b000_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: MID, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_b100_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: DST, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_b200_0000 }, 0).unwrap();
+    w.write(&Call::WriteResource { resource: SRC, subresource: 0, offset: 0, data: &payload }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L_PROD, list_type: 2, allocator: A_PROD, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::Close { list: L_PROD }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L_CONS, list_type: 0, allocator: A_CONS, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::Close { list: L_CONS }, 0).unwrap();
+
+    // Repeatable cross-queue frame: producer signals F=1, consumer waits F=1.
+    w.write(&Call::Reset { list: L_PROD, allocator: A_PROD, pso: 0 }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: L_PROD, dst: MID, dst_offset: 0, src: SRC, src_offset: 0, size: SZ as u64 }, 0).unwrap();
+    w.write(&Call::Close { list: L_PROD }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q_PROD, lists: U64s::from_slice(&lp) }, 0).unwrap();
+    w.write(&Call::QueueSignal { queue: Q_PROD, fence: F, value: 1 }, 0).unwrap();
+
+    w.write(&Call::QueueWait { queue: Q_CONS, fence: F, value: 1 }, 0).unwrap();
+    w.write(&Call::Reset { list: L_CONS, allocator: A_CONS, pso: 0 }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: L_CONS, dst: DST, dst_offset: 0, src: MID, src_offset: 0, size: SZ as u64 }, 0).unwrap();
+    w.write(&Call::Close { list: L_CONS }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q_CONS, lists: U64s::from_slice(&lc) }, 0).unwrap();
+    w.write(&Call::FrameEnd { frame: 0 }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let opts = bench::BenchOptions { iterations: 5, warmup: 3, until: None };
+    let (rep, backend) = bench::run_bench(&trace, &opts).unwrap();
+    assert!(rep.failures.is_empty(), "{rep}");
+    assert_eq!(rep.gpu_busy.samples.len(), 5);
+    assert_eq!(backend.snapshot_fence_values(), vec![(F, 1)]);
+    let dst = backend.resource(DST).unwrap().shared_slice(0, SZ).unwrap();
+    assert!(dst.iter().all(|&b| b == 0x5A), "cross-queue synced copy produced wrong bytes");
+}
+

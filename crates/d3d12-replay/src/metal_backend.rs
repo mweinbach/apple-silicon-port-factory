@@ -267,6 +267,9 @@ pub struct MetalBackend {
     timing_armed: bool,
     /// When true, `Present` forces `sync_interval = 0` so headless replay never sleeps 16.6 ms.
     disable_vsync: bool,
+    /// True after `ExecuteCommandLists`/`Present` until `wait_all_idle()` completes, so
+    /// subsequent `WriteResource` updates wait for pending GPU reads before overwriting shared memory.
+    has_pending_gpu_work: bool,
 }
 
 impl MetalBackend {
@@ -295,6 +298,7 @@ impl MetalBackend {
             gpu_timer: None,
             timing_armed: false,
             disable_vsync: true,
+            has_pending_gpu_work: false,
         })
     }
 
@@ -320,6 +324,7 @@ impl MetalBackend {
         for q in self.queues.values() {
             q.wait_idle();
         }
+        self.has_pending_gpu_work = false;
         self.retired.clear();
     }
 
@@ -358,12 +363,19 @@ impl MetalBackend {
         self.swapchains.iter().map(|(&id, sc)| (id, sc.current)).collect()
     }
 
-    /// Wait idle, reset allocators, restore swapchain buffer indices, and optionally reopen
-    /// lists that were open at the start of a repeated benchmark frame.
+    /// Snapshot each live fence's completed timeline value so repeated benchmark iterations
+    /// restore cross-queue fence timelines instead of reusing already-completed values.
+    pub fn snapshot_fence_values(&self) -> Vec<(u64, u64)> {
+        self.fences.iter().map(|(&id, f)| (id, f.completed())).collect()
+    }
+
+    /// Wait idle, reset allocators, restore swapchain buffer indices and fence timelines,
+    /// and optionally reopen lists that were open at the start of a repeated benchmark frame.
     pub fn prepare_bench_iteration(
         &mut self,
         reopen_lists: &[u64],
         swapchain_indices: &[(u64, usize)],
+        fence_values: &[(u64, u64)],
     ) -> Result<(), String> {
         self.wait_all_idle();
         for &(id, idx) in swapchain_indices {
@@ -371,6 +383,12 @@ impl MetalBackend {
                 if idx < sc.buffers.len() {
                     sc.current = idx;
                 }
+            }
+        }
+        for &(id, val) in fence_values {
+            if self.fences.contains_key(&id) {
+                let fresh = Fence::new(val).ok_or_else(|| format!("recreate fence {id:#x} at value {val}"))?;
+                self.fences.insert(id, Arc::new(fresh));
             }
         }
         for alloc in self.allocators.values() {
@@ -1004,6 +1022,13 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::WriteResource { resource, offset, data, .. } => {
+                // Captured traces do not record CPU fence waits (`SetEventOnCompletion`), while
+                // `Queue::execute_command_lists` submits asynchronously. Drain pending GPU work
+                // before overwriting shared upload memory so an earlier submission never reads
+                // data written for a later submission.
+                if self.has_pending_gpu_work {
+                    self.wait_all_idle();
+                }
                 let res = self
                     .resources
                     .get(resource)
@@ -1674,6 +1699,7 @@ impl Backend for MetalBackend {
                     let mut refs: Vec<&mut CommandList> = taken.iter_mut().map(|(_, l)| &mut l.cl).collect();
                     q.execute_command_lists(&mut refs);
                 }
+                self.has_pending_gpu_work = true;
                 for (id, l) in taken {
                     self.lists.insert(id, l);
                 }
@@ -1767,6 +1793,7 @@ impl Backend for MetalBackend {
                 }
                 let si = if self.disable_vsync { 0 } else { *sync_interval };
                 sc.present(si)?;
+                self.has_pending_gpu_work = true;
                 Ok(Handled::Done)
             }
         }

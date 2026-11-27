@@ -168,13 +168,15 @@ fn is_setup_call(c: &Call) -> bool {
     )
 }
 
-/// Partition `records` into `(setup_end, reopen_lists)`:
-/// - Multi-frame trace (>= 2 `Present`/`FrameEnd`): loop the last complete frame.
-/// - Single-frame trace with an explicit `Reset`: loop starting at the first `Reset`
-///   (after any initial `CreateCommandList` + `Close` setup).
-/// - Otherwise: loop starting at the first non-setup call, reopening any command list
-///   that was left open by setup.
-fn find_frame_slice(records: &[Record]) -> (usize, Vec<u64>) {
+/// Partition `records` into `(frame_start, frame_end, reopen_lists)`:
+/// - Multi-frame trace (>= 2 `Present`/`FrameEnd`): loop the last complete frame
+///   `[prev_boundary..last_boundary]`, excluding any trailing partial frame or teardown records.
+/// - Single-frame trace with 1 `Present`/`FrameEnd`: bound `frame_end` at that boundary so
+///   trailing `Release` teardown records never run inside the repeated loop, and start at the
+///   first `Reset` (or first non-setup call) before `frame_end`.
+/// - Traces with no `Present`/`FrameEnd`: trim trailing `Release` teardown calls and start at
+///   the first `Reset` or first non-setup call.
+pub(crate) fn find_frame_slice(records: &[Record]) -> (usize, usize, Vec<u64>) {
     let mut frame_boundaries: Vec<usize> = Vec::new();
     for (i, r) in records.iter().enumerate() {
         if matches!(r.call, Call::FrameEnd { .. }) {
@@ -188,20 +190,32 @@ fn find_frame_slice(records: &[Record]) -> (usize, Vec<u64>) {
             }
         }
     }
+    let frame_end = if let Some(&last) = frame_boundaries.last() {
+        last
+    } else {
+        let mut end = records.len();
+        while end > 0 && matches!(records[end - 1].call, Call::Release { .. }) {
+            end -= 1;
+        }
+        end
+    };
     let frame_start = if frame_boundaries.len() >= 2 {
         frame_boundaries[frame_boundaries.len() - 2]
-    } else if let Some(first_reset) = records.iter().position(|r| matches!(r.call, Call::Reset { .. })) {
+    } else if let Some(first_reset) = records[..frame_end].iter().position(|r| matches!(r.call, Call::Reset { .. })) {
         first_reset
     } else {
-        records.iter().position(|r| !is_setup_call(&r.call)).unwrap_or(0)
+        records[..frame_end]
+            .iter()
+            .position(|r| !is_setup_call(&r.call))
+            .unwrap_or(0)
     };
 
-    // Determine which command lists are used inside `records[frame_start..]` without first
-    // being `Reset` inside the slice, so `prepare_bench_iteration` re-opens them cleanly.
+    // Determine which command lists are used inside `records[frame_start..frame_end]` without
+    // first being `Reset` inside the slice, so `prepare_bench_iteration` re-opens them cleanly.
     let mut reset_first: HashSet<u64> = HashSet::new();
     let mut needs_reopen: Vec<u64> = Vec::new();
     let mut seen_reopen: HashSet<u64> = HashSet::new();
-    for r in &records[frame_start..] {
+    for r in &records[frame_start..frame_end] {
         if let Call::Reset { list, .. } = r.call {
             reset_first.insert(list);
             continue;
@@ -212,7 +226,7 @@ fn find_frame_slice(records: &[Record]) -> (usize, Vec<u64>) {
             }
         }
     }
-    (frame_start, needs_reopen)
+    (frame_start, frame_end, needs_reopen)
 }
 
 fn record_list_id(c: &Call) -> Option<u64> {
@@ -283,7 +297,7 @@ pub(crate) fn run_bench_with_timer_capacity(
         anyhow::bail!("trace contains no records");
     }
 
-    let (frame_start, reopen_lists) = find_frame_slice(&records);
+    let (frame_start, frame_end, reopen_lists) = find_frame_slice(&records);
     let mut backend = MetalBackend::new().map_err(|e| anyhow::anyhow!(e))?;
     let objs = Objects::default();
     let mut failures = Vec::new();
@@ -296,6 +310,7 @@ pub(crate) fn run_bench_with_timer_capacity(
     }
     backend.wait_all_idle();
     let swapchain_indices = backend.snapshot_swapchain_indices();
+    let fence_values = backend.snapshot_fence_values();
 
     // 2. Arm hardware GPU timing BEFORE warmup so the `MTL4CounterHeap` and timestamp
     //    paths are resident and warm before measured iteration 0 begins.
@@ -307,9 +322,9 @@ pub(crate) fn run_bench_with_timer_capacity(
         backend.reset_gpu_timer();
         objc2::rc::autoreleasepool(|_| -> anyhow::Result<()> {
             backend
-                .prepare_bench_iteration(&reopen_lists, &swapchain_indices)
+                .prepare_bench_iteration(&reopen_lists, &swapchain_indices, &fence_values)
                 .map_err(|e| anyhow::anyhow!("prepare warmup {iter}: {e}"))?;
-            for rec in &records[frame_start..] {
+            for rec in &records[frame_start..frame_end] {
                 match backend.call(rec, &objs) {
                     Ok(Handled::Done | Handled::Skipped) => {}
                     Err(e) => failures.push(format!("warmup {iter} #{} {}: {e}", rec.index, rec.call.name())),
@@ -343,11 +358,11 @@ pub(crate) fn run_bench_with_timer_capacity(
         let slots_before = backend.gpu_timer_used_slots();
         let (wall_ms, pair_lo, pair_hi) = objc2::rc::autoreleasepool(|_| -> anyhow::Result<(f64, usize, usize)> {
             backend
-                .prepare_bench_iteration(&reopen_lists, &swapchain_indices)
+                .prepare_bench_iteration(&reopen_lists, &swapchain_indices, &fence_values)
                 .map_err(|e| anyhow::anyhow!("prepare iteration {iter}: {e}"))?;
             let pair_lo = backend.gpu_timer_pair_count();
             let t0 = Instant::now();
-            for rec in &records[frame_start..] {
+            for rec in &records[frame_start..frame_end] {
                 match backend.call(rec, &objs) {
                     Ok(Handled::Done | Handled::Skipped) => {}
                     Err(e) => failures.push(format!("iter {iter} #{} {}: {e}", rec.index, rec.call.name())),
@@ -376,7 +391,7 @@ pub(crate) fn run_bench_with_timer_capacity(
         warmup: opts.warmup,
         iterations: measured,
         setup_records: frame_start,
-        frame_records: records.len() - frame_start,
+        frame_records: frame_end.saturating_sub(frame_start),
         gpu_busy: TimingStats::from_samples(gpu_samples),
         frame_time: TimingStats::from_samples(frame_samples),
         failures,
