@@ -24,6 +24,7 @@ pub mod query;
 pub mod queue;
 pub mod resource;
 pub mod swapchain;
+pub mod view_pool;
 pub mod views;
 
 pub use device::{device, Device};
