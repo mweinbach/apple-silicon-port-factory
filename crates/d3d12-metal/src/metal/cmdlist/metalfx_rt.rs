@@ -1400,7 +1400,11 @@ impl CommandList {
             }
             MetalFxPostSync::FullFallback => {
                 self.pending_mfx_wait_fence = fence.map(|f| f.retain());
-                self.pending_mfx_wait_stages = UTIL_STAGES;
+                self.pending_mfx_wait_stages = if fence.is_some() {
+                    UTIL_STAGES
+                } else {
+                    MTLStages::empty()
+                };
                 self.pending_mfx_after = MTLStages::All;
                 self.pending_mfx_cross_enc_released = false;
                 self.bar.stage_sync = [StageSync::default(); 7];
