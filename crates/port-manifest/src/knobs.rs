@@ -871,6 +871,15 @@ pub const KNOBS: &[KnobSpec] = &[
         crates: &["port-loader"],
     },
     KnobSpec {
+        name: "PORT_ASYNC_COMMIT",
+        aliases: &[],
+        kind: KnobType::Bool,
+        default: "1",
+        description: "Offload Direct-queue MTL4CommandQueue commits and events to an in-order worker thread.",
+        affects_aot_key: false,
+        crates: &["d3d12-metal"],
+    },
+    KnobSpec {
         name: "PORT_AUDIO",
         aliases: &["AW2_AUDIO"],
         kind: KnobType::String,
