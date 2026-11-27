@@ -1,7 +1,9 @@
 //! `ID3D11DeviceContext` (115 base slots) / `ID3D11DeviceContext1` (134 total slots):
 //! immediate Metal 4 execution and deferred command-list recording/replay.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use d3d12_metal::layout::PlacedFootprint;
@@ -18,7 +20,7 @@ use d3d12_metal::types::{dim, heap_type, HeapProperties, Rect, ResourceDesc};
 use crate::types::*;
 
 use super::com::*;
-use super::device::DeviceCore;
+use super::device::{DeviceCore, DynamicBufPool};
 use super::resources::*;
 use super::state::*;
 use super::types::*;
@@ -135,8 +137,51 @@ fn d3d11_primitives_per_instance(topo: u32, count: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 const ALLOC_RING: usize = 4;
-const RES_HEAP_CAP: u32 = 32768;
-const SAMP_HEAP_CAP: u32 = 2048;
+const HEAP_RING: usize = 4;
+const RES_HEAP_CAP: u32 = if cfg!(target_os = "ios") { 65_536 } else { 262_144 };
+const SAMP_HEAP_CAP: u32 = if cfg!(target_os = "ios") { 8_192 } else { 16_384 };
+const UPLOAD_CHUNK_SIZE: usize = if cfg!(target_os = "ios") { 1 << 20 } else { 4 << 20 };
+const MAX_READY_UPLOAD_CHUNKS: usize = if cfg!(target_os = "ios") { 2 } else { 6 };
+
+/// Per-frame immediate-context counters snapshotted on `Present`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    pub draws: u64,
+    pub flushes: u64,
+    pub mid_frame_flushes: u64,
+    pub mid_frame_stalls: u64,
+    pub res_slots: u64,
+    pub samp_slots: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StageResCache {
+    cmdbuf_epoch: u64,
+    heap_epoch: u64,
+    bind_gen: u64,
+    dev_ver: u64,
+    slots_sig: u64,
+    cbv_mask: u16,
+    srv_mask: u128,
+    uav_mask: u8,
+    gpu_va: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StageSampCache {
+    cmdbuf_epoch: u64,
+    heap_epoch: u64,
+    bind_gen: u64,
+    samp_mask: u16,
+    gpu_va: u64,
+}
+
+const STAGE_VS: usize = 0;
+const STAGE_PS: usize = 1;
+const STAGE_GS: usize = 2;
+const STAGE_HS: usize = 3;
+const STAGE_DS: usize = 4;
+const STAGE_CS: usize = 5;
 
 pub struct ImmediateExec {
     queue: Arc<Queue>,
@@ -148,20 +193,53 @@ pub struct ImmediateExec {
     pub(super) has_work: bool,
     res_heaps: Vec<DescriptorHeap>,
     res_heap_idx: usize,
-    res_heap_vals: [u64; 2],
+    res_heap_vals: Vec<u64>,
     res_cursor: u32,
+    res_heap_epoch: u64,
     samp_heaps: Vec<DescriptorHeap>,
     samp_heap_idx: usize,
-    samp_heap_vals: [u64; 2],
+    samp_heap_vals: Vec<u64>,
     samp_cursor: u32,
+    samp_heap_epoch: u64,
+    cmdbuf_epoch: u64,
+    /// Dedicated keep-alive vectors avoid per-resource `Box<dyn Send>` heap allocations.
+    keep_mtls: Vec<Arc<MtlResource>>,
+    keep_psos: Vec<Arc<GraphicsPipeline>>,
     keep_alive: Vec<Box<dyn Send>>,
+    /// Resident upload ring for `Map(WRITE_DISCARD)` small dynamic buffers and `UpdateSubresource`.
+    cur_upload: Option<(Arc<MtlResource>, usize, usize)>,
+    active_upload_chunks: Vec<Arc<MtlResource>>,
+    retired_upload_chunks: VecDeque<(u64, Arc<MtlResource>)>,
+    ready_upload_chunks: Vec<Arc<MtlResource>>,
+    /// Dedicated dynamic-pool buffers discarded while the current command buffer had work.
+    dynamic_pool: Arc<Mutex<DynamicBufPool>>,
+    pending_pool_returns: Vec<(u64, Arc<MtlResource>)>,
+    /// Per-stage descriptor table caches (indexed by `STAGE_*`).
+    stage_res_cache: [StageResCache; 6],
+    stage_samp_cache: [StageSampCache; 6],
+    /// Last bound graphics/compute state on the current open command buffer.
+    gfx_heaps_bound: bool,
+    compute_heaps_bound: bool,
+    bound_gfx_tables: [u64; 10],
+    bound_cs_tables: [u64; 2],
+    cached_gfx_pso: Option<Arc<CachedGfxPso>>,
+    cached_gfx_indexed: bool,
+    rt_synced: bool,
+    rt_backings_sig: u64,
+    dyn_synced: bool,
+    bound_vbs_mask: u32,
+    /// Scratch buffers reused across draws to avoid per-draw `Vec` allocations.
+    scratch_barriers: Vec<Barrier>,
+    scratch_attached: Vec<usize>,
     pending_queries: Vec<Arc<QueryInner>>,
     active_pipeline_stats: Vec<Arc<QueryInner>>,
+    /// Per-frame telemetry counters.
+    frame_stats: FrameStats,
 }
 unsafe impl Send for ImmediateExec {}
 
 impl ImmediateExec {
-    pub fn new(queue: Arc<Queue>) -> Result<Self, String> {
+    pub fn new(queue: Arc<Queue>, dynamic_pool: Arc<Mutex<DynamicBufPool>>) -> Result<Self, String> {
         let mut allocs = Vec::with_capacity(ALLOC_RING);
         for _ in 0..ALLOC_RING {
             allocs.push(CommandAllocator::new(ListType::Direct).ok_or("CommandAllocator::new failed")?);
@@ -185,16 +263,57 @@ impl ImmediateExec {
             has_work: false,
             res_heaps,
             res_heap_idx: 0,
-            res_heap_vals: [0; 2],
-            res_cursor: 0,
+            res_heap_vals: vec![0; 2],
+            res_cursor: 1, // Slot 0 reserved as zeroed dummy descriptor.
+            res_heap_epoch: 1,
             samp_heaps,
             samp_heap_idx: 0,
-            samp_heap_vals: [0; 2],
-            samp_cursor: 0,
+            samp_heap_vals: vec![0; 2],
+            samp_cursor: 1, // Slot 0 reserved as zeroed dummy descriptor.
+            samp_heap_epoch: 1,
+            cmdbuf_epoch: 1,
+            keep_mtls: Vec::with_capacity(64),
+            keep_psos: Vec::with_capacity(16),
             keep_alive: Vec::new(),
+            cur_upload: None,
+            active_upload_chunks: Vec::new(),
+            retired_upload_chunks: VecDeque::new(),
+            ready_upload_chunks: Vec::new(),
+            dynamic_pool,
+            pending_pool_returns: Vec::new(),
+            stage_res_cache: [StageResCache::default(); 6],
+            stage_samp_cache: [StageSampCache::default(); 6],
+            gfx_heaps_bound: false,
+            compute_heaps_bound: false,
+            bound_gfx_tables: [u64::MAX; 10],
+            bound_cs_tables: [u64::MAX; 2],
+            cached_gfx_pso: None,
+            cached_gfx_indexed: false,
+            rt_synced: false,
+            rt_backings_sig: 0,
+            dyn_synced: false,
+            bound_vbs_mask: 0,
+            scratch_barriers: Vec::with_capacity(16),
+            scratch_attached: Vec::with_capacity(10),
             pending_queries: Vec::new(),
             active_pipeline_stats: Vec::new(),
+            frame_stats: FrameStats::default(),
         })
+    }
+
+    #[inline]
+    pub fn invalidate_live_caches(&mut self) {
+        self.cached_gfx_pso = None;
+        self.rt_synced = false;
+        self.dyn_synced = false;
+        self.stage_res_cache = [StageResCache::default(); 6];
+        self.stage_samp_cache = [StageSampCache::default(); 6];
+        self.bound_gfx_tables = [u64::MAX; 10];
+        self.bound_cs_tables = [u64::MAX; 2];
+    }
+
+    pub fn take_frame_stats(&mut self) -> FrameStats {
+        std::mem::take(&mut self.frame_stats)
     }
 
     pub(super) fn ensure_open(&mut self) -> Result<(), String> {
@@ -202,17 +321,151 @@ impl ImmediateExec {
             return Ok(());
         }
         let i = self.ring_idx;
-        if self.ring_vals[i] != 0 {
+        if self.ring_vals[i] != 0 && self.queue.timeline.completed() < self.ring_vals[i] {
             self.queue.timeline.wait_cpu(self.ring_vals[i], u64::MAX);
         }
         self.allocs[i].reset();
         self.cl.begin(&self.allocs[i])?;
         self.open = true;
+        self.gfx_heaps_bound = false;
+        self.compute_heaps_bound = false;
+        self.bound_gfx_tables = [u64::MAX; 10];
+        self.bound_cs_tables = [u64::MAX; 2];
+        self.rt_synced = false;
+        self.dyn_synced = false;
+        self.bound_vbs_mask = 0;
         Ok(())
     }
 
     pub fn keep<T: Send + 'static>(&mut self, obj: T) {
         self.keep_alive.push(Box::new(obj));
+    }
+
+    #[inline]
+    pub fn keep_mtl(&mut self, mtl: &Arc<MtlResource>) {
+        if let Some((cur, _, _)) = &self.cur_upload {
+            if Arc::ptr_eq(cur, mtl) {
+                if !self.active_upload_chunks.iter().any(|c| Arc::ptr_eq(c, cur)) {
+                    self.active_upload_chunks.push(cur.clone());
+                }
+                return;
+            }
+        }
+        if self.keep_mtls.last().is_some_and(|last| Arc::ptr_eq(last, mtl)) {
+            return;
+        }
+        self.keep_mtls.push(mtl.clone());
+    }
+
+    #[inline]
+    fn keep_pso(&mut self, pso: &Arc<GraphicsPipeline>) {
+        if self.keep_psos.last().is_some_and(|last| Arc::ptr_eq(last, pso)) {
+            return;
+        }
+        self.keep_psos.push(pso.clone());
+    }
+
+    /// Sub-allocate an `align`-aligned slice from the resident upload ring (recycled
+    /// via `Queue::timeline` once the GPU finishes and no live `ResourceCore` references
+    /// the chunk).
+    pub(super) fn alloc_upload_slice(
+        &mut self,
+        len: usize,
+        align: usize,
+    ) -> Result<(Arc<MtlResource>, u64, *mut u8), String> {
+        let align = align.max(16);
+        if let Some((ref chunk, ref mut cur, cap)) = self.cur_upload {
+            let off = cur.next_multiple_of(align);
+            if off.saturating_add(len) <= cap {
+                *cur = off + len;
+                let cpu = chunk.cpu_ptr().ok_or("upload ring chunk has no cpu_ptr")?;
+                if !self.active_upload_chunks.iter().any(|c| Arc::ptr_eq(c, chunk)) {
+                    self.active_upload_chunks.push(chunk.clone());
+                }
+                return Ok((chunk.clone(), off as u64, unsafe { cpu.add(off) }));
+            }
+        }
+
+        // Reclaim completed chunks no longer referenced by any live ResourceCore.
+        let completed = self.queue.timeline.completed();
+        let mut remaining = VecDeque::new();
+        while let Some((tv, chunk)) = self.retired_upload_chunks.pop_front() {
+            if tv <= completed {
+                if Arc::strong_count(&chunk) == 1 && self.ready_upload_chunks.len() < MAX_READY_UPLOAD_CHUNKS {
+                    self.ready_upload_chunks.push(chunk);
+                }
+            } else {
+                remaining.push_back((tv, chunk));
+            }
+        }
+        self.retired_upload_chunks = remaining;
+
+        let cap = len.max(UPLOAD_CHUNK_SIZE);
+        let chunk = if cap == UPLOAD_CHUNK_SIZE {
+            if let Some(reused) = self.ready_upload_chunks.pop() {
+                reused
+            } else {
+                let rdesc = ResourceDesc {
+                    Dimension: dim::BUFFER,
+                    Width: UPLOAD_CHUNK_SIZE as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleCount: 1,
+                    Layout: 1,
+                    ..Default::default()
+                };
+                let hp = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+                let r = Arc::new(
+                    new_committed_resource(&rdesc, &hp, "d3d11 upload ring")
+                        .map_err(|e| format!("{e:?}"))?,
+                );
+                r.register_ptr();
+                r
+            }
+        } else {
+            let rdesc = ResourceDesc {
+                Dimension: dim::BUFFER,
+                Width: cap as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleCount: 1,
+                Layout: 1,
+                ..Default::default()
+            };
+            let hp = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+            let r = Arc::new(
+                new_committed_resource(&rdesc, &hp, "d3d11 upload large")
+                    .map_err(|e| format!("{e:?}"))?,
+            );
+            r.register_ptr();
+            r
+        };
+
+        let cpu = chunk.cpu_ptr().ok_or("upload ring chunk has no cpu_ptr")?;
+        if cap == UPLOAD_CHUNK_SIZE {
+            // Move previous cur_upload (if any) into active_upload_chunks so it gets
+            // retired with the exact timeline value on the next flush.
+            if let Some((prev, _, _)) = self.cur_upload.replace((chunk.clone(), len, cap)) {
+                if !self.active_upload_chunks.iter().any(|c| Arc::ptr_eq(c, &prev)) {
+                    self.active_upload_chunks.push(prev);
+                }
+            }
+            self.active_upload_chunks.push(chunk.clone());
+        } else {
+            self.keep_mtl(&chunk);
+        }
+        Ok((chunk, 0, cpu))
+    }
+
+    pub(super) fn defer_pool_return(&mut self, class_size: u64, buf: Arc<MtlResource>) {
+        if self.has_work {
+            self.pending_pool_returns.push((class_size, buf));
+        } else {
+            let tv = self.queue.last_submitted();
+            self.dynamic_pool.lock().unwrap().retire(tv, class_size, buf);
+        }
     }
 
     pub fn flush(&mut self) -> u64 {
@@ -233,15 +486,67 @@ impl ImmediateExec {
             return self.queue.last_submitted();
         }
         let v = self.queue.submit(&[&self.cl.cb]);
+        self.frame_stats.flushes += 1;
+        self.cmdbuf_epoch = self.cmdbuf_epoch.wrapping_add(1);
         let i = self.ring_idx;
         self.ring_vals[i] = v;
         self.ring_idx = (i + 1) % self.allocs.len();
         self.open = false;
         self.has_work = false;
-        let kept = std::mem::take(&mut self.keep_alive);
-        if !kept.is_empty() {
-            self.queue.defer_release(Box::new(kept));
+        self.gfx_heaps_bound = false;
+        self.compute_heaps_bound = false;
+        self.bound_gfx_tables = [u64::MAX; 10];
+        self.bound_cs_tables = [u64::MAX; 2];
+        self.rt_synced = false;
+        self.dyn_synced = false;
+
+        let kept_mtls = std::mem::take(&mut self.keep_mtls);
+        let kept_psos = std::mem::take(&mut self.keep_psos);
+        let kept_any = std::mem::take(&mut self.keep_alive);
+        if !kept_mtls.is_empty() || !kept_psos.is_empty() || !kept_any.is_empty() {
+            self.queue.defer_release(Box::new((kept_mtls, kept_psos, kept_any)));
         }
+
+        // Tag active upload chunks with this submission's timeline value.
+        for chunk in self.active_upload_chunks.drain(..) {
+            let is_cur = self.cur_upload.as_ref().is_some_and(|(c, _, _)| Arc::ptr_eq(c, &chunk));
+            if is_cur {
+                // Keep chunk alive on the queue while the current chunk continues bump-allocating
+                // disjoint tail offsets in subsequent frames.
+                self.queue.defer_release(Box::new(chunk));
+            } else {
+                self.retired_upload_chunks.push_back((v, chunk));
+            }
+        }
+        if !self.pending_pool_returns.is_empty() {
+            let mut pool = self.dynamic_pool.lock().unwrap();
+            for (class_size, buf) in self.pending_pool_returns.drain(..) {
+                pool.retire(v, class_size, buf);
+            }
+        }
+
+        // Proactively rotate half-full descriptor heaps at frame/flush boundaries onto a
+        // completed heap (zero wait_cpu) so the next frame starts cleanly at cursor 1.
+        let completed = self.queue.timeline.completed();
+        if self.res_cursor > RES_HEAP_CAP / 2 {
+            self.res_heap_vals[self.res_heap_idx] = v;
+            let next = (self.res_heap_idx + 1) % self.res_heaps.len();
+            if self.res_heap_vals[next] <= completed {
+                self.res_heap_idx = next;
+                self.res_cursor = 1;
+                self.res_heap_epoch = self.res_heap_epoch.wrapping_add(1);
+            }
+        }
+        if self.samp_cursor > SAMP_HEAP_CAP / 2 {
+            self.samp_heap_vals[self.samp_heap_idx] = v;
+            let next = (self.samp_heap_idx + 1) % self.samp_heaps.len();
+            if self.samp_heap_vals[next] <= completed {
+                self.samp_heap_idx = next;
+                self.samp_cursor = 1;
+                self.samp_heap_epoch = self.samp_heap_epoch.wrapping_add(1);
+            }
+        }
+
         for q in std::mem::take(&mut self.pending_queries) {
             let mut rt = q.rt.lock().unwrap();
             rt.submitted = true;
@@ -250,38 +555,98 @@ impl ImmediateExec {
         v
     }
 
-    fn alloc_res_slots(&mut self, count: u32) -> Result<(usize, u64), String> {
-        if self.res_cursor + count > RES_HEAP_CAP {
-            let v = self.flush();
-            self.res_heap_vals[self.res_heap_idx] = v;
-            self.res_heap_idx = (self.res_heap_idx + 1) % self.res_heaps.len();
-            if self.res_heap_vals[self.res_heap_idx] != 0 {
-                self.queue.timeline.wait_cpu(self.res_heap_vals[self.res_heap_idx], u64::MAX);
-            }
-            self.res_cursor = 0;
-            self.ensure_open()?;
+    #[inline]
+    fn dummy_res_gpu(&self) -> u64 {
+        self.res_heaps[self.res_heap_idx].gpu_base
+    }
+
+    #[inline]
+    fn dummy_samp_gpu(&self) -> u64 {
+        self.samp_heaps[self.samp_heap_idx].gpu_base
+    }
+
+    fn ensure_res_space(&mut self, needed: u32) -> Result<(), String> {
+        if self.res_cursor + needed <= RES_HEAP_CAP {
+            return Ok(());
         }
+        self.frame_stats.mid_frame_flushes += 1;
+        let v = self.flush();
+        self.res_heap_vals[self.res_heap_idx] = v;
+        let completed = self.queue.timeline.completed();
+        let next = (self.res_heap_idx + 1) % self.res_heaps.len();
+        if self.res_heap_vals[next] > completed && self.res_heaps.len() < HEAP_RING {
+            let idx = self.res_heaps.len();
+            let h = DescriptorHeap::new(
+                heap_kind::CBV_SRV_UAV,
+                RES_HEAP_CAP,
+                true,
+                &format!("d3d11 res heap {idx}"),
+            )?;
+            self.res_heaps.push(h);
+            self.res_heap_vals.push(0);
+            self.res_heap_idx = idx;
+        } else {
+            self.res_heap_idx = next;
+            if self.res_heap_vals[next] > completed {
+                self.frame_stats.mid_frame_stalls += 1;
+                self.queue.timeline.wait_cpu(self.res_heap_vals[next], u64::MAX);
+            }
+        }
+        self.res_cursor = 1;
+        self.res_heap_epoch = self.res_heap_epoch.wrapping_add(1);
+        self.ensure_open()
+    }
+
+    fn ensure_samp_space(&mut self, needed: u32) -> Result<(), String> {
+        if self.samp_cursor + needed <= SAMP_HEAP_CAP {
+            return Ok(());
+        }
+        self.frame_stats.mid_frame_flushes += 1;
+        let v = self.flush();
+        self.samp_heap_vals[self.samp_heap_idx] = v;
+        let completed = self.queue.timeline.completed();
+        let next = (self.samp_heap_idx + 1) % self.samp_heaps.len();
+        if self.samp_heap_vals[next] > completed && self.samp_heaps.len() < HEAP_RING {
+            let idx = self.samp_heaps.len();
+            let h = DescriptorHeap::new(
+                heap_kind::SAMPLER,
+                SAMP_HEAP_CAP,
+                true,
+                &format!("d3d11 samp heap {idx}"),
+            )?;
+            self.samp_heaps.push(h);
+            self.samp_heap_vals.push(0);
+            self.samp_heap_idx = idx;
+        } else {
+            self.samp_heap_idx = next;
+            if self.samp_heap_vals[next] > completed {
+                self.frame_stats.mid_frame_stalls += 1;
+                self.queue.timeline.wait_cpu(self.samp_heap_vals[next], u64::MAX);
+            }
+        }
+        self.samp_cursor = 1;
+        self.samp_heap_epoch = self.samp_heap_epoch.wrapping_add(1);
+        self.ensure_open()
+    }
+
+    #[inline]
+    fn alloc_res_slots_unchecked(&mut self, count: u32) -> (usize, u64) {
+        debug_assert!(self.res_cursor + count <= RES_HEAP_CAP);
         let h = &self.res_heaps[self.res_heap_idx];
         let off = self.res_cursor as usize * RESOURCE_DESCRIPTOR_SIZE as usize;
         self.res_cursor += count;
-        Ok((h.cpu_base + off, h.gpu_base + off as u64))
+        self.frame_stats.res_slots += count as u64;
+        (h.cpu_base + off, h.gpu_base + off as u64)
     }
 
-    fn alloc_samp_slots(&mut self, count: u32) -> Result<(usize, u64), String> {
-        if self.samp_cursor + count > SAMP_HEAP_CAP {
-            let v = self.flush();
-            self.samp_heap_vals[self.samp_heap_idx] = v;
-            self.samp_heap_idx = (self.samp_heap_idx + 1) % self.samp_heaps.len();
-            if self.samp_heap_vals[self.samp_heap_idx] != 0 {
-                self.queue.timeline.wait_cpu(self.samp_heap_vals[self.samp_heap_idx], u64::MAX);
-            }
-            self.samp_cursor = 0;
-            self.ensure_open()?;
-        }
+    #[inline]
+    fn alloc_samp_slots_unchecked(&mut self, count: u32) -> (usize, u64) {
+        debug_assert!(self.samp_cursor + count <= SAMP_HEAP_CAP);
         let h = &self.samp_heaps[self.samp_heap_idx];
         let off = self.samp_cursor as usize * RESOURCE_DESCRIPTOR_SIZE as usize;
         self.samp_cursor += count;
-        Ok((h.cpu_base + off, h.gpu_base + off as u64))
+        self.frame_stats.samp_slots += count as u64;
+        (h.cpu_base + off, h.gpu_base + off as u64)
     }
 
     fn bind_active_heaps(&mut self) {
@@ -340,6 +705,8 @@ pub struct StageBindings {
     pub cbs: Vec<CbSlot>,
     pub srvs: Vec<SrvSlot>,
     pub samplers: Vec<SampSlot>,
+    pub res_gen: u64,
+    pub samp_gen: u64,
 }
 
 impl Default for StageBindings {
@@ -348,6 +715,8 @@ impl Default for StageBindings {
             cbs: vec![CbSlot::default(); D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT],
             srvs: vec![SrvSlot::default(); D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT],
             samplers: vec![SampSlot::default(); D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT],
+            res_gen: 1,
+            samp_gen: 1,
         }
     }
 }
@@ -374,7 +743,9 @@ pub struct ContextState {
     pub ds_bind: StageBindings,
     pub cs_bind: StageBindings,
     pub cs_uavs: Vec<UavSlot>,
+    pub cs_uavs_gen: u64,
     pub om_uavs: Vec<UavSlot>,
+    pub om_uavs_gen: u64,
 
     pub input_layout_com: ComRef,
     pub input_layout: Option<Arc<InputLayoutInner>>,
@@ -406,6 +777,14 @@ pub struct ContextState {
     pub so_targets: Vec<ComRef>,
     pub predicate_com: ComRef,
     pub predicate_val: BOOL,
+
+    // Dirty flags for immediate-context fast-path state diffing.
+    pub pso_dirty: bool,
+    pub rt_dirty: bool,
+    pub vp_dirty: bool,
+    pub scissor_dirty: bool,
+    pub blend_factor_dirty: bool,
+    pub stencil_ref_dirty: bool,
 }
 
 impl Default for ContextState {
@@ -430,7 +809,9 @@ impl Default for ContextState {
             ds_bind: StageBindings::default(),
             cs_bind: StageBindings::default(),
             cs_uavs: vec![UavSlot::default(); D3D11_PS_CS_UAV_REGISTER_COUNT],
+            cs_uavs_gen: 1,
             om_uavs: vec![UavSlot::default(); D3D11_PS_CS_UAV_REGISTER_COUNT],
+            om_uavs_gen: 1,
             input_layout_com: ComRef::default(),
             input_layout: None,
             vbs: vec![VbSlot::default(); D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT],
@@ -456,7 +837,25 @@ impl Default for ContextState {
             so_targets: vec![ComRef::default(); D3D11_SO_BUFFER_SLOT_COUNT],
             predicate_com: ComRef::default(),
             predicate_val: 0,
+            pso_dirty: true,
+            rt_dirty: true,
+            vp_dirty: true,
+            scissor_dirty: true,
+            blend_factor_dirty: true,
+            stencil_ref_dirty: true,
         }
+    }
+}
+
+impl ContextState {
+    #[inline]
+    fn clear_gfx_dirty(&mut self) {
+        self.pso_dirty = false;
+        self.rt_dirty = false;
+        self.vp_dirty = false;
+        self.scissor_dirty = false;
+        self.blend_factor_dirty = false;
+        self.stencil_ref_dirty = false;
     }
 }
 
@@ -519,29 +918,89 @@ pub enum RecordedCmd {
 // Immediate execution helpers
 // ---------------------------------------------------------------------------
 
+#[inline]
 unsafe fn write_desc_entry(cpu_base: usize, idx: usize, entry: views::Entry) {
     let dst = (cpu_base + idx * RESOURCE_DESCRIPTOR_SIZE as usize) as *mut u8;
     std::ptr::copy_nonoverlapping(entry.as_ptr(), dst, entry.len());
 }
 
-unsafe fn populate_stage_table(
+#[inline]
+fn mix_sig(h: &mut u64, v: u64) {
+    *h ^= v;
+    *h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(27);
+}
+
+fn compute_stage_slots_sig(
+    bind: &StageBindings,
+    uavs: Option<&[UavSlot]>,
+    usage: StageUsage,
+) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut m = usage.cbv_mask;
+    while m != 0 {
+        let i = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let cb = &bind.cbs[i];
+        let v = cb.res.as_ref().map_or(0, |r| {
+            ((Arc::as_ptr(r) as u64) << 16) ^ r.version.load(Ordering::Acquire)
+        });
+        mix_sig(&mut h, (i as u64) | (v << 4) ^ ((cb.first_constant as u64) << 32) ^ (cb.num_constants as u64));
+    }
+    let mut sm = usage.srv_mask;
+    while sm != 0 {
+        let i = sm.trailing_zeros() as usize;
+        sm &= sm - 1;
+        let v = bind.srvs[i].srv.as_ref().map_or(0, |s| {
+            ((Arc::as_ptr(s) as u64) << 16) ^ s.resource.version.load(Ordering::Acquire)
+        });
+        mix_sig(&mut h, ((i + 14) as u64) ^ v);
+    }
+    if let Some(uavs) = uavs {
+        let mut um = usage.uav_mask;
+        while um != 0 {
+            let i = um.trailing_zeros() as usize;
+            um &= um - 1;
+            let v = uavs[i].uav.as_ref().map_or(0, |u| {
+                ((Arc::as_ptr(u) as u64) << 16) ^ u.resource.version.load(Ordering::Acquire)
+            });
+            mix_sig(&mut h, ((i + 142) as u64) ^ v);
+        }
+    }
+    h
+}
+
+unsafe fn populate_stage_table_masked(
     exec: &mut ImmediateExec,
     cpu_base: usize,
     bind: &StageBindings,
     uavs: Option<&[UavSlot]>,
+    usage: StageUsage,
 ) {
-    for (i, cb) in bind.cbs.iter().enumerate() {
+    let active_count =
+        usage.cbv_mask.count_ones() + usage.srv_mask.count_ones() + usage.uav_mask.count_ones();
+    if usage.res_table_len > active_count {
+        std::ptr::write_bytes(
+            cpu_base as *mut u8,
+            0,
+            usage.res_table_len as usize * RESOURCE_DESCRIPTOR_SIZE as usize,
+        );
+    }
+    let mut m = usage.cbv_mask;
+    while m != 0 {
+        let i = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let cb = &bind.cbs[i];
         let entry = if let Some(res) = &cb.res {
-            let mtl = res.current_mtl();
+            let b = res.current_backing();
             let off = (cb.first_constant as u64) * 16;
-            let total = mtl.desc.Width;
+            let total = (res.kind.buffer_width() as u64).min(b.mtl.desc.Width.saturating_sub(b.offset));
             let len = if cb.num_constants == 0 {
                 total.saturating_sub(off)
             } else {
                 ((cb.num_constants as u64) * 16).min(total.saturating_sub(off))
             };
-            let e = views::cbv_entry(mtl.gpu_va + off, len.min(u32::MAX as u64) as u32);
-            exec.keep(mtl);
+            let e = views::cbv_entry(b.mtl.gpu_va + b.offset + off, len.min(u32::MAX as u64) as u32);
+            exec.keep_mtl(&b.mtl);
             e
         } else {
             [0u8; 24]
@@ -549,11 +1008,15 @@ unsafe fn populate_stage_table(
         write_desc_entry(cpu_base, i, entry);
     }
     let srv_off = RS_CBV_COUNT as usize;
-    for (i, slot) in bind.srvs.iter().enumerate() {
+    let mut sm = usage.srv_mask;
+    while sm != 0 {
+        let i = sm.trailing_zeros() as usize;
+        sm &= sm - 1;
+        let slot = &bind.srvs[i];
         let entry = if let Some(srv) = &slot.srv {
             match srv.entry() {
                 Ok((mtl, e)) => {
-                    exec.keep(mtl);
+                    exec.keep_mtl(&mtl);
                     e
                 }
                 Err(e) => {
@@ -568,13 +1031,17 @@ unsafe fn populate_stage_table(
     }
     if let Some(uavs) = uavs {
         let uav_off = (RS_CBV_COUNT + RS_SRV_COUNT) as usize;
-        for (i, slot) in uavs.iter().enumerate() {
+        let mut um = usage.uav_mask;
+        while um != 0 {
+            let i = um.trailing_zeros() as usize;
+            um &= um - 1;
+            let slot = &uavs[i];
             let entry = if let Some(uav) = &slot.uav {
                 match uav.entry() {
                     Ok((mtl, e)) => {
-                        exec.keep(mtl);
+                        exec.keep_mtl(&mtl);
                         if let Some(counter) = &uav.counter {
-                            exec.keep(counter.clone());
+                            exec.keep_mtl(counter);
                         }
                         e
                     }
@@ -591,65 +1058,150 @@ unsafe fn populate_stage_table(
     }
 }
 
-unsafe fn populate_sampler_table(cpu_base: usize, bind: &StageBindings) {
-    for (i, slot) in bind.samplers.iter().enumerate() {
-        let entry = slot.samp.as_ref().map_or([0u8; 24], |s| s.entry);
+unsafe fn populate_sampler_table_masked(cpu_base: usize, bind: &StageBindings, usage: StageUsage) {
+    if usage.samp_table_len > usage.samp_mask.count_ones() {
+        std::ptr::write_bytes(
+            cpu_base as *mut u8,
+            0,
+            usage.samp_table_len as usize * RESOURCE_DESCRIPTOR_SIZE as usize,
+        );
+    }
+    let mut m = usage.samp_mask;
+    while m != 0 {
+        let i = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let entry = bind.samplers[i].samp.as_ref().map_or([0u8; 24], |s| s.entry);
         write_desc_entry(cpu_base, i, entry);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+unsafe fn resolve_stage_res_table(
+    device: &DeviceCore,
+    exec: &mut ImmediateExec,
+    stage_idx: usize,
+    bind: &StageBindings,
+    uavs: Option<&[UavSlot]>,
+    uav_gen: u64,
+    usage: StageUsage,
+    allow_cache: bool,
+) -> (u64, bool) {
+    if usage.res_table_len == 0 {
+        return (exec.dummy_res_gpu(), false);
+    }
+    let combined_gen = bind.res_gen ^ uav_gen.rotate_left(17);
+    let dev_ver = device.desc_resource_version();
+    if allow_cache {
+        let c = exec.stage_res_cache[stage_idx];
+        if c.cmdbuf_epoch == exec.cmdbuf_epoch
+            && c.heap_epoch == exec.res_heap_epoch
+            && c.bind_gen == combined_gen
+            && (usage.cbv_mask & !c.cbv_mask) == 0
+            && (usage.srv_mask & !c.srv_mask) == 0
+            && (usage.uav_mask & !c.uav_mask) == 0
+        {
+            if c.dev_ver == dev_ver {
+                return (c.gpu_va, false);
+            }
+            let sig = compute_stage_slots_sig(bind, uavs, usage);
+            if sig == c.slots_sig {
+                exec.stage_res_cache[stage_idx].dev_ver = dev_ver;
+                return (c.gpu_va, false);
+            }
+        }
+    }
+    let (cpu, gpu) = exec.alloc_res_slots_unchecked(usage.res_table_len);
+    populate_stage_table_masked(exec, cpu, bind, uavs, usage);
+    if allow_cache {
+        let sig = compute_stage_slots_sig(bind, uavs, usage);
+        exec.stage_res_cache[stage_idx] = StageResCache {
+            cmdbuf_epoch: exec.cmdbuf_epoch,
+            heap_epoch: exec.res_heap_epoch,
+            bind_gen: combined_gen,
+            dev_ver,
+            slots_sig: sig,
+            cbv_mask: usage.cbv_mask,
+            srv_mask: usage.srv_mask,
+            uav_mask: usage.uav_mask,
+            gpu_va: gpu,
+        };
+    }
+    (gpu, true)
+}
+
+unsafe fn resolve_stage_samp_table(
+    exec: &mut ImmediateExec,
+    stage_idx: usize,
+    bind: &StageBindings,
+    usage: StageUsage,
+    allow_cache: bool,
+) -> u64 {
+    if usage.samp_table_len == 0 {
+        return exec.dummy_samp_gpu();
+    }
+    if allow_cache {
+        let c = exec.stage_samp_cache[stage_idx];
+        if c.cmdbuf_epoch == exec.cmdbuf_epoch
+            && c.heap_epoch == exec.samp_heap_epoch
+            && c.bind_gen == bind.samp_gen
+            && (usage.samp_mask & !c.samp_mask) == 0
+        {
+            return c.gpu_va;
+        }
+    }
+    let (cpu, gpu) = exec.alloc_samp_slots_unchecked(usage.samp_table_len);
+    populate_sampler_table_masked(cpu, bind, usage);
+    if allow_cache {
+        exec.stage_samp_cache[stage_idx] = StageSampCache {
+            cmdbuf_epoch: exec.cmdbuf_epoch,
+            heap_epoch: exec.samp_heap_epoch,
+            bind_gen: bind.samp_gen,
+            samp_mask: usage.samp_mask,
+            gpu_va: gpu,
+        };
+    }
+    gpu
+}
+
 fn get_or_build_gfx_pso(
     device: &DeviceCore,
+    exec: &mut ImmediateExec,
     st: &ContextState,
     indexed: bool,
-) -> Result<Arc<GraphicsPipeline>, String> {
+    live_state: bool,
+) -> Result<Arc<CachedGfxPso>, String> {
+    if live_state && !st.pso_dirty && exec.cached_gfx_indexed == indexed {
+        if let Some(ref cached) = exec.cached_gfx_pso {
+            return Ok(cached.clone());
+        }
+    }
     let vs = st.vs.as_ref().ok_or("no vertex shader bound")?;
     let hs = st.hs.as_ref();
     let ds = st.ds.as_ref();
     let gs = st.gs.as_ref();
     let ps = st.ps.as_ref();
 
-    let blend_d12 = st
-        .blend
-        .as_ref()
-        .map(|b| b.d3d12)
-        .unwrap_or_else(|| D3D11_BLEND_DESC::default_d3d11().to_d3d12());
-    let (rast_mtl, rast_hash) = match &st.rast {
-        Some(r) => (r.mtl, r.hash),
-        None => {
-            let d1 = D3D11_RASTERIZER_DESC::default_d3d11().to_desc1();
-            (d3d12_metal::state::raster_state(&d1.to_d3d12()), hash_raster_desc(&d1))
-        }
-    };
-    let (ds_d12, ds_mtl) = match &st.ds_state {
-        Some(d) => (d.desc.to_d3d12(), d.mtl),
-        None => {
-            let d = D3D11_DEPTH_STENCIL_DESC::default_d3d11().to_d3d12();
-            (d, d3d12_metal::state::depth_stencil_state(&d))
-        }
-    };
-
-    let mut rtv_formats = [0u32; 8];
+    let mut rtv_formats = [0u16; 8];
     let mut num_rtvs = 0u8;
-    let mut sample_count = 1u32;
+    let mut sample_count = 1u8;
     for (i, slot) in st.rtvs.iter().enumerate() {
         if let Some(rtv) = &slot.rtv {
-            rtv_formats[i] = rtv.format();
+            rtv_formats[i] = rtv.format() as u16;
             num_rtvs = (i + 1) as u8;
-            sample_count = rtv.resource.kind.sample_count().max(1);
+            sample_count = rtv.resource.kind.sample_count().clamp(1, 255) as u8;
         }
     }
     let dsv_format = match &st.dsv {
         Some(dsv) => {
             if num_rtvs == 0 {
-                sample_count = dsv.resource.kind.sample_count().max(1);
+                sample_count = dsv.resource.kind.sample_count().clamp(1, 255) as u8;
             }
-            dsv.format()
+            dsv.format() as u16
         }
         None => 0,
     };
 
-    let topology_type = d3d11_topology_to_type(st.topology);
+    let topology_type = d3d11_topology_to_type(st.topology) as u8;
     let strip_cut = if indexed {
         match st.ib_format {
             57 => 1, // CUT_0XFFFF
@@ -661,28 +1213,46 @@ fn get_or_build_gfx_pso(
     };
 
     let key = GraphicsPsoKey {
-        vs_hash: vs.hash,
-        hs_hash: hs.map_or(0, |h| h.hash),
-        ds_hash: ds.map_or(0, |d| d.hash),
-        gs_hash: gs.map_or(0, |g| g.hash),
-        ps_hash: ps.map_or(0, |p| p.hash),
-        il_hash: st.input_layout.as_ref().map_or(0, |il| il.hash),
-        blend: blend_d12,
+        vs_id: vs.id,
+        hs_id: hs.map_or(0, |h| h.id),
+        ds_id: ds.map_or(0, |d| d.id),
+        gs_id: gs.map_or(0, |g| g.id),
+        ps_id: ps.map_or(0, |p| p.id),
+        il_id: st.input_layout.as_ref().map_or(0, |il| il.id),
+        blend_id: st.blend.as_ref().map_or(0, |b| b.id),
         sample_mask: st.sample_mask,
-        raster_hash: rast_hash,
-        depth_stencil: ds_d12,
+        raster_id: st.rast.as_ref().map_or(0, |r| r.id),
+        ds_state_id: if dsv_format == 0 { 0 } else { st.ds_state.as_ref().map_or(0, |d| d.id) },
+        rtv_formats,
+        dsv_format,
         topology_type,
         strip_cut,
-        rtv_formats,
         num_rtvs,
-        dsv_format,
         sample_count,
     };
 
-    if let Some(p) = device.gfx_psos.lock().unwrap().get(&key) {
-        return Ok(p.clone());
+    if let Some(p) = device.gfx_psos.lock().unwrap().get(&key).cloned() {
+        if live_state {
+            exec.cached_gfx_pso = Some(p.clone());
+            exec.cached_gfx_indexed = indexed;
+        }
+        return Ok(p);
     }
 
+    let blend_d12 = st
+        .blend
+        .as_ref()
+        .map(|b| b.d3d12)
+        .unwrap_or_else(|| D3D11_BLEND_DESC::default_d3d11().to_d3d12());
+    let rast_mtl = match &st.rast {
+        Some(r) => r.mtl,
+        None => d3d12_metal::state::raster_state(&D3D11_RASTERIZER_DESC::default_d3d11().to_desc1().to_d3d12()),
+    };
+    let ds_mtl = match &st.ds_state {
+        Some(d) => d.mtl,
+        None => d3d12_metal::state::depth_stencil_state(&D3D11_DEPTH_STENCIL_DESC::default_d3d11().to_d3d12()),
+    };
+    let rtv_formats_u32: Vec<u32> = rtv_formats[..num_rtvs as usize].iter().map(|&f| f as u32).collect();
     let gdesc = GraphicsDesc {
         vs: &vs.bytecode,
         ps: ps.map(|p| p.bytecode.as_slice()),
@@ -691,11 +1261,11 @@ fn get_or_build_gfx_pso(
         raster: rast_mtl,
         depth_stencil: ds_mtl,
         input_layout: st.input_layout.as_ref().map_or_else(Vec::new, |il| il.elements.clone()),
-        strip_cut,
-        topology_type,
-        rtv_formats: rtv_formats[..num_rtvs as usize].to_vec(),
-        dsv_format,
-        sample_count,
+        strip_cut: strip_cut as u32,
+        topology_type: topology_type as u32,
+        rtv_formats: rtv_formats_u32,
+        dsv_format: dsv_format as u32,
+        sample_count: sample_count as u32,
     };
     let label = format!("d3d11_gfx_{:016x}", vs.hash as u64);
     let pso = Arc::new(match (hs, ds, gs) {
@@ -715,8 +1285,14 @@ fn get_or_build_gfx_pso(
         }
         (None, None, None) => GraphicsPipeline::new(device.gfx_rs.clone(), &gdesc, &label)?,
     });
-    device.gfx_psos.lock().unwrap().insert(key, pso.clone());
-    Ok(pso)
+    let usage = GfxPsoUsage::from_pipeline(&pso);
+    let cached = Arc::new(CachedGfxPso { pso, usage });
+    device.gfx_psos.lock().unwrap().insert(key, cached.clone());
+    if live_state {
+        exec.cached_gfx_pso = Some(cached.clone());
+        exec.cached_gfx_indexed = indexed;
+    }
+    Ok(cached)
 }
 
 fn sync_stage_shared(device: &DeviceCore, bind: &StageBindings) {
@@ -733,6 +1309,9 @@ fn sync_stage_shared(device: &DeviceCore, bind: &StageBindings) {
 }
 
 fn sync_state_shared(device: &DeviceCore, st: &ContextState) {
+    if !device.has_shared_resources.load(Ordering::Acquire) {
+        return;
+    }
     sync_stage_shared(device, &st.vs_bind);
     sync_stage_shared(device, &st.hs_bind);
     sync_stage_shared(device, &st.ds_bind);
@@ -812,10 +1391,11 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
         RecordedCmd::ClearRtv { rtv, color, rects } => {
             match rtv.target_view() {
                 Ok((mtl, tv)) => {
-                    exec.keep(mtl);
+                    exec.keep_mtl(&mtl);
                     if let Err(e) = exec.cl.clear_rtv(&tv, *color, rects) {
                         log::warn!(target: "d3d", "d3d11 ClearRenderTargetView: {e}");
                     } else {
+                        rtv.resource.last_gpu_state.store(gpu_state::RENDER_TARGET, Ordering::Release);
                         exec.has_work = true;
                     }
                 }
@@ -825,10 +1405,11 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
         RecordedCmd::ClearDsv { dsv, flags, depth, stencil, rects } => {
             match dsv.target_view() {
                 Ok((mtl, tv)) => {
-                    exec.keep(mtl);
+                    exec.keep_mtl(&mtl);
                     if let Err(e) = exec.cl.clear_dsv(&tv, *flags & clear_flag::DEPTH != 0, *depth, *flags & clear_flag::STENCIL != 0, *stencil, rects) {
                         log::warn!(target: "d3d", "d3d11 ClearDepthStencilView: {e}");
                     } else {
+                        dsv.resource.last_gpu_state.store(gpu_state::DEPTH_WRITE, Ordering::Release);
                         exec.has_work = true;
                     }
                 }
@@ -842,9 +1423,11 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
                 log::warn!(target: "d3d", "d3d11 ClearUnorderedAccessViewUint: {e}");
             } else {
                 exec.cl.barrier();
+                uav.resource.last_gpu_state.store(gpu_state::UNORDERED_ACCESS, Ordering::Release);
+                exec.invalidate_live_caches();
                 exec.has_work = true;
             }
-            exec.keep(mtl);
+            exec.keep_mtl(&mtl);
         }
         RecordedCmd::ClearUavFloat { uav, values } => {
             let mtl = uav.resource.current_mtl();
@@ -853,37 +1436,68 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
                 log::warn!(target: "d3d", "d3d11 ClearUnorderedAccessViewFloat: {e}");
             } else {
                 exec.cl.barrier();
+                uav.resource.last_gpu_state.store(gpu_state::UNORDERED_ACCESS, Ordering::Release);
+                exec.invalidate_live_caches();
                 exec.has_work = true;
             }
-            exec.keep(mtl);
+            exec.keep_mtl(&mtl);
         }
         RecordedCmd::CopyResource { dst, src } => {
-            let d = dst.current_mtl();
-            let s = src.current_mtl();
             exec.cl.barrier();
-            if let Err(e) = exec.cl.copy_resource(&d, &s) {
-                log::warn!(target: "d3d", "d3d11 CopyResource: {e}");
+            if dst.is_buffer() && src.is_buffer() {
+                let db = dst.current_backing();
+                let sb = src.current_backing();
+                let len = (dst.kind.buffer_width() as u64).min(src.kind.buffer_width() as u64);
+                if let Err(e) = exec.cl.copy_buffer(&db.mtl, db.offset, &sb.mtl, sb.offset, len) {
+                    log::warn!(target: "d3d", "d3d11 CopyResource: {e}");
+                } else {
+                    exec.cl.barrier();
+                    dst.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
+                    exec.has_work = true;
+                }
+                exec.keep_mtl(&db.mtl);
+                exec.keep_mtl(&sb.mtl);
             } else {
-                exec.cl.barrier();
-                exec.has_work = true;
+                let d = dst.current_mtl();
+                let s = src.current_mtl();
+                if let Err(e) = exec.cl.copy_resource(&d, &s) {
+                    log::warn!(target: "d3d", "d3d11 CopyResource: {e}");
+                } else {
+                    exec.cl.barrier();
+                    dst.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
+                    exec.has_work = true;
+                }
+                exec.keep_mtl(&d);
+                exec.keep_mtl(&s);
             }
-            exec.keep((d, s));
         }
         RecordedCmd::CopySubresourceRegion { dst, dst_sub, dst_xyz, src, src_sub, src_box } => {
-            let d = dst.current_mtl();
-            let s = src.current_mtl();
             exec.cl.barrier();
-            let res = if dst.is_buffer() && src.is_buffer() {
+            if dst.is_buffer() && src.is_buffer() {
+                let db = dst.current_backing();
+                let sb = src.current_backing();
+                let src_w = src.kind.buffer_width() as u64;
+                let dst_w = dst.kind.buffer_width() as u64;
                 let (src_off, len) = match src_box {
                     Some(b) => (b.left as u64, b.right.saturating_sub(b.left) as u64),
-                    None => (0, s.desc.Width),
+                    None => (0, src_w),
                 };
                 let dst_off = dst_xyz[0] as u64;
                 let max_len = len
-                    .min(s.desc.Width.saturating_sub(src_off))
-                    .min(d.desc.Width.saturating_sub(dst_off));
-                exec.cl.copy_buffer(&d, dst_off, &s, src_off, max_len)
+                    .min(src_w.saturating_sub(src_off))
+                    .min(dst_w.saturating_sub(dst_off));
+                if let Err(e) = exec.cl.copy_buffer(&db.mtl, db.offset + dst_off, &sb.mtl, sb.offset + src_off, max_len) {
+                    log::warn!(target: "d3d", "d3d11 CopySubresourceRegion: {e}");
+                } else {
+                    exec.cl.barrier();
+                    dst.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
+                    exec.has_work = true;
+                }
+                exec.keep_mtl(&db.mtl);
+                exec.keep_mtl(&sb.mtl);
             } else {
+                let d = dst.current_mtl();
+                let s = src.current_mtl();
                 let cbox = src_box.map(|b| CopyBox {
                     left: b.left,
                     top: b.top,
@@ -892,23 +1506,33 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
                     bottom: b.bottom,
                     back: b.back,
                 });
-                exec.cl.copy_texture_region(
+                if let Err(e) = exec.cl.copy_texture_region(
                     CopyLoc::Subresource(&d, *dst_sub),
                     *dst_xyz,
                     CopyLoc::Subresource(&s, *src_sub),
                     cbox,
-                )
-            };
-            if let Err(e) = res {
-                log::warn!(target: "d3d", "d3d11 CopySubresourceRegion: {e}");
-            } else {
-                exec.cl.barrier();
-                exec.has_work = true;
+                ) {
+                    log::warn!(target: "d3d", "d3d11 CopySubresourceRegion: {e}");
+                } else {
+                    exec.cl.barrier();
+                    dst.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
+                    exec.has_work = true;
+                }
+                exec.keep_mtl(&d);
+                exec.keep_mtl(&s);
             }
-            exec.keep((d, s));
         }
         RecordedCmd::UpdateSubresource { dst, dst_sub, dst_box, data, src_row_pitch, src_depth_pitch } => {
-            if let Err(e) = exec_update_subresource_bytes(&mut exec, dst, *dst_sub, *dst_box, data, *src_row_pitch, *src_depth_pitch) {
+            if let Err(e) = exec_update_subresource_raw(
+                &mut exec,
+                dst,
+                *dst_sub,
+                *dst_box,
+                data.as_ptr(),
+                Some(data.len()),
+                *src_row_pitch,
+                *src_depth_pitch,
+            ) {
                 log::warn!(target: "d3d", "d3d11 UpdateSubresource: {e}");
             }
         }
@@ -920,58 +1544,62 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
                 log::warn!(target: "d3d", "d3d11 ResolveSubresource: {e}");
             } else {
                 exec.cl.barrier();
+                dst.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
                 exec.has_work = true;
             }
-            exec.keep((d, s));
+            exec.keep_mtl(&d);
+            exec.keep_mtl(&s);
         }
         RecordedCmd::Draw { state, vertex_count, instance_count, start_vertex, start_instance } => {
-            if let Err(e) = exec_draw(device, &mut exec, state, None, *vertex_count, *instance_count, *start_vertex, 0, *start_instance) {
+            if let Err(e) = exec_draw(device, &mut exec, state, false, None, *vertex_count, *instance_count, *start_vertex, 0, *start_instance) {
                 log::warn!(target: "d3d", "d3d11 Draw({vertex_count}, {instance_count}): {e}");
             }
         }
         RecordedCmd::DrawIndexed { state, index_count, instance_count, start_index, base_vertex, start_instance } => {
-            if let Err(e) = exec_draw(device, &mut exec, state, Some(*start_index), *index_count, *instance_count, 0, *base_vertex, *start_instance) {
+            if let Err(e) = exec_draw(device, &mut exec, state, false, Some(*start_index), *index_count, *instance_count, 0, *base_vertex, *start_instance) {
                 log::warn!(target: "d3d", "d3d11 DrawIndexed({index_count}, {instance_count}): {e}");
             }
         }
         RecordedCmd::DrawInstancedIndirect { state, args, offset } => {
-            if let Err(e) = exec_draw_indirect(device, &mut exec, state, args, *offset, false) {
+            if let Err(e) = exec_draw_indirect(device, &mut exec, state, false, args, *offset, false) {
                 log::warn!(target: "d3d", "d3d11 DrawInstancedIndirect(off={offset}): {e}");
             }
         }
         RecordedCmd::DrawIndexedInstancedIndirect { state, args, offset } => {
-            if let Err(e) = exec_draw_indirect(device, &mut exec, state, args, *offset, true) {
+            if let Err(e) = exec_draw_indirect(device, &mut exec, state, false, args, *offset, true) {
                 log::warn!(target: "d3d", "d3d11 DrawIndexedInstancedIndirect(off={offset}): {e}");
             }
         }
         RecordedCmd::Dispatch { state, x, y, z } => {
-            if let Err(e) = exec_dispatch(device, &mut exec, state, *x, *y, *z) {
+            if let Err(e) = exec_dispatch(device, &mut exec, state, false, *x, *y, *z) {
                 log::warn!(target: "d3d", "d3d11 Dispatch({x}, {y}, {z}): {e}");
             }
         }
         RecordedCmd::DispatchIndirect { state, args, offset } => {
-            if let Err(e) = exec_dispatch_indirect(device, &mut exec, state, args, *offset) {
+            if let Err(e) = exec_dispatch_indirect(device, &mut exec, state, false, args, *offset) {
                 log::warn!(target: "d3d", "d3d11 DispatchIndirect(off={offset}): {e}");
             }
         }
         RecordedCmd::CopyStructureCount { dst, dst_offset, uav } => {
             if let Some(counter) = &uav.counter {
-                let d = dst.current_mtl();
+                let db = dst.current_backing();
+                let dst_w = dst.kind.buffer_width() as u64;
                 let off = *dst_offset as u64;
-                if off & 3 == 0 && off.saturating_add(4) <= d.desc.Width {
+                if off & 3 == 0 && off.saturating_add(4) <= dst_w {
                     exec.cl.barrier();
-                    if let Err(e) = exec.cl.copy_buffer(&d, off, counter, 0, 4) {
+                    if let Err(e) = exec.cl.copy_buffer(&db.mtl, db.offset + off, counter, 0, 4) {
                         log::warn!(target: "d3d", "d3d11 CopyStructureCount: {e}");
                     } else {
                         exec.cl.barrier();
+                        dst.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
                         exec.has_work = true;
                     }
-                    exec.keep((d, counter.clone()));
+                    exec.keep_mtl(&db.mtl);
+                    exec.keep_mtl(counter);
                 } else {
                     log::warn!(
                         target: "d3d",
-                        "d3d11 CopyStructureCount: misaligned or out-of-bounds offset {off} for {}B dst buffer",
-                        d.desc.Width
+                        "d3d11 CopyStructureCount: misaligned or out-of-bounds offset {off} for {dst_w}B dst buffer"
                     );
                 }
             } else {
@@ -987,7 +1615,7 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
                     exec.cl.barrier();
                     exec.has_work = true;
                 }
-                exec.keep(counter.clone());
+                exec.keep_mtl(counter);
             }
         }
         RecordedCmd::GenerateMips { srv } => {
@@ -1050,58 +1678,49 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
         RecordedCmd::DiscardResource(res) => {
             let mtl = res.current_mtl();
             exec.cl.discard_resource(&mtl, None);
-            exec.keep(mtl);
+            res.last_gpu_state.store(gpu_state::COMMON, Ordering::Release);
+            exec.keep_mtl(&mtl);
         }
     }
 }
 
-unsafe fn exec_update_subresource_bytes(
+#[allow(clippy::too_many_arguments)]
+unsafe fn exec_update_subresource_raw(
     exec: &mut ImmediateExec,
     dst: &ResourceCore,
     dst_sub: u32,
     dst_box: Option<D3D11_BOX>,
-    data: &[u8],
+    src_ptr: *const u8,
+    src_len: Option<usize>,
     src_row_pitch: u32,
     src_depth_pitch: u32,
 ) -> Result<(), String> {
-    let dst_mtl = dst.current_mtl();
     if dst.is_buffer() {
+        let db = dst.current_backing();
+        let dst_w = dst.kind.buffer_width() as u64;
         let (dst_off, len) = match dst_box {
             Some(b) => (b.left as u64, b.right.saturating_sub(b.left) as u64),
-            None => (0, dst_mtl.desc.Width),
+            None => (0, dst_w),
         };
-        let copy_len = (len as usize)
-            .min(data.len())
-            .min((dst_mtl.desc.Width.saturating_sub(dst_off)) as usize);
+        let mut copy_len = (len as usize).min(dst_w.saturating_sub(dst_off) as usize);
+        if let Some(slen) = src_len {
+            copy_len = copy_len.min(slen);
+        }
         if copy_len == 0 {
             return Ok(());
         }
-        let up_desc = ResourceDesc {
-            Dimension: dim::BUFFER,
-            Width: copy_len as u64,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleCount: 1,
-            Layout: 1,
-            ..Default::default()
-        };
-        let hp = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
-        let up = Arc::new(
-            new_committed_resource(&up_desc, &hp, "d3d11 update buf")
-                .map_err(|e| format!("{e:?}"))?,
-        );
-        up.register_ptr();
-        let cpu = up.cpu_ptr().ok_or("upload buffer has no cpu_ptr")?;
-        std::ptr::copy_nonoverlapping(data.as_ptr(), cpu, copy_len);
+        let (up, up_off, up_cpu) = exec.alloc_upload_slice(copy_len, 256)?;
+        std::ptr::copy_nonoverlapping(src_ptr, up_cpu, copy_len);
         exec.cl.barrier();
-        exec.cl.copy_buffer(&dst_mtl, dst_off, &up, 0, copy_len as u64)?;
+        exec.cl.copy_buffer(&db.mtl, db.offset + dst_off, &up, up_off, copy_len as u64)?;
         exec.cl.barrier();
+        dst.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
         exec.has_work = true;
-        exec.keep((up, dst_mtl));
+        exec.keep_mtl(&db.mtl);
         return Ok(());
     }
 
+    let dst_mtl = dst.current_mtl();
     let (layouts, _) = d3d12_metal::layout::copyable_footprints(&dst_mtl.desc, dst_sub, 1, 0)
         .ok_or_else(|| format!("copyable_footprints failed for subresource {dst_sub}"))?;
     let lay = layouts[0];
@@ -1126,37 +1745,30 @@ unsafe fn exec_update_subresource_bytes(
     let dst_row_pitch = row_bytes.next_multiple_of(256).max(256);
     let dst_slice_pitch = dst_row_pitch * num_rows;
     let total = dst_slice_pitch * d as usize;
-    let up_desc = ResourceDesc {
-        Dimension: dim::BUFFER,
-        Width: (total as u64).max(16),
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleCount: 1,
-        Layout: 1,
-        ..Default::default()
-    };
-    let hp = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
-    let up = Arc::new(
-        new_committed_resource(&up_desc, &hp, "d3d11 update tex")
-            .map_err(|e| format!("{e:?}"))?,
-    );
-    up.register_ptr();
-    let dst_base = up.cpu_ptr().ok_or("upload buffer has no cpu_ptr")?;
+    let (up, up_off, dst_base) = exec.alloc_upload_slice(total.max(16), 512)?;
     let srp = if src_row_pitch == 0 { row_bytes } else { src_row_pitch as usize };
     let sdp = if src_depth_pitch == 0 { srp * num_rows } else { src_depth_pitch as usize };
     for z in 0..d as usize {
         for y in 0..num_rows {
             let soff = z * sdp + y * srp;
             let doff = z * dst_slice_pitch + y * dst_row_pitch;
-            if soff < data.len() {
-                let n = row_bytes.min(data.len() - soff);
-                std::ptr::copy_nonoverlapping(data.as_ptr().add(soff), dst_base.add(doff), n);
+            let n = match src_len {
+                Some(slen) => {
+                    if soff >= slen {
+                        0
+                    } else {
+                        row_bytes.min(slen - soff)
+                    }
+                }
+                None => row_bytes,
+            };
+            if n > 0 {
+                std::ptr::copy_nonoverlapping(src_ptr.add(soff), dst_base.add(doff), n);
             }
         }
     }
     let fp = PlacedFootprint {
-        offset: 0,
+        offset: up_off,
         format: lay.footprint.format,
         width: w.next_multiple_of(bw),
         height: h.next_multiple_of(bh),
@@ -1172,8 +1784,9 @@ unsafe fn exec_update_subresource_bytes(
         None,
     )?;
     exec.cl.barrier();
+    dst.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
     exec.has_work = true;
-    exec.keep((up, dst_mtl));
+    exec.keep_mtl(&dst_mtl);
     Ok(())
 }
 
@@ -1181,174 +1794,328 @@ unsafe fn prepare_gfx_draw(
     device: &DeviceCore,
     exec: &mut ImmediateExec,
     st: &ContextState,
+    live_state: bool,
     indexed: bool,
-    indirect_arg: Option<&Arc<MtlResource>>,
+    indirect_arg: Option<(&ResourceCore, &Arc<MtlResource>)>,
 ) -> Result<(), String> {
-    let pso = get_or_build_gfx_pso(device, st, indexed)?;
+    let cached = get_or_build_gfx_pso(device, exec, st, indexed, live_state)?;
+    let pso = &cached.pso;
+    let usage = cached.usage;
 
-    // Allocate VS + PS (+ optional GS / HS / DS) resource & sampler descriptor tables.
-    let (vs_res_cpu, vs_res_gpu) = exec.alloc_res_slots(VS_RES_TABLE_LEN)?;
-    let (ps_res_cpu, ps_res_gpu) = exec.alloc_res_slots(PS_RES_TABLE_LEN)?;
-    let (vs_samp_cpu, vs_samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
-    let (ps_samp_cpu, ps_samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
+    // Pre-reserve worst-case descriptor space BEFORE allocating any stage tables so
+    // a mid-draw heap rotation cannot invalidate an earlier stage's table pointer.
+    let need_res = usage.vs.res_table_len
+        + usage.ps.res_table_len
+        + if st.gs.is_some() { usage.gs.res_table_len } else { 0 }
+        + if st.hs.is_some() { usage.hs.res_table_len } else { 0 }
+        + if st.ds.is_some() { usage.ds.res_table_len } else { 0 };
+    let need_samp = usage.vs.samp_table_len
+        + usage.ps.samp_table_len
+        + if st.gs.is_some() { usage.gs.samp_table_len } else { 0 }
+        + if st.hs.is_some() { usage.hs.samp_table_len } else { 0 }
+        + if st.ds.is_some() { usage.ds.samp_table_len } else { 0 };
+    exec.ensure_res_space(need_res)?;
+    exec.ensure_samp_space(need_samp)?;
+
+    // Resolve per-stage resource & sampler descriptor tables (reusing cached tables when unchanged).
+    let (vs_res_gpu, mut wrote_res) =
+        resolve_stage_res_table(device, exec, STAGE_VS, &st.vs_bind, None, 0, usage.vs, live_state);
+    let (ps_res_gpu, w) = resolve_stage_res_table(
+        device,
+        exec,
+        STAGE_PS,
+        &st.ps_bind,
+        Some(&st.om_uavs),
+        st.om_uavs_gen,
+        usage.ps,
+        live_state,
+    );
+    wrote_res |= w;
+    let vs_samp_gpu = resolve_stage_samp_table(exec, STAGE_VS, &st.vs_bind, usage.vs, live_state);
+    let ps_samp_gpu = resolve_stage_samp_table(exec, STAGE_PS, &st.ps_bind, usage.ps, live_state);
     let gs_tables = if st.gs.is_some() {
-        let (gs_res_cpu, gs_res_gpu) = exec.alloc_res_slots(GS_RES_TABLE_LEN)?;
-        let (gs_samp_cpu, gs_samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
-        populate_stage_table(exec, gs_res_cpu, &st.gs_bind, None);
-        populate_sampler_table(gs_samp_cpu, &st.gs_bind);
-        Some((gs_res_gpu, gs_samp_gpu))
+        let (r, w) = resolve_stage_res_table(device, exec, STAGE_GS, &st.gs_bind, None, 0, usage.gs, live_state);
+        wrote_res |= w;
+        let s = resolve_stage_samp_table(exec, STAGE_GS, &st.gs_bind, usage.gs, live_state);
+        Some((r, s))
     } else {
         None
     };
     let hs_tables = if st.hs.is_some() {
-        let (hs_res_cpu, hs_res_gpu) = exec.alloc_res_slots(HS_RES_TABLE_LEN)?;
-        let (hs_samp_cpu, hs_samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
-        populate_stage_table(exec, hs_res_cpu, &st.hs_bind, None);
-        populate_sampler_table(hs_samp_cpu, &st.hs_bind);
-        Some((hs_res_gpu, hs_samp_gpu))
+        let (r, w) = resolve_stage_res_table(device, exec, STAGE_HS, &st.hs_bind, None, 0, usage.hs, live_state);
+        wrote_res |= w;
+        let s = resolve_stage_samp_table(exec, STAGE_HS, &st.hs_bind, usage.hs, live_state);
+        Some((r, s))
     } else {
         None
     };
     let ds_tables = if st.ds.is_some() {
-        let (ds_res_cpu, ds_res_gpu) = exec.alloc_res_slots(DS_RES_TABLE_LEN)?;
-        let (ds_samp_cpu, ds_samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
-        populate_stage_table(exec, ds_res_cpu, &st.ds_bind, None);
-        populate_sampler_table(ds_samp_cpu, &st.ds_bind);
-        Some((ds_res_gpu, ds_samp_gpu))
+        let (r, w) = resolve_stage_res_table(device, exec, STAGE_DS, &st.ds_bind, None, 0, usage.ds, live_state);
+        wrote_res |= w;
+        let s = resolve_stage_samp_table(exec, STAGE_DS, &st.ds_bind, usage.ds, live_state);
+        Some((r, s))
     } else {
         None
     };
+    if wrote_res {
+        bump_desc_heap_gen();
+    }
 
-    populate_stage_table(exec, vs_res_cpu, &st.vs_bind, None);
-    populate_stage_table(exec, ps_res_cpu, &st.ps_bind, Some(&st.om_uavs));
-    populate_sampler_table(vs_samp_cpu, &st.vs_bind);
-    populate_sampler_table(ps_samp_cpu, &st.ps_bind);
-    bump_desc_heap_gen();
-
-    // Render targets & DSV.
-    let mut rtv_views = Vec::new();
-    let mut attached_ptrs = Vec::new();
+    // Render targets & DSV (skip rebuilding TargetViews when unchanged on this open command buffer).
+    let mut rt_sig = 0x517c_c1b7_2722_0a95u64;
     let mut max_rt = 0usize;
     for (i, slot) in st.rtvs.iter().enumerate() {
-        if slot.rtv.is_some() {
+        if let Some(rtv) = &slot.rtv {
             max_rt = i + 1;
+            let v = ((Arc::as_ptr(rtv) as u64) << 16) ^ rtv.resource.version.load(Ordering::Acquire);
+            mix_sig(&mut rt_sig, (i as u64) | (v << 4));
         }
     }
+    if let Some(dsv) = &st.dsv {
+        let v = ((Arc::as_ptr(dsv) as u64) << 16) ^ dsv.resource.version.load(Ordering::Acquire);
+        mix_sig(&mut rt_sig, 0x8000 | (v << 4));
+    }
+    let need_rt = !live_state || st.rt_dirty || !exec.rt_synced || rt_sig != exec.rt_backings_sig;
+    if need_rt {
+        exec.scratch_attached.clear();
+        let mut rtv_views = Vec::with_capacity(max_rt);
+        for slot in &st.rtvs[..max_rt] {
+            if let Some(rtv) = &slot.rtv {
+                let (mtl, tv) = rtv.target_view()?;
+                exec.scratch_attached.push(Arc::as_ptr(&mtl) as usize);
+                exec.keep_mtl(&mtl);
+                rtv_views.push(tv);
+            } else {
+                rtv_views.push(TargetView::NULL);
+            }
+        }
+        let dsv_view = match &st.dsv {
+            Some(dsv) => {
+                let (mtl, tv) = dsv.target_view()?;
+                exec.scratch_attached.push(Arc::as_ptr(&mtl) as usize);
+                exec.keep_mtl(&mtl);
+                Some(tv)
+            }
+            None => None,
+        };
+        exec.cl.set_render_targets(rtv_views, dsv_view);
+        if live_state {
+            exec.rt_synced = true;
+            exec.rt_backings_sig = rt_sig;
+        } else {
+            exec.rt_synced = false;
+        }
+    }
+
+    // Per-resource last-state hazard tracking: only emit SRV Transition barriers when a
+    // bound SRV actually has a pending write state (prevents splitting Metal render passes
+    // on steady-state read-only textures).
+    exec.scratch_barriers.clear();
+    let check_srv_stage = |bind: &StageBindings,
+                           mask: u128,
+                           attached: &[usize],
+                           barriers: &mut Vec<Barrier>,
+                           keep_mtls: &mut Vec<Arc<MtlResource>>| {
+        let mut sm = mask;
+        while sm != 0 {
+            let i = sm.trailing_zeros() as usize;
+            sm &= sm - 1;
+            if let Some(srv) = &bind.srvs[i].srv {
+                let prev = srv.resource.last_gpu_state.load(Ordering::Acquire);
+                if (prev & gpu_state::WRITE_MASK) != 0 {
+                    let mtl = srv.resource.current_mtl();
+                    let ptr = Arc::as_ptr(&mtl) as usize;
+                    if !attached.contains(&ptr) {
+                        barriers.push(Barrier::Transition(
+                            ptr,
+                            prev & gpu_state::WRITE_MASK,
+                            gpu_state::SRV_ALL,
+                        ));
+                        srv.resource.last_gpu_state.store(gpu_state::SRV_ALL, Ordering::Release);
+                    }
+                    if keep_mtls.last().is_none_or(|last| !Arc::ptr_eq(last, &mtl)) {
+                        keep_mtls.push(mtl);
+                    }
+                }
+            }
+        }
+    };
+    check_srv_stage(&st.vs_bind, usage.vs.srv_mask, &exec.scratch_attached, &mut exec.scratch_barriers, &mut exec.keep_mtls);
+    check_srv_stage(&st.ps_bind, usage.ps.srv_mask, &exec.scratch_attached, &mut exec.scratch_barriers, &mut exec.keep_mtls);
+    if st.gs.is_some() {
+        check_srv_stage(&st.gs_bind, usage.gs.srv_mask, &exec.scratch_attached, &mut exec.scratch_barriers, &mut exec.keep_mtls);
+    }
+    if st.hs.is_some() {
+        check_srv_stage(&st.hs_bind, usage.hs.srv_mask, &exec.scratch_attached, &mut exec.scratch_barriers, &mut exec.keep_mtls);
+    }
+    if st.ds.is_some() {
+        check_srv_stage(&st.ds_bind, usage.ds.srv_mask, &exec.scratch_attached, &mut exec.scratch_barriers, &mut exec.keep_mtls);
+    }
+    let mut om_um = usage.ps.uav_mask;
+    while om_um != 0 {
+        let i = om_um.trailing_zeros() as usize;
+        om_um &= om_um - 1;
+        if let Some(uav) = &st.om_uavs[i].uav {
+            let mtl = uav.resource.current_mtl();
+            exec.scratch_barriers.push(Barrier::Uav(Arc::as_ptr(&mtl) as usize));
+            uav.resource.last_gpu_state.store(gpu_state::UNORDERED_ACCESS, Ordering::Release);
+            exec.keep_mtl(&mtl);
+            if let Some(counter) = &uav.counter {
+                exec.scratch_barriers.push(Barrier::Uav(Arc::as_ptr(counter) as usize));
+                exec.keep_mtl(counter);
+            }
+        }
+    }
+    if let Some((arg_res, arg_mtl)) = indirect_arg {
+        let prev = arg_res.last_gpu_state.load(Ordering::Acquire);
+        if prev != gpu_state::INDIRECT_ARGUMENT {
+            exec.scratch_barriers.push(Barrier::Transition(
+                Arc::as_ptr(arg_mtl) as usize,
+                prev & gpu_state::WRITE_MASK,
+                gpu_state::INDIRECT_ARGUMENT,
+            ));
+            arg_res.last_gpu_state.store(gpu_state::INDIRECT_ARGUMENT, Ordering::Release);
+        }
+    }
+    if !exec.scratch_barriers.is_empty() {
+        exec.cl.barrier_list(&exec.scratch_barriers);
+    }
+
+    // Mark bound render targets / writable DSV as written for future SRV reads.
     for slot in &st.rtvs[..max_rt] {
         if let Some(rtv) = &slot.rtv {
-            let (mtl, tv) = rtv.target_view()?;
-            attached_ptrs.push(Arc::as_ptr(&mtl) as usize);
-            exec.keep(mtl);
-            rtv_views.push(tv);
-        } else {
-            rtv_views.push(TargetView::NULL);
-        }
-    }
-    let dsv_view = match &st.dsv {
-        Some(dsv) => {
-            let (mtl, tv) = dsv.target_view()?;
-            attached_ptrs.push(Arc::as_ptr(&mtl) as usize);
-            exec.keep(mtl);
-            Some(tv)
-        }
-        None => None,
-    };
-
-    // Implicit D3D11 resource hazard barriers: prior render/copy/compute writes to
-    // bound SRVs, OM UAVs, or indirect argument buffers must complete before this draw.
-    let mut barriers = Vec::new();
-    for slot in st
-        .vs_bind
-        .srvs
-        .iter()
-        .chain(st.hs_bind.srvs.iter())
-        .chain(st.ds_bind.srvs.iter())
-        .chain(st.gs_bind.srvs.iter())
-        .chain(st.ps_bind.srvs.iter())
-    {
-        if let Some(srv) = &slot.srv {
-            let mtl = srv.resource.current_mtl();
-            let ptr = Arc::as_ptr(&mtl) as usize;
-            if !attached_ptrs.contains(&ptr) {
-                // RENDER_TARGET | DEPTH_WRITE | UNORDERED_ACCESS | COPY_DEST -> NON_PIXEL_SRV | PIXEL_SRV
-                barriers.push(Barrier::Transition(ptr, 0x4 | 0x10 | 0x8 | 0x400, 0xC0));
-            }
-            exec.keep(mtl);
-        }
-    }
-    for slot in &st.om_uavs {
-        if let Some(uav) = &slot.uav {
-            let mtl = uav.resource.current_mtl();
-            barriers.push(Barrier::Uav(Arc::as_ptr(&mtl) as usize));
-            exec.keep(mtl);
-            if let Some(counter) = &uav.counter {
-                barriers.push(Barrier::Uav(Arc::as_ptr(counter) as usize));
-                exec.keep(counter.clone());
+            if rtv.resource.last_gpu_state.load(Ordering::Acquire) != gpu_state::RENDER_TARGET {
+                rtv.resource.last_gpu_state.store(gpu_state::RENDER_TARGET, Ordering::Release);
             }
         }
     }
-    if let Some(arg_mtl) = indirect_arg {
-        // Any prior write -> INDIRECT_ARGUMENT (0x200)
-        barriers.push(Barrier::Transition(Arc::as_ptr(arg_mtl) as usize, 0, 0x200));
-    }
-    if !barriers.is_empty() {
-        exec.cl.barrier_list(&barriers);
+    if let Some(dsv) = &st.dsv {
+        let read_only_both = (dsv.desc.Flags & 0x3) == 0x3;
+        if !read_only_both && dsv.resource.last_gpu_state.load(Ordering::Acquire) != gpu_state::DEPTH_WRITE {
+            dsv.resource.last_gpu_state.store(gpu_state::DEPTH_WRITE, Ordering::Release);
+        }
     }
 
-    exec.bind_active_heaps();
-    exec.cl.gfx_root.set_root_signature(device.gfx_rs.clone())?;
-    exec.cl.gfx_root.set_table(0, vs_res_gpu)?;
-    exec.cl.gfx_root.set_table(1, vs_samp_gpu)?;
-    exec.cl.gfx_root.set_table(2, ps_res_gpu)?;
-    exec.cl.gfx_root.set_table(3, ps_samp_gpu)?;
+    if !exec.gfx_heaps_bound {
+        exec.bind_active_heaps();
+        exec.cl.gfx_root.set_root_signature(device.gfx_rs.clone())?;
+        exec.gfx_heaps_bound = true;
+        exec.bound_gfx_tables = [u64::MAX; 10];
+    }
+    if exec.bound_gfx_tables[0] != vs_res_gpu {
+        exec.cl.gfx_root.set_table(0, vs_res_gpu)?;
+        exec.bound_gfx_tables[0] = vs_res_gpu;
+    }
+    if exec.bound_gfx_tables[1] != vs_samp_gpu {
+        exec.cl.gfx_root.set_table(1, vs_samp_gpu)?;
+        exec.bound_gfx_tables[1] = vs_samp_gpu;
+    }
+    if exec.bound_gfx_tables[2] != ps_res_gpu {
+        exec.cl.gfx_root.set_table(2, ps_res_gpu)?;
+        exec.bound_gfx_tables[2] = ps_res_gpu;
+    }
+    if exec.bound_gfx_tables[3] != ps_samp_gpu {
+        exec.cl.gfx_root.set_table(3, ps_samp_gpu)?;
+        exec.bound_gfx_tables[3] = ps_samp_gpu;
+    }
     if let Some((gs_res_gpu, gs_samp_gpu)) = gs_tables {
-        exec.cl.gfx_root.set_table(4, gs_res_gpu)?;
-        exec.cl.gfx_root.set_table(5, gs_samp_gpu)?;
+        if exec.bound_gfx_tables[4] != gs_res_gpu {
+            exec.cl.gfx_root.set_table(4, gs_res_gpu)?;
+            exec.bound_gfx_tables[4] = gs_res_gpu;
+        }
+        if exec.bound_gfx_tables[5] != gs_samp_gpu {
+            exec.cl.gfx_root.set_table(5, gs_samp_gpu)?;
+            exec.bound_gfx_tables[5] = gs_samp_gpu;
+        }
     }
     if let Some((hs_res_gpu, hs_samp_gpu)) = hs_tables {
-        exec.cl.gfx_root.set_table(6, hs_res_gpu)?;
-        exec.cl.gfx_root.set_table(7, hs_samp_gpu)?;
+        if exec.bound_gfx_tables[6] != hs_res_gpu {
+            exec.cl.gfx_root.set_table(6, hs_res_gpu)?;
+            exec.bound_gfx_tables[6] = hs_res_gpu;
+        }
+        if exec.bound_gfx_tables[7] != hs_samp_gpu {
+            exec.cl.gfx_root.set_table(7, hs_samp_gpu)?;
+            exec.bound_gfx_tables[7] = hs_samp_gpu;
+        }
     }
     if let Some((ds_res_gpu, ds_samp_gpu)) = ds_tables {
-        exec.cl.gfx_root.set_table(8, ds_res_gpu)?;
-        exec.cl.gfx_root.set_table(9, ds_samp_gpu)?;
+        if exec.bound_gfx_tables[8] != ds_res_gpu {
+            exec.cl.gfx_root.set_table(8, ds_res_gpu)?;
+            exec.bound_gfx_tables[8] = ds_res_gpu;
+        }
+        if exec.bound_gfx_tables[9] != ds_samp_gpu {
+            exec.cl.gfx_root.set_table(9, ds_samp_gpu)?;
+            exec.bound_gfx_tables[9] = ds_samp_gpu;
+        }
     }
 
-    exec.cl.set_render_targets(rtv_views, dsv_view);
-    exec.cl.set_graphics_pipeline(pso.clone());
-    exec.keep(pso);
-
-    // Viewports & scissors (D3D11 only clips scissors when RasterizerDesc.ScissorEnable != 0).
-    let mut mtl_vps = Vec::with_capacity(st.viewports.len());
-    for vp in &st.viewports {
-        push_mtl_viewport(&mut mtl_vps, vp);
+    if exec.cl.gfx.pso.as_ref().is_none_or(|cur| !Arc::ptr_eq(cur, pso)) {
+        exec.cl.set_graphics_pipeline(pso.clone());
+        exec.keep_pso(pso);
     }
-    exec.cl.set_viewports(mtl_vps);
-    let scissor_on = st.rast.as_ref().is_some_and(|r| r.scissor_enable);
-    exec.cl.set_scissors(if scissor_on { st.scissors.clone() } else { Vec::new() });
-    exec.cl.set_blend_factor(st.blend_factor);
-    exec.cl.set_stencil_ref(st.stencil_ref);
 
-    // Vertex buffers & index buffer.
+    // Viewports, scissors, blend factor, stencil ref (only push when dirty or on first draw of cmdbuf).
+    let sync_all_dyn = !live_state || !exec.dyn_synced;
+    if sync_all_dyn || st.vp_dirty {
+        let mut mtl_vps = Vec::with_capacity(st.viewports.len());
+        for vp in &st.viewports {
+            push_mtl_viewport(&mut mtl_vps, vp);
+        }
+        exec.cl.set_viewports(mtl_vps);
+    }
+    if sync_all_dyn || st.scissor_dirty {
+        let scissor_on = st.rast.as_ref().is_some_and(|r| r.scissor_enable);
+        exec.cl.set_scissors(if scissor_on { st.scissors.clone() } else { Vec::new() });
+    }
+    if sync_all_dyn || st.blend_factor_dirty {
+        exec.cl.set_blend_factor(st.blend_factor);
+    }
+    if sync_all_dyn || st.stencil_ref_dirty {
+        exec.cl.set_stencil_ref(st.stencil_ref);
+    }
+    exec.dyn_synced = live_state;
+    if !live_state {
+        exec.cached_gfx_pso = None;
+    }
+
+    // Vertex buffers (only slots declared by the pipeline's InputLayout) & index buffer.
     exec.cl.gfx.topology = st.topology;
-    for (i, vb) in st.vbs.iter().take(MAX_VERTEX_SLOTS as usize).enumerate() {
+    let new_vbs_mask = pso.vertex_slots;
+    let mut vm = new_vbs_mask;
+    while vm != 0 {
+        let i = vm.trailing_zeros() as usize;
+        vm &= vm - 1;
+        if i >= MAX_VERTEX_SLOTS as usize {
+            break;
+        }
+        let vb = &st.vbs[i];
         if let Some(res) = &vb.res {
-            let mtl = res.current_mtl();
+            let b = res.current_backing();
+            let buf_w = res.kind.buffer_width() as u64;
             let off = vb.offset as u64;
-            let avail = mtl.desc.Width.saturating_sub(off).min(u32::MAX as u64) as u32;
-            exec.cl.gfx.vbs[i] = (mtl.gpu_va + off, avail, vb.stride);
-            exec.keep(mtl);
+            let avail = buf_w.saturating_sub(off).min(u32::MAX as u64) as u32;
+            exec.cl.gfx.vbs[i] = (b.mtl.gpu_va + b.offset + off, avail, vb.stride);
+            exec.keep_mtl(&b.mtl);
         } else {
             exec.cl.gfx.vbs[i] = (0, 0, 0);
         }
     }
+    let mut stale = exec.bound_vbs_mask & !new_vbs_mask;
+    while stale != 0 {
+        let i = stale.trailing_zeros() as usize;
+        stale &= stale - 1;
+        exec.cl.gfx.vbs[i] = (0, 0, 0);
+    }
+    exec.bound_vbs_mask = new_vbs_mask;
+
     if indexed {
         if let Some(ib) = &st.ib {
-            let mtl = ib.current_mtl();
+            let b = ib.current_backing();
+            let buf_w = ib.kind.buffer_width() as u64;
             let off = st.ib_offset as u64;
-            let avail = mtl.desc.Width.saturating_sub(off).min(u32::MAX as u64) as u32;
-            exec.cl.gfx.ib = Some((mtl.gpu_va + off, avail, st.ib_format));
-            exec.keep(mtl);
+            let avail = buf_w.saturating_sub(off).min(u32::MAX as u64) as u32;
+            exec.cl.gfx.ib = Some((b.mtl.gpu_va + b.offset + off, avail, st.ib_format));
+            exec.keep_mtl(&b.mtl);
         } else {
             return Err("indexed draw with no index buffer bound".into());
         }
@@ -1409,17 +2176,18 @@ unsafe fn exec_draw(
     device: &DeviceCore,
     exec: &mut ImmediateExec,
     st: &ContextState,
+    live_state: bool,
     indexed_start: Option<u32>,
     count: u32,
     instances: u32,
     start_vertex: u32,
     base_vertex: i32,
     start_instance: u32,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if count == 0 || instances == 0 || st.vs.is_none() {
-        return Ok(());
+        return Ok(false);
     }
-    prepare_gfx_draw(device, exec, st, indexed_start.is_some(), None)?;
+    prepare_gfx_draw(device, exec, st, live_state, indexed_start.is_some(), None)?;
     if let Some(start_index) = indexed_start {
         exec.cl.draw_indexed(count, instances, start_index, base_vertex, start_instance)?;
     } else {
@@ -1446,32 +2214,34 @@ unsafe fn exec_draw(
             );
         }
     }
+    exec.frame_stats.draws += 1;
     exec.has_work = true;
-    Ok(())
+    Ok(true)
 }
 
 unsafe fn exec_draw_indirect(
     device: &DeviceCore,
     exec: &mut ImmediateExec,
     st: &ContextState,
+    live_state: bool,
     args: &ResourceCore,
     offset: u32,
     indexed: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if st.vs.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     let arg_size: u64 = if indexed { 20 } else { 16 };
-    let arg_mtl = args.current_mtl();
+    let arg_b = args.current_backing();
+    let arg_w = args.kind.buffer_width() as u64;
     let off = offset as u64;
-    if off & 3 != 0 || off.saturating_add(arg_size) > arg_mtl.desc.Width {
+    if off & 3 != 0 || off.saturating_add(arg_size) > arg_w {
         return Err(format!(
-            "indirect draw args offset {off}+{arg_size} out of bounds or misaligned ({}B buffer)",
-            arg_mtl.desc.Width
+            "indirect draw args offset {off}+{arg_size} out of bounds or misaligned ({arg_w}B buffer)"
         ));
     }
-    arg_mtl.register_ptr();
-    prepare_gfx_draw(device, exec, st, indexed, Some(&arg_mtl))?;
+    arg_b.mtl.register_ptr();
+    prepare_gfx_draw(device, exec, st, live_state, indexed, Some((args, &arg_b.mtl)))?;
     let layout = IndirectLayout {
         stride: arg_size as u32,
         work: if indexed { Work::DrawIndexed } else { Work::Draw },
@@ -1480,40 +2250,67 @@ unsafe fn exec_draw_indirect(
         vb_offsets: Vec::new(),
         ib_offset: None,
     };
-    exec.cl.execute_indirect(&layout, 1, arg_mtl.gpu_va + off, None, None)?;
-    exec.keep(arg_mtl);
+    exec.cl.execute_indirect(&layout, 1, arg_b.mtl.gpu_va + arg_b.offset + off, None, None)?;
+    exec.keep_mtl(&arg_b.mtl);
+    exec.frame_stats.draws += 1;
     exec.has_work = true;
-    Ok(())
+    Ok(true)
 }
 
 unsafe fn prepare_compute_dispatch(
     device: &DeviceCore,
     exec: &mut ImmediateExec,
     st: &ContextState,
-) -> Result<(), String> {
+    live_state: bool,
+) -> Result<Arc<CachedComputePso>, String> {
     let Some(cs) = &st.cs else {
         return Err("no compute shader bound".into());
     };
-    let pso = cs.pipeline()?;
-    let (res_cpu, res_gpu) = exec.alloc_res_slots(CS_RES_TABLE_LEN)?;
-    let (samp_cpu, samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
-    populate_stage_table(exec, res_cpu, &st.cs_bind, Some(&st.cs_uavs));
-    populate_sampler_table(samp_cpu, &st.cs_bind);
-    bump_desc_heap_gen();
+    let cached = cs.pipeline()?;
+    let usage = cached.usage;
 
-    exec.bind_active_heaps();
-    exec.cl.compute_root.set_root_signature(device.compute_rs.clone())?;
-    exec.cl.compute_root.set_table(0, res_gpu)?;
-    exec.cl.compute_root.set_table(1, samp_gpu)?;
-    exec.cl.set_compute_pipeline(pso.clone());
-    exec.keep(pso);
-    Ok(())
+    exec.ensure_res_space(usage.res_table_len)?;
+    exec.ensure_samp_space(usage.samp_table_len)?;
+
+    let (res_gpu, wrote_res) = resolve_stage_res_table(
+        device,
+        exec,
+        STAGE_CS,
+        &st.cs_bind,
+        Some(&st.cs_uavs),
+        st.cs_uavs_gen,
+        usage,
+        live_state,
+    );
+    let samp_gpu = resolve_stage_samp_table(exec, STAGE_CS, &st.cs_bind, usage, live_state);
+    if wrote_res {
+        bump_desc_heap_gen();
+    }
+
+    if !exec.compute_heaps_bound {
+        exec.bind_active_heaps();
+        exec.cl.compute_root.set_root_signature(device.compute_rs.clone())?;
+        exec.compute_heaps_bound = true;
+        exec.bound_cs_tables = [u64::MAX; 2];
+    }
+    if exec.bound_cs_tables[0] != res_gpu {
+        exec.cl.compute_root.set_table(0, res_gpu)?;
+        exec.bound_cs_tables[0] = res_gpu;
+    }
+    if exec.bound_cs_tables[1] != samp_gpu {
+        exec.cl.compute_root.set_table(1, samp_gpu)?;
+        exec.bound_cs_tables[1] = samp_gpu;
+    }
+    exec.cl.set_compute_pipeline(cached.pso.clone());
+    exec.keep(cached.pso.clone());
+    Ok(cached)
 }
 
 unsafe fn exec_dispatch(
     device: &DeviceCore,
     exec: &mut ImmediateExec,
     st: &ContextState,
+    live_state: bool,
     x: u32,
     y: u32,
     z: u32,
@@ -1521,17 +2318,20 @@ unsafe fn exec_dispatch(
     if x == 0 || y == 0 || z == 0 {
         return Ok(());
     }
-    prepare_compute_dispatch(device, exec, st)?;
+    let cached = prepare_compute_dispatch(device, exec, st, live_state)?;
     exec.cl.barrier();
     exec.cl.dispatch(x, y, z)?;
     exec.cl.barrier();
+    let mut um = cached.usage.uav_mask;
+    while um != 0 {
+        let i = um.trailing_zeros() as usize;
+        um &= um - 1;
+        if let Some(uav) = &st.cs_uavs[i].uav {
+            uav.resource.last_gpu_state.store(gpu_state::UNORDERED_ACCESS, Ordering::Release);
+        }
+    }
     if !exec.active_pipeline_stats.is_empty() {
-        let tg = st
-            .cs
-            .as_ref()
-            .and_then(|cs| cs.pipeline().ok())
-            .map(|p| p.threadgroup)
-            .unwrap_or([1, 1, 1]);
+        let tg = cached.pso.threadgroup;
         let threads = (x as u64)
             .saturating_mul(y as u64)
             .saturating_mul(z as u64)
@@ -1551,19 +2351,20 @@ unsafe fn exec_dispatch_indirect(
     device: &DeviceCore,
     exec: &mut ImmediateExec,
     st: &ContextState,
+    live_state: bool,
     args: &ResourceCore,
     offset: u32,
 ) -> Result<(), String> {
-    let arg_mtl = args.current_mtl();
+    let arg_b = args.current_backing();
+    let arg_w = args.kind.buffer_width() as u64;
     let off = offset as u64;
-    if off & 3 != 0 || off.saturating_add(12) > arg_mtl.desc.Width {
+    if off & 3 != 0 || off.saturating_add(12) > arg_w {
         return Err(format!(
-            "DispatchIndirect args offset {off}+12 out of bounds or misaligned ({}B buffer)",
-            arg_mtl.desc.Width
+            "DispatchIndirect args offset {off}+12 out of bounds or misaligned ({arg_w}B buffer)"
         ));
     }
-    arg_mtl.register_ptr();
-    prepare_compute_dispatch(device, exec, st)?;
+    arg_b.mtl.register_ptr();
+    let cached = prepare_compute_dispatch(device, exec, st, live_state)?;
     let layout = IndirectLayout {
         stride: 12,
         work: Work::Dispatch,
@@ -1573,9 +2374,17 @@ unsafe fn exec_dispatch_indirect(
         ib_offset: None,
     };
     exec.cl.barrier();
-    exec.cl.execute_indirect(&layout, 1, arg_mtl.gpu_va + off, None, None)?;
+    exec.cl.execute_indirect(&layout, 1, arg_b.mtl.gpu_va + arg_b.offset + off, None, None)?;
     exec.cl.barrier();
-    exec.keep(arg_mtl);
+    let mut um = cached.usage.uav_mask;
+    while um != 0 {
+        let i = um.trailing_zeros() as usize;
+        um &= um - 1;
+        if let Some(uav) = &st.cs_uavs[i].uav {
+            uav.resource.last_gpu_state.store(gpu_state::UNORDERED_ACCESS, Ordering::Release);
+        }
+    }
+    exec.keep_mtl(&arg_b.mtl);
     exec.has_work = true;
     Ok(())
 }
@@ -1609,7 +2418,9 @@ unsafe fn exec_generate_mips(exec: &mut ImmediateExec, srv: &SrvInner) -> Result
         slice_count,
     )?;
     exec.cl.barrier();
-    exec.keep(mtl);
+    srv.resource.last_gpu_state.store(gpu_state::UNORDERED_ACCESS, Ordering::Release);
+    exec.invalidate_live_caches();
+    exec.keep_mtl(&mtl);
     exec.has_work = true;
     Ok(())
 }
@@ -1825,22 +2636,31 @@ pub type PCtx = *mut Obj<D3d11Context>;
 // ---------------------------------------------------------------------------
 
 unsafe fn set_cbs(
-    slots: &mut [CbSlot],
+    bind: &mut StageBindings,
     start: u32,
     n: u32,
     bufs: *const *mut c_void,
     firsts: *const u32,
     nums: *const u32,
 ) {
+    let mut changed = false;
     for i in 0..n as usize {
         let idx = start as usize + i;
-        if idx >= slots.len() {
+        if idx >= bind.cbs.len() {
             break;
         }
         let p = if bufs.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(bufs.add(i)) };
         let fc = if firsts.is_null() { 0 } else { std::ptr::read_unaligned(firsts.add(i)) };
         let nc = if nums.is_null() { 0 } else { std::ptr::read_unaligned(nums.add(i)) };
-        slots[idx] = CbSlot { com: ComRef::from_borrowed(p), res: buffer_from_ptr(p), first_constant: fc, num_constants: nc };
+        let cur = &bind.cbs[idx];
+        if cur.com.as_ptr() == p && cur.first_constant == fc && cur.num_constants == nc {
+            continue;
+        }
+        bind.cbs[idx] = CbSlot { com: ComRef::from_borrowed(p), res: buffer_from_ptr(p), first_constant: fc, num_constants: nc };
+        changed = true;
+    }
+    if changed {
+        bind.res_gen = bind.res_gen.wrapping_add(1);
     }
 }
 
@@ -1872,13 +2692,21 @@ unsafe fn get_cbs(
     }
 }
 
-unsafe fn set_srvs(slots: &mut [SrvSlot], start: u32, n: u32, views: *const *mut c_void) {
+unsafe fn set_srvs(bind: &mut StageBindings, start: u32, n: u32, views: *const *mut c_void) {
+    let mut changed = false;
     for i in 0..n as usize {
         let idx = start as usize + i;
-        if idx >= slots.len() { break; }
+        if idx >= bind.srvs.len() { break; }
         let p = if views.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(views.add(i)) };
+        if bind.srvs[idx].com.as_ptr() == p {
+            continue;
+        }
         let srv = Obj::<D3d11Srv>::from_iface(p).map(|o| Obj::get(o).inner.clone());
-        slots[idx] = SrvSlot { com: ComRef::from_borrowed(p), srv };
+        bind.srvs[idx] = SrvSlot { com: ComRef::from_borrowed(p), srv };
+        changed = true;
+    }
+    if changed {
+        bind.res_gen = bind.res_gen.wrapping_add(1);
     }
 }
 
@@ -1893,12 +2721,20 @@ unsafe fn get_srvs(slots: &[SrvSlot], start: u32, n: u32, out: *mut *mut c_void)
     }
 }
 
-unsafe fn set_samplers(slots: &mut [SampSlot], start: u32, n: u32, samps: *const *mut c_void) {
+unsafe fn set_samplers(bind: &mut StageBindings, start: u32, n: u32, samps: *const *mut c_void) {
+    let mut changed = false;
     for i in 0..n as usize {
         let idx = start as usize + i;
-        if idx >= slots.len() { break; }
+        if idx >= bind.samplers.len() { break; }
         let p = if samps.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(samps.add(i)) };
-        slots[idx] = SampSlot { com: ComRef::from_borrowed(p), samp: samp_from_ptr(p) };
+        if bind.samplers[idx].com.as_ptr() == p {
+            continue;
+        }
+        bind.samplers[idx] = SampSlot { com: ComRef::from_borrowed(p), samp: samp_from_ptr(p) };
+        changed = true;
+    }
+    if changed {
+        bind.samp_gen = bind.samp_gen.wrapping_add(1);
     }
 }
 
@@ -1915,17 +2751,24 @@ unsafe fn get_samplers(slots: &[SampSlot], start: u32, n: u32, out: *mut *mut c_
 
 unsafe fn set_uavs(
     slots: &mut [UavSlot],
+    gen: &mut u64,
     start: u32,
     n: u32,
     views: *const *mut c_void,
     init_counts: *const u32,
     counter_updates: &mut Vec<(Arc<UavInner>, u32)>,
 ) {
+    let mut changed = false;
     for i in 0..n as usize {
         let idx = start as usize + i;
         if idx >= slots.len() { break; }
         let p = if views.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(views.add(i)) };
-        let uav = Obj::<D3d11Uav>::from_iface(p).map(|o| Obj::get(o).inner.clone());
+        let same = slots[idx].com.as_ptr() == p;
+        let uav = if same {
+            slots[idx].uav.clone()
+        } else {
+            Obj::<D3d11Uav>::from_iface(p).map(|o| Obj::get(o).inner.clone())
+        };
         if !init_counts.is_null() {
             let init = std::ptr::read_unaligned(init_counts.add(i));
             if init != D3D11_UAV_COUNTER_KEEP {
@@ -1936,7 +2779,13 @@ unsafe fn set_uavs(
                 }
             }
         }
-        slots[idx] = UavSlot { com: ComRef::from_borrowed(p), uav };
+        if !same {
+            slots[idx] = UavSlot { com: ComRef::from_borrowed(p), uav };
+            changed = true;
+        }
+    }
+    if changed {
+        *gen = gen.wrapping_add(1);
     }
 }
 
@@ -1956,41 +2805,41 @@ unsafe fn get_uavs(slots: &[UavSlot], start: u32, n: u32, out: *mut *mut c_void)
 // ---------------------------------------------------------------------------
 
 unsafe extern "win64" fn vs_set_constant_buffers(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().vs_bind.cbs, start, n, bufs, std::ptr::null(), std::ptr::null());
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().vs_bind, start, n, bufs, std::ptr::null(), std::ptr::null());
 }
 unsafe extern "win64" fn ps_set_constant_buffers(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().ps_bind.cbs, start, n, bufs, std::ptr::null(), std::ptr::null());
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().ps_bind, start, n, bufs, std::ptr::null(), std::ptr::null());
 }
 unsafe extern "win64" fn gs_set_constant_buffers(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().gs_bind.cbs, start, n, bufs, std::ptr::null(), std::ptr::null());
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().gs_bind, start, n, bufs, std::ptr::null(), std::ptr::null());
 }
 unsafe extern "win64" fn hs_set_constant_buffers(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().hs_bind.cbs, start, n, bufs, std::ptr::null(), std::ptr::null());
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().hs_bind, start, n, bufs, std::ptr::null(), std::ptr::null());
 }
 unsafe extern "win64" fn ds_set_constant_buffers(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().ds_bind.cbs, start, n, bufs, std::ptr::null(), std::ptr::null());
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().ds_bind, start, n, bufs, std::ptr::null(), std::ptr::null());
 }
 unsafe extern "win64" fn cs_set_constant_buffers(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().cs_bind.cbs, start, n, bufs, std::ptr::null(), std::ptr::null());
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().cs_bind, start, n, bufs, std::ptr::null(), std::ptr::null());
 }
 
 unsafe extern "win64" fn vs_set_constant_buffers1(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void, f: *const u32, c: *const u32) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().vs_bind.cbs, start, n, bufs, f, c);
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().vs_bind, start, n, bufs, f, c);
 }
 unsafe extern "win64" fn ps_set_constant_buffers1(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void, f: *const u32, c: *const u32) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().ps_bind.cbs, start, n, bufs, f, c);
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().ps_bind, start, n, bufs, f, c);
 }
 unsafe extern "win64" fn gs_set_constant_buffers1(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void, f: *const u32, c: *const u32) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().gs_bind.cbs, start, n, bufs, f, c);
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().gs_bind, start, n, bufs, f, c);
 }
 unsafe extern "win64" fn hs_set_constant_buffers1(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void, f: *const u32, c: *const u32) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().hs_bind.cbs, start, n, bufs, f, c);
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().hs_bind, start, n, bufs, f, c);
 }
 unsafe extern "win64" fn ds_set_constant_buffers1(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void, f: *const u32, c: *const u32) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().ds_bind.cbs, start, n, bufs, f, c);
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().ds_bind, start, n, bufs, f, c);
 }
 unsafe extern "win64" fn cs_set_constant_buffers1(this: PCtx, start: u32, n: u32, bufs: *const *mut c_void, f: *const u32, c: *const u32) {
-    set_cbs(&mut Obj::get(this).state.lock().unwrap().cs_bind.cbs, start, n, bufs, f, c);
+    set_cbs(&mut Obj::get(this).state.lock().unwrap().cs_bind, start, n, bufs, f, c);
 }
 
 unsafe extern "win64" fn vs_get_constant_buffers(this: PCtx, start: u32, n: u32, bufs: *mut *mut c_void) {
@@ -2032,22 +2881,22 @@ unsafe extern "win64" fn cs_get_constant_buffers1(this: PCtx, start: u32, n: u32
 }
 
 unsafe extern "win64" fn vs_set_shader_resources(this: PCtx, start: u32, n: u32, v: *const *mut c_void) {
-    set_srvs(&mut Obj::get(this).state.lock().unwrap().vs_bind.srvs, start, n, v);
+    set_srvs(&mut Obj::get(this).state.lock().unwrap().vs_bind, start, n, v);
 }
 unsafe extern "win64" fn ps_set_shader_resources(this: PCtx, start: u32, n: u32, v: *const *mut c_void) {
-    set_srvs(&mut Obj::get(this).state.lock().unwrap().ps_bind.srvs, start, n, v);
+    set_srvs(&mut Obj::get(this).state.lock().unwrap().ps_bind, start, n, v);
 }
 unsafe extern "win64" fn gs_set_shader_resources(this: PCtx, start: u32, n: u32, v: *const *mut c_void) {
-    set_srvs(&mut Obj::get(this).state.lock().unwrap().gs_bind.srvs, start, n, v);
+    set_srvs(&mut Obj::get(this).state.lock().unwrap().gs_bind, start, n, v);
 }
 unsafe extern "win64" fn hs_set_shader_resources(this: PCtx, start: u32, n: u32, v: *const *mut c_void) {
-    set_srvs(&mut Obj::get(this).state.lock().unwrap().hs_bind.srvs, start, n, v);
+    set_srvs(&mut Obj::get(this).state.lock().unwrap().hs_bind, start, n, v);
 }
 unsafe extern "win64" fn ds_set_shader_resources(this: PCtx, start: u32, n: u32, v: *const *mut c_void) {
-    set_srvs(&mut Obj::get(this).state.lock().unwrap().ds_bind.srvs, start, n, v);
+    set_srvs(&mut Obj::get(this).state.lock().unwrap().ds_bind, start, n, v);
 }
 unsafe extern "win64" fn cs_set_shader_resources(this: PCtx, start: u32, n: u32, v: *const *mut c_void) {
-    set_srvs(&mut Obj::get(this).state.lock().unwrap().cs_bind.srvs, start, n, v);
+    set_srvs(&mut Obj::get(this).state.lock().unwrap().cs_bind, start, n, v);
 }
 
 unsafe extern "win64" fn vs_get_shader_resources(this: PCtx, start: u32, n: u32, v: *mut *mut c_void) {
@@ -2070,22 +2919,22 @@ unsafe extern "win64" fn cs_get_shader_resources(this: PCtx, start: u32, n: u32,
 }
 
 unsafe extern "win64" fn vs_set_samplers(this: PCtx, start: u32, n: u32, s: *const *mut c_void) {
-    set_samplers(&mut Obj::get(this).state.lock().unwrap().vs_bind.samplers, start, n, s);
+    set_samplers(&mut Obj::get(this).state.lock().unwrap().vs_bind, start, n, s);
 }
 unsafe extern "win64" fn ps_set_samplers(this: PCtx, start: u32, n: u32, s: *const *mut c_void) {
-    set_samplers(&mut Obj::get(this).state.lock().unwrap().ps_bind.samplers, start, n, s);
+    set_samplers(&mut Obj::get(this).state.lock().unwrap().ps_bind, start, n, s);
 }
 unsafe extern "win64" fn gs_set_samplers(this: PCtx, start: u32, n: u32, s: *const *mut c_void) {
-    set_samplers(&mut Obj::get(this).state.lock().unwrap().gs_bind.samplers, start, n, s);
+    set_samplers(&mut Obj::get(this).state.lock().unwrap().gs_bind, start, n, s);
 }
 unsafe extern "win64" fn hs_set_samplers(this: PCtx, start: u32, n: u32, s: *const *mut c_void) {
-    set_samplers(&mut Obj::get(this).state.lock().unwrap().hs_bind.samplers, start, n, s);
+    set_samplers(&mut Obj::get(this).state.lock().unwrap().hs_bind, start, n, s);
 }
 unsafe extern "win64" fn ds_set_samplers(this: PCtx, start: u32, n: u32, s: *const *mut c_void) {
-    set_samplers(&mut Obj::get(this).state.lock().unwrap().ds_bind.samplers, start, n, s);
+    set_samplers(&mut Obj::get(this).state.lock().unwrap().ds_bind, start, n, s);
 }
 unsafe extern "win64" fn cs_set_samplers(this: PCtx, start: u32, n: u32, s: *const *mut c_void) {
-    set_samplers(&mut Obj::get(this).state.lock().unwrap().cs_bind.samplers, start, n, s);
+    set_samplers(&mut Obj::get(this).state.lock().unwrap().cs_bind, start, n, s);
 }
 
 unsafe extern "win64" fn vs_get_samplers(this: PCtx, start: u32, n: u32, s: *mut *mut c_void) {
@@ -2112,7 +2961,8 @@ unsafe extern "win64" fn cs_set_uavs(this: PCtx, start: u32, n: u32, views: *con
     let mut counter_updates = Vec::new();
     {
         let mut st = ctx.state.lock().unwrap();
-        set_uavs(&mut st.cs_uavs, start, n, views, init_counts, &mut counter_updates);
+        let st = &mut *st;
+        set_uavs(&mut st.cs_uavs, &mut st.cs_uavs_gen, start, n, views, init_counts, &mut counter_updates);
     }
     for (uav, value) in counter_updates {
         ctx.emit(RecordedCmd::SetUavCounter { uav, value });
@@ -2124,33 +2974,56 @@ unsafe extern "win64" fn cs_get_uavs(this: PCtx, start: u32, n: u32, views: *mut
 
 unsafe extern "win64" fn vs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
+    if st.vs_com.as_ptr() == shader {
+        return;
+    }
     st.vs_com = ComRef::from_borrowed(shader);
     st.vs = vs_from_ptr(shader);
+    st.pso_dirty = true;
 }
 unsafe extern "win64" fn ps_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
+    if st.ps_com.as_ptr() == shader {
+        return;
+    }
     st.ps_com = ComRef::from_borrowed(shader);
     st.ps = ps_from_ptr(shader);
+    st.pso_dirty = true;
 }
 unsafe extern "win64" fn cs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
+    if st.cs_com.as_ptr() == shader {
+        return;
+    }
     st.cs_com = ComRef::from_borrowed(shader);
     st.cs = cs_from_ptr(shader);
 }
 unsafe extern "win64" fn gs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
+    if st.gs_com.as_ptr() == shader {
+        return;
+    }
     st.gs_com = ComRef::from_borrowed(shader);
     st.gs = gs_from_ptr(shader);
+    st.pso_dirty = true;
 }
 unsafe extern "win64" fn hs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
+    if st.hs_com.as_ptr() == shader {
+        return;
+    }
     st.hs_com = ComRef::from_borrowed(shader);
     st.hs = hs_from_ptr(shader);
+    st.pso_dirty = true;
 }
 unsafe extern "win64" fn ds_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
+    if st.ds_com.as_ptr() == shader {
+        return;
+    }
     st.ds_com = ComRef::from_borrowed(shader);
     st.ds = domain_shader_from_ptr(shader);
+    st.pso_dirty = true;
 }
 
 unsafe extern "win64" fn vs_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
@@ -2184,8 +3057,12 @@ unsafe extern "win64" fn ds_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *
 
 unsafe extern "win64" fn ia_set_input_layout(this: PCtx, il: *mut c_void) {
     let mut st = Obj::get(this).state.lock().unwrap();
+    if st.input_layout_com.as_ptr() == il {
+        return;
+    }
     st.input_layout_com = ComRef::from_borrowed(il);
     st.input_layout = il_from_ptr(il);
+    st.pso_dirty = true;
 }
 unsafe extern "win64" fn ia_get_input_layout(this: PCtx, out: *mut *mut c_void) {
     Obj::get(this).state.lock().unwrap().input_layout_com.copy_out(out);
@@ -2206,6 +3083,10 @@ unsafe extern "win64" fn ia_set_vertex_buffers(
         let p = if bufs.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(bufs.add(i)) };
         let stride = if strides.is_null() { 0 } else { std::ptr::read_unaligned(strides.add(i)) };
         let offset = if offsets.is_null() { 0 } else { std::ptr::read_unaligned(offsets.add(i)) };
+        let cur = &st.vbs[idx];
+        if cur.com.as_ptr() == p && cur.stride == stride && cur.offset == offset {
+            continue;
+        }
         st.vbs[idx] = VbSlot { com: ComRef::from_borrowed(p), res: buffer_from_ptr(p), stride, offset };
     }
 }
@@ -2233,10 +3114,15 @@ unsafe extern "win64" fn ia_get_vertex_buffers(
 
 unsafe extern "win64" fn ia_set_index_buffer(this: PCtx, buf: *mut c_void, fmt: u32, offset: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
-    st.ib_com = ComRef::from_borrowed(buf);
-    st.ib = buffer_from_ptr(buf);
-    st.ib_format = fmt;
+    if st.ib_format != fmt {
+        st.ib_format = fmt;
+        st.pso_dirty = true;
+    }
     st.ib_offset = offset;
+    if st.ib_com.as_ptr() != buf {
+        st.ib_com = ComRef::from_borrowed(buf);
+        st.ib = buffer_from_ptr(buf);
+    }
 }
 unsafe extern "win64" fn ia_get_index_buffer(this: PCtx, out: *mut *mut c_void, fmt: *mut u32, offset: *mut u32) {
     let st = Obj::get(this).state.lock().unwrap();
@@ -2246,7 +3132,14 @@ unsafe extern "win64" fn ia_get_index_buffer(this: PCtx, out: *mut *mut c_void, 
 }
 
 unsafe extern "win64" fn ia_set_primitive_topology(this: PCtx, topo: u32) {
-    Obj::get(this).state.lock().unwrap().topology = topo;
+    let mut st = Obj::get(this).state.lock().unwrap();
+    let old = st.topology;
+    if old != topo {
+        st.topology = topo;
+        if d3d11_topology_to_type(old) != d3d11_topology_to_type(topo) {
+            st.pso_dirty = true;
+        }
+    }
 }
 unsafe extern "win64" fn ia_get_primitive_topology(this: PCtx, out: *mut u32) {
     if !out.is_null() { std::ptr::write_unaligned(out, Obj::get(this).state.lock().unwrap().topology); }
@@ -2254,16 +3147,29 @@ unsafe extern "win64" fn ia_get_primitive_topology(this: PCtx, out: *mut u32) {
 
 unsafe extern "win64" fn om_set_render_targets(this: PCtx, n: u32, rtvs: *const *mut c_void, dsv: *mut c_void) {
     let mut st = Obj::get(this).state.lock().unwrap();
-    for slot in &mut st.rtvs {
-        *slot = RtvSlot::default();
+    let count = (n as usize).min(st.rtvs.len());
+    let mut changed = false;
+    for i in 0..st.rtvs.len() {
+        let p = if i < count && !rtvs.is_null() {
+            std::ptr::read_unaligned(rtvs.add(i))
+        } else {
+            std::ptr::null_mut()
+        };
+        if st.rtvs[i].com.as_ptr() != p {
+            let rtv = Obj::<D3d11Rtv>::from_iface(p).map(|o| Obj::get(o).inner.clone());
+            st.rtvs[i] = RtvSlot { com: ComRef::from_borrowed(p), rtv };
+            changed = true;
+        }
     }
-    for i in 0..(n as usize).min(st.rtvs.len()) {
-        let p = if rtvs.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(rtvs.add(i)) };
-        let rtv = Obj::<D3d11Rtv>::from_iface(p).map(|o| Obj::get(o).inner.clone());
-        st.rtvs[i] = RtvSlot { com: ComRef::from_borrowed(p), rtv };
+    if st.dsv_com.as_ptr() != dsv {
+        st.dsv_com = ComRef::from_borrowed(dsv);
+        st.dsv = Obj::<D3d11Dsv>::from_iface(dsv).map(|o| Obj::get(o).inner.clone());
+        changed = true;
     }
-    st.dsv_com = ComRef::from_borrowed(dsv);
-    st.dsv = Obj::<D3d11Dsv>::from_iface(dsv).map(|o| Obj::get(o).inner.clone());
+    if changed {
+        st.rt_dirty = true;
+        st.pso_dirty = true;
+    }
 }
 
 unsafe extern "win64" fn om_set_render_targets_and_uavs(
@@ -2280,25 +3186,47 @@ unsafe extern "win64" fn om_set_render_targets_and_uavs(
     let mut counter_updates = Vec::new();
     {
         let mut st = ctx.state.lock().unwrap();
+        let st = &mut *st;
         // D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL = 0xFFFFFFFF
         if num_rtvs != u32::MAX {
-            for slot in &mut st.rtvs {
-                *slot = RtvSlot::default();
+            let count = (num_rtvs as usize).min(st.rtvs.len());
+            let mut changed = false;
+            for i in 0..st.rtvs.len() {
+                let p = if i < count && !rtvs.is_null() {
+                    std::ptr::read_unaligned(rtvs.add(i))
+                } else {
+                    std::ptr::null_mut()
+                };
+                if st.rtvs[i].com.as_ptr() != p {
+                    let rtv = Obj::<D3d11Rtv>::from_iface(p).map(|o| Obj::get(o).inner.clone());
+                    st.rtvs[i] = RtvSlot { com: ComRef::from_borrowed(p), rtv };
+                    changed = true;
+                }
             }
-            for i in 0..(num_rtvs as usize).min(st.rtvs.len()) {
-                let p = if rtvs.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(rtvs.add(i)) };
-                let rtv = Obj::<D3d11Rtv>::from_iface(p).map(|o| Obj::get(o).inner.clone());
-                st.rtvs[i] = RtvSlot { com: ComRef::from_borrowed(p), rtv };
+            if st.dsv_com.as_ptr() != dsv {
+                st.dsv_com = ComRef::from_borrowed(dsv);
+                st.dsv = Obj::<D3d11Dsv>::from_iface(dsv).map(|o| Obj::get(o).inner.clone());
+                changed = true;
             }
-            st.dsv_com = ComRef::from_borrowed(dsv);
-            st.dsv = Obj::<D3d11Dsv>::from_iface(dsv).map(|o| Obj::get(o).inner.clone());
+            if changed {
+                st.rt_dirty = true;
+                st.pso_dirty = true;
+            }
         }
         // D3D11_KEEP_UNORDERED_ACCESS_VIEWS = 0xFFFFFFFF
         if num_uavs != u32::MAX {
-            for slot in &mut st.om_uavs {
-                *slot = UavSlot::default();
+            let mut cleared_any = false;
+            for (i, slot) in st.om_uavs.iter_mut().enumerate() {
+                let in_range = i >= uav_start as usize && i < (uav_start as usize).saturating_add(num_uavs as usize);
+                if !in_range && !slot.com.as_ptr().is_null() {
+                    *slot = UavSlot::default();
+                    cleared_any = true;
+                }
             }
-            set_uavs(&mut st.om_uavs, uav_start, num_uavs, uavs, init_counts, &mut counter_updates);
+            if cleared_any {
+                st.om_uavs_gen = st.om_uavs_gen.wrapping_add(1);
+            }
+            set_uavs(&mut st.om_uavs, &mut st.om_uavs_gen, uav_start, num_uavs, uavs, init_counts, &mut counter_updates);
         }
     }
     for (uav, value) in counter_updates {
@@ -2335,10 +3263,25 @@ unsafe extern "win64" fn om_get_render_targets_and_uavs(
 
 unsafe extern "win64" fn om_set_blend_state(this: PCtx, state: *mut c_void, factor: *const [f32; 4], sample_mask: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
-    st.blend_com = ComRef::from_borrowed(state);
-    st.blend = blend_from_ptr(state);
-    st.blend_factor = if factor.is_null() { [1.0; 4] } else { std::ptr::read_unaligned(factor) };
-    st.sample_mask = sample_mask;
+    if st.blend_com.as_ptr() != state {
+        let old_id = st.blend.as_ref().map_or(0, |b| b.id);
+        let next = blend_from_ptr(state);
+        let new_id = next.as_ref().map_or(0, |b| b.id);
+        st.blend_com = ComRef::from_borrowed(state);
+        st.blend = next;
+        if old_id != new_id {
+            st.pso_dirty = true;
+        }
+    }
+    let next_factor = if factor.is_null() { [1.0; 4] } else { std::ptr::read_unaligned(factor) };
+    if st.blend_factor != next_factor {
+        st.blend_factor = next_factor;
+        st.blend_factor_dirty = true;
+    }
+    if st.sample_mask != sample_mask {
+        st.sample_mask = sample_mask;
+        st.pso_dirty = true;
+    }
 }
 unsafe extern "win64" fn om_get_blend_state(this: PCtx, out: *mut *mut c_void, factor: *mut [f32; 4], mask: *mut u32) {
     let st = Obj::get(this).state.lock().unwrap();
@@ -2349,9 +3292,20 @@ unsafe extern "win64" fn om_get_blend_state(this: PCtx, out: *mut *mut c_void, f
 
 unsafe extern "win64" fn om_set_depth_stencil_state(this: PCtx, state: *mut c_void, stencil_ref: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
-    st.ds_state_com = ComRef::from_borrowed(state);
-    st.ds_state = ds_from_ptr(state);
-    st.stencil_ref = stencil_ref;
+    if st.ds_state_com.as_ptr() != state {
+        let old_id = st.ds_state.as_ref().map_or(0, |d| d.id);
+        let next = ds_from_ptr(state);
+        let new_id = next.as_ref().map_or(0, |d| d.id);
+        st.ds_state_com = ComRef::from_borrowed(state);
+        st.ds_state = next;
+        if old_id != new_id {
+            st.pso_dirty = true;
+        }
+    }
+    if st.stencil_ref != stencil_ref {
+        st.stencil_ref = stencil_ref;
+        st.stencil_ref_dirty = true;
+    }
 }
 unsafe extern "win64" fn om_get_depth_stencil_state(this: PCtx, out: *mut *mut c_void, stencil_ref: *mut u32) {
     let st = Obj::get(this).state.lock().unwrap();
@@ -2361,8 +3315,22 @@ unsafe extern "win64" fn om_get_depth_stencil_state(this: PCtx, out: *mut *mut c
 
 unsafe extern "win64" fn rs_set_state(this: PCtx, state: *mut c_void) {
     let mut st = Obj::get(this).state.lock().unwrap();
+    if st.rast_com.as_ptr() == state {
+        return;
+    }
+    let old_id = st.rast.as_ref().map_or(0, |r| r.id);
+    let old_scissor = st.rast.as_ref().is_some_and(|r| r.scissor_enable);
+    let next = rast_from_ptr(state);
+    let new_id = next.as_ref().map_or(0, |r| r.id);
+    let new_scissor = next.as_ref().is_some_and(|r| r.scissor_enable);
     st.rast_com = ComRef::from_borrowed(state);
-    st.rast = rast_from_ptr(state);
+    st.rast = next;
+    if old_id != new_id {
+        st.pso_dirty = true;
+    }
+    if old_scissor != new_scissor {
+        st.scissor_dirty = true;
+    }
 }
 unsafe extern "win64" fn rs_get_state(this: PCtx, out: *mut *mut c_void) {
     Obj::get(this).state.lock().unwrap().rast_com.copy_out(out);
@@ -2377,6 +3345,7 @@ unsafe extern "win64" fn rs_set_viewports(this: PCtx, n: u32, vps: *const D3D11_
             st.viewports.push(std::ptr::read_unaligned(vps.add(i)));
         }
     }
+    st.vp_dirty = true;
 }
 unsafe extern "win64" fn rs_get_viewports(this: PCtx, n: *mut u32, out: *mut D3D11_VIEWPORT) {
     if n.is_null() { return; }
@@ -2405,6 +3374,7 @@ unsafe extern "win64" fn rs_set_scissor_rects(this: PCtx, n: u32, rects: *const 
             st.scissors.push(std::ptr::read_unaligned(rects.add(i)));
         }
     }
+    st.scissor_dirty = true;
 }
 unsafe extern "win64" fn rs_get_scissor_rects(this: PCtx, n: *mut u32, out: *mut Rect) {
     if n.is_null() { return; }
@@ -2511,23 +3481,57 @@ unsafe extern "win64" fn map(
     res.sync_other_devices(&ctx.device);
     if res.is_buffer() {
         let byte_width = res.kind.buffer_width();
-        let mtl = if mtype == map_type::WRITE_DISCARD {
-            match res.alloc_fresh_buffer_mtl() {
-                Ok(fresh) => {
-                    let old = res.replace_mtl(fresh.clone());
-                    ctx.device.queue.defer_release(Box::new(old));
-                    fresh
+        let ptr: *mut u8 = if mtype == map_type::WRITE_DISCARD {
+            if let Some(bw) = res.ring_dynamic_byte_width() {
+                let (mtl, offset, cpu_ptr) = {
+                    let mut exec = ctx.device.imm_exec.lock().unwrap();
+                    match exec.alloc_upload_slice(bw as usize, 256) {
+                        Ok(slice) => slice,
+                        Err(e) => return d11_failed!(E_OUTOFMEMORY, "Map(WRITE_DISCARD) ring: {e}"),
+                    }
+                };
+                let _old = res.replace_backing(ResourceBacking { mtl, offset });
+                // `_old` is either a ring chunk already retained by `imm_exec`/`queue` or the initial
+                // buffer; if a command buffer references it, `keep_mtl` already holds an `Arc`.
+                cpu_ptr
+            } else if let Some(class_size) = res.pool_dynamic_class_size() {
+                let completed = ctx.device.queue.timeline.completed();
+                let fresh = match ctx.device.dynamic_pool.lock().unwrap().acquire(class_size, completed) {
+                    Ok(buf) => buf,
+                    Err(e) => return d11_failed!(E_OUTOFMEMORY, "Map(WRITE_DISCARD) pool: {e}"),
+                };
+                let Some(cpu_ptr) = fresh.cpu_ptr() else {
+                    return d11_failed!(E_INVALIDARG, "Map: pooled buffer has no cpu_ptr");
+                };
+                let old = res.replace_backing(ResourceBacking { mtl: fresh, offset: 0 });
+                if old.offset == 0 && old.mtl.desc.Width == class_size {
+                    let mut exec = ctx.device.imm_exec.lock().unwrap();
+                    exec.defer_pool_return(class_size, old.mtl);
+                } else {
+                    ctx.device.queue.defer_release(Box::new(old.mtl));
                 }
-                Err(e) => return d11_failed!(E_OUTOFMEMORY, "Map(WRITE_DISCARD): {e}"),
+                cpu_ptr
+            } else {
+                let fresh = match res.alloc_fresh_buffer_mtl() {
+                    Ok(f) => f,
+                    Err(e) => return d11_failed!(E_OUTOFMEMORY, "Map(WRITE_DISCARD): {e}"),
+                };
+                let Some(cpu_ptr) = fresh.cpu_ptr() else {
+                    return d11_failed!(E_INVALIDARG, "Map: buffer {:?} is not CPU-accessible (usage={})", res.kind, res.kind.usage());
+                };
+                let old = res.replace_backing(ResourceBacking { mtl: fresh, offset: 0 });
+                ctx.device.queue.defer_release(Box::new(old.mtl));
+                cpu_ptr
             }
         } else {
             if mtype != map_type::WRITE_NO_OVERWRITE {
                 ctx.device.flush_and_wait_idle();
             }
-            res.current_mtl()
-        };
-        let Some(ptr) = mtl.cpu_ptr() else {
-            return d11_failed!(E_INVALIDARG, "Map: buffer {:?} is not CPU-accessible (usage={})", res.kind, res.kind.usage());
+            let b = res.current_backing();
+            let Some(base) = b.mtl.cpu_ptr() else {
+                return d11_failed!(E_INVALIDARG, "Map: buffer {:?} is not CPU-accessible (usage={})", res.kind, res.kind.usage());
+            };
+            base.add(b.offset as usize)
         };
         res.mapped.lock().unwrap().insert(sub, MapState {
             map_type: mtype,
@@ -2639,9 +3643,11 @@ unsafe extern "win64" fn unmap(this: PCtx, res_ptr: *mut c_void, sub: u32) {
                         log::warn!(target: "d3d", "d3d11 Unmap texture upload: {e}");
                     } else {
                         exec.cl.barrier();
+                        res.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
                         exec.has_work = true;
                     }
-                    exec.keep((mtl, staging_buf));
+                    exec.keep_mtl(&mtl);
+                    exec.keep_mtl(&staging_buf);
                 }
             }
         }
@@ -2714,6 +3720,29 @@ unsafe extern "win64" fn update_subresource(
         return;
     };
     let bx = if dst_box.is_null() { None } else { Some(std::ptr::read_unaligned(dst_box)) };
+    let ctx = Obj::get(this);
+    if !ctx.deferred {
+        // Immediate fast path: single copy directly into the resident upload ring (zero Vec<u8> alloc).
+        dst.sync_other_devices(&ctx.device);
+        let mut exec = ctx.device.imm_exec.lock().unwrap();
+        if let Err(e) = exec.ensure_open() {
+            log::warn!(target: "d3d", "d3d11 UpdateSubresource ensure_open: {e}");
+            return;
+        }
+        if let Err(e) = exec_update_subresource_raw(
+            &mut exec,
+            &dst,
+            dst_sub,
+            bx,
+            src_data as *const u8,
+            None,
+            src_row_pitch,
+            src_depth_pitch,
+        ) {
+            log::warn!(target: "d3d", "d3d11 UpdateSubresource: {e}");
+        }
+        return;
+    }
     let data = if dst.is_buffer() {
         let len = match bx {
             Some(b) => b.right.saturating_sub(b.left) as usize,
@@ -2743,7 +3772,7 @@ unsafe extern "win64" fn update_subresource(
         let total = (d as usize - 1) * sdp + (rows - 1) * srp + row_bytes;
         std::slice::from_raw_parts(src_data as *const u8, total).to_vec()
     };
-    Obj::get(this).emit(RecordedCmd::UpdateSubresource {
+    ctx.emit(RecordedCmd::UpdateSubresource {
         dst,
         dst_sub,
         dst_box: bx,
@@ -2854,8 +3883,23 @@ unsafe extern "win64" fn clear_view(
 
 unsafe extern "win64" fn draw(this: PCtx, vertex_count: u32, start_vertex: u32) {
     let ctx = Obj::get(this);
-    let st = Box::new(ctx.state.lock().unwrap().clone());
-    ctx.emit(RecordedCmd::Draw { state: st, vertex_count, instance_count: 1, start_vertex, start_instance: 0 });
+    if ctx.deferred {
+        let st = Box::new(ctx.state.lock().unwrap().clone());
+        ctx.emit(RecordedCmd::Draw { state: st, vertex_count, instance_count: 1, start_vertex, start_instance: 0 });
+        return;
+    }
+    let mut st = ctx.state.lock().unwrap();
+    sync_state_shared(&ctx.device, &st);
+    let mut exec = ctx.device.imm_exec.lock().unwrap();
+    if let Err(e) = exec.ensure_open() {
+        log::warn!(target: "d3d", "d3d11 Draw ensure_open: {e}");
+        return;
+    }
+    match exec_draw(&ctx.device, &mut exec, &st, true, None, vertex_count, 1, start_vertex, 0, 0) {
+        Ok(true) => st.clear_gfx_dirty(),
+        Ok(false) => {}
+        Err(e) => log::warn!(target: "d3d", "d3d11 Draw({vertex_count}, 1): {e}"),
+    }
 }
 
 unsafe extern "win64" fn draw_instanced(
@@ -2866,21 +3910,51 @@ unsafe extern "win64" fn draw_instanced(
     start_instance: u32,
 ) {
     let ctx = Obj::get(this);
-    let st = Box::new(ctx.state.lock().unwrap().clone());
-    ctx.emit(RecordedCmd::Draw { state: st, vertex_count, instance_count, start_vertex, start_instance });
+    if ctx.deferred {
+        let st = Box::new(ctx.state.lock().unwrap().clone());
+        ctx.emit(RecordedCmd::Draw { state: st, vertex_count, instance_count, start_vertex, start_instance });
+        return;
+    }
+    let mut st = ctx.state.lock().unwrap();
+    sync_state_shared(&ctx.device, &st);
+    let mut exec = ctx.device.imm_exec.lock().unwrap();
+    if let Err(e) = exec.ensure_open() {
+        log::warn!(target: "d3d", "d3d11 DrawInstanced ensure_open: {e}");
+        return;
+    }
+    match exec_draw(&ctx.device, &mut exec, &st, true, None, vertex_count, instance_count, start_vertex, 0, start_instance) {
+        Ok(true) => st.clear_gfx_dirty(),
+        Ok(false) => {}
+        Err(e) => log::warn!(target: "d3d", "d3d11 Draw({vertex_count}, {instance_count}): {e}"),
+    }
 }
 
 unsafe extern "win64" fn draw_indexed(this: PCtx, index_count: u32, start_index: u32, base_vertex: i32) {
     let ctx = Obj::get(this);
-    let st = Box::new(ctx.state.lock().unwrap().clone());
-    ctx.emit(RecordedCmd::DrawIndexed {
-        state: st,
-        index_count,
-        instance_count: 1,
-        start_index,
-        base_vertex,
-        start_instance: 0,
-    });
+    if ctx.deferred {
+        let st = Box::new(ctx.state.lock().unwrap().clone());
+        ctx.emit(RecordedCmd::DrawIndexed {
+            state: st,
+            index_count,
+            instance_count: 1,
+            start_index,
+            base_vertex,
+            start_instance: 0,
+        });
+        return;
+    }
+    let mut st = ctx.state.lock().unwrap();
+    sync_state_shared(&ctx.device, &st);
+    let mut exec = ctx.device.imm_exec.lock().unwrap();
+    if let Err(e) = exec.ensure_open() {
+        log::warn!(target: "d3d", "d3d11 DrawIndexed ensure_open: {e}");
+        return;
+    }
+    match exec_draw(&ctx.device, &mut exec, &st, true, Some(start_index), index_count, 1, 0, base_vertex, 0) {
+        Ok(true) => st.clear_gfx_dirty(),
+        Ok(false) => {}
+        Err(e) => log::warn!(target: "d3d", "d3d11 DrawIndexed({index_count}, 1): {e}"),
+    }
 }
 
 unsafe extern "win64" fn draw_indexed_instanced(
@@ -2892,21 +3966,49 @@ unsafe extern "win64" fn draw_indexed_instanced(
     start_instance: u32,
 ) {
     let ctx = Obj::get(this);
-    let st = Box::new(ctx.state.lock().unwrap().clone());
-    ctx.emit(RecordedCmd::DrawIndexed {
-        state: st,
-        index_count,
-        instance_count,
-        start_index,
-        base_vertex,
-        start_instance,
-    });
+    if ctx.deferred {
+        let st = Box::new(ctx.state.lock().unwrap().clone());
+        ctx.emit(RecordedCmd::DrawIndexed {
+            state: st,
+            index_count,
+            instance_count,
+            start_index,
+            base_vertex,
+            start_instance,
+        });
+        return;
+    }
+    let mut st = ctx.state.lock().unwrap();
+    sync_state_shared(&ctx.device, &st);
+    let mut exec = ctx.device.imm_exec.lock().unwrap();
+    if let Err(e) = exec.ensure_open() {
+        log::warn!(target: "d3d", "d3d11 DrawIndexedInstanced ensure_open: {e}");
+        return;
+    }
+    match exec_draw(&ctx.device, &mut exec, &st, true, Some(start_index), index_count, instance_count, 0, base_vertex, start_instance) {
+        Ok(true) => st.clear_gfx_dirty(),
+        Ok(false) => {}
+        Err(e) => log::warn!(target: "d3d", "d3d11 DrawIndexed({index_count}, {instance_count}): {e}"),
+    }
 }
 
 unsafe extern "win64" fn dispatch(this: PCtx, x: u32, y: u32, z: u32) {
     let ctx = Obj::get(this);
-    let st = Box::new(ctx.state.lock().unwrap().clone());
-    ctx.emit(RecordedCmd::Dispatch { state: st, x, y, z });
+    if ctx.deferred {
+        let st = Box::new(ctx.state.lock().unwrap().clone());
+        ctx.emit(RecordedCmd::Dispatch { state: st, x, y, z });
+        return;
+    }
+    let st = ctx.state.lock().unwrap();
+    sync_state_shared(&ctx.device, &st);
+    let mut exec = ctx.device.imm_exec.lock().unwrap();
+    if let Err(e) = exec.ensure_open() {
+        log::warn!(target: "d3d", "d3d11 Dispatch ensure_open: {e}");
+        return;
+    }
+    if let Err(e) = exec_dispatch(&ctx.device, &mut exec, &st, true, x, y, z) {
+        log::warn!(target: "d3d", "d3d11 Dispatch({x}, {y}, {z}): {e}");
+    }
 }
 
 unsafe extern "win64" fn draw_auto(_this: PCtx) {
@@ -2918,8 +4020,24 @@ unsafe extern "win64" fn draw_instanced_indirect(this: PCtx, buf: *mut c_void, o
         return;
     };
     let ctx = Obj::get(this);
-    let st = Box::new(ctx.state.lock().unwrap().clone());
-    ctx.emit(RecordedCmd::DrawInstancedIndirect { state: st, args, offset: off });
+    if ctx.deferred {
+        let st = Box::new(ctx.state.lock().unwrap().clone());
+        ctx.emit(RecordedCmd::DrawInstancedIndirect { state: st, args, offset: off });
+        return;
+    }
+    let mut st = ctx.state.lock().unwrap();
+    sync_state_shared(&ctx.device, &st);
+    args.sync_other_devices(&ctx.device);
+    let mut exec = ctx.device.imm_exec.lock().unwrap();
+    if let Err(e) = exec.ensure_open() {
+        log::warn!(target: "d3d", "d3d11 DrawInstancedIndirect ensure_open: {e}");
+        return;
+    }
+    match exec_draw_indirect(&ctx.device, &mut exec, &st, true, &args, off, false) {
+        Ok(true) => st.clear_gfx_dirty(),
+        Ok(false) => {}
+        Err(e) => log::warn!(target: "d3d", "d3d11 DrawInstancedIndirect(off={off}): {e}"),
+    }
 }
 unsafe extern "win64" fn draw_indexed_instanced_indirect(this: PCtx, buf: *mut c_void, off: u32) {
     let Some(args) = buffer_from_ptr(buf) else {
@@ -2927,8 +4045,24 @@ unsafe extern "win64" fn draw_indexed_instanced_indirect(this: PCtx, buf: *mut c
         return;
     };
     let ctx = Obj::get(this);
-    let st = Box::new(ctx.state.lock().unwrap().clone());
-    ctx.emit(RecordedCmd::DrawIndexedInstancedIndirect { state: st, args, offset: off });
+    if ctx.deferred {
+        let st = Box::new(ctx.state.lock().unwrap().clone());
+        ctx.emit(RecordedCmd::DrawIndexedInstancedIndirect { state: st, args, offset: off });
+        return;
+    }
+    let mut st = ctx.state.lock().unwrap();
+    sync_state_shared(&ctx.device, &st);
+    args.sync_other_devices(&ctx.device);
+    let mut exec = ctx.device.imm_exec.lock().unwrap();
+    if let Err(e) = exec.ensure_open() {
+        log::warn!(target: "d3d", "d3d11 DrawIndexedInstancedIndirect ensure_open: {e}");
+        return;
+    }
+    match exec_draw_indirect(&ctx.device, &mut exec, &st, true, &args, off, true) {
+        Ok(true) => st.clear_gfx_dirty(),
+        Ok(false) => {}
+        Err(e) => log::warn!(target: "d3d", "d3d11 DrawIndexedInstancedIndirect(off={off}): {e}"),
+    }
 }
 unsafe extern "win64" fn dispatch_indirect(this: PCtx, buf: *mut c_void, off: u32) {
     let Some(args) = buffer_from_ptr(buf) else {
@@ -2936,8 +4070,22 @@ unsafe extern "win64" fn dispatch_indirect(this: PCtx, buf: *mut c_void, off: u3
         return;
     };
     let ctx = Obj::get(this);
-    let st = Box::new(ctx.state.lock().unwrap().clone());
-    ctx.emit(RecordedCmd::DispatchIndirect { state: st, args, offset: off });
+    if ctx.deferred {
+        let st = Box::new(ctx.state.lock().unwrap().clone());
+        ctx.emit(RecordedCmd::DispatchIndirect { state: st, args, offset: off });
+        return;
+    }
+    let st = ctx.state.lock().unwrap();
+    sync_state_shared(&ctx.device, &st);
+    args.sync_other_devices(&ctx.device);
+    let mut exec = ctx.device.imm_exec.lock().unwrap();
+    if let Err(e) = exec.ensure_open() {
+        log::warn!(target: "d3d", "d3d11 DispatchIndirect ensure_open: {e}");
+        return;
+    }
+    if let Err(e) = exec_dispatch_indirect(&ctx.device, &mut exec, &st, true, &args, off) {
+        log::warn!(target: "d3d", "d3d11 DispatchIndirect(off={off}): {e}");
+    }
 }
 unsafe extern "win64" fn copy_structure_count(this: PCtx, dst: *mut c_void, off: u32, uav: *mut c_void) {
     let Some(dst_buf) = buffer_from_ptr(dst) else {
@@ -2964,7 +4112,11 @@ unsafe extern "win64" fn generate_mips(this: PCtx, srv: *mut c_void) {
 
 pub unsafe extern "win64" fn set_resource_min_lod(_this: PCtx, res: *mut c_void, min_lod: f32) {
     if let Some(r) = resource_from_ptr(res) {
-        r.min_lod_bits.store(min_lod.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        let bits = min_lod.to_bits();
+        if r.min_lod_bits.swap(bits, Ordering::AcqRel) != bits {
+            r.version.fetch_add(1, Ordering::Release);
+            r.device.bump_desc_resource_version();
+        }
     }
 }
 crate::win64_bridge!(fn set_resource_min_lod(PCtx, *mut c_void, f32) -> ());
@@ -3104,7 +4256,11 @@ unsafe extern "win64" fn get_data(
 }
 
 unsafe extern "win64" fn clear_state(this: PCtx) {
-    *Obj::get(this).state.lock().unwrap() = ContextState::default();
+    let ctx = Obj::get(this);
+    *ctx.state.lock().unwrap() = ContextState::default();
+    if !ctx.deferred {
+        ctx.device.imm_exec.lock().unwrap().invalidate_live_caches();
+    }
 }
 
 unsafe extern "win64" fn flush(this: PCtx) {
@@ -3165,10 +4321,23 @@ unsafe extern "win64" fn execute_command_list(
     } else {
         None
     };
+    if !ctx.deferred {
+        ctx.device.imm_exec.lock().unwrap().invalidate_live_caches();
+    }
     for cmd in &cl.cmds {
         ctx.emit(cmd.clone());
     }
-    *ctx.state.lock().unwrap() = saved.unwrap_or_default();
+    let mut next_state = saved.unwrap_or_default();
+    next_state.pso_dirty = true;
+    next_state.rt_dirty = true;
+    next_state.vp_dirty = true;
+    next_state.scissor_dirty = true;
+    next_state.blend_factor_dirty = true;
+    next_state.stencil_ref_dirty = true;
+    *ctx.state.lock().unwrap() = next_state;
+    if !ctx.deferred {
+        ctx.device.imm_exec.lock().unwrap().invalidate_live_caches();
+    }
 }
 
 unsafe extern "win64" fn discard_resource(this: PCtx, res: *mut c_void) {
@@ -3238,9 +4407,152 @@ unsafe extern "win64" fn swap_device_context_state(
     if let Some(prev_state_obj) = Obj::<D3d11DeviceContextState>::from_iface(prev_obj.as_ptr()) {
         *Obj::get(prev_state_obj).state.lock().unwrap() = current_state;
     }
-    let next_state = std::mem::take(&mut *Obj::get(target).state.lock().unwrap());
+    let mut next_state = std::mem::take(&mut *Obj::get(target).state.lock().unwrap());
+    next_state.pso_dirty = true;
+    next_state.rt_dirty = true;
+    next_state.vp_dirty = true;
+    next_state.scissor_dirty = true;
+    next_state.blend_factor_dirty = true;
+    next_state.stencil_ref_dirty = true;
     *ctx.state.lock().unwrap() = next_state;
+    ctx.device.imm_exec.lock().unwrap().invalidate_live_caches();
 
     prev_obj.copy_out(prev);
     *active_guard = Some(ComRef::from_borrowed(state));
+}
+
+/// Audited `ID3D11DeviceContext` / `ID3D11DeviceContext1` methods safe for the
+/// ARM64 JIT `DF_PLAIN` direct-call fast path:
+/// - `<= 8` integer/pointer arguments (including `this`), integer/void return
+/// - no `f32`/`f64`/XMM arguments or returns
+/// - no guest callbacks or SEH unwind
+///
+/// Explicitly excluded:
+/// - Float/XMM-arg or float-return methods: `ClearDepthStencilView`, `SetResourceMinLOD`,
+///   `GetResourceMinLOD`, `ClearRenderTargetView`, `ClearUnorderedAccessViewFloat`, `ClearView`
+/// - `> 8` argument methods: `CopySubresourceRegion` (9 args), `CopySubresourceRegion1` (10 args)
+pub(crate) fn plain_fns() -> &'static [usize] {
+    static FNS: OnceLock<Vec<usize>> = OnceLock::new();
+    FNS.get_or_init(|| {
+        vec![
+            vs_set_constant_buffers as *const () as usize,
+            ps_set_shader_resources as *const () as usize,
+            ps_set_shader as *const () as usize,
+            ps_set_samplers as *const () as usize,
+            vs_set_shader as *const () as usize,
+            draw_indexed as *const () as usize,
+            draw as *const () as usize,
+            map as *const () as usize,
+            unmap as *const () as usize,
+            ps_set_constant_buffers as *const () as usize,
+            ia_set_input_layout as *const () as usize,
+            ia_set_vertex_buffers as *const () as usize,
+            ia_set_index_buffer as *const () as usize,
+            draw_indexed_instanced as *const () as usize,
+            draw_instanced as *const () as usize,
+            gs_set_constant_buffers as *const () as usize,
+            gs_set_shader as *const () as usize,
+            ia_set_primitive_topology as *const () as usize,
+            vs_set_shader_resources as *const () as usize,
+            vs_set_samplers as *const () as usize,
+            begin_async as *const () as usize,
+            end_async as *const () as usize,
+            get_data as *const () as usize,
+            set_predication as *const () as usize,
+            gs_set_shader_resources as *const () as usize,
+            gs_set_samplers as *const () as usize,
+            om_set_render_targets as *const () as usize,
+            om_set_render_targets_and_uavs as *const () as usize,
+            om_set_blend_state as *const () as usize,
+            om_set_depth_stencil_state as *const () as usize,
+            so_set_targets as *const () as usize,
+            draw_indexed_instanced_indirect as *const () as usize,
+            draw_instanced_indirect as *const () as usize,
+            dispatch as *const () as usize,
+            dispatch_indirect as *const () as usize,
+            rs_set_state as *const () as usize,
+            rs_set_viewports as *const () as usize,
+            rs_set_scissor_rects as *const () as usize,
+            copy_resource as *const () as usize,
+            update_subresource as *const () as usize,
+            copy_structure_count as *const () as usize,
+            clear_uav_uint as *const () as usize,
+            generate_mips as *const () as usize,
+            resolve_subresource as *const () as usize,
+            execute_command_list as *const () as usize,
+            hs_set_shader_resources as *const () as usize,
+            hs_set_shader as *const () as usize,
+            hs_set_samplers as *const () as usize,
+            hs_set_constant_buffers as *const () as usize,
+            ds_set_shader_resources as *const () as usize,
+            ds_set_shader as *const () as usize,
+            ds_set_samplers as *const () as usize,
+            ds_set_constant_buffers as *const () as usize,
+            cs_set_shader_resources as *const () as usize,
+            cs_set_uavs as *const () as usize,
+            cs_set_shader as *const () as usize,
+            cs_set_samplers as *const () as usize,
+            cs_set_constant_buffers as *const () as usize,
+            vs_get_constant_buffers as *const () as usize,
+            ps_get_shader_resources as *const () as usize,
+            ps_get_shader as *const () as usize,
+            ps_get_samplers as *const () as usize,
+            vs_get_shader as *const () as usize,
+            ps_get_constant_buffers as *const () as usize,
+            ia_get_input_layout as *const () as usize,
+            ia_get_vertex_buffers as *const () as usize,
+            ia_get_index_buffer as *const () as usize,
+            gs_get_constant_buffers as *const () as usize,
+            gs_get_shader as *const () as usize,
+            ia_get_primitive_topology as *const () as usize,
+            vs_get_shader_resources as *const () as usize,
+            vs_get_samplers as *const () as usize,
+            get_predication as *const () as usize,
+            gs_get_shader_resources as *const () as usize,
+            gs_get_samplers as *const () as usize,
+            om_get_render_targets as *const () as usize,
+            om_get_render_targets_and_uavs as *const () as usize,
+            om_get_blend_state as *const () as usize,
+            om_get_depth_stencil_state as *const () as usize,
+            so_get_targets as *const () as usize,
+            rs_get_state as *const () as usize,
+            rs_get_viewports as *const () as usize,
+            rs_get_scissor_rects as *const () as usize,
+            hs_get_shader_resources as *const () as usize,
+            hs_get_shader as *const () as usize,
+            hs_get_samplers as *const () as usize,
+            hs_get_constant_buffers as *const () as usize,
+            ds_get_shader_resources as *const () as usize,
+            ds_get_shader as *const () as usize,
+            ds_get_samplers as *const () as usize,
+            ds_get_constant_buffers as *const () as usize,
+            cs_get_shader_resources as *const () as usize,
+            cs_get_uavs as *const () as usize,
+            cs_get_shader as *const () as usize,
+            cs_get_samplers as *const () as usize,
+            cs_get_constant_buffers as *const () as usize,
+            clear_state as *const () as usize,
+            flush as *const () as usize,
+            get_type as *const () as usize,
+            get_context_flags as *const () as usize,
+            finish_command_list as *const () as usize,
+            update_subresource1 as *const () as usize,
+            discard_resource as *const () as usize,
+            discard_view as *const () as usize,
+            vs_set_constant_buffers1 as *const () as usize,
+            hs_set_constant_buffers1 as *const () as usize,
+            ds_set_constant_buffers1 as *const () as usize,
+            gs_set_constant_buffers1 as *const () as usize,
+            ps_set_constant_buffers1 as *const () as usize,
+            cs_set_constant_buffers1 as *const () as usize,
+            vs_get_constant_buffers1 as *const () as usize,
+            hs_get_constant_buffers1 as *const () as usize,
+            ds_get_constant_buffers1 as *const () as usize,
+            gs_get_constant_buffers1 as *const () as usize,
+            ps_get_constant_buffers1 as *const () as usize,
+            cs_get_constant_buffers1 as *const () as usize,
+            swap_device_context_state as *const () as usize,
+            discard_view1 as *const () as usize,
+        ]
+    })
 }

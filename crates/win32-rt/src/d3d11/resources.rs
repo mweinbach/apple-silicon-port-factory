@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use d3d12_metal::metal::cmdlist::{CopyLoc, TargetView};
@@ -124,13 +124,38 @@ pub struct MapState {
     pub depth_pitch: u32,
 }
 
+/// Backing Metal resource + optional byte offset (non-zero for ring-suballocated
+/// dynamic buffers via `Map(WRITE_DISCARD)`).
+#[derive(Clone)]
+pub struct ResourceBacking {
+    pub mtl: Arc<MtlResource>,
+    pub offset: u64,
+}
+
+/// D3D12 resource state bits tracked per `ResourceCore` to suppress redundant
+/// SRV barriers on read-only textures across consecutive draws.
+pub mod gpu_state {
+    pub const COMMON: u32 = 0;
+    pub const RENDER_TARGET: u32 = 0x4;
+    pub const UNORDERED_ACCESS: u32 = 0x8;
+    pub const DEPTH_WRITE: u32 = 0x10;
+    pub const SRV_ALL: u32 = 0xC0;
+    pub const INDIRECT_ARGUMENT: u32 = 0x200;
+    pub const COPY_DEST: u32 = 0x400;
+    pub const WRITE_MASK: u32 = RENDER_TARGET | UNORDERED_ACCESS | DEPTH_WRITE | COPY_DEST;
+}
+
 /// Shared state backing any D3D11 resource COM object.
 pub struct ResourceCore {
     pub device: Arc<DeviceCore>,
     pub kind: ResourceKind,
-    /// Current Metal backing resource. Swapped on `Map(WRITE_DISCARD)` for dynamic
-    /// buffers or on `IDXGISwapChain::Present` for backbuffer 0.
-    pub mtl: RwLock<Arc<MtlResource>>,
+    /// Current Metal backing resource (+ ring byte offset). Swapped on `Map(WRITE_DISCARD)`
+    /// for dynamic buffers or on `IDXGISwapChain::Present` for backbuffer 0.
+    pub mtl: RwLock<ResourceBacking>,
+    /// Monotonic backing/view version (incremented on `replace_backing` and `SetResourceMinLOD`).
+    pub version: AtomicU64,
+    /// Last D3D12 GPU state observed on this resource (see [`gpu_state`]).
+    pub last_gpu_state: AtomicU32,
     /// Lazily allocated READBACK staging buffer for CPU `Map`/`Unmap` of textures.
     pub tex_staging: Mutex<Option<TexStaging>>,
     pub mapped: Mutex<HashMap<u32, MapState>>,
@@ -161,13 +186,60 @@ pub struct TexStaging {
 }
 
 impl ResourceCore {
-    pub fn current_mtl(&self) -> Arc<MtlResource> {
+    pub fn current_backing(&self) -> ResourceBacking {
         self.mtl.read().unwrap().clone()
     }
 
+    pub fn current_mtl(&self) -> Arc<MtlResource> {
+        self.mtl.read().unwrap().mtl.clone()
+    }
+
+    pub fn replace_backing(&self, next: ResourceBacking) -> ResourceBacking {
+        let old = {
+            let mut g = self.mtl.write().unwrap();
+            std::mem::replace(&mut *g, next)
+        };
+        self.version.fetch_add(1, Ordering::Release);
+        self.last_gpu_state.store(gpu_state::COMMON, Ordering::Release);
+        let bind = self.kind.bind_flags();
+        if (bind & (bind_flag::CONSTANT_BUFFER | bind_flag::SHADER_RESOURCE | bind_flag::UNORDERED_ACCESS)) != 0 {
+            self.device.bump_desc_resource_version();
+        }
+        old
+    }
+
     pub fn replace_mtl(&self, next: Arc<MtlResource>) -> Arc<MtlResource> {
-        let mut g = self.mtl.write().unwrap();
-        std::mem::replace(&mut *g, next)
+        self.replace_backing(ResourceBacking { mtl: next, offset: 0 }).mtl
+    }
+
+    /// True if this dynamic buffer can be sub-allocated from `ImmediateExec`'s upload ring
+    /// on `Map(WRITE_DISCARD)` (non-SRV/UAV, `<= 64 KiB`).
+    pub fn ring_dynamic_byte_width(&self) -> Option<u32> {
+        match self.kind {
+            ResourceKind::Buffer(d)
+                if d.Usage == usage::DYNAMIC
+                    && (d.BindFlags & (bind_flag::SHADER_RESOURCE | bind_flag::UNORDERED_ACCESS)) == 0
+                    && d.ByteWidth <= 65_536 =>
+            {
+                Some(d.ByteWidth)
+            }
+            _ => None,
+        }
+    }
+
+    /// Power-of-two size class for recycling dedicated `Map(WRITE_DISCARD)` dynamic buffers
+    /// (buffers with `BIND_SHADER_RESOURCE` or `> 64 KiB` up to 4 MiB).
+    pub fn pool_dynamic_class_size(&self) -> Option<u64> {
+        match self.kind {
+            ResourceKind::Buffer(d)
+                if d.Usage == usage::DYNAMIC
+                    && (d.BindFlags & bind_flag::UNORDERED_ACCESS) == 0
+                    && d.ByteWidth <= (4 << 20) =>
+            {
+                Some((d.ByteWidth as u64).max(256).next_power_of_two())
+            }
+            _ => None,
+        }
     }
 
     pub fn is_buffer(&self) -> bool {
@@ -190,6 +262,8 @@ impl ResourceCore {
         ensure(&mut list, &self.device);
         ensure(&mut list, dev);
         self.has_remote_devices.store(true, Ordering::Release);
+        self.device.has_shared_resources.store(true, Ordering::Release);
+        dev.has_shared_resources.store(true, Ordering::Release);
     }
 
     /// Flush & wait idle on any OTHER `DeviceCore` sharing this resource.
@@ -251,7 +325,9 @@ impl ResourceCore {
         Arc::new(Self {
             device,
             kind,
-            mtl: RwLock::new(mtl),
+            mtl: RwLock::new(ResourceBacking { mtl, offset: 0 }),
+            version: AtomicU64::new(1),
+            last_gpu_state: AtomicU32::new(gpu_state::COMMON),
             tex_staging: Mutex::new(None),
             mapped: Mutex::new(HashMap::new()),
             eviction_priority: AtomicU32::new(0x7800_0000), // DXGI_RESOURCE_PRIORITY_NORMAL
@@ -1321,6 +1397,7 @@ unsafe extern "win64" fn surf_unmap(this: *mut Obj<DxgiSurface>) -> HRESULT {
             exec.has_work = true;
             exec.keep((mtl, staging_buf));
         }
+        core.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
         surf.device.flush_and_wait_idle();
     }
     S_OK
@@ -1522,6 +1599,7 @@ unsafe extern "win64" fn surf_release_dc(
         exec.has_work = true;
         exec.keep((mtl, staging_buf));
     }
+    core.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
     surf.device.flush_and_wait_idle();
     S_OK
 }

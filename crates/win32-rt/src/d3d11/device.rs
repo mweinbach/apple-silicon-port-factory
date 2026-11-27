@@ -1,14 +1,13 @@
 //! `ID3D11Device` (43 base slots) / `ID3D11Device1` (50 total slots) and
 //! `IDXGIDevice1` tear-off + D3D11-aware DXGI adapter/factory bridge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use d3d12_metal::metal::cmdlist::{CommandAllocator, CommandList, CopyLoc};
 use d3d12_metal::metal::device::Device as MtlDevice;
-use d3d12_metal::metal::pipeline::GraphicsPipeline;
 use d3d12_metal::metal::query::QueryHeap;
 use d3d12_metal::metal::queue::{ListType, Queue};
 use d3d12_metal::metal::resource::Resource as MtlResource;
@@ -21,7 +20,7 @@ use crate::dxgi::swapchain::{FullscreenDesc, SwapChainDesc, SwapChainDesc1};
 use crate::types::*;
 
 use super::com::*;
-use super::context::{D3d11Context, ImmediateExec};
+use super::context::{D3d11Context, FrameStats, ImmediateExec};
 use super::resources::*;
 use super::state::*;
 use super::types::*;
@@ -71,6 +70,65 @@ impl TimestampPool {
     }
 }
 
+/// Size-class pool for dedicated `Map(WRITE_DISCARD)` dynamic buffers (`> 64 KiB` or
+/// `BIND_SHADER_RESOURCE`), recycled once `Queue::timeline` finishes with them.
+#[derive(Default)]
+pub struct DynamicBufPool {
+    in_flight: VecDeque<(u64, u64, Arc<MtlResource>)>,
+    ready: HashMap<u64, Vec<Arc<MtlResource>>>,
+    ready_bytes: u64,
+}
+
+const MAX_DYNAMIC_POOL_BYTES: u64 = if cfg!(target_os = "ios") { 16 << 20 } else { 64 << 20 };
+
+impl DynamicBufPool {
+    fn reclaim(&mut self, completed: u64) {
+        let mut remaining = VecDeque::new();
+        while let Some((tv, class_size, buf)) = self.in_flight.pop_front() {
+            if tv <= completed {
+                if Arc::strong_count(&buf) == 1 && self.ready_bytes.saturating_add(class_size) <= MAX_DYNAMIC_POOL_BYTES {
+                    self.ready.entry(class_size).or_default().push(buf);
+                    self.ready_bytes = self.ready_bytes.saturating_add(class_size);
+                }
+            } else {
+                remaining.push_back((tv, class_size, buf));
+            }
+        }
+        self.in_flight = remaining;
+    }
+
+    pub fn acquire(&mut self, class_size: u64, completed: u64) -> Result<Arc<MtlResource>, String> {
+        self.reclaim(completed);
+        if let Some(bucket) = self.ready.get_mut(&class_size) {
+            if let Some(buf) = bucket.pop() {
+                self.ready_bytes = self.ready_bytes.saturating_sub(class_size);
+                return Ok(buf);
+            }
+        }
+        let rdesc = ResourceDesc {
+            Dimension: dim::BUFFER,
+            Width: class_size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleCount: 1,
+            Layout: 1,
+            ..Default::default()
+        };
+        let hp = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+        let mtl = Arc::new(
+            new_committed_resource(&rdesc, &hp, "d3d11 dynamic pool")
+                .map_err(|e| format!("{e:?}"))?,
+        );
+        mtl.register_ptr();
+        Ok(mtl)
+    }
+
+    pub fn retire(&mut self, timeline_val: u64, class_size: u64, buf: Arc<MtlResource>) {
+        self.in_flight.push_back((timeline_val, class_size, buf));
+    }
+}
+
 /// Shared core behind an `ID3D11Device` and all of its children.
 pub struct DeviceCore {
     pub mtl: &'static MtlDevice,
@@ -81,11 +139,23 @@ pub struct DeviceCore {
     pub removed_reason: Mutex<HRESULT>,
     pub gfx_rs: Arc<RootSignature>,
     pub compute_rs: Arc<RootSignature>,
-    pub gfx_psos: Mutex<HashMap<GraphicsPsoKey, Arc<GraphicsPipeline>>>,
+    pub gfx_psos: Mutex<HashMap<GraphicsPsoKey, Arc<CachedGfxPso>>>,
     /// Shared timestamp query heap pool (avoids AGX's ~32 MTL4CounterHeap ceiling).
     timestamp_pool: Mutex<TimestampPool>,
     /// Immediate Metal 4 command encoder/ring backend.
     pub imm_exec: Mutex<ImmediateExec>,
+    /// Recycled dedicated dynamic buffers (`> 64 KiB` or `BIND_SHADER_RESOURCE`).
+    pub dynamic_pool: Arc<Mutex<DynamicBufPool>>,
+    /// Monotonic state-object ID generator for shaders & input layouts.
+    next_state_id: AtomicU32,
+    /// Canonical per-device state ID interners for compact `GraphicsPsoKey`s.
+    blend_ids: Mutex<HashMap<d3d12_metal::state::BlendDesc, u32>>,
+    raster_ids: Mutex<HashMap<RasterKey, u32>>,
+    ds_ids: Mutex<HashMap<d3d12_metal::state::DepthStencilState, u32>>,
+    /// True once any resource on this device has been shared with another device.
+    pub has_shared_resources: AtomicBool,
+    /// Bumped whenever a CB/SRV/UAV resource swaps its backing or changes minLOD.
+    pub desc_resource_version: AtomicU64,
     /// Non-owning pointer to the primary `Obj<D3d11Device>` while alive (0 once released).
     pub device_com: AtomicUsize,
     /// Non-owning pointer to the immediate `Obj<D3d11Context>` (owned by `D3d11Device`).
@@ -101,7 +171,8 @@ impl DeviceCore {
         feature_level: u32,
         creation_flags: u32,
     ) -> Result<Arc<Self>, HRESULT> {
-        let imm_exec = ImmediateExec::new(queue.clone())
+        let dynamic_pool = Arc::new(Mutex::new(DynamicBufPool::default()));
+        let imm_exec = ImmediateExec::new(queue.clone(), dynamic_pool.clone())
             .map_err(|e| d11_failed!(E_OUTOFMEMORY, "D3D11 immediate exec init: {e}"))?;
         Ok(Arc::new(Self {
             mtl,
@@ -115,6 +186,13 @@ impl DeviceCore {
             gfx_psos: Mutex::new(HashMap::new()),
             timestamp_pool: Mutex::new(TimestampPool::default()),
             imm_exec: Mutex::new(imm_exec),
+            dynamic_pool,
+            next_state_id: AtomicU32::new(1),
+            blend_ids: Mutex::new(HashMap::new()),
+            raster_ids: Mutex::new(HashMap::new()),
+            ds_ids: Mutex::new(HashMap::new()),
+            has_shared_resources: AtomicBool::new(false),
+            desc_resource_version: AtomicU64::new(1),
             device_com: AtomicUsize::new(0),
             imm_ctx_com: AtomicUsize::new(0),
             gpu_thread_priority: AtomicI32::new(0),
@@ -122,9 +200,58 @@ impl DeviceCore {
         }))
     }
 
+    pub fn alloc_state_id(&self) -> u32 {
+        self.next_state_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn intern_blend_id(&self, desc: d3d12_metal::state::BlendDesc) -> u32 {
+        let mut m = self.blend_ids.lock().unwrap();
+        if let Some(&id) = m.get(&desc) {
+            return id;
+        }
+        let id = (m.len() as u32) + 1;
+        m.insert(desc, id);
+        id
+    }
+
+    pub fn intern_raster_id(&self, key: RasterKey) -> u32 {
+        let mut m = self.raster_ids.lock().unwrap();
+        if let Some(&id) = m.get(&key) {
+            return id;
+        }
+        let id = (m.len() as u32) + 1;
+        m.insert(key, id);
+        id
+    }
+
+    pub fn intern_ds_id(&self, state: d3d12_metal::state::DepthStencilState) -> u32 {
+        let mut m = self.ds_ids.lock().unwrap();
+        if let Some(&id) = m.get(&state) {
+            return id;
+        }
+        let id = (m.len() as u32) + 1;
+        m.insert(state, id);
+        id
+    }
+
+    #[inline]
+    pub fn bump_desc_resource_version(&self) {
+        self.desc_resource_version.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn desc_resource_version(&self) -> u64 {
+        self.desc_resource_version.load(Ordering::Acquire)
+    }
+
     /// Submit all recorded immediate commands to the Metal 4 queue.
     pub fn flush_immediate(&self) -> u64 {
         self.imm_exec.lock().unwrap().flush()
+    }
+
+    /// Snapshot and reset per-frame immediate execution counters (called on `Present`).
+    pub fn take_frame_stats(&self) -> FrameStats {
+        self.imm_exec.lock().unwrap().take_frame_stats()
     }
 
     /// Submit all recorded immediate commands and wait for GPU completion.
@@ -198,11 +325,17 @@ impl DeviceCore {
         {
             let ctx = unsafe { Obj::get(p) };
             let mut st = ctx.state.lock().unwrap();
+            let mut unbound = false;
             for slot in &mut st.rtvs {
                 if slot.rtv.as_ref().is_some_and(|v| Arc::ptr_eq(&v.resource, resource)) {
                     released.push(std::mem::take(&mut slot.com));
                     slot.rtv = None;
+                    unbound = true;
                 }
+            }
+            if unbound {
+                st.rt_dirty = true;
+                st.pso_dirty = true;
             }
         }
         drop(released);
@@ -464,6 +597,7 @@ unsafe extern "win64" fn create_buffer(
             if let Err(e) = core.upload_initial_buffer(&mtl, sd.pSysMem as *const u8, d.ByteWidth as usize) {
                 return d11_failed!(E_FAIL, "CreateBuffer initial upload: {e}");
             }
+            res.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
         }
     }
     if out.is_null() {
@@ -496,6 +630,7 @@ unsafe extern "win64" fn create_texture1d(
         if let Err(e) = core.upload_initial_texture(&mtl, initial) {
             return d11_failed!(E_FAIL, "CreateTexture1D initial upload: {e}");
         }
+        res.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
     }
     if out.is_null() {
         return S_FALSE;
@@ -527,6 +662,7 @@ unsafe extern "win64" fn create_texture2d(
         if let Err(e) = core.upload_initial_texture(&mtl, initial) {
             return d11_failed!(E_FAIL, "CreateTexture2D initial upload: {e}");
         }
+        res.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
     }
     if out.is_null() {
         return S_FALSE;
@@ -558,6 +694,7 @@ unsafe extern "win64" fn create_texture3d(
         if let Err(e) = core.upload_initial_texture(&mtl, initial) {
             return d11_failed!(E_FAIL, "CreateTexture3D initial upload: {e}");
         }
+        res.last_gpu_state.store(gpu_state::COPY_DEST, Ordering::Release);
     }
     if out.is_null() {
         return S_FALSE;
@@ -645,8 +782,11 @@ unsafe extern "win64" fn create_input_layout(
     if out.is_null() {
         return S_FALSE;
     }
+    let core = Obj::get(this).core.clone();
+    let id = core.alloc_state_id();
     let inner = Arc::new(InputLayoutInner {
-        device: Obj::get(this).core.clone(),
+        device: core,
+        id,
         elements,
         hash: kh.finish(),
     });
@@ -679,7 +819,9 @@ unsafe extern "win64" fn create_vertex_shader(
     };
     if out.is_null() { return S_FALSE; }
     let hash = dxil_metal::hash::hash128(&bytes);
-    let inner = Arc::new(ShaderBlob { device: Obj::get(this).core.clone(), bytecode: bytes, hash });
+    let core = Obj::get(this).core.clone();
+    let id = core.alloc_state_id();
+    let inner = Arc::new(ShaderBlob { device: core, id, bytecode: bytes, hash });
     std::ptr::write_unaligned(out, Obj::new(D3d11VertexShader { inner }) as *mut c_void);
     S_OK
 }
@@ -698,7 +840,9 @@ unsafe extern "win64" fn create_pixel_shader(
     };
     if out.is_null() { return S_FALSE; }
     let hash = dxil_metal::hash::hash128(&bytes);
-    let inner = Arc::new(ShaderBlob { device: Obj::get(this).core.clone(), bytecode: bytes, hash });
+    let core = Obj::get(this).core.clone();
+    let id = core.alloc_state_id();
+    let inner = Arc::new(ShaderBlob { device: core, id, bytecode: bytes, hash });
     std::ptr::write_unaligned(out, Obj::new(D3d11PixelShader { inner }) as *mut c_void);
     S_OK
 }
@@ -735,7 +879,9 @@ unsafe extern "win64" fn create_geometry_shader(
     };
     if out.is_null() { return S_FALSE; }
     let hash = dxil_metal::hash::hash128(&bytes);
-    let inner = Arc::new(ShaderBlob { device: Obj::get(this).core.clone(), bytecode: bytes, hash });
+    let core = Obj::get(this).core.clone();
+    let id = core.alloc_state_id();
+    let inner = Arc::new(ShaderBlob { device: core, id, bytecode: bytes, hash });
     std::ptr::write_unaligned(out, Obj::new(D3d11GeometryShader { inner }) as *mut c_void);
     S_OK
 }
@@ -763,7 +909,9 @@ unsafe extern "win64" fn create_hull_shader(
     };
     if out.is_null() { return S_FALSE; }
     let hash = dxil_metal::hash::hash128(&bytes);
-    let inner = Arc::new(ShaderBlob { device: Obj::get(this).core.clone(), bytecode: bytes, hash });
+    let core = Obj::get(this).core.clone();
+    let id = core.alloc_state_id();
+    let inner = Arc::new(ShaderBlob { device: core, id, bytecode: bytes, hash });
     std::ptr::write_unaligned(out, Obj::new(D3d11HullShader { inner }) as *mut c_void);
     S_OK
 }
@@ -782,7 +930,9 @@ unsafe extern "win64" fn create_domain_shader(
     };
     if out.is_null() { return S_FALSE; }
     let hash = dxil_metal::hash::hash128(&bytes);
-    let inner = Arc::new(ShaderBlob { device: Obj::get(this).core.clone(), bytecode: bytes, hash });
+    let core = Obj::get(this).core.clone();
+    let id = core.alloc_state_id();
+    let inner = Arc::new(ShaderBlob { device: core, id, bytecode: bytes, hash });
     std::ptr::write_unaligned(out, Obj::new(D3d11DomainShader { inner }) as *mut c_void);
     S_OK
 }
@@ -806,11 +956,15 @@ unsafe extern "win64" fn create_blend_state(
     }
     if out.is_null() { return S_FALSE; }
     let d0 = std::ptr::read_unaligned(desc);
+    let d3d12 = d0.to_d3d12();
+    let core = Obj::get(this).core.clone();
+    let id = core.intern_blend_id(d3d12);
     let inner = Arc::new(BlendStateInner {
-        device: Obj::get(this).core.clone(),
+        device: core,
+        id,
         desc0: d0,
         desc1: d0.to_desc1(),
-        d3d12: d0.to_d3d12(),
+        d3d12,
     });
     std::ptr::write_unaligned(out, Obj::new(D3d11BlendState { inner }) as *mut c_void);
     S_OK
@@ -827,11 +981,15 @@ unsafe extern "win64" fn create_blend_state1(
     }
     if out.is_null() { return S_FALSE; }
     let d1 = std::ptr::read_unaligned(desc);
+    let d3d12 = d1.to_d3d12();
+    let core = Obj::get(this).core.clone();
+    let id = core.intern_blend_id(d3d12);
     let inner = Arc::new(BlendStateInner {
-        device: Obj::get(this).core.clone(),
+        device: core,
+        id,
         desc0: d1.to_desc0(),
         desc1: d1,
-        d3d12: d1.to_d3d12(),
+        d3d12,
     });
     std::ptr::write_unaligned(out, Obj::new(D3d11BlendState { inner }) as *mut c_void);
     S_OK
@@ -849,7 +1007,9 @@ unsafe extern "win64" fn create_depth_stencil_state(
     if out.is_null() { return S_FALSE; }
     let d = std::ptr::read_unaligned(desc);
     let mtl = d3d12_metal::state::depth_stencil_state(&d.to_d3d12());
-    let inner = Arc::new(DepthStencilStateInner { device: Obj::get(this).core.clone(), desc: d, mtl });
+    let core = Obj::get(this).core.clone();
+    let id = core.intern_ds_id(mtl);
+    let inner = Arc::new(DepthStencilStateInner { device: core, id, desc: d, mtl });
     std::ptr::write_unaligned(out, Obj::new(D3d11DepthStencilState { inner }) as *mut c_void);
     S_OK
 }
@@ -867,8 +1027,11 @@ unsafe extern "win64" fn create_rasterizer_state(
     let d0 = std::ptr::read_unaligned(desc);
     let d1 = d0.to_desc1();
     let mtl = d3d12_metal::state::raster_state(&d1.to_d3d12());
+    let core = Obj::get(this).core.clone();
+    let id = core.intern_raster_id(RasterKey::from_desc1(&d1));
     let inner = Arc::new(RasterizerStateInner {
-        device: Obj::get(this).core.clone(),
+        device: core,
+        id,
         desc0: d0,
         desc1: d1,
         scissor_enable: d0.ScissorEnable != 0,
@@ -891,8 +1054,11 @@ unsafe extern "win64" fn create_rasterizer_state1(
     if out.is_null() { return S_FALSE; }
     let d1 = std::ptr::read_unaligned(desc);
     let mtl = d3d12_metal::state::raster_state(&d1.to_d3d12());
+    let core = Obj::get(this).core.clone();
+    let id = core.intern_raster_id(RasterKey::from_desc1(&d1));
     let inner = Arc::new(RasterizerStateInner {
-        device: Obj::get(this).core.clone(),
+        device: core,
+        id,
         desc0: d1.to_desc0(),
         desc1: d1,
         scissor_enable: d1.ScissorEnable != 0,

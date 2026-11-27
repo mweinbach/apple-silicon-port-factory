@@ -350,6 +350,7 @@ unsafe fn do_present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
     }
     // Flush all pending D3D11 immediate context commands onto the shared queue first.
     s.device.flush_immediate();
+    let fstats = s.device.take_frame_stats();
     let mut st = s.st.lock().unwrap();
     let present_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::Present, sync as u64);
     let res = st.sc.present(sync);
@@ -370,6 +371,18 @@ unsafe fn do_present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
                 Obj::get(b0).core.replace_mtl(next_mtl.clone());
             }
             let n = s.presents.fetch_add(1, Ordering::AcqRel) + 1;
+            if fstats.draws >= 256 {
+                log::info!(
+                    target: "d3d",
+                    "d3d11 frame stats: frame={n} draws={} flushes={} mid_frame_flushes={} mid_frame_stalls={} res_slots={} samp_slots={}",
+                    fstats.draws,
+                    fstats.flushes,
+                    fstats.mid_frame_flushes,
+                    fstats.mid_frame_stalls,
+                    fstats.res_slots,
+                    fstats.samp_slots,
+                );
+            }
             if n <= 10 || n % 60 == 0 {
                 log::info!(target: "d3d", "d3d11 Present #{n} (sync {sync}, flags {flags:#x})");
             }
