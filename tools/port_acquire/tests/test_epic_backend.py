@@ -387,9 +387,16 @@ if cmd in ("install", "download", "update"):
     install_dir = Path(folder)
     install_dir.mkdir(parents=True, exist_ok=True)
     if not is_dlc:
-        (install_dir / "Spider-Man2.exe").write_bytes(b"MZ_MOCK")
-        (install_dir / "Redist").mkdir(exist_ok=True)
-        (install_dir / "Redist" / "VC_redist.x64.exe").write_bytes(b"MZ_MOCK")
+        if app_name == "OnlineShooter":
+            (install_dir / "start_protected_game.exe").write_bytes(b"MZ_MOCK")
+            (install_dir / "EasyAntiCheat").mkdir(exist_ok=True)
+            (install_dir / "EasyAntiCheat" / "EasyAntiCheat_EOS_Setup.exe").write_bytes(b"MZ_MOCK")
+            (install_dir / "Game").mkdir(exist_ok=True)
+            (install_dir / "Game" / "EOSSDK-Win64-Shipping.dll").write_bytes(b"MZ_MOCK")
+        else:
+            (install_dir / "Spider-Man2.exe").write_bytes(b"MZ_MOCK")
+            (install_dir / "Redist").mkdir(exist_ok=True)
+            (install_dir / "Redist" / "VC_redist.x64.exe").write_bytes(b"MZ_MOCK")
     else:
         (install_dir / f"{app_name}.dat").write_bytes(b"DLC_MOCK")
 
@@ -943,6 +950,35 @@ class TestEpicBackendMocked(unittest.TestCase):
             DownloadOptions(app_id="ArachnidTwo", dest=dest1, platform="windows")
         )
         self.assertEqual(Path(res.install_path).resolve(), dest1.resolve())
+
+    def test_default_registered_download_manifest_populates_anticheat_and_eos_signals(self) -> None:
+        dest = self.root / "games" / "OnlineShooter"
+        proc = self._run_cli(
+            "download",
+            "OnlineShooter",
+            "--dest",
+            str(dest),
+            "--platform",
+            "windows",
+            "--json",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertTrue(data["ok"])
+        manifest = read_package_manifest(Path(data["manifest_path"]))
+        compat = manifest["compatibility_signals"]
+        self.assertTrue(compat["anticheat"]["detected"])
+        self.assertIn("Easy Anti-Cheat (EAC)", compat["anticheat"]["systems"])
+        self.assertTrue(compat["requires_eos"])
+        self.assertTrue(compat["drm"]["detected"])
+        self.assertEqual(compat["drm"]["third_party_launcher"], "Ubisoft Connect")
+
+        # Offline info on the installed directory must also detect EAC + EOS from files on disk.
+        offline_info = self.backend.info("OnlineShooter", platform="windows", offline=True)
+        self.assertTrue(offline_info.manifest_files_checked)
+        self.assertTrue(offline_info.anticheat.detected)
+        self.assertIn("Easy Anti-Cheat (EAC)", offline_info.anticheat.systems)
+        self.assertTrue(offline_info.requires_eos)
 
     def test_uninstall_fails_on_exit_zero_removal_or_lock_error(self) -> None:
         dest = self.root / "games" / "UninstallFail"

@@ -216,6 +216,33 @@ def _parse_bool_attr(val: Any) -> bool | None:
     return None
 
 
+def _scan_installed_relpaths(install_dir: Path, *, max_depth: int = 4, max_files: int = 5000) -> list[str]:
+    """Collect relative file paths under an installed directory without following symlinks."""
+    if not install_dir.is_dir():
+        return []
+    out: list[str] = []
+    stack: list[tuple[Path, int]] = [(install_dir, 0)]
+    while stack and len(out) < max_files:
+        cur, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        try:
+            entries = sorted(cur.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink():
+                continue
+            if entry.is_dir():
+                if depth < max_depth and not entry.name.startswith("."):
+                    stack.append((entry, depth + 1))
+            elif entry.is_file():
+                out.append(entry.relative_to(install_dir).as_posix())
+                if len(out) >= max_files:
+                    break
+    return out
+
+
 def _extract_release_app_id(entries: Any, *, platform: str = "Windows") -> str:
     """Extract an installable Epic `appId` from Legendary's `installable` or `releaseInfo` array."""
     if not isinstance(entries, list):
@@ -967,6 +994,9 @@ class EpicBackend(StoreBackend):
             executable = None
 
         manifest_files = None if offline else self._list_manifest_files(resolved_app_id, platform=platform)
+        inspected_files = manifest_files
+        if inspected_files is None and install_path and Path(install_path).is_dir():
+            inspected_files = _scan_installed_relpaths(Path(install_path))
 
         (
             can_run_offline,
@@ -979,7 +1009,7 @@ class EpicBackend(StoreBackend):
             game=game,
             manifest=manifest,
             install=inst_entry or {},
-            manifest_files=manifest_files,
+            manifest_files=inspected_files,
         )
 
         # Merge on-disk redistributable scan if already installed
@@ -1058,7 +1088,7 @@ class EpicBackend(StoreBackend):
             drm=drm,
             dlcs=dlcs,
             redistributables=redists,
-            manifest_files_checked=manifest_files is not None,
+            manifest_files_checked=inspected_files is not None,
             default_launch_args=default_launch_args,
         )
 
