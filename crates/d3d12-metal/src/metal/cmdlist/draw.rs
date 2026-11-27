@@ -309,6 +309,94 @@ impl CommandList {
         self.draw_encoder_for(0)
     }
 
+    const NULL_TARGET_VIEW: TargetView = TargetView {
+        resource: 0,
+        format: 0,
+        mip: 0,
+        plane: 0,
+        first_slice: 0,
+        slices: 0,
+        ty: 0,
+        flags: 0,
+    };
+
+    /// Mask `rtvs` to only color attachment slots declared non-`Invalid` by `pso_rtvs`
+    /// into a stack buffer (up to 8 D3D12 color attachments — zero heap allocation).
+    ///
+    /// In D3D12, `OMSetRenderTargets` may bind more RTVs than a subsequent PSO writes
+    /// (excess slots are silently untouched). Metal 4 validation (`MTL_DEBUG_LAYER=1`)
+    /// aborts if a framebuffer attaches a non-nil color texture where the active pipeline's
+    /// `colorAttachments[i].pixelFormat` is `MTLPixelFormatInvalid`.
+    pub(super) fn mask_rtvs_for_formats(
+        rtvs: &[TargetView],
+        pso_rtvs: &[u32],
+    ) -> ([TargetView; 8], usize) {
+        let mut out = [Self::NULL_TARGET_VIEW; 8];
+        let n = rtvs.len().min(8);
+        for (i, v) in rtvs.iter().take(n).enumerate() {
+            let valid = pso_rtvs
+                .get(i)
+                .copied()
+                .is_some_and(|f| crate::format::info(f).mtl != MTLPixelFormat::Invalid);
+            if valid {
+                out[i] = *v;
+            }
+        }
+        (out, n)
+    }
+
+    /// Active RTVs masked against the currently bound graphics or mesh PSO's `rtv_formats`
+    /// into a stack buffer (zero heap allocation on the hot per-draw path).
+    /// When no PSO is bound (e.g. direct render-pass tests), returns `self.gfx.rtvs` unmasked.
+    pub(super) fn effective_rtvs(&self) -> ([TargetView; 8], usize) {
+        let pso_rtvs: Option<&[u32]> = self
+            .gfx
+            .pso
+            .as_ref()
+            .map(|p| p.rtv_formats.as_slice())
+            .or_else(|| self.gfx.mesh.as_ref().map(|m| m.rtv_formats.as_slice()));
+        match pso_rtvs {
+            Some(fmts) => Self::mask_rtvs_for_formats(&self.gfx.rtvs, fmts),
+            None => {
+                let mut out = [Self::NULL_TARGET_VIEW; 8];
+                let n = self.gfx.rtvs.len().min(8);
+                out[..n].copy_from_slice(&self.gfx.rtvs[..n]);
+                (out, n)
+            }
+        }
+    }
+
+    /// DXGI formats of the color attachments actually attached to the open render pass
+    /// (zeroing slots where `open_rtvs[i].resource == 0`) so in-pass ICB vertex expanders
+    /// match the framebuffer's exact color attachment mask under `MTL_DEBUG_LAYER=1`.
+    pub(super) fn open_pass_rtv_formats(&self, pso_rtvs: &[u32]) -> Vec<u32> {
+        let mut out = Vec::with_capacity(pso_rtvs.len());
+        for (i, &f) in pso_rtvs.iter().enumerate() {
+            let attached = self.gfx.open_rtvs.get(i).is_some_and(|v| v.resource != 0);
+            out.push(if attached { f } else { 0 });
+        }
+        out
+    }
+
+    /// True when the currently bound PSO's effective RTV mask matches the staged ICB batch
+    /// (or open render pass), so batching can continue without splitting passes.
+    pub(super) fn batch_rtvs_compatible(&self) -> bool {
+        let (eff_buf, eff_len) = self.effective_rtvs();
+        let eff = &eff_buf[..eff_len];
+        if self.icb.icb_prepass_pending {
+            if let Some(first) = self.icb.icb_segs.first() {
+                let (first_buf, first_len) =
+                    Self::mask_rtvs_for_formats(&self.gfx.rtvs, &first.pso.rtv_formats);
+                return Self::same_targets(&first_buf[..first_len], self.gfx.dsv, eff, self.gfx.dsv);
+            }
+        }
+        if self.gfx.draw_pass {
+            let dsv_norm = self.gfx.dsv.filter(|v| v.resource != 0);
+            return Self::same_targets(&self.gfx.open_rtvs, self.gfx.open_dsv, eff, dsv_norm);
+        }
+        true
+    }
+
     /// Open a render pass for the current targets (loading and storing
     /// their contents, or clearing them when a deferred clear is pending).
     /// Returns the encoder and the render target size.
@@ -316,29 +404,27 @@ impl CommandList {
         &mut self,
         opening_pre_raster_reads: u8,
     ) -> Result<(Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>>, (usize, usize)), String> {
+        let (rtv_buf, rtv_len) = self.effective_rtvs();
+        let rtvs = &rtv_buf[..rtv_len];
+        let dsv = self.gfx.dsv.filter(|v| v.resource != 0);
         if let (Encoder::Render(e), true) = (&self.enc, self.gfx.draw_pass) {
+            let same_open = Self::same_targets(
+                &self.gfx.open_rtvs,
+                self.gfx.open_dsv,
+                rtvs,
+                dsv,
+            );
             if self.opts.opt_rp_split_exact_keep {
-                let dsv_norm = self.gfx.dsv.filter(|v| v.resource != 0);
-                let same_open = Self::same_targets(
-                    &self.gfx.open_rtvs,
-                    self.gfx.open_dsv,
-                    &self.gfx.rtvs,
-                    dsv_norm,
-                );
                 let pending_hit = !self.clears.pending_clears.is_empty()
                     && self.clears.pending_clears.iter().any(|p| {
-                        self.gfx
-                            .rtvs
-                            .iter()
-                            .chain(dsv_norm.iter())
+                        rtvs.iter()
+                            .chain(dsv.iter())
                             .any(|v| v.resource != 0 && v.resource == p.view.resource)
                     });
                 let disc_hit = !self.clears.discards.is_empty()
                     && self.clears.discards.iter().any(|&d| {
-                        self.gfx
-                            .rtvs
-                            .iter()
-                            .chain(dsv_norm.iter())
+                        rtvs.iter()
+                            .chain(dsv.iter())
                             .any(|v| v.resource == d)
                     });
                 if !same_open || pending_hit || disc_hit {
@@ -352,6 +438,8 @@ impl CommandList {
                     }
                     return Ok((e.clone(), self.gfx.pass_size));
                 }
+            } else if !same_open {
+                self.end_encoder();
             } else {
                 if self.rp_sync.rp_kept_writes.iter().any(|kw| kw.eff_s1 == 0) {
                     self.rp_sync.rp_kept_later_draw = true;
@@ -359,8 +447,6 @@ impl CommandList {
                 return Ok((e.clone(), self.gfx.pass_size));
             }
         }
-        let rtvs = self.gfx.rtvs.clone();
-        let dsv = self.gfx.dsv.filter(|v| v.resource != 0);
         if !self.clears.pending_clears.is_empty() {
             // A pending clear of an attached subresource through another
             // view format cannot be folded: it must land first.
@@ -539,7 +625,8 @@ impl CommandList {
             .ok_or("render encoder")?;
         e.setArgumentTable_atStages(&self.table, MTLRenderStages::Vertex | MTLRenderStages::Fragment);
         self.gfx.draw_pass = true;
-        self.gfx.open_rtvs = rtvs;
+        self.gfx.open_rtvs.clear();
+        self.gfx.open_rtvs.extend_from_slice(rtvs);
         self.gfx.open_dsv = dsv;
         self.gfx.had_target_rebind = false;
         self.gfx.dirty = GFX_DIRTY_ALL;
@@ -1376,7 +1463,10 @@ impl CommandList {
             };
             return self.execute_indirect(&layout, 1, a, None, None);
         }
-        if !self.icb.icb_segs.is_empty() && !self.check_batched_draw_uav_hazard(false) {
+        if !self.icb.icb_segs.is_empty()
+            && self.batch_rtvs_compatible()
+            && !self.check_batched_draw_uav_hazard(false)
+        {
             let (pso, prim, dyn_idx, bind, deferred_meta) =
                 self.begin_draw_batched(None, &args.to_bytes())?;
             self.icb.icb_segs.push(DrawSeg {
@@ -1466,7 +1556,10 @@ impl CommandList {
             };
             return self.execute_indirect(&layout, 1, a, None, None);
         }
-        if !self.icb.icb_segs.is_empty() && !self.check_batched_draw_uav_hazard(true) {
+        if !self.icb.icb_segs.is_empty()
+            && self.batch_rtvs_compatible()
+            && !self.check_batched_draw_uav_hazard(true)
+        {
             let (pso, prim, dyn_idx, bind, deferred_meta) =
                 self.begin_draw_batched(Some(f.ir), &args.to_bytes())?;
             if !crate::topology::strip_cut_matches(pso.strip_cut, fmt, self.gfx.topology) {
@@ -1704,5 +1797,40 @@ impl CommandList {
         }
         self.note_stage_ran(ran);
         Ok((e, p))
+    }
+}
+
+#[cfg(test)]
+mod excess_rtv_tests {
+    use super::*;
+
+    #[test]
+    fn mask_rtvs_strips_excess_and_preserves_valid_slots() {
+        const RGBA8: u32 = 28;
+        let tv0 = TargetView { resource: 0x1000, format: RGBA8, mip: 0, plane: 0, first_slice: 0, slices: 1, ty: 2, flags: 0 };
+        let tv1 = TargetView { resource: 0x2000, format: RGBA8, mip: 0, plane: 0, first_slice: 0, slices: 1, ty: 2, flags: 0 };
+
+        // 2 RTVs bound, 1-RTV PSO -> slot 1 masked to NULL.
+        let (m1, n1) = CommandList::mask_rtvs_for_formats(&[tv0, tv1], &[RGBA8]);
+        assert_eq!(n1, 2);
+        assert_eq!(m1[0].resource, 0x1000);
+        assert_eq!(m1[1].resource, 0);
+
+        // 2 RTVs bound, depth-only PSO (empty rtv_formats) -> all slots masked to NULL.
+        let (m0, n0) = CommandList::mask_rtvs_for_formats(&[tv0, tv1], &[]);
+        assert_eq!(n0, 2);
+        assert_eq!(m0[0].resource, 0);
+        assert_eq!(m0[1].resource, 0);
+
+        // 2 RTVs bound, sparse PSO ([0, RGBA8]) -> slot 0 masked, slot 1 kept.
+        let (ms, ns) = CommandList::mask_rtvs_for_formats(&[tv0, tv1], &[0, RGBA8]);
+        assert_eq!(ns, 2);
+        assert_eq!(ms[0].resource, 0);
+        assert_eq!(ms[1].resource, 0x2000);
+
+        // 1 RTV bound, 2-RTV PSO -> slot 0 kept, no panic.
+        let (m2, n2) = CommandList::mask_rtvs_for_formats(&[tv0], &[RGBA8, RGBA8]);
+        assert_eq!(n2, 1);
+        assert_eq!(m2[0].resource, 0x1000);
     }
 }

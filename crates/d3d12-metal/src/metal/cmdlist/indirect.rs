@@ -1245,7 +1245,7 @@ impl CommandList {
         args_cpu: Option<&[u8]>,
         count: Option<u64>,
     ) -> Result<(), String> {
-        if !matches!(l.work, Work::Draw | Work::DrawIndexed) {
+        if !matches!(l.work, Work::Draw | Work::DrawIndexed | Work::DispatchMesh) {
             self.disc_unmark(0);
         }
         if max_count == 0 {
@@ -1281,6 +1281,12 @@ impl CommandList {
         }
         let ws = l.work.size();
         let pred = self.predication;
+        if mesh
+            && (l.needs_expansion(count.is_some()) || pred.is_some() || max_count > 1)
+            && indirect_icb::enabled()
+        {
+            return self.execute_indirect_mesh_icb(l, max_count, args, count);
+        }
         if !compute
             && !mesh
             && (l.needs_expansion(count.is_some()) || pred.is_some())
@@ -2386,6 +2392,9 @@ impl CommandList {
             IOS_ICB_PASS_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.end_encoder();
         }
+        if self.icb.icb_prepass_pending && !self.batch_rtvs_compatible() {
+            self.flush_draw_batch(false);
+        }
         let p = self.gfx.pso.clone().ok_or("draw without a graphics PSO")?;
         let t = crate::topology::topology(self.gfx.topology)
             .ok_or_else(|| format!("primitive topology {}", self.gfx.topology))?;
@@ -2770,6 +2779,191 @@ impl CommandList {
         self.icb.enc_used_icb = true;
         // ICB commands bind their own buffers: restore the encoder's table
         // and state for later direct draws.
+        e.setArgumentTable_atStages(&self.table, MTLRenderStages::Vertex | MTLRenderStages::Fragment);
+        self.rp_sync.enc_render_cache.mesh_stages_bound = false;
+        self.invalidate_table_cache();
+        self.gfx.dirty = GFX_DIRTY_ALL;
+        Ok(())
+    }
+
+    /// GPU-encoded `ExecuteIndirect(DispatchMesh)` using `MTLIndirectCommandTypeDrawMeshThreadgroups`
+    /// and an in-pass `Point` vertex expander (`aw2_ei_mesh_icb_vs`), staying inside the open
+    /// TBDR render pass without splitting into a compute encoder, wiping discard marks, or
+    /// issuing a `0..max_count` CPU loop.
+    fn execute_indirect_mesh_icb(
+        &mut self,
+        l: &IndirectLayout,
+        max_count: u32,
+        args: u64,
+        count: Option<u64>,
+    ) -> Result<(), String> {
+        if !self.icb.icb_segs.is_empty() {
+            self.flush_draw_batch(true);
+        }
+        let p = self
+            .gfx
+            .mesh
+            .clone()
+            .ok_or("ExecuteIndirect DispatchMesh without a mesh PSO")?;
+        let icb_pso = p.icb_pso()?;
+        let (tlab_size, patches) = if l.patches.is_empty() {
+            (0, Vec::new())
+        } else {
+            let rs = self.gfx_root.rs.as_ref().ok_or(
+                "ExecuteIndirect with root argument changes but no root signature",
+            )?;
+            (rs.layout().size, l.kernel_patches(rs.layout())?)
+        };
+        let ts = indirect::tlab_stride(tlab_size);
+        let has_patches = !patches.is_empty();
+        let has_object = p.object_threads.is_some();
+        let has_ps = p.pixel.is_some();
+        let mut before_icb = MTLStages::Mesh;
+        if has_object {
+            before_icb |= MTLStages::Object;
+        }
+        if has_ps {
+            before_icb |= MTLStages::Fragment;
+        }
+
+        let mut q = crate::mesh::MeshIcbParams {
+            args,
+            count: count.unwrap_or(0),
+            pred: self.predication.map_or(0, |pr| pr.gpu_va),
+            pred_op: self.predication.map_or(0, |pr| pr.op),
+            heap: self.heaps[0],
+            sampler_heap: self.heaps[1],
+            stride: l.stride,
+            max_count,
+            work_offset: l.work_offset,
+            tlab_size,
+            tlab_stride: ts,
+            npatch: patches.len() as u32,
+            obj_threads: p.object_threads.unwrap_or([1, 1, 1]),
+            mesh_threads: p.mesh_threads,
+            has_object: u32::from(has_object),
+            has_ps: u32::from(has_ps),
+            ..Default::default()
+        };
+        q.patches[..patches.len()].copy_from_slice(&patches);
+
+        stats::inc(&stats::c::ei_icb);
+        let cb_ptr = Retained::as_ptr(&self.cb) as usize;
+
+        let (e, icb) = if indirect_icb::in_pass() {
+            // Preserve `pass_uav_hazard` ordering, render-pass barriers, dynamic state, and
+            // masked RTV attachments via `begin_mesh(true)` before allocating scratch/ICB slots.
+            let (e, _p) = self.begin_mesh(true)?;
+            let eff_fmts = self.open_pass_rtv_formats(&p.rtv_formats);
+            let ex = crate::mesh::mesh_icb_expander(&eff_fmts, p.sample_count)?;
+            let (icb, location) = crate::mesh::alloc_mesh_icb(cb_ptr, max_count, has_object)?;
+            q.icb = unsafe { std::mem::transmute::<MTLResourceID, u64>(icb.gpuResourceID()) };
+            q.location = location;
+            let scratch = self.icb.icb_scratch.clone().ok_or("command list is not open")?;
+            {
+                let mut sr = scratch.lock().unwrap();
+                q.range_out = sr.alloc(8, 16)?.0;
+                if has_patches {
+                    q.tlab_out = sr.alloc(ts as usize * max_count as usize, 256)?.0;
+                }
+            }
+            let root = if self.gfx_root.rs.is_some() { self.gfx_root.bound } else { 0 };
+            q.tlab_in = root;
+            q.tlab_static = root;
+            let ring = self.ring.clone().ok_or("command list is not open")?;
+            let params_va = ring.lock().unwrap().upload(q.bytes(), 256)?;
+            self.icb.enc_icb_cmds = self.icb.enc_icb_cmds.saturating_add(max_count);
+
+            if icb_reuse_enabled() && !self.icb.enc_icb_war_done {
+                e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                    MTLStages::All,
+                    MTLStages::Vertex,
+                    MTL4VisibilityOptions::Device,
+                );
+                self.icb.enc_icb_war_done = true;
+            }
+            if self.occlusion.is_some() {
+                unsafe { e.setVisibilityResultMode_offset(MTLVisibilityResultMode::Disabled, 0) };
+            }
+            self.rp_sync
+                .enc_render_cache
+                .apply_pso(&e, &ex, self.opts.opt_fast_enc_state);
+            // Index 0 is the descriptor heap slot; `bind_table` restores it after expansion.
+            self.set_table_addr(params_va, 0);
+            unsafe {
+                e.drawPrimitives_vertexStart_vertexCount(
+                    MTLPrimitiveType::Point,
+                    0,
+                    max_count as usize,
+                );
+            }
+            self.note_stage_ran(MTLStages::Vertex);
+            e.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                MTLStages::Vertex,
+                before_icb,
+                MTL4VisibilityOptions::Device,
+            );
+            if let Some(o) = &self.occlusion {
+                let mode = if o.binary {
+                    MTLVisibilityResultMode::Boolean
+                } else {
+                    MTLVisibilityResultMode::Counting
+                };
+                unsafe { e.setVisibilityResultMode_offset(mode, o.index as usize * 8) };
+            }
+            self.bind_table(root);
+            (e, icb)
+        } else {
+            let k = crate::mesh::mesh_icb_kernel()?;
+            let root = self.flush_root(false)?;
+            let ce = self.compute().ok_or("compute encoder")?;
+            let (icb, location) = crate::mesh::alloc_mesh_icb(cb_ptr, max_count, has_object)?;
+            q.icb = unsafe { std::mem::transmute::<MTLResourceID, u64>(icb.gpuResourceID()) };
+            q.location = location;
+            let scratch = self.icb.icb_scratch.clone().ok_or("command list is not open")?;
+            {
+                let mut sr = scratch.lock().unwrap();
+                q.range_out = sr.alloc(8, 16)?.0;
+                if has_patches {
+                    q.tlab_out = sr.alloc(ts as usize * max_count as usize, 256)?.0;
+                }
+            }
+            q.tlab_in = root;
+            q.tlab_static = root;
+            let ring = self.ring.clone().ok_or("command list is not open")?;
+            let params_va = ring.lock().unwrap().upload(q.bytes(), 256)?;
+            self.icb.enc_icb_cmds = self.icb.enc_icb_cmds.saturating_add(max_count);
+
+            if icb_reuse_enabled() && !self.icb.enc_icb_war_done {
+                ce.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                    MTLStages::All,
+                    MTLStages::Dispatch,
+                    MTL4VisibilityOptions::Device,
+                );
+                self.icb.enc_icb_war_done = true;
+            }
+            self.pt_note_util(pt::synth::EI_EXPAND, 1);
+            ce.setComputePipelineState(k);
+            self.compute_pso_bound = false;
+            self.set_table_addr(params_va, 0);
+            ce.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: (max_count as usize).div_ceil(64), height: 1, depth: 1 },
+                MTLSize { width: 64, height: 1, depth: 1 },
+            );
+            self.note_stage_ran(MTLStages::Dispatch);
+            self.produced(MTLStages::Dispatch, before_icb);
+            (self.begin_mesh(true)?.0, icb)
+        };
+
+        self.rp_sync
+            .enc_render_cache
+            .apply_pso(&e, icb_pso, self.opts.opt_fast_enc_state);
+        if let Some(m) = self.pt_cur() {
+            m.icb += 1;
+        }
+        unsafe { e.executeCommandsInBuffer_indirectBuffer(&icb, q.range_out) };
+        self.icb.enc_used_icb = true;
+        // Restore the encoder's argument table and dirty flags after ICB execution.
         e.setArgumentTable_atStages(&self.table, MTLRenderStages::Vertex | MTLRenderStages::Fragment);
         self.rp_sync.enc_render_cache.mesh_stages_bound = false;
         self.invalidate_table_cache();
