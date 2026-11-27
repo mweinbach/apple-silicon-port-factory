@@ -274,8 +274,10 @@ pub struct MetalBackend {
     desc_heaps: HashMap<u64, LiveDescHeap>,
     heaps: HashMap<u64, Arc<Heap>>,
     resources: HashMap<u64, Arc<Resource>>,
-    /// Recorded buffer GPU VA -> `(size_bytes, live_gpu_va)`.
-    va_map: BTreeMap<u64, (u64, u64)>,
+    /// Recorded buffer GPU VA -> live `(resource_id, size_bytes, live_gpu_va)` entries.
+    va_map: BTreeMap<u64, Vec<(u64, u64, u64)>>,
+    /// Live buffer resource ID -> recorded GPU VA key in `va_map` (for cleanup on `Release`).
+    resource_vas: HashMap<u64, u64>,
     root_sigs: HashMap<u64, Arc<RootSignature>>,
     psos: HashMap<u64, LivePso>,
     cmd_sigs: HashMap<u64, LiveCmdSig>,
@@ -318,6 +320,7 @@ impl MetalBackend {
             heaps: HashMap::new(),
             resources: HashMap::new(),
             va_map: BTreeMap::new(),
+            resource_vas: HashMap::new(),
             root_sigs: HashMap::new(),
             psos: HashMap::new(),
             cmd_sigs: HashMap::new(),
@@ -586,20 +589,35 @@ impl MetalBackend {
         self.resources.get(&id)
     }
 
-    fn register_va(&mut self, rec_va: u64, res: &Resource) {
+    fn register_va(&mut self, res_id: u64, rec_va: u64, res: &Resource) {
         if rec_va != 0 && res.gpu_va != 0 && res.desc.is_buffer() {
-            self.va_map.insert(rec_va, (res.desc.Width.max(1), res.gpu_va));
+            let size = res.desc.Width.max(1);
+            self.va_map.entry(rec_va).or_default().push((res_id, size, res.gpu_va));
+            self.resource_vas.insert(res_id, rec_va);
         }
     }
 
-    fn translate_gpu_va(&self, rec_va: u64) -> u64 {
+    fn unregister_va(&mut self, res_id: u64) {
+        if let Some(rec_va) = self.resource_vas.remove(&res_id) {
+            if let Some(entries) = self.va_map.get_mut(&rec_va) {
+                entries.retain(|&(id, _, _)| id != res_id);
+                if entries.is_empty() {
+                    self.va_map.remove(&rec_va);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn translate_gpu_va(&self, rec_va: u64) -> u64 {
         if rec_va == 0 {
             return 0;
         }
-        if let Some((&base, &(size, live_base))) = self.va_map.range(..=rec_va).next_back() {
+        for (&base, entries) in self.va_map.range(..=rec_va).rev() {
             let off = rec_va - base;
-            if off <= size {
-                return live_base + off;
+            for &(_, size, live_base) in entries.iter().rev() {
+                if off <= size {
+                    return live_base + off;
+                }
             }
         }
         rec_va
@@ -917,7 +935,7 @@ impl Backend for MetalBackend {
                     Resource::new_committed_default(&rd, &hp, &format!("replay res {resource:#x}"))
                         .map_err(|e| format!("Resource::new_committed: {e:?}"))?,
                 );
-                self.register_va(*gpu_va, &res);
+                self.register_va(*resource, *gpu_va, &res);
                 self.resources.insert(*resource, res);
                 Ok(Handled::Done)
             }
@@ -934,7 +952,7 @@ impl Backend for MetalBackend {
                     Resource::new_placed_default(h, *offset, &rd, &format!("replay placed {resource:#x}"))
                         .map_err(|e| format!("Resource::new_placed: {e:?}"))?,
                 );
-                self.register_va(*gpu_va, &res);
+                self.register_va(*resource, *gpu_va, &res);
                 self.resources.insert(*resource, res);
                 Ok(Handled::Done)
             }
@@ -1009,6 +1027,7 @@ impl Backend for MetalBackend {
             }
             Call::Release { object } => {
                 if let Some(r) = self.resources.remove(object) {
+                    self.unregister_va(*object);
                     self.retired.push(Box::new(r));
                 } else if let Some(h) = self.heaps.remove(object) {
                     self.retired.push(Box::new(h));

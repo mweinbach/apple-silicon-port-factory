@@ -2358,3 +2358,119 @@ fn metal_backend_retains_bound_dsv_after_release_and_drain() {
     assert_eq!(pixel_at(&img, 48, 48), [192, 192, 192]);
 }
 
+#[test]
+fn metal_backend_va_map_removes_released_buffers_and_preserves_aliases() {
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::types::{dim, heap_type, HeapDesc, HeapProperties, ResourceDesc};
+
+    if d3d12_metal::metal::device().is_none() {
+        return;
+    }
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+    }
+
+    let hp_up = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+    let buf_desc = |w: u64| ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: w,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        ..Default::default()
+    };
+    let heap_desc = HeapDesc {
+        SizeInBytes: 65536,
+        Properties: hp_up,
+        Alignment: 65536,
+        Flags: 0,
+    };
+
+    // Case 1: release buffer 10 at 0x4_2000, then allocate larger buffer 11 spanning
+    // 0x4_1000..0x4_4000; 0x4_2100 must translate into buffer 11 rather than released buffer 10.
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();
+    w.write(
+        &Call::CreateCommittedResource {
+            device: 1,
+            resource: 10,
+            heap_properties: bytes_of(&hp_up),
+            heap_flags: 0,
+            desc: bytes_of(&buf_desc(0x1000)),
+            initial_state: 0,
+            clear_value: None,
+            gpu_va: 0x4_2000,
+        },
+        0,
+    )
+    .unwrap();
+    w.write(&Call::Release { object: 10 }, 0).unwrap();
+    w.write(
+        &Call::CreateCommittedResource {
+            device: 1,
+            resource: 11,
+            heap_properties: bytes_of(&hp_up),
+            heap_flags: 0,
+            desc: bytes_of(&buf_desc(0x3000)),
+            initial_state: 0,
+            clear_value: None,
+            gpu_va: 0x4_1000,
+        },
+        0,
+    )
+    .unwrap();
+    // Case 2: two live placed buffers aliasing the same recorded GPU VA 0x4_8000;
+    // releasing one must keep the remaining live alias resolvable.
+    w.write(&Call::CreateHeap { device: 1, heap: 20, desc: bytes_of(&heap_desc) }, 0).unwrap();
+    w.write(
+        &Call::CreatePlacedResource {
+            device: 1,
+            resource: 12,
+            heap: 20,
+            offset: 0,
+            desc: bytes_of(&buf_desc(0x1000)),
+            initial_state: 0,
+            clear_value: None,
+            gpu_va: 0x4_8000,
+        },
+        0,
+    )
+    .unwrap();
+    w.write(
+        &Call::CreatePlacedResource {
+            device: 1,
+            resource: 13,
+            heap: 20,
+            offset: 0,
+            desc: bytes_of(&buf_desc(0x1000)),
+            initial_state: 0,
+            clear_value: None,
+            gpu_va: 0x4_8000,
+        },
+        0,
+    )
+    .unwrap();
+    w.write(&Call::Release { object: 12 }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+
+    let live11 = backend.resource(11).expect("buffer 11 live").gpu_va;
+    assert_eq!(backend.translate_gpu_va(0x4_2100), live11 + 0x1100);
+
+    let live13 = backend.resource(13).expect("aliased buffer 13 live").gpu_va;
+    assert_eq!(backend.translate_gpu_va(0x4_8100), live13 + 0x100);
+
+    // Releasing the last alias removes 0x4_8000 from va_map completely.
+    let mut w2 = Writer::new(Vec::new()).unwrap();
+    w2.write(&Call::Release { object: 13 }, 0).unwrap();
+    let rep2 = replay::replay(&w2.into_inner(), &mut backend, None, 100).unwrap();
+    assert_eq!(rep2.failed.total, 0, "{rep2}");
+    assert_eq!(backend.translate_gpu_va(0x4_8100), 0x4_8100);
+}
+
