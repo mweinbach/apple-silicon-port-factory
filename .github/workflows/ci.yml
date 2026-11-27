@@ -48,6 +48,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Audit submodules, db storage, crate boundaries, tracked binaries and personal paths
         run: .agents/skills/audit-repo-hygiene/scripts/audit_repo_hygiene.sh
+      - name: Unit tests for tools/port-acquire (offline mocked backends)
+        run: python3 -m unittest discover -s tools/port_acquire/tests -v
 
   test:
     name: Build and test (macOS arm64)
