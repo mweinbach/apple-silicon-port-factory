@@ -2072,6 +2072,29 @@ fn metal_backend_bench_rejects_cross_frame_unsignaled_setup_wait() {
         .err()
         .expect("bench must reject setup prefix with unsignaled cross-frame fence wait instead of deadlocking");
     assert!(err.to_string().contains("blocked on fence signals"), "{err}");
+
+    // Wait-only setup queue: `QueueWait(F, 1)` is enqueued in setup without any `ExecuteCommandLists`
+    // until the final frame; bench must still detect the unsatisfied wait before replacing `F`.
+    let mut w2 = Writer::new(Vec::new()).unwrap();
+    w2.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w2.write(&Call::CreateCommandQueue { device: D, queue: Q_GFX, desc: bytes_of(&qd_gfx) }, 0).unwrap();
+    w2.write(&Call::CreateCommandQueue { device: D, queue: Q_COMP, desc: bytes_of(&qd_comp) }, 0).unwrap();
+    w2.write(&Call::CreateCommandAllocator { device: D, allocator: A, list_type: 0 }, 0).unwrap();
+    w2.write(&Call::CreateFence { device: D, fence: F, initial_value: 0, flags: 0 }, 0).unwrap();
+    w2.write(&Call::CreateCommandList { device: D, list: L, list_type: 0, allocator: 0, initial_pso: 0 }, 0).unwrap();
+    w2.write(&Call::QueueWait { queue: Q_GFX, fence: F, value: 1 }, 0).unwrap();
+    w2.write(&Call::FrameEnd { frame: 0 }, 0).unwrap();
+    // Final frame submits consumer work on Q_GFX and signals F=1 on Q_COMP:
+    w2.write(&Call::Reset { list: L, allocator: A, pso: 0 }, 0).unwrap();
+    w2.write(&Call::Close { list: L }, 0).unwrap();
+    w2.write(&Call::ExecuteCommandLists { queue: Q_GFX, lists: U64s::from_slice(&lists) }, 0).unwrap();
+    w2.write(&Call::QueueSignal { queue: Q_COMP, fence: F, value: 1 }, 0).unwrap();
+    w2.write(&Call::FrameEnd { frame: 1 }, 0).unwrap();
+
+    let err2 = bench::run_bench(&w2.into_inner(), &opts)
+        .err()
+        .expect("bench must reject wait-only setup queue with unsatisfied cross-frame fence wait");
+    assert!(err2.to_string().contains("blocked on fence signals"), "{err2}");
 }
 
 #[test]

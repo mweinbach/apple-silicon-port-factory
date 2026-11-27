@@ -367,8 +367,9 @@ impl MetalBackend {
         self.retired.clear();
     }
 
-    /// Return IDs of any busy queues currently blocked on fence waits that have not been
-    /// transitively satisfied by prior signals (draining them would deadlock).
+    /// Return IDs of any queues (including wait-only queues without submitted command lists)
+    /// currently blocked on fence waits that have not been transitively satisfied by prior
+    /// signals (draining them or replacing their fences would deadlock).
     pub fn blocked_queues(&self) -> Vec<u64> {
         let mut blocked: HashSet<u64> = HashSet::new();
         loop {
@@ -393,12 +394,7 @@ impl MetalBackend {
                 break;
             }
         }
-        let mut out: Vec<u64> = self
-            .queue_busy
-            .iter()
-            .copied()
-            .filter(|qid| blocked.contains(qid))
-            .collect();
+        let mut out: Vec<u64> = blocked.into_iter().collect();
         out.sort_unstable();
         out
     }
@@ -424,7 +420,7 @@ impl MetalBackend {
             self.queue_busy.remove(&qid);
             self.queue_waits.remove(&qid);
         }
-        if self.queue_busy.is_empty() {
+        if self.queue_busy.is_empty() && blocked.is_empty() {
             self.retired.clear();
         }
     }
