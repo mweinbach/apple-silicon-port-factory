@@ -525,6 +525,27 @@ class SteamBackend(StoreBackend):
         acf_map = self._scan_steamapps_manifests()
         return acf_map.get(str(app_id))
 
+    def existing_managed_install_path(
+        self,
+        app_id: str,
+        *,
+        platform: str = "windows",
+    ) -> Path | None:
+        """Return the registered `port-acquire` install path for `app_id` matching `platform`.
+
+        Intentionally ignores unmanaged Steam-client installations under `steamapps/common/`
+        so downloading Windows depots without `--dest` never overwrites a native macOS Steam
+        client installation.
+        """
+        resolved_id = self._resolve_app_id(app_id, offline=True)
+        entry = self._load_installs().get(resolved_id)
+        if not isinstance(entry, dict) or not entry.get("install_path"):
+            return None
+        entry_plat = str(entry.get("platform") or "windows").strip().lower()
+        if entry_plat != platform.strip().lower():
+            return None
+        return Path(str(entry["install_path"])).expanduser().resolve()
+
     # ------------------------------------------------------------------
     # DepotDownloader Execution
     # ------------------------------------------------------------------

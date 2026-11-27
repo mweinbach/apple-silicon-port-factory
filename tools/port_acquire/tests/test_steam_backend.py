@@ -1947,6 +1947,35 @@ class SteamBackendTests(unittest.TestCase):
             self.assertEqual(rc2, 0)
             self.assertEqual(Path(dl2["install_path"]), first_path)
             self.assertFalse((default_base / "Sample Action RPG").exists())
+
+            # Unmanaged native macOS Steam-client install must NOT be targeted by a Windows download
+            sa_dir = self.steam_home / "steamapps"
+            native_dir = sa_dir / "common" / "NativeMacGame"
+            native_dir.mkdir(parents=True, exist_ok=True)
+            (native_dir / "NativeApp.txt").write_text("MACOS_NATIVE", encoding="utf-8")
+            (sa_dir / "appmanifest_555000.acf").write_text(
+                textwrap.dedent(
+                    """\
+                    "AppState"
+                    {
+                        "appid"        "555000"
+                        "name"         "Native Mac Game"
+                        "installdir"   "NativeMacGame"
+                        "buildid"      "100"
+                        "LastOwner"    "76561198000000002"
+                    }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            rc3, dl3 = run_cli(
+                ["--store", "steam", "--json", "download", "555000", "--platform", "windows"]
+            )
+            self.assertEqual(rc3, 0)
+            win_path = Path(dl3["install_path"])
+            self.assertNotEqual(win_path.resolve(), native_dir.resolve())
+            self.assertTrue(str(win_path).startswith(str(default_base.resolve())))
+            self.assertEqual((native_dir / "NativeApp.txt").read_text(encoding="utf-8"), "MACOS_NATIVE")
         finally:
             for k, v in old_env.items():
                 if v is None:

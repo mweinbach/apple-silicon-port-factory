@@ -621,16 +621,33 @@ def _dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "download":
         if args.dest is None:
-            info_hint: GameInfo | None = None
-            try:
-                info_hint = backend.info(args.app, platform=args.platform, offline=True)
-            except AcquireError:
-                info_hint = None
-            if info_hint is not None and info_hint.install_path:
-                dest = Path(info_hint.install_path).expanduser().resolve()
+            managed_path: Path | None = None
+            has_managed_hook = hasattr(backend, "existing_managed_install_path")
+            if has_managed_hook:
+                try:
+                    managed_path = backend.existing_managed_install_path(
+                        args.app, platform=args.platform
+                    )
+                except AcquireError:
+                    managed_path = None
+            if managed_path is not None:
+                dest = managed_path
             else:
-                title_hint = info_hint.title if info_hint is not None else None
-                dest = _default_dest(store_name, args.app, title=title_hint)
+                info_hint: GameInfo | None = None
+                try:
+                    info_hint = backend.info(args.app, platform=args.platform, offline=True)
+                except AcquireError:
+                    info_hint = None
+                if (
+                    not has_managed_hook
+                    and info_hint is not None
+                    and info_hint.install_path
+                    and info_hint.platform == args.platform
+                ):
+                    dest = Path(info_hint.install_path).expanduser().resolve()
+                else:
+                    title_hint = info_hint.title if info_hint is not None else None
+                    dest = _default_dest(store_name, args.app, title=title_hint)
         else:
             dest = Path(args.dest).expanduser().resolve()
 
