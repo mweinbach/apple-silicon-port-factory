@@ -364,11 +364,7 @@ pub(crate) fn resolve_temporal_inputs(
         pre_exposure,
         auto_exposure,
         use_exposure_texture: effective_exp_tex,
-        // `d3d12_metal::CommandList::upscale_temporal` enables dynamic-resolution
-        // scaling automatically whenever `render_size` is smaller than the input
-        // texture (`x0 != in_w || y0 != in_h`); fixed-res XeSS titles pass full
-        // `render_size != [0, 0]` and should use a fixed-dimension scaler.
-        dynamic_resolution: false,
+        dynamic_resolution: render_size != [0, 0],
         output_resolution_motion_vectors: high_res_mv,
         jittered_motion_vectors: jittered_mv,
     }
@@ -963,7 +959,7 @@ mod tests {
         assert!(d_first.depth_reversed);
         assert!(d_first.output_resolution_motion_vectors);
         assert!(d_first.jittered_motion_vectors);
-        assert!(!d_first.dynamic_resolution);
+        assert!(d_first.dynamic_resolution);
         assert!(!d_first.auto_exposure);
 
         // Subsequent frame without resetHistory does not reset.

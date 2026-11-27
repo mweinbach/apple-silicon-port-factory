@@ -512,11 +512,7 @@ fn build_temporal_desc(
         depth_reversed: (create_flags & NGX_DLSS_FLAG_DEPTH_INVERTED) != 0,
         pre_exposure,
         auto_exposure,
-        // `d3d12_metal::CommandList::upscale_temporal` enables dynamic-resolution
-        // scaling automatically whenever `render_size` is smaller than the input
-        // texture (`x0 != in_w || y0 != in_h`); fixed-res DLSS titles always pass
-        // full `render_size != [0, 0]` and should use a fixed-dimension scaler.
-        dynamic_resolution: false,
+        dynamic_resolution: render_size != [0, 0],
         output_resolution_motion_vectors: out_res_mv,
         jittered_motion_vectors: (create_flags & NGX_DLSS_FLAG_MV_JITTERED) != 0,
         color_origin: [0, 0],
