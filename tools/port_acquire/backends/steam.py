@@ -546,6 +546,45 @@ class SteamBackend(StoreBackend):
             return None
         return Path(str(entry["install_path"])).expanduser().resolve()
 
+    def _is_unmanaged_steam_client_install(
+        self,
+        resolved_id: str,
+        entry: dict[str, Any],
+    ) -> bool:
+        """Return True when `entry` came from a Steam-client `.acf` rather than `port-acquire`."""
+        return bool(entry.get("manifest_path")) and resolved_id not in self._load_installs()
+
+    def _detect_acf_install_platform(self, install_path: Path) -> str | None:
+        """Best-effort shallow detection of whether an unmanaged Steam-client folder is macOS or Windows."""
+        if not install_path.is_dir():
+            return None
+        has_app = False
+        has_exe = False
+        stack: list[tuple[Path, int]] = [(install_path, 0)]
+        while stack:
+            cur, depth = stack.pop()
+            if depth > 2:
+                continue
+            try:
+                children = list(cur.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if child.is_symlink():
+                    continue
+                low = child.name.lower()
+                if child.is_dir() and low.endswith(".app"):
+                    has_app = True
+                elif child.is_file() and low.endswith(".exe"):
+                    has_exe = True
+                elif child.is_dir() and depth < 2 and not child.name.startswith("."):
+                    stack.append((child, depth + 1))
+        if has_app and not has_exe:
+            return "macos"
+        if has_exe and not has_app:
+            return "windows"
+        return None
+
     # ------------------------------------------------------------------
     # DepotDownloader Execution
     # ------------------------------------------------------------------
@@ -1949,10 +1988,11 @@ class SteamBackend(StoreBackend):
                 details={"skipped_depots": skipped_base},
             )
 
-        # Record downloaded DLC depots & manifest versions from the processed depots
+        # Record downloaded DLC depots & manifest versions ONLY when depot transfer evidence exists.
         downloaded_dlcs: list[str] = []
         dlc_versions: dict[str, str] = {}
         dlc_depots_recorded: dict[str, list[str]] = {}
+        explicit_dlc_set = {str(d) for d in options.dlcs}
         if target_dlcs:
             dlc_to_depots, depot_to_dlc = self._resolve_dlc_depot_map(
                 resolved_id,
@@ -1967,8 +2007,21 @@ class SteamBackend(StoreBackend):
                     for did in dep_ids
                     if did in downloaded_depots_by_id
                 ]
-                if dep_ids:
-                    dlc_depots_recorded[dlc_id] = dep_ids
+                if not this_dlc_depots:
+                    if dlc_id in explicit_dlc_set:
+                        raise AcquireError(
+                            f"Could not resolve or confirm depot transfer for requested DLC AppID "
+                            f"{dlc_id} under base Steam AppID {resolved_id} (ensure local Steam "
+                            "appcache/appinfo.vdf is present or that the DLC has an accessible "
+                            "depot under the base app).",
+                            code="dlc_depot_not_found",
+                            details={"app_id": resolved_id, "dlc_app_id": dlc_id},
+                        )
+                    # Do not falsely record an unverified/unmapped DLC as installed.
+                    continue
+                dlc_depots_recorded[dlc_id] = [
+                    str(d["depot_id"]) for d in this_dlc_depots if d.get("depot_id")
+                ]
                 dlc_ver = self._version_from_manifests(this_dlc_depots)
                 if dlc_ver:
                     dlc_versions[dlc_id] = dlc_ver
@@ -2239,6 +2292,25 @@ class SteamBackend(StoreBackend):
                 "Download it first with `tools/port-acquire --store steam download <appid>`."
             )
         install_path = Path(str(entry["install_path"]))
+        unmanaged_acf = self._is_unmanaged_steam_client_install(resolved_id, entry)
+        if unmanaged_acf:
+            if repair:
+                raise AcquireError(
+                    f"Steam AppID {resolved_id} is an unmanaged Steam-client installation "
+                    f"({install_path}); refusing to repair it in-place with DepotDownloader. "
+                    "Verify it via the Steam client or download a separate managed Windows copy "
+                    "with `tools/port-acquire --store steam download <appid> --platform windows`.",
+                    code="unmanaged_steam_install",
+                    details={"app_id": resolved_id, "install_path": str(install_path)},
+                )
+            detected_plat = self._detect_acf_install_platform(install_path)
+            if detected_plat == "macos":
+                raise AcquireError(
+                    f"Steam AppID {resolved_id} at {install_path} is a native macOS Steam-client "
+                    "installation; refusing to verify it against Windows manifests.",
+                    code="unmanaged_steam_install",
+                    details={"app_id": resolved_id, "install_path": str(install_path), "platform": "macos"},
+                )
         if not install_path.is_dir():
             if not repair:
                 return VerifyResult(
@@ -2555,6 +2627,25 @@ class SteamBackend(StoreBackend):
                 f"Steam AppID {resolved_id} is not installed; use `download` instead of `update`."
             )
         install_path = Path(str(entry["install_path"]))
+        unmanaged_acf = self._is_unmanaged_steam_client_install(resolved_id, entry)
+        if unmanaged_acf:
+            if not check_only:
+                raise AcquireError(
+                    f"Steam AppID {resolved_id} is an unmanaged Steam-client installation "
+                    f"({install_path}); refusing to overwrite it in-place with DepotDownloader. "
+                    "Download a separate managed Windows copy with "
+                    "`tools/port-acquire --store steam download <appid> --platform windows`.",
+                    code="unmanaged_steam_install",
+                    details={"app_id": resolved_id, "install_path": str(install_path)},
+                )
+            detected_plat = self._detect_acf_install_platform(install_path)
+            if detected_plat == "macos":
+                raise AcquireError(
+                    f"Steam AppID {resolved_id} at {install_path} is a native macOS Steam-client "
+                    "installation; refusing to check Windows updates against it.",
+                    code="unmanaged_steam_install",
+                    details={"app_id": resolved_id, "install_path": str(install_path), "platform": "macos"},
+                )
         platform = str(entry.get("platform") or "windows")
         branch = str(entry.get("branch") or "public")
         old_version = str(entry.get("build_id") or "") or None

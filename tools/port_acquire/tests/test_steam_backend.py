@@ -2068,6 +2068,90 @@ class SteamBackendTests(unittest.TestCase):
         self.assertFalse(ver_missing_redist.ok)
         self.assertEqual(ver_missing_redist.missing_files, ["_CommonRedist/228990/DXSETUP.exe"])
 
+    def test_unmanaged_steam_client_install_rejected_for_inplace_update_and_repair(self) -> None:
+        sa_dir = self.steam_home / "steamapps"
+        native_dir = sa_dir / "common" / "NativeMacTitle"
+        (native_dir / "NativeMacTitle.app" / "Contents").mkdir(parents=True, exist_ok=True)
+        (native_dir / "NativeMacTitle.app" / "Contents" / "Info.plist").write_text("<plist/>", encoding="utf-8")
+        (sa_dir / "appmanifest_1091500.acf").write_text(
+            textwrap.dedent(
+                """\
+                "AppState"
+                {
+                    "appid"        "1091500"
+                    "name"         "Native Mac Title"
+                    "installdir"   "NativeMacTitle"
+                    "buildid"      "100"
+                    "LastOwner"    "76561198000000002"
+                    "MountedDepots"
+                    {
+                        "1091509"  "111111"
+                    }
+                }
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        backend = self._make_backend()
+        for fn in (
+            lambda: backend.update("1091500", check_only=False),
+            lambda: backend.update("1091500", check_only=True),
+            lambda: backend.verify("1091500", repair=True),
+            lambda: backend.verify("1091500", repair=False),
+        ):
+            with self.assertRaises(AcquireError) as ctx:
+                fn()
+            self.assertEqual(ctx.exception.code, "unmanaged_steam_install")
+
+        # Must never write Windows files into the native macOS Steam directory
+        self.assertFalse((native_dir / "bin" / "x64" / "SampleGame.exe").exists())
+
+    def test_explicit_dlc_without_resolved_depot_transfer_fails_honestly(self) -> None:
+        # No appinfo.vdf and no depot matching DLC 2138330 (only base depot 1091501 exists)
+        def fake_http(url: str):
+            if "appdetails" in url:
+                return {
+                    "1091500": {
+                        "success": True,
+                        "data": {
+                            "name": "Sample Action RPG",
+                            "dlc": [2138330],
+                        },
+                    }
+                }
+            return {}
+
+        backend = self._make_backend(allow_network=True, http_get_json=fake_http)
+        dest = self.root / "games" / "UnmappedDlcGame"
+
+        # Explicit --dlc 2138330 must fail with dlc_depot_not_found instead of claiming installed
+        with self.assertRaises(AcquireError) as ctx:
+            backend.download(
+                DownloadOptions(
+                    app_id="1091500",
+                    dest=dest,
+                    platform="windows",
+                    dlcs=("2138330",),
+                    skip_dlcs=False,
+                )
+            )
+        self.assertEqual(ctx.exception.code, "dlc_depot_not_found")
+        self.assertNotIn("1091500", backend._load_installs())
+
+        # Implicit --with-dlcs must NOT fabricate downloaded_dlcs=['2138330'] without depot evidence
+        dl = backend.download(
+            DownloadOptions(
+                app_id="1091500",
+                dest=dest,
+                platform="windows",
+                with_dlcs=True,
+                skip_dlcs=False,
+            )
+        )
+        self.assertEqual(dl.downloaded_dlcs, [])
+        self.assertEqual(backend._load_installs()["1091500"]["dlcs"], [])
+
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):
             if "appdetails" in url:
