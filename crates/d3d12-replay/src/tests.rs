@@ -2497,3 +2497,220 @@ fn metal_backend_va_map_removes_released_buffers_and_preserves_aliases() {
     assert_eq!(backend.translate_gpu_va(0x4_8100), 0x4_8100);
 }
 
+#[test]
+fn metal_backend_shader_visible_descriptor_overwrite_waits_for_prior_gpu_reads() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::metal::descriptor::{heap_kind, RESOURCE_DESCRIPTOR_SIZE};
+    use d3d12_metal::metal::views::SamplerDesc;
+    use d3d12_metal::types::{
+        dim, heap_type, resource_flags, CommandQueueDesc, DescriptorHeapDesc, HeapProperties,
+        ResourceBarrier, ResourceDesc,
+    };
+    use dxil_metal::root_signature::flags::DESCRIPTOR_RANGE_OFFSET_APPEND;
+    use dxil_metal::{
+        dxbc, DescriptorRange, DescriptorRangeType, RootDescriptor, RootDescriptorKind,
+        RootParameter, RootParameterKind, RootSignatureDesc, RootSignatureVersion,
+    };
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+    }
+    fn transition(res: u64, before: u32, after: u32) -> ResourceBarrier {
+        ResourceBarrier { Type: 0, Flags: 0, u: [res, (before as u64) << 32, after as u64] }
+    }
+
+    let mut cs = include_bytes!("../../dxil-metal/tests/fixtures/static_samplers.cs.dxil").to_vec();
+    dxbc::sign_container(&mut cs).expect("sign DXBC fixture");
+    let srv_range = DescriptorRange {
+        range_type: DescriptorRangeType::Srv,
+        num_descriptors: 1,
+        base_shader_register: 0,
+        register_space: 0,
+        flags: 0,
+        offset_in_descriptors_from_table_start: DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let samp_range = DescriptorRange {
+        range_type: DescriptorRangeType::Sampler,
+        num_descriptors: 2,
+        base_shader_register: 0,
+        register_space: 0,
+        flags: 0,
+        offset_in_descriptors_from_table_start: DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let rs_blob = RootSignatureDesc {
+        version: RootSignatureVersion::V1_1,
+        parameters: vec![
+            RootParameter { kind: RootParameterKind::DescriptorTable(vec![srv_range]), visibility: 0 },
+            RootParameter {
+                kind: RootParameterKind::Descriptor(
+                    RootDescriptorKind::Uav,
+                    RootDescriptor { shader_register: 0, register_space: 0, flags: 0 },
+                ),
+                visibility: 0,
+            },
+            RootParameter { kind: RootParameterKind::DescriptorTable(vec![samp_range]), visibility: 0 },
+        ],
+        static_samplers: vec![],
+        flags: 0,
+    }
+    .to_blob();
+
+    let stride = RESOURCE_DESCRIPTOR_SIZE as u64;
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let hp_def = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+    let hp_rb = HeapProperties { Type: heap_type::READBACK, ..Default::default() };
+    let tex_desc = ResourceDesc {
+        Dimension: dim::TEXTURE2D,
+        Width: 4,
+        Height: 4,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: 28,
+        SampleCount: 1,
+        Flags: resource_flags::ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let uav_desc = ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: 1024,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        Flags: resource_flags::ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let rb_desc = ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: 1024,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        ..Default::default()
+    };
+    let rtv_hd = DescriptorHeapDesc { Type: heap_kind::RTV, NumDescriptors: 2, Flags: 0, NodeMask: 0 };
+    let stage_hd = DescriptorHeapDesc { Type: heap_kind::CBV_SRV_UAV, NumDescriptors: 2, Flags: 0, NodeMask: 0 };
+    let gpu_srv_hd = DescriptorHeapDesc { Type: heap_kind::CBV_SRV_UAV, NumDescriptors: 2, Flags: 1, NodeMask: 0 };
+    let gpu_samp_hd = DescriptorHeapDesc { Type: heap_kind::SAMPLER, NumDescriptors: 2, Flags: 1, NodeMask: 0 };
+    let samp = SamplerDesc { address: [3, 3, 3], max_lod: f32::MAX, ..Default::default() };
+
+    const RTV_CPU: u64 = 0x7a00_0000;
+    const STAGE_CPU: u64 = 0x7b00_0000;
+    const GPU_SRV_CPU: u64 = 0x7c00_0000;
+    const GPU_SRV_GPU: u64 = 0x8c00_0000;
+    const GPU_SAMP_CPU: u64 = 0x7d00_0000;
+    const GPU_SAMP_GPU: u64 = 0x8d00_0000;
+    let heaps = [22u64, 23u64];
+    let l1 = [4u64];
+    let l2 = [5u64];
+    let l3 = [6u64];
+
+    // Three submissions sharing shader-visible SRV slot 0 with ZERO WriteResource calls:
+    //   1) slot 0 -> TEX_A (red)   -> 64 dispatches into RB_1
+    //   2) CreateShaderResourceView overwrites slot 0 -> TEX_B (blue) -> 64 dispatches into RB_2
+    //   3) CopyDescriptorsSimple overwrites slot 0 -> TEX_A (red) -> dispatches into RB_3
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 3, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 30, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 31, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateRootSignature { device: 1, root_signature: 50, blob: &rs_blob }, 0).unwrap();
+    w.write(&Call::CreateComputePipelineState { device: 1, pso: 51, root_signature: 50, cs: &cs, flags: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 10, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&tex_desc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 11, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&tex_desc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 12, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&uav_desc), initial_state: 0, clear_value: None, gpu_va: 0x4_1000_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 13, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&uav_desc), initial_state: 0, clear_value: None, gpu_va: 0x4_1001_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 14, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&uav_desc), initial_state: 0, clear_value: None, gpu_va: 0x4_1002_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 15, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&rb_desc), initial_state: 0, clear_value: None, gpu_va: 0x4_1003_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 16, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&rb_desc), initial_state: 0, clear_value: None, gpu_va: 0x4_1004_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 17, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&rb_desc), initial_state: 0, clear_value: None, gpu_va: 0x4_1005_0000 }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: 1, heap: 20, desc: bytes_of(&rtv_hd), cpu_start: RTV_CPU, gpu_start: 0 }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: 1, heap: 21, desc: bytes_of(&stage_hd), cpu_start: STAGE_CPU, gpu_start: 0 }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: 1, heap: 22, desc: bytes_of(&gpu_srv_hd), cpu_start: GPU_SRV_CPU, gpu_start: GPU_SRV_GPU }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: 1, heap: 23, desc: bytes_of(&gpu_samp_hd), cpu_start: GPU_SAMP_CPU, gpu_start: GPU_SAMP_GPU }, 0).unwrap();
+    w.write(&Call::CreateRenderTargetView { resource: 10, desc: None, dest: RTV_CPU }, 0).unwrap();
+    w.write(&Call::CreateRenderTargetView { resource: 11, desc: None, dest: RTV_CPU + 32 }, 0).unwrap();
+    w.write(&Call::CreateShaderResourceView { resource: 10, desc: None, dest: STAGE_CPU }, 0).unwrap();
+    w.write(&Call::CreateSampler { desc: bytes_of(&samp), dest: GPU_SAMP_CPU }, 0).unwrap();
+    w.write(&Call::CreateSampler { desc: bytes_of(&samp), dest: GPU_SAMP_CPU + stride }, 0).unwrap();
+
+    // Submission 1: clear TEX_A red, TEX_B blue, point GPU_SRV_HEAP[0] -> TEX_A, dispatch 64x into RB_1.
+    w.write(&Call::CreateShaderResourceView { resource: 10, desc: None, dest: GPU_SRV_CPU }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: 1, list: 4, list_type: 0, allocator: 3, initial_pso: 51 }, 0).unwrap();
+    w.write(&Call::ClearRenderTargetView { list: 4, rtv: RTV_CPU, color: [1.0, 0.0, 0.0, 1.0], rects: &[] }, 0).unwrap();
+    w.write(&Call::ClearRenderTargetView { list: 4, rtv: RTV_CPU + 32, color: [0.0, 0.0, 1.0, 1.0], rects: &[] }, 0).unwrap();
+    let b_ab = [transition(10, 0x4, 0x40), transition(11, 0x4, 0x40)];
+    let b_ab_bytes = unsafe { std::slice::from_raw_parts(b_ab.as_ptr().cast::<u8>(), std::mem::size_of_val(&b_ab)) };
+    w.write(&Call::ResourceBarrier { list: 4, barriers: b_ab_bytes }, 0).unwrap();
+    w.write(&Call::SetComputeRootSignature { list: 4, root_signature: 50 }, 0).unwrap();
+    w.write(&Call::SetDescriptorHeaps { list: 4, heaps: U64s::from_slice(&heaps) }, 0).unwrap();
+    w.write(&Call::SetRootDescriptorTable { list: 4, compute: true, param: 0, gpu_handle: GPU_SRV_GPU }, 0).unwrap();
+    w.write(&Call::SetRootView { list: 4, compute: true, param: 1, kind: 2, gpu_va: 0x4_1000_0000 }, 0).unwrap();
+    w.write(&Call::SetRootDescriptorTable { list: 4, compute: true, param: 2, gpu_handle: GPU_SAMP_GPU }, 0).unwrap();
+    for _ in 0..64 {
+        w.write(&Call::Dispatch { list: 4, x: 1, y: 1, z: 1 }, 0).unwrap();
+    }
+    w.write(&Call::ResourceBarrier { list: 4, barriers: bytes_of(&transition(12, 0x8, 0x800)) }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: 4, dst: 15, dst_offset: 0, src: 12, src_offset: 0, size: 64 }, 0).unwrap();
+    w.write(&Call::Close { list: 4 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&l1) }, 0).unwrap();
+
+    // Submission 2: overwrite GPU_SRV_HEAP[0] -> TEX_B (blue) immediately after submit 1.
+    w.write(&Call::CreateShaderResourceView { resource: 11, desc: None, dest: GPU_SRV_CPU }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: 1, list: 5, list_type: 0, allocator: 30, initial_pso: 51 }, 0).unwrap();
+    w.write(&Call::SetComputeRootSignature { list: 5, root_signature: 50 }, 0).unwrap();
+    w.write(&Call::SetDescriptorHeaps { list: 5, heaps: U64s::from_slice(&heaps) }, 0).unwrap();
+    w.write(&Call::SetRootDescriptorTable { list: 5, compute: true, param: 0, gpu_handle: GPU_SRV_GPU }, 0).unwrap();
+    w.write(&Call::SetRootView { list: 5, compute: true, param: 1, kind: 2, gpu_va: 0x4_1001_0000 }, 0).unwrap();
+    w.write(&Call::SetRootDescriptorTable { list: 5, compute: true, param: 2, gpu_handle: GPU_SAMP_GPU }, 0).unwrap();
+    for _ in 0..64 {
+        w.write(&Call::Dispatch { list: 5, x: 1, y: 1, z: 1 }, 0).unwrap();
+    }
+    w.write(&Call::ResourceBarrier { list: 5, barriers: bytes_of(&transition(13, 0x8, 0x800)) }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: 5, dst: 16, dst_offset: 0, src: 13, src_offset: 0, size: 64 }, 0).unwrap();
+    w.write(&Call::Close { list: 5 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&l2) }, 0).unwrap();
+
+    // Submission 3: overwrite GPU_SRV_HEAP[0] -> TEX_A (red) via CopyDescriptorsSimple immediately after submit 2.
+    w.write(&Call::CopyDescriptorsSimple { count: 1, dest: GPU_SRV_CPU, src: STAGE_CPU, heap_type: heap_kind::CBV_SRV_UAV }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: 1, list: 6, list_type: 0, allocator: 31, initial_pso: 51 }, 0).unwrap();
+    w.write(&Call::SetComputeRootSignature { list: 6, root_signature: 50 }, 0).unwrap();
+    w.write(&Call::SetDescriptorHeaps { list: 6, heaps: U64s::from_slice(&heaps) }, 0).unwrap();
+    w.write(&Call::SetRootDescriptorTable { list: 6, compute: true, param: 0, gpu_handle: GPU_SRV_GPU }, 0).unwrap();
+    w.write(&Call::SetRootView { list: 6, compute: true, param: 1, kind: 2, gpu_va: 0x4_1002_0000 }, 0).unwrap();
+    w.write(&Call::SetRootDescriptorTable { list: 6, compute: true, param: 2, gpu_handle: GPU_SAMP_GPU }, 0).unwrap();
+    w.write(&Call::Dispatch { list: 6, x: 1, y: 1, z: 1 }, 0).unwrap();
+    w.write(&Call::ResourceBarrier { list: 6, barriers: bytes_of(&transition(14, 0x8, 0x800)) }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: 6, dst: 17, dst_offset: 0, src: 14, src_offset: 0, size: 64 }, 0).unwrap();
+    w.write(&Call::Close { list: 6 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&l3) }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+
+    let read_rgba = |id: u64| -> [f32; 4] {
+        let s = backend.resource(id).unwrap().shared_slice(0, 16).unwrap();
+        [
+            f32::from_le_bytes(s[0..4].try_into().unwrap()),
+            f32::from_le_bytes(s[4..8].try_into().unwrap()),
+            f32::from_le_bytes(s[8..12].try_into().unwrap()),
+            f32::from_le_bytes(s[12..16].try_into().unwrap()),
+        ]
+    };
+    let c1 = read_rgba(15);
+    let c2 = read_rgba(16);
+    let c3 = read_rgba(17);
+    assert!(c1[0] > 0.9 && c1[2] < 0.1, "submission 1 must see red TEX_A, got {c1:?}");
+    assert!(c2[2] > 0.9 && c2[0] < 0.1, "submission 2 must see blue TEX_B, got {c2:?}");
+    assert!(c3[0] > 0.9 && c3[2] < 0.1, "submission 3 must see red TEX_A, got {c3:?}");
+}
+

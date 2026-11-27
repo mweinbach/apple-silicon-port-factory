@@ -737,6 +737,22 @@ impl MetalBackend {
             .map_err(|e| format!("embedded root signature: {e}"))
     }
 
+    fn write_desc_entry(&mut self, heap_id: u64, idx: usize, entry: &[u8; 24]) -> Result<usize, String> {
+        if self.desc_heaps.get(&heap_id).is_some_and(|h| h.heap.shader_visible) {
+            // Captured traces do not record CPU fence waits (`SetEventOnCompletion`), while
+            // shader-visible `DescriptorHeap`s live in GPU-visible shared memory bound directly
+            // by address. Drain unblocked queues before overwriting a shader-visible slot so
+            // prior submissions never observe a later submission's descriptors.
+            self.drain_unblocked_queues();
+        }
+        let h = self
+            .desc_heaps
+            .get_mut(&heap_id)
+            .ok_or_else(|| format!("unknown descriptor heap {heap_id:#x}"))?;
+        h.write_entry(idx, entry)?;
+        Ok(h.live_cpu_addr(idx))
+    }
+
     fn copy_single_descriptor(&mut self, dst_cpu: u64, src_cpu: u64, heap_type: u32) -> Result<(), String> {
         let (dst_id, dst_idx) = self
             .find_cpu_slot(dst_cpu)
@@ -756,11 +772,7 @@ impl MetalBackend {
         }
         let entry = self.desc_heaps[&src_id].read_entry(src_idx)?;
         let src_live_cpu = self.desc_heaps[&src_id].live_cpu_addr(src_idx);
-        let dst_live_cpu = {
-            let dst_h = self.desc_heaps.get_mut(&dst_id).unwrap();
-            dst_h.write_entry(dst_idx, &entry)?;
-            dst_h.live_cpu_addr(dst_idx)
-        };
+        let dst_live_cpu = self.write_desc_entry(dst_id, dst_idx, &entry)?;
         if heap_type == heap_kind::CBV_SRV_UAV {
             if let Some((res_ptr, desc)) = descriptor::uav_at(src_live_cpu) {
                 let res = self.resources.values().find(|r| Arc::as_ptr(r) as usize == res_ptr);
@@ -1082,7 +1094,7 @@ impl Backend for MetalBackend {
                     None => None,
                 };
                 let entry = views::srv_entry(res, d_opt)?;
-                self.desc_heaps.get_mut(&heap_id).unwrap().write_entry(idx, &entry)?;
+                self.write_desc_entry(heap_id, idx, &entry)?;
                 descriptor::bump_desc_heap_gen();
                 Ok(Handled::Done)
             }
@@ -1123,12 +1135,9 @@ impl Backend for MetalBackend {
                     None => None,
                 };
                 let entry = views::uav_entry_with_counter(res, ctr, d_opt)?;
-                let live_cpu = {
-                    let h = self.desc_heaps.get_mut(&heap_id).unwrap();
-                    h.write_entry(idx, &entry)?;
-                    h.live_cpu_addr(idx)
-                };
-                descriptor::record_uav(live_cpu, res, d_opt);
+                let live_cpu = self.write_desc_entry(heap_id, idx, &entry)?;
+                let res_ref = if *resource != 0 { self.resources.get(resource).map(|r| r.as_ref()) } else { None };
+                descriptor::record_uav(live_cpu, res_ref, d_opt);
                 descriptor::bump_desc_heap_gen();
                 Ok(Handled::Done)
             }
@@ -1176,7 +1185,7 @@ impl Backend for MetalBackend {
                     .ok_or_else(|| format!("CreateConstantBufferView unknown CPU handle {dest:#x}"))?;
                 let live_va = self.translate_gpu_va(*buffer_location);
                 let entry = views::cbv_entry(live_va, *size);
-                self.desc_heaps.get_mut(&heap_id).unwrap().write_entry(idx, &entry)?;
+                self.write_desc_entry(heap_id, idx, &entry)?;
                 descriptor::bump_desc_heap_gen();
                 Ok(Handled::Done)
             }
@@ -1186,7 +1195,7 @@ impl Backend for MetalBackend {
                     .ok_or_else(|| format!("CreateSampler unknown CPU handle {dest:#x}"))?;
                 let sd = read_copy::<SamplerDesc>(desc)?;
                 let entry = views::sampler_entry(&sd)?;
-                self.desc_heaps.get_mut(&heap_id).unwrap().write_entry(idx, &entry)?;
+                self.write_desc_entry(heap_id, idx, &entry)?;
                 Ok(Handled::Done)
             }
             Call::CopyDescriptorsSimple { count, dest, src, heap_type } => {
