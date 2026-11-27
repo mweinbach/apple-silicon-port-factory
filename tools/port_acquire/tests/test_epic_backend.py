@@ -65,7 +65,7 @@ DEFAULT_STATE = {
             "app_title": "Marvel's Spider-Man 2",
             "asset_infos": {
                 "Windows": {"build_version": "1.1.0", "app_name": "ArachnidTwo"},
-                "Mac": {"build_version": "1.1.0", "app_name": "ArachnidTwo"},
+                "Mac": {"build_version": "1.1.0-mac", "app_name": "ArachnidTwo"},
             },
             "metadata": {
                 "id": "cat_arachnid_2",
@@ -627,8 +627,16 @@ class TestEpicBackendMocked(unittest.TestCase):
         data = json.loads(proc.stdout)
         self.assertEqual(data["count"], 4)  # 4 base games; nested DLCs attach to ArachnidTwo
         sm2 = next(g for g in data["games"] if g["app_id"] == "ArachnidTwo")
+        self.assertEqual(sm2["version"], "1.1.0")
         dlc_ids = {d["app_id"] for d in sm2["dlcs"]}
         self.assertEqual(dlc_ids, {"ArachnidTwoPreorderDLC", "ArachnidTwoExpansion"})
+
+        # Requesting `--platform macos` must select the Mac build version rather than Windows.
+        proc_mac = self._run_cli("list-owned", "--platform", "macos", "--json")
+        self.assertEqual(proc_mac.returncode, 0, proc_mac.stderr)
+        mac_games = json.loads(proc_mac.stdout)["games"]
+        sm2_mac = next(g for g in mac_games if g["app_id"] == "ArachnidTwo")
+        self.assertEqual(sm2_mac["version"], "1.1.0-mac")
 
         proc_search = self._run_cli("search", "Spider-Man 2", "--json")
         self.assertEqual(proc_search.returncode, 0, proc_search.stderr)

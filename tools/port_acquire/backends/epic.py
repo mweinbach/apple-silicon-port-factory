@@ -699,7 +699,17 @@ class EpicBackend(StoreBackend):
                 platforms = [platform.lower()]
 
             version: str | None = None
-            for pref in ("Windows", "Mac"):
+            req_leg_plat = _platform_to_legendary(platform)
+            plat_order: list[str] = []
+            if req_leg_plat:
+                plat_order.append(req_leg_plat)
+            for fallback_plat in ("Windows", "Mac"):
+                if fallback_plat not in plat_order:
+                    plat_order.append(fallback_plat)
+            for key in asset_infos.keys():
+                if key not in plat_order:
+                    plat_order.append(key)
+            for pref in plat_order:
                 ai = asset_infos.get(pref)
                 if isinstance(ai, dict) and ai.get("build_version"):
                     version = str(ai["build_version"])
