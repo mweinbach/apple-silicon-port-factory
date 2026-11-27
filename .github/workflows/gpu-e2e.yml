@@ -1,0 +1,175 @@
+name: GPU, Audio & E2E (Apple Silicon)
+
+# Runs hardware-dependent Metal 4, shader toolchain, CoreAudio/WASAPI, MoltenVK,
+# replay, and benchmark suites on a dedicated self-hosted Apple Silicon macOS runner.
+#
+# Security model (public repo + self-hosted runner):
+#   - NEVER triggered automatically on pull_request opened/reopened/synchronize.
+#   - Triggered ONLY on:
+#       1. `push` to `main` (already reviewed & merged),
+#       2. `workflow_dispatch` (manual maintainer invocation),
+#       3. `pull_request` `labeled` with the `gpu-ci` label (only repository
+#          maintainers/collaborators can apply labels; pushing new commits does
+#          NOT re-trigger this workflow until a maintainer re-reviews and
+#          re-applies the label).
+#   - Minimal permissions (`contents: read`) and `persist-credentials: false` on checkout.
+#   - See `docs/GPU_CI.md` for runner registration, required labels, and host setup.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_bench:
+        description: "Run cargo opsdb -- bench after GPU/E2E tests"
+        type: boolean
+        default: true
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  MTL_DEBUG_LAYER: "1"
+
+jobs:
+  gpu-e2e:
+    name: Apple Silicon GPU, audio & E2E (MTL_DEBUG_LAYER=1)
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 90
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'gpu-ci'
+      )
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Inspect Apple Silicon host, Metal toolchain, and optional dylibs
+        id: host
+        run: |
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          xcodebuild -version
+          rustc -Vv
+          cargo -V
+          if command -v zig >/dev/null 2>&1; then
+            echo "zig: $(zig version) ($(command -v zig))"
+          elif [ -n "${ZIG:-}" ] && [ -x "${ZIG}" ]; then
+            echo "zig: $("${ZIG}" version) (${ZIG})"
+          else
+            echo "zig: NOT FOUND"
+          fi
+          if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            xcrun -sdk macosx metal --version
+            echo "has_metal_toolchain=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Xcode Metal Toolchain: NOT FOUND"
+            echo "has_metal_toolchain=false" >> "$GITHUB_OUTPUT"
+          fi
+          for p in \
+            "${METAL_IRCONVERTER_DYLIB:-}" \
+            "$HOME/.local/opt/metal-shaderconverter/lib/libmetalirconverter.dylib" \
+            "/usr/local/lib/libmetalirconverter.dylib" \
+            "/opt/metal-shaderconverter/lib/libmetalirconverter.dylib"; do
+            if [ -n "$p" ] && [ -f "$p" ]; then
+              echo "libmetalirconverter: $p"
+              break
+            fi
+          done
+          for p in \
+            "${PORT_DXILCONV:-}" \
+            "${AW2_DXILCONV:-}" \
+            "$HOME/.local/lib/libdxilconv.dylib" \
+            "/opt/homebrew/lib/libdxilconv.dylib" \
+            "/usr/local/lib/libdxilconv.dylib"; do
+            if [ -n "$p" ] && [ -f "$p" ]; then
+              echo "libdxilconv: $p"
+              break
+            fi
+          done
+          for p in \
+            "${PORT_VULKAN_DYLIB:-}" \
+            "/opt/homebrew/lib/libMoltenVK.dylib" \
+            "/usr/local/lib/libMoltenVK.dylib" \
+            "${VULKAN_SDK:-}/lib/libMoltenVK.dylib"; do
+            if [ -n "$p" ] && [ -f "$p" ]; then
+              echo "libMoltenVK: $p"
+              break
+            fi
+          done
+
+      - name: Prepare isolated run directories
+        run: |
+          mkdir -p "${RUNNER_TEMP}/port-aot" "${RUNNER_TEMP}/port-crash" "${RUNNER_TEMP}/translator"
+          {
+            echo "PORT_AOT_DIR=${RUNNER_TEMP}/port-aot"
+            echo "PORT_CRASH_DIR=${RUNNER_TEMP}/port-crash"
+            echo "TRANSLATOR_HOME=${RUNNER_TEMP}/translator"
+          } >> "$GITHUB_ENV"
+
+      - name: Build universal runner (port-runner)
+        run: cargo runner-build
+
+      - name: d3d12-metal library & Metal 4 GPU integration tests
+        run: |
+          cargo test -p d3d12-metal --lib --target aarch64-apple-darwin -- --test-threads=1
+          cargo test -p d3d12-metal --target aarch64-apple-darwin \
+            --test gpu_clear_resolve \
+            --test gpu_mesh \
+            --test gpu_rayquery \
+            -- --test-threads=1
+
+      - name: dxil-metal shader compiler & PSO archive tests
+        run: >-
+          cargo test -p dxil-metal --features metal --target aarch64-apple-darwin --
+          --test-threads=1
+
+      - name: Verify offline SPIR-V & WGSL .metallib compilation (when Metal toolchain present)
+        if: steps.host.outputs.has_metal_toolchain == 'true'
+        run: >-
+          cargo test -p dxil-metal --lib --features metal --target aarch64-apple-darwin --
+          spirv_to_msl_and_metallib_pipeline_works
+          wgsl_to_msl_and_metallib_pipeline_works
+          metal41_msl_and_spirv_options_compile_cleanly
+          --test-threads=1 --nocapture
+
+      - name: win32-rt D3D11, Vulkan (MoltenVK), and CoreAudio/WASAPI tests
+        env:
+          PORT_TEST_MOLTENVK: "1"
+        run: >-
+          cargo test -p win32-rt --lib --target aarch64-apple-darwin --
+          d3d11 misc::vulkan_1 audio --test-threads=1
+
+      - name: port-loader E2E guests (D3D11, D3D12, Vulkan)
+        env:
+          PORT_TEST_MOLTENVK: "1"
+        run: >-
+          cargo test -p port-loader --target aarch64-apple-darwin
+          --test d3d11_e2e
+          --test d3d12_e2e
+          --test vulkan_e2e
+          -- --test-threads=1
+
+      - name: d3d12-replay Metal 4 backend & synthetic trace tests
+        run: >-
+          cargo test -p d3d12-replay --target aarch64-apple-darwin --
+          --test-threads=1
+
+      - name: Guest benchmark suite (cargo opsdb -- bench)
+        if: github.event_name != 'workflow_dispatch' || inputs.run_bench
+        run: >-
+          cargo opsdb -- bench --out "${RUNNER_TEMP}/bench_results.json"
