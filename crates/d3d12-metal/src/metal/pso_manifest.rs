@@ -35,6 +35,10 @@ const RECORD_VERSION: u8 = 1;
 const KIND_COMPUTE: u8 = 1;
 const KIND_GRAPHICS: u8 = 2;
 const KIND_MESH: u8 = 3;
+const KIND_GRAPHICS_ICB: u8 = 4;
+const KIND_MESH_ICB: u8 = 5;
+const KIND_GEOMETRY: u8 = 6;
+const KIND_TESSELLATION: u8 = 7;
 
 std::thread_local! {
     static IN_PREWARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -84,6 +88,7 @@ pub enum PsoRecipe {
         dsv_format: u32,
         sample_count: u32,
         lazy_icb: bool,
+        with_icb: bool,
         immut_opt: bool,
         pso_opt_v2: bool,
     },
@@ -94,6 +99,41 @@ pub enum PsoRecipe {
         ps_hash: Option<u128>,
         blend: BlendDesc,
         sample_mask: u32,
+        rtv_formats: Vec<u32>,
+        dsv_format: u32,
+        sample_count: u32,
+        with_icb: bool,
+        immut_opt: bool,
+        pso_opt_v2: bool,
+    },
+    Geometry {
+        rs_hash: u128,
+        vs_hash: u128,
+        gs_hash: u128,
+        ps_hash: Option<u128>,
+        blend: BlendDesc,
+        sample_mask: u32,
+        input_layout: Vec<InputElement>,
+        strip_cut: u32,
+        topology_type: u32,
+        rtv_formats: Vec<u32>,
+        dsv_format: u32,
+        sample_count: u32,
+        immut_opt: bool,
+        pso_opt_v2: bool,
+    },
+    Tessellation {
+        rs_hash: u128,
+        vs_hash: u128,
+        hs_hash: u128,
+        ds_hash: u128,
+        gs_hash: Option<u128>,
+        ps_hash: Option<u128>,
+        blend: BlendDesc,
+        sample_mask: u32,
+        input_layout: Vec<InputElement>,
+        strip_cut: u32,
+        topology_type: u32,
         rtv_formats: Vec<u32>,
         dsv_format: u32,
         sample_count: u32,
@@ -306,10 +346,11 @@ fn encode_recipe(recipe: &PsoRecipe) -> Vec<u8> {
             dsv_format,
             sample_count,
             lazy_icb,
+            with_icb,
             immut_opt,
             pso_opt_v2,
         } => {
-            w.u8(KIND_GRAPHICS)
+            w.u8(if *with_icb { KIND_GRAPHICS_ICB } else { KIND_GRAPHICS })
                 .u128(*rs_hash)
                 .u128(*vs_hash)
                 .opt_u128(*ps_hash)
@@ -335,16 +376,85 @@ fn encode_recipe(recipe: &PsoRecipe) -> Vec<u8> {
             rtv_formats,
             dsv_format,
             sample_count,
+            with_icb,
             immut_opt,
             pso_opt_v2,
         } => {
-            w.u8(KIND_MESH)
+            w.u8(if *with_icb { KIND_MESH_ICB } else { KIND_MESH })
                 .u128(*rs_hash)
                 .opt_u128(*as_hash)
                 .u128(*ms_hash)
                 .opt_u128(*ps_hash)
                 .blend(blend)
                 .u32(*sample_mask)
+                .u32_slice(rtv_formats)
+                .u32(*dsv_format)
+                .u32(*sample_count)
+                .bool(*immut_opt)
+                .bool(*pso_opt_v2);
+        }
+        PsoRecipe::Geometry {
+            rs_hash,
+            vs_hash,
+            gs_hash,
+            ps_hash,
+            blend,
+            sample_mask,
+            input_layout,
+            strip_cut,
+            topology_type,
+            rtv_formats,
+            dsv_format,
+            sample_count,
+            immut_opt,
+            pso_opt_v2,
+        } => {
+            w.u8(KIND_GEOMETRY)
+                .u128(*rs_hash)
+                .u128(*vs_hash)
+                .u128(*gs_hash)
+                .opt_u128(*ps_hash)
+                .blend(blend)
+                .u32(*sample_mask)
+                .input_layout(input_layout)
+                .u32(*strip_cut)
+                .u32(*topology_type)
+                .u32_slice(rtv_formats)
+                .u32(*dsv_format)
+                .u32(*sample_count)
+                .bool(*immut_opt)
+                .bool(*pso_opt_v2);
+        }
+        PsoRecipe::Tessellation {
+            rs_hash,
+            vs_hash,
+            hs_hash,
+            ds_hash,
+            gs_hash,
+            ps_hash,
+            blend,
+            sample_mask,
+            input_layout,
+            strip_cut,
+            topology_type,
+            rtv_formats,
+            dsv_format,
+            sample_count,
+            immut_opt,
+            pso_opt_v2,
+        } => {
+            w.u8(KIND_TESSELLATION)
+                .u128(*rs_hash)
+                .u128(*vs_hash)
+                .u128(*hs_hash)
+                .u128(*ds_hash)
+                .opt_u128(*gs_hash)
+                .opt_u128(*ps_hash)
+                .blend(blend)
+                .u32(*sample_mask)
+                .input_layout(input_layout)
+                .u32(*strip_cut)
+                .u32(*topology_type)
                 .u32_slice(rtv_formats)
                 .u32(*dsv_format)
                 .u32(*sample_count)
@@ -369,9 +479,57 @@ fn decode_recipe(payload: &[u8]) -> Result<PsoManifestEntry, String> {
             pin_tg: r.bool()?,
             immut_opt: r.bool()?,
         },
-        KIND_GRAPHICS => PsoRecipe::Graphics {
+        KIND_GRAPHICS | KIND_GRAPHICS_ICB => {
+            let rs_hash = r.u128()?;
+            let vs_hash = r.u128()?;
+            let ps_hash = r.opt_u128()?;
+            let blend = r.blend()?;
+            let sample_mask = r.u32()?;
+            let input_layout = r.input_layout()?;
+            let strip_cut = r.u32()?;
+            let topology_type = r.u32()?;
+            let rtv_formats = r.u32_vec(16)?;
+            let dsv_format = r.u32()?;
+            let sample_count = r.u32()?;
+            let lazy_icb = r.bool()?;
+            let immut_opt = r.bool()?;
+            let pso_opt_v2 = r.bool()?;
+            PsoRecipe::Graphics {
+                rs_hash,
+                vs_hash,
+                ps_hash,
+                blend,
+                sample_mask,
+                input_layout,
+                strip_cut,
+                topology_type,
+                rtv_formats,
+                dsv_format,
+                sample_count,
+                lazy_icb,
+                with_icb: kind == KIND_GRAPHICS_ICB || !lazy_icb,
+                immut_opt,
+                pso_opt_v2,
+            }
+        }
+        KIND_MESH | KIND_MESH_ICB => PsoRecipe::Mesh {
+            rs_hash: r.u128()?,
+            as_hash: r.opt_u128()?,
+            ms_hash: r.u128()?,
+            ps_hash: r.opt_u128()?,
+            blend: r.blend()?,
+            sample_mask: r.u32()?,
+            rtv_formats: r.u32_vec(16)?,
+            dsv_format: r.u32()?,
+            sample_count: r.u32()?,
+            with_icb: kind == KIND_MESH_ICB,
+            immut_opt: r.bool()?,
+            pso_opt_v2: r.bool()?,
+        },
+        KIND_GEOMETRY => PsoRecipe::Geometry {
             rs_hash: r.u128()?,
             vs_hash: r.u128()?,
+            gs_hash: r.u128()?,
             ps_hash: r.opt_u128()?,
             blend: r.blend()?,
             sample_mask: r.u32()?,
@@ -381,17 +539,21 @@ fn decode_recipe(payload: &[u8]) -> Result<PsoManifestEntry, String> {
             rtv_formats: r.u32_vec(16)?,
             dsv_format: r.u32()?,
             sample_count: r.u32()?,
-            lazy_icb: r.bool()?,
             immut_opt: r.bool()?,
             pso_opt_v2: r.bool()?,
         },
-        KIND_MESH => PsoRecipe::Mesh {
+        KIND_TESSELLATION => PsoRecipe::Tessellation {
             rs_hash: r.u128()?,
-            as_hash: r.opt_u128()?,
-            ms_hash: r.u128()?,
+            vs_hash: r.u128()?,
+            hs_hash: r.u128()?,
+            ds_hash: r.u128()?,
+            gs_hash: r.opt_u128()?,
             ps_hash: r.opt_u128()?,
             blend: r.blend()?,
             sample_mask: r.u32()?,
+            input_layout: r.input_layout()?,
+            strip_cut: r.u32()?,
+            topology_type: r.u32()?,
             rtv_formats: r.u32_vec(16)?,
             dsv_format: r.u32()?,
             sample_count: r.u32()?,
@@ -467,6 +629,11 @@ pub struct PsoManifestWriter {
     dir: PathBuf,
     file: Mutex<File>,
     seen: Mutex<HashSet<u128>>,
+    /// Maps lazy `GraphicsPipeline` ICB PSO keys (`base_key`) to their ready-to-record
+    /// `with_icb: true` recipes (whose blobs were already persisted when the primary
+    /// graphics PSO was created), so first-demand `icb_pso()` calls can append the ICB
+    /// recipe in O(1) without retaining raw DXIL buffers on `GraphicsPipeline`.
+    pending_icb: Mutex<HashMap<u128, PsoRecipe>>,
 }
 
 impl PsoManifestWriter {
@@ -497,6 +664,7 @@ impl PsoManifestWriter {
             dir,
             file: Mutex::new(file),
             seen: Mutex::new(entries.into_iter().map(|e| e.key).collect()),
+            pending_icb: Mutex::new(HashMap::new()),
         })
     }
 
@@ -580,11 +748,25 @@ impl PsoManifestWriter {
         immut_opt: bool,
         pso_opt_v2: bool,
     ) -> Result<bool, String> {
+        self.record_graphics_with_icb(rs, d, lazy_icb, !lazy_icb, immut_opt, pso_opt_v2, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_graphics_with_icb(
+        &self,
+        rs: &RootSignature,
+        d: &GraphicsDesc,
+        lazy_icb: bool,
+        with_icb: bool,
+        immut_opt: bool,
+        pso_opt_v2: bool,
+        icb_key: Option<u128>,
+    ) -> Result<bool, String> {
         let rs_blob = rs.desc().to_rts0();
         let rs_hash = self.store_blob(&rs_blob)?;
         let vs_hash = self.store_blob(d.vs)?;
         let ps_hash = d.ps.map(|b| self.store_blob(b)).transpose()?;
-        self.record_recipe(PsoRecipe::Graphics {
+        let recipe = PsoRecipe::Graphics {
             rs_hash,
             vs_hash,
             ps_hash,
@@ -597,15 +779,47 @@ impl PsoManifestWriter {
             dsv_format: d.dsv_format,
             sample_count: d.sample_count,
             lazy_icb,
+            with_icb,
             immut_opt,
             pso_opt_v2,
-        })
+        };
+        if lazy_icb && !with_icb {
+            if let Some(k) = icb_key {
+                let mut icb_recipe = recipe.clone();
+                if let PsoRecipe::Graphics { with_icb: ref mut flag, .. } = icb_recipe {
+                    *flag = true;
+                }
+                self.pending_icb.lock().unwrap().insert(k, icb_recipe);
+            }
+        }
+        self.record_recipe(recipe)
+    }
+
+    /// Record the `with_icb = true` variant of a previously registered lazy-ICB graphics
+    /// pipeline when `GraphicsPipeline::icb_pso()` is demanded at runtime.
+    pub fn record_graphics_icb_by_key(&self, icb_key: u128) -> Result<bool, String> {
+        let recipe = self.pending_icb.lock().unwrap().remove(&icb_key);
+        let Some(recipe) = recipe else {
+            return Ok(false);
+        };
+        self.record_recipe(recipe)
     }
 
     pub fn record_mesh(
         &self,
         rs: &RootSignature,
         d: &MeshDesc,
+        immut_opt: bool,
+        pso_opt_v2: bool,
+    ) -> Result<bool, String> {
+        self.record_mesh_with_icb(rs, d, false, immut_opt, pso_opt_v2)
+    }
+
+    pub fn record_mesh_with_icb(
+        &self,
+        rs: &RootSignature,
+        d: &MeshDesc,
+        with_icb: bool,
         immut_opt: bool,
         pso_opt_v2: bool,
     ) -> Result<bool, String> {
@@ -621,6 +835,76 @@ impl PsoManifestWriter {
             ps_hash,
             blend: d.blend,
             sample_mask: d.sample_mask,
+            rtv_formats: d.rtv_formats.clone(),
+            dsv_format: d.dsv_format,
+            sample_count: d.sample_count,
+            with_icb,
+            immut_opt,
+            pso_opt_v2,
+        })
+    }
+
+    pub fn record_geometry(
+        &self,
+        rs: &RootSignature,
+        d: &GraphicsDesc,
+        gs_dxil: &[u8],
+        immut_opt: bool,
+        pso_opt_v2: bool,
+    ) -> Result<bool, String> {
+        let rs_blob = rs.desc().to_rts0();
+        let rs_hash = self.store_blob(&rs_blob)?;
+        let vs_hash = self.store_blob(d.vs)?;
+        let gs_hash = self.store_blob(gs_dxil)?;
+        let ps_hash = d.ps.map(|b| self.store_blob(b)).transpose()?;
+        self.record_recipe(PsoRecipe::Geometry {
+            rs_hash,
+            vs_hash,
+            gs_hash,
+            ps_hash,
+            blend: d.blend,
+            sample_mask: d.sample_mask,
+            input_layout: d.input_layout.clone(),
+            strip_cut: d.strip_cut,
+            topology_type: d.topology_type,
+            rtv_formats: d.rtv_formats.clone(),
+            dsv_format: d.dsv_format,
+            sample_count: d.sample_count,
+            immut_opt,
+            pso_opt_v2,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_tessellation(
+        &self,
+        rs: &RootSignature,
+        d: &GraphicsDesc,
+        hs_dxil: &[u8],
+        ds_dxil: &[u8],
+        gs_dxil: Option<&[u8]>,
+        immut_opt: bool,
+        pso_opt_v2: bool,
+    ) -> Result<bool, String> {
+        let rs_blob = rs.desc().to_rts0();
+        let rs_hash = self.store_blob(&rs_blob)?;
+        let vs_hash = self.store_blob(d.vs)?;
+        let hs_hash = self.store_blob(hs_dxil)?;
+        let ds_hash = self.store_blob(ds_dxil)?;
+        let gs_hash = gs_dxil.map(|b| self.store_blob(b)).transpose()?;
+        let ps_hash = d.ps.map(|b| self.store_blob(b)).transpose()?;
+        self.record_recipe(PsoRecipe::Tessellation {
+            rs_hash,
+            vs_hash,
+            hs_hash,
+            ds_hash,
+            gs_hash,
+            ps_hash,
+            blend: d.blend,
+            sample_mask: d.sample_mask,
+            input_layout: d.input_layout.clone(),
+            strip_cut: d.strip_cut,
+            topology_type: d.topology_type,
             rtv_formats: d.rtv_formats.clone(),
             dsv_format: d.dsv_format,
             sample_count: d.sample_count,
@@ -653,13 +937,27 @@ pub(crate) fn note_graphics(
     lazy_icb: bool,
     immut_opt: bool,
     pso_opt_v2: bool,
+    icb_key: Option<u128>,
 ) {
     if is_prewarming() {
         return;
     }
     if let Some(w) = global_writer() {
-        if let Err(e) = w.record_graphics(rs, d, lazy_icb, immut_opt, pso_opt_v2) {
+        if let Err(e) =
+            w.record_graphics_with_icb(rs, d, lazy_icb, !lazy_icb, immut_opt, pso_opt_v2, icb_key)
+        {
             log::warn!(target: "d3d", "pso manifest graphics record failed: {e}");
+        }
+    }
+}
+
+pub(crate) fn note_graphics_icb(icb_key: u128) {
+    if is_prewarming() {
+        return;
+    }
+    if let Some(w) = global_writer() {
+        if let Err(e) = w.record_graphics_icb_by_key(icb_key) {
+            log::warn!(target: "d3d", "pso manifest graphics ICB record failed: {e}");
         }
     }
 }
@@ -671,6 +969,44 @@ pub(crate) fn note_mesh(rs: &RootSignature, d: &MeshDesc, immut_opt: bool, pso_o
     if let Some(w) = global_writer() {
         if let Err(e) = w.record_mesh(rs, d, immut_opt, pso_opt_v2) {
             log::warn!(target: "d3d", "pso manifest mesh record failed: {e}");
+        }
+    }
+}
+
+pub(crate) fn note_geometry(
+    rs: &RootSignature,
+    d: &GraphicsDesc,
+    gs_dxil: &[u8],
+    immut_opt: bool,
+    pso_opt_v2: bool,
+) {
+    if is_prewarming() {
+        return;
+    }
+    if let Some(w) = global_writer() {
+        if let Err(e) = w.record_geometry(rs, d, gs_dxil, immut_opt, pso_opt_v2) {
+            log::warn!(target: "d3d", "pso manifest geometry record failed: {e}");
+        }
+    }
+}
+
+pub(crate) fn note_tessellation(
+    rs: &RootSignature,
+    d: &GraphicsDesc,
+    hs_dxil: &[u8],
+    ds_dxil: &[u8],
+    gs_dxil: Option<&[u8]>,
+    immut_opt: bool,
+    pso_opt_v2: bool,
+) {
+    if is_prewarming() {
+        return;
+    }
+    if let Some(w) = global_writer() {
+        if let Err(e) =
+            w.record_tessellation(rs, d, hs_dxil, ds_dxil, gs_dxil, immut_opt, pso_opt_v2)
+        {
+            log::warn!(target: "d3d", "pso manifest tessellation record failed: {e}");
         }
     }
 }
@@ -918,6 +1254,7 @@ pub fn prewarm_into_cache_with_progress(
                             dsv_format,
                             sample_count,
                             lazy_icb,
+                            with_icb,
                             immut_opt,
                             pso_opt_v2,
                         } => load_rs(m, *rs_hash).and_then(|rs| {
@@ -937,7 +1274,7 @@ pub fn prewarm_into_cache_with_progress(
                                 dsv_format: *dsv_format,
                                 sample_count: *sample_count,
                             };
-                            GraphicsPipeline::new_in_cache(
+                            let gp = GraphicsPipeline::new_in_cache(
                                 cache,
                                 rs,
                                 &gd,
@@ -945,8 +1282,11 @@ pub fn prewarm_into_cache_with_progress(
                                 *lazy_icb,
                                 *immut_opt,
                                 *pso_opt_v2,
-                            )
-                            .map(|_| ())
+                            )?;
+                            if *with_icb {
+                                gp.prewarm_icb_in_cache(cache)?;
+                            }
+                            Ok(())
                         }),
                         PsoRecipe::Mesh {
                             rs_hash,
@@ -958,6 +1298,7 @@ pub fn prewarm_into_cache_with_progress(
                             rtv_formats,
                             dsv_format,
                             sample_count,
+                            with_icb,
                             immut_opt,
                             pso_opt_v2,
                         } => load_rs(m, *rs_hash).and_then(|rs| {
@@ -978,9 +1319,113 @@ pub fn prewarm_into_cache_with_progress(
                             };
                             MeshPipeline::new_in_cache(
                                 cache,
-                                rs,
+                                rs.clone(),
                                 &md,
                                 "prewarm_mesh",
+                                *immut_opt,
+                                *pso_opt_v2,
+                            )?;
+                            if *with_icb && *immut_opt {
+                                MeshPipeline::new_in_cache(
+                                    cache,
+                                    rs,
+                                    &md,
+                                    "prewarm_mesh_icb",
+                                    false,
+                                    *pso_opt_v2,
+                                )?;
+                            }
+                            Ok(())
+                        }),
+                        PsoRecipe::Geometry {
+                            rs_hash,
+                            vs_hash,
+                            gs_hash,
+                            ps_hash,
+                            blend,
+                            sample_mask,
+                            input_layout,
+                            strip_cut,
+                            topology_type,
+                            rtv_formats,
+                            dsv_format,
+                            sample_count,
+                            immut_opt,
+                            pso_opt_v2,
+                        } => load_rs(m, *rs_hash).and_then(|rs| {
+                            let vs = m.read_blob(*vs_hash)?;
+                            let gs = m.read_blob(*gs_hash)?;
+                            let ps = ps_hash.map(|h| m.read_blob(h)).transpose()?;
+                            let gd = GraphicsDesc {
+                                vs: &vs,
+                                ps: ps.as_deref(),
+                                blend: *blend,
+                                sample_mask: *sample_mask,
+                                raster: RasterState::default(),
+                                depth_stencil: DepthStencilState::default(),
+                                input_layout: input_layout.clone(),
+                                strip_cut: *strip_cut,
+                                topology_type: *topology_type,
+                                rtv_formats: rtv_formats.clone(),
+                                dsv_format: *dsv_format,
+                                sample_count: *sample_count,
+                            };
+                            GraphicsPipeline::new_geometry_in_cache(
+                                cache,
+                                rs,
+                                &gd,
+                                &gs,
+                                "prewarm_gs",
+                                *immut_opt,
+                                *pso_opt_v2,
+                            )
+                            .map(|_| ())
+                        }),
+                        PsoRecipe::Tessellation {
+                            rs_hash,
+                            vs_hash,
+                            hs_hash,
+                            ds_hash,
+                            gs_hash,
+                            ps_hash,
+                            blend,
+                            sample_mask,
+                            input_layout,
+                            strip_cut,
+                            topology_type,
+                            rtv_formats,
+                            dsv_format,
+                            sample_count,
+                            immut_opt,
+                            pso_opt_v2,
+                        } => load_rs(m, *rs_hash).and_then(|rs| {
+                            let vs = m.read_blob(*vs_hash)?;
+                            let hs = m.read_blob(*hs_hash)?;
+                            let ds = m.read_blob(*ds_hash)?;
+                            let gs = gs_hash.map(|h| m.read_blob(h)).transpose()?;
+                            let ps = ps_hash.map(|h| m.read_blob(h)).transpose()?;
+                            let gd = GraphicsDesc {
+                                vs: &vs,
+                                ps: ps.as_deref(),
+                                blend: *blend,
+                                sample_mask: *sample_mask,
+                                raster: RasterState::default(),
+                                depth_stencil: DepthStencilState::default(),
+                                input_layout: input_layout.clone(),
+                                strip_cut: *strip_cut,
+                                topology_type: *topology_type,
+                                rtv_formats: rtv_formats.clone(),
+                                dsv_format: *dsv_format,
+                                sample_count: *sample_count,
+                            };
+                            GraphicsPipeline::new_tessellation_in_cache(
+                                cache,
+                                rs,
+                                &gd,
+                                &hs,
+                                &ds,
+                                gs.as_deref(),
+                                "prewarm_tess",
                                 *immut_opt,
                                 *pso_opt_v2,
                             )
@@ -1282,8 +1727,11 @@ mod tests {
                 dsv_format: 40,
                 sample_count: 1,
             };
-            assert!(w.record_graphics(&rs, &gd, true, true, false).unwrap());
+            assert!(w.record_graphics_with_icb(&rs, &gd, true, false, true, false, Some(0x9999)).unwrap());
             assert!(!w.record_graphics(&rs, &gd, true, true, false).unwrap());
+            // Demanding the ICB variant by key appends the distinct `with_icb = true` recipe.
+            assert!(w.record_graphics_icb_by_key(0x9999).unwrap());
+            assert!(!w.record_graphics_icb_by_key(0x9999).unwrap(), "second ICB demand must dedupe");
 
             let md = MeshDesc {
                 amplification: None,
@@ -1298,7 +1746,13 @@ mod tests {
                 sample_count: 1,
             };
             assert!(w.record_mesh(&rs, &md, true, false).unwrap());
-            assert_eq!(w.len(), 3);
+            assert!(w.record_mesh_with_icb(&rs, &md, true, true, false).unwrap());
+            assert!(w.record_geometry(&rs, &gd, b"DXBC-fake-geom", true, false).unwrap());
+            assert!(
+                w.record_tessellation(&rs, &gd, b"DXBC-fake-hull", b"DXBC-fake-domain", Some(b"DXBC-fake-geom"), true, false)
+                    .unwrap()
+            );
+            assert_eq!(w.len(), 7);
         }
 
         // Append a torn tail and confirm reload ignores it cleanly.
@@ -1307,7 +1761,11 @@ mod tests {
             f.write_all(&[0x44, 0x00, 0x00, 0x00, 0xde, 0xad]).unwrap();
         }
         let m = PsoManifest::load(&dir).unwrap();
-        assert_eq!(m.entries.len(), 3);
+        assert_eq!(m.entries.len(), 7);
+        assert!(m.entries.iter().any(|e| matches!(e.recipe, PsoRecipe::Graphics { lazy_icb: true, with_icb: true, .. })));
+        assert!(m.entries.iter().any(|e| matches!(e.recipe, PsoRecipe::Mesh { with_icb: true, .. })));
+        assert!(m.entries.iter().any(|e| matches!(e.recipe, PsoRecipe::Geometry { .. })));
+        assert!(m.entries.iter().any(|e| matches!(e.recipe, PsoRecipe::Tessellation { gs_hash: Some(_), .. })));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1358,6 +1816,69 @@ mod tests {
         let _pso = ComputePipeline::new_in_cache(&warm_cache, rs, &dxil, "verify_warm", true, true).unwrap();
         let st = warm_cache.stats();
         assert_eq!((st.archives_loaded, st.archive_hits, st.compiles), (1, 1, 0), "{st:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prewarm_compiles_with_icb_graphics_variant_for_zero_gameplay_compiles() {
+        let Some(dev) = crate::metal::device() else {
+            return;
+        };
+        if !dxil_metal::converter_available() {
+            return;
+        }
+        let vs_dxil: &[u8] = include_bytes!("../../../dxil-metal/tests/fixtures/entry_v2.vs.dxil");
+        let root = std::env::temp_dir().join(format!("d3d12_icb_prewarm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manifest_dir = root.join("pso_manifest");
+        let pso_dir = root.join("pso_cache");
+
+        let rs = RootSignature::new(RootSignatureDesc {
+            version: RootSignatureVersion::V1_1,
+            parameters: vec![],
+            static_samplers: vec![],
+            flags: 0,
+        })
+        .unwrap();
+        let gd = GraphicsDesc {
+            vs: vs_dxil,
+            ps: None,
+            blend: BlendDesc::default(),
+            sample_mask: u32::MAX,
+            raster: RasterState::default(),
+            depth_stencil: DepthStencilState::default(),
+            input_layout: vec![],
+            strip_cut: 0,
+            topology_type: 3,
+            rtv_formats: vec![],
+            dsv_format: 40,
+            sample_count: 1,
+        };
+
+        let writer = PsoManifestWriter::open(&manifest_dir).unwrap();
+        assert!(writer.record_graphics_with_icb(&rs, &gd, true, true, true, false, None).unwrap());
+        drop(writer);
+
+        let cfg = PipelineCacheConfig {
+            dir: Some(pso_dir.clone()),
+            max_archives: 16,
+            flush_on_drop: false,
+        };
+        let cold = PipelineCache::open(&dev.dev, &cfg).unwrap();
+        let rep = prewarm_into_cache(&cold, std::slice::from_ref(&manifest_dir), 1).unwrap();
+        assert_eq!(rep.pso_compiled, 1);
+        assert_eq!(rep.pso_failed, 0);
+        // Both primary (non-ICB) and ICB variants compiled into the archive!
+        assert_eq!(cold.stats().compiles, 2);
+        drop(cold);
+
+        // Warm launch: both primary GraphicsPipeline AND prewarm_icb_in_cache hit with 0 compiles!
+        let warm = PipelineCache::open(&dev.dev, &cfg).unwrap();
+        let gp = GraphicsPipeline::new_in_cache(&warm, rs, &gd, "warm_gfx", true, true, false).unwrap();
+        gp.prewarm_icb_in_cache(&warm).unwrap();
+        let st = warm.stats();
+        assert_eq!((st.archive_hits, st.compiles), (2, 0), "{st:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
