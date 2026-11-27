@@ -458,13 +458,52 @@ def parse_loginusers_vdf(path: Path) -> list[dict[str, Any]]:
     return users
 
 
-def parse_local_owned_app_ids(steam_home: Path) -> set[str]:
-    """Collect owned Steam AppIDs from local macOS Steam `userdata` caches (no credentials)."""
+_STEAM_ID64_BASE = 76561197960265728
+
+
+def steam_id64_to_account_id32(steam_id64: str | None) -> str | None:
+    """Convert a 64-bit SteamID string to Steam's 32-bit `userdata/<account_id>` folder name."""
+    if not steam_id64:
+        return None
+    raw = str(steam_id64).strip()
+    if not raw.isdigit():
+        return None
+    val = int(raw)
+    if val <= _STEAM_ID64_BASE:
+        return None
+    return str(val - _STEAM_ID64_BASE)
+
+
+def parse_local_owned_app_ids(
+    steam_home: Path,
+    *,
+    steam_id64: str | None = None,
+) -> set[str]:
+    """Collect owned Steam AppIDs from local Steam `userdata` caches scoped to one account.
+
+    When `steam_id64` is supplied, only `userdata/<account_id32>` is scanned.
+    When `steam_id64` is omitted, a single numeric `userdata/<id>` directory is
+    scanned; multiple `userdata/*` directories are never merged together.
+    """
     owned: set[str] = set()
     userdata = steam_home / "userdata"
     if not userdata.is_dir():
         return owned
-    for user_dir in sorted(userdata.iterdir()):
+
+    user_dirs: list[Path] = []
+    if steam_id64 is not None:
+        account_id32 = steam_id64_to_account_id32(steam_id64)
+        if account_id32 is None:
+            return owned
+        cand = userdata / account_id32
+        if cand.is_dir():
+            user_dirs = [cand]
+    else:
+        numeric_dirs = [p for p in sorted(userdata.iterdir()) if p.is_dir() and p.name.isdigit()]
+        if len(numeric_dirs) == 1:
+            user_dirs = numeric_dirs
+
+    for user_dir in user_dirs:
         cfg_dir = user_dir / "config"
         if not cfg_dir.is_dir():
             continue
@@ -511,6 +550,7 @@ def parse_appmanifest_acf(path: Path) -> dict[str, Any] | None:
     user_cfg = vdf_get(state, "UserConfig")
     branch = str(vdf_get(user_cfg, "betakey", default="") or "").strip() or "public"
     size_str = str(vdf_get(state, "SizeOnDisk", default="") or "").strip()
+    last_owner = str(vdf_get(state, "LastOwner", default="") or "").strip() or None
     return {
         "app_id": app_id,
         "name": str(vdf_get(state, "name", default=app_id) or app_id),
@@ -518,6 +558,7 @@ def parse_appmanifest_acf(path: Path) -> dict[str, Any] | None:
         "build_id": str(vdf_get(state, "buildid", default="") or "") or None,
         "size_on_disk_bytes": int(size_str) if size_str.isdigit() else None,
         "branch": branch,
+        "last_owner": last_owner,
         "mounted_depots": depots,
         "manifest_path": str(path),
     }

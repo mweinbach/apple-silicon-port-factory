@@ -32,6 +32,7 @@ Hard rules:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -263,11 +264,15 @@ class SteamBackend(StoreBackend):
     def _installs_file(self) -> Path:
         return self.state_dir() / "steam-installs.json"
 
-    def _owned_cache_file(self) -> Path:
-        return self.state_dir() / "steam-owned-cache.json"
+    def _owned_cache_file(self, account_name: str) -> Path:
+        safe_key = re.sub(r"[^a-z0-9_-]+", "_", account_name.strip().lower()).strip("_") or "default"
+        return self.state_dir() / f"steam-owned-cache-{safe_key}.json"
 
     def _manifest_cache_file(self, app_id: str) -> Path:
         return self.state_dir() / "manifests" / f"{app_id}.json"
+
+    def _store_details_cache_file(self, app_id: str) -> Path:
+        return self.state_dir() / "store_details" / f"{app_id}.json"
 
     def find_depot_downloader(self) -> Path | None:
         if self._explicit_dd is not None:
@@ -829,47 +834,117 @@ class SteamBackend(StoreBackend):
             )
         return owned
 
-    def _load_owned_id_cache(self) -> set[str]:
-        data = _read_json(self._owned_cache_file(), {})
+    def _load_owned_id_cache(self, account_name: str | None) -> set[str]:
+        if not account_name:
+            return set()
+        data = _read_json(self._owned_cache_file(account_name), {})
         raw = data.get("app_ids") if isinstance(data, dict) else None
         if isinstance(raw, list):
             return {str(x) for x in raw if str(x).isdigit()}
         return set()
 
-    def _save_owned_id_cache(self, app_ids: set[str]) -> None:
+    def _save_owned_id_cache(self, app_ids: set[str], account_name: str | None) -> None:
+        if not account_name:
+            return
         _atomic_write_json(
-            self._owned_cache_file(),
+            self._owned_cache_file(account_name),
             {
+                "account_name": account_name,
                 "app_ids": sorted(app_ids, key=lambda x: int(x) if x.isdigit() else 0),
                 "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             },
         )
 
+    def _is_multi_account_environment(self, account_name: str | None = None) -> bool:
+        loginusers = parse_loginusers_vdf(self.steam_home() / "config" / "loginusers.vdf")
+        if len(loginusers) > 1:
+            return True
+        if account_name and loginusers:
+            known_accts = {u["account_name"].lower() for u in loginusers if u.get("account_name")}
+            if known_accts and account_name.lower() not in known_accts:
+                return True
+        userdata = self.steam_home() / "userdata"
+        if userdata.is_dir():
+            numeric_dirs = [p for p in userdata.iterdir() if p.is_dir() and p.name.isdigit()]
+            if len(numeric_dirs) > 1:
+                return True
+        return False
+
+    def _local_userdata_owned_ids(
+        self,
+        account_name: str | None,
+        steam_id64: str | None,
+    ) -> set[str]:
+        if steam_id64 is not None:
+            return parse_local_owned_app_ids(self.steam_home(), steam_id64=steam_id64)
+        loginusers = parse_loginusers_vdf(self.steam_home() / "config" / "loginusers.vdf")
+        if loginusers:
+            # `loginusers.vdf` exists for other account(s), none matching `account_name`;
+            # never fall back to reading another account's `userdata` directory.
+            return set()
+        return parse_local_owned_app_ids(self.steam_home(), steam_id64=None)
+
+    def _install_belongs_to_account(
+        self,
+        entry: dict[str, Any],
+        account_name: str | None,
+        steam_id64: str | None,
+        multi_account: bool,
+    ) -> bool:
+        entry_acct = str(entry.get("account_name") or "").strip()
+        entry_id64 = str(entry.get("steam_id64") or "").strip()
+        if entry_acct:
+            return bool(account_name and entry_acct.lower() == account_name.lower())
+        if entry_id64:
+            return bool(steam_id64 and entry_id64 == str(steam_id64))
+        return not multi_account
+
+    def _acf_belongs_to_account(
+        self,
+        acf: dict[str, Any],
+        steam_id64: str | None,
+        multi_account: bool,
+    ) -> bool:
+        last_owner = str(acf.get("last_owner") or "").strip()
+        if last_owner and last_owner != "0":
+            return bool(steam_id64 and last_owner == str(steam_id64))
+        return not multi_account
+
     def _known_owned_app_ids(self, *, offline: bool = False) -> set[str]:
-        """Return known owned AppIDs from Web API, local Steam caches, and managed installs."""
-        owned_ids = self._load_owned_id_cache()
-        owned_ids |= parse_local_owned_app_ids(self.steam_home())
-        owned_ids |= set(self._load_installs().keys())
-        owned_ids |= set(self._scan_steamapps_manifests().keys())
-        for inst in self._load_installs().values():
-            for dlc_id in inst.get("dlcs") or []:
-                if str(dlc_id).isdigit():
-                    owned_ids.add(str(dlc_id))
+        """Return known owned AppIDs scoped strictly to the active Steam account."""
+        account_name, steam_id64 = self._resolve_account_info()
+        if not account_name:
+            return set()
+
+        multi_account = self._is_multi_account_environment(account_name)
+        owned_ids = self._load_owned_id_cache(account_name)
+        owned_ids |= self._local_userdata_owned_ids(account_name, steam_id64)
+
+        for aid, inst in self._load_installs().items():
+            if self._install_belongs_to_account(inst, account_name, steam_id64, multi_account):
+                owned_ids.add(aid)
+                for dlc_id in inst.get("dlcs") or []:
+                    if str(dlc_id).isdigit():
+                        owned_ids.add(str(dlc_id))
+
+        for aid, acf in self._scan_steamapps_manifests().items():
+            if self._acf_belongs_to_account(acf, steam_id64, multi_account):
+                owned_ids.add(aid)
 
         if not offline:
-            account_name, steam_id64 = self._resolve_account_info()
             api_key = self._get_steam_web_api_key()
-            if account_name and api_key and steam_id64:
+            if api_key and steam_id64:
                 web_games = self._list_owned_via_web_api(api_key, steam_id64)
                 if web_games is not None:
                     for g in web_games:
                         owned_ids.add(g.app_id)
-                    self._save_owned_id_cache(owned_ids)
+                    self._save_owned_id_cache(owned_ids, account_name)
         return owned_ids
 
     def list_owned(self, *, platform: str = "windows", refresh: bool = False) -> list[OwnedGame]:
         del refresh
         account_name, steam_id64 = self._require_logged_in_account()
+        multi_account = self._is_multi_account_environment(account_name)
         installs = self._load_installs()
         acf_map = self._scan_steamapps_manifests()
 
@@ -883,11 +958,17 @@ class SteamBackend(StoreBackend):
                 for g in web_games:
                     games_by_id[g.app_id] = g
 
-        # 2. Local Steam library caches (`userdata/*/config/{localconfig.vdf,librarycache}`),
-        #    local `steamapps/appmanifest_*.acf`, and managed `port-acquire` installs
-        local_ids = parse_local_owned_app_ids(self.steam_home())
-        local_ids |= set(installs.keys())
-        local_ids |= set(acf_map.keys())
+        # 2. Local Steam library caches scoped to the active Steam account:
+        #    `userdata/<account_id32>/config/{localconfig.vdf,librarycache}`,
+        #    account-owned `steamapps/appmanifest_*.acf`, and managed installs.
+        local_ids = self._local_userdata_owned_ids(account_name, steam_id64)
+        for aid, inst in installs.items():
+            if self._install_belongs_to_account(inst, account_name, steam_id64, multi_account):
+                local_ids.add(aid)
+        for aid, acf in acf_map.items():
+            if self._acf_belongs_to_account(acf, steam_id64, multi_account):
+                local_ids.add(aid)
+
         for aid in sorted(local_ids, key=lambda x: int(x) if x.isdigit() else 0):
             if aid == COMMON_REDIST_APP_ID:
                 continue
@@ -903,7 +984,7 @@ class SteamBackend(StoreBackend):
                     platforms=["windows"],
                 )
 
-        # Merge installed state
+        # Merge installed state onto games owned by this account
         for aid, inst in installs.items():
             if aid in games_by_id:
                 games_by_id[aid].installed = True
@@ -920,7 +1001,7 @@ class SteamBackend(StoreBackend):
                     games_by_id[aid].title = str(acf["name"])
 
         if games_by_id:
-            self._save_owned_id_cache(set(games_by_id.keys()))
+            self._save_owned_id_cache(set(games_by_id.keys()), account_name)
 
         result = sorted(
             games_by_id.values(),
@@ -1075,18 +1156,24 @@ class SteamBackend(StoreBackend):
             "Run `tools/port-acquire --store steam search \"<title>\" --json` to find its AppID."
         )
 
-    def _fetch_store_appdetails(self, app_id: str) -> dict[str, Any]:
-        if not self._allow_network:
-            return {}
+    def _fetch_store_appdetails(self, app_id: str, *, offline: bool = False) -> dict[str, Any]:
+        cache_path = self._store_details_cache_file(app_id)
+        if offline or not self._allow_network:
+            cached = _read_json(cache_path, {})
+            return cached if isinstance(cached, dict) else {}
         url = f"https://store.steampowered.com/api/appdetails?appids={urllib.parse.quote(app_id)}&l=english"
         try:
             payload = self._http_get_json(url)
         except Exception:
-            return {}
+            cached = _read_json(cache_path, {})
+            return cached if isinstance(cached, dict) else {}
         entry = payload.get(str(app_id)) if isinstance(payload, dict) else None
         if isinstance(entry, dict) and entry.get("success") and isinstance(entry.get("data"), dict):
-            return entry["data"]
-        return {}
+            data = entry["data"]
+            _atomic_write_json(cache_path, data)
+            return data
+        cached = _read_json(cache_path, {})
+        return cached if isinstance(cached, dict) else {}
 
     def _detect_signals(
         self,
@@ -1240,7 +1327,7 @@ class SteamBackend(StoreBackend):
             account_name=account_name,
             offline=offline,
         )
-        store_details = {} if offline else self._fetch_store_appdetails(resolved_id)
+        store_details = self._fetch_store_appdetails(resolved_id, offline=offline)
         owned_app_ids = self._known_owned_app_ids(offline=offline)
 
         install_path_str = (
@@ -1442,7 +1529,7 @@ class SteamBackend(StoreBackend):
         )
 
     def download(self, options: DownloadOptions) -> DownloadResult:
-        account_name, _ = self._require_logged_in_account()
+        account_name, steam_id64 = self._require_logged_in_account()
         resolved_id = self._resolve_app_id(options.app_id, offline=False)
         dest = options.dest.expanduser().resolve()
         dest.mkdir(parents=True, exist_ok=True)
@@ -1577,6 +1664,8 @@ class SteamBackend(StoreBackend):
             installs[resolved_id] = {
                 "app_id": resolved_id,
                 "title": title,
+                "account_name": account_name,
+                "steam_id64": steam_id64,
                 "install_path": str(dest),
                 "platform": options.platform,
                 "branch": branch,
@@ -1602,6 +1691,79 @@ class SteamBackend(StoreBackend):
             downloaded_redists=downloaded_redists,
         )
 
+    def _verify_files_readonly(
+        self,
+        install_path: Path,
+        depots: list[dict[str, Any]],
+    ) -> tuple[int, list[str], list[str]]:
+        """Check local files against depot manifest sizes and SHA-1 digests without writing to disk."""
+        install_root = install_path.resolve()
+        checked = 0
+        missing_files: list[str] = []
+        corrupted_files: list[str] = []
+        seen_paths: set[str] = set()
+
+        for depot in depots:
+            if not isinstance(depot, dict):
+                continue
+            for entry in depot.get("files") or []:
+                if not isinstance(entry, dict):
+                    continue
+                flags = int(entry.get("flags") or 0)
+                # EDepotFileFlag.Directory (0x40 = 64)
+                if flags & 64:
+                    continue
+                rel = str(entry.get("path") or "").replace("\\", "/").strip().lstrip("/")
+                if not rel or rel.endswith("/") or rel in seen_paths:
+                    continue
+                seen_paths.add(rel)
+
+                rel_path = Path(rel)
+                if rel_path.is_absolute() or ".." in rel_path.parts:
+                    continue
+
+                target = install_path / rel_path
+                try:
+                    target.resolve().relative_to(install_root)
+                except (OSError, ValueError):
+                    checked += 1
+                    corrupted_files.append(rel)
+                    continue
+
+                checked += 1
+                if not target.is_file():
+                    missing_files.append(rel)
+                    continue
+
+                expected_size = entry.get("size_bytes")
+                try:
+                    actual_size = target.stat().st_size
+                except OSError:
+                    corrupted_files.append(rel)
+                    continue
+
+                if isinstance(expected_size, int) and actual_size != expected_size:
+                    corrupted_files.append(rel)
+                    continue
+
+                expected_sha1 = str(entry.get("sha1") or "").lower()
+                if len(expected_sha1) == 40 and expected_sha1 != "0" * 40:
+                    digest = hashlib.sha1()
+                    try:
+                        with target.open("rb") as fh:
+                            while True:
+                                chunk = fh.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                digest.update(chunk)
+                    except OSError:
+                        corrupted_files.append(rel)
+                        continue
+                    if digest.hexdigest() != expected_sha1:
+                        corrupted_files.append(rel)
+
+        return checked, missing_files, corrupted_files
+
     def verify(self, app_id: str, *, repair: bool = False) -> VerifyResult:
         account_name, _ = self._require_logged_in_account()
         resolved_id = self._resolve_app_id(app_id, offline=True, strict=True)
@@ -1613,17 +1775,58 @@ class SteamBackend(StoreBackend):
             )
         install_path = Path(str(entry["install_path"]))
         if not install_path.is_dir():
-            return VerifyResult(
-                store=self.name,
-                app_id=resolved_id,
-                ok=False,
-                repaired=False,
-                missing_files=[str(install_path)],
-                message=f"Install directory missing: {install_path}",
-            )
+            if not repair:
+                return VerifyResult(
+                    store=self.name,
+                    app_id=resolved_id,
+                    ok=False,
+                    repaired=False,
+                    missing_files=[str(install_path)],
+                    message=f"Install directory missing: {install_path}",
+                )
+            install_path.mkdir(parents=True, exist_ok=True)
 
         platform = str(entry.get("platform") or "windows")
         branch = str(entry.get("branch") or "public")
+
+        if not repair:
+            # Read-only verification: query fresh depot manifests via `-manifest-only`
+            # and verify file presence, size, and SHA-1 locally without downloading or
+            # overwriting any files in `install_path`.
+            manifest_data = self._fetch_depot_manifests(
+                resolved_id,
+                platform=platform,
+                branch=branch,
+                account_name=account_name,
+                offline=False,
+                allow_cache_fallback=False,
+            )
+            checked, missing_files, corrupted_files = self._verify_files_readonly(
+                install_path,
+                manifest_data.get("depots") or [],
+            )
+            if checked == 0:
+                raise CommandFailedError(
+                    f"Could not obtain depot file manifest entries for Steam AppID {resolved_id} "
+                    f"(branch {branch!r}) to verify."
+                )
+            ok = not missing_files and not corrupted_files
+            return VerifyResult(
+                store=self.name,
+                app_id=resolved_id,
+                ok=ok,
+                repaired=False,
+                missing_files=missing_files,
+                corrupted_files=corrupted_files,
+                message=(
+                    f"Verified {checked} files OK (read-only)"
+                    if ok
+                    else (
+                        f"Verification failed (read-only): {len(missing_files)} missing, "
+                        f"{len(corrupted_files)} corrupted (re-run with --repair to fix)"
+                    )
+                ),
+            )
 
         dd_args = [
             "-app",
@@ -1654,7 +1857,7 @@ class SteamBackend(StoreBackend):
             app_id=resolved_id,
             ok=ok,
             repaired=repaired_flag,
-            message=msg_lines[-1] if msg_lines else ("Verified OK via DepotDownloader -validate" if ok else "Validation failed"),
+            message=msg_lines[-1] if msg_lines else ("Repaired OK via DepotDownloader -validate" if ok else "Repair failed"),
         )
 
     def update(

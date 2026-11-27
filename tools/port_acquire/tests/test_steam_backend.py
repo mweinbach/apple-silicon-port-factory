@@ -7,6 +7,7 @@ network access and zero real credentials.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -256,7 +257,8 @@ class SteamBackendTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        cfg_dir = self.steam_home / "userdata" / "100002" / "config"
+        # 76561198000000002 - 76561197960265728 = 39734274
+        cfg_dir = self.steam_home / "userdata" / "39734274" / "config"
         (cfg_dir / "librarycache").mkdir(parents=True, exist_ok=True)
         (cfg_dir / "librarycache" / "367520.json").write_text("{}", encoding="utf-8")
         (cfg_dir / "localconfig.vdf").write_text(
@@ -770,6 +772,190 @@ class SteamBackendTests(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+    def test_verify_readonly_detects_missing_and_corrupt_without_repairing(self) -> None:
+        exe_bytes = b"MZ\x90\x00MOCKPE"
+        dll_bytes = b"MZ\x90\x00STEAM"
+        exe_sha1 = hashlib.sha1(exe_bytes).hexdigest()
+        dll_sha1 = hashlib.sha1(dll_bytes).hexdigest()
+        real_manifest = textwrap.dedent(
+            f"""\
+            Content Manifest for Depot 1091501
+
+            Manifest ID / date       : 8811223344556677889 / 11/26/2026 12:00:00
+            Total number of files    : 3
+            Total number of chunks   : 2
+            Total bytes on disk      : {len(exe_bytes) + len(dll_bytes)}
+            Total bytes compressed   : {len(exe_bytes) + len(dll_bytes)}
+
+                      Size Chunks File SHA                                 Flags Name
+                         0      0 0000000000000000000000000000000000000000    64 bin\\x64
+            {len(exe_bytes):14d}      1 {exe_sha1}     0 bin\\x64\\SampleGame.exe
+            {len(dll_bytes):14d}      1 {dll_sha1}     0 bin\\x64\\steam_api64.dll
+            """
+        )
+        self.manifest_file.write_text(real_manifest, encoding="utf-8")
+
+        backend = self._make_backend()
+        backend.login(username="testplayer")
+        dest = self.root / "games" / "VerifyReadOnlyGame"
+        backend.download(DownloadOptions(app_id="1091500", dest=dest, platform="windows"))
+
+        # 1. Clean install passes read-only verification without invoking download/validate
+        before_count = len(self._read_invocations())
+        ok_ver = backend.verify("1091500", repair=False)
+        self.assertTrue(ok_ver.ok)
+        self.assertFalse(ok_ver.repaired)
+        self.assertEqual(ok_ver.missing_files, [])
+        self.assertEqual(ok_ver.corrupted_files, [])
+        new_calls = self._read_invocations()[before_count:]
+        self.assertEqual(len(new_calls), 1)
+        self.assertIn("-manifest-only", new_calls[0])
+        self.assertNotIn("-validate", new_calls[0])
+
+        # 2. Delete one file and corrupt another; verify(repair=False) reports both and leaves disk untouched
+        exe_path = dest / "bin" / "x64" / "SampleGame.exe"
+        dll_path = dest / "bin" / "x64" / "steam_api64.dll"
+        exe_path.unlink()
+        dll_path.write_bytes(b"CORRUPTED!!")
+
+        before_count = len(self._read_invocations())
+        bad_ver = backend.verify("1091500", repair=False)
+        self.assertFalse(bad_ver.ok)
+        self.assertFalse(bad_ver.repaired)
+        self.assertEqual(bad_ver.missing_files, ["bin/x64/SampleGame.exe"])
+        self.assertEqual(bad_ver.corrupted_files, ["bin/x64/steam_api64.dll"])
+        # Must stay strictly read-only: deleted file still absent, corrupted bytes untouched
+        self.assertFalse(exe_path.exists())
+        self.assertEqual(dll_path.read_bytes(), b"CORRUPTED!!")
+        ro_calls = self._read_invocations()[before_count:]
+        self.assertEqual(len(ro_calls), 1)
+        self.assertIn("-manifest-only", ro_calls[0])
+        self.assertNotIn("-validate", ro_calls[0])
+
+        # 3. verify(repair=True) invokes DepotDownloader -validate and restores both files
+        rep_ver = backend.verify("1091500", repair=True)
+        self.assertTrue(rep_ver.ok)
+        self.assertTrue(rep_ver.repaired)
+        self.assertEqual(exe_path.read_bytes(), exe_bytes)
+        self.assertEqual(dll_path.read_bytes(), dll_bytes)
+
+    def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
+        def fake_http(url: str):
+            if "appdetails" in url:
+                return {
+                    "1091500": {
+                        "success": True,
+                        "data": {
+                            "name": "Sample Action RPG",
+                            "dlc": [2138330, 2138331],
+                            "drm_notice": "Incorporates 3rd-party DRM: Denuvo Anti-Tamper",
+                            "categories": [{"description": "Steam Achievements"}],
+                        },
+                    }
+                }
+            return {}
+
+        backend = self._make_backend(allow_network=True, http_get_json=fake_http)
+        backend.login(username="testplayer")
+        dest = self.root / "games" / "CachedStoreMetaGame"
+        backend.download(DownloadOptions(app_id="1091500", dest=dest, platform="windows"))
+
+        # Offline info (the exact path used by CLI when generating port-acquire-manifest.json)
+        # must preserve cached Store title, DLCs, and DRM signals.
+        offline_info = backend.info("1091500", platform="windows", offline=True)
+        self.assertEqual(offline_info.title, "Sample Action RPG")
+        self.assertEqual([d.app_id for d in offline_info.dlcs], ["2138330", "2138331"])
+        self.assertTrue(offline_info.drm.detected)
+        self.assertTrue(offline_info.drm.requires_online_auth)
+        self.assertTrue(any("Denuvo" in s for s in offline_info.drm.signals))
+
+    def test_local_ownership_and_cache_scoped_to_active_account(self) -> None:
+        # Configure two Steam accounts on the same machine:
+        #   testplayer -> 76561198000000002 (account_id32 = 39734274) owns 1091500, 2138330, 367520
+        #   otheruser  -> 76561198000000001 (account_id32 = 39734273) owns 555555, 2138331
+        (self.steam_home / "config" / "loginusers.vdf").write_text(
+            textwrap.dedent(
+                """\
+                "users"
+                {
+                    "76561198000000001"
+                    {
+                        "AccountName"       "otheruser"
+                        "PersonaName"       "Other User"
+                        "MostRecent"        "0"
+                        "RememberPassword"  "1"
+                    }
+                    "76561198000000002"
+                    {
+                        "AccountName"       "testplayer"
+                        "PersonaName"       "Test Player"
+                        "MostRecent"        "1"
+                        "RememberPassword"  "1"
+                    }
+                }
+                """
+            ),
+            encoding="utf-8",
+        )
+        other_cfg = self.steam_home / "userdata" / "39734273" / "config"
+        other_cfg.mkdir(parents=True, exist_ok=True)
+        (other_cfg / "localconfig.vdf").write_text(
+            '"UserLocalConfigStore" { "Software" { "Valve" { "Steam" { "apps" { "555555" { "Playtime" "10" } "2138331" { "Playtime" "5" } } } } } }\n',
+            encoding="utf-8",
+        )
+        # Shared steamapps ACF owned by otheruser
+        sa_dir = self.steam_home / "steamapps"
+        sa_dir.mkdir(parents=True, exist_ok=True)
+        (sa_dir / "appmanifest_777777.acf").write_text(
+            '"AppState" { "appid" "777777" "name" "Other User Installed Game" "installdir" "OtherGame" "LastOwner" "76561198000000001" }\n',
+            encoding="utf-8",
+        )
+
+        # Direct helper test: multi-user directory without steam_id64 must not merge accounts
+        self.assertEqual(parse_local_owned_app_ids(self.steam_home), set())
+        self.assertEqual(
+            parse_local_owned_app_ids(self.steam_home, steam_id64="76561198000000002"),
+            {"367520", "1091500", "2138330"},
+        )
+        self.assertEqual(
+            parse_local_owned_app_ids(self.steam_home, steam_id64="76561198000000001"),
+            {"555555", "2138331"},
+        )
+
+        def fake_http(url: str):
+            if "appdetails" in url:
+                return {
+                    "1091500": {
+                        "success": True,
+                        "data": {
+                            "name": "Sample Action RPG",
+                            "dlc": [2138330, 2138331],
+                        },
+                    }
+                }
+            return {}
+
+        backend = self._make_backend(allow_network=True, http_get_json=fake_http)
+
+        # Account 1: otheruser sees only its own games, not testplayer's
+        backend.login(username="otheruser")
+        other_owned = {g.app_id for g in backend.list_owned()}
+        self.assertEqual(other_owned, {"555555", "2138331", "777777"})
+
+        # Account 2: testplayer sees only its own games and DLC 2138330 (NOT 2138331, 555555, or 777777)
+        backend.login(username="testplayer")
+        player_owned = {g.app_id for g in backend.list_owned()}
+        self.assertEqual(player_owned, {"367520", "1091500", "2138330"})
+
+        info = backend.info("1091500", platform="windows", offline=False)
+        dlc_by_id = {d.app_id: d for d in info.dlcs}
+        self.assertTrue(dlc_by_id["2138330"].owned)
+        self.assertFalse(dlc_by_id["2138331"].owned)
+
+        # Unlisted account name not in loginusers.vdf must not inherit other accounts' local caches
+        backend.login(username="brandnewuser")
+        self.assertEqual(backend.list_owned(), [])
 
     def test_unauthenticated_download_raises_auth_required(self) -> None:
         empty_home = self.root / "empty_steam_home"
