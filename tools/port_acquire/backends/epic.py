@@ -1156,19 +1156,52 @@ class EpicBackend(StoreBackend):
 
     def download(self, options: DownloadOptions) -> DownloadResult:
         leg_plat = _platform_to_legendary(options.platform) or "Windows"
+        want_plat_norm = _normalize_platform_name(options.platform)
         dest = options.dest.expanduser().resolve()
 
-        # Legendary's `--download-only` maps to `no_install=True`, which skips its built-in
-        # `--with-dlcs` branch. When both are requested, download the base game with
-        # `--skip-dlcs` and then download each owned, installable DLC explicitly into `dest`.
+        # Validate that the requested platform actually exists for this app before invoking
+        # `legendary install` (Legendary silently falls back to Windows when a requested
+        # platform like Mac has no asset).
+        try:
+            pre_info = self._run_json(["info", options.app_id, "--platform", leg_plat, "--json"])
+        except AcquireError:
+            pre_info = None
+        if isinstance(pre_info, dict):
+            pre_game = pre_info.get("game") if isinstance(pre_info.get("game"), dict) else pre_info
+            avail_plats: set[str] = set()
+            asset_infos = pre_game.get("asset_infos")
+            if isinstance(asset_infos, dict):
+                avail_plats.update(_normalize_platform_name(k) for k in asset_infos.keys())
+            supported_plats = pre_game.get("supported_platforms")
+            if isinstance(supported_plats, list):
+                avail_plats.update(
+                    _normalize_platform_name(str(p)) for p in supported_plats if str(p).strip()
+                )
+            if avail_plats and want_plat_norm not in avail_plats:
+                raise CommandFailedError(
+                    f"Epic app {options.app_id!r} does not have a {want_plat_norm!r} build "
+                    f"(available platforms: {', '.join(sorted(avail_plats))}). Refusing to "
+                    f"let Legendary fall back to another platform.",
+                    code="platform_unavailable",
+                    details={
+                        "app_id": options.app_id,
+                        "requested_platform": want_plat_norm,
+                        "available_platforms": sorted(avail_plats),
+                    },
+                )
+
+        # Always enumerate and download requested DLCs explicitly (passing `--skip-dlcs` on
+        # the base install): real Legendary skips its built-in `--with-dlcs` branch both under
+        # `--download-only` (`no_install=True`) AND whenever the base game is already current
+        # (download size == 0).
         explicit_dlcs_after_base: list[str] = []
-        if options.with_dlcs and options.no_register:
+        if options.with_dlcs:
             explicit_dlcs_after_base = [
                 d.app_id
                 for d in self.list_dlcs(options.app_id, platform=options.platform)
                 if d.owned and d.installable and d.app_id
             ]
-        elif not options.with_dlcs and options.dlcs:
+        elif options.dlcs:
             explicit_dlcs_after_base = list(options.dlcs)
 
         # Real Legendary reuses `igame.install_path` (before `--game-folder`) AND overrides
@@ -1176,7 +1209,6 @@ class EpicBackend(StoreBackend):
         # (even under `--download-only`). Reject conflicting `--dest` or `--platform` up front so
         # we never silently modify files outside `--dest` or download the wrong OS build.
         existing_installed = self._installed_map()
-        want_plat_norm = _normalize_platform_name(options.platform)
         for target_id in (options.app_id, *explicit_dlcs_after_base):
             existing = existing_installed.get(target_id)
             if not existing:
@@ -1229,11 +1261,8 @@ class EpicBackend(StoreBackend):
             "--game-folder",
             str(dest),
             "--skip-sdl",
+            "--skip-dlcs",
         ]
-        if options.with_dlcs and not options.no_register:
-            cmd.append("--with-dlcs")
-        else:
-            cmd.append("--skip-dlcs")
         if options.no_register:
             cmd.append("--download-only")
         if options.max_workers is not None:
@@ -1287,20 +1316,28 @@ class EpicBackend(StoreBackend):
                 f"legendary install for {options.app_id!r} did not register an installed entry",
                 details={"app_id": options.app_id},
             )
+        if inst and isinstance(inst.get("platform"), str) and inst["platform"].strip():
+            actual_plat = _normalize_platform_name(inst["platform"])
+            if actual_plat != want_plat_norm:
+                raise CommandFailedError(
+                    f"legendary registered {options.app_id!r} for platform {actual_plat!r} "
+                    f"instead of requested {want_plat_norm!r}",
+                    code="platform_mismatch",
+                    details={
+                        "app_id": options.app_id,
+                        "requested_platform": want_plat_norm,
+                        "installed_platform": actual_plat,
+                    },
+                )
         install_path = str(inst["install_path"]) if inst and inst.get("install_path") else str(dest)
         title = str(inst.get("title") or options.app_id) if inst else options.app_id
         version = str(inst["version"]) if inst and inst.get("version") else None
-
-        if options.with_dlcs and not options.no_register:
-            for d_id, d_entry in installed_map.items():
-                if d_entry.get("is_dlc") and d_entry.get("install_path") == install_path:
-                    downloaded_dlcs.append(d_id)
 
         return DownloadResult(
             store=self.name,
             app_id=options.app_id,
             title=title,
-            platform=options.platform.lower(),
+            platform=want_plat_norm,
             install_path=install_path,
             version=version,
             downloaded_dlcs=sorted(set(downloaded_dlcs)),

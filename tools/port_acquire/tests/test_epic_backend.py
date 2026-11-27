@@ -65,6 +65,7 @@ DEFAULT_STATE = {
             "app_title": "Marvel's Spider-Man 2",
             "asset_infos": {
                 "Windows": {"build_version": "1.1.0", "app_name": "ArachnidTwo"},
+                "Mac": {"build_version": "1.1.0", "app_name": "ArachnidTwo"},
             },
             "metadata": {
                 "id": "cat_arachnid_2",
@@ -719,13 +720,16 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertIn("-epicapp=ArachnidTwo", manifest["launch_args"])
         self.assertTrue(any(r["id"] == "eos_overlay" for r in manifest["redistributables"]))
 
-        # Verify command flags passed to legendary
+        # Verify command flags passed to legendary (base + explicit DLC installs)
         invocations = self._read_invocations()
         install_inv = next(inv for inv in invocations if "install" in inv and "ArachnidTwo" in inv)
         self.assertIn("--platform", install_inv)
         self.assertEqual(install_inv[install_inv.index("--platform") + 1], "Windows")
         self.assertIn("--game-folder", install_inv)
-        self.assertIn("--with-dlcs", install_inv)
+        self.assertIn("--skip-dlcs", install_inv)
+        self.assertTrue(
+            any("install" in inv and "ArachnidTwoPreorderDLC" in inv for inv in invocations)
+        )
 
         # Verify OK
         proc_ver = self._run_cli("verify", "ArachnidTwo", "--json")
@@ -1057,6 +1061,50 @@ class TestEpicBackendMocked(unittest.TestCase):
 
         m_after = read_package_manifest(dest / MANIFEST_FILENAME)
         self.assertEqual(m_after["platform"], "macos")
+
+    def test_registered_download_with_dlcs_fetches_dlcs_when_base_is_already_current(self) -> None:
+        dest = self.root / "games" / "BaseAlreadyCurrent"
+        # First install base game only (without DLCs).
+        self.backend.download(
+            DownloadOptions(app_id="ArachnidTwo", dest=dest, platform="windows", with_dlcs=False)
+        )
+        self.assertFalse((dest / "ArachnidTwoPreorderDLC.dat").exists())
+
+        # Now request `--with-dlcs` against the existing current installation; all owned
+        # installable DLCs must be downloaded explicitly.
+        res = self.backend.download(
+            DownloadOptions(app_id="ArachnidTwo", dest=dest, platform="windows", with_dlcs=True)
+        )
+        self.assertEqual(
+            set(res.downloaded_dlcs),
+            {"ArachnidTwoPreorderDLC", "ArachnidTwoExpansion", "ArachnidTwoEntitlementDLC"},
+        )
+        self.assertTrue((dest / "ArachnidTwoPreorderDLC.dat").is_file())
+        self.assertTrue((dest / "ArachnidTwoExpansion.dat").is_file())
+        self.assertTrue((dest / "ArachnidTwoEntitlementDLC.dat").is_file())
+
+    def test_download_rejects_unavailable_platform_before_legendary_fallback(self) -> None:
+        dest = self.root / "games" / "WindowsOnlyAsMac"
+        inv_before = len(self._read_invocations())
+        # `OnlineShooter` only has a Windows asset in `asset_infos`.
+        proc = self._run_cli(
+            "download",
+            "OnlineShooter",
+            "--dest",
+            str(dest),
+            "--platform",
+            "macos",
+            "--json",
+        )
+        self.assertEqual(proc.returncode, 5)
+        err = json.loads(proc.stdout)
+        self.assertFalse(err["ok"])
+        self.assertEqual(err["error"]["code"], "platform_unavailable")
+        self.assertEqual(err["error"]["details"]["requested_platform"], "macos")
+        self.assertEqual(err["error"]["details"]["available_platforms"], ["windows"])
+        self.assertFalse(dest.exists())
+        inv_after = self._read_invocations()[inv_before:]
+        self.assertFalse(any("install" in inv for inv in inv_after))
 
     def test_uninstall_fails_on_exit_zero_removal_or_lock_error(self) -> None:
         dest = self.root / "games" / "UninstallFail"
