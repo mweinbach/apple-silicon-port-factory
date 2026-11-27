@@ -210,6 +210,11 @@ pub struct TemporalEncodeInputs<'a> {
     pub reactive_mask: Option<&'a MtlTexture>,
     pub content_w: u32,
     pub content_h: u32,
+    pub color_offset: [u32; 2],
+    pub depth_offset: [u32; 2],
+    pub motion_offset: [u32; 2],
+    pub reactive_offset: [u32; 2],
+    pub output_offset: [u32; 2],
     pub jitter_offset: [f32; 2],
     pub motion_vector_scale: [f32; 2],
     pub reset: bool,
@@ -302,6 +307,7 @@ pub struct TemporalScaler {
     has_reactive_setter: bool,
     has_pre_exposure_setter: bool,
     has_fence_setter: bool,
+    has_content_offsets: bool,
 }
 
 // SAFETY: `TemporalScaler` is only mutated while holding its enclosing `Mutex`,
@@ -313,6 +319,12 @@ impl TemporalScaler {
     /// Whether the MetalFX temporal scaler exposes `setFence:` on this OS/device.
     pub(crate) fn has_fence(&self) -> bool {
         self.has_fence_setter
+    }
+
+    /// Whether the MetalFX temporal scaler exposes macOS 27 / Metal 4.1 zero-copy content
+    /// and output offset setters (`setColorContentOffsetX:`, `setOutputOffsetX:`, etc.).
+    pub(crate) fn has_content_offsets(&self) -> bool {
+        self.has_content_offsets
     }
 
     /// Encode MetalFX temporal upscaling directly into an open `MTL4CommandBuffer`
@@ -338,6 +350,20 @@ impl TemporalScaler {
             }
             let _: () = msg_send![&*self.obj, setInputContentWidth: inputs.content_w as usize];
             let _: () = msg_send![&*self.obj, setInputContentHeight: inputs.content_h as usize];
+            if self.has_content_offsets {
+                let _: () = msg_send![&*self.obj, setColorContentOffsetX: inputs.color_offset[0] as usize];
+                let _: () = msg_send![&*self.obj, setColorContentOffsetY: inputs.color_offset[1] as usize];
+                let _: () = msg_send![&*self.obj, setDepthContentOffsetX: inputs.depth_offset[0] as usize];
+                let _: () = msg_send![&*self.obj, setDepthContentOffsetY: inputs.depth_offset[1] as usize];
+                let _: () = msg_send![&*self.obj, setMotionContentOffsetX: inputs.motion_offset[0] as usize];
+                let _: () = msg_send![&*self.obj, setMotionContentOffsetY: inputs.motion_offset[1] as usize];
+                if self.has_reactive_setter && self.reactive_usage.is_some() {
+                    let _: () = msg_send![&*self.obj, setReactiveMaskContentOffsetX: inputs.reactive_offset[0] as usize];
+                    let _: () = msg_send![&*self.obj, setReactiveMaskContentOffsetY: inputs.reactive_offset[1] as usize];
+                }
+                let _: () = msg_send![&*self.obj, setOutputOffsetX: inputs.output_offset[0] as usize];
+                let _: () = msg_send![&*self.obj, setOutputOffsetY: inputs.output_offset[1] as usize];
+            }
             let _: () = msg_send![&*self.obj, setJitterOffsetX: inputs.jitter_offset[0]];
             let _: () = msg_send![&*self.obj, setJitterOffsetY: inputs.jitter_offset[1]];
             let _: () = msg_send![&*self.obj, setMotionVectorScaleX: inputs.motion_vector_scale[0]];
@@ -353,6 +379,20 @@ impl TemporalScaler {
             let _: () = msg_send![&*self.obj, encodeToCommandBuffer: cb];
             // Release texture/fence references immediately so cached scalers never pin
             // transient render targets across resizes or resource destruction.
+            if self.has_content_offsets {
+                let _: () = msg_send![&*self.obj, setColorContentOffsetX: 0usize];
+                let _: () = msg_send![&*self.obj, setColorContentOffsetY: 0usize];
+                let _: () = msg_send![&*self.obj, setDepthContentOffsetX: 0usize];
+                let _: () = msg_send![&*self.obj, setDepthContentOffsetY: 0usize];
+                let _: () = msg_send![&*self.obj, setMotionContentOffsetX: 0usize];
+                let _: () = msg_send![&*self.obj, setMotionContentOffsetY: 0usize];
+                if self.has_reactive_setter && self.reactive_usage.is_some() {
+                    let _: () = msg_send![&*self.obj, setReactiveMaskContentOffsetX: 0usize];
+                    let _: () = msg_send![&*self.obj, setReactiveMaskContentOffsetY: 0usize];
+                }
+                let _: () = msg_send![&*self.obj, setOutputOffsetX: 0usize];
+                let _: () = msg_send![&*self.obj, setOutputOffsetY: 0usize];
+            }
             let _: () = msg_send![&*self.obj, setColorTexture: None::<&MtlTexture>];
             let _: () = msg_send![&*self.obj, setDepthTexture: None::<&MtlTexture>];
             let _: () = msg_send![&*self.obj, setMotionTexture: None::<&MtlTexture>];
@@ -854,9 +894,17 @@ pub fn get_or_create_temporal_scaler(key: TemporalScalerKey) -> Option<Arc<Mutex
         let has_fence_setter: Bool = unsafe {
             msg_send![&*obj, respondsToSelector: objc2::sel!(setFence:)]
         };
+        let has_content_offsets: bool = unsafe {
+            let c: Bool = msg_send![&*obj, respondsToSelector: objc2::sel!(setColorContentOffsetX:)];
+            let d: Bool = msg_send![&*obj, respondsToSelector: objc2::sel!(setDepthContentOffsetX:)];
+            let m: Bool = msg_send![&*obj, respondsToSelector: objc2::sel!(setMotionContentOffsetX:)];
+            let r: Bool = msg_send![&*obj, respondsToSelector: objc2::sel!(setReactiveMaskContentOffsetX:)];
+            let o: Bool = msg_send![&*obj, respondsToSelector: objc2::sel!(setOutputOffsetX:)];
+            c.as_bool() && d.as_bool() && m.as_bool() && r.as_bool() && o.as_bool()
+        };
         log::debug!(
             target: "d3d",
-            "metalfx: created temporal scaler {}x{} (color={:?}, depth={:?}, motion={:?}, reactive={:?}) -> {}x{} ({:?}) usages=(c={:?}, d={:?}, m={:?}, o={:?}, r={:?}) drs={} scale=[{:.2},{:.2}]",
+            "metalfx: created temporal scaler {}x{} (color={:?}, depth={:?}, motion={:?}, reactive={:?}) -> {}x{} ({:?}) usages=(c={:?}, d={:?}, m={:?}, o={:?}, r={:?}) drs={} offsets={} scale=[{:.2},{:.2}]",
             key.input_w,
             key.input_h,
             color_fmt,
@@ -872,6 +920,7 @@ pub fn get_or_create_temporal_scaler(key: TemporalScalerKey) -> Option<Arc<Mutex
             output_usage,
             reactive_usage,
             key.dynamic_resolution,
+            has_content_offsets,
             min_scale,
             max_scale,
         );
@@ -894,6 +943,7 @@ pub fn get_or_create_temporal_scaler(key: TemporalScalerKey) -> Option<Arc<Mutex
             has_reactive_setter: has_reactive_setter.as_bool(),
             has_pre_exposure_setter: has_pre_exposure_setter.as_bool(),
             has_fence_setter: has_fence_setter.as_bool(),
+            has_content_offsets,
         })))
     });
 
@@ -1778,5 +1828,117 @@ mod tests {
             (br - 0.1).abs() < 0.02 && (bg - 0.8).abs() < 0.02 && (bb - 0.2).abs() < 0.02,
             "bilinear subrect border leaked outside source subrect: got ({br}, {bg}, {bb})"
         );
+    }
+
+    #[test]
+    fn metal41_temporal_offsets_zero_copy_subrect() {
+        if super::super::device().is_none() {
+            return;
+        }
+        let _lock = crate::metal::env_test_lock();
+        let saved_master = std::env::var_os("PORT_METAL41");
+        let saved_sub = std::env::var_os("PORT_METAL41_METALFX_OFFSETS");
+        std::env::set_var("PORT_METAL41_METALFX_OFFSETS", "1");
+
+        use crate::metal::cmdlist::{CommandAllocator, CommandList, CopyLoc, TargetView};
+        use crate::metal::queue::{ListType, Queue};
+        use crate::metal::resource::Resource;
+        use crate::types::{dim, heap_type, resource_flags, HeapProperties, ResourceDesc};
+
+        const RGBA16_FLOAT: u32 = 10;
+        const D32_FLOAT: u32 = 40;
+        const RG16_FLOAT: u32 = 34;
+
+        let make_tex = |w: u64, h: u32, fmt: u32, flags: u32, name: &str| {
+            let desc = ResourceDesc {
+                Dimension: dim::TEXTURE2D,
+                Width: w,
+                Height: h,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: fmt,
+                SampleCount: 1,
+                Flags: flags,
+                ..Default::default()
+            };
+            let hp = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+            Resource::new_committed_default(&desc, &hp, name).unwrap()
+        };
+        let make_readback = |bytes: u64| {
+            let desc = ResourceDesc {
+                Dimension: dim::BUFFER,
+                Width: bytes,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleCount: 1,
+                Layout: 1,
+                ..Default::default()
+            };
+            let hp = HeapProperties { Type: heap_type::READBACK, ..Default::default() };
+            Resource::new_committed_default(&desc, &hp, "mfx offsets rb").unwrap()
+        };
+
+        let q = Queue::new(ListType::Direct, "mfx offsets test").unwrap();
+        let alloc = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l = CommandList::new(ListType::Direct).unwrap();
+
+        let color = make_tex(128, 128, RGBA16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "off color");
+        let depth = make_tex(128, 128, D32_FLOAT, resource_flags::ALLOW_DEPTH_STENCIL, "off depth");
+        let motion = make_tex(128, 128, RG16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "off motion");
+        let out = make_tex(
+            192,
+            192,
+            RGBA16_FLOAT,
+            resource_flags::ALLOW_RENDER_TARGET | resource_flags::ALLOW_UNORDERED_ACCESS,
+            "off out",
+        );
+        let rb_out = make_readback(192 * 8 * 192);
+        let fp_out = PlacedFootprint { offset: 0, format: RGBA16_FLOAT, width: 192, height: 192, depth: 1, row_pitch: 192 * 8, _pad: 0 };
+        let rtv_c = TargetView::rtv(&color, None).unwrap();
+        let dsv_d = TargetView::dsv(&depth, None).unwrap();
+        let rtv_m = TargetView::rtv(&motion, None).unwrap();
+        let rtv_out = TargetView::rtv(&out, None).unwrap();
+
+        l.begin(&alloc).unwrap();
+        unsafe {
+            l.clear_rtv(&rtv_c, [0.9, 0.1, 0.1, 1.0], &[]).unwrap();
+            l.clear_rtv(&rtv_c, [0.1, 0.8, 0.2, 1.0], &[crate::types::Rect { left: 32, top: 32, right: 96, bottom: 96 }]).unwrap();
+            l.clear_dsv(&dsv_d, true, 0.5, false, 0, &[]).unwrap();
+            l.clear_rtv(&rtv_m, [0.0, 0.0, 0.0, 0.0], &[]).unwrap();
+            l.clear_rtv(&rtv_out, [0.05, 0.05, 0.05, 1.0], &[]).unwrap();
+        }
+        let mut p = TemporalUpscaleParams::new(&out, &color, &depth, &motion, [64, 64], [128, 128]);
+        p.reset = true;
+        p.color_origin = [32, 32];
+        p.depth_origin = [32, 32];
+        p.motion_origin = [32, 32];
+        p.output_origin = [64, 64];
+        l.upscale_temporal_with_backend(&p).unwrap();
+        l.copy_texture_region(CopyLoc::Footprint(&rb_out, fp_out), [0, 0, 0], CopyLoc::Subresource(&out, 0), None).unwrap();
+        l.close().unwrap();
+        q.execute_command_lists(&mut [&mut l]);
+        q.wait_idle();
+
+        let px = unsafe { std::slice::from_raw_parts(rb_out.cpu_ptr().unwrap() as *const u16, 192 * 192 * 4) };
+        let out_bg = (8 * 192 + 8) * 4;
+        assert!((f16_to_f32(px[out_bg]) - 0.05).abs() < 0.03, "outside output subrect was overwritten");
+        let out_mid = (128 * 192 + 128) * 4;
+        let mr = f16_to_f32(px[out_mid]);
+        let mg = f16_to_f32(px[out_mid + 1]);
+        let mb = f16_to_f32(px[out_mid + 2]);
+        assert!(
+            (mr - 0.1).abs() < 0.1 && (mg - 0.8).abs() < 0.1 && (mb - 0.2).abs() < 0.1,
+            "zero-copy MetalFX 27.0 offsets should upscale green subrect (0.1, 0.8, 0.2), got ({mr}, {mg}, {mb})"
+        );
+
+        match saved_master {
+            Some(v) => std::env::set_var("PORT_METAL41", v),
+            None => std::env::remove_var("PORT_METAL41"),
+        }
+        match saved_sub {
+            Some(v) => std::env::set_var("PORT_METAL41_METALFX_OFFSETS", v),
+            None => std::env::remove_var("PORT_METAL41_METALFX_OFFSETS"),
+        }
     }
 }

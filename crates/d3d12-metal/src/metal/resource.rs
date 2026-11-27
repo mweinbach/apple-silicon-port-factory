@@ -47,6 +47,9 @@ pub struct ViewKey {
     pub slices: (u32, u32),
     /// `MTLTextureSwizzle` r,g,b,a packed in bytes (0x05040302 = identity).
     pub swizzle: u32,
+    /// Canonical `f32::to_bits()` of Metal 4.1 `MTLTextureViewDescriptor.minLOD`
+    /// (`0` when disabled or zero).
+    pub min_lod_bits: u32,
 }
 
 pub const SWIZZLE_IDENTITY: u32 = 0x0504_0302;
@@ -54,6 +57,43 @@ pub const SWIZZLE_IDENTITY: u32 = 0x0504_0302;
 fn unpack_swizzle(s: u32) -> MTLTextureSwizzleChannels {
     let c = |i: u32| MTLTextureSwizzle(((s >> (8 * i)) & 0xFF) as u8);
     MTLTextureSwizzleChannels { red: c(0), green: c(1), blue: c(2), alpha: c(3) }
+}
+
+/// Creates a Metal 4.1 (`macOS 27` / `iOS 27`) texture view with hardware `minLOD` via
+/// `MTLTextureViewDescriptor` + `newTextureViewWithDescriptor:`. Returns `None` on older
+/// OSes lacking the class/selectors so callers fall back cleanly to standard texture views.
+unsafe fn create_texture_view_with_min_lod(
+    tex: &MtlTexture,
+    fmt: MTLPixelFormat,
+    ty: MTLTextureType,
+    levels: objc2_foundation::NSRange,
+    slices: objc2_foundation::NSRange,
+    swizzle: u32,
+    abs_min_lod: f32,
+) -> Option<Retained<MtlTexture>> {
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2::{msg_send, sel};
+
+    let cls = AnyClass::get(c"MTLTextureViewDescriptor")?;
+    let has_new_view: Bool =
+        msg_send![tex, respondsToSelector: sel!(newTextureViewWithDescriptor:)];
+    if !has_new_view.as_bool() {
+        return None;
+    }
+    let desc: Retained<AnyObject> = msg_send![cls, new];
+    let has_min_lod: Bool = msg_send![&*desc, respondsToSelector: sel!(setMinLOD:)];
+    if !has_min_lod.as_bool() {
+        return None;
+    }
+    let _: () = msg_send![&*desc, setPixelFormat: fmt];
+    let _: () = msg_send![&*desc, setTextureType: ty];
+    let _: () = msg_send![&*desc, setLevelRange: levels];
+    let _: () = msg_send![&*desc, setSliceRange: slices];
+    if swizzle != SWIZZLE_IDENTITY {
+        let _: () = msg_send![&*desc, setSwizzle: unpack_swizzle(swizzle)];
+    }
+    let _: () = msg_send![&*desc, setMinLOD: abs_min_lod];
+    msg_send![tex, newTextureViewWithDescriptor: &*desc]
 }
 
 #[derive(Clone, Copy)]
@@ -1199,27 +1239,75 @@ impl Resource {
     /// [`Self::texture_view`] with a component swizzle (packed
     /// `MTLTextureSwizzle` bytes r,g,b,a).
     pub fn texture_view_swizzled(&self, fmt: MTLPixelFormat, ty: MTLTextureType, mips: (u32, u32), slices: (u32, u32), swizzle: u32) -> Option<Retained<MtlTexture>> {
+        self.texture_view_swizzled_min_lod(fmt, ty, mips, slices, swizzle, 0.0)
+    }
+
+    /// [`Self::texture_view_swizzled`] with an optional Metal 4.1 (`macOS 27` / `iOS 27`)
+    /// `MTLTextureViewDescriptor.minLOD` clamp (`min_lod` is relative to `mips.0`, matching
+    /// D3D12 `ResourceMinLODClamp` and D3D11 `SetResourceMinLOD`).
+    ///
+    /// Active when `min_lod > 0.0` and `PORT_METAL41_VIEW_MIN_LOD` (or `PORT_METAL41`) is
+    /// enabled; falls back cleanly to standard texture views on macOS 26 or when disabled.
+    pub fn texture_view_swizzled_min_lod(
+        &self,
+        fmt: MTLPixelFormat,
+        ty: MTLTextureType,
+        mips: (u32, u32),
+        slices: (u32, u32),
+        swizzle: u32,
+        min_lod: f32,
+    ) -> Option<Retained<MtlTexture>> {
         self.view_epoch.fetch_min(super::queue::submit_epoch(), Ordering::Relaxed);
         let t = self.texture()?;
         let full_mips = (0, t.mipmapLevelCount() as u32);
         let full_slices = (0, (t.arrayLength() as u32).max(1) * if t.textureType() == MTLTextureType::TypeCube || t.textureType() == MTLTextureType::TypeCubeArray { 6 } else { 1 });
-        if fmt == self.mtl_format && ty == t.textureType() && mips == full_mips && slices == full_slices && swizzle == SWIZZLE_IDENTITY {
+        // Metal 4.1 applies `MTLTextureViewDescriptor.minLOD` after adding `levelRange.location`
+        // (`mips.0`), requiring `minLOD <= levelRange.location + levelRange.length` and
+        // `Apple10`+ GPU support (`TextureViewMinLOD`).
+        let max_abs_lod = (mips.0.saturating_add(mips.1)) as f32;
+        let abs_min_lod = if super::device().is_some_and(|d| d.supports_texture_view_min_lod())
+            && min_lod.is_finite()
+            && min_lod > 0.0
+            && mips.1 > 0
+        {
+            (mips.0 as f32 + min_lod).min(max_abs_lod)
+        } else {
+            0.0
+        };
+        let min_lod_bits = if abs_min_lod > 0.0 { abs_min_lod.to_bits() } else { 0 };
+        if fmt == self.mtl_format
+            && ty == t.textureType()
+            && mips == full_mips
+            && slices == full_slices
+            && swizzle == SWIZZLE_IDENTITY
+            && min_lod_bits == 0
+        {
             return Some(t.retain());
         }
-        let key = ViewKey { format: fmt.0, ty: ty.0, mips, slices, swizzle };
+        let key = ViewKey { format: fmt.0, ty: ty.0, mips, slices, swizzle, min_lod_bits };
         let mut v = self.views.lock().unwrap();
         if let Some(x) = v.get(&key) {
             return Some(x.clone());
         }
         let levels = objc2_foundation::NSRange::new(mips.0 as usize, mips.1 as usize);
         let sl = objc2_foundation::NSRange::new(slices.0 as usize, slices.1 as usize);
-        let view = unsafe {
-            if swizzle == SWIZZLE_IDENTITY {
-                t.newTextureViewWithPixelFormat_textureType_levels_slices(fmt, ty, levels, sl)
-            } else {
-                t.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(fmt, ty, levels, sl, unpack_swizzle(swizzle))
+        let view_with_min_lod = if min_lod_bits != 0 {
+            unsafe {
+                create_texture_view_with_min_lod(t, fmt, ty, levels, sl, swizzle, abs_min_lod)
             }
-        }?;
+        } else {
+            None
+        };
+        let view = match view_with_min_lod {
+            Some(tv) => tv,
+            None => unsafe {
+                if swizzle == SWIZZLE_IDENTITY {
+                    t.newTextureViewWithPixelFormat_textureType_levels_slices(fmt, ty, levels, sl)
+                } else {
+                    t.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(fmt, ty, levels, sl, unpack_swizzle(swizzle))
+                }
+            }?,
+        };
         let rk = self.registered_key.load(Ordering::Relaxed);
         if rk != 0 {
             res_registry().write().unwrap().insert_tex_id(mtl_tex_id(&view), rk);
@@ -1249,7 +1337,12 @@ impl Resource {
                 MTLTextureUsage::ShaderRead
             },
         ) };
-        let bpe = crate::format::TABLE.iter().find(|f| f.mtl == fmt).map(|f| f.bytes).unwrap_or(4) as u64;
+        let bpe = match fmt.0 {
+            120 | 121 | 122 => 12u64, // Metal 4.1 Apple10+ MTLPixelFormatRGB32{Uint,Sint,Float}
+            95..=99 => 6u64,          // Metal 4.1 Apple10+ MTLPixelFormatRGB16*
+            45..=48 => 3u64,          // Metal 4.1 Apple10+ MTLPixelFormatRGB8*
+            _ => crate::format::TABLE.iter().find(|f| f.mtl == fmt).map(|f| f.bytes).unwrap_or(4) as u64,
+        };
         let t = b.newTextureWithDescriptor_offset_bytesPerRow(&td, offset as usize, (elements.max(1) * bpe) as usize)?;
         let rk = self.registered_key.load(Ordering::Relaxed);
         if rk != 0 {

@@ -221,19 +221,30 @@ fn buffer_entry(
         return Ok(DescriptorTableEntry::buffer(base + off, dxil_metal::runtime::buffer_metadata(size, 0, false)).to_bytes());
     }
     let fi = format::info(dxgi);
-    if fi.mtl == MTLPixelFormat::Invalid || fi.bytes == 0 {
-        return Err(format!("typed buffer view with format {}", format::name(dxgi)));
-    }
-    let bpe = fi.bytes as u64;
     let dev = super::device().ok_or("no device")?;
-    let align = dev.dev.minimumTextureBufferAlignmentForPixelFormat(fi.mtl).max(1) as u64;
+    // Metal 4.1 (`macOS 27` / `iOS 27`, Apple10+): read-only 3-channel RGB32 texture buffers
+    // (`MTLPixelFormatRGB32{Uint=120, Sint=121, Float=122}`) support D3D12/D3D11 typed
+    // `Buffer<float3>` / `Buffer<uint3>` / `Buffer<int3>` SRVs.
+    let (mtl_fmt, bpe) = if fi.mtl != MTLPixelFormat::Invalid && fi.bytes != 0 {
+        (fi.mtl, fi.bytes as u64)
+    } else if !writable && dev.supports_rgb32_texture_buffer() {
+        match dxgi {
+            6 => (MTLPixelFormat(122), 12u64), // DXGI_FORMAT_R32G32B32_FLOAT -> MTLPixelFormatRGB32Float
+            7 => (MTLPixelFormat(120), 12u64), // DXGI_FORMAT_R32G32B32_UINT  -> MTLPixelFormatRGB32Uint
+            8 => (MTLPixelFormat(121), 12u64), // DXGI_FORMAT_R32G32B32_SINT  -> MTLPixelFormatRGB32Sint
+            _ => return Err(format!("typed buffer view with format {}", format::name(dxgi))),
+        }
+    } else {
+        return Err(format!("typed buffer view with format {}", format::name(dxgi)));
+    };
+    let align = dev.dev.minimumTextureBufferAlignmentForPixelFormat(mtl_fmt).max(1) as u64;
     let off = first * bpe;
     let aligned = off / align * align;
     let el_off = (off - aligned) / bpe;
     if el_off > 255 {
         return Err(format!("typed buffer view element offset {el_off} > 255"));
     }
-    let tv = r.buffer_texture_view(fi.mtl, aligned, num as u64 + el_off, writable).ok_or("texture buffer view creation failed")?;
+    let tv = r.buffer_texture_view(mtl_fmt, aligned, num as u64 + el_off, writable).ok_or("texture buffer view creation failed")?;
     r.note_view_kind(super::resource::HK_TYPED_BUF);
     let v = BufferView {
         gpu_va: base + aligned,
@@ -305,7 +316,7 @@ pub fn srv_entry(r: Option<&Resource>, desc: Option<&[u8; 40]>) -> Result<Entry,
     };
     r.note_view_kind(super::resource::view_tex_handle_kind_mask(dxgi, r.desc.Format, ty));
     // Single-slice 2D views of an array texture keep their slice.
-    let view = r.texture_view_swizzled(fmt, ty, mips, slices, swz);
+    let view = r.texture_view_swizzled_min_lod(fmt, ty, mips, slices, swz, min_lod);
     texture_entry(view, min_lod)
 }
 
@@ -430,5 +441,95 @@ mod tests {
         assert_ne!(tex_id, 0, "counter texture buffer view resource ID must be populated");
         assert_eq!(meta & 0xffff_ffff, 256);
         assert_eq!(meta >> 63, 0, "structured buffer with counter must NOT set typed_buffer bit");
+    }
+
+    #[test]
+    fn metal41_view_min_lod_creates_hardware_min_lod_view_when_enabled() {
+        if super::super::device().is_none() {
+            return;
+        }
+        let _lock = crate::metal::env_test_lock();
+        let saved_master = std::env::var_os("PORT_METAL41");
+        let saved_sub = std::env::var_os("PORT_METAL41_VIEW_MIN_LOD");
+
+        use crate::types::{dim, heap_type, HeapProperties, ResourceDesc};
+        let tdesc = ResourceDesc {
+            Dimension: dim::TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 6,
+            Format: 28, // R8G8B8A8_UNORM
+            SampleCount: 1,
+            ..Default::default()
+        };
+        let hp = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+        let res = Resource::new_committed_default(&tdesc, &hp, "min_lod test").unwrap();
+        let base_id = resource_id(res.texture().unwrap());
+
+        let mut d = [0u8; 40];
+        d[0..4].copy_from_slice(&28u32.to_le_bytes()); // R8G8B8A8_UNORM
+        d[4..8].copy_from_slice(&4u32.to_le_bytes()); // TEXTURE2D
+        d[8..12].copy_from_slice(&DEFAULT_MAPPING.to_le_bytes());
+        d[16..20].copy_from_slice(&1u32.to_le_bytes()); // MostDetailedMip = 1
+        d[20..24].copy_from_slice(&5u32.to_le_bytes()); // MipLevels = 5
+        d[28..32].copy_from_slice(&1.5f32.to_bits().to_le_bytes()); // ResourceMinLODClamp = 1.5
+
+        // Off: no hardware minLOD view override; returns standard mip-range view.
+        std::env::set_var("PORT_METAL41", "0");
+        std::env::set_var("PORT_METAL41_VIEW_MIN_LOD", "0");
+        let v_off = res
+            .texture_view_swizzled_min_lod(
+                MTLPixelFormat::RGBA8Unorm,
+                MTLTextureType::Type2D,
+                (0, 6),
+                (0, 1),
+                SWIZZLE_IDENTITY,
+                2.25,
+            )
+            .unwrap();
+        assert_eq!(resource_id(&v_off), base_id, "disabled minLOD must reuse base texture");
+
+        // On: Metal 4.1 hardware MTLTextureViewDescriptor.minLOD applied on Apple10+
+        // (base_mip + clamp = 1 + 1.5 = 2.5); on Apple9 and earlier falls back cleanly
+        // to the descriptor-table min_lod_clamp with zero Metal validation errors.
+        std::env::set_var("PORT_METAL41_VIEW_MIN_LOD", "1");
+        let dev = super::super::device().unwrap();
+        let v_on = res
+            .texture_view_swizzled_min_lod(
+                MTLPixelFormat::RGBA8Unorm,
+                MTLTextureType::Type2D,
+                (1, 5),
+                (0, 1),
+                SWIZZLE_IDENTITY,
+                1.5,
+            )
+            .unwrap();
+        let e_on = srv_entry(Some(&res), Some(&d)).unwrap();
+        let entry_id = u64::from_le_bytes(e_on[8..16].try_into().unwrap());
+        let entry_min_lod = f32::from_bits(u32::from_le_bytes(e_on[16..20].try_into().unwrap()));
+        assert!((entry_min_lod - 1.5).abs() < 1e-6, "descriptor min_lod_clamp must be 1.5");
+        assert_eq!(entry_id, resource_id(&v_on), "SRV entry must reference texture view");
+        if dev.supports_texture_view_min_lod() {
+            let has_min_lod: objc2::runtime::Bool = unsafe {
+                objc2::msg_send![&*v_on, respondsToSelector: objc2::sel!(minLOD)]
+            };
+            if has_min_lod.as_bool() {
+                let hw_min_lod: f32 = unsafe { objc2::msg_send![&*v_on, minLOD] };
+                assert!(
+                    (hw_min_lod - 2.5).abs() < 1e-4,
+                    "expected hardware minLOD = 1 + 1.5 = 2.5, got {hw_min_lod}"
+                );
+            }
+        }
+
+        match saved_master {
+            Some(v) => std::env::set_var("PORT_METAL41", v),
+            None => std::env::remove_var("PORT_METAL41"),
+        }
+        match saved_sub {
+            Some(v) => std::env::set_var("PORT_METAL41_VIEW_MIN_LOD", v),
+            None => std::env::remove_var("PORT_METAL41_VIEW_MIN_LOD"),
+        }
     }
 }

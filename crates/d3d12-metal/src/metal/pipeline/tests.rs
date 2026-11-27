@@ -1132,3 +1132,42 @@ fn g51_real_northlight_binrfx_and_pe_dxil_handle_kinds() {
     );
     assert!(skin && depth && framegen, "missing expected Alan Wake 2 v1.2.10 shader fixtures");
 }
+
+#[test]
+fn metal41_compute_scheduling_options_build_valid_psos() {
+    if crate::metal::device().is_none() {
+        return;
+    }
+    use crate::metal::m41::{ComputeSchedulingOpts, ContentionRelief, ForwardProgressUsage};
+    let src = "
+#include <metal_stdlib>
+using namespace metal;
+kernel void m41_sched_noop(device uint* dst [[buffer(0)]], uint id [[thread_position_in_grid]]) {
+    dst[id] = id + 1u;
+}
+";
+    let lib = crate::metal::pipeline::library_from_source_with_opts("m41_sched_test", src, false)
+        .expect("compile m41_sched_test");
+    let cases = [
+        ComputeSchedulingOpts {
+            forward_progress: Some(ForwardProgressUsage::Weak),
+            contention_relief: Some(ContentionRelief::Automatic),
+            optimize_for_persistent_kernel: true, // must be auto-suppressed when Weak
+        },
+        ComputeSchedulingOpts {
+            forward_progress: Some(ForwardProgressUsage::SimdGroupParallel),
+            contention_relief: Some(ContentionRelief::None),
+            optimize_for_persistent_kernel: true,
+        },
+    ];
+    for (idx, sched) in cases.iter().enumerate() {
+        let desc = MTL4ComputePipelineDescriptor::new();
+        desc.setComputeFunctionDescriptor(Some(&function_descriptor(&lib, "m41_sched_noop")));
+        apply_compute_scheduling_options(&desc, sched);
+        let pso = pso_cache()
+            .expect("pso_cache")
+            .compute_pipeline(None, &desc)
+            .unwrap_or_else(|e| panic!("scheduling case {idx} failed: {e}"));
+        assert!(pso.maxTotalThreadsPerThreadgroup() >= 32);
+    }
+}

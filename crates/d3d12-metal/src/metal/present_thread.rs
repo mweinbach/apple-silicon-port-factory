@@ -458,7 +458,15 @@ fn blit_with(
         };
         let s_tex: &ProtocolObject<dyn MTLTexture> = cached_src_linear.or(src_view.as_deref()).unwrap_or(src);
         let d_tex: &ProtocolObject<dyn MTLTexture> = dst_view.as_deref().unwrap_or(dst);
-        let kernel_name = if same_size { "port_present_copy_2d" } else { "port_present_scale_2d" };
+        let use_m41_b2 = same_size && super::m41::block_read_kernels_enabled();
+        let kernel_name = if use_m41_b2 {
+            "port_present_copy_2d_b2"
+        } else if same_size {
+            "port_present_copy_2d"
+        } else {
+            "port_present_scale_2d"
+        };
+        let grid_w = if use_m41_b2 { dw.div_ceil(2) } else { dw };
         if let Ok(pso) = super::clear::kernel(kernel_name) {
             let dispatch_with_table = |table: &ProtocolObject<dyn MTL4ArgumentTable>| unsafe {
                 e.setComputePipelineState(pso);
@@ -466,7 +474,7 @@ fn blit_with(
                 table.setTexture_atIndex(d_tex.gpuResourceID(), 1);
                 e.setArgumentTable(Some(table));
                 e.dispatchThreads_threadsPerThreadgroup(
-                    MTLSize { width: dw, height: dh, depth: 1 },
+                    MTLSize { width: grid_w, height: dh, depth: 1 },
                     MTLSize { width: 8, height: 8, depth: 1 },
                 );
             };

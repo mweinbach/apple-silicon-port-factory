@@ -1829,7 +1829,7 @@ pub struct SrvInner {
     pub res_com: usize,
     pub desc: D3D11_SHADER_RESOURCE_VIEW_DESC,
     pub d3d12_desc: [u8; 40],
-    cache: Mutex<(usize, views::Entry)>,
+    cache: Mutex<(usize, u32, views::Entry)>,
 }
 
 impl Drop for SrvInner {
@@ -1838,16 +1838,37 @@ impl Drop for SrvInner {
     }
 }
 
+/// Patch D3D12 `ResourceMinLODClamp` in a 40-byte `D3D12_SHADER_RESOURCE_VIEW_DESC` from D3D11's
+/// `ID3D11DeviceContext::SetResourceMinLOD` value.
+fn patch_d3d12_srv_min_lod(desc: &mut [u8; 40], min_lod_bits: u32) {
+    let dim = u32::from_le_bytes(desc[4..8].try_into().unwrap());
+    let off = match dim {
+        2 | 8 | 9 => 24,  // TEXTURE1D, TEXTURE3D, TEXTURECUBE
+        3 | 10 => 32,     // TEXTURE1DARRAY, TEXTURECUBEARRAY
+        4 => 28,          // TEXTURE2D
+        5 => 36,          // TEXTURE2DARRAY
+        _ => return,
+    };
+    desc[off..off + 4].copy_from_slice(&min_lod_bits.to_le_bytes());
+}
+
 impl SrvInner {
     pub fn entry(&self) -> Result<(Arc<MtlResource>, views::Entry), String> {
         let mtl = self.resource.current_mtl();
         let ptr = Arc::as_ptr(&mtl) as usize;
+        let min_lod_bits = self.resource.min_lod_bits.load(Ordering::Relaxed);
         let mut g = self.cache.lock().unwrap();
-        if g.0 == ptr {
-            return Ok((mtl, g.1));
+        if g.0 == ptr && g.1 == min_lod_bits {
+            return Ok((mtl, g.2));
         }
-        let e = views::srv_entry(Some(&mtl), Some(&self.d3d12_desc))?;
-        *g = (ptr, e);
+        let e = if min_lod_bits == 0 {
+            views::srv_entry(Some(&mtl), Some(&self.d3d12_desc))?
+        } else {
+            let mut d = self.d3d12_desc;
+            patch_d3d12_srv_min_lod(&mut d, min_lod_bits);
+            views::srv_entry(Some(&mtl), Some(&d))?
+        };
+        *g = (ptr, min_lod_bits, e);
         Ok((mtl, e))
     }
 }
@@ -2140,7 +2161,15 @@ pub unsafe fn create_srv(
     }
     let d12 = srv_desc_to_d3d12(&d, res.kind.buffer_stride());
     let mtl = res.current_mtl();
-    let initial = match views::srv_entry(Some(&mtl), Some(&d12)) {
+    let min_lod_bits = res.min_lod_bits.load(Ordering::Relaxed);
+    let initial = if min_lod_bits == 0 {
+        views::srv_entry(Some(&mtl), Some(&d12))
+    } else {
+        let mut patched = d12;
+        patch_d3d12_srv_min_lod(&mut patched, min_lod_bits);
+        views::srv_entry(Some(&mtl), Some(&patched))
+    };
+    let initial = match initial {
         Ok(e) => e,
         Err(e) => return d11_failed!(E_INVALIDARG, "CreateShaderResourceView({d:?}): {e}"),
     };
@@ -2154,7 +2183,7 @@ pub unsafe fn create_srv(
         res_com: res_ptr as usize,
         desc: d,
         d3d12_desc: d12,
-        cache: Mutex::new((Arc::as_ptr(&mtl) as usize, initial)),
+        cache: Mutex::new((Arc::as_ptr(&mtl) as usize, min_lod_bits, initial)),
     });
     std::ptr::write_unaligned(out, Obj::new(D3d11Srv { inner }) as *mut c_void);
     S_OK

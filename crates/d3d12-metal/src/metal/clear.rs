@@ -260,16 +260,7 @@ inline float3 port_ffx_tonemap(float3 rgb) {
 inline float3 port_ffx_inv_tonemap(float3 rgb) {
     return rgb / max(1e-6f, 1.0f - max(rgb.r, max(rgb.g, rgb.b)));
 }
-kernel void port_ffx_gen_reactive_2d(
-    texture2d<float, access::read> opaque_tex [[texture(0)]],
-    texture2d<float, access::read> pre_upscale_tex [[texture(1)]],
-    texture2d<float, access::write> out_reactive [[texture(2)]],
-    constant FfxReactiveParams& p [[buffer(0)]],
-    uint2 g [[thread_position_in_grid]])
-{
-    if (g.x >= p.width || g.y >= p.height) return;
-    float3 c_opaque = opaque_tex.read(g).rgb;
-    float3 c_pre = pre_upscale_tex.read(g).rgb;
+inline float4 port_ffx_reactive_pixel(float3 c_opaque, float3 c_pre, constant FfxReactiveParams& p) {
     if ((p.flags & 1u) != 0u) {
         c_opaque = port_ffx_tonemap(c_opaque);
         c_pre = port_ffx_tonemap(c_pre);
@@ -286,12 +277,67 @@ kernel void port_ffx_gen_reactive_2d(
     if ((p.flags & 4u) != 0u) {
         val = (val < p.cutoff_threshold) ? 0.0f : p.binary_value;
     }
-    out_reactive.write(float4(val, val, val, val), g);
+    return float4(val, val, val, val);
+}
+kernel void port_ffx_gen_reactive_2d(
+    texture2d<float, access::read> opaque_tex [[texture(0)]],
+    texture2d<float, access::read> pre_upscale_tex [[texture(1)]],
+    texture2d<float, access::write> out_reactive [[texture(2)]],
+    constant FfxReactiveParams& p [[buffer(0)]],
+    uint2 g [[thread_position_in_grid]])
+{
+    if (g.x >= p.width || g.y >= p.height) return;
+    out_reactive.write(port_ffx_reactive_pixel(opaque_tex.read(g).rgb, pre_upscale_tex.read(g).rgb, p), g);
+}
+
+// Metal 4.1 multipixel block_read<2, 1> variant (2 horizontal pixels/thread).
+kernel void port_ffx_gen_reactive_2d_b2(
+    texture2d<float, access::read> opaque_tex [[texture(0)]],
+    texture2d<float, access::read> pre_upscale_tex [[texture(1)]],
+    texture2d<float, access::write> out_reactive [[texture(2)]],
+    constant FfxReactiveParams& p [[buffer(0)]],
+    uint2 g [[thread_position_in_grid]])
+{
+    uint bx = g.x << 1u;
+    if (bx >= p.width || g.y >= p.height) return;
+#if __METAL_VERSION__ >= 410
+    if (bx + 1u < p.width) {
+        auto bo = opaque_tex.block_read<2, 1>(int2(bx, g.y));
+        auto bp = pre_upscale_tex.block_read<2, 1>(int2(bx, g.y));
+        out_reactive.write(port_ffx_reactive_pixel(bo.value<0, 0>().rgb, bp.value<0, 0>().rgb, p), uint2(bx, g.y));
+        out_reactive.write(port_ffx_reactive_pixel(bo.value<1, 0>().rgb, bp.value<1, 0>().rgb, p), uint2(bx + 1u, g.y));
+        return;
+    }
+#endif
+    out_reactive.write(port_ffx_reactive_pixel(opaque_tex.read(uint2(bx, g.y)).rgb, pre_upscale_tex.read(uint2(bx, g.y)).rgb, p), uint2(bx, g.y));
+    if (bx + 1u < p.width) {
+        out_reactive.write(port_ffx_reactive_pixel(opaque_tex.read(uint2(bx + 1u, g.y)).rgb, pre_upscale_tex.read(uint2(bx + 1u, g.y)).rgb, p), uint2(bx + 1u, g.y));
+    }
 }
 
 kernel void port_present_copy_2d(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], uint2 g [[thread_position_in_grid]]) {
     if (g.x < dst.get_width() && g.y < dst.get_height() && g.x < src.get_width() && g.y < src.get_height()) {
         dst.write(src.read(g), g);
+    }
+}
+
+// Metal 4.1 multipixel block_read<2, 1> variant (2 horizontal pixels/thread).
+kernel void port_present_copy_2d_b2(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], uint2 g [[thread_position_in_grid]]) {
+    uint bx = g.x << 1u;
+    uint cw = min(dst.get_width(), src.get_width());
+    uint ch = min(dst.get_height(), src.get_height());
+    if (bx >= cw || g.y >= ch) return;
+#if __METAL_VERSION__ >= 410
+    if (bx + 1u < cw) {
+        auto blk = src.block_read<2, 1>(int2(bx, g.y));
+        dst.write(blk.value<0, 0>(), uint2(bx, g.y));
+        dst.write(blk.value<1, 0>(), uint2(bx + 1u, g.y));
+        return;
+    }
+#endif
+    dst.write(src.read(uint2(bx, g.y)), uint2(bx, g.y));
+    if (bx + 1u < cw) {
+        dst.write(src.read(uint2(bx + 1u, g.y)), uint2(bx + 1u, g.y));
     }
 }
 
@@ -390,6 +436,144 @@ kernel void port_clamp_f16_inf_2d(
     }
 }
 
+// Metal 4.1 multipixel block_read<2, 1> variant of port_clamp_f16_inf_2d (same 2x2 grid).
+kernel void port_clamp_f16_inf_2d_b2(
+    texture2d<float, access::read_write> tex [[texture(0)]],
+    constant float4& maxv [[buffer(0)]],
+    uint2 g [[thread_position_in_grid]])
+{
+    uint bx = g.x << 1u, by = g.y << 1u;
+    uint w = tex.get_width(), h = tex.get_height();
+    if (bx >= w || by >= h) return;
+    for (uint dy = 0u; dy < 2u; ++dy) {
+        uint y = by + dy;
+        if (y >= h) break;
+#if __METAL_VERSION__ >= 410
+        if (bx + 1u < w) {
+            auto blk = tex.block_read<2, 1>(int2(bx, y));
+            float4 v0 = blk.value<0, 0>();
+            float4 v1 = blk.value<1, 0>();
+            if (isinf(v0.x) || isinf(v0.y) || isinf(v0.z) || isinf(v0.w)) {
+                v0.x = isinf(v0.x) ? copysign(maxv.x, v0.x) : v0.x;
+                v0.y = isinf(v0.y) ? copysign(maxv.y, v0.y) : v0.y;
+                v0.z = isinf(v0.z) ? copysign(maxv.z, v0.z) : v0.z;
+                v0.w = isinf(v0.w) ? copysign(maxv.w, v0.w) : v0.w;
+                tex.write(v0, uint2(bx, y));
+            }
+            if (isinf(v1.x) || isinf(v1.y) || isinf(v1.z) || isinf(v1.w)) {
+                v1.x = isinf(v1.x) ? copysign(maxv.x, v1.x) : v1.x;
+                v1.y = isinf(v1.y) ? copysign(maxv.y, v1.y) : v1.y;
+                v1.z = isinf(v1.z) ? copysign(maxv.z, v1.z) : v1.z;
+                v1.w = isinf(v1.w) ? copysign(maxv.w, v1.w) : v1.w;
+                tex.write(v1, uint2(bx + 1u, y));
+            }
+            continue;
+        }
+#endif
+        for (uint dx = 0u; dx < 2u; ++dx) {
+            uint x = bx + dx;
+            if (x >= w) break;
+            float4 v = tex.read(uint2(x, y));
+            if (isinf(v.x) || isinf(v.y) || isinf(v.z) || isinf(v.w)) {
+                v.x = isinf(v.x) ? copysign(maxv.x, v.x) : v.x;
+                v.y = isinf(v.y) ? copysign(maxv.y, v.y) : v.y;
+                v.z = isinf(v.z) ? copysign(maxv.z, v.z) : v.z;
+                v.w = isinf(v.w) ? copysign(maxv.w, v.w) : v.w;
+                tex.write(v, uint2(x, y));
+            }
+        }
+    }
+}
+
+// Metal 4.1 multipixel block_read<2, 1> + SIMD-group reduction + release-ordered atomic
+// variant of port_diag_tex_scan_2d (2 horizontal pixels/thread).
+inline void port_diag_store_release(device atomic_uint* dst, uint val) {
+#if __METAL_VERSION__ >= 410
+    atomic_store_explicit(dst, val, memory_order_release, mem_flags::mem_device);
+#else
+    atomic_store_explicit(dst, val, memory_order_relaxed);
+#endif
+}
+
+kernel void port_diag_tex_scan_2d_b2(
+    texture2d<float, access::read> tex [[texture(0)]],
+    device atomic_uint* out [[buffer(0)]],
+    uint2 g [[thread_position_in_grid]])
+{
+    uint w = tex.get_width(), h = tex.get_height();
+    uint bx = g.x << 1u;
+    uint c0 = 0u, c1 = 0u, c2 = 0u, c3 = 0u;
+    uint c4 = 0u, c5 = 0u, c6 = 0u, c7 = 0u;
+    uint c8 = 0u, c9 = 0u, c10 = 0u;
+    if (bx < w && g.y < h) {
+        bool has_p1 = (bx + 1u) < w;
+        float4 p0, p1;
+#if __METAL_VERSION__ >= 410
+        if (has_p1) {
+            auto blk = tex.block_read<2, 1>(int2(bx, g.y));
+            p0 = blk.value<0, 0>();
+            p1 = blk.value<1, 0>();
+        } else {
+            p0 = tex.read(uint2(bx, g.y));
+            p1 = float4(0.0f);
+        }
+#else
+        p0 = tex.read(uint2(bx, g.y));
+        p1 = has_p1 ? tex.read(uint2(bx + 1u, g.y)) : float4(0.0f);
+#endif
+        for (uint lane = 0u; lane < (has_p1 ? 2u : 1u); ++lane) {
+            uint px = bx + lane;
+            float4 v = (lane == 0u) ? p0 : p1;
+            if (px == (w >> 1) && g.y == (h >> 1)) {
+                port_diag_store_release(&out[16], as_type<uint>(v.x));
+                port_diag_store_release(&out[17], as_type<uint>(v.y));
+                port_diag_store_release(&out[18], as_type<uint>(v.z));
+                port_diag_store_release(&out[19], as_type<uint>(v.w));
+            }
+            if (px == ((w * 2u) / 3u) && g.y == ((h * 7u) / 8u)) {
+                port_diag_store_release(&out[20], as_type<uint>(v.x));
+                port_diag_store_release(&out[21], as_type<uint>(v.y));
+                port_diag_store_release(&out[22], as_type<uint>(v.z));
+                port_diag_store_release(&out[23], as_type<uint>(v.w));
+            }
+            bool nr = isnan(v.x), ng = isnan(v.y), nb = isnan(v.z), na = isnan(v.w);
+            bool ir = isinf(v.x), ig = isinf(v.y), ib = isinf(v.z), ia = isinf(v.w);
+            bool hr = !nr && !ir && abs(v.x) > 500.0;
+            bool hg = !ng && !ig && abs(v.y) > 500.0;
+            bool hb = !nb && !ib && abs(v.z) > 500.0;
+            c0 += uint(nr); c1 += uint(ng); c2 += uint(nb); c3 += uint(na);
+            c4 += uint(ir); c5 += uint(ig); c6 += uint(ib); c7 += uint(ia);
+            c8 += uint(hr); c9 += uint(hg); c10 += uint(hb);
+            if (nr || ng || nb || ir || ig || ib || hr || hg || hb) {
+                if (atomic_load_explicit(&out[12], memory_order_relaxed) == 0xFFFFFFFFu) {
+                    uint expected = 0xFFFFFFFFu;
+                    if (atomic_compare_exchange_weak_explicit(&out[12], &expected, (g.y << 16) | px, memory_order_relaxed, memory_order_relaxed)) {
+                        port_diag_store_release(&out[13], as_type<uint>(v.x));
+                        port_diag_store_release(&out[14], as_type<uint>(v.y));
+                        port_diag_store_release(&out[15], as_type<uint>(v.z));
+                    }
+                }
+            }
+        }
+    }
+    uint s0 = simd_sum(c0), s1 = simd_sum(c1), s2 = simd_sum(c2), s3 = simd_sum(c3);
+    uint s4 = simd_sum(c4), s5 = simd_sum(c5), s6 = simd_sum(c6), s7 = simd_sum(c7);
+    uint s8 = simd_sum(c8), s9 = simd_sum(c9), s10 = simd_sum(c10);
+    if (simd_is_first()) {
+        if (s0 != 0u) atomic_fetch_add_explicit(&out[0], s0, memory_order_relaxed);
+        if (s1 != 0u) atomic_fetch_add_explicit(&out[1], s1, memory_order_relaxed);
+        if (s2 != 0u) atomic_fetch_add_explicit(&out[2], s2, memory_order_relaxed);
+        if (s3 != 0u) atomic_fetch_add_explicit(&out[3], s3, memory_order_relaxed);
+        if (s4 != 0u) atomic_fetch_add_explicit(&out[4], s4, memory_order_relaxed);
+        if (s5 != 0u) atomic_fetch_add_explicit(&out[5], s5, memory_order_relaxed);
+        if (s6 != 0u) atomic_fetch_add_explicit(&out[6], s6, memory_order_relaxed);
+        if (s7 != 0u) atomic_fetch_add_explicit(&out[7], s7, memory_order_relaxed);
+        if (s8 != 0u) atomic_fetch_add_explicit(&out[8], s8, memory_order_relaxed);
+        if (s9 != 0u) atomic_fetch_add_explicit(&out[9], s9, memory_order_relaxed);
+        if (s10 != 0u) atomic_fetch_add_explicit(&out[10], s10, memory_order_relaxed);
+    }
+}
+
 "#;
 
 /// The typed texture clear kernels (1-pixel/thread + 2x2-pixel/thread `*_t4` variants),
@@ -436,7 +620,10 @@ unsafe impl Sync for Kernels {}
 fn default_tg(name: &str) -> [u32; 3] {
     if name == "port_fill" || name == "port_fill_v4" {
         [64, 1, 1]
-    } else if name.ends_with("_t4") || name == "port_clamp_f16_inf_2d" {
+    } else if name.ends_with("_t4")
+        || name == "port_clamp_f16_inf_2d"
+        || name == "port_clamp_f16_inf_2d_b2"
+    {
         [16, 8, 1]
     } else {
         [8, 8, 1]
@@ -446,7 +633,10 @@ fn default_tg(name: &str) -> [u32; 3] {
 fn fast_tg(name: &str) -> [u32; 3] {
     if name == "port_fill" || name == "port_fill_v4" {
         [256, 1, 1]
-    } else if name.ends_with("_t4") || name == "port_clamp_f16_inf_2d" {
+    } else if name.ends_with("_t4")
+        || name == "port_clamp_f16_inf_2d"
+        || name == "port_clamp_f16_inf_2d_b2"
+    {
         [16, 8, 1]
     } else if name == "port_upscale_2d_f" || name.starts_with("port_clear_2d_") {
         [16, 16, 1]
@@ -466,10 +656,14 @@ fn kernels() -> &'static Kernels {
                 "port_fill_v4".to_string(),
                 "port_upscale_2d_f".to_string(),
                 "port_ffx_gen_reactive_2d".to_string(),
+                "port_ffx_gen_reactive_2d_b2".to_string(),
                 "port_present_copy_2d".to_string(),
+                "port_present_copy_2d_b2".to_string(),
                 "port_present_scale_2d".to_string(),
                 "port_diag_tex_scan_2d".to_string(),
+                "port_diag_tex_scan_2d_b2".to_string(),
                 "port_clamp_f16_inf_2d".to_string(),
+                "port_clamp_f16_inf_2d_b2".to_string(),
             ];
             for t in ["1d", "1da", "2d", "2da", "3d"] {
                 for c in ["f", "u", "i"] {
@@ -756,5 +950,275 @@ mod tests {
                 assert_eq!(px[y * 8 + x], want, "({x},{y})");
             }
         }
+    }
+
+    #[test]
+    fn metal41_block_read_kernels_match_baseline_on_odd_dimensions() {
+        let Some(d) = super::super::device() else { return };
+        let opts = MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
+        let (w, h) = (17usize, 9usize);
+
+        let make_tex_f16 = |usage: MTLTextureUsage| {
+            let td = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    MTLPixelFormat::RGBA16Float,
+                    w,
+                    h,
+                    false,
+                )
+            };
+            td.setUsage(usage);
+            td.setStorageMode(MTLStorageMode::Shared);
+            td.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+            d.dev.newTextureWithDescriptor(&td).unwrap()
+        };
+        let make_tex_r8 = || {
+            let td = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    MTLPixelFormat::R8Unorm,
+                    w,
+                    h,
+                    false,
+                )
+            };
+            td.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
+            td.setStorageMode(MTLStorageMode::Shared);
+            td.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+            d.dev.newTextureWithDescriptor(&td).unwrap()
+        };
+
+        let rw = MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
+        let src = make_tex_f16(MTLTextureUsage::ShaderRead);
+        let opa = make_tex_f16(MTLTextureUsage::ShaderRead);
+        let dst_copy_ref = make_tex_f16(rw);
+        let dst_copy_b2 = make_tex_f16(rw);
+        let dst_react_ref = make_tex_r8();
+        let dst_react_b2 = make_tex_r8();
+        let clamp_ref = make_tex_f16(rw);
+        let clamp_b2 = make_tex_f16(rw);
+
+        let mut src_px = vec![0u16; w * h * 4];
+        let mut opa_px = vec![0u16; w * h * 4];
+        let mut clp_px = vec![0u16; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let r = (x as f32) / (w as f32);
+                let g = (y as f32) / (h as f32);
+                src_px[i] = f32_to_f16(r);
+                src_px[i + 1] = f32_to_f16(g);
+                src_px[i + 2] = f32_to_f16(0.25);
+                src_px[i + 3] = f32_to_f16(1.0);
+
+                let diff = if (x + y) % 3 == 0 { 0.6 } else { 0.0 };
+                opa_px[i] = f32_to_f16((r - diff).max(0.0));
+                opa_px[i + 1] = f32_to_f16(g);
+                opa_px[i + 2] = f32_to_f16(0.25);
+                opa_px[i + 3] = f32_to_f16(1.0);
+
+                // Inject +Inf, -Inf, NaN, and >500.0 pixels for clamp & diag scan tests.
+                clp_px[i] = if x == 16 && y == 8 { 0x7c00 } else if x == 3 && y == 4 { 0x7e00 } else { src_px[i] };
+                clp_px[i + 1] = if x == 5 && y == 2 { 0xfc00 } else if x == 7 && y == 6 { f32_to_f16(600.0) } else { src_px[i + 1] };
+                clp_px[i + 2] = src_px[i + 2];
+                clp_px[i + 3] = src_px[i + 3];
+            }
+        }
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize { width: w, height: h, depth: 1 },
+        };
+        let upload_f16 = |tex: &crate::metal::resource::MtlTexture, data: &[u16]| unsafe {
+            tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                std::ptr::NonNull::new(data.as_ptr() as *mut _).unwrap(),
+                w * 8,
+            );
+        };
+        upload_f16(&src, &src_px);
+        upload_f16(&opa, &opa_px);
+        upload_f16(&clamp_ref, &clp_px);
+        upload_f16(&clamp_b2, &clp_px);
+
+        let react_p = FfxReactiveParams {
+            width: w as u32,
+            height: h as u32,
+            flags: 2, // apply threshold
+            _pad0: 0,
+            scale: 1.0,
+            cutoff_threshold: 0.2,
+            binary_value: 0.9,
+            _pad1: 0.0,
+        };
+        let maxv = [65504.0f32; 4];
+        let react_pb = unsafe {
+            d.dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&react_p as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<FfxReactiveParams>(),
+                opts,
+            )
+        }
+        .unwrap();
+        let maxv_b = unsafe {
+            d.dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&maxv as *const _ as *mut _).unwrap(),
+                16,
+                opts,
+            )
+        }
+        .unwrap();
+        let scan_ref_b = d.dev.newBufferWithLength_options(96, opts).unwrap();
+        let scan_b2_b = d.dev.newBufferWithLength_options(96, opts).unwrap();
+        unsafe {
+            let init_scan = |b: &ProtocolObject<dyn MTLBuffer>| {
+                let s = std::slice::from_raw_parts_mut(b.contents().as_ptr() as *mut u32, 24);
+                s.fill(0);
+                s[12] = 0xFFFF_FFFF;
+            };
+            init_scan(&scan_ref_b);
+            init_scan(&scan_b2_b);
+        }
+
+        let rsd = MTLResidencySetDescriptor::new();
+        let rs = d.dev.newResidencySetWithDescriptor_error(&rsd).unwrap();
+        for a in [
+            ProtocolObject::from_ref(&*src),
+            ProtocolObject::from_ref(&*opa),
+            ProtocolObject::from_ref(&*dst_copy_ref),
+            ProtocolObject::from_ref(&*dst_copy_b2),
+            ProtocolObject::from_ref(&*dst_react_ref),
+            ProtocolObject::from_ref(&*dst_react_b2),
+            ProtocolObject::from_ref(&*clamp_ref),
+            ProtocolObject::from_ref(&*clamp_b2),
+            ProtocolObject::from_ref(&*react_pb),
+            ProtocolObject::from_ref(&*maxv_b),
+            ProtocolObject::from_ref(&*scan_ref_b),
+            ProtocolObject::from_ref(&*scan_b2_b),
+        ] {
+            rs.addAllocation(a);
+        }
+        rs.commit();
+
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxBufferBindCount(2);
+        atd.setMaxTextureBindCount(4);
+        let table = d.dev.newArgumentTableWithDescriptor_error(&atd).unwrap();
+
+        let q = d.dev.newMTL4CommandQueue().unwrap();
+        q.addResidencySet(&rs);
+        let alloc = d.dev.newCommandAllocator().unwrap();
+        let cmd = d.dev.newCommandBuffer().unwrap();
+        cmd.beginCommandBufferWithAllocator(&alloc);
+        let e = cmd.computeCommandEncoder().unwrap();
+        let tg = MTLSize { width: 8, height: 8, depth: 1 };
+        unsafe {
+            // 1) present_copy vs _b2
+            e.setComputePipelineState(kernel("port_present_copy_2d").unwrap());
+            table.setTexture_atIndex(src.gpuResourceID(), 0);
+            table.setTexture_atIndex(dst_copy_ref.gpuResourceID(), 1);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: w, height: h, depth: 1 }, tg);
+
+            e.setComputePipelineState(kernel("port_present_copy_2d_b2").unwrap());
+            table.setTexture_atIndex(src.gpuResourceID(), 0);
+            table.setTexture_atIndex(dst_copy_b2.gpuResourceID(), 1);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: w.div_ceil(2), height: h, depth: 1 }, tg);
+
+            // 2) ffx_gen_reactive vs _b2
+            e.setComputePipelineState(kernel("port_ffx_gen_reactive_2d").unwrap());
+            table.setTexture_atIndex(opa.gpuResourceID(), 0);
+            table.setTexture_atIndex(src.gpuResourceID(), 1);
+            table.setTexture_atIndex(dst_react_ref.gpuResourceID(), 2);
+            table.setAddress_atIndex(react_pb.gpuAddress(), 0);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: w, height: h, depth: 1 }, tg);
+
+            e.setComputePipelineState(kernel("port_ffx_gen_reactive_2d_b2").unwrap());
+            table.setTexture_atIndex(opa.gpuResourceID(), 0);
+            table.setTexture_atIndex(src.gpuResourceID(), 1);
+            table.setTexture_atIndex(dst_react_b2.gpuResourceID(), 2);
+            table.setAddress_atIndex(react_pb.gpuAddress(), 0);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: w.div_ceil(2), height: h, depth: 1 }, tg);
+
+            // 3) diag_tex_scan vs _b2 (run BEFORE clamping!)
+            e.setComputePipelineState(kernel("port_diag_tex_scan_2d").unwrap());
+            table.setTexture_atIndex(clamp_ref.gpuResourceID(), 0);
+            table.setAddress_atIndex(scan_ref_b.gpuAddress(), 0);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: w, height: h, depth: 1 }, tg);
+
+            e.setComputePipelineState(kernel("port_diag_tex_scan_2d_b2").unwrap());
+            table.setTexture_atIndex(clamp_ref.gpuResourceID(), 0);
+            table.setAddress_atIndex(scan_b2_b.gpuAddress(), 0);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: w.div_ceil(16), height: h.div_ceil(8), depth: 1 },
+                tg,
+            );
+
+            // 4) clamp_f16_inf vs _b2
+            e.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                MTLStages::Dispatch,
+                MTLStages::Dispatch,
+                MTL4VisibilityOptions::Device,
+            );
+            let clp_grid = MTLSize { width: w.div_ceil(2), height: h.div_ceil(2), depth: 1 };
+            e.setComputePipelineState(kernel("port_clamp_f16_inf_2d").unwrap());
+            table.setTexture_atIndex(clamp_ref.gpuResourceID(), 0);
+            table.setAddress_atIndex(maxv_b.gpuAddress(), 0);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(clp_grid, tg);
+
+            e.setComputePipelineState(kernel("port_clamp_f16_inf_2d_b2").unwrap());
+            table.setTexture_atIndex(clamp_b2.gpuResourceID(), 0);
+            table.setAddress_atIndex(maxv_b.gpuAddress(), 0);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(clp_grid, tg);
+        }
+        e.endEncoding();
+        cmd.endCommandBuffer();
+        let ev = d.dev.newSharedEvent().unwrap();
+        let mut cbs = [std::ptr::NonNull::from(&*cmd)];
+        unsafe { q.commit_count(std::ptr::NonNull::new(cbs.as_mut_ptr()).unwrap(), 1) };
+        q.signalEvent_value(ProtocolObject::from_ref(&*ev), 1);
+        assert!(ev.waitUntilSignaledValue_timeoutMS(1, 5000));
+
+        let read_f16 = |tex: &crate::metal::resource::MtlTexture| {
+            let mut out = vec![0u16; w * h * 4];
+            unsafe {
+                tex.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                    std::ptr::NonNull::new(out.as_mut_ptr() as *mut _).unwrap(),
+                    w * 8,
+                    region,
+                    0,
+                );
+            }
+            out
+        };
+        let read_r8 = |tex: &crate::metal::resource::MtlTexture| {
+            let mut out = vec![0u8; w * h];
+            unsafe {
+                tex.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                    std::ptr::NonNull::new(out.as_mut_ptr() as *mut _).unwrap(),
+                    w,
+                    region,
+                    0,
+                );
+            }
+            out
+        };
+
+        assert_eq!(read_f16(&dst_copy_b2), read_f16(&dst_copy_ref), "present_copy_b2 parity");
+        assert_eq!(read_r8(&dst_react_b2), read_r8(&dst_react_ref), "ffx_gen_reactive_b2 parity");
+        assert_eq!(read_f16(&clamp_b2), read_f16(&clamp_ref), "clamp_f16_inf_b2 parity");
+
+        let s_ref = unsafe { std::slice::from_raw_parts(scan_ref_b.contents().as_ptr() as *const u32, 24) };
+        let s_b2 = unsafe { std::slice::from_raw_parts(scan_b2_b.contents().as_ptr() as *const u32, 24) };
+        // Counters [0..11] (NaN/Inf/high counts) and sample probes [16..24] must match exactly.
+        assert_eq!(&s_b2[0..11], &s_ref[0..11], "diag_tex_scan_b2 counts parity");
+        assert_eq!(&s_b2[16..24], &s_ref[16..24], "diag_tex_scan_b2 sample probes parity");
+        assert_ne!(s_b2[12], 0xFFFF_FFFF, "diag_tex_scan_b2 must record a bad pixel location");
     }
 }

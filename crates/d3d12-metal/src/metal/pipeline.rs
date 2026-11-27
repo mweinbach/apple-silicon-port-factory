@@ -23,8 +23,8 @@ use objc2_foundation::NSString;
 use objc2_metal::*;
 
 pub use compute::{
-    compute_pipeline_from_function, compute_pipeline_from_function_tg,
-    compute_pipeline_from_function_tg_opts, ComputePipeline,
+    apply_compute_scheduling_options, compute_pipeline_from_function,
+    compute_pipeline_from_function_tg, compute_pipeline_from_function_tg_opts, ComputePipeline,
 };
 #[cfg(test)]
 pub use dxil_hk::register_shader_hk_profile_for_test;

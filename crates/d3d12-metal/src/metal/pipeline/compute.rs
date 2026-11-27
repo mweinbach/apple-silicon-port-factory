@@ -16,6 +16,53 @@ use super::{
     apply_immutable_pipeline_options, compile, function_descriptor, library, pso_cache,
     shader_function_descriptor, MtlComputePipeline, MtlLibrary,
 };
+use crate::metal::m41::{ComputeSchedulingOpts, ForwardProgressUsage};
+
+/// Applies Metal 4.1 (`macOS 27` / `iOS 27`) compute pipeline scheduling hints
+/// (`forwardProgressUsage`, `contentionRelief`, `optimizeForPersistentKernel`) via
+/// `respondsToSelector:` so macOS 26 remains unaffected.
+pub fn apply_compute_scheduling_options(
+    desc: &MTL4ComputePipelineDescriptor,
+    sched: &ComputeSchedulingOpts,
+) {
+    if !sched.is_active() {
+        return;
+    }
+    unsafe {
+        if let Some(fp) = sched.forward_progress {
+            let has_sel: objc2::runtime::Bool = objc2::msg_send![
+                desc,
+                respondsToSelector: objc2::sel!(setForwardProgressUsage:)
+            ];
+            if has_sel.as_bool() {
+                let _: () = objc2::msg_send![desc, setForwardProgressUsage: fp as isize];
+            }
+        }
+        if let Some(cr) = sched.contention_relief {
+            let has_sel: objc2::runtime::Bool = objc2::msg_send![
+                desc,
+                respondsToSelector: objc2::sel!(setContentionRelief:)
+            ];
+            if has_sel.as_bool() {
+                let _: () = objc2::msg_send![desc, setContentionRelief: cr as isize];
+            }
+        }
+        if sched.optimize_for_persistent_kernel
+            && sched.forward_progress != Some(ForwardProgressUsage::Weak)
+        {
+            let has_sel: objc2::runtime::Bool = objc2::msg_send![
+                desc,
+                respondsToSelector: objc2::sel!(setOptimizeForPersistentKernel:)
+            ];
+            if has_sel.as_bool() {
+                let _: () = objc2::msg_send![
+                    desc,
+                    setOptimizeForPersistentKernel: objc2::runtime::Bool::YES
+                ];
+            }
+        }
+    }
+}
 
 /// Builds a `MTLComputePipelineState` for `function_name` in `lib` through the `MTL4Compiler`
 /// and `MTL4Archive` PSO cache.
@@ -43,7 +90,8 @@ pub fn compute_pipeline_from_function_tg_opts(
     tg: Option<[u32; 3]>,
     immut_opt: bool,
 ) -> Result<Retained<MtlComputePipeline>, String> {
-    if tg.is_none() && !immut_opt {
+    let sched = ComputeSchedulingOpts::from_env();
+    if tg.is_none() && !immut_opt && !sched.is_active() {
         let mut k = dxil_metal::hash::KeyHasher::new("d3d12-metal msl compute pso v1");
         k.bytes(function_name.as_bytes());
         return pso_cache()?
@@ -82,6 +130,10 @@ pub fn compute_pipeline_from_function_tg_opts(
         desc.setSupportBinaryLinking(false);
         desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Disabled);
         cache_key ^= IMMUTABLE_OPT_KEY_SALT;
+    }
+    if sched.is_active() {
+        apply_compute_scheduling_options(&desc, &sched);
+        cache_key ^= sched.cache_key_salt();
     }
     pso_cache()?
         .compute_pipeline(Some(cache_key), &desc)
@@ -174,6 +226,11 @@ impl ComputePipeline {
             desc.setSupportBinaryLinking(false);
             desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Disabled);
             cache_key ^= IMMUTABLE_OPT_KEY_SALT;
+        }
+        let sched = ComputeSchedulingOpts::from_env();
+        if sched.is_active() {
+            apply_compute_scheduling_options(&desc, &sched);
+            cache_key ^= sched.cache_key_salt();
         }
         let pso = cache
             .compute_pipeline(Some(cache_key), &desc)
