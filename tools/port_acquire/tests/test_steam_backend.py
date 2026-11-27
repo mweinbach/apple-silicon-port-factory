@@ -22,6 +22,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from port_acquire import (  # noqa: E402
+    AcquireError,
     AuthRequiredError,
     DownloadOptions,
     UnsupportedOperationError,
@@ -721,6 +722,50 @@ class SteamBackendTests(unittest.TestCase):
         self.assertEqual(plan.args, ["-config", "My Settings.ini", "-windowed"])
         self.assertTrue(plan.redacted_auth_args)
         self.assertNotIn("secret", " ".join(plan.args).lower())
+
+    def test_resolve_prefers_exact_match_and_rejects_ambiguous_uninstall(self) -> None:
+        backend = self._make_backend()
+        p2_dir = self.root / "games" / "Portal2"
+        p1_dir = self.root / "games" / "Portal"
+        p2_dir.mkdir(parents=True, exist_ok=True)
+        p1_dir.mkdir(parents=True, exist_ok=True)
+        (p2_dir / "portal2.exe").write_bytes(b"MZ")
+        (p1_dir / "hl2.exe").write_bytes(b"MZ")
+
+        # Register "Portal 2" BEFORE "Portal" so insertion order would pick 620 if naive
+        backend._save_installs(
+            {
+                "620": {"app_id": "620", "title": "Portal 2", "install_path": str(p2_dir)},
+                "400": {"app_id": "400", "title": "Portal", "install_path": str(p1_dir)},
+            }
+        )
+
+        # Exact match must resolve to Portal (400) and leave Portal 2 (620) intact
+        res = backend.uninstall("Portal", keep_files=False)
+        self.assertEqual(res.app_id, "400")
+        self.assertFalse(p1_dir.exists())
+        self.assertTrue(p2_dir.is_dir())
+
+        # Non-exact fuzzy match for uninstall must be rejected even if only Portal 2 remains
+        with self.assertRaises(AcquireError) as ctx_single:
+            backend.uninstall("Portal", keep_files=False)
+        self.assertEqual(ctx_single.exception.code, "ambiguous_app")
+        self.assertTrue(p2_dir.is_dir())
+
+        # Ambiguous fuzzy match across two similar titles must also be rejected without deleting either
+        p3_dir = self.root / "games" / "PortalStories"
+        p3_dir.mkdir(parents=True, exist_ok=True)
+        backend._save_installs(
+            {
+                "620": {"app_id": "620", "title": "Portal 2", "install_path": str(p2_dir)},
+                "317400": {"app_id": "317400", "title": "Portal Stories: Mel", "install_path": str(p3_dir)},
+            }
+        )
+        with self.assertRaises(AcquireError) as ctx:
+            backend.uninstall("Portal", keep_files=False)
+        self.assertEqual(ctx.exception.code, "ambiguous_app")
+        self.assertTrue(p2_dir.is_dir())
+        self.assertTrue(p3_dir.is_dir())
 
     def test_cli_end_to_end_json_and_package_manifest(self) -> None:
         dest = self.root / "cli_dest" / "SampleRPG"

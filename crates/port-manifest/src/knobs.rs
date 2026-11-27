@@ -385,6 +385,16 @@ pub fn aot_key_hash() -> u64 {
     aot_key_hash_with(mk)
 }
 
+/// Returns `true` when a knob name holds a credential/secret whose value must
+/// never be printed verbatim in `--knobs` / `--knobs --json` diagnostics.
+pub fn is_sensitive_knob_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("API_KEY")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("TOKEN")
+}
+
 /// Format resolved knobs as a human-readable aligned table for `port-runner --knobs`.
 pub fn format_table(resolved: &[ResolvedKnob], manifest_path: Option<&Path>) -> String {
     let mut out = String::new();
@@ -418,6 +428,8 @@ pub fn format_table(resolved: &[ResolvedKnob], manifest_path: Option<&Path>) -> 
     for r in resolved {
         let val_disp = if r.value.is_empty() {
             "<unset>".to_string()
+        } else if is_sensitive_knob_name(r.spec.name) {
+            "<redacted>".to_string()
         } else {
             r.value.clone()
         };
@@ -498,7 +510,12 @@ pub fn format_json(
             "      \"default\": {},\n",
             json_escape(r.spec.default)
         ));
-        out.push_str(&format!("      \"value\": {},\n", json_escape(&r.value)));
+        let json_val = if !r.value.is_empty() && is_sensitive_knob_name(r.spec.name) {
+            "<redacted>"
+        } else {
+            r.value.as_str()
+        };
+        out.push_str(&format!("      \"value\": {},\n", json_escape(json_val)));
         out.push_str(&format!(
             "      \"source\": {},\n",
             json_escape(r.source.tag())
@@ -4620,5 +4637,27 @@ mod tests {
         assert!(aot_names.contains("PORT_JIT_RAS"));
         assert!(aot_names.contains("PORT_JIT_TSO"));
         assert!(aot_names.contains("PORT_AOT_PROBE"));
+    }
+
+    #[test]
+    fn sensitive_knobs_are_redacted_in_table_and_json() {
+        let prev = std::env::var_os("PORT_STEAM_API_KEY");
+        let sentinel = "SUPER_SECRET_STEAM_API_KEY_98765";
+        std::env::set_var("PORT_STEAM_API_KEY", sentinel);
+
+        let resolved = resolve_all(None);
+        let table = format_table(&resolved, None);
+        let json = format_json(&resolved, None, 0);
+
+        match prev {
+            Some(v) => std::env::set_var("PORT_STEAM_API_KEY", v),
+            None => std::env::remove_var("PORT_STEAM_API_KEY"),
+        }
+
+        assert!(is_sensitive_knob_name("PORT_STEAM_API_KEY"));
+        assert!(!table.contains(sentinel), "table leaked sensitive knob value");
+        assert!(!json.contains(sentinel), "json leaked sensitive knob value");
+        assert!(table.contains("<redacted>"));
+        assert!(json.contains("\"value\": \"<redacted>\""));
     }
 }

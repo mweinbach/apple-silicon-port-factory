@@ -63,6 +63,7 @@ from ..backend import (
     UpdateResult,
     VerifyResult,
     fuzzy_search_owned,
+    normalize_title,
     scan_dir_redistributables,
     score_title_match,
 )
@@ -872,21 +873,104 @@ class SteamBackend(StoreBackend):
 
         return fuzzy_search_owned(owned, query, limit=limit, min_score=min_score)
 
-    def _resolve_app_id(self, app_ref: str, *, offline: bool = False) -> str:
+    def _resolve_app_id(
+        self,
+        app_ref: str,
+        *,
+        offline: bool = False,
+        strict: bool = False,
+        require_exact: bool = False,
+    ) -> str:
         raw = app_ref.strip()
         if raw.isdigit():
             return raw
-        # Check installed apps first (works offline)
-        for aid, inst in self._load_installs().items():
-            if score_title_match(raw, str(inst.get("title") or ""), aid) >= 0.75:
-                return aid
+
+        norm_query = normalize_title(raw)
+
+        # Collect all local installed candidates across both managed installs and steamapps ACFs.
+        local_candidates: dict[str, str] = {}
         for aid, acf in self._scan_steamapps_manifests().items():
-            if score_title_match(raw, str(acf.get("name") or ""), aid) >= 0.75:
-                return aid
+            local_candidates[str(aid)] = str(acf.get("name") or "")
+        for aid, inst in self._load_installs().items():
+            local_candidates[str(aid)] = str(inst.get("title") or local_candidates.get(str(aid), ""))
+
+        # 1. Exact normalized title match always wins over fuzzy matches.
+        exact_local = [
+            (aid, title)
+            for aid, title in local_candidates.items()
+            if norm_query and normalize_title(title) == norm_query
+        ]
+        if len(exact_local) == 1:
+            return exact_local[0][0]
+        if len(exact_local) > 1:
+            choices = ", ".join(f"{aid} ({title})" for aid, title in sorted(exact_local))
+            raise AcquireError(
+                f"Ambiguous Steam app name {app_ref!r}; multiple exact matches: {choices}. "
+                "Specify the numeric AppID explicitly.",
+                code="ambiguous_app",
+                details={"query": raw, "candidates": [{"app_id": a, "title": t} for a, t in exact_local]},
+            )
+
+        # 2. Rank fuzzy local matches; destructive operations require exact title or numeric AppID.
+        scored_local: list[tuple[float, str, str]] = []
+        for aid, title in local_candidates.items():
+            sc = score_title_match(raw, title, aid)
+            if sc >= 0.60:
+                scored_local.append((sc, aid, title))
+        scored_local.sort(key=lambda item: (-item[0], item[2].lower(), item[1]))
+        if require_exact:
+            if scored_local:
+                all_cands = [(aid, title) for _, aid, title in scored_local[:5]]
+                choices = ", ".join(f"{aid} ({title})" for aid, title in all_cands)
+                raise AcquireError(
+                    f"Ambiguous or non-exact Steam app name {app_ref!r} for destructive operation; "
+                    f"closest installed titles: {choices}. Specify the exact title or numeric AppID.",
+                    code="ambiguous_app",
+                    details={"query": raw, "candidates": [{"app_id": a, "title": t} for a, t in all_cands]},
+                )
+            raise AppNotFoundError(
+                f"Could not find installed Steam app {app_ref!r}. Specify the exact title or numeric AppID."
+            )
+        if scored_local and scored_local[0][0] >= 0.75:
+            top_score, top_aid, _ = scored_local[0]
+            competing = [
+                (aid, title)
+                for sc, aid, title in scored_local[1:]
+                if sc >= 0.75 or (strict and (top_score - sc) <= 0.15)
+            ]
+            if competing:
+                all_cands = [(top_aid, scored_local[0][2]), *competing]
+                choices = ", ".join(f"{aid} ({title})" for aid, title in all_cands)
+                raise AcquireError(
+                    f"Ambiguous Steam app name {app_ref!r}; matching installed titles: {choices}. "
+                    "Specify the exact title or numeric AppID.",
+                    code="ambiguous_app",
+                    details={"query": raw, "candidates": [{"app_id": a, "title": t} for a, t in all_cands]},
+                )
+            return top_aid
+
         if not offline:
-            matches = self.search(raw, limit=1, min_score=0.5)
+            matches = self.search(raw, limit=5, min_score=0.5)
             if matches:
+                exact_remote = [m for m in matches if norm_query and normalize_title(m.title) == norm_query]
+                if len(exact_remote) == 1:
+                    return exact_remote[0].app_id
+                if len(exact_remote) > 1:
+                    choices = ", ".join(f"{m.app_id} ({m.title})" for m in exact_remote)
+                    raise AcquireError(
+                        f"Ambiguous Steam app name {app_ref!r}; multiple exact matches: {choices}. "
+                        "Specify the numeric AppID explicitly.",
+                        code="ambiguous_app",
+                    )
+                if len(matches) > 1 and (matches[0].score - matches[1].score) <= 0.05:
+                    choices = ", ".join(f"{m.app_id} ({m.title})" for m in matches[:3])
+                    raise AcquireError(
+                        f"Ambiguous Steam app name {app_ref!r}; top matches: {choices}. "
+                        "Specify the exact title or numeric AppID.",
+                        code="ambiguous_app",
+                    )
                 return matches[0].app_id
+
         raise AppNotFoundError(
             f"Could not resolve Steam app {app_ref!r} to a numeric AppID. "
             "Run `tools/port-acquire --store steam search \"<title>\" --json` to find its AppID."
@@ -1545,7 +1629,7 @@ class SteamBackend(StoreBackend):
 
     def verify(self, app_id: str, *, repair: bool = False) -> VerifyResult:
         account_name, _ = self._require_logged_in_account()
-        resolved_id = self._resolve_app_id(app_id, offline=True)
+        resolved_id = self._resolve_app_id(app_id, offline=True, strict=True)
         entry = self._get_installed_entry(resolved_id)
         if not entry or not entry.get("install_path"):
             raise AppNotFoundError(
@@ -1630,7 +1714,7 @@ class SteamBackend(StoreBackend):
     ) -> UpdateResult:
         self._require_logged_in_account()
         use_steamcmd = self._use_steamcmd_for_download()
-        resolved_id = self._resolve_app_id(app_id, offline=not use_steamcmd)
+        resolved_id = self._resolve_app_id(app_id, offline=not use_steamcmd, strict=True)
         entry = self._get_installed_entry(resolved_id)
         if not entry or not entry.get("install_path"):
             raise AppNotFoundError(
@@ -1717,7 +1801,7 @@ class SteamBackend(StoreBackend):
         skip_uninstaller: bool = False,
     ) -> UninstallResult:
         del skip_uninstaller  # SteamCMD has no interactive Windows uninstaller on macOS
-        resolved_id = self._resolve_app_id(app_id, offline=True)
+        resolved_id = self._resolve_app_id(app_id, offline=True, strict=True, require_exact=True)
         installs = self._load_installs()
         entry = installs.get(resolved_id)
         if entry is None:
