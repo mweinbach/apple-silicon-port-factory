@@ -57,8 +57,8 @@ pub struct ViewPoolStats {
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        if let Some(v) = super::env_canonical_or_alias("PORT_TEXTURE_VIEW_POOL", "AW2_TEXTURE_VIEW_POOL") {
-            if !super::parse_bool_knob(&v) {
+        if let Ok(v) = std::env::var("PORT_TEXTURE_VIEW_POOL") {
+            if !v.is_empty() && !super::parse_bool_knob(&v) {
                 log::info!(target: "d3d", "MTLTextureViewPool disabled via PORT_TEXTURE_VIEW_POOL={v}");
                 return false;
             }

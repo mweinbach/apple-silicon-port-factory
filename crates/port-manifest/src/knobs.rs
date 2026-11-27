@@ -3896,7 +3896,7 @@ pub const KNOBS: &[KnobSpec] = &[
     },
     KnobSpec {
         name: "PORT_TEXTURE_VIEW_POOL",
-        aliases: &["AW2_TEXTURE_VIEW_POOL"],
+        aliases: &[],
         kind: KnobType::Bool,
         default: "1",
         description: "Back shader-visible D3D12 texture and typed-buffer views with Metal 4 MTLTextureViewPool.",
