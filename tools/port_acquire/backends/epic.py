@@ -1108,7 +1108,6 @@ class EpicBackend(StoreBackend):
     def download(self, options: DownloadOptions) -> DownloadResult:
         leg_plat = _platform_to_legendary(options.platform) or "Windows"
         dest = options.dest.expanduser().resolve()
-        dest.mkdir(parents=True, exist_ok=True)
 
         # Legendary's `--download-only` maps to `no_install=True`, which skips its built-in
         # `--with-dlcs` branch. When both are requested, download the base game with
@@ -1122,6 +1121,32 @@ class EpicBackend(StoreBackend):
             ]
         elif not options.with_dlcs and options.dlcs:
             explicit_dlcs_after_base = list(options.dlcs)
+
+        # Real Legendary reuses `igame.install_path` before `--game-folder` whenever an app is
+        # already registered in `installed.json` (even under `--download-only`). Reject a
+        # conflicting `--dest` up front so we never silently modify files outside `--dest`.
+        existing_installed = self._installed_map()
+        for target_id in (options.app_id, *explicit_dlcs_after_base):
+            existing = existing_installed.get(target_id)
+            if existing and existing.get("install_path"):
+                existing_path = Path(str(existing["install_path"])).expanduser().resolve()
+                if existing_path != dest:
+                    raise CommandFailedError(
+                        f"Epic app {target_id!r} is already registered in Legendary at "
+                        f"{existing_path}, which conflicts with requested --dest {dest}. "
+                        f"Legendary reuses the registered install path instead of --game-folder. "
+                        f"Use --dest {existing_path!s}, run `tools/port-acquire update {target_id}`, "
+                        f"uninstall/move the existing registration, or set PORT_LEGENDARY_CONFIG "
+                        f"to an isolated config directory for a separate download.",
+                        code="destination_conflict",
+                        details={
+                            "app_id": target_id,
+                            "requested_dest": str(dest),
+                            "existing_install_path": str(existing_path),
+                        },
+                    )
+
+        dest.mkdir(parents=True, exist_ok=True)
 
         cmd = [
             "-y",

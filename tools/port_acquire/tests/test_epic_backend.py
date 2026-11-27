@@ -885,14 +885,13 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.backend.download(DownloadOptions(app_id="ArachnidTwo", dest=dest1, platform="windows"))
 
         # Now simulate Legendary catching a downloader error, logging `Installation failed`,
-        # and exiting 0 while the old registration still exists.
-        dest2 = self.root / "games" / "FailedRedownload"
+        # and exiting 0 while targeting the same registered destination.
         self._patch_state(install_fail_zero=True)
         proc = self._run_cli(
             "download",
             "ArachnidTwo",
             "--dest",
-            str(dest2),
+            str(dest1),
             "--platform",
             "windows",
             "--json",
@@ -901,14 +900,49 @@ class TestEpicBackendMocked(unittest.TestCase):
         err = json.loads(proc.stdout)
         self.assertFalse(err["ok"])
         self.assertEqual(err["error"]["code"], "command_failed")
-        self.assertFalse((dest2 / MANIFEST_FILENAME).exists())
+        self.assertFalse((dest1 / MANIFEST_FILENAME).exists())
 
         # Also fail if Legendary exits 0 without confirming installation completion.
         self._patch_state(install_fail_zero=False, install_silent_zero=True)
         with self.assertRaises(CommandFailedError):
             self.backend.download(
-                DownloadOptions(app_id="ArachnidTwo", dest=dest2, platform="windows")
+                DownloadOptions(app_id="ArachnidTwo", dest=dest1, platform="windows")
             )
+
+    def test_download_rejects_conflicting_dest_when_already_registered(self) -> None:
+        dest1 = self.root / "games" / "ExistingHeroicInstall"
+        self.backend.download(DownloadOptions(app_id="ArachnidTwo", dest=dest1, platform="windows"))
+        inv_before = len(self._read_invocations())
+
+        # Attempting to download to a different --dest (with or without --no-register) must
+        # fail before invoking `legendary install`, leaving `dest2` uncreated and `dest1` untouched.
+        dest2 = self.root / "games" / "SeparateDest"
+        proc = self._run_cli(
+            "download",
+            "ArachnidTwo",
+            "--dest",
+            str(dest2),
+            "--platform",
+            "windows",
+            "--no-register",
+            "--json",
+        )
+        self.assertEqual(proc.returncode, 5)
+        err = json.loads(proc.stdout)
+        self.assertFalse(err["ok"])
+        self.assertEqual(err["error"]["code"], "destination_conflict")
+        self.assertEqual(err["error"]["details"]["existing_install_path"], str(dest1.resolve()))
+        self.assertEqual(err["error"]["details"]["requested_dest"], str(dest2.resolve()))
+        self.assertFalse(dest2.exists())
+
+        inv_after = self._read_invocations()[inv_before:]
+        self.assertFalse(any("install" in inv for inv in inv_after))
+
+        # Targeting the existing registered directory is permitted.
+        res = self.backend.download(
+            DownloadOptions(app_id="ArachnidTwo", dest=dest1, platform="windows")
+        )
+        self.assertEqual(Path(res.install_path).resolve(), dest1.resolve())
 
     def test_uninstall_fails_on_exit_zero_removal_or_lock_error(self) -> None:
         dest = self.root / "games" / "UninstallFail"
