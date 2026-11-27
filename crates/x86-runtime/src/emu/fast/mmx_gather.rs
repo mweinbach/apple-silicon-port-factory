@@ -758,7 +758,7 @@ unsafe fn exec_vgather(cpu: &mut Cpu, op: &FastOp) {
         }
         m_vec[half] &= !(elem_mask << sh);
     }
-    if any_load && crate::emu::mem::tso() {
+    if any_load && crate::emu::mem::tso_vec() {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
     }
     if elem_bits == 32 && idx_bits == 64 && !idx_ymm {

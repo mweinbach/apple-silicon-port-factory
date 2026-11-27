@@ -3,10 +3,9 @@
 
 use super::emit::{enc_logic_imm, sf, Asm};
 use super::lazy::PF_NONE;
-use super::translate::{stack_tso, Chk, Cond, FlagState, Src, SysCold, SysColdKind, Tr};
+use super::translate::{Chk, Cond, FlagState, Src, SysCold, SysColdKind, Tr};
 use super::*;
 use crate::emu::fast::{self, FastOp};
-use crate::emu::mem;
 
 impl Asm {
     pub(super) fn tbz(&mut self, t: u32, bit: u32) -> usize {
@@ -502,9 +501,9 @@ impl Tr<'_> {
     }
 
     /// Write an 8/16/32/64-bit result for `K_HI8` according to `spec`.
-    pub(super) fn wr_hi8_dst(&mut self, spec: u8, w: u8, val: u32, mem_addr: Option<u32>) {
+    pub(super) fn wr_hi8_dst(&mut self, k: usize, spec: u8, w: u8, val: u32, mem_addr: Option<u32>) {
         if spec & 0x40 != 0 {
-            self.store_checked_addr(val, mem_addr.unwrap(), 8);
+            self.store_checked_addr(k, val, mem_addr.unwrap(), 8);
         } else if spec & 0x80 != 0 {
             let idx = spec & 0x0F;
             self.a.bfm(true, g(idx), val, 56, 7);
@@ -778,7 +777,7 @@ impl Tr<'_> {
                             }
                             self.a.fmov_fg(true, T0, 0);
                             self.a.v_umov_d(T1, 0, 1);
-                            if mem::tso() && (chk != Chk::Stack || stack_tso()) {
+                            if self.vec_tso(k, chk, false) {
                                 self.a.dmb_ishst();
                             }
                             self.a.str(64, T0, a, 0);
@@ -1059,7 +1058,7 @@ impl Tr<'_> {
                     }
                     self.a.ldr(64, T0, a, 0);
                     self.a.ldr(64, T1, a, 8);
-                    if mem::tso() {
+                    if self.vec_tso(k, Self::chk_of(op), true) {
                         self.a.dmb_ishld();
                     }
                     self.a.fmov_gf(true, 1, T0);
@@ -1197,18 +1196,18 @@ impl Tr<'_> {
                 } else {
                     None
                 };
-                self.wr_hi8_dst(op.r0, op.w, T0, dst_a);
+                self.wr_hi8_dst(k, op.r0, op.w, T0, dst_a);
             }
             1 => {
                 // movzx
                 let _ = self.rd_hi8_src(k, op, op.r1, T0);
-                self.wr_hi8_dst(op.r0, op.w, T0, None);
+                self.wr_hi8_dst(k, op.r0, op.w, T0, None);
             }
             2 => {
                 // movsx
                 let _ = self.rd_hi8_src(k, op, op.r1, T0);
                 self.a.sbfm(true, T0, T0, 0, 7);
-                self.wr_hi8_dst(op.r0, op.w, T0, None);
+                self.wr_hi8_dst(k, op.r0, op.w, T0, None);
             }
             3..=11 => {
                 // add(3), sub(4), and(5), or(6), xor(7), cmp(8), test(9), adc(10), sbb(11)
@@ -1254,7 +1253,7 @@ impl Tr<'_> {
                         }
                     }
                     if writes {
-                        self.wr_hi8_dst(op.r0, 8, T2, dst_a);
+                        self.wr_hi8_dst(k, op.r0, 8, T2, dst_a);
                     }
                     if need_pf {
                         self.a.str(8, T2, XCPU, OFF_PFV);
@@ -1282,7 +1281,7 @@ impl Tr<'_> {
                     }
                     self.a.lsr_i(true, T2, T5, 56);
                     if writes {
-                        self.wr_hi8_dst(op.r0, 8, T2, dst_a);
+                        self.wr_hi8_dst(k, op.r0, 8, T2, dst_a);
                     }
                     if need_pf {
                         self.a.str(8, T2, XCPU, OFF_PFV);
@@ -1310,7 +1309,7 @@ impl Tr<'_> {
                 self.a.mov_imm(true, T4, 1u64 << 56);
                 self.a.addsub_rr(true, dec, true, T5, T3, T4, 0);
                 self.a.lsr_i(true, T2, T5, 56);
-                self.wr_hi8_dst(op.r0, 8, T2, None);
+                self.wr_hi8_dst(k, op.r0, 8, T2, None);
                 if la & FP != 0 {
                     self.a.str(8, T2, XCPU, OFF_PFV);
                 }
@@ -1325,7 +1324,7 @@ impl Tr<'_> {
                 // not
                 let _ = self.rd_hi8_src(k, op, op.r0, T0);
                 self.a.emit(0x2A20_03E0 | T0 << 16 | 31 << 5 | T0);
-                self.wr_hi8_dst(op.r0, 8, T0, None);
+                self.wr_hi8_dst(k, op.r0, 8, T0, None);
             }
             15 => {
                 // neg
@@ -1333,7 +1332,7 @@ impl Tr<'_> {
                 self.a.lsl_i(true, T3, T3, 56);
                 self.a.addsub_rr(true, true, true, T5, ZR, T3, 0);
                 self.a.lsr_i(true, T2, T5, 56);
-                self.wr_hi8_dst(op.r0, 8, T2, None);
+                self.wr_hi8_dst(k, op.r0, 8, T2, None);
                 if la & FP != 0 {
                     self.a.str(8, T2, XCPU, OFF_PFV);
                 }
@@ -1407,7 +1406,7 @@ impl Tr<'_> {
                         self.a.str(8, T3, XCPU, OFF_OF);
                     }
                 }
-                self.wr_hi8_dst(op.r0, 8, T1, None);
+                self.wr_hi8_dst(k, op.r0, 8, T1, None);
                 self.a.bind(skip);
                 self.fs = FlagState {
                     src: Src::None,
@@ -1429,14 +1428,14 @@ impl Tr<'_> {
                     }
                     Cond::Const(b) => self.a.movz(false, T0, b as u32, 0),
                 }
-                self.wr_hi8_dst(op.r0, 8, T0, None);
+                self.wr_hi8_dst(k, op.r0, 8, T0, None);
             }
             22 => {
                 // xchg
                 let _ = self.rd_hi8_src(k, op, op.r0, T0);
                 let _ = self.rd_hi8_src(k, op, op.r1, T1);
-                self.wr_hi8_dst(op.r0, 8, T1, None);
-                self.wr_hi8_dst(op.r1, 8, T0, None);
+                self.wr_hi8_dst(k, op.r0, 8, T1, None);
+                self.wr_hi8_dst(k, op.r1, 8, T0, None);
             }
             23 => {
                 // xadd
@@ -1446,8 +1445,8 @@ impl Tr<'_> {
                 self.a.lsl_i(true, T4, T1, 56);
                 self.a.addsub_rr(true, false, true, T5, T3, T4, 0);
                 self.a.lsr_i(true, T2, T5, 56);
-                self.wr_hi8_dst(op.r0, 8, T2, None);
-                self.wr_hi8_dst(op.r1, 8, T0, None);
+                self.wr_hi8_dst(k, op.r0, 8, T2, None);
+                self.wr_hi8_dst(k, op.r1, 8, T0, None);
                 if la & FP != 0 {
                     self.a.str(8, T2, XCPU, OFF_PFV);
                 }
@@ -1468,7 +1467,7 @@ impl Tr<'_> {
                 self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
                 self.a.lsr_i(true, T2, T5, 56);
                 let neq = self.a.bcond(NE);
-                self.wr_hi8_dst(op.r0, 8, T6, None);
+                self.wr_hi8_dst(k, op.r0, 8, T6, None);
                 let done = self.a.b();
                 self.a.bind(neq);
                 self.wr_gpr(0, 8, T1);
@@ -1511,25 +1510,25 @@ impl Tr<'_> {
         match op_k {
             0 => {
                 // movs
-                self.load(k, T0, g(6), wb, Chk::Full);
-                self.store(k, T0, g(7), wb, Chk::Full);
+                self.load_memcpy(k, T0, g(6), wb, Chk::Full);
+                self.store_memcpy(k, T0, g(7), wb, Chk::Full);
                 self.a.addsub_rr(true, false, false, g(6), g(6), T4, 0);
                 self.a.addsub_rr(true, false, false, g(7), g(7), T4, 0);
             }
             1 => {
                 // stos
-                self.store(k, g(0), g(7), wb, Chk::Full);
+                self.store_memcpy(k, g(0), g(7), wb, Chk::Full);
                 self.a.addsub_rr(true, false, false, g(7), g(7), T4, 0);
             }
             2 => {
                 // lods
-                self.load(k, T0, g(6), wb, Chk::Full);
+                self.load_memcpy(k, T0, g(6), wb, Chk::Full);
                 self.wr_gpr(0, op.w, T0);
                 self.a.addsub_rr(true, false, false, g(6), g(6), T4, 0);
             }
             3 => {
                 // scas: acc - [rdi]
-                self.load(k, T1, g(7), wb, Chk::Full);
+                self.load_memcpy(k, T1, g(7), wb, Chk::Full);
                 self.a.addsub_rr(true, false, false, g(7), g(7), T4, 0);
                 let sh = 64 - wb;
                 if wb == 64 {
@@ -1557,8 +1556,8 @@ impl Tr<'_> {
             }
             _ => {
                 // cmps: [rsi] - [rdi]
-                self.load(k, T0, g(6), wb, Chk::Full);
-                self.load(k, T1, g(7), wb, Chk::Full);
+                self.load_memcpy(k, T0, g(6), wb, Chk::Full);
+                self.load_memcpy(k, T1, g(7), wb, Chk::Full);
                 self.a.addsub_rr(true, false, false, g(6), g(6), T4, 0);
                 self.a.addsub_rr(true, false, false, g(7), g(7), T4, 0);
                 let sh = 64 - wb;
@@ -1708,7 +1707,7 @@ impl Tr<'_> {
             self.a.patch(back, loop_top);
             self.a.bind(done_loop);
             if let Some(a) = addr {
-                self.store_checked_addr(T0, a, wb);
+                self.store_checked_addr(k, T0, a, wb);
             } else {
                 self.wr_gpr(op.r0, op.w, T0);
             }
@@ -2184,7 +2183,7 @@ impl Tr<'_> {
             }
             self.a.ldr(64, T0, a, 0);
             self.a.ldr(64, T1, a, 8);
-            if mem::tso() {
+            if self.vec_tso(k, Self::chk_of(op), true) {
                 self.a.dmb_ishld();
             }
             self.a.fmov_gf(true, 1, T0);

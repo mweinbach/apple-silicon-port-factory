@@ -23,10 +23,26 @@ pub(super) enum JtVal {
     ScaledIndex { scale: u8, indir: Option<(u64, u8)>, bound: Option<usize> },
     /// Secondary index loaded from an 8-bit or 16-bit indirection table:
     /// `idx2 = *(u8|u16)(tbl_va + idx * elem_bytes)`.
-    IndirIndex { tbl_va: u64, elem_bytes: u8, bound: Option<usize> },
+    /// For `elem_bytes == 2`, may also be added directly to a base register as a 16-bit
+    /// unsigned offset jump table (`Target16`).
+    IndirIndex {
+        tbl_va: u64,
+        elem_bytes: u8,
+        assumed_base_reg: Option<u8>,
+        bound: Option<usize>,
+    },
     /// Address of a jump-table slot (`lea rPtr, [rTbl + idx*stride]` or `add rTbl, scaled_idx`),
-    /// ready for `mov reg, [rPtr]` / `movsxd reg, [rPtr]` / `jmp qword ptr [rPtr]`.
+    /// ready for `mov reg, [rPtr]` / `movsxd reg, [rPtr]` / `movsx/movzx reg, word ptr [rPtr]` /
+    /// `jmp qword ptr [rPtr]`.
     TablePtr { tbl_va: u64, stride: u8, indir: Option<(u64, u8)>, bound: Option<usize> },
+    /// 16-bit offset loaded from a jump table: `off = *(u16|i16)(tbl_va + idx * 2)`.
+    TableOff16 {
+        tbl_va: u64,
+        signed: bool,
+        assumed_base_reg: Option<u8>,
+        indir: Option<(u64, u8)>,
+        bound: Option<usize>,
+    },
     /// 32-bit offset loaded from a jump table: `off = *(u32|i32)(tbl_va + idx * 4)`.
     /// `assumed_base_reg`: `Some(r)` when `r` was unknown (e.g. MSVC hoisted `__ImageBase`
     /// in `[rBase + idx*4 + rva_tbl]`) and `tbl_va` was formed as `image_base + disp`.
@@ -34,6 +50,16 @@ pub(super) enum JtVal {
         tbl_va: u64,
         signed: bool,
         assumed_base_reg: Option<u8>,
+        indir: Option<(u64, u8)>,
+        bound: Option<usize>,
+    },
+    /// Resolved 16-bit-offset jump target (`base_va ± entry`), ready for `jmp reg`.
+    Target16 {
+        base_va: u64,
+        tbl_va: u64,
+        signed: bool,
+        sub_from_base: bool,
+        assumed_base: bool,
         indir: Option<(u64, u8)>,
         bound: Option<usize>,
     },
@@ -83,7 +109,7 @@ fn op_imm(ins: &iced_x86::Instruction, op: u32) -> Option<u64> {
 fn extract_idx(v: JtVal) -> (Option<(u64, u8)>, Option<usize>) {
     match v {
         JtVal::Index { bound } => (None, bound),
-        JtVal::IndirIndex { tbl_va, elem_bytes, bound } => (Some((tbl_va, elem_bytes)), bound),
+        JtVal::IndirIndex { tbl_va, elem_bytes, bound, .. } => (Some((tbl_va, elem_bytes)), bound),
         _ => (None, None),
     }
 }
@@ -105,8 +131,48 @@ fn jt_val_rank(v: JtVal) -> u8 {
         JtVal::IndirIndex { bound: Some(_), .. } | JtVal::ScaledIndex { bound: Some(_), .. } => 4,
         JtVal::Const(_) => 5,
         JtVal::TablePtr { .. } => 6,
-        JtVal::TableOff32 { .. } => 7,
-        JtVal::Target32 { .. } | JtVal::Target64 { .. } => 8,
+        JtVal::TableOff16 { .. } | JtVal::TableOff32 { .. } => 7,
+        JtVal::Target16 { .. } | JtVal::Target32 { .. } | JtVal::Target64 { .. } => 8,
+    }
+}
+
+fn jt_upper_bound(v: JtVal) -> Option<usize> {
+    match v {
+        JtVal::Const(c) if c < MAX_JT_ENTRIES as u64 => Some(c as usize + 1),
+        JtVal::Index { bound } => bound,
+        _ => None,
+    }
+}
+
+fn flip_cmp_cc(cc: iced_x86::ConditionCode) -> iced_x86::ConditionCode {
+    use iced_x86::ConditionCode as CC;
+    match cc {
+        CC::a => CC::b,
+        CC::ae => CC::be,
+        CC::b => CC::a,
+        CC::be => CC::ae,
+        CC::g => CC::l,
+        CC::ge => CC::le,
+        CC::l => CC::g,
+        CC::le => CC::ge,
+        other => other,
+    }
+}
+
+fn cmov_cc(mn: iced_x86::Mnemonic) -> Option<iced_x86::ConditionCode> {
+    use iced_x86::{ConditionCode as CC, Mnemonic as M};
+    match mn {
+        M::Cmova => Some(CC::a),
+        M::Cmovae => Some(CC::ae),
+        M::Cmovb => Some(CC::b),
+        M::Cmovbe => Some(CC::be),
+        M::Cmovg => Some(CC::g),
+        M::Cmovge => Some(CC::ge),
+        M::Cmovl => Some(CC::l),
+        M::Cmovle => Some(CC::le),
+        M::Cmove => Some(CC::e),
+        M::Cmovne => Some(CC::ne),
+        _ => None,
     }
 }
 
@@ -160,28 +226,76 @@ fn adjust_index_bound(bound: Option<usize>, signed_delta: i64) -> JtVal {
 
 fn combine_add_target(lhs: JtVal, lhs_reg: usize, rhs: JtVal, rhs_reg: usize, img_base: u64) -> JtVal {
     let pair = |off: JtVal, base_val: JtVal, base_reg: usize| -> Option<JtVal> {
-        let JtVal::TableOff32 { tbl_va, signed, assumed_base_reg, indir, bound } = off else {
-            return None;
-        };
-        match (assumed_base_reg, base_val) {
-            (None, JtVal::Const(base_va)) => Some(JtVal::Target32 {
-                base_va,
-                tbl_va,
-                signed,
-                sub_from_base: false,
-                assumed_base: false,
-                indir,
-                bound,
-            }),
-            (Some(breg), _) if breg as usize == base_reg => Some(JtVal::Target32 {
-                base_va: img_base,
-                tbl_va,
-                signed,
-                sub_from_base: false,
-                assumed_base: true,
-                indir,
-                bound,
-            }),
+        match off {
+            JtVal::TableOff32 { tbl_va, signed, assumed_base_reg, indir, bound } => {
+                match (assumed_base_reg, base_val) {
+                    (None, JtVal::Const(base_va)) => Some(JtVal::Target32 {
+                        base_va,
+                        tbl_va,
+                        signed,
+                        sub_from_base: false,
+                        assumed_base: false,
+                        indir,
+                        bound,
+                    }),
+                    (Some(breg), _) if breg as usize == base_reg => Some(JtVal::Target32 {
+                        base_va: img_base,
+                        tbl_va,
+                        signed,
+                        sub_from_base: false,
+                        assumed_base: true,
+                        indir,
+                        bound,
+                    }),
+                    _ => None,
+                }
+            }
+            JtVal::TableOff16 { tbl_va, signed, assumed_base_reg, indir, bound } => {
+                match (assumed_base_reg, base_val) {
+                    (None, JtVal::Const(base_va)) => Some(JtVal::Target16 {
+                        base_va,
+                        tbl_va,
+                        signed,
+                        sub_from_base: false,
+                        assumed_base: false,
+                        indir,
+                        bound,
+                    }),
+                    (Some(breg), _) if breg as usize == base_reg => Some(JtVal::Target16 {
+                        base_va: img_base,
+                        tbl_va,
+                        signed,
+                        sub_from_base: false,
+                        assumed_base: true,
+                        indir,
+                        bound,
+                    }),
+                    _ => None,
+                }
+            }
+            JtVal::IndirIndex { tbl_va, elem_bytes: 2, assumed_base_reg, bound } => {
+                match (assumed_base_reg, base_val) {
+                    (None, JtVal::Const(base_va)) => Some(JtVal::Target16 {
+                        base_va,
+                        tbl_va,
+                        signed: false,
+                        sub_from_base: false,
+                        assumed_base: false,
+                        indir: None,
+                        bound,
+                    }),
+                    (Some(breg), _) if breg as usize == base_reg => Some(JtVal::Target16 {
+                        base_va: img_base,
+                        tbl_va,
+                        signed: false,
+                        sub_from_base: false,
+                        assumed_base: true,
+                        indir: None,
+                        bound,
+                    }),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     };
@@ -217,10 +331,20 @@ fn eval_mem_load(
     let midx = gpr_idx(ins.memory_index());
     let disp = ins.memory_displacement64();
 
-    // Pre-computed table slot pointer: `mov eax, [rPtr]` / `movsxd rax, [rPtr]` / `jmp [rPtr]`.
+    // Pre-computed table slot pointer: `mov eax, [rPtr]` / `movsxd rax, [rPtr]` /
+    // `movsx rax, word ptr [rPtr]` / `jmp [rPtr]`.
     if midx.is_none() && disp == 0 {
         if let Some(b) = mbase {
             if let JtVal::TablePtr { tbl_va, stride, indir, bound } = regs[b] {
+                if msize == 2 && stride == 2 {
+                    return JtVal::TableOff16 {
+                        tbl_va,
+                        signed,
+                        assumed_base_reg: None,
+                        indir,
+                        bound,
+                    };
+                }
                 if msize == 4 && stride == 4 {
                     return JtVal::TableOff32 {
                         tbl_va,
@@ -242,7 +366,7 @@ fn eval_mem_load(
         return JtVal::Unknown;
     };
 
-    // Pre-scaled index in `[rTbl + rScaledIdx]` (scale == 1, e.g. after `shl rIdx, 2|3`).
+    // Pre-scaled index in `[rTbl + rScaledIdx]` (scale == 1, e.g. after `shl rIdx, 1|2|3`).
     if scale == 1 {
         if let Some(b) = mbase {
             let scaled_pair = match (regs[b], regs[ix]) {
@@ -255,6 +379,15 @@ fn eval_mem_load(
                 _ => None,
             };
             if let Some((tbl_va, s, indir, bound)) = scaled_pair {
+                if msize == 2 && s == 2 {
+                    return JtVal::TableOff16 {
+                        tbl_va,
+                        signed,
+                        assumed_base_reg: None,
+                        indir,
+                        bound,
+                    };
+                }
                 if msize == 4 && s == 4 {
                     return JtVal::TableOff32 {
                         tbl_va,
@@ -273,7 +406,37 @@ fn eval_mem_load(
 
     let (indir, bound) = extract_idx(regs[ix]);
 
-    if msize == 4 && scale == 4 {
+    if msize == 2 && scale == 2 {
+        match mbase {
+            Some(b) => match regs[b] {
+                JtVal::Const(c) => JtVal::TableOff16 {
+                    tbl_va: c.wrapping_add(disp),
+                    signed,
+                    assumed_base_reg: None,
+                    indir,
+                    bound,
+                },
+                _ if disp > 0 && disp < img_size => JtVal::TableOff16 {
+                    tbl_va: img_base.wrapping_add(disp),
+                    signed,
+                    assumed_base_reg: Some(b as u8),
+                    indir,
+                    bound,
+                },
+                _ => JtVal::Unknown,
+            },
+            None if disp >= img_base && disp < img_base.saturating_add(img_size) => {
+                JtVal::TableOff16 {
+                    tbl_va: disp,
+                    signed,
+                    assumed_base_reg: None,
+                    indir,
+                    bound,
+                }
+            }
+            None => JtVal::Unknown,
+        }
+    } else if msize == 4 && scale == 4 {
         match mbase {
             Some(b) => match regs[b] {
                 JtVal::Const(c) => JtVal::TableOff32 {
@@ -337,20 +500,67 @@ fn eval_mem_movzx(
         };
     }
     let scale = ins.memory_index_scale();
-    if scale != msize as u32 {
-        return JtVal::Unknown;
-    }
     let mbase = gpr_idx(ins.memory_base());
     let midx = gpr_idx(ins.memory_index());
     let disp = ins.memory_displacement64();
 
+    // Pre-computed 16-bit table slot pointer (`movzx reg, word ptr [rPtr]`) or pre-scaled index.
+    if msize == 2 && midx.is_none() && disp == 0 {
+        if let Some(b) = mbase {
+            if let JtVal::TablePtr { tbl_va, stride: 2, indir, bound } = regs[b] {
+                return JtVal::TableOff16 {
+                    tbl_va,
+                    signed: false,
+                    assumed_base_reg: None,
+                    indir,
+                    bound,
+                };
+            }
+        }
+    }
+    if msize == 2 && scale == 1 {
+        if let (Some(b), Some(ix)) = (mbase, midx) {
+            let scaled_pair = match (regs[b], regs[ix]) {
+                (JtVal::Const(c), JtVal::ScaledIndex { scale: 2, indir, bound }) => {
+                    Some((c.wrapping_add(disp), indir, bound))
+                }
+                (JtVal::ScaledIndex { scale: 2, indir, bound }, JtVal::Const(c)) => {
+                    Some((c.wrapping_add(disp), indir, bound))
+                }
+                _ => None,
+            };
+            if let Some((tbl_va, indir, bound)) = scaled_pair {
+                return JtVal::TableOff16 {
+                    tbl_va,
+                    signed: false,
+                    assumed_base_reg: None,
+                    indir,
+                    bound,
+                };
+            }
+        }
+    }
+    if scale != msize as u32 {
+        return JtVal::Unknown;
+    }
+
     match (mbase, midx) {
         (Some(b), Some(ix)) => {
             if let JtVal::Const(c) = regs[b] {
-                let (_, bound) = extract_idx(regs[ix]);
+                let (indir, bound) = extract_idx(regs[ix]);
+                if msize == 2 && indir.is_some() {
+                    return JtVal::TableOff16 {
+                        tbl_va: c.wrapping_add(disp),
+                        signed: false,
+                        assumed_base_reg: None,
+                        indir,
+                        bound,
+                    };
+                }
                 return JtVal::IndirIndex {
                     tbl_va: c.wrapping_add(disp),
                     elem_bytes: msize as u8,
+                    assumed_base_reg: None,
                     bound,
                 };
             }
@@ -360,32 +570,57 @@ fn eval_mem_movzx(
                     return JtVal::IndirIndex {
                         tbl_va: c.wrapping_add(disp),
                         elem_bytes: 1,
+                        assumed_base_reg: None,
                         bound,
                     };
                 }
             }
             // Hoisted __ImageBase heuristic: `movzx rIdx2, byte/word ptr [rBase + rIdx*s + rva]`.
             if disp > 0 && disp < img_size {
-                let idx_reg = if scale == 1
+                let (base_reg, idx_reg) = if scale == 1
                     && matches!(regs[b], JtVal::Index { bound: Some(_) })
                     && !matches!(regs[ix], JtVal::Index { bound: Some(_) })
                 {
-                    b
+                    (ix, b)
                 } else {
-                    ix
+                    (b, ix)
                 };
-                let (_, bound) = extract_idx(regs[idx_reg]);
+                let (indir, bound) = extract_idx(regs[idx_reg]);
+                if msize == 2 && indir.is_some() {
+                    return JtVal::TableOff16 {
+                        tbl_va: img_base.wrapping_add(disp),
+                        signed: false,
+                        assumed_base_reg: Some(base_reg as u8),
+                        indir,
+                        bound,
+                    };
+                }
                 return JtVal::IndirIndex {
                     tbl_va: img_base.wrapping_add(disp),
                     elem_bytes: msize as u8,
+                    assumed_base_reg: Some(base_reg as u8),
                     bound,
                 };
             }
             JtVal::Unknown
         }
         (None, Some(ix)) if disp >= img_base && disp < img_base.saturating_add(img_size) => {
-            let (_, bound) = extract_idx(regs[ix]);
-            JtVal::IndirIndex { tbl_va: disp, elem_bytes: msize as u8, bound }
+            let (indir, bound) = extract_idx(regs[ix]);
+            if msize == 2 && indir.is_some() {
+                return JtVal::TableOff16 {
+                    tbl_va: disp,
+                    signed: false,
+                    assumed_base_reg: None,
+                    indir,
+                    bound,
+                };
+            }
+            JtVal::IndirIndex {
+                tbl_va: disp,
+                elem_bytes: msize as u8,
+                assumed_base_reg: None,
+                bound,
+            }
         }
         // Byte-loaded switch/bytecode index (`movzx reg, byte ptr [base + disp]`): naturally
         // bounded to `0..256` without requiring an explicit prior `cmp reg, imm` check.
@@ -468,6 +703,9 @@ unsafe fn resolve_jt_targets(
     };
 
     let (base_va, tbl_va, stride, signed, sub_from_base, assumed_base, indir, bound) = match kind {
+        JtVal::Target16 { base_va, tbl_va, signed, sub_from_base, assumed_base, indir, bound } => {
+            (base_va, tbl_va, 2u64, signed, sub_from_base, assumed_base, indir, bound)
+        }
         JtVal::Target32 { base_va, tbl_va, signed, sub_from_base, assumed_base, indir, bound } => {
             (base_va, tbl_va, 4u64, signed, sub_from_base, assumed_base, indir, bound)
         }
@@ -512,7 +750,15 @@ unsafe fn resolve_jt_targets(
         if !in_img(entry_addr, stride) {
             break;
         }
-        let target = if stride == 4 {
+        let target = if stride == 2 {
+            let raw = core::ptr::read_unaligned(entry_addr as usize as *const u16);
+            let disp = if signed { raw as i16 as i64 as u64 } else { raw as u64 };
+            if sub_from_base {
+                base_va.wrapping_sub(disp)
+            } else {
+                base_va.wrapping_add(disp)
+            }
+        } else if stride == 4 {
             let raw = core::ptr::read_unaligned(entry_addr as usize as *const u32);
             let disp = if signed { raw as i32 as i64 as u64 } else { raw as u64 };
             if sub_from_base {
@@ -785,12 +1031,12 @@ pub(super) unsafe fn analyze_block(
                                     _ => JtVal::Unknown,
                                 }
                             }
-                            (None, Some(ix), s @ (4 | 8), 0) => {
+                            (None, Some(ix), s @ (2 | 4 | 8), 0) => {
                                 clobber_alias(&mut alias, dst);
                                 let (indir, bound) = extract_idx(regs[ix]);
                                 JtVal::ScaledIndex { scale: s as u8, indir, bound }
                             }
-                            (Some(b), Some(ix), s @ (4 | 8), d) => {
+                            (Some(b), Some(ix), s @ (2 | 4 | 8), d) => {
                                 clobber_alias(&mut alias, dst);
                                 if let JtVal::Const(c) = regs[b] {
                                     let (indir, bound) = extract_idx(regs[ix]);
@@ -968,6 +1214,76 @@ pub(super) unsafe fn analyze_block(
                                     }
                                     (
                                         JtVal::Const(base_va),
+                                        JtVal::TableOff16 {
+                                            tbl_va,
+                                            signed,
+                                            assumed_base_reg: None,
+                                            indir,
+                                            bound,
+                                        },
+                                    ) => JtVal::Target16 {
+                                        base_va,
+                                        tbl_va,
+                                        signed,
+                                        sub_from_base: true,
+                                        assumed_base: false,
+                                        indir,
+                                        bound,
+                                    },
+                                    (
+                                        _,
+                                        JtVal::TableOff16 {
+                                            tbl_va,
+                                            signed,
+                                            assumed_base_reg: Some(breg),
+                                            indir,
+                                            bound,
+                                        },
+                                    ) if breg as usize == dst => JtVal::Target16 {
+                                        base_va: img_base,
+                                        tbl_va,
+                                        signed,
+                                        sub_from_base: true,
+                                        assumed_base: true,
+                                        indir,
+                                        bound,
+                                    },
+                                    (
+                                        JtVal::Const(base_va),
+                                        JtVal::IndirIndex {
+                                            tbl_va,
+                                            elem_bytes: 2,
+                                            assumed_base_reg: None,
+                                            bound,
+                                        },
+                                    ) => JtVal::Target16 {
+                                        base_va,
+                                        tbl_va,
+                                        signed: false,
+                                        sub_from_base: true,
+                                        assumed_base: false,
+                                        indir: None,
+                                        bound,
+                                    },
+                                    (
+                                        _,
+                                        JtVal::IndirIndex {
+                                            tbl_va,
+                                            elem_bytes: 2,
+                                            assumed_base_reg: Some(breg),
+                                            bound,
+                                        },
+                                    ) if breg as usize == dst => JtVal::Target16 {
+                                        base_va: img_base,
+                                        tbl_va,
+                                        signed: false,
+                                        sub_from_base: true,
+                                        assumed_base: true,
+                                        indir: None,
+                                        bound,
+                                    },
+                                    (
+                                        JtVal::Const(base_va),
                                         JtVal::TableOff32 {
                                             tbl_va,
                                             signed,
@@ -1092,6 +1408,10 @@ pub(super) unsafe fn analyze_block(
                 if ins.op_kind(0) == K::Register {
                     if let Some(dst) = gpr_idx(ins.op0_register()) {
                         let new_val = match op_imm(ins, 1) {
+                            Some(1) => {
+                                let (indir, bound) = extract_idx(regs[dst]);
+                                JtVal::ScaledIndex { scale: 2, indir, bound }
+                            }
                             Some(2) => {
                                 let (indir, bound) = extract_idx(regs[dst]);
                                 JtVal::ScaledIndex { scale: 4, indir, bound }
@@ -1158,6 +1478,66 @@ pub(super) unsafe fn analyze_block(
                     clear_cmp_reg(&mut last_cmp, r);
                 }
             }
+            _ if cmov_cc(mn).is_some() => {
+                // Branchless switch-index clamping (Spectre-safe / MSVC / Clang):
+                // e.g. `cmp eax, N; mov ecx, def; cmova eax, ecx` or `mov ecx, def; cmp eax, N; cmovb ecx, eax`.
+                if ins.op_kind(0) == K::Register {
+                    if let Some(dst) = gpr_idx(ins.op0_register()) {
+                        let raw_cc = cmov_cc(mn).unwrap();
+                        let (src_reg, src_val) = if ins.op_kind(1) == K::Register {
+                            match gpr_idx(ins.op1_register()) {
+                                Some(sr) => (Some(sr), regs[sr]),
+                                None => (None, JtVal::Unknown),
+                            }
+                        } else {
+                            (None, JtVal::Unknown)
+                        };
+                        let mut clamped: Option<usize> = None;
+                        if let Some((mask, imm, rev)) = last_cmp {
+                            let cc = if rev { flip_cmp_cc(raw_cc) } else { raw_cc };
+                            let bound_le =
+                                (imm < MAX_JT_ENTRIES as u64).then(|| imm as usize + 1);
+                            let bound_lt = (imm > 0 && imm <= MAX_JT_ENTRIES as u64)
+                                .then(|| imm as usize);
+                            if (mask & (1u16 << dst)) != 0 {
+                                let keep_b = match cc {
+                                    CC::a | CC::g => bound_le,
+                                    CC::ae | CC::ge => bound_lt,
+                                    _ => None,
+                                };
+                                if let (Some(kb), Some(sb)) = (keep_b, jt_upper_bound(src_val)) {
+                                    clamped = Some(kb.max(sb));
+                                }
+                            } else if let Some(sr) = src_reg {
+                                if (mask & (1u16 << sr)) != 0 {
+                                    let move_b = match cc {
+                                        CC::b | CC::l => bound_lt,
+                                        CC::be | CC::le => bound_le,
+                                        _ => None,
+                                    };
+                                    if let (Some(mb), Some(db)) = (move_b, jt_upper_bound(regs[dst]))
+                                    {
+                                        clamped = Some(mb.max(db));
+                                    }
+                                }
+                            }
+                        }
+                        if clamped.is_none() {
+                            if let (Some(db), Some(sb)) =
+                                (jt_upper_bound(regs[dst]), jt_upper_bound(src_val))
+                            {
+                                clamped = Some(db.max(sb));
+                            }
+                        }
+                        clobber_alias(&mut alias, dst);
+                        regs[dst] = match clamped {
+                            Some(b) => JtVal::Index { bound: Some(b.min(MAX_JT_ENTRIES)) },
+                            None => JtVal::Unknown,
+                        };
+                        clear_cmp_reg(&mut last_cmp, dst);
+                    }
+                }
+            }
             _ => {
                 if ins.flow_control() != F::ConditionalBranch
                     && ins.op_count() > 0
@@ -1199,17 +1579,7 @@ pub(super) unsafe fn analyze_block(
                     last.condition_code()
                 } else {
                     // `cmp const, reg` swaps the direction of ordered comparisons.
-                    match last.condition_code() {
-                        CC::a => CC::b,
-                        CC::ae => CC::be,
-                        CC::b => CC::a,
-                        CC::be => CC::ae,
-                        CC::g => CC::l,
-                        CC::ge => CC::le,
-                        CC::l => CC::g,
-                        CC::le => CC::ge,
-                        other => other,
-                    }
+                    flip_cmp_cc(last.condition_code())
                 };
                 let (taken_b, fall_b) = match cc {
                     CC::a | CC::g => (None, bound_le),
@@ -1248,7 +1618,10 @@ pub(super) unsafe fn analyze_block(
                 K::Memory => eval_mem_load(last, &regs, false, img_base, img_size),
                 _ => JtVal::Unknown,
             };
-            if matches!(jt_kind, JtVal::Target32 { .. } | JtVal::Target64 { .. }) {
+            if matches!(
+                jt_kind,
+                JtVal::Target16 { .. } | JtVal::Target32 { .. } | JtVal::Target64 { .. }
+            ) {
                 let cur_func = fmap.root_of(ip.wrapping_sub(img_base) as u32);
                 let targets = resolve_jt_targets(jt_kind, base, size, text, fmap, cur_func);
                 step.jt_targets = targets.len();

@@ -778,7 +778,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                             && crate::emu::regfile_ext::is_valid_guest_range(dst, total)
                         {
                             let dist = dst.wrapping_sub(src);
-                            if crate::emu::mem::tso() {
+                            if crate::emu::mem::tso_memcpy() {
                                 core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                             }
                             if dist == 0 || dist >= total as u64 {
@@ -804,7 +804,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                                     cpu.write_mem(dst.wrapping_add(i * elem_bytes), ebits, v);
                                 }
                             }
-                            if crate::emu::mem::tso() {
+                            if crate::emu::mem::tso_memcpy() {
                                 core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                             }
                             let dst_end = dst.wrapping_add(total as u64);
@@ -851,11 +851,11 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         }
                     });
                     if let Some((src_lo, dst_lo, dst_hi, total, total_u)) = bulk_ok {
-                        if crate::emu::mem::tso() {
+                        if crate::emu::mem::tso_memcpy() {
                             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                         }
                         core::ptr::copy(src_lo as *const u8, dst_lo as *mut u8, total);
-                        if crate::emu::mem::tso() {
+                        if crate::emu::mem::tso_memcpy() {
                             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                         }
                         if crate::emu::mem::jit_overlaps(dst_lo as usize, dst_hi as usize) {
@@ -902,7 +902,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                     }
                 });
                 if let Some((dst_lo, dst_hi, total, total_u)) = bulk_range {
-                    if crate::emu::mem::tso() {
+                    if crate::emu::mem::tso_memcpy() {
                         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                     }
                     let b = val as u8;
@@ -1040,7 +1040,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         }
                     }
                 }
-                if crate::emu::mem::tso() {
+                if crate::emu::mem::tso_memcpy() {
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 }
                 cpu.gpr[7] = ptr;
@@ -1144,7 +1144,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         }
                     }
                 }
-                if crate::emu::mem::tso() {
+                if crate::emu::mem::tso_memcpy() {
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 }
                 cpu.gpr[6] = p1;

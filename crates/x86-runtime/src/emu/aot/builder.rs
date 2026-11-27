@@ -304,9 +304,30 @@ pub(super) unsafe fn build_image_with_threads(
     vbase: usize,
     threads: usize,
 ) -> Option<Image> {
-    build_image_with_threads_and_limits(pool, ips, vbase, threads, AOT_BANK_SPAN, MAX_CODE)
+    build_image_with_threads_and_limits_qos(pool, ips, vbase, threads, AOT_BANK_SPAN, MAX_CODE, None)
 }
 
+/// Parallel block translation with optional macOS/iOS worker-thread QoS class
+/// (`QOS_CLASS_UTILITY` / `QOS_CLASS_BACKGROUND`) applied inside every spawned worker.
+pub(super) unsafe fn build_image_with_threads_qos(
+    pool: &mut WorkerCaches,
+    ips: &[u64],
+    vbase: usize,
+    threads: usize,
+    worker_qos: Option<u32>,
+) -> Option<Image> {
+    build_image_with_threads_and_limits_qos(
+        pool,
+        ips,
+        vbase,
+        threads,
+        AOT_BANK_SPAN,
+        MAX_CODE,
+        worker_qos,
+    )
+}
+
+#[cfg(test)]
 pub(super) unsafe fn build_image_with_threads_and_limits(
     pool: &mut WorkerCaches,
     ips: &[u64],
@@ -314,6 +335,18 @@ pub(super) unsafe fn build_image_with_threads_and_limits(
     threads: usize,
     bank_span: usize,
     max_code: usize,
+) -> Option<Image> {
+    build_image_with_threads_and_limits_qos(pool, ips, vbase, threads, bank_span, max_code, None)
+}
+
+pub(super) unsafe fn build_image_with_threads_and_limits_qos(
+    pool: &mut WorkerCaches,
+    ips: &[u64],
+    vbase: usize,
+    threads: usize,
+    bank_span: usize,
+    max_code: usize,
+    worker_qos: Option<u32>,
 ) -> Option<Image> {
     if threads <= 1 || ips.len() < 2 {
         return build_image_with_limits(pool.get_one(), ips, vbase, bank_span, max_code);
@@ -342,6 +375,9 @@ pub(super) unsafe fn build_image_with_threads_and_limits(
                 .name(format!("port-aot-w{wi}"))
                 .stack_size(PARALLEL_WORKER_STACK)
                 .spawn_scoped(scope, move || {
+                    if let Some(q) = worker_qos {
+                        super::set_qos(q);
+                    }
                     let bcp: *mut BlockCache = &mut **local_bc;
                     let mut scratch = Vec::with_capacity(jit::AOT_MAX_BLOCK_BYTES / 4);
                     let mut tr_scratch = jit::TrScratch::new();
@@ -390,6 +426,55 @@ pub(super) unsafe fn build_image_with_threads_and_limits(
     }
     asm.flush(&mut img, &offs);
     Some(img)
+}
+
+/// Unified root set for any AOT builder (offline prewarm, `PORT_AOT_BUILD`, and live
+/// `bg_build`): always takes the union of static PE roots, runtime-replayed callback roots,
+/// and recorded JIT/interpreter miss profile RVAs so background/profile builds never clobber
+/// a full static `.aot` image with a partial profile-only cache.
+pub(super) struct ModuleRoots {
+    pub(super) roots: Vec<u32>,
+    pub(super) static_count: usize,
+    pub(super) replayed_count: usize,
+    pub(super) prof_count: usize,
+}
+
+pub(super) unsafe fn collect_module_roots(
+    name: &str,
+    base: usize,
+    size: usize,
+    image_hash: &[u64; 2],
+    max_roots: usize,
+) -> ModuleRoots {
+    let mut roots = discover_pe_roots(base, size, 0);
+    let static_count = roots.len();
+    let replayed = super::callbacks::load_replayed_callback_roots(name, base, size);
+    let replayed_count = replayed.len();
+    let prof_rvas = read_profile(name, image_hash);
+    let prof_count = prof_rvas.len();
+    if !replayed.is_empty() || !prof_rvas.is_empty() {
+        let text = super::format::exec_sections(base, size);
+        roots.extend(replayed.into_iter().map(|c| c.rva));
+        for rva in prof_rvas {
+            let ip = base as u64 + rva as u64;
+            if (rva as usize) < size
+                && text.iter().any(|&(s, e)| (s as u64..e as u64).contains(&ip))
+            {
+                roots.push(rva);
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+    }
+    if max_roots > 0 && roots.len() > max_roots {
+        roots.truncate(max_roots);
+    }
+    ModuleRoots {
+        roots,
+        static_count,
+        replayed_count,
+        prof_count,
+    }
 }
 
 /// Outcome of profile-free offline `.aot` block-cache precompilation for one mapped PE module.
@@ -448,28 +533,10 @@ pub fn aot_prewarm_all_mapped(max_roots_per_module: usize) -> Vec<AotPrewarmRepo
         }
 
         let key = unsafe { module_key(base, size) };
-        let mut roots = unsafe { discover_pe_roots(base, size, 0) };
-        let replayed = unsafe { super::callbacks::load_replayed_callback_roots(&name, base, size) };
-        let replayed_count = replayed.len();
-        let prof_rvas = read_profile(&name, &key.image_hash);
-        let prof_count = prof_rvas.len();
-        if !replayed.is_empty() || !prof_rvas.is_empty() {
-            let text = unsafe { super::format::exec_sections(base, size) };
-            roots.extend(replayed.into_iter().map(|c| c.rva));
-            for rva in prof_rvas {
-                let ip = base as u64 + rva as u64;
-                if (rva as usize) < size
-                    && text.iter().any(|&(s, e)| (s as u64..e as u64).contains(&ip))
-                {
-                    roots.push(rva);
-                }
-            }
-            roots.sort_unstable();
-            roots.dedup();
-        }
-        if max_roots_per_module > 0 && roots.len() > max_roots_per_module {
-            roots.truncate(max_roots_per_module);
-        }
+        let mr = unsafe { collect_module_roots(&name, base, size, &key.image_hash, max_roots_per_module) };
+        let roots = mr.roots;
+        let replayed_count = mr.replayed_count;
+        let prof_count = mr.prof_count;
         if roots.is_empty() {
             log::info!("emu aot: prewarm {name}: no executable code roots found; skipped");
             reports.push(AotPrewarmReport {
@@ -610,22 +677,16 @@ pub(super) unsafe fn build_all(pending: &[(String, usize, usize)], sel: &[String
         }
         let (base, size) = (*base, *size);
         let key = module_key(base, size);
-        let mut prof = read_profile(name, &key.image_hash);
-        let replayed = super::callbacks::load_replayed_callback_roots(name, base, size);
-        if !replayed.is_empty() {
-            prof.extend(replayed.into_iter().map(|c| c.rva));
-            prof.sort_unstable();
-            prof.dedup();
-        }
-        if prof.is_empty() {
+        let mr = collect_module_roots(name, base, size, &key.image_hash, 0);
+        if mr.roots.is_empty() {
             log::info!(
-                "emu aot: {name}: no profile ({}); skipped",
+                "emu aot: {name}: no static or profiled roots ({}); skipped",
                 profile_file(name, &key.image_hash).display()
             );
             continue;
         }
         let t0 = std::time::Instant::now();
-        let (ips, cl) = discover_with_threads(&mut pool, base, size, &prof, depth, threads);
+        let (ips, cl) = discover_with_threads(&mut pool, base, size, &mr.roots, depth, threads);
         let build_threads = if ips.len() >= PARALLEL_MIN_BLOCKS { threads } else { 1 };
         let Some(img) = build_image_with_threads(&mut pool, &ips, BUILD_VBASE, build_threads) else {
             log::error!("emu aot: {name}: shared stubs don't fit; not built");
@@ -634,9 +695,12 @@ pub(super) unsafe fn build_all(pending: &[(String, usize, usize)], sel: &[String
         let path = cache_file(name, &key);
         match write_atomic(&path, &encode(name, &key, &img, 0)) {
             Ok(()) => log::info!(
-                "emu aot: {name}: built {} blocks ({} profiled, {} candidates; closure depth {depth}: {} jump tables / {} targets, {} leaf callees, {} lea leaves, {} cross-function successors skipped, .pdata {} functions, {} chained fragments merged, {} broken; {} bank(s), {build_threads} thread(s)), {} KiB code, {} links, {} relocs, {} assumptions in {:.2}s -> {} ({} cache(s) of other keys removed)",
+                "emu aot: {name}: built {} blocks ({} roots: {} static, {} callbacks, {} profiled; {} candidates; closure depth {depth}: {} jump tables / {} targets, {} leaf callees, {} lea leaves, {} cross-function successors skipped, .pdata {} functions, {} chained fragments merged, {} broken; {} bank(s), {build_threads} thread(s)), {} KiB code, {} links, {} relocs, {} assumptions in {:.2}s -> {} ({} cache(s) of other keys removed)",
                 img.blocks.len(),
-                prof.len(),
+                mr.roots.len(),
+                mr.static_count,
+                mr.replayed_count,
+                mr.prof_count,
                 ips.len(),
                 cl.jt_tables,
                 cl.jt_targets,

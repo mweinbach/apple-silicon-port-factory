@@ -251,7 +251,7 @@ impl<'a> Rf<'a> {
             return None;
         }
         let p = addr as usize;
-        Some(if super::mem::tso() { super::mem::load128_acq(p) } else { rd::<u128>(p) })
+        Some(if super::mem::tso_vec() { super::mem::load128_acq(p) } else { rd::<u128>(p) })
     }
 
     #[inline(always)]
@@ -316,7 +316,7 @@ impl<'a> Rf<'a> {
             return false;
         }
         let p = addr as usize;
-        if super::mem::tso() {
+        if super::mem::tso_vec() {
             super::mem::store128_rel(p, v);
         } else {
             wr::<u128>(p, v);

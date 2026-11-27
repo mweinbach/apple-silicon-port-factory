@@ -10,7 +10,6 @@ use super::translate::{Chk, Tr};
 use super::xmm::xh;
 use super::*;
 use crate::emu::fast::{self, FastOp};
-use crate::emu::mem;
 
 impl Tr<'_> {
     /// Load `Cpu::jx.x87_state` into `XA` and invalidate the `XA` address cache.
@@ -636,7 +635,7 @@ impl Tr<'_> {
                             }
                             self.a.ldr(64, T0, a, 0);
                             self.a.ldr(64, T1, a, 8);
-                            if mem::tso() {
+                            if self.vec_tso(k, Self::chk_of(op), true) {
                                 self.a.dmb_ishld();
                             }
                             self.a.fmov_gf(true, 1, T0);

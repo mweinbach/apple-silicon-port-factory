@@ -800,7 +800,7 @@ impl Cpu {
             return 0;
         }
         let p = addr as usize;
-        if mem::tso() {
+        if mem::tso_vec() {
             return mem::load128_acq(p);
         }
         rd::<u128>(p)
@@ -816,7 +816,7 @@ impl Cpu {
             return;
         }
         let p = addr as usize;
-        if mem::tso() {
+        if mem::tso_vec() {
             return mem::store128_rel(p, val);
         }
         wr::<u128>(p, val);

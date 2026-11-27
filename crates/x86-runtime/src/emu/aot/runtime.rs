@@ -1190,6 +1190,13 @@ pub(super) unsafe fn install_image(
         TEST_VERIFIED.with(|c| c.set(c.get() + verified));
         TEST_VERIFY_MISMATCHES.with(|c| c.set(c.get() + bad_verify));
     }
+    // Machine code has already been copied into `MAP_JIT` and any initial load-time
+    // verification is complete. Free the redundant heap `Vec<u32>` unless `verify_mode() != 0`
+    // and there are revivable `DEAD_ASSUME` blocks (`bad_check > 0`) that `revalidate_dir`
+    // would later verify against `m.img.code`.
+    if !test && (verify_mode() == 0 || bad_check == 0) {
+        m.img.release_code_heap();
+    }
     let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
     let d = g.get_or_insert_with(|| Dir {
         modules: Vec::new(),
@@ -1393,6 +1400,7 @@ pub(super) static MAPPED: Mutex<Vec<Mapped>> = Mutex::new(Vec::new());
 pub fn module_mapped(name: &str, base: usize, size: usize) {
     let _ = bind_static_aot_module(name, base, size);
     let norm = name.to_ascii_lowercase();
+    unsafe { super::volatile::register_mapped_module(&norm, base, size) };
     let fingerprint = unsafe { super::callbacks::image_fingerprint(base, size) };
     let exec = unsafe { super::format::exec_sections(base, size) };
     if let Ok(mut v) = MAPPED.lock() {

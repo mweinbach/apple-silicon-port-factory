@@ -2612,11 +2612,11 @@ fn fill_callback_plugin_pe(buf: &mut [u8], timestamp: u32, extra_text_byte: u8) 
     w32(buf, 0x2334, 1);
     w32(buf, 0x2338, 0x10B0);
 
-    // Load Config @ 0x2400 with GuardEHContinuationTable @ 0x2560 (relocated VA)
+    // Load Config @ 0x2400 with GuardEHContinuationTable (+0x108) @ 0x2560 (relocated VA)
     w32(buf, 0x2400, 0x140);
     w32(buf, 0x2400 + 0x90, 0x0040_0000);
-    w64(buf, 0x2400 + 0x110, base + 0x2560);
-    w64(buf, 0x2400 + 0x118, 1);
+    w64(buf, 0x2400 + 0x108, base + 0x2560);
+    w64(buf, 0x2400 + 0x110, 1);
     w32(buf, 0x2560, 0x10B0);
 
     // Static COM vtable @ 0x2600 (3 methods: QI=0x12C0, AddRef=0x12E0, Release=0x1300)
@@ -3360,4 +3360,561 @@ fn aot_far_branch_island_chains_b_and_bl_preserving_ras() {
     let got = unsafe { crate::emu::call_va8(fn_entry, 5, 0, 0, 0, 0, 0, 0, 0) };
     crate::emu::jit::force(0);
     assert_eq!(got, 119 * 119);
+}
+
+#[inline]
+fn w16(buf: &mut [u8], o: usize, v: u16) {
+    buf[o..o + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn w32(buf: &mut [u8], o: usize, v: u32) {
+    buf[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// `bg_build` must take the union of static PE roots + replayed callbacks + profile roots so a
+/// tiny runtime profile never clobbers a full static `.aot` cache image.
+#[test]
+fn bg_build_unions_static_callback_and_profile_roots_without_clobbering() {
+    use super::bg::{bg_build, BgJob};
+    use super::format::{cache_file, decode, module_key, profile_file};
+
+    let dir = test_dir("bg-union");
+    let prev_aot_dir = std::env::var_os("PORT_AOT_DIR");
+    let prev_aw2_dir = std::env::var_os("AW2_DLL_AOT_DIR");
+    std::env::set_var("PORT_AOT_DIR", &dir);
+    std::env::remove_var("AW2_DLL_AOT_DIR");
+
+    let mut pe = TestMappedBuf::alloc(0x4000, 0x2_3F30_0000);
+    let base = pe.base();
+    let base64 = base as u64;
+    let buf = pe.as_slice_mut();
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x1000, 0x2000, 0x1000, None, Some((0x2000, 24)));
+    // Two static .pdata functions at 0x1000 and 0x1100, plus one runtime-only block at 0x1200.
+    buf[0x1000..0x1006].copy_from_slice(&[0xB8, 0x01, 0, 0, 0, 0xC3]);
+    buf[0x1100..0x1106].copy_from_slice(&[0xB8, 0x02, 0, 0, 0, 0xC3]);
+    buf[0x1200..0x1206].copy_from_slice(&[0xB8, 0x03, 0, 0, 0, 0xC3]);
+    w32(buf, 0x2000, 0x1000);
+    w32(buf, 0x2004, 0x1006);
+    w32(buf, 0x2008, 0);
+    w32(buf, 0x200C, 0x1100);
+    w32(buf, 0x2010, 0x1106);
+    w32(buf, 0x2014, 0);
+
+    let key = unsafe { module_key(base, pe.len) };
+    // Write a tiny profile containing ONLY the runtime-only block 0x1200.
+    let ppath = profile_file("union_test.dll", &key.image_hash);
+    std::fs::create_dir_all(ppath.parent().unwrap()).unwrap();
+    std::fs::write(&ppath, "1200\t1\n").unwrap();
+
+    let mut pool = WorkerCaches::new();
+    let job = BgJob {
+        name: "union_test.dll".to_string(),
+        base,
+        size: pe.len,
+        key,
+        install: false,
+    };
+    unsafe { bg_build(&mut pool, job, QOS_CLASS_BACKGROUND) };
+
+    let cpath = cache_file("union_test.dll", &key);
+    let bytes = std::fs::read(&cpath).expect("bg_build must write .aot cache");
+    let (_, _, img, _) = decode(&bytes).expect("decode written .aot cache");
+    let ips: std::collections::HashSet<u64> = img.blocks.iter().map(|b| b.ip).collect();
+    assert!(ips.contains(&(base64 + 0x1000)), "static root 0x1000 must not be clobbered");
+    assert!(ips.contains(&(base64 + 0x1100)), "static root 0x1100 must not be clobbered");
+    assert!(ips.contains(&(base64 + 0x1200)), "profile root 0x1200 must be included");
+
+    match prev_aot_dir {
+        Some(v) => std::env::set_var("PORT_AOT_DIR", v),
+        None => std::env::remove_var("PORT_AOT_DIR"),
+    }
+    match prev_aw2_dir {
+        Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
+        None => std::env::remove_var("AW2_DLL_AOT_DIR"),
+    }
+}
+
+/// `Image::release_code_heap` must free the heap `Vec<u32>` after copying into `MAP_JIT`
+/// while preserving `code_bytes()` and `bank_end()`.
+#[test]
+fn image_release_code_heap_frees_vec_and_preserves_metadata() {
+    let mut pe = TestMappedBuf::alloc(0x2000, 0x2_3F34_0000);
+    let base = pe.base() as u64;
+    let buf = pe.as_slice_mut();
+    buf[0x100..0x106].copy_from_slice(&[0xB8, 0x42, 0, 0, 0, 0xC3]);
+
+    let mut bc = Box::new(BlockCache::new());
+    let mut img = unsafe { build_image(&mut *bc, &[base + 0x100], BUILD_VBASE) }.expect("build_image");
+    let bytes_before = img.code_bytes();
+    let end_before = img.bank_end(0);
+    assert!(bytes_before > 0);
+    assert!(!img.code.is_empty());
+
+    img.release_code_heap();
+    assert!(img.code.is_empty());
+    assert_eq!(img.code.capacity(), 0);
+    assert_eq!(img.code_bytes(), bytes_before);
+    assert_eq!(img.bank_end(0), end_before);
+}
+
+/// Static `.pdata`/`.xdata` unwind discovery must seed FH4 (`FuncInfo4` unwind actions,
+/// `TryBlockMap4`/`HandlerMap4` catch funclets + continuations), FH3 (`FuncInfo` unwind + catch
+/// handlers), and `UNW_FLAG_CHAININFO` chained unwind handlers.
+#[test]
+fn static_unwind_discovers_fh4_fh3_and_chained_handlers() {
+    use super::callbacks::{discover_all_callback_roots, CallbackKind, CallbackRoot};
+
+    let mut pe = TestMappedBuf::alloc(0x4000, 0x2_3F38_0000);
+    let base = pe.base();
+    let base64 = base as u64;
+    let buf = pe.as_slice_mut();
+    // .text @ 0x1000..0x2000, .rdata/.pdata @ 0x2000..0x3800, 3 RUNTIME_FUNCTIONs @ 0x2000 (36B)
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x1000, 0x2000, 0x1800, None, Some((0x2000, 36)));
+
+    let put_fn = |b: &mut [u8], rva: usize, imm: u8| {
+        b[rva..rva + 6].copy_from_slice(&[0xB8, imm, 0, 0, 0, 0xC3]);
+    };
+    put_fn(buf, 0x1000, 1); // FH4 function body
+    put_fn(buf, 0x1080, 2); // FH4 personality
+    put_fn(buf, 0x1100, 3); // FH4 UWMap4 unwind action
+    put_fn(buf, 0x1120, 4); // FH4 HandlerMap4 catch funclet
+    put_fn(buf, 0x1140, 5); // FH4 HandlerMap4 continuation
+    put_fn(buf, 0x1200, 6); // FH3 function body
+    put_fn(buf, 0x1280, 7); // FH3 personality
+    put_fn(buf, 0x1300, 8); // FH3 unwind action
+    put_fn(buf, 0x1320, 9); // FH3 catch handler
+    put_fn(buf, 0x1400, 10); // Chained child body
+    put_fn(buf, 0x1420, 11); // Chained parent body
+    put_fn(buf, 0x1440, 12); // Chained parent handler
+
+    // Entry 0: FH4 function @ 0x1000..0x1040 -> UNWIND_INFO @ 0x2100
+    w32(buf, 0x2000, 0x1000);
+    w32(buf, 0x2004, 0x1040);
+    w32(buf, 0x2008, 0x2100);
+    buf[0x2100] = 0x01 | (1 << 3); // v1, UNW_FLAG_EHANDLER
+    w32(buf, 0x2104, 0x1080); // personality RVA
+    w32(buf, 0x2108, 0x2200); // FuncInfo4 RVA (single u32 RVA)
+    // FuncInfo4 @ 0x2200: header = 0x08 (uwMap) | 0x10 (tryBlockMap) = 0x18
+    buf[0x2200] = 0x18;
+    w32(buf, 0x2201, 0x2220); // dispUnwindMap
+    w32(buf, 0x2205, 0x2240); // dispTryBlockMap
+    w32(buf, 0x2209, 0);      // dispIPtoStateMap (0 = none)
+    // UWMap4 @ 0x2220: count=1 (varint 0x02 => 1), entry: (nextOff=0, type=1 -> (0<<2)|1=1 => varint 0x02), action=0x1100, obj=0 (varint 0x00)
+    buf[0x2220] = 0x02;
+    buf[0x2221] = 0x02;
+    w32(buf, 0x2222, 0x1100);
+    buf[0x2226] = 0x00;
+    // TryBlockMap4 @ 0x2240: count=1 (varint 0x02), tryLow=0 (0x00), tryHigh=0 (0x00), catchHigh=1 (0x02), dispHandlerArray=0x2260
+    buf[0x2240] = 0x02;
+    buf[0x2241] = 0x00;
+    buf[0x2242] = 0x00;
+    buf[0x2243] = 0x02;
+    w32(buf, 0x2244, 0x2260);
+    // HandlerMap4 @ 0x2260: count=1 (varint 0x02), header = 0x08 (cont is RVA) | (1<<4) (1 cont addr) = 0x18
+    buf[0x2260] = 0x02;
+    buf[0x2261] = 0x18;
+    w32(buf, 0x2262, 0x1120); // catch funclet RVA
+    w32(buf, 0x2266, 0x1140); // continuation RVA
+
+    // Entry 1: FH3 function @ 0x1200..0x1240 -> UNWIND_INFO @ 0x2300
+    w32(buf, 0x200C, 0x1200);
+    w32(buf, 0x2010, 0x1240);
+    w32(buf, 0x2014, 0x2300);
+    buf[0x2300] = 0x01 | (1 << 3);
+    w32(buf, 0x2304, 0x1280);
+    w32(buf, 0x2308, 0x2400); // FuncInfo3 RVA
+    // FuncInfo3 @ 0x2400
+    w32(buf, 0x2400, 0x1993_0522);
+    w32(buf, 0x2404, 1); // maxState
+    w32(buf, 0x2408, 0x2440); // dispUnwindMap
+    w32(buf, 0x240C, 1); // nTryBlocks
+    w32(buf, 0x2410, 0x2460); // dispTryBlockMap
+    // UnwindMapEntry @ 0x2440: toState=-1, action=0x1300
+    w32(buf, 0x2440, u32::MAX);
+    w32(buf, 0x2444, 0x1300);
+    // TryBlockMapEntry @ 0x2460 (20 bytes): tryLow=0, tryHigh=0, catchHigh=1, nCatches=1, dispHandlerArray=0x2480
+    w32(buf, 0x2460, 0);
+    w32(buf, 0x2464, 0);
+    w32(buf, 0x2468, 1);
+    w32(buf, 0x246C, 1);
+    w32(buf, 0x2470, 0x2480);
+    // HandlerType @ 0x2480 (20 bytes): adjectives=0, dispType=0, dispCatchObj=0, dispOfHandler=0x1320, dispFrame=0
+    w32(buf, 0x248C, 0x1320);
+
+    // Entry 2: Chained child @ 0x1400..0x1410 -> UNWIND_INFO @ 0x2500 with UNW_FLAG_CHAININFO -> 0x2520 (handler 0x1440)
+    w32(buf, 0x2018, 0x1400);
+    w32(buf, 0x201C, 0x1410);
+    w32(buf, 0x2020, 0x2500);
+    buf[0x2500] = 0x01 | (4 << 3); // UNW_FLAG_CHAININFO
+    w32(buf, 0x2504, 0x1420);
+    w32(buf, 0x2508, 0x1430);
+    w32(buf, 0x250C, 0x2520);
+    buf[0x2520] = 0x01 | (2 << 3); // UNW_FLAG_UHANDLER
+    w32(buf, 0x2524, 0x1440);
+
+    let roots = unsafe { discover_all_callback_roots("unwind_test.dll", base, pe.len) };
+    let has = |rva: u32, kind: CallbackKind| roots.contains(&CallbackRoot { rva, kind });
+    assert!(has(0x1080, CallbackKind::UnwindHandler), "FH4 personality");
+    assert!(has(0x1100, CallbackKind::UnwindHandler), "FH4 UWMap4 action: {roots:?}");
+    assert!(has(0x1120, CallbackKind::UnwindHandler), "FH4 catch funclet: {roots:?}");
+    assert!(has(0x1140, CallbackKind::EhContinuation), "FH4 continuation: {roots:?}");
+    assert!(has(0x1280, CallbackKind::UnwindHandler), "FH3 personality");
+    assert!(has(0x1300, CallbackKind::UnwindHandler), "FH3 unwind action: {roots:?}");
+    assert!(has(0x1320, CallbackKind::UnwindHandler), "FH3 catch handler: {roots:?}");
+    assert!(has(0x1440, CallbackKind::UnwindHandler), "chained parent unwind handler: {roots:?}");
+}
+
+/// Static jump-table discovery must recognize branchless `cmov`-clamped indices and 16-bit
+/// signed/unsigned offset tables (`movzx`/`movsx word ptr [tbl + idx*2]`).
+#[test]
+fn jumptable_discovers_cmov_clamped_and_16bit_offset_tables() {
+    use iced_x86::code_asm::*;
+
+    let mut pe = TestMappedBuf::alloc(0x4000, 0x2_3F3C_0000);
+    let base = pe.base();
+    let base64 = base as u64;
+    let buf = pe.as_slice_mut();
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x1000, 0x2000, 0x1000, None, None);
+
+    // Targets for switch 1 (cmov-clamped 32-bit RVA table) at 0x1400..0x1430
+    // Targets for switch 2 (16-bit unsigned offset table) at 0x1500..0x1530
+    // Targets for switch 3 (16-bit signed offset table with shl 1) at 0x1600..0x1630
+    let put_case = |b: &mut [u8], rva: usize, v: u8| {
+        b[rva..rva + 6].copy_from_slice(&[0xB8, v, 0, 0, 0, 0xC3]);
+    };
+    for i in 0..4usize {
+        put_case(buf, 0x1400 + i * 0x10, 0x10 + i as u8);
+        put_case(buf, 0x1500 + i * 0x10, 0x20 + i as u8);
+        put_case(buf, 0x1600 + i * 0x10, 0x30 + i as u8);
+    }
+
+    // Table 1 @ 0x2000: 4 x i32 offsets relative to 0x2000
+    for i in 0..4u32 {
+        let target = 0x1400 + i * 0x10;
+        w32(buf, 0x2000 + (i as usize) * 4, (target as i32 - 0x2000i32) as u32);
+    }
+    // Table 2 @ 0x2020: 4 x u16 offsets relative to 0x1500
+    for i in 0..4u16 {
+        w16(buf, 0x2020 + (i as usize) * 2, i * 0x10);
+    }
+    // Table 3 @ 0x2040: 4 x i16 offsets relative to 0x1620 (negative & positive!)
+    for i in 0..4i16 {
+        let off = (i * 0x10) - 0x20;
+        w16(buf, 0x2040 + (i as usize) * 2, off as u16);
+    }
+
+    // Helper to append `lea reg, [rip + (target_rva - next_rva)]` (7 bytes).
+    let emit_lea_rip = |a: &mut CodeAssembler, start_rva: u32, reg_code: u8, target_rva: u32| {
+        let cur_len = a.assemble(base64 + start_rva as u64).unwrap().len() as u32;
+        let next_rva = start_rva + cur_len + 7;
+        let rex = 0x48 | ((reg_code >> 3) << 2);
+        let modrm = 0x05 | ((reg_code & 7) << 3);
+        let disp = (target_rva as i32 - next_rva as i32).to_le_bytes();
+        a.db(&[rex, 0x8D, modrm, disp[0], disp[1], disp[2], disp[3]]).unwrap();
+    };
+
+    // Switch 1 @ 0x1000: cmov-clamped (`cmp ecx, 3; mov eax, 3; cmovb eax, ecx; lea rdx, [rip+0x2000]; movsxd rcx, [rdx+rax*4]; add rcx, rdx; jmp rcx`)
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.cmp(ecx, 3).unwrap();
+    a.mov(eax, 3).unwrap();
+    a.cmovb(eax, ecx).unwrap();
+    emit_lea_rip(&mut a, 0x1000, 2 /* rdx */, 0x2000);
+    a.movsxd(rcx, dword_ptr(rdx + rax * 4)).unwrap();
+    a.add(rcx, rdx).unwrap();
+    a.jmp(rcx).unwrap();
+    let s1 = a.assemble(base64 + 0x1000).unwrap();
+    buf[0x1000..0x1000 + s1.len()].copy_from_slice(&s1);
+
+    // Switch 2 @ 0x1100: unsigned 16-bit offset table (`cmp ecx, 3; ja default; lea rdx, [rip+0x2020]; movzx eax, word [rdx+rcx*2]; lea r8, [rip+0x1500]; add rax, r8; jmp rax`)
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.cmp(ecx, 3).unwrap();
+    // `ja +24` (skip switch body straight to `ret`) — compute exact body size using label after `db`.
+    let mut def2 = a.create_label();
+    a.ja(def2).unwrap();
+    // Assemble prefix up to `lea` without binding `def2` by computing offset from known prefix length:
+    // `cmp ecx, 3` (3B) + `ja rel8` (2B) = 5B -> lea rdx @ +5 (7B, next = 0x110C)
+    let d_tbl2 = (0x2020i32 - 0x110Ci32).to_le_bytes();
+    a.db(&[0x48, 0x8D, 0x15, d_tbl2[0], d_tbl2[1], d_tbl2[2], d_tbl2[3]]).unwrap();
+    a.movzx(eax, word_ptr(rdx + rcx * 2)).unwrap(); // 4B -> ends at 0x1110
+    // `lea r8, [rip + ...]` @ +16 (7B, next = 0x1117)
+    let d_base2 = (0x1500i32 - 0x1117i32).to_le_bytes();
+    a.db(&[0x4C, 0x8D, 0x05, d_base2[0], d_base2[1], d_base2[2], d_base2[3]]).unwrap();
+    a.add(rax, r8).unwrap();
+    a.jmp(rax).unwrap();
+    a.set_label(&mut def2).unwrap();
+    a.ret().unwrap();
+    let s2 = a.assemble(base64 + 0x1100).unwrap();
+    buf[0x1100..0x1100 + s2.len()].copy_from_slice(&s2);
+
+    // Switch 3 @ 0x1200: signed 16-bit offset table with `shl rcx, 1`
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut def3 = a.create_label();
+    a.cmp(ecx, 3).unwrap(); // 3B
+    a.ja(def3).unwrap();    // 2B -> +5
+    let d_tbl3 = (0x2040i32 - 0x120Ci32).to_le_bytes();
+    a.db(&[0x48, 0x8D, 0x15, d_tbl3[0], d_tbl3[1], d_tbl3[2], d_tbl3[3]]).unwrap(); // 7B -> +12 (0x120C)
+    a.shl(rcx, 1).unwrap(); // 3B -> +15 (0x120F)
+    a.movsx(rax, word_ptr(rdx + rcx)).unwrap(); // 5B (48 0F BF 04 0A) -> +20 (0x1214)
+    let d_base3 = (0x1620i32 - 0x121Bi32).to_le_bytes();
+    a.db(&[0x4C, 0x8D, 0x05, d_base3[0], d_base3[1], d_base3[2], d_base3[3]]).unwrap(); // 7B -> +27 (0x121B)
+    a.add(rax, r8).unwrap();
+    a.jmp(rax).unwrap();
+    a.set_label(&mut def3).unwrap();
+    a.ret().unwrap();
+    let s3 = a.assemble(base64 + 0x1200).unwrap();
+    buf[0x1200..0x1200 + s3.len()].copy_from_slice(&s3);
+
+    let mut bc = Box::new(BlockCache::new());
+    let (ips, _) = unsafe { discover(&mut *bc, base, pe.len, &[0x1000, 0x1100, 0x1200], DEFAULT_AOT_CLOSURE) };
+    for i in 0..4u64 {
+        assert!(ips.contains(&(base64 + 0x1400 + i * 0x10)), "cmov switch target {i} missing");
+        assert!(ips.contains(&(base64 + 0x1500 + i * 0x10)), "u16 switch target {i} missing");
+        assert!(ips.contains(&(base64 + 0x1600 + i * 0x10)), "i16 switch target {i} missing");
+    }
+}
+
+/// 1-shot `interp_fast` misses (before `JitCache` tier-up) and `static_only` misses must record
+/// the missed RVA via `record_runtime_callback` so cold blocks feed back into offline prewarm.
+#[test]
+fn one_shot_and_static_only_misses_feed_callbacks() {
+    use super::callbacks::{
+        clear_runtime_callbacks_for_test, flush_runtime_callbacks, load_replayed_callback_roots,
+        CallbackKind,
+    };
+
+    let dir = test_dir("miss-feedback");
+    let prev_aot_dir = std::env::var_os("PORT_AOT_DIR");
+    let prev_aw2_dir = std::env::var_os("AW2_DLL_AOT_DIR");
+    std::env::set_var("PORT_AOT_DIR", &dir);
+    std::env::remove_var("AW2_DLL_AOT_DIR");
+    clear_runtime_callbacks_for_test();
+
+    let mut pe = TestMappedBuf::alloc(0x2000, 0x2_3F40_0000);
+    let base = pe.base();
+    let base64 = base as u64;
+    let buf = pe.as_slice_mut();
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x1000, 0x1800, 0x400, None, None);
+    buf[0x1000..0x1006].copy_from_slice(&[0xB8, 0x11, 0, 0, 0, 0xC3]);
+    buf[0x1040..0x1046].copy_from_slice(&[0xB8, 0x22, 0, 0, 0, 0xC3]);
+
+    // Register module in MAPPED so `record_runtime_callback` maps guest IP -> (name, rva).
+    super::runtime::module_mapped("miss_feed.dll", base, pe.len);
+
+    let mut bc = Box::new(BlockCache::new());
+    // 1. Dynamic 1-shot miss with hot=4 returns None on first hit, yet MUST record the RVA.
+    let mut jc = jit::JitCache::new();
+    unsafe { jc.warm() };
+    jc.test_set_hot(4);
+    let r = unsafe { jc.lookup(base64 + 0x1000, &mut *bc) };
+    assert_eq!(r, None, "1st hit with hot=4 should return None to interp_fast");
+
+    // 2. static_only miss (iOS / static Mach-O) returns None, yet MUST record the RVA.
+    let mut jc_static = jit::JitCache::new();
+    jc_static.test_set_static_only(true);
+    let r2 = unsafe { jc_static.lookup(base64 + 0x1040, &mut *bc) };
+    assert_eq!(r2, None);
+
+    flush_runtime_callbacks();
+    let replayed = unsafe { load_replayed_callback_roots("miss_feed.dll", base, pe.len) };
+    assert!(
+        replayed.iter().any(|c| c.rva == 0x1000 && c.kind == CallbackKind::GenericCallback),
+        "1-shot interp_fast miss must feed back into callback replay: {replayed:?}"
+    );
+    assert!(
+        replayed.iter().any(|c| c.rva == 0x1040 && c.kind == CallbackKind::GenericCallback),
+        "static_only miss must feed back into callback replay: {replayed:?}"
+    );
+
+    MAPPED.lock().unwrap().retain(|m| m.base != base);
+    clear_runtime_callbacks_for_test();
+    match prev_aot_dir {
+        Some(v) => std::env::set_var("PORT_AOT_DIR", v),
+        None => std::env::remove_var("PORT_AOT_DIR"),
+    }
+    match prev_aw2_dir {
+        Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
+        None => std::env::remove_var("AW2_DLL_AOT_DIR"),
+    }
+}
+
+/// PE `VolatileMetadata` TSO elision: inside a covered range, non-volatile loads/stores emit
+/// plain ARM64 `ldr`/`str`, listed volatile RVAs keep `ldapr`/`ldapur`/`stlr`/`stlur`, `LOCK`
+/// atomics stay unconditionally ordered, uncovered ranges keep full TSO, and
+/// `PORT_JIT_VOLATILE_META=0` restores full TSO everywhere.
+#[test]
+fn volatile_metadata_elides_non_volatile_and_preserves_volatile_and_atomics() {
+    use iced_x86::code_asm::*;
+
+    let is_tso_ld = |w: u32| (w & 0x3FFF_FC00) == 0x38BF_C000 || (w & 0x3FE0_0C00) == 0x1940_0000;
+    let is_tso_st = |w: u32| (w & 0x3FFF_FC00) == 0x089F_FC00 || (w & 0x3FE0_0C00) == 0x1900_0000;
+
+    let mut pe = TestMappedBuf::alloc(0x2000, 0x2_3F44_0000);
+    let base = pe.base() as u64;
+    let buf = pe.as_slice_mut();
+
+    // Block A @ 0x1000 (covered, non-volatile): mov rax, [rcx]; mov [rdx], rax; ret
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rax, qword_ptr(rcx)).unwrap();
+    a.mov(qword_ptr(rdx), rax).unwrap();
+    a.ret().unwrap();
+    let blk_nv = a.assemble(base + 0x1000).unwrap();
+    buf[0x1000..0x1000 + blk_nv.len()].copy_from_slice(&blk_nv);
+
+    // Block B @ 0x1040 (covered, BOTH load & store listed in VolatileAccessTable)
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rax, qword_ptr(rcx)).unwrap();
+    let vol_store_off = a.assemble(base + 0x1040).unwrap().len() as u32;
+    a.mov(qword_ptr(rdx), rax).unwrap();
+    a.ret().unwrap();
+    let blk_vol = a.assemble(base + 0x1040).unwrap();
+    buf[0x1040..0x1040 + blk_vol.len()].copy_from_slice(&blk_vol);
+
+    // Block C @ 0x1080 (covered, LOCK XADD — NOT in VolatileAccessTable, must stay atomic!)
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.lock().xadd(qword_ptr(rcx), rax).unwrap();
+    a.ret().unwrap();
+    let blk_lock = a.assemble(base + 0x1080).unwrap();
+    buf[0x1080..0x1080 + blk_lock.len()].copy_from_slice(&blk_lock);
+
+    // Block D @ 0x1200 (OUTSIDE covered range [0x1000, 0x1100): must keep full TSO!)
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rax, qword_ptr(rcx)).unwrap();
+    a.mov(qword_ptr(rdx), rax).unwrap();
+    a.ret().unwrap();
+    let blk_uncov = a.assemble(base + 0x1200).unwrap();
+    buf[0x1200..0x1200 + blk_uncov.len()].copy_from_slice(&blk_uncov);
+
+    struct Guard(u64);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            test_unregister_volatile_meta(self.0);
+            crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+        }
+    }
+    let _g = Guard(base);
+    test_register_volatile_meta(
+        base,
+        pe.len as u64,
+        &[(0x1000, 0x1100)],
+        &[0x1040, 0x1040 + vol_store_off],
+    );
+
+    let words_of = |ip: u64| -> Vec<u32> {
+        let mut bc = Box::new(BlockCache::new());
+        let img = unsafe { build_image(&mut *bc, &[ip], BUILD_VBASE) }.expect("build_image");
+        let b = &img.blocks[0];
+        let start = (b.code_off as usize - AOT_STUBS_BYTES) / 4;
+        let end = start + (b.main as usize);
+        img.code[start..end].to_vec()
+    };
+
+    // With PORT_JIT_VOLATILE_META=1:
+    crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(true)));
+    let w_nv = words_of(base + 0x1000);
+    assert!(!w_nv.iter().any(|&w| is_tso_ld(w)), "non-volatile covered load must elide TSO");
+    assert!(!w_nv.iter().any(|&w| is_tso_st(w)), "non-volatile covered store must elide TSO");
+
+    let w_vol = words_of(base + 0x1040);
+    assert!(w_vol.iter().any(|&w| is_tso_ld(w)), "listed volatile load must keep TSO");
+    assert!(w_vol.iter().any(|&w| is_tso_st(w)), "listed volatile store must keep TSO");
+
+    let w_lock = words_of(base + 0x1080);
+    // LSE `ldaddal` (0xF8E0_0000 mask 0xFFE0_FC00) or LL/SC `ldaxr`/`stlxr` (0xC85F_FC00)
+    let has_atomic = w_lock
+        .iter()
+        .any(|&w| (w & 0xFFE0_FC00) == 0xF8E0_0000 || (w & 0xFFFF_FC00) == 0xC85F_FC00);
+    assert!(has_atomic, "LOCK XADD inside covered range must remain unconditionally atomic");
+
+    let w_uncov = words_of(base + 0x1200);
+    assert!(w_uncov.iter().any(|&w| is_tso_ld(w)), "uncovered load must keep TSO");
+    assert!(w_uncov.iter().any(|&w| is_tso_st(w)), "uncovered store must keep TSO");
+
+    // With PORT_JIT_VOLATILE_META=0: even covered non-volatile block keeps full TSO.
+    crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(false)));
+    let w_off = words_of(base + 0x1000);
+    assert!(w_off.iter().any(|&w| is_tso_ld(w)), "PORT_JIT_VOLATILE_META=0 must keep TSO load");
+    assert!(w_off.iter().any(|&w| is_tso_st(w)), "PORT_JIT_VOLATILE_META=0 must keep TSO store");
+}
+
+/// `PORT_JIT_TSO_VEC` and `PORT_JIT_TSO_MEMCPY` independently toggle vector barriers and bulk
+/// string/memcpy ordering without disabling scalar TSO.
+#[test]
+fn tso_vec_and_tso_memcpy_independent_codegen_switches() {
+    use iced_x86::code_asm::*;
+
+    let is_tso_ld = |w: u32| (w & 0x3FFF_FC00) == 0x38BF_C000 || (w & 0x3FE0_0C00) == 0x1940_0000;
+    let is_tso_st = |w: u32| (w & 0x3FFF_FC00) == 0x089F_FC00 || (w & 0x3FE0_0C00) == 0x1900_0000;
+    const DMB_ISHLD: u32 = 0xD503_39BF;
+    const DMB_ISHST: u32 = 0xD503_3ABF;
+
+    let mut pe = TestMappedBuf::alloc(0x2000, 0x2_3F48_0000);
+    let base = pe.base() as u64;
+    let buf = pe.as_slice_mut();
+
+    // Scalar block @ 0x100
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rax, qword_ptr(rcx)).unwrap();
+    a.mov(qword_ptr(rdx), rax).unwrap();
+    a.ret().unwrap();
+    let b_sc = a.assemble(base + 0x100).unwrap();
+    buf[0x100..0x100 + b_sc.len()].copy_from_slice(&b_sc);
+
+    // Vector block @ 0x200
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.movdqu(xmm0, xmmword_ptr(rcx)).unwrap();
+    a.movdqu(xmmword_ptr(rdx), xmm0).unwrap();
+    a.ret().unwrap();
+    let b_vec = a.assemble(base + 0x200).unwrap();
+    buf[0x200..0x200 + b_vec.len()].copy_from_slice(&b_vec);
+
+    // Bulk rep movsq block @ 0x300
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.rep().movsq().unwrap();
+    a.ret().unwrap();
+    let b_rep = a.assemble(base + 0x300).unwrap();
+    buf[0x300..0x300 + b_rep.len()].copy_from_slice(&b_rep);
+
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            crate::emu::mem::TEST_TSO_VEC.with(|c| c.set(None));
+            crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(None));
+        }
+    }
+    let _g = Guard;
+
+    let words_of = |ip: u64| -> Vec<u32> {
+        let mut bc = Box::new(BlockCache::new());
+        let img = unsafe { build_image(&mut *bc, &[ip], BUILD_VBASE) }.expect("build_image");
+        let b = &img.blocks[0];
+        let start = (b.code_off as usize - AOT_STUBS_BYTES) / 4;
+        let end = start + (b.main as usize);
+        img.code[start..end].to_vec()
+    };
+
+    // Default (all on): scalar, vec, and rep movsq all ordered.
+    let w_vec_on = words_of(base + 0x200);
+    assert!(w_vec_on.contains(&DMB_ISHLD) && w_vec_on.contains(&DMB_ISHST));
+    let w_rep_on = words_of(base + 0x300);
+    assert!(w_rep_on.iter().any(|&w| is_tso_ld(w)) && w_rep_on.iter().any(|&w| is_tso_st(w)));
+
+    // PORT_JIT_TSO_VEC=0: vector drops DMB barriers, scalar and rep movsq keep TSO.
+    crate::emu::mem::TEST_TSO_VEC.with(|c| c.set(Some(false)));
+    let w_vec_off = words_of(base + 0x200);
+    assert!(!w_vec_off.contains(&DMB_ISHLD) && !w_vec_off.contains(&DMB_ISHST));
+    let w_sc_still = words_of(base + 0x100);
+    assert!(w_sc_still.iter().any(|&w| is_tso_ld(w)) && w_sc_still.iter().any(|&w| is_tso_st(w)));
+    let w_rep_still = words_of(base + 0x300);
+    assert!(w_rep_still.iter().any(|&w| is_tso_ld(w)) && w_rep_still.iter().any(|&w| is_tso_st(w)));
+
+    // PORT_JIT_TSO_VEC=1, PORT_JIT_TSO_MEMCPY=0: rep movsq drops TSO, scalar & vector keep TSO.
+    crate::emu::mem::TEST_TSO_VEC.with(|c| c.set(Some(true)));
+    crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(Some(false)));
+    let w_rep_off = words_of(base + 0x300);
+    assert!(!w_rep_off.iter().any(|&w| is_tso_ld(w)) && !w_rep_off.iter().any(|&w| is_tso_st(w)));
+    let w_vec_still = words_of(base + 0x200);
+    assert!(w_vec_still.contains(&DMB_ISHLD) && w_vec_still.contains(&DMB_ISHST));
+    let w_sc_still2 = words_of(base + 0x100);
+    assert!(w_sc_still2.iter().any(|&w| is_tso_ld(w)) && w_sc_still2.iter().any(|&w| is_tso_st(w)));
 }

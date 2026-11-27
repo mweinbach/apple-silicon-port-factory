@@ -767,7 +767,7 @@ impl Cpu {
                         cpu.gpr[7] = cpu.gpr[7].wrapping_sub(elem_bytes);
                     }
                 } else if elem_bytes == 1 && count > 0 {
-                    if mem::tso() {
+                    if mem::tso_memcpy() {
                         // Plain bulk stores: order them after all earlier guest accesses.
                         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                     }
@@ -828,7 +828,7 @@ impl Cpu {
                     } else if total_bytes > 0 {
                         let (src, dst) = (cpu.gpr[6], cpu.gpr[7]);
                         let dist = dst.wrapping_sub(src);
-                        if mem::tso() {
+                        if mem::tso_memcpy() {
                             // Plain bulk copy: order it after all earlier guest accesses.
                             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                         }
@@ -852,7 +852,7 @@ impl Cpu {
                                 cpu.write_mem(dst.wrapping_add(i * elem_bytes), bits, v);
                             }
                         }
-                        if mem::tso() {
+                        if mem::tso_memcpy() {
                             // ...and keep its plain loads before later guest loads.
                             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                         }

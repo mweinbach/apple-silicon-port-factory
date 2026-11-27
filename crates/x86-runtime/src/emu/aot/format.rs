@@ -23,7 +23,7 @@ pub(super) const FORMAT_VERSION: u32 = 8;
 const LEGACY_STUB_COUNT_V6: usize = 10;
 const LEGACY_STUB_COUNT_V7: usize = 12;
 /// Bump on any codegen-relevant change the source hash can't see.
-const AOT_CODEGEN_VERSION: u64 = 5;
+const AOT_CODEGEN_VERSION: u64 = 6;
 
 /// Small 128-bit streaming hash (cache keys / file checksums, not cryptographic).
 pub(super) struct H128 {
@@ -110,6 +110,7 @@ pub(in crate::emu) fn codegen_hash() -> u64 {
             include_bytes!("../interp.rs"),
             include_bytes!("../generic_ops.rs"),
             include_bytes!("../mem.rs"),
+            include_bytes!("volatile.rs"),
             include_bytes!("../simd_kernels.rs"),
             include_bytes!("../simd_mov.rs"),
             include_bytes!("../simd_fp.rs"),
@@ -362,7 +363,12 @@ pub(in crate::emu) struct Image {
     /// `(va, host-callable)`.
     pub(in crate::emu) assume: Vec<(u64, bool)>,
     /// Code words; word 0 sits at region offset [`AOT_STUBS_BYTES`].
+    /// Released via [`Image::release_code_heap`] after installation into `MAP_JIT` when
+    /// `verify_mode() == 0` (or zero revivable blocks exist) to avoid holding a redundant
+    /// heap copy of mapped AOT machine code.
     pub(in crate::emu) code: Vec<u32>,
+    /// Retained word count of `code` after [`Image::release_code_heap`] frees the heap buffer.
+    pub(super) code_words_len: usize,
 }
 
 impl Default for Image {
@@ -375,6 +381,7 @@ impl Default for Image {
             relocs: Vec::new(),
             assume: Vec::new(),
             code: Vec::new(),
+            code_words_len: 0,
         }
     }
 }
@@ -398,7 +405,14 @@ pub(super) const AOT_FAR_SLAB: usize = 128 << 10;
 
 impl Image {
     pub(super) fn code_bytes(&self) -> usize {
-        self.code.len() * 4
+        self.code.len().max(self.code_words_len) * 4
+    }
+
+    /// Free the heap-allocated `code` buffer once machine code has been copied into `MAP_JIT`,
+    /// preserving `code_bytes()` / `bank_end()` metadata for PC sampling and diagnostics.
+    pub(super) fn release_code_heap(&mut self) {
+        self.code_words_len = self.code.len().max(self.code_words_len);
+        self.code = Vec::new();
     }
 
     pub(in crate::emu) fn stub_banks(&self) -> &[u32] {

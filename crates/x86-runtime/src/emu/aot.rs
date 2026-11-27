@@ -16,6 +16,7 @@ mod cfg_discover;
 mod format;
 mod jumptable;
 mod runtime;
+mod volatile;
 #[cfg(test)]
 mod tests;
 
@@ -44,6 +45,9 @@ pub(crate) use runtime::resolve_guest_va;
 pub(super) use runtime::{
     active, counts, epoch, find, note_code_region, probe_table, revalidate, was_killed_at,
 };
+pub(super) use volatile::{lookup_module_for_ip, ModuleVolatileMeta};
+#[cfg(test)]
+pub(super) use volatile::{test_register_volatile_meta, test_unregister_volatile_meta};
 #[cfg(test)]
 pub(super) use runtime::revive_enabled;
 #[cfg(test)]
