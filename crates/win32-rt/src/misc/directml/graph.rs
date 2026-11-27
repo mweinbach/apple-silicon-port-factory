@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use d3d12_metal::metal::cmdlist::{
     CommandAllocator as MtlCommandAllocator, CommandList as MtlCommandList,
 };
+use d3d12_metal::metal::dml_gpu::{self, DmlDataType, DmlFusedActivation, DmlGemmDesc};
 use d3d12_metal::metal::queue::{ListType, Queue as MtlQueue};
 use d3d12_metal::metal::resource::Resource as MtlResource;
 use d3d12_metal::types::{dim, heap_type, HeapProperties, ResourceDesc};
 
 use super::abi::*;
-use super::ops::{execute_op, OpSpec};
+use super::ops::{execute_op, FusedAct, OpSpec, TensorDesc};
 use crate::com::{com_call_slot, com_call_slot_raw};
 use crate::strings::rd;
 use crate::types::{E_INVALIDARG, HRESULT};
@@ -437,6 +438,282 @@ pub(super) unsafe fn run_initialize(ops: &[Arc<CompiledOpState>], bt: &BindingTa
     }
 }
 
+fn map_fused_act(act: Option<FusedAct>) -> DmlFusedActivation {
+    match act {
+        None => DmlFusedActivation::None,
+        Some(FusedAct::Identity) => DmlFusedActivation::Identity,
+        Some(FusedAct::Relu) => DmlFusedActivation::Relu,
+        Some(FusedAct::Sigmoid) => DmlFusedActivation::Sigmoid,
+        Some(FusedAct::Tanh) => DmlFusedActivation::Tanh,
+        Some(FusedAct::LeakyRelu(a)) => DmlFusedActivation::LeakyRelu(a),
+        Some(FusedAct::Elu(a)) => DmlFusedActivation::Elu(a),
+        Some(FusedAct::Linear(a, b)) => DmlFusedActivation::Linear(a, b),
+        Some(FusedAct::HardSigmoid(a, b)) => DmlFusedActivation::HardSigmoid(a, b),
+        Some(FusedAct::ScaledElu(a, g)) => DmlFusedActivation::ScaledElu(a, g),
+        Some(FusedAct::ScaledTanh(a, b)) => DmlFusedActivation::ScaledTanh(a, b),
+        Some(FusedAct::Softplus(s)) => DmlFusedActivation::Softplus(s),
+        Some(FusedAct::Softsign) => DmlFusedActivation::Softsign,
+        Some(FusedAct::ThresholdedRelu(a)) => DmlFusedActivation::ThresholdedRelu(a),
+        Some(FusedAct::Gelu) => DmlFusedActivation::Gelu,
+        Some(FusedAct::Celu(a)) => DmlFusedActivation::Celu(a),
+        Some(FusedAct::Clip(lo, hi)) => DmlFusedActivation::Clip(lo, hi),
+    }
+}
+
+/// Computes a single flat batch stride (in elements) when `td`'s leading batch dimensions
+/// right-align cleanly against `out_batch_dims` (either all-broadcast -> 0, or contiguous
+/// linear multiples). Returns `None` for non-linear multi-axis broadcast patterns.
+fn uniform_batch_stride(td: &TensorDesc, out_batch_dims: &[u32]) -> Option<u64> {
+    let ob = out_batch_dims.len();
+    if ob == 0 {
+        return Some(0);
+    }
+    let tb = td.sizes.len().saturating_sub(2);
+    let mut base: Option<u64> = None;
+    let mut weight = 1u64;
+    for rev_i in 0..ob {
+        let od = ob - 1 - rev_i;
+        let out_sz = out_batch_dims[od];
+        if out_sz <= 1 {
+            continue;
+        }
+        let (td_sz, td_st) = if rev_i < tb {
+            let td_d = tb - 1 - rev_i;
+            (td.sizes[td_d], td.strides[td_d] as u64)
+        } else {
+            (1u32, 0u64)
+        };
+        let eff = if td_sz == 1 {
+            0u64
+        } else if td_sz == out_sz {
+            td_st
+        } else {
+            return None;
+        };
+        match base {
+            None => base = Some(eff),
+            Some(b) => {
+                if eff != b.checked_mul(weight)? {
+                    return None;
+                }
+            }
+        }
+        weight = weight.checked_mul(out_sz as u64)?;
+    }
+    Some(base.unwrap_or(0))
+}
+
+fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    let a_end = a_start.saturating_add(a_len);
+    let b_end = b_start.saturating_add(b_len);
+    a_start < b_end && b_start < a_end
+}
+
+/// Optional Metal 4.1 MPP GPU path for `OpSpec::Gemm` (`PORT_METAL41_DIRECTML_GPU=1` /
+/// `PORT_METAL41=1`). Returns `true` when executed directly on GPU without CPU staging.
+unsafe fn try_run_gemm_gpu(
+    compiled: &CompiledOpState,
+    spec: &OpSpec,
+    flat_inputs: &[Option<BufferBinding>],
+    persist_buf: Option<&BufferBinding>,
+    bt: &BindingTableState,
+) -> bool {
+    if !d3d12_metal::metal::m41::directml_gpu_enabled() {
+        return false;
+    }
+    let OpSpec::Gemm { a, b, c, output, trans_a, trans_b, alpha, beta, fused } = spec else {
+        return false;
+    };
+    let (dtype, elem_bytes) = match output.data_type {
+        DML_TENSOR_DATA_TYPE_FLOAT32 => (DmlDataType::Float32, 4u64),
+        DML_TENSOR_DATA_TYPE_FLOAT16 => (DmlDataType::Float16, 2u64),
+        _ => return false,
+    };
+    if a.data_type != output.data_type || b.data_type != output.data_type {
+        return false;
+    }
+    let (out_rank, a_rank, b_rank) = (output.sizes.len(), a.sizes.len(), b.sizes.len());
+    if out_rank < 2 || a_rank < 2 || b_rank < 2 {
+        return false;
+    }
+    let m = output.sizes[out_rank - 2];
+    let n = output.sizes[out_rank - 1];
+    let a_rows = a.sizes[a_rank - 2];
+    let a_cols = a.sizes[a_rank - 1];
+    let b_rows = b.sizes[b_rank - 2];
+    let b_cols = b.sizes[b_rank - 1];
+    let k = if *trans_a { a_rows } else { a_cols };
+    if *trans_a {
+        if a_rows != k || a_cols != m {
+            return false;
+        }
+    } else if a_rows != m || a_cols != k {
+        return false;
+    }
+    if *trans_b {
+        if b_rows != n || b_cols != k {
+            return false;
+        }
+    } else if b_rows != k || b_cols != n {
+        return false;
+    }
+    // Require packed row-major inner 2D strides for A, B, and Output (`tensor_inline`).
+    let packed_2d = |td: &TensorDesc, rows: u32, cols: u32| -> bool {
+        let r = td.sizes.len();
+        (cols <= 1 || td.strides[r - 1] == 1) && (rows <= 1 || td.strides[r - 2] == cols)
+    };
+    if !packed_2d(a, a_rows, a_cols) || !packed_2d(b, b_rows, b_cols) || !packed_2d(output, m, n) {
+        return false;
+    }
+
+    let batch_dims = &output.sizes[..out_rank - 2];
+    let batches_u64 = batch_dims.iter().fold(1u64, |acc, &v| acc.saturating_mul(v as u64));
+    let Ok(batches) = u32::try_from(batches_u64) else {
+        return false;
+    };
+    if batches == 0 || m == 0 || n == 0 || k == 0 {
+        return false;
+    }
+    let (Some(a_batch_stride), Some(b_batch_stride), Some(out_batch_stride)) = (
+        uniform_batch_stride(a, batch_dims),
+        uniform_batch_stride(b, batch_dims),
+        uniform_batch_stride(output, batch_dims),
+    ) else {
+        return false;
+    };
+
+    let resolve_input = |slot: usize| -> Option<BufferBinding> {
+        if let Some(Some(bb)) = flat_inputs.get(slot) {
+            if bb.resource_ptr != 0 {
+                return Some(bb.clone());
+            }
+        }
+        if let Some(&(_, p_off, p_len)) = compiled.persistent_inputs.iter().find(|&&(idx, _, _)| idx == slot) {
+            if let Some(pb) = persist_buf {
+                return Some(BufferBinding {
+                    resource_ptr: pb.resource_ptr,
+                    offset: pb.offset.saturating_add(p_off),
+                    size: p_len,
+                });
+            }
+        }
+        None
+    };
+
+    let (Some(a_bb), Some(b_bb), Some(out_bb)) = (
+        resolve_input(0),
+        resolve_input(1),
+        bt.outputs.first().and_then(|s| s.first_buffer()).cloned(),
+    ) else {
+        return false;
+    };
+    let resolve_res = |bb: &BufferBinding, td: &TensorDesc| -> Option<(Arc<MtlResource>, u64)> {
+        if bb.resource_ptr == 0 {
+            return None;
+        }
+        let res = crate::d3d12::resource::from_ptr(bb.resource_ptr as *mut c_void)?;
+        if res.r.gpu_va == 0 {
+            return None;
+        }
+        let va = res.r.gpu_va.checked_add(bb.offset)?;
+        if va % elem_bytes != 0 {
+            return None;
+        }
+        if bb.offset.checked_add(td.total_bytes)? > res.r.desc.Width {
+            return None;
+        }
+        Some((res.r.clone(), bb.offset))
+    };
+
+    let (Some((a_res, a_off)), Some((b_res, b_off)), Some((out_res, out_off))) = (
+        resolve_res(&a_bb, a),
+        resolve_res(&b_bb, b),
+        resolve_res(&out_bb, output),
+    ) else {
+        return false;
+    };
+
+    let mut has_c = false;
+    let mut c_res_pair: Option<(Arc<MtlResource>, u64)> = None;
+    let (mut c_batch_stride, mut c_row_stride, mut c_col_stride) = (0u64, 0u64, 0u64);
+    if let Some(cd) = c.as_ref() {
+        if *beta != 0.0 {
+            if cd.data_type != output.data_type || cd.sizes.is_empty() {
+                return false;
+            }
+            let Some(c_bb) = resolve_input(2) else {
+                return false;
+            };
+            let Some(c_pair) = resolve_res(&c_bb, cd) else {
+                return false;
+            };
+            let cr = cd.sizes.len();
+            c_col_stride = if cd.sizes[cr - 1] == 1 {
+                0
+            } else if cd.sizes[cr - 1] == n {
+                cd.strides[cr - 1] as u64
+            } else {
+                return false;
+            };
+            c_row_stride = if cr < 2 || cd.sizes[cr - 2] == 1 {
+                0
+            } else if cd.sizes[cr - 2] == m {
+                cd.strides[cr - 2] as u64
+            } else {
+                return false;
+            };
+            let Some(cbs) = uniform_batch_stride(cd, batch_dims) else {
+                return false;
+            };
+            c_batch_stride = cbs;
+            c_res_pair = Some(c_pair);
+            has_c = true;
+        }
+    }
+
+    // Refuse aliased output vs inputs so parallel threadgroups never race.
+    let out_va = out_res.gpu_va + out_off;
+    if ranges_overlap(out_va, output.total_bytes, a_res.gpu_va + a_off, a.total_bytes)
+        || ranges_overlap(out_va, output.total_bytes, b_res.gpu_va + b_off, b.total_bytes)
+    {
+        return false;
+    }
+    if let (Some((cr, coff)), Some(cd)) = (&c_res_pair, c.as_ref()) {
+        if ranges_overlap(out_va, output.total_bytes, cr.gpu_va + *coff, cd.total_bytes) {
+            return false;
+        }
+    }
+
+    let desc = DmlGemmDesc {
+        dtype,
+        batches,
+        m,
+        n,
+        k,
+        trans_a: *trans_a,
+        trans_b: *trans_b,
+        alpha: *alpha,
+        beta: *beta,
+        a_batch_stride_elems: a_batch_stride,
+        b_batch_stride_elems: b_batch_stride,
+        out_batch_stride_elems: out_batch_stride,
+        c_batch_stride_elems: c_batch_stride,
+        c_row_stride_elems: c_row_stride,
+        c_col_stride_elems: c_col_stride,
+        has_c,
+        activation: map_fused_act(*fused),
+    };
+    let c_arg = c_res_pair.as_ref().map(|(r, off)| (&**r, *off));
+    match dml_gpu::try_execute_gemm((&*a_res, a_off), (&*b_res, b_off), c_arg, (&*out_res, out_off), &desc) {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(e) => {
+            log::warn!(target: "d3d", "directml: Metal 4.1 MPP GPU GEMM fallback to CPU: {e}");
+            false
+        }
+    }
+}
+
 /// Execute one compiled single operator against D3D12 buffer bindings.
 pub(super) unsafe fn run_single_op(
     compiled: &CompiledOpState,
@@ -458,6 +735,10 @@ pub(super) unsafe fn run_single_op(
         } else {
             bt.inputs.iter().map(|s| s.first_buffer().cloned()).collect()
         };
+
+    if try_run_gemm_gpu(compiled, spec, &flat_inputs, persist_buf, bt) {
+        return;
+    }
 
     let mut owned_inputs: Vec<Option<Vec<u8>>> = Vec::with_capacity(in_descs.len());
     for (i, td_opt) in in_descs.iter().enumerate() {

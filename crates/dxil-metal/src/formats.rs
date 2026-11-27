@@ -209,7 +209,7 @@ pub const SHADER_FORMAT_CATALOG: &[ShaderFormatSpec] = &[
         magic_signature: "UTF-8 text ('#include <metal_stdlib>', 'using namespace metal;', 'kernel void', 'vertex ', 'fragment ')",
         header_layout: "UTF-8 Metal C++14/C++17 shading language source",
         inner_chunks_or_sections: "stage_in structs, [[buffer(N)]] / [[texture(N)]] / [[sampler(N)]] bindings, vertex/fragment/kernel functions",
-        native_metal_pipeline: "xcrun -sdk macosx metal -std=metal3.1 -O2 -c -> .air -> xcrun metallib -> .metallib",
+        native_metal_pipeline: "xcrun -sdk macosx metal -std=metal3.1 (or -std=metal4.1 / -fmetal-rtz-fp-conversion with PORT_METAL41=1) -O2 -c -> .air -> xcrun metallib -> .metallib",
         status: "native_direct",
     },
     ShaderFormatSpec {

@@ -79,6 +79,9 @@ pub struct Device {
     pub unified_memory: bool,
     pub recommended_working_set: u64,
     pub metal4: bool,
+    /// True on Apple GPU Family 10+ (e.g. M5 / A19 Pro), required for macOS 27
+    /// read-only `MTLPixelFormatRGB32{Float,Uint,Sint}` texture buffers.
+    pub apple10: bool,
     /// Device-wide residency set: everything the GPU may touch through
     /// descriptor heaps or GPU VAs lives here (Metal 4 has no implicit
     /// residency). Commit is batched: see [`Device::commit_residency`].
@@ -102,6 +105,7 @@ pub fn device() -> Option<&'static Device> {
             super::gpucapture::pre_device_init();
             let dev = MTLCreateSystemDefaultDevice()?;
             let metal4 = dev.supportsFamily(MTLGPUFamily::Metal4);
+            let apple10 = dev.supportsFamily(MTLGPUFamily::Apple10);
             if !metal4 {
                 log::error!(target: "d3d", "{}: Metal 4 not supported; no D3D12 adapter", dev.name());
                 return None;
@@ -123,6 +127,7 @@ pub fn device() -> Option<&'static Device> {
                 unified_memory: dev.hasUnifiedMemory(),
                 recommended_working_set: dev.recommendedMaxWorkingSetSize(),
                 metal4,
+                apple10,
                 residency,
                 residency_dirty: Mutex::new(false),
                 residency_dirty_fast: AtomicBool::new(false),
@@ -130,10 +135,11 @@ pub fn device() -> Option<&'static Device> {
             };
             log::info!(
                 target: "d3d",
-                "Metal device: {} (registry {:#x}, unified {}, recommended working set {} MiB, reported VRAM {} MiB, translated {})",
+                "Metal device: {} (registry {:#x}, unified {}, apple10 {}, recommended working set {} MiB, reported VRAM {} MiB, translated {})",
                 m.name,
                 m.registry_id,
                 m.unified_memory,
+                m.apple10,
                 m.recommended_working_set >> 20,
                 m.reported_vram() >> 20,
                 super::is_translated()
@@ -145,6 +151,22 @@ pub fn device() -> Option<&'static Device> {
 }
 
 impl Device {
+    /// True when the active GPU supports macOS 27 read-only `MTLPixelFormatRGB32{Float,Uint,Sint}`
+    /// texture buffers (`Apple10`+) AND the Metal 4.1 option (`PORT_METAL41_RGB32_TBUF` /
+    /// `PORT_METAL41`) is enabled.
+    #[inline]
+    pub fn supports_rgb32_texture_buffer(&self) -> bool {
+        self.apple10 && super::m41::rgb32_texture_buffer_enabled()
+    }
+
+    /// True when the active GPU supports macOS 27 hardware `MTLTextureViewDescriptor.minLOD`
+    /// (`Apple10`+; `Apple9` asserts `device does not support TextureViewMinLOD` under Metal
+    /// validation) AND `PORT_METAL41_VIEW_MIN_LOD` / `PORT_METAL41` is enabled.
+    #[inline]
+    pub fn supports_texture_view_min_lod(&self) -> bool {
+        self.apple10 && super::m41::view_min_lod_enabled()
+    }
+
     /// What DXGI reports as `DedicatedVideoMemory` in `IDXGIAdapter::GetDesc*`:
     /// `PORT_VRAM_MB` / `AW2_VRAM_MB` if set; on iOS defaults to `MIN_REPORTED_VRAM`
     /// (~5.375 GiB, satisfying desktop minimum-VRAM startup gates without over-reporting
