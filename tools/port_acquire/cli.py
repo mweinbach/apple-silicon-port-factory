@@ -400,7 +400,10 @@ def _write_manifest_for_install(
 
     launch_plan = None
     try:
-        launch_plan = backend.launch_args(app_id, offline=True)
+        launch_kwargs: dict[str, Any] = {"offline": True}
+        if "install_dir" in inspect.signature(backend.launch_args).parameters:
+            launch_kwargs["install_dir"] = install_dir
+        launch_plan = backend.launch_args(app_id, **launch_kwargs)
     except AcquireError:
         launch_plan = None
 

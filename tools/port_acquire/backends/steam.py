@@ -1,26 +1,32 @@
-"""Steam store backend for `tools/port-acquire` using Valve's `steamcmd`.
+"""Native Apple Silicon (`arm64`) Steam backend for `tools/port-acquire`.
 
-Tool selection (macOS Apple Silicon / `arm64`):
-- **Primary engine: Valve's `steamcmd`** (`+@sSteamCmdForcePlatformType windows`),
-  because it is Valve's official CLI and covers the complete acquisition lifecycle:
-  interactive login + Steam Guard token caching, owned license enumeration
-  (`+licenses_print`), full depot/branch/DLC/redist metadata (`+app_info_print`),
-  Windows depot downloads with branch/beta switching (`+app_update -beta`), file
-  checksum verification (`validate`), and targeted DLC / `_CommonRedist` (`228980`)
-  depot fetches (`+download_depot`).
-- **macOS `arm64` caveat & optional fallback:** Valve ships macOS `steamcmd` as an
-  Intel `x86_64` binary, so it executes via Rosetta 2 on Apple Silicon. When
-  `steamcmd` or Rosetta 2 is unavailable, download/verify/update operations can fall
-  back to native Apple Silicon `arm64` `DepotDownloader` (`PORT_DEPOT_DOWNLOADER` or
-  `~/.local/bin/DepotDownloader`, installed by `cargo opsdb -- steam-setup`), while
-  noting that `DepotDownloader` cannot run `licenses_print` or `app_info_print`.
+Uses **SteamRE/DepotDownloader** (standalone native `arm64` macOS binary — zero
+x86 translation layer) for interactive login, Steam Guard token caching, Windows
+depot inspection (`-manifest-only`), Windows x64 depot downloads (`-os windows
+-osarch 64`), branch/beta switching (`-branch`), checksum verification
+(`-validate`), DLC depot pulls, and Steamworks Common Redistributables
+(`AppID 228980`) fetches.
+
+Metadata & owned-library sources (native `arm64` only):
+- **`list-owned`:** Optional Steam Web API (`IPlayerService/GetOwnedGames/v1`,
+  key read from macOS Keychain `port-acquire-steam-web-api-key` or registered
+  `PORT_STEAM_API_KEY`) when configured; otherwise scans local Steam client
+  `userdata/*/config/{localconfig.vdf,librarycache}` + `steamapps/appmanifest_*.acf`
+  + managed `port-acquire` installs.
+- **`info <app>`:** Runs `DepotDownloader -app <id> -os windows -osarch 64
+  -manifest-only` to retrieve exact depot IDs, manifest GIDs, compressed/disk
+  sizes, and full depot file lists (for executable discovery, Steamworks/anti-cheat/
+  `_CommonRedist` detection before downloading), combined with Steam's public
+  Store `appdetails` API for title, DLC AppID list, and DRM notices.
 
 Hard rules:
 - Zero DRM, anti-cheat, or ownership bypasses of any kind. `info` reports
   Steamworks/DRM/anti-cheat signals read-only.
-- Only download titles owned by the logged-in account through Valve's official tools.
-- Never store, return, or log passwords, Steam Guard codes, refresh tokens, or API
-  keys. Credentials stay in `steamcmd`'s own cache or the macOS Keychain.
+- Only download titles owned by the logged-in account through DepotDownloader /
+  Valve's normal Steam3 depot protocol.
+- Never store, return, or log passwords, Steam Guard codes, refresh tokens, or
+  Web API keys. Credentials stay in DepotDownloader's own cache or the macOS
+  Keychain.
 """
 
 from __future__ import annotations
@@ -29,13 +35,12 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import platform as py_platform
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any, Callable
-import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -59,9 +64,9 @@ from ..backend import (
     SearchMatch,
     StoreBackend,
     UninstallResult,
-    UnsupportedOperationError,
     UpdateResult,
     VerifyResult,
+    classify_redistributable_path,
     fuzzy_search_owned,
     normalize_title,
     scan_dir_redistributables,
@@ -71,13 +76,12 @@ from ..manifest import redact_env, redact_launch_args
 from ._steam_vdf import (
     COMMON_REDIST_APP_ID,
     COMMON_REDIST_DEPOTS,
-    extract_appinfo_vdf,
     extract_proton_redist_info,
-    has_cached_connect_token,
     parse_appmanifest_acf,
-    parse_licenses_print,
+    parse_depot_downloader_stdout,
+    parse_depot_manifest_txt,
+    parse_local_owned_app_ids,
     parse_loginusers_vdf,
-    vdf_get,
 )
 
 KEYCHAIN_WEB_API_SERVICE = "port-acquire-steam-web-api-key"
@@ -85,7 +89,7 @@ KEYCHAIN_WEB_API_SERVICE = "port-acquire-steam-web-api-key"
 _ANTICHEAT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("Easy Anti-Cheat", re.compile(r"(easyanticheat|eac_launcher|start_protected_game)", re.I)),
     ("BattlEye", re.compile(r"(battleye|beservice|beclient)", re.I)),
-    ("Valve Anti-Cheat (VAC)", re.compile(r"(\bvac\b|vacmacmodulecache)", re.I)),
+    ("Valve Anti-Cheat (VAC)", re.compile(r"(\bvac\b|valve\s+anti-cheat)", re.I)),
     ("Riot Vanguard", re.compile(r"(vanguard|vgk\.sys)", re.I)),
     ("RICOCHET Anti-Cheat", re.compile(r"(ricochet|randgrid)", re.I)),
     ("nProtect GameGuard", re.compile(r"(gameguard|nprotect)", re.I)),
@@ -99,29 +103,26 @@ _DRM_PATTERNS: list[tuple[str, re.Pattern[str], str | None]] = [
     ("Ubisoft Connect", re.compile(r"(ubisoft\s+connect|uplay)", re.I), "Ubisoft Connect"),
     ("Rockstar Games Launcher", re.compile(r"rockstar\s+games\s+launcher", re.I), "Rockstar Games Launcher"),
     ("2K Launcher", re.compile(r"2k\s+launcher", re.I), "2K Launcher"),
-    ("Battlenet / Activision", re.compile(r"battle\.net", re.I), "Battle.net"),
-    ("SteamStub / CEG", re.compile(r"(steamstub|steam\s+ceg|\b\.bind\b)", re.I), None),
+    ("Battle.net", re.compile(r"battle\.net", re.I), "Battle.net"),
+    ("SteamStub / CEG", re.compile(r"(steamstub|steam\s+ceg)", re.I), None),
 ]
 
 _SKIP_EXE_PATTERNS = re.compile(
-    r"(unins|vcredist|vc_redist|dxsetup|dxwebsetup|dotnet|ndp4|oalinst|physx|crashreport|ueprereq|redist)",
+    r"(unins|vcredist|vc_redist|dxsetup|dxwebsetup|dotnet|ndp4|oalinst|physx|"
+    r"crashreport|ueprereq|redist|easyanticheat|battleye|beservice|_setup\.exe$|setup\.exe$)",
     re.I,
 )
 
 _LOGIN_FAIL_PATTERNS = re.compile(
-    r"(FAILED|Invalid\s+Password|Rate\s+Limit|Steam\s+Guard|Two-factor|Cached\s+credentials|"
-    r"password:|Logon\s+Failure|Access\s+Denied|No\s+connection)",
+    r"(Unable\s+to\s+login|InvalidPassword|Enter\s+account\s+password|Steam\s+Guard|"
+    r"Two-factor|AccountLogonDenied|RateLimitExceeded|Login\s+failed|No\s+stored\s+token|"
+    r"does\s+not\s+have\s+access|not\s+available\s+from\s+this\s+account)",
     re.I,
 )
 
 
 def _split_windows_args(raw: str) -> list[str]:
-    """Parse a Windows-style command-line argument string preserving quoted values.
-
-    Handles double-quoted substrings (e.g. `-config "My Settings.ini"` ->
-    `['-config', 'My Settings.ini']`) and escaped quotes (`\\"`), while keeping
-    Windows path backslashes (e.g. `C:\\Games\\Foo`) intact.
-    """
+    """Parse a Windows-style command-line argument string preserving quoted values."""
     args: list[str] = []
     cur: list[str] = []
     in_quotes = False
@@ -131,7 +132,6 @@ def _split_windows_args(raw: str) -> list[str]:
     while i < n:
         ch = raw[i]
         if ch == "\\":
-            # Count consecutive backslashes before a quote (Windows CommandLineToArgvW rule)
             bs = 0
             while i + bs < n and raw[i + bs] == "\\":
                 bs += 1
@@ -172,19 +172,15 @@ def _redact_cmd(cmd: list[str]) -> list[str]:
     """Return a copy of `cmd` with any sensitive arguments replaced by `<redacted>`."""
     out: list[str] = []
     redact_next = False
-    for idx, tok in enumerate(cmd):
+    for tok in cmd:
         if redact_next:
             out.append("<redacted>")
             redact_next = False
             continue
         low = tok.lower()
-        if low in ("-betapassword", "-branchpassword", "-password", "--password"):
+        if low in ("-branchpassword", "-password", "--password"):
             out.append(tok)
             redact_next = True
-            continue
-        # Handle `+login <user> <password>` (we never pass passwords, but guard defensively)
-        if idx >= 2 and cmd[idx - 2].lower() in ("+login", "login") and not tok.startswith("+"):
-            out.append("<redacted>")
             continue
         out.append(tok)
     return out
@@ -219,32 +215,28 @@ def _default_http_get_json(url: str, *, timeout: float = 15.0) -> Any:
 
 
 class SteamBackend(StoreBackend):
-    """Pluggable Steam backend backed primarily by Valve's `steamcmd`."""
+    """Pluggable Steam backend powered natively on Apple Silicon by `DepotDownloader`."""
 
     name = "steam"
-    display_name = "Steam (steamcmd)"
+    display_name = "Steam (DepotDownloader native arm64)"
 
     def __init__(
         self,
         *,
-        steamcmd_bin: str | Path | None = None,
         depot_downloader_bin: str | Path | None = None,
         steam_home: str | Path | None = None,
         state_dir: str | Path | None = None,
         http_get_json: Callable[[str], Any] | None = None,
         allow_network: bool = True,
-        rosetta_check: Callable[[], bool] | None = None,
     ) -> None:
-        self._explicit_steamcmd = Path(steamcmd_bin) if steamcmd_bin else None
         self._explicit_dd = Path(depot_downloader_bin) if depot_downloader_bin else None
         self._explicit_steam_home = Path(steam_home) if steam_home else None
         self._explicit_state_dir = Path(state_dir) if state_dir else None
         self._http_get_json = http_get_json or _default_http_get_json
         self._allow_network = allow_network
-        self._rosetta_check = rosetta_check
 
     # ------------------------------------------------------------------
-    # Paths & Tool Discovery
+    # Paths & Native Binary Discovery
     # ------------------------------------------------------------------
 
     def steam_home(self) -> Path:
@@ -271,31 +263,11 @@ class SteamBackend(StoreBackend):
     def _installs_file(self) -> Path:
         return self.state_dir() / "steam-installs.json"
 
-    def _appinfo_cache_file(self, app_id: str) -> Path:
-        return self.state_dir() / "appinfo" / f"{app_id}.json"
+    def _owned_cache_file(self) -> Path:
+        return self.state_dir() / "steam-owned-cache.json"
 
-    def find_steamcmd(self) -> Path | None:
-        if self._explicit_steamcmd is not None:
-            return self._explicit_steamcmd if self._explicit_steamcmd.is_file() else None
-        env_bin = os.environ.get("PORT_STEAMCMD", "").strip()
-        if env_bin:
-            p = Path(env_bin).expanduser()
-            return p if p.is_file() else None
-        for name in ("steamcmd", "steamcmd.sh"):
-            found = shutil.which(name)
-            if found:
-                return Path(found)
-        candidates = [
-            Path("/opt/homebrew/bin/steamcmd"),
-            Path("/usr/local/bin/steamcmd"),
-            Path.home() / "Steam" / "steamcmd.sh",
-            Path.home() / ".local" / "opt" / "steamcmd" / "steamcmd.sh",
-            Path.home() / "Library" / "Application Support" / "SteamCMD" / "steamcmd.sh",
-        ]
-        for cand in candidates:
-            if cand.is_file():
-                return cand
-        return None
+    def _manifest_cache_file(self, app_id: str) -> Path:
+        return self.state_dir() / "manifests" / f"{app_id}.json"
 
     def find_depot_downloader(self) -> Path | None:
         if self._explicit_dd is not None:
@@ -308,6 +280,9 @@ class SteamBackend(StoreBackend):
             Path.home() / ".local" / "opt" / "depotdownloader" / "DepotDownloader",
             Path.home() / ".local" / "bin" / "DepotDownloader",
             Path.home() / ".local" / "bin" / "depotdownloader",
+            Path("/opt/homebrew/bin/DepotDownloader"),
+            Path("/opt/homebrew/bin/depotdownloader"),
+            Path("/usr/local/bin/DepotDownloader"),
         ]
         for cand in candidates:
             if cand.is_file():
@@ -318,43 +293,50 @@ class SteamBackend(StoreBackend):
                 return Path(found)
         return None
 
-    def is_rosetta_available(self) -> bool:
-        if self._rosetta_check is not None:
-            return self._rosetta_check()
-        if sys.platform != "darwin" or py_platform.machine().lower() not in ("arm64", "aarch64"):
-            return True
+    def _require_depot_downloader(self) -> Path:
+        dd = self.find_depot_downloader()
+        if dd is None:
+            raise BackendUnavailableError(
+                "Native arm64 `DepotDownloader` not found. Install it with "
+                "`cargo opsdb -- steam-setup` (downloads the standalone native macOS arm64 "
+                "SteamRE/DepotDownloader release into ~/.local/bin/DepotDownloader), "
+                "or point `PORT_DEPOT_DOWNLOADER` to your DepotDownloader binary."
+            )
+        return dd
+
+    def _backend_version_label(self) -> str | None:
+        dd = self.find_depot_downloader()
+        if dd is None:
+            return None
         try:
             proc = subprocess.run(
-                ["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                [str(dd), "--version"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
+                text=True,
                 timeout=5,
                 check=False,
             )
-            return proc.returncode == 0
+            first = (proc.stdout or proc.stderr).strip().splitlines()
+            if proc.returncode == 0 and first:
+                return first[0].strip()
         except OSError:
-            return False
+            pass
+        return f"DepotDownloader ({dd.name})"
 
-    def _require_steamcmd(self) -> Path:
-        scmd = self.find_steamcmd()
-        if scmd is None:
-            raise BackendUnavailableError(
-                "Valve `steamcmd` not found. Install it with `brew install --cask steamcmd` "
-                "(requires Rosetta 2 on Apple Silicon: `softwareupdate --install-rosetta`), "
-                "or point `PORT_STEAMCMD` to your `steamcmd` binary."
-            )
-        return scmd
-
-    def _backend_version_label(self) -> str | None:
-        scmd = self.find_steamcmd()
-        if scmd is not None:
-            if sys.platform == "darwin" and py_platform.machine().lower() in ("arm64", "aarch64"):
-                rosetta = "Rosetta 2 OK" if self.is_rosetta_available() else "Rosetta 2 missing"
-                return f"steamcmd ({scmd.name}, x86_64 via {rosetta})"
-            return f"steamcmd ({scmd.name})"
+    def _has_depot_downloader_config(self) -> bool:
+        """Boolean check for DepotDownloader's own cached token store (never reads token bytes)."""
         dd = self.find_depot_downloader()
+        candidates: list[Path] = [
+            self.state_dir() / ".DepotDownloader" / "DepotDownloader.config",
+            Path.home() / ".local" / "share" / "DepotDownloader" / "DepotDownloader.config",
+            Path.home() / ".config" / "DepotDownloader" / "DepotDownloader.config",
+        ]
         if dd is not None:
-            return f"DepotDownloader ({dd.name}, fallback)"
-        return None
+            resolved_dir = dd.resolve().parent
+            candidates.append(resolved_dir / "DepotDownloader.config")
+            candidates.append(resolved_dir / ".DepotDownloader" / "DepotDownloader.config")
+        return any(c.is_file() for c in candidates)
 
     # ------------------------------------------------------------------
     # Keychain & Session Metadata (Strictly Secret-Free)
@@ -485,27 +467,28 @@ class SteamBackend(StoreBackend):
         return acf_map.get(str(app_id))
 
     # ------------------------------------------------------------------
-    # Subprocess Execution
+    # DepotDownloader Execution
     # ------------------------------------------------------------------
 
-    def _run_steamcmd(
+    def _run_depot_downloader(
         self,
         args: list[str],
         *,
         interactive: bool = False,
-        timeout: float | None = 300.0,
+        timeout: float | None = 1800.0,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        scmd = self._require_steamcmd()
-        cmd = [str(scmd), *args]
+        dd = self._require_depot_downloader()
+        cmd = [str(dd), *args]
         env = os.environ.copy()
         if self._explicit_steam_home is not None:
             env["PORT_STEAM_HOME"] = str(self._explicit_steam_home)
+
         if interactive:
             try:
                 proc = subprocess.run(cmd, env=env, check=False)
             except OSError as exc:
-                raise BackendUnavailableError(f"failed to execute steamcmd: {exc}") from exc
+                raise BackendUnavailableError(f"failed to execute DepotDownloader: {exc}") from exc
             completed = subprocess.CompletedProcess(cmd, proc.returncode, "", "")
         else:
             try:
@@ -520,54 +503,126 @@ class SteamBackend(StoreBackend):
                 )
             except subprocess.TimeoutExpired as exc:
                 raise CommandFailedError(
-                    "steamcmd timed out (it may be waiting for interactive login or Steam Guard; "
-                    "run `tools/port-acquire --store steam login --username <account>` first)",
+                    "DepotDownloader timed out (it may be waiting for interactive login or Steam Guard; "
+                    "run `tools/port-acquire --store steam login --username <your_steam_account>` first)",
                     details={"command": _redact_cmd(cmd)},
                 ) from exc
             except OSError as exc:
-                raise BackendUnavailableError(f"failed to execute steamcmd: {exc}") from exc
+                raise BackendUnavailableError(f"failed to execute DepotDownloader: {exc}") from exc
 
         if check and completed.returncode != 0:
             combined = (completed.stdout + "\n" + completed.stderr).strip()
             tail = "\n".join(combined.splitlines()[-12:])
-            raise CommandFailedError(
-                f"steamcmd exited with status {completed.returncode}: {tail or 'no output'}",
-                details={"returncode": completed.returncode, "command": _redact_cmd(cmd)},
-            )
-        return completed
-
-    def _run_depot_downloader(
-        self,
-        args: list[str],
-        *,
-        timeout: float | None = 1800.0,
-    ) -> subprocess.CompletedProcess[str]:
-        dd = self.find_depot_downloader()
-        if dd is None:
-            raise BackendUnavailableError(
-                "Neither `steamcmd` nor `DepotDownloader` is installed. "
-                "Install `steamcmd` (`brew install --cask steamcmd`) or run `cargo opsdb -- steam-setup`."
-            )
-        cmd = [str(dd), *args]
-        try:
-            completed = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except OSError as exc:
-            raise BackendUnavailableError(f"failed to execute DepotDownloader: {exc}") from exc
-        if completed.returncode != 0:
-            combined = (completed.stdout + "\n" + completed.stderr).strip()
-            tail = "\n".join(combined.splitlines()[-12:])
+            if _LOGIN_FAIL_PATTERNS.search(combined):
+                raise AuthRequiredError(
+                    f"DepotDownloader authentication/entitlement check failed: {tail or 'login required'}",
+                    details={"returncode": completed.returncode, "command": _redact_cmd(cmd)},
+                )
             raise CommandFailedError(
                 f"DepotDownloader exited with status {completed.returncode}: {tail or 'no output'}",
                 details={"returncode": completed.returncode, "command": _redact_cmd(cmd)},
             )
         return completed
+
+    def _fetch_depot_manifests(
+        self,
+        app_id: str,
+        *,
+        platform: str = "windows",
+        branch: str = "public",
+        account_name: str | None = None,
+        offline: bool = False,
+        allow_cache_fallback: bool = True,
+    ) -> dict[str, Any]:
+        """Run `DepotDownloader -manifest-only` (or read cached manifests when offline)."""
+        cache_path = self._manifest_cache_file(app_id)
+        if offline:
+            cached = _read_json(cache_path, {})
+            return cached if isinstance(cached, dict) else {}
+
+        with tempfile.TemporaryDirectory(prefix=f"port-acquire-dd-{app_id}-") as tmp_dir:
+            dd_args: list[str] = [
+                "-app",
+                str(app_id),
+                "-os",
+                platform,
+                "-osarch",
+                "64",
+                "-branch",
+                branch,
+                "-manifest-only",
+                "-dir",
+                tmp_dir,
+            ]
+            if account_name:
+                dd_args.extend(["-username", account_name, "-remember-password"])
+
+            proc = self._run_depot_downloader(
+                dd_args,
+                interactive=False,
+                timeout=120.0,
+                check=False,
+            )
+            combined = proc.stdout + "\n" + proc.stderr
+            stdout_info = parse_depot_downloader_stdout(combined)
+
+            depots: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for txt_file in sorted(Path(tmp_dir).rglob("manifest_*.txt")):
+                parsed = parse_depot_manifest_txt(
+                    txt_file.read_text(encoding="utf-8", errors="ignore"),
+                    filename=txt_file.name,
+                )
+                did = parsed.get("depot_id")
+                if did:
+                    seen_ids.add(did)
+                    depots.append(parsed)
+
+            # Merge stdout depot names / any depot lines without a separate .txt file
+            stdout_by_id = {d["depot_id"]: d for d in stdout_info.get("depots", []) if d.get("depot_id")}
+            for dep in depots:
+                sd = stdout_by_id.get(dep["depot_id"])
+                if sd and sd.get("name"):
+                    dep["name"] = sd["name"]
+            for did, sd in stdout_by_id.items():
+                if did not in seen_ids:
+                    depots.append(
+                        {
+                            "depot_id": did,
+                            "name": sd.get("name", ""),
+                            "manifest_gid": sd.get("manifest_gid"),
+                            "creation_date": sd.get("date"),
+                            "file_count": 0,
+                            "disk_size_bytes": None,
+                            "download_size_bytes": None,
+                            "files": [],
+                        }
+                    )
+
+            if not depots and proc.returncode != 0:
+                if allow_cache_fallback:
+                    cached = _read_json(cache_path, {})
+                    if isinstance(cached, dict) and cached.get("depots"):
+                        return cached
+                if _LOGIN_FAIL_PATTERNS.search(combined):
+                    raise AuthRequiredError(
+                        f"DepotDownloader could not query manifests for AppID {app_id}; "
+                        f"run `tools/port-acquire --store steam login --username {account_name or '<your_steam_account>'}`."
+                    )
+                raise CommandFailedError(
+                    f"DepotDownloader -manifest-only failed for AppID {app_id} (exit {proc.returncode})"
+                )
+
+            payload = {
+                "app_id": str(app_id),
+                "platform": platform,
+                "branch": stdout_info.get("branch") or branch,
+                "depots": depots,
+                "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            if depots:
+                _atomic_write_json(cache_path, payload)
+            return payload
 
     # ------------------------------------------------------------------
     # StoreBackend Methods
@@ -582,14 +637,14 @@ class SteamBackend(StoreBackend):
         logout: bool = False,
         username: str | None = None,
     ) -> AuthStatus:
-        del no_webview, auth_code  # SteamCMD handles Steam Guard directly in the terminal
+        del no_webview, auth_code  # DepotDownloader handles Steam Guard directly in the terminal
         if logout:
             self._clear_session()
             return AuthStatus(
                 store=self.name,
                 logged_in=False,
                 display_name=None,
-                backend_available=self.find_steamcmd() is not None or self.find_depot_downloader() is not None,
+                backend_available=self.find_depot_downloader() is not None,
                 backend_version=self._backend_version_label(),
             )
 
@@ -601,61 +656,70 @@ class SteamBackend(StoreBackend):
         if import_existing:
             if not account_name:
                 raise AuthRequiredError(
-                    "No existing Steam login found in `loginusers.vdf`. Run interactive login: "
-                    "`tools/port-acquire --store steam login --username <your_steam_account>`"
+                    "No existing Steam account found in `loginusers.vdf`. Run interactive login:\n"
+                    "  tools/port-acquire --store steam login --username <your_steam_account>"
                 )
             self._save_session(account_name, steam_id64)
-            return self.status(offline=self.find_steamcmd() is None)
+            return self.status(offline=self.find_depot_downloader() is None)
 
         if not account_name:
             if sys.stdin.isatty():
                 entered = input("Steam account username (not password): ").strip()
                 if entered:
-                    account_name, steam_id64 = self._resolve_account_info(entered)
+                    account_name, steam_id64 = self._resolve_account_info(entered, ignore_logged_out=True)
             if not account_name:
                 raise AuthRequiredError(
                     "Steam username required for interactive login. Run:\n"
                     "  tools/port-acquire --store steam login --username <your_steam_account>"
                 )
 
-        # Interactive login attaches directly to the user's TTY so Valve's `steamcmd`
-        # prompts for password and Steam Guard directly (credentials never touch our code).
-        scmd = self._require_steamcmd()
-        if sys.platform == "darwin" and py_platform.machine().lower() in ("arm64", "aarch64"):
-            if not self.is_rosetta_available():
-                raise BackendUnavailableError(
-                    "Rosetta 2 is required to run Valve's x86_64 `steamcmd` on Apple Silicon. "
-                    "Install it with `softwareupdate --install-rosetta --agree-to-license`."
-                )
+        # Interactive login attaches directly to the user's TTY so DepotDownloader
+        # prompts for password and Steam Guard directly (credentials stay in
+        # DepotDownloader's own cache and never touch our code or logs).
+        # Uses AppID 228980 (free Steamworks Common Redistributables) with -manifest-only
+        # so zero game payloads are downloaded during authentication.
+        dd = self._require_depot_downloader()
+        with tempfile.TemporaryDirectory(prefix="port-acquire-dd-login-") as tmp_dir:
+            proc = self._run_depot_downloader(
+                [
+                    "-app",
+                    COMMON_REDIST_APP_ID,
+                    "-os",
+                    "windows",
+                    "-osarch",
+                    "64",
+                    "-manifest-only",
+                    "-dir",
+                    tmp_dir,
+                    "-username",
+                    account_name,
+                    "-remember-password",
+                ],
+                interactive=True,
+                check=False,
+            )
 
-        proc = self._run_steamcmd(
-            ["+login", account_name, "+quit"],
-            interactive=True,
-            check=False,
-        )
         if proc.returncode != 0:
             raise AuthRequiredError(
-                f"SteamCMD login did not complete cleanly (exit {proc.returncode}). "
+                f"DepotDownloader login did not complete cleanly (exit {proc.returncode}). "
                 f"Re-run interactively:\n"
                 f"  tools/port-acquire --store steam login --username {account_name}"
             )
 
-        # Refresh SteamID64 from loginusers.vdf if SteamCMD updated it.
-        _, refreshed_id64 = self._resolve_account_info(account_name)
+        _, refreshed_id64 = self._resolve_account_info(account_name, ignore_logged_out=True)
         self._save_session(account_name, refreshed_id64 or steam_id64)
 
         return AuthStatus(
             store=self.name,
             logged_in=True,
             display_name=account_name,
-            backend_available=scmd.is_file(),
+            backend_available=dd.is_file(),
             backend_version=self._backend_version_label(),
         )
 
     def status(self, *, offline: bool = False) -> AuthStatus:
-        scmd = self.find_steamcmd()
         dd = self.find_depot_downloader()
-        available = scmd is not None or dd is not None
+        available = dd is not None
         version = self._backend_version_label()
         account_name, _ = self._resolve_account_info()
 
@@ -668,19 +732,17 @@ class SteamBackend(StoreBackend):
                 backend_version=version,
             )
 
-        if offline or not self._use_steamcmd_for_download():
-            has_token = has_cached_connect_token(
-                self.steam_home() / "config" / "config.vdf",
-                account_name=account_name,
-            )
-            sess_present = bool(self._load_session().get("account_name"))
+        if offline or dd is None:
+            sess = self._load_session()
+            sess_active = bool(sess.get("account_name")) and not bool(sess.get("logged_out"))
+            has_cache = self._has_depot_downloader_config()
             loginusers = parse_loginusers_vdf(self.steam_home() / "config" / "loginusers.vdf")
             remembered = any(
                 u["account_name"].lower() == account_name.lower()
                 and (u["remember_password"] or u["allow_auto_login"])
                 for u in loginusers
             )
-            logged_in = bool(has_token or sess_present or remembered)
+            logged_in = bool(sess_active or has_cache or remembered)
             return AuthStatus(
                 store=self.name,
                 logged_in=logged_in,
@@ -689,13 +751,27 @@ class SteamBackend(StoreBackend):
                 backend_version=version,
             )
 
-        # Non-interactive cached-token probe via `steamcmd +login <user> +quit`.
-        proc = self._run_steamcmd(
-            ["+login", account_name, "+quit"],
-            interactive=False,
-            timeout=30.0,
-            check=False,
-        )
+        # Non-interactive cached-token probe via `DepotDownloader -manifest-only` on free App 228980.
+        with tempfile.TemporaryDirectory(prefix="port-acquire-dd-status-") as tmp_dir:
+            proc = self._run_depot_downloader(
+                [
+                    "-app",
+                    COMMON_REDIST_APP_ID,
+                    "-os",
+                    "windows",
+                    "-osarch",
+                    "64",
+                    "-manifest-only",
+                    "-dir",
+                    tmp_dir,
+                    "-username",
+                    account_name,
+                    "-remember-password",
+                ],
+                interactive=False,
+                timeout=30.0,
+                check=False,
+            )
         combined = proc.stdout + "\n" + proc.stderr
         logged_in = proc.returncode == 0 and not _LOGIN_FAIL_PATTERNS.search(combined)
         return AuthStatus(
@@ -731,7 +807,7 @@ class SteamBackend(StoreBackend):
         try:
             payload = self._http_get_json(url)
         except Exception:
-            # Never expose `url` (contains api_key) in errors; fall back cleanly to steamcmd.
+            # Never expose `url` (contains api_key) in errors.
             return None
         resp = payload.get("response") if isinstance(payload, dict) else None
         raw_games = resp.get("games") if isinstance(resp, dict) else None
@@ -753,6 +829,44 @@ class SteamBackend(StoreBackend):
             )
         return owned
 
+    def _load_owned_id_cache(self) -> set[str]:
+        data = _read_json(self._owned_cache_file(), {})
+        raw = data.get("app_ids") if isinstance(data, dict) else None
+        if isinstance(raw, list):
+            return {str(x) for x in raw if str(x).isdigit()}
+        return set()
+
+    def _save_owned_id_cache(self, app_ids: set[str]) -> None:
+        _atomic_write_json(
+            self._owned_cache_file(),
+            {
+                "app_ids": sorted(app_ids, key=lambda x: int(x) if x.isdigit() else 0),
+                "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+
+    def _known_owned_app_ids(self, *, offline: bool = False) -> set[str]:
+        """Return known owned AppIDs from Web API, local Steam caches, and managed installs."""
+        owned_ids = self._load_owned_id_cache()
+        owned_ids |= parse_local_owned_app_ids(self.steam_home())
+        owned_ids |= set(self._load_installs().keys())
+        owned_ids |= set(self._scan_steamapps_manifests().keys())
+        for inst in self._load_installs().values():
+            for dlc_id in inst.get("dlcs") or []:
+                if str(dlc_id).isdigit():
+                    owned_ids.add(str(dlc_id))
+
+        if not offline:
+            account_name, steam_id64 = self._resolve_account_info()
+            api_key = self._get_steam_web_api_key()
+            if account_name and api_key and steam_id64:
+                web_games = self._list_owned_via_web_api(api_key, steam_id64)
+                if web_games is not None:
+                    for g in web_games:
+                        owned_ids.add(g.app_id)
+                    self._save_owned_id_cache(owned_ids)
+        return owned_ids
+
     def list_owned(self, *, platform: str = "windows", refresh: bool = False) -> list[OwnedGame]:
         del refresh
         account_name, steam_id64 = self._require_logged_in_account()
@@ -761,7 +875,7 @@ class SteamBackend(StoreBackend):
 
         games_by_id: dict[str, OwnedGame] = {}
 
-        # 1. Optional Steam Web API (fast, includes human titles)
+        # 1. Steam Web API (`IPlayerService/GetOwnedGames/v1`) when key + SteamID64 are available
         api_key = self._get_steam_web_api_key()
         if api_key and steam_id64:
             web_games = self._list_owned_via_web_api(api_key, steam_id64)
@@ -769,44 +883,27 @@ class SteamBackend(StoreBackend):
                 for g in web_games:
                     games_by_id[g.app_id] = g
 
-        # 2. Primary zero-API-key source: `steamcmd +login <user> +licenses_print +quit`
-        if not games_by_id:
-            proc = self._run_steamcmd(
-                ["+login", account_name, "+licenses_print", "+quit"],
-                interactive=False,
-                timeout=120.0,
-                check=False,
-            )
-            combined = proc.stdout + "\n" + proc.stderr
-            if proc.returncode != 0 or _LOGIN_FAIL_PATTERNS.search(combined):
-                raise AuthRequiredError(
-                    f"SteamCMD could not list licenses for '{account_name}' with cached login. "
-                    f"Re-authenticate interactively:\n"
-                    f"  tools/port-acquire --store steam login --username {account_name}"
+        # 2. Local Steam library caches (`userdata/*/config/{localconfig.vdf,librarycache}`),
+        #    local `steamapps/appmanifest_*.acf`, and managed `port-acquire` installs
+        local_ids = parse_local_owned_app_ids(self.steam_home())
+        local_ids |= set(installs.keys())
+        local_ids |= set(acf_map.keys())
+        for aid in sorted(local_ids, key=lambda x: int(x) if x.isdigit() else 0):
+            if aid == COMMON_REDIST_APP_ID:
+                continue
+            if aid not in games_by_id:
+                inst_title = (
+                    str(installs.get(aid, {}).get("title") or "")
+                    or str(acf_map.get(aid, {}).get("name") or "")
                 )
-            licenses = parse_licenses_print(combined)
-            for lic in licenses:
-                if not lic.get("active", True):
-                    continue
-                for aid in lic.get("app_ids", []):
-                    if aid == COMMON_REDIST_APP_ID:
-                        continue
-                    if aid not in games_by_id:
-                        cached_vdf = _read_json(self._appinfo_cache_file(aid), {})
-                        cached_title = str(vdf_get(cached_vdf, "common", "name", default="") or "")
-                        inst_title = (
-                            str(installs.get(aid, {}).get("title") or "")
-                            or str(acf_map.get(aid, {}).get("name") or "")
-                        )
-                        title = cached_title or inst_title or f"Steam App {aid}"
-                        games_by_id[aid] = OwnedGame(
-                            store=self.name,
-                            app_id=aid,
-                            title=title,
-                            platforms=["windows"],
-                        )
+                games_by_id[aid] = OwnedGame(
+                    store=self.name,
+                    app_id=aid,
+                    title=inst_title or f"Steam App {aid}",
+                    platforms=["windows"],
+                )
 
-        # Merge local installed state
+        # Merge installed state
         for aid, inst in installs.items():
             if aid in games_by_id:
                 games_by_id[aid].installed = True
@@ -821,6 +918,9 @@ class SteamBackend(StoreBackend):
                 games_by_id[aid].version = acf.get("build_id")
                 if acf.get("name") and games_by_id[aid].title.startswith("Steam App "):
                     games_by_id[aid].title = str(acf["name"])
+
+        if games_by_id:
+            self._save_owned_id_cache(set(games_by_id.keys()))
 
         result = sorted(
             games_by_id.values(),
@@ -861,9 +961,8 @@ class SteamBackend(StoreBackend):
     ) -> list[SearchMatch]:
         owned = self.list_owned(platform=platform, refresh=refresh)
 
-        # If any owned apps came from `licenses_print` without human titles, enrich
-        # titles of matching owned apps via Steam's public Store Search API while
-        # strictly restricting returned results to apps owned by the logged-in account.
+        # Enrich unnamed local-cache AppIDs via Steam's public Store Search API while
+        # strictly restricting returned matches to titles owned by the account.
         has_unnamed = any(g.title.startswith("Steam App ") for g in owned)
         if has_unnamed and self._allow_network and not query.strip().isdigit():
             owned_by_id = {g.app_id: g for g in owned}
@@ -989,55 +1088,9 @@ class SteamBackend(StoreBackend):
             return entry["data"]
         return {}
 
-    def _fetch_appinfo_vdf(
-        self,
-        app_id: str,
-        *,
-        platform: str = "windows",
-        offline: bool = False,
-        allow_cache_fallback: bool = True,
-    ) -> dict[str, Any]:
-        cache_path = self._appinfo_cache_file(app_id)
-        if offline:
-            cached = _read_json(cache_path, {})
-            return cached if isinstance(cached, dict) else {}
-
-        account_name, _ = self._resolve_account_info()
-        login_user = account_name or "anonymous"
-        proc = self._run_steamcmd(
-            [
-                "+@sSteamCmdForcePlatformType",
-                platform,
-                "+login",
-                login_user,
-                "+app_info_update",
-                "1",
-                "+app_info_request",
-                app_id,
-                "+app_info_print",
-                app_id,
-                "+quit",
-            ],
-            interactive=False,
-            timeout=120.0,
-            check=False,
-        )
-        vdf_data, _ = extract_appinfo_vdf(proc.stdout + "\n" + proc.stderr, app_id)
-        if not vdf_data and proc.returncode != 0:
-            if allow_cache_fallback:
-                cached = _read_json(cache_path, {})
-                if isinstance(cached, dict) and cached:
-                    return cached
-            raise CommandFailedError(
-                f"steamcmd failed to query app_info for AppID {app_id} (exit {proc.returncode})"
-            )
-        if vdf_data:
-            _atomic_write_json(cache_path, vdf_data)
-        return vdf_data
-
     def _detect_signals(
         self,
-        appinfo: dict[str, Any],
+        manifest_paths: list[str],
         store_details: dict[str, Any],
         install_dir: Path | None,
     ) -> tuple[bool, list[str], AnticheatReport, DrmReport]:
@@ -1049,47 +1102,20 @@ class SteamBackend(StoreBackend):
         requires_online_auth = False
         third_party_launcher: str | None = None
 
-        # 1. Inspect AppInfo VDF
-        ufs = vdf_get(appinfo, "ufs")
-        if isinstance(ufs, dict) and ufs:
-            steamworks_signals.append("appinfo:ufs_steam_cloud")
-        if vdf_get(appinfo, "config", "steamcontrollertemplateindex") is not None:
-            steamworks_signals.append("appinfo:steam_input")
-        depots_node = vdf_get(appinfo, "depots")
-        if isinstance(depots_node, dict):
-            for did, dval in depots_node.items():
-                if not did.isdigit() or not isinstance(dval, dict):
-                    continue
-                if str(vdf_get(dval, "depotfromapp", default="")) == COMMON_REDIST_APP_ID:
-                    if "appinfo:common_redist_228980" not in steamworks_signals:
-                        steamworks_signals.append("appinfo:common_redist_228980")
-
-        ac_url = str(vdf_get(appinfo, "extended", "anti_cheat_support_url", default="") or "").strip()
-        if ac_url:
-            anticheat_signals.append(f"appinfo:anti_cheat_support_url={ac_url}")
-
-        if vdf_get(appinfo, "common", "vacmacmodulecache") is not None:
-            if "Valve Anti-Cheat (VAC)" not in anticheat_systems:
-                anticheat_systems.append("Valve Anti-Cheat (VAC)")
-            anticheat_signals.append("appinfo:vacmacmodulecache")
-
-        if str(vdf_get(appinfo, "extended", "thirdpartycdkey", default="0")) == "1":
-            drm_signals.append("appinfo:thirdpartycdkey")
-
-        # Scan serialized launch/common/extended text for known anti-cheat/DRM strings
-        metadata_blob = json.dumps(
-            {
-                "common": vdf_get(appinfo, "common", default={}),
-                "extended": vdf_get(appinfo, "extended", default={}),
-                "config": vdf_get(appinfo, "config", default={}),
-            },
-            default=str,
-        )
-        for sys_name, pattern in _ANTICHEAT_PATTERNS:
-            if pattern.search(metadata_blob):
-                if sys_name not in anticheat_systems:
-                    anticheat_systems.append(sys_name)
-                anticheat_signals.append(f"appinfo:{sys_name}")
+        # 1. Inspect file paths from DepotDownloader `-manifest-only`
+        for rel in manifest_paths:
+            low_name = Path(rel).name.lower()
+            if low_name in ("steam_api64.dll", "steam_api.dll", "steam_appid.txt"):
+                sig = f"manifest:{rel}"
+                if sig not in steamworks_signals:
+                    steamworks_signals.append(sig)
+            for sys_name, pattern in _ANTICHEAT_PATTERNS:
+                if pattern.search(rel):
+                    if sys_name not in anticheat_systems:
+                        anticheat_systems.append(sys_name)
+                    sig = f"manifest:{rel}"
+                    if sig not in anticheat_signals:
+                        anticheat_signals.append(sig)
 
         # 2. Inspect Steam Store `appdetails` (drm_notice, ext_user_account_notice, categories)
         drm_notice = str(store_details.get("drm_notice") or "").strip()
@@ -1171,54 +1197,52 @@ class SteamBackend(StoreBackend):
         )
         return bool(steamworks_signals), steamworks_signals, ac_report, drm_report
 
-    def _pick_launch_entry(
-        self,
-        appinfo: dict[str, Any],
-        *,
-        platform: str = "windows",
-    ) -> tuple[str | None, list[str], str | None]:
-        """Select the primary Windows launch executable, args, and workingdir from AppInfo."""
-        launch_node = vdf_get(appinfo, "config", "launch")
-        if not isinstance(launch_node, dict):
-            return None, [], None
-
-        candidates: list[tuple[int, str, list[str], str | None]] = []
-        for key, entry in launch_node.items():
-            if not isinstance(entry, dict):
+    def _pick_executable_from_paths(self, paths: list[str]) -> str | None:
+        """Choose the most likely primary Windows `.exe` from a list of relative file paths."""
+        candidates: list[str] = []
+        for raw in paths:
+            norm = raw.replace("\\", "/")
+            low = norm.lower()
+            if not low.endswith(".exe"):
                 continue
-            exe = str(vdf_get(entry, "executable", default="") or "").strip().replace("\\", "/")
-            if not exe:
+            fname = Path(norm).name
+            if _SKIP_EXE_PATTERNS.search(fname) or "_commonredist/" in low:
                 continue
-            cfg = vdf_get(entry, "config")
-            oslist = str(vdf_get(cfg, "oslist", default="") or "").lower()
-            osarch = str(vdf_get(cfg, "osarch", default="") or "").strip()
-            launch_type = str(vdf_get(entry, "type", default="default") or "default").lower()
-            if oslist and platform not in oslist:
-                continue
-            if launch_type not in ("default", "none", ""):
-                priority = 2
-            else:
-                priority = 0
-            if osarch == "64":
-                priority -= 1
-            raw_args = str(vdf_get(entry, "arguments", default="") or "").strip()
-            args_list = _split_windows_args(raw_args) if raw_args else []
-            workdir = str(vdf_get(entry, "workingdir", default="") or "").strip().replace("\\", "/") or None
-            sort_idx = int(key) if str(key).isdigit() else 999
-            candidates.append((priority * 1000 + sort_idx, exe, args_list, workdir))
-
+            candidates.append(norm)
         if not candidates:
-            return None, [], None
-        candidates.sort(key=lambda item: item[0])
-        _, exe, args_list, workdir = candidates[0]
-        return exe, args_list, workdir
+            return None
+        candidates.sort(key=lambda p: (len(Path(p).parts), Path(p).name.lower()))
+        return candidates[0]
+
+    def _version_from_manifests(self, depots: list[dict[str, Any]]) -> str | None:
+        """Derive a deterministic version fingerprint from depot manifest GIDs."""
+        pairs = sorted(
+            (str(d["depot_id"]), str(d["manifest_gid"]))
+            for d in depots
+            if d.get("depot_id") and d.get("manifest_gid")
+        )
+        if not pairs:
+            return None
+        if len(pairs) == 1:
+            return pairs[0][1]
+        return ",".join(f"{did}:{gid}" for did, gid in pairs)
 
     def info(self, app_id: str, *, platform: str = "windows", offline: bool = False) -> GameInfo:
         resolved_id = self._resolve_app_id(app_id, offline=offline)
-        appinfo = self._fetch_appinfo_vdf(resolved_id, platform=platform, offline=offline)
-        store_details = {} if offline else self._fetch_store_appdetails(resolved_id)
-
+        account_name, _ = self._resolve_account_info()
         installed_entry = self._get_installed_entry(resolved_id)
+        branch = str((installed_entry or {}).get("branch") or "public")
+
+        manifest_data = self._fetch_depot_manifests(
+            resolved_id,
+            platform=platform,
+            branch=branch,
+            account_name=account_name,
+            offline=offline,
+        )
+        store_details = {} if offline else self._fetch_store_appdetails(resolved_id)
+        owned_app_ids = self._known_owned_app_ids(offline=offline)
+
         install_path_str = (
             str(installed_entry.get("install_path"))
             if installed_entry and installed_entry.get("install_path")
@@ -1227,136 +1251,74 @@ class SteamBackend(StoreBackend):
         install_dir = Path(install_path_str) if install_path_str else None
         is_installed = bool(install_dir and install_dir.is_dir())
 
-        title = (
-            str(vdf_get(appinfo, "common", "name", default="") or "")
-            or str(store_details.get("name") or "")
-            or str((installed_entry or {}).get("title") or (installed_entry or {}).get("name") or "")
-            or f"Steam App {resolved_id}"
-        )
-
-        # Parse branches & depots
-        depots_node = vdf_get(appinfo, "depots")
+        raw_depots = manifest_data.get("depots") or []
         depots: list[DepotItem] = []
-        branches: list[dict[str, Any]] = []
-        public_build_id: str | None = None
-        base_download_bytes = 0
-        base_disk_bytes = 0
-        has_size_info = False
-        dlc_map: dict[str, DlcItem] = {}
+        manifest_paths: list[str] = []
+        total_disk = 0
+        total_download = 0
+        has_size = False
 
-        if isinstance(depots_node, dict):
-            branches_node = vdf_get(depots_node, "branches")
-            if isinstance(branches_node, dict):
-                for bname, bval in branches_node.items():
-                    if not isinstance(bval, dict):
-                        continue
-                    bid = str(vdf_get(bval, "buildid", default="") or "") or None
-                    if bname == "public" and bid:
-                        public_build_id = bid
-                    branches.append(
-                        {
-                            "name": str(bname),
-                            "build_id": bid,
-                            "time_updated": str(vdf_get(bval, "timeupdated", default="") or "") or None,
-                            "pwd_required": str(vdf_get(bval, "pwdrequired", default="0")) == "1",
-                            "description": str(vdf_get(bval, "description", default="") or ""),
-                        }
-                    )
+        for d in raw_depots:
+            if not isinstance(d, dict) or not d.get("depot_id"):
+                continue
+            did = str(d["depot_id"])
+            is_common_redist = did in COMMON_REDIST_DEPOTS
+            disk_sz = d.get("disk_size_bytes")
+            dl_sz = d.get("download_size_bytes")
+            depots.append(
+                DepotItem(
+                    depot_id=did,
+                    name=str(
+                        d.get("name")
+                        or (COMMON_REDIST_DEPOTS.get(did, {}).get("name") if is_common_redist else "")
+                    ),
+                    oslist=[platform],
+                    osarch="64",
+                    manifest_gid=str(d["manifest_gid"]) if d.get("manifest_gid") else None,
+                    size_bytes=int(disk_sz) if isinstance(disk_sz, int) else None,
+                    download_bytes=int(dl_sz) if isinstance(dl_sz, int) else None,
+                    shared_install=is_common_redist,
+                    depot_from_app=COMMON_REDIST_APP_ID if is_common_redist else None,
+                    is_common_redist=is_common_redist,
+                )
+            )
+            if not is_common_redist:
+                if isinstance(disk_sz, int):
+                    total_disk += disk_sz
+                    has_size = True
+                if isinstance(dl_sz, int):
+                    total_download += dl_sz
+                    has_size = True
+            for f in d.get("files") or []:
+                if isinstance(f, dict) and f.get("path"):
+                    manifest_paths.append(str(f["path"]))
 
-            for key, dval in depots_node.items():
-                if not str(key).isdigit() or not isinstance(dval, dict):
+        # DLCs from Steam Store `appdetails.dlc` with honest entitlement resolution
+        # against the user's owned AppIDs (never blindly marking catalog DLCs as owned).
+        installed_dlcs = set((installed_entry or {}).get("dlcs") or [])
+        dlcs: list[DlcItem] = []
+        raw_dlc_ids = store_details.get("dlc")
+        if isinstance(raw_dlc_ids, list):
+            for raw_dlc in raw_dlc_ids:
+                dlc_id = str(raw_dlc)
+                if not dlc_id.isdigit():
                     continue
-                cfg = vdf_get(dval, "config")
-                oslist_raw = str(vdf_get(cfg, "oslist", default="") or "")
-                oslist = [s.strip().lower() for s in oslist_raw.split(",") if s.strip()]
-                osarch = str(vdf_get(cfg, "osarch", default="") or "").strip() or None
-                language = str(vdf_get(cfg, "language", default="") or "").strip() or None
-                dlc_app_id = str(vdf_get(dval, "dlcappid", default="") or "").strip() or None
-                depot_from_app = str(vdf_get(dval, "depotfromapp", default="") or "").strip() or None
-                shared_install = str(vdf_get(dval, "sharedinstall", default="0")) == "1"
-                is_common_redist = (
-                    depot_from_app == COMMON_REDIST_APP_ID or str(key) in COMMON_REDIST_DEPOTS
-                )
-
-                pub_manifest = vdf_get(dval, "manifests", "public")
-                manifest_gid: str | None = None
-                size_bytes: int | None = None
-                download_bytes: int | None = None
-                if isinstance(pub_manifest, dict):
-                    manifest_gid = str(vdf_get(pub_manifest, "gid", default="") or "") or None
-                    sz_s = str(vdf_get(pub_manifest, "size", default="") or "").strip()
-                    dl_s = str(vdf_get(pub_manifest, "download", default="") or "").strip()
-                    size_bytes = int(sz_s) if sz_s.isdigit() else None
-                    download_bytes = int(dl_s) if dl_s.isdigit() else None
-                elif isinstance(pub_manifest, str) and pub_manifest.strip():
-                    manifest_gid = pub_manifest.strip()
-
-                depot_name = str(vdf_get(dval, "name", default="") or "")
-                if not depot_name and is_common_redist:
-                    depot_name = COMMON_REDIST_DEPOTS.get(str(key), {}).get(
-                        "name", f"Steamworks Common Redistributable ({key})"
-                    )
-
-                depots.append(
-                    DepotItem(
-                        depot_id=str(key),
-                        name=depot_name,
-                        oslist=oslist,
-                        osarch=osarch,
-                        language=language,
-                        manifest_gid=manifest_gid,
-                        size_bytes=size_bytes,
-                        download_bytes=download_bytes,
-                        dlc_app_id=dlc_app_id,
-                        shared_install=shared_install,
-                        depot_from_app=depot_from_app,
-                        is_common_redist=is_common_redist,
+                is_owned = dlc_id in owned_app_ids or dlc_id in installed_dlcs
+                dlcs.append(
+                    DlcItem(
+                        app_id=dlc_id,
+                        title=f"Steam DLC {dlc_id}",
+                        owned=is_owned,
+                        installed=dlc_id in installed_dlcs,
                     )
                 )
 
-                matches_platform = not oslist or platform in oslist
-                if matches_platform and not is_common_redist:
-                    if dlc_app_id:
-                        existing_dlc = dlc_map.get(dlc_app_id)
-                        if existing_dlc is None:
-                            dlc_map[dlc_app_id] = DlcItem(
-                                app_id=dlc_app_id,
-                                title=depot_name or f"Steam DLC {dlc_app_id}",
-                                owned=True,
-                                installed=dlc_app_id in ((installed_entry or {}).get("dlcs") or []),
-                                download_size_bytes=download_bytes,
-                                disk_size_bytes=size_bytes,
-                            )
-                        else:
-                            if download_bytes is not None:
-                                existing_dlc.download_size_bytes = (
-                                    existing_dlc.download_size_bytes or 0
-                                ) + download_bytes
-                            if size_bytes is not None:
-                                existing_dlc.disk_size_bytes = (
-                                    existing_dlc.disk_size_bytes or 0
-                                ) + size_bytes
-                    else:
-                        if size_bytes is not None:
-                            base_disk_bytes += size_bytes
-                            has_size_info = True
-                        if download_bytes is not None:
-                            base_download_bytes += download_bytes
-                            has_size_info = True
-
-        # Add any DLCs listed in `extended.listofdlc`
-        listofdlc = str(vdf_get(appinfo, "extended", "listofdlc", default="") or "")
-        for dlc_tok in re.findall(r"\d+", listofdlc):
-            if dlc_tok not in dlc_map:
-                dlc_map[dlc_tok] = DlcItem(
-                    app_id=dlc_tok,
-                    title=f"Steam DLC {dlc_tok}",
-                    owned=True,
-                    installed=dlc_tok in ((installed_entry or {}).get("dlcs") or []),
-                )
-
-        # Redistributables + Proton-adjacent info
-        proton_info = extract_proton_redist_info(appinfo, install_dir if is_installed else None)
+        # Redistributables + Proton-adjacent redist info
+        proton_info = extract_proton_redist_info(
+            depot_ids=[d.depot_id for d in depots],
+            manifest_paths=manifest_paths,
+            install_dir=install_dir if is_installed else None,
+        )
         redists: list[RedistributableItem] = []
         seen_redists: set[tuple[str, str | None]] = set()
 
@@ -1379,6 +1341,14 @@ class SteamBackend(StoreBackend):
             if key not in seen_redists:
                 seen_redists.add(key)
                 redists.append(item)
+
+        for rel in manifest_paths:
+            item = classify_redistributable_path(rel, source="manifest_files", present_on_disk=None)
+            if item is not None:
+                key = (item.id, item.relative_path)
+                if key not in seen_redists:
+                    seen_redists.add(key)
+                    redists.append(item)
 
         for script in proton_info.get("install_scripts", []):
             for proc_entry in script.get("run_processes", []):
@@ -1409,12 +1379,37 @@ class SteamBackend(StoreBackend):
                     redists.append(item)
 
         req_steamworks, steamworks_signals, ac_report, drm_report = self._detect_signals(
-            appinfo,
+            manifest_paths,
             store_details,
             install_dir if is_installed else None,
         )
-        exe, _, _ = self._pick_launch_entry(appinfo, platform=platform)
-        version = public_build_id or (installed_entry or {}).get("build_id")
+
+        exe = self._pick_executable_from_paths(manifest_paths)
+        if not exe and is_installed and install_dir is not None:
+            disk_exes = [
+                p.relative_to(install_dir).as_posix()
+                for p in sorted(install_dir.rglob("*.exe"))
+                if not p.is_symlink()
+            ]
+            exe = self._pick_executable_from_paths(disk_exes)
+
+        active_branch = str(manifest_data.get("branch") or branch)
+        manifest_ver = self._version_from_manifests(raw_depots)
+        version = manifest_ver or (installed_entry or {}).get("build_id")
+
+        title = (
+            str(store_details.get("name") or "")
+            or str((installed_entry or {}).get("title") or (installed_entry or {}).get("name") or "")
+            or f"Steam App {resolved_id}"
+        )
+
+        branches = [
+            {
+                "name": active_branch,
+                "build_id": manifest_ver,
+                "description": "Active queried branch (DepotDownloader)",
+            }
+        ]
 
         return GameInfo(
             store=self.name,
@@ -1422,10 +1417,10 @@ class SteamBackend(StoreBackend):
             title=title,
             platform=platform,
             version=str(version) if version else None,
-            download_size_bytes=base_download_bytes if has_size_info else None,
+            download_size_bytes=total_download if has_size else None,
             disk_size_bytes=(
-                base_disk_bytes
-                if has_size_info
+                total_disk
+                if has_size
                 else (installed_entry or {}).get("size_on_disk_bytes")
             ),
             installed=is_installed,
@@ -1440,165 +1435,142 @@ class SteamBackend(StoreBackend):
             drm=drm_report,
             depots=depots,
             branches=branches,
-            dlcs=sorted(dlc_map.values(), key=lambda d: int(d.app_id) if d.app_id.isdigit() else 0),
+            dlcs=sorted(dlcs, key=lambda d: int(d.app_id) if d.app_id.isdigit() else 0),
             redistributables=redists,
             proton_redist_info=proton_info,
-            manifest_files_checked=bool(appinfo),
+            manifest_files_checked=bool(manifest_paths),
         )
-
-    def _use_steamcmd_for_download(self) -> bool:
-        scmd = self.find_steamcmd()
-        if scmd is None:
-            return False
-        if sys.platform == "darwin" and py_platform.machine().lower() in ("arm64", "aarch64"):
-            return self.is_rosetta_available()
-        return True
 
     def download(self, options: DownloadOptions) -> DownloadResult:
         account_name, _ = self._require_logged_in_account()
-        use_steamcmd = self._use_steamcmd_for_download()
-        resolved_id = self._resolve_app_id(options.app_id, offline=not use_steamcmd)
+        resolved_id = self._resolve_app_id(options.app_id, offline=False)
         dest = options.dest.expanduser().resolve()
         dest.mkdir(parents=True, exist_ok=True)
         branch = (options.branch or "public").strip()
 
-        # Fetch metadata before download (best-effort) when steamcmd is runnable.
+        # Pre-fetch manifest metadata (best-effort) so we know depots, owned DLCs, and redists.
         info: GameInfo | None = None
-        if use_steamcmd:
-            try:
-                info = self.info(resolved_id, platform=options.platform, offline=False)
-            except AcquireError:
-                info = None
+        try:
+            info = self.info(resolved_id, platform=options.platform, offline=False)
+        except AcquireError:
+            info = None
 
-        downloaded_depots: list[str] = []
+        dd_args: list[str] = [
+            "-app",
+            resolved_id,
+            "-os",
+            options.platform,
+            "-osarch",
+            "64",
+            "-branch",
+            branch,
+            "-dir",
+            str(dest),
+            "-username",
+            account_name,
+            "-remember-password",
+        ]
+        if options.branch_password:
+            dd_args.extend(["-branchpassword", options.branch_password])
+        if options.validate:
+            dd_args.append("-validate")
+        if options.max_workers:
+            dd_args.extend(["-max-downloads", str(options.max_workers)])
+        dd_args.extend(options.extra_args)
+
+        proc = self._run_depot_downloader(dd_args, interactive=False, timeout=None, check=True)
+        stdout_info = parse_depot_downloader_stdout(proc.stdout + "\n" + proc.stderr)
+
+        downloaded_depots: list[str] = [
+            d["depot_id"] for d in stdout_info.get("depots", []) if d.get("depot_id")
+        ]
+        if not downloaded_depots and info is not None:
+            downloaded_depots = [d.depot_id for d in info.depots if not d.is_common_redist]
+
+        # Owned DLC depots when requested
         downloaded_dlcs: list[str] = []
-        downloaded_redists: list[str] = []
-
-        if use_steamcmd:
-            args: list[str] = [
-                "+@sSteamCmdForcePlatformType",
-                options.platform,
-                "+force_install_dir",
-                str(dest),
-                "+login",
-                account_name,
-                "+app_update",
-                resolved_id,
-            ]
-            if branch and branch != "public":
-                args.extend(["-beta", branch])
-                if options.branch_password:
-                    args.extend(["-betapassword", options.branch_password])
-            if options.validate:
-                args.append("validate")
-            args.extend(options.extra_args)
-            args.append("+quit")
-
-            proc = self._run_steamcmd(args, interactive=False, timeout=None, check=False)
-            combined = proc.stdout + "\n" + proc.stderr
-            if proc.returncode != 0 or _LOGIN_FAIL_PATTERNS.search(combined):
-                if _LOGIN_FAIL_PATTERNS.search(combined):
-                    raise AuthRequiredError(
-                        f"SteamCMD authentication failed for '{account_name}'. "
-                        f"Run interactively:\n"
-                        f"  tools/port-acquire --store steam login --username {account_name}"
-                    )
-                raise CommandFailedError(
-                    f"steamcmd app_update failed for AppID {resolved_id} (exit {proc.returncode})",
-                    details={"returncode": proc.returncode, "command": _redact_cmd(args)},
-                )
-
-            if info is not None:
-                for dep in info.depots:
-                    matches_os = not dep.oslist or options.platform in dep.oslist
-                    if matches_os and not dep.is_common_redist and not dep.dlc_app_id:
-                        downloaded_depots.append(dep.depot_id)
-
-            # Explicit DLC depot download when requested
-            if info is not None and (options.with_dlcs or options.dlcs):
-                wanted_dlcs = set(options.dlcs) if options.dlcs else {d.app_id for d in info.dlcs}
-                for dep in info.depots:
-                    if dep.dlc_app_id and dep.dlc_app_id in wanted_dlcs:
-                        if not dep.oslist or options.platform in dep.oslist:
-                            dlc_args = [
-                                "+@sSteamCmdForcePlatformType",
-                                options.platform,
-                                "+login",
-                                account_name,
-                                "+download_depot",
-                                resolved_id,
-                                dep.depot_id,
-                                "+quit",
-                            ]
-                            self._run_steamcmd(dlc_args, interactive=False, timeout=None, check=True)
-                            downloaded_depots.append(dep.depot_id)
-                            if dep.dlc_app_id not in downloaded_dlcs:
-                                downloaded_dlcs.append(dep.dlc_app_id)
-
-            # Steamworks Common Redistributables (`228980`) depot fetch when requested
-            if info is not None and options.with_redists:
-                for dep in info.depots:
-                    if dep.is_common_redist:
-                        redist_args = [
-                            "+@sSteamCmdForcePlatformType",
-                            options.platform,
-                            "+login",
-                            account_name,
-                            "+download_depot",
-                            COMMON_REDIST_APP_ID,
-                            dep.depot_id,
-                            "+quit",
-                        ]
-                        self._run_steamcmd(redist_args, interactive=False, timeout=None, check=True)
-                        downloaded_redists.append(dep.depot_id)
-                        # Stage downloaded depot directory if SteamCMD placed it under steamapps/content
-                        staged_src = (
-                            self.steam_home()
-                            / "steamapps"
-                            / "content"
-                            / f"app_{COMMON_REDIST_APP_ID}"
-                            / f"depot_{dep.depot_id}"
+        if options.with_dlcs or options.dlcs:
+            owned_ids = self._known_owned_app_ids(offline=False)
+            if options.dlcs:
+                target_dlcs = list(options.dlcs)
+                for dlc_id in target_dlcs:
+                    if owned_ids and dlc_id not in owned_ids:
+                        raise AcquireError(
+                            f"DLC AppID {dlc_id} is not owned by the logged-in Steam account.",
+                            code="dlc_not_owned",
+                            details={"dlc_app_id": dlc_id},
                         )
-                        if staged_src.is_dir():
-                            redist_dst = dest / "_CommonRedist" / dep.depot_id
-                            shutil.copytree(staged_src, redist_dst, dirs_exist_ok=True)
-        else:
-            # Native arm64 DepotDownloader fallback when steamcmd/Rosetta is unavailable
-            dd_args = [
-                "-app",
-                resolved_id,
-                "-os",
-                options.platform,
-                "-osarch",
-                "64",
-                "-branch",
-                branch,
-                "-dir",
-                str(dest),
-                "-username",
-                account_name,
-                "-remember-password",
-            ]
-            if options.branch_password:
-                dd_args.extend(["-branchpassword", options.branch_password])
-            if options.validate:
-                dd_args.append("-validate")
-            if options.max_workers:
-                dd_args.extend(["-max-downloads", str(options.max_workers)])
-            self._run_depot_downloader(dd_args)
+            elif info is not None:
+                # Only download DLCs confirmed owned by the account
+                target_dlcs = [d.app_id for d in info.dlcs if d.owned]
+            else:
+                target_dlcs = []
+
+            for dlc_id in target_dlcs:
+                dlc_args = [
+                    "-app",
+                    dlc_id,
+                    "-os",
+                    options.platform,
+                    "-osarch",
+                    "64",
+                    "-branch",
+                    branch,
+                    "-dir",
+                    str(dest),
+                    "-username",
+                    account_name,
+                    "-remember-password",
+                ]
+                if options.validate:
+                    dlc_args.append("-validate")
+                self._run_depot_downloader(dlc_args, interactive=False, timeout=None, check=True)
+                if dlc_id not in downloaded_dlcs:
+                    downloaded_dlcs.append(dlc_id)
+
+        # Steamworks Common Redistributables (`AppID 228980`) depots when requested
+        downloaded_redists: list[str] = []
+        if options.with_redists and info is not None:
+            shared_depots = info.proton_redist_info.get("shared_depots") or []
+            for sd in shared_depots:
+                did = str(sd.get("depot_id") or "")
+                if not did.isdigit():
+                    continue
+                redist_dst = dest / "_CommonRedist" / did
+                redist_dst.mkdir(parents=True, exist_ok=True)
+                redist_args = [
+                    "-app",
+                    COMMON_REDIST_APP_ID,
+                    "-depot",
+                    did,
+                    "-os",
+                    options.platform,
+                    "-osarch",
+                    "64",
+                    "-dir",
+                    str(redist_dst),
+                    "-username",
+                    account_name,
+                    "-remember-password",
+                ]
+                self._run_depot_downloader(redist_args, interactive=False, timeout=None, check=True)
+                if did not in downloaded_redists:
+                    downloaded_redists.append(did)
 
         # Ensure standard `steam_appid.txt` exists for downstream packaging/runtime
         appid_txt = dest / "steam_appid.txt"
         if not appid_txt.exists():
             appid_txt.write_text(f"{resolved_id}\n", encoding="utf-8")
 
-        # Determine build_id from downloaded appmanifest or info
-        build_id = info.version if info else None
-        local_acf = parse_appmanifest_acf(dest / "steamapps" / f"appmanifest_{resolved_id}.acf")
-        if local_acf and local_acf.get("build_id"):
-            build_id = str(local_acf["build_id"])
-
-        title = info.title if info else (local_acf or {}).get("name") or f"Steam App {resolved_id}"
+        manifest_gids = {
+            d["depot_id"]: d["manifest_gid"]
+            for d in stdout_info.get("depots", [])
+            if d.get("depot_id") and d.get("manifest_gid")
+        }
+        version = self._version_from_manifests(stdout_info.get("depots", [])) or (
+            info.version if info else None
+        )
+        title = info.title if info else f"Steam App {resolved_id}"
 
         if not options.no_register:
             installs = self._load_installs()
@@ -1608,7 +1580,8 @@ class SteamBackend(StoreBackend):
                 "install_path": str(dest),
                 "platform": options.platform,
                 "branch": branch,
-                "build_id": build_id,
+                "build_id": version,
+                "manifest_gids": manifest_gids,
                 "depots": downloaded_depots,
                 "dlcs": downloaded_dlcs,
                 "redists": downloaded_redists,
@@ -1622,7 +1595,7 @@ class SteamBackend(StoreBackend):
             title=title,
             platform=options.platform,
             install_path=str(dest),
-            version=build_id,
+            version=version,
             branch=branch,
             downloaded_dlcs=downloaded_dlcs,
             downloaded_depots=downloaded_depots,
@@ -1652,36 +1625,6 @@ class SteamBackend(StoreBackend):
         platform = str(entry.get("platform") or "windows")
         branch = str(entry.get("branch") or "public")
 
-        if self._use_steamcmd_for_download():
-            args = [
-                "+@sSteamCmdForcePlatformType",
-                platform,
-                "+force_install_dir",
-                str(install_path),
-                "+login",
-                account_name,
-                "+app_update",
-                resolved_id,
-            ]
-            if branch and branch != "public":
-                args.extend(["-beta", branch])
-            args.extend(["validate", "+quit"])
-            proc = self._run_steamcmd(args, interactive=False, timeout=None, check=False)
-            combined = proc.stdout + "\n" + proc.stderr
-            ok = proc.returncode == 0 and "error!" not in combined.lower()
-            repaired_flag = bool(
-                repair and ok and ("downloading" in combined.lower() or "repaired" in combined.lower())
-            )
-            msg_lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
-            return VerifyResult(
-                store=self.name,
-                app_id=resolved_id,
-                ok=ok,
-                repaired=repaired_flag,
-                message=msg_lines[-1] if msg_lines else ("Verified OK" if ok else "Validation failed"),
-            )
-
-        # DepotDownloader fallback
         dd_args = [
             "-app",
             resolved_id,
@@ -1698,13 +1641,20 @@ class SteamBackend(StoreBackend):
             "-remember-password",
             "-validate",
         ]
-        self._run_depot_downloader(dd_args)
+        proc = self._run_depot_downloader(dd_args, interactive=False, timeout=None, check=False)
+        combined = proc.stdout + "\n" + proc.stderr
+        ok = proc.returncode == 0
+        parsed_out = parse_depot_downloader_stdout(combined)
+        repaired_flag = bool(
+            repair and ok and (parsed_out.get("total_downloaded_bytes") or 0) > 0
+        )
+        msg_lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
         return VerifyResult(
             store=self.name,
             app_id=resolved_id,
-            ok=True,
-            repaired=repair,
-            message="Verified via DepotDownloader -validate",
+            ok=ok,
+            repaired=repaired_flag,
+            message=msg_lines[-1] if msg_lines else ("Verified OK via DepotDownloader -validate" if ok else "Validation failed"),
         )
 
     def update(
@@ -1714,9 +1664,8 @@ class SteamBackend(StoreBackend):
         check_only: bool = False,
         with_dlcs: bool = False,
     ) -> UpdateResult:
-        self._require_logged_in_account()
-        use_steamcmd = self._use_steamcmd_for_download()
-        resolved_id = self._resolve_app_id(app_id, offline=not use_steamcmd, strict=True)
+        account_name, _ = self._require_logged_in_account()
+        resolved_id = self._resolve_app_id(app_id, offline=False, strict=True)
         entry = self._get_installed_entry(resolved_id)
         if not entry or not entry.get("install_path"):
             raise AppNotFoundError(
@@ -1727,68 +1676,52 @@ class SteamBackend(StoreBackend):
         branch = str(entry.get("branch") or "public")
         old_version = str(entry.get("build_id") or "") or None
 
-        remote_build: str | None = None
-        if use_steamcmd:
-            remote_appinfo = self._fetch_appinfo_vdf(
-                resolved_id,
-                platform=platform,
-                offline=False,
-                allow_cache_fallback=False,
-            )
-            branches_node = vdf_get(remote_appinfo, "depots", "branches")
-            if isinstance(branches_node, dict):
-                branch_entry = vdf_get(branches_node, branch)
-                if isinstance(branch_entry, dict):
-                    bid = str(vdf_get(branch_entry, "buildid", default="") or "").strip()
-                    if bid:
-                        remote_build = bid
-                if remote_build is None and branch == "public":
-                    pub_entry = vdf_get(branches_node, "public")
-                    if isinstance(pub_entry, dict):
-                        bid = str(vdf_get(pub_entry, "buildid", default="") or "").strip()
-                        if bid:
-                            remote_build = bid
+        # Always fetch fresh remote manifests (never falling back to local cache or local build_id).
+        remote_manifests = self._fetch_depot_manifests(
+            resolved_id,
+            platform=platform,
+            branch=branch,
+            account_name=account_name,
+            offline=False,
+            allow_cache_fallback=False,
+        )
+        remote_version = self._version_from_manifests(remote_manifests.get("depots") or [])
 
-            if remote_build is None:
-                if check_only:
-                    raise CommandFailedError(
-                        f"Could not obtain remote build ID for Steam AppID {resolved_id} "
-                        f"(branch {branch!r}) from steamcmd app_info_print."
-                    )
-            else:
-                update_available = remote_build != old_version
-                if check_only:
-                    return UpdateResult(
-                        store=self.name,
-                        app_id=resolved_id,
-                        updated=False,
-                        update_available=update_available,
-                        old_version=old_version,
-                        new_version=remote_build,
-                        install_path=str(install_path),
-                        message=(
-                            f"Update available ({old_version or 'unknown'} -> {remote_build})"
-                            if update_available
-                            else "Already up to date"
-                        ),
-                    )
+        if remote_version is None:
+            if check_only:
+                raise CommandFailedError(
+                    f"Could not obtain remote manifest ID for Steam AppID {resolved_id} "
+                    f"(branch {branch!r}) from DepotDownloader -manifest-only."
+                )
+        else:
+            update_available = remote_version != old_version
+            if check_only:
+                return UpdateResult(
+                    store=self.name,
+                    app_id=resolved_id,
+                    updated=False,
+                    update_available=update_available,
+                    old_version=old_version,
+                    new_version=remote_version,
+                    install_path=str(install_path),
+                    message=(
+                        f"Update available ({old_version or 'unknown'} -> {remote_version})"
+                        if update_available
+                        else "Already up to date"
+                    ),
+                )
 
-                if not update_available and old_version is not None:
-                    return UpdateResult(
-                        store=self.name,
-                        app_id=resolved_id,
-                        updated=False,
-                        update_available=False,
-                        old_version=old_version,
-                        new_version=remote_build,
-                        install_path=str(install_path),
-                        message="Already up to date",
-                    )
-        elif check_only:
-            raise UnsupportedOperationError(
-                "Remote update checks (--check-only) require `steamcmd` (and Rosetta 2 on Apple Silicon); "
-                "run `update` without `--check-only` to update in-place via the DepotDownloader fallback."
-            )
+            if not update_available and old_version is not None:
+                return UpdateResult(
+                    store=self.name,
+                    app_id=resolved_id,
+                    updated=False,
+                    update_available=False,
+                    old_version=old_version,
+                    new_version=remote_version,
+                    install_path=str(install_path),
+                    message="Already up to date",
+                )
 
         dl_res = self.download(
             DownloadOptions(
@@ -1806,13 +1739,9 @@ class SteamBackend(StoreBackend):
             updated=True,
             update_available=True,
             old_version=old_version,
-            new_version=dl_res.version or remote_build,
+            new_version=dl_res.version or remote_version,
             install_path=dl_res.install_path,
-            message=(
-                f"Updated {resolved_id} on branch '{branch}'"
-                if use_steamcmd
-                else f"Updated {resolved_id} on branch '{branch}' via DepotDownloader fallback"
-            ),
+            message=f"Updated {resolved_id} on branch '{branch}' via DepotDownloader",
         )
 
     def uninstall(
@@ -1822,7 +1751,7 @@ class SteamBackend(StoreBackend):
         keep_files: bool = False,
         skip_uninstaller: bool = False,
     ) -> UninstallResult:
-        del skip_uninstaller  # SteamCMD has no interactive Windows uninstaller on macOS
+        del skip_uninstaller
         resolved_id = self._resolve_app_id(app_id, offline=True, strict=True, require_exact=True)
         installs = self._load_installs()
         entry = installs.get(resolved_id)
@@ -1835,7 +1764,6 @@ class SteamBackend(StoreBackend):
         install_path = Path(install_path_str).resolve() if install_path_str else None
 
         if not keep_files and install_path is not None:
-            # Safety guard: refuse to delete root, home, or top-level system directories.
             home_resolved = Path.home().resolve()
             if (
                 install_path == Path("/")
@@ -1860,47 +1788,65 @@ class SteamBackend(StoreBackend):
             install_path=install_path_str or None,
         )
 
-    def launch_args(self, app_id: str, *, offline: bool = True) -> LaunchPlan:
+    def launch_args(
+        self,
+        app_id: str,
+        *,
+        offline: bool = True,
+        install_dir: Path | None = None,
+    ) -> LaunchPlan:
         resolved_id = self._resolve_app_id(app_id, offline=True)
         entry = self._get_installed_entry(resolved_id)
-        if not entry or not entry.get("install_path"):
+
+        resolved_dir: Path | None = None
+        if install_dir is not None:
+            resolved_dir = Path(install_dir)
+        elif entry and entry.get("install_path"):
+            resolved_dir = Path(str(entry["install_path"]))
+
+        if resolved_dir is None:
             raise AppNotFoundError(
                 f"Steam AppID {resolved_id} is not installed; cannot generate launch plan."
             )
-        install_dir = Path(str(entry["install_path"]))
-        platform = str(entry.get("platform") or "windows")
-        appinfo = self._fetch_appinfo_vdf(resolved_id, platform=platform, offline=True)
-        if not appinfo and not offline and self.find_steamcmd() is not None:
-            try:
-                appinfo = self._fetch_appinfo_vdf(resolved_id, platform=platform, offline=False)
-            except AcquireError:
-                appinfo = {}
 
-        exe, raw_args, workdir = self._pick_launch_entry(appinfo, platform=platform)
-        if not exe and install_dir.is_dir():
-            # Fallback: scan for the primary Windows .exe inside `install_dir`
-            exe_candidates: list[Path] = []
-            for p in sorted(install_dir.rglob("*.exe")):
-                if p.is_symlink() or _SKIP_EXE_PATTERNS.search(p.name):
-                    continue
-                exe_candidates.append(p)
-            if exe_candidates:
-                exe_candidates.sort(key=lambda p: (len(p.relative_to(install_dir).parts), p.name.lower()))
-                exe = exe_candidates[0].relative_to(install_dir).as_posix()
+        platform = str((entry or {}).get("platform") or "windows")
+        manifest_data = self._fetch_depot_manifests(
+            resolved_id,
+            platform=platform,
+            offline=True,
+        )
+        manifest_paths: list[str] = []
+        for d in manifest_data.get("depots") or []:
+            if isinstance(d, dict):
+                for f in d.get("files") or []:
+                    if isinstance(f, dict) and f.get("path"):
+                        manifest_paths.append(str(f["path"]))
 
+        exe = self._pick_executable_from_paths(manifest_paths)
+        if not exe and resolved_dir.is_dir():
+            disk_exes = [
+                p.relative_to(resolved_dir).as_posix()
+                for p in sorted(resolved_dir.rglob("*.exe"))
+                if not p.is_symlink()
+            ]
+            exe = self._pick_executable_from_paths(disk_exes)
+
+        raw_args_str = str((entry or {}).get("launch_args") or "")
+        raw_args = _split_windows_args(raw_args_str) if raw_args_str else []
         safe_args, args_redacted = redact_launch_args(raw_args)
         safe_env, env_redacted = redact_env({"SteamAppId": resolved_id, "SteamGameId": resolved_id})
-        title = (
-            str(vdf_get(appinfo, "common", "name", default="") or "")
-            or str(entry.get("title") or entry.get("name") or f"Steam App {resolved_id}")
+        title = str(
+            (entry or {}).get("title")
+            or (entry or {}).get("name")
+            or f"Steam App {resolved_id}"
         )
         return LaunchPlan(
             store=self.name,
             app_id=resolved_id,
             title=title,
-            install_dir=str(install_dir),
+            install_dir=str(resolved_dir),
             executable=exe or "",
-            working_dir=workdir or (Path(exe).parent.as_posix() if exe else "."),
+            working_dir=Path(exe).parent.as_posix() if exe else ".",
             args=safe_args,
             env=safe_env,
             offline=offline,

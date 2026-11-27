@@ -3804,15 +3804,6 @@ pub const KNOBS: &[KnobSpec] = &[
         crates: &["win32-rt"],
     },
     KnobSpec {
-        name: "PORT_STEAMCMD",
-        aliases: &[],
-        kind: KnobType::Path,
-        default: "",
-        description: "Override path to Valve's steamcmd / steamcmd.sh binary for port-acquire --store steam.",
-        affects_aot_key: false,
-        crates: &["port-factory"],
-    },
-    KnobSpec {
         name: "PORT_STEAM_API_KEY",
         aliases: &[],
         kind: KnobType::String,

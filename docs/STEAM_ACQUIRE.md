@@ -1,48 +1,43 @@
 # Steam Game Acquisition (`tools/port-acquire --store steam`)
 
 This guide covers the agent-facing and user-facing workflow for acquiring **legally owned**
-Windows x86-64 games from Steam on Apple Silicon macOS and handing them off to the
-Apple Silicon Port Factory pipeline (`audit-game`, `port-runner`, and `.app` packaging).
+Windows x86-64 games from Steam on Apple Silicon macOS (`arm64`) and handing them off to
+the Apple Silicon Port Factory pipeline (`audit-game`, `port-runner`, and `.app` packaging).
 
 > **Hard policy:** Never bypass DRM, anti-cheat, or store ownership checks. Only download
-> titles owned by the logged-in Steam account through Valve's official tools. Never commit
-> game binaries, assets, passwords, Steam Guard codes, or tokens.
+> titles owned by the logged-in Steam account through Steam's normal depot protocol. Never
+> commit game binaries, assets, passwords, Steam Guard codes, or tokens.
 
 ---
 
-## 1. Tool Selection: Why `steamcmd` (and when `DepotDownloader` is used)
+## 1. Tool Selection: Native `arm64` `DepotDownloader`
 
-The `steam` backend (`tools/port_acquire/backends/steam.py`) uses **Valve's official
-`steamcmd`** as its primary engine, with native Apple Silicon `DepotDownloader` as an
-optional download/verify fallback:
+The `steam` backend (`tools/port_acquire/backends/steam.py`) uses **SteamRE/DepotDownloader**
+(standalone native Apple Silicon `arm64` macOS binary — zero x86 translation layer, zero
+`.NET` runtime dependency):
 
-| Capability | Valve `steamcmd` (Primary) | `DepotDownloader` (Fallback) |
+- **Install (one command via Port Factory):**
+  ```sh
+  cargo opsdb -- steam-setup
+  ```
+  This downloads the official standalone `DepotDownloader-macos-arm64.zip` release from
+  `SteamRE/DepotDownloader` into `~/.local/opt/depotdownloader/DepotDownloader` and symlinks
+  `~/.local/bin/DepotDownloader`. You can also override the binary path with the registered
+  `PORT_DEPOT_DOWNLOADER` environment knob.
+
+### Capabilities & Honest Gaps
+
+| Operation | How `port-acquire --store steam` handles it | Notes / Gaps |
 |---|---|---|
-| Force Windows depots on macOS | `+@sSteamCmdForcePlatformType windows` | `-os windows -osarch 64` |
-| Interactive login + Steam Guard token cache | Built-in (`+login <user>`, cached by Steam in `config.vdf`) | `-username` / `-qr` + `-remember-password` |
-| Owned library license list (`list-owned`) | Built-in (`+licenses_print`) | Not supported |
-| Full depot, branch/beta, DLC & `228980` redist metadata (`info`) | Built-in (`+app_info_update 1 +app_info_request <id> +app_info_print <id>`) | Not supported |
-| Branch / beta switching (`--branch`) | `+app_update <id> -beta <branch> [-betapassword <pw>]` | `-branch <branch> [-branchpassword <pw>]` |
-| Checksum verification (`verify`) | `+app_update <id> validate` | `-validate` |
-| Targeted DLC & `_CommonRedist` (`228980`) depot pulls | `+download_depot <app_id> <depot_id>` | `-app <id> -depot <depot_id>` |
-| macOS Apple Silicon (`arm64`) binary | Intel `x86_64` (runs via **Rosetta 2**) | Native `arm64` Mach-O (`cargo opsdb -- steam-setup`) |
-
-**Why `steamcmd` is primary:** `DepotDownloader` only fetches manifests/depots and cannot
-query owned licenses (`licenses_print`) or full AppInfo VDF (`app_info_print`) for depots,
-branches, DLC lists, Steamworks Common Redistributables (`228980`), or Proton/Steam Deck
-compatibility metadata. `steamcmd` provides all of those directly from Valve.
-
-**macOS `arm64` caveat:** Valve distributes macOS `steamcmd` as a 64-bit Intel (`x86_64`)
-binary. On Apple Silicon Macs, install Rosetta 2 once and then install `steamcmd`:
-
-```sh
-softwareupdate --install-rosetta --agree-to-license
-brew install --cask steamcmd
-```
-
-If `steamcmd` or Rosetta 2 is absent on a machine, `download`, `verify`, and `update` fall
-back automatically to native `arm64` `DepotDownloader` (installed via `cargo opsdb --
-steam-setup` or located via `PORT_DEPOT_DOWNLOADER`).
+| `login` | `DepotDownloader -app 228980 -manifest-only -username <user> -remember-password` (interactive TTY) | Account owner enters password and completes Steam Guard directly; refresh token stays in `DepotDownloader`'s own cache. Zero game files downloaded during login. |
+| `status` | Non-interactive `-manifest-only` probe on free App `228980` (`--offline` inspects local session metadata only) | Reports login state, account name, and `DepotDownloader` version only — never tokens or secrets. |
+| `list-owned` | **1)** Steam Web API `IPlayerService/GetOwnedGames/v1` (when an optional Web API key is stored in macOS Keychain or `PORT_STEAM_API_KEY` and SteamID64 is known); **2)** local Steam library caches (`userdata/*/config/{localconfig.vdf,librarycache}` + `steamapps/appmanifest_*.acf` + managed installs) | **Gap:** `DepotDownloader` has no `licenses_print` command. Without a Steam Web API key or a local macOS Steam client cache, unplayed/uninstalled owned games are not enumerated automatically — pass the numeric AppID directly to `info`/`download`, and `DepotDownloader` still enforces Valve's server-side ownership check. |
+| `search <name>` | Fuzzy match over owned library (+ Steam public Store Search intersected strictly with owned AppIDs to resolve unnamed local cache IDs) | Never returns unowned titles. |
+| `info <app>` | `DepotDownloader -app <id> -os windows -osarch 64 -manifest-only` + Steam Store `appdetails` | Gives exact depot IDs, manifest GIDs, compressed/disk sizes, and **complete file lists before downloading** (detecting `.exe`, Steamworks `steam_api64.dll`, anti-cheat binaries, and `_CommonRedist`), plus Store `drm_notice` and DLC IDs checked against owned entitlements. **Gap:** `DepotDownloader` does not dump raw `appinfo.vdf` branch catalogs or Steam Deck compatibility blocks; pass explicit `--branch <name>` if targeting a beta branch. |
+| `download` | `DepotDownloader -app <id> -os windows -osarch 64 -branch <branch> [-branchpassword <pw>] -dir <dest> -username <user> -remember-password [-validate]` | Also downloads owned DLCs (`--with-dlcs` / `--dlc <id>`) and App `228980` Steamworks Common Redistributables (`--with-redists`), and writes `<dest>/port-acquire-manifest.json`. |
+| `verify` | `DepotDownloader ... -validate` | Verifies and optionally repairs local files against Steam depot checksums. |
+| `update` | Fresh `DepotDownloader -manifest-only` comparison against stored manifest GIDs, then in-place `download` if changed | `--check-only` fails honestly if remote manifests cannot be retrieved instead of falsely claiming up-to-date. |
+| `uninstall` | Removes managed install directory (with exact-title/numeric-AppID safety check) and registry entry | Refuses ambiguous/non-exact titles on destructive uninstall. |
 
 ---
 
@@ -52,38 +47,36 @@ steam-setup` or located via `PORT_DEPOT_DOWNLOADER`).
    ```sh
    tools/port-acquire --store steam login --username <your_steam_account>
    ```
-   `port-acquire` attaches `steamcmd +login <account> +quit` directly to the user's terminal
-   so password and Steam Guard prompts go straight to Valve's `steamcmd`. Refresh tokens stay
-   exclusively in Steam's own cache (`~/Library/Application Support/Steam/config/config.vdf`).
+   `port-acquire` attaches `DepotDownloader` directly to the user's terminal with
+   `-username <account> -remember-password` so password and Steam Guard prompts go straight
+   to `DepotDownloader`. Refresh tokens stay exclusively in `DepotDownloader`'s own cache.
 2. **Never pass or store passwords, Steam Guard codes, or refresh tokens** in git, CI,
-   manifests, or chat/thread logs. `port-acquire` stores only `{account_name, steam_id64}` in
-   `~/.local/share/port-acquire/steam-session.json`.
+   manifests, or chat/thread logs. `port-acquire` stores only `{logged_out, account_name,
+   steam_id64}` in `~/.local/share/port-acquire/steam-session.json`.
 3. **`status` reports login state and account name only:**
    ```sh
    tools/port-acquire --store steam status --json
    ```
-4. **Optional Steam Web API key (for faster `list-owned` with titles):**
-   Without an API key, `list-owned` uses `steamcmd +licenses_print` out of the box. If you
-   want full title + playtime resolution via Valve's `IPlayerService/GetOwnedGames/v1`, store
-   a Steam Web API key in the macOS Keychain (preferred) or set the registered
-   `PORT_STEAM_API_KEY` environment variable:
+4. **Optional Steam Web API key (for full `list-owned` with titles):**
+   Store a Steam Web API key in the macOS Keychain (preferred) or set the registered
+   `PORT_STEAM_API_KEY` environment variable (automatically redacted to `<redacted>` in
+   `port-runner --knobs` and `--knobs --json`):
    ```sh
-   # Preferred: macOS Keychain (never touches disk in repo or shell history when using -w prompt)
+   # Preferred: macOS Keychain (prompts securely without placing the key in shell history)
    security add-generic-password -a "$USER" -s port-acquire-steam-web-api-key -w
    ```
 5. **Private beta branch passwords:** Never pass branch passwords on the CLI. Use
    `--branch-password-env MY_BETA_PW` so the value is read from the environment and redacted
-   from logs and manifests.
+   from error logs and manifests.
 
 ### Registered `PORT_*` Environment Knobs (`crates/port-manifest/src/knobs.rs`)
 
 | Knob | Purpose |
 |---|---|
-| `PORT_STEAMCMD` | Override path to `steamcmd` / `steamcmd.sh` |
-| `PORT_STEAM_API_KEY` | Optional Steam Web API key (alternative to macOS Keychain; never logged) |
-| `PORT_STEAM_HOME` | Override Steam config/library directory (default `~/Library/Application Support/Steam`) |
+| `PORT_DEPOT_DOWNLOADER` | Override path to native `arm64` `DepotDownloader` binary |
+| `PORT_STEAM_API_KEY` | Optional Steam Web API key (alternative to macOS Keychain; redacted in `--knobs` diagnostics) |
+| `PORT_STEAM_HOME` | Override local Steam config/library directory (default `~/Library/Application Support/Steam`) |
 | `PORT_STEAM_USER` | Optional default Steam account name (never a password) |
-| `PORT_DEPOT_DOWNLOADER` | Override path to native `arm64` `DepotDownloader` fallback |
 
 ---
 
@@ -97,28 +90,27 @@ When the user says **"I own `<Game Title>` on Steam"**, follow these exact steps
 tools/port-acquire --store steam status --json
 ```
 
-- If `logged_in` is `false`, **stop** and give the user the exact command to run in their own
-  terminal:
+- If `backend_available` is `false`, install native `arm64` `DepotDownloader`:
+  ```sh
+  cargo opsdb -- steam-setup
+  ```
+- If `logged_in` is `false`, **stop** and give the user the exact native login command to
+  run in their own terminal:
   ```sh
   tools/port-acquire --store steam login --username <your_steam_account>
-  ```
-- If `backend_available` is `false`, ask the user to install `steamcmd`:
-  ```sh
-  softwareupdate --install-rosetta --agree-to-license
-  brew install --cask steamcmd
   ```
 
 ### Step 2 — Find the owned AppID
 
 ```sh
 tools/port-acquire --store steam search "<Game Title>" --json
-# Or inspect the full owned list:
+# Or inspect the owned list:
 tools/port-acquire --store steam list-owned --platform windows --json
 ```
 
-`search` fuzzy-matches against the user's owned library (and when `licenses_print` has
-numeric-only entries without a Steam Web API key, intersects Steam's public Store Search
-results strictly with the user's owned AppIDs so unowned titles are never returned).
+If the user has neither a Steam Web API key nor a local Steam cache entry for the game, ask
+for or confirm the numeric Steam AppID and proceed to Step 3 (`DepotDownloader` enforces
+ownership directly against Valve's servers).
 
 ### Step 3 — Inspect depots, size, DLCs, redists, and DRM/anti-cheat (report-only)
 
@@ -129,19 +121,18 @@ tools/port-acquire --store steam list-redists <appid> --json
 ```
 
 Review the JSON report with the user before downloading:
-- `download_size_bytes` / `disk_size_bytes` and `depots` (Windows x64 vs DLC vs `228980`
-  shared redist depots)
-- `branches` (default `public` plus any available beta branches)
+- `download_size_bytes` / `disk_size_bytes` and `depots` (Windows x64 manifest GIDs and sizes)
+- `dlcs` (each tagged honestly with `owned: true/false` against known account entitlements)
 - `requires_steamworks` / `steamworks_signals`
 - `drm` (`report_only: true` — flags Denuvo, third-party launchers, online activation)
 - `anticheat` (`report_only: true` — flags EAC, BattlEye, VAC, Vanguard, Ricochet)
-- `proton_redist_info` (App `228980` Steamworks Common Redistributables, `installscript.vdf`,
-  and Valve's `steam_deck_compatibility` / recommended Proton runtime notes)
+- `proton_redist_info` (inferred App `228980` Steamworks Common Redistributables,
+  `_CommonRedist` paths, `installscript.vdf`, and runtime notes)
 
 If kernel anti-cheat or incompatible DRM is reported, inform the user honestly — **never**
 attempt any bypass.
 
-### Step 4 — Download Windows depots (+ optional branch, DLCs, and `_CommonRedist`)
+### Step 4 — Download Windows depots (+ optional branch, owned DLCs, and `_CommonRedist`)
 
 ```sh
 tools/port-acquire --store steam download <appid> \
@@ -211,22 +202,22 @@ cargo opsdb -- bundle-verify out/apps/<GameName>.app
 
 ## 4. Packaging Hook Point (`port-acquire-manifest.json`)
 
-Every `download` (and `launch-args --export-manifest`) writes a game-agnostic schema-v1
-JSON file at `<dest>/port-acquire-manifest.json`. There is **zero game-specific logic** in
-the manifest or hook.
+Every `download` (including `--no-register`) and `launch-args --export-manifest` writes a
+game-agnostic schema-v1 JSON file at `<dest>/port-acquire-manifest.json`. There is **zero
+game-specific logic** in the manifest or hook.
 
 Key fields recorded for downstream `.app` packaging
 (`crates/port-factory/src/steam_library/macos_bundle.rs` and `vdf.rs`):
 
-- `store`, `app_id`, `title`, `platform`, `version` (`buildid`), `branch`
+- `store`, `app_id`, `title`, `platform`, `version` (manifest GID fingerprint), `branch`
 - `executable`, `working_dir`, `launch_args`, `launch_env` (sanitized; auth tokens redacted)
-- `depots` and `downloaded_depots` (depot IDs, OS/arch filters, manifest GIDs, sizes, DLC links)
-- `dlcs` (owned/installed DLC AppIDs and sizes)
+- `depots` and `downloaded_depots` (depot IDs, OS/arch filters, manifest GIDs, sizes)
+- `dlcs` (AppIDs with honest `owned` and `installed` flags)
 - `redistributables` and `downloaded_redists` (each tagged with `native_in_win32_rt: true/false`
   so `.app` bundling knows VC++, DirectX, and OpenAL `228980` depots are satisfied natively by
   `crates/win32-rt` while `.NET` and `PhysX` stay flagged for audit)
 - `proton_redist_info` (`shared_redist_app_id: "228980"`, `shared_depots`, `common_redist_dirs`,
-  `install_scripts`, `steam_deck_compatibility` / `recommended_runtime`, and `proton_notes`)
+  `install_scripts`, and `proton_notes`)
 - `compatibility_signals` (`requires_steamworks`, `steamworks_signals`, `anticheat`, `drm` —
   strictly report-only)
 - `packaging_hook`:
@@ -244,4 +235,4 @@ read `<game_dir>/port-acquire-manifest.json` (when present) to:
    `Contents/Resources/game.toml` without heuristic PE guessing.
 2. Copy `port-acquire-manifest.json` into `Contents/Resources/port-acquire-manifest.json`.
 3. Skip staging redundant `native_in_win32_rt: true` redistributables while preserving DLC
-   records and Proton/Steamworks metadata for `bundle-verify`.
+   records and Steamworks/Proton-adjacent redist metadata for `bundle-verify`.
