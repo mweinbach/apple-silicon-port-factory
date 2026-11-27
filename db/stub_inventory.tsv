@@ -1,9 +1,9 @@
 dll	api	kind	file	line	detail
 crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	55	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	794	"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"
-d3d11.dll	create_geometry_shader_so	stub	crates/win32-rt/src/d3d11/device.rs	748	"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"
-d3d11.dll	draw_auto	stub	crates/win32-rt/src/d3d11/context.rs	2913	"ID3D11DeviceContext::DrawAuto not implemented"
-d3d11.dll	get_data	stub	crates/win32-rt/src/d3d11/context.rs	3094	"GetData(PIPELINE_STATISTICS): GPU-side counters (PS/Clipper/GSPrimitives/DS/indirect) unavailable on Apple Silicon"
+d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	944	"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"
+d3d11.dll	create_geometry_shader_so	stub	crates/win32-rt/src/d3d11/device.rs	894	"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"
+d3d11.dll	draw_auto	stub	crates/win32-rt/src/d3d11/context.rs	4107	"ID3D11DeviceContext::DrawAuto not implemented"
+d3d11.dll	get_data	stub	crates/win32-rt/src/d3d11/context.rs	4338	"GetData(PIPELINE_STATISTICS): GPU-side counters (PS/Clipper/GSPrimitives/DS/indirect) unavailable on Apple Silicon"
 directml.dll	parse	middleware_stub	crates/win32-rt/src/misc/directml/ops.rs	1048	"DirectML CreateOperator: unsupported operator type {other}"
 nri.dll	core_cmd_set_sample_positions	middleware_stub	crates/win32-rt/src/misc/nri/cmdlist.rs	965	"CmdSetSamplePositions: programmable sample positions not supported on Metal"
 nri.dll	core_create_query_pool	middleware_stub	crates/win32-rt/src/misc/nri/device.rs	1383	"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type

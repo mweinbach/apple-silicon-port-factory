@@ -119,10 +119,10 @@ fn check_prerequisites() -> Option<PathBuf> {
     Some(zig)
 }
 
-fn compile_guest_exe(zig: &Path, work_dir: &Path) -> PathBuf {
-    let src_path = work_dir.join("d3d11_e2e_guest.c");
-    let exe_path = work_dir.join("d3d11_e2e_guest.exe");
-    std::fs::write(&src_path, GUEST_C_SOURCE).expect("write guest C source");
+fn compile_c_source(zig: &Path, work_dir: &Path, stem: &str, src: &str) -> PathBuf {
+    let src_path = work_dir.join(format!("{stem}.c"));
+    let exe_path = work_dir.join(format!("{stem}.exe"));
+    std::fs::write(&src_path, src).expect("write guest C source");
     let zig_cache = work_dir.join("zig-cache");
     let output = Command::new(zig)
         .args(["cc", "-target", "x86_64-windows-gnu", "-O2", "-Wall", "-Wextra"])
@@ -142,6 +142,10 @@ fn compile_guest_exe(zig: &Path, work_dir: &Path) -> PathBuf {
     );
     assert!(exe_path.is_file(), "compiled PE missing at {}", exe_path.display());
     exe_path
+}
+
+fn compile_guest_exe(zig: &Path, work_dir: &Path) -> PathBuf {
+    compile_c_source(zig, work_dir, "d3d11_e2e_guest", GUEST_C_SOURCE)
 }
 
 fn run_guest_in_port_runner(work_dir: &Path, exe_path: &Path, headless: bool) -> (Option<i32>, String, PathBuf) {
@@ -310,6 +314,366 @@ fn d3d11_e2e_windowed_nswindow_swapchain() {
         "windowed run unexpectedly fell back to offscreen swapchain:\n{log}"
     );
 }
+
+fn parse_u64_kv(line: &str, key: &str) -> Option<u64> {
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(&prefix)?.parse::<u64>().ok())
+}
+
+#[test]
+fn d3d11_e2e_stress_4096_draws_map_discard() {
+    let Some(zig) = check_prerequisites() else {
+        return;
+    };
+    let tmp = TempDir::new("stress4096");
+    let exe = compile_c_source(&zig, tmp.path(), "d3d11_stress_4096", STRESS_GUEST_C_SOURCE);
+    let (code, log, _ctl_dir) = run_guest_in_port_runner(tmp.path(), &exe, true);
+    let mut stress_frames = 0usize;
+    for line in log.lines() {
+        if line.contains("D3D11_STRESS:") || line.contains("d3d11 frame stats:") {
+            eprintln!("{line}");
+        }
+        if line.contains("d3d11 frame stats:") {
+            let draws = parse_u64_kv(line, "draws").unwrap_or(0);
+            if draws == 4096 {
+                stress_frames += 1;
+                let flushes = parse_u64_kv(line, "flushes").expect("flushes kv");
+                let mid_flushes = parse_u64_kv(line, "mid_frame_flushes").expect("mid_frame_flushes kv");
+                let mid_stalls = parse_u64_kv(line, "mid_frame_stalls").expect("mid_frame_stalls kv");
+                let samp_slots = parse_u64_kv(line, "samp_slots").expect("samp_slots kv");
+                assert!(
+                    flushes <= 1,
+                    "4096-draw frame must flush at most once, got flushes={flushes}: {line}"
+                );
+                assert_eq!(
+                    mid_flushes, 0,
+                    "4096-draw frame must not mid-frame flush: {line}"
+                );
+                assert_eq!(
+                    mid_stalls, 0,
+                    "4096-draw frame must have 0 mid-frame wait_cpu stalls: {line}"
+                );
+                assert!(
+                    samp_slots <= 16,
+                    "4096-draw frame with static sampler should reuse sampler table, got samp_slots={samp_slots}: {line}"
+                );
+            }
+        }
+    }
+    assert_eq!(code, Some(0), "d3d11_stress_4096 failed (exit={code:?}):\n{log}");
+    assert!(
+        log.contains("D3D11_STRESS: PASS"),
+        "d3d11_stress_4096 missing PASS marker:\n{log}"
+    );
+    assert_eq!(
+        stress_frames, 3,
+        "expected 3 measured 4096-draw frame stat lines:\n{log}"
+    );
+    for forbidden in [
+        "FAIL:",
+        "PANIC",
+        "UNIMPLEMENTED",
+        "MTLDebugComputeCommandEncoder",
+        "MTLDebugRenderCommandEncoder",
+        "failed assertion",
+    ] {
+        assert!(
+            !log.contains(forbidden),
+            "d3d11_stress_4096 reported error {forbidden:?}:\n{log}"
+        );
+    }
+}
+
+const STRESS_GUEST_C_SOURCE: &str = r##"
+#define COBJMACROS
+#define CINTERFACE
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static const GUID MY_IID_ID3D11Texture2D =
+    {0x6f15aaf2, 0xd208, 0x4e89, {0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c}};
+
+/* vs_5_0: passthrough POSITION (v0.xyzw) -> SV_Position (o0.xyzw) */
+static const uint8_t kVsPassthroughDxbc[216] = {
+    0x44, 0x58, 0x42, 0x43, 0x9d, 0x3b, 0x28, 0xb4, 0xb7, 0xe9, 0x69, 0xf4,
+    0x0e, 0x49, 0x0a, 0xe5, 0xae, 0x5e, 0xa2, 0x25, 0x01, 0x00, 0x00, 0x00,
+    0xd8, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00,
+    0x60, 0x00, 0x00, 0x00, 0x94, 0x00, 0x00, 0x00, 0x49, 0x53, 0x47, 0x4e,
+    0x2c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x0f, 0x00, 0x00,
+    0x50, 0x4f, 0x53, 0x49, 0x54, 0x49, 0x4f, 0x4e, 0x00, 0x00, 0x00, 0x00,
+    0x4f, 0x53, 0x47, 0x4e, 0x2c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x00, 0x00, 0x53, 0x56, 0x5f, 0x50, 0x6f, 0x73, 0x69, 0x74,
+    0x69, 0x6f, 0x6e, 0x00, 0x53, 0x48, 0x45, 0x58, 0x3c, 0x00, 0x00, 0x00,
+    0x50, 0x00, 0x01, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x5f, 0x00, 0x00, 0x03,
+    0xf2, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x00, 0x00, 0x04,
+    0xf2, 0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x36, 0x00, 0x00, 0x05, 0xf2, 0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x46, 0x1e, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x01,
+};
+
+/* ps_5_0: samples Texture2D t0 with sampler s0 at UV = cb0[0].xy -> SV_Target0 */
+static const uint8_t kPsSampleTex2dCb0Dxbc[232] = {
+    0x44, 0x58, 0x42, 0x43, 0xcd, 0xed, 0x6c, 0x7f, 0xbe, 0x8e, 0x5f, 0x53,
+    0xd1, 0x0e, 0x5f, 0xd9, 0x1c, 0xd1, 0x10, 0x9e, 0x01, 0x00, 0x00, 0x00,
+    0xe8, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00,
+    0x3c, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x49, 0x53, 0x47, 0x4e,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x4f, 0x53, 0x47, 0x4e, 0x2c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x00, 0x00, 0x53, 0x56, 0x5f, 0x54, 0x61, 0x72, 0x67, 0x65,
+    0x74, 0x00, 0x00, 0x00, 0x53, 0x48, 0x45, 0x58, 0x70, 0x00, 0x00, 0x00,
+    0x50, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x6a, 0x08, 0x00, 0x01,
+    0x59, 0x00, 0x00, 0x04, 0x46, 0x8e, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x5a, 0x00, 0x00, 0x03, 0x00, 0x60, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x58, 0x18, 0x00, 0x04, 0x00, 0x70, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x55, 0x55, 0x00, 0x00, 0x65, 0x00, 0x00, 0x03,
+    0xf2, 0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x0a,
+    0xf2, 0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, 0x8e, 0x20, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, 0x7e, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x3e, 0x00, 0x00, 0x01,
+};
+
+#define CHECK_HR(hr, msg) do { \
+    HRESULT _h = (hr); \
+    if (FAILED(_h)) { \
+        fprintf(stderr, "FAIL: %s (hr=0x%08lx)\n", (msg), (unsigned long)_h); \
+        fflush(stderr); \
+        ExitProcess(1); \
+    } \
+} while (0)
+
+#define CHECK_COND(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL: %s\n", (msg)); \
+        fflush(stderr); \
+        ExitProcess(2); \
+    } \
+} while (0)
+
+int main(void) {
+    DXGI_SWAP_CHAIN_DESC scd;
+    memset(&scd, 0, sizeof(scd));
+    scd.BufferDesc.Width = 256;
+    scd.BufferDesc.Height = 256;
+    scd.BufferDesc.RefreshRate.Numerator = 60;
+    scd.BufferDesc.RefreshRate.Denominator = 1;
+    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.SampleDesc.Count = 1;
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.BufferCount = 2;
+    scd.OutputWindow = NULL;
+    scd.Windowed = TRUE;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+    IDXGISwapChain *sc = NULL;
+    ID3D11Device *dev = NULL;
+    ID3D11DeviceContext *ctx = NULL;
+    D3D_FEATURE_LEVEL fl = 0;
+    CHECK_HR(
+        D3D11CreateDeviceAndSwapChain(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
+            D3D11_SDK_VERSION, &scd, &sc, &dev, &fl, &ctx
+        ),
+        "D3D11CreateDeviceAndSwapChain"
+    );
+
+    ID3D11Texture2D *backbuf = NULL;
+    CHECK_HR(IDXGISwapChain_GetBuffer(sc, 0, &MY_IID_ID3D11Texture2D, (void **)&backbuf), "GetBuffer(0)");
+    ID3D11RenderTargetView *rtv = NULL;
+    CHECK_HR(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)backbuf, NULL, &rtv), "CreateRTV");
+
+    D3D11_TEXTURE2D_DESC stg_desc;
+    memset(&stg_desc, 0, sizeof(stg_desc));
+    stg_desc.Width = 256;
+    stg_desc.Height = 256;
+    stg_desc.MipLevels = 1;
+    stg_desc.ArraySize = 1;
+    stg_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    stg_desc.SampleDesc.Count = 1;
+    stg_desc.Usage = D3D11_USAGE_STAGING;
+    stg_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D *staging = NULL;
+    CHECK_HR(ID3D11Device_CreateTexture2D(dev, &stg_desc, NULL, &staging), "CreateTexture2D(staging)");
+
+    /* 2x2 RGBA8 immutable SRV texture: (0,0)=Red, (1,0)=Green, (0,1)=Blue, (1,1)=Cyan */
+    static const uint32_t kTexPixels[4] = {
+        0xFF0000FFu, 0xFF00FF00u,
+        0xFFFF0000u, 0xFFFFFF00u,
+    };
+    D3D11_TEXTURE2D_DESC tex_desc;
+    memset(&tex_desc, 0, sizeof(tex_desc));
+    tex_desc.Width = 2;
+    tex_desc.Height = 2;
+    tex_desc.MipLevels = 1;
+    tex_desc.ArraySize = 1;
+    tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    tex_desc.SampleDesc.Count = 1;
+    tex_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA tex_init = {kTexPixels, 8, 16};
+    ID3D11Texture2D *srv_tex = NULL;
+    CHECK_HR(ID3D11Device_CreateTexture2D(dev, &tex_desc, &tex_init, &srv_tex), "CreateTexture2D(srv)");
+    ID3D11ShaderResourceView *srv = NULL;
+    CHECK_HR(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)srv_tex, NULL, &srv), "CreateSRV");
+
+    D3D11_SAMPLER_DESC samp_desc;
+    memset(&samp_desc, 0, sizeof(samp_desc));
+    samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    samp_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    samp_desc.MaxLOD = 3.402823466e+38f;
+    ID3D11SamplerState *samp = NULL;
+    CHECK_HR(ID3D11Device_CreateSamplerState(dev, &samp_desc, &samp), "CreateSamplerState");
+
+    D3D11_RASTERIZER_DESC rs_desc;
+    memset(&rs_desc, 0, sizeof(rs_desc));
+    rs_desc.FillMode = D3D11_FILL_SOLID;
+    rs_desc.CullMode = D3D11_CULL_NONE;
+    rs_desc.DepthClipEnable = TRUE;
+    ID3D11RasterizerState *rs = NULL;
+    CHECK_HR(ID3D11Device_CreateRasterizerState(dev, &rs_desc, &rs), "CreateRasterizerState");
+
+    ID3D11VertexShader *vs = NULL;
+    ID3D11PixelShader *ps = NULL;
+    CHECK_HR(ID3D11Device_CreateVertexShader(dev, kVsPassthroughDxbc, sizeof(kVsPassthroughDxbc), NULL, &vs), "CreateVS");
+    CHECK_HR(ID3D11Device_CreatePixelShader(dev, kPsSampleTex2dCb0Dxbc, sizeof(kPsSampleTex2dCb0Dxbc), NULL, &ps), "CreatePS");
+
+    D3D11_INPUT_ELEMENT_DESC ied;
+    memset(&ied, 0, sizeof(ied));
+    ied.SemanticName = "POSITION";
+    ied.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    ID3D11InputLayout *il = NULL;
+    CHECK_HR(ID3D11Device_CreateInputLayout(dev, &ied, 1, kVsPassthroughDxbc, sizeof(kVsPassthroughDxbc), &il), "CreateIL");
+
+    static const float kQuad[6][4] = {
+        {-0.5f, -0.5f, 0.25f, 1.0f}, {-0.5f,  0.5f, 0.25f, 1.0f}, { 0.5f,  0.5f, 0.25f, 1.0f},
+        {-0.5f, -0.5f, 0.25f, 1.0f}, { 0.5f,  0.5f, 0.25f, 1.0f}, { 0.5f, -0.5f, 0.25f, 1.0f},
+    };
+    D3D11_BUFFER_DESC vb_desc;
+    memset(&vb_desc, 0, sizeof(vb_desc));
+    vb_desc.ByteWidth = sizeof(kQuad);
+    vb_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    vb_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA vb_init = {kQuad, sizeof(kQuad), sizeof(kQuad)};
+    ID3D11Buffer *vb = NULL;
+    CHECK_HR(ID3D11Device_CreateBuffer(dev, &vb_desc, &vb_init, &vb), "CreateBuffer(VB)");
+
+    D3D11_BUFFER_DESC cb_desc;
+    memset(&cb_desc, 0, sizeof(cb_desc));
+    cb_desc.ByteWidth = 16;
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ID3D11Buffer *dyn_cb = NULL;
+    CHECK_HR(ID3D11Device_CreateBuffer(dev, &cb_desc, NULL, &dyn_cb), "CreateBuffer(dyn CB)");
+
+    const float clear_black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const float uvs[4][4] = {
+        {0.25f, 0.25f, 0.0f, 0.0f}, /* Red */
+        {0.75f, 0.25f, 0.0f, 0.0f}, /* Green */
+        {0.25f, 0.75f, 0.0f, 0.0f}, /* Blue */
+        {0.75f, 0.75f, 0.0f, 0.0f}, /* Cyan */
+    };
+    UINT stride = 16, offset = 0;
+    D3D11_VIEWPORT vp = {0.0f, 0.0f, 256.0f, 256.0f, 0.0f, 1.0f};
+
+    LARGE_INTEGER freq, t0, t1, t2;
+    QueryPerformanceFrequency(&freq);
+
+    /* Frame 0: warmup (4 draws); Frames 1..3: 4096 draws each with Map(WRITE_DISCARD) per draw */
+    for (int frame = 0; frame < 4; ++frame) {
+        int ndraws = (frame == 0) ? 4 : 4096;
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, clear_black);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+        ID3D11DeviceContext_RSSetState(ctx, rs);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+        ID3D11DeviceContext_IASetInputLayout(ctx, il);
+        ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vb, &stride, &offset);
+        ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &srv);
+        ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &samp);
+        ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &dyn_cb);
+
+        QueryPerformanceCounter(&t0);
+        for (int i = 0; i < ndraws; ++i) {
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            CHECK_HR(
+                ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)dyn_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped),
+                "Map(dyn_cb WRITE_DISCARD)"
+            );
+            int idx = (i == ndraws - 1) ? 3 : (i % 3);
+            memcpy(mapped.pData, uvs[idx], 16);
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)dyn_cb, 0);
+            ID3D11DeviceContext_Draw(ctx, 6, 0);
+        }
+        QueryPerformanceCounter(&t1);
+
+        if (frame == 3) {
+            ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)backbuf);
+            D3D11_MAPPED_SUBRESOURCE rb;
+            memset(&rb, 0, sizeof(rb));
+            CHECK_HR(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &rb), "Map(staging)");
+            const uint8_t *px = (const uint8_t *)rb.pData + (size_t)128 * rb.RowPitch + (size_t)128 * 4;
+            uint8_t r = px[0], g = px[1], b = px[2], a = px[3];
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+            printf("D3D11_STRESS: center=(%u,%u,%u,%u)\n", r, g, b, a);
+            CHECK_COND(r == 0 && g == 255 && b == 255 && a == 255, "final draw #4095 must render Cyan (0,255,255,255)");
+        }
+
+        HRESULT phr = IDXGISwapChain_Present(sc, 0, 0);
+        CHECK_COND(phr == S_OK || phr == DXGI_STATUS_OCCLUDED, "Present");
+        QueryPerformanceCounter(&t2);
+
+        if (frame > 0) {
+            double draw_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+            double total_ms = (double)(t2.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+            double dpm = (draw_ms > 0.0) ? ((double)ndraws / draw_ms) : 0.0;
+            printf("D3D11_STRESS: frame=%d draws=%d draw_ms=%.2f total_ms=%.2f draws_per_ms=%.2f\n",
+                   frame, ndraws, draw_ms, total_ms, dpm);
+            fflush(stdout);
+        }
+    }
+
+    ID3D11DeviceContext_ClearState(ctx);
+    ID3D11DeviceContext_Flush(ctx);
+    ID3D11Buffer_Release(dyn_cb);
+    ID3D11Buffer_Release(vb);
+    ID3D11InputLayout_Release(il);
+    ID3D11PixelShader_Release(ps);
+    ID3D11VertexShader_Release(vs);
+    ID3D11RasterizerState_Release(rs);
+    ID3D11SamplerState_Release(samp);
+    ID3D11ShaderResourceView_Release(srv);
+    ID3D11Texture2D_Release(srv_tex);
+    ID3D11Texture2D_Release(staging);
+    ID3D11RenderTargetView_Release(rtv);
+    ID3D11Texture2D_Release(backbuf);
+    IDXGISwapChain_Release(sc);
+    ID3D11DeviceContext_Release(ctx);
+    ID3D11Device_Release(dev);
+
+    printf("D3D11_STRESS: PASS\n");
+    fflush(stdout);
+    ExitProcess(0);
+    return 0;
+}
+"##;
 
 const GUEST_C_SOURCE: &str = r##"
 #define COBJMACROS

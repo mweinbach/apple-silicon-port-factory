@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use super::builder::{
-    build_image_with_threads, read_profile, WorkerCaches, PARALLEL_MIN_BLOCKS,
+    build_image_with_threads_qos, collect_module_roots, read_profile, WorkerCaches,
+    PARALLEL_MIN_BLOCKS,
 };
-use super::cfg_discover::discover;
+use super::cfg_discover::discover_with_threads_qos;
 use super::format::{
     cache_file, encode, image_hash, profile_file, write_atomic, AotKey, BUILD_VBASE,
     FLAG_VERIFY_PENDING,
@@ -271,11 +272,11 @@ pub(super) fn sweep_start() {
 /// installed into this process (no valid cache was loaded) or only written for the next run
 /// (the loaded cache's profile grew).
 pub(super) struct BgJob {
-    name: String,
-    base: usize,
-    size: usize,
-    key: AotKey,
-    install: bool,
+    pub(super) name: String,
+    pub(super) base: usize,
+    pub(super) size: usize,
+    pub(super) key: AotKey,
+    pub(super) install: bool,
 }
 
 /// Pending jobs and whether the builder thread is running (both under this lock).
@@ -390,15 +391,16 @@ fn bg_main() {
             set_qos(want);
             qos = want;
         }
-        unsafe { bg_build(&mut pool, job) };
+        unsafe { bg_build(&mut pool, job, want) };
     }
 }
 
-/// Build `job`'s module from its profile on this (background) thread using a conservative
-/// thread pool (`bg_threads()`); discard the result if the image's code changed since
-/// activation; write the cache (flagged for verification at its first load,
+/// Build `job`'s module from the union of static PE roots, runtime-replayed callback roots,
+/// and recorded profile roots on this (background) thread using a conservative thread pool
+/// (`bg_threads()`) whose workers all run at `qos`; discard the result if the image's code
+/// changed since activation; write the cache (flagged for verification at its first load,
 /// [`FLAG_VERIFY_PENDING`]); install it if requested.
-unsafe fn bg_build(pool: &mut WorkerCaches, job: BgJob) {
+pub(super) unsafe fn bg_build(pool: &mut WorkerCaches, job: BgJob, qos: u32) {
     let BgJob { name, base, size, key, install } = job;
     if crate::emu::mem::jit_overlaps(base, base.wrapping_add(size)) {
         log::info!(
@@ -407,24 +409,25 @@ unsafe fn bg_build(pool: &mut WorkerCaches, job: BgJob) {
         return;
     }
     let t0 = std::time::Instant::now();
-    let mut prof = read_profile(&name, &key.image_hash);
-    let replayed = super::callbacks::load_replayed_callback_roots(&name, base, size);
-    if !replayed.is_empty() {
-        prof.extend(replayed.into_iter().map(|c| c.rva));
-        prof.sort_unstable();
-        prof.dedup();
+    let mr = collect_module_roots(&name, base, size, &key.image_hash, 0);
+    if mr.roots.is_empty() {
+        log::info!("emu aot: {name}: no executable code roots found; skipping background AOT build");
+        return;
     }
     let depth = aot_closure_depth();
-    let bcp = pool.get_one();
-    let (ips, _) = discover(bcp, base, size, &prof, depth);
+    let threads = bg_threads();
+    let (ips, _) =
+        discover_with_threads_qos(pool, base, size, &mr.roots, depth, threads, Some(qos));
     if crate::emu::mem::jit_overlaps(base, base.wrapping_add(size)) {
         log::info!(
             "emu aot: {name}: became run-time modified during discovery; aborting background AOT build"
         );
         return;
     }
-    let build_threads = if ips.len() >= PARALLEL_MIN_BLOCKS { bg_threads() } else { 1 };
-    let Some(img) = build_image_with_threads(pool, &ips, BUILD_VBASE, build_threads) else {
+    let build_threads = if ips.len() >= PARALLEL_MIN_BLOCKS { threads } else { 1 };
+    let Some(img) =
+        build_image_with_threads_qos(pool, &ips, BUILD_VBASE, build_threads, Some(qos))
+    else {
         log::error!("emu aot: {name}: shared stubs don't fit; not built");
         return;
     };
@@ -444,9 +447,12 @@ unsafe fn bg_build(pool: &mut WorkerCaches, job: BgJob) {
         Err(e) => log::error!("emu aot: {name}: writing {}: {e}", path.display()),
     }
     log::info!(
-        "emu aot: {name}: background build: {} blocks ({} profiled, {} candidates), {} KiB code in {build_s:.2}s -> {}{}{}",
+        "emu aot: {name}: background build: {} blocks ({} roots: {} static, {} callbacks, {} profiled; {} candidates), {} KiB code in {build_s:.2}s -> {}{}{}",
         img.blocks.len(),
-        prof.len(),
+        mr.roots.len(),
+        mr.static_count,
+        mr.replayed_count,
+        mr.prof_count,
         ips.len(),
         img.code_bytes() >> 10,
         path.display(),
@@ -485,9 +491,12 @@ fn profile_add(ip: u64) {
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
         win32_rt::process::register_exit_hook(profile_dump);
-        let _ = std::thread::Builder::new().name("port-jit-profile".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            profile_dump();
+        let _ = std::thread::Builder::new().name("port-jit-profile".into()).spawn(|| {
+            set_qos(QOS_CLASS_BACKGROUND);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                profile_dump();
+            }
         });
     });
     if let Ok(mut p) = PROFILE.lock() {

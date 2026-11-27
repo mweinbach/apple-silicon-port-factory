@@ -4648,6 +4648,20 @@ fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
         let queue = Queue::new(ListType::Direct, "pred_tess_q").expect("queue");
         let alloc = CommandAllocator::new(ListType::Direct).expect("alloc");
         let mut cl = CommandList::new(ListType::Direct).expect("cl");
+        let res_heap = d3d12_metal::metal::descriptor::DescriptorHeap::new(
+            d3d12_metal::metal::descriptor::heap_kind::CBV_SRV_UAV,
+            16,
+            true,
+            "pred_tess_res_heap",
+        )
+        .expect("res_heap");
+        let samp_heap = d3d12_metal::metal::descriptor::DescriptorHeap::new(
+            d3d12_metal::metal::descriptor::heap_kind::SAMPLER,
+            16,
+            true,
+            "pred_tess_samp_heap",
+        )
+        .expect("samp_heap");
 
         let mk_buf = |bytes: &[u8], hp_ty: u32, name: &str| -> MtlResource {
             let rd = ResourceDesc {
@@ -4737,6 +4751,7 @@ fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
         for (label, indirect, indexed, pred_va, pred_op, expected) in cases {
             alloc.reset();
             cl.begin(&alloc).expect("begin");
+            cl.set_descriptor_heaps(res_heap.gpu_base, samp_heap.gpu_base);
             unsafe { cl.clear_rtv(&tv, [0.0; 4], &[]).expect("clear") };
             cl.set_render_targets(vec![tv], None);
             cl.set_graphics_pipeline(pso.clone());
@@ -4878,5 +4893,425 @@ fn metal41_set_resource_min_lod_propagates_to_srv_hardware_view() {
         com_release(tex);
         com_release(ctx);
         com_release(dev);
+    }
+}
+
+#[test]
+fn df_plain_registration_audit_and_pso_key_compactness() {
+    // GraphicsPsoKey must stay compact (single 64-byte cache line, down from 544B).
+    assert!(
+        std::mem::size_of::<state::GraphicsPsoKey>() <= 64,
+        "GraphicsPsoKey bloated to {} bytes",
+        std::mem::size_of::<state::GraphicsPsoKey>()
+    );
+
+    let plain: std::collections::HashSet<usize> = crate::plain_builtin_fns().iter().copied().collect();
+
+    // Hot Win32 runtime builtins added to DF_PLAIN.
+    for (name, addr) in [
+        ("FlsGetValue", crate::kernel32::threads::FlsGetValue as *const () as usize),
+        ("FlsSetValue", crate::kernel32::threads::FlsSetValue as *const () as usize),
+        ("HeapAlloc", crate::kernel32::memory::HeapAlloc as *const () as usize),
+        ("HeapFree", crate::kernel32::memory::HeapFree as *const () as usize),
+        ("_Mtx_lock", crate::misc::msvcp140::_Mtx_lock as *const () as usize),
+        ("InterlockedPopEntrySList", crate::sync::InterlockedPopEntrySList as *const () as usize),
+    ] {
+        assert!(plain.contains(&addr), "{name} missing from plain_builtin_fns()");
+    }
+
+    // Verify D3D11 immediate context vtable slots against DF_PLAIN allow/deny rules.
+    let vtbl = <context::D3d11Context as crate::d3d12::com::ComClass>::class().vtbl;
+    let slot_addr = |idx: usize| unsafe { *(vtbl.add(idx)) };
+
+    // Strictly callback-free, integer-only <= 8-arg hot context methods MUST be DF_PLAIN.
+    for (name, idx) in [
+        ("DrawIndexed", 12),
+        ("Draw", 13),
+        ("Map", 14),
+        ("Unmap", 15),
+        ("DrawIndexedInstanced", 20),
+        ("DrawInstanced", 21),
+        ("IASetPrimitiveTopology", 24),
+        ("DrawIndexedInstancedIndirect", 39),
+        ("DrawInstancedIndirect", 40),
+        ("Dispatch", 41),
+        ("DispatchIndirect", 42),
+        ("RSSetViewports", 44),
+        ("RSSetScissorRects", 45),
+        ("CopyResource", 47),
+        ("UpdateSubresource", 48),
+        ("Flush", 111),
+        ("UpdateSubresource1", 116),
+    ] {
+        assert!(
+            plain.contains(&slot_addr(idx)),
+            "ID3D11DeviceContext::{name} (slot {idx}) missing from plain_builtin_fns()"
+        );
+    }
+
+    // Float-arg / float-ret / >8-arg AND COM-release/AddRef callback-capable methods MUST
+    // stay excluded from DF_PLAIN.
+    for (name, idx) in [
+        ("VSSetConstantBuffers", 7),
+        ("PSSetShaderResources", 8),
+        ("PSSetShader", 9),
+        ("PSSetSamplers", 10),
+        ("VSSetShader", 11),
+        ("IASetInputLayout", 17),
+        ("IASetVertexBuffers", 18),
+        ("IASetIndexBuffer", 19),
+        ("OMSetRenderTargets", 33),
+        ("OMSetRenderTargetsAndUnorderedAccessViews", 34),
+        ("OMSetBlendState", 35),
+        ("OMSetDepthStencilState", 36),
+        ("RSSetState", 43),
+        ("CopySubresourceRegion", 46),
+        ("ClearRenderTargetView", 50),
+        ("ClearUnorderedAccessViewFloat", 52),
+        ("ClearDepthStencilView", 53),
+        ("SetResourceMinLOD", 55),
+        ("GetResourceMinLOD", 56),
+        ("ExecuteCommandList", 58),
+        ("ClearState", 110),
+        ("FinishCommandList", 114),
+        ("CopySubresourceRegion1", 115),
+        ("SwapDeviceContextState", 131),
+        ("ClearView", 132),
+    ] {
+        assert!(
+            !plain.contains(&slot_addr(idx)),
+            "ID3D11DeviceContext::{name} (slot {idx}) must NOT be in plain_builtin_fns()"
+        );
+    }
+}
+
+#[test]
+fn hot_path_pso_reuse_dynamic_pool_and_frame_stats_on_metal() {
+    if d3d12_metal::metal::device().is_none() || !dxil_metal::converter_available() || !dxil_metal::dxilconv::available() {
+        return;
+    }
+    unsafe {
+        let mut dev: *mut c_void = std::ptr::null_mut();
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            D3D11CreateDevice(
+                std::ptr::null_mut(),
+                driver_type::HARDWARE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                0,
+                D3D11_SDK_VERSION,
+                &mut dev,
+                std::ptr::null_mut(),
+                &mut ctx,
+            ),
+            S_OK
+        );
+
+        let create_buf: unsafe extern "win64" fn(*mut c_void, *const D3D11_BUFFER_DESC, *const D3D11_SUBRESOURCE_DATA, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 3));
+        let create_tex2d: unsafe extern "win64" fn(*mut c_void, *const D3D11_TEXTURE2D_DESC, *const D3D11_SUBRESOURCE_DATA, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 5));
+        let create_rtv: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const D3D11_RENDER_TARGET_VIEW_DESC, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 9));
+        let create_il: unsafe extern "win64" fn(*mut c_void, *const D3D11_INPUT_ELEMENT_DESC, u32, *const c_void, usize, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 11));
+        let create_vs: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 12));
+        let create_ps: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 15));
+        let create_blend: unsafe extern "win64" fn(*mut c_void, *const D3D11_BLEND_DESC, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 20));
+        let create_ds: unsafe extern "win64" fn(*mut c_void, *const D3D11_DEPTH_STENCIL_DESC, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 21));
+        let create_rast: unsafe extern "win64" fn(*mut c_void, *const D3D11_RASTERIZER_DESC, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 22));
+
+        let ps_set_shader: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 9));
+        let vs_set_shader: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 11));
+        let draw: unsafe extern "win64" fn(*mut c_void, u32, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 13));
+        let map_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut D3D11_MAPPED_SUBRESOURCE) -> HRESULT =
+            std::mem::transmute(vtbl_slot(ctx, 14));
+        let unmap_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 15));
+        let ps_set_cbs: unsafe extern "win64" fn(*mut c_void, u32, u32, *const *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 16));
+        let ia_set_il: unsafe extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 17));
+        let ia_set_vbs: unsafe extern "win64" fn(*mut c_void, u32, u32, *const *mut c_void, *const u32, *const u32) =
+            std::mem::transmute(vtbl_slot(ctx, 18));
+        let ia_set_topo: unsafe extern "win64" fn(*mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 24));
+        let om_set_rts: unsafe extern "win64" fn(*mut c_void, u32, *const *mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 33));
+        let om_set_blend: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const [f32; 4], u32) =
+            std::mem::transmute(vtbl_slot(ctx, 35));
+        let om_set_ds: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 36));
+        let rs_set_state: unsafe extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 43));
+        let rs_set_vps: unsafe extern "win64" fn(*mut c_void, u32, *const D3D11_VIEWPORT) =
+            std::mem::transmute(vtbl_slot(ctx, 44));
+        let copy_res: unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 47));
+        let flush_fn: unsafe extern "win64" fn(*mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 111));
+
+        // 1. Verify PSO key excludes ScissorEnable, BlendFactor, StencilRef, and DS when no DSV is bound.
+        let rt_desc = D3D11_TEXTURE2D_DESC {
+            Width: 8,
+            Height: 8,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: usage::DEFAULT,
+            BindFlags: bind_flag::RENDER_TARGET,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut rt = std::ptr::null_mut();
+        assert_eq!(create_tex2d(dev, &rt_desc, std::ptr::null(), &mut rt), S_OK);
+        let mut rtv = std::ptr::null_mut();
+        assert_eq!(create_rtv(dev, rt, std::ptr::null(), &mut rtv), S_OK);
+
+        let vs_dxbc = sm5_vs_passthrough();
+        let ps_dxbc = sm5_ps_cb0_color();
+        let mut vs = std::ptr::null_mut();
+        let mut ps = std::ptr::null_mut();
+        assert_eq!(create_vs(dev, vs_dxbc.as_ptr() as *const c_void, vs_dxbc.len(), std::ptr::null_mut(), &mut vs), S_OK);
+        assert_eq!(create_ps(dev, ps_dxbc.as_ptr() as *const c_void, ps_dxbc.len(), std::ptr::null_mut(), &mut ps), S_OK);
+
+        let sem = b"POSITION\0";
+        let ied = D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: sem.as_ptr(),
+            SemanticIndex: 0,
+            Format: 2, // R32G32B32A32_FLOAT
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: 0,
+            InstanceDataStepRate: 0,
+        };
+        let mut il = std::ptr::null_mut();
+        assert_eq!(create_il(dev, &ied, 1, vs_dxbc.as_ptr() as *const c_void, vs_dxbc.len(), &mut il), S_OK);
+
+        let verts: [[f32; 4]; 3] = [[-1.0, -1.0, 0.0, 1.0], [-1.0, 3.0, 0.0, 1.0], [3.0, -1.0, 0.0, 1.0]];
+        let vb_desc = D3D11_BUFFER_DESC {
+            ByteWidth: 48,
+            Usage: usage::DEFAULT,
+            BindFlags: bind_flag::VERTEX_BUFFER,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let vb_init = D3D11_SUBRESOURCE_DATA { pSysMem: verts.as_ptr() as *const c_void, SysMemPitch: 0, SysMemSlicePitch: 0 };
+        let mut vb = std::ptr::null_mut();
+        assert_eq!(create_buf(dev, &vb_desc, &vb_init, &mut vb), S_OK);
+
+        let mut rast_a_desc = D3D11_RASTERIZER_DESC::default_d3d11();
+        rast_a_desc.ScissorEnable = 0;
+        let mut rast_b_desc = rast_a_desc;
+        rast_b_desc.ScissorEnable = 1;
+        let mut rast_a = std::ptr::null_mut();
+        let mut rast_b = std::ptr::null_mut();
+        assert_eq!(create_rast(dev, &rast_a_desc, &mut rast_a), S_OK);
+        assert_eq!(create_rast(dev, &rast_b_desc, &mut rast_b), S_OK);
+
+        let mut ds_a_desc = D3D11_DEPTH_STENCIL_DESC::default_d3d11();
+        ds_a_desc.DepthEnable = 1;
+        let mut ds_b_desc = ds_a_desc;
+        ds_b_desc.DepthEnable = 0;
+        let mut ds_a = std::ptr::null_mut();
+        let mut ds_b = std::ptr::null_mut();
+        assert_eq!(create_ds(dev, &ds_a_desc, &mut ds_a), S_OK);
+        assert_eq!(create_ds(dev, &ds_b_desc, &mut ds_b), S_OK);
+
+        let blend_desc = D3D11_BLEND_DESC::default_d3d11();
+        let mut blend = std::ptr::null_mut();
+        assert_eq!(create_blend(dev, &blend_desc, &mut blend), S_OK);
+
+        let cb_desc = D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            Usage: usage::DYNAMIC,
+            BindFlags: bind_flag::CONSTANT_BUFFER,
+            CPUAccessFlags: cpu_access::WRITE,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let mut cb = std::ptr::null_mut();
+        assert_eq!(create_buf(dev, &cb_desc, std::ptr::null(), &mut cb), S_OK);
+
+        om_set_rts(ctx, 1, &rtv, std::ptr::null_mut());
+        let vp = D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: 8.0, Height: 8.0, MinDepth: 0.0, MaxDepth: 1.0 };
+        rs_set_vps(ctx, 1, &vp);
+        ia_set_il(ctx, il);
+        let stride = 16u32;
+        let offset = 0u32;
+        ia_set_vbs(ctx, 0, 1, &vb, &stride, &offset);
+        ia_set_topo(ctx, topology::TRIANGLELIST);
+        vs_set_shader(ctx, vs, std::ptr::null(), 0);
+        ps_set_shader(ctx, ps, std::ptr::null(), 0);
+        ps_set_cbs(ctx, 0, 1, &cb);
+
+        let dev_core = (*crate::d3d12::com::Obj::<device::D3d11Device>::from_iface(dev).unwrap()).inner.core.clone();
+        let _ = dev_core.take_frame_stats();
+
+        // Issue 256 draws toggling ScissorEnable, BlendFactor, StencilRef, and DS state (no DSV bound)
+        // plus Map(WRITE_DISCARD) on the ring-backed dynamic CB every draw.
+        for i in 0..256u32 {
+            rs_set_state(ctx, if i & 1 == 0 { rast_a } else { rast_b });
+            let bf = [0.25 * (i & 3) as f32, 0.5, 0.75, 1.0];
+            om_set_blend(ctx, blend, &bf, u32::MAX);
+            om_set_ds(ctx, if i & 1 == 0 { ds_a } else { ds_b }, i & 0xFF);
+            let mut m = D3D11_MAPPED_SUBRESOURCE { pData: std::ptr::null_mut(), RowPitch: 0, DepthPitch: 0 };
+            assert_eq!(map_fn(ctx, cb, 0, map_type::WRITE_DISCARD, 0, &mut m), S_OK);
+            let color: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+            std::ptr::copy_nonoverlapping(color.as_ptr() as *const u8, m.pData as *mut u8, 16);
+            unmap_fn(ctx, cb, 0);
+            draw(ctx, 3, 0);
+        }
+        flush_fn(ctx);
+        let stats = dev_core.take_frame_stats();
+        assert_eq!(stats.draws, 256);
+        assert_eq!(stats.flushes, 1);
+        assert_eq!(stats.mid_frame_flushes, 0);
+        assert_eq!(stats.mid_frame_stalls, 0);
+        assert_eq!(stats.samp_slots, 0, "PS with no samplers must allocate 0 sampler slots");
+        assert_eq!(stats.res_slots, 256, "PS with only cb0 must allocate 1 resource slot per draw");
+        assert_eq!(
+            dev_core.gfx_psos.lock().unwrap().len(),
+            1,
+            "ScissorEnable, BlendFactor, StencilRef, and DSV-less DepthStencilState must share 1 PSO"
+        );
+
+        // 2. Verify pooled dynamic buffer (> 64 KiB) Map(WRITE_DISCARD) + CopyResource readback.
+        let big_len = 96 * 1024u32;
+        let big_dyn_desc = D3D11_BUFFER_DESC {
+            ByteWidth: big_len,
+            Usage: usage::DYNAMIC,
+            BindFlags: bind_flag::VERTEX_BUFFER,
+            CPUAccessFlags: cpu_access::WRITE,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let big_stg_desc = D3D11_BUFFER_DESC {
+            ByteWidth: big_len,
+            Usage: usage::STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: cpu_access::READ,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let mut big_dyn = std::ptr::null_mut();
+        let mut big_stg = std::ptr::null_mut();
+        assert_eq!(create_buf(dev, &big_dyn_desc, std::ptr::null(), &mut big_dyn), S_OK);
+        assert_eq!(create_buf(dev, &big_stg_desc, std::ptr::null(), &mut big_stg), S_OK);
+        for iter in 0..4u32 {
+            let mut m = D3D11_MAPPED_SUBRESOURCE { pData: std::ptr::null_mut(), RowPitch: 0, DepthPitch: 0 };
+            assert_eq!(map_fn(ctx, big_dyn, 0, map_type::WRITE_DISCARD, 0, &mut m), S_OK);
+            let words = std::slice::from_raw_parts_mut(m.pData as *mut u32, (big_len / 4) as usize);
+            words[0] = 0x1234_0000 | iter;
+            words[words.len() - 1] = 0xABCD_0000 | iter;
+            unmap_fn(ctx, big_dyn, 0);
+            copy_res(ctx, big_stg, big_dyn);
+            let mut rb = D3D11_MAPPED_SUBRESOURCE { pData: std::ptr::null_mut(), RowPitch: 0, DepthPitch: 0 };
+            assert_eq!(map_fn(ctx, big_stg, 0, map_type::READ, 0, &mut rb), S_OK);
+            let got = std::slice::from_raw_parts(rb.pData as *const u32, (big_len / 4) as usize);
+            assert_eq!(got[0], 0x1234_0000 | iter);
+            assert_eq!(got[got.len() - 1], 0xABCD_0000 | iter);
+            unmap_fn(ctx, big_stg, 0);
+        }
+
+        com_release(big_stg);
+        com_release(big_dyn);
+        com_release(cb);
+        com_release(vb);
+        com_release(il);
+        com_release(blend);
+        com_release(ds_b);
+        com_release(ds_a);
+        com_release(rast_b);
+        com_release(rast_a);
+        com_release(ps);
+        com_release(vs);
+        com_release(rtv);
+        com_release(rt);
+        com_release(ctx);
+        com_release(dev);
+    }
+}
+
+#[test]
+fn shared_resource_min_lod_invalidates_importing_device_desc_version() {
+    if d3d12_metal::metal::device().is_none() {
+        return;
+    }
+    unsafe {
+        let mut dev_a = std::ptr::null_mut();
+        let mut ctx_a = std::ptr::null_mut();
+        let mut dev_b = std::ptr::null_mut();
+        let mut ctx_b = std::ptr::null_mut();
+        assert_eq!(
+            D3D11CreateDevice(std::ptr::null_mut(), driver_type::HARDWARE, std::ptr::null_mut(), 0, std::ptr::null(), 0, D3D11_SDK_VERSION, &mut dev_a, std::ptr::null_mut(), &mut ctx_a),
+            S_OK
+        );
+        assert_eq!(
+            D3D11CreateDevice(std::ptr::null_mut(), driver_type::HARDWARE, std::ptr::null_mut(), 0, std::ptr::null(), 0, D3D11_SDK_VERSION, &mut dev_b, std::ptr::null_mut(), &mut ctx_b),
+            S_OK
+        );
+
+        let create_tex2d: unsafe extern "win64" fn(*mut c_void, *const D3D11_TEXTURE2D_DESC, *const D3D11_SUBRESOURCE_DATA, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev_a, 5));
+        let open_shared_b: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const crate::d3d12::com::Guid, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev_b, 28));
+
+        let td = D3D11_TEXTURE2D_DESC {
+            Width: 16,
+            Height: 16,
+            MipLevels: 4,
+            ArraySize: 1,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: usage::DEFAULT,
+            BindFlags: bind_flag::SHADER_RESOURCE,
+            CPUAccessFlags: 0,
+            MiscFlags: misc_flag::SHARED,
+        };
+        let mut tex_a = std::ptr::null_mut();
+        assert_eq!(create_tex2d(dev_a, &td, std::ptr::null(), &mut tex_a), S_OK);
+
+        let qi_fn: unsafe extern "win64" fn(*mut c_void, *const crate::d3d12::com::Guid, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(tex_a, 0));
+        let mut dxgi_res = std::ptr::null_mut();
+        assert_eq!(qi_fn(tex_a, &IID_IDXGIResource, &mut dxgi_res), S_OK);
+        let get_shared_handle: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dxgi_res, 8));
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(get_shared_handle(dxgi_res, &mut handle), S_OK);
+        assert!(!handle.is_null());
+
+        let mut tex_b = std::ptr::null_mut();
+        assert_eq!(open_shared_b(dev_b, handle, &IID_ID3D11Texture2D, &mut tex_b), S_OK);
+
+        let core_a = (*crate::d3d12::com::Obj::<device::D3d11Device>::from_iface(dev_a).unwrap()).inner.core.clone();
+        let core_b = (*crate::d3d12::com::Obj::<device::D3d11Device>::from_iface(dev_b).unwrap()).inner.core.clone();
+        let va0 = core_a.desc_resource_version();
+        let vb0 = core_b.desc_resource_version();
+
+        context::set_resource_min_lod(ctx_b as context::PCtx, tex_b, 1.5);
+        assert!(core_a.desc_resource_version() > va0, "owning device A desc_resource_version must bump");
+        assert!(core_b.desc_resource_version() > vb0, "importing device B desc_resource_version must bump");
+
+        com_release(tex_b);
+        com_release(dxgi_res);
+        com_release(tex_a);
+        com_release(ctx_b);
+        com_release(dev_b);
+        com_release(ctx_a);
+        com_release(dev_a);
     }
 }

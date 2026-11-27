@@ -310,7 +310,7 @@ impl Tr<'_> {
                         }
                         self.a.ldr(64, T0, XCPU, s);
                         self.a.ldr(64, T1, XCPU, s + 8);
-                        if mem::tso() && (chk != Chk::Stack || stack_tso()) {
+                        if self.vec_tso(k, chk, false) {
                             self.a.dmb_ishst();
                         }
                         self.a.str(64, T0, a, 0);
@@ -326,7 +326,7 @@ impl Tr<'_> {
                         self.a.ldr(64, T1, XCPU, s + 8);
                         self.a.ldr(64, T2, XCPU, sh);
                         self.a.ldr(64, T3, XCPU, sh + 8);
-                        if mem::tso() && (chk != Chk::Stack || stack_tso()) {
+                        if self.vec_tso(k, chk, false) {
                             self.a.dmb_ishst();
                         }
                         self.a.str(64, T0, a, 0);
@@ -576,7 +576,7 @@ impl Tr<'_> {
                 } else {
                     self.a.addsub_ri(false, dec, false, T2, T0, 1, false);
                 }
-                self.store_checked_addr(T2, addr, wb);
+                self.store_checked_addr(k, T2, addr, wb);
                 if need_pf {
                     self.a.str(8, T2, XCPU, OFF_PFV);
                 }
@@ -717,7 +717,7 @@ impl Tr<'_> {
                         }
                         self.a.ldr(64, T0, a, 0);
                         self.a.ldr(64, T1, a, 8);
-                        if mem::tso() && (chk != Chk::Stack || stack_tso()) {
+                        if self.vec_tso(k, chk, true) {
                             self.a.dmb_ishld();
                         }
                         self.a.str(64, T0, XCPU, OFF_XMM + d);
@@ -978,7 +978,7 @@ impl Tr<'_> {
                 self.wr_gpr(op.r0, w as u8, T2);
             }
             if mem_dst {
-                self.store_checked_addr(T2, addr, w);
+                self.store_checked_addr(k, T2, addr, w);
             }
             if need_pf {
                 self.a.str(8, T2, XCPU, OFF_PFV);
@@ -1054,7 +1054,7 @@ impl Tr<'_> {
             }
         }
         if mem_dst {
-            self.store_checked_addr(res, addr, w);
+            self.store_checked_addr(k, res, addr, w);
         }
         // AW2_JIT_FLAGLAZY: the parity byte may stay in the result register (`pf_defer`).
         let pf_mem = need_pf && !self.pf_defer(k, res, op.r0);

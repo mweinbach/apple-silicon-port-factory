@@ -288,5 +288,11 @@ pub unsafe extern "win64" fn D3D11On12CreateDevice(
     }
 }
 
+/// Pure-integer leaf D3D11 COM vtable methods (<= 8 integer args, no XMM args/ret,
+/// never re-enter guest code) eligible for `DF_PLAIN` direct calls from translated code.
+pub fn plain_com_fns() -> &'static [usize] {
+    context::plain_fns()
+}
+
 #[cfg(test)]
 mod tests;

@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use d3d12_metal::metal::pipeline::ComputePipeline;
+use d3d12_metal::metal::pipeline::{msc_used_resources, ComputePipeline, GraphicsPipeline};
 use d3d12_metal::metal::query::QueryHeap;
 use d3d12_metal::metal::resource::Resource as MtlResource;
 use d3d12_metal::metal::views;
@@ -156,11 +156,153 @@ pub fn build_compute_root_signature() -> Arc<RootSignature> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-stage reflected descriptor usage (sizes tables from MSC reflection)
+// ---------------------------------------------------------------------------
+
+/// Reflected descriptor slots accessed by one compiled shader stage within our
+/// canonical D3D11 root signatures (`[CBV b0..13, SRV t0..127, (UAV u0..7)]` +
+/// `[Sampler s0..15]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageUsage {
+    pub cbv_mask: u16,
+    pub srv_mask: u128,
+    pub uav_mask: u8,
+    pub samp_mask: u16,
+    pub res_table_len: u32,
+    pub samp_table_len: u32,
+}
+
+impl StageUsage {
+    pub const EMPTY: Self = Self {
+        cbv_mask: 0,
+        srv_mask: 0,
+        uav_mask: 0,
+        samp_mask: 0,
+        res_table_len: 0,
+        samp_table_len: 0,
+    };
+
+    pub fn full(max_res_len: u32, has_uavs: bool) -> Self {
+        Self {
+            cbv_mask: (1u16 << RS_CBV_COUNT) - 1,
+            srv_mask: u128::MAX,
+            uav_mask: if has_uavs { u8::MAX } else { 0 },
+            samp_mask: u16::MAX,
+            res_table_len: max_res_len,
+            samp_table_len: RS_SAMPLER_COUNT,
+        }
+    }
+
+    pub fn from_compiled_shader(
+        sh: &dxil_metal::CompiledShader,
+        res_param: u32,
+        samp_param: u32,
+        max_res_len: u32,
+        has_uavs: bool,
+    ) -> Self {
+        let Some(used) = msc_used_resources(sh.reflection.json.as_str()) else {
+            return Self::full(max_res_len, has_uavs);
+        };
+        let mut out = Self::EMPTY;
+        for u in used {
+            if !u.is_in_grs {
+                continue;
+            }
+            if u.binding_index == res_param {
+                if u.table_length == 0 {
+                    continue;
+                }
+                if u.table_start_index == u32::MAX || u.table_length == u32::MAX {
+                    out.cbv_mask = (1u16 << RS_CBV_COUNT) - 1;
+                    out.srv_mask = u128::MAX;
+                    out.uav_mask = if has_uavs { u8::MAX } else { 0 };
+                    out.res_table_len = max_res_len;
+                    continue;
+                }
+                let end = u.table_start_index.saturating_add(u.table_length).min(max_res_len);
+                out.res_table_len = out.res_table_len.max(end);
+                for idx in u.table_start_index..end {
+                    if idx < RS_CBV_COUNT {
+                        out.cbv_mask |= 1u16 << idx;
+                    } else if idx < RS_CBV_COUNT + RS_SRV_COUNT {
+                        out.srv_mask |= 1u128 << (idx - RS_CBV_COUNT);
+                    } else if has_uavs && idx < RS_CBV_COUNT + RS_SRV_COUNT + RS_UAV_COUNT {
+                        out.uav_mask |= 1u8 << (idx - RS_CBV_COUNT - RS_SRV_COUNT);
+                    }
+                }
+            } else if u.binding_index == samp_param {
+                if u.table_length == 0 {
+                    continue;
+                }
+                if u.table_start_index == u32::MAX || u.table_length == u32::MAX {
+                    out.samp_mask = u16::MAX;
+                    out.samp_table_len = RS_SAMPLER_COUNT;
+                    continue;
+                }
+                let end = u.table_start_index.saturating_add(u.table_length).min(RS_SAMPLER_COUNT);
+                out.samp_table_len = out.samp_table_len.max(end);
+                for idx in u.table_start_index..end {
+                    out.samp_mask |= 1u16 << idx;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GfxPsoUsage {
+    pub vs: StageUsage,
+    pub ps: StageUsage,
+    pub gs: StageUsage,
+    pub hs: StageUsage,
+    pub ds: StageUsage,
+}
+
+impl GfxPsoUsage {
+    pub fn from_pipeline(pso: &GraphicsPipeline) -> Self {
+        let vs = StageUsage::from_compiled_shader(&pso.vs, 0, 1, VS_RES_TABLE_LEN, false);
+        let ps = match &pso.ps {
+            Some(s) => StageUsage::from_compiled_shader(s, 2, 3, PS_RES_TABLE_LEN, true),
+            None => StageUsage::EMPTY,
+        };
+        let gs_sh = pso
+            .gs_emu
+            .as_ref()
+            .map(|g| &g.gs)
+            .or_else(|| pso.tess_emu.as_ref().and_then(|t| t.gs.as_ref()));
+        let gs = match gs_sh {
+            Some(s) => StageUsage::from_compiled_shader(s, 4, 5, GS_RES_TABLE_LEN, false),
+            None => StageUsage::EMPTY,
+        };
+        let (hs, ds) = match &pso.tess_emu {
+            Some(t) => (
+                StageUsage::from_compiled_shader(&t.hs, 6, 7, HS_RES_TABLE_LEN, false),
+                StageUsage::from_compiled_shader(&t.ds, 8, 9, DS_RES_TABLE_LEN, false),
+            ),
+            None => (StageUsage::EMPTY, StageUsage::EMPTY),
+        };
+        Self { vs, ps, gs, hs, ds }
+    }
+}
+
+pub struct CachedGfxPso {
+    pub pso: Arc<GraphicsPipeline>,
+    pub usage: GfxPsoUsage,
+}
+
+pub struct CachedComputePso {
+    pub pso: Arc<ComputePipeline>,
+    pub usage: StageUsage,
+}
+
+// ---------------------------------------------------------------------------
 // Shaders: VertexShader, PixelShader, ComputeShader (7 slots each)
 // ---------------------------------------------------------------------------
 
 pub struct ShaderBlob {
     pub device: Arc<DeviceCore>,
+    pub id: u32,
     pub bytecode: Vec<u8>,
     pub hash: u128,
 }
@@ -169,7 +311,7 @@ pub struct ComputeShaderInner {
     pub device: Arc<DeviceCore>,
     pub bytecode: Vec<u8>,
     pub hash: u128,
-    pso: OnceLock<Result<Arc<ComputePipeline>, String>>,
+    pso: OnceLock<Result<Arc<CachedComputePso>, String>>,
 }
 
 impl ComputeShaderInner {
@@ -186,15 +328,16 @@ impl ComputeShaderInner {
         s
     }
 
-    pub fn pipeline(&self) -> Result<Arc<ComputePipeline>, String> {
+    pub fn pipeline(&self) -> Result<Arc<CachedComputePso>, String> {
         self.pso
             .get_or_init(|| {
-                ComputePipeline::new(
+                let pso = Arc::new(ComputePipeline::new(
                     self.device.compute_rs.clone(),
                     &self.bytecode,
                     &format!("d3d11_cs_{:016x}", self.hash as u64),
-                )
-                .map(Arc::new)
+                )?);
+                let usage = StageUsage::from_compiled_shader(&pso.shader, 0, 1, CS_RES_TABLE_LEN, true);
+                Ok(Arc::new(CachedComputePso { pso, usage }))
             })
             .clone()
     }
@@ -341,6 +484,7 @@ impl ComClass for D3d11ComputeShader {
 
 pub struct InputLayoutInner {
     pub device: Arc<DeviceCore>,
+    pub id: u32,
     pub elements: Vec<InputElement>,
     pub hash: u128,
 }
@@ -376,6 +520,7 @@ impl ComClass for D3d11InputLayout {
 
 pub struct BlendStateInner {
     pub device: Arc<DeviceCore>,
+    pub id: u32,
     pub desc0: D3D11_BLEND_DESC,
     pub desc1: D3D11_BLEND_DESC1,
     pub d3d12: d3d12_metal::state::BlendDesc,
@@ -425,6 +570,8 @@ impl ComClass for D3d11BlendState {
 
 pub struct RasterizerStateInner {
     pub device: Arc<DeviceCore>,
+    /// Canonical non-scissor rasterizer state ID (`ScissorEnable` is dynamic via `set_scissors`).
+    pub id: u32,
     pub desc0: D3D11_RASTERIZER_DESC,
     pub desc1: D3D11_RASTERIZER_DESC1,
     pub scissor_enable: bool,
@@ -476,6 +623,8 @@ impl ComClass for D3d11RasterizerState {
 
 pub struct DepthStencilStateInner {
     pub device: Arc<DeviceCore>,
+    /// Canonical depth-stencil state ID (`StencilRef` is dynamic via `set_stencil_ref`).
+    pub id: u32,
     pub desc: D3D11_DEPTH_STENCIL_DESC,
     pub mtl: d3d12_metal::state::DepthStencilState,
 }
@@ -681,24 +830,67 @@ impl ComClass for D3d11CommandList {
 // Graphics PSO cache key
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// Compact integer-ID key for D3D11's `device.gfx_psos` cache.
+///
+/// Replaces the previous 544-byte key (which copied and hashed full 328-byte `BlendDesc`
+/// and 52-byte `DepthStencilDesc` structs plus six `u128` hashes per draw) with canonical
+/// per-device integer IDs:
+/// - `ScissorEnable`, `BlendFactor`, and `StencilRef` are dynamic encoder state and excluded.
+/// - `ds_id` is forced to `0` whenever `dsv_format == 0` (Metal ignores DS state with no DSV).
+/// - `raster_id` and `ds_id` (when `dsv_format != 0`) remain in the key because
+///   `d3d12_metal::CommandList::apply_dynamic` applies `p.raster` / `p.depth_stencil` from
+///   `GraphicsPipeline`, while `d3d12-metal`'s underlying `PipelineCache` shares the compiled
+///   `MTL4RenderPipelineState` across raster/DS variants.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GraphicsPsoKey {
-    pub vs_hash: u128,
-    pub hs_hash: u128,
-    pub ds_hash: u128,
-    pub gs_hash: u128,
-    pub ps_hash: u128,
-    pub il_hash: u128,
-    pub blend: d3d12_metal::state::BlendDesc,
+    pub vs_id: u32,
+    pub hs_id: u32,
+    pub ds_id: u32,
+    pub gs_id: u32,
+    pub ps_id: u32,
+    pub il_id: u32,
+    pub blend_id: u32,
     pub sample_mask: u32,
-    pub raster_hash: u64,
-    pub depth_stencil: d3d12_metal::state::DepthStencilDesc,
-    pub topology_type: u32,
-    pub strip_cut: u32,
-    pub rtv_formats: [u32; 8],
+    pub raster_id: u32,
+    pub ds_state_id: u32,
+    pub rtv_formats: [u16; 8],
+    pub dsv_format: u16,
+    pub topology_type: u8,
+    pub strip_cut: u8,
     pub num_rtvs: u8,
-    pub dsv_format: u32,
-    pub sample_count: u32,
+    pub sample_count: u8,
+}
+
+/// Exact non-scissor key for interning `ID3D11RasterizerState` objects into canonical IDs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RasterKey {
+    pub fill_mode: u32,
+    pub cull_mode: u32,
+    pub front_ccw: i32,
+    pub depth_bias: i32,
+    pub depth_bias_clamp_bits: u32,
+    pub slope_scaled_depth_bias_bits: u32,
+    pub depth_clip_enable: i32,
+    pub multisample_enable: i32,
+    pub antialiased_line_enable: i32,
+    pub forced_sample_count: u32,
+}
+
+impl RasterKey {
+    pub fn from_desc1(d: &D3D11_RASTERIZER_DESC1) -> Self {
+        Self {
+            fill_mode: d.FillMode,
+            cull_mode: d.CullMode,
+            front_ccw: d.FrontCounterClockwise,
+            depth_bias: d.DepthBias,
+            depth_bias_clamp_bits: d.DepthBiasClamp.to_bits(),
+            slope_scaled_depth_bias_bits: d.SlopeScaledDepthBias.to_bits(),
+            depth_clip_enable: d.DepthClipEnable,
+            multisample_enable: d.MultisampleEnable,
+            antialiased_line_enable: d.AntialiasedLineEnable,
+            forced_sample_count: d.ForcedSampleCount,
+        }
+    }
 }
 
 /// Hash a `D3D11_RASTERIZER_DESC1` deterministically for PSO cache keying.

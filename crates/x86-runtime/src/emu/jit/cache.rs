@@ -784,6 +784,11 @@ impl JitCache {
 
     /// Force zero-`MAP_JIT` `static_only` mode on this cache (unit tests).
     #[cfg(test)]
+    pub(in crate::emu) fn test_set_hot(&mut self, hot: u32) {
+        self.hot = hot;
+    }
+
+    #[cfg(test)]
     pub(in crate::emu) fn test_set_static_only(&mut self, v: bool) {
         self.test_forced_static = v;
         self.static_only = v;
@@ -1160,6 +1165,13 @@ impl JitCache {
                 }
                 return Some(code);
             }
+            if !mem::in_jit(to_mapped_addr(ip)) {
+                crate::emu::aot::profile_note(ip);
+                crate::emu::aot::record_runtime_callback(
+                    ip,
+                    crate::emu::aot::CallbackKind::GenericCallback,
+                );
+            }
             jset_insert(&mut self.index, None, JEnt { ip, fast: 0, gen: 0, hits: NOJIT, code: 0 }, JMeta::default());
             return None;
         }
@@ -1189,6 +1201,16 @@ impl JitCache {
         }
         if let Some(code) = self.install_aot(ip) {
             return Some(code);
+        }
+        // Record 1-shot cold image-block misses on their very first visit (not only blocks
+        // reaching `hits >= self.hot` and JIT tier-up), so cold `interp_fast` misses feed back
+        // into offline prewarm and background rebuilds for strict-AOT closure.
+        if !mem::in_jit(to_mapped_addr(ip)) {
+            crate::emu::aot::profile_note(ip);
+            crate::emu::aot::record_runtime_callback(
+                ip,
+                crate::emu::aot::CallbackKind::GenericCallback,
+            );
         }
         let b = jset_base(ip);
         let victim = if self.index[b].ip == 0 || (self.index[b].code == 0 && (self.index[b].fast & 1) == 0) {
@@ -2292,6 +2314,18 @@ pub(super) fn new_tr<'a>(
         rdtsc_slow: st.rdtsc_slow,
         rdtscp_slow: st.rdtscp_slow,
         target_host: p.target_host,
+        vol_meta: if mem::volatile_meta_enabled() && !ops.is_empty() {
+            let lo = to_mapped_addr(ops[0].ip);
+            let last = ops[ops.len() - 1];
+            let hi = to_mapped_addr(last.ip.wrapping_add(last.len as u64));
+            if mem::jit_overlaps(lo, hi) {
+                None
+            } else {
+                crate::emu::aot::lookup_module_for_ip(ops[0].ip)
+            }
+        } else {
+            None
+        },
         ras_miss: st.ras_miss,
         wr: p.wr,
         grp: [Grp::None; BLK_MAX_INSNS],
@@ -2340,6 +2374,40 @@ pub(super) fn new_tr<'a>(
         rlits,
         relocs,
     }
+}
+
+#[cfg(test)]
+pub(in crate::emu) unsafe fn test_translate_live_words(
+    ip: u64,
+    bc: *mut BlockCache,
+) -> Option<Vec<u32>> {
+    let p = prep_block(bc, ip)?;
+    let stubs = StubAddrs {
+        exit: 0x1000,
+        lookup_rip: 0x1100,
+        lookup_jmp: 0x1200,
+        lookup_call: 0x1300,
+        lookup_rip_ic: 0x1104,
+        lookup_jmp_ic: 0x1204,
+        lookup_call_ic: 0x1304,
+        host_xfer: 0x1400,
+        ras_miss: 0x1500,
+        ras_miss_ic: 0x1504,
+        spill_xmm: 0x1600,
+        reload_xmm: 0x1700,
+        clear_ymm_hi: 0x1800,
+        rdtsc_slow: 0x1900,
+        rdtscp_slow: 0x1a00,
+    };
+    let mut scratch = TrScratch::new();
+    let mut buf = vec![0u32; 512];
+    let asm = Asm::new(buf.as_mut_ptr(), 0x2000, buf.len());
+    let mut tr = new_tr(asm, &p.ops[..p.k], &p, &stubs, false, &mut scratch);
+    let main = tr.translate(p.term, p.live_out);
+    if tr.a.overflow {
+        return None;
+    }
+    Some(buf[..main].to_vec())
 }
 
 std::thread_local! {
