@@ -555,6 +555,12 @@ impl MetalBackend {
 
     /// Read back the last presented swapchain buffer (or last bound/cleared RTV) as RGB8.
     pub fn capture_frame(&mut self) -> Result<FrameImage, String> {
+        let blocked = self.blocked_queues();
+        if !blocked.is_empty() {
+            return Err(format!(
+                "cannot capture frame: queue(s) {blocked:?} remain blocked on unsignaled fence waits"
+            ));
+        }
         self.wait_all_idle();
         let queue = self.primary_queue().ok_or("no command queue available for frame readback")?;
         let target = self
@@ -2003,6 +2009,13 @@ impl Backend for MetalBackend {
     }
 
     fn finish(&mut self) -> Result<(), String> {
+        let blocked = self.blocked_queues();
+        if !blocked.is_empty() {
+            self.drain_unblocked_queues();
+            return Err(format!(
+                "cannot finish GPU replay: queue(s) {blocked:?} remain blocked on unsignaled fence waits"
+            ));
+        }
         self.wait_all_idle();
         Ok(())
     }

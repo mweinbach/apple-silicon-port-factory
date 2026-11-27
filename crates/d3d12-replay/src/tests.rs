@@ -2075,3 +2075,43 @@ fn metal_backend_bench_rejects_cross_frame_unsignaled_setup_wait() {
     assert!(err.to_string().contains("blocked on fence signals"), "{err}");
 }
 
+#[test]
+fn metal_backend_replay_until_rejects_blocked_wait_without_hanging() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::types::CommandQueueDesc;
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    let qd_gfx = CommandQueueDesc { Type: 0, ..Default::default() };
+    let qd_comp = CommandQueueDesc { Type: 2, ..Default::default() };
+    let lists = [3u64];
+
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();               // 0
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd_gfx) }, 0).unwrap(); // 1
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 5, desc: bytes_of(&qd_comp) }, 0).unwrap(); // 2
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 4, list_type: 0 }, 0).unwrap(); // 3
+    w.write(&Call::CreateFence { device: 1, fence: 6, initial_value: 0, flags: 0 }, 0).unwrap(); // 4
+    w.write(&Call::CreateCommandList { device: 1, list: 3, list_type: 0, allocator: 4, initial_pso: 0 }, 0).unwrap(); // 5
+    w.write(&Call::Close { list: 3 }, 0).unwrap();                                               // 6
+    w.write(&Call::QueueWait { queue: 2, fence: 6, value: 1 }, 0).unwrap();                      // 7
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&lists) }, 0).unwrap(); // 8
+    // Signal arrives at record 9; stopping at --until 8 leaves queue 2 blocked on fence 6=1.
+    w.write(&Call::QueueSignal { queue: 5, fence: 6, value: 1 }, 0).unwrap();                    // 9
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, Some(8), 100).unwrap();
+    assert_eq!(rep.failed.total, 1, "{rep}");
+    assert!(
+        rep.failed.items[0].1.contains("blocked on unsignaled fence waits"),
+        "{:?}",
+        rep.failed.items
+    );
+}
+
