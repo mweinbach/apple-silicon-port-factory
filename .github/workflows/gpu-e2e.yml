@@ -1,5 +1,12 @@
 name: GPU, Audio & E2E (Apple Silicon)
 
+run-name: >-
+  ${{
+    github.event_name == 'pull_request_target' &&
+    format('GPU CI: PR #{0} @ {1}', github.event.pull_request.number, github.event.pull_request.head.sha) ||
+    'GPU, Audio & E2E (Apple Silicon)'
+  }}
+
 # Runs hardware-dependent Metal 4, shader toolchain, CoreAudio/WASAPI, MoltenVK,
 # replay, and benchmark suites on a dedicated self-hosted Apple Silicon macOS runner.
 #
@@ -47,31 +54,86 @@ env:
   MTL_DEBUG_LAYER: "1"
 
 jobs:
-  # Protected approval gate for pull requests: executed strictly from the trusted base
-  # branch (`main`) via `pull_request_target` on a GitHub-hosted runner (never the
-  # self-hosted Mac) inside the `gpu-ci-pr` protected Environment so a runner owner must
-  # explicitly approve the exact `pull_request.head.sha` before the self-hosted job starts.
-  # Because `pull_request_target` ignores workflow edits from the PR branch, a fork PR
-  # cannot remove this gate, its environment protection, or the SHA check.
-  approve-pr-gpu:
-    name: Approve PR head SHA for self-hosted GPU CI
+  # Pre-approval metadata job (runs on GitHub-hosted ubuntu-latest with zero checkout):
+  # publishes the exact immutable PR commit SHA, tree SHA, and review URL to the run
+  # summary BEFORE the `gpu-ci-pr` Environment pauses for runner-owner approval, and
+  # verifies the live PR head has not moved since the `gpu-ci` label event.
+  prepare-pr-gpu:
+    name: Prepare PR #${{ github.event.pull_request.number }} @ ${{ github.event.pull_request.head.sha }}
     runs-on: ubuntu-latest
-    environment: gpu-ci-pr
     timeout-minutes: 5
     if: >-
       github.event_name == 'pull_request_target' &&
       github.event.action == 'labeled' &&
       github.event.label.name == 'gpu-ci'
     outputs:
-      head_sha: ${{ steps.bind.outputs.head_sha }}
+      head_sha: ${{ steps.inspect.outputs.head_sha }}
+      tree_sha: ${{ steps.inspect.outputs.tree_sha }}
     steps:
-      - name: Bind approval to reviewed PR head SHA
+      - name: Record immutable PR commit & tree SHA before approval
+        id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          LIVE_SHA="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          if [ "$LIVE_SHA" != "$EVENT_SHA" ]; then
+            echo "ERROR: PR #${PR_NUMBER} head moved (${LIVE_SHA} != ${EVENT_SHA}); re-review and re-apply gpu-ci." >&2
+            exit 1
+          fi
+          TREE_SHA="$(gh api "repos/${REPO}/commits/${EVENT_SHA}" --jq '.commit.tree.sha')"
+          if [ -z "$TREE_SHA" ] || [ "$TREE_SHA" = "null" ]; then
+            echo "ERROR: failed to resolve immutable tree SHA for ${EVENT_SHA}" >&2
+            exit 1
+          fi
+          {
+            echo "### Self-hosted GPU CI approval summary"
+            echo ""
+            echo "- **PR**: #${PR_NUMBER}"
+            echo "- **Immutable commit SHA**: \`${EVENT_SHA}\`"
+            echo "- **Immutable tree SHA**: \`${TREE_SHA}\`"
+            echo "- **Inspect exact commit**: https://github.com/${REPO}/commit/${EVENT_SHA}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "head_sha=${EVENT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tree_sha=${TREE_SHA}" >> "$GITHUB_OUTPUT"
+
+  # Protected approval gate for pull requests: executed strictly from the trusted base
+  # branch (`main`) via `pull_request_target` on a GitHub-hosted runner (never the
+  # self-hosted Mac) inside the `gpu-ci-pr` protected Environment. Both the workflow
+  # `run-name` and this job's `name` display the exact immutable commit SHA before a
+  # runner owner approves deployment, preventing PR-head swap (TOCTOU) attacks.
+  approve-pr-gpu:
+    name: Approve PR #${{ github.event.pull_request.number }} @ ${{ github.event.pull_request.head.sha }}
+    needs: [prepare-pr-gpu]
+    runs-on: ubuntu-latest
+    environment: gpu-ci-pr
+    timeout-minutes: 5
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      needs.prepare-pr-gpu.result == 'success'
+    outputs:
+      head_sha: ${{ steps.bind.outputs.head_sha }}
+      tree_sha: ${{ steps.bind.outputs.tree_sha }}
+    steps:
+      - name: Confirm approved immutable commit SHA
         id: bind
         env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          APPROVED_SHA: ${{ needs.prepare-pr-gpu.outputs.head_sha }}
+          APPROVED_TREE_SHA: ${{ needs.prepare-pr-gpu.outputs.tree_sha }}
         run: |
-          echo "Approved PR #${{ github.event.pull_request.number }} commit ${PR_HEAD_SHA} for self-hosted GPU CI"
-          echo "head_sha=${PR_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          LIVE_SHA="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          if [ "$LIVE_SHA" != "$APPROVED_SHA" ]; then
+            echo "ERROR: PR #${PR_NUMBER} head changed during approval (${LIVE_SHA} != ${APPROVED_SHA}); aborting." >&2
+            exit 1
+          fi
+          echo "Approved immutable PR #${PR_NUMBER} commit ${APPROVED_SHA} (tree ${APPROVED_TREE_SHA})"
+          echo "head_sha=${APPROVED_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tree_sha=${APPROVED_TREE_SHA}" >> "$GITHUB_OUTPUT"
 
   gpu-e2e:
     name: Apple Silicon GPU, audio & E2E (MTL_DEBUG_LAYER=1)
@@ -86,23 +148,27 @@ jobs:
           github.event_name == 'pull_request_target' &&
           needs.approve-pr-gpu.result == 'success' &&
           needs.approve-pr-gpu.outputs.head_sha != '' &&
+          needs.approve-pr-gpu.outputs.tree_sha != '' &&
           needs.approve-pr-gpu.outputs.head_sha == github.event.pull_request.head.sha
         )
       )
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
+          repository: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request_target' && needs.approve-pr-gpu.outputs.head_sha || github.sha }}
           persist-credentials: false
 
-      - name: Verify checked-out commit matches approved SHA
+      - name: Verify checked-out commit & tree match approved SHAs
         if: github.event_name == 'pull_request_target'
         env:
           APPROVED_SHA: ${{ needs.approve-pr-gpu.outputs.head_sha }}
+          APPROVED_TREE_SHA: ${{ needs.approve-pr-gpu.outputs.tree_sha }}
         run: |
           HEAD_SHA="$(git rev-parse HEAD)"
-          if [ "$HEAD_SHA" != "$APPROVED_SHA" ]; then
-            echo "ERROR: checked-out commit $HEAD_SHA != approved SHA $APPROVED_SHA" >&2
+          HEAD_TREE="$(git rev-parse 'HEAD^{tree}')"
+          if [ "$HEAD_SHA" != "$APPROVED_SHA" ] || [ "$HEAD_TREE" != "$APPROVED_TREE_SHA" ]; then
+            echo "ERROR: checked-out commit ${HEAD_SHA} (tree ${HEAD_TREE}) != approved ${APPROVED_SHA} (tree ${APPROVED_TREE_SHA})" >&2
             exit 1
           fi
 
