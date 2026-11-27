@@ -1180,7 +1180,7 @@ class SteamBackendTests(unittest.TestCase):
                 app_id = argv[argv.index("-app") + 1]
                 dest = pathlib.Path(argv[argv.index("-dir") + 1])
                 dest.mkdir(parents=True, exist_ok=True)
-                base_gid = "8811223344556677889"
+                base_gid = os.environ.get("MOCK_BASE_GID", "8811223344556677889")
                 dlc_gid = os.environ.get("MOCK_DLC_GID", "770011")
                 if "-manifest-only" in argv:
                     if app_id == "2138330":
@@ -1237,7 +1237,9 @@ class SteamBackendTests(unittest.TestCase):
                 }
             return {}
 
+        prev_base_gid = os.environ.get("MOCK_BASE_GID")
         prev_dlc_gid = os.environ.get("MOCK_DLC_GID")
+        os.environ["MOCK_BASE_GID"] = "8811223344556677889"
         os.environ["MOCK_DLC_GID"] = "770011"
         try:
             backend = self._make_backend(
@@ -1275,7 +1277,21 @@ class SteamBackendTests(unittest.TestCase):
             upd2 = backend.update("1091500", check_only=False, with_dlcs=True)
             self.assertTrue(upd2.updated)
             self.assertEqual((dest / "dlc_2138330.pak").read_bytes(), b"DLC_770022")
+
+            # Base-only update must preserve existing installed DLC IDs and versions on the same install
+            os.environ["MOCK_BASE_GID"] = "9911223344556677999"
+            upd_base = backend.update("1091500", check_only=False, with_dlcs=False)
+            self.assertTrue(upd_base.updated)
+            info_after = backend.info("1091500", platform="windows", offline=True)
+            dlc_after = {d.app_id: d for d in info_after.dlcs}
+            self.assertTrue(dlc_after["2138330"].installed)
+            chk_after = backend.update("1091500", check_only=True, with_dlcs=True)
+            self.assertFalse(chk_after.update_available)
         finally:
+            if prev_base_gid is None:
+                os.environ.pop("MOCK_BASE_GID", None)
+            else:
+                os.environ["MOCK_BASE_GID"] = prev_base_gid
             if prev_dlc_gid is None:
                 os.environ.pop("MOCK_DLC_GID", None)
             else:

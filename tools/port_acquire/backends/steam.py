@@ -1724,7 +1724,41 @@ class SteamBackend(StoreBackend):
 
         if not options.no_register:
             installs = self._load_installs()
-            installs[resolved_id] = {
+            existing = installs.get(resolved_id)
+            same_install = False
+            if isinstance(existing, dict) and existing.get("install_path"):
+                try:
+                    same_install = Path(str(existing["install_path"])).expanduser().resolve() == dest
+                except OSError:
+                    same_install = str(existing["install_path"]) == str(dest)
+
+            merged_dlcs: list[str] = []
+            merged_dlc_versions: dict[str, str] = {}
+            merged_redists: list[str] = []
+            if same_install and isinstance(existing, dict):
+                for prev_dlc in existing.get("dlcs") or []:
+                    s_dlc = str(prev_dlc)
+                    if s_dlc and s_dlc not in merged_dlcs:
+                        merged_dlcs.append(s_dlc)
+                prev_vers = existing.get("dlc_versions")
+                if isinstance(prev_vers, dict):
+                    for k, v in prev_vers.items():
+                        if v:
+                            merged_dlc_versions[str(k)] = str(v)
+                for prev_redist in existing.get("redists") or []:
+                    s_red = str(prev_redist)
+                    if s_red and s_red not in merged_redists:
+                        merged_redists.append(s_red)
+
+            for dlc_id in downloaded_dlcs:
+                if dlc_id not in merged_dlcs:
+                    merged_dlcs.append(dlc_id)
+            merged_dlc_versions.update(dlc_versions)
+            for redist_id in downloaded_redists:
+                if redist_id not in merged_redists:
+                    merged_redists.append(redist_id)
+
+            new_entry: dict[str, Any] = {
                 "app_id": resolved_id,
                 "title": title,
                 "account_name": account_name,
@@ -1735,11 +1769,15 @@ class SteamBackend(StoreBackend):
                 "build_id": version,
                 "manifest_gids": manifest_gids,
                 "depots": downloaded_depots,
-                "dlcs": downloaded_dlcs,
-                "dlc_versions": dlc_versions,
-                "redists": downloaded_redists,
+                "dlcs": merged_dlcs,
+                "dlc_versions": merged_dlc_versions,
+                "redists": merged_redists,
                 "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
+            if same_install and isinstance(existing, dict) and existing.get("launch_args"):
+                new_entry["launch_args"] = existing["launch_args"]
+
+            installs[resolved_id] = new_entry
             self._save_installs(installs)
 
         return DownloadResult(
