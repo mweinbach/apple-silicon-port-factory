@@ -621,3 +621,107 @@ fn litmus_mp_volatile_metadata_preserves_synchronization() {
         );
     }
 }
+
+/// Scalar-off / memcpy-on override (`PORT_JIT_TSO=0`, `PORT_JIT_TSO_MEMCPY=1`): verifies that
+/// interpreter string instructions (`stosq` release store / `lodsq` acquire load) still enforce
+/// MP synchronization even when scalar TSO is explicitly disabled.
+#[test]
+fn litmus_mp_interp_string_ops_honor_memcpy_tso_override() {
+    let mut code = CodeBuf::new(0x4000);
+    let base = code.base();
+    let prod_ip = base + 0x100;
+    let cons_ip = base + 0x200;
+
+    // Producer(rcx = &data, rdx = &flag, r8 = iter):
+    //   mov [rcx], r8 (plain non-TSO scalar store)
+    //   push rdi; mov rdi, rdx; mov rax, r8; cld; stosq (TSO memcpy release store!)
+    //   pop rdi; ret
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(qword_ptr(rcx), r8).unwrap();
+    a.push(rdi).unwrap();
+    a.mov(rdi, rdx).unwrap();
+    a.mov(rax, r8).unwrap();
+    a.cld().unwrap();
+    a.stosq().unwrap();
+    a.pop(rdi).unwrap();
+    a.ret().unwrap();
+    code.put(0x100, &a.assemble(prod_ip).unwrap());
+
+    // Consumer(rcx = &data, rdx = &flag, r8 = iter) -> rax = data:
+    //   push rsi; cld
+    //   spin: mov rsi, rdx; lodsq (TSO memcpy acquire load!); cmp rax, r8; jne spin
+    //   mov rax, [rcx] (plain non-TSO scalar load); pop rsi; ret
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut spin = a.create_label();
+    a.push(rsi).unwrap();
+    a.cld().unwrap();
+    a.set_label(&mut spin).unwrap();
+    a.mov(rsi, rdx).unwrap();
+    a.lodsq().unwrap();
+    a.cmp(rax, r8).unwrap();
+    a.jne(spin).unwrap();
+    a.mov(rax, qword_ptr(rcx)).unwrap();
+    a.pop(rsi).unwrap();
+    a.ret().unwrap();
+    code.put(0x200, &a.assemble(cons_ip).unwrap());
+
+    let shared = SharedPair::new();
+    let data_ptr = shared.a.as_ptr() as u64;
+    let flag_ptr = shared.b.as_ptr() as u64;
+    let iters = 1500u64;
+    let start_bar = Barrier::new(2);
+    let end_bar = Barrier::new(2);
+    let stale = AtomicU64::new(0);
+
+    struct OverrideGuard;
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            crate::emu::mem::TEST_NO_TSO.with(|c| c.set(false));
+            crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(None));
+        }
+    }
+
+    std::thread::scope(|s| {
+        let sb_r = &start_bar;
+        let eb_r = &end_bar;
+        let stale_r = &stale;
+        let shared_r = &*shared;
+        let t_cons = s.spawn(move || {
+            let _ov = OverrideGuard;
+            crate::emu::mem::TEST_NO_TSO.with(|c| c.set(true));
+            crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(Some(true)));
+            let g = ParticipantGuard::enter(ExecMode::Interp, "mp-interp-lodsq-consumer");
+            for iter in 1..=iters {
+                sb_r.wait();
+                let got = unsafe { call_va8(cons_ip, data_ptr, flag_ptr, iter, 0, 0, 0, 0, 0) };
+                if got != iter {
+                    stale_r.fetch_add(1, Ordering::Relaxed);
+                }
+                eb_r.wait();
+            }
+            g.verify_and_exit();
+        });
+        let t_prod = s.spawn(move || {
+            let _ov = OverrideGuard;
+            crate::emu::mem::TEST_NO_TSO.with(|c| c.set(true));
+            crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(Some(true)));
+            let g = ParticipantGuard::enter(ExecMode::Interp, "mp-interp-stosq-producer");
+            for iter in 1..=iters {
+                shared_r.a[0].store(0, Ordering::SeqCst);
+                shared_r.b[0].store(0, Ordering::SeqCst);
+                sb_r.wait();
+                unsafe { call_va8(prod_ip, data_ptr, flag_ptr, iter, 0, 0, 0, 0, 0) };
+                eb_r.wait();
+            }
+            g.verify_and_exit();
+        });
+        t_prod.join().unwrap();
+        t_cons.join().unwrap();
+    });
+
+    assert_eq!(
+        stale.load(Ordering::Relaxed),
+        0,
+        "interpreter stosq/lodsq MP failed under PORT_JIT_TSO=0 + PORT_JIT_TSO_MEMCPY=1"
+    );
+}

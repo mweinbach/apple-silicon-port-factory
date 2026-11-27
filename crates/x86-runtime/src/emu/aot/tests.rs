@@ -3915,6 +3915,7 @@ fn tso_vec_and_tso_memcpy_independent_codegen_switches() {
     struct Guard;
     impl Drop for Guard {
         fn drop(&mut self) {
+            crate::emu::mem::TEST_NO_TSO.with(|c| c.set(false));
             crate::emu::mem::TEST_TSO_VEC.with(|c| c.set(None));
             crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(None));
         }
@@ -3954,4 +3955,19 @@ fn tso_vec_and_tso_memcpy_independent_codegen_switches() {
     assert!(w_vec_still.contains(&DMB_ISHLD) && w_vec_still.contains(&DMB_ISHST));
     let w_sc_still2 = words_of(base + 0x100);
     assert!(w_sc_still2.iter().any(|&w| is_tso_ld(w)) && w_sc_still2.iter().any(|&w| is_tso_st(w)));
+
+    // PORT_JIT_TSO=0, PORT_JIT_TSO_MEMCPY=1: scalar drops TSO while rep movsq keeps TSO.
+    crate::emu::mem::TEST_NO_TSO.with(|c| c.set(true));
+    crate::emu::mem::TEST_TSO_VEC.with(|c| c.set(None));
+    crate::emu::mem::TEST_TSO_MEMCPY.with(|c| c.set(Some(true)));
+    assert!(!crate::emu::mem::tso());
+    assert!(!crate::emu::mem::tso_vec());
+    assert!(crate::emu::mem::tso_memcpy());
+    let w_sc_off = words_of(base + 0x100);
+    assert!(!w_sc_off.iter().any(|&w| is_tso_ld(w)) && !w_sc_off.iter().any(|&w| is_tso_st(w)));
+    let w_rep_override = words_of(base + 0x300);
+    assert!(
+        w_rep_override.iter().any(|&w| is_tso_ld(w)) && w_rep_override.iter().any(|&w| is_tso_st(w)),
+        "PORT_JIT_TSO=0 + PORT_JIT_TSO_MEMCPY=1 must preserve TSO on string/memcpy ops"
+    );
 }

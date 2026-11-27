@@ -763,7 +763,7 @@ impl Cpu {
                 let val = cpu.gpr[0];
                 if cpu.df {
                     for _ in 0..count {
-                        cpu.write_mem(cpu.gpr[7], (elem_bytes * 8) as u32, val);
+                        cpu.write_mem_memcpy(cpu.gpr[7], (elem_bytes * 8) as u32, val);
                         cpu.gpr[7] = cpu.gpr[7].wrapping_sub(elem_bytes);
                     }
                 } else if elem_bytes == 1 && count > 0 {
@@ -775,7 +775,7 @@ impl Cpu {
                     cpu.gpr[7] = cpu.gpr[7].wrapping_add(count);
                 } else {
                     for _ in 0..count {
-                        cpu.write_mem(cpu.gpr[7], (elem_bytes * 8) as u32, val);
+                        cpu.write_mem_memcpy(cpu.gpr[7], (elem_bytes * 8) as u32, val);
                         cpu.gpr[7] = cpu.gpr[7].wrapping_add(elem_bytes);
                     }
                 }
@@ -820,8 +820,8 @@ impl Cpu {
                     if cpu.df {
                         let bits = (elem_bytes * 8) as u32;
                         for _ in 0..count {
-                            let v = cpu.read_mem(cpu.gpr[6], bits);
-                            cpu.write_mem(cpu.gpr[7], bits, v);
+                            let v = cpu.read_mem_memcpy(cpu.gpr[6], bits);
+                            cpu.write_mem_memcpy(cpu.gpr[7], bits, v);
                             cpu.gpr[6] = cpu.gpr[6].wrapping_sub(elem_bytes);
                             cpu.gpr[7] = cpu.gpr[7].wrapping_sub(elem_bytes);
                         }
@@ -848,8 +848,8 @@ impl Cpu {
                         } else {
                             let bits = (elem_bytes * 8) as u32;
                             for i in 0..count {
-                                let v = cpu.read_mem(src.wrapping_add(i * elem_bytes), bits);
-                                cpu.write_mem(dst.wrapping_add(i * elem_bytes), bits, v);
+                                let v = cpu.read_mem_memcpy(src.wrapping_add(i * elem_bytes), bits);
+                                cpu.write_mem_memcpy(dst.wrapping_add(i * elem_bytes), bits, v);
                             }
                         }
                         if mem::tso_memcpy() {

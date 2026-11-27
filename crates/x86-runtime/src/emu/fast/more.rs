@@ -800,8 +800,8 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                                 }
                             } else {
                                 for i in 0..count {
-                                    let v = cpu.read_mem(src.wrapping_add(i * elem_bytes), ebits);
-                                    cpu.write_mem(dst.wrapping_add(i * elem_bytes), ebits, v);
+                                    let v = cpu.read_mem_memcpy(src.wrapping_add(i * elem_bytes), ebits);
+                                    cpu.write_mem_memcpy(dst.wrapping_add(i * elem_bytes), ebits, v);
                                 }
                             }
                             if crate::emu::mem::tso_memcpy() {
@@ -815,16 +815,16 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                             cpu.gpr[7] = dst_end;
                         } else {
                             for _ in 0..count {
-                                let v = cpu.read_mem(cpu.gpr[6], ebits);
-                                cpu.write_mem(cpu.gpr[7], ebits, v);
+                                let v = cpu.read_mem_memcpy(cpu.gpr[6], ebits);
+                                cpu.write_mem_memcpy(cpu.gpr[7], ebits, v);
                                 cpu.gpr[6] = cpu.gpr[6].wrapping_add(elem_bytes);
                                 cpu.gpr[7] = cpu.gpr[7].wrapping_add(elem_bytes);
                             }
                         }
                     } else {
                         for _ in 0..count {
-                            let v = cpu.read_mem(cpu.gpr[6], ebits);
-                            cpu.write_mem(cpu.gpr[7], ebits, v);
+                            let v = cpu.read_mem_memcpy(cpu.gpr[6], ebits);
+                            cpu.write_mem_memcpy(cpu.gpr[7], ebits, v);
                             cpu.gpr[6] = cpu.gpr[6].wrapping_add(elem_bytes);
                             cpu.gpr[7] = cpu.gpr[7].wrapping_add(elem_bytes);
                         }
@@ -865,8 +865,8 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         cpu.gpr[7] = dst.wrapping_sub(total_u);
                     } else {
                         for _ in 0..count {
-                            let v = cpu.read_mem(cpu.gpr[6], ebits);
-                            cpu.write_mem(cpu.gpr[7], ebits, v);
+                            let v = cpu.read_mem_memcpy(cpu.gpr[6], ebits);
+                            cpu.write_mem_memcpy(cpu.gpr[7], ebits, v);
                             cpu.gpr[6] = cpu.gpr[6].wrapping_sub(elem_bytes);
                             cpu.gpr[7] = cpu.gpr[7].wrapping_sub(elem_bytes);
                         }
@@ -961,7 +961,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                 } else {
                     let step = if cpu.df { elem_bytes.wrapping_neg() } else { elem_bytes };
                     for _ in 0..count {
-                        cpu.write_mem(cpu.gpr[7], ebits, val);
+                        cpu.write_mem_memcpy(cpu.gpr[7], ebits, val);
                         cpu.gpr[7] = cpu.gpr[7].wrapping_add(step);
                     }
                 }
@@ -979,7 +979,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
             let count = if rep { cpu.gpr[1] } else { 1 };
             if count > 0 {
                 let last = cpu.gpr[6].wrapping_add(step.wrapping_mul(count - 1));
-                let v = cpu.read_mem(last, ebits);
+                let v = cpu.read_mem_memcpy(last, ebits);
                 cpu.rset(0, op.w, v);
                 cpu.gpr[6] = cpu.gpr[6].wrapping_add(step.wrapping_mul(count));
                 cpu.last_bits[6] = 64;
@@ -1030,7 +1030,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                             break;
                         }
                     } else {
-                        let m = cpu.read_mem(ptr, 8) as u8;
+                        let m = cpu.read_mem_memcpy(ptr, 8) as u8;
                         ptr = ptr.wrapping_add(1);
                         rem -= 1;
                         let stop = if stop_on_eq { acc == m } else { acc != m };
@@ -1057,7 +1057,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
             let acc = cpu.gpr[0] & mask;
             if rep_mode == 2 {
                 while cpu.gpr[1] != 0 {
-                    let m = cpu.read_mem(cpu.gpr[7], ebits) & mask;
+                    let m = cpu.read_mem_memcpy(cpu.gpr[7], ebits) & mask;
                     cpu.gpr[7] = cpu.gpr[7].wrapping_add(step);
                     cpu.gpr[1] = cpu.gpr[1].wrapping_sub(1);
                     let _ = cpu.update_flags_sub(acc, m, ebits);
@@ -1067,7 +1067,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                 }
             } else if rep_mode == 1 {
                 while cpu.gpr[1] != 0 {
-                    let m = cpu.read_mem(cpu.gpr[7], ebits) & mask;
+                    let m = cpu.read_mem_memcpy(cpu.gpr[7], ebits) & mask;
                     cpu.gpr[7] = cpu.gpr[7].wrapping_add(step);
                     cpu.gpr[1] = cpu.gpr[1].wrapping_sub(1);
                     let _ = cpu.update_flags_sub(acc, m, ebits);
@@ -1076,7 +1076,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                     }
                 }
             } else {
-                let m = cpu.read_mem(cpu.gpr[7], ebits) & mask;
+                let m = cpu.read_mem_memcpy(cpu.gpr[7], ebits) & mask;
                 cpu.gpr[7] = cpu.gpr[7].wrapping_add(step);
                 let _ = cpu.update_flags_sub(acc, m, ebits);
             }
@@ -1132,8 +1132,8 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                             break;
                         }
                     } else {
-                        let a = cpu.read_mem(p1, 8) as u8;
-                        let b = cpu.read_mem(p2, 8) as u8;
+                        let a = cpu.read_mem_memcpy(p1, 8) as u8;
+                        let b = cpu.read_mem_memcpy(p2, 8) as u8;
                         p1 = p1.wrapping_add(1);
                         p2 = p2.wrapping_add(1);
                         rem -= 1;
@@ -1164,8 +1164,8 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                 if rep && cpu.gpr[1] == 0 {
                     break;
                 }
-                let a = cpu.read_mem(cpu.gpr[6], ebits);
-                let b = cpu.read_mem(cpu.gpr[7], ebits);
+                let a = cpu.read_mem_memcpy(cpu.gpr[6], ebits);
+                let b = cpu.read_mem_memcpy(cpu.gpr[7], ebits);
                 cpu.gpr[6] = cpu.gpr[6].wrapping_add(step);
                 cpu.gpr[7] = cpu.gpr[7].wrapping_add(step);
                 let _ = cpu.update_flags_sub(a, b, ebits);
