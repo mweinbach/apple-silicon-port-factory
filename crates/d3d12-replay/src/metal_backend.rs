@@ -4,7 +4,7 @@
 //! handles onto live `d3d12_metal::metal` objects and executes every recorded
 //! command on Apple Silicon Metal 4.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use d3d12_metal::layout::PlacedFootprint;
@@ -268,6 +268,8 @@ pub struct MetalBackend {
     fences: HashMap<u64, Arc<Fence>>,
     query_heaps: HashMap<u64, Arc<QueryHeap>>,
     swapchains: HashMap<u64, Swapchain>,
+    /// Swapchain ID -> owning command queue ID (for tracking pending GPU work on `Present`).
+    swapchain_queues: HashMap<u64, u64>,
     /// Objects released during replay, kept alive until `wait_all_idle()` so GPU command buffers
     /// and non-owning `TargetView` pointers never dangle.
     retired: Vec<Box<dyn Send>>,
@@ -280,9 +282,12 @@ pub struct MetalBackend {
     timing_armed: bool,
     /// When true, `Present` forces `sync_interval = 0` so headless replay never sleeps 16.6 ms.
     disable_vsync: bool,
-    /// True after `ExecuteCommandLists`/`Present` until `wait_all_idle()` completes, so
-    /// subsequent `WriteResource` updates wait for pending GPU reads before overwriting shared memory.
-    has_pending_gpu_work: bool,
+    /// Queues that have submitted GPU work (`ExecuteCommandLists`/`Present`) since their last drain.
+    queue_busy: HashSet<u64>,
+    /// Pending cross-queue `(fence_id, value)` waits enqueued on each queue since its last drain.
+    queue_waits: HashMap<u64, Vec<(u64, u64)>>,
+    /// Signals recorded on each fence: `(value, producer_queue_id)` where `None` is CPU/initial.
+    fence_signals: HashMap<u64, Vec<(u64, Option<u64>)>>,
 }
 
 impl MetalBackend {
@@ -305,13 +310,16 @@ impl MetalBackend {
             fences: HashMap::new(),
             query_heaps: HashMap::new(),
             swapchains: HashMap::new(),
+            swapchain_queues: HashMap::new(),
             retired: Vec::new(),
             last_presented: None,
             last_rtv: None,
             gpu_timer: None,
             timing_armed: false,
             disable_vsync: true,
-            has_pending_gpu_work: false,
+            queue_busy: HashSet::new(),
+            queue_waits: HashMap::new(),
+            fence_signals: HashMap::new(),
         })
     }
 
@@ -337,8 +345,57 @@ impl MetalBackend {
         for q in self.queues.values() {
             q.wait_idle();
         }
-        self.has_pending_gpu_work = false;
+        self.queue_busy.clear();
+        self.queue_waits.clear();
         self.retired.clear();
+    }
+
+    /// Drain every busy queue whose enqueued fence waits are already transitively satisfied
+    /// by prior signals, avoiding deadlocks on queues waiting for a producer that appears
+    /// later in the trace.
+    fn drain_unblocked_queues(&mut self) {
+        if self.queue_busy.is_empty() {
+            return;
+        }
+        let mut blocked: HashSet<u64> = HashSet::new();
+        loop {
+            let mut changed = false;
+            for (&qid, waits) in &self.queue_waits {
+                if blocked.contains(&qid) {
+                    continue;
+                }
+                let is_blocked = waits.iter().any(|&(fid, val)| {
+                    let satisfied_by_unblocked = self.fence_signals.get(&fid).is_some_and(|sigs| {
+                        sigs.iter()
+                            .any(|&(sv, prod)| sv >= val && prod.is_none_or(|pq| !blocked.contains(&pq)))
+                    });
+                    !satisfied_by_unblocked
+                });
+                if is_blocked {
+                    blocked.insert(qid);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let drainable: Vec<u64> = self
+            .queue_busy
+            .iter()
+            .copied()
+            .filter(|qid| !blocked.contains(qid))
+            .collect();
+        for qid in drainable {
+            if let Some(q) = self.queues.get(&qid) {
+                q.wait_idle();
+            }
+            self.queue_busy.remove(&qid);
+            self.queue_waits.remove(&qid);
+        }
+        if self.queue_busy.is_empty() {
+            self.retired.clear();
+        }
     }
 
     /// Primary Direct queue (or any queue if no Direct queue was created).
@@ -402,19 +459,41 @@ impl MetalBackend {
             if self.fences.contains_key(&id) {
                 let fresh = Fence::new(val).ok_or_else(|| format!("recreate fence {id:#x} at value {val}"))?;
                 self.fences.insert(id, Arc::new(fresh));
+                self.fence_signals.insert(id, vec![(val, None)]);
             }
         }
-        for alloc in self.allocators.values() {
-            alloc.reset();
+        let open_allocs: HashSet<u64> = self
+            .lists
+            .values()
+            .filter(|l| l.cl.is_open())
+            .map(|l| l.alloc_id)
+            .collect();
+        for (&alloc_id, alloc) in &self.allocators {
+            if !open_allocs.contains(&alloc_id) {
+                alloc.reset();
+            }
         }
         for &list_id in reopen_lists {
-            let (alloc_id, init_pso) = {
+            let (already_open, alloc_id, init_pso) = {
                 let Some(l) = self.lists.get(&list_id) else { continue };
-                if l.cl.is_open() {
-                    continue;
-                }
-                (l.alloc_id, l.initial_pso)
+                (l.cl.is_open(), l.alloc_id, l.initial_pso)
             };
+            if already_open {
+                // Setup left this list open while timing was disarmed (e.g. warmup == 0):
+                // arm its opening timestamp now so `Close` records a complete GPU duration pair.
+                let l = self.lists.get_mut(&list_id).unwrap();
+                if self.timing_armed
+                    && l.open_ts_slot.is_none()
+                    && matches!(l.cl.kind, ListType::Direct | ListType::Compute)
+                {
+                    if let Some(timer) = self.gpu_timer.as_mut() {
+                        let slot = timer.alloc_slot()?;
+                        l.cl.write_timestamp(&timer.heap, slot)?;
+                        l.open_ts_slot = Some(slot);
+                    }
+                }
+                continue;
+            }
             let alloc = self
                 .allocators
                 .get(&alloc_id)
@@ -842,6 +921,7 @@ impl Backend for MetalBackend {
             Call::CreateFence { fence, initial_value, .. } => {
                 let f = Fence::new(*initial_value).ok_or("Fence::new failed")?;
                 self.fences.insert(*fence, Arc::new(f));
+                self.fence_signals.insert(*fence, vec![(*initial_value, None)]);
                 Ok(Handled::Done)
             }
             Call::CreateQueryHeap { heap, desc, .. } => {
@@ -1054,12 +1134,11 @@ impl Backend for MetalBackend {
             }
             Call::WriteResource { resource, offset, data, .. } => {
                 // Captured traces do not record CPU fence waits (`SetEventOnCompletion`), while
-                // `Queue::execute_command_lists` submits asynchronously. Drain pending GPU work
+                // `Queue::execute_command_lists` submits asynchronously. Drain unblocked queues
                 // before overwriting shared upload memory so an earlier submission never reads
-                // data written for a later submission.
-                if self.has_pending_gpu_work {
-                    self.wait_all_idle();
-                }
+                // data written for a later submission, without deadlocking queues waiting on a
+                // producer that appears later in the trace.
+                self.drain_unblocked_queues();
                 let res = self
                     .resources
                     .get(resource)
@@ -1758,7 +1837,7 @@ impl Backend for MetalBackend {
                     let mut refs: Vec<&mut CommandList> = taken.iter_mut().map(|(_, l)| &mut l.cl).collect();
                     q.execute_command_lists(&mut refs);
                 }
-                self.has_pending_gpu_work = true;
+                self.queue_busy.insert(*queue);
                 for (id, l) in taken {
                     self.lists.insert(id, l);
                 }
@@ -1774,6 +1853,7 @@ impl Backend for MetalBackend {
                     .get(fence)
                     .ok_or_else(|| format!("QueueSignal unknown fence {fence:#x}"))?;
                 q.signal(f, *value);
+                self.fence_signals.entry(*fence).or_default().push((*value, Some(*queue)));
                 Ok(Handled::Done)
             }
             Call::QueueWait { queue, fence, value } => {
@@ -1786,6 +1866,7 @@ impl Backend for MetalBackend {
                     .get(fence)
                     .ok_or_else(|| format!("QueueWait unknown fence {fence:#x}"))?;
                 q.wait(f, *value);
+                self.queue_waits.entry(*queue).or_default().push((*fence, *value));
                 Ok(Handled::Done)
             }
             Call::FenceSignal { fence, value } => {
@@ -1794,6 +1875,7 @@ impl Backend for MetalBackend {
                     .get(fence)
                     .ok_or_else(|| format!("FenceSignal unknown fence {fence:#x}"))?;
                 f.signal_cpu(*value);
+                self.fence_signals.entry(*fence).or_default().push((*value, None));
                 Ok(Handled::Done)
             }
             Call::CreateSwapChain { queue, swapchain, desc } => {
@@ -1815,6 +1897,7 @@ impl Backend for MetalBackend {
                     Swapchain::new(std::ptr::null_mut(), q, w, h, fmt, count, &|f| f())?
                 };
                 self.swapchains.insert(*swapchain, sc);
+                self.swapchain_queues.insert(*swapchain, *queue);
                 Ok(Handled::Done)
             }
             Call::GetSwapChainBuffer { swapchain, index, resource } => {
@@ -1852,7 +1935,9 @@ impl Backend for MetalBackend {
                 }
                 let si = if self.disable_vsync { 0 } else { *sync_interval };
                 sc.present(si)?;
-                self.has_pending_gpu_work = true;
+                if let Some(&qid) = self.swapchain_queues.get(swapchain) {
+                    self.queue_busy.insert(qid);
+                }
                 Ok(Handled::Done)
             }
         }

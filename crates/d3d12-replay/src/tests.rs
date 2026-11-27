@@ -1568,3 +1568,143 @@ fn metal_backend_bench_rejects_skipped_incomplete_workload() {
     assert!(msg.contains("incomplete") && msg.contains("DispatchRays"), "unexpected error: {msg}");
 }
 
+#[test]
+fn metal_backend_write_resource_does_not_deadlock_on_pending_cross_queue_wait() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::types::{dim, heap_type, CommandQueueDesc, HeapProperties, ResourceDesc};
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    const D: u64 = 0x9000;
+    const Q_GFX: u64 = 0x9100;
+    const Q_COMP: u64 = 0x9101;
+    const A_GFX: u64 = 0x9200;
+    const A_COMP: u64 = 0x9201;
+    const L_GFX: u64 = 0x9300;
+    const L_COMP: u64 = 0x9301;
+    const F: u64 = 0x9400;
+    const UP: u64 = 0x9500;
+    const MID: u64 = 0x9501;
+    const DST: u64 = 0x9502;
+    const SZ: usize = 4096;
+
+    let qd_gfx = CommandQueueDesc { Type: 0, ..Default::default() };
+    let qd_comp = CommandQueueDesc { Type: 2, ..Default::default() };
+    let hp_up = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+    let hp_def = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+    let hp_rb = HeapProperties { Type: heap_type::READBACK, ..Default::default() };
+    let bdesc = ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: SZ as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        ..Default::default()
+    };
+    let payload = vec![0x3Cu8; SZ];
+    let lg = [L_GFX];
+    let lc = [L_COMP];
+
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q_GFX, desc: bytes_of(&qd_gfx) }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q_COMP, desc: bytes_of(&qd_comp) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A_GFX, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A_COMP, list_type: 2 }, 0).unwrap();
+    w.write(&Call::CreateFence { device: D, fence: F, initial_value: 0, flags: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: UP, heap_properties: bytes_of(&hp_up), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_d000_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: MID, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_d100_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: DST, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_d200_0000 }, 0).unwrap();
+    // Consumer submits BEFORE producer and waits on fence value 1 (not signaled yet!).
+    w.write(&Call::QueueWait { queue: Q_GFX, fence: F, value: 1 }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L_GFX, list_type: 0, allocator: A_GFX, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: L_GFX, dst: DST, dst_offset: 0, src: MID, src_offset: 0, size: SZ as u64 }, 0).unwrap();
+    w.write(&Call::Close { list: L_GFX }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q_GFX, lists: U64s::from_slice(&lg) }, 0).unwrap();
+    // WriteResource for the producer while Q_GFX is blocked waiting on F=1: must NOT deadlock!
+    w.write(&Call::WriteResource { resource: UP, subresource: 0, offset: 0, data: &payload }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L_COMP, list_type: 2, allocator: A_COMP, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: L_COMP, dst: MID, dst_offset: 0, src: UP, src_offset: 0, size: SZ as u64 }, 0).unwrap();
+    w.write(&Call::Close { list: L_COMP }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q_COMP, lists: U64s::from_slice(&lc) }, 0).unwrap();
+    w.write(&Call::QueueSignal { queue: Q_COMP, fence: F, value: 1 }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    let dst = backend.resource(DST).unwrap().shared_slice(0, SZ).unwrap();
+    assert!(dst.iter().all(|&b| b == 0x3C), "cross-queue consumer copy received wrong bytes");
+}
+
+#[test]
+fn metal_backend_bench_instruments_already_open_list_with_zero_warmup() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::bench;
+    use d3d12_metal::metal::descriptor::heap_kind;
+    use d3d12_metal::types::{dim, heap_type, resource_flags, CommandQueueDesc, DescriptorHeapDesc, HeapProperties, ResourceDesc};
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    const D: u64 = 0xa000;
+    const Q: u64 = 0xa100;
+    const A: u64 = 0xa200;
+    const L: u64 = 0xa300;
+    const RT: u64 = 0xa400;
+    const RTV_HEAP: u64 = 0xa500;
+    const RTV_CPU: u64 = 0x7e00_0000;
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let hp_def = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+    let rdesc = ResourceDesc {
+        Dimension: dim::TEXTURE2D,
+        Width: 128,
+        Height: 128,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: 28,
+        SampleCount: 1,
+        Flags: resource_flags::ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let rtv_hd = DescriptorHeapDesc { Type: heap_kind::RTV, NumDescriptors: 1, Flags: 0, NodeMask: 0 };
+    let lists = [L];
+
+    // Single-frame trace with NO Reset: CreateCommandList leaves L open at the end of setup.
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: RT, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&rdesc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: D, heap: RTV_HEAP, desc: bytes_of(&rtv_hd), cpu_start: RTV_CPU, gpu_start: 0 }, 0).unwrap();
+    w.write(&Call::CreateRenderTargetView { resource: RT, desc: None, dest: RTV_CPU }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L, list_type: 0, allocator: A, initial_pso: 0 }, 0).unwrap();
+    // Frame body starts here with L already open from setup!
+    w.write(&Call::ClearRenderTargetView { list: L, rtv: RTV_CPU, color: [0.2, 0.4, 0.6, 1.0], rects: &[] }, 0).unwrap();
+    w.write(&Call::Close { list: L }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q, lists: U64s::from_slice(&lists) }, 0).unwrap();
+    w.write(&Call::FrameEnd { frame: 0 }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let opts = bench::BenchOptions { iterations: 1, warmup: 0, until: None };
+    let (rep, _backend) = bench::run_bench(&trace, &opts).unwrap();
+    assert!(rep.failures.is_empty(), "{rep}");
+    assert_eq!(rep.gpu_busy.samples.len(), 1);
+    assert!(
+        rep.gpu_busy.samples[0] > 0.0,
+        "expected positive gpu_busy_ms for already-open list with warmup=0, got {}:\n{rep}",
+        rep.gpu_busy.samples[0]
+    );
+}
+
