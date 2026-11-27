@@ -709,6 +709,33 @@ pub struct StageBindings {
     pub samp_gen: u64,
 }
 
+impl StageBindings {
+    /// Clone only the inner `Arc`s and binding metadata without calling `com_add_ref`,
+    /// so deferred draw snapshots (and command-list teardown) never re-enter guest COM callbacks.
+    fn snapshot(&self) -> Self {
+        Self {
+            cbs: self
+                .cbs
+                .iter()
+                .map(|c| CbSlot {
+                    com: ComRef(0),
+                    res: c.res.clone(),
+                    first_constant: c.first_constant,
+                    num_constants: c.num_constants,
+                })
+                .collect(),
+            srvs: self.srvs.iter().map(|s| SrvSlot { com: ComRef(0), srv: s.srv.clone() }).collect(),
+            samplers: self
+                .samplers
+                .iter()
+                .map(|s| SampSlot { com: ComRef(0), samp: s.samp.clone() })
+                .collect(),
+            res_gen: self.res_gen,
+            samp_gen: self.samp_gen,
+        }
+    }
+}
+
 impl Default for StageBindings {
     fn default() -> Self {
         Self {
@@ -856,6 +883,71 @@ impl ContextState {
         self.scissor_dirty = false;
         self.blend_factor_dirty = false;
         self.stencil_ref_dirty = false;
+    }
+
+    /// Snapshot execution-only state for deferred `Draw*`/`Dispatch*` recording without
+    /// touching COM refcounts (`ComRef` stays null), so recording and dropping command lists
+    /// never invoke guest `IUnknown` callbacks (`SetPrivateDataInterface`).
+    fn snapshot_for_draw(&self) -> Self {
+        Self {
+            vs_com: ComRef(0),
+            vs: self.vs.clone(),
+            hs_com: ComRef(0),
+            hs: self.hs.clone(),
+            ds_com: ComRef(0),
+            ds: self.ds.clone(),
+            gs_com: ComRef(0),
+            gs: self.gs.clone(),
+            ps_com: ComRef(0),
+            ps: self.ps.clone(),
+            cs_com: ComRef(0),
+            cs: self.cs.clone(),
+            vs_bind: self.vs_bind.snapshot(),
+            ps_bind: self.ps_bind.snapshot(),
+            gs_bind: self.gs_bind.snapshot(),
+            hs_bind: self.hs_bind.snapshot(),
+            ds_bind: self.ds_bind.snapshot(),
+            cs_bind: self.cs_bind.snapshot(),
+            cs_uavs: self.cs_uavs.iter().map(|u| UavSlot { com: ComRef(0), uav: u.uav.clone() }).collect(),
+            cs_uavs_gen: self.cs_uavs_gen,
+            om_uavs: self.om_uavs.iter().map(|u| UavSlot { com: ComRef(0), uav: u.uav.clone() }).collect(),
+            om_uavs_gen: self.om_uavs_gen,
+            input_layout_com: ComRef(0),
+            input_layout: self.input_layout.clone(),
+            vbs: self
+                .vbs
+                .iter()
+                .map(|v| VbSlot { com: ComRef(0), res: v.res.clone(), stride: v.stride, offset: v.offset })
+                .collect(),
+            ib_com: ComRef(0),
+            ib: self.ib.clone(),
+            ib_format: self.ib_format,
+            ib_offset: self.ib_offset,
+            topology: self.topology,
+            rtvs: self.rtvs.iter().map(|r| RtvSlot { com: ComRef(0), rtv: r.rtv.clone() }).collect(),
+            dsv_com: ComRef(0),
+            dsv: self.dsv.clone(),
+            blend_com: ComRef(0),
+            blend: self.blend.clone(),
+            blend_factor: self.blend_factor,
+            sample_mask: self.sample_mask,
+            ds_state_com: ComRef(0),
+            ds_state: self.ds_state.clone(),
+            stencil_ref: self.stencil_ref,
+            rast_com: ComRef(0),
+            rast: self.rast.clone(),
+            viewports: self.viewports.clone(),
+            scissors: self.scissors.clone(),
+            so_targets: Vec::new(),
+            predicate_com: ComRef(0),
+            predicate_val: self.predicate_val,
+            pso_dirty: true,
+            rt_dirty: true,
+            vp_dirty: true,
+            scissor_dirty: true,
+            blend_factor_dirty: true,
+            stencil_ref_dirty: true,
+        }
     }
 }
 
@@ -3884,7 +3976,7 @@ unsafe extern "win64" fn clear_view(
 unsafe extern "win64" fn draw(this: PCtx, vertex_count: u32, start_vertex: u32) {
     let ctx = Obj::get(this);
     if ctx.deferred {
-        let st = Box::new(ctx.state.lock().unwrap().clone());
+        let st = Box::new(ctx.state.lock().unwrap().snapshot_for_draw());
         ctx.emit(RecordedCmd::Draw { state: st, vertex_count, instance_count: 1, start_vertex, start_instance: 0 });
         return;
     }
@@ -3911,7 +4003,7 @@ unsafe extern "win64" fn draw_instanced(
 ) {
     let ctx = Obj::get(this);
     if ctx.deferred {
-        let st = Box::new(ctx.state.lock().unwrap().clone());
+        let st = Box::new(ctx.state.lock().unwrap().snapshot_for_draw());
         ctx.emit(RecordedCmd::Draw { state: st, vertex_count, instance_count, start_vertex, start_instance });
         return;
     }
@@ -3932,7 +4024,7 @@ unsafe extern "win64" fn draw_instanced(
 unsafe extern "win64" fn draw_indexed(this: PCtx, index_count: u32, start_index: u32, base_vertex: i32) {
     let ctx = Obj::get(this);
     if ctx.deferred {
-        let st = Box::new(ctx.state.lock().unwrap().clone());
+        let st = Box::new(ctx.state.lock().unwrap().snapshot_for_draw());
         ctx.emit(RecordedCmd::DrawIndexed {
             state: st,
             index_count,
@@ -3967,7 +4059,7 @@ unsafe extern "win64" fn draw_indexed_instanced(
 ) {
     let ctx = Obj::get(this);
     if ctx.deferred {
-        let st = Box::new(ctx.state.lock().unwrap().clone());
+        let st = Box::new(ctx.state.lock().unwrap().snapshot_for_draw());
         ctx.emit(RecordedCmd::DrawIndexed {
             state: st,
             index_count,
@@ -3995,7 +4087,7 @@ unsafe extern "win64" fn draw_indexed_instanced(
 unsafe extern "win64" fn dispatch(this: PCtx, x: u32, y: u32, z: u32) {
     let ctx = Obj::get(this);
     if ctx.deferred {
-        let st = Box::new(ctx.state.lock().unwrap().clone());
+        let st = Box::new(ctx.state.lock().unwrap().snapshot_for_draw());
         ctx.emit(RecordedCmd::Dispatch { state: st, x, y, z });
         return;
     }
@@ -4021,7 +4113,7 @@ unsafe extern "win64" fn draw_instanced_indirect(this: PCtx, buf: *mut c_void, o
     };
     let ctx = Obj::get(this);
     if ctx.deferred {
-        let st = Box::new(ctx.state.lock().unwrap().clone());
+        let st = Box::new(ctx.state.lock().unwrap().snapshot_for_draw());
         ctx.emit(RecordedCmd::DrawInstancedIndirect { state: st, args, offset: off });
         return;
     }
@@ -4046,7 +4138,7 @@ unsafe extern "win64" fn draw_indexed_instanced_indirect(this: PCtx, buf: *mut c
     };
     let ctx = Obj::get(this);
     if ctx.deferred {
-        let st = Box::new(ctx.state.lock().unwrap().clone());
+        let st = Box::new(ctx.state.lock().unwrap().snapshot_for_draw());
         ctx.emit(RecordedCmd::DrawIndexedInstancedIndirect { state: st, args, offset: off });
         return;
     }
@@ -4071,7 +4163,7 @@ unsafe extern "win64" fn dispatch_indirect(this: PCtx, buf: *mut c_void, off: u3
     };
     let ctx = Obj::get(this);
     if ctx.deferred {
-        let st = Box::new(ctx.state.lock().unwrap().clone());
+        let st = Box::new(ctx.state.lock().unwrap().snapshot_for_draw());
         ctx.emit(RecordedCmd::DispatchIndirect { state: st, args, offset: off });
         return;
     }
@@ -4425,133 +4517,53 @@ unsafe extern "win64" fn swap_device_context_state(
 /// ARM64 JIT `DF_PLAIN` direct-call fast path:
 /// - `<= 8` integer/pointer arguments (including `this`), integer/void return
 /// - no `f32`/`f64`/XMM arguments or returns
-/// - no guest callbacks or SEH unwind
+/// - strictly callback-free: NEVER invokes `com_release`/`com_add_ref` on `ComRef`s
+///   (dropping a bound COM object's `PrivateData` can re-enter guest `IUnknown::Release`
+///   stored via `SetPrivateDataInterface`, which requires the generic bridge to publish
+///   the live guest stack pointer)
+/// - no SEH unwind
 ///
 /// Explicitly excluded:
 /// - Float/XMM-arg or float-return methods: `ClearDepthStencilView`, `SetResourceMinLOD`,
 ///   `GetResourceMinLOD`, `ClearRenderTargetView`, `ClearUnorderedAccessViewFloat`, `ClearView`
 /// - `> 8` argument methods: `CopySubresourceRegion` (9 args), `CopySubresourceRegion1` (10 args)
+/// - COM-refcount-mutating methods (`ClearState`, `FinishCommandList`, `ExecuteCommandList`,
+///   `SwapDeviceContextState`, and all `*_Set*` / `*_Get*` COM object binding slots)
 pub(crate) fn plain_fns() -> &'static [usize] {
     static FNS: OnceLock<Vec<usize>> = OnceLock::new();
     FNS.get_or_init(|| {
         vec![
-            vs_set_constant_buffers as *const () as usize,
-            ps_set_shader_resources as *const () as usize,
-            ps_set_shader as *const () as usize,
-            ps_set_samplers as *const () as usize,
-            vs_set_shader as *const () as usize,
             draw_indexed as *const () as usize,
             draw as *const () as usize,
             map as *const () as usize,
             unmap as *const () as usize,
-            ps_set_constant_buffers as *const () as usize,
-            ia_set_input_layout as *const () as usize,
-            ia_set_vertex_buffers as *const () as usize,
-            ia_set_index_buffer as *const () as usize,
             draw_indexed_instanced as *const () as usize,
             draw_instanced as *const () as usize,
-            gs_set_constant_buffers as *const () as usize,
-            gs_set_shader as *const () as usize,
             ia_set_primitive_topology as *const () as usize,
-            vs_set_shader_resources as *const () as usize,
-            vs_set_samplers as *const () as usize,
+            ia_get_primitive_topology as *const () as usize,
             begin_async as *const () as usize,
             end_async as *const () as usize,
             get_data as *const () as usize,
-            set_predication as *const () as usize,
-            gs_set_shader_resources as *const () as usize,
-            gs_set_samplers as *const () as usize,
-            om_set_render_targets as *const () as usize,
-            om_set_render_targets_and_uavs as *const () as usize,
-            om_set_blend_state as *const () as usize,
-            om_set_depth_stencil_state as *const () as usize,
-            so_set_targets as *const () as usize,
             draw_indexed_instanced_indirect as *const () as usize,
             draw_instanced_indirect as *const () as usize,
             dispatch as *const () as usize,
             dispatch_indirect as *const () as usize,
-            rs_set_state as *const () as usize,
             rs_set_viewports as *const () as usize,
+            rs_get_viewports as *const () as usize,
             rs_set_scissor_rects as *const () as usize,
+            rs_get_scissor_rects as *const () as usize,
             copy_resource as *const () as usize,
             update_subresource as *const () as usize,
+            update_subresource1 as *const () as usize,
             copy_structure_count as *const () as usize,
             clear_uav_uint as *const () as usize,
             generate_mips as *const () as usize,
             resolve_subresource as *const () as usize,
-            execute_command_list as *const () as usize,
-            hs_set_shader_resources as *const () as usize,
-            hs_set_shader as *const () as usize,
-            hs_set_samplers as *const () as usize,
-            hs_set_constant_buffers as *const () as usize,
-            ds_set_shader_resources as *const () as usize,
-            ds_set_shader as *const () as usize,
-            ds_set_samplers as *const () as usize,
-            ds_set_constant_buffers as *const () as usize,
-            cs_set_shader_resources as *const () as usize,
-            cs_set_uavs as *const () as usize,
-            cs_set_shader as *const () as usize,
-            cs_set_samplers as *const () as usize,
-            cs_set_constant_buffers as *const () as usize,
-            vs_get_constant_buffers as *const () as usize,
-            ps_get_shader_resources as *const () as usize,
-            ps_get_shader as *const () as usize,
-            ps_get_samplers as *const () as usize,
-            vs_get_shader as *const () as usize,
-            ps_get_constant_buffers as *const () as usize,
-            ia_get_input_layout as *const () as usize,
-            ia_get_vertex_buffers as *const () as usize,
-            ia_get_index_buffer as *const () as usize,
-            gs_get_constant_buffers as *const () as usize,
-            gs_get_shader as *const () as usize,
-            ia_get_primitive_topology as *const () as usize,
-            vs_get_shader_resources as *const () as usize,
-            vs_get_samplers as *const () as usize,
-            get_predication as *const () as usize,
-            gs_get_shader_resources as *const () as usize,
-            gs_get_samplers as *const () as usize,
-            om_get_render_targets as *const () as usize,
-            om_get_render_targets_and_uavs as *const () as usize,
-            om_get_blend_state as *const () as usize,
-            om_get_depth_stencil_state as *const () as usize,
-            so_get_targets as *const () as usize,
-            rs_get_state as *const () as usize,
-            rs_get_viewports as *const () as usize,
-            rs_get_scissor_rects as *const () as usize,
-            hs_get_shader_resources as *const () as usize,
-            hs_get_shader as *const () as usize,
-            hs_get_samplers as *const () as usize,
-            hs_get_constant_buffers as *const () as usize,
-            ds_get_shader_resources as *const () as usize,
-            ds_get_shader as *const () as usize,
-            ds_get_samplers as *const () as usize,
-            ds_get_constant_buffers as *const () as usize,
-            cs_get_shader_resources as *const () as usize,
-            cs_get_uavs as *const () as usize,
-            cs_get_shader as *const () as usize,
-            cs_get_samplers as *const () as usize,
-            cs_get_constant_buffers as *const () as usize,
-            clear_state as *const () as usize,
             flush as *const () as usize,
             get_type as *const () as usize,
             get_context_flags as *const () as usize,
-            finish_command_list as *const () as usize,
-            update_subresource1 as *const () as usize,
             discard_resource as *const () as usize,
             discard_view as *const () as usize,
-            vs_set_constant_buffers1 as *const () as usize,
-            hs_set_constant_buffers1 as *const () as usize,
-            ds_set_constant_buffers1 as *const () as usize,
-            gs_set_constant_buffers1 as *const () as usize,
-            ps_set_constant_buffers1 as *const () as usize,
-            cs_set_constant_buffers1 as *const () as usize,
-            vs_get_constant_buffers1 as *const () as usize,
-            hs_get_constant_buffers1 as *const () as usize,
-            ds_get_constant_buffers1 as *const () as usize,
-            gs_get_constant_buffers1 as *const () as usize,
-            ps_get_constant_buffers1 as *const () as usize,
-            cs_get_constant_buffers1 as *const () as usize,
-            swap_device_context_state as *const () as usize,
             discard_view1 as *const () as usize,
         ]
     })

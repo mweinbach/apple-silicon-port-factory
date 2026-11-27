@@ -4923,35 +4923,25 @@ fn df_plain_registration_audit_and_pso_key_compactness() {
     let vtbl = <context::D3d11Context as crate::d3d12::com::ComClass>::class().vtbl;
     let slot_addr = |idx: usize| unsafe { *(vtbl.add(idx)) };
 
-    // Integer-only <= 8-arg hot context methods MUST be DF_PLAIN.
+    // Strictly callback-free, integer-only <= 8-arg hot context methods MUST be DF_PLAIN.
     for (name, idx) in [
-        ("VSSetConstantBuffers", 7),
-        ("PSSetShaderResources", 8),
-        ("PSSetShader", 9),
-        ("PSSetSamplers", 10),
-        ("VSSetShader", 11),
         ("DrawIndexed", 12),
         ("Draw", 13),
         ("Map", 14),
         ("Unmap", 15),
-        ("PSSetConstantBuffers", 16),
-        ("IASetInputLayout", 17),
-        ("IASetVertexBuffers", 18),
-        ("IASetIndexBuffer", 19),
         ("DrawIndexedInstanced", 20),
         ("DrawInstanced", 21),
         ("IASetPrimitiveTopology", 24),
-        ("OMSetRenderTargets", 33),
-        ("OMSetRenderTargetsAndUnorderedAccessViews", 34),
-        ("OMSetBlendState", 35),
-        ("OMSetDepthStencilState", 36),
+        ("DrawIndexedInstancedIndirect", 39),
+        ("DrawInstancedIndirect", 40),
         ("Dispatch", 41),
-        ("RSSetState", 43),
+        ("DispatchIndirect", 42),
         ("RSSetViewports", 44),
         ("RSSetScissorRects", 45),
         ("CopyResource", 47),
         ("UpdateSubresource", 48),
         ("Flush", 111),
+        ("UpdateSubresource1", 116),
     ] {
         assert!(
             plain.contains(&slot_addr(idx)),
@@ -4959,15 +4949,33 @@ fn df_plain_registration_audit_and_pso_key_compactness() {
         );
     }
 
-    // Float-arg / float-ret / >8-arg context methods MUST stay excluded from DF_PLAIN.
+    // Float-arg / float-ret / >8-arg AND COM-release/AddRef callback-capable methods MUST
+    // stay excluded from DF_PLAIN.
     for (name, idx) in [
+        ("VSSetConstantBuffers", 7),
+        ("PSSetShaderResources", 8),
+        ("PSSetShader", 9),
+        ("PSSetSamplers", 10),
+        ("VSSetShader", 11),
+        ("IASetInputLayout", 17),
+        ("IASetVertexBuffers", 18),
+        ("IASetIndexBuffer", 19),
+        ("OMSetRenderTargets", 33),
+        ("OMSetRenderTargetsAndUnorderedAccessViews", 34),
+        ("OMSetBlendState", 35),
+        ("OMSetDepthStencilState", 36),
+        ("RSSetState", 43),
         ("CopySubresourceRegion", 46),
         ("ClearRenderTargetView", 50),
         ("ClearUnorderedAccessViewFloat", 52),
         ("ClearDepthStencilView", 53),
         ("SetResourceMinLOD", 55),
         ("GetResourceMinLOD", 56),
+        ("ExecuteCommandList", 58),
+        ("ClearState", 110),
+        ("FinishCommandList", 114),
         ("CopySubresourceRegion1", 115),
+        ("SwapDeviceContextState", 131),
         ("ClearView", 132),
     ] {
         assert!(
