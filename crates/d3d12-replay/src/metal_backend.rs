@@ -43,7 +43,7 @@ pub(crate) const DEFAULT_MAX_TIMESTAMPS: u32 = 4096;
 
 /// Live descriptor heap paired with its recorded address space for safe handle remapping.
 struct LiveDescHeap {
-    heap: DescriptorHeap,
+    heap: Arc<DescriptorHeap>,
     rec_cpu_start: u64,
     rec_gpu_start: u64,
     rec_stride: u64,
@@ -143,6 +143,13 @@ struct LiveCommandList {
     /// source resource right before `ExecuteCommandLists` so submission-time `WriteResource`
     /// uploads (`tr::sync_uploads`) are reflected in the relocated scratch buffer.
     pending_indirect_relocs: Vec<PendingIndirectReloc>,
+    /// Strong references to every `Resource`, `DescriptorHeap`, and `QueryHeap` referenced by
+    /// commands recorded on this list (including non-owning `TargetView` and barrier raw pointers,
+    /// relocated indirect scratch buffers, and bound heaps), kept alive until `Reset` and moved to
+    /// `retired` across `Reset` so `Release` + queue drain can never cause a host or GPU UAF.
+    retained_resources: Vec<Arc<Resource>>,
+    retained_desc_heaps: Vec<Arc<DescriptorHeap>>,
+    retained_query_heaps: Vec<Arc<QueryHeap>>,
 }
 
 #[derive(Clone)]
@@ -534,6 +541,9 @@ impl MetalBackend {
             l.closed_ts_pair = None;
             l.submitted_since_reset = false;
             l.pending_indirect_relocs.clear();
+            l.retained_resources.clear();
+            l.retained_desc_heaps.clear();
+            l.retained_query_heaps.clear();
             if let Some(p) = pso {
                 bind_pso(&mut l.cl, p);
             }
@@ -747,7 +757,10 @@ impl MetalBackend {
         Ok(())
     }
 
-    fn decode_copy_loc<'a>(resources: &'a HashMap<u64, Arc<Resource>>, blob: &[u8]) -> Result<CopyLoc<'a>, String> {
+    fn decode_copy_loc_owned(
+        resources: &HashMap<u64, Arc<Resource>>,
+        blob: &[u8],
+    ) -> Result<(Arc<Resource>, Result<u32, PlacedFootprint>), String> {
         if blob.len() < 48 {
             return Err(format!("D3D12_TEXTURE_COPY_LOCATION too short ({} bytes)", blob.len()));
         }
@@ -755,13 +768,14 @@ impl MetalBackend {
         let loc_type = u32::from_le_bytes(blob[8..12].try_into().unwrap());
         let res = resources
             .get(&res_id)
+            .cloned()
             .ok_or_else(|| format!("CopyTextureRegion unknown resource {res_id:#x}"))?;
         if loc_type == 0 {
             let sub = u32::from_le_bytes(blob[16..20].try_into().unwrap());
-            Ok(CopyLoc::Subresource(res.as_ref(), sub))
+            Ok((res, Ok(sub)))
         } else {
             let fp = read_copy::<PlacedFootprint>(&blob[16..48])?;
-            Ok(CopyLoc::Footprint(res.as_ref(), fp))
+            Ok((res, Err(fp)))
         }
     }
 }
@@ -837,11 +851,17 @@ impl Backend for MetalBackend {
                         closed_ts_pair: None,
                         submitted_since_reset: false,
                         pending_indirect_relocs: Vec::new(),
+                        retained_resources: Vec::new(),
+                        retained_desc_heaps: Vec::new(),
+                        retained_query_heaps: Vec::new(),
                     },
                 );
                 Ok(Handled::Done)
             }
             Call::CreateDescriptorHeap { heap, desc, cpu_start, gpu_start, .. } => {
+                if self.desc_heaps.contains_key(heap) {
+                    return Err(format!("CreateDescriptorHeap: duplicate still-live descriptor heap id {heap:#x}"));
+                }
                 let d = read_copy::<DescriptorHeapDesc>(desc)?;
                 let shader_visible = (d.Flags & 1) != 0;
                 let dh = DescriptorHeap::new(
@@ -859,7 +879,7 @@ impl Backend for MetalBackend {
                 self.desc_heaps.insert(
                     *heap,
                     LiveDescHeap {
-                        heap: dh,
+                        heap: Arc::new(dh),
                         rec_cpu_start: *cpu_start,
                         rec_gpu_start: *gpu_start,
                         rec_stride: stride,
@@ -1236,8 +1256,20 @@ impl Backend for MetalBackend {
                 l.closed_ts_pair = None;
                 l.submitted_since_reset = false;
                 l.pending_indirect_relocs.clear();
+                let old_retained = std::mem::take(&mut l.retained_resources);
+                let old_desc_heaps = std::mem::take(&mut l.retained_desc_heaps);
+                let old_query_heaps = std::mem::take(&mut l.retained_query_heaps);
                 if let Some(p) = live_pso {
                     bind_pso(&mut l.cl, p);
+                }
+                if !old_retained.is_empty() {
+                    self.retired.push(Box::new(old_retained));
+                }
+                if !old_desc_heaps.is_empty() {
+                    self.retired.push(Box::new(old_desc_heaps));
+                }
+                if !old_query_heaps.is_empty() {
+                    self.retired.push(Box::new(old_query_heaps));
                 }
                 Ok(Handled::Done)
             }
@@ -1272,33 +1304,40 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::SetPredication { list, buffer, aligned_offset, operation } => {
-                let pred = if *buffer == 0 {
-                    None
+                let (pred, pred_res) = if *buffer == 0 {
+                    (None, None)
                 } else {
                     let res = self
                         .resources
                         .get(buffer)
+                        .cloned()
                         .ok_or_else(|| format!("SetPredication unknown buffer {buffer:#x}"))?;
-                    Some((res.gpu_va + aligned_offset, *operation))
+                    (Some((res.gpu_va + aligned_offset, *operation)), Some(res))
                 };
                 let l = self
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("SetPredication unknown command list {list:#x}"))?;
+                if let Some(r) = pred_res {
+                    l.retained_resources.push(r);
+                }
                 l.cl.set_predication(pred);
                 Ok(Handled::Done)
             }
             Call::ResourceBarrier { list, barriers } => {
                 let raw_barriers = read_copy_array::<ResourceBarrier>(barriers)?;
                 let mut items = Vec::with_capacity(raw_barriers.len());
+                let mut barrier_res = Vec::with_capacity(raw_barriers.len());
                 for b in &raw_barriers {
                     match b.Type {
                         0 => {
                             let res_id = b.u[0];
-                            let ptr = self
-                                .resources
-                                .get(&res_id)
-                                .map_or(0, |r| Arc::as_ptr(r) as usize);
+                            let ptr = if let Some(r) = self.resources.get(&res_id) {
+                                barrier_res.push(Arc::clone(r));
+                                Arc::as_ptr(r) as usize
+                            } else {
+                                0
+                            };
                             let sub = b.u[1] as u32;
                             let before = (b.u[1] >> 32) as u32;
                             let after = b.u[2] as u32;
@@ -1311,10 +1350,12 @@ impl Backend for MetalBackend {
                         1 => items.push(Barrier::Full),
                         2 => {
                             let res_id = b.u[0];
-                            let ptr = self
-                                .resources
-                                .get(&res_id)
-                                .map_or(0, |r| Arc::as_ptr(r) as usize);
+                            let ptr = if let Some(r) = self.resources.get(&res_id) {
+                                barrier_res.push(Arc::clone(r));
+                                Arc::as_ptr(r) as usize
+                            } else {
+                                0
+                            };
                             items.push(Barrier::Uav(ptr));
                         }
                         _ => items.push(Barrier::Full),
@@ -1324,6 +1365,7 @@ impl Backend for MetalBackend {
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("ResourceBarrier unknown command list {list:#x}"))?;
+                l.retained_resources.extend(barrier_res);
                 l.cl.barrier_list(&items);
                 Ok(Handled::Done)
             }
@@ -1368,11 +1410,13 @@ impl Backend for MetalBackend {
             }
             Call::SetDescriptorHeaps { list, heaps } => {
                 let (mut res_gpu, mut samp_gpu) = (0u64, 0u64);
+                let mut bound_heaps = Vec::with_capacity(heaps.len());
                 for hid in heaps.iter() {
                     let h = self
                         .desc_heaps
                         .get(&hid)
                         .ok_or_else(|| format!("SetDescriptorHeaps unknown heap {hid:#x}"))?;
+                    bound_heaps.push(Arc::clone(&h.heap));
                     match h.heap.kind {
                         heap_kind::CBV_SRV_UAV => res_gpu = h.heap.gpu_base,
                         heap_kind::SAMPLER => samp_gpu = h.heap.gpu_base,
@@ -1383,6 +1427,7 @@ impl Backend for MetalBackend {
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
+                l.retained_desc_heaps.extend(bound_heaps);
                 l.cl.set_descriptor_heaps(res_gpu, samp_gpu);
                 Ok(Handled::Done)
             }
@@ -1489,14 +1534,18 @@ impl Backend for MetalBackend {
             }
             Call::OMSetRenderTargets { list, rtvs, dsv } => {
                 let mut live_rtvs = Vec::with_capacity(rtvs.len());
+                let mut bound_res = Vec::with_capacity(rtvs.len() + 1);
                 let mut first_rtv_res = None;
                 for h in rtvs.iter() {
                     if h == 0 {
                         live_rtvs.push(TargetView::NULL);
                     } else {
                         let (tv, res) = self.resolve_target_view(h)?;
-                        if first_rtv_res.is_none() {
-                            first_rtv_res = res;
+                        if let Some(r) = res {
+                            if first_rtv_res.is_none() {
+                                first_rtv_res = Some(Arc::clone(&r));
+                            }
+                            bound_res.push(r);
                         }
                         live_rtvs.push(tv);
                     }
@@ -1504,11 +1553,20 @@ impl Backend for MetalBackend {
                 if first_rtv_res.is_some() {
                     self.last_rtv = first_rtv_res;
                 }
-                let live_dsv = if *dsv != 0 { Some(self.resolve_target_view(*dsv)?.0) } else { None };
+                let live_dsv = if *dsv != 0 {
+                    let (tv, res) = self.resolve_target_view(*dsv)?;
+                    if let Some(r) = res {
+                        bound_res.push(r);
+                    }
+                    Some(tv)
+                } else {
+                    None
+                };
                 let l = self
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
+                l.retained_resources.extend(bound_res);
                 l.cl.set_render_targets(live_rtvs, live_dsv);
                 Ok(Handled::Done)
             }
@@ -1546,19 +1604,22 @@ impl Backend for MetalBackend {
             }
             Call::ClearRenderTargetView { list, rtv, color, rects } => {
                 let (tv, res) = self.resolve_target_view(*rtv)?;
-                if res.is_some() {
-                    self.last_rtv = res;
+                if let Some(ref r) = res {
+                    self.last_rtv = Some(Arc::clone(r));
                 }
                 let rs = read_copy_array::<Rect>(rects)?;
                 let l = self
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
+                if let Some(r) = res {
+                    l.retained_resources.push(r);
+                }
                 unsafe { l.cl.clear_rtv(&tv, *color, &rs)? };
                 Ok(Handled::Done)
             }
             Call::ClearDepthStencilView { list, dsv, flags, depth, stencil, rects } => {
-                let (tv, _) = self.resolve_target_view(*dsv)?;
+                let (tv, res) = self.resolve_target_view(*dsv)?;
                 let rs = read_copy_array::<Rect>(rects)?;
                 let clear_d = (*flags & 1) != 0;
                 let clear_s = (*flags & 2) != 0;
@@ -1566,6 +1627,9 @@ impl Backend for MetalBackend {
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
+                if let Some(r) = res {
+                    l.retained_resources.push(r);
+                }
                 unsafe { l.cl.clear_dsv(&tv, clear_d, *depth, clear_s, *stencil, &rs)? };
                 Ok(Handled::Done)
             }
@@ -1589,6 +1653,7 @@ impl Backend for MetalBackend {
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
                 l.cl.clear_uav_handle(live_cpu, &res, ClearValue::Uint(v), &rs)?;
+                l.retained_resources.push(res);
                 Ok(Handled::Done)
             }
             Call::ClearUnorderedAccessViewFloat { list, cpu_handle, resource, values, rects, .. } => {
@@ -1607,6 +1672,7 @@ impl Backend for MetalBackend {
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
                 l.cl.clear_uav_handle(live_cpu, &res, ClearValue::Float(*values), &rs)?;
+                l.retained_resources.push(res);
                 Ok(Handled::Done)
             }
             Call::DiscardResource { list, resource, region } => {
@@ -1630,6 +1696,7 @@ impl Backend for MetalBackend {
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
                 l.cl.discard_resource(&res, reg);
+                l.retained_resources.push(res);
                 Ok(Handled::Done)
             }
             Call::DrawInstanced { list, vertex_count, instance_count, start_vertex, start_instance } => {
@@ -1675,14 +1742,15 @@ impl Backend for MetalBackend {
                     .get(args)
                     .cloned()
                     .ok_or_else(|| format!("ExecuteIndirect unknown args buffer {args:#x}"))?;
-                let count_va = if *count != 0 {
+                let (count_va, count_res) = if *count != 0 {
                     let c_res = self
                         .resources
                         .get(count)
+                        .cloned()
                         .ok_or_else(|| format!("ExecuteIndirect unknown count buffer {count:#x}"))?;
-                    Some(c_res.gpu_va + count_offset)
+                    (Some(c_res.gpu_va + count_offset), Some(c_res))
                 } else {
-                    None
+                    (None, None)
                 };
                 let args_len = (*max_count as usize)
                     .checked_mul(sig.layout.stride as usize)
@@ -1696,7 +1764,6 @@ impl Backend for MetalBackend {
                         )
                     })?;
                     let scratch = self.build_relocated_indirect_args(&sig, *max_count, src_bytes)?;
-                    self.retired.push(Box::new(Arc::clone(&scratch)));
                     Some(scratch)
                 } else {
                     None
@@ -1710,7 +1777,12 @@ impl Backend for MetalBackend {
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
                 l.cl.execute_indirect(&sig.layout, *max_count, live_args_va, args_cpu, count_va)?;
+                l.retained_resources.push(args_res);
+                if let Some(cr) = count_res {
+                    l.retained_resources.push(cr);
+                }
                 if let Some(scratch) = relocated_scratch {
+                    l.retained_resources.push(Arc::clone(&scratch));
                     l.pending_indirect_relocs.push(PendingIndirectReloc {
                         sig,
                         max_count: *max_count,
@@ -1738,11 +1810,13 @@ impl Backend for MetalBackend {
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
                 l.cl.copy_buffer(&dr, *dst_offset, &sr, *src_offset, *size)?;
+                l.retained_resources.push(dr);
+                l.retained_resources.push(sr);
                 Ok(Handled::Done)
             }
             Call::CopyTextureRegion { list, dst, dst_x, dst_y, dst_z, src, src_box } => {
-                let dloc = Self::decode_copy_loc(&self.resources, dst)?;
-                let sloc = Self::decode_copy_loc(&self.resources, src)?;
+                let (d_res, d_kind) = Self::decode_copy_loc_owned(&self.resources, dst)?;
+                let (s_res, s_kind) = Self::decode_copy_loc_owned(&self.resources, src)?;
                 let sbox = match src_box {
                     Some(b) => Some(read_copy::<CopyBox>(b)?),
                     None => None,
@@ -1751,7 +1825,17 @@ impl Backend for MetalBackend {
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
+                let dloc = match d_kind {
+                    Ok(sub) => CopyLoc::Subresource(d_res.as_ref(), sub),
+                    Err(fp) => CopyLoc::Footprint(d_res.as_ref(), fp),
+                };
+                let sloc = match s_kind {
+                    Ok(sub) => CopyLoc::Subresource(s_res.as_ref(), sub),
+                    Err(fp) => CopyLoc::Footprint(s_res.as_ref(), fp),
+                };
                 l.cl.copy_texture_region(dloc, [*dst_x, *dst_y, *dst_z], sloc, sbox)?;
+                l.retained_resources.push(d_res);
+                l.retained_resources.push(s_res);
                 Ok(Handled::Done)
             }
             Call::CopyResource { list, dst, src } => {
@@ -1770,6 +1854,8 @@ impl Backend for MetalBackend {
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
                 l.cl.copy_resource(&dr, &sr)?;
+                l.retained_resources.push(dr);
+                l.retained_resources.push(sr);
                 Ok(Handled::Done)
             }
             Call::ResolveSubresource { list, dst, dst_sub, src, src_sub, format } => {
@@ -1788,6 +1874,8 @@ impl Backend for MetalBackend {
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
                 l.cl.resolve_subresource(&dr, *dst_sub, &sr, *src_sub, *format)?;
+                l.retained_resources.push(dr);
+                l.retained_resources.push(sr);
                 Ok(Handled::Done)
             }
             Call::BeginQuery { list, heap, query_type, index } => {
@@ -1805,6 +1893,7 @@ impl Backend for MetalBackend {
                     query::query_type::BINARY_OCCLUSION => l.cl.begin_occlusion(&qh, *index, true)?,
                     _ => return Ok(Handled::Skipped),
                 }
+                l.retained_query_heaps.push(qh);
                 Ok(Handled::Done)
             }
             Call::EndQuery { list, heap, query_type, index } => {
@@ -1824,6 +1913,7 @@ impl Backend for MetalBackend {
                     }
                     _ => return Ok(Handled::Skipped),
                 }
+                l.retained_query_heaps.push(qh);
                 Ok(Handled::Done)
             }
             Call::ResolveQueryData { list, heap, query_type, start, count, dst, dst_offset } => {
@@ -1848,6 +1938,8 @@ impl Backend for MetalBackend {
                     }
                     _ => return Ok(Handled::Skipped),
                 }
+                l.retained_query_heaps.push(qh);
+                l.retained_resources.push(dr);
                 Ok(Handled::Done)
             }
             Call::BuildRaytracingAccelerationStructure { .. }

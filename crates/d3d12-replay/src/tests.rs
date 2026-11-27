@@ -2208,3 +2208,153 @@ fn metal_backend_rejects_duplicate_resource_id_and_stale_target_view() {
     );
 }
 
+#[test]
+fn metal_backend_retains_bound_dsv_after_release_and_drain() {
+    if !metal_and_converter_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::metal::descriptor::heap_kind;
+    use d3d12_metal::types::{
+        dim, heap_type, resource_flags, CommandQueueDesc, DescriptorHeapDesc, HeapProperties, Rect,
+        ResourceDesc, Viewport,
+    };
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    const MS_DIRECT: &[u8] = include_bytes!("../../d3d12-metal/tests/fixtures/mesh_direct.ms.dxil");
+    let ms = signed(MS_DIRECT);
+    let ps = signed(MESH_PS);
+    let rs_blob = RootSignatureDesc::from_blob(&ms).unwrap().to_blob();
+
+    let mut blend = vec![0u8; 328];
+    for (off, v) in [(8, 2u32), (12, 1), (16, 1), (20, 2), (24, 1), (28, 1), (32, 4)] {
+        blend[8 + off..8 + off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    blend[8 + 36] = 0xF;
+    let mut raster = vec![0u8; 44];
+    raster[0..4].copy_from_slice(&3u32.to_le_bytes());
+    raster[4..8].copy_from_slice(&1u32.to_le_bytes());
+    raster[24..28].copy_from_slice(&1u32.to_le_bytes());
+    let mut depth = vec![0u8; 52];
+    depth[8..12].copy_from_slice(&8u32.to_le_bytes());
+    for face in [20, 36] {
+        for (k, v) in [1u32, 1, 1, 8].into_iter().enumerate() {
+            depth[face + 4 * k..face + 4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    let rtv_fmts = [28u32];
+    let pso_desc = GraphicsPipeline {
+        root_signature: 50,
+        vs: &[],
+        ps: &ps,
+        ds: &[],
+        hs: &[],
+        gs: &[],
+        stream_output: &[],
+        blend: &blend,
+        sample_mask: u32::MAX,
+        rasterizer: &raster,
+        raster_version: 0,
+        depth_stencil: &depth,
+        depth_stencil_version: 0,
+        input_layout: &[],
+        ib_strip_cut_value: 0,
+        primitive_topology_type: 3,
+        rtv_formats: U32s::from_slice(&rtv_fmts),
+        dsv_format: 40, // DXGI_FORMAT_D32_FLOAT
+        sample_count: 1,
+        sample_quality: 0,
+        node_mask: 0,
+        flags: 0,
+    };
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let hp_def = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+    let hp_up = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+    let rt_desc = ResourceDesc {
+        Dimension: dim::TEXTURE2D,
+        Width: 64,
+        Height: 64,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: 28,
+        SampleCount: 1,
+        Flags: resource_flags::ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let dsv_desc = ResourceDesc {
+        Dimension: dim::TEXTURE2D,
+        Width: 64,
+        Height: 64,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: 40, // DXGI_FORMAT_D32_FLOAT
+        SampleCount: 1,
+        Flags: resource_flags::ALLOW_DEPTH_STENCIL,
+        ..Default::default()
+    };
+    let up_desc = ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: 64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        ..Default::default()
+    };
+    let rtv_hd = DescriptorHeapDesc { Type: heap_kind::RTV, NumDescriptors: 1, Flags: 0, NodeMask: 0 };
+    let dsv_hd = DescriptorHeapDesc { Type: heap_kind::DSV, NumDescriptors: 1, Flags: 0, NodeMask: 0 };
+    let rtv_cpu = 0x7f30_0000u64;
+    let dsv_cpu = 0x7f40_0000u64;
+    let rtvs = [rtv_cpu];
+    let vp = Viewport { x: 0.0, y: 0.0, w: 64.0, h: 64.0, min_depth: 0.0, max_depth: 1.0 };
+    let sc = Rect { left: 0, top: 0, right: 64, bottom: 64 };
+    let consts = [0u32, 192, 0, 0];
+    let l_dummy = [5u64];
+    let l_draw = [4u64];
+
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 3, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 6, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateRootSignature { device: 1, root_signature: 50, blob: &rs_blob }, 0).unwrap();
+    w.write(&Call::CreateMeshPipelineState { device: 1, pso: 51, amplification: &[], mesh: &ms, desc: pso_desc }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 10, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&rt_desc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 11, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&dsv_desc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 12, heap_properties: bytes_of(&hp_up), heap_flags: 0, desc: bytes_of(&up_desc), initial_state: 0, clear_value: None, gpu_va: 0x4_f500_0000 }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: 1, heap: 20, desc: bytes_of(&rtv_hd), cpu_start: rtv_cpu, gpu_start: 0 }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: 1, heap: 21, desc: bytes_of(&dsv_hd), cpu_start: dsv_cpu, gpu_start: 0 }, 0).unwrap();
+    w.write(&Call::CreateRenderTargetView { resource: 10, desc: None, dest: rtv_cpu }, 0).unwrap();
+    w.write(&Call::CreateDepthStencilView { resource: 11, desc: None, dest: dsv_cpu }, 0).unwrap();
+    // Bind RTV + DSV on list 4, then Release DSV 11, submit dummy list 5, and trigger WriteResource
+    // so `drain_unblocked_queues()` clears `self.retired` BEFORE list 4 records its draw!
+    w.write(&Call::CreateCommandList { device: 1, list: 4, list_type: 0, allocator: 3, initial_pso: 51 }, 0).unwrap();
+    w.write(&Call::SetGraphicsRootSignature { list: 4, root_signature: 50 }, 0).unwrap();
+    w.write(&Call::OMSetRenderTargets { list: 4, rtvs: U64s::from_slice(&rtvs), dsv: dsv_cpu }, 0).unwrap();
+    w.write(&Call::Release { object: 11 }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: 1, list: 5, list_type: 0, allocator: 6, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::Close { list: 5 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&l_dummy) }, 0).unwrap();
+    w.write(&Call::WriteResource { resource: 12, subresource: 0, offset: 0, data: &[1, 2, 3, 4] }, 0).unwrap();
+    // Now draw on list 4 (which still has the DSV bound): must NOT UAF!
+    w.write(&Call::RSSetViewports { list: 4, viewports: bytes_of(&vp) }, 0).unwrap();
+    w.write(&Call::RSSetScissorRects { list: 4, rects: bytes_of(&sc) }, 0).unwrap();
+    w.write(&Call::SetRoot32BitConstants { list: 4, compute: false, param: 0, dest_offset: 0, values: U32s::from_slice(&consts) }, 0).unwrap();
+    w.write(&Call::DispatchMesh { list: 4, x: 4, y: 1, z: 1 }, 0).unwrap();
+    w.write(&Call::Close { list: 4 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&l_draw) }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    let img = backend.capture_frame().unwrap();
+    assert_eq!(pixel_at(&img, 16, 16), [255, 0, 0]);
+    assert_eq!(pixel_at(&img, 48, 48), [192, 192, 192]);
+}
+
