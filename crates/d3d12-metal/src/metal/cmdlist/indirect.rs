@@ -898,7 +898,11 @@ impl CommandList {
                     || ((self.opts.opt_queue_start_stage_exact || self.list_rsplit_v2_active())
                         && self.occlusion.is_none()));
             self.bar.opening_pre_raster_stages = MTLStages::Vertex;
-            let enc_res = unsafe { self.draw_encoder_for(first_eff_reads) };
+            // Open the deferred batch's render pass using its captured segment PSO's RTV
+            // mask rather than `self.gfx.pso`, which may already hold a narrower next PSO.
+            let batch_rtv_fmts = segs.first().map(|s| s.pso.rtv_formats.as_slice());
+            let enc_res =
+                unsafe { self.draw_encoder_for_rtv_formats(first_eff_reads, batch_rtv_fmts) };
             self.bar.opening_pre_raster_stages = PRE_RASTER;
             self.bar.opening_render_split_ok = false;
             self.icb.icb_prepass_flushing = false;
@@ -2849,14 +2853,17 @@ impl CommandList {
 
         stats::inc(&stats::c::ei_icb);
         let cb_ptr = Retained::as_ptr(&self.cb) as usize;
+        let alloc_key = self.alloc_key;
 
         let (e, icb) = if indirect_icb::in_pass() {
-            // Preserve `pass_uav_hazard` ordering, render-pass barriers, dynamic state, and
-            // masked RTV attachments via `begin_mesh(true)` before allocating scratch/ICB slots.
-            let (e, _p) = self.begin_mesh(true)?;
+            // Preserve `pass_uav_hazard` ordering, render-pass barriers (including
+            // `MTLStages::Vertex` + `READS_BUF` for the vertex expander's `args`/`count`/`pred`
+            // inputs), dynamic state, and masked RTV attachments via `begin_mesh_for(true, true)`.
+            let (e, _p) = self.begin_mesh_for(true, true)?;
             let eff_fmts = self.open_pass_rtv_formats(&p.rtv_formats);
             let ex = crate::mesh::mesh_icb_expander(&eff_fmts, p.sample_count)?;
-            let (icb, location) = crate::mesh::alloc_mesh_icb(cb_ptr, max_count, has_object)?;
+            let (icb, location) =
+                crate::mesh::alloc_mesh_icb(cb_ptr, alloc_key, max_count, has_object)?;
             q.icb = unsafe { std::mem::transmute::<MTLResourceID, u64>(icb.gpuResourceID()) };
             q.location = location;
             let scratch = self.icb.icb_scratch.clone().ok_or("command list is not open")?;
@@ -2917,7 +2924,8 @@ impl CommandList {
             let k = crate::mesh::mesh_icb_kernel()?;
             let root = self.flush_root(false)?;
             let ce = self.compute().ok_or("compute encoder")?;
-            let (icb, location) = crate::mesh::alloc_mesh_icb(cb_ptr, max_count, has_object)?;
+            let (icb, location) =
+                crate::mesh::alloc_mesh_icb(cb_ptr, alloc_key, max_count, has_object)?;
             q.icb = unsafe { std::mem::transmute::<MTLResourceID, u64>(icb.gpuResourceID()) };
             q.location = location;
             let scratch = self.icb.icb_scratch.clone().ok_or("command list is not open")?;

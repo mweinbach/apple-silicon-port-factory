@@ -154,12 +154,14 @@ pub fn has_pending_cbs() -> bool {
     GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
 }
 
-/// Lock-free check for whether any command buffer is either buffered in `pending_cbs`
-/// or still in flight inside an async [`CommitWorker`].
+/// Lock-free check for whether any command buffer is either buffered in `pending_cbs`,
+/// still in flight inside an async [`CommitWorker`], or holds active recording-level mesh
+/// ICB ownership that must be released on `CommandList::begin` / `CommandAllocator::reset`.
 #[inline]
 pub fn has_uncommitted_cbs() -> bool {
     GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
         || GLOBAL_INFLIGHT_COMMIT_CBS.load(Ordering::Acquire) > 0
+        || crate::mesh::has_active_mesh_icbs()
 }
 
 /// Lock-free check for whether any queue currently holds buffered command buffers or deferred signals.
@@ -986,101 +988,115 @@ impl Queue {
         }
     }
 
-    /// Ensure `cb` is no longer buffered in `pending_cbs` and neither `cb` nor
-    /// `alloc_key` is still in flight on an async [`CommitWorker`] before
-    /// `CommandList::begin(&alloc)` re-begins `cb` on `alloc`.
+    /// Ensure `cb` is no longer buffered in `pending_cbs`, neither `cb` nor `alloc_key`
+    /// is still in flight on an async [`CommitWorker`], and any prior recording-level
+    /// mesh ICB ownership for `cb` is released before `CommandList::begin(&alloc)`.
     pub(crate) fn flush_if_cb_or_alloc_in_flight(cb: &MtlCommandBuffer, alloc_key: usize) {
         if !has_uncommitted_cbs() {
             return;
         }
         let target = cb as *const MtlCommandBuffer as usize;
-        const INLINE_W: usize = 4;
-        let mut inline_w: [Option<Arc<CommitWorker>>; INLINE_W] = [const { None }; INLINE_W];
-        let mut inline_len = 0usize;
-        let mut overflow_w: Vec<Arc<CommitWorker>> = Vec::new();
+        if GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
+            || GLOBAL_INFLIGHT_COMMIT_CBS.load(Ordering::Acquire) > 0
         {
-            let aq = active_queues().lock().unwrap();
-            for &p in aq.iter() {
-                // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
-                let q = unsafe { &*(p as *const Queue) };
-                if q.has_pending_cbs.load(Ordering::Acquire) {
-                    let _g = q.submit.lock().unwrap();
-                    let found = {
-                        let pc = q.pending_cbs.lock().unwrap();
-                        pc.iter().any(|(c, _)| Retained::as_ptr(c) as usize == target)
-                    };
-                    if found {
-                        q.flush_pending_cbs_locked();
+            const INLINE_W: usize = 4;
+            let mut inline_w: [Option<Arc<CommitWorker>>; INLINE_W] = [const { None }; INLINE_W];
+            let mut inline_len = 0usize;
+            let mut overflow_w: Vec<Arc<CommitWorker>> = Vec::new();
+            {
+                let aq = active_queues().lock().unwrap();
+                for &p in aq.iter() {
+                    // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+                    let q = unsafe { &*(p as *const Queue) };
+                    if q.has_pending_cbs.load(Ordering::Acquire) {
+                        let _g = q.submit.lock().unwrap();
+                        let found = {
+                            let pc = q.pending_cbs.lock().unwrap();
+                            pc.iter().any(|(c, _)| Retained::as_ptr(c) as usize == target)
+                        };
+                        if found {
+                            q.flush_pending_cbs_locked();
+                        }
                     }
-                }
-                if let Some(cw) = &q.commit_worker {
-                    if cw.in_flight_cbs.load(Ordering::Acquire) > 0 {
-                        if inline_len < INLINE_W {
-                            inline_w[inline_len] = Some(Arc::clone(cw));
-                            inline_len += 1;
-                        } else {
-                            overflow_w.push(Arc::clone(cw));
+                    if let Some(cw) = &q.commit_worker {
+                        if cw.in_flight_cbs.load(Ordering::Acquire) > 0 {
+                            if inline_len < INLINE_W {
+                                inline_w[inline_len] = Some(Arc::clone(cw));
+                                inline_len += 1;
+                            } else {
+                                overflow_w.push(Arc::clone(cw));
+                            }
                         }
                     }
                 }
             }
-        }
-        for slot in &mut inline_w[..inline_len] {
-            if let Some(cw) = slot.take() {
+            for slot in &mut inline_w[..inline_len] {
+                if let Some(cw) = slot.take() {
+                    cw.wait_if_cb_or_alloc_in_flight(target, alloc_key);
+                }
+            }
+            for cw in overflow_w {
                 cw.wait_if_cb_or_alloc_in_flight(target, alloc_key);
             }
         }
-        for cw in overflow_w {
-            cw.wait_if_cb_or_alloc_in_flight(target, alloc_key);
+        if crate::mesh::has_active_mesh_icbs() {
+            crate::mesh::release_mesh_icbs_for_cb(target);
         }
     }
 
     /// Flush buffered command buffers on whichever live queue holds a CB recorded
-    /// with `alloc_key` (or an unknown `0` alloc_key), and wait for any matching
-    /// async [`CommitWorker`] batch to return from `commit:count:`, before
-    /// `CommandAllocator::reset()` or `Drop`.
+    /// with `alloc_key` (or an unknown `0` alloc_key), wait for any matching async
+    /// [`CommitWorker`] batch to return from `commit:count:`, and release recording-level
+    /// mesh ICB ownership for `alloc_key` before `CommandAllocator::reset()` or `Drop`.
     pub(crate) fn flush_if_alloc_pending(alloc_key: usize) {
         if !has_uncommitted_cbs() {
             return;
         }
-        const INLINE_W: usize = 4;
-        let mut inline_w: [Option<Arc<CommitWorker>>; INLINE_W] = [const { None }; INLINE_W];
-        let mut inline_len = 0usize;
-        let mut overflow_w: Vec<Arc<CommitWorker>> = Vec::new();
+        if GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
+            || GLOBAL_INFLIGHT_COMMIT_CBS.load(Ordering::Acquire) > 0
         {
-            let aq = active_queues().lock().unwrap();
-            for &p in aq.iter() {
-                // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
-                let q = unsafe { &*(p as *const Queue) };
-                if q.has_pending_cbs.load(Ordering::Acquire) {
-                    let _g = q.submit.lock().unwrap();
-                    let found = {
-                        let pc = q.pending_cbs.lock().unwrap();
-                        pc.iter().any(|(_, ak)| *ak == 0 || *ak == alloc_key)
-                    };
-                    if found {
-                        q.flush_pending_cbs_locked();
+            const INLINE_W: usize = 4;
+            let mut inline_w: [Option<Arc<CommitWorker>>; INLINE_W] = [const { None }; INLINE_W];
+            let mut inline_len = 0usize;
+            let mut overflow_w: Vec<Arc<CommitWorker>> = Vec::new();
+            {
+                let aq = active_queues().lock().unwrap();
+                for &p in aq.iter() {
+                    // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+                    let q = unsafe { &*(p as *const Queue) };
+                    if q.has_pending_cbs.load(Ordering::Acquire) {
+                        let _g = q.submit.lock().unwrap();
+                        let found = {
+                            let pc = q.pending_cbs.lock().unwrap();
+                            pc.iter().any(|(_, ak)| *ak == 0 || *ak == alloc_key)
+                        };
+                        if found {
+                            q.flush_pending_cbs_locked();
+                        }
                     }
-                }
-                if let Some(cw) = &q.commit_worker {
-                    if cw.in_flight_cbs.load(Ordering::Acquire) > 0 {
-                        if inline_len < INLINE_W {
-                            inline_w[inline_len] = Some(Arc::clone(cw));
-                            inline_len += 1;
-                        } else {
-                            overflow_w.push(Arc::clone(cw));
+                    if let Some(cw) = &q.commit_worker {
+                        if cw.in_flight_cbs.load(Ordering::Acquire) > 0 {
+                            if inline_len < INLINE_W {
+                                inline_w[inline_len] = Some(Arc::clone(cw));
+                                inline_len += 1;
+                            } else {
+                                overflow_w.push(Arc::clone(cw));
+                            }
                         }
                     }
                 }
             }
-        }
-        for slot in &mut inline_w[..inline_len] {
-            if let Some(cw) = slot.take() {
+            for slot in &mut inline_w[..inline_len] {
+                if let Some(cw) = slot.take() {
+                    cw.wait_if_cb_or_alloc_in_flight(0, alloc_key);
+                }
+            }
+            for cw in overflow_w {
                 cw.wait_if_cb_or_alloc_in_flight(0, alloc_key);
             }
         }
-        for cw in overflow_w {
-            cw.wait_if_cb_or_alloc_in_flight(0, alloc_key);
+        if crate::mesh::has_active_mesh_icbs() {
+            crate::mesh::release_mesh_icbs_for_alloc(alloc_key);
         }
     }
 
@@ -1305,7 +1321,7 @@ impl Queue {
             return;
         }
         for &ptr in cb_ptrs {
-            if let Some(lease) = crate::mesh::take_mesh_icbs_for_cb(ptr) {
+            if let Some(lease) = crate::mesh::retain_mesh_icbs_for_cb(ptr) {
                 self.defer_release(Box::new(lease));
             }
         }

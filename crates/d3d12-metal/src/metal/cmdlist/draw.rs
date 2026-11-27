@@ -345,16 +345,20 @@ impl CommandList {
         (out, n)
     }
 
-    /// Active RTVs masked against the currently bound graphics or mesh PSO's `rtv_formats`
-    /// into a stack buffer (zero heap allocation on the hot per-draw path).
-    /// When no PSO is bound (e.g. direct render-pass tests), returns `self.gfx.rtvs` unmasked.
-    pub(super) fn effective_rtvs(&self) -> ([TargetView; 8], usize) {
-        let pso_rtvs: Option<&[u32]> = self
-            .gfx
-            .pso
-            .as_ref()
-            .map(|p| p.rtv_formats.as_slice())
-            .or_else(|| self.gfx.mesh.as_ref().map(|m| m.rtv_formats.as_slice()));
+    /// Active RTVs masked against `pso_rtv_override` (if provided) or the currently bound
+    /// graphics/mesh PSO's `rtv_formats` into a stack buffer (zero heap allocation on the
+    /// hot per-draw path). When neither is set, returns `self.gfx.rtvs` unmasked.
+    pub(super) fn effective_rtvs_for(
+        &self,
+        pso_rtv_override: Option<&[u32]>,
+    ) -> ([TargetView; 8], usize) {
+        let pso_rtvs: Option<&[u32]> = pso_rtv_override.or_else(|| {
+            self.gfx
+                .pso
+                .as_ref()
+                .map(|p| p.rtv_formats.as_slice())
+                .or_else(|| self.gfx.mesh.as_ref().map(|m| m.rtv_formats.as_slice()))
+        });
         match pso_rtvs {
             Some(fmts) => Self::mask_rtvs_for_formats(&self.gfx.rtvs, fmts),
             None => {
@@ -364,6 +368,13 @@ impl CommandList {
                 (out, n)
             }
         }
+    }
+
+    /// Active RTVs masked against the currently bound graphics or mesh PSO's `rtv_formats`
+    /// into a stack buffer (zero heap allocation on the hot per-draw path).
+    #[inline]
+    pub(super) fn effective_rtvs(&self) -> ([TargetView; 8], usize) {
+        self.effective_rtvs_for(None)
     }
 
     /// DXGI formats of the color attachments actually attached to the open render pass
@@ -400,11 +411,23 @@ impl CommandList {
     /// Open a render pass for the current targets (loading and storing
     /// their contents, or clearing them when a deferred clear is pending).
     /// Returns the encoder and the render target size.
+    #[inline]
     pub(super) unsafe fn draw_encoder_for(
         &mut self,
         opening_pre_raster_reads: u8,
     ) -> Result<(Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>>, (usize, usize)), String> {
-        let (rtv_buf, rtv_len) = self.effective_rtvs();
+        self.draw_encoder_for_rtv_formats(opening_pre_raster_reads, None)
+    }
+
+    /// Open a render pass masking `self.gfx.rtvs` against `pso_rtv_override` when provided
+    /// (used by deferred ICB prepass flushes whose captured segment PSO may differ from the
+    /// newly bound `self.gfx.pso`), or against the currently bound PSO otherwise.
+    pub(super) unsafe fn draw_encoder_for_rtv_formats(
+        &mut self,
+        opening_pre_raster_reads: u8,
+        pso_rtv_override: Option<&[u32]>,
+    ) -> Result<(Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>>, (usize, usize)), String> {
+        let (rtv_buf, rtv_len) = self.effective_rtvs_for(pso_rtv_override);
         let rtvs = &rtv_buf[..rtv_len];
         let dsv = self.gfx.dsv.filter(|v| v.resource != 0);
         if let (Encoder::Render(e), true) = (&self.enc, self.gfx.draw_pass) {
@@ -1651,6 +1674,24 @@ impl CommandList {
         ),
         String,
     > {
+        self.begin_mesh_for(indirect, false)
+    }
+
+    /// Prepare the open render pass for a mesh-shader draw. When `icb_vtx_expand` is true,
+    /// an in-pass `Point` vertex shader will read GPU-written `args` / `count` / `pred`
+    /// buffers before dispatching mesh threadgroups, so buffer reads and `MTLStages::Vertex`
+    /// are included in opening, mid-pass, and deferred pre-raster synchronization.
+    pub(super) fn begin_mesh_for(
+        &mut self,
+        indirect: bool,
+        icb_vtx_expand: bool,
+    ) -> Result<
+        (
+            Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>>,
+            Arc<crate::mesh::MeshPipeline>,
+        ),
+        String,
+    > {
         if !self.icb.icb_segs.is_empty() {
             self.flush_draw_batch(true);
         }
@@ -1687,12 +1728,12 @@ impl CommandList {
                     || self.opts.opt_cs_to_ps_overlap_v2
                     || self.gfx_to_ps_overlap_active())
                     && self.predication.is_some()));
-        let mut eff_reads = base_reads | if need_vs_buf { READS_BUF } else { 0 };
+        let mut eff_reads = base_reads | if need_vs_buf || icb_vtx_expand { READS_BUF } else { 0 };
         if p.ms_as_writes_uav && self.bar.list_unwaited_vtx_frag {
             eff_reads |= READS_TEX;
         }
         if self.need_pre_open_cur_draw_exact() {
-            self.resolve_cur_draw_mesh_exact(&p, indirect);
+            self.resolve_cur_draw_mesh_exact(&p, indirect || icb_vtx_expand);
         } else {
             self.rp_sync.cur_draw_exact_valid = false;
         }
@@ -1705,7 +1746,12 @@ impl CommandList {
         } else {
             MTLStages::Mesh
         };
-        self.bar.opening_pre_raster_stages = mesh_pre;
+        let sync_pre = if icb_vtx_expand {
+            mesh_pre | MTLStages::Vertex
+        } else {
+            mesh_pre
+        };
+        self.bar.opening_pre_raster_stages = sync_pre;
         let enc_res = unsafe { self.draw_encoder_for(eff_reads) };
         self.bar.opening_pre_raster_stages = PRE_RASTER;
         self.bar.opening_render_split_ok = false;
@@ -1734,20 +1780,20 @@ impl CommandList {
             if self.rp_sync.cur_draw_exact_valid {
                 self.commit_cur_draw_exact_to_enc();
             } else {
-                self.record_mesh_stage_exact_binds(&p, indirect);
+                self.record_mesh_stage_exact_binds(&p, indirect || icb_vtx_expand);
             }
         }
         if writes_uav && self.opts.opt_rp_split_exact_keep {
-            self.record_mesh_uav_write_exact(&p, indirect);
+            self.record_mesh_uav_write_exact(&p, indirect || icb_vtx_expand);
         }
-        self.render_mid_barrier(&e, mesh_pre);
+        self.render_mid_barrier(&e, sync_pre);
         self.record_gfx_draw_uav_writes(
             writes_uav,
             p.ms_as_writes_uav,
             p.ps_writes_uav,
             mesh_pre,
         );
-        self.sync_pre_raster(&e, eff_reads, mesh_pre);
+        self.sync_pre_raster(&e, eff_reads, sync_pre);
         self.rp_sync.cur_draw_exact_valid = false;
         if let Some(m) = self.pt_cur() {
             m.draws += 1;
@@ -1832,5 +1878,20 @@ mod excess_rtv_tests {
         let (m2, n2) = CommandList::mask_rtvs_for_formats(&[tv0], &[RGBA8, RGBA8]);
         assert_eq!(n2, 1);
         assert_eq!(m2[0].resource, 0x1000);
+
+        // Explicit override (used when flushing a deferred 2-RTV prepass batch after
+        // `self.gfx.pso` has already switched to a 1-RTV PSO) preserves slot 1.
+        if crate::metal::device().is_some() {
+            let mut cl = CommandList::new(crate::metal::queue::ListType::Direct).unwrap();
+            cl.set_render_targets(vec![tv0, tv1], None);
+            let (ov, ov_n) = cl.effective_rtvs_for(Some(&[RGBA8, RGBA8]));
+            assert_eq!(ov_n, 2);
+            assert_eq!(ov[0].resource, 0x1000);
+            assert_eq!(ov[1].resource, 0x2000);
+            let (ov1, ov1_n) = cl.effective_rtvs_for(Some(&[RGBA8]));
+            assert_eq!(ov1_n, 2);
+            assert_eq!(ov1[0].resource, 0x1000);
+            assert_eq!(ov1[1].resource, 0);
+        }
     }
 }

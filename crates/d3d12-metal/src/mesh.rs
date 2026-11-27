@@ -668,75 +668,142 @@ impl Drop for MeshIcbChunk {
     }
 }
 
-/// GPU-completion-guarded lease returned to [`Queue::defer_release`] when a command buffer
-/// carrying mesh ICBs is submitted. Dropping the lease after GPU completion recycles the
-/// chunks back into [`MESH_ICB_POOL`].
+/// Ref-counted owner of a [`MeshIcbChunk`].
+///
+/// Both the recording-level table ([`ACTIVE_MESH_ICBS`], held until `CommandList::begin`
+/// or `CommandAllocator::reset`/`Drop`) and every outstanding GPU submission's
+/// [`MeshIcbLease`] hold an [`Arc<MeshIcbChunkGuard>`]. The chunk is only recycled back
+/// into [`MESH_ICB_POOL`] (or dropped to remove residency) once the recording is released
+/// **and** every submitted GPU execution referencing it has completed.
+struct MeshIcbChunkGuard {
+    chunk: Mutex<Option<MeshIcbChunk>>,
+}
+
+impl Drop for MeshIcbChunkGuard {
+    fn drop(&mut self) {
+        let Some(mut c) = self.chunk.lock().unwrap().take() else {
+            return;
+        };
+        c.off = 0;
+        let mut pool = MESH_ICB_POOL.lock().unwrap();
+        if pool.len() < MAX_POOLED_MESH_ICBS {
+            pool.push(c);
+        }
+    }
+}
+
+struct RecordedMeshIcbs {
+    alloc_key: usize,
+    chunks: Vec<Arc<MeshIcbChunkGuard>>,
+}
+
+/// GPU-completion-guarded lease returned to [`Queue::defer_release`] on every submission
+/// of a command buffer carrying mesh ICBs.
 pub(crate) struct MeshIcbLease {
-    chunks: Vec<MeshIcbChunk>,
+    _chunks: Vec<Arc<MeshIcbChunkGuard>>,
 }
 unsafe impl Send for MeshIcbLease {}
 
 const MAX_POOLED_MESH_ICBS: usize = 16;
 
 static MESH_ICB_POOL: Mutex<Vec<MeshIcbChunk>> = Mutex::new(Vec::new());
-static ACTIVE_MESH_ICBS: OnceLock<Mutex<HashMap<usize, Vec<MeshIcbChunk>>>> = OnceLock::new();
+static ACTIVE_MESH_ICBS: OnceLock<Mutex<HashMap<usize, RecordedMeshIcbs>>> = OnceLock::new();
 static ACTIVE_MESH_ICB_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-impl Drop for MeshIcbLease {
-    fn drop(&mut self) {
-        if self.chunks.is_empty() {
-            return;
-        }
-        let mut pool = MESH_ICB_POOL.lock().unwrap();
-        for mut c in self.chunks.drain(..) {
-            c.off = 0;
-            if pool.len() < MAX_POOLED_MESH_ICBS {
-                pool.push(c);
-            }
-        }
-    }
-}
-
-/// Fast lock-free check used on queue submit so non-mesh command buffers pay one atomic load.
+/// Fast lock-free check used on queue submit and allocator/list reset so non-mesh paths
+/// pay one atomic load.
 #[inline]
 pub(crate) fn has_active_mesh_icbs() -> bool {
     ACTIVE_MESH_ICB_COUNT.load(Ordering::Acquire) > 0
 }
 
-/// Detach any mesh ICB chunks recorded on `cb_ptr` so [`Queue::defer_release`] keeps them
-/// alive until GPU completion and then recycles them into [`MESH_ICB_POOL`].
-pub(crate) fn take_mesh_icbs_for_cb(cb_ptr: usize) -> Option<MeshIcbLease> {
+/// Retain a [`MeshIcbLease`] for one GPU submission of `cb_ptr` without releasing
+/// recording-level ownership, so a closed command list submitted multiple times without
+/// `Reset` tracks every outstanding execution and never recycles its ICBs prematurely.
+pub(crate) fn retain_mesh_icbs_for_cb(cb_ptr: usize) -> Option<MeshIcbLease> {
     if !has_active_mesh_icbs() {
         return None;
     }
     let map = ACTIVE_MESH_ICBS.get()?;
-    let chunks = map.lock().unwrap().remove(&cb_ptr)?;
-    ACTIVE_MESH_ICB_COUNT.fetch_sub(1, Ordering::AcqRel);
-    if chunks.is_empty() {
+    let guard = map.lock().unwrap();
+    let rec = guard.get(&cb_ptr)?;
+    if rec.chunks.is_empty() {
         None
     } else {
-        Some(MeshIcbLease { chunks })
+        Some(MeshIcbLease { _chunks: rec.chunks.clone() })
     }
 }
 
+/// Release recording-level mesh ICB ownership for `cb_ptr` when `CommandList::begin`
+/// starts a new recording on `cb_ptr`. Any in-flight GPU submission still holds its own
+/// [`MeshIcbLease`] clone until GPU completion.
+pub(crate) fn release_mesh_icbs_for_cb(cb_ptr: usize) {
+    if !has_active_mesh_icbs() {
+        return;
+    }
+    let Some(map) = ACTIVE_MESH_ICBS.get() else {
+        return;
+    };
+    let removed = map.lock().unwrap().remove(&cb_ptr);
+    if removed.is_some() {
+        ACTIVE_MESH_ICB_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+    drop(removed);
+}
+
+/// Release recording-level mesh ICB ownership for every command buffer recorded on
+/// `alloc_key` when `CommandAllocator::reset` or `Drop` runs. Any in-flight GPU
+/// submission still holds its own [`MeshIcbLease`] clone until GPU completion.
+pub(crate) fn release_mesh_icbs_for_alloc(alloc_key: usize) {
+    if alloc_key == 0 || !has_active_mesh_icbs() {
+        return;
+    }
+    let Some(map) = ACTIVE_MESH_ICBS.get() else {
+        return;
+    };
+    let mut removed: Vec<RecordedMeshIcbs> = Vec::new();
+    {
+        let mut guard = map.lock().unwrap();
+        let keys: Vec<usize> = guard
+            .iter()
+            .filter_map(|(&k, v)| (v.alloc_key == alloc_key).then_some(k))
+            .collect();
+        for k in keys {
+            if let Some(rec) = guard.remove(&k) {
+                ACTIVE_MESH_ICB_COUNT.fetch_sub(1, Ordering::AcqRel);
+                removed.push(rec);
+            }
+        }
+    }
+    drop(removed);
+}
+
 /// Allocate `count` mesh ICB command slots (`MTLIndirectCommandTypeDrawMeshThreadgroups`)
-/// for command buffer `cb_ptr`, packing multiple draws per command buffer into one ICB and
-/// recycling completed chunks from [`MESH_ICB_POOL`].
+/// for command buffer `cb_ptr` (recorded on `alloc_key`), packing multiple draws per
+/// command buffer into one ICB and recycling completed chunks from [`MESH_ICB_POOL`].
 pub(crate) fn alloc_mesh_icb(
     cb_ptr: usize,
+    alloc_key: usize,
     count: u32,
     has_object: bool,
 ) -> Result<(Retained<MtlIcb>, u32), String> {
     let need = count.max(1);
     let map = ACTIVE_MESH_ICBS.get_or_init(|| Mutex::new(HashMap::new()));
     {
-        let mut guard = map.lock().unwrap();
-        if let Some(chunks) = guard.get_mut(&cb_ptr) {
-            for c in chunks.iter_mut() {
-                if c.has_object == has_object && c.cap.saturating_sub(c.off) >= need {
-                    let loc = c.off;
-                    c.off += need;
-                    return Ok((c.icb.clone(), loc));
+        let guard = map.lock().unwrap();
+        if let Some(rec) = guard.get(&cb_ptr) {
+            if rec.alloc_key == alloc_key {
+                for g in &rec.chunks {
+                    if Arc::strong_count(g) == 1 {
+                        let mut slot = g.chunk.lock().unwrap();
+                        if let Some(c) = slot.as_mut() {
+                            if c.has_object == has_object && c.cap.saturating_sub(c.off) >= need {
+                                let loc = c.off;
+                                c.off += need;
+                                return Ok((c.icb.clone(), loc));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -797,12 +864,21 @@ pub(crate) fn alloc_mesh_icb(
     let loc = chunk.off;
     chunk.off += need;
     let out = chunk.icb.clone();
+    let wrapped = Arc::new(MeshIcbChunkGuard { chunk: Mutex::new(Some(chunk)) });
     let mut guard = map.lock().unwrap();
-    let entry = guard.entry(cb_ptr);
-    let was_absent = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
-    entry.or_default().push(chunk);
-    if was_absent {
-        ACTIVE_MESH_ICB_COUNT.fetch_add(1, Ordering::AcqRel);
+    match guard.entry(cb_ptr) {
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(RecordedMeshIcbs { alloc_key, chunks: vec![wrapped] });
+            ACTIVE_MESH_ICB_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+        std::collections::hash_map::Entry::Occupied(mut o) => {
+            let rec = o.get_mut();
+            if rec.alloc_key != alloc_key {
+                rec.alloc_key = alloc_key;
+                rec.chunks.clear();
+            }
+            rec.chunks.push(wrapped);
+        }
     }
     Ok((out, loc))
 }
@@ -1131,27 +1207,48 @@ mod tests {
             let y = if qi & 2 == 2 { SIZE * 3 / 4 } else { SIZE / 4 };
             px[y * SIZE + x]
         };
-        // Also test MS-only (no AS, no payload) drawing non-empty grid (4, 1, 1) with count=1:
+        // Also test:
+        // (1) GPU-written DEFAULT args/count/pred buffers synchronized before the in-pass
+        //     Vertex expander (P1 review fix), and
+        // (2) repeated submission of the same closed mesh CommandList without Reset,
+        //     retaining mesh ICB ownership until CommandList::begin / CommandAllocator::reset.
         {
             alloc.reset();
             let rtv_ms = mk_tex("mesh icb rtv_ms");
             let rb_ms = mk_buf(heap_type::READBACK, (SIZE * SIZE * 4) as u64, "mesh icb rb_ms");
-            let args_m = mk_buf(heap_type::UPLOAD, 64, "mesh icb args_m");
-            let cnt_m = mk_buf(heap_type::UPLOAD, 64, "mesh icb cnt_m");
+            let args_up = mk_buf(heap_type::UPLOAD, 64, "mesh icb args_up");
+            let cnt_up = mk_buf(heap_type::UPLOAD, 64, "mesh icb cnt_up");
+            let pred_up = mk_buf(heap_type::UPLOAD, 64, "mesh icb pred_up");
+            let args_def = mk_buf(heap_type::DEFAULT, 64, "mesh icb args_def");
+            let cnt_def = mk_buf(heap_type::DEFAULT, 64, "mesh icb cnt_def");
+            let pred_def = mk_buf(heap_type::DEFAULT, 64, "mesh icb pred_def");
             let c_m: [[u32; 8]; 1] = [[0, 123, 0, 0, 4, 1, 1, 0]];
             unsafe {
-                std::ptr::copy_nonoverlapping(c_m.as_ptr().cast::<u8>(), args_m.cpu_ptr().unwrap(), 32);
-                *(cnt_m.cpu_ptr().unwrap() as *mut u32) = 1;
+                std::ptr::copy_nonoverlapping(c_m.as_ptr().cast::<u8>(), args_up.cpu_ptr().unwrap(), 32);
+                *(cnt_up.cpu_ptr().unwrap() as *mut u32) = 1;
+                // D3D12_PREDICATION_OP_EQUAL_ZERO (0): pred == 1 -> do NOT skip.
+                *(pred_up.cpu_ptr().unwrap() as *mut u64) = 1;
             }
             let tvm = TargetView::rtv(&rtv_ms, None).unwrap();
             l.begin(&alloc).unwrap();
+            l.copy_buffer(&args_def, 0, &args_up, 0, 32).unwrap();
+            l.copy_buffer(&cnt_def, 0, &cnt_up, 0, 4).unwrap();
+            l.copy_buffer(&pred_def, 0, &pred_up, 0, 8).unwrap();
+            // Transition COPY_DEST (0x400) -> INDIRECT_ARGUMENT (0x200) before in-pass expansion.
+            l.barrier_list(&[
+                crate::metal::cmdlist::Barrier::Transition(&args_def as *const Resource as usize, 0x400, 0x200),
+                crate::metal::cmdlist::Barrier::Transition(&cnt_def as *const Resource as usize, 0x400, 0x200),
+                crate::metal::cmdlist::Barrier::Transition(&pred_def as *const Resource as usize, 0x400, 0x200),
+            ]);
             unsafe { l.clear_rtv(&tvm, [0.0, 0.0, 0.0, 1.0], &[]).unwrap(); }
             l.set_render_targets(vec![tvm], None);
             l.set_viewports_raw(&[(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0)]);
             l.gfx_root.set_root_signature(rs.clone()).unwrap();
             l.gfx_root.set_constants(0, 0, &[0, 0, 0, 0]).unwrap();
             l.set_mesh_pipeline(pso_ms.clone());
-            l.execute_indirect(&layout, 1, args_m.gpu_va, None, Some(cnt_m.gpu_va)).unwrap();
+            l.set_predication(Some((pred_def.gpu_va, 0)));
+            l.execute_indirect(&layout, 1, args_def.gpu_va, None, Some(cnt_def.gpu_va)).unwrap();
+            l.set_predication(None);
             l.barrier_list(&[crate::metal::cmdlist::Barrier::Transition(
                 &rtv_ms as *const Resource as usize,
                 0x4,
@@ -1164,13 +1261,43 @@ mod tests {
                 None,
             ).unwrap();
             l.close().unwrap();
+
+            // 1st submission of closed list: recording ownership must stay active afterward.
+            let cb_ptr = Retained::as_ptr(&l.cb) as usize;
             let _ = q.execute_command_lists(&mut [&mut l]);
             q.wait_idle();
+            assert!(
+                has_active_mesh_icbs(),
+                "closed mesh command list must retain recording-level ICB ownership after submission"
+            );
             let pxm = unsafe { std::slice::from_raw_parts(rb_ms.cpu_ptr().unwrap() as *const [u8; 4], SIZE * SIZE) };
             assert_eq!(quad(pxm, 0), [255, 0, 0, 255], "MS-only Q0 red");
             assert_eq!(quad(pxm, 1), [0, 255, 0, 255], "MS-only Q1 green");
             assert_eq!(quad(pxm, 2), [0, 0, 255, 255], "MS-only Q2 blue");
             assert_eq!(quad(pxm, 3), [123, 123, 123, 255], "MS-only Q3 patched grey=123");
+
+            // Simulate a second outstanding submission lease on the still-closed list:
+            // resetting the allocator drops recording-level ownership, while the chunk must
+            // stay out of `MESH_ICB_POOL` until the second lease drops too.
+            let lease2 = retain_mesh_icbs_for_cb(cb_ptr)
+                .expect("closed mesh command list must yield a lease on repeated retention");
+            let pool_before_reset = MESH_ICB_POOL.lock().unwrap().len();
+            alloc.reset();
+            assert!(
+                !has_active_mesh_icbs(),
+                "CommandAllocator::reset must release recording-level mesh ICB ownership"
+            );
+            assert_eq!(
+                MESH_ICB_POOL.lock().unwrap().len(),
+                pool_before_reset,
+                "chunk must not recycle while an outstanding submission lease is still alive"
+            );
+            drop(lease2);
+            assert!(
+                MESH_ICB_POOL.lock().unwrap().len() > pool_before_reset
+                    || MESH_ICB_POOL.lock().unwrap().len() == MAX_POOLED_MESH_ICBS,
+                "dropping the final submission lease must recycle the mesh ICB chunk"
+            );
         }
         assert_eq!(quad(px0, 0), [255, 0, 0, 255], "Q0 red");
         assert_eq!(quad(px0, 1), [0, 0, 0, 255], "Q1 must stay culled (count=2 + cull_mask=0b0010)");
