@@ -169,6 +169,37 @@ fn texture_entry(id: Option<u64>, min_lod: f32) -> Result<Entry, String> {
     Ok(DescriptorTableEntry::texture(id, min_lod, 0).to_bytes())
 }
 
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/// Align a typed texture-buffer start byte offset (`first * bpe`) down to a byte offset
+/// that satisfies BOTH Metal's `minimumTextureBufferAlignmentForPixelFormat` (`align`) AND
+/// whole-texel alignment (`(off - aligned) % bpe == 0`), so 12-byte `RGB32*` views never
+/// start mid-texel when `align` does not divide `bpe` (e.g. `align=16, bpe=12 -> lcm=48`).
+fn align_typed_buffer_offset(first: u64, bpe: u64, align: u64) -> Result<(u64, u64), String> {
+    let bpe = bpe.max(1);
+    let align = align.max(1);
+    let step = (align / gcd_u64(align, bpe))
+        .checked_mul(bpe)
+        .ok_or_else(|| format!("typed buffer alignment overflow (align={align}, bpe={bpe})"))?;
+    let off = first
+        .checked_mul(bpe)
+        .ok_or_else(|| format!("typed buffer offset overflow (first={first}, bpe={bpe})"))?;
+    let aligned = (off / step) * step;
+    let el_off = (off - aligned) / bpe;
+    debug_assert_eq!(aligned + el_off * bpe, off);
+    if el_off > 255 {
+        return Err(format!("typed buffer view element offset {el_off} > 255"));
+    }
+    Ok((aligned, el_off))
+}
+
 /// Buffer SRV/UAV (`D3D12_BUFFER_SRV`/`_UAV`): raw (flag 1), structured
 /// (stride) or typed (format, via a texture-buffer view). When `counter` is
 /// supplied on a writable raw/structured buffer UAV, its `R32Uint` texture-buffer
@@ -234,12 +265,7 @@ fn buffer_entry(
         return Err(format!("typed buffer view with format {}", format::name(dxgi)));
     };
     let align = dev.dev.minimumTextureBufferAlignmentForPixelFormat(mtl_fmt).max(1) as u64;
-    let off = first * bpe;
-    let aligned = off / align * align;
-    let el_off = (off - aligned) / bpe;
-    if el_off > 255 {
-        return Err(format!("typed buffer view element offset {el_off} > 255"));
-    }
+    let (aligned, el_off) = align_typed_buffer_offset(first, bpe, align)?;
     let tv_id = r.buffer_texture_view_id(mtl_fmt, aligned, num as u64 + el_off, writable).ok_or("texture buffer view creation failed")?;
     r.note_view_kind(super::resource::HK_TYPED_BUF);
     let v = BufferView {
@@ -489,9 +515,15 @@ mod tests {
             .unwrap();
         assert_eq!(tex_id(&v_off), base_id, "disabled minLOD must reuse base texture");
 
-        // On: Metal 4.1 hardware MTLTextureViewDescriptor.minLOD applied on Apple10+
-        // (base_mip + clamp = 1 + 1.5 = 2.5); on Apple9 and earlier falls back cleanly
-        // to the descriptor-table min_lod_clamp with zero Metal validation errors.
+        // On: Metal 4.1 hardware MTLTextureViewDescriptor.minLOD is resource-relative on Apple10+
+        // (MostDetailedMip=1 + ResourceMinLODClamp=1.5 -> hardware minLOD = 1.5, NOT 2.5);
+        // on Apple9 and earlier falls back cleanly to descriptor-table min_lod_clamp.
+        assert_eq!(crate::metal::resource::resolve_view_min_lod((0, 6), 2.25), 2.25);
+        assert_eq!(crate::metal::resource::resolve_view_min_lod((1, 5), 1.5), 1.5);
+        assert_eq!(crate::metal::resource::resolve_view_min_lod((2, 4), 1.5), 0.0);
+        assert_eq!(crate::metal::resource::resolve_view_min_lod((1, 5), 10.0), 6.0);
+        assert_eq!(crate::metal::resource::resolve_view_min_lod((0, 6), f32::NAN), 0.0);
+
         std::env::set_var("PORT_METAL41_VIEW_MIN_LOD", "1");
         let dev = super::super::device().unwrap();
         let v_on = res
@@ -516,8 +548,8 @@ mod tests {
             if has_min_lod.as_bool() {
                 let hw_min_lod: f32 = unsafe { objc2::msg_send![&*v_on, minLOD] };
                 assert!(
-                    (hw_min_lod - 2.5).abs() < 1e-4,
-                    "expected hardware minLOD = 1 + 1.5 = 2.5, got {hw_min_lod}"
+                    (hw_min_lod - 1.5).abs() < 1e-4,
+                    "expected resource-relative hardware minLOD = 1.5, got {hw_min_lod}"
                 );
             }
         }
@@ -530,5 +562,29 @@ mod tests {
             Some(v) => std::env::set_var("PORT_METAL41_VIEW_MIN_LOD", v),
             None => std::env::remove_var("PORT_METAL41_VIEW_MIN_LOD"),
         }
+    }
+
+    #[test]
+    fn rgb32_typed_buffer_offset_aligns_to_lcm_of_metal_alignment_and_texel_size() {
+        // 12-byte RGB32 texels with Metal alignments that do not divide 12 (16, 64, 256).
+        for align in [16u64, 64, 256] {
+            for first in [0u64, 1, 2, 3, 4, 5, 7, 16, 17, 63, 64, 65] {
+                let (aligned, el_off) = align_typed_buffer_offset(first, 12, align).unwrap();
+                assert_eq!(aligned % align, 0, "align={align} first={first} aligned={aligned}");
+                assert_eq!(aligned % 12, 0, "align={align} first={first} must be whole-texel aligned");
+                assert_eq!(
+                    aligned + el_off * 12,
+                    first * 12,
+                    "align={align} first={first} -> aligned={aligned} el_off={el_off}"
+                );
+                assert!(el_off <= 255);
+            }
+        }
+        // Specific regression case: align=16, bpe=12, FirstElement=2 -> byte offset 24 -> aligned=0, el_off=2.
+        assert_eq!(align_typed_buffer_offset(2, 12, 16).unwrap(), (0, 2));
+        assert_eq!(align_typed_buffer_offset(5, 12, 16).unwrap(), (48, 1));
+        // Power-of-two texels stay identical to baseline alignment.
+        assert_eq!(align_typed_buffer_offset(5, 4, 16).unwrap(), (16, 1));
+        assert_eq!(align_typed_buffer_offset(3, 16, 16).unwrap(), (48, 0));
     }
 }

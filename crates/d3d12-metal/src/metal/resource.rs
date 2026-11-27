@@ -1257,11 +1257,12 @@ impl Resource {
     }
 
     /// [`Self::texture_view_swizzled`] with an optional Metal 4.1 (`macOS 27` / `iOS 27`)
-    /// `MTLTextureViewDescriptor.minLOD` clamp (`min_lod` is relative to `mips.0`, matching
+    /// `MTLTextureViewDescriptor.minLOD` clamp (`min_lod` is resource-relative, matching
     /// D3D12 `ResourceMinLODClamp` and D3D11 `SetResourceMinLOD`).
     ///
-    /// Active when `min_lod > 0.0` and `PORT_METAL41_VIEW_MIN_LOD` (or `PORT_METAL41`) is
-    /// enabled; falls back cleanly to standard texture views on macOS 26 or when disabled.
+    /// Active when `min_lod > mips.0` and `Device::supports_texture_view_min_lod()` (`Apple10`+
+    /// with `PORT_METAL41_VIEW_MIN_LOD` / `PORT_METAL41`); falls back cleanly to standard
+    /// texture views on `Apple9` and earlier, on macOS 26, or when disabled.
     pub fn texture_view_swizzled_min_lod(
         &self,
         fmt: MTLPixelFormat,
@@ -1276,15 +1277,9 @@ impl Resource {
         let full_mips = (0, t.mipmapLevelCount() as u32);
         let full_slices = (0, (t.arrayLength() as u32).max(1) * if t.textureType() == MTLTextureType::TypeCube || t.textureType() == MTLTextureType::TypeCubeArray { 6 } else { 1 });
         // Metal 4.1 applies `MTLTextureViewDescriptor.minLOD` after adding `levelRange.location`
-        // (`mips.0`), requiring `minLOD <= levelRange.location + levelRange.length` and
-        // `Apple10`+ GPU support (`TextureViewMinLOD`).
-        let max_abs_lod = (mips.0.saturating_add(mips.1)) as f32;
-        let abs_min_lod = if super::device().is_some_and(|d| d.supports_texture_view_min_lod())
-            && min_lod.is_finite()
-            && min_lod > 0.0
-            && mips.1 > 0
-        {
-            (mips.0 as f32 + min_lod).min(max_abs_lod)
+        // (`mips.0`), so both D3D `ResourceMinLODClamp` and Metal `minLOD` are resource-relative.
+        let abs_min_lod = if super::device().is_some_and(|d| d.supports_texture_view_min_lod()) {
+            resolve_view_min_lod(mips, min_lod)
         } else {
             0.0
         };
@@ -1377,7 +1372,8 @@ impl Resource {
     }
 
     /// [`Self::texture_view_id_swizzled`] with an optional Metal 4.1 (`Apple10`+)
-    /// `MTLTextureViewDescriptor.minLOD` clamp (`min_lod` is relative to `mips.0`).
+    /// `MTLTextureViewDescriptor.minLOD` clamp (`min_lod` is resource-relative, matching
+    /// D3D12 `ResourceMinLODClamp` and D3D11 `SetResourceMinLOD`).
     ///
     /// When `PORT_METAL41_VIEW_MIN_LOD` is off or the GPU is `< Apple10`, `min_lod_bits == 0`
     /// and this takes the exact baseline `MTLTextureViewPool` path.
@@ -1394,13 +1390,8 @@ impl Resource {
         let t = self.texture()?;
         let full_mips = (0, t.mipmapLevelCount() as u32);
         let full_slices = (0, (t.arrayLength() as u32).max(1) * if t.textureType() == MTLTextureType::TypeCube || t.textureType() == MTLTextureType::TypeCubeArray { 6 } else { 1 });
-        let max_abs_lod = (mips.0.saturating_add(mips.1)) as f32;
-        let abs_min_lod = if super::device().is_some_and(|d| d.supports_texture_view_min_lod())
-            && min_lod.is_finite()
-            && min_lod > 0.0
-            && mips.1 > 0
-        {
-            (mips.0 as f32 + min_lod).min(max_abs_lod)
+        let abs_min_lod = if super::device().is_some_and(|d| d.supports_texture_view_min_lod()) {
+            resolve_view_min_lod(mips, min_lod)
         } else {
             0.0
         };
@@ -1483,6 +1474,20 @@ impl Resource {
         }
         self.buffer_texture_view(fmt, offset, elements, writable).map(|v| mtl_tex_id(&v))
     }
+}
+
+/// Resolves a Direct3D resource-relative `ResourceMinLODClamp` / `SetResourceMinLOD`
+/// into a Metal 4.1 `MTLTextureViewDescriptor.minLOD` (also resource-relative, applied
+/// after adding `levelRange.location` = `mips.0`).
+///
+/// Returns `0.0` when `min_lod` does not restrict beyond `mips.0` (`MostDetailedMip`),
+/// otherwise clamps to `mips.0 + mips.1` (`levelRange.location + levelRange.length`).
+pub(crate) fn resolve_view_min_lod(mips: (u32, u32), min_lod: f32) -> f32 {
+    if !min_lod.is_finite() || min_lod <= mips.0 as f32 || mips.1 == 0 {
+        return 0.0;
+    }
+    let max_abs_lod = mips.0.saturating_add(mips.1) as f32;
+    min_lod.min(max_abs_lod)
 }
 
 fn texture_buffer_bpe(fmt: MTLPixelFormat) -> u64 {
