@@ -47,6 +47,8 @@ DEFAULT_STATE = {
     "logged_in": True,
     "account": "ExamplePlayer",
     "verify_fail": False,
+    "verify_silent_zero": False,
+    "omit_remote_version": False,
     "warn_on_stdout": False,
     "installed": {},
     "updates": {
@@ -66,13 +68,26 @@ DEFAULT_STATE = {
                     "PresenceId": {"type": "STRING", "value": "pres_arachnid_2"},
                 },
             },
-            "dlc_list": [
+            # Real Legendary `list --json` nests add-ons under `dlcs` (not `dlc_list` or top-level rows).
+            "dlcs": [
                 {
                     "app_name": "ArachnidTwoPreorderDLC",
                     "app_title": "Suit Pack DLC",
+                    "asset_infos": {
+                        "Windows": {"build_version": "1.1.0", "app_name": "ArachnidTwoPreorderDLC"},
+                    },
                     "download_size": 524288000,
                     "disk_size": 1073741824,
-                }
+                },
+                {
+                    "app_name": "ArachnidTwoExpansion",
+                    "app_title": "Story Expansion Add-On",
+                    "asset_infos": {
+                        "Windows": {"build_version": "1.1.0", "app_name": "ArachnidTwoExpansion"},
+                    },
+                    "download_size": 2147483648,
+                    "disk_size": 4294967296,
+                },
             ],
         },
         {
@@ -87,17 +102,7 @@ DEFAULT_STATE = {
                     "CanRunOffline": {"type": "STRING", "value": "true"},
                 },
             },
-        },
-        {
-            "app_name": "ArachnidTwoExpansion",
-            "app_title": "Story Expansion Add-On",
-            "asset_infos": {
-                "Windows": {"build_version": "1.1.0", "app_name": "ArachnidTwoExpansion"},
-            },
-            "metadata": {
-                "id": "cat_arachnid_2_exp",
-                "mainGameItem": {"id": "cat_arachnid_2"},
-            },
+            "dlcs": [],
         },
         {
             "app_name": "OnlineShooter",
@@ -114,6 +119,7 @@ DEFAULT_STATE = {
                     "ThirdPartyManagedApp": {"type": "STRING", "value": "Ubisoft Connect"},
                 },
             },
+            "dlcs": [],
         },
     ],
     "manifest_files": {
@@ -224,7 +230,7 @@ if cmd == "list-installed":
     check_updates = "--check-updates" in rest
     for app_name, entry in state["installed"].items():
         row = dict(entry)
-        if check_updates and app_name in state.get("updates", {}):
+        if check_updates and not state.get("omit_remote_version") and app_name in state.get("updates", {}):
             row["remote_version"] = state["updates"][app_name]
             row["update_available"] = row["remote_version"] != row.get("version")
         rows.append(row)
@@ -258,16 +264,23 @@ if cmd == "info":
         if app_name == "ArachnidTwo"
         else None
     )
+    # Real Legendary `info --json`: `manifest.version` is the integer manifest format
+    # revision (e.g. 18), while `manifest.build_version` is the game build version.
+    build_ver = state.get("updates", {}).get(
+        app_name,
+        game.get("asset_infos", {}).get("Windows", {}).get("build_version", "1.1.0"),
+    )
     payload = {
         "game": {
             "app_name": game["app_name"],
             "title": game["app_title"],
-            "version": state.get("updates", {}).get(app_name, "1.1.0"),
+            "asset_infos": game.get("asset_infos", {}),
             "metadata": game.get("metadata", {}),
-            "dlc_list": game.get("dlc_list", []),
+            "owned_dlc": game.get("dlcs", []),
         },
         "manifest": {
-            "version": "1.1.0",
+            "version": 18,
+            "build_version": build_ver,
             "download_size": 48_000_000_000,
             "disk_size": 92_000_000_000,
             "launch_exe": exe,
@@ -307,7 +320,7 @@ if cmd in ("install", "download", "update"):
     is_dlc = False
     if game is None:
         for g in state["catalog"]:
-            for d in g.get("dlc_list", []):
+            for d in g.get("dlcs", []):
                 if d["app_name"] == app_name:
                     dlc_title = d["app_title"]
                     is_dlc = True
@@ -338,8 +351,8 @@ if cmd in ("install", "download", "update"):
             "can_run_offline": True,
             "requires_ot": False,
         }
-        if "--with-dlcs" in rest and game and game.get("dlc_list"):
-            for d in game["dlc_list"]:
+        if "--with-dlcs" in rest and game and game.get("dlcs"):
+            for d in game["dlcs"]:
                 d_id = d["app_name"]
                 (install_dir / f"{d_id}.dat").write_bytes(b"DLC_MOCK")
                 state["installed"][d_id] = {
@@ -366,21 +379,25 @@ if cmd == "eos-overlay":
 if cmd == "verify":
     app_name = rest[0]
     if app_name not in state["installed"]:
-        print(f"ERROR: {app_name} is not installed", file=sys.stderr)
-        sys.exit(1)
+        # Real Legendary logs this error and exits 0.
+        print(f'[cli] ERROR: Game "{app_name}" is not installed', file=sys.stderr)
+        sys.exit(0)
+    if state.get("verify_silent_zero"):
+        sys.exit(0)
     if state.get("verify_fail"):
         print('ERROR: File "Spider-Man2.exe" failed hash check (corrupted)!', file=sys.stderr)
         print('ERROR: Missing file "Data/level0.dat"', file=sys.stderr)
         sys.exit(1)
-    print("Verification finished successfully.")
+    print("Verification was successful.")
     sys.exit(0)
 
 if cmd == "uninstall":
     app_name = rest[0]
     entry = state["installed"].pop(app_name, None)
     if entry is None:
-        print(f"ERROR: {app_name} is not installed", file=sys.stderr)
-        sys.exit(1)
+        # Real Legendary logs this error and exits 0.
+        print(f"[cli] ERROR: Game {app_name} not installed, cannot uninstall!", file=sys.stderr)
+        sys.exit(0)
     if "--keep-files" not in rest:
         p = Path(entry["install_path"])
         if p.is_dir():
@@ -529,12 +546,15 @@ class TestEpicBackendMocked(unittest.TestCase):
         sdata = json.loads(proc_search.stdout)
         self.assertEqual(sdata["matches"][0]["app_id"], "ArachnidTwo")
         self.assertEqual(sdata["matches"][0]["title"], "Marvel's Spider-Man 2")
+        self.assertEqual(sdata["matches"][0]["dlcs_count"], 2)
 
     def test_info_reports_size_eos_anticheat_drm_dlcs_and_redists(self) -> None:
         # 1. Single-player title with EOS SDK + VC++ + DirectX + DLCs, zero anti-cheat
         proc = self._run_cli("info", "ArachnidTwo", "--platform", "windows", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         info = json.loads(proc.stdout)
+        # Must use manifest.build_version ("1.2.0"), never manifest.version format revision (18).
+        self.assertEqual(info["version"], "1.2.0")
         self.assertEqual(info["download_size_bytes"], 48_000_000_000)
         self.assertEqual(info["disk_size_bytes"], 92_000_000_000)
         self.assertTrue(info["can_run_offline"])
@@ -543,14 +563,14 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertTrue(info["anticheat"]["report_only"])
         self.assertFalse(info["drm"]["detected"])
         self.assertTrue(info["drm"]["report_only"])
-        self.assertEqual(len(info["dlcs"]), 1)
+        self.assertEqual(len(info["dlcs"]), 2)
         cats = {r["category"] for r in info["redistributables"]}
         self.assertEqual(cats, {"vcredist", "directx", "eos_sdk"})
 
         # Check dedicated list-dlcs & list-redists commands
         proc_dlcs = self._run_cli("list-dlcs", "ArachnidTwo", "--json")
         self.assertEqual(proc_dlcs.returncode, 0)
-        self.assertEqual(json.loads(proc_dlcs.stdout)["count"], 1)
+        self.assertEqual(json.loads(proc_dlcs.stdout)["count"], 2)
 
         proc_redists = self._run_cli("list-redists", "ArachnidTwo", "--json")
         self.assertEqual(proc_redists.returncode, 0)
@@ -709,6 +729,41 @@ class TestEpicBackendMocked(unittest.TestCase):
 
         with self.assertRaises(AppNotFoundError):
             self.backend.uninstall("NotInstalledApp")
+
+    def test_info_and_update_use_manifest_build_version_not_format_version(self) -> None:
+        dest = self.root / "games" / "CurrentBuild"
+        self._patch_state(updates={"ArachnidTwo": "1.1.0"}, omit_remote_version=True)
+        self.backend.download(DownloadOptions(app_id="ArachnidTwo", dest=dest, platform="windows"))
+
+        info = self.backend.info("ArachnidTwo", platform="windows")
+        self.assertEqual(info.version, "1.1.0")
+
+        # `list-installed --check-updates` omits `remote_version`, forcing fallback to `info --json`.
+        # Because `manifest.version` is 18 (format rev) and `manifest.build_version` is "1.1.0",
+        # an already-current install must NOT report update_available=True.
+        upd = self.backend.update("ArachnidTwo", check_only=True)
+        self.assertFalse(upd.update_available)
+        self.assertFalse(upd.updated)
+        self.assertEqual(upd.old_version, "1.1.0")
+        self.assertEqual(upd.new_version, "1.1.0")
+
+    def test_verify_uninstalled_or_silent_zero_does_not_report_ok(self) -> None:
+        # Real Legendary exits 0 when verifying an uninstalled app, logging
+        # `[cli] ERROR: Game "..." is not installed`.
+        proc = self._run_cli("verify", "NeverInstalledApp", "--json")
+        self.assertEqual(proc.returncode, 4)
+        err = json.loads(proc.stdout)
+        self.assertFalse(err["ok"])
+        self.assertEqual(err["error"]["code"], "app_not_found")
+
+        # Even if verify exits 0 on an installed app without printing completion confirmation,
+        # port-acquire must not claim all files verified cleanly.
+        dest = self.root / "games" / "SilentVerify"
+        self.backend.download(DownloadOptions(app_id="ArachnidTwo", dest=dest, platform="windows"))
+        self._patch_state(verify_silent_zero=True)
+        res = self.backend.verify("ArachnidTwo")
+        self.assertFalse(res.ok)
+        self.assertIn("without reporting verification completion", res.message)
 
 
 if __name__ == "__main__":

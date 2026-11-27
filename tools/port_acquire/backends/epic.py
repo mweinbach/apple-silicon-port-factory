@@ -74,6 +74,14 @@ _NOT_FOUND_PATTERNS = (
     "not found in",
 )
 
+_VERIFY_SUCCESS_PATTERNS = (
+    "verification was successful",
+    "verification finished successfully",
+    "verification succeeded",
+    "verification complete",
+    "all files verified",
+)
+
 _ANTICHEAT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Easy Anti-Cheat (EAC)",
@@ -164,6 +172,42 @@ def _parse_int(val: Any) -> int | None:
         return val
     if isinstance(val, str) and val.strip().isdigit():
         return int(val.strip())
+    return None
+
+
+def _extract_build_version(
+    *,
+    game: dict[str, Any],
+    manifest: dict[str, Any],
+    install: dict[str, Any] | None = None,
+    platform: str = "Windows",
+) -> str | None:
+    """Return the game build version from Legendary `info --json` data.
+
+    In Legendary's schema, `manifest.version` is the manifest format revision (e.g. `18`),
+    whereas `manifest.build_version` is the game's build version string.
+    """
+    build_ver = manifest.get("build_version")
+    if isinstance(build_ver, str) and build_ver.strip():
+        return build_ver.strip()
+
+    asset_infos = game.get("asset_infos")
+    if isinstance(asset_infos, dict):
+        for plat in (platform, "Windows", "Mac", *asset_infos.keys()):
+            ai = asset_infos.get(plat)
+            if isinstance(ai, dict):
+                bv = ai.get("build_version")
+                if isinstance(bv, str) and bv.strip():
+                    return bv.strip()
+
+    for container, key in (
+        (game, "app_version"),
+        (game, "version"),
+        (install or {}, "version"),
+    ):
+        val = container.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
     return None
 
 
@@ -544,31 +588,40 @@ class EpicBackend(StoreBackend):
                 continue
 
             inline_dlcs: list[DlcItem] = []
-            raw_dlcs = row.get("dlc_list")
-            if isinstance(raw_dlcs, list):
-                for d in raw_dlcs:
-                    if not isinstance(d, dict):
-                        continue
-                    d_id = str(d.get("app_name") or d.get("id") or "").strip()
-                    if not d_id:
-                        continue
-                    d_inst = installed_map.get(d_id)
-                    inline_dlcs.append(
-                        DlcItem(
-                            app_id=d_id,
-                            title=str(d.get("app_title") or d.get("title") or d_id).strip(),
-                            owned=True,
-                            installed=d_inst is not None,
-                            install_path=(
-                                str(d_inst["install_path"])
-                                if d_inst and d_inst.get("install_path")
-                                else None
-                            ),
-                            disk_size_bytes=(
-                                _parse_int(d_inst.get("install_size")) if d_inst else None
-                            ),
-                        )
+            seen_inline_dlcs: set[str] = set()
+            # Real Legendary `list --json` nests add-ons under `dlcs`; also accept
+            # legacy/alternate `dlc_list` if present.
+            raw_dlcs: list[Any] = []
+            for key in ("dlcs", "dlc_list"):
+                val = row.get(key)
+                if isinstance(val, list):
+                    raw_dlcs.extend(val)
+            for d in raw_dlcs:
+                if not isinstance(d, dict):
+                    continue
+                d_id = str(d.get("app_name") or d.get("id") or "").strip()
+                if not d_id or d_id in seen_inline_dlcs:
+                    continue
+                seen_inline_dlcs.add(d_id)
+                d_inst = installed_map.get(d_id)
+                inline_dlcs.append(
+                    DlcItem(
+                        app_id=d_id,
+                        title=str(d.get("app_title") or d.get("title") or d_id).strip(),
+                        owned=True,
+                        installed=d_inst is not None,
+                        install_path=(
+                            str(d_inst["install_path"])
+                            if d_inst and d_inst.get("install_path")
+                            else None
+                        ),
+                        download_size_bytes=_parse_int(d.get("download_size")),
+                        disk_size_bytes=(
+                            _parse_int(d.get("disk_size"))
+                            or (_parse_int(d_inst.get("install_size")) if d_inst else None)
+                        ),
                     )
+                )
 
             owned = OwnedGame(
                 store=self.name,
@@ -778,9 +831,8 @@ class EpicBackend(StoreBackend):
 
         resolved_app_id = str(game.get("app_name") or app_id)
         title = str(game.get("title") or game.get("app_title") or resolved_app_id)
-        version = (
-            str(manifest.get("version") or game.get("version") or install.get("version") or "")
-            or None
+        version = _extract_build_version(
+            game=game, manifest=manifest, install=install, platform=leg_plat
         )
         download_size = _parse_int(manifest.get("download_size"))
         disk_size = _parse_int(manifest.get("disk_size")) or _parse_int(install.get("install_size"))
@@ -826,11 +878,11 @@ class EpicBackend(StoreBackend):
                     seen.add((item.id, item.relative_path))
                     redists.append(item)
 
-        # Collect DLCs from `game.owned_dlc` / `game.dlc_list` / `metadata.dlcItemList`
+        # Collect DLCs from `game.owned_dlc` / `game.dlcs` / `game.dlc_list` / `metadata.dlcItemList`
         dlcs: list[DlcItem] = []
         seen_dlcs: set[str] = set()
         dlc_sources = []
-        for key in ("owned_dlc", "dlc_list"):
+        for key in ("owned_dlc", "dlcs", "dlc_list"):
             if isinstance(game.get(key), list):
                 dlc_sources.extend(game[key])
         metadata = game.get("metadata") if isinstance(game.get("metadata"), dict) else {}
@@ -968,16 +1020,18 @@ class EpicBackend(StoreBackend):
         if repair:
             proc = self._run(["-y", "install", app_id, "--repair", "--skip-dlcs"], check=False)
             combined = f"{proc.stdout}\n{proc.stderr}".strip()
+            combined_lower = combined.lower()
+            if any(pat in combined_lower for pat in _NOT_FOUND_PATTERNS):
+                raise AppNotFoundError(
+                    f"app {app_id!r} is not installed: {_sanitize_error_text(combined)}"
+                )
             if proc.returncode != 0:
-                sanitized = _sanitize_error_text(combined)
-                if any(pat in combined.lower() for pat in _NOT_FOUND_PATTERNS):
-                    raise AppNotFoundError(f"app {app_id!r} is not installed: {sanitized}")
                 return VerifyResult(
                     store=self.name,
                     app_id=app_id,
                     ok=False,
                     repaired=False,
-                    message=sanitized,
+                    message=_sanitize_error_text(combined),
                 )
             return VerifyResult(
                 store=self.name,
@@ -989,26 +1043,43 @@ class EpicBackend(StoreBackend):
 
         proc = self._run(["verify", app_id], check=False)
         combined = f"{proc.stdout}\n{proc.stderr}"
+        combined_lower = combined.lower()
+        # Real Legendary logs `Game "<app>" is not installed` and exits 0; always check
+        # not-installed patterns regardless of exit status.
+        if any(pat in combined_lower for pat in _NOT_FOUND_PATTERNS):
+            raise AppNotFoundError(
+                f"app {app_id!r} is not installed: {_sanitize_error_text(combined)}"
+            )
+
         missing: list[str] = []
         corrupted: list[str] = []
+        has_error_line = False
         for line in combined.splitlines():
             low = line.lower()
             if "missing" in low and ("file" in low or '"' in line or "'" in line):
                 missing.append(line.strip())
             elif ("corrupt" in low or "mismatch" in low or "hash" in low) and "failed" in low:
                 corrupted.append(line.strip())
+            if "error:" in low:
+                has_error_line = True
 
-        if proc.returncode != 0 and any(pat in combined.lower() for pat in _NOT_FOUND_PATTERNS):
-            raise AppNotFoundError(
-                f"app {app_id!r} is not installed: {_sanitize_error_text(combined)}"
-            )
-
-        ok = proc.returncode == 0 and not missing and not corrupted
-        msg = (
-            "All files verified cleanly."
-            if ok
-            else _sanitize_error_text(combined.strip() or f"verify exited with {proc.returncode}")
+        completed_ok = any(pat in combined_lower for pat in _VERIFY_SUCCESS_PATTERNS)
+        ok = (
+            proc.returncode == 0
+            and completed_ok
+            and not has_error_line
+            and not missing
+            and not corrupted
         )
+        if ok:
+            msg = "All files verified cleanly."
+        elif proc.returncode == 0 and not completed_ok and not combined.strip():
+            msg = "legendary verify exited 0 without reporting verification completion."
+        else:
+            msg = _sanitize_error_text(
+                combined.strip()
+                or f"verify did not confirm completion (exit {proc.returncode})"
+            )
         return VerifyResult(
             store=self.name,
             app_id=app_id,
@@ -1035,24 +1106,37 @@ class EpicBackend(StoreBackend):
         old_version = str(entry.get("version") or "") or None
         remote_version = str(entry.get("remote_version") or "") or None
         install_path = str(entry.get("install_path") or "") or None
+        inst_platform = str(entry.get("platform") or "Windows")
         update_available = bool(
             entry.get("update_available")
             or (remote_version and old_version and remote_version != old_version)
         )
         # Some legendary builds omit `remote_version` in `list-installed --check-updates --json`;
-        # cross-check against `info --json` when available so `--check-only` stays accurate.
+        # cross-check against `info --json` `manifest.build_version` when available.
         if remote_version is None and not update_available:
             try:
-                latest_info = self._run_json(["info", app_id, "--json"])
+                latest_info = self._run_json(
+                    ["info", app_id, "--platform", inst_platform, "--json"]
+                )
                 if isinstance(latest_info, dict):
-                    manifest = latest_info.get("manifest")
-                    game_meta = latest_info.get("game")
-                    cand_ver = (
-                        (manifest.get("version") if isinstance(manifest, dict) else None)
-                        or (game_meta.get("version") if isinstance(game_meta, dict) else None)
+                    manifest = (
+                        latest_info.get("manifest")
+                        if isinstance(latest_info.get("manifest"), dict)
+                        else {}
+                    )
+                    game_meta = (
+                        latest_info.get("game")
+                        if isinstance(latest_info.get("game"), dict)
+                        else {}
+                    )
+                    cand_ver = _extract_build_version(
+                        game=game_meta,
+                        manifest=manifest,
+                        install=None,
+                        platform=inst_platform,
                     )
                     if cand_ver:
-                        remote_version = str(cand_ver)
+                        remote_version = cand_ver
                         if old_version and remote_version != old_version:
                             update_available = True
             except AcquireError:
@@ -1100,7 +1184,12 @@ class EpicBackend(StoreBackend):
             cmd.append("--keep-files")
         if skip_uninstaller:
             cmd.append("--skip-uninstaller")
-        self._run(cmd, check=True)
+        proc = self._run(cmd, check=True)
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        if any(pat in combined.lower() for pat in _NOT_FOUND_PATTERNS):
+            raise AppNotFoundError(
+                f"app {app_id!r} is not installed: {_sanitize_error_text(combined)}"
+            )
         return UninstallResult(
             store=self.name,
             app_id=app_id,
