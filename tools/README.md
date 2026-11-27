@@ -12,7 +12,7 @@ Generated databases, Ghidra projects, and logs live in gitignored directories (`
 
 | Tool | What it does |
 |---|---|
-| `tools/port-acquire` | Pluggable CLI game acquisition wrapper (`epic` via Heroic's `legendary`, plus `tools/port_acquire/backend.py` interface for `steam` and other stores) with `--json` output, fuzzy search, DLC/redistributable listing, and `port-acquire-manifest.json` export. See [docs/ACQUISITION.md](../docs/ACQUISITION.md). |
+| `tools/port-acquire` | Pluggable CLI game acquisition wrapper (`epic` via Heroic's `legendary`, `steam` via native `arm64` `DepotDownloader`, plus `tools/port_acquire/backend.py` interface for additional stores) with `--json` output, fuzzy search, DLC/redistributable listing, and `port-acquire-manifest.json` export. See [docs/ACQUISITION.md](../docs/ACQUISITION.md) and [docs/STEAM_ACQUIRE.md](../docs/STEAM_ACQUIRE.md). |
 | `tools/opsdb.sh` | Shell wrapper around `cargo opsdb --` (`crates/port-factory`). See [docs/OPS_DB.md](../docs/OPS_DB.md). |
 | `tools/debug/live_probe.py` | Universal frame-paced `PORT_CONTROL_DIR` automation, input scripting, PNG capture, and pass/fail reproducer (`cargo opsdb -- live-probe`). See [docs/DIAGNOSTICS.md](../docs/DIAGNOSTICS.md). |
 | `tools/debug/bisect_runtime.py` | Execution-mode knob matrix (`PORT_AOT`, `FAST_NAN`, `LSE2_TRAP`, `STACK_TSO`, `XMM_PIN`, `AW2_JIT`, `AW2_EMU_FAST`) + `O(log N)` `PORT_AOT_SKIP`/`PORT_JIT_SKIP` bisector (`cargo opsdb -- bisect-runtime`). |

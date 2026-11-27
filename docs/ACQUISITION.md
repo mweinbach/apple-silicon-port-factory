@@ -8,8 +8,8 @@ Silicon Port Factory audit, bring-up, and `.app` packaging pipeline.
 > **Hard Policy — Zero Bypass, Zero Stored Secrets**
 > - **No DRM, anti-cheat, or ownership bypass of any kind.** `port-acquire` only queries and
 >   downloads titles owned by the currently authenticated account via established open-source store
->   clients (`legendary` for Epic Games Store; pluggable backends such as Steam via
->   `tools/port_acquire/backends/`).
+>   clients (`legendary` for Epic Games Store, native `arm64` `DepotDownloader` for Steam — see
+>   [docs/STEAM_ACQUIRE.md](STEAM_ACQUIRE.md) — and future plugins in `tools/port_acquire/backends/`).
 > - **Never commit game files or credentials.** Authentication tokens remain strictly inside the
 >   store client's own config directory (for Epic: `legendary`'s `user.json` under
 >   `~/.config/legendary` or `$PORT_LEGENDARY_CONFIG`). `status` reports only login state and the
@@ -45,6 +45,10 @@ pip3 install --user legendary-gl
 | `PORT_ACQUIRE_DEST` | `~/Games/PortFactory/<store>` | Default base directory for `download` when `--dest` is omitted. |
 | `PORT_LEGENDARY` | auto-discovered | Explicit path to the `legendary` executable. |
 | `PORT_LEGENDARY_CONFIG` | `~/.config/legendary` | Override `LEGENDARY_CONFIG_PATH` (e.g. set to `$HOME/Library/Application Support/heroic/legendaryConfig/legendary` to share an existing Heroic session). |
+| `PORT_DEPOT_DOWNLOADER` | auto-discovered | Explicit path to the native `arm64` `DepotDownloader` binary (`--store steam`; see [docs/STEAM_ACQUIRE.md](STEAM_ACQUIRE.md)). |
+| `PORT_STEAM_API_KEY` | macOS Keychain | Optional Steam Web API key for `--store steam list-owned` (redacted in `--knobs` diagnostics). |
+| `PORT_STEAM_HOME` | `~/Library/Application Support/Steam` | Override local Steam config/library directory for `--store steam`. |
+| `PORT_STEAM_USER` | unset | Optional default Steam account username (never a password). |
 
 ---
 

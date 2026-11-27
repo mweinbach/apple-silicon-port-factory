@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 from pathlib import Path
@@ -131,6 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--logout",
         action="store_true",
         help="Remove saved credentials from the backend config (log out)",
+    )
+    p_login.add_argument(
+        "--username",
+        default=None,
+        help="Store account username (e.g. Steam login name; never pass passwords on CLI)",
     )
 
     # status
@@ -268,6 +274,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also download official EOS Overlay redistributable bits into the destination",
     )
     p_dl.add_argument(
+        "--with-redists",
+        action="store_true",
+        help="Also fetch store shared redistributables (e.g. Steamworks Common Redistributables / _CommonRedist)",
+    )
+    p_dl.add_argument(
+        "--branch",
+        default=None,
+        help="Optional store release branch/beta name (e.g. public, beta, experimental)",
+    )
+    p_dl.add_argument(
+        "--branch-password-env",
+        default=None,
+        help="Environment variable name containing a private beta branch password (never logged)",
+    )
+    p_dl.add_argument(
+        "--validate",
+        action="store_true",
+        help="Verify downloaded files against store checksums during download",
+    )
+    p_dl.add_argument(
         "--no-register",
         action="store_true",
         help="Download files without registering the install in the backend database",
@@ -298,6 +324,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-download any missing or corrupted files",
     )
+    p_verify.add_argument(
+        "--branch-password-env",
+        default=None,
+        help="Environment variable name containing a private beta branch password (never logged)",
+    )
 
     # update
     p_update = sub.add_parser("update", help="Check for or apply updates to an installed game")
@@ -312,6 +343,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--with-dlcs",
         action="store_true",
         help="Also update installed DLCs",
+    )
+    p_update.add_argument(
+        "--branch-password-env",
+        default=None,
+        help="Environment variable name containing a private beta branch password (never logged)",
     )
 
     # uninstall
@@ -363,21 +399,32 @@ def _write_manifest_for_install(
     platform: str,
     manifest_out: Path,
     eos_overlay_path: str | None = None,
+    branch: str | None = None,
+    downloaded_depots: list[str] | None = None,
+    downloaded_redists: list[str] | None = None,
+    branch_password: str | None = None,
     offline: bool = False,
 ) -> dict[str, Any]:
+    info_sig_params = inspect.signature(backend.info).parameters
+    extra_info_kwargs: dict[str, Any] = {}
+    if branch and "branch" in info_sig_params:
+        extra_info_kwargs["branch"] = branch
+    if branch_password and "branch_password" in info_sig_params:
+        extra_info_kwargs["branch_password"] = branch_password
+
     info: GameInfo | None = None
     try:
-        info = backend.info(app_id, platform=platform, offline=offline)
+        info = backend.info(app_id, platform=platform, offline=offline, **extra_info_kwargs)
     except AcquireError:
         info = None
     if info is None:
         try:
-            info = backend.info(app_id, platform=platform, offline=not offline)
+            info = backend.info(app_id, platform=platform, offline=not offline, **extra_info_kwargs)
         except AcquireError:
             info = None
     elif offline and (not info.executable or not info.manifest_files_checked):
         try:
-            online_info = backend.info(app_id, platform=platform, offline=False)
+            online_info = backend.info(app_id, platform=platform, offline=False, **extra_info_kwargs)
             if online_info.executable or online_info.manifest_files_checked:
                 info = online_info
         except AcquireError:
@@ -387,7 +434,10 @@ def _write_manifest_for_install(
 
     launch_plan = None
     try:
-        launch_plan = backend.launch_args(app_id, offline=True)
+        launch_kwargs: dict[str, Any] = {"offline": True}
+        if "install_dir" in inspect.signature(backend.launch_args).parameters:
+            launch_kwargs["install_dir"] = install_dir
+        launch_plan = backend.launch_args(app_id, **launch_kwargs)
     except AcquireError:
         launch_plan = None
 
@@ -398,6 +448,9 @@ def _write_manifest_for_install(
         launch_plan=launch_plan,
         eos_overlay_path=eos_overlay_path,
         extra_redists=disk_redists,
+        branch=branch,
+        downloaded_depots=downloaded_depots,
+        downloaded_redists=downloaded_redists,
     )
     write_package_manifest(manifest, manifest_out)
     return manifest
@@ -420,12 +473,17 @@ def _dispatch(args: argparse.Namespace) -> int:
     backend = get_backend(store_name)
 
     if cmd == "login":
-        status = backend.login(
-            no_webview=bool(args.no_webview),
-            auth_code=args.code,
-            import_existing=bool(args.import_existing),
-            logout=bool(args.logout),
-        )
+        login_kwargs: dict[str, Any] = {
+            "no_webview": bool(args.no_webview),
+            "auth_code": args.code,
+            "import_existing": bool(args.import_existing),
+            "logout": bool(args.logout),
+        }
+        if args.username is not None:
+            sig = inspect.signature(backend.login)
+            if "username" in sig.parameters:
+                login_kwargs["username"] = args.username
+        status = backend.login(**login_kwargs)
         lines = [
             f"Store: {status.store}",
             f"Logged in: {status.logged_in}",
@@ -506,10 +564,14 @@ def _dispatch(args: argparse.Namespace) -> int:
             f"Offline OK: {info.can_run_offline}",
             f"EOS needed: {info.requires_eos}"
             + (f" ({', '.join(info.eos_signals)})" if info.eos_signals else ""),
+            f"Steamworks: {info.requires_steamworks}"
+            + (f" ({', '.join(info.steamworks_signals)})" if info.steamworks_signals else ""),
             f"Anti-cheat: {'DETECTED: ' + ', '.join(info.anticheat.systems) if info.anticheat.detected else 'none detected'} (report-only)",
             f"DRM/Auth:   {'DETECTED' if info.drm.detected else 'none detected'}"
             + (f" (signals: {', '.join(info.drm.signals)})" if info.drm.signals else "")
             + " (report-only)",
+            f"Depots:     {len(info.depots)}",
+            f"Branches:   {', '.join(b.get('name', '?') for b in info.branches) if info.branches else '(none)'}",
             f"DLCs:       {len(info.dlcs)}",
             f"Redists:    {len(info.redistributables)}",
         ]
@@ -558,15 +620,61 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if cmd == "download":
-        title_hint: str | None = None
         if args.dest is None:
-            try:
-                title_hint = backend.info(args.app, platform=args.platform, offline=True).title
-            except AcquireError:
-                title_hint = None
-            dest = _default_dest(store_name, args.app, title=title_hint)
+            managed_path: Path | None = None
+            has_managed_hook = hasattr(backend, "existing_managed_install_path")
+            if has_managed_hook:
+                try:
+                    managed_path = backend.existing_managed_install_path(
+                        args.app, platform=args.platform
+                    )
+                except AcquireError:
+                    managed_path = None
+            if managed_path is not None:
+                dest = managed_path
+            else:
+                info_hint: GameInfo | None = None
+                try:
+                    info_hint = backend.info(args.app, platform=args.platform, offline=True)
+                except AcquireError:
+                    info_hint = None
+                if (
+                    not has_managed_hook
+                    and info_hint is not None
+                    and info_hint.install_path
+                    and info_hint.platform == args.platform
+                ):
+                    dest = Path(info_hint.install_path).expanduser().resolve()
+                else:
+                    title_hint = info_hint.title if info_hint is not None else None
+                    dest = _default_dest(store_name, args.app, title=title_hint)
+                    # Avoid colliding on the default title directory when a managed copy for
+                    # another platform already occupies it (for `--no-register` side-by-side
+                    # downloads, qualify with `-<platform>`; registered downloads are also
+                    # guarded inside the backend against platform conflicts).
+                    other_managed_path: Path | None = None
+                    if has_managed_hook:
+                        try:
+                            other_managed_path = backend.existing_managed_install_path(
+                                args.app, platform=None
+                            )
+                        except AcquireError:
+                            other_managed_path = None
+                    elif info_hint is not None and info_hint.install_path:
+                        other_managed_path = Path(info_hint.install_path).expanduser().resolve()
+                    if args.no_register and other_managed_path is not None and other_managed_path == dest:
+                        dest = dest.with_name(f"{dest.name}-{args.platform}")
         else:
             dest = Path(args.dest).expanduser().resolve()
+
+        branch_password: str | None = None
+        if args.branch_password_env:
+            branch_password = os.environ.get(args.branch_password_env)
+            if not branch_password:
+                raise AcquireError(
+                    f"branch password env var {args.branch_password_env!r} is unset or empty",
+                    code="missing_branch_password",
+                )
 
         opts = DownloadOptions(
             app_id=args.app,
@@ -576,6 +684,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             skip_dlcs=not bool(args.with_dlcs) and not bool(args.dlc),
             dlcs=tuple(args.dlc or ()),
             with_eos_overlay=bool(args.with_eos_overlay),
+            with_redists=bool(args.with_redists),
+            branch=args.branch,
+            branch_password=branch_password,
+            validate=bool(args.validate),
             no_register=bool(args.no_register),
             max_workers=args.max_workers,
         )
@@ -595,7 +707,11 @@ def _dispatch(args: argparse.Namespace) -> int:
                 platform=result.platform,
                 manifest_out=manifest_path,
                 eos_overlay_path=result.eos_overlay_path,
-                offline=False,
+                branch=result.branch,
+                downloaded_depots=result.downloaded_depots,
+                downloaded_redists=result.downloaded_redists,
+                branch_password=branch_password,
+                offline=True,
             )
             result.manifest_path = str(manifest_path)
 
@@ -603,8 +719,12 @@ def _dispatch(args: argparse.Namespace) -> int:
             f"Downloaded {result.title} ({result.app_id}) [{result.platform}]",
             f"  Install path: {result.install_path}",
         ]
+        if result.branch:
+            lines.append(f"  Branch:       {result.branch}")
         if result.downloaded_dlcs:
             lines.append(f"  DLCs:         {', '.join(result.downloaded_dlcs)}")
+        if result.downloaded_redists:
+            lines.append(f"  Redists:      {', '.join(result.downloaded_redists)}")
         if result.eos_overlay_path:
             lines.append(f"  EOS overlay:  {result.eos_overlay_path}")
         if result.manifest_path:
@@ -613,7 +733,17 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if cmd == "verify":
-        res = backend.verify(args.app, repair=bool(args.repair))
+        verify_kwargs: dict[str, Any] = {"repair": bool(args.repair)}
+        if args.branch_password_env:
+            branch_password = os.environ.get(args.branch_password_env)
+            if not branch_password:
+                raise AcquireError(
+                    f"branch password env var {args.branch_password_env!r} is unset or empty",
+                    code="missing_branch_password",
+                )
+            if "branch_password" in inspect.signature(backend.verify).parameters:
+                verify_kwargs["branch_password"] = branch_password
+        res = backend.verify(args.app, **verify_kwargs)
         lines = [
             f"Verify {res.app_id}: {'OK' if res.ok else 'FAILED'}"
             + (" (repaired)" if res.repaired else ""),
@@ -624,11 +754,20 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0 if res.ok else 1
 
     if cmd == "update":
-        res = backend.update(
-            args.app,
-            check_only=bool(args.check_only),
-            with_dlcs=bool(args.with_dlcs),
-        )
+        update_kwargs: dict[str, Any] = {
+            "check_only": bool(args.check_only),
+            "with_dlcs": bool(args.with_dlcs),
+        }
+        if args.branch_password_env:
+            branch_password = os.environ.get(args.branch_password_env)
+            if not branch_password:
+                raise AcquireError(
+                    f"branch password env var {args.branch_password_env!r} is unset or empty",
+                    code="missing_branch_password",
+                )
+            if "branch_password" in inspect.signature(backend.update).parameters:
+                update_kwargs["branch_password"] = branch_password
+        res = backend.update(args.app, **update_kwargs)
         if res.updated and res.install_path:
             existing_manifest = Path(res.install_path) / MANIFEST_FILENAME
             if existing_manifest.is_file():
@@ -646,6 +785,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                     install_dir=Path(res.install_path),
                     platform=refresh_platform or "windows",
                     manifest_out=existing_manifest,
+                    branch_password=update_kwargs.get("branch_password"),
                     offline=False,
                 )
         lines = [
