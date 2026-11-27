@@ -510,6 +510,7 @@ fn resolve_slice_into(
     st.agg.lists += 1;
     let isolate_copy_q = copy_light && queue == 3;
     let mut prev_kind: Option<usize> = None;
+    let mut prev_pass_end: u64 = 0;
     for (i, m) in metas.iter().enumerate() {
         let (mut s, mut e) = (ts[2 * i], ts[2 * i + 1]);
         // On Apple TBDR, a render pass that closed with 0 draws/ICBs may never
@@ -532,21 +533,20 @@ fn resolve_slice_into(
             }
         }
         if m.kind == kind::ML {
-            let pe = if isolate_copy_q {
-                st.last_end_by_q[(queue as usize) & 3]
-            } else {
-                st.last_end
-            };
-            if !valid(s) && valid(e) && valid(pe) && pe <= e {
+            if !valid(s) && valid(e) && valid(prev_pass_end) && prev_pass_end <= e {
                 // Pre-MetalFX sync ran on a 0-dispatch compute encoder whose relaxed
-                // timestamp resolved to 0 on AGX; bracket from the previous encoder's end.
-                s = pe;
+                // timestamp resolved to 0 on AGX; bracket from the immediately preceding
+                // valid encoder's end in this same recording (never across submissions
+                // or skipped bad passes).
+                s = prev_pass_end;
             }
         }
         if !valid(s) || !valid(e) || e < s {
             st.agg.bad += 1;
+            prev_pass_end = 0;
             continue;
         }
+        prev_pass_end = e;
         let k = (m.kind as usize).min(kind::COUNT - 1);
         let dur = ns(e - s);
         let q_idx = (queue as usize) & 3;
@@ -1066,6 +1066,68 @@ mod tests {
         assert_eq!(st.agg.sync_gap[1], 0);
         assert_eq!(synth::name(synth::METALFX_TEMPORAL), Some("port:metalfx_temporal"));
         assert_eq!(synth::name(synth::METALFX_SPATIAL), Some("port:metalfx_spatial"));
+
+        // A new submission starting with an ML pass whose 0-dispatch pre-sync start resolved
+        // to 0 must NOT backfill from the previous submission's `st.last_end` (which would
+        // absorb inter-submission idle time into ML duration and busy time).
+        let ml_only = [PassMeta {
+            kind: kind::ML,
+            sync: 1,
+            dispatches: 1,
+            w: 1440,
+            h: 810,
+            shader: synth::METALFX_TEMPORAL,
+            ..Default::default()
+        }];
+        resolve_slice_into(&mut st, 1, 0, 0, 5_000, 5_100, &ml_only, &[0, 8_000], false, freq);
+        assert_eq!(st.agg.bad, 2);
+        assert_eq!(st.agg.kind_dur[kind::ML as usize], 2000);
+        assert_eq!(st.agg.kind_n[kind::ML as usize], 1);
+        assert_eq!(st.agg.busy, 3000);
+
+        // An ML pass with missing start immediately after a bad pass in the same list must
+        // likewise NOT backfill across the skipped bad pass.
+        let after_bad = [
+            PassMeta {
+                kind: kind::COMPUTE,
+                sync: 1,
+                dispatches: 1,
+                shader: 0x300,
+                ..Default::default()
+            },
+            PassMeta {
+                kind: kind::COMPUTE,
+                sync: 1,
+                dispatches: 1,
+                shader: 0x301,
+                ..Default::default()
+            },
+            PassMeta {
+                kind: kind::ML,
+                sync: 1,
+                dispatches: 1,
+                w: 1440,
+                h: 810,
+                shader: synth::METALFX_SPATIAL,
+                ..Default::default()
+            },
+        ];
+        resolve_slice_into(
+            &mut st,
+            2,
+            0,
+            0,
+            9_000,
+            9_100,
+            &after_bad,
+            &[10_000, 10_500, 0, 0, 0, 12_000],
+            false,
+            freq,
+        );
+        assert_eq!(st.agg.bad, 4);
+        assert_eq!(st.agg.kind_dur[kind::ML as usize], 2000);
+        assert_eq!(st.agg.kind_n[kind::ML as usize], 1);
+        assert_eq!(st.agg.busy, 3500);
     }
 
     #[test]
