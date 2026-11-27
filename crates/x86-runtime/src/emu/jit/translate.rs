@@ -195,6 +195,15 @@ pub(super) struct SysCold {
     pub(super) lb: [u8; 16],
     pub(super) xd: u16,
     pub(super) pf: u8,
+    pub(super) ymm_dirty_pending: u16,
+}
+
+/// Out-of-line split-lock shard-spinlock slow path for `K_ATOMIC` ops crossing a 16-byte granule.
+pub(super) struct AtomicCold {
+    pub(super) fix: usize,
+    pub(super) back: usize,
+    pub(super) sub: u8,
+    pub(super) wb: u32,
 }
 
 pub(super) struct SideExit {
@@ -206,6 +215,8 @@ pub(super) struct SideExit {
     pub(super) xd: u16,
     /// Pending parity byte (`Tr::pf`).
     pub(super) pf: u8,
+    /// Pending `ymm_dirty` bits written earlier in this block (not yet flushed to `Cpu::jx.ymm_dirty`).
+    pub(super) ymm_dirty_pending: u16,
     /// Static x87 TOP state at this side exit (flushed before leaving to interpreter).
     pub(super) x87_top_known: Option<u8>,
     pub(super) x87_top_dirty: bool,
@@ -309,12 +320,17 @@ pub(super) struct Tr<'a> {
     pub(super) xpin: bool,
     /// Bitmask of `Cpu::ymm_hi[0..16]` known zero at the current translation point.
     pub(super) ymm_clean: u16,
+    /// Bitmask of `ymm_hi[0..16]` written by 256-bit ops in this block whose `Cpu::jx.ymm_dirty`
+    /// and `XBUD` bit-0 update is coalesced until block exit / `vzeroupper` / side exit.
+    pub(super) ymm_dirty_pending: u16,
     /// Deferred cold calls to `clear_ymm_hi`: `(tbnz_site, resume_pos, mask)`.
     pub(super) ymm_colds: Vec<(usize, usize, u16)>,
     /// (branch to fallback, resume after counter sample, ordered read).
     pub(super) tsc_colds: Vec<(usize, usize, bool)>,
     /// Deferred cold paths for system/state ops (`#GP(0)`, non-AFP `ldmxcsr`, XSTATE abnormal exit).
     pub(super) sys_colds: Vec<SysCold>,
+    /// Deferred cold split-lock slow paths for `K_ATOMIC` ops crossing a 16-byte granule.
+    pub(super) atomic_colds: Vec<AtomicCold>,
     /// Deferred cold paths for per-site indirect-branch inline caches.
     pub(super) ic_colds: Vec<IcCold>,
     /// Bitmasks of guest `xmm0..15` whose upper bits `[127:32]` / `[127:64]` are known 0.
@@ -578,9 +594,10 @@ impl Tr<'_> {
             self.track_rsp(k);
         }
         self.xa_key = None;
-        // Every transfer out of the block (terminator, budget exit) sees Cpu::xmm and X87State current;
-        // terminators (inline plain calls) may write Cpu::xmm0 directly.
+        // Every transfer out of the block (terminator, budget exit) sees Cpu::xmm, ymm_dirty,
+        // and X87State current; terminators (inline plain calls) may write Cpu::xmm0 directly.
         self.xbarrier();
+        self.flush_ymm_dirty();
         self.flush_x87_top();
         if bud_be && self.term_tests_budget(&term) {
             // Leave before the terminator (the interpreter runs it) once the budget is out.
@@ -636,6 +653,7 @@ impl Tr<'_> {
         self.emit_cold_nan();
         self.emit_x87_colds();
         self.emit_sys_colds();
+        self.emit_atomic_colds();
         self.emit_ic_colds();
         let mut ses = core::mem::take(&mut self.side_exits);
         for se in &ses {
@@ -651,6 +669,7 @@ impl Tr<'_> {
             self.flush_flags(need);
             self.flush_lb();
             self.xstore(se.xd);
+            self.flush_ymm_dirty_mask(se.ymm_dirty_pending);
             self.flush_x87_top_for_exit(se.x87_top_known, se.x87_top_dirty, se.x87_sw_top_dirty);
             if self.bud_dec {
                 self.a.addsub_ri(true, false, false, XBUD, XBUD, (2 * (n - se.k)) as u32, false);
@@ -691,6 +710,7 @@ impl Tr<'_> {
         self.ymm_colds.clear();
         self.tsc_colds.clear();
         self.sys_colds.clear();
+        self.atomic_colds.clear();
         self.ic_colds.clear();
         self.cold.clear();
         self.x87_colds.clear();
@@ -709,6 +729,7 @@ impl Tr<'_> {
         sc.ymm_colds = self.ymm_colds;
         sc.tsc_colds = self.tsc_colds;
         sc.sys_colds = self.sys_colds;
+        sc.atomic_colds = self.atomic_colds;
         sc.ic_colds = self.ic_colds;
         sc.cold = self.cold;
         sc.x87_colds = self.x87_colds;
@@ -1295,33 +1316,68 @@ impl Tr<'_> {
     /// Emit a single 1-cycle register-only `tbnz x8, #0, #cold` check calling `clear_ymm_hi`
     /// out-of-line with `mask` when any YMM upper half is dirty. Clobbers nothing on fast path.
     pub(super) fn emit_ymm_clear_check(&mut self, mask: u16) {
+        self.flush_ymm_dirty();
         let fix = self.a.tbnz(XBUD, 0);
         self.ymm_colds.push((fix, self.a.pos, mask));
     }
 
-    /// Store 128-bit vector `v_src` into `Cpu::ymm_hi[reg]` and mark `reg` dirty in
-    /// `Cpu::jx.ymm_dirty` and bit 0 of `XBUD`.
-    pub(super) fn write_ymm_hi(&mut self, reg: u8, v_src: u32) {
-        let r = reg & 15;
-        let bit = 1u16 << r;
-        self.a.str(128, v_src, XCPU, OFF_YMM_HI + (r as u32) * 16);
-        self.ymm_clean &= !bit;
+    /// Flush coalesced `ymm_dirty` bitmask `m` into `Cpu::jx.ymm_dirty` and set bit 0 of `XBUD`.
+    /// Preserves all guest GPRs, `T0..T6`, and NZCV (clobbers only `XS`, and `XA` if `m` is not
+    /// a 32-bit ARM64 logical immediate).
+    pub(super) fn flush_ymm_dirty_mask(&mut self, m: u16) {
+        if m == 0 {
+            return;
+        }
+        self.xa_key = None;
         self.a.ldr(16, XS, XCPU, OFF_YMM_DIRTY);
-        self.a.logic_ri(false, 1, XS, XS, enc_logic_imm(bit as u64, false).unwrap());
+        if let Some(imm) = enc_logic_imm(m as u64, false) {
+            self.a.logic_ri(false, 1, XS, XS, imm);
+        } else {
+            self.a.movz(false, XA, m as u32, 0);
+            self.a.logic_rr(false, 1, XS, XS, XA, 0, 0);
+        }
         self.a.str(16, XS, XCPU, OFF_YMM_DIRTY);
         self.a.logic_ri(true, 1, XBUD, XBUD, enc_logic_imm(1, true).unwrap());
     }
 
-    /// Zero `Cpu::ymm_hi[reg]` for a VEX-128 op (0 instructions when already proven clean,
-    /// 1 instruction `stp xzr, xzr` otherwise — `ymm_dirty` stays a conservative superset).
+    /// Flush any pending coalesced `ymm_dirty` bits accumulated by 256-bit ops in this block.
+    pub(super) fn flush_ymm_dirty(&mut self) {
+        let m = self.ymm_dirty_pending;
+        if m != 0 {
+            self.ymm_dirty_pending = 0;
+            self.flush_ymm_dirty_mask(m);
+        }
+    }
+
+    /// Write 128-bit vector `v_src` into `ymm_hi[reg]` (pinned `v(8+reg)` for `reg < 8` when
+    /// `xpin`, else `Cpu::ymm_hi[reg]`) and queue `reg` in the block-coalesced `ymm_dirty` mask.
+    pub(super) fn write_ymm_hi(&mut self, reg: u8, v_src: u32) {
+        let r = reg & 15;
+        let bit = 1u16 << r;
+        if let Some(vy) = self.yh_reg(r) {
+            self.a.v_mov(vy, v_src);
+        } else {
+            self.a.str(128, v_src, XCPU, OFF_YMM_HI + (r as u32) * 16);
+        }
+        self.ymm_clean &= !bit;
+        self.ymm_dirty_pending |= bit;
+    }
+
+    /// Zero `ymm_hi[reg]` for a VEX-128 op (0 instructions when already proven clean, 1
+    /// zero-latency register `eor` when pinned in `v8..v15`, or 1 `stp xzr, xzr` otherwise).
     pub(super) fn clear_ymm_hi(&mut self, reg: u8) {
         let r = reg & 15;
         let bit = 1u16 << r;
         if self.ymm_clean & bit != 0 {
             return;
         }
-        self.a.zero128(XCPU, OFF_YMM_HI + (r as u32) * 16);
+        if let Some(vy) = self.yh_reg(r) {
+            self.a.v_zero(vy);
+        } else {
+            self.a.zero128(XCPU, OFF_YMM_HI + (r as u32) * 16);
+        }
         self.ymm_clean |= bit;
+        self.ymm_dirty_pending &= !bit;
     }
 
     /// Inline call of the host function `h` (`DF_PLAIN` builtin or `inline_variant`: at most
@@ -1670,6 +1726,7 @@ impl Tr<'_> {
             lb: self.lb,
             xd: self.xd,
             pf: self.pf,
+            ymm_dirty_pending: self.ymm_dirty_pending,
             x87_top_known: self.x87_top_known,
             x87_top_dirty: self.x87_top_dirty,
             x87_sw_top_dirty: self.x87_sw_top_dirty,
@@ -1692,8 +1749,17 @@ impl Tr<'_> {
     pub(super) fn bind_side_exit(&mut self, se: usize, f: usize) {
         // Chain multiple branches to the same side exit through per-site stubs.
         let s = &self.side_exits[se];
-        let (k, fs, lb, xd, pf, x87_top_known, x87_top_dirty, x87_sw_top_dirty) =
-            (s.k, s.fs, s.lb, s.xd, s.pf, s.x87_top_known, s.x87_top_dirty, s.x87_sw_top_dirty);
+        let (k, fs, lb, xd, pf, ymm_dirty_pending, x87_top_known, x87_top_dirty, x87_sw_top_dirty) = (
+            s.k,
+            s.fs,
+            s.lb,
+            s.xd,
+            s.pf,
+            s.ymm_dirty_pending,
+            s.x87_top_known,
+            s.x87_top_dirty,
+            s.x87_sw_top_dirty,
+        );
         if s.fix == usize::MAX {
             self.side_exits[se].fix = f;
         } else {
@@ -1704,6 +1770,7 @@ impl Tr<'_> {
                 lb,
                 xd,
                 pf,
+                ymm_dirty_pending,
                 x87_top_known,
                 x87_top_dirty,
                 x87_sw_top_dirty,

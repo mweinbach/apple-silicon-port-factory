@@ -83,10 +83,18 @@ pub(in crate::emu) fn retlit_enabled() -> bool {
 
 /// Host vector register caching guest `xmm0` (guest `xmm i` lives in `v(XV0 + i)`).
 const XV0: u32 = 16;
+/// Host vector register pinning guest `ymm_hi[0..8]` when `xpin` is active (`v8..v15`).
+const YV0: u32 = 8;
 
 #[inline(always)]
 pub(super) fn xh(i: u8) -> u32 {
     XV0 + (i & 15) as u32
+}
+
+#[inline(always)]
+pub(super) fn yh(i: u8) -> Option<u32> {
+    let r = i & 15;
+    (r < 8).then_some(YV0 + r as u32)
 }
 
 #[inline(always)]
@@ -118,7 +126,7 @@ pub(super) fn xmm_class(op: &FastOp) -> XClass {
         | K_LOOP
         | K_SYS_MISC..=K_ATOMIC
         | K_MMX_VSHUF_RR..=K_MMX_VINT_RM => XClass::Free,
-        K_VSHUF_RR..=K_CVTF2I_M => XClass::Aware,
+        K_VSHUF_RR..=K_CVTF2I_M | K_VFMA_RR | K_VFMA_RM => XClass::Aware,
         _ => XClass::Barrier,
     }
 }
@@ -213,6 +221,10 @@ impl Tr<'_> {
         if self.xpin {
             return xh(i);
         }
+        if !self.xon {
+            self.a.ldr(128, xh(i), XCPU, xoff(i));
+            return xh(i);
+        }
         let b = 1u16 << (i & 15);
         if self.xv & b == 0 {
             self.a.ldr(128, xh(i), XCPU, xoff(i));
@@ -252,6 +264,10 @@ impl Tr<'_> {
         if self.xpin {
             return;
         }
+        if !self.xon {
+            self.a.str(128, xh(i), XCPU, xoff(i));
+            return;
+        }
         let b = 1u16 << (i & 15);
         self.xv |= b;
         self.xd |= b;
@@ -286,6 +302,32 @@ impl Tr<'_> {
             self.a.v_mov(t, xh(i));
         } else {
             self.a.ldr(128, t, XCPU, xoff(i));
+        }
+    }
+
+    /// Host register pinning guest `ymm_hi[i]` (`v8..v15` for `i < 8` when `xpin`), else `None`.
+    #[inline(always)]
+    pub(super) fn yh_reg(&self, i: u8) -> Option<u32> {
+        if self.xpin { yh(i) } else { None }
+    }
+
+    /// Copy of guest `ymm_hi[i]` into vector temp `t` (pinned `v8..v15` or `Cpu::ymm_hi`).
+    pub(super) fn ysrc(&mut self, t: u32, i: u8) {
+        if let Some(vy) = self.yh_reg(i) {
+            self.a.v_mov(t, vy);
+        } else {
+            self.a.ldr(128, t, XCPU, OFF_YMM_HI + 16 * (i & 15) as u32);
+        }
+    }
+
+    /// Host vector register holding guest `ymm_hi[i]`: pinned `v8..v15` with zero copies,
+    /// otherwise loaded into `fallback_tmp`.
+    pub(super) fn yget(&mut self, i: u8, fallback_tmp: u32) -> u32 {
+        if let Some(vy) = self.yh_reg(i) {
+            vy
+        } else {
+            self.a.ldr(128, fallback_tmp, XCPU, OFF_YMM_HI + 16 * (i & 15) as u32);
+            fallback_tmp
         }
     }
 
@@ -361,14 +403,27 @@ impl Tr<'_> {
                 self.x_fp_scalar(k, op, sub)
             }
             K_VFP_RR | K_VFP_RM if !v256 && matches!(sub, 12..=23) => self.x_fp_packed(k, op, sub),
+            K_VFP_RR | K_VFP_RM
+                if v256 && matches!(sub, 12..=23) && (self.fast_nan || matches!(sub, 16 | 17 | 22 | 23)) =>
+            {
+                self.x_fp_packed_256(k, op, sub)
+            }
             K_VSHUF_RM if !v256 && matches!((sub, op.w >> 4), (VS_ZX32, 2) | (VS_ZX64, 3) | (VS_MOV, 4)) => {
                 self.x_load(k, op, sub)
             }
+            K_VSHUF_RM if v256 && sub == VS_MOV && (op.w >> 4) == 5 => self.x_load_256(k, op),
             K_VSHUF_RM if !v256 && matches!(sub, VS_XOR | VS_OR | VS_AND | VS_ANDN) && (op.w >> 4) == 4 => {
                 self.x_logic_rm(k, op, sub)
             }
+            K_VSHUF_RM if v256 && matches!(sub, VS_XOR | VS_OR | VS_AND | VS_ANDN) && (op.w >> 4) == 5 => {
+                self.x_logic_rm_256(k, op, sub)
+            }
             K_VSHUF_RR if !v256 && sub <= VS_ANDN => self.x_move(k, op, sub),
+            K_VSHUF_RR if v256 && matches!(sub, VS_MOV | VS_XOR | VS_OR | VS_AND | VS_ANDN) => {
+                self.x_move_256(op, sub)
+            }
             K_VSHUF_RR if !v256 && self.x_shuf_rr(op, sub) => {}
+            K_VFMA_RR | K_VFMA_RM => self.emit_vfma_op(k, op),
             // Everything else: the generic NEON path (operands via `xsrc`, result written
             // through to `Cpu::xmm` by `vstore_dst`, which drops the cached copy).
             K_VSHUF_RR | K_VSHUF_RM | K_VINT_RR | K_VINT_RM | K_VFP_RR | K_VFP_RM => self.vop(k, op),
@@ -574,6 +629,250 @@ impl Tr<'_> {
         self.xdef(d);
         if op.w & 3 == VM_V128 {
             self.clear_ymm_hi(d);
+        }
+    }
+
+    /// 256-bit `vaddps`..`vmaxpd` directly on pinned `(xh, yh)` registers (2 NEON instructions
+    /// for register-register ops; 1 `ldp q` + 2 NEON instructions for memory ops).
+    pub(super) fn x_fp_packed_256(&mut self, k: usize, op: &FastOp, sub: u8) {
+        use fast::*;
+        let is_mem = op.kind == K_VFP_RM;
+        if is_mem {
+            self.vec256_mem_op(k, op, true, 1, 7);
+        }
+        let d = op.r0 & 15;
+        let s1 = (op.imm >> 8) as u8 & 15;
+        let va_lo = self.xget(s1);
+        let vb_lo = if is_mem { 1 } else { self.xget(op.r1) };
+        let vd_lo = xh(d);
+        let va_hi = self.yget(s1, 0);
+        let vb_hi = if is_mem { 7 } else { self.yget(op.r1, 1) };
+        let yh_dst = self.yh_reg(d);
+        // Use v5 (not v3/v4) as the unpinned upper-half dest so `flush_minmax_result`
+        // (`flush_denorm_lanes`, which clobbers v3/v4) never aliases the result register.
+        let vd_hi = yh_dst.unwrap_or(5);
+        let is_pd = sub >= 18;
+        match sub {
+            16 | 17 | 22 | 23 => {
+                for (vd, va, vb) in [(vd_lo, va_lo, vb_lo), (vd_hi, va_hi, vb_hi)] {
+                    let dst = if vd != va && vd != vb { vd } else { 2 };
+                    if sub == 17 || sub == 23 {
+                        self.a.v_fcmgt(is_pd, dst, va, vb);
+                    } else {
+                        self.a.v_fcmgt(is_pd, dst, vb, va);
+                    }
+                    self.a.v_bsl(dst, va, vb);
+                    self.flush_minmax_result(dst, is_pd);
+                    if dst != vd {
+                        self.a.v_mov(vd, dst);
+                    }
+                }
+            }
+            _ => {
+                let aop = if is_pd { sub - 18 } else { sub - 12 };
+                self.a.v_farith(is_pd, aop, vd_lo, va_lo, vb_lo);
+                self.a.v_farith(is_pd, aop, vd_hi, va_hi, vb_hi);
+            }
+        }
+        self.xdef(d);
+        if yh_dst.is_some() {
+            let bit = 1u16 << d;
+            self.ymm_clean &= !bit;
+            self.ymm_dirty_pending |= bit;
+        } else {
+            self.write_ymm_hi(d, vd_hi);
+        }
+    }
+
+    /// 256-bit vector load (`ld = true`) or store (`ld = false`) for `op`'s memory operand
+    /// into/from `(v_lo, v_hi)`, participating in `plan_groups` and emitting a single
+    /// `ldp q`/`stp q` when possible.
+    pub(super) fn vec256_mem_op(&mut self, k: usize, op: &FastOp, ld: bool, v_lo: u32, v_hi: u32) {
+        if ld {
+            debug_assert_ne!(v_lo, v_hi, "ldp q requires distinct destination registers");
+        }
+        self.xa_key = None;
+        let mut chk = Self::chk_of(op);
+        if ld && chk == Chk::Ro && op.base == RNONE && op.index == RNONE {
+            self.mov_lit(XA, op.disp as u64);
+            self.a.ldp_q(v_lo, v_hi, XA, 0);
+            return;
+        }
+        let tso = mem::tso() && (chk != Chk::Stack || stack_tso()) && !(chk == Chk::Ro && ld);
+        if op.base < RNONE && op.index == RNONE {
+            let b = g(op.base);
+            let d = op.disp;
+            let use_pair = d % 16 == 0 && (-1024..=1008).contains(&d);
+            let use_ui = !use_pair && d >= 0 && (d as u64) % 16 == 0 && (d as u64) / 16 + 1 < 4096;
+            if use_pair || use_ui {
+                let mut lead_lo = 0i32;
+                let mut lead = None;
+                if chk == Chk::Full && self.grp_k != k {
+                    match self.grp[k] {
+                        Grp::Lead { lo, id } => {
+                            self.grp_k = k;
+                            lead_lo = lo as i32;
+                            lead = Some(id);
+                        }
+                        Grp::Member { id } if self.grp_ok & (1u64 << id) != 0 => {
+                            self.grp_k = k;
+                            chk = Chk::Align;
+                        }
+                        _ => {}
+                    }
+                }
+                if chk == Chk::Full && !hw_range_enabled() {
+                    let se = self.side_exit_here(k);
+                    let min_d = d + lead_lo as i64;
+                    if (0..4096).contains(&min_d) && d < 4096 {
+                        self.range_check_to(b, se);
+                    } else if min_d < 0 && -min_d < 4096 {
+                        self.a.addsub_ri(true, true, false, XS, b, (-min_d) as u32, false);
+                        self.range_check_to(XS, se);
+                    } else {
+                        self.a.add_imm(true, XS, b, min_d);
+                        self.range_check_to(XS, se);
+                    }
+                    if let Some(id) = lead {
+                        self.grp_ok |= 1u64 << id;
+                    }
+                }
+                if !ld && tso {
+                    self.a.dmb_ishst();
+                }
+                if use_pair {
+                    if ld {
+                        self.a.ldp_q(v_lo, v_hi, b, d as i32);
+                    } else {
+                        self.a.stp_q(v_lo, v_hi, b, d as i32);
+                    }
+                } else {
+                    self.a.ldst_ui(ld, 128, v_lo, b, d as u32);
+                    self.a.ldst_ui(ld, 128, v_hi, b, d as u32 + 16);
+                }
+                if ld && tso {
+                    self.a.dmb_ishld();
+                }
+                return;
+            }
+        }
+        let a = self.addr_into(op, XA);
+        if chk == Chk::Full && !hw_range_enabled() {
+            let se = self.side_exit_here(k);
+            self.range_check_op(k, a, se);
+        }
+        if !ld && tso {
+            self.a.dmb_ishst();
+        }
+        if ld {
+            self.a.ldp_q(v_lo, v_hi, a, 0);
+        } else {
+            self.a.stp_q(v_lo, v_hi, a, 0);
+        }
+        if ld && tso {
+            self.a.dmb_ishld();
+        }
+    }
+
+    /// 256-bit `vmovaps/vmovups/vmovdqa/vmovdqu ymm, m256`: single `ldp q` directly into
+    /// `(xh(d), yh(d))` when pinned (or `(xh(d), v0)` + `str q` for `ymm8..15`).
+    pub(super) fn x_load_256(&mut self, k: usize, op: &FastOp) {
+        let d = op.r0 & 15;
+        let vd = xh(d);
+        if let Some(vy) = self.yh_reg(d) {
+            self.vec256_mem_op(k, op, true, vd, vy);
+            self.xdef(d);
+            let bit = 1u16 << d;
+            self.ymm_clean &= !bit;
+            self.ymm_dirty_pending |= bit;
+        } else {
+            self.vec256_mem_op(k, op, true, vd, 0);
+            self.xdef(d);
+            self.write_ymm_hi(d, 0);
+        }
+    }
+
+    /// 256-bit bitwise `vxorps`/`vorps`/`vandps`/`vandnps` with memory operand directly into
+    /// `(xh(d), yh(d))`.
+    pub(super) fn x_logic_rm_256(&mut self, k: usize, op: &FastOp, sub: u8) {
+        use fast::*;
+        let d = op.r0 & 15;
+        let s1 = (op.imm >> 8) as u8 & 15;
+        self.vec256_mem_op(k, op, true, 1, 7);
+        let va_lo = self.xget(s1);
+        let vd_lo = xh(d);
+        let va_hi = self.yget(s1, 0);
+        let yh_dst = self.yh_reg(d);
+        let vd_hi = yh_dst.unwrap_or(0);
+        for (vd, va, vb) in [(vd_lo, va_lo, 1u32), (vd_hi, va_hi, 7u32)] {
+            match sub {
+                VS_XOR => self.a.v_eor(vd, va, vb),
+                VS_OR => self.a.v_orr(vd, va, vb),
+                VS_AND => self.a.v_and(vd, va, vb),
+                _ => self.a.v_bic(vd, vb, va),
+            }
+        }
+        self.xdef(d);
+        if yh_dst.is_some() {
+            let bit = 1u16 << d;
+            self.ymm_clean &= !bit;
+            self.ymm_dirty_pending |= bit;
+        } else {
+            self.write_ymm_hi(d, vd_hi);
+        }
+    }
+
+    /// 256-bit register moves & bitwise ops (`VS_MOV`/`VS_XOR`/`VS_OR`/`VS_AND`/`VS_ANDN`).
+    pub(super) fn x_move_256(&mut self, op: &FastOp, sub: u8) {
+        use fast::*;
+        let d = op.r0 & 15;
+        let s1 = (op.imm >> 8) as u8 & 15;
+        let s2 = op.r1 & 15;
+        let vd_lo = xh(d);
+        let yh_dst = self.yh_reg(d);
+        if sub == VS_XOR && s1 == s2 {
+            self.a.v_zero(vd_lo);
+            self.xdef(d);
+            self.x_mark_hi(d, true, true);
+            self.clear_ymm_hi(d);
+            return;
+        }
+        if sub == VS_MOV {
+            if d != s2 {
+                self.xsrc(vd_lo, s2);
+                self.xdef(d);
+                if let Some(vy) = yh_dst {
+                    self.ysrc(vy, s2);
+                    let bit = 1u16 << d;
+                    self.ymm_clean &= !bit;
+                    self.ymm_dirty_pending |= bit;
+                } else {
+                    self.ysrc(0, s2);
+                    self.write_ymm_hi(d, 0);
+                }
+            }
+            return;
+        }
+        let va_lo = self.xget(s1);
+        let vb_lo = self.xget(s2);
+        let va_hi = self.yget(s1, 0);
+        let vb_hi = self.yget(s2, 1);
+        let vd_hi = yh_dst.unwrap_or(0);
+        for (vd, va, vb) in [(vd_lo, va_lo, vb_lo), (vd_hi, va_hi, vb_hi)] {
+            match sub {
+                VS_XOR => self.a.v_eor(vd, va, vb),
+                VS_OR => self.a.v_orr(vd, va, vb),
+                VS_AND => self.a.v_and(vd, va, vb),
+                _ => self.a.v_bic(vd, vb, va),
+            }
+        }
+        self.xdef(d);
+        if yh_dst.is_some() {
+            let bit = 1u16 << d;
+            self.ymm_clean &= !bit;
+            self.ymm_dirty_pending |= bit;
+        } else {
+            self.write_ymm_hi(d, vd_hi);
         }
     }
 
@@ -986,24 +1285,14 @@ impl Tr<'_> {
                 self.vec128_mem_op(k, op, false, v);
             }
             _ => {
-                let a = self.addr_into(op, XA);
-                let chk = Self::chk_of(op);
-                if chk == Chk::Full && !hw_range_enabled() {
-                    let se = self.side_exit_here(k);
-                    self.range_check_op(k, a, se);
-                }
-                let v = if cached {
+                let v_lo = if cached {
                     xh(s)
                 } else {
                     self.a.ldr(128, 0, XCPU, xoff(s));
                     0
                 };
-                self.a.ldr(128, 1, XCPU, OFF_YMM_HI + 16 * s as u32);
-                if mem::tso() && (chk != Chk::Stack || stack_tso()) {
-                    self.a.dmb_ishst();
-                }
-                self.a.str(128, v, a, 0);
-                self.a.str(128, 1, a, 16);
+                let v_hi = self.yget(s, 1);
+                self.vec256_mem_op(k, op, false, v_lo, v_hi);
             }
         }
     }

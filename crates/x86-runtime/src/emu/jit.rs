@@ -912,8 +912,9 @@ const _: () = assert!(
         && OFF_IC_TABLE < 8 * 4096
         && OFF_SWITCH_YIELD % 4 == 0
         && OFF_SWITCH_YIELD < 4 * 4096
-        && OFF_YMM_HI % 8 == 0
+        && OFF_YMM_HI % 16 == 0
         && OFF_YMM_HI <= 504
+        && OFF_YMM_HI + 96 <= 1008
 );
 const _: () = assert!(OFF_GPR == 0);
 const _: () = assert!(OFF_TABLE + 8 == OFF_JX + offset_of!(JitScratch, mul) as u32);

@@ -224,7 +224,7 @@ impl Tr<'_> {
         // Load vector index into v2 (lo) and v3 (hi if idx_ymm).
         self.xsrc(2, v);
         if idx_ymm {
-            self.a.ldr(128, 3, XCPU, OFF_YMM_HI + (v as u32) * 16);
+            self.ysrc(3, v);
         }
 
         // Precompute T5 = base + disp (32-bit wrapped if B_ADDR32; GS added per lane after wrap).
@@ -275,7 +275,11 @@ impl Tr<'_> {
                 }
             } else {
                 debug_assert!(msk_ymm);
-                self.a.ldr(elem_bits, T1, XCPU, m_ymm_off + lane_byte_off);
+                if let Some(ym) = self.yh_reg(m) {
+                    self.a.v_umov_elem(elem_lg, T1, ym, lane);
+                } else {
+                    self.a.ldr(elem_bits, T1, XCPU, m_ymm_off + lane_byte_off);
+                }
             }
             let skip_load = self.a.tbz(T1, elem_bits - 1);
 
@@ -302,6 +306,8 @@ impl Tr<'_> {
                 } else {
                     self.a.str(elem_bits, T0, XCPU, d_xmm_off + lane_byte_off);
                 }
+            } else if let Some(yd) = self.yh_reg(d) {
+                self.a.v_ins_elem(elem_lg, yd, lane, T0);
             } else {
                 self.a.str(elem_bits, T0, XCPU, d_ymm_off + lane_byte_off);
             }
@@ -315,6 +321,8 @@ impl Tr<'_> {
                 } else {
                     self.a.str(elem_bits, ZR, XCPU, m_xmm_off + lane_byte_off);
                 }
+            } else if let Some(ym) = self.yh_reg(m) {
+                self.a.v_ins_elem(elem_lg, ym, lane, ZR);
             } else {
                 self.a.str(elem_bits, ZR, XCPU, m_ymm_off + lane_byte_off);
             }
@@ -345,14 +353,13 @@ impl Tr<'_> {
             K_VEXT_RR | K_VEXT_RM => {
                 let sub = op.x & 0x3F;
                 let imm8 = op.imm as u8;
-                let s1 = ((op.imm >> 8) as u32 & 15) * 16;
                 let is_256 = (op.w & 3) == VM_V256;
                 self.vload_b(k, op);
                 self.xsrc(0, (op.imm >> 8) as u8);
                 self.emit_vext_lane(sub, imm8);
                 if is_256 {
                     self.a.v_mov(6, 0);
-                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1);
+                    self.ysrc(0, (op.imm >> 8) as u8);
                     self.a.v_mov(1, 7);
                     let hi_imm = if sub == VX_MPSADBW { imm8 >> 3 } else { imm8 };
                     self.emit_vext_lane(sub, hi_imm);

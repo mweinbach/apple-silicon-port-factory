@@ -395,8 +395,7 @@ impl Tr<'_> {
             // (`ldr q1, [cpu, #xmm]` unless the XMM cache holds the register.)
             self.xsrc(1, op.r1);
             if is_256 {
-                let r2 = (op.r1 as u32 & 15) * 16;
-                self.a.ldr(128, 7, XCPU, OFF_YMM_HI + r2);
+                self.ysrc(7, op.r1);
             }
             return;
         }
@@ -427,37 +426,13 @@ impl Tr<'_> {
                     let se = self.side_exit_here(k);
                     self.range_check_op(k, a, se);
                 }
-                self.a.ldr(64, T0, a, 0);
-                self.a.ldr(64, T1, a, 8);
+                self.a.ldr(128, 1, a, 0);
                 if mem::tso() && (chk != Chk::Stack || stack_tso()) {
                     self.a.dmb_ishld();
                 }
-                self.a.fmov_gf(true, 1, T0);
-                self.a.v_ins_d(1, 1, T1);
             }
             _ => {
-                let a = self.addr_into(op, XA);
-                let chk = Self::chk_of(op);
-                if chk == Chk::Ro {
-                    self.a.ldr(128, 1, a, 0);
-                    self.a.ldr(128, 7, a, 16);
-                    return;
-                }
-                if chk == Chk::Full {
-                    let se = self.side_exit_here(k);
-                    self.range_check_op(k, a, se);
-                }
-                self.a.ldr(64, T0, a, 0);
-                self.a.ldr(64, T1, a, 8);
-                self.a.ldr(64, T2, a, 16);
-                self.a.ldr(64, T3, a, 24);
-                if mem::tso() && (chk != Chk::Stack || stack_tso()) {
-                    self.a.dmb_ishld();
-                }
-                self.a.fmov_gf(true, 1, T0);
-                self.a.v_ins_d(1, 1, T1);
-                self.a.fmov_gf(true, 7, T2);
-                self.a.v_ins_d(7, 1, T3);
+                self.vec256_mem_op(k, op, true, 1, 7);
             }
         }
     }
@@ -992,6 +967,7 @@ impl Tr<'_> {
 
     // Clear just the fraction bits of exponent-zero lanes; preserve the sign and NaN payloads.
     fn flush_denorm_lanes(&mut self, reg: u32, double: bool) {
+        debug_assert!(reg != 3 && reg != 4, "flush_denorm_lanes clobbers v3 and v4 as scratch");
         let (width, exponent, fraction) = if double {
             (3, 0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff)
         } else {
@@ -1293,7 +1269,6 @@ impl Tr<'_> {
         use fast::*;
         let sub = op.x & 0x3F;
         let imm8 = op.imm as u8;
-        let s1 = ((op.imm >> 8) as u32 & 15) * 16;
         let is_256 = (op.w & 3) == VM_V256;
         let is_vfp = matches!(op.kind, K_VFP_RR | K_VFP_RM);
         let touches_nzcv = is_vfp
@@ -1312,7 +1287,7 @@ impl Tr<'_> {
         }
         if is_256 {
             self.a.v_mov(6, 0);
-            self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1);
+            self.ysrc(0, (op.imm >> 8) as u8);
             if !(matches!(op.kind, K_VSHUF_RR | K_VSHUF_RM) && (VS_PSRLW..=VS_PSLLQ).contains(&sub)) {
                 self.a.v_mov(1, 7);
             }
@@ -2122,36 +2097,33 @@ impl Tr<'_> {
                 self.store(k, T0, a, wb, Self::chk_of(op));
             }
             K_MOVMSK => {
-                let s = (op.r1 as u32 & 15) * 16;
                 let sub = op.x & 0x3F;
                 let is_256 = (sub & 1) != 0;
                 self.xsrc(0, op.r1);
                 if is_256 {
-                    self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s);
+                    self.ysrc(1, op.r1);
                 }
                 match sub >> 1 {
                     0 => {
-                        // pmovmskb / vpmovmskb
-                        self.a.mov_imm(true, T2, 0x8040_2010_0804_0201);
+                        // pmovmskb / vpmovmskb: `cmlt < 0` + bit-weight AND + 3× pairwise `addp.16b`
+                        // packs all 16 (or 32) sign bits straight into `s0` with zero NEON mul/addv.
+                        self.mov_lit(T2, 0x8040_2010_0804_0201);
                         self.a.v_dup(3, 2, T2);
-                        self.a.v_shr_i(true, 8, 0, 0, 7);
-                        self.a.neon_3same(false, 0, 19, 0, 0, 2); // mul v0.16b, v0.16b, v2.16b
-                        self.a.v_ext(3, 0, 0, 8);
-                        self.a.v_addv_8b(0, 0);
-                        self.a.v_addv_8b(3, 3);
-                        self.a.fmov_fg(false, T0, 0);
-                        self.a.fmov_fg(false, T1, 3);
-                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 8);
+                        self.a.v_cmlt0(0, 0, 0);
+                        self.a.v_and(0, 0, 2);
                         if is_256 {
-                            self.a.v_shr_i(true, 8, 1, 1, 7);
-                            self.a.neon_3same(false, 0, 19, 1, 1, 2);
-                            self.a.v_ext(3, 1, 1, 8);
-                            self.a.v_addv_8b(1, 1);
-                            self.a.v_addv_8b(3, 3);
-                            self.a.fmov_fg(false, T1, 1);
-                            self.a.fmov_fg(false, T2, 3);
-                            self.a.logic_rr(false, 1, T0, T0, T1, 0, 16);
-                            self.a.logic_rr(false, 1, T0, T0, T2, 0, 24);
+                            self.a.v_cmlt0(0, 1, 1);
+                            self.a.v_and(1, 1, 2);
+                            self.a.neon_3same(false, 0, 23, 0, 0, 1); // addp v0.16b, v0.16b, v1.16b
+                            self.a.neon_3same(false, 0, 23, 0, 0, 0);
+                            self.a.neon_3same(false, 0, 23, 0, 0, 0);
+                            self.a.fmov_fg(false, T0, 0);
+                        } else {
+                            self.a.neon_3same(false, 0, 23, 0, 0, 0);
+                            self.a.neon_3same(false, 0, 23, 0, 0, 0);
+                            self.a.neon_3same(false, 0, 23, 0, 0, 0);
+                            self.a.fmov_fg(false, T0, 0);
+                            self.a.ubfm(false, T0, T0, 0, 15);
                         }
                     }
                     1 => {

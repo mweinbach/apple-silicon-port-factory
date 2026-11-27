@@ -137,23 +137,28 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     let lb_on = cfg.lb_on;
     let bud_light = cfg.bud_light;
     // enter(cpu: x0, code: x1)
+    // When `xpin` is active, guest `xmm0..15` stay pinned in `v16..v31` AND `ymm_hi[0..7]`
+    // stay pinned in `v8..v15`. Save callee-saved `q8..q15` (superset of AAPCS64 `d8..d15`)
+    // in the frame and load pinned vector state via `reload_xmm`.
     let enter = a.pos;
-    a.emit(0xA980_0000 | ((-12i32 as u32) & 0x7F) << 15 | 30 << 10 | 31 << 5 | 29); // stp x29, x30, [sp, #-96]!
+    let frame_qwords: i32 = if xpin { 28 } else { 12 }; // 224B vs 96B (16B-aligned)
+    a.emit(0xA980_0000 | ((-frame_qwords as u32) & 0x7F) << 15 | 30 << 10 | 31 << 5 | 29); // stp x29, x30, [sp, #-frame]!
     a.emit(0x9100_03FD); // mov x29, sp
     a.stp_x(19, 20, 31, 16);
     a.stp_x(21, 22, 31, 32);
     a.stp_x(23, 24, 31, 48);
     a.stp_x(25, 26, 31, 64);
     a.stp_x(27, 28, 31, 80);
+    if xpin {
+        for i in 0..4u32 {
+            a.stp_q(8 + 2 * i, 9 + 2 * i, 31, (96 + 32 * i) as i32);
+        }
+    }
     a.mov_rr(true, XCPU, 0);
     for i in 0..8 {
         a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
     }
-    if xpin {
-        for i in 0..8u32 {
-            a.ldp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
-        }
-    }
+    let enter_reload = xpin.then(|| a.bl());
     if ras {
         a.ldr(64, XRAS, XCPU, OFF_RAS);
     }
@@ -173,31 +178,35 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     for i in 0..8 {
         a.stp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
     }
-    if xpin {
-        for i in 0..8u32 {
-            a.stp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
-        }
-    }
+    let exit_spill = xpin.then(|| a.bl());
     if ras {
         a.str(64, XRAS, XCPU, OFF_RAS);
     }
     a.asr_i(true, XA, XBUD, 1);
     a.str(64, XA, XCPU, OFF_BUDGET);
-    // exit_ns: same, with the GPRs and budget already stored by the caller.
+    // exit_ns: same, with the GPRs, pinned vectors, and budget already stored by the caller.
     let exit_ns = a.pos;
+    if xpin {
+        for i in 0..4u32 {
+            a.ldp_q(8 + 2 * i, 9 + 2 * i, 31, (96 + 32 * i) as i32);
+        }
+    }
     a.ldp_x(19, 20, 31, 16);
     a.ldp_x(21, 22, 31, 32);
     a.ldp_x(23, 24, 31, 48);
     a.ldp_x(25, 26, 31, 64);
     a.ldp_x(27, 28, 31, 80);
-    a.emit(0xA8C0_0000 | (12u32 & 0x7F) << 15 | 30 << 10 | 31 << 5 | 29); // ldp x29, x30, [sp], #96
+    a.emit(0xA8C0_0000 | ((frame_qwords as u32) & 0x7F) << 15 | 30 << 10 | 31 << 5 | 29); // ldp x29, x30, [sp], #frame
     a.ret();
 
-    // Shared XMM spill/reload helpers (preserves all GPRs, q0..q15, and NZCV).
+    // Shared XMM + pinned YMM_HI[0..7] spill/reload helpers (preserves all GPRs, q0..q7, and NZCV).
     let (spill_xmm, reload_xmm) = if xpin {
         let sp_pos = a.pos;
         for i in 0..8u32 {
             a.stp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
+        }
+        for i in 0..4u32 {
+            a.stp_q(8 + 2 * i, 9 + 2 * i, XCPU, (OFF_YMM_HI + 32 * i) as i32);
         }
         a.ret();
 
@@ -205,15 +214,25 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         for i in 0..8u32 {
             a.ldp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
         }
+        for i in 0..4u32 {
+            a.ldp_q(8 + 2 * i, 9 + 2 * i, XCPU, (OFF_YMM_HI + 32 * i) as i32);
+        }
         a.ret();
+        if let Some(f) = enter_reload {
+            a.patch(f, rl_pos);
+        }
+        if let Some(f) = exit_spill {
+            a.patch(f, sp_pos);
+        }
         (Some(sp_pos), Some(rl_pos))
     } else {
         (None, None)
     };
 
-    // Shared VEX-128 / `vzeroupper` lazy `Cpu::ymm_hi` zeroing stub: clears `Cpu::ymm_hi[r]`
-    // for every bit `r` set in BOTH `w16` (mask) and `Cpu::jx.ymm_dirty`, updates
-    // `Cpu::jx.ymm_dirty`, and clears bit 0 of `XBUD` once `ymm_dirty` reaches 0.
+    // Shared VEX-128 / `vzeroupper` lazy `Cpu::ymm_hi` zeroing stub: clears `ymm_hi[r]`
+    // (register `v(8+r)` for `r < 8` when `xpin`, else `Cpu::ymm_hi[r]` in memory) for every
+    // bit `r` set in BOTH `w16` (mask) and `Cpu::jx.ymm_dirty`, updates `Cpu::jx.ymm_dirty`,
+    // and clears bit 0 of `XBUD` once `ymm_dirty` reaches 0.
     // Clobbers only x16, x17 (and bit 0 of x8); preserves all other GPRs and NZCV.
     let clear_ymm_hi = a.pos;
     a.ldr(16, XS, XCPU, OFF_YMM_DIRTY);
@@ -224,6 +243,17 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     let ym_keep_bit = a.cbnz(false, XS);
     a.logic_ri(true, 0, XBUD, XBUD, enc_logic_imm(!1u64, true).unwrap());
     a.bind(ym_keep_bit);
+    let ym_hi_done = if xpin {
+        for r in 0..8u32 {
+            let skip = a.tbz(XA, r);
+            a.v_zero(8 + r);
+            a.bind(skip);
+        }
+        a.logic_ri(false, 0, XA, XA, enc_logic_imm(0xFF00, false).unwrap());
+        Some(a.cbz(false, XA))
+    } else {
+        None
+    };
     let ym_loop = a.pos;
     a.rbit(false, XS, XA);
     a.clz(false, XS, XS);
@@ -233,6 +263,9 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     a.logic_rr(false, 0, XA, XA, XS, 0, 0); // and w16, w16, w17
     let ym_back = a.cbnz(false, XA);
     a.patch(ym_back, ym_loop);
+    if let Some(done) = ym_hi_done {
+        a.bind(done);
+    }
     a.ret();
     a.bind(ym_done);
     let ym_ret = a.cbnz(false, XS);
@@ -877,10 +910,9 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         for i in 0..8 {
             a.stp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
         }
-        if xpin {
-            for i in 0..8u32 {
-                a.stp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
-            }
+        if let Some(sp_pos) = spill_xmm {
+            let sp_addr = a.addr_of(sp_pos);
+            a.bl_to(sp_addr);
         }
         if ras {
             a.str(64, XRAS, XCPU, OFF_RAS);
@@ -904,10 +936,9 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         for i in 0..8 {
             a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
         }
-        if xpin {
-            for i in 0..8u32 {
-                a.ldp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
-            }
+        if let Some(rl_pos) = reload_xmm {
+            let rl_addr = a.addr_of(rl_pos);
+            a.bl_to(rl_addr);
         }
         if ras {
             a.ldr(64, XRAS, XCPU, OFF_RAS);

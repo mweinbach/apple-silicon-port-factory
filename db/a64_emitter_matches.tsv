@@ -1043,7 +1043,7 @@ case_id	case_word	word	assembly	page	encodings
 543	lock_not_qword_rsp[4]	35000091	cbnz w17, #16	cbnz	CBNZ_32_compbranch
 543	lock_not_qword_rsp[5]	92800002	movn x2, #0	movn	MOVN_64_movewide
 543	lock_not_qword_rsp[6]	f8e22200	ldeoral x2, x0, [x16]	ldeor	LDEORAL_64_memop
-543	lock_not_qword_rsp[7]	1400000f	b #60	b_uncond	B_only_branch_imm
+543	lock_not_qword_rsp[7]	d5033bbf	dmb ish	dmb	DMB_BO_barriers
 543	lock_not_qword_rsp[8]	d3442605	ubfx x5, x16, #4, #6	ubfx_ubfm	UBFM_64M_bitfield/UBFX
 543	lock_not_qword_rsp[9]	f94165f1	ldr x17, [x15, #712]	ldr_imm_gen	LDR_64_ldst_pos
 543	lock_not_qword_rsp[10]	8b051e31	add x17, x17, x5, lsl #7	add_addsub_shift	ADD_64_addsub_shift
@@ -1058,7 +1058,7 @@ case_id	case_word	word	assembly	page	encodings
 543	lock_not_qword_rsp[19]	aa2003e2	mvn x2, x0	mvn_orn_log_shift	ORN_64_log_shift/MVN
 543	lock_not_qword_rsp[20]	f9000202	str x2, [x16]	str_imm_gen	STR_64_ldst_pos
 543	lock_not_qword_rsp[21]	889ffe3f	stlr wzr, [x17]	stlr	STLR_SL32_ldstord
-543	lock_not_qword_rsp[22]	d5033bbf	dmb ish	dmb	DMB_BO_barriers
+543	lock_not_qword_rsp[22]	17fffff1	b #-60	b_uncond	B_only_branch_imm
 544	lock_and_dword_rsp[0]	aa1703f0	mov x16, x23	mov_orr_log_shift	ORR_64_log_shift/MOV
 544	lock_and_dword_rsp[1]	aa1303e1	mov x1, x19	mov_orr_log_shift	ORR_64_log_shift/MOV
 544	lock_and_dword_rsp[2]	12000e11	and w17, w16, #15	and_log_imm	AND_32_log_imm
@@ -1067,7 +1067,7 @@ case_id	case_word	word	assembly	page	encodings
 544	lock_and_dword_rsp[5]	35000091	cbnz w17, #16	cbnz	CBNZ_32_compbranch
 544	lock_and_dword_rsp[6]	2a2103e2	mvn w2, w1	mvn_orn_log_shift	ORN_32_log_shift/MVN
 544	lock_and_dword_rsp[7]	b8e21200	ldclral w2, w0, [x16]	ldclr	LDCLRAL_32_memop
-544	lock_and_dword_rsp[8]	1400000f	b #60	b_uncond	B_only_branch_imm
+544	lock_and_dword_rsp[8]	d5033bbf	dmb ish	dmb	DMB_BO_barriers
 544	lock_and_dword_rsp[9]	d3442605	ubfx x5, x16, #4, #6	ubfx_ubfm	UBFM_64M_bitfield/UBFX
 544	lock_and_dword_rsp[10]	f94165f1	ldr x17, [x15, #712]	ldr_imm_gen	LDR_64_ldst_pos
 544	lock_and_dword_rsp[11]	8b051e31	add x17, x17, x5, lsl #7	add_addsub_shift	ADD_64_addsub_shift
@@ -1082,8 +1082,7 @@ case_id	case_word	word	assembly	page	encodings
 544	lock_and_dword_rsp[20]	0a010002	and w2, w0, w1	and_log_shift	AND_32_log_shift
 544	lock_and_dword_rsp[21]	b9000202	str w2, [x16]	str_imm_gen	STR_32_ldst_pos
 544	lock_and_dword_rsp[22]	889ffe3f	stlr wzr, [x17]	stlr	STLR_SL32_ldstord
-544	lock_and_dword_rsp[23]	d5033bbf	dmb ish	dmb	DMB_BO_barriers
-544	lock_and_dword_rsp[24]	6a010005	ands w5, w0, w1	ands_log_shift	ANDS_32_log_shift
+544	lock_and_dword_rsp[23]	17fffff1	b #-60	b_uncond	B_only_branch_imm
 545	rdtsc[0]	394ca1e1	ldrb w1, [x15, #808]	ldrb_imm	LDRB_32_ldst_pos
 545	rdtsc[1]	36080041	tbz w1, #1, #8	tbz	TBZ_only_testbranch
 545	rdtsc[2]	14000004	b #16	b_uncond	B_only_branch_imm

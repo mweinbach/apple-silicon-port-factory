@@ -59,6 +59,7 @@ fn register_translated_instructions(cases: &mut Cases) {
         let mut tr = new_tr(a, &prep.ops[..1], &prep, &stubs, false, &mut scratch);
         tr.op(0);
         tr.emit_timestamp_fallbacks();
+        tr.emit_atomic_colds();
         assert!(!tr.a.overflow);
         cases.record(name, expected, &buf[..tr.a.pos]);
         tr.return_scratch(&mut scratch);
@@ -126,7 +127,7 @@ fn register_translated_instructions(cases: &mut Cases) {
             ("cbnz", "cbnz w17, #16"),
             ("movn", "movn x2, #0"),
             ("ldeor", "ldeoral x2, x0, [x16]"),
-            ("b_uncond", "b #60"),
+            ("dmb", "dmb ish"),
             ("ubfx_ubfm", "ubfx x5, x16, #4, #6"),
             ("ldr_imm_gen", &load_locks),
             ("add_addsub_shift", "add x17, x17, x5, lsl #7"),
@@ -141,7 +142,7 @@ fn register_translated_instructions(cases: &mut Cases) {
             ("mvn_orn_log_shift", "mvn x2, x0"),
             ("str_imm_gen", "str x2, [x16]"),
             ("stlr", "stlr wzr, [x17]"),
-            ("dmb", "dmb ish"),
+            ("b_uncond", "b #-60"),
         ],
     );
     check(
@@ -156,7 +157,7 @@ fn register_translated_instructions(cases: &mut Cases) {
             ("cbnz", "cbnz w17, #16"),
             ("mvn_orn_log_shift", "mvn w2, w1"),
             ("ldclr", "ldclral w2, w0, [x16]"),
-            ("b_uncond", "b #60"),
+            ("dmb", "dmb ish"),
             ("ubfx_ubfm", "ubfx x5, x16, #4, #6"),
             ("ldr_imm_gen", &load_locks),
             ("add_addsub_shift", "add x17, x17, x5, lsl #7"),
@@ -171,8 +172,7 @@ fn register_translated_instructions(cases: &mut Cases) {
             ("and_log_shift", "and w2, w0, w1"),
             ("str_imm_gen", "str w2, [x16]"),
             ("stlr", "stlr wzr, [x17]"),
-            ("dmb", "dmb ish"),
-            ("ands_log_shift", "ands w5, w0, w1"),
+            ("b_uncond", "b #-60"),
         ],
     );
     let load_mode = format!("ldrb w1, [x15, #{}]", crate::emu::jit::OFF_TSC_MODE);

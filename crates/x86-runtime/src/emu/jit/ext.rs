@@ -2,11 +2,10 @@
 //! and dispatch into `super::more` for `K_VAES_RR..=K_VSHA_RM`.
 
 use super::emit::{enc_logic_imm, sf, Asm};
-use super::translate::{stack_tso, Chk, FlagState, Src, Tr};
+use super::translate::{FlagState, Src, Tr};
 use super::xmm::xh;
 use super::*;
 use crate::emu::fast::{self, FastOp};
-use crate::emu::mem;
 
 impl Asm {
     pub(super) fn v_xtl(&mut self, u: bool, sz: u32, q: bool, vd: u32, vn: u32) {
@@ -93,69 +92,187 @@ impl Tr<'_> {
         self.a.v_mov(vd, 3);
     }
 
-    pub(super) fn emit_vfma_lane(&mut self, ty: u8, ord: u8, fop: u8) {
-        // v0 = v1(d), v2 = v2(s2), v1 = v3(s3). Result in v0.
-        let (m1, m2, acc) = match ord {
-            0 => (0u32, 1u32, 2u32),
-            1 => (2, 0, 1),
-            _ => (2, 1, 0),
-        };
+    /// Emit one packed 128-bit FMA lane: `vd = ±(vm1 * vm2) ± vacc`.
+    /// Preserves exact `(vn = vm1, vm = vm2)` operand order for dual-NaN payload parity.
+    /// Scratch temps `v2`, `v3`, `v5` must not alias `vm1`, `vm2`, or `vacc`.
+    pub(super) fn emit_vfma_packed_lane(
+        &mut self,
+        is_pd: bool,
+        fop: u8,
+        vd: u32,
+        vm1: u32,
+        vm2: u32,
+        vacc: u32,
+        acc_scratch: bool,
+    ) {
         let neg_mul = fop == 2 || fop == 3;
+        let m1_reg = if neg_mul {
+            self.a.v_fneg(is_pd, 3, vm1);
+            3
+        } else {
+            vm1
+        };
+        let acc_reg = if vd != m1_reg && vd != vm2 {
+            self.a.v_mov(vd, vacc);
+            vd
+        } else if fop == 0 && vd == vacc {
+            vd
+        } else if acc_scratch && vacc != m1_reg && vacc != vm2 {
+            vacc
+        } else {
+            self.a.v_mov(5, vacc);
+            5
+        };
+        match fop {
+            1 | 3 => self.a.v_fneg(is_pd, acc_reg, acc_reg),
+            4 => {
+                // fmaddsub: negate even lanes of acc
+                if is_pd {
+                    self.a.mov_imm(true, T0, 0x8000_0000_0000_0000);
+                    self.a.fmov_gf(true, 2, T0);
+                } else {
+                    self.a.mov_imm(true, T0, 0x0000_0000_8000_0000);
+                    self.a.v_dup(3, 2, T0);
+                }
+                self.a.v_eor(acc_reg, acc_reg, 2);
+            }
+            5 => {
+                // fmsubadd: negate odd lanes of acc
+                if is_pd {
+                    self.a.mov_imm(true, T0, 0x8000_0000_0000_0000);
+                    self.a.v_zero(2);
+                    self.a.v_ins_d(2, 1, T0);
+                } else {
+                    self.a.mov_imm(true, T0, 0x8000_0000_0000_0000);
+                    self.a.v_dup(3, 2, T0);
+                }
+                self.a.v_eor(acc_reg, acc_reg, 2);
+            }
+            _ => {}
+        }
+        self.a.v_fmla(is_pd, acc_reg, m1_reg, vm2);
+        if acc_reg != vd {
+            self.a.v_mov(vd, acc_reg);
+        }
+    }
+
+    /// Direct pinned-register translation for `K_VFMA_RR` / `K_VFMA_RM` (scalar ss/sd and
+    /// 128/256-bit packed ps/pd), eliminating `v0..v5` copies and scalar FP↔GPR roundtrips.
+    pub(super) fn emit_vfma_op(&mut self, k: usize, op: &FastOp) {
+        use fast::*;
+        let d = op.r0 & 15;
+        let s2 = (op.imm & 0xFF) as u8 & 15;
+        let fma_code = ((op.imm >> 8) & 0xFF) as u8;
+        let ty = fma_code & 3;
+        let ord = (fma_code >> 2) & 3;
+        let fop = (fma_code >> 4) & 7;
+        let is_256 = (op.w & 3) == VM_V256;
+        let is_mem = op.kind == K_VFMA_RM;
+
         if ty <= 1 {
             let is_sd = ty == 1;
-            self.a.v_mov(3, m1);
-            self.a.v_mov(4, m2);
-            self.a.v_mov(5, acc);
-            if neg_mul {
-                self.a.s_fneg(is_sd, 3, 3);
-            }
-            if fop == 1 || fop == 3 {
-                self.a.s_fneg(is_sd, 5, 5);
-            }
-            self.a.s_fmadd(is_sd, 3, 3, 4, 5);
-            self.a.fmov_fg(is_sd, T0, 3);
-            if is_sd {
-                self.a.v_ins_d(0, 0, T0);
+            let bits = if is_sd { 64 } else { 32 };
+            let v3_lo = if is_mem {
+                if !self.scalar_fp_mem_op(k, true, 1, op, bits) {
+                    self.load_op(k, T0, op, bits);
+                    self.a.fmov_gf(is_sd, 1, T0);
+                }
+                1
             } else {
-                self.a.v_ins_s(0, 0, T0);
+                self.xget(op.r1)
+            };
+            let v1_lo = self.xget(d);
+            let v2_lo = self.xget(s2);
+            let (vm1, vm2, vacc) = match ord {
+                0 => (v1_lo, v3_lo, v2_lo),
+                1 => (v2_lo, v1_lo, v3_lo),
+                _ => (v2_lo, v3_lo, v1_lo),
+            };
+            let neg_mul = fop == 2 || fop == 3;
+            let m1_reg = if neg_mul {
+                self.a.s_fneg(is_sd, 3, vm1);
+                3
+            } else {
+                vm1
+            };
+            let acc_reg = if fop == 1 || fop == 3 {
+                self.a.s_fneg(is_sd, 5, vacc);
+                5
+            } else {
+                vacc
+            };
+            let hi_zero = if is_sd {
+                self.xmm_hi64_zero & (1u16 << d) != 0
+            } else {
+                self.xmm_hi32_zero & (1u16 << d) != 0
+            };
+            let hi_dead = if is_sd {
+                (self.xmm_hi64_live[k + 1] & (1u16 << d)) == 0
+            } else {
+                (self.xmm_hi32_live[k + 1] & (1u16 << d)) == 0
+            };
+            if hi_zero || hi_dead {
+                self.a.s_fmadd(is_sd, xh(d), m1_reg, vm2, acc_reg);
+                self.xdef(d);
+                self.x_mark_hi(d, !is_sd, true);
+            } else {
+                self.a.s_fmadd(is_sd, 2, m1_reg, vm2, acc_reg);
+                self.a.v_ins_lane(if is_sd { 3 } else { 2 }, xh(d), 0, 2, 0);
+                self.xdef(d);
+            }
+            self.clear_ymm_hi(d);
+            return;
+        }
+
+        let is_pd = ty == 3;
+        if is_mem {
+            if is_256 {
+                self.vec256_mem_op(k, op, true, 1, 7);
+            } else {
+                self.vec128_mem_op(k, op, true, 1);
+            }
+        }
+        let v1_lo = self.xget(d);
+        let v2_lo = self.xget(s2);
+        let v3_lo = if is_mem { 1 } else { self.xget(op.r1) };
+        let (vm1_lo, vm2_lo, vacc_lo) = match ord {
+            0 => (v1_lo, v3_lo, v2_lo),
+            1 => (v2_lo, v1_lo, v3_lo),
+            _ => (v2_lo, v3_lo, v1_lo),
+        };
+        let vd_lo = xh(d);
+        self.emit_vfma_packed_lane(is_pd, fop, vd_lo, vm1_lo, vm2_lo, vacc_lo, vacc_lo < 8);
+        self.xdef(d);
+
+        if is_256 {
+            let v1_hi = self.yget(d, 0);
+            let v2_hi = if s2 == d { v1_hi } else { self.yget(s2, 4) };
+            let v3_hi = if is_mem {
+                7
+            } else if (op.r1 & 15) == d {
+                v1_hi
+            } else if (op.r1 & 15) == s2 {
+                v2_hi
+            } else {
+                self.yget(op.r1, 7)
+            };
+            let (vm1_hi, vm2_hi, vacc_hi) = match ord {
+                0 => (v1_hi, v3_hi, v2_hi),
+                1 => (v2_hi, v1_hi, v3_hi),
+                _ => (v2_hi, v3_hi, v1_hi),
+            };
+            let yh_dst = self.yh_reg(d);
+            let vd_hi = yh_dst.unwrap_or(6);
+            self.emit_vfma_packed_lane(is_pd, fop, vd_hi, vm1_hi, vm2_hi, vacc_hi, vacc_hi < 8);
+            if yh_dst.is_some() {
+                let bit = 1u16 << d;
+                self.ymm_clean &= !bit;
+                self.ymm_dirty_pending |= bit;
+            } else {
+                self.write_ymm_hi(d, vd_hi);
             }
         } else {
-            let is_pd = ty == 3;
-            self.a.v_mov(3, m1);
-            self.a.v_mov(4, m2);
-            self.a.v_mov(5, acc);
-            if neg_mul {
-                self.a.v_fneg(is_pd, 3, 3);
-            }
-            match fop {
-                1 | 3 => self.a.v_fneg(is_pd, 5, 5),
-                4 => {
-                    // fmaddsub: negate even lanes of acc
-                    if is_pd {
-                        self.a.mov_imm(true, T0, 0x8000_0000_0000_0000);
-                        self.a.fmov_gf(true, 2, T0);
-                    } else {
-                        self.a.mov_imm(true, T0, 0x0000_0000_8000_0000);
-                        self.a.v_dup(3, 2, T0);
-                    }
-                    self.a.v_eor(5, 5, 2);
-                }
-                5 => {
-                    // fmsubadd: negate odd lanes of acc
-                    if is_pd {
-                        self.a.mov_imm(true, T0, 0x8000_0000_0000_0000);
-                        self.a.v_zero(2);
-                        self.a.v_ins_d(2, 1, T0);
-                    } else {
-                        self.a.mov_imm(true, T0, 0x8000_0000_0000_0000);
-                        self.a.v_dup(3, 2, T0);
-                    }
-                    self.a.v_eor(5, 5, 2);
-                }
-                _ => {}
-            }
-            self.a.v_fmla(is_pd, 5, 3, 4);
-            self.a.v_mov(0, 5);
+            self.clear_ymm_hi(d);
         }
     }
 
@@ -171,18 +288,7 @@ impl Tr<'_> {
                 let mem = (op.x & 0x20) != 0;
                 if lg == 4 {
                     if mem {
-                        let a = self.addr_into(op, XA);
-                        if Self::chk_of(op) == Chk::Full {
-                            let se = self.side_exit_here(k);
-                            self.range_check_to(a, se);
-                        }
-                        self.a.ldr(64, T0, a, 0);
-                        self.a.ldr(64, T1, a, 8);
-                        if mem::tso() {
-                            self.a.dmb_ishld();
-                        }
-                        self.a.fmov_gf(true, 0, T0);
-                        self.a.v_ins_d(0, 1, T1);
+                        self.vec128_mem_op(k, op, true, 0);
                     } else {
                         self.xsrc(0, op.r1);
                     }
@@ -214,21 +320,11 @@ impl Tr<'_> {
                 let u = (sub & 1) != 0;
                 let mem = (op.x & 0x20) != 0;
                 if mem {
-                    let a = self.addr_into(op, XA);
                     let mbits = op.imm as u32;
                     if mbits == 128 {
-                        if Self::chk_of(op) == Chk::Full {
-                            let se = self.side_exit_here(k);
-                            self.range_check_to(a, se);
-                        }
-                        self.a.ldr(64, T0, a, 0);
-                        self.a.ldr(64, T1, a, 8);
-                        if mem::tso() {
-                            self.a.dmb_ishld();
-                        }
-                        self.a.fmov_gf(true, 0, T0);
-                        self.a.v_ins_d(0, 1, T1);
+                        self.vec128_mem_op(k, op, true, 0);
                     } else {
+                        let a = self.addr_into(op, XA);
                         self.load(k, T0, a, mbits, Self::chk_of(op));
                         self.a.fmov_gf(true, 0, T0);
                     }
@@ -297,20 +393,10 @@ impl Tr<'_> {
                 let mem = (op.x & 0x20) != 0;
                 if sub <= 1 {
                     if mem {
-                        let a = self.addr_into(op, XA);
                         if mode == VM_V256 {
-                            if Self::chk_of(op) == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            self.a.ldr(64, T0, a, 0);
-                            self.a.ldr(64, T1, a, 8);
-                            if mem::tso() {
-                                self.a.dmb_ishld();
-                            }
-                            self.a.fmov_gf(true, 0, T0);
-                            self.a.v_ins_d(0, 1, T1);
+                            self.vec128_mem_op(k, op, true, 0);
                         } else {
+                            let a = self.addr_into(op, XA);
                             self.load(k, T0, a, 64, Self::chk_of(op));
                             self.a.fmov_gf(true, 0, T0);
                         }
@@ -338,31 +424,15 @@ impl Tr<'_> {
                     }
                 } else {
                     if mem {
-                        let a = self.addr_into(op, XA);
-                        if Self::chk_of(op) == Chk::Full {
-                            let se = self.side_exit_here(k);
-                            self.range_check_to(a, se);
-                        }
-                        self.a.ldr(64, T0, a, 0);
-                        self.a.ldr(64, T1, a, 8);
                         if src_256 {
-                            self.a.ldr(64, T2, a, 16);
-                            self.a.ldr(64, T3, a, 24);
-                        }
-                        if mem::tso() {
-                            self.a.dmb_ishld();
-                        }
-                        self.a.fmov_gf(true, 0, T0);
-                        self.a.v_ins_d(0, 1, T1);
-                        if src_256 {
-                            self.a.fmov_gf(true, 1, T2);
-                            self.a.v_ins_d(1, 1, T3);
+                            self.vec256_mem_op(k, op, true, 0, 1);
+                        } else {
+                            self.vec128_mem_op(k, op, true, 0);
                         }
                     } else {
-                        let s = (op.r1 as u32 & 15) * 16;
                         self.xsrc(0, op.r1);
                         if src_256 {
-                            self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s);
+                            self.ysrc(1, op.r1);
                         }
                     }
                     if sub == 2 {
@@ -385,122 +455,33 @@ impl Tr<'_> {
                     }
                 }
             }
-            K_VFMA_RR | K_VFMA_RM => {
-                let d = (op.r0 as u32 & 15) * 16;
-                let s2 = ((op.imm & 0xFF) as u32 & 15) * 16;
-                let fma_code = ((op.imm >> 8) & 0xFF) as u8;
-                let ty = fma_code & 3;
-                let ord = (fma_code >> 2) & 3;
-                let fop = (fma_code >> 4) & 7;
-                let is_256 = (op.w & 3) == VM_V256;
-                if op.kind == K_VFMA_RM {
-                    let a = self.addr_into(op, XA);
-                    let chk = Self::chk_of(op);
-                    match op.w >> 4 {
-                        2 => {
-                            self.load(k, T0, a, 32, chk);
-                            self.a.fmov_gf(false, 1, T0);
-                        }
-                        3 => {
-                            self.load(k, T0, a, 64, chk);
-                            self.a.fmov_gf(true, 1, T0);
-                        }
-                        4 => {
-                            if chk == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            self.a.ldr(64, T0, a, 0);
-                            self.a.ldr(64, T1, a, 8);
-                            if mem::tso() {
-                                self.a.dmb_ishld();
-                            }
-                            self.a.fmov_gf(true, 1, T0);
-                            self.a.v_ins_d(1, 1, T1);
-                        }
-                        _ => {
-                            if chk == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            self.a.ldr(64, T0, a, 0);
-                            self.a.ldr(64, T1, a, 8);
-                            self.a.ldr(64, T2, a, 16);
-                            self.a.ldr(64, T3, a, 24);
-                            if mem::tso() {
-                                self.a.dmb_ishld();
-                            }
-                            self.a.fmov_gf(true, 1, T0);
-                            self.a.v_ins_d(1, 1, T1);
-                            self.a.fmov_gf(true, 7, T2);
-                            self.a.v_ins_d(7, 1, T3);
-                        }
-                    }
-                } else {
-                    let s3 = (op.r1 as u32 & 15) * 16;
-                    self.xsrc(1, op.r1);
-                    if is_256 {
-                        self.a.ldr(128, 7, XCPU, OFF_YMM_HI + s3);
-                    }
-                }
-                self.xsrc(0, op.r0);
-                self.xsrc(2, (op.imm & 0xFF) as u8);
-                self.emit_vfma_lane(ty, ord, fop);
-                if is_256 {
-                    self.a.v_mov(6, 0);
-                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + d);
-                    self.a.ldr(128, 2, XCPU, OFF_YMM_HI + s2);
-                    self.a.v_mov(1, 7);
-                    self.emit_vfma_lane(ty, ord, fop);
-                    self.xwrite(op.r0, 6);
-                    self.write_ymm_hi(op.r0, 0);
-                } else {
-                    self.xwrite(op.r0, 0);
-                    self.clear_ymm_hi(op.r0);
-                }
-            }
+            K_VFMA_RR | K_VFMA_RM => self.emit_vfma_op(k, op),
             K_VBLENDV_RR | K_VBLENDV_RM => {
-                let m_reg = ((op.imm & 0xFF) as u32 & 15) * 16;
-                let s1 = (((op.imm >> 8) & 0xFF) as u32 & 15) * 16;
+                let m_reg = (op.imm & 0xFF) as u8;
+                let s1_reg = ((op.imm >> 8) & 0xFF) as u8;
                 let lg = (op.x & 0x3F) as u32;
                 let is_256 = (op.w & 3) == VM_V256;
                 if op.kind == K_VBLENDV_RM {
-                    let a = self.addr_into(op, XA);
-                    if Self::chk_of(op) == Chk::Full {
-                        let se = self.side_exit_here(k);
-                        self.range_check_to(a, se);
-                    }
-                    self.a.ldr(64, T0, a, 0);
-                    self.a.ldr(64, T1, a, 8);
                     if is_256 {
-                        self.a.ldr(64, T2, a, 16);
-                        self.a.ldr(64, T3, a, 24);
-                    }
-                    if mem::tso() {
-                        self.a.dmb_ishld();
-                    }
-                    self.a.fmov_gf(true, 1, T0);
-                    self.a.v_ins_d(1, 1, T1);
-                    if is_256 {
-                        self.a.fmov_gf(true, 7, T2);
-                        self.a.v_ins_d(7, 1, T3);
+                        self.vec256_mem_op(k, op, true, 1, 7);
+                    } else {
+                        self.vec128_mem_op(k, op, true, 1);
                     }
                 } else {
-                    let s2 = (op.r1 as u32 & 15) * 16;
                     self.xsrc(1, op.r1);
                     if is_256 {
-                        self.a.ldr(128, 7, XCPU, OFF_YMM_HI + s2);
+                        self.ysrc(7, op.r1);
                     }
                 }
-                self.xsrc(0, ((op.imm >> 8) & 0xFF) as u8);
-                self.xsrc(2, (op.imm & 0xFF) as u8);
+                self.xsrc(0, s1_reg);
+                self.xsrc(2, m_reg);
                 self.a.v_cmlt0(lg, 2, 2);
                 self.a.v_bsl(2, 1, 0);
                 self.a.v_mov(0, 2);
                 if is_256 {
                     self.a.v_mov(6, 0);
-                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1);
-                    self.a.ldr(128, 2, XCPU, OFF_YMM_HI + m_reg);
+                    self.ysrc(0, s1_reg);
+                    self.ysrc(2, m_reg);
                     self.a.v_cmlt0(lg, 2, 2);
                     self.a.v_bsl(2, 7, 0);
                     self.a.v_mov(0, 2);
@@ -508,35 +489,18 @@ impl Tr<'_> {
                 self.vstore_dst(op);
             }
             K_VTEST_RR | K_VTEST_RM => {
-                let s1 = (op.r0 as u32 & 15) * 16;
                 let is_256 = (op.w & 3) == VM_V256;
                 let sub = op.x & 0x3F;
                 if op.kind == K_VTEST_RM {
-                    let a = self.addr_into(op, XA);
-                    if Self::chk_of(op) == Chk::Full {
-                        let se = self.side_exit_here(k);
-                        self.range_check_to(a, se);
-                    }
-                    self.a.ldr(64, T0, a, 0);
-                    self.a.ldr(64, T1, a, 8);
                     if is_256 {
-                        self.a.ldr(64, T2, a, 16);
-                        self.a.ldr(64, T3, a, 24);
-                    }
-                    if mem::tso() {
-                        self.a.dmb_ishld();
-                    }
-                    self.a.fmov_gf(true, 1, T0);
-                    self.a.v_ins_d(1, 1, T1);
-                    if is_256 {
-                        self.a.fmov_gf(true, 7, T2);
-                        self.a.v_ins_d(7, 1, T3);
+                        self.vec256_mem_op(k, op, true, 1, 7);
+                    } else {
+                        self.vec128_mem_op(k, op, true, 1);
                     }
                 } else if la & FALL != 0 {
-                    let s2 = (op.r1 as u32 & 15) * 16;
                     self.xsrc(1, op.r1);
                     if is_256 {
-                        self.a.ldr(128, 7, XCPU, OFF_YMM_HI + s2);
+                        self.ysrc(7, op.r1);
                     }
                 }
                 if la & FALL != 0 {
@@ -551,7 +515,7 @@ impl Tr<'_> {
                     self.a.v_and(2, 0, 1);
                     self.a.v_bic(3, 1, 0);
                     if is_256 {
-                        self.a.ldr(128, 6, XCPU, OFF_YMM_HI + s1);
+                        self.ysrc(6, op.r0);
                         if sub == 1 {
                             self.a.v_shr_i(true, 32, 6, 6, 31);
                             self.a.v_shr_i(true, 32, 7, 7, 31);
@@ -881,26 +845,10 @@ impl Tr<'_> {
                     0 => {
                         // Vpermq / Vpermpd
                         if mem {
-                            let a = self.addr_into(op, XA);
-                            if Self::chk_of(op) == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            self.a.ldr(64, T0, a, 0);
-                            self.a.ldr(64, T1, a, 8);
-                            self.a.ldr(64, T2, a, 16);
-                            self.a.ldr(64, T3, a, 24);
-                            if mem::tso() {
-                                self.a.dmb_ishld();
-                            }
-                            self.a.fmov_gf(true, 0, T0);
-                            self.a.v_ins_d(0, 1, T1);
-                            self.a.fmov_gf(true, 1, T2);
-                            self.a.v_ins_d(1, 1, T3);
+                            self.vec256_mem_op(k, op, true, 0, 1);
                         } else {
-                            let s = (op.r1 as u32 & 15) * 16;
                             self.xsrc(0, op.r1);
-                            self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s);
+                            self.ysrc(1, op.r1);
                         }
                         let imm = op.imm as usize;
                         let build_q = |q0: usize, q1: usize| -> (u64, u64) {
@@ -931,31 +879,15 @@ impl Tr<'_> {
                     }
                     1 => {
                         // Vpermd / Vpermps
-                        let idx_reg = ((op.imm & 15) as u32) * 16;
+                        let idx_reg = (op.imm & 15) as u8;
                         if mem {
-                            let a = self.addr_into(op, XA);
-                            if Self::chk_of(op) == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            self.a.ldr(64, T0, a, 0);
-                            self.a.ldr(64, T1, a, 8);
-                            self.a.ldr(64, T2, a, 16);
-                            self.a.ldr(64, T3, a, 24);
-                            if mem::tso() {
-                                self.a.dmb_ishld();
-                            }
-                            self.a.fmov_gf(true, 0, T0);
-                            self.a.v_ins_d(0, 1, T1);
-                            self.a.fmov_gf(true, 1, T2);
-                            self.a.v_ins_d(1, 1, T3);
+                            self.vec256_mem_op(k, op, true, 0, 1);
                         } else {
-                            let s = (op.r1 as u32 & 15) * 16;
                             self.xsrc(0, op.r1);
-                            self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s);
+                            self.ysrc(1, op.r1);
                         }
-                        self.xsrc(2, (op.imm & 15) as u8);
-                        self.a.ldr(128, 3, XCPU, OFF_YMM_HI + idx_reg);
+                        self.xsrc(2, idx_reg);
+                        self.ysrc(3, idx_reg);
                         self.a.movz(false, T0, 7, 0);
                         self.a.v_dup(2, 4, T0);
                         self.a.v_and(2, 2, 4);
@@ -976,31 +908,15 @@ impl Tr<'_> {
                     2 => {
                         // Vperm2f128 / Vperm2i128
                         let imm = (op.imm & 0xFF) as u8;
-                        let s1 = (((op.imm >> 8) & 15) as u32) * 16;
+                        let s1_reg = ((op.imm >> 8) & 15) as u8;
                         if mem {
-                            let a = self.addr_into(op, XA);
-                            if Self::chk_of(op) == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            self.a.ldr(64, T0, a, 0);
-                            self.a.ldr(64, T1, a, 8);
-                            self.a.ldr(64, T2, a, 16);
-                            self.a.ldr(64, T3, a, 24);
-                            if mem::tso() {
-                                self.a.dmb_ishld();
-                            }
-                            self.a.fmov_gf(true, 2, T0);
-                            self.a.v_ins_d(2, 1, T1);
-                            self.a.fmov_gf(true, 3, T2);
-                            self.a.v_ins_d(3, 1, T3);
+                            self.vec256_mem_op(k, op, true, 2, 3);
                         } else {
-                            let s2 = (op.r1 as u32 & 15) * 16;
                             self.xsrc(2, op.r1);
-                            self.a.ldr(128, 3, XCPU, OFF_YMM_HI + s2);
+                            self.ysrc(3, op.r1);
                         }
-                        self.xsrc(0, ((op.imm >> 8) & 15) as u8);
-                        self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s1);
+                        self.xsrc(0, s1_reg);
+                        self.ysrc(1, s1_reg);
                         for (dst_v, ctrl) in [(4u32, imm & 0xF), (5u32, (imm >> 4) & 0xF)] {
                             if ctrl & 8 != 0 {
                                 self.a.v_zero(dst_v);
@@ -1014,25 +930,14 @@ impl Tr<'_> {
                     3 => {
                         // Vinsertf128 / Vinserti128
                         let imm = (op.imm & 1) as u8;
-                        let s1 = (((op.imm >> 8) & 15) as u32) * 16;
+                        let s1_reg = ((op.imm >> 8) & 15) as u8;
                         if mem {
-                            let a = self.addr_into(op, XA);
-                            if Self::chk_of(op) == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            self.a.ldr(64, T0, a, 0);
-                            self.a.ldr(64, T1, a, 8);
-                            if mem::tso() {
-                                self.a.dmb_ishld();
-                            }
-                            self.a.fmov_gf(true, 2, T0);
-                            self.a.v_ins_d(2, 1, T1);
+                            self.vec128_mem_op(k, op, true, 2);
                         } else {
                             self.xsrc(2, op.r1);
                         }
-                        self.xsrc(0, ((op.imm >> 8) & 15) as u8);
-                        self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s1);
+                        self.xsrc(0, s1_reg);
+                        self.ysrc(1, s1_reg);
                         if imm == 0 {
                             self.xwrite(op.r0, 2);
                             self.write_ymm_hi(op.r0, 1);
@@ -1043,29 +948,19 @@ impl Tr<'_> {
                     }
                     4 => {
                         // Vextractf128 / Vextracti128
-                        let s = (op.r1 as u32 & 15) * 16;
                         let lo_lane = (op.imm & 1) == 0;
                         if mem {
-                            let a = self.addr_into(op, XA);
-                            let chk = Self::chk_of(op);
-                            if chk == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            if lo_lane {
-                                self.xsrc(0, op.r1);
+                            let v = if lo_lane {
+                                self.xget(op.r1)
                             } else {
-                                self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s);
-                            }
-                            if mem::tso() && (chk != Chk::Stack || stack_tso()) {
-                                self.a.dmb_ishst();
-                            }
-                            self.a.str(128, 0, a, 0);
+                                self.yget(op.r1, 0)
+                            };
+                            self.vec128_mem_op(k, op, false, v);
                         } else {
                             if lo_lane {
                                 self.xsrc(0, op.r1);
                             } else {
-                                self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s);
+                                self.ysrc(0, op.r1);
                             }
                             self.xwrite(op.r0, 0);
                             self.clear_ymm_hi(op.r0);

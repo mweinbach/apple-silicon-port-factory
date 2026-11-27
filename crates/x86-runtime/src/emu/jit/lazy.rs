@@ -44,7 +44,7 @@ pub(in crate::emu) fn flaglazy_enabled() -> bool {
 }
 
 /// Successor-block depth of the flag liveness scan with `AW2_JIT_FLAGLAZY`.
-pub(super) const FLAGLAZY_DEPTH: u32 = 3;
+pub(super) const FLAGLAZY_DEPTH: u32 = 6;
 
 /// No pending parity byte (`Tr::pf`).
 pub(super) const PF_NONE: u8 = 0xFF;

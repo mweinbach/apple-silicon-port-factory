@@ -8907,3 +8907,237 @@ fn xfer_plain_widened_abi_shapes_int_xmm_stack_and_bail() {
         crate::exe::unregister_native_va(va);
     }
 }
+
+/// Cross-block pinned `ymm_hi[0..7]` in `v8..v15`, coalesced `ymm_dirty`, direct 256-bit
+/// `vmovups`/`vfmadd213ps`/`vaddps`/`vminps`/`vpmovmskb`, `vzeroupper`, and preservation across
+/// an inline `DF_PLAIN` host call (`spill_xmm`/`reload_xmm`) must match the interpreter bit-for-bit.
+#[test]
+fn ymm_hi_pinned_across_blocks_fma_movmsk_and_host_calls() {
+    use iced_x86::code_asm::*;
+
+    extern "win64" fn plain_add_u64(a: u64, b: u64) -> u64 {
+        a.wrapping_add(b).wrapping_mul(3)
+    }
+    let host_va = 0x7FF9_9123_0000u64;
+    let host_ptr = plain_add_u64 as *const () as usize;
+    crate::exe::register_native_va(host_va, host_ptr);
+    crate::emu::routes::test_set_extra_plain_flags(host_ptr, crate::emu::DF_PLAIN);
+
+    let mut code = vec![0u8; 4096];
+    let base = code.as_ptr() as u64;
+    let mut mem = vec![0u8; 4096];
+    // Populate 256-bit float arrays and byte pattern for vpmovmskb.
+    for i in 0..64usize {
+        let f = (i as f32) * 0.25 - 4.5;
+        mem[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    for i in 0..32usize {
+        mem[512 + i] = if i % 3 == 0 || i == 31 || i == 15 { 0x80 } else { 0x7F };
+    }
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut lp = a.create_label();
+    // rcx = mem_base
+    a.vmovups(ymm4, ymmword_ptr(rcx + 128)).unwrap(); // loop-invariant pinned ymm_hi[4]
+    a.vmovups(ymm9, ymmword_ptr(rcx + 160)).unwrap(); // unpinned ymm_hi[9]
+    a.mov(r8d, 4).unwrap();
+    a.set_label(&mut lp).unwrap();
+    a.vmovups(ymm0, ymmword_ptr(rcx)).unwrap();
+    a.vmovups(ymm1, ymmword_ptr(rcx + 32)).unwrap();
+    a.vfmadd213ps(ymm0, ymm4, ymmword_ptr(rcx + 64)).unwrap();
+    a.vfmadd213ps(ymm1, ymm9, ymmword_ptr(rcx + 96)).unwrap();
+    a.vaddps(ymm2, ymm0, ymm1).unwrap();
+    a.vminps(ymm3, ymm2, ymm4).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 256), ymm3).unwrap();
+    a.dec(r8d).unwrap();
+    a.jne(lp).unwrap();
+    // Call a DF_PLAIN host function (must spill/reload pinned v8..v15 without losing ymm0..4!)
+    a.push(rcx).unwrap();
+    a.sub(rsp, 0x20).unwrap();
+    a.mov(rcx, 11u64).unwrap();
+    a.mov(rdx, 29u64).unwrap();
+    a.mov(rax, host_va).unwrap();
+    a.call(rax).unwrap();
+    a.add(rsp, 0x20).unwrap();
+    a.pop(rcx).unwrap();
+    // Verify ymm0 and ymm4 upper halves survived the host call + test vpmovmskb 256-bit and vzeroupper.
+    a.vaddps(ymm5, ymm0, ymm4).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 288), ymm5).unwrap();
+    a.vmovdqu(ymm6, ymmword_ptr(rcx + 512)).unwrap();
+    a.vpmovmskb(r9d, ymm6).unwrap();
+    a.xor(rax, r9).unwrap();
+    a.vzeroupper().unwrap();
+    // Verify vzeroupper cleared ymm_hi[0..7] & ymm_hi[8..15] by storing ymm0 and ymm9 back to memory.
+    a.vmovups(ymmword_ptr(rcx + 320), ymm0).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 352), ymm9).unwrap();
+    a.ret().unwrap();
+    let bytes = a.assemble(base).unwrap();
+    code[..bytes.len()].copy_from_slice(&bytes);
+
+    let run = |mode: u8| -> (u64, Vec<u8>) {
+        let mut m = mem.clone();
+        jit::force(mode);
+        let r = unsafe { crate::emu::call_va8(base, m.as_mut_ptr() as u64, 0, 0, 0, 0, 0, 0, 0) };
+        jit::force(0);
+        (r, m)
+    };
+
+    let (ir, im) = run(2);
+    let (jr, jm) = run(1);
+    crate::emu::routes::test_set_extra_plain_flags(host_ptr, 0);
+    crate::exe::unregister_native_va(host_va);
+
+    assert_eq!(jr, ir, "rax mismatch (vpmovmskb + plain_call)");
+    assert_eq!(&jm[256..384], &im[256..384], "stored 256-bit YMM outputs mismatch");
+    // Ensure vzeroupper actually cleared upper 128 bits of both pinned ymm0 and unpinned ymm9!
+    assert_eq!(&jm[336..352], &[0u8; 16], "vzeroupper must clear pinned ymm_hi[0]");
+    assert_eq!(&jm[368..384], &[0u8; 16], "vzeroupper must clear unpinned ymm_hi[9]");
+}
+
+/// Dead-flag elision across `FlowControl::Next` fallthrough, non-zero `K_SHIFT_RI`, and
+/// Win64 host tail jumps must match the interpreter on both registers and live flags.
+#[test]
+fn dead_flag_elision_across_fallthrough_shift_and_host_jmp() {
+    use iced_x86::code_asm::*;
+
+    extern "win64" fn plain_tail_fn(a: u64) -> u64 {
+        a ^ 0x55AA_1234
+    }
+    let host_va = 0x7FF9_9124_0000u64;
+    let host_ptr = plain_tail_fn as *const () as usize;
+    crate::exe::register_native_va(host_va, host_ptr);
+    crate::emu::routes::test_set_extra_plain_flags(host_ptr, crate::emu::DF_PLAIN);
+
+    let mut code = vec![0u8; 4096];
+    let base = code.as_ptr() as u64;
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut next_blk = a.create_label();
+    // Block 1: ends in jmp next_blk after an add whose flags are killed by `shl eax, 3` in block 2.
+    a.mov(eax, ecx).unwrap();
+    a.add(eax, edx).unwrap();
+    a.jmp(next_blk).unwrap();
+    // Block 2: starts with non-zero immediate shift (kills all flags), then computes flags for setb.
+    a.set_label(&mut next_blk).unwrap();
+    a.shl(eax, 3).unwrap();
+    a.sub(eax, r8d).unwrap();
+    a.setb(cl).unwrap();
+    a.movzx(ecx, cl).unwrap();
+    a.add(rcx, rax).unwrap();
+    // Tail-jump to Win64 host function (flags dead on entry!).
+    a.jmp(host_va).unwrap();
+    let bytes = a.assemble(base).unwrap();
+    code[..bytes.len()].copy_from_slice(&bytes);
+
+    let run = |mode: u8, ia: u64, ib: u64, ic: u64| -> u64 {
+        jit::force(mode);
+        let r = unsafe { crate::emu::call_va8(base, ia, ib, ic, 0, 0, 0, 0, 0) };
+        jit::force(0);
+        r
+    };
+
+    for &(ia, ib, ic) in &[(10u64, 5u64, 200u64), (100, 3, 50), (0, 0, 1)] {
+        assert_eq!(run(1, ia, ib, ic), run(2, ia, ib, ic), "mismatch for ({ia},{ib},{ic})");
+    }
+    crate::emu::routes::test_set_extra_plain_flags(host_ptr, 0);
+    crate::exe::unregister_native_va(host_va);
+}
+
+/// Regression test: 256-bit `vminps`/`vmaxpd` writing to unpinned `ymm8..15` (and all
+/// destinations when `xmm_pin` is off) with `MXCSR.DAZ` enabled must not alias
+/// `flush_denorm_lanes`'s `v3`/`v4` scratch registers.
+#[test]
+fn ymm8_15_256bit_minmax_with_daz_matches_interpreter() {
+    use iced_x86::code_asm::*;
+
+    let mut code = vec![0u8; 4096];
+    let base = code.as_ptr() as u64;
+    let mut mem = vec![0u8; 512];
+    // 8 x f32 in [0..32] and [32..64] (mix of finite values and subnormals in upper 128b).
+    let a_f32: [u32; 8] = [
+        1.5f32.to_bits(),
+        (-2.0f32).to_bits(),
+        0x0000_0042, // +subnormal
+        3.25f32.to_bits(),
+        4.5f32.to_bits(),
+        0x8000_0015, // -subnormal
+        (-7.0f32).to_bits(),
+        9.0f32.to_bits(),
+    ];
+    let b_f32: [u32; 8] = [
+        2.0f32.to_bits(),
+        (-1.0f32).to_bits(),
+        1.0f32.to_bits(),
+        (-0.5f32).to_bits(),
+        2.25f32.to_bits(),
+        0.5f32.to_bits(),
+        (-3.0f32).to_bits(),
+        12.0f32.to_bits(),
+    ];
+    for (i, &w) in a_f32.iter().enumerate() {
+        mem[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    for (i, &w) in b_f32.iter().enumerate() {
+        mem[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    // 4 x f64 in [64..96] and [96..128] (finite + subnormal in upper 128b).
+    let a_f64: [u64; 4] = [
+        1.25f64.to_bits(),
+        (-3.5f64).to_bits(),
+        0x0000_0000_0000_0077, // +subnormal
+        6.5f64.to_bits(),
+    ];
+    let b_f64: [u64; 4] = [
+        0.5f64.to_bits(),
+        (-4.0f64).to_bits(),
+        (-1.0f64).to_bits(),
+        8.25f64.to_bits(),
+    ];
+    for (i, &w) in a_f64.iter().enumerate() {
+        mem[64 + i * 8..64 + i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    for (i, &w) in b_f64.iter().enumerate() {
+        mem[96 + i * 8..96 + i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    // MXCSR with DAZ (bit 6 = 0x40) + default masked exceptions (0x1F80) at [256..260],
+    // original MXCSR save slot at [260..264].
+    mem[256..260].copy_from_slice(&0x1FC0u32.to_le_bytes());
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.stmxcsr(dword_ptr(rcx + 260)).unwrap();
+    a.ldmxcsr(dword_ptr(rcx + 256)).unwrap();
+    a.vmovups(ymm8, ymmword_ptr(rcx)).unwrap();
+    a.vmovups(ymm11, ymmword_ptr(rcx + 32)).unwrap();
+    a.vminps(ymm9, ymm8, ymm11).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 128), ymm9).unwrap();
+    a.vmovupd(ymm10, ymmword_ptr(rcx + 64)).unwrap();
+    a.vmaxpd(ymm12, ymm10, ymmword_ptr(rcx + 96)).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 160), ymm12).unwrap();
+    a.ldmxcsr(dword_ptr(rcx + 260)).unwrap();
+    a.vzeroupper().unwrap();
+    a.xor(eax, eax).unwrap();
+    a.ret().unwrap();
+    let bytes = a.assemble(base).unwrap();
+    code[..bytes.len()].copy_from_slice(&bytes);
+
+    let run = |mode: u8, xpin: bool| -> Vec<u8> {
+        let mut m = mem.clone();
+        std::thread::spawn(move || {
+            jit::test_set_knobs(jit::TestKnobs { xmm_pin: Some(xpin), ..jit::TestKnobs::NONE });
+            jit::force(mode);
+            unsafe {
+                crate::emu::call_va8(base, m.as_mut_ptr() as u64, 0, 0, 0, 0, 0, 0, 0);
+            }
+            jit::force(0);
+            jit::test_set_knobs(jit::TestKnobs::NONE);
+            m
+        })
+        .join()
+        .unwrap()
+    };
+
+    let interp = run(2, true);
+    let jit_pinned = run(1, true);
+    let jit_unpinned = run(1, false);
+    assert_eq!(&jit_pinned[128..192], &interp[128..192], "pinned ymm9/ymm12 DAZ minmax mismatch");
+    assert_eq!(&jit_unpinned[128..192], &interp[128..192], "unpinned ymm9/ymm12 DAZ minmax mismatch");
+}
