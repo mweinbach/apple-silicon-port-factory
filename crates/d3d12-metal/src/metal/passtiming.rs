@@ -223,19 +223,27 @@ pub(crate) fn dedicated_heap_pool_counts() -> Option<(usize, usize)> {
 pub struct PassLog {
     slice: u32,
     metas: Vec<PassMeta>,
+    /// Start-slot offset within the slice (`0, 2, 4, ...`) for each entry in
+    /// `metas`; decoupled from `metas.len()` so discarded ML timestamp slots are
+    /// never reused within the same recording.
+    slots: Vec<u16>,
     cur: PassMeta,
+    /// Start-slot offset within the slice reserved for the currently open encoder.
+    cur_slot: u16,
     /// The open encoder has a start timestamp.
     open: bool,
     /// Opaque MetalFX / ML pass bracketed between the pre-sync encoder's end
-    /// timestamp and the next encoder's opening timestamp (zero extra encoders).
-    pending_ml: Option<PassMeta>,
+    /// timestamp and the next encoder's opening timestamp (zero extra encoders),
+    /// paired with its reserved start-slot offset within the slice.
+    pending_ml: Option<(PassMeta, u16)>,
     /// True if an ML pass was discarded with no intervening timed encoder yet;
     /// prevents a back-to-back scaler on `Encoder::None` from falsely bracketing
     /// back across the discarded scaler to `st.last_end`.
     prev_discarded_ml: bool,
-    /// High-water mark of counter-heap slots written in this slice (including any
-    /// discarded `pending_ml` start stamp so `Drop` invalidates the full range).
-    written_slots: usize,
+    /// Monotonically advancing counter-heap slot cursor within this slice (always
+    /// a multiple of 2). Never rolled back on `discard_ml()`, preventing unordered
+    /// GPU writes from racing on a reused slot and tracking the dirty range for `Drop`.
+    next_slot: usize,
     overflow: u32,
     /// Submission ordinal of the list within its frame.
     ord: u32,
@@ -297,7 +305,23 @@ impl PassLog {
             NO_SLICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         };
-        Some(PassLog { slice, metas: Vec::with_capacity(64), cur: PassMeta::default(), open: false, pending_ml: None, prev_discarded_ml: false, written_slots: 0, overflow: 0, ord: 0, t_ecl: 0, t_commit: 0, queue: 0, wait: 0 })
+        Some(PassLog {
+            slice,
+            metas: Vec::with_capacity(64),
+            slots: Vec::with_capacity(64),
+            cur: PassMeta::default(),
+            cur_slot: 0,
+            open: false,
+            pending_ml: None,
+            prev_discarded_ml: false,
+            next_slot: 0,
+            overflow: 0,
+            ord: 0,
+            t_ecl: 0,
+            t_commit: 0,
+            queue: 0,
+            wait: 0,
+        })
     }
 
     pub fn heap(&self) -> &'static MtlCounterHeap {
@@ -325,14 +349,16 @@ impl PassLog {
     pub fn open(&mut self, kind: u8, sync: u8) -> Option<usize> {
         self.prev_discarded_ml = false;
         self.cur = PassMeta { kind, sync, ..PassMeta::default() };
-        let k = self.metas.len();
-        self.open = 2 * k + 1 < SLICE;
-        if !self.open {
+        if self.next_slot + 2 > SLICE {
+            self.open = false;
             self.overflow += 1;
             return None;
         }
-        self.written_slots = self.written_slots.max(2 * k + 2);
-        Some(self.base() + 2 * k)
+        let slot = self.next_slot;
+        self.next_slot += 2;
+        self.cur_slot = slot as u16;
+        self.open = true;
+        Some(self.base() + slot)
     }
 
     pub fn cur(&mut self) -> &mut PassMeta {
@@ -349,9 +375,9 @@ impl PassLog {
         if !std::mem::take(&mut self.open) {
             return None;
         }
-        let k = self.metas.len();
         self.metas.push(self.cur);
-        Some(self.base() + 2 * k + 1)
+        self.slots.push(self.cur_slot);
+        Some(self.base() + self.cur_slot as usize + 1)
     }
 
     /// Begin timing an opaque MetalFX / ML pass encoded directly on the command buffer:
@@ -363,22 +389,25 @@ impl PassLog {
         if self.open || self.pending_ml.is_some() || self.prev_discarded_ml {
             return None;
         }
-        let k = self.metas.len();
-        if 2 * k + 1 >= SLICE {
+        if self.next_slot + 2 > SLICE {
             self.overflow += 1;
             return None;
         }
-        self.pending_ml = Some(PassMeta {
-            kind: kind::ML,
-            sync,
-            dispatches: 1,
-            w,
-            h,
-            shader,
-            ..PassMeta::default()
-        });
-        self.written_slots = self.written_slots.max(2 * k + 2);
-        Some(self.base() + 2 * k)
+        let slot = self.next_slot;
+        self.next_slot += 2;
+        self.pending_ml = Some((
+            PassMeta {
+                kind: kind::ML,
+                sync,
+                dispatches: 1,
+                w,
+                h,
+                shader,
+                ..PassMeta::default()
+            },
+            slot as u16,
+        ));
+        Some(self.base() + slot)
     }
 
     /// True when an opaque MetalFX / ML pass is currently open and awaiting a
@@ -391,7 +420,9 @@ impl PassLog {
     /// Discard a pending opaque MetalFX / ML pass without emitting a `PassMeta`
     /// (used when no synchronized endpoint timestamp exists without splitting or
     /// adding GPU work, e.g. a Fragment-only Render wait or consecutive direct-output
-    /// MetalFX scalers separated only by a 0-dispatch sync encoder).
+    /// MetalFX scalers separated only by a 0-dispatch sync encoder). Its reserved
+    /// counter-heap slots remain consumed so no subsequent pass can race with the
+    /// already-encoded start timestamp write.
     pub fn discard_ml(&mut self) {
         if self.pending_ml.take().is_some() {
             self.prev_discarded_ml = true;
@@ -401,20 +432,17 @@ impl PassLog {
     /// Finish timing a pending opaque MetalFX / ML pass on the next encoder's opening
     /// (after its `waitForFence`): returns the end-timestamp heap index to stamp.
     pub fn close_ml(&mut self) -> Option<usize> {
-        let meta = self.pending_ml.take()?;
-        let k = self.metas.len();
+        let (meta, slot) = self.pending_ml.take()?;
         self.metas.push(meta);
-        Some(self.base() + 2 * k + 1)
+        self.slots.push(slot);
+        Some(self.base() + slot as usize + 1)
     }
 }
 
 impl Drop for PassLog {
     fn drop(&mut self) {
         if let Some(s) = shared() {
-            let pending = usize::from(self.open) + usize::from(self.pending_ml.is_some());
-            let used = (2 * self.metas.len() + pending * 2)
-                .max(self.written_slots)
-                .min(SLICE);
+            let used = self.next_slot.min(SLICE);
             let mut pool = s.pool.lock().unwrap();
             if let Some(h) = pool.release_slice(self.slice, used) {
                 unsafe { s.heaps[h].invalidateCounterRange(NSRange::new(0, HEAP_ENTRIES)) };
@@ -619,17 +647,34 @@ fn resolve_slice_into(
     }
 }
 
+fn pack_pass_timestamps(slots: &[u16], raw_ts: &[u64]) -> Vec<u64> {
+    let mut ts = Vec::with_capacity(slots.len() * 2);
+    for &slot in slots {
+        let idx = slot as usize;
+        if idx + 1 < raw_ts.len() {
+            ts.push(raw_ts[idx]);
+            ts.push(raw_ts[idx + 1]);
+        } else {
+            ts.push(0);
+            ts.push(0);
+        }
+    }
+    ts
+}
+
 fn resolve_into(st: &mut State, logs: &[PassLog], copy_light: bool) {
     let freq = super::query::timestamp_frequency().max(1) as u128;
     for log in logs {
         st.agg.overflow += log.overflow as u64;
         let n = log.metas.len();
-        if n == 0 {
+        let n_slots = log.next_slot.min(SLICE);
+        if n == 0 || n_slots == 0 {
             continue;
         }
-        let Some(data) = (unsafe { log.heap().resolveCounterRange(NSRange::new(log.base(), 2 * n)) }) else { continue };
+        let Some(data) = (unsafe { log.heap().resolveCounterRange(NSRange::new(log.base(), n_slots)) }) else { continue };
         let bytes = data.to_vec();
-        let ts: Vec<u64> = bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        let raw_ts: Vec<u64> = bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        let ts = pack_pass_timestamps(&log.slots, &raw_ts);
         resolve_slice_into(st, log.ord, log.queue, log.wait, log.t_ecl, log.t_commit, &log.metas, &ts, copy_light, freq);
     }
 }
@@ -1131,26 +1176,38 @@ mod tests {
     }
 
     #[test]
-    fn discard_ml_drops_unsynchronized_span_blocks_chained_ml_and_preserves_written_slots() {
+    fn discard_ml_drops_unsynchronized_span_blocks_chained_ml_and_reserves_slots() {
         let Some(mut log) = PassLog::acquire() else {
             return;
         };
-        assert!(log.open_ml(synth::METALFX_TEMPORAL, 1440, 810, 1).is_some());
+        let ml0_s = log.open_ml(synth::METALFX_TEMPORAL, 1440, 810, 1).expect("ml0_s");
         assert!(log.has_pending_ml());
-        assert_eq!(log.written_slots, 2);
+        assert_eq!(log.next_slot, 2);
         log.discard_ml();
         assert!(!log.has_pending_ml());
         assert!(log.metas.is_empty());
-        assert_eq!(log.written_slots, 2);
+        assert!(log.slots.is_empty());
+        assert_eq!(log.next_slot, 2);
         assert!(log.close_ml().is_none());
         // A back-to-back scaler without an intervening timed encoder must not open an ML span
         // (its 0-dispatch start would otherwise falsely bracket back across the discarded pass).
         assert!(log.open_ml(synth::METALFX_SPATIAL, 1440, 810, 1).is_none());
-        // Once a regular timed encoder runs, subsequent ML passes can be timed cleanly again.
-        assert!(log.open(kind::COMPUTE, 1).is_some());
-        assert!(log.close().is_some());
-        assert!(log.open_ml(synth::METALFX_SPATIAL, 1440, 810, 1).is_some());
-        assert!(log.close_ml().is_some());
+        assert_eq!(log.next_slot, 2);
+        // Opening a regular timed encoder MUST NOT reuse the discarded ML pass's slot index
+        // (prevents an earlier Fragment timestamp write from racing with the new pass's start).
+        let cs_s = log.open(kind::COMPUTE, 1).expect("cs_s");
+        assert_eq!(cs_s, ml0_s + 2);
+        let cs_e = log.close().expect("cs_e");
+        assert_eq!(cs_e, ml0_s + 3);
+        let ml1_s = log.open_ml(synth::METALFX_SPATIAL, 1440, 810, 1).expect("ml1_s");
+        assert_eq!(ml1_s, ml0_s + 4);
+        let ml1_e = log.close_ml().expect("ml1_e");
+        assert_eq!(ml1_e, ml0_s + 5);
+        assert_eq!(log.next_slot, 6);
         assert_eq!(log.metas.len(), 2);
+        assert_eq!(log.slots, vec![2, 4]);
+        // Packing resolved counter-heap timestamps must skip the reserved discarded pair [0, 1].
+        let raw_ts = [999, 0, 1_000, 1_500, 1_500, 3_500];
+        assert_eq!(pack_pass_timestamps(&log.slots, &raw_ts), vec![1_000, 1_500, 1_500, 3_500]);
     }
 }
