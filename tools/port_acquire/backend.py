@@ -120,6 +120,8 @@ class DlcItem:
     app_id: str
     title: str
     owned: bool = True
+    installable: bool = True
+    catalog_id: str | None = None
     installed: bool = False
     install_path: str | None = None
     download_size_bytes: int | None = None

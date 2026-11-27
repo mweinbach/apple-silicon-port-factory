@@ -24,6 +24,7 @@ import sys
 from typing import Any
 
 from ..backend import (
+    AcquireError,
     AnticheatReport,
     AppNotFoundError,
     AuthRequiredError,
@@ -102,6 +103,14 @@ _INSTALL_SUCCESS_PATTERNS = (
     "is up to date",
     "nothing to download",
     "finished installing",
+)
+
+_EOS_OVERLAY_SUCCESS_PATTERNS = (
+    "overlay has been downloaded",
+    "overlay has been installed",
+    "overlay is already up to date",
+    "finished installation process",
+    "finished downloading",
 )
 
 _ANTICHEAT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -610,7 +619,7 @@ class EpicBackend(StoreBackend):
                 continue
 
             inline_dlcs: list[DlcItem] = []
-            seen_inline_dlcs: set[str] = set()
+            seen_inline_dlcs: set[tuple[str, str | None]] = set()
             # Real Legendary `list --json` nests add-ons under `dlcs`; also accept
             # legacy/alternate `dlc_list` if present.
             raw_dlcs: list[Any] = []
@@ -621,16 +630,25 @@ class EpicBackend(StoreBackend):
             for d in raw_dlcs:
                 if not isinstance(d, dict):
                     continue
-                d_id = str(d.get("app_name") or d.get("id") or "").strip()
-                if not d_id or d_id in seen_inline_dlcs:
+                d_meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+                catalog_id = str(d.get("id") or d_meta.get("id") or "").strip() or None
+                d_app = str(d.get("app_name") or "").strip()
+                explicit_installable = d.get("installable")
+                installable = bool(d_app) and (explicit_installable is not False)
+                if not d_app and not catalog_id:
                     continue
-                seen_inline_dlcs.add(d_id)
-                d_inst = installed_map.get(d_id)
+                dedup_key = (d_app, None if d_app else catalog_id)
+                if dedup_key in seen_inline_dlcs:
+                    continue
+                seen_inline_dlcs.add(dedup_key)
+                d_inst = installed_map.get(d_app) if d_app else None
                 inline_dlcs.append(
                     DlcItem(
-                        app_id=d_id,
-                        title=str(d.get("app_title") or d.get("title") or d_id).strip(),
+                        app_id=d_app,
+                        title=str(d.get("app_title") or d.get("title") or d_app or catalog_id).strip(),
                         owned=True,
+                        installable=installable,
+                        catalog_id=catalog_id,
                         installed=d_inst is not None,
                         install_path=(
                             str(d_inst["install_path"])
@@ -703,11 +721,13 @@ class EpicBackend(StoreBackend):
         )
 
         # Offline capability & ownership token
-        can_run_offline = _parse_bool_attr(custom.get("CanRunOffline"))
+        can_run_offline = _parse_bool_attr(game.get("can_run_offline"))
+        if can_run_offline is None:
+            can_run_offline = _parse_bool_attr(custom.get("CanRunOffline"))
         if can_run_offline is None:
             can_run_offline = _parse_bool_attr(install.get("can_run_offline"))
 
-        requires_ot = bool(install.get("requires_ot"))
+        requires_ot = bool(game.get("requires_ot") or install.get("requires_ot"))
         if _parse_bool_attr(custom.get("UseAccessControl")) is True:
             requires_ot = True
 
@@ -727,12 +747,19 @@ class EpicBackend(StoreBackend):
         if can_run_offline is False:
             drm_signals.append("CanRunOffline=false")
 
-        third_party_attr = custom.get("ThirdPartyManagedApp") or custom.get("PartnerLinkType")
-        if isinstance(third_party_attr, dict):
-            third_party_attr = third_party_attr.get("value")
-        if isinstance(third_party_attr, str) and third_party_attr.strip():
-            third_party_launcher = third_party_attr.strip()
-            drm_signals.append(f"third_party_launcher:{third_party_launcher}")
+        # Real Legendary `info --json` exposes external launchers via `game.external_activation`
+        # (and raw library rows may expose `customAttributes.ThirdPartyManagedApp` / `PartnerLinkType`).
+        ext_activation = game.get("external_activation")
+        if isinstance(ext_activation, str) and ext_activation.strip() and ext_activation.strip().lower() not in ("none", "false"):
+            third_party_launcher = ext_activation.strip()
+            drm_signals.append(f"external_activation:{third_party_launcher}")
+        else:
+            third_party_attr = custom.get("ThirdPartyManagedApp") or custom.get("PartnerLinkType")
+            if isinstance(third_party_attr, dict):
+                third_party_attr = third_party_attr.get("value")
+            if isinstance(third_party_attr, str) and third_party_attr.strip():
+                third_party_launcher = third_party_attr.strip()
+                drm_signals.append(f"third_party_launcher:{third_party_launcher}")
 
         # Redistributables from Epic prereq_info / manifest.prerequisites
         redists: list[RedistributableItem] = []
@@ -902,7 +929,7 @@ class EpicBackend(StoreBackend):
 
         # Collect DLCs from `game.owned_dlc` / `game.dlcs` / `game.dlc_list` / `metadata.dlcItemList`
         dlcs: list[DlcItem] = []
-        seen_dlcs: set[str] = set()
+        seen_dlcs: set[tuple[str, str | None]] = set()
         dlc_sources = []
         for key in ("owned_dlc", "dlcs", "dlc_list"):
             if isinstance(game.get(key), list):
@@ -914,22 +941,37 @@ class EpicBackend(StoreBackend):
         for d in dlc_sources:
             if not isinstance(d, dict):
                 continue
+            explicit_installable = d.get("installable")
+            catalog_id = str(d.get("id") or "").strip() or None
             d_app = str(d.get("app_name") or "").strip()
-            if not d_app and isinstance(d.get("releaseInfo"), list) and d["releaseInfo"]:
+            if (
+                not d_app
+                and explicit_installable is not False
+                and isinstance(d.get("releaseInfo"), list)
+                and d["releaseInfo"]
+            ):
                 first = d["releaseInfo"][0]
                 if isinstance(first, dict) and first.get("appId"):
                     d_app = str(first["appId"]).strip()
-            if not d_app:
-                d_app = str(d.get("id") or "").strip()
-            if not d_app or d_app in seen_dlcs:
+
+            # Entitlement-only DLCs in real Legendary `info --json` have `app_name: null`,
+            # `installable: false`, and only a catalog `id`. Never turn the catalog ID into
+            # a synthetic installable app_id.
+            installable = bool(d_app) and (explicit_installable is not False)
+            if not d_app and not catalog_id:
                 continue
-            seen_dlcs.add(d_app)
-            d_inst = installed_map.get(d_app)
+            dedup_key = (d_app, None if d_app else catalog_id)
+            if dedup_key in seen_dlcs:
+                continue
+            seen_dlcs.add(dedup_key)
+            d_inst = installed_map.get(d_app) if d_app else None
             dlcs.append(
                 DlcItem(
                     app_id=d_app,
-                    title=str(d.get("app_title") or d.get("title") or d_app).strip(),
+                    title=str(d.get("app_title") or d.get("title") or d_app or catalog_id).strip(),
                     owned=bool(d.get("owned", True)),
+                    installable=installable,
+                    catalog_id=catalog_id,
                     installed=d_inst is not None,
                     install_path=(
                         str(d_inst["install_path"])
@@ -969,6 +1011,7 @@ class EpicBackend(StoreBackend):
         *,
         app_id: str,
         action: str,
+        success_patterns: tuple[str, ...] = _INSTALL_SUCCESS_PATTERNS,
     ) -> None:
         """Confirm Legendary actually completed an install/download/repair/update.
 
@@ -996,7 +1039,7 @@ class EpicBackend(StoreBackend):
             or any(pat in line.lower() for pat in _INSTALL_FAILURE_PATTERNS)
             for line in combined.splitlines()
         )
-        completed_ok = any(pat in combined_lower for pat in _INSTALL_SUCCESS_PATTERNS)
+        completed_ok = any(pat in combined_lower for pat in success_patterns)
 
         if proc.returncode != 0 or has_error_line or not completed_ok:
             reason = sanitized or f"exit {proc.returncode} with no completion confirmation"
@@ -1012,13 +1055,13 @@ class EpicBackend(StoreBackend):
 
         # Legendary's `--download-only` maps to `no_install=True`, which skips its built-in
         # `--with-dlcs` branch. When both are requested, download the base game with
-        # `--skip-dlcs` and then download each owned DLC explicitly into `dest`.
+        # `--skip-dlcs` and then download each owned, installable DLC explicitly into `dest`.
         explicit_dlcs_after_base: list[str] = []
         if options.with_dlcs and options.no_register:
             explicit_dlcs_after_base = [
                 d.app_id
                 for d in self.list_dlcs(options.app_id, platform=options.platform)
-                if d.owned
+                if d.owned and d.installable and d.app_id
             ]
         elif not options.with_dlcs and options.dlcs:
             explicit_dlcs_after_base = list(options.dlcs)
@@ -1076,7 +1119,10 @@ class EpicBackend(StoreBackend):
                 check=False,
             )
             self._assert_install_completed(
-                ov_proc, app_id=f"{options.app_id}:eos-overlay", action="eos-overlay install"
+                ov_proc,
+                app_id=f"{options.app_id}:eos-overlay",
+                action="eos-overlay install",
+                success_patterns=_EOS_OVERLAY_SUCCESS_PATTERNS,
             )
             eos_overlay_path = str(overlay_dir)
 

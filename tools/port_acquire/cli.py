@@ -504,9 +504,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         dlcs = backend.list_dlcs(args.app, platform=args.platform, offline=bool(args.offline))
         lines = [f"DLCs for {args.app} ({len(dlcs)}):"]
         for d in dlcs:
-            inst = " [installed]" if d.installed else ""
+            inst = " [installed]" if d.installed else ("" if d.installable else " [entitlement-only]")
+            label = d.app_id or d.catalog_id or "<entitlement>"
             lines.append(
-                f"  {d.app_id:24} {d.title} ({_format_bytes(d.disk_size_bytes)}){inst}"
+                f"  {label:24} {d.title} ({_format_bytes(d.disk_size_bytes)}){inst}"
             )
         _emit(
             {

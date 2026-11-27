@@ -124,6 +124,15 @@ DEFAULT_STATE = {
             },
             "dlcs": [],
         },
+        {
+            "app_name": "ExternalLauncherGame",
+            "app_title": "External Launcher RPG",
+            "external_activation": "Ubisoft Connect",
+            "asset_infos": {
+                "Windows": {"build_version": "1.0.0", "app_name": "ExternalLauncherGame"},
+            },
+            "dlcs": [],
+        },
     ],
     "manifest_files": {
         "ArachnidTwo": [
@@ -269,18 +278,33 @@ if cmd == "info":
     )
     # Real Legendary `info --json`: `manifest.version` is the integer manifest format
     # revision (e.g. 18), while `manifest.build_version` is the game build version.
+    # For entitlement-only DLCs, Legendary returns `app_name: None, installable: False, id: ...`.
+    # For external-launcher titles, Legendary exposes `game.external_activation` (without raw metadata).
     build_ver = state.get("updates", {}).get(
         app_name,
         game.get("asset_infos", {}).get("Windows", {}).get("build_version", "1.1.0"),
     )
+    owned_dlc = list(game.get("dlcs", []))
+    if app_name == "ArachnidTwo":
+        owned_dlc.append(
+            {
+                "app_name": None,
+                "installable": False,
+                "id": "cat_entitlement_only_bonus",
+                "title": "Digital Bonus Entitlement",
+            }
+        )
+    game_payload = {
+        "app_name": game["app_name"],
+        "title": game["app_title"],
+        "external_activation": game.get("external_activation"),
+        "asset_infos": game.get("asset_infos", {}),
+        "owned_dlc": owned_dlc,
+    }
+    if "metadata" in game:
+        game_payload["metadata"] = game["metadata"]
     payload = {
-        "game": {
-            "app_name": game["app_name"],
-            "title": game["app_title"],
-            "asset_infos": game.get("asset_infos", {}),
-            "metadata": game.get("metadata", {}),
-            "owned_dlc": game.get("dlcs", []),
-        },
+        "game": game_payload,
         "manifest": {
             "version": 18,
             "build_version": build_ver,
@@ -384,7 +408,8 @@ if cmd == "eos-overlay":
         ov = Path(path)
         ov.mkdir(parents=True, exist_ok=True)
         (ov / "EOSOVH-Win64-Shipping.dll").write_bytes(b"MZ_MOCK")
-        print("[cli] INFO: Finished installation process in 0.05 seconds.")
+        # Exact upstream Legendary macOS message (no Wine prefix supplied).
+        print("[cli] INFO: Overlay has been downloaded.")
     sys.exit(0)
 
 if cmd == "verify":
@@ -547,7 +572,7 @@ class TestEpicBackendMocked(unittest.TestCase):
         proc = self._run_cli("list-owned", "--platform", "windows", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         data = json.loads(proc.stdout)
-        self.assertEqual(data["count"], 3)  # 3 base games; DLC row attaches to ArachnidTwo
+        self.assertEqual(data["count"], 4)  # 4 base games; nested DLCs attach to ArachnidTwo
         sm2 = next(g for g in data["games"] if g["app_id"] == "ArachnidTwo")
         dlc_ids = {d["app_id"] for d in sm2["dlcs"]}
         self.assertEqual(dlc_ids, {"ArachnidTwoPreorderDLC", "ArachnidTwoExpansion"})
@@ -574,14 +599,25 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertTrue(info["anticheat"]["report_only"])
         self.assertFalse(info["drm"]["detected"])
         self.assertTrue(info["drm"]["report_only"])
-        self.assertEqual(len(info["dlcs"]), 2)
+        self.assertEqual(len(info["dlcs"]), 3)
+        entitlement = next(d for d in info["dlcs"] if d["catalog_id"] == "cat_entitlement_only_bonus")
+        self.assertFalse(entitlement["installable"])
+        self.assertEqual(entitlement["app_id"], "")
         cats = {r["category"] for r in info["redistributables"]}
         self.assertEqual(cats, {"vcredist", "directx", "eos_sdk"})
 
         # Check dedicated list-dlcs & list-redists commands
         proc_dlcs = self._run_cli("list-dlcs", "ArachnidTwo", "--json")
         self.assertEqual(proc_dlcs.returncode, 0)
-        self.assertEqual(json.loads(proc_dlcs.stdout)["count"], 2)
+        self.assertEqual(json.loads(proc_dlcs.stdout)["count"], 3)
+
+        # 2b. Uninstalled external-launcher title with `game.external_activation` only (no metadata/files)
+        proc_ext = self._run_cli("info", "ExternalLauncherGame", "--platform", "windows", "--json")
+        self.assertEqual(proc_ext.returncode, 0, proc_ext.stderr)
+        ext_info = json.loads(proc_ext.stdout)
+        self.assertTrue(ext_info["drm"]["detected"])
+        self.assertEqual(ext_info["drm"]["third_party_launcher"], "Ubisoft Connect")
+        self.assertIn("external_activation:Ubisoft Connect", ext_info["drm"]["signals"])
 
         proc_redists = self._run_cli("list-redists", "ArachnidTwo", "--json")
         self.assertEqual(proc_redists.returncode, 0)
