@@ -3895,6 +3895,15 @@ pub const KNOBS: &[KnobSpec] = &[
         crates: &["port-factory"],
     },
     KnobSpec {
+        name: "PORT_TEXTURE_VIEW_POOL",
+        aliases: &[],
+        kind: KnobType::Bool,
+        default: "1",
+        description: "Back shader-visible D3D12 texture and typed-buffer views with Metal 4 MTLTextureViewPool.",
+        affects_aot_key: false,
+        crates: &["d3d12-metal"],
+    },
+    KnobSpec {
         name: "PORT_THREAD_PRIORITY",
         aliases: &["AW2_THREAD_PRIORITY"],
         kind: KnobType::Bool,

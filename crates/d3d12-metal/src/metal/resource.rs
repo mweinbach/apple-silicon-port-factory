@@ -664,6 +664,8 @@ pub struct Resource {
     pub mtl_format: MTLPixelFormat,
     views: Mutex<HashMap<ViewKey, Retained<MtlTexture>>>,
     buffer_views: Mutex<HashMap<BufferViewKey, Retained<MtlTexture>>>,
+    pooled_views: Mutex<HashMap<ViewKey, super::view_pool::PooledView>>,
+    pooled_buffer_views: Mutex<HashMap<BufferViewKey, super::view_pool::PooledView>>,
     cpu_mirror: Mutex<Vec<u8>>,
     registered_key: std::sync::atomic::AtomicUsize,
     uav_tracked_key: std::sync::atomic::AtomicUsize,
@@ -886,6 +888,8 @@ impl Resource {
             mtl_format,
             views: Mutex::new(HashMap::new()),
             buffer_views: Mutex::new(HashMap::new()),
+            pooled_views: Mutex::new(HashMap::new()),
+            pooled_buffer_views: Mutex::new(HashMap::new()),
             cpu_mirror: Mutex::new(Vec::new()),
             registered_key: std::sync::atomic::AtomicUsize::new(0),
             uav_tracked_key: std::sync::atomic::AtomicUsize::new(0),
@@ -988,6 +992,8 @@ impl Resource {
             mtl_format,
             views: Mutex::new(HashMap::new()),
             buffer_views: Mutex::new(HashMap::new()),
+            pooled_views: Mutex::new(HashMap::new()),
+            pooled_buffer_views: Mutex::new(HashMap::new()),
             cpu_mirror: Mutex::new(Vec::new()),
             registered_key: std::sync::atomic::AtomicUsize::new(0),
             uav_tracked_key: std::sync::atomic::AtomicUsize::new(0),
@@ -1075,6 +1081,8 @@ impl Resource {
         }
         let views = self.views.lock().unwrap();
         let bviews = self.buffer_views.lock().unwrap();
+        let pviews = self.pooled_views.lock().unwrap();
+        let pbviews = self.pooled_buffer_views.lock().unwrap();
         let mut reg = res_registry().write().unwrap();
         if prev != 0 && self.gpu_va != 0 {
             reg.remove_buffer(self.gpu_va, prev);
@@ -1090,6 +1098,12 @@ impl Resource {
         }
         for tv in bviews.values() {
             reg.insert_tex_id(mtl_tex_id(tv), key);
+        }
+        for pv in pviews.values() {
+            reg.insert_tex_id(pv.id, key);
+        }
+        for pv in pbviews.values() {
+            reg.insert_tex_id(pv.id, key);
         }
     }
 
@@ -1258,6 +1272,87 @@ impl Resource {
         v.insert(key, t.clone());
         Some(t)
     }
+
+    /// Lightweight `MTLResourceID` for a shader-visible texture view.
+    ///
+    /// Returns the base texture's `gpuResourceID` for identity views, reuses an
+    /// already-cached view, or allocates from the Metal 4 [`super::view_pool`]
+    /// without constructing an Objective-C `MTLTexture` object (falling back to
+    /// [`Self::texture_view_swizzled`] when pooling is disabled or unavailable).
+    pub fn texture_view_id(&self, fmt: MTLPixelFormat, ty: MTLTextureType, mips: (u32, u32), slices: (u32, u32)) -> Option<u64> {
+        self.texture_view_id_swizzled(fmt, ty, mips, slices, SWIZZLE_IDENTITY)
+    }
+
+    /// [`Self::texture_view_id`] with a packed `MTLTextureSwizzle` (r,g,b,a bytes).
+    pub fn texture_view_id_swizzled(&self, fmt: MTLPixelFormat, ty: MTLTextureType, mips: (u32, u32), slices: (u32, u32), swizzle: u32) -> Option<u64> {
+        self.view_epoch.fetch_min(super::queue::submit_epoch(), Ordering::Relaxed);
+        let t = self.texture()?;
+        let full_mips = (0, t.mipmapLevelCount() as u32);
+        let full_slices = (0, (t.arrayLength() as u32).max(1) * if t.textureType() == MTLTextureType::TypeCube || t.textureType() == MTLTextureType::TypeCubeArray { 6 } else { 1 });
+        if fmt == self.mtl_format && ty == t.textureType() && mips == full_mips && slices == full_slices && swizzle == SWIZZLE_IDENTITY {
+            return Some(mtl_tex_id(t));
+        }
+        let key = ViewKey { format: fmt.0, ty: ty.0, mips, slices, swizzle };
+        if let Some(existing) = self.views.lock().unwrap().get(&key) {
+            return Some(mtl_tex_id(existing));
+        }
+        {
+            let mut pv_map = self.pooled_views.lock().unwrap();
+            if let Some(pv) = pv_map.get(&key) {
+                return Some(pv.id);
+            }
+            if let Some(pv) = super::view_pool::create_texture_view(t, fmt, ty, mips, slices, unpack_swizzle(swizzle)) {
+                let rk = self.registered_key.load(Ordering::Relaxed);
+                if rk != 0 {
+                    res_registry().write().unwrap().insert_tex_id(pv.id, rk);
+                }
+                pv_map.insert(key, pv);
+                return Some(pv.id);
+            }
+        }
+        self.texture_view_swizzled(fmt, ty, mips, slices, swizzle).map(|v| mtl_tex_id(&v))
+    }
+
+    /// Lightweight `MTLResourceID` for a shader-visible typed-buffer or UAV
+    /// counter texture-buffer view, backed by Metal 4 [`super::view_pool`] when
+    /// enabled (falling back to [`Self::buffer_texture_view`]).
+    pub fn buffer_texture_view_id(&self, fmt: MTLPixelFormat, offset: u64, elements: u64, writable: bool) -> Option<u64> {
+        self.view_epoch.fetch_min(super::queue::submit_epoch(), Ordering::Relaxed);
+        let b = self.buffer()?;
+        let key = BufferViewKey { format: fmt.0, offset, elements, writable };
+        if let Some(existing) = self.buffer_views.lock().unwrap().get(&key) {
+            return Some(mtl_tex_id(existing));
+        }
+        {
+            let mut pbv_map = self.pooled_buffer_views.lock().unwrap();
+            if let Some(pv) = pbv_map.get(&key) {
+                return Some(pv.id);
+            }
+            if super::view_pool::enabled() {
+                let td = unsafe { MTLTextureDescriptor::textureBufferDescriptorWithPixelFormat_width_resourceOptions_usage(
+                    fmt,
+                    elements.max(1) as usize,
+                    b.resourceOptions(),
+                    if writable {
+                        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite | MTLTextureUsage::PixelFormatView
+                    } else {
+                        MTLTextureUsage::ShaderRead
+                    },
+                ) };
+                let bpe = crate::format::TABLE.iter().find(|f| f.mtl == fmt).map(|f| f.bytes).unwrap_or(4) as u64;
+                let bytes_per_row = elements.max(1) * bpe;
+                if let Some(pv) = super::view_pool::create_buffer_texture_view(b, &td, offset, bytes_per_row) {
+                    let rk = self.registered_key.load(Ordering::Relaxed);
+                    if rk != 0 {
+                        res_registry().write().unwrap().insert_tex_id(pv.id, rk);
+                    }
+                    pbv_map.insert(key, pv);
+                    return Some(pv.id);
+                }
+            }
+        }
+        self.buffer_texture_view(fmt, offset, elements, writable).map(|v| mtl_tex_id(&v))
+    }
 }
 
 impl Drop for Resource {
@@ -1268,6 +1363,15 @@ impl Drop for Resource {
         }
         super::descriptor::forget_uav_resource(self as *const Resource as usize);
         let rk = self.registered_key.load(Ordering::Relaxed);
+        let pviews = self.pooled_views.get_mut().unwrap();
+        let pbviews = self.pooled_buffer_views.get_mut().unwrap();
+        let mut retired_slots = Vec::with_capacity(pviews.len() + pbviews.len());
+        for pv in pviews.values() {
+            retired_slots.push(pv.slot);
+        }
+        for pv in pbviews.values() {
+            retired_slots.push(pv.slot);
+        }
         if rk != 0 {
             let views = self.views.get_mut().unwrap();
             let bviews = self.buffer_views.get_mut().unwrap();
@@ -1284,6 +1388,15 @@ impl Drop for Resource {
             for tv in bviews.values() {
                 reg.remove_tex_id(mtl_tex_id(tv));
             }
+            for pv in pviews.values() {
+                reg.remove_tex_id(pv.id);
+            }
+            for pv in pbviews.values() {
+                reg.remove_tex_id(pv.id);
+            }
+        }
+        if !retired_slots.is_empty() {
+            super::view_pool::retire_slots(retired_slots);
         }
         if self.gpu_va != 0 {
             let retired = crate::rt::accel::evict_range(self.gpu_va, self.desc.Width);
