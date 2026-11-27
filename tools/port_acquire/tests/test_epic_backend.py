@@ -385,7 +385,13 @@ if cmd in ("install", "download", "update"):
         print(f"ERROR: Could not find {app_name}", file=sys.stderr)
         sys.exit(1)
 
-    folder = get_flag("--game-folder") or get_flag("--base-path") or str(cfg_dir / app_name)
+    plat = get_flag("--platform", "Windows")
+    # Match real Legendary's macOS `.app` bundle behavior: Legendary clears `--game-folder`
+    # and downloads into `--base-path` (falling back to default dir if `--base-path` was omitted).
+    if plat == "Mac" and not is_dlc:
+        folder = get_flag("--base-path") or str(cfg_dir / "default_games" / app_name)
+    else:
+        folder = get_flag("--game-folder") or get_flag("--base-path") or str(cfg_dir / app_name)
     install_dir = Path(folder)
     install_dir.mkdir(parents=True, exist_ok=True)
     if not is_dlc:
@@ -1105,6 +1111,34 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertFalse(dest.exists())
         inv_after = self._read_invocations()[inv_before:]
         self.assertFalse(any("install" in inv for inv in inv_after))
+
+    def test_macos_download_passes_base_path_so_app_bundles_honor_dest(self) -> None:
+        dest = self.root / "games" / "MacBundleDest"
+        proc = self._run_cli(
+            "download",
+            "ArachnidTwo",
+            "--dest",
+            str(dest),
+            "--platform",
+            "macos",
+            "--no-register",
+            "--json",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertEqual(Path(data["install_path"]).resolve(), dest.resolve())
+        # Mock clears `--game-folder` for Mac installs just like real Legendary `.app` payloads;
+        # payload must still land inside `dest` via `--base-path`.
+        self.assertTrue((dest / "Spider-Man2.exe").is_file())
+        self.assertTrue((dest / MANIFEST_FILENAME).is_file())
+        install_inv = next(
+            inv for inv in self._read_invocations() if "install" in inv and "ArachnidTwo" in inv
+        )
+        self.assertIn("--base-path", install_inv)
+        self.assertEqual(
+            Path(install_inv[install_inv.index("--base-path") + 1]).resolve(),
+            dest.resolve(),
+        )
 
     def test_uninstall_fails_on_exit_zero_removal_or_lock_error(self) -> None:
         dest = self.root / "games" / "UninstallFail"

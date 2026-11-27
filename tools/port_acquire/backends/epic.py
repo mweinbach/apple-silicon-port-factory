@@ -1252,12 +1252,18 @@ class EpicBackend(StoreBackend):
 
         dest.mkdir(parents=True, exist_ok=True)
 
+        # Pass BOTH `--base-path` and `--game-folder` set to `dest`: for normal Windows/non-.app
+        # titles Python's `os.path.join(base_path, game_folder)` resolves to the absolute `dest`,
+        # while for macOS `.app` bundles (where Legendary clears `game_folder`) Legendary falls
+        # back to `--base-path`, still keeping the download inside `dest`.
         cmd = [
             "-y",
             "install",
             options.app_id,
             "--platform",
             leg_plat,
+            "--base-path",
+            str(dest),
             "--game-folder",
             str(dest),
             "--skip-sdl",
@@ -1280,6 +1286,8 @@ class EpicBackend(StoreBackend):
                 dlc_id,
                 "--platform",
                 leg_plat,
+                "--base-path",
+                str(dest),
                 "--game-folder",
                 str(dest),
                 "--skip-dlcs",
