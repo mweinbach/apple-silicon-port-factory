@@ -2740,3 +2740,60 @@ fn bench_rejects_truncated_trace_without_complete_frame() {
     assert!(err.to_string().contains("truncated"), "{err}");
 }
 
+#[test]
+fn metal_backend_drains_released_queue_before_write_resource_and_finish() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::types::{dim, heap_type, CommandQueueDesc, HeapProperties, ResourceDesc};
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+    }
+
+    const SZ: usize = 4 * 1024 * 1024;
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let hp_up = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+    let hp_rb = HeapProperties { Type: heap_type::READBACK, ..Default::default() };
+    let bdesc = ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: SZ as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        ..Default::default()
+    };
+    let pat_a = vec![0xAAu8; SZ];
+    let pat_b = vec![0x55u8; SZ];
+    let lists = [4u64];
+
+    // Submit 8 x 4 MiB copies from UP (0xAA) -> RB on queue 2, immediately Release queue 2,
+    // then immediately overwrite UP with 0x55 via WriteResource. `drain_unblocked_queues()`
+    // must still wait for released queue 2 before overwriting UP!
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 3, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 10, heap_properties: bytes_of(&hp_up), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_e000_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 11, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_e100_0000 }, 0).unwrap();
+    w.write(&Call::WriteResource { resource: 10, subresource: 0, offset: 0, data: &pat_a }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: 1, list: 4, list_type: 0, allocator: 3, initial_pso: 0 }, 0).unwrap();
+    for _ in 0..8 {
+        w.write(&Call::CopyBufferRegion { list: 4, dst: 11, dst_offset: 0, src: 10, src_offset: 0, size: SZ as u64 }, 0).unwrap();
+    }
+    w.write(&Call::Close { list: 4 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&lists) }, 0).unwrap();
+    w.write(&Call::Release { object: 2 }, 0).unwrap();
+    w.write(&Call::WriteResource { resource: 10, subresource: 0, offset: 0, data: &pat_b }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    let rb = backend.resource(11).unwrap().shared_slice(0, SZ).unwrap();
+    assert!(rb.iter().all(|&b| b == 0xAA), "released queue copy observed overwritten upload bytes");
+}
+

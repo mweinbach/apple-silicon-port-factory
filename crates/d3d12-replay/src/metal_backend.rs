@@ -289,6 +289,11 @@ pub struct MetalBackend {
     /// Objects released during replay, kept alive until `wait_all_idle()` so GPU command buffers
     /// and non-owning `TargetView` pointers never dangle.
     retired: Vec<Box<dyn Send>>,
+    /// Queues released during replay, kept in the synchronization set until drained so
+    /// `drain_unblocked_queues()` and `wait_all_idle()` still wait on their submitted GPU work.
+    retired_queues: Vec<(u64, Arc<Queue>)>,
+    /// Fences released during replay, kept reachable for `Drop` unblock signaling until drained.
+    retired_fences: Vec<(u64, Arc<Fence>)>,
     /// Most recently presented swapchain back buffer (primary target for `--golden`).
     last_presented: Option<Arc<Resource>>,
     /// Most recently bound or cleared RTV resource (fallback target for `--golden` without swapchain).
@@ -329,6 +334,8 @@ impl MetalBackend {
             swapchains: HashMap::new(),
             swapchain_queues: HashMap::new(),
             retired: Vec::new(),
+            retired_queues: Vec::new(),
+            retired_fences: Vec::new(),
             last_presented: None,
             last_rtv: None,
             gpu_timer: None,
@@ -362,8 +369,13 @@ impl MetalBackend {
         for q in self.queues.values() {
             q.wait_idle();
         }
+        for (_, q) in &self.retired_queues {
+            q.wait_idle();
+        }
         self.queue_busy.clear();
         self.queue_waits.clear();
+        self.retired_queues.clear();
+        self.retired_fences.clear();
         self.retired.clear();
     }
 
@@ -403,7 +415,7 @@ impl MetalBackend {
     /// by prior signals, avoiding deadlocks on queues waiting for a producer that appears
     /// later in the trace.
     fn drain_unblocked_queues(&mut self) {
-        if self.queue_busy.is_empty() {
+        if self.queue_busy.is_empty() && self.retired_queues.is_empty() {
             return;
         }
         let blocked: HashSet<u64> = self.blocked_queues().into_iter().collect();
@@ -413,14 +425,26 @@ impl MetalBackend {
             .copied()
             .filter(|qid| !blocked.contains(qid))
             .collect();
-        for qid in drainable {
-            if let Some(q) = self.queues.get(&qid) {
+        for qid in &drainable {
+            if let Some(q) = self.queues.get(qid) {
                 q.wait_idle();
             }
-            self.queue_busy.remove(&qid);
-            self.queue_waits.remove(&qid);
+            self.queue_busy.remove(qid);
+            self.queue_waits.remove(qid);
         }
-        if self.queue_busy.is_empty() && blocked.is_empty() {
+        let mut still_retired = Vec::new();
+        for (qid, q) in std::mem::take(&mut self.retired_queues) {
+            if blocked.contains(&qid) {
+                still_retired.push((qid, q));
+            } else {
+                q.wait_idle();
+                self.queue_busy.remove(&qid);
+                self.queue_waits.remove(&qid);
+            }
+        }
+        self.retired_queues = still_retired;
+        if self.queue_busy.is_empty() && self.retired_queues.is_empty() && blocked.is_empty() {
+            self.retired_fences.clear();
             self.retired.clear();
         }
     }
@@ -1050,9 +1074,9 @@ impl Backend for MetalBackend {
                 } else if let Some(a) = self.allocators.remove(object) {
                     self.retired.push(Box::new(a));
                 } else if let Some(q) = self.queues.remove(object) {
-                    self.retired.push(Box::new(q));
+                    self.retired_queues.push((*object, q));
                 } else if let Some(f) = self.fences.remove(object) {
-                    self.retired.push(Box::new(f));
+                    self.retired_fences.push((*object, f));
                 } else if let Some(qh) = self.query_heaps.remove(object) {
                     self.retired.push(Box::new(qh));
                 } else if let Some(sc) = self.swapchains.remove(object) {
@@ -2178,6 +2202,11 @@ impl Drop for MetalBackend {
                 for &(fid, val) in waits {
                     if let Some(f) = self.fences.get(&fid) {
                         if f.completed() < val {
+                            f.signal_cpu(val);
+                        }
+                    }
+                    for (rfid, f) in &self.retired_fences {
+                        if *rfid == fid && f.completed() < val {
                             f.signal_cpu(val);
                         }
                     }
