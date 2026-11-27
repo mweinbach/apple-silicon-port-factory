@@ -365,10 +365,10 @@ impl AtomicWord {
 //   bits 3..: reader count     (step SRW_READER = 8)
 // ---------------------------------------------------------------------------
 
-const SRW_WRITER: usize = 1;
-const SRW_PARKED: usize = 2;
-const SRW_WAITING_WRITER: usize = 4;
-const SRW_READER: usize = 8;
+pub const SRW_WRITER: usize = 1;
+pub const SRW_PARKED: usize = 2;
+pub const SRW_WAITING_WRITER: usize = 4;
+pub const SRW_READER: usize = 8;
 const SRW_READERS_MASK: usize = !7;
 
 const SRW_TOKEN_READER: ParkToken = ParkToken(0);

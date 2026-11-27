@@ -76,6 +76,16 @@ pub(super) const FAST_KIND_LEAVE_CS: u64 = 3;
 pub(super) const FAST_KIND_XINPUT: u64 = 4;
 #[allow(dead_code)]
 pub(super) const FAST_KIND_SWITCH_TO_THREAD: u64 = 5;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_THREAD_ID: u64 = 6;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_TLS: u64 = 7;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_SRW_ACQ_EXCL: u64 = 8;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_SRW_ACQ_SHARED: u64 = 9;
+#[allow(dead_code)]
+pub(super) const FAST_KIND_SRW_REL: u64 = 10;
 
 pub(super) const EXIT_RIP: u64 = 0;
 pub(super) const EXIT_CALL: u64 = 1;

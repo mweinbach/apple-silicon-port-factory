@@ -419,15 +419,24 @@ impl Asm {
         self.emit(0xD53B_E000 | t);
     }
     /// Call a native leaf in the embedding FP environment. The call target is in XA,
-    /// arguments are live in x0..7, and XS is the only spare register at these sites.
+    /// arguments are live in x0..7, and XS (x17) + x9 (already saved on the stack at
+    /// every caller) are spare scratch registers. Skips both pipeline-serializing
+    /// `msr fpcr` writes on the common fast path where hardware `FPCR == host_fpcr`.
     pub(super) fn call_with_host_fpcr(&mut self, stack_slot: u32) {
+        const TMP: u32 = 9;
         self.mrs_fpcr(XS);
+        self.ldr(64, TMP, super::XCPU, super::OFF_HOST_FPCR);
+        self.addsub_rr(true, true, true, ZR, XS, TMP, 0); // cmp x17, x9
+        let same = self.bcond(super::EQ);
         self.str(64, XS, 31, stack_slot);
-        self.ldr(64, XS, super::XCPU, super::OFF_HOST_FPCR);
-        self.msr_fpcr(XS);
+        self.msr_fpcr(TMP);
         self.blr(super::XA);
         self.ldr(64, XS, 31, stack_slot);
         self.msr_fpcr(XS);
+        let done = self.b();
+        self.bind(same);
+        self.blr(super::XA);
+        self.bind(done);
     }
 
     /// `mrs xt, fpcr` (reads ARM64 floating-point control register).

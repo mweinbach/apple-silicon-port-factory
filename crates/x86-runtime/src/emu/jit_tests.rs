@@ -9141,3 +9141,444 @@ fn ymm8_15_256bit_minmax_with_daz_matches_interpreter() {
     assert_eq!(&jit_pinned[128..192], &interp[128..192], "pinned ymm9/ymm12 DAZ minmax mismatch");
     assert_eq!(&jit_unpinned[128..192], &interp[128..192], "unpinned ymm9/ymm12 DAZ minmax mismatch");
 }
+
+/// Zero-spill `FAST_KIND_*` inline thunks (`GetCurrentThreadId`, `GetLastError`, `TlsGetValue`,
+/// `TlsSetValue` low + expansion + out-of-range, and all 6 `SRWLock` primitives) across both
+/// indirect `call reg` (`lookup_call`) and tail `jmp reg` (`lookup_jmp`), plus bailouts on
+/// contention, `SRW_PARKED`, unaligned lock words, and invalid TLS indices.
+#[test]
+fn inline_fast_thunks_tid_tls_and_srw_call_and_tail_jmp() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use iced_x86::code_asm::*;
+    use win32_rt::kernel32::process::{GetLastError, SetLastError};
+    use win32_rt::kernel32::threads::{GetCurrentThreadId, TlsGetValue, TlsSetValue};
+    use win32_rt::sync::{
+        AcquireSRWLockExclusive, AcquireSRWLockShared, InitializeSRWLock, ReleaseSRWLockExclusive,
+        ReleaseSRWLockShared, TryAcquireSRWLockExclusive, TryAcquireSRWLockShared, SRW_PARKED,
+        SRW_WAITING_WRITER, SRW_WRITER,
+    };
+
+    std::thread::Builder::new()
+        .name("fast_thunks_tid_tls_srw".into())
+        .spawn(|| {
+            let my_tid = unsafe { GetCurrentThreadId() } as u64;
+            assert_ne!(my_tid, 0);
+
+            const BASE: u64 = 0x7FFF_E760_0000;
+            let vas = [
+                BASE + 0x100, // GetCurrentThreadId
+                BASE + 0x110, // GetLastError
+                BASE + 0x120, // TlsGetValue
+                BASE + 0x130, // TlsSetValue
+                BASE + 0x140, // AcquireSRWLockExclusive
+                BASE + 0x150, // TryAcquireSRWLockExclusive
+                BASE + 0x160, // ReleaseSRWLockExclusive
+                BASE + 0x170, // AcquireSRWLockShared
+                BASE + 0x180, // TryAcquireSRWLockShared
+                BASE + 0x190, // ReleaseSRWLockShared
+            ];
+            let [t_tid, t_gle, t_tls_get, t_tls_set, t_srw_ae, t_srw_te, t_srw_re, t_srw_as, t_srw_ts, t_srw_rs] = vas;
+            let fns: [usize; 10] = [
+                GetCurrentThreadId as *const () as usize,
+                GetLastError as *const () as usize,
+                TlsGetValue as *const () as usize,
+                TlsSetValue as *const () as usize,
+                AcquireSRWLockExclusive as *const () as usize,
+                TryAcquireSRWLockExclusive as *const () as usize,
+                ReleaseSRWLockExclusive as *const () as usize,
+                AcquireSRWLockShared as *const () as usize,
+                TryAcquireSRWLockShared as *const () as usize,
+                ReleaseSRWLockShared as *const () as usize,
+            ];
+            for (&va, &p) in vas.iter().zip(fns.iter()) {
+                crate::exe::register_native_va(va, p);
+            }
+
+            // Guest harness: `invoke(arg0=rcx, arg1=rdx, target=r8, is_tail=r9, sbuf=[rsp+0x28])`
+            let c = arena_alloc(0x200, 16);
+            let code = (|| -> Result<Vec<u8>, IcedError> {
+                let mut a = CodeAssembler::new(64)?;
+                let mut do_tail = a.create_label();
+                let mut done = a.create_label();
+                let mut tail_stub = a.create_label();
+                a.push(rbx)?;
+                a.push(r12)?;
+                a.push(r13)?;
+                a.sub(rsp, 0x30)?;
+                a.mov(rbx, qword_ptr(rsp + 0x70))?; // sbuf
+                a.mov(rax, r8)?;
+                a.mov(r10, r9)?;
+                a.mov(r12, 0x1122_3344_5566_7788u64)?;
+                a.mov(r13, 0xCAFE_BABE_DEAD_BEEFu64)?;
+                a.movdqu(xmm6, xmmword_ptr(rbx + 0x00))?;
+                a.movdqu(xmm15, xmmword_ptr(rbx + 0x10))?;
+                a.test(r10d, r10d)?;
+                a.jne(do_tail)?;
+                a.call(rax)?;
+                a.jmp(done)?;
+                a.set_label(&mut do_tail)?;
+                a.call(tail_stub)?;
+                a.set_label(&mut done)?;
+                a.movdqu(xmmword_ptr(rbx + 0x20), xmm6)?;
+                a.movdqu(xmmword_ptr(rbx + 0x30), xmm15)?;
+                a.mov(qword_ptr(rbx + 0x40), r12)?;
+                a.mov(qword_ptr(rbx + 0x48), r13)?;
+                a.add(rsp, 0x30)?;
+                a.pop(r13)?;
+                a.pop(r12)?;
+                a.pop(rbx)?;
+                a.ret()?;
+                a.set_label(&mut tail_stub)?;
+                a.jmp(rax)?;
+                a.assemble(c as u64)
+            })()
+            .expect("assemble");
+
+            let sbuf = arena_alloc(0x80, 16);
+            let plain = jit::plaincall_enabled();
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(code.as_ptr(), c, code.len());
+                let invoke = |target: u64, arg0: u64, arg1: u64, is_tail: u64| -> u64 {
+                    core::ptr::write_bytes(sbuf, 0, 0x80);
+                    for i in 0..0x20usize {
+                        *sbuf.add(i) = (0x50 + i) as u8;
+                    }
+                    jit::force(1);
+                    let (ret, _) = emu_run_full(
+                        c as u64,
+                        [arg0, arg1, target, is_tail, sbuf as u64, 0, 0, 0],
+                        [0; 4],
+                        [0; 8],
+                    );
+                    jit::force(0);
+                    assert_eq!(
+                        core::slice::from_raw_parts(sbuf.add(0x20), 0x20),
+                        core::slice::from_raw_parts(sbuf, 0x20),
+                        "XMM6/XMM15 clobbered (target={target:#x}, tail={is_tail})"
+                    );
+                    assert_eq!(core::ptr::read_unaligned(sbuf.add(0x40) as *const u64), 0x1122_3344_5566_7788);
+                    assert_eq!(core::ptr::read_unaligned(sbuf.add(0x48) as *const u64), 0xCAFE_BABE_DEAD_BEEF);
+                    ret
+                };
+
+                // 1. GetCurrentThreadId & GetLastError
+                // Warm both call and tail-jump paths so `do_tail -> tail_stub` is compiled & linked.
+                assert_eq!(invoke(t_tid, 0, 0, 0), my_tid);
+                assert_eq!(invoke(t_tid, 0, 0, 1), my_tid);
+                SetLastError(0x42);
+                assert_eq!(invoke(t_gle, 0, 0, 0), 0x42);
+                if plain {
+                    let s0 = jit::test_stub_plain_hits();
+                    let rm0 = jit::test_ras_moves();
+                    assert_eq!(invoke(t_tid, 0, 0, 0), my_tid);
+                    assert_eq!(invoke(t_tid, 0, 0, 1), my_tid);
+                    SetLastError(0x1234);
+                    assert_eq!(invoke(t_gle, 0, 0, 0), 0x1234);
+                    assert_eq!(invoke(t_gle, 0, 0, 1), 0x1234);
+                    assert_eq!(jit::test_stub_plain_hits() - s0, 4);
+                    assert_eq!(jit::test_ras_moves() - rm0, 0);
+                }
+
+                // 2. TlsSetValue & TlsGetValue (low slot < 64, expansion slot >= 64, invalid slot >= 1088)
+                assert_eq!(invoke(t_tls_set, 5, 0x1111_2222_3333_4444, 0), 1);
+                assert_eq!(invoke(t_tls_get, 5, 0, 0), 0x1111_2222_3333_4444);
+                if plain {
+                    let s0 = jit::test_stub_plain_hits();
+                    SetLastError(77);
+                    // Upper 32 bits garbage in rcx must be ignored; TlsSetValue keeps LastError=77.
+                    assert_eq!(invoke(t_tls_set, 0xDEAD_0000_0000_0007, 0xABCD_1234_5678_90EF, 0), 1);
+                    assert_eq!(GetLastError(), 77);
+                    // TlsGetValue reads value AND clears LastError to 0.
+                    assert_eq!(invoke(t_tls_get, 0xBEEF_0000_0000_0007, 0, 1), 0xABCD_1234_5678_90EF);
+                    assert_eq!(GetLastError(), 0);
+                    assert_eq!(jit::test_stub_plain_hits() - s0, 2);
+
+                    // Expansion slot 70: first TlsSetValue bails to allocate TlsExpansionSlots,
+                    // then subsequent set/get hit the inline fast thunk.
+                    let x0 = super::test_xfer_plain();
+                    assert_eq!(invoke(t_tls_set, 70, 0x9988_7766_5544_3322, 0), 1);
+                    assert_eq!(super::test_xfer_plain() - x0, 1, "first expansion TlsSetValue allocates via slow path");
+                    let s1 = jit::test_stub_plain_hits();
+                    SetLastError(99);
+                    assert_eq!(invoke(t_tls_get, 70, 0, 0), 0x9988_7766_5544_3322);
+                    assert_eq!(GetLastError(), 0);
+                    assert_eq!(invoke(t_tls_set, 70, 0x5555_6666_7777_8888, 1), 1);
+                    assert_eq!(invoke(t_tls_get, 70, 0, 1), 0x5555_6666_7777_8888);
+                    assert_eq!(jit::test_stub_plain_hits() - s1, 3);
+
+                    // Invalid slot >= 1088 bails to slow path and sets ERROR_INVALID_PARAMETER (87).
+                    let x1 = super::test_xfer_plain();
+                    assert_eq!(invoke(t_tls_get, 1088, 0, 0), 0);
+                    assert_eq!(GetLastError(), 87);
+                    assert_eq!(invoke(t_tls_set, 2000, 1, 0), 0);
+                    assert_eq!(GetLastError(), 87);
+                    assert_eq!(super::test_xfer_plain() - x1, 2);
+                }
+
+                // 3. SRWLock (exclusive + shared + try + contention + parked + unaligned)
+                let mut lock_word = AtomicUsize::new(0);
+                let lp = (&mut lock_word as *mut AtomicUsize).cast::<core::ffi::c_void>();
+                InitializeSRWLock(lp);
+                let lva = lp as u64;
+
+                // Warm all 6 targets via xfer_plain so their FAST_KIND_* entries are installed.
+                invoke(t_srw_ae, lva, 0, 0);
+                invoke(t_srw_re, lva, 0, 0);
+                assert_eq!(invoke(t_srw_te, lva, 0, 0), 1);
+                invoke(t_srw_re, lva, 0, 0);
+                invoke(t_srw_as, lva, 0, 0);
+                assert_eq!(invoke(t_srw_ts, lva, 0, 0), 1);
+                invoke(t_srw_rs, lva, 0, 0);
+                invoke(t_srw_rs, lva, 0, 0);
+                assert_eq!(lock_word.load(Ordering::SeqCst), 0);
+
+                if plain {
+                    let s0 = jit::test_stub_plain_hits();
+                    let rm0 = jit::test_ras_moves();
+                    // Exclusive acquire -> TryAcquireExclusive fails inline (0) -> TryAcquireShared fails inline (0) -> ReleaseExclusive.
+                    invoke(t_srw_ae, lva, 0, 0);
+                    assert_eq!(lock_word.load(Ordering::Acquire), SRW_WRITER);
+                    assert_eq!(invoke(t_srw_te, lva, 0, 0), 0);
+                    assert_eq!(invoke(t_srw_ts, lva, 0, 1), 0);
+                    invoke(t_srw_re, lva, 0, 1);
+                    assert_eq!(lock_word.load(Ordering::Acquire), 0);
+
+                    // Shared acquire (2 readers) -> TryAcquireExclusive fails inline (0) -> ReleaseShared twice.
+                    invoke(t_srw_as, lva, 0, 0);
+                    assert_eq!(invoke(t_srw_ts, lva, 0, 0), 1);
+                    assert_eq!(lock_word.load(Ordering::Acquire), 16);
+                    assert_eq!(invoke(t_srw_te, lva, 0, 1), 0);
+                    invoke(t_srw_rs, lva, 0, 0);
+                    assert_eq!(lock_word.load(Ordering::Acquire), 8);
+                    invoke(t_srw_rs, lva, 0, 1);
+                    assert_eq!(lock_word.load(Ordering::Acquire), 0);
+
+                    // Waiting writer blocks TryAcquireShared inline (returns 0 without bailing).
+                    lock_word.store(SRW_WAITING_WRITER, Ordering::SeqCst);
+                    assert_eq!(invoke(t_srw_ts, lva, 0, 0), 0);
+                    lock_word.store(0, Ordering::SeqCst);
+                    assert_eq!(jit::test_stub_plain_hits() - s0, 10, "all 10 uncontended/try SRW ops must hit inline fast thunk");
+                    assert_eq!(jit::test_ras_moves() - rm0, 0);
+
+                    // Parked writer bit forces ReleaseSRWLockExclusive to bail cleanly to slow path without losing the lock.
+                    lock_word.store(SRW_WRITER | SRW_PARKED, Ordering::SeqCst);
+                    let x0 = super::test_xfer_plain();
+                    invoke(t_srw_re, lva, 0, 0);
+                    assert_eq!(super::test_xfer_plain() - x0, 1);
+                    assert_eq!(lock_word.load(Ordering::SeqCst), 0);
+
+                    // Unaligned SRWLock bails cleanly to sync.rs unaligned shard lock.
+                    #[repr(align(16))]
+                    struct RawBuf([u8; 32]);
+                    let mut raw = RawBuf([0u8; 32]);
+                    let unal = raw.0.as_mut_ptr().add(3) as u64;
+                    let x1 = super::test_xfer_plain();
+                    invoke(t_srw_ae, unal, 0, 0);
+                    assert_eq!(invoke(t_srw_te, unal, 0, 0), 0);
+                    invoke(t_srw_re, unal, 0, 0);
+                    assert_eq!(super::test_xfer_plain() - x1, 3);
+                }
+
+                for &va in &vas {
+                    crate::exe::unregister_native_va(va);
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Verify conditional `ymm_hi` spill/reload (`XBUD` bit 0) and `call_with_host_fpcr` FPCR
+/// elision/isolation:
+/// 1. When `ymm_dirty == 0`, a `DF_PLAIN` callee that scribbles upper 64 bits of `q8..q15`
+///    and all of `v16..v31` must still return clean zeros in `ymm_hi[0..7]` and intact `xmm0..15`.
+/// 2. After spilling dirty `ymm_hi`, running `vzeroupper` (which clears `v8..v15` and `XBUD` bit 0),
+///    and exiting JIT, `Cpu::ymm_hi[0..7]` in memory must be zero (no stale dirty state).
+/// 3. `call_with_host_fpcr` preserves non-default guest `MXCSR` (`0x9FC0` FTZ|DAZ) while running
+///    the host callee under IEEE-754 `host_fpcr`, AND works cleanly under default `0x1F80`.
+#[test]
+fn conditional_ymm_spill_and_fpcr_elision_across_plain_call() {
+    use iced_x86::code_asm::*;
+
+    static SEEN_FPCR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+    unsafe extern "win64" fn clobber_vectors_and_read_fpcr(a: u64) -> u64 {
+        let fpcr: u64;
+        core::arch::asm!(
+            "mrs {f}, fpcr",
+            // Clobber upper 64 bits of q8..q15 (caller-saved under AAPCS64) while preserving d8..d15!
+            "movi v0.16b, #0xaa",
+            "ins v8.d[1], v0.d[0]",
+            "ins v9.d[1], v0.d[0]",
+            "ins v15.d[1], v0.d[0]",
+            // Clobber caller-saved v16..v19.
+            "movi v16.16b, #0x55",
+            "movi v17.16b, #0x66",
+            f = out(reg) fpcr,
+            out("v0") _,
+            out("v16") _,
+            out("v17") _,
+            options(nomem, nostack),
+        );
+        SEEN_FPCR.store(fpcr & super::FPCR_GUEST_MASK, core::sync::atomic::Ordering::SeqCst);
+        a.wrapping_add(1)
+    }
+
+    const HOST_VA: u64 = 0x7FFF_E761_0000;
+    const HOST_INT_VA: u64 = 0x7FFF_E761_0100;
+    let host_ptr = clobber_vectors_and_read_fpcr as *const () as usize;
+    unsafe extern "win64" fn clobber_vectors_int_only(a: u64) -> u64 {
+        core::arch::asm!(
+            "movi v0.16b, #0xbb",
+            "ins v8.d[1], v0.d[0]",
+            "movi v16.16b, #0x77",
+            out("v0") _,
+            out("v16") _,
+            options(nomem, nostack),
+        );
+        a.wrapping_add(2)
+    }
+    let host_int_ptr = clobber_vectors_int_only as *const () as usize;
+    // Float/FPCR-sensitive DF_PLAIN_XMM callee must observe host FPCR (0) under guest 0x9FC0.
+    crate::emu::routes::test_set_extra_plain_flags(host_ptr, crate::emu::DF_PLAIN | crate::emu::DF_PLAIN_XMM);
+    crate::emu::routes::test_set_extra_plain_flags(host_int_ptr, crate::emu::DF_PLAIN);
+    crate::exe::register_native_va(HOST_VA, host_ptr);
+    crate::exe::register_native_va(HOST_INT_VA, host_int_ptr);
+
+    let code_buf = arena_alloc(0x200, 16);
+    let data = arena_alloc(0x200, 32);
+    unsafe {
+        // [0x00..0x20]: 256-bit pattern for ymm0
+        for i in 0..32usize {
+            *data.add(i) = (0x10 + i) as u8;
+        }
+        // [0x20..0x24]: 0x9FC0 (FTZ|DAZ), [0x24..0x28]: 0x1F80 (default)
+        core::ptr::write_unaligned(data.add(0x20) as *mut u32, 0x9FC0);
+        core::ptr::write_unaligned(data.add(0x24) as *mut u32, 0x1F80);
+
+        let bytes = (|| -> Result<Vec<u8>, IcedError> {
+            let mut a = CodeAssembler::new(64)?;
+            a.push(rbx)?;
+            a.sub(rsp, 0x28)?;
+            a.mov(rbx, rcx)?;
+            // 1) Clean ymm_hi (ymm_dirty == 0) + default MXCSR (0x1F80): call pure-integer DF_PLAIN
+            //    (`needs_xmm == 0` -> zero mrs/msr fpcr, preserves xmm0, re-zeros clobbered ymm_hi).
+            a.vmovdqu(xmm0, xmmword_ptr(rbx + 0x00))?;
+            a.mov(rcx, 10u64)?;
+            a.mov(r10, HOST_INT_VA)?;
+            a.call(r10)?;
+            // Store full ymm0 (low MUST still be [0x00..0x10], upper 128 bits MUST be 0!).
+            a.vmovdqu(ymmword_ptr(rbx + 0x40), ymm0)?;
+            // 2) Dirty ymm0 + non-default MXCSR (0x9FC0): call DF_PLAIN_XMM host fn (`needs_xmm == 1`).
+            a.ldmxcsr(dword_ptr(rbx + 0x20))?;
+            a.vmovdqu(ymm0, ymmword_ptr(rbx + 0x00))?;
+            a.vmovdqu(ymm1, ymmword_ptr(rbx + 0x00))?;
+            a.mov(rcx, 20u64)?;
+            a.mov(r10, HOST_VA)?;
+            a.call(r10)?;
+            // Store full ymm1 (both low and high 128 bits must match [0x00..0x20]) + stmxcsr.
+            a.vmovdqu(ymmword_ptr(rbx + 0x60), ymm1)?;
+            a.stmxcsr(dword_ptr(rbx + 0x80))?;
+            // 3) Clear ymm_hi via vzeroupper after dirty spill, restore 0x1F80, and exit JIT.
+            a.vzeroupper()?;
+            a.ldmxcsr(dword_ptr(rbx + 0x24))?;
+            a.add(rsp, 0x28)?;
+            a.pop(rbx)?;
+            a.ret()?;
+            a.assemble(code_buf as u64)
+        })()
+        .expect("assemble");
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), code_buf, bytes.len());
+
+        // Run twice so call #2 hits cached `is_plain` in `stubs.rs` (call #1 warms via `xfer_plain`).
+        for iter in 0..2 {
+            SEEN_FPCR.store(u64::MAX, core::sync::atomic::Ordering::SeqCst);
+            jit::force(1);
+            let (ret, _) = emu_run_full(code_buf as u64, [data as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
+            jit::force(0);
+            assert_eq!(ret, 21, "iter {iter}: return value mismatch");
+            assert_eq!(
+                SEEN_FPCR.load(core::sync::atomic::Ordering::SeqCst),
+                0,
+                "iter {iter}: host callee must observe IEEE-754 host FPCR even under guest 0x9FC0"
+            );
+            assert_eq!(
+                core::slice::from_raw_parts(data.add(0x40), 16),
+                core::slice::from_raw_parts(data, 16),
+                "iter {iter}: xmm0 low corrupted across clean plain call"
+            );
+            assert_eq!(
+                core::slice::from_raw_parts(data.add(0x50), 16),
+                &[0u8; 16],
+                "iter {iter}: ymm0_hi corrupted by AAPCS64 callee upper-64b clobber when clean"
+            );
+            assert_eq!(
+                core::slice::from_raw_parts(data.add(0x60), 32),
+                core::slice::from_raw_parts(data, 32),
+                "iter {iter}: dirty ymm1 corrupted across plain_xmm call"
+            );
+            assert_eq!(
+                core::ptr::read_unaligned(data.add(0x80) as *const u32),
+                0x9FC0,
+                "iter {iter}: guest MXCSR not preserved across plain call"
+            );
+        }
+        crate::exe::unregister_native_va(HOST_VA);
+        crate::exe::unregister_native_va(HOST_INT_VA);
+    }
+}
+
+/// Regression for Codex P1 finding: a 256-bit write followed in the same basic block by an x87
+/// instruction that takes a deferred `X87Cold` helper path (e.g. `fld m32` of a subnormal) must
+/// flush its pre-branch `ymm_dirty_pending` bits before `x87_trampoline` calls conditional
+/// `spill_xmm`/`reload_xmm`, preserving pinned `ymm_hi[0..7]` (`v8..v15`).
+#[test]
+fn deferred_x87_cold_helper_preserves_pending_ymm_hi() {
+    use iced_x86::code_asm::*;
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    // Single block: ymm_dirty_pending is NOT flushed before `fld` branches to `X87ColdKind::FldF32`.
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 0x00)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 0x20)).unwrap();
+    a.fninit().unwrap();
+    a.fld(dword_ptr(rcx + 0x40)).unwrap();
+    a.fstp(qword_ptr(rcx + 0x48)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 0x60), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 0x80), ymm3).unwrap();
+    a.vzeroupper().unwrap();
+    a.xor(eax, eax).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    const DATA: usize = 0x100;
+    let cptr = arena_alloc(code.len() + 16, 16);
+    let dptr = arena_alloc(DATA, 64);
+    let mut init = vec![0u8; DATA];
+    for i in 0..32usize {
+        init[i] = (0x21 + i) as u8;
+        init[0x20 + i] = (0xA1 + i) as u8;
+    }
+    // Smallest positive f32 subnormal forces `X87ColdKind::FldF32` cold helper path.
+    init[0x40..0x44].copy_from_slice(&0x0000_0001u32.to_le_bytes());
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), cptr, code.len());
+        core::ptr::write_bytes(cptr.add(code.len()), 0xCC, 16);
+        let interp = run_mode(cptr, dptr, &init, 2);
+        let jit1 = run_mode(cptr, dptr, &init, 1);
+        assert_eq!(jit1.1, interp.1, "deferred x87 cold helper JIT vs interpreter mismatch");
+        assert_eq!(
+            &jit1.1[0x60..0x80],
+            &init[0x00..0x20],
+            "ymm0 upper 128 bits lost across deferred x87 cold helper"
+        );
+        assert_eq!(
+            &jit1.1[0x80..0xA0],
+            &init[0x20..0x40],
+            "ymm3 upper 128 bits lost across deferred x87 cold helper"
+        );
+        let f64_bits = u64::from_le_bytes(jit1.1[0x48..0x50].try_into().unwrap());
+        assert_eq!(f64_bits, (f32::from_bits(1) as f64).to_bits(), "x87 subnormal fld/fstp mismatch");
+    }
+}
