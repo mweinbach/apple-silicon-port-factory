@@ -316,6 +316,7 @@ if cmd == "info":
         "app_name": game["app_name"],
         "title": game["app_title"],
         "external_activation": game.get("external_activation"),
+        "command_line": "-epicportal -AUTH_PASSWORD=must_be_redacted" if app_name == "ArachnidTwo" else "",
         "asset_infos": game.get("asset_infos", {}),
         "owned_dlc": owned_dlc,
     }
@@ -401,10 +402,12 @@ if cmd in ("install", "download", "update"):
         (install_dir / f"{app_name}.dat").write_bytes(b"DLC_MOCK")
 
     if "--download-only" not in rest:
+        plat = get_flag("--platform", "Windows")
         state["installed"][app_name] = {
             "app_name": app_name,
             "title": dlc_title or game["app_title"],
             "version": "1.1.0",
+            "platform": plat,
             "install_path": str(install_dir),
             "executable": "Spider-Man2.exe" if not is_dlc else "",
             "install_size": 92_000_000_000 if not is_dlc else 1_073_741_824,
@@ -881,9 +884,11 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertTrue((dest / "ArachnidTwoExpansion.dat").is_file())
         self.assertTrue((dest / "ArachnidTwoEntitlementDLC.dat").is_file())
         manifest = read_package_manifest(dest / MANIFEST_FILENAME)
-        # Unregistered download must still populate executable and default launch args via online info.
+        # Unregistered download must populate executable and merge+sanitize both
+        # `manifest.launch_command` and `game.command_line` (`AdditionalCommandLine`).
         self.assertEqual(manifest["executable"], "Spider-Man2.exe")
-        self.assertEqual(manifest["launch_args"], ["-dx12"])
+        self.assertEqual(manifest["launch_args"], ["-dx12", "-epicportal"])
+        self.assertNotIn("must_be_redacted", (dest / MANIFEST_FILENAME).read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], "1.2.0")
 
     def test_download_fails_on_exit_zero_installation_failed_even_when_already_registered(self) -> None:
@@ -945,11 +950,37 @@ class TestEpicBackendMocked(unittest.TestCase):
         inv_after = self._read_invocations()[inv_before:]
         self.assertFalse(any("install" in inv for inv in inv_after))
 
-        # Targeting the existing registered directory is permitted.
+        # Targeting the existing registered directory is permitted for the matching platform.
         res = self.backend.download(
             DownloadOptions(app_id="ArachnidTwo", dest=dest1, platform="windows")
         )
         self.assertEqual(Path(res.install_path).resolve(), dest1.resolve())
+
+    def test_download_rejects_conflicting_platform_when_already_registered(self) -> None:
+        dest = self.root / "games" / "MacInstall"
+        self.backend.download(DownloadOptions(app_id="ArachnidTwo", dest=dest, platform="macos"))
+        inv_before = len(self._read_invocations())
+
+        # Requesting `--platform windows` against an existing macOS registration at the same
+        # `--dest` must fail before invoking `legendary install` (which would force Mac).
+        proc = self._run_cli(
+            "download",
+            "ArachnidTwo",
+            "--dest",
+            str(dest),
+            "--platform",
+            "windows",
+            "--json",
+        )
+        self.assertEqual(proc.returncode, 5)
+        err = json.loads(proc.stdout)
+        self.assertFalse(err["ok"])
+        self.assertEqual(err["error"]["code"], "platform_conflict")
+        self.assertEqual(err["error"]["details"]["existing_platform"], "macos")
+        self.assertEqual(err["error"]["details"]["requested_platform"], "windows")
+
+        inv_after = self._read_invocations()[inv_before:]
+        self.assertFalse(any("install" in inv for inv in inv_after))
 
     def test_default_registered_download_manifest_populates_anticheat_and_eos_signals(self) -> None:
         dest = self.root / "games" / "OnlineShooter"

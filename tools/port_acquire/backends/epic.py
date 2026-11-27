@@ -1061,14 +1061,31 @@ class EpicBackend(StoreBackend):
                 )
             )
 
-        raw_launch_cmd = manifest.get("launch_command")
-        default_launch_args: list[str] = []
-        if isinstance(raw_launch_cmd, str) and raw_launch_cmd.strip():
-            try:
-                parsed_args = shlex.split(raw_launch_cmd)
-            except ValueError:
-                parsed_args = raw_launch_cmd.split()
-            default_launch_args, _ = redact_launch_args(parsed_args)
+        # Merge both `manifest.launch_command` and Epic's `game.command_line`
+        # (`AdditionalCommandLine`), matching Legendary's launcher behavior.
+        parsed_default_args: list[str] = []
+        raw_cmd_sources: list[Any] = [
+            manifest.get("launch_command"),
+            game.get("command_line"),
+        ]
+        if not game.get("command_line"):
+            custom_attrs = (
+                metadata.get("customAttributes")
+                if isinstance(metadata.get("customAttributes"), dict)
+                else {}
+            )
+            addl = custom_attrs.get("AdditionalCommandLine")
+            if isinstance(addl, dict):
+                addl = addl.get("value")
+            if addl:
+                raw_cmd_sources.append(addl)
+        for raw_cmd in raw_cmd_sources:
+            if isinstance(raw_cmd, str) and raw_cmd.strip():
+                try:
+                    parsed_default_args.extend(shlex.split(raw_cmd))
+                except ValueError:
+                    parsed_default_args.extend(raw_cmd.split())
+        default_launch_args, _ = redact_launch_args(parsed_default_args)
 
         return GameInfo(
             store=self.name,
@@ -1152,13 +1169,36 @@ class EpicBackend(StoreBackend):
         elif not options.with_dlcs and options.dlcs:
             explicit_dlcs_after_base = list(options.dlcs)
 
-        # Real Legendary reuses `igame.install_path` before `--game-folder` whenever an app is
-        # already registered in `installed.json` (even under `--download-only`). Reject a
-        # conflicting `--dest` up front so we never silently modify files outside `--dest`.
+        # Real Legendary reuses `igame.install_path` (before `--game-folder`) AND overrides
+        # `args.platform = igame.platform` whenever an app is already registered in `installed.json`
+        # (even under `--download-only`). Reject conflicting `--dest` or `--platform` up front so
+        # we never silently modify files outside `--dest` or download the wrong OS build.
         existing_installed = self._installed_map()
+        want_plat_norm = _normalize_platform_name(options.platform)
         for target_id in (options.app_id, *explicit_dlcs_after_base):
             existing = existing_installed.get(target_id)
-            if existing and existing.get("install_path"):
+            if not existing:
+                continue
+            existing_raw_plat = existing.get("platform")
+            if isinstance(existing_raw_plat, str) and existing_raw_plat.strip():
+                existing_plat_norm = _normalize_platform_name(existing_raw_plat)
+                if existing_plat_norm != want_plat_norm:
+                    raise CommandFailedError(
+                        f"Epic app {target_id!r} is already registered in Legendary for platform "
+                        f"{existing_plat_norm!r}, which conflicts with requested --platform "
+                        f"{want_plat_norm!r}. Legendary forces the registered platform instead of "
+                        f"--platform. Uninstall the existing registration first or set "
+                        f"PORT_LEGENDARY_CONFIG to an isolated config directory for a separate "
+                        f"{want_plat_norm} download.",
+                        code="platform_conflict",
+                        details={
+                            "app_id": target_id,
+                            "requested_platform": want_plat_norm,
+                            "existing_platform": existing_plat_norm,
+                            "existing_install_path": str(existing.get("install_path") or ""),
+                        },
+                    )
+            if existing.get("install_path"):
                 existing_path = Path(str(existing["install_path"])).expanduser().resolve()
                 if existing_path != dest:
                     raise CommandFailedError(
