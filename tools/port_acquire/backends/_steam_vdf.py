@@ -593,10 +593,62 @@ def _parse_binary_vdf_map(
     return out, pos
 
 
-def parse_appinfo_vdf_dlc_depots(steam_home: Path, app_id: str) -> dict[str, list[str]]:
+def _normalize_steam_os(platform: str) -> str:
+    low = platform.strip().lower()
+    if low in ("win32", "win64", "windows", "win"):
+        return "windows"
+    if low in ("osx", "macos", "darwin", "mac"):
+        return "macos"
+    return low
+
+
+def _depot_config_matches(
+    config: Any,
+    *,
+    platform: str | None = None,
+    osarch: str | None = None,
+    language: str | None = None,
+    lowviolence: bool = False,
+) -> bool:
+    """Apply Steamworks depot `config` filters mirroring DepotDownloader's selection logic."""
+    if not isinstance(config, dict):
+        return True
+    if platform is not None:
+        raw_os = str(vdf_get(config, "oslist", default="") or "").strip()
+        if raw_os:
+            target_os = _normalize_steam_os(platform)
+            allowed = {_normalize_steam_os(part) for part in raw_os.split(",") if part.strip()}
+            if allowed and target_os not in allowed:
+                return False
+    if osarch is not None:
+        raw_arch = str(vdf_get(config, "osarch", default="") or "").strip().lower()
+        if raw_arch and raw_arch != osarch.strip().lower():
+            return False
+    if language is not None:
+        raw_lang = str(vdf_get(config, "language", default="") or "").strip().lower()
+        if raw_lang and raw_lang != language.strip().lower():
+            return False
+    raw_lv = str(vdf_get(config, "lowviolence", default="") or "").strip().lower()
+    if raw_lv in ("1", "true") and not lowviolence:
+        return False
+    return True
+
+
+def parse_appinfo_vdf_dlc_depots(
+    steam_home: Path,
+    app_id: str,
+    *,
+    platform: str | None = None,
+    osarch: str | None = None,
+    language: str | None = None,
+    lowviolence: bool = False,
+) -> dict[str, list[str]]:
     """Read Steam's local binary `appcache/appinfo.vdf` to map `dlc_app_id -> [depot_ids]`.
 
     Supports binary `appinfo.vdf` v27, v28, and v29 (read-only, zero credentials).
+    When `platform`, `osarch`, or `language` is supplied, depots whose `config`
+    excludes the requested target are filtered out so explicit `-depot` selection
+    never downloads another platform/architecture/language's payload.
     Returns an empty dict when `appinfo.vdf` is absent or does not contain `app_id`.
     """
     if not str(app_id).isdigit():
@@ -637,6 +689,7 @@ def parse_appinfo_vdf_dlc_depots(steam_home: Path, app_id: str) -> dict[str, lis
     entry_hdr_len = 40 if magic == _APPINFO_MAGIC_V27 else 60
     target_id = int(app_id)
     n = len(data)
+    apply_filters = any(x is not None for x in (platform, osarch, language))
 
     while pos + 8 <= n:
         cur_app_id, entry_size = struct.unpack_from("<II", data, pos)
@@ -658,6 +711,14 @@ def parse_appinfo_vdf_dlc_depots(steam_home: Path, app_id: str) -> dict[str, lis
             dlc_map: dict[str, list[str]] = {}
             for depot_id, depot_body in depots.items():
                 if not str(depot_id).isdigit() or not isinstance(depot_body, dict):
+                    continue
+                if apply_filters and not _depot_config_matches(
+                    vdf_get(depot_body, "config"),
+                    platform=platform,
+                    osarch=osarch,
+                    language=language,
+                    lowviolence=lowviolence,
+                ):
                     continue
                 dlc_app_id = str(vdf_get(depot_body, "dlcappid", default="") or "").strip()
                 if dlc_app_id.isdigit():

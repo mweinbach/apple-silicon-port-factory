@@ -75,6 +75,7 @@ def _write_mock_appinfo_vdf(
     depots: dict[str, str | None],
     *,
     v29: bool = False,
+    depot_configs: dict[str, dict[str, str]] | None = None,
 ) -> Path:
     """Write a minimal valid Steam binary `appcache/appinfo.vdf` (v28 or v29)."""
     strings: list[str] = []
@@ -104,9 +105,11 @@ def _write_mock_appinfo_vdf(
 
     depots_node: dict = {}
     for did, dlc_app_id in depots.items():
-        node: dict[str, str] = {"name": f"Depot {did}"}
+        node: dict = {"name": f"Depot {did}"}
         if dlc_app_id is not None:
             node["dlcappid"] = dlc_app_id
+        if depot_configs and did in depot_configs:
+            node["config"] = dict(depot_configs[did])
         depots_node[did] = node
 
     payload = _encode_map({"appinfo": {"depots": depots_node}})
@@ -176,10 +179,26 @@ def _write_mock_depot_downloader(
 
         if "-manifest-only" in argv:
             if app_id == "228980":
+                import hashlib
+                r_depots = depot_args or ["228989"]
+                r_sha = hashlib.sha1(b"MOCK_REDIST").hexdigest()
                 print("Using app branch: 'public'.")
-                print("Got depot key for 228989 result: OK")
-                print("Processing depot 228989 - Visual C++ 2022 Redistributable")
-                print("Manifest 1111111111111111111 (11/26/2026 12:00:00)")
+                for rdep in r_depots:
+                    if dest is not None:
+                        dest.mkdir(parents=True, exist_ok=True)
+                        (dest / f"manifest_{{rdep}}_1111111111111111111.txt").write_text(
+                            f"Content Manifest for Depot {{rdep}}\\n"
+                            "Manifest ID / date       : 1111111111111111111 / 11/26/2026 12:00:00\\n"
+                            "Total number of files    : 1\\n"
+                            "Total bytes on disk      : 11\\n"
+                            "Total bytes compressed   : 11\\n"
+                            "          Size Chunks File SHA                                 Flags Name\\n"
+                            f"            11      1 {{r_sha}}     0 redist_{{rdep}}.bin\\n",
+                            encoding="utf-8",
+                        )
+                    print(f"Got depot key for {{rdep}} result: OK")
+                    print(f"Processing depot {{rdep}} - Common Redistributable")
+                    print("Manifest 1111111111111111111 (11/26/2026 12:00:00)")
                 sys.exit(0)
             if {empty_manifest!r} or os.environ.get("MOCK_EMPTY_MANIFEST") == "1":
                 print("No depots available for manifest-only query")
@@ -2130,6 +2149,165 @@ class SteamBackendTests(unittest.TestCase):
 
         info = backend.info("1091500", platform="windows", offline=True)
         self.assertEqual(Path(info.install_path).resolve(), managed_dest)
+
+    def test_appinfo_dlc_depot_config_filtering_excludes_wrong_os_arch_and_language(self) -> None:
+        # DLC 2138330 has four depots in appinfo.vdf:
+        #   999001 -> windows / 64 / english (should be selected)
+        #   999002 -> macos / 64             (excluded for windows)
+        #   999003 -> windows / 32           (excluded for 64-bit)
+        #   999004 -> windows / 64 / japanese (excluded for default english)
+        _write_mock_appinfo_vdf(
+            self.steam_home,
+            1091500,
+            {
+                "1091501": None,
+                "999001": "2138330",
+                "999002": "2138330",
+                "999003": "2138330",
+                "999004": "2138330",
+            },
+            v29=True,
+            depot_configs={
+                "1091501": {"oslist": "windows", "osarch": "64"},
+                "999001": {"oslist": "windows", "osarch": "64"},
+                "999002": {"oslist": "macos", "osarch": "64"},
+                "999003": {"oslist": "windows", "osarch": "32"},
+                "999004": {"oslist": "windows", "osarch": "64", "language": "japanese"},
+            },
+        )
+        filtered = parse_appinfo_vdf_dlc_depots(
+            self.steam_home,
+            "1091500",
+            platform="windows",
+            osarch="64",
+            language="english",
+        )
+        self.assertEqual(filtered, {"2138330": ["999001"]})
+
+        backend = self._make_backend()
+        dest = self.root / "games" / "FilteredDlcGame"
+        dl = backend.download(
+            DownloadOptions(
+                app_id="1091500",
+                dest=dest,
+                platform="windows",
+                dlcs=("2138330",),
+                skip_dlcs=False,
+            )
+        )
+        self.assertEqual(dl.downloaded_dlcs, ["2138330"])
+        logged = self.log_path.read_text(encoding="utf-8")
+        self.assertIn('"-depot", "1091501", "999001"', logged)
+        self.assertNotIn("999002", logged)
+        self.assertNotIn("999003", logged)
+        self.assertNotIn("999004", logged)
+
+    def test_verify_readonly_queries_app_228980_and_rejects_missing_redist_manifest(self) -> None:
+        game_bytes = b"MZ\x90\x00BASE"
+        dx_bytes = b"MZ\x90\x00DXSETUP"
+        game_sha = hashlib.sha1(game_bytes).hexdigest()
+        dx_sha = hashlib.sha1(dx_bytes).hexdigest()
+
+        # Base app 1091500's manifest query returns ONLY base depot 1091501 (not 228990).
+        # App 228980 returns 228990's file manifest unless MOCK_FAIL_REDIST_MANIFEST=1.
+        dd_bin = self.root / "bin" / "DepotDownloader-redist-228980-query"
+        dd_bin.parent.mkdir(parents=True, exist_ok=True)
+        dd_bin.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import os, pathlib, sys
+                argv = sys.argv[1:]
+                app_id = argv[argv.index("-app") + 1] if "-app" in argv else ""
+                dest = pathlib.Path(argv[argv.index("-dir") + 1]) if "-dir" in argv else None
+                if "-manifest-only" in argv:
+                    if app_id == "1091500":
+                        if dest is not None:
+                            dest.mkdir(parents=True, exist_ok=True)
+                            (dest / "manifest_1091501_100.txt").write_text(
+                                "Content Manifest for Depot 1091501\\n"
+                                "Manifest ID / date       : 100 / 11/26/2026 12:00:00\\n"
+                                "Total number of files    : 1\\n"
+                                "Total bytes on disk      : {len(game_bytes)}\\n"
+                                "Total bytes compressed   : {len(game_bytes)}\\n"
+                                "          Size Chunks File SHA                                 Flags Name\\n"
+                                "            {len(game_bytes)}      1 {game_sha}     0 SampleGame.exe\\n",
+                                encoding="utf-8",
+                            )
+                        print("Using app branch: 'public'.")
+                        print("Processing depot 1091501 - Base Game")
+                        print("Manifest 100 (11/26/2026 12:00:00)")
+                        sys.exit(0)
+                    if app_id == "228980":
+                        if os.environ.get("MOCK_FAIL_REDIST_MANIFEST") == "1":
+                            print("Using app branch: 'public'.")
+                            print("Processing depot 228990 - DirectX Jun 2010")
+                            sys.exit(0)
+                        if dest is not None:
+                            dest.mkdir(parents=True, exist_ok=True)
+                            (dest / "manifest_228990_200.txt").write_text(
+                                "Content Manifest for Depot 228990\\n"
+                                "Manifest ID / date       : 200 / 11/26/2026 12:00:00\\n"
+                                "Total number of files    : 1\\n"
+                                "Total bytes on disk      : {len(dx_bytes)}\\n"
+                                "Total bytes compressed   : {len(dx_bytes)}\\n"
+                                "          Size Chunks File SHA                                 Flags Name\\n"
+                                "            {len(dx_bytes)}      1 {dx_sha}     0 DXSETUP.exe\\n",
+                                encoding="utf-8",
+                            )
+                        print("Using app branch: 'public'.")
+                        print("Processing depot 228990 - DirectX Jun 2010")
+                        print("Manifest 200 (11/26/2026 12:00:00)")
+                        sys.exit(0)
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        dd_bin.chmod(dd_bin.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=dd_bin)
+        dest = self.root / "games" / "RedistCoverageGame"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "SampleGame.exe").write_bytes(game_bytes)
+        backend._save_installs(
+            {
+                "1091500": {
+                    "app_id": "1091500",
+                    "title": "Redist Coverage Game",
+                    "account_name": "testplayer",
+                    "install_path": str(dest),
+                    "platform": "windows",
+                    "branch": "public",
+                    "depots": ["1091501"],
+                    "redists": ["228990"],
+                }
+            }
+        )
+
+        # 1. `_CommonRedist/228990` is missing entirely -> must query App 228980 and report failure
+        ver_missing = backend.verify("1091500", repair=False)
+        self.assertFalse(ver_missing.ok)
+        self.assertEqual(ver_missing.missing_files, ["_CommonRedist/228990"])
+
+        # 2. When App 228980 fails to supply a file manifest, verify must fail honestly instead of ok=True
+        prev = os.environ.get("MOCK_FAIL_REDIST_MANIFEST")
+        os.environ["MOCK_FAIL_REDIST_MANIFEST"] = "1"
+        try:
+            with self.assertRaises(CommandFailedError):
+                backend.verify("1091500", repair=False)
+        finally:
+            if prev is None:
+                os.environ.pop("MOCK_FAIL_REDIST_MANIFEST", None)
+            else:
+                os.environ["MOCK_FAIL_REDIST_MANIFEST"] = prev
+
+        # 3. Once `_CommonRedist/228990/DXSETUP.exe` is present with matching SHA-1, verify passes
+        (dest / "_CommonRedist" / "228990").mkdir(parents=True, exist_ok=True)
+        (dest / "_CommonRedist" / "228990" / "DXSETUP.exe").write_bytes(dx_bytes)
+        ver_ok = backend.verify("1091500", repair=False)
+        self.assertTrue(ver_ok.ok)
+        self.assertEqual(ver_ok.missing_files, [])
 
     def test_unmanaged_steam_client_install_rejected_for_inplace_update_and_repair(self) -> None:
         sa_dir = self.steam_home / "steamapps"

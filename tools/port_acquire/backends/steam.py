@@ -1474,6 +1474,20 @@ class SteamBackend(StoreBackend):
             return pairs[0][1]
         return ",".join(f"{did}:{gid}" for did, gid in pairs)
 
+    @staticmethod
+    def _extract_dd_filter_options(extra_args: tuple[str, ...] | list[str]) -> tuple[str, bool]:
+        """Extract `-language <lang>` (default `'english'`) and `-lowviolence` from extra args."""
+        language = "english"
+        lowviolence = False
+        args = list(extra_args)
+        for i, tok in enumerate(args):
+            low = str(tok).strip().lower()
+            if low == "-language" and i + 1 < len(args) and str(args[i + 1]).strip():
+                language = str(args[i + 1]).strip().lower()
+            elif low == "-lowviolence":
+                lowviolence = True
+        return language, lowviolence
+
     def _resolve_dlc_depot_map(
         self,
         app_id: str,
@@ -1481,13 +1495,19 @@ class SteamBackend(StoreBackend):
         store_details: dict[str, Any],
         *,
         saved_dlc_depots: dict[str, Any] | None = None,
+        platform: str | None = None,
+        osarch: str | None = None,
+        language: str | None = None,
+        lowviolence: bool = False,
     ) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Map `dlc_app_id -> [depot_ids]` and `depot_id -> dlc_app_id` under base `app_id`.
 
         In Steamworks, all DLC depots reside inside the base game's depot list (never under
         the DLC's standalone AppID). Resolution order:
-        1. Local Steam binary `appcache/appinfo.vdf` (`depots.<id>.dlcappid`), when present.
-        2. Previously recorded `dlc_depots` in `steam-installs.json`.
+        1. Local Steam binary `appcache/appinfo.vdf` (`depots.<id>.dlcappid`), filtered by
+           `config.{oslist,osarch,language,lowviolence}` when `platform` is supplied.
+        2. Previously recorded `dlc_depots` in `steam-installs.json` (excluding depots
+           explicitly ruled out by `appinfo.vdf` config filters).
         3. Explicit `dlc_app_id` field on depot dicts.
         4. Steam Store `appdetails.dlc` IDs correlated with depots returned under `app_id`
            (exact depot ID == DLC AppID or standard adjacent depot ID == DLC AppID + 1).
@@ -1509,8 +1529,35 @@ class SteamBackend(StoreBackend):
             if depot_id not in lst:
                 lst.append(depot_id)
 
-        # 1. Local binary appinfo.vdf (authoritative Steamworks `dlcappid` metadata)
-        for dlc_id, dep_ids in parse_appinfo_vdf_dlc_depots(self.steam_home(), app_id).items():
+        # 1. Local binary appinfo.vdf (authoritative Steamworks `dlcappid` metadata).
+        # When target filters are supplied, compute both unfiltered and filtered sets so we
+        # never select incompatible platform/arch/language depots into `-depot <ids>`, while
+        # still recognizing all DLC depots in `depot_to_dlc` if they appear in raw metadata.
+        unfiltered_appinfo = parse_appinfo_vdf_dlc_depots(self.steam_home(), app_id)
+        if platform is not None or osarch is not None or language is not None:
+            filtered_appinfo = parse_appinfo_vdf_dlc_depots(
+                self.steam_home(),
+                app_id,
+                platform=platform,
+                osarch=osarch or "64",
+                language=language or "english",
+                lowviolence=lowviolence,
+            )
+            filtered_depot_set = {
+                str(did) for dep_ids in filtered_appinfo.values() for did in dep_ids
+            }
+            excluded_by_config = {
+                str(did)
+                for dep_ids in unfiltered_appinfo.values()
+                for did in dep_ids
+                if str(did) not in filtered_depot_set
+            }
+            appinfo_map = filtered_appinfo
+        else:
+            excluded_by_config = set()
+            appinfo_map = unfiltered_appinfo
+
+        for dlc_id, dep_ids in appinfo_map.items():
             for did in dep_ids:
                 _link(str(dlc_id), str(did))
 
@@ -1519,7 +1566,8 @@ class SteamBackend(StoreBackend):
             for dlc_id, dep_ids in saved_dlc_depots.items():
                 if isinstance(dep_ids, list):
                     for did in dep_ids:
-                        _link(str(dlc_id), str(did))
+                        if str(did) not in excluded_by_config:
+                            _link(str(dlc_id), str(did))
 
         # 3. Explicit dlc_app_id already on depot dicts
         for d in depots:
@@ -1527,7 +1575,7 @@ class SteamBackend(StoreBackend):
                 continue
             did = str(d.get("depot_id") or "")
             explicit_dlc = str(d.get("dlc_app_id") or "")
-            if did and explicit_dlc:
+            if did and explicit_dlc and did not in excluded_by_config:
                 _link(explicit_dlc, did)
 
         # 4. Correlate Store `appdetails.dlc` IDs with depots enumerated under base `app_id`
@@ -1542,7 +1590,12 @@ class SteamBackend(StoreBackend):
                 if not isinstance(d, dict):
                     continue
                 did = str(d.get("depot_id") or "")
-                if not did.isdigit() or did in depot_to_dlc or did in COMMON_REDIST_DEPOTS:
+                if (
+                    not did.isdigit()
+                    or did in depot_to_dlc
+                    or did in COMMON_REDIST_DEPOTS
+                    or did in excluded_by_config
+                ):
                     continue
                 if did in store_dlc_ids:
                     _link(did, did)
@@ -1841,11 +1894,16 @@ class SteamBackend(StoreBackend):
             if info is not None
             else []
         )
+        dd_language, dd_lowviolence = self._extract_dd_filter_options(options.extra_args)
         dlc_to_depots, depot_to_dlc = self._resolve_dlc_depot_map(
             resolved_id,
             info_depot_dicts,
             store_details,
             saved_dlc_depots=(existing_entry or {}).get("dlc_depots"),
+            platform=options.platform,
+            osarch="64",
+            language=dd_language,
+            lowviolence=dd_lowviolence,
         )
 
         # Validate requested DLC ownership upfront before transferring payloads.
@@ -1901,12 +1959,20 @@ class SteamBackend(StoreBackend):
         ]
         known_dlc_depot_ids = set(depot_to_dlc.keys())
 
+        info_depot_ids = {d.depot_id for d in (info.depots if info is not None else [])}
         requested_dlc_depot_ids: list[str] = []
         dlc_depots_by_dlc: dict[str, list[str]] = {}
         for dlc_id in target_dlcs:
             dep_ids = list(dlc_to_depots.get(dlc_id) or [])
             if not dep_ids and info is not None and any(d.depot_id == dlc_id for d in info.depots):
                 dep_ids = [dlc_id]
+            # When the platform-filtered `-manifest-only` query returned depots for this DLC,
+            # intersect against `info_depot_ids` so explicit `-depot` never selects a depot
+            # excluded by DepotDownloader's own platform/arch/language filters.
+            if info_depot_ids and dep_ids:
+                confirmed = [did for did in dep_ids if did in info_depot_ids]
+                if confirmed:
+                    dep_ids = confirmed
             dlc_depots_by_dlc[dlc_id] = dep_ids
             for did in dep_ids:
                 if did not in requested_dlc_depot_ids:
@@ -2004,6 +2070,10 @@ class SteamBackend(StoreBackend):
                 info_depot_dicts + all_stdout_depots,
                 store_details,
                 saved_dlc_depots=(existing_entry or {}).get("dlc_depots"),
+                platform=options.platform,
+                osarch="64",
+                language=dd_language,
+                lowviolence=dd_lowviolence,
             )
             for dlc_id in target_dlcs:
                 dep_ids = list(dlc_to_depots.get(dlc_id) or dlc_depots_by_dlc.get(dlc_id) or [])
@@ -2454,11 +2524,47 @@ class SteamBackend(StoreBackend):
                 install_path,
                 depots,
             )
-            # Verify any separately downloaded Common Redistributables against `_CommonRedist/<depot_id>`
-            for rdep in redist_depots:
-                rdid = str(rdep.get("depot_id") or "")
-                if rdid not in installed_redists or not rdep.get("has_file_manifest", bool(rdep.get("files"))):
-                    continue
+            # Verify every separately downloaded Common Redistributable (`entry["redists"]`)
+            # against `_CommonRedist/<depot_id>`. Query App 228980 explicitly when a recorded
+            # redistributable is absent from the base app's manifest response or lacks a file
+            # manifest, and fail honestly instead of silently skipping incomplete coverage.
+            redist_depots_by_id = {
+                str(rdep.get("depot_id") or ""): rdep
+                for rdep in redist_depots
+                if rdep.get("depot_id")
+            }
+            for rdid in sorted(installed_redists, key=lambda x: int(x) if x.isdigit() else 0):
+                rdep = redist_depots_by_id.get(rdid)
+                if rdep is None or not rdep.get("has_file_manifest", bool(rdep.get("files"))):
+                    r_manifest = self._fetch_depot_manifests(
+                        COMMON_REDIST_APP_ID,
+                        depot_id=rdid,
+                        platform=platform,
+                        branch="public",
+                        account_name=account_name,
+                        offline=False,
+                        allow_cache_fallback=False,
+                        update_cache=False,
+                    )
+                    r_skipped = set(r_manifest.get("skipped_depots") or [])
+                    r_found = [
+                        d
+                        for d in (r_manifest.get("depots") or [])
+                        if isinstance(d, dict) and str(d.get("depot_id") or "") == rdid
+                    ]
+                    rdep = r_found[0] if r_found else None
+                    if rdep is None or not rdep.get("has_file_manifest", bool(rdep.get("files"))):
+                        if rdid in r_skipped:
+                            raise AuthRequiredError(
+                                f"Cannot verify Steam AppID {resolved_id}: current account lacks access to "
+                                f"installed redistributable depot {rdid} (App {COMMON_REDIST_APP_ID}).",
+                                details={"missing_depots": [rdid], "skipped_depots": sorted(r_skipped)},
+                            )
+                        raise CommandFailedError(
+                            f"Incomplete redistributable manifest coverage for Steam AppID {resolved_id}: "
+                            f"could not obtain file manifest for installed redistributable depot {rdid}.",
+                            details={"missing_depots": [rdid]},
+                        )
                 r_root = install_path / "_CommonRedist" / rdid
                 if not r_root.is_dir():
                     missing_files.append(f"_CommonRedist/{rdid}")
@@ -2736,6 +2842,9 @@ class SteamBackend(StoreBackend):
             remote_depots,
             store_details,
             saved_dlc_depots=entry.get("dlc_depots"),
+            platform=platform,
+            osarch="64",
+            language="english",
         )
         remote_base_depots = [
             d
