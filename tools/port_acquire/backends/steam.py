@@ -552,6 +552,7 @@ class SteamBackend(StoreBackend):
         account_name: str | None = None,
         offline: bool = False,
         allow_cache_fallback: bool = True,
+        update_cache: bool = True,
     ) -> dict[str, Any]:
         """Run `DepotDownloader -manifest-only` (or read cached manifests when offline)."""
         cache_path = self._manifest_cache_file(app_id)
@@ -662,7 +663,7 @@ class SteamBackend(StoreBackend):
                 "depots": depots,
                 "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
-            if depots:
+            if update_cache and depots:
                 _atomic_write_json(cache_path, payload)
             return payload
 
@@ -1633,6 +1634,7 @@ class SteamBackend(StoreBackend):
 
         # Owned DLC depots when requested
         downloaded_dlcs: list[str] = []
+        dlc_versions: dict[str, str] = {}
         if options.with_dlcs or options.dlcs:
             owned_ids = self._known_owned_app_ids(offline=False)
             if options.dlcs:
@@ -1668,7 +1670,11 @@ class SteamBackend(StoreBackend):
                 ]
                 if options.validate:
                     dlc_args.append("-validate")
-                self._run_depot_downloader(dlc_args, interactive=False, timeout=None, check=True)
+                dlc_proc = self._run_depot_downloader(dlc_args, interactive=False, timeout=None, check=True)
+                dlc_out = parse_depot_downloader_stdout(dlc_proc.stdout + "\n" + dlc_proc.stderr)
+                dlc_ver = self._version_from_manifests(dlc_out.get("depots", []))
+                if dlc_ver:
+                    dlc_versions[dlc_id] = dlc_ver
                 if dlc_id not in downloaded_dlcs:
                     downloaded_dlcs.append(dlc_id)
 
@@ -1730,6 +1736,7 @@ class SteamBackend(StoreBackend):
                 "manifest_gids": manifest_gids,
                 "depots": downloaded_depots,
                 "dlcs": downloaded_dlcs,
+                "dlc_versions": dlc_versions,
                 "redists": downloaded_redists,
                 "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
@@ -1863,6 +1870,7 @@ class SteamBackend(StoreBackend):
                 account_name=account_name,
                 offline=False,
                 allow_cache_fallback=False,
+                update_cache=False,
             )
             depots = manifest_data.get("depots") or []
             missing_file_manifests = [
@@ -1954,7 +1962,8 @@ class SteamBackend(StoreBackend):
         branch = str(entry.get("branch") or "public")
         old_version = str(entry.get("build_id") or "") or None
 
-        # Always fetch fresh remote manifests (never falling back to local cache or local build_id).
+        # Always fetch fresh remote manifests without overwriting the installed manifest cache
+        # so `--check-only` cannot clobber launch metadata for the currently installed build.
         remote_manifests = self._fetch_depot_manifests(
             resolved_id,
             platform=platform,
@@ -1962,8 +1971,63 @@ class SteamBackend(StoreBackend):
             account_name=account_name,
             offline=False,
             allow_cache_fallback=False,
+            update_cache=False,
         )
         remote_version = self._version_from_manifests(remote_manifests.get("depots") or [])
+
+        # When `--with-dlcs` is requested, also check owned DLCs for newly owned/uninstalled
+        # expansions or updated DLC manifest GIDs before declaring the install up to date.
+        dlc_updates_needed: list[str] = []
+        if with_dlcs:
+            installed_dlcs = {str(x) for x in (entry.get("dlcs") or []) if str(x).isdigit()}
+            raw_dlc_vers = entry.get("dlc_versions")
+            installed_dlc_versions: dict[str, str] = (
+                {str(k): str(v) for k, v in raw_dlc_vers.items() if v}
+                if isinstance(raw_dlc_vers, dict)
+                else {}
+            )
+            store_details = self._fetch_store_appdetails(resolved_id, offline=False)
+            owned_ids = self._known_owned_app_ids(offline=False)
+            target_dlcs: list[str] = []
+            seen_dlcs: set[str] = set()
+            for raw_dlc in store_details.get("dlc") or []:
+                did = str(raw_dlc)
+                if did.isdigit() and did not in seen_dlcs and (did in owned_ids or did in installed_dlcs):
+                    seen_dlcs.add(did)
+                    target_dlcs.append(did)
+            for did in sorted(installed_dlcs, key=lambda x: int(x)):
+                if did not in seen_dlcs:
+                    seen_dlcs.add(did)
+                    target_dlcs.append(did)
+
+            for dlc_id in target_dlcs:
+                if dlc_id not in installed_dlcs:
+                    dlc_updates_needed.append(dlc_id)
+                    continue
+                installed_dlc_ver = installed_dlc_versions.get(dlc_id)
+                try:
+                    dlc_remote = self._fetch_depot_manifests(
+                        dlc_id,
+                        platform=platform,
+                        branch=branch,
+                        account_name=account_name,
+                        offline=False,
+                        allow_cache_fallback=False,
+                        update_cache=False,
+                    )
+                    dlc_remote_ver = self._version_from_manifests(dlc_remote.get("depots") or [])
+                except CommandFailedError:
+                    dlc_remote_ver = None
+                if dlc_remote_ver is None:
+                    if not check_only:
+                        dlc_updates_needed.append(dlc_id)
+                    elif installed_dlc_ver is not None:
+                        raise CommandFailedError(
+                            f"Could not obtain remote manifest ID for Steam DLC AppID {dlc_id} "
+                            f"(branch {branch!r}) from DepotDownloader -manifest-only."
+                        )
+                elif dlc_remote_ver != installed_dlc_ver:
+                    dlc_updates_needed.append(dlc_id)
 
         if remote_version is None:
             if check_only:
@@ -1972,8 +2036,20 @@ class SteamBackend(StoreBackend):
                     f"(branch {branch!r}) from DepotDownloader -manifest-only."
                 )
         else:
-            update_available = remote_version != old_version
+            base_update_available = remote_version != old_version
+            update_available = base_update_available or bool(dlc_updates_needed)
             if check_only:
+                if base_update_available and dlc_updates_needed:
+                    msg = (
+                        f"Update available ({old_version or 'unknown'} -> {remote_version}) "
+                        f"plus DLC updates: {', '.join(dlc_updates_needed)}"
+                    )
+                elif base_update_available:
+                    msg = f"Update available ({old_version or 'unknown'} -> {remote_version})"
+                elif dlc_updates_needed:
+                    msg = f"DLC update/install available: {', '.join(dlc_updates_needed)}"
+                else:
+                    msg = "Already up to date"
                 return UpdateResult(
                     store=self.name,
                     app_id=resolved_id,
@@ -1982,11 +2058,7 @@ class SteamBackend(StoreBackend):
                     old_version=old_version,
                     new_version=remote_version,
                     install_path=str(install_path),
-                    message=(
-                        f"Update available ({old_version or 'unknown'} -> {remote_version})"
-                        if update_available
-                        else "Already up to date"
-                    ),
+                    message=msg,
                 )
 
             if not update_available and old_version is not None:
@@ -2104,6 +2176,11 @@ class SteamBackend(StoreBackend):
                             manifest_paths.append(str(f["path"]))
 
         exe = self._pick_executable_from_paths(manifest_paths)
+        if exe and resolved_dir.is_dir() and not (resolved_dir / Path(exe)).is_file():
+            existing_manifest_paths = [
+                p for p in manifest_paths if (resolved_dir / Path(p.replace("\\", "/"))).is_file()
+            ]
+            exe = self._pick_executable_from_paths(existing_manifest_paths)
         if not exe and resolved_dir.is_dir():
             disk_exes = [
                 p.relative_to(resolved_dir).as_posix()

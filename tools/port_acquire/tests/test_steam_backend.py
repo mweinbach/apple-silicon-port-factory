@@ -1147,6 +1147,140 @@ class SteamBackendTests(unittest.TestCase):
         self.assertEqual(plan.install_dir, str(ext_game_dir))
         self.assertEqual(plan.executable, "ExternalRPG.exe")
 
+    def test_update_check_only_preserves_installed_launch_metadata(self) -> None:
+        backend = self._make_backend()
+        backend.login(username="testplayer")
+        dest = self.root / "games" / "CheckOnlyPreserveGame"
+        backend.download(DownloadOptions(app_id="1091500", dest=dest, platform="windows"))
+
+        # Simulate a newer remote release renaming SampleGame.exe -> NewGame.exe
+        renamed_manifest = SAMPLE_UPDATED_MANIFEST_TXT.replace("SampleGame.exe", "NewGame.exe")
+        self.manifest_file.write_text(renamed_manifest, encoding="utf-8")
+
+        upd = backend.update("1091500", check_only=True)
+        self.assertTrue(upd.update_available)
+        self.assertFalse(upd.updated)
+
+        # Installed launch plan must still select the actually installed SampleGame.exe
+        plan = backend.launch_args("1091500", offline=True)
+        self.assertEqual(plan.executable, "bin/x64/SampleGame.exe")
+        self.assertTrue((dest / plan.executable).is_file())
+
+    def test_update_with_dlcs_installs_and_updates_dlc_when_base_unchanged(self) -> None:
+        dlc_dd = self.root / "dlc-update-dd"
+        dlc_dd.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os, pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-dlc")
+                    sys.exit(0)
+                app_id = argv[argv.index("-app") + 1]
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                base_gid = "8811223344556677889"
+                dlc_gid = os.environ.get("MOCK_DLC_GID", "770011")
+                if "-manifest-only" in argv:
+                    if app_id == "2138330":
+                        (dest / f"manifest_2138331_{dlc_gid}.txt").write_text(
+                            f"Content Manifest for Depot 2138331\\n"
+                            f"Manifest ID / date : {dlc_gid} / 11/26/2026\\n"
+                            f"Size Chunks File SHA Flags Name\\n"
+                            f"8 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 dlc_2138330.pak\\n",
+                            encoding="utf-8",
+                        )
+                        print("Using app branch: 'public'.")
+                        print("Processing depot 2138331 - Expansion DLC")
+                        print(f"Manifest {dlc_gid} (11/26/2026 12:00:00)")
+                    else:
+                        (dest / f"manifest_1091501_{base_gid}.txt").write_text(
+                            f"Content Manifest for Depot 1091501\\n"
+                            f"Manifest ID / date : {base_gid} / 11/26/2026\\n"
+                            f"Size Chunks File SHA Flags Name\\n"
+                            f"10 1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 0 bin\\\\x64\\\\SampleGame.exe\\n",
+                            encoding="utf-8",
+                        )
+                        print("Using app branch: 'public'.")
+                        print("Processing depot 1091501 - Base Game")
+                        print(f"Manifest {base_gid} (11/26/2026 12:00:00)")
+                    sys.exit(0)
+                if app_id == "2138330":
+                    (dest / "dlc_2138330.pak").write_bytes(f"DLC_{dlc_gid}".encode("utf-8"))
+                    print("Using app branch: 'public'.")
+                    print("Processing depot 2138331 - Expansion DLC")
+                    print(f"Manifest {dlc_gid} (11/26/2026 12:00:00)")
+                else:
+                    (dest / "bin" / "x64").mkdir(parents=True, exist_ok=True)
+                    (dest / "bin" / "x64" / "SampleGame.exe").write_bytes(b"MZ\\x90\\x00BASE")
+                    print("Using app branch: 'public'.")
+                    print("Processing depot 1091501 - Base Game")
+                    print(f"Manifest {base_gid} (11/26/2026 12:00:00)")
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        dlc_dd.chmod(dlc_dd.stat().st_mode | stat.S_IXUSR)
+
+        def fake_http(url: str):
+            if "appdetails" in url:
+                return {
+                    "1091500": {
+                        "success": True,
+                        "data": {
+                            "name": "Sample Action RPG",
+                            "dlc": [2138330],
+                        },
+                    }
+                }
+            return {}
+
+        prev_dlc_gid = os.environ.get("MOCK_DLC_GID")
+        os.environ["MOCK_DLC_GID"] = "770011"
+        try:
+            backend = self._make_backend(
+                depot_downloader_bin=dlc_dd,
+                allow_network=True,
+                http_get_json=fake_http,
+            )
+            dest = self.root / "games" / "DlcUpdateGame"
+            # Initial install WITHOUT DLCs
+            backend.download(
+                DownloadOptions(app_id="1091500", dest=dest, platform="windows", with_dlcs=False)
+            )
+            self.assertFalse((dest / "dlc_2138330.pak").exists())
+
+            # Base manifest is unchanged, but owned DLC 2138330 is not yet installed -> update_available=True
+            chk1 = backend.update("1091500", check_only=True, with_dlcs=True)
+            self.assertTrue(chk1.update_available)
+            self.assertFalse(chk1.updated)
+
+            # Running update --with-dlcs installs the missing owned DLC
+            upd1 = backend.update("1091500", check_only=False, with_dlcs=True)
+            self.assertTrue(upd1.updated)
+            self.assertEqual((dest / "dlc_2138330.pak").read_bytes(), b"DLC_770011")
+
+            # Now both base and DLC are current -> up to date
+            upd_same = backend.update("1091500", check_only=False, with_dlcs=True)
+            self.assertFalse(upd_same.updated)
+            self.assertFalse(upd_same.update_available)
+
+            # Bump DLC manifest GID while base stays unchanged -> update --with-dlcs detects & applies it
+            os.environ["MOCK_DLC_GID"] = "770022"
+            chk2 = backend.update("1091500", check_only=True, with_dlcs=True)
+            self.assertTrue(chk2.update_available)
+
+            upd2 = backend.update("1091500", check_only=False, with_dlcs=True)
+            self.assertTrue(upd2.updated)
+            self.assertEqual((dest / "dlc_2138330.pak").read_bytes(), b"DLC_770022")
+        finally:
+            if prev_dlc_gid is None:
+                os.environ.pop("MOCK_DLC_GID", None)
+            else:
+                os.environ["MOCK_DLC_GID"] = prev_dlc_gid
+
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):
             if "appdetails" in url:
