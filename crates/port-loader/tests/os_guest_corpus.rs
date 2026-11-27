@@ -2404,42 +2404,63 @@ fn guest_cpu_topology_and_cross_thread_priority() {
         );
     };
 
-    // 2. [cpu] cap mode via game.toml manifest -> guest CPUID & LPI both see exactly 4 CPUs.
+    let sysctl_u32 = |name: &std::ffi::CStr| -> Option<u32> {
+        let mut v: u32 = 0;
+        let mut sz = std::mem::size_of::<u32>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut v as *mut u32).cast(),
+                &mut sz,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(v)
+    };
+    let host_logical = sysctl_u32(c"hw.logicalcpu")
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get() as u32))
+        .unwrap_or(4)
+        .clamp(1, 64);
+    let host_p_cores = sysctl_u32(c"hw.perflevel0.logicalcpu")
+        .unwrap_or(host_logical)
+        .clamp(1, host_logical);
+
+    // 2a. [cpu] cap mode strictly below host logical count (when host > 1) proves real clamping.
+    let cap_below = if host_logical > 2 { 2 } else { 1 };
+    let cap_below_toml =
+        format!("[app]\nid = \"topo-cap\"\n[cpu]\nmode = \"cap\"\nmax_cores = {cap_below}\n");
+    run_with_override(
+        "manifest-cap-below",
+        Some(&cap_below_toml),
+        &[],
+        cap_below.min(host_logical),
+    );
+
+    // 2b. [cpu] cap mode with max_cores = 4 clamps honestly to min(4, host_logical) on any host
+    //     (e.g. 3 on 3-core CI VMs, 4 on >=4-core Macs).
     run_with_override(
         "manifest-cap-4",
         Some("[app]\nid = \"topo-cap\"\n[cpu]\nmode = \"cap\"\nmax_cores = 4\n"),
         &[],
-        4,
+        4u32.min(host_logical),
     );
 
     // 3. PORT_NUM_CPUS env override beats [cpu] manifest section.
     run_with_override(
         "env-num-cpus-6",
-        Some("[app]\nid = \"topo-cap\"\n[cpu]\nmode = \"cap\"\nmax_cores = 4\n"),
+        Some(&cap_below_toml),
         &[("PORT_NUM_CPUS", "6")],
         6,
     );
 
-    // 4. [cpu] p_cores mode matches host hw.perflevel0.logicalcpu.
-    let mut p_cores: u32 = 0;
-    let mut sz = std::mem::size_of::<u32>();
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.perflevel0.logicalcpu".as_ptr(),
-            (&mut p_cores as *mut u32).cast(),
-            &mut sz,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 && p_cores >= 1 {
-        run_with_override(
-            "manifest-pcores",
-            Some("[app]\nid = \"topo-pcores\"\n[cpu]\nmode = \"p_cores\"\n"),
-            &[],
-            p_cores,
-        );
-    }
+    // 4. [cpu] p_cores mode matches host hw.perflevel0.logicalcpu (clamped to 1..=host_logical).
+    run_with_override(
+        "manifest-pcores",
+        Some("[app]\nid = \"topo-pcores\"\n[cpu]\nmode = \"p_cores\"\n"),
+        &[],
+        host_p_cores,
+    );
 }
 
 const CPU_TOPO_PRIO_C: &str = r##"
