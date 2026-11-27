@@ -1082,7 +1082,9 @@ class EpicBackend(StoreBackend):
         for raw_cmd in raw_cmd_sources:
             if isinstance(raw_cmd, str) and raw_cmd.strip():
                 try:
-                    parsed_default_args.extend(shlex.split(raw_cmd))
+                    # Use posix=False (matching Legendary's launcher) so Windows path
+                    # backslashes like `-DataPath=Data\Content` are preserved verbatim.
+                    parsed_default_args.extend(shlex.split(raw_cmd, posix=False))
                 except ValueError:
                     parsed_default_args.extend(raw_cmd.split())
         default_launch_args, _ = redact_launch_args(parsed_default_args)
@@ -1394,61 +1396,125 @@ class EpicBackend(StoreBackend):
         remote_version = str(entry.get("remote_version") or "") or None
         install_path = str(entry.get("install_path") or "") or None
         inst_platform = str(entry.get("platform") or "Windows")
-        update_available = bool(
-            entry.get("update_available")
-            or (remote_version and old_version and remote_version != old_version)
-        )
-        # Some legendary builds omit `remote_version` in `list-installed --check-updates --json`;
-        # cross-check against `info --json` `manifest.build_version` when available.
-        if remote_version is None and not update_available:
-            try:
-                latest_info = self._run_json(
-                    ["info", app_id, "--platform", inst_platform, "--json"]
-                )
-                if isinstance(latest_info, dict):
-                    manifest = (
-                        latest_info.get("manifest")
-                        if isinstance(latest_info.get("manifest"), dict)
-                        else {}
-                    )
-                    game_meta = (
-                        latest_info.get("game")
-                        if isinstance(latest_info.get("game"), dict)
-                        else {}
-                    )
-                    cand_ver = _extract_build_version(
-                        game=game_meta,
-                        manifest=manifest,
-                        install=None,
-                        platform=inst_platform,
-                    )
-                    if cand_ver:
-                        remote_version = cand_ver
-                        if old_version and remote_version != old_version:
-                            update_available = True
-            except AcquireError:
-                pass
+        norm_platform = _normalize_platform_name(inst_platform)
 
+        def _entry_has_update(row: dict[str, Any], row_platform: str) -> tuple[bool, str | None]:
+            cur_v = str(row.get("version") or "") or None
+            rem_v = str(row.get("remote_version") or "") or None
+            avail = bool(row.get("update_available") or (rem_v and cur_v and rem_v != cur_v))
+            if rem_v is None and not avail:
+                try:
+                    latest_info = self._run_json(
+                        ["info", str(row["app_name"]), "--platform", row_platform, "--json"]
+                    )
+                    if isinstance(latest_info, dict):
+                        manifest = (
+                            latest_info.get("manifest")
+                            if isinstance(latest_info.get("manifest"), dict)
+                            else {}
+                        )
+                        game_meta = (
+                            latest_info.get("game")
+                            if isinstance(latest_info.get("game"), dict)
+                            else {}
+                        )
+                        cand_ver = _extract_build_version(
+                            game=game_meta,
+                            manifest=manifest,
+                            install=None,
+                            platform=row_platform,
+                        )
+                        if cand_ver:
+                            rem_v = cand_ver
+                            if cur_v and rem_v != cur_v:
+                                avail = True
+                except AcquireError:
+                    pass
+            return avail, rem_v
+
+        update_available, remote_version = _entry_has_update(entry, inst_platform)
+
+        # Find installed DLCs belonging to `app_id` so `--with-dlcs` updates them even when
+        # the base game is already current (Legendary exits early when base download size is 0).
+        installed_dlc_rows: list[dict[str, Any]] = []
+        if with_dlcs:
+            owned_dlc_ids: set[str] = set()
+            try:
+                owned_dlc_ids = {
+                    d.app_id
+                    for d in self.list_dlcs(app_id, platform=norm_platform)
+                    if d.app_id
+                }
+            except AcquireError:
+                owned_dlc_ids = set()
+            for r in rows:
+                if not isinstance(r, dict) or not r.get("app_name"):
+                    continue
+                r_id = str(r["app_name"])
+                if r_id == app_id or not r.get("is_dlc"):
+                    continue
+                same_dir = bool(install_path and r.get("install_path") == install_path)
+                if same_dir or r_id in owned_dlc_ids:
+                    installed_dlc_rows.append(r)
+
+        dlc_updates_available: list[str] = []
+        if with_dlcs:
+            for d_row in installed_dlc_rows:
+                d_plat = str(d_row.get("platform") or inst_platform)
+                d_avail, _ = _entry_has_update(d_row, d_plat)
+                if d_avail:
+                    dlc_updates_available.append(str(d_row["app_name"]))
+
+        any_update_available = update_available or bool(dlc_updates_available)
         if check_only:
             return UpdateResult(
                 store=self.name,
                 app_id=app_id,
                 updated=False,
-                update_available=update_available,
+                update_available=any_update_available,
                 old_version=old_version,
                 new_version=remote_version or old_version,
                 install_path=install_path,
-                message="Update available." if update_available else "Already up to date.",
+                platform=norm_platform,
+                message="Update available." if any_update_available else "Already up to date.",
             )
 
-        cmd = ["-y", "install", app_id, "--update-only", "--skip-sdl"]
-        cmd.append("--with-dlcs" if with_dlcs else "--skip-dlcs")
-        upd_proc = self._run(cmd, check=False)
+        # Update base game first with `--skip-dlcs`, then update each installed DLC explicitly
+        # so DLC updates are never skipped when the base game is already current.
+        upd_proc = self._run(
+            ["-y", "install", app_id, "--update-only", "--skip-sdl", "--skip-dlcs"],
+            check=False,
+        )
         self._assert_install_completed(upd_proc, app_id=app_id, action="update")
 
-        after = self._installed_map().get(app_id) or {}
+        updated_dlcs: list[str] = []
+        if with_dlcs and installed_dlc_rows:
+            before_dlc_versions = {
+                str(r["app_name"]): str(r.get("version") or "")
+                for r in installed_dlc_rows
+            }
+            for d_row in installed_dlc_rows:
+                d_id = str(d_row["app_name"])
+                d_proc = self._run(
+                    ["-y", "install", d_id, "--update-only", "--skip-sdl", "--skip-dlcs"],
+                    check=False,
+                )
+                self._assert_install_completed(d_proc, app_id=d_id, action="dlc update")
+            after_map = self._installed_map()
+            for d_id, prev_ver in before_dlc_versions.items():
+                cur_ver = str((after_map.get(d_id) or {}).get("version") or "")
+                if (prev_ver and cur_ver and cur_ver != prev_ver) or d_id in dlc_updates_available:
+                    updated_dlcs.append(d_id)
+        else:
+            after_map = self._installed_map()
+
+        after = after_map.get(app_id) or {}
         new_version = str(after.get("version") or remote_version or old_version or "") or None
-        changed = bool(old_version and new_version and new_version != old_version) or update_available
+        changed = (
+            bool(old_version and new_version and new_version != old_version)
+            or update_available
+            or bool(updated_dlcs)
+        )
         return UpdateResult(
             store=self.name,
             app_id=app_id,
@@ -1457,6 +1523,8 @@ class EpicBackend(StoreBackend):
             old_version=old_version,
             new_version=new_version,
             install_path=str(after.get("install_path") or install_path or "") or None,
+            platform=norm_platform,
+            updated_dlcs=sorted(set(updated_dlcs)),
             message="Update applied." if changed else "Already up to date.",
         )
 

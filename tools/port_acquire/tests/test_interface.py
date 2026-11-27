@@ -222,6 +222,28 @@ class TestInterfaceAndManifest(unittest.TestCase):
         self.assertIn('args = "-epicapp=ArachnidTwo -windowed"', toml)
         self.assertNotIn("leaked_secret", toml)
 
+    def test_render_starter_game_toml_normalizes_prequoted_args(self) -> None:
+        manifest = {
+            "app_id": "QuotedApp",
+            "title": "Quoted App",
+            "executable": "Game.exe",
+            "launch_args": [
+                '"Test Game"',
+                "'Single Quoted'",
+                '-DataPath="C:\\My Games\\Data"',
+                "Plain With Space",
+                "-DataDir=Data\\Content",
+            ],
+        }
+        toml = render_starter_game_toml(manifest)
+        # Must NOT double-quote `""Test Game""` (which would split in GameManifest::split_args).
+        self.assertNotIn('\\"\\"Test Game\\"\\"', toml)
+        self.assertIn(
+            'args = "\\"Test Game\\" \\"Single Quoted\\" -DataPath=\\"C:\\\\My Games\\\\Data\\" '
+            '\\"Plain With Space\\" -DataDir=Data\\\\Content"',
+            toml,
+        )
+
     def test_redistributable_classification_and_disk_scan(self) -> None:
         vc = classify_redistributable_path("_CommonRedist/vcredist/VC_redist.x64.exe")
         self.assertIsNotNone(vc)

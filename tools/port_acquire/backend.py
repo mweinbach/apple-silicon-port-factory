@@ -299,6 +299,8 @@ class UpdateResult:
     old_version: str | None = None
     new_version: str | None = None
     install_path: str | None = None
+    platform: str | None = None
+    updated_dlcs: list[str] = field(default_factory=list)
     message: str = ""
 
     def to_dict(self) -> dict[str, Any]:

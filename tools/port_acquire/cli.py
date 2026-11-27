@@ -20,6 +20,7 @@ from .backend import (
 from .manifest import (
     MANIFEST_FILENAME,
     build_package_manifest,
+    read_package_manifest,
     render_starter_game_toml,
     write_package_manifest,
 )
@@ -631,11 +632,19 @@ def _dispatch(args: argparse.Namespace) -> int:
         if res.updated and res.install_path:
             existing_manifest = Path(res.install_path) / MANIFEST_FILENAME
             if existing_manifest.is_file():
+                refresh_platform = res.platform
+                if not refresh_platform:
+                    try:
+                        prev = read_package_manifest(existing_manifest)
+                        if isinstance(prev.get("platform"), str) and prev["platform"].strip():
+                            refresh_platform = prev["platform"].strip()
+                    except (OSError, ValueError):
+                        refresh_platform = None
                 _write_manifest_for_install(
                     backend,
                     app_id=res.app_id,
                     install_dir=Path(res.install_path),
-                    platform="windows",
+                    platform=refresh_platform or "windows",
                     manifest_out=existing_manifest,
                     offline=False,
                 )
@@ -668,14 +677,23 @@ def _dispatch(args: argparse.Namespace) -> int:
         manifest_obj: dict[str, Any] | None = None
 
         if args.export_manifest or args.export_game_toml:
+            export_platform = "windows"
+            existing_manifest = Path(plan.install_dir) / MANIFEST_FILENAME if plan.install_dir else None
+            if existing_manifest and existing_manifest.is_file():
+                try:
+                    prev = read_package_manifest(existing_manifest)
+                    if isinstance(prev.get("platform"), str) and prev["platform"].strip():
+                        export_platform = prev["platform"].strip()
+                except (OSError, ValueError):
+                    pass
             try:
-                info = backend.info(args.app, platform="windows", offline=True)
+                info = backend.info(args.app, platform=export_platform, offline=True)
             except AcquireError:
                 info = GameInfo(
                     store=store_name,
                     app_id=plan.app_id,
                     title=plan.title,
-                    platform="windows",
+                    platform=export_platform,
                     installed=True,
                     install_path=plan.install_dir,
                     executable=plan.executable,

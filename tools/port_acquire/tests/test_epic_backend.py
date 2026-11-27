@@ -330,7 +330,7 @@ if cmd == "info":
             "download_size": 48_000_000_000,
             "disk_size": 92_000_000_000,
             "launch_exe": exe,
-            "launch_command": "-dx12",
+            "launch_command": r"-dx12 -DataPath=Data\Content",
             "prerequisites": prereq,
         },
         "install": state["installed"].get(app_name, {}),
@@ -884,10 +884,13 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertTrue((dest / "ArachnidTwoExpansion.dat").is_file())
         self.assertTrue((dest / "ArachnidTwoEntitlementDLC.dat").is_file())
         manifest = read_package_manifest(dest / MANIFEST_FILENAME)
-        # Unregistered download must populate executable and merge+sanitize both
-        # `manifest.launch_command` and `game.command_line` (`AdditionalCommandLine`).
+        # Unregistered download must populate executable, preserve Windows backslashes
+        # (posix=False), and merge+sanitize both `manifest.launch_command` and `game.command_line`.
         self.assertEqual(manifest["executable"], "Spider-Man2.exe")
-        self.assertEqual(manifest["launch_args"], ["-dx12", "-epicportal"])
+        self.assertEqual(
+            manifest["launch_args"],
+            ["-dx12", r"-DataPath=Data\Content", "-epicportal"],
+        )
         self.assertNotIn("must_be_redacted", (dest / MANIFEST_FILENAME).read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], "1.2.0")
 
@@ -1010,6 +1013,50 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertTrue(offline_info.anticheat.detected)
         self.assertIn("Easy Anti-Cheat (EAC)", offline_info.anticheat.systems)
         self.assertTrue(offline_info.requires_eos)
+
+    def test_update_with_dlcs_updates_dlc_when_base_game_is_already_current(self) -> None:
+        dest = self.root / "games" / "BaseCurrentDlcStale"
+        # Base game is already current (1.1.0 == 1.1.0), while DLC has an update (1.1.0 -> 1.3.0).
+        self._patch_state(
+            updates={"ArachnidTwo": "1.1.0", "ArachnidTwoPreorderDLC": "1.3.0"}
+        )
+        self.backend.download(
+            DownloadOptions(app_id="ArachnidTwo", dest=dest, platform="windows", with_dlcs=True)
+        )
+
+        chk = self.backend.update("ArachnidTwo", check_only=True, with_dlcs=True)
+        self.assertTrue(chk.update_available)
+        self.assertFalse(chk.updated)
+
+        upd = self.backend.update("ArachnidTwo", with_dlcs=True)
+        self.assertTrue(upd.updated)
+        self.assertIn("ArachnidTwoPreorderDLC", upd.updated_dlcs)
+        installed_after = self.backend._installed_map()
+        self.assertEqual(installed_after["ArachnidTwoPreorderDLC"]["version"], "1.3.0")
+
+    def test_update_refreshes_manifest_preserving_macos_platform(self) -> None:
+        dest = self.root / "games" / "MacUpdateGame"
+        proc_dl = self._run_cli(
+            "download",
+            "ArachnidTwo",
+            "--dest",
+            str(dest),
+            "--platform",
+            "macos",
+            "--json",
+        )
+        self.assertEqual(proc_dl.returncode, 0, proc_dl.stderr)
+        m_before = read_package_manifest(dest / MANIFEST_FILENAME)
+        self.assertEqual(m_before["platform"], "macos")
+
+        proc_upd = self._run_cli("update", "ArachnidTwo", "--json")
+        self.assertEqual(proc_upd.returncode, 0, proc_upd.stderr)
+        upd_data = json.loads(proc_upd.stdout)
+        self.assertTrue(upd_data["updated"])
+        self.assertEqual(upd_data["platform"], "macos")
+
+        m_after = read_package_manifest(dest / MANIFEST_FILENAME)
+        self.assertEqual(m_after["platform"], "macos")
 
     def test_uninstall_fails_on_exit_zero_removal_or_lock_error(self) -> None:
         dest = self.root / "games" / "UninstallFail"
