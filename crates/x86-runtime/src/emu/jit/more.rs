@@ -240,6 +240,7 @@ impl Tr<'_> {
     fn emit_cpuid(&mut self, k: usize) {
         self.flush_flags(self.live[k]);
         self.fs.host = 0;
+        self.flush_ymm_dirty();
         if self.xpin {
             self.a.bl_to(self.spill_xmm);
         }
@@ -307,6 +308,9 @@ impl Tr<'_> {
         self.a.mov_rr(true, T2, a); // x2 = guest area address
         if self.xpin {
             self.a.bl_to(self.spill_xmm);
+            for i in 0..4u32 {
+                self.a.stp_q(8 + 2 * i, 9 + 2 * i, XCPU, (OFF_YMM_HI + 32 * i) as i32);
+            }
         }
         for i in 0..8 {
             self.a.stp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
@@ -346,9 +350,6 @@ impl Tr<'_> {
         if self.ras_miss != 0 {
             self.a.ldr(64, XRAS, XCPU, OFF_RAS);
         }
-        if self.xpin {
-            self.a.bl_to(self.reload_xmm);
-        }
         if op.w & crate::emu::xstate::XS_FLAG_RESTORE != 0 {
             self.a.ldr(16, XS, XCPU, OFF_YMM_DIRTY);
             self.a.addsub_ri(false, true, true, ZR, XS, 0, false);
@@ -358,6 +359,9 @@ impl Tr<'_> {
             self.x87_top_known = None;
             self.x87_top_dirty = false;
             self.x87_sw_top_dirty = false;
+        }
+        if self.xpin {
+            self.a.bl_to(self.reload_xmm);
         }
     }
 
@@ -379,6 +383,9 @@ impl Tr<'_> {
                     self.flush_ymm_dirty_mask(c.ymm_dirty_pending);
                     if self.xpin {
                         self.a.bl_to(self.spill_xmm);
+                        for i in 0..4u32 {
+                            self.a.stp_q(8 + 2 * i, 9 + 2 * i, XCPU, (OFF_YMM_HI + 32 * i) as i32);
+                        }
                     }
                     for i in 0..8 {
                         self.a.stp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
@@ -989,6 +996,7 @@ impl Tr<'_> {
                         // (`guest_entropy_raw` -> `EntropyResult { val: x0, ok: x1 }`), zero
                         // static AOT relocations. Intel SDM: on success `dst = val`, `CF = 1`;
                         // on failure `dst = 0`, `CF = 0`; `OF = SF = ZF = AF = PF = 0` always.
+                        self.flush_ymm_dirty();
                         self.a.addsub_ri(true, true, false, 31, 31, 96, false);
                         self.a.stp_x(XRAS, XBUD, 31, 0);
                         self.a.stp_x(9, 10, 31, 16);
@@ -1001,6 +1009,7 @@ impl Tr<'_> {
                         self.a.ldr(64, XA, XCPU, OFF_ENTROPY_FN);
                         self.a.call_with_host_fpcr(80);
                         self.a.ldr(64, XCPU, 31, 64);
+                        self.a.ldr(64, XBUD, 31, 8);
                         if self.reload_xmm != 0 {
                             self.a.bl_to(self.reload_xmm);
                         }

@@ -433,6 +433,7 @@ impl Tr<'_> {
     /// `XA = helper_fn_ptr`. Preserves guest GPRs, `XCPU`, `XBUD`, `XRAS`, `v16..v31`, `NZCV`.
     fn emit_call_x87_helper(&mut self, helper_off: u32) {
         self.xa_key = None;
+        self.flush_ymm_dirty();
         self.a.ldr(64, T0, XCPU, OFF_X87_STATE);
         self.a.ldr(64, XA, XCPU, OFF_X87_HELPERS);
         self.a.ldr(64, XA, XA, helper_off);
@@ -1901,6 +1902,7 @@ impl Tr<'_> {
             self.a.call_with_host_fpcr(88);
             if self.xpin {
                 self.a.ldr(64, XCPU, 31, 64);
+                self.a.ldr(64, XBUD, 31, 8);
                 self.a.bl_to(self.reload_xmm);
             }
             self.a.ldr(64, XS, 31, 80);
