@@ -904,8 +904,14 @@ impl CommandList {
         let output_usage = scaler.output_usage;
         let has_fence = scaler.has_fence();
         let has_scratch_blit = scratch.is_some();
-        let (mfx_fence, pre_sync, was_full) =
-            self.sync_queue_before_metalfx(output_usage, has_fence, tight_stages);
+        let (mfx_fence, pre_sync, was_full) = self.sync_queue_before_metalfx(
+            output_usage,
+            has_fence,
+            tight_stages,
+            pt::synth::METALFX_TEMPORAL,
+            w,
+            h,
+        );
         let used_fence = params.fence.or(mfx_fence.as_deref());
         let effective_has_fence = has_fence && used_fence.is_some();
 
@@ -960,6 +966,9 @@ impl CommandList {
         output_usage: MTLTextureUsage,
         has_fence: bool,
         tight_stages: bool,
+        pt_shader: u64,
+        pt_w: u32,
+        pt_h: u32,
     ) -> (Option<Retained<ProtocolObject<dyn MTLFence>>>, StageSync, bool) {
         if !self.icb.icb_segs.is_empty() {
             self.flush_draw_batch(false);
@@ -974,6 +983,7 @@ impl CommandList {
         let was_full = self.bar.needs_barrier;
         let need_all_before =
             !masked || was_full || self.bar.list_unwaited_cs || self.bar.list_unwaited_gfx;
+        let ml_sync: u8 = if need_all_before { 2 } else { 1 };
         let pending_wait = self.pending_mfx_wait_fence.take();
         self.pending_mfx_wait_stages = MTLStages::empty();
 
@@ -1018,6 +1028,16 @@ impl CommandList {
                     prod_before,
                     MTL4VisibilityOptions::Device,
                 );
+                if let Some(i) = self.pt.as_mut().and_then(|p| p.close()) {
+                    self.pt_stamp(i, true);
+                }
+                if let Some(i) = self
+                    .pt
+                    .as_mut()
+                    .and_then(|p| p.open_ml(pt_shader, pt_w, pt_h, ml_sync))
+                {
+                    self.pt_stamp(i, true);
+                }
                 self.end_encoder();
             }
             Encoder::Render(e) => {
@@ -1062,6 +1082,16 @@ impl CommandList {
                     prod_before,
                     MTL4VisibilityOptions::Device,
                 );
+                if let Some(i) = self.pt.as_mut().and_then(|p| p.close()) {
+                    self.pt_stamp(i, true);
+                }
+                if let Some(i) = self
+                    .pt
+                    .as_mut()
+                    .and_then(|p| p.open_ml(pt_shader, pt_w, pt_h, ml_sync))
+                {
+                    self.pt_stamp(i, true);
+                }
                 self.end_encoder();
             }
             Encoder::None => {
@@ -1095,7 +1125,30 @@ impl CommandList {
                         prod_before,
                         MTL4VisibilityOptions::Device,
                     );
+                    if self.pt.is_none() && self.pt_armed {
+                        self.pt = pt::PassLog::acquire();
+                        self.pt_armed = false;
+                    }
+                    if let Some(p) = self.pt.as_mut() {
+                        if p.has_pending_ml() {
+                            // Two consecutive direct-output MetalFX scalers separated only by
+                            // a 0-dispatch compute encoder have no valid AGX boundary timestamp
+                            // between them; discard the pending pass (which also suppresses
+                            // starting the chained pass so neither is misattributed).
+                            p.discard_ml();
+                        } else if let Some(i) = p.open_ml(pt_shader, pt_w, pt_h, ml_sync) {
+                            unsafe {
+                                e.writeTimestampWithGranularity_intoHeap_atIndex(
+                                    MTL4TimestampGranularity::Relaxed,
+                                    p.heap(),
+                                    i,
+                                );
+                            }
+                        }
+                    }
                     e.endEncoding();
+                } else if let Some(p) = self.pt.as_mut() {
+                    p.discard_ml();
                 }
             }
         }
@@ -1244,6 +1297,12 @@ impl CommandList {
                 && !legacy_barriers()
                 && barrier_masks();
             let before_q = if scoped { UTIL_STAGES } else { MTLStages::All };
+            if let Some(p) = self.pt.as_mut() {
+                // This fallback fence-flush compute encoder has 0 dispatches (its relaxed
+                // timestamp resolves to 0 on AGX), so discard any trailing pending ML pass
+                // rather than stamping an invalid endpoint.
+                p.discard_ml();
+            }
             if let Some(e) = self.cb.computeCommandEncoder() {
                 e.waitForFence_beforeEncoderStages(&f, MTLStages::Dispatch);
                 if scoped {
@@ -1344,7 +1403,11 @@ impl CommandList {
             }
             MetalFxPostSync::FullFallback => {
                 self.pending_mfx_wait_fence = fence.map(|f| f.retain());
-                self.pending_mfx_wait_stages = UTIL_STAGES;
+                self.pending_mfx_wait_stages = if fence.is_some() {
+                    UTIL_STAGES
+                } else {
+                    MTLStages::empty()
+                };
                 self.pending_mfx_after = MTLStages::All;
                 self.pending_mfx_cross_enc_released = false;
                 self.bar.stage_sync = [StageSync::default(); 7];
@@ -1870,8 +1933,14 @@ impl CommandList {
         let output_usage = scaler.output_usage;
         let has_fence = scaler.has_fence();
         let has_scratch_blit = scratch.is_some();
-        let (mfx_fence, pre_sync, was_full) =
-            self.sync_queue_before_metalfx(output_usage, has_fence, tight_stages);
+        let (mfx_fence, pre_sync, was_full) = self.sync_queue_before_metalfx(
+            output_usage,
+            has_fence,
+            tight_stages,
+            pt::synth::METALFX_SPATIAL,
+            w,
+            h,
+        );
         let effective_has_fence = has_fence && mfx_fence.is_some();
 
         let mfx_src: &MtlTexture = staged_src.as_deref().unwrap_or(sv);

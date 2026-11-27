@@ -617,6 +617,30 @@ impl CommandList {
             self.pt = pt::PassLog::acquire();
             self.pt_armed = false;
         }
+        if self.pt.as_ref().is_some_and(|p| p.has_pending_ml()) {
+            // Only close an opaque ML interval when this encoder's opening timestamp stage
+            // (`Vertex` for Render, start-of-encoder for Compute) actually synchronized with
+            // MetalFX. When a post-MetalFX render pass intentionally uses a Fragment-only
+            // fence wait (leaving `MTLStages::Vertex` pending so Vertex overlaps MetalFX),
+            // discard the pending ML interval rather than recording an unsynchronized endpoint.
+            let ml_synced = match &self.enc {
+                Encoder::Render(_) => {
+                    (self.pending_mfx_wait_fence.is_none() || self.pending_mfx_cross_enc_released)
+                        && !self.pending_mfx_wait_stages.contains(MTLStages::Vertex)
+                }
+                Encoder::Compute(_) => {
+                    self.pending_mfx_wait_fence.is_none() || self.pending_mfx_cross_enc_released
+                }
+                Encoder::None => false,
+            };
+            if ml_synced {
+                if let Some(end_idx) = self.pt.as_mut().and_then(|p| p.close_ml()) {
+                    self.pt_stamp(end_idx, false);
+                }
+            } else if let Some(p) = self.pt.as_mut() {
+                p.discard_ml();
+            }
+        }
         let a = self.bar.enc_sync_after;
         let sync = if a.is_empty() {
             0

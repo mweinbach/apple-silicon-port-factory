@@ -39,11 +39,12 @@ pub mod kind {
     pub const CLEAR: u8 = 1;
     pub const UTIL: u8 = 2;
     pub const COMPUTE: u8 = 3;
-    pub const COUNT: usize = 4;
-    pub const NAMES: [&str; COUNT] = ["draw", "clear", "util", "compute"];
+    pub const ML: u8 = 4;
+    pub const COUNT: usize = 5;
+    pub const NAMES: [&str; COUNT] = ["draw", "clear", "util", "compute", "ml"];
 }
 
-/// Synthetic shader keys for internal utility / copy / clear / RT encoders
+/// Synthetic shader keys for internal utility / copy / clear / RT / ML encoders
 /// that do not bind a converted DXIL game shader (previously logged as `0`).
 pub mod synth {
     pub const CLEAR_CS: u64 = 0xffff_ff00_0000_0001;
@@ -56,6 +57,8 @@ pub mod synth {
     pub const CLEAR_PASS: u64 = 0xffff_ff00_0000_0008;
     pub const RESOLVE: u64 = 0xffff_ff00_0000_0009;
     pub const FILL_OCCL: u64 = 0xffff_ff00_0000_000a;
+    pub const METALFX_TEMPORAL: u64 = 0xffff_ff00_0000_000b;
+    pub const METALFX_SPATIAL: u64 = 0xffff_ff00_0000_000c;
 
     pub fn name(key: u64) -> Option<&'static str> {
         match key {
@@ -69,6 +72,8 @@ pub mod synth {
             CLEAR_PASS => Some("aw2:clear_pass"),
             RESOLVE => Some("aw2:resolve"),
             FILL_OCCL => Some("aw2:fill_occl"),
+            METALFX_TEMPORAL => Some("port:metalfx_temporal"),
+            METALFX_SPATIAL => Some("port:metalfx_spatial"),
             _ => None,
         }
     }
@@ -218,9 +223,27 @@ pub(crate) fn dedicated_heap_pool_counts() -> Option<(usize, usize)> {
 pub struct PassLog {
     slice: u32,
     metas: Vec<PassMeta>,
+    /// Start-slot offset within the slice (`0, 2, 4, ...`) for each entry in
+    /// `metas`; decoupled from `metas.len()` so discarded ML timestamp slots are
+    /// never reused within the same recording.
+    slots: Vec<u16>,
     cur: PassMeta,
+    /// Start-slot offset within the slice reserved for the currently open encoder.
+    cur_slot: u16,
     /// The open encoder has a start timestamp.
     open: bool,
+    /// Opaque MetalFX / ML pass bracketed between the pre-sync encoder's end
+    /// timestamp and the next encoder's opening timestamp (zero extra encoders),
+    /// paired with its reserved start-slot offset within the slice.
+    pending_ml: Option<(PassMeta, u16)>,
+    /// True if an ML pass was discarded with no intervening timed encoder yet;
+    /// prevents a back-to-back scaler on `Encoder::None` from falsely bracketing
+    /// back across the discarded scaler to `st.last_end`.
+    prev_discarded_ml: bool,
+    /// Monotonically advancing counter-heap slot cursor within this slice (always
+    /// a multiple of 2). Never rolled back on `discard_ml()`, preventing unordered
+    /// GPU writes from racing on a reused slot and tracking the dirty range for `Drop`.
+    next_slot: usize,
     overflow: u32,
     /// Submission ordinal of the list within its frame.
     ord: u32,
@@ -282,7 +305,23 @@ impl PassLog {
             NO_SLICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         };
-        Some(PassLog { slice, metas: Vec::with_capacity(64), cur: PassMeta::default(), open: false, overflow: 0, ord: 0, t_ecl: 0, t_commit: 0, queue: 0, wait: 0 })
+        Some(PassLog {
+            slice,
+            metas: Vec::with_capacity(64),
+            slots: Vec::with_capacity(64),
+            cur: PassMeta::default(),
+            cur_slot: 0,
+            open: false,
+            pending_ml: None,
+            prev_discarded_ml: false,
+            next_slot: 0,
+            overflow: 0,
+            ord: 0,
+            t_ecl: 0,
+            t_commit: 0,
+            queue: 0,
+            wait: 0,
+        })
     }
 
     pub fn heap(&self) -> &'static MtlCounterHeap {
@@ -308,14 +347,18 @@ impl PassLog {
     /// An encoder opened: heap index for its start timestamp (None when the
     /// slice is full).
     pub fn open(&mut self, kind: u8, sync: u8) -> Option<usize> {
+        self.prev_discarded_ml = false;
         self.cur = PassMeta { kind, sync, ..PassMeta::default() };
-        let k = self.metas.len();
-        self.open = 2 * k + 1 < SLICE;
-        if !self.open {
+        if self.next_slot + 2 > SLICE {
+            self.open = false;
             self.overflow += 1;
             return None;
         }
-        Some(self.base() + 2 * k)
+        let slot = self.next_slot;
+        self.next_slot += 2;
+        self.cur_slot = slot as u16;
+        self.open = true;
+        Some(self.base() + slot)
     }
 
     pub fn cur(&mut self) -> &mut PassMeta {
@@ -332,16 +375,74 @@ impl PassLog {
         if !std::mem::take(&mut self.open) {
             return None;
         }
-        let k = self.metas.len();
         self.metas.push(self.cur);
-        Some(self.base() + 2 * k + 1)
+        self.slots.push(self.cur_slot);
+        Some(self.base() + self.cur_slot as usize + 1)
+    }
+
+    /// Begin timing an opaque MetalFX / ML pass encoded directly on the command buffer:
+    /// returns the start-timestamp heap index to stamp on the pre-sync encoder right before
+    /// `endEncoding()`. Must be called when no regular encoder pass is open (`!self.open`)
+    /// and no prior ML pass is still pending or was just discarded without an intervening
+    /// timed encoder.
+    pub fn open_ml(&mut self, shader: u64, w: u32, h: u32, sync: u8) -> Option<usize> {
+        if self.open || self.pending_ml.is_some() || self.prev_discarded_ml {
+            return None;
+        }
+        if self.next_slot + 2 > SLICE {
+            self.overflow += 1;
+            return None;
+        }
+        let slot = self.next_slot;
+        self.next_slot += 2;
+        self.pending_ml = Some((
+            PassMeta {
+                kind: kind::ML,
+                sync,
+                dispatches: 1,
+                w,
+                h,
+                shader,
+                ..PassMeta::default()
+            },
+            slot as u16,
+        ));
+        Some(self.base() + slot)
+    }
+
+    /// True when an opaque MetalFX / ML pass is currently open and awaiting a
+    /// synchronized post-MetalFX endpoint timestamp.
+    #[inline]
+    pub fn has_pending_ml(&self) -> bool {
+        self.pending_ml.is_some()
+    }
+
+    /// Discard a pending opaque MetalFX / ML pass without emitting a `PassMeta`
+    /// (used when no synchronized endpoint timestamp exists without splitting or
+    /// adding GPU work, e.g. a Fragment-only Render wait or consecutive direct-output
+    /// MetalFX scalers separated only by a 0-dispatch sync encoder). Its reserved
+    /// counter-heap slots remain consumed so no subsequent pass can race with the
+    /// already-encoded start timestamp write.
+    pub fn discard_ml(&mut self) {
+        if self.pending_ml.take().is_some() {
+            self.prev_discarded_ml = true;
+        }
+    }
+
+    /// Finish timing a pending opaque MetalFX / ML pass on the next encoder's opening
+    /// (after its `waitForFence`): returns the end-timestamp heap index to stamp.
+    pub fn close_ml(&mut self) -> Option<usize> {
+        let (meta, slot) = self.pending_ml.take()?;
+        self.metas.push(meta);
+        self.slots.push(slot);
+        Some(self.base() + slot as usize + 1)
     }
 }
 
 impl Drop for PassLog {
     fn drop(&mut self) {
         if let Some(s) = shared() {
-            let used = (2 * self.metas.len() + usize::from(self.open) * 2).min(SLICE);
+            let used = self.next_slot.min(SLICE);
             let mut pool = s.pool.lock().unwrap();
             if let Some(h) = pool.release_slice(self.slice, used) {
                 unsafe { s.heaps[h].invalidateCounterRange(NSRange::new(0, HEAP_ENTRIES)) };
@@ -437,6 +538,7 @@ fn resolve_slice_into(
     st.agg.lists += 1;
     let isolate_copy_q = copy_light && queue == 3;
     let mut prev_kind: Option<usize> = None;
+    let mut prev_pass_end: u64 = 0;
     for (i, m) in metas.iter().enumerate() {
         let (mut s, mut e) = (ts[2 * i], ts[2 * i + 1]);
         // On Apple TBDR, a render pass that closed with 0 draws/ICBs may never
@@ -446,7 +548,10 @@ fn resolve_slice_into(
         // boundary endpoint. Coalesce the missing endpoint rather than dropping
         // the pass as `bad`.
         let valid = |t: u64| t != 0 && t < u64::MAX - 1;
-        let zero_work_coalesce = (m.kind != kind::COMPUTE && m.draws == 0 && m.icb == 0)
+        let zero_work_coalesce = (m.kind != kind::COMPUTE
+            && m.kind != kind::ML
+            && m.draws == 0
+            && m.icb == 0)
             || (m.draws == 0 && m.dispatches == 0 && m.icb == 0);
         if zero_work_coalesce {
             if !valid(s) && valid(e) {
@@ -455,10 +560,21 @@ fn resolve_slice_into(
                 e = s;
             }
         }
+        if m.kind == kind::ML {
+            if !valid(s) && valid(e) && valid(prev_pass_end) && prev_pass_end <= e {
+                // Pre-MetalFX sync ran on a 0-dispatch compute encoder whose relaxed
+                // timestamp resolved to 0 on AGX; bracket from the immediately preceding
+                // valid encoder's end in this same recording (never across submissions
+                // or skipped bad passes).
+                s = prev_pass_end;
+            }
+        }
         if !valid(s) || !valid(e) || e < s {
             st.agg.bad += 1;
+            prev_pass_end = 0;
             continue;
         }
+        prev_pass_end = e;
         let k = (m.kind as usize).min(kind::COUNT - 1);
         let dur = ns(e - s);
         let q_idx = (queue as usize) & 3;
@@ -531,17 +647,34 @@ fn resolve_slice_into(
     }
 }
 
+fn pack_pass_timestamps(slots: &[u16], raw_ts: &[u64]) -> Vec<u64> {
+    let mut ts = Vec::with_capacity(slots.len() * 2);
+    for &slot in slots {
+        let idx = slot as usize;
+        if idx + 1 < raw_ts.len() {
+            ts.push(raw_ts[idx]);
+            ts.push(raw_ts[idx + 1]);
+        } else {
+            ts.push(0);
+            ts.push(0);
+        }
+    }
+    ts
+}
+
 fn resolve_into(st: &mut State, logs: &[PassLog], copy_light: bool) {
     let freq = super::query::timestamp_frequency().max(1) as u128;
     for log in logs {
         st.agg.overflow += log.overflow as u64;
         let n = log.metas.len();
-        if n == 0 {
+        let n_slots = log.next_slot.min(SLICE);
+        if n == 0 || n_slots == 0 {
             continue;
         }
-        let Some(data) = (unsafe { log.heap().resolveCounterRange(NSRange::new(log.base(), 2 * n)) }) else { continue };
+        let Some(data) = (unsafe { log.heap().resolveCounterRange(NSRange::new(log.base(), n_slots)) }) else { continue };
         let bytes = data.to_vec();
-        let ts: Vec<u64> = bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        let raw_ts: Vec<u64> = bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        let ts = pack_pass_timestamps(&log.slots, &raw_ts);
         resolve_slice_into(st, log.ord, log.queue, log.wait, log.t_ecl, log.t_commit, &log.metas, &ts, copy_light, freq);
     }
 }
@@ -923,5 +1056,158 @@ mod tests {
         std::env::set_var("AW2_PASS_TIMING", "1");
         assert!(enabled_from_env());
         assert!(!split_from_env());
+    }
+
+    #[test]
+    fn ml_pass_accounts_gpu_busy_and_flags_inverted_timestamps_honestly() {
+        let freq = 1_000_000_000_u128;
+        let metas = [
+            PassMeta {
+                kind: kind::COMPUTE,
+                sync: 1,
+                dispatches: 2,
+                shader: 0x100,
+                ..Default::default()
+            },
+            PassMeta {
+                kind: kind::ML,
+                sync: 1,
+                dispatches: 1,
+                w: 1440,
+                h: 810,
+                shader: synth::METALFX_TEMPORAL,
+                ..Default::default()
+            },
+            PassMeta {
+                kind: kind::COMPUTE,
+                sync: 1,
+                dispatches: 1,
+                shader: 0x200,
+                ..Default::default()
+            },
+            // Inverted ML timestamps (e < s) must NOT be silently clamped to 0.
+            PassMeta {
+                kind: kind::ML,
+                sync: 1,
+                dispatches: 1,
+                w: 1440,
+                h: 810,
+                shader: synth::METALFX_SPATIAL,
+                ..Default::default()
+            },
+        ];
+        // Pre-compute: [1000, 1500], ML temporal (0-dispatch pre-sync start=0 -> bracketed from
+        // prev_end=1500 to 3500), post-compute: [3500, 4000], inverted ML spatial: [4000, 3900]
+        // -> honestly flagged as bad == 1.
+        let ts = [1000, 1500, 0, 3500, 3500, 4000, 4000, 3900];
+        let mut st = State { agg: Agg::default(), last_end: 0, last_end_by_q: [0; 4] };
+        resolve_slice_into(&mut st, 0, 0, 0, 900, 950, &metas, &ts, false, freq);
+
+        assert_eq!(st.agg.bad, 1);
+        assert_eq!(st.agg.kind_dur[kind::ML as usize], 2000);
+        assert_eq!(st.agg.kind_excl[kind::ML as usize], 2000);
+        assert_eq!(st.agg.kind_n[kind::ML as usize], 1);
+        assert_eq!(st.agg.busy, 3000);
+        assert_eq!(st.agg.sync_gap[1], 0);
+        assert_eq!(synth::name(synth::METALFX_TEMPORAL), Some("port:metalfx_temporal"));
+        assert_eq!(synth::name(synth::METALFX_SPATIAL), Some("port:metalfx_spatial"));
+
+        // A new submission starting with an ML pass whose 0-dispatch pre-sync start resolved
+        // to 0 must NOT backfill from the previous submission's `st.last_end` (which would
+        // absorb inter-submission idle time into ML duration and busy time).
+        let ml_only = [PassMeta {
+            kind: kind::ML,
+            sync: 1,
+            dispatches: 1,
+            w: 1440,
+            h: 810,
+            shader: synth::METALFX_TEMPORAL,
+            ..Default::default()
+        }];
+        resolve_slice_into(&mut st, 1, 0, 0, 5_000, 5_100, &ml_only, &[0, 8_000], false, freq);
+        assert_eq!(st.agg.bad, 2);
+        assert_eq!(st.agg.kind_dur[kind::ML as usize], 2000);
+        assert_eq!(st.agg.kind_n[kind::ML as usize], 1);
+        assert_eq!(st.agg.busy, 3000);
+
+        // An ML pass with missing start immediately after a bad pass in the same list must
+        // likewise NOT backfill across the skipped bad pass.
+        let after_bad = [
+            PassMeta {
+                kind: kind::COMPUTE,
+                sync: 1,
+                dispatches: 1,
+                shader: 0x300,
+                ..Default::default()
+            },
+            PassMeta {
+                kind: kind::COMPUTE,
+                sync: 1,
+                dispatches: 1,
+                shader: 0x301,
+                ..Default::default()
+            },
+            PassMeta {
+                kind: kind::ML,
+                sync: 1,
+                dispatches: 1,
+                w: 1440,
+                h: 810,
+                shader: synth::METALFX_SPATIAL,
+                ..Default::default()
+            },
+        ];
+        resolve_slice_into(
+            &mut st,
+            2,
+            0,
+            0,
+            9_000,
+            9_100,
+            &after_bad,
+            &[10_000, 10_500, 0, 0, 0, 12_000],
+            false,
+            freq,
+        );
+        assert_eq!(st.agg.bad, 4);
+        assert_eq!(st.agg.kind_dur[kind::ML as usize], 2000);
+        assert_eq!(st.agg.kind_n[kind::ML as usize], 1);
+        assert_eq!(st.agg.busy, 3500);
+    }
+
+    #[test]
+    fn discard_ml_drops_unsynchronized_span_blocks_chained_ml_and_reserves_slots() {
+        let Some(mut log) = PassLog::acquire() else {
+            return;
+        };
+        let ml0_s = log.open_ml(synth::METALFX_TEMPORAL, 1440, 810, 1).expect("ml0_s");
+        assert!(log.has_pending_ml());
+        assert_eq!(log.next_slot, 2);
+        log.discard_ml();
+        assert!(!log.has_pending_ml());
+        assert!(log.metas.is_empty());
+        assert!(log.slots.is_empty());
+        assert_eq!(log.next_slot, 2);
+        assert!(log.close_ml().is_none());
+        // A back-to-back scaler without an intervening timed encoder must not open an ML span
+        // (its 0-dispatch start would otherwise falsely bracket back across the discarded pass).
+        assert!(log.open_ml(synth::METALFX_SPATIAL, 1440, 810, 1).is_none());
+        assert_eq!(log.next_slot, 2);
+        // Opening a regular timed encoder MUST NOT reuse the discarded ML pass's slot index
+        // (prevents an earlier Fragment timestamp write from racing with the new pass's start).
+        let cs_s = log.open(kind::COMPUTE, 1).expect("cs_s");
+        assert_eq!(cs_s, ml0_s + 2);
+        let cs_e = log.close().expect("cs_e");
+        assert_eq!(cs_e, ml0_s + 3);
+        let ml1_s = log.open_ml(synth::METALFX_SPATIAL, 1440, 810, 1).expect("ml1_s");
+        assert_eq!(ml1_s, ml0_s + 4);
+        let ml1_e = log.close_ml().expect("ml1_e");
+        assert_eq!(ml1_e, ml0_s + 5);
+        assert_eq!(log.next_slot, 6);
+        assert_eq!(log.metas.len(), 2);
+        assert_eq!(log.slots, vec![2, 4]);
+        // Packing resolved counter-heap timestamps must skip the reserved discarded pair [0, 1].
+        let raw_ts = [999, 0, 1_000, 1_500, 1_500, 3_500];
+        assert_eq!(pack_pass_timestamps(&log.slots, &raw_ts), vec![1_000, 1_500, 1_500, 3_500]);
     }
 }

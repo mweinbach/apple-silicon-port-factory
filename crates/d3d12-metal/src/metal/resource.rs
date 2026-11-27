@@ -159,7 +159,7 @@ pub(crate) struct BufVaCache {
     last: BufVaEntry,
     mru_cursor: usize,
     mru: [BufVaEntry; 4],
-    page: [BufVaEntry; 256],
+    page: [BufVaEntry; 512],
 }
 
 impl BufVaCache {
@@ -168,7 +168,7 @@ impl BufVaCache {
             last: BufVaEntry::EMPTY,
             mru_cursor: 0,
             mru: [BufVaEntry::EMPTY; 4],
-            page: [BufVaEntry::EMPTY; 256],
+            page: [BufVaEntry::EMPTY; 512],
         }
     }
 
@@ -178,7 +178,7 @@ impl BufVaCache {
 
     #[inline(always)]
     fn page_slot(va: u64) -> usize {
-        (((va >> 16) ^ (va >> 24)) as usize) & 255
+        (((va >> 12) ^ (va >> 21)) as usize) & 511
     }
 
     #[inline(always)]
