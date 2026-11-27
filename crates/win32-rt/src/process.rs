@@ -538,11 +538,92 @@ pub fn merge_manifest_args(cmdline: &str) -> String {
 pub fn init(mut cfg: ProcessConfig) {
     cfg.cmdline = merge_manifest_args(&cfg.cmdline);
     let _ = CONFIG.set(cfg);
+    // Begin an NSProcessInfo latency-critical activity so macOS/iOS does not apply App Nap,
+    // aggressive timer coalescing, or background E-core throttling to the running game.
+    begin_latency_critical_activity();
     // D3D12 API trace (d3d12_metal::trace): flush buffered records at exit.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     register_exit_hook(d3d12_metal::trace::flush);
     // Global stub registry: emit ranked stub summary table (and optional JSON/diff) at exit.
     register_exit_hook(crate::stub_registry::log_exit_summary);
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+struct LatencyActivityToken(
+    objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
+);
+
+// Foundation documents NSProcessInfo activity tokens as thread-safe opaque objects returned
+// by `beginActivityWithOptions:reason:` and passed back to `endActivity:`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe impl Send for LatencyActivityToken {}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static LATENCY_ACTIVITY: Mutex<Option<LatencyActivityToken>> = Mutex::new(None);
+
+fn latency_critical_enabled() -> bool {
+    match std::env::var("PORT_LATENCY_CRITICAL") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Acquire a process-wide `NSProcessInfo` latency-critical activity
+/// (`NSActivityLatencyCritical | NSActivityUserInitiated`) unless opted out via
+/// `PORT_LATENCY_CRITICAL=0`. Idempotent; returns `true` when an activity token is active.
+pub fn begin_latency_critical_activity() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        if !latency_critical_enabled() {
+            return false;
+        }
+        let mut guard = LATENCY_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return true;
+        }
+        use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+        let opts = NSActivityOptions::LatencyCritical | NSActivityOptions::UserInitiated;
+        let reason = NSString::from_str("Windows game runtime latency-critical execution");
+        let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(opts, &reason);
+        *guard = Some(LatencyActivityToken(token));
+        log::info!("process: acquired NSProcessInfo latency-critical activity");
+        true
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        false
+    }
+}
+
+/// Release the process-wide `NSProcessInfo` latency-critical activity, if active.
+pub fn end_latency_critical_activity() {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let token = LATENCY_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(LatencyActivityToken(obj)) = token {
+            unsafe {
+                objc2_foundation::NSProcessInfo::processInfo().endActivity(&obj);
+            }
+        }
+    }
+}
+
+/// Returns `true` if the `NSProcessInfo` latency-critical activity is currently held.
+pub fn is_latency_critical_active() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        LATENCY_ACTIVITY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -850,20 +931,172 @@ pub fn env_block_a() -> *mut u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Host info
+// Host info & unified guest CPU topology
 // ---------------------------------------------------------------------------
 
+/// Unified host/guest CPU topology snapshot shared across `process::num_cpus()`,
+/// Win32 `GetSystemInfo` / `GetLogicalProcessorInformation*` / `GetSystemCpuSetInformation`,
+/// `NtQuerySystemInformation`, and guest x86-64 `CPUID` topology leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuTopology {
+    /// Host total logical CPUs (`1..=64`).
+    pub host_logical: u32,
+    /// Host performance (P) cores (`1..=host_logical`).
+    pub host_p_cores: u32,
+    /// Host efficiency (E) cores (`host_logical - host_p_cores`).
+    pub host_e_cores: u32,
+    /// Effective logical CPUs exposed to the Windows guest (`1..=64`).
+    pub guest_logical: u32,
+    /// Effective performance (P) cores exposed to the guest (`1..=guest_logical`).
+    pub guest_p_cores: u32,
+    /// Effective efficiency (E) cores exposed to the guest (`guest_logical - guest_p_cores`).
+    pub guest_e_cores: u32,
+    /// L1 data cache size per core in bytes.
+    pub l1d_bytes: u32,
+    /// L1 instruction cache size per core in bytes.
+    pub l1i_bytes: u32,
+    /// Shared L2 cache size in bytes.
+    pub l2_bytes: u32,
+    /// Shared L3 / SLC cache size in bytes.
+    pub l3_bytes: u32,
+    /// Cache line size in bytes (power of two, 64..=128).
+    pub cache_line_bytes: u32,
+}
+
+fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
+    let mut v: u32 = 0;
+    let mut sz = std::mem::size_of::<u32>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut v as *mut u32).cast::<std::ffi::c_void>(),
+            &mut sz,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then_some(v)
+}
+
+/// Resolve `(guest_logical, guest_p_cores, guest_e_cores)` from host core counts and
+/// configuration overrides with strict precedence:
+/// `PORT_NUM_CPUS > PORT_CPU_MODE / [cpu] mode + max_cores > default ("all")`.
+pub fn resolve_cpu_counts(
+    host_logical: u32,
+    host_p_cores: u32,
+    num_cpus_override: Option<u32>,
+    cpu_mode: Option<&str>,
+    max_cores: Option<u32>,
+) -> (u32, u32, u32) {
+    let host_total = host_logical.clamp(1, 64);
+    let host_p = host_p_cores.clamp(1, host_total);
+    let max_cap = max_cores.filter(|&m| m >= 1).map(|m| m.min(64));
+
+    let guest_logical = if let Some(n) = num_cpus_override.filter(|&n| n >= 1) {
+        n.min(64)
+    } else {
+        match cpu_mode.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("p_cores" | "p-cores" | "pcores") => {
+                max_cap.map_or(host_p, |cap| host_p.min(cap))
+            }
+            Some("cap") => max_cap.map_or(host_p, |cap| host_total.min(cap)),
+            _ => max_cap.map_or(host_total, |cap| host_total.min(cap)),
+        }
+    };
+
+    let guest_p = host_p.min(guest_logical);
+    let guest_e = guest_logical - guest_p;
+    (guest_logical, guest_p, guest_e)
+}
+
+fn detect_cpu_topology() -> CpuTopology {
+    let host_logical = sysctl_u32(c"hw.logicalcpu")
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .map(|n| n.get() as u32)
+        })
+        .unwrap_or(4)
+        .clamp(1, 64);
+    let host_p_cores = sysctl_u32(c"hw.perflevel0.logicalcpu")
+        .unwrap_or(host_logical)
+        .clamp(1, host_logical);
+    let host_e_cores = host_logical - host_p_cores;
+
+    let num_cpus_override = std::env::var("PORT_NUM_CPUS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1);
+    let cpu_mode = std::env::var("PORT_CPU_MODE")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let max_cores = std::env::var("PORT_CPU_MAX_CORES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1);
+
+    let (guest_logical, guest_p_cores, guest_e_cores) = resolve_cpu_counts(
+        host_logical,
+        host_p_cores,
+        num_cpus_override,
+        cpu_mode.as_deref(),
+        max_cores,
+    );
+
+    let cache_line_bytes = sysctl_u32(c"hw.cachelinesize")
+        .filter(|&v| v >= 64 && v.is_power_of_two())
+        .unwrap_or(128)
+        .min(128);
+    let l1d_bytes = sysctl_u32(c"hw.perflevel0.l1dcachesize")
+        .or_else(|| sysctl_u32(c"hw.l1dcachesize"))
+        .filter(|&v| v >= 4096)
+        .unwrap_or(64 * 1024);
+    let l1i_bytes = sysctl_u32(c"hw.perflevel0.l1icachesize")
+        .or_else(|| sysctl_u32(c"hw.l1icachesize"))
+        .filter(|&v| v >= 4096)
+        .unwrap_or(128 * 1024);
+    let l2_bytes = sysctl_u32(c"hw.perflevel0.l2cachesize")
+        .or_else(|| sysctl_u32(c"hw.l2cachesize"))
+        .filter(|&v| v >= 64 * 1024)
+        .unwrap_or(16 * 1024 * 1024);
+    let l3_bytes = 32 * 1024 * 1024;
+
+    log::info!(
+        "cpu topology: guest={} ({}P+{}E), host={} ({}P+{}E), mode={}, max_cores={:?}, override={:?}",
+        guest_logical,
+        guest_p_cores,
+        guest_e_cores,
+        host_logical,
+        host_p_cores,
+        host_e_cores,
+        cpu_mode.as_deref().unwrap_or("all"),
+        max_cores,
+        num_cpus_override,
+    );
+
+    CpuTopology {
+        host_logical,
+        host_p_cores,
+        host_e_cores,
+        guest_logical,
+        guest_p_cores,
+        guest_e_cores,
+        l1d_bytes,
+        l1i_bytes,
+        l2_bytes,
+        l3_bytes,
+        cache_line_bytes,
+    }
+}
+
+/// Process-wide unified CPU topology queried by Win32 sysinfo, PEB/env, and guest CPUID.
+pub fn cpu_topology() -> CpuTopology {
+    static TOPO: OnceLock<CpuTopology> = OnceLock::new();
+    *TOPO.get_or_init(detect_cpu_topology)
+}
+
 pub fn num_cpus() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        let host = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
-        std::env::var("PORT_NUM_CPUS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|&n| n >= 1)
-            .map(|n| n.min(64))
-            .unwrap_or(host)
-    })
+    cpu_topology().guest_logical
 }
 
 pub fn active_processor_mask() -> usize {
@@ -1076,5 +1309,57 @@ mod tests {
             None => std::env::remove_var(late_key),
         }
         assert!(child_env.iter().all(|(k, _)| k != late_key));
+    }
+
+    #[test]
+    fn cpu_topology_resolution_precedence_and_chip_profiles() {
+        // M3 Ultra (24 P + 8 E = 32 logical)
+        assert_eq!(resolve_cpu_counts(32, 24, None, None, None), (32, 24, 8));
+        assert_eq!(resolve_cpu_counts(32, 24, None, Some("all"), None), (32, 24, 8));
+        assert_eq!(resolve_cpu_counts(32, 24, None, Some("p_cores"), None), (24, 24, 0));
+        assert_eq!(resolve_cpu_counts(32, 24, None, Some("p-cores"), Some(16)), (16, 16, 0));
+        assert_eq!(resolve_cpu_counts(32, 24, None, Some("cap"), Some(16)), (16, 16, 0));
+        assert_eq!(resolve_cpu_counts(32, 24, None, Some("cap"), Some(28)), (28, 24, 4));
+        assert_eq!(resolve_cpu_counts(32, 24, None, Some("cap"), None), (24, 24, 0));
+        // Implicit cap when only max_cores is provided without mode.
+        assert_eq!(resolve_cpu_counts(32, 24, None, None, Some(12)), (12, 12, 0));
+        // Explicit PORT_NUM_CPUS takes top precedence over mode and max_cores.
+        assert_eq!(resolve_cpu_counts(32, 24, Some(8), Some("all"), Some(16)), (8, 8, 0));
+        assert_eq!(resolve_cpu_counts(32, 24, Some(32), Some("p_cores"), Some(8)), (32, 24, 8));
+
+        // Base M-series (4 P + 4 E = 8 logical): default "all" preserves all 8 cores.
+        assert_eq!(resolve_cpu_counts(8, 4, None, None, None), (8, 4, 4));
+        assert_eq!(resolve_cpu_counts(8, 4, None, Some("p_cores"), None), (4, 4, 0));
+
+        // Clamping invariants (1..=64).
+        assert_eq!(resolve_cpu_counts(0, 0, None, None, None), (1, 1, 0));
+        assert_eq!(resolve_cpu_counts(128, 96, None, Some("all"), None), (64, 64, 0));
+        assert_eq!(resolve_cpu_counts(32, 24, Some(99), None, None), (64, 24, 40));
+    }
+
+    #[test]
+    fn latency_critical_activity_begin_and_end() {
+        let prev = std::env::var_os("PORT_LATENCY_CRITICAL");
+        end_latency_critical_activity();
+
+        std::env::set_var("PORT_LATENCY_CRITICAL", "0");
+        assert!(!begin_latency_critical_activity());
+        assert!(!is_latency_critical_active());
+
+        std::env::set_var("PORT_LATENCY_CRITICAL", "1");
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            assert!(begin_latency_critical_activity());
+            assert!(is_latency_critical_active());
+            // Idempotent re-entry keeps the token alive.
+            assert!(begin_latency_critical_activity());
+            end_latency_critical_activity();
+            assert!(!is_latency_critical_active());
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("PORT_LATENCY_CRITICAL", v),
+            None => std::env::remove_var("PORT_LATENCY_CRITICAL"),
+        }
     }
 }

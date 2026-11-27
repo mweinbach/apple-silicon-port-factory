@@ -231,11 +231,11 @@ pub unsafe extern "win64" fn SetThreadContext(h: HANDLE, ctx: *const c_void) -> 
 pub unsafe extern "win64" fn SetThreadPriority(h: HANDLE, prio: i32) -> BOOL {
     match thread_obj(h) {
         Some(t) => {
-            t.priority.store(prio, Ordering::Relaxed);
-            // Mach precedence importance (thread::sched::importance_for). The
-            // Wwise render thread additionally gets a time-constraint policy
-            // from the WASAPI render client (audio::audioclient), which is
-            // where its period is known; avrt.dll is not imported by the exe.
+            t.priority.store(prio, Ordering::Release);
+            // Mach precedence importance (thread::sched::importance_for) plus Darwin QoS
+            // (immediate self-QoS, or cross-thread QoS override + pending_qos handoff).
+            // The Wwise render thread additionally gets a time-constraint policy from the
+            // WASAPI render client (audio::audioclient), where its period is known.
             match thread::sched::apply_win_priority(&t, prio) {
                 Ok(()) => log::debug!("SetThreadPriority(tid 0x{:x}, {prio}) -> importance {}", t.tid.load(Ordering::Relaxed), thread::sched::importance_for(prio)),
                 Err(kr) => log::debug!("SetThreadPriority(tid 0x{:x}, {prio}): recorded, host policy not applied ({kr})", t.tid.load(Ordering::Relaxed)),
@@ -821,6 +821,7 @@ pub unsafe extern "win64" fn SwitchToFiber(fiber: *mut c_void) {
                 teb::install(resumed_teb);
             }
             thread::install_current_thread_context(resumed_obj);
+            thread::sched::flush_pending_qos();
         }
         FiberCmd::Exit { teb: exit_teb, thread_obj: exit_obj } => {
             if !exit_teb.is_null() {
@@ -1342,6 +1343,7 @@ fn wait_result_code(r: WaitResult) -> u32 {
 }
 
 pub unsafe extern "win64" fn WaitForSingleObjectEx(h: HANDLE, ms: u32, alertable: BOOL) -> u32 {
+    thread::sched::flush_pending_qos();
     if h == handles::CURRENT_PROCESS {
         // Waiting on our own process never completes.
         if ms == INFINITE {
@@ -1356,6 +1358,7 @@ pub unsafe extern "win64" fn WaitForSingleObjectEx(h: HANDLE, ms: u32, alertable
     let t0 = if ms != 0 { crate::hitch::span_begin() } else { 0 };
     let res = handles::wait_single_handle(h, timeout, alertable != 0);
     crate::hitch::span_end(t0, crate::hitch::SPAN_OBJ_WAIT);
+    thread::sched::flush_pending_qos();
     if matches!(res, WaitResult::Failed(err::ERROR_INVALID_HANDLE)) {
         log::debug!("WaitForSingleObject on invalid handle {h:p}");
     }
@@ -1367,6 +1370,7 @@ pub unsafe extern "win64" fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32 {
 }
 
 pub unsafe extern "win64" fn WaitForMultipleObjectsEx(n: u32, hs: *const HANDLE, all: BOOL, ms: u32, alertable: BOOL) -> u32 {
+    thread::sched::flush_pending_qos();
     if n == 0 || n > 64 || hs.is_null() {
         set_err(err::ERROR_INVALID_PARAMETER);
         return WAIT_FAILED;
@@ -1377,6 +1381,7 @@ pub unsafe extern "win64" fn WaitForMultipleObjectsEx(n: u32, hs: *const HANDLE,
             let t0 = if ms != 0 { crate::hitch::span_begin() } else { 0 };
             let r = wait_result_code(handles::wait_for(objs.as_slice(), all != 0, ms, alertable != 0));
             crate::hitch::span_end(t0, crate::hitch::SPAN_OBJ_WAIT);
+            thread::sched::flush_pending_qos();
             r
         }
         Err(e) => {

@@ -3,16 +3,18 @@
 use crate::strings::*;
 use crate::teb::{OS_BUILD, OS_MAJOR, OS_MINOR};
 use crate::types::*;
-use std::ffi::c_void;
 
 /// Synthetic x86_64 CPUID leaves (AVX2 + FMA + BMI1/2 + SSE4.2 + F16C + MOVBE + POPCNT + LZCNT + CX16)
-/// used when running natively on `aarch64` without Rosetta.
+/// used when running natively on `aarch64` without Rosetta. Topology fields mirror the shared
+/// `process::cpu_topology()` source.
 pub fn synthetic_cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
+    let topo = crate::process::cpu_topology();
+    let cores = topo.guest_logical.clamp(1, 64);
     match (leaf, sub) {
-        (0, _) => (0x16, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+        (0, _) => (0x1f, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
         (1, _) => (
             0x0009_06ea,
-            0x0010_0800,
+            (cores << 16) | 0x0800,
             (1 << 0)
                 | (1 << 9)
                 | (1 << 12)
@@ -34,11 +36,33 @@ pub fn synthetic_cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
                 | (1 << 23)
                 | (1 << 24)
                 | (1 << 25)
-                | (1 << 26),
+                | (1 << 26)
+                | (u32::from(cores > 1) << 28),
         ),
+        (4, 0..=3) => {
+            let line = topo.cache_line_bytes.max(64);
+            let ways = 8u32;
+            let (kind, level, size, sharing) = match sub {
+                0 => (1, 1, topo.l1d_bytes, 1),
+                1 => (2, 1, topo.l1i_bytes, 1),
+                2 => (3, 2, topo.l2_bytes, cores),
+                _ => (3, 3, topo.l3_bytes, cores),
+            };
+            let sets = (size / (ways * line)).max(1);
+            let eax = kind | (level << 5) | (1 << 8) | ((sharing - 1) << 14) | ((cores - 1) << 26);
+            (eax, ((ways - 1) << 22) | (line - 1), sets - 1, 0)
+        }
         (7, 0) => (0, (1 << 3) | (1 << 5) | (1 << 8), 0, 0),
+        (0xb | 0x1f, 0) => (0, 1, 1 << 8, 0),
+        (0xb | 0x1f, 1) => (cores.next_power_of_two().ilog2(), cores, (2 << 8) | 1, 0),
+        (0xb | 0x1f, _) => (0, 0, sub & 0xff, 0),
         (0x8000_0000, _) => (0x8000_0008, 0, 0, 0),
         (0x8000_0001, _) => (0, 0, 1 << 5, (1 << 27) | (1 << 29)),
+        (0x8000_0008, _) => {
+            let apic_bits = cores.next_power_of_two().ilog2().min(15);
+            let ecx = (apic_bits << 12) | ((cores - 1) & 0xff);
+            (48 << 8 | 48, 0, ecx, 0)
+        }
         _ => (0, 0, 0, 0),
     }
 }
@@ -136,7 +160,7 @@ pub fn fill_system_info(si: &mut SYSTEM_INFO) {
     si.dwPageSize = 0x1000;
     si.lpMinimumApplicationAddress = 0x10000;
     si.lpMaximumApplicationAddress = 0x7FFF_FFFE_FFFF;
-    si.dwActiveProcessorMask = if n >= 64 { usize::MAX } else { (1usize << n) - 1 };
+    si.dwActiveProcessorMask = crate::process::active_processor_mask();
     si.dwNumberOfProcessors = n;
     si.dwProcessorType = 8664;
     si.dwAllocationGranularity = 0x10000;
@@ -423,19 +447,10 @@ pub unsafe extern "win64" fn GetPhysicallyInstalledSystemMemory(kb: *mut u64) ->
     TRUE
 }
 
-fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
-    let mut v: u32 = 0;
-    let mut sz = 4usize;
-    let rc = unsafe { libc::sysctlbyname(name.as_ptr(), &mut v as *mut u32 as *mut c_void, &mut sz, std::ptr::null_mut(), 0) };
-    (rc == 0).then_some(v)
-}
-
-/// (performance core count, efficiency core count). Apple Silicon reports
-/// perflevel0 = P cores, perflevel1 = E cores; no SMT.
+/// (performance core count, efficiency core count) from the shared guest topology.
 pub fn core_classes() -> (u32, u32) {
-    let n = crate::process::num_cpus();
-    let p = sysctl_u32(c"hw.perflevel0.logicalcpu").unwrap_or(n).min(n);
-    (p, n - p)
+    let topo = crate::process::cpu_topology();
+    (topo.guest_p_cores, topo.guest_e_cores)
 }
 
 fn write_group_affinity(p: *mut u8, mask: usize) {
@@ -447,9 +462,10 @@ fn write_group_affinity(p: *mut u8, mask: usize) {
 
 /// Builds the GetLogicalProcessorInformationEx buffer for `relation`.
 fn build_lpi_ex(relation: u32) -> Vec<u8> {
-    let n = crate::process::num_cpus() as usize;
-    let (pcores, _) = core_classes();
-    let all_mask: usize = if n >= 64 { usize::MAX } else { (1usize << n) - 1 };
+    let topo = crate::process::cpu_topology();
+    let n = topo.guest_logical as usize;
+    let pcores = topo.guest_p_cores as usize;
+    let all_mask = crate::process::active_processor_mask();
     let mut out = Vec::new();
     let want = |r: u32| relation == 0xFFFF || relation == r;
     // RelationProcessorCore (0): one per logical CPU (no SMT on Apple Silicon).
@@ -459,7 +475,7 @@ fn build_lpi_ex(relation: u32) -> Vec<u8> {
             e[0..4].copy_from_slice(&0u32.to_le_bytes());
             e[4..8].copy_from_slice(&48u32.to_le_bytes());
             e[8] = 0; // Flags (LTP_PC_SMT = 1)
-            e[9] = if i < pcores as usize { 1 } else { 0 }; // EfficiencyClass
+            e[9] = if i < pcores { 1 } else { 0 }; // EfficiencyClass
             e[30..32].copy_from_slice(&1u16.to_le_bytes()); // GroupCount
             write_group_affinity(e[32..].as_mut_ptr(), 1usize << i);
             out.extend(e);
@@ -476,13 +492,14 @@ fn build_lpi_ex(relation: u32) -> Vec<u8> {
     }
     // RelationCache (2): L1d/L1i per core, L2 shared, (no L3 on Apple Silicon; report SLC as L3)
     if want(2) {
+        let line_size = topo.cache_line_bytes as u16;
         let mut push_cache = |level: u8, size: u32, ty: u32, mask: usize| {
             let mut e = vec![0u8; 56];
             e[0..4].copy_from_slice(&2u32.to_le_bytes());
             e[4..8].copy_from_slice(&56u32.to_le_bytes());
             e[8] = level;
             e[9] = 8; // associativity
-            e[10..12].copy_from_slice(&128u16.to_le_bytes()); // line size
+            e[10..12].copy_from_slice(&line_size.to_le_bytes()); // line size
             e[12..16].copy_from_slice(&size.to_le_bytes());
             e[16..20].copy_from_slice(&ty.to_le_bytes());
             e[38..40].copy_from_slice(&1u16.to_le_bytes());
@@ -490,11 +507,11 @@ fn build_lpi_ex(relation: u32) -> Vec<u8> {
             out.extend(e);
         };
         for i in 0..n {
-            push_cache(1, 64 * 1024, 2, 1 << i); // CacheData
-            push_cache(1, 128 * 1024, 1, 1 << i); // CacheInstruction
+            push_cache(1, topo.l1d_bytes, 2, 1 << i); // CacheData
+            push_cache(1, topo.l1i_bytes, 1, 1 << i); // CacheInstruction
         }
-        push_cache(2, 16 * 1024 * 1024, 0, all_mask); // CacheUnified
-        push_cache(3, 32 * 1024 * 1024, 0, all_mask);
+        push_cache(2, topo.l2_bytes, 0, all_mask); // CacheUnified
+        push_cache(3, topo.l3_bytes, 0, all_mask);
     }
     // RelationProcessorPackage (3)
     if want(3) {
@@ -542,8 +559,9 @@ pub unsafe extern "win64" fn GetLogicalProcessorInformation(buf: *mut u8, len: *
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    let n = crate::process::num_cpus() as usize;
-    let all: usize = if n >= 64 { usize::MAX } else { (1usize << n) - 1 };
+    let topo = crate::process::cpu_topology();
+    let n = topo.guest_logical as usize;
+    let all = crate::process::active_processor_mask();
     let mut out: Vec<u8> = Vec::new();
     let mut push = |mask: usize, rel: u32, payload: [u8; 16]| {
         out.extend(mask.to_le_bytes());
@@ -559,8 +577,8 @@ pub unsafe extern "win64" fn GetLogicalProcessorInformation(buf: *mut u8, len: *
     let mut cache = [0u8; 16];
     cache[0] = 2;
     cache[1] = 8;
-    cache[2..4].copy_from_slice(&128u16.to_le_bytes());
-    cache[4..8].copy_from_slice(&(16u32 << 20).to_le_bytes());
+    cache[2..4].copy_from_slice(&(topo.cache_line_bytes as u16).to_le_bytes());
+    cache[4..8].copy_from_slice(&topo.l2_bytes.to_le_bytes());
     push(all, 2, cache);
     if buf.is_null() || (len.read_unaligned() as usize) < out.len() {
         len.write_unaligned(out.len() as u32);
@@ -590,14 +608,12 @@ pub unsafe extern "win64" fn GetNumaHighestNodeNumber(n: *mut u32) -> BOOL {
 }
 
 pub unsafe extern "win64" fn GetNumaNodeProcessorMask(node: u8, mask: *mut u64) -> BOOL {
-    let n = crate::process::num_cpus();
-    *mask = if node == 0 { if n >= 64 { u64::MAX } else { (1u64 << n) - 1 } } else { 0 };
+    *mask = if node == 0 { crate::process::active_processor_mask() as u64 } else { 0 };
     TRUE
 }
 
 pub unsafe extern "win64" fn GetNumaNodeProcessorMaskEx(node: u16, aff: *mut u8) -> BOOL {
-    let n = crate::process::num_cpus();
-    write_group_affinity(aff, if node == 0 { (1usize << n) - 1 } else { 0 });
+    write_group_affinity(aff, if node == 0 { crate::process::active_processor_mask() } else { 0 });
     TRUE
 }
 
@@ -827,5 +843,64 @@ mod tests {
         let (avail, load) = compute_ios_memory_status(total, 5 << 30, 1 << 30);
         assert_eq!(avail, 1 << 30);
         assert_eq!(load, 83);
+    }
+
+    #[test]
+    fn unified_topology_matches_sysinfo_lpi_and_synthetic_cpuid() {
+        let topo = crate::process::cpu_topology();
+        let n = topo.guest_logical;
+        assert!((1..=64).contains(&n));
+        assert_eq!(topo.guest_p_cores + topo.guest_e_cores, n);
+        assert_eq!(core_classes(), (topo.guest_p_cores, topo.guest_e_cores));
+
+        let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        fill_system_info(&mut si);
+        assert_eq!(si.dwNumberOfProcessors, n);
+        assert_eq!(si.dwActiveProcessorMask, crate::process::active_processor_mask());
+
+        // Synthetic CPUID topology leaves must match the unified topology source.
+        let (_, b1, _, d1) = synthetic_cpuid(1, 0);
+        assert_eq!((b1 >> 16) & 0xff, n);
+        assert_eq!((d1 >> 28) & 1, u32::from(n > 1));
+
+        let (a4, b4, c4, _) = synthetic_cpuid(4, 0);
+        assert_eq!(((a4 >> 26) & 0x3f) + 1, n);
+        let ways = ((b4 >> 22) & 0x3ff) + 1;
+        let line = (b4 & 0xfff) + 1;
+        let sets = c4 + 1;
+        assert_eq!(ways * line * sets, topo.l1d_bytes);
+
+        let (_, b11, _, _) = synthetic_cpuid(0xb, 1);
+        assert_eq!(b11, n);
+        let (_, b1f, _, _) = synthetic_cpuid(0x1f, 1);
+        assert_eq!(b1f, n);
+        let (_, _, c88, _) = synthetic_cpuid(0x8000_0008, 0);
+        assert_eq!((c88 & 0xff) + 1, n);
+
+        // GetLogicalProcessorInformationEx(RelationProcessorCore) matches core count & P/E split.
+        let mut len = 0u32;
+        unsafe {
+            assert_eq!(GetLogicalProcessorInformationEx(0, std::ptr::null_mut(), &mut len), FALSE);
+            let mut buf = vec![0u8; len as usize];
+            assert_eq!(GetLogicalProcessorInformationEx(0, buf.as_mut_ptr(), &mut len), TRUE);
+            let mut pos = 0usize;
+            let mut count = 0u32;
+            let mut p_seen = 0u32;
+            let mut mask = 0usize;
+            while pos < len as usize {
+                let rel = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+                let sz = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+                assert_eq!(rel, 0);
+                if buf[pos + 9] == 1 {
+                    p_seen += 1;
+                }
+                mask |= usize::from_le_bytes(buf[pos + 32..pos + 40].try_into().unwrap());
+                count += 1;
+                pos += sz;
+            }
+            assert_eq!(count, n);
+            assert_eq!(p_seen, topo.guest_p_cores);
+            assert_eq!(mask, si.dwActiveProcessorMask);
+        }
     }
 }

@@ -260,9 +260,28 @@ pub fn validate_manifest_knobs(manifest_knobs: &BTreeMap<String, String>) -> Vec
 pub fn apply_manifest_and_aliases(
     manifest: Option<&GameManifest>,
 ) -> Result<Vec<ResolvedKnob>, String> {
-    let manifest_knobs = manifest.map(|m| &m.knobs);
-    if let Some(mk) = manifest_knobs {
-        let unknown = validate_manifest_knobs(mk);
+    let effective_manifest_knobs: Option<BTreeMap<String, String>> = manifest.map(|m| {
+        let mut merged = m.knobs.clone();
+        if let Some(mode) = m.cpu.mode {
+            let has_mode = merged
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("PORT_CPU_MODE"));
+            if !has_mode {
+                merged.insert("PORT_CPU_MODE".to_string(), mode.to_toml_value().to_string());
+            }
+        }
+        if let Some(max_cores) = m.cpu.max_cores {
+            let has_max = merged
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("PORT_CPU_MAX_CORES"));
+            if !has_max {
+                merged.insert("PORT_CPU_MAX_CORES".to_string(), max_cores.to_string());
+            }
+        }
+        merged
+    });
+    if let Some(m) = manifest {
+        let unknown = validate_manifest_knobs(&m.knobs);
         if !unknown.is_empty() {
             return Err(format!(
                 "unknown knob(s) in game.toml [knobs]: {} (run `port-runner --knobs` to list registered knobs)",
@@ -271,6 +290,7 @@ pub fn apply_manifest_and_aliases(
         }
     }
 
+    let manifest_knobs = effective_manifest_knobs.as_ref();
     let resolved = resolve_all(manifest_knobs);
 
     if let Ok(mut guard) = ACTIVE_MANIFEST_KNOBS.write() {
@@ -1472,6 +1492,24 @@ pub const KNOBS: &[KnobSpec] = &[
         description: "Override path to host libcoreclr.dylib for .NET hosting.",
         affects_aot_key: false,
         crates: &["win32-rt"],
+    },
+    KnobSpec {
+        name: "PORT_CPU_MAX_CORES",
+        aliases: &[],
+        kind: KnobType::U32,
+        default: "0",
+        description: "Upper bound on guest logical CPUs for PORT_CPU_MODE=cap or [cpu] max_cores (0 = unset).",
+        affects_aot_key: false,
+        crates: &["port-loader", "port-manifest", "win32-rt"],
+    },
+    KnobSpec {
+        name: "PORT_CPU_MODE",
+        aliases: &[],
+        kind: KnobType::Enum(&["all", "p_cores", "cap"]),
+        default: "all",
+        description: "Guest CPU topology mode: all (P+E cores), p_cores (P-cores only), or cap (clamp to PORT_CPU_MAX_CORES).",
+        affects_aot_key: false,
+        crates: &["port-loader", "port-manifest", "win32-rt"],
     },
     KnobSpec {
         name: "PORT_CRASH_DIR",
@@ -2887,6 +2925,15 @@ pub const KNOBS: &[KnobSpec] = &[
         crates: &["x86-runtime"],
     },
     KnobSpec {
+        name: "PORT_LATENCY_CRITICAL",
+        aliases: &[],
+        kind: KnobType::Bool,
+        default: "1",
+        description: "Hold an NSProcessInfo latency-critical activity while running (0 disables).",
+        affects_aot_key: false,
+        crates: &["win32-rt"],
+    },
+    KnobSpec {
         name: "PORT_LEGACY_BARRIERS",
         aliases: &["AW2_LEGACY_BARRIERS"],
         kind: KnobType::Bool,
@@ -3260,9 +3307,9 @@ pub const KNOBS: &[KnobSpec] = &[
         aliases: &[],
         kind: KnobType::U32,
         default: "0",
-        description: "Override logical CPU count reported to Windows (0 = host CPU count).",
+        description: "Override logical CPU count reported to Windows (0 = follow PORT_CPU_MODE / host).",
         affects_aot_key: false,
-        crates: &["win32-rt"],
+        crates: &["port-loader", "win32-rt"],
     },
     KnobSpec {
         name: "PORT_OFFLINE",
@@ -3323,7 +3370,7 @@ pub const KNOBS: &[KnobSpec] = &[
         aliases: &["AW2_PRECISE_SLEEP"],
         kind: KnobType::Bool,
         default: "0",
-        description: "Use high-precision spin-assisted wait for short Win32 Sleep calls.",
+        description: "Force mach_wait_until for short Win32 Sleep calls (unset = follow timeBeginPeriod, 0 = force off, 1 = force on).",
         affects_aot_key: false,
         crates: &["win32-rt"],
     },
@@ -4683,5 +4730,53 @@ mod tests {
         assert!(aot_names.contains("PORT_JIT_RAS"));
         assert!(aot_names.contains("PORT_JIT_TSO"));
         assert!(aot_names.contains("PORT_AOT_PROBE"));
+    }
+
+    #[test]
+    fn apply_manifest_propagates_cpu_section_with_env_and_knobs_precedence() {
+        let prev_mode = std::env::var_os("PORT_CPU_MODE");
+        let prev_max = std::env::var_os("PORT_CPU_MAX_CORES");
+
+        std::env::remove_var("PORT_CPU_MODE");
+        std::env::remove_var("PORT_CPU_MAX_CORES");
+
+        // 1. [cpu] populates PORT_CPU_MODE and PORT_CPU_MAX_CORES from manifest.
+        let m_cpu = GameManifest::parse("[cpu]\nmode = \"p_cores\"\nmax_cores = 12\n");
+        let resolved = apply_manifest_and_aliases(Some(&m_cpu)).expect("apply [cpu] manifest");
+        assert_eq!(std::env::var("PORT_CPU_MODE").as_deref(), Ok("p_cores"));
+        assert_eq!(std::env::var("PORT_CPU_MAX_CORES").as_deref(), Ok("12"));
+        let r_mode = resolved.iter().find(|r| r.spec.name == "PORT_CPU_MODE").unwrap();
+        assert_eq!(r_mode.source, KnobSource::Manifest);
+        let r_max = resolved.iter().find(|r| r.spec.name == "PORT_CPU_MAX_CORES").unwrap();
+        assert_eq!(r_max.source, KnobSource::Manifest);
+
+        // 2. [knobs] overrides [cpu] within the same manifest.
+        std::env::remove_var("PORT_CPU_MODE");
+        std::env::remove_var("PORT_CPU_MAX_CORES");
+        let m_override = GameManifest::parse(
+            "[cpu]\nmode = \"p_cores\"\nmax_cores = 12\n[knobs]\nPORT_CPU_MODE = \"cap\"\nPORT_CPU_MAX_CORES = 8\n",
+        );
+        let _ = apply_manifest_and_aliases(Some(&m_override)).expect("apply [knobs] over [cpu]");
+        assert_eq!(std::env::var("PORT_CPU_MODE").as_deref(), Ok("cap"));
+        assert_eq!(std::env::var("PORT_CPU_MAX_CORES").as_deref(), Ok("8"));
+
+        // 3. Process env overrides both [knobs] and [cpu].
+        std::env::set_var("PORT_CPU_MODE", "all");
+        let resolved_env = apply_manifest_and_aliases(Some(&m_cpu)).expect("env over manifest");
+        let r_env = resolved_env.iter().find(|r| r.spec.name == "PORT_CPU_MODE").unwrap();
+        assert_eq!(r_env.source, KnobSource::Env);
+        assert_eq!(r_env.value, "all");
+
+        if let Ok(mut g) = ACTIVE_MANIFEST_KNOBS.write() {
+            *g = None;
+        }
+        match prev_mode {
+            Some(v) => std::env::set_var("PORT_CPU_MODE", v),
+            None => std::env::remove_var("PORT_CPU_MODE"),
+        }
+        match prev_max {
+            Some(v) => std::env::set_var("PORT_CPU_MAX_CORES", v),
+            None => std::env::remove_var("PORT_CPU_MAX_CORES"),
+        }
     }
 }
