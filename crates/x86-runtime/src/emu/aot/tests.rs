@@ -3830,6 +3830,43 @@ fn volatile_metadata_elides_non_volatile_and_preserves_volatile_and_atomics() {
     assert!(w_uncov.iter().any(|&w| is_tso_ld(w)), "uncovered load must keep TSO");
     assert!(w_uncov.iter().any(|&w| is_tso_st(w)), "uncovered store must keep TSO");
 
+    // Runtime-modified code overlapping a covered PE range must disable VolatileMetadata elision
+    // in live JIT translations (uses a distinct mapping so `note_code_region` never merges with `pe`).
+    {
+        let mut smc_pe = TestMappedBuf::alloc(0x2000, 0x2_3F50_0000);
+        let smc_base = smc_pe.base() as u64;
+        let smc_buf = smc_pe.as_slice_mut();
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.mov(rax, qword_ptr(rcx)).unwrap();
+        a.mov(qword_ptr(rdx), rax).unwrap();
+        a.ret().unwrap();
+        let blk_smc = a.assemble(smc_base + 0x1000).unwrap();
+        smc_buf[0x1000..0x1000 + blk_smc.len()].copy_from_slice(&blk_smc);
+
+        let _smc_guard = Guard(smc_base);
+        test_register_volatile_meta(smc_base, smc_pe.len as u64, &[(0x1000, 0x1100)], &[]);
+        let mut bc = Box::new(BlockCache::new());
+        // Before `note_code_region`, live JIT elides TSO inside covered range.
+        let w_before = unsafe { jit::test_translate_live_words(smc_base + 0x1000, &mut *bc) }
+            .expect("live translate before SMC");
+        assert!(!w_before.iter().any(|&w| is_tso_ld(w)), "covered live JIT before SMC elides load TSO");
+        assert!(!w_before.iter().any(|&w| is_tso_st(w)), "covered live JIT before SMC elides store TSO");
+
+        // After `note_code_region`, live JIT MUST keep full TSO even inside the covered range.
+        let smc_lo = (smc_base as usize) + 0x1000;
+        crate::emu::mem::note_code_region(smc_lo, smc_lo + blk_smc.len());
+        let w_after = unsafe { jit::test_translate_live_words(smc_base + 0x1000, &mut *bc) }
+            .expect("live translate after SMC");
+        assert!(
+            w_after.iter().any(|&w| is_tso_ld(w)),
+            "runtime-modified code inside covered range must keep TSO load"
+        );
+        assert!(
+            w_after.iter().any(|&w| is_tso_st(w)),
+            "runtime-modified code inside covered range must keep TSO store"
+        );
+    }
+
     // With PORT_JIT_VOLATILE_META=0: even covered non-volatile block keeps full TSO.
     crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(false)));
     let w_off = words_of(base + 0x1000);

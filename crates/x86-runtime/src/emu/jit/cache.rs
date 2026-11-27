@@ -2315,7 +2315,14 @@ pub(super) fn new_tr<'a>(
         rdtscp_slow: st.rdtscp_slow,
         target_host: p.target_host,
         vol_meta: if mem::volatile_meta_enabled() && !ops.is_empty() {
-            crate::emu::aot::lookup_module_for_ip(ops[0].ip)
+            let lo = to_mapped_addr(ops[0].ip);
+            let last = ops[ops.len() - 1];
+            let hi = to_mapped_addr(last.ip.wrapping_add(last.len as u64));
+            if mem::jit_overlaps(lo, hi) {
+                None
+            } else {
+                crate::emu::aot::lookup_module_for_ip(ops[0].ip)
+            }
         } else {
             None
         },
@@ -2367,6 +2374,40 @@ pub(super) fn new_tr<'a>(
         rlits,
         relocs,
     }
+}
+
+#[cfg(test)]
+pub(in crate::emu) unsafe fn test_translate_live_words(
+    ip: u64,
+    bc: *mut BlockCache,
+) -> Option<Vec<u32>> {
+    let p = prep_block(bc, ip)?;
+    let stubs = StubAddrs {
+        exit: 0x1000,
+        lookup_rip: 0x1100,
+        lookup_jmp: 0x1200,
+        lookup_call: 0x1300,
+        lookup_rip_ic: 0x1104,
+        lookup_jmp_ic: 0x1204,
+        lookup_call_ic: 0x1304,
+        host_xfer: 0x1400,
+        ras_miss: 0x1500,
+        ras_miss_ic: 0x1504,
+        spill_xmm: 0x1600,
+        reload_xmm: 0x1700,
+        clear_ymm_hi: 0x1800,
+        rdtsc_slow: 0x1900,
+        rdtscp_slow: 0x1a00,
+    };
+    let mut scratch = TrScratch::new();
+    let mut buf = vec![0u32; 512];
+    let asm = Asm::new(buf.as_mut_ptr(), 0x2000, buf.len());
+    let mut tr = new_tr(asm, &p.ops[..p.k], &p, &stubs, false, &mut scratch);
+    let main = tr.translate(p.term, p.live_out);
+    if tr.a.overflow {
+        return None;
+    }
+    Some(buf[..main].to_vec())
 }
 
 std::thread_local! {

@@ -154,6 +154,11 @@ pub fn disk_aot_disabled() -> bool {
         || std::env::var_os("PORT_CHILD_PROCESS").is_some_and(|v| v == "1")
 }
 
+#[cfg(test)]
+pub(in crate::emu) fn test_set_aot_enabled(on: bool) {
+    TEST_AOT.with(|c| c.set(on));
+}
+
 /// `PORT_AOT` / `AW2_DLL_AOT`: 0 = JIT only, 1 = load valid caches, 2 = load valid caches and
 /// build missing (installed when done) or outgrown (for the next run) ones from the profile on a
 /// background thread (implies `PORT_JIT_PROFILE=1`). Unset: 2 for game runs, 0 for

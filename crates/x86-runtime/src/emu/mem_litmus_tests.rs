@@ -11,11 +11,67 @@ use iced_x86::code_asm::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Barrier;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecMode {
     Interp,
     Jit,
     Aot,
+}
+
+/// Thread-local execution-mode guard for a spawned litmus participant.
+/// Ensures `ExecMode::Aot` enables AOT lookup on every worker thread and verifies at least one
+/// AOT block installation actually occurred on that thread.
+struct ParticipantGuard {
+    mode: ExecMode,
+    aot_before: u64,
+    label: &'static str,
+}
+
+impl ParticipantGuard {
+    fn enter(mode: ExecMode, label: &'static str) -> Self {
+        let aot_before = jit::test_aot_installs();
+        match mode {
+            ExecMode::Interp => {
+                aot::test_set_aot_enabled(false);
+                jit::force(2);
+            }
+            ExecMode::Jit => {
+                aot::test_set_aot_enabled(false);
+                jit::force(1);
+            }
+            ExecMode::Aot => {
+                aot::test_set_aot_enabled(true);
+                jit::force(1);
+            }
+        }
+        Self { mode, aot_before, label }
+    }
+
+    fn verify_and_exit(self) {
+        let after = jit::test_aot_installs();
+        let mode = self.mode;
+        let before = self.aot_before;
+        let label = self.label;
+        drop(self);
+        if mode == ExecMode::Aot {
+            assert!(
+                after > before,
+                "{label}: ExecMode::Aot participant did not execute installed AOT code (installs {before} -> {after})"
+            );
+        } else {
+            assert_eq!(
+                after, before,
+                "{label}: {mode:?} participant unexpectedly installed AOT code"
+            );
+        }
+    }
+}
+
+impl Drop for ParticipantGuard {
+    fn drop(&mut self) {
+        jit::force(0);
+        aot::test_set_aot_enabled(false);
+    }
 }
 
 /// Page-aligned RW code buffer in valid guest address space for litmus tests.
@@ -88,9 +144,7 @@ fn litmus_mp_scalar_interp_jit_aot() {
     let cons_ip = base + 0x200;
 
     // Producer(rcx = &data, rdx = &flag, r8 = iter):
-    //   mov [rcx], r8
-    //   mov [rdx], r8
-    //   ret
+    //   mov [rcx], r8; mov [rdx], r8; ret
     let mut a = CodeAssembler::new(64).unwrap();
     a.mov(qword_ptr(rcx), r8).unwrap();
     a.mov(qword_ptr(rdx), r8).unwrap();
@@ -108,26 +162,22 @@ fn litmus_mp_scalar_interp_jit_aot() {
     a.jne(spin).unwrap();
     a.mov(rax, qword_ptr(rcx)).unwrap();
     a.ret().unwrap();
-    let cons_bytes = a.assemble(cons_ip).unwrap();
-    code.put(0x200, &cons_bytes);
+    code.put(0x200, &a.assemble(cons_ip).unwrap());
 
     let shared = SharedPair::new();
     let data_ptr = shared.a.as_ptr() as u64;
     let flag_ptr = shared.b.as_ptr() as u64;
 
     for mode in [ExecMode::Interp, ExecMode::Jit, ExecMode::Aot] {
-        let _aot = if matches!(mode, ExecMode::Aot) {
+        let _aot = if mode == ExecMode::Aot {
             let (live, _, _) = unsafe { aot::test_install(&[prod_ip, cons_ip], || {}) };
             assert!(live >= 2, "AOT must install both producer and consumer blocks");
             Some(AotGuard)
         } else {
             None
         };
-        shared.a[0].store(0, Ordering::SeqCst);
-        shared.b[0].store(0, Ordering::SeqCst);
 
-        let iters: u64 = if matches!(mode, ExecMode::Interp) { 1000 } else { 4000 };
-        let force_val = if matches!(mode, ExecMode::Interp) { 2 } else { 1 };
+        let iters: u64 = if mode == ExecMode::Interp { 1000 } else { 4000 };
         let start_bar = Barrier::new(2);
         let end_bar = Barrier::new(2);
         let stale = AtomicU64::new(0);
@@ -136,8 +186,9 @@ fn litmus_mp_scalar_interp_jit_aot() {
             let sb_r = &start_bar;
             let eb_r = &end_bar;
             let stale_r = &stale;
+            let shared_r = &*shared;
             let t_cons = s.spawn(move || {
-                jit::force(force_val);
+                let g = ParticipantGuard::enter(mode, "mp-scalar-consumer");
                 for iter in 1..=iters {
                     sb_r.wait();
                     let got = unsafe { call_va8(cons_ip, data_ptr, flag_ptr, iter, 0, 0, 0, 0, 0) };
@@ -146,18 +197,20 @@ fn litmus_mp_scalar_interp_jit_aot() {
                     }
                     eb_r.wait();
                 }
-                jit::force(0);
+                g.verify_and_exit();
             });
-
-            jit::force(force_val);
-            for iter in 1..=iters {
-                shared.a[0].store(0, Ordering::SeqCst);
-                shared.b[0].store(0, Ordering::SeqCst);
-                start_bar.wait();
-                unsafe { call_va8(prod_ip, data_ptr, flag_ptr, iter, 0, 0, 0, 0, 0) };
-                end_bar.wait();
-            }
-            jit::force(0);
+            let t_prod = s.spawn(move || {
+                let g = ParticipantGuard::enter(mode, "mp-scalar-producer");
+                for iter in 1..=iters {
+                    shared_r.a[0].store(0, Ordering::SeqCst);
+                    shared_r.b[0].store(0, Ordering::SeqCst);
+                    sb_r.wait();
+                    unsafe { call_va8(prod_ip, data_ptr, flag_ptr, iter, 0, 0, 0, 0, 0) };
+                    eb_r.wait();
+                }
+                g.verify_and_exit();
+            });
+            t_prod.join().unwrap();
             t_cons.join().unwrap();
         });
 
@@ -270,15 +323,14 @@ fn litmus_mp_vector_and_rep_movs_interp_jit_aot() {
     let bulk_dst = shared.c.as_ptr() as u64;
 
     for mode in [ExecMode::Interp, ExecMode::Jit, ExecMode::Aot] {
-        let _aot = if matches!(mode, ExecMode::Aot) {
+        let _aot = if mode == ExecMode::Aot {
             let (live, _, _) = unsafe { aot::test_install(&[v_prod, v_cons, m_prod, m_cons], || {}) };
             assert!(live >= 4, "AOT must install vector and rep movsq litmus blocks");
             Some(AotGuard)
         } else {
             None
         };
-        let iters: u64 = if matches!(mode, ExecMode::Interp) { 500 } else { 2000 };
-        let force_val = if matches!(mode, ExecMode::Interp) { 2 } else { 1 };
+        let iters: u64 = if mode == ExecMode::Interp { 500 } else { 2000 };
 
         // 1. 128-bit vector MP
         let start_bar = Barrier::new(2);
@@ -288,8 +340,9 @@ fn litmus_mp_vector_and_rep_movs_interp_jit_aot() {
             let sb_r = &start_bar;
             let eb_r = &end_bar;
             let stale_r = &vec_stale;
-            let t = s.spawn(move || {
-                jit::force(force_val);
+            let shared_r = &*shared;
+            let t_cons = s.spawn(move || {
+                let g = ParticipantGuard::enter(mode, "mp-vec-consumer");
                 for iter in 1..=iters {
                     sb_r.wait();
                     let ok = unsafe { call_va8(v_cons, vec_data, flag_ptr, iter, 0, 0, 0, 0, 0) };
@@ -298,19 +351,22 @@ fn litmus_mp_vector_and_rep_movs_interp_jit_aot() {
                     }
                     eb_r.wait();
                 }
-                jit::force(0);
+                g.verify_and_exit();
             });
-            jit::force(force_val);
-            for iter in 1..=iters {
-                shared.a[0].store(0, Ordering::SeqCst);
-                shared.a[1].store(0, Ordering::SeqCst);
-                shared.b[0].store(0, Ordering::SeqCst);
-                start_bar.wait();
-                unsafe { call_va8(v_prod, vec_data, flag_ptr, iter, 0, 0, 0, 0, 0) };
-                end_bar.wait();
-            }
-            jit::force(0);
-            t.join().unwrap();
+            let t_prod = s.spawn(move || {
+                let g = ParticipantGuard::enter(mode, "mp-vec-producer");
+                for iter in 1..=iters {
+                    shared_r.a[0].store(0, Ordering::SeqCst);
+                    shared_r.a[1].store(0, Ordering::SeqCst);
+                    shared_r.b[0].store(0, Ordering::SeqCst);
+                    sb_r.wait();
+                    unsafe { call_va8(v_prod, vec_data, flag_ptr, iter, 0, 0, 0, 0, 0) };
+                    eb_r.wait();
+                }
+                g.verify_and_exit();
+            });
+            t_prod.join().unwrap();
+            t_cons.join().unwrap();
         });
         assert_eq!(vec_stale.load(Ordering::Relaxed), 0, "vector MP stale/torn in {mode:?}");
 
@@ -322,10 +378,11 @@ fn litmus_mp_vector_and_rep_movs_interp_jit_aot() {
             let sb_r = &start_bar;
             let eb_r = &end_bar;
             let stale_r = &rep_stale;
-            let t = s.spawn(move || {
+            let shared_r = &*shared;
+            let t_cons = s.spawn(move || {
+                let g = ParticipantGuard::enter(mode, "mp-repmovs-consumer");
                 let mut local = [0u64; 8];
                 let local_ptr = local.as_mut_ptr() as u64;
-                jit::force(force_val);
                 for iter in 1..=iters {
                     sb_r.wait();
                     let ok = unsafe { call_va8(m_cons, bulk_dst, local_ptr, flag_ptr, iter, 0, 0, 0, 0) };
@@ -334,23 +391,26 @@ fn litmus_mp_vector_and_rep_movs_interp_jit_aot() {
                     }
                     eb_r.wait();
                 }
-                jit::force(0);
+                g.verify_and_exit();
             });
-            let mut src_buf = [0u64; 8];
-            let src_ptr = src_buf.as_mut_ptr() as u64;
-            jit::force(force_val);
-            for iter in 1..=iters {
-                for slot in &shared.c {
-                    slot.store(0, Ordering::SeqCst);
+            let t_prod = s.spawn(move || {
+                let g = ParticipantGuard::enter(mode, "mp-repmovs-producer");
+                let mut src_buf = [0u64; 8];
+                let src_ptr = src_buf.as_mut_ptr() as u64;
+                for iter in 1..=iters {
+                    for slot in &shared_r.c {
+                        slot.store(0, Ordering::SeqCst);
+                    }
+                    shared_r.b[0].store(0, Ordering::SeqCst);
+                    src_buf.fill(iter);
+                    sb_r.wait();
+                    unsafe { call_va8(m_prod, src_ptr, bulk_dst, flag_ptr, iter, 0, 0, 0, 0) };
+                    eb_r.wait();
                 }
-                shared.b[0].store(0, Ordering::SeqCst);
-                src_buf.fill(iter);
-                start_bar.wait();
-                unsafe { call_va8(m_prod, src_ptr, bulk_dst, flag_ptr, iter, 0, 0, 0, 0) };
-                end_bar.wait();
-            }
-            jit::force(0);
-            t.join().unwrap();
+                g.verify_and_exit();
+            });
+            t_prod.join().unwrap();
+            t_cons.join().unwrap();
         });
         assert_eq!(rep_stale.load(Ordering::Relaxed), 0, "rep movsq MP stale in {mode:?}");
     }
@@ -395,15 +455,14 @@ fn litmus_sb_mfence_and_xchg_interp_jit_aot() {
 
     for (label, fn_ip) in [("mfence", sb_mfence), ("xchg", sb_xchg)] {
         for mode in [ExecMode::Interp, ExecMode::Jit, ExecMode::Aot] {
-            let _aot = if matches!(mode, ExecMode::Aot) {
+            let _aot = if mode == ExecMode::Aot {
                 let (live, _, _) = unsafe { aot::test_install(&[fn_ip], || {}) };
                 assert!(live >= 1);
                 Some(AotGuard)
             } else {
                 None
             };
-            let iters = if matches!(mode, ExecMode::Interp) { 600 } else { 2000 };
-            let force_val = if matches!(mode, ExecMode::Interp) { 2 } else { 1 };
+            let iters = if mode == ExecMode::Interp { 600 } else { 2000 };
             let start_bar = Barrier::new(2);
             let end_bar = Barrier::new(2);
             let r1_slot = AtomicU64::new(0);
@@ -413,31 +472,35 @@ fn litmus_sb_mfence_and_xchg_interp_jit_aot() {
                 let sb_r = &start_bar;
                 let eb_r = &end_bar;
                 let r1_r = &r1_slot;
-                let t = s.spawn(move || {
-                    jit::force(force_val);
+                let forb_r = &forbidden;
+                let shared_r = &*shared;
+                let t1 = s.spawn(move || {
+                    let g = ParticipantGuard::enter(mode, "sb-t1");
                     for _ in 0..iters {
                         sb_r.wait();
                         let r1 = unsafe { call_va8(fn_ip, y_ptr, x_ptr, 0, 0, 0, 0, 0, 0) };
                         r1_r.store(r1, Ordering::Relaxed);
                         eb_r.wait();
                     }
-                    jit::force(0);
+                    g.verify_and_exit();
                 });
-
-                jit::force(force_val);
-                for _ in 0..iters {
-                    shared.a[0].store(0, Ordering::SeqCst);
-                    shared.b[0].store(0, Ordering::SeqCst);
-                    start_bar.wait();
-                    let r0 = unsafe { call_va8(fn_ip, x_ptr, y_ptr, 0, 0, 0, 0, 0, 0) };
-                    end_bar.wait();
-                    let r1 = r1_slot.load(Ordering::Relaxed);
-                    if r0 == 0 && r1 == 0 {
-                        forbidden.fetch_add(1, Ordering::Relaxed);
+                let t0 = s.spawn(move || {
+                    let g = ParticipantGuard::enter(mode, "sb-t0");
+                    for _ in 0..iters {
+                        shared_r.a[0].store(0, Ordering::SeqCst);
+                        shared_r.b[0].store(0, Ordering::SeqCst);
+                        sb_r.wait();
+                        let r0 = unsafe { call_va8(fn_ip, x_ptr, y_ptr, 0, 0, 0, 0, 0, 0) };
+                        eb_r.wait();
+                        let r1 = r1_r.load(Ordering::Relaxed);
+                        if r0 == 0 && r1 == 0 {
+                            forb_r.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                }
-                jit::force(0);
-                t.join().unwrap();
+                    g.verify_and_exit();
+                });
+                t0.join().unwrap();
+                t1.join().unwrap();
             });
 
             assert_eq!(
@@ -507,15 +570,13 @@ fn litmus_mp_volatile_metadata_preserves_synchronization() {
     let flag_ptr = shared.b.as_ptr() as u64;
 
     for mode in [ExecMode::Jit, ExecMode::Aot] {
-        let _aot = if matches!(mode, ExecMode::Aot) {
+        let _aot = if mode == ExecMode::Aot {
             let (live, _, _) = unsafe { aot::test_install(&[prod_ip, cons_ip], || {}) };
             assert!(live >= 2);
             Some(AotGuard)
         } else {
             None
         };
-        shared.a[0].store(0, Ordering::SeqCst);
-        shared.b[0].store(0, Ordering::SeqCst);
 
         let iters = 3000u64;
         let start_bar = Barrier::new(2);
@@ -525,8 +586,9 @@ fn litmus_mp_volatile_metadata_preserves_synchronization() {
             let sb_r = &start_bar;
             let eb_r = &end_bar;
             let stale_r = &stale;
-            let t = s.spawn(move || {
-                jit::force(1);
+            let shared_r = &*shared;
+            let t_cons = s.spawn(move || {
+                let g = ParticipantGuard::enter(mode, "mp-volmeta-consumer");
                 for iter in 1..=iters {
                     sb_r.wait();
                     let got = unsafe { call_va8(cons_ip, data_ptr, flag_ptr, iter, 0, 0, 0, 0, 0) };
@@ -535,18 +597,21 @@ fn litmus_mp_volatile_metadata_preserves_synchronization() {
                     }
                     eb_r.wait();
                 }
-                jit::force(0);
+                g.verify_and_exit();
             });
-            jit::force(1);
-            for iter in 1..=iters {
-                shared.a[0].store(0, Ordering::SeqCst);
-                shared.b[0].store(0, Ordering::SeqCst);
-                start_bar.wait();
-                unsafe { call_va8(prod_ip, data_ptr, flag_ptr, iter, 0, 0, 0, 0, 0) };
-                end_bar.wait();
-            }
-            jit::force(0);
-            t.join().unwrap();
+            let t_prod = s.spawn(move || {
+                let g = ParticipantGuard::enter(mode, "mp-volmeta-producer");
+                for iter in 1..=iters {
+                    shared_r.a[0].store(0, Ordering::SeqCst);
+                    shared_r.b[0].store(0, Ordering::SeqCst);
+                    sb_r.wait();
+                    unsafe { call_va8(prod_ip, data_ptr, flag_ptr, iter, 0, 0, 0, 0, 0) };
+                    eb_r.wait();
+                }
+                g.verify_and_exit();
+            });
+            t_prod.join().unwrap();
+            t_cons.join().unwrap();
         });
 
         assert_eq!(
