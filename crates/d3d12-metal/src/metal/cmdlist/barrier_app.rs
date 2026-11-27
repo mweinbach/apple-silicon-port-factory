@@ -2037,8 +2037,13 @@ impl CommandList {
         if targets.is_empty() {
             return;
         }
+        let clamp_kernel = if crate::metal::m41::block_read_kernels_enabled() {
+            "port_clamp_f16_inf_2d_b2"
+        } else {
+            "port_clamp_f16_inf_2d"
+        };
         let Ok((pso, tg)) =
-            crate::metal::clear::kernel_for_dispatch("port_clamp_f16_inf_2d", self.opts.opt_fast_bind_pso)
+            crate::metal::clear::kernel_for_dispatch(clamp_kernel, self.opts.opt_fast_bind_pso)
         else {
             return;
         };

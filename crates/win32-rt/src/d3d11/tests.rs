@@ -4778,3 +4778,105 @@ fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
         }
     }
 }
+
+#[test]
+fn metal41_set_resource_min_lod_propagates_to_srv_hardware_view() {
+    if d3d12_metal::metal::device().is_none() {
+        return;
+    }
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+    let _g_master = EnvGuard { key: "PORT_METAL41", prev: std::env::var_os("PORT_METAL41") };
+    let _g_sub = EnvGuard {
+        key: "PORT_METAL41_VIEW_MIN_LOD",
+        prev: std::env::var_os("PORT_METAL41_VIEW_MIN_LOD"),
+    };
+    std::env::set_var("PORT_METAL41_VIEW_MIN_LOD", "1");
+
+    unsafe {
+        let mut dev: *mut c_void = std::ptr::null_mut();
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            D3D11CreateDevice(
+                std::ptr::null_mut(),
+                driver_type::HARDWARE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                0,
+                D3D11_SDK_VERSION,
+                &mut dev,
+                std::ptr::null_mut(),
+                &mut ctx,
+            ),
+            S_OK
+        );
+
+        let create_tex2d: unsafe extern "win64" fn(
+            *mut c_void,
+            *const D3D11_TEXTURE2D_DESC,
+            *const D3D11_SUBRESOURCE_DATA,
+            *mut *mut c_void,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(dev, 5));
+        let create_srv: unsafe extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            *const D3D11_SHADER_RESOURCE_VIEW_DESC,
+            *mut *mut c_void,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(dev, 7));
+        let get_min_lod: unsafe extern "win64" fn(*mut c_void, *mut c_void) -> f32 =
+            std::mem::transmute(vtbl_slot(ctx, 56));
+
+        let td = D3D11_TEXTURE2D_DESC {
+            Width: 32,
+            Height: 32,
+            MipLevels: 5,
+            ArraySize: 1,
+            Format: 28, // R8G8B8A8_UNORM
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: usage::DEFAULT,
+            BindFlags: bind_flag::SHADER_RESOURCE,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: *mut c_void = std::ptr::null_mut();
+        assert_eq!(create_tex2d(dev, &td, std::ptr::null(), &mut tex), S_OK);
+        let mut srv: *mut c_void = std::ptr::null_mut();
+        assert_eq!(create_srv(dev, tex, std::ptr::null(), &mut srv), S_OK);
+
+        let srv_ptr = crate::d3d12::com::Obj::<super::resources::D3d11Srv>::from_iface(srv)
+            .expect("D3d11Srv");
+        let srv_obj = &(*srv_ptr).inner.inner;
+        let (_, e0) = srv_obj.entry().expect("initial entry");
+        let id0 = u64::from_le_bytes(e0[8..16].try_into().unwrap());
+        let lod0 = f32::from_bits(u32::from_le_bytes(e0[16..20].try_into().unwrap()));
+        assert_eq!(lod0, 0.0);
+
+        // Update MinLOD via ID3D11DeviceContext::SetResourceMinLOD and verify cache invalidates
+        // and updates the descriptor entry's min_lod_clamp + hardware view resource ID.
+        context::set_resource_min_lod(ctx as context::PCtx, tex, 2.25);
+        assert!((get_min_lod(ctx, tex) - 2.25).abs() < 1e-6);
+        let (_, e1) = srv_obj.entry().expect("updated entry");
+        let id1 = u64::from_le_bytes(e1[8..16].try_into().unwrap());
+        let lod1 = f32::from_bits(u32::from_le_bytes(e1[16..20].try_into().unwrap()));
+        assert!((lod1 - 2.25).abs() < 1e-6, "descriptor min_lod_clamp must update to 2.25, got {lod1}");
+        if d3d12_metal::metal::device().is_some_and(|d| d.supports_texture_view_min_lod()) {
+            assert_ne!(id1, id0, "hardware minLOD view must produce a distinct MTLTexture resource ID");
+        }
+
+        com_release(srv);
+        com_release(tex);
+        com_release(ctx);
+        com_release(dev);
+    }
+}

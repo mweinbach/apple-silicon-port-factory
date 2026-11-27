@@ -54,6 +54,38 @@ use crate::Error;
 /// `MTLLanguageVersion4_1` (`(4 << 16) + 1`, introduced in macOS 27 / Metal 4.1).
 pub const LANGUAGE_VERSION_4_1: MTLLanguageVersion = MTLLanguageVersion((4 << 16) + 1);
 
+/// `MTLFloatingPointConversionRoundingModeTowardZero` (macOS 27 / iOS 27, Metal 4.1 §1.6.3).
+const FP_CONVERSION_ROUNDING_RTZ: isize = 1;
+
+/// Options for compiling MSL source via [`PipelineCache::library_from_source_with_compile_opts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceCompileOptions {
+    /// Force `MTLMathMode::Fast` and `MTLMathFloatingPointFunctions::Fast`.
+    pub fast_math: bool,
+    /// Metal 4.1 (`macOS 27` / `iOS 27`): request round-toward-zero narrowing float conversions
+    /// (`MTLFloatingPointConversionRoundingModeTowardZero` / `-fmetal-rtz-fp-conversion`) for
+    /// DirectX/SPIR-V compatibility (`half(70000.0f) == 65504.0` instead of `+Inf`).
+    /// Ignored gracefully on older OSes via `respondsToSelector:`.
+    pub rtz_fp_conversion: bool,
+}
+
+fn parse_env_bool(name: &str) -> Option<bool> {
+    let v = std::env::var(name).ok()?;
+    let t = v.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(!matches!(t.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+}
+
+/// True when `PORT_METAL41_RTZ_FP` (or master `PORT_METAL41`) opts into MSL 4.1 RTZ float
+/// conversion rounding mode. Default `false`.
+pub fn rtz_fp_conversion_enabled() -> bool {
+    parse_env_bool("PORT_METAL41_RTZ_FP")
+        .or_else(|| parse_env_bool("PORT_METAL41"))
+        .unwrap_or(false)
+}
+
 pub type ComputePipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type RenderPipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
@@ -548,12 +580,31 @@ impl PipelineCache {
     }
 
     /// Like [`Self::library_from_source`], optionally forcing `MTLMathMode::Fast` and
-    /// `MTLMathFloatingPointFunctions::Fast` on [`MTLCompileOptions`].
+    /// `MTLMathFloatingPointFunctions::Fast` on [`MTLCompileOptions`]. Inherits
+    /// [`rtz_fp_conversion_enabled`] (`PORT_METAL41_RTZ_FP` / `PORT_METAL41`).
     pub fn library_from_source_with_opts(
         &self,
         name: &str,
         source: &str,
         fast_math: bool,
+    ) -> Result<Library, Error> {
+        self.library_from_source_with_compile_opts(
+            name,
+            source,
+            SourceCompileOptions {
+                fast_math,
+                rtz_fp_conversion: rtz_fp_conversion_enabled(),
+            },
+        )
+    }
+
+    /// Compiles an MSL source string with explicit [`SourceCompileOptions`] (fast-math and
+    /// Metal 4.1 RTZ narrowing float conversion rounding mode).
+    pub fn library_from_source_with_compile_opts(
+        &self,
+        name: &str,
+        source: &str,
+        compile_opts: SourceCompileOptions,
     ) -> Result<Library, Error> {
         let try_compile = |ver: Option<MTLLanguageVersion>| -> Result<Library, Error> {
             let _permit = self.compile_limiter.acquire();
@@ -562,9 +613,23 @@ impl PipelineCache {
                 if let Some(v) = ver {
                     opts.setLanguageVersion(v);
                 }
-                if fast_math {
+                if compile_opts.fast_math {
                     opts.setMathMode(MTLMathMode::Fast);
                     opts.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Fast);
+                }
+                if compile_opts.rtz_fp_conversion && ver == Some(LANGUAGE_VERSION_4_1) {
+                    unsafe {
+                        let has_sel: objc2::runtime::Bool = objc2::msg_send![
+                            &*opts,
+                            respondsToSelector: objc2::sel!(setFloatingPointConversionRoundingMode:)
+                        ];
+                        if has_sel.as_bool() {
+                            let _: () = objc2::msg_send![
+                                &*opts,
+                                setFloatingPointConversionRoundingMode: FP_CONVERSION_ROUNDING_RTZ
+                            ];
+                        }
+                    }
                 }
                 let desc = MTL4LibraryDescriptor::new();
                 desc.setSource(Some(&NSString::from_str(source)));
@@ -774,6 +839,7 @@ impl Drop for PipelineCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLBuffer;
 
     #[test]
     fn incremental_flush_never_wipes_archives_and_reset_compiler_succeeds() {
@@ -834,5 +900,89 @@ mod tests {
         assert!(second_path.exists(), "mid-session flush must never delete second archive");
         drop(compact_cache);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metal41_rtz_fp_conversion_option_saturates_f16_overflow() {
+        use objc2_metal::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+            MTLResourceOptions, MTLSize,
+        };
+        let Some(dev) = objc2_metal::MTLCreateSystemDefaultDevice() else {
+            return;
+        };
+        if !dev.supportsFamily(objc2_metal::MTLGPUFamily::Metal4) {
+            return;
+        }
+        // Only assert RTZ rounding behavior when macOS 27+ exposes the selector.
+        let probe_opts = MTLCompileOptions::new();
+        let has_rtz: objc2::runtime::Bool = unsafe {
+            objc2::msg_send![
+                &*probe_opts,
+                respondsToSelector: objc2::sel!(setFloatingPointConversionRoundingMode:)
+            ]
+        };
+        if !has_rtz.as_bool() {
+            return;
+        }
+        let cfg = PipelineCacheConfig { dir: None, max_archives: 8, flush_on_drop: false };
+        let cache = PipelineCache::open(&dev, &cfg).expect("open memory-only pso cache");
+        let src = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void cvt_f16(device const float* inp [[buffer(0)]], device half* outp [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    outp[i] = half(inp[i]);
+}
+"#;
+        let run = |rtz: bool| -> [u16; 4] {
+            let lib = cache
+                .library_from_source_with_compile_opts(
+                    if rtz { "cvt_rtz" } else { "cvt_rtne" },
+                    src,
+                    SourceCompileOptions { fast_math: false, rtz_fp_conversion: rtz },
+                )
+                .expect("compile msl4.1 cvt");
+            let pso = cache
+                .compute_pipeline_from_function(None, &lib, "cvt_f16")
+                .expect("build pso");
+            let in_buf = dev
+                .newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            let out_buf = dev
+                .newBufferWithLength_options(8, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            let vals: [f32; 4] = [70000.0, 65520.0, 65504.0, 1.0];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    vals.as_ptr(),
+                    in_buf.contents().as_ptr() as *mut f32,
+                    4,
+                );
+            }
+            let cq = dev.newCommandQueue().unwrap();
+            let cb = cq.commandBuffer().unwrap();
+            let ce = cb.computeCommandEncoder().unwrap();
+            ce.setComputePipelineState(&pso);
+            unsafe {
+                ce.setBuffer_offset_atIndex(Some(&in_buf), 0, 0);
+                ce.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+            }
+            ce.dispatchThreads_threadsPerThreadgroup(
+                MTLSize { width: 4, height: 1, depth: 1 },
+                MTLSize { width: 4, height: 1, depth: 1 },
+            );
+            ce.endEncoding();
+            cb.commit();
+            cb.waitUntilCompleted();
+            unsafe { *(out_buf.contents().as_ptr() as *const [u16; 4]) }
+        };
+        let rtne = run(false);
+        let rtz = run(true);
+        assert_eq!(rtne[0], 0x7c00, "RTNE 70000.0f -> +Inf");
+        assert_eq!(rtne[1], 0x7c00, "RTNE 65520.0f -> +Inf");
+        assert_eq!(rtz[0], 0x7bff, "Metal 4.1 RTZ 70000.0f -> 65504.0");
+        assert_eq!(rtz[1], 0x7bff, "Metal 4.1 RTZ 65520.0f -> 65504.0");
+        assert_eq!(rtz[2], 0x7bff, "65504.0f -> 65504.0");
+        assert_eq!(rtz[3], 0x3c00, "1.0f -> 1.0");
     }
 }

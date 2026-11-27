@@ -120,6 +120,8 @@ class DlcItem:
     app_id: str
     title: str
     owned: bool = True
+    installable: bool = True
+    catalog_id: str | None = None
     installed: bool = False
     install_path: str | None = None
     download_size_bytes: int | None = None
@@ -256,6 +258,7 @@ class GameInfo:
     redistributables: list[RedistributableItem] = field(default_factory=list)
     proton_redist_info: dict[str, Any] = field(default_factory=dict)
     manifest_files_checked: bool = False
+    default_launch_args: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -329,6 +332,8 @@ class UpdateResult:
     old_version: str | None = None
     new_version: str | None = None
     install_path: str | None = None
+    platform: str | None = None
+    updated_dlcs: list[str] = field(default_factory=list)
     message: str = ""
 
     def to_dict(self) -> dict[str, Any]:

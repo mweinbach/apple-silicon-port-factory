@@ -1,1 +1,1 @@
-"""Unit tests for `tools/port-acquire`."""
+"""Unit tests for `tools/port_acquire` (offline, mocked backends, zero credentials)."""

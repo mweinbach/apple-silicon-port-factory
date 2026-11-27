@@ -302,8 +302,75 @@ pub struct MslTranslation {
     pub reflection: ShaderReflection,
 }
 
+/// Options controlling `naga` MSL generation and `xcrun metal` compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MslCompileOptions {
+    /// Naga MSL target `(major, minor)`: `(3, 1)` legacy default, `(4, 0)` enables MSL 4.0
+    /// `metal::vertex_value<T>` (`PerVertex` / `VK_KHR_fragment_shader_barycentric`).
+    pub naga_lang_version: (u8, u8),
+    /// Preferred `-std=` standard passed to `xcrun -sdk macosx metal` (`"metal3.1"`, `"metal4.0"`,
+    /// or `"metal4.1"`). Automatically falls back to `"metal4.0"` -> `"metal3.1"` if the host
+    /// Metal toolchain is older than requested.
+    pub std_version: &'static str,
+    /// Pass MSL 4.1 `-fmetal-rtz-fp-conversion` (Spec §1.6.3) to use round-toward-zero narrowing
+    /// float conversions for non-Metal API compatibility when compiling under `metal4.1`.
+    pub rtz_fp_conversion: bool,
+}
+
+impl Default for MslCompileOptions {
+    fn default() -> Self {
+        Self::legacy_msl31()
+    }
+}
+
+fn parse_env_bool(name: &str) -> Option<bool> {
+    let v = std::env::var(name).ok()?;
+    let t = v.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(!matches!(t.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+}
+
+impl MslCompileOptions {
+    /// Legacy MSL 3.1 options (`lang_version: (3, 1)`, `-std=metal3.1`, RTNE narrowing).
+    pub const fn legacy_msl31() -> Self {
+        Self {
+            naga_lang_version: (3, 1),
+            std_version: "metal3.1",
+            rtz_fp_conversion: false,
+        }
+    }
+
+    /// Metal 4.1 options (`naga` MSL 4.0 + `-std=metal4.1` with toolchain fallback, optional RTZ).
+    pub const fn metal41(rtz_fp_conversion: bool) -> Self {
+        Self {
+            naga_lang_version: (4, 0),
+            std_version: "metal4.1",
+            rtz_fp_conversion,
+        }
+    }
+
+    /// Resolves options from `PORT_METAL41`, `PORT_METAL41_SPIRV`, and `PORT_METAL41_RTZ_FP`.
+    /// Defaults to [`Self::legacy_msl31`] when none are enabled.
+    pub fn from_env() -> Self {
+        let master = parse_env_bool("PORT_METAL41").unwrap_or(false);
+        let spirv_m41 = parse_env_bool("PORT_METAL41_SPIRV").unwrap_or(master);
+        let rtz = parse_env_bool("PORT_METAL41_RTZ_FP").unwrap_or(master);
+        if spirv_m41 || rtz {
+            Self::metal41(rtz)
+        } else {
+            Self::legacy_msl31()
+        }
+    }
+
+    fn is_legacy_default(&self) -> bool {
+        *self == Self::legacy_msl31()
+    }
+}
+
 /// Builds a deterministic Naga MSL `Options` + `EntryPointResourceMap` for `module`.
-fn build_msl_options(module: &naga::Module) -> naga::back::msl::Options {
+fn build_msl_options(module: &naga::Module, lang_version: (u8, u8)) -> naga::back::msl::Options {
     let mut per_entry_point_map = naga::back::msl::EntryPointResourceMap::default();
 
     let mut base_resources = naga::back::msl::BindingMap::default();
@@ -393,7 +460,7 @@ fn build_msl_options(module: &naga::Module) -> naga::back::msl::Options {
     }
 
     naga::back::msl::Options {
-        lang_version: (3, 1),
+        lang_version,
         per_entry_point_map,
         inline_samplers: Vec::new(),
         spirv_cross_compatibility: false,
@@ -446,6 +513,7 @@ fn translate_naga_module_to_msl(
     module: &naga::Module,
     source_kind: &str,
     entry_point: Option<&str>,
+    msl_compile_opts: MslCompileOptions,
 ) -> Result<MslTranslation, Error> {
     let mut validator = naga::valid::Validator::new(
         naga::valid::ValidationFlags::empty(),
@@ -485,7 +553,7 @@ fn translate_naga_module_to_msl(
 
     let ep = &module.entry_points[ep_idx];
     let stage = map_naga_stage(ep.stage);
-    let msl_opts = build_msl_options(module);
+    let msl_opts = build_msl_options(module, msl_compile_opts.naga_lang_version);
     let pipe_opts = naga::back::msl::PipelineOptions {
         entry_point: Some((ep.stage, ep.name.clone())),
         allow_and_force_point_size: false,
@@ -595,6 +663,15 @@ pub fn translate_spirv_to_msl(
     spirv_bytes: &[u8],
     entry_point: Option<&str>,
 ) -> Result<MslTranslation, Error> {
+    translate_spirv_to_msl_with_opts(spirv_bytes, entry_point, MslCompileOptions::from_env())
+}
+
+/// Like [`translate_spirv_to_msl`], with explicit [`MslCompileOptions`].
+pub fn translate_spirv_to_msl_with_opts(
+    spirv_bytes: &[u8],
+    entry_point: Option<&str>,
+    opts: MslCompileOptions,
+) -> Result<MslTranslation, Error> {
     let le_bytes = normalize_spirv_le(spirv_bytes)?;
     let spv_opts = naga::front::spv::Options {
         adjust_coordinate_space: false,
@@ -603,7 +680,7 @@ pub fn translate_spirv_to_msl(
     };
     let module = naga::front::spv::parse_u8_slice(&le_bytes, &spv_opts)
         .map_err(|e| Error::InvalidInput(format!("SPIR-V parse error: {e}")))?;
-    translate_naga_module_to_msl(&module, "SPIR-V", entry_point)
+    translate_naga_module_to_msl(&module, "SPIR-V", entry_point, opts)
 }
 
 /// Translates a WebGPU `WGSL` source shader into Metal Shading Language (`.msl`) + `ShaderReflection`.
@@ -611,9 +688,18 @@ pub fn translate_wgsl_to_msl(
     wgsl_source: &str,
     entry_point: Option<&str>,
 ) -> Result<MslTranslation, Error> {
+    translate_wgsl_to_msl_with_opts(wgsl_source, entry_point, MslCompileOptions::from_env())
+}
+
+/// Like [`translate_wgsl_to_msl`], with explicit [`MslCompileOptions`].
+pub fn translate_wgsl_to_msl_with_opts(
+    wgsl_source: &str,
+    entry_point: Option<&str>,
+    opts: MslCompileOptions,
+) -> Result<MslTranslation, Error> {
     let module = naga::front::wgsl::parse_str(wgsl_source)
         .map_err(|e| Error::InvalidInput(format!("WGSL parse error: {}", e.emit_to_string(wgsl_source))))?;
-    translate_naga_module_to_msl(&module, "WGSL", entry_point)
+    translate_naga_module_to_msl(&module, "WGSL", entry_point, opts)
 }
 
 /// Returns the version string of the host Apple Metal compiler (`xcrun -sdk macosx metal --version`),
@@ -640,9 +726,63 @@ pub fn metal_toolchain_available() -> bool {
     metal_toolchain_version().is_some()
 }
 
+/// Probes whether the host `xcrun -sdk macosx metal` accepts `-std=<std_ver>`.
+fn probe_metal_std(std_ver: &str) -> bool {
+    let std_flag = format!("-std={std_ver}");
+    Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "-x", "metal", &std_flag, "-E", "/dev/null"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// True when the host Metal CLI toolchain supports `-std=metal4.1`.
+pub fn metal_toolchain_supports_4_1() -> bool {
+    static SUPPORTS: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS.get_or_init(|| metal_toolchain_available() && probe_metal_std("metal4.1"))
+}
+
+/// True when the host Metal CLI toolchain supports `-std=metal4.0`.
+pub fn metal_toolchain_supports_4_0() -> bool {
+    static SUPPORTS: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS.get_or_init(|| metal_toolchain_available() && probe_metal_std("metal4.0"))
+}
+
+/// Resolves the effective `-std=` value for `requested`, falling back cleanly on older toolchains.
+fn effective_metal_std(requested: &str) -> &str {
+    match requested {
+        "metal4.1" => {
+            if metal_toolchain_supports_4_1() {
+                "metal4.1"
+            } else if metal_toolchain_supports_4_0() {
+                "metal4.0"
+            } else {
+                "metal3.1"
+            }
+        }
+        "metal4.0" => {
+            if metal_toolchain_supports_4_0() {
+                "metal4.0"
+            } else {
+                "metal3.1"
+            }
+        }
+        other => other,
+    }
+}
+
 /// Compiles Metal Shading Language (`.msl`) source code into a native Apple `.metallib` binary
 /// (`MTLB` container magic) using `xcrun -sdk macosx metal` + `xcrun -sdk macosx metallib`.
 pub fn compile_msl_to_metallib(msl_source: &str) -> Result<Vec<u8>, Error> {
+    compile_msl_to_metallib_with_opts(msl_source, MslCompileOptions::from_env())
+}
+
+/// Like [`compile_msl_to_metallib`], with explicit [`MslCompileOptions`] (supporting `-std=metal4.1`
+/// and MSL 4.1 `-fmetal-rtz-fp-conversion`).
+pub fn compile_msl_to_metallib_with_opts(
+    msl_source: &str,
+    opts: MslCompileOptions,
+) -> Result<Vec<u8>, Error> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     if !metal_toolchain_available() {
         return Err(Error::Load(
@@ -669,16 +809,15 @@ pub fn compile_msl_to_metallib(msl_source: &str) -> Result<Vec<u8>, Error> {
         return Err(Error::Io(format!("write temp .metal: {e}")));
     }
 
-    let metal_out = Command::new("xcrun")
-        .args([
-            "-sdk",
-            "macosx",
-            "metal",
-            "-std=metal3.1",
-            "-O2",
-            "-Wno-unused-variable",
-            "-c",
-        ])
+    let std_ver = effective_metal_std(opts.std_version);
+    let std_flag = format!("-std={std_ver}");
+    let mut cmd = Command::new("xcrun");
+    cmd.args(["-sdk", "macosx", "metal", &std_flag, "-O2", "-Wno-unused-variable"]);
+    if opts.rtz_fp_conversion && std_ver == "metal4.1" {
+        cmd.arg("-fmetal-rtz-fp-conversion");
+    }
+    let metal_out = cmd
+        .arg("-c")
         .arg(&msl_path)
         .arg("-o")
         .arg(&air_path)
@@ -731,11 +870,26 @@ pub fn compile_spirv_uncached(
     spirv_bytes: &[u8],
     entry_point: Option<&str>,
 ) -> Result<(CompiledShader, String), Error> {
-    let trans = translate_spirv_to_msl(spirv_bytes, entry_point)?;
-    let metallib = compile_msl_to_metallib(&trans.msl_source)?;
+    compile_spirv_uncached_with_opts(spirv_bytes, entry_point, MslCompileOptions::from_env())
+}
+
+/// Like [`compile_spirv_uncached`], with explicit [`MslCompileOptions`].
+pub fn compile_spirv_uncached_with_opts(
+    spirv_bytes: &[u8],
+    entry_point: Option<&str>,
+    opts: MslCompileOptions,
+) -> Result<(CompiledShader, String), Error> {
+    let trans = translate_spirv_to_msl_with_opts(spirv_bytes, entry_point, opts)?;
+    let metallib = compile_msl_to_metallib_with_opts(&trans.msl_source, opts)?;
     let mut kh = KeyHasher::new("dxil-metal/spirv-metal/v2");
     kh.bytes(spirv_bytes);
     kh.bytes(trans.entry_point_name.as_bytes());
+    if !opts.is_legacy_default() {
+        kh.u32(opts.naga_lang_version.0 as u32)
+            .u32(opts.naga_lang_version.1 as u32)
+            .bytes(effective_metal_std(opts.std_version).as_bytes())
+            .u32(opts.rtz_fp_conversion as u32);
+    }
     let key = kh.finish();
     Ok((
         CompiledShader {
@@ -754,11 +908,26 @@ pub fn compile_wgsl_uncached(
     wgsl_source: &str,
     entry_point: Option<&str>,
 ) -> Result<(CompiledShader, String), Error> {
-    let trans = translate_wgsl_to_msl(wgsl_source, entry_point)?;
-    let metallib = compile_msl_to_metallib(&trans.msl_source)?;
+    compile_wgsl_uncached_with_opts(wgsl_source, entry_point, MslCompileOptions::from_env())
+}
+
+/// Like [`compile_wgsl_uncached`], with explicit [`MslCompileOptions`].
+pub fn compile_wgsl_uncached_with_opts(
+    wgsl_source: &str,
+    entry_point: Option<&str>,
+    opts: MslCompileOptions,
+) -> Result<(CompiledShader, String), Error> {
+    let trans = translate_wgsl_to_msl_with_opts(wgsl_source, entry_point, opts)?;
+    let metallib = compile_msl_to_metallib_with_opts(&trans.msl_source, opts)?;
     let mut kh = KeyHasher::new("dxil-metal/wgsl-metal/v2");
     kh.bytes(wgsl_source.as_bytes());
     kh.bytes(trans.entry_point_name.as_bytes());
+    if !opts.is_legacy_default() {
+        kh.u32(opts.naga_lang_version.0 as u32)
+            .u32(opts.naga_lang_version.1 as u32)
+            .bytes(effective_metal_std(opts.std_version).as_bytes())
+            .u32(opts.rtz_fp_conversion as u32);
+    }
     let key = kh.finish();
     Ok((
         CompiledShader {
@@ -779,13 +948,20 @@ pub fn compile_spirv_cached(
     spirv_bytes: &[u8],
     entry_point: Option<&str>,
 ) -> Result<Arc<CompiledShader>, Error> {
+    let opts = MslCompileOptions::from_env();
     let mut kh = KeyHasher::new("dxil-metal/spirv-metal/v2");
     kh.bytes(metal_toolchain_version().unwrap_or("naga-msl-fallback").as_bytes());
     kh.bytes(spirv_bytes);
     kh.bytes(entry_point.unwrap_or("").as_bytes());
+    if !opts.is_legacy_default() {
+        kh.u32(opts.naga_lang_version.0 as u32)
+            .u32(opts.naga_lang_version.1 as u32)
+            .bytes(effective_metal_std(opts.std_version).as_bytes())
+            .u32(opts.rtz_fp_conversion as u32);
+    }
     let key = kh.finish();
     cache.get_or_compile(key, || {
-        compile_spirv_uncached(spirv_bytes, entry_point).map(|(s, _msl)| s)
+        compile_spirv_uncached_with_opts(spirv_bytes, entry_point, opts).map(|(s, _msl)| s)
     })
 }
 
@@ -1057,5 +1233,47 @@ mod tests {
         } else {
             assert!(matches!(compile_wgsl_uncached(wgsl, Some("cs_main")), Err(Error::Load(_))));
         }
+    }
+
+    #[test]
+    fn metal41_msl_and_spirv_options_compile_cleanly() {
+        let spv = sample_vulkan_compute_spirv();
+        let m41_opts = MslCompileOptions::metal41(true);
+        let trans = translate_spirv_to_msl_with_opts(&spv, Some("main"), m41_opts)
+            .expect("translate_spirv_to_msl_with_opts(metal41)");
+        assert!(trans.msl_source.contains("kernel void"));
+
+        if !metal_toolchain_supports_4_1() {
+            return;
+        }
+        let (compiled, _) = compile_spirv_uncached_with_opts(&spv, Some("main"), m41_opts)
+            .expect("compile_spirv metal4.1 + rtz");
+        assert!(compiled.metallib.starts_with(b"MTLB"));
+
+        // Verify MSL 4.1-only constructs (block_read, interleave, acquire/release atomics/barriers,
+        // threadgroup atomic_float) compile to a native MTLB library under MslCompileOptions::metal41(true).
+        let msl41_src = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void k_m41(
+    texture2d<float, access::read> tex [[texture(0)]],
+    device float4* out [[buffer(0)]],
+    device atomic_uint* flag [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    threadgroup atomic_float tg_acc;
+    constexpr sampler s(address::clamp_to_edge);
+    auto b = tex.block_read<2, 1>(s, int2(gid));
+    float4 v = b.value<0, 0>() + b.value<1, 0>();
+    uint m = interleave(ushort(gid.x), ushort(gid.y));
+    atomic_fetch_add_explicit(&tg_acc, v.x, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel, thread_scope_threadgroup);
+    atomic_store_explicit(flag, m, memory_order_release, mem_flags::mem_device);
+    out[gid.x] = v;
+}
+"#;
+        let metallib = compile_msl_to_metallib_with_opts(msl41_src, m41_opts)
+            .expect("compile MSL 4.1 features");
+        assert!(metallib.starts_with(b"MTLB"));
     }
 }

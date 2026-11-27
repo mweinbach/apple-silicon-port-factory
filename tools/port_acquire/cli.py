@@ -21,6 +21,7 @@ from .backend import (
 from .manifest import (
     MANIFEST_FILENAME,
     build_package_manifest,
+    read_package_manifest,
     render_starter_game_toml,
     write_package_manifest,
 )
@@ -401,11 +402,34 @@ def _write_manifest_for_install(
     branch: str | None = None,
     downloaded_depots: list[str] | None = None,
     downloaded_redists: list[str] | None = None,
-    offline: bool = True,
+    branch_password: str | None = None,
+    offline: bool = False,
 ) -> dict[str, Any]:
+    info_sig_params = inspect.signature(backend.info).parameters
+    extra_info_kwargs: dict[str, Any] = {}
+    if branch and "branch" in info_sig_params:
+        extra_info_kwargs["branch"] = branch
+    if branch_password and "branch_password" in info_sig_params:
+        extra_info_kwargs["branch_password"] = branch_password
+
+    info: GameInfo | None = None
     try:
-        info = backend.info(app_id, platform=platform, offline=offline)
+        info = backend.info(app_id, platform=platform, offline=offline, **extra_info_kwargs)
     except AcquireError:
+        info = None
+    if info is None:
+        try:
+            info = backend.info(app_id, platform=platform, offline=not offline, **extra_info_kwargs)
+        except AcquireError:
+            info = None
+    elif offline and (not info.executable or not info.manifest_files_checked):
+        try:
+            online_info = backend.info(app_id, platform=platform, offline=False, **extra_info_kwargs)
+            if online_info.executable or online_info.manifest_files_checked:
+                info = online_info
+        except AcquireError:
+            pass
+    if info is None:
         info = GameInfo(store=backend.name, app_id=app_id, title=app_id, platform=platform)
 
     launch_plan = None
@@ -558,9 +582,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         dlcs = backend.list_dlcs(args.app, platform=args.platform, offline=bool(args.offline))
         lines = [f"DLCs for {args.app} ({len(dlcs)}):"]
         for d in dlcs:
-            inst = " [installed]" if d.installed else ""
+            inst = " [installed]" if d.installed else ("" if d.installable else " [entitlement-only]")
+            label = d.app_id or d.catalog_id or "<entitlement>"
             lines.append(
-                f"  {d.app_id:24} {d.title} ({_format_bytes(d.disk_size_bytes)}){inst}"
+                f"  {label:24} {d.title} ({_format_bytes(d.disk_size_bytes)}){inst}"
             )
         _emit(
             {
@@ -648,6 +673,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 branch=result.branch,
                 downloaded_depots=result.downloaded_depots,
                 downloaded_redists=result.downloaded_redists,
+                branch_password=branch_password,
                 offline=True,
             )
             result.manifest_path = str(manifest_path)
@@ -708,13 +734,22 @@ def _dispatch(args: argparse.Namespace) -> int:
         if res.updated and res.install_path:
             existing_manifest = Path(res.install_path) / MANIFEST_FILENAME
             if existing_manifest.is_file():
+                refresh_platform = res.platform
+                if not refresh_platform:
+                    try:
+                        prev = read_package_manifest(existing_manifest)
+                        if isinstance(prev.get("platform"), str) and prev["platform"].strip():
+                            refresh_platform = prev["platform"].strip()
+                    except (OSError, ValueError):
+                        refresh_platform = None
                 _write_manifest_for_install(
                     backend,
                     app_id=res.app_id,
                     install_dir=Path(res.install_path),
-                    platform="windows",
+                    platform=refresh_platform or "windows",
                     manifest_out=existing_manifest,
-                    offline=True,
+                    branch_password=update_kwargs.get("branch_password"),
+                    offline=False,
                 )
         lines = [
             f"Update {res.app_id}: updated={res.updated}, available={res.update_available}",
@@ -745,14 +780,23 @@ def _dispatch(args: argparse.Namespace) -> int:
         manifest_obj: dict[str, Any] | None = None
 
         if args.export_manifest or args.export_game_toml:
+            export_platform = "windows"
+            existing_manifest = Path(plan.install_dir) / MANIFEST_FILENAME if plan.install_dir else None
+            if existing_manifest and existing_manifest.is_file():
+                try:
+                    prev = read_package_manifest(existing_manifest)
+                    if isinstance(prev.get("platform"), str) and prev["platform"].strip():
+                        export_platform = prev["platform"].strip()
+                except (OSError, ValueError):
+                    pass
             try:
-                info = backend.info(args.app, platform="windows", offline=True)
+                info = backend.info(args.app, platform=export_platform, offline=True)
             except AcquireError:
                 info = GameInfo(
                     store=store_name,
                     app_id=plan.app_id,
                     title=plan.title,
-                    platform="windows",
+                    platform=export_platform,
                     installed=True,
                     install_path=plan.install_dir,
                     executable=plan.executable,

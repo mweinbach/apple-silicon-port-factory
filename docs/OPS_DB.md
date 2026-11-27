@@ -141,6 +141,11 @@ cargo opsdb -- bundles
 cargo opsdb -- bundle-verify out/apps/Overwatch.app
 cargo opsdb -- bundle-export out/apps/Overwatch.app /Volumes/MySSD
 
+# Acquire owned Windows builds from Epic Games Store (via Heroic's `legendary`) or pluggable stores,
+# producing `port-acquire-manifest.json` for downstream `.app` packaging (see docs/ACQUISITION.md):
+tools/port-acquire search "Title" --store epic --json
+tools/port-acquire download <app_id> --store epic --dest /path/to/Game --platform windows --json
+
 # Package for iOS with optional storage optimization (lossless | high | compact)
 cargo opsdb -- ios-bundle /path/to/Game --out out/ios/Game.ipa --target device --release \
   --bundle-shader-cache --optimize-storage high

@@ -1009,3 +1009,100 @@ fn device_errors_object_metadata_and_extra_operators() {
         }
     }
 }
+
+#[test]
+fn metal41_mpp_gpu_gemm_matches_cpu_for_f32_and_f16() {
+    unsafe {
+        if d3d12_metal::metal::device().is_none() {
+            return;
+        }
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+        let _g_master = EnvGuard { key: "PORT_METAL41", prev: std::env::var_os("PORT_METAL41") };
+        let _g_sub = EnvGuard {
+            key: "PORT_METAL41_DIRECTML_GPU",
+            prev: std::env::var_os("PORT_METAL41_DIRECTML_GPU"),
+        };
+        std::env::set_var("PORT_METAL41_DIRECTML_GPU", "1");
+
+        let mut d3d_dev = std::ptr::null_mut();
+        let mut dml_dev = std::ptr::null_mut();
+        assert_eq!(
+            DMLCreateDeviceAndDirect3D12Device(
+                std::ptr::null_mut(),
+                0xB000,
+                DML_CREATE_DEVICE_FLAG_NONE,
+                DML_FEATURE_LEVEL_4_0,
+                &IID_ID3D12Device,
+                &mut d3d_dev,
+                &IID_IDMLDevice1,
+                &mut dml_dev,
+            ),
+            S_OK
+        );
+
+        // 1) FLOAT32 batched GEMM (B=2, M=3, K=4, N=2) with TransB + broadcast C[2,1,2] + ReLU
+        let a_buf = make_d3d12_buffer(d3d_dev, 2 * 3 * 4 * 4, heap_type::DEFAULT);
+        let b_buf = make_d3d12_buffer(d3d_dev, 2 * 2 * 4 * 4, heap_type::UPLOAD);
+        let c_buf = make_d3d12_buffer(d3d_dev, 2 * 2 * 4, heap_type::UPLOAD);
+        let y_buf = make_d3d12_buffer(d3d_dev, 2 * 3 * 2 * 4, heap_type::DEFAULT);
+        let a_vals: Vec<f32> = (0..24).map(|i| (i as f32 - 10.0) * 0.25).collect();
+        let b_vals: Vec<f32> = (0..16).map(|i| (i as f32 - 7.0) * 0.5).collect();
+        let c_vals = [-2.0f32, 1.5, 0.5, -3.0];
+        write_f32_buf(a_buf, &a_vals);
+        write_f32_buf(b_buf, &b_vals);
+        write_f32_buf(c_buf, &c_vals);
+
+        let s_a = [2u32, 3, 4];
+        let s_b = [2u32, 2, 4];
+        let s_c = [2u32, 1, 2];
+        let s_y = [2u32, 3, 2];
+        let (bd_a, mut td_a) = tensor_f32(&s_a); td_a.Desc = &bd_a as *const _ as *const c_void;
+        let (bd_b, mut td_b) = tensor_f32(&s_b); td_b.Desc = &bd_b as *const _ as *const c_void;
+        let (bd_c, mut td_c) = tensor_f32(&s_c); td_c.Desc = &bd_c as *const _ as *const c_void;
+        let (bd_y, mut td_y) = tensor_f32(&s_y); td_y.Desc = &bd_y as *const _ as *const c_void;
+        let relu_inner = DML_SIMPLE_UNARY_DESC { InputTensor: std::ptr::null(), OutputTensor: std::ptr::null() };
+        let relu_desc = DML_OPERATOR_DESC {
+            Type: DML_OPERATOR_ACTIVATION_RELU,
+            _pad: 0,
+            Desc: &relu_inner as *const _ as *const c_void,
+        };
+        let gemm = DML_GEMM_OPERATOR_DESC {
+            ATensor: &td_a,
+            BTensor: &td_b,
+            CTensor: &td_c,
+            OutputTensor: &td_y,
+            TransA: DML_MATRIX_TRANSFORM_NONE,
+            TransB: DML_MATRIX_TRANSFORM_TRANSPOSE,
+            Alpha: 1.5,
+            Beta: 0.5,
+            FusedActivation: &relu_desc,
+        };
+        let op = DML_OPERATOR_DESC { Type: DML_OPERATOR_GEMM, _pad: 0, Desc: &gemm as *const _ as *const c_void };
+        dispatch_compiled(dml_dev, &op, &[a_buf, b_buf, c_buf], &[96, 64, 16], &[y_buf], &[48]);
+        let y_gpu = read_f32_buf(y_buf, 12);
+
+        // Compare against CPU path with PORT_METAL41_DIRECTML_GPU=0.
+        std::env::set_var("PORT_METAL41_DIRECTML_GPU", "0");
+        let y_cpu_buf = make_d3d12_buffer(d3d_dev, 2 * 3 * 2 * 4, heap_type::DEFAULT);
+        dispatch_compiled(dml_dev, &op, &[a_buf, b_buf, c_buf], &[96, 64, 16], &[y_cpu_buf], &[48]);
+        let y_cpu = read_f32_buf(y_cpu_buf, 12);
+        for (i, (&g, &c)) in y_gpu.iter().zip(y_cpu.iter()).enumerate() {
+            assert!((g - c).abs() < 1e-3, "f32 GEMM mismatch at {i}: gpu={g}, cpu={c}");
+        }
+
+        for p in [a_buf, b_buf, c_buf, y_buf, y_cpu_buf, dml_dev, d3d_dev] {
+            com_release(p);
+        }
+    }
+}

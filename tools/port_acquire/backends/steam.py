@@ -2580,6 +2580,7 @@ class SteamBackend(StoreBackend):
                     old_version=old_version,
                     new_version=remote_version,
                     install_path=str(install_path),
+                    platform=platform,
                     message=msg,
                 )
 
@@ -2592,6 +2593,7 @@ class SteamBackend(StoreBackend):
                     old_version=old_version,
                     new_version=remote_version,
                     install_path=str(install_path),
+                    platform=platform,
                     message="Already up to date",
                 )
 
@@ -2614,6 +2616,8 @@ class SteamBackend(StoreBackend):
             old_version=old_version,
             new_version=dl_res.version or remote_version,
             install_path=dl_res.install_path,
+            platform=dl_res.platform,
+            updated_dlcs=list(dl_res.downloaded_dlcs),
             message=f"Updated {resolved_id} on branch '{branch}' via DepotDownloader",
         )
 

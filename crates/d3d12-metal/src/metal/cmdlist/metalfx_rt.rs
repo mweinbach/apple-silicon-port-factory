@@ -804,11 +804,22 @@ impl CommandList {
         let depth_usage = scaler.depth_usage;
         let motion_usage = scaler.motion_usage;
         let reactive_usage = scaler.reactive_usage.unwrap_or(MTLTextureUsage::ShaderRead);
+        let use_native_offsets =
+            crate::metal::m41::metalfx_offsets_enabled() && scaler.has_content_offsets();
+        let inputs_usage_ok = sv.usage().contains(color_usage)
+            && depth_v.usage().contains(depth_usage)
+            && motion_v.usage().contains(motion_usage)
+            && reactive_v
+                .as_ref()
+                .zip(scaler.reactive_usage)
+                .is_none_or(|(rv, req)| rv.usage().contains(req));
+        let use_native_input_offsets = has_input_subrect && use_native_offsets && inputs_usage_ok;
         let direct_ok = dv.storageMode() == MTLStorageMode::Private
             && dv.usage().contains(scaler.output_usage)
-            && params.output_origin == [0, 0]
-            && w == dv.width() as u32
-            && h == dv.height() as u32;
+            && ((params.output_origin == [0, 0] && w == dv.width() as u32 && h == dv.height() as u32)
+                || (use_native_offsets
+                    && params.output_origin[0].saturating_add(w) <= dv.width() as u32
+                    && params.output_origin[1].saturating_add(h) <= dv.height() as u32));
         let scratch = if direct_ok {
             None
         } else {
@@ -827,7 +838,9 @@ impl CommandList {
         if !self.icb.icb_segs.is_empty() {
             self.flush_draw_batch(false);
         }
-        let (staged_color, staged_depth, staged_motion, staged_reactive) = if has_input_subrect {
+        let (staged_color, staged_depth, staged_motion, staged_reactive) = if has_input_subrect
+            && !use_native_input_offsets
+        {
             let Some(sc) = self.blit_subrect_to_scratch(
                 sv,
                 params.color_origin,
@@ -925,6 +938,11 @@ impl CommandList {
             reactive_mask: staged_reactive.as_deref().or(reactive_v.as_deref()),
             content_w: x0,
             content_h: y0,
+            color_offset: if use_native_input_offsets { params.color_origin } else { [0, 0] },
+            depth_offset: if use_native_input_offsets { params.depth_origin } else { [0, 0] },
+            motion_offset: if use_native_input_offsets { params.motion_origin } else { [0, 0] },
+            reactive_offset: if use_native_input_offsets { params.reactive_origin } else { [0, 0] },
+            output_offset: if direct_ok && use_native_offsets { params.output_origin } else { [0, 0] },
             jitter_offset: params.jitter_offset,
             motion_vector_scale: params.motion_vector_scale,
             reset: params.reset,
@@ -1772,13 +1790,18 @@ impl CommandList {
             binary_value: if binary_value.is_finite() { binary_value } else { 0.0 },
             _pad1: 0.0,
         };
+        let (kernel_name, grid) = if crate::metal::m41::block_read_kernels_enabled() {
+            ("port_ffx_gen_reactive_2d_b2", [w.div_ceil(2), h, 1])
+        } else {
+            ("port_ffx_gen_reactive_2d", [w, h, 1])
+        };
         self.util_dispatch_3tex_with(
-            "port_ffx_gen_reactive_2d",
+            kernel_name,
             Some(&ov),
             Some(&pv),
             Some(&dv),
             clear::bytes_of(&params),
-            [w, h, 1],
+            grid,
             &touch,
             barrier_tight_stages(),
         )
