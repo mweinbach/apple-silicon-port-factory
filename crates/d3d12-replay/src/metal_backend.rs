@@ -132,6 +132,9 @@ struct LiveCommandList {
     alloc_id: u64,
     initial_pso: u64,
     open_ts_slot: Option<u32>,
+    /// Closed `(start_slot, end_slot)` timestamp pair awaiting actual submission via
+    /// `ExecuteCommandLists`; discarded recordings (`Reset` without submit) are never summed.
+    closed_ts_pair: Option<(u32, u32)>,
     /// True once this closed command list has been submitted via `ExecuteCommandLists`
     /// since its last `begin`/`Reset`, so timed benchmarks reject re-executing the same
     /// baked timestamp writes into identical counter-heap slots.
@@ -354,13 +357,9 @@ impl MetalBackend {
         self.retired.clear();
     }
 
-    /// Drain every busy queue whose enqueued fence waits are already transitively satisfied
-    /// by prior signals, avoiding deadlocks on queues waiting for a producer that appears
-    /// later in the trace.
-    fn drain_unblocked_queues(&mut self) {
-        if self.queue_busy.is_empty() {
-            return;
-        }
+    /// Return IDs of any busy queues currently blocked on fence waits that have not been
+    /// transitively satisfied by prior signals (draining them would deadlock).
+    pub fn blocked_queues(&self) -> Vec<u64> {
         let mut blocked: HashSet<u64> = HashSet::new();
         loop {
             let mut changed = false;
@@ -384,6 +383,24 @@ impl MetalBackend {
                 break;
             }
         }
+        let mut out: Vec<u64> = self
+            .queue_busy
+            .iter()
+            .copied()
+            .filter(|qid| blocked.contains(qid))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Drain every busy queue whose enqueued fence waits are already transitively satisfied
+    /// by prior signals, avoiding deadlocks on queues waiting for a producer that appears
+    /// later in the trace.
+    fn drain_unblocked_queues(&mut self) {
+        if self.queue_busy.is_empty() {
+            return;
+        }
+        let blocked: HashSet<u64> = self.blocked_queues().into_iter().collect();
         let drainable: Vec<u64> = self
             .queue_busy
             .iter()
@@ -514,6 +531,7 @@ impl MetalBackend {
                 }
             }
             l.open_ts_slot = ts_slot;
+            l.closed_ts_pair = None;
             l.submitted_since_reset = false;
             l.pending_indirect_relocs.clear();
             if let Some(p) = pso {
@@ -801,6 +819,7 @@ impl Backend for MetalBackend {
                         alloc_id: *allocator,
                         initial_pso: *initial_pso,
                         open_ts_slot,
+                        closed_ts_pair: None,
                         submitted_since_reset: false,
                         pending_indirect_relocs: Vec::new(),
                     },
@@ -1190,6 +1209,7 @@ impl Backend for MetalBackend {
                     }
                 }
                 l.open_ts_slot = open_ts_slot;
+                l.closed_ts_pair = None;
                 l.submitted_since_reset = false;
                 l.pending_indirect_relocs.clear();
                 if let Some(p) = live_pso {
@@ -1202,12 +1222,13 @@ impl Backend for MetalBackend {
                     .lists
                     .get_mut(list)
                     .ok_or_else(|| format!("Close unknown command list {list:#x}"))?;
+                l.closed_ts_pair = None;
                 if let Some(start_slot) = l.open_ts_slot.take() {
                     if self.timing_armed {
                         if let Some(timer) = self.gpu_timer.as_mut() {
                             let end_slot = timer.alloc_slot()?;
                             l.cl.write_timestamp(&timer.heap, end_slot)?;
-                            timer.pairs.push((start_slot, end_slot));
+                            l.closed_ts_pair = Some((start_slot, end_slot));
                         }
                     }
                 }
@@ -1869,6 +1890,13 @@ impl Backend for MetalBackend {
                 }
                 self.queue_busy.insert(*queue);
                 for (id, mut l) in taken {
+                    if self.timing_armed {
+                        if let Some(pair) = l.closed_ts_pair.take() {
+                            if let Some(timer) = self.gpu_timer.as_mut() {
+                                timer.pairs.push(pair);
+                            }
+                        }
+                    }
                     l.submitted_since_reset = true;
                     self.lists.insert(id, l);
                 }
@@ -1982,6 +2010,19 @@ impl Backend for MetalBackend {
 
 impl Drop for MetalBackend {
     fn drop(&mut self) {
+        // Release any blocked cross-queue waits via CPU signal before draining so dropping
+        // a rejected backend after an early error never hangs waiting on an unsignaled fence.
+        if !self.blocked_queues().is_empty() {
+            for waits in self.queue_waits.values() {
+                for &(fid, val) in waits {
+                    if let Some(f) = self.fences.get(&fid) {
+                        if f.completed() < val {
+                            f.signal_cpu(val);
+                        }
+                    }
+                }
+            }
+        }
         self.wait_all_idle();
     }
 }

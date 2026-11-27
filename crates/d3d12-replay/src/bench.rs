@@ -359,6 +359,13 @@ pub(crate) fn run_bench_with_timer_capacity(
             Err(e) => failures.push(format!("setup #{} {}: {e}", rec.index, rec.call.name())),
         }
     }
+    let blocked = backend.blocked_queues();
+    if !blocked.is_empty() {
+        anyhow::bail!(
+            "cannot benchmark trace: setup prefix [0..{frame_start}] leaves queue(s) {blocked:?} \
+             blocked on fence signals not produced before frame_start"
+        );
+    }
     backend.wait_all_idle();
     let swapchain_indices = backend.snapshot_swapchain_indices();
     let fence_values = backend.snapshot_fence_values();
@@ -390,6 +397,13 @@ pub(crate) fn run_bench_with_timer_capacity(
                     }
                     Err(e) => failures.push(format!("warmup {iter} #{} {}: {e}", rec.index, rec.call.name())),
                 }
+            }
+            let blocked = backend.blocked_queues();
+            if !blocked.is_empty() {
+                anyhow::bail!(
+                    "cannot benchmark trace: warmup {iter} leaves queue(s) {blocked:?} \
+                     blocked on unsignaled cross-frame fence waits"
+                );
             }
             backend.wait_all_idle();
             Ok(())
@@ -438,6 +452,13 @@ pub(crate) fn run_bench_with_timer_capacity(
                     }
                     Err(e) => failures.push(format!("iter {iter} #{} {}: {e}", rec.index, rec.call.name())),
                 }
+            }
+            let blocked = backend.blocked_queues();
+            if !blocked.is_empty() {
+                anyhow::bail!(
+                    "cannot benchmark trace: iteration {iter} leaves queue(s) {blocked:?} \
+                     blocked on unsignaled cross-frame fence waits"
+                );
             }
             backend.wait_all_idle();
             let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
