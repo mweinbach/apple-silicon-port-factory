@@ -41,11 +41,16 @@ _SECRET_ARG_PREFIXES = (
     "-auth_exchangecode=",
     "-epicuserid=",
     "-epicusername=",
+    "-betapassword=",
+    "-branchpassword=",
+    "-password=",
     "--token=",
     "--password=",
     "--secret=",
     "--sid=",
     "--auth-code=",
+    "--api-key=",
+    "--branch-password=",
 )
 
 _SECRET_ARG_FLAGS_WITH_VALUE = {
@@ -54,15 +59,20 @@ _SECRET_ARG_FLAGS_WITH_VALUE = {
     "-auth_type",
     "-auth_exchangecode",
     "-epicuserid",
+    "-betapassword",
+    "-branchpassword",
+    "-password",
     "--token",
     "--password",
     "--secret",
     "--sid",
     "--auth-code",
+    "--api-key",
+    "--branch-password",
 }
 
 _SECRET_ENV_PATTERNS = re.compile(
-    r"(TOKEN|PASSWORD|SECRET|COOKIE|AUTH|CREDENTIAL|EXCHANGE_CODE|SESSION|SID)",
+    r"(TOKEN|PASSWORD|SECRET|COOKIE|AUTH|CREDENTIAL|EXCHANGE_CODE|SESSION|SID|API_KEY)",
     re.IGNORECASE,
 )
 
@@ -111,6 +121,9 @@ def build_package_manifest(
     launch_plan: LaunchPlan | None = None,
     eos_overlay_path: str | None = None,
     extra_redists: list[RedistributableItem] | None = None,
+    branch: str | None = None,
+    downloaded_depots: list[str] | None = None,
+    downloaded_redists: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a schema-v1 `port-acquire-manifest.json` dictionary (strictly secret-free)."""
     install_dir_str = str(install_dir)
@@ -172,18 +185,26 @@ def build_package_manifest(
         "title": info.title,
         "platform": info.platform,
         "version": info.version,
+        "branch": branch,
         "install_dir": install_dir_str,
         "executable": executable,
         "working_dir": working_dir,
         "launch_args": safe_args,
         "launch_env": safe_env,
         "redacted_auth_args": bool(args_redacted or env_redacted),
+        "depots": [d.to_dict() for d in info.depots],
+        "downloaded_depots": list(downloaded_depots or []),
+        "branches": list(info.branches),
         "dlcs": [d.to_dict() for d in dlcs],
         "redistributables": [r.to_dict() for r in redists],
+        "downloaded_redists": list(downloaded_redists or []),
+        "proton_redist_info": dict(info.proton_redist_info),
         "compatibility_signals": {
             "can_run_offline": info.can_run_offline,
             "requires_eos": info.requires_eos,
             "eos_signals": list(info.eos_signals),
+            "requires_steamworks": info.requires_steamworks,
+            "steamworks_signals": list(info.steamworks_signals),
             "anticheat": anticheat.to_dict(),
             "drm": drm.to_dict(),
         },
@@ -193,7 +214,8 @@ def build_package_manifest(
             "notes": (
                 "Consumed by .app packaging (`crates/port-factory/src/steam_library/"
                 "macos_bundle.rs` & `vdf.rs`) to resolve executable, non-secret launch "
-                "args, DLCs, and Win32-native vs bundled redistributables."
+                "args, depots, DLCs, Proton-adjacent redist info, and Win32-native vs "
+                "bundled redistributables."
             ),
         },
     }
@@ -246,12 +268,18 @@ def render_starter_game_toml(manifest: dict[str, Any]) -> str:
         f'win_dir = "C:\\\\Games\\\\{_toml_escape(exec_ident)}"',
         f'log_name = "{_toml_escape(exec_ident)}.log"',
         'computer_name = "WIN64PORT"',
+    ]
+    if str(manifest.get("store") or "").lower() == "steam":
+        raw_app_id = str(manifest.get("app_id") or "").strip()
+        if raw_app_id.isdigit():
+            lines.append(f'steam_app_id = "{raw_app_id}"')
+    lines.extend([
         "",
         "[runtime]",
         "preferred_base_retry = false",
         "v8_jitless = false",
         "legacy_remedy_migration = false",
-    ]
+    ])
     if args_str:
         lines.append(f'args = "{_toml_escape(args_str)}"')
     lines.append("")

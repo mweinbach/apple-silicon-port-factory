@@ -209,6 +209,27 @@ class SearchMatch:
 
 
 @dataclass
+class DepotItem:
+    """One store content depot (e.g. Steam Windows x64, DLC, or shared redist depot)."""
+
+    depot_id: str
+    name: str = ""
+    oslist: list[str] = field(default_factory=list)
+    osarch: str | None = None
+    language: str | None = None
+    manifest_gid: str | None = None
+    size_bytes: int | None = None
+    download_bytes: int | None = None
+    dlc_app_id: str | None = None
+    shared_install: bool = False
+    depot_from_app: str | None = None
+    is_common_redist: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class GameInfo:
     """Detailed pre-download or post-download inspection for one owned title."""
 
@@ -225,10 +246,15 @@ class GameInfo:
     can_run_offline: bool | None = None
     requires_eos: bool = False
     eos_signals: list[str] = field(default_factory=list)
+    requires_steamworks: bool = False
+    steamworks_signals: list[str] = field(default_factory=list)
     anticheat: AnticheatReport = field(default_factory=AnticheatReport)
     drm: DrmReport = field(default_factory=DrmReport)
+    depots: list[DepotItem] = field(default_factory=list)
+    branches: list[dict[str, Any]] = field(default_factory=list)
     dlcs: list[DlcItem] = field(default_factory=list)
     redistributables: list[RedistributableItem] = field(default_factory=list)
+    proton_redist_info: dict[str, Any] = field(default_factory=dict)
     manifest_files_checked: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -246,6 +272,10 @@ class DownloadOptions:
     skip_dlcs: bool = True
     dlcs: tuple[str, ...] = ()
     with_eos_overlay: bool = False
+    with_redists: bool = False
+    branch: str | None = None
+    branch_password: str | None = None
+    validate: bool = False
     no_register: bool = False
     max_workers: int | None = None
     extra_args: tuple[str, ...] = ()
@@ -261,7 +291,10 @@ class DownloadResult:
     platform: str
     install_path: str
     version: str | None = None
+    branch: str | None = None
     downloaded_dlcs: list[str] = field(default_factory=list)
+    downloaded_depots: list[str] = field(default_factory=list)
+    downloaded_redists: list[str] = field(default_factory=list)
     eos_overlay_path: str | None = None
     manifest_path: str | None = None
 

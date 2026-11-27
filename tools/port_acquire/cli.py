@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 from pathlib import Path
@@ -130,6 +131,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--logout",
         action="store_true",
         help="Remove saved credentials from the backend config (log out)",
+    )
+    p_login.add_argument(
+        "--username",
+        default=None,
+        help="Store account username (e.g. Steam login name; never pass passwords on CLI)",
     )
 
     # status
@@ -267,6 +273,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also download official EOS Overlay redistributable bits into the destination",
     )
     p_dl.add_argument(
+        "--with-redists",
+        action="store_true",
+        help="Also fetch store shared redistributables (e.g. Steamworks Common Redistributables / _CommonRedist)",
+    )
+    p_dl.add_argument(
+        "--branch",
+        default=None,
+        help="Optional store release branch/beta name (e.g. public, beta, experimental)",
+    )
+    p_dl.add_argument(
+        "--branch-password-env",
+        default=None,
+        help="Environment variable name containing a private beta branch password (never logged)",
+    )
+    p_dl.add_argument(
+        "--validate",
+        action="store_true",
+        help="Verify downloaded files against store checksums during download",
+    )
+    p_dl.add_argument(
         "--no-register",
         action="store_true",
         help="Download files without registering the install in the backend database",
@@ -362,6 +388,9 @@ def _write_manifest_for_install(
     platform: str,
     manifest_out: Path,
     eos_overlay_path: str | None = None,
+    branch: str | None = None,
+    downloaded_depots: list[str] | None = None,
+    downloaded_redists: list[str] | None = None,
     offline: bool = True,
 ) -> dict[str, Any]:
     try:
@@ -382,6 +411,9 @@ def _write_manifest_for_install(
         launch_plan=launch_plan,
         eos_overlay_path=eos_overlay_path,
         extra_redists=disk_redists,
+        branch=branch,
+        downloaded_depots=downloaded_depots,
+        downloaded_redists=downloaded_redists,
     )
     write_package_manifest(manifest, manifest_out)
     return manifest
@@ -404,12 +436,17 @@ def _dispatch(args: argparse.Namespace) -> int:
     backend = get_backend(store_name)
 
     if cmd == "login":
-        status = backend.login(
-            no_webview=bool(args.no_webview),
-            auth_code=args.code,
-            import_existing=bool(args.import_existing),
-            logout=bool(args.logout),
-        )
+        login_kwargs: dict[str, Any] = {
+            "no_webview": bool(args.no_webview),
+            "auth_code": args.code,
+            "import_existing": bool(args.import_existing),
+            "logout": bool(args.logout),
+        }
+        if args.username is not None:
+            sig = inspect.signature(backend.login)
+            if "username" in sig.parameters:
+                login_kwargs["username"] = args.username
+        status = backend.login(**login_kwargs)
         lines = [
             f"Store: {status.store}",
             f"Logged in: {status.logged_in}",
@@ -490,10 +527,14 @@ def _dispatch(args: argparse.Namespace) -> int:
             f"Offline OK: {info.can_run_offline}",
             f"EOS needed: {info.requires_eos}"
             + (f" ({', '.join(info.eos_signals)})" if info.eos_signals else ""),
+            f"Steamworks: {info.requires_steamworks}"
+            + (f" ({', '.join(info.steamworks_signals)})" if info.steamworks_signals else ""),
             f"Anti-cheat: {'DETECTED: ' + ', '.join(info.anticheat.systems) if info.anticheat.detected else 'none detected'} (report-only)",
             f"DRM/Auth:   {'DETECTED' if info.drm.detected else 'none detected'}"
             + (f" (signals: {', '.join(info.drm.signals)})" if info.drm.signals else "")
             + " (report-only)",
+            f"Depots:     {len(info.depots)}",
+            f"Branches:   {', '.join(b.get('name', '?') for b in info.branches) if info.branches else '(none)'}",
             f"DLCs:       {len(info.dlcs)}",
             f"Redists:    {len(info.redistributables)}",
         ]
@@ -551,6 +592,15 @@ def _dispatch(args: argparse.Namespace) -> int:
         else:
             dest = Path(args.dest).expanduser().resolve()
 
+        branch_password: str | None = None
+        if args.branch_password_env:
+            branch_password = os.environ.get(args.branch_password_env)
+            if not branch_password:
+                raise AcquireError(
+                    f"branch password env var {args.branch_password_env!r} is unset or empty",
+                    code="missing_branch_password",
+                )
+
         opts = DownloadOptions(
             app_id=args.app,
             dest=dest,
@@ -559,6 +609,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             skip_dlcs=not bool(args.with_dlcs) and not bool(args.dlc),
             dlcs=tuple(args.dlc or ()),
             with_eos_overlay=bool(args.with_eos_overlay),
+            with_redists=bool(args.with_redists),
+            branch=args.branch,
+            branch_password=branch_password,
+            validate=bool(args.validate),
             no_register=bool(args.no_register),
             max_workers=args.max_workers,
         )
@@ -578,6 +632,9 @@ def _dispatch(args: argparse.Namespace) -> int:
                 platform=result.platform,
                 manifest_out=manifest_path,
                 eos_overlay_path=result.eos_overlay_path,
+                branch=result.branch,
+                downloaded_depots=result.downloaded_depots,
+                downloaded_redists=result.downloaded_redists,
                 offline=True,
             )
             result.manifest_path = str(manifest_path)
@@ -586,8 +643,12 @@ def _dispatch(args: argparse.Namespace) -> int:
             f"Downloaded {result.title} ({result.app_id}) [{result.platform}]",
             f"  Install path: {result.install_path}",
         ]
+        if result.branch:
+            lines.append(f"  Branch:       {result.branch}")
         if result.downloaded_dlcs:
             lines.append(f"  DLCs:         {', '.join(result.downloaded_dlcs)}")
+        if result.downloaded_redists:
+            lines.append(f"  Redists:      {', '.join(result.downloaded_redists)}")
         if result.eos_overlay_path:
             lines.append(f"  EOS overlay:  {result.eos_overlay_path}")
         if result.manifest_path:
