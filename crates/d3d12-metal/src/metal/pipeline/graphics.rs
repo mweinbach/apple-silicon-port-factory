@@ -244,18 +244,29 @@ impl GraphicsPipeline {
         gs_dxil: &[u8],
         label: &str,
     ) -> Result<GraphicsPipeline, String> {
-        Self::new_geometry_in_cache(
+        let immut_opt = shader_immutable_opt();
+        let pso_opt_v2 = shader_pso_opt_v2();
+        let rs_for_manifest = rs.clone();
+        let out = Self::new_geometry_in_cache(
             pso_cache()?,
             rs,
             d,
             gs_dxil,
             label,
-            shader_immutable_opt(),
-            shader_pso_opt_v2(),
-        )
+            immut_opt,
+            pso_opt_v2,
+        )?;
+        crate::metal::pso_manifest::note_geometry(
+            &rs_for_manifest,
+            d,
+            gs_dxil,
+            immut_opt,
+            pso_opt_v2,
+        );
+        Ok(out)
     }
 
-    fn new_geometry_in_cache(
+    pub(crate) fn new_geometry_in_cache(
         cache: &PipelineCache,
         rs: Arc<RootSignature>,
         d: &GraphicsDesc,
@@ -540,7 +551,10 @@ impl GraphicsPipeline {
         gs_dxil: Option<&[u8]>,
         label: &str,
     ) -> Result<GraphicsPipeline, String> {
-        Self::new_tessellation_in_cache(
+        let immut_opt = shader_immutable_opt();
+        let pso_opt_v2 = shader_pso_opt_v2();
+        let rs_for_manifest = rs.clone();
+        let out = Self::new_tessellation_in_cache(
             pso_cache()?,
             rs,
             d,
@@ -548,13 +562,23 @@ impl GraphicsPipeline {
             ds_dxil,
             gs_dxil,
             label,
-            shader_immutable_opt(),
-            shader_pso_opt_v2(),
-        )
+            immut_opt,
+            pso_opt_v2,
+        )?;
+        crate::metal::pso_manifest::note_tessellation(
+            &rs_for_manifest,
+            d,
+            hs_dxil,
+            ds_dxil,
+            gs_dxil,
+            immut_opt,
+            pso_opt_v2,
+        );
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new_tessellation_in_cache(
+    pub(crate) fn new_tessellation_in_cache(
         cache: &PipelineCache,
         rs: Arc<RootSignature>,
         d: &GraphicsDesc,
@@ -983,6 +1007,7 @@ impl GraphicsPipeline {
             lazy_icb,
             immut_opt,
             pso_opt_v2,
+            out.icb_desc.as_ref().map(|(_, k)| *k),
         );
         Ok(out)
     }
@@ -1294,11 +1319,26 @@ impl GraphicsPipeline {
                 desc.setSupportIndirectCommandBuffers(
                     MTL4IndirectCommandBufferSupportState::Enabled,
                 );
-                pso_cache()?
+                let pso = pso_cache()?
                     .render_pipeline(Some(*icb_key), desc)
-                    .map_err(|e| format!("render pipeline (icb): {e}"))
+                    .map_err(|e| format!("render pipeline (icb): {e}"))?;
+                crate::metal::pso_manifest::note_graphics_icb(*icb_key);
+                Ok(pso)
             })
             .as_deref()
             .map_err(Clone::clone)
+    }
+
+    /// Prewarms the ICB-capable `MTLRenderPipelineState` variant directly into `cache`
+    /// during cold-device shader prewarming so `icb_pso()` never compiles on demand mid-gameplay.
+    pub(crate) fn prewarm_icb_in_cache(&self, cache: &PipelineCache) -> Result<(), String> {
+        let Some((desc, icb_key)) = &self.icb_desc else {
+            return Ok(());
+        };
+        desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
+        cache
+            .render_pipeline(Some(*icb_key), desc)
+            .map(|_| ())
+            .map_err(|e| format!("render pipeline (icb prewarm): {e}"))
     }
 }

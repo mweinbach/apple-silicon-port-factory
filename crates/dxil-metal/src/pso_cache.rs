@@ -32,10 +32,10 @@
 //! # let _ = (compiler, pso); Ok(()) }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use objc2::rc::Retained;
@@ -98,7 +98,12 @@ pub const DEFAULT_MAX_ARCHIVES: usize = 256;
 #[cfg(not(target_os = "ios"))]
 pub const DEFAULT_MAX_ARCHIVES: usize = 64;
 const ARCHIVE_EXT: &str = "mtl4a";
+const IDX_EXT: &str = "idx";
 const TMP_PREFIX: &str = "tmp-";
+const IDX_MAGIC: [u8; 4] = *b"M4IX";
+const IDX_VERSION: u32 = 1;
+const KIND_COMPUTE: u8 = 1;
+const KIND_RENDER: u8 = 2;
 
 /// Number of cold `MTL4Compiler` compiles between automatic mid-frame flush + compiler
 /// resets (`PORT_IOS_PSO_RESET_BATCH`, default `12` on iOS, `0` = disabled on macOS).
@@ -137,6 +142,8 @@ pub struct PipelineCacheStats {
 struct Counters {
     memory_hits: AtomicU64,
     archive_hits: AtomicU64,
+    archive_probes: AtomicU64,
+    in_flight_waits: AtomicU64,
     compiles: AtomicU64,
     failures: AtomicU64,
     archives_loaded: AtomicU64,
@@ -232,29 +239,153 @@ impl CompileLimiter {
     }
 }
 
-/// Pipeline-state cache; see the [module docs](self). Thread-safe.
-pub struct PipelineCache {
+struct InFlightSlot {
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// Per-key singleflight table preventing duplicate concurrent archive probes and
+/// `MTL4Compiler` invocations when multiple threads request the same PSO key.
+#[derive(Default)]
+struct InFlightTable {
+    active: Mutex<HashMap<u128, Arc<InFlightSlot>>>,
+}
+
+struct InFlightGuard<'a> {
+    table: &'a InFlightTable,
+    key: u128,
+    slot: Arc<InFlightSlot>,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut map = self.table.active.lock().unwrap();
+            map.remove(&self.key);
+        }
+        {
+            let mut done = self.slot.done.lock().unwrap();
+            *done = true;
+        }
+        self.slot.cv.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct BgFlushState {
+    requested: bool,
+    in_flight: bool,
+    sync_waiters: usize,
+    shutdown: bool,
+}
+
+/// Shared serializer & archive-writing state accessible from both foreground calls
+/// and the background incremental serializer thread.
+struct FlushCore {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     compiler: RwLock<Retained<ProtocolObject<dyn MTL4Compiler>>>,
     serializer: Mutex<Option<Serializer>>,
+    /// `(kind, key)` pairs captured by the current `serializer` instance.
+    serializer_keys: Mutex<HashSet<(u8, u128)>>,
     compile_lock: RwLock<()>,
-    compile_limiter: CompileLimiter,
-    post_batch_hook: Mutex<Option<fn()>>,
-    archives: Vec<Retained<ProtocolObject<dyn MTL4Archive>>>,
     /// Archive files loaded at open (deleted only after a final compacting flush).
     archive_paths: Vec<PathBuf>,
     /// `<dir>/<device id>` when disk caching is on.
     device_dir: Option<PathBuf>,
-    /// Human-readable `MTLDevice.name | macOS build` identity string.
-    device_id_str: String,
     compacting: bool,
     dirty: AtomicBool,
     compiles_since_flush: AtomicU64,
     flushed: AtomicBool,
+    counters: Counters,
+    bg_mu: Mutex<BgFlushState>,
+    bg_cv: Condvar,
+}
+unsafe impl Send for FlushCore {}
+unsafe impl Sync for FlushCore {}
+
+fn idx_path(archive_path: &Path) -> PathBuf {
+    archive_path.with_extension(IDX_EXT)
+}
+
+fn read_archive_index(archive_path: &Path) -> Option<Vec<(u8, u128)>> {
+    let expected_len = std::fs::metadata(archive_path).ok()?.len();
+    let idx_p = idx_path(archive_path);
+    let b = std::fs::read(&idx_p).ok()?;
+    if b.len() < 28 || b[..4] != IDX_MAGIC {
+        let _ = std::fs::remove_file(&idx_p);
+        return None;
+    }
+    let version = u32::from_le_bytes(b[4..8].try_into().ok()?);
+    let archive_len = u64::from_le_bytes(b[8..16].try_into().ok()?);
+    let count = u32::from_le_bytes(b[16..20].try_into().ok()?) as usize;
+    let payload_end = 20usize.checked_add(count.checked_mul(17)?)?;
+    if version != IDX_VERSION || archive_len != expected_len || b.len() != payload_end + 8 {
+        let _ = std::fs::remove_file(&idx_p);
+        return None;
+    }
+    let expected_sum = crate::hash::xxh64(&b[..payload_end], 0).to_le_bytes();
+    if b[payload_end..] != expected_sum {
+        let _ = std::fs::remove_file(&idx_p);
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 20 + i * 17;
+        let kind = b[off];
+        let key = u128::from_le_bytes(b[off + 1..off + 17].try_into().ok()?);
+        out.push((kind, key));
+    }
+    Some(out)
+}
+
+fn write_archive_index(archive_path: &Path, keys: &[(u8, u128)]) -> Result<(), Error> {
+    let archive_len = std::fs::metadata(archive_path)
+        .map_err(|e| Error::Io(format!("pso cache: stat {}: {e}", archive_path.display())))?
+        .len();
+    let mut buf = Vec::with_capacity(28 + keys.len() * 17);
+    buf.extend_from_slice(&IDX_MAGIC);
+    buf.extend_from_slice(&IDX_VERSION.to_le_bytes());
+    buf.extend_from_slice(&archive_len.to_le_bytes());
+    buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for &(kind, key) in keys {
+        buf.push(kind);
+        buf.extend_from_slice(&key.to_le_bytes());
+    }
+    let sum = crate::hash::xxh64(&buf, 0).to_le_bytes();
+    buf.extend_from_slice(&sum);
+    let dst = idx_path(archive_path);
+    let tmp_name = dst
+        .file_name()
+        .map(|n| format!("{TMP_PREFIX}{}", n.to_string_lossy()))
+        .unwrap_or_else(|| format!("{TMP_PREFIX}index.{IDX_EXT}"));
+    let tmp = dst.with_file_name(tmp_name);
+    std::fs::write(&tmp, &buf)
+        .map_err(|e| Error::Io(format!("pso cache: write {}: {e}", tmp.display())))?;
+    if let Err(e) = std::fs::rename(&tmp, &dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Io(format!("pso cache: rename {}: {e}", dst.display())));
+    }
+    Ok(())
+}
+
+/// Pipeline-state cache; see the [module docs](self). Thread-safe.
+pub struct PipelineCache {
+    flush_core: Arc<FlushCore>,
+    bg_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    compile_limiter: CompileLimiter,
+    post_batch_hook: Mutex<Option<fn()>>,
+    archives: Vec<Retained<ProtocolObject<dyn MTL4Archive>>>,
+    /// Persistent + runtime index mapping `(kind, key)` to the archive index holding it.
+    key_to_archive: RwLock<HashMap<(u8, u128), usize>>,
+    /// Legacy or corrupt-index archive indices that lack a verified `.idx` sidecar.
+    unindexed_archives: Vec<usize>,
+    /// Human-readable `MTLDevice.name | macOS build` identity string.
+    device_id_str: String,
     flush_on_drop: bool,
     compute: RwLock<HashMap<u128, ComputePipeline>>,
     render: RwLock<HashMap<u128, RenderPipeline>>,
-    counters: Counters,
+    in_flight_compute: InFlightTable,
+    in_flight_render: InFlightTable,
 }
 
 fn create_compiler_and_serializer(
@@ -373,15 +504,23 @@ impl PipelineCache {
 
         let mut archives = Vec::new();
         let mut archive_paths = Vec::new();
+        let mut key_to_archive: HashMap<(u8, u128), usize> = HashMap::new();
+        let mut unindexed_archives: Vec<usize> = Vec::new();
+        let mut orphan_idxs: Vec<PathBuf> = Vec::new();
         if let Some(d) = &device_dir {
             let mut files: Vec<PathBuf> = std::fs::read_dir(d)
                 .map(|it| it.filter_map(|e| e.ok().map(|e| e.path())).collect())
                 .unwrap_or_default();
             files.sort();
+            let mut live_archives: HashSet<PathBuf> = HashSet::new();
             for p in files {
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 if name.starts_with(TMP_PREFIX) {
                     let _ = std::fs::remove_file(&p); // torn write from a crashed session
+                    continue;
+                }
+                if p.extension().and_then(|e| e.to_str()) == Some(IDX_EXT) {
+                    orphan_idxs.push(p);
                     continue;
                 }
                 if p.extension().and_then(|e| e.to_str()) != Some(ARCHIVE_EXT) {
@@ -395,6 +534,15 @@ impl PipelineCache {
                 });
                 match r {
                     Ok(a) => {
+                        let slot = archives.len();
+                        if let Some(entries) = read_archive_index(&p) {
+                            for (kind, key) in entries {
+                                key_to_archive.insert((kind, key), slot);
+                            }
+                        } else {
+                            unindexed_archives.push(slot);
+                        }
+                        live_archives.insert(p.clone());
                         archives.push(a);
                         archive_paths.push(p);
                         counters.archives_loaded.fetch_add(1, Ordering::Relaxed);
@@ -402,8 +550,15 @@ impl PipelineCache {
                     Err(e) => {
                         log::warn!("pso cache: dropping unreadable archive {}: {e}", p.display());
                         let _ = std::fs::remove_file(&p);
+                        let _ = std::fs::remove_file(idx_path(&p));
                         counters.archives_rejected.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+            }
+            for ip in orphan_idxs {
+                let matching_archive = ip.with_extension(ARCHIVE_EXT);
+                if !live_archives.contains(&matching_archive) {
+                    let _ = std::fs::remove_file(&ip);
                 }
             }
         }
@@ -411,30 +566,46 @@ impl PipelineCache {
         let (compiler, serializer) = create_compiler_and_serializer(device, device_dir.is_some())?;
         let compacting = archives.len() > config.max_archives.max(1);
         if !archives.is_empty() {
-            log::info!("pso cache: loaded {} archive(s)", archives.len());
+            log::info!(
+                "pso cache: loaded {} archive(s) ({} indexed keys, {} unindexed)",
+                archives.len(),
+                key_to_archive.len(),
+                unindexed_archives.len()
+            );
         }
         if compacting {
             log::info!("pso cache: {} archives > {}; compacting this session", archives.len(), config.max_archives);
         }
-        Ok(Self {
+        let flush_core = Arc::new(FlushCore {
             device: objc2::Message::retain(device),
             compiler: RwLock::new(compiler),
             serializer: Mutex::new(serializer),
+            serializer_keys: Mutex::new(HashSet::new()),
             compile_lock: RwLock::new(()),
-            compile_limiter: CompileLimiter::from_env(),
-            post_batch_hook: Mutex::new(None),
-            archives,
             archive_paths,
             device_dir,
-            device_id_str,
             compacting,
             dirty: AtomicBool::new(false),
             compiles_since_flush: AtomicU64::new(0),
             flushed: AtomicBool::new(false),
+            counters,
+            bg_mu: Mutex::new(BgFlushState::default()),
+            bg_cv: Condvar::new(),
+        });
+        Ok(Self {
+            flush_core,
+            bg_thread: Mutex::new(None),
+            compile_limiter: CompileLimiter::from_env(),
+            post_batch_hook: Mutex::new(None),
+            archives,
+            key_to_archive: RwLock::new(key_to_archive),
+            unindexed_archives,
+            device_id_str,
             flush_on_drop: config.flush_on_drop,
             compute: RwLock::new(HashMap::new()),
             render: RwLock::new(HashMap::new()),
-            counters,
+            in_flight_compute: InFlightTable::default(),
+            in_flight_render: InFlightTable::default(),
         })
     }
 
@@ -442,7 +613,7 @@ impl PipelineCache {
     /// too, e.g. `newLibraryWithDescriptor`. Pipelines built on it directly are also captured
     /// for the next archive.
     pub fn compiler(&self) -> Retained<ProtocolObject<dyn MTL4Compiler>> {
-        self.compiler.read().unwrap().clone()
+        self.flush_core.compiler.read().unwrap().clone()
     }
 
     /// Register a callback invoked after an automatic mid-frame PSO batch flush + compiler
@@ -454,12 +625,12 @@ impl PipelineCache {
 
     /// Directory holding this device's archives (`None` = disk caching off).
     pub fn dir(&self) -> Option<&Path> {
-        self.device_dir.as_deref()
+        self.flush_core.device_dir.as_deref()
     }
 
     /// Parent root directory containing per-device subdirectories (`None` = disk caching off).
     pub fn root_dir(&self) -> Option<&Path> {
-        self.device_dir.as_deref().and_then(Path::parent)
+        self.flush_core.device_dir.as_deref().and_then(Path::parent)
     }
 
     /// Human-readable `MTLDevice.name | macOS build` identity string.
@@ -470,92 +641,183 @@ impl PipelineCache {
     /// True when disk caching is active and this `(GPU, OS build)` directory has zero loaded
     /// `MTL4Archive` binaries (i.e. first launch on a new Mac or after a macOS update).
     pub fn is_cold_device(&self) -> bool {
-        self.device_dir.is_some() && self.archives.is_empty()
+        self.flush_core.device_dir.is_some() && self.archives.is_empty()
     }
 
     pub fn is_compacting(&self) -> bool {
-        self.compacting
+        self.flush_core.compacting
+    }
+
+    /// Total individual `MTL4Archive` lookup calls issued (for diagnostics/tests verifying
+    /// indexed O(1) lookups and 0-probe misses).
+    pub fn archive_probes(&self) -> u64 {
+        self.flush_core.counters.archive_probes.load(Ordering::Relaxed)
+    }
+
+    /// Number of threads that coalesced behind an already in-flight compile for the same key.
+    pub fn in_flight_waits(&self) -> u64 {
+        self.flush_core.counters.in_flight_waits.load(Ordering::Relaxed)
     }
 
     fn task_options(&self) -> Option<Retained<MTL4CompilerTaskOptions>> {
-        (self.compacting && !self.archives.is_empty()).then(|| {
+        (self.flush_core.compacting && !self.archives.is_empty()).then(|| {
             let o = MTL4CompilerTaskOptions::new();
             o.setLookupArchives(Some(&NSArray::from_retained_slice(&self.archives)));
             o
         })
     }
 
+    fn probe_archive<P>(
+        &self,
+        archive: &ProtocolObject<dyn MTL4Archive>,
+        from_archive: &impl Fn(&ProtocolObject<dyn MTL4Archive>) -> Result<P, Retained<NSError>>,
+    ) -> Option<P> {
+        self.flush_core.counters.archive_probes.fetch_add(1, Ordering::Relaxed);
+        let r = guarded("archive lookup", || from_archive(archive));
+        if let Err(e) = &r {
+            log::warn!("pso cache: {e}");
+        }
+        match r {
+            Ok(Ok(p)) => Some(p),
+            _ => None,
+        }
+    }
+
     fn build<P: Clone>(
         &self,
+        kind: u8,
         key: Option<u128>,
         memo: &RwLock<HashMap<u128, P>>,
+        in_flight: &InFlightTable,
         from_archive: impl Fn(&ProtocolObject<dyn MTL4Archive>) -> Result<P, Retained<NSError>>,
         compile: impl FnOnce(&ProtocolObject<dyn MTL4Compiler>, Option<&MTL4CompilerTaskOptions>) -> Result<P, Retained<NSError>>,
         what: &str,
     ) -> Result<P, Error> {
-        if let Some(k) = key {
-            if let Some(p) = memo.read().unwrap().get(&k) {
-                self.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(p.clone());
-            }
-        }
-        let mut did_compile = false;
-        let p = objc2::rc::autoreleasepool(|_| -> Result<P, Error> {
-            if !self.compacting {
-                let t = Instant::now();
-                for a in &self.archives {
-                    let r = guarded("archive lookup", || from_archive(a));
-                    if let Err(e) = &r {
-                        log::warn!("pso cache: {e}");
+        // 1. Fast path + per-key singleflight deduplication so concurrent requests for
+        //    the same PSO key never perform redundant archive probes or MTL4Compiler builds.
+        let _in_flight_guard = if let Some(k) = key {
+            loop {
+                if let Some(p) = memo.read().unwrap().get(&k) {
+                    self.flush_core.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(p.clone());
+                }
+                let wait_slot = {
+                    let mut map = in_flight.active.lock().unwrap();
+                    if let Some(p) = memo.read().unwrap().get(&k) {
+                        self.flush_core.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(p.clone());
                     }
-                    if let Ok(Ok(p)) = r {
-                        self.counters.archive_hits.fetch_add(1, Ordering::Relaxed);
-                        self.counters.lookup_nanos.fetch_add(nanos(t), Ordering::Relaxed);
-                        return Ok(p);
+                    if let Some(existing) = map.get(&k) {
+                        Some(existing.clone())
+                    } else {
+                        let slot = Arc::new(InFlightSlot {
+                            done: Mutex::new(false),
+                            cv: Condvar::new(),
+                        });
+                        map.insert(k, slot.clone());
+                        drop(map);
+                        break Some(InFlightGuard { table: in_flight, key: k, slot });
+                    }
+                };
+                if let Some(slot) = wait_slot {
+                    self.flush_core.counters.in_flight_waits.fetch_add(1, Ordering::Relaxed);
+                    let mut done = slot.done.lock().unwrap();
+                    while !*done {
+                        done = slot.cv.wait(done).unwrap();
                     }
                 }
-                self.counters.lookup_nanos.fetch_add(nanos(t), Ordering::Relaxed);
+            }
+        } else {
+            None
+        };
+
+        let mut did_compile = false;
+        let p = objc2::rc::autoreleasepool(|_| -> Result<P, Error> {
+            if !self.flush_core.compacting && !self.archives.is_empty() {
+                let t = Instant::now();
+                let hit = if let Some(k) = key {
+                    let indexed_slot = self.key_to_archive.read().unwrap().get(&(kind, k)).copied();
+                    let mut found = None;
+                    if let Some(idx) = indexed_slot {
+                        if let Some(a) = self.archives.get(idx) {
+                            found = self.probe_archive(a, &from_archive);
+                        }
+                    }
+                    if found.is_none() {
+                        // Only probe legacy archives that lack a verified `.idx` sidecar;
+                        // indexed archives are skipped in O(1) without touching ObjC/catch.
+                        for &idx in &self.unindexed_archives {
+                            if Some(idx) == indexed_slot {
+                                continue;
+                            }
+                            if let Some(p) = self.probe_archive(&self.archives[idx], &from_archive) {
+                                self.key_to_archive.write().unwrap().insert((kind, k), idx);
+                                found = Some(p);
+                                break;
+                            }
+                        }
+                    }
+                    found
+                } else {
+                    let mut found = None;
+                    for a in &self.archives {
+                        if let Some(p) = self.probe_archive(a, &from_archive) {
+                            found = Some(p);
+                            break;
+                        }
+                    }
+                    found
+                };
+                self.flush_core.counters.lookup_nanos.fetch_add(nanos(t), Ordering::Relaxed);
+                if let Some(p) = hit {
+                    self.flush_core.counters.archive_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(p);
+                }
             }
             let _permit = self.compile_limiter.acquire();
             // Another worker may have finished compiling this exact key while we waited.
             if let Some(k) = key {
                 if let Some(p) = memo.read().unwrap().get(&k) {
-                    self.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
+                    self.flush_core.counters.memory_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(p.clone());
                 }
             }
             let t = Instant::now();
             let opts = self.task_options();
-            let _compile_guard = self.compile_lock.read().unwrap();
-            let compiler = self.compiler.read().unwrap();
+            let _compile_guard = self.flush_core.compile_lock.read().unwrap();
+            let compiler = self.flush_core.compiler.read().unwrap();
             let r = guarded(what, || compile(&*compiler, opts.as_deref()))
                 .and_then(|r| r.map_err(|e| ns_err(what, &e)));
             drop(compiler);
-            drop(_compile_guard);
-            self.counters.compile_nanos.fetch_add(nanos(t), Ordering::Relaxed);
-            match r {
-                Ok(p) => {
-                    self.counters.compiles.fetch_add(1, Ordering::Relaxed);
-                    self.compiles_since_flush.fetch_add(1, Ordering::Relaxed);
-                    self.dirty.store(true, Ordering::Relaxed);
-                    did_compile = true;
-                    Ok(p)
+            if r.is_ok() {
+                if let Some(k) = key {
+                    self.flush_core.serializer_keys.lock().unwrap().insert((kind, k));
                 }
+                self.flush_core.counters.compiles.fetch_add(1, Ordering::Relaxed);
+                self.flush_core.compiles_since_flush.fetch_add(1, Ordering::Relaxed);
+                self.flush_core.dirty.store(true, Ordering::Release);
+                did_compile = true;
+            }
+            drop(_compile_guard);
+            self.flush_core.counters.compile_nanos.fetch_add(nanos(t), Ordering::Relaxed);
+            match r {
+                Ok(p) => Ok(p),
                 Err(e) => {
-                    self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                    self.flush_core.counters.failures.fetch_add(1, Ordering::Relaxed);
                     Err(e)
                 }
             }
         })?;
         let out = if let Some(k) = key {
-            // Another thread may have raced us; keep the first so callers share one object.
+            // Insert before releasing `_in_flight_guard` so waking waiters immediately hit `memo`.
             memo.write().unwrap().entry(k).or_insert(p).clone()
         } else {
             p
         };
-        if did_compile && !self.compacting {
+        drop(_in_flight_guard);
+        if did_compile && !self.flush_core.compacting {
             let batch = pso_reset_batch();
-            if batch > 0 && self.compiles_since_flush.load(Ordering::Relaxed) >= batch {
+            if batch > 0 && self.flush_core.compiles_since_flush.load(Ordering::Relaxed) >= batch {
                 match self.flush_and_reset_compiler_if_dirty() {
                     Ok(Some(_)) => {
                         if let Some(hook) = *self.post_batch_hook.lock().unwrap() {
@@ -637,8 +899,8 @@ impl PipelineCache {
                 if !name.is_empty() {
                     desc.setName(Some(&NSString::from_str(name)));
                 }
-                let _compile_guard = self.compile_lock.read().unwrap();
-                let compiler = self.compiler.read().unwrap();
+                let _compile_guard = self.flush_core.compile_lock.read().unwrap();
+                let compiler = self.flush_core.compiler.read().unwrap();
                 guarded(name, || compiler.newLibraryWithDescriptor_error(&desc))
                     .and_then(|r| r.map_err(|e| ns_err(name, &e)))
             })
@@ -668,8 +930,10 @@ impl PipelineCache {
     /// `CreateComputePipelineState`. `key` enables in-memory dedup.
     pub fn compute_pipeline(&self, key: Option<u128>, desc: &MTL4ComputePipelineDescriptor) -> Result<ComputePipeline, Error> {
         self.build(
+            KIND_COMPUTE,
             key,
             &self.compute,
+            &self.in_flight_compute,
             |a| a.newComputePipelineStateWithDescriptor_error(desc),
             |c, o| c.newComputePipelineStateWithDescriptor_compilerTaskOptions_error(desc, o),
             "compute pipeline",
@@ -680,19 +944,85 @@ impl PipelineCache {
     /// `key` enables in-memory dedup.
     pub fn render_pipeline(&self, key: Option<u128>, desc: &MTL4PipelineDescriptor) -> Result<RenderPipeline, Error> {
         self.build(
+            KIND_RENDER,
             key,
             &self.render,
+            &self.in_flight_render,
             |a| a.newRenderPipelineStateWithDescriptor_error(desc),
             |c, o| c.newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(desc, o),
             "render pipeline",
         )
     }
 
+    fn ensure_bg_flusher(&self) {
+        let mut slot = self.bg_thread.lock().unwrap();
+        if slot.is_some() {
+            return;
+        }
+        let core = self.flush_core.clone();
+        match std::thread::Builder::new()
+            .name("port-pso-flush".into())
+            .spawn(move || bg_flush_worker(core))
+        {
+            Ok(h) => *slot = Some(h),
+            Err(e) => {
+                log::warn!("pso cache: failed to spawn background flush thread: {e}");
+            }
+        }
+    }
+
+    /// Schedules an asynchronous mid-session incremental flush on a background utility
+    /// thread so `Present` never blocks on `serializeAsArchiveAndFlushToURL` or
+    /// `compile_lock.write()`. Returns immediately in O(1) when the cache is clean
+    /// (warm cache) or in compacting mode.
+    pub fn flush_incremental_async(&self) {
+        let core = &self.flush_core;
+        if core.device_dir.is_none()
+            || core.compacting
+            || !core.dirty.load(Ordering::Acquire)
+        {
+            return;
+        }
+        self.ensure_bg_flusher();
+        let mut st = core.bg_mu.lock().unwrap();
+        if st.shutdown {
+            return;
+        }
+        st.requested = true;
+        core.bg_cv.notify_one();
+    }
+
+    /// Waits for any in-flight background flush to finish cleanly (preventing torn `tmp-*`
+    /// files) and blocks new background flushes for the duration of `f`.
+    fn with_bg_flusher_quiesced<R>(&self, f: impl FnOnce() -> R) -> R {
+        let core = &self.flush_core;
+        {
+            let mut st = core.bg_mu.lock().unwrap();
+            st.sync_waiters += 1;
+            st.requested = false;
+            while st.in_flight {
+                st = core.bg_cv.wait(st).unwrap();
+            }
+        }
+        struct Release<'a>(&'a FlushCore);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                let mut st = self.0.bg_mu.lock().unwrap();
+                st.sync_waiters = st.sync_waiters.saturating_sub(1);
+                self.0.bg_cv.notify_all();
+            }
+        }
+        let _rel = Release(core);
+        f()
+    }
+
     /// Flushes newly compiled pipelines mid-session only when at least `min_compiles` cold
     /// compilations have accumulated since the last flush. Never deletes pre-existing
     /// archives during a compacting session (only [`Self::flush`] on shutdown may compact).
     pub fn flush_if_dirty_compiles(&self, min_compiles: u64) -> Result<Option<PathBuf>, Error> {
-        if self.compacting || self.compiles_since_flush.load(Ordering::Relaxed) < min_compiles {
+        if self.flush_core.compacting
+            || self.flush_core.compiles_since_flush.load(Ordering::Relaxed) < min_compiles
+        {
             return Ok(None);
         }
         self.flush_incremental()
@@ -702,10 +1032,10 @@ impl PipelineCache {
     /// archive without deleting any existing archives (no-op in compacting mode, so a partial
     /// mid-session flush at the main menu can never wipe level archives on disk).
     pub fn flush_incremental(&self) -> Result<Option<PathBuf>, Error> {
-        if self.compacting {
+        if self.flush_core.compacting {
             return Ok(None);
         }
-        self.flush_inner(false, false)
+        self.with_bg_flusher_quiesced(|| self.flush_core.flush_inner(false, false))
     }
 
     /// Mid-session flush + `MTL4Compiler` recreation: writes any newly compiled pipelines to
@@ -713,44 +1043,104 @@ impl PipelineCache {
     /// autorelease pool so Apple's internal LLVM/AGX compiler scratch arenas are returned to
     /// XNU immediately (critical during cold level-load PSO bursts on 6 GiB iOS Jetsam).
     pub fn flush_and_reset_compiler(&self) -> Result<Option<PathBuf>, Error> {
-        if self.compacting {
+        if self.flush_core.compacting {
             return Ok(None);
         }
-        self.flush_inner(true, false)
+        self.with_bg_flusher_quiesced(|| self.flush_core.flush_inner(true, false))
     }
 
     /// Like [`Self::flush_and_reset_compiler`], but skips compiler recreation if another
     /// thread already flushed this batch (avoids duplicate resets when multiple workers cross
     /// the batch threshold simultaneously).
     fn flush_and_reset_compiler_if_dirty(&self) -> Result<Option<PathBuf>, Error> {
-        if self.compacting {
+        if self.flush_core.compacting {
             return Ok(None);
         }
-        self.flush_inner(true, true)
+        self.with_bg_flusher_quiesced(|| self.flush_core.flush_inner(true, true))
     }
 
-    /// Final flush (called at shutdown / [`Drop`]): writes newly compiled pipelines as a new
-    /// archive, and if this session was compacting, removes the superseded archives loaded at open.
+    /// Final flush (called at shutdown / [`Drop`]): drains any in-flight background archive
+    /// write so no torn `tmp-*` files remain, writes newly compiled pipelines as a new
+    /// archive + `.idx` sidecar, and if this session was compacting, removes superseded archives.
     pub fn flush(&self) -> Result<Option<PathBuf>, Error> {
-        self.flush_inner(false, false)
+        self.with_bg_flusher_quiesced(|| self.flush_core.flush_inner(false, false))
+    }
+
+    pub fn stats(&self) -> PipelineCacheStats {
+        self.flush_core.stats()
+    }
+}
+
+fn bg_flush_worker(core: Arc<FlushCore>) {
+    loop {
+        {
+            let mut st = core.bg_mu.lock().unwrap();
+            while (!st.requested || st.sync_waiters > 0) && !st.shutdown {
+                st = core.bg_cv.wait(st).unwrap();
+            }
+            if st.shutdown {
+                st.requested = false;
+                st.in_flight = false;
+                core.bg_cv.notify_all();
+                return;
+            }
+            st.requested = false;
+            st.in_flight = true;
+        }
+        match core.flush_inner(false, false) {
+            Ok(Some(p)) => log::info!("pso cache (bg): wrote {}", p.display()),
+            Ok(None) => {}
+            Err(e) => log::warn!("pso cache (bg): flush failed: {e}"),
+        }
+        {
+            let mut st = core.bg_mu.lock().unwrap();
+            st.in_flight = false;
+            core.bg_cv.notify_all();
+        }
+    }
+}
+
+impl FlushCore {
+    fn stats(&self) -> PipelineCacheStats {
+        let c = &self.counters;
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        PipelineCacheStats {
+            memory_hits: g(&c.memory_hits),
+            archive_hits: g(&c.archive_hits),
+            compiles: g(&c.compiles),
+            failures: g(&c.failures),
+            archives_loaded: g(&c.archives_loaded),
+            archives_written: g(&c.archives_written),
+            archives_rejected: g(&c.archives_rejected),
+            lookup_nanos: g(&c.lookup_nanos),
+            compile_nanos: g(&c.compile_nanos),
+        }
     }
 
     fn flush_inner(&self, reset_compiler: bool, reset_only_if_wrote: bool) -> Result<Option<PathBuf>, Error> {
         let Some(dir) = &self.device_dir else {
             return Ok(None);
         };
+        if !reset_compiler
+            && ((self.compacting && self.flushed.load(Ordering::Acquire))
+                || !self.dirty.load(Ordering::Acquire))
+        {
+            return Ok(None);
+        }
         let _compile_guard = self.compile_lock.write().unwrap();
         let mut ser_slot = self.serializer.lock().unwrap();
         let wrote = if let Some(ser) = ser_slot.as_ref() {
-            if (self.compacting && self.flushed.load(Ordering::Relaxed))
-                || !self.dirty.swap(false, Ordering::Relaxed)
+            if (self.compacting && self.flushed.load(Ordering::Acquire))
+                || !self.dirty.swap(false, Ordering::AcqRel)
             {
                 None
             } else {
                 objc2::rc::autoreleasepool(|_| -> Result<Option<PathBuf>, Error> {
+                    static FLUSH_SEQ: AtomicU64 = AtomicU64::new(0);
+                    let seq = FLUSH_SEQ.fetch_add(1, Ordering::Relaxed);
                     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
                     let name = format!(
-                        "{}{stamp:x}-{}.{ARCHIVE_EXT}",
+                        "{}{stamp:x}-{}-{seq}.{ARCHIVE_EXT}",
                         if self.compacting { "compact-" } else { "s-" },
                         std::process::id()
                     );
@@ -761,24 +1151,36 @@ impl PipelineCache {
                     })
                     .and_then(|r| r.map_err(|e| ns_err("serializeAsArchiveAndFlushToURL", &e)));
                     if let Err(e) = r {
-                        self.dirty.store(true, Ordering::Relaxed);
+                        self.dirty.store(true, Ordering::Release);
                         let _ = std::fs::remove_file(&tmp);
                         return Err(e);
                     }
+                    // `serializeAsArchiveAndFlushToURL` drains the serializer's captured
+                    // dataset, so drain `serializer_keys` into this archive's `.idx` only
+                    // after serialization succeeds (preserving keys on error for retry).
+                    let keys_snapshot: Vec<(u8, u128)> = {
+                        let mut ks = self.serializer_keys.lock().unwrap();
+                        ks.drain().collect()
+                    };
                     self.compiles_since_flush.store(0, Ordering::Relaxed);
-                    self.flushed.store(true, Ordering::Relaxed);
+                    self.flushed.store(true, Ordering::Release);
                     std::fs::rename(&tmp, &dst)
                         .map_err(|e| Error::Io(format!("pso cache: rename {}: {e}", dst.display())))?;
+                    if let Err(e) = write_archive_index(&dst, &keys_snapshot) {
+                        log::warn!("pso cache: failed to write archive index for {}: {e}", dst.display());
+                    }
                     self.counters.archives_written.fetch_add(1, Ordering::Relaxed);
                     if self.compacting {
                         for p in &self.archive_paths {
                             let _ = std::fs::remove_file(p);
+                            let _ = std::fs::remove_file(idx_path(p));
                         }
                     }
                     let st = self.stats();
                     log::info!(
-                        "pso cache: wrote {} (archive_hits={} memory_hits={} compiles={})",
+                        "pso cache: wrote {} (keys={} archive_hits={} memory_hits={} compiles={})",
                         dst.display(),
+                        keys_snapshot.len(),
                         st.archive_hits,
                         st.memory_hits,
                         st.compiles
@@ -797,6 +1199,7 @@ impl PipelineCache {
                         let mut comp_slot = self.compiler.write().unwrap();
                         let old_compiler = std::mem::replace(&mut *comp_slot, new_compiler);
                         let old_ser = std::mem::replace(&mut *ser_slot, new_ser);
+                        self.serializer_keys.lock().unwrap().clear();
                         drop(old_compiler);
                         drop(old_ser);
                     }
@@ -808,26 +1211,19 @@ impl PipelineCache {
         }
         Ok(wrote)
     }
-
-    pub fn stats(&self) -> PipelineCacheStats {
-        let c = &self.counters;
-        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        PipelineCacheStats {
-            memory_hits: g(&c.memory_hits),
-            archive_hits: g(&c.archive_hits),
-            compiles: g(&c.compiles),
-            failures: g(&c.failures),
-            archives_loaded: g(&c.archives_loaded),
-            archives_written: g(&c.archives_written),
-            archives_rejected: g(&c.archives_rejected),
-            lookup_nanos: g(&c.lookup_nanos),
-            compile_nanos: g(&c.compile_nanos),
-        }
-    }
 }
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
+        {
+            let mut st = self.flush_core.bg_mu.lock().unwrap();
+            st.shutdown = true;
+            st.requested = false;
+            self.flush_core.bg_cv.notify_all();
+        }
+        if let Some(h) = self.bg_thread.lock().unwrap().take() {
+            let _ = h.join();
+        }
         if self.flush_on_drop {
             if let Err(e) = self.flush() {
                 log::warn!("pso cache: flush on drop failed: {e}");
@@ -984,5 +1380,176 @@ kernel void cvt_f16(device const float* inp [[buffer(0)]], device half* outp [[b
         assert_eq!(rtz[1], 0x7bff, "Metal 4.1 RTZ 65520.0f -> 65504.0");
         assert_eq!(rtz[2], 0x7bff, "65504.0f -> 65504.0");
         assert_eq!(rtz[3], 0x3c00, "1.0f -> 1.0");
+    }
+
+    #[test]
+    fn key_to_archive_index_avoids_linear_probing_on_hits_and_misses() {
+        let Some(dev) = objc2_metal::MTLCreateSystemDefaultDevice() else {
+            return;
+        };
+        if !dev.supportsFamily(objc2_metal::MTLGPUFamily::Metal4) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pso-cache-idx-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = PipelineCacheConfig {
+            dir: Some(dir.clone()),
+            max_archives: 64,
+            flush_on_drop: false,
+        };
+
+        // Write 4 separate archives, each holding one unique compute shader key.
+        let sources = [
+            ("k0", "kernel void k0(device uint *o [[buffer(0)]]) { o[0] = 10; }"),
+            ("k1", "kernel void k1(device uint *o [[buffer(0)]]) { o[0] = 20; }"),
+            ("k2", "kernel void k2(device uint *o [[buffer(0)]]) { o[0] = 30; }"),
+            ("k3", "kernel void k3(device uint *o [[buffer(0)]]) { o[0] = 40; }"),
+        ];
+        {
+            let cache = PipelineCache::open(&dev, &cfg).expect("open cold cache");
+            for (i, (name, src)) in sources.iter().enumerate() {
+                let lib = cache.library_from_source(name, src).expect("compile msl");
+                let _pso = cache
+                    .compute_pipeline_from_function(Some(0xA000 + i as u128), &lib, name)
+                    .expect("compile pso");
+                let arch = cache
+                    .flush_and_reset_compiler()
+                    .expect("flush+reset")
+                    .expect("archive written");
+                assert!(idx_path(&arch).is_file(), "sidecar .idx must be written alongside archive");
+            }
+        }
+
+        // Re-open warm cache: all 4 archives must be indexed.
+        let warm = PipelineCache::open(&dev, &cfg).expect("open warm cache");
+        assert_eq!(warm.stats().archives_loaded, 4);
+        assert!(warm.unindexed_archives.is_empty(), "all 4 archives must be indexed");
+
+        // Hit key in the LAST archive (#3): must do exactly 1 archive probe (O(1)), not 4.
+        let lib3 = warm.library_from_source("k3", sources[3].1).expect("msl k3");
+        let _pso3 = warm
+            .compute_pipeline_from_function(Some(0xA003), &lib3, "k3")
+            .expect("hit k3");
+        assert_eq!(warm.stats().archive_hits, 1);
+        assert_eq!(warm.stats().compiles, 0);
+        assert_eq!(warm.archive_probes(), 1, "indexed hit must probe only its owning archive");
+
+        // Miss on a brand-new key: must perform 0 archive probes (zero linear probing!).
+        let probes_before_miss = warm.archive_probes();
+        let lib_miss = warm
+            .library_from_source("k_miss", "kernel void k_miss(device uint *o [[buffer(0)]]) { o[0] = 99; }")
+            .expect("msl miss");
+        let _pso_miss = warm
+            .compute_pipeline_from_function(Some(0xBEEF), &lib_miss, "k_miss")
+            .expect("compile miss");
+        assert_eq!(warm.stats().compiles, 1);
+        assert_eq!(
+            warm.archive_probes(),
+            probes_before_miss,
+            "indexed miss must NOT linearly probe any MTL4Archive"
+        );
+
+        drop(warm);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_flight_compile_deduplication_coalesces_concurrent_same_key_requests() {
+        let Some(dev) = objc2_metal::MTLCreateSystemDefaultDevice() else {
+            return;
+        };
+        if !dev.supportsFamily(objc2_metal::MTLGPUFamily::Metal4) {
+            return;
+        }
+        let cfg = PipelineCacheConfig { dir: None, max_archives: 8, flush_on_drop: false };
+        let cache = Arc::new(PipelineCache::open(&dev, &cfg).expect("open memory cache"));
+        let lib = cache
+            .library_from_source(
+                "dedup",
+                "kernel void k_dedup(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = i * 7 + 3; }",
+            )
+            .expect("compile msl");
+
+        let threads = 6usize;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let c = cache.clone();
+                let b = barrier.clone();
+                let l = lib.clone();
+                scope.spawn(move || {
+                    b.wait();
+                    let _pso = c
+                        .compute_pipeline_from_function(Some(0xDEAD_C0DE), &l, "k_dedup")
+                        .expect("dedup compile");
+                });
+            }
+        });
+        let st = cache.stats();
+        assert_eq!(st.compiles, 1, "concurrent same-key compiles must coalesce to 1 compile: {st:?}");
+        assert_eq!(st.memory_hits, (threads - 1) as u64, "remaining threads must hit memo: {st:?}");
+    }
+
+    #[test]
+    fn background_async_flush_coordinates_cleanly_with_final_flush_and_leaves_no_tmp_files() {
+        let Some(dev) = objc2_metal::MTLCreateSystemDefaultDevice() else {
+            return;
+        };
+        if !dev.supportsFamily(objc2_metal::MTLGPUFamily::Metal4) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pso-cache-bg-flush-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = PipelineCacheConfig {
+            dir: Some(dir.clone()),
+            max_archives: 64,
+            flush_on_drop: true,
+        };
+        let dev_dir;
+        {
+            let cache = PipelineCache::open(&dev, &cfg).expect("open bg cache");
+            dev_dir = cache.dir().expect("device dir").to_path_buf();
+            // Clean cache async flush must be an immediate no-op without spawning/writing.
+            cache.flush_incremental_async();
+            assert_eq!(cache.stats().archives_written, 0);
+
+            let lib1 = cache
+                .library_from_source("bg1", "kernel void k_bg1(device uint *o [[buffer(0)]]) { o[0] = 1; }")
+                .expect("msl1");
+            let _p1 = cache
+                .compute_pipeline_from_function(Some(0xB1), &lib1, "k_bg1")
+                .expect("pso1");
+            // Kick off background flush, immediately compile another PSO and run ExitProcess final flush().
+            cache.flush_incremental_async();
+            let lib2 = cache
+                .library_from_source("bg2", "kernel void k_bg2(device uint *o [[buffer(0)]]) { o[0] = 2; }")
+                .expect("msl2");
+            let _p2 = cache
+                .compute_pipeline_from_function(Some(0xB2), &lib2, "k_bg2")
+                .expect("pso2");
+            let _ = cache.flush().expect("final flush");
+            assert!(cache.stats().archives_written >= 1);
+        }
+
+        // Verify zero leftover `tmp-*` files exist after shutdown.
+        for entry in std::fs::read_dir(&dev_dir).expect("read dev dir").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.starts_with(TMP_PREFIX), "leftover temp file after flush: {name}");
+        }
+
+        // Re-open warm cache and confirm BOTH pipelines hit archives with 0 compiles.
+        let warm = PipelineCache::open(&dev, &cfg).expect("reopen warm cache");
+        let lib1 = warm
+            .library_from_source("bg1", "kernel void k_bg1(device uint *o [[buffer(0)]]) { o[0] = 1; }")
+            .expect("msl1");
+        let lib2 = warm
+            .library_from_source("bg2", "kernel void k_bg2(device uint *o [[buffer(0)]]) { o[0] = 2; }")
+            .expect("msl2");
+        let _p1 = warm.compute_pipeline_from_function(Some(0xB1), &lib1, "k_bg1").expect("hit1");
+        let _p2 = warm.compute_pipeline_from_function(Some(0xB2), &lib2, "k_bg2").expect("hit2");
+        let st = warm.stats();
+        assert_eq!((st.archive_hits, st.compiles), (2, 0), "{st:?}");
+        drop(warm);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
