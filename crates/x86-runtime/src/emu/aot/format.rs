@@ -23,7 +23,7 @@ pub(super) const FORMAT_VERSION: u32 = 8;
 const LEGACY_STUB_COUNT_V6: usize = 10;
 const LEGACY_STUB_COUNT_V7: usize = 12;
 /// Bump on any codegen-relevant change the source hash can't see.
-const AOT_CODEGEN_VERSION: u64 = 4;
+const AOT_CODEGEN_VERSION: u64 = 5;
 
 /// Small 128-bit streaming hash (cache keys / file checksums, not cryptographic).
 pub(super) struct H128 {
