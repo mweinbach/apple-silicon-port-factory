@@ -3394,7 +3394,7 @@ pub const KNOBS: &[KnobSpec] = &[
         name: "PORT_QUEUE_START_STAGE_EXACT",
         aliases: &["AW2_QUEUE_START_STAGE_EXACT"],
         kind: KnobType::Bool,
-        default: "0",
+        default: "1",
         description: "Use exact producer stage mask at command-queue start boundaries.",
         affects_aot_key: false,
         crates: &["d3d12-metal"],

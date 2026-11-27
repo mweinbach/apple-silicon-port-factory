@@ -507,6 +507,9 @@ fn copy_queue_light_narrows_copy_list_barriers_to_blit_without_touching_direct_q
         *p.add(0) = 0x1122_3344;
         *p.add(1) = 0x5566_7788;
     }
+    // Simulate a previously GPU-used buffer so `PORT_QUEUE_START_STAGE_EXACT`'s fresh-upload
+    // shortcut does not elide the `COMMON -> COPY_DEST` barrier before `opt_copy_queue_light` runs.
+    mid_buf.mark_gpu_used();
     let mid_id = &mid_buf as *const Resource as usize;
 
     let _stats_guard = gpu_stats_lock();
