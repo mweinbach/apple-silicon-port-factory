@@ -24,6 +24,7 @@ if str(_TOOLS_DIR) not in sys.path:
 from port_acquire import (  # noqa: E402
     AcquireError,
     AuthRequiredError,
+    CommandFailedError,
     DownloadOptions,
     UnsupportedOperationError,
     available_backends,
@@ -766,6 +767,26 @@ class SteamBackendTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "ambiguous_app")
         self.assertTrue(p2_dir.is_dir())
         self.assertTrue(p3_dir.is_dir())
+
+    def test_update_does_not_treat_empty_appinfo_as_up_to_date(self) -> None:
+        backend = self._make_backend()
+        backend.login(username="testplayer")
+        dest = self.root / "games" / "EmptyAppInfoGame"
+        backend.download(DownloadOptions(app_id="1091500", dest=dest, platform="windows"))
+
+        # Simulate steamcmd returning no AppInfo block
+        self.appinfo_path.write_text("No app info for 1091500 found, requesting...\n", encoding="utf-8")
+
+        # --check-only must fail honestly rather than reporting "Already up to date"
+        with self.assertRaises(CommandFailedError):
+            backend.update("1091500", check_only=True)
+
+        # Ordinary update must proceed to download()/app_update
+        before_count = len([c for c in self._read_invocations() if "+app_update" in c])
+        upd = backend.update("1091500", check_only=False)
+        after_count = len([c for c in self._read_invocations() if "+app_update" in c])
+        self.assertTrue(upd.updated)
+        self.assertEqual(after_count, before_count + 1)
 
     def test_cli_end_to_end_json_and_package_manifest(self) -> None:
         dest = self.root / "cli_dest" / "SampleRPG"

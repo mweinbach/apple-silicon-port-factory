@@ -995,6 +995,7 @@ class SteamBackend(StoreBackend):
         *,
         platform: str = "windows",
         offline: bool = False,
+        allow_cache_fallback: bool = True,
     ) -> dict[str, Any]:
         cache_path = self._appinfo_cache_file(app_id)
         if offline:
@@ -1023,9 +1024,10 @@ class SteamBackend(StoreBackend):
         )
         vdf_data, _ = extract_appinfo_vdf(proc.stdout + "\n" + proc.stderr, app_id)
         if not vdf_data and proc.returncode != 0:
-            cached = _read_json(cache_path, {})
-            if isinstance(cached, dict) and cached:
-                return cached
+            if allow_cache_fallback:
+                cached = _read_json(cache_path, {})
+                if isinstance(cached, dict) and cached:
+                    return cached
             raise CommandFailedError(
                 f"steamcmd failed to query app_info for AppID {app_id} (exit {proc.returncode})"
             )
@@ -1727,41 +1729,61 @@ class SteamBackend(StoreBackend):
 
         remote_build: str | None = None
         if use_steamcmd:
-            info = self.info(resolved_id, platform=platform, offline=False)
-            remote_build = info.version
-            for b in info.branches:
-                if b.get("name") == branch and b.get("build_id"):
-                    remote_build = str(b["build_id"])
-                    break
+            remote_appinfo = self._fetch_appinfo_vdf(
+                resolved_id,
+                platform=platform,
+                offline=False,
+                allow_cache_fallback=False,
+            )
+            branches_node = vdf_get(remote_appinfo, "depots", "branches")
+            if isinstance(branches_node, dict):
+                branch_entry = vdf_get(branches_node, branch)
+                if isinstance(branch_entry, dict):
+                    bid = str(vdf_get(branch_entry, "buildid", default="") or "").strip()
+                    if bid:
+                        remote_build = bid
+                if remote_build is None and branch == "public":
+                    pub_entry = vdf_get(branches_node, "public")
+                    if isinstance(pub_entry, dict):
+                        bid = str(vdf_get(pub_entry, "buildid", default="") or "").strip()
+                        if bid:
+                            remote_build = bid
 
-            update_available = bool(remote_build and remote_build != old_version)
-            if check_only:
-                return UpdateResult(
-                    store=self.name,
-                    app_id=resolved_id,
-                    updated=False,
-                    update_available=update_available,
-                    old_version=old_version,
-                    new_version=remote_build,
-                    install_path=str(install_path),
-                    message=(
-                        f"Update available ({old_version or 'unknown'} -> {remote_build})"
-                        if update_available
-                        else "Already up to date"
-                    ),
-                )
+            if remote_build is None:
+                if check_only:
+                    raise CommandFailedError(
+                        f"Could not obtain remote build ID for Steam AppID {resolved_id} "
+                        f"(branch {branch!r}) from steamcmd app_info_print."
+                    )
+            else:
+                update_available = remote_build != old_version
+                if check_only:
+                    return UpdateResult(
+                        store=self.name,
+                        app_id=resolved_id,
+                        updated=False,
+                        update_available=update_available,
+                        old_version=old_version,
+                        new_version=remote_build,
+                        install_path=str(install_path),
+                        message=(
+                            f"Update available ({old_version or 'unknown'} -> {remote_build})"
+                            if update_available
+                            else "Already up to date"
+                        ),
+                    )
 
-            if not update_available and old_version is not None:
-                return UpdateResult(
-                    store=self.name,
-                    app_id=resolved_id,
-                    updated=False,
-                    update_available=False,
-                    old_version=old_version,
-                    new_version=remote_build,
-                    install_path=str(install_path),
-                    message="Already up to date",
-                )
+                if not update_available and old_version is not None:
+                    return UpdateResult(
+                        store=self.name,
+                        app_id=resolved_id,
+                        updated=False,
+                        update_available=False,
+                        old_version=old_version,
+                        new_version=remote_build,
+                        install_path=str(install_path),
+                        message="Already up to date",
+                    )
         elif check_only:
             raise UnsupportedOperationError(
                 "Remote update checks (--check-only) require `steamcmd` (and Rosetta 2 on Apple Silicon); "
