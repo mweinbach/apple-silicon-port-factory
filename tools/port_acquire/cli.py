@@ -364,9 +364,19 @@ def _write_manifest_for_install(
     eos_overlay_path: str | None = None,
     offline: bool = True,
 ) -> dict[str, Any]:
+    info: GameInfo | None = None
     try:
         info = backend.info(app_id, platform=platform, offline=offline)
     except AcquireError:
+        info = None
+    if (info is None or not info.executable) and offline:
+        try:
+            online_info = backend.info(app_id, platform=platform, offline=False)
+            if info is None or online_info.executable:
+                info = online_info
+        except AcquireError:
+            pass
+    if info is None:
         info = GameInfo(store=backend.name, app_id=app_id, title=app_id, platform=platform)
 
     launch_plan = None
@@ -579,7 +589,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 platform=result.platform,
                 manifest_out=manifest_path,
                 eos_overlay_path=result.eos_overlay_path,
-                offline=True,
+                offline=not bool(args.no_register),
             )
             result.manifest_path = str(manifest_path)
 

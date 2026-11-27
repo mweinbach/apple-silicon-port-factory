@@ -114,7 +114,11 @@ def build_package_manifest(
 ) -> dict[str, Any]:
     """Build a schema-v1 `port-acquire-manifest.json` dictionary (strictly secret-free)."""
     install_dir_str = str(install_dir)
-    raw_args = list(launch_plan.args) if launch_plan is not None else []
+    raw_args = (
+        list(launch_plan.args)
+        if launch_plan is not None
+        else list(info.default_launch_args)
+    )
     safe_args, args_redacted = redact_launch_args(raw_args)
     if launch_plan is not None and launch_plan.redacted_auth_args:
         args_redacted = True

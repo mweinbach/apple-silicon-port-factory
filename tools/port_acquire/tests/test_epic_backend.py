@@ -51,6 +51,8 @@ DEFAULT_STATE = {
     "verify_silent_zero": False,
     "install_fail_zero": False,
     "install_silent_zero": False,
+    "uninstall_fail_zero": False,
+    "uninstall_lock_zero": False,
     "omit_remote_version": False,
     "warn_on_stdout": False,
     "installed": {},
@@ -262,6 +264,10 @@ if cmd == "list-files":
 if cmd == "info":
     require_auth()
     app_name = rest[0]
+    if "--offline" in rest and app_name not in state["installed"]:
+        # Real Legendary `info --offline` cannot load manifest for unregistered apps.
+        print(f'[cli] ERROR: Game "{app_name}" is not installed', file=sys.stderr)
+        sys.exit(1)
     game = next((g for g in state["catalog"] if g["app_name"] == app_name), None)
     if game is None:
         print(f"ERROR: Could not find {app_name} in library", file=sys.stderr)
@@ -279,6 +285,8 @@ if cmd == "info":
     # Real Legendary `info --json`: `manifest.version` is the integer manifest format
     # revision (e.g. 18), while `manifest.build_version` is the game build version.
     # For entitlement-only DLCs, Legendary returns `app_name: None, installable: False, id: ...`.
+    # For entitlement-backed downloadable DLCs, Legendary can return `app_name: None` with a
+    # non-empty `installable` release-info array containing `appId`.
     # For external-launcher titles, Legendary exposes `game.external_activation` (without raw metadata).
     build_ver = state.get("updates", {}).get(
         app_name,
@@ -286,6 +294,16 @@ if cmd == "info":
     )
     owned_dlc = list(game.get("dlcs", []))
     if app_name == "ArachnidTwo":
+        owned_dlc.append(
+            {
+                "app_name": None,
+                "installable": [
+                    {"appId": "ArachnidTwoEntitlementDLC", "platform": ["Windows"]},
+                ],
+                "id": "cat_entitlement_installable",
+                "title": "Entitlement Downloadable DLC",
+            }
+        )
         owned_dlc.append(
             {
                 "app_name": None,
@@ -358,6 +376,9 @@ if cmd in ("install", "download", "update"):
                     dlc_title = d["app_title"]
                     is_dlc = True
                     break
+        if not is_dlc and app_name == "ArachnidTwoEntitlementDLC":
+            dlc_title = "Entitlement Downloadable DLC"
+            is_dlc = True
     if game is None and not is_dlc:
         print(f"ERROR: Could not find {app_name}", file=sys.stderr)
         sys.exit(1)
@@ -429,6 +450,12 @@ if cmd == "verify":
 
 if cmd == "uninstall":
     app_name = rest[0]
+    if state.get("uninstall_fail_zero"):
+        print("[cli] ERROR: Removing game failed: PermissionError", file=sys.stderr)
+        sys.exit(0)
+    if state.get("uninstall_lock_zero"):
+        print("[cli] ERROR: Could not acquire lockfile for uninstall", file=sys.stderr)
+        sys.exit(0)
     entry = state["installed"].pop(app_name, None)
     if entry is None:
         # Real Legendary logs this error and exits 0.
@@ -441,6 +468,7 @@ if cmd == "uninstall":
                 if child.is_file():
                     child.unlink()
     save_state(state)
+    print("[cli] INFO: Game has been uninstalled.")
     sys.exit(0)
 
 if cmd == "launch":
@@ -599,17 +627,20 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertTrue(info["anticheat"]["report_only"])
         self.assertFalse(info["drm"]["detected"])
         self.assertTrue(info["drm"]["report_only"])
-        self.assertEqual(len(info["dlcs"]), 3)
+        self.assertEqual(len(info["dlcs"]), 4)
         entitlement = next(d for d in info["dlcs"] if d["catalog_id"] == "cat_entitlement_only_bonus")
         self.assertFalse(entitlement["installable"])
         self.assertEqual(entitlement["app_id"], "")
+        ent_dl = next(d for d in info["dlcs"] if d["catalog_id"] == "cat_entitlement_installable")
+        self.assertTrue(ent_dl["installable"])
+        self.assertEqual(ent_dl["app_id"], "ArachnidTwoEntitlementDLC")
         cats = {r["category"] for r in info["redistributables"]}
         self.assertEqual(cats, {"vcredist", "directx", "eos_sdk"})
 
         # Check dedicated list-dlcs & list-redists commands
         proc_dlcs = self._run_cli("list-dlcs", "ArachnidTwo", "--json")
         self.assertEqual(proc_dlcs.returncode, 0)
-        self.assertEqual(json.loads(proc_dlcs.stdout)["count"], 3)
+        self.assertEqual(json.loads(proc_dlcs.stdout)["count"], 4)
 
         # 2b. Uninstalled external-launcher title with `game.external_activation` only (no metadata/files)
         proc_ext = self._run_cli("info", "ExternalLauncherGame", "--platform", "windows", "--json")
@@ -830,13 +861,23 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(
             set(data["downloaded_dlcs"]),
-            {"ArachnidTwoPreorderDLC", "ArachnidTwoExpansion"},
+            {
+                "ArachnidTwoPreorderDLC",
+                "ArachnidTwoExpansion",
+                "ArachnidTwoEntitlementDLC",
+            },
         )
-        # Base game + both DLC payloads landed in the same destination directory.
+        # Base game + all installable DLC payloads (including entitlement-backed `installable` list)
+        # landed in the same destination directory; non-installable entitlement was excluded.
         self.assertTrue((dest / "Spider-Man2.exe").is_file())
         self.assertTrue((dest / "ArachnidTwoPreorderDLC.dat").is_file())
         self.assertTrue((dest / "ArachnidTwoExpansion.dat").is_file())
-        self.assertTrue((dest / MANIFEST_FILENAME).is_file())
+        self.assertTrue((dest / "ArachnidTwoEntitlementDLC.dat").is_file())
+        manifest = read_package_manifest(dest / MANIFEST_FILENAME)
+        # Unregistered download must still populate executable and default launch args via online info.
+        self.assertEqual(manifest["executable"], "Spider-Man2.exe")
+        self.assertEqual(manifest["launch_args"], ["-dx12"])
+        self.assertEqual(manifest["version"], "1.2.0")
 
     def test_download_fails_on_exit_zero_installation_failed_even_when_already_registered(self) -> None:
         # First install cleanly so `ArachnidTwo` is already registered in installed.json.
@@ -868,6 +909,19 @@ class TestEpicBackendMocked(unittest.TestCase):
             self.backend.download(
                 DownloadOptions(app_id="ArachnidTwo", dest=dest2, platform="windows")
             )
+
+    def test_uninstall_fails_on_exit_zero_removal_or_lock_error(self) -> None:
+        dest = self.root / "games" / "UninstallFail"
+        self.backend.download(DownloadOptions(app_id="ArachnidTwo", dest=dest, platform="windows"))
+
+        self._patch_state(uninstall_fail_zero=True)
+        proc_fail = self._run_cli("uninstall", "ArachnidTwo", "--json")
+        self.assertEqual(proc_fail.returncode, 5)
+        self.assertEqual(json.loads(proc_fail.stdout)["error"]["code"], "command_failed")
+
+        self._patch_state(uninstall_fail_zero=False, uninstall_lock_zero=True)
+        with self.assertRaises(CommandFailedError):
+            self.backend.uninstall("ArachnidTwo")
 
 
 if __name__ == "__main__":

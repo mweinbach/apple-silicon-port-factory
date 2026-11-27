@@ -232,6 +232,7 @@ class GameInfo:
     dlcs: list[DlcItem] = field(default_factory=list)
     redistributables: list[RedistributableItem] = field(default_factory=list)
     manifest_files_checked: bool = False
+    default_launch_args: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

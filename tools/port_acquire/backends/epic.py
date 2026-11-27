@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -113,6 +114,25 @@ _EOS_OVERLAY_SUCCESS_PATTERNS = (
     "finished downloading",
 )
 
+_UNINSTALL_FAILURE_PATTERNS = (
+    "removing game failed",
+    "failed to uninstall",
+    "failed to remove",
+    "could not acquire lock",
+    "failed to acquire lock",
+    "unable to acquire lock",
+    "lockfile",
+    "[cli] error:",
+    "[core] error:",
+)
+
+_UNINSTALL_SUCCESS_PATTERNS = (
+    "game has been uninstalled",
+    "has been uninstalled",
+    "uninstalled successfully",
+    "removed from legendary",
+)
+
 _ANTICHEAT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Easy Anti-Cheat (EAC)",
@@ -194,6 +214,51 @@ def _parse_bool_attr(val: Any) -> bool | None:
         if low in ("false", "0", "no"):
             return False
     return None
+
+
+def _extract_release_app_id(entries: Any, *, platform: str = "Windows") -> str:
+    """Extract an installable Epic `appId` from Legendary's `installable` or `releaseInfo` array."""
+    if not isinstance(entries, list):
+        return ""
+    want = platform.strip().lower()
+    fallback = ""
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        cand = str(entry.get("appId") or entry.get("app_name") or "").strip()
+        if not cand:
+            continue
+        if not fallback:
+            fallback = cand
+        plats = entry.get("platform")
+        if isinstance(plats, list) and any(str(p).strip().lower() == want for p in plats):
+            return cand
+    return fallback
+
+
+def _resolve_dlc_entry(d: dict[str, Any], *, platform: str = "Windows") -> tuple[str, bool, str | None]:
+    """Return `(app_id, installable, catalog_id)` for a Legendary DLC entry.
+
+    In Legendary `info --json`, entitlement-backed downloadable DLCs may have `app_name: null`
+    with a non-empty `installable` release-info list containing `appId`, whereas truly
+    non-installable entitlements have `installable: false` (or `[]`) and only a catalog `id`.
+    """
+    d_meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+    catalog_id = str(d.get("id") or d_meta.get("id") or "").strip() or None
+    d_app = str(d.get("app_name") or "").strip()
+    raw_installable = d.get("installable")
+
+    if isinstance(raw_installable, list):
+        if not d_app:
+            d_app = _extract_release_app_id(raw_installable, platform=platform)
+        installable = bool(raw_installable) and bool(d_app)
+    elif raw_installable is False:
+        installable = False
+    else:
+        if not d_app:
+            d_app = _extract_release_app_id(d.get("releaseInfo"), platform=platform)
+        installable = bool(d_app)
+    return d_app, installable, catalog_id
 
 
 def _parse_int(val: Any) -> int | None:
@@ -630,11 +695,9 @@ class EpicBackend(StoreBackend):
             for d in raw_dlcs:
                 if not isinstance(d, dict):
                     continue
-                d_meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
-                catalog_id = str(d.get("id") or d_meta.get("id") or "").strip() or None
-                d_app = str(d.get("app_name") or "").strip()
-                explicit_installable = d.get("installable")
-                installable = bool(d_app) and (explicit_installable is not False)
+                d_app, installable, catalog_id = _resolve_dlc_entry(
+                    d, platform=_platform_to_legendary(platform) or "Windows"
+                )
                 if not d_app and not catalog_id:
                     continue
                 dedup_key = (d_app, None if d_app else catalog_id)
@@ -941,23 +1004,7 @@ class EpicBackend(StoreBackend):
         for d in dlc_sources:
             if not isinstance(d, dict):
                 continue
-            explicit_installable = d.get("installable")
-            catalog_id = str(d.get("id") or "").strip() or None
-            d_app = str(d.get("app_name") or "").strip()
-            if (
-                not d_app
-                and explicit_installable is not False
-                and isinstance(d.get("releaseInfo"), list)
-                and d["releaseInfo"]
-            ):
-                first = d["releaseInfo"][0]
-                if isinstance(first, dict) and first.get("appId"):
-                    d_app = str(first["appId"]).strip()
-
-            # Entitlement-only DLCs in real Legendary `info --json` have `app_name: null`,
-            # `installable: false`, and only a catalog `id`. Never turn the catalog ID into
-            # a synthetic installable app_id.
-            installable = bool(d_app) and (explicit_installable is not False)
+            d_app, installable, catalog_id = _resolve_dlc_entry(d, platform=leg_plat)
             if not d_app and not catalog_id:
                 continue
             dedup_key = (d_app, None if d_app else catalog_id)
@@ -984,6 +1031,15 @@ class EpicBackend(StoreBackend):
                 )
             )
 
+        raw_launch_cmd = manifest.get("launch_command")
+        default_launch_args: list[str] = []
+        if isinstance(raw_launch_cmd, str) and raw_launch_cmd.strip():
+            try:
+                parsed_args = shlex.split(raw_launch_cmd)
+            except ValueError:
+                parsed_args = raw_launch_cmd.split()
+            default_launch_args, _ = redact_launch_args(parsed_args)
+
         return GameInfo(
             store=self.name,
             app_id=resolved_app_id,
@@ -1003,6 +1059,7 @@ class EpicBackend(StoreBackend):
             dlcs=dlcs,
             redistributables=redists,
             manifest_files_checked=manifest_files is not None,
+            default_launch_args=default_launch_args,
         )
 
     def _assert_install_completed(
@@ -1320,11 +1377,25 @@ class EpicBackend(StoreBackend):
             cmd.append("--keep-files")
         if skip_uninstaller:
             cmd.append("--skip-uninstaller")
-        proc = self._run(cmd, check=True)
+        proc = self._run(cmd, check=False)
         combined = f"{proc.stdout}\n{proc.stderr}"
-        if any(pat in combined.lower() for pat in _NOT_FOUND_PATTERNS):
-            raise AppNotFoundError(
-                f"app {app_id!r} is not installed: {_sanitize_error_text(combined)}"
+        combined_lower = combined.lower()
+        sanitized = _sanitize_error_text(combined)
+        if any(pat in combined_lower for pat in _NOT_FOUND_PATTERNS):
+            raise AppNotFoundError(f"app {app_id!r} is not installed: {sanitized}")
+
+        has_error_line = any(
+            line.lstrip().lower().startswith("error:")
+            or any(pat in line.lower() for pat in _UNINSTALL_FAILURE_PATTERNS)
+            for line in combined.splitlines()
+        )
+        completed_ok = any(pat in combined_lower for pat in _UNINSTALL_SUCCESS_PATTERNS)
+        still_installed = app_id in self._installed_map()
+        if proc.returncode != 0 or has_error_line or not completed_ok or still_installed:
+            reason = sanitized or f"exit {proc.returncode} with no uninstall completion confirmation"
+            raise CommandFailedError(
+                f"legendary uninstall for {app_id!r} did not complete cleanly: {reason}",
+                details={"returncode": proc.returncode, "still_installed": still_installed},
             )
         return UninstallResult(
             store=self.name,
