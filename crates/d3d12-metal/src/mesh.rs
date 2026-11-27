@@ -9,7 +9,8 @@
 //! * Bindings are the same as for every other stage (heaps at 0/1, top-level argument buffer
 //!   at 2). The argument table must be set for `STAGES` (object | mesh | fragment).
 //!
-//! The device reports `MeshShaderTier` 1 only when [`enabled`] (`AW2_MESH_SHADERS=1`).
+//! The device reports `MeshShaderTier` 1 by default ([`enabled`]; set
+//! `PORT_MESH_SHADERS=0` or `AW2_MESH_SHADERS=0` to disable).
 //!
 //! Limits that differ from D3D12:
 //!
@@ -30,9 +31,11 @@ use objc2_metal::*;
 use crate::metal::pipeline::{compile, depth_stencil_state, library, pso_cache, shader_function_descriptor, MtlDepthStencil, MtlRenderPipeline};
 use crate::state::{BlendDesc, BlendState, DepthStencilState, RasterState};
 
-/// `AW2_MESH_SHADERS=1`: report `D3D12_MESH_SHADER_TIER_1` and accept AS/MS pipelines.
+/// `PORT_MESH_SHADERS` (legacy alias `AW2_MESH_SHADERS`, default **on**; `=0` disables):
+/// report `D3D12_MESH_SHADER_TIER_1` and accept AS/MS pipelines on Metal 4.
 pub fn enabled() -> bool {
-    std::env::var("AW2_MESH_SHADERS").is_ok_and(|v| v == "1")
+    crate::metal::env_canonical_or_alias("PORT_MESH_SHADERS", "AW2_MESH_SHADERS")
+        .is_none_or(|v| crate::metal::parse_bool_knob(&v))
 }
 
 /// Render stages that read the argument table in a mesh pass.
@@ -455,5 +458,46 @@ mod tests {
     fn stages_cover_object_mesh_fragment() {
         assert!(STAGES.contains(MTLRenderStages::Object | MTLRenderStages::Mesh | MTLRenderStages::Fragment));
         assert!(!STAGES.contains(MTLRenderStages::Vertex));
+    }
+
+    #[test]
+    fn enabled_default_on_and_env_precedence() {
+        let _lock = crate::metal::env_test_lock();
+        let prev_p = std::env::var_os("PORT_MESH_SHADERS");
+        let prev_a = std::env::var_os("AW2_MESH_SHADERS");
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("PORT_MESH_SHADERS", v),
+                    None => std::env::remove_var("PORT_MESH_SHADERS"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("AW2_MESH_SHADERS", v),
+                    None => std::env::remove_var("AW2_MESH_SHADERS"),
+                }
+            }
+        }
+        let _restore = Restore(prev_p, prev_a);
+
+        std::env::remove_var("PORT_MESH_SHADERS");
+        std::env::remove_var("AW2_MESH_SHADERS");
+        assert!(enabled(), "mesh shaders must default ON");
+
+        // Legacy alias can disable.
+        std::env::set_var("AW2_MESH_SHADERS", "0");
+        assert!(!enabled());
+
+        // Canonical overrides legacy alias in both directions.
+        std::env::set_var("PORT_MESH_SHADERS", "1");
+        assert!(enabled());
+
+        std::env::set_var("AW2_MESH_SHADERS", "1");
+        std::env::set_var("PORT_MESH_SHADERS", "0");
+        assert!(!enabled());
+
+        // Empty canonical falls back to legacy alias.
+        std::env::set_var("PORT_MESH_SHADERS", "");
+        assert!(enabled());
     }
 }

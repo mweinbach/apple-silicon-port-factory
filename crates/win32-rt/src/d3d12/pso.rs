@@ -562,7 +562,7 @@ unsafe fn create_graphics_inner(g: GfxParts, what: &str, riid: *const Guid, out:
     }
     if let Some(ms) = g.mesh.and_then(|b| b.bytes()) {
         if !d3d12_metal::mesh::enabled() {
-            return failed!(E_NOTIMPL, "{what}: mesh shader pipelines need AW2_MESH_SHADERS=1");
+            return failed!(E_NOTIMPL, "{what}: mesh shader pipelines disabled (set PORT_MESH_SHADERS=1)");
         }
         if g.vs.is_some() {
             return failed!(E_INVALIDARG, "{what}: both a vertex and a mesh shader");
