@@ -69,6 +69,12 @@ pub struct ThreadObj {
     resume_cv: Condvar,
     pub pthread: AtomicUsize,
     pub priority: std::sync::atomic::AtomicI32,
+    /// Set when another thread calls `SetThreadPriority` on this thread; cleared and applied
+    /// via `pthread_set_qos_class_self_np` at the thread's next wait/entry boundary.
+    pub pending_qos: AtomicBool,
+    /// Active Darwin `pthread_override_t` handle applied by cross-thread priority raises
+    /// (`0` when none). Always paired with `pthread_override_qos_class_end_np` on flush/exit/drop.
+    qos_override: AtomicUsize,
     /// Per-thread Windows affinity mask (`0` = inherit process affinity mask).
     pub affinity_mask: AtomicUsize,
     /// Per-thread Windows processor group (`0` on single-group systems).
@@ -122,6 +128,8 @@ impl ThreadObj {
             resume_cv: Condvar::new(),
             pthread: AtomicUsize::new(0),
             priority: std::sync::atomic::AtomicI32::new(0),
+            pending_qos: AtomicBool::new(false),
+            qos_override: AtomicUsize::new(0),
             affinity_mask: AtomicUsize::new(0),
             affinity_group: AtomicU16::new(0),
             start_address: AtomicUsize::new(0),
@@ -204,6 +212,8 @@ impl ThreadObj {
                 s = self.resume_cv.wait(s).unwrap();
             }
             s.self_suspended = false;
+            drop(s);
+            sched::flush_pending_qos();
             return Ok(prev);
         }
 
@@ -358,12 +368,14 @@ impl ThreadObj {
         s.phase = ThreadPhase::Exiting;
         s.mach_port = 0;
         s.count = 0;
+        sched::clear_qos_override(self);
         self.resume_cv.notify_all();
     }
 }
 
 impl Drop for ThreadObj {
     fn drop(&mut self) {
+        sched::clear_qos_override(self);
         let s = self.suspend.get_mut().unwrap_or_else(|e| e.into_inner());
         #[cfg(target_vendor = "apple")]
         if s.kernel_suspended && s.mach_port != 0 {
@@ -781,6 +793,9 @@ pub fn enter_activity(kind: u8, start_ns: u64, arg: u64) -> (u8, u64, u64) {
     }
     unsafe {
         let t = &*p;
+        if t.pending_qos.load(Ordering::Relaxed) {
+            sched::flush_pending_qos_for(t);
+        }
         let pk = t.act_kind.load(Ordering::Relaxed);
         let ps = t.act_start_ns.load(Ordering::Relaxed);
         let pa = t.act_arg.load(Ordering::Relaxed);
@@ -936,6 +951,7 @@ pub fn spawn_with_start_address(
         // Keep joinable so the stack reaper can `pthread_join` and safely `munmap`
         // the custom mmap stack after the thread has completely exited.
         libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_JOINABLE);
+        sched::configure_attr_qos(&mut attr, 0);
         let mut th: libc::pthread_t = std::mem::zeroed();
         let rc = libc::pthread_create(&mut th, &attr, thread_main, info_ptr as *mut c_void);
         libc::pthread_attr_destroy(&mut attr);
@@ -1003,7 +1019,9 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
         }
         return std::ptr::null_mut();
     }
-    sched::apply_self_qos(obj.priority.load(Ordering::Relaxed));
+    obj.pending_qos.store(false, Ordering::Release);
+    sched::apply_self_qos(obj.priority.load(Ordering::Acquire));
+    sched::clear_qos_override(&obj);
     let aff = obj.affinity_mask.load(Ordering::Relaxed);
     if aff != 0 {
         let pm = crate::kernel32::process::current_process_affinity_mask();
@@ -1073,6 +1091,7 @@ pub fn has_pending_apc() -> bool {
 }
 
 pub fn run_pending_apcs() {
+    sched::flush_pending_qos();
     if let Some(t) = current_thread_object() {
         loop {
             let next = {
@@ -1342,6 +1361,26 @@ pub mod sched {
         fn thread_suspend(target_act: u32) -> i32;
         #[cfg(target_vendor = "apple")]
         fn thread_resume(target_act: u32) -> i32;
+        #[cfg(target_vendor = "apple")]
+        fn pthread_attr_set_qos_class_np(
+            attr: *mut libc::pthread_attr_t,
+            qos_class: libc::qos_class_t,
+            relative_priority: libc::c_int,
+        ) -> libc::c_int;
+        #[cfg(target_vendor = "apple")]
+        fn pthread_get_qos_class_np(
+            pthread: libc::pthread_t,
+            qos_class: *mut libc::qos_class_t,
+            relative_priority: *mut libc::c_int,
+        ) -> libc::c_int;
+        #[cfg(target_vendor = "apple")]
+        fn pthread_override_qos_class_start_np(
+            pthread: libc::pthread_t,
+            qos_class: libc::qos_class_t,
+            relative_priority: libc::c_int,
+        ) -> *mut std::ffi::c_void;
+        #[cfg(target_vendor = "apple")]
+        fn pthread_override_qos_class_end_np(override_obj: *mut std::ffi::c_void) -> libc::c_int;
     }
 
     #[cfg(target_vendor = "apple")]
@@ -1365,7 +1404,17 @@ pub mod sched {
 
     fn thread_priority_disabled() -> bool {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *OFF.get_or_init(|| std::env::var("AW2_THREAD_PRIORITY").is_ok_and(|v| v == "0"))
+        *OFF.get_or_init(|| {
+            let val = std::env::var("PORT_THREAD_PRIORITY")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("AW2_THREAD_PRIORITY")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                });
+            val.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        })
     }
 
     #[cfg(target_vendor = "apple")]
@@ -1491,6 +1540,77 @@ pub mod sched {
         (kr == 0).then_some(v)
     }
 
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn qos_for_win_priority(prio: i32) -> (libc::qos_class_t, libc::c_int) {
+        let normal_initiated = ios_normal_qos_initiated();
+        match prio {
+            i32::MIN..=-15 => (libc::qos_class_t::QOS_CLASS_UTILITY, -4),
+            -14..=-2 => (libc::qos_class_t::QOS_CLASS_UTILITY, 0),
+            -1 => (libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0),
+            0 if normal_initiated => (libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0),
+            0 => (libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, -2),
+            1 => (libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, -1),
+            2.. => (libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0),
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn qos_rank(qos: libc::qos_class_t) -> u32 {
+        match qos {
+            libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE => 5,
+            libc::qos_class_t::QOS_CLASS_USER_INITIATED => 4,
+            libc::qos_class_t::QOS_CLASS_DEFAULT => 3,
+            libc::qos_class_t::QOS_CLASS_UTILITY => 2,
+            libc::qos_class_t::QOS_CLASS_BACKGROUND => 1,
+            _ => 0,
+        }
+    }
+
+    /// Set the initial Darwin QoS class on `pthread_attr_t` before `pthread_create` so newly
+    /// spawned Windows threads start on the right core class immediately.
+    pub(super) fn configure_attr_qos(attr: *mut libc::pthread_attr_t, prio: i32) {
+        #[cfg(target_vendor = "apple")]
+        {
+            if thread_priority_disabled() {
+                return;
+            }
+            let (qos, rel) = qos_for_win_priority(prio);
+            unsafe {
+                let _ = pthread_attr_set_qos_class_np(attr, qos, rel);
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (attr, prio);
+        }
+    }
+
+    /// Query the calling thread's current Darwin `(qos_class, relative_priority)`.
+    #[cfg(all(test, target_vendor = "apple"))]
+    pub(crate) fn current_qos() -> Option<(libc::qos_class_t, libc::c_int)> {
+        let mut qos = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+        let mut rel: libc::c_int = 0;
+        let rc = unsafe { pthread_get_qos_class_np(libc::pthread_self(), &mut qos, &mut rel) };
+        (rc == 0).then_some((qos, rel))
+    }
+
+    /// End and clear any active cross-thread Darwin QoS override held on `t`.
+    pub(super) fn clear_qos_override(t: &ThreadObj) {
+        #[cfg(target_vendor = "apple")]
+        {
+            let prev = t.qos_override.swap(0, Ordering::AcqRel);
+            if prev != 0 {
+                unsafe {
+                    let _ = pthread_override_qos_class_end_np(prev as *mut std::ffi::c_void);
+                }
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = t;
+        }
+    }
+
     /// Apply Darwin QoS class matching a Win32 priority on the calling thread.
     ///
     /// Keeps `NORMAL` (`prio == 0`) threads inside `QOS_CLASS_USER_INTERACTIVE`
@@ -1505,14 +1625,7 @@ pub mod sched {
             if thread_priority_disabled() {
                 return;
             }
-            let normal_initiated = ios_normal_qos_initiated();
-            let (qos, rel) = match prio {
-                i32::MIN..=-2 => (libc::qos_class_t::QOS_CLASS_UTILITY, 0),
-                -1 => (libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0),
-                0 if normal_initiated => (libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0),
-                0 => (libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, -2),
-                1.. => (libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0),
-            };
+            let (qos, rel) = qos_for_win_priority(prio);
             unsafe {
                 libc::pthread_set_qos_class_self_np(qos, rel);
             }
@@ -1520,6 +1633,34 @@ pub mod sched {
         #[cfg(not(target_vendor = "apple"))]
         {
             let _ = prio;
+        }
+    }
+
+    /// Apply any deferred cross-thread `SetThreadPriority` QoS update on the current thread.
+    /// Fast path is a single lock-free atomic load (~1 ns) when no cross-thread update is pending.
+    #[inline(always)]
+    pub fn flush_pending_qos() {
+        let p = super::ACT_SLOT.with(|c| c.get());
+        if p.is_null() {
+            return;
+        }
+        unsafe {
+            let t = &*p;
+            if t.pending_qos.load(Ordering::Acquire) {
+                flush_pending_qos_for(t);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn flush_pending_qos_for(t: &ThreadObj) {
+        if t.pending_qos.swap(false, Ordering::AcqRel) {
+            let prio = t.priority.load(Ordering::Acquire);
+            apply_self_qos(prio);
+            // Per Apple `<pthread/qos.h>`: set the new self QoS BEFORE ending any
+            // cross-thread override so the thread's effective QoS never dips in between.
+            clear_qos_override(t);
         }
     }
 
@@ -1564,16 +1705,89 @@ pub mod sched {
     }
 
     /// `SetThreadPriority`: apply the Win32 priority to the host thread.
-    /// `AW2_THREAD_PRIORITY=0` keeps the old record-only behaviour.
+    ///
+    /// - On Apple Silicon (Darwin), XNU permanently disables pthread QoS classes (`EPERM` on
+    ///   all future `pthread_set_qos_class_self_np` calls, resetting QoS to `UNSPECIFIED`) if
+    ///   legacy Mach `THREAD_PRECEDENCE_POLICY` is set on a thread. Therefore Apple targets use
+    ///   pure Darwin QoS + relative priority:
+    ///   - Current thread: applies `pthread_set_qos_class_self_np` immediately and drops any
+    ///     prior cross-thread override.
+    ///   - Other thread: sets `pending_qos = true` so the target applies exact self-QoS at its
+    ///     next wait/entry boundary, and for raises immediately boosts the live target via
+    ///     `pthread_override_qos_class_start_np` (releasing stale overrides on lowerings).
+    /// - `PORT_THREAD_PRIORITY=0` (legacy `AW2_THREAD_PRIORITY=0`) keeps record-only behavior.
     pub fn apply_win_priority(t: &ThreadObj, prio: i32) -> Result<(), i32> {
         if thread_priority_disabled() {
             return Ok(());
         }
-        if super::current_thread_object().is_some_and(|c| std::ptr::eq(&*c, t)) {
+        t.priority.store(prio, Ordering::Release);
+        if t.is_current_thread(0) {
+            t.pending_qos.store(false, Ordering::Release);
             apply_self_qos(prio);
+            clear_qos_override(t);
+            #[cfg(target_vendor = "apple")]
+            return Ok(());
+        } else {
+            #[cfg(target_vendor = "apple")]
+            {
+                let s = super::defer_lock(&t.suspend);
+                if s.phase == super::ThreadPhase::Exiting {
+                    return Err(-1);
+                }
+                // Re-read the latest published priority under `t.suspend` so concurrent
+                // cross-thread SetThreadPriority calls never install an older override.
+                let effective_prio = t.priority.load(Ordering::Acquire);
+                let pth = t.pthread.load(Ordering::Acquire);
+                if pth != 0 {
+                    let (want_qos, want_rel) = qos_for_win_priority(effective_prio);
+                    let mut cur_qos = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+                    let mut cur_rel: libc::c_int = 0;
+                    let got = unsafe {
+                        pthread_get_qos_class_np(
+                            pth as libc::pthread_t,
+                            &mut cur_qos,
+                            &mut cur_rel,
+                        )
+                    };
+                    let is_raise = got != 0
+                        || qos_rank(want_qos) > qos_rank(cur_qos)
+                        || (qos_rank(want_qos) == qos_rank(cur_qos) && want_rel > cur_rel);
+                    if is_raise {
+                        let ov = unsafe {
+                            pthread_override_qos_class_start_np(
+                                pth as libc::pthread_t,
+                                want_qos,
+                                want_rel,
+                            )
+                        };
+                        let prev = t.qos_override.swap(ov as usize, Ordering::AcqRel);
+                        if prev != 0 {
+                            unsafe {
+                                let _ = pthread_override_qos_class_end_np(
+                                    prev as *mut std::ffi::c_void,
+                                );
+                            }
+                        }
+                    } else {
+                        clear_qos_override(t);
+                    }
+                }
+                // Publish pending_qos AFTER updating `qos_override` so even if the target
+                // thread raced a flush right before `qos_override.swap`, its next wait/entry
+                // boundary will still apply self-QoS and release the override cleanly.
+                t.pending_qos.store(true, Ordering::Release);
+                return Ok(());
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                t.pending_qos.store(true, Ordering::Release);
+            }
         }
-        let Some(port) = port_of(t) else { return Err(-1) };
-        set_importance(port, importance_for(prio))
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let Some(port) = port_of(t) else { return Err(-1) };
+            set_importance(port, importance_for(prio))
+        }
     }
 
     /// Time-constraint policy for a periodic realtime thread: `period_ns`
@@ -1664,6 +1878,116 @@ pub mod sched {
                 // Calling `enqueue_stack_reap_for` again (simulating a second teardown path)
                 // must be a no-op and never enqueue duplicate reclamation.
                 assert!(!super::super::enqueue_stack_reap_for(&obj, 0x1234));
+            }
+        }
+
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn cross_thread_set_thread_priority_updates_target_qos_and_clears_overrides() {
+            use crate::kernel32::threads::{
+                CloseHandle, CreateEventW, GetThreadPriority, ResumeThread, SetEvent,
+                SetThreadPriority, WaitForSingleObject,
+            };
+            use crate::types::{FALSE, HANDLE, TRUE, WAIT_OBJECT_0};
+            use std::sync::{Arc, Mutex};
+
+            let observed: Arc<Mutex<Vec<(u32, libc::c_int)>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let obs_w = Arc::clone(&observed);
+            let qos_key = |(q, r): (libc::qos_class_t, libc::c_int)| (qos_rank(q), r);
+
+            unsafe {
+                let step_ready = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+                let step_go = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+                let sr = step_ready as usize;
+                let sg = step_go as usize;
+
+                let obj = super::super::spawn(
+                    Box::new(move || {
+                        // Step 0: initial QoS set cleanly at thread creation (NORMAL -> USER_INTERACTIVE, -2).
+                        obs_w.lock().unwrap().push(qos_key(current_qos().expect("initial qos")));
+                        SetEvent(sr as HANDLE);
+
+                        // Step 1: wait for lower priority (-2 -> UTILITY) and flush on wakeup.
+                        assert_eq!(WaitForSingleObject(sg as HANDLE, 5_000), WAIT_OBJECT_0);
+                        obs_w.lock().unwrap().push(qos_key(current_qos().expect("lowered qos")));
+                        SetEvent(sr as HANDLE);
+
+                        // Step 2: wait for raised priority (+2 -> USER_INTERACTIVE, 0) and flush on wakeup.
+                        assert_eq!(WaitForSingleObject(sg as HANDLE, 5_000), WAIT_OBJECT_0);
+                        obs_w.lock().unwrap().push(qos_key(current_qos().expect("raised qos")));
+                        SetEvent(sr as HANDLE);
+                        0
+                    }),
+                    64 * 1024,
+                    false,
+                    false,
+                )
+                .expect("spawn qos worker");
+                let h = crate::handles::insert(obj.clone());
+
+                assert_eq!(WaitForSingleObject(step_ready, 5_000), WAIT_OBJECT_0);
+
+                // Cross-thread lower: NORMAL (0) -> LOWEST (-2).
+                assert_eq!(SetThreadPriority(h, -2), TRUE);
+                assert_eq!(GetThreadPriority(h), -2);
+                assert!(obj.pending_qos.load(Ordering::Acquire));
+                assert_eq!(obj.qos_override.load(Ordering::Acquire), 0);
+                assert_eq!(SetEvent(step_go), TRUE);
+                assert_eq!(WaitForSingleObject(step_ready, 5_000), WAIT_OBJECT_0);
+                assert!(!obj.pending_qos.load(Ordering::Acquire));
+
+                // Cross-thread raise: LOWEST (-2) -> HIGHEST (+2).
+                assert_eq!(SetThreadPriority(h, 2), TRUE);
+                assert_eq!(GetThreadPriority(h), 2);
+                assert!(obj.pending_qos.load(Ordering::Acquire));
+                assert_ne!(
+                    obj.qos_override.load(Ordering::Acquire),
+                    0,
+                    "cross-thread raise should acquire a Darwin QoS override"
+                );
+                assert_eq!(SetEvent(step_go), TRUE);
+                assert_eq!(WaitForSingleObject(step_ready, 5_000), WAIT_OBJECT_0);
+                assert!(!obj.pending_qos.load(Ordering::Acquire));
+                assert_eq!(
+                    obj.qos_override.load(Ordering::Acquire),
+                    0,
+                    "target thread must release override after applying self QoS"
+                );
+
+                assert_eq!(WaitForSingleObject(h, 5_000), WAIT_OBJECT_0);
+                assert_eq!(CloseHandle(h), TRUE);
+                assert_eq!(CloseHandle(step_ready), TRUE);
+                assert_eq!(CloseHandle(step_go), TRUE);
+
+                let snaps = observed.lock().unwrap();
+                assert_eq!(snaps.len(), 3);
+                assert_eq!(snaps[0], qos_key(qos_for_win_priority(0)));
+                assert_eq!(snaps[1], qos_key(qos_for_win_priority(-2)));
+                assert_eq!(snaps[2], qos_key(qos_for_win_priority(2)));
+
+                // CREATE_SUSPENDED thread: cross-thread SetThreadPriority before ResumeThread
+                // takes effect immediately upon start without leaking an override.
+                let sus_qos: Arc<Mutex<Option<(u32, libc::c_int)>>> =
+                    Arc::new(Mutex::new(None));
+                let sq = Arc::clone(&sus_qos);
+                let sobj = super::super::spawn(
+                    Box::new(move || {
+                        *sq.lock().unwrap() = current_qos().map(qos_key);
+                        0
+                    }),
+                    64 * 1024,
+                    true,
+                    false,
+                )
+                .expect("spawn suspended qos worker");
+                let sh = crate::handles::insert(sobj.clone());
+                assert_eq!(SetThreadPriority(sh, 2), TRUE);
+                assert_eq!(ResumeThread(sh), 1);
+                assert_eq!(WaitForSingleObject(sh, 5_000), WAIT_OBJECT_0);
+                assert_eq!(*sus_qos.lock().unwrap(), Some(qos_key(qos_for_win_priority(2))));
+                assert_eq!(sobj.qos_override.load(Ordering::Acquire), 0);
+                assert_eq!(CloseHandle(sh), TRUE);
             }
         }
     }

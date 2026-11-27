@@ -2315,3 +2315,339 @@ fn core_threadpool_cleanup() {
 fn core_winsock_messages() {
     run_core_guest("winsock_msg", include_str!("os_guests/winsock_msg.c"), &["ws2_32"]);
 }
+
+// ---------------------------------------------------------------------------
+// 11. Unified CPU topology (CPUID vs Win32 sysinfo / [cpu] manifest) &
+//     cross-thread SetThreadPriority + timeBeginPeriod
+// ---------------------------------------------------------------------------
+
+#[test]
+fn guest_cpu_topology_and_cross_thread_priority() {
+    let zig = corpus_compiler();
+    let tmp = TempDir::new("cpu-topo-prio");
+    let exe = compile_c_guest(
+        &zig,
+        tmp.path(),
+        "cpu_topo_prio",
+        CPU_TOPO_PRIO_C,
+        &["kernel32", "winmm"],
+    );
+
+    // 1. Default host topology in both Live JIT and Prewarmed AOT modes.
+    run_guest_both_modes(
+        "cpu_topo_prio",
+        &exe,
+        tmp.path(),
+        &[
+            "CORPUS_CPU: cpuid_vs_lpi_exact ok",
+            "CORPUS_CPU: cross_thread_priority ok",
+            "CORPUS_CPU: time_begin_period ok",
+            "CORPUS_CPU: PASS ALL",
+        ],
+        DEFAULT_TIMEOUT,
+    );
+
+    // Helper to run the compiled guest with custom manifest / env overrides and verify expected CPU count.
+    let run_with_override = |tag: &str, manifest_toml: Option<&str>, extra_env: &[(&str, &str)], expected_cpus: u32| {
+        let log_dir = tmp.path().join(format!("logs-{tag}"));
+        let drive_c = tmp.path().join(format!("drive_c-{tag}"));
+        let aot_dir = tmp.path().join("aot-cache");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::create_dir_all(&drive_c).unwrap();
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_port-runner"));
+        cmd.arg("--pe").arg(&exe);
+        if let Some(toml_body) = manifest_toml {
+            let mpath = tmp.path().join(format!("{tag}.toml"));
+            std::fs::write(&mpath, toml_body).unwrap();
+            cmd.arg("--manifest").arg(&mpath);
+        }
+        cmd.env("PORT_LOG_DIR", &log_dir)
+            .env("PORT_AOT_DIR", &aot_dir)
+            .env("AW2_DRIVE_C", &drive_c)
+            .env("TRANSLATOR_HOME", &drive_c)
+            .env("PORT_HEADLESS", "1")
+            .env("AW2_HEADLESS", "1")
+            .env("PORT_AOT_GUARD", "0")
+            .env("PORT_AOT", "1")
+            .env("AW2_DLL_AOT", "1")
+            .env("RUST_LOG", "info")
+            .env_remove("PORT_CPU_MODE")
+            .env_remove("PORT_CPU_MAX_CORES")
+            .env_remove("PORT_NUM_CPUS");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("run port-runner topology override");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut combined = String::new();
+        if let Ok(rd) = std::fs::read_dir(&log_dir) {
+            for entry in rd.flatten() {
+                if let Ok(txt) = std::fs::read_to_string(entry.path()) {
+                    combined.push_str(&txt);
+                    combined.push('\n');
+                }
+            }
+        }
+        combined.push_str(&stdout);
+        combined.push('\n');
+        combined.push_str(&stderr);
+        assert!(
+            out.status.success(),
+            "topology override {tag} failed (status={:?}):\n{combined}",
+            out.status
+        );
+        let marker = format!("CORPUS_CPU: count={expected_cpus}");
+        assert!(
+            combined.contains(&marker) && combined.contains("CORPUS_CPU: PASS ALL"),
+            "topology override {tag} missing {marker:?}:\n{combined}"
+        );
+    };
+
+    let sysctl_u32 = |name: &std::ffi::CStr| -> Option<u32> {
+        let mut v: u32 = 0;
+        let mut sz = std::mem::size_of::<u32>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut v as *mut u32).cast(),
+                &mut sz,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(v)
+    };
+    let host_logical = sysctl_u32(c"hw.logicalcpu")
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get() as u32))
+        .unwrap_or(4)
+        .clamp(1, 64);
+    let host_p_cores = sysctl_u32(c"hw.perflevel0.logicalcpu")
+        .unwrap_or(host_logical)
+        .clamp(1, host_logical);
+
+    // 2a. [cpu] cap mode strictly below host logical count (when host > 1) proves real clamping.
+    let cap_below = if host_logical > 2 { 2 } else { 1 };
+    let cap_below_toml =
+        format!("[app]\nid = \"topo-cap\"\n[cpu]\nmode = \"cap\"\nmax_cores = {cap_below}\n");
+    run_with_override(
+        "manifest-cap-below",
+        Some(&cap_below_toml),
+        &[],
+        cap_below.min(host_logical),
+    );
+
+    // 2b. [cpu] cap mode with max_cores = 4 clamps honestly to min(4, host_logical) on any host
+    //     (e.g. 3 on 3-core CI VMs, 4 on >=4-core Macs).
+    run_with_override(
+        "manifest-cap-4",
+        Some("[app]\nid = \"topo-cap\"\n[cpu]\nmode = \"cap\"\nmax_cores = 4\n"),
+        &[],
+        4u32.min(host_logical),
+    );
+
+    // 3. PORT_NUM_CPUS env override beats [cpu] manifest section.
+    run_with_override(
+        "env-num-cpus-6",
+        Some(&cap_below_toml),
+        &[("PORT_NUM_CPUS", "6")],
+        6,
+    );
+
+    // 4. [cpu] p_cores mode matches host hw.perflevel0.logicalcpu (clamped to 1..=host_logical).
+    run_with_override(
+        "manifest-pcores",
+        Some("[app]\nid = \"topo-pcores\"\n[cpu]\nmode = \"p_cores\"\n"),
+        &[],
+        host_p_cores,
+    );
+}
+
+const CPU_TOPO_PRIO_C: &str = r##"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <mmsystem.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL: %s (line %d, err=%lu)\n", (msg), __LINE__, (unsigned long)GetLastError()); \
+        fflush(stderr); \
+        ExitProcess(1); \
+    } \
+} while (0)
+
+static void do_cpuid(uint32_t leaf, uint32_t sub, uint32_t out[4]) {
+    uint32_t a = leaf, b = 0, c = sub, d = 0;
+    __asm__ volatile ("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    out[0] = a;
+    out[1] = b;
+    out[2] = c;
+    out[3] = d;
+}
+
+typedef struct {
+    HANDLE ready_ev;
+    HANDLE go_ev;
+    volatile int observed_prios[3];
+} PrioCtx;
+
+static DWORD WINAPI prio_worker(LPVOID lp) {
+    PrioCtx *ctx = (PrioCtx *)lp;
+    ctx->observed_prios[0] = GetThreadPriority(GetCurrentThread());
+    SetEvent(ctx->ready_ev);
+
+    CHECK(WaitForSingleObject(ctx->go_ev, 5000) == WAIT_OBJECT_0, "worker wait step 1");
+    ctx->observed_prios[1] = GetThreadPriority(GetCurrentThread());
+    Sleep(1);
+    SetEvent(ctx->ready_ev);
+
+    CHECK(WaitForSingleObject(ctx->go_ev, 5000) == WAIT_OBJECT_0, "worker wait step 2");
+    ctx->observed_prios[2] = GetThreadPriority(GetCurrentThread());
+    SwitchToThread();
+    SetEvent(ctx->ready_ev);
+    return 0;
+}
+
+static DWORD WINAPI suspended_prio_worker(LPVOID lp) {
+    volatile int *out = (volatile int *)lp;
+    *out = GetThreadPriority(GetCurrentThread());
+    return 0;
+}
+
+int main(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    DWORD n = si.dwNumberOfProcessors;
+    CHECK(n >= 1 && n <= 64, "dwNumberOfProcessors in 1..=64");
+    CHECK(GetActiveProcessorCount(0) == n, "GetActiveProcessorCount matches GetSystemInfo");
+    CHECK(GetMaximumProcessorCount(0) == n, "GetMaximumProcessorCount matches GetSystemInfo");
+
+    char env_buf[32] = {0};
+    DWORD env_len = GetEnvironmentVariableA("NUMBER_OF_PROCESSORS", env_buf, sizeof(env_buf));
+    CHECK(env_len > 0 && (DWORD)atoi(env_buf) == n, "NUMBER_OF_PROCESSORS matches GetSystemInfo");
+
+    /* CPUID topology leaves must match Win32 sysinfo exactly. */
+    uint32_t r0[4], r1[4], r4_0[4], r4_2[4], rb_0[4], rb_1[4], r1f_1[4], r88[4];
+    do_cpuid(0, 0, r0);
+    CHECK(r0[0] >= 0x1f, "CPUID max standard leaf >= 0x1f");
+    do_cpuid(1, 0, r1);
+    CHECK(((r1[1] >> 16) & 0xffu) == n, "CPUID leaf 1 EBX[23:16] == dwNumberOfProcessors");
+    CHECK(((r1[3] >> 28) & 1u) == (n > 1 ? 1u : 0u), "CPUID leaf 1 HTT matches n > 1");
+
+    do_cpuid(4, 0, r4_0);
+    CHECK((((r4_0[0] >> 26) & 0x3fu) + 1u) == n, "CPUID leaf 4.0 max cores == dwNumberOfProcessors");
+    uint32_t cpuid_l1d = (((r4_0[1] >> 22) & 0x3ffu) + 1u) * ((r4_0[1] & 0xfffu) + 1u) * (r4_0[2] + 1u);
+    do_cpuid(4, 2, r4_2);
+    uint32_t cpuid_l2 = (((r4_2[1] >> 22) & 0x3ffu) + 1u) * ((r4_2[1] & 0xfffu) + 1u) * (r4_2[2] + 1u);
+
+    do_cpuid(0xb, 0, rb_0);
+    CHECK(rb_0[1] == 1u, "CPUID leaf 0xb.0 SMT count == 1 (no SMT)");
+    do_cpuid(0xb, 1, rb_1);
+    CHECK(rb_1[1] == n, "CPUID leaf 0xb.1 logical count == dwNumberOfProcessors");
+    do_cpuid(0x1f, 1, r1f_1);
+    CHECK(r1f_1[1] == n, "CPUID leaf 0x1f.1 logical count == dwNumberOfProcessors");
+
+    do_cpuid(0x80000008u, 0, r88);
+    CHECK(((r88[2] & 0xffu) + 1u) == n, "CPUID leaf 0x80000008 ECX[7:0]+1 == dwNumberOfProcessors");
+
+    /* GetLogicalProcessorInformationEx(RelationProcessorCore, RelationGroup, RelationCache). */
+    DWORD len = 0;
+    CHECK(!GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) &&
+          GetLastError() == ERROR_INSUFFICIENT_BUFFER, "LPI core size query");
+    BYTE *buf = (BYTE *)malloc(len);
+    CHECK(buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (void *)buf, &len), "LPI core fetch");
+    DWORD core_count = 0;
+    ULONG_PTR mask_accum = 0;
+    for (DWORD pos = 0; pos < len;) {
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX rec = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + pos);
+        CHECK(rec->Relationship == RelationProcessorCore && rec->Size >= 48, "valid core record");
+        CHECK(rec->Processor.GroupCount == 1, "single group");
+        ULONG_PTR m = rec->Processor.GroupMask[0].Mask;
+        CHECK(m != 0 && (mask_accum & m) == 0, "unique core mask");
+        mask_accum |= m;
+        core_count++;
+        pos += rec->Size;
+    }
+    free(buf);
+    CHECK(core_count == n, "LPI RelationProcessorCore count == dwNumberOfProcessors");
+    CHECK(mask_accum == si.dwActiveProcessorMask, "LPI mask == dwActiveProcessorMask");
+
+    len = 0;
+    CHECK(!GetLogicalProcessorInformationEx(RelationCache, NULL, &len) &&
+          GetLastError() == ERROR_INSUFFICIENT_BUFFER, "LPI cache size query");
+    buf = (BYTE *)malloc(len);
+    CHECK(buf && GetLogicalProcessorInformationEx(RelationCache, (void *)buf, &len), "LPI cache fetch");
+    uint32_t lpi_l1d = 0, lpi_l2 = 0;
+    for (DWORD pos = 0; pos < len;) {
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX rec = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + pos);
+        if (rec->Cache.Level == 1 && rec->Cache.Type == CacheData && lpi_l1d == 0) {
+            lpi_l1d = rec->Cache.CacheSize;
+        } else if (rec->Cache.Level == 2) {
+            lpi_l2 = rec->Cache.CacheSize;
+        }
+        pos += rec->Size;
+    }
+    free(buf);
+    CHECK(lpi_l1d == cpuid_l1d, "LPI L1d size == CPUID leaf 4.0 L1d size");
+    CHECK(lpi_l2 == cpuid_l2, "LPI L2 size == CPUID leaf 4.2 L2 size");
+    printf("CORPUS_CPU: count=%lu\n", (unsigned long)n);
+    printf("CORPUS_CPU: cpuid_vs_lpi_exact ok\n");
+
+    /* Cross-thread SetThreadPriority (lower, raise, and CREATE_SUSPENDED pre-resume). */
+    PrioCtx ctx;
+    ctx.ready_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ctx.go_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ctx.observed_prios[0] = ctx.observed_prios[1] = ctx.observed_prios[2] = 99;
+    HANDLE wt = CreateThread(NULL, 0, prio_worker, &ctx, 0, NULL);
+    CHECK(wt != NULL, "CreateThread prio_worker");
+    CHECK(WaitForSingleObject(ctx.ready_ev, 5000) == WAIT_OBJECT_0, "worker ready 0");
+    CHECK(ctx.observed_prios[0] == THREAD_PRIORITY_NORMAL, "initial priority NORMAL");
+
+    CHECK(SetThreadPriority(wt, THREAD_PRIORITY_LOWEST), "cross-thread SetThreadPriority LOWEST");
+    CHECK(GetThreadPriority(wt) == THREAD_PRIORITY_LOWEST, "GetThreadPriority LOWEST");
+    CHECK(SetEvent(ctx.go_ev), "release worker step 1");
+    CHECK(WaitForSingleObject(ctx.ready_ev, 5000) == WAIT_OBJECT_0, "worker ready 1");
+    CHECK(ctx.observed_prios[1] == THREAD_PRIORITY_LOWEST, "worker observed LOWEST");
+
+    CHECK(SetThreadPriority(wt, THREAD_PRIORITY_HIGHEST), "cross-thread SetThreadPriority HIGHEST");
+    CHECK(GetThreadPriority(wt) == THREAD_PRIORITY_HIGHEST, "GetThreadPriority HIGHEST");
+    CHECK(SetEvent(ctx.go_ev), "release worker step 2");
+    CHECK(WaitForSingleObject(ctx.ready_ev, 5000) == WAIT_OBJECT_0, "worker ready 2");
+    CHECK(ctx.observed_prios[2] == THREAD_PRIORITY_HIGHEST, "worker observed HIGHEST");
+
+    CHECK(WaitForSingleObject(wt, 5000) == WAIT_OBJECT_0, "join prio_worker");
+    CloseHandle(wt);
+    CloseHandle(ctx.ready_ev);
+    CloseHandle(ctx.go_ev);
+
+    volatile int sus_prio = 99;
+    HANDLE st = CreateThread(NULL, 0, suspended_prio_worker, (LPVOID)&sus_prio, CREATE_SUSPENDED, NULL);
+    CHECK(st != NULL, "CreateThread CREATE_SUSPENDED");
+    CHECK(SetThreadPriority(st, THREAD_PRIORITY_ABOVE_NORMAL), "SetThreadPriority before resume");
+    CHECK(ResumeThread(st) == 1, "ResumeThread");
+    CHECK(WaitForSingleObject(st, 5000) == WAIT_OBJECT_0, "join suspended_prio_worker");
+    CHECK(sus_prio == THREAD_PRIORITY_ABOVE_NORMAL, "suspended worker observed ABOVE_NORMAL");
+    CloseHandle(st);
+    printf("CORPUS_CPU: cross_thread_priority ok\n");
+
+    /* timeBeginPeriod / timeEndPeriod + precise short Sleep(1). */
+    CHECK(timeBeginPeriod(0) != TIMERR_NOERROR, "timeBeginPeriod(0) fails");
+    CHECK(timeEndPeriod(1) != TIMERR_NOERROR, "unmatched timeEndPeriod(1) fails");
+    CHECK(timeBeginPeriod(1) == TIMERR_NOERROR, "timeBeginPeriod(1)");
+    LARGE_INTEGER freq, t0, t1;
+    CHECK(QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&t0), "QPC before Sleep(1)");
+    Sleep(1);
+    CHECK(QueryPerformanceCounter(&t1), "QPC after Sleep(1)");
+    CHECK(t1.QuadPart > t0.QuadPart, "QPC advanced across Sleep(1)");
+    CHECK(timeEndPeriod(1) == TIMERR_NOERROR, "timeEndPeriod(1)");
+    CHECK(timeEndPeriod(1) != TIMERR_NOERROR, "double timeEndPeriod(1) fails");
+    printf("CORPUS_CPU: time_begin_period ok\n");
+
+    printf("CORPUS_CPU: PASS ALL\n");
+    fflush(stdout);
+    return 0;
+}
+"##;

@@ -1,7 +1,7 @@
 //! winmm.dll: multimedia timers.
 
 use crate::types::*;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -11,25 +11,67 @@ pub static ORDINALS: &[(u16, &str)] = &[];
 
 const TIMERR_NOERROR: u32 = 0;
 const TIMERR_NOCANDO: u32 = 97;
+const TIME_PERIOD_MIN_MS: u32 = 1;
+const TIME_PERIOD_MAX_MS: u32 = 1_000_000;
+
+/// Active minimum requested multimedia timer period in ms (`0` = none active).
+/// Read lock-free by `kernel32::time::sleep_ms` to engage precise `mach_wait_until` waits.
+static ACTIVE_MIN_PERIOD_MS: AtomicU32 = AtomicU32::new(0);
+static PERIOD_COUNTS: Mutex<BTreeMap<u32, u32>> = Mutex::new(BTreeMap::new());
+
+/// Smallest currently active period requested via `timeBeginPeriod`, if any.
+#[inline]
+pub fn requested_timer_period_ms() -> Option<u32> {
+    let p = ACTIVE_MIN_PERIOD_MS.load(Ordering::Acquire);
+    (p > 0).then_some(p)
+}
+
+/// Returns `true` when any guest component holds an active `timeBeginPeriod(<= 15 ms)`
+/// request (finer than Windows' 15.6 ms default system timer tick).
+#[inline]
+pub fn high_res_timer_active() -> bool {
+    let p = ACTIVE_MIN_PERIOD_MS.load(Ordering::Acquire);
+    p > 0 && p <= 15
+}
 
 #[inline(never)]
 pub unsafe extern "win64" fn timeGetTime() -> u32 {
     (crate::kernel32::time::interrupt_time_100ns() / 10_000) as u32
 }
 
-/// The host timer is already high resolution; the period is accepted but
-/// nothing changes (sleep granularity on macOS is ~sub-millisecond).
+/// Request a minimum timer resolution of `p` milliseconds (`1..=1_000_000`).
+/// Tracked with reference counts so `kernel32::time::sleep_ms` engages precise
+/// `mach_wait_until` deadlines whenever high-resolution timing (`<= 15 ms`) is active.
 pub unsafe extern "win64" fn timeBeginPeriod(p: u32) -> u32 {
-    if p == 0 {
+    if !(TIME_PERIOD_MIN_MS..=TIME_PERIOD_MAX_MS).contains(&p) {
         return TIMERR_NOCANDO;
     }
-    log::debug!("timeBeginPeriod({p}) (no-op: host timers are high resolution)");
+    let mut counts = crate::thread::defer_lock(&PERIOD_COUNTS);
+    let entry = counts.entry(p).or_insert(0);
+    *entry = entry.saturating_add(1);
+    let min_p = counts.keys().next().copied().unwrap_or(0);
+    ACTIVE_MIN_PERIOD_MS.store(min_p, Ordering::Release);
+    log::debug!("timeBeginPeriod({p}) -> active min period = {min_p} ms");
     TIMERR_NOERROR
 }
+
+/// Release a previously requested timer resolution of `p` milliseconds.
 pub unsafe extern "win64" fn timeEndPeriod(p: u32) -> u32 {
-    if p == 0 {
+    if !(TIME_PERIOD_MIN_MS..=TIME_PERIOD_MAX_MS).contains(&p) {
         return TIMERR_NOCANDO;
     }
+    let mut counts = crate::thread::defer_lock(&PERIOD_COUNTS);
+    let Some(entry) = counts.get_mut(&p) else {
+        return TIMERR_NOCANDO;
+    };
+    if *entry <= 1 {
+        counts.remove(&p);
+    } else {
+        *entry -= 1;
+    }
+    let min_p = counts.keys().next().copied().unwrap_or(0);
+    ACTIVE_MIN_PERIOD_MS.store(min_p, Ordering::Release);
+    log::debug!("timeEndPeriod({p}) -> active min period = {min_p} ms");
     TIMERR_NOERROR
 }
 
@@ -371,6 +413,50 @@ mod tests {
             assert_eq!(timeKillEvent(id2), TIMERR_NOERROR);
             // Killing an already-killed id returns MMSYSERR_INVALPARAM (96).
             assert_eq!(timeKillEvent(id2), 96);
+        }
+    }
+
+    #[test]
+    fn time_begin_and_end_period_track_min_period_and_precise_sleep() {
+        unsafe {
+            assert_eq!(timeBeginPeriod(0), TIMERR_NOCANDO);
+            assert_eq!(timeBeginPeriod(1_000_001), TIMERR_NOCANDO);
+            assert_eq!(timeEndPeriod(0), TIMERR_NOCANDO);
+            assert_eq!(timeEndPeriod(1), TIMERR_NOCANDO);
+            assert_eq!(requested_timer_period_ms(), None);
+            assert!(!high_res_timer_active());
+
+            assert_eq!(timeBeginPeriod(5), TIMERR_NOERROR);
+            assert_eq!(requested_timer_period_ms(), Some(5));
+            assert!(high_res_timer_active());
+            if std::env::var_os("PORT_PRECISE_SLEEP").is_none()
+                && std::env::var_os("AW2_PRECISE_SLEEP").is_none()
+            {
+                assert!(crate::kernel32::time::should_use_precise_sleep(1));
+                assert!(crate::kernel32::time::should_use_precise_sleep(15));
+                assert!(!crate::kernel32::time::should_use_precise_sleep(16));
+                assert!(!crate::kernel32::time::should_use_precise_sleep(0));
+            }
+
+            // Finer period lowers the active minimum; nested refs must unwind cleanly.
+            assert_eq!(timeBeginPeriod(1), TIMERR_NOERROR);
+            assert_eq!(timeBeginPeriod(1), TIMERR_NOERROR);
+            assert_eq!(requested_timer_period_ms(), Some(1));
+            assert_eq!(timeEndPeriod(1), TIMERR_NOERROR);
+            assert_eq!(requested_timer_period_ms(), Some(1));
+            assert_eq!(timeEndPeriod(1), TIMERR_NOERROR);
+            assert_eq!(requested_timer_period_ms(), Some(5));
+
+            // Coarser period (>15ms) does not engage high-res sleep once finer periods end.
+            assert_eq!(timeBeginPeriod(20), TIMERR_NOERROR);
+            assert_eq!(timeEndPeriod(5), TIMERR_NOERROR);
+            assert_eq!(requested_timer_period_ms(), Some(20));
+            assert!(!high_res_timer_active());
+
+            assert_eq!(timeEndPeriod(20), TIMERR_NOERROR);
+            assert_eq!(requested_timer_period_ms(), None);
+            assert!(!high_res_timer_active());
+            assert_eq!(timeEndPeriod(20), TIMERR_NOCANDO);
         }
     }
 }

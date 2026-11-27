@@ -8,7 +8,8 @@ pub(super) const YMM_OFFSET: usize = 576;
 pub(super) const XSAVE_SIZE: usize = YMM_OFFSET + 16 * 16;
 
 pub(crate) fn query(leaf: u32, subleaf: u32) -> [u32; 4] {
-    let cores = win32_rt::process::num_cpus().clamp(1, 64);
+    let topo = win32_rt::process::cpu_topology();
+    let cores = topo.guest_logical.clamp(1, 64);
     let apic = || unsafe { win32_rt::kernel32::threads::GetCurrentProcessorNumber() } % cores;
     let features = host();
     match (leaf, subleaf) {
@@ -29,14 +30,17 @@ pub(crate) fn query(leaf: u32, subleaf: u32) -> [u32; 4] {
         }
         (4, 0..=3) => {
             // Match the virtual caches and single-package, no-SMT layout in Win32 sysinfo.
+            let line = topo.cache_line_bytes.max(64);
+            let ways = 8u32;
             let (kind, level, size, sharing) = match subleaf {
-                0 => (1, 1, 64 * 1024, 1),
-                1 => (2, 1, 128 * 1024, 1),
-                2 => (3, 2, 16 * 1024 * 1024, cores),
-                _ => (3, 3, 32 * 1024 * 1024, cores),
+                0 => (1, 1, topo.l1d_bytes, 1),
+                1 => (2, 1, topo.l1i_bytes, 1),
+                2 => (3, 2, topo.l2_bytes, cores),
+                _ => (3, 3, topo.l3_bytes, cores),
             };
+            let sets = (size / (ways * line)).max(1);
             let eax = kind | (level << 5) | (1 << 8) | ((sharing - 1) << 14) | ((cores - 1) << 26);
-            [eax, (7 << 22) | 127, size / (8 * 128) - 1, 0]
+            [eax, ((ways - 1) << 22) | (line - 1), sets - 1, 0]
         }
         (7, 0) => {
             let ebx = (1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 13) // BMI1, AVX2, BMI2, ERMS, deprecated FCS/FDS
@@ -65,7 +69,11 @@ pub(crate) fn query(leaf: u32, subleaf: u32) -> [u32; 4] {
                 u32::from_le_bytes(BRAND[p..p + 4].try_into().unwrap())
             })
         }
-        (0x8000_0008, _) => [48 << 8 | 48, 0, 0, 0],
+        (0x8000_0008, _) => {
+            let apic_bits = cores.next_power_of_two().ilog2().min(15);
+            let ecx = (apic_bits << 12) | ((cores - 1) & 0xff);
+            [48 << 8 | 48, 0, ecx, 0]
+        }
         _ => [0; 4],
     }
 }

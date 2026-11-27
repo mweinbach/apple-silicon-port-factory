@@ -15,6 +15,43 @@ pub struct MiddlewareSelection {
     pub mode: Option<DllRoute>,
 }
 
+/// Guest CPU topology selection mode in `game.toml` (`[cpu] mode = ...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuMode {
+    /// Expose all host logical cores (P + E).
+    All,
+    /// Expose only performance (P) cores on hybrid Apple Silicon hosts.
+    PCores,
+    /// Cap guest logical cores to `max_cores` (or host P-cores if `max_cores` is unset).
+    Cap,
+}
+
+impl CpuMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" => Some(Self::All),
+            "p_cores" | "p-cores" | "pcores" => Some(Self::PCores),
+            "cap" => Some(Self::Cap),
+            _ => None,
+        }
+    }
+
+    pub fn to_toml_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::PCores => "p_cores",
+            Self::Cap => "cap",
+        }
+    }
+}
+
+/// Optional `[cpu]` topology settings in `game.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CpuManifestConfig {
+    pub mode: Option<CpuMode>,
+    pub max_cores: Option<u32>,
+}
+
 /// Optional `[storage]` optimization settings in `game.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageManifestConfig {
@@ -56,6 +93,9 @@ pub struct GameManifest {
 
     // [middleware] & [middleware.<family>]
     pub middleware: BTreeMap<String, MiddlewareSelection>,
+
+    // [cpu]
+    pub cpu: CpuManifestConfig,
 
     // [storage]
     pub storage: StorageManifestConfig,
@@ -357,6 +397,18 @@ impl GameManifest {
                 self.legacy_remedy_migration = parse_bool(&val)
             }
             "args" | "runtime.args" | "game_args" | "runtime.game_args" => self.args = Some(val),
+            "cpu.mode" => {
+                if let Some(mode) = CpuMode::parse(&val) {
+                    self.cpu.mode = Some(mode);
+                }
+            }
+            "cpu.max_cores" => {
+                if let Ok(n) = val.trim().parse::<u32>() {
+                    if n >= 1 {
+                        self.cpu.max_cores = Some(n);
+                    }
+                }
+            }
             "storage.archive_repacker" => self.storage.archive_repacker = Some(val),
             "storage.archive_dir" => self.storage.archive_dir = Some(val),
             "ios.seed_file" => {
@@ -459,6 +511,14 @@ impl GameManifest {
                     escape_toml_str(&route.to_toml_value())
                 ));
             }
+        }
+
+        if self.cpu.mode.is_some() || self.cpu.max_cores.is_some() {
+            start_section(&mut out, "cpu");
+            if let Some(mode) = self.cpu.mode {
+                push_opt_str(&mut out, "mode", Some(mode.to_toml_value()));
+            }
+            push_opt_u32(&mut out, "max_cores", self.cpu.max_cores);
         }
 
         let has_storage = self.storage.archive_repacker.is_some()
@@ -771,6 +831,12 @@ fn push_opt_bool(out: &mut String, key: &str, val: Option<bool>) {
     }
 }
 
+fn push_opt_u32(out: &mut String, key: &str, val: Option<u32>) {
+    if let Some(v) = val {
+        out.push_str(&format!("{key} = {v}\n"));
+    }
+}
+
 fn parse_bool(s: &str) -> Option<bool> {
     match s.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Some(true),
@@ -921,6 +987,10 @@ keep_dlls = [
             plugin_dirs: vec!["plugins".into(), "controls".into()],
             dlls: BTreeMap::new(),
             middleware: BTreeMap::new(),
+            cpu: CpuManifestConfig {
+                mode: Some(CpuMode::Cap),
+                max_cores: Some(16),
+            },
             storage: StorageManifestConfig {
                 keep_dlls: vec!["NRD.dll".into(), "PhysX3_x64.dll".into()],
                 archive_repacker: Some("custom-repacker".into()),
@@ -996,5 +1066,35 @@ AW2_DLL_AOT = "1"
         );
         assert_eq!(m.knobs.get("AW2_DLL_AOT").map(String::as_str), Some("1"));
         assert!(crate::knobs::validate_manifest_knobs(&m.knobs).is_empty());
+    }
+
+    #[test]
+    fn parses_cpu_section_modes_and_max_cores() {
+        let p_cores = GameManifest::parse(
+            r#"
+[app]
+id = "cpu-pcores"
+
+[cpu]
+mode = "p_cores"
+max_cores = 16
+"#,
+        );
+        assert_eq!(p_cores.cpu.mode, Some(CpuMode::PCores));
+        assert_eq!(p_cores.cpu.max_cores, Some(16));
+        assert_eq!(GameManifest::parse(&p_cores.to_toml()).cpu, p_cores.cpu);
+
+        let all = GameManifest::parse("[cpu]\nmode = \"all\"\n");
+        assert_eq!(all.cpu.mode, Some(CpuMode::All));
+        assert_eq!(all.cpu.max_cores, None);
+
+        let cap = GameManifest::parse("[cpu]\nmode = \"cap\"\nmax_cores = 12\n");
+        assert_eq!(cap.cpu.mode, Some(CpuMode::Cap));
+        assert_eq!(cap.cpu.max_cores, Some(12));
+
+        // Zero max_cores and unknown mode are ignored safely.
+        let bad = GameManifest::parse("[cpu]\nmode = \"bogus\"\nmax_cores = 0\n");
+        assert_eq!(bad.cpu.mode, None);
+        assert_eq!(bad.cpu.max_cores, None);
     }
 }

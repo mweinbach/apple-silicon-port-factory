@@ -529,9 +529,44 @@ pub unsafe extern "win64" fn GetDynamicTimeZoneInformation(p: *mut u8) -> u32 {
     r
 }
 
-fn precise_sleep() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_PRECISE_SLEEP").is_some_and(|v| v != "0"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreciseSleepMode {
+    /// Follow `winmm::timeBeginPeriod` (engage `mach_wait_until` when period `<= 15 ms` is active).
+    Auto,
+    /// Always use `mach_wait_until` for short sleeps (`1..=15 ms`).
+    ForceOn,
+    /// Never use `mach_wait_until` (explicit `PORT_PRECISE_SLEEP=0` / `AW2_PRECISE_SLEEP=0`).
+    ForceOff,
+}
+
+fn precise_sleep_mode() -> PreciseSleepMode {
+    static MODE: OnceLock<PreciseSleepMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let val = std::env::var("PORT_PRECISE_SLEEP")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AW2_PRECISE_SLEEP")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            });
+        match val.as_deref().map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("0" | "false" | "no" | "off") => PreciseSleepMode::ForceOff,
+            Some(_) => PreciseSleepMode::ForceOn,
+            None => PreciseSleepMode::Auto,
+        }
+    })
+}
+
+pub(crate) fn should_use_precise_sleep(ms: u32) -> bool {
+    if ms == 0 || ms > 15 {
+        return false;
+    }
+    match precise_sleep_mode() {
+        PreciseSleepMode::ForceOn => true,
+        PreciseSleepMode::ForceOff => false,
+        PreciseSleepMode::Auto => crate::misc::winmm::high_res_timer_active(),
+    }
 }
 
 fn mach_sleep_ns(ns: u64) {
@@ -545,8 +580,15 @@ fn mach_sleep_ns(ns: u64) {
     }
     let now = unsafe { mach_absolute_time() };
     let ticks = (ns as u128 * d as u128 / n as u128) as u64;
-    unsafe {
-        let _ = mach_wait_until(now.saturating_add(ticks));
+    let deadline = now.saturating_add(ticks);
+    loop {
+        let kr = unsafe { mach_wait_until(deadline) };
+        if kr == 0 || crate::thread::is_current_terminate_requested() {
+            break;
+        }
+        if unsafe { mach_absolute_time() } >= deadline {
+            break;
+        }
     }
 }
 
@@ -555,22 +597,27 @@ pub unsafe extern "win64" fn Sleep(ms: u32) {
 }
 
 pub fn sleep_ms(ms: u32) {
+    crate::thread::sched::flush_pending_qos();
     if ms == 0 {
         std::thread::yield_now();
     } else if ms == INFINITE {
         loop {
             std::thread::park();
         }
-    } else if ms <= 15 && precise_sleep() {
+    } else if should_use_precise_sleep(ms) {
         mach_sleep_ns(ms as u64 * 1_000_000);
     } else {
         std::thread::sleep(std::time::Duration::from_millis(ms as u64));
     }
+    crate::thread::sched::flush_pending_qos();
 }
 
 pub unsafe extern "win64" fn SleepEx(ms: u32, alertable: BOOL) -> u32 {
+    crate::thread::sched::flush_pending_qos();
     if alertable != 0 {
-        if crate::handles::alertable_sleep(ms) {
+        let woke_apc = crate::handles::alertable_sleep(ms);
+        crate::thread::sched::flush_pending_qos();
+        if woke_apc {
             return WAIT_IO_COMPLETION;
         }
         return 0;
@@ -581,6 +628,7 @@ pub unsafe extern "win64" fn SleepEx(ms: u32, alertable: BOOL) -> u32 {
 
 #[inline(never)]
 pub unsafe extern "win64" fn SwitchToThread() -> BOOL {
+    crate::thread::sched::flush_pending_qos();
     libc::sched_yield();
     TRUE
 }
@@ -780,8 +828,10 @@ mod tests {
 
     #[test]
     fn precise_sleep_default_off_and_mach_sleep_deadline() {
-        if std::env::var_os("AW2_PRECISE_SLEEP").is_none() {
-            assert!(!precise_sleep());
+        if std::env::var_os("PORT_PRECISE_SLEEP").is_none()
+            && std::env::var_os("AW2_PRECISE_SLEEP").is_none()
+        {
+            assert!(!should_use_precise_sleep(1));
         }
         let t0 = std::time::Instant::now();
         mach_sleep_ns(1_000_000);
