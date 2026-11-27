@@ -4115,7 +4115,7 @@ pub unsafe extern "win64" fn set_resource_min_lod(_this: PCtx, res: *mut c_void,
         let bits = min_lod.to_bits();
         if r.min_lod_bits.swap(bits, Ordering::AcqRel) != bits {
             r.version.fetch_add(1, Ordering::Release);
-            r.device.bump_desc_resource_version();
+            r.notify_desc_resource_changed();
         }
     }
 }

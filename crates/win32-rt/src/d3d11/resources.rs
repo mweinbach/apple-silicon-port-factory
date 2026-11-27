@@ -194,6 +194,23 @@ impl ResourceCore {
         self.mtl.read().unwrap().mtl.clone()
     }
 
+    pub fn notify_desc_resource_changed(&self) {
+        self.device.bump_desc_resource_version();
+        if self.has_remote_devices.load(Ordering::Acquire) {
+            let mut list = self.shared_devices.lock().unwrap();
+            list.retain(|w| {
+                if let Some(d) = w.upgrade() {
+                    if !Arc::ptr_eq(&d, &self.device) {
+                        d.bump_desc_resource_version();
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+
     pub fn replace_backing(&self, next: ResourceBacking) -> ResourceBacking {
         let old = {
             let mut g = self.mtl.write().unwrap();
@@ -203,7 +220,7 @@ impl ResourceCore {
         self.last_gpu_state.store(gpu_state::COMMON, Ordering::Release);
         let bind = self.kind.bind_flags();
         if (bind & (bind_flag::CONSTANT_BUFFER | bind_flag::SHADER_RESOURCE | bind_flag::UNORDERED_ACCESS)) != 0 {
-            self.device.bump_desc_resource_version();
+            self.notify_desc_resource_changed();
         }
         old
     }

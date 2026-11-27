@@ -5236,3 +5236,74 @@ fn hot_path_pso_reuse_dynamic_pool_and_frame_stats_on_metal() {
         com_release(dev);
     }
 }
+
+#[test]
+fn shared_resource_min_lod_invalidates_importing_device_desc_version() {
+    if d3d12_metal::metal::device().is_none() {
+        return;
+    }
+    unsafe {
+        let mut dev_a = std::ptr::null_mut();
+        let mut ctx_a = std::ptr::null_mut();
+        let mut dev_b = std::ptr::null_mut();
+        let mut ctx_b = std::ptr::null_mut();
+        assert_eq!(
+            D3D11CreateDevice(std::ptr::null_mut(), driver_type::HARDWARE, std::ptr::null_mut(), 0, std::ptr::null(), 0, D3D11_SDK_VERSION, &mut dev_a, std::ptr::null_mut(), &mut ctx_a),
+            S_OK
+        );
+        assert_eq!(
+            D3D11CreateDevice(std::ptr::null_mut(), driver_type::HARDWARE, std::ptr::null_mut(), 0, std::ptr::null(), 0, D3D11_SDK_VERSION, &mut dev_b, std::ptr::null_mut(), &mut ctx_b),
+            S_OK
+        );
+
+        let create_tex2d: unsafe extern "win64" fn(*mut c_void, *const D3D11_TEXTURE2D_DESC, *const D3D11_SUBRESOURCE_DATA, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev_a, 5));
+        let open_shared_b: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const crate::d3d12::com::Guid, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev_b, 28));
+
+        let td = D3D11_TEXTURE2D_DESC {
+            Width: 16,
+            Height: 16,
+            MipLevels: 4,
+            ArraySize: 1,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: usage::DEFAULT,
+            BindFlags: bind_flag::SHADER_RESOURCE,
+            CPUAccessFlags: 0,
+            MiscFlags: misc_flag::SHARED,
+        };
+        let mut tex_a = std::ptr::null_mut();
+        assert_eq!(create_tex2d(dev_a, &td, std::ptr::null(), &mut tex_a), S_OK);
+
+        let qi_fn: unsafe extern "win64" fn(*mut c_void, *const crate::d3d12::com::Guid, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(tex_a, 0));
+        let mut dxgi_res = std::ptr::null_mut();
+        assert_eq!(qi_fn(tex_a, &IID_IDXGIResource, &mut dxgi_res), S_OK);
+        let get_shared_handle: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dxgi_res, 8));
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(get_shared_handle(dxgi_res, &mut handle), S_OK);
+        assert!(!handle.is_null());
+
+        let mut tex_b = std::ptr::null_mut();
+        assert_eq!(open_shared_b(dev_b, handle, &IID_ID3D11Texture2D, &mut tex_b), S_OK);
+
+        let core_a = (*crate::d3d12::com::Obj::<device::D3d11Device>::from_iface(dev_a).unwrap()).inner.core.clone();
+        let core_b = (*crate::d3d12::com::Obj::<device::D3d11Device>::from_iface(dev_b).unwrap()).inner.core.clone();
+        let va0 = core_a.desc_resource_version();
+        let vb0 = core_b.desc_resource_version();
+
+        context::set_resource_min_lod(ctx_b as context::PCtx, tex_b, 1.5);
+        assert!(core_a.desc_resource_version() > va0, "owning device A desc_resource_version must bump");
+        assert!(core_b.desc_resource_version() > vb0, "importing device B desc_resource_version must bump");
+
+        com_release(tex_b);
+        com_release(dxgi_res);
+        com_release(tex_a);
+        com_release(ctx_b);
+        com_release(dev_b);
+        com_release(ctx_a);
+        com_release(dev_a);
+    }
+}
