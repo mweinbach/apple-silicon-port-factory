@@ -10,7 +10,7 @@
 //! burst-tail CPU minimal). Threads that repeatedly enter long sleeps rapidly
 //! decay their spin budget to `0` so idle CPU never regresses.
 //!
-//! `PORT_WAIT_SPIN_US` (alias `AW2_WAIT_SPIN_US`, default `16`, `0` = off):
+//! `PORT_WAIT_SPIN_US` (alias `AW2_WAIT_SPIN_US`, default `12`, `0` = off):
 //! maximum adaptive spin budget in microseconds before parking.
 //! `PORT_WAKE_STATS=1` (alias `AW2_WAKE_STATS=1`): log wake/sleep/spin stats
 //! every ~2 s.
@@ -19,7 +19,7 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 extern "C" {
     fn __ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> i32;
@@ -30,15 +30,15 @@ const UL_COMPARE_AND_WAIT: u32 = 1;
 const ULF_NO_ERRNO: u32 = 0x0100_0000;
 
 /// Default maximum adaptive spin budget (µs) before parking in `__ulock_wait`.
-pub(crate) const DEFAULT_WAIT_SPIN_US: u64 = 16;
+pub(crate) const DEFAULT_WAIT_SPIN_US: u64 = 12;
 /// Hard upper bound on spin loop iterations regardless of clock speed.
-const MAX_SPIN_ITERS: u32 = 1024;
+const MAX_SPIN_ITERS: u32 = 512;
 /// Sleep duration (µs) above which a wait is considered an idle/long sleep for
 /// adaptive decay.
-const LONG_SLEEP_US: u64 = 200;
+const LONG_SLEEP_US: u64 = 150;
 /// Number of long sleeps between brief 2 µs probes once an idle thread has
 /// decayed to 0 spin budget.
-const IDLE_PROBE_INTERVAL: u16 = 16;
+const IDLE_PROBE_INTERVAL: u16 = 32;
 
 const IDLE: u32 = 0;
 const NOTIFIED: u32 = 1;
@@ -80,29 +80,32 @@ fn config() -> &'static Config {
 }
 
 static KERNEL_WAKES: AtomicU64 = AtomicU64::new(0);
-static KERNEL_WAKE_NS: AtomicU64 = AtomicU64::new(0);
+static KERNEL_WAKE_TICKS: AtomicU64 = AtomicU64::new(0);
 static CHEAP_WAKES: AtomicU64 = AtomicU64::new(0);
 static COALESCED_WAKES: AtomicU64 = AtomicU64::new(0);
 static SLEEPS: AtomicU64 = AtomicU64::new(0);
 static SPIN_HITS: AtomicU64 = AtomicU64::new(0);
-static NEXT_REPORT_NS: AtomicU64 = AtomicU64::new(0);
+static NEXT_REPORT_TICKS: AtomicU64 = AtomicU64::new(0);
 
-#[inline(always)]
-fn now_ns() -> u64 {
-    crate::hitch::now_ns()
-}
-
-fn maybe_report(now: u64) {
-    let next = NEXT_REPORT_NS.load(Ordering::Relaxed);
-    if now < next
-        || NEXT_REPORT_NS
-            .compare_exchange(next, now + 2_000_000_000, Ordering::Relaxed, Ordering::Relaxed)
+#[cold]
+fn maybe_report(now_ticks: u64) {
+    let next = NEXT_REPORT_TICKS.load(Ordering::Relaxed);
+    let interval = us_to_ticks(2_000_000);
+    if now_ticks < next
+        || NEXT_REPORT_TICKS
+            .compare_exchange(
+                next,
+                now_ticks.saturating_add(interval),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
             .is_err()
     {
         return;
     }
     let kw = KERNEL_WAKES.swap(0, Ordering::Relaxed);
-    let ns = KERNEL_WAKE_NS.swap(0, Ordering::Relaxed);
+    let ticks = KERNEL_WAKE_TICKS.swap(0, Ordering::Relaxed);
+    let ns = ticks_to_ns(ticks);
     log::info!(
         "wake-stats: kernel_wakes={} ({:.2} us avg) cheap_wakes={} sleeps={} spin_hits={} coalesced={}",
         kw,
@@ -124,16 +127,20 @@ pub(crate) fn record_spin_hit_stat() {
 #[inline(always)]
 pub(crate) fn record_cheap_wake_stat() {
     if config().stats {
-        CHEAP_WAKES.fetch_add(1, Ordering::Relaxed);
-        maybe_report(now_ns());
+        let prev = CHEAP_WAKES.fetch_add(1, Ordering::Relaxed);
+        if (prev & 1023) == 0 {
+            maybe_report(ticks_now());
+        }
     }
 }
 
 #[inline(always)]
 pub(crate) fn record_coalesced_wake_stat() {
     if config().stats {
-        COALESCED_WAKES.fetch_add(1, Ordering::Relaxed);
-        maybe_report(now_ns());
+        let prev = COALESCED_WAKES.fetch_add(1, Ordering::Relaxed);
+        if (prev & 1023) == 0 {
+            maybe_report(ticks_now());
+        }
     }
 }
 
@@ -185,13 +192,54 @@ pub(crate) fn us_to_ticks(us: u64) -> u64 {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn ticks_to_us(ticks: u64) -> u64 {
-    ticks.saturating_mul(1_000_000) / ticks_freq()
+    ((ticks as u128).saturating_mul(1_000_000) / ticks_freq() as u128) as u64
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 pub(crate) fn ticks_to_us(ticks: u64) -> u64 {
     ticks / 1_000
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
+    ((ticks as u128).saturating_mul(1_000_000_000) / ticks_freq() as u128) as u64
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
+    ticks
+}
+
+#[inline(always)]
+pub(crate) fn duration_to_ticks(d: Duration) -> u64 {
+    if d.is_zero() {
+        return 0;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        ((d.as_nanos().saturating_mul(ticks_freq() as u128) / 1_000_000_000)
+            .min(u64::MAX as u128) as u64)
+            .max(1)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        (d.as_nanos().min(u64::MAX as u128) as u64).max(1)
+    }
+}
+
+/// Convert an optional relative timeout into an absolute zero-syscall tick deadline.
+#[inline(always)]
+pub(crate) fn deadline_from_duration(timeout: Option<Duration>) -> Option<u64> {
+    timeout.map(|d| ticks_now().saturating_add(duration_to_ticks(d)))
+}
+
+/// True if an optional absolute tick deadline has already elapsed.
+#[inline(always)]
+pub(crate) fn deadline_expired(deadline_ticks: Option<u64>) -> bool {
+    deadline_ticks.is_some_and(|d| ticks_now() >= d)
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +259,7 @@ struct ThreadSpinState {
 impl ThreadSpinState {
     const fn new() -> Self {
         Self {
-            budget_us: 4,
+            budget_us: 2,
             miss_streak: 0,
             probe_countdown: 0,
         }
@@ -242,7 +290,7 @@ impl ThreadSpinState {
         let cap32 = cap_us.min(u32::MAX as u64) as u32;
         self.miss_streak = 0;
         self.probe_countdown = 0;
-        self.budget_us = self.budget_us.max(2).saturating_mul(2).min(cap32);
+        self.budget_us = self.budget_us.saturating_add(2).min(cap32);
     }
 
     #[inline]
@@ -253,19 +301,19 @@ impl ThreadSpinState {
         let cap32 = cap_us.min(u32::MAX as u64) as u32;
         if timed_out || sleep_us >= LONG_SLEEP_US {
             self.miss_streak = self.miss_streak.saturating_add(1);
-            if self.miss_streak >= 3 {
+            if self.miss_streak >= 2 {
                 self.budget_us = 0;
                 self.probe_countdown = IDLE_PROBE_INTERVAL;
             } else {
                 self.budget_us /= 2;
             }
-        } else if sleep_us < cap_us.saturating_mul(2) {
-            // Very short sleep that just missed our spin window: gently expand.
+        } else if sleep_us <= cap_us {
+            // Very short sleep that barely missed our spin window: gently nudge up by 1 µs.
             self.miss_streak = 0;
-            self.budget_us = self.budget_us.saturating_add(2).min(cap32);
+            self.budget_us = self.budget_us.saturating_add(1).min(cap32);
         } else {
             self.miss_streak = self.miss_streak.saturating_add(1);
-            self.budget_us = (self.budget_us * 3) / 4;
+            self.budget_us /= 2;
         }
     }
 }
@@ -279,22 +327,27 @@ pub(crate) fn spin_enabled() -> bool {
     config().spin_max_us > 0
 }
 
-/// Compute the current thread's adaptive spin budget (µs), capped by `cap_us`
-/// and by any remaining time before `deadline`.
 #[inline]
-pub(crate) fn adaptive_spin_budget_us(deadline: Option<Instant>, cap_us: u64) -> u64 {
+fn next_thread_spin_budget_us(cap_us: u64) -> u64 {
     let eff_cap = config().spin_max_us.min(cap_us);
     if eff_cap == 0 {
         return 0;
     }
-    let mut budget = SPIN_STATE
+    SPIN_STATE
         .try_with(|c| {
             let mut st = c.get();
             let b = st.next_budget_us(eff_cap);
             c.set(st);
             b
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Compute the current thread's adaptive spin budget (µs), capped by `cap_us`
+/// and by any remaining time before `deadline`.
+#[inline]
+pub(crate) fn adaptive_spin_budget_us(deadline: Option<Instant>, cap_us: u64) -> u64 {
+    let mut budget = next_thread_spin_budget_us(cap_us);
     if budget == 0 {
         return 0;
     }
@@ -310,6 +363,24 @@ pub(crate) fn adaptive_spin_budget_us(deadline: Option<Instant>, cap_us: u64) ->
         budget = budget.min(rem_us);
     }
     budget
+}
+
+#[inline]
+fn adaptive_spin_budget_ticks(deadline_ticks: Option<u64>, cap_us: u64) -> u64 {
+    let budget = next_thread_spin_budget_us(cap_us);
+    if budget == 0 {
+        return 0;
+    }
+    let mut max_ticks = us_to_ticks(budget);
+    if let Some(dt) = deadline_ticks {
+        let now = ticks_now();
+        if now >= dt {
+            return 0;
+        }
+        let rem = dt - now;
+        max_ticks = max_ticks.min(rem);
+    }
+    max_ticks
 }
 
 #[inline]
@@ -333,6 +404,25 @@ pub(crate) fn record_sleep_outcome(sleep_us: u64, timed_out: bool) {
     });
 }
 
+#[inline(always)]
+fn run_bounded_spin_ticks(max_ticks: u64, mut check: impl FnMut() -> bool) -> bool {
+    if max_ticks == 0 {
+        return false;
+    }
+    let start = ticks_now();
+    for i in 0..MAX_SPIN_ITERS {
+        if check() {
+            record_spin_hit();
+            return true;
+        }
+        std::hint::spin_loop();
+        if (i & 7) == 7 && ticks_now().wrapping_sub(start) >= max_ticks {
+            return false;
+        }
+    }
+    false
+}
+
 /// Bounded adaptive spin for wait predicates (events, semaphores, condvars,
 /// `WaitOnAddress`, SRW locks). Strictly bounded by both `MAX_SPIN_ITERS` and
 /// `budget_us` using zero-syscall `CNTVCT_EL0` ticks on ARM64.
@@ -340,25 +430,24 @@ pub(crate) fn record_sleep_outcome(sleep_us: u64, timed_out: bool) {
 pub(crate) fn spin_until(
     deadline: Option<Instant>,
     cap_us: u64,
-    mut check: impl FnMut() -> bool,
+    check: impl FnMut() -> bool,
 ) -> bool {
     let budget_us = adaptive_spin_budget_us(deadline, cap_us);
     if budget_us == 0 {
         return false;
     }
-    let start = ticks_now();
-    let max_ticks = us_to_ticks(budget_us);
-    for i in 0..MAX_SPIN_ITERS {
-        if check() {
-            record_spin_hit();
-            return true;
-        }
-        std::hint::spin_loop();
-        if (i & 15) == 15 && ticks_now().wrapping_sub(start) >= max_ticks {
-            return false;
-        }
-    }
-    false
+    run_bounded_spin_ticks(us_to_ticks(budget_us), check)
+}
+
+/// Zero-syscall tick-deadline variant of [`spin_until`].
+#[inline]
+pub(crate) fn spin_until_ticks(
+    deadline_ticks: Option<u64>,
+    cap_us: u64,
+    check: impl FnMut() -> bool,
+) -> bool {
+    let max_ticks = adaptive_spin_budget_ticks(deadline_ticks, cap_us);
+    run_bounded_spin_ticks(max_ticks, check)
 }
 
 #[inline]
@@ -371,6 +460,21 @@ fn deadline_timeout_us(deadline: Option<Instant>) -> Option<u32> {
                 None
             } else {
                 Some(((d - now).as_micros().min(u32::MAX as u128) as u32).max(1))
+            }
+        }
+    }
+}
+
+#[inline]
+fn deadline_ticks_timeout_us(deadline_ticks: Option<u64>) -> Option<u32> {
+    match deadline_ticks {
+        None => Some(0), // infinite
+        Some(dt) => {
+            let now = ticks_now();
+            if now >= dt {
+                None
+            } else {
+                Some((ticks_to_us(dt - now).min(u32::MAX as u64) as u32).max(1))
             }
         }
     }
@@ -420,11 +524,21 @@ impl Parker {
         self.park_sleep_only(deadline)
     }
 
-    /// Block directly in `__ulock_wait` without an additional spin phase (used
-    /// when the caller already performed its object-level capped spin).
-    /// Returns `true` if `__ulock_wait` was interrupted by `EINTR` for a pending
-    /// `TerminateThread` request.
-    pub fn park_sleep_only(&self, deadline: Option<Instant>) -> bool {
+    /// Bounded tick-deadline spin waiting for [`Self::unpark`] (`NOTIFIED`) without
+    /// entering `__ulock_wait`. Returns `true` if notified before budget/deadline elapsed.
+    #[inline]
+    pub(crate) fn spin_wait_ticks(&self, deadline_ticks: Option<u64>, cap_us: u64) -> bool {
+        if self.word.load(Ordering::Acquire) == NOTIFIED {
+            return true;
+        }
+        cap_us > 0
+            && spin_until_ticks(deadline_ticks, cap_us, || {
+                self.word.load(Ordering::Acquire) == NOTIFIED
+            })
+    }
+
+    #[inline]
+    fn park_sleep_loop(&self, mut next_timeout_us: impl FnMut() -> Option<u32>) -> bool {
         if self.word.load(Ordering::Acquire) == NOTIFIED {
             return false;
         }
@@ -440,7 +554,7 @@ impl Parker {
         let mut timed_out = false;
         let mut interrupted = false;
         loop {
-            let Some(timeout_us) = deadline_timeout_us(deadline) else {
+            let Some(timeout_us) = next_timeout_us() else {
                 timed_out = true;
                 break;
             };
@@ -474,27 +588,44 @@ impl Parker {
         interrupted
     }
 
+    /// Block directly in `__ulock_wait` without an additional spin phase (used
+    /// when the caller already performed its object-level capped spin).
+    /// Returns `true` if `__ulock_wait` was interrupted by `EINTR` for a pending
+    /// `TerminateThread` request.
+    pub fn park_sleep_only(&self, deadline: Option<Instant>) -> bool {
+        self.park_sleep_loop(|| deadline_timeout_us(deadline))
+    }
+
+    /// Zero-syscall tick-deadline variant of [`Self::park_sleep_only`].
+    pub(crate) fn park_sleep_only_ticks(&self, deadline_ticks: Option<u64>) -> bool {
+        self.park_sleep_loop(|| deadline_ticks_timeout_us(deadline_ticks))
+    }
+
     /// Wake the owner; enters the kernel only if it is actually asleep.
     #[inline]
     pub fn unpark(&self) {
         let prev = self.word.swap(NOTIFIED, Ordering::AcqRel);
         let cfg = config();
         if prev == SLEEPING {
-            let t0 = cfg.stats.then(now_ns);
+            let t0 = cfg.stats.then(ticks_now);
             unsafe { __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, self.addr(), 0) };
             if let Some(t0) = t0 {
-                let t1 = now_ns();
-                KERNEL_WAKES.fetch_add(1, Ordering::Relaxed);
-                KERNEL_WAKE_NS.fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
-                maybe_report(t1);
+                let t1 = ticks_now();
+                let kw = KERNEL_WAKES.fetch_add(1, Ordering::Relaxed);
+                KERNEL_WAKE_TICKS.fetch_add(t1.wrapping_sub(t0), Ordering::Relaxed);
+                if (kw & 255) == 0 {
+                    maybe_report(t1);
+                }
             }
         } else if cfg.stats {
-            if prev == NOTIFIED {
-                COALESCED_WAKES.fetch_add(1, Ordering::Relaxed);
+            let prev_cnt = if prev == NOTIFIED {
+                COALESCED_WAKES.fetch_add(1, Ordering::Relaxed)
             } else {
-                CHEAP_WAKES.fetch_add(1, Ordering::Relaxed);
+                CHEAP_WAKES.fetch_add(1, Ordering::Relaxed)
+            };
+            if (prev_cnt & 1023) == 0 {
+                maybe_report(ticks_now());
             }
-            maybe_report(now_ns());
         }
     }
 }
@@ -622,25 +753,35 @@ mod tests {
     #[test]
     fn adaptive_spin_decays_to_zero_on_long_sleeps_and_ramps_on_hits() {
         let mut st = ThreadSpinState::new();
-        assert_eq!(st.next_budget_us(16), 4);
-        // Three long sleeps must decay budget to 0.
-        st.on_sleep_done(500, false, 16);
-        assert_eq!(st.budget_us, 2);
-        st.on_sleep_done(500, false, 16);
+        assert_eq!(st.next_budget_us(12), 2);
+        // Two long sleeps must decay budget to 0.
+        st.on_sleep_done(500, false, 12);
         assert_eq!(st.budget_us, 1);
-        st.on_sleep_done(500, false, 16);
+        st.on_sleep_done(500, false, 12);
         assert_eq!(st.budget_us, 0);
-        // Next 16 calls return 0 (no spinning while idle), then one 2 us probe.
+        // Next IDLE_PROBE_INTERVAL calls return 0 (no spinning while idle), then one 2 us probe.
         for _ in 0..IDLE_PROBE_INTERVAL {
-            assert_eq!(st.next_budget_us(16), 0);
+            assert_eq!(st.next_budget_us(12), 0);
         }
-        assert_eq!(st.next_budget_us(16), 2);
-        // A spin hit immediately ramps up to cap.
-        st.on_spin_hit(16);
-        assert!(st.budget_us >= 4);
-        for _ in 0..4 {
-            st.on_spin_hit(16);
+        assert_eq!(st.next_budget_us(12), 2);
+        // Spin hits ramp linearly (+2 us) up to cap.
+        for _ in 0..6 {
+            st.on_spin_hit(12);
         }
-        assert_eq!(st.budget_us, 16);
+        assert_eq!(st.budget_us, 12);
+        // Medium sleep above cap decays budget rather than expanding it.
+        st.on_sleep_done(40, false, 12);
+        assert_eq!(st.budget_us, 6);
+    }
+
+    #[test]
+    fn park_ticks_times_out_accurately() {
+        let p = Parker::new();
+        p.arm();
+        let t = Instant::now();
+        let dl = deadline_from_duration(Some(Duration::from_millis(15)));
+        p.park_sleep_only_ticks(dl);
+        assert!(t.elapsed() >= Duration::from_millis(14));
+        assert!(deadline_expired(dl));
     }
 }

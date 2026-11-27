@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub trait KObject: Any + Send + Sync {
     fn type_name(&self) -> &'static str;
@@ -1364,10 +1364,11 @@ pub fn wait_for_duration(
         return WaitResult::Timeout;
     }
 
-    let deadline = timeout.map(|d| Instant::now() + d);
+    let deadline = park::deadline_from_duration(timeout);
     let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, objs.len() as u64);
     let _term_defer = crate::thread::TerminateDeferGuard::enter();
     let mut reg = Registration::new(objs, wait_all, alertable, tid);
+    let mut allow_spin = park::spin_enabled();
     loop {
         // Arm BEFORE re-checking state so lock-free notifiers (Event::set,
         // Semaphore::release, queue_apc) racing with us cannot lose a wakeup.
@@ -1388,12 +1389,21 @@ pub fn wait_for_duration(
             }
             return res;
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if park::deadline_expired(deadline) {
             return WaitResult::Timeout;
         }
         let park = Arc::clone(&reg.waiter);
         drop(g);
-        if park.park.park(deadline) {
+        let spun_hit = if allow_spin && try_claim_spinner(&MULTI_WAIT_SPINNERS) {
+            allow_spin = false;
+            let hit = park.park.spin_wait_ticks(deadline, 4);
+            MULTI_WAIT_SPINNERS.fetch_sub(1, Ordering::Release);
+            hit
+        } else {
+            allow_spin = false;
+            false
+        };
+        if !spun_hit && park.park.park_sleep_only_ticks(deadline) {
             return WaitResult::Timeout;
         }
         g = wait_lock();
@@ -1422,7 +1432,7 @@ pub fn alertable_sleep_duration(timeout: Option<Duration>) -> bool {
         return false;
     }
     let tid = crate::teb::thread_id();
-    let deadline = timeout.map(|d| Instant::now() + d);
+    let deadline = park::deadline_from_duration(timeout);
     let _term_defer = crate::thread::TerminateDeferGuard::enter();
     let reg = Registration::new(&[], false, true, tid);
     loop {
@@ -1433,10 +1443,10 @@ pub fn alertable_sleep_duration(timeout: Option<Duration>) -> bool {
             crate::thread::run_pending_apcs();
             return true;
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if park::deadline_expired(deadline) {
             return false;
         }
-        if reg.waiter.park.park(deadline) {
+        if reg.waiter.park.park_sleep_only_ticks(deadline) {
             return false;
         }
     }
@@ -1456,6 +1466,9 @@ pub fn alertable_sleep(timeout_ms: u32) -> bool {
 /// `nmspinning` pattern): keeps hot worker-pool latency low while preventing
 /// 16+ idle workers from burning CPU at the tail of a frame's job burst.
 const MAX_CONCURRENT_SPINNERS: u32 = 2;
+
+/// Global concurrent spinner cap for multi-object / complex `wait_for_duration` calls.
+static MULTI_WAIT_SPINNERS: AtomicU32 = AtomicU32::new(0);
 
 #[inline]
 fn try_claim_spinner(spinners: &AtomicU32) -> bool {
@@ -1708,11 +1721,11 @@ impl Event {
             return WaitResult::Timeout;
         }
         let my_gen = self.pulse_word.load(Ordering::Acquire) as u32;
-        let deadline = timeout.map(|d| Instant::now() + d);
+        let deadline = park::deadline_from_duration(timeout);
 
         // Capped adaptive bounded spin (at most `MAX_CONCURRENT_SPINNERS` per event).
         if park::spin_enabled() && try_claim_spinner(&self.spinners) {
-            let hit = park::spin_until(deadline, u64::MAX, || {
+            let hit = park::spin_until_ticks(deadline, u64::MAX, || {
                 self.try_take() || self.try_claim_pulse(my_gen)
             });
             self.spinners.fetch_sub(1, Ordering::Release);
@@ -1751,7 +1764,7 @@ impl Event {
                 return WaitResult::Object(0);
             }
 
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if park::deadline_expired(deadline) {
                 if holds_in_flight {
                     self.in_flight.fetch_sub(1, Ordering::AcqRel);
                     std::sync::atomic::fence(Ordering::SeqCst);
@@ -1803,7 +1816,7 @@ impl Event {
                 continue;
             }
 
-            let interrupted = waiter.park.park_sleep_only(deadline);
+            let interrupted = waiter.park.park_sleep_only_ticks(deadline);
 
             let mut node_pulsed = false;
             self.queue.lock.lock();
@@ -2251,11 +2264,11 @@ impl Semaphore {
         if matches!(timeout, Some(d) if d.is_zero()) {
             return WaitResult::Timeout;
         }
-        let deadline = timeout.map(|d| Instant::now() + d);
+        let deadline = park::deadline_from_duration(timeout);
 
         // Capped adaptive bounded spin (at most `MAX_CONCURRENT_SPINNERS` per semaphore).
         if park::spin_enabled() && try_claim_spinner(&self.spinners) {
-            let hit = park::spin_until(deadline, u64::MAX, || {
+            let hit = park::spin_until_ticks(deadline, u64::MAX, || {
                 self.available_count(Ordering::Relaxed) > 0 && self.try_take()
             });
             self.spinners.fetch_sub(1, Ordering::Release);
@@ -2284,7 +2297,7 @@ impl Semaphore {
                 return WaitResult::Object(0);
             }
 
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if park::deadline_expired(deadline) {
                 if holds_in_flight {
                     self.in_flight.fetch_sub(1, Ordering::AcqRel);
                     std::sync::atomic::fence(Ordering::SeqCst);
@@ -2322,7 +2335,7 @@ impl Semaphore {
                 continue;
             }
 
-            let interrupted = waiter.park.park_sleep_only(deadline);
+            let interrupted = waiter.park.park_sleep_only_ticks(deadline);
 
             self.queue.lock.lock();
             unsafe {
@@ -2599,6 +2612,7 @@ impl<T> HandleTable<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn waitable_timer_cached_and_invalidated_on_close() {
