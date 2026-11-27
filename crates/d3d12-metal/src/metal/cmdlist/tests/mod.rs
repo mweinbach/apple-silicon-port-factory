@@ -1136,8 +1136,10 @@ fn g35_defaults_promote_g34_winners_and_keep_g35_knobs_opt_in() {
         assert!(opt_fast_bind_pso_env());
         assert!(crate::metal::pipeline::fast_bind_pso());
     }
-    if std::env::var_os("AW2_PRESENT_OFF_MAIN").is_none() {
-        assert!(crate::metal::swapchain::present_off_main());
+    if std::env::var_os("PORT_PRESENT_OFF_MAIN").is_none()
+        && std::env::var_os("AW2_PRESENT_OFF_MAIN").is_none()
+    {
+        assert!(!crate::metal::swapchain::present_off_main());
     }
     if std::env::var_os("AW2_UAV0_CLEAR_OVERLAP").is_none() {
         assert!(opt_uav0_clear_overlap_env());

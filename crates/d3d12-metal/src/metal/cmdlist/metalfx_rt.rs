@@ -973,13 +973,23 @@ impl CommandList {
         if !self.icb.icb_segs.is_empty() {
             self.flush_draw_batch(false);
         }
-        if self.mfx_fence.is_none() {
-            self.mfx_fence = crate::metal::device().and_then(|d| d.dev.newFence());
-        }
+        // Acquire a fence from the bound `CommandAllocator`'s pool so two in-flight
+        // recordings reusing the same `CommandList` on different allocators never
+        // alias a live `MTLFence` in `updateFence` / `scaler.setFence` / `waitForFence`.
+        let cur_fence = self
+            .mfx_fences
+            .as_ref()
+            .and_then(|pool| pool.lock().unwrap().acquire())
+            .or_else(|| {
+                if self.mfx_fence.is_none() {
+                    self.mfx_fence = crate::metal::device().and_then(|d| d.dev.newFence());
+                }
+                self.mfx_fence.clone()
+            });
         let legacy = legacy_barriers();
         let masks = barrier_masks();
         let masked = tight_stages && !legacy && masks;
-        let effective_has_fence = has_fence && self.mfx_fence.is_some();
+        let effective_has_fence = has_fence && cur_fence.is_some();
         let was_full = self.bar.needs_barrier;
         let need_all_before =
             !masked || was_full || self.bar.list_unwaited_cs || self.bar.list_unwaited_gfx;
@@ -1011,7 +1021,7 @@ impl CommandList {
                     MTLStages::Dispatch,
                     MTL4VisibilityOptions::Device,
                 );
-                if let Some(f) = &self.mfx_fence {
+                if let Some(f) = &cur_fence {
                     e.updateFence_afterEncoderStages(f, MTLStages::Dispatch);
                 }
                 self.note_stage_ran(MTLStages::Dispatch);
@@ -1065,7 +1075,7 @@ impl CommandList {
                         MTL4VisibilityOptions::Device,
                     );
                 }
-                if let Some(f) = &self.mfx_fence {
+                if let Some(f) = &cur_fence {
                     e.updateFence_afterEncoderStages(f, MTLStages::Fragment);
                 }
                 self.note_stage_ran(MTLStages::Fragment);
@@ -1109,7 +1119,7 @@ impl CommandList {
                         MTLStages::Dispatch,
                         MTL4VisibilityOptions::Device,
                     );
-                    if let Some(f) = &self.mfx_fence {
+                    if let Some(f) = &cur_fence {
                         e.updateFence_afterEncoderStages(f, MTLStages::Dispatch);
                     }
                     let (prod_after, prod_before) = metalfx_pre_producer_barrier(
@@ -1157,7 +1167,7 @@ impl CommandList {
         } else {
             UTIL_STAGES
         });
-        (self.mfx_fence.clone(), pre_sync, was_full)
+        (cur_fence, pre_sync, was_full)
     }
 
     /// Wait on `pending_mfx_wait_fence` for the subset of `stages` that has not
@@ -2523,5 +2533,74 @@ mod tests {
             (r2 - 0.2).abs() < 0.15 && (g2 - 0.7).abs() < 0.15 && (b2 - 0.5).abs() < 0.15,
             "fallback post-MetalFX readback corrupted: ({r2}, {g2}, {b2})"
         );
+    }
+
+    #[test]
+    fn allocator_mfx_fence_pool_isolates_reused_cmdlist_across_allocators() {
+        if crate::metal::device().is_none() {
+            return;
+        }
+        use crate::metal::cmdlist::CommandAllocator;
+        use crate::metal::queue::ListType;
+
+        let alloc0 = CommandAllocator::new(ListType::Direct).unwrap();
+        let alloc1 = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l = CommandList::new(ListType::Direct).unwrap();
+
+        // First recording on `alloc0`: acquires fence A from `alloc0`'s pool.
+        l.begin(&alloc0).unwrap();
+        let (f0_a, _, _) = l.sync_queue_before_metalfx(
+            MTLTextureUsage::ShaderWrite,
+            true,
+            true,
+            pt::synth::METALFX_TEMPORAL,
+            64,
+            64,
+        );
+        let (f0_b, _, _) = l.sync_queue_before_metalfx(
+            MTLTextureUsage::ShaderWrite,
+            true,
+            true,
+            pt::synth::METALFX_TEMPORAL,
+            64,
+            64,
+        );
+        l.close().unwrap();
+
+        // Second recording of the SAME `CommandList` on `alloc1` while `alloc0` is still
+        // in flight: must acquire a distinct `MTLFence` from `alloc1`'s pool so the two
+        // in-flight recordings never alias the same live `MTLFence`.
+        l.begin(&alloc1).unwrap();
+        let (f1_a, _, _) = l.sync_queue_before_metalfx(
+            MTLTextureUsage::ShaderWrite,
+            true,
+            true,
+            pt::synth::METALFX_TEMPORAL,
+            64,
+            64,
+        );
+        l.close().unwrap();
+
+        let p0_a = Retained::as_ptr(f0_a.as_ref().expect("f0_a")) as usize;
+        let p0_b = Retained::as_ptr(f0_b.as_ref().expect("f0_b")) as usize;
+        let p1_a = Retained::as_ptr(f1_a.as_ref().expect("f1_a")) as usize;
+        assert_ne!(p0_a, p0_b, "two MetalFX passes in one recording must use distinct fences");
+        assert_ne!(p0_a, p1_a, "reusing CommandList across allocators must not alias MTLFence");
+        assert_ne!(p0_b, p1_a, "reusing CommandList across allocators must not alias MTLFence");
+
+        // After `alloc0.reset()`, its pool cursor rewinds and reuses `p0_a` without leaking.
+        alloc0.reset();
+        l.begin(&alloc0).unwrap();
+        let (f0_reused, _, _) = l.sync_queue_before_metalfx(
+            MTLTextureUsage::ShaderWrite,
+            true,
+            true,
+            pt::synth::METALFX_TEMPORAL,
+            64,
+            64,
+        );
+        l.close().unwrap();
+        let p0_reused = Retained::as_ptr(f0_reused.as_ref().expect("f0_reused")) as usize;
+        assert_eq!(p0_reused, p0_a, "CommandAllocator::reset must rewind and reuse pooled MTLFence");
     }
 }
