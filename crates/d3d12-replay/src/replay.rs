@@ -320,11 +320,14 @@ impl Tracker {
             }
             Call::CreateCommandList { device, list, allocator, initial_pso, .. } => {
                 self.expect(i, "CreateCommandList", *device, &[K::Device], false);
-                self.expect(i, "CreateCommandList allocator", *allocator, &[K::Allocator], false);
+                self.expect(i, "CreateCommandList allocator", *allocator, &[K::Allocator], true);
                 self.expect(i, "CreateCommandList initial PSO", *initial_pso, &[K::GraphicsPso, K::ComputePso, K::MeshPso], true);
                 self.create(i, *list, K::CommandList, Info::None);
                 if let Some(st) = self.objs.lists.get_mut(list) {
                     st.pso = *initial_pso;
+                    if *allocator == 0 {
+                        st.open = false;
+                    }
                 }
             }
             Call::CreateDescriptorHeap { device, heap, desc, cpu_start, gpu_start } => {

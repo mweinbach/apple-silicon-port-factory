@@ -132,6 +132,10 @@ struct LiveCommandList {
     alloc_id: u64,
     initial_pso: u64,
     open_ts_slot: Option<u32>,
+    /// True once this closed command list has been submitted via `ExecuteCommandLists`
+    /// since its last `begin`/`Reset`, so timed benchmarks reject re-executing the same
+    /// baked timestamp writes into identical counter-heap slots.
+    submitted_since_reset: bool,
     /// Indirect argument buffers with embedded GPU VAs that must be refreshed from their
     /// source resource right before `ExecuteCommandLists` so submission-time `WriteResource`
     /// uploads (`tr::sync_uploads`) are reflected in the relocated scratch buffer.
@@ -510,6 +514,7 @@ impl MetalBackend {
                 }
             }
             l.open_ts_slot = ts_slot;
+            l.submitted_since_reset = false;
             l.pending_indirect_relocs.clear();
             if let Some(p) = pso {
                 bind_pso(&mut l.cl, p);
@@ -766,23 +771,27 @@ impl Backend for MetalBackend {
             }
             Call::CreateCommandList { list, list_type, allocator, initial_pso, .. } => {
                 let kind = ListType::from_raw(*list_type).unwrap_or(ListType::Direct);
-                let alloc = self
-                    .allocators
-                    .get(allocator)
-                    .ok_or_else(|| format!("unknown allocator {allocator:#x}"))?;
                 let mut cl = CommandList::new(kind).ok_or("CommandList::new failed")?;
-                cl.begin(alloc)?;
                 let mut open_ts_slot = None;
-                if self.timing_armed && matches!(kind, ListType::Direct | ListType::Compute) {
-                    if let Some(timer) = self.gpu_timer.as_mut() {
-                        let slot = timer.alloc_slot()?;
-                        cl.write_timestamp(&timer.heap, slot)?;
-                        open_ts_slot = Some(slot);
+                // `ID3D12Device4::CreateCommandList1` captures `allocator == 0` and creates a
+                // closed command list that will be opened later by `Reset`.
+                if *allocator != 0 {
+                    let alloc = self
+                        .allocators
+                        .get(allocator)
+                        .ok_or_else(|| format!("unknown allocator {allocator:#x}"))?;
+                    cl.begin(alloc)?;
+                    if self.timing_armed && matches!(kind, ListType::Direct | ListType::Compute) {
+                        if let Some(timer) = self.gpu_timer.as_mut() {
+                            let slot = timer.alloc_slot()?;
+                            cl.write_timestamp(&timer.heap, slot)?;
+                            open_ts_slot = Some(slot);
+                        }
                     }
-                }
-                if *initial_pso != 0 {
-                    if let Some(p) = self.psos.get(initial_pso).cloned() {
-                        bind_pso(&mut cl, p);
+                    if *initial_pso != 0 {
+                        if let Some(p) = self.psos.get(initial_pso).cloned() {
+                            bind_pso(&mut cl, p);
+                        }
                     }
                 }
                 self.lists.insert(
@@ -792,6 +801,7 @@ impl Backend for MetalBackend {
                         alloc_id: *allocator,
                         initial_pso: *initial_pso,
                         open_ts_slot,
+                        submitted_since_reset: false,
                         pending_indirect_relocs: Vec::new(),
                     },
                 );
@@ -1180,6 +1190,7 @@ impl Backend for MetalBackend {
                     }
                 }
                 l.open_ts_slot = open_ts_slot;
+                l.submitted_since_reset = false;
                 l.pending_indirect_relocs.clear();
                 if let Some(p) = live_pso {
                     bind_pso(&mut l.cl, p);
@@ -1807,13 +1818,32 @@ impl Backend for MetalBackend {
                     .cloned()
                     .ok_or_else(|| format!("ExecuteCommandLists unknown queue {queue:#x}"))?;
                 let ids = lists.to_vec();
+                // Validate list existence, uniqueness within this batch, and repeated-submission
+                // timing soundness before removing any list from `self.lists`.
+                let mut batch_seen: HashSet<u64> = HashSet::with_capacity(ids.len());
+                for &id in &ids {
+                    if !batch_seen.insert(id) {
+                        return Err(format!("ExecuteCommandLists duplicate list {id:#x} in single batch"));
+                    }
+                    let l = self
+                        .lists
+                        .get(&id)
+                        .ok_or_else(|| format!("ExecuteCommandLists unknown list {id:#x}"))?;
+                    if self.timing_armed
+                        && l.submitted_since_reset
+                        && matches!(l.cl.kind, ListType::Direct | ListType::Compute)
+                    {
+                        return Err(format!(
+                            "cannot benchmark repeated submission of closed command list {id:#x} \
+                             without Reset (re-executing baked timestamp writes would overwrite slots \
+                             and understate gpu_busy_ms)"
+                        ));
+                    }
+                }
                 // Extract command lists in submission order, execute as one batch, then restore.
                 let mut taken: Vec<(u64, LiveCommandList)> = Vec::with_capacity(ids.len());
                 for id in ids {
-                    let l = self
-                        .lists
-                        .remove(&id)
-                        .ok_or_else(|| format!("ExecuteCommandLists unknown or duplicate list {id:#x}"))?;
+                    let l = self.lists.remove(&id).unwrap();
                     taken.push((id, l));
                 }
                 // Refresh any relocated indirect argument scratch buffers from their source
@@ -1838,7 +1868,8 @@ impl Backend for MetalBackend {
                     q.execute_command_lists(&mut refs);
                 }
                 self.queue_busy.insert(*queue);
-                for (id, l) in taken {
+                for (id, mut l) in taken {
+                    l.submitted_since_reset = true;
                     self.lists.insert(id, l);
                 }
                 Ok(Handled::Done)

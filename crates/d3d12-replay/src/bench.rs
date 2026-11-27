@@ -343,6 +343,9 @@ pub(crate) fn run_bench_with_timer_capacity(
                             rec.call.name()
                         );
                     }
+                    Err(e) if e.contains("repeated submission of closed command list") => {
+                        anyhow::bail!("warmup {iter} #{} {}: {e}", rec.index, rec.call.name());
+                    }
                     Err(e) => failures.push(format!("warmup {iter} #{} {}: {e}", rec.index, rec.call.name())),
                 }
             }
@@ -387,6 +390,9 @@ pub(crate) fn run_bench_with_timer_capacity(
                             rec.index,
                             rec.call.name()
                         );
+                    }
+                    Err(e) if e.contains("repeated submission of closed command list") => {
+                        anyhow::bail!("iter {iter} #{} {}: {e}", rec.index, rec.call.name());
                     }
                     Err(e) => failures.push(format!("iter {iter} #{} {}: {e}", rec.index, rec.call.name())),
                 }
