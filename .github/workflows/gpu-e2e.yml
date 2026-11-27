@@ -18,12 +18,16 @@ run-name: >-
 #     gate, environment protection, or SHA check.
 #   - Triggered ONLY on:
 #       1. `push` to `main` (already reviewed & merged),
-#       2. `workflow_dispatch` on `refs/heads/main` (manual rerun of merged `main`),
-#       3. `pull_request_target` `labeled` with the `gpu-ci` label, which first
+#       2. `pull_request_target` `labeled` with the `gpu-ci` label, which first
 #          passes through the trusted `approve-pr-gpu` gate job protected by the
 #          `gpu-ci-pr` GitHub Environment (configured with runner-owner Required
 #          Reviewers) and binds approval to the exact `pull_request.head.sha`
 #          before any PR code is checked out on the self-hosted Mac.
+#   - `workflow_dispatch` is intentionally omitted because GitHub evaluates a
+#     dispatched workflow from the caller-selected branch, which would allow a
+#     write collaborator to remove in-YAML ref/environment guards on a feature
+#     branch before dispatching it. Re-run `main` via GitHub Actions' native
+#     "Re-run all jobs" on the latest `push` run instead.
 #   - Minimal permissions (`contents: read`) and `persist-credentials: false` on checkout.
 #   - See `docs/GPU_CI.md` for runner registration, `gpu-ci-pr` environment protection,
 #     required labels, and host setup.
@@ -31,12 +35,6 @@ run-name: >-
 on:
   push:
     branches: [main]
-  workflow_dispatch:
-    inputs:
-      run_bench:
-        description: "Run cargo opsdb -- bench after GPU/E2E tests"
-        type: boolean
-        default: true
   pull_request_target:
     types: [labeled]
 
@@ -143,7 +141,6 @@ jobs:
     if: >-
       !cancelled() && (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
         (
           github.event_name == 'pull_request_target' &&
           needs.approve-pr-gpu.result == 'success' &&
@@ -284,6 +281,5 @@ jobs:
           --test-threads=1
 
       - name: Guest benchmark suite (cargo opsdb -- bench)
-        if: github.event_name != 'workflow_dispatch' || inputs.run_bench
         run: >-
           cargo opsdb -- bench --out "${RUNNER_TEMP}/bench_results.json"

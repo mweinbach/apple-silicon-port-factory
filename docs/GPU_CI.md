@@ -16,10 +16,9 @@ pull requests:
 
 | Trigger | Runs GPU CI? | Why |
 |---|---|---|
-| `push` to `main` | Yes | Already reviewed and merged to `main`. |
-| `workflow_dispatch` on `refs/heads/main` | Yes | Explicit manual run against merged `main` (with optional `run_bench` input). Dispatches targeting non-`main` refs are rejected by `gpu-e2e`'s `if:` condition so collaborator feature branches must go through a PR + `gpu-ci-pr` approval. |
+| `push` to `main` | Yes | Already reviewed and merged to `main`. To re-run GPU CI on `main`, use GitHub Actions' native **Re-run all jobs** button on the latest `push` run. |
 | `pull_request_target` (`types: [labeled]`) with label `gpu-ci` | Only after `gpu-ci-pr` approval | GitHub executes `gpu-e2e.yml` strictly from the trusted base branch (`main`), so a fork PR cannot edit the workflow to bypass the gate. Applying `gpu-ci` runs `prepare-pr-gpu` on `ubuntu-latest` to publish the immutable commit SHA, tree SHA, and review URL to the run summary, then pauses `approve-pr-gpu` (whose job name and workflow `run-name` display the exact immutable SHA) in the protected GitHub Environment `gpu-ci-pr`. A runner owner configured as a Required Reviewer must explicitly approve that exact SHA before `gpu-e2e` checks out the immutable commit SHA directly and verifies both `HEAD` and `HEAD^{tree}`. `opened`, `reopened`, and `synchronize` are excluded, so pushing new commits never re-triggers the workflow. |
-| Any other `pull_request` / `pull_request_target` event | **No** | Untrusted code never reaches the self-hosted runner. |
+| `workflow_dispatch` or any other `pull_request` / `pull_request_target` event | **No** | `workflow_dispatch` is intentionally omitted because GitHub evaluates dispatched workflow YAML from the caller-selected branch, which would allow a write collaborator to remove in-YAML ref/environment checks on a feature branch before dispatching. Untrusted code never reaches the self-hosted runner. |
 
 Additional hardening in `gpu-e2e.yml`:
 - Trusted base-branch workflow orchestration (`pull_request_target`): PR branches cannot modify `prepare-pr-gpu`, `approve-pr-gpu`, `environment: gpu-ci-pr`, or the SHA checks.
