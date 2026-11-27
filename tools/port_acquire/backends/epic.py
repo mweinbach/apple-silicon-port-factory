@@ -189,20 +189,20 @@ def _extract_json_payload(stdout: str) -> Any:
     except json.JSONDecodeError:
         pass
 
-    # Fallback: skip leading non-JSON log lines if a version wrote logs to stdout.
-    start_obj = text.find("{")
-    start_arr = text.find("[")
-    starts = [idx for idx in (start_obj, start_arr) if idx != -1]
-    if starts:
-        start = min(starts)
-        open_ch = text[start]
-        close_ch = "}" if open_ch == "{" else "]"
-        end = text.rfind(close_ch)
-        if end > start:
+    # Fallback: skip leading non-JSON log lines (such as `[Core] WARNING: ...`)
+    # by attempting raw_decode from each line that starts with `{` or `[`.
+    decoder = json.JSONDecoder()
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith(("{", "[")):
+            offset = pos + (len(line) - len(stripped))
             try:
-                return json.loads(text[start : end + 1])
+                obj, _ = decoder.raw_decode(text, offset)
+                return obj
             except json.JSONDecodeError:
                 pass
+        pos += len(line)
     raise CommandFailedError(
         "failed to parse JSON output from legendary",
         details={"stdout_preview": _sanitize_error_text(text[:300])},
