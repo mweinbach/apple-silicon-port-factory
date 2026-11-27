@@ -79,6 +79,30 @@ use std::sync::{Arc, Mutex};
 
 pub type MtlAllocator = ProtocolObject<dyn MTL4CommandAllocator>;
 
+#[derive(Default)]
+pub struct MfxFencePool {
+    fences: Vec<Retained<ProtocolObject<dyn MTLFence>>>,
+    cursor: usize,
+}
+
+impl MfxFencePool {
+    pub fn acquire(&mut self) -> Option<Retained<ProtocolObject<dyn MTLFence>>> {
+        if self.cursor < self.fences.len() {
+            let f = self.fences[self.cursor].clone();
+            self.cursor += 1;
+            return Some(f);
+        }
+        let f = super::device()?.dev.newFence()?;
+        self.fences.push(f.clone());
+        self.cursor += 1;
+        Some(f)
+    }
+
+    pub fn reset(&mut self) {
+        self.cursor = 0;
+    }
+}
+
 pub struct CommandAllocator {
     pub a: Retained<MtlAllocator>,
     pub kind: ListType,
@@ -92,6 +116,8 @@ pub struct CommandAllocator {
     pub rt_keep: Arc<Mutex<Vec<crate::rt::accel::Retired>>>,
     /// GPU-encoded `ExecuteIndirect` commands of lists recorded here.
     pub icbs: Arc<Mutex<super::indirect_icb::IcbRing>>,
+    /// Per-allocator MetalFX fences (rewound on `CommandAllocator::reset` after GPU completion).
+    pub mfx_fences: Arc<Mutex<MfxFencePool>>,
 }
 unsafe impl Send for CommandAllocator {}
 unsafe impl Sync for CommandAllocator {}
@@ -106,6 +132,7 @@ impl CommandAllocator {
             icb_scratch: Arc::new(Mutex::new(UploadRing::new_gpu_scratch())),
             rt_keep: Arc::default(),
             icbs: Arc::default(),
+            mfx_fences: Arc::default(),
         })
     }
 
@@ -119,6 +146,7 @@ impl CommandAllocator {
         self.icb_scratch.lock().unwrap().reset();
         self.rt_keep.lock().unwrap().clear();
         self.icbs.lock().unwrap().reset();
+        self.mfx_fences.lock().unwrap().reset();
     }
 }
 
@@ -185,6 +213,8 @@ pub struct CommandList {
     util_table: Option<Retained<MtlArgumentTable>>,
     /// Lazily allocated fence updated before opaque MetalFX passes (`MTL4FX*Scaler::setFence:`).
     mfx_fence: Option<Retained<ProtocolObject<dyn MTLFence>>>,
+    /// Bound `CommandAllocator`'s MetalFX fence pool for per-recording fence isolation.
+    mfx_fences: Option<Arc<Mutex<MfxFencePool>>>,
     /// Deferred post-MetalFX fence wait folded into the next encoder's `begin_barrier`
     /// (or flushed in `close()` if MetalFX was the last operation on the command buffer).
     pending_mfx_wait_fence: Option<Retained<ProtocolObject<dyn MTLFence>>>,
@@ -248,6 +278,7 @@ impl CommandList {
             predication: None,
             util_table: None,
             mfx_fence: None,
+            mfx_fences: None,
             pending_mfx_wait_fence: None,
             pending_mfx_wait_stages: MTLStages::empty(),
             pending_mfx_after: MTLStages::empty(),
@@ -336,6 +367,7 @@ impl CommandList {
         self.enc = Encoder::None;
         self.ring = Some(alloc.ring.clone());
         self.rt_keep = Some(alloc.rt_keep.clone());
+        self.mfx_fences = Some(alloc.mfx_fences.clone());
         self.icb.reset_for_begin(alloc.icb_scratch.clone(), alloc.icbs.clone());
         self.binds.cs_bind_cache.valid = false;
         self.binds.gfx_bind_cache.valid = false;

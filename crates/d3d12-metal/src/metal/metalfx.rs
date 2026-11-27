@@ -656,6 +656,10 @@ pub fn get_or_create_scaler(
             let _: () = msg_send![&*desc, setColorTextureFormat: color_fmt];
             let _: () = msg_send![&*desc, setOutputTextureFormat: output_fmt];
             let _: () = msg_send![&*desc, setColorProcessingMode: mode as isize];
+            let has_sync: Bool = msg_send![&*desc, respondsToSelector: objc2::sel!(setRequiresSynchronousInitialization:)];
+            if has_sync.as_bool() {
+                let _: () = msg_send![&*desc, setRequiresSynchronousInitialization: Bool::YES];
+            }
         }
         let obj: Option<Retained<AnyObject>> = unsafe {
             msg_send![&*desc, newSpatialScalerWithDevice: &*d.dev, compiler: &*rt.compiler]
@@ -740,6 +744,10 @@ pub fn get_or_create_temporal_scaler(key: TemporalScalerKey) -> Option<Arc<Mutex
             let _: () = msg_send![&*desc, setMotionTextureFormat: motion_fmt];
             let _: () = msg_send![&*desc, setOutputTextureFormat: output_fmt];
             let _: () = msg_send![&*desc, setAutoExposureEnabled: Bool::new(key.auto_exposure)];
+            let has_sync: Bool = msg_send![&*desc, respondsToSelector: objc2::sel!(setRequiresSynchronousInitialization:)];
+            if has_sync.as_bool() {
+                let _: () = msg_send![&*desc, setRequiresSynchronousInitialization: Bool::YES];
+            }
             if key.dynamic_resolution {
                 let has_drs: Bool = msg_send![&*desc, respondsToSelector: objc2::sel!(setInputContentPropertiesEnabled:)];
                 if has_drs.as_bool() {

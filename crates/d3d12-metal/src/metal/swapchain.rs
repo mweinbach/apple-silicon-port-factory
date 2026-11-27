@@ -54,20 +54,43 @@ fn vsync_disabled_by_env() -> bool {
     *V.get_or_init(vsync_disabled_from_env)
 }
 
-/// `AW2_PRESENT_OFF_MAIN`: offload sync-0 `present_async` back-buffer ->
-/// staging-texture blit (and its `All -> Blit` queue barrier) from the main
-/// render queue `q0` onto a dedicated staging `MTL4CommandQueue` (`sq`).
-/// Default **on** (`AW2_PRESENT_OFF_MAIN=0` disables).
+/// `PORT_PRESENT_OFF_MAIN` (legacy alias `AW2_PRESENT_OFF_MAIN`): offload sync-0
+/// `present_async` back-buffer -> staging-texture blit from the main render queue
+/// `q0` onto a dedicated staging `MTL4CommandQueue` (`sq`).
+///
+/// Default **off** (`PORT_PRESENT_OFF_MAIN=1` opts in): keeping the lightweight
+/// back-buffer -> staging blit on `q0` with a stage-narrowed queue barrier
+/// (`Fragment | Blit`, plus `Dispatch` if `ShaderWrite` is set) avoids dual-queue
+/// `q0 <-> sq` `MTLSharedEvent` arbitration (`present_sq_wait`) right after
+/// MetalFX/end-of-frame work while `PresentThread` still acquires drawables and
+/// presents asynchronously on `pq`.
 pub fn present_off_main() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("AW2_PRESENT_OFF_MAIN").is_none_or(|v| v != "0"))
+    *V.get_or_init(|| {
+        super::env_canonical_or_alias("PORT_PRESENT_OFF_MAIN", "AW2_PRESENT_OFF_MAIN")
+            .is_some_and(|v| super::parse_bool_knob(&v))
+    })
+}
+
+/// Producer stages that can legally write a swapchain back buffer on `q0`
+/// before a sync-0 staging blit (`Fragment` RTV writes, `Blit` copies, plus
+/// `Dispatch` when `ShaderWrite` usage is enabled on the texture).
+#[inline]
+pub(crate) fn main_queue_present_after_stages(src_usage: MTLTextureUsage) -> MTLStages {
+    if src_usage.contains(MTLTextureUsage::ShaderWrite) {
+        MTLStages::Fragment | MTLStages::Blit | MTLStages::Dispatch
+    } else {
+        MTLStages::Fragment | MTLStages::Blit
+    }
 }
 
 /// `PORT_PRESENT_BLIT_NARROW` (alias `AW2_PRESENT_BLIT_NARROW`, default **on**; `=0` disables):
-/// emit `MTLStages::Blit -> MTLStages::Blit` instead of `MTLStages::All -> MTLStages::Blit` on
-/// dedicated swapchain blit queues `sq` and `pq` (cross-queue `q0 -> sq` and `sq -> pq` producer
-/// visibility is already synchronized via `MTLSharedEvent` `wait`), while keeping
-/// `MTLStages::All -> MTLStages::Blit` whenever submitting on `q0`.
+/// emit stage-narrowed queue barriers for swapchain present blits:
+/// - `MTLStages::Blit -> MTLStages::Blit` on dedicated queues `sq` and `pq`
+///   (cross-queue producer visibility is already synchronized via `MTLSharedEvent`),
+/// - `Fragment | Blit` (plus `Dispatch` when `ShaderWrite` is set) `-> MTLStages::Blit`
+///   for sync-0 staging copies on `q0`, avoiding `MTLStages::All` stalls across
+///   unrelated stages (`PRE_RASTER`, `AccelerationStructure`, `MachineLearning`).
 pub fn present_blit_narrow() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -595,9 +618,13 @@ impl Swapchain {
         cb.beginCommandBufferWithAllocator(&st.allocs[i].a);
         let e = cb.computeCommandEncoder().ok_or("compute encoder")?;
         let use_sq = self.opt_present_off_main && self.sq.is_some();
-        let after_stages = if use_sq && self.opt_present_blit_narrow {
+        let after_stages = if self.opt_present_blit_narrow {
             super::encstats::inc(&super::encstats::c::present_blit_narrow);
-            MTLStages::Blit
+            if use_sq {
+                MTLStages::Blit
+            } else {
+                main_queue_present_after_stages(src.usage())
+            }
         } else {
             MTLStages::All
         };
@@ -811,8 +838,10 @@ mod tests {
 
     #[test]
     fn present_off_main_offloads_staging_blit_to_sq_and_preserves_pixels_across_resize_on_gpu() {
-        if std::env::var_os("AW2_PRESENT_OFF_MAIN").is_none() {
-            assert!(super::present_off_main());
+        if std::env::var_os("PORT_PRESENT_OFF_MAIN").is_none()
+            && std::env::var_os("AW2_PRESENT_OFF_MAIN").is_none()
+        {
+            assert!(!super::present_off_main(), "PORT_PRESENT_OFF_MAIN must default OFF");
         }
         if super::super::device().is_none() {
             return;
@@ -1094,11 +1123,25 @@ mod tests {
         let px0 = unsafe { *(rb.buffer().unwrap().contents().as_ptr() as *const u32) };
         assert_eq!(px0, 0xff00_ff00, "narrow Blit -> Blit on sq must preserve green pixels");
 
-        // Fallback onto `q0` (`opt_present_off_main = false`, plus offscreen `present_sync`):
-        // must keep `MTLStages::All -> MTLStages::Blit` (no `present_blit_narrow` increment on `q0`).
+        // Main-queue sync-0 staging (`opt_present_off_main = false`, default):
+        // narrows to `Fragment | Blit` (plus `Dispatch` if `ShaderWrite` is set)
+        // when `opt_present_blit_narrow = true`, and preserves `MTLStages::All` when
+        // `opt_present_blit_narrow = false` or on offscreen `present_sync`.
+        assert_eq!(
+            super::main_queue_present_after_stages(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead),
+            MTLStages::Fragment | MTLStages::Blit
+        );
+        assert_eq!(
+            super::main_queue_present_after_stages(
+                MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+            ),
+            MTLStages::Fragment | MTLStages::Blit | MTLStages::Dispatch
+        );
+
         sc.current = 1;
         sc.presents += 1;
         sc.opt_present_off_main = false;
+        sc.opt_present_blit_narrow = true;
         sc.pthread.as_ref().unwrap().set_present_blit_narrow(false);
         let rtv1 = TargetView::rtv(&sc.buffers[1], None).unwrap();
         alloc.reset();
@@ -1112,8 +1155,18 @@ mod tests {
         sc.pthread.as_ref().unwrap().drain();
         assert_eq!(
             super::super::encstats::c::present_blit_narrow.load(Relaxed),
-            narrow_before_q0,
-            "main-queue fallback must keep MTLStages::All -> MTLStages::Blit"
+            narrow_before_q0 + 1,
+            "main-queue sync-0 staging blit must use narrowed Fragment|Blit -> Blit when opt_present_blit_narrow=true"
+        );
+
+        sc.opt_present_blit_narrow = false;
+        let narrow_before_q0_off = super::super::encstats::c::present_blit_narrow.load(Relaxed);
+        let _ = sc.present_async().unwrap();
+        sc.pthread.as_ref().unwrap().drain();
+        assert_eq!(
+            super::super::encstats::c::present_blit_narrow.load(Relaxed),
+            narrow_before_q0_off,
+            "main-queue fallback must keep MTLStages::All -> MTLStages::Blit when opt_present_blit_narrow=false"
         );
 
         let mut offscreen = unsafe {
