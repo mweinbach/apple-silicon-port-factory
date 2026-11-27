@@ -1456,8 +1456,16 @@ class SteamBackendTests(unittest.TestCase):
             info_after = backend.info("1091500", platform="windows", offline=True)
             dlc_after = {d.app_id: d for d in info_after.dlcs}
             self.assertTrue(dlc_after["2138330"].installed)
+            self.assertIn("999001", backend._load_installs()["1091500"]["depots"])
             chk_after = backend.update("1091500", check_only=True, with_dlcs=True)
             self.assertFalse(chk_after.update_available)
+
+            # Deleting the DLC file after a base-only update and running verify(repair=True)
+            # must restore the DLC file because depot 999001 was preserved in `depots`.
+            (dest / "dlc_2138330.pak").unlink()
+            rep = backend.verify("1091500", repair=True)
+            self.assertTrue(rep.ok)
+            self.assertEqual((dest / "dlc_2138330.pak").read_bytes(), b"DLC_770022")
 
             # Explicit --dlc download selects base depot + DLC depot via -app 1091500 -depot <id>
             explicit_dest = self.root / "games" / "ExplicitDlcGame"
@@ -1785,6 +1793,47 @@ class SteamBackendTests(unittest.TestCase):
                 os.environ.pop("MOCK_COV_MODE", None)
             else:
                 os.environ["MOCK_COV_MODE"] = prev_cov
+
+    def test_update_compares_mounted_depot_manifests_for_acf_installs(self) -> None:
+        sa_dir = self.steam_home / "steamapps"
+        game_dir = sa_dir / "common" / "AcfGame"
+        game_dir.mkdir(parents=True, exist_ok=True)
+        (game_dir / "SampleGame.exe").write_bytes(b"MZ\x90\x00ACF")
+        # Steam ACF has buildid "555001" (app buildid) and MountedDepots matching remote manifest GID
+        (sa_dir / "appmanifest_1091500.acf").write_text(
+            textwrap.dedent(
+                """\
+                "AppState"
+                {
+                    "appid"        "1091500"
+                    "name"         "Sample Action RPG"
+                    "installdir"   "AcfGame"
+                    "buildid"      "555001"
+                    "SizeOnDisk"   "123456"
+                    "LastOwner"    "76561198000000002"
+                    "MountedDepots"
+                    {
+                        "1091501"  "8811223344556677889"
+                    }
+                }
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        backend = self._make_backend()
+        # MountedDepots matches remote manifest GID -> must report already up to date
+        chk_same = backend.update("1091500", check_only=True)
+        self.assertFalse(chk_same.update_available)
+        self.assertEqual(chk_same.old_version, "8811223344556677889")
+        self.assertEqual(chk_same.new_version, "8811223344556677889")
+
+        # Once remote manifest GID changes -> must report update available
+        self.manifest_file.write_text(SAMPLE_UPDATED_MANIFEST_TXT, encoding="utf-8")
+        chk_new = backend.update("1091500", check_only=True)
+        self.assertTrue(chk_new.update_available)
+        self.assertEqual(chk_new.old_version, "8811223344556677889")
+        self.assertEqual(chk_new.new_version, "9922334455667788990")
 
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):

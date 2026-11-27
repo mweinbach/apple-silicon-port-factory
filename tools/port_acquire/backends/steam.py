@@ -2002,6 +2002,8 @@ class SteamBackend(StoreBackend):
             merged_dlc_versions: dict[str, str] = {}
             merged_dlc_depots: dict[str, list[str]] = {}
             merged_redists: list[str] = []
+            merged_depots: list[str] = list(downloaded_depots)
+            merged_manifest_gids: dict[str, str] = dict(manifest_gids)
             if same_install and isinstance(existing, dict):
                 for prev_dlc in existing.get("dlcs") or []:
                     s_dlc = str(prev_dlc)
@@ -2031,6 +2033,18 @@ class SteamBackend(StoreBackend):
                 if redist_id not in merged_redists:
                     merged_redists.append(redist_id)
 
+            # Preserve untouched installed DLC depots and their manifest GIDs during base-only
+            # updates so subsequent `verify --repair` keeps repairing installed DLCs too.
+            if same_install and isinstance(existing, dict):
+                prev_gids = existing.get("manifest_gids")
+                prev_gids_map = prev_gids if isinstance(prev_gids, dict) else {}
+                for dep_list in merged_dlc_depots.values():
+                    for did in dep_list:
+                        if did not in merged_depots:
+                            merged_depots.append(did)
+                        if did not in merged_manifest_gids and prev_gids_map.get(did):
+                            merged_manifest_gids[did] = str(prev_gids_map[did])
+
             branch_requires_password = bool(options.branch_password)
             if (
                 not branch_requires_password
@@ -2050,8 +2064,8 @@ class SteamBackend(StoreBackend):
                 "branch": branch,
                 "branch_requires_password": branch_requires_password,
                 "build_id": version,
-                "manifest_gids": manifest_gids,
-                "depots": downloaded_depots,
+                "manifest_gids": merged_manifest_gids,
+                "depots": merged_depots,
                 "dlcs": merged_dlcs,
                 "dlc_versions": merged_dlc_versions,
                 "dlc_depots": merged_dlc_depots,
@@ -2206,6 +2220,14 @@ class SteamBackend(StoreBackend):
                 for d in entry["mounted_depots"].keys()
                 if str(d).isdigit() and str(d) not in COMMON_REDIST_DEPOTS
             ]
+        raw_dlc_depots = entry.get("dlc_depots")
+        if isinstance(raw_dlc_depots, dict):
+            for dep_list in raw_dlc_depots.values():
+                if isinstance(dep_list, list):
+                    for d in dep_list:
+                        sd = str(d)
+                        if sd.isdigit() and sd not in COMMON_REDIST_DEPOTS and sd not in recorded_depots:
+                            recorded_depots.append(sd)
 
         if not repair:
             # Read-only verification: query fresh depot manifests via `-manifest-only`
@@ -2430,6 +2452,21 @@ class SteamBackend(StoreBackend):
         ]
         remote_version = self._version_from_manifests(remote_base_depots or remote_depots)
 
+        # For Steam-client installs discovered from `appmanifest_*.acf`, `entry["build_id"]`
+        # is Steam's app buildid rather than a depot manifest GID fingerprint. Derive `old_version`
+        # from `mounted_depots` so both sides compare matching depot manifest GIDs.
+        mounted_depots = entry.get("mounted_depots")
+        if isinstance(mounted_depots, dict) and mounted_depots and not entry.get("manifest_gids"):
+            acf_all = [
+                {"depot_id": str(did), "manifest_gid": str(gid)}
+                for did, gid in mounted_depots.items()
+                if str(did).isdigit() and str(gid) and str(did) not in COMMON_REDIST_DEPOTS
+            ]
+            acf_base = [d for d in acf_all if d["depot_id"] not in depot_to_dlc]
+            acf_ver = self._version_from_manifests(acf_base or acf_all)
+            if acf_ver:
+                old_version = acf_ver
+
         # When `--with-dlcs` is requested, also check owned DLC depots under base `resolved_id`
         # (never querying `-app <dlc_id>`) for newly owned/uninstalled DLCs or updated manifests.
         dlc_updates_needed: list[str] = []
@@ -2441,6 +2478,18 @@ class SteamBackend(StoreBackend):
                 if isinstance(raw_dlc_vers, dict)
                 else {}
             )
+            if isinstance(mounted_depots, dict) and mounted_depots:
+                for dlc_id, dep_ids in dlc_to_depots.items():
+                    mounted_for_dlc = [
+                        {"depot_id": did, "manifest_gid": str(mounted_depots[did])}
+                        for did in dep_ids
+                        if did in mounted_depots and mounted_depots[did]
+                    ]
+                    if mounted_for_dlc:
+                        installed_dlcs.add(dlc_id)
+                        ver_str = self._version_from_manifests(mounted_for_dlc)
+                        if ver_str and dlc_id not in installed_dlc_versions:
+                            installed_dlc_versions[dlc_id] = ver_str
             owned_ids = self._known_owned_app_ids(offline=False)
             target_dlcs: list[str] = []
             seen_dlcs: set[str] = set()
