@@ -1169,7 +1169,7 @@ fn bench_slice_excludes_trailing_partial_frame_and_teardown() {
         trace = w.into_inner();
     }
     let recs: Vec<_> = Reader::new(&trace).unwrap().map(|r| r.unwrap()).collect();
-    let (start, end, _) = bench::find_frame_slice(&recs);
+    let (start, end, _) = bench::find_frame_slice(&recs).unwrap();
     assert_eq!(end, base_count, "frame_end must stop at FrameEnd and exclude trailing partial/teardown records");
     assert!(start < end);
 
@@ -1804,5 +1804,98 @@ fn metal_backend_bench_rejects_repeated_submission_of_closed_list() {
         .expect("bench must reject repeated submission of the same closed list without Reset");
     let msg = err.to_string();
     assert!(msg.contains("repeated submission"), "unexpected error: {msg}");
+}
+
+#[test]
+fn bench_slice_preserves_multi_list_recording_and_rejects_split_list() {
+    use crate::bench;
+    use d3d12_metal::metal::descriptor::heap_kind;
+    use d3d12_metal::trace::Reader;
+    use d3d12_metal::types::{dim, heap_type, resource_flags, CommandQueueDesc, DescriptorHeapDesc, HeapProperties, ResourceDesc};
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    const D: u64 = 0xc000;
+    const Q: u64 = 0xc100;
+    const A1: u64 = 0xc200;
+    const A2: u64 = 0xc201;
+    const L1: u64 = 0xc300;
+    const L2: u64 = 0xc301;
+    const RT: u64 = 0xc400;
+    const RTV_HEAP: u64 = 0xc500;
+    const RTV_CPU: u64 = 0x7f10_0000;
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let hp_def = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+    let rdesc = ResourceDesc {
+        Dimension: dim::TEXTURE2D,
+        Width: 32,
+        Height: 32,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: 28,
+        SampleCount: 1,
+        Flags: resource_flags::ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let rtv_hd = DescriptorHeapDesc { Type: heap_kind::RTV, NumDescriptors: 1, Flags: 0, NodeMask: 0 };
+    let both = [L1, L2];
+
+    // 1. Single-frame trace where L1 records ClearRTV BEFORE L2 calls Reset:
+    //    frame_start must begin at L1's ClearRTV, NOT skip ahead to L2's Reset.
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A1, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A2, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: RT, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&rdesc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: D, heap: RTV_HEAP, desc: bytes_of(&rtv_hd), cpu_start: RTV_CPU, gpu_start: 0 }, 0).unwrap();
+    w.write(&Call::CreateRenderTargetView { resource: RT, desc: None, dest: RTV_CPU }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L1, list_type: 0, allocator: A1, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L2, list_type: 0, allocator: A2, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::Close { list: L2 }, 0).unwrap(); // empty setup Close on L2
+    // Frame work begins on L1 BEFORE L2's Reset:
+    w.write(&Call::ClearRenderTargetView { list: L1, rtv: RTV_CPU, color: [1.0, 0.0, 0.0, 1.0], rects: &[] }, 0).unwrap();
+    w.write(&Call::Reset { list: L2, allocator: A2, pso: 0 }, 0).unwrap();
+    w.write(&Call::ClearRenderTargetView { list: L2, rtv: RTV_CPU, color: [0.0, 1.0, 0.0, 1.0], rects: &[] }, 0).unwrap();
+    w.write(&Call::Close { list: L1 }, 0).unwrap();
+    w.write(&Call::Close { list: L2 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q, lists: U64s::from_slice(&both) }, 0).unwrap();
+    w.write(&Call::FrameEnd { frame: 0 }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let recs: Vec<_> = Reader::new(&trace).unwrap().map(|r| r.unwrap()).collect();
+    let (start, end, reopen) = bench::find_frame_slice(&recs).unwrap();
+    assert!(matches!(recs[start].call, Call::ClearRenderTargetView { list: L1, .. }), "got {:?}", recs[start].call.name());
+    assert_eq!(reopen, vec![L1]);
+    assert_eq!(end, recs.len());
+
+    if metal_ready() {
+        let opts = bench::BenchOptions { iterations: 3, warmup: 1, until: None };
+        let (rep, mut backend) = bench::run_bench(&trace, &opts).unwrap();
+        assert!(rep.failures.is_empty(), "{rep}");
+        assert_eq!(rep.gpu_busy.samples.len(), 3);
+        let img = backend.capture_frame().unwrap();
+        assert_eq!(pixel_at(&img, 16, 16), [0, 255, 0]);
+    }
+
+    // 2. Multi-frame trace where L1 records ClearRTV in frame 0 and closes in frame 1 without Reset:
+    //    must be rejected rather than silently dropping frame-0 bindings on iteration 2.
+    let mut w2 = Writer::new(Vec::new()).unwrap();
+    w2.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w2.write(&Call::CreateCommandAllocator { device: D, allocator: A1, list_type: 0 }, 0).unwrap();
+    w2.write(&Call::CreateCommandList { device: D, list: L1, list_type: 0, allocator: A1, initial_pso: 0 }, 0).unwrap();
+    w2.write(&Call::ClearRenderTargetView { list: L1, rtv: RTV_CPU, color: [1.0, 0.0, 0.0, 1.0], rects: &[] }, 0).unwrap();
+    w2.write(&Call::FrameEnd { frame: 0 }, 0).unwrap();
+    w2.write(&Call::Close { list: L1 }, 0).unwrap();
+    w2.write(&Call::FrameEnd { frame: 1 }, 0).unwrap();
+    let split_trace = w2.into_inner();
+    let split_recs: Vec<_> = Reader::new(&split_trace).unwrap().map(|r| r.unwrap()).collect();
+    let err = bench::find_frame_slice(&split_recs)
+        .err()
+        .expect("must reject command list split across frame boundary");
+    assert!(err.to_string().contains("recorded before frame_start"), "{err}");
 }
 

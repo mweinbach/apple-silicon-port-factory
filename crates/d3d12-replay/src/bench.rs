@@ -173,10 +173,14 @@ fn is_setup_call(c: &Call) -> bool {
 ///   `[prev_boundary..last_boundary]`, excluding any trailing partial frame or teardown records.
 /// - Single-frame trace with 1 `Present`/`FrameEnd`: bound `frame_end` at that boundary so
 ///   trailing `Release` teardown records never run inside the repeated loop, and start at the
-///   first `Reset` (or first non-setup call) before `frame_end`.
-/// - Traces with no `Present`/`FrameEnd`: trim trailing `Release` teardown calls and start at
-///   the first `Reset` or first non-setup call.
-pub(crate) fn find_frame_slice(records: &[Record]) -> (usize, usize, Vec<u64>) {
+///   earliest non-setup call (ignoring empty setup `CreateCommandList`+`Close` pairs) so earlier
+///   recording on another list is never skipped when a later list calls `Reset`.
+/// - Traces with no `Present`/`FrameEnd`: trim trailing `Release` teardown calls and apply the
+///   same earliest non-setup start rule.
+/// - Returns an error if any command list used inside `[frame_start..frame_end]` without a
+///   leading `Reset` already had commands recorded into it before `frame_start` (which would be
+///   silently lost when `prepare_bench_iteration` reopens the list on subsequent iterations).
+pub(crate) fn find_frame_slice(records: &[Record]) -> anyhow::Result<(usize, usize, Vec<u64>)> {
     let mut frame_boundaries: Vec<usize> = Vec::new();
     for (i, r) in records.iter().enumerate() {
         if matches!(r.call, Call::FrameEnd { .. }) {
@@ -201,14 +205,45 @@ pub(crate) fn find_frame_slice(records: &[Record]) -> (usize, usize, Vec<u64>) {
     };
     let frame_start = if frame_boundaries.len() >= 2 {
         frame_boundaries[frame_boundaries.len() - 2]
-    } else if let Some(first_reset) = records[..frame_end].iter().position(|r| matches!(r.call, Call::Reset { .. })) {
-        first_reset
     } else {
-        records[..frame_end]
-            .iter()
-            .position(|r| !is_setup_call(&r.call))
-            .unwrap_or(0)
+        // Earliest non-setup call before `frame_end`, skipping only empty `Close` calls that
+        // immediately close a freshly created list with no commands recorded on it.
+        let mut recorded_lists: HashSet<u64> = HashSet::new();
+        let mut start = frame_end;
+        for (i, r) in records[..frame_end].iter().enumerate() {
+            if is_setup_call(&r.call) {
+                continue;
+            }
+            if let Call::Close { list } = r.call {
+                if !recorded_lists.contains(&list) {
+                    continue;
+                }
+            }
+            if let Some(list) = record_list_id(&r.call) {
+                if !matches!(r.call, Call::Close { .. }) {
+                    recorded_lists.insert(list);
+                }
+            }
+            start = i;
+            break;
+        }
+        start
     };
+
+    // Track which lists carry unclosed recorded commands across `frame_start`.
+    let mut dirty_open_before_start: HashSet<u64> = HashSet::new();
+    for r in &records[..frame_start] {
+        match r.call {
+            Call::Reset { list, .. } | Call::Close { list } => {
+                dirty_open_before_start.remove(&list);
+            }
+            _ => {
+                if let Some(list) = record_list_id(&r.call) {
+                    dirty_open_before_start.insert(list);
+                }
+            }
+        }
+    }
 
     // Determine which command lists are used inside `records[frame_start..frame_end]` without
     // first being `Reset` inside the slice, so `prepare_bench_iteration` re-opens them cleanly.
@@ -222,11 +257,18 @@ pub(crate) fn find_frame_slice(records: &[Record]) -> (usize, usize, Vec<u64>) {
         }
         if let Some(list) = record_list_id(&r.call) {
             if !reset_first.contains(&list) && seen_reopen.insert(list) {
+                if dirty_open_before_start.contains(&list) {
+                    anyhow::bail!(
+                        "cannot safely benchmark frame slice [{frame_start}..{frame_end}]: \
+                         command list {list:#x} has commands recorded before frame_start and is \
+                         used without Reset inside the frame"
+                    );
+                }
                 needs_reopen.push(list);
             }
         }
     }
-    (frame_start, frame_end, needs_reopen)
+    Ok((frame_start, frame_end, needs_reopen))
 }
 
 fn record_list_id(c: &Call) -> Option<u64> {
@@ -297,7 +339,7 @@ pub(crate) fn run_bench_with_timer_capacity(
         anyhow::bail!("trace contains no records");
     }
 
-    let (frame_start, frame_end, reopen_lists) = find_frame_slice(&records);
+    let (frame_start, frame_end, reopen_lists) = find_frame_slice(&records)?;
     let mut backend = MetalBackend::new().map_err(|e| anyhow::anyhow!(e))?;
     let objs = Objects::default();
     let mut failures = Vec::new();
