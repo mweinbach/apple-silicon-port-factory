@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import struct
 from typing import Any
 
 
@@ -528,6 +529,144 @@ def parse_local_owned_app_ids(
             except OSError:
                 pass
     return owned
+
+
+_APPINFO_MAGIC_V27 = 0x07564427
+_APPINFO_MAGIC_V28 = 0x07564428
+_APPINFO_MAGIC_V29 = 0x07564429
+
+
+def _read_cstr(buf: bytes, pos: int) -> tuple[str, int]:
+    end = buf.find(b"\x00", pos)
+    if end == -1:
+        raise ValueError("unterminated binary VDF string")
+    return buf[pos:end].decode("utf-8", errors="replace"), end + 1
+
+
+def _parse_binary_vdf_map(
+    buf: bytes,
+    pos: int,
+    string_table: list[str] | None,
+) -> tuple[dict[str, Any], int]:
+    out: dict[str, Any] = {}
+    n = len(buf)
+    while pos < n:
+        type_byte = buf[pos]
+        pos += 1
+        if type_byte == 0x08:
+            break
+        if string_table is not None:
+            if pos + 4 > n:
+                break
+            idx = struct.unpack_from("<I", buf, pos)[0]
+            pos += 4
+            if idx >= len(string_table):
+                break
+            key = string_table[idx]
+        else:
+            key, pos = _read_cstr(buf, pos)
+
+        if type_byte == 0x00:
+            child, pos = _parse_binary_vdf_map(buf, pos, string_table)
+            out[key] = child
+        elif type_byte == 0x01:
+            val, pos = _read_cstr(buf, pos)
+            out[key] = val
+        elif type_byte == 0x02:
+            if pos + 4 > n:
+                break
+            out[key] = str(struct.unpack_from("<i", buf, pos)[0])
+            pos += 4
+        elif type_byte in (0x03, 0x04, 0x06):
+            pos += 4
+        elif type_byte == 0x05:
+            while pos + 1 < n and buf[pos : pos + 2] != b"\x00\x00":
+                pos += 2
+            pos += 2
+        elif type_byte == 0x07:
+            if pos + 8 > n:
+                break
+            out[key] = str(struct.unpack_from("<Q", buf, pos)[0])
+            pos += 8
+        else:
+            break
+    return out, pos
+
+
+def parse_appinfo_vdf_dlc_depots(steam_home: Path, app_id: str) -> dict[str, list[str]]:
+    """Read Steam's local binary `appcache/appinfo.vdf` to map `dlc_app_id -> [depot_ids]`.
+
+    Supports binary `appinfo.vdf` v27, v28, and v29 (read-only, zero credentials).
+    Returns an empty dict when `appinfo.vdf` is absent or does not contain `app_id`.
+    """
+    if not str(app_id).isdigit():
+        return {}
+    path = steam_home / "appcache" / "appinfo.vdf"
+    if not path.is_file():
+        return {}
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+    if len(data) < 8:
+        return {}
+
+    magic, _universe = struct.unpack_from("<II", data, 0)
+    if magic not in (_APPINFO_MAGIC_V27, _APPINFO_MAGIC_V28, _APPINFO_MAGIC_V29):
+        return {}
+
+    pos = 8
+    string_table: list[str] | None = None
+    if magic == _APPINFO_MAGIC_V29:
+        if len(data) < 16:
+            return {}
+        str_off = struct.unpack_from("<q", data, 8)[0]
+        pos = 16
+        if str_off <= 0 or str_off + 4 > len(data):
+            return {}
+        str_count = struct.unpack_from("<I", data, str_off)[0]
+        st_pos = str_off + 4
+        string_table = []
+        try:
+            for _ in range(str_count):
+                s, st_pos = _read_cstr(data, st_pos)
+                string_table.append(s)
+        except ValueError:
+            return {}
+
+    entry_hdr_len = 40 if magic == _APPINFO_MAGIC_V27 else 60
+    target_id = int(app_id)
+    n = len(data)
+
+    while pos + 8 <= n:
+        cur_app_id, entry_size = struct.unpack_from("<II", data, pos)
+        pos += 8
+        if cur_app_id == 0:
+            break
+        entry_end = pos + entry_size
+        if entry_end > n or entry_size < entry_hdr_len:
+            break
+        if cur_app_id == target_id:
+            payload = data[pos + entry_hdr_len : entry_end]
+            try:
+                parsed, _ = _parse_binary_vdf_map(payload, 0, string_table)
+            except (ValueError, IndexError, struct.error):
+                return {}
+            depots = vdf_get(parsed, "appinfo", "depots")
+            if not isinstance(depots, dict):
+                return {}
+            dlc_map: dict[str, list[str]] = {}
+            for depot_id, depot_body in depots.items():
+                if not str(depot_id).isdigit() or not isinstance(depot_body, dict):
+                    continue
+                dlc_app_id = str(vdf_get(depot_body, "dlcappid", default="") or "").strip()
+                if dlc_app_id.isdigit():
+                    dlc_map.setdefault(dlc_app_id, [])
+                    if str(depot_id) not in dlc_map[dlc_app_id]:
+                        dlc_map[dlc_app_id].append(str(depot_id))
+            return dlc_map
+        pos = entry_end
+    return {}
 
 
 def parse_libraryfolders_vdf(steam_home: Path) -> list[Path]:

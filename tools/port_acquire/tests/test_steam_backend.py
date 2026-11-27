@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import struct
 import sys
 import tempfile
 import textwrap
@@ -32,6 +33,7 @@ from port_acquire import (  # noqa: E402
     read_package_manifest,
 )
 from port_acquire.backends._steam_vdf import (  # noqa: E402
+    parse_appinfo_vdf_dlc_depots,
     parse_depot_downloader_stdout,
     parse_depot_manifest_txt,
     parse_installscript_vdf,
@@ -67,6 +69,69 @@ SAMPLE_UPDATED_MANIFEST_TXT = SAMPLE_MANIFEST_TXT.replace(
 )
 
 
+def _write_mock_appinfo_vdf(
+    steam_home: Path,
+    app_id: int,
+    depots: dict[str, str | None],
+    *,
+    v29: bool = False,
+) -> Path:
+    """Write a minimal valid Steam binary `appcache/appinfo.vdf` (v28 or v29)."""
+    strings: list[str] = []
+    string_idx: dict[str, int] = {}
+
+    def _key_bytes(name: str) -> bytes:
+        if not v29:
+            return name.encode("utf-8") + b"\x00"
+        if name not in string_idx:
+            string_idx[name] = len(strings)
+            strings.append(name)
+        return struct.pack("<I", string_idx[name])
+
+    def _encode_map(d: dict) -> bytes:
+        buf = bytearray()
+        for k, v in d.items():
+            if isinstance(v, dict):
+                buf.append(0x00)
+                buf.extend(_key_bytes(k))
+                buf.extend(_encode_map(v))
+            else:
+                buf.append(0x01)
+                buf.extend(_key_bytes(k))
+                buf.extend(str(v).encode("utf-8") + b"\x00")
+        buf.append(0x08)
+        return bytes(buf)
+
+    depots_node: dict = {}
+    for did, dlc_app_id in depots.items():
+        node: dict[str, str] = {"name": f"Depot {did}"}
+        if dlc_app_id is not None:
+            node["dlcappid"] = dlc_app_id
+        depots_node[did] = node
+
+    payload = _encode_map({"appinfo": {"depots": depots_node}})
+    entry_hdr = struct.pack("<IIQ20sI20s", 2, 1700000000, 0, b"\x00" * 20, 1, b"\x00" * 20)
+    entry_body = entry_hdr + payload
+    entry = struct.pack("<II", app_id, len(entry_body)) + entry_body + struct.pack("<I", 0)
+
+    out = bytearray()
+    if v29:
+        str_off = 16 + len(entry)
+        out.extend(struct.pack("<IIq", 0x07564429, 1, str_off))
+        out.extend(entry)
+        out.extend(struct.pack("<I", len(strings)))
+        for s in strings:
+            out.extend(s.encode("utf-8") + b"\x00")
+    else:
+        out.extend(struct.pack("<II", 0x07564428, 1))
+        out.extend(entry)
+
+    vdf_path = steam_home / "appcache" / "appinfo.vdf"
+    vdf_path.parent.mkdir(parents=True, exist_ok=True)
+    vdf_path.write_bytes(bytes(out))
+    return vdf_path
+
+
 def _write_mock_depot_downloader(
     bin_path: Path,
     log_path: Path,
@@ -94,8 +159,15 @@ def _write_mock_depot_downloader(
             sys.exit(1)
 
         app_id = argv[argv.index("-app") + 1] if "-app" in argv else "0"
+        depot_arg = argv[argv.index("-depot") + 1] if "-depot" in argv else None
         branch = argv[argv.index("-branch") + 1] if "-branch" in argv else "public"
         dest = pathlib.Path(argv[argv.index("-dir") + 1]) if "-dir" in argv else None
+
+        # Match real DepotDownloader 3.4.0: DLC AppIDs have no standalone depot list;
+        # all DLC depots live under the base game's AppID.
+        if app_id in ("2138330", "2138331", "2138332"):
+            print(f"Error: Couldn't find any depots to download for app {{app_id}}")
+            sys.exit(1)
 
         if "-manifest-only" in argv:
             if app_id == "228980":
@@ -119,22 +191,30 @@ def _write_mock_depot_downloader(
             sys.exit(0)
 
         # Download or validate mode
+        gid = os.environ.get("MOCK_MANIFEST_GID", "8811223344556677889")
         if dest is not None:
             dest.mkdir(parents=True, exist_ok=True)
-            if app_id == "228980" and "-depot" in argv:
-                dep = argv[argv.index("-depot") + 1]
-                (dest / f"redist_{{dep}}.bin").write_bytes(b"MOCK_REDIST")
-            elif app_id == "2138330":
+            if app_id == "228980" and depot_arg:
+                (dest / f"redist_{{depot_arg}}.bin").write_bytes(b"MOCK_REDIST")
+                print(f"Using app branch: '{{branch}}'.")
+                print(f"Processing depot {{depot_arg}} - Common Redist")
+                print("Manifest 1111111111111111111 (11/26/2026 12:00:00)")
+                print("Total downloaded: 512 bytes")
+                sys.exit(0)
+            if depot_arg == "999001":
                 (dest / "dlc_2138330.pak").write_bytes(b"MOCK_DLC")
-            else:
-                (dest / "bin" / "x64").mkdir(parents=True, exist_ok=True)
-                (dest / "bin" / "x64" / "SampleGame.exe").write_bytes(b"MZ\\x90\\x00MOCKPE")
-                (dest / "bin" / "x64" / "steam_api64.dll").write_bytes(b"MZ\\x90\\x00STEAM")
-                (dest / "installscript.vdf").write_text(
-                    '"InstallScript" {{"Run Process" {{"VCRedist" {{"process 1" "%INSTALLDIR%\\\\_CommonRedist\\\\vcredist\\\\vc_redist.x64.exe" "command 1" "/quiet"}}}}}}\\n',
-                    encoding="utf-8",
-                )
-        gid = os.environ.get("MOCK_MANIFEST_GID", "8811223344556677889")
+                print(f"Using app branch: '{{branch}}'.")
+                print("Processing depot 999001 - Expansion Pack DLC Content")
+                print("Manifest 770011 (11/26/2026 12:00:00)")
+                print("Total downloaded: 2048 bytes")
+                sys.exit(0)
+            (dest / "bin" / "x64").mkdir(parents=True, exist_ok=True)
+            (dest / "bin" / "x64" / "SampleGame.exe").write_bytes(b"MZ\\x90\\x00MOCKPE")
+            (dest / "bin" / "x64" / "steam_api64.dll").write_bytes(b"MZ\\x90\\x00STEAM")
+            (dest / "installscript.vdf").write_text(
+                '"InstallScript" {{"Run Process" {{"VCRedist" {{"process 1" "%INSTALLDIR%\\\\_CommonRedist\\\\vcredist\\\\vc_redist.x64.exe" "command 1" "/quiet"}}}}}}\\n',
+                encoding="utf-8",
+            )
         print(f"Using app branch: '{{branch}}'.")
         print("Processing depot 1091501 - Sample Action RPG Win64 Content")
         print(f"Manifest {{gid}} (11/26/2026 12:00:00)")
@@ -247,6 +327,20 @@ class SteamVdfAndManifestParserTests(unittest.TestCase):
         )
         self.assertEqual(parsed["root"]["path"], 'C:\\Games\\"Test"')
         self.assertEqual(parsed["root"]["winrel"], "bin\\x64\\Game.exe")
+
+    def test_parse_appinfo_vdf_dlc_depots_v28_and_v29(self) -> None:
+        for v29 in (False, True):
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                _write_mock_appinfo_vdf(
+                    root,
+                    1091500,
+                    {"1091501": None, "999001": "2138330", "999002": "2138331"},
+                    v29=v29,
+                )
+                mapping = parse_appinfo_vdf_dlc_depots(root, "1091500")
+                self.assertEqual(mapping, {"2138330": ["999001"], "2138331": ["999002"]})
+                self.assertEqual(parse_appinfo_vdf_dlc_depots(root, "9999999"), {})
 
 
 class SteamBackendTests(unittest.TestCase):
@@ -481,6 +575,13 @@ class SteamBackendTests(unittest.TestCase):
         self.assertTrue(info.anticheat.report_only)
 
     def test_download_branch_owned_dlcs_redists_verify_update_uninstall(self) -> None:
+        # Map DLC 2138330 -> depot 999001 inside base AppID 1091500 (matching real Steamworks)
+        _write_mock_appinfo_vdf(
+            self.steam_home,
+            1091500,
+            {"1091501": None, "999001": "2138330", "999002": "2138331"},
+        )
+
         def fake_http(url: str):
             if "appdetails" in url:
                 return {
@@ -513,7 +614,7 @@ class SteamBackendTests(unittest.TestCase):
         )
         self.assertEqual(dl.app_id, "1091500")
         self.assertEqual(dl.branch, "beta")
-        # Only owned DLC 2138330 is downloaded; unowned 2138331 is NOT downloaded
+        # Only owned DLC 2138330 is downloaded (via -app 1091500 -depot 999001); unowned 2138331 is NOT
         self.assertEqual(dl.downloaded_dlcs, ["2138330"])
         self.assertTrue((dest / "dlc_2138330.pak").is_file())
         self.assertIn("228989", dl.downloaded_redists)
@@ -522,10 +623,29 @@ class SteamBackendTests(unittest.TestCase):
         self.assertTrue((dest / "_CommonRedist" / "228989" / "redist_228989.bin").is_file())
 
         invocations = self._read_invocations()
+        # NEVER invoke DepotDownloader with a DLC AppID as -app
+        self.assertTrue(
+            all(c[c.index("-app") + 1] != "2138330" for c in invocations if "-app" in c)
+        )
         base_dl_calls = [
-            c for c in invocations if "-app" in c and c[c.index("-app") + 1] == "1091500" and "-manifest-only" not in c
+            c
+            for c in invocations
+            if "-app" in c
+            and c[c.index("-app") + 1] == "1091500"
+            and "-depot" not in c
+            and "-manifest-only" not in c
+        ]
+        dlc_dl_calls = [
+            c
+            for c in invocations
+            if "-app" in c
+            and c[c.index("-app") + 1] == "1091500"
+            and "-depot" in c
+            and c[c.index("-depot") + 1] == "999001"
+            and "-manifest-only" not in c
         ]
         self.assertEqual(len(base_dl_calls), 1)
+        self.assertEqual(len(dlc_dl_calls), 1)
         cmd = base_dl_calls[0]
         self.assertIn("-os", cmd)
         self.assertIn("windows", cmd)
@@ -1167,56 +1287,68 @@ class SteamBackendTests(unittest.TestCase):
         self.assertTrue((dest / plan.executable).is_file())
 
     def test_update_with_dlcs_installs_and_updates_dlc_when_base_unchanged(self) -> None:
+        # Map DLC 2138330 -> depot 999001 under base AppID 1091500 (deliberately non-adjacent ID)
+        _write_mock_appinfo_vdf(
+            self.steam_home,
+            1091500,
+            {"1091501": None, "999001": "2138330"},
+        )
+        dlc_log = self.root / "dlc_update_dd.log"
         dlc_dd = self.root / "dlc-update-dd"
         dlc_dd.write_text(
             textwrap.dedent(
-                """\
+                f"""\
                 #!/usr/bin/env python3
-                import os, pathlib, sys
+                import json, os, pathlib, sys
                 argv = sys.argv[1:]
                 if argv == ["--version"]:
                     print("DepotDownloader v3.4.0+mock-dlc")
                     sys.exit(0)
+                with pathlib.Path({str(dlc_log)!r}).open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(argv) + "\\n")
                 app_id = argv[argv.index("-app") + 1]
+                depot_arg = argv[argv.index("-depot") + 1] if "-depot" in argv else None
+                # Match real DepotDownloader: DLC AppIDs have no standalone depots
+                if app_id != "1091500":
+                    print(f"Error: Couldn't find any depots to download for app {{app_id}}")
+                    sys.exit(1)
                 dest = pathlib.Path(argv[argv.index("-dir") + 1])
                 dest.mkdir(parents=True, exist_ok=True)
                 base_gid = os.environ.get("MOCK_BASE_GID", "8811223344556677889")
                 dlc_gid = os.environ.get("MOCK_DLC_GID", "770011")
                 if "-manifest-only" in argv:
-                    if app_id == "2138330":
-                        (dest / f"manifest_2138331_{dlc_gid}.txt").write_text(
-                            f"Content Manifest for Depot 2138331\\n"
-                            f"Manifest ID / date : {dlc_gid} / 11/26/2026\\n"
-                            f"Size Chunks File SHA Flags Name\\n"
-                            f"8 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 dlc_2138330.pak\\n",
-                            encoding="utf-8",
-                        )
-                        print("Using app branch: 'public'.")
-                        print("Processing depot 2138331 - Expansion DLC")
-                        print(f"Manifest {dlc_gid} (11/26/2026 12:00:00)")
-                    else:
-                        (dest / f"manifest_1091501_{base_gid}.txt").write_text(
+                    print("Using app branch: 'public'.")
+                    if depot_arg in (None, "1091501"):
+                        (dest / f"manifest_1091501_{{base_gid}}.txt").write_text(
                             f"Content Manifest for Depot 1091501\\n"
-                            f"Manifest ID / date : {base_gid} / 11/26/2026\\n"
+                            f"Manifest ID / date : {{base_gid}} / 11/26/2026\\n"
                             f"Size Chunks File SHA Flags Name\\n"
                             f"10 1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 0 bin\\\\x64\\\\SampleGame.exe\\n",
                             encoding="utf-8",
                         )
-                        print("Using app branch: 'public'.")
                         print("Processing depot 1091501 - Base Game")
-                        print(f"Manifest {base_gid} (11/26/2026 12:00:00)")
+                        print(f"Manifest {{base_gid}} (11/26/2026 12:00:00)")
+                    if depot_arg in (None, "999001"):
+                        (dest / f"manifest_999001_{{dlc_gid}}.txt").write_text(
+                            f"Content Manifest for Depot 999001\\n"
+                            f"Manifest ID / date : {{dlc_gid}} / 11/26/2026\\n"
+                            f"Size Chunks File SHA Flags Name\\n"
+                            f"8 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 dlc_2138330.pak\\n",
+                            encoding="utf-8",
+                        )
+                        print("Processing depot 999001 - Expansion DLC")
+                        print(f"Manifest {{dlc_gid}} (11/26/2026 12:00:00)")
                     sys.exit(0)
-                if app_id == "2138330":
-                    (dest / "dlc_2138330.pak").write_bytes(f"DLC_{dlc_gid}".encode("utf-8"))
-                    print("Using app branch: 'public'.")
-                    print("Processing depot 2138331 - Expansion DLC")
-                    print(f"Manifest {dlc_gid} (11/26/2026 12:00:00)")
-                else:
+                print("Using app branch: 'public'.")
+                if depot_arg in (None, "1091501"):
                     (dest / "bin" / "x64").mkdir(parents=True, exist_ok=True)
                     (dest / "bin" / "x64" / "SampleGame.exe").write_bytes(b"MZ\\x90\\x00BASE")
-                    print("Using app branch: 'public'.")
                     print("Processing depot 1091501 - Base Game")
-                    print(f"Manifest {base_gid} (11/26/2026 12:00:00)")
+                    print(f"Manifest {{base_gid}} (11/26/2026 12:00:00)")
+                if depot_arg in (None, "999001"):
+                    (dest / "dlc_2138330.pak").write_bytes(f"DLC_{{dlc_gid}}".encode("utf-8"))
+                    print("Processing depot 999001 - Expansion DLC")
+                    print(f"Manifest {{dlc_gid}} (11/26/2026 12:00:00)")
                 sys.exit(0)
                 """
             ),
@@ -1248,7 +1380,7 @@ class SteamBackendTests(unittest.TestCase):
                 http_get_json=fake_http,
             )
             dest = self.root / "games" / "DlcUpdateGame"
-            # Initial install WITHOUT DLCs
+            # Initial install WITHOUT DLCs -> downloads only base depot 1091501
             backend.download(
                 DownloadOptions(app_id="1091500", dest=dest, platform="windows", with_dlcs=False)
             )
@@ -1259,7 +1391,7 @@ class SteamBackendTests(unittest.TestCase):
             self.assertTrue(chk1.update_available)
             self.assertFalse(chk1.updated)
 
-            # Running update --with-dlcs installs the missing owned DLC
+            # Running update --with-dlcs installs the missing owned DLC under base AppID 1091500
             upd1 = backend.update("1091500", check_only=False, with_dlcs=True)
             self.assertTrue(upd1.updated)
             self.assertEqual((dest / "dlc_2138330.pak").read_bytes(), b"DLC_770011")
@@ -1269,7 +1401,7 @@ class SteamBackendTests(unittest.TestCase):
             self.assertFalse(upd_same.updated)
             self.assertFalse(upd_same.update_available)
 
-            # Bump DLC manifest GID while base stays unchanged -> update --with-dlcs detects & applies it
+            # Bump DLC depot GID while base stays unchanged -> update --with-dlcs detects & applies it
             os.environ["MOCK_DLC_GID"] = "770022"
             chk2 = backend.update("1091500", check_only=True, with_dlcs=True)
             self.assertTrue(chk2.update_available)
@@ -1278,7 +1410,7 @@ class SteamBackendTests(unittest.TestCase):
             self.assertTrue(upd2.updated)
             self.assertEqual((dest / "dlc_2138330.pak").read_bytes(), b"DLC_770022")
 
-            # Base-only update must preserve existing installed DLC IDs and versions on the same install
+            # Base-only update must preserve existing installed DLC IDs, depots, and versions
             os.environ["MOCK_BASE_GID"] = "9911223344556677999"
             upd_base = backend.update("1091500", check_only=False, with_dlcs=False)
             self.assertTrue(upd_base.updated)
@@ -1287,6 +1419,28 @@ class SteamBackendTests(unittest.TestCase):
             self.assertTrue(dlc_after["2138330"].installed)
             chk_after = backend.update("1091500", check_only=True, with_dlcs=True)
             self.assertFalse(chk_after.update_available)
+
+            # Explicit --dlc download selects base depot + DLC depot via -app 1091500 -depot <id>
+            explicit_dest = self.root / "games" / "ExplicitDlcGame"
+            dl_explicit = backend.download(
+                DownloadOptions(
+                    app_id="1091500",
+                    dest=explicit_dest,
+                    platform="windows",
+                    dlcs=("2138330",),
+                    skip_dlcs=False,
+                )
+            )
+            self.assertEqual(dl_explicit.downloaded_dlcs, ["2138330"])
+            self.assertEqual((explicit_dest / "dlc_2138330.pak").read_bytes(), b"DLC_770022")
+
+            # Verify every single DepotDownloader call used base AppID 1091500, never DLC AppID 2138330
+            calls = [json.loads(ln) for ln in dlc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertTrue(calls)
+            self.assertTrue(all(c[c.index("-app") + 1] == "1091500" for c in calls if "-app" in c))
+            self.assertTrue(
+                any("-depot" in c and c[c.index("-depot") + 1] == "999001" for c in calls)
+            )
         finally:
             if prev_base_gid is None:
                 os.environ.pop("MOCK_BASE_GID", None)
