@@ -412,6 +412,10 @@ impl Tr<'_> {
                         self.a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
                     }
                     if self.xpin {
+                        self.a.ldr(16, XS, XCPU, OFF_YMM_DIRTY);
+                        self.a.addsub_ri(false, true, true, ZR, XS, 0, false);
+                        self.a.cset(XS, NE);
+                        self.a.bfxil0(XBUD, XS, 1);
                         self.a.bl_to(self.reload_xmm);
                     }
                     if self.ras_miss != 0 {
@@ -458,6 +462,10 @@ impl Tr<'_> {
                         self.a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
                     }
                     if self.xpin {
+                        self.a.ldr(16, XS, XCPU, OFF_YMM_DIRTY);
+                        self.a.addsub_ri(false, true, true, ZR, XS, 0, false);
+                        self.a.cset(XS, NE);
+                        self.a.bfxil0(XBUD, XS, 1);
                         self.a.bl_to(self.reload_xmm);
                     }
                     if self.ras_miss != 0 {

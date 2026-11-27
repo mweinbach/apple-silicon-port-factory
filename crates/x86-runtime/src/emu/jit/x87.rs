@@ -75,6 +75,8 @@ pub(super) struct X87Cold {
     top_known: Option<u8>,
     top_dirty: bool,
     sw_top_dirty: bool,
+    /// Pending `ymm_dirty` bits written earlier in this block (not yet flushed to `Cpu::jx.ymm_dirty` / `XBUD` bit 0).
+    ymm_dirty_pending: u16,
     kind: X87ColdKind,
 }
 
@@ -638,6 +640,7 @@ impl Tr<'_> {
                     top_known: tk,
                     top_dirty: td,
                     sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                     kind: X87ColdKind::FldSt { idx: op.r0 },
                 });
             }
@@ -671,6 +674,7 @@ impl Tr<'_> {
                         top_known: tk,
                         top_dirty: td,
                         sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                         kind: X87ColdKind::FldConst { id: op.r0 },
                     });
                 } else {
@@ -716,6 +720,7 @@ impl Tr<'_> {
                             top_known: tk,
                             top_dirty: td,
                             sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                             kind: if op.w == 8 { X87ColdKind::FldF64 } else { X87ColdKind::FldF32 },
                         });
                     }
@@ -748,6 +753,7 @@ impl Tr<'_> {
                             top_known: tk,
                             top_dirty: td,
                             sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                             kind: X87ColdKind::FldF80,
                         });
                     }
@@ -796,6 +802,7 @@ impl Tr<'_> {
                     top_known: tk,
                     top_dirty: td,
                     sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                     kind: X87ColdKind::FildI64,
                 });
             }
@@ -835,6 +842,7 @@ impl Tr<'_> {
                     top_known: tk,
                     top_dirty: td,
                     sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                     kind: X87ColdKind::FstSt { idx: op.r0, pop },
                 });
             }
@@ -894,6 +902,7 @@ impl Tr<'_> {
                     top_known: tk,
                     top_dirty: td,
                     sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                     kind: X87ColdKind::FstMem { op: *op, sz, pop },
                 });
             }
@@ -974,6 +983,7 @@ impl Tr<'_> {
                     top_known: tk,
                     top_dirty: td,
                     sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                     kind: X87ColdKind::Fist { op: *op, bits, flags: op.r1 },
                 });
             }
@@ -1060,6 +1070,7 @@ impl Tr<'_> {
                     top_known: tk,
                     top_dirty: td,
                     sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                     kind: X87ColdKind::FcmovFault { idx: op.r0 },
                 });
             }
@@ -1281,6 +1292,7 @@ impl Tr<'_> {
             top_known: tk,
             top_dirty: td,
             sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
             kind: X87ColdKind::BinopSt { op_pop: op.w, dst: op.r0, src: op.r1 },
         });
     }
@@ -1367,6 +1379,7 @@ impl Tr<'_> {
             top_known: tk,
             top_dirty: td,
             sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
             kind: X87ColdKind::BinopMem { op_code, w: op.w },
         });
     }
@@ -1454,6 +1467,7 @@ impl Tr<'_> {
             top_known: tk,
             top_dirty: td,
             sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
             kind: X87ColdKind::Unary { sub: X87_UNARY_SQRT },
         });
     }
@@ -1499,6 +1513,7 @@ impl Tr<'_> {
             top_known: tk,
             top_dirty: td,
             sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
             kind: X87ColdKind::Unary { sub: X87_UNARY_RNDINT },
         });
     }
@@ -1559,6 +1574,7 @@ impl Tr<'_> {
                 top_known: tk,
                 top_dirty: td,
                 sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                 kind: X87ColdKind::CmpSt { idx: op.r0, flags: op.w, is_fcomi: true },
             });
             let la = self.live[k + 1];
@@ -1589,6 +1605,7 @@ impl Tr<'_> {
                 top_known: tk,
                 top_dirty: td,
                 sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
                 kind: X87ColdKind::CmpSt { idx: op.r0, flags: op.w, is_fcomi: false },
             });
         }
@@ -1663,6 +1680,7 @@ impl Tr<'_> {
             top_known: tk,
             top_dirty: td,
             sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
             kind: X87ColdKind::CmpMem { w: op.w, flags: op.r1 },
         });
     }
@@ -1698,6 +1716,7 @@ impl Tr<'_> {
             top_known: tk,
             top_dirty: td,
             sw_top_dirty: std,
+            ymm_dirty_pending: self.ymm_dirty_pending,
             kind: X87ColdKind::Ftst,
         });
     }
@@ -1721,6 +1740,9 @@ impl Tr<'_> {
                 self.load_x87_state();
                 emit_flush_top_raw(&mut self.a, XA, XS, T0, c.top_known, c.top_dirty, c.sw_top_dirty);
             }
+            // Flush any pre-branch pending YMM dirty bits so `x87_trampoline`'s conditional
+            // `spill_xmm`/`reload_xmm` preserves pinned `v8..v15` (`ymm_hi[0..7]`).
+            self.flush_ymm_dirty_mask(c.ymm_dirty_pending);
             match c.kind {
                 X87ColdKind::FldF32 => {
                     self.a.mov_rr(false, T1, T6);

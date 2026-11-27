@@ -9528,3 +9528,57 @@ fn conditional_ymm_spill_and_fpcr_elision_across_plain_call() {
         crate::exe::unregister_native_va(HOST_INT_VA);
     }
 }
+
+/// Regression for Codex P1 finding: a 256-bit write followed in the same basic block by an x87
+/// instruction that takes a deferred `X87Cold` helper path (e.g. `fld m32` of a subnormal) must
+/// flush its pre-branch `ymm_dirty_pending` bits before `x87_trampoline` calls conditional
+/// `spill_xmm`/`reload_xmm`, preserving pinned `ymm_hi[0..7]` (`v8..v15`).
+#[test]
+fn deferred_x87_cold_helper_preserves_pending_ymm_hi() {
+    use iced_x86::code_asm::*;
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    // Single block: ymm_dirty_pending is NOT flushed before `fld` branches to `X87ColdKind::FldF32`.
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 0x00)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 0x20)).unwrap();
+    a.fninit().unwrap();
+    a.fld(dword_ptr(rcx + 0x40)).unwrap();
+    a.fstp(qword_ptr(rcx + 0x48)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 0x60), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 0x80), ymm3).unwrap();
+    a.vzeroupper().unwrap();
+    a.xor(eax, eax).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    const DATA: usize = 0x100;
+    let cptr = arena_alloc(code.len() + 16, 16);
+    let dptr = arena_alloc(DATA, 64);
+    let mut init = vec![0u8; DATA];
+    for i in 0..32usize {
+        init[i] = (0x21 + i) as u8;
+        init[0x20 + i] = (0xA1 + i) as u8;
+    }
+    // Smallest positive f32 subnormal forces `X87ColdKind::FldF32` cold helper path.
+    init[0x40..0x44].copy_from_slice(&0x0000_0001u32.to_le_bytes());
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), cptr, code.len());
+        core::ptr::write_bytes(cptr.add(code.len()), 0xCC, 16);
+        let interp = run_mode(cptr, dptr, &init, 2);
+        let jit1 = run_mode(cptr, dptr, &init, 1);
+        assert_eq!(jit1.1, interp.1, "deferred x87 cold helper JIT vs interpreter mismatch");
+        assert_eq!(
+            &jit1.1[0x60..0x80],
+            &init[0x00..0x20],
+            "ymm0 upper 128 bits lost across deferred x87 cold helper"
+        );
+        assert_eq!(
+            &jit1.1[0x80..0xA0],
+            &init[0x20..0x40],
+            "ymm3 upper 128 bits lost across deferred x87 cold helper"
+        );
+        let f64_bits = u64::from_le_bytes(jit1.1[0x48..0x50].try_into().unwrap());
+        assert_eq!(f64_bits, (f32::from_bits(1) as f64).to_bits(), "x87 subnormal fld/fstp mismatch");
+    }
+}
