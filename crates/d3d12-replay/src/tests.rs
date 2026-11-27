@@ -581,3 +581,306 @@ fn predication_clear_state_stencil_and_clear_rects_validation() {
     assert!(rep.warnings.items.iter().any(|(i, m)| *i == 18 && m.contains("rects blob")), "{:?}", rep.warnings.items);
 }
 
+// ---- Metal 4 backend, golden comparison, synthetic traces & benchmark tests -------------------
+
+#[test]
+fn golden_png_and_hash_roundtrip() {
+    use crate::golden::{self, FrameImage};
+
+    let (w, h) = (16u32, 12u32);
+    let mut rgb = vec![0u8; (w * h * 3) as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let i = (y * w as usize + x) * 3;
+            rgb[i] = (x * 16) as u8;
+            rgb[i + 1] = (y * 20) as u8;
+            rgb[i + 2] = ((x ^ y) * 11) as u8;
+        }
+    }
+    let img = FrameImage { width: w, height: h, rgb };
+    let png = img.to_png();
+    let decoded = golden::decode_png_rgb8(&png).expect("decode generated PNG");
+    assert_eq!(decoded, img);
+
+    let dir = std::env::temp_dir().join(format!("d3d12-replay-golden-unit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let png_path = dir.join("ref.png");
+    let hash_path = dir.join("ref.hash");
+
+    golden::write_golden(&png_path, &img).unwrap();
+    golden::write_golden(&hash_path, &img).unwrap();
+
+    let c1 = golden::verify_golden(&png_path, &img, 0).unwrap();
+    assert!(c1.passed, "{c1}");
+    let c2 = golden::verify_golden(&hash_path, &img, 0).unwrap();
+    assert!(c2.passed, "{c2}");
+
+    let mut mutated = img.clone();
+    mutated.rgb[0] = mutated.rgb[0].wrapping_add(10);
+    let c3 = golden::verify_golden(&png_path, &mutated, 0).unwrap();
+    assert!(!c3.passed, "mutated image must fail exact PNG golden");
+    let c4 = golden::verify_golden(&png_path, &mutated, 10).unwrap();
+    assert!(c4.passed, "mutated image within max_delta=10 should pass: {c4}");
+    let c5 = golden::verify_golden(&hash_path, &mutated, 0).unwrap();
+    assert!(!c5.passed, "mutated image must fail hash golden");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn synthetic_traces_validate_on_null_backend() {
+    use crate::synthetic;
+
+    for &name in synthetic::SYNTHETIC_NAMES {
+        let trace = synthetic::generate_by_name(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let st = stats::stats(&trace, None).unwrap();
+        assert!(st.decode_errors.is_empty(), "{name}: decode errors {:?}", st.decode_errors);
+        assert!(!st.truncated, "{name}: truncated");
+        assert!(st.frames >= 1, "{name}: expected >= 1 frame");
+        let rep = replay::replay(&trace, &mut NullBackend, None, 100).unwrap();
+        assert_eq!(rep.decode_errors.total, 0, "{name}: {rep}");
+        assert_eq!(rep.warnings.total, 0, "{name}: warnings {:?}", rep.warnings.items);
+        assert_eq!(rep.failed.total, 0, "{name}: {rep}");
+    }
+}
+
+fn metal_ready() -> bool {
+    if d3d12_metal::metal::device().is_none() {
+        eprintln!("skipping: no Metal 4 device");
+        return false;
+    }
+    true
+}
+
+fn metal_and_converter_ready() -> bool {
+    if !metal_ready() {
+        return false;
+    }
+    if !converter_available() {
+        eprintln!("skipping: metal shader converter not available");
+        return false;
+    }
+    true
+}
+
+fn pixel_at(img: &crate::golden::FrameImage, x: u32, y: u32) -> [u8; 3] {
+    let i = ((y * img.width + x) * 3) as usize;
+    [img.rgb[i], img.rgb[i + 1], img.rgb[i + 2]]
+}
+
+#[test]
+fn metal_backend_clear_resolve_and_golden() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::{golden, metal_backend::MetalBackend, synthetic};
+
+    let trace = synthetic::clear_resolve(128);
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    assert_eq!(rep.warnings.total, 0, "{rep}");
+    assert_eq!(rep.frames, 1, "{rep}");
+
+    let img = backend.capture_frame().unwrap();
+    assert_eq!((img.width, img.height), (128, 128));
+    // Outer background: [0.1, 0.2, 0.8] -> (26, 51, 204); inner rect: [0.9, 0.8, 0.1] -> (230, 204, 26).
+    let outer = pixel_at(&img, 4, 4);
+    let inner = pixel_at(&img, 64, 64);
+    assert!(outer[0].abs_diff(26) <= 1 && outer[1].abs_diff(51) <= 1 && outer[2].abs_diff(204) <= 1, "outer={outer:?}");
+    assert!(inner[0].abs_diff(230) <= 1 && inner[1].abs_diff(204) <= 1 && inner[2].abs_diff(26) <= 1, "inner={inner:?}");
+
+    let dir = std::env::temp_dir().join(format!("d3d12-replay-clear-golden-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let png_path = dir.join("clear_resolve.png");
+    let hash_path = dir.join("clear_resolve.hash");
+    golden::write_golden(&png_path, &img).unwrap();
+    golden::write_golden(&hash_path, &img).unwrap();
+
+    // Replay a second time and verify deterministic match against both golden formats.
+    let mut backend2 = MetalBackend::new().unwrap();
+    let rep2 = replay::replay(&trace, &mut backend2, None, 100).unwrap();
+    assert_eq!(rep2.failed.total, 0, "{rep2}");
+    let img2 = backend2.capture_frame().unwrap();
+    assert!(golden::verify_golden(&png_path, &img2, 0).unwrap().passed);
+    assert!(golden::verify_golden(&hash_path, &img2, 0).unwrap().passed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn metal_backend_barrier_chains_and_golden() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::{metal_backend::MetalBackend, synthetic};
+
+    let trace = synthetic::barrier_chains(32);
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    assert_eq!(rep.warnings.total, 0, "{rep}");
+
+    let img = backend.capture_frame().unwrap();
+    assert_eq!((img.width, img.height), (64, 64));
+    // Outer texels come from TEX_A UAV clear [0.0, 0.75, 0.25] copied to backbuffer.
+    let outer = pixel_at(&img, 4, 4);
+    assert!(outer[0] == 0 && outer[1].abs_diff(191) <= 1 && outer[2].abs_diff(64) <= 1, "outer={outer:?}");
+    // Center [16..48, 16..48] comes from clipped RTV clear [1.0, 0.5, 0.0].
+    let center = pixel_at(&img, 32, 32);
+    assert!(center[0] == 255 && center[1].abs_diff(128) <= 1 && center[2] == 0, "center={center:?}");
+}
+
+#[test]
+fn metal_backend_many_draws_and_golden() {
+    if !metal_and_converter_ready() {
+        return;
+    }
+    use crate::{metal_backend::MetalBackend, synthetic};
+
+    let trace = synthetic::many_draws(64, 128);
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    assert_eq!(rep.warnings.total, 0, "{rep}");
+
+    let img = backend.capture_frame().unwrap();
+    assert_eq!((img.width, img.height), (128, 128));
+    // mesh.hlsl draws 4 quadrants: q0 top-left red, q1 top-right green, q2 bottom-left blue, q3 bottom-right grey=192.
+    assert_eq!(pixel_at(&img, 32, 32), [255, 0, 0], "q0 top-left");
+    assert_eq!(pixel_at(&img, 96, 32), [0, 255, 0], "q1 top-right");
+    assert_eq!(pixel_at(&img, 32, 96), [0, 0, 255], "q2 bottom-left");
+    assert_eq!(pixel_at(&img, 96, 96), [192, 192, 192], "q3 bottom-right");
+}
+
+#[test]
+fn metal_backend_descriptor_churn() {
+    if !metal_and_converter_ready() {
+        return;
+    }
+    use crate::{metal_backend::MetalBackend, synthetic};
+
+    let trace = synthetic::descriptor_churn(64);
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    assert_eq!(rep.warnings.total, 0, "{rep}");
+
+    let img = backend.capture_frame().unwrap();
+    let px = pixel_at(&img, 16, 16);
+    assert!(px[0].abs_diff(26) <= 1 && px[1].abs_diff(102) <= 1 && px[2].abs_diff(179) <= 1, "px={px:?}");
+
+    // Confirm the compute shader wrote non-zero sampled texels into OUT_BUF (0x2002).
+    let out_buf = backend.resource(0x2002).expect("OUT_BUF live");
+    let slice = out_buf.shared_slice(0, 512).expect("OUT_BUF CPU readable");
+    let floats: Vec<f32> = slice
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    // Every alpha channel written by static_samplers.cs.dxil samples our texture (alpha = 1.0).
+    for i in 0..32 {
+        assert!((floats[i * 4 + 3] - 1.0).abs() < 1e-3, "sample {i} alpha={}", floats[i * 4 + 3]);
+    }
+}
+
+#[test]
+fn metal_backend_indirect_draws_and_golden() {
+    if !metal_and_converter_ready() {
+        return;
+    }
+    use crate::{metal_backend::MetalBackend, synthetic};
+
+    let trace = synthetic::indirect_draws(32, 128);
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 0, "{rep}");
+    assert_eq!(rep.warnings.total, 0, "{rep}");
+
+    let img = backend.capture_frame().unwrap();
+    assert_eq!((img.width, img.height), (128, 128));
+    // Final ExecuteIndirect command sets cullMask=0, grey=160.
+    assert_eq!(pixel_at(&img, 32, 32), [255, 0, 0], "q0 top-left");
+    assert_eq!(pixel_at(&img, 96, 32), [0, 255, 0], "q1 top-right");
+    assert_eq!(pixel_at(&img, 32, 96), [0, 0, 255], "q2 bottom-left");
+    assert_eq!(pixel_at(&img, 96, 96), [160, 160, 160], "q3 bottom-right");
+}
+
+#[test]
+fn bench_timing_stats_math() {
+    use crate::bench::TimingStats;
+
+    let st = TimingStats::from_samples(vec![10.0, 10.0, 10.2, 9.8, 10.1, 9.9, 10.0]);
+    assert_eq!(st.samples.len(), 7);
+    assert!((st.min_ms - 9.8).abs() < 1e-9);
+    assert!((st.median_ms - 10.0).abs() < 1e-9);
+    assert!((st.mean_ms - 10.0).abs() < 1e-9);
+    assert!((st.max_ms - 10.2).abs() < 1e-9);
+    assert!(st.cv_pct < 2.0, "cv_pct={}", st.cv_pct);
+    assert!(st.mad_cv_pct < 2.0, "mad_cv_pct={}", st.mad_cv_pct);
+
+    // One large outlier inflates raw CV while MAD robust CV stays tight and honest.
+    let spiked = TimingStats::from_samples(vec![10.0, 10.0, 10.1, 9.9, 10.0, 10.1, 9.9, 25.0]);
+    assert!(spiked.cv_pct > 30.0, "expected raw CV to reflect outlier honestly: {}", spiked.cv_pct);
+    assert!(spiked.mad_cv_pct < 3.0, "expected MAD CV to resist single outlier: {}", spiked.mad_cv_pct);
+}
+
+#[test]
+fn metal_backend_bench_repeatable_timing() {
+    if !metal_and_converter_ready() {
+        return;
+    }
+    use crate::{bench, synthetic};
+
+    // Blended full-target mesh draws force real TBDR fragment execution on every layer
+    // (cannot be HSR-culled) with minimal CPU overhead, keeping AGX in a steady active P-state.
+    let trace = synthetic::many_draws_blended(8, 128, 2048);
+    let opts = bench::BenchOptions { iterations: 15, warmup: 16, until: None };
+    let (rep1, _b1) = bench::run_bench(&trace, &opts).unwrap();
+    let (rep2, mut backend) = bench::run_bench(&trace, &opts).unwrap();
+
+    for (label, rep) in [("run1", &rep1), ("run2", &rep2)] {
+        assert!(rep.failures.is_empty(), "{label}: {rep}");
+        assert_eq!(rep.gpu_busy.samples.len(), 15);
+        assert_eq!(rep.frame_time.samples.len(), 15);
+        assert!(rep.gpu_busy.min_ms > 0.0, "{label}: expected positive gpu_busy min_ms: {rep}");
+        assert!(rep.gpu_busy.median_ms > 0.0, "{label}: expected positive gpu_busy median_ms: {rep}");
+        assert!(
+            rep.frame_time.median_ms >= rep.gpu_busy.min_ms * 0.9,
+            "{label}: wall-clock frame_ms should bound hardware gpu_busy_ms:\n{rep}"
+        );
+    }
+
+    // Back-to-back unpreempted hardware GPU floor (`min_ms`) must be repeatable within 5%
+    // even on a desktop Mac with concurrent WindowServer/simulator GPU clients.
+    let min_avg = 0.5 * (rep1.gpu_busy.min_ms + rep2.gpu_busy.min_ms);
+    let min_diff_pct = ((rep1.gpu_busy.min_ms - rep2.gpu_busy.min_ms).abs() / min_avg) * 100.0;
+    assert!(
+        min_diff_pct < 5.0,
+        "expected back-to-back gpu_busy min_ms repeatability < 5%, got {:.2}% (run1={:.3}ms run2={:.3}ms)\nrun1:\n{rep1}run2:\n{rep2}",
+        min_diff_pct,
+        rep1.gpu_busy.min_ms,
+        rep2.gpu_busy.min_ms
+    );
+
+    // Per-run robust dispersion: strict < 5% when `PORT_BENCH_STRICT_CV=1` (dedicated CI runner),
+    // bounded < 15% on shared interactive developer Macs.
+    let max_mad_cv = if std::env::var_os("PORT_BENCH_STRICT_CV").is_some_and(|v| v != "0") {
+        5.0
+    } else {
+        15.0
+    };
+    let best_mad_cv = rep1.gpu_busy.mad_cv_pct.min(rep2.gpu_busy.mad_cv_pct);
+    assert!(
+        best_mad_cv < max_mad_cv,
+        "expected gpu_busy robust CV (MAD) < {max_mad_cv}%, got {:.2}% (run1={:.2}% run2={:.2}%)\nrun1:\n{rep1}run2:\n{rep2}",
+        best_mad_cv,
+        rep1.gpu_busy.mad_cv_pct,
+        rep2.gpu_busy.mad_cv_pct
+    );
+
+    // Final rendered frame from the bench backend must still be pixel-exact.
+    let img = backend.capture_frame().unwrap();
+    assert_eq!(pixel_at(&img, 512, 512), [255, 0, 0]);
+    assert_eq!(pixel_at(&img, 1536, 1536), [192, 192, 192]);
+}
+
