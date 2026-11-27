@@ -67,6 +67,16 @@ caches compiled Metal 4 pipeline archives (`MTL4Archive`) on disk. Its default b
      `d3d12-metal` automatically wraps `MTL4LibraryFunctionDescriptor` in
      `MTL4SpecializedFunctionDescriptor` across compute, graphics, and mesh pipelines.
 
+6. **Opt-in Metal 4.1 / MSL 4.1 compiler controls (`crates/dxil-metal/src/{pso_cache,spirv_metal}.rs`)**
+   - `PORT_METAL41_RTZ_FP` (follows `PORT_METAL41`): enables MSL 4.1
+     `MTLFloatingPointConversionRoundingModeTowardZero` / `-fmetal-rtz-fp-conversion` on runtime
+     MSL source compiles and `spirv_metal` compilations so FP32→FP16 narrowing saturates to
+     `±65504` instead of overflowing to `±Inf`.
+   - `PORT_METAL41_SPIRV` (follows `PORT_METAL41`): upgrades `spirv_metal` (`naga` SPIR-V/WGSL →
+     MSL → `xcrun metal`) from legacy `-std=metal3.1` to `naga` `(4, 0)` + `-std=metal4.1`
+     (falling back to `metal4.0` → `metal3.1` on older toolchains) with separated disk cache keys
+     so default caches remain unaffected.
+
 ---
 
 ## 3. CLI & Prewarming

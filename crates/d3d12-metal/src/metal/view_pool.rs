@@ -182,6 +182,20 @@ pub fn create_texture_view(
     slices: (u32, u32),
     swizzle: MTLTextureSwizzleChannels,
 ) -> Option<PooledView> {
+    create_texture_view_with_min_lod(tex, fmt, ty, mips, slices, swizzle, 0.0)
+}
+
+/// Like [`create_texture_view`], optionally setting Metal 4.1 (`Apple10`+)
+/// `MTLTextureViewDescriptor.minLOD` when `abs_min_lod > 0.0`.
+pub fn create_texture_view_with_min_lod(
+    tex: &MtlTexture,
+    fmt: MTLPixelFormat,
+    ty: MTLTextureType,
+    mips: (u32, u32),
+    slices: (u32, u32),
+    swizzle: MTLTextureSwizzleChannels,
+    abs_min_lod: f32,
+) -> Option<PooledView> {
     if !enabled() {
         return None;
     }
@@ -195,6 +209,12 @@ pub fn create_texture_view(
         let _: () = msg_send![&*tvd, setLevelRange: NSRange::new(mips.0 as usize, mips.1 as usize)];
         let _: () = msg_send![&*tvd, setSliceRange: NSRange::new(slices.0 as usize, slices.1 as usize)];
         let _: () = msg_send![&*tvd, setSwizzle: swizzle];
+        if abs_min_lod > 0.0 {
+            let has_min_lod: Bool = msg_send![&*tvd, respondsToSelector: objc2::sel!(setMinLOD:)];
+            if has_min_lod.as_bool() {
+                let _: () = msg_send![&*tvd, setMinLOD: abs_min_lod];
+            }
+        }
         let pool = &state.chunks[slot.chunk as usize].pool;
         let rid: MTLResourceID =
             msg_send![&**pool, setTextureView: tex, descriptor: &*tvd, atIndex: slot.slot as usize];

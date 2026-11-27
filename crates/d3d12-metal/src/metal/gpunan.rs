@@ -169,7 +169,17 @@ kernel void probe_rd(texture2d<float, access::read> t [[texture(0)]], device flo
 }
 "#;
             let ns_src = objc2_foundation::NSString::from_str(src);
-            let Ok(lib) = dev.newLibraryWithSource_options_error(&ns_src, None) else {
+            let compile_probe = |ver: Option<MTLLanguageVersion>| {
+                let opts = MTLCompileOptions::new();
+                if let Some(v) = ver {
+                    opts.setLanguageVersion(v);
+                }
+                dev.newLibraryWithSource_options_error(&ns_src, Some(&opts))
+            };
+            let Ok(lib) = compile_probe(Some(dxil_metal::pso_cache::LANGUAGE_VERSION_4_1))
+                .or_else(|_| compile_probe(Some(MTLLanguageVersion(4 << 16))))
+                .or_else(|_| dev.newLibraryWithSource_options_error(&ns_src, None))
+            else {
                 log::warn!(target: "d3d", "f16 overflow probe: failed to compile probe library");
                 return;
             };
@@ -457,7 +467,13 @@ pub fn encode_scan_texture(
     if w == 0 || h == 0 {
         return false;
     }
-    let Ok(pso) = super::clear::kernel("port_diag_tex_scan_2d") else {
+    let use_m41_b2 = super::m41::block_read_kernels_enabled();
+    let kernel_name = if use_m41_b2 {
+        "port_diag_tex_scan_2d_b2"
+    } else {
+        "port_diag_tex_scan_2d"
+    };
+    let Ok(pso) = super::clear::kernel(kernel_name) else {
         return false;
     };
     let mut st = state().lock().unwrap();
@@ -487,7 +503,7 @@ pub fn encode_scan_texture(
         e.setArgumentTable(Some(&tbl));
         e.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
-                width: (w as usize).div_ceil(8),
+                width: (w as usize).div_ceil(if use_m41_b2 { 16 } else { 8 }),
                 height: (h as usize).div_ceil(8),
                 depth: 1,
             },
