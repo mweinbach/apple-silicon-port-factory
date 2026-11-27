@@ -318,6 +318,10 @@ pub struct RunRes {
     pub fault_pc: u64,
     /// Raw `waitpid` status (or `-errno` when `waitpid` failed).
     pub wait_status: i32,
+    /// Decoded termination kind (`TERM_EXITED`, `TERM_SIGNALED`, `TERM_WAIT_ERR`, ...).
+    pub exit_kind: u8,
+    /// Decoded exit code, signal number, or `waitpid` errno.
+    pub exit_code: i32,
     /// Signal recorded by `on_fault` (`RunHdr::fault_sig`, 0 if `on_fault` did not exit).
     pub fault_sig: u32,
     /// [`ST_HOST`]: the host API (NUL-terminated).
@@ -359,6 +363,9 @@ pub unsafe fn run_one(bufs: &Bufs, r: usize, timeout_ms: u64, body: &dyn Fn() ->
         if !rp.is_null() {
             super::memmap::protect(core::slice::from_raw_parts(rp, rn));
         }
+        // Signal to the orchestrator that fork + `mprotect` setup finished so `timeout_ms`
+        // bounds `body()` rather than host VM scheduling latency during child startup.
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*h).started), 1);
         let t0 = now_us();
         let (rax, xmm0) = body();
         let t1 = now_us();
@@ -376,8 +383,10 @@ pub unsafe fn run_one(bufs: &Bufs, r: usize, timeout_ms: u64, body: &dyn Fn() ->
         (*h).done = 1;
         libc::_exit(handler::EXIT_OK);
     }
-    let deadline = now_us() + timeout_ms * 1000;
+    let startup_deadline = now_us().saturating_add(timeout_ms.saturating_add(5_000).saturating_mul(1000));
+    let mut body_deadline: Option<u64> = None;
     let mut raw_status = 0i32;
+    let mut killed_for_timeout = false;
     loop {
         let (w, err) = waitpid_retry(pid, &mut raw_status, libc::WNOHANG);
         if w == pid {
@@ -387,10 +396,22 @@ pub unsafe fn run_one(bufs: &Bufs, r: usize, timeout_ms: u64, body: &dyn Fn() ->
             raw_status = if err > 0 { -err } else { -1 };
             break;
         }
-        if now_us() > deadline {
+        if body_deadline.is_none() && core::ptr::read_volatile(core::ptr::addr_of!((*h).started)) != 0 {
+            body_deadline = Some(now_us().saturating_add(timeout_ms.saturating_mul(1000)));
+        }
+        let now = now_us();
+        let expired = match body_deadline {
+            Some(dl) => now > dl,
+            None => now > startup_deadline,
+        };
+        if expired {
             libc::kill(pid, libc::SIGKILL);
-            let _ = waitpid_retry(pid, &mut raw_status, 0);
-            return RunRes { status: ST_TIMEOUT, wait_status: raw_status, ..Default::default() };
+            let (rw, rerr) = waitpid_retry(pid, &mut raw_status, 0);
+            if rw < 0 {
+                raw_status = if rerr > 0 { -rerr } else { -1 };
+            }
+            killed_for_timeout = true;
+            break;
         }
         if parent_gone() {
             libc::kill(pid, libc::SIGKILL);
@@ -401,7 +422,19 @@ pub unsafe fn run_one(bufs: &Bufs, r: usize, timeout_ms: u64, body: &dyn Fn() ->
     }
     let done = core::ptr::read_volatile(core::ptr::addr_of!((*h).done));
     let overflow = core::ptr::read_volatile(core::ptr::addr_of!((*h).overflow));
-    let status = classify_run_exit(raw_status, done, overflow);
+    let (exit_kind, exit_code) = super::types::ChildExit::from_raw(raw_status).to_parts();
+    let status = if killed_for_timeout {
+        // If the child had already exited cleanly right before our `SIGKILL` arrived, keep
+        // its completed result instead of misclassifying a raced fast run as a timeout.
+        let natural = classify_run_exit(raw_status, done, overflow);
+        if matches!(natural, ST_OK | ST_OVERFLOW) {
+            natural
+        } else {
+            ST_TIMEOUT
+        }
+    } else {
+        classify_run_exit(raw_status, done, overflow)
+    };
     if status == ST_OK {
         rebase(buf, bufs.maxpages);
     }
@@ -413,6 +446,8 @@ pub unsafe fn run_one(bufs: &Bufs, r: usize, timeout_ms: u64, body: &dyn Fn() ->
         fault_addr: core::ptr::read_volatile(core::ptr::addr_of!((*h).fault_addr)),
         fault_pc: core::ptr::read_volatile(core::ptr::addr_of!((*h).fault_pc)),
         wait_status: raw_status,
+        exit_kind,
+        exit_code,
         fault_sig: core::ptr::read_volatile(core::ptr::addr_of!((*h).fault_sig)) as u32,
         host_api: core::ptr::read_volatile(core::ptr::addr_of!((*h).host_api)),
     }

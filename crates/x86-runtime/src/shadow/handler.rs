@@ -30,6 +30,7 @@ pub const EXIT_FAULT: i32 = 91;
 /// Start of a run buffer (MAP_SHARED). The page list follows at [`HDR_BYTES`].
 #[repr(C)]
 pub struct RunHdr {
+    pub started: u64,
     pub done: u64,
     pub rax: u64,
     pub xmm0: u128,

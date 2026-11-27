@@ -87,7 +87,7 @@ jobs:
       - name: Unit tests, AOT multi-module verification and headless Win32 guest corpus
         run: >-
           cargo factory-test --test aot_multi_module_verify --test os_guest_corpus --
-          --test-threads=1 --skip shadow::tests::timeouts_and_faults
+          --test-threads=1
       - name: Static readiness against synthetic PEs and Zig guests
         env:
           PORT_CRASH_DIR: ${{ runner.temp }}/readiness-crashes
@@ -95,15 +95,6 @@ jobs:
           cargo test -p port-factory --target aarch64-apple-darwin
           --test audit_game_cli --test readiness_guest --
           readiness_ --include-ignored --test-threads=1
-      # This test forks a child that spins forever and expects the shadow probe to report a
-      # timeout. On GitHub-hosted runners it has reported a fault instead; on Apple Silicon
-      # hardware it passes. It runs here so the result stays visible, but it does not gate
-      # the job until the cause is understood.
-      - name: Known issue on hosted runners (does not gate) - shadow timeouts_and_faults
-        continue-on-error: true
-        run: >-
-          cargo factory-test --
-          --test-threads=1 --exact shadow::tests::timeouts_and_faults
       - name: Check the Alan Wake 2 crate against shared signatures
         run: cargo check -p aw2-game --no-default-features --target aarch64-apple-darwin
       - name: Compiler cache statistics

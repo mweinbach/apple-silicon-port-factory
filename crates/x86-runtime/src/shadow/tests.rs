@@ -511,12 +511,45 @@ fn timeouts_and_faults() {
     c.timeout_ms = 200;
     let ok = || (0u64, 0u128);
     let r = unsafe { probe_blocking(&c, &ArgRegs::default(), false, &ok, &spin) };
-    assert_eq!((r.outcome(), r.reason()), (Outcome::Mismatch, Reason::NativeTimeout), "{r:?} diag={:?}", diag());
+    assert_eq!(
+        (r.outcome(), r.reason()),
+        (Outcome::Mismatch, Reason::NativeTimeout),
+        "runs=[{}] {r:?} diag={:?}",
+        r.run_diagnostics(),
+        diag()
+    );
+    assert_eq!(r.run_exit(0), ChildExit::Exited(0), "runs=[{}]", r.run_diagnostics());
+    assert!(
+        matches!(r.run_exit(1), ChildExit::Signaled { sig, .. } if sig == libc::SIGKILL || sig == libc::SIGALRM),
+        "expected SIGKILL/SIGALRM for spinning native child, got runs=[{}]",
+        r.run_diagnostics()
+    );
     let r = unsafe { probe_blocking(&c, &ArgRegs::default(), false, &spin, &ok) };
-    assert_eq!((r.outcome(), r.reason()), (Outcome::Skipped, Reason::GuestTimeout), "{r:?} diag={:?}", diag());
+    assert_eq!(
+        (r.outcome(), r.reason()),
+        (Outcome::Skipped, Reason::GuestTimeout),
+        "runs=[{}] {r:?} diag={:?}",
+        r.run_diagnostics(),
+        diag()
+    );
+    assert!(
+        matches!(r.run_exit(0), ChildExit::Signaled { sig, .. } if sig == libc::SIGKILL || sig == libc::SIGALRM),
+        "expected SIGKILL/SIGALRM for spinning guest child, got runs=[{}]",
+        r.run_diagnostics()
+    );
+    assert_eq!(r.run_exit(1), ChildExit::Exited(0), "runs=[{}]", r.run_diagnostics());
     let r = unsafe { probe_blocking(&c, &ArgRegs::default(), false, &spin, &spin) };
-    assert_eq!(r.reason(), Reason::DoubleTimeout, "{r:?} diag={:?}", diag());
+    assert_eq!(
+        r.reason(),
+        Reason::DoubleTimeout,
+        "runs=[{}] {r:?} diag={:?}",
+        r.run_diagnostics(),
+        diag()
+    );
     // A fault inside the valid address range is a mismatch; a wild one is inconclusive.
+    // Fault cases do not test short deadlines; use the standard probe timeout so slow VMs
+    // cannot turn a fault into a timeout.
+    let fc = cfg("fault");
     let guard = unsafe {
         libc::mmap(core::ptr::null_mut(), 16384, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
     } as usize;
@@ -524,15 +557,34 @@ fn timeouts_and_faults() {
         core::ptr::write_volatile(guard as *mut u64, 1);
         (0u64, 0u128)
     };
-    let r = unsafe { probe_blocking(&c, &ArgRegs::default(), false, &ok, &bad) };
-    assert_eq!((r.outcome(), r.reason()), (Outcome::Mismatch, Reason::NativeFault), "{r:?} diag={:?}", diag());
-    assert_eq!(r.fault_addr[1], guard as u64);
+    let r = unsafe { probe_blocking(&fc, &ArgRegs::default(), false, &ok, &bad) };
+    assert_eq!(
+        (r.outcome(), r.reason()),
+        (Outcome::Mismatch, Reason::NativeFault),
+        "runs=[{}] {r:?} diag={:?}",
+        r.run_diagnostics(),
+        diag()
+    );
+    assert_eq!(r.fault_addr[1], guard as u64, "runs=[{}]", r.run_diagnostics());
+    assert_eq!(r.run_exit(1), ChildExit::Exited(super::handler::EXIT_FAULT), "runs=[{}]", r.run_diagnostics());
+    assert!(
+        r.fault_sig[1] == libc::SIGSEGV as u32 || r.fault_sig[1] == libc::SIGBUS as u32,
+        "runs=[{}]",
+        r.run_diagnostics()
+    );
     let wild = || unsafe {
         core::ptr::write_volatile(0x8usize as *mut u64, 1);
         (0u64, 0u128)
     };
-    let r = unsafe { probe_blocking(&c, &ArgRegs::default(), false, &ok, &wild) };
-    assert_eq!((r.outcome(), r.reason()), (Outcome::Skipped, Reason::NativeWildFault), "{r:?} diag={:?}", diag());
+    let r = unsafe { probe_blocking(&fc, &ArgRegs::default(), false, &ok, &wild) };
+    assert_eq!(
+        (r.outcome(), r.reason()),
+        (Outcome::Skipped, Reason::NativeWildFault),
+        "runs=[{}] {r:?} diag={:?}",
+        r.run_diagnostics(),
+        diag()
+    );
+    assert_eq!(r.run_exit(1), ChildExit::Exited(super::handler::EXIT_FAULT), "runs=[{}]", r.run_diagnostics());
 }
 
 #[test]
@@ -809,4 +861,18 @@ fn classify_run_exit_treats_watchdog_sigalrm_as_timeout() {
         super::run::classify_run_exit(win32_rt::shadow::EXIT_HOST_UNSAFE << 8, 0, 0),
         super::run::ST_HOST
     );
+}
+
+#[test]
+fn child_exit_decodes_wait_status_variants() {
+    assert_eq!(ChildExit::from_raw(0), ChildExit::Exited(0));
+    assert_eq!(ChildExit::from_raw(super::handler::EXIT_FAULT << 8), ChildExit::Exited(super::handler::EXIT_FAULT));
+    assert_eq!(ChildExit::from_raw(libc::SIGKILL), ChildExit::Signaled { sig: libc::SIGKILL, core_dumped: false });
+    assert_eq!(ChildExit::from_raw(libc::SIGALRM), ChildExit::Signaled { sig: libc::SIGALRM, core_dumped: false });
+    assert_eq!(ChildExit::from_raw(libc::SIGSEGV | 0x80), ChildExit::Signaled { sig: libc::SIGSEGV, core_dumped: true });
+    assert_eq!(ChildExit::from_raw(-libc::ECHILD), ChildExit::WaitError(libc::ECHILD));
+    assert_eq!(ChildExit::from_raw(libc::SIGKILL).describe(), format!("signaled(SIGKILL={})", libc::SIGKILL));
+    assert_eq!(ChildExit::from_raw(libc::SIGALRM).describe(), format!("signaled(SIGALRM={})", libc::SIGALRM));
+    assert_eq!(ChildExit::from_raw(super::handler::EXIT_FAULT << 8).describe(), "exited(91)");
+    assert_eq!(ChildExit::from_raw(-libc::ECHILD).describe(), format!("waitpid_err({})", libc::ECHILD));
 }

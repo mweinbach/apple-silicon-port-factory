@@ -31,7 +31,7 @@ mod run;
 mod types;
 pub use compare::DiffRange;
 pub use core_probe::diag;
-pub use types::{Outcome, Reason, Report, RetUse};
+pub use types::{ChildExit, Outcome, Reason, Report, RetUse};
 
 /// Class bits (`class=`).
 pub const C_DRAFT: u32 = 1;
