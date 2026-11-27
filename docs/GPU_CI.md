@@ -18,17 +18,16 @@ pull requests:
 |---|---|---|
 | `push` to `main` | Yes | Already reviewed and merged to `main`. |
 | `workflow_dispatch` | Yes | Explicit manual run by a maintainer (with optional `run_bench` input). |
-| `pull_request` (`types: [labeled]`) with label `gpu-ci` | Yes | Only repository maintainers/collaborators can apply labels. `opened`, `reopened`, and `synchronize` are intentionally excluded, so pushing new commits to a labeled PR does **not** re-run the workflow until a maintainer reviews the new diff and re-applies `gpu-ci`. |
+| `pull_request` (`types: [labeled]`) with label `gpu-ci` | Only after `gpu-ci-pr` approval | Applying `gpu-ci` starts an `ubuntu-latest` gate job (`approve-pr-gpu`) behind the protected GitHub Environment `gpu-ci-pr`. A runner owner configured as a Required Reviewer must explicitly approve the run before the self-hosted Mac job executes, and checkout is cryptographically pinned to the approved `pull_request.head.sha`. `opened`, `reopened`, and `synchronize` are excluded, so pushing new commits never re-triggers the workflow. |
 | Any other `pull_request` event | **No** | Untrusted code never reaches the self-hosted runner. |
 
 Additional hardening in `gpu-e2e.yml`:
+- Protected GitHub Environment `gpu-ci-pr` with Required Reviewers (runner owner(s)) gates all PR runs on `ubuntu-latest` before any checkout occurs on the self-hosted Mac — label/triage permission alone cannot execute code on the runner host.
+- PR checkouts are pinned to the exact approved `pull_request.head.sha` and verified with `git rev-parse HEAD` before running any build or test command.
 - Minimal top-level `permissions: { contents: read }`.
 - `actions/checkout` pinned to a full commit SHA with `persist-credentials: false`.
 - Per-run isolated `PORT_AOT_DIR`, `PORT_CRASH_DIR`, and `TRANSLATOR_HOME` under `${{ runner.temp }}`.
-- Before applying `gpu-ci` to an external fork PR, maintainers must inspect both code changes and
-  any edits under `.github/workflows/`.
-- Keep the runner dedicated to CI under a non-admin macOS account with zero commercial game files,
-  personal credentials, or SSH keys in `$HOME`.
+- Prefer configuring the runner in `--ephemeral` mode (or inside a dedicated non-admin macOS account with zero commercial game files, personal credentials, or SSH keys in `$HOME`).
 
 ---
 
@@ -70,7 +69,11 @@ runs-on: [self-hosted, macOS, ARM64]
    ./svc.sh start
    ```
 5. Create the `gpu-ci` repository label in **Issues / Pull Requests → Labels** so maintainers can
-   trigger the workflow on reviewed pull requests.
+   request GPU CI on reviewed pull requests.
+6. Create the **`gpu-ci-pr`** protected Environment in **Settings → Environments → New environment**:
+   - Enable **Required reviewers** and add only the runner owner(s) trusted with the Mac host.
+   - Optionally restrict deployment branches or combine with `--ephemeral` runner registration so
+     each job runs on a clean runner registration.
 
 ---
 

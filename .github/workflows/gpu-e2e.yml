@@ -8,12 +8,14 @@ name: GPU, Audio & E2E (Apple Silicon)
 #   - Triggered ONLY on:
 #       1. `push` to `main` (already reviewed & merged),
 #       2. `workflow_dispatch` (manual maintainer invocation),
-#       3. `pull_request` `labeled` with the `gpu-ci` label (only repository
-#          maintainers/collaborators can apply labels; pushing new commits does
-#          NOT re-trigger this workflow until a maintainer re-reviews and
-#          re-applies the label).
+#       3. `pull_request` `labeled` with the `gpu-ci` label, which first passes
+#          through the `approve-pr-gpu` gate job protected by the `gpu-ci-pr`
+#          GitHub Environment (configured with runner-owner Required Reviewers)
+#          and binds approval to the exact `pull_request.head.sha` before any
+#          code executes on the self-hosted Mac.
 #   - Minimal permissions (`contents: read`) and `persist-credentials: false` on checkout.
-#   - See `docs/GPU_CI.md` for runner registration, required labels, and host setup.
+#   - See `docs/GPU_CI.md` for runner registration, `gpu-ci-pr` environment protection,
+#     required labels, and host setup.
 
 on:
   push:
@@ -41,22 +43,63 @@ env:
   MTL_DEBUG_LAYER: "1"
 
 jobs:
+  # Protected approval gate for pull requests: runs on a GitHub-hosted runner (never the
+  # self-hosted Mac) inside the `gpu-ci-pr` protected Environment so a runner owner must
+  # explicitly approve the exact `pull_request.head.sha` before the self-hosted job starts.
+  # This prevents accounts that only hold label/triage permissions from executing code on
+  # the self-hosted runner host.
+  approve-pr-gpu:
+    name: Approve PR head SHA for self-hosted GPU CI
+    runs-on: ubuntu-latest
+    environment: gpu-ci-pr
+    timeout-minutes: 5
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'gpu-ci'
+    outputs:
+      head_sha: ${{ steps.bind.outputs.head_sha }}
+    steps:
+      - name: Bind approval to reviewed PR head SHA
+        id: bind
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "Approved PR #${{ github.event.pull_request.number }} commit ${PR_HEAD_SHA} for self-hosted GPU CI"
+          echo "head_sha=${PR_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
   gpu-e2e:
     name: Apple Silicon GPU, audio & E2E (MTL_DEBUG_LAYER=1)
+    needs: [approve-pr-gpu]
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 90
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      github.event_name == 'workflow_dispatch' ||
-      (
-        github.event_name == 'pull_request' &&
-        github.event.action == 'labeled' &&
-        github.event.label.name == 'gpu-ci'
+      !cancelled() && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'pull_request' &&
+          needs.approve-pr-gpu.result == 'success' &&
+          needs.approve-pr-gpu.outputs.head_sha != '' &&
+          needs.approve-pr-gpu.outputs.head_sha == github.event.pull_request.head.sha
+        )
       )
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'pull_request' && needs.approve-pr-gpu.outputs.head_sha || github.sha }}
           persist-credentials: false
+
+      - name: Verify checked-out commit matches approved SHA
+        if: github.event_name == 'pull_request'
+        env:
+          APPROVED_SHA: ${{ needs.approve-pr-gpu.outputs.head_sha }}
+        run: |
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "$HEAD_SHA" != "$APPROVED_SHA" ]; then
+            echo "ERROR: checked-out commit $HEAD_SHA != approved SHA $APPROVED_SHA" >&2
+            exit 1
+          fi
 
       - name: Inspect Apple Silicon host, Metal toolchain, and optional dylibs
         id: host
