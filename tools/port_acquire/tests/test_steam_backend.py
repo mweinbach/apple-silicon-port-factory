@@ -160,6 +160,26 @@ class SteamVdfAndManifestParserTests(unittest.TestCase):
         self.assertEqual(len(parsed["files"]), 5)
         self.assertEqual(parsed["files"][0]["path"], "bin/x64/SampleGame.exe")
 
+        # DepotDownloader formats flags as lowercase hexadecimal (`:x`): 40 == 0x40 (Directory), a4 == 0xa4
+        hex_manifest = textwrap.dedent(
+            """\
+            Content Manifest for Depot 1091501
+
+            Manifest ID / date       : 8811223344556677889 / 11/26/2026 12:00:00
+            Total number of files    : 2
+            Total bytes on disk      : 100
+            Total bytes compressed   : 80
+
+                      Size Chunks File SHA                                 Flags Name
+                         0      0 0000000000000000000000000000000000000000    40 bin
+                       100      1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa    a4 bin\\tool.exe
+            """
+        )
+        parsed_hex = parse_depot_manifest_txt(hex_manifest)
+        self.assertEqual(len(parsed_hex["files"]), 2)
+        self.assertEqual(parsed_hex["files"][0]["flags"], 0x40)
+        self.assertEqual(parsed_hex["files"][1]["flags"], 0xA4)
+
         out = parse_depot_downloader_stdout(
             "Using app branch: 'beta'.\n"
             "Processing depot 1091501 - Sample Win64\n"
@@ -789,8 +809,9 @@ class SteamBackendTests(unittest.TestCase):
             Total bytes compressed   : {len(exe_bytes) + len(dll_bytes)}
 
                       Size Chunks File SHA                                 Flags Name
-                         0      0 0000000000000000000000000000000000000000    64 bin\\x64
-            {len(exe_bytes):14d}      1 {exe_sha1}     0 bin\\x64\\SampleGame.exe
+                         0      0 0000000000000000000000000000000000000000    40 bin
+                         0      0 0000000000000000000000000000000000000000    40 bin\\x64
+            {len(exe_bytes):14d}      1 {exe_sha1}   100 bin\\x64\\SampleGame.exe
             {len(dll_bytes):14d}      1 {dll_sha1}     0 bin\\x64\\steam_api64.dll
             """
         )
@@ -839,6 +860,85 @@ class SteamBackendTests(unittest.TestCase):
         self.assertTrue(rep_ver.repaired)
         self.assertEqual(exe_path.read_bytes(), exe_bytes)
         self.assertEqual(dll_path.read_bytes(), dll_bytes)
+
+    def test_verify_readonly_uses_last_depot_wins_for_overlapping_files(self) -> None:
+        base_bytes = b"BASE_DEPOT_EXE_V1"
+        override_bytes = b"OVERRIDE_DEPOT_EXE_V2_WINNING"
+        base_sha1 = hashlib.sha1(base_bytes).hexdigest()
+        override_sha1 = hashlib.sha1(override_bytes).hexdigest()
+
+        # Deliberately give the first depot a higher ID (1091502) and the winning override
+        # depot a lower ID (1091501) to prove stdout processing order is preserved rather
+        # than sorting manifest filenames lexicographically.
+        multi_dd = self.root / "multi-depot-dd"
+        multi_dd.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-multi")
+                    sys.exit(0)
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                if "-manifest-only" in argv:
+                    (dest / "manifest_1091502_111.txt").write_text(
+                        "Content Manifest for Depot 1091502\\n"
+                        "Manifest ID / date : 111 / 11/26/2026\\n"
+                        "Size Chunks File SHA Flags Name\\n"
+                        "0 0 0000000000000000000000000000000000000000 40 bin\\n"
+                        "{len(base_bytes)} 1 {base_sha1} 0 bin\\\\SampleGame.exe\\n",
+                        encoding="utf-8",
+                    )
+                    (dest / "manifest_1091501_222.txt").write_text(
+                        "Content Manifest for Depot 1091501\\n"
+                        "Manifest ID / date : 222 / 11/26/2026\\n"
+                        "Size Chunks File SHA Flags Name\\n"
+                        "{len(override_bytes)} 1 {override_sha1} 0 bin\\\\SampleGame.exe\\n",
+                        encoding="utf-8",
+                    )
+                    print("Using app branch: 'public'.")
+                    print("Processing depot 1091502 - Base Depot")
+                    print("Manifest 111 (11/26/2026 12:00:00)")
+                    print("Processing depot 1091501 - Override Depot")
+                    print("Manifest 222 (11/26/2026 12:00:00)")
+                    sys.exit(0)
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        multi_dd.chmod(multi_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=multi_dd)
+        dest = self.root / "games" / "MultiDepotGame"
+        (dest / "bin").mkdir(parents=True, exist_ok=True)
+        backend._save_installs(
+            {
+                "1091500": {
+                    "app_id": "1091500",
+                    "title": "Multi Depot Game",
+                    "account_name": "testplayer",
+                    "install_path": str(dest),
+                    "platform": "windows",
+                    "branch": "public",
+                }
+            }
+        )
+
+        # Winning (last-processed) depot's bytes pass verification cleanly
+        (dest / "bin" / "SampleGame.exe").write_bytes(override_bytes)
+        ok_ver = backend.verify("1091500", repair=False)
+        self.assertTrue(ok_ver.ok)
+        self.assertEqual(ok_ver.missing_files, [])
+        self.assertEqual(ok_ver.corrupted_files, [])
+
+        # Overridden (first-processed) depot's bytes are flagged as corrupted
+        (dest / "bin" / "SampleGame.exe").write_bytes(base_bytes)
+        bad_ver = backend.verify("1091500", repair=False)
+        self.assertFalse(bad_ver.ok)
+        self.assertEqual(bad_ver.corrupted_files, ["bin/SampleGame.exe"])
 
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):

@@ -300,8 +300,11 @@ _MANIFEST_ID_DATE_RE = re.compile(r"Manifest\s+ID\s*/\s*date\s*:\s*(\d+)(?:\s*/\
 _MANIFEST_NUM_FILES_RE = re.compile(r"Total\s+number\s+of\s+files\s*:\s*(\d+)", re.I)
 _MANIFEST_DISK_BYTES_RE = re.compile(r"Total\s+bytes\s+on\s+disk\s*:\s*(\d+)", re.I)
 _MANIFEST_COMP_BYTES_RE = re.compile(r"Total\s+bytes\s+compressed\s*:\s*(\d+)", re.I)
-# File rows: "<size> <chunks> <sha1_hex> <flags> <relative_path>"
-_MANIFEST_FILE_ROW_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+([0-9a-fA-F]{40})\s+(\d+)\s+(.+?)\s*$")
+# File rows: "<size> <chunks> <sha1_hex> <flags_hex> <relative_path>"
+# DepotDownloader formats `flags` as lowercase hex (`:x`, e.g. `40` for Directory = 0x40).
+_MANIFEST_FILE_ROW_RE = re.compile(
+    r"^\s*(\d+)\s+(\d+)\s+([0-9a-fA-F]{40})\s+([0-9a-fA-F]+)\s+(.+?)\s*$"
+)
 _MANIFEST_FNAME_RE = re.compile(r"manifest_(\d+)_(\d+)\.txt$", re.I)
 
 
@@ -351,7 +354,7 @@ def parse_depot_manifest_txt(text: str, *, filename: str = "") -> dict[str, Any]
                     "size_bytes": int(m.group(1)),
                     "chunks": int(m.group(2)),
                     "sha1": m.group(3).lower(),
-                    "flags": int(m.group(4)),
+                    "flags": int(m.group(4), 16),
                     "path": rel_path,
                 }
             )

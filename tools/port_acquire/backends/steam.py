@@ -571,8 +571,7 @@ class SteamBackend(StoreBackend):
             combined = proc.stdout + "\n" + proc.stderr
             stdout_info = parse_depot_downloader_stdout(combined)
 
-            depots: list[dict[str, Any]] = []
-            seen_ids: set[str] = set()
+            parsed_by_id: dict[str, dict[str, Any]] = {}
             for txt_file in sorted(Path(tmp_dir).rglob("manifest_*.txt")):
                 parsed = parse_depot_manifest_txt(
                     txt_file.read_text(encoding="utf-8", errors="ignore"),
@@ -580,17 +579,23 @@ class SteamBackend(StoreBackend):
                 )
                 did = parsed.get("depot_id")
                 if did:
-                    seen_ids.add(did)
-                    depots.append(parsed)
+                    parsed_by_id[did] = parsed
 
-            # Merge stdout depot names / any depot lines without a separate .txt file
-            stdout_by_id = {d["depot_id"]: d for d in stdout_info.get("depots", []) if d.get("depot_id")}
-            for dep in depots:
-                sd = stdout_by_id.get(dep["depot_id"])
-                if sd and sd.get("name"):
-                    dep["name"] = sd["name"]
-            for did, sd in stdout_by_id.items():
-                if did not in seen_ids:
+            # Preserve DepotDownloader's exact depot processing order (from stdout) so
+            # overlapping files across depots follow DepotDownloader's last-depot-wins order.
+            depots: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for sd in stdout_info.get("depots", []):
+                did = sd.get("depot_id")
+                if not did or did in seen_ids:
+                    continue
+                seen_ids.add(did)
+                if did in parsed_by_id:
+                    dep = parsed_by_id[did]
+                    if sd.get("name"):
+                        dep["name"] = sd["name"]
+                    depots.append(dep)
+                else:
                     depots.append(
                         {
                             "depot_id": did,
@@ -603,6 +608,12 @@ class SteamBackend(StoreBackend):
                             "files": [],
                         }
                     )
+            for did in sorted(
+                (k for k in parsed_by_id if k not in seen_ids),
+                key=lambda x: int(x) if x.isdigit() else 0,
+            ):
+                seen_ids.add(did)
+                depots.append(parsed_by_id[did])
 
             if not depots and proc.returncode != 0:
                 if allow_cache_fallback:
@@ -1696,12 +1707,13 @@ class SteamBackend(StoreBackend):
         install_path: Path,
         depots: list[dict[str, Any]],
     ) -> tuple[int, list[str], list[str]]:
-        """Check local files against depot manifest sizes and SHA-1 digests without writing to disk."""
+        """Check local files against depot manifest sizes and SHA-1 digests without writing to disk.
+
+        Overlapping relative paths across multiple depots follow DepotDownloader's
+        last-depot-wins precedence.
+        """
         install_root = install_path.resolve()
-        checked = 0
-        missing_files: list[str] = []
-        corrupted_files: list[str] = []
-        seen_paths: set[str] = set()
+        winning_files: dict[str, tuple[str, dict[str, Any]]] = {}
 
         for depot in depots:
             if not isinstance(depot, dict):
@@ -1710,57 +1722,62 @@ class SteamBackend(StoreBackend):
                 if not isinstance(entry, dict):
                     continue
                 flags = int(entry.get("flags") or 0)
-                # EDepotFileFlag.Directory (0x40 = 64)
-                if flags & 64:
+                # EDepotFileFlag.Directory (0x40)
+                if flags & 0x40:
                     continue
                 rel = str(entry.get("path") or "").replace("\\", "/").strip().lstrip("/")
-                if not rel or rel.endswith("/") or rel in seen_paths:
+                if not rel or rel.endswith("/"):
                     continue
-                seen_paths.add(rel)
-
                 rel_path = Path(rel)
                 if rel_path.is_absolute() or ".." in rel_path.parts:
                     continue
+                # Last-depot-wins (case-insensitive for Windows depot paths)
+                winning_files[rel.lower()] = (rel, entry)
 
-                target = install_path / rel_path
-                try:
-                    target.resolve().relative_to(install_root)
-                except (OSError, ValueError):
-                    checked += 1
-                    corrupted_files.append(rel)
-                    continue
+        checked = 0
+        missing_files: list[str] = []
+        corrupted_files: list[str] = []
 
+        for rel, entry in winning_files.values():
+            target = install_path / Path(rel)
+            try:
+                target.resolve().relative_to(install_root)
+            except (OSError, ValueError):
                 checked += 1
-                if not target.is_file():
-                    missing_files.append(rel)
-                    continue
+                corrupted_files.append(rel)
+                continue
 
-                expected_size = entry.get("size_bytes")
+            checked += 1
+            if not target.is_file():
+                missing_files.append(rel)
+                continue
+
+            expected_size = entry.get("size_bytes")
+            try:
+                actual_size = target.stat().st_size
+            except OSError:
+                corrupted_files.append(rel)
+                continue
+
+            if isinstance(expected_size, int) and actual_size != expected_size:
+                corrupted_files.append(rel)
+                continue
+
+            expected_sha1 = str(entry.get("sha1") or "").lower()
+            if len(expected_sha1) == 40 and expected_sha1 != "0" * 40:
+                digest = hashlib.sha1()
                 try:
-                    actual_size = target.stat().st_size
+                    with target.open("rb") as fh:
+                        while True:
+                            chunk = fh.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
                 except OSError:
                     corrupted_files.append(rel)
                     continue
-
-                if isinstance(expected_size, int) and actual_size != expected_size:
+                if digest.hexdigest() != expected_sha1:
                     corrupted_files.append(rel)
-                    continue
-
-                expected_sha1 = str(entry.get("sha1") or "").lower()
-                if len(expected_sha1) == 40 and expected_sha1 != "0" * 40:
-                    digest = hashlib.sha1()
-                    try:
-                        with target.open("rb") as fh:
-                            while True:
-                                chunk = fh.read(1024 * 1024)
-                                if not chunk:
-                                    break
-                                digest.update(chunk)
-                    except OSError:
-                        corrupted_files.append(rel)
-                        continue
-                    if digest.hexdigest() != expected_sha1:
-                        corrupted_files.append(rel)
 
         return checked, missing_files, corrupted_files
 
