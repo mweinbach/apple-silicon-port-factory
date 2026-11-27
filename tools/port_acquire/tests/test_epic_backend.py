@@ -25,6 +25,7 @@ from port_acquire.backend import (  # noqa: E402
     AppNotFoundError,
     AuthRequiredError,
     BackendUnavailableError,
+    CommandFailedError,
     DownloadOptions,
 )
 from port_acquire.backends.epic import EpicBackend  # noqa: E402
@@ -48,6 +49,8 @@ DEFAULT_STATE = {
     "account": "ExamplePlayer",
     "verify_fail": False,
     "verify_silent_zero": False,
+    "install_fail_zero": False,
+    "install_silent_zero": False,
     "omit_remote_version": False,
     "warn_on_stdout": False,
     "installed": {},
@@ -295,23 +298,29 @@ if cmd == "info":
 if cmd in ("install", "download", "update"):
     require_auth()
     app_name = rest[0]
+    if state.get("install_fail_zero"):
+        # Real Legendary catches downloader exceptions, logs Installation failed, and exits 0.
+        print("[cli] ERROR: Installation failed: simulated downloader exception", file=sys.stderr)
+        sys.exit(0)
+    if state.get("install_silent_zero"):
+        sys.exit(0)
     if "--repair" in rest:
         if app_name not in state["installed"]:
-            print(f"ERROR: {app_name} is not installed", file=sys.stderr)
-            sys.exit(1)
+            print(f'[cli] ERROR: Game "{app_name}" is not installed', file=sys.stderr)
+            sys.exit(0)
         state["verify_fail"] = False
         save_state(state)
-        print(f"Repaired {app_name}")
+        print("[cli] INFO: Finished installation process in 0.10 seconds.")
         sys.exit(0)
 
     if "--update-only" in rest:
         if app_name not in state["installed"]:
-            print(f"ERROR: {app_name} is not installed", file=sys.stderr)
-            sys.exit(1)
+            print(f'[cli] ERROR: Game "{app_name}" is not installed', file=sys.stderr)
+            sys.exit(0)
         new_ver = state.get("updates", {}).get(app_name, state["installed"][app_name]["version"])
         state["installed"][app_name]["version"] = new_ver
         save_state(state)
-        print(f"Updated {app_name} to {new_ver}")
+        print("[cli] INFO: Finished installation process in 0.10 seconds.")
         sys.exit(0)
 
     game = next((g for g in state["catalog"] if g["app_name"] == app_name), None)
@@ -365,6 +374,7 @@ if cmd in ("install", "download", "update"):
                     "is_dlc": True,
                 }
         save_state(state)
+    print("[cli] INFO: Finished installation process in 0.10 seconds.")
     sys.exit(0)
 
 if cmd == "eos-overlay":
@@ -374,6 +384,7 @@ if cmd == "eos-overlay":
         ov = Path(path)
         ov.mkdir(parents=True, exist_ok=True)
         (ov / "EOSOVH-Win64-Shipping.dll").write_bytes(b"MZ_MOCK")
+        print("[cli] INFO: Finished installation process in 0.05 seconds.")
     sys.exit(0)
 
 if cmd == "verify":
@@ -764,6 +775,63 @@ class TestEpicBackendMocked(unittest.TestCase):
         res = self.backend.verify("ArachnidTwo")
         self.assertFalse(res.ok)
         self.assertIn("without reporting verification completion", res.message)
+
+    def test_download_no_register_with_dlcs_downloads_each_dlc_explicitly(self) -> None:
+        dest = self.root / "games" / "NoRegisterWithDlcs"
+        proc = self._run_cli(
+            "download",
+            "ArachnidTwo",
+            "--dest",
+            str(dest),
+            "--platform",
+            "windows",
+            "--no-register",
+            "--with-dlcs",
+            "--json",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(
+            set(data["downloaded_dlcs"]),
+            {"ArachnidTwoPreorderDLC", "ArachnidTwoExpansion"},
+        )
+        # Base game + both DLC payloads landed in the same destination directory.
+        self.assertTrue((dest / "Spider-Man2.exe").is_file())
+        self.assertTrue((dest / "ArachnidTwoPreorderDLC.dat").is_file())
+        self.assertTrue((dest / "ArachnidTwoExpansion.dat").is_file())
+        self.assertTrue((dest / MANIFEST_FILENAME).is_file())
+
+    def test_download_fails_on_exit_zero_installation_failed_even_when_already_registered(self) -> None:
+        # First install cleanly so `ArachnidTwo` is already registered in installed.json.
+        dest1 = self.root / "games" / "InstalledFirst"
+        self.backend.download(DownloadOptions(app_id="ArachnidTwo", dest=dest1, platform="windows"))
+
+        # Now simulate Legendary catching a downloader error, logging `Installation failed`,
+        # and exiting 0 while the old registration still exists.
+        dest2 = self.root / "games" / "FailedRedownload"
+        self._patch_state(install_fail_zero=True)
+        proc = self._run_cli(
+            "download",
+            "ArachnidTwo",
+            "--dest",
+            str(dest2),
+            "--platform",
+            "windows",
+            "--json",
+        )
+        self.assertEqual(proc.returncode, 5)
+        err = json.loads(proc.stdout)
+        self.assertFalse(err["ok"])
+        self.assertEqual(err["error"]["code"], "command_failed")
+        self.assertFalse((dest2 / MANIFEST_FILENAME).exists())
+
+        # Also fail if Legendary exits 0 without confirming installation completion.
+        self._patch_state(install_fail_zero=False, install_silent_zero=True)
+        with self.assertRaises(CommandFailedError):
+            self.backend.download(
+                DownloadOptions(app_id="ArachnidTwo", dest=dest2, platform="windows")
+            )
 
 
 if __name__ == "__main__":

@@ -82,6 +82,28 @@ _VERIFY_SUCCESS_PATTERNS = (
     "all files verified",
 )
 
+_INSTALL_FAILURE_PATTERNS = (
+    "installation failed",
+    "download failed",
+    "failed to install",
+    "failed to download",
+    "aborting",
+    "[cli] error:",
+    "[dlm] error:",
+    "[core] error:",
+)
+
+_INSTALL_SUCCESS_PATTERNS = (
+    "finished installation process",
+    "finished downloading",
+    "download finished",
+    "installation finished",
+    "already up to date",
+    "is up to date",
+    "nothing to download",
+    "finished installing",
+)
+
 _ANTICHEAT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Easy Anti-Cheat (EAC)",
@@ -941,10 +963,65 @@ class EpicBackend(StoreBackend):
             manifest_files_checked=manifest_files is not None,
         )
 
+    def _assert_install_completed(
+        self,
+        proc: subprocess.CompletedProcess[str],
+        *,
+        app_id: str,
+        action: str,
+    ) -> None:
+        """Confirm Legendary actually completed an install/download/repair/update.
+
+        Real Legendary catches downloader exceptions, logs `Installation failed`, and
+        exits 0; treat exit code 0 without positive completion output (or with any error
+        banner) as a failure rather than silently returning success.
+        """
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        combined_lower = combined.lower()
+        sanitized = _sanitize_error_text(combined)
+
+        if any(pat in combined_lower for pat in _AUTH_ERROR_PATTERNS):
+            raise AuthRequiredError(
+                "Epic Games Store authentication required. Run `tools/port-acquire login --store epic` interactively.",
+                details={"backend_message": sanitized},
+            )
+        if any(pat in combined_lower for pat in _NOT_FOUND_PATTERNS):
+            raise AppNotFoundError(
+                f"app {app_id!r} not found or not installed: {sanitized}",
+                details={"returncode": proc.returncode},
+            )
+
+        has_error_line = any(
+            line.lstrip().lower().startswith("error:")
+            or any(pat in line.lower() for pat in _INSTALL_FAILURE_PATTERNS)
+            for line in combined.splitlines()
+        )
+        completed_ok = any(pat in combined_lower for pat in _INSTALL_SUCCESS_PATTERNS)
+
+        if proc.returncode != 0 or has_error_line or not completed_ok:
+            reason = sanitized or f"exit {proc.returncode} with no completion confirmation"
+            raise CommandFailedError(
+                f"legendary {action} for {app_id!r} did not complete cleanly: {reason}",
+                details={"returncode": proc.returncode},
+            )
+
     def download(self, options: DownloadOptions) -> DownloadResult:
         leg_plat = _platform_to_legendary(options.platform) or "Windows"
         dest = options.dest.expanduser().resolve()
         dest.mkdir(parents=True, exist_ok=True)
+
+        # Legendary's `--download-only` maps to `no_install=True`, which skips its built-in
+        # `--with-dlcs` branch. When both are requested, download the base game with
+        # `--skip-dlcs` and then download each owned DLC explicitly into `dest`.
+        explicit_dlcs_after_base: list[str] = []
+        if options.with_dlcs and options.no_register:
+            explicit_dlcs_after_base = [
+                d.app_id
+                for d in self.list_dlcs(options.app_id, platform=options.platform)
+                if d.owned
+            ]
+        elif not options.with_dlcs and options.dlcs:
+            explicit_dlcs_after_base = list(options.dlcs)
 
         cmd = [
             "-y",
@@ -956,7 +1033,7 @@ class EpicBackend(StoreBackend):
             str(dest),
             "--skip-sdl",
         ]
-        if options.with_dlcs:
+        if options.with_dlcs and not options.no_register:
             cmd.append("--with-dlcs")
         else:
             cmd.append("--skip-dlcs")
@@ -966,41 +1043,55 @@ class EpicBackend(StoreBackend):
             cmd.extend(["--max-workers", str(options.max_workers)])
         cmd.extend(options.extra_args)
 
-        self._run(cmd, check=True)
+        proc = self._run(cmd, check=False)
+        self._assert_install_completed(proc, app_id=options.app_id, action="download")
 
         downloaded_dlcs: list[str] = []
-        if not options.with_dlcs and options.dlcs:
-            for dlc_id in options.dlcs:
-                dlc_cmd = [
-                    "-y",
-                    "install",
-                    dlc_id,
-                    "--platform",
-                    leg_plat,
-                    "--base-path",
-                    str(dest),
-                    "--skip-dlcs",
-                    "--skip-sdl",
-                ]
-                if options.no_register:
-                    dlc_cmd.append("--download-only")
-                self._run(dlc_cmd, check=True)
-                downloaded_dlcs.append(dlc_id)
+        for dlc_id in explicit_dlcs_after_base:
+            dlc_cmd = [
+                "-y",
+                "install",
+                dlc_id,
+                "--platform",
+                leg_plat,
+                "--game-folder",
+                str(dest),
+                "--skip-dlcs",
+                "--skip-sdl",
+            ]
+            if options.no_register:
+                dlc_cmd.append("--download-only")
+            if options.max_workers is not None:
+                dlc_cmd.extend(["--max-workers", str(options.max_workers)])
+            dlc_proc = self._run(dlc_cmd, check=False)
+            self._assert_install_completed(dlc_proc, app_id=dlc_id, action="dlc download")
+            downloaded_dlcs.append(dlc_id)
 
         eos_overlay_path: str | None = None
         if options.with_eos_overlay:
             overlay_dir = dest / ".port-acquire" / "eos-overlay"
             overlay_dir.mkdir(parents=True, exist_ok=True)
-            self._run(["-y", "eos-overlay", "install", "--path", str(overlay_dir)], check=True)
+            ov_proc = self._run(
+                ["-y", "eos-overlay", "install", "--path", str(overlay_dir)],
+                check=False,
+            )
+            self._assert_install_completed(
+                ov_proc, app_id=f"{options.app_id}:eos-overlay", action="eos-overlay install"
+            )
             eos_overlay_path = str(overlay_dir)
 
         installed_map = self._installed_map()
         inst = installed_map.get(options.app_id)
+        if not options.no_register and inst is None:
+            raise CommandFailedError(
+                f"legendary install for {options.app_id!r} did not register an installed entry",
+                details={"app_id": options.app_id},
+            )
         install_path = str(inst["install_path"]) if inst and inst.get("install_path") else str(dest)
         title = str(inst.get("title") or options.app_id) if inst else options.app_id
         version = str(inst["version"]) if inst and inst.get("version") else None
 
-        if options.with_dlcs:
+        if options.with_dlcs and not options.no_register:
             for d_id, d_entry in installed_map.items():
                 if d_entry.get("is_dlc") and d_entry.get("install_path") == install_path:
                     downloaded_dlcs.append(d_id)
@@ -1019,19 +1110,17 @@ class EpicBackend(StoreBackend):
     def verify(self, app_id: str, *, repair: bool = False) -> VerifyResult:
         if repair:
             proc = self._run(["-y", "install", app_id, "--repair", "--skip-dlcs"], check=False)
-            combined = f"{proc.stdout}\n{proc.stderr}".strip()
-            combined_lower = combined.lower()
-            if any(pat in combined_lower for pat in _NOT_FOUND_PATTERNS):
-                raise AppNotFoundError(
-                    f"app {app_id!r} is not installed: {_sanitize_error_text(combined)}"
-                )
-            if proc.returncode != 0:
+            try:
+                self._assert_install_completed(proc, app_id=app_id, action="repair")
+            except (AppNotFoundError, AuthRequiredError):
+                raise
+            except CommandFailedError as exc:
                 return VerifyResult(
                     store=self.name,
                     app_id=app_id,
                     ok=False,
                     repaired=False,
-                    message=_sanitize_error_text(combined),
+                    message=str(exc),
                 )
             return VerifyResult(
                 store=self.name,
@@ -1156,7 +1245,8 @@ class EpicBackend(StoreBackend):
 
         cmd = ["-y", "install", app_id, "--update-only", "--skip-sdl"]
         cmd.append("--with-dlcs" if with_dlcs else "--skip-dlcs")
-        self._run(cmd, check=True)
+        upd_proc = self._run(cmd, check=False)
+        self._assert_install_completed(upd_proc, app_id=app_id, action="update")
 
         after = self._installed_map().get(app_id) or {}
         new_version = str(after.get("version") or remote_version or old_version or "") or None
