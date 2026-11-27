@@ -1857,14 +1857,20 @@ impl Backend for MetalBackend {
                         .get(&id)
                         .ok_or_else(|| format!("ExecuteCommandLists unknown list {id:#x}"))?;
                     if self.timing_armed
-                        && l.submitted_since_reset
                         && matches!(l.cl.kind, ListType::Direct | ListType::Compute | ListType::Copy)
                     {
-                        return Err(format!(
-                            "cannot benchmark repeated submission of closed command list {id:#x} \
-                             without Reset (re-executing baked timestamp writes would overwrite slots \
-                             and understate gpu_busy_ms)"
-                        ));
+                        if l.submitted_since_reset {
+                            return Err(format!(
+                                "cannot benchmark repeated submission of closed command list {id:#x} \
+                                 without Reset (re-executing baked timestamp writes would overwrite slots \
+                                 and understate gpu_busy_ms)"
+                            ));
+                        }
+                        if l.closed_ts_pair.is_none() {
+                            return Err(format!(
+                                "cannot benchmark command list {id:#x} recorded while GPU timing was disarmed"
+                            ));
+                        }
                     }
                 }
                 // Extract command lists in submission order, execute as one batch, then restore.

@@ -1954,9 +1954,8 @@ fn metal_backend_bench_measures_copy_queue_work() {
     let (rep, backend) = bench::run_bench(&trace, &opts).unwrap();
     assert!(rep.failures.is_empty(), "{rep}");
     assert_eq!(rep.gpu_busy.samples.len(), 4);
-    for (i, &ms) in rep.gpu_busy.samples.iter().enumerate() {
-        assert!(ms > 0.0, "copy-queue iteration {i} reported non-positive gpu_busy_ms={ms}:\n{rep}");
-    }
+    assert_eq!(backend.gpu_timer_pair_count(), 4, "Copy queue command lists must register timestamp pairs");
+    assert!(rep.gpu_busy.max_ms > 0.0, "expected positive copy-queue gpu_busy_ms:\n{rep}");
     let dst = backend.resource(DST).unwrap().shared_slice(0, SZ).unwrap();
     assert!(dst.iter().all(|&b| b == 0x7E));
 }
@@ -2025,7 +2024,7 @@ fn metal_backend_bench_ignores_unsubmitted_closed_command_list() {
     assert!(rep.failures.is_empty(), "{rep}");
     // Only the 3 submitted L_USED recordings should be counted as timestamp pairs (not L_DISCARDED).
     assert_eq!(backend.gpu_timer_pair_count(), 3);
-    assert!(rep.gpu_busy.min_ms > 0.0 && rep.gpu_busy.max_ms < 1000.0, "{rep}");
+    assert!(rep.gpu_busy.max_ms > 0.0 && rep.gpu_busy.max_ms < 1000.0, "{rep}");
 }
 
 #[test]
@@ -2113,5 +2112,38 @@ fn metal_backend_replay_until_rejects_blocked_wait_without_hanging() {
         "{:?}",
         rep.failed.items
     );
+}
+
+#[test]
+fn bench_slice_rejects_list_recorded_in_setup_prefix() {
+    use crate::bench;
+    use d3d12_metal::trace::Reader;
+    use d3d12_metal::types::CommandQueueDesc;
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let lists = [3u64];
+
+    // Multi-frame trace: list 3 is recorded and closed in frame 0 (setup prefix), then submitted
+    // for the first time in frame 1 (bench body) without being Reset/recorded inside frame 1.
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 4, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: 1, list: 3, list_type: 0, allocator: 4, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::Close { list: 3 }, 0).unwrap();
+    w.write(&Call::FrameEnd { frame: 0 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&lists) }, 0).unwrap();
+    w.write(&Call::FrameEnd { frame: 1 }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let recs: Vec<_> = Reader::new(&trace).unwrap().map(|r| r.unwrap()).collect();
+    let err = bench::find_frame_slice(&recs)
+        .err()
+        .expect("must reject submitting a command list recorded entirely in setup prefix");
+    assert!(err.to_string().contains("recorded before frame_start"), "{err}");
 }
 

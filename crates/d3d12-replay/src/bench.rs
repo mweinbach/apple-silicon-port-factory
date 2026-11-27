@@ -247,13 +247,32 @@ pub(crate) fn find_frame_slice(records: &[Record]) -> anyhow::Result<(usize, usi
 
     // Determine which command lists are used inside `records[frame_start..frame_end]` without
     // first being `Reset` inside the slice, so `prepare_bench_iteration` re-opens them cleanly.
+    // Also verify every list submitted via `ExecuteCommandLists` inside the frame was recorded
+    // and closed inside `[frame_start..frame_end]` (not pre-recorded during untimed setup).
     let mut reset_first: HashSet<u64> = HashSet::new();
+    let mut closed_in_frame: HashSet<u64> = HashSet::new();
     let mut needs_reopen: Vec<u64> = Vec::new();
     let mut seen_reopen: HashSet<u64> = HashSet::new();
     for r in &records[frame_start..frame_end] {
-        if let Call::Reset { list, .. } = r.call {
-            reset_first.insert(list);
-            continue;
+        match &r.call {
+            Call::Reset { list, .. } => {
+                reset_first.insert(*list);
+                closed_in_frame.remove(list);
+                continue;
+            }
+            Call::ExecuteCommandLists { lists, .. } => {
+                for list in lists.iter() {
+                    if !closed_in_frame.contains(&list) {
+                        anyhow::bail!(
+                            "cannot safely benchmark frame slice [{frame_start}..{frame_end}]: \
+                             command list {list:#x} submitted via ExecuteCommandLists was recorded \
+                             before frame_start"
+                        );
+                    }
+                }
+                continue;
+            }
+            _ => {}
         }
         if let Some(list) = record_list_id(&r.call) {
             if !reset_first.contains(&list) && seen_reopen.insert(list) {
@@ -265,6 +284,9 @@ pub(crate) fn find_frame_slice(records: &[Record]) -> anyhow::Result<(usize, usi
                     );
                 }
                 needs_reopen.push(list);
+            }
+            if matches!(r.call, Call::Close { .. }) {
+                closed_in_frame.insert(list);
             }
         }
     }
