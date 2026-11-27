@@ -378,6 +378,7 @@ fn g49_b_gfx_to_ps_overlap_v2_list_start_skips_readonly_srv_and_syncs_frag_writa
 
     let run_case = |enable_b: bool, legacy_rsplit: bool, slot_second_draw: u64| -> (u64, bool, bool, u64, u32) {
         let mut l = CommandList::new(ListType::Direct).unwrap();
+        l.opts.opt_queue_start_stage_exact = false;
         l.opts.opt_gfx_to_ps_overlap_v2 = enable_b;
         l.opts.opt_list_start_render_split = legacy_rsplit;
         l.opts.test_force_frag_buf_write = Some(!legacy_rsplit);

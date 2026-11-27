@@ -632,15 +632,20 @@ const RAS_LEN: usize = 4096;
 const RAS_BYTES: usize = RAS_LEN * 16;
 const _: () = assert!(RAS_BYTES == 1 << 16);
 
-/// Zero-spill inline fast-thunk kinds stored in bits `62..60` of `JEnt::fast` when
-/// bit 63 and bit 0 are both set (`fast = payload | (1 << 63) | (kind << 60) | sub_bit1 | 1`).
-/// Bit 59 is reserved as a transient scratch bit (`lookup_jmp` vs `lookup_call`) inside `stubs.rs`.
+/// Zero-spill inline fast-thunk kinds stored in bits `62..59` of `JEnt::fast` when
+/// bit 63 and bit 0 are both set (`fast = payload | (1 << 63) | (kind << 59) | sub_bit1 | 1`).
+/// Bit 58 is reserved as a transient scratch bit (`lookup_jmp` vs `lookup_call`) inside `stubs.rs`.
 pub(in crate::emu) const FAST_KIND_QPC: u64 = 0;
 pub(in crate::emu) const FAST_KIND_TIME_MS: u64 = 1;
 pub(in crate::emu) const FAST_KIND_ENTER_CS: u64 = 2;
 pub(in crate::emu) const FAST_KIND_LEAVE_CS: u64 = 3;
 pub(in crate::emu) const FAST_KIND_XINPUT: u64 = 4;
 pub(in crate::emu) const FAST_KIND_SWITCH_TO_THREAD: u64 = 5;
+pub(in crate::emu) const FAST_KIND_THREAD_ID: u64 = 6;
+pub(in crate::emu) const FAST_KIND_TLS: u64 = 7;
+pub(in crate::emu) const FAST_KIND_SRW_ACQ_EXCL: u64 = 8;
+pub(in crate::emu) const FAST_KIND_SRW_ACQ_SHARED: u64 = 9;
+pub(in crate::emu) const FAST_KIND_SRW_REL: u64 = 10;
 
 const FAST_PTR_FORBIDDEN_BITS: u64 = 0xFFFF_0000_0000_0003;
 
@@ -1562,7 +1567,7 @@ impl JitCache {
 
     /// Install a zero-spill inline fast-thunk entry (`FAST_KIND_*`) into the running thread's
     /// 2-way `table`:
-    /// `fast = payload | (1 << 63) | (kind << 60) | ((sub_bit1 as u64) << 1) | 1`,
+    /// `fast = payload | (1 << 63) | (kind << 59) | ((sub_bit1 as u64) << 1) | 1`,
     /// `code = 0`, `hits = NOJIT`.
     #[inline(always)]
     pub(in crate::emu) unsafe fn cache_fast_thunk(
@@ -1573,10 +1578,10 @@ impl JitCache {
         payload: usize,
     ) {
         let addr = payload as u64;
-        if table == 0 || kind > 7 || (addr & FAST_PTR_FORBIDDEN_BITS) != 0 {
+        if table == 0 || kind > 15 || (addr & FAST_PTR_FORBIDDEN_BITS) != 0 {
             return;
         }
-        let fast = addr | (1u64 << 63) | (kind << 60) | ((sub_bit1 as u64) << 1) | 1;
+        let fast = addr | (1u64 << 63) | (kind << 59) | ((sub_bit1 as u64) << 1) | 1;
         let b = jset_base(target);
         let base = (table as *mut JEnt).add(b);
         let e0 = &mut *base;

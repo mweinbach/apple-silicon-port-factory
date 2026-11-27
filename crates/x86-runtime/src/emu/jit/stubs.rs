@@ -8,6 +8,17 @@ use super::xmm::xmm_pin_enabled;
 use super::*;
 use crate::emu::mem;
 
+const _: () = assert!(win32_rt::teb::off::CLIENT_ID_THREAD == 0x48);
+const _: () = assert!(win32_rt::teb::off::LAST_ERROR == 0x68);
+const _: () = assert!(win32_rt::teb::off::TLS_SLOTS == 0x1480);
+const _: () = assert!(win32_rt::teb::off::TLS_EXPANSION_SLOTS == 0x1780);
+const _: () = assert!(win32_rt::teb::TLS_MINIMUM_AVAILABLE == 64);
+const _: () = assert!(win32_rt::teb::TLS_EXPANSION_SLOTS == 1024);
+const _: () = assert!(win32_rt::sync::SRW_WRITER == 1);
+const _: () = assert!(win32_rt::sync::SRW_PARKED == 2);
+const _: () = assert!(win32_rt::sync::SRW_WAITING_WRITER == 4);
+const _: () = assert!(win32_rt::sync::SRW_READER == 8);
+
 /// Explicit stub emission configuration, shared by dynamic JIT/AOT (`StubCfg::live`)
 /// and offline static Mach-O `.o` emission (`StubCfg::from_aot_knobs`).
 #[derive(Clone, Copy)]
@@ -158,19 +169,19 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     for i in 0..8 {
         a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
     }
-    let enter_reload = xpin.then(|| a.bl());
     if ras {
         a.ldr(64, XRAS, XCPU, OFF_RAS);
     }
-    // Pack `XBUD = (budget << 1) | (ymm_dirty != 0)` so VEX-128 / `vzeroupper` checks are a
-    // single register-only `tbnz x8, #0` while `sub x8, #(2*n)` and `tbnz x8, #63` keep exact
-    // budget semantics without touching bit 0.
+    // Pack `XBUD = (budget << 1) | (ymm_dirty != 0)` so VEX-128 / `vzeroupper` / `spill_xmm` /
+    // `reload_xmm` checks are a single register-only `tbz`/`tbnz x8, #0` while `sub x8, #(2*n)`
+    // and `tbnz x8, #63` keep exact budget semantics without touching bit 0.
     a.ldr(64, XBUD, XCPU, OFF_BUDGET);
     a.lsl_i(true, XBUD, XBUD, 1);
     a.ldr(16, XS, XCPU, OFF_YMM_DIRTY);
     a.addsub_ri(false, true, true, ZR, XS, 0, false); // cmp w17, #0
     a.cset(XS, NE);
     a.logic_rr(true, 1, XBUD, XBUD, XS, 0, 0); // orr x8, x8, x17
+    let enter_reload = xpin.then(|| a.bl());
     a.br(1);
 
     // exit (w0 = exit code; rip / target already stored)
@@ -200,13 +211,21 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     a.ret();
 
     // Shared XMM + pinned YMM_HI[0..7] spill/reload helpers (preserves all GPRs, q0..q7, and NZCV).
-    let (spill_xmm, reload_xmm) = if xpin {
+    // `spill_xmm` skips the 4 `stp q` of `v8..v15` when `XBUD` bit 0 == 0 (no dirty upper YMM lanes);
+    // `spill_xmm_full` (`exit` / `host_xfer`) always stores `v8..v15` so `Cpu::ymm_hi[0..7]` stays
+    // exact in memory after `clear_ymm_hi`.
+    // `reload_xmm` skips the 4 `ldp q` of `v8..v15` when `XBUD` bit 0 == 0 and instead re-zeros
+    // `v8..v15` via zero-cycle `movi #0` (AAPCS64 callees may clobber upper 64 bits of `q8..q15`).
+    let (spill_xmm, spill_xmm_full, reload_xmm) = if xpin {
         let sp_pos = a.pos;
-        for i in 0..8u32 {
-            a.stp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
-        }
+        let sp_skip_ymm = a.tbz(XBUD, 0);
+        let sp_full_pos = a.pos;
         for i in 0..4u32 {
             a.stp_q(8 + 2 * i, 9 + 2 * i, XCPU, (OFF_YMM_HI + 32 * i) as i32);
+        }
+        a.bind(sp_skip_ymm);
+        for i in 0..8u32 {
+            a.stp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
         }
         a.ret();
 
@@ -214,19 +233,25 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         for i in 0..8u32 {
             a.ldp_q(16 + 2 * i, 17 + 2 * i, XCPU, (OFF_XMM + 32 * i) as i32);
         }
+        let rl_zero_ymm = a.tbz(XBUD, 0);
         for i in 0..4u32 {
             a.ldp_q(8 + 2 * i, 9 + 2 * i, XCPU, (OFF_YMM_HI + 32 * i) as i32);
+        }
+        a.ret();
+        a.bind(rl_zero_ymm);
+        for r in 0..8u32 {
+            a.v_zero(8 + r);
         }
         a.ret();
         if let Some(f) = enter_reload {
             a.patch(f, rl_pos);
         }
         if let Some(f) = exit_spill {
-            a.patch(f, sp_pos);
+            a.patch(f, sp_full_pos);
         }
-        (Some(sp_pos), Some(rl_pos))
+        (Some(sp_pos), Some(sp_full_pos), Some(rl_pos))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Shared VEX-128 / `vzeroupper` lazy `Cpu::ymm_hi` zeroing stub: clears `ymm_hi[r]`
@@ -505,18 +530,25 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     a.movz(false, 0, EXIT_CALL as u32, 0);
     a.b_to(e);
 
-    // Fast path (`lookup_call`) for tagged `DF_PLAIN` (bit 0), pure-float-math (bits 0..1),
-    // and zero-spill inline fast thunks (bit 63 | kind<<60 | bit 0) cached in `table`.
+    // Fast path (`lookup_call` + `lookup_jmp`) for tagged `DF_PLAIN` (bit 0), pure-float-math
+    // (bits 0..1), and zero-spill inline fast thunks (bit 63 | kind<<59 | bit 0) cached in `table`.
+    // Bit 58 of `x1` is set transiently by `lookup_jmp` to distinguish tail jumps from calls.
+    let mut to_ras_miss: Vec<usize> = Vec::new();
+    let ptr_mask = enc_logic_imm(0x0000_FFFF_FFFF_FFFC, true).unwrap();
+    let align7 = enc_logic_imm(7, true).unwrap();
+    let jmp_bit58 = enc_logic_imm(1u64 << 58, true).unwrap();
+
     a.bind(is_plain);
     let is_inline_call = a.tbnz(1, 63);
-    a.logic_ri(true, 0, XA, 1, enc_logic_imm(!3u64, true).unwrap());
+    let plain_shared = a.pos;
+    a.logic_ri(true, 0, XA, 1, ptr_mask); // strip bits 63..48 (incl. bit 58) and bits 1..0
     a.addsub_ri(true, true, false, 31, 31, 96, false); // sub sp, sp, #96
     a.stp_x(8, 9, 31, 0);
     a.stp_x(10, 11, 31, 16);
     a.stp_x(12, 13, 31, 32);
     a.stp_x(14, 15, 31, 48);
     a.stp_x(30, T3, 31, 64);
-    a.str(64, 1, 31, 88); // preserve tagged host pointer (bit 1 = needs_xmm) across blr
+    a.str(64, 1, 31, 88); // preserve tagged host pointer (bit 1 = needs_xmm, bit 58 = is_jmp)
     let no_xmm_in = a.tbz(1, 1);
     if xpin {
         a.v_mov(0, 16);
@@ -543,7 +575,15 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     }
     a.ldp_x(4, 5, g(4), 0x20);
     a.ldp_x(6, 7, g(4), 0x30);
+    // Pure-integer `DF_PLAIN` callees (`needs_xmm == 0`, bit 1 == 0) skip `mrs fpcr` /
+    // `msr fpcr` completely; float-ABI & stdio callees (bit 1 == 1) use `call_with_host_fpcr`.
+    a.ldr(64, 9, 31, 88);
+    let fpcr_call = a.tbnz(9, 1);
+    a.blr(XA);
+    let plain_call_done = a.b();
+    a.bind(fpcr_call);
     a.call_with_host_fpcr(80);
+    a.bind(plain_call_done);
     a.ldp_x(8, 9, 31, 0);
     a.ldp_x(10, 11, 31, 16);
     a.ldp_x(12, 13, 31, 32);
@@ -577,6 +617,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.addsub_ri(true, false, false, 2, 2, 1, false);
         a.str(64, 2, XCPU, OFF_PLAINHITS);
     }
+    let plain_ret_jmp = a.tbnz(XS, 58);
     let call_bud_out = if ras {
         let bud_plain = bud.then(|| a.tbnz(XBUD, 63));
         a.ret();
@@ -596,82 +637,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.b_to(lr);
         None
     };
-
-    // Fast path (`lookup_jmp`) for tail jumps to tagged `DF_PLAIN` / pure-float-math /
-    // zero-spill inline fast-thunk host entries cached in `table`.
-    let mut to_ras_miss: Vec<usize> = Vec::new();
-    a.bind(is_plain_jmp);
-    let not_inline_jmp = a.tbz(1, 63);
-    a.logic_ri(true, 1, 1, 1, enc_logic_imm(1u64 << 59, true).unwrap()); // bit 59 = lookup_jmp
-    let is_inline_jmp = a.b();
-    a.bind(not_inline_jmp);
-    a.ldr_post(T3, g(4), 8); // pop guest return address; g(4) now points to Win64 shadow space
-    a.logic_ri(true, 0, XA, 1, enc_logic_imm(!3u64, true).unwrap());
-    a.addsub_ri(true, true, false, 31, 31, 96, false); // sub sp, sp, #96
-    a.stp_x(8, 9, 31, 0);
-    a.stp_x(10, 11, 31, 16);
-    a.stp_x(12, 13, 31, 32);
-    a.stp_x(14, 15, 31, 48);
-    a.stp_x(30, T3, 31, 64);
-    a.str(64, 1, 31, 88); // preserve tagged host pointer (bit 1 = needs_xmm) across blr
-    let no_xmm_in_jmp = a.tbz(1, 1);
-    if xpin {
-        a.v_mov(0, 16);
-        a.v_mov(1, 17);
-        a.v_mov(2, 18);
-        a.v_mov(3, 19);
-    } else {
-        a.ldp_q(0, 1, XCPU, OFF_XMM as i32);
-        a.ldp_q(2, 3, XCPU, (OFF_XMM + 32) as i32);
-    }
-    a.bind(no_xmm_in_jmp);
-    // AAPCS64 designates `v16..v31` as caller-saved (clobbered by NEON `memcpy`/`memset`/Rust),
-    // so pinned XMM registers must always be spilled before `blr` and reloaded afterward.
-    if let Some(sp_pos) = spill_xmm {
-        let sp_addr = a.addr_of(sp_pos);
-        a.bl_to(sp_addr);
-    }
-    if ras {
-        a.str(64, XRAS, XCPU, OFF_RAS);
-    }
-    for (j, gi) in [1u8, 2, 8, 9].into_iter().enumerate() {
-        a.mov_rr(true, j as u32, g(gi));
-    }
-    a.ldp_x(4, 5, g(4), 0x20);
-    a.ldp_x(6, 7, g(4), 0x30);
-    a.call_with_host_fpcr(80);
-    a.ldp_x(8, 9, 31, 0);
-    a.ldp_x(10, 11, 31, 16);
-    a.ldp_x(12, 13, 31, 32);
-    a.ldp_x(14, 15, 31, 48);
-    if let Some(rl_pos) = reload_xmm {
-        let rl_addr = a.addr_of(rl_pos);
-        a.bl_to(rl_addr);
-    }
-    // Only write `q0` back to guest `xmm0` for float-ABI (`needs_xmm`, bit 1 == 1) callees.
-    a.ldr(64, XS, 31, 88);
-    let no_xmm_out_jmp = a.tbz(XS, 1);
-    if xpin {
-        a.v_mov(16, 0);
-    } else {
-        a.str(128, 0, XCPU, OFF_XMM);
-    }
-    a.bind(no_xmm_out_jmp);
-    if ras {
-        a.ldr(64, XRAS, XCPU, OFF_RAS);
-    }
-    a.ldp_x(30, T3, 31, 64);
-    a.addsub_ri(true, false, false, 31, 31, 96, false); // add sp, sp, #96
-    a.mov_rr(true, g(0), 0);
-    if lb_on {
-        a.str(8, ZR, XCPU, OFF_LB);
-    }
-    #[cfg(test)]
-    if cfg.count_plain_hits {
-        a.ldr(64, 2, XCPU, OFF_PLAINHITS);
-        a.addsub_ri(true, false, false, 2, 2, 1, false);
-        a.str(64, 2, XCPU, OFF_PLAINHITS);
-    }
+    a.bind(plain_ret_jmp);
     a.mov_rr(true, 0, T3);
     if bud {
         let f = a.tbnz(XBUD, 63);
@@ -689,17 +655,23 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.b_to(lr);
     }
 
-    // Shared zero-spill inline fast-thunk dispatcher for both `lookup_call` (bit 59 == 0)
-    // and `lookup_jmp` (bit 59 == 1). Preserves `x0` (target VA), `x1` (tag + bit 59),
+    // Fast path (`lookup_jmp`) entry: tag bit 58 and share `is_inline_*` / `plain_shared`.
+    a.bind(is_plain_jmp);
+    a.logic_ri(true, 1, 1, 1, jmp_bit58); // bit 58 = lookup_jmp
+    let is_inline_jmp = a.tbnz(1, 63);
+    a.ldr_post(T3, g(4), 8); // pop guest return address; g(4) now points to Win64 shadow space
+    let to_plain = a.b();
+    a.patch(to_plain, plain_shared);
+
+    // Shared zero-spill inline fast-thunk dispatcher for both `lookup_call` (bit 58 == 0)
+    // and `lookup_jmp` (bit 58 == 1). Preserves `x0` (target VA), `x1` (tag + bit 58),
     // `T3` (return address for call), `x30` (landing pad for call), `g(1..15)`, and all XMMs.
     // Free scratch: `x2`, `XA`, `XS` (and `g(0)` as volatile Win64 return register).
     a.bind(is_inline_call);
     a.bind(is_inline_jmp);
     let mut to_inline_done: Vec<usize> = Vec::new();
     let mut to_inline_bail: Vec<usize> = Vec::new();
-    let ptr_mask = enc_logic_imm(0x0000_FFFF_FFFF_FFFC, true).unwrap();
-    let align7 = enc_logic_imm(7, true).unwrap();
-    a.ubfx(2, 1, 60, 3); // x2 = FAST_KIND_* (0..=5)
+    a.ubfx(2, 1, 59, 4); // x2 = FAST_KIND_* (0..=10)
 
     // Kinds 0 (QPC) & 1 (TIME_MS): shared `cntvct_el0` + Q64 scale read.
     a.addsub_ri(false, true, true, ZR, 2, 2, false); // cmp w2, #2
@@ -712,7 +684,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     a.ldr(64, XA, XA, 16); // x16 = offset
     a.umulh(2, 2, XS);
     a.addsub_rr(true, false, false, 2, 2, XA, 0); // x2 = interrupt_time_100ns
-    let is_time_ms = a.tbnz(1, 60);
+    let is_time_ms = a.tbnz(1, 59);
     // KIND_QPC (0): *lpPerformanceCount = x2; return TRUE.
     a.str(64, 2, g(1), 0);
     a.movz(false, g(0), 1, 0);
@@ -838,7 +810,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     // bails to `SwitchToThread()` -> `libc::sched_yield()` returning TRUE).
     a.bind(not_xinput);
     a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_SWITCH_TO_THREAD as u32, false);
-    to_inline_bail.push(a.bcond(NE));
+    let not_switch = a.bcond(NE);
     a.ldr(32, 2, XCPU, OFF_SWITCH_YIELD);
     a.addsub_ri(false, false, false, 2, 2, 1, false);
     a.str(32, 2, XCPU, OFF_SWITCH_YIELD);
@@ -846,8 +818,128 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     to_inline_bail.push(a.bcond(EQ));
     a.isb();
     a.movz(false, g(0), 0, 0); // FALSE (no OS context switch occurred)
+    to_inline_done.push(a.b());
 
-    // Shared fast-path return epilogue (`lookup_call` vs `lookup_jmp` via bit 59 of x1).
+    // Kind 6: GetCurrentThreadId / _Thrd_id (bit 1 == 0) & GetLastError (bit 1 == 1).
+    a.bind(not_switch);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_THREAD_ID as u32, false);
+    let not_thread_id = a.bcond(NE);
+    a.ldr(64, XA, XCPU, OFF_TEB);
+    to_inline_bail.push(a.cbz(true, XA));
+    let is_last_err = a.tbnz(1, 1);
+    a.ldr(32, XS, XA, 0x48); // TEB.ClientId.UniqueThread (zero-extended)
+    to_inline_bail.push(a.cbz(false, XS));
+    a.mov_rr(false, g(0), XS);
+    to_inline_done.push(a.b());
+    a.bind(is_last_err);
+    a.ldr(32, g(0), XA, 0x68); // TEB.LastErrorValue (zero-extended)
+    to_inline_done.push(a.b());
+
+    // Kind 7: TlsGetValue (bit 1 == 0) & TlsSetValue (bit 1 == 1).
+    // `w_g1` = `i: u32`, `g(2)` = `v: *mut c_void` (for TlsSetValue).
+    a.bind(not_thread_id);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_TLS as u32, false);
+    let not_tls = a.bcond(NE);
+    a.ldr(64, XA, XCPU, OFF_TEB);
+    to_inline_bail.push(a.cbz(true, XA));
+    a.mov_rr(false, 2, g(1)); // zero-extend u32 slot index into x2
+    a.addsub_ri(false, true, true, ZR, 2, 64, false); // cmp w2, #64
+    let tls_exp = a.bcond(HS);
+    a.addsub_rr(true, false, false, XS, XA, 2, 3); // x17 = TEB + i*8
+    let tls_set_low = a.tbnz(1, 1);
+    a.str(32, ZR, XA, 0x68); // TEB.LastErrorValue = 0
+    a.ldr(64, g(0), XS, 0x1480); // TEB.TlsSlots[i]
+    to_inline_done.push(a.b());
+    a.bind(tls_set_low);
+    a.str(64, g(2), XS, 0x1480); // TEB.TlsSlots[i] = v
+    a.movz(false, g(0), 1, 0); // TRUE
+    to_inline_done.push(a.b());
+    a.bind(tls_exp);
+    a.addsub_ri(false, true, false, 2, 2, 64, false); // w2 = i - 64 (zero-extended)
+    a.addsub_ri(false, true, true, ZR, 2, 1024, false); // cmp w2, #1024
+    to_inline_bail.push(a.bcond(HS));
+    a.ldr(64, XS, XA, 0x1780); // TEB.TlsExpansionSlots
+    to_inline_bail.push(a.cbz(true, XS));
+    a.addsub_rr(true, false, false, XS, XS, 2, 3); // &exp[i - 64]
+    let tls_set_exp = a.tbnz(1, 1);
+    a.str(32, ZR, XA, 0x68); // TEB.LastErrorValue = 0
+    a.ldr(64, g(0), XS, 0);
+    to_inline_done.push(a.b());
+    a.bind(tls_set_exp);
+    a.str(64, g(2), XS, 0);
+    a.movz(false, g(0), 1, 0); // TRUE
+    to_inline_done.push(a.b());
+
+    // Kind 8: AcquireSRWLockExclusive (bit 1 == 0) & TryAcquireSRWLockExclusive (bit 1 == 1).
+    a.bind(not_tls);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_SRW_ACQ_EXCL as u32, false);
+    let not_srw_acq_excl = a.bcond(NE);
+    to_inline_bail.push(a.cbz(true, g(1)));
+    a.logic_ri(true, 3, ZR, g(1), align7);
+    to_inline_bail.push(a.bcond(NE));
+    a.movz(true, 2, 0, 0); // expected = 0
+    a.movz(true, XS, 1, 0); // desired = SRW_WRITER (1)
+    a.casa(64, 2, XS, g(1)); // Acquire CAS 0 -> 1
+    let srw_excl_miss = a.cbnz(true, 2);
+    a.movz(false, g(0), 1, 0); // TRUE (for TryAcquire; ignored by void Acquire)
+    to_inline_done.push(a.b());
+    a.bind(srw_excl_miss);
+    to_inline_bail.push(a.tbz(1, 1)); // AcquireSRWLockExclusive -> slow spin/park
+    a.logic_ri(true, 3, ZR, 2, enc_logic_imm(!6u64, true).unwrap()); // (s & (WRITER|READERS)) != 0?
+    to_inline_bail.push(a.bcond(EQ)); // parked-only -> let slow CAS s -> s|1
+    a.movz(false, g(0), 0, 0); // TryAcquireSRWLockExclusive -> FALSE
+    to_inline_done.push(a.b());
+
+    // Kind 9: AcquireSRWLockShared (bit 1 == 0) & TryAcquireSRWLockShared (bit 1 == 1).
+    a.bind(not_srw_acq_excl);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_SRW_ACQ_SHARED as u32, false);
+    let not_srw_acq_sh = a.bcond(NE);
+    to_inline_bail.push(a.cbz(true, g(1)));
+    a.logic_ri(true, 3, ZR, g(1), align7);
+    to_inline_bail.push(a.bcond(NE));
+    a.ldr(64, 2, g(1), 0); // s = load(Relaxed)
+    let srw_sh_busy0 = a.tbnz(2, 0); // SRW_WRITER
+    let srw_sh_busy1 = a.tbnz(2, 2); // SRW_WAITING_WRITER
+    a.addsub_ri(true, false, false, XS, 2, 8, false); // desired = s + SRW_READER
+    a.mov_rr(true, XA, 2); // save expected
+    a.casa(64, 2, XS, g(1)); // Acquire CAS s -> s + 8
+    a.addsub_rr(true, true, true, ZR, 2, XA, 0); // cmp old, expected
+    to_inline_bail.push(a.bcond(NE));
+    a.movz(false, g(0), 1, 0); // TRUE
+    to_inline_done.push(a.b());
+    a.bind(srw_sh_busy0);
+    a.bind(srw_sh_busy1);
+    to_inline_bail.push(a.tbz(1, 1)); // AcquireSRWLockShared -> slow spin/park
+    a.movz(false, g(0), 0, 0); // TryAcquireSRWLockShared -> FALSE
+    to_inline_done.push(a.b());
+
+    // Kind 10: ReleaseSRWLockExclusive (bit 1 == 0) & ReleaseSRWLockShared (bit 1 == 1).
+    a.bind(not_srw_acq_sh);
+    a.addsub_ri(false, true, true, ZR, 2, FAST_KIND_SRW_REL as u32, false);
+    to_inline_bail.push(a.bcond(NE));
+    to_inline_bail.push(a.cbz(true, g(1)));
+    a.logic_ri(true, 3, ZR, g(1), align7);
+    to_inline_bail.push(a.bcond(NE));
+    let srw_rel_sh = a.tbnz(1, 1);
+    // ReleaseSRWLockExclusive: Release CAS 1 -> 0 (untouched when parked/waiting).
+    a.movz(true, 2, 1, 0);
+    a.casl(64, 2, ZR, g(1));
+    a.addsub_ri(true, true, true, ZR, 2, 1, false);
+    to_inline_bail.push(a.bcond(NE));
+    to_inline_done.push(a.b());
+    // ReleaseSRWLockShared: if (s & 7) == 0 && s != 0, Release CAS s -> s - 8.
+    a.bind(srw_rel_sh);
+    a.ldr(64, 2, g(1), 0);
+    to_inline_bail.push(a.cbz(true, 2));
+    a.logic_ri(true, 3, ZR, 2, align7);
+    to_inline_bail.push(a.bcond(NE));
+    a.addsub_ri(true, true, false, XS, 2, 8, false);
+    a.mov_rr(true, XA, 2);
+    a.casl(64, 2, XS, g(1));
+    a.addsub_rr(true, true, true, ZR, 2, XA, 0);
+    to_inline_bail.push(a.bcond(NE));
+
+    // Shared fast-path return epilogue (`lookup_call` vs `lookup_jmp` via bit 58 of x1).
     let inline_fast_done = a.pos;
     for f in to_inline_done {
         a.patch(f, inline_fast_done);
@@ -861,7 +953,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.addsub_ri(true, false, false, 2, 2, 1, false);
         a.str(64, 2, XCPU, OFF_PLAINHITS);
     }
-    let inline_ret_jmp = a.tbnz(1, 59);
+    let inline_ret_jmp = a.tbnz(1, 58);
     if ras {
         if let Some(out) = call_bud_out {
             let f = a.tbnz(XBUD, 63);
@@ -896,7 +988,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     for f in to_inline_bail {
         a.patch(f, inline_fast_bail);
     }
-    let bail_to_jmp = a.tbnz(1, 59);
+    let bail_to_jmp = a.tbnz(1, 58);
     a.patch(bail_to_jmp, jmp_slow);
     let bail_to_call = a.b();
     a.patch(bail_to_call, call_slow);
@@ -910,7 +1002,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         for i in 0..8 {
             a.stp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
         }
-        if let Some(sp_pos) = spill_xmm {
+        if let Some(sp_pos) = spill_xmm_full {
             let sp_addr = a.addr_of(sp_pos);
             a.bl_to(sp_addr);
         }
@@ -936,10 +1028,6 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         for i in 0..8 {
             a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
         }
-        if let Some(rl_pos) = reload_xmm {
-            let rl_addr = a.addr_of(rl_pos);
-            a.bl_to(rl_addr);
-        }
         if ras {
             a.ldr(64, XRAS, XCPU, OFF_RAS);
         }
@@ -949,6 +1037,10 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
         a.addsub_ri(false, true, true, ZR, XS, 0, false);
         a.cset(XS, NE);
         a.logic_rr(true, 1, XBUD, XBUD, XS, 0, 0);
+        if let Some(rl_pos) = reload_xmm {
+            let rl_addr = a.addr_of(rl_pos);
+            a.bl_to(rl_addr);
+        }
         a.ldr(64, 0, XCPU, OFF_RIP);
         let lr = a.addr_of(lookup_rip);
         a.b_to(lr);

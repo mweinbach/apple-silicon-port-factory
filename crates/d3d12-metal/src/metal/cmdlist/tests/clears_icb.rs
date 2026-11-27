@@ -2616,7 +2616,10 @@ fn g48_defaults_promote_cs_to_ps_overlap_v2_and_keep_other_knobs_off() {
     assert!(!l.opts.opt_cs_to_ps_overlap);
     assert!(!l.opts.opt_gfx_to_ps_overlap);
     assert!(!l.opts.opt_clear_isolate_coalesce);
-    assert!(!l.opts.opt_queue_start_stage_exact);
+    assert!(
+        l.opts.opt_queue_start_stage_exact,
+        "PORT_QUEUE_START_STAGE_EXACT promoted to Default-ON"
+    );
 }
 
 #[test]

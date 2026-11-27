@@ -1629,6 +1629,16 @@ fn classify_fast_thunk(h: usize) -> Option<(u64, bool, usize)> {
         xinput: [usize; 2],
         xinput_ex: [usize; 2],
         switch_thread: [usize; 4],
+        thread_id: [usize; 5],
+        last_error: [usize; 3],
+        tls_get: [usize; 3],
+        tls_set: [usize; 3],
+        srw_acq_excl: [usize; 5],
+        srw_try_excl: [usize; 3],
+        srw_acq_sh: [usize; 5],
+        srw_try_sh: [usize; 3],
+        srw_rel_excl: [usize; 5],
+        srw_rel_sh: [usize; 5],
     }
     static TABLE: std::sync::OnceLock<FastThunkTable> = std::sync::OnceLock::new();
     let t = TABLE.get_or_init(|| {
@@ -1676,6 +1686,66 @@ fn classify_fast_thunk(h: usize) -> Option<(u64, bool, usize)> {
                 lk("kernel32.dll", "SwitchToThread"),
                 lk("msvcp140.dll", "_Thrd_yield"),
             ],
+            thread_id: [
+                win32_rt::kernel32::threads::GetCurrentThreadId as *const () as usize,
+                win32_rt::misc::msvcp140::_Thrd_id as *const () as usize,
+                lk("kernel32.dll", "GetCurrentThreadId"),
+                lk("kernelbase.dll", "GetCurrentThreadId"),
+                lk("msvcp140.dll", "_Thrd_id"),
+            ],
+            last_error: [
+                win32_rt::kernel32::process::GetLastError as *const () as usize,
+                lk("kernel32.dll", "GetLastError"),
+                lk("kernelbase.dll", "GetLastError"),
+            ],
+            tls_get: [
+                win32_rt::kernel32::threads::TlsGetValue as *const () as usize,
+                lk("kernel32.dll", "TlsGetValue"),
+                lk("kernelbase.dll", "TlsGetValue"),
+            ],
+            tls_set: [
+                win32_rt::kernel32::threads::TlsSetValue as *const () as usize,
+                lk("kernel32.dll", "TlsSetValue"),
+                lk("kernelbase.dll", "TlsSetValue"),
+            ],
+            srw_acq_excl: [
+                win32_rt::sync::AcquireSRWLockExclusive as *const () as usize,
+                win32_rt::ntdll::RtlAcquireSRWLockExclusive as *const () as usize,
+                lk("kernel32.dll", "AcquireSRWLockExclusive"),
+                lk("kernelbase.dll", "AcquireSRWLockExclusive"),
+                lk("ntdll.dll", "RtlAcquireSRWLockExclusive"),
+            ],
+            srw_try_excl: [
+                win32_rt::sync::TryAcquireSRWLockExclusive as *const () as usize,
+                lk("kernel32.dll", "TryAcquireSRWLockExclusive"),
+                lk("kernelbase.dll", "TryAcquireSRWLockExclusive"),
+            ],
+            srw_acq_sh: [
+                win32_rt::sync::AcquireSRWLockShared as *const () as usize,
+                win32_rt::ntdll::RtlAcquireSRWLockShared as *const () as usize,
+                lk("kernel32.dll", "AcquireSRWLockShared"),
+                lk("kernelbase.dll", "AcquireSRWLockShared"),
+                lk("ntdll.dll", "RtlAcquireSRWLockShared"),
+            ],
+            srw_try_sh: [
+                win32_rt::sync::TryAcquireSRWLockShared as *const () as usize,
+                lk("kernel32.dll", "TryAcquireSRWLockShared"),
+                lk("kernelbase.dll", "TryAcquireSRWLockShared"),
+            ],
+            srw_rel_excl: [
+                win32_rt::sync::ReleaseSRWLockExclusive as *const () as usize,
+                win32_rt::ntdll::RtlReleaseSRWLockExclusive as *const () as usize,
+                lk("kernel32.dll", "ReleaseSRWLockExclusive"),
+                lk("kernelbase.dll", "ReleaseSRWLockExclusive"),
+                lk("ntdll.dll", "RtlReleaseSRWLockExclusive"),
+            ],
+            srw_rel_sh: [
+                win32_rt::sync::ReleaseSRWLockShared as *const () as usize,
+                win32_rt::ntdll::RtlReleaseSRWLockShared as *const () as usize,
+                lk("kernel32.dll", "ReleaseSRWLockShared"),
+                lk("kernelbase.dll", "ReleaseSRWLockShared"),
+                lk("ntdll.dll", "RtlReleaseSRWLockShared"),
+            ],
         }
     });
     if t.qpc.contains(&h) {
@@ -1709,6 +1779,36 @@ fn classify_fast_thunk(h: usize) -> Option<(u64, bool, usize)> {
     }
     if t.switch_thread.contains(&h) {
         return Some((jit::FAST_KIND_SWITCH_TO_THREAD, false, 0));
+    }
+    if t.thread_id.contains(&h) {
+        return Some((jit::FAST_KIND_THREAD_ID, false, 0));
+    }
+    if t.last_error.contains(&h) {
+        return Some((jit::FAST_KIND_THREAD_ID, true, 0));
+    }
+    if t.tls_get.contains(&h) {
+        return Some((jit::FAST_KIND_TLS, false, 0));
+    }
+    if t.tls_set.contains(&h) {
+        return Some((jit::FAST_KIND_TLS, true, 0));
+    }
+    if t.srw_acq_excl.contains(&h) {
+        return Some((jit::FAST_KIND_SRW_ACQ_EXCL, false, 0));
+    }
+    if t.srw_try_excl.contains(&h) {
+        return Some((jit::FAST_KIND_SRW_ACQ_EXCL, true, 0));
+    }
+    if t.srw_acq_sh.contains(&h) {
+        return Some((jit::FAST_KIND_SRW_ACQ_SHARED, false, 0));
+    }
+    if t.srw_try_sh.contains(&h) {
+        return Some((jit::FAST_KIND_SRW_ACQ_SHARED, true, 0));
+    }
+    if t.srw_rel_excl.contains(&h) {
+        return Some((jit::FAST_KIND_SRW_REL, false, 0));
+    }
+    if t.srw_rel_sh.contains(&h) {
+        return Some((jit::FAST_KIND_SRW_REL, true, 0));
     }
     None
 }

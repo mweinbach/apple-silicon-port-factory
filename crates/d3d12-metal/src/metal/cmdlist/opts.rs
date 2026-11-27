@@ -202,7 +202,11 @@ opt_default_off!(pub(crate) opt_cs_to_ps_overlap_env, "AW2_CS_TO_PS_OVERLAP");
 opt_default_on!(pub(crate) opt_cs_to_ps_overlap_v2_env, "AW2_CS_TO_PS_OVERLAP_V2");
 opt_default_off!(pub(crate) opt_gfx_to_ps_overlap_env, "AW2_GFX_TO_PS_OVERLAP");
 opt_default_off!(pub(crate) opt_clear_isolate_coalesce_env, "AW2_CLEAR_ISOLATE_COALESCE");
-opt_default_off!(pub(crate) opt_queue_start_stage_exact_env, "AW2_QUEUE_START_STAGE_EXACT");
+opt_dual_default_on!(
+    pub(crate) opt_queue_start_stage_exact_env,
+    "PORT_QUEUE_START_STAGE_EXACT",
+    "AW2_QUEUE_START_STAGE_EXACT"
+);
 opt_default_off!(pub(crate) opt_ps_to_cs_overlap_env, "AW2_PS_TO_CS_OVERLAP");
 opt_default_off!(pub(crate) opt_gfx_to_ps_overlap_v2_env, "AW2_GFX_TO_PS_OVERLAP_V2");
 opt_default_off!(pub(crate) opt_clear_zero_qb_coalesce_env, "AW2_CLEAR_ZERO_QB_COALESCE");

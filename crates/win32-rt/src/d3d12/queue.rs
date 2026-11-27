@@ -84,12 +84,51 @@ pub unsafe fn create(desc: *const CommandQueueDesc, riid: *const Guid, out: *mut
 }
 
 unsafe extern "win64" fn execute_command_lists(this: PQ, n: u32, lists: *const *mut c_void) {
+    const INLINE_CAP: usize = 8;
     crate::shadow::guard_host("d3d12 ExecuteCommandLists");
     super::tr::sync_uploads();
     tr!(
         let ids: Vec<u64> = (0..n as usize).map(|i| *lists.add(i) as u64).collect();
         Call::ExecuteCommandLists { queue: this as u64, lists: U64s::from_slice(&ids) }
     );
+    let q = Obj::get(this).q.clone();
+    let t_ecl = d3d12_metal::metal::queue::capture_submit_timestamp();
+    if (n as usize) <= INLINE_CAP {
+        let mut inline: [cmdlist::PL; INLINE_CAP] = [std::ptr::null_mut(); INLINE_CAP];
+        let mut len = 0usize;
+        for i in 0..n as usize {
+            let p = *lists.add(i);
+            let Some(l) = Obj::<cmdlist::CommandList>::from_iface(p) else {
+                log::error!(target: "d3d", "ExecuteCommandLists: list {i} ({p:?}) is not one of ours; skipped");
+                continue;
+            };
+            inline[len] = l;
+            len += 1;
+        }
+        crate::hitch::queue_op(crate::hitch::QOP_ECL_CALL, q.kind as u32, len as u64, 0);
+        if !cs::enabled() {
+            submit_lists(&q, &inline[..len], t_ecl);
+            return;
+        }
+        // The lists' recorded commands were handed to the CS thread at Close;
+        // submission follows them in order. Lists stay alive until submitted.
+        let mut lp = [cs::SendPtr(std::ptr::null::<Obj<cmdlist::CommandList>>()); INLINE_CAP];
+        for i in 0..len {
+            Obj::add_ref(inline[i]);
+            lp[i] = cs::SendPtr(inline[i] as *const _);
+        }
+        cs::submit(move || {
+            let mut ls: [cmdlist::PL; INLINE_CAP] = [std::ptr::null_mut(); INLINE_CAP];
+            for i in 0..len {
+                ls[i] = lp[i].get() as cmdlist::PL;
+            }
+            submit_lists(&q, &ls[..len], t_ecl);
+            for &l in &ls[..len] {
+                Obj::release(l);
+            }
+        });
+        return;
+    }
     let mut ls: Vec<cmdlist::PL> = Vec::with_capacity(n as usize);
     for i in 0..n as usize {
         let p = *lists.add(i);
@@ -99,9 +138,7 @@ unsafe extern "win64" fn execute_command_lists(this: PQ, n: u32, lists: *const *
         };
         ls.push(l);
     }
-    let q = Obj::get(this).q.clone();
     crate::hitch::queue_op(crate::hitch::QOP_ECL_CALL, q.kind as u32, ls.len() as u64, 0);
-    let t_ecl = d3d12_metal::metal::queue::capture_submit_timestamp();
     if !cs::enabled() {
         submit_lists(&q, &ls, t_ecl);
         return;
@@ -123,11 +160,14 @@ unsafe extern "win64" fn execute_command_lists(this: PQ, n: u32, lists: *const *
 
 unsafe fn submit_lists(q: &Queue, ls: &[cmdlist::PL], t_ecl: u64) {
     let n = ls.len();
-    let mut guards: Vec<_> = ls.iter().map(|&l| Obj::get(l).state.lock().unwrap()).collect();
-    let mut lists: Vec<&mut d3d12_metal::metal::cmdlist::CommandList> =
-        guards.iter_mut().map(|g| &mut g.l).collect();
-    let scope = crate::hitch::Scope::enter(crate::hitch::ActKind::CmdSubmit, lists.len() as u64);
-    let res = q.execute_command_lists_at(&mut lists, t_ecl);
+    let scope = crate::hitch::Scope::enter(crate::hitch::ActKind::CmdSubmit, n as u64);
+    let mut batch = q.begin_prepare(t_ecl);
+    for (i, &l) in ls.iter().enumerate() {
+        let mut g = Obj::get(l).state.lock().unwrap();
+        q.prepare_list(&mut batch, &mut g.l, i);
+        // Release each `CommandList` lock immediately before committing to Metal.
+    }
+    let res = q.submit_prepared(batch);
     let elapsed_ns = scope.elapsed_ns();
     drop(scope);
     crate::hitch::record_cmd_submit(res.submitted_cbs as u64, elapsed_ns);

@@ -794,17 +794,7 @@ fn is_plain_builtin(h: usize) -> bool {
             ),
             (
                 &["ucrtbase.dll", "api-ms-win-crt-stdio-l1-1-0.dll", "msvcrt.dll"],
-                &[
-                    "__acrt_iob_func",
-                    "__stdio_common_vsprintf",
-                    "__stdio_common_vswprintf",
-                    "__stdio_common_vsprintf_s",
-                    "__stdio_common_vswprintf_s",
-                    "__stdio_common_vsnprintf_s",
-                    "__stdio_common_vsnwprintf_s",
-                    "__stdio_common_vsscanf",
-                    "__stdio_common_vswscanf",
-                ],
+                &["__acrt_iob_func"],
             ),
             (
                 &["kernel32.dll", "kernelbase.dll"],
@@ -866,8 +856,9 @@ fn is_plain_builtin(h: usize) -> bool {
     table.binary_search(&h).is_ok()
 }
 
-/// Pure floating-point leaf builtins (`DF_PLAIN | DF_PLAIN_XMM`): `<= 8` GPR args + `xmm0..3`,
-/// returns `(rax, xmm0)`, never calls guest code or raises SEH.
+/// Pure floating-point (and FP-formatting stdio) leaf builtins (`DF_PLAIN | DF_PLAIN_XMM`):
+/// `<= 8` GPR args + `xmm0..3`, returns `(rax, xmm0)`, runs under IEEE-754 `host_fpcr`,
+/// never calls guest code or raises SEH.
 fn is_plain_xmm_builtin(h: usize) -> bool {
     if h == 0 {
         return false;
@@ -875,6 +866,30 @@ fn is_plain_xmm_builtin(h: usize) -> bool {
     static SORTED: std::sync::OnceLock<Box<[usize]>> = std::sync::OnceLock::new();
     let table = SORTED.get_or_init(|| {
         let mut v = win32_rt::pure_float_math_fns().to_vec();
+        // Stdio formatting/scanning helpers may perform host f64 conversions (%f/%g/strtod)
+        // that depend on IEEE-754 rounding/denormal FPCR rather than guest MXCSR.
+        const EXTRA_FPCR_EXPORTS: &[(&[&str], &[&str])] = &[(
+            &["ucrtbase.dll", "api-ms-win-crt-stdio-l1-1-0.dll", "msvcrt.dll"],
+            &[
+                "__stdio_common_vsprintf",
+                "__stdio_common_vswprintf",
+                "__stdio_common_vsprintf_s",
+                "__stdio_common_vswprintf_s",
+                "__stdio_common_vsnprintf_s",
+                "__stdio_common_vsnwprintf_s",
+                "__stdio_common_vsscanf",
+                "__stdio_common_vswscanf",
+            ],
+        )];
+        for &(dlls, names) in EXTRA_FPCR_EXPORTS {
+            for &dll in dlls {
+                for &name in names {
+                    if let Some(p) = win32_rt::lookup(dll, name) {
+                        v.push(p as usize);
+                    }
+                }
+            }
+        }
         v.retain(|&p| p != 0);
         v.sort_unstable();
         v.dedup();

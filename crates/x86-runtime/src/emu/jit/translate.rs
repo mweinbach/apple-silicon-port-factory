@@ -1406,6 +1406,9 @@ impl Tr<'_> {
         } else {
             None
         };
+        // Ensure `XBUD` bit 0 reflects any 256-bit writes earlier in this block before `spill_xmm`
+        // tests `XBUD` bit 0 to decide whether `v8..v15` (`ymm_hi[0..7]`) must be spilled.
+        self.flush_ymm_dirty();
         // AAPCS64 designates `v16..v31` as caller-saved; even integer-only `DF_PLAIN` builtins
         // (e.g. NEON `memcpy`/`memset` or LLVM auto-vectorized Rust) can clobber `v16..v31`,
         // so pinned XMM registers must always be spilled before `blr` and reloaded afterward.
@@ -1435,7 +1438,11 @@ impl Tr<'_> {
         self.a.stp_x(12, 13, 31, 32);
         self.a.stp_x(14, 15, 31, 48);
         self.mov_host_lit(XA, h, hva, bail.is_some(), src);
-        self.a.call_with_host_fpcr(64);
+        if needs_xmm {
+            self.a.call_with_host_fpcr(64);
+        } else {
+            self.a.blr(XA);
+        }
         self.a.ldp_x(8, 9, 31, 0);
         self.a.ldp_x(10, 11, 31, 16);
         self.a.ldp_x(12, 13, 31, 32);
@@ -1491,6 +1498,14 @@ impl Tr<'_> {
             LeaveCs,
             XInput { ex: bool },
             SwitchToThread,
+            ThreadId,
+            LastError,
+            TlsGet,
+            TlsSet,
+            SrwAcqExcl { try_only: bool },
+            SrwAcqShared { try_only: bool },
+            SrwRelExcl,
+            SrwRelShared,
         }
         struct Table {
             qpc: [usize; 4],
@@ -1501,6 +1516,16 @@ impl Tr<'_> {
             xinput: [usize; 2],
             xinput_ex: [usize; 2],
             switch_thread: [usize; 4],
+            thread_id: [usize; 5],
+            last_error: [usize; 3],
+            tls_get: [usize; 3],
+            tls_set: [usize; 3],
+            srw_acq_excl: [usize; 5],
+            srw_try_excl: [usize; 3],
+            srw_acq_sh: [usize; 5],
+            srw_try_sh: [usize; 3],
+            srw_rel_excl: [usize; 5],
+            srw_rel_sh: [usize; 5],
         }
         static TABLE: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
         let t = TABLE.get_or_init(|| {
@@ -1548,6 +1573,66 @@ impl Tr<'_> {
                     lk("kernel32.dll", "SwitchToThread"),
                     lk("msvcp140.dll", "_Thrd_yield"),
                 ],
+                thread_id: [
+                    win32_rt::kernel32::threads::GetCurrentThreadId as *const () as usize,
+                    win32_rt::misc::msvcp140::_Thrd_id as *const () as usize,
+                    lk("kernel32.dll", "GetCurrentThreadId"),
+                    lk("kernelbase.dll", "GetCurrentThreadId"),
+                    lk("msvcp140.dll", "_Thrd_id"),
+                ],
+                last_error: [
+                    win32_rt::kernel32::process::GetLastError as *const () as usize,
+                    lk("kernel32.dll", "GetLastError"),
+                    lk("kernelbase.dll", "GetLastError"),
+                ],
+                tls_get: [
+                    win32_rt::kernel32::threads::TlsGetValue as *const () as usize,
+                    lk("kernel32.dll", "TlsGetValue"),
+                    lk("kernelbase.dll", "TlsGetValue"),
+                ],
+                tls_set: [
+                    win32_rt::kernel32::threads::TlsSetValue as *const () as usize,
+                    lk("kernel32.dll", "TlsSetValue"),
+                    lk("kernelbase.dll", "TlsSetValue"),
+                ],
+                srw_acq_excl: [
+                    win32_rt::sync::AcquireSRWLockExclusive as *const () as usize,
+                    win32_rt::ntdll::RtlAcquireSRWLockExclusive as *const () as usize,
+                    lk("kernel32.dll", "AcquireSRWLockExclusive"),
+                    lk("kernelbase.dll", "AcquireSRWLockExclusive"),
+                    lk("ntdll.dll", "RtlAcquireSRWLockExclusive"),
+                ],
+                srw_try_excl: [
+                    win32_rt::sync::TryAcquireSRWLockExclusive as *const () as usize,
+                    lk("kernel32.dll", "TryAcquireSRWLockExclusive"),
+                    lk("kernelbase.dll", "TryAcquireSRWLockExclusive"),
+                ],
+                srw_acq_sh: [
+                    win32_rt::sync::AcquireSRWLockShared as *const () as usize,
+                    win32_rt::ntdll::RtlAcquireSRWLockShared as *const () as usize,
+                    lk("kernel32.dll", "AcquireSRWLockShared"),
+                    lk("kernelbase.dll", "AcquireSRWLockShared"),
+                    lk("ntdll.dll", "RtlAcquireSRWLockShared"),
+                ],
+                srw_try_sh: [
+                    win32_rt::sync::TryAcquireSRWLockShared as *const () as usize,
+                    lk("kernel32.dll", "TryAcquireSRWLockShared"),
+                    lk("kernelbase.dll", "TryAcquireSRWLockShared"),
+                ],
+                srw_rel_excl: [
+                    win32_rt::sync::ReleaseSRWLockExclusive as *const () as usize,
+                    win32_rt::ntdll::RtlReleaseSRWLockExclusive as *const () as usize,
+                    lk("kernel32.dll", "ReleaseSRWLockExclusive"),
+                    lk("kernelbase.dll", "ReleaseSRWLockExclusive"),
+                    lk("ntdll.dll", "RtlReleaseSRWLockExclusive"),
+                ],
+                srw_rel_sh: [
+                    win32_rt::sync::ReleaseSRWLockShared as *const () as usize,
+                    win32_rt::ntdll::RtlReleaseSRWLockShared as *const () as usize,
+                    lk("kernel32.dll", "ReleaseSRWLockShared"),
+                    lk("kernelbase.dll", "ReleaseSRWLockShared"),
+                    lk("ntdll.dll", "RtlReleaseSRWLockShared"),
+                ],
             }
         });
         let kind = if t.qpc.contains(&h) {
@@ -1566,6 +1651,26 @@ impl Tr<'_> {
             InlineKind::XInput { ex: true }
         } else if t.switch_thread.contains(&h) {
             InlineKind::SwitchToThread
+        } else if t.thread_id.contains(&h) {
+            InlineKind::ThreadId
+        } else if t.last_error.contains(&h) {
+            InlineKind::LastError
+        } else if t.tls_get.contains(&h) {
+            InlineKind::TlsGet
+        } else if t.tls_set.contains(&h) {
+            InlineKind::TlsSet
+        } else if t.srw_acq_excl.contains(&h) {
+            InlineKind::SrwAcqExcl { try_only: false }
+        } else if t.srw_try_excl.contains(&h) {
+            InlineKind::SrwAcqExcl { try_only: true }
+        } else if t.srw_acq_sh.contains(&h) {
+            InlineKind::SrwAcqShared { try_only: false }
+        } else if t.srw_try_sh.contains(&h) {
+            InlineKind::SrwAcqShared { try_only: true }
+        } else if t.srw_rel_excl.contains(&h) {
+            InlineKind::SrwRelExcl
+        } else if t.srw_rel_sh.contains(&h) {
+            InlineKind::SrwRelShared
         } else {
             return None;
         };
@@ -1698,6 +1803,128 @@ impl Tr<'_> {
                 slow_branches.push(self.a.bcond(EQ));
                 self.a.isb();
                 self.a.movz(false, g(0), 0, 0); // FALSE
+            }
+            InlineKind::ThreadId => {
+                self.a.ldr(64, XA, XCPU, OFF_TEB);
+                slow_branches.push(self.a.cbz(true, XA));
+                self.a.ldr(32, XS, XA, 0x48);
+                slow_branches.push(self.a.cbz(false, XS));
+                self.a.mov_rr(false, g(0), XS);
+            }
+            InlineKind::LastError => {
+                self.a.ldr(64, XA, XCPU, OFF_TEB);
+                slow_branches.push(self.a.cbz(true, XA));
+                self.a.ldr(32, g(0), XA, 0x68);
+            }
+            InlineKind::TlsGet => {
+                self.a.ldr(64, XA, XCPU, OFF_TEB);
+                slow_branches.push(self.a.cbz(true, XA));
+                self.a.mov_rr(false, T2, g(1));
+                self.a.addsub_ri(false, true, true, ZR, T2, 64, false);
+                let exp = self.a.bcond(HS);
+                self.a.addsub_rr(true, false, false, XS, XA, T2, 3);
+                self.a.str(32, ZR, XA, 0x68);
+                self.a.ldr(64, g(0), XS, 0x1480);
+                fast_join.push(self.a.b());
+                self.a.bind(exp);
+                self.a.addsub_ri(false, true, false, T2, T2, 64, false);
+                self.a.addsub_ri(false, true, true, ZR, T2, 1024, false);
+                slow_branches.push(self.a.bcond(HS));
+                self.a.ldr(64, XS, XA, 0x1780);
+                slow_branches.push(self.a.cbz(true, XS));
+                self.a.addsub_rr(true, false, false, XS, XS, T2, 3);
+                self.a.str(32, ZR, XA, 0x68);
+                self.a.ldr(64, g(0), XS, 0);
+            }
+            InlineKind::TlsSet => {
+                self.a.ldr(64, XA, XCPU, OFF_TEB);
+                slow_branches.push(self.a.cbz(true, XA));
+                self.a.mov_rr(false, T2, g(1));
+                self.a.addsub_ri(false, true, true, ZR, T2, 64, false);
+                let exp = self.a.bcond(HS);
+                self.a.addsub_rr(true, false, false, XS, XA, T2, 3);
+                self.a.str(64, g(2), XS, 0x1480);
+                self.a.movz(false, g(0), 1, 0);
+                fast_join.push(self.a.b());
+                self.a.bind(exp);
+                self.a.addsub_ri(false, true, false, T2, T2, 64, false);
+                self.a.addsub_ri(false, true, true, ZR, T2, 1024, false);
+                slow_branches.push(self.a.bcond(HS));
+                self.a.ldr(64, XS, XA, 0x1780);
+                slow_branches.push(self.a.cbz(true, XS));
+                self.a.addsub_rr(true, false, false, XS, XS, T2, 3);
+                self.a.str(64, g(2), XS, 0);
+                self.a.movz(false, g(0), 1, 0);
+            }
+            InlineKind::SrwAcqExcl { try_only } => {
+                slow_branches.push(self.a.cbz(true, g(1)));
+                self.a.logic_ri(true, 3, ZR, g(1), enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.movz(true, T2, 0, 0);
+                self.a.movz(true, XS, 1, 0);
+                self.a.casa(64, T2, XS, g(1));
+                if try_only {
+                    let miss = self.a.cbnz(true, T2);
+                    self.a.movz(false, g(0), 1, 0);
+                    fast_join.push(self.a.b());
+                    self.a.bind(miss);
+                    self.a.logic_ri(true, 3, ZR, T2, enc_logic_imm(!6u64, true).unwrap());
+                    slow_branches.push(self.a.bcond(EQ));
+                    self.a.movz(false, g(0), 0, 0);
+                } else {
+                    slow_branches.push(self.a.cbnz(true, T2));
+                }
+            }
+            InlineKind::SrwAcqShared { try_only } => {
+                slow_branches.push(self.a.cbz(true, g(1)));
+                self.a.logic_ri(true, 3, ZR, g(1), enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.ldr(64, T2, g(1), 0);
+                if try_only {
+                    let b0 = self.a.tbnz(T2, 0);
+                    let b1 = self.a.tbnz(T2, 2);
+                    self.a.addsub_ri(true, false, false, XS, T2, 8, false);
+                    self.a.mov_rr(true, XA, T2);
+                    self.a.casa(64, T2, XS, g(1));
+                    self.a.addsub_rr(true, true, true, ZR, T2, XA, 0);
+                    slow_branches.push(self.a.bcond(NE));
+                    self.a.movz(false, g(0), 1, 0);
+                    fast_join.push(self.a.b());
+                    self.a.bind(b0);
+                    self.a.bind(b1);
+                    self.a.movz(false, g(0), 0, 0);
+                } else {
+                    slow_branches.push(self.a.tbnz(T2, 0));
+                    slow_branches.push(self.a.tbnz(T2, 2));
+                    self.a.addsub_ri(true, false, false, XS, T2, 8, false);
+                    self.a.mov_rr(true, XA, T2);
+                    self.a.casa(64, T2, XS, g(1));
+                    self.a.addsub_rr(true, true, true, ZR, T2, XA, 0);
+                    slow_branches.push(self.a.bcond(NE));
+                }
+            }
+            InlineKind::SrwRelExcl => {
+                slow_branches.push(self.a.cbz(true, g(1)));
+                self.a.logic_ri(true, 3, ZR, g(1), enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.movz(true, T2, 1, 0);
+                self.a.casl(64, T2, ZR, g(1));
+                self.a.addsub_ri(true, true, true, ZR, T2, 1, false);
+                slow_branches.push(self.a.bcond(NE));
+            }
+            InlineKind::SrwRelShared => {
+                slow_branches.push(self.a.cbz(true, g(1)));
+                self.a.logic_ri(true, 3, ZR, g(1), enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.ldr(64, T2, g(1), 0);
+                slow_branches.push(self.a.cbz(true, T2));
+                self.a.logic_ri(true, 3, ZR, T2, enc_logic_imm(7, true).unwrap());
+                slow_branches.push(self.a.bcond(NE));
+                self.a.addsub_ri(true, true, false, XS, T2, 8, false);
+                self.a.mov_rr(true, XA, T2);
+                self.a.casl(64, T2, XS, g(1));
+                self.a.addsub_rr(true, true, true, ZR, T2, XA, 0);
+                slow_branches.push(self.a.bcond(NE));
             }
         }
         for f in fast_join {

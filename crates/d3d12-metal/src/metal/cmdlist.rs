@@ -138,7 +138,7 @@ impl CommandAllocator {
 
     /// `ID3D12CommandAllocator::Reset` (the app guarantees GPU completion).
     pub fn reset(&self) {
-        if super::queue::has_pending_cbs() {
+        if super::queue::has_uncommitted_cbs() {
             super::queue::Queue::flush_if_alloc_pending(Retained::as_ptr(&self.a) as usize);
         }
         self.a.reset();
@@ -152,7 +152,7 @@ impl CommandAllocator {
 
 impl Drop for CommandAllocator {
     fn drop(&mut self) {
-        if super::queue::has_pending_cbs() {
+        if super::queue::has_uncommitted_cbs() {
             super::queue::Queue::flush_if_alloc_pending(Retained::as_ptr(&self.a) as usize);
         }
     }
@@ -339,8 +339,11 @@ impl CommandList {
         if self.open {
             return Err("command list is already open".into());
         }
-        if super::queue::has_pending_cbs() {
-            super::queue::Queue::flush_if_cb_pending(&self.cb);
+        if super::queue::has_uncommitted_cbs() {
+            super::queue::Queue::flush_if_cb_or_alloc_in_flight(
+                &self.cb,
+                Retained::as_ptr(&alloc.a) as usize,
+            );
         }
         self.cb.beginCommandBufferWithAllocator(&alloc.a);
         if !self.label.is_empty() {

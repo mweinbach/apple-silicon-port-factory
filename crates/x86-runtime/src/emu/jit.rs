@@ -59,7 +59,9 @@ pub(super) use aot::{emit_static_stubs, test_emit_stubs_and_veneer_for_knobs};
 pub(super) use cache::{
     inline_host_fn, patch_lse2_unaligned, prep_block, register_lse2_region, unregister_lse2_region,
     JitCache, TrScratch, FAST_KIND_ENTER_CS, FAST_KIND_LEAVE_CS, FAST_KIND_QPC,
-    FAST_KIND_SWITCH_TO_THREAD, FAST_KIND_TIME_MS, FAST_KIND_XINPUT, JMUL,
+    FAST_KIND_SRW_ACQ_EXCL, FAST_KIND_SRW_ACQ_SHARED, FAST_KIND_SRW_REL,
+    FAST_KIND_SWITCH_TO_THREAD, FAST_KIND_THREAD_ID, FAST_KIND_TIME_MS, FAST_KIND_TLS,
+    FAST_KIND_XINPUT, JMUL,
 };
 #[cfg(test)]
 pub(super) use cache::{test_aot_installs, test_probe_hits};
