@@ -3,11 +3,12 @@
 //!
 //! The game's gates (`d3d12_init_and_check` 0x14208d490,
 //! `gpu_feature_validator` 0x142070370) need: `TypedUAVLoadAdditionalFormats`,
-//! `ResourceBindingTier 3`, shader model ≥ 6.5. Mesh shaders (unless
-//! `AW2_MESH_SHADERS=1`), VRS, DXR,
-//! enhanced barriers and work graphs are reported absent, which selects the
-//! game's VS / legacy-barrier / raster paths. Struct sizes are checked
-//! exactly (a mismatch is `E_INVALIDARG`, like the runtime).
+//! `ResourceBindingTier 3`, shader model ≥ 6.5. Mesh shaders (`MeshShaderTier 1`)
+//! are reported supported by default (`PORT_MESH_SHADERS=0` / `AW2_MESH_SHADERS=0`
+//! disables them to select the VS path). VRS, DXR, enhanced barriers and work
+//! graphs are reported absent, which selects the legacy-barrier / raster paths.
+//! Struct sizes are checked exactly (a mismatch is `E_INVALIDARG`, like the
+//! runtime).
 
 use crate::format;
 
@@ -256,8 +257,8 @@ pub unsafe fn check_feature_support(feature: u32, data: &mut [u8]) -> Result<(),
             put(data, &[F, F, 0, 0, F]);
         }
         // D3D12_OPTIONS7 {MeshShaderTier, SamplerFeedbackTier}. Mesh
-        // shaders (TIER_1 = 10) only behind AW2_MESH_SHADERS=1 until the
-        // game's mesh path is validated; the VS path is the default.
+        // shaders (TIER_1 = 10) are enabled by default on Metal 4
+        // (`PORT_MESH_SHADERS=0` / `AW2_MESH_SHADERS=0` falls back to VS).
         32 => {
             need(8)?;
             put(data, &[if crate::mesh::enabled() { 10 } else { 0 }, 0]);
@@ -366,13 +367,33 @@ mod tests {
     /// Golden values for every (feature, size) the game queries.
     #[test]
     fn golden_feature_table() {
+        let _lock = crate::metal::env_test_lock();
+        let prev_p = std::env::var_os("PORT_MESH_SHADERS");
+        let prev_a = std::env::var_os("AW2_MESH_SHADERS");
+        std::env::remove_var("PORT_MESH_SHADERS");
+        std::env::remove_var("AW2_MESH_SHADERS");
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("PORT_MESH_SHADERS", v),
+                    None => std::env::remove_var("PORT_MESH_SHADERS"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("AW2_MESH_SHADERS", v),
+                    None => std::env::remove_var("AW2_MESH_SHADERS"),
+                }
+            }
+        }
+        let _restore = Restore(prev_p, prev_a);
+
         assert_eq!(q(0, 60, &[]).unwrap(), vec![0, 0, 2, 0, 3, 0, 1, 0, 0, 40, 0, 0, 0, 1, 2]);
         assert!(matches!(q(0, 0x38, &[]), Err(CapsError::InvalidArg(_))));
         assert_eq!(q(7, 4, &[0x69]).unwrap(), vec![0x66]);
         assert_eq!(q(7, 4, &[0x65]).unwrap(), vec![0x65]);
         assert_eq!(q(27, 12, &[]).unwrap(), vec![0, 0, 0]);
         assert_eq!(q(30, 20, &[]).unwrap(), vec![0; 5]);
-        assert_eq!(q(32, 8, &[]).unwrap(), vec![0, 0]);
+        assert_eq!(q(32, 8, &[]).unwrap(), vec![10, 0]);
         assert_eq!(q(41, 12, &[]).unwrap(), vec![0, 0, 0]);
         assert_eq!(q(65, 16, &[]).unwrap(), vec![0; 4]);
         assert_eq!(q(12, 4, &[3]).unwrap(), vec![2]);
