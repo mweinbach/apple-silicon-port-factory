@@ -648,7 +648,9 @@ impl Tr<'_> {
         let va_hi = self.yget(s1, 0);
         let vb_hi = if is_mem { 7 } else { self.yget(op.r1, 1) };
         let yh_dst = self.yh_reg(d);
-        let vd_hi = yh_dst.unwrap_or(4);
+        // Use v5 (not v3/v4) as the unpinned upper-half dest so `flush_minmax_result`
+        // (`flush_denorm_lanes`, which clobbers v3/v4) never aliases the result register.
+        let vd_hi = yh_dst.unwrap_or(5);
         let is_pd = sub >= 18;
         match sub {
             16 | 17 | 22 | 23 => {

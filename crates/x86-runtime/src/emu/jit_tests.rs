@@ -9041,3 +9041,103 @@ fn dead_flag_elision_across_fallthrough_shift_and_host_jmp() {
     crate::emu::routes::test_set_extra_plain_flags(host_ptr, 0);
     crate::exe::unregister_native_va(host_va);
 }
+
+/// Regression test: 256-bit `vminps`/`vmaxpd` writing to unpinned `ymm8..15` (and all
+/// destinations when `xmm_pin` is off) with `MXCSR.DAZ` enabled must not alias
+/// `flush_denorm_lanes`'s `v3`/`v4` scratch registers.
+#[test]
+fn ymm8_15_256bit_minmax_with_daz_matches_interpreter() {
+    use iced_x86::code_asm::*;
+
+    let mut code = vec![0u8; 4096];
+    let base = code.as_ptr() as u64;
+    let mut mem = vec![0u8; 512];
+    // 8 x f32 in [0..32] and [32..64] (mix of finite values and subnormals in upper 128b).
+    let a_f32: [u32; 8] = [
+        1.5f32.to_bits(),
+        (-2.0f32).to_bits(),
+        0x0000_0042, // +subnormal
+        3.25f32.to_bits(),
+        4.5f32.to_bits(),
+        0x8000_0015, // -subnormal
+        (-7.0f32).to_bits(),
+        9.0f32.to_bits(),
+    ];
+    let b_f32: [u32; 8] = [
+        2.0f32.to_bits(),
+        (-1.0f32).to_bits(),
+        1.0f32.to_bits(),
+        (-0.5f32).to_bits(),
+        2.25f32.to_bits(),
+        0.5f32.to_bits(),
+        (-3.0f32).to_bits(),
+        12.0f32.to_bits(),
+    ];
+    for (i, &w) in a_f32.iter().enumerate() {
+        mem[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    for (i, &w) in b_f32.iter().enumerate() {
+        mem[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    // 4 x f64 in [64..96] and [96..128] (finite + subnormal in upper 128b).
+    let a_f64: [u64; 4] = [
+        1.25f64.to_bits(),
+        (-3.5f64).to_bits(),
+        0x0000_0000_0000_0077, // +subnormal
+        6.5f64.to_bits(),
+    ];
+    let b_f64: [u64; 4] = [
+        0.5f64.to_bits(),
+        (-4.0f64).to_bits(),
+        (-1.0f64).to_bits(),
+        8.25f64.to_bits(),
+    ];
+    for (i, &w) in a_f64.iter().enumerate() {
+        mem[64 + i * 8..64 + i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    for (i, &w) in b_f64.iter().enumerate() {
+        mem[96 + i * 8..96 + i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    // MXCSR with DAZ (bit 6 = 0x40) + default masked exceptions (0x1F80) at [256..260],
+    // original MXCSR save slot at [260..264].
+    mem[256..260].copy_from_slice(&0x1FC0u32.to_le_bytes());
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.stmxcsr(dword_ptr(rcx + 260)).unwrap();
+    a.ldmxcsr(dword_ptr(rcx + 256)).unwrap();
+    a.vmovups(ymm8, ymmword_ptr(rcx)).unwrap();
+    a.vmovups(ymm11, ymmword_ptr(rcx + 32)).unwrap();
+    a.vminps(ymm9, ymm8, ymm11).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 128), ymm9).unwrap();
+    a.vmovupd(ymm10, ymmword_ptr(rcx + 64)).unwrap();
+    a.vmaxpd(ymm12, ymm10, ymmword_ptr(rcx + 96)).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 160), ymm12).unwrap();
+    a.ldmxcsr(dword_ptr(rcx + 260)).unwrap();
+    a.vzeroupper().unwrap();
+    a.xor(eax, eax).unwrap();
+    a.ret().unwrap();
+    let bytes = a.assemble(base).unwrap();
+    code[..bytes.len()].copy_from_slice(&bytes);
+
+    let run = |mode: u8, xpin: bool| -> Vec<u8> {
+        let mut m = mem.clone();
+        std::thread::spawn(move || {
+            jit::test_set_knobs(jit::TestKnobs { xmm_pin: Some(xpin), ..jit::TestKnobs::NONE });
+            jit::force(mode);
+            unsafe {
+                crate::emu::call_va8(base, m.as_mut_ptr() as u64, 0, 0, 0, 0, 0, 0, 0);
+            }
+            jit::force(0);
+            jit::test_set_knobs(jit::TestKnobs::NONE);
+            m
+        })
+        .join()
+        .unwrap()
+    };
+
+    let interp = run(2, true);
+    let jit_pinned = run(1, true);
+    let jit_unpinned = run(1, false);
+    assert_eq!(&jit_pinned[128..192], &interp[128..192], "pinned ymm9/ymm12 DAZ minmax mismatch");
+    assert_eq!(&jit_unpinned[128..192], &interp[128..192], "unpinned ymm9/ymm12 DAZ minmax mismatch");
+}

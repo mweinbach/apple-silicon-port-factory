@@ -967,6 +967,7 @@ impl Tr<'_> {
 
     // Clear just the fraction bits of exponent-zero lanes; preserve the sign and NaN payloads.
     fn flush_denorm_lanes(&mut self, reg: u32, double: bool) {
+        debug_assert!(reg != 3 && reg != 4, "flush_denorm_lanes clobbers v3 and v4 as scratch");
         let (width, exponent, fraction) = if double {
             (3, 0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff)
         } else {
