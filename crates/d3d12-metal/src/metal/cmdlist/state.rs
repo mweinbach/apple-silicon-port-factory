@@ -2036,6 +2036,9 @@ pub(super) struct BarrierState {
     pub(super) bar_scratch_ib_adds: Vec<(MTLStages, MTLStages, OblKind, Option<SmallSpans>)>,
     pub(super) bar_scratch_ib_uav_adds:
         Vec<(usize, MTLStages, MTLStages, OblKind, Option<SmallSpans>)>,
+    pub(super) bar_scratch_split_begin_res: Vec<usize>,
+    pub(super) bar_scratch_split_begin_keys: Vec<(usize, u32, u32, u32)>,
+    pub(super) bar_scratch_narrow_trail: Vec<(usize, MTLStages, MTLStages)>,
 }
 
 impl BarrierState {
@@ -2152,6 +2155,9 @@ impl BarrierState {
             bar_scratch_rp_pt: Vec::new(),
             bar_scratch_ib_adds: Vec::new(),
             bar_scratch_ib_uav_adds: Vec::new(),
+            bar_scratch_split_begin_res: Vec::new(),
+            bar_scratch_split_begin_keys: Vec::new(),
+            bar_scratch_narrow_trail: Vec::new(),
         }
     }
 

@@ -2352,10 +2352,13 @@ impl CommandList {
         if !self.bar.uav_passthrough.is_empty() {
             batch_pt.extend_from_slice(&self.bar.uav_passthrough);
         }
-        let mut split_begin_res: Vec<usize> = Vec::new();
+        let mut split_begin_res = std::mem::take(&mut self.bar.bar_scratch_split_begin_res);
+        split_begin_res.clear();
         let mut split_begin_all = false;
-        let mut split_begin_keys: Vec<(usize, u32, u32, u32)> = Vec::new();
-        let mut local_narrow_trail: Vec<(usize, S, S)> = Vec::new();
+        let mut split_begin_keys = std::mem::take(&mut self.bar.bar_scratch_split_begin_keys);
+        split_begin_keys.clear();
+        let mut local_narrow_trail = std::mem::take(&mut self.bar.bar_scratch_narrow_trail);
+        local_narrow_trail.clear();
         let mut all_matched_split_end = true;
         let mut any_matched_split_end = false;
         let mut matched_split_req = [0u32; 7];
@@ -2911,6 +2914,9 @@ impl CommandList {
                 read_cs_mid_items,
                 active_items,
                 batch_pt,
+                split_begin_res,
+                split_begin_keys,
+                local_narrow_trail,
             );
             return;
         }
@@ -3469,6 +3475,9 @@ impl CommandList {
                             read_cs_mid_items,
                             active_items,
                             batch_pt,
+                            split_begin_res,
+                            split_begin_keys,
+                            local_narrow_trail,
                         );
                         return;
                     }
@@ -3546,6 +3555,9 @@ impl CommandList {
                     read_cs_mid_items,
                     active_items,
                     batch_pt,
+                    split_begin_res,
+                    split_begin_keys,
+                    local_narrow_trail,
                 );
                 return;
             }
@@ -3558,7 +3570,7 @@ impl CommandList {
             } else {
                 self.cur_producer_gen()
             };
-            for (nr, na, nb) in local_narrow_trail {
+            for (nr, na, nb) in local_narrow_trail.drain(..) {
                 self.bar.trail_narrow_items.push((nr, na, nb, trail_req));
             }
         }
@@ -4013,6 +4025,9 @@ impl CommandList {
             read_cs_mid_items,
             active_items,
             batch_pt,
+            split_begin_res,
+            split_begin_keys,
+            local_narrow_trail,
         );
     }
 
@@ -4028,6 +4043,9 @@ impl CommandList {
         mut read_cs_mid_items: Vec<(usize, MTLStages, MTLStages, MTLStages)>,
         mut active_items: Vec<Barrier>,
         mut batch_pt: Vec<(usize, MTLStages)>,
+        mut split_begin_res: Vec<usize>,
+        mut split_begin_keys: Vec<(usize, u32, u32, u32)>,
+        mut local_narrow_trail: Vec<(usize, MTLStages, MTLStages)>,
     ) {
         res.clear();
         self.bar.bar_scratch_res = res;
@@ -4059,6 +4077,18 @@ impl CommandList {
         }
         batch_pt.clear();
         self.bar.bar_scratch_pt = batch_pt;
+        if split_begin_res.capacity() > 0 {
+            split_begin_res.clear();
+            self.bar.bar_scratch_split_begin_res = split_begin_res;
+        }
+        if split_begin_keys.capacity() > 0 {
+            split_begin_keys.clear();
+            self.bar.bar_scratch_split_begin_keys = split_begin_keys;
+        }
+        if local_narrow_trail.capacity() > 0 {
+            local_narrow_trail.clear();
+            self.bar.bar_scratch_narrow_trail = local_narrow_trail;
+        }
     }
 
     /// Before a draw in an already open draw pass: pending barrier stages

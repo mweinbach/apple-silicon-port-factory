@@ -39,11 +39,12 @@ pub mod kind {
     pub const CLEAR: u8 = 1;
     pub const UTIL: u8 = 2;
     pub const COMPUTE: u8 = 3;
-    pub const COUNT: usize = 4;
-    pub const NAMES: [&str; COUNT] = ["draw", "clear", "util", "compute"];
+    pub const ML: u8 = 4;
+    pub const COUNT: usize = 5;
+    pub const NAMES: [&str; COUNT] = ["draw", "clear", "util", "compute", "ml"];
 }
 
-/// Synthetic shader keys for internal utility / copy / clear / RT encoders
+/// Synthetic shader keys for internal utility / copy / clear / RT / ML encoders
 /// that do not bind a converted DXIL game shader (previously logged as `0`).
 pub mod synth {
     pub const CLEAR_CS: u64 = 0xffff_ff00_0000_0001;
@@ -56,6 +57,8 @@ pub mod synth {
     pub const CLEAR_PASS: u64 = 0xffff_ff00_0000_0008;
     pub const RESOLVE: u64 = 0xffff_ff00_0000_0009;
     pub const FILL_OCCL: u64 = 0xffff_ff00_0000_000a;
+    pub const METALFX_TEMPORAL: u64 = 0xffff_ff00_0000_000b;
+    pub const METALFX_SPATIAL: u64 = 0xffff_ff00_0000_000c;
 
     pub fn name(key: u64) -> Option<&'static str> {
         match key {
@@ -69,6 +72,8 @@ pub mod synth {
             CLEAR_PASS => Some("aw2:clear_pass"),
             RESOLVE => Some("aw2:resolve"),
             FILL_OCCL => Some("aw2:fill_occl"),
+            METALFX_TEMPORAL => Some("port:metalfx_temporal"),
+            METALFX_SPATIAL => Some("port:metalfx_spatial"),
             _ => None,
         }
     }
@@ -221,6 +226,9 @@ pub struct PassLog {
     cur: PassMeta,
     /// The open encoder has a start timestamp.
     open: bool,
+    /// Opaque MetalFX / ML pass bracketed between the pre-sync encoder's end
+    /// timestamp and the next encoder's opening timestamp (zero extra encoders).
+    pending_ml: Option<PassMeta>,
     overflow: u32,
     /// Submission ordinal of the list within its frame.
     ord: u32,
@@ -282,7 +290,7 @@ impl PassLog {
             NO_SLICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         };
-        Some(PassLog { slice, metas: Vec::with_capacity(64), cur: PassMeta::default(), open: false, overflow: 0, ord: 0, t_ecl: 0, t_commit: 0, queue: 0, wait: 0 })
+        Some(PassLog { slice, metas: Vec::with_capacity(64), cur: PassMeta::default(), open: false, pending_ml: None, overflow: 0, ord: 0, t_ecl: 0, t_commit: 0, queue: 0, wait: 0 })
     }
 
     pub fn heap(&self) -> &'static MtlCounterHeap {
@@ -336,12 +344,46 @@ impl PassLog {
         self.metas.push(self.cur);
         Some(self.base() + 2 * k + 1)
     }
+
+    /// Begin timing an opaque MetalFX / ML pass encoded directly on the command buffer:
+    /// returns the start-timestamp heap index to stamp on the pre-sync encoder right before
+    /// `endEncoding()`. Must be called when no regular encoder pass is open (`!self.open`).
+    pub fn open_ml(&mut self, shader: u64, w: u32, h: u32, sync: u8) -> Option<usize> {
+        if self.open || self.pending_ml.is_some() {
+            return None;
+        }
+        let k = self.metas.len();
+        if 2 * k + 1 >= SLICE {
+            self.overflow += 1;
+            return None;
+        }
+        self.pending_ml = Some(PassMeta {
+            kind: kind::ML,
+            sync,
+            dispatches: 1,
+            w,
+            h,
+            shader,
+            ..PassMeta::default()
+        });
+        Some(self.base() + 2 * k)
+    }
+
+    /// Finish timing a pending opaque MetalFX / ML pass on the next encoder's opening
+    /// (after its `waitForFence`): returns the end-timestamp heap index to stamp.
+    pub fn close_ml(&mut self) -> Option<usize> {
+        let meta = self.pending_ml.take()?;
+        let k = self.metas.len();
+        self.metas.push(meta);
+        Some(self.base() + 2 * k + 1)
+    }
 }
 
 impl Drop for PassLog {
     fn drop(&mut self) {
         if let Some(s) = shared() {
-            let used = (2 * self.metas.len() + usize::from(self.open) * 2).min(SLICE);
+            let pending = usize::from(self.open) + usize::from(self.pending_ml.is_some());
+            let used = (2 * self.metas.len() + pending * 2).min(SLICE);
             let mut pool = s.pool.lock().unwrap();
             if let Some(h) = pool.release_slice(self.slice, used) {
                 unsafe { s.heaps[h].invalidateCounterRange(NSRange::new(0, HEAP_ENTRIES)) };
@@ -446,12 +488,31 @@ fn resolve_slice_into(
         // boundary endpoint. Coalesce the missing endpoint rather than dropping
         // the pass as `bad`.
         let valid = |t: u64| t != 0 && t < u64::MAX - 1;
-        let zero_work_coalesce = (m.kind != kind::COMPUTE && m.draws == 0 && m.icb == 0)
+        let zero_work_coalesce = (m.kind != kind::COMPUTE
+            && m.kind != kind::ML
+            && m.draws == 0
+            && m.icb == 0)
             || (m.draws == 0 && m.dispatches == 0 && m.icb == 0);
         if zero_work_coalesce {
             if !valid(s) && valid(e) {
                 s = e;
             } else if !valid(e) && valid(s) {
+                e = s;
+            }
+        }
+        if m.kind == kind::ML {
+            let pe = if isolate_copy_q {
+                st.last_end_by_q[(queue as usize) & 3]
+            } else {
+                st.last_end
+            };
+            if !valid(s) && valid(e) && valid(pe) {
+                // Pre-MetalFX sync ran on a 0-dispatch compute encoder whose relaxed
+                // timestamp resolved to 0 on AGX; bracket from the previous encoder's end.
+                s = pe.min(e);
+            } else if valid(s) && valid(e) && e < s {
+                // A subsequent render pass's Vertex stage may overlap the ML pass before
+                // Fragment waits on `mfx_fence`; clamp to 0 duration instead of flagging `bad`.
                 e = s;
             }
         }
@@ -923,5 +984,60 @@ mod tests {
         std::env::set_var("AW2_PASS_TIMING", "1");
         assert!(enabled_from_env());
         assert!(!split_from_env());
+    }
+
+    #[test]
+    fn ml_pass_accounts_gpu_busy_instead_of_masked_idle_and_clamps_overlap() {
+        let freq = 1_000_000_000_u128;
+        let metas = [
+            PassMeta {
+                kind: kind::COMPUTE,
+                sync: 1,
+                dispatches: 2,
+                shader: 0x100,
+                ..Default::default()
+            },
+            PassMeta {
+                kind: kind::ML,
+                sync: 1,
+                dispatches: 1,
+                w: 1440,
+                h: 810,
+                shader: synth::METALFX_TEMPORAL,
+                ..Default::default()
+            },
+            PassMeta {
+                kind: kind::COMPUTE,
+                sync: 1,
+                dispatches: 1,
+                shader: 0x200,
+                ..Default::default()
+            },
+            // Overlapping ML pass followed by a render pass whose Vertex started before ML end:
+            PassMeta {
+                kind: kind::ML,
+                sync: 1,
+                dispatches: 1,
+                w: 1440,
+                h: 810,
+                shader: synth::METALFX_SPATIAL,
+                ..Default::default()
+            },
+        ];
+        // Pre-compute: [1000, 1500], ML temporal (0-dispatch pre-sync start=0 -> bracketed from
+        // prev_end=1500 to 3500), post-compute: [3500, 4000], overlapped ML spatial: [4000, 3900]
+        // -> clamped to [4000, 4000] with bad == 0.
+        let ts = [1000, 1500, 0, 3500, 3500, 4000, 4000, 3900];
+        let mut st = State { agg: Agg::default(), last_end: 0, last_end_by_q: [0; 4] };
+        resolve_slice_into(&mut st, 0, 0, 0, 900, 950, &metas, &ts, false, freq);
+
+        assert_eq!(st.agg.bad, 0);
+        assert_eq!(st.agg.kind_dur[kind::ML as usize], 2000);
+        assert_eq!(st.agg.kind_excl[kind::ML as usize], 2000);
+        assert_eq!(st.agg.kind_n[kind::ML as usize], 2);
+        assert_eq!(st.agg.busy, 3000);
+        assert_eq!(st.agg.sync_gap[1], 0);
+        assert_eq!(synth::name(synth::METALFX_TEMPORAL), Some("port:metalfx_temporal"));
+        assert_eq!(synth::name(synth::METALFX_SPATIAL), Some("port:metalfx_spatial"));
     }
 }

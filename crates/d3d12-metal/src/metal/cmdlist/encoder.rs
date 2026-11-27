@@ -617,6 +617,9 @@ impl CommandList {
             self.pt = pt::PassLog::acquire();
             self.pt_armed = false;
         }
+        if let Some(end_idx) = self.pt.as_mut().and_then(|p| p.close_ml()) {
+            self.pt_stamp(end_idx, false);
+        }
         let a = self.bar.enc_sync_after;
         let sync = if a.is_empty() {
             0
