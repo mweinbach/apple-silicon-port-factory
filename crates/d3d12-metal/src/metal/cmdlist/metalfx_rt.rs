@@ -1130,7 +1130,13 @@ impl CommandList {
                         self.pt_armed = false;
                     }
                     if let Some(p) = self.pt.as_mut() {
-                        if let Some(i) = p.open_ml(pt_shader, pt_w, pt_h, ml_sync) {
+                        if p.has_pending_ml() {
+                            // Two consecutive direct-output MetalFX scalers separated only by
+                            // a 0-dispatch compute encoder have no valid AGX boundary timestamp
+                            // between them; discard the pending pass (which also suppresses
+                            // starting the chained pass so neither is misattributed).
+                            p.discard_ml();
+                        } else if let Some(i) = p.open_ml(pt_shader, pt_w, pt_h, ml_sync) {
                             unsafe {
                                 e.writeTimestampWithGranularity_intoHeap_atIndex(
                                     MTL4TimestampGranularity::Relaxed,
@@ -1141,6 +1147,8 @@ impl CommandList {
                         }
                     }
                     e.endEncoding();
+                } else if let Some(p) = self.pt.as_mut() {
+                    p.discard_ml();
                 }
             }
         }
@@ -1289,6 +1297,12 @@ impl CommandList {
                 && !legacy_barriers()
                 && barrier_masks();
             let before_q = if scoped { UTIL_STAGES } else { MTLStages::All };
+            if let Some(p) = self.pt.as_mut() {
+                // This fallback fence-flush compute encoder has 0 dispatches (its relaxed
+                // timestamp resolves to 0 on AGX), so discard any trailing pending ML pass
+                // rather than stamping an invalid endpoint.
+                p.discard_ml();
+            }
             if let Some(e) = self.cb.computeCommandEncoder() {
                 e.waitForFence_beforeEncoderStages(&f, MTLStages::Dispatch);
                 if scoped {
@@ -1297,17 +1311,6 @@ impl CommandList {
                         MTLStages::Dispatch,
                         MTL4VisibilityOptions::Device,
                     );
-                }
-                if let Some(p) = self.pt.as_mut() {
-                    if let Some(i) = p.close_ml() {
-                        unsafe {
-                            e.writeTimestampWithGranularity_intoHeap_atIndex(
-                                MTL4TimestampGranularity::Relaxed,
-                                p.heap(),
-                                i,
-                            );
-                        }
-                    }
                 }
                 e.barrierAfterStages_beforeQueueStages_visibilityOptions(
                     MTLStages::Dispatch,

@@ -229,6 +229,10 @@ pub struct PassLog {
     /// Opaque MetalFX / ML pass bracketed between the pre-sync encoder's end
     /// timestamp and the next encoder's opening timestamp (zero extra encoders).
     pending_ml: Option<PassMeta>,
+    /// True if an ML pass was discarded with no intervening timed encoder yet;
+    /// prevents a back-to-back scaler on `Encoder::None` from falsely bracketing
+    /// back across the discarded scaler to `st.last_end`.
+    prev_discarded_ml: bool,
     /// High-water mark of counter-heap slots written in this slice (including any
     /// discarded `pending_ml` start stamp so `Drop` invalidates the full range).
     written_slots: usize,
@@ -293,7 +297,7 @@ impl PassLog {
             NO_SLICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         };
-        Some(PassLog { slice, metas: Vec::with_capacity(64), cur: PassMeta::default(), open: false, pending_ml: None, written_slots: 0, overflow: 0, ord: 0, t_ecl: 0, t_commit: 0, queue: 0, wait: 0 })
+        Some(PassLog { slice, metas: Vec::with_capacity(64), cur: PassMeta::default(), open: false, pending_ml: None, prev_discarded_ml: false, written_slots: 0, overflow: 0, ord: 0, t_ecl: 0, t_commit: 0, queue: 0, wait: 0 })
     }
 
     pub fn heap(&self) -> &'static MtlCounterHeap {
@@ -319,6 +323,7 @@ impl PassLog {
     /// An encoder opened: heap index for its start timestamp (None when the
     /// slice is full).
     pub fn open(&mut self, kind: u8, sync: u8) -> Option<usize> {
+        self.prev_discarded_ml = false;
         self.cur = PassMeta { kind, sync, ..PassMeta::default() };
         let k = self.metas.len();
         self.open = 2 * k + 1 < SLICE;
@@ -351,9 +356,11 @@ impl PassLog {
 
     /// Begin timing an opaque MetalFX / ML pass encoded directly on the command buffer:
     /// returns the start-timestamp heap index to stamp on the pre-sync encoder right before
-    /// `endEncoding()`. Must be called when no regular encoder pass is open (`!self.open`).
+    /// `endEncoding()`. Must be called when no regular encoder pass is open (`!self.open`)
+    /// and no prior ML pass is still pending or was just discarded without an intervening
+    /// timed encoder.
     pub fn open_ml(&mut self, shader: u64, w: u32, h: u32, sync: u8) -> Option<usize> {
-        if self.open || self.pending_ml.is_some() {
+        if self.open || self.pending_ml.is_some() || self.prev_discarded_ml {
             return None;
         }
         let k = self.metas.len();
@@ -382,10 +389,13 @@ impl PassLog {
     }
 
     /// Discard a pending opaque MetalFX / ML pass without emitting a `PassMeta`
-    /// (used when the next encoder's opening stage is allowed to overlap MetalFX
-    /// so no synchronized endpoint timestamp exists without splitting the pass).
+    /// (used when no synchronized endpoint timestamp exists without splitting or
+    /// adding GPU work, e.g. a Fragment-only Render wait or consecutive direct-output
+    /// MetalFX scalers separated only by a 0-dispatch sync encoder).
     pub fn discard_ml(&mut self) {
-        self.pending_ml = None;
+        if self.pending_ml.take().is_some() {
+            self.prev_discarded_ml = true;
+        }
     }
 
     /// Finish timing a pending opaque MetalFX / ML pass on the next encoder's opening
@@ -1059,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn discard_ml_drops_unsynchronized_span_and_preserves_written_slots() {
+    fn discard_ml_drops_unsynchronized_span_blocks_chained_ml_and_preserves_written_slots() {
         let Some(mut log) = PassLog::acquire() else {
             return;
         };
@@ -1071,5 +1081,14 @@ mod tests {
         assert!(log.metas.is_empty());
         assert_eq!(log.written_slots, 2);
         assert!(log.close_ml().is_none());
+        // A back-to-back scaler without an intervening timed encoder must not open an ML span
+        // (its 0-dispatch start would otherwise falsely bracket back across the discarded pass).
+        assert!(log.open_ml(synth::METALFX_SPATIAL, 1440, 810, 1).is_none());
+        // Once a regular timed encoder runs, subsequent ML passes can be timed cleanly again.
+        assert!(log.open(kind::COMPUTE, 1).is_some());
+        assert!(log.close().is_some());
+        assert!(log.open_ml(synth::METALFX_SPATIAL, 1440, 810, 1).is_some());
+        assert!(log.close_ml().is_some());
+        assert_eq!(log.metas.len(), 2);
     }
 }
