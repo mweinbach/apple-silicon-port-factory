@@ -2511,8 +2511,10 @@ fn empty_enc_elide_skips_zero_work_lists_and_narrows_blit_first_list_start_on_gp
     l3.copy_texture_region(CopyLoc::Footprint(&rb_clear, fp4), [0, 0, 0], CopyLoc::Subresource(&clear_only_tex, 0), None).unwrap();
     l3.close().unwrap();
 
-    // Guardrail 2: a `Blit`-first list copying into an un-transitioned `DEFAULT` buffer (`COMMON -> COPY_DEST`)
-    // MUST keep `after = MTLStages::All` (`before = MTLStages::Blit`, `!list_cs_unwaited_frag`)!
+    // Guardrail 2: a `Blit`-first list copying into a previously GPU-used, un-transitioned
+    // `DEFAULT` buffer (`COMMON -> COPY_DEST`) MUST keep `after = MTLStages::All`
+    // (`before = MTLStages::Blit`, `!list_cs_unwaited_frag`) even with `PORT_QUEUE_START_STAGE_EXACT=1`!
+    common_dst.mark_gpu_used();
     let mut l4 = CommandList::new(ListType::Direct).unwrap();
     l4.opts.opt_empty_enc_elide = true;
     l4.begin(&a4).unwrap();
@@ -3862,7 +3864,9 @@ fn list_start_explicit_blit_narrowing_and_cross_list_trailing_guard_on_gpu() {
         "L2 consumed all RT->COPY_* narrowing transitions in its narrowed Blit encoder, so close() must emit zero trailing producer barriers"
     );
 
-    // Part C: `COMMON` (`s0 == 0`) and `ALLOW_SIMULTANEOUS_ACCESS` must taint and fall back to `All -> Blit`.
+    // Part C: previously GPU-used `COMMON` (`s0 == 0`) and `ALLOW_SIMULTANEOUS_ACCESS`
+    // must taint and fall back to `All -> Blit` even with `PORT_QUEUE_START_STAGE_EXACT=1`.
+    tex_common.mark_gpu_used();
     let mut l3 = CommandList::new(ListType::Direct).unwrap();
     l3.begin(&alloc3).unwrap();
     l3.barrier_list_with(&[Barrier::Transition(common_id, STATE_COMMON, STATE_COPY_DEST)], true, false);
