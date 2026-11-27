@@ -81,6 +81,7 @@ from ._steam_vdf import (
     parse_appmanifest_acf,
     parse_depot_downloader_stdout,
     parse_depot_manifest_txt,
+    parse_libraryfolders_vdf,
     parse_local_owned_app_ids,
     parse_loginusers_vdf,
 )
@@ -452,16 +453,28 @@ class SteamBackend(StoreBackend):
 
     def _scan_steamapps_manifests(self) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
-        sa_dir = self.steam_home() / "steamapps"
-        if not sa_dir.is_dir():
-            return out
-        for path in sorted(sa_dir.glob("appmanifest_*.acf")):
-            parsed = parse_appmanifest_acf(path)
-            if parsed and parsed.get("app_id"):
+        for sa_dir in parse_libraryfolders_vdf(self.steam_home()):
+            for path in sorted(sa_dir.glob("appmanifest_*.acf")):
+                parsed = parse_appmanifest_acf(path)
+                if not parsed or not parsed.get("app_id"):
+                    continue
                 installdir = parsed.get("installdir", "")
                 if installdir:
                     parsed["install_path"] = str(sa_dir / "common" / installdir)
-                out[parsed["app_id"]] = parsed
+                aid = parsed["app_id"]
+                existing = out.get(aid)
+                if existing is None:
+                    out[aid] = parsed
+                else:
+                    # Prefer an entry whose install directory actually exists on disk.
+                    old_exists = bool(
+                        existing.get("install_path") and Path(str(existing["install_path"])).is_dir()
+                    )
+                    new_exists = bool(
+                        parsed.get("install_path") and Path(str(parsed["install_path"])).is_dir()
+                    )
+                    if new_exists and not old_exists:
+                        out[aid] = parsed
         return out
 
     def _get_installed_entry(self, app_id: str) -> dict[str, Any] | None:
@@ -535,6 +548,7 @@ class SteamBackend(StoreBackend):
         *,
         platform: str = "windows",
         branch: str = "public",
+        branch_password: str | None = None,
         account_name: str | None = None,
         offline: bool = False,
         allow_cache_fallback: bool = True,
@@ -559,6 +573,8 @@ class SteamBackend(StoreBackend):
                 "-dir",
                 tmp_dir,
             ]
+            if branch_password:
+                dd_args.extend(["-branchpassword", branch_password])
             if account_name:
                 dd_args.extend(["-username", account_name, "-remember-password"])
 
@@ -605,6 +621,7 @@ class SteamBackend(StoreBackend):
                             "file_count": 0,
                             "disk_size_bytes": None,
                             "download_size_bytes": None,
+                            "has_file_manifest": False,
                             "files": [],
                         }
                     )
@@ -615,8 +632,17 @@ class SteamBackend(StoreBackend):
                 seen_ids.add(did)
                 depots.append(parsed_by_id[did])
 
-            if not depots and proc.returncode != 0:
+            if proc.returncode != 0:
                 if allow_cache_fallback:
+                    if depots:
+                        return {
+                            "app_id": str(app_id),
+                            "platform": platform,
+                            "branch": stdout_info.get("branch") or branch,
+                            "depots": depots,
+                            "partial": True,
+                            "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        }
                     cached = _read_json(cache_path, {})
                     if isinstance(cached, dict) and cached.get("depots"):
                         return cached
@@ -1325,16 +1351,29 @@ class SteamBackend(StoreBackend):
             return pairs[0][1]
         return ",".join(f"{did}:{gid}" for did, gid in pairs)
 
-    def info(self, app_id: str, *, platform: str = "windows", offline: bool = False) -> GameInfo:
+    def info(
+        self,
+        app_id: str,
+        *,
+        platform: str = "windows",
+        offline: bool = False,
+        branch: str | None = None,
+        branch_password: str | None = None,
+    ) -> GameInfo:
         resolved_id = self._resolve_app_id(app_id, offline=offline)
         account_name, _ = self._resolve_account_info()
         installed_entry = self._get_installed_entry(resolved_id)
-        branch = str((installed_entry or {}).get("branch") or "public")
+        effective_branch = (
+            branch.strip()
+            if branch and branch.strip()
+            else str((installed_entry or {}).get("branch") or "public")
+        )
 
         manifest_data = self._fetch_depot_manifests(
             resolved_id,
             platform=platform,
-            branch=branch,
+            branch=effective_branch,
+            branch_password=branch_password,
             account_name=account_name,
             offline=offline,
         )
@@ -1491,7 +1530,7 @@ class SteamBackend(StoreBackend):
             ]
             exe = self._pick_executable_from_paths(disk_exes)
 
-        active_branch = str(manifest_data.get("branch") or branch)
+        active_branch = str(manifest_data.get("branch") or effective_branch)
         manifest_ver = self._version_from_manifests(raw_depots)
         version = manifest_ver or (installed_entry or {}).get("build_id")
 
@@ -1546,10 +1585,17 @@ class SteamBackend(StoreBackend):
         dest.mkdir(parents=True, exist_ok=True)
         branch = (options.branch or "public").strip()
 
-        # Pre-fetch manifest metadata (best-effort) so we know depots, owned DLCs, and redists.
+        # Pre-fetch manifest metadata for the requested branch (including branch password when set)
+        # so depot caches, offline `info()`, `launch_args()`, and package manifests reflect this branch.
         info: GameInfo | None = None
         try:
-            info = self.info(resolved_id, platform=options.platform, offline=False)
+            info = self.info(
+                resolved_id,
+                platform=options.platform,
+                offline=False,
+                branch=branch,
+                branch_password=options.branch_password,
+            )
         except AcquireError:
             info = None
 
@@ -1818,9 +1864,21 @@ class SteamBackend(StoreBackend):
                 offline=False,
                 allow_cache_fallback=False,
             )
+            depots = manifest_data.get("depots") or []
+            missing_file_manifests = [
+                str(d.get("depot_id"))
+                for d in depots
+                if isinstance(d, dict) and not d.get("has_file_manifest", bool(d.get("files")))
+            ]
+            if not depots or missing_file_manifests:
+                raise CommandFailedError(
+                    f"Incomplete depot file manifests for Steam AppID {resolved_id} "
+                    f"(branch {branch!r}); missing file lists for depots: "
+                    f"{', '.join(missing_file_manifests) or 'none'}."
+                )
             checked, missing_files, corrupted_files = self._verify_files_readonly(
                 install_path,
-                manifest_data.get("depots") or [],
+                depots,
             )
             if checked == 0:
                 raise CommandFailedError(
@@ -2030,17 +2088,20 @@ class SteamBackend(StoreBackend):
             )
 
         platform = str((entry or {}).get("platform") or "windows")
+        expected_branch = str((entry or {}).get("branch") or "").strip()
         manifest_data = self._fetch_depot_manifests(
             resolved_id,
             platform=platform,
             offline=True,
         )
+        manifest_branch = str(manifest_data.get("branch") or "").strip()
         manifest_paths: list[str] = []
-        for d in manifest_data.get("depots") or []:
-            if isinstance(d, dict):
-                for f in d.get("files") or []:
-                    if isinstance(f, dict) and f.get("path"):
-                        manifest_paths.append(str(f["path"]))
+        if not expected_branch or not manifest_branch or manifest_branch == expected_branch:
+            for d in manifest_data.get("depots") or []:
+                if isinstance(d, dict):
+                    for f in d.get("files") or []:
+                        if isinstance(f, dict) and f.get("path"):
+                            manifest_paths.append(str(f["path"]))
 
         exe = self._pick_executable_from_paths(manifest_paths)
         if not exe and resolved_dir.is_dir():

@@ -369,6 +369,7 @@ def parse_depot_manifest_txt(text: str, *, filename: str = "") -> dict[str, Any]
         "file_count": file_count if file_count is not None else len(files),
         "disk_size_bytes": disk_bytes,
         "download_size_bytes": compressed_bytes,
+        "has_file_manifest": True,
         "files": files,
     }
 
@@ -527,6 +528,52 @@ def parse_local_owned_app_ids(
             except OSError:
                 pass
     return owned
+
+
+def parse_libraryfolders_vdf(steam_home: Path) -> list[Path]:
+    """Return all existing `steamapps` directories from `steam_home` and `libraryfolders.vdf`."""
+    steamapps_dirs: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add_candidate(raw_dir: Path) -> None:
+        sa = raw_dir if raw_dir.name.lower() == "steamapps" else raw_dir / "steamapps"
+        if not sa.is_dir():
+            return
+        try:
+            key = sa.resolve()
+        except OSError:
+            key = sa
+        if key not in seen:
+            seen.add(key)
+            steamapps_dirs.append(sa)
+
+    _add_candidate(steam_home)
+
+    for vdf_path in (
+        steam_home / "steamapps" / "libraryfolders.vdf",
+        steam_home / "config" / "libraryfolders.vdf",
+    ):
+        if not vdf_path.is_file():
+            continue
+        try:
+            parsed = parse_vdf(vdf_path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+        folders = vdf_get(parsed, "libraryfolders")
+        if not isinstance(folders, dict):
+            continue
+        for key, val in folders.items():
+            raw_path: str | None = None
+            if isinstance(val, dict):
+                p = vdf_get(val, "path", default="")
+                if isinstance(p, str) and p.strip():
+                    raw_path = p.strip()
+            elif isinstance(val, str) and str(key).isdigit() and val.strip():
+                raw_path = val.strip()
+            if raw_path:
+                _add_candidate(Path(raw_path).expanduser())
+
+    return steamapps_dirs
 
 
 def parse_appmanifest_acf(path: Path) -> dict[str, Any] | None:

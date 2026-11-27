@@ -940,6 +940,213 @@ class SteamBackendTests(unittest.TestCase):
         self.assertFalse(bad_ver.ok)
         self.assertEqual(bad_ver.corrupted_files, ["bin/SampleGame.exe"])
 
+    def test_verify_readonly_rejects_partial_or_failed_manifest_query(self) -> None:
+        exe_bytes = b"MZ\x90\x00MOCKPE"
+        exe_sha1 = hashlib.sha1(exe_bytes).hexdigest()
+
+        partial_dd = self.root / "partial-fail-dd"
+        partial_dd.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import os, pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-partial")
+                    sys.exit(0)
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                if "-manifest-only" in argv:
+                    (dest / "manifest_1091501_111.txt").write_text(
+                        "Content Manifest for Depot 1091501\\n"
+                        "Manifest ID / date : 111 / 11/26/2026\\n"
+                        "Size Chunks File SHA Flags Name\\n"
+                        "{len(exe_bytes)} 1 {exe_sha1} 0 bin\\\\SampleGame.exe\\n",
+                        encoding="utf-8",
+                    )
+                    print("Using app branch: 'public'.")
+                    print("Processing depot 1091501 - Base Depot")
+                    print("Manifest 111 (11/26/2026 12:00:00)")
+                    print("Processing depot 1091502 - Missing Depot")
+                    sys.exit(int(os.environ.get("MOCK_EXIT_CODE", "1")))
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        partial_dd.chmod(partial_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=partial_dd)
+        dest = self.root / "games" / "PartialVerifyGame"
+        (dest / "bin").mkdir(parents=True, exist_ok=True)
+        (dest / "bin" / "SampleGame.exe").write_bytes(exe_bytes)
+        backend._save_installs(
+            {
+                "1091500": {
+                    "app_id": "1091500",
+                    "title": "Partial Verify Game",
+                    "account_name": "testplayer",
+                    "install_path": str(dest),
+                    "platform": "windows",
+                    "branch": "public",
+                }
+            }
+        )
+
+        # Case 1: DepotDownloader exits nonzero after writing 1 of 2 manifests -> must raise
+        with self.assertRaises(CommandFailedError):
+            backend.verify("1091500", repair=False)
+
+        # Case 2: DepotDownloader exits 0 but second depot has no parsed manifest .txt -> must raise
+        prev = os.environ.get("MOCK_EXIT_CODE")
+        os.environ["MOCK_EXIT_CODE"] = "0"
+        try:
+            with self.assertRaises(CommandFailedError):
+                backend.verify("1091500", repair=False)
+        finally:
+            if prev is None:
+                os.environ.pop("MOCK_EXIT_CODE", None)
+            else:
+                os.environ["MOCK_EXIT_CODE"] = prev
+
+    def test_beta_download_caches_beta_branch_manifest_and_launch_plan(self) -> None:
+        branch_log = self.root / "branch_dd.log"
+        branch_dd = self.root / "branch-dd"
+        branch_dd.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import json, pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-branch")
+                    sys.exit(0)
+                with pathlib.Path({str(branch_log)!r}).open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(argv) + "\\n")
+                branch = argv[argv.index("-branch") + 1] if "-branch" in argv else "public"
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                if "-manifest-only" in argv:
+                    if branch == "beta":
+                        if "-branchpassword" not in argv or argv[argv.index("-branchpassword") + 1] != "SECRET_BETA":
+                            print("Invalid branch password")
+                            sys.exit(1)
+                        exe_rel = "beta\\\\Game.exe"
+                        gid = "222222222"
+                    else:
+                        exe_rel = "public\\\\Game.exe"
+                        gid = "111111111"
+                    (dest / f"manifest_1091501_{{gid}}.txt").write_text(
+                        f"Content Manifest for Depot 1091501\\n"
+                        f"Manifest ID / date : {{gid}} / 11/26/2026\\n"
+                        f"Size Chunks File SHA Flags Name\\n"
+                        f"10 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 {{exe_rel}}\\n",
+                        encoding="utf-8",
+                    )
+                    print(f"Using app branch: '{{branch}}'.")
+                    print("Processing depot 1091501 - Branch Content")
+                    print(f"Manifest {{gid}} (11/26/2026 12:00:00)")
+                    sys.exit(0)
+                sub = "beta" if branch == "beta" else "public"
+                (dest / sub).mkdir(parents=True, exist_ok=True)
+                (dest / sub / "Game.exe").write_bytes(b"MZ\\x90\\x00BRANCH")
+                print(f"Using app branch: '{{branch}}'.")
+                print("Processing depot 1091501 - Branch Content")
+                print("Manifest 222222222 (11/26/2026 12:00:00)")
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        branch_dd.chmod(branch_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=branch_dd)
+        dest = self.root / "games" / "BetaGame"
+        dl = backend.download(
+            DownloadOptions(
+                app_id="1091500",
+                dest=dest,
+                platform="windows",
+                branch="beta",
+                branch_password="SECRET_BETA",
+            )
+        )
+        self.assertEqual(dl.branch, "beta")
+
+        offline_info = backend.info("1091500", platform="windows", offline=True)
+        self.assertEqual(offline_info.executable, "beta/Game.exe")
+        plan = backend.launch_args("1091500", offline=True)
+        self.assertEqual(plan.executable, "beta/Game.exe")
+        self.assertEqual(plan.working_dir, "beta")
+
+        # Verify manifest-only pre-fetch used the requested beta branch & password
+        logged = [json.loads(ln) for ln in branch_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        manifest_calls = [c for c in logged if "-manifest-only" in c]
+        self.assertEqual(len(manifest_calls), 1)
+        self.assertIn("-branch", manifest_calls[0])
+        self.assertEqual(manifest_calls[0][manifest_calls[0].index("-branch") + 1], "beta")
+        self.assertIn("-branchpassword", manifest_calls[0])
+
+    def test_discovers_installed_games_in_additional_libraryfolders_vdf(self) -> None:
+        ext_lib = self.root / "ExternalSSD" / "SteamLibrary"
+        ext_sa = ext_lib / "steamapps"
+        ext_game_dir = ext_sa / "common" / "ExternalRPG"
+        ext_game_dir.mkdir(parents=True, exist_ok=True)
+        (ext_game_dir / "ExternalRPG.exe").write_bytes(b"MZ\x90\x00EXT")
+        (ext_sa / "appmanifest_444444.acf").write_text(
+            textwrap.dedent(
+                """\
+                "AppState"
+                {
+                    "appid"        "444444"
+                    "name"         "External RPG"
+                    "installdir"   "ExternalRPG"
+                    "buildid"      "555001"
+                    "SizeOnDisk"   "123456"
+                    "LastOwner"    "76561198000000002"
+                }
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        primary_sa = self.steam_home / "steamapps"
+        primary_sa.mkdir(parents=True, exist_ok=True)
+        (primary_sa / "libraryfolders.vdf").write_text(
+            textwrap.dedent(
+                f"""\
+                "libraryfolders"
+                {{
+                    "0"
+                    {{
+                        "path"    "{self.steam_home}"
+                    }}
+                    "1"
+                    {{
+                        "path"    "{ext_lib}"
+                    }}
+                }}
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        backend = self._make_backend()
+        owned = backend.list_owned()
+        ext_owned = [g for g in owned if g.app_id == "444444"]
+        self.assertEqual(len(ext_owned), 1)
+        self.assertTrue(ext_owned[0].installed)
+        self.assertEqual(ext_owned[0].install_path, str(ext_game_dir))
+
+        info = backend.info("444444", platform="windows", offline=True)
+        self.assertTrue(info.installed)
+        self.assertEqual(info.install_path, str(ext_game_dir))
+        self.assertEqual(info.executable, "ExternalRPG.exe")
+
+        plan = backend.launch_args("444444", offline=True)
+        self.assertEqual(plan.install_dir, str(ext_game_dir))
+        self.assertEqual(plan.executable, "ExternalRPG.exe")
+
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):
             if "appdetails" in url:
