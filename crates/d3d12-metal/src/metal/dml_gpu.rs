@@ -169,11 +169,15 @@ inline float dml_apply_act(float x, uint kind, float p0, float p1) {
         case 7u:  return clamp(p0 * x + p1, 0.0f, 1.0f);
         case 8u:  return p1 * (x > 0.0f ? x : p0 * (exp(x) - 1.0f));
         case 9u:  return p0 * tanh(p1 * x);
-        case 10u: return log(exp(p0 * x) + 1.0f) / p0;
+        case 10u: {
+            float z = p0 * x;
+            return (max(z, 0.0f) + log(1.0f + exp(-abs(z)))) / p0;
+        }
         case 11u: return x / (1.0f + abs(x));
         case 12u: return x > p0 ? x : 0.0f;
         case 13u: return 0.5f * x * (1.0f + dml_erf_approx(x * 0.7071067811865475f));
-        case 14u: return max(x, 0.0f) + min(p0 * (exp(x / p0) - 1.0f), 0.0f);
+        case 14u: return p0 > 0.0f ? (x >= 0.0f ? x : p0 * (exp(x / p0) - 1.0f))
+                                   : max(x, 0.0f) + min(p0 * (exp(x / p0) - 1.0f), 0.0f);
         case 15u: return clamp(x, p0, p1);
         default:  return x;
     }
@@ -663,6 +667,77 @@ mod tests {
                 assert!(
                     (got - exp).abs() < 2e-2,
                     "f16 mismatch at ({r},{col}): got={got}, exp={exp}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mpp_matmul2d_gemm_softplus_large_inputs_stay_finite_f32_and_f16() {
+        if crate::metal::device().is_none() {
+            return;
+        }
+        // Cover large positive (>88.7 float exp threshold), zero, and large negative inputs
+        // with Softplus(steepness=1.0 and 2.0) in both FP32 and FP16.
+        let vals = [100.0f32, 250.0, 0.0, -100.0];
+        let eye_k1 = [1.0f32];
+        let a_f32 = make_buf(&f32s_to_bytes(&vals));
+        let b_f32 = make_buf(&f32s_to_bytes(&eye_k1));
+        let out_f32 = make_buf(&vec![0u8; vals.len() * 4]);
+
+        let a_f16_bytes: Vec<u8> = vals.iter().flat_map(|&v| f32_to_f16_bits(v).to_le_bytes()).collect();
+        let b_f16_bytes: Vec<u8> = eye_k1.iter().flat_map(|&v| f32_to_f16_bits(v).to_le_bytes()).collect();
+        let a_f16 = make_buf(&a_f16_bytes);
+        let b_f16 = make_buf(&b_f16_bytes);
+        let out_f16 = make_buf(&vec![0u8; vals.len() * 2]);
+
+        for steepness in [1.0f32, 2.0f32] {
+            let desc_f32 = DmlGemmDesc {
+                dtype: DmlDataType::Float32,
+                batches: 1,
+                m: vals.len() as u32,
+                n: 1,
+                k: 1,
+                trans_a: false,
+                trans_b: false,
+                alpha: 1.0,
+                beta: 0.0,
+                a_batch_stride_elems: 0,
+                b_batch_stride_elems: 0,
+                out_batch_stride_elems: 0,
+                c_batch_stride_elems: 0,
+                c_row_stride_elems: 0,
+                c_col_stride_elems: 0,
+                has_c: false,
+                activation: DmlFusedActivation::Softplus(steepness),
+            };
+            execute_gemm_force((&a_f32, 0), (&b_f32, 0), None, (&out_f32, 0), &desc_f32)
+                .expect("execute_gemm_force f32 softplus");
+            let got_f32 = read_f32s(&out_f32, vals.len());
+
+            let desc_f16 = DmlGemmDesc { dtype: DmlDataType::Float16, ..desc_f32 };
+            execute_gemm_force((&a_f16, 0), (&b_f16, 0), None, (&out_f16, 0), &desc_f16)
+                .expect("execute_gemm_force f16 softplus");
+            let raw_f16 = out_f16.shared_slice(0, vals.len() * 2).unwrap();
+            let got_f16: Vec<f32> = (0..vals.len())
+                .map(|i| f16_bits_to_f32(u16::from_le_bytes([raw_f16[i * 2], raw_f16[i * 2 + 1]])))
+                .collect();
+
+            for (i, &x) in vals.iter().enumerate() {
+                let s = steepness as f64;
+                let z = s * (x as f64);
+                let exp = ((z.max(0.0) + (-z.abs()).exp().ln_1p()) / s) as f32;
+                assert!(got_f32[i].is_finite(), "f32 softplus({x}, {steepness}) non-finite: {}", got_f32[i]);
+                assert!(
+                    (got_f32[i] - exp).abs() < 1e-4,
+                    "f32 softplus({x}, {steepness}): got={}, exp={exp}",
+                    got_f32[i]
+                );
+                assert!(got_f16[i].is_finite(), "f16 softplus({x}, {steepness}) non-finite: {}", got_f16[i]);
+                assert!(
+                    (got_f16[i] - exp).abs() < 0.25,
+                    "f16 softplus({x}, {steepness}): got={}, exp={exp}",
+                    got_f16[i]
                 );
             }
         }
