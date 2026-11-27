@@ -773,6 +773,7 @@ mod vblank {
         struct VBlankState {
             gen: AtomicU64,
             waiters: AtomicUsize,
+            consecutive_timeouts: std::sync::atomic::AtomicU32,
             mu: Mutex<u64>,
             cv: Condvar,
         }
@@ -791,6 +792,7 @@ mod vblank {
             ctx: *mut c_void,
         ) -> i32 {
             let st = &*(ctx as *const VBlankState);
+            st.consecutive_timeouts.store(0, Ordering::Relaxed);
             let next = st.gen.fetch_add(1, Ordering::Release) + 1;
             if st.waiters.load(Ordering::Acquire) > 0 {
                 if let Ok(mut g) = st.mu.lock() {
@@ -833,6 +835,7 @@ mod vblank {
             let state = Arc::new(VBlankState {
                 gen: AtomicU64::new(0),
                 waiters: AtomicUsize::new(0),
+                consecutive_timeouts: std::sync::atomic::AtomicU32::new(0),
                 mu: Mutex::new(0),
                 cv: Condvar::new(),
             });
@@ -857,6 +860,12 @@ mod vblank {
                 pace_monotonic(fallback_hz);
                 return false;
             };
+            // If the display link stopped ticking (e.g. headless/asleep panel), fall back
+            // to monotonic refresh-phase pacing instead of stalling on repeated timeouts.
+            if st.consecutive_timeouts.load(Ordering::Relaxed) >= 2 {
+                pace_monotonic(fallback_hz);
+                return false;
+            }
             st.waiters.fetch_add(1, Ordering::AcqRel);
             let start = st.gen.load(Ordering::Acquire);
             let mut guard = st.mu.lock().unwrap();
@@ -865,7 +874,7 @@ mod vblank {
                 *guard = start;
             }
             let max_wait = Duration::from_micros(
-                (2_500_000u64 / fallback_hz.max(1) as u64).clamp(50_000, 250_000),
+                (2_500_000u64 / fallback_hz.max(1) as u64).clamp(25_000, 100_000),
             );
             let (guard, timeout) = st
                 .cv
@@ -874,6 +883,9 @@ mod vblank {
             let ticked = *guard > start && !timeout.timed_out();
             drop(guard);
             st.waiters.fetch_sub(1, Ordering::AcqRel);
+            if !ticked {
+                st.consecutive_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
             ticked
         }
     }

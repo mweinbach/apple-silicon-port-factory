@@ -129,8 +129,14 @@ pub struct Swapchain {
     /// Active `DXGI_COLOR_SPACE_TYPE` configured on the `CAMetalLayer`.
     pub color_space: u32,
     pub buffers: Vec<Arc<Resource>>,
+    /// Pre-created linear UNORM views for `*_sRGB` back buffers so compute
+    /// staging/present blits never allocate an ObjC texture view per frame.
+    buf_linear_views: Vec<Option<super::present_thread::SendTex>>,
     pub current: usize,
     pub presents: u64,
+    /// Host display refresh rate in Hz used to compute `presentAfterMinimumDuration`
+    /// for `sync_interval >= 2` (e.g. 60 fps on 120 Hz ProMotion panels).
+    refresh_hz: u32,
     state: Mutex<PresentState>,
     /// Present queue (on-screen swapchains): the drawable wait and blit run
     /// here, so the main queue never stalls on drawable availability.
@@ -175,6 +181,56 @@ extern "C" {
     static kCGColorSpaceITUR_2100_HLG: *const std::ffi::c_void;
     fn CGColorSpaceCreateWithName(name: *const std::ffi::c_void) -> *mut CgColorSpace;
     fn CGColorSpaceRelease(space: *mut CgColorSpace);
+    #[cfg(target_os = "macos")]
+    fn CGMainDisplayID() -> u32;
+    #[cfg(target_os = "macos")]
+    fn CGDisplayCopyDisplayMode(display: u32) -> *mut std::ffi::c_void;
+    #[cfg(target_os = "macos")]
+    fn CGDisplayModeGetRefreshRate(mode: *mut std::ffi::c_void) -> f64;
+    #[cfg(target_os = "macos")]
+    fn CGDisplayModeRelease(mode: *mut std::ffi::c_void);
+}
+
+/// Minimum presentation duration (seconds) for `MTLDrawable::presentAfterMinimumDuration:`
+/// when `sync_interval >= 2`. Returns `None` for `sync_interval <= 1` (use `present()`).
+#[inline]
+pub fn present_min_duration(sync_interval: u32, refresh_hz: u32) -> Option<f64> {
+    if sync_interval < 2 {
+        return None;
+    }
+    let clamped = sync_interval.min(4) as f64;
+    let hz = refresh_hz.max(1) as f64;
+    Some(clamped / hz)
+}
+
+fn default_host_refresh_hz() -> u32 {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let id = CGMainDisplayID();
+        if id != 0 {
+            let mode = CGDisplayCopyDisplayMode(id);
+            if !mode.is_null() {
+                let rate = CGDisplayModeGetRefreshRate(mode);
+                CGDisplayModeRelease(mode);
+                if rate.is_finite() && rate >= 24.0 {
+                    return rate.round() as u32;
+                }
+            }
+        }
+    }
+    60
+}
+
+fn make_linear_views(buffers: &[Arc<Resource>]) -> Vec<Option<super::present_thread::SendTex>> {
+    buffers
+        .iter()
+        .map(|b| {
+            let tex = b.texture()?;
+            let lf = super::present_thread::srgb_linear_twin(tex.pixelFormat())?;
+            tex.newTextureViewWithPixelFormat(lf)
+                .map(super::present_thread::SendTex)
+        })
+        .collect()
 }
 
 /// CoreGraphics target for a `DXGI_COLOR_SPACE_TYPE`.
@@ -387,7 +443,7 @@ impl Swapchain {
             main(Box::new(move || {
                 l.0.setDevice(Some(dev));
                 l.0.setPixelFormat(mtl_format);
-                l.0.setFramebufferOnly(false);
+                l.0.setFramebufferOnly(true);
                 l.0.setMaximumDrawableCount(3);
                 #[cfg(target_os = "macos")]
                 l.0.setDisplaySyncEnabled(init_sync);
@@ -398,6 +454,7 @@ impl Swapchain {
             }));
         }
         let buffers = make_buffers(w, h, dxgi, count)?;
+        let buf_linear_views = make_linear_views(&buffers);
         let mut allocs = Vec::new();
         let mut cbs = Vec::new();
         for _ in 0..RING {
@@ -436,8 +493,10 @@ impl Swapchain {
             mtl_format,
             color_space: init_cs,
             buffers,
+            buf_linear_views,
             current: 0,
             presents: 0,
+            refresh_hz: default_host_refresh_hz(),
             state: Mutex::new(PresentState {
                 allocs,
                 cbs,
@@ -457,6 +516,19 @@ impl Swapchain {
             opt_present_off_main: present_off_main(),
             opt_present_blit_narrow: present_blit_narrow(),
         })
+    }
+
+    /// Update the active display refresh rate (Hz) used for `sync_interval >= 2`
+    /// frame pacing via `MTLDrawable::presentAfterMinimumDuration:`.
+    pub fn set_refresh_hz(&mut self, hz: u32) {
+        if hz > 0 {
+            self.refresh_hz = hz;
+        }
+    }
+
+    /// Active display refresh rate (Hz) configured on this swapchain.
+    pub fn refresh_hz(&self) -> u32 {
+        self.refresh_hz
     }
 
     /// `SetColorSpace1`: configure `CAMetalLayer.colorspace`, EDR headroom, and
@@ -521,11 +593,13 @@ impl Swapchain {
         if let Some(l) = &self.layer {
             main(Box::new(move || {
                 l.0.setPixelFormat(mtl_format);
+                l.0.setFramebufferOnly(true);
                 l.0.setDrawableSize(objc2_core_foundation::CGSize { width: w as f64, height: h as f64 });
                 let _ = unsafe { apply_layer_colorspace(&l.0, cs) };
             }));
         }
         self.buffers = make_buffers(w, h, dxgi, count)?;
+        self.buf_linear_views = make_linear_views(&self.buffers);
         if let Some(pt) = &self.pthread {
             pt.set_staging(w, h, staging_format(&self.buffers)?)?;
         }
@@ -681,7 +755,7 @@ impl Swapchain {
 
     /// Vsync'd on-screen present (blit on the present queue from this
     /// thread) or offscreen present.
-    fn present_sync(&mut self, sync_interval: u32, _want_sync: bool) -> Result<u64, String> {
+    fn present_sync(&mut self, sync_interval: u32, want_sync: bool) -> Result<u64, String> {
         if self.async_mode {
             if let Some(pt) = &self.pthread {
                 pt.drain();
@@ -693,6 +767,8 @@ impl Swapchain {
             }
             self.async_mode = false;
         }
+        let src = self.buffers[self.current].texture().ok_or("back buffer is not a texture")?;
+        let src_linear = self.buf_linear_views[self.current].as_ref().map(|v| &*v.0);
         let pq = self.pq.clone();
         let mut st = self.state.lock().unwrap();
         let pres_q: &Queue = pq.as_deref().unwrap_or(&self.queue);
@@ -717,45 +793,57 @@ impl Swapchain {
         st.ring = (i + 1) % RING;
         let cb = st.cbs[i].clone();
         cb.beginCommandBufferWithAllocator(&st.allocs[i].a);
-        let src = self.buffers[self.current].texture().ok_or("back buffer is not a texture")?;
-        let e = cb.computeCommandEncoder().ok_or("compute encoder")?;
         let use_pq = drawable.is_some() && pq.is_some();
         let after_stages = if use_pq && self.opt_present_blit_narrow {
             super::encstats::inc(&super::encstats::c::present_blit_narrow);
-            MTLStages::Blit
+            MTLStages::Fragment
         } else {
             MTLStages::All
         };
         let dst_tex = drawable.as_ref().map(|d| d.texture());
-        let compute_blit = dst_tex.as_ref().is_some_and(|dst| super::present_thread::needs_compute_blit(src, dst));
         if self.presents == 0 {
             if let Some(dst) = &dst_tex {
                 log::info!(
                     target: "d3d",
-                    "swapchain first present: src={:?} {}x{}, dst={:?} {}x{}, compute_blit={compute_blit}",
+                    "swapchain first present: src={:?} {}x{}, dst={:?} {}x{}, fb_only={}",
                     src.pixelFormat(),
                     src.width(),
                     src.height(),
                     dst.pixelFormat(),
                     dst.width(),
                     dst.height(),
+                    dst.isFramebufferOnly(),
                 );
             }
         }
-        let before_stages = if compute_blit {
-            MTLStages::Blit | MTLStages::Dispatch
-        } else {
-            MTLStages::Blit
-        };
-        e.barrierAfterQueueStages_beforeStages_visibilityOptions(after_stages, before_stages, MTL4VisibilityOptions::Device);
+        let n = self.presents + 1;
+        let capture_due = super::capture::has_pending()
+            || super::capture::config().is_some_and(|(_, at)| at.contains(&n));
         let keep_views = if let Some(dst) = &dst_tex {
-            super::present_thread::blit(&e, src, dst)
+            super::present_thread::render_present_pass(
+                &cb,
+                src,
+                src_linear,
+                dst,
+                after_stages,
+                None,
+            )?
         } else {
             Vec::new()
         };
-        let n = self.presents + 1;
-        let capture = capture_encode(&e, src, n);
-        e.endEncoding();
+        let capture = if capture_due {
+            let e = cb.computeCommandEncoder().ok_or("compute encoder")?;
+            e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                MTLStages::All,
+                MTLStages::Blit,
+                MTL4VisibilityOptions::Device,
+            );
+            let c = capture_encode(&e, src, n);
+            e.endEncoding();
+            c
+        } else {
+            None
+        };
         cb.endCommandBuffer();
         let (v, pv, owner) = match &drawable {
             Some(drawable) => {
@@ -770,7 +858,15 @@ impl Swapchain {
                     pq.defer_release(Box::new(keep_views));
                 }
                 pq.q.signalDrawable(md);
-                md.present();
+                if want_sync {
+                    if let Some(min_dur) = present_min_duration(sync_interval, self.refresh_hz) {
+                        md.presentAfterMinimumDuration(min_dur);
+                    } else {
+                        md.present();
+                    }
+                } else {
+                    md.present();
+                }
                 self.buf_pv[self.current] = pv;
                 self.last_pv = pv;
                 // The next frame renders into the next buffer: its
@@ -786,8 +882,10 @@ impl Swapchain {
             None => {
                 let v = self.queue.submit(&[&cb]);
                 // Offscreen: no display to wait on; pace vsync'd presents.
-                if sync_interval > 0 {
-                    let period = std::time::Duration::from_micros(16_667 * sync_interval.min(4) as u64);
+                if want_sync && sync_interval > 0 {
+                    let period_us = (1_000_000u64 / self.refresh_hz.max(1) as u64)
+                        * sync_interval.min(4) as u64;
+                    let period = std::time::Duration::from_micros(period_us);
                     if let Some(t) = self.last_present {
                         if let Some(rest) = period.checked_sub(t.elapsed()) {
                             std::thread::sleep(rest);
@@ -824,7 +922,9 @@ impl Drop for Swapchain {
     }
 }
 
-/// Staging texture format: the back buffers' own Metal format.
+/// Staging texture format: the back buffers' own Metal format so `q0`/`sq`
+/// executes a pure hardware DMA `copyFromTexture` while `pq` performs the single
+/// TBDR fullscreen render pass directly into a `framebufferOnly = true` drawable.
 fn staging_format(buffers: &[Arc<Resource>]) -> Result<MTLPixelFormat, String> {
     Ok(buffers.first().and_then(|b| b.texture()).ok_or("back buffer is not a texture")?.pixelFormat())
 }
@@ -1615,5 +1715,201 @@ mod tests {
         std::env::set_var("PORT_VSYNC", "");
         std::env::set_var("AW2_VSYNC", "false");
         assert!(vsync_disabled_from_env());
+    }
+
+    #[test]
+    fn present_min_duration_computes_promotion_60hz_and_clamps_sync_interval() {
+        assert_eq!(present_min_duration(0, 120), None);
+        assert_eq!(present_min_duration(1, 120), None);
+        let d2_120 = present_min_duration(2, 120).expect("sync_interval=2 must set min duration");
+        assert!((d2_120 - (1.0 / 60.0)).abs() < 1e-9, "2/120 Hz must equal 1/60 s, got {d2_120}");
+        let d3_120 = present_min_duration(3, 120).unwrap();
+        assert!((d3_120 - (3.0 / 120.0)).abs() < 1e-9);
+        let d4_120 = present_min_duration(4, 120).unwrap();
+        assert!((d4_120 - (1.0 / 30.0)).abs() < 1e-9);
+        assert_eq!(present_min_duration(8, 120), Some(4.0 / 120.0));
+        let d2_60 = present_min_duration(2, 60).unwrap();
+        assert!((d2_60 - (1.0 / 30.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn render_present_pass_swizzles_rgba8_srgb_and_scales_into_framebuffer_only_layer_on_gpu() {
+        let Some(d) = super::super::device() else { return };
+        let q0 = Arc::new(Queue::new(ListType::Direct, "render present test q0").unwrap());
+        let layer = CAMetalLayer::new();
+        let layer_ptr = Retained::as_ptr(&layer) as *mut std::ffi::c_void;
+        let mut sc = unsafe { Swapchain::new(layer_ptr, q0.clone(), 8, 8, 28, 2, &|f| f()).unwrap() };
+        assert!(layer.framebufferOnly(), "Swapchain::new must enable CAMetalLayer.framebufferOnly");
+
+        // Present sync_interval=2 on 120 Hz ProMotion (exercises presentAfterMinimumDuration + render pass)
+        sc.set_refresh_hz(120);
+        assert_eq!(sc.refresh_hz(), 120);
+        let alloc = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut cl = CommandList::new(ListType::Direct).unwrap();
+        let rtv0 = TargetView::rtv(&sc.buffers[0], None).unwrap();
+        cl.begin(&alloc).unwrap();
+        unsafe { cl.clear_rtv(&rtv0, [1.0, 0.25, 0.06, 1.0], &[]).unwrap() };
+        cl.close().unwrap();
+        q0.submit(&[&cl.cb]);
+        let _ = sc.present(2).unwrap();
+        assert!(layer.framebufferOnly(), "CAMetalLayer.framebufferOnly must stay true on present_sync");
+
+        // Verify AW2_PRESENT_CAPTURE captures pre-swizzle RGBA8 back buffer accurately on present_async.
+        let cap_path = std::env::temp_dir().join(format!("d3d12_present_cap_{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&cap_path);
+        super::super::capture::request_next(cap_path.to_string_lossy().into_owned());
+        let rtv1 = TargetView::rtv(&sc.buffers[sc.current], None).unwrap();
+        alloc.reset();
+        cl.begin(&alloc).unwrap();
+        unsafe { cl.clear_rtv(&rtv1, [1.0, 0.0, 0.0, 1.0], &[]).unwrap() };
+        cl.close().unwrap();
+        q0.submit(&[&cl.cb]);
+        let _ = sc.present(0).unwrap();
+        sc.pthread.as_ref().unwrap().drain();
+        assert!(cap_path.is_file(), "present capture PNG must be written");
+        let _ = std::fs::remove_file(&cap_path);
+        assert!(layer.framebufferOnly(), "CAMetalLayer.framebufferOnly must stay true on present_async");
+
+        // Verify render_present_pass pixel accuracy for RGBA8 -> BGRA8, sRGB -> sRGB (all 256 values),
+        // sRGB -> UNORM (no double-gamma), and 4x2 RGB10A2 -> 8x8 BGRA8 centered letterbox scaling.
+        let run_render_present = |src_fmt: MTLPixelFormat,
+                                  sw: usize,
+                                  sh: usize,
+                                  src_bytes: &[u8],
+                                  dst_fmt: MTLPixelFormat,
+                                  dw: usize,
+                                  dh: usize|
+         -> Vec<u8> {
+            let std = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(src_fmt, sw, sh, false)
+            };
+            std.setStorageMode(MTLStorageMode::Shared);
+            std.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView);
+            let src_tex = d.dev.newTextureWithDescriptor(&std).unwrap();
+            unsafe {
+                src_tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    MTLRegion { origin: MTLOrigin { x: 0, y: 0, z: 0 }, size: MTLSize { width: sw, height: sh, depth: 1 } },
+                    0,
+                    std::ptr::NonNull::new(src_bytes.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                    sw * 4,
+                );
+            }
+            let dtd = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(dst_fmt, dw, dh, false)
+            };
+            dtd.setStorageMode(MTLStorageMode::Shared);
+            dtd.setUsage(MTLTextureUsage::RenderTarget);
+            let dst_tex = d.dev.newTextureWithDescriptor(&dtd).unwrap();
+
+            d.add_resident(ProtocolObject::from_ref(&*src_tex));
+            d.add_resident(ProtocolObject::from_ref(&*dst_tex));
+            d.commit_residency();
+
+            let cb = d.dev.newCommandBuffer().unwrap();
+            let a = CommandAllocator::new(ListType::Direct).unwrap();
+            cb.beginCommandBufferWithAllocator(&a.a);
+            let keep = super::super::present_thread::render_present_pass(
+                &cb,
+                &src_tex,
+                None,
+                &dst_tex,
+                MTLStages::All,
+                None,
+            )
+            .unwrap();
+            cb.endCommandBuffer();
+            q0.submit(&[&cb]);
+            if !keep.is_empty() {
+                q0.defer_release(Box::new(keep));
+            }
+            q0.wait_idle();
+
+            let mut out = vec![0u8; dw * dh * 4];
+            unsafe {
+                dst_tex.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                    std::ptr::NonNull::new(out.as_mut_ptr() as *mut std::ffi::c_void).unwrap(),
+                    dw * 4,
+                    MTLRegion { origin: MTLOrigin { x: 0, y: 0, z: 0 }, size: MTLSize { width: dw, height: dh, depth: 1 } },
+                    0,
+                );
+            }
+            d.remove_resident(ProtocolObject::from_ref(&*src_tex));
+            d.remove_resident(ProtocolObject::from_ref(&*dst_tex));
+            out
+        };
+
+        // 1. RGBA8Unorm -> BGRA8Unorm exact channel swizzle.
+        let rgba: Vec<u8> = [0xFFu8, 0x40, 0x10, 0xFF].iter().copied().cycle().take(4 * 4 * 4).collect();
+        let bgra = run_render_present(MTLPixelFormat::RGBA8Unorm, 4, 4, &rgba, MTLPixelFormat::BGRA8Unorm, 4, 4);
+        for px in bgra.chunks_exact(4) {
+            assert_eq!(px, &[0x10, 0x40, 0xFF, 0xFF]);
+        }
+
+        // 2. RGBA8Unorm_sRGB -> BGRA8Unorm_sRGB bit-accurate roundtrip across all 256 byte values (0..=255).
+        let mut srgb_in = Vec::with_capacity(256 * 4);
+        for v in 0u8..=255 {
+            srgb_in.extend_from_slice(&[v, 255 - v, v.wrapping_mul(3), 0xFF]);
+        }
+        let srgb_out = run_render_present(
+            MTLPixelFormat::RGBA8Unorm_sRGB,
+            16,
+            16,
+            &srgb_in,
+            MTLPixelFormat::BGRA8Unorm_sRGB,
+            16,
+            16,
+        );
+        for i in 0..256 {
+            let r = srgb_in[i * 4];
+            let g = srgb_in[i * 4 + 1];
+            let b = srgb_in[i * 4 + 2];
+            assert_eq!(
+                &srgb_out[i * 4..i * 4 + 4],
+                &[b, g, r, 0xFF],
+                "sRGB->sRGB render present mismatch at pixel {i}"
+            );
+        }
+
+        // 3. RGBA8Unorm_sRGB -> BGRA8Unorm preserves raw sRGB bytes without double-gamma darkening.
+        let srgb_raw: Vec<u8> = [0x80u8, 0x40, 0xC0, 0xFF].iter().copied().cycle().take(4 * 4 * 4).collect();
+        let unorm_out = run_render_present(
+            MTLPixelFormat::RGBA8Unorm_sRGB,
+            4,
+            4,
+            &srgb_raw,
+            MTLPixelFormat::BGRA8Unorm,
+            4,
+            4,
+        );
+        for px in unorm_out.chunks_exact(4) {
+            assert_eq!(px, &[0xC0, 0x40, 0x80, 0xFF]);
+        }
+
+        // 4. 4x2 RGB10A2Unorm -> 8x8 BGRA8Unorm aspect-preserving centered scale + black letterbox bars.
+        let packed: u32 = 1023u32 | (512u32 << 10) | (256u32 << 20) | (3u32 << 30);
+        let rgb10: Vec<u8> = (0..8).flat_map(|_| packed.to_le_bytes()).collect();
+        let scaled = run_render_present(
+            MTLPixelFormat::RGB10A2Unorm,
+            4,
+            2,
+            &rgb10,
+            MTLPixelFormat::BGRA8Unorm,
+            8,
+            8,
+        );
+        for y in 0..8usize {
+            for x in 0..8usize {
+                let off = (y * 8 + x) * 4;
+                let (b, g, r, a) = (scaled[off], scaled[off + 1], scaled[off + 2], scaled[off + 3]);
+                if (2..6).contains(&y) {
+                    assert_eq!(r, 0xFF, "scaled center ({x},{y}) R");
+                    assert!((g as i32 - 0x80).abs() <= 1, "scaled center ({x},{y}) G={g:#x}");
+                    assert!((b as i32 - 0x40).abs() <= 1, "scaled center ({x},{y}) B={b:#x}");
+                    assert_eq!(a, 0xFF, "scaled center ({x},{y}) A");
+                } else {
+                    assert_eq!((r, g, b, a), (0, 0, 0, 0xFF), "scaled letterbox ({x},{y}) must be opaque black");
+                }
+            }
+        }
     }
 }

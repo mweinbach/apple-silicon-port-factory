@@ -8,6 +8,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::AnyThread;
 use objc2_metal::*;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -47,7 +48,19 @@ unsafe impl Sync for Listener {}
 
 fn listener() -> &'static MTLSharedEventListener {
     static L: OnceLock<Listener> = OnceLock::new();
-    &L.get_or_init(|| Listener(MTLSharedEventListener::new())).0
+    &L.get_or_init(|| {
+        let attr = dispatch2::DispatchQueueAttr::with_qos_class(
+            dispatch2::DispatchQueueAttr::SERIAL,
+            dispatch2::DispatchQoS::UserInteractive,
+            0,
+        );
+        let q = dispatch2::DispatchQueue::new("port.mtl.shared_event_listener", Some(&attr));
+        let l = unsafe {
+            MTLSharedEventListener::initWithDispatchQueue(MTLSharedEventListener::alloc(), &q)
+        };
+        Listener(l)
+    })
+    .0
 }
 
 impl Fence {
@@ -210,5 +223,43 @@ impl Drop for Fence {
                 self as *const Fence as usize,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_event_listener_runs_at_user_interactive_qos() {
+        let Some(fence) = Fence::new(0) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        fence.on_completion(
+            1,
+            Box::new(move || {
+                #[cfg(target_vendor = "apple")]
+                let qos = unsafe {
+                    extern "C" {
+                        fn qos_class_self() -> libc::qos_class_t;
+                    }
+                    qos_class_self() as u32
+                };
+                #[cfg(not(target_vendor = "apple"))]
+                let qos = 0u32;
+                let _ = tx.send(qos);
+            }),
+        );
+        fence.signal_cpu(1);
+        let observed = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("MTLSharedEventListener completion callback timed out");
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(
+            observed,
+            libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE as u32,
+            "MTLSharedEventListener dispatch queue must run at QOS_CLASS_USER_INTERACTIVE"
+        );
     }
 }

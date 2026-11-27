@@ -42,6 +42,9 @@ struct State {
     occluded_logged: bool,
     /// Released once per completed present; starts at the maximum frame latency.
     latency: Arc<Semaphore>,
+    /// Permits still to be swallowed by upcoming frame completions after
+    /// `SetMaximumFrameLatency` lowered the limit below in-flight frames.
+    pending_latency_drain: Arc<Mutex<u32>>,
 }
 unsafe impl Send for State {}
 
@@ -156,6 +159,21 @@ fn main_sync(f: Box<dyn FnOnce() + Send + '_>) {
     if crate::macos::run_sync(f).is_none() {
         log::warn!(target: "d3d", "swapchain: no main thread (headless); layer not configured");
     }
+}
+
+fn refresh_hz_for_hwnd(hwnd: usize) -> u32 {
+    let ms = crate::macos::display::monitors();
+    if hwnd != 0 {
+        let r = crate::user32::monitor::monitor_rect_for_window(hwnd);
+        if let Some(m) = ms.iter().find(|m| m.rect == r) {
+            return m.refresh_hz.max(1);
+        }
+    }
+    ms.iter()
+        .find(|m| m.primary)
+        .or_else(|| ms.first())
+        .map(|m| m.refresh_hz.max(1))
+        .unwrap_or(60)
 }
 
 unsafe fn wrap_buffers(sc: &MtlSwapchain) -> Vec<PR> {
@@ -303,10 +321,11 @@ pub unsafe fn create(factory: *mut Obj<Factory>, queue: *mut c_void, hwnd: usize
         h = if h == 0 { ch.max(8) } else { h };
     }
     let count = desc.buffer_count.clamp(2, 16);
-    let sc = match MtlSwapchain::new(layer, q.q.clone(), w, h, desc.format, count, &main_sync) {
+    let mut sc = match MtlSwapchain::new(layer, q.q.clone(), w, h, desc.format, count, &main_sync) {
         Ok(s) => s,
         Err(e) => return failed!(DXGI_ERROR_INVALID_CALL, "CreateSwapChain({desc:?}): {e}"),
     };
+    sc.set_refresh_hz(refresh_hz_for_hwnd(hwnd));
     let buffers = wrap_buffers(&sc);
     let mut d = desc;
     d.width = w;
@@ -341,6 +360,7 @@ pub unsafe fn create(factory: *mut Obj<Factory>, queue: *mut c_void, hwnd: usize
         d3d12_metal::metal::queue::enable_perf_meter();
     }
     let latency = Arc::new(Semaphore::new(max_latency as i32, 16, None));
+    let pending_latency_drain = Arc::new(Mutex::new(0u32));
     com_add_ref(factory as *mut c_void);
     com_add_ref(queue);
     let initial_cs = sc.color_space;
@@ -365,6 +385,7 @@ pub unsafe fn create(factory: *mut Obj<Factory>, queue: *mut c_void, hwnd: usize
             matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             occluded_logged: false,
             latency,
+            pending_latency_drain,
         }),
     });
     crate::macos::set_active_swapchain_size(w, h);
@@ -414,8 +435,14 @@ unsafe fn present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
             st.occluded_logged = false;
             st.present_refresh = crate::dxgi::adapter::record_present();
             let sem = st.latency.clone();
+            let drain = st.pending_latency_drain.clone();
             st.sc.queue.timeline.on_completion(v, Box::new(move || {
-                sem.release(1);
+                let mut d = drain.lock().unwrap();
+                if *d > 0 {
+                    *d -= 1;
+                } else {
+                    sem.release(1);
+                }
             }));
             let n = s.presents.fetch_add(1, Ordering::AcqRel) + 1;
             d3d12_metal::metal::gpucapture::on_present(n.into());
@@ -520,7 +547,11 @@ unsafe fn present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
                 }
             }
             if n == 120 || n == 240 || n % 600 == 0 {
-                d3d12_metal::metal::pipeline::flush_pso_cache();
+                if d3d12_metal::metal::pipeline::pso_cache_stats_if_initialized().is_some() {
+                    if let Ok(cache) = d3d12_metal::metal::pipeline::pso_cache() {
+                        cache.flush_incremental_async();
+                    }
+                }
             }
             if n % 600 == 0 && d3d12_metal::metal::encstats::enabled() {
                 d3d12_metal::metal::encstats::dump(600);
@@ -738,6 +769,7 @@ unsafe fn do_resize(this: PS, count: u32, w: u32, h: u32, fmt: u32, flags: u32) 
     if let Err(e) = st.sc.resize(w, h, fmt, count, &main_sync) {
         return failed!(DXGI_ERROR_INVALID_CALL, "ResizeBuffers({count}, {w}x{h}, {}): {e}", d3d12_metal::format::name(fmt));
     }
+    st.sc.set_refresh_hz(refresh_hz_for_hwnd(s.hwnd));
     for b in std::mem::take(&mut st.buffers) {
         Obj::release(b);
     }
@@ -894,8 +926,23 @@ unsafe extern "win64" fn set_maximum_frame_latency(this: PS, n: u32) -> HRESULT 
         return failed!(DXGI_ERROR_INVALID_CALL, "SetMaximumFrameLatency({n})");
     }
     let mut st = Obj::get(this).st.lock().unwrap();
-    if n > st.max_latency {
-        st.latency.release((n - st.max_latency) as i32);
+    let prev = st.max_latency;
+    if n > prev {
+        let delta = n - prev;
+        let mut d = st.pending_latency_drain.lock().unwrap();
+        let cancel = (*d).min(delta);
+        *d -= cancel;
+        let release = delta - cancel;
+        if release > 0 {
+            st.latency.release(release as i32);
+        }
+    } else if n < prev {
+        let mut rem = prev - n;
+        let mut d = st.pending_latency_drain.lock().unwrap();
+        while rem > 0 && st.latency.try_take() {
+            rem -= 1;
+        }
+        *d += rem;
     }
     log::debug!(target: "d3d", "SetMaximumFrameLatency({n})");
     st.max_latency = n;
@@ -1159,5 +1206,95 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_maximum_frame_latency_drains_available_and_in_flight_permits() {
+        if d3d12_metal::metal::device().is_none() {
+            return;
+        }
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_headless = std::env::var_os("PORT_HEADLESS");
+        std::env::set_var("PORT_HEADLESS", "1");
+        unsafe {
+            let mut factory: *mut c_void = std::ptr::null_mut();
+            let mut device: *mut c_void = std::ptr::null_mut();
+            let mut queue: *mut c_void = std::ptr::null_mut();
+            assert_eq!(crate::dxgi::CreateDXGIFactory1(&crate::dxgi::IID_IDXGIFactory1, &mut factory), S_OK);
+            assert_eq!(
+                crate::d3d12::D3D12CreateDevice(std::ptr::null_mut(), 0xb000, &crate::d3d12::vtables::IID_ID3D12Device, &mut device),
+                S_OK
+            );
+            let qd = d3d12_metal::types::CommandQueueDesc { Type: 0, Priority: 0, Flags: 0, NodeMask: 0 };
+            let create_q: unsafe extern "win64" fn(*mut c_void, *const d3d12_metal::types::CommandQueueDesc, *const Guid, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute((*(device as *const *const usize)).add(8).read());
+            assert_eq!(create_q(device, &qd, &crate::d3d12::vtables::IID_ID3D12CommandQueue, &mut queue), S_OK);
+
+            let desc = SwapChainDesc1 {
+                width: 64,
+                height: 64,
+                format: 28,
+                sample_count: 1,
+                buffer_usage: 0x20,
+                buffer_count: 3,
+                swap_effect: 4,
+                flags: FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+                ..Default::default()
+            };
+            let mut sc: *mut c_void = std::ptr::null_mut();
+            assert_eq!(create(factory as *mut Obj<Factory>, queue, 0, desc, None, &mut sc), S_OK);
+            let sc_obj = sc as PS;
+            let waitable = get_frame_latency_waitable_object(sc_obj);
+            assert!(!waitable.is_null());
+
+            // 1. Default waitable latency is 1 -> raise to 3 -> lower to 1 while all permits available.
+            assert_eq!(set_maximum_frame_latency(sc_obj, 3), S_OK);
+            assert_eq!(set_maximum_frame_latency(sc_obj, 1), S_OK);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(waitable, 0), 0);
+            assert_eq!(
+                crate::kernel32::threads::WaitForSingleObject(waitable, 0),
+                0x102,
+                "lowering max_latency from 3->1 must drain 2 excess available permits"
+            );
+
+            // Restore the 1 permit we consumed by presenting once and waiting for GPU completion.
+            assert_eq!(do_present(sc_obj, 0, 0), S_OK);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(waitable, 5000), 0);
+
+            // 2. Raise to 3, consume all 3 permits (1 already held + 2 newly released), lower to 1
+            //    BEFORE presenting the 3 frames so the 2 excess permits must be swallowed on completion.
+            assert_eq!(set_maximum_frame_latency(sc_obj, 3), S_OK);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(waitable, 0), 0);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(waitable, 0), 0);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(waitable, 0), 0x102);
+
+            assert_eq!(set_maximum_frame_latency(sc_obj, 1), S_OK);
+            for _ in 0..3 {
+                assert_eq!(do_present(sc_obj, 0, 0), S_OK);
+            }
+            {
+                let st = Obj::get(sc_obj).st.lock().unwrap();
+                st.sc.queue.wait_idle();
+            }
+            // Wait for the single surviving permit, then confirm no extra permits leaked through.
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(waitable, 5000), 0);
+            // Give libdispatch a brief moment in case any spurious release was queued.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert_eq!(
+                crate::kernel32::threads::WaitForSingleObject(waitable, 0),
+                0x102,
+                "lowering max_latency with in-flight frames must swallow excess completion releases"
+            );
+
+            crate::handles::close(waitable);
+            com_release(sc);
+            com_release(queue);
+            com_release(device);
+            com_release(factory);
+        }
+        match prev_headless {
+            Some(v) => std::env::set_var("PORT_HEADLESS", v),
+            None => std::env::remove_var("PORT_HEADLESS"),
+        }
     }
 }
