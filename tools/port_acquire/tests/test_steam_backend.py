@@ -1835,6 +1835,125 @@ class SteamBackendTests(unittest.TestCase):
         self.assertEqual(chk_new.old_version, "8811223344556677889")
         self.assertEqual(chk_new.new_version, "9922334455667788990")
 
+    def test_per_depot_branch_fallback_warning_aborts_before_download(self) -> None:
+        fb_log = self.root / "fallback_dd.log"
+        fb_dd = self.root / "fallback-dd"
+        fb_dd.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import json, pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-fallback")
+                    sys.exit(0)
+                with pathlib.Path({str(fb_log)!r}).open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(argv) + "\\n")
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                # Mirror DepotDownloader 3.4.0 ContentDownloader.cs#L519-L526:
+                # header still prints requested branch, then per-depot warning falls back to public.
+                print("Using app branch: 'beta'.")
+                print('Warning: Depot 1091501 does not have branch named "beta". Trying public branch.')
+                print("Processing depot 1091501 - Public Content")
+                print("Manifest 111111 (11/26/2026 12:00:00)")
+                if "-manifest-only" in argv:
+                    (dest / "manifest_1091501_111111.txt").write_text(
+                        "Content Manifest for Depot 1091501\\n"
+                        "Manifest ID / date : 111111 / 11/26/2026\\n"
+                        "Size Chunks File SHA Flags Name\\n"
+                        "10 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 public\\\\Game.exe\\n",
+                        encoding="utf-8",
+                    )
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        fb_dd.chmod(fb_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=fb_dd)
+        dest = self.root / "games" / "FallbackBetaGame"
+
+        with self.assertRaises(CommandFailedError) as ctx:
+            backend.download(
+                DownloadOptions(
+                    app_id="1091500",
+                    dest=dest,
+                    platform="windows",
+                    branch="beta",
+                    branch_password="BAD_PASSWORD",
+                )
+            )
+        self.assertEqual(ctx.exception.code, "branch_fallback")
+        # Must abort during preflight -manifest-only and NEVER start a download transfer
+        calls = [json.loads(ln) for ln in fb_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("-manifest-only", calls[0])
+        self.assertNotIn("1091500", backend._load_installs())
+
+    def test_repair_synchronizes_installed_version_and_manifest_cache(self) -> None:
+        backend = self._make_backend()
+        backend.login(username="testplayer")
+        dest = self.root / "games" / "RepairSyncGame"
+        backend.download(DownloadOptions(app_id="1091500", dest=dest, platform="windows"))
+        self.assertEqual(backend._load_installs()["1091500"]["build_id"], "8811223344556677889")
+
+        # Remote branch advances to manifest 9922334455667788990; repair pulls the new manifest
+        self.manifest_file.write_text(SAMPLE_UPDATED_MANIFEST_TXT, encoding="utf-8")
+        prev_gid = os.environ.get("MOCK_MANIFEST_GID")
+        os.environ["MOCK_MANIFEST_GID"] = "9922334455667788990"
+        try:
+            ver = backend.verify("1091500", repair=True)
+            self.assertTrue(ver.ok)
+            self.assertTrue(ver.repaired)
+            self.assertEqual(backend._load_installs()["1091500"]["build_id"], "9922334455667788990")
+            chk = backend.update("1091500", check_only=True)
+            self.assertFalse(chk.update_available)
+            self.assertEqual(chk.old_version, "9922334455667788990")
+        finally:
+            if prev_gid is None:
+                os.environ.pop("MOCK_MANIFEST_GID", None)
+            else:
+                os.environ["MOCK_MANIFEST_GID"] = prev_gid
+
+    def test_cli_repeated_download_without_dest_reuses_registered_install_path(self) -> None:
+        default_base = self.root / "default_acquire_dest"
+        env_updates = {
+            "PORT_DEPOT_DOWNLOADER": str(self.mock_dd),
+            "PORT_STEAM_HOME": str(self.steam_home),
+            "PORT_STEAM_USER": "testplayer",
+            "PORT_ACQUIRE_DEST": str(default_base),
+        }
+        old_env = {k: os.environ.get(k) for k in env_updates}
+        os.environ.update(env_updates)
+        try:
+            def run_cli(argv: list[str]) -> tuple[int, dict]:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli_main(argv)
+                return rc, json.loads(buf.getvalue())
+
+            rc1, dl1 = run_cli(["--store", "steam", "--json", "download", "1091500"])
+            self.assertEqual(rc1, 0)
+            first_path = Path(dl1["install_path"])
+
+            # Simulate Store title now cached under store_details (real title differs from placeholder)
+            store_cache = self.steam_home / ".port-acquire" / "store_details" / "1091500.json"
+            store_cache.parent.mkdir(parents=True, exist_ok=True)
+            store_cache.write_text(json.dumps({"name": "Sample Action RPG"}), encoding="utf-8")
+
+            rc2, dl2 = run_cli(["--store", "steam", "--json", "download", "1091500"])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(Path(dl2["install_path"]), first_path)
+            self.assertFalse((default_base / "Sample Action RPG").exists())
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):
             if "appdetails" in url:

@@ -128,6 +128,41 @@ _SKIPPED_DEPOT_RE = re.compile(
     re.I,
 )
 
+# DepotDownloader 3.4.0 emits a per-depot warning when a private beta branch is
+# missing or its password is invalid, then silently falls back to `public`.
+_BRANCH_FALLBACK_RE = re.compile(
+    r"(does\s+not\s+have\s+branch\s+named|Trying\s+public\s+branch|"
+    r"Unable\s+to\s+find\s+branch|Invalid\s+branch\s+password)",
+    re.I,
+)
+
+
+def _check_branch_fallback(
+    requested_branch: str,
+    combined_output: str,
+    actual_branch: str | None,
+    *,
+    app_id: str,
+    context: str,
+) -> None:
+    """Reject DepotDownloader's silent fallback from a non-public branch to `public`."""
+    if requested_branch.lower() == "public":
+        return
+    fell_back_header = bool(actual_branch and actual_branch.lower() != requested_branch.lower())
+    fell_back_warning = bool(_BRANCH_FALLBACK_RE.search(combined_output))
+    if fell_back_header or fell_back_warning:
+        raise CommandFailedError(
+            f"DepotDownloader fell back from requested branch {requested_branch!r} "
+            f"(to {actual_branch or 'public'!r}) during {context} for Steam AppID {app_id}; "
+            "verify the branch name and pass --branch-password-env for private betas.",
+            code="branch_fallback",
+            details={
+                "app_id": str(app_id),
+                "requested_branch": requested_branch,
+                "actual_branch": actual_branch or "public",
+            },
+        )
+
 
 def _split_windows_args(raw: str) -> list[str]:
     """Parse a Windows-style command-line argument string preserving quoted values."""
@@ -601,17 +636,13 @@ class SteamBackend(StoreBackend):
             combined = proc.stdout + "\n" + proc.stderr
             stdout_info = parse_depot_downloader_stdout(combined)
             skipped_depots = sorted(set(_SKIPPED_DEPOT_RE.findall(combined)))
-            actual_branch = stdout_info.get("branch")
-            if (
-                branch.lower() != "public"
-                and actual_branch
-                and actual_branch.lower() != branch.lower()
-            ):
-                raise CommandFailedError(
-                    f"DepotDownloader fell back to branch {actual_branch!r} instead of requested "
-                    f"branch {branch!r} for Steam AppID {app_id} "
-                    "(verify the branch name and pass --branch-password-env for private betas)."
-                )
+            _check_branch_fallback(
+                branch,
+                combined,
+                stdout_info.get("branch"),
+                app_id=str(app_id),
+                context="manifest query",
+            )
 
             parsed_by_id: dict[str, dict[str, Any]] = {}
             for txt_file in sorted(Path(tmp_dir).rglob("manifest_*.txt")):
@@ -1713,6 +1744,7 @@ class SteamBackend(StoreBackend):
 
         # Pre-fetch manifest metadata for the requested branch (including branch password when set)
         # so depot caches, offline `info()`, `launch_args()`, and package manifests reflect this branch.
+        # Propagate branch-fallback and auth failures immediately before transferring any files.
         info: GameInfo | None = None
         try:
             info = self.info(
@@ -1722,7 +1754,11 @@ class SteamBackend(StoreBackend):
                 branch=branch,
                 branch_password=options.branch_password,
             )
-        except AcquireError:
+        except AuthRequiredError:
+            raise
+        except AcquireError as exc:
+            if exc.code == "branch_fallback":
+                raise
             info = None
 
         store_details = self._fetch_store_appdetails(resolved_id, offline=True)
@@ -1837,17 +1873,13 @@ class SteamBackend(StoreBackend):
         )
         combined = proc.stdout + "\n" + proc.stderr
         out = parse_depot_downloader_stdout(combined)
-        actual_dl_branch = out.get("branch")
-        if (
-            branch.lower() != "public"
-            and actual_dl_branch
-            and actual_dl_branch.lower() != branch.lower()
-        ):
-            raise CommandFailedError(
-                f"DepotDownloader fell back to branch {actual_dl_branch!r} instead of requested "
-                f"branch {branch!r} for Steam AppID {resolved_id} "
-                "(check branch name and --branch-password-env)."
-            )
+        _check_branch_fallback(
+            branch,
+            combined,
+            out.get("branch"),
+            app_id=resolved_id,
+            context="download",
+        )
         skipped_depots = set(_SKIPPED_DEPOT_RE.findall(combined))
 
         all_stdout_depots: list[dict[str, Any]] = []
@@ -2358,20 +2390,18 @@ class SteamBackend(StoreBackend):
         proc = self._run_depot_downloader(dd_args, interactive=False, timeout=None, check=False)
         combined = proc.stdout + "\n" + proc.stderr
         parsed_out = parse_depot_downloader_stdout(combined)
-        actual_branch = parsed_out.get("branch")
-        if (
-            branch.lower() != "public"
-            and actual_branch
-            and actual_branch.lower() != branch.lower()
-        ):
-            raise CommandFailedError(
-                f"DepotDownloader fell back to branch {actual_branch!r} instead of requested "
-                f"branch {branch!r} during repair (check --branch-password-env)."
-            )
+        _check_branch_fallback(
+            branch,
+            combined,
+            parsed_out.get("branch"),
+            app_id=resolved_id,
+            context="repair",
+        )
         skipped_repair = set(_SKIPPED_DEPOT_RE.findall(combined))
-        processed_repair = {
-            str(d.get("depot_id")) for d in parsed_out.get("depots", []) if d.get("depot_id")
-        }
+        processed_repair_list = [
+            d for d in parsed_out.get("depots", []) if isinstance(d, dict) and d.get("depot_id")
+        ]
+        processed_repair = {str(d["depot_id"]): d for d in processed_repair_list}
         missing_repair = [did for did in recorded_depots if did not in processed_repair]
         if proc.returncode == 0 and missing_repair:
             if any(did in skipped_repair for did in missing_repair):
@@ -2384,6 +2414,68 @@ class SteamBackend(StoreBackend):
                 details={"missing_depots": missing_repair},
             )
         ok = proc.returncode == 0
+        if ok:
+            # DepotDownloader `-validate` downloads the current manifest for `branch` when no
+            # manifest GID is pinned; synchronize the installation registry and cached manifest
+            # file list so subsequent `info`, `launch-args`, and `update` reflect repaired files.
+            try:
+                self._fetch_depot_manifests(
+                    resolved_id,
+                    platform=platform,
+                    branch=branch,
+                    branch_password=branch_password,
+                    account_name=account_name,
+                    offline=False,
+                    allow_cache_fallback=True,
+                    update_cache=True,
+                )
+            except AcquireError:
+                pass
+
+            installs = self._load_installs()
+            managed = installs.get(resolved_id)
+            if isinstance(managed, dict) and processed_repair:
+                store_details = self._fetch_store_appdetails(resolved_id, offline=True)
+                dlc_to_depots, depot_to_dlc = self._resolve_dlc_depot_map(
+                    resolved_id,
+                    processed_repair_list,
+                    store_details,
+                    saved_dlc_depots=managed.get("dlc_depots"),
+                )
+                gids = (
+                    dict(managed["manifest_gids"])
+                    if isinstance(managed.get("manifest_gids"), dict)
+                    else {}
+                )
+                for did, dep in processed_repair.items():
+                    if dep.get("manifest_gid"):
+                        gids[did] = str(dep["manifest_gid"])
+                managed["manifest_gids"] = gids
+
+                base_repaired = [
+                    dep
+                    for did, dep in processed_repair.items()
+                    if did not in depot_to_dlc and did not in COMMON_REDIST_DEPOTS
+                ]
+                new_ver = self._version_from_manifests(base_repaired or processed_repair_list)
+                if new_ver:
+                    managed["build_id"] = new_ver
+
+                dlc_vers = (
+                    dict(managed["dlc_versions"])
+                    if isinstance(managed.get("dlc_versions"), dict)
+                    else {}
+                )
+                for dlc_id, dep_ids in dlc_to_depots.items():
+                    dlc_deps = [processed_repair[did] for did in dep_ids if did in processed_repair]
+                    dver = self._version_from_manifests(dlc_deps)
+                    if dver:
+                        dlc_vers[dlc_id] = dver
+                managed["dlc_versions"] = dlc_vers
+                managed["updated_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                installs[resolved_id] = managed
+                self._save_installs(installs)
+
         repaired_flag = bool(
             repair and ok and (parsed_out.get("total_downloaded_bytes") or 0) > 0
         )

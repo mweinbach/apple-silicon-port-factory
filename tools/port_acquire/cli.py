@@ -620,13 +620,17 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if cmd == "download":
-        title_hint: str | None = None
         if args.dest is None:
+            info_hint: GameInfo | None = None
             try:
-                title_hint = backend.info(args.app, platform=args.platform, offline=True).title
+                info_hint = backend.info(args.app, platform=args.platform, offline=True)
             except AcquireError:
-                title_hint = None
-            dest = _default_dest(store_name, args.app, title=title_hint)
+                info_hint = None
+            if info_hint is not None and info_hint.install_path:
+                dest = Path(info_hint.install_path).expanduser().resolve()
+            else:
+                title_hint = info_hint.title if info_hint is not None else None
+                dest = _default_dest(store_name, args.app, title=title_hint)
         else:
             dest = Path(args.dest).expanduser().resolve()
 
