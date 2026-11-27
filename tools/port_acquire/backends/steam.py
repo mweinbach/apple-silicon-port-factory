@@ -1699,8 +1699,10 @@ class SteamBackend(StoreBackend):
                     manifest_paths.append(str(f["path"]))
 
         # DLCs from Steam Store `appdetails.dlc` with honest entitlement resolution
-        # against the user's owned AppIDs (never blindly marking catalog DLCs as owned).
+        # against the user's owned AppIDs and depots returned by authenticated `-manifest-only`
+        # (never blindly marking catalog DLCs as owned).
         installed_dlcs = set((installed_entry or {}).get("dlcs") or [])
+        entitled_dlcs = {d.dlc_app_id for d in depots if d.dlc_app_id}
         dlcs: list[DlcItem] = []
         raw_dlc_ids = store_details.get("dlc")
         if isinstance(raw_dlc_ids, list):
@@ -1708,7 +1710,11 @@ class SteamBackend(StoreBackend):
                 dlc_id = str(raw_dlc)
                 if not dlc_id.isdigit():
                     continue
-                is_owned = dlc_id in owned_app_ids or dlc_id in installed_dlcs
+                is_owned = (
+                    dlc_id in owned_app_ids
+                    or dlc_id in installed_dlcs
+                    or dlc_id in entitled_dlcs
+                )
                 dlcs.append(
                     DlcItem(
                         app_id=dlc_id,
@@ -1906,22 +1912,16 @@ class SteamBackend(StoreBackend):
             lowviolence=dd_lowviolence,
         )
 
-        # Validate requested DLC ownership upfront before transferring payloads.
+        # Select target DLCs. For explicit `--dlc <id>`, do NOT reject based on incomplete
+        # local Steam caches (`localconfig.vdf` / `GetOwnedGames` omit newly purchased or
+        # uninstalled DLCs); let authenticated `DepotDownloader` enforce authoritative
+        # Steam3 server-side entitlement.
         target_dlcs: list[str] = []
-        if options.with_dlcs or options.dlcs:
-            owned_ids = self._known_owned_app_ids(offline=False)
-            if options.dlcs:
-                target_dlcs = list(options.dlcs)
-                for dlc_id in target_dlcs:
-                    if owned_ids and dlc_id not in owned_ids:
-                        raise AcquireError(
-                            f"DLC AppID {dlc_id} is not owned by the logged-in Steam account.",
-                            code="dlc_not_owned",
-                            details={"dlc_app_id": dlc_id},
-                        )
-            elif info is not None:
-                # Only select DLCs confirmed owned by the account
-                target_dlcs = [d.app_id for d in info.dlcs if d.owned]
+        if options.dlcs:
+            target_dlcs = list(options.dlcs)
+        elif options.with_dlcs and info is not None:
+            # Only select DLCs confirmed owned locally or entitled by `-manifest-only`.
+            target_dlcs = [d.app_id for d in info.dlcs if d.owned]
 
         def _build_dd_args(depot_ids: list[str] | None = None) -> list[str]:
             args: list[str] = ["-app", resolved_id]
@@ -2040,7 +2040,23 @@ class SteamBackend(StoreBackend):
                 f"DepotDownloader exited 0 without processing any depots for Steam AppID {resolved_id}."
             )
         if missing_depots:
-            if any(did in skipped_depots for did in missing_depots) or _LOGIN_FAIL_PATTERNS.search(combined):
+            requested_dlc_set = set(requested_dlc_depot_ids)
+            skipped_missing = [did for did in missing_depots if did in skipped_depots]
+            if skipped_missing and all(did in requested_dlc_set for did in missing_depots):
+                unowned_dlc_ids = sorted(
+                    {depot_to_dlc[did] for did in missing_depots if did in depot_to_dlc}
+                )
+                raise AcquireError(
+                    f"Steam account lacks entitlement for requested DLC depot(s) "
+                    f"{', '.join(missing_depots)} under base AppID {resolved_id}.",
+                    code="dlc_not_owned",
+                    details={
+                        "dlc_app_ids": unowned_dlc_ids,
+                        "missing_depots": missing_depots,
+                        "skipped_depots": sorted(skipped_depots),
+                    },
+                )
+            if skipped_missing or _LOGIN_FAIL_PATTERNS.search(combined):
                 raise AuthRequiredError(
                     f"DepotDownloader skipped required depot(s) {', '.join(missing_depots)} for "
                     f"Steam AppID {resolved_id} (account lacks entitlement or depot key).",

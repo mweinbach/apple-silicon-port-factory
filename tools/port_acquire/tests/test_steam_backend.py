@@ -241,6 +241,8 @@ def _write_mock_depot_downloader(
                 (dest / "dlc_2138330.pak").write_bytes(b"MOCK_DLC")
                 print("Processing depot 999001 - Expansion Pack DLC Content")
                 print("Manifest 770011 (11/26/2026 12:00:00)")
+            if "999002" in selected:
+                print("Depot 999002 is not available from this account.")
         print("Total downloaded: 4096 bytes")
         sys.exit(0)
         """
@@ -672,7 +674,14 @@ class SteamBackendTests(unittest.TestCase):
         self.assertIn("-validate", cmd)
         self.assertNotIn("TOP_SECRET_BETA_PW", " ".join(_redact_cmd(cmd)))
 
-        # Requesting an unowned DLC explicitly must fail honestly
+        # Requesting an unowned DLC explicitly must fail honestly when Steam3/DepotDownloader
+        # reports its depot is unavailable for this account.
+        _write_mock_appinfo_vdf(
+            self.steam_home,
+            1091500,
+            {"1091501": None, "999001": "2138330", "999002": "2138331"},
+            v29=True,
+        )
         with self.assertRaises(AcquireError) as unowned_ctx:
             backend.download(
                 DownloadOptions(
@@ -2308,6 +2317,51 @@ class SteamBackendTests(unittest.TestCase):
         ver_ok = backend.verify("1091500", repair=False)
         self.assertTrue(ver_ok.ok)
         self.assertEqual(ver_ok.missing_files, [])
+
+    def test_explicit_dlc_not_in_local_cache_succeeds_when_downloader_entitles_it(self) -> None:
+        # Remove DLC 2138330 from localconfig.vdf so `_known_owned_app_ids()` is nonempty
+        # (contains base app 1091500) but incomplete for a newly purchased expansion.
+        cfg_dir = self.steam_home / "userdata" / "39734274" / "config"
+        (cfg_dir / "localconfig.vdf").write_text(
+            '"UserLocalConfigStore" { "Software" { "Valve" { "Steam" { "apps" { "1091500" { "Playtime" "120" } } } } } }\n',
+            encoding="utf-8",
+        )
+        _write_mock_appinfo_vdf(
+            self.steam_home,
+            1091500,
+            {"1091501": None, "999001": "2138330", "999002": "2138331"},
+            v29=True,
+        )
+
+        backend = self._make_backend()
+        dest = self.root / "games" / "NewlyPurchasedDlcGame"
+
+        # 1. Owned expansion absent from localconfig.vdf must NOT be prematurely rejected;
+        #    authenticated DepotDownloader validates entitlement and transfers depot 999001.
+        dl = backend.download(
+            DownloadOptions(
+                app_id="1091500",
+                dest=dest,
+                platform="windows",
+                dlcs=("2138330",),
+                skip_dlcs=False,
+            )
+        )
+        self.assertEqual(dl.downloaded_dlcs, ["2138330"])
+        self.assertTrue((dest / "dlc_2138330.pak").is_file())
+
+        # 2. Unowned DLC 2138331 whose depot 999002 is rejected by DepotDownloader fails honestly.
+        with self.assertRaises(AcquireError) as ctx:
+            backend.download(
+                DownloadOptions(
+                    app_id="1091500",
+                    dest=dest,
+                    platform="windows",
+                    dlcs=("2138331",),
+                    skip_dlcs=False,
+                )
+            )
+        self.assertEqual(ctx.exception.code, "dlc_not_owned")
 
     def test_unmanaged_steam_client_install_rejected_for_inplace_update_and_repair(self) -> None:
         sa_dir = self.steam_home / "steamapps"
