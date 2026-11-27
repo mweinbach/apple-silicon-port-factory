@@ -1983,6 +1983,91 @@ class SteamBackendTests(unittest.TestCase):
                 else:
                     os.environ[k] = v
 
+    def test_verify_readonly_excludes_unrequested_common_redist_depots(self) -> None:
+        game_bytes = b"MZ\x90\x00GAME"
+        dx_bytes = b"MZ\x90\x00DXSETUP"
+        game_sha1 = hashlib.sha1(game_bytes).hexdigest()
+        dx_sha1 = hashlib.sha1(dx_bytes).hexdigest()
+
+        redist_dd = self.root / "redist-verify-dd"
+        redist_dd.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-redist-verify")
+                    sys.exit(0)
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                if "-manifest-only" in argv:
+                    (dest / "manifest_1091501_100.txt").write_text(
+                        "Content Manifest for Depot 1091501\\n"
+                        "Manifest ID / date : 100 / 11/26/2026\\n"
+                        "Size Chunks File SHA Flags Name\\n"
+                        "{len(game_bytes)} 1 {game_sha1} 0 SampleGame.exe\\n",
+                        encoding="utf-8",
+                    )
+                    (dest / "manifest_228990_200.txt").write_text(
+                        "Content Manifest for Depot 228990\\n"
+                        "Manifest ID / date : 200 / 11/26/2026\\n"
+                        "Size Chunks File SHA Flags Name\\n"
+                        "{len(dx_bytes)} 1 {dx_sha1} 0 DXSETUP.exe\\n",
+                        encoding="utf-8",
+                    )
+                    print("Using app branch: 'public'.")
+                    print("Processing depot 1091501 - Base Game")
+                    print("Manifest 100 (11/26/2026 12:00:00)")
+                    print("Processing depot 228990 - DirectX June 2010 Redistributable")
+                    print("Manifest 200 (11/26/2026 12:00:00)")
+                    sys.exit(0)
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        redist_dd.chmod(redist_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=redist_dd)
+        dest = self.root / "games" / "RedistVerifyGame"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "SampleGame.exe").write_bytes(game_bytes)
+
+        # 1. Base-only install (no redists downloaded): must pass verify without flagging DXSETUP.exe missing
+        backend._save_installs(
+            {
+                "1091500": {
+                    "app_id": "1091500",
+                    "title": "Redist Verify Game",
+                    "account_name": "testplayer",
+                    "install_path": str(dest),
+                    "platform": "windows",
+                    "branch": "public",
+                    "depots": ["1091501"],
+                    "redists": [],
+                }
+            }
+        )
+        ver_base = backend.verify("1091500", repair=False)
+        self.assertTrue(ver_base.ok)
+        self.assertEqual(ver_base.missing_files, [])
+
+        # 2. When depot 228990 WAS downloaded via --with-redists into `_CommonRedist/228990/`,
+        # verify checks it at its actual `_CommonRedist/228990/DXSETUP.exe` path.
+        (dest / "_CommonRedist" / "228990").mkdir(parents=True, exist_ok=True)
+        (dest / "_CommonRedist" / "228990" / "DXSETUP.exe").write_bytes(dx_bytes)
+        insts = backend._load_installs()
+        insts["1091500"]["redists"] = ["228990"]
+        backend._save_installs(insts)
+        ver_with_redist = backend.verify("1091500", repair=False)
+        self.assertTrue(ver_with_redist.ok)
+
+        (dest / "_CommonRedist" / "228990" / "DXSETUP.exe").unlink()
+        ver_missing_redist = backend.verify("1091500", repair=False)
+        self.assertFalse(ver_missing_redist.ok)
+        self.assertEqual(ver_missing_redist.missing_files, ["_CommonRedist/228990/DXSETUP.exe"])
+
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):
             if "appdetails" in url:

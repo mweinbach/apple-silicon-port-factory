@@ -2296,12 +2296,30 @@ class SteamBackend(StoreBackend):
                 allow_cache_fallback=False,
                 update_cache=False,
             )
-            depots = manifest_data.get("depots") or []
-            skipped_depots = set(manifest_data.get("skipped_depots") or [])
+            all_depots = manifest_data.get("depots") or []
+            skipped_depots = {
+                did
+                for did in (manifest_data.get("skipped_depots") or [])
+                if str(did) not in COMMON_REDIST_DEPOTS
+            }
+            # Steamworks Common Redistributables (App 228980) are managed separately under
+            # `_CommonRedist/<depot_id>` only when `--with-redists` is requested; exclude
+            # them from the base game-root verification set.
+            installed_redists = {str(x) for x in (entry.get("redists") or []) if str(x).isdigit()}
+            redist_depots = [
+                d
+                for d in all_depots
+                if isinstance(d, dict) and str(d.get("depot_id") or "") in COMMON_REDIST_DEPOTS
+            ]
+            depots = [
+                d
+                for d in all_depots
+                if isinstance(d, dict) and str(d.get("depot_id") or "") not in COMMON_REDIST_DEPOTS
+            ]
             missing_file_manifests = [
                 str(d.get("depot_id"))
                 for d in depots
-                if isinstance(d, dict) and not d.get("has_file_manifest", bool(d.get("files")))
+                if not d.get("has_file_manifest", bool(d.get("files")))
             ]
             if not depots or missing_file_manifests:
                 raise CommandFailedError(
@@ -2323,15 +2341,14 @@ class SteamBackend(StoreBackend):
                     d
                     for d in depots
                     if not (
-                        isinstance(d, dict)
-                        and str(d.get("depot_id") or "") in depot_to_dlc
+                        str(d.get("depot_id") or "") in depot_to_dlc
                         and depot_to_dlc[str(d.get("depot_id") or "")] not in installed_dlcs
                     )
                 ]
 
             # Require complete coverage of the installation's recorded depots before reporting OK.
             returned_depot_ids = {
-                str(d.get("depot_id")) for d in depots if isinstance(d, dict) and d.get("depot_id")
+                str(d.get("depot_id")) for d in depots if d.get("depot_id")
             }
             missing_required = [did for did in recorded_depots if did not in returned_depot_ids]
             if missing_required:
@@ -2360,6 +2377,19 @@ class SteamBackend(StoreBackend):
                 install_path,
                 depots,
             )
+            # Verify any separately downloaded Common Redistributables against `_CommonRedist/<depot_id>`
+            for rdep in redist_depots:
+                rdid = str(rdep.get("depot_id") or "")
+                if rdid not in installed_redists or not rdep.get("has_file_manifest", bool(rdep.get("files"))):
+                    continue
+                r_root = install_path / "_CommonRedist" / rdid
+                if not r_root.is_dir():
+                    missing_files.append(f"_CommonRedist/{rdid}")
+                    continue
+                r_chk, r_miss, r_corr = self._verify_files_readonly(r_root, [rdep])
+                checked += r_chk
+                missing_files.extend(f"_CommonRedist/{rdid}/{p}" for p in r_miss)
+                corrupted_files.extend(f"_CommonRedist/{rdid}/{p}" for p in r_corr)
             if checked == 0:
                 raise CommandFailedError(
                     f"Could not obtain depot file manifest entries for Steam AppID {resolved_id} "
