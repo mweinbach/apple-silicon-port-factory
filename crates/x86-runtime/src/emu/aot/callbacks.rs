@@ -280,9 +280,228 @@ const UNW_FLAG_EHANDLER: u8 = 1;
 const UNW_FLAG_UHANDLER: u8 = 2;
 const UNW_FLAG_CHAININFO: u8 = 4;
 
-/// Image-backed `.pdata` unwind/exception handlers (`UNW_FLAG_EHANDLER` / `UNW_FLAG_UHANDLER`)
-/// and valid `C_SCOPE_TABLE` filter/finally handlers (`UnwindHandler`) + catch jump targets
-/// (`EhContinuation`).
+/// Parse an MSVC C++ Frame Handler 4 (`FH4::FuncInfo4`) table at `fi_rva` with strict
+/// structural validation, extracting unwind destructor/cleanup funclets, catch funclets
+/// (`UnwindHandler`), and catch continuation landing pads (`EhContinuation`).
+unsafe fn parse_fh4_func_info(
+    base: usize,
+    size: usize,
+    rf_begin: u32,
+    fi_rva: u32,
+    text: &[(usize, usize)],
+    in_text: &impl Fn(u32) -> bool,
+) -> Option<Vec<CallbackRoot>> {
+    const MAX_UW_ENTRIES: u32 = 512;
+    const MAX_TRY_BLOCKS: u32 = 256;
+    const MAX_HANDLERS: u32 = 64;
+    const MAX_SEGS: u32 = 256;
+
+    let size64 = size as u64;
+    let fits = |off: u64, n: u64| off.checked_add(n).is_some_and(|e| e <= size64);
+    let rd8 = |off: u64| *((base as u64 + off) as *const u8);
+    let rd32 = |off: u64| core::ptr::read_unaligned((base as u64 + off) as *const u32);
+    let rd_i32 = |pos: &mut u64| -> Option<i32> {
+        if !fits(*pos, 4) {
+            return None;
+        }
+        let v = rd32(*pos) as i32;
+        *pos += 4;
+        Some(v)
+    };
+    let rd_u = |pos: &mut u64| -> Option<u32> {
+        if !fits(*pos, 1) {
+            return None;
+        }
+        let b0 = rd8(*pos);
+        if (b0 & 1) == 0 {
+            *pos += 1;
+            Some((b0 as u32) >> 1)
+        } else if (b0 & 3) == 1 {
+            if !fits(*pos, 2) {
+                return None;
+            }
+            let v = (b0 as u32) | ((rd8(*pos + 1) as u32) << 8);
+            *pos += 2;
+            Some(v >> 2)
+        } else if (b0 & 7) == 3 {
+            if !fits(*pos, 3) {
+                return None;
+            }
+            let v = (b0 as u32) | ((rd8(*pos + 1) as u32) << 8) | ((rd8(*pos + 2) as u32) << 16);
+            *pos += 3;
+            Some(v >> 3)
+        } else if (b0 & 15) == 7 {
+            if !fits(*pos, 4) {
+                return None;
+            }
+            let v = rd32(*pos);
+            *pos += 4;
+            Some(v >> 4)
+        } else {
+            if !fits(*pos, 5) {
+                return None;
+            }
+            let v = rd32(*pos + 1);
+            *pos += 5;
+            Some(v)
+        }
+    };
+
+    // FuncInfo4 lives in read-only data (`.rdata`/`.xdata`), never inside `.text`.
+    if fi_rva < 0x400 || !fits(fi_rva as u64, 5) {
+        return None;
+    }
+    let fi_va = base as u64 + fi_rva as u64;
+    if text.iter().any(|&(s, e)| (s as u64..e as u64).contains(&fi_va)) {
+        return None;
+    }
+
+    let mut p = fi_rva as u64;
+    let header = rd8(p);
+    p += 1;
+    // Bit 7 is reserved; require at least unwind map (0x08) or try-block map (0x10).
+    if (header & 0x80) != 0 || (header & 0x18) == 0 {
+        return None;
+    }
+    if (header & 0x04) != 0 {
+        let _bbt = rd_u(&mut p)?;
+    }
+    let disp_uw = if (header & 0x08) != 0 { rd_i32(&mut p)? } else { 0 };
+    let disp_try = if (header & 0x10) != 0 { rd_i32(&mut p)? } else { 0 };
+    let ip_map_rva = rd_i32(&mut p)?;
+
+    // Validate IP-to-state map pointer as a structural fingerprint check.
+    if ip_map_rva < 0 || (ip_map_rva != 0 && ((ip_map_rva as u64) < 0x400 || (ip_map_rva as u64) >= size64)) {
+        return None;
+    }
+    if (header & 0x02) != 0 && ip_map_rva != 0 {
+        let mut sp = ip_map_rva as u64;
+        let num_segs = rd_u(&mut sp)?;
+        if num_segs == 0 || num_segs > MAX_SEGS || !fits(sp, num_segs as u64 * 8) {
+            return None;
+        }
+    }
+
+    let mut found = Vec::new();
+
+    if disp_uw != 0 {
+        if disp_uw < 0x400 || (disp_uw as u64) >= size64 {
+            return None;
+        }
+        let mut up = disp_uw as u64;
+        let count = rd_u(&mut up)?;
+        if count > MAX_UW_ENTRIES {
+            return None;
+        }
+        for _ in 0..count {
+            let v = rd_u(&mut up)?;
+            let kind = v & 3;
+            if kind != 0 {
+                let action = rd_i32(&mut up)?;
+                if action != 0 {
+                    if action < 0 || !in_text(action as u32) {
+                        return None;
+                    }
+                    found.push(CallbackRoot {
+                        rva: action as u32,
+                        kind: CallbackKind::UnwindHandler,
+                    });
+                }
+            }
+            if kind == 1 || kind == 2 {
+                let _obj = rd_u(&mut up)?;
+            }
+        }
+    }
+
+    if disp_try != 0 {
+        if disp_try < 0x400 || (disp_try as u64) >= size64 {
+            return None;
+        }
+        let mut tp = disp_try as u64;
+        let tcount = rd_u(&mut tp)?;
+        if tcount == 0 || tcount > MAX_TRY_BLOCKS {
+            return None;
+        }
+        for _ in 0..tcount {
+            let try_low = rd_u(&mut tp)?;
+            let try_high = rd_u(&mut tp)?;
+            let catch_high = rd_u(&mut tp)?;
+            let disp_ha = rd_i32(&mut tp)?;
+            if try_low > try_high || try_high > catch_high {
+                return None;
+            }
+            if disp_ha < 0x400 || (disp_ha as u64) >= size64 {
+                return None;
+            }
+            let mut hp = disp_ha as u64;
+            let hcount = rd_u(&mut hp)?;
+            if hcount == 0 || hcount > MAX_HANDLERS {
+                return None;
+            }
+            for _ in 0..hcount {
+                if !fits(hp, 1) {
+                    return None;
+                }
+                let hh = rd8(hp);
+                hp += 1;
+                if (hh & 0xC0) != 0 {
+                    return None;
+                }
+                if (hh & 0x01) != 0 {
+                    let _adj = rd_u(&mut hp)?;
+                }
+                if (hh & 0x02) != 0 {
+                    let _dt = rd_i32(&mut hp)?;
+                }
+                if (hh & 0x04) != 0 {
+                    let _co = rd_u(&mut hp)?;
+                }
+                let disp_of_handler = rd_i32(&mut hp)?;
+                if disp_of_handler <= 0 || !in_text(disp_of_handler as u32) {
+                    return None;
+                }
+                found.push(CallbackRoot {
+                    rva: disp_of_handler as u32,
+                    kind: CallbackKind::UnwindHandler,
+                });
+                let cont_type = (hh & 0x30) >> 4;
+                let is_rva = (hh & 0x08) != 0;
+                let n_cont = match cont_type {
+                    1 => 1,
+                    2 => 2,
+                    _ => 0,
+                };
+                for _ in 0..n_cont {
+                    let cont_rva = if is_rva {
+                        let r = rd_i32(&mut hp)?;
+                        if r < 0 {
+                            return None;
+                        }
+                        r as u32
+                    } else {
+                        rf_begin.checked_add(rd_u(&mut hp)?)?
+                    };
+                    if cont_rva != 0 {
+                        if !in_text(cont_rva) {
+                            return None;
+                        }
+                        found.push(CallbackRoot {
+                            rva: cont_rva,
+                            kind: CallbackKind::EhContinuation,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    (!found.is_empty()).then_some(found)
+}
+
+/// Image-backed `.pdata` unwind/exception handlers (`UNW_FLAG_EHANDLER` / `UNW_FLAG_UHANDLER`),
+/// `C_SCOPE_TABLE` filter/finally handlers (`UnwindHandler`) + catch jump targets
+/// (`EhContinuation`), and MSVC C++ FH3/FH4 unwind/catch funclets + continuations.
 unsafe fn unwind_handler_and_scope_roots(
     base: usize,
     size: usize,
@@ -302,18 +521,56 @@ unsafe fn unwind_handler_and_scope_roots(
             && is_plausible_code_entry(ip, text)
     };
 
+    let mut seen_unwind: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
     for i in 0..len as u64 / 12 {
         let off = rva as u64 + i * 12;
         if !fits(off, 12) {
             break;
         }
-        let rf_begin = rd32(off);
-        let rf_end = rd32(off + 4);
-        let unwind_rva = rd32(off + 8);
+        let mut rf_begin = rd32(off);
+        let mut rf_end = rd32(off + 4);
+        let mut unwind_rva = rd32(off + 8);
         if rf_begin >= rf_end || !fits(rf_begin as u64, (rf_end - rf_begin) as u64) {
             continue;
         }
-        if (unwind_rva & 1) != 0 || unwind_rva == 0 {
+        // Follow `RUNTIME_FUNCTION_INDIRECT` and `UNW_FLAG_CHAININFO` chains to reach the
+        // owning `UNWIND_INFO` carrying `UNW_FLAG_EHANDLER` / `UNW_FLAG_UHANDLER`.
+        let mut hops = 0u32;
+        while unwind_rva != 0 && hops < 16 {
+            hops += 1;
+            if (unwind_rva & 1) != 0 {
+                let ind = (unwind_rva & !1) as u64;
+                if !fits(ind, 12) {
+                    unwind_rva = 0;
+                    break;
+                }
+                rf_begin = rd32(ind);
+                rf_end = rd32(ind + 4);
+                unwind_rva = rd32(ind + 8);
+                continue;
+            }
+            let u = unwind_rva as u64;
+            if !fits(u, 4) {
+                unwind_rva = 0;
+                break;
+            }
+            let flags = rd8(u) >> 3;
+            if (flags & UNW_FLAG_CHAININFO) != 0 {
+                let count_of_codes = rd8(u + 2) as u64;
+                let parent = u + 4 + ((count_of_codes + 1) & !1) * 2;
+                if !fits(parent, 12) {
+                    unwind_rva = 0;
+                    break;
+                }
+                rf_begin = rd32(parent);
+                rf_end = rd32(parent + 4);
+                unwind_rva = rd32(parent + 8);
+                continue;
+            }
+            break;
+        }
+        if unwind_rva == 0 || (unwind_rva & 1) != 0 || !seen_unwind.insert(unwind_rva) {
             continue;
         }
         let u = unwind_rva as u64;
@@ -336,40 +593,83 @@ unsafe fn unwind_handler_and_scope_roots(
             out.push(CallbackRoot { rva: handler_rva, kind: CallbackKind::UnwindHandler });
         }
 
-        // Check if handler-specific data immediately following `handler_rva` is a well-formed
-        // `C_SCOPE_TABLE` (`Count: u32`, followed by `Count` 16-byte `C_SCOPE_TABLE_ENTRY`
-        // records whose `[BeginAddress, EndAddress]` intervals all lie inside `[rf_begin, rf_end]`).
         let scope_off = handler_off + 4;
         if !fits(scope_off, 4) {
             continue;
         }
+
+        // 1) Check `C_SCOPE_TABLE` (`__C_specific_handler` / `__GSHandlerCheck_SEH`).
         let scope_count = rd32(scope_off) as u64;
-        if scope_count == 0 || scope_count > 256 || !fits(scope_off + 4, scope_count * 16) {
+        let mut matched_c_scope = false;
+        if scope_count > 0 && scope_count <= 256 && fits(scope_off + 4, scope_count * 16) {
+            let mut all_valid = true;
+            for si in 0..scope_count {
+                let rec = scope_off + 4 + si * 16;
+                let sb = rd32(rec);
+                let se = rd32(rec + 4);
+                if !(sb >= rf_begin && sb < se && se <= rf_end) {
+                    all_valid = false;
+                    break;
+                }
+            }
+            if all_valid {
+                matched_c_scope = true;
+                for si in 0..scope_count {
+                    let rec = scope_off + 4 + si * 16;
+                    let sh = rd32(rec + 8); // HandlerAddress (1 = EXCEPTION_EXECUTE_HANDLER)
+                    let sj = rd32(rec + 12); // JumpTarget (catch continuation RVA)
+                    if sh > 1 && in_text(sh) {
+                        out.push(CallbackRoot { rva: sh, kind: CallbackKind::UnwindHandler });
+                    }
+                    if sj != 0 && sj >= rf_begin && sj < rf_end && in_text(sj) {
+                        out.push(CallbackRoot { rva: sj, kind: CallbackKind::EhContinuation });
+                    }
+                }
+            }
+        }
+        if matched_c_scope {
             continue;
         }
-        let mut all_valid = true;
-        for si in 0..scope_count {
-            let rec = scope_off + 4 + si * 16;
-            let sb = rd32(rec);
-            let se = rd32(rec + 4);
-            if !(sb >= rf_begin && sb < se && se <= rf_end) {
-                all_valid = false;
-                break;
+
+        // 2) Check MSVC C++ FH3 (`FuncInfo`, magic 0x19930520..=0x19930522).
+        let fi_rva = scope_count as u32;
+        if fi_rva >= 0x400 && fits(fi_rva as u64, 40) {
+            let magic = rd32(fi_rva as u64) & 0x1FFF_FFFF;
+            if matches!(magic, 0x1993_0520..=0x1993_0522) {
+                let max_state = rd32(fi_rva as u64 + 4) as u64;
+                let disp_uw = rd32(fi_rva as u64 + 8) as u64;
+                if max_state > 0 && max_state <= 512 && disp_uw >= 0x400 && fits(disp_uw, max_state * 8) {
+                    for ui in 0..max_state {
+                        let action = rd32(disp_uw + ui * 8 + 4);
+                        if action != 0 && in_text(action) {
+                            out.push(CallbackRoot { rva: action, kind: CallbackKind::UnwindHandler });
+                        }
+                    }
+                }
+                let n_try = rd32(fi_rva as u64 + 12) as u64;
+                let disp_try = rd32(fi_rva as u64 + 16) as u64;
+                if n_try > 0 && n_try <= 256 && disp_try >= 0x400 && fits(disp_try, n_try * 20) {
+                    for ti in 0..n_try {
+                        let rec = disp_try + ti * 20;
+                        let n_catches = rd32(rec + 12) as u64;
+                        let disp_ha = rd32(rec + 16) as u64;
+                        if n_catches > 0 && n_catches <= 64 && disp_ha >= 0x400 && fits(disp_ha, n_catches * 20) {
+                            for ci in 0..n_catches {
+                                let h = rd32(disp_ha + ci * 20 + 12);
+                                if h != 0 && in_text(h) {
+                                    out.push(CallbackRoot { rva: h, kind: CallbackKind::UnwindHandler });
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
             }
         }
-        if !all_valid {
-            continue;
-        }
-        for si in 0..scope_count {
-            let rec = scope_off + 4 + si * 16;
-            let sh = rd32(rec + 8); // HandlerAddress (1 = EXCEPTION_EXECUTE_HANDLER)
-            let sj = rd32(rec + 12); // JumpTarget (catch continuation RVA)
-            if sh > 1 && in_text(sh) {
-                out.push(CallbackRoot { rva: sh, kind: CallbackKind::UnwindHandler });
-            }
-            if sj != 0 && sj >= rf_begin && sj < rf_end && in_text(sj) {
-                out.push(CallbackRoot { rva: sj, kind: CallbackKind::EhContinuation });
-            }
+
+        // 3) Check MSVC C++ FH4 (`__CxxFrameHandler4` / `__GSHandlerCheck_EH4`).
+        if let Some(fh4_roots) = parse_fh4_func_info(base, size, rf_begin, fi_rva, text, &in_text) {
+            out.extend(fh4_roots);
         }
     }
     out
@@ -395,15 +695,16 @@ pub(super) unsafe fn load_config_eh_continuation_rvas(
     let rd64 = |off: u64| core::ptr::read_unaligned((base as u64 + off) as *const u64);
     let avail = (size as u64).saturating_sub(dir_rva as u64);
     let lc_size = (rd32(dir_rva as u64) as u64).min(avail);
-    if lc_size < 0x120 {
+    // `GuardEHContinuationTable` (+0x108) and `GuardEHContinuationCount` (+0x110) require >= 0x118.
+    if lc_size < 0x118 {
         return out;
     }
     let guard_flags = rd32(dir_rva as u64 + 0x90);
     if (guard_flags & IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT) == 0 {
         return out;
     }
-    let tbl_va = rd64(dir_rva as u64 + 0x110);
-    let count = rd64(dir_rva as u64 + 0x118);
+    let tbl_va = rd64(dir_rva as u64 + 0x108);
+    let count = rd64(dir_rva as u64 + 0x110);
     if tbl_va == 0 || count == 0 {
         return out;
     }

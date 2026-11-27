@@ -297,6 +297,10 @@ pub(super) struct Tr<'a> {
     pub(super) rdtscp_slow: usize,
     /// Static terminator target needs host dispatch (or is 0 / `__chkstk`).
     pub(super) target_host: bool,
+    /// Optional PE `IMAGE_VOLATILE_METADATA` table for the module containing this block
+    /// (`PORT_JIT_VOLATILE_META=1`), enabling safe TSO elision for non-volatile accesses
+    /// inside compiler-certified covered ranges.
+    pub(super) vol_meta: Option<std::sync::Arc<crate::emu::aot::ModuleVolatileMeta>>,
     /// `JitCache::ras_miss`: non-zero = shadow return-address stack on (`AW2_JIT_RAS`).
     pub(super) ras_miss: usize,
     /// Guest GPRs each op may write (`gpr_writes`; all zero unless `AW2_JIT_MEMCHK` bit 2
@@ -2154,6 +2158,41 @@ impl Tr<'_> {
         }
     }
 
+    /// Whether PE `IMAGE_VOLATILE_METADATA` certifies that instruction `k` is a non-volatile
+    /// memory access whose TSO ordering may be safely elided. Explicit `LOCK` atomics and
+    /// fences never call this and remain unconditionally ordered.
+    #[inline(always)]
+    pub(super) fn can_elide_tso(&self, k: usize) -> bool {
+        self.vol_meta
+            .as_ref()
+            .is_some_and(|m| m.can_elide_tso_va(self.ops[k].ip))
+    }
+
+    /// Whether a non-atomic scalar load/store at instruction `k` requires TSO ordering.
+    #[inline(always)]
+    pub(super) fn scalar_tso(&self, k: usize, chk: Chk, ld: bool) -> bool {
+        mem::tso()
+            && (chk != Chk::Stack || stack_tso())
+            && !(chk == Chk::Ro && ld)
+            && !self.can_elide_tso(k)
+    }
+
+    /// Whether a 128/256-bit vector load/store at instruction `k` requires TSO barriers.
+    #[inline(always)]
+    pub(super) fn vec_tso(&self, k: usize, chk: Chk, ld: bool) -> bool {
+        mem::tso_vec()
+            && (chk != Chk::Stack || stack_tso())
+            && !(chk == Chk::Ro && ld)
+            && !self.can_elide_tso(k)
+    }
+
+    /// Whether a bulk string/memcpy instruction (`rep movs`/`stos`/`lods`/`scas`/`cmps`) at
+    /// instruction `k` requires TSO ordering.
+    #[inline(always)]
+    pub(super) fn memcpy_tso(&self, k: usize) -> bool {
+        mem::tso_memcpy() && !self.can_elide_tso(k)
+    }
+
     /// `AW2_JIT_MEMCHK` bit 3: displacement for `ldapur`/`stlur [x23, #disp]` if op `k`'s
     /// `[rsp+disp]` operand (scalar, TSO stack accesses) qualifies: `disp` fits 9 bits and
     /// `disp % 8 + size <= 8`, so with rsp 8-aligned the access stays inside one 16-byte
@@ -2161,7 +2200,12 @@ impl Tr<'_> {
     /// once (side exit at op `k`) until rsp is rewritten.
     pub(super) fn rsp_slot(&mut self, k: usize, op: &FastOp, bits: u32) -> Option<i32> {
         if !host().has(HostFeatures::LSE2 | HostFeatures::LRCPC2)
-            || memchk_mask() & 8 == 0 || !mem::tso() || !stack_tso() || op.base != 4 || op.index != RNONE || bits > 64 {
+            || memchk_mask() & 8 == 0
+            || !self.scalar_tso(k, Chk::Stack, true)
+            || op.base != 4
+            || op.index != RNONE
+            || bits > 64
+        {
             return None;
         }
         let d = op.disp;
@@ -2292,6 +2336,18 @@ impl Tr<'_> {
         self.mem_access(k, false, src, a, bits, chk);
     }
 
+    /// Guest load/store for bulk string/memcpy ops (`rep movs`/`stos`/`lods`/`scas`/`cmps`),
+    /// gated by `PORT_JIT_TSO_MEMCPY` and PE `VolatileMetadata`.
+    pub(super) fn load_memcpy(&mut self, k: usize, dst: u32, a: u32, bits: u32, chk: Chk) {
+        let tso = self.memcpy_tso(k);
+        self.mem_access_with_tso(k, true, dst, a, bits, chk, tso);
+    }
+
+    pub(super) fn store_memcpy(&mut self, k: usize, src: u32, a: u32, bits: u32, chk: Chk) {
+        let tso = self.memcpy_tso(k);
+        self.mem_access_with_tso(k, false, src, a, bits, chk, tso);
+    }
+
     /// Guest load of `bits` from `op`'s memory operand into `dst`, using direct `[base, #disp]`
     /// addressing (`ldapur`/`ldr`/`ldur`) when possible instead of `add x16, base, #disp`.
     pub(super) fn load_op(&mut self, k: usize, dst: u32, op: &FastOp, bits: u32) {
@@ -2330,7 +2386,7 @@ impl Tr<'_> {
             let b = g(op.base);
             let d = op.disp;
             let mut chk = Self::chk_of(op);
-            let tso = mem::tso() && (chk != Chk::Stack || stack_tso()) && !(chk == Chk::Ro && ld);
+            let tso = self.scalar_tso(k, chk, ld);
             let lse2 = lse2_trap_enabled();
             let bytes = (bits / 8) as u64;
             let use_plain_ui = !tso && d >= 0 && ((d as u64) & (bytes - 1)) == 0 && ((d as u64) / bytes) < 4096;
@@ -2411,7 +2467,7 @@ impl Tr<'_> {
         // eliminating redundant index arithmetic across vec3 / struct-array element loads.
         if hw_range_enabled() && op.base < RNONE && op.index < RNONE && bits <= 64 {
             let chk = Self::chk_of(op);
-            let tso = mem::tso() && (chk != Chk::Stack || stack_tso()) && !(chk == Chk::Ro && ld);
+            let tso = self.scalar_tso(k, chk, ld);
             let lse2 = lse2_trap_enabled();
             if !tso || (host().has(HostFeatures::LRCPC2) && (lse2 || bits == 8)) {
                 let scale = op.x >> 6;
@@ -2441,6 +2497,20 @@ impl Tr<'_> {
     }
 
     pub(super) fn mem_access(&mut self, k: usize, ld: bool, reg: u32, a: u32, bits: u32, chk: Chk) {
+        let tso = self.scalar_tso(k, chk, ld);
+        self.mem_access_with_tso(k, ld, reg, a, bits, chk, tso);
+    }
+
+    pub(super) fn mem_access_with_tso(
+        &mut self,
+        k: usize,
+        ld: bool,
+        reg: u32,
+        a: u32,
+        bits: u32,
+        chk: Chk,
+        tso: bool,
+    ) {
         let lg = match bits {
             8 => 0,
             16 => 1,
@@ -2465,7 +2535,6 @@ impl Tr<'_> {
                 _ => {}
             }
         }
-        let tso = mem::tso() && (chk != Chk::Stack || stack_tso()) && !(chk == Chk::Ro && ld);
         let lse2 = lse2_trap_enabled();
         let mut fix = None;
         let mut exit = None;
@@ -2543,8 +2612,8 @@ impl Tr<'_> {
     }
 
     /// Store with only an alignment check (address already range-checked in this op).
-    pub(super) fn store_checked_addr(&mut self, src: u32, a: u32, bits: u32) {
-        let tso = mem::tso();
+    pub(super) fn store_checked_addr(&mut self, k: usize, src: u32, a: u32, bits: u32) {
+        let tso = self.scalar_tso(k, Chk::Align, false);
         if tso && bits > 8 && !lse2_trap_enabled() {
             self.a.logic_ri(true, 0, XS, a, enc_logic_imm((bits / 8 - 1) as u64, true).unwrap());
             let f = self.a.cbnz(true, XS);

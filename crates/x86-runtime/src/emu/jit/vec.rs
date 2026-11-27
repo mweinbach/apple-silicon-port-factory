@@ -3,10 +3,9 @@
 //! and extended integer/stack/flag fast ops (`K_BSWAP_R..=K_PEXTR`).
 
 use super::emit::{enc_logic_imm, sf, Asm};
-use super::translate::{stack_tso, Chk, Cond, FlagState, Src, Tr};
+use super::translate::{Chk, Cond, FlagState, Src, Tr};
 use super::*;
 use crate::emu::fast::{self, FastOp};
-use crate::emu::mem;
 
 impl Asm {
     pub(super) fn adcs(&mut self, x: bool, s: bool, d: u32, n: u32, m: u32) {
@@ -427,7 +426,7 @@ impl Tr<'_> {
                     self.range_check_op(k, a, se);
                 }
                 self.a.ldr(128, 1, a, 0);
-                if mem::tso() && (chk != Chk::Stack || stack_tso()) {
+                if self.vec_tso(k, chk, true) {
                     self.a.dmb_ishld();
                 }
             }
@@ -1911,7 +1910,7 @@ impl Tr<'_> {
                     }
                 }
                 self.shift_flags(la, wb, of_zero);
-                self.store_checked_addr(T1, addr, wb);
+                self.store_checked_addr(k, T1, addr, wb);
                 self.fs.host = 0;
                 self.fs.mem = (self.fs.mem & !FALL) | (la & FALL);
                 self.fs.src = Src::None;
@@ -1965,7 +1964,7 @@ impl Tr<'_> {
                     }
                 }
                 self.shift_flags(la, wb, of_zero);
-                self.store_checked_addr(T1, addr, wb);
+                self.store_checked_addr(k, T1, addr, wb);
                 self.a.bind(skip);
                 self.fs.host = 0;
                 self.fs.mem = (self.fs.mem & !FALL) | (la & FALL);
@@ -1992,7 +1991,7 @@ impl Tr<'_> {
                         }
                     }
                 }
-                self.store_checked_addr(T1, addr, wb);
+                self.store_checked_addr(k, T1, addr, wb);
                 if la & (FC | FO) != 0 {
                     self.a.ubfx(T2, T1, wb - 1, 1);
                     let cf_reg = if ror {
@@ -2049,7 +2048,7 @@ impl Tr<'_> {
                         self.a.ubfm(false, T1, T1, 0, wb - 1);
                     }
                 }
-                self.store_checked_addr(T1, addr, wb);
+                self.store_checked_addr(k, T1, addr, wb);
                 if la & (FC | FO) != 0 {
                     self.a.ubfx(T2, T1, wb - 1, 1);
                     let cf_reg = if ror {

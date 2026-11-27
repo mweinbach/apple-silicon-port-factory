@@ -1352,7 +1352,7 @@ impl Cpu {
                         }
                         m_vec[half] &= !(elem_mask << sh);
                     }
-                    if any_load && super::mem::tso() {
+                    if any_load && super::mem::tso_vec() {
                         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                     }
                     // VEX.128 vgatherqps/vpgatherqd (vm64x) zeroes dest[127:64] unconditionally.

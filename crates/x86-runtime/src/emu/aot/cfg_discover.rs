@@ -157,6 +157,7 @@ pub(super) struct Closure {
 /// `PORT_AOT_PDATA=0` / `AW2_DLL_AOT_PDATA=0`) intra-function successors stay in the same
 /// function (chain roots merged), while direct calls / tail-jumps into `.pdata`-less leaf
 /// functions are followed so leaf helpers aren't left out of AOT caches.
+#[cfg(test)]
 pub(super) unsafe fn discover(
     bc: *mut BlockCache,
     base: usize,
@@ -164,7 +165,7 @@ pub(super) unsafe fn discover(
     prof: &[u32],
     depth: u32,
 ) -> (Vec<u64>, Closure) {
-    discover_inner(Some(bc), None, base, size, prof, depth, 1)
+    discover_inner(Some(bc), None, base, size, prof, depth, 1, None)
 }
 
 /// Parallel-capable version of [`discover`]: expands large BFS frontiers across up to
@@ -177,7 +178,21 @@ pub(super) unsafe fn discover_with_threads(
     depth: u32,
     threads: usize,
 ) -> (Vec<u64>, Closure) {
-    discover_inner(None, Some(pool), base, size, prof, depth, threads)
+    discover_inner(None, Some(pool), base, size, prof, depth, threads, None)
+}
+
+/// Parallel-capable [`discover`] that pins every spawned worker thread to `worker_qos`
+/// (e.g. `QOS_CLASS_UTILITY` / `QOS_CLASS_BACKGROUND` during live background builds).
+pub(super) unsafe fn discover_with_threads_qos(
+    pool: &mut WorkerCaches,
+    base: usize,
+    size: usize,
+    prof: &[u32],
+    depth: u32,
+    threads: usize,
+    worker_qos: Option<u32>,
+) -> (Vec<u64>, Closure) {
+    discover_inner(None, Some(pool), base, size, prof, depth, threads, worker_qos)
 }
 
 unsafe fn discover_inner(
@@ -188,6 +203,7 @@ unsafe fn discover_inner(
     prof: &[u32],
     depth: u32,
     threads: usize,
+    worker_qos: Option<u32>,
 ) -> (Vec<u64>, Closure) {
     let text = exec_sections(base, size);
     let in_text = |ip: u64| text.iter().any(|&(s, e)| (s as u64..e as u64).contains(&ip));
@@ -274,6 +290,9 @@ unsafe fn discover_inner(
                         .name(format!("port-aot-d{wi}"))
                         .stack_size(PARALLEL_WORKER_STACK)
                         .spawn_scoped(scope, move || {
+                            if let Some(q) = worker_qos {
+                                super::set_qos(q);
+                            }
                             let bcp: *mut BlockCache = &mut **local_bc;
                             let mut done: Vec<(usize, Vec<BlockStep>)> = Vec::new();
                             loop {

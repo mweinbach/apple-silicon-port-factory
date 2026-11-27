@@ -751,14 +751,14 @@ impl Cpu {
     }
 
     #[inline(always)]
-    pub(super) unsafe fn read_mem(&self, addr: u64, bits: u32) -> u64 {
+    unsafe fn read_mem_with_tso(&self, addr: u64, bits: u32, tso: bool) -> u64 {
         let bytes = (bits as usize / 8).clamp(1, 8);
         if !regfile_ext::is_valid_guest_range(addr, bytes) {
             cold_bad_addr(self, "read_mem", addr, bits, false);
             return 0;
         }
         let p = addr as usize;
-        if mem::tso() {
+        if tso {
             return mem::load_acq(p, if bits > 64 { 64 } else { bits });
         }
         match bits {
@@ -771,7 +771,7 @@ impl Cpu {
     }
 
     #[inline(always)]
-    pub(super) unsafe fn write_mem(&self, addr: u64, bits: u32, val: u64) {
+    unsafe fn write_mem_with_tso(&self, addr: u64, bits: u32, val: u64, tso: bool) {
         if precise_faults() && FAULT_PENDING.with(|p| p.get().is_some()) {
             return;
         }
@@ -781,7 +781,7 @@ impl Cpu {
             return;
         }
         let p = addr as usize;
-        if mem::tso() {
+        if tso {
             return mem::store_rel(p, if bits > 64 { 64 } else { bits }, val);
         }
         match bits {
@@ -793,6 +793,28 @@ impl Cpu {
         }
     }
 
+    #[inline(always)]
+    pub(super) unsafe fn read_mem(&self, addr: u64, bits: u32) -> u64 {
+        self.read_mem_with_tso(addr, bits, mem::tso())
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn write_mem(&self, addr: u64, bits: u32, val: u64) {
+        self.write_mem_with_tso(addr, bits, val, mem::tso())
+    }
+
+    /// String/memcpy load honoring `PORT_JIT_TSO_MEMCPY` independently of scalar `PORT_JIT_TSO`.
+    #[inline(always)]
+    pub(super) unsafe fn read_mem_memcpy(&self, addr: u64, bits: u32) -> u64 {
+        self.read_mem_with_tso(addr, bits, mem::tso_memcpy())
+    }
+
+    /// String/memcpy store honoring `PORT_JIT_TSO_MEMCPY` independently of scalar `PORT_JIT_TSO`.
+    #[inline(always)]
+    pub(super) unsafe fn write_mem_memcpy(&self, addr: u64, bits: u32, val: u64) {
+        self.write_mem_with_tso(addr, bits, val, mem::tso_memcpy())
+    }
+
     #[inline]
     pub(super) unsafe fn read_u128(&self, addr: u64) -> u128 {
         if !regfile_ext::is_valid_guest_range(addr, 16) {
@@ -800,7 +822,7 @@ impl Cpu {
             return 0;
         }
         let p = addr as usize;
-        if mem::tso() {
+        if mem::tso_vec() {
             return mem::load128_acq(p);
         }
         rd::<u128>(p)
@@ -816,7 +838,7 @@ impl Cpu {
             return;
         }
         let p = addr as usize;
-        if mem::tso() {
+        if mem::tso_vec() {
             return mem::store128_rel(p, val);
         }
         wr::<u128>(p, val);

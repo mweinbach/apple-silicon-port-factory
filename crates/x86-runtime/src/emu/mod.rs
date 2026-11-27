@@ -70,6 +70,8 @@ mod mod_tests;
 mod jit_coverage;
 #[cfg(all(test, target_arch = "aarch64"))]
 mod jit_bench;
+#[cfg(all(test, target_arch = "aarch64"))]
+mod mem_litmus_tests;
 
 // ---------------------------------------------------------------------------------------------
 // Public & crate-internal API re-exports (preserving 100% of `crate::emu::*` paths)

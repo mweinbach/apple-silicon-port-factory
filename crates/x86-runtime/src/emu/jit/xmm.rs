@@ -4,10 +4,9 @@
 use super::aot::{AotReloc, RELOC_HOST_FN, RELOC_QPC_STATE, RELOC_SLOT_VAL, RELOC_XINPUT_STATE};
 use super::emit::Asm;
 use super::lazy::PF_NONE;
-use super::translate::{stack_tso, Chk, FlagState, Grp, Src, Tr};
+use super::translate::{Chk, FlagState, Grp, Src, Tr};
 use super::*;
 use crate::emu::fast::{self, FastOp, RNONE};
-use crate::emu::mem;
 
 /// `AW2_JIT_XMMREG` (default 1): keep guest XMM registers in host `v16..v31` within a
 /// block, NaN fixups out of line. `0`: jit5 code.
@@ -698,7 +697,7 @@ impl Tr<'_> {
             self.a.ldp_q(v_lo, v_hi, XA, 0);
             return;
         }
-        let tso = mem::tso() && (chk != Chk::Stack || stack_tso()) && !(chk == Chk::Ro && ld);
+        let tso = self.vec_tso(k, chk, ld);
         if op.base < RNONE && op.index == RNONE {
             let b = g(op.base);
             let d = op.disp;
@@ -884,7 +883,7 @@ impl Tr<'_> {
             return false;
         }
         let mut chk = Self::chk_of(op);
-        let tso = mem::tso() && (chk != Chk::Stack || stack_tso()) && !(chk == Chk::Ro && ld);
+        let tso = self.scalar_tso(k, chk, ld);
         if tso {
             return false;
         }
@@ -951,7 +950,7 @@ impl Tr<'_> {
             self.a.ldst_ui(true, 128, v, XA, 0);
             return;
         }
-        let tso = mem::tso() && (chk != Chk::Stack || stack_tso()) && !(chk == Chk::Ro && ld);
+        let tso = self.vec_tso(k, chk, ld);
         if op.base < RNONE && op.index == RNONE {
             let b = g(op.base);
             let d = op.disp;

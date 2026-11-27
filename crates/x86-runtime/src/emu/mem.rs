@@ -18,6 +18,12 @@ const TSO_DEFAULT: bool = true;
 
 #[cfg(not(test))]
 static TSO_STATE: AtomicU8 = AtomicU8::new(0);
+#[cfg(not(test))]
+static TSO_VEC_STATE: AtomicU8 = AtomicU8::new(0);
+#[cfg(not(test))]
+static TSO_MEMCPY_STATE: AtomicU8 = AtomicU8::new(0);
+#[cfg(not(test))]
+static VOLATILE_META_STATE: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(not(test))]
 #[cold]
@@ -28,6 +34,42 @@ fn init_tso() -> bool {
         log::info!("emu: non-TSO non-atomic guest loads/stores (PORT_JIT_TSO=0)");
     }
     TSO_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+fn init_tso_vec() -> bool {
+    let on = std::env::var("PORT_JIT_TSO_VEC").map_or_else(|_| tso(), |s| s.trim() != "0");
+    if !on {
+        log::info!("emu: non-TSO vector loads/stores (PORT_JIT_TSO_VEC=0)");
+    }
+    TSO_VEC_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+fn init_tso_memcpy() -> bool {
+    let on = std::env::var("PORT_JIT_TSO_MEMCPY").map_or_else(|_| tso(), |s| s.trim() != "0");
+    if !on {
+        log::info!("emu: non-TSO bulk string/memcpy ops (PORT_JIT_TSO_MEMCPY=0)");
+    }
+    TSO_MEMCPY_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+fn init_volatile_meta() -> bool {
+    let on = std::env::var("PORT_JIT_VOLATILE_META").map_or(true, |s| s.trim() != "0");
+    if !on {
+        log::info!("emu: PE VolatileMetadata TSO elision disabled (PORT_JIT_VOLATILE_META=0)");
+    }
+    VOLATILE_META_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
     on
 }
 
@@ -48,11 +90,89 @@ pub(super) fn tso() -> bool {
     }
 }
 
+/// Whether TSO barriers are enabled for 128/256-bit vector loads/stores (`PORT_JIT_TSO_VEC`,
+/// inheriting `PORT_JIT_TSO` when unset).
+#[inline(always)]
+pub(super) fn tso_vec() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(v) = TEST_TSO_VEC.with(|c| c.get()) {
+            return v;
+        }
+        if let Ok(s) = std::env::var("PORT_JIT_TSO_VEC") {
+            return s.trim() != "0";
+        }
+        tso()
+    }
+    #[cfg(not(test))]
+    {
+        match TSO_VEC_STATE.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => init_tso_vec(),
+        }
+    }
+}
+
+/// Whether TSO ordering is enabled for bulk string/memcpy ops (`PORT_JIT_TSO_MEMCPY`,
+/// inheriting `PORT_JIT_TSO` when unset).
+#[inline(always)]
+pub(super) fn tso_memcpy() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(v) = TEST_TSO_MEMCPY.with(|c| c.get()) {
+            return v;
+        }
+        if let Ok(s) = std::env::var("PORT_JIT_TSO_MEMCPY") {
+            return s.trim() != "0";
+        }
+        tso()
+    }
+    #[cfg(not(test))]
+    {
+        match TSO_MEMCPY_STATE.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => init_tso_memcpy(),
+        }
+    }
+}
+
+/// Whether PE `IMAGE_LOAD_CONFIG_DIRECTORY64.VolatileMetadataPointer` TSO elision is enabled
+/// (`PORT_JIT_VOLATILE_META`, default on).
+#[inline(always)]
+pub(super) fn volatile_meta_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(v) = TEST_VOLATILE_META.with(|c| c.get()) {
+            return v;
+        }
+        if let Ok(s) = std::env::var("PORT_JIT_VOLATILE_META") {
+            return s.trim() != "0";
+        }
+        true
+    }
+    #[cfg(not(test))]
+    {
+        match VOLATILE_META_STATE.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => init_volatile_meta(),
+        }
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     /// Test-only: disable TSO emulation on this thread (interpreter and translations made
     /// on it), for measuring its cost (`jit_bench`).
     pub(super) static TEST_NO_TSO: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Test-only override for `PORT_JIT_TSO_VEC` on this thread.
+    pub(super) static TEST_TSO_VEC: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+    /// Test-only override for `PORT_JIT_TSO_MEMCPY` on this thread.
+    pub(super) static TEST_TSO_MEMCPY: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+    /// Test-only override for `PORT_JIT_VOLATILE_META` on this thread.
+    pub(super) static TEST_VOLATILE_META: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
 }
 
 #[cold]

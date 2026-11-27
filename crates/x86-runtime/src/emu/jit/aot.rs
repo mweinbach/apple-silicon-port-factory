@@ -351,10 +351,17 @@ pub(in crate::emu) fn aot_knob_bits() -> u64 {
     let low = bits.iter().fold(0u64, |k, &(b, v)| k | (v << b));
     debug_assert_eq!(low >> 39, 0, "aot_knob_bits low bitfields overflowed bit 38");
     // Fold a 25-bit digest of all registry-declared AOT-key knobs (`affects_aot_key == true`)
-    // into bits 39..=63 so any codegen/stub knob set via `PORT_*`, legacy `AW2_*`, or
-    // `game.toml [knobs]` partitions the `.aot` cache key without disturbing bits 0..=38
-    // read by `StubCfg::from_aot_knobs` and static Mach-O emission.
-    let high = (port_manifest::knobs::aot_key_hash() & ((1u64 << 25) - 1)) << 39;
+    // plus the effective runtime TSO/VolatileMetadata switches into bits 39..=63 so any
+    // codegen/stub knob set via `PORT_*`, legacy `AW2_*`, `game.toml [knobs]`, or inherited
+    // `PORT_JIT_TSO=0` vs explicit `PORT_JIT_TSO_VEC=1`/`PORT_JIT_TSO_MEMCPY=1` partitions
+    // the `.aot` cache key without disturbing bits 0..=38 read by `StubCfg::from_aot_knobs`
+    // and static Mach-O emission.
+    let eff_tso = (mem::tso() as u64)
+        | ((mem::tso_vec() as u64) << 1)
+        | ((mem::tso_memcpy() as u64) << 2)
+        | ((mem::volatile_meta_enabled() as u64) << 3);
+    let digest = (port_manifest::knobs::aot_key_hash() ^ eff_tso).wrapping_mul(0x0000_0100_0000_01b3);
+    let high = (digest & ((1u64 << 25) - 1)) << 39;
     low | high
 }
 

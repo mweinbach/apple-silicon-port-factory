@@ -16,6 +16,7 @@ mod cfg_discover;
 mod format;
 mod jumptable;
 mod runtime;
+mod volatile;
 #[cfg(test)]
 mod tests;
 
@@ -44,6 +45,9 @@ pub(crate) use runtime::resolve_guest_va;
 pub(super) use runtime::{
     active, counts, epoch, find, note_code_region, probe_table, revalidate, was_killed_at,
 };
+pub(super) use volatile::{lookup_module_for_ip, ModuleVolatileMeta};
+#[cfg(test)]
+pub(super) use volatile::{test_register_volatile_meta, test_unregister_volatile_meta};
 #[cfg(test)]
 pub(super) use runtime::revive_enabled;
 #[cfg(test)]
@@ -148,6 +152,11 @@ pub fn set_disk_aot_disabled(disabled: bool) {
 pub fn disk_aot_disabled() -> bool {
     DISK_AOT_DISABLED.load(Ordering::Acquire)
         || std::env::var_os("PORT_CHILD_PROCESS").is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+pub(in crate::emu) fn test_set_aot_enabled(on: bool) {
+    TEST_AOT.with(|c| c.set(on));
 }
 
 /// `PORT_AOT` / `AW2_DLL_AOT`: 0 = JIT only, 1 = load valid caches, 2 = load valid caches and

@@ -277,13 +277,65 @@ pub struct BaseReloc {
 }
 
 /// Subset of `IMAGE_LOAD_CONFIG_DIRECTORY64` the loader cares about.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LoadConfig {
     pub size: u32,
     pub security_cookie_va: u64,
     pub guard_cf_check_function_pointer_va: u64,
     pub guard_cf_dispatch_function_pointer_va: u64,
     pub guard_flags: u32,
+    /// `IMAGE_LOAD_CONFIG_DIRECTORY64.VolatileMetadataPointer` (`+0x100`), if present.
+    pub volatile_metadata_va: u64,
+}
+
+/// One compiler-certified code RVA range `[start_rva, end_rva)` from
+/// `IMAGE_VOLATILE_METADATA::VolatileInfoRangeTable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolatileRange {
+    pub start_rva: u32,
+    pub end_rva: u32,
+}
+
+/// Parsed PE `IMAGE_VOLATILE_METADATA` table (`VolatileMetadataPointer`).
+///
+/// Within any range in [`Self::ranges`], the MSVC compiler (`/volatileMetadata`) certifies
+/// that memory accesses NOT listed in [`Self::access_rvas`] (and not explicit `LOCK`/fence
+/// instructions) are non-volatile/non-atomic and do not require x86 TSO acquire/release
+/// ordering on weakly-ordered architectures.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolatileMetadata {
+    pub version: u32,
+    /// Sorted, non-overlapping covered code RVA half-open ranges `[start_rva, end_rva)`.
+    pub ranges: Vec<VolatileRange>,
+    /// Sorted, deduplicated instruction RVAs that perform volatile/atomic memory accesses.
+    pub access_rvas: Vec<u32>,
+}
+
+impl VolatileMetadata {
+    /// True if no covered code ranges are present.
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// True if instruction `rva` lies inside a compiler-certified covered range.
+    #[inline]
+    pub fn in_covered_range(&self, rva: u32) -> bool {
+        let idx = self.ranges.partition_point(|r| r.start_rva <= rva);
+        idx > 0 && rva < self.ranges[idx - 1].end_rva
+    }
+
+    /// True if instruction `rva` is explicitly listed in `VolatileAccessTable`.
+    #[inline]
+    pub fn is_volatile_access(&self, rva: u32) -> bool {
+        self.access_rvas.binary_search(&rva).is_ok()
+    }
+
+    /// True if TSO ordering may be safely elided for a non-`LOCK` access at `rva`:
+    /// inside a covered range AND not listed in `VolatileAccessTable`.
+    #[inline]
+    pub fn can_elide_tso(&self, rva: u32) -> bool {
+        self.in_covered_range(rva) && !self.is_volatile_access(rva)
+    }
 }
 
 /// A parsed PE32+ image (borrowing the bytes).
@@ -712,7 +764,7 @@ impl<'a> Pe<'a> {
         let d = dir.rva;
         let size = self.u32_at(d)?;
         let get = |off: u32| -> u64 {
-            if off + 8 <= size {
+            if off.checked_add(8).is_some_and(|e| e <= size) {
                 self.u64_at(d + off).unwrap_or(0)
             } else {
                 0
@@ -723,11 +775,108 @@ impl<'a> Pe<'a> {
             security_cookie_va: get(0x58),
             guard_cf_check_function_pointer_va: get(0x70),
             guard_cf_dispatch_function_pointer_va: get(0x78),
-            guard_flags: if 0x94 + 4 <= size {
+            guard_flags: if 0x90 + 4 <= size {
                 self.u32_at(d + 0x90).unwrap_or(0)
             } else {
                 0
             },
+            volatile_metadata_va: get(0x100),
+        }))
+    }
+
+    /// Parse `IMAGE_VOLATILE_METADATA` referenced by
+    /// `IMAGE_LOAD_CONFIG_DIRECTORY64.VolatileMetadataPointer` (`+0x100`), if present.
+    pub fn volatile_metadata(&self) -> Result<Option<VolatileMetadata>> {
+        let Some(lc) = self.load_config()? else {
+            return Ok(None);
+        };
+        if lc.volatile_metadata_va == 0 {
+            return Ok(None);
+        }
+        let vm_rva = match self.va_to_rva(lc.volatile_metadata_va) {
+            Ok(r) => r,
+            Err(_) if self.layout == Layout::Mapped => {
+                let mapped_base = self.data.as_ptr() as u64;
+                let Some(rel) = lc
+                    .volatile_metadata_va
+                    .checked_sub(mapped_base)
+                    .filter(|&r| (r as usize) < self.data.len())
+                else {
+                    return Ok(None);
+                };
+                rel as u32
+            }
+            Err(_) => return Ok(None),
+        };
+        let hdr = match self.bytes_at(vm_rva, 24) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let vm_size = rd_u32(hdr, 0)?;
+        if vm_size < 24 {
+            return Ok(None);
+        }
+        let version = rd_u32(hdr, 4)?;
+        let access_rva = rd_u32(hdr, 8)?;
+        let access_size = rd_u32(hdr, 12)?;
+        let range_rva = rd_u32(hdr, 16)?;
+        let range_size = rd_u32(hdr, 20)?;
+
+        let mut ranges = Vec::new();
+        if range_rva != 0 && range_size >= 8 {
+            if range_size % 8 != 0 {
+                return Ok(None);
+            }
+            let Ok(rbytes) = self.bytes_at(range_rva, range_size as usize) else {
+                return Ok(None);
+            };
+            ranges.reserve((range_size / 8) as usize);
+            for chunk in rbytes.chunks_exact(8) {
+                let start_rva = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+                let len = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                if len == 0 {
+                    continue;
+                }
+                let end_rva = start_rva.saturating_add(len);
+                if end_rva > start_rva {
+                    ranges.push(VolatileRange { start_rva, end_rva });
+                }
+            }
+            ranges.sort_unstable_by_key(|r| (r.start_rva, r.end_rva));
+            // Coalesce overlapping/adjacent ranges so binary search is strictly monotone.
+            let mut merged: Vec<VolatileRange> = Vec::with_capacity(ranges.len());
+            for r in ranges {
+                if let Some(last) = merged.last_mut() {
+                    if r.start_rva <= last.end_rva {
+                        last.end_rva = last.end_rva.max(r.end_rva);
+                        continue;
+                    }
+                }
+                merged.push(r);
+            }
+            ranges = merged;
+        }
+
+        let mut access_rvas = Vec::new();
+        if access_rva != 0 && access_size >= 4 {
+            if access_size % 4 != 0 {
+                return Ok(None);
+            }
+            let Ok(abytes) = self.bytes_at(access_rva, access_size as usize) else {
+                return Ok(None);
+            };
+            access_rvas.reserve((access_size / 4) as usize);
+            for chunk in abytes.chunks_exact(4) {
+                access_rvas.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            access_rvas.sort_unstable();
+            access_rvas.dedup();
+        }
+
+        Ok(Some(VolatileMetadata {
+            version,
+            ranges,
+            access_rvas,
         }))
     }
 
@@ -1304,5 +1453,107 @@ mod tests {
             hdr.execution_mode(IMAGE_FILE_MACHINE_AMD64),
             ClrExecutionMode::ReadyToRunHybrid
         );
+    }
+
+    #[test]
+    fn parse_volatile_metadata_synthetic_file_and_mapped() {
+        let image_base = 0x1_8000_0000u64;
+        let mut img = vec![0u8; 0x3000];
+        let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+        // Minimal valid PE32+ with .text @ 0x1000..0x2000 and .rdata @ 0x2000..0x3000.
+        w16(&mut img, 0, 0x5A4D);
+        w32(&mut img, 0x3C, 0x80);
+        w32(&mut img, 0x80, 0x0000_4550);
+        w16(&mut img, 0x84, IMAGE_FILE_MACHINE_AMD64);
+        w16(&mut img, 0x86, 2); // 2 sections
+        w16(&mut img, 0x94, 0xF0); // SizeOfOptionalHeader
+        let opt = 0x98;
+        w16(&mut img, opt, 0x20B);
+        w32(&mut img, opt + 16, 0x1000); // entry
+        w64(&mut img, opt + 24, image_base);
+        w32(&mut img, opt + 32, 0x1000); // SectionAlignment
+        w32(&mut img, opt + 36, 0x200); // FileAlignment
+        w32(&mut img, opt + 56, 0x3000); // SizeOfImage
+        w32(&mut img, opt + 60, 0x400); // SizeOfHeaders
+        w32(&mut img, opt + 108, 16); // NumberOfRvaAndSizes
+        // DataDirectory[10] (LoadConfig) @ 0x2000, size 0x140
+        w32(&mut img, opt + 112 + 10 * 8, 0x2000);
+        w32(&mut img, opt + 112 + 10 * 8 + 4, 0x140);
+
+        let sec0 = opt + 0xF0;
+        img[sec0..sec0 + 5].copy_from_slice(b".text");
+        w32(&mut img, sec0 + 8, 0x1000);
+        w32(&mut img, sec0 + 12, 0x1000);
+        w32(&mut img, sec0 + 16, 0x1000);
+        w32(&mut img, sec0 + 20, 0x1000);
+        w32(&mut img, sec0 + 36, IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
+
+        let sec1 = sec0 + 40;
+        img[sec1..sec1 + 6].copy_from_slice(b".rdata");
+        w32(&mut img, sec1 + 8, 0x1000);
+        w32(&mut img, sec1 + 12, 0x2000);
+        w32(&mut img, sec1 + 16, 0x1000);
+        w32(&mut img, sec1 + 20, 0x2000);
+        w32(&mut img, sec1 + 36, IMAGE_SCN_MEM_READ);
+
+        // IMAGE_LOAD_CONFIG_DIRECTORY64 @ 0x2000
+        w32(&mut img, 0x2000, 0x140);
+        w32(&mut img, 0x2000 + 0x90, 0x0000_0100); // GuardFlags
+        w64(&mut img, 0x2000 + 0x100, image_base + 0x2200); // VolatileMetadataPointer
+
+        // IMAGE_VOLATILE_METADATA @ 0x2200
+        w32(&mut img, 0x2200, 24);
+        w32(&mut img, 0x2204, 0x8002_8002);
+        w32(&mut img, 0x2208, 0x2300); // VolatileAccessTable RVA
+        w32(&mut img, 0x220C, 12); // 3 u32 entries (unsorted input to verify sorting)
+        w32(&mut img, 0x2210, 0x2400); // VolatileInfoRangeTable RVA
+        w32(&mut img, 0x2214, 16); // 2 (start, len) entries
+
+        w32(&mut img, 0x2300, 0x1040);
+        w32(&mut img, 0x2304, 0x1010);
+        w32(&mut img, 0x2308, 0x1040); // duplicate
+
+        w32(&mut img, 0x2400, 0x1000);
+        w32(&mut img, 0x2404, 0x80); // [0x1000, 0x1080)
+        w32(&mut img, 0x2408, 0x1200);
+        w32(&mut img, 0x240C, 0x40); // [0x1200, 0x1240)
+
+        for layout in [Layout::File, Layout::Mapped] {
+            let pe = Pe::parse_with_layout(&img, layout).unwrap();
+            let lc = pe.load_config().unwrap().unwrap();
+            assert_eq!(lc.size, 0x140);
+            assert_eq!(lc.guard_flags, 0x0000_0100);
+            assert_eq!(lc.volatile_metadata_va, image_base + 0x2200);
+
+            let vm = pe.volatile_metadata().unwrap().unwrap();
+            assert_eq!(vm.version, 0x8002_8002);
+            assert_eq!(
+                vm.ranges,
+                vec![
+                    VolatileRange { start_rva: 0x1000, end_rva: 0x1080 },
+                    VolatileRange { start_rva: 0x1200, end_rva: 0x1240 },
+                ]
+            );
+            assert_eq!(vm.access_rvas, vec![0x1010, 0x1040]);
+            assert!(vm.can_elide_tso(0x1000));
+            assert!(!vm.can_elide_tso(0x1010));
+            assert!(vm.can_elide_tso(0x1014));
+            assert!(!vm.can_elide_tso(0x1040));
+            assert!(!vm.can_elide_tso(0x1080)); // outside range
+            assert!(!vm.can_elide_tso(0x1100)); // uncovered gap
+            assert!(vm.can_elide_tso(0x1200));
+            assert!(!vm.can_elide_tso(0x1240));
+        }
+
+        // Also test relocated mapped VA (VolatileMetadataPointer relocated to buffer address).
+        let mapped_base = img.as_ptr() as u64;
+        w64(&mut img, 0x2000 + 0x100, mapped_base + 0x2200);
+        let pe_reloc = Pe::parse_mapped(&img).unwrap();
+        let vm_reloc = pe_reloc.volatile_metadata().unwrap().unwrap();
+        assert!(vm_reloc.can_elide_tso(0x1000));
+        assert!(!vm_reloc.can_elide_tso(0x1010));
     }
 }
