@@ -348,17 +348,32 @@ pub(crate) fn run_bench_with_timer_capacity(
     opts: &BenchOptions,
     timer_capacity: u32,
 ) -> anyhow::Result<(BenchReport, MetalBackend)> {
-    let reader = Reader::new(data).map_err(|e| anyhow::anyhow!("{}", e.0))?;
+    let mut reader = Reader::new(data).map_err(|e| anyhow::anyhow!("{}", e.0))?;
     let mut records = Vec::new();
-    for r in reader {
+    let mut stopped_at_until = false;
+    while let Some(r) = reader.next() {
         let rec = r.map_err(|e| anyhow::anyhow!("{}", e.0))?;
         if opts.until.is_some_and(|u| rec.index > u) {
+            stopped_at_until = true;
             break;
         }
         records.push(rec);
     }
+    let truncated = !stopped_at_until && reader.truncated();
     if records.is_empty() {
+        if truncated {
+            anyhow::bail!("cannot benchmark truncated trace with no complete records");
+        }
         anyhow::bail!("trace contains no records");
+    }
+    let has_complete_frame = records
+        .iter()
+        .any(|r| matches!(r.call, Call::FrameEnd { .. } | Call::Present { .. }));
+    if truncated && !has_complete_frame {
+        anyhow::bail!(
+            "cannot benchmark truncated trace ({} complete records, no complete FrameEnd/Present boundary)",
+            records.len()
+        );
     }
 
     let (frame_start, frame_end, reopen_lists) = find_frame_slice(&records)?;

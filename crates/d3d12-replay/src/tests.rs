@@ -2710,3 +2710,33 @@ fn metal_backend_shader_visible_descriptor_overwrite_waits_for_prior_gpu_reads()
     assert!(c3[0] > 0.9 && c3[2] < 0.1, "submission 3 must see red TEX_A, got {c3:?}");
 }
 
+#[test]
+fn bench_rejects_truncated_trace_without_complete_frame() {
+    use crate::bench;
+    use d3d12_metal::types::CommandQueueDesc;
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+    }
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let lists = [3u64];
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 4, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: 1, list: 3, list_type: 0, allocator: 4, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::Close { list: 3 }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: 2, lists: U64s::from_slice(&lists) }, 0).unwrap();
+
+    // Truncate inside the final `ExecuteCommandLists` record (torn single-frame capture).
+    let mut torn = w.into_inner();
+    torn.truncate(torn.len() - 4);
+
+    let opts = bench::BenchOptions { iterations: 2, warmup: 0, until: None };
+    let err = bench::run_bench(&torn, &opts)
+        .err()
+        .expect("bench must reject torn single-frame capture instead of reporting 0 ms");
+    assert!(err.to_string().contains("truncated"), "{err}");
+}
+
