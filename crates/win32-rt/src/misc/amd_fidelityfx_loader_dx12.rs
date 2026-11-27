@@ -114,9 +114,11 @@ const _: () = assert!(std::mem::offset_of!(FfxDispatchDescUpscaleGenerateReactiv
 struct FfxContextState {
     swapchain: usize,
     upscale_flags: u32,
-    #[allow(dead_code)]
     max_render_size: [u32; 2],
     max_upscale_size: [u32; 2],
+    /// Latched once a context observes a sub-`max_render_size` dispatch so
+    /// `dynamic_resolution` never flips back to `false` on a full-resolution frame.
+    saw_dynamic_resolution: bool,
     first_dispatch: bool,
     logged_first_dispatch: bool,
     logged_gen_reactive: bool,
@@ -129,10 +131,25 @@ impl FfxContextState {
             upscale_flags: 0,
             max_render_size: [0, 0],
             max_upscale_size: [0, 0],
+            saw_dynamic_resolution: false,
             first_dispatch: true,
             logged_first_dispatch: false,
             logged_gen_reactive: false,
         }
+    }
+
+    fn resolve_dynamic_resolution(&mut self, render_size: [u32; 2]) -> bool {
+        if (self.upscale_flags & FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION) != 0 {
+            self.saw_dynamic_resolution = true;
+            return true;
+        }
+        if render_size != [0, 0]
+            && self.max_render_size != [0, 0]
+            && render_size != self.max_render_size
+        {
+            self.saw_dynamic_resolution = true;
+        }
+        self.saw_dynamic_resolution
     }
 }
 
@@ -466,8 +483,7 @@ pub unsafe extern "win64" fn ffxDispatch(context: *mut usize, header: *const Ffx
                     && !motion_in.is_null();
                 let is_hdr = (ctx.upscale_flags & FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE) != 0;
                 let depth_reversed = (ctx.upscale_flags & FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0;
-                let dynamic_resolution =
-                    (ctx.upscale_flags & FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION) != 0;
+                let dynamic_resolution = ctx.resolve_dynamic_resolution(render_size);
                 let output_res_mv = (ctx.upscale_flags
                     & FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS)
                     != 0;
@@ -1190,5 +1206,24 @@ mod tests {
 
             assert_eq!(ffxDestroyContext(&mut ctx, 0), FFX_API_RETURN_OK);
         }
+    }
+
+    #[test]
+    fn ffx_dynamic_resolution_latches_without_flipping_back() {
+        let mut st = FfxContextState::new_swapchain(0);
+        st.max_render_size = [1424, 802];
+        // Fixed-resolution context without DRS flag stays false when render_size == max_render_size.
+        assert!(!st.resolve_dynamic_resolution([1424, 802]));
+        assert!(!st.resolve_dynamic_resolution([0, 0]));
+        // Once a sub-max render size arrives, DRS latches true and never flips back to false
+        // when render_size returns to max_render_size.
+        assert!(st.resolve_dynamic_resolution([1280, 720]));
+        assert!(st.resolve_dynamic_resolution([1424, 802]));
+
+        // Explicit FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION flag starts true immediately.
+        let mut st_flag = FfxContextState::new_swapchain(0);
+        st_flag.upscale_flags = FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
+        st_flag.max_render_size = [1424, 802];
+        assert!(st_flag.resolve_dynamic_resolution([1424, 802]));
     }
 }

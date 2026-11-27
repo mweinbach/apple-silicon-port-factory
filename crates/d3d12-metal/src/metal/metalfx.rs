@@ -501,10 +501,23 @@ struct MetalFxRuntime {
     temporal_desc_cls: Option<&'static AnyClass>,
     temporal_min_scale: f32,
     temporal_max_scale: f32,
-    compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
+    /// Fallback compiler used only when [`crate::metal::pipeline::pso_cache`] is unavailable.
+    fallback_compiler: Option<Retained<ProtocolObject<dyn MTL4Compiler>>>,
     scalers: Mutex<HashMap<ScalerKey, Option<Arc<Mutex<SpatialScaler>>>>>,
     temporal_scalers: Mutex<HashMap<TemporalScalerKey, Option<Arc<Mutex<TemporalScaler>>>>>,
     scratch: Mutex<HashMap<(u32, u32, usize, usize, u8), SendTex>>,
+}
+
+impl MetalFxRuntime {
+    /// Prefer the shared `PipelineCache` `MTL4Compiler` (which carries
+    /// `MTL4PipelineDataSetSerializer` binary capture and tracks compiler resets)
+    /// so MetalFX internal pipelines are captured into the shared `.mtl4a` archive.
+    fn compiler(&self) -> Option<Retained<ProtocolObject<dyn MTL4Compiler>>> {
+        if let Ok(cache) = crate::metal::pipeline::pso_cache() {
+            return Some(cache.compiler());
+        }
+        self.fallback_compiler.clone()
+    }
 }
 
 unsafe impl Send for MetalFxRuntime {}
@@ -551,12 +564,16 @@ fn runtime() -> Option<&'static MetalFxRuntime> {
         if spatial_desc_cls.is_none() && temporal_desc_cls.is_none() {
             return None;
         }
-        let cdesc = MTL4CompilerDescriptor::new();
-        let compiler = match d.dev.newCompilerWithDescriptor_error(&cdesc) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!(target: "d3d", "metalfx: newCompilerWithDescriptor failed: {e}");
-                return None;
+        let fallback_compiler = if crate::metal::pipeline::pso_cache().is_ok() {
+            None
+        } else {
+            let cdesc = MTL4CompilerDescriptor::new();
+            match d.dev.newCompilerWithDescriptor_error(&cdesc) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::warn!(target: "d3d", "metalfx: newCompilerWithDescriptor failed: {e}");
+                    return None;
+                }
             }
         };
         let (temporal_min_scale, temporal_max_scale) = if let Some(tcls) = temporal_desc_cls {
@@ -594,7 +611,7 @@ fn runtime() -> Option<&'static MetalFxRuntime> {
             temporal_desc_cls,
             temporal_min_scale,
             temporal_max_scale,
-            compiler,
+            fallback_compiler,
             scalers: Mutex::new(HashMap::new()),
             temporal_scalers: Mutex::new(HashMap::new()),
             scratch: Mutex::new(HashMap::new()),
@@ -701,8 +718,9 @@ pub fn get_or_create_scaler(
                 let _: () = msg_send![&*desc, setRequiresSynchronousInitialization: Bool::YES];
             }
         }
+        let compiler = rt.compiler()?;
         let obj: Option<Retained<AnyObject>> = unsafe {
-            msg_send![&*desc, newSpatialScalerWithDevice: &*d.dev, compiler: &*rt.compiler]
+            msg_send![&*desc, newSpatialScalerWithDevice: &*d.dev, compiler: &*compiler]
         };
         let obj = obj?;
         let color_usage: MTLTextureUsage = unsafe { msg_send![&*obj, colorTextureUsage] };
@@ -734,6 +752,18 @@ pub fn get_or_create_scaler(
 
     let mut cache = rt.scalers.lock().unwrap();
     cache.entry(key).or_insert_with(|| created).clone()
+}
+
+/// True when a usable (non-negative-cached) `MTL4FXTemporalScaler` already exists for `key`.
+pub fn has_cached_temporal_scaler(key: TemporalScalerKey) -> bool {
+    let Some(rt) = runtime() else {
+        return false;
+    };
+    rt.temporal_scalers
+        .lock()
+        .unwrap()
+        .get(&key)
+        .is_some_and(Option::is_some)
 }
 
 /// Fetch or create a cached `MTL4FXTemporalScaler` for `key`.
@@ -829,8 +859,9 @@ pub fn get_or_create_temporal_scaler(key: TemporalScalerKey) -> Option<Arc<Mutex
                 }
             }
         }
+        let compiler = rt.compiler()?;
         let obj: Option<Retained<AnyObject>> = unsafe {
-            msg_send![&*desc, newTemporalScalerWithDevice: &*d.dev, compiler: &*rt.compiler]
+            msg_send![&*desc, newTemporalScalerWithDevice: &*d.dev, compiler: &*compiler]
         };
         let Some(obj) = obj else {
             log::warn!(

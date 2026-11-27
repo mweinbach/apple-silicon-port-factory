@@ -60,13 +60,14 @@ pub fn fence_signal_coalesce() -> bool {
     })
 }
 
-/// `PORT_ASYNC_COMMIT`: offload Direct-queue `MTL4CommandQueue::commit:count:` (plus
-/// ordered `signalEvent`/`waitForEvent` ops) to a dedicated in-order worker thread so
-/// synchronous MetalFX `preCommit` ANE work (4–26 ms) never stalls `d3d12-metal-cs`.
-/// Default **on** (`PORT_ASYNC_COMMIT=0` disables).
+/// `PORT_ASYNC_COMMIT`: opt-in offload of Direct-queue `MTL4CommandQueue::commit:count:`
+/// (plus fused ordered `signalEvent`/`waitForEvent` ops) to a dedicated in-order worker
+/// thread. Default **off** (`PORT_ASYNC_COMMIT=1` enables): under `PORT_MESH_SHADERS=1`,
+/// cross-thread commit handoff regressed Cauldron Lake p95 (+1.1–1.6 ms) and >16 ms tail
+/// frames (2.5–4x) relative to inline commit with `PORT_QUEUE_START_STAGE_EXACT=1`.
 pub fn async_commit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PORT_ASYNC_COMMIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("PORT_ASYNC_COMMIT").is_some_and(|v| v != "0"))
 }
 
 /// `D3D12_COMMAND_LIST_TYPE`.
@@ -153,12 +154,14 @@ pub fn has_pending_cbs() -> bool {
     GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
 }
 
-/// Lock-free check for whether any command buffer is either buffered in `pending_cbs`
-/// or still in flight inside an async [`CommitWorker`].
+/// Lock-free check for whether any command buffer is either buffered in `pending_cbs`,
+/// still in flight inside an async [`CommitWorker`], or holds active recording-level mesh
+/// ICB ownership that must be released on `CommandList::begin` / `CommandAllocator::reset`.
 #[inline]
 pub fn has_uncommitted_cbs() -> bool {
     GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
         || GLOBAL_INFLIGHT_COMMIT_CBS.load(Ordering::Acquire) > 0
+        || crate::mesh::has_active_mesh_icbs()
 }
 
 /// Lock-free check for whether any queue currently holds buffered command buffers or deferred signals.
@@ -181,6 +184,10 @@ unsafe impl<T> Sync for SendMtl<T> {}
 
 enum CommitOp {
     Commit(Vec<(Retained<MtlCommandBuffer>, usize)>),
+    CommitAndSignals {
+        cbs: Vec<(Retained<MtlCommandBuffer>, usize)>,
+        signals: Vec<(Retained<MtlEvent>, u64)>,
+    },
     Signal(Retained<MtlEvent>, u64),
     Wait(Retained<MtlEvent>, u64),
 }
@@ -199,6 +206,7 @@ struct CommitWorkerInner {
 struct CommitWorker {
     q: SendMtl<Retained<MtlQueue>>,
     kind: ListType,
+    is_swapchain_internal: bool,
     inner: Mutex<CommitWorkerInner>,
     work_cv: Condvar,
     done_cv: Condvar,
@@ -209,10 +217,11 @@ struct CommitWorker {
 }
 
 impl CommitWorker {
-    fn new(q: Retained<MtlQueue>, kind: ListType) -> Arc<Self> {
+    fn new(q: Retained<MtlQueue>, kind: ListType, is_swapchain_internal: bool) -> Arc<Self> {
         Arc::new(Self {
             q: SendMtl(q),
             kind,
+            is_swapchain_internal,
             inner: Mutex::new(CommitWorkerInner {
                 queue: VecDeque::new(),
                 active_cbs: Vec::new(),
@@ -261,7 +270,13 @@ impl CommitWorker {
                 loop {
                     if let Some(op) = g.queue.pop_front() {
                         g.active_op = true;
-                        if let CommitOp::Commit(ref cbs) = op {
+                        let op_cbs = match &op {
+                            CommitOp::Commit(cbs) | CommitOp::CommitAndSignals { cbs, .. } => {
+                                Some(cbs.as_slice())
+                            }
+                            _ => None,
+                        };
+                        if let Some(cbs) = op_cbs {
                             g.active_cbs.clear();
                             g.active_cbs.reserve(cbs.len());
                             for (c, ak) in cbs {
@@ -277,13 +292,22 @@ impl CommitWorker {
                 }
             };
             let committed_cbs = match &op {
-                CommitOp::Commit(cbs) => cbs.len(),
+                CommitOp::Commit(cbs) | CommitOp::CommitAndSignals { cbs, .. } => cbs.len(),
                 _ => 0,
             };
             objc2::rc::autoreleasepool(|_| match op {
                 CommitOp::Commit(cbs) => {
-                    commit_retained_cbs(&self.q.0, &cbs, self.kind);
+                    commit_retained_cbs(&self.q.0, &cbs, self.kind, self.is_swapchain_internal);
                     drop(cbs);
+                }
+                CommitOp::CommitAndSignals { cbs, signals } => {
+                    if !cbs.is_empty() {
+                        commit_retained_cbs(&self.q.0, &cbs, self.kind, self.is_swapchain_internal);
+                        drop(cbs);
+                    }
+                    for (ev, val) in signals {
+                        self.q.0.signalEvent_value(ProtocolObject::from_ref(&*ev), val);
+                    }
                 }
                 CommitOp::Signal(ev, val) => {
                     self.q.0.signalEvent_value(ProtocolObject::from_ref(&*ev), val);
@@ -320,6 +344,35 @@ impl CommitWorker {
         self.work_cv.notify_one();
     }
 
+    fn enqueue_commit_and_signals(
+        self: &Arc<Self>,
+        cbs: Vec<(Retained<MtlCommandBuffer>, usize)>,
+        mut signals: Vec<(Retained<MtlEvent>, u64)>,
+    ) {
+        if cbs.is_empty() && signals.is_empty() {
+            return;
+        }
+        if signals.is_empty() {
+            self.enqueue_commit(cbs);
+            return;
+        }
+        if cbs.is_empty() && signals.len() == 1 {
+            let (ev, val) = signals.pop().unwrap();
+            self.enqueue_signal(ev, val);
+            return;
+        }
+        self.ensure_started();
+        let n = cbs.len();
+        self.in_flight_ops.fetch_add(1, Ordering::AcqRel);
+        if n > 0 {
+            self.in_flight_cbs.fetch_add(n, Ordering::AcqRel);
+            GLOBAL_INFLIGHT_COMMIT_CBS.fetch_add(n, Ordering::AcqRel);
+        }
+        let mut g = self.inner.lock().unwrap();
+        g.queue.push_back(CommitOp::CommitAndSignals { cbs, signals });
+        self.work_cv.notify_one();
+    }
+
     fn enqueue_signal(self: &Arc<Self>, ev: Retained<MtlEvent>, val: u64) {
         self.ensure_started();
         self.in_flight_ops.fetch_add(1, Ordering::AcqRel);
@@ -345,10 +398,12 @@ impl CommitWorker {
                 .iter()
                 .any(|&(p, ak)| (cb_ptr != 0 && p == cb_ptr) || (alloc_key != 0 && (ak == 0 || ak == alloc_key)))
                 || g.queue.iter().any(|op| match op {
-                    CommitOp::Commit(cbs) => cbs.iter().any(|(c, ak)| {
-                        (cb_ptr != 0 && Retained::as_ptr(c) as usize == cb_ptr)
-                            || (alloc_key != 0 && (*ak == 0 || *ak == alloc_key))
-                    }),
+                    CommitOp::Commit(cbs) | CommitOp::CommitAndSignals { cbs, .. } => {
+                        cbs.iter().any(|(c, ak)| {
+                            (cb_ptr != 0 && Retained::as_ptr(c) as usize == cb_ptr)
+                                || (alloc_key != 0 && (*ak == 0 || *ak == alloc_key))
+                        })
+                    }
                     _ => false,
                 })
         };
@@ -674,10 +729,21 @@ fn record_test_commit(n: usize) {
 
 /// Commit `cbs` to `q` using a stack-allocated pointer array for `<= 32` command
 /// buffers (falling back to heap allocation only for larger batches).
+///
+/// Swapchain-internal queues (`pq` / `sq`) are excluded from the built-in Direct-queue
+/// `perf_meter_callback` so async present blits do not contaminate `q0`'s `gpu_busy`
+/// timestamps or submit/CB counts (custom diagnostic feedback hooks still observe them).
 #[inline]
-fn commit_cbs(q: &MtlQueue, cbs: &[&MtlCommandBuffer], kind: ListType) {
+fn should_install_feedback(hook: usize, is_swapchain_internal: bool) -> bool {
+    hook != 0
+        && !(is_swapchain_internal && hook == (perf_meter_callback as GpuFeedbackHook) as usize)
+}
+
+#[inline]
+fn commit_cbs(q: &MtlQueue, cbs: &[&MtlCommandBuffer], kind: ListType, is_swapchain_internal: bool) {
     const STACK_CAP: usize = 32;
     let hook = FEEDBACK_HOOK.load(Ordering::Relaxed);
+    let attach_fb = should_install_feedback(hook, is_swapchain_internal);
     if cbs.len() <= STACK_CAP {
         let mut stack: [std::mem::MaybeUninit<NonNull<MtlCommandBuffer>>; STACK_CAP] =
             [const { std::mem::MaybeUninit::uninit() }; STACK_CAP];
@@ -688,14 +754,14 @@ fn commit_cbs(q: &MtlQueue, cbs: &[&MtlCommandBuffer], kind: ListType) {
         let slice = unsafe {
             std::slice::from_raw_parts_mut(stack.as_mut_ptr() as *mut NonNull<MtlCommandBuffer>, cbs.len())
         };
-        if hook != 0 {
+        if attach_fb {
             commit_with_feedback(q, slice, kind, hook);
         } else {
             unsafe { q.commit_count(NonNull::new(slice.as_mut_ptr()).unwrap(), slice.len()) };
         }
     } else {
         let mut ptrs: Vec<NonNull<MtlCommandBuffer>> = cbs.iter().map(|c| NonNull::from(*c)).collect();
-        if hook != 0 {
+        if attach_fb {
             commit_with_feedback(q, &mut ptrs, kind, hook);
         } else {
             unsafe { q.commit_count(NonNull::new(ptrs.as_mut_ptr()).unwrap(), ptrs.len()) };
@@ -708,6 +774,7 @@ fn commit_retained_cbs(
     q: &MtlQueue,
     cbs: &[(Retained<MtlCommandBuffer>, usize)],
     kind: ListType,
+    is_swapchain_internal: bool,
 ) {
     if cbs.is_empty() {
         return;
@@ -728,10 +795,10 @@ fn commit_retained_cbs(
         let slice = unsafe {
             std::slice::from_raw_parts(stack.as_ptr() as *const &MtlCommandBuffer, n)
         };
-        commit_cbs(q, slice, kind);
+        commit_cbs(q, slice, kind, is_swapchain_internal);
     } else {
         let refs: Vec<&MtlCommandBuffer> = cbs.iter().map(|(cb, _)| &**cb).collect();
-        commit_cbs(q, &refs, kind);
+        commit_cbs(q, &refs, kind, is_swapchain_internal);
     }
 }
 
@@ -752,6 +819,15 @@ impl Queue {
     }
 
     pub fn new(kind: ListType, label: &str) -> Option<Queue> {
+        Self::new_inner(kind, label, async_commit())
+    }
+
+    #[cfg(test)]
+    fn new_with_async_commit(kind: ListType, label: &str, use_async_commit: bool) -> Option<Queue> {
+        Self::new_inner(kind, label, use_async_commit)
+    }
+
+    fn new_inner(kind: ListType, label: &str, use_async_commit: bool) -> Option<Queue> {
         let d = super::device()?;
         let desc = MTL4CommandQueueDescriptor::new();
         desc.setLabel(Some(&objc2_foundation::NSString::from_str(label)));
@@ -760,8 +836,8 @@ impl Queue {
         let lower = label.to_ascii_lowercase();
         let is_swapchain_internal = lower.contains("swapchain") || lower.contains("present");
         let allow_direct_coalesce = kind == ListType::Direct && !is_swapchain_internal;
-        let commit_worker = if allow_direct_coalesce && async_commit() {
-            Some(CommitWorker::new(q.clone(), kind))
+        let commit_worker = if allow_direct_coalesce && use_async_commit {
+            Some(CommitWorker::new(q.clone(), kind, is_swapchain_internal))
         } else {
             None
         };
@@ -848,16 +924,31 @@ impl Queue {
         if let Some(cw) = &self.commit_worker {
             cw.enqueue_commit(cbs);
         } else {
-            commit_retained_cbs(&self.q, &cbs, self.kind);
+            commit_retained_cbs(&self.q, &cbs, self.kind, self.is_swapchain_internal);
         }
     }
 
+    /// Dispatch a commit batch and any immediately-following event signals as a single
+    /// fused [`CommitOp`] on [`CommitWorker`] (one mutex acquisition and one condvar wake)
+    /// when async commit is active, or inline in strict FIFO order otherwise.
     #[inline]
-    fn dispatch_signal_locked(&self, ev: &MtlEvent, val: u64) {
+    fn dispatch_commit_and_signals_locked(
+        &self,
+        cbs: Vec<(Retained<MtlCommandBuffer>, usize)>,
+        signals: Vec<(Retained<MtlEvent>, u64)>,
+    ) {
+        if !cbs.is_empty() {
+            record_test_commit(cbs.len());
+        }
         if let Some(cw) = &self.commit_worker {
-            cw.enqueue_signal(ev.retain(), val);
+            cw.enqueue_commit_and_signals(cbs, signals);
         } else {
-            self.q.signalEvent_value(ProtocolObject::from_ref(ev), val);
+            if !cbs.is_empty() {
+                commit_retained_cbs(&self.q, &cbs, self.kind, self.is_swapchain_internal);
+            }
+            for (ev, val) in signals {
+                self.q.signalEvent_value(ProtocolObject::from_ref(&*ev), val);
+            }
         }
     }
 
@@ -870,119 +961,142 @@ impl Queue {
         }
     }
 
-    /// Flush any buffered uncommitted command buffers on `self.q` in a single
-    /// `MTL4CommandQueue::commit:count:` call. Caller must hold `self.submit`.
-    fn flush_pending_cbs_locked(&self) {
+    /// Take any buffered uncommitted command buffers without dispatching them yet.
+    /// Caller must hold `self.submit`.
+    #[inline]
+    fn take_pending_cbs_locked(&self) -> Vec<(Retained<MtlCommandBuffer>, usize)> {
         if !self.has_pending_cbs.load(Ordering::Acquire) {
-            return;
+            return Vec::new();
         }
         let cbs = {
             let mut pc = self.pending_cbs.lock().unwrap();
             self.has_pending_cbs.store(false, Ordering::Release);
             std::mem::take(&mut *pc)
         };
-        if cbs.is_empty() {
-            return;
+        if !cbs.is_empty() {
+            GLOBAL_PENDING_CBS.fetch_sub(cbs.len(), Ordering::AcqRel);
         }
-        GLOBAL_PENDING_CBS.fetch_sub(cbs.len(), Ordering::AcqRel);
-        self.dispatch_commit_locked(cbs);
+        cbs
     }
 
-    /// Ensure `cb` is no longer buffered in `pending_cbs` and neither `cb` nor
-    /// `alloc_key` is still in flight on an async [`CommitWorker`] before
-    /// `CommandList::begin(&alloc)` re-begins `cb` on `alloc`.
+    /// Flush any buffered uncommitted command buffers on `self.q` in a single
+    /// `MTL4CommandQueue::commit:count:` call. Caller must hold `self.submit`.
+    fn flush_pending_cbs_locked(&self) {
+        let cbs = self.take_pending_cbs_locked();
+        if !cbs.is_empty() {
+            self.dispatch_commit_locked(cbs);
+        }
+    }
+
+    /// Ensure `cb` is no longer buffered in `pending_cbs`, neither `cb` nor `alloc_key`
+    /// is still in flight on an async [`CommitWorker`], and any prior recording-level
+    /// mesh ICB ownership for `cb` is released before `CommandList::begin(&alloc)`.
     pub(crate) fn flush_if_cb_or_alloc_in_flight(cb: &MtlCommandBuffer, alloc_key: usize) {
         if !has_uncommitted_cbs() {
             return;
         }
         let target = cb as *const MtlCommandBuffer as usize;
-        const INLINE_W: usize = 4;
-        let mut inline_w: [Option<Arc<CommitWorker>>; INLINE_W] = [const { None }; INLINE_W];
-        let mut inline_len = 0usize;
-        let mut overflow_w: Vec<Arc<CommitWorker>> = Vec::new();
+        if GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
+            || GLOBAL_INFLIGHT_COMMIT_CBS.load(Ordering::Acquire) > 0
         {
-            let aq = active_queues().lock().unwrap();
-            for &p in aq.iter() {
-                // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
-                let q = unsafe { &*(p as *const Queue) };
-                if q.has_pending_cbs.load(Ordering::Acquire) {
-                    let _g = q.submit.lock().unwrap();
-                    let found = {
-                        let pc = q.pending_cbs.lock().unwrap();
-                        pc.iter().any(|(c, _)| Retained::as_ptr(c) as usize == target)
-                    };
-                    if found {
-                        q.flush_pending_cbs_locked();
+            const INLINE_W: usize = 4;
+            let mut inline_w: [Option<Arc<CommitWorker>>; INLINE_W] = [const { None }; INLINE_W];
+            let mut inline_len = 0usize;
+            let mut overflow_w: Vec<Arc<CommitWorker>> = Vec::new();
+            {
+                let aq = active_queues().lock().unwrap();
+                for &p in aq.iter() {
+                    // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+                    let q = unsafe { &*(p as *const Queue) };
+                    if q.has_pending_cbs.load(Ordering::Acquire) {
+                        let _g = q.submit.lock().unwrap();
+                        let found = {
+                            let pc = q.pending_cbs.lock().unwrap();
+                            pc.iter().any(|(c, _)| Retained::as_ptr(c) as usize == target)
+                        };
+                        if found {
+                            q.flush_pending_cbs_locked();
+                        }
                     }
-                }
-                if let Some(cw) = &q.commit_worker {
-                    if cw.in_flight_cbs.load(Ordering::Acquire) > 0 {
-                        if inline_len < INLINE_W {
-                            inline_w[inline_len] = Some(Arc::clone(cw));
-                            inline_len += 1;
-                        } else {
-                            overflow_w.push(Arc::clone(cw));
+                    if let Some(cw) = &q.commit_worker {
+                        if cw.in_flight_cbs.load(Ordering::Acquire) > 0 {
+                            if inline_len < INLINE_W {
+                                inline_w[inline_len] = Some(Arc::clone(cw));
+                                inline_len += 1;
+                            } else {
+                                overflow_w.push(Arc::clone(cw));
+                            }
                         }
                     }
                 }
             }
-        }
-        for slot in &mut inline_w[..inline_len] {
-            if let Some(cw) = slot.take() {
+            for slot in &mut inline_w[..inline_len] {
+                if let Some(cw) = slot.take() {
+                    cw.wait_if_cb_or_alloc_in_flight(target, alloc_key);
+                }
+            }
+            for cw in overflow_w {
                 cw.wait_if_cb_or_alloc_in_flight(target, alloc_key);
             }
         }
-        for cw in overflow_w {
-            cw.wait_if_cb_or_alloc_in_flight(target, alloc_key);
+        if crate::mesh::has_active_mesh_icbs() {
+            crate::mesh::release_mesh_icbs_for_cb(target);
         }
     }
 
     /// Flush buffered command buffers on whichever live queue holds a CB recorded
-    /// with `alloc_key` (or an unknown `0` alloc_key), and wait for any matching
-    /// async [`CommitWorker`] batch to return from `commit:count:`, before
-    /// `CommandAllocator::reset()` or `Drop`.
+    /// with `alloc_key` (or an unknown `0` alloc_key), wait for any matching async
+    /// [`CommitWorker`] batch to return from `commit:count:`, and release recording-level
+    /// mesh ICB ownership for `alloc_key` before `CommandAllocator::reset()` or `Drop`.
     pub(crate) fn flush_if_alloc_pending(alloc_key: usize) {
         if !has_uncommitted_cbs() {
             return;
         }
-        const INLINE_W: usize = 4;
-        let mut inline_w: [Option<Arc<CommitWorker>>; INLINE_W] = [const { None }; INLINE_W];
-        let mut inline_len = 0usize;
-        let mut overflow_w: Vec<Arc<CommitWorker>> = Vec::new();
+        if GLOBAL_PENDING_CBS.load(Ordering::Acquire) > 0
+            || GLOBAL_INFLIGHT_COMMIT_CBS.load(Ordering::Acquire) > 0
         {
-            let aq = active_queues().lock().unwrap();
-            for &p in aq.iter() {
-                // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
-                let q = unsafe { &*(p as *const Queue) };
-                if q.has_pending_cbs.load(Ordering::Acquire) {
-                    let _g = q.submit.lock().unwrap();
-                    let found = {
-                        let pc = q.pending_cbs.lock().unwrap();
-                        pc.iter().any(|(_, ak)| *ak == 0 || *ak == alloc_key)
-                    };
-                    if found {
-                        q.flush_pending_cbs_locked();
+            const INLINE_W: usize = 4;
+            let mut inline_w: [Option<Arc<CommitWorker>>; INLINE_W] = [const { None }; INLINE_W];
+            let mut inline_len = 0usize;
+            let mut overflow_w: Vec<Arc<CommitWorker>> = Vec::new();
+            {
+                let aq = active_queues().lock().unwrap();
+                for &p in aq.iter() {
+                    // SAFETY: `active_queues` lock prevents any listed `Queue` from completing `Drop`.
+                    let q = unsafe { &*(p as *const Queue) };
+                    if q.has_pending_cbs.load(Ordering::Acquire) {
+                        let _g = q.submit.lock().unwrap();
+                        let found = {
+                            let pc = q.pending_cbs.lock().unwrap();
+                            pc.iter().any(|(_, ak)| *ak == 0 || *ak == alloc_key)
+                        };
+                        if found {
+                            q.flush_pending_cbs_locked();
+                        }
                     }
-                }
-                if let Some(cw) = &q.commit_worker {
-                    if cw.in_flight_cbs.load(Ordering::Acquire) > 0 {
-                        if inline_len < INLINE_W {
-                            inline_w[inline_len] = Some(Arc::clone(cw));
-                            inline_len += 1;
-                        } else {
-                            overflow_w.push(Arc::clone(cw));
+                    if let Some(cw) = &q.commit_worker {
+                        if cw.in_flight_cbs.load(Ordering::Acquire) > 0 {
+                            if inline_len < INLINE_W {
+                                inline_w[inline_len] = Some(Arc::clone(cw));
+                                inline_len += 1;
+                            } else {
+                                overflow_w.push(Arc::clone(cw));
+                            }
                         }
                     }
                 }
             }
-        }
-        for slot in &mut inline_w[..inline_len] {
-            if let Some(cw) = slot.take() {
+            for slot in &mut inline_w[..inline_len] {
+                if let Some(cw) = slot.take() {
+                    cw.wait_if_cb_or_alloc_in_flight(0, alloc_key);
+                }
+            }
+            for cw in overflow_w {
                 cw.wait_if_cb_or_alloc_in_flight(0, alloc_key);
             }
         }
-        for cw in overflow_w {
-            cw.wait_if_cb_or_alloc_in_flight(0, alloc_key);
+        if crate::mesh::has_active_mesh_icbs() {
+            crate::mesh::release_mesh_icbs_for_alloc(alloc_key);
         }
     }
 
@@ -1027,8 +1141,9 @@ impl Queue {
                 || q.has_deferred_signals.load(Ordering::Acquire)
             {
                 let _g = q.submit.lock().unwrap();
-                q.flush_pending_cbs_locked();
-                q.flush_fence_signals_locked();
+                let cbs = q.take_pending_cbs_locked();
+                let sigs = q.take_deferred_fence_signals_locked();
+                q.dispatch_commit_and_signals_locked(cbs, sigs);
             }
         }
     }
@@ -1072,12 +1187,12 @@ impl Queue {
                 f.ev.setSignaledValue(v);
             }
             if let Some((ev, gv)) = greater_sig {
-                q.flush_pending_cbs_locked();
+                let cbs = q.take_pending_cbs_locked();
                 if fence_ptr != 0 {
                     let f = unsafe { &*(fence_ptr as *const Fence) };
                     f.emitted_sig_value.fetch_max(gv, Ordering::AcqRel);
                 }
-                q.dispatch_signal_locked(&ev, gv);
+                q.dispatch_commit_and_signals_locked(cbs, vec![(ev, gv)]);
             }
             true
         })
@@ -1096,11 +1211,12 @@ impl Queue {
         });
     }
 
-    /// Emit all deferred `ID3D12CommandQueue::Signal` events in enqueue order.
+    /// Drain all deferred `ID3D12CommandQueue::Signal` entries in enqueue order,
+    /// updating per-fence state and returning `(event, value)` pairs ready to emit.
     /// Caller must hold `self.submit`.
-    fn flush_fence_signals_locked(&self) {
+    fn take_deferred_fence_signals_locked(&self) -> Vec<(Retained<MtlEvent>, u64)> {
         if !self.has_deferred_signals.load(Ordering::Acquire) {
-            return;
+            return Vec::new();
         }
         self.set_has_deferred_signals(false);
         let entries = {
@@ -1108,12 +1224,11 @@ impl Queue {
             std::mem::take(&mut *ds)
         };
         if entries.is_empty() {
-            return;
+            return Vec::new();
         }
-        // Any buffered CBs submitted prior to these signals MUST commit before signaling.
-        self.flush_pending_cbs_locked();
         let cur_epoch = self.commit_epoch.load(Ordering::Acquire);
         let me = self as *const Queue as usize;
+        let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.fence_ptr != 0 {
                 let f = unsafe { &*(entry.fence_ptr as *const Fence) };
@@ -1130,8 +1245,25 @@ impl Queue {
             if entry.enqueued_epoch < cur_epoch {
                 super::encstats::inc(&super::encstats::c::fence_sig_coalesced);
             }
-            self.dispatch_signal_locked(&entry.ev, entry.val);
+            out.push((entry.ev, entry.val));
         }
+        out
+    }
+
+    /// Emit all deferred `ID3D12CommandQueue::Signal` events in enqueue order
+    /// (fusing any pending CB commit + signals into one `CommitOp`).
+    /// Caller must hold `self.submit`.
+    fn flush_fence_signals_locked(&self) {
+        if !self.has_deferred_signals.load(Ordering::Acquire) {
+            return;
+        }
+        let sigs = self.take_deferred_fence_signals_locked();
+        if sigs.is_empty() {
+            return;
+        }
+        // Any buffered CBs submitted prior to these signals MUST commit before signaling.
+        let cbs = self.take_pending_cbs_locked();
+        self.dispatch_commit_and_signals_locked(cbs, sigs);
     }
 
     #[inline]
@@ -1146,11 +1278,12 @@ impl Queue {
     }
 
     /// Emit `signalEvent_value(&self.timeline.ev, v)` if any committed command buffers
-    /// or `PassLog`s are awaiting a timeline value. Caller must hold `self.submit` and
-    /// run [`Self::collect`] AFTER releasing `self.submit`.
+    /// or `PassLog`s are awaiting a timeline value, fusing pending CBs, deferred fence
+    /// signals, and the timeline signal into a single `CommitOp`. Caller must hold
+    /// `self.submit` and run [`Self::collect`] AFTER releasing `self.submit`.
     fn flush_timeline_locked(&self) -> u64 {
-        self.flush_pending_cbs_locked();
-        self.flush_fence_signals_locked();
+        let cbs = self.take_pending_cbs_locked();
+        let mut sigs = self.take_deferred_fence_signals_locked();
         let logs = if self.pending_log_count.load(Ordering::Acquire) > 0 {
             let mut pl = self.pending_pass_logs.lock().unwrap();
             self.pending_log_count.store(0, Ordering::Release);
@@ -1160,9 +1293,11 @@ impl Queue {
         };
         let (v, was_unsignaled) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
         if !was_unsignaled && logs.is_empty() {
+            self.dispatch_commit_and_signals_locked(cbs, sigs);
             return v - 1;
         }
-        self.dispatch_signal_locked(&self.timeline.ev, v);
+        sigs.push((self.timeline.ev.clone(), v));
+        self.dispatch_commit_and_signals_locked(cbs, sigs);
         self.timeline_state
             .store(Self::pack_timeline_state(v + 1, false), Ordering::Release);
         if !logs.is_empty() {
@@ -1180,10 +1315,27 @@ impl Queue {
         self.submit_with_logs(cbs, Vec::new())
     }
 
+    #[inline]
+    fn retire_mesh_icbs_for_ptrs(&self, cb_ptrs: &[usize]) {
+        if !crate::mesh::has_active_mesh_icbs() {
+            return;
+        }
+        for &ptr in cb_ptrs {
+            if let Some(lease) = crate::mesh::retain_mesh_icbs_for_cb(ptr) {
+                self.defer_release(Box::new(lease));
+            }
+        }
+    }
+
     /// Commit closed command buffers in order and eagerly signal `self.timeline`,
     /// folding in any previously deferred `unsignaled` command buffers or `PassLog`s.
     pub fn submit_with_logs(&self, cbs: &[&MtlCommandBuffer], mut logs: Vec<super::passtiming::PassLog>) -> u64 {
         self.ensure_registered_active();
+        let cb_ptrs: Vec<usize> = if crate::mesh::has_active_mesh_icbs() {
+            cbs.iter().map(|&cb| cb as *const MtlCommandBuffer as usize).collect()
+        } else {
+            Vec::new()
+        };
         let v = {
             let _g = self.submit.lock().unwrap();
             if self.pending_log_count.load(Ordering::Acquire) > 0 {
@@ -1194,57 +1346,51 @@ impl Queue {
                     logs = std::mem::take(&mut *pl);
                 }
             }
-            let pending = if self.has_pending_cbs.load(Ordering::Acquire) {
-                let mut pc = self.pending_cbs.lock().unwrap();
-                self.has_pending_cbs.store(false, Ordering::Release);
-                let taken = std::mem::take(&mut *pc);
-                if !taken.is_empty() {
-                    GLOBAL_PENDING_CBS.fetch_sub(taken.len(), Ordering::AcqRel);
-                }
-                taken
-            } else {
-                Vec::new()
-            };
-            if !pending.is_empty() || !cbs.is_empty() {
-                if self.commit_worker.is_some() {
-                    let mut combined = pending;
+            let pending = self.take_pending_cbs_locked();
+            let mut sigs = self.take_deferred_fence_signals_locked();
+            let (v, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
+            if self.commit_worker.is_some() {
+                let mut combined = pending;
+                if !cbs.is_empty() {
                     combined.reserve(cbs.len());
                     for &cb in cbs {
                         combined.push((cb.retain(), 0));
                     }
-                    self.dispatch_commit_locked(combined);
-                    if !cbs.is_empty() {
-                        self.commit_epoch.fetch_add(1, Ordering::AcqRel);
-                        SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
-                    }
-                } else {
+                    self.commit_epoch.fetch_add(1, Ordering::AcqRel);
+                    SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
+                }
+                sigs.push((self.timeline.ev.clone(), v));
+                self.dispatch_commit_and_signals_locked(combined, sigs);
+            } else {
+                if !pending.is_empty() || !cbs.is_empty() {
                     if let Some(d) = super::device() {
                         d.commit_residency();
                     }
                     if pending.is_empty() {
                         record_test_commit(cbs.len());
-                        commit_cbs(&self.q, cbs, self.kind);
+                        commit_cbs(&self.q, cbs, self.kind, self.is_swapchain_internal);
                         self.commit_epoch.fetch_add(1, Ordering::AcqRel);
                         SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
                     } else if cbs.is_empty() {
                         let refs: Vec<&MtlCommandBuffer> = pending.iter().map(|(c, _)| &**c).collect();
                         record_test_commit(refs.len());
-                        commit_cbs(&self.q, &refs, self.kind);
+                        commit_cbs(&self.q, &refs, self.kind, self.is_swapchain_internal);
                     } else {
                         let mut combined: Vec<&MtlCommandBuffer> =
                             Vec::with_capacity(pending.len() + cbs.len());
                         combined.extend(pending.iter().map(|(c, _)| &**c));
                         combined.extend_from_slice(cbs);
                         record_test_commit(combined.len());
-                        commit_cbs(&self.q, &combined, self.kind);
+                        commit_cbs(&self.q, &combined, self.kind, self.is_swapchain_internal);
                         self.commit_epoch.fetch_add(1, Ordering::AcqRel);
                         SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
                     }
                 }
+                for (ev, sv) in sigs {
+                    self.q.signalEvent_value(ProtocolObject::from_ref(&*ev), sv);
+                }
+                self.q.signalEvent_value(ProtocolObject::from_ref(&*self.timeline.ev), v);
             }
-            self.flush_fence_signals_locked();
-            let (v, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
-            self.dispatch_signal_locked(&self.timeline.ev, v);
             self.timeline_state
                 .store(Self::pack_timeline_state(v + 1, false), Ordering::Release);
             if !logs.is_empty() {
@@ -1253,6 +1399,9 @@ impl Queue {
             }
             v
         };
+        if !cb_ptrs.is_empty() {
+            self.retire_mesh_icbs_for_ptrs(&cb_ptrs);
+        }
         self.collect_async();
         v
     }
@@ -1281,6 +1430,11 @@ impl Queue {
             return self.submit_with_logs(cbs, logs);
         }
         self.ensure_registered_active();
+        let cb_ptrs: Vec<usize> = if crate::mesh::has_active_mesh_icbs() {
+            cbs.iter().map(|&cb| cb as *const MtlCommandBuffer as usize).collect()
+        } else {
+            Vec::new()
+        };
         let out = {
             let _g = self.submit.lock().unwrap();
             if cbs.is_empty() && logs.is_empty() {
@@ -1349,6 +1503,9 @@ impl Queue {
                 }
             }
         };
+        if !cb_ptrs.is_empty() {
+            self.retire_mesh_icbs_for_ptrs(&cb_ptrs);
+        }
         self.collect_async();
         out
     }
@@ -1434,6 +1591,18 @@ impl Queue {
             return ExecuteResult { submitted_cbs, timeline_value };
         }
         self.ensure_registered_active();
+        let cb_ptrs: Vec<usize> = if crate::mesh::has_active_mesh_icbs() && submitted_cbs > 0 {
+            if !batch.overflow.is_empty() {
+                batch.overflow.iter().map(|(c, _)| Retained::as_ptr(c) as usize).collect()
+            } else {
+                batch.inline[..batch.inline_len]
+                    .iter()
+                    .filter_map(|s| s.as_ref().map(|(c, _)| Retained::as_ptr(c) as usize))
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
         let out = {
             let _g = self.submit.lock().unwrap();
             if submitted_cbs == 0 && batch.pass_logs.is_empty() {
@@ -1512,6 +1681,9 @@ impl Queue {
                 }
             }
         };
+        if !cb_ptrs.is_empty() {
+            self.retire_mesh_icbs_for_ptrs(&cb_ptrs);
+        }
         self.collect_async();
         ExecuteResult { submitted_cbs, timeline_value: out }
     }
@@ -1641,10 +1813,11 @@ impl Queue {
             }
             return;
         }
-        self.flush_pending_cbs_locked();
-        self.flush_fence_signals_locked();
+        let cbs = self.take_pending_cbs_locked();
+        let mut sigs = self.take_deferred_fence_signals_locked();
         f.emitted_sig_value.fetch_max(v, O::AcqRel);
-        self.dispatch_signal_locked(&f.ev, v);
+        sigs.push((f.ev.clone(), v));
+        self.dispatch_commit_and_signals_locked(cbs, sigs);
     }
 
     /// `ID3D12CommandQueue::Wait`. A wait on a value this queue itself
@@ -2718,14 +2891,18 @@ mod tests {
             return;
         }
         if std::env::var_os("PORT_ASYNC_COMMIT").is_none() {
-            assert!(async_commit(), "PORT_ASYNC_COMMIT must default ON");
+            assert!(!async_commit(), "PORT_ASYNC_COMMIT must default OFF");
+            let default_direct = Queue::new(ListType::Direct, "default direct").unwrap();
+            assert!(
+                default_direct.commit_worker.is_none(),
+                "default Direct queue must commit inline when PORT_ASYNC_COMMIT is unset"
+            );
         }
-        let direct = Queue::new(ListType::Direct, "async commit direct").unwrap();
-        let present = Queue::new(ListType::Direct, "swapchain present queue").unwrap();
-        let copy = Queue::new(ListType::Copy, "async commit copy").unwrap();
-        if async_commit() {
-            assert!(direct.commit_worker.is_some(), "non-swapchain Direct queue must use CommitWorker");
-        }
+        let direct = Queue::new_with_async_commit(ListType::Direct, "async commit direct", true).unwrap();
+        let present =
+            Queue::new_with_async_commit(ListType::Direct, "swapchain present queue", true).unwrap();
+        let copy = Queue::new_with_async_commit(ListType::Copy, "async commit copy", true).unwrap();
+        assert!(direct.commit_worker.is_some(), "opt-in Direct queue must use CommitWorker");
         assert!(present.commit_worker.is_none(), "swapchain-internal queue must not spawn CommitWorker");
         assert!(copy.commit_worker.is_none(), "Copy queue must not spawn CommitWorker");
 
@@ -2812,6 +2989,24 @@ mod tests {
         f_cpu.signal_cpu(5);
         direct.wait_idle();
         assert_eq!(f_cpu.completed(), 5);
+    }
+
+    #[test]
+    fn perf_meter_excludes_swapchain_internal_queues() {
+        let pm = (perf_meter_callback as GpuFeedbackHook) as usize;
+        assert!(should_install_feedback(pm, false), "q0 must install perf_meter_callback");
+        assert!(
+            !should_install_feedback(pm, true),
+            "swapchain-internal present/staging queues must be excluded from q0 perf_meter"
+        );
+        fn custom_hook(_: u32, _: u32, _: u64, _: u64, _: u64) {}
+        let custom = (custom_hook as GpuFeedbackHook) as usize;
+        assert!(
+            should_install_feedback(custom, true),
+            "custom diagnostic feedback hooks must still observe swapchain-internal queues"
+        );
+        assert!(!should_install_feedback(0, false));
+        assert!(!should_install_feedback(0, true));
     }
 }
 

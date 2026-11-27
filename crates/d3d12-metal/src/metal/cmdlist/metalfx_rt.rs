@@ -560,6 +560,76 @@ impl CommandList {
         Ok(())
     }
 
+    /// Copy/convert a 1x1 guest exposure texture (`R32Float`, etc.) into MetalFX's
+    /// internal 1x1 `R16Float` scratch texture without passing a wildcard `0usize`
+    /// into intra-compute barrier tracking (`dst_exp` is purely internal scratch
+    /// immediately synchronized by `sync_queue_before_metalfx`).
+    fn convert_exposure_to_r16f(
+        &mut self,
+        src_exp: &MtlTexture,
+        dst_exp: &MtlTexture,
+        exp_ptr: usize,
+        tight_stages: bool,
+    ) -> Result<(), String> {
+        let (pso, tg) = crate::metal::clear::kernel_for_dispatch(
+            "port_present_copy_2d",
+            self.opts.opt_fast_bind_pso,
+        )?;
+        let ring = self.ring.clone().ok_or("command list is not open")?;
+        let pa = ring.lock().unwrap().upload(&[0u8; 4], 256)?;
+        self.ensure_util_table()?;
+        let masked = tight_stages && !legacy_barriers() && barrier_masks();
+        let ib_tight = self.ib_tight_active();
+        let exp_reads: &[usize] = if exp_ptr != 0 {
+            std::slice::from_ref(&exp_ptr)
+        } else {
+            &[]
+        };
+        if masked {
+            self.add_pend(UTIL_STAGES, MTLStages::Dispatch);
+            if exp_ptr != 0 {
+                if ib_tight {
+                    self.ib_note_touch_before_tight(exp_ptr, MTLStages::Dispatch);
+                } else {
+                    self.ib_note(exp_ptr);
+                }
+            }
+            stats::inc(&stats::c::qb_upscale_masked);
+        } else {
+            self.need_full(FullWhy::ClearUav);
+        }
+        let e = if ib_tight && masked && exp_ptr != 0 {
+            self.compute_op_tight(
+                MTLStages::Dispatch,
+                Some(&[]),
+                Some(exp_reads),
+                Some(exp_reads),
+            )
+        } else if masked && exp_ptr != 0 {
+            self.compute_touch(Some(exp_reads))
+        } else {
+            self.compute_touch(None)
+        }
+        .ok_or("compute encoder")?;
+        self.pt_note_util(pt::synth::CLEAR_UAV, 1);
+        let t = self.util_table.as_ref().unwrap();
+        unsafe {
+            t.setAddress_atIndex(pa, 0);
+            t.setTexture_atIndex(src_exp.gpuResourceID(), 0);
+            t.setTexture_atIndex(dst_exp.gpuResourceID(), 1);
+        }
+        e.setArgumentTable(Some(t));
+        e.setComputePipelineState(&pso);
+        e.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: 1, height: 1, depth: 1 },
+            MTLSize { width: tg[0] as usize, height: tg[1] as usize, depth: tg[2] as usize },
+        );
+        self.note_stage_ran(MTLStages::Dispatch);
+        e.setArgumentTable(Some(&self.table));
+        self.compute_pso_bound = false;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_upscale_temporal_metalfx(
         &mut self,
@@ -743,7 +813,7 @@ impl CommandList {
             }
         }
         let dynamic_resolution = params.dynamic_resolution || x0 != in_w || y0 != in_h;
-        let key = crate::metal::metalfx::TemporalScalerKey::new(
+        let mut key = crate::metal::metalfx::TemporalScalerKey::new(
             in_w, in_h, w, h, s_fmt, depth_fmt, motion_fmt, d_fmt,
         )
         .with_reactive_format(reactive_fmt)
@@ -751,6 +821,15 @@ impl CommandList {
         .with_dynamic_resolution(dynamic_resolution)
         .with_output_resolution_motion_vectors(params.output_resolution_motion_vectors)
         .with_jittered_motion_vectors(params.jittered_motion_vectors);
+        // Once a dynamic-resolution scaler exists for this surface tuple, keep using it
+        // even on frames whose `render_size` reaches full `(in_w, in_h)` so we never flip
+        // between DRS and non-DRS scalers and break temporal history.
+        if !dynamic_resolution {
+            let drs_key = key.with_dynamic_resolution(true);
+            if crate::metal::metalfx::has_cached_temporal_scaler(drs_key) {
+                key = drs_key;
+            }
+        }
 
         let Some(scaler_arc) = crate::metal::metalfx::get_or_create_temporal_scaler(key) else {
             return Ok(false);
@@ -903,16 +982,7 @@ impl CommandList {
             (None, None, None, None)
         };
         if let (Some((src_exp, exp_ptr)), Some(dst_exp)) = (&exp_convert_src, &exp_v) {
-            let exp_touch = [0usize, *exp_ptr];
-            self.util_dispatch_with(
-                "port_present_copy_2d",
-                Some(src_exp),
-                Some(dst_exp),
-                &[0u8; 4],
-                [1, 1, 1],
-                &exp_touch,
-                tight_stages,
-            )?;
+            self.convert_exposure_to_r16f(src_exp, dst_exp, *exp_ptr, tight_stages)?;
         }
         let output_usage = scaler.output_usage;
         let has_fence = scaler.has_fence();
@@ -2128,21 +2198,76 @@ impl CommandList {
         self.compute_pso_bound = false;
         self.bind_table(grs);
         self.set_table_addr(arg_va, crate::rt::pipeline::RAY_DISPATCH_ARGUMENTS_BIND_POINT);
+        let tg = dispatch_rays_threadgroup_size(
+            desc.Width as usize,
+            desc.Height as usize,
+            desc.Depth as usize,
+            rt.pso.threadExecutionWidth(),
+            rt.pso.maxTotalThreadsPerThreadgroup(),
+        );
         e.dispatchThreads_threadsPerThreadgroup(
             MTLSize {
                 width: desc.Width as usize,
                 height: desc.Height as usize,
                 depth: desc.Depth as usize,
             },
-            MTLSize {
-                width: (desc.Width as usize).clamp(1, 8),
-                height: (desc.Height as usize).clamp(1, 8),
-                depth: 1,
-            },
+            tg,
         );
         self.note_stage_ran(MTLStages::Dispatch);
         Ok(())
     }
+}
+
+/// Choose a full-SIMD `threadsPerThreadgroup` shape for `DispatchRays(width, height, depth)`:
+/// - 1D dispatches (`height == 1`, `depth == 1`): fill a full SIMD group `(simd, 1, 1)`
+///   (e.g. `(32, 1, 1)` on Apple Silicon) instead of clamping to `(8, 1, 1)` (25% occupancy).
+/// - 2D dispatches (`height > 1`): prefer cache-coherent `8x8` tiles when large enough,
+///   widening X or Y when one dimension is thin so total threads still fill `exec_width`.
+/// - Always clamped to `max_tg` (`pso.maxTotalThreadsPerThreadgroup()`).
+pub(crate) fn dispatch_rays_threadgroup_size(
+    width: usize,
+    height: usize,
+    depth: usize,
+    exec_width: usize,
+    max_tg: usize,
+) -> MTLSize {
+    let w = width.max(1);
+    let h = height.max(1);
+    let d = depth.max(1);
+    let max_t = max_tg.max(1);
+    let simd = exec_width.max(1).min(max_t);
+    if h == 1 && d == 1 {
+        return MTLSize { width: w.min(simd), height: 1, depth: 1 };
+    }
+    if h == 1 {
+        let tg_w = w.min(simd);
+        let tg_d = d.min((max_t / tg_w).max(1)).min(4);
+        return MTLSize { width: tg_w, height: 1, depth: tg_d };
+    }
+    if w == 1 {
+        let tg_h = h.min(simd);
+        return MTLSize { width: 1, height: tg_h, depth: 1 };
+    }
+    // 2D ray grid: target 8x8 when max_t >= 64, expanding the wider axis when one axis < 8
+    // so thin strips (e.g. Nx2 or Nx4) still fill a full 32-wide SIMD group.
+    let target = if max_t >= 64 { 64usize } else { simd };
+    let mut tg_w = w.min(8);
+    let mut tg_h = h.min(8);
+    if tg_w * tg_h < simd {
+        if w > tg_w {
+            tg_w = w.min((simd.div_ceil(tg_h)).max(tg_w)).min(max_t / tg_h);
+        }
+        if tg_w * tg_h < simd && h > tg_h {
+            tg_h = h.min((simd.div_ceil(tg_w)).max(tg_h)).min(max_t / tg_w);
+        }
+    }
+    while tg_w * tg_h > target && tg_h > 1 {
+        tg_h = (tg_h / 2).max(1);
+    }
+    while tg_w * tg_h > max_t && tg_w > 1 {
+        tg_w = (tg_w / 2).max(1);
+    }
+    MTLSize { width: tg_w.max(1), height: tg_h.max(1), depth: 1 }
 }
 
 #[cfg(test)]
@@ -2625,5 +2750,34 @@ mod tests {
         l.close().unwrap();
         let p0_reused = Retained::as_ptr(f0_reused.as_ref().expect("f0_reused")) as usize;
         assert_eq!(p0_reused, p0_a, "CommandAllocator::reset must rewind and reuse pooled MTLFence");
+    }
+
+    #[test]
+    fn dispatch_rays_threadgroup_size_fills_simd_for_1d_and_thin_2d() {
+        // 1D ray dispatch (N, 1, 1) on 32-wide Apple Silicon must use (32, 1, 1) instead of (8, 1, 1).
+        let tg_1d = dispatch_rays_threadgroup_size(1024, 1, 1, 32, 1024);
+        assert_eq!((tg_1d.width, tg_1d.height, tg_1d.depth), (32, 1, 1));
+
+        // Short 1D dispatch clamps cleanly to Width.
+        let tg_1d_small = dispatch_rays_threadgroup_size(12, 1, 1, 32, 1024);
+        assert_eq!((tg_1d_small.width, tg_1d_small.height, tg_1d_small.depth), (12, 1, 1));
+
+        // 1D vertical dispatch (1, N, 1) fills full SIMD height.
+        let tg_1d_y = dispatch_rays_threadgroup_size(1, 512, 1, 32, 1024);
+        assert_eq!((tg_1d_y.width, tg_1d_y.height, tg_1d_y.depth), (1, 32, 1));
+
+        // Large 2D ray grid keeps 8x8 tile coherence.
+        let tg_2d = dispatch_rays_threadgroup_size(1424, 802, 1, 32, 1024);
+        assert_eq!((tg_2d.width, tg_2d.height, tg_2d.depth), (8, 8, 1));
+
+        // Thin 2D strip (256, 2, 1) widens X to (16, 2, 1) = 32 lanes instead of (8, 2, 1) = 16.
+        let tg_strip = dispatch_rays_threadgroup_size(256, 2, 1, 32, 1024);
+        assert_eq!((tg_strip.width, tg_strip.height, tg_strip.depth), (16, 2, 1));
+
+        // Never exceeds maxTotalThreadsPerThreadgroup even on register-heavy RT PSOs.
+        let tg_capped = dispatch_rays_threadgroup_size(1024, 1, 1, 32, 16);
+        assert_eq!((tg_capped.width, tg_capped.height, tg_capped.depth), (16, 1, 1));
+        let tg_2d_capped = dispatch_rays_threadgroup_size(1024, 1024, 1, 32, 32);
+        assert!(tg_2d_capped.width * tg_2d_capped.height * tg_2d_capped.depth <= 32);
     }
 }
