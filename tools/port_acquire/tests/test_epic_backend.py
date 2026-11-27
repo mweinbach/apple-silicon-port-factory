@@ -352,6 +352,14 @@ if cmd in ("install", "download", "update"):
         if app_name not in state["installed"]:
             print(f'[cli] ERROR: Game "{app_name}" is not installed', file=sys.stderr)
             sys.exit(0)
+        if state.get("verify_fail"):
+            # Real Legendary logs initial verification diagnostics as `[cli] ERROR:` before
+            # repairing those files and finishing the installation process.
+            print('[cli] ERROR: File does not exist: "Data/level0.dat"', file=sys.stderr)
+            print(
+                '[cli] ERROR: Verification failed for "Spider-Man2.exe" (hash mismatch)',
+                file=sys.stderr,
+            )
         state["verify_fail"] = False
         save_state(state)
         print("[cli] INFO: Finished installation process in 0.10 seconds.")
@@ -742,7 +750,7 @@ class TestEpicBackendMocked(unittest.TestCase):
         self.assertEqual(proc_ver.returncode, 0, proc_ver.stderr)
         self.assertTrue(json.loads(proc_ver.stdout)["ok"])
 
-        # Verify failure -> repair
+        # Verify failure -> repair (mock emits pre-repair `[cli] ERROR:` lines before finishing)
         self._patch_state(verify_fail=True)
         proc_fail = self._run_cli("verify", "ArachnidTwo", "--json")
         self.assertEqual(proc_fail.returncode, 1)
@@ -756,6 +764,15 @@ class TestEpicBackendMocked(unittest.TestCase):
         rep_data = json.loads(proc_rep.stdout)
         self.assertTrue(rep_data["ok"])
         self.assertTrue(rep_data["repaired"])
+
+        # Repair that hits `Installation failed` on exit 0 must still fail.
+        self._patch_state(install_fail_zero=True)
+        proc_rep_fail = self._run_cli("verify", "ArachnidTwo", "--repair", "--json")
+        self.assertEqual(proc_rep_fail.returncode, 1)
+        rep_fail_data = json.loads(proc_rep_fail.stdout)
+        self.assertFalse(rep_fail_data["ok"])
+        self.assertFalse(rep_fail_data["repaired"])
+        self._patch_state(install_fail_zero=False)
 
         # Update check-only -> update apply
         proc_chk = self._run_cli("update", "ArachnidTwo", "--check-only", "--json")

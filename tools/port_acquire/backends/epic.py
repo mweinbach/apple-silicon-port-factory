@@ -95,6 +95,25 @@ _INSTALL_FAILURE_PATTERNS = (
     "[core] error:",
 )
 
+_REPAIR_FATAL_FAILURE_PATTERNS = (
+    "installation failed",
+    "download failed",
+    "failed to install",
+    "failed to download",
+    "aborting",
+    "[dlm] error:",
+    "[core] error:",
+)
+
+_PRE_REPAIR_VERIFY_DIAG_PATTERNS = (
+    "file does not exist",
+    "missing",
+    "corrupt",
+    "hash",
+    "mismatch",
+    "verification failed",
+)
+
 _INSTALL_SUCCESS_PATTERNS = (
     "finished installation process",
     "finished downloading",
@@ -1118,6 +1137,7 @@ class EpicBackend(StoreBackend):
         app_id: str,
         action: str,
         success_patterns: tuple[str, ...] = _INSTALL_SUCCESS_PATTERNS,
+        allow_pre_repair_verify_errors: bool = False,
     ) -> None:
         """Confirm Legendary actually completed an install/download/repair/update.
 
@@ -1140,12 +1160,35 @@ class EpicBackend(StoreBackend):
                 details={"returncode": proc.returncode},
             )
 
-        has_error_line = any(
-            line.lstrip().lower().startswith("error:")
-            or any(pat in line.lower() for pat in _INSTALL_FAILURE_PATTERNS)
-            for line in combined.splitlines()
+        lines = combined.splitlines()
+        completed_ok = any(
+            any(pat in line.lower() for pat in success_patterns) for line in lines
         )
-        completed_ok = any(pat in combined_lower for pat in success_patterns)
+
+        if allow_pre_repair_verify_errors:
+            has_error_line = False
+            for line in lines:
+                low = line.lower()
+                if any(pat in low for pat in _REPAIR_FATAL_FAILURE_PATTERNS):
+                    has_error_line = True
+                    break
+                is_err = line.lstrip().lower().startswith("error:") or "[cli] error:" in low
+                if is_err:
+                    # Expected pre-repair file verification diagnostics (missing/corrupted
+                    # files) are allowed when the subsequent repair completes cleanly;
+                    # reject any other error line.
+                    is_expected_verify_diag = completed_ok and any(
+                        pat in low for pat in _PRE_REPAIR_VERIFY_DIAG_PATTERNS
+                    )
+                    if not is_expected_verify_diag:
+                        has_error_line = True
+                        break
+        else:
+            has_error_line = any(
+                line.lstrip().lower().startswith("error:")
+                or any(pat in line.lower() for pat in _INSTALL_FAILURE_PATTERNS)
+                for line in lines
+            )
 
         if proc.returncode != 0 or has_error_line or not completed_ok:
             reason = sanitized or f"exit {proc.returncode} with no completion confirmation"
@@ -1356,7 +1399,13 @@ class EpicBackend(StoreBackend):
         if repair:
             proc = self._run(["-y", "install", app_id, "--repair", "--skip-dlcs"], check=False)
             try:
-                self._assert_install_completed(proc, app_id=app_id, action="repair")
+                self._assert_install_completed(
+                    proc,
+                    app_id=app_id,
+                    action="repair",
+                    success_patterns=_INSTALL_SUCCESS_PATTERNS + _VERIFY_SUCCESS_PATTERNS,
+                    allow_pre_repair_verify_errors=True,
+                )
             except (AppNotFoundError, AuthRequiredError):
                 raise
             except CommandFailedError as exc:
