@@ -666,14 +666,22 @@ class SteamBackendTests(unittest.TestCase):
             )
         self.assertEqual(unowned_ctx.exception.code, "dlc_not_owned")
 
-        # Verify
-        ver = backend.verify("1091500", repair=True)
+        # Verify & update require the private branch password (never silently falling back to public)
+        with self.assertRaises(AcquireError) as missing_pw_ver:
+            backend.verify("1091500", repair=True)
+        self.assertEqual(missing_pw_ver.exception.code, "missing_branch_password")
+
+        ver = backend.verify("1091500", repair=True, branch_password="TOP_SECRET_BETA_PW")
         self.assertTrue(ver.ok)
         self.assertTrue(ver.repaired)
 
         # Update check-only detects newer manifest GID
         self.manifest_file.write_text(SAMPLE_UPDATED_MANIFEST_TXT, encoding="utf-8")
-        upd_check = backend.update("1091500", check_only=True)
+        with self.assertRaises(AcquireError) as missing_pw_upd:
+            backend.update("1091500", check_only=True)
+        self.assertEqual(missing_pw_upd.exception.code, "missing_branch_password")
+
+        upd_check = backend.update("1091500", check_only=True, branch_password="TOP_SECRET_BETA_PW")
         self.assertTrue(upd_check.update_available)
         self.assertFalse(upd_check.updated)
         self.assertEqual(upd_check.old_version, "8811223344556677889")
@@ -878,9 +886,37 @@ class SteamBackendTests(unittest.TestCase):
             self.assertTrue(manifest["compatibility_signals"]["requires_steamworks"])
             self.assertEqual(manifest["packaging_hook"]["format"], "port-acquire-manifest-v1")
 
-            rc, ver = run_cli(["--store", "steam", "--json", "verify", "1091500", "--repair"])
+            rc, ver = run_cli(
+                [
+                    "--store",
+                    "steam",
+                    "--json",
+                    "verify",
+                    "1091500",
+                    "--repair",
+                    "--branch-password-env",
+                    "MOCK_BETA_PW",
+                ]
+            )
             self.assertEqual(rc, 0)
             self.assertTrue(ver["ok"])
+            self.assertNotIn("NEVER_WRITE_THIS_PW", json.dumps(ver))
+
+            rc, upd = run_cli(
+                [
+                    "--store",
+                    "steam",
+                    "--json",
+                    "update",
+                    "1091500",
+                    "--check-only",
+                    "--branch-password-env",
+                    "MOCK_BETA_PW",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertTrue(upd["ok"])
+            self.assertNotIn("NEVER_WRITE_THIS_PW", json.dumps(upd))
 
             rc, launch = run_cli(
                 [
@@ -1584,6 +1620,171 @@ class SteamBackendTests(unittest.TestCase):
                 os.environ.pop("MOCK_SKIP_MODE", None)
             else:
                 os.environ["MOCK_SKIP_MODE"] = prev_mode
+
+    def test_private_branch_maintenance_requires_and_forwards_branch_password(self) -> None:
+        beta_bytes = b"MZ\x90\x00BETA_V1"
+        beta_sha1 = hashlib.sha1(beta_bytes).hexdigest()
+        priv_dd = self.root / "private-branch-dd"
+        priv_dd.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import os, pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-priv")
+                    sys.exit(0)
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                branch = argv[argv.index("-branch") + 1] if "-branch" in argv else "public"
+                pw = argv[argv.index("-branchpassword") + 1] if "-branchpassword" in argv else None
+                # Mirror DepotDownloader 3.4.0: missing/wrong private branch password falls back to 'public'
+                effective_branch = branch if (branch == "public" or pw == "SECRET_BETA_42") else "public"
+                gid = os.environ.get("MOCK_PRIV_GID", "5001") if effective_branch == "beta" else "1001"
+                if "-manifest-only" in argv:
+                    (dest / f"manifest_1091501_{{gid}}.txt").write_text(
+                        f"Content Manifest for Depot 1091501\\n"
+                        f"Manifest ID / date : {{gid}} / 11/26/2026\\n"
+                        f"Size Chunks File SHA Flags Name\\n"
+                        f"{len(beta_bytes)} 1 {beta_sha1} 0 beta\\\\Game.exe\\n",
+                        encoding="utf-8",
+                    )
+                    print(f"Using app branch: '{{effective_branch}}'.")
+                    print("Processing depot 1091501 - Private Beta Content")
+                    print(f"Manifest {{gid}} (11/26/2026 12:00:00)")
+                    sys.exit(0)
+                (dest / "beta").mkdir(parents=True, exist_ok=True)
+                (dest / "beta" / "Game.exe").write_bytes({beta_bytes!r})
+                print(f"Using app branch: '{{effective_branch}}'.")
+                print("Processing depot 1091501 - Private Beta Content")
+                print(f"Manifest {{gid}} (11/26/2026 12:00:00)")
+                print("Total downloaded: 128 bytes")
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        priv_dd.chmod(priv_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=priv_dd)
+        dest = self.root / "games" / "PrivateBetaGame"
+        backend.download(
+            DownloadOptions(
+                app_id="1091500",
+                dest=dest,
+                platform="windows",
+                branch="beta",
+                branch_password="SECRET_BETA_42",
+            )
+        )
+
+        # Password must NEVER be persisted in steam-installs.json, only the boolean flag
+        installs_raw = (self.state_dir / "steam-installs.json").read_text(encoding="utf-8")
+        self.assertNotIn("SECRET_BETA_42", installs_raw)
+        self.assertTrue(backend._load_installs()["1091500"]["branch_requires_password"])
+
+        # Omitting branch_password on verify/update raises missing_branch_password
+        with self.assertRaises(AcquireError) as ctx_ver:
+            backend.verify("1091500", repair=False)
+        self.assertEqual(ctx_ver.exception.code, "missing_branch_password")
+
+        with self.assertRaises(AcquireError) as ctx_upd:
+            backend.update("1091500", check_only=False)
+        self.assertEqual(ctx_upd.exception.code, "missing_branch_password")
+
+        # Supplying the wrong password causes DepotDownloader fallback to 'public', which is rejected
+        with self.assertRaises(CommandFailedError):
+            backend.update("1091500", check_only=True, branch_password="WRONG_PW")
+
+        # Supplying the right password succeeds for read-only verify, repair, check-only, and update
+        ver_ro = backend.verify("1091500", repair=False, branch_password="SECRET_BETA_42")
+        self.assertTrue(ver_ro.ok)
+        ver_rep = backend.verify("1091500", repair=True, branch_password="SECRET_BETA_42")
+        self.assertTrue(ver_rep.ok)
+
+        prev_gid = os.environ.get("MOCK_PRIV_GID")
+        os.environ["MOCK_PRIV_GID"] = "5002"
+        try:
+            chk = backend.update("1091500", check_only=True, branch_password="SECRET_BETA_42")
+            self.assertTrue(chk.update_available)
+            self.assertEqual(chk.new_version, "5002")
+            upd = backend.update("1091500", check_only=False, branch_password="SECRET_BETA_42")
+            self.assertTrue(upd.updated)
+            self.assertEqual(upd.new_version, "5002")
+        finally:
+            if prev_gid is None:
+                os.environ.pop("MOCK_PRIV_GID", None)
+            else:
+                os.environ["MOCK_PRIV_GID"] = prev_gid
+
+    def test_verify_readonly_rejects_missing_installed_depot_coverage(self) -> None:
+        f1 = b"DEPOT_101_FILE"
+        f1_sha1 = hashlib.sha1(f1).hexdigest()
+        partial_cov_dd = self.root / "partial-cov-dd"
+        partial_cov_dd.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import os, pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-cov")
+                    sys.exit(0)
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                if "-manifest-only" in argv:
+                    (dest / "manifest_101_1000.txt").write_text(
+                        "Content Manifest for Depot 101\\n"
+                        "Manifest ID / date : 1000 / 11/26/2026\\n"
+                        "Size Chunks File SHA Flags Name\\n"
+                        "{len(f1)} 1 {f1_sha1} 0 bin\\\\a.bin\\n",
+                        encoding="utf-8",
+                    )
+                    print("Using app branch: 'public'.")
+                    print("Processing depot 101 - Depot 101")
+                    print("Manifest 1000 (11/26/2026 12:00:00)")
+                    if os.environ.get("MOCK_COV_MODE") == "entitlement":
+                        print("Depot 102 is not available from this account.")
+                    sys.exit(0)
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        partial_cov_dd.chmod(partial_cov_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=partial_cov_dd)
+        dest = self.root / "games" / "PartialCovGame"
+        (dest / "bin").mkdir(parents=True, exist_ok=True)
+        (dest / "bin" / "a.bin").write_bytes(f1)
+        backend._save_installs(
+            {
+                "1091500": {
+                    "app_id": "1091500",
+                    "title": "Partial Coverage Game",
+                    "account_name": "testplayer",
+                    "install_path": str(dest),
+                    "platform": "windows",
+                    "branch": "public",
+                    "depots": ["101", "102"],
+                }
+            }
+        )
+
+        prev_cov = os.environ.get("MOCK_COV_MODE")
+        try:
+            os.environ["MOCK_COV_MODE"] = "entitlement"
+            with self.assertRaises(AuthRequiredError):
+                backend.verify("1091500", repair=False)
+
+            os.environ["MOCK_COV_MODE"] = "silent_omit"
+            with self.assertRaises(CommandFailedError):
+                backend.verify("1091500", repair=False)
+        finally:
+            if prev_cov is None:
+                os.environ.pop("MOCK_COV_MODE", None)
+            else:
+                os.environ["MOCK_COV_MODE"] = prev_cov
 
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):

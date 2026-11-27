@@ -600,6 +600,18 @@ class SteamBackend(StoreBackend):
             )
             combined = proc.stdout + "\n" + proc.stderr
             stdout_info = parse_depot_downloader_stdout(combined)
+            skipped_depots = sorted(set(_SKIPPED_DEPOT_RE.findall(combined)))
+            actual_branch = stdout_info.get("branch")
+            if (
+                branch.lower() != "public"
+                and actual_branch
+                and actual_branch.lower() != branch.lower()
+            ):
+                raise CommandFailedError(
+                    f"DepotDownloader fell back to branch {actual_branch!r} instead of requested "
+                    f"branch {branch!r} for Steam AppID {app_id} "
+                    "(verify the branch name and pass --branch-password-env for private betas)."
+                )
 
             parsed_by_id: dict[str, dict[str, Any]] = {}
             for txt_file in sorted(Path(tmp_dir).rglob("manifest_*.txt")):
@@ -674,6 +686,7 @@ class SteamBackend(StoreBackend):
                 "platform": platform,
                 "branch": stdout_info.get("branch") or branch,
                 "depots": depots,
+                "skipped_depots": skipped_depots,
                 "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             if update_cache and depots and depot_id is None:
@@ -1824,6 +1837,17 @@ class SteamBackend(StoreBackend):
         )
         combined = proc.stdout + "\n" + proc.stderr
         out = parse_depot_downloader_stdout(combined)
+        actual_dl_branch = out.get("branch")
+        if (
+            branch.lower() != "public"
+            and actual_dl_branch
+            and actual_dl_branch.lower() != branch.lower()
+        ):
+            raise CommandFailedError(
+                f"DepotDownloader fell back to branch {actual_dl_branch!r} instead of requested "
+                f"branch {branch!r} for Steam AppID {resolved_id} "
+                "(check branch name and --branch-password-env)."
+            )
         skipped_depots = set(_SKIPPED_DEPOT_RE.findall(combined))
 
         all_stdout_depots: list[dict[str, Any]] = []
@@ -2007,6 +2031,15 @@ class SteamBackend(StoreBackend):
                 if redist_id not in merged_redists:
                     merged_redists.append(redist_id)
 
+            branch_requires_password = bool(options.branch_password)
+            if (
+                not branch_requires_password
+                and same_install
+                and isinstance(existing, dict)
+                and str(existing.get("branch") or "public").lower() == branch.lower()
+            ):
+                branch_requires_password = bool(existing.get("branch_requires_password"))
+
             new_entry: dict[str, Any] = {
                 "app_id": resolved_id,
                 "title": title,
@@ -2015,6 +2048,7 @@ class SteamBackend(StoreBackend):
                 "install_path": str(dest),
                 "platform": options.platform,
                 "branch": branch,
+                "branch_requires_password": branch_requires_password,
                 "build_id": version,
                 "manifest_gids": manifest_gids,
                 "depots": downloaded_depots,
@@ -2122,7 +2156,13 @@ class SteamBackend(StoreBackend):
 
         return checked, missing_files, corrupted_files
 
-    def verify(self, app_id: str, *, repair: bool = False) -> VerifyResult:
+    def verify(
+        self,
+        app_id: str,
+        *,
+        repair: bool = False,
+        branch_password: str | None = None,
+    ) -> VerifyResult:
         account_name, _ = self._require_logged_in_account()
         resolved_id = self._resolve_app_id(app_id, offline=True, strict=True)
         entry = self._get_installed_entry(resolved_id)
@@ -2146,6 +2186,26 @@ class SteamBackend(StoreBackend):
 
         platform = str(entry.get("platform") or "windows")
         branch = str(entry.get("branch") or "public")
+        if entry.get("branch_requires_password") and not branch_password:
+            raise AcquireError(
+                f"Steam AppID {resolved_id} is installed on password-protected branch {branch!r}; "
+                "pass `--branch-password-env <VAR>` to verify or repair without falling back to public.",
+                code="missing_branch_password",
+                details={"app_id": resolved_id, "branch": branch},
+            )
+
+        recorded_depots: list[str] = []
+        raw_rec = entry.get("depots")
+        if isinstance(raw_rec, list):
+            recorded_depots = [
+                str(d) for d in raw_rec if str(d).isdigit() and str(d) not in COMMON_REDIST_DEPOTS
+            ]
+        elif isinstance(entry.get("mounted_depots"), dict):
+            recorded_depots = [
+                str(d)
+                for d in entry["mounted_depots"].keys()
+                if str(d).isdigit() and str(d) not in COMMON_REDIST_DEPOTS
+            ]
 
         if not repair:
             # Read-only verification: query fresh depot manifests via `-manifest-only`
@@ -2155,12 +2215,14 @@ class SteamBackend(StoreBackend):
                 resolved_id,
                 platform=platform,
                 branch=branch,
+                branch_password=branch_password,
                 account_name=account_name,
                 offline=False,
                 allow_cache_fallback=False,
                 update_cache=False,
             )
             depots = manifest_data.get("depots") or []
+            skipped_depots = set(manifest_data.get("skipped_depots") or [])
             missing_file_manifests = [
                 str(d.get("depot_id"))
                 for d in depots
@@ -2191,6 +2253,34 @@ class SteamBackend(StoreBackend):
                         and depot_to_dlc[str(d.get("depot_id") or "")] not in installed_dlcs
                     )
                 ]
+
+            # Require complete coverage of the installation's recorded depots before reporting OK.
+            returned_depot_ids = {
+                str(d.get("depot_id")) for d in depots if isinstance(d, dict) and d.get("depot_id")
+            }
+            missing_required = [did for did in recorded_depots if did not in returned_depot_ids]
+            if missing_required:
+                if any(did in skipped_depots for did in missing_required):
+                    raise AuthRequiredError(
+                        f"Cannot verify Steam AppID {resolved_id}: current account lacks access to "
+                        f"installed depot(s) {', '.join(missing_required)}.",
+                        details={
+                            "missing_depots": missing_required,
+                            "skipped_depots": sorted(skipped_depots),
+                        },
+                    )
+                raise CommandFailedError(
+                    f"Incomplete depot coverage for Steam AppID {resolved_id}: installed depot(s) "
+                    f"{', '.join(missing_required)} were omitted from manifest query.",
+                    details={"missing_depots": missing_required},
+                )
+            if not recorded_depots and skipped_depots:
+                raise AuthRequiredError(
+                    f"Cannot verify Steam AppID {resolved_id}: DepotDownloader skipped depot(s) "
+                    f"{', '.join(sorted(skipped_depots))} (not available from this account).",
+                    details={"skipped_depots": sorted(skipped_depots)},
+                )
+
             checked, missing_files, corrupted_files = self._verify_files_readonly(
                 install_path,
                 depots,
@@ -2221,23 +2311,57 @@ class SteamBackend(StoreBackend):
         dd_args = [
             "-app",
             resolved_id,
-            "-os",
-            platform,
-            "-osarch",
-            "64",
-            "-branch",
-            branch,
-            "-dir",
-            str(install_path),
-            "-username",
-            account_name,
-            "-remember-password",
-            "-validate",
         ]
+        if recorded_depots:
+            dd_args.append("-depot")
+            dd_args.extend(recorded_depots)
+        dd_args.extend(
+            [
+                "-os",
+                platform,
+                "-osarch",
+                "64",
+                "-branch",
+                branch,
+                "-dir",
+                str(install_path),
+                "-username",
+                account_name,
+                "-remember-password",
+                "-validate",
+            ]
+        )
+        if branch_password:
+            dd_args.extend(["-branchpassword", branch_password])
         proc = self._run_depot_downloader(dd_args, interactive=False, timeout=None, check=False)
         combined = proc.stdout + "\n" + proc.stderr
-        ok = proc.returncode == 0
         parsed_out = parse_depot_downloader_stdout(combined)
+        actual_branch = parsed_out.get("branch")
+        if (
+            branch.lower() != "public"
+            and actual_branch
+            and actual_branch.lower() != branch.lower()
+        ):
+            raise CommandFailedError(
+                f"DepotDownloader fell back to branch {actual_branch!r} instead of requested "
+                f"branch {branch!r} during repair (check --branch-password-env)."
+            )
+        skipped_repair = set(_SKIPPED_DEPOT_RE.findall(combined))
+        processed_repair = {
+            str(d.get("depot_id")) for d in parsed_out.get("depots", []) if d.get("depot_id")
+        }
+        missing_repair = [did for did in recorded_depots if did not in processed_repair]
+        if proc.returncode == 0 and missing_repair:
+            if any(did in skipped_repair for did in missing_repair):
+                raise AuthRequiredError(
+                    f"Repair skipped installed depot(s) {', '.join(missing_repair)} for Steam AppID {resolved_id}.",
+                    details={"missing_depots": missing_repair, "skipped_depots": sorted(skipped_repair)},
+                )
+            raise CommandFailedError(
+                f"Repair did not process installed depot(s) {', '.join(missing_repair)} for Steam AppID {resolved_id}.",
+                details={"missing_depots": missing_repair},
+            )
+        ok = proc.returncode == 0
         repaired_flag = bool(
             repair and ok and (parsed_out.get("total_downloaded_bytes") or 0) > 0
         )
@@ -2256,6 +2380,7 @@ class SteamBackend(StoreBackend):
         *,
         check_only: bool = False,
         with_dlcs: bool = False,
+        branch_password: str | None = None,
     ) -> UpdateResult:
         account_name, _ = self._require_logged_in_account()
         resolved_id = self._resolve_app_id(app_id, offline=False, strict=True)
@@ -2268,6 +2393,13 @@ class SteamBackend(StoreBackend):
         platform = str(entry.get("platform") or "windows")
         branch = str(entry.get("branch") or "public")
         old_version = str(entry.get("build_id") or "") or None
+        if entry.get("branch_requires_password") and not branch_password:
+            raise AcquireError(
+                f"Steam AppID {resolved_id} is installed on password-protected branch {branch!r}; "
+                "pass `--branch-password-env <VAR>` to update without falling back to public.",
+                code="missing_branch_password",
+                details={"app_id": resolved_id, "branch": branch},
+            )
 
         # Always fetch fresh remote manifests under base `resolved_id` without overwriting the
         # installed manifest cache so `--check-only` cannot clobber installed launch metadata.
@@ -2275,6 +2407,7 @@ class SteamBackend(StoreBackend):
             resolved_id,
             platform=platform,
             branch=branch,
+            branch_password=branch_password,
             account_name=account_name,
             offline=False,
             allow_cache_fallback=False,
@@ -2344,6 +2477,7 @@ class SteamBackend(StoreBackend):
                             depot_id=dep_id,
                             platform=platform,
                             branch=branch,
+                            branch_password=branch_password,
                             account_name=account_name,
                             offline=False,
                             allow_cache_fallback=False,
@@ -2420,6 +2554,7 @@ class SteamBackend(StoreBackend):
                 with_dlcs=with_dlcs,
                 skip_dlcs=not with_dlcs,
                 branch=branch,
+                branch_password=branch_password,
             )
         )
         return UpdateResult(

@@ -323,6 +323,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-download any missing or corrupted files",
     )
+    p_verify.add_argument(
+        "--branch-password-env",
+        default=None,
+        help="Environment variable name containing a private beta branch password (never logged)",
+    )
 
     # update
     p_update = sub.add_parser("update", help="Check for or apply updates to an installed game")
@@ -337,6 +342,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--with-dlcs",
         action="store_true",
         help="Also update installed DLCs",
+    )
+    p_update.add_argument(
+        "--branch-password-env",
+        default=None,
+        help="Environment variable name containing a private beta branch password (never logged)",
     )
 
     # uninstall
@@ -660,7 +670,17 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if cmd == "verify":
-        res = backend.verify(args.app, repair=bool(args.repair))
+        verify_kwargs: dict[str, Any] = {"repair": bool(args.repair)}
+        if args.branch_password_env:
+            branch_password = os.environ.get(args.branch_password_env)
+            if not branch_password:
+                raise AcquireError(
+                    f"branch password env var {args.branch_password_env!r} is unset or empty",
+                    code="missing_branch_password",
+                )
+            if "branch_password" in inspect.signature(backend.verify).parameters:
+                verify_kwargs["branch_password"] = branch_password
+        res = backend.verify(args.app, **verify_kwargs)
         lines = [
             f"Verify {res.app_id}: {'OK' if res.ok else 'FAILED'}"
             + (" (repaired)" if res.repaired else ""),
@@ -671,11 +691,20 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0 if res.ok else 1
 
     if cmd == "update":
-        res = backend.update(
-            args.app,
-            check_only=bool(args.check_only),
-            with_dlcs=bool(args.with_dlcs),
-        )
+        update_kwargs: dict[str, Any] = {
+            "check_only": bool(args.check_only),
+            "with_dlcs": bool(args.with_dlcs),
+        }
+        if args.branch_password_env:
+            branch_password = os.environ.get(args.branch_password_env)
+            if not branch_password:
+                raise AcquireError(
+                    f"branch password env var {args.branch_password_env!r} is unset or empty",
+                    code="missing_branch_password",
+                )
+            if "branch_password" in inspect.signature(backend.update).parameters:
+                update_kwargs["branch_password"] = branch_password
+        res = backend.update(args.app, **update_kwargs)
         if res.updated and res.install_path:
             existing_manifest = Path(res.install_path) / MANIFEST_FILENAME
             if existing_manifest.is_file():
