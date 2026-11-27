@@ -2797,3 +2797,30 @@ fn metal_backend_drains_released_queue_before_write_resource_and_finish() {
     assert!(rb.iter().all(|&b| b == 0xAA), "released queue copy observed overwritten upload bytes");
 }
 
+#[test]
+fn metal_backend_rejects_duplicate_live_queue_and_fence_ids() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::types::CommandQueueDesc;
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+    }
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateFence { device: 1, fence: 6, initial_value: 0, flags: 0 }, 0).unwrap();
+    w.write(&Call::CreateFence { device: 1, fence: 6, initial_value: 0, flags: 0 }, 0).unwrap();
+
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&w.into_inner(), &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 2, "{rep}");
+    assert!(rep.failed.items[0].1.contains("duplicate still-live queue id"), "{:?}", rep.failed.items);
+    assert!(rep.failed.items[1].1.contains("duplicate still-live fence id"), "{:?}", rep.failed.items);
+}
+

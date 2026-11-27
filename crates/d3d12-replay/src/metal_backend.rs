@@ -844,6 +844,9 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreateCommandQueue { queue, desc, .. } => {
+                if self.queues.contains_key(queue) {
+                    return Err(format!("CreateCommandQueue: duplicate still-live queue id {queue:#x}"));
+                }
                 let qd = if desc.len() >= std::mem::size_of::<CommandQueueDesc>() {
                     read_copy::<CommandQueueDesc>(&desc[..std::mem::size_of::<CommandQueueDesc>()])?
                 } else {
@@ -861,12 +864,18 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreateCommandAllocator { allocator, list_type, .. } => {
+                if self.allocators.contains_key(allocator) {
+                    return Err(format!("CreateCommandAllocator: duplicate still-live allocator id {allocator:#x}"));
+                }
                 let kind = ListType::from_raw(*list_type).unwrap_or(ListType::Direct);
                 let a = CommandAllocator::new(kind).ok_or("CommandAllocator::new failed")?;
                 self.allocators.insert(*allocator, a);
                 Ok(Handled::Done)
             }
             Call::CreateCommandList { list, list_type, allocator, initial_pso, .. } => {
+                if self.lists.contains_key(list) {
+                    return Err(format!("CreateCommandList: duplicate still-live list id {list:#x}"));
+                }
                 let kind = ListType::from_raw(*list_type).unwrap_or(ListType::Direct);
                 let mut cl = CommandList::new(kind).ok_or("CommandList::new failed")?;
                 let mut open_ts_slot = None;
@@ -990,11 +999,17 @@ impl Backend for MetalBackend {
             }
             Call::CreateReservedResource { .. } => Ok(Handled::Skipped),
             Call::CreateRootSignature { root_signature, blob, .. } => {
+                if self.root_sigs.contains_key(root_signature) {
+                    return Err(format!("CreateRootSignature: duplicate still-live root signature id {root_signature:#x}"));
+                }
                 let rs = RootSignature::from_blob(blob).map_err(|e| format!("RootSignature: {e}"))?;
                 self.root_sigs.insert(*root_signature, rs);
                 Ok(Handled::Done)
             }
             Call::CreateGraphicsPipelineState { pso, desc, .. } => {
+                if self.psos.contains_key(pso) {
+                    return Err(format!("CreateGraphicsPipelineState: duplicate still-live PSO id {pso:#x}"));
+                }
                 if !desc.hs.is_empty() || !desc.ds.is_empty() {
                     return Ok(Handled::Skipped);
                 }
@@ -1009,6 +1024,9 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreateMeshPipelineState { pso, amplification, mesh, desc, .. } => {
+                if self.psos.contains_key(pso) {
+                    return Err(format!("CreateMeshPipelineState: duplicate still-live PSO id {pso:#x}"));
+                }
                 let rs = self.resolve_root_sig(desc.root_signature, if !amplification.is_empty() { amplification } else { mesh })?;
                 let mdesc = decode_mesh_desc(amplification, mesh, desc)?;
                 let mp = MeshPipeline::new(rs, &mdesc, &format!("replay mesh pso {pso:#x}"))?;
@@ -1016,6 +1034,9 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreateComputePipelineState { pso, root_signature, cs, .. } => {
+                if self.psos.contains_key(pso) {
+                    return Err(format!("CreateComputePipelineState: duplicate still-live PSO id {pso:#x}"));
+                }
                 let rs = self.resolve_root_sig(*root_signature, cs)?;
                 let cp = ComputePipeline::new(rs, cs, &format!("replay cs pso {pso:#x}"))?;
                 self.psos.insert(*pso, LivePso::Compute(Arc::new(cp)));
@@ -1023,6 +1044,9 @@ impl Backend for MetalBackend {
             }
             Call::CreateStateObject { .. } | Call::AddToStateObject { .. } => Ok(Handled::Skipped),
             Call::CreateCommandSignature { signature, byte_stride, arguments, .. } => {
+                if self.cmd_sigs.contains_key(signature) {
+                    return Err(format!("CreateCommandSignature: duplicate still-live signature id {signature:#x}"));
+                }
                 if !arguments.len().is_multiple_of(16) {
                     return Err(format!("CreateCommandSignature arguments {} bytes not multiple of 16", arguments.len()));
                 }
@@ -1042,12 +1066,18 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreateFence { fence, initial_value, .. } => {
+                if self.fences.contains_key(fence) {
+                    return Err(format!("CreateFence: duplicate still-live fence id {fence:#x}"));
+                }
                 let f = Fence::new(*initial_value).ok_or("Fence::new failed")?;
                 self.fences.insert(*fence, Arc::new(f));
                 self.fence_signals.insert(*fence, vec![(*initial_value, None)]);
                 Ok(Handled::Done)
             }
             Call::CreateQueryHeap { heap, desc, .. } => {
+                if self.query_heaps.contains_key(heap) {
+                    return Err(format!("CreateQueryHeap: duplicate still-live query heap id {heap:#x}"));
+                }
                 if desc.len() < 8 {
                     return Err(format!("CreateQueryHeap desc too short ({} bytes)", desc.len()));
                 }
@@ -2108,6 +2138,9 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreateSwapChain { queue, swapchain, desc } => {
+                if self.swapchains.contains_key(swapchain) {
+                    return Err(format!("CreateSwapChain: duplicate still-live swapchain id {swapchain:#x}"));
+                }
                 let q = self
                     .queues
                     .get(queue)
