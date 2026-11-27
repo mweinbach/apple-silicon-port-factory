@@ -488,7 +488,7 @@ impl MetalBackend {
                 let l = self.lists.get_mut(&list_id).unwrap();
                 if self.timing_armed
                     && l.open_ts_slot.is_none()
-                    && matches!(l.cl.kind, ListType::Direct | ListType::Compute)
+                    && matches!(l.cl.kind, ListType::Direct | ListType::Compute | ListType::Copy)
                 {
                     if let Some(timer) = self.gpu_timer.as_mut() {
                         let slot = timer.alloc_slot()?;
@@ -506,7 +506,7 @@ impl MetalBackend {
             let mut ts_slot = None;
             let l = self.lists.get_mut(&list_id).unwrap();
             l.cl.begin(alloc)?;
-            if self.timing_armed && matches!(l.cl.kind, ListType::Direct | ListType::Compute) {
+            if self.timing_armed && matches!(l.cl.kind, ListType::Direct | ListType::Compute | ListType::Copy) {
                 if let Some(timer) = self.gpu_timer.as_mut() {
                     let slot = timer.alloc_slot()?;
                     l.cl.write_timestamp(&timer.heap, slot)?;
@@ -781,7 +781,7 @@ impl Backend for MetalBackend {
                         .get(allocator)
                         .ok_or_else(|| format!("unknown allocator {allocator:#x}"))?;
                     cl.begin(alloc)?;
-                    if self.timing_armed && matches!(kind, ListType::Direct | ListType::Compute) {
+                    if self.timing_armed && matches!(kind, ListType::Direct | ListType::Compute | ListType::Copy) {
                         if let Some(timer) = self.gpu_timer.as_mut() {
                             let slot = timer.alloc_slot()?;
                             cl.write_timestamp(&timer.heap, slot)?;
@@ -1182,7 +1182,7 @@ impl Backend for MetalBackend {
                 l.alloc_id = *allocator;
                 l.initial_pso = *pso;
                 let mut open_ts_slot = None;
-                if self.timing_armed && matches!(l.cl.kind, ListType::Direct | ListType::Compute) {
+                if self.timing_armed && matches!(l.cl.kind, ListType::Direct | ListType::Compute | ListType::Copy) {
                     if let Some(timer) = self.gpu_timer.as_mut() {
                         let slot = timer.alloc_slot()?;
                         l.cl.write_timestamp(&timer.heap, slot)?;
@@ -1831,7 +1831,7 @@ impl Backend for MetalBackend {
                         .ok_or_else(|| format!("ExecuteCommandLists unknown list {id:#x}"))?;
                     if self.timing_armed
                         && l.submitted_since_reset
-                        && matches!(l.cl.kind, ListType::Direct | ListType::Compute)
+                        && matches!(l.cl.kind, ListType::Direct | ListType::Compute | ListType::Copy)
                     {
                         return Err(format!(
                             "cannot benchmark repeated submission of closed command list {id:#x} \

@@ -1899,3 +1899,66 @@ fn bench_slice_preserves_multi_list_recording_and_rejects_split_list() {
     assert!(err.to_string().contains("recorded before frame_start"), "{err}");
 }
 
+#[test]
+fn metal_backend_bench_measures_copy_queue_work() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::bench;
+    use d3d12_metal::types::{dim, heap_type, CommandQueueDesc, HeapProperties, ResourceDesc};
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    const D: u64 = 0xd000;
+    const Q_COPY: u64 = 0xd100;
+    const A_COPY: u64 = 0xd200;
+    const L_COPY: u64 = 0xd300;
+    const SRC: u64 = 0xd400;
+    const DST: u64 = 0xd401;
+    const SZ: usize = 8 * 1024 * 1024;
+
+    let qd_copy = CommandQueueDesc { Type: 3, ..Default::default() }; // D3D12_COMMAND_LIST_TYPE_COPY
+    let hp_up = HeapProperties { Type: heap_type::UPLOAD, ..Default::default() };
+    let hp_rb = HeapProperties { Type: heap_type::READBACK, ..Default::default() };
+    let bdesc = ResourceDesc {
+        Dimension: dim::BUFFER,
+        Width: SZ as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleCount: 1,
+        Layout: 1,
+        ..Default::default()
+    };
+    let payload = vec![0x7Eu8; SZ];
+    let lists = [L_COPY];
+
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: D, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: D, queue: Q_COPY, desc: bytes_of(&qd_copy) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: D, allocator: A_COPY, list_type: 3 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: SRC, heap_properties: bytes_of(&hp_up), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_e000_0000 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: D, resource: DST, heap_properties: bytes_of(&hp_rb), heap_flags: 0, desc: bytes_of(&bdesc), initial_state: 0, clear_value: None, gpu_va: 0x4_e100_0000 }, 0).unwrap();
+    w.write(&Call::WriteResource { resource: SRC, subresource: 0, offset: 0, data: &payload }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: D, list: L_COPY, list_type: 3, allocator: 0, initial_pso: 0 }, 0).unwrap();
+    // Copy-queue-only frame body:
+    w.write(&Call::Reset { list: L_COPY, allocator: A_COPY, pso: 0 }, 0).unwrap();
+    w.write(&Call::CopyBufferRegion { list: L_COPY, dst: DST, dst_offset: 0, src: SRC, src_offset: 0, size: SZ as u64 }, 0).unwrap();
+    w.write(&Call::Close { list: L_COPY }, 0).unwrap();
+    w.write(&Call::ExecuteCommandLists { queue: Q_COPY, lists: U64s::from_slice(&lists) }, 0).unwrap();
+    w.write(&Call::FrameEnd { frame: 0 }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let opts = bench::BenchOptions { iterations: 4, warmup: 2, until: None };
+    let (rep, backend) = bench::run_bench(&trace, &opts).unwrap();
+    assert!(rep.failures.is_empty(), "{rep}");
+    assert_eq!(rep.gpu_busy.samples.len(), 4);
+    for (i, &ms) in rep.gpu_busy.samples.iter().enumerate() {
+        assert!(ms > 0.0, "copy-queue iteration {i} reported non-positive gpu_busy_ms={ms}:\n{rep}");
+    }
+    let dst = backend.resource(DST).unwrap().shared_slice(0, SZ).unwrap();
+    assert!(dst.iter().all(|&b| b == 0x7E));
+}
+
