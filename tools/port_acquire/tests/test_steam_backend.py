@@ -2022,6 +2022,25 @@ class SteamBackendTests(unittest.TestCase):
                     print("Processing depot 228990 - DirectX June 2010 Redistributable")
                     print("Manifest 200 (11/26/2026 12:00:00)")
                     sys.exit(0)
+                app_id = argv[argv.index("-app") + 1] if "-app" in argv else ""
+                depots = []
+                if "-depot" in argv:
+                    i = argv.index("-depot") + 1
+                    while i < len(argv) and not argv[i].startswith("-"):
+                        depots.append(argv[i])
+                        i += 1
+                if app_id == "228980" and "228990" in depots and dest is not None:
+                    dest.mkdir(parents=True, exist_ok=True)
+                    (dest / "DXSETUP.exe").write_bytes({dx_bytes!r})
+                    print("Using app branch: 'public'.")
+                    print("Processing depot 228990 - DirectX June 2010 Redistributable")
+                    print("Manifest 200 (11/26/2026 12:00:00)")
+                    print("Total downloaded: 512 bytes")
+                    sys.exit(0)
+                print("Using app branch: 'public'.")
+                print("Processing depot 1091501 - Base Game")
+                print("Manifest 100 (11/26/2026 12:00:00)")
+                print("Total downloaded: 0 bytes")
                 sys.exit(0)
                 """
             ),
@@ -2067,6 +2086,50 @@ class SteamBackendTests(unittest.TestCase):
         ver_missing_redist = backend.verify("1091500", repair=False)
         self.assertFalse(ver_missing_redist.ok)
         self.assertEqual(ver_missing_redist.missing_files, ["_CommonRedist/228990/DXSETUP.exe"])
+
+        # 3. Repairing must also validate/restore separately installed redistributable depots
+        # under `_CommonRedist/<depot_id>` so verification succeeds immediately afterwards.
+        repaired = backend.verify("1091500", repair=True)
+        self.assertTrue(repaired.ok)
+        self.assertTrue(repaired.repaired)
+        self.assertTrue((dest / "_CommonRedist" / "228990" / "DXSETUP.exe").is_file())
+        ver_after_repair = backend.verify("1091500", repair=False)
+        self.assertTrue(ver_after_repair.ok)
+        self.assertEqual(ver_after_repair.missing_files, [])
+
+    def test_list_owned_preserves_managed_install_precedence_over_acf(self) -> None:
+        sa_dir = self.steam_home / "steamapps"
+        native_dir = sa_dir / "common" / "NativeMacTitle"
+        (native_dir / "NativeMacTitle.app" / "Contents").mkdir(parents=True, exist_ok=True)
+        (sa_dir / "appmanifest_1091500.acf").write_text(
+            textwrap.dedent(
+                """\
+                "AppState"
+                {
+                    "appid"        "1091500"
+                    "name"         "Native Mac Title"
+                    "installdir"   "NativeMacTitle"
+                    "buildid"      "100"
+                    "LastOwner"    "76561198000000002"
+                }
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        backend = self._make_backend()
+        managed_dest = (self.root / "games" / "ManagedWinCopy").resolve()
+        backend.download(DownloadOptions(app_id="1091500", dest=managed_dest, platform="windows"))
+
+        owned = backend.list_owned(platform="windows")
+        by_id = {g.app_id: g for g in owned}
+        self.assertIn("1091500", by_id)
+        self.assertTrue(by_id["1091500"].installed)
+        self.assertEqual(Path(by_id["1091500"].install_path).resolve(), managed_dest)
+        self.assertEqual(by_id["1091500"].version, "8811223344556677889")
+
+        info = backend.info("1091500", platform="windows", offline=True)
+        self.assertEqual(Path(info.install_path).resolve(), managed_dest)
 
     def test_unmanaged_steam_client_install_rejected_for_inplace_update_and_repair(self) -> None:
         sa_dir = self.steam_home / "steamapps"

@@ -1139,19 +1139,24 @@ class SteamBackend(StoreBackend):
                     platforms=["windows"],
                 )
 
-        # Merge installed state onto games owned by this account
+        # Merge installed state onto games owned by this account.
+        # Managed `port-acquire` installs take precedence over unmanaged Steam-client
+        # `.acf` installs (matching `_get_installed_entry()`).
+        managed_installed_ids: set[str] = set()
         for aid, inst in installs.items():
             if aid in games_by_id:
                 games_by_id[aid].installed = True
                 games_by_id[aid].install_path = inst.get("install_path")
                 games_by_id[aid].version = inst.get("build_id")
+                managed_installed_ids.add(aid)
                 if inst.get("title") and games_by_id[aid].title.startswith("Steam App "):
                     games_by_id[aid].title = str(inst["title"])
         for aid, acf in acf_map.items():
             if aid in games_by_id:
-                games_by_id[aid].installed = True
-                games_by_id[aid].install_path = acf.get("install_path")
-                games_by_id[aid].version = acf.get("build_id")
+                if aid not in managed_installed_ids:
+                    games_by_id[aid].installed = True
+                    games_by_id[aid].install_path = acf.get("install_path")
+                    games_by_id[aid].version = acf.get("build_id")
                 if acf.get("name") and games_by_id[aid].title.startswith("Steam App "):
                     games_by_id[aid].title = str(acf["name"])
 
@@ -2537,6 +2542,62 @@ class SteamBackend(StoreBackend):
                 details={"missing_depots": missing_repair},
             )
         ok = proc.returncode == 0
+        redist_repaired_bytes = 0
+        installed_redists_list = list(
+            dict.fromkeys(str(x) for x in (entry.get("redists") or []) if str(x).isdigit())
+        )
+        if ok and installed_redists_list:
+            # Repair separately managed Common Redistributables (`AppID 228980`) at their
+            # actual `_CommonRedist/<depot_id>` destinations before reporting overall success.
+            for rdid in installed_redists_list:
+                redist_dst = install_path / "_CommonRedist" / rdid
+                redist_dst.mkdir(parents=True, exist_ok=True)
+                redist_args = [
+                    "-app",
+                    COMMON_REDIST_APP_ID,
+                    "-depot",
+                    rdid,
+                    "-os",
+                    platform,
+                    "-osarch",
+                    "64",
+                    "-dir",
+                    str(redist_dst),
+                    "-username",
+                    account_name,
+                    "-remember-password",
+                    "-validate",
+                ]
+                r_proc = self._run_depot_downloader(
+                    redist_args,
+                    interactive=False,
+                    timeout=None,
+                    check=False,
+                )
+                r_combined = r_proc.stdout + "\n" + r_proc.stderr
+                r_parsed = parse_depot_downloader_stdout(r_combined)
+                r_skipped = set(_SKIPPED_DEPOT_RE.findall(r_combined))
+                r_processed = {
+                    str(d["depot_id"])
+                    for d in r_parsed.get("depots", [])
+                    if isinstance(d, dict) and d.get("depot_id")
+                }
+                if r_proc.returncode != 0:
+                    ok = False
+                    combined = combined + "\n" + r_combined
+                    break
+                if rdid not in r_processed:
+                    if rdid in r_skipped:
+                        raise AuthRequiredError(
+                            f"Repair skipped installed redistributable depot {rdid} for Steam AppID {resolved_id}.",
+                            details={"missing_depots": [rdid], "skipped_depots": sorted(r_skipped)},
+                        )
+                    raise CommandFailedError(
+                        f"Repair did not process installed redistributable depot {rdid} for Steam AppID {resolved_id}.",
+                        details={"missing_depots": [rdid]},
+                    )
+                redist_repaired_bytes += int(r_parsed.get("total_downloaded_bytes") or 0)
+
         if ok:
             # DepotDownloader `-validate` downloads the current manifest for `branch` when no
             # manifest GID is pinned; synchronize the installation registry and cached manifest
@@ -2599,9 +2660,8 @@ class SteamBackend(StoreBackend):
                 installs[resolved_id] = managed
                 self._save_installs(installs)
 
-        repaired_flag = bool(
-            repair and ok and (parsed_out.get("total_downloaded_bytes") or 0) > 0
-        )
+        total_repaired_bytes = int(parsed_out.get("total_downloaded_bytes") or 0) + redist_repaired_bytes
+        repaired_flag = bool(repair and ok and total_repaired_bytes > 0)
         msg_lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
         return VerifyResult(
             store=self.name,
