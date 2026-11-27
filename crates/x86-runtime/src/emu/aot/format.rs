@@ -390,6 +390,11 @@ pub(super) const AOT_BANK_SPAN: usize = 112 << 20;
 pub(super) const MAX_CODE: usize = 2048 << 20;
 /// Per-bank LSE2 exact-TSO unaligned-trap patch slab in dynamic `MAP_JIT` regions.
 pub(super) const AOT_LSE2_SLAB: usize = 256 << 10;
+/// Per-bank far-branch island slab (16 bytes per deduplicated far target: `ldr x16, .+8;
+/// br x16; .quad target`) appended after each bank's LSE2 slab so cross-bank and
+/// cross-module `b`/`bl` links beyond ±128 MiB direct reach stay chained without falling
+/// back to `lookup_rip`.
+pub(super) const AOT_FAR_SLAB: usize = 128 << 10;
 
 impl Image {
     pub(super) fn code_bytes(&self) -> usize {

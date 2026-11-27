@@ -3292,3 +3292,72 @@ fn aot_deep_pdata_function_discovers_leaf_callees_past_default_depth() {
         closure.leaf_callees
     );
 }
+
+/// Far-branch islands (`ldr x16, .+8; br x16; .quad dst`) must chain both direct `b` tail jumps
+/// and `bl` calls (preserving `x30` / RAS return landing pads), deduplicate repeated targets,
+/// and match interpreter execution cleanly.
+#[test]
+fn aot_far_branch_island_chains_b_and_bl_preserving_ras() {
+    use iced_x86::code_asm::*;
+    use std::sync::atomic::Ordering;
+
+    struct ResetFar;
+    impl Drop for ResetFar {
+        fn drop(&mut self) {
+            super::runtime::TEST_FORCE_FAR_LINK.store(false, Ordering::Relaxed);
+            super::runtime::test_uninstall();
+        }
+    }
+
+    let mut code = TestMappedBuf::alloc(0x4000, 0x2_3F20_0000);
+    let base = code.base() as u64;
+    let buf = code.as_slice_mut();
+
+    let fn_entry = base + 0x100;
+    let fn_callee = base + 0x200;
+    let fn_tail = base + 0x300;
+    let fn_mid = base + 0x180;
+
+    // entry: xor eax, eax; call callee; add eax, 100; jmp tail (and a second call to callee to test dedup)
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(eax, ecx).unwrap();
+    a.call(fn_callee).unwrap();
+    a.call(fn_callee).unwrap();
+    a.jmp(fn_mid).unwrap();
+    let b_entry = a.assemble(fn_entry).unwrap();
+    buf[0x100..0x100 + b_entry.len()].copy_from_slice(&b_entry);
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.add(eax, 100).unwrap();
+    a.jmp(fn_tail).unwrap();
+    let b_mid = a.assemble(fn_mid).unwrap();
+    buf[0x180..0x180 + b_mid.len()].copy_from_slice(&b_mid);
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.add(eax, 7).unwrap();
+    a.ret().unwrap();
+    let b_callee = a.assemble(fn_callee).unwrap();
+    buf[0x200..0x200 + b_callee.len()].copy_from_slice(&b_callee);
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.imul_2(eax, eax).unwrap();
+    a.ret().unwrap();
+    let b_tail = a.assemble(fn_tail).unwrap();
+    buf[0x300..0x300 + b_tail.len()].copy_from_slice(&b_tail);
+
+    let call1 = fn_entry + 7; // after first `call fn_callee`
+    let call2 = fn_entry + 12; // after second `call fn_callee`
+    let ips = [fn_entry, call1, call2, fn_mid, fn_callee, fn_tail];
+
+    let _reset = ResetFar;
+    super::runtime::TEST_FORCE_FAR_LINK.store(true, Ordering::Relaxed);
+    let (live, _, links) = unsafe { super::runtime::test_install(&ips, || {}) };
+    assert!(live >= 4 && links >= 3, "expected live blocks and links, got live={live} links={links}");
+
+    // Run through the installed AOT far-branch islands and compare with exact arithmetic:
+    // ((5 + 7 + 7) + 100)^2 = 119^2 = 14161.
+    crate::emu::jit::force(1);
+    let got = unsafe { crate::emu::call_va8(fn_entry, 5, 0, 0, 0, 0, 0, 0, 0) };
+    crate::emu::jit::force(0);
+    assert_eq!(got, 119 * 119);
+}

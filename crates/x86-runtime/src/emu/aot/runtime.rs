@@ -11,7 +11,7 @@ use super::builder::{build_all, split_and_rebase_block};
 use super::builder::build_image;
 use super::format::{
     decode, image_hash, module_key_hashed, read_cache_file, set_flags, word_to_off, write_atomic,
-    AotKey, BlockEnt, Image, LinkEnt, RelocEnt, AOT_LSE2_SLAB, FLAG_VERIFY_PENDING,
+    AotKey, BlockEnt, Image, LinkEnt, RelocEnt, AOT_FAR_SLAB, AOT_LSE2_SLAB, FLAG_VERIFY_PENDING,
 };
 #[cfg(test)]
 use super::format::{encode, BUILD_VBASE};
@@ -29,19 +29,31 @@ use crate::emu::jit::{
 };
 use crate::emu::BlockCache;
 
+/// Per-bank far-branch island slab: 16-byte immutable veneers (`ldr x16, .+8; br x16; .quad dst`)
+/// deduplicated by destination host code address so cross-bank and cross-module links beyond
+/// ±128 MiB `b`/`bl` range chain directly while preserving `x30` (`LR`) for calls.
+struct FarSlab {
+    lo: usize,
+    used: usize,
+    len: usize,
+    islands: HashMap<usize, usize>,
+}
+
 pub(super) struct Module {
     pub(super) name: String,
     base: usize,
     size: usize,
-    /// `MAP_JIT` region: bank 0 stubs at offset 0, followed by per-bank code and LSE2 slabs.
+    /// `MAP_JIT` region: bank 0 stubs at offset 0, followed by per-bank code, LSE2, and far slabs.
     region: usize,
     /// Total byte length of the `MAP_JIT` allocation starting at `region`.
     region_len: usize,
     /// Per-bank runtime byte shift relative to `img`'s flat offsets:
     /// `host_addr(off_in_bank_k) == region + off + bank_shifts[k]`.
-    /// Single-bank images have `[0]`; multi-bank images insert a 256 KiB LSE2 slab after each
-    /// bank so every instruction stays well within ±128 MiB `b_reach` of its bank's slab.
+    /// Single-bank images have `[0]`; multi-bank images insert LSE2 + far-island slabs after each
+    /// bank so every instruction stays well within ±128 MiB `b_reach` of its bank's slabs.
     bank_shifts: Vec<usize>,
+    /// Per-bank far-branch island slabs (same length as `bank_shifts`).
+    far_slabs: Vec<FarSlab>,
     img: Image,
     /// Per block: 0 = alive, [`DEAD_PERM`] or [`DEAD_ASSUME`].
     dead: Box<[AtomicU8]>,
@@ -69,6 +81,32 @@ impl Module {
             let bi = self.img.bank_index_of(img_off);
             self.region + img_off as usize + self.bank_shifts[bi]
         }
+    }
+
+    /// Return (or emit and icache-flush) a 16-byte far-branch island in `site_off`'s bank
+    /// jumping to `target_code`. Code memory must be writable on this thread.
+    unsafe fn far_island(&mut self, site_off: u32, target_code: usize) -> Option<usize> {
+        let bi = if self.bank_shifts.len() <= 1 {
+            0
+        } else {
+            self.img.bank_index_of(site_off)
+        };
+        let slab = self.far_slabs.get_mut(bi)?;
+        if let Some(&isl) = slab.islands.get(&target_code) {
+            return Some(isl);
+        }
+        if slab.used + 16 > slab.len {
+            return None;
+        }
+        let isl = slab.lo + slab.used;
+        slab.used += 16;
+        let p = isl as *mut u32;
+        *p.add(0) = 0x5800_0050; // ldr x16, .+8
+        *p.add(1) = 0xD61F_0200; // br x16 (preserves x30 for `bl`)
+        core::ptr::write(p.add(2) as *mut u64, target_code as u64);
+        icache_invalidate(isl as *mut u8, 16);
+        slab.islands.insert(target_code, isl);
+        Some(isl)
     }
 
     /// Translate a live `MAP_JIT` host PC back to a flat `Image` byte offset, or `None`
@@ -273,6 +311,9 @@ static CHECKED_VG: AtomicU32 = AtomicU32::new(0);
 static EPOCH: AtomicU32 = AtomicU32::new(0);
 /// Any module installed.
 static HAVE: AtomicBool = AtomicBool::new(false);
+/// Test-only: force `link_pass` to route direct links through per-bank far-branch islands.
+#[cfg(test)]
+pub(super) static TEST_FORCE_FAR_LINK: AtomicBool = AtomicBool::new(false);
 
 /// AOT module kills so far ([`crate::emu::jit::JitCache::run`] flushes when it changes).
 #[inline(always)]
@@ -302,7 +343,7 @@ pub(super) unsafe fn store_b(site: usize, target: usize) {
     let old = cell.load(Ordering::Relaxed);
     let link_bit = if old == 0xD503_201F { 0 } else { old & 0x8000_0000 };
     let off = (((target as i64 - site as i64) >> 2) as u32) & 0x03FF_FFFF;
-    cell.store(0x1400_0000 | link_bit | off, Ordering::Relaxed);
+    cell.store(0x1400_0000 | link_bit | off, Ordering::Release);
 }
 
 /// Patch a `b.cond` / `cbz` / `cbnz` at `cond_site` directly to `target` if within ±1 MiB.
@@ -489,27 +530,44 @@ unsafe fn link_pass(d: &mut Dir) -> Vec<usize> {
                     continue;
                 }
                 let (site, code) = (m.host_addr(l.site_off), t.host_addr(tb_.code_off));
-                if reach(site, code) {
-                    let cond_site =
-                        if l.cond_off == u32::MAX { 0 } else { m.host_addr(l.cond_off) };
-                    todo.push((mi, li, site, code, l.target, cond_site));
-                }
+                let cond_site =
+                    if l.cond_off == u32::MAX { 0 } else { m.host_addr(l.cond_off) };
+                todo.push((mi, li, l.site_off, site, code, l.target, cond_site));
             }
         }
     }
+    let force_far = {
+        #[cfg(test)]
+        {
+            TEST_FORCE_FAR_LINK.load(Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    };
     let mut patched = Vec::with_capacity(todo.len());
-    for (mi, li, site, code, target, cond_site) in todo {
+    for (mi, li, site_off, site, code, target, cond_site) in todo {
+        let dest = if !force_far && reach(site, code) {
+            code
+        } else {
+            let Some(isl) = d.modules[mi].far_island(site_off, code) else {
+                continue;
+            };
+            debug_assert!(reach(site, isl), "far-branch island out of b reach");
+            isl
+        };
         let cell = &*(site as *const AtomicU32);
         let old = cell.load(Ordering::Relaxed);
-        if code == site + 4 && (old & 0xFC00_0000) == 0x1400_0000 {
+        if dest == site + 4 && (old & 0xFC00_0000) == 0x1400_0000 {
             // Fallthrough directly into the immediately-following hot block: 0-cycle `nop`
             // avoids taking a branch and keeps Apple Silicon's 8-wide fetch group intact!
-            cell.store(0xD503_201F, Ordering::Relaxed);
+            cell.store(0xD503_201F, Ordering::Release);
         } else {
-            store_b(site, code);
+            store_b(site, dest);
         }
         if cond_site != 0 {
-            if let Some(cs) = try_patch_cond_branch(cond_site, code) {
+            if let Some(cs) = try_patch_cond_branch(cond_site, dest) {
                 patched.push(cs);
             }
         }
@@ -952,6 +1010,7 @@ pub(super) unsafe fn install_image(
     let mut bank_shifts: Vec<usize> = Vec::with_capacity(nbanks);
     let mut bank_rt_offs: Vec<usize> = Vec::with_capacity(nbanks);
     let mut bank_slab_offs: Vec<usize> = Vec::with_capacity(nbanks);
+    let mut bank_far_offs: Vec<usize> = Vec::with_capacity(nbanks);
     let mut cursor = 0usize;
     for &(bo, b_end) in &banks_snap {
         cursor = (cursor + 15) & !15;
@@ -960,7 +1019,9 @@ pub(super) unsafe fn install_image(
         let bank_len = b_end - bo;
         let slab_off = (cursor + bank_len + 15) & !15;
         bank_slab_offs.push(slab_off);
-        cursor = slab_off + AOT_LSE2_SLAB;
+        let far_off = slab_off + AOT_LSE2_SLAB;
+        bank_far_offs.push(far_off);
+        cursor = far_off + AOT_FAR_SLAB;
     }
     let len = (cursor + 0x3FFF) & !0x3FFF;
     let Some(p) = alloc_jit(len) else {
@@ -969,6 +1030,7 @@ pub(super) unsafe fn install_image(
     };
     let region = p as usize;
     let mut lse2_slots: Vec<usize> = Vec::with_capacity(nbanks);
+    let mut far_slabs: Vec<FarSlab> = Vec::with_capacity(nbanks);
     for bi in 0..nbanks {
         let rt_base = region + bank_rt_offs[bi];
         let bank_len = banks_snap[bi].1 - banks_snap[bi].0;
@@ -983,6 +1045,14 @@ pub(super) unsafe fn install_image(
                 lse2_slots.push(slot);
             }
         }
+        let far_lo = region + bank_far_offs[bi];
+        let far_hi = far_lo + AOT_FAR_SLAB;
+        let far_len = if code_lo < code_hi && reach(code_lo, far_hi) && reach(far_hi, code_lo) {
+            AOT_FAR_SLAB
+        } else {
+            0
+        };
+        far_slabs.push(FarSlab { lo: far_lo, used: 0, len: far_len, islands: HashMap::new() });
     }
     let t0 = std::time::Instant::now();
     let _r = REVALIDATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -995,6 +1065,7 @@ pub(super) unsafe fn install_image(
         region,
         region_len: len,
         bank_shifts,
+        far_slabs,
         img,
         dead: (0..n).map(|_| AtomicU8::new(0)).collect(),
         linked: vec![false; nlinks],

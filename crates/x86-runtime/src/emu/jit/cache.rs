@@ -6,7 +6,8 @@ use super::emit::Asm;
 use super::lazy::{flaglazy_enabled, succ_lb_kill, Edges, FLAGLAZY_DEPTH, PF_NONE};
 use super::stubs::{emit_stubs, plaincall_enabled};
 use super::translate::{
-    classify, op_flags, supported, FlagState, Grp, IcCold, SideExit, SlowMem, Src, SysCold, Term, Tr,
+    classify, op_flags, supported, AtomicCold, FlagState, Grp, IcCold, SideExit, SlowMem, Src,
+    SysCold, Term, Tr,
 };
 use super::x87::X87Cold;
 use super::xmm::{fast_nan_enabled, retlit_enabled, xmm_pin_enabled, xmmreg_enabled, ColdNan};
@@ -396,8 +397,8 @@ pub(super) const JSET_BITS: u32 = JBITS - 1;
 const JLEN: usize = 1 << JBITS;
 pub(in crate::emu) const JMUL: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Per-thread 2-way polymorphic indirect-branch inline cache dimensions (1024 sets × 32B = 32 KiB).
-pub(super) const IC_BITS: u32 = 10;
+/// Per-thread 2-way polymorphic indirect-branch inline cache dimensions (2048 sets × 32B = 64 KiB).
+pub(super) const IC_BITS: u32 = 11;
 pub(super) const IC_SETS: usize = 1 << IC_BITS;
 
 /// One 2-way inline-cache set (32 bytes, layout read directly by translated ARM64 code).
@@ -411,7 +412,7 @@ pub(super) struct IcSet {
 }
 const _: () = assert!(core::mem::size_of::<IcSet>() == 32);
 
-/// Byte offset (`0..32768`, fits in ARM64 `movz imm16`) into `IcSet[IC_SETS]` for an indirect
+/// Byte offset (`0..65536`, fits in ARM64 `movz imm16`) into `IcSet[IC_SETS]` for an indirect
 /// branch at guest instruction `ip`. Pure integer immediate: zero baked host addresses and
 /// invariant under shifted-base AOT / static Mach-O reload.
 #[inline(always)]
@@ -2109,7 +2110,11 @@ pub(super) unsafe fn prep_block_with(
             edge.live[0]
         }
         Term::Jcc { target, fall, near, .. } => {
-            let t = if near && resolved_host(bc, target) { FALL } else { succ_need(bc, target, depth) };
+            let t = if near && resolved_host(bc, target) {
+                if host_kills_flags(target) { 0 } else { FALL }
+            } else {
+                succ_need(bc, target, depth)
+            };
             let f = succ_need(bc, fall, depth);
             edge.live = [t, f];
             edge.kill = [if resolved[0] { 0 } else { succ_lb_kill(bc, target, lazy) }, succ_lb_kill(bc, fall, lazy)];
@@ -2123,7 +2128,7 @@ pub(super) unsafe fn prep_block_with(
         }
         Term::Jmp(t) => {
             if is_chkstk(t) || resolved_host(bc, t) {
-                FALL
+                if host_kills_flags(t) { 0 } else { FALL }
             } else {
                 edge.live[0] = succ_need(bc, t, depth);
                 edge.kill[0] = if resolved[0] { 0 } else { succ_lb_kill(bc, t, lazy) };
@@ -2142,6 +2147,7 @@ pub(super) unsafe fn prep_block_with(
             }
         }
         Term::CallR | Term::CallM if flags_dead_mask() & 1 != 0 => 0,
+        Term::JmpM if flags_dead_mask() & 1 != 0 && const_slot_plain(&ops[k - 1]).is_some() => 0,
         Term::Ret if flags_dead_mask() & 2 != 0 => 0,
         _ => FALL,
     };
@@ -2164,6 +2170,7 @@ pub(in crate::emu) struct TrScratch {
     pub(super) ymm_colds: Vec<(usize, usize, u16)>,
     pub(super) tsc_colds: Vec<(usize, usize, bool)>,
     pub(super) sys_colds: Vec<SysCold>,
+    pub(super) atomic_colds: Vec<AtomicCold>,
     pub(super) ic_colds: Vec<IcCold>,
     pub(super) cold: Vec<ColdNan>,
     pub(super) x87_colds: Vec<X87Cold>,
@@ -2189,6 +2196,7 @@ impl TrScratch {
             ymm_colds: Vec::new(),
             tsc_colds: Vec::new(),
             sys_colds: Vec::new(),
+            atomic_colds: Vec::new(),
             ic_colds: Vec::new(),
             cold: Vec::new(),
             x87_colds: Vec::new(),
@@ -2223,6 +2231,7 @@ pub(super) fn new_tr<'a>(
     let mut ymm_colds = core::mem::take(&mut sc.ymm_colds);
     let tsc_colds = core::mem::take(&mut sc.tsc_colds);
     let mut sys_colds = core::mem::take(&mut sc.sys_colds);
+    let mut atomic_colds = core::mem::take(&mut sc.atomic_colds);
     let mut ic_colds = core::mem::take(&mut sc.ic_colds);
     let mut cold = core::mem::take(&mut sc.cold);
     let mut x87_colds = core::mem::take(&mut sc.x87_colds);
@@ -2240,6 +2249,7 @@ pub(super) fn new_tr<'a>(
     link_conds.clear();
     ymm_colds.clear();
     sys_colds.clear();
+    atomic_colds.clear();
     ic_colds.clear();
     cold.clear();
     x87_colds.clear();
@@ -2288,9 +2298,11 @@ pub(super) fn new_tr<'a>(
         xon: xmmreg_enabled(),
         xpin: xmm_pin_enabled(),
         ymm_clean: 0,
+        ymm_dirty_pending: 0,
         ymm_colds,
         tsc_colds,
         sys_colds,
+        atomic_colds,
         ic_colds,
         xmm_hi32_zero: 0,
         xmm_hi64_zero: 0,
@@ -2509,12 +2521,46 @@ pub(super) fn can_speculate_code(ip: u64) -> bool {
     win32_rt::kernel32::memory::is_speculative_read_safe(mapped, min_bytes)
 }
 
+/// Whether a Win64 ABI host-resolved target at `va` kills all arithmetic flags on entry.
+/// Excludes special-ABI helpers (`__chkstk`, routed DLL stack/regfile/stub helpers) that
+/// may observe or preserve caller flags.
+#[inline]
+fn host_kills_flags(va: u64) -> bool {
+    flags_dead_mask() & 1 != 0
+        && !is_chkstk(va)
+        && !crate::emu::is_routed_dll_chkstk(va)
+        && !crate::emu::is_routed_dll_stack_pos(va)
+        && !crate::emu::is_routed_regfile(va)
+        && !crate::emu::is_routed_dll_stub(va)
+}
+
 /// Flags that may be read at guest `ip` before being overwritten (conservative).
 unsafe fn succ_need(bc: *mut BlockCache, ip: u64, depth: u32) -> u8 {
+    let mut visited = [0u64; 8];
+    succ_need_rec(bc, ip, depth, &mut visited, 0)
+}
+
+unsafe fn succ_need_rec(
+    bc: *mut BlockCache,
+    ip: u64,
+    depth: u32,
+    visited: &mut [u64; 8],
+    vlen: usize,
+) -> u8 {
     use iced_x86::Mnemonic as M;
-    if !can_speculate_code(ip) || resolved_host(bc, ip) || mem::in_jit(to_mapped_addr(ip)) {
+    if resolved_host(bc, ip) {
+        return if host_kills_flags(ip) { 0 } else { FALL };
+    }
+    if !can_speculate_code(ip) || mem::in_jit(to_mapped_addr(ip)) {
         return FALL;
     }
+    if visited[..vlen].contains(&ip) {
+        return FALL;
+    }
+    if vlen < visited.len() {
+        visited[vlen] = ip;
+    }
+    let next_vlen = (vlen + 1).min(visited.len());
     let mut dummy = 0u64;
     let Ok((off, n)) = BlockCache::get(bc, ip, &mut dummy) else { return FALL };
     let mut need = 0u8;
@@ -2522,19 +2568,24 @@ unsafe fn succ_need(bc: *mut BlockCache, ip: u64, depth: u32) -> u8 {
     let lazy = flaglazy_enabled();
     for i in 0..n {
         let ins = &(&(*bc).arena)[off + i];
+        let op = &(&(*bc).ops)[off + i];
         need |= iced_bits(ins.rflags_read()) & !kill;
         let mut k = match ins.mnemonic() {
-            // Count may be zero (flags unchanged).
+            // Immediate shift decoded as `K_SHIFT_RI`/`K_SHIFT_MI` has a guaranteed non-zero
+            // masked count and overwrites all arithmetic flags in both interpreter and JIT.
+            M::Shl | M::Sal | M::Shr | M::Sar
+                if matches!(op.kind, fast::K_SHIFT_RI | fast::K_SHIFT_MI) =>
+            {
+                FALL
+            }
+            // Variable-count shifts/rotates may have count 0 (flags unchanged).
             M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror | M::Rcl | M::Rcr | M::Shld | M::Shrd => 0,
             _ => iced_bits(ins.rflags_written() | ins.rflags_cleared() | ins.rflags_set()),
         };
         // AW2_JIT_FLAGLAZY (per-edge flushes rely on exact kills): a fast op kills only what
         // the emulator's own model says it overwrites, in case it differs from iced's.
-        if lazy {
-            let op = &(&(*bc).ops)[off + i];
-            if op.kind != fast::K_INSN {
-                k &= op_flags(op).1;
-            }
+        if lazy && op.kind != fast::K_INSN {
+            k &= op_flags(op).1;
         }
         kill |= k;
         if kill & FALL == FALL {
@@ -2551,13 +2602,19 @@ unsafe fn succ_need(bc: *mut BlockCache, ip: u64, depth: u32) -> u8 {
             if dead {
                 return need;
             }
-            // AW2_JIT_FLAGLAZY: look through a direct jmp / jcc at the end of the block
-            // (values copied first: the recursion may grow the arena).
+            // AW2_JIT_FLAGLAZY: look through a direct jmp / jcc / straight-line fallthrough
+            // at the end of the block (values copied first: recursion may grow the arena).
             let (tgt, nxt) = (ins.near_branch_target(), ins.next_ip());
-            if depth > 1 && tgt != 0 {
+            if depth > 1 {
                 let rest = match flow {
-                    F::UnconditionalBranch => Some(succ_need(bc, tgt, depth - 1)),
-                    F::ConditionalBranch => Some(succ_need(bc, tgt, depth - 1) | succ_need(bc, nxt, depth - 1)),
+                    F::Next => Some(succ_need_rec(bc, nxt, depth - 1, visited, next_vlen)),
+                    F::UnconditionalBranch if tgt != 0 => {
+                        Some(succ_need_rec(bc, tgt, depth - 1, visited, next_vlen))
+                    }
+                    F::ConditionalBranch if tgt != 0 => Some(
+                        succ_need_rec(bc, tgt, depth - 1, visited, next_vlen)
+                            | succ_need_rec(bc, nxt, depth - 1, visited, next_vlen),
+                    ),
                     _ => None,
                 };
                 if let Some(r) = rest {

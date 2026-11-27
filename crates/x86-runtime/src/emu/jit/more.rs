@@ -176,6 +176,7 @@ impl Tr<'_> {
             lb: self.lb,
             xd: self.xd,
             pf: self.pf,
+            ymm_dirty_pending: self.ymm_dirty_pending,
         });
         self.a.str(32, T0, XCPU, OFF_MXCSR);
         // RMode: MXCSR RC bits 14:13 map 00->00 (RN), 01->10 (RM), 10->01 (RP), 11->11 (RZ).
@@ -205,6 +206,7 @@ impl Tr<'_> {
                 lb: self.lb,
                 xd: self.xd,
                 pf: self.pf,
+                ymm_dirty_pending: self.ymm_dirty_pending,
             });
             self.a.logic_rr(true, 1, T1, T1, T2, 0, 24);
         }
@@ -286,6 +288,7 @@ impl Tr<'_> {
             lb: self.lb,
             xd: self.xd,
             pf: self.pf,
+            ymm_dirty_pending: self.ymm_dirty_pending,
         });
         self.a.movz(false, g(0), crate::emu::cpuid::XCR0, 0);
         self.a.movz(true, g(2), 0, 0);
@@ -296,6 +299,7 @@ impl Tr<'_> {
     /// Native `FXSAVE*`/`FXRSTOR*`/`XSAVE*`/`XRSTOR*` via `Cpu::jx.sys_helpers.xstate`.
     fn emit_xstate(&mut self, k: usize, op: &FastOp) {
         self.flush_x87_top();
+        self.flush_ymm_dirty();
         self.flush_flags(FALL);
         self.fs.host = 0;
         self.flush_lb();
@@ -333,6 +337,7 @@ impl Tr<'_> {
             lb: self.lb,
             xd: 0,
             pf: PF_NONE,
+            ymm_dirty_pending: 0,
         });
         // Normal completion: reload caller-saved guest GPRs r10..r15 (`HG[10..16]`), XRAS, XMMs.
         for i in 5..8 {
@@ -371,6 +376,7 @@ impl Tr<'_> {
                     self.flush_flags(FALL);
                     self.flush_lb();
                     self.xstore(c.xd);
+                    self.flush_ymm_dirty_mask(c.ymm_dirty_pending);
                     if self.xpin {
                         self.a.bl_to(self.spill_xmm);
                     }
@@ -416,6 +422,7 @@ impl Tr<'_> {
                     self.flush_flags(self.live[c.k + 1]);
                     self.flush_lb();
                     self.xstore(c.xd);
+                    self.flush_ymm_dirty_mask(c.ymm_dirty_pending);
                     if self.bud_dec && n > c.k + 1 {
                         self.a.addsub_ri(true, false, false, XBUD, XBUD, (2 * (n - (c.k + 1))) as u32, false);
                     }
@@ -671,9 +678,8 @@ impl Tr<'_> {
                 }
                 self.emit_vaes_lane(sub, imm8);
                 if is_256 {
-                    let s1 = ((op.imm >> 8) as u32 & 15) * 16;
                     self.a.v_mov(6, 0);
-                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1);
+                    self.ysrc(0, (op.imm >> 8) as u8);
                     self.a.v_mov(1, 7);
                     self.emit_vaes_lane(sub, imm8);
                 }
@@ -686,20 +692,10 @@ impl Tr<'_> {
                     // Vcvtph2ps
                     let is_256 = (op.w & 3) == VM_V256;
                     if mem {
-                        let a = self.addr_into(op, XA);
                         if is_256 {
-                            if Self::chk_of(op) == Chk::Full {
-                                let se = self.side_exit_here(k);
-                                self.range_check_to(a, se);
-                            }
-                            self.a.ldr(64, T0, a, 0);
-                            self.a.ldr(64, T1, a, 8);
-                            if mem::tso() {
-                                self.a.dmb_ishld();
-                            }
-                            self.a.fmov_gf(true, 0, T0);
-                            self.a.v_ins_d(0, 1, T1);
+                            self.vec128_mem_op(k, op, true, 0);
                         } else {
+                            let a = self.addr_into(op, XA);
                             self.load(k, T0, a, 64, Self::chk_of(op));
                             self.a.fmov_gf(true, 0, T0);
                         }
@@ -719,10 +715,9 @@ impl Tr<'_> {
                 } else {
                     // Vcvtps2ph
                     let src_256 = op.w != 0;
-                    let s = (op.r1 as u32 & 15) * 16;
                     self.xsrc(0, op.r1);
                     if src_256 {
-                        self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s);
+                        self.ysrc(1, op.r1);
                     }
                     let imm = op.imm as u8;
                     if (imm & 4) != 0 {
@@ -792,15 +787,13 @@ impl Tr<'_> {
                 } else {
                     (2, 32, 4, 4)
                 };
-                let d_or_s = (op.r0 as u32 & 15) * 16;
-                let m_off = (op.r1 as u32 & 15) * 16;
                 let base_a = self.addr_into(op, T5);
                 if base_a != T5 {
                     self.a.mov_rr(true, T5, base_a);
                 }
                 self.xsrc(2, op.r1);
                 if is_256 {
-                    self.a.ldr(128, 3, XCPU, OFF_YMM_HI + m_off);
+                    self.ysrc(3, op.r1);
                 }
                 let halves = if is_256 { 2u32 } else { 1u32 };
                 if !is_store {
@@ -826,7 +819,7 @@ impl Tr<'_> {
                 } else {
                     self.xsrc(0, op.r0);
                     if is_256 {
-                        self.a.ldr(128, 1, XCPU, OFF_YMM_HI + d_or_s);
+                        self.ysrc(1, op.r0);
                     }
                     for h in 0..halves {
                         for lane in 0..per_lane {
@@ -1142,9 +1135,8 @@ impl Tr<'_> {
                 self.xsrc(0, (op.imm >> 8) as u8);
                 self.emit_gfni_lane(sub, imm8, 6);
                 if is_256 {
-                    let s1 = ((op.imm >> 8) as u32 & 15) * 16;
                     self.a.v_mov(6, 0);
-                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1);
+                    self.ysrc(0, (op.imm >> 8) as u8);
                     self.a.v_mov(1, 7);
                     self.emit_gfni_lane(sub, imm8, 7);
                 }
@@ -1158,11 +1150,9 @@ impl Tr<'_> {
                 self.xsrc(5, op.r0);
                 self.emit_vnni_lane(sub);
                 if is_256 {
-                    let d_off = (op.r0 as u32 & 15) * 16;
-                    let s1_off = ((op.imm >> 8) as u32 & 15) * 16;
                     self.a.v_mov(6, 0);
-                    self.a.ldr(128, 5, XCPU, OFF_YMM_HI + d_off);
-                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1_off);
+                    self.ysrc(5, op.r0);
+                    self.ysrc(0, (op.imm >> 8) as u8);
                     self.a.v_mov(1, 7);
                     self.emit_vnni_lane(sub);
                 }
@@ -1837,94 +1827,103 @@ impl Tr<'_> {
                     _ => self.a.swpal(wb, T1, T0, XA), // 13: xchg
                 }
                 if let Some(cross) = cross {
-                    let done = self.a.b();
-                    self.a.bind(cross);
-                    self.emit_shard_lock_acquire(XS, T5, T6);
-                    self.a.ldr(wb, T0, XA, 0);
-                    match sub {
-                        0 | 14 => self.a.addsub_rr(x, false, false, T2, T0, T1, 0),
-                        1 => self.a.addsub_rr(x, true, false, T2, T0, T1, 0),
-                        2 => self.a.logic_rr(x, 0, T2, T0, T1, 0, 0),
-                        3 => self.a.logic_rr(x, 1, T2, T0, T1, 0, 0),
-                        4 => self.a.logic_rr(x, 2, T2, T0, T1, 0, 0),
-                        5 => self.a.addsub_ri(x, false, false, T2, T0, 1, false),
-                        6 => self.a.addsub_ri(x, true, false, T2, T0, 1, false),
-                        7 => self.a.emit(sf(x) | 0x2A20_03E0 | T0 << 16 | 31 << 5 | T2),
-                        8 => self.a.addsub_rr(x, true, false, T2, ZR, T0, 0),
-                        _ => self.a.mov_rr(x, T2, T1),
-                    }
-                    self.a.str(wb, T2, XA, 0);
-                    self.a.stlr(32, ZR, XS);
-                    self.a.bind(done);
+                    self.atomic_colds.push(super::translate::AtomicCold {
+                        fix: cross,
+                        back: self.a.pos,
+                        sub,
+                        wb,
+                    });
                 }
                 self.a.dmb_ish();
                 if matches!(sub, 13 | 14) {
                     self.wr_gpr(op.r1, op.w, T0);
                 }
                 if !matches!(sub, 7 | 13) {
-                    if sub == 3 {
-                        self.a.logic_rr(x, 1, T2, T0, T1, 0, 0);
-                    } else if sub == 4 {
-                        self.a.logic_rr(x, 2, T2, T0, T1, 0, 0);
-                    }
-                    let sh = 64 - wb;
-                    if wb >= 32 {
-                        match sub {
-                            0 | 14 => self.a.addsub_rr(x, false, true, T5, T0, T1, 0),
-                            1 => self.a.addsub_rr(x, true, true, T5, T0, T1, 0),
-                            2 => self.a.logic_rr(x, 3, T5, T0, T1, 0, 0),
-                            3 | 4 => self.a.logic_rr(x, 3, ZR, T2, T2, 0, 0),
-                            5 => self.a.addsub_ri(x, false, true, T5, T0, 1, false),
-                            6 => self.a.addsub_ri(x, true, true, T5, T0, 1, false),
-                            _ => self.a.addsub_rr(x, true, true, T5, ZR, T0, 0),
-                        }
+                    let need_nzcv = if matches!(sub, 5 | 6) {
+                        la & (FZ | FS | FO) != 0
                     } else {
-                        self.a.lsl_i(true, T3, T0, sh);
-                        match sub {
-                            0 | 1 | 2 | 14 => {
-                                self.a.lsl_i(true, T4, T1, sh);
-                                if sub == 0 || sub == 14 {
-                                    self.a.addsub_rr(true, false, true, T5, T3, T4, 0);
-                                } else if sub == 1 {
-                                    self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
-                                } else {
-                                    self.a.logic_rr(true, 3, T5, T3, T4, 0, 0);
-                                }
-                            }
-                            3 | 4 => {
-                                self.a.lsl_i(true, T5, T2, sh);
-                                self.a.logic_rr(true, 3, ZR, T5, T5, 0, 0);
-                            }
-                            5 | 6 => {
-                                self.a.mov_imm(true, T4, 1u64 << sh);
-                                self.a.addsub_rr(true, sub == 6, true, T5, T3, T4, 0);
-                            }
-                            _ => self.a.addsub_rr(true, true, true, T5, ZR, T3, 0),
+                        la & FNZCV != 0
+                    };
+                    let need_pf = la & FP != 0;
+                    if need_nzcv || need_pf {
+                        if sub == 3 {
+                            self.a.logic_rr(x, 1, T2, T0, T1, 0, 0);
+                        } else if sub == 4 {
+                            self.a.logic_rr(x, 2, T2, T0, T1, 0, 0);
                         }
-                    }
-                    if la & FP != 0 {
-                        if matches!(sub, 3 | 4) {
-                            self.a.str(8, T2, XCPU, OFF_PFV);
-                        } else if wb >= 32 {
-                            self.a.str(8, T5, XCPU, OFF_PFV);
+                        let sh = 64 - wb;
+                        if wb >= 32 {
+                            match sub {
+                                0 | 14 => self.a.addsub_rr(x, false, need_nzcv, T5, T0, T1, 0),
+                                1 => self.a.addsub_rr(x, true, need_nzcv, T5, T0, T1, 0),
+                                2 => self.a.logic_rr(x, if need_nzcv { 3 } else { 0 }, T5, T0, T1, 0, 0),
+                                3 | 4 => {
+                                    if need_nzcv {
+                                        self.a.logic_rr(x, 3, ZR, T2, T2, 0, 0);
+                                    }
+                                }
+                                5 => self.a.addsub_ri(x, false, need_nzcv, T5, T0, 1, false),
+                                6 => self.a.addsub_ri(x, true, need_nzcv, T5, T0, 1, false),
+                                _ => self.a.addsub_rr(x, true, need_nzcv, T5, ZR, T0, 0),
+                            }
+                        } else if need_nzcv {
+                            self.a.lsl_i(true, T3, T0, sh);
+                            match sub {
+                                0 | 1 | 2 | 14 => {
+                                    self.a.lsl_i(true, T4, T1, sh);
+                                    if sub == 0 || sub == 14 {
+                                        self.a.addsub_rr(true, false, true, T5, T3, T4, 0);
+                                    } else if sub == 1 {
+                                        self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
+                                    } else {
+                                        self.a.logic_rr(true, 3, T5, T3, T4, 0, 0);
+                                    }
+                                }
+                                3 | 4 => {
+                                    self.a.lsl_i(true, T5, T2, sh);
+                                    self.a.logic_rr(true, 3, ZR, T5, T5, 0, 0);
+                                }
+                                5 | 6 => {
+                                    self.a.mov_imm(true, T4, 1u64 << sh);
+                                    self.a.addsub_rr(true, sub == 6, true, T5, T3, T4, 0);
+                                }
+                                _ => self.a.addsub_rr(true, true, true, T5, ZR, T3, 0),
+                            }
                         } else {
-                            self.a.lsr_i(true, T2, T5, sh);
-                            self.a.str(8, T2, XCPU, OFF_PFV);
+                            match sub {
+                                0 | 14 => self.a.addsub_rr(false, false, false, T5, T0, T1, 0),
+                                1 => self.a.addsub_rr(false, true, false, T5, T0, T1, 0),
+                                2 => self.a.logic_rr(false, 0, T5, T0, T1, 0, 0),
+                                3 | 4 => {}
+                                5 => self.a.addsub_ri(false, false, false, T5, T0, 1, false),
+                                6 => self.a.addsub_ri(false, true, false, T5, T0, 1, false),
+                                _ => self.a.addsub_rr(false, true, false, T5, ZR, T0, 0),
+                            }
+                        }
+                        if need_pf {
+                            if matches!(sub, 3 | 4) {
+                                self.a.str(8, T2, XCPU, OFF_PFV);
+                            } else if wb >= 32 || !need_nzcv {
+                                self.a.str(8, T5, XCPU, OFF_PFV);
+                            } else {
+                                self.a.lsr_i(true, T2, T5, sh);
+                                self.a.str(8, T2, XCPU, OFF_PFV);
+                            }
                         }
                     }
                     if matches!(sub, 5 | 6) {
                         self.fs.mem &= !(FZ | FS | FO | FP);
-                        if la & FP != 0 {
+                        if need_pf {
                             self.fs.mem |= FP;
                         }
-                        self.fs.host = la & (FZ | FS | FO);
+                        self.fs.host = if need_nzcv { la & (FZ | FS | FO) } else { 0 };
                         self.fs.src = Src::IncDec;
                     } else {
                         self.fs.mem &= !FALL;
-                        if la & FP != 0 {
+                        if need_pf {
                             self.fs.mem |= FP;
                         }
-                        self.fs.host = la & FNZCV;
+                        self.fs.host = if need_nzcv { la & FNZCV } else { 0 };
                         self.fs.src = match sub {
                             0 | 14 => Src::Add,
                             1 | 8 => Src::Sub,
@@ -2116,6 +2115,35 @@ impl Tr<'_> {
                 self.fs.mem |= FZ;
             }
         }
+    }
+
+    /// Out-of-line split-lock spinlock slow paths for `K_ATOMIC` ops crossing a 16-byte granule.
+    pub(super) fn emit_atomic_colds(&mut self) {
+        let mut colds = core::mem::take(&mut self.atomic_colds);
+        for c in &colds {
+            self.a.bind(c.fix);
+            let x = c.wb == 64;
+            self.emit_shard_lock_acquire(XS, T5, T6);
+            self.a.ldr(c.wb, T0, XA, 0);
+            match c.sub {
+                0 | 14 => self.a.addsub_rr(x, false, false, T2, T0, T1, 0),
+                1 => self.a.addsub_rr(x, true, false, T2, T0, T1, 0),
+                2 => self.a.logic_rr(x, 0, T2, T0, T1, 0, 0),
+                3 => self.a.logic_rr(x, 1, T2, T0, T1, 0, 0),
+                4 => self.a.logic_rr(x, 2, T2, T0, T1, 0, 0),
+                5 => self.a.addsub_ri(x, false, false, T2, T0, 1, false),
+                6 => self.a.addsub_ri(x, true, false, T2, T0, 1, false),
+                7 => self.a.emit(sf(x) | 0x2A20_03E0 | T0 << 16 | 31 << 5 | T2),
+                8 => self.a.addsub_rr(x, true, false, T2, ZR, T0, 0),
+                _ => self.a.mov_rr(x, T2, T1),
+            }
+            self.a.str(c.wb, T2, XA, 0);
+            self.a.stlr(32, ZR, XS);
+            let back = self.a.b();
+            self.a.patch(back, c.back);
+        }
+        colds.clear();
+        self.atomic_colds = colds;
     }
 
     pub(super) fn emit_pcmpstr_op(&mut self, k: usize, op: &FastOp) {
