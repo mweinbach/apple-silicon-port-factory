@@ -2147,3 +2147,64 @@ fn bench_slice_rejects_list_recorded_in_setup_prefix() {
     assert!(err.to_string().contains("recorded before frame_start"), "{err}");
 }
 
+#[test]
+fn metal_backend_rejects_duplicate_resource_id_and_stale_target_view() {
+    if !metal_ready() {
+        return;
+    }
+    use crate::metal_backend::MetalBackend;
+    use d3d12_metal::metal::descriptor::heap_kind;
+    use d3d12_metal::types::{dim, heap_type, resource_flags, CommandQueueDesc, DescriptorHeapDesc, HeapProperties, ResourceDesc};
+
+    fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    }
+
+    let qd = CommandQueueDesc { Type: 0, ..Default::default() };
+    let hp_def = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+    let rdesc = ResourceDesc {
+        Dimension: dim::TEXTURE2D,
+        Width: 32,
+        Height: 32,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: 28,
+        SampleCount: 1,
+        Flags: resource_flags::ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let rtv_hd = DescriptorHeapDesc { Type: heap_kind::RTV, NumDescriptors: 1, Flags: 0, NodeMask: 0 };
+    let rtv_cpu = 0x7f20_0000u64;
+
+    let mut w = Writer::new(Vec::new()).unwrap();
+    w.write(&Call::CreateDevice { device: 1, feature_level: 0xc200 }, 0).unwrap();
+    w.write(&Call::CreateCommandQueue { device: 1, queue: 2, desc: bytes_of(&qd) }, 0).unwrap();
+    w.write(&Call::CreateCommandAllocator { device: 1, allocator: 3, list_type: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommandList { device: 1, list: 4, list_type: 0, allocator: 3, initial_pso: 0 }, 0).unwrap();
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 10, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&rdesc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    w.write(&Call::CreateDescriptorHeap { device: 1, heap: 20, desc: bytes_of(&rtv_hd), cpu_start: rtv_cpu, gpu_start: 0 }, 0).unwrap();
+    w.write(&Call::CreateRenderTargetView { resource: 10, desc: None, dest: rtv_cpu }, 0).unwrap();
+    // 1. Duplicate still-live resource ID 10 must be rejected without dropping the original resource.
+    w.write(&Call::CreateCommittedResource { device: 1, resource: 10, heap_properties: bytes_of(&hp_def), heap_flags: 0, desc: bytes_of(&rdesc), initial_state: 0, clear_value: None, gpu_va: 0 }, 0).unwrap();
+    // 2. Release resource 10, then attempt to ClearRenderTargetView on the now-stale RTV handle:
+    //    must fail cleanly in resolve_target_view rather than dereferencing a non-live Resource*.
+    w.write(&Call::Release { object: 10 }, 0).unwrap();
+    w.write(&Call::ClearRenderTargetView { list: 4, rtv: rtv_cpu, color: [1.0, 0.0, 0.0, 1.0], rects: &[] }, 0).unwrap();
+    w.write(&Call::Close { list: 4 }, 0).unwrap();
+
+    let trace = w.into_inner();
+    let mut backend = MetalBackend::new().unwrap();
+    let rep = replay::replay(&trace, &mut backend, None, 100).unwrap();
+    assert_eq!(rep.failed.total, 2, "{rep}");
+    assert!(
+        rep.failed.items.iter().any(|(_, m)| m.contains("duplicate still-live resource id")),
+        "{:?}",
+        rep.failed.items
+    );
+    assert!(
+        rep.failed.items.iter().any(|(_, m)| m.contains("no longer live")),
+        "{:?}",
+        rep.failed.items
+    );
+}
+

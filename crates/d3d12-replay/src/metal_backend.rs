@@ -684,12 +684,21 @@ impl MetalBackend {
             .targets
             .get(idx)
             .ok_or_else(|| format!("target view slot {idx} out of range"))?;
+        if tv.resource == 0 {
+            return Ok((tv, None));
+        }
         let res = self
             .resources
             .values()
             .find(|r| Arc::as_ptr(r) as usize == tv.resource)
-            .cloned();
-        Ok((tv, res))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "RTV/DSV handle {rec_cpu:#x} references resource pointer {:#x} which is no longer live",
+                    tv.resource
+                )
+            })?;
+        Ok((tv, Some(res)))
     }
 
     fn resolve_root_sig(&self, id: u64, embedded_shader: &[u8]) -> Result<Arc<RootSignature>, String> {
@@ -860,6 +869,9 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreateHeap { heap, desc, .. } => {
+                if self.heaps.contains_key(heap) {
+                    return Err(format!("CreateHeap: duplicate still-live heap id {heap:#x}"));
+                }
                 let d = read_copy::<HeapDesc>(desc)?;
                 let h = Heap::new(&d, &format!("replay heap {heap:#x}"))
                     .map_err(|e| format!("Heap::new: {e:?}"))?;
@@ -867,6 +879,9 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreateCommittedResource { resource, heap_properties, desc, gpu_va, .. } => {
+                if self.resources.contains_key(resource) {
+                    return Err(format!("CreateCommittedResource: duplicate still-live resource id {resource:#x}"));
+                }
                 let hp = if heap_properties.len() >= std::mem::size_of::<HeapProperties>() {
                     read_copy::<HeapProperties>(&heap_properties[..std::mem::size_of::<HeapProperties>()])?
                 } else if heap_properties.len() >= 4 {
@@ -887,6 +902,9 @@ impl Backend for MetalBackend {
                 Ok(Handled::Done)
             }
             Call::CreatePlacedResource { resource, heap, offset, desc, gpu_va, .. } => {
+                if self.resources.contains_key(resource) {
+                    return Err(format!("CreatePlacedResource: duplicate still-live resource id {resource:#x}"));
+                }
                 let h = self
                     .heaps
                     .get(heap)
@@ -1981,7 +1999,15 @@ impl Backend for MetalBackend {
                     .get(*index as usize)
                     .cloned()
                     .ok_or_else(|| format!("swapchain buffer index {index} out of range ({})", sc.buffers.len()))?;
-                self.resources.insert(*resource, buf);
+                if let Some(existing) = self.resources.get(resource) {
+                    if !Arc::ptr_eq(existing, &buf) {
+                        return Err(format!(
+                            "GetSwapChainBuffer: duplicate still-live resource id {resource:#x}"
+                        ));
+                    }
+                } else {
+                    self.resources.insert(*resource, buf);
+                }
                 Ok(Handled::Done)
             }
             Call::ResizeBuffers { swapchain, count, width, height, format, .. } => {
