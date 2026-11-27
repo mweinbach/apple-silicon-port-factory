@@ -5,14 +5,18 @@ name: GPU, Audio & E2E (Apple Silicon)
 #
 # Security model (public repo + self-hosted runner):
 #   - NEVER triggered automatically on pull_request opened/reopened/synchronize.
+#   - Uses `pull_request_target` (`types: [labeled]`) rather than `pull_request`
+#     so GitHub ALWAYS executes this workflow definition from the trusted base
+#     branch (`main`) — a fork PR cannot modify this file to remove the approval
+#     gate, environment protection, or SHA check.
 #   - Triggered ONLY on:
 #       1. `push` to `main` (already reviewed & merged),
 #       2. `workflow_dispatch` (manual maintainer invocation),
-#       3. `pull_request` `labeled` with the `gpu-ci` label, which first passes
-#          through the `approve-pr-gpu` gate job protected by the `gpu-ci-pr`
-#          GitHub Environment (configured with runner-owner Required Reviewers)
-#          and binds approval to the exact `pull_request.head.sha` before any
-#          code executes on the self-hosted Mac.
+#       3. `pull_request_target` `labeled` with the `gpu-ci` label, which first
+#          passes through the trusted `approve-pr-gpu` gate job protected by the
+#          `gpu-ci-pr` GitHub Environment (configured with runner-owner Required
+#          Reviewers) and binds approval to the exact `pull_request.head.sha`
+#          before any PR code is checked out on the self-hosted Mac.
 #   - Minimal permissions (`contents: read`) and `persist-credentials: false` on checkout.
 #   - See `docs/GPU_CI.md` for runner registration, `gpu-ci-pr` environment protection,
 #     required labels, and host setup.
@@ -26,7 +30,7 @@ on:
         description: "Run cargo opsdb -- bench after GPU/E2E tests"
         type: boolean
         default: true
-  pull_request:
+  pull_request_target:
     types: [labeled]
 
 permissions:
@@ -43,18 +47,19 @@ env:
   MTL_DEBUG_LAYER: "1"
 
 jobs:
-  # Protected approval gate for pull requests: runs on a GitHub-hosted runner (never the
+  # Protected approval gate for pull requests: executed strictly from the trusted base
+  # branch (`main`) via `pull_request_target` on a GitHub-hosted runner (never the
   # self-hosted Mac) inside the `gpu-ci-pr` protected Environment so a runner owner must
   # explicitly approve the exact `pull_request.head.sha` before the self-hosted job starts.
-  # This prevents accounts that only hold label/triage permissions from executing code on
-  # the self-hosted runner host.
+  # Because `pull_request_target` ignores workflow edits from the PR branch, a fork PR
+  # cannot remove this gate, its environment protection, or the SHA check.
   approve-pr-gpu:
     name: Approve PR head SHA for self-hosted GPU CI
     runs-on: ubuntu-latest
     environment: gpu-ci-pr
     timeout-minutes: 5
     if: >-
-      github.event_name == 'pull_request' &&
+      github.event_name == 'pull_request_target' &&
       github.event.action == 'labeled' &&
       github.event.label.name == 'gpu-ci'
     outputs:
@@ -78,7 +83,7 @@ jobs:
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
         github.event_name == 'workflow_dispatch' ||
         (
-          github.event_name == 'pull_request' &&
+          github.event_name == 'pull_request_target' &&
           needs.approve-pr-gpu.result == 'success' &&
           needs.approve-pr-gpu.outputs.head_sha != '' &&
           needs.approve-pr-gpu.outputs.head_sha == github.event.pull_request.head.sha
@@ -87,11 +92,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && needs.approve-pr-gpu.outputs.head_sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
           persist-credentials: false
 
       - name: Verify checked-out commit matches approved SHA
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         env:
           APPROVED_SHA: ${{ needs.approve-pr-gpu.outputs.head_sha }}
         run: |

@@ -118,11 +118,24 @@ enum LivePso {
     Compute(Arc<ComputePipeline>),
 }
 
+struct PendingIndirectReloc {
+    sig: LiveCmdSig,
+    max_count: u32,
+    src_res_id: u64,
+    src_offset: u64,
+    args_len: usize,
+    scratch: Arc<Resource>,
+}
+
 struct LiveCommandList {
     cl: CommandList,
     alloc_id: u64,
     initial_pso: u64,
     open_ts_slot: Option<u32>,
+    /// Indirect argument buffers with embedded GPU VAs that must be refreshed from their
+    /// source resource right before `ExecuteCommandLists` so submission-time `WriteResource`
+    /// uploads (`tr::sync_uploads`) are reflected in the relocated scratch buffer.
+    pending_indirect_relocs: Vec<PendingIndirectReloc>,
 }
 
 #[derive(Clone)]
@@ -418,6 +431,7 @@ impl MetalBackend {
                 }
             }
             l.open_ts_slot = ts_slot;
+            l.pending_indirect_relocs.clear();
             if let Some(p) = pso {
                 bind_pso(&mut l.cl, p);
             }
@@ -498,6 +512,17 @@ impl MetalBackend {
             Resource::new_committed(&desc, &hp, MTLTextureUsage::empty(), "replay relocated indirect args")
                 .map_err(|e| format!("relocated indirect args buffer: {e:?}"))?,
         );
+        self.write_relocated_indirect_args(&scratch, sig, max_count, src_bytes)?;
+        Ok(scratch)
+    }
+
+    fn write_relocated_indirect_args(
+        &self,
+        scratch: &Resource,
+        sig: &LiveCmdSig,
+        max_count: u32,
+        src_bytes: &[u8],
+    ) -> Result<(), String> {
         let ptr = scratch
             .cpu_ptr()
             .ok_or("relocated indirect args upload buffer missing CPU pointer")?;
@@ -514,8 +539,8 @@ impl MetalBackend {
                 }
             }
         }
-        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, len) };
-        Ok(scratch)
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, buf.len()) };
+        Ok(())
     }
 
     fn find_cpu_slot(&self, rec_cpu: u64) -> Option<(u64, usize)> {
@@ -683,7 +708,13 @@ impl Backend for MetalBackend {
                 }
                 self.lists.insert(
                     *list,
-                    LiveCommandList { cl, alloc_id: *allocator, initial_pso: *initial_pso, open_ts_slot },
+                    LiveCommandList {
+                        cl,
+                        alloc_id: *allocator,
+                        initial_pso: *initial_pso,
+                        open_ts_slot,
+                        pending_indirect_relocs: Vec::new(),
+                    },
                 );
                 Ok(Handled::Done)
             }
@@ -1070,6 +1101,7 @@ impl Backend for MetalBackend {
                     }
                 }
                 l.open_ts_slot = open_ts_slot;
+                l.pending_indirect_relocs.clear();
                 if let Some(p) = live_pso {
                     bind_pso(&mut l.cl, p);
                 }
@@ -1543,6 +1575,16 @@ impl Backend for MetalBackend {
                     .get_mut(list)
                     .ok_or_else(|| format!("unknown command list {list:#x}"))?;
                 l.cl.execute_indirect(&sig.layout, *max_count, live_args_va, args_cpu, count_va)?;
+                if let Some(scratch) = relocated_scratch {
+                    l.pending_indirect_relocs.push(PendingIndirectReloc {
+                        sig,
+                        max_count: *max_count,
+                        src_res_id: *args,
+                        src_offset: *args_offset,
+                        args_len,
+                        scratch,
+                    });
+                }
                 Ok(Handled::Done)
             }
             Call::CopyBufferRegion { list, dst, dst_offset, src, src_offset, size } => {
@@ -1694,6 +1736,23 @@ impl Backend for MetalBackend {
                         .remove(&id)
                         .ok_or_else(|| format!("ExecuteCommandLists unknown or duplicate list {id:#x}"))?;
                     taken.push((id, l));
+                }
+                // Refresh any relocated indirect argument scratch buffers from their source
+                // upload buffers right before submission so captured `WriteResource` updates
+                // emitted via `tr::sync_uploads()` after `ExecuteIndirect` are reflected.
+                for (_, l) in &taken {
+                    for reloc in &l.pending_indirect_relocs {
+                        if let Some(src_res) = self.resources.get(&reloc.src_res_id) {
+                            if let Some(src_bytes) = src_res.shared_slice(reloc.src_offset, reloc.args_len) {
+                                self.write_relocated_indirect_args(
+                                    &reloc.scratch,
+                                    &reloc.sig,
+                                    reloc.max_count,
+                                    src_bytes,
+                                )?;
+                            }
+                        }
+                    }
                 }
                 {
                     let mut refs: Vec<&mut CommandList> = taken.iter_mut().map(|(_, l)| &mut l.cl).collect();

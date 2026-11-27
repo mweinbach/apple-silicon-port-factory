@@ -302,10 +302,19 @@ pub(crate) fn run_bench_with_timer_capacity(
     let objs = Objects::default();
     let mut failures = Vec::new();
 
-    // 1. Setup prefix (run once, untimed).
+    // 1. Setup prefix (run once, untimed). Reject unsupported skipped calls honestly
+    //    so `--bench` never reports timings for an incomplete workload.
     for rec in &records[..frame_start] {
-        if let Err(e) = backend.call(rec, &objs) {
-            failures.push(format!("setup #{} {}: {e}", rec.index, rec.call.name()));
+        match backend.call(rec, &objs) {
+            Ok(Handled::Done) => {}
+            Ok(Handled::Skipped) => {
+                anyhow::bail!(
+                    "cannot benchmark incomplete workload: unsupported setup call #{} {} was skipped by metal backend",
+                    rec.index,
+                    rec.call.name()
+                );
+            }
+            Err(e) => failures.push(format!("setup #{} {}: {e}", rec.index, rec.call.name())),
         }
     }
     backend.wait_all_idle();
@@ -326,7 +335,14 @@ pub(crate) fn run_bench_with_timer_capacity(
                 .map_err(|e| anyhow::anyhow!("prepare warmup {iter}: {e}"))?;
             for rec in &records[frame_start..frame_end] {
                 match backend.call(rec, &objs) {
-                    Ok(Handled::Done | Handled::Skipped) => {}
+                    Ok(Handled::Done) => {}
+                    Ok(Handled::Skipped) => {
+                        anyhow::bail!(
+                            "cannot benchmark incomplete workload: unsupported frame call #{} {} was skipped by metal backend",
+                            rec.index,
+                            rec.call.name()
+                        );
+                    }
                     Err(e) => failures.push(format!("warmup {iter} #{} {}: {e}", rec.index, rec.call.name())),
                 }
             }
@@ -364,7 +380,14 @@ pub(crate) fn run_bench_with_timer_capacity(
             let t0 = Instant::now();
             for rec in &records[frame_start..frame_end] {
                 match backend.call(rec, &objs) {
-                    Ok(Handled::Done | Handled::Skipped) => {}
+                    Ok(Handled::Done) => {}
+                    Ok(Handled::Skipped) => {
+                        anyhow::bail!(
+                            "cannot benchmark incomplete workload: unsupported frame call #{} {} was skipped by metal backend",
+                            rec.index,
+                            rec.call.name()
+                        );
+                    }
                     Err(e) => failures.push(format!("iter {iter} #{} {}: {e}", rec.index, rec.call.name())),
                 }
             }

@@ -18,10 +18,11 @@ pull requests:
 |---|---|---|
 | `push` to `main` | Yes | Already reviewed and merged to `main`. |
 | `workflow_dispatch` | Yes | Explicit manual run by a maintainer (with optional `run_bench` input). |
-| `pull_request` (`types: [labeled]`) with label `gpu-ci` | Only after `gpu-ci-pr` approval | Applying `gpu-ci` starts an `ubuntu-latest` gate job (`approve-pr-gpu`) behind the protected GitHub Environment `gpu-ci-pr`. A runner owner configured as a Required Reviewer must explicitly approve the run before the self-hosted Mac job executes, and checkout is cryptographically pinned to the approved `pull_request.head.sha`. `opened`, `reopened`, and `synchronize` are excluded, so pushing new commits never re-triggers the workflow. |
-| Any other `pull_request` event | **No** | Untrusted code never reaches the self-hosted runner. |
+| `pull_request_target` (`types: [labeled]`) with label `gpu-ci` | Only after `gpu-ci-pr` approval | GitHub executes `gpu-e2e.yml` strictly from the trusted base branch (`main`), so a fork PR cannot edit the workflow to bypass the gate. Applying `gpu-ci` starts the `ubuntu-latest` gate job (`approve-pr-gpu`) behind the protected GitHub Environment `gpu-ci-pr`. A runner owner configured as a Required Reviewer must explicitly approve the run before the self-hosted Mac job executes, and checkout is cryptographically pinned to the approved `pull_request.head.sha`. `opened`, `reopened`, and `synchronize` are excluded, so pushing new commits never re-triggers the workflow. |
+| Any other `pull_request` / `pull_request_target` event | **No** | Untrusted code never reaches the self-hosted runner. |
 
 Additional hardening in `gpu-e2e.yml`:
+- Trusted base-branch workflow orchestration (`pull_request_target`): PR branches cannot modify `approve-pr-gpu`, `environment: gpu-ci-pr`, or the SHA checks.
 - Protected GitHub Environment `gpu-ci-pr` with Required Reviewers (runner owner(s)) gates all PR runs on `ubuntu-latest` before any checkout occurs on the self-hosted Mac — label/triage permission alone cannot execute code on the runner host.
 - PR checkouts are pinned to the exact approved `pull_request.head.sha` and verified with `git rev-parse HEAD` before running any build or test command.
 - Minimal top-level `permissions: { contents: read }`.
