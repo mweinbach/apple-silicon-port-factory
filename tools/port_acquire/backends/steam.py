@@ -59,6 +59,7 @@ from ..backend import (
     SearchMatch,
     StoreBackend,
     UninstallResult,
+    UnsupportedOperationError,
     UpdateResult,
     VerifyResult,
     fuzzy_search_owned,
@@ -111,6 +112,59 @@ _LOGIN_FAIL_PATTERNS = re.compile(
     r"password:|Logon\s+Failure|Access\s+Denied|No\s+connection)",
     re.I,
 )
+
+
+def _split_windows_args(raw: str) -> list[str]:
+    """Parse a Windows-style command-line argument string preserving quoted values.
+
+    Handles double-quoted substrings (e.g. `-config "My Settings.ini"` ->
+    `['-config', 'My Settings.ini']`) and escaped quotes (`\\"`), while keeping
+    Windows path backslashes (e.g. `C:\\Games\\Foo`) intact.
+    """
+    args: list[str] = []
+    cur: list[str] = []
+    in_quotes = False
+    has_token = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "\\":
+            # Count consecutive backslashes before a quote (Windows CommandLineToArgvW rule)
+            bs = 0
+            while i + bs < n and raw[i + bs] == "\\":
+                bs += 1
+            if i + bs < n and raw[i + bs] == '"':
+                cur.append("\\" * (bs // 2))
+                if bs % 2 == 1:
+                    cur.append('"')
+                    has_token = True
+                    i += bs + 1
+                    continue
+                i += bs
+                continue
+            cur.append("\\" * bs)
+            has_token = True
+            i += bs
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            has_token = True
+            i += 1
+            continue
+        if ch.isspace() and not in_quotes:
+            if has_token or cur:
+                args.append("".join(cur))
+                cur = []
+                has_token = False
+            i += 1
+            continue
+        cur.append(ch)
+        has_token = True
+        i += 1
+    if has_token or cur:
+        args.append("".join(cur))
+    return args
 
 
 def _redact_cmd(cmd: list[str]) -> list[str]:
@@ -343,6 +397,7 @@ class SteamBackend(StoreBackend):
     def _save_session(self, account_name: str, steam_id64: str | None = None) -> None:
         # Security invariant: ONLY account name and public SteamID64 are ever saved.
         payload: dict[str, Any] = {
+            "logged_out": False,
             "account_name": account_name,
             "steam_id64": steam_id64,
             "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -350,14 +405,22 @@ class SteamBackend(StoreBackend):
         _atomic_write_json(self._session_file(), payload)
 
     def _clear_session(self) -> None:
-        sf = self._session_file()
-        if sf.exists():
-            try:
-                sf.unlink()
-            except OSError:
-                pass
+        # Persist an explicit logged-out sentinel so subsequent `status`, `list-owned`,
+        # and `download` calls do not silently rediscover an account from `loginusers.vdf`.
+        payload: dict[str, Any] = {
+            "logged_out": True,
+            "account_name": None,
+            "steam_id64": None,
+            "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        _atomic_write_json(self._session_file(), payload)
 
-    def _resolve_account_info(self, explicit_username: str | None = None) -> tuple[str | None, str | None]:
+    def _resolve_account_info(
+        self,
+        explicit_username: str | None = None,
+        *,
+        ignore_logged_out: bool = False,
+    ) -> tuple[str | None, str | None]:
         """Return `(account_name, steam_id64)` without ever touching passwords or tokens."""
         loginusers = parse_loginusers_vdf(self.steam_home() / "config" / "loginusers.vdf")
 
@@ -371,11 +434,14 @@ class SteamBackend(StoreBackend):
             acct = explicit_username.strip()
             return acct, _find_id64(acct)
 
+        sess = self._load_session()
+        if not ignore_logged_out and bool(sess.get("logged_out")):
+            return None, None
+
         env_user = os.environ.get("PORT_STEAM_USER", "").strip()
         if env_user:
             return env_user, _find_id64(env_user)
 
-        sess = self._load_session()
         sess_acct = str(sess.get("account_name") or "").strip()
         if sess_acct:
             sess_id = str(sess.get("steam_id64") or "").strip() or _find_id64(sess_acct)
@@ -526,7 +592,10 @@ class SteamBackend(StoreBackend):
                 backend_version=self._backend_version_label(),
             )
 
-        account_name, steam_id64 = self._resolve_account_info(username)
+        account_name, steam_id64 = self._resolve_account_info(
+            username,
+            ignore_logged_out=import_existing,
+        )
 
         if import_existing:
             if not account_name:
@@ -598,7 +667,7 @@ class SteamBackend(StoreBackend):
                 backend_version=version,
             )
 
-        if offline or scmd is None:
+        if offline or not self._use_steamcmd_for_download():
             has_token = has_cached_connect_token(
                 self.steam_home() / "config" / "config.vdf",
                 account_name=account_name,
@@ -1047,7 +1116,7 @@ class SteamBackend(StoreBackend):
             if osarch == "64":
                 priority -= 1
             raw_args = str(vdf_get(entry, "arguments", default="") or "").strip()
-            args_list = raw_args.split() if raw_args else []
+            args_list = _split_windows_args(raw_args) if raw_args else []
             workdir = str(vdf_get(entry, "workingdir", default="") or "").strip().replace("\\", "/") or None
             sort_idx = int(key) if str(key).isdigit() else 999
             candidates.append((priority * 1000 + sort_idx, exe, args_list, workdir))
@@ -1301,14 +1370,15 @@ class SteamBackend(StoreBackend):
 
     def download(self, options: DownloadOptions) -> DownloadResult:
         account_name, _ = self._require_logged_in_account()
-        resolved_id = self._resolve_app_id(options.app_id, offline=False)
+        use_steamcmd = self._use_steamcmd_for_download()
+        resolved_id = self._resolve_app_id(options.app_id, offline=not use_steamcmd)
         dest = options.dest.expanduser().resolve()
         dest.mkdir(parents=True, exist_ok=True)
         branch = (options.branch or "public").strip()
 
-        # Fetch metadata before download (best-effort) so we know title, depots, DLCs, redists.
+        # Fetch metadata before download (best-effort) when steamcmd is runnable.
         info: GameInfo | None = None
-        if self.find_steamcmd() is not None:
+        if use_steamcmd:
             try:
                 info = self.info(resolved_id, platform=options.platform, offline=False)
             except AcquireError:
@@ -1318,7 +1388,7 @@ class SteamBackend(StoreBackend):
         downloaded_dlcs: list[str] = []
         downloaded_redists: list[str] = []
 
-        if self._use_steamcmd_for_download():
+        if use_steamcmd:
             args: list[str] = [
                 "+@sSteamCmdForcePlatformType",
                 options.platform,
@@ -1558,8 +1628,9 @@ class SteamBackend(StoreBackend):
         check_only: bool = False,
         with_dlcs: bool = False,
     ) -> UpdateResult:
-        account_name, _ = self._require_logged_in_account()
-        resolved_id = self._resolve_app_id(app_id, offline=False)
+        self._require_logged_in_account()
+        use_steamcmd = self._use_steamcmd_for_download()
+        resolved_id = self._resolve_app_id(app_id, offline=not use_steamcmd)
         entry = self._get_installed_entry(resolved_id)
         if not entry or not entry.get("install_path"):
             raise AppNotFoundError(
@@ -1570,40 +1641,47 @@ class SteamBackend(StoreBackend):
         branch = str(entry.get("branch") or "public")
         old_version = str(entry.get("build_id") or "") or None
 
-        info = self.info(resolved_id, platform=platform, offline=False)
-        remote_build = info.version
-        for b in info.branches:
-            if b.get("name") == branch and b.get("build_id"):
-                remote_build = str(b["build_id"])
-                break
+        remote_build: str | None = None
+        if use_steamcmd:
+            info = self.info(resolved_id, platform=platform, offline=False)
+            remote_build = info.version
+            for b in info.branches:
+                if b.get("name") == branch and b.get("build_id"):
+                    remote_build = str(b["build_id"])
+                    break
 
-        update_available = bool(remote_build and remote_build != old_version)
-        if check_only:
-            return UpdateResult(
-                store=self.name,
-                app_id=resolved_id,
-                updated=False,
-                update_available=update_available,
-                old_version=old_version,
-                new_version=remote_build,
-                install_path=str(install_path),
-                message=(
-                    f"Update available ({old_version or 'unknown'} -> {remote_build})"
-                    if update_available
-                    else "Already up to date"
-                ),
-            )
+            update_available = bool(remote_build and remote_build != old_version)
+            if check_only:
+                return UpdateResult(
+                    store=self.name,
+                    app_id=resolved_id,
+                    updated=False,
+                    update_available=update_available,
+                    old_version=old_version,
+                    new_version=remote_build,
+                    install_path=str(install_path),
+                    message=(
+                        f"Update available ({old_version or 'unknown'} -> {remote_build})"
+                        if update_available
+                        else "Already up to date"
+                    ),
+                )
 
-        if not update_available and old_version is not None:
-            return UpdateResult(
-                store=self.name,
-                app_id=resolved_id,
-                updated=False,
-                update_available=False,
-                old_version=old_version,
-                new_version=remote_build,
-                install_path=str(install_path),
-                message="Already up to date",
+            if not update_available and old_version is not None:
+                return UpdateResult(
+                    store=self.name,
+                    app_id=resolved_id,
+                    updated=False,
+                    update_available=False,
+                    old_version=old_version,
+                    new_version=remote_build,
+                    install_path=str(install_path),
+                    message="Already up to date",
+                )
+        elif check_only:
+            raise UnsupportedOperationError(
+                "Remote update checks (--check-only) require `steamcmd` (and Rosetta 2 on Apple Silicon); "
+                "run `update` without `--check-only` to update in-place via the DepotDownloader fallback."
             )
 
         dl_res = self.download(
@@ -1624,7 +1702,11 @@ class SteamBackend(StoreBackend):
             old_version=old_version,
             new_version=dl_res.version or remote_build,
             install_path=dl_res.install_path,
-            message=f"Updated {resolved_id} on branch '{branch}'",
+            message=(
+                f"Updated {resolved_id} on branch '{branch}'"
+                if use_steamcmd
+                else f"Updated {resolved_id} on branch '{branch}' via DepotDownloader fallback"
+            ),
         )
 
     def uninstall(

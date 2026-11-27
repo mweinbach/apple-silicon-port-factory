@@ -24,6 +24,7 @@ if str(_TOOLS_DIR) not in sys.path:
 from port_acquire import (  # noqa: E402
     AuthRequiredError,
     DownloadOptions,
+    UnsupportedOperationError,
     available_backends,
     get_backend,
     read_package_manifest,
@@ -35,7 +36,7 @@ from port_acquire.backends._steam_vdf import (  # noqa: E402
     parse_loginusers_vdf,
     parse_vdf,
 )
-from port_acquire.backends.steam import SteamBackend, _redact_cmd  # noqa: E402
+from port_acquire.backends.steam import SteamBackend, _redact_cmd, _split_windows_args  # noqa: E402
 from port_acquire.cli import main as cli_main  # noqa: E402
 
 
@@ -464,6 +465,18 @@ class SteamBackendTests(unittest.TestCase):
         self.assertFalse(logged_out.logged_in)
         self.assertIsNone(logged_out.display_name)
 
+        # Logout must persist even when `loginusers.vdf` / `config.vdf` still exist on disk
+        st_after_logout = backend.status(offline=True)
+        self.assertFalse(st_after_logout.logged_in)
+        self.assertIsNone(st_after_logout.display_name)
+        with self.assertRaises(AuthRequiredError):
+            backend.download(DownloadOptions(app_id="1091500", dest=self.root / "after_logout"))
+
+        # Explicit re-import restores the logged-in session
+        reimported = backend.login(import_existing=True)
+        self.assertTrue(reimported.logged_in)
+        self.assertEqual(reimported.display_name, "testplayer")
+
     def test_status_reports_logged_out_on_steam_guard_failure(self) -> None:
         failing_scmd = _write_mock_steamcmd(
             self.root / "fail-steamcmd",
@@ -665,13 +678,49 @@ class SteamBackendTests(unittest.TestCase):
             DownloadOptions(app_id="1091500", dest=dest, platform="windows", branch="beta", validate=True)
         )
         self.assertEqual(res.app_id, "1091500")
+
+        # Verify and update must also reach DepotDownloader fallback without requiring steamcmd
+        ver = backend.verify("1091500", repair=True)
+        self.assertTrue(ver.ok)
+
+        with self.assertRaises(UnsupportedOperationError):
+            backend.update("1091500", check_only=True)
+
+        upd = backend.update("1091500", check_only=False)
+        self.assertTrue(upd.updated)
+
         calls = [json.loads(ln) for ln in dd_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 3)
         self.assertIn("-os", calls[0])
         self.assertIn("windows", calls[0])
         self.assertIn("-branch", calls[0])
         self.assertIn("beta", calls[0])
         self.assertIn("-validate", calls[0])
+        self.assertIn("-validate", calls[1])
+
+    def test_quoted_launch_args_and_secret_redaction(self) -> None:
+        parsed = _split_windows_args(
+            '-config "My Settings.ini" -path "C:\\Games\\Sample" -password "my secret pass" --flag'
+        )
+        self.assertEqual(
+            parsed,
+            ["-config", "My Settings.ini", "-path", "C:\\Games\\Sample", "-password", "my secret pass", "--flag"],
+        )
+
+        # Verify launch_args() preserves quoted paths and redacts entire quoted secret values
+        quoted_appinfo = SAMPLE_APPINFO_VDF.replace(
+            '"-skipStartScreen"',
+            '"-config \\"My Settings.ini\\" -password \\"my secret pass\\" -windowed"',
+        )
+        self.appinfo_path.write_text(quoted_appinfo, encoding="utf-8")
+        backend = self._make_backend()
+        backend.login(username="testplayer")
+        dest = self.root / "games" / "QuotedArgsGame"
+        backend.download(DownloadOptions(app_id="1091500", dest=dest, platform="windows"))
+        plan = backend.launch_args("1091500", offline=True)
+        self.assertEqual(plan.args, ["-config", "My Settings.ini", "-windowed"])
+        self.assertTrue(plan.redacted_auth_args)
+        self.assertNotIn("secret", " ".join(plan.args).lower())
 
     def test_cli_end_to_end_json_and_package_manifest(self) -> None:
         dest = self.root / "cli_dest" / "SampleRPG"
