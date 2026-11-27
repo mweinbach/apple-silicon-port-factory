@@ -17,7 +17,7 @@ pull requests:
 | Trigger | Runs GPU CI? | Why |
 |---|---|---|
 | `push` to `main` | Yes | Already reviewed and merged to `main`. |
-| `workflow_dispatch` | Yes | Explicit manual run by a maintainer (with optional `run_bench` input). |
+| `workflow_dispatch` on `refs/heads/main` | Yes | Explicit manual run against merged `main` (with optional `run_bench` input). Dispatches targeting non-`main` refs are rejected by `gpu-e2e`'s `if:` condition so collaborator feature branches must go through a PR + `gpu-ci-pr` approval. |
 | `pull_request_target` (`types: [labeled]`) with label `gpu-ci` | Only after `gpu-ci-pr` approval | GitHub executes `gpu-e2e.yml` strictly from the trusted base branch (`main`), so a fork PR cannot edit the workflow to bypass the gate. Applying `gpu-ci` starts the `ubuntu-latest` gate job (`approve-pr-gpu`) behind the protected GitHub Environment `gpu-ci-pr`. A runner owner configured as a Required Reviewer must explicitly approve the run before the self-hosted Mac job executes, and checkout is cryptographically pinned to the approved `pull_request.head.sha`. `opened`, `reopened`, and `synchronize` are excluded, so pushing new commits never re-triggers the workflow. |
 | Any other `pull_request` / `pull_request_target` event | **No** | Untrusted code never reaches the self-hosted runner. |
 

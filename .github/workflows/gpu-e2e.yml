@@ -11,7 +11,7 @@ name: GPU, Audio & E2E (Apple Silicon)
 #     gate, environment protection, or SHA check.
 #   - Triggered ONLY on:
 #       1. `push` to `main` (already reviewed & merged),
-#       2. `workflow_dispatch` (manual maintainer invocation),
+#       2. `workflow_dispatch` on `refs/heads/main` (manual rerun of merged `main`),
 #       3. `pull_request_target` `labeled` with the `gpu-ci` label, which first
 #          passes through the trusted `approve-pr-gpu` gate job protected by the
 #          `gpu-ci-pr` GitHub Environment (configured with runner-owner Required
@@ -81,7 +81,7 @@ jobs:
     if: >-
       !cancelled() && (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
         (
           github.event_name == 'pull_request_target' &&
           needs.approve-pr-gpu.result == 'success' &&
