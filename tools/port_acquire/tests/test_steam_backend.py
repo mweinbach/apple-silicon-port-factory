@@ -159,7 +159,12 @@ def _write_mock_depot_downloader(
             sys.exit(1)
 
         app_id = argv[argv.index("-app") + 1] if "-app" in argv else "0"
-        depot_arg = argv[argv.index("-depot") + 1] if "-depot" in argv else None
+        depot_args = []
+        if "-depot" in argv:
+            idx = argv.index("-depot") + 1
+            while idx < len(argv) and not argv[idx].startswith("-"):
+                depot_args.append(argv[idx])
+                idx += 1
         branch = argv[argv.index("-branch") + 1] if "-branch" in argv else "public"
         dest = pathlib.Path(argv[argv.index("-dir") + 1]) if "-dir" in argv else None
 
@@ -192,32 +197,31 @@ def _write_mock_depot_downloader(
 
         # Download or validate mode
         gid = os.environ.get("MOCK_MANIFEST_GID", "8811223344556677889")
+        print(f"Using app branch: '{{branch}}'.")
         if dest is not None:
             dest.mkdir(parents=True, exist_ok=True)
-            if app_id == "228980" and depot_arg:
-                (dest / f"redist_{{depot_arg}}.bin").write_bytes(b"MOCK_REDIST")
-                print(f"Using app branch: '{{branch}}'.")
-                print(f"Processing depot {{depot_arg}} - Common Redist")
-                print("Manifest 1111111111111111111 (11/26/2026 12:00:00)")
+            if app_id == "228980" and depot_args:
+                for dep in depot_args:
+                    (dest / f"redist_{{dep}}.bin").write_bytes(b"MOCK_REDIST")
+                    print(f"Processing depot {{dep}} - Common Redist")
+                    print("Manifest 1111111111111111111 (11/26/2026 12:00:00)")
                 print("Total downloaded: 512 bytes")
                 sys.exit(0)
-            if depot_arg == "999001":
+            selected = depot_args or ["1091501"]
+            if "1091501" in selected:
+                (dest / "bin" / "x64").mkdir(parents=True, exist_ok=True)
+                (dest / "bin" / "x64" / "SampleGame.exe").write_bytes(b"MZ\\x90\\x00MOCKPE")
+                (dest / "bin" / "x64" / "steam_api64.dll").write_bytes(b"MZ\\x90\\x00STEAM")
+                (dest / "installscript.vdf").write_text(
+                    '"InstallScript" {{"Run Process" {{"VCRedist" {{"process 1" "%INSTALLDIR%\\\\_CommonRedist\\\\vcredist\\\\vc_redist.x64.exe" "command 1" "/quiet"}}}}}}\\n',
+                    encoding="utf-8",
+                )
+                print("Processing depot 1091501 - Sample Action RPG Win64 Content")
+                print(f"Manifest {{gid}} (11/26/2026 12:00:00)")
+            if "999001" in selected:
                 (dest / "dlc_2138330.pak").write_bytes(b"MOCK_DLC")
-                print(f"Using app branch: '{{branch}}'.")
                 print("Processing depot 999001 - Expansion Pack DLC Content")
                 print("Manifest 770011 (11/26/2026 12:00:00)")
-                print("Total downloaded: 2048 bytes")
-                sys.exit(0)
-            (dest / "bin" / "x64").mkdir(parents=True, exist_ok=True)
-            (dest / "bin" / "x64" / "SampleGame.exe").write_bytes(b"MZ\\x90\\x00MOCKPE")
-            (dest / "bin" / "x64" / "steam_api64.dll").write_bytes(b"MZ\\x90\\x00STEAM")
-            (dest / "installscript.vdf").write_text(
-                '"InstallScript" {{"Run Process" {{"VCRedist" {{"process 1" "%INSTALLDIR%\\\\_CommonRedist\\\\vcredist\\\\vc_redist.x64.exe" "command 1" "/quiet"}}}}}}\\n',
-                encoding="utf-8",
-            )
-        print(f"Using app branch: '{{branch}}'.")
-        print("Processing depot 1091501 - Sample Action RPG Win64 Content")
-        print(f"Manifest {{gid}} (11/26/2026 12:00:00)")
         print("Total downloaded: 4096 bytes")
         sys.exit(0)
         """
@@ -627,26 +631,19 @@ class SteamBackendTests(unittest.TestCase):
         self.assertTrue(
             all(c[c.index("-app") + 1] != "2138330" for c in invocations if "-app" in c)
         )
-        base_dl_calls = [
+        # Base + owned DLC depots are transferred together in ONE invocation (`-app 1091500 -depot 1091501 999001`)
+        app_dl_calls = [
             c
             for c in invocations
             if "-app" in c
             and c[c.index("-app") + 1] == "1091500"
-            and "-depot" not in c
             and "-manifest-only" not in c
         ]
-        dlc_dl_calls = [
-            c
-            for c in invocations
-            if "-app" in c
-            and c[c.index("-app") + 1] == "1091500"
-            and "-depot" in c
-            and c[c.index("-depot") + 1] == "999001"
-            and "-manifest-only" not in c
-        ]
-        self.assertEqual(len(base_dl_calls), 1)
-        self.assertEqual(len(dlc_dl_calls), 1)
-        cmd = base_dl_calls[0]
+        self.assertEqual(len(app_dl_calls), 1)
+        cmd = app_dl_calls[0]
+        self.assertIn("-depot", cmd)
+        dep_idx = cmd.index("-depot") + 1
+        self.assertEqual(cmd[dep_idx : dep_idx + 2], ["1091501", "999001"])
         self.assertIn("-os", cmd)
         self.assertIn("windows", cmd)
         self.assertIn("-osarch", cmd)
@@ -1307,7 +1304,12 @@ class SteamBackendTests(unittest.TestCase):
                 with pathlib.Path({str(dlc_log)!r}).open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(argv) + "\\n")
                 app_id = argv[argv.index("-app") + 1]
-                depot_arg = argv[argv.index("-depot") + 1] if "-depot" in argv else None
+                depot_args = []
+                if "-depot" in argv:
+                    idx = argv.index("-depot") + 1
+                    while idx < len(argv) and not argv[idx].startswith("-"):
+                        depot_args.append(argv[idx])
+                        idx += 1
                 # Match real DepotDownloader: DLC AppIDs have no standalone depots
                 if app_id != "1091500":
                     print(f"Error: Couldn't find any depots to download for app {{app_id}}")
@@ -1316,9 +1318,10 @@ class SteamBackendTests(unittest.TestCase):
                 dest.mkdir(parents=True, exist_ok=True)
                 base_gid = os.environ.get("MOCK_BASE_GID", "8811223344556677889")
                 dlc_gid = os.environ.get("MOCK_DLC_GID", "770011")
+                selected = depot_args or ["1091501", "999001"]
                 if "-manifest-only" in argv:
                     print("Using app branch: 'public'.")
-                    if depot_arg in (None, "1091501"):
+                    if "1091501" in selected:
                         (dest / f"manifest_1091501_{{base_gid}}.txt").write_text(
                             f"Content Manifest for Depot 1091501\\n"
                             f"Manifest ID / date : {{base_gid}} / 11/26/2026\\n"
@@ -1328,7 +1331,7 @@ class SteamBackendTests(unittest.TestCase):
                         )
                         print("Processing depot 1091501 - Base Game")
                         print(f"Manifest {{base_gid}} (11/26/2026 12:00:00)")
-                    if depot_arg in (None, "999001"):
+                    if "999001" in selected:
                         (dest / f"manifest_999001_{{dlc_gid}}.txt").write_text(
                             f"Content Manifest for Depot 999001\\n"
                             f"Manifest ID / date : {{dlc_gid}} / 11/26/2026\\n"
@@ -1340,12 +1343,12 @@ class SteamBackendTests(unittest.TestCase):
                         print(f"Manifest {{dlc_gid}} (11/26/2026 12:00:00)")
                     sys.exit(0)
                 print("Using app branch: 'public'.")
-                if depot_arg in (None, "1091501"):
+                if "1091501" in selected:
                     (dest / "bin" / "x64").mkdir(parents=True, exist_ok=True)
                     (dest / "bin" / "x64" / "SampleGame.exe").write_bytes(b"MZ\\x90\\x00BASE")
                     print("Processing depot 1091501 - Base Game")
                     print(f"Manifest {{base_gid}} (11/26/2026 12:00:00)")
-                if depot_arg in (None, "999001"):
+                if "999001" in selected:
                     (dest / "dlc_2138330.pak").write_bytes(f"DLC_{{dlc_gid}}".encode("utf-8"))
                     print("Processing depot 999001 - Expansion DLC")
                     print(f"Manifest {{dlc_gid}} (11/26/2026 12:00:00)")
@@ -1434,12 +1437,17 @@ class SteamBackendTests(unittest.TestCase):
             self.assertEqual(dl_explicit.downloaded_dlcs, ["2138330"])
             self.assertEqual((explicit_dest / "dlc_2138330.pak").read_bytes(), b"DLC_770022")
 
-            # Verify every single DepotDownloader call used base AppID 1091500, never DLC AppID 2138330
+            # Verify every single DepotDownloader call used base AppID 1091500, never DLC AppID 2138330,
+            # and explicit --dlc passed both base and DLC depots in one single `-depot 1091501 999001` call
             calls = [json.loads(ln) for ln in dlc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
             self.assertTrue(calls)
             self.assertTrue(all(c[c.index("-app") + 1] == "1091500" for c in calls if "-app" in c))
             self.assertTrue(
-                any("-depot" in c and c[c.index("-depot") + 1] == "999001" for c in calls)
+                any(
+                    "-depot" in c
+                    and c[c.index("-depot") + 1 : c.index("-depot") + 3] == ["1091501", "999001"]
+                    for c in calls
+                )
             )
         finally:
             if prev_base_gid is None:
@@ -1450,6 +1458,132 @@ class SteamBackendTests(unittest.TestCase):
                 os.environ.pop("MOCK_DLC_GID", None)
             else:
                 os.environ["MOCK_DLC_GID"] = prev_dlc_gid
+
+    def test_multi_base_depots_downloaded_in_single_invocation(self) -> None:
+        _write_mock_appinfo_vdf(
+            self.steam_home,
+            1091500,
+            {"1091501": None, "1091502": None, "999001": "2138330"},
+        )
+        multi_log = self.root / "multi_base_dd.log"
+        multi_dd = self.root / "multi-base-dd"
+        multi_dd.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env python3
+                import json, pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-multi-base")
+                    sys.exit(0)
+                with pathlib.Path({str(multi_log)!r}).open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(argv) + "\\n")
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                depot_args = []
+                if "-depot" in argv:
+                    idx = argv.index("-depot") + 1
+                    while idx < len(argv) and not argv[idx].startswith("-"):
+                        depot_args.append(argv[idx])
+                        idx += 1
+                selected = depot_args or ["1091501", "1091502", "999001"]
+                if "-manifest-only" in argv:
+                    print("Using app branch: 'public'.")
+                    for did in selected:
+                        (dest / f"manifest_{{did}}_100.txt").write_text(
+                            f"Content Manifest for Depot {{did}}\\n"
+                            f"Manifest ID / date : 100 / 11/26/2026\\n"
+                            f"Size Chunks File SHA Flags Name\\n"
+                            f"10 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 f_{{did}}.bin\\n",
+                            encoding="utf-8",
+                        )
+                        print(f"Processing depot {{did}} - Depot {{did}}")
+                        print("Manifest 100 (11/26/2026 12:00:00)")
+                    sys.exit(0)
+                print("Using app branch: 'public'.")
+                for did in selected:
+                    (dest / f"f_{{did}}.bin").write_bytes(b"OK")
+                    print(f"Processing depot {{did}} - Depot {{did}}")
+                    print("Manifest 100 (11/26/2026 12:00:00)")
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        multi_dd.chmod(multi_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=multi_dd)
+        dest = self.root / "games" / "MultiBaseGame"
+        dl = backend.download(
+            DownloadOptions(app_id="1091500", dest=dest, platform="windows", with_dlcs=False)
+        )
+        self.assertEqual(dl.downloaded_depots, ["1091501", "1091502"])
+
+        logged = [json.loads(ln) for ln in multi_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        dl_calls = [c for c in logged if "-manifest-only" not in c]
+        self.assertEqual(len(dl_calls), 1)
+        dep_idx = dl_calls[0].index("-depot") + 1
+        self.assertEqual(dl_calls[0][dep_idx : dep_idx + 2], ["1091501", "1091502"])
+
+    def test_download_rejects_skipped_or_unprocessed_depots(self) -> None:
+        skip_dd = self.root / "skip-depot-dd"
+        skip_dd.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os, pathlib, sys
+                argv = sys.argv[1:]
+                if argv == ["--version"]:
+                    print("DepotDownloader v3.4.0+mock-skip")
+                    sys.exit(0)
+                dest = pathlib.Path(argv[argv.index("-dir") + 1])
+                dest.mkdir(parents=True, exist_ok=True)
+                if "-manifest-only" in argv:
+                    (dest / "manifest_1091501_100.txt").write_text(
+                        "Content Manifest for Depot 1091501\\n"
+                        "Manifest ID / date : 100 / 11/26/2026\\n"
+                        "Size Chunks File SHA Flags Name\\n"
+                        "10 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 Game.exe\\n",
+                        encoding="utf-8",
+                    )
+                    print("Using app branch: 'public'.")
+                    print("Processing depot 1091501 - Base Game")
+                    print("Manifest 100 (11/26/2026 12:00:00)")
+                    sys.exit(0)
+                if os.environ.get("MOCK_SKIP_MODE") == "entitlement":
+                    print("Using app branch: 'public'.")
+                    print("Depot 1091501 is not available from this account.")
+                    sys.exit(0)
+                print("Using app branch: 'public'.")
+                print("Total downloaded: 0 bytes")
+                sys.exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        skip_dd.chmod(skip_dd.stat().st_mode | stat.S_IXUSR)
+
+        backend = self._make_backend(depot_downloader_bin=skip_dd)
+        dest = self.root / "games" / "SkippedDepotGame"
+
+        prev_mode = os.environ.get("MOCK_SKIP_MODE")
+        try:
+            os.environ["MOCK_SKIP_MODE"] = "entitlement"
+            with self.assertRaises(AuthRequiredError):
+                backend.download(DownloadOptions(app_id="1091500", dest=dest, platform="windows"))
+            self.assertFalse((dest / "steam_appid.txt").exists())
+            self.assertNotIn("1091500", backend._load_installs())
+
+            os.environ["MOCK_SKIP_MODE"] = "empty"
+            with self.assertRaises(CommandFailedError):
+                backend.download(DownloadOptions(app_id="1091500", dest=dest, platform="windows"))
+            self.assertFalse((dest / "steam_appid.txt").exists())
+            self.assertNotIn("1091500", backend._load_installs())
+        finally:
+            if prev_mode is None:
+                os.environ.pop("MOCK_SKIP_MODE", None)
+            else:
+                os.environ["MOCK_SKIP_MODE"] = prev_mode
 
     def test_offline_info_and_manifest_retain_cached_store_metadata(self) -> None:
         def fake_http(url: str):

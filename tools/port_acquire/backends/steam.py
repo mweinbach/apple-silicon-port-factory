@@ -123,6 +123,11 @@ _LOGIN_FAIL_PATTERNS = re.compile(
     re.I,
 )
 
+_SKIPPED_DEPOT_RE = re.compile(
+    r"Depot\s+(\d+)\s+is\s+not\s+available\s+from\s+this\s+account",
+    re.I,
+)
+
 
 def _split_windows_args(raw: str) -> list[str]:
     """Parse a Windows-style command-line argument string preserving quoted values."""
@@ -1746,10 +1751,11 @@ class SteamBackend(StoreBackend):
                 # Only select DLCs confirmed owned by the account
                 target_dlcs = [d.app_id for d in info.dlcs if d.owned]
 
-        def _build_dd_args(depot_id: str | None = None) -> list[str]:
+        def _build_dd_args(depot_ids: list[str] | None = None) -> list[str]:
             args: list[str] = ["-app", resolved_id]
-            if depot_id is not None:
-                args.extend(["-depot", depot_id])
+            if depot_ids:
+                args.append("-depot")
+                args.extend(depot_ids)
             args.extend(
                 [
                     "-os",
@@ -1780,56 +1786,97 @@ class SteamBackend(StoreBackend):
             if not d.is_common_redist and d.depot_id not in depot_to_dlc
         ]
         known_dlc_depot_ids = set(depot_to_dlc.keys())
-        all_requested_dlcs_mapped = all(
-            bool(dlc_to_depots.get(d)) or any(dep.depot_id == d for dep in (info.depots if info else []))
-            for d in options.dlcs
+
+        requested_dlc_depot_ids: list[str] = []
+        dlc_depots_by_dlc: dict[str, list[str]] = {}
+        for dlc_id in target_dlcs:
+            dep_ids = list(dlc_to_depots.get(dlc_id) or [])
+            if not dep_ids and info is not None and any(d.depot_id == dlc_id for d in info.depots):
+                dep_ids = [dlc_id]
+            dlc_depots_by_dlc[dlc_id] = dep_ids
+            for did in dep_ids:
+                if did not in requested_dlc_depot_ids:
+                    requested_dlc_depot_ids.append(did)
+
+        all_requested_dlcs_mapped = all(bool(dlc_depots_by_dlc.get(d)) for d in options.dlcs)
+
+        # Pass all selected depots together in ONE DepotDownloader invocation
+        # (`-app <base_id> -depot <id1> <id2> ...`) so DepotDownloader's cross-depot
+        # cleanup (`allFileNamesAllDepots`) and last-depot-wins precedence stay intact.
+        selected_depot_ids: list[str] | None = None
+        if base_depot_ids and known_dlc_depot_ids:
+            if not options.with_dlcs and not options.dlcs:
+                selected_depot_ids = list(base_depot_ids)
+            elif options.dlcs and all_requested_dlcs_mapped:
+                selected_depot_ids = list(base_depot_ids) + [
+                    did for did in requested_dlc_depot_ids if did not in base_depot_ids
+                ]
+            elif options.with_dlcs and requested_dlc_depot_ids:
+                selected_depot_ids = list(base_depot_ids) + [
+                    did for did in requested_dlc_depot_ids if did not in base_depot_ids
+                ]
+
+        proc = self._run_depot_downloader(
+            _build_dd_args(depot_ids=selected_depot_ids),
+            interactive=False,
+            timeout=None,
+            check=True,
         )
-        # Filter the base download to explicit base depots when we know which depots belong
-        # to DLCs and the caller asked for base-only or specific `--dlc` selections.
-        filter_base_depots = (
-            bool(base_depot_ids)
-            and bool(known_dlc_depot_ids)
-            and ((not options.with_dlcs and not options.dlcs) or (bool(options.dlcs) and all_requested_dlcs_mapped))
-        )
+        combined = proc.stdout + "\n" + proc.stderr
+        out = parse_depot_downloader_stdout(combined)
+        skipped_depots = set(_SKIPPED_DEPOT_RE.findall(combined))
 
         all_stdout_depots: list[dict[str, Any]] = []
         downloaded_depots_by_id: dict[str, dict[str, Any]] = {}
+        for dep in out.get("depots", []):
+            did = str(dep.get("depot_id") or "")
+            if did:
+                downloaded_depots_by_id[did] = dep
+                all_stdout_depots.append(dep)
 
-        def _record_stdout_depots(dep_list: list[dict[str, Any]]) -> None:
-            for dep in dep_list:
-                did = str(dep.get("depot_id") or "")
-                if did:
-                    downloaded_depots_by_id[did] = dep
-                    all_stdout_depots.append(dep)
-
-        if filter_base_depots:
-            for base_did in base_depot_ids:
-                proc = self._run_depot_downloader(
-                    _build_dd_args(depot_id=base_did),
-                    interactive=False,
-                    timeout=None,
-                    check=True,
+        # Verify DepotDownloader actually processed the required depots; DepotDownloader can
+        # exit 0 after skipping inaccessible depots ("Depot X is not available from this account.").
+        required_depots = (
+            list(selected_depot_ids)
+            if selected_depot_ids is not None
+            else [did for did in requested_dlc_depot_ids if did not in downloaded_depots_by_id]
+        )
+        missing_depots = [did for did in required_depots if did not in downloaded_depots_by_id]
+        if selected_depot_ids is None and not downloaded_depots_by_id:
+            if skipped_depots or _LOGIN_FAIL_PATTERNS.search(combined):
+                raise AuthRequiredError(
+                    f"DepotDownloader had no accessible depots for Steam AppID {resolved_id} "
+                    f"(skipped: {', '.join(sorted(skipped_depots)) or 'unknown'}).",
+                    details={"skipped_depots": sorted(skipped_depots)},
                 )
-                out = parse_depot_downloader_stdout(proc.stdout + "\n" + proc.stderr)
-                _record_stdout_depots(out.get("depots", []))
-        else:
-            proc = self._run_depot_downloader(
-                _build_dd_args(depot_id=None),
-                interactive=False,
-                timeout=None,
-                check=True,
+            raise CommandFailedError(
+                f"DepotDownloader exited 0 without processing any depots for Steam AppID {resolved_id}."
             )
-            out = parse_depot_downloader_stdout(proc.stdout + "\n" + proc.stderr)
-            _record_stdout_depots(out.get("depots", []))
+        if missing_depots:
+            if any(did in skipped_depots for did in missing_depots) or _LOGIN_FAIL_PATTERNS.search(combined):
+                raise AuthRequiredError(
+                    f"DepotDownloader skipped required depot(s) {', '.join(missing_depots)} for "
+                    f"Steam AppID {resolved_id} (account lacks entitlement or depot key).",
+                    details={"missing_depots": missing_depots, "skipped_depots": sorted(skipped_depots)},
+                )
+            raise CommandFailedError(
+                f"DepotDownloader did not process required depot(s) {', '.join(missing_depots)} "
+                f"for Steam AppID {resolved_id}.",
+                details={"missing_depots": missing_depots},
+            )
+        skipped_base = [did for did in base_depot_ids if did in skipped_depots and did not in downloaded_depots_by_id]
+        if skipped_base:
+            raise AuthRequiredError(
+                f"DepotDownloader skipped base depot(s) {', '.join(skipped_base)} for "
+                f"Steam AppID {resolved_id}.",
+                details={"skipped_depots": skipped_base},
+            )
 
-        # Owned DLC depots — ALWAYS downloaded through the base game's `-app <resolved_id>`
-        # with explicit `-depot <did>` selection (never `-app <dlc_id>`, because Valve hosts
-        # all DLC depots inside the base app's depot list).
+        # Record downloaded DLC depots & manifest versions from the processed depots
         downloaded_dlcs: list[str] = []
         dlc_versions: dict[str, str] = {}
         dlc_depots_recorded: dict[str, list[str]] = {}
         if target_dlcs:
-            # Refresh mapping with any depots reported by DepotDownloader stdout
             dlc_to_depots, depot_to_dlc = self._resolve_dlc_depot_map(
                 resolved_id,
                 info_depot_dicts + all_stdout_depots,
@@ -1837,29 +1884,12 @@ class SteamBackend(StoreBackend):
                 saved_dlc_depots=(existing_entry or {}).get("dlc_depots"),
             )
             for dlc_id in target_dlcs:
-                dep_ids = list(dlc_to_depots.get(dlc_id) or [])
-                if not dep_ids and info is not None and any(d.depot_id == dlc_id for d in info.depots):
-                    dep_ids = [dlc_id]
-
-                this_dlc_depots: list[dict[str, Any]] = []
-                for did in dep_ids:
-                    if did in downloaded_depots_by_id:
-                        this_dlc_depots.append(downloaded_depots_by_id[did])
-                        continue
-                    dlc_proc = self._run_depot_downloader(
-                        _build_dd_args(depot_id=did),
-                        interactive=False,
-                        timeout=None,
-                        check=True,
-                    )
-                    dlc_out = parse_depot_downloader_stdout(dlc_proc.stdout + "\n" + dlc_proc.stderr)
-                    _record_stdout_depots(dlc_out.get("depots", []))
-                    for dep in dlc_out.get("depots", []):
-                        if str(dep.get("depot_id") or "") == did:
-                            this_dlc_depots.append(dep)
-                    if not any(str(dep.get("depot_id") or "") == did for dep in this_dlc_depots) and did in downloaded_depots_by_id:
-                        this_dlc_depots.append(downloaded_depots_by_id[did])
-
+                dep_ids = list(dlc_to_depots.get(dlc_id) or dlc_depots_by_dlc.get(dlc_id) or [])
+                this_dlc_depots = [
+                    downloaded_depots_by_id[did]
+                    for did in dep_ids
+                    if did in downloaded_depots_by_id
+                ]
                 if dep_ids:
                     dlc_depots_recorded[dlc_id] = dep_ids
                 dlc_ver = self._version_from_manifests(this_dlc_depots)
@@ -1869,8 +1899,6 @@ class SteamBackend(StoreBackend):
                     downloaded_dlcs.append(dlc_id)
 
         downloaded_depots: list[str] = list(downloaded_depots_by_id.keys())
-        if not downloaded_depots and info is not None:
-            downloaded_depots = [d.depot_id for d in info.depots if not d.is_common_redist]
 
         # Steamworks Common Redistributables (`AppID 228980`) depots when requested
         downloaded_redists: list[str] = []
@@ -1897,7 +1925,22 @@ class SteamBackend(StoreBackend):
                     account_name,
                     "-remember-password",
                 ]
-                self._run_depot_downloader(redist_args, interactive=False, timeout=None, check=True)
+                redist_proc = self._run_depot_downloader(
+                    redist_args, interactive=False, timeout=None, check=True
+                )
+                redist_combined = redist_proc.stdout + "\n" + redist_proc.stderr
+                redist_out = parse_depot_downloader_stdout(redist_combined)
+                redist_processed = {
+                    str(d.get("depot_id") or "") for d in redist_out.get("depots", []) if d.get("depot_id")
+                }
+                if did not in redist_processed:
+                    if _SKIPPED_DEPOT_RE.search(redist_combined) or _LOGIN_FAIL_PATTERNS.search(redist_combined):
+                        raise AuthRequiredError(
+                            f"DepotDownloader skipped Common Redistributable depot {did} (App {COMMON_REDIST_APP_ID})."
+                        )
+                    raise CommandFailedError(
+                        f"DepotDownloader did not process Common Redistributable depot {did} (App {COMMON_REDIST_APP_ID})."
+                    )
                 if did not in downloaded_redists:
                     downloaded_redists.append(did)
 
