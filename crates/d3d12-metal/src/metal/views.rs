@@ -1,11 +1,12 @@
 //! Shader-visible descriptors: D3D12 SRV/UAV/CBV/sampler descriptions →
 //! 24-byte `IRDescriptorTableEntry`s (`dxil_metal::runtime`).
 //!
-//! Texture views and samplers are Metal objects whose `gpuResourceID` goes
-//! into the entry; they are cached (views on their resource, samplers in a
-//! process-wide table) so the IDs stay valid as long as the resource lives.
+//! Texture views and samplers produce Metal `MTLResourceID`s that go into the
+//! entry; non-identity texture and typed-buffer views are allocated from the
+//! Metal 4 [`super::view_pool`] (cached on their resource, recycled after GPU
+//! completion), while samplers live in a process-wide table.
 
-use super::resource::{MtlTexture, Resource, SWIZZLE_IDENTITY};
+use super::resource::{Resource, SWIZZLE_IDENTITY};
 use crate::format;
 use dxil_metal::runtime::{BufferView, DescriptorTableEntry};
 use objc2::rc::Retained;
@@ -15,11 +16,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 pub type Entry = [u8; 24];
-
-fn resource_id(t: &MtlTexture) -> u64 {
-    // MTLResourceID is a single u64 (`_impl`).
-    unsafe { std::mem::transmute::<MTLResourceID, u64>(t.gpuResourceID()) }
-}
 
 // ---------------------------------------------------------------------------
 // Samplers
@@ -168,9 +164,9 @@ fn mip_range(r: &Resource, most_detailed: u32, levels: u32) -> (u32, u32) {
     (first, n)
 }
 
-fn texture_entry(t: Option<Retained<MtlTexture>>, min_lod: f32) -> Result<Entry, String> {
-    let t = t.ok_or("texture view creation failed")?;
-    Ok(DescriptorTableEntry::texture(resource_id(&t), min_lod, 0).to_bytes())
+fn texture_entry(id: Option<u64>, min_lod: f32) -> Result<Entry, String> {
+    let id = id.ok_or("texture view creation failed")?;
+    Ok(DescriptorTableEntry::texture(id, min_lod, 0).to_bytes())
 }
 
 /// Buffer SRV/UAV (`D3D12_BUFFER_SRV`/`_UAV`): raw (flag 1), structured
@@ -205,13 +201,13 @@ fn buffer_entry(
                 if el_off > 255 {
                     return Err(format!("UAV counter element offset {el_off} > 255"));
                 }
-                let tv = cr
-                    .buffer_texture_view(MTLPixelFormat::R32Uint, aligned, 1 + el_off, true)
+                let tv_id = cr
+                    .buffer_texture_view_id(MTLPixelFormat::R32Uint, aligned, 1 + el_off, true)
                     .ok_or("UAV counter texture buffer view creation failed")?;
                 let v = BufferView {
                     gpu_va: base + off,
                     size,
-                    texture_buffer_view_id: resource_id(&tv),
+                    texture_buffer_view_id: tv_id,
                     texture_view_offset_in_elements: el_off as u32,
                     typed_buffer: false,
                 };
@@ -233,12 +229,12 @@ fn buffer_entry(
     if el_off > 255 {
         return Err(format!("typed buffer view element offset {el_off} > 255"));
     }
-    let tv = r.buffer_texture_view(fi.mtl, aligned, num as u64 + el_off, writable).ok_or("texture buffer view creation failed")?;
+    let tv_id = r.buffer_texture_view_id(fi.mtl, aligned, num as u64 + el_off, writable).ok_or("texture buffer view creation failed")?;
     r.note_view_kind(super::resource::HK_TYPED_BUF);
     let v = BufferView {
         gpu_va: base + aligned,
         size: (num as u64 + el_off) * bpe,
-        texture_buffer_view_id: resource_id(&tv),
+        texture_buffer_view_id: tv_id,
         texture_view_offset_in_elements: el_off as u32,
         typed_buffer: true,
     };
@@ -275,7 +271,7 @@ pub fn srv_entry(r: Option<&Resource>, desc: Option<&[u8; 40]>) -> Result<Entry,
         let t = r.texture().ok_or("no texture")?;
         let fmt = r.mtl_format;
         let ty = t.textureType();
-        let view = r.texture_view(fmt, ty, (0, r.desc.mip_levels()), (0, r.desc.array_size()));
+        let view = r.texture_view_id(fmt, ty, (0, r.desc.mip_levels()), (0, r.desc.array_size()));
         return texture_entry(view, 0.0);
     };
     let dxgi = u32s(d, 0);
@@ -305,7 +301,7 @@ pub fn srv_entry(r: Option<&Resource>, desc: Option<&[u8; 40]>) -> Result<Entry,
     };
     r.note_view_kind(super::resource::view_tex_handle_kind_mask(dxgi, r.desc.Format, ty));
     // Single-slice 2D views of an array texture keep their slice.
-    let view = r.texture_view_swizzled(fmt, ty, mips, slices, swz);
+    let view = r.texture_view_id_swizzled(fmt, ty, mips, slices, swz);
     texture_entry(view, min_lod)
 }
 
@@ -329,7 +325,7 @@ pub fn uav_entry_with_counter(
             return Err("UAV of a buffer without a desc".into());
         }
         let t = r.texture().ok_or("no texture")?;
-        let view = r.texture_view(r.mtl_format, t.textureType(), (0, 1), (0, r.desc.array_size()));
+        let view = r.texture_view_id(r.mtl_format, t.textureType(), (0, 1), (0, r.desc.array_size()));
         return texture_entry(view, 0.0);
     };
     let dxgi = u32s(d, 0);
@@ -360,7 +356,7 @@ pub fn uav_entry_with_counter(
         _ => return Err(format!("UAV view dimension {dimension}")),
     };
     r.note_view_kind(super::resource::view_tex_handle_kind_mask(dxgi, r.desc.Format, ty));
-    let view = r.texture_view(fmt, ty, (mip, 1), slices);
+    let view = r.texture_view_id(fmt, ty, (mip, 1), slices);
     texture_entry(view, 0.0)
 }
 
