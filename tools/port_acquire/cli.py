@@ -648,6 +648,22 @@ def _dispatch(args: argparse.Namespace) -> int:
                 else:
                     title_hint = info_hint.title if info_hint is not None else None
                     dest = _default_dest(store_name, args.app, title=title_hint)
+                    # Avoid colliding on the default title directory when a managed copy for
+                    # another platform already occupies it (for `--no-register` side-by-side
+                    # downloads, qualify with `-<platform>`; registered downloads are also
+                    # guarded inside the backend against platform conflicts).
+                    other_managed_path: Path | None = None
+                    if has_managed_hook:
+                        try:
+                            other_managed_path = backend.existing_managed_install_path(
+                                args.app, platform=None
+                            )
+                        except AcquireError:
+                            other_managed_path = None
+                    elif info_hint is not None and info_hint.install_path:
+                        other_managed_path = Path(info_hint.install_path).expanduser().resolve()
+                    if args.no_register and other_managed_path is not None and other_managed_path == dest:
+                        dest = dest.with_name(f"{dest.name}-{args.platform}")
         else:
             dest = Path(args.dest).expanduser().resolve()
 

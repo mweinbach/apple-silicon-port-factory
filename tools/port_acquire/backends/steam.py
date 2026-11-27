@@ -529,9 +529,9 @@ class SteamBackend(StoreBackend):
         self,
         app_id: str,
         *,
-        platform: str = "windows",
+        platform: str | None = "windows",
     ) -> Path | None:
-        """Return the registered `port-acquire` install path for `app_id` matching `platform`.
+        """Return the registered `port-acquire` install path for `app_id` (optionally filtered by `platform`).
 
         Intentionally ignores unmanaged Steam-client installations under `steamapps/common/`
         so downloading Windows depots without `--dest` never overwrites a native macOS Steam
@@ -541,9 +541,10 @@ class SteamBackend(StoreBackend):
         entry = self._load_installs().get(resolved_id)
         if not isinstance(entry, dict) or not entry.get("install_path"):
             return None
-        entry_plat = str(entry.get("platform") or "windows").strip().lower()
-        if entry_plat != platform.strip().lower():
-            return None
+        if platform is not None:
+            entry_plat = str(entry.get("platform") or "windows").strip().lower()
+            if entry_plat != platform.strip().lower():
+                return None
         return Path(str(entry["install_path"])).expanduser().resolve()
 
     def _is_unmanaged_steam_client_install(
@@ -1863,8 +1864,49 @@ class SteamBackend(StoreBackend):
         account_name, steam_id64 = self._require_logged_in_account()
         resolved_id = self._resolve_app_id(options.app_id, offline=False)
         dest = options.dest.expanduser().resolve()
-        dest.mkdir(parents=True, exist_ok=True)
         branch = (options.branch or "public").strip()
+
+        # Prevent mixing platform-specific payloads or silently clobbering an existing
+        # `port-acquire` managed installation of a different platform.
+        managed_entry = self._load_installs().get(resolved_id)
+        if isinstance(managed_entry, dict):
+            existing_plat = str(managed_entry.get("platform") or "windows").strip().lower()
+            want_plat = options.platform.strip().lower()
+            existing_path_raw = str(managed_entry.get("install_path") or "").strip()
+            existing_path = (
+                Path(existing_path_raw).expanduser().resolve() if existing_path_raw else None
+            )
+            if existing_plat != want_plat:
+                if not options.no_register:
+                    raise AcquireError(
+                        f"Steam AppID {resolved_id} is already registered in `port-acquire` for "
+                        f"platform {existing_plat!r} at {existing_path or '(unknown)'}, which "
+                        f"conflicts with requested --platform {want_plat!r}. Uninstall the "
+                        "existing managed install first or pass `--no-register --dest <dir>` for "
+                        f"a separate {want_plat} copy.",
+                        code="platform_conflict",
+                        details={
+                            "app_id": resolved_id,
+                            "requested_platform": want_plat,
+                            "existing_platform": existing_plat,
+                            "existing_install_path": str(existing_path or ""),
+                        },
+                    )
+                if existing_path is not None and existing_path == dest:
+                    raise AcquireError(
+                        f"Destination {dest} is already occupied by a managed {existing_plat!r} "
+                        f"installation of Steam AppID {resolved_id}; refusing to mix {want_plat!r} "
+                        "files into the same directory. Pass a separate `--dest` directory.",
+                        code="platform_conflict",
+                        details={
+                            "app_id": resolved_id,
+                            "requested_platform": want_plat,
+                            "existing_platform": existing_plat,
+                            "existing_install_path": str(existing_path),
+                        },
+                    )
+
+        dest.mkdir(parents=True, exist_ok=True)
 
         # Pre-fetch manifest metadata for the requested branch (including branch password when set)
         # so depot caches, offline `info()`, `launch_args()`, and package manifests reflect this branch.

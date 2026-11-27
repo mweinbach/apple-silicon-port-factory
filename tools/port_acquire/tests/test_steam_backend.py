@@ -2363,6 +2363,74 @@ class SteamBackendTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.code, "dlc_not_owned")
 
+    def test_cli_download_prevents_managed_platform_collision_and_qualifies_unregistered_dest(self) -> None:
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from port_acquire import cli as acquire_cli
+
+        def fake_http(url: str):
+            if "appdetails" in url:
+                return {
+                    "1091500": {
+                        "success": True,
+                        "data": {"name": "Sample Action RPG"},
+                    }
+                }
+            return {}
+
+        backend = self._make_backend(allow_network=True, http_get_json=fake_http)
+        # Warm cached Store title (exact repro: offline title hint resolves "Sample Action RPG")
+        backend.info("1091500", platform="macos", offline=False)
+        dest_root = self.root / "managed_dest_root"
+
+        def run_cli(argv: list[str]) -> tuple[int, dict]:
+            out = io.StringIO()
+            with (
+                mock.patch("port_acquire.cli.get_backend", return_value=backend),
+                mock.patch.dict(os.environ, {"PORT_ACQUIRE_DEST": str(dest_root)}, clear=False),
+                redirect_stdout(out),
+            ):
+                rc = acquire_cli.main(argv)
+            return rc, json.loads(out.getvalue())
+
+        # 1. Managed macOS download occupies default `<dest_root>/Sample Action RPG`
+        rc1, payload1 = run_cli(["--store", "steam", "download", "1091500", "--platform", "macos", "--json"])
+        self.assertEqual(rc1, 0)
+        macos_dir = Path(payload1["install_path"]).resolve()
+        self.assertEqual(macos_dir, (dest_root / "Sample Action RPG").resolve())
+        self.assertEqual(backend._load_installs()["1091500"]["platform"], "macos")
+
+        log_len_before = len(self.log_path.read_text(encoding="utf-8"))
+
+        # 2. Registered Windows download without `--dest` must reject platform_conflict BEFORE transfer
+        rc2, payload2 = run_cli(["--store", "steam", "download", "1091500", "--platform", "windows", "--json"])
+        self.assertNotEqual(rc2, 0)
+        self.assertEqual(payload2["error"]["code"], "platform_conflict")
+        self.assertEqual(backend._load_installs()["1091500"]["platform"], "macos")
+        self.assertEqual(len(self.log_path.read_text(encoding="utf-8")), log_len_before)
+
+        # 3. Unregistered `--no-register` Windows download without `--dest` uses a platform-qualified dir
+        rc3, payload3 = run_cli(
+            ["--store", "steam", "download", "1091500", "--platform", "windows", "--no-register", "--json"]
+        )
+        self.assertEqual(rc3, 0)
+        win_dir = Path(payload3["install_path"]).resolve()
+        self.assertEqual(win_dir, (dest_root / "Sample Action RPG-windows").resolve())
+        self.assertNotEqual(win_dir, macos_dir)
+        self.assertEqual(backend._load_installs()["1091500"]["platform"], "macos")
+
+        # 4. Explicit colliding `--dest` on `--no-register` with conflicting platform is also rejected
+        with self.assertRaises(AcquireError) as ctx:
+            backend.download(
+                DownloadOptions(
+                    app_id="1091500",
+                    dest=macos_dir,
+                    platform="windows",
+                    no_register=True,
+                )
+            )
+        self.assertEqual(ctx.exception.code, "platform_conflict")
+
     def test_unmanaged_steam_client_install_rejected_for_inplace_update_and_repair(self) -> None:
         sa_dir = self.steam_home / "steamapps"
         native_dir = sa_dir / "common" / "NativeMacTitle"
