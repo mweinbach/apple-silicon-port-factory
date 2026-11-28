@@ -288,36 +288,67 @@ pub fn verify_app_bundle_with_options(
         );
     }
 
-    // Optional `port-acquire-manifest.json` integrity & secret-redaction audit when present.
-    let acquire_manifest_path = resources_dir.join(ACQUIRE_MANIFEST_FILENAME);
-    if acquire_manifest_path.is_file() {
-        match load_acquire_manifest(&acquire_manifest_path) {
-            Ok(acq) if acq.had_unredacted_secrets => push(
+    // Optional `port-acquire-manifest.json` integrity & secret-redaction audit when present
+    // in either `Contents/Resources/` or `Contents/Resources/Game/`.
+    let acquire_manifest_paths = [
+        (
+            format!("Contents/Resources/{ACQUIRE_MANIFEST_FILENAME}"),
+            resources_dir.join(ACQUIRE_MANIFEST_FILENAME),
+        ),
+        (
+            format!("Contents/Resources/Game/{ACQUIRE_MANIFEST_FILENAME}"),
+            resources_dir.join("Game").join(ACQUIRE_MANIFEST_FILENAME),
+        ),
+    ];
+    let present_manifests: Vec<&(String, PathBuf)> = acquire_manifest_paths
+        .iter()
+        .filter(|(_, p)| p.is_file())
+        .collect();
+    if !present_manifests.is_empty() {
+        let mut manifest_errors: Vec<String> = Vec::new();
+        let mut first_clean: Option<super::acquire_manifest::AcquireManifest> = None;
+        for (rel, path) in &present_manifests {
+            match load_acquire_manifest(path) {
+                Ok(acq) if acq.had_unredacted_secrets => {
+                    manifest_errors.push(format!(
+                        "{rel} contains unredacted auth/secret launch flags"
+                    ));
+                }
+                Ok(acq) => {
+                    if first_clean.is_none() {
+                        first_clean = Some(acq);
+                    }
+                }
+                Err(e) => {
+                    manifest_errors.push(format!("invalid {rel}: {e:#}"));
+                }
+            }
+        }
+        if !manifest_errors.is_empty() {
+            push(
                 &mut checks,
                 "acquire_manifest",
                 BundleCheckStatus::Fail,
-                format!(
-                    "Contents/Resources/{ACQUIRE_MANIFEST_FILENAME} contains unredacted auth/secret launch flags"
-                ),
-            ),
-            Ok(acq) => push(
+                manifest_errors.join("; "),
+            );
+        } else if let Some(acq) = first_clean {
+            let copies_note = if present_manifests.len() > 1 {
+                format!(" ({} bundled copies verified)", present_manifests.len())
+            } else {
+                String::new()
+            };
+            push(
                 &mut checks,
                 "acquire_manifest",
                 BundleCheckStatus::Pass,
                 format!(
-                    "schema_version={} (store={:?}, app_id={:?}, {} launch arg(s), zero unredacted secrets)",
+                    "schema_version={} (store={:?}, app_id={:?}, {} launch arg(s), zero unredacted secrets){copies_note}",
                     acq.schema_version,
                     acq.store,
                     acq.app_id,
                     acq.launch_args.len()
                 ),
-            ),
-            Err(e) => push(
-                &mut checks,
-                "acquire_manifest",
-                BundleCheckStatus::Fail,
-                format!("invalid Contents/Resources/{ACQUIRE_MANIFEST_FILENAME}: {e:#}"),
-            ),
+            );
         }
     }
 

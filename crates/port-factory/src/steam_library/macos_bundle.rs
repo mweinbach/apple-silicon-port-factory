@@ -3,8 +3,8 @@
 //! generation, and native bundle launcher codegen.
 
 use super::acquire_manifest::{
-    is_numeric_steam_app_id, load_acquire_manifest_in_dir, AcquireManifest,
-    ACQUIRE_MANIFEST_FILENAME,
+    is_numeric_steam_app_id, load_acquire_manifest_in_dir, sanitize_acquire_manifest_json,
+    AcquireManifest, ACQUIRE_MANIFEST_FILENAME,
 };
 use super::discovery::{
     inspect_game_directory, scan_all_steam_libraries, GameLibrarySource, InstalledGameEntry,
@@ -440,7 +440,12 @@ pub fn stage_bundle_frameworks(
 #[derive(Debug, Clone)]
 pub struct BundleLauncherConfig<'a> {
     pub clean_title: &'a str,
+    /// Storefront identifier (e.g. `Some("steam")`, `Some("epic")`, `Some("gog")`, or `None`).
+    pub store: Option<&'a str>,
     pub app_id: &'a str,
+    /// Resolved numeric Steam AppID, populated ONLY when the bundle is actually a Steam title.
+    /// Non-Steam numeric IDs (e.g. GOG) MUST pass `None` so `STEAM_APPID`/`SteamAppId` are not set.
+    pub steam_app_id: Option<&'a str>,
     pub exe_rel: &'a str,
     pub image_base: u64,
     pub size_of_image: u32,
@@ -725,6 +730,19 @@ pub fn find_repo_game_manifest(
     Some(manifest.to_toml())
 }
 
+fn sanitize_launcher_cache_key(app_id: &str) -> String {
+    let cleaned: String = app_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "app".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Generate the Rust source for the self-contained `.app` launcher binary.
 ///
 /// The launcher resolves `Contents/Frameworks/`, `Contents/Resources/`, and `Contents/MacOS/`
@@ -737,27 +755,76 @@ pub fn find_repo_game_manifest(
 /// - Sets `METAL_IRCONVERTER_DYLIB` when `Contents/Frameworks/libmetalirconverter.dylib` exists.
 /// - Sets `AW2_DXILCONV` when `Contents/Frameworks/libdxilconv.dylib` exists.
 /// - Sets `PORT_VULKAN_DYLIB` when `Contents/Frameworks/libMoltenVK.dylib` exists.
+/// - Sets `STEAM_APPID` / `SteamAppId` / `SteamGameId` ONLY when `steam_app_id` is a valid
+///   numeric Steam AppID and `store` is not a non-Steam storefront.
 /// - Prepends `Contents/Frameworks` to `DYLD_FALLBACK_LIBRARY_PATH`.
 /// - Preserves any explicit developer override already present in the environment.
+///
+/// Every string value is emitted strictly as a Rust debug-escaped string literal (`{:?}`)
+/// via single-pass placeholder expansion so untrusted manifest fields can never inject code
+/// or trigger secondary placeholder substitution.
 pub fn generate_bundle_launcher_source(cfg: &BundleLauncherConfig<'_>) -> String {
-    BUNDLE_LAUNCHER_TEMPLATE
-        .replace("__CLEAN_TITLE__", cfg.clean_title)
-        .replace("__APP_ID_DEBUG__", &format!("{:?}", cfg.app_id))
-        .replace("__APP_ID__", cfg.app_id)
-        .replace("__EXE_REL_DEBUG__", &format!("{:?}", cfg.exe_rel))
-        .replace("__EXE_REL__", cfg.exe_rel)
-        .replace("__IMAGE_BASE_HEX__", &format!("{:016X}", cfg.image_base))
-        .replace("__SIZE_OF_IMAGE_HEX__", &format!("{:08X}", cfg.size_of_image))
-        .replace("__AOT_FN_COUNT__", &cfg.aot_fn_count.to_string())
-        .replace(
+    let is_non_steam_store = cfg
+        .store
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|s| !s.eq_ignore_ascii_case("steam"));
+    let effective_steam_app_id = if is_non_steam_store {
+        ""
+    } else {
+        cfg.steam_app_id
+            .map(str::trim)
+            .filter(|id| is_numeric_steam_app_id(id))
+            .unwrap_or("")
+    };
+    let store_display = cfg
+        .store
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    let cache_key = sanitize_launcher_cache_key(cfg.app_id);
+
+    let replacements: &[(&str, String)] = &[
+        ("__CLEAN_TITLE_DEBUG__", format!("{:?}", cfg.clean_title)),
+        ("__STORE_DEBUG__", format!("{:?}", store_display)),
+        ("__APP_ID_DEBUG__", format!("{:?}", cfg.app_id)),
+        (
+            "__STEAM_APP_ID_DEBUG__",
+            format!("{:?}", effective_steam_app_id),
+        ),
+        ("__CACHE_KEY_DEBUG__", format!("{:?}", cache_key)),
+        ("__EXE_REL_DEBUG__", format!("{:?}", cfg.exe_rel)),
+        ("__IMAGE_BASE_HEX__", format!("{:016X}", cfg.image_base)),
+        (
+            "__SIZE_OF_IMAGE_HEX__",
+            format!("{:08X}", cfg.size_of_image),
+        ),
+        ("__AOT_FN_COUNT__", cfg.aot_fn_count.to_string()),
+        (
             "__AOT_DYLIB_NAME_DEBUG__",
-            &format!("{:?}", cfg.aot_dylib_name),
-        )
-        .replace("__AOT_DYLIB_NAME__", cfg.aot_dylib_name)
-        .replace(
+            format!("{:?}", cfg.aot_dylib_name),
+        ),
+        (
             "__EXTRA_AOT_DYLIBS_DEBUG__",
-            &format!("{:?}", cfg.extra_aot_dylibs),
-        )
+            format!("{:?}", cfg.extra_aot_dylibs),
+        ),
+    ];
+
+    let mut out = String::with_capacity(BUNDLE_LAUNCHER_TEMPLATE.len() + 256);
+    let mut rest = BUNDLE_LAUNCHER_TEMPLATE;
+    while let Some(pos) = rest.find("__") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if let Some((tok, val)) = replacements.iter().find(|(t, _)| after.starts_with(*t)) {
+            out.push_str(val);
+            rest = &after[tok.len()..];
+        } else {
+            out.push_str("__");
+            rest = &after[2..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Wall-clock stage timings recorded while packaging a macOS `.app` bundle.
@@ -968,7 +1035,7 @@ pub fn convert_steam_game(
     if let Some(ref acq) = acquire_manifest {
         if acq.had_unredacted_secrets {
             let msg = format!(
-                "{ACQUIRE_MANIFEST_FILENAME} contained unredacted auth/secret launch flags (stripped before generating game.toml)"
+                "{ACQUIRE_MANIFEST_FILENAME} contained unredacted auth/secret launch flags (stripped from generated game.toml and bundled manifest copies)"
             );
             eprintln!("warning: {msg}");
             warnings.push(msg);
@@ -983,6 +1050,11 @@ pub fn convert_steam_game(
         .or_else(|| {
             is_numeric_steam_app_id(&resolved_entry.app_id).then(|| "steam".to_string())
         });
+    let resolved_steam_app_id: Option<&str> = if let Some(ref acq) = acquire_manifest {
+        acq.steam_app_id()
+    } else {
+        is_numeric_steam_app_id(&resolved_entry.app_id).then_some(resolved_entry.app_id.trim())
+    };
 
     let primary_exe = resolved_entry.primary_exe.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1028,7 +1100,7 @@ pub fn convert_steam_game(
             )?;
             let post = apply_post_install(
                 &resolved_entry.install_dir,
-                &resolved_entry.app_id,
+                resolved_steam_app_id.unwrap_or("0"),
                 &out_dir,
             )?;
             Ok(SteamConvertResult {
@@ -1197,17 +1269,28 @@ fn package_macos_game_bundle(
     // Detect V8 / Cohtml / CEF using the exact same rules as `audit-game`.
     let v8_jitless = detect_v8_or_cohtml_in_game_dir(&entry.install_dir);
 
-    // Mirror `port-acquire-manifest.json` into `Contents/Resources/` when present and valid.
+    // Resolve whether this bundle actually belongs to Steam (never treat non-Steam numeric IDs
+    // such as GOG product IDs as Steam AppIDs for `steam_appid.txt` or launcher env vars).
+    let resolved_steam_app_id: Option<&str> = if let Some(acq) = acquire_manifest {
+        acq.steam_app_id()
+    } else {
+        is_numeric_steam_app_id(&entry.app_id).then_some(entry.app_id.trim())
+    };
+
+    // Sanitize and mirror `port-acquire-manifest.json` into `Contents/Resources/` when present
+    // and valid so no unredacted auth/secret launch flags are ever packaged into the `.app`.
     let src_acquire_manifest = entry.install_dir.join(ACQUIRE_MANIFEST_FILENAME);
     let dst_acquire_manifest = resources_dir.join(ACQUIRE_MANIFEST_FILENAME);
+    let mut sanitized_acquire_manifest_json: Option<String> = None;
     if acquire_manifest.is_some() && src_acquire_manifest.is_file() {
-        fs::copy(&src_acquire_manifest, &dst_acquire_manifest).with_context(|| {
-            format!(
-                "copying {} -> {}",
-                src_acquire_manifest.display(),
-                dst_acquire_manifest.display()
-            )
+        let raw = fs::read_to_string(&src_acquire_manifest)
+            .with_context(|| format!("reading {}", src_acquire_manifest.display()))?;
+        let (_, sanitized) = sanitize_acquire_manifest_json(&raw)
+            .with_context(|| format!("sanitizing {}", src_acquire_manifest.display()))?;
+        fs::write(&dst_acquire_manifest, &sanitized).with_context(|| {
+            format!("writing sanitized {}", dst_acquire_manifest.display())
         })?;
+        sanitized_acquire_manifest_json = Some(sanitized);
     } else if dst_acquire_manifest.exists() {
         let _ = fs::remove_file(&dst_acquire_manifest);
     }
@@ -1219,20 +1302,24 @@ fn package_macos_game_bundle(
     let display_name = acquire_manifest
         .and_then(|a| a.title.as_deref())
         .unwrap_or(clean_title);
-    let manifest_toml = find_repo_game_manifest(workspace_root, &entry.app_id, &exe_rel)
-        .map(|curated| {
-            merge_acquire_and_v8_into_curated_manifest(&curated, v8_jitless, acquire_manifest)
+    let manifest_toml = find_repo_game_manifest(
+        workspace_root,
+        resolved_steam_app_id.unwrap_or("custom"),
+        &exe_rel,
+    )
+    .map(|curated| {
+        merge_acquire_and_v8_into_curated_manifest(&curated, v8_jitless, acquire_manifest)
+    })
+    .unwrap_or_else(|| {
+        generate_bundle_game_manifest_toml(&BundleManifestInput {
+            display_name,
+            exec_ident,
+            exe_rel: &exe_rel,
+            app_id: &entry.app_id,
+            v8_jitless,
+            acquire_manifest,
         })
-        .unwrap_or_else(|| {
-            generate_bundle_game_manifest_toml(&BundleManifestInput {
-                display_name,
-                exec_ident,
-                exe_rel: &exe_rel,
-                app_id: &entry.app_id,
-                v8_jitless,
-                acquire_manifest,
-            })
-        });
+    });
     fs::write(&manifest_path, manifest_toml)?;
 
     // Copy runtime frameworks (`libmetalirconverter.dylib`, optional `libdxilconv.dylib`,
@@ -1240,8 +1327,9 @@ fn package_macos_game_bundle(
     // works with zero developer environment variables set.
     let staged_frameworks = stage_bundle_frameworks(&frameworks_dir, workspace_root)?;
 
-    // 4. Apply Post-Install (`steam_appid.txt` + `steam_registry.tsv`)
-    let post = apply_post_install(&entry.install_dir, &entry.app_id, &resources_dir)?;
+    // 4. Apply Post-Install (`steam_appid.txt` only for Steam + `steam_registry.tsv`)
+    let post_steam_id = resolved_steam_app_id.unwrap_or("0");
+    let post = apply_post_install(&entry.install_dir, post_steam_id, &resources_dir)?;
 
     // 5. Copy/clone all game files (EXEs, DLLs, assets) into `Contents/Resources/Game`
     let t_copy = Instant::now();
@@ -1263,8 +1351,20 @@ fn package_macos_game_bundle(
                 copy_report.symlinks_skipped_cycle,
             );
         }
+        // Replace the cloned `Contents/Resources/Game/port-acquire-manifest.json` with the
+        // sanitized copy (removing first so copy-on-write/read-only metadata never blocks or
+        // mutates the source install directory).
+        if let Some(ref sanitized) = sanitized_acquire_manifest_json {
+            let game_manifest_copy = bundle_game_dir.join(ACQUIRE_MANIFEST_FILENAME);
+            if game_manifest_copy.exists() || game_manifest_copy.is_symlink() {
+                let _ = fs::remove_file(&game_manifest_copy);
+            }
+            fs::write(&game_manifest_copy, sanitized).with_context(|| {
+                format!("writing sanitized {}", game_manifest_copy.display())
+            })?;
+        }
     }
-    let _ = apply_post_install(&entry.install_dir, &entry.app_id, &bundle_game_dir);
+    let _ = apply_post_install(&entry.install_dir, post_steam_id, &bundle_game_dir);
     stage_timings.payload_copy_secs = t_copy.elapsed().as_secs_f64();
 
     // 6. Shader Pre-Compilation (parallel across cores, defaulting to all shaders unless capped
@@ -1514,7 +1614,9 @@ fn package_macos_game_bundle(
     let standalone_rs_path = aot_dir.join(format!("{ident_lower}_standalone_main.rs"));
     let launcher_cfg = BundleLauncherConfig {
         clean_title,
+        store: store_label.as_deref(),
         app_id: &entry.app_id,
+        steam_app_id: resolved_steam_app_id,
         exe_rel: &exe_rel,
         image_base,
         size_of_image,

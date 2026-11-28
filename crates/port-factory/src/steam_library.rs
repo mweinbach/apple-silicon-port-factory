@@ -24,9 +24,10 @@ mod tests;
 
 pub use crate::bundle_common::{copy_ios_shader_cache, copy_portable_shader_cache};
 pub use acquire_manifest::{
-    format_game_toml_args, is_numeric_steam_app_id, load_acquire_manifest,
-    load_acquire_manifest_in_dir, parse_acquire_manifest, redact_launch_args, AcquireManifest,
-    AcquireRedistItem, ACQUIRE_MANIFEST_FILENAME, ACQUIRE_MANIFEST_SCHEMA_VERSION,
+    format_game_toml_args, is_numeric_steam_app_id, is_valid_app_id, is_valid_store_name,
+    load_acquire_manifest, load_acquire_manifest_in_dir, parse_acquire_manifest,
+    redact_launch_args, sanitize_acquire_manifest_json, AcquireManifest, AcquireRedistItem,
+    ACQUIRE_MANIFEST_FILENAME, ACQUIRE_MANIFEST_SCHEMA_VERSION,
 };
 pub use discovery::{
     default_apps_dir, default_steam_downloads_dir, known_steam_app_metadata,

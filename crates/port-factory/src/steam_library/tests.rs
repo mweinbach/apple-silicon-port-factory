@@ -248,7 +248,9 @@ fn generates_and_executes_self_contained_launcher_with_empty_env() {
 
     let cfg = BundleLauncherConfig {
         clean_title: "TestGame",
+        store: Some("steam"),
         app_id: "12345",
+        steam_app_id: Some("12345"),
         exe_rel: "Bin/TestGame.exe",
         image_base: 0x14000_0000,
         size_of_image: 0x20_0000,
@@ -267,9 +269,12 @@ fn generates_and_executes_self_contained_launcher_with_empty_env() {
     assert!(src.contains("libmetalirconverter.dylib"));
     assert!(src.contains("libdxilconv.dylib"));
     assert!(src.contains("libMoltenVK.dylib"));
-    assert!(!src.contains("__CLEAN_TITLE__"));
-    assert!(!src.contains("__APP_ID__"));
-    assert!(!src.contains("__EXE_REL__"));
+    assert!(!src.contains("__CLEAN_TITLE_DEBUG__"));
+    assert!(!src.contains("__STORE_DEBUG__"));
+    assert!(!src.contains("__APP_ID_DEBUG__"));
+    assert!(!src.contains("__STEAM_APP_ID_DEBUG__"));
+    assert!(!src.contains("__CACHE_KEY_DEBUG__"));
+    assert!(!src.contains("__EXE_REL_DEBUG__"));
 
     // Compile the generated launcher with rustc and run it with an EMPTY environment
     // (`env_clear()`, matching a cold launch from Finder) against a stub `port-runner`.
@@ -1373,4 +1378,331 @@ fn steam_convert_surfaces_prewarm_aot_failure_clearly() {
         .join("Contents/Resources")
         .join(ACQUIRE_MANIFEST_FILENAME)
         .is_file());
+}
+
+#[test]
+fn steam_convert_sanitizes_bundled_acquire_manifests_and_gates_non_steam_numeric_ids() {
+    use crate::win32_db::test_pe_fixture::{build_synthetic_pe, build_synthetic_win32_workspace};
+
+    let tmp = make_temp_dir("sanitize_and_gog_gate");
+    let fake_ws = tmp.path().join("ws");
+    build_synthetic_win32_workspace(&fake_ws);
+
+    // Stage tiny fake `port-runner` (prints Steam env vars during launch, exits 0 on --prewarm-aot)
+    // and fake `dxil-metald` so `convert_steam_game` runs end-to-end quickly.
+    let rel_dir = fake_ws.join("target/aarch64-apple-darwin/release");
+    fs::create_dir_all(&rel_dir).unwrap();
+    let probe_runner_rs = tmp.path().join("probe_runner.rs");
+    fs::write(
+        &probe_runner_rs,
+        r#"fn main() {
+    for k in ["STEAM_APPID", "SteamAppId", "SteamGameId"] {
+        println!("{k}={}", std::env::var(k).unwrap_or_default());
+    }
+}
+"#,
+    )
+    .unwrap();
+    let probe_runner = rel_dir.join("port-runner");
+    let st1 = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            &probe_runner_rs.to_string_lossy(),
+            "-o",
+            &probe_runner.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(st1.status.success());
+
+    let fake_shaderd_rs = tmp.path().join("fake_shaderd.rs");
+    fs::write(
+        &fake_shaderd_rs,
+        "fn main() { println!(\"dxil-metald protocol v1\"); }\n",
+    )
+    .unwrap();
+    let fake_shaderd = rel_dir.join("dxil-metald");
+    let st2 = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            &fake_shaderd_rs.to_string_lossy(),
+            "-o",
+            &fake_shaderd.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(st2.status.success());
+
+    // Synthetic GOG game directory with a NUMERIC non-Steam app_id (`1207658924`) AND
+    // unredacted secret flags in `port-acquire-manifest.json`.
+    let game_dir = tmp.path().join("SyntheticGogGame");
+    fs::create_dir_all(&game_dir).unwrap();
+    let exe_bytes = build_synthetic_pe(
+        false,
+        &[0x31, 0xC0, 0xC3],
+        &[("KERNEL32.dll", &["CreateFileW"])],
+        false,
+    );
+    fs::write(game_dir.join("Classic.exe"), &exe_bytes).unwrap();
+    let raw_manifest = r#"{
+  "schema_version": 1,
+  "generated_by": "port-acquire",
+  "store": "gog",
+  "app_id": "1207658924",
+  "title": "GOG Classic",
+  "version": "1.2.3",
+  "executable": "Classic.exe",
+  "launch_args": [
+    "-skipintro",
+    "-auth_password=SUPER_SECRET_PW",
+    "--token",
+    "LEAKED_TOKEN_VAL",
+    "-windowed"
+  ]
+}
+"#;
+    fs::write(game_dir.join(ACQUIRE_MANIFEST_FILENAME), raw_manifest).unwrap();
+
+    let out_app = tmp.path().join("GOG Classic.app");
+    let res = convert_steam_game(
+        &fake_ws,
+        &SteamConvertOptions {
+            target: game_dir.to_string_lossy().into_owned(),
+            format: ConversionFormat::MacOsApp,
+            output_path: Some(out_app.clone()),
+            precompile_shaders: false,
+            shader_limit: None,
+            max_aot_functions: 0,
+            bundle_shader_cache_from: None,
+        },
+    )
+    .unwrap();
+
+    // Clean up external signing receipt for this synthetic bundle.
+    if let (Some(cache_dir), Some(ref launcher)) = (
+        crate::bundle_codesign::verify_receipt_cache_dir(),
+        &res.standalone_executable,
+    ) {
+        if let Ok(cd) = crate::bundle_codesign::read_macho_code_directory_info(launcher) {
+            let _ = fs::remove_file(cache_dir.join(format!("{}.tsv", cd.cdhash_full_hex)));
+        }
+    }
+
+    // 1. Source manifest must remain untouched; BOTH bundled copies AND game.toml must strip secrets.
+    let src_after = fs::read_to_string(game_dir.join(ACQUIRE_MANIFEST_FILENAME)).unwrap();
+    assert_eq!(src_after, raw_manifest);
+
+    let res_manifest =
+        fs::read_to_string(out_app.join("Contents/Resources").join(ACQUIRE_MANIFEST_FILENAME))
+            .unwrap();
+    let game_manifest = fs::read_to_string(
+        out_app
+            .join("Contents/Resources/Game")
+            .join(ACQUIRE_MANIFEST_FILENAME),
+    )
+    .unwrap();
+    let generated_toml = fs::read_to_string(out_app.join("Contents/Resources/game.toml")).unwrap();
+    for (label, content) in [
+        ("Resources/port-acquire-manifest.json", &res_manifest),
+        ("Resources/Game/port-acquire-manifest.json", &game_manifest),
+        ("Resources/game.toml", &generated_toml),
+    ] {
+        assert!(
+            !content.contains("SUPER_SECRET_PW") && !content.contains("LEAKED_TOKEN_VAL"),
+            "{label} still contained secret launch args:\n{content}"
+        );
+        assert!(
+            content.contains("-skipintro") && content.contains("-windowed"),
+            "{label} lost non-secret launch args:\n{content}"
+        );
+    }
+    assert!(res_manifest.contains("\"generated_by\": \"port-acquire\""));
+    assert_eq!(res_manifest, game_manifest);
+
+    // `bundle-verify` must PASS `acquire_manifest` on the sanitized bundle it just produced.
+    let verify_rep = verify_app_bundle(&out_app).unwrap();
+    let acq_check = verify_rep
+        .checks
+        .iter()
+        .find(|c| c.name == "acquire_manifest")
+        .expect("acquire_manifest check present");
+    assert_eq!(
+        acq_check.status,
+        BundleCheckStatus::Pass,
+        "expected acquire_manifest PASS, got: {:?}",
+        acq_check
+    );
+
+    // 2. Non-Steam numeric GOG ID must NEVER write `steam_appid.txt` or export Steam env vars.
+    assert!(!game_dir.join("steam_appid.txt").exists());
+    assert!(!out_app.join("Contents/Resources/steam_appid.txt").exists());
+    assert!(!out_app
+        .join("Contents/Resources/Game/steam_appid.txt")
+        .exists());
+    assert!(!generated_toml.contains("steam_app_id"), "{generated_toml}");
+
+    let launcher_bin = res
+        .standalone_executable
+        .as_ref()
+        .expect("standalone launcher built");
+    let run_out = Command::new(launcher_bin)
+        .env_clear()
+        .output()
+        .expect("exec GOG launcher");
+    assert!(run_out.status.success());
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(stdout.contains("STEAM_APPID=\n"), "{stdout}");
+    assert!(stdout.contains("SteamAppId=\n"), "{stdout}");
+    assert!(stdout.contains("SteamGameId=\n"), "{stdout}");
+
+    // 3. Injecting a secret ONLY into `Contents/Resources/Game/port-acquire-manifest.json`
+    //    must cause `bundle-verify` to FAIL `acquire_manifest`.
+    fs::write(
+        out_app
+            .join("Contents/Resources/Game")
+            .join(ACQUIRE_MANIFEST_FILENAME),
+        raw_manifest,
+    )
+    .unwrap();
+    let tampered_rep = verify_app_bundle(&out_app).unwrap();
+    let tampered_check = tampered_rep
+        .checks
+        .iter()
+        .find(|c| c.name == "acquire_manifest")
+        .unwrap();
+    assert_eq!(tampered_check.status, BundleCheckStatus::Fail);
+    assert!(
+        tampered_check
+            .detail
+            .contains("Contents/Resources/Game/port-acquire-manifest.json"),
+        "{}",
+        tampered_check.detail
+    );
+
+    // 4. Positive control: a Steam launcher with `store: Some("steam")` and numeric
+    //    `steam_app_id: Some("2357570")` MUST still export all three Steam env vars.
+    let steam_app = tmp.path().join("SteamProbe.app");
+    fs::create_dir_all(steam_app.join("Contents/MacOS")).unwrap();
+    fs::create_dir_all(steam_app.join("Contents/Resources/Game")).unwrap();
+    fs::create_dir_all(steam_app.join("Contents/Frameworks")).unwrap();
+    fs::copy(&probe_runner, steam_app.join("Contents/MacOS/port-runner")).unwrap();
+    let steam_src = generate_bundle_launcher_source(&BundleLauncherConfig {
+        clean_title: "SteamProbe",
+        store: Some("steam"),
+        app_id: "2357570",
+        steam_app_id: Some("2357570"),
+        exe_rel: "Game.exe",
+        image_base: 0x1_4000_0000,
+        size_of_image: 0x1000,
+        aot_fn_count: 0,
+        aot_dylib_name: "",
+        extra_aot_dylibs: &[],
+    });
+    let steam_rs = tmp.path().join("steam_probe.rs");
+    let steam_bin = steam_app.join("Contents/MacOS/SteamProbe");
+    fs::write(&steam_rs, &steam_src).unwrap();
+    let st3 = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            &steam_rs.to_string_lossy(),
+            "-o",
+            &steam_bin.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st3.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st3.stderr)
+    );
+    let steam_run = Command::new(&steam_bin).env_clear().output().unwrap();
+    assert!(steam_run.status.success());
+    let steam_stdout = String::from_utf8_lossy(&steam_run.stdout);
+    assert!(steam_stdout.contains("STEAM_APPID=2357570\n"), "{steam_stdout}");
+    assert!(steam_stdout.contains("SteamAppId=2357570\n"), "{steam_stdout}");
+    assert!(steam_stdout.contains("SteamGameId=2357570\n"), "{steam_stdout}");
+}
+
+#[test]
+fn rejects_unsafe_acquire_manifest_ids_and_escapes_all_launcher_template_fields() {
+    // 1. `parse_acquire_manifest` must reject code-injection / traversal syntax in `app_id`,
+    //    `store`, and `executable`.
+    let injected_app_id = r#"{
+      "schema_version": 1,
+      "store": "epic",
+      "app_id": "\"); } std::process::exit(99); if true { println!(\""
+    }"#;
+    assert!(parse_acquire_manifest(injected_app_id).is_err());
+    assert!(parse_acquire_manifest(
+        r#"{"schema_version":1,"store":"epic","app_id":"../escape"}"#
+    )
+    .is_err());
+    assert!(parse_acquire_manifest(
+        r#"{"schema_version":1,"store":"epic;rm","app_id":"abc123"}"#
+    )
+    .is_err());
+    assert!(parse_acquire_manifest(
+        r#"{"schema_version":1,"store":"epic","app_id":"abc123","executable":"../evil.exe"}"#
+    )
+    .is_err());
+    assert!(is_valid_app_id("a1b2c3d4e5f60718293a4b5c6d7e8f90"));
+    assert!(is_valid_app_id("cat:item_1.0-rc1"));
+    assert!(!is_valid_app_id(r#"" ); std::process::exit(99);"#));
+    assert!(!is_valid_app_id("bad/path"));
+
+    // 2. Defense-in-depth: even if adversarial strings are passed directly to
+    //    `BundleLauncherConfig`, generated Rust code must compile cleanly and never execute
+    //    injected code or expand nested template tokens.
+    let tmp = make_temp_dir("launcher_injection_defense");
+    let app = tmp.path().join("Safe.app");
+    fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    fs::create_dir_all(app.join("Contents/Resources")).unwrap();
+    fs::create_dir_all(app.join("Contents/Frameworks")).unwrap();
+
+    let payload = "\"); } std::process::exit(99); if true { println!(\"__APP_ID_DEBUG__ {0}";
+    let src = generate_bundle_launcher_source(&BundleLauncherConfig {
+        clean_title: payload,
+        store: Some(payload),
+        app_id: payload,
+        steam_app_id: Some(payload),
+        exe_rel: payload,
+        image_base: 0x1_4000_0000,
+        size_of_image: 0x1000,
+        aot_fn_count: 0,
+        aot_dylib_name: payload,
+        extra_aot_dylibs: &[],
+    });
+    let rs_path = tmp.path().join("safe_launcher.rs");
+    let bin_path = app.join("Contents/MacOS/Safe");
+    fs::write(&rs_path, &src).unwrap();
+    let st = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            &rs_path.to_string_lossy(),
+            "-o",
+            &bin_path.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "escaped launcher failed to compile:\n{}\n--- source ---\n{}",
+        String::from_utf8_lossy(&st.stderr),
+        src
+    );
+
+    let out = Command::new(&bin_path)
+        .arg("--aot-info")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "injected exit(99) or crash occurred! status={:?}, stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(payload), "expected literal payload printed: {stdout}");
+    assert!(stdout.contains("Steam AppID            : \n"), "{stdout}");
 }

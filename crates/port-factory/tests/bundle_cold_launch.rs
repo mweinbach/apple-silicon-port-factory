@@ -298,7 +298,9 @@ fn self_contained_app_bundle_cold_launch_with_empty_env() {
     // 4. Compile the generated native ARM64 bundle launcher (`Contents/MacOS/ColdTest`).
     let launcher_cfg = BundleLauncherConfig {
         clean_title: "ColdTest",
+        store: Some("steam"),
         app_id: "999999",
+        steam_app_id: Some("999999"),
         exe_rel: "ColdTest.exe",
         image_base: 0x1_4000_0000,
         size_of_image: 0x3000,

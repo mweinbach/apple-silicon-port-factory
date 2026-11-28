@@ -44,12 +44,17 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--aot-info") {
-        println!("=== Native ARM64 Game Bundle Launcher: __CLEAN_TITLE__ ===");
-        println!("  Steam AppID            : __APP_ID__");
-        println!("  Original PE Executable : __EXE_REL__");
+        println!(
+            "=== Native ARM64 Game Bundle Launcher: {} ===",
+            __CLEAN_TITLE_DEBUG__
+        );
+        println!("  Store                  : {}", __STORE_DEBUG__);
+        println!("  AppID                  : {}", __APP_ID_DEBUG__);
+        println!("  Steam AppID            : {}", __STEAM_APP_ID_DEBUG__);
+        println!("  Original PE Executable : {}", __EXE_REL_DEBUG__);
         println!("  Preferred ImageBase    : 0x__IMAGE_BASE_HEX__ (SizeOfImage: 0x__SIZE_OF_IMAGE_HEX__)");
         println!("  AOT Dylib Functions    : __AOT_FN_COUNT__");
-        println!("  AOT Dylib              : __AOT_DYLIB_NAME__");
+        println!("  AOT Dylib              : {}", __AOT_DYLIB_NAME_DEBUG__);
         println!("  Bundled Manifest (TOML): {}", bundled_manifest.is_file());
         println!("  Bundled AotCache Dir   : {}", bundled_aot_dir.is_dir());
         println!("  Bundled Shader Helper  : {}", bundled_shaderd.is_file());
@@ -124,14 +129,14 @@ fn main() {
         .env("PATH", &bundled_path)
         .env("DYLD_FALLBACK_LIBRARY_PATH", &dyld_fallback);
 
-    let bundled_app_id: &str = __APP_ID_DEBUG__;
-    if !bundled_app_id.is_empty()
-        && bundled_app_id != "0"
-        && bundled_app_id.chars().all(|c| c.is_ascii_digit())
+    let bundled_steam_app_id: &str = __STEAM_APP_ID_DEBUG__;
+    if !bundled_steam_app_id.is_empty()
+        && bundled_steam_app_id != "0"
+        && bundled_steam_app_id.chars().all(|c| c.is_ascii_digit())
     {
-        cmd.env("STEAM_APPID", bundled_app_id)
-            .env("SteamAppId", bundled_app_id)
-            .env("SteamGameId", bundled_app_id);
+        cmd.env("STEAM_APPID", bundled_steam_app_id)
+            .env("SteamAppId", bundled_steam_app_id)
+            .env("SteamGameId", bundled_steam_app_id);
     }
 
     if env_unset("PORT_GAME_DIR") {
@@ -163,7 +168,7 @@ fn main() {
     let user_home = std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);
-    let fallback_tmp_root = std::env::temp_dir().join(format!("port-factory-cache-{}", __APP_ID_DEBUG__));
+    let fallback_tmp_root = std::env::temp_dir().join(format!("port-factory-cache-{}", __CACHE_KEY_DEBUG__));
     let writable_aot_dir = if !prewarm_bundle {
         if let Some(ref home) = user_home {
             home.join("Library/Caches/port-factory/aot")

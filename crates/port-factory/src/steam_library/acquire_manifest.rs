@@ -118,6 +118,44 @@ pub fn is_numeric_steam_app_id(raw: &str) -> bool {
     !t.is_empty() && t != "0" && t.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Returns `true` when `raw` is a safe storefront application identifier
+/// (ASCII alphanumeric plus `-`, `_`, `.`, `:`, max 128 chars, no `..` traversal).
+pub fn is_valid_app_id(raw: &str) -> bool {
+    let t = raw.trim();
+    !t.is_empty()
+        && t.len() <= 128
+        && !t.contains("..")
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+/// Returns `true` when `raw` is a safe storefront name (ASCII alphanumeric plus `-`, `_`, max 64 chars).
+pub fn is_valid_store_name(raw: &str) -> bool {
+    let t = raw.trim();
+    !t.is_empty()
+        && t.len() <= 64
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// Returns `true` when `rel` is a safe relative executable path inside the game install directory
+/// (no absolute paths, drive prefixes, control characters, or `..` components).
+fn is_safe_relative_exe_path(rel: &str) -> bool {
+    let t = rel.trim();
+    if t.is_empty() || t.starts_with('/') || t.starts_with('\\') {
+        return false;
+    }
+    if t.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
+    // Reject Windows drive-letter prefixes like `C:...`
+    let bytes = t.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    !t.split('/').any(|seg| seg == "..")
+}
+
 /// Defense-in-depth secret/token flag redaction for `launch_args`.
 /// Returns `(sanitized_args, redacted_flag_names)`.
 pub fn redact_launch_args(args: &[String]) -> (Vec<String>, Vec<String>) {
@@ -204,9 +242,7 @@ fn non_empty_str(val: Option<&JsonValue>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Parse a schema-v1 `port-acquire-manifest.json` string.
-pub fn parse_acquire_manifest(raw: &str) -> Result<AcquireManifest> {
-    let root = parse_json(raw).map_err(|e| anyhow!("invalid JSON: {e}"))?;
+fn parse_acquire_manifest_value(root: &JsonValue) -> Result<AcquireManifest> {
     if !matches!(root, JsonValue::Object(_)) {
         bail!("port-acquire manifest root must be a JSON object");
     }
@@ -228,10 +264,23 @@ pub fn parse_acquire_manifest(raw: &str) -> Result<AcquireManifest> {
     let store = non_empty_str(root.get("store"))
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
+    if !store.is_empty() && !is_valid_store_name(&store) {
+        bail!("invalid `store` in port-acquire manifest: {store:?}");
+    }
+
     let app_id = non_empty_str(root.get("app_id")).unwrap_or_default();
+    if !app_id.is_empty() && !is_valid_app_id(&app_id) {
+        bail!("invalid `app_id` syntax in port-acquire manifest: {app_id:?}");
+    }
+
     let title = non_empty_str(root.get("title"));
     let version = non_empty_str(root.get("version"));
     let executable = non_empty_str(root.get("executable")).map(|s| s.replace('\\', "/"));
+    if let Some(ref exe) = executable {
+        if !is_safe_relative_exe_path(exe) {
+            bail!("unsafe relative `executable` path in port-acquire manifest: {exe:?}");
+        }
+    }
 
     let raw_args: Vec<String> = root
         .get("launch_args")
@@ -295,6 +344,39 @@ pub fn parse_acquire_manifest(raw: &str) -> Result<AcquireManifest> {
         requires_steamworks,
         redistributables,
     })
+}
+
+/// Parse a schema-v1 `port-acquire-manifest.json` string.
+pub fn parse_acquire_manifest(raw: &str) -> Result<AcquireManifest> {
+    let root = parse_json(raw).map_err(|e| anyhow!("invalid JSON: {e}"))?;
+    parse_acquire_manifest_value(&root)
+}
+
+/// Parse a schema-v1 `port-acquire-manifest.json` string and return both the parsed
+/// [`AcquireManifest`] and a sanitized JSON representation with any secret/auth
+/// `launch_args` stripped while preserving all other fields.
+pub fn sanitize_acquire_manifest_json(raw: &str) -> Result<(AcquireManifest, String)> {
+    let mut root = parse_json(raw).map_err(|e| anyhow!("invalid JSON: {e}"))?;
+    let manifest = parse_acquire_manifest_value(&root)?;
+    if !manifest.had_unredacted_secrets {
+        return Ok((manifest, raw.to_string()));
+    }
+    if let JsonValue::Object(ref mut entries) = root {
+        let sanitized_array = JsonValue::Array(
+            manifest
+                .launch_args
+                .iter()
+                .cloned()
+                .map(JsonValue::Str)
+                .collect(),
+        );
+        if let Some((_, val)) = entries.iter_mut().find(|(k, _)| k == "launch_args") {
+            *val = sanitized_array;
+        }
+    }
+    let mut rendered = root.to_json_pretty();
+    rendered.push('\n');
+    Ok((manifest, rendered))
 }
 
 /// Read and parse a `port-acquire-manifest.json` file from `path`.
