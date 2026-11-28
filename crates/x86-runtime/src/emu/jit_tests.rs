@@ -1481,6 +1481,390 @@ fn translator_dynamic_plain_builtins_take_xfer_plain() {
     }
 }
 
+/// Newly promoted `kernel32` / `ucrtbase` / `msvcp140` pure-host leaf exports must resolve
+/// with `DF_PLAIN` (and alertable waits must stay off `DF_PLAIN`), heap `inline_variant`s
+/// (`malloc`, `calloc`, `realloc`, `_recalloc`, `_aligned_malloc`, `_aligned_offset_malloc`)
+/// must resolve with `(bail = true, needs_xmm = false)`, and live JIT execution of both the
+/// fast paths and bail paths must match the interpreter bit-for-bit while preserving `xmm0`.
+#[test]
+fn promoted_plain_leaf_exports_and_heap_inline_variants() {
+    let exp = |dll: &str, name: &str| {
+        win32_rt::lookup(dll, name).unwrap_or_else(|| panic!("missing builtin {dll}!{name}")) as usize
+    };
+    let scratch = arena_alloc(4096, 16) as u64;
+    let mut next_va = scratch;
+    let mut alloc_va = || {
+        let va = next_va;
+        next_va += 16;
+        va
+    };
+
+    // 1. Every promoted pure-host leaf export must have DF_PLAIN and NOT DF_PLAIN_XMM.
+    let plain_exports: &[(&str, &str)] = &[
+        ("ucrtbase.dll", "_aligned_free"),
+        ("ucrtbase.dll", "_aligned_realloc"),
+        ("ucrtbase.dll", "_aligned_offset_realloc"),
+        ("ucrtbase.dll", "_aligned_recalloc"),
+        ("ucrtbase.dll", "_aligned_msize"),
+        ("ucrtbase.dll", "_expand"),
+        ("ucrtbase.dll", "_get_heap_handle"),
+        ("ucrtbase.dll", "_errno"),
+        ("ucrtbase.dll", "__doserrno"),
+        ("ucrtbase.dll", "_get_errno"),
+        ("ucrtbase.dll", "_set_errno"),
+        ("ucrtbase.dll", "_get_doserrno"),
+        ("ucrtbase.dll", "_set_doserrno"),
+        ("msvcp140.dll", "_Mtx_init_in_situ"),
+        ("msvcp140.dll", "_Mtx_destroy_in_situ"),
+        ("msvcp140.dll", "_Cnd_init_in_situ"),
+        ("msvcp140.dll", "_Cnd_destroy_in_situ"),
+        ("msvcp140.dll", "_Cnd_signal"),
+        ("msvcp140.dll", "_Cnd_broadcast"),
+        ("msvcp140.dll", "_Cnd_wait"),
+        ("msvcp140.dll", "_Cnd_timedwait"),
+        ("msvcp140.dll", "_Cnd_register_at_thread_exit"),
+        ("msvcp140.dll", "_Cnd_unregister_at_thread_exit"),
+        ("msvcp140.dll", "_Cnd_do_broadcast_at_thread_exit"),
+        ("msvcp140.dll", "_Thrd_id"),
+        ("msvcp140.dll", "_Thrd_sleep"),
+        ("msvcp140.dll", "_Mbrtowc"),
+        ("msvcp140.dll", "_Query_perf_counter"),
+        ("msvcp140.dll", "_Query_perf_frequency"),
+        ("msvcp140.dll", "_Xtime_get_ticks"),
+        ("msvcp140.dll", "??0_Lockit@std@@QEAA@H@Z"),
+        ("msvcp140.dll", "??1_Lockit@std@@QEAA@XZ"),
+        ("kernel32.dll", "InitializeCriticalSection"),
+        ("kernel32.dll", "InitializeCriticalSectionAndSpinCount"),
+        ("kernel32.dll", "InitializeCriticalSectionEx"),
+        ("kernel32.dll", "SetCriticalSectionSpinCount"),
+        ("kernel32.dll", "InitializeConditionVariable"),
+        ("kernel32.dll", "ReleaseMutex"),
+        ("kernel32.dll", "WaitForSingleObject"),
+        ("kernel32.dll", "WaitForMultipleObjects"),
+        ("kernel32.dll", "Sleep"),
+        ("kernel32.dll", "GetCurrentProcessorNumberEx"),
+        ("kernel32.dll", "GetThreadId"),
+        ("kernel32.dll", "SetFilePointer"),
+        ("kernel32.dll", "SetFilePointerEx"),
+        ("kernel32.dll", "GetFileSize"),
+        ("kernel32.dll", "GetFileSizeEx"),
+        ("kernel32.dll", "SetEndOfFile"),
+        ("kernel32.dll", "DuplicateHandle"),
+        ("kernel32.dll", "SetHandleInformation"),
+        ("kernel32.dll", "GetHandleInformation"),
+        ("kernel32.dll", "GetSystemInfo"),
+        ("kernel32.dll", "GetNativeSystemInfo"),
+    ];
+    for &(dll, name) in plain_exports {
+        let p = exp(dll, name);
+        let va = alloc_va();
+        crate::exe::register_native_va(va, p);
+        let (h, fl) = resolve_dispatch(va);
+        assert_eq!(h, p, "{dll}!{name}: host fn mismatch");
+        assert_eq!(
+            fl & (DF_PLAIN | DF_PLAIN_XMM),
+            DF_PLAIN,
+            "{dll}!{name}: expected DF_PLAIN without DF_PLAIN_XMM, got flags={fl:#x}"
+        );
+        crate::exe::unregister_native_va(va);
+    }
+
+    // 2. Alertable waits can run guest APC callbacks and must NEVER be classified DF_PLAIN.
+    for &(dll, name) in &[
+        ("kernel32.dll", "WaitForSingleObjectEx"),
+        ("kernel32.dll", "WaitForMultipleObjectsEx"),
+        ("kernel32.dll", "SleepEx"),
+    ] {
+        let p = exp(dll, name);
+        let va = alloc_va();
+        crate::exe::register_native_va(va, p);
+        let (_, fl) = resolve_dispatch(va);
+        assert_eq!(fl & DF_PLAIN, 0, "{dll}!{name}: alertable wait must NOT have DF_PLAIN");
+        crate::exe::unregister_native_va(va);
+    }
+
+    // 3. Heap inline_variants must resolve to (try_fn != export_ptr, bail=true, needs_xmm=false).
+    let plain = jit::plaincall_enabled();
+    for &(dll, name) in &[
+        ("ucrtbase.dll", "malloc"),
+        ("ucrtbase.dll", "_malloc_base"),
+        ("ucrtbase.dll", "calloc"),
+        ("ucrtbase.dll", "_calloc_base"),
+        ("ucrtbase.dll", "realloc"),
+        ("ucrtbase.dll", "_realloc_base"),
+        ("ucrtbase.dll", "_recalloc"),
+        ("ucrtbase.dll", "_recalloc_base"),
+        ("ucrtbase.dll", "_aligned_malloc"),
+        ("ucrtbase.dll", "_aligned_offset_malloc"),
+        ("msvcrt.dll", "realloc"),
+        ("msvcrt.dll", "_aligned_malloc"),
+    ] {
+        let p = exp(dll, name);
+        let va = alloc_va();
+        crate::exe::register_native_va(va, p);
+        let (_, fl) = resolve_dispatch(va);
+        assert_eq!(fl & DF_PLAIN, 0, "{dll}!{name}: inline_variant must not carry DF_PLAIN");
+        if plain {
+            let kind = jit::inline_host_fn_kind(va);
+            assert!(
+                matches!(kind, Some((try_fn, true, false)) if try_fn != p),
+                "{dll}!{name}: expected Some((try_fn, bail=true, needs_xmm=false)), got {kind:?}"
+            );
+        }
+        crate::exe::unregister_native_va(va);
+    }
+
+    // 4. Live JIT vs interpreter parity for fast paths, bail paths, XMM0 preservation,
+    //    and promoted DF_PLAIN UCRT/kernel32/msvcp140 calls.
+    static INV_PARAM_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    unsafe extern "win64" fn test_inv_param(
+        _: *const u16,
+        _: *const u16,
+        _: *const u16,
+        _: u32,
+        _: usize,
+    ) {
+        INV_PARAM_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    let reg = |dll: &str, name: &str, alloc: &mut dyn FnMut() -> u64| -> (u64, usize) {
+        let p = exp(dll, name);
+        let va = alloc();
+        crate::exe::register_native_va(va, p);
+        (va, p)
+    };
+    let (va_realloc, _) = reg("ucrtbase.dll", "realloc", &mut alloc_va);
+    let (va_recalloc, _) = reg("ucrtbase.dll", "_recalloc", &mut alloc_va);
+    let (va_free, _) = reg("ucrtbase.dll", "free", &mut alloc_va);
+    let (va_amalloc, _) = reg("ucrtbase.dll", "_aligned_malloc", &mut alloc_va);
+    let (va_amsize, _) = reg("ucrtbase.dll", "_aligned_msize", &mut alloc_va);
+    let (va_arealloc, _) = reg("ucrtbase.dll", "_aligned_realloc", &mut alloc_va);
+    let (va_afree, _) = reg("ucrtbase.dll", "_aligned_free", &mut alloc_va);
+    let (va_set_errno, _) = reg("ucrtbase.dll", "_set_errno", &mut alloc_va);
+    let (va_get_errno, _) = reg("ucrtbase.dll", "_get_errno", &mut alloc_va);
+    let (va_errno, _) = reg("ucrtbase.dll", "_errno", &mut alloc_va);
+    let (va_mtx_init, _) = reg("msvcp140.dll", "_Mtx_init_in_situ", &mut alloc_va);
+    let (va_mtx_lock, _) = reg("msvcp140.dll", "_Mtx_lock", &mut alloc_va);
+    let (va_mtx_owns, _) = reg("msvcp140.dll", "_Mtx_current_owns", &mut alloc_va);
+    let (va_mtx_unlock, _) = reg("msvcp140.dll", "_Mtx_unlock", &mut alloc_va);
+    let (va_mtx_dtor, _) = reg("msvcp140.dll", "_Mtx_destroy_in_situ", &mut alloc_va);
+    let (va_lockit_ctor, _) = reg("msvcp140.dll", "??0_Lockit@std@@QEAA@H@Z", &mut alloc_va);
+    let (va_lockit_dtor, _) = reg("msvcp140.dll", "??1_Lockit@std@@QEAA@XZ", &mut alloc_va);
+    let (va_cs_init, _) = reg("kernel32.dll", "InitializeCriticalSectionAndSpinCount", &mut alloc_va);
+    let (va_cs_spin, _) = reg("kernel32.dll", "SetCriticalSectionSpinCount", &mut alloc_va);
+    let (va_cs_del, _) = reg("kernel32.dll", "DeleteCriticalSection", &mut alloc_va);
+    let registered = [
+        va_realloc, va_recalloc, va_free, va_amalloc, va_amsize, va_arealloc, va_afree,
+        va_set_errno, va_get_errno, va_errno, va_mtx_init, va_mtx_lock, va_mtx_owns,
+        va_mtx_unlock, va_mtx_dtor, va_lockit_ctor, va_lockit_dtor, va_cs_init, va_cs_spin,
+        va_cs_del,
+    ];
+
+    let c = arena_alloc(0x800, 16);
+    let code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.push(rbx)?;
+        a.push(r12)?;
+        a.push(r13)?;
+        a.sub(rsp, 0x40)?;
+        a.mov(rbx, rcx)?; // rbx = data buffer
+
+        // Load a sentinel into xmm0; pure-integer heap inline_variants (`needs_xmm == false`)
+        // must not clobber xmm0.
+        a.mov(rax, 0x1122_3344_5566_7788u64 as i64)?;
+        a.movq(xmm0, rax)?;
+
+        // realloc(NULL, 32) -> write tag -> realloc(p, 96) -> verify tag -> realloc(p, 0) [bail]
+        a.xor(ecx, ecx)?;
+        a.mov(edx, 32)?;
+        a.call(va_realloc)?;
+        a.mov(r12, rax)?;
+        a.mov(rax, 0xCAFE_BABE_1234_5678u64 as i64)?;
+        a.mov(qword_ptr(r12), rax)?;
+        a.mov(rcx, r12)?;
+        a.mov(edx, 96)?;
+        a.call(va_realloc)?;
+        a.mov(r12, rax)?;
+        a.mov(rax, qword_ptr(r12))?;
+        a.mov(qword_ptr(rbx + 0x00), rax)?; // [0x00] = preserved tag
+        a.mov(rcx, r12)?;
+        a.xor(edx, edx)?;
+        a.call(va_realloc)?; // size == 0 -> bails to real realloc -> frees and returns NULL
+        a.mov(qword_ptr(rbx + 0x08), rax)?; // [0x08] = 0
+
+        // _recalloc(NULL, 4, 8) -> verify zeroed -> write -> _recalloc(p, 8, 8) -> verify
+        // preserved + zero-extended -> _recalloc(p, u64::MAX, 2) [overflow bail -> ENOMEM] -> free
+        a.xor(ecx, ecx)?;
+        a.mov(edx, 4)?;
+        a.mov(r8d, 8)?;
+        a.call(va_recalloc)?;
+        a.mov(r12, rax)?;
+        a.mov(rax, qword_ptr(r12 + 24))?;
+        a.mov(qword_ptr(rbx + 0x10), rax)?; // [0x10] = 0
+        a.mov(rax, 0xDEAD_BEEF_0102_0304u64 as i64)?;
+        a.mov(qword_ptr(r12), rax)?;
+        a.mov(rcx, r12)?;
+        a.mov(edx, 8)?;
+        a.mov(r8d, 8)?;
+        a.call(va_recalloc)?;
+        a.mov(r12, rax)?;
+        a.mov(rax, qword_ptr(r12))?;
+        a.mov(qword_ptr(rbx + 0x18), rax)?; // [0x18] = preserved tag
+        a.mov(rax, qword_ptr(r12 + 56))?;
+        a.mov(qword_ptr(rbx + 0x20), rax)?; // [0x20] = 0 (zero-extended tail)
+        a.mov(rcx, r12)?;
+        a.mov(rdx, -1i64)?;
+        a.mov(r8d, 2)?;
+        a.call(va_recalloc)?; // overflow -> bails -> returns NULL + errno = ENOMEM (12)
+        a.mov(qword_ptr(rbx + 0x28), rax)?; // [0x28] = 0
+        a.call(va_errno)?;
+        a.mov(eax, dword_ptr(rax))?;
+        a.mov(dword_ptr(rbx + 0x30), eax)?; // [0x30] = ENOMEM (12)
+        a.mov(rcx, r12)?;
+        a.call(va_free)?;
+
+        // _aligned_malloc(80, 64) -> verify 64B align & _aligned_msize -> _aligned_realloc(p, 160, 64)
+        // -> _aligned_free(p); load xmm0 sentinel right before the fast-path call and verify
+        // `needs_xmm == false` preserves it across `_aligned_malloc`.
+        a.mov(rax, 0x1122_3344_5566_7788u64 as i64)?;
+        a.movq(xmm0, rax)?;
+        a.mov(ecx, 80)?;
+        a.mov(edx, 64)?;
+        a.call(va_amalloc)?;
+        a.mov(r12, rax)?;
+        a.movq(rax, xmm0)?;
+        a.mov(qword_ptr(rbx + 0x38), rax)?; // [0x38] = xmm0 sentinel
+        a.mov(rax, r12)?;
+        a.and(rax, 63)?;
+        a.mov(qword_ptr(rbx + 0x40), rax)?; // [0x40] = 0 (64B aligned)
+        a.mov(rax, 0x55AA_55AA_9988_7766u64 as i64)?;
+        a.mov(qword_ptr(r12), rax)?;
+        a.mov(rcx, r12)?;
+        a.mov(edx, 64)?;
+        a.xor(r8d, r8d)?;
+        a.call(va_amsize)?;
+        a.mov(qword_ptr(rbx + 0x48), rax)?; // [0x48] = 80
+        a.mov(rcx, r12)?;
+        a.mov(edx, 160)?;
+        a.mov(r8d, 64)?;
+        a.call(va_arealloc)?;
+        a.mov(r12, rax)?;
+        a.mov(rax, r12)?;
+        a.and(rax, 63)?;
+        a.mov(qword_ptr(rbx + 0x50), rax)?; // [0x50] = 0 (64B aligned)
+        a.mov(rax, qword_ptr(r12))?;
+        a.mov(qword_ptr(rbx + 0x58), rax)?; // [0x58] = preserved tag
+        a.mov(rcx, r12)?;
+        a.call(va_afree)?;
+
+        // _aligned_malloc(64, 3): invalid alignment -> bails to real _aligned_malloc ->
+        // sets errno = EINVAL (22) and calls invalid_parameter handler.
+        a.mov(ecx, 64)?;
+        a.mov(edx, 3)?;
+        a.call(va_amalloc)?;
+        a.mov(qword_ptr(rbx + 0x60), rax)?; // [0x60] = 0
+        a.lea(rcx, ptr(rbx + 0x68))?;
+        a.call(va_get_errno)?; // [0x68] = EINVAL (22)
+
+        // _set_errno(17) -> _get_errno(&[0x6C])
+        a.mov(ecx, 17)?;
+        a.call(va_set_errno)?;
+        a.lea(rcx, ptr(rbx + 0x6C))?;
+        a.call(va_get_errno)?;
+
+        // msvcp140 _Mtx_init_in_situ / lock / owns / unlock / destroy + _Lockit ctor/dtor
+        a.lea(rcx, ptr(rbx + 0x100))?;
+        a.mov(edx, 2)?;
+        a.call(va_mtx_init)?;
+        a.lea(rcx, ptr(rbx + 0x100))?;
+        a.call(va_mtx_lock)?;
+        a.lea(rcx, ptr(rbx + 0x100))?;
+        a.call(va_mtx_owns)?;
+        a.mov(dword_ptr(rbx + 0x70), eax)?; // [0x70] = 1
+        a.lea(rcx, ptr(rbx + 0x100))?;
+        a.call(va_mtx_unlock)?;
+        a.lea(rcx, ptr(rbx + 0x100))?;
+        a.call(va_mtx_dtor)?;
+        a.lea(rcx, ptr(rbx + 0x180))?;
+        a.mov(edx, 3)?;
+        a.call(va_lockit_ctor)?;
+        a.mov(eax, dword_ptr(rbx + 0x180))?;
+        a.mov(dword_ptr(rbx + 0x74), eax)?; // [0x74] = 3
+        a.lea(rcx, ptr(rbx + 0x180))?;
+        a.call(va_lockit_dtor)?;
+
+        // kernel32 InitializeCriticalSectionAndSpinCount / SetCriticalSectionSpinCount / Delete
+        a.lea(rcx, ptr(rbx + 0x200))?;
+        a.mov(edx, 4000)?;
+        a.call(va_cs_init)?;
+        a.mov(dword_ptr(rbx + 0x78), eax)?; // [0x78] = 1 (TRUE)
+        a.lea(rcx, ptr(rbx + 0x200))?;
+        a.mov(edx, 1000)?;
+        a.call(va_cs_spin)?;
+        a.mov(dword_ptr(rbx + 0x7C), eax)?; // [0x7C] = 4000 (previous spin)
+        a.lea(rcx, ptr(rbx + 0x200))?;
+        a.call(va_cs_del)?;
+
+        a.xor(eax, eax)?;
+        a.add(rsp, 0x40)?;
+        a.pop(r13)?;
+        a.pop(r12)?;
+        a.pop(rbx)?;
+        a.ret()?;
+        a.assemble(c as u64)
+    })()
+    .expect("assemble");
+
+    let d = arena_alloc(DATA, 64);
+    let init = vec![0u8; DATA];
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), c, code.len());
+        let prev_handler = win32_rt::ucrt::runtime::_set_invalid_parameter_handler(
+            test_inv_param as *const () as usize,
+        );
+        INV_PARAM_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let interp = run_mode(c, d, &init, 2);
+        let jit1 = run_mode(c, d, &init, 1);
+        let jit2 = run_mode(c, d, &init, 1);
+        let hits = INV_PARAM_HITS.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = win32_rt::ucrt::runtime::_set_invalid_parameter_handler(prev_handler);
+        for va in registered {
+            crate::exe::unregister_native_va(va);
+        }
+        assert_eq!(hits, 3, "invalid _aligned_malloc bail path must fire handler on interp + 2 JIT runs");
+        for (label, got) in [("jit1", &jit1), ("jit2", &jit2)] {
+            assert_eq!(got.0, interp.0, "{label}: return mismatch");
+            // Compare the result header `[0x00..0x80]` (CS/Mtx scratch below 0x100..0x240 has handles).
+            assert_eq!(
+                &got.1[..0x80],
+                &interp.1[..0x80],
+                "{label}: result mismatch vs interpreter"
+            );
+        }
+        let r64 = |off: usize| u64::from_le_bytes(jit2.1[off..off + 8].try_into().unwrap());
+        let r32 = |off: usize| u32::from_le_bytes(jit2.1[off..off + 4].try_into().unwrap());
+        assert_eq!(r64(0x00), 0xCAFE_BABE_1234_5678);
+        assert_eq!(r64(0x08), 0);
+        assert_eq!(r64(0x10), 0);
+        assert_eq!(r64(0x18), 0xDEAD_BEEF_0102_0304);
+        assert_eq!(r64(0x20), 0);
+        assert_eq!(r64(0x28), 0);
+        assert_eq!(r32(0x30), 12); // ENOMEM
+        assert_eq!(r64(0x38), 0x1122_3344_5566_7788); // xmm0 preserved
+        assert_eq!(r64(0x40), 0);
+        assert_eq!(r64(0x48), 80);
+        assert_eq!(r64(0x50), 0);
+        assert_eq!(r64(0x58), 0x55AA_55AA_9988_7766);
+        assert_eq!(r64(0x60), 0);
+        assert_eq!(r32(0x68), 22); // EINVAL
+        assert_eq!(r32(0x6C), 17);
+        assert_eq!(r32(0x70), 1);
+        assert_eq!(r32(0x74), 3);
+        assert_eq!(r32(0x78), 1);
+        assert_eq!(r32(0x7C), 4000);
+    }
+}
+
 // --- memory checks / push-pop / budget (AW2_JIT_MEMCHK, AW2_JIT_PUSHPOP, AW2_JIT_BUDGET_BACKEDGE)
 
 const MC_DATA: usize = 0x1000;

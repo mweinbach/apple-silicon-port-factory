@@ -797,6 +797,53 @@ fn is_plain_builtin(h: usize) -> bool {
                 &["__acrt_iob_func"],
             ),
             (
+                &["ucrtbase.dll", "api-ms-win-crt-heap-l1-1-0.dll", "msvcrt.dll"],
+                &[
+                    "_aligned_free",
+                    "_aligned_realloc",
+                    "_aligned_offset_realloc",
+                    "_aligned_recalloc",
+                    "_aligned_msize",
+                    "_expand",
+                    "_get_heap_handle",
+                ],
+            ),
+            (
+                &["ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "msvcrt.dll"],
+                &[
+                    "_errno",
+                    "__doserrno",
+                    "_get_errno",
+                    "_set_errno",
+                    "_get_doserrno",
+                    "_set_doserrno",
+                ],
+            ),
+            (
+                &["msvcp140.dll"],
+                &[
+                    "_Mtx_init_in_situ",
+                    "_Mtx_destroy_in_situ",
+                    "_Cnd_init_in_situ",
+                    "_Cnd_destroy_in_situ",
+                    "_Cnd_signal",
+                    "_Cnd_broadcast",
+                    "_Cnd_wait",
+                    "_Cnd_timedwait",
+                    "_Cnd_register_at_thread_exit",
+                    "_Cnd_unregister_at_thread_exit",
+                    "_Cnd_do_broadcast_at_thread_exit",
+                    "_Thrd_id",
+                    "_Thrd_sleep",
+                    "_Mbrtowc",
+                    "_Query_perf_counter",
+                    "_Query_perf_frequency",
+                    "_Xtime_get_ticks",
+                    "??0_Lockit@std@@QEAA@H@Z",
+                    "??1_Lockit@std@@QEAA@XZ",
+                ],
+            ),
+            (
                 &["kernel32.dll", "kernelbase.dll"],
                 &[
                     "HeapAlloc",
@@ -808,6 +855,28 @@ fn is_plain_builtin(h: usize) -> bool {
                     "HeapLock",
                     "HeapUnlock",
                     "GetProcessHeap",
+                    "InitializeCriticalSection",
+                    "InitializeCriticalSectionAndSpinCount",
+                    "InitializeCriticalSectionEx",
+                    "SetCriticalSectionSpinCount",
+                    "InitializeConditionVariable",
+                    "ReleaseMutex",
+                    // Non-alertable waits only: WaitFor*Ex / SleepEx may run guest APCs.
+                    "WaitForSingleObject",
+                    "WaitForMultipleObjects",
+                    "Sleep",
+                    "GetCurrentProcessorNumberEx",
+                    "GetThreadId",
+                    "SetFilePointer",
+                    "SetFilePointerEx",
+                    "GetFileSize",
+                    "GetFileSizeEx",
+                    "SetEndOfFile",
+                    "DuplicateHandle",
+                    "SetHandleInformation",
+                    "GetHandleInformation",
+                    "GetSystemInfo",
+                    "GetNativeSystemInfo",
                     "GetSystemTimeAsFileTime",
                     "GetSystemTimePreciseAsFileTime",
                     "GetSystemTime",
@@ -928,12 +997,15 @@ pub(crate) fn test_set_extra_plain_flags(host_fn: usize, extra_flags: u32) {
 }
 
 /// Host function the translator may call inline (no bridge, no TLS context) in place of
-/// the non-`DF_PLAIN` host function `h`, with `host_call_asm`'s register setup (Win64 args
-/// 1..8 in x0..x7, xmm0..3 in q0..q3; result rax = x0, xmm0 = q0), and whether a 0 result
-/// means "not handled, make the real call" (then the variant had no side effects).
+/// the non-`DF_PLAIN` host function `h`, returning `(fn_ptr, bail, needs_xmm)`:
+/// - `fn_ptr`: Win64 leaf entrypoint (args 1..8 in x0..x7, result rax = x0; when `needs_xmm`
+///   is true, xmm0..3 in q0..q3, IEEE-754 host FPCR, and result xmm0 = q0);
+/// - `bail`: a 0 return value means "not handled, make the real call" (with zero side effects
+///   before bailing);
+/// - `needs_xmm`: whether XMM0..3/FPCR marshalling is required (false for pure-integer leaves).
 /// Every variant provably never runs guest code.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-pub(super) fn inline_variant(h: usize) -> Option<(usize, bool)> {
+pub(super) fn inline_variant(h: usize) -> Option<(usize, bool, bool)> {
     use win32_rt::ucrt::heap;
     if h == 0 {
         return None;
@@ -947,16 +1019,54 @@ pub(super) fn inline_variant(h: usize) -> Option<(usize, bool)> {
         v.into_boxed_slice()
     });
     if pure.binary_search(&h).is_ok() {
-        return Some((h, false));
+        return Some((h, false, true));
     }
-    if h == heap::malloc as *const () as usize || h == heap::_malloc_base as *const () as usize {
-        return Some((malloc_try as *const () as usize, true));
+    static INLINE_HEAP: std::sync::OnceLock<Box<[(usize, usize)]>> = std::sync::OnceLock::new();
+    let heap_table = INLINE_HEAP.get_or_init(|| {
+        const HEAP_DLLS: &[&str] = &["ucrtbase.dll", "api-ms-win-crt-heap-l1-1-0.dll", "msvcrt.dll"];
+        let specs: &[(&str, usize, usize)] = &[
+            ("malloc", heap::malloc as *const () as usize, malloc_try as *const () as usize),
+            ("_malloc_base", heap::_malloc_base as *const () as usize, malloc_try as *const () as usize),
+            ("calloc", heap::calloc as *const () as usize, calloc_try as *const () as usize),
+            ("_calloc_base", heap::_calloc_base as *const () as usize, calloc_try as *const () as usize),
+            ("realloc", heap::realloc as *const () as usize, realloc_try as *const () as usize),
+            ("_realloc_base", heap::_realloc_base as *const () as usize, realloc_try as *const () as usize),
+            ("_recalloc", heap::_recalloc as *const () as usize, recalloc_try as *const () as usize),
+            ("_recalloc_base", heap::_recalloc_base as *const () as usize, recalloc_try as *const () as usize),
+            (
+                "_aligned_malloc",
+                heap::_aligned_malloc as *const () as usize,
+                aligned_malloc_try as *const () as usize,
+            ),
+            (
+                "_aligned_offset_malloc",
+                heap::_aligned_offset_malloc as *const () as usize,
+                aligned_offset_malloc_try as *const () as usize,
+            ),
+        ];
+        let mut v: Vec<(usize, usize)> = Vec::with_capacity(specs.len() * 2);
+        for &(name, direct_ptr, try_fn) in specs {
+            if direct_ptr != 0 {
+                v.push((direct_ptr, try_fn));
+            }
+            for &dll in HEAP_DLLS {
+                if let Some(p) = win32_rt::lookup(dll, name) {
+                    let addr = p as usize;
+                    if addr != 0 {
+                        v.push((addr, try_fn));
+                    }
+                }
+            }
+        }
+        v.sort_unstable_by_key(|e| e.0);
+        v.dedup_by_key(|e| e.0);
+        v.into_boxed_slice()
+    });
+    if let Ok(idx) = heap_table.binary_search_by_key(&h, |e| e.0) {
+        return Some((heap_table[idx].1, true, false));
     }
-    if h == heap::calloc as *const () as usize || h == heap::_calloc_base as *const () as usize {
-        return Some((calloc_try as *const () as usize, true));
-    }
-    if let Some(hit) = crate::hooks::lookup_extra_inline_variant(h) {
-        return Some(hit);
+    if let Some((f2, bail)) = crate::hooks::lookup_extra_inline_variant(h) {
+        return Some((f2, bail, true));
     }
     None
 }
@@ -965,6 +1075,9 @@ pub(super) fn inline_variant(h: usize) -> Option<(usize, bool)> {
 /// the block, or 0 to make the real call.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 unsafe extern "win64" fn malloc_try(size: usize) -> *mut core::ffi::c_void {
+    if size > isize::MAX as usize {
+        return core::ptr::null_mut();
+    }
     win32_rt::heap::alloc(size.max(1), false)
 }
 
@@ -972,10 +1085,81 @@ unsafe extern "win64" fn malloc_try(size: usize) -> *mut core::ffi::c_void {
 /// to make the real call.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 unsafe extern "win64" fn calloc_try(n: usize, size: usize) -> *mut core::ffi::c_void {
-    match n.checked_mul(size) {
+    match n.checked_mul(size).filter(|&t| t <= isize::MAX as usize) {
         Some(t) => win32_rt::heap::alloc(t.max(1), true),
         None => core::ptr::null_mut(),
     }
+}
+
+/// `realloc` without the `size == 0` free, `errno`, and OOM `_callnewh` paths: the resized
+/// block, or 0 (with zero side effects) to make the real call.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+unsafe extern "win64" fn realloc_try(
+    p: *mut core::ffi::c_void,
+    size: usize,
+) -> *mut core::ffi::c_void {
+    if size > isize::MAX as usize {
+        return core::ptr::null_mut();
+    }
+    if p.is_null() {
+        return win32_rt::heap::alloc(size.max(1), false);
+    }
+    if size == 0 {
+        return core::ptr::null_mut();
+    }
+    win32_rt::heap::realloc(p, size, false, false)
+}
+
+/// `_recalloc` without the overflow, `t == 0`, `errno`, and OOM `_callnewh` paths: the
+/// zero-extended block, or 0 (with zero side effects) to make the real call.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+unsafe extern "win64" fn recalloc_try(
+    p: *mut core::ffi::c_void,
+    n: usize,
+    size: usize,
+) -> *mut core::ffi::c_void {
+    let Some(t) = n.checked_mul(size).filter(|&t| t <= isize::MAX as usize) else {
+        return core::ptr::null_mut();
+    };
+    if p.is_null() {
+        return win32_rt::heap::alloc(t.max(1), true);
+    }
+    if t == 0 {
+        return core::ptr::null_mut();
+    }
+    win32_rt::heap::realloc(p, t, true, false)
+}
+
+/// `_aligned_offset_malloc` without the `invalid_parameter` and OOM `errno` paths: the
+/// aligned block, or 0 (with zero side effects) to make the real call.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+unsafe extern "win64" fn aligned_offset_malloc_try(
+    size: usize,
+    align: usize,
+    off: usize,
+) -> *mut core::ffi::c_void {
+    if !align.is_power_of_two() || !(off == 0 || (size > 0 && off < size)) {
+        return core::ptr::null_mut();
+    }
+    let eff_align = align.max(core::mem::size_of::<usize>());
+    let ok_size = size
+        .checked_add(eff_align)
+        .and_then(|v| v.checked_add(core::mem::size_of::<usize>() * 2))
+        .is_some_and(|v| v <= isize::MAX as usize);
+    if !ok_size {
+        return core::ptr::null_mut();
+    }
+    win32_rt::heap::aligned_alloc(size, align, off)
+}
+
+/// `_aligned_malloc` without the `invalid_parameter` and OOM `errno` paths: the aligned
+/// block, or 0 (with zero side effects) to make the real call.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+unsafe extern "win64" fn aligned_malloc_try(
+    size: usize,
+    align: usize,
+) -> *mut core::ffi::c_void {
+    aligned_offset_malloc_try(size, align, 0)
 }
 
 /// [`resolve_host_callable`] plus the call's ABI flags (`DF_*`), memoized in a per-thread

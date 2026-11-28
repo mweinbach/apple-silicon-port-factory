@@ -973,11 +973,11 @@ fn classify_plain_leaf(
         });
     }
     if flags == DF_VALID | DF_HOST {
-        if let Some((f2, bail)) = inline_variant(h) {
+        if let Some((f2, bail, needs_xmm)) = inline_variant(h) {
             return Some(PlainLeafSpec {
                 host_fn: f2,
                 bail,
-                needs_xmm: true,
+                needs_xmm,
                 needs_stack: false,
                 cacheable: !bail,
             });
