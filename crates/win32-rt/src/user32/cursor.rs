@@ -1281,9 +1281,84 @@ pub unsafe extern "win64" fn LoadIconW(inst: HINSTANCE, name: LPCWSTR) -> usize 
 
 const RT_BITMAP: u16 = 2;
 
-/// Decode a standalone DIB resource (`RT_BITMAP`: `BITMAPINFOHEADER` + optional palette
-/// + pixel rows, where `biHeight` is the actual image height) into top-down 32bpp BGRA.
+#[derive(Clone, Copy, Debug)]
+struct ChannelMask {
+    mask: u32,
+    shift: u32,
+    max_val: u64,
+}
+
+impl ChannelMask {
+    fn from_mask(mask: u32, bpp: u16) -> Option<Self> {
+        if mask == 0 {
+            return Some(Self { mask: 0, shift: 0, max_val: 0 });
+        }
+        if bpp == 16 && (mask & !0xFFFF) != 0 {
+            return None;
+        }
+        let shift = mask.trailing_zeros();
+        let shifted = mask >> shift;
+        // Contiguous bitfield masks satisfy `shifted & (shifted + 1) == 0` (handling `u32::MAX`).
+        if shifted != u32::MAX && (shifted & shifted.wrapping_add(1)) != 0 {
+            return None;
+        }
+        Some(Self { mask, shift, max_val: shifted as u64 })
+    }
+
+    #[inline]
+    fn extract(self, v: u32, default_when_zero: u8) -> u8 {
+        if self.mask == 0 {
+            return default_when_zero;
+        }
+        let raw = ((v & self.mask) >> self.shift) as u64;
+        ((raw * 255 + (self.max_val / 2)) / self.max_val) as u8
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BitfieldLayout {
+    r: ChannelMask,
+    g: ChannelMask,
+    b: ChannelMask,
+    a: ChannelMask,
+}
+
+impl BitfieldLayout {
+    fn from_masks(r_m: u32, g_m: u32, b_m: u32, a_m: u32, bpp: u16) -> Option<Self> {
+        // Reject overlapping channels or completely empty RGB masks.
+        if ((r_m & g_m) | (r_m & b_m) | (g_m & b_m) | ((r_m | g_m | b_m) & a_m)) != 0 {
+            return None;
+        }
+        if (r_m | g_m | b_m) == 0 {
+            return None;
+        }
+        Some(Self {
+            r: ChannelMask::from_mask(r_m, bpp)?,
+            g: ChannelMask::from_mask(g_m, bpp)?,
+            b: ChannelMask::from_mask(b_m, bpp)?,
+            a: ChannelMask::from_mask(a_m, bpp)?,
+        })
+    }
+
+    #[inline]
+    fn decode_bgra(self, v: u32) -> [u8; 4] {
+        [
+            self.b.extract(v, 0),
+            self.g.extract(v, 0),
+            self.r.extract(v, 0),
+            self.a.extract(v, 0xFF),
+        ]
+    }
+}
+
+/// Decode a standalone DIB resource (`RT_BITMAP`: `BITMAPINFOHEADER`/`V2`/`V3`/`V4`/`V5`
+/// + optional bitfield masks/palette + pixel rows, where `biHeight` is the actual image height)
+/// into top-down 32bpp BGRA.
 fn decode_dib_bitmap_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const BI_RGB: u32 = 0;
+    const BI_BITFIELDS: u32 = 3;
+    const BI_ALPHABITFIELDS: u32 = 6;
+
     if bytes.len() < 40 {
         return None;
     }
@@ -1302,10 +1377,49 @@ fn decode_dib_bitmap_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if width == 0 || height == 0 || width > 8192 || height > 8192 {
         return None;
     }
-    // Support BI_RGB (0) and BI_BITFIELDS (3) for 16/32bpp.
-    if compression != 0 && !(compression == 3 && matches!(bpp, 16 | 32)) {
+    // Support BI_RGB (0), BI_BITFIELDS (3), and BI_ALPHABITFIELDS (6) for 16/32bpp.
+    let is_bitfields = matches!(compression, BI_BITFIELDS | BI_ALPHABITFIELDS);
+    if compression != BI_RGB && !(is_bitfields && matches!(bpp, 16 | 32)) {
         return None;
     }
+
+    let read_u32 = |off: usize| -> Option<u32> {
+        if off.checked_add(4)? > bytes.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]))
+    };
+
+    let (bitfields, extra_mask_dwords) = if is_bitfields {
+        let (r_m, g_m, b_m, a_m, extra) = if bi_size == 40 {
+            let r = read_u32(40)?;
+            let g = read_u32(44)?;
+            let b = read_u32(48)?;
+            if compression == BI_ALPHABITFIELDS {
+                (r, g, b, read_u32(52)?, 4usize)
+            } else {
+                (r, g, b, 0u32, 3usize)
+            }
+        } else if bi_size >= 52 {
+            // BITMAPV2INFOHEADER (52), V3 (56), V4 (108), V5 (124) embed channel masks at +40..+56.
+            let r = read_u32(40)?;
+            let g = read_u32(44)?;
+            let b = read_u32(48)?;
+            let a = if bi_size >= 56 {
+                read_u32(52)?
+            } else if compression == BI_ALPHABITFIELDS {
+                return None;
+            } else {
+                0
+            };
+            (r, g, b, a, 0usize)
+        } else {
+            return None;
+        };
+        (Some(BitfieldLayout::from_masks(r_m, g_m, b_m, a_m, bpp)?), extra)
+    } else {
+        (None, 0usize)
+    };
 
     let top_down = raw_h < 0;
     let w_u = width as usize;
@@ -1316,13 +1430,10 @@ fn decode_dib_bitmap_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         } else {
             1usize << (bpp as usize)
         }
-    } else if compression == 3 && bi_size == 40 {
-        // 3 DWORD channel masks immediately follow a 40-byte BITMAPINFOHEADER.
-        3
     } else {
         0
     };
-    let palette_off = bi_size;
+    let palette_off = bi_size.checked_add(extra_mask_dwords.checked_mul(4)?)?;
     let pixel_off = palette_off.checked_add(palette_entries.checked_mul(4)?)?;
     let stride = ((w_u.checked_mul(bpp as usize)?.checked_add(31)?) & !31) / 8;
     let pixel_bytes = stride.checked_mul(h_u)?;
@@ -1338,7 +1449,12 @@ fn decode_dib_bitmap_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
             let px: [u8; 4] = match bpp {
                 32 => {
                     let o = x * 4;
-                    [row[o], row[o + 1], row[o + 2], row[o + 3]]
+                    if let Some(bf) = bitfields {
+                        let v = u32::from_le_bytes([row[o], row[o + 1], row[o + 2], row[o + 3]]);
+                        bf.decode_bgra(v)
+                    } else {
+                        [row[o], row[o + 1], row[o + 2], row[o + 3]]
+                    }
                 }
                 24 => {
                     let o = x * 3;
@@ -1346,11 +1462,16 @@ fn decode_dib_bitmap_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                 }
                 16 => {
                     let o = x * 2;
-                    let v = u16::from_le_bytes([row[o], row[o + 1]]);
-                    let r = (((v >> 10) & 0x1F) * 255 / 31) as u8;
-                    let g = (((v >> 5) & 0x1F) * 255 / 31) as u8;
-                    let b = ((v & 0x1F) * 255 / 31) as u8;
-                    [b, g, r, 0xFF]
+                    let v = u16::from_le_bytes([row[o], row[o + 1]]) as u32;
+                    if let Some(bf) = bitfields {
+                        bf.decode_bgra(v)
+                    } else {
+                        // BI_RGB 16bpp default is RGB555.
+                        let r = (((v >> 10) & 0x1F) * 255 / 31) as u8;
+                        let g = (((v >> 5) & 0x1F) * 255 / 31) as u8;
+                        let b = ((v & 0x1F) * 255 / 31) as u8;
+                        [b, g, r, 0xFF]
+                    }
                 }
                 8 => {
                     let idx = row[x] as usize;
@@ -1391,6 +1512,390 @@ fn decode_dib_bitmap_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     Some((width, height, bgra))
 }
 
+#[derive(Clone, Copy)]
+enum OemButtonStyle {
+    Normal,
+    Pressed,
+    Inactive,
+    Flat,
+}
+
+/// Renders a 16×16 32bpp BGRA standard Windows OEM UI glyph bitmap.
+fn render_oem_glyph_16x16(rows: &[&str; 16], style: OemButtonStyle) -> (u32, u32, Vec<u8>) {
+    const BG_FACE: [u8; 4] = [0xD4, 0xD4, 0xD4, 0xFF];
+    const BG_WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+    const HI_LIGHT: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+    const SHADOW: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
+    const DARK: [u8; 4] = [0x40, 0x40, 0x40, 0xFF];
+    const FG_BLACK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
+    const FG_GRAY: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
+
+    let mut bgra = vec![0u8; 16 * 16 * 4];
+    let put = |buf: &mut [u8], x: usize, y: usize, c: [u8; 4]| {
+        if x < 16 && y < 16 {
+            let o = (y * 16 + x) * 4;
+            buf[o..o + 4].copy_from_slice(&c);
+        }
+    };
+
+    let (fill, fg, shift) = match style {
+        OemButtonStyle::Normal => (BG_FACE, FG_BLACK, 0usize),
+        OemButtonStyle::Pressed => (BG_FACE, FG_BLACK, 1usize),
+        OemButtonStyle::Inactive => (BG_FACE, FG_GRAY, 0usize),
+        OemButtonStyle::Flat => (BG_WHITE, FG_BLACK, 0usize),
+    };
+
+    for y in 0..16 {
+        for x in 0..16 {
+            let color = match style {
+                OemButtonStyle::Flat => fill,
+                OemButtonStyle::Pressed => {
+                    if x == 0 || y == 0 {
+                        DARK
+                    } else if x == 15 || y == 15 {
+                        HI_LIGHT
+                    } else if x == 1 || y == 1 {
+                        SHADOW
+                    } else {
+                        fill
+                    }
+                }
+                OemButtonStyle::Normal | OemButtonStyle::Inactive => {
+                    if x == 15 || y == 15 {
+                        DARK
+                    } else if x == 0 || y == 0 {
+                        HI_LIGHT
+                    } else if x == 14 || y == 14 {
+                        SHADOW
+                    } else {
+                        fill
+                    }
+                }
+            };
+            put(&mut bgra, x, y, color);
+        }
+    }
+
+    for (y, row) in rows.iter().enumerate() {
+        for (x, b) in row.bytes().enumerate().take(16) {
+            if b == b'#' {
+                if matches!(style, OemButtonStyle::Inactive) {
+                    put(&mut bgra, x + 1, y + 1, HI_LIGHT);
+                }
+                put(&mut bgra, x + shift, y + shift, fg);
+            }
+        }
+    }
+    (16, 16, bgra)
+}
+
+/// Renders the classic Windows `OBM_CHECKBOXES` 4×3 state sprite sheet (52×39, 13×13 per cell).
+fn render_oem_checkboxes() -> (u32, u32, Vec<u8>) {
+    const CELL: usize = 13;
+    const W: usize = CELL * 4;
+    const H: usize = CELL * 3;
+    let mut bgra = vec![0xFFu8; W * H * 4]; // white opaque background
+    let put = |buf: &mut [u8], x: usize, y: usize, c: [u8; 4]| {
+        if x < W && y < H {
+            let o = (y * W + x) * 4;
+            buf[o..o + 4].copy_from_slice(&c);
+        }
+    };
+    const BORDER: [u8; 4] = [0x40, 0x40, 0x40, 0xFF];
+    const FACE: [u8; 4] = [0xD4, 0xD4, 0xD4, 0xFF];
+    const CHECK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
+
+    for row in 0..3 {
+        for col in 0..4 {
+            let ox = col * CELL;
+            let oy = row * CELL;
+            let is_radio = row == 1;
+            let checked = (col & 1) != 0;
+            let pressed = (col & 2) != 0;
+            let interior = if pressed || row == 2 { FACE } else { [0xFF, 0xFF, 0xFF, 0xFF] };
+            for cy in 1..12 {
+                for cx in 1..12 {
+                    if is_radio {
+                        let dx = (cx as i32) - 6;
+                        let dy = (cy as i32) - 6;
+                        let d2 = dx * dx + dy * dy;
+                        if (18..=27).contains(&d2) {
+                            put(&mut bgra, ox + cx, oy + cy, BORDER);
+                        } else if d2 < 18 {
+                            put(&mut bgra, ox + cx, oy + cy, interior);
+                            if checked && d2 <= 4 {
+                                put(&mut bgra, ox + cx, oy + cy, CHECK);
+                            }
+                        }
+                    } else if cx == 1 || cx == 11 || cy == 1 || cy == 11 {
+                        put(&mut bgra, ox + cx, oy + cy, BORDER);
+                    } else {
+                        put(&mut bgra, ox + cx, oy + cy, interior);
+                    }
+                }
+            }
+            if !is_radio && checked {
+                // Draw crisp checkmark inside the 11x11 box.
+                for &(dx, dy) in &[(3, 6), (4, 7), (5, 8), (6, 7), (7, 6), (8, 5), (9, 4), (4, 8), (5, 9), (6, 8), (7, 7), (8, 6), (9, 5)] {
+                    put(&mut bgra, ox + dx, oy + dy, CHECK);
+                }
+            }
+        }
+    }
+    (W as u32, H as u32, bgra)
+}
+
+/// Renders real pixel content for standard Windows OEM bitmap IDs (`OBM_*`, `winuser.h`),
+/// or returns `None` for unknown/unsupported IDs.
+fn render_oem_bitmap(id: u16) -> Option<(u32, u32, Vec<u8>)> {
+    const CLOSE: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        "...##......##...",
+        "....##....##....",
+        ".....##..##.....",
+        "......####......",
+        ".......##.......",
+        "......####......",
+        ".....##..##.....",
+        "....##....##....",
+        "...##......##...",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const UP_ARROW: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        "................",
+        ".......##.......",
+        "......####......",
+        ".....######.....",
+        "....########....",
+        "...##########...",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const DN_ARROW: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "...##########...",
+        "....########....",
+        ".....######.....",
+        "......####......",
+        ".......##.......",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const RG_ARROW: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        ".....#..........",
+        ".....##.........",
+        ".....###........",
+        ".....####.......",
+        ".....#####......",
+        ".....####.......",
+        ".....###........",
+        ".....##.........",
+        ".....#..........",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const LF_ARROW: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        "..........#.....",
+        ".........##.....",
+        "........###.....",
+        ".......####.....",
+        "......#####.....",
+        ".......####.....",
+        "........###.....",
+        ".........##.....",
+        "..........#.....",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const REDUCE: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "....########....",
+        "....########....",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const ZOOM: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        "...##########...",
+        "...##########...",
+        "...#........#...",
+        "...#........#...",
+        "...#........#...",
+        "...#........#...",
+        "...#........#...",
+        "...#........#...",
+        "...##########...",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const RESTORE: [&str; 16] = [
+        "................",
+        "................",
+        "......#######...",
+        "......#######...",
+        "......#.....#...",
+        "...#######..#...",
+        "...#######..#...",
+        "...#.....####...",
+        "...#.....#......",
+        "...#.....#......",
+        "...#######......",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const CHECKMARK: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        "............##..",
+        "...........##...",
+        "..........##....",
+        ".........##.....",
+        "..##....##......",
+        "...##..##.......",
+        "....####........",
+        ".....##.........",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    const SIZE_GRIP: [&str; 16] = [
+        "................",
+        "................",
+        "................",
+        "................",
+        ".............#..",
+        "............##..",
+        "...........#.#..",
+        "..........#..#..",
+        ".........#...#..",
+        "........#..#.#..",
+        ".......#..##.#..",
+        "......#..#.#.#..",
+        ".....#..#..#.#..",
+        "....##########..",
+        "................",
+        "................",
+    ];
+    const SIZE_ARROWS: [&str; 16] = [
+        "................",
+        ".......##.......",
+        "......####......",
+        ".....######.....",
+        ".......##.......",
+        "...#...##...#...",
+        "..##...##...##..",
+        ".##############.",
+        ".##############.",
+        "..##...##...##..",
+        "...#...##...#...",
+        ".......##.......",
+        ".....######.....",
+        "......####......",
+        ".......##.......",
+        "................",
+    ];
+    const BTN_CORNERS: [&str; 16] = [
+        "##............##",
+        "#..............#",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "#..............#",
+        "##............##",
+    ];
+
+    match id {
+        32754 | 32767 => Some(render_oem_glyph_16x16(&CLOSE, OemButtonStyle::Normal)), // OBM_CLOSE / OBM_OLD_CLOSE
+        32753 | 32764 => Some(render_oem_glyph_16x16(&UP_ARROW, OemButtonStyle::Normal)), // OBM_UPARROW / OBM_OLD_UPARROW
+        32752 | 32763 => Some(render_oem_glyph_16x16(&DN_ARROW, OemButtonStyle::Normal)), // OBM_DNARROW / OBM_OLD_DNARROW
+        32751 | 32762 => Some(render_oem_glyph_16x16(&RG_ARROW, OemButtonStyle::Normal)), // OBM_RGARROW / OBM_OLD_RGARROW
+        32750 | 32761 => Some(render_oem_glyph_16x16(&LF_ARROW, OemButtonStyle::Normal)), // OBM_LFARROW / OBM_OLD_LFARROW
+        32749 | 32757 => Some(render_oem_glyph_16x16(&REDUCE, OemButtonStyle::Normal)), // OBM_REDUCE / OBM_OLD_REDUCE
+        32748 | 32756 => Some(render_oem_glyph_16x16(&ZOOM, OemButtonStyle::Normal)), // OBM_ZOOM / OBM_OLD_ZOOM
+        32747 | 32755 => Some(render_oem_glyph_16x16(&RESTORE, OemButtonStyle::Normal)), // OBM_RESTORE / OBM_OLD_RESTORE
+        32746 => Some(render_oem_glyph_16x16(&REDUCE, OemButtonStyle::Pressed)), // OBM_REDUCED
+        32745 => Some(render_oem_glyph_16x16(&ZOOM, OemButtonStyle::Pressed)), // OBM_ZOOMD
+        32744 => Some(render_oem_glyph_16x16(&RESTORE, OemButtonStyle::Pressed)), // OBM_RESTORED
+        32743 => Some(render_oem_glyph_16x16(&UP_ARROW, OemButtonStyle::Pressed)), // OBM_UPARROWD
+        32742 => Some(render_oem_glyph_16x16(&DN_ARROW, OemButtonStyle::Pressed)), // OBM_DNARROWD
+        32741 => Some(render_oem_glyph_16x16(&RG_ARROW, OemButtonStyle::Pressed)), // OBM_RGARROWD
+        32740 => Some(render_oem_glyph_16x16(&LF_ARROW, OemButtonStyle::Pressed)), // OBM_LFARROWD
+        32739 => Some(render_oem_glyph_16x16(&RG_ARROW, OemButtonStyle::Flat)), // OBM_MNARROW
+        32738 => Some(render_oem_glyph_16x16(&DN_ARROW, OemButtonStyle::Normal)), // OBM_COMBO
+        32737 => Some(render_oem_glyph_16x16(&UP_ARROW, OemButtonStyle::Inactive)), // OBM_UPARROWI
+        32736 => Some(render_oem_glyph_16x16(&DN_ARROW, OemButtonStyle::Inactive)), // OBM_DNARROWI
+        32735 => Some(render_oem_glyph_16x16(&RG_ARROW, OemButtonStyle::Inactive)), // OBM_RGARROWI
+        32734 => Some(render_oem_glyph_16x16(&LF_ARROW, OemButtonStyle::Inactive)), // OBM_LFARROWI
+        32760 => Some(render_oem_glyph_16x16(&CHECKMARK, OemButtonStyle::Flat)), // OBM_CHECK
+        32759 => Some(render_oem_checkboxes()), // OBM_CHECKBOXES
+        32758 => Some(render_oem_glyph_16x16(&BTN_CORNERS, OemButtonStyle::Flat)), // OBM_BTNCORNERS
+        32766 => Some(render_oem_glyph_16x16(&SIZE_ARROWS, OemButtonStyle::Normal)), // OBM_SIZE
+        32765 => Some(render_oem_glyph_16x16(&SIZE_GRIP, OemButtonStyle::Normal)), // OBM_BTSIZE
+        _ => None,
+    }
+}
+
 unsafe fn load_bitmap_impl(inst: usize, name: *const u16, ansi: bool) -> usize {
     let Some(res_id) = icon_res_id(name, ansi) else {
         set_error(e::INVALID_PARAMETER);
@@ -1398,10 +1903,12 @@ unsafe fn load_bitmap_impl(inst: usize, name: *const u16, ansi: bool) -> usize {
     };
     if inst == 0 {
         if let IconResId::Int(id) = res_id {
-            // Standard Windows OEM bitmap IDs (OBM_CLOSE ..= OBM_OLD_CLOSE: 32734..=32767).
-            if (32734..=32767).contains(&id) {
-                return crate::misc::gdi32::CreateCompatibleBitmap(0, 16, 16);
+            if let Some((w, h, bgra)) = render_oem_bitmap(id) {
+                return create_icon_color_dib(w, h, &bgra);
             }
+            log::warn!("user32: LoadBitmap unsupported OEM bitmap id={id}");
+        } else {
+            log::warn!("user32: LoadBitmap with NULL hInstance requires an integer OEM bitmap ID");
         }
         set_error(e::RESOURCE_NAME_NOT_FOUND);
         return 0;
@@ -2753,11 +3260,91 @@ mod tests {
             assert_eq!(LoadBitmapW(hinst, 999 as LPCWSTR), 0);
             assert_eq!(crate::teb::last_error(), e::RESOURCE_NAME_NOT_FOUND);
 
-            // OEM bitmap (OBM_CLOSE = 32754) with NULL hinst succeeds; invalid ID fails.
+            // OEM bitmaps (OBM_CLOSE = 32754, OBM_CHECK = 32760, OBM_CHECKBOXES = 32759)
+            // return real rendered non-blank DIB pixels; unknown OEM IDs fail honestly.
             let hoem = LoadBitmapW(std::ptr::null_mut(), 32754 as LPCWSTR);
             assert_ne!(hoem, 0);
+            let mut close_bm = [0u8; 32];
+            assert_eq!(crate::misc::gdi32::GetObjectW(hoem, 32, close_bm.as_mut_ptr()), 32);
+            assert_eq!(i32::from_le_bytes(close_bm[4..8].try_into().unwrap()), 16);
+            assert_eq!(i32::from_le_bytes(close_bm[8..12].try_into().unwrap()), 16);
+            let close_bits = usize::from_le_bytes(close_bm[24..32].try_into().unwrap()) as *const u8;
+            let close_slice = std::slice::from_raw_parts(close_bits, 16 * 16 * 4);
+            let dark_pixels = close_slice.chunks_exact(4).filter(|p| p == &[0, 0, 0, 0xFF]).count();
+            let face_pixels = close_slice.chunks_exact(4).filter(|p| p == &[0xD4, 0xD4, 0xD4, 0xFF]).count();
+            assert!(dark_pixels > 10 && face_pixels > 50, "OBM_CLOSE must render a real visible glyph");
+
+            let hchk = LoadBitmapW(std::ptr::null_mut(), 32760 as LPCWSTR);
+            assert_ne!(hchk, 0);
+            let mut chk_bm = [0u8; 32];
+            assert_eq!(crate::misc::gdi32::GetObjectW(hchk, 32, chk_bm.as_mut_ptr()), 32);
+            let chk_bits = usize::from_le_bytes(chk_bm[24..32].try_into().unwrap()) as *const u8;
+            let chk_slice = std::slice::from_raw_parts(chk_bits, 16 * 16 * 4);
+            assert_ne!(close_slice, chk_slice, "distinct OEM bitmaps must produce distinct pixels");
+
+            let hboxes = LoadBitmapW(std::ptr::null_mut(), 32759 as LPCWSTR);
+            assert_ne!(hboxes, 0);
+            let mut box_bm = [0u8; 32];
+            assert_eq!(crate::misc::gdi32::GetObjectW(hboxes, 32, box_bm.as_mut_ptr()), 32);
+            assert_eq!(i32::from_le_bytes(box_bm[4..8].try_into().unwrap()), 52);
+            assert_eq!(i32::from_le_bytes(box_bm[8..12].try_into().unwrap()), 39);
+
             assert_eq!(crate::misc::gdi32::DeleteObject(hoem), TRUE);
+            assert_eq!(crate::misc::gdi32::DeleteObject(hchk), TRUE);
+            assert_eq!(crate::misc::gdi32::DeleteObject(hboxes), TRUE);
+
             assert_eq!(LoadBitmapW(std::ptr::null_mut(), 1 as LPCWSTR), 0);
+            assert_eq!(crate::teb::last_error(), e::RESOURCE_NAME_NOT_FOUND);
+
+            // BI_BITFIELDS 16bpp RGB565 must decode masks accurately (pure green 0x07E0 -> [0, 255, 0, 255]).
+            let mut rgb565 = Vec::new();
+            rgb565.extend_from_slice(&40u32.to_le_bytes()); // biSize
+            rgb565.extend_from_slice(&3i32.to_le_bytes()); // biWidth
+            rgb565.extend_from_slice(&(-1i32).to_le_bytes()); // top-down biHeight
+            rgb565.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+            rgb565.extend_from_slice(&16u16.to_le_bytes()); // biBitCount
+            rgb565.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+            rgb565.extend_from_slice(&[0u8; 20]);
+            // RGB565 masks immediately follow 40-byte BITMAPINFOHEADER.
+            rgb565.extend_from_slice(&0xF800u32.to_le_bytes()); // R
+            rgb565.extend_from_slice(&0x07E0u32.to_le_bytes()); // G
+            rgb565.extend_from_slice(&0x001Fu32.to_le_bytes()); // B
+            // 3 pixels: pure red, pure green, pure blue + 2B row padding
+            rgb565.extend_from_slice(&0xF800u16.to_le_bytes());
+            rgb565.extend_from_slice(&0x07E0u16.to_le_bytes());
+            rgb565.extend_from_slice(&0x001Fu16.to_le_bytes());
+            rgb565.extend_from_slice(&[0u8; 2]);
+            let (w565, h565, px565) = decode_dib_bitmap_to_bgra(&rgb565).expect("RGB565 must decode");
+            assert_eq!((w565, h565), (3, 1));
+            assert_eq!(&px565[0..4], &[0, 0, 255, 255]);   // pure red in BGRA
+            assert_eq!(&px565[4..8], &[0, 255, 0, 255]);   // pure green in BGRA (zero red bleed!)
+            assert_eq!(&px565[8..12], &[255, 0, 0, 255]);  // pure blue in BGRA
+
+            // BI_BITFIELDS 32bpp BITMAPV4HEADER with RGBA masks (non-default channel order + alpha mask).
+            let mut v4_rgba = vec![0u8; 108];
+            v4_rgba[0..4].copy_from_slice(&108u32.to_le_bytes()); // BITMAPV4HEADER
+            v4_rgba[4..8].copy_from_slice(&1i32.to_le_bytes());
+            v4_rgba[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+            v4_rgba[12..14].copy_from_slice(&1u16.to_le_bytes());
+            v4_rgba[14..16].copy_from_slice(&32u16.to_le_bytes());
+            v4_rgba[16..20].copy_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+            v4_rgba[40..44].copy_from_slice(&0x0000_00FFu32.to_le_bytes()); // R in low byte
+            v4_rgba[44..48].copy_from_slice(&0x0000_FF00u32.to_le_bytes()); // G
+            v4_rgba[48..52].copy_from_slice(&0x00FF_0000u32.to_le_bytes()); // B
+            v4_rgba[52..56].copy_from_slice(&0xFF00_0000u32.to_le_bytes()); // A
+            // Pixel R=0x12, G=0x34, B=0x56, A=0x78 -> LE u32 0x78563412 -> BGRA [0x56, 0x34, 0x12, 0x78]
+            v4_rgba.extend_from_slice(&0x7856_3412u32.to_le_bytes());
+            let (wv4, hv4, pxv4) = decode_dib_bitmap_to_bgra(&v4_rgba).expect("32bpp V4 BI_BITFIELDS must decode");
+            assert_eq!((wv4, hv4), (1, 1));
+            assert_eq!(&pxv4[0..4], &[0x56, 0x34, 0x12, 0x78]);
+
+            // Overlapping or non-contiguous BI_BITFIELDS masks must be rejected cleanly.
+            let mut bad_masks = rgb565.clone();
+            bad_masks[44..48].copy_from_slice(&0xF800u32.to_le_bytes()); // G overlaps R
+            assert!(decode_dib_bitmap_to_bgra(&bad_masks).is_none());
+            let mut non_contig = rgb565.clone();
+            non_contig[40..44].copy_from_slice(&0xA000u32.to_le_bytes()); // 1010_0000_0000_0000
+            assert!(decode_dib_bitmap_to_bgra(&non_contig).is_none());
         }
     }
 }

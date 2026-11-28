@@ -46,7 +46,9 @@ enum CounterKind {
     MemoryAvailMBytes,
     MemoryCommitPct,
     ProcessWorkingSet,
+    ProcessWorkingSetPrivate,
     ProcessPrivateBytes,
+    ProcessVirtualBytes,
     ProcessProcessorPct,
     SystemUptimeSec,
 }
@@ -149,8 +151,10 @@ fn parse_counter_path(path: &str) -> Result<CounterKind, i32> {
             _ => Err(PDH_CSTATUS_NO_COUNTER),
         },
         "process" => match ctr_name.as_str() {
-            "working set" | "working set - private" => Ok(CounterKind::ProcessWorkingSet),
-            "private bytes" | "virtual bytes" => Ok(CounterKind::ProcessPrivateBytes),
+            "working set" => Ok(CounterKind::ProcessWorkingSet),
+            "working set - private" => Ok(CounterKind::ProcessWorkingSetPrivate),
+            "private bytes" => Ok(CounterKind::ProcessPrivateBytes),
+            "virtual bytes" => Ok(CounterKind::ProcessVirtualBytes),
             "% processor time" => Ok(CounterKind::ProcessProcessorPct),
             _ => Err(PDH_CSTATUS_NO_COUNTER),
         },
@@ -253,22 +257,89 @@ fn process_cpu_seconds() -> (f64, f64) {
     }
 }
 
-fn process_rss_bytes() -> u64 {
+#[derive(Clone, Copy, Debug)]
+struct ProcessVmMetrics {
+    virtual_size: u64,
+    resident_size: u64,
+    internal: u64,
+    phys_footprint: u64,
+}
+
+/// Samples live current process memory metrics from Mach `TASK_VM_INFO`
+/// (not lifetime peak `ru_maxrss`):
+/// - `resident_size`: current working set
+/// - `internal`: current private anonymous resident pages ("Working Set - Private")
+/// - `phys_footprint`: current private committed/dirty+compressed footprint ("Private Bytes")
+/// - `virtual_size`: current virtual address space size ("Virtual Bytes")
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn process_vm_memory_metrics() -> Option<ProcessVmMetrics> {
+    #[repr(C)]
+    struct TaskVmInfoPrefix {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+        _rest: [u64; 32],
+    }
+    const TASK_VM_INFO: i32 = 22;
+    extern "C" {
+        static mach_task_self_: u32;
+        fn task_info(
+            target_task: u32,
+            flavor: i32,
+            task_info_out: *mut u32,
+            task_info_out_cnt: *mut u32,
+        ) -> i32;
+    }
     unsafe {
-        let mut ru: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 && ru.ru_maxrss > 0 {
-            // macOS reports ru_maxrss in bytes.
-            ru.ru_maxrss as u64
+        let mut info: TaskVmInfoPrefix = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<TaskVmInfoPrefix>() / std::mem::size_of::<u32>()) as u32;
+        let rc = task_info(
+            mach_task_self_,
+            TASK_VM_INFO,
+            &mut info as *mut _ as *mut u32,
+            &mut count,
+        );
+        let min_bytes = std::mem::offset_of!(TaskVmInfoPrefix, phys_footprint) + 8;
+        if rc == 0 && (count as usize) * 4 >= min_bytes {
+            Some(ProcessVmMetrics {
+                virtual_size: info.virtual_size,
+                resident_size: info.resident_size,
+                internal: info.internal,
+                phys_footprint: info.phys_footprint,
+            })
         } else {
-            0
+            None
         }
     }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn process_vm_memory_metrics() -> Option<ProcessVmMetrics> {
+    None
 }
 
 fn sample_counter(
     c: &mut CounterState,
     now: Instant,
     cached_total_ticks: &mut Option<Option<[u32; 4]>>,
+    cached_vm_metrics: &mut Option<Option<ProcessVmMetrics>>,
 ) {
     let val = match c.kind {
         CounterKind::ProcessorTotalPct(target)
@@ -348,8 +419,21 @@ fn sample_counter(
                 }
             }
         }
-        CounterKind::ProcessWorkingSet | CounterKind::ProcessPrivateBytes => {
-            process_rss_bytes() as f64
+        CounterKind::ProcessWorkingSet
+        | CounterKind::ProcessWorkingSetPrivate
+        | CounterKind::ProcessPrivateBytes
+        | CounterKind::ProcessVirtualBytes => {
+            let Some(vm) = *cached_vm_metrics.get_or_insert_with(process_vm_memory_metrics) else {
+                c.last_value = None;
+                return;
+            };
+            match c.kind {
+                CounterKind::ProcessWorkingSet => vm.resident_size as f64,
+                CounterKind::ProcessWorkingSetPrivate => vm.internal as f64,
+                CounterKind::ProcessPrivateBytes => vm.phys_footprint as f64,
+                CounterKind::ProcessVirtualBytes => vm.virtual_size as f64,
+                _ => 0.0,
+            }
         }
         CounterKind::SystemUptimeSec => {
             (unsafe { crate::kernel32::time::GetTickCount64() } as f64) / 1000.0
@@ -418,9 +502,10 @@ pub unsafe extern "win64" fn PdhCollectQueryData(h_query: usize) -> i32 {
     };
     let now = Instant::now();
     let mut cached_total_ticks: Option<Option<[u32; 4]>> = None;
+    let mut cached_vm_metrics: Option<Option<ProcessVmMetrics>> = None;
     for cid in counter_ids {
         if let Some(c) = st.counters.get_mut(&cid) {
-            sample_counter(c, now, &mut cached_total_ticks);
+            sample_counter(c, now, &mut cached_total_ticks, &mut cached_vm_metrics);
         }
     }
     ERROR_SUCCESS
@@ -507,6 +592,22 @@ mod tests {
             let mut c_proc = 0usize;
             assert_eq!(PdhAddCounterW(q, proc_path.as_ptr(), 0, &mut c_proc), ERROR_SUCCESS);
 
+            let ws_path = to_wide_z("\\Process(self)\\Working Set");
+            let mut c_ws = 0usize;
+            assert_eq!(PdhAddCounterW(q, ws_path.as_ptr(), 0, &mut c_ws), ERROR_SUCCESS);
+
+            let ws_priv_path = to_wide_z("\\Process(self)\\Working Set - Private");
+            let mut c_ws_priv = 0usize;
+            assert_eq!(PdhAddCounterW(q, ws_priv_path.as_ptr(), 0, &mut c_ws_priv), ERROR_SUCCESS);
+
+            let priv_path = to_wide_z("\\Process(self)\\Private Bytes");
+            let mut c_priv = 0usize;
+            assert_eq!(PdhAddCounterW(q, priv_path.as_ptr(), 0, &mut c_priv), ERROR_SUCCESS);
+
+            let virt_path = to_wide_z("\\Process(self)\\Virtual Bytes");
+            let mut c_virt = 0usize;
+            assert_eq!(PdhAddCounterW(q, virt_path.as_ptr(), 0, &mut c_virt), ERROR_SUCCESS);
+
             // Out-of-range or missing processor instance fails honestly with PDH_CSTATUS_NO_INSTANCE.
             let bad_inst = to_wide_z("\\Processor(99999)\\% Processor Time");
             let mut c_bad_inst = 1usize;
@@ -557,6 +658,68 @@ mod tests {
             assert!(proc_pct >= 0.0);
             // Total host CPU percentage equals user + kernel (from the exact same Mach tick snapshot).
             assert!((cpu_pct - (user_pct + kern_pct)).abs() <= 1e-6);
+
+            // Process memory counters report live Mach TASK_VM_INFO metrics (not peak ru_maxrss),
+            // distinguish virtual vs resident vs private bytes, and drop when large mappings are freed.
+            let mut read_i64 = |ch: usize| -> i64 {
+                let mut v = [0u8; 16];
+                assert_eq!(PdhGetFormattedCounterValue(ch, PDH_FMT_LARGE, &mut ty, v.as_mut_ptr()), ERROR_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(v.as_ptr() as *const u32), PDH_CSTATUS_VALID_DATA);
+                std::ptr::read_unaligned(v.as_ptr().add(8) as *const i64)
+            };
+            let ws_base = read_i64(c_ws);
+            let ws_priv_base = read_i64(c_ws_priv);
+            let priv_base = read_i64(c_priv);
+            let virt_base = read_i64(c_virt);
+            assert!(ws_base > 0 && ws_priv_base > 0 && priv_base > 0 && virt_base > 0);
+            assert!(virt_base >= ws_base, "virtual bytes ({virt_base}) must be >= working set ({ws_base})");
+
+            // Fault 32 MiB of anonymous private memory, sample, then unmap and verify current metrics drop.
+            const ALLOC_BYTES: usize = 32 * 1024 * 1024;
+            let mapped = libc::mmap(
+                std::ptr::null_mut(),
+                ALLOC_BYTES,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(mapped, libc::MAP_FAILED);
+            for off in (0..ALLOC_BYTES).step_by(4096) {
+                std::ptr::write_volatile((mapped as *mut u8).add(off), 0xA5);
+            }
+            assert_eq!(PdhCollectQueryData(q), ERROR_SUCCESS);
+            let ws_high = read_i64(c_ws);
+            let ws_priv_high = read_i64(c_ws_priv);
+            let priv_high = read_i64(c_priv);
+            let virt_high = read_i64(c_virt);
+            assert!(ws_high >= ws_base + (16 * 1024 * 1024));
+            assert!(ws_priv_high >= ws_priv_base + (16 * 1024 * 1024));
+            assert!(priv_high >= priv_base + (16 * 1024 * 1024));
+            assert!(virt_high >= virt_base + (16 * 1024 * 1024));
+
+            assert_eq!(libc::munmap(mapped, ALLOC_BYTES), 0);
+            assert_eq!(PdhCollectQueryData(q), ERROR_SUCCESS);
+            let ws_after = read_i64(c_ws);
+            let ws_priv_after = read_i64(c_ws_priv);
+            let priv_after = read_i64(c_priv);
+            let virt_after = read_i64(c_virt);
+            assert!(
+                ws_high - ws_after >= 16 * 1024 * 1024,
+                "Working Set must reflect released memory (high={ws_high}, after={ws_after})"
+            );
+            assert!(
+                ws_priv_high - ws_priv_after >= 16 * 1024 * 1024,
+                "Working Set - Private must drop on munmap (high={ws_priv_high}, after={ws_priv_after})"
+            );
+            assert!(
+                priv_high - priv_after >= 16 * 1024 * 1024,
+                "Private Bytes must drop on munmap (high={priv_high}, after={priv_after})"
+            );
+            assert!(
+                virt_high - virt_after >= 16 * 1024 * 1024,
+                "Virtual Bytes must drop on munmap (high={virt_high}, after={virt_after})"
+            );
 
             assert_eq!(PdhCloseQuery(q), ERROR_SUCCESS);
             assert_eq!(PdhCloseQuery(q), PDH_INVALID_HANDLE);
