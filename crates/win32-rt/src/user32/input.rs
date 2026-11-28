@@ -1616,16 +1616,57 @@ pub struct RAWINPUTDEVICE {
 const _: () = assert!(std::mem::size_of::<RAWINPUTDEVICE>() == 16);
 
 const RIDEV_REMOVE: u32 = 0x0000_0001;
+const RIDEV_EXCLUDE: u32 = 0x0000_0010;
+const RIDEV_PAGEONLY: u32 = 0x0000_0020;
 const RIDEV_NOLEGACY: u32 = 0x0000_0030;
 const RIDEV_INPUTSINK: u32 = 0x0000_0100;
 const RIDEV_NOHOTKEYS: u32 = 0x0000_0200;
+const RIDEV_DEVNOTIFY: u32 = 0x0000_2000;
 const RIM_TYPEMOUSE: u32 = 0;
 const RIM_TYPEKEYBOARD: u32 = 1;
+const RIM_TYPEHID: u32 = 2;
+const GIDC_ARRIVAL: usize = 1;
+const GIDC_REMOVAL: usize = 2;
 const RID_INPUT: u32 = 0x1000_0003;
 const RID_HEADER: u32 = 0x1000_0005;
 const HEADER_SIZE: usize = 24;
 const FAKE_MOUSE_DEVICE: usize = 0x0001_0001;
 const FAKE_KEYBOARD_DEVICE: usize = 0x0001_0002;
+/// Base tag for Raw Input `HANDLE`s backed by `misc::hid::Device` (`inst >= 1`).
+const HID_RAW_HANDLE_BASE: usize = 0x0001_0000_0000;
+
+#[inline]
+fn raw_hid_handle(inst: u32) -> usize {
+    HID_RAW_HANDLE_BASE | (inst as usize)
+}
+
+#[inline]
+fn hid_inst_from_raw_handle(h: usize) -> Option<u32> {
+    if (h >> 32) == 1 && (h as u32) != 0 {
+        Some(h as u32)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn is_page_only(flags: u32) -> bool {
+    (flags & RIDEV_NOLEGACY) == RIDEV_PAGEONLY
+}
+
+#[inline]
+fn is_exclude(flags: u32) -> bool {
+    (flags & RIDEV_NOLEGACY) == RIDEV_EXCLUDE
+}
+
+/// Resolve the winning Raw Input registration for `(page, usage)`, honoring exact
+/// overrides, `RIDEV_EXCLUDE` exclusions, and `RIDEV_PAGEONLY` wildcards.
+fn raw_reg_matches(regs: &[RawReg], page: u16, usage: u16) -> Option<RawReg> {
+    if let Some(exact) = regs.iter().find(|r| r.page == page && r.usage == usage && !is_page_only(r.flags)) {
+        return (!is_exclude(exact.flags)).then_some(*exact);
+    }
+    regs.iter().find(|r| r.page == page && is_page_only(r.flags)).copied()
+}
 
 #[derive(Clone, Copy, Debug)]
 struct RawReg {
@@ -1635,6 +1676,10 @@ struct RawReg {
     target: usize,
     #[allow(dead_code)] // registering thread (Windows scopes registrations per thread)
     tid: u32,
+    /// Highest `hid::Device::inst` already announced by this registration's initial
+    /// `RIDEV_DEVNOTIFY` replay; live `GIDC_ARRIVAL` callbacks with `inst <= this`
+    /// are suppressed so a device is never announced twice.
+    devnotify_after_inst: u32,
 }
 
 static RAW_REGS: Mutex<Vec<RawReg>> = Mutex::new(Vec::new());
@@ -1669,7 +1714,7 @@ fn raw_fetch(h: usize) -> Option<Vec<u8>> {
 }
 
 pub fn raw_mouse_registered() -> bool {
-    RAW_REGS.lock().unwrap().iter().any(|r| r.page == 1 && r.usage == 2)
+    raw_reg_matches(&RAW_REGS.lock().unwrap(), 1, 2).is_some()
 }
 
 /// Resolve the live target HWND and foreground flag (`RIM_INPUT` vs `RIM_INPUTSINK`)
@@ -1691,16 +1736,18 @@ fn raw_active_target(reg: RawReg) -> Option<(usize, bool)> {
     Some((target, fg))
 }
 
+/// Resolve the destination HWND for `WM_INPUT_DEVICE_CHANGE` (`RIDEV_DEVNOTIFY`).
+fn raw_devnotify_target(reg: RawReg) -> Option<usize> {
+    let target = if reg.target != 0 { reg.target } else { FOCUS.load(Ordering::Acquire) };
+    (target != 0 && window::exists(target)).then_some(target)
+}
+
 /// True when the given legacy HID device (`(1, 2)` mouse or `(1, 6)` keyboard)
 /// has a live raw-input registration with `RIDEV_NOLEGACY`, suppressing legacy
 /// `WM_MOUSE*` / `WM_KEY*` messages while `WM_INPUT` is delivered to that target.
 fn raw_nolegacy_active(page: u16, usage: u16) -> bool {
-    let reg = RAW_REGS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|r| r.page == page && r.usage == usage && (r.flags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY)
-        .copied();
+    let reg = raw_reg_matches(&RAW_REGS.lock().unwrap(), page, usage)
+        .filter(|r| (r.flags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY);
     reg.and_then(raw_active_target).is_some()
 }
 
@@ -1708,23 +1755,59 @@ fn raw_nolegacy_active(page: u16, usage: u16) -> bool {
 /// registration with `RIDEV_NOHOTKEYS`, disabling application-defined `RegisterHotKey`
 /// interception so keydowns flow through to raw input and normal dispatch.
 fn raw_nohotkeys_active() -> bool {
-    let reg = RAW_REGS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|r| r.page == 1 && r.usage == 6 && (r.flags & RIDEV_NOHOTKEYS) != 0)
-        .copied();
+    let reg = raw_reg_matches(&RAW_REGS.lock().unwrap(), 1, 6)
+        .filter(|r| (r.flags & RIDEV_NOHOTKEYS) != 0);
     reg.and_then(raw_active_target).is_some_and(|(_, fg)| fg)
 }
 
 /// Deliver a raw input record to the registered target (if any).
-fn raw_deliver(page: u16, usage: u16, build: impl FnOnce(usize) -> Vec<u8>) {
-    let reg = RAW_REGS.lock().unwrap().iter().find(|r| r.page == page && r.usage == usage).copied();
+fn raw_deliver(page: u16, usage: u16, build: impl FnOnce(usize, usize) -> Vec<u8>) {
+    let reg = raw_reg_matches(&RAW_REGS.lock().unwrap(), page, usage);
     let Some((target, fg)) = reg.and_then(raw_active_target) else { return };
     let device = if page == 1 && usage == 2 { FAKE_MOUSE_DEVICE } else { FAKE_KEYBOARD_DEVICE };
-    let h = raw_store(build(device));
     let wparam = if fg { 0 } else { 1 }; // RIM_INPUT / RIM_INPUTSINK
+    let h = raw_store(build(device, wparam));
     post_input_to(target, wm::INPUT, wparam, h as isize, Vec::new());
+}
+
+/// Deliver a normalized HID input report (`RIM_TYPEHID`) to any active Raw Input
+/// registration matching `(usage_page, usage)`. Safe to call from any thread.
+pub fn native_raw_hid(inst: u32, usage_page: u16, usage: u16, report: &[u8]) {
+    let reg = raw_reg_matches(&RAW_REGS.lock().unwrap(), usage_page, usage);
+    let Some((target, fg)) = reg.and_then(raw_active_target) else { return };
+    let wparam = if fg { 0 } else { 1 }; // RIM_INPUT / RIM_INPUTSINK
+    let total_size = (HEADER_SIZE + 8 + report.len()) as u32;
+    let mut v = header(RIM_TYPEHID, total_size, raw_hid_handle(inst), wparam);
+    v.extend_from_slice(&(report.len() as u32).to_le_bytes()); // RAWHID.dwSizeHid
+    v.extend_from_slice(&1u32.to_le_bytes()); // RAWHID.dwCount
+    v.extend_from_slice(report);
+    let h = raw_store(v);
+    post_input_to(target, wm::INPUT, wparam, h as isize, Vec::new());
+}
+
+/// True when a `RegisterRawInputDevices` batch includes any live registration
+/// that can match a HID device (anything beyond legacy mouse `(1, 2)` and
+/// keyboard `(1, 6)`), regardless of whether `RIDEV_DEVNOTIFY` was requested.
+fn raw_batch_needs_hid_backend(parsed: &[RAWINPUTDEVICE]) -> bool {
+    parsed.iter().any(|d| {
+        (d.flags & RIDEV_REMOVE) == 0
+            && !is_exclude(d.flags)
+            && (is_page_only(d.flags) || !(d.usage_page == 1 && matches!(d.usage, 2 | 6)))
+    })
+}
+
+/// Notify Raw Input `RIDEV_DEVNOTIFY` listeners (`WM_INPUT_DEVICE_CHANGE`) when
+/// a HID device arrives or is removed. Safe to call from any thread.
+pub fn notify_raw_hid_device_change(inst: u32, usage_page: u16, usage: u16, arrived: bool) {
+    let reg = raw_reg_matches(&RAW_REGS.lock().unwrap(), usage_page, usage)
+        .filter(|r| (r.flags & RIDEV_DEVNOTIFY) != 0);
+    let Some(reg) = reg else { return };
+    if arrived && inst <= reg.devnotify_after_inst {
+        return;
+    }
+    let Some(target) = raw_devnotify_target(reg) else { return };
+    let wparam = if arrived { GIDC_ARRIVAL } else { GIDC_REMOVAL };
+    message::post_message(target, wm::INPUT_DEVICE_CHANGE, wparam, raw_hid_handle(inst) as LPARAM);
 }
 
 fn header(ty: u32, size: u32, device: usize, wparam: usize) -> Vec<u8> {
@@ -1737,8 +1820,7 @@ fn header(ty: u32, size: u32, device: usize, wparam: usize) -> Vec<u8> {
 }
 
 fn raw_mouse(dx: i32, dy: i32, button_flags: u16, button_data: u16) {
-    raw_deliver(1, 2, |dev| {
-        let wp = if APP_ACTIVE.load(Ordering::Acquire) { 0 } else { 1 };
+    raw_deliver(1, 2, |dev, wp| {
         let mut v = header(RIM_TYPEMOUSE, 48, dev, wp);
         v.extend_from_slice(&0u16.to_le_bytes()); // usFlags = MOUSE_MOVE_RELATIVE
         v.extend_from_slice(&0u16.to_le_bytes()); // padding
@@ -1753,8 +1835,7 @@ fn raw_mouse(dx: i32, dy: i32, button_flags: u16, button_data: u16) {
 }
 
 fn raw_keyboard(k: &keymap::Key, down: bool, msg: u32) {
-    raw_deliver(1, 6, |dev| {
-        let wp = if APP_ACTIVE.load(Ordering::Acquire) { 0 } else { 1 };
+    raw_deliver(1, 6, |dev, wp| {
         let mut v = header(RIM_TYPEKEYBOARD, 40, dev, wp);
         let flags: u16 = (!down) as u16 | if k.ext { 2 } else { 0 };
         v.extend_from_slice(&(k.scan as u16).to_le_bytes());
@@ -1773,17 +1854,33 @@ pub unsafe extern "win64" fn RegisterRawInputDevices(devs: *const RAWINPUTDEVICE
         return FALSE;
     }
     let tid = crate::teb::thread_id();
-    let devs = std::slice::from_raw_parts(devs, n as usize);
-    let mut regs = RAW_REGS.lock().unwrap();
-    for d in devs {
+    let mut parsed = Vec::with_capacity(n as usize);
+    for i in 0..n as usize {
+        parsed.push(std::ptr::read_unaligned(devs.add(i)));
+    }
+    // Validate the full batch atomically before mutating `RAW_REGS`.
+    for d in &parsed {
         if d.flags & RIDEV_REMOVE != 0 {
+            if d.target != 0
+                || (d.flags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY
+                || is_exclude(d.flags)
+                || (is_page_only(d.flags) && d.usage != 0)
+            {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            continue;
+        }
+        if is_exclude(d.flags) {
             if d.target != 0 {
                 set_error(e::INVALID_PARAMETER);
                 return FALSE;
             }
-            regs.retain(|r| !(r.page == d.usage_page && r.usage == d.usage));
-            log::info!("RegisterRawInputDevices: removed ({},{})", d.usage_page, d.usage);
             continue;
+        }
+        if is_page_only(d.flags) && d.usage != 0 {
+            set_error(e::INVALID_PARAMETER);
+            return FALSE;
         }
         if d.target != 0 && !window::exists(d.target) {
             set_error(e::INVALID_WINDOW_HANDLE);
@@ -1798,11 +1895,100 @@ pub unsafe extern "win64" fn RegisterRawInputDevices(devs: *const RAWINPUTDEVICE
             set_error(e::INVALID_PARAMETER);
             return FALSE;
         }
-        regs.retain(|r| !(r.page == d.usage_page && r.usage == d.usage));
-        regs.push(RawReg { page: d.usage_page, usage: d.usage, flags: d.flags, target: d.target, tid });
-        log::info!("RegisterRawInputDevices: ({},{}) flags={:#x} target={:#x}", d.usage_page, d.usage, d.flags, d.target);
     }
-    drop(regs);
+
+    // Start the HID backend BEFORE installing the new registrations so:
+    // 1. HID registrations without RIDEV_DEVNOTIFY still start IOHIDManager and receive WM_INPUT;
+    // 2. initial HID matches delivered during backend startup cannot race ahead of our
+    //    RIDEV_DEVNOTIFY initial-arrival replay and announce the same device twice.
+    if raw_batch_needs_hid_backend(&parsed) {
+        crate::misc::hid::ensure_started();
+    }
+
+    let mut newly_devnotify: Vec<(u16, u16, bool)> = Vec::new();
+    let mut has_devnotify = false;
+    for d in &parsed {
+        if (d.flags & RIDEV_REMOVE) == 0 && !is_exclude(d.flags) && (d.flags & RIDEV_DEVNOTIFY) != 0 {
+            has_devnotify = true;
+            let key = (d.usage_page, d.usage, is_page_only(d.flags));
+            if !newly_devnotify.contains(&key) {
+                newly_devnotify.push(key);
+            }
+        }
+    }
+
+    let (final_regs, hid_snapshot) = {
+        let mut regs = RAW_REGS.lock().unwrap();
+        // Lock order is strictly `RAW_REGS` -> `hid::registry()` (`hid.rs` always releases
+        // `registry()` before calling into `user32::input`). Recording `max_inst` under
+        // `RAW_REGS` ensures any concurrent `hid::device_added` arrival already in
+        // `hid_snapshot` is suppressed in `notify_raw_hid_device_change`, while any device
+        // added afterwards (`inst > max_inst`) is announced once by the live callback.
+        let (hid_snapshot, max_inst) = if has_devnotify {
+            crate::misc::hid::devices_with_max_inst()
+        } else {
+            (Vec::new(), 0)
+        };
+        for d in &parsed {
+            let page_only = is_page_only(d.flags);
+            if d.flags & RIDEV_REMOVE != 0 {
+                regs.retain(|r| {
+                    !(r.page == d.usage_page
+                        && is_page_only(r.flags) == page_only
+                        && (page_only || r.usage == d.usage))
+                });
+                log::info!("RegisterRawInputDevices: removed ({},{}) flags={:#x}", d.usage_page, d.usage, d.flags);
+                continue;
+            }
+            regs.retain(|r| {
+                !(r.page == d.usage_page
+                    && is_page_only(r.flags) == page_only
+                    && (page_only || r.usage == d.usage))
+            });
+            let devnotify_after_inst = if !is_exclude(d.flags) && (d.flags & RIDEV_DEVNOTIFY) != 0 {
+                max_inst
+            } else {
+                0
+            };
+            regs.push(RawReg {
+                page: d.usage_page,
+                usage: d.usage,
+                flags: d.flags,
+                target: d.target,
+                tid,
+                devnotify_after_inst,
+            });
+            log::info!("RegisterRawInputDevices: ({},{}) flags={:#x} target={:#x}", d.usage_page, d.usage, d.flags, d.target);
+        }
+        (regs.clone(), hid_snapshot)
+    };
+
+    // Per Microsoft Learn, registering with RIDEV_DEVNOTIFY delivers initial
+    // WM_INPUT_DEVICE_CHANGE(GIDC_ARRIVAL) notifications for already-present matching devices.
+    if !newly_devnotify.is_empty() {
+        let mut present: Vec<(u16, u16, usize)> = vec![
+            (1, 2, FAKE_MOUSE_DEVICE),
+            (1, 6, FAKE_KEYBOARD_DEVICE),
+        ];
+        for dev in hid_snapshot {
+            if dev.connected() {
+                present.push((dev.caps.usage_page, dev.caps.usage, raw_hid_handle(dev.inst)));
+            }
+        }
+        for (page, usage, h_dev) in present {
+            let Some(reg) = raw_reg_matches(&final_regs, page, usage) else { continue };
+            if (reg.flags & RIDEV_DEVNOTIFY) == 0 {
+                continue;
+            }
+            if !newly_devnotify.contains(&(reg.page, reg.usage, is_page_only(reg.flags))) {
+                continue;
+            }
+            if let Some(target) = raw_devnotify_target(reg) {
+                message::post_message(target, wm::INPUT_DEVICE_CHANGE, GIDC_ARRIVAL, h_dev as LPARAM);
+            }
+        }
+    }
+
     super::cursor::update_state();
     TRUE
 }
@@ -1813,8 +1999,9 @@ pub unsafe extern "win64" fn GetRegisteredRawInputDevices(out: *mut RAWINPUTDEVI
         return u32::MAX;
     }
     let regs = RAW_REGS.lock().unwrap();
-    if out.is_null() || (*n as usize) < regs.len() {
-        *n = regs.len() as u32;
+    let cap = std::ptr::read_unaligned(n) as usize;
+    if out.is_null() || cap < regs.len() {
+        std::ptr::write_unaligned(n, regs.len() as u32);
         if !out.is_null() {
             set_error(e::INSUFFICIENT_BUFFER);
             return u32::MAX;
@@ -1822,7 +2009,10 @@ pub unsafe extern "win64" fn GetRegisteredRawInputDevices(out: *mut RAWINPUTDEVI
         return 0;
     }
     for (i, r) in regs.iter().enumerate() {
-        *out.add(i) = RAWINPUTDEVICE { usage_page: r.page, usage: r.usage, flags: r.flags, target: r.target };
+        std::ptr::write_unaligned(
+            out.add(i),
+            RAWINPUTDEVICE { usage_page: r.page, usage: r.usage, flags: r.flags, target: r.target },
+        );
     }
     regs.len() as u32
 }
@@ -1850,6 +2040,7 @@ pub unsafe extern "win64" fn GetRawInputData(h: usize, cmd: u32, data: *mut u8, 
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct RAWINPUTDEVICELIST {
     pub h_device: usize,
     pub dw_type: u32,
@@ -1864,10 +2055,16 @@ pub unsafe extern "win64" fn GetRawInputDeviceList(
         set_error(e::INVALID_PARAMETER);
         return u32::MAX;
     }
-    let devs = [
-        RAWINPUTDEVICELIST { h_device: FAKE_MOUSE_DEVICE, dw_type: RIM_TYPEMOUSE },
-        RAWINPUTDEVICELIST { h_device: FAKE_KEYBOARD_DEVICE, dw_type: RIM_TYPEKEYBOARD },
-    ];
+    crate::misc::hid::ensure_started();
+    let hid_devs = crate::misc::hid::devices();
+    let mut devs = Vec::with_capacity(2 + hid_devs.len());
+    devs.push(RAWINPUTDEVICELIST { h_device: FAKE_MOUSE_DEVICE, dw_type: RIM_TYPEMOUSE });
+    devs.push(RAWINPUTDEVICELIST { h_device: FAKE_KEYBOARD_DEVICE, dw_type: RIM_TYPEKEYBOARD });
+    for d in hid_devs {
+        if d.connected() {
+            devs.push(RAWINPUTDEVICELIST { h_device: raw_hid_handle(d.inst), dw_type: RIM_TYPEHID });
+        }
+    }
     let cap = std::ptr::read_unaligned(num_devices) as usize;
     if list.is_null() {
         std::ptr::write_unaligned(num_devices, devs.len() as u32);
@@ -1894,16 +2091,23 @@ unsafe fn raw_device_info_impl(h_device: usize, cmd: u32, data: *mut u8, pcb_siz
     }
     let is_mouse = h_device == FAKE_MOUSE_DEVICE;
     let is_kbd = h_device == FAKE_KEYBOARD_DEVICE;
-    if !is_mouse && !is_kbd {
+    let hid_dev = if !is_mouse && !is_kbd {
+        hid_inst_from_raw_handle(h_device).and_then(crate::misc::hid::device_by_inst)
+    } else {
+        None
+    };
+    if !is_mouse && !is_kbd && hid_dev.is_none() {
         set_error(crate::types::err::ERROR_INVALID_HANDLE);
         return u32::MAX;
     }
     match cmd {
         RIDI_DEVICENAME => {
-            let name = if is_mouse {
+            let name: &str = if is_mouse {
                 "\\\\?\\HID#VID_05AC&PID_0001#Mouse#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"
-            } else {
+            } else if is_kbd {
                 "\\\\?\\HID#VID_05AC&PID_0002#Keyboard#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}"
+            } else {
+                hid_dev.as_ref().unwrap().path.as_str()
             };
             let need = if wide { name.encode_utf16().count() + 1 } else { name.len() + 1 };
             let cap = std::ptr::read_unaligned(pcb_size) as usize;
@@ -1944,19 +2148,44 @@ unsafe fn raw_device_info_impl(h_device: usize, cmd: u32, data: *mut u8, pcb_siz
                 std::ptr::write_unaligned(data.add(12) as *mut u32, 5); // dwNumberOfButtons
                 std::ptr::write_unaligned(data.add(16) as *mut u32, 1000); // dwSampleRate
                 std::ptr::write_unaligned(data.add(20) as *mut u32, 1); // fHasHorizontalWheel
-            } else {
+            } else if is_kbd {
                 std::ptr::write_unaligned(data.add(4) as *mut u32, RIM_TYPEKEYBOARD);
                 std::ptr::write_unaligned(data.add(8) as *mut u32, 4); // dwType (enhanced)
                 std::ptr::write_unaligned(data.add(16) as *mut u32, 1); // dwKeyboardMode
                 std::ptr::write_unaligned(data.add(20) as *mut u32, 12); // dwNumberOfFunctionKeys
                 std::ptr::write_unaligned(data.add(24) as *mut u32, 3); // dwNumberOfIndicators
                 std::ptr::write_unaligned(data.add(28) as *mut u32, 104); // dwNumberOfKeysTotal
+            } else {
+                let dev = hid_dev.as_ref().unwrap();
+                std::ptr::write_unaligned(data.add(4) as *mut u32, RIM_TYPEHID);
+                std::ptr::write_unaligned(data.add(8) as *mut u32, dev.desc.vendor_id as u32);
+                std::ptr::write_unaligned(data.add(12) as *mut u32, dev.desc.product_id as u32);
+                std::ptr::write_unaligned(data.add(16) as *mut u32, dev.desc.version as u32);
+                std::ptr::write_unaligned(data.add(20) as *mut u16, dev.caps.usage_page);
+                std::ptr::write_unaligned(data.add(22) as *mut u16, dev.caps.usage);
             }
             SIZE as u32
         }
         RIDI_PREPARSEDDATA => {
-            std::ptr::write_unaligned(pcb_size, 0);
-            0
+            if let Some(dev) = hid_dev.as_ref() {
+                let blob = crate::misc::hid::raw_preparsed_bytes(dev);
+                let need = blob.len();
+                let cap = std::ptr::read_unaligned(pcb_size) as usize;
+                if data.is_null() {
+                    std::ptr::write_unaligned(pcb_size, need as u32);
+                    return 0;
+                }
+                if cap < need {
+                    std::ptr::write_unaligned(pcb_size, need as u32);
+                    set_error(e::INSUFFICIENT_BUFFER);
+                    return u32::MAX;
+                }
+                std::ptr::copy_nonoverlapping(blob.as_ptr(), data, need);
+                need as u32
+            } else {
+                std::ptr::write_unaligned(pcb_size, 0);
+                0
+            }
         }
         _ => {
             set_error(e::INVALID_PARAMETER);
@@ -3181,5 +3410,231 @@ mod tests {
             let t1 = (lii.add(4) as *const u32).read_unaligned();
             assert!(t1.wrapping_sub(t0) < 60_000 && t1 != t0, "expected dwTime to advance: t0={t0}, t1={t1}");
         }
+    }
+
+    #[test]
+    fn raw_input_enumerates_hid_devices_preparsed_data_and_delivers_reports() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        const RIDI_PREPARSEDDATA: u32 = 0x2000_0005;
+        const RIDI_DEVICENAME: u32 = 0x2000_0007;
+        const RIDI_DEVICEINFO: u32 = 0x2000_000B;
+        const DEV_ID: u64 = 0xD5_7701;
+
+        std::thread::spawn(|| unsafe {
+            let _be = crate::misc::hid::tests::install_fake_dualsense(DEV_ID);
+            let dev = crate::misc::hid::devices()
+                .into_iter()
+                .find(|d| d.desc.id == DEV_ID)
+                .expect("fake DualSense should be registered");
+            let expected_h = raw_hid_handle(dev.inst);
+
+            // 1. GetRawInputDeviceList reports mouse, keyboard, and the connected HID device.
+            let mut count = 0u32;
+            let entry_size = std::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
+            assert_eq!(GetRawInputDeviceList(std::ptr::null_mut(), &mut count, entry_size), 0);
+            assert!(count >= 3, "expected at least mouse + keyboard + DualSense, got {count}");
+
+            let mut small = [RAWINPUTDEVICELIST { h_device: 0, dw_type: 0 }; 1];
+            let mut small_cnt = 1u32;
+            assert_eq!(GetRawInputDeviceList(small.as_mut_ptr(), &mut small_cnt, entry_size), u32::MAX);
+            assert_eq!(crate::teb::last_error(), e::INSUFFICIENT_BUFFER);
+            assert_eq!(small_cnt, count);
+
+            let mut list = vec![RAWINPUTDEVICELIST { h_device: 0, dw_type: 0 }; count as usize];
+            let got = GetRawInputDeviceList(list.as_mut_ptr(), &mut count, entry_size);
+            assert_eq!(got, count);
+            assert!(list.iter().any(|d| d.h_device == FAKE_MOUSE_DEVICE && d.dw_type == RIM_TYPEMOUSE));
+            assert!(list.iter().any(|d| d.h_device == FAKE_KEYBOARD_DEVICE && d.dw_type == RIM_TYPEKEYBOARD));
+            assert!(list.iter().any(|d| d.h_device == expected_h && d.dw_type == RIM_TYPEHID));
+
+            // 2. GetRawInputDeviceInfoW/A returns device path, RID_DEVICE_INFO_HID, and HidP-usable preparsed data.
+            let mut name_len = 0u32;
+            assert_eq!(GetRawInputDeviceInfoW(expected_h, RIDI_DEVICENAME, std::ptr::null_mut(), &mut name_len), 0);
+            let mut wbuf = vec![0u16; name_len as usize];
+            let written = GetRawInputDeviceInfoW(expected_h, RIDI_DEVICENAME, wbuf.as_mut_ptr().cast(), &mut name_len);
+            assert_eq!(written, name_len);
+            let name_w = String::from_utf16_lossy(&wbuf[..wbuf.len().saturating_sub(1)]);
+            assert_eq!(name_w, dev.path);
+
+            let mut ansi_len = 0u32;
+            assert_eq!(GetRawInputDeviceInfoA(expected_h, RIDI_DEVICENAME, std::ptr::null_mut(), &mut ansi_len), 0);
+            let mut abuf = vec![0u8; ansi_len as usize];
+            assert_eq!(GetRawInputDeviceInfoA(expected_h, RIDI_DEVICENAME, abuf.as_mut_ptr(), &mut ansi_len), ansi_len);
+            assert_eq!(std::str::from_utf8(&abuf[..abuf.len() - 1]).unwrap(), dev.path);
+
+            let mut info = [0u8; 32];
+            let mut info_sz = 32u32;
+            assert_eq!(GetRawInputDeviceInfoW(expected_h, RIDI_DEVICEINFO, info.as_mut_ptr(), &mut info_sz), 32);
+            assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), 32);
+            assert_eq!(u32::from_le_bytes(info[4..8].try_into().unwrap()), RIM_TYPEHID);
+            assert_eq!(u32::from_le_bytes(info[8..12].try_into().unwrap()), 0x054c);
+            assert_eq!(u32::from_le_bytes(info[12..16].try_into().unwrap()), 0x0ce6);
+            assert_eq!(u32::from_le_bytes(info[16..20].try_into().unwrap()), 0x0100);
+            assert_eq!(u16::from_le_bytes(info[20..22].try_into().unwrap()), dev.caps.usage_page);
+            assert_eq!(u16::from_le_bytes(info[22..24].try_into().unwrap()), dev.caps.usage);
+
+            let mut pp_sz = 0u32;
+            assert_eq!(GetRawInputDeviceInfoW(expected_h, RIDI_PREPARSEDDATA, std::ptr::null_mut(), &mut pp_sz), 0);
+            assert_eq!(pp_sz as usize, crate::misc::hid::RAW_PREPARSED_SIZE);
+            let mut pp_buf = vec![0u8; pp_sz as usize];
+            assert_eq!(GetRawInputDeviceInfoW(expected_h, RIDI_PREPARSEDDATA, pp_buf.as_mut_ptr(), &mut pp_sz), pp_sz);
+            let mut caps = [0u8; 64];
+            assert_eq!(crate::misc::hid::HidP_GetCaps(pp_buf.as_ptr(), caps.as_mut_ptr()), 0x0011_0000);
+            assert_eq!(u16::from_le_bytes([caps[0], caps[1]]), dev.caps.usage);
+            assert_eq!(u16::from_le_bytes([caps[2], caps[3]]), dev.caps.usage_page);
+            assert_eq!(u16::from_le_bytes([caps[4], caps[5]]), dev.caps.report_len[0]);
+            // Caller-owned RIDI_PREPARSEDDATA buffer must not be accepted by HidD_FreePreparsedData.
+            assert_eq!(crate::misc::hid::HidD_FreePreparsedData(pp_buf.as_mut_ptr()), 0);
+
+            // 3. RIDEV_PAGEONLY + RIDEV_EXCLUDE + RIDEV_DEVNOTIFY + WM_INPUT (RIM_TYPEHID) + hotplug removal.
+            let cls = crate::strings::to_wide_z("RawHidTestCls");
+            let wc = class::WNDCLASS {
+                style: 0,
+                wndproc: register_typed_host_wndproc(defproc::DefWindowProcW),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = class::RegisterClassW(&wc);
+            let hwnd = window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                ws::POPUP,
+                0,
+                0,
+                100,
+                100,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            set_active_window(hwnd as usize, false);
+            set_focus(hwnd as usize);
+
+            // Invalid RIDEV_PAGEONLY with non-zero usage must fail atomically without modifying RAW_REGS.
+            let bad_regs = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_DEVNOTIFY, target: hwnd as usize },
+                RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_PAGEONLY, target: hwnd as usize },
+            ];
+            assert_eq!(RegisterRawInputDevices(bad_regs.as_ptr(), 2, 16), FALSE);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+
+            // Register page 1 with RIDEV_PAGEONLY | RIDEV_DEVNOTIFY while excluding mouse (1, 2).
+            let regs = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 0, flags: RIDEV_PAGEONLY | RIDEV_DEVNOTIFY, target: hwnd as usize },
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_EXCLUDE, target: 0 },
+            ];
+            assert_eq!(RegisterRawInputDevices(regs.as_ptr(), 2, 16), TRUE);
+            assert!(!raw_mouse_registered(), "excluded mouse must not match page-only registration");
+
+            let mut arrivals = Vec::new();
+            let mut m = MSG::default();
+            while message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE) != 0 {
+                assert_eq!(m.wparam, GIDC_ARRIVAL);
+                arrivals.push(m.lparam as usize);
+            }
+            assert!(arrivals.contains(&expected_h), "expected initial GIDC_ARRIVAL for DualSense: {arrivals:#x?}");
+            assert_eq!(
+                arrivals.iter().filter(|&&h| h == expected_h).count(),
+                1,
+                "already-connected DualSense must receive exactly one GIDC_ARRIVAL"
+            );
+            assert!(arrivals.contains(&FAKE_KEYBOARD_DEVICE), "expected initial GIDC_ARRIVAL for keyboard");
+            assert!(!arrivals.contains(&FAKE_MOUSE_DEVICE), "excluded mouse must not fire GIDC_ARRIVAL");
+
+            // A delayed/in-flight startup callback for the already-announced instance must not replay a second arrival.
+            notify_raw_hid_device_change(dev.inst, dev.caps.usage_page, dev.caps.usage, true);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                FALSE,
+                "delayed arrival for an already-replayed inst must be deduplicated"
+            );
+
+            // A subsequent hotplug arrival (higher inst) must fire GIDC_ARRIVAL once.
+            const DEV_ID_2: u64 = 0xD5_7702;
+            let _be2 = crate::misc::hid::tests::install_fake_dualsense(DEV_ID_2);
+            let dev2 = crate::misc::hid::devices()
+                .into_iter()
+                .find(|d| d.desc.id == DEV_ID_2)
+                .expect("second fake DualSense should be registered");
+            let expected_h2 = raw_hid_handle(dev2.inst);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                TRUE
+            );
+            assert_eq!(m.wparam, GIDC_ARRIVAL);
+            assert_eq!(m.lparam as usize, expected_h2);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                FALSE
+            );
+            crate::misc::hid::device_removed(DEV_ID_2);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                TRUE
+            );
+            assert_eq!(m.wparam, GIDC_REMOVAL);
+            assert_eq!(m.lparam as usize, expected_h2);
+
+            // Non-DEVNOTIFY HID registrations (flags=0, RIDEV_INPUTSINK, RIDEV_PAGEONLY) still require starting the HID backend,
+            // while legacy mouse/keyboard-only, REMOVE, and EXCLUDE batches do not.
+            assert!(raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: 0, target: hwnd as usize }]));
+            assert!(raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 4, flags: RIDEV_INPUTSINK, target: hwnd as usize }]));
+            assert!(raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 0, flags: RIDEV_PAGEONLY, target: hwnd as usize }]));
+            assert!(!raw_batch_needs_hid_backend(&[
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_NOLEGACY, target: hwnd as usize },
+                RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_DEVNOTIFY, target: hwnd as usize },
+            ]));
+            assert!(!raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_REMOVE, target: 0 }]));
+            assert!(!raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_EXCLUDE, target: 0 }]));
+
+            // Deliver a HID report and verify WM_INPUT + GetRawInputData(RID_INPUT) RAWHID payload.
+            let mut rep = [0u8; 64];
+            rep[0] = 0x01;
+            rep[1] = 0x42;
+            rep[2] = 0x99;
+            crate::misc::hid::input_report(DEV_ID, 1, &rep);
+            assert_eq!(message::PeekMessageW(&mut m, hwnd, wm::INPUT, wm::INPUT, message::PM_REMOVE), TRUE);
+            assert_eq!(m.wparam, 0);
+            let mut raw_sz = 0u32;
+            assert_eq!(GetRawInputData(m.lparam as usize, RID_INPUT, std::ptr::null_mut(), &mut raw_sz, 24), 0);
+            assert_eq!(raw_sz as usize, HEADER_SIZE + 8 + 64);
+            let mut raw_buf = vec![0u8; raw_sz as usize];
+            assert_eq!(GetRawInputData(m.lparam as usize, RID_INPUT, raw_buf.as_mut_ptr(), &mut raw_sz, 24), raw_sz);
+            assert_eq!(u32::from_le_bytes(raw_buf[0..4].try_into().unwrap()), RIM_TYPEHID);
+            assert_eq!(u64::from_le_bytes(raw_buf[8..16].try_into().unwrap()) as usize, expected_h);
+            assert_eq!(u32::from_le_bytes(raw_buf[24..28].try_into().unwrap()), 64);
+            assert_eq!(u32::from_le_bytes(raw_buf[28..32].try_into().unwrap()), 1);
+            assert_eq!((raw_buf[32], raw_buf[33], raw_buf[34]), (0x01, 0x42, 0x99));
+
+            // Removing the HID device posts GIDC_REMOVAL and invalidates its Raw Input handle.
+            crate::misc::hid::device_removed(DEV_ID);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                TRUE
+            );
+            assert_eq!(m.wparam, GIDC_REMOVAL);
+            assert_eq!(m.lparam as usize, expected_h);
+            assert_eq!(GetRawInputDeviceInfoW(expected_h, RIDI_DEVICEINFO, info.as_mut_ptr(), &mut info_sz), u32::MAX);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_HANDLE);
+
+            // Clean up registrations & window.
+            let rem = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 0, flags: RIDEV_REMOVE | RIDEV_PAGEONLY, target: 0 },
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_REMOVE, target: 0 },
+            ];
+            assert_eq!(RegisterRawInputDevices(rem.as_ptr(), 2, 16), TRUE);
+            let _ = window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
     }
 }

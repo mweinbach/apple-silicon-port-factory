@@ -36,7 +36,7 @@ use crate::kernel32::file::OVERLAPPED;
 use crate::types::*;
 use parse::{Caps, HIDP_FEATURE, HIDP_INPUT, HIDP_OUTPUT};
 use std::any::Any;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -213,9 +213,12 @@ pub fn device_added(desc: DeviceDesc) -> bool {
         caps.report_len[1],
         caps.report_len[2]
     );
+    let usage_page = caps.usage_page;
+    let usage = caps.usage;
     r.devices.push(Arc::new(Device { desc, caps: Arc::new(caps), path, inst, connected: AtomicBool::new(true), readers: Mutex::new(Vec::new()) }));
     drop(r);
     crate::user32::misc::notify_device_change(true);
+    crate::user32::input::notify_raw_hid_device_change(inst, usage_page, usage, true);
     true
 }
 
@@ -235,6 +238,7 @@ pub fn device_removed(id: u64) {
         h.fail_all(STATUS_DEVICE_NOT_CONNECTED);
     }
     crate::user32::misc::notify_device_change(false);
+    crate::user32::input::notify_raw_hid_device_change(dev.inst, dev.caps.usage_page, dev.caps.usage, false);
 }
 
 /// Windows layout of a report: `[report ID (0 if unnumbered), payload..]`,
@@ -272,11 +276,25 @@ pub fn input_report(id: u64, report_id: u8, data: &[u8]) {
     for h in readers {
         h.deliver(&buf);
     }
+    crate::user32::input::native_raw_hid(dev.inst, dev.caps.usage_page, dev.caps.usage, &buf);
 }
 
 /// Connected devices, in arrival order.
 pub fn devices() -> Vec<Arc<Device>> {
     registry().lock().unwrap().devices.clone()
+}
+
+/// Atomically snapshot currently connected devices along with the highest
+/// `Device::inst` assigned so far (for deduplicating initial `RIDEV_DEVNOTIFY`
+/// arrivals against concurrent `device_added` callbacks).
+pub fn devices_with_max_inst() -> (Vec<Arc<Device>>, u32) {
+    let r = registry().lock().unwrap();
+    (r.devices.clone(), r.next_inst.saturating_sub(1))
+}
+
+/// Look up a currently connected HID device by its stable instance number (`Device::inst`).
+pub fn device_by_inst(inst: u32) -> Option<Arc<Device>> {
+    registry().lock().unwrap().devices.iter().find(|d| d.inst == inst && d.connected()).cloned()
 }
 
 /// Is a Sony (054C) game controller exposed through the HID path? Then the
@@ -715,10 +733,31 @@ pub unsafe extern "win64" fn HidD_GetAttributes(h: HANDLE, attr: *mut u8) -> BOO
     1
 }
 
-/// Preparsed data blobs handed out (validated on use).
+/// Preparsed data blobs handed out by `HidD_GetPreparsedData` (validated on use).
 fn preparsed() -> &'static Mutex<HashSet<usize>> {
     static P: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Self-describing 16-byte header written into caller-allocated buffers by
+/// `GetRawInputDeviceInfo(RIDI_PREPARSEDDATA)` so `HidP_*` can inspect them
+/// without requiring `HidD_FreePreparsedData`.
+const RAW_PREPARSED_MAGIC: [u8; 8] = *b"HidP RAW";
+pub const RAW_PREPARSED_SIZE: usize = 16;
+
+fn raw_preparsed() -> &'static Mutex<HashMap<u64, Arc<Caps>>> {
+    static RP: OnceLock<Mutex<HashMap<u64, Arc<Caps>>>> = OnceLock::new();
+    RP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Build the flat `RIDI_PREPARSEDDATA` blob for a connected HID device.
+pub fn raw_preparsed_bytes(dev: &Device) -> [u8; RAW_PREPARSED_SIZE] {
+    let token = dev.inst as u64;
+    raw_preparsed().lock().unwrap().insert(token, dev.caps.clone());
+    let mut out = [0u8; RAW_PREPARSED_SIZE];
+    out[0..8].copy_from_slice(&RAW_PREPARSED_MAGIC);
+    out[8..16].copy_from_slice(&token.to_le_bytes());
+    out
 }
 
 struct Preparsed {
@@ -727,11 +766,29 @@ struct Preparsed {
 }
 
 fn with_preparsed<R>(pp: *const u8, f: impl FnOnce(&Caps) -> R) -> Option<R> {
-    if !preparsed().lock().unwrap().contains(&(pp as usize)) {
+    if pp.is_null() {
         return None;
     }
-    let p = unsafe { &*(pp as *const Preparsed) };
-    Some(f(&p.caps))
+    if preparsed().lock().unwrap().contains(&(pp as usize)) {
+        let p = unsafe { &*(pp as *const Preparsed) };
+        return Some(f(&p.caps));
+    }
+    if (pp as usize) < 0x10000 {
+        return None;
+    }
+    let caps = {
+        let map = raw_preparsed().lock().unwrap();
+        if map.is_empty() {
+            return None;
+        }
+        let hdr = unsafe { std::ptr::read_unaligned(pp as *const [u8; RAW_PREPARSED_SIZE]) };
+        if hdr[0..8] != RAW_PREPARSED_MAGIC {
+            return None;
+        }
+        let token = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        map.get(&token).cloned()?
+    };
+    Some(f(&caps))
 }
 
 pub unsafe extern "win64" fn HidD_GetPreparsedData(h: HANDLE, out: *mut *mut u8) -> BOOLEAN {
