@@ -629,7 +629,7 @@ pub fn generate_game_manifest_toml(
     })
 }
 
-fn merge_acquire_and_v8_into_curated_manifest(
+pub(crate) fn merge_acquire_and_v8_into_curated_manifest(
     curated_toml: &str,
     v8_jitless: bool,
     acquire_manifest: Option<&AcquireManifest>,
@@ -648,8 +648,12 @@ fn merge_acquire_and_v8_into_curated_manifest(
         if manifest.args.is_none() {
             manifest.args = acq.formatted_runtime_args();
         }
-        if manifest.steam_app_id.is_none() {
-            manifest.steam_app_id = acq.steam_app_id().map(str::to_string);
+        if store.is_some() && !acq.is_steam_store() {
+            // Explicitly non-Steam acquisition: clear any inherited curated `steam_app_id` so
+            // `port-loader` never exports `STEAM_APPID`/`SteamAppId`/`SteamGameId` from `game.toml`.
+            manifest.steam_app_id = None;
+        } else if let Some(steam_id) = acq.steam_app_id() {
+            manifest.steam_app_id = Some(steam_id.to_string());
         }
     }
     inject_app_store_metadata(manifest.to_toml(), store, store_app_id)

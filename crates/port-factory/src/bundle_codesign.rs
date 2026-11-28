@@ -736,6 +736,8 @@ struct FileStatKey {
     size: u64,
     mtime_sec: i64,
     mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
 }
 
 #[cfg(unix)]
@@ -748,6 +750,8 @@ fn stat_file_key(path: &Path) -> std::io::Result<FileStatKey> {
         size: m.len(),
         mtime_sec: m.mtime(),
         mtime_nsec: m.mtime_nsec(),
+        ctime_sec: m.ctime(),
+        ctime_nsec: m.ctime_nsec(),
     })
 }
 
@@ -765,6 +769,8 @@ fn stat_file_key(path: &Path) -> std::io::Result<FileStatKey> {
         size: m.len(),
         mtime_sec: d.as_secs() as i64,
         mtime_nsec: d.subsec_nanos() as i64,
+        ctime_sec: d.as_secs() as i64,
+        ctime_nsec: d.subsec_nanos() as i64,
     })
 }
 
@@ -807,7 +813,7 @@ fn load_receipt(cache_dir: &Path, cdhash_hex: &str) -> Option<VerifyReceipt> {
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() != 7 {
+        if cols.len() != 9 {
             return None;
         }
         let rel = cols[0].to_string();
@@ -816,7 +822,9 @@ fn load_receipt(cache_dir: &Path, cdhash_hex: &str) -> Option<VerifyReceipt> {
         let size = cols[3].parse::<u64>().ok()?;
         let mtime_sec = cols[4].parse::<i64>().ok()?;
         let mtime_nsec = cols[5].parse::<i64>().ok()?;
-        let hash2 = hex_decode_32(cols[6])?;
+        let ctime_sec = cols[6].parse::<i64>().ok()?;
+        let ctime_nsec = cols[7].parse::<i64>().ok()?;
+        let hash2 = hex_decode_32(cols[8])?;
         entries.insert(
             rel,
             ReceiptRecord {
@@ -826,6 +834,8 @@ fn load_receipt(cache_dir: &Path, cdhash_hex: &str) -> Option<VerifyReceipt> {
                     size,
                     mtime_sec,
                     mtime_nsec,
+                    ctime_sec,
+                    ctime_nsec,
                 },
                 hash2,
             },
@@ -843,24 +853,29 @@ fn write_receipt(cache_dir: &Path, receipt: &VerifyReceipt) -> Result<()> {
         .with_context(|| format!("creating receipt cache dir {}", cache_dir.display()))?;
     let mut out = String::new();
     use std::fmt::Write as _;
-    let _ = writeln!(out, "# port-factory-verify-receipt v1");
+    let _ = writeln!(out, "# port-factory-verify-receipt v2");
     let _ = writeln!(out, "# cdhash={}", receipt.cdhash_full_hex);
     let _ = writeln!(
         out,
         "# coderesources_sha256={}",
         receipt.coderesources_sha256_hex
     );
-    let _ = writeln!(out, "rel_path\tdev\tino\tsize\tmtime_sec\tmtime_nsec\thash2_hex");
+    let _ = writeln!(
+        out,
+        "rel_path\tdev\tino\tsize\tmtime_sec\tmtime_nsec\tctime_sec\tctime_nsec\thash2_hex"
+    );
     for (rel, rec) in &receipt.entries {
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             rel,
             rec.stat.dev,
             rec.stat.ino,
             rec.stat.size,
             rec.stat.mtime_sec,
             rec.stat.mtime_nsec,
+            rec.stat.ctime_sec,
+            rec.stat.ctime_nsec,
             hex_encode(&rec.hash2)
         );
     }
@@ -1779,19 +1794,34 @@ mod tests {
         assert!(full.detail.contains("2 nested code signature(s) OK"), "{}", full.detail);
         assert!(full.detail.contains("parallel SHA-256 verified 3 sealed file(s)"));
 
-        // 3. Tamper with a `Game/` payload file (different size/mtime): default verify MUST detect and FAIL!
-        let orig_asset1 = fs::read(game_dir.join("asset1.bin")).unwrap();
+        // 3. Tamper with a `Game/` payload file IN PLACE with the EXACT same byte length AND
+        //    restore its original `mtime`: `ctime` still advances so the receipt MUST invalidate
+        //    and default verify MUST re-hash and FAIL!
+        let asset1_path = game_dir.join("asset1.bin");
+        let orig_asset1 = fs::read(&asset1_path).unwrap();
+        let orig_mtime = fs::metadata(&asset1_path).unwrap().modified().unwrap();
         let mut tampered = orig_asset1.clone();
         tampered[0] ^= 0xFF;
-        tampered.push(0x01);
-        fs::write(game_dir.join("asset1.bin"), &tampered).unwrap();
+        // Brief pause guarantees distinct nanosecond ctime even on coarse clocks, then overwrite
+        // in place (same inode & byte length) and restore the original mtime.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .open(&asset1_path)
+                .unwrap();
+            f.write_all(&tampered).unwrap();
+            f.sync_all().unwrap();
+            f.set_modified(orig_mtime).unwrap();
+        }
         let res_tamper = verify_bundle_codesign_fast_in(&app_dir, false, Some(&receipt_cache)).unwrap();
         assert!(
             !res_tamper.passed,
-            "modified Game/ payload must fail verification even without --full"
+            "equal-length in-place overwrite with restored mtime must fail verification via ctime invalidation"
         );
         assert!(res_tamper.detail.contains("asset1.bin"), "{}", res_tamper.detail);
-        fs::write(game_dir.join("asset1.bin"), &orig_asset1).unwrap();
+        fs::write(&asset1_path, &orig_asset1).unwrap();
 
         // 4. Inject an extra unsealed file in Resources/Game: MUST FAIL!
         let extra = game_dir.join("injected.txt");

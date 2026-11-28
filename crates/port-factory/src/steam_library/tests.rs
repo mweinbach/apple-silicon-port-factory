@@ -1082,7 +1082,51 @@ fn parses_port_acquire_manifest_for_any_store_and_generates_game_toml() {
     // 5. Unsupported schema_version fails honestly.
     assert!(parse_acquire_manifest(r#"{"schema_version": 99, "store": "epic"}"#).is_err());
 
-    // 6. `scan_post_install` picks up `native_in_win32_rt: true` redistributables from the manifest.
+    // 6. Merging a non-Steam acquisition into a curated repo manifest matched by executable
+    //    name MUST clear any inherited `steam_app_id` while preserving curated overrides/flags,
+    //    whereas a Steam acquisition retains `steam_app_id`.
+    let curated = r#"[app]
+id = "curateddemo"
+name = "Curated Demo"
+exe = "Hero2.exe"
+steam_app_id = "2357570"
+
+[runtime]
+builtin_overrides = "dstorage=guest"
+"#;
+    let merged_epic =
+        super::macos_bundle::merge_acquire_and_v8_into_curated_manifest(curated, true, Some(&epic));
+    let parsed_merged_epic = GameManifest::parse(&merged_epic);
+    assert_eq!(parsed_merged_epic.steam_app_id, None, "{merged_epic}");
+    assert!(!merged_epic.contains("steam_app_id"), "{merged_epic}");
+    assert!(merged_epic.contains("store = \"epic\""), "{merged_epic}");
+    assert!(
+        merged_epic.contains("app_id = \"a1b2c3d4e5f60718293a4b5c6d7e8f90\""),
+        "{merged_epic}"
+    );
+    assert_eq!(
+        parsed_merged_epic.builtin_overrides.as_deref(),
+        Some("dstorage=guest")
+    );
+    assert_eq!(parsed_merged_epic.v8_jitless, Some(true));
+
+    let merged_gog =
+        super::macos_bundle::merge_acquire_and_v8_into_curated_manifest(curated, false, Some(&gog));
+    assert_eq!(GameManifest::parse(&merged_gog).steam_app_id, None);
+    assert!(!merged_gog.contains("steam_app_id"), "{merged_gog}");
+    assert!(merged_gog.contains("store = \"gog\""), "{merged_gog}");
+
+    let merged_steam = super::macos_bundle::merge_acquire_and_v8_into_curated_manifest(
+        curated,
+        false,
+        Some(&steam),
+    );
+    assert_eq!(
+        GameManifest::parse(&merged_steam).steam_app_id.as_deref(),
+        Some("2357570")
+    );
+
+    // 7. `scan_post_install` picks up `native_in_win32_rt: true` redistributables from the manifest.
     let tmp = make_temp_dir("acquire_postinstall");
     fs::write(tmp.path().join(ACQUIRE_MANIFEST_FILENAME), epic_json).unwrap();
     let post = scan_post_install(tmp.path());
