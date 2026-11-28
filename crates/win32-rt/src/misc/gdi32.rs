@@ -2012,6 +2012,158 @@ pub unsafe extern "win64" fn BitBlt(
     TRUE
 }
 
+const BLACKONWHITE: i32 = 1;
+const WHITEONBLACK: i32 = 2;
+const COLORONCOLOR: i32 = 3;
+const HALFTONE: i32 = 4;
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn sample_stretch_pixel(
+    src_bm: &BitmapData,
+    sx_start: i32,
+    sy_start: i32,
+    src_w: i64,
+    src_h: i64,
+    dst_w: i64,
+    dst_h: i64,
+    sample_x: i64,
+    sample_y: i64,
+    mode: i32,
+) -> Option<[u8; 4]> {
+    match mode {
+        COLORONCOLOR => {
+            let sx = sx_start.saturating_add(((sample_x * src_w) / dst_w) as i32);
+            let sy = sy_start.saturating_add(((sample_y * src_h) / dst_h) as i32);
+            src_bm.get_rgba(sx, sy)
+        }
+        BLACKONWHITE | WHITEONBLACK => {
+            let x0 = (sample_x * src_w) / dst_w;
+            let x1 = (((sample_x + 1) * src_w) / dst_w).max(x0 + 1).min(src_w);
+            let y0 = (sample_y * src_h) / dst_h;
+            let y1 = (((sample_y + 1) * src_h) / dst_h).max(y0 + 1).min(src_h);
+            let mut acc: Option<[u8; 4]> = None;
+            for ry in y0..y1 {
+                let sy = sy_start.saturating_add(ry as i32);
+                for rx in x0..x1 {
+                    let sx = sx_start.saturating_add(rx as i32);
+                    if let Some(px) = src_bm.get_rgba(sx, sy) {
+                        acc = Some(match acc {
+                            None => px,
+                            Some(cur) if mode == BLACKONWHITE => [
+                                cur[0] & px[0],
+                                cur[1] & px[1],
+                                cur[2] & px[2],
+                                cur[3] & px[3],
+                            ],
+                            Some(cur) => [
+                                cur[0] | px[0],
+                                cur[1] | px[1],
+                                cur[2] | px[2],
+                                cur[3] | px[3],
+                            ],
+                        });
+                    }
+                }
+            }
+            acc
+        }
+        HALFTONE => {
+            // Area-weighted box average when shrinking on either axis; bilinear interpolation
+            // when enlarging on both axes (and exact identity when 1:1).
+            if src_w > dst_w || src_h > dst_h {
+                let u0 = (sample_x as f64) * (src_w as f64) / (dst_w as f64);
+                let u1 = ((sample_x + 1) as f64) * (src_w as f64) / (dst_w as f64);
+                let v0 = (sample_y as f64) * (src_h as f64) / (dst_h as f64);
+                let v1 = ((sample_y + 1) as f64) * (src_h as f64) / (dst_h as f64);
+                let ix0 = (u0.floor() as i64).max(0);
+                let ix1 = (u1.ceil() as i64).max(ix0 + 1).min(src_w);
+                let iy0 = (v0.floor() as i64).max(0);
+                let iy1 = (v1.ceil() as i64).max(iy0 + 1).min(src_h);
+                let mut sum = [0.0f64; 4];
+                let mut wsum = 0.0f64;
+                for ry in iy0..iy1 {
+                    let wy = (v1.min((ry + 1) as f64) - v0.max(ry as f64)).max(0.0);
+                    if wy <= 0.0 {
+                        continue;
+                    }
+                    let sy = sy_start.saturating_add(ry as i32);
+                    for rx in ix0..ix1 {
+                        let wx = (u1.min((rx + 1) as f64) - u0.max(rx as f64)).max(0.0);
+                        let w = wx * wy;
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        let sx = sx_start.saturating_add(rx as i32);
+                        if let Some(px) = src_bm.get_rgba(sx, sy) {
+                            for c in 0..4 {
+                                sum[c] += (px[c] as f64) * w;
+                            }
+                            wsum += w;
+                        }
+                    }
+                }
+                if wsum > 0.0 {
+                    Some([
+                        (sum[0] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[1] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[2] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[3] / wsum).round().clamp(0.0, 255.0) as u8,
+                    ])
+                } else {
+                    None
+                }
+            } else {
+                let fx = ((sample_x as f64 + 0.5) * (src_w as f64 / dst_w as f64) - 0.5)
+                    .clamp(0.0, (src_w - 1) as f64);
+                let fy = ((sample_y as f64 + 0.5) * (src_h as f64 / dst_h as f64) - 0.5)
+                    .clamp(0.0, (src_h - 1) as f64);
+                let x0 = fx.floor() as i64;
+                let y0 = fy.floor() as i64;
+                let x1 = (x0 + 1).min(src_w - 1);
+                let y1 = (y0 + 1).min(src_h - 1);
+                let tx = fx - (x0 as f64);
+                let ty = fy - (y0 as f64);
+                let samples = [
+                    ((x0, y0), (1.0 - tx) * (1.0 - ty)),
+                    ((x1, y0), tx * (1.0 - ty)),
+                    ((x0, y1), (1.0 - tx) * ty),
+                    ((x1, y1), tx * ty),
+                ];
+                let mut sum = [0.0f64; 4];
+                let mut wsum = 0.0f64;
+                for ((rx, ry), w) in samples {
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let sx = sx_start.saturating_add(rx as i32);
+                    let sy = sy_start.saturating_add(ry as i32);
+                    if let Some(px) = src_bm.get_rgba(sx, sy) {
+                        for c in 0..4 {
+                            sum[c] += (px[c] as f64) * w;
+                        }
+                        wsum += w;
+                    }
+                }
+                if wsum > 0.0 {
+                    Some([
+                        (sum[0] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[1] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[2] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[3] / wsum).round().clamp(0.0, 255.0) as u8,
+                    ])
+                } else {
+                    None
+                }
+            }
+        }
+        _ => {
+            let sx = sx_start.saturating_add(((sample_x * src_w) / dst_w) as i32);
+            let sy = sy_start.saturating_add(((sample_y * src_h) / dst_h) as i32);
+            src_bm.get_rgba(sx, sy)
+        }
+    }
+}
+
 pub unsafe extern "win64" fn StretchBlt(
     dst: usize,
     x: i32,
@@ -2047,6 +2199,7 @@ pub unsafe extern "win64" fn StretchBlt(
         return TRUE;
     };
 
+    let stretch_mode = dst_dc.stretch_blt_mode;
     let dst_w = cx.unsigned_abs() as i64;
     let dst_h = cy.unsigned_abs() as i64;
     let src_w = w1.unsigned_abs() as i64;
@@ -2067,15 +2220,24 @@ pub unsafe extern "win64" fn StretchBlt(
             continue;
         }
         let sample_y = if flip_y { dst_h - 1 - row } else { row };
-        let sy = sy_start.saturating_add(((sample_y * src_h) / dst_h) as i32);
         for col in 0..dst_w {
             let dx = dx_start.saturating_add(col as i32);
             if dx < 0 || (dx as usize) >= dst_bm.width {
                 continue;
             }
             let sample_x = if flip_x { dst_w - 1 - col } else { col };
-            let sx = sx_start.saturating_add(((sample_x * src_w) / dst_w) as i32);
-            tmp[(row as usize) * tw + (col as usize)] = src_bm.get_rgba(sx, sy);
+            tmp[(row as usize) * tw + (col as usize)] = sample_stretch_pixel(
+                src_bm,
+                sx_start,
+                sy_start,
+                src_w,
+                src_h,
+                dst_w,
+                dst_h,
+                sample_x,
+                sample_y,
+                stretch_mode,
+            );
         }
     }
     for row in 0..th {
@@ -2917,5 +3079,80 @@ mod tests {
             dropped.load(Ordering::Acquire),
             "external backing allocation must be released once the final in-flight draw drops"
         );
+    }
+
+    #[test]
+    fn stretch_blt_honors_blackonwhite_whiteonblack_coloroncolor_and_halftone() {
+        unsafe {
+            let src_dc = CreateCompatibleDC(0);
+            let dst_dc = CreateCompatibleDC(0);
+            assert_ne!(src_dc, 0);
+            assert_ne!(dst_dc, 0);
+
+            // 1. 1bpp monochrome 2x1 [black, white] shrunk to 1x1:
+            //    BLACKONWHITE -> black (AND), WHITEONBLACK -> white (OR).
+            let mono_src = CreateBitmap(2, 1, 1, 1, std::ptr::null());
+            let mono_dst = CreateBitmap(1, 1, 1, 1, std::ptr::null());
+            let old_s = SelectObject(src_dc, mono_src);
+            let old_d = SelectObject(dst_dc, mono_dst);
+            SetPixel(src_dc, 0, 0, 0x0000_0000); // black
+            SetPixel(src_dc, 1, 0, 0x00FF_FFFF); // white
+
+            assert_eq!(SetStretchBltMode(dst_dc, WHITEONBLACK), BLACKONWHITE);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            assert_eq!(GetPixel(dst_dc, 0, 0), 0x00FF_FFFF, "WHITEONBLACK must preserve white via OR");
+
+            assert_eq!(SetStretchBltMode(dst_dc, BLACKONWHITE), WHITEONBLACK);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            assert_eq!(GetPixel(dst_dc, 0, 0), 0x0000_0000, "BLACKONWHITE must preserve black via AND");
+
+            // Reversed [white, black]: BLACKONWHITE still preserves black, while COLORONCOLOR picks pixel 0 (white).
+            SetPixel(src_dc, 0, 0, 0x00FF_FFFF);
+            SetPixel(src_dc, 1, 0, 0x0000_0000);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            assert_eq!(GetPixel(dst_dc, 0, 0), 0x0000_0000, "BLACKONWHITE must AND reversed pair to black");
+
+            assert_eq!(SetStretchBltMode(dst_dc, COLORONCOLOR), BLACKONWHITE);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            assert_eq!(GetPixel(dst_dc, 0, 0), 0x00FF_FFFF, "COLORONCOLOR must drop eliminated pixel");
+
+            SelectObject(src_dc, old_s);
+            SelectObject(dst_dc, old_d);
+            DeleteObject(mono_src);
+            DeleteObject(mono_dst);
+
+            // 2. 32bpp color shrink & enlarge with HALFTONE vs COLORONCOLOR.
+            let bmi2 = make_bmi_header(2, -1, 32);
+            let bmi4 = make_bmi_header(4, -1, 32);
+            let mut sb: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut db: *mut std::ffi::c_void = std::ptr::null_mut();
+            let color_src = CreateDIBSection(src_dc, bmi2.as_ptr(), 0, &mut sb, std::ptr::null_mut(), 0);
+            let color_dst = CreateDIBSection(dst_dc, bmi4.as_ptr(), 0, &mut db, std::ptr::null_mut(), 0);
+            let old_s2 = SelectObject(src_dc, color_src);
+            let old_d2 = SelectObject(dst_dc, color_dst);
+
+            SetPixel(src_dc, 0, 0, 0x0000_0000); // black
+            SetPixel(src_dc, 1, 0, 0x00FF_FFFF); // white
+
+            assert_eq!(SetStretchBltMode(dst_dc, HALFTONE), COLORONCOLOR);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            let avg = GetPixel(dst_dc, 0, 0);
+            assert_eq!(avg, 0x0080_8080, "HALFTONE shrink of black+white must average to mid-gray");
+
+            // HALFTONE 2x1 -> 4x1 upscale produces an interior blended pixel rather than hard nearest-neighbor.
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 4, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            let p0 = GetPixel(dst_dc, 0, 0) & 0xFF;
+            let p1 = GetPixel(dst_dc, 1, 0) & 0xFF;
+            let p2 = GetPixel(dst_dc, 2, 0) & 0xFF;
+            let p3 = GetPixel(dst_dc, 3, 0) & 0xFF;
+            assert!(p0 < p1 && p1 < p2 && p2 < p3, "HALFTONE upscale must interpolate smoothly: {p0}, {p1}, {p2}, {p3}");
+
+            SelectObject(src_dc, old_s2);
+            SelectObject(dst_dc, old_d2);
+            DeleteObject(color_src);
+            DeleteObject(color_dst);
+            DeleteDC(src_dc);
+            DeleteDC(dst_dc);
+        }
     }
 }
