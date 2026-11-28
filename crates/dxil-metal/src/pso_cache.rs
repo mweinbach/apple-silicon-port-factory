@@ -386,6 +386,11 @@ pub struct PipelineCache {
     render: RwLock<HashMap<u128, RenderPipeline>>,
     in_flight_compute: InFlightTable,
     in_flight_render: InFlightTable,
+    /// Shared/exclusive gate for Metal compiler XPC disconnect recovery:
+    /// initial attempts take `.read()` (full concurrency), while retries after
+    /// `XPC_ERROR_CONNECTION_INTERRUPTED` take `.write()` so a single bad shader
+    /// crashing `MTLCompilerService` cannot repeatedly kill sibling retries.
+    xpc_retry_gate: RwLock<()>,
 }
 
 fn create_compiler_and_serializer(
@@ -434,25 +439,39 @@ fn is_transient_xpc_interrupt(err: &Error) -> bool {
 
 /// Retries a Metal compiler call when Apple's out-of-process `MTLCompilerService`
 /// XPC helper restarts while concurrent threads are compiling pipelines/libraries.
+///
+/// Initial attempts (`attempt == 0`) hold `gate.read()` so normal multi-threaded
+/// compilation runs at full concurrency. Retries (`attempt >= 1`) hold `gate.write()`
+/// so each retrying shader runs in isolation after the backoff, preventing a single
+/// crashing shader from repeatedly taking down sibling threads in lockstep.
 fn retry_on_xpc_interrupt<T>(
     what: &str,
+    gate: &RwLock<()>,
     backoffs_ms: &[u64],
     mut f: impl FnMut() -> Result<T, Error>,
 ) -> Result<T, Error> {
     let mut attempt = 0usize;
     loop {
-        match f() {
+        let res = if attempt == 0 {
+            let _shared = gate.read().unwrap();
+            f()
+        } else {
+            let wait_ms = backoffs_ms[attempt - 1];
+            let _exclusive = gate.write().unwrap();
+            if wait_ms > 0 {
+                std::thread::sleep(Duration::from_millis(wait_ms));
+            }
+            f()
+        };
+        match res {
             Ok(v) => return Ok(v),
             Err(e) if attempt < backoffs_ms.len() && is_transient_xpc_interrupt(&e) => {
                 let wait_ms = backoffs_ms[attempt];
                 attempt += 1;
                 log::warn!(
-                    "pso cache: {what} hit transient Metal compiler XPC disconnect (retry {attempt}/{} after {wait_ms}ms): {e}",
+                    "pso cache: {what} hit transient Metal compiler XPC disconnect (serialized retry {attempt}/{} after {wait_ms}ms): {e}",
                     backoffs_ms.len()
                 );
-                if wait_ms > 0 {
-                    std::thread::sleep(Duration::from_millis(wait_ms));
-                }
             }
             Err(e) => return Err(e),
         }
@@ -644,6 +663,7 @@ impl PipelineCache {
             render: RwLock::new(HashMap::new()),
             in_flight_compute: InFlightTable::default(),
             in_flight_render: InFlightTable::default(),
+            xpc_retry_gate: RwLock::new(()),
         })
     }
 
@@ -821,7 +841,7 @@ impl PipelineCache {
                 }
             }
             let t = Instant::now();
-            let r = retry_on_xpc_interrupt(what, XPC_RETRY_BACKOFFS_MS, || {
+            let r = retry_on_xpc_interrupt(what, &self.xpc_retry_gate, XPC_RETRY_BACKOFFS_MS, || {
                 // Re-acquire locks per attempt so we never hold `compile_lock` or `compiler`
                 // across retry backoff sleeps, while still keeping `compile_lock` held from a
                 // successful compile through serializer key/dirty updates.
@@ -913,7 +933,7 @@ impl PipelineCache {
     ) -> Result<Library, Error> {
         let try_compile = |ver: Option<MTLLanguageVersion>| -> Result<Library, Error> {
             let _permit = self.compile_limiter.acquire();
-            retry_on_xpc_interrupt(name, XPC_RETRY_BACKOFFS_MS, || {
+            retry_on_xpc_interrupt(name, &self.xpc_retry_gate, XPC_RETRY_BACKOFFS_MS, || {
                 objc2::rc::autoreleasepool(|_| {
                     let opts = MTLCompileOptions::new();
                     if let Some(v) = ver {
@@ -1618,9 +1638,11 @@ kernel void cvt_f16(device const float* inp [[buffer(0)]], device half* outp [[b
         )));
         assert!(!is_transient_xpc_interrupt(&Error::Io("XPC_ERROR_CONNECTION_INTERRUPTED".into())));
 
+        let gate = RwLock::new(());
+
         // 1) Recovers when a transient XPC disconnect clears on retry.
         let mut calls = 0usize;
-        let ok = retry_on_xpc_interrupt("test", &[0, 0], || {
+        let ok = retry_on_xpc_interrupt("test", &gate, &[0, 0], || {
             calls += 1;
             if calls < 3 {
                 Err(xpc_err())
@@ -1633,7 +1655,7 @@ kernel void cvt_f16(device const float* inp [[buffer(0)]], device half* outp [[b
 
         // 2) Bounds retries when the XPC disconnect persists.
         let mut calls = 0usize;
-        let err = retry_on_xpc_interrupt::<u32>("test", &[0, 0], || {
+        let err = retry_on_xpc_interrupt::<u32>("test", &gate, &[0, 0], || {
             calls += 1;
             Err(xpc_err())
         });
@@ -1642,11 +1664,57 @@ kernel void cvt_f16(device const float* inp [[buffer(0)]], device half* outp [[b
 
         // 3) Does not retry non-XPC compiler errors.
         let mut calls = 0usize;
-        let err = retry_on_xpc_interrupt::<u32>("test", &[0, 0], || {
+        let err = retry_on_xpc_interrupt::<u32>("test", &gate, &[0, 0], || {
             calls += 1;
             Err(Error::Metal("compute pipeline: invalid shader".into()))
         });
         assert!(err.is_err());
         assert_eq!(calls, 1, "non-transient compiler errors must fail immediately");
+
+        // 4) Serialized retry isolation: concurrent sibling threads hitting XPC disconnect
+        //    must execute their retries strictly one at a time so one crashing shader
+        //    cannot kill sibling retries in lockstep.
+        let shared_gate = Arc::new(RwLock::new(()));
+        let start_barrier = Arc::new(std::sync::Barrier::new(4));
+        let in_retry = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_retry_concurrency = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for idx in 0..4usize {
+                let g = shared_gate.clone();
+                let b = start_barrier.clone();
+                let active = in_retry.clone();
+                let max_c = max_retry_concurrency.clone();
+                scope.spawn(move || {
+                    let mut attempt = 0usize;
+                    let r = retry_on_xpc_interrupt("concurrent", &g, &[0, 0], || {
+                        attempt += 1;
+                        if attempt == 1 {
+                            b.wait();
+                            return Err(xpc_err());
+                        }
+                        let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_c.fetch_max(cur, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(5));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        if idx == 0 {
+                            // Simulate one persistently crashing shader.
+                            Err(xpc_err())
+                        } else {
+                            Ok(idx)
+                        }
+                    });
+                    if idx == 0 {
+                        assert!(r.is_err());
+                    } else {
+                        assert_eq!(r.unwrap(), idx);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            max_retry_concurrency.load(Ordering::SeqCst),
+            1,
+            "XPC disconnect retries must run strictly one at a time"
+        );
     }
 }
