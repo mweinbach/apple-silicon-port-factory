@@ -17,6 +17,7 @@ pub static ORDINALS: &[(u16, &str)] = &[];
 
 pub const ERROR_SUCCESS: i32 = 0;
 pub const PDH_CSTATUS_VALID_DATA: u32 = 0x0000_0000;
+pub const PDH_CSTATUS_NO_INSTANCE: i32 = 0x8000_07D1u32 as i32;
 pub const PDH_CSTATUS_NO_OBJECT: i32 = 0xC000_0BB8u32 as i32;
 pub const PDH_CSTATUS_NO_COUNTER: i32 = 0xC000_0BB9u32 as i32;
 pub const PDH_INVALID_HANDLE: i32 = 0xC000_0BBCu32 as i32;
@@ -29,10 +30,17 @@ pub const PDH_FMT_LARGE: u32 = 0x0000_0400;
 const PDH_FMT_TYPE_MASK: u32 = 0x0000_0F00;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessorTarget {
+    Total,
+    Core(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CounterKind {
-    ProcessorTotalPct,
-    ProcessorUserPct,
-    ProcessorKernelPct,
+    ProcessorTotalPct(ProcessorTarget),
+    ProcessorUserPct(ProcessorTarget),
+    ProcessorKernelPct(ProcessorTarget),
+    ProcessorIdlePct(ProcessorTarget),
     MemoryAvailBytes,
     MemoryAvailKBytes,
     MemoryAvailMBytes,
@@ -49,6 +57,7 @@ struct CounterState {
     last_value: Option<f64>,
     prev_sample_time: Option<Instant>,
     prev_cpu_sec: f64,
+    prev_host_ticks: Option<[u32; 4]>,
 }
 
 struct QueryState {
@@ -72,6 +81,29 @@ fn state() -> &'static Mutex<PdhState> {
 
 static NEXT_HANDLE: AtomicUsize = AtomicUsize::new(0x5A00_0001);
 
+fn parse_processor_instance(instance: Option<&str>) -> Result<ProcessorTarget, i32> {
+    let raw = instance.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return Err(PDH_CSTATUS_NO_INSTANCE);
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower == "_total" || lower.ends_with(",_total") {
+        return Ok(ProcessorTarget::Total);
+    }
+    // Support both "\Processor(0)" and "\Processor Information(0,0)" formats.
+    let idx_part = match lower.split_once(',') {
+        Some(("0", core_str)) => core_str.trim(),
+        Some(_) => return Err(PDH_CSTATUS_NO_INSTANCE),
+        None => lower.as_str(),
+    };
+    let core = idx_part.parse::<usize>().map_err(|_| PDH_CSTATUS_NO_INSTANCE)?;
+    let ncpus = crate::process::num_cpus().max(1) as usize;
+    if core >= ncpus {
+        return Err(PDH_CSTATUS_NO_INSTANCE);
+    }
+    Ok(ProcessorTarget::Core(core))
+}
+
 fn parse_counter_path(path: &str) -> Result<CounterKind, i32> {
     let trimmed = path.trim();
     // Strip optional \\machine prefix and leading '\'.
@@ -89,15 +121,26 @@ fn parse_counter_path(path: &str) -> Result<CounterKind, i32> {
         Some((o, c)) => (o.trim(), c.trim()),
         None => return Err(PDH_CSTATUS_NO_COUNTER),
     };
-    let obj_name = obj_part.split('(').next().unwrap_or(obj_part).trim().to_ascii_lowercase();
+    let (obj_raw, instance) = match obj_part.split_once('(') {
+        Some((name, tail)) => match tail.strip_suffix(')') {
+            Some(inst) => (name, Some(inst)),
+            None => return Err(PDH_CSTATUS_NO_OBJECT),
+        },
+        None => (obj_part, None),
+    };
+    let obj_name = obj_raw.trim().to_ascii_lowercase();
     let ctr_name = counter_part.to_ascii_lowercase();
     match obj_name.as_str() {
-        "processor" | "processor information" => match ctr_name.as_str() {
-            "% processor time" | "% processor utility" => Ok(CounterKind::ProcessorTotalPct),
-            "% user time" => Ok(CounterKind::ProcessorUserPct),
-            "% privileged time" => Ok(CounterKind::ProcessorKernelPct),
-            _ => Err(PDH_CSTATUS_NO_COUNTER),
-        },
+        "processor" | "processor information" => {
+            let target = parse_processor_instance(instance)?;
+            match ctr_name.as_str() {
+                "% processor time" | "% processor utility" => Ok(CounterKind::ProcessorTotalPct(target)),
+                "% user time" => Ok(CounterKind::ProcessorUserPct(target)),
+                "% privileged time" => Ok(CounterKind::ProcessorKernelPct(target)),
+                "% idle time" => Ok(CounterKind::ProcessorIdlePct(target)),
+                _ => Err(PDH_CSTATUS_NO_COUNTER),
+            }
+        }
         "memory" => match ctr_name.as_str() {
             "available bytes" => Ok(CounterKind::MemoryAvailBytes),
             "available kbytes" => Ok(CounterKind::MemoryAvailKBytes),
@@ -117,6 +160,84 @@ fn parse_counter_path(path: &str) -> Result<CounterKind, i32> {
         },
         _ => Err(PDH_CSTATUS_NO_OBJECT),
     }
+}
+
+/// Samples real host-wide (or per-core) CPU load ticks `[user, system, idle, nice]` from Mach.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn host_cpu_ticks(target: ProcessorTarget) -> Option<[u32; 4]> {
+    const HOST_CPU_LOAD_INFO: i32 = 3;
+    const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
+    extern "C" {
+        fn mach_host_self() -> u32;
+        static mach_task_self_: u32;
+        fn host_statistics(
+            host_priv: u32,
+            flavor: i32,
+            host_info_out: *mut i32,
+            host_info_out_cnt: *mut u32,
+        ) -> i32;
+        fn host_processor_info(
+            host: u32,
+            flavor: i32,
+            out_processor_count: *mut u32,
+            out_processor_info: *mut *mut i32,
+            out_processor_info_cnt: *mut u32,
+        ) -> i32;
+        fn mach_vm_deallocate(task: u32, addr: u64, size: u64) -> i32;
+    }
+    unsafe {
+        match target {
+            ProcessorTarget::Total => {
+                let mut ticks = [0u32; 4];
+                let mut count: u32 = 4;
+                let kr = host_statistics(
+                    mach_host_self(),
+                    HOST_CPU_LOAD_INFO,
+                    ticks.as_mut_ptr() as *mut i32,
+                    &mut count,
+                );
+                if kr == 0 && count >= 4 {
+                    Some(ticks)
+                } else {
+                    None
+                }
+            }
+            ProcessorTarget::Core(idx) => {
+                let mut proc_cnt: u32 = 0;
+                let mut info_ptr: *mut i32 = std::ptr::null_mut();
+                let mut info_cnt: u32 = 0;
+                let kr = host_processor_info(
+                    mach_host_self(),
+                    PROCESSOR_CPU_LOAD_INFO,
+                    &mut proc_cnt,
+                    &mut info_ptr,
+                    &mut info_cnt,
+                );
+                if kr != 0 || info_ptr.is_null() {
+                    return None;
+                }
+                let result = if idx < proc_cnt as usize && (idx + 1) * 4 <= info_cnt as usize {
+                    let base = info_ptr.add(idx * 4);
+                    Some([
+                        std::ptr::read_unaligned(base) as u32,
+                        std::ptr::read_unaligned(base.add(1)) as u32,
+                        std::ptr::read_unaligned(base.add(2)) as u32,
+                        std::ptr::read_unaligned(base.add(3)) as u32,
+                    ])
+                } else {
+                    None
+                };
+                let bytes = (info_cnt as u64) * 4;
+                let _ = mach_vm_deallocate(mach_task_self_, info_ptr as u64, bytes);
+                result
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn host_cpu_ticks(_target: ProcessorTarget) -> Option<[u32; 4]> {
+    None
 }
 
 fn process_cpu_seconds() -> (f64, f64) {
@@ -144,29 +265,58 @@ fn process_rss_bytes() -> u64 {
     }
 }
 
-fn sample_counter(c: &mut CounterState, now: Instant) {
+fn sample_counter(
+    c: &mut CounterState,
+    now: Instant,
+    cached_total_ticks: &mut Option<Option<[u32; 4]>>,
+) {
     let val = match c.kind {
-        CounterKind::ProcessorTotalPct
-        | CounterKind::ProcessorUserPct
-        | CounterKind::ProcessorKernelPct
-        | CounterKind::ProcessProcessorPct => {
-            let (u, s) = process_cpu_seconds();
-            let cur_cpu = match c.kind {
-                CounterKind::ProcessorUserPct => u,
-                CounterKind::ProcessorKernelPct => s,
-                _ => u + s,
+        CounterKind::ProcessorTotalPct(target)
+        | CounterKind::ProcessorUserPct(target)
+        | CounterKind::ProcessorKernelPct(target)
+        | CounterKind::ProcessorIdlePct(target) => {
+            let cur_opt = match target {
+                ProcessorTarget::Total => *cached_total_ticks.get_or_insert_with(|| host_cpu_ticks(ProcessorTarget::Total)),
+                ProcessorTarget::Core(idx) => host_cpu_ticks(ProcessorTarget::Core(idx)),
             };
+            let Some(cur) = cur_opt else {
+                c.last_value = None;
+                return;
+            };
+            let pct = if let Some(prev) = c.prev_host_ticks {
+                let du = cur[0].wrapping_sub(prev[0]) as f64;
+                let ds = cur[1].wrapping_sub(prev[1]) as f64;
+                let di = cur[2].wrapping_sub(prev[2]) as f64;
+                let dn = cur[3].wrapping_sub(prev[3]) as f64;
+                let total = du + ds + di + dn;
+                if total > 0.0 {
+                    let raw = match c.kind {
+                        CounterKind::ProcessorTotalPct(_) => ((du + ds + dn) / total) * 100.0,
+                        CounterKind::ProcessorUserPct(_) => ((du + dn) / total) * 100.0,
+                        CounterKind::ProcessorKernelPct(_) => (ds / total) * 100.0,
+                        CounterKind::ProcessorIdlePct(_) => (di / total) * 100.0,
+                        _ => 0.0,
+                    };
+                    raw.clamp(0.0, 100.0)
+                } else {
+                    c.last_value.unwrap_or(0.0)
+                }
+            } else {
+                0.0
+            };
+            c.prev_host_ticks = Some(cur);
+            c.prev_sample_time = Some(now);
+            pct
+        }
+        CounterKind::ProcessProcessorPct => {
+            let (u, s) = process_cpu_seconds();
+            let cur_cpu = u + s;
             let pct = if let Some(prev_t) = c.prev_sample_time {
                 let dt = now.saturating_duration_since(prev_t).as_secs_f64();
                 if dt > 1e-6 {
                     let cpus = crate::process::num_cpus().max(1) as f64;
                     let delta = (cur_cpu - c.prev_cpu_sec).max(0.0);
-                    let raw = if c.kind == CounterKind::ProcessProcessorPct {
-                        (delta / dt) * 100.0
-                    } else {
-                        (delta / (dt * cpus)) * 100.0
-                    };
-                    raw.clamp(0.0, 100.0 * cpus)
+                    ((delta / dt) * 100.0).clamp(0.0, 100.0 * cpus)
                 } else {
                     c.last_value.unwrap_or(0.0)
                 }
@@ -254,6 +404,7 @@ pub unsafe extern "win64" fn PdhAddCounterW(
             last_value: None,
             prev_sample_time: None,
             prev_cpu_sec: 0.0,
+            prev_host_ticks: None,
         },
     );
     std::ptr::write_unaligned(ph_counter, ch);
@@ -266,9 +417,10 @@ pub unsafe extern "win64" fn PdhCollectQueryData(h_query: usize) -> i32 {
         return PDH_INVALID_HANDLE;
     };
     let now = Instant::now();
+    let mut cached_total_ticks: Option<Option<[u32; 4]>> = None;
     for cid in counter_ids {
         if let Some(c) = st.counters.get_mut(&cid) {
-            sample_counter(c, now);
+            sample_counter(c, now, &mut cached_total_ticks);
         }
     }
     ERROR_SUCCESS
@@ -339,13 +491,45 @@ mod tests {
             let mut c_cpu = 0usize;
             assert_eq!(PdhAddCounterW(q, cpu_path.as_ptr(), 0, &mut c_cpu), ERROR_SUCCESS);
 
+            let user_path = to_wide_z("\\Processor(_Total)\\% User Time");
+            let mut c_user = 0usize;
+            assert_eq!(PdhAddCounterW(q, user_path.as_ptr(), 0, &mut c_user), ERROR_SUCCESS);
+
+            let kern_path = to_wide_z("\\Processor(_Total)\\% Privileged Time");
+            let mut c_kern = 0usize;
+            assert_eq!(PdhAddCounterW(q, kern_path.as_ptr(), 0, &mut c_kern), ERROR_SUCCESS);
+
+            let core0_path = to_wide_z("\\Processor(0)\\% Processor Time");
+            let mut c_core0 = 0usize;
+            assert_eq!(PdhAddCounterW(q, core0_path.as_ptr(), 0, &mut c_core0), ERROR_SUCCESS);
+
+            let proc_path = to_wide_z("\\Process(self)\\% Processor Time");
+            let mut c_proc = 0usize;
+            assert_eq!(PdhAddCounterW(q, proc_path.as_ptr(), 0, &mut c_proc), ERROR_SUCCESS);
+
+            // Out-of-range or missing processor instance fails honestly with PDH_CSTATUS_NO_INSTANCE.
+            let bad_inst = to_wide_z("\\Processor(99999)\\% Processor Time");
+            let mut c_bad_inst = 1usize;
+            assert_eq!(PdhAddCounterW(q, bad_inst.as_ptr(), 0, &mut c_bad_inst), PDH_CSTATUS_NO_INSTANCE);
+            assert_eq!(c_bad_inst, 0);
+
             // Unknown counter object fails honestly with PDH_CSTATUS_NO_OBJECT.
             let bad_path = to_wide_z("\\NoSuchPerfObject\\Foo");
             let mut c_bad = 1usize;
             assert_eq!(PdhAddCounterW(q, bad_path.as_ptr(), 0, &mut c_bad), PDH_CSTATUS_NO_OBJECT);
             assert_eq!(c_bad, 0);
 
+            // Verify Mach host-wide and per-core ticks are real non-zero system counters.
+            let t0 = host_cpu_ticks(ProcessorTarget::Total).expect("host_statistics must return ticks");
+            assert!(t0.iter().map(|&v| v as u64).sum::<u64>() > 0);
+            let core0_t0 = host_cpu_ticks(ProcessorTarget::Core(0)).expect("host_processor_info must return core 0 ticks");
+            assert!(core0_t0.iter().map(|&v| v as u64).sum::<u64>() > 0);
+
             assert_eq!(PdhCollectQueryData(q), ERROR_SUCCESS);
+            // Allow at least one host scheduler tick to elapse so host-wide delta is sampled.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert_eq!(PdhCollectQueryData(q), ERROR_SUCCESS);
+
             let mut val = [0u8; 16];
             let mut ty = 99u32;
             assert_eq!(
@@ -355,12 +539,24 @@ mod tests {
             assert_eq!(std::ptr::read_unaligned(val.as_ptr() as *const u32), PDH_CSTATUS_VALID_DATA);
             assert!(std::ptr::read_unaligned(val.as_ptr().add(8) as *const i64) > 0);
 
-            assert_eq!(
-                PdhGetFormattedCounterValue(c_cpu, PDH_FMT_DOUBLE, &mut ty, val.as_mut_ptr()),
-                ERROR_SUCCESS
-            );
-            let cpu_pct = std::ptr::read_unaligned(val.as_ptr().add(8) as *const f64);
-            assert!(cpu_pct >= 0.0);
+            let mut read_pct = |ch: usize| -> f64 {
+                let mut v = [0u8; 16];
+                assert_eq!(PdhGetFormattedCounterValue(ch, PDH_FMT_DOUBLE, &mut ty, v.as_mut_ptr()), ERROR_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(v.as_ptr() as *const u32), PDH_CSTATUS_VALID_DATA);
+                std::ptr::read_unaligned(v.as_ptr().add(8) as *const f64)
+            };
+            let cpu_pct = read_pct(c_cpu);
+            let user_pct = read_pct(c_user);
+            let kern_pct = read_pct(c_kern);
+            let core0_pct = read_pct(c_core0);
+            let proc_pct = read_pct(c_proc);
+            assert!((0.0..=100.0).contains(&cpu_pct));
+            assert!((0.0..=100.0).contains(&user_pct));
+            assert!((0.0..=100.0).contains(&kern_pct));
+            assert!((0.0..=100.0).contains(&core0_pct));
+            assert!(proc_pct >= 0.0);
+            // Total host CPU percentage equals user + kernel (from the exact same Mach tick snapshot).
+            assert!((cpu_pct - (user_pct + kern_pct)).abs() <= 1e-6);
 
             assert_eq!(PdhCloseQuery(q), ERROR_SUCCESS);
             assert_eq!(PdhCloseQuery(q), PDH_INVALID_HANDLE);

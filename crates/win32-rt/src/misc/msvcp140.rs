@@ -2527,11 +2527,26 @@ static OSTREAM_VBTABLE: [i32; 2] = [0, 0x10];
 static IOSTREAM_IN_VBTABLE: [i32; 2] = [0, 0x20];
 static IOSTREAM_OUT_VBTABLE: [i32; 2] = [0, 0x10];
 
+#[inline]
+unsafe fn read_field<S, T>(base: *const S, offset: usize) -> T {
+    std::ptr::read_unaligned((base as *const u8).add(offset) as *const T)
+}
+
+#[inline]
+unsafe fn write_field<S, T>(base: *mut S, offset: usize, val: T) {
+    std::ptr::write_unaligned((base as *mut u8).add(offset) as *mut T, val)
+}
+
+#[inline]
+unsafe fn field_ptr<S, T>(base: *mut S, offset: usize) -> *mut T {
+    (base as *mut u8).add(offset) as *mut T
+}
+
 unsafe extern "win64" fn ios_ctor(this: *mut BasicIos) -> *mut BasicIos {
     ensure_vtables_registered();
     if !this.is_null() {
-        std::ptr::write_bytes(this, 0, 1);
-        (*this).vtable = BASIC_IOS_VTABLE.as_ptr();
+        std::ptr::write_bytes(this as *mut u8, 0, std::mem::size_of::<BasicIos>());
+        write_field(this, std::mem::offset_of!(BasicIos, vtable), BASIC_IOS_VTABLE.as_ptr());
     }
     this
 }
@@ -2554,19 +2569,19 @@ unsafe extern "win64" fn ios_init_export(
 }
 
 unsafe extern "win64" fn ios_base_bool(this: *const BasicIos) -> u8 {
-    (!this.is_null() && ((*this).mystate & 6) == 0) as u8
+    (!this.is_null() && (read_field::<BasicIos, i32>(this, std::mem::offset_of!(BasicIos, mystate)) & 6) == 0) as u8
 }
 
 unsafe extern "win64" fn ios_base_flags(this: *const BasicIos) -> i32 {
-    if this.is_null() { 0 } else { (*this).fmtfl }
+    if this.is_null() { 0 } else { read_field(this, std::mem::offset_of!(BasicIos, fmtfl)) }
 }
 
 unsafe extern "win64" fn ios_base_setf1(this: *mut BasicIos, newfmt: i32) -> i32 {
     if this.is_null() {
         return 0;
     }
-    let old = (*this).fmtfl;
-    (*this).fmtfl = (old | newfmt) & 0xFFFF;
+    let old: i32 = read_field(this, std::mem::offset_of!(BasicIos, fmtfl));
+    write_field(this, std::mem::offset_of!(BasicIos, fmtfl), (old | newfmt) & 0xFFFF);
     old
 }
 
@@ -2574,30 +2589,38 @@ unsafe extern "win64" fn ios_base_setf2(this: *mut BasicIos, newfmt: i32, mask: 
     if this.is_null() {
         return 0;
     }
-    let old = (*this).fmtfl;
-    (*this).fmtfl = ((old & !mask) | (newfmt & mask)) & 0xFFFF;
+    let old: i32 = read_field(this, std::mem::offset_of!(BasicIos, fmtfl));
+    write_field(
+        this,
+        std::mem::offset_of!(BasicIos, fmtfl),
+        ((old & !mask) | (newfmt & mask)) & 0xFFFF,
+    );
     old
 }
 
 unsafe extern "win64" fn ios_base_width_get(this: *const BasicIos) -> i64 {
-    if this.is_null() { 0 } else { (*this).wide }
+    if this.is_null() { 0 } else { read_field(this, std::mem::offset_of!(BasicIos, wide)) }
 }
 
 unsafe extern "win64" fn ios_base_width_set(this: *mut BasicIos, newwidth: i64) -> i64 {
     if this.is_null() {
         return 0;
     }
-    let old = (*this).wide;
-    (*this).wide = newwidth;
+    let old: i64 = read_field(this, std::mem::offset_of!(BasicIos, wide));
+    write_field(this, std::mem::offset_of!(BasicIos, wide), newwidth);
     old
 }
 
 unsafe extern "win64" fn ios_fill_get(this: *const BasicIos) -> u8 {
-    if this.is_null() { b' ' } else { (*this).fillch }
+    if this.is_null() { b' ' } else { read_field(this, std::mem::offset_of!(BasicIos, fillch)) }
 }
 
 unsafe extern "win64" fn ios_rdbuf_get(this: *const BasicIos) -> *mut BasicStreambuf {
-    if this.is_null() { std::ptr::null_mut() } else { (*this).mystrbuf }
+    if this.is_null() {
+        std::ptr::null_mut()
+    } else {
+        read_field(this, std::mem::offset_of!(BasicIos, mystrbuf))
+    }
 }
 
 unsafe extern "win64" fn ios_rdbuf_set(
@@ -2607,14 +2630,18 @@ unsafe extern "win64" fn ios_rdbuf_set(
     if this.is_null() {
         return std::ptr::null_mut();
     }
-    let old = (*this).mystrbuf;
-    (*this).mystrbuf = sb;
-    (*this).mystate = if sb.is_null() { 4 } else { 0 };
+    let old: *mut BasicStreambuf = read_field(this, std::mem::offset_of!(BasicIos, mystrbuf));
+    write_field(this, std::mem::offset_of!(BasicIos, mystrbuf), sb);
+    write_field(this, std::mem::offset_of!(BasicIos, mystate), if sb.is_null() { 4i32 } else { 0i32 });
     old
 }
 
 unsafe extern "win64" fn ios_tie_get(this: *const BasicIos) -> *mut c_void {
-    if this.is_null() { std::ptr::null_mut() } else { (*this).tiestr }
+    if this.is_null() {
+        std::ptr::null_mut()
+    } else {
+        read_field(this, std::mem::offset_of!(BasicIos, tiestr))
+    }
 }
 
 unsafe extern "win64" fn ios_copyfmt(
@@ -2624,22 +2651,25 @@ unsafe extern "win64" fn ios_copyfmt(
     if this.is_null() || rhs.is_null() || (this as *const BasicIos) == rhs {
         return this;
     }
-    (*this).fmtfl = (*rhs).fmtfl;
-    (*this).prec = (*rhs).prec;
-    (*this).wide = (*rhs).wide;
-    (*this).fillch = (*rhs).fillch;
-    (*this).tiestr = (*rhs).tiestr;
-    (*this).except = (*rhs).except;
-    if !(*rhs).ploc.is_null() {
-        let loc_imp = (*(*rhs).ploc)[1] as *mut Locimp;
+    write_field::<_, i32>(this, std::mem::offset_of!(BasicIos, fmtfl), read_field(rhs, std::mem::offset_of!(BasicIos, fmtfl)));
+    write_field::<_, i64>(this, std::mem::offset_of!(BasicIos, prec), read_field(rhs, std::mem::offset_of!(BasicIos, prec)));
+    write_field::<_, i64>(this, std::mem::offset_of!(BasicIos, wide), read_field(rhs, std::mem::offset_of!(BasicIos, wide)));
+    write_field::<_, u8>(this, std::mem::offset_of!(BasicIos, fillch), read_field(rhs, std::mem::offset_of!(BasicIos, fillch)));
+    write_field::<_, *mut c_void>(this, std::mem::offset_of!(BasicIos, tiestr), read_field(rhs, std::mem::offset_of!(BasicIos, tiestr)));
+    write_field::<_, i32>(this, std::mem::offset_of!(BasicIos, except), read_field(rhs, std::mem::offset_of!(BasicIos, except)));
+    let rhs_ploc: *mut [usize; 2] = read_field(rhs, std::mem::offset_of!(BasicIos, ploc));
+    if !rhs_ploc.is_null() {
+        let loc_imp = std::ptr::read_unaligned((rhs_ploc as *const usize).add(1)) as *mut Locimp;
         if !loc_imp.is_null() {
             (*loc_imp).refs.fetch_add(1, Ordering::Relaxed);
         }
-        if (*this).ploc.is_null() {
-            (*this).ploc = crate::ucrt::heap::calloc(1, 16) as *mut [usize; 2];
+        let mut dst_ploc: *mut [usize; 2] = read_field(this, std::mem::offset_of!(BasicIos, ploc));
+        if dst_ploc.is_null() {
+            dst_ploc = crate::ucrt::heap::calloc(1, 16) as *mut [usize; 2];
+            write_field(this, std::mem::offset_of!(BasicIos, ploc), dst_ploc);
         }
-        if !(*this).ploc.is_null() {
-            (*(*this).ploc)[1] = loc_imp as usize;
+        if !dst_ploc.is_null() {
+            std::ptr::write_unaligned((dst_ploc as *mut usize).add(1), loc_imp as usize);
         }
     }
     this
@@ -2647,10 +2677,11 @@ unsafe extern "win64" fn ios_copyfmt(
 
 unsafe extern "win64" fn ios_dtor(this: *mut BasicIos) {
     if !this.is_null() {
-        (*this).vtable = BASIC_IOS_VTABLE.as_ptr();
-        if !(*this).ploc.is_null() {
-            crate::ucrt::heap::free((*this).ploc.cast());
-            (*this).ploc = std::ptr::null_mut();
+        write_field(this, std::mem::offset_of!(BasicIos, vtable), BASIC_IOS_VTABLE.as_ptr());
+        let ploc: *mut [usize; 2] = read_field(this, std::mem::offset_of!(BasicIos, ploc));
+        if !ploc.is_null() {
+            crate::ucrt::heap::free(ploc.cast());
+            write_field(this, std::mem::offset_of!(BasicIos, ploc), std::ptr::null_mut::<[usize; 2]>());
         }
     }
 }
@@ -2667,32 +2698,34 @@ unsafe fn ios_init(ios: *mut BasicIos, sb: *mut BasicStreambuf) {
     if ios.is_null() {
         return;
     }
-    (*ios).vtable = BASIC_IOS_VTABLE.as_ptr();
-    (*ios).mystate = if sb.is_null() { 4 } else { 0 };
-    (*ios).except = 0;
-    (*ios).fmtfl = 0x201;
-    (*ios).prec = 6;
-    (*ios).wide = 0;
+    write_field(ios, std::mem::offset_of!(BasicIos, vtable), BASIC_IOS_VTABLE.as_ptr());
+    write_field(ios, std::mem::offset_of!(BasicIos, mystate), if sb.is_null() { 4i32 } else { 0i32 });
+    write_field(ios, std::mem::offset_of!(BasicIos, except), 0i32);
+    write_field(ios, std::mem::offset_of!(BasicIos, fmtfl), 0x201i32);
+    write_field(ios, std::mem::offset_of!(BasicIos, prec), 6i64);
+    write_field(ios, std::mem::offset_of!(BasicIos, wide), 0i64);
     let loc = crate::ucrt::heap::calloc(1, 16) as *mut [usize; 2];
     if !loc.is_null() {
-        (*loc)[1] = locale_init(1) as usize;
+        std::ptr::write_unaligned((loc as *mut usize).add(1), locale_init(1) as usize);
     }
-    (*ios).ploc = loc;
-    (*ios).mystrbuf = sb;
-    (*ios).tiestr = std::ptr::null_mut();
-    (*ios).fillch = b' ';
+    write_field(ios, std::mem::offset_of!(BasicIos, ploc), loc);
+    write_field(ios, std::mem::offset_of!(BasicIos, mystrbuf), sb);
+    write_field(ios, std::mem::offset_of!(BasicIos, tiestr), std::ptr::null_mut::<c_void>());
+    write_field(ios, std::mem::offset_of!(BasicIos, fillch), b' ');
 }
 
 unsafe extern "win64" fn ios_good(this: *const BasicIos) -> u8 {
-    (!this.is_null() && (*this).mystate == 0) as u8
+    (!this.is_null() && read_field::<BasicIos, i32>(this, std::mem::offset_of!(BasicIos, mystate)) == 0) as u8
 }
 
 unsafe extern "win64" fn ios_setstate(this: *mut BasicIos, state: i32, _reraise: u8) {
     if this.is_null() {
         return;
     }
-    let extra = if (*this).mystrbuf.is_null() { 4 } else { 0 };
-    (*this).mystate = ((*this).mystate | state | extra) & 0x17;
+    let sb: *mut BasicStreambuf = read_field(this, std::mem::offset_of!(BasicIos, mystrbuf));
+    let extra = if sb.is_null() { 4 } else { 0 };
+    let cur: i32 = read_field(this, std::mem::offset_of!(BasicIos, mystate));
+    write_field(this, std::mem::offset_of!(BasicIos, mystate), (cur | state | extra) & 0x17);
 }
 
 unsafe extern "win64" fn ios_widen(_this: *const BasicIos, ch: u8) -> u8 {
@@ -2979,13 +3012,16 @@ unsafe extern "win64" fn ostream_tellp(
         return out;
     }
     let ios = stream_ios(this);
-    if !ios.is_null() && ((*ios).mystate & 6) == 0 && !(*ios).mystrbuf.is_null() {
-        let sb = (*ios).mystrbuf;
-        let vtable = (*sb).vtable;
-        if !vtable.is_null() {
-            let seekoff = (*vtable.add(10)).0 as usize;
-            if seekoff != 0 {
-                let _ = crate::call_guest8(seekoff, sb as u64, out as u64, 0, 1, 2, 0, 0, 0);
+    if !ios.is_null() {
+        let mystate: i32 = read_field(ios, std::mem::offset_of!(BasicIos, mystate));
+        let sb: *mut BasicStreambuf = read_field(ios, std::mem::offset_of!(BasicIos, mystrbuf));
+        if (mystate & 6) == 0 && !sb.is_null() {
+            let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambuf, vtable));
+            if !vtable.is_null() {
+                let seekoff = std::ptr::read_unaligned(vtable.add(10)).0 as usize;
+                if seekoff != 0 {
+                    let _ = crate::call_guest8(seekoff, sb as u64, out as u64, 0, 1, 2, 0, 0, 0);
+                }
             }
         }
     }
@@ -3129,34 +3165,59 @@ static BASIC_STREAMBUF_W_VTABLE: [Ptr; 15] = [
 unsafe extern "win64" fn streambuf_w_ctor(this: *mut BasicStreambufW) -> *mut BasicStreambufW {
     ensure_vtables_registered();
     if !this.is_null() {
-        (*this).vtable = BASIC_STREAMBUF_W_VTABLE.as_ptr();
-        (*this).gfirst = std::ptr::null_mut();
-        (*this).pfirst = std::ptr::null_mut();
-        (*this).igfirst = &mut (*this).gfirst;
-        (*this).ipfirst = &mut (*this).pfirst;
-        (*this).gnext = std::ptr::null_mut();
-        (*this).pnext = std::ptr::null_mut();
-        (*this).ignext = &mut (*this).gnext;
-        (*this).ipnext = &mut (*this).pnext;
-        (*this).gcount = 0;
-        (*this).pcount = 0;
-        (*this).igcount = &mut (*this).gcount;
-        (*this).ipcount = &mut (*this).pcount;
+        write_field(this, std::mem::offset_of!(BasicStreambufW, vtable), BASIC_STREAMBUF_W_VTABLE.as_ptr());
+        write_field(this, std::mem::offset_of!(BasicStreambufW, gfirst), std::ptr::null_mut::<u16>());
+        write_field(this, std::mem::offset_of!(BasicStreambufW, pfirst), std::ptr::null_mut::<u16>());
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambufW, igfirst),
+            field_ptr::<_, *mut u16>(this, std::mem::offset_of!(BasicStreambufW, gfirst)),
+        );
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambufW, ipfirst),
+            field_ptr::<_, *mut u16>(this, std::mem::offset_of!(BasicStreambufW, pfirst)),
+        );
+        write_field(this, std::mem::offset_of!(BasicStreambufW, gnext), std::ptr::null_mut::<u16>());
+        write_field(this, std::mem::offset_of!(BasicStreambufW, pnext), std::ptr::null_mut::<u16>());
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambufW, ignext),
+            field_ptr::<_, *mut u16>(this, std::mem::offset_of!(BasicStreambufW, gnext)),
+        );
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambufW, ipnext),
+            field_ptr::<_, *mut u16>(this, std::mem::offset_of!(BasicStreambufW, pnext)),
+        );
+        write_field(this, std::mem::offset_of!(BasicStreambufW, gcount), 0i32);
+        write_field(this, std::mem::offset_of!(BasicStreambufW, pcount), 0i32);
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambufW, igcount),
+            field_ptr::<_, i32>(this, std::mem::offset_of!(BasicStreambufW, gcount)),
+        );
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambufW, ipcount),
+            field_ptr::<_, i32>(this, std::mem::offset_of!(BasicStreambufW, pcount)),
+        );
         let loc = crate::ucrt::heap::calloc(1, 16) as *mut [usize; 2];
         if !loc.is_null() {
-            (*loc)[1] = locale_init(1) as usize;
+            std::ptr::write_unaligned((loc as *mut usize).add(1), locale_init(1) as usize);
         }
-        (*this).plocale = loc;
+        write_field(this, std::mem::offset_of!(BasicStreambufW, plocale), loc);
     }
     this
 }
 
 unsafe extern "win64" fn streambuf_w_dtor(this: *mut BasicStreambufW) {
     if !this.is_null() {
-        (*this).vtable = BASIC_STREAMBUF_W_VTABLE.as_ptr();
-        if !(*this).plocale.is_null() {
-            crate::ucrt::heap::free((*this).plocale.cast());
-            (*this).plocale = std::ptr::null_mut();
+        write_field(this, std::mem::offset_of!(BasicStreambufW, vtable), BASIC_STREAMBUF_W_VTABLE.as_ptr());
+        let plocale: *mut [usize; 2] = read_field(this, std::mem::offset_of!(BasicStreambufW, plocale));
+        if !plocale.is_null() {
+            crate::ucrt::heap::free(plocale.cast());
+            write_field(this, std::mem::offset_of!(BasicStreambufW, plocale), std::ptr::null_mut::<[usize; 2]>());
         }
     }
 }
@@ -3191,19 +3252,26 @@ unsafe extern "win64" fn streambuf_w_uflow(this: *mut BasicStreambufW) -> u16 {
     if this.is_null() {
         return WEOF_U16;
     }
-    let vtable = (*this).vtable;
-    let underflow = (*vtable.add(6)).0 as usize;
+    let vtable: *const Ptr = read_field(this, std::mem::offset_of!(BasicStreambufW, vtable));
+    if vtable.is_null() {
+        return WEOF_U16;
+    }
+    let underflow = std::ptr::read_unaligned(vtable.add(6)).0 as usize;
     if crate::call_guest8(underflow, this as u64, 0, 0, 0, 0, 0, 0, 0) as u16 == WEOF_U16 {
         return WEOF_U16;
     }
-    let cnt = (*this).igcount;
-    let nxt = (*this).ignext;
-    if cnt.is_null() || nxt.is_null() || (*nxt).is_null() {
+    let cnt: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, igcount));
+    let nxt: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ignext));
+    if cnt.is_null() || nxt.is_null() {
         return WEOF_U16;
     }
-    *cnt -= 1;
-    let p = *nxt;
-    *nxt = p.add(1);
+    let p = std::ptr::read_unaligned(nxt);
+    if p.is_null() {
+        return WEOF_U16;
+    }
+    let cur_cnt = std::ptr::read_unaligned(cnt);
+    std::ptr::write_unaligned(cnt, cur_cnt.wrapping_sub(1));
+    std::ptr::write_unaligned(nxt, p.add(1));
     std::ptr::read_unaligned(p)
 }
 
@@ -3217,25 +3285,24 @@ unsafe extern "win64" fn streambuf_w_xsgetn(
     }
     let mut rem = count;
     while rem > 0 {
-        let avail = if !(*this).ignext.is_null()
-            && !(*(*this).ignext).is_null()
-            && !(*this).igcount.is_null()
-        {
-            (*(*this).igcount).max(0) as i64
-        } else {
-            0
-        };
+        let ignext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ignext));
+        let igcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, igcount));
+        let src = if !ignext.is_null() { std::ptr::read_unaligned(ignext) } else { std::ptr::null_mut() };
+        let cur_cnt = if !igcount.is_null() { std::ptr::read_unaligned(igcount) } else { 0 };
+        let avail = if !src.is_null() { cur_cnt.max(0) as i64 } else { 0 };
         if avail > 0 {
             let n = rem.min(avail) as usize;
-            let src = *(*this).ignext;
             std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n * 2);
-            *(*this).ignext = src.add(n);
-            *(*this).igcount -= n as i32;
+            std::ptr::write_unaligned(ignext, src.add(n));
+            std::ptr::write_unaligned(igcount, cur_cnt.wrapping_sub(n as i32));
             dst = dst.add(n);
             rem -= n as i64;
         } else {
-            let vtable = (*this).vtable;
-            let uflow = (*vtable.add(7)).0 as usize;
+            let vtable: *const Ptr = read_field(this, std::mem::offset_of!(BasicStreambufW, vtable));
+            if vtable.is_null() {
+                break;
+            }
+            let uflow = std::ptr::read_unaligned(vtable.add(7)).0 as usize;
             let c = crate::call_guest8(uflow, this as u64, 0, 0, 0, 0, 0, 0, 0) as u16;
             if c == WEOF_U16 {
                 break;
@@ -3258,25 +3325,24 @@ unsafe extern "win64" fn streambuf_w_xsputn(
     }
     let mut rem = count;
     while rem > 0 {
-        let avail = if !(*this).ipnext.is_null()
-            && !(*(*this).ipnext).is_null()
-            && !(*this).ipcount.is_null()
-        {
-            (*(*this).ipcount).max(0) as i64
-        } else {
-            0
-        };
+        let ipnext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipnext));
+        let ipcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipcount));
+        let dst = if !ipnext.is_null() { std::ptr::read_unaligned(ipnext) } else { std::ptr::null_mut() };
+        let cur_cnt = if !ipcount.is_null() { std::ptr::read_unaligned(ipcount) } else { 0 };
+        let avail = if !dst.is_null() { cur_cnt.max(0) as i64 } else { 0 };
         if avail > 0 {
             let n = rem.min(avail) as usize;
-            let dst = *(*this).ipnext;
             std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n * 2);
-            *(*this).ipnext = dst.add(n);
-            *(*this).ipcount -= n as i32;
+            std::ptr::write_unaligned(ipnext, dst.add(n));
+            std::ptr::write_unaligned(ipcount, cur_cnt.wrapping_sub(n as i32));
             src = src.add(n);
             rem -= n as i64;
         } else {
-            let vtable = (*this).vtable;
-            let overflow = (*vtable.add(3)).0 as usize;
+            let vtable: *const Ptr = read_field(this, std::mem::offset_of!(BasicStreambufW, vtable));
+            if vtable.is_null() {
+                break;
+            }
+            let overflow = std::ptr::read_unaligned(vtable.add(3)).0 as usize;
             let ch = std::ptr::read_unaligned(src);
             if crate::call_guest8(overflow, this as u64, ch as u64, 0, 0, 0, 0, 0, 0) as u16
                 == WEOF_U16
@@ -3333,19 +3399,21 @@ unsafe extern "win64" fn streambuf_w_sputc(this: *mut BasicStreambufW, ch: u16) 
     if this.is_null() {
         return WEOF_U16;
     }
-    if !(*this).ipnext.is_null()
-        && !(*(*this).ipnext).is_null()
-        && !(*this).ipcount.is_null()
-        && *(*this).ipcount > 0
-    {
-        *(*this).ipcount -= 1;
-        let p = *(*this).ipnext;
-        *(*this).ipnext = p.add(1);
+    let ipnext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipnext));
+    let ipcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipcount));
+    let p = if !ipnext.is_null() { std::ptr::read_unaligned(ipnext) } else { std::ptr::null_mut() };
+    let cur_cnt = if !ipcount.is_null() { std::ptr::read_unaligned(ipcount) } else { 0 };
+    if !p.is_null() && cur_cnt > 0 {
+        std::ptr::write_unaligned(ipcount, cur_cnt.wrapping_sub(1));
+        std::ptr::write_unaligned(ipnext, p.add(1));
         std::ptr::write_unaligned(p, ch);
         ch
     } else {
-        let vtable = (*this).vtable;
-        let overflow = (*vtable.add(3)).0 as usize;
+        let vtable: *const Ptr = read_field(this, std::mem::offset_of!(BasicStreambufW, vtable));
+        if vtable.is_null() {
+            return WEOF_U16;
+        }
+        let overflow = std::ptr::read_unaligned(vtable.add(3)).0 as usize;
         crate::call_guest8(overflow, this as u64, ch as u64, 0, 0, 0, 0, 0, 0) as u16
     }
 }
@@ -3358,70 +3426,115 @@ unsafe extern "win64" fn streambuf_w_sputn(
     if this.is_null() {
         return 0;
     }
-    let vtable = (*this).vtable;
-    let xsputn = (*vtable.add(9)).0 as usize;
+    let vtable: *const Ptr = read_field(this, std::mem::offset_of!(BasicStreambufW, vtable));
+    if vtable.is_null() {
+        return 0;
+    }
+    let xsputn = std::ptr::read_unaligned(vtable.add(9)).0 as usize;
     crate::call_guest8(xsputn, this as u64, s as u64, count as u64, 0, 0, 0, 0, 0) as i64
 }
 
 unsafe extern "win64" fn streambuf_w_pninc(this: *mut BasicStreambufW) -> *mut u16 {
-    if this.is_null() || (*this).ipnext.is_null() || (*(*this).ipnext).is_null() {
+    if this.is_null() {
         return std::ptr::null_mut();
     }
-    if !(*this).ipcount.is_null() {
-        *(*this).ipcount -= 1;
+    let ipnext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipnext));
+    if ipnext.is_null() {
+        return std::ptr::null_mut();
     }
-    let p = *(*this).ipnext;
-    *(*this).ipnext = p.add(1);
+    let p = std::ptr::read_unaligned(ipnext);
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ipcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipcount));
+    if !ipcount.is_null() {
+        let cur = std::ptr::read_unaligned(ipcount);
+        std::ptr::write_unaligned(ipcount, cur.wrapping_sub(1));
+    }
+    std::ptr::write_unaligned(ipnext, p.add(1));
     p
 }
 
 unsafe extern "win64" fn streambuf_w_eback(this: *const BasicStreambufW) -> *mut u16 {
-    if this.is_null() || (*this).igfirst.is_null() { std::ptr::null_mut() } else { *(*this).igfirst }
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let igfirst: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, igfirst));
+    if igfirst.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(igfirst) }
 }
 
 unsafe extern "win64" fn streambuf_w_gptr(this: *const BasicStreambufW) -> *mut u16 {
-    if this.is_null() || (*this).ignext.is_null() { std::ptr::null_mut() } else { *(*this).ignext }
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ignext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ignext));
+    if ignext.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(ignext) }
 }
 
 unsafe extern "win64" fn streambuf_w_egptr(this: *const BasicStreambufW) -> *mut u16 {
-    if this.is_null()
-        || (*this).ignext.is_null()
-        || (*(*this).ignext).is_null()
-        || (*this).igcount.is_null()
-    {
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ignext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ignext));
+    let igcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, igcount));
+    if ignext.is_null() || igcount.is_null() {
+        return std::ptr::null_mut();
+    }
+    let p = std::ptr::read_unaligned(ignext);
+    if p.is_null() {
         std::ptr::null_mut()
     } else {
-        (*(*this).ignext).wrapping_offset((*(*this).igcount) as isize)
+        p.wrapping_offset(std::ptr::read_unaligned(igcount) as isize)
     }
 }
 
 unsafe extern "win64" fn streambuf_w_pbase(this: *const BasicStreambufW) -> *mut u16 {
-    if this.is_null() || (*this).ipfirst.is_null() { std::ptr::null_mut() } else { *(*this).ipfirst }
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ipfirst: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipfirst));
+    if ipfirst.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(ipfirst) }
 }
 
 unsafe extern "win64" fn streambuf_w_pptr(this: *const BasicStreambufW) -> *mut u16 {
-    if this.is_null() || (*this).ipnext.is_null() { std::ptr::null_mut() } else { *(*this).ipnext }
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ipnext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipnext));
+    if ipnext.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(ipnext) }
 }
 
 unsafe extern "win64" fn streambuf_w_epptr(this: *const BasicStreambufW) -> *mut u16 {
-    if this.is_null()
-        || (*this).ipnext.is_null()
-        || (*(*this).ipnext).is_null()
-        || (*this).ipcount.is_null()
-    {
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ipnext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipnext));
+    let ipcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipcount));
+    if ipnext.is_null() || ipcount.is_null() {
+        return std::ptr::null_mut();
+    }
+    let p = std::ptr::read_unaligned(ipnext);
+    if p.is_null() {
         std::ptr::null_mut()
     } else {
-        (*(*this).ipnext).wrapping_offset((*(*this).ipcount) as isize)
+        p.wrapping_offset(std::ptr::read_unaligned(ipcount) as isize)
     }
 }
 
 unsafe extern "win64" fn streambuf_w_gbump(this: *mut BasicStreambufW, off: i32) {
-    if this.is_null() || (*this).ignext.is_null() || (*this).igcount.is_null() {
+    if this.is_null() {
         return;
     }
-    *(*this).igcount = (*(*this).igcount).wrapping_sub(off);
-    if !(*(*this).ignext).is_null() {
-        *(*this).ignext = (*(*this).ignext).wrapping_offset(off as isize);
+    let ignext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ignext));
+    let igcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, igcount));
+    if ignext.is_null() || igcount.is_null() {
+        return;
+    }
+    let cur = std::ptr::read_unaligned(igcount);
+    std::ptr::write_unaligned(igcount, cur.wrapping_sub(off));
+    let p = std::ptr::read_unaligned(ignext);
+    if !p.is_null() {
+        std::ptr::write_unaligned(ignext, p.wrapping_offset(off as isize));
     }
 }
 
@@ -3434,18 +3547,22 @@ unsafe extern "win64" fn streambuf_w_setg(
     if this.is_null() {
         return;
     }
-    if !(*this).igfirst.is_null() {
-        *(*this).igfirst = first;
+    let igfirst: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, igfirst));
+    let ignext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ignext));
+    let igcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, igcount));
+    if !igfirst.is_null() {
+        std::ptr::write_unaligned(igfirst, first);
     }
-    if !(*this).ignext.is_null() {
-        *(*this).ignext = next;
+    if !ignext.is_null() {
+        std::ptr::write_unaligned(ignext, next);
     }
-    if !(*this).igcount.is_null() {
-        *(*this).igcount = if next.is_null() || last.is_null() {
+    if !igcount.is_null() {
+        let cnt = if next.is_null() || last.is_null() {
             0
         } else {
             ((last as isize).wrapping_sub(next as isize) / 2) as i32
         };
+        std::ptr::write_unaligned(igcount, cnt);
     }
 }
 
@@ -3458,18 +3575,22 @@ unsafe extern "win64" fn streambuf_w_setp3(
     if this.is_null() {
         return;
     }
-    if !(*this).ipfirst.is_null() {
-        *(*this).ipfirst = first;
+    let ipfirst: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipfirst));
+    let ipnext: *mut *mut u16 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipnext));
+    let ipcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambufW, ipcount));
+    if !ipfirst.is_null() {
+        std::ptr::write_unaligned(ipfirst, first);
     }
-    if !(*this).ipnext.is_null() {
-        *(*this).ipnext = next;
+    if !ipnext.is_null() {
+        std::ptr::write_unaligned(ipnext, next);
     }
-    if !(*this).ipcount.is_null() {
-        *(*this).ipcount = if next.is_null() || last.is_null() {
+    if !ipcount.is_null() {
+        let cnt = if next.is_null() || last.is_null() {
             0
         } else {
             ((last as isize).wrapping_sub(next as isize) / 2) as i32
         };
+        std::ptr::write_unaligned(ipcount, cnt);
     }
 }
 
@@ -3507,18 +3628,19 @@ static BASIC_IOS_W_VTABLE: [Ptr; 1] = [Ptr(ios_w_deleting_dtor as *const ())];
 unsafe extern "win64" fn ios_w_ctor(this: *mut BasicIosW) -> *mut BasicIosW {
     ensure_vtables_registered();
     if !this.is_null() {
-        std::ptr::write_bytes(this, 0, 1);
-        (*this).vtable = BASIC_IOS_W_VTABLE.as_ptr();
+        std::ptr::write_bytes(this as *mut u8, 0, std::mem::size_of::<BasicIosW>());
+        write_field(this, std::mem::offset_of!(BasicIosW, vtable), BASIC_IOS_W_VTABLE.as_ptr());
     }
     this
 }
 
 unsafe extern "win64" fn ios_w_dtor(this: *mut BasicIosW) {
     if !this.is_null() {
-        (*this).vtable = BASIC_IOS_W_VTABLE.as_ptr();
-        if !(*this).ploc.is_null() {
-            crate::ucrt::heap::free((*this).ploc.cast());
-            (*this).ploc = std::ptr::null_mut();
+        write_field(this, std::mem::offset_of!(BasicIosW, vtable), BASIC_IOS_W_VTABLE.as_ptr());
+        let ploc: *mut [usize; 2] = read_field(this, std::mem::offset_of!(BasicIosW, ploc));
+        if !ploc.is_null() {
+            crate::ucrt::heap::free(ploc.cast());
+            write_field(this, std::mem::offset_of!(BasicIosW, ploc), std::ptr::null_mut::<[usize; 2]>());
         }
     }
 }
@@ -3535,49 +3657,59 @@ unsafe fn ios_w_init(ios: *mut BasicIosW, sb: *mut BasicStreambufW) {
     if ios.is_null() {
         return;
     }
-    (*ios).vtable = BASIC_IOS_W_VTABLE.as_ptr();
-    (*ios).mystate = if sb.is_null() { 4 } else { 0 };
-    (*ios).except = 0;
-    (*ios).fmtfl = 0x201;
-    (*ios).prec = 6;
-    (*ios).wide = 0;
+    write_field(ios, std::mem::offset_of!(BasicIosW, vtable), BASIC_IOS_W_VTABLE.as_ptr());
+    write_field(ios, std::mem::offset_of!(BasicIosW, mystate), if sb.is_null() { 4i32 } else { 0i32 });
+    write_field(ios, std::mem::offset_of!(BasicIosW, except), 0i32);
+    write_field(ios, std::mem::offset_of!(BasicIosW, fmtfl), 0x201i32);
+    write_field(ios, std::mem::offset_of!(BasicIosW, prec), 6i64);
+    write_field(ios, std::mem::offset_of!(BasicIosW, wide), 0i64);
     let loc = crate::ucrt::heap::calloc(1, 16) as *mut [usize; 2];
     if !loc.is_null() {
-        (*loc)[1] = locale_init(1) as usize;
+        std::ptr::write_unaligned((loc as *mut usize).add(1), locale_init(1) as usize);
     }
-    (*ios).ploc = loc;
-    (*ios).mystrbuf = sb;
-    (*ios).tiestr = std::ptr::null_mut();
-    (*ios).fillch = b' ' as u16;
+    write_field(ios, std::mem::offset_of!(BasicIosW, ploc), loc);
+    write_field(ios, std::mem::offset_of!(BasicIosW, mystrbuf), sb);
+    write_field(ios, std::mem::offset_of!(BasicIosW, tiestr), std::ptr::null_mut::<c_void>());
+    write_field(ios, std::mem::offset_of!(BasicIosW, fillch), b' ' as u16);
 }
 
 unsafe extern "win64" fn ios_w_setstate(this: *mut BasicIosW, state: i32, _reraise: u8) {
     if this.is_null() {
         return;
     }
-    let extra = if (*this).mystrbuf.is_null() { 4 } else { 0 };
-    (*this).mystate = ((*this).mystate | state | extra) & 0x17;
+    let sb: *mut BasicStreambufW = read_field(this, std::mem::offset_of!(BasicIosW, mystrbuf));
+    let extra = if sb.is_null() { 4 } else { 0 };
+    let cur: i32 = read_field(this, std::mem::offset_of!(BasicIosW, mystate));
+    write_field(this, std::mem::offset_of!(BasicIosW, mystate), (cur | state | extra) & 0x17);
 }
 
 unsafe extern "win64" fn ios_w_fill_get(this: *const BasicIosW) -> u16 {
-    if this.is_null() { b' ' as u16 } else { (*this).fillch }
+    if this.is_null() { b' ' as u16 } else { read_field(this, std::mem::offset_of!(BasicIosW, fillch)) }
 }
 
 unsafe extern "win64" fn ios_w_fill_set(this: *mut BasicIosW, ch: u16) -> u16 {
     if this.is_null() {
         return b' ' as u16;
     }
-    let old = (*this).fillch;
-    (*this).fillch = ch;
+    let old: u16 = read_field(this, std::mem::offset_of!(BasicIosW, fillch));
+    write_field(this, std::mem::offset_of!(BasicIosW, fillch), ch);
     old
 }
 
 unsafe extern "win64" fn ios_w_rdbuf_get(this: *const BasicIosW) -> *mut BasicStreambufW {
-    if this.is_null() { std::ptr::null_mut() } else { (*this).mystrbuf }
+    if this.is_null() {
+        std::ptr::null_mut()
+    } else {
+        read_field(this, std::mem::offset_of!(BasicIosW, mystrbuf))
+    }
 }
 
 unsafe extern "win64" fn ios_w_tie_get(this: *const BasicIosW) -> *mut c_void {
-    if this.is_null() { std::ptr::null_mut() } else { (*this).tiestr }
+    if this.is_null() {
+        std::ptr::null_mut()
+    } else {
+        read_field(this, std::mem::offset_of!(BasicIosW, tiestr))
+    }
 }
 
 #[inline]
@@ -3613,16 +3745,18 @@ unsafe extern "win64" fn ostream_w_osfx(this: *mut u8) {
         return;
     }
     let ios = stream_ios_w(this);
-    if !ios.is_null()
-        && (*ios).mystate == 0
-        && ((*ios).fmtfl & 2) != 0
-        && !(*ios).mystrbuf.is_null()
-    {
-        let sb = (*ios).mystrbuf;
-        let vtable = (*sb).vtable;
-        let sync = (*vtable.add(13)).0 as usize;
-        if crate::call_guest8(sync, sb as u64, 0, 0, 0, 0, 0, 0, 0) as i32 == -1 {
-            ios_w_setstate(ios, 4, 0);
+    if !ios.is_null() {
+        let mystate: i32 = read_field(ios, std::mem::offset_of!(BasicIosW, mystate));
+        let fmtfl: i32 = read_field(ios, std::mem::offset_of!(BasicIosW, fmtfl));
+        let sb: *mut BasicStreambufW = read_field(ios, std::mem::offset_of!(BasicIosW, mystrbuf));
+        if mystate == 0 && (fmtfl & 2) != 0 && !sb.is_null() {
+            let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambufW, vtable));
+            if !vtable.is_null() {
+                let sync = std::ptr::read_unaligned(vtable.add(13)).0 as usize;
+                if crate::call_guest8(sync, sb as u64, 0, 0, 0, 0, 0, 0, 0) as i32 == -1 {
+                    ios_w_setstate(ios, 4, 0);
+                }
+            }
         }
     }
 }
@@ -3632,12 +3766,16 @@ unsafe extern "win64" fn ostream_w_flush(this: *mut u8) -> *mut u8 {
         return this;
     }
     let ios = stream_ios_w(this);
-    if !ios.is_null() && !(*ios).mystrbuf.is_null() {
-        let sb = (*ios).mystrbuf;
-        let vtable = (*sb).vtable;
-        let sync = (*vtable.add(13)).0 as usize;
-        if crate::call_guest8(sync, sb as u64, 0, 0, 0, 0, 0, 0, 0) as i32 == -1 {
-            ios_w_setstate(ios, 4, 0);
+    if !ios.is_null() {
+        let sb: *mut BasicStreambufW = read_field(ios, std::mem::offset_of!(BasicIosW, mystrbuf));
+        if !sb.is_null() {
+            let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambufW, vtable));
+            if !vtable.is_null() {
+                let sync = std::ptr::read_unaligned(vtable.add(13)).0 as usize;
+                if crate::call_guest8(sync, sb as u64, 0, 0, 0, 0, 0, 0, 0) as i32 == -1 {
+                    ios_w_setstate(ios, 4, 0);
+                }
+            }
         }
     }
     this
@@ -3648,21 +3786,21 @@ unsafe extern "win64" fn ostream_w_shl_u32(this: *mut u8, v: u32) -> *mut u8 {
         return this;
     }
     let ios = stream_ios_w(this);
-    let (fmtfl, w, fill) = if !ios.is_null() {
-        let f = (*ios).fmtfl;
-        let wi = (*ios).wide;
-        let fl = char::from_u32((*ios).fillch as u32).unwrap_or(' ');
-        (*ios).wide = 0;
-        (f, wi, fl)
+    let (fmtfl, w, fill, sb) = if !ios.is_null() {
+        let f: i32 = read_field(ios, std::mem::offset_of!(BasicIosW, fmtfl));
+        let wi: i64 = read_field(ios, std::mem::offset_of!(BasicIosW, wide));
+        let fillch: u16 = read_field(ios, std::mem::offset_of!(BasicIosW, fillch));
+        let fl = char::from_u32(fillch as u32).unwrap_or(' ');
+        write_field(ios, std::mem::offset_of!(BasicIosW, wide), 0i64);
+        let sb: *mut BasicStreambufW = read_field(ios, std::mem::offset_of!(BasicIosW, mystrbuf));
+        (f, wi, fl, sb)
     } else {
-        (0x201, 0, ' ')
+        (0x201, 0, ' ', std::ptr::null_mut())
     };
     let s = pad_formatted(format_uint_with_flags(fmtfl, v as u64), fmtfl, w, fill);
     let units: Vec<u16> = s.encode_utf16().collect();
-    if !ios.is_null() && !(*ios).mystrbuf.is_null() && !units.is_empty() {
-        if streambuf_w_sputn((*ios).mystrbuf, units.as_ptr(), units.len() as i64)
-            != units.len() as i64
-        {
+    if !ios.is_null() && !sb.is_null() && !units.is_empty() {
+        if streambuf_w_sputn(sb, units.as_ptr(), units.len() as i64) != units.len() as i64 {
             ios_w_setstate(ios, 4, 0);
         }
     }
@@ -3785,24 +3923,24 @@ unsafe extern "win64" fn fiopen_w(filename: *const u16, mode: i32, _prot: i32) -
 
 unsafe extern "win64" fn codecvt_d_getcat(ppf: *mut *const Facet, _ploc: *const c_void) -> usize {
     ensure_vtables_registered();
-    if !ppf.is_null() && (*ppf).is_null() {
+    if !ppf.is_null() && std::ptr::read_unaligned(ppf).is_null() {
         let p = crate::ucrt::heap::calloc(1, std::mem::size_of::<CodecvtU32>()) as *mut CodecvtU32;
         if !p.is_null() {
             (*p).vtable = CODECVT_U32_VTABLE.as_ptr();
             (*p).refs = AtomicU32::new(0);
-            *ppf = p.cast();
+            std::ptr::write_unaligned(ppf, p.cast());
         }
     }
     2
 }
 unsafe extern "win64" fn time_put_getcat(ppf: *mut *const Facet, _ploc: *const c_void) -> usize {
     ensure_vtables_registered();
-    if !ppf.is_null() && (*ppf).is_null() {
+    if !ppf.is_null() && std::ptr::read_unaligned(ppf).is_null() {
         let p = crate::ucrt::heap::calloc(1, std::mem::size_of::<Facet>()) as *mut Facet;
         if !p.is_null() {
             (*p).vtable = FACET_VTABLE.as_ptr();
             (*p).refs = AtomicU32::new(0);
-            *ppf = p;
+            std::ptr::write_unaligned(ppf, p);
         }
     }
     5
@@ -3828,67 +3966,133 @@ unsafe extern "win64" fn codecvt_d_in_out(
 
 unsafe extern "win64" fn streambuf_init_empty(this: *mut BasicStreambuf) {
     if !this.is_null() {
-        (*this).gfirst = std::ptr::null_mut();
-        (*this).pfirst = std::ptr::null_mut();
-        (*this).igfirst = &mut (*this).gfirst;
-        (*this).ipfirst = &mut (*this).pfirst;
-        (*this).gnext = std::ptr::null_mut();
-        (*this).pnext = std::ptr::null_mut();
-        (*this).ignext = &mut (*this).gnext;
-        (*this).ipnext = &mut (*this).pnext;
-        (*this).gcount = 0;
-        (*this).pcount = 0;
-        (*this).igcount = &mut (*this).gcount;
-        (*this).ipcount = &mut (*this).pcount;
+        write_field(this, std::mem::offset_of!(BasicStreambuf, gfirst), std::ptr::null_mut::<u8>());
+        write_field(this, std::mem::offset_of!(BasicStreambuf, pfirst), std::ptr::null_mut::<u8>());
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambuf, igfirst),
+            field_ptr::<_, *mut u8>(this, std::mem::offset_of!(BasicStreambuf, gfirst)),
+        );
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambuf, ipfirst),
+            field_ptr::<_, *mut u8>(this, std::mem::offset_of!(BasicStreambuf, pfirst)),
+        );
+        write_field(this, std::mem::offset_of!(BasicStreambuf, gnext), std::ptr::null_mut::<u8>());
+        write_field(this, std::mem::offset_of!(BasicStreambuf, pnext), std::ptr::null_mut::<u8>());
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambuf, ignext),
+            field_ptr::<_, *mut u8>(this, std::mem::offset_of!(BasicStreambuf, gnext)),
+        );
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambuf, ipnext),
+            field_ptr::<_, *mut u8>(this, std::mem::offset_of!(BasicStreambuf, pnext)),
+        );
+        write_field(this, std::mem::offset_of!(BasicStreambuf, gcount), 0i32);
+        write_field(this, std::mem::offset_of!(BasicStreambuf, pcount), 0i32);
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambuf, igcount),
+            field_ptr::<_, i32>(this, std::mem::offset_of!(BasicStreambuf, gcount)),
+        );
+        write_field(
+            this,
+            std::mem::offset_of!(BasicStreambuf, ipcount),
+            field_ptr::<_, i32>(this, std::mem::offset_of!(BasicStreambuf, pcount)),
+        );
     }
 }
 unsafe extern "win64" fn streambuf_pninc(this: *mut BasicStreambuf) -> *mut u8 {
-    if this.is_null() || (*this).ipnext.is_null() || (*(*this).ipnext).is_null() {
+    if this.is_null() {
         return std::ptr::null_mut();
     }
-    if !(*this).ipcount.is_null() {
-        *(*this).ipcount -= 1;
+    let ipnext: *mut *mut u8 = read_field(this, std::mem::offset_of!(BasicStreambuf, ipnext));
+    if ipnext.is_null() {
+        return std::ptr::null_mut();
     }
-    let p = *(*this).ipnext;
-    *(*this).ipnext = p.add(1);
+    let p = std::ptr::read_unaligned(ipnext);
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ipcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambuf, ipcount));
+    if !ipcount.is_null() {
+        let cur = std::ptr::read_unaligned(ipcount);
+        std::ptr::write_unaligned(ipcount, cur.wrapping_sub(1));
+    }
+    std::ptr::write_unaligned(ipnext, p.add(1));
     p
 }
 unsafe extern "win64" fn streambuf_eback(this: *const BasicStreambuf) -> *mut u8 {
-    if this.is_null() || (*this).igfirst.is_null() { std::ptr::null_mut() } else { *(*this).igfirst }
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let igfirst: *mut *mut u8 = read_field(this, std::mem::offset_of!(BasicStreambuf, igfirst));
+    if igfirst.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(igfirst) }
 }
 unsafe extern "win64" fn streambuf_gptr(this: *const BasicStreambuf) -> *mut u8 {
-    if this.is_null() || (*this).ignext.is_null() { std::ptr::null_mut() } else { *(*this).ignext }
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ignext: *mut *mut u8 = read_field(this, std::mem::offset_of!(BasicStreambuf, ignext));
+    if ignext.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(ignext) }
 }
 unsafe extern "win64" fn streambuf_egptr(this: *const BasicStreambuf) -> *mut u8 {
-    if this.is_null() || (*this).ignext.is_null() || (*(*this).ignext).is_null() || (*this).igcount.is_null() {
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ignext: *mut *mut u8 = read_field(this, std::mem::offset_of!(BasicStreambuf, ignext));
+    let igcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambuf, igcount));
+    if ignext.is_null() || igcount.is_null() {
+        return std::ptr::null_mut();
+    }
+    let p = std::ptr::read_unaligned(ignext);
+    if p.is_null() {
         std::ptr::null_mut()
     } else {
-        (*(*this).ignext).wrapping_offset((*(*this).igcount) as isize)
+        p.wrapping_offset(std::ptr::read_unaligned(igcount) as isize)
     }
 }
 unsafe extern "win64" fn streambuf_pbase(this: *const BasicStreambuf) -> *mut u8 {
-    if this.is_null() || (*this).ipfirst.is_null() { std::ptr::null_mut() } else { *(*this).ipfirst }
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ipfirst: *mut *mut u8 = read_field(this, std::mem::offset_of!(BasicStreambuf, ipfirst));
+    if ipfirst.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(ipfirst) }
 }
 unsafe extern "win64" fn streambuf_pptr(this: *const BasicStreambuf) -> *mut u8 {
-    if this.is_null() || (*this).ipnext.is_null() { std::ptr::null_mut() } else { *(*this).ipnext }
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ipnext: *mut *mut u8 = read_field(this, std::mem::offset_of!(BasicStreambuf, ipnext));
+    if ipnext.is_null() { std::ptr::null_mut() } else { std::ptr::read_unaligned(ipnext) }
 }
 unsafe extern "win64" fn streambuf_epptr(this: *const BasicStreambuf) -> *mut u8 {
-    if this.is_null() || (*this).ipnext.is_null() || (*(*this).ipnext).is_null() || (*this).ipcount.is_null() {
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ipnext: *mut *mut u8 = read_field(this, std::mem::offset_of!(BasicStreambuf, ipnext));
+    let ipcount: *mut i32 = read_field(this, std::mem::offset_of!(BasicStreambuf, ipcount));
+    if ipnext.is_null() || ipcount.is_null() {
+        return std::ptr::null_mut();
+    }
+    let p = std::ptr::read_unaligned(ipnext);
+    if p.is_null() {
         std::ptr::null_mut()
     } else {
-        (*(*this).ipnext).wrapping_offset((*(*this).ipcount) as isize)
+        p.wrapping_offset(std::ptr::read_unaligned(ipcount) as isize)
     }
 }
 unsafe extern "win64" fn streambuf_getloc(_this: *const BasicStreambuf, out: *mut [usize; 2]) -> *mut [usize; 2] {
     if !out.is_null() {
-        (*out)[0] = 0;
-        (*out)[1] = locale_init(1) as usize;
+        std::ptr::write_unaligned(out, [0, locale_init(1) as usize]);
     }
     out
 }
 unsafe extern "win64" fn ios_clear(this: *mut BasicIos, state: i32, _reraise: u8) {
     if !this.is_null() {
-        (*this).mystate = state & 0x17;
+        write_field(this, std::mem::offset_of!(BasicIos, mystate), state & 0x17);
     }
 }
 unsafe extern "win64" fn istream_read(this: *mut u8, dst: *mut u8, count: i64) -> *mut u8 {
@@ -3896,11 +4100,14 @@ unsafe extern "win64" fn istream_read(this: *mut u8, dst: *mut u8, count: i64) -
         return this;
     }
     let ios = stream_ios(this);
-    if !ios.is_null() && !(*ios).mystrbuf.is_null() {
-        let got = streambuf_xsgetn((*ios).mystrbuf, dst, count);
-        std::ptr::write_unaligned(this.add(8) as *mut i64, got);
-        if got != count {
-            ios_setstate(ios, 3, 0);
+    if !ios.is_null() {
+        let sb: *mut BasicStreambuf = read_field(ios, std::mem::offset_of!(BasicIos, mystrbuf));
+        if !sb.is_null() {
+            let got = streambuf_xsgetn(sb, dst, count);
+            std::ptr::write_unaligned(this.add(8) as *mut i64, got);
+            if got != count {
+                ios_setstate(ios, 3, 0);
+            }
         }
     }
     this
@@ -3916,8 +4123,7 @@ unsafe extern "win64" fn istream_tellg(_this: *mut u8, out: *mut [i64; 3]) -> *m
 }
 unsafe extern "win64" fn smanip_noop(out: *mut [usize; 2], val: i64) -> *mut [usize; 2] {
     if !out.is_null() {
-        (*out)[0] = noop_method as *const () as usize;
-        (*out)[1] = val as usize;
+        std::ptr::write_unaligned(out, [noop_method as *const () as usize, val as usize]);
     }
     out
 }
@@ -3927,7 +4133,7 @@ unsafe extern "win64" fn time_put_put(
     out_it: *const [usize; 2],
 ) -> *mut [usize; 2] {
     if !out_ret.is_null() && !out_it.is_null() {
-        *out_ret = *out_it;
+        std::ptr::write_unaligned(out_ret, std::ptr::read_unaligned(out_it));
     }
     out_ret
 }
@@ -4269,6 +4475,68 @@ mod tests {
             assert_eq!(wpmem[written], b'!' as u16);
             ios_w_dtor(wios);
             streambuf_w_dtor(&mut wsb);
+
+            // Unaligned wide-stream objects (odd byte offset, !is_aligned()) must never UB/abort.
+            let mut raw_wsb = vec![0xCCu8; std::mem::size_of::<BasicStreambufW>() + 8];
+            let unaligned_wsb = raw_wsb.as_mut_ptr().add(1) as *mut BasicStreambufW;
+            assert!(!unaligned_wsb.is_aligned());
+            streambuf_w_ctor(unaligned_wsb);
+
+            let mut raw_wbuf = [0u8; 66];
+            let unaligned_g = raw_wbuf.as_mut_ptr().add(1) as *mut u16;
+            for (i, u) in "ABCD".encode_utf16().enumerate() {
+                std::ptr::write_unaligned(unaligned_g.add(i), u);
+            }
+            let unaligned_p = raw_wbuf.as_mut_ptr().add(17) as *mut u16;
+            streambuf_w_setg(unaligned_wsb, unaligned_g, unaligned_g, unaligned_g.add(4));
+            streambuf_w_setp2(unaligned_wsb, unaligned_p, unaligned_p.add(16));
+            assert_eq!(streambuf_w_eback(unaligned_wsb), unaligned_g);
+            assert_eq!(streambuf_w_gptr(unaligned_wsb), unaligned_g);
+            assert_eq!(streambuf_w_egptr(unaligned_wsb), unaligned_g.add(4));
+            assert_eq!(streambuf_w_pbase(unaligned_wsb), unaligned_p);
+            assert_eq!(streambuf_w_pptr(unaligned_wsb), unaligned_p);
+            assert_eq!(streambuf_w_epptr(unaligned_wsb), unaligned_p.add(16));
+
+            let mut got_w = [0u16; 2];
+            assert_eq!(streambuf_w_xsgetn(unaligned_wsb, got_w.as_mut_ptr(), 2), 2);
+            assert_eq!(got_w, [b'A' as u16, b'B' as u16]);
+            streambuf_w_gbump(unaligned_wsb, 1);
+            assert_eq!(streambuf_w_gptr(unaligned_wsb), unaligned_g.add(3));
+            assert_eq!(streambuf_w_sputc(unaligned_wsb, b'X' as u16), b'X' as u16);
+            let pn = streambuf_w_pninc(unaligned_wsb);
+            assert_eq!(pn, unaligned_p.add(1));
+            std::ptr::write_unaligned(pn, b'Y' as u16);
+            assert_eq!(std::ptr::read_unaligned(unaligned_p), b'X' as u16);
+            assert_eq!(std::ptr::read_unaligned(unaligned_p.add(1)), b'Y' as u16);
+
+            let mut raw_wiostr = vec![0xDDu8; 0x20 + std::mem::size_of::<BasicIosW>() + 8];
+            let unaligned_wiostr = raw_wiostr.as_mut_ptr().add(3);
+            assert!(!(unaligned_wiostr as *const BasicIosW).is_aligned());
+            iostream_w_ctor(unaligned_wiostr, unaligned_wsb, 1);
+            let unaligned_wios = stream_ios_w(unaligned_wiostr);
+            assert!(!unaligned_wios.is_aligned());
+            assert_eq!(ios_w_rdbuf_get(unaligned_wios), unaligned_wsb);
+            assert!(ios_w_tie_get(unaligned_wios).is_null());
+            assert_eq!(ios_base_bool(unaligned_wios as *const BasicIos), 1);
+            assert_eq!(ios_w_fill_set(unaligned_wios, b'*' as u16), b' ' as u16);
+            assert_eq!(ios_w_fill_get(unaligned_wios), b'*' as u16);
+            ios_base_setf2(unaligned_wios as *mut BasicIos, 0x0800 | 0x0004, 0x0E00 | 0x0004);
+            ios_base_width_set(unaligned_wios as *mut BasicIos, 3);
+            ostream_w_shl_u32(unaligned_wiostr, 0xF);
+            assert_eq!(std::ptr::read_unaligned(unaligned_p.add(2)), b'*' as u16);
+            assert_eq!(std::ptr::read_unaligned(unaligned_p.add(3)), b'*' as u16);
+            assert_eq!(std::ptr::read_unaligned(unaligned_p.add(4)), b'F' as u16);
+            ostream_w_flush(unaligned_wiostr);
+            ostream_w_osfx(unaligned_wiostr);
+            ios_w_setstate(unaligned_wios, 1, 0);
+            ios_w_dtor(unaligned_wios);
+            streambuf_w_dtor(unaligned_wsb);
+
+            let mut raw_ios_standalone = vec![0xEEu8; std::mem::size_of::<BasicIosW>() + 8];
+            let unaligned_ios_standalone = raw_ios_standalone.as_mut_ptr().add(3) as *mut BasicIosW;
+            assert!(!unaligned_ios_standalone.is_aligned());
+            ios_w_ctor(unaligned_ios_standalone);
+            ios_w_dtor(unaligned_ios_standalone);
 
             // Narrow basic_ios ctor(sb) + rdbuf + copyfmt + tellp.
             let mut ios1: BasicIos = std::mem::zeroed();

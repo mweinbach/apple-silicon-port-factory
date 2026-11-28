@@ -1045,14 +1045,355 @@ pub unsafe extern "win64" fn SetStretchBltMode(hdc: usize, mode: i32) -> i32 {
     }
 }
 
+/// Draws pre-split text lines into a DC's selected bitmap using CoreText/CoreGraphics.
+///
+/// Respects `dc.text_color`, `dc.bk_color`, `dc.bk_mode` (`OPAQUE = 2`), selected font metrics,
+/// horizontal/vertical alignment (`DT_CENTER`, `DT_RIGHT`, `DT_VCENTER`, `DT_BOTTOM`, `DT_SINGLELINE`),
+/// and clipping to `(left, top, right, bottom)` unless `DT_NOCLIP` is set.
+/// Returns `false` if `hdc` is invalid or rendering fails on a bitmap-backed DC.
+pub(crate) unsafe fn draw_text_lines(
+    hdc: usize,
+    lines: &[(&str, i32, i32)],
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    format: u32,
+) -> bool {
+    const DT_CENTER: u32 = 0x0001;
+    const DT_RIGHT: u32 = 0x0002;
+    const DT_VCENTER: u32 = 0x0004;
+    const DT_BOTTOM: u32 = 0x0008;
+    const DT_SINGLELINE: u32 = 0x0020;
+    const DT_NOCLIP: u32 = 0x0100;
+    const OPAQUE: i32 = 2;
+
+    let (bm, font, text_rgba, bk_rgba, opaque_bg) = {
+        let m = objs().lock().unwrap();
+        let Some(Obj::Dc(dc)) = m.get(&hdc) else {
+            return false;
+        };
+        let Some(Obj::Bitmap(bm)) = m.get(&dc.bitmap) else {
+            // Valid DC with the default 1x1 stock bitmap (no user DIB selected), matching Rectangle/PatBlt.
+            return true;
+        };
+        (
+            bm.clone(),
+            resolve_font(&m, dc.font),
+            colorref_to_rgba(dc.text_color),
+            colorref_to_rgba(dc.bk_color),
+            dc.bk_mode == OPAQUE,
+        )
+    };
+
+    if bm.width == 0 || bm.height == 0 || bm.bits_ptr == 0 {
+        return true;
+    }
+
+    let (clip_x0, clip_y0, clip_x1, clip_y1) = if (format & DT_NOCLIP) != 0 {
+        (0, 0, bm.width as i32, bm.height as i32)
+    } else {
+        (
+            left.max(0).min(bm.width as i32),
+            top.max(0).min(bm.height as i32),
+            right.max(0).min(bm.width as i32),
+            bottom.max(0).min(bm.height as i32),
+        )
+    };
+    if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
+        return true;
+    }
+
+    let total_h: i32 = lines.iter().fold(0i32, |acc, (_, _, h)| acc.saturating_add(*h));
+    let mut cur_y = if (format & DT_SINGLELINE) != 0 {
+        if (format & DT_BOTTOM) != 0 {
+            bottom.saturating_sub(total_h)
+        } else if (format & DT_VCENTER) != 0 {
+            top.saturating_add((bottom.saturating_sub(top).saturating_sub(total_h)) / 2)
+        } else {
+            top
+        }
+    } else {
+        top
+    };
+
+    let mut positioned: Vec<(&str, i32, i32, i32, i32)> = Vec::with_capacity(lines.len());
+    let mut min_x = clip_x1;
+    let mut min_y = clip_y1;
+    let mut max_x = clip_x0;
+    let mut max_y = clip_y0;
+
+    for &(line, line_w, line_h) in lines {
+        let x = if (format & DT_RIGHT) != 0 {
+            right.saturating_sub(line_w)
+        } else if (format & DT_CENTER) != 0 {
+            left.saturating_add((right.saturating_sub(left).saturating_sub(line_w)) / 2)
+        } else {
+            left
+        };
+        if opaque_bg && line_w > 0 && line_h > 0 {
+            let fx0 = x.max(clip_x0);
+            let fy0 = cur_y.max(clip_y0);
+            let fx1 = x.saturating_add(line_w).min(clip_x1);
+            let fy1 = cur_y.saturating_add(line_h).min(clip_y1);
+            for py in fy0..fy1 {
+                for px in fx0..fx1 {
+                    bm.set_rgba(px, py, bk_rgba);
+                }
+            }
+        }
+        if !line.is_empty() && line_h > 0 {
+            // CoreText advance can differ slightly from GDI heuristic width; allow full clip width on right.
+            let lx0 = x.max(clip_x0);
+            let ly0 = cur_y.max(clip_y0);
+            let lx1 = clip_x1;
+            let ly1 = cur_y.saturating_add(line_h).saturating_add(4).min(clip_y1);
+            if lx0 < lx1 && ly0 < ly1 {
+                min_x = min_x.min(lx0);
+                min_y = min_y.min(ly0);
+                max_x = max_x.max(lx1);
+                max_y = max_y.max(ly1);
+            }
+            positioned.push((line, x, cur_y, line_w, line_h));
+        }
+        cur_y = cur_y.saturating_add(line_h);
+    }
+
+    if positioned.is_empty() || min_x >= max_x || min_y >= max_y {
+        return true;
+    }
+
+    rasterize_text_coretext(&bm, &font, &positioned, min_x, min_y, max_x, max_y, text_rgba)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe fn rasterize_text_coretext(
+    bm: &BitmapData,
+    font: &FontData,
+    lines: &[(&str, i32, i32, i32, i32)],
+    origin_x: i32,
+    origin_y: i32,
+    end_x: i32,
+    end_y: i32,
+    text_rgba: [u8; 4],
+) -> bool {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CFRange {
+        location: isize,
+        length: isize,
+    }
+
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFBooleanTrue: *const c_void;
+        fn CFRelease(cf: *const c_void);
+        fn CFStringCreateWithBytes(
+            alloc: *const c_void,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external: u8,
+        ) -> *const c_void;
+        fn CFAttributedStringCreateMutable(alloc: *const c_void, max_length: isize) -> *mut c_void;
+        fn CFAttributedStringReplaceString(a_str: *mut c_void, range: CFRange, replacement: *const c_void);
+        fn CFAttributedStringGetLength(a_str: *const c_void) -> isize;
+        fn CFAttributedStringSetAttribute(
+            a_str: *mut c_void,
+            range: CFRange,
+            attr_name: *const c_void,
+            value: *const c_void,
+        );
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+        fn CGColorSpaceRelease(cs: *mut c_void);
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *mut c_void,
+            bitmap_info: u32,
+        ) -> *mut c_void;
+        fn CGContextRelease(ctx: *mut c_void);
+        fn CGContextSetRGBFillColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);
+        fn CGContextSetTextPosition(ctx: *mut c_void, x: f64, y: f64);
+    }
+
+    #[link(name = "CoreText", kind = "framework")]
+    extern "C" {
+        static kCTFontAttributeName: *const c_void;
+        static kCTForegroundColorFromContextAttributeName: *const c_void;
+        fn CTFontCreateWithName(name: *const c_void, size: f64, matrix: *const c_void) -> *const c_void;
+        fn CTFontGetAscent(font: *const c_void) -> f64;
+        fn CTLineCreateWithAttributedString(attr_str: *const c_void) -> *const c_void;
+        fn CTLineDraw(line: *const c_void, context: *mut c_void);
+    }
+
+    let surf_w = (end_x - origin_x) as usize;
+    let surf_h = (end_y - origin_y) as usize;
+    let bytes_per_row = surf_w.saturating_mul(4);
+    let mut pixels = vec![0u8; bytes_per_row.saturating_mul(surf_h)];
+
+    let cs = CGColorSpaceCreateDeviceRGB();
+    if cs.is_null() {
+        return false;
+    }
+    let ctx = CGBitmapContextCreate(
+        pixels.as_mut_ptr().cast(),
+        surf_w,
+        surf_h,
+        8,
+        bytes_per_row,
+        cs,
+        K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+    );
+    CGColorSpaceRelease(cs);
+    if ctx.is_null() {
+        return false;
+    }
+
+    let pt_size = (if font.height != 0 { font.height.unsigned_abs() } else { 16 }).max(4) as f64;
+    let font_name = if font.is_monospace() {
+        "Courier"
+    } else if !font.face.is_empty() {
+        font.face.as_str()
+    } else {
+        "Helvetica"
+    };
+    let cf_font_name = CFStringCreateWithBytes(
+        std::ptr::null(),
+        font_name.as_ptr(),
+        font_name.len() as isize,
+        CF_STRING_ENCODING_UTF8,
+        0,
+    );
+    let ct_font = if !cf_font_name.is_null() {
+        let f = CTFontCreateWithName(cf_font_name, pt_size, std::ptr::null());
+        CFRelease(cf_font_name);
+        f
+    } else {
+        std::ptr::null()
+    };
+    if ct_font.is_null() {
+        CGContextRelease(ctx);
+        return false;
+    }
+
+    let ascent = CTFontGetAscent(ct_font).clamp(1.0, pt_size);
+    CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+
+    for &(line, x, y, _w, line_h) in lines {
+        let cf_str = CFStringCreateWithBytes(
+            std::ptr::null(),
+            line.as_ptr(),
+            line.len() as isize,
+            CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        if cf_str.is_null() {
+            continue;
+        }
+        let attr = CFAttributedStringCreateMutable(std::ptr::null(), 0);
+        if !attr.is_null() {
+            CFAttributedStringReplaceString(attr, CFRange { location: 0, length: 0 }, cf_str);
+            let utf16_len = CFAttributedStringGetLength(attr);
+            let full_range = CFRange { location: 0, length: utf16_len };
+            CFAttributedStringSetAttribute(attr, full_range, kCTFontAttributeName, ct_font);
+            CFAttributedStringSetAttribute(
+                attr,
+                full_range,
+                kCTForegroundColorFromContextAttributeName,
+                kCFBooleanTrue,
+            );
+            let ct_line = CTLineCreateWithAttributedString(attr);
+            if !ct_line.is_null() {
+                let cg_x = (x - origin_x) as f64;
+                let baseline_y = (y as f64) + ascent.min(line_h.max(1) as f64);
+                let cg_y = (end_y as f64) - baseline_y;
+                CGContextSetTextPosition(ctx, cg_x, cg_y);
+                CTLineDraw(ct_line, ctx);
+                CFRelease(ct_line);
+            }
+            CFRelease(attr);
+        }
+        CFRelease(cf_str);
+    }
+
+    CFRelease(ct_font);
+    CGContextRelease(ctx);
+
+    for dy in 0..surf_h {
+        let py = origin_y + dy as i32;
+        let row_off = dy * bytes_per_row;
+        for dx in 0..surf_w {
+            let alpha = pixels[row_off + dx * 4 + 3];
+            if alpha == 0 {
+                continue;
+            }
+            let px = origin_x + dx as i32;
+            let dst = bm.get_rgba(px, py).unwrap_or([0, 0, 0, 0xFF]);
+            let a = alpha as u32;
+            let inv = 255 - a;
+            let out_r = ((text_rgba[0] as u32 * a + dst[0] as u32 * inv + 127) / 255) as u8;
+            let out_g = ((text_rgba[1] as u32 * a + dst[1] as u32 * inv + 127) / 255) as u8;
+            let out_b = ((text_rgba[2] as u32 * a + dst[2] as u32 * inv + 127) / 255) as u8;
+            let out_a = dst[3].max(alpha);
+            bm.set_rgba(px, py, [out_r, out_g, out_b, out_a]);
+        }
+    }
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+unsafe fn rasterize_text_coretext(
+    _bm: &BitmapData,
+    _font: &FontData,
+    _lines: &[(&str, i32, i32, i32, i32)],
+    _origin_x: i32,
+    _origin_y: i32,
+    _end_x: i32,
+    _end_y: i32,
+    _text_rgba: [u8; 4],
+) -> bool {
+    false
+}
+
 pub unsafe extern "win64" fn TextOutW(
-    _hdc: usize,
-    _x: i32,
-    _y: i32,
-    _str: LPCWSTR,
-    _count: i32,
+    hdc: usize,
+    x: i32,
+    y: i32,
+    s: LPCWSTR,
+    count: i32,
 ) -> BOOL {
-    TRUE
+    if count < 0 || (s.is_null() && count > 0) {
+        crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let font = {
+        let m = objs().lock().unwrap();
+        let Some(Obj::Dc(dc)) = m.get(&hdc) else {
+            crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        };
+        resolve_font(&m, dc.font)
+    };
+    let mut units = Vec::with_capacity(count as usize);
+    for i in 0..(count as usize) {
+        units.push(s.add(i).read_unaligned());
+    }
+    let text = String::from_utf16_lossy(&units);
+    let sz = measure_text(&font, &text);
+    draw_text_lines(hdc, &[(&text, sz.cx, sz.cy)], x, y, x.saturating_add(sz.cx), y.saturating_add(sz.cy), 0x0100 /* DT_NOCLIP */) as BOOL
 }
 
 pub unsafe extern "win64" fn ChoosePixelFormat(_hdc: usize, _ppfd: *const u8) -> i32 {
@@ -1421,13 +1762,28 @@ pub unsafe extern "win64" fn Rectangle(hdc: usize, l: i32, t: i32, r: i32, b: i3
 }
 
 pub unsafe extern "win64" fn TextOutA(
-    _hdc: usize,
-    _x: i32,
-    _y: i32,
-    _str: LPCSTR,
-    _count: i32,
+    hdc: usize,
+    x: i32,
+    y: i32,
+    s: LPCSTR,
+    count: i32,
 ) -> BOOL {
-    TRUE
+    if count < 0 || (s.is_null() && count > 0) {
+        crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let font = {
+        let m = objs().lock().unwrap();
+        let Some(Obj::Dc(dc)) = m.get(&hdc) else {
+            crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        };
+        resolve_font(&m, dc.font)
+    };
+    let bytes = if count > 0 { std::slice::from_raw_parts(s, count as usize) } else { &[] };
+    let text = String::from_utf8_lossy(bytes);
+    let sz = measure_text(&font, &text);
+    draw_text_lines(hdc, &[(&text, sz.cx, sz.cy)], x, y, x.saturating_add(sz.cx), y.saturating_add(sz.cy), 0x0100 /* DT_NOCLIP */) as BOOL
 }
 
 unsafe fn write_dib_pixel(row_ptr: *mut u8, x: usize, bpp: u16, rgba: [u8; 4]) {

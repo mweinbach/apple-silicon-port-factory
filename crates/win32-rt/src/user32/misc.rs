@@ -2946,6 +2946,7 @@ pub unsafe extern "win64" fn DrawTextW(
 
     let mut max_w = 0i32;
     let mut total_h = 0i32;
+    let mut measured: Vec<(String, i32, i32)> = Vec::with_capacity(lines.len());
     for line in &lines {
         let mut sz = crate::misc::gdi32::SIZE { cx: 0, cy: 0 };
         let ptr = if line.is_empty() { std::ptr::null() } else { line.as_ptr() };
@@ -2954,13 +2955,21 @@ pub unsafe extern "win64" fn DrawTextW(
         }
         max_w = max_w.max(sz.cx);
         total_h = total_h.saturating_add(sz.cy);
+        measured.push((String::from_utf16_lossy(line), sz.cx, sz.cy));
     }
 
+    let mut rc = lprc.read_unaligned();
     if (format & DT_CALCRECT) != 0 {
-        let mut rc = lprc.read_unaligned();
         rc.right = rc.left.saturating_add(max_w);
         rc.bottom = rc.top.saturating_add(total_h);
         lprc.write_unaligned(rc);
+        return total_h;
+    }
+
+    let line_refs: Vec<(&str, i32, i32)> = measured.iter().map(|(s, w, h)| (s.as_str(), *w, *h)).collect();
+    if !crate::misc::gdi32::draw_text_lines(hdc, &line_refs, rc.left, rc.top, rc.right, rc.bottom, format) {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
     }
     total_h
 }
@@ -4049,6 +4058,66 @@ mod tests {
             assert_eq!(h2, h1 * 2);
             assert_eq!(rc2.bottom, h2);
             assert_eq!(DrawTextW(0, multi.as_ptr(), -1, &mut rc2, 0), 0);
+
+            // 3b. DrawTextW without DT_CALCRECT actually rasterizes glyphs onto a DIB-backed DC,
+            // respects clipping to lprc, and DT_CALCRECT leaves pixels untouched.
+            let mut bmi = [0u8; 40];
+            bmi[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+            bmi[4..8].copy_from_slice(&128i32.to_le_bytes()); // biWidth
+            bmi[8..12].copy_from_slice(&(-48i32).to_le_bytes()); // top-down biHeight
+            bmi[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
+            bmi[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbm = crate::misc::gdi32::CreateDIBSection(
+                dc,
+                bmi.as_ptr(),
+                0,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_ne!(hbm, 0);
+            assert!(!bits.is_null());
+            let old_bm = crate::misc::gdi32::SelectObject(dc, hbm);
+            let buf = std::slice::from_raw_parts_mut(bits as *mut u8, 128 * 48 * 4);
+            buf.fill(0);
+
+            crate::misc::gdi32::SetBkMode(dc, 1 /* TRANSPARENT */);
+            crate::misc::gdi32::SetTextColor(dc, 0x0000_00FF /* bright red COLORREF */);
+            let label = crate::strings::to_wide_z("HELLO");
+
+            // DT_CALCRECT must measure only and never write pixels.
+            let mut calc_rc = RECT::new(8, 8, 120, 40);
+            assert!(DrawTextW(dc, label.as_ptr(), -1, &mut calc_rc, DT_SINGLELINE | DT_CALCRECT) > 0);
+            assert!(buf.iter().all(|&b| b == 0), "DT_CALCRECT must not draw pixels");
+
+            // Painting mode draws non-zero red glyph pixels strictly inside paint_rc.
+            let mut paint_rc = RECT::new(8, 8, 96, 36);
+            let drawn_h = DrawTextW(dc, label.as_ptr(), -1, &mut paint_rc, DT_SINGLELINE);
+            assert!(drawn_h > 0);
+            assert_eq!(paint_rc, RECT::new(8, 8, 96, 36), "painting must not mutate lprc");
+
+            let mut lit_inside = 0usize;
+            let mut lit_outside = 0usize;
+            for py in 0..48usize {
+                for px in 0..128usize {
+                    let off = (py * 128 + px) * 4;
+                    let r = buf[off + 2];
+                    let inside = px >= 8 && px < 96 && py >= 8 && py < 36;
+                    if r > 0 {
+                        if inside {
+                            lit_inside += 1;
+                        } else {
+                            lit_outside += 1;
+                        }
+                    }
+                }
+            }
+            assert!(lit_inside > 20, "expected rasterized glyph pixels inside lprc, got {lit_inside}");
+            assert_eq!(lit_outside, 0, "glyph pixels must be clipped to lprc");
+
+            crate::misc::gdi32::SelectObject(dc, old_bm);
+            crate::misc::gdi32::DeleteObject(hbm);
 
             // 4. DrawFrameControl draws on a valid DC and rejects null/invalid DC.
             let frame_rc = RECT::new(0, 0, 16, 16);
