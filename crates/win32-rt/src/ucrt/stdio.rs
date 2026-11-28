@@ -2021,6 +2021,242 @@ pub unsafe extern "win64" fn _wfdopen(fd: i32, mode: *const u16) -> *mut FILE {
     _fdopen(fd, m)
 }
 
+unsafe fn freopen_str(path: &str, mode: &str, fp: *mut FILE) -> *mut FILE {
+    if fp.is_null() {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    let Some(mf) = parse_mode(mode) else {
+        errno::set(EINVAL);
+        super::runtime::invalid_parameter("freopen: bad mode");
+        return std::ptr::null_mut();
+    };
+    let _l = Locked::new();
+    let Some((old_fd, is_static)) = with_table(|t| {
+        t.map.get_mut(&(fp as usize)).map(|s| {
+            let _ = s.flush();
+            (s.fd, s.is_static)
+        })
+    }) else {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    };
+    let new_fd = open_host_bom(path, mf.oflag, 0x180, mf.write_bom, mf.detect_bom, false);
+    if new_fd < 0 {
+        if !is_static {
+            if let Some(s) = with_table(|t| t.map.remove(&(fp as usize))) {
+                let _ = _close(s.fd);
+            }
+        }
+        return std::ptr::null_mut();
+    }
+    let final_fd = if is_static && (0..=2).contains(&old_fd) {
+        if libc::dup2(new_fd, old_fd) >= 0 {
+            let info = fd_info(new_fd);
+            let _ = _close(new_fd);
+            set_fd_info(old_fd, info, None);
+            old_fd
+        } else {
+            new_fd
+        }
+    } else {
+        if old_fd >= 0 && !is_static {
+            let _ = _close(old_fd);
+        }
+        new_fd
+    };
+    (*fp)._file = final_fd;
+    (*fp)._flag = (mf.readable as i32) | ((mf.writable as i32) << 1);
+    with_table(|t| {
+        if let Some(s) = t.map.get_mut(&(fp as usize)) {
+            s.fd = final_fd;
+            s.readable = mf.readable;
+            s.writable = mf.writable;
+            s.eof = false;
+            s.err = false;
+            s.wbuf.clear();
+            s.rbuf.clear();
+            s.rbuf_src_pos.clear();
+            s.rpos = 0;
+            s.unget.clear();
+        }
+    });
+    fp
+}
+
+pub unsafe extern "win64" fn freopen(path: *const u8, mode: *const u8, fp: *mut FILE) -> *mut FILE {
+    if path.is_null() || mode.is_null() || fp.is_null() {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    freopen_str(&from_ansi(path), &from_ansi(mode), fp)
+}
+
+pub unsafe extern "win64" fn _wfreopen(path: *const u16, mode: *const u16, fp: *mut FILE) -> *mut FILE {
+    if path.is_null() || mode.is_null() || fp.is_null() {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    freopen_str(&from_wide(path), &from_wide(mode), fp)
+}
+
+pub unsafe extern "win64" fn _pipe(pfds: *mut i32, _psize: u32, textmode: i32) -> i32 {
+    if pfds.is_null() {
+        errno::set(EINVAL);
+        return -1;
+    }
+    let mut fds = [-1i32; 2];
+    if libc::pipe(fds.as_mut_ptr()) != 0 {
+        errno::set_from_host();
+        return -1;
+    }
+    if (textmode & O_NOINHERIT) != 0 {
+        for &fd in &fds {
+            let fl = libc::fcntl(fd, libc::F_GETFD);
+            if fl >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    let eff_mode = if (textmode & O_BINARY) != 0 {
+        (TextMode::Binary, O_BINARY)
+    } else if (textmode & O_TEXT) != 0 {
+        (TextMode::AnsiText, O_TEXT)
+    } else if FMODE.load(std::sync::atomic::Ordering::Relaxed) == O_BINARY {
+        (TextMode::Binary, O_BINARY)
+    } else {
+        (TextMode::AnsiText, O_TEXT)
+    };
+    for &fd in &fds {
+        set_fd_info(
+            fd,
+            FdInfo {
+                mode: eff_mode.0,
+                win_mode: eff_mode.1,
+                raw: true,
+                temporary: false,
+                osf_handle: None,
+            },
+            None,
+        );
+    }
+    std::ptr::write_unaligned(pfds, fds[0]);
+    std::ptr::write_unaligned(pfds.add(1), fds[1]);
+    0
+}
+
+#[cfg(target_os = "macos")]
+static POPEN_CHILDREN: Mutex<Option<HashMap<usize, std::process::Child>>> = Mutex::new(None);
+
+pub unsafe extern "win64" fn _popen(command: *const u8, mode: *const u8) -> *mut FILE {
+    if command.is_null() || mode.is_null() {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    let cmd_str = from_ansi(command);
+    let mode_str = from_ansi(mode);
+    let Some(mf) = parse_mode(&mode_str) else {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    };
+    if mf.readable == mf.writable {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::IntoRawFd;
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(&cmd_str);
+        if mf.readable {
+            cmd.stdout(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::piped());
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                errno::set_from_host();
+                return std::ptr::null_mut();
+            }
+        };
+        let fd = if mf.readable {
+            child.stdout.take().map(IntoRawFd::into_raw_fd)
+        } else {
+            child.stdin.take().map(IntoRawFd::into_raw_fd)
+        };
+        let Some(fd) = fd else {
+            let _ = child.kill();
+            let _ = child.wait();
+            errno::set(EINVAL);
+            return std::ptr::null_mut();
+        };
+        let is_bin = (mf.oflag & O_BINARY) != 0;
+        set_fd_info(
+            fd,
+            FdInfo {
+                mode: if is_bin { TextMode::Binary } else { TextMode::AnsiText },
+                win_mode: if is_bin { O_BINARY } else { O_TEXT },
+                raw: true,
+                temporary: false,
+                osf_handle: None,
+            },
+            None,
+        );
+        let _l = Locked::new();
+        let fp = new_stream(fd, &mf);
+        POPEN_CHILDREN
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(fp as usize, child);
+        fp
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cmd_str;
+        crate::stub!("_popen unsupported on this platform");
+        errno::set(EACCES);
+        std::ptr::null_mut()
+    }
+}
+
+pub unsafe extern "win64" fn _pclose(fp: *mut FILE) -> i32 {
+    if fp.is_null() {
+        errno::set(EINVAL);
+        return -1;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let child = POPEN_CHILDREN
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.remove(&(fp as usize)));
+        let _ = fclose(fp);
+        match child {
+            Some(mut c) => match c.wait() {
+                Ok(status) => status.code().unwrap_or(-1),
+                Err(_) => {
+                    errno::set_from_host();
+                    -1
+                }
+            },
+            None => {
+                errno::set(EINVAL);
+                -1
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fclose(fp);
+        errno::set(EINVAL);
+        -1
+    }
+}
+
 pub unsafe extern "win64" fn fclose(fp: *mut FILE) -> i32 {
     let _l = Locked::new();
     let s = with_table(|t| {
@@ -3920,6 +4156,57 @@ mod tests {
             clear_u8_pending(synth_fd);
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn freopen_pipe_and_popen_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("win32_rt_stdio_sm2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("U:\\", &dir);
+
+        unsafe {
+            // freopen + _wfreopen redirect an open FILE* cleanly.
+            let p1 = b"U:\\one.txt\0";
+            let p2 = b"U:\\two.txt\0";
+            let fp = fopen(p1.as_ptr(), b"wb\0".as_ptr());
+            assert!(!fp.is_null());
+            assert_eq!(fwrite(b"first".as_ptr().cast(), 1, 5, fp), 5);
+            let fp2 = freopen(p2.as_ptr(), b"wb\0".as_ptr(), fp);
+            assert_eq!(fp2, fp);
+            assert_eq!(fwrite(b"second".as_ptr().cast(), 1, 6, fp2), 6);
+            let wp2: Vec<u16> = "U:\\two.txt\0".encode_utf16().collect();
+            let wrm: Vec<u16> = "rb\0".encode_utf16().collect();
+            let fp3 = _wfreopen(wp2.as_ptr(), wrm.as_ptr(), fp2);
+            assert_eq!(fp3, fp);
+            let mut rbuf = [0u8; 16];
+            let n = fread(rbuf.as_mut_ptr().cast(), 1, 16, fp3);
+            assert_eq!(&rbuf[..n], b"second");
+            assert_eq!(fclose(fp3), 0);
+            assert_eq!(std::fs::read(dir.join("one.txt")).unwrap(), b"first");
+
+            // _pipe creates a working CRT fd pair.
+            let mut fds = [-1i32; 2];
+            assert_eq!(_pipe(fds.as_mut_ptr(), 4096, O_BINARY | O_NOINHERIT), 0);
+            assert_eq!(_write(fds[1], b"abc".as_ptr().cast(), 3), 3);
+            let mut pbuf = [0u8; 8];
+            assert_eq!(_read(fds[0], pbuf.as_mut_ptr().cast(), 8), 3);
+            assert_eq!(&pbuf[..3], b"abc");
+            assert_eq!(_close(fds[0]), 0);
+            assert_eq!(_close(fds[1]), 0);
+
+            // _popen + _pclose run a real child command and return its exit code on macOS.
+            #[cfg(target_os = "macos")]
+            {
+                let pfp = _popen(b"printf 'hello-popen'\0".as_ptr(), b"rb\0".as_ptr());
+                assert!(!pfp.is_null());
+                let mut out = [0u8; 32];
+                let got = fread(out.as_mut_ptr().cast(), 1, out.len(), pfp);
+                assert_eq!(&out[..got], b"hello-popen");
+                assert_eq!(_pclose(pfp), 0);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3315,6 +3315,9 @@ ucrtbase.dll	_msize	-	CRT_STL	real	win32_rt::ucrt::heap::_msize	crates/win32-rt/
 ucrtbase.dll	_msize_base	-	CRT_STL	real	win32_rt::ucrt::heap::_msize_base	crates/win32-rt/src/ucrt/heap.rs
 ucrtbase.dll	_open	-	CRT_STL	real	win32_rt::ucrt::stdio::_open	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_open_osfhandle	-	CRT_STL	real	win32_rt::ucrt::stdio::_open_osfhandle	crates/win32-rt/src/ucrt/stdio.rs
+ucrtbase.dll	_pclose	-	CRT_STL	real	win32_rt::ucrt::stdio::_pclose	crates/win32-rt/src/ucrt/stdio.rs
+ucrtbase.dll	_pipe	-	CRT_STL	real	win32_rt::ucrt::stdio::_pipe	crates/win32-rt/src/ucrt/stdio.rs
+ucrtbase.dll	_popen	-	CRT_STL	partial	win32_rt::ucrt::stdio::_popen	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_putc_nolock	-	CRT_STL	real	win32_rt::ucrt::stdio::_putc_nolock	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_putenv	-	CRT_STL	real	win32_rt::ucrt::env::_putenv	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_putenv_s	-	CRT_STL	real	win32_rt::ucrt::env::_putenv_s	crates/win32-rt/src/ucrt/env.rs
@@ -3377,8 +3380,10 @@ ucrtbase.dll	_strset	-	CRT_STL	real	win32_rt::ucrt::string::_strset	crates/win32
 ucrtbase.dll	_strtod_l	-	CRT_STL	real	win32_rt::ucrt::convert::_strtod_l	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_strtof_l	-	CRT_STL	real	win32_rt::ucrt::convert::_strtof_l	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_strtoi64	-	CRT_STL	real	win32_rt::ucrt::convert::_strtoi64	crates/win32-rt/src/ucrt/convert.rs
+ucrtbase.dll	_strtoi64_l	-	CRT_STL	real	win32_rt::ucrt::convert::_strtoi64_l	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_strtol_l	-	CRT_STL	real	win32_rt::ucrt::convert::_strtol_l	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_strtoui64	-	CRT_STL	real	win32_rt::ucrt::convert::_strtoui64	crates/win32-rt/src/ucrt/convert.rs
+ucrtbase.dll	_strtoui64_l	-	CRT_STL	real	win32_rt::ucrt::convert::_strtoui64_l	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_strtoul_l	-	CRT_STL	real	win32_rt::ucrt::convert::_strtoul_l	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_strupr	-	CRT_STL	real	win32_rt::ucrt::string::_strupr	crates/win32-rt/src/ucrt/string.rs
 ucrtbase.dll	_strupr_s	-	CRT_STL	real	win32_rt::ucrt::string::_strupr_s	crates/win32-rt/src/ucrt/string.rs
@@ -3433,6 +3438,7 @@ ucrtbase.dll	_wcsupr_s	-	CRT_STL	real	win32_rt::ucrt::string::_wcsupr_s	crates/w
 ucrtbase.dll	_wfdopen	-	CRT_STL	real	win32_rt::ucrt::stdio::_wfdopen	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_wfopen	-	CRT_STL	real	win32_rt::ucrt::stdio::_wfopen	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_wfopen_s	-	CRT_STL	real	win32_rt::ucrt::stdio::_wfopen_s	crates/win32-rt/src/ucrt/stdio.rs
+ucrtbase.dll	_wfreopen	-	CRT_STL	real	win32_rt::ucrt::stdio::_wfreopen	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_wfsopen	-	CRT_STL	real	win32_rt::ucrt::stdio::_wfsopen	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_wfullpath	-	CRT_STL	real	win32_rt::ucrt::env::_wfullpath	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_wgetcwd	-	CRT_STL	real	win32_rt::ucrt::env::_wgetcwd	crates/win32-rt/src/ucrt/env.rs
@@ -3547,6 +3553,7 @@ ucrtbase.dll	fputws	-	CRT_STL	real	win32_rt::ucrt::stdio::fputws	crates/win32-rt
 ucrtbase.dll	fread	-	CRT_STL	real	win32_rt::ucrt::stdio::fread	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	fread_s	-	CRT_STL	real	win32_rt::ucrt::stdio::fread_s	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	free	-	CRT_STL	real	win32_rt::ucrt::heap::free	crates/win32-rt/src/ucrt/heap.rs
+ucrtbase.dll	freopen	-	CRT_STL	real	win32_rt::ucrt::stdio::freopen	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	frexp	-	CRT_STL	real	win32_rt::ucrt::math::frexp	crates/win32-rt/src/ucrt/math.rs
 ucrtbase.dll	frexpf	-	CRT_STL	real	win32_rt::ucrt::math::frexpf	crates/win32-rt/src/ucrt/math.rs
 ucrtbase.dll	fseek	-	CRT_STL	real	win32_rt::ucrt::stdio::fseek	crates/win32-rt/src/ucrt/stdio.rs
@@ -3632,6 +3639,8 @@ ucrtbase.dll	nan	-	CRT_STL	real	win32_rt::ucrt::math::nan	crates/win32-rt/src/uc
 ucrtbase.dll	nanf	-	CRT_STL	real	win32_rt::ucrt::math::nanf	crates/win32-rt/src/ucrt/math.rs
 ucrtbase.dll	nearbyint	-	CRT_STL	real	win32_rt::ucrt::math::nearbyint	crates/win32-rt/src/ucrt/math.rs
 ucrtbase.dll	nearbyintf	-	CRT_STL	real	win32_rt::ucrt::math::nearbyintf	crates/win32-rt/src/ucrt/math.rs
+ucrtbase.dll	nextafter	-	CRT_STL	real	win32_rt::ucrt::math::nextafter	crates/win32-rt/src/ucrt/math.rs
+ucrtbase.dll	nextafterf	-	CRT_STL	real	win32_rt::ucrt::math::nextafterf	crates/win32-rt/src/ucrt/math.rs
 ucrtbase.dll	perror	-	CRT_STL	real	win32_rt::ucrt::stdio::perror	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	pow	-	CRT_STL	real	win32_rt::ucrt::math::pow	crates/win32-rt/src/ucrt/math.rs
 ucrtbase.dll	powf	-	CRT_STL	real	win32_rt::ucrt::math::powf	crates/win32-rt/src/ucrt/math.rs
@@ -4120,8 +4129,10 @@ vcruntime140.dll	__AdjustPointer	-	CRT_STL	real	win32_rt::misc::vcruntime140::__
 vcruntime140.dll	__C_specific_handler	-	CRT_STL	real	win32_rt::misc::vcruntime140::__C_specific_handler	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	__CxxFrameHandler3	-	CRT_STL	real	win32_rt::misc::vcruntime140::__CxxFrameHandler3	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	__RTDynamicCast	-	CRT_STL	real	win32_rt::misc::vcruntime140::__RTDynamicCast	crates/win32-rt/src/misc/vcruntime140.rs
+vcruntime140.dll	__RTtypeid	-	CRT_STL	real	win32_rt::misc::vcruntime140::__RTtypeid	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	__current_exception	-	CRT_STL	real	win32_rt::misc::vcruntime140::__current_exception	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	__current_exception_context	-	CRT_STL	real	win32_rt::misc::vcruntime140::__current_exception_context	crates/win32-rt/src/misc/vcruntime140.rs
+vcruntime140.dll	__intrinsic_setjmp	-	CRT_STL	real	win32_rt::misc::vcruntime140::__intrinsic_setjmp	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	__processing_throw	-	CRT_STL	real	win32_rt::misc::vcruntime140::__processing_throw	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	__std_exception_copy	-	CRT_STL	real	win32_rt::misc::vcruntime140::__std_exception_copy	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	__std_exception_destroy	-	CRT_STL	real	win32_rt::misc::vcruntime140::__std_exception_destroy	crates/win32-rt/src/misc/vcruntime140.rs
@@ -4133,12 +4144,15 @@ vcruntime140.dll	__std_type_info_name	-	CRT_STL	real	win32_rt::misc::vcruntime14
 vcruntime140.dll	__uncaught_exception	-	CRT_STL	real	win32_rt::misc::vcruntime140::__uncaught_exception	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	__uncaught_exceptions	-	CRT_STL	real	win32_rt::misc::vcruntime140::__uncaught_exceptions	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	_purecall	-	CRT_STL	real	win32_rt::misc::vcruntime140::_purecall	crates/win32-rt/src/misc/vcruntime140.rs
+vcruntime140.dll	_set_purecall_handler	-	CRT_STL	real	win32_rt::misc::vcruntime140::_set_purecall_handler	crates/win32-rt/src/misc/vcruntime140.rs
+vcruntime140.dll	longjmp	-	CRT_STL	real	win32_rt::misc::vcruntime140::longjmp	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	memchr	-	CRT_STL	real	win32_rt::misc::vcruntime140::memchr	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	memcmp	-	CRT_STL	real	win32_rt::misc::vcruntime140::memcmp	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	memcpy	-	CRT_STL	real	win32_rt::misc::vcruntime140::memcpy	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	memmove	-	CRT_STL	real	win32_rt::misc::vcruntime140::memmove	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	memset	-	CRT_STL	real	win32_rt::misc::vcruntime140::memset	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	strchr	-	CRT_STL	real	win32_rt::misc::vcruntime140::strchr	crates/win32-rt/src/misc/vcruntime140.rs
+vcruntime140.dll	strrchr	-	CRT_STL	real	win32_rt::misc::vcruntime140::strrchr	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	strstr	-	CRT_STL	real	win32_rt::misc::vcruntime140::strstr	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	wcschr	-	CRT_STL	real	win32_rt::misc::vcruntime140::wcschr	crates/win32-rt/src/misc/vcruntime140.rs
 vcruntime140.dll	wcsrchr	-	CRT_STL	real	win32_rt::misc::vcruntime140::wcsrchr	crates/win32-rt/src/misc/vcruntime140.rs

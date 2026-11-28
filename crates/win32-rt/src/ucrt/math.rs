@@ -42,6 +42,10 @@ mod m {
         pub fn tgamma(x: f64) -> f64;
         #[link_name = "lgamma"]
         pub fn lgamma(x: f64) -> f64;
+        #[link_name = "nextafter"]
+        pub fn nextafter(x: f64, y: f64) -> f64;
+        #[link_name = "nextafterf"]
+        pub fn nextafterf(x: f32, y: f32) -> f32;
     }
 }
 
@@ -220,6 +224,14 @@ pub extern "win64" fn remainder(x: f64, y: f64) -> f64 {
 }
 pub extern "win64" fn remainderf(x: f32, y: f32) -> f32 {
     unsafe { m::remainderf(x, y) }
+}
+#[inline(never)]
+pub extern "win64" fn nextafter(x: f64, y: f64) -> f64 {
+    unsafe { m::nextafter(x, y) }
+}
+#[inline(never)]
+pub extern "win64" fn nextafterf(x: f32, y: f32) -> f32 {
+    unsafe { m::nextafterf(x, y) }
 }
 pub extern "win64" fn erf(x: f64) -> f64 {
     unsafe { m::erf(x) }
@@ -423,5 +435,8 @@ mod tests {
         assert_eq!(unsafe { frexp(0, &mut e, 8.0) }, 0.5);
         assert_eq!(e, 4);
         assert_eq!(lrint(2.5), 2);
+        assert_eq!(nextafterf(1.0f32, 2.0f32), f32::from_bits(1.0f32.to_bits() + 1));
+        assert_eq!(nextafterf(1.0f32, 0.0f32), f32::from_bits(1.0f32.to_bits() - 1));
+        assert_eq!(nextafter(1.0f64, 2.0f64), f64::from_bits(1.0f64.to_bits() + 1));
     }
 }

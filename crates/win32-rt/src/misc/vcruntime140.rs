@@ -3,12 +3,13 @@
 //! `__C_specific_handler`, and `__CxxFrameHandler3`.
 
 // @exports: _CxxThrowException, __AdjustPointer, __C_specific_handler
-// @exports: __CxxFrameHandler3, __RTDynamicCast, __current_exception
-// @exports: __current_exception_context, __processing_throw, __std_exception_copy
-// @exports: __std_exception_destroy, __std_terminate, __std_type_info_compare
-// @exports: __std_type_info_destroy_list, __std_type_info_name
-// @exports: __uncaught_exception, __uncaught_exceptions, _purecall, memchr
-// @exports: memcmp, memcpy, memmove, memset, strchr, strstr, wcsrchr, wcsstr
+// @exports: __CxxFrameHandler3, __RTDynamicCast, __RTtypeid, __current_exception
+// @exports: __current_exception_context, __intrinsic_setjmp, __processing_throw
+// @exports: __std_exception_copy, __std_exception_destroy, __std_terminate
+// @exports: __std_type_info_compare, __std_type_info_destroy_list, __std_type_info_name
+// @exports: __uncaught_exception, __uncaught_exceptions, _purecall
+// @exports: _set_purecall_handler, longjmp, memchr, memcmp, memcpy, memmove
+// @exports: memset, strchr, strrchr, strstr, wcsrchr, wcsstr
 
 use crate::Export;
 use crate::unwind::{
@@ -17,6 +18,7 @@ use crate::unwind::{
     RtlUnwindEx,
 };
 use std::ffi::{CStr, c_char, c_void};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub static EXTRA_EXPORTS: &[Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
@@ -70,6 +72,13 @@ pub unsafe extern "win64" fn strchr(s: *const c_char, c: i32) -> *mut c_char {
         return std::ptr::null_mut();
     }
     libc::strchr(s, c)
+}
+
+pub unsafe extern "win64" fn strrchr(s: *const c_char, c: i32) -> *mut c_char {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    libc::strrchr(s, c)
 }
 
 pub unsafe extern "win64" fn strstr(haystack: *const c_char, needle: *const c_char) -> *mut c_char {
@@ -328,6 +337,35 @@ pub unsafe extern "win64" fn __RTDynamicCast(
     std::ptr::null_mut()
 }
 
+/// `__RTtypeid`: returns the `TypeDescriptor*` (`std::type_info*`) for polymorphic object `inptr`.
+pub unsafe extern "win64" fn __RTtypeid(inptr: *mut u8) -> *const u8 {
+    if inptr.is_null() {
+        log::error!("__RTtypeid(NULL)");
+        _CxxThrowException(std::ptr::null_mut(), std::ptr::null());
+        return std::ptr::null();
+    }
+    let vtable = std::ptr::read_unaligned(inptr as *const *const usize);
+    if vtable.is_null() {
+        return std::ptr::null();
+    }
+    let col_ptr = std::ptr::read_unaligned(vtable.sub(1)) as *const RttiCompleteObjectLocator;
+    if col_ptr.is_null() {
+        return std::ptr::null();
+    }
+    let col = std::ptr::read_unaligned(col_ptr);
+    let image_base = if col.signature == 0 {
+        let mut b: *mut c_void = std::ptr::null_mut();
+        RtlPcToFileHeader(col_ptr.cast(), &mut b);
+        b as usize
+    } else {
+        (col_ptr as usize).wrapping_sub(col.p_self as isize as usize)
+    };
+    if image_base == 0 {
+        return std::ptr::null();
+    }
+    (image_base as isize + col.p_type_descriptor as isize) as *const u8
+}
+
 // ---------------------------------------------------------------------------
 // std::exception helpers & C++ exception state (`0x180006820..0x180007290`)
 // ---------------------------------------------------------------------------
@@ -436,9 +474,22 @@ pub unsafe extern "win64" fn __std_terminate() -> ! {
     crate::ucrt::runtime::terminate()
 }
 
+static PURECALL_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+pub unsafe extern "win64" fn _set_purecall_handler(handler: usize) -> usize {
+    PURECALL_HANDLER.swap(handler, Ordering::AcqRel)
+}
+
 pub unsafe extern "win64" fn _purecall() -> ! {
+    let h = PURECALL_HANDLER.load(Ordering::Acquire);
+    if h != 0 {
+        let _ = crate::call_guest8(h, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
     crate::ucrt::runtime::abort()
 }
+
+context_capturing_export!(__intrinsic_setjmp => crate::unwind::setjmp_impl);
+context_capturing_export!(longjmp => crate::unwind::longjmp_impl);
 
 /// `__DestructExceptionObject` (`0x1800011a0`).
 pub(crate) unsafe fn destruct_exception_object(rec: *const ExceptionRecord) {
@@ -685,4 +736,89 @@ pub unsafe extern "win64" fn __CxxFrameHandler3(
         }
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vcruntime_strrchr_purecall_rtti_and_setjmp_exports() {
+        for sym in [
+            "strrchr",
+            "_set_purecall_handler",
+            "__RTtypeid",
+            "__intrinsic_setjmp",
+            "longjmp",
+        ] {
+            assert!(
+                crate::lookup("vcruntime140.dll", sym).is_some(),
+                "missing vcruntime140!{sym}"
+            );
+        }
+
+        unsafe {
+            // strrchr
+            let s = c"ab/cd/ef";
+            let hit = strrchr(s.as_ptr(), b'/' as i32);
+            assert_eq!(hit, s.as_ptr().add(5) as *mut c_char);
+            assert!(strrchr(s.as_ptr(), b'z' as i32).is_null());
+            assert!(strrchr(std::ptr::null(), b'a' as i32).is_null());
+
+            // _set_purecall_handler swaps atomically
+            let prev = _set_purecall_handler(0x1234_5678);
+            assert_eq!(_set_purecall_handler(prev), 0x1234_5678);
+
+            // __RTtypeid resolves TypeDescriptor from vtable[-1] CompleteObjectLocator (signature=1)
+            #[repr(C)]
+            struct FakeRttiModule {
+                td: [u8; 32],
+                col: RttiCompleteObjectLocator,
+                vtable_with_meta: [usize; 2],
+            }
+            let mut m = FakeRttiModule {
+                td: [0; 32],
+                col: RttiCompleteObjectLocator {
+                    signature: 1,
+                    offset: 0,
+                    cd_offset: 0,
+                    p_type_descriptor: 0,
+                    p_class_descriptor: 0,
+                    p_self: 32,
+                },
+                vtable_with_meta: [0, 0],
+            };
+            m.vtable_with_meta[0] = &m.col as *const RttiCompleteObjectLocator as usize;
+            let mut obj_vptr = &m.vtable_with_meta[1] as *const usize;
+            let got = __RTtypeid(&mut obj_vptr as *mut *const usize as *mut u8);
+            assert_eq!(got, m.td.as_ptr());
+
+            // setjmp_impl populates _JUMP_BUFFER fields faithfully from Context
+            let mut ctx = Context::zeroed();
+            let mut jb = [0u8; 256];
+            ctx.gpr[crate::unwind::RCX] = jb.as_mut_ptr() as u64;
+            ctx.gpr[crate::unwind::RDX] = 0x7000_0000;
+            ctx.gpr[crate::unwind::RBX] = 0x1111;
+            ctx.gpr[crate::unwind::RSP] = 0x2222;
+            ctx.gpr[crate::unwind::RBP] = 0x3333;
+            ctx.gpr[crate::unwind::RSI] = 0x4444;
+            ctx.gpr[crate::unwind::RDI] = 0x5555;
+            ctx.gpr[12] = 0x6666;
+            ctx.gpr[13] = 0x7777;
+            ctx.gpr[14] = 0x8888;
+            ctx.gpr[15] = 0x9999;
+            ctx.rip = 0x1400_1234;
+            ctx.mx_csr = 0x1F80;
+            *ctx.xmm_mut(6) = [6u8; 16];
+            *ctx.xmm_mut(15) = [15u8; 16];
+            assert_eq!(crate::unwind::setjmp_impl(&mut ctx, 0), 0);
+            assert_eq!(std::ptr::read_unaligned(jb.as_ptr() as *const u64), 0x7000_0000);
+            assert_eq!(std::ptr::read_unaligned(jb.as_ptr().add(0x08) as *const u64), 0x1111);
+            assert_eq!(std::ptr::read_unaligned(jb.as_ptr().add(0x10) as *const u64), 0x2222);
+            assert_eq!(std::ptr::read_unaligned(jb.as_ptr().add(0x50) as *const u64), 0x1400_1234);
+            assert_eq!(std::ptr::read_unaligned(jb.as_ptr().add(0x58) as *const u32), 0x1F80);
+            assert_eq!(&jb[0x60..0x70], &[6u8; 16]);
+            assert_eq!(&jb[0xF0..0x100], &[15u8; 16]);
+        }
+    }
 }

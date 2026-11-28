@@ -175,6 +175,12 @@ pub unsafe extern "win64" fn _strtol_l(s: *const u8, e: *mut *const u8, b: i32, 
 pub unsafe extern "win64" fn _strtoul_l(s: *const u8, e: *mut *const u8, b: i32, _l: *mut c_void) -> u32 {
     strtoul(s, e, b)
 }
+pub unsafe extern "win64" fn _strtoi64_l(s: *const u8, e: *mut *const u8, b: i32, _l: *mut c_void) -> i64 {
+    _strtoi64(s, e, b)
+}
+pub unsafe extern "win64" fn _strtoui64_l(s: *const u8, e: *mut *const u8, b: i32, _l: *mut c_void) -> u64 {
+    _strtoui64(s, e, b)
+}
 
 pub unsafe extern "win64" fn atoi(s: *const u8) -> i32 {
     strtol(s, std::ptr::null_mut(), 10)
@@ -1164,6 +1170,10 @@ mod tests {
             assert_eq!(strtoul(b"-1\0".as_ptr(), std::ptr::null_mut(), 10), u32::MAX);
             assert_eq!(strtoull(b"0777\0".as_ptr(), std::ptr::null_mut(), 0), 0o777);
             assert_eq!(strtol(b"xyz\0".as_ptr(), &mut e, 10), 0);
+            assert_eq!(_strtoi64_l(b"-9223372036854775807x\0".as_ptr(), &mut e, 10, std::ptr::null_mut()), -9223372036854775807);
+            assert_eq!(*e, b'x');
+            assert_eq!(_strtoui64_l(b"0xDEADBEEFCAFEy\0".as_ptr(), &mut e, 16, std::ptr::null_mut()), 0xDEADBEEFCAFE);
+            assert_eq!(*e, b'y');
         }
     }
     #[test]
