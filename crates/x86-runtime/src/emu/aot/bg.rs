@@ -15,7 +15,7 @@ use super::format::{
     cache_file, encode, image_hash, profile_file, write_atomic, AotKey, BUILD_VBASE,
     FLAG_VERIFY_PENDING,
 };
-use super::runtime::{install_image, Verify, MAPPED};
+use super::runtime::{count_missing_profile_ips, install_image, Verify, MAPPED};
 use super::{
     aot_closure_depth, bg_threads, bg_wait, build_request, cache_dir, env_u32_any, game_run,
     profile_enabled, set_qos, verify_mode, QOS_CLASS_BACKGROUND, QOS_CLASS_UTILITY,
@@ -289,14 +289,15 @@ static BG_CV: Condvar = Condvar::new();
 const BG_STALE_DIV: usize = 10;
 const BG_STALE_MAX: usize = 2000;
 
-/// `AW2_DLL_AOT=2` at activation: the background job for module `name` given the load
-/// result (`loaded`: block IPs of the installed cache), or None.
-pub(super) fn bg_job(
+/// Shared implementation for [`bg_job`] and [`bg_job_for_module`]: checks whether a module
+/// needs a background build (`install = true` when no cache was loaded, or `install = false`
+/// when `count_missing(&prof)` exceeds the staleness thresholds).
+fn bg_job_inner(
     name: &str,
     base: usize,
     size: usize,
     key: AotKey,
-    loaded: Option<&[u64]>,
+    count_missing: Option<&dyn Fn(&[u32]) -> usize>,
 ) -> Option<BgJob> {
     if crate::emu::mem::jit_overlaps(base, base.wrapping_add(size)) {
         log::info!(
@@ -317,14 +318,10 @@ pub(super) fn bg_job(
         );
         return None;
     }
-    let install = match loaded {
+    let install = match count_missing {
         None => true,
-        Some(ips) => {
-            let have: HashSet<u64> = ips.iter().copied().collect();
-            let new = prof
-                .iter()
-                .filter(|&&rva| !have.contains(&(base as u64 + rva as u64)))
-                .count();
+        Some(counter) => {
+            let new = counter(&prof);
             if new * BG_STALE_DIV <= prof.len() && new <= BG_STALE_MAX {
                 return None;
             }
@@ -336,6 +333,53 @@ pub(super) fn bg_job(
         }
     };
     Some(BgJob { name: name.to_string(), base, size, key, install })
+}
+
+/// `AW2_DLL_AOT=2` at activation: the background job for module `name` given the load
+/// result (`loaded`: block IPs of the installed cache), or None.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn bg_job(
+    name: &str,
+    base: usize,
+    size: usize,
+    key: AotKey,
+    loaded: Option<&[u64]>,
+) -> Option<BgJob> {
+    let checker = loaded.map(|ips| {
+        move |prof: &[u32]| {
+            let have: HashSet<u64> = ips.iter().copied().collect();
+            prof.iter()
+                .filter(|&&rva| !have.contains(&(base as u64 + rva as u64)))
+                .count()
+        }
+    });
+    bg_job_inner(
+        name,
+        base,
+        size,
+        key,
+        checker.as_ref().map(|f| f as &dyn Fn(&[u32]) -> usize),
+    )
+}
+
+/// Zero-allocation variant of [`bg_job`] for `activate()`: checks `prof` directly against the
+/// already-installed module `loaded_mi`'s sorted `img.blocks` via O(log N) binary search,
+/// avoiding multi-million-entry `Vec<u64>` copies and `HashSet` builds on the startup path.
+pub(super) fn bg_job_for_module(
+    name: &str,
+    base: usize,
+    size: usize,
+    key: AotKey,
+    loaded_mi: Option<usize>,
+) -> Option<BgJob> {
+    let checker = loaded_mi.map(|mi| move |prof: &[u32]| count_missing_profile_ips(mi, base, prof));
+    bg_job_inner(
+        name,
+        base,
+        size,
+        key,
+        checker.as_ref().map(|f| f as &dyn Fn(&[u32]) -> usize),
+    )
 }
 
 /// Queue `jobs` for the builder thread (started on demand; exits when the queue is empty).

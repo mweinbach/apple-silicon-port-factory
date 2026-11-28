@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-use super::bg::{bg_enqueue, bg_job, sweep_start, touch};
+use super::bg::{bg_enqueue, bg_job_for_module, sweep_start, touch};
 use super::builder::{build_all, split_and_rebase_block};
 #[cfg(test)]
 use super::builder::build_image;
@@ -64,14 +64,7 @@ impl Hasher for FastIntHasher {
 }
 
 pub(super) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastIntHasher>>;
-
-/// Pack `(module_idx, link_idx)` into a single `u64` intrusive-list node (`u64::MAX` = nil).
-#[inline(always)]
-fn pack_link_node(mi: usize, li: usize) -> u64 {
-    ((mi as u64) << 32) | (li as u64)
-}
-
-const LINK_NODE_NIL: u64 = u64::MAX;
+pub(super) type FastSet<K> = HashSet<K, BuildHasherDefault<FastIntHasher>>;
 
 /// Minimum block/link count to fan out assumption checking or initial linking across workers.
 const PARALLEL_THRESHOLD: usize = 32_768;
@@ -90,15 +83,6 @@ fn alloc_atomic_u8_zeroed(n: usize) -> Box<[AtomicU8]> {
     }
     let raw = Box::into_raw(vec![0u8; n].into_boxed_slice());
     unsafe { Box::from_raw(raw as *mut [AtomicU8]) }
-}
-
-/// Fast filled boxed `AtomicU64` slice (`vec![val; n]` lowers to bulk `memset` for `u64::MAX`).
-fn alloc_atomic_u64_filled(n: usize, val: u64) -> Box<[AtomicU64]> {
-    const {
-        assert!(core::mem::size_of::<AtomicU64>() == 8 && core::mem::align_of::<AtomicU64>() == 8);
-    }
-    let raw = Box::into_raw(vec![val; n].into_boxed_slice());
-    unsafe { Box::from_raw(raw as *mut [AtomicU64]) }
 }
 
 /// Per-bank far-branch island slab: 16-byte immutable veneers (`ldr x16, .+8; br x16; .quad dst`)
@@ -129,20 +113,16 @@ pub(super) struct Module {
     img: Image,
     /// Per block: 0 = alive, [`DEAD_PERM`] or [`DEAD_ASSUME`].
     dead: Box<[AtomicU8]>,
-    /// Per block: head of intrusive chain (`pack_link_node(src_mod, src_link)`) of patched link
-    /// sites pointing at this block (`LINK_NODE_NIL` if none). Replaces a global `HashMap` over
-    /// millions of target IPs, giving O(1) `kill()` and wait-free parallel link registration.
-    incoming_head: Box<[AtomicU64]>,
     /// Per link: currently patched to its target.
     linked: Vec<bool>,
-    /// Per link: next packed `(module, link)` node in the target block's [`Self::incoming_head`]
-    /// intrusive chain (`LINK_NODE_NIL` if unlinked or tail).
-    incoming_next: Vec<u64>,
     /// Indices of currently unlinked link sites in `0..img.links.len()` (valid once
     /// `unlinked_init` is true). Avoids O(M^2) rescans of already-linked sites across modules.
     unlinked: Vec<u32>,
     /// True after this module's initial `link_pass` populated `unlinked`.
     unlinked_init: bool,
+    /// True when this module's `MAP_JIT` region was installed during a deferred startup batch
+    /// and still needs its bulk icache invalidation after batch linking completes.
+    needs_icache_flush: bool,
     /// Per block: has a held import slot ([`rebase_block`]); never verified (its
     /// re-translation sees a different slot state, its guarded call is still correct).
     slot_held: Vec<bool>,
@@ -232,6 +212,10 @@ pub(super) struct Dir {
     has_overlaps: bool,
     /// Shared probe table published in [`PROBE`] (kept in sync with `map` / `dead`).
     probe: ProbeTab,
+    /// Earliest `(seq, va_gen)` captured at the start of an initial multi-module deferred batch
+    /// when no prior live modules existed; published into `CHECKED_SEQ`/`CHECKED_VG` once the
+    /// batch finishes linking and flushing icache.
+    batch_init_gens: Option<(u64, u32)>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -283,6 +267,29 @@ impl ProbeTab {
                 return e;
             }
             i = (i + 1) & (self.cap - 1);
+        }
+    }
+
+    /// Read-only lookup of `ip` in a populated probe table (`0` if absent or dead/host-entry).
+    #[inline(always)]
+    unsafe fn lookup(&self, ip: u64) -> usize {
+        if self.base == 0 || ip == 0 {
+            return 0;
+        }
+        let ents = (self.base + 16) as *const [AtomicU64; 2];
+        let shift = 64 - self.cap.trailing_zeros();
+        let mask = self.cap - 1;
+        let mut i = (ip.wrapping_mul(jit::JMUL) >> shift) as usize;
+        loop {
+            let e = &*ents.add(i);
+            let k = e[0].load(Ordering::Relaxed);
+            if k == ip {
+                return e[1].load(Ordering::Relaxed) as usize;
+            }
+            if k == 0 {
+                return 0;
+            }
+            i = (i + 1) & mask;
         }
     }
 
@@ -403,8 +410,9 @@ impl Dir {
         self.probe_rebuild_with_workers(aot_install_workers());
     }
 
-    /// [`Self::probe_rebuild`] parameterized by worker count (also called directly by tests).
-    unsafe fn probe_rebuild_with_workers(&mut self, workers: usize) {
+    /// Build a fresh probe table covering every live non-host-entry block without publishing
+    /// it to [`PROBE`] yet (lets batch startup link against the table before icache flush).
+    unsafe fn build_probe_table(&self, workers: usize) -> ProbeTab {
         let mut total_blocks = 0usize;
         let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
         if !self.has_overlaps {
@@ -534,47 +542,28 @@ impl Dir {
                 }
             }
         }
+        t
+    }
+
+    /// [`Self::probe_rebuild`] parameterized by worker count (also called directly by tests).
+    unsafe fn probe_rebuild_with_workers(&mut self, workers: usize) {
+        let t = self.build_probe_table(workers);
         PROBE.store(t.base, Ordering::Release);
         self.probe = t;
     }
 
-    /// Test helper: whether the current owner of `ip` has any patched incoming AOT links.
+    /// Test helper: whether any live module currently holds a patched link targeting `ip`.
     #[cfg(test)]
     pub(super) fn has_incoming_links(&self, ip: u64) -> bool {
-        self.map.get(&ip).is_some_and(|&(tm, tb)| {
-            self.modules[tm as usize].incoming_head[tb as usize].load(Ordering::Relaxed)
-                != LINK_NODE_NIL
+        self.modules.iter().any(|m| {
+            !m.gone
+                && !m.killed
+                && m.img
+                    .links
+                    .iter()
+                    .enumerate()
+                    .any(|(li, l)| m.linked[li] && l.target == ip)
         })
-    }
-
-    /// Test helper: prune uninstalled module indices from per-block intrusive incoming chains.
-    #[cfg(test)]
-    pub(super) fn prune_incoming(&mut self, gone: &[u32]) {
-        for tm in 0..self.modules.len() {
-            let tm_gone = self.modules[tm].gone;
-            let nb = self.modules[tm].incoming_head.len();
-            for tb in 0..nb {
-                let head = self.modules[tm].incoming_head[tb].load(Ordering::Relaxed);
-                if head == LINK_NODE_NIL {
-                    continue;
-                }
-                let mut node = head;
-                let mut new_head = LINK_NODE_NIL;
-                while node != LINK_NODE_NIL {
-                    let sm = (node >> 32) as usize;
-                    let sl = (node as u32) as usize;
-                    let next = self.modules[sm].incoming_next[sl];
-                    if tm_gone || gone.contains(&(sm as u32)) {
-                        self.modules[sm].incoming_next[sl] = LINK_NODE_NIL;
-                    } else {
-                        self.modules[sm].incoming_next[sl] = new_head;
-                        new_head = node;
-                    }
-                    node = next;
-                }
-                self.modules[tm].incoming_head[tb].store(new_head, Ordering::Relaxed);
-            }
-        }
     }
 }
 
@@ -1087,23 +1076,116 @@ unsafe fn check_install_blocks(
     (bad, rewrites, watch)
 }
 
-/// Mark block `bi` of module `mi` dead (`why`: [`DEAD_PERM`] / [`DEAD_ASSUME`]) and unpatch
-/// every AOT link site pointing at it (code must be writable on this thread).
-unsafe fn kill(d: &mut Dir, mi: usize, bi: usize, why: u8, patched: &mut Vec<usize>) {
-    let ip = {
-        let m = &d.modules[mi];
-        m.dead[bi].store(why, Ordering::Release);
-        m.img.blocks[bi].ip
-    };
-    d.probe_sync(ip);
-    let mut node = d.modules[mi].incoming_head[bi].swap(LINK_NODE_NIL, Ordering::AcqRel);
-    while node != LINK_NODE_NIL {
-        let sm = (node >> 32) as usize;
-        let sl = (node as u32) as usize;
+/// Mark a batch of `(module, block)` entries dead (`why`: [`DEAD_PERM`] / [`DEAD_ASSUME`])
+/// and unpatch every currently-linked AOT site targeting any of their IPs (code must be
+/// writable on this thread). Avoids maintaining 85+ MiB of per-block/per-link incoming chains
+/// on the hot install path by scanning module link tables in parallel on this rare cold path.
+unsafe fn kill_batch(
+    d: &mut Dir,
+    kills: &[(usize, usize)],
+    why: u8,
+    patched: &mut Vec<usize>,
+) {
+    if kills.is_empty() {
+        return;
+    }
+    let mut min_ip = u64::MAX;
+    let mut max_ip = 0u64;
+    let mut killed_ips: FastSet<u64> =
+        FastSet::with_capacity_and_hasher(kills.len(), Default::default());
+    for &(mi, bi) in kills {
+        let ip = {
+            let m = &d.modules[mi];
+            m.dead[bi].store(why, Ordering::Release);
+            m.img.blocks[bi].ip
+        };
+        d.probe_sync(ip);
+        min_ip = min_ip.min(ip);
+        max_ip = max_ip.max(ip);
+        killed_ips.insert(ip);
+    }
+    let single_ip = (killed_ips.len() == 1).then_some(min_ip);
+    let workers = if cfg!(test) { 1 } else { aot_install_workers() };
+    for sm in 0..d.modules.len() {
+        if d.modules[sm].gone {
+            continue;
+        }
+        let nlinks = d.modules[sm].img.links.len();
+        if nlinks == 0 {
+            continue;
+        }
+        let hits: Vec<u32> = if workers > 1 && nlinks >= PARALLEL_THRESHOLD {
+            let m = &d.modules[sm];
+            let links = &m.img.links;
+            let linked = &m.linked;
+            let killed_ref = &killed_ips;
+            let chunk = nlinks.div_ceil(workers);
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                let mut lo = 0usize;
+                while lo < nlinks {
+                    let hi = (lo + chunk).min(nlinks);
+                    handles.push(s.spawn(move || {
+                        let mut out = Vec::new();
+                        if let Some(only) = single_ip {
+                            for sl in lo..hi {
+                                if linked[sl] && links[sl].target == only {
+                                    out.push(sl as u32);
+                                }
+                            }
+                        } else {
+                            for sl in lo..hi {
+                                let tgt = links[sl].target;
+                                if linked[sl]
+                                    && tgt >= min_ip
+                                    && tgt <= max_ip
+                                    && killed_ref.contains(&tgt)
+                                {
+                                    out.push(sl as u32);
+                                }
+                            }
+                        }
+                        out
+                    }));
+                    lo = hi;
+                }
+                let mut merged = Vec::new();
+                for h in handles {
+                    merged.extend(h.join().expect("aot kill_batch scan worker panicked"));
+                }
+                merged
+            })
+        } else {
+            let m = &d.modules[sm];
+            let mut out = Vec::new();
+            if let Some(only) = single_ip {
+                for (sl, l) in m.img.links.iter().enumerate() {
+                    if m.linked[sl] && l.target == only {
+                        out.push(sl as u32);
+                    }
+                }
+            } else {
+                for (sl, l) in m.img.links.iter().enumerate() {
+                    if m.linked[sl]
+                        && l.target >= min_ip
+                        && l.target <= max_ip
+                        && killed_ips.contains(&l.target)
+                    {
+                        out.push(sl as u32);
+                    }
+                }
+            }
+            out
+        };
+        if hits.is_empty() {
+            continue;
+        }
         let m = &mut d.modules[sm];
-        let next = m.incoming_next[sl];
-        m.incoming_next[sl] = LINK_NODE_NIL;
-        if !m.gone && m.linked[sl] {
+        for sl_u32 in hits {
+            let sl = sl_u32 as usize;
+            if !m.linked[sl] {
+                continue;
+            }
             let l = m.img.links[sl];
             let site = m.host_addr(l.site_off);
             if l.cond_off != u32::MAX {
@@ -1115,11 +1197,10 @@ unsafe fn kill(d: &mut Dir, mi: usize, bi: usize, why: u8, patched: &mut Vec<usi
             store_b(site, m.host_addr(l.fallback_off));
             m.linked[sl] = false;
             if m.unlinked_init {
-                m.unlinked.push(sl as u32);
+                m.unlinked.push(sl_u32);
             }
             patched.push(site);
         }
-        node = next;
     }
 }
 
@@ -1130,12 +1211,19 @@ unsafe fn link_one(
     mi: usize,
     li: usize,
     force_far: bool,
-    skip_icache: Option<(usize, usize)>,
+    probe: Option<&ProbeTab>,
+    skip_icache: &[(usize, usize)],
     patched: &mut Vec<usize>,
 ) -> bool {
     let l = d.modules[mi].img.links[li];
-    let Some(&(tm, tb)) = d.map.get(&l.target) else { return false };
-    let code = {
+    let code = if let Some(pt) = probe {
+        let c = pt.lookup(l.target);
+        if c == 0 {
+            return false;
+        }
+        c
+    } else {
+        let Some(&(tm, tb)) = d.map.get(&l.target) else { return false };
         let t = &d.modules[tm as usize];
         let tb_ = &t.img.blocks[tb as usize];
         if t.gone || t.dead[tb as usize].load(Ordering::Relaxed) != 0 || tb_.host_entry {
@@ -1168,7 +1256,7 @@ unsafe fn link_one(
         store_b(site, dest);
     }
     let record = |addr: usize, out: &mut Vec<usize>| {
-        if !skip_icache.is_some_and(|(lo, hi)| (lo..hi).contains(&addr)) {
+        if !skip_icache.iter().any(|&(lo, hi)| (lo..hi).contains(&addr)) {
             out.push(addr);
         }
     };
@@ -1177,40 +1265,31 @@ unsafe fn link_one(
             record(cs, patched);
         }
     }
-    let node = pack_link_node(mi, li);
-    let prev = d.modules[tm as usize].incoming_head[tb as usize].swap(node, Ordering::Relaxed);
-    let m = &mut d.modules[mi];
-    debug_assert_eq!(m.incoming_next[li], LINK_NODE_NIL);
-    m.incoming_next[li] = prev;
-    m.linked[li] = true;
+    d.modules[mi].linked[li] = true;
     record(site, patched);
     true
 }
 
 /// Parallel initial link pass for a newly installed module `mi` (`!unlinked_init`, `!force_far`):
-/// resolves targets against read-only `d.map`/`d.modules`, patches in-range `site`/`cond_site`
-/// words in disjoint link chunks (per-thread `JitWrite`), wait-free pushes onto per-block
-/// `incoming_head[tb]`, and finishes rare out-of-range (`far_island`) sites serially.
+/// resolves targets via a single read-only `ProbeTab::lookup` when available (or `d.map`),
+/// patches in-range `site`/`cond_site` words in disjoint link chunks (per-thread `JitWrite`),
+/// and finishes rare out-of-range (`far_island`) sites serially.
 unsafe fn link_module_initial_parallel(
     d: &mut Dir,
     mi: usize,
     workers: usize,
-    skip_icache: Option<(usize, usize)>,
+    probe: Option<&ProbeTab>,
+    skip_icache: &[(usize, usize)],
     patched: &mut Vec<usize>,
 ) {
     let nlinks = d.modules[mi].img.links.len();
     let mut linked = core::mem::take(&mut d.modules[mi].linked);
-    let mut incoming_next = core::mem::take(&mut d.modules[mi].incoming_next);
     let chunk = nlinks.div_ceil(workers);
     let worker_out: Vec<(Vec<u32>, Vec<u32>, Vec<usize>)> = {
         let d_ref: &Dir = d;
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(workers);
-            for (ci, (l_chunk, n_chunk)) in linked
-                .chunks_mut(chunk)
-                .zip(incoming_next.chunks_mut(chunk))
-                .enumerate()
-            {
+            for (ci, l_chunk) in linked.chunks_mut(chunk).enumerate() {
                 let base_li = ci * chunk;
                 handles.push(s.spawn(move || {
                     let _jw = JitWrite::new();
@@ -1225,18 +1304,29 @@ unsafe fn link_module_initial_parallel(
                         }
                         let li = base_li + offset;
                         let l = links[li];
-                        let Some(&(tm, tb)) = d_ref.map.get(&l.target) else {
-                            local_unlinked.push(li as u32);
-                            continue;
+                        let code = if let Some(pt) = probe {
+                            let c = pt.lookup(l.target);
+                            if c == 0 {
+                                local_unlinked.push(li as u32);
+                                continue;
+                            }
+                            c
+                        } else {
+                            let Some(&(tm, tb)) = d_ref.map.get(&l.target) else {
+                                local_unlinked.push(li as u32);
+                                continue;
+                            };
+                            let t = &d_ref.modules[tm as usize];
+                            let tb_ = &t.img.blocks[tb as usize];
+                            if t.gone
+                                || t.dead[tb as usize].load(Ordering::Relaxed) != 0
+                                || tb_.host_entry
+                            {
+                                local_unlinked.push(li as u32);
+                                continue;
+                            }
+                            t.host_addr(tb_.code_off)
                         };
-                        let t = &d_ref.modules[tm as usize];
-                        let tb_ = &t.img.blocks[tb as usize];
-                        if t.gone || t.dead[tb as usize].load(Ordering::Relaxed) != 0 || tb_.host_entry
-                        {
-                            local_unlinked.push(li as u32);
-                            continue;
-                        }
-                        let code = t.host_addr(tb_.code_off);
                         let site = m.host_addr(l.site_off);
                         if !reach(site, code) {
                             local_far.push(li as u32);
@@ -1252,17 +1342,13 @@ unsafe fn link_module_initial_parallel(
                         if l.cond_off != u32::MAX {
                             let cond_site = m.host_addr(l.cond_off);
                             if let Some(cs) = try_patch_cond_branch(cond_site, code) {
-                                if !skip_icache.is_some_and(|(slo, shi)| (slo..shi).contains(&cs)) {
+                                if !skip_icache.iter().any(|&(slo, shi)| (slo..shi).contains(&cs)) {
                                     local_patched.push(cs);
                                 }
                             }
                         }
-                        let node = pack_link_node(mi, li);
-                        let prev = t.incoming_head[tb as usize].swap(node, Ordering::Relaxed);
-                        debug_assert_eq!(n_chunk[offset], LINK_NODE_NIL);
-                        n_chunk[offset] = prev;
                         l_chunk[offset] = true;
-                        if !skip_icache.is_some_and(|(slo, shi)| (slo..shi).contains(&site)) {
+                        if !skip_icache.iter().any(|&(slo, shi)| (slo..shi).contains(&site)) {
                             local_patched.push(site);
                         }
                     }
@@ -1276,7 +1362,6 @@ unsafe fn link_module_initial_parallel(
         })
     };
     d.modules[mi].linked = linked;
-    d.modules[mi].incoming_next = incoming_next;
     let total_unlinked: usize = worker_out.iter().map(|(u, _, _)| u.len()).sum();
     let mut unlinked = Vec::with_capacity(total_unlinked);
     let mut far_sites = Vec::new();
@@ -1286,7 +1371,7 @@ unsafe fn link_module_initial_parallel(
         patched.extend(p);
     }
     for li in far_sites {
-        if !link_one(d, mi, li as usize, false, skip_icache, patched) {
+        if !link_one(d, mi, li as usize, false, probe, skip_icache, patched) {
             unlinked.push(li);
         }
     }
@@ -1296,8 +1381,13 @@ unsafe fn link_module_initial_parallel(
 
 /// Patch every unlinked AOT link site whose target is a live, linkable block in range
 /// (code must be writable on this thread). Returns patched sites outside `skip_icache`
-/// (callers that bulk-invalidate a newly installed region pass `Some((region, region + len))`).
-unsafe fn link_pass(d: &mut Dir, skip_icache: Option<(usize, usize)>) -> Vec<usize> {
+/// (callers that bulk-invalidate newly installed regions pass those `(region, region + len)`
+/// ranges). When `probe` is `Some`, target resolution uses a single lock-free `ProbeTab::lookup`.
+unsafe fn link_pass_with_probe(
+    d: &mut Dir,
+    probe: Option<&ProbeTab>,
+    skip_icache: &[(usize, usize)],
+) -> Vec<usize> {
     static NO_LINK: OnceLock<bool> = OnceLock::new();
     if *NO_LINK.get_or_init(|| {
         std::env::var("PORT_AOT_NO_LINK").is_ok_and(|v| v.trim() != "0" && !v.trim().is_empty())
@@ -1323,12 +1413,12 @@ unsafe fn link_pass(d: &mut Dir, skip_icache: Option<(usize, usize)>) -> Vec<usi
         if !d.modules[mi].unlinked_init {
             let nlinks = d.modules[mi].img.links.len();
             if !force_far && workers > 1 && nlinks >= PARALLEL_THRESHOLD {
-                link_module_initial_parallel(d, mi, workers, skip_icache, &mut patched);
+                link_module_initial_parallel(d, mi, workers, probe, skip_icache, &mut patched);
             } else {
                 let mut unlinked = Vec::new();
                 for li in 0..nlinks {
                     if !d.modules[mi].linked[li]
-                        && !link_one(d, mi, li, force_far, skip_icache, &mut patched)
+                        && !link_one(d, mi, li, force_far, probe, skip_icache, &mut patched)
                     {
                         unlinked.push(li as u32);
                     }
@@ -1342,7 +1432,7 @@ unsafe fn link_pass(d: &mut Dir, skip_icache: Option<(usize, usize)>) -> Vec<usi
             for i in 0..unlinked.len() {
                 let li = unlinked[i] as usize;
                 if d.modules[mi].linked[li]
-                    || link_one(d, mi, li, force_far, skip_icache, &mut patched)
+                    || link_one(d, mi, li, force_far, probe, skip_icache, &mut patched)
                 {
                     continue;
                 }
@@ -1354,6 +1444,11 @@ unsafe fn link_pass(d: &mut Dir, skip_icache: Option<(usize, usize)>) -> Vec<usi
         }
     }
     patched
+}
+
+unsafe fn link_pass(d: &mut Dir, skip_icache: Option<(usize, usize)>) -> Vec<usize> {
+    let slice = skip_icache.as_slice();
+    link_pass_with_probe(d, None, slice)
 }
 
 /// After a `va_gen` change (from `JitCache::run` / [`find`]): re-check affected blocks'
@@ -1613,9 +1708,7 @@ unsafe fn revalidate_dir(d: &mut Dir, cur_sg: u32, delta: &crate::exe::VaDelta) 
         for &(slot, h) in &rewrites {
             (*(slot as *const AtomicU64)).store(h, Ordering::Relaxed);
         }
-        for &(mi, bi) in &kills {
-            kill(d, mi, bi, DEAD_ASSUME, &mut patched);
-        }
+        kill_batch(d, &kills, DEAD_ASSUME, &mut patched);
         let mut vbc: Option<Box<BlockCache>> = None;
         let mut scratch = Vec::new();
         let mut tr_scratch = jit::TrScratch::new();
@@ -1704,6 +1797,7 @@ pub(in crate::emu) fn note_code_region() {
     let mut patched = Vec::new();
     unsafe {
         let _w = JitWrite::new();
+        let mut kills = Vec::new();
         for mi in 0..d.modules.len() {
             if !hit(&d.modules[mi]) {
                 continue;
@@ -1715,10 +1809,11 @@ pub(in crate::emu) fn note_code_region() {
             );
             for bi in 0..d.modules[mi].img.blocks.len() {
                 if d.modules[mi].dead[bi].load(Ordering::Relaxed) != DEAD_PERM {
-                    kill(d, mi, bi, DEAD_PERM, &mut patched);
+                    kills.push((mi, bi));
                 }
             }
         }
+        kill_batch(d, &kills, DEAD_PERM, &mut patched);
     }
     for s in patched {
         unsafe { icache_invalidate(s as *mut u8, 4) };
@@ -1940,6 +2035,7 @@ impl Verify {
 /// [`install_image`] result.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Installed {
+    pub(super) mi: usize,
     pub(super) live: usize,
     /// Blocks re-translated and compared ...
     pub(super) verified: usize,
@@ -2068,11 +2164,10 @@ unsafe fn install_image_opts(
         far_slabs,
         img,
         dead: alloc_atomic_u8_zeroed(n),
-        incoming_head: alloc_atomic_u64_filled(n, LINK_NODE_NIL),
         linked: vec![false; nlinks],
-        incoming_next: vec![LINK_NODE_NIL; nlinks],
         unlinked: Vec::new(),
         unlinked_init: false,
+        needs_icache_flush: defer_probe,
         slot_held: vec![false; n],
         watch_blocks: Vec::new(),
         watch_struct_gen: sg_before,
@@ -2261,6 +2356,7 @@ unsafe fn install_image_opts(
         map: FastMap::default(),
         has_overlaps: false,
         probe: ProbeTab::default(),
+        batch_init_gens: None,
     });
     let had_live_modules = d.modules.iter().any(|existing| !existing.gone && !existing.killed);
     let mi = d.modules.len() as u32;
@@ -2300,6 +2396,22 @@ unsafe fn install_image_opts(
         );
     }
     d.modules.push(m);
+    if defer_probe {
+        // Multi-module startup batch: defer linking, bulk icache invalidation, `PROBE`, and
+        // `HAVE` publication to `flush_probe_table()` so all modules link in a single pass
+        // directly against the freshly built `ProbeTab`.
+        if !had_live_modules && d.batch_init_gens.is_none() {
+            d.batch_init_gens = Some((seq_before, vg_before));
+        }
+        drop(w);
+        drop(g);
+        log::info!(
+            "emu aot: {name}: {live}/{n} blocks staged ({} KiB code across {nbanks} bank(s) at {region:#x}; {bad_verify} verify mismatches ({verified} verified), {bad_check} stale (revivable), {bad_slot} stale import slots, {held_blocks} slot state differs (guarded, unverified); {rebased} slot relocations rebased; {nlinks} links deferred; {:.1} ms)",
+            code_bytes >> 10,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        return Some(Installed { mi: mi as usize, live, verified, mismatches: bad_verify });
+    }
     let patched = link_pass(d, Some((region, region + len)));
     let linked = {
         let m_ref = &d.modules[mi as usize];
@@ -2311,14 +2423,13 @@ unsafe fn install_image_opts(
     };
     let miss = unlinked_reasons(d, mi as usize);
     drop(w);
-    icache_invalidate(region as *mut u8, len);
+    let ic_workers = if test || len < (4 << 20) { 1 } else { aot_install_workers() };
+    icache_invalidate_regions_parallel(&[(region, region + len)], ic_workers);
     for &s in &patched {
         icache_invalidate(s as *mut u8, 4);
     }
     // Lock-free readers (the stubs' probe) only see the code once it is coherent.
-    if !defer_probe {
-        d.probe_insert_batch(&probe_updates);
-    }
+    d.probe_insert_batch(&probe_updates);
     if !had_live_modules {
         // Every block in this first live module was just validated against `>= vg_before`, and
         // no pre-existing live modules could be at an older `va_gen`. Publishing `seq_before` /
@@ -2338,7 +2449,7 @@ unsafe fn install_image_opts(
         miss[3],
         t0.elapsed().as_secs_f64() * 1e3
     );
-    Some(Installed { live, verified, mismatches: bad_verify })
+    Some(Installed { mi: mi as usize, live, verified, mismatches: bad_verify })
 }
 
 /// Why module `mi`'s unpatched link sites are unpatched: `[target not in any loaded cache
@@ -2437,27 +2548,117 @@ unsafe fn read_and_decode_module(
     Some(DecodedModule { path, from_fallback, img, flags, backing })
 }
 
-/// Publish a single coalesced probe table after a multi-module `activate()` batch.
-unsafe fn flush_probe_table() {
-    if !jit::aot_probe_enabled() {
+/// Invalidate instruction caches across `regions` (`(lo, hi)` byte spans), fanning out
+/// multi-megabyte regions in 2 MiB chunks across `workers` so `dc cvau`/`ic ivau` scales
+/// across cores. All workers join before returning (inner-shareable `dsb ish` per chunk).
+unsafe fn icache_invalidate_regions_parallel(regions: &[(usize, usize)], workers: usize) {
+    const ICACHE_CHUNK: usize = 2 << 20;
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    for &(lo, hi) in regions {
+        let mut cur = lo;
+        while cur < hi {
+            let take = (hi - cur).min(ICACHE_CHUNK);
+            chunks.push((cur, take));
+            cur += take;
+        }
+    }
+    if workers <= 1 || chunks.len() <= 1 {
+        for &(addr, len) in &chunks {
+            icache_invalidate(addr as *mut u8, len);
+        }
         return;
     }
+    let n_workers = workers.min(chunks.len());
+    let next = AtomicUsize::new(0);
+    let chunks_ref = &chunks;
+    std::thread::scope(|s| {
+        for _ in 0..n_workers {
+            let next = &next;
+            s.spawn(move || loop {
+                let ci = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(addr, len)) = chunks_ref.get(ci) else { break };
+                icache_invalidate(addr as *mut u8, len);
+            });
+        }
+    });
+}
+
+/// Finalize a multi-module deferred `activate()` batch: build the coalesced probe table,
+/// link all staged modules in parallel directly against `ProbeTab::lookup`, bulk-invalidate
+/// staged `MAP_JIT` regions, and publish `PROBE` + `CHECKED_VG` + `HAVE`.
+unsafe fn flush_probe_table() {
     let t0 = std::time::Instant::now();
+    let _r = REVALIDATE.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
     let Some(d) = g.as_mut() else { return };
-    if d.map.is_empty() {
+    if d.modules.is_empty() {
         return;
     }
-    d.probe_rebuild();
+    let workers = aot_install_workers();
+    let t_probe0 = std::time::Instant::now();
+    let new_probe = if jit::aot_probe_enabled() && !d.map.is_empty() {
+        Some(d.build_probe_table(workers))
+    } else {
+        None
+    };
+    let probe_ms = t_probe0.elapsed().as_secs_f64() * 1e3;
+
+    let mut pending_icache: Vec<(usize, usize)> = Vec::new();
+    for m in &mut d.modules {
+        if m.needs_icache_flush {
+            pending_icache.push((m.region, m.region + m.region_len));
+            m.needs_icache_flush = false;
+        }
+    }
+    let t_link0 = std::time::Instant::now();
+    let patched = {
+        let _w = JitWrite::new();
+        link_pass_with_probe(d, new_probe.as_ref(), &pending_icache)
+    };
+    let link_ms = t_link0.elapsed().as_secs_f64() * 1e3;
+
+    let t_ic0 = std::time::Instant::now();
+    icache_invalidate_regions_parallel(&pending_icache, workers);
+    for &s in &patched {
+        icache_invalidate(s as *mut u8, 4);
+    }
+    let icache_ms = t_ic0.elapsed().as_secs_f64() * 1e3;
+
+    if let Some(t) = new_probe {
+        PROBE.store(t.base, Ordering::Release);
+        d.probe = t;
+    }
+    if let Some((seq, vg)) = d.batch_init_gens.take() {
+        CHECKED_SEQ.store(seq, Ordering::Release);
+        CHECKED_VG.store(vg, Ordering::Release);
+    }
+    if d.modules.iter().any(|m| !m.gone && !m.killed) {
+        HAVE.store(true, Ordering::Release);
+    }
+    let mut total_links = 0usize;
+    let mut total_linked = 0usize;
+    for m in &d.modules {
+        if m.gone || m.killed {
+            continue;
+        }
+        let nl = m.img.links.len();
+        total_links += nl;
+        total_linked += if m.unlinked_init {
+            nl - m.unlinked.len()
+        } else {
+            m.linked.iter().filter(|&&b| b).count()
+        };
+    }
     log::info!(
-        "emu aot: published shared probe table ({} live entries, cap {}, {:.1} ms)",
+        "emu aot: published shared probe table ({} live entries, cap {}) and patched {total_linked}/{total_links} links ({probe_ms:.1} ms probe, {link_ms:.1} ms link, {icache_ms:.1} ms icache, {:.1} ms total)",
         d.probe.used,
         d.probe.cap,
         t0.elapsed().as_secs_f64() * 1e3
     );
 }
 
-/// RAII guard ensuring a deferred multi-module batch always publishes `PROBE` before returning.
+/// RAII guard ensuring a deferred multi-module batch always links, flushes icache, and
+/// publishes `PROBE` + `HAVE` before returning.
 struct ProbeBatchGuard(bool);
 
 impl Drop for ProbeBatchGuard {
@@ -2468,24 +2669,45 @@ impl Drop for ProbeBatchGuard {
     }
 }
 
+/// Count how many RVAs in `prof` are absent from installed module `mi`'s `img.blocks`
+/// (live or dead), using O(log N) binary search when `img.blocks_sorted` holds.
+pub(super) fn count_missing_profile_ips(mi: usize, base: usize, prof: &[u32]) -> usize {
+    let g = DIR.read().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_ref().and_then(|d| d.modules.get(mi)) else {
+        return prof.len();
+    };
+    let blocks = &m.img.blocks;
+    if m.img.blocks_sorted {
+        prof.iter()
+            .filter(|&&rva| {
+                let ip = (base as u64).wrapping_add(rva as u64);
+                blocks.binary_search_by_key(&ip, |b| b.ip).is_err()
+            })
+            .count()
+    } else {
+        let mut have: FastSet<u64> =
+            FastSet::with_capacity_and_hasher(blocks.len(), Default::default());
+        for b in blocks {
+            have.insert(b.ip);
+        }
+        prof.iter()
+            .filter(|&&rva| !have.contains(&(base as u64).wrapping_add(rva as u64)))
+            .count()
+    }
+}
+
 unsafe fn install_decoded_module(
     name: &str,
     base: usize,
     size: usize,
     decoded: DecodedModule,
-    need_ips: bool,
     defer_probe: bool,
-) -> Option<Vec<u64>> {
+) -> Option<usize> {
     let DecodedModule { path, from_fallback, img, flags, backing } = decoded;
     if !from_fallback {
         touch(&path);
     }
     let nblocks = img.blocks.len();
-    let ips = if need_ips {
-        img.blocks.iter().map(|b| b.ip).collect()
-    } else {
-        Vec::new()
-    };
     let pending = flags & FLAG_VERIFY_PENDING != 0;
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2529,12 +2751,13 @@ unsafe fn install_decoded_module(
             }
         );
     }
-    Some(ips)
+    Some(r.mi)
 }
 
 /// Load the cache of image `name` mapped at `[base, base + size)` if it matches `key`
 /// (computed at activation). Returns the IPs of the installed image's blocks (live or not),
 /// or None if no valid cache was installed.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) unsafe fn load_module(
     name: &str,
     base: usize,
@@ -2542,7 +2765,10 @@ pub(super) unsafe fn load_module(
     key: &AotKey,
 ) -> Option<Vec<u64>> {
     let decoded = read_and_decode_module(name, base, size, key, None, verify_mode() != 0)?;
-    install_decoded_module(name, base, size, decoded, true, false)
+    let mi = install_decoded_module(name, base, size, decoded, false)?;
+    let g = DIR.read().unwrap_or_else(|e| e.into_inner());
+    let m = g.as_ref()?.modules.get(mi)?;
+    Some(m.img.blocks.iter().map(|b| b.ip).collect())
 }
 
 /// Blocks above which the first load of a background-built cache verifies a sample ...
@@ -2621,17 +2847,12 @@ pub fn module_mapped(name: &str, base: usize, size: usize) {
 pub fn activate() {
     crate::pc_sample::start(resolve_host_pc, resolve_guest_va);
     crate::diag::install_boundary_hook();
-    let mut hashes: Vec<Option<[u64; 2]>> = Vec::new();
     let pending: Vec<(String, usize, usize)> = match MAPPED.lock() {
         Ok(mut v) => v
             .iter_mut()
             .filter(|m| !m.active)
             .map(|m| {
                 m.active = true;
-                if jit_writable() && profile_enabled() {
-                    m.phash = Some(unsafe { image_hash(m.base, m.size) });
-                }
-                hashes.push(m.phash);
                 (m.name.clone(), m.base, m.size)
             })
             .collect(),
@@ -2640,6 +2861,36 @@ pub fn activate() {
     if pending.is_empty() || super::disk_aot_disabled() {
         return;
     }
+    let hashes: Vec<Option<[u64; 2]>> = if jit_writable() && profile_enabled() {
+        // Hash mapped executable sections in parallel outside `MAPPED.lock()` so large images
+        // (e.g. primary EXE + middleware DLLs) overlap across cores instead of serializing.
+        let computed: Vec<[u64; 2]> = if pending.len() == 1 {
+            vec![unsafe { image_hash(pending[0].1, pending[0].2) }]
+        } else {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = pending
+                    .iter()
+                    .map(|&(_, base, size)| s.spawn(move || unsafe { image_hash(base, size) }))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("aot phash worker panicked"))
+                    .collect()
+            })
+        };
+        if let Ok(mut v) = MAPPED.lock() {
+            for ((name, base, size), &h) in pending.iter().zip(computed.iter()) {
+                if let Some(m) =
+                    v.iter_mut().find(|m| m.name == *name && m.base == *base && m.size == *size)
+                {
+                    m.phash = Some(h);
+                }
+            }
+        }
+        computed.into_iter().map(Some).collect()
+    } else {
+        vec![None; pending.len()]
+    };
     if let Some(sel) = build_request() {
         unsafe { build_all(&pending, &sel) };
         log::info!("emu aot: AW2_DLL_AOT_BUILD done; exiting");
@@ -2673,9 +2924,12 @@ pub fn activate() {
     if targets.len() == 1 {
         let (name, base, size, h) = &targets[0];
         let key = unsafe { module_key_hashed(*base, *size, *h) };
-        let loaded = unsafe { load_module(name, *base, *size, &key) };
+        let loaded_mi = unsafe {
+            read_and_decode_module(name, *base, *size, &key, None, verify_mode() != 0)
+                .and_then(|d| install_decoded_module(name, *base, *size, d, false))
+        };
         if aot_mode() == 2 {
-            jobs.extend(bg_job(name, *base, *size, key, loaded.as_deref()));
+            jobs.extend(bg_job_for_module(name, *base, *size, key, loaded_mi));
         }
     } else {
         // Schedule largest images first (stable tie-break) so the biggest `.aot` cache decodes
@@ -2704,10 +2958,10 @@ pub fn activate() {
         let primary_dir = cache_dir();
         let fallbacks = fallback_cache_dirs_for(&primary_dir);
         let mode = aot_mode();
-        let need_ips = mode == 2;
         let retain_code = verify_mode() != 0;
-        // Coalesce startup `probe_rebuild` into one final pass when no probe table is published
-        // yet, avoiding repeated intermediate rebuilds and leaked probe tables across a batch.
+        // Coalesce startup `probe_rebuild` + linking + icache invalidation into one final pass
+        // when no probe table is published yet, avoiding intermediate rebuilds and letting the
+        // parallel link pass resolve targets via single-probe `ProbeTab::lookup`.
         let defer_probe = PROBE.load(Ordering::Relaxed) == 0;
         let _probe_guard = ProbeBatchGuard(defer_probe);
         // Overlap disk I/O + checksum + decode of the next module with `install_image` of the
@@ -2737,11 +2991,11 @@ pub fn activate() {
             });
             for ((name, base, size, _), key) in targets.iter().zip(keys.iter()) {
                 let decoded = rx.recv().ok().flatten();
-                let loaded = decoded.and_then(|d| unsafe {
-                    install_decoded_module(name, *base, *size, d, need_ips, defer_probe)
+                let loaded_mi = decoded.and_then(|d| unsafe {
+                    install_decoded_module(name, *base, *size, d, defer_probe)
                 });
                 if mode == 2 {
-                    jobs.extend(bg_job(name, *base, *size, *key, loaded.as_deref()));
+                    jobs.extend(bg_job_for_module(name, *base, *size, *key, loaded_mi));
                 }
             }
         });
@@ -2931,7 +3185,6 @@ pub(in crate::emu) fn test_uninstall() {
     for ip in ips {
         unsafe { d.probe_sync(ip) };
     }
-    d.prune_incoming(&gone);
 }
 
 #[cfg(test)]
@@ -3166,16 +3419,44 @@ mod fast_load_tests {
         }
         .expect("install_image_opts");
         assert_eq!(inst.live, ips.len());
-        unsafe {
+        // Verify `img_nocopy.blocks_sorted` and zero-allocation `count_missing_profile_ips`
+        // (both the sorted O(log N) binary-search path and the unsorted fallback path).
+        let inst_mi = inst.mi;
+        let sample_profs: Vec<u32> = vec![
+            0x100, // callee_va (present)
+            0x180, // hook_target_va (present)
+            0x200, // caller 0 (present)
+            0x0F0, // missing
+            0x3FF0, // missing
+        ];
+        assert_eq!(
+            count_missing_profile_ips(inst_mi, base as usize, &sample_profs),
+            2,
+            "sorted binary-search profile check must count exactly 2 missing RVAs"
+        );
+        {
             let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
-            g.as_mut().unwrap().probe_rebuild_with_workers(4);
+            let m = &mut g.as_mut().unwrap().modules[inst_mi];
+            assert!(m.img.blocks_sorted, "decoded blocks must be detected as sorted");
+            m.img.blocks_sorted = false;
         }
-        assert!(test_probe_check().is_ok(), "parallel probe_rebuild_with_workers(4) must match directory");
+        assert_eq!(
+            count_missing_profile_ips(inst_mi, base as usize, &sample_profs),
+            2,
+            "unsorted fallback profile check must agree with sorted binary-search path"
+        );
+        {
+            let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
+            g.as_mut().unwrap().modules[inst_mi].img.blocks_sorted = true;
+        }
+
+        // Flush deferred batch: builds probe table, links via ProbeTab::lookup, flushes icache,
+        // and publishes PROBE + HAVE.
         unsafe { flush_probe_table() };
         assert!(test_probe_check().is_ok(), "coalesced flush_probe_table must match directory");
 
         // Reset the installed module's link state and exercise `link_module_initial_parallel`
-        // directly across 4 worker threads racing on `callee_va`'s `incoming_head`.
+        // directly across 4 worker threads using `ProbeTab::lookup`, followed by `kill_batch`.
         let host_ptr = dummy_host_va as *const () as usize;
         unsafe {
             let _r = REVALIDATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -3187,11 +3468,8 @@ mod fast_load_tests {
             let region = d.modules[mi].region;
             let region_len = d.modules[mi].region_len;
 
-            // Unpatch all existing links in `mi`, reset `incoming_head`, then re-link in parallel!
+            // Unpatch all existing links in `mi`, then re-link in parallel using `d.probe`!
             let _w = JitWrite::new();
-            for bi in 0..d.modules[mi].incoming_head.len() {
-                d.modules[mi].incoming_head[bi].store(LINK_NODE_NIL, Ordering::Relaxed);
-            }
             for li in 0..d.modules[mi].linked.len() {
                 if d.modules[mi].linked[li] {
                     let l = d.modules[mi].img.links[li];
@@ -3199,40 +3477,45 @@ mod fast_load_tests {
                     store_b(site, d.modules[mi].host_addr(l.fallback_off));
                     d.modules[mi].linked[li] = false;
                 }
-                d.modules[mi].incoming_next[li] = LINK_NODE_NIL;
             }
             d.modules[mi].unlinked.clear();
             d.modules[mi].unlinked_init = false;
 
+            let probe_snap = ProbeTab {
+                base: d.probe.base,
+                cap: d.probe.cap,
+                used: d.probe.used,
+            };
             let mut patched = Vec::new();
-            link_module_initial_parallel(d, mi, 4, Some((region, region + region_len)), &mut patched);
-
-            // Walk `callee_bi`'s incoming chain: must contain all N_CALLERS link nodes!
-            let mut chain_len = 0usize;
-            let mut node = d.modules[mi].incoming_head[callee_bi].load(Ordering::Relaxed);
-            while node != LINK_NODE_NIL {
-                let sm = (node >> 32) as usize;
-                let sl_idx = (node as u32) as usize;
-                assert_eq!(sm, mi);
-                assert!(d.modules[mi].linked[sl_idx]);
-                chain_len += 1;
-                node = d.modules[mi].incoming_next[sl_idx];
-            }
-            assert_eq!(
-                chain_len, N_CALLERS,
-                "parallel link_module_initial_parallel must register all {N_CALLERS} incoming links"
+            link_module_initial_parallel(
+                d,
+                mi,
+                4,
+                Some(&probe_snap),
+                &[(region, region + region_len)],
+                &mut patched,
             );
 
-            // Killing `callee_bi` must unpatch every single caller in the chain cleanly.
+            // Every caller targeting `callee_va` must be linked now.
+            let linked_to_callee = d.modules[mi]
+                .img
+                .links
+                .iter()
+                .enumerate()
+                .filter(|&(li, l)| d.modules[mi].linked[li] && l.target == callee_va)
+                .count();
+            assert_eq!(
+                linked_to_callee, N_CALLERS,
+                "parallel probe-backed link_module_initial_parallel must patch all {N_CALLERS} caller links"
+            );
+
+            // Killing `callee_bi` via `kill_batch` must unpatch every single caller cleanly.
             let mut kill_patched = Vec::new();
-            kill(d, mi, callee_bi, DEAD_ASSUME, &mut kill_patched);
-            assert_eq!(
-                d.modules[mi].incoming_head[callee_bi].load(Ordering::Relaxed),
-                LINK_NODE_NIL
-            );
+            kill_batch(d, &[(mi, callee_bi)], DEAD_ASSUME, &mut kill_patched);
+            assert!(!d.has_incoming_links(callee_va), "kill_batch must unpatch all incoming links");
             assert!(
                 kill_patched.len() >= N_CALLERS,
-                "kill must unpatch all {N_CALLERS} caller sites (got {})",
+                "kill_batch must unpatch all {N_CALLERS} caller sites (got {})",
                 kill_patched.len()
             );
 
