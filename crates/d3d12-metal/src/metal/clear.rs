@@ -144,7 +144,8 @@ pub fn raw_texture_uint_clear_element(dxgi: u32, v: ClearValue) -> Option<Vec<u8
 }
 
 /// Encodes `f32` to an unsigned float with 5-bit exponent (bias 15) and `mbits` mantissa
-/// bits (`mbits == 6` for 11-bit R/G, `mbits == 5` for 10-bit B in `R11G11B10_FLOAT`).
+/// bits (`mbits == 6` for 11-bit R/G, `mbits == 5` for 10-bit B in `R11G11B10_FLOAT`),
+/// using Direct3D's round-toward-zero (truncation) rule for narrowing float conversion.
 fn f32_to_ufloat(f: f32, mbits: u32) -> u32 {
     let b = f.to_bits();
     let exp = ((b >> 23) & 0xff) as i32;
@@ -162,25 +163,17 @@ fn f32_to_ufloat(f: f32, mbits: u32) -> u32 {
     }
     let e = exp - 127 + 15;
     let shift = 23 - mbits;
-    let round = 1u32 << (shift - 1);
     if e >= 0x1f {
         return (0x1f << mbits) - 1; // clamp finite overflow to max finite
     }
     if e <= 0 {
-        let sub_shift = (1 - e) as u32;
-        if sub_shift > 24 {
+        let total_shift = (1 - e) as u32 + shift;
+        if total_shift >= 32 {
             return 0;
         }
-        let m = (man | 0x80_0000) >> sub_shift;
-        return (m + round) >> shift;
+        return (man | 0x80_0000) >> total_shift;
     }
-    let mant_rounded = man + round;
-    let carry = mant_rounded >> 23;
-    let out_e = (e as u32) + carry;
-    if out_e >= 0x1f {
-        return (0x1f << mbits) - 1;
-    }
-    (out_e << mbits) | ((mant_rounded & 0x7f_ffff) >> shift)
+    ((e as u32) << mbits) | (man >> shift)
 }
 
 fn encode_packed_element(dxgi: u32, v: ClearValue) -> Option<Vec<u8>> {
@@ -1130,8 +1123,18 @@ mod tests {
         assert!(raw_texture_uint_clear_element(26, ClearValue::Float([f32::NAN; 4])).is_none());
         assert_eq!(f32_to_ufloat(1.0, 6), 0x3c0);
         assert_eq!(f32_to_ufloat(1.0, 5), 0x1e0);
+        // Non-exact normal and subnormal values must truncate toward zero per D3D float conversion rules.
+        assert_eq!(f32_to_ufloat(1.01, 6), 0x3c0);
+        assert_eq!(f32_to_ufloat(1.9999, 6), 0x3ff);
+        assert_eq!(f32_to_ufloat(1.02, 5), 0x1e0);
+        assert_eq!(f32_to_ufloat(1.9999, 5), 0x1ff);
+        assert_eq!(f32_to_ufloat(0.9 * 2f32.powi(-20), 6), 0);
+        assert_eq!(f32_to_ufloat(1.9 * 2f32.powi(-20), 6), 1);
+        assert_eq!(f32_to_ufloat(0.9 * 2f32.powi(-19), 5), 0);
+        assert_eq!(f32_to_ufloat(1.9 * 2f32.powi(-19), 5), 1);
         assert_eq!(f32_to_ufloat(-5.0, 6), 0);
         assert_eq!(f32_to_ufloat(65024.0, 6), 0x7bf);
+        assert_eq!(f32_to_ufloat(70000.0, 6), 0x7bf);
         assert_eq!(f32_to_ufloat(64512.0, 5), 0x3df);
         assert_eq!(f32_to_ufloat(f32::INFINITY, 6), 0x7c0);
         assert_eq!(
