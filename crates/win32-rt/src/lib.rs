@@ -613,6 +613,7 @@ pub fn plain_builtin_fns() -> &'static [usize] {
             kernel32::threads::TlsGetValue as *const () as usize,
             kernel32::threads::TlsSetValue as *const () as usize,
             kernel32::threads::FlsGetValue as *const () as usize,
+            kernel32::threads::FlsGetValue2 as *const () as usize,
             kernel32::threads::FlsSetValue as *const () as usize,
             kernel32::threads::SetEvent as *const () as usize,
             kernel32::threads::ResetEvent as *const () as usize,

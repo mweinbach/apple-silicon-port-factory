@@ -2,7 +2,7 @@
 //! text layout, hit-testing, and glyph outline/bitmap rasterization.
 
 mod abi;
-mod analysis;
+pub(crate) mod analysis;
 mod font;
 mod layout;
 mod sfnt;

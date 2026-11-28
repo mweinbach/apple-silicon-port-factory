@@ -486,6 +486,15 @@ pub unsafe extern "win64" fn FlsGetValue(i: u32) -> *mut c_void {
     thread::fls_get(i) as *mut c_void
 }
 
+/// Windows 11 24H2 / MSVC CRT fast FLS getter (`api-ms-win-core-fibers-l1-1-2`).
+/// Identical to `FlsGetValue` except it does not modify the thread's last-error code.
+pub unsafe extern "win64" fn FlsGetValue2(i: u32) -> *mut c_void {
+    if !thread::fls_valid(i) {
+        return std::ptr::null_mut();
+    }
+    thread::fls_get(i) as *mut c_void
+}
+
 pub unsafe extern "win64" fn FlsSetValue(i: u32, v: *mut c_void) -> BOOL {
     if !thread::fls_valid(i) {
         set_err(err::ERROR_INVALID_PARAMETER);
@@ -1760,6 +1769,32 @@ mod tests {
             assert_eq!(called.load(Ordering::Acquire), 1);
             assert!(FlsGetValue(idx).is_null());
             assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn fls_get_value2_preserves_last_error() {
+        unsafe {
+            let idx = FlsAlloc(None);
+            assert_ne!(idx, thread::FLS_OUT_OF_INDEXES);
+
+            const SENTINEL_ERR: u32 = 0x1357_2468;
+            teb::set_last_error(SENTINEL_ERR);
+            assert!(FlsGetValue2(idx).is_null());
+            assert_eq!(teb::last_error(), SENTINEL_ERR);
+
+            let val = 0xDEAD_BEEFusize as *mut c_void;
+            assert_eq!(FlsSetValue(idx, val), TRUE);
+            teb::set_last_error(SENTINEL_ERR);
+            assert_eq!(FlsGetValue2(idx), val);
+            assert_eq!(teb::last_error(), SENTINEL_ERR);
+
+            assert_eq!(FlsFree(idx), TRUE);
+            teb::set_last_error(SENTINEL_ERR);
+            assert!(FlsGetValue2(idx).is_null());
+            assert_eq!(teb::last_error(), SENTINEL_ERR);
+            assert!(FlsGetValue2(u32::MAX).is_null());
+            assert_eq!(teb::last_error(), SENTINEL_ERR);
         }
     }
 
