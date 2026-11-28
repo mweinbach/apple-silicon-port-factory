@@ -22,7 +22,7 @@ use std::mem::ManuallyDrop;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -8135,6 +8135,7 @@ pub struct MappingObj {
     size: u64,
     writable: bool,
     exec: bool,
+    open_handles: AtomicUsize,
     name: Option<String>,
     /// Original Windows path if backed by a file handle (`None` for pagefile/anonymous sections).
     win_path: Option<String>,
@@ -8146,6 +8147,21 @@ impl KObject for MappingObj {
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn on_handle_open(&self) {
+        if self.name.is_some() {
+            self.open_handles.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fn on_handle_close(&self) {
+        if let Some(ref name) = self.name {
+            if self.open_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+                handles::unregister_named_object(name, self as *const Self as *const (), &self.open_handles);
+            }
+        }
+    }
+    fn has_open_handles(&self) -> bool {
+        self.name.is_none() || self.open_handles.load(Ordering::Acquire) > 0
     }
 }
 
@@ -8186,14 +8202,22 @@ pub fn mapping_size(h: HANDLE) -> Option<u64> {
 }
 
 pub unsafe fn create_mapping(h: HANDLE, protect: u32, size: u64, name: Option<String>) -> HANDLE {
+    let name = name.filter(|s| !s.is_empty());
     if let Some(n) = &name {
-        if let Some(o) = crate::thread::defer_lock(handles::named_objects()).get(n).cloned() {
-            if o.as_any().is::<MappingObj>() {
-                set_err(err::ERROR_ALREADY_EXISTS);
-                return handles::insert(o);
+        let mut names = crate::thread::defer_lock(handles::named_objects());
+        if let Some(o) = names.get(n) {
+            if o.has_open_handles() {
+                if o.as_any().is::<MappingObj>() {
+                    let existing_h = handles::insert(o.clone());
+                    drop(names);
+                    set_err(err::ERROR_ALREADY_EXISTS);
+                    return existing_h;
+                }
+                drop(names);
+                set_err(err::ERROR_INVALID_HANDLE); // name collision with another type
+                return std::ptr::null_mut();
             }
-            set_err(6); // ERROR_INVALID_HANDLE (name collision with another type)
-            return std::ptr::null_mut();
+            names.remove(n);
         }
     }
     let prot = protect & 0xFF;
@@ -8238,9 +8262,36 @@ pub unsafe fn create_mapping(h: HANDLE, protect: u32, size: u64, name: Option<St
         set_err(1006); // ERROR_FILE_INVALID: mapping an empty file
         return std::ptr::null_mut();
     }
-    let obj: Arc<dyn KObject> = Arc::new(MappingObj { file, size, writable, exec, name: name.clone(), win_path });
+    let obj: Arc<dyn KObject> = Arc::new(MappingObj {
+        file,
+        size,
+        writable,
+        exec,
+        open_handles: AtomicUsize::new(0),
+        name: name.clone(),
+        win_path,
+    });
     if let Some(n) = name {
-        crate::thread::defer_lock(handles::named_objects()).insert(n, obj.clone());
+        let mut names = crate::thread::defer_lock(handles::named_objects());
+        if let Some(existing) = names.get(&n) {
+            if existing.has_open_handles() {
+                if existing.as_any().is::<MappingObj>() {
+                    let existing_h = handles::insert(existing.clone());
+                    drop(names);
+                    set_err(err::ERROR_ALREADY_EXISTS);
+                    return existing_h;
+                }
+                drop(names);
+                set_err(err::ERROR_INVALID_HANDLE);
+                return std::ptr::null_mut();
+            }
+            names.remove(&n);
+        }
+        let new_h = handles::insert(obj.clone());
+        names.insert(n, obj);
+        drop(names);
+        set_err(0);
+        return new_h;
     }
     set_err(0);
     handles::insert(obj)
@@ -8275,14 +8326,25 @@ pub unsafe extern "win64" fn CreateFileMappingFromApp(
     create_mapping(h, page_protect, max_size, from_wide_opt(name))
 }
 pub unsafe extern "win64" fn OpenFileMappingW(_access: u32, _inherit: BOOL, name: LPCWSTR) -> HANDLE {
-    let n = from_wide(name);
-    match crate::thread::defer_lock(handles::named_objects()).get(&n).cloned() {
-        Some(o) if o.as_any().is::<MappingObj>() => handles::insert(o),
-        _ => {
-            set_err(err::ERROR_FILE_NOT_FOUND);
-            std::ptr::null_mut()
+    let Some(n) = from_wide_opt(name).filter(|s| !s.is_empty()) else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
+    let mut names = crate::thread::defer_lock(handles::named_objects());
+    if let Some(o) = names.get(&n) {
+        if o.has_open_handles() {
+            if o.as_any().is::<MappingObj>() {
+                return handles::insert(o.clone());
+            }
+            drop(names);
+            set_err(err::ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
         }
+        names.remove(&n);
     }
+    drop(names);
+    set_err(err::ERROR_FILE_NOT_FOUND);
+    std::ptr::null_mut()
 }
 
 const FILE_MAP_COPY: u32 = 0x1;
@@ -13388,5 +13450,52 @@ mod tests {
             crate::kernel32::threads::CloseHandle(srv_ov);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_name_and_closed_named_file_mapping_semantics() {
+        unsafe {
+            let empty_w: [u16; 1] = [0];
+            let empty_a: [u8; 1] = [0];
+            let m1 = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0x04, 0, 4096, empty_w.as_ptr());
+            assert!(!m1.is_null());
+            assert_eq!(teb::last_error(), 0);
+            let m2 = CreateFileMappingA(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0x04, 0, 4096, empty_a.as_ptr());
+            assert!(!m2.is_null());
+            assert_eq!(teb::last_error(), 0);
+            assert!(
+                !Arc::ptr_eq(&handles::get(m1).unwrap(), &handles::get(m2).unwrap()),
+                "empty-name file mappings must be distinct unnamed objects"
+            );
+            assert!(OpenFileMappingW(0, FALSE, empty_w.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert!(OpenFileMappingW(0, FALSE, std::ptr::null()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(crate::kernel32::threads::CloseHandle(m1), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(m2), TRUE);
+
+            // Named mapping shares while open and releases its name when the last handle closes.
+            let name = to_wide_z("Local\\PortFactory_NamedMappingLifecycleTest");
+            let n1 = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0x04, 0, 4096, name.as_ptr());
+            assert!(!n1.is_null());
+            assert_eq!(teb::last_error(), 0);
+            let n2 = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0x04, 0, 4096, name.as_ptr());
+            assert!(!n2.is_null());
+            assert_eq!(teb::last_error(), err::ERROR_ALREADY_EXISTS);
+            assert!(Arc::ptr_eq(&handles::get(n1).unwrap(), &handles::get(n2).unwrap()));
+            let n3 = OpenFileMappingW(0, FALSE, name.as_ptr());
+            assert!(!n3.is_null());
+            assert!(Arc::ptr_eq(&handles::get(n1).unwrap(), &handles::get(n3).unwrap()));
+            assert_eq!(crate::kernel32::threads::CloseHandle(n1), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(n2), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(n3), TRUE);
+
+            assert!(OpenFileMappingW(0, FALSE, name.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+            let n4 = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0x04, 0, 4096, name.as_ptr());
+            assert!(!n4.is_null());
+            assert_eq!(teb::last_error(), 0);
+            assert_eq!(crate::kernel32::threads::CloseHandle(n4), TRUE);
+        }
     }
 }
