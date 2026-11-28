@@ -1171,3 +1171,273 @@ kernel void m41_sched_noop(device uint* dst [[buffer(0)]], uint id [[thread_posi
         assert!(pso.maxTotalThreadsPerThreadgroup() >= 32);
     }
 }
+
+#[test]
+fn resolve_render_targets_and_blend_sanitizes_non_blendable_and_rejects_invalid() {
+    use crate::state::{blend as b, BlendDesc, RenderTargetBlendDesc};
+
+    let mut desc = BlendDesc::default();
+    desc.IndependentBlendEnable = 0;
+    desc.RenderTarget[0] = RenderTargetBlendDesc {
+        BlendEnable: 1,
+        LogicOpEnable: 0,
+        SrcBlend: b::ONE,
+        DestBlend: b::INV_SRC_ALPHA,
+        BlendOp: 1,
+        SrcBlendAlpha: b::INV_DEST_ALPHA,
+        DestBlendAlpha: b::ONE,
+        BlendOpAlpha: 1,
+        LogicOp: 4,
+        RenderTargetWriteMask: 0xB, // R | G | A (non-trivial mask must survive)
+    };
+
+    // Mixed float + integer MRT with IndependentBlendEnable = FALSE:
+    // [R32_FLOAT (41), R16G16_FLOAT (34), R32G32_UINT (17), R32G32_UINT (17), R32_UINT (42)]
+    let rtvs = [41u32, 34, 17, 17, 42];
+    let (resolved, mtl, count) =
+        resolve_render_targets_and_blend_with(&desc, &rtvs, 1, true, |s| matches!(s, 1 | 2 | 4))
+            .expect("mixed float+integer MRT with broadcast blend must succeed");
+    assert_eq!(count, 5);
+    assert_eq!(
+        &mtl[..5],
+        &[
+            MTLPixelFormat::R32Float,
+            MTLPixelFormat::RG16Float,
+            MTLPixelFormat::RG32Uint,
+            MTLPixelFormat::RG32Uint,
+            MTLPixelFormat::R32Uint,
+        ]
+    );
+    assert!(resolved.attachments[0].enabled);
+    assert!(resolved.attachments[1].enabled);
+    assert!(!resolved.attachments[2].enabled);
+    assert!(!resolved.attachments[3].enabled);
+    assert!(!resolved.attachments[4].enabled);
+    // Write masks must be preserved even when blending is disabled on integer RTs.
+    let expected_mask = MTLColorWriteMask::Red | MTLColorWriteMask::Green | MTLColorWriteMask::Alpha;
+    for i in 0..5 {
+        assert_eq!(resolved.attachments[i].write_mask, expected_mask);
+    }
+
+    // Without float32_blend (e.g. iOS Apple7-9), enabled blending on R32_FLOAT / RG32_FLOAT /
+    // RGBA32_FLOAT must return an explicit error instead of silently turning into an unblended
+    // overwrite, while unblended 32-bit float RTVs still succeed.
+    assert!(
+        resolve_render_targets_and_blend_with(&desc, &rtvs, 1, false, |s| matches!(s, 1 | 2 | 4))
+            .is_err(),
+        "enabled blending on R32_FLOAT without float32_blend must be rejected"
+    );
+    let mut unblended_f32 = BlendDesc::default();
+    unblended_f32.RenderTarget[0].RenderTargetWriteMask = 0xF;
+    let (f32_ok, _, _) = resolve_render_targets_and_blend_with(
+        &unblended_f32,
+        &[41, 16, 2],
+        1,
+        false,
+        |s| matches!(s, 1 | 2 | 4),
+    )
+    .expect("unblended 32-bit float RTVs must succeed even without float32_blend");
+    assert!(!f32_ok.attachments[0].enabled);
+
+    // Pure blendable MRT must preserve the exact BlendState produced by `state::blend_state`
+    // (no cache-key perturbation for already-valid pipelines).
+    let float_rtvs = [28u32, 34];
+    let (untouched, _, _) =
+        resolve_render_targets_and_blend_with(&desc, &float_rtvs, 1, true, |s| s == 1)
+            .expect("blendable MRT");
+    assert_eq!(untouched, crate::state::blend_state(&desc));
+
+    // If the only enabled attachment with SRC1_* / BLEND_FACTOR is non-blendable, stale
+    // dual_source and uses_blend_constant flags must clear.
+    let mut ds_const = BlendDesc::default();
+    ds_const.RenderTarget[0] = RenderTargetBlendDesc {
+        BlendEnable: 1,
+        SrcBlend: b::BLEND_FACTOR,
+        DestBlend: b::INV_SRC1_COLOR,
+        BlendOp: 1,
+        SrcBlendAlpha: b::ONE,
+        DestBlendAlpha: b::ZERO,
+        BlendOpAlpha: 1,
+        RenderTargetWriteMask: 0xF,
+        ..Default::default()
+    };
+    let (cleared, _, _) =
+        resolve_render_targets_and_blend_with(&ds_const, &[42], 1, true, |s| s == 1)
+            .expect("integer-only RT clears dual_source/blend_constant");
+    assert!(!cleared.attachments[0].enabled);
+    assert!(!cleared.dual_source);
+    assert!(!cleared.uses_blend_constant);
+
+    // Dual-source on RT0 with a trailing DXGI_FORMAT_UNKNOWN (0) slot is valid; with a second
+    // active color attachment it must be rejected.
+    let (ds_sparse, mtl_sparse, _) =
+        resolve_render_targets_and_blend_with(&ds_const, &[28, 0], 1, true, |s| s == 1)
+            .expect("dual-source on RT0 with UNKNOWN RT1 is valid");
+    assert!(ds_sparse.dual_source);
+    assert_eq!(mtl_sparse[1], MTLPixelFormat::Invalid);
+    assert!(
+        resolve_render_targets_and_blend_with(&ds_const, &[28, 28], 1, true, |s| s == 1).is_err(),
+        "dual-source with 2 active RTs must be rejected"
+    );
+
+    // Invalid RTV formats, >8 RTs, and unsupported sample counts must return Err.
+    for bad_fmt in [27u32, 40, 45, 71, 6, 67, 999] {
+        assert!(
+            resolve_render_targets_and_blend_with(&desc, &[bad_fmt], 1, true, |s| s == 1).is_err(),
+            "format {bad_fmt} must be rejected as an RTV format"
+        );
+    }
+    assert!(
+        resolve_render_targets_and_blend_with(&desc, &[28; 9], 1, true, |s| s == 1).is_err(),
+        ">8 render targets must be rejected"
+    );
+    assert!(
+        resolve_render_targets_and_blend_with(&desc, &[28], 8, true, |s| matches!(s, 1 | 2 | 4))
+            .is_err(),
+        "unsupported sample count must be rejected"
+    );
+}
+
+#[test]
+fn mixed_float_and_uint_mrt_renders_blended_float_and_unblended_uint_on_gpu() {
+    let Some(d) = crate::metal::device() else {
+        return;
+    };
+    use crate::state::{blend as b, BlendDesc, RenderTargetBlendDesc};
+    use std::ptr::NonNull;
+
+    let src = "
+#include <metal_stdlib>
+using namespace metal;
+struct MrtOut {
+    float c0 [[color(0)]];
+    uint c1 [[color(1)]];
+};
+vertex float4 mrt_vs(uint vid [[vertex_id]]) {
+    float2 uv = float2((vid << 1) & 2, vid & 2);
+    return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+fragment MrtOut mrt_fs() {
+    return { 0.5, 0x12345678u };
+}
+";
+    let lib = crate::metal::pipeline::library_from_source_with_opts("mrt_blend_gpu_test", src, false)
+        .expect("compile mrt_blend_gpu_test");
+
+    // IndependentBlendEnable = FALSE, additive blend (1*Src + 1*Dst) broadcast across
+    // [R32_FLOAT, R32_UINT]: RT0 must blend (0.25 + 0.5 = 0.75), RT1 must overwrite
+    // cleanly with 0x12345678 without aborting Metal validation.
+    let mut blend_desc = BlendDesc::default();
+    blend_desc.IndependentBlendEnable = 0;
+    blend_desc.RenderTarget[0] = RenderTargetBlendDesc {
+        BlendEnable: 1,
+        SrcBlend: b::ONE,
+        DestBlend: b::ONE,
+        BlendOp: 1,
+        SrcBlendAlpha: b::ONE,
+        DestBlendAlpha: b::ONE,
+        BlendOpAlpha: 1,
+        RenderTargetWriteMask: 0xF,
+        ..Default::default()
+    };
+    let rtv_formats = [41u32, 42u32]; // R32_FLOAT, R32_UINT
+    let (blend, mtl_rtvs, count) =
+        resolve_render_targets_and_blend(&blend_desc, &rtv_formats, 1).expect("resolve MRT");
+    assert!(blend.attachments[0].enabled);
+    assert!(!blend.attachments[1].enabled);
+
+    let pdesc = MTL4RenderPipelineDescriptor::new();
+    pdesc.setVertexFunctionDescriptor(Some(&function_descriptor(&lib, "mrt_vs")));
+    pdesc.setFragmentFunctionDescriptor(Some(&function_descriptor(&lib, "mrt_fs")));
+    apply_color_attachments(&pdesc.colorAttachments(), &mtl_rtvs, count, &blend, false);
+    unsafe { pdesc.setRasterSampleCount(1) };
+    let pso = pso_cache()
+        .expect("pso_cache")
+        .render_pipeline(None, &pdesc)
+        .expect("compile mixed R32Float+R32Uint render pipeline");
+
+    let mk_rt = |pf: MTLPixelFormat| {
+        let td = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                pf, 4, 4, false,
+            )
+        };
+        td.setUsage(MTLTextureUsage::RenderTarget);
+        td.setStorageMode(MTLStorageMode::Shared);
+        d.dev.newTextureWithDescriptor(&td).expect("rt texture")
+    };
+    let rt0 = mk_rt(MTLPixelFormat::R32Float);
+    let rt1 = mk_rt(MTLPixelFormat::R32Uint);
+
+    let rsd = MTLResidencySetDescriptor::new();
+    let res = d.dev.newResidencySetWithDescriptor_error(&rsd).expect("residency");
+    res.addAllocation(ProtocolObject::from_ref(&*rt0));
+    res.addAllocation(ProtocolObject::from_ref(&*rt1));
+    res.commit();
+
+    let queue = d.dev.newMTL4CommandQueue().expect("queue");
+    let alloc = d.dev.newCommandAllocator().expect("alloc");
+    let cb = d.dev.newCommandBuffer().expect("cb");
+    cb.beginCommandBufferWithAllocator(&alloc);
+    cb.useResidencySet(&res);
+
+    let rp = MTL4RenderPassDescriptor::new();
+    let c0 = unsafe { rp.colorAttachments().objectAtIndexedSubscript(0) };
+    c0.setTexture(Some(&rt0));
+    c0.setLoadAction(MTLLoadAction::Clear);
+    c0.setStoreAction(MTLStoreAction::Store);
+    c0.setClearColor(MTLClearColor { red: 0.25, green: 0.0, blue: 0.0, alpha: 1.0 });
+
+    let c1 = unsafe { rp.colorAttachments().objectAtIndexedSubscript(1) };
+    c1.setTexture(Some(&rt1));
+    c1.setLoadAction(MTLLoadAction::Clear);
+    c1.setStoreAction(MTLStoreAction::Store);
+    c1.setClearColor(MTLClearColor { red: 99.0, green: 0.0, blue: 0.0, alpha: 0.0 });
+
+    let enc = cb.renderCommandEncoderWithDescriptor(&rp).expect("render encoder");
+    enc.setRenderPipelineState(&pso);
+    enc.setViewport(MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: 4.0,
+        height: 4.0,
+        znear: 0.0,
+        zfar: 1.0,
+    });
+    unsafe { enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3) };
+    enc.endEncoding();
+    cb.endCommandBuffer();
+
+    let ev = d.dev.newSharedEvent().expect("event");
+    let mut cbs = [NonNull::from(&*cb)];
+    unsafe { queue.commit_count(NonNull::new(cbs.as_mut_ptr()).unwrap(), 1) };
+    queue.signalEvent_value(ProtocolObject::from_ref(&*ev), 1);
+    assert!(ev.waitUntilSignaledValue_timeoutMS(1, 10_000), "GPU timeout");
+
+    let region = MTLRegion {
+        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+        size: MTLSize { width: 4, height: 4, depth: 1 },
+    };
+    let mut out0 = [0f32; 16];
+    let mut out1 = [0u32; 16];
+    unsafe {
+        rt0.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+            NonNull::new(out0.as_mut_ptr().cast()).unwrap(),
+            16,
+            region,
+            0,
+        );
+        rt1.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+            NonNull::new(out1.as_mut_ptr().cast()).unwrap(),
+            16,
+            region,
+            0,
+        );
+    }
+    assert!(
+        (out0[0] - 0.75).abs() < 1e-4,
+        "RT0 R32Float must additive-blend 0.25 + 0.50 = 0.75, got {}",
+        out0[0]
+    );
+    assert_eq!(out1[0], 0x1234_5678, "RT1 R32Uint must write unblended integer value");
+}

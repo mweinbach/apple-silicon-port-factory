@@ -25,6 +25,28 @@ impl Tr<'_> {
                     | K_MOVSX_RR
                     | K_MOVZX_RM
                     | K_MOVSX_RM
+                    | K_LEA
+                    | K_ALU_RR
+                    | K_ALU_RI
+                    | K_ALU_RM
+                    | K_ALU_MR
+                    | K_ALU_MI
+                    | K_CMPJ_RR
+                    | K_CMPJ_RI
+                    | K_CMPJ_RM
+                    | K_INC_R
+                    | K_DEC_R
+                    | K_SHIFT_RI
+                    | K_SETCC_R
+                    | K_CMOV_RR
+                    | K_NOT_R
+                    | K_NEG_R
+                    | K_BT_RR
+                    | K_BT_RI
+                    | K_IMUL_RR
+                    | K_IMUL_RM
+                    | K_IMUL_RRI
+                    | K_IMUL_RMI
                     | K_VSHUF_RR
                     | K_VSHUF_RM
                     | K_VFP_RR
@@ -812,8 +834,9 @@ impl Tr<'_> {
         let mem_dst = mem_a && !is_cmp;
         let writes_reg = !mem_a && !is_cmp;
         if is_cmp && !need_nzcv && !need_pf {
-            // Dead compare: only the memory operand's range check remains observable.
-            if matches!(op.kind, K_ALU_RM | K_CMPJ_RM | K_ALU_MR | K_ALU_MI) {
+            // Dead compare: only the memory operand's software range check remains observable
+            // (under `hw_range_enabled()`, `range_check_op` is a no-op so avoid dead `XA` math).
+            if !hw_range_enabled() && matches!(op.kind, K_ALU_RM | K_CMPJ_RM | K_ALU_MR | K_ALU_MI) {
                 if let Grp::Member { id } = self.grp[k] {
                     if self.grp_ok & (1u64 << id) != 0 {
                         self.grp_k = k;
