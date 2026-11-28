@@ -32,6 +32,7 @@ struct Parser<'a> {
     pos: usize,
     flags: u32,
     depth: usize,
+    budget: usize,
     names: Vec<String>,
     types: Vec<String>,
 }
@@ -43,9 +44,18 @@ impl<'a> Parser<'a> {
             pos: 0,
             flags,
             depth: 0,
+            budget: MAX_OUT,
             names: Vec::new(),
             types: Vec::new(),
         }
+    }
+
+    /// Reserve `bytes` from the cumulative expansion budget before allocating, cloning,
+    /// joining, or formatting, aborting with `None` if adversarial nesting/back-references
+    /// would exceed `MAX_OUT`.
+    fn charge(&mut self, bytes: usize) -> Option<()> {
+        self.budget = self.budget.checked_sub(bytes)?;
+        Some(())
     }
 
     fn peek(&self) -> Option<u8> {
@@ -83,16 +93,20 @@ impl<'a> Parser<'a> {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    fn push_name_ref(&mut self, name: &str) {
+    fn push_name_ref(&mut self, name: &str) -> Option<()> {
         if self.names.len() < 10 {
+            self.charge(name.len())?;
             self.names.push(name.to_string());
         }
+        Some(())
     }
 
-    fn push_type_ref(&mut self, ty: &str) {
+    fn push_type_ref(&mut self, ty: &str) -> Option<()> {
         if self.types.len() < 10 {
+            self.charge(ty.len())?;
             self.types.push(ty.to_string());
         }
+        Some(())
     }
 
     fn kw(&self, s: &str) -> String {
@@ -109,6 +123,8 @@ impl<'a> Parser<'a> {
         if let Some(b @ b'0'..=b'9') = self.peek() {
             self.pos += 1;
             let idx = (b - b'0') as usize;
+            let len = self.names.get(idx)?.len();
+            self.charge(len)?;
             return self.names.get(idx).cloned();
         }
         let start = self.pos;
@@ -121,8 +137,10 @@ impl<'a> Parser<'a> {
         if self.pos == start || !self.eat(b'@') {
             return None;
         }
-        let s = std::str::from_utf8(&self.src[start..self.pos - 1]).ok()?.to_string();
-        self.push_name_ref(&s);
+        let raw = std::str::from_utf8(&self.src[start..self.pos - 1]).ok()?;
+        self.charge(raw.len())?;
+        let s = raw.to_string();
+        self.push_name_ref(&s)?;
         Some(s)
     }
 
@@ -185,6 +203,11 @@ impl<'a> Parser<'a> {
                     return None;
                 }
             }
+            let mut total = base.len().checked_add(3)?;
+            for a in &args {
+                total = total.checked_add(a.len())?.checked_add(1)?;
+            }
+            self.charge(total)?;
             let joined = args.join(",");
             if joined.ends_with('>') {
                 Some(format!("{base}<{joined} >"))
@@ -195,10 +218,9 @@ impl<'a> Parser<'a> {
         self.names = saved_names;
         self.types = saved_types;
         self.leave();
-        if let Some(ref s) = res {
-            self.push_name_ref(s);
-        }
-        res
+        let s = res?;
+        self.push_name_ref(&s)?;
+        Some(s)
     }
 
     fn parse_special_name(&mut self) -> Option<(String, SpecialKind)> {
@@ -354,6 +376,11 @@ impl<'a> Parser<'a> {
         if scopes.is_empty() {
             Some((leaf, kind))
         } else {
+            let mut total = leaf.len();
+            for s in &scopes {
+                total = total.checked_add(s.len())?.checked_add(2)?;
+            }
+            self.charge(total)?;
             scopes.push(leaf);
             Some((scopes.join("::"), kind))
         }
@@ -392,6 +419,8 @@ impl<'a> Parser<'a> {
         if let Some(b @ b'0'..=b'9') = self.peek() {
             self.pos += 1;
             let idx = (b - b'0') as usize;
+            let len = self.types.get(idx)?.len();
+            self.charge(len)?;
             return self.types.get(idx).cloned();
         }
         let start_pos = self.pos;
@@ -441,6 +470,7 @@ impl<'a> Parser<'a> {
                 if (self.flags & UNDNAME_NO_ECSU) != 0 {
                     qname
                 } else {
+                    self.charge(tag.len().checked_add(qname.len())?)?;
                     format!("{tag}{qname}")
                 }
             }
@@ -470,10 +500,17 @@ impl<'a> Parser<'a> {
                         let k = self.kw(cc);
                         if k.is_empty() { String::new() } else { format!("{k} ") }
                     };
+                    self.charge(
+                        ret.len()
+                            .checked_add(cc_str.len())?
+                            .checked_add(params.len())?
+                            .checked_add(8)?,
+                    )?;
                     format!("{ret} ({cc_str}*)({params})")
                 } else {
                     let pointee_cv = self.parse_cv()?;
                     let target = self.parse_type(false)?;
+                    self.charge(target.len().checked_add(32)?)?;
                     let mut s = if pointee_cv.is_empty() {
                         target
                     } else {
@@ -495,7 +532,12 @@ impl<'a> Parser<'a> {
                 // Qualified primitive or template parameter (`?A...`, `?B...`, `$$...`)
                 let cv = self.parse_cv()?;
                 let inner = self.parse_type(false)?;
-                if cv.is_empty() { inner } else { format!("{inner} {cv}") }
+                if cv.is_empty() {
+                    inner
+                } else {
+                    self.charge(inner.len().checked_add(cv.len())?.checked_add(1)?)?;
+                    format!("{inner} {cv}")
+                }
             }
             b'$' => {
                 if self.eat(b'$') {
@@ -505,6 +547,7 @@ impl<'a> Parser<'a> {
                             let _ = self.eat(b'E');
                             let cv = self.parse_cv()?;
                             let inner = self.parse_type(false)?;
+                            self.charge(inner.len().checked_add(cv.len())?.checked_add(4)?)?;
                             if cv.is_empty() {
                                 format!("{inner} &&")
                             } else {
@@ -524,7 +567,7 @@ impl<'a> Parser<'a> {
         // MSVC records every non-empty parameter type whose mangled encoding is > 1 byte
         // (including 2-byte extended primitives such as `_J`, `_N`, `_W` and `$$T`).
         if record_backref && !ty.is_empty() && (self.pos - start_pos) > 1 {
-            self.push_type_ref(&ty);
+            self.push_type_ref(&ty)?;
         }
         Some(ty)
     }
@@ -556,6 +599,11 @@ impl<'a> Parser<'a> {
         if params.is_empty() {
             Some("void".to_string())
         } else {
+            let mut total = 0usize;
+            for p in &params {
+                total = total.checked_add(p.len())?.checked_add(1)?;
+            }
+            self.charge(total)?;
             Some(params.join(","))
         }
     }
@@ -904,10 +952,17 @@ mod tests {
             "A::operator int"
         );
 
-        // Non-mangled C names pass through unchanged; deeply nested garbage never panics.
+        // Non-mangled C names pass through unchanged; deeply nested or exponential
+        // back-reference bombs abort safely within budget and fall back to verbatim input.
         assert_eq!(demangle_msvc("plain_c_symbol", 0), "plain_c_symbol");
         let deep = format!("?{}@A@@YAXH@Z", "P".repeat(200));
         let _ = demangle_msvc(&deep, 0);
+        let mut bomb = "V?$V@H@@".to_string();
+        for _ in 0..16 {
+            bomb = format!("V?$V@{bomb}V1@V1@V1@@@");
+        }
+        let rtti_bomb = format!(".{bomb}");
+        assert_eq!(demangle_msvc(&rtti_bomb, 0), rtti_bomb);
     }
 
     #[test]
