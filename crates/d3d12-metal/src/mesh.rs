@@ -184,7 +184,8 @@ impl MeshPipeline {
         immut_opt: bool,
         pso_opt_v2: bool,
     ) -> Result<MeshPipeline, String> {
-        let blend = crate::state::blend_state(&d.blend);
+        let (blend, mtl_rtvs, rtv_count) =
+            crate::metal::pipeline::resolve_render_targets_and_blend(&d.blend, &d.rtv_formats, d.sample_count)?;
         if !blend.unsupported_logic_ops.is_empty() {
             log::warn!(target: "d3d", "mesh PSO: unsupported logic ops {:?} (blending off)", blend.unsupported_logic_ops.as_slice());
         }
@@ -268,14 +269,7 @@ impl MeshPipeline {
                 desc.setAlphaToOneState(MTL4AlphaToOneState::Disabled);
             }
             let ca = desc.colorAttachments();
-            for (i, f) in d.rtv_formats.iter().enumerate().take(8) {
-                let a = unsafe { ca.objectAtIndexedSubscript(i) };
-                let pf = crate::format::info(*f).mtl;
-                a.setPixelFormat(pf);
-                if pf != MTLPixelFormat::Invalid {
-                    blend.attachments[i].apply_to_with_opt(&a, pso_opt_v2);
-                }
-            }
+            crate::metal::pipeline::apply_color_attachments(&ca, &mtl_rtvs, rtv_count, &blend, pso_opt_v2);
             unsafe { desc.setRasterSampleCount(d.sample_count.max(1) as usize) };
             desc.setAlphaToCoverageState(if blend.alpha_to_coverage {
                 MTL4AlphaToCoverageState::Enabled

@@ -273,8 +273,12 @@ impl Asm {
         let (sub, a) = if v < 0 { (true, v.unsigned_abs()) } else { (false, v as u64) };
         if a < 4096 {
             self.addsub_ri(x, sub, false, d, n, a as u32, false);
-        } else if a & 0xFFF == 0 && a < (1 << 24) {
+        } else if a < (1 << 24) {
             self.addsub_ri(x, sub, false, d, n, (a >> 12) as u32, true);
+            let lo = (a & 0xFFF) as u32;
+            if lo != 0 {
+                self.addsub_ri(x, sub, false, d, d, lo, false);
+            }
         } else {
             self.mov_imm(x, XS, v as u64);
             self.addsub_rr(x, false, false, d, n, XS, 0);

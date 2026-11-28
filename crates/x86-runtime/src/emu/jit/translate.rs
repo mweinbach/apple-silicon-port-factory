@@ -2478,17 +2478,32 @@ impl Tr<'_> {
                 return;
             }
             // Large displacement `[base + disp]` with `hw_range_enabled()` + `ldapur/stlur`:
-            // split `disp = hi_4k + lo_9` when `lo_9` fits signed 9 bits and `hi_4k` fits
-            // `imm12 << 12`, caching `(base, RNONE, 0, hi_4k)` in `XA` for nearby fields.
+            // reuse an existing `XA = base + prev_hi` window when `disp - prev_hi` fits signed
+            // 9 bits, otherwise cache a 512-byte-aligned window `hi = (disp + 256) & !0x1FF`
+            // (preserving exact 4 KiB-aligned windows for `±255` around 4 KiB boundaries).
             if hw_range_enabled() && (!tso || unscaled_tso) {
-                let hi = (d.wrapping_add(256)) & !0xFFF;
-                let lo = d.wrapping_sub(hi);
-                if hi != 0 && (-256..=255).contains(&lo) && (-0xFF_F000..=0xFF_F000).contains(&hi) {
-                    let key = (op.base, RNONE, 0u8, hi);
-                    if self.xa_key != Some(key) {
-                        self.a.addsub_ri(true, hi < 0, false, XA, b, (hi.unsigned_abs() >> 12) as u32, true);
-                        self.xa_key = Some(key);
+                let cached_lo = match self.xa_key {
+                    Some((kb, RNONE, 0, prev_hi)) if kb == op.base => {
+                        d.checked_sub(prev_hi).filter(|lo| (-256..=255).contains(lo))
                     }
+                    _ => None,
+                };
+                let lo = if let Some(lo) = cached_lo {
+                    Some(lo)
+                } else if let Some(sum) = d.checked_add(256) {
+                    let hi = sum & !0x1FF;
+                    let lo = d.wrapping_sub(hi);
+                    if hi != 0 && (-256..=255).contains(&lo) {
+                        self.a.add_imm(true, XA, b, hi);
+                        self.xa_key = Some((op.base, RNONE, 0u8, hi));
+                        Some(lo)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(lo) = lo {
                     if tso {
                         self.a.ldapur_stlur(ld, bits, reg, XA, lo as i32);
                     } else {
@@ -2504,9 +2519,9 @@ impl Tr<'_> {
                 }
             }
         }
-        // Indexed `[base + idx*scale + disp]` under `hw_range_enabled()`: compute/reuse
-        // `XA = base + (idx << scale) + hi_4k` and emit direct `ldapur/stlur/ldur/stur [XA, #lo]`,
-        // eliminating redundant index arithmetic across vec3 / struct-array element loads.
+        // Indexed `[base + idx*scale + disp]` under `hw_range_enabled()`: reuse `XA` when
+        // `disp - prev_hi` fits signed 9 bits, else compute `XA = base + (idx << scale) + hi`
+        // (512-byte-aligned window) and emit direct `ldapur/stlur/ldur/stur [XA, #lo]`.
         if hw_range_enabled() && op.base < RNONE && op.index < RNONE && bits <= 64 {
             let chk = Self::chk_of(op);
             let tso = self.scalar_tso(k, chk, ld);
@@ -2514,17 +2529,31 @@ impl Tr<'_> {
             if !tso || (host().has(HostFeatures::LRCPC2) && (lse2 || bits == 8)) {
                 let scale = op.x >> 6;
                 let d = op.disp;
-                let hi = (d.wrapping_add(256)) & !0xFFF;
-                let lo = d.wrapping_sub(hi);
-                if (-256..=255).contains(&lo) {
-                    let key = (op.base, op.index, scale, hi);
-                    if self.xa_key != Some(key) {
+                let cached_lo = match self.xa_key {
+                    Some((kb, ki, ks, prev_hi)) if kb == op.base && ki == op.index && ks == scale => {
+                        d.checked_sub(prev_hi).filter(|lo| (-256..=255).contains(lo))
+                    }
+                    _ => None,
+                };
+                let lo = if let Some(lo) = cached_lo {
+                    Some(lo)
+                } else if let Some(sum) = d.checked_add(256) {
+                    let hi = sum & !0x1FF;
+                    let lo = d.wrapping_sub(hi);
+                    if (-256..=255).contains(&lo) {
                         self.a.addsub_rr(true, false, false, XA, g(op.base), g(op.index), scale as u32);
                         if hi != 0 {
                             self.a.add_imm(true, XA, XA, hi);
                         }
-                        self.xa_key = Some(key);
+                        self.xa_key = Some((op.base, op.index, scale, hi));
+                        Some(lo)
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some(lo) = lo {
                     if tso {
                         self.a.ldapur_stlur(ld, bits, reg, XA, lo as i32);
                     } else {

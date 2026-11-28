@@ -10170,3 +10170,232 @@ fn inline_exact_tso_for_compile_time_misaligned_abs_accesses() {
         );
     }
 }
+
+/// 512B `XA` base-window caching (direct + indexed + negative + interleaved ALU/LEA/vector ops),
+/// 2-instruction 24-bit `Asm::add_imm`, and `wr` base/index invalidation under both `memchk=15`
+/// and `memchk=0` with `hw_range=1`.
+#[test]
+fn xa_window_512b_caching_and_24bit_add_imm() {
+    struct ResetKnobs;
+    impl Drop for ResetKnobs {
+        fn drop(&mut self) {
+            jit::test_set_knobs(jit::TestKnobs::NONE);
+            aot::test_uninstall();
+        }
+    }
+    let _guard = ResetKnobs;
+
+    // 64-bit `ADD/SUB X16, Xn, #imm{, lsl #12}` (`Rd == 16`, excluding `Rn == XRAS (7)` in `ret`).
+    let is_addsub_imm_xa = |w: u32| (w & 0xBF80_001F) == 0x9100_0010 && ((w >> 5) & 31) != 7;
+    // 64-bit `ADD X16, Xn, Xm{, lsl #s}` (`Rd == 16`).
+    let is_add_rr_xa = |w: u32| (w & 0xFF20_001F) == 0x8B00_0010;
+    // `MOVZ/MOVN/MOVK X17, ...` (`Rd == 17 == XS`).
+    let is_mov_imm_xs = |w: u32| (w & 0x1F80_001F) == 0x1280_0011;
+
+    let code_ptr = arena_alloc(0x1000, 64);
+    let code_va = code_ptr as u64;
+    let stubs: jit::AotStubOffs = [0; 16];
+
+    let translate_hot = |code_bytes: &[u8], memchk: u8| -> Vec<u32> {
+        unsafe {
+            core::ptr::copy_nonoverlapping(code_bytes.as_ptr(), code_ptr, code_bytes.len());
+            core::ptr::write_bytes(code_ptr.add(code_bytes.len()), 0xCC, 16);
+        }
+        jit::test_set_knobs(jit::TestKnobs {
+            memchk: Some(memchk),
+            hw_range: Some(true),
+            lse2_trap: Some(true),
+            ..jit::TestKnobs::NONE
+        });
+        let mut bc = Box::new(BlockCache::new());
+        let mut scratch = Vec::new();
+        let mut tr_scratch = jit::TrScratch::new();
+        let t = unsafe {
+            jit::aot_translate(
+                &mut *bc,
+                code_va,
+                0x2000_0000_1000,
+                0x2000_0000_0000,
+                &stubs,
+                &mut scratch,
+                &mut tr_scratch,
+            )
+        }
+        .expect("aot_translate");
+        t.words[..t.main as usize].to_vec()
+    };
+
+    // 1. Direct 512B window `[rcx + 0x100..0x2F8]` with interleaved ALU/LEA/live-CMP/IMUL/stack-vec.
+    let direct_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.mov(rax, qword_ptr(rcx + 0x200))?;
+        a.add(rax, 7)?;
+        a.lea(r8, ptr(rax + 0x10))?;
+        a.cmp(r8, qword_ptr(rcx + 0x208))?;
+        a.cmove(rax, r8)?;
+        a.add(rax, qword_ptr(rcx + 0x100))?;
+        a.imul_2(r8, qword_ptr(rcx + 0x2F8))?;
+        a.movaps(xmm0, xmmword_ptr(rsp + 0x20))?;
+        a.mov(qword_ptr(rcx + 0x210), r8)?;
+        a.ret()?;
+        a.assemble(code_va)
+    })()
+    .unwrap();
+    let hot = translate_hot(&direct_code, 15);
+    assert_eq!(
+        hot.iter().filter(|&&w| is_addsub_imm_xa(w)).count(),
+        1,
+        "expected 1 XA window add across 5 direct [rcx + 0x100..0x2F8] accesses + interleaved ALU/LEA/vec"
+    );
+
+    // 2. 24-bit displacement `[rcx + 0x12340..0x12358]` uses 2-insn `add_imm` (0 XS mov_imm)
+    //    and reuses `XA` across all 4 accesses (including live `cmp [mem], reg`).
+    let disp24_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.mov(rax, qword_ptr(rcx + 0x12340))?;
+        a.mov(rdx, qword_ptr(rcx + 0x12348))?;
+        a.add(rax, qword_ptr(rcx + 0x12350))?;
+        a.cmp(qword_ptr(rcx + 0x12358), rdx)?;
+        a.setne(r11b)?;
+        a.ret()?;
+        a.assemble(code_va)
+    })()
+    .unwrap();
+    let hot24 = translate_hot(&disp24_code, 15);
+    assert_eq!(
+        hot24.iter().filter(|&&w| is_addsub_imm_xa(w)).count(),
+        2,
+        "expected 2-insn 24-bit add_imm into XA reused across 4 accesses"
+    );
+    assert_eq!(
+        hot24.iter().filter(|&&w| is_mov_imm_xs(w)).count(),
+        0,
+        "24-bit add_imm must not clobber XS via movz/movk"
+    );
+
+    // 3. Indexed `[rcx + rdx*8 + 0x200..0x218]` with interleaved ALU computes XA only once.
+    let indexed_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.mov(rax, qword_ptr(rcx + rdx * 8 + 0x200))?;
+        a.add(rax, 3)?;
+        a.add(rax, qword_ptr(rcx + rdx * 8 + 0x208))?;
+        a.xor(rax, qword_ptr(rcx + rdx * 8 + 0x210))?;
+        a.mov(qword_ptr(rcx + rdx * 8 + 0x218), rax)?;
+        a.ret()?;
+        a.assemble(code_va)
+    })()
+    .unwrap();
+    let hot_idx = translate_hot(&indexed_code, 15);
+    assert_eq!(
+        hot_idx.iter().filter(|&&w| is_add_rr_xa(w)).count(),
+        1,
+        "expected 1 indexed XA base add across 4 [rcx + rdx*8 + 0x200..0x218] accesses"
+    );
+    assert_eq!(
+        hot_idx.iter().filter(|&&w| is_addsub_imm_xa(w)).count(),
+        1,
+        "expected 1 XA window imm add across 4 indexed accesses"
+    );
+
+    // 4. Negative displacements `[rcx - 0x300 .. -0x2E8]` share a single `sub x16, rcx, #0x200`.
+    let neg_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.mov(rax, qword_ptr(rcx - 0x300))?;
+        a.add(rax, qword_ptr(rcx - 0x2F8))?;
+        a.sub(rax, qword_ptr(rcx - 0x2F0))?;
+        a.mov(qword_ptr(rcx - 0x2E8), rax)?;
+        a.ret()?;
+        a.assemble(code_va)
+    })()
+    .unwrap();
+    let hot_neg = translate_hot(&neg_code, 15);
+    assert_eq!(
+        hot_neg.iter().filter(|&&w| is_addsub_imm_xa(w)).count(),
+        1,
+        "expected 1 XA sub across 4 negative [rcx - 0x300..-0x2E8] accesses"
+    );
+
+    // 5. Execution parity + invalidation on base/index writes (add/lea/inc/cmov/mov) under
+    //    both `memchk=15` and `memchk=0` (with `hw_range=1`) + AOT.
+    const BUF_SZ: usize = 0x1_4000;
+    let data_ptr = arena_alloc(BUF_SZ, 64);
+    let mut init = vec![0u8; BUF_SZ];
+    for (i, chunk) in init.chunks_exact_mut(8).enumerate() {
+        let v = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5678);
+        chunk.copy_from_slice(&v.to_le_bytes());
+    }
+    let exec_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        // rcx = base buffer (`BUF_SZ` bytes).
+        a.mov(r9, rcx)?;
+        // Direct 512B window + interleaved ALU + LEA + 24-bit displacement.
+        a.mov(rax, qword_ptr(rcx + 0x200))?;
+        a.add(rax, 0x55)?;
+        a.lea(r8, ptr(rcx + 0x12345))?;
+        a.add(rax, qword_ptr(rcx + 0x208))?;
+        a.xor(rax, qword_ptr(rcx + 0x100))?;
+        a.add(rax, qword_ptr(rcx + 0x2F8))?;
+        a.add(rax, qword_ptr(rcx + 0x12340))?;
+        a.add(rax, qword_ptr(rcx + 0x12348))?;
+        a.mov(qword_ptr(rcx + 0x210), rax)?;
+        // Modify base `rcx` via `add`, then `lea`, then `cmove` — XA MUST invalidate each time!
+        a.add(rcx, 0x100)?;
+        a.add(rax, qword_ptr(rcx + 0x200))?;
+        a.lea(rcx, ptr(rcx + 0x100))?;
+        a.add(rax, qword_ptr(rcx + 0x200))?;
+        a.xor(r10, r10)?; // ZF = 1
+        a.lea(r11, ptr(r9 + 0x600))?;
+        a.cmove(rcx, r11)?;
+        a.add(rax, qword_ptr(rcx + 0x200))?;
+        // Negative displacements off shifted `rcx = r9 + 0x600`.
+        a.add(rax, qword_ptr(rcx - 0x300))?;
+        a.sub(rax, qword_ptr(rcx - 0x2F8))?;
+        a.mov(qword_ptr(rcx - 0x2E8), rax)?;
+        // Indexed accesses + index modification via `inc` / `add` — XA MUST invalidate!
+        a.mov(rdx, 2u64)?;
+        a.add(rax, qword_ptr(r9 + rdx * 8 + 0x200))?;
+        a.add(rax, qword_ptr(r9 + rdx * 8 + 0x208))?;
+        a.inc(rdx)?;
+        a.add(rax, qword_ptr(r9 + rdx * 8 + 0x200))?;
+        a.add(rdx, 3)?;
+        a.add(rax, qword_ptr(r9 + rdx * 8 + 0x208))?;
+        a.mov(qword_ptr(r9 + rdx * 8 + 0x210), rax)?;
+        // Fold `r8 - r9` (verifies 24-bit `lea`) into return value.
+        a.sub(r8, r9)?;
+        a.xor(rax, r8)?;
+        a.ret()?;
+        a.assemble(code_va)
+    })()
+    .unwrap();
+
+    let run_cfg = |mode: u8, memchk: u8, use_aot: bool| -> (u64, Vec<u8>) {
+        unsafe {
+            core::ptr::copy_nonoverlapping(exec_code.as_ptr(), code_ptr, exec_code.len());
+            core::ptr::write_bytes(code_ptr.add(exec_code.len()), 0xCC, 16);
+            jit::test_set_knobs(jit::TestKnobs {
+                memchk: Some(memchk),
+                hw_range: Some(true),
+                lse2_trap: Some(true),
+                ..jit::TestKnobs::NONE
+            });
+            if use_aot {
+                aot::test_uninstall();
+                let (live, _, _) = aot::test_install(&[code_va], || {});
+                assert_eq!(live, 1, "AOT install failed");
+            }
+            let res = run_mode(code_ptr, data_ptr, &init, mode);
+            if use_aot {
+                aot::test_uninstall();
+            }
+            res
+        }
+    };
+
+    let interp = run_cfg(2, 15, false);
+    let jit_15 = run_cfg(1, 15, false);
+    let jit_0 = run_cfg(1, 0, false);
+    let aot_15 = run_cfg(1, 15, true);
+    assert_eq!(jit_15, interp, "Live JIT (memchk=15) != interpreter");
+    assert_eq!(jit_0, interp, "Live JIT (memchk=0, hw_range=1) != interpreter");
+    assert_eq!(aot_15, interp, "AOT (memchk=15) != interpreter");
+}
