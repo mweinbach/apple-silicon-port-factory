@@ -106,9 +106,29 @@ impl Drop for AotGuard {
 }
 
 struct VolMetaGuard(u64);
+impl VolMetaGuard {
+    fn enable(base: u64) -> Self {
+        crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(true)));
+        Self(base)
+    }
+}
 impl Drop for VolMetaGuard {
     fn drop(&mut self) {
+        crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
         aot::test_unregister_volatile_meta(self.0);
+    }
+}
+
+struct WorkerVolMetaGuard;
+impl WorkerVolMetaGuard {
+    fn enable() -> Self {
+        crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(true)));
+        Self
+    }
+}
+impl Drop for WorkerVolMetaGuard {
+    fn drop(&mut self) {
+        crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
     }
 }
 
@@ -446,7 +466,7 @@ fn litmus_sb_mfence_and_xchg_interp_jit_aot() {
 
     // Cover [0x100, 0x300) with empty VolatileAccessTable so plain stores/loads elide TSO
     // while `mfence` and `xchg` MUST still enforce full Store-Buffering ordering!
-    let _vol = VolMetaGuard(base);
+    let _vol = VolMetaGuard::enable(base);
     aot::test_register_volatile_meta(base, code.len() as u64, &[(0x100, 0x300)], &[]);
 
     let shared = SharedPair::new();
@@ -475,6 +495,7 @@ fn litmus_sb_mfence_and_xchg_interp_jit_aot() {
                 let forb_r = &forbidden;
                 let shared_r = &*shared;
                 let t1 = s.spawn(move || {
+                    let _vol_w = WorkerVolMetaGuard::enable();
                     let g = ParticipantGuard::enter(mode, "sb-t1");
                     for _ in 0..iters {
                         sb_r.wait();
@@ -485,6 +506,7 @@ fn litmus_sb_mfence_and_xchg_interp_jit_aot() {
                     g.verify_and_exit();
                 });
                 let t0 = s.spawn(move || {
+                    let _vol_w = WorkerVolMetaGuard::enable();
                     let g = ParticipantGuard::enter(mode, "sb-t0");
                     for _ in 0..iters {
                         shared_r.a[0].store(0, Ordering::SeqCst);
@@ -550,7 +572,7 @@ fn litmus_mp_volatile_metadata_preserves_synchronization() {
     a.ret().unwrap();
     code.put(0x200, &a.assemble(cons_ip).unwrap());
 
-    let _vol = VolMetaGuard(base);
+    let _vol = VolMetaGuard::enable(base);
     aot::test_register_volatile_meta(
         base,
         code.len() as u64,
@@ -588,6 +610,7 @@ fn litmus_mp_volatile_metadata_preserves_synchronization() {
             let stale_r = &stale;
             let shared_r = &*shared;
             let t_cons = s.spawn(move || {
+                let _vol_w = WorkerVolMetaGuard::enable();
                 let g = ParticipantGuard::enter(mode, "mp-volmeta-consumer");
                 for iter in 1..=iters {
                     sb_r.wait();
@@ -600,6 +623,7 @@ fn litmus_mp_volatile_metadata_preserves_synchronization() {
                 g.verify_and_exit();
             });
             let t_prod = s.spawn(move || {
+                let _vol_w = WorkerVolMetaGuard::enable();
                 let g = ParticipantGuard::enter(mode, "mp-volmeta-producer");
                 for iter in 1..=iters {
                     shared_r.a[0].store(0, Ordering::SeqCst);
