@@ -2409,10 +2409,13 @@ fn create_job_object_impl(name: Option<String>) -> HANDLE {
         return handles::insert(JobObj::new(None));
     };
     {
-        let other = crate::thread::defer_lock(handles::named_objects());
-        if other.contains_key(&n) {
-            set_err(err::ERROR_INVALID_HANDLE);
-            return std::ptr::null_mut();
+        let mut other = crate::thread::defer_lock(handles::named_objects());
+        if let Some(o) = other.get(&n) {
+            if o.has_open_handles() {
+                set_err(err::ERROR_INVALID_HANDLE);
+                return std::ptr::null_mut();
+            }
+            other.remove(&n);
         }
     }
     let mut jobs = crate::thread::defer_lock(named_jobs());

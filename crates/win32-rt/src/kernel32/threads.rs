@@ -859,63 +859,74 @@ pub unsafe extern "win64" fn SwitchToFiber(fiber: *mut c_void) {
 // Events, mutexes, semaphores, waitable timers
 // ---------------------------------------------------------------------------
 
-fn named_create<T: KObject>(name: Option<String>, make: impl FnOnce() -> Arc<T>) -> HANDLE {
-    let Some(n) = name else {
-        return handles::insert(make());
+fn named_create<T: KObject>(name: Option<String>, make: impl FnOnce(Option<String>) -> Arc<T>) -> HANDLE {
+    // On Windows, a non-NULL pointer to an empty string (`""` / `L""`) creates an
+    // unnamed kernel object (identical to passing NULL) rather than sharing a
+    // single global `""` entry across callers.
+    let Some(n) = name.filter(|s| !s.is_empty()) else {
+        set_err(0);
+        return handles::insert(make(None));
     };
     let mut names = thread::defer_lock(handles::named_objects());
     if let Some(existing) = names.get(&n) {
-        if existing.as_any().is::<T>() {
-            let h = handles::insert(existing.clone());
+        if existing.has_open_handles() {
+            if existing.as_any().is::<T>() {
+                let h = handles::insert(existing.clone());
+                drop(names);
+                set_err(err::ERROR_ALREADY_EXISTS);
+                return h;
+            }
             drop(names);
-            set_err(err::ERROR_ALREADY_EXISTS);
-            return h;
+            set_err(err::ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
         }
-        drop(names);
-        set_err(err::ERROR_INVALID_HANDLE);
-        return std::ptr::null_mut();
+        names.remove(&n);
     }
-    let o = make();
-    names.insert(n, o.clone());
+    let o = make(Some(n.clone()));
+    let h = handles::insert(o.clone());
+    names.insert(n, o);
     drop(names);
     set_err(0);
-    handles::insert(o)
+    h
 }
 
 fn named_open<T: KObject>(name: Option<String>) -> HANDLE {
-    let Some(n) = name else {
+    let Some(n) = name.filter(|s| !s.is_empty()) else {
         set_err(err::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     };
-    let names = thread::defer_lock(handles::named_objects());
-    match names.get(&n) {
-        Some(o) if o.as_any().is::<T>() => handles::insert(o.clone()),
-        _ => {
-            set_err(err::ERROR_FILE_NOT_FOUND);
-            std::ptr::null_mut()
+    let mut names = thread::defer_lock(handles::named_objects());
+    if let Some(o) = names.get(&n) {
+        if o.has_open_handles() {
+            if o.as_any().is::<T>() {
+                return handles::insert(o.clone());
+            }
+            drop(names);
+            set_err(err::ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
         }
+        names.remove(&n);
     }
+    drop(names);
+    set_err(err::ERROR_FILE_NOT_FOUND);
+    std::ptr::null_mut()
 }
 
 pub unsafe extern "win64" fn CreateEventW(_s: *mut c_void, manual: BOOL, initial: BOOL, name: LPCWSTR) -> HANDLE {
-    let n = from_wide_opt(name);
-    named_create(n.clone(), || Arc::new(Event::new(manual != 0, initial != 0, n)))
+    named_create(from_wide_opt(name), |n| Arc::new(Event::new(manual != 0, initial != 0, n)))
 }
 pub unsafe extern "win64" fn CreateEventA(_s: *mut c_void, manual: BOOL, initial: BOOL, name: LPCSTR) -> HANDLE {
-    let n = from_ansi_opt(name);
-    named_create(n.clone(), || Arc::new(Event::new(manual != 0, initial != 0, n)))
+    named_create(from_ansi_opt(name), |n| Arc::new(Event::new(manual != 0, initial != 0, n)))
 }
 const CREATE_EVENT_MANUAL_RESET: u32 = 1;
 const CREATE_EVENT_INITIAL_SET: u32 = 2;
 pub unsafe extern "win64" fn CreateEventExW(_s: *mut c_void, name: LPCWSTR, flags: u32, _access: u32) -> HANDLE {
-    let n = from_wide_opt(name);
-    named_create(n.clone(), || {
+    named_create(from_wide_opt(name), |n| {
         Arc::new(Event::new(flags & CREATE_EVENT_MANUAL_RESET != 0, flags & CREATE_EVENT_INITIAL_SET != 0, n))
     })
 }
 pub unsafe extern "win64" fn CreateEventExA(_s: *mut c_void, name: LPCSTR, flags: u32, _access: u32) -> HANDLE {
-    let n = from_ansi_opt(name);
-    named_create(n.clone(), || {
+    named_create(from_ansi_opt(name), |n| {
         Arc::new(Event::new(flags & CREATE_EVENT_MANUAL_RESET != 0, flags & CREATE_EVENT_INITIAL_SET != 0, n))
     })
 }
@@ -948,20 +959,17 @@ pub unsafe extern "win64" fn PulseEvent(h: HANDLE) -> BOOL {
 
 fn new_mutex(owned: bool, name: Option<String>) -> Arc<MutexObj> {
     let tid = teb::thread_id();
-    Arc::new(MutexObj { state: handles::Guarded::new(if owned { (tid, 1, false) } else { (0, 0, false) }), name })
+    Arc::new(if owned { MutexObj::new(tid, 1, name) } else { MutexObj::new(0, 0, name) })
 }
 
 pub unsafe extern "win64" fn CreateMutexW(_s: *mut c_void, owned: BOOL, name: LPCWSTR) -> HANDLE {
-    let n = from_wide_opt(name);
-    named_create(n.clone(), || new_mutex(owned != 0, n))
+    named_create(from_wide_opt(name), |n| new_mutex(owned != 0, n))
 }
 pub unsafe extern "win64" fn CreateMutexA(_s: *mut c_void, owned: BOOL, name: LPCSTR) -> HANDLE {
-    let n = from_ansi_opt(name);
-    named_create(n.clone(), || new_mutex(owned != 0, n))
+    named_create(from_ansi_opt(name), |n| new_mutex(owned != 0, n))
 }
 pub unsafe extern "win64" fn CreateMutexExW(_s: *mut c_void, name: LPCWSTR, flags: u32, _a: u32) -> HANDLE {
-    let n = from_wide_opt(name);
-    named_create(n.clone(), || new_mutex(flags & 1 != 0, n))
+    named_create(from_wide_opt(name), |n| new_mutex(flags & 1 != 0, n))
 }
 pub unsafe extern "win64" fn OpenMutexW(_a: u32, _i: BOOL, name: LPCWSTR) -> HANDLE {
     named_open::<MutexObj>(from_wide_opt(name))
@@ -989,8 +997,7 @@ pub unsafe extern "win64" fn CreateSemaphoreW(_s: *mut c_void, initial: i32, max
         set_err(err::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
-    let n = from_wide_opt(name);
-    named_create(n.clone(), || new_sem(initial, max, n))
+    named_create(from_wide_opt(name), |n| new_sem(initial, max, n))
 }
 pub unsafe extern "win64" fn CreateSemaphoreA(s: *mut c_void, initial: i32, max: i32, name: LPCSTR) -> HANDLE {
     let w = from_ansi_opt(name).map(|n| to_wide_z(&n));
@@ -1024,13 +1031,15 @@ pub unsafe extern "win64" fn ReleaseSemaphore(h: HANDLE, n: i32, prev: *mut i32)
 const CREATE_WAITABLE_TIMER_MANUAL_RESET: u32 = 1;
 
 pub unsafe extern "win64" fn CreateWaitableTimerExW(_s: *mut c_void, name: LPCWSTR, flags: u32, _access: u32) -> HANDLE {
-    let n = from_wide_opt(name);
-    named_create(n.clone(), || Arc::new(handles::WaitableTimer::new(flags & CREATE_WAITABLE_TIMER_MANUAL_RESET != 0, n)))
+    named_create(from_wide_opt(name), |n| {
+        Arc::new(handles::WaitableTimer::new(flags & CREATE_WAITABLE_TIMER_MANUAL_RESET != 0, n))
+    })
 }
 
 pub unsafe extern "win64" fn CreateWaitableTimerExA(_s: *mut c_void, name: LPCSTR, flags: u32, _access: u32) -> HANDLE {
-    let n = from_ansi_opt(name);
-    named_create(n.clone(), || Arc::new(handles::WaitableTimer::new(flags & CREATE_WAITABLE_TIMER_MANUAL_RESET != 0, n)))
+    named_create(from_ansi_opt(name), |n| {
+        Arc::new(handles::WaitableTimer::new(flags & CREATE_WAITABLE_TIMER_MANUAL_RESET != 0, n))
+    })
 }
 
 pub unsafe extern "win64" fn CreateWaitableTimerW(s: *mut c_void, manual: BOOL, name: LPCWSTR) -> HANDLE {
@@ -1391,8 +1400,22 @@ pub unsafe extern "win64" fn WaitForMultipleObjectsEx(n: u32, hs: *const HANDLE,
     }
     match resolve_waitables(&handles_buf[..count]) {
         Ok(objs) => {
+            let slice = objs.as_slice();
+            if all != 0 {
+                // Windows rejects duplicate handles to the same kernel object when
+                // `bWaitAll` is TRUE (`ERROR_INVALID_PARAMETER`), preventing livelock
+                // on auto-reset events and semaphores.
+                for i in 0..slice.len() {
+                    for j in (i + 1)..slice.len() {
+                        if Arc::ptr_eq(&slice[i], &slice[j]) {
+                            set_err(err::ERROR_INVALID_PARAMETER);
+                            return WAIT_FAILED;
+                        }
+                    }
+                }
+            }
             let t0 = if ms != 0 { crate::hitch::span_begin() } else { 0 };
-            let r = wait_result_code(handles::wait_for(objs.as_slice(), all != 0, ms, alertable != 0));
+            let r = wait_result_code(handles::wait_for(slice, all != 0, ms, alertable != 0));
             crate::hitch::span_end(t0, crate::hitch::SPAN_OBJ_WAIT);
             thread::sched::flush_pending_qos();
             r
@@ -2223,6 +2246,239 @@ mod tests {
             assert_eq!(WaitForMultipleObjectsEx(2, unaligned, FALSE, 0, FALSE), WAIT_OBJECT_0 + 1);
             assert_eq!(CloseHandle(e0), TRUE);
             assert_eq!(CloseHandle(e1), TRUE);
+        }
+    }
+
+    #[test]
+    fn empty_name_sync_objects_are_distinct_unnamed_objects() {
+        unsafe {
+            let empty_w: [u16; 1] = [0];
+            let empty_a: [u8; 1] = [0];
+
+            // Pre-poison LastError to verify unnamed creation clears it to 0.
+            set_err(err::ERROR_ALREADY_EXISTS);
+            let e1 = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, empty_w.as_ptr());
+            assert!(!e1.is_null());
+            assert_eq!(teb::last_error(), 0);
+
+            let e2 = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, empty_w.as_ptr());
+            assert!(!e2.is_null());
+            assert_eq!(teb::last_error(), 0);
+            let e3 = CreateEventA(std::ptr::null_mut(), TRUE, FALSE, empty_a.as_ptr());
+            assert!(!e3.is_null());
+            assert_eq!(teb::last_error(), 0);
+            let e4 = CreateEventExW(std::ptr::null_mut(), empty_w.as_ptr(), CREATE_EVENT_MANUAL_RESET, 0);
+            assert!(!e4.is_null());
+            assert_eq!(teb::last_error(), 0);
+            let e5 = CreateEventExA(std::ptr::null_mut(), empty_a.as_ptr(), CREATE_EVENT_MANUAL_RESET, 0);
+            assert!(!e5.is_null());
+            assert_eq!(teb::last_error(), 0);
+
+            // Every empty-name event must be an independent unnamed Event object.
+            let o1 = handles::get(e1).unwrap();
+            let o2 = handles::get(e2).unwrap();
+            let o3 = handles::get(e3).unwrap();
+            let o4 = handles::get(e4).unwrap();
+            let o5 = handles::get(e5).unwrap();
+            let evs = [&o1, &o2, &o3, &o4, &o5];
+            for i in 0..evs.len() {
+                for j in (i + 1)..evs.len() {
+                    assert!(!Arc::ptr_eq(evs[i], evs[j]), "empty-name events {i} and {j} aliased!");
+                }
+            }
+
+            // Signaling e1 and resetting e2 must be completely independent.
+            assert_eq!(SetEvent(e1), TRUE);
+            assert_eq!(ResetEvent(e2), TRUE);
+            assert_eq!(WaitForSingleObject(e1, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(e2, 0), WAIT_TIMEOUT);
+
+            // Creating other sync object types with L"" / "" must succeed (no collision on "").
+            let m1 = CreateMutexW(std::ptr::null_mut(), FALSE, empty_w.as_ptr());
+            let m2 = CreateMutexA(std::ptr::null_mut(), FALSE, empty_a.as_ptr());
+            let m3 = CreateMutexExW(std::ptr::null_mut(), empty_w.as_ptr(), 0, 0);
+            assert!(!m1.is_null() && !m2.is_null() && !m3.is_null());
+            assert!(!Arc::ptr_eq(&handles::get(m1).unwrap(), &handles::get(m2).unwrap()));
+            assert!(!Arc::ptr_eq(&handles::get(m1).unwrap(), &handles::get(m3).unwrap()));
+
+            let s1 = CreateSemaphoreW(std::ptr::null_mut(), 0, 4, empty_w.as_ptr());
+            let s2 = CreateSemaphoreA(std::ptr::null_mut(), 0, 4, empty_a.as_ptr());
+            let s3 = CreateSemaphoreExW(std::ptr::null_mut(), 0, 4, empty_w.as_ptr(), 0, 0);
+            assert!(!s1.is_null() && !s2.is_null() && !s3.is_null());
+            assert!(!Arc::ptr_eq(&handles::get(s1).unwrap(), &handles::get(s2).unwrap()));
+            assert!(!Arc::ptr_eq(&handles::get(s1).unwrap(), &handles::get(s3).unwrap()));
+
+            let t1 = CreateWaitableTimerW(std::ptr::null_mut(), TRUE, empty_w.as_ptr());
+            let t2 = CreateWaitableTimerA(std::ptr::null_mut(), TRUE, empty_a.as_ptr());
+            let t3 = CreateWaitableTimerExW(std::ptr::null_mut(), empty_w.as_ptr(), CREATE_WAITABLE_TIMER_MANUAL_RESET, 0);
+            let t4 = CreateWaitableTimerExA(std::ptr::null_mut(), empty_a.as_ptr(), CREATE_WAITABLE_TIMER_MANUAL_RESET, 0);
+            assert!(!t1.is_null() && !t2.is_null() && !t3.is_null() && !t4.is_null());
+            assert!(!Arc::ptr_eq(&handles::get(t1).unwrap(), &handles::get(t2).unwrap()));
+            assert!(!Arc::ptr_eq(&handles::get(t1).unwrap(), &handles::get(t3).unwrap()));
+            assert!(!Arc::ptr_eq(&handles::get(t1).unwrap(), &handles::get(t4).unwrap()));
+
+            // Open* with L"" or "" must fail with ERROR_INVALID_PARAMETER.
+            assert!(OpenEventW(0, FALSE, empty_w.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert!(OpenEventA(0, FALSE, empty_a.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert!(OpenMutexW(0, FALSE, empty_w.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert!(OpenSemaphoreW(0, FALSE, empty_w.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert!(OpenWaitableTimerW(0, FALSE, empty_w.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            for h in [e1, e2, e3, e4, e5, m1, m2, m3, s1, s2, s3, t1, t2, t3, t4] {
+                assert_eq!(CloseHandle(h), TRUE);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_name_event_multithreaded_job_wait_stress() {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+
+        // Multi-threaded regression stress reproducing job-completion waits when a
+        // wrapper passes L"" to CreateEventW: concurrent background threads resetting
+        // their own L"" events must never clear a completed job's event signal.
+        let empty_w: [u16; 1] = [0];
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut noise_threads = Vec::new();
+        for _ in 0..4 {
+            let stop_c = Arc::clone(&stop);
+            noise_threads.push(std::thread::spawn(move || unsafe {
+                let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, empty_w.as_ptr());
+                assert!(!ev.is_null());
+                while !stop_c.load(Ordering::Relaxed) {
+                    ResetEvent(ev);
+                    std::hint::spin_loop();
+                    SetEvent(ev);
+                    ResetEvent(ev);
+                }
+                CloseHandle(ev);
+            }));
+        }
+
+        const JOBS: usize = 16;
+        const ROUNDS: usize = 250;
+        let job_events: Vec<usize> = (0..JOBS)
+            .map(|_| unsafe {
+                let h = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, empty_w.as_ptr());
+                assert!(!h.is_null());
+                h as usize
+            })
+            .collect();
+
+        for round in 0..ROUNDS {
+            let ev_u = job_events[round % JOBS];
+            let active = Arc::new(AtomicU32::new(0));
+            unsafe {
+                assert_eq!(ResetEvent(ev_u as HANDLE), TRUE);
+            }
+            active.fetch_add(1, Ordering::SeqCst);
+            let act_w = Arc::clone(&active);
+            let worker = std::thread::spawn(move || unsafe {
+                if act_w.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    assert_eq!(SetEvent(ev_u as HANDLE), TRUE);
+                }
+            });
+            while active.load(Ordering::Acquire) > 0 {
+                let r = unsafe { WaitForSingleObject(ev_u as HANDLE, 5_000) };
+                assert_eq!(r, WAIT_OBJECT_0, "lost job-completion wakeup at round {round}");
+            }
+            worker.join().unwrap();
+        }
+
+        stop.store(true, Ordering::Release);
+        for t in noise_threads {
+            t.join().unwrap();
+        }
+        for ev_u in job_events {
+            unsafe {
+                assert_eq!(CloseHandle(ev_u as HANDLE), TRUE);
+            }
+        }
+    }
+
+    #[test]
+    fn named_sync_objects_release_name_when_last_handle_closes() {
+        unsafe {
+            let name = to_wide_z("Local\\PortFactory_NamedSyncLifecycleTest");
+
+            // Create signaled manual-reset event, open a second handle, verify sharing & collision.
+            let h1 = CreateEventW(std::ptr::null_mut(), TRUE, TRUE, name.as_ptr());
+            assert!(!h1.is_null());
+            assert_eq!(teb::last_error(), 0);
+            let h2 = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, name.as_ptr());
+            assert!(!h2.is_null());
+            assert_eq!(teb::last_error(), err::ERROR_ALREADY_EXISTS);
+            assert!(Arc::ptr_eq(&handles::get(h1).unwrap(), &handles::get(h2).unwrap()));
+            assert_eq!(WaitForSingleObject(h2, 0), WAIT_OBJECT_0);
+
+            let h3 = OpenEventW(0, FALSE, name.as_ptr());
+            assert!(!h3.is_null());
+            assert!(Arc::ptr_eq(&handles::get(h1).unwrap(), &handles::get(h3).unwrap()));
+
+            // Cross-type Create/Open with the same live name fails with ERROR_INVALID_HANDLE.
+            assert!(CreateMutexW(std::ptr::null_mut(), FALSE, name.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+            assert!(OpenMutexW(0, FALSE, name.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            // Closing 2 of 3 handles keeps the named object alive.
+            assert_eq!(CloseHandle(h1), TRUE);
+            assert_eq!(CloseHandle(h2), TRUE);
+            let h4 = OpenEventW(0, FALSE, name.as_ptr());
+            assert!(!h4.is_null());
+            assert_eq!(CloseHandle(h3), TRUE);
+            assert_eq!(CloseHandle(h4), TRUE);
+
+            // Once all handles are closed, OpenEventW fails with ERROR_FILE_NOT_FOUND,
+            // and recreating with the same name creates a fresh unsignaled object.
+            assert!(OpenEventW(0, FALSE, name.as_ptr()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+
+            let h_fresh = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, name.as_ptr());
+            assert!(!h_fresh.is_null());
+            assert_eq!(teb::last_error(), 0);
+            assert_eq!(WaitForSingleObject(h_fresh, 0), WAIT_TIMEOUT);
+            assert_eq!(CloseHandle(h_fresh), TRUE);
+
+            // Name can now be reused for a different kernel object type (Mutex).
+            let m = CreateMutexW(std::ptr::null_mut(), FALSE, name.as_ptr());
+            assert!(!m.is_null());
+            assert_eq!(teb::last_error(), 0);
+            assert_eq!(CloseHandle(m), TRUE);
+        }
+    }
+
+    #[test]
+    fn wait_for_multiple_wait_all_rejects_duplicate_handles() {
+        unsafe {
+            let ev = CreateEventW(std::ptr::null_mut(), FALSE, TRUE, std::ptr::null());
+            assert!(!ev.is_null());
+            let mut dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(
+                DuplicateHandle(handles::CURRENT_PROCESS, ev, handles::CURRENT_PROCESS, &mut dup, 0, FALSE, 0),
+                TRUE
+            );
+            assert!(!dup.is_null());
+
+            // Identical handle repeated with bWaitAll = TRUE -> WAIT_FAILED + ERROR_INVALID_PARAMETER.
+            let same = [ev, ev];
+            assert_eq!(WaitForMultipleObjects(2, same.as_ptr(), TRUE, 50), WAIT_FAILED);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Two distinct handles to the same kernel object with bWaitAll = TRUE -> WAIT_FAILED.
+            let aliased = [ev, dup];
+            assert_eq!(WaitForMultipleObjects(2, aliased.as_ptr(), TRUE, 50), WAIT_FAILED);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Signal must remain untouched.
+            assert_eq!(WaitForSingleObject(ev, 0), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(dup), TRUE);
+            assert_eq!(CloseHandle(ev), TRUE);
         }
     }
 }

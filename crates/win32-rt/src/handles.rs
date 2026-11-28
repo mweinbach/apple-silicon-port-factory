@@ -39,6 +39,12 @@ pub trait KObject: Any + Send + Sync {
     fn on_handle_open(&self) {}
     /// Called after a handle table entry referencing this object is closed (outside the handle table lock).
     fn on_handle_close(&self) {}
+    /// True while at least one handle table entry references this object.
+    /// Named kernel objects override this so the namespace drops closed objects
+    /// cleanly even if a thread's `HCACHE` still holds a transient `Arc` clone.
+    fn has_open_handles(&self) -> bool {
+        true
+    }
 }
 
 /// State is only accessed while holding [`WAIT_LOCK`] (passed as `&WaitGuard`),
@@ -1636,6 +1642,7 @@ pub struct Event {
     /// Active multi-object or alertable waiters registered in `BUCKETS`/`ANY_WAITERS`.
     complex_waiters: AtomicU32,
     queue: LocalWaitQueue,
+    open_handles: AtomicUsize,
     pub name: Option<String>,
 }
 
@@ -1650,6 +1657,7 @@ impl Event {
             pulse_word: AtomicU64::new(0),
             complex_waiters: AtomicU32::new(0),
             queue: LocalWaitQueue::new(),
+            open_handles: AtomicUsize::new(0),
             name,
         }
     }
@@ -1862,7 +1870,7 @@ impl Event {
     /// Redundant `SetEvent` calls on an already-signaled event return immediately
     /// without redundant `__ulock_wake` syscalls or queue locks.
     pub fn set_returning_prev(&self) -> bool {
-        if self.signaled.swap(true, Ordering::AcqRel) {
+        if self.signaled.swap(true, Ordering::SeqCst) {
             park::record_coalesced_wake_stat();
             return true;
         }
@@ -1892,12 +1900,15 @@ impl Event {
     }
 
     pub fn reset(&self) {
-        self.signaled.store(false, Ordering::Release);
+        // Use a SeqCst RMW rather than a Release store so ARM64 FEAT_RCPC (`stlr` + `ldapr`)
+        // cannot hoist a subsequent guest flag check ahead of `ResetEvent` in the classic
+        // `ResetEvent(ev); if (!flag) WaitForSingleObject(ev)` pattern.
+        let _ = self.signaled.swap(false, Ordering::SeqCst);
     }
 
     /// Reset the event and return whether it was previously signaled (`NtResetEvent`).
     pub fn reset_returning_prev(&self) -> bool {
-        self.signaled.swap(false, Ordering::AcqRel)
+        self.signaled.swap(false, Ordering::SeqCst)
     }
 
     fn bump_pulse_word(&self) {
@@ -1986,6 +1997,21 @@ impl KObject for Event {
     fn waitable(&self) -> Option<&dyn Waitable> {
         Some(self)
     }
+    fn on_handle_open(&self) {
+        if self.name.is_some() {
+            self.open_handles.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fn on_handle_close(&self) {
+        if let Some(ref name) = self.name {
+            if self.open_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+                unregister_named_object(name, self as *const Self as *const (), &self.open_handles);
+            }
+        }
+    }
+    fn has_open_handles(&self) -> bool {
+        self.name.is_none() || self.open_handles.load(Ordering::Acquire) > 0
+    }
 }
 
 impl Waitable for Event {
@@ -2004,7 +2030,18 @@ impl Waitable for Event {
 pub struct MutexObj {
     /// (owner tid, recursion count, abandoned)
     pub state: Guarded<(u32, u32, bool)>,
+    open_handles: AtomicUsize,
     pub name: Option<String>,
+}
+
+impl MutexObj {
+    pub fn new(owner_tid: u32, recursion: u32, name: Option<String>) -> Self {
+        MutexObj {
+            state: Guarded::new((owner_tid, recursion, false)),
+            open_handles: AtomicUsize::new(0),
+            name,
+        }
+    }
 }
 
 impl KObject for MutexObj {
@@ -2016,6 +2053,21 @@ impl KObject for MutexObj {
     }
     fn waitable(&self) -> Option<&dyn Waitable> {
         Some(self)
+    }
+    fn on_handle_open(&self) {
+        if self.name.is_some() {
+            self.open_handles.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fn on_handle_close(&self) {
+        if let Some(ref name) = self.name {
+            if self.open_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+                unregister_named_object(name, self as *const Self as *const (), &self.open_handles);
+            }
+        }
+    }
+    fn has_open_handles(&self) -> bool {
+        self.name.is_none() || self.open_handles.load(Ordering::Acquire) > 0
     }
 }
 
@@ -2068,6 +2120,7 @@ pub struct Semaphore {
     /// Active multi-object or alertable waiters registered in `BUCKETS`/`ANY_WAITERS`.
     complex_waiters: AtomicU32,
     queue: LocalWaitQueue,
+    open_handles: AtomicUsize,
     pub max: i32,
     pub name: Option<String>,
 }
@@ -2081,6 +2134,21 @@ impl KObject for Semaphore {
     }
     fn waitable(&self) -> Option<&dyn Waitable> {
         Some(self)
+    }
+    fn on_handle_open(&self) {
+        if self.name.is_some() {
+            self.open_handles.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fn on_handle_close(&self) {
+        if let Some(ref name) = self.name {
+            if self.open_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+                unregister_named_object(name, self as *const Self as *const (), &self.open_handles);
+            }
+        }
+    }
+    fn has_open_handles(&self) -> bool {
+        self.name.is_none() || self.open_handles.load(Ordering::Acquire) > 0
     }
 }
 
@@ -2106,6 +2174,7 @@ impl Semaphore {
             in_flight: AtomicU32::new(0),
             complex_waiters: AtomicU32::new(0),
             queue: LocalWaitQueue::new(),
+            open_handles: AtomicUsize::new(0),
             max,
             name,
         }
@@ -2394,6 +2463,7 @@ pub struct WaitableTimer {
     pub manual_reset: bool,
     pub signaled: Guarded<bool>,
     pub generation: Guarded<u64>,
+    open_handles: AtomicUsize,
     pub name: Option<String>,
 }
 
@@ -2403,6 +2473,7 @@ impl WaitableTimer {
             manual_reset,
             signaled: Guarded::new(false),
             generation: Guarded::new(0),
+            open_handles: AtomicUsize::new(0),
             name,
         }
     }
@@ -2455,6 +2526,21 @@ impl KObject for WaitableTimer {
     fn waitable(&self) -> Option<&dyn Waitable> {
         Some(self)
     }
+    fn on_handle_open(&self) {
+        if self.name.is_some() {
+            self.open_handles.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fn on_handle_close(&self) {
+        if let Some(ref name) = self.name {
+            if self.open_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+                unregister_named_object(name, self as *const Self as *const (), &self.open_handles);
+            }
+        }
+    }
+    fn has_open_handles(&self) -> bool {
+        self.name.is_none() || self.open_handles.load(Ordering::Acquire) > 0
+    }
 }
 
 impl Waitable for WaitableTimer {
@@ -2473,6 +2559,21 @@ impl Waitable for WaitableTimer {
 pub fn named_objects() -> &'static Mutex<HashMap<String, Arc<dyn KObject>>> {
     static N: OnceLock<Mutex<HashMap<String, Arc<dyn KObject>>>> = OnceLock::new();
     N.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remove `name` from `named_objects()` when the last open handle to the object at
+/// `obj_ptr` closes (matching Windows temporary kernel object lifetime).
+pub(crate) fn unregister_named_object(name: &str, obj_ptr: *const (), open_handles: &AtomicUsize) {
+    let mut names = crate::thread::defer_lock(named_objects());
+    if open_handles.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    if names
+        .get(name)
+        .is_some_and(|e| std::ptr::eq(Arc::as_ptr(e) as *const (), obj_ptr))
+    {
+        names.remove(name);
+    }
 }
 
 /// A placeholder object for handles of things we only track (e.g. tokens).
@@ -2690,7 +2791,7 @@ mod tests {
             let obj: Arc<dyn KObject> = match i % 4 {
                 0 => Arc::new(Semaphore::new(1, 4, None)),
                 1 => Arc::new(Event::new(true, false, None)),
-                2 => Arc::new(MutexObj { state: Guarded::new((0, 0, false)), name: None }),
+                2 => Arc::new(MutexObj::new(0, 0, None)),
                 _ => Arc::new(WaitableTimer::new(false, None)),
             };
             let h = insert(obj.clone());
@@ -2715,7 +2816,7 @@ mod tests {
                             0 => Arc::new(WaitableTimer::new(true, None)),
                             1 => Arc::new(Semaphore::new(0, 8, None)),
                             2 => Arc::new(Event::new(false, false, None)),
-                            _ => Arc::new(MutexObj { state: Guarded::new((0, 0, false)), name: None }),
+                            _ => Arc::new(MutexObj::new(0, 0, None)),
                         };
                         let h = insert(obj.clone());
                         local.push((h as usize, obj));
@@ -3363,5 +3464,55 @@ mod tests {
         assert!(close(h_sem));
         assert!(close(h_auto));
         assert!(close(h_man));
+    }
+
+    #[test]
+    fn manual_reset_event_reset_flag_dekker_litmus_stress() {
+        use std::sync::Barrier;
+
+        // Dekker litmus stress for the classic Windows manual-reset event pattern:
+        //   Waiter:   ResetEvent(ev); if !flag { WaitForSingleObject(ev, INFINITE); }
+        //   Signaler: flag = true; SetEvent(ev);
+        // Requires a StoreLoad barrier on `Event::reset()` so ARM64 FEAT_RCPC
+        // (`stlr` + `ldapr`) cannot hoist the flag read ahead of `ResetEvent`.
+        let ev = Arc::new(Event::new(true, false, None));
+        let h = insert(ev.clone());
+        let flag = Arc::new(AtomicBool::new(false));
+        const ROUNDS: usize = 3_000;
+        let round_start = Arc::new(Barrier::new(2));
+        let round_end = Arc::new(Barrier::new(2));
+
+        let hv = h as usize;
+        let flag_s = Arc::clone(&flag);
+        let rs = Arc::clone(&round_start);
+        let re = Arc::clone(&round_end);
+        let signaler = std::thread::spawn(move || {
+            for r in 0..ROUNDS {
+                rs.wait();
+                if (r & 3) == 0 {
+                    std::hint::spin_loop();
+                }
+                flag_s.store(true, Ordering::Release);
+                with_event(hv as HANDLE, |e| e.set()).unwrap();
+                re.wait();
+            }
+        });
+
+        for r in 0..ROUNDS {
+            flag.store(false, Ordering::Release);
+            with_event(h, |e| e.set()).unwrap();
+            round_start.wait();
+            with_event(h, |e| e.reset()).unwrap();
+            if !flag.load(Ordering::Acquire) {
+                let res = wait_single_handle(h, Some(Duration::from_secs(5)), false);
+                assert!(
+                    matches!(res, WaitResult::Object(0)),
+                    "lost wakeup in ResetEvent + flag-check Dekker litmus at round {r}"
+                );
+            }
+            round_end.wait();
+        }
+        signaler.join().unwrap();
+        assert!(close(h));
     }
 }
