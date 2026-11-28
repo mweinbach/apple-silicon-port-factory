@@ -1169,23 +1169,43 @@ pub struct IndexBufferView {
     pub format: u32,
 }
 
+/// Returns `true` if a vertex buffer binding at `slot` is beyond the supported
+/// `MAX_VERTEX_SLOTS` range and carries a non-null view (`va != 0 || size != 0`).
+/// Null/empty clears (`va == 0 && size == 0`) on out-of-range slots (e.g.
+/// `IASetVertexBuffers(0, 32, NULL)`) are harmless no-ops and do not warn.
+#[inline]
+fn is_unsupported_nonnull_vb_slot(slot: u32, max_slots: usize, view: (u64, u32, u32)) -> bool {
+    slot as usize >= max_slots && (view.0 != 0 || view.1 != 0)
+}
+
 unsafe extern "win64" fn ia_set_vertex_buffers(this: PL, start: u32, n: u32, views: *const VertexBufferView) {
     tr!(Call::IASetVertexBuffers { list: this as u64, start_slot: start, views: tr::raw_n(views, n as usize) });
     const MAX: usize = d3d12_metal::metal::pipeline::MAX_VERTEX_SLOTS as usize;
     let mut vs = [(0u64, 0u32, 0u32); MAX];
     let mut m = 0usize;
     for i in 0..n {
-        let slot = start + i;
-        if slot as usize >= MAX {
-            log::warn!(target: "d3d", "IASetVertexBuffers: slot {slot} is beyond the {MAX} supported slots");
-            continue;
-        }
-        vs[m] = if views.is_null() {
+        let Some(slot) = start.checked_add(i) else {
+            break;
+        };
+        let view = if views.is_null() {
             (0, 0, 0)
         } else {
             let v = std::ptr::read_unaligned(views.add(i as usize));
             (v.va, v.size, v.stride)
         };
+        if slot as usize >= MAX {
+            if is_unsupported_nonnull_vb_slot(slot, MAX, view) {
+                log::warn!(
+                    target: "d3d",
+                    "IASetVertexBuffers: non-null vertex buffer bound to slot {slot} beyond the {MAX} supported slots (va={:#x}, size={}, stride={})",
+                    view.0,
+                    view.1,
+                    view.2
+                );
+            }
+            continue;
+        }
+        vs[m] = view;
         m += 1;
     }
     let first = start as usize;
@@ -1634,6 +1654,24 @@ pub(crate) fn plain_fns() -> &'static [usize] {
         ]
         .into_boxed_slice()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ia_set_vertex_buffers_ignores_null_clears_past_max_slots_but_flags_nonnull() {
+        const MAX: usize = d3d12_metal::metal::pipeline::MAX_VERTEX_SLOTS as usize;
+        assert!(!is_unsupported_nonnull_vb_slot(0, MAX, (0x1000, 64, 16)));
+        assert!(!is_unsupported_nonnull_vb_slot((MAX - 1) as u32, MAX, (0x1000, 64, 16)));
+        // Null/empty clears past MAX_VERTEX_SLOTS (e.g. IASetVertexBuffers(0, 32, NULL)) are no-ops.
+        assert!(!is_unsupported_nonnull_vb_slot(MAX as u32, MAX, (0, 0, 0)));
+        assert!(!is_unsupported_nonnull_vb_slot(31, MAX, (0, 0, 16)));
+        // Non-null vertex buffers past MAX_VERTEX_SLOTS must still warn honestly.
+        assert!(is_unsupported_nonnull_vb_slot(MAX as u32, MAX, (0x1000, 64, 16)));
+        assert!(is_unsupported_nonnull_vb_slot(31, MAX, (0, 64, 16)));
+    }
 }
 
 
