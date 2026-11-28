@@ -2,6 +2,8 @@
 //! revalidation & revival, cache loading, and loader activation entry points.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
@@ -10,12 +12,16 @@ use super::builder::{build_all, split_and_rebase_block};
 #[cfg(test)]
 use super::builder::build_image;
 use super::format::{
-    decode, image_hash, module_key_hashed, read_cache_file, set_flags, word_to_off, write_atomic,
-    AotKey, BlockEnt, Image, LinkEnt, RelocEnt, AOT_FAR_SLAB, AOT_LSE2_SLAB, FLAG_VERIFY_PENDING,
+    codegen_hash, decode, image_hash, module_key_hashed, read_cache_file, read_cache_file_in,
+    set_flags, word_to_off, write_atomic, AotKey, BlockEnt, Image, LinkEnt, RelocEnt,
+    AOT_FAR_SLAB, AOT_LSE2_SLAB, FLAG_VERIFY_PENDING,
 };
 #[cfg(test)]
 use super::format::{encode, BUILD_VBASE};
-use super::{aot_mode, build_request, env_u32_any, profile_enabled, verify_mode, ACTIVATED};
+use super::{
+    aot_mode, build_request, cache_dir, env_u32_any, fallback_cache_dirs_for, profile_enabled,
+    verify_mode, ACTIVATED,
+};
 #[cfg(test)]
 use super::{
     TEST_AOT, TEST_HELD, TEST_NO_REVIVE, TEST_REBASED, TEST_VERIFIED, TEST_VERIFY_MISMATCHES,
@@ -29,6 +35,44 @@ use crate::emu::jit::{
 };
 use crate::emu::BlockCache;
 
+/// Fast non-cryptographic hasher for internal guest-VA / host-PC maps (never exposed to untrusted
+/// hash-flooding inputs; avoids SipHash overhead across millions of AOT blocks and link sites).
+#[derive(Default)]
+pub(super) struct FastIntHasher(u64);
+
+impl Hasher for FastIntHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        // Spread entropy into both top 7 bits (hashbrown H2 tag) and low bits (bucket index).
+        let h = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^ (h >> 32)
+    }
+}
+
+pub(super) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastIntHasher>>;
+
+/// Pack `(module_idx, link_idx)` into a single `u64` intrusive-list node (`u64::MAX` = nil).
+#[inline(always)]
+fn pack_link_node(mi: usize, li: usize) -> u64 {
+    ((mi as u64) << 32) | (li as u64)
+}
+
+const LINK_NODE_NIL: u64 = u64::MAX;
+
 /// Per-bank far-branch island slab: 16-byte immutable veneers (`ldr x16, .+8; br x16; .quad dst`)
 /// deduplicated by destination host code address so cross-bank and cross-module links beyond
 /// ±128 MiB `b`/`bl` range chain directly while preserving `x30` (`LR`) for calls.
@@ -36,7 +80,7 @@ struct FarSlab {
     lo: usize,
     used: usize,
     len: usize,
-    islands: HashMap<usize, usize>,
+    islands: FastMap<usize, usize>,
 }
 
 pub(super) struct Module {
@@ -59,6 +103,15 @@ pub(super) struct Module {
     dead: Box<[AtomicU8]>,
     /// Per link: currently patched to its target.
     linked: Vec<bool>,
+    /// Per link: next packed `(module, link)` node in [`Dir::incoming`]'s intrusive chain for
+    /// this link's target IP (`LINK_NODE_NIL` if unlinked or tail). Eliminates millions of
+    /// per-target `Vec` heap allocations during `link_pass`.
+    incoming_next: Vec<u64>,
+    /// Indices of currently unlinked link sites in `0..img.links.len()` (valid once
+    /// `unlinked_init` is true). Avoids O(M^2) rescans of already-linked sites across modules.
+    unlinked: Vec<u32>,
+    /// True after this module's initial `link_pass` populated `unlinked`.
+    unlinked_init: bool,
     /// Per block: has a held import slot ([`rebase_block`]); never verified (its
     /// re-translation sees a different slot state, its guarded call is still correct).
     slot_held: Vec<bool>,
@@ -136,9 +189,10 @@ impl Module {
 pub(super) struct Dir {
     pub(super) modules: Vec<Module>,
     /// Live block IP -> (module, block).
-    pub(super) map: HashMap<u64, (u32, u32)>,
-    /// Target IP -> patched link sites `(module, link)` pointing at its block.
-    pub(super) incoming: HashMap<u64, Vec<(u32, u32)>>,
+    pub(super) map: FastMap<u64, (u32, u32)>,
+    /// Target IP -> head of intrusive chain (`pack_link_node(module, link)`) of patched link
+    /// sites pointing at its block (`Module::incoming_next` stores the chain links).
+    pub(super) incoming: FastMap<u64, u64>,
     /// Shared probe table published in [`PROBE`] (kept in sync with `map` / `dead`).
     probe: ProbeTab,
 }
@@ -197,15 +251,21 @@ impl ProbeTab {
 }
 
 impl Dir {
-    /// Probe-table value for `ip`: the code of its live, non-host-entry owner, else 0.
-    fn probe_val(&self, ip: u64) -> u64 {
-        let Some(&(mi, bi)) = self.map.get(&ip) else { return 0 };
+    /// Probe-table value for `(mi, bi)` without re-looking up `self.map`.
+    #[inline]
+    fn probe_val_entry(&self, mi: u32, bi: u32) -> u64 {
         let m = &self.modules[mi as usize];
         let b = &m.img.blocks[bi as usize];
         if m.gone || m.killed || b.host_entry || m.dead[bi as usize].load(Ordering::Relaxed) != 0 {
             return 0;
         }
         m.host_addr(b.code_off) as u64
+    }
+
+    /// Probe-table value for `ip`: the code of its live, non-host-entry owner, else 0.
+    fn probe_val(&self, ip: u64) -> u64 {
+        let Some(&(mi, bi)) = self.map.get(&ip) else { return 0 };
+        self.probe_val_entry(mi, bi)
     }
 
     /// Bring the probe entry of `ip` in line with the map (after any change to its owner or
@@ -233,26 +293,92 @@ impl Dir {
         }
     }
 
+    /// Bulk-publish `(ip, code)` entries already installed in `self.map` (with `code == 0`
+    /// clearing an overwritten prior entry). Triggers at most one `probe_rebuild()` instead of
+    /// rebuilding mid-loop and re-probing millions of entries.
+    unsafe fn probe_insert_batch(&mut self, entries: &[(u64, u64)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let enabled = jit::aot_probe_enabled();
+        if self.probe.base == 0 {
+            if enabled && entries.iter().any(|&(_, v)| v != 0) {
+                self.probe_rebuild();
+            }
+            return;
+        }
+        if enabled {
+            let add_upper = entries.iter().filter(|&&(_, v)| v != 0).count();
+            if 2 * (self.probe.used + add_upper) > self.probe.cap {
+                self.probe_rebuild();
+                return;
+            }
+        }
+        for &(ip, v) in entries {
+            let e = self.probe.slot(ip);
+            if e[0].load(Ordering::Relaxed) == ip {
+                e[1].store(v, Ordering::Release);
+            } else if v != 0 && enabled {
+                if 2 * (self.probe.used + 1) > self.probe.cap {
+                    self.probe_rebuild();
+                    return;
+                }
+                e[1].store(v, Ordering::Relaxed);
+                e[0].store(ip, Ordering::Release);
+                self.probe.used += 1;
+            }
+        }
+    }
+
     /// Build a table sized for every live entry of the map and publish it.
     unsafe fn probe_rebuild(&mut self) {
-        let live: Vec<(u64, u64)> = self
-            .map
-            .keys()
-            .filter_map(|&ip| Some((ip, self.probe_val(ip))).filter(|&(_, v)| v != 0))
-            .collect();
-        let bits = (2 * live.len()).max(2).next_power_of_two().trailing_zeros().max(PROBE_MIN_BITS);
+        let mut live_count = 0usize;
+        for &(mi, bi) in self.map.values() {
+            if self.probe_val_entry(mi, bi) != 0 {
+                live_count += 1;
+            }
+        }
+        let bits = (2 * live_count).max(2).next_power_of_two().trailing_zeros().max(PROBE_MIN_BITS);
         let cap = 1usize << bits;
         let p = Box::leak(vec![0u64; 2 + 2 * cap].into_boxed_slice()).as_mut_ptr();
         *p = 64 - bits as u64;
         *p.add(1) = cap as u64 - 1;
-        let t = ProbeTab { base: p as usize, cap, used: live.len() };
-        for &(ip, v) in &live {
-            let e = t.slot(ip);
-            e[1].store(v, Ordering::Relaxed);
-            e[0].store(ip, Ordering::Relaxed);
+        let t = ProbeTab { base: p as usize, cap, used: live_count };
+        for (&ip, &(mi, bi)) in &self.map {
+            let v = self.probe_val_entry(mi, bi);
+            if v != 0 {
+                let e = t.slot(ip);
+                e[1].store(v, Ordering::Relaxed);
+                e[0].store(ip, Ordering::Relaxed);
+            }
         }
         PROBE.store(t.base, Ordering::Release);
         self.probe = t;
+    }
+
+    /// Test helper: prune uninstalled module indices from intrusive incoming link chains.
+    #[cfg(test)]
+    pub(super) fn prune_incoming(&mut self, gone: &[u32]) {
+        let targets: Vec<u64> = self.incoming.keys().copied().collect();
+        for target in targets {
+            let mut node = self.incoming.remove(&target).unwrap_or(LINK_NODE_NIL);
+            let mut new_head = LINK_NODE_NIL;
+            while node != LINK_NODE_NIL {
+                let sm = (node >> 32) as usize;
+                let sl = (node as u32) as usize;
+                let next = self.modules[sm].incoming_next[sl];
+                if gone.contains(&(sm as u32)) {
+                    self.modules[sm].incoming_next[sl] = LINK_NODE_NIL;
+                } else {
+                    self.modules[sm].incoming_next[sl] = new_head;
+                    new_head = node;
+                }
+                node = next;
+            }
+            if new_head != LINK_NODE_NIL {
+                self.incoming.insert(target, new_head);
+            }
+        }
     }
 }
 
@@ -389,7 +515,7 @@ fn host_now(va: u64) -> bool {
 /// [`crate::emu::jit::JitCache`] on an index miss; the caller installs
 /// `JEnt { ip, fast: if host_entry { 0 } else { code }, gen: 0, code }`.
 pub(in crate::emu) fn find(ip: u64) -> Option<(usize, bool)> {
-    if aot_mode() != 0 && HAVE.load(Ordering::Relaxed) {
+    if aot_mode() != 0 && HAVE.load(Ordering::Acquire) {
         let vg = crate::exe::va_gen();
         if CHECKED_VG.load(Ordering::Acquire) != vg {
             revalidate(vg);
@@ -416,8 +542,8 @@ pub(in crate::emu) fn find(ip: u64) -> Option<(usize, bool)> {
 unsafe fn check_block(
     m: &Module,
     b: &BlockEnt,
-    hm: &mut HashMap<u64, bool>,
-    fm: &mut HashMap<u64, Option<(usize, bool)>>,
+    hm: &mut FastMap<u64, bool>,
+    fm: &mut FastMap<u64, Option<(usize, bool)>>,
     rewrites: &mut Vec<(usize, u64)>,
 ) -> Result<(), &'static str> {
     if crate::emu::is_routed_dll_chkstk(b.ip)
@@ -483,58 +609,107 @@ unsafe fn kill(d: &mut Dir, mi: usize, bi: usize, why: u8, patched: &mut Vec<usi
         m.img.blocks[bi].ip
     };
     d.probe_sync(ip);
-    if let Some(v) = d.incoming.remove(&ip) {
-        for (sm, sl) in v {
-            let m = &mut d.modules[sm as usize];
-            let l = m.img.links[sl as usize];
-            let site = m.host_addr(l.site_off);
-            if l.cond_off != u32::MAX {
-                let cond_site = m.host_addr(l.cond_off);
-                if let Some(cs) = try_patch_cond_branch(cond_site, site) {
-                    patched.push(cs);
+    if let Some(mut node) = d.incoming.remove(&ip) {
+        while node != LINK_NODE_NIL {
+            let sm = (node >> 32) as usize;
+            let sl = (node as u32) as usize;
+            let m = &mut d.modules[sm];
+            let next = m.incoming_next[sl];
+            m.incoming_next[sl] = LINK_NODE_NIL;
+            if !m.gone && m.linked[sl] {
+                let l = m.img.links[sl];
+                let site = m.host_addr(l.site_off);
+                if l.cond_off != u32::MAX {
+                    let cond_site = m.host_addr(l.cond_off);
+                    if let Some(cs) = try_patch_cond_branch(cond_site, site) {
+                        patched.push(cs);
+                    }
                 }
+                store_b(site, m.host_addr(l.fallback_off));
+                m.linked[sl] = false;
+                if m.unlinked_init {
+                    m.unlinked.push(sl as u32);
+                }
+                patched.push(site);
             }
-            store_b(site, m.host_addr(l.fallback_off));
-            m.linked[sl as usize] = false;
-            patched.push(site);
+            node = next;
         }
     }
 }
 
+/// Attempt to patch link `li` of module `mi` in-place. Returns `true` if patched.
+#[inline]
+unsafe fn link_one(
+    d: &mut Dir,
+    mi: usize,
+    li: usize,
+    force_far: bool,
+    skip_icache: Option<(usize, usize)>,
+    patched: &mut Vec<usize>,
+) -> bool {
+    let l = d.modules[mi].img.links[li];
+    let Some(&(tm, tb)) = d.map.get(&l.target) else { return false };
+    let code = {
+        let t = &d.modules[tm as usize];
+        let tb_ = &t.img.blocks[tb as usize];
+        if t.gone || t.dead[tb as usize].load(Ordering::Relaxed) != 0 || tb_.host_entry {
+            return false;
+        }
+        t.host_addr(tb_.code_off)
+    };
+    let (site, cond_site) = {
+        let m = &d.modules[mi];
+        let s = m.host_addr(l.site_off);
+        let c = if l.cond_off == u32::MAX { 0 } else { m.host_addr(l.cond_off) };
+        (s, c)
+    };
+    let dest = if !force_far && reach(site, code) {
+        code
+    } else {
+        let Some(isl) = d.modules[mi].far_island(l.site_off, code) else {
+            return false;
+        };
+        debug_assert!(reach(site, isl), "far-branch island out of b reach");
+        isl
+    };
+    let cell = &*(site as *const AtomicU32);
+    let old = cell.load(Ordering::Relaxed);
+    if dest == site + 4 && (old & 0xFC00_0000) == 0x1400_0000 {
+        // Fallthrough directly into the immediately-following hot block: 0-cycle `nop`
+        // avoids taking a branch and keeps Apple Silicon's 8-wide fetch group intact!
+        cell.store(0xD503_201F, Ordering::Release);
+    } else {
+        store_b(site, dest);
+    }
+    let record = |addr: usize, out: &mut Vec<usize>| {
+        if !skip_icache.is_some_and(|(lo, hi)| (lo..hi).contains(&addr)) {
+            out.push(addr);
+        }
+    };
+    if cond_site != 0 {
+        if let Some(cs) = try_patch_cond_branch(cond_site, dest) {
+            record(cs, patched);
+        }
+    }
+    let node = pack_link_node(mi, li);
+    let prev = d.incoming.insert(l.target, node).unwrap_or(LINK_NODE_NIL);
+    let m = &mut d.modules[mi];
+    debug_assert_eq!(m.incoming_next[li], LINK_NODE_NIL);
+    m.incoming_next[li] = prev;
+    m.linked[li] = true;
+    record(site, patched);
+    true
+}
+
 /// Patch every unlinked AOT link site whose target is a live, linkable block in range
-/// (code must be writable on this thread). Returns the patched sites.
-unsafe fn link_pass(d: &mut Dir) -> Vec<usize> {
+/// (code must be writable on this thread). Returns patched sites outside `skip_icache`
+/// (callers that bulk-invalidate a newly installed region pass `Some((region, region + len))`).
+unsafe fn link_pass(d: &mut Dir, skip_icache: Option<(usize, usize)>) -> Vec<usize> {
     static NO_LINK: OnceLock<bool> = OnceLock::new();
     if *NO_LINK.get_or_init(|| {
         std::env::var("PORT_AOT_NO_LINK").is_ok_and(|v| v.trim() != "0" && !v.trim().is_empty())
     }) {
         return Vec::new();
-    }
-    let mut todo = Vec::new();
-    for (mi, m) in d.modules.iter().enumerate() {
-        if m.gone || m.killed {
-            continue;
-        }
-        for b in &m.img.blocks {
-            let lo = b.link_lo as usize;
-            let hi = lo + b.link_n as usize;
-            for li in lo..hi {
-                if m.linked[li] {
-                    continue;
-                }
-                let l = m.img.links[li];
-                let Some(&(tm, tb)) = d.map.get(&l.target) else { continue };
-                let t = &d.modules[tm as usize];
-                let tb_ = &t.img.blocks[tb as usize];
-                if t.gone || t.dead[tb as usize].load(Ordering::Relaxed) != 0 || tb_.host_entry {
-                    continue;
-                }
-                let (site, code) = (m.host_addr(l.site_off), t.host_addr(tb_.code_off));
-                let cond_site =
-                    if l.cond_off == u32::MAX { 0 } else { m.host_addr(l.cond_off) };
-                todo.push((mi, li, l.site_off, site, code, l.target, cond_site));
-            }
-        }
     }
     let force_far = {
         #[cfg(test)]
@@ -546,34 +721,40 @@ unsafe fn link_pass(d: &mut Dir) -> Vec<usize> {
             false
         }
     };
-    let mut patched = Vec::with_capacity(todo.len());
-    for (mi, li, site_off, site, code, target, cond_site) in todo {
-        let dest = if !force_far && reach(site, code) {
-            code
-        } else {
-            let Some(isl) = d.modules[mi].far_island(site_off, code) else {
-                continue;
-            };
-            debug_assert!(reach(site, isl), "far-branch island out of b reach");
-            isl
-        };
-        let cell = &*(site as *const AtomicU32);
-        let old = cell.load(Ordering::Relaxed);
-        if dest == site + 4 && (old & 0xFC00_0000) == 0x1400_0000 {
-            // Fallthrough directly into the immediately-following hot block: 0-cycle `nop`
-            // avoids taking a branch and keeps Apple Silicon's 8-wide fetch group intact!
-            cell.store(0xD503_201F, Ordering::Release);
-        } else {
-            store_b(site, dest);
+    let mut patched = Vec::new();
+    for mi in 0..d.modules.len() {
+        if d.modules[mi].gone || d.modules[mi].killed {
+            continue;
         }
-        if cond_site != 0 {
-            if let Some(cs) = try_patch_cond_branch(cond_site, dest) {
-                patched.push(cs);
+        if !d.modules[mi].unlinked_init {
+            let nlinks = d.modules[mi].img.links.len();
+            d.incoming.reserve(nlinks / 2);
+            let mut unlinked = Vec::new();
+            for li in 0..nlinks {
+                if !d.modules[mi].linked[li]
+                    && !link_one(d, mi, li, force_far, skip_icache, &mut patched)
+                {
+                    unlinked.push(li as u32);
+                }
             }
+            d.modules[mi].unlinked = unlinked;
+            d.modules[mi].unlinked_init = true;
+        } else {
+            let mut unlinked = core::mem::take(&mut d.modules[mi].unlinked);
+            let mut keep = 0usize;
+            for i in 0..unlinked.len() {
+                let li = unlinked[i] as usize;
+                if d.modules[mi].linked[li]
+                    || link_one(d, mi, li, force_far, skip_icache, &mut patched)
+                {
+                    continue;
+                }
+                unlinked[keep] = li as u32;
+                keep += 1;
+            }
+            unlinked.truncate(keep);
+            d.modules[mi].unlinked = unlinked;
         }
-        d.modules[mi].linked[li] = true;
-        d.incoming.entry(target).or_default().push((mi as u32, li as u32));
-        patched.push(site);
     }
     patched
 }
@@ -602,7 +783,13 @@ pub(in crate::emu) fn revalidate(vg: u32) {
 /// dead ones that pass again (relocation slots rewritten, back in the map, re-linked; with
 /// `AW2_DLL_AOT_VERIFY` re-verified first). Returns the number of blocks killed.
 unsafe fn revalidate_dir(d: &mut Dir) -> usize {
-    let (mut hm, mut fm) = (HashMap::new(), HashMap::new());
+    #[cfg(test)]
+    TEST_REVALIDATE_CALLS.fetch_add(1, Ordering::Relaxed);
+    let hm_cap = (d.map.len() / 8).min(512 * 1024);
+    let (mut hm, mut fm) = (
+        FastMap::with_capacity_and_hasher(hm_cap, Default::default()),
+        FastMap::default(),
+    );
     let (mut kills, mut rewrites, mut revive) = (Vec::new(), Vec::new(), Vec::new());
     for (mi, m) in d.modules.iter().enumerate() {
         if m.gone || m.killed {
@@ -693,7 +880,7 @@ unsafe fn revalidate_dir(d: &mut Dir) -> usize {
             revived += 1;
         }
         if revived != 0 {
-            patched.extend(link_pass(d));
+            patched.extend(link_pass(d, None));
         }
     }
     for s in patched {
@@ -783,7 +970,7 @@ unsafe fn rebase_block(
     region: usize,
     bank_shifts: &[usize],
     b: &BlockEnt,
-    slots: &mut HashMap<u64, u64>,
+    slots: &mut FastMap<u64, u64>,
     held: &mut Vec<(u64, u64, u64)>,
 ) -> Option<usize> {
     let (lo, hi) = (b.reloc_lo as usize, (b.reloc_lo + b.reloc_n) as usize);
@@ -1052,10 +1239,11 @@ pub(super) unsafe fn install_image(
         } else {
             0
         };
-        far_slabs.push(FarSlab { lo: far_lo, used: 0, len: far_len, islands: HashMap::new() });
+        far_slabs.push(FarSlab { lo: far_lo, used: 0, len: far_len, islands: FastMap::default() });
     }
     let t0 = std::time::Instant::now();
     let _r = REVALIDATE.lock().unwrap_or_else(|e| e.into_inner());
+    let vg_before = crate::exe::va_gen();
     let n = img.blocks.len();
     let nlinks = img.links.len();
     let mut m = Module {
@@ -1069,6 +1257,9 @@ pub(super) unsafe fn install_image(
         img,
         dead: (0..n).map(|_| AtomicU8::new(0)).collect(),
         linked: vec![false; nlinks],
+        incoming_next: vec![LINK_NODE_NIL; nlinks],
+        unlinked: Vec::new(),
+        unlinked_init: false,
         slot_held: vec![false; n],
         killed: false,
         gone: false,
@@ -1101,12 +1292,15 @@ pub(super) unsafe fn install_image(
         }
     }
     let (mut bad_verify, mut bad_check, mut bad_slot, mut rebased) = (0usize, 0usize, 0usize, 0usize);
-    let mut slots = HashMap::new();
+    let mut slots: FastMap<u64, u64> = FastMap::default();
     // Blocks with a held import slot (see rebase_block): correct (guarded) but not verified,
     // since their re-translation now sees a different slot state.
     let mut held_blocks = 0usize;
     let mut held = Vec::new();
     for bi in 0..n {
+        if m.img.blocks[bi].reloc_n == 0 {
+            continue;
+        }
         let b = m.img.blocks[bi];
         held.clear();
         match rebase_block(&mut m.img, region, &m.bank_shifts, &b, &mut slots, &mut held) {
@@ -1148,13 +1342,18 @@ pub(super) unsafe fn install_image(
     }
     // Assumptions first: a block built for another host-callable state is dead-but-revivable
     // (its re-translation now would differ, so it is not verified until revived).
-    let (mut hm, mut fm, mut rewrites) = (HashMap::new(), HashMap::new(), Vec::new());
+    let hm_cap = (m.img.assume.len() / 8).min(512 * 1024);
+    let (mut hm, mut fm, mut rewrites) = (
+        FastMap::with_capacity_and_hasher(hm_cap, Default::default()),
+        FastMap::default(),
+        Vec::new(),
+    );
     for bi in 0..n {
         if m.dead[bi].load(Ordering::Relaxed) != 0 {
             continue;
         }
-        let b = m.img.blocks[bi];
-        if check_block(&m, &b, &mut hm, &mut fm, &mut rewrites).is_err() {
+        let b = &m.img.blocks[bi];
+        if check_block(&m, b, &mut hm, &mut fm, &mut rewrites).is_err() {
             m.dead[bi].store(DEAD_ASSUME, Ordering::Relaxed);
             bad_check += 1;
         }
@@ -1201,14 +1400,17 @@ pub(super) unsafe fn install_image(
     let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
     let d = g.get_or_insert_with(|| Dir {
         modules: Vec::new(),
-        map: HashMap::new(),
-        incoming: HashMap::new(),
+        map: FastMap::default(),
+        incoming: FastMap::default(),
         probe: ProbeTab::default(),
     });
+    let had_live_modules = d.modules.iter().any(|existing| !existing.gone && !existing.killed);
     let mi = d.modules.len() as u32;
-    let mut live_ips = Vec::new();
     let aot_filt = crate::diag::aot_filter_active();
     let mut filt_skipped = 0usize;
+    let mut live = 0usize;
+    d.map.reserve(n);
+    let mut probe_updates: Vec<(u64, u64)> = Vec::with_capacity(n);
     for (bi, b) in m.img.blocks.iter().enumerate() {
         if m.dead[bi].load(Ordering::Relaxed) == 0 {
             if aot_filt && !crate::diag::aot_allows(b.ip) {
@@ -1216,8 +1418,13 @@ pub(super) unsafe fn install_image(
                 filt_skipped += 1;
                 continue;
             }
-            d.map.insert(b.ip, (mi, bi as u32));
-            live_ips.push(b.ip);
+            let replaced = d.map.insert(b.ip, (mi, bi as u32)).is_some();
+            if !b.host_entry {
+                probe_updates.push((b.ip, m.host_addr(b.code_off) as u64));
+            } else if replaced {
+                probe_updates.push((b.ip, 0));
+            }
+            live += 1;
         }
     }
     if filt_skipped != 0 {
@@ -1225,21 +1432,30 @@ pub(super) unsafe fn install_image(
             "emu aot: {name}: PORT_AOT_SKIP/ALLOW excluded {filt_skipped}/{n} blocks (falling back to live JIT)"
         );
     }
-    let live = live_ips.len();
     d.modules.push(m);
-    let patched = link_pass(d);
-    let linked = d.modules[mi as usize].linked.iter().filter(|&&b| b).count();
+    let patched = link_pass(d, Some((region, region + len)));
+    let linked = {
+        let m_ref = &d.modules[mi as usize];
+        if m_ref.unlinked_init {
+            nlinks - m_ref.unlinked.len()
+        } else {
+            m_ref.linked.iter().filter(|&&b| b).count()
+        }
+    };
     let miss = unlinked_reasons(d, mi as usize);
     drop(w);
     icache_invalidate(region as *mut u8, len);
     for &s in &patched {
-        if !(region..region + len).contains(&s) {
-            icache_invalidate(s as *mut u8, 4);
-        }
+        icache_invalidate(s as *mut u8, 4);
     }
     // Lock-free readers (the stubs' probe) only see the code once it is coherent.
-    for ip in live_ips {
-        d.probe_sync(ip);
+    d.probe_insert_batch(&probe_updates);
+    if !had_live_modules {
+        // Every block in this first live module was just validated against `>= vg_before`, and
+        // no pre-existing live modules could be at an older `va_gen`. Publishing `vg_before`
+        // avoids a redundant full-directory revalidation on the very first `find()` while still
+        // triggering revalidation if `va_gen()` advanced during install.
+        CHECKED_VG.store(vg_before, Ordering::Release);
     }
     HAVE.store(true, Ordering::Release);
     drop(g);
@@ -1261,10 +1477,7 @@ pub(super) unsafe fn install_image(
 fn unlinked_reasons(d: &Dir, mi: usize) -> [usize; 4] {
     let m = &d.modules[mi];
     let mut miss = [0usize; 4];
-    for (li, l) in m.img.links.iter().enumerate() {
-        if m.linked[li] {
-            continue;
-        }
+    let mut classify = |l: &LinkEnt| {
         let k = match d.map.get(&l.target) {
             Some(&(tm, tb)) => {
                 let t = &d.modules[tm as usize];
@@ -1283,19 +1496,40 @@ fn unlinked_reasons(d: &Dir, mi: usize) -> [usize; 4] {
             },
         };
         miss[k] += 1;
+    };
+    if m.unlinked_init {
+        for &li in &m.unlinked {
+            classify(&m.img.links[li as usize]);
+        }
+    } else {
+        for (li, l) in m.img.links.iter().enumerate() {
+            if !m.linked[li] {
+                classify(l);
+            }
+        }
     }
     miss
 }
 
-/// Load the cache of image `name` mapped at `[base, base + size)` if it matches `key`
-/// (computed at activation). Returns the IPs of the installed image's blocks (live or not),
-/// or None if no valid cache was installed.
-pub(super) unsafe fn load_module(
+/// Pre-read and checksum-verified AOT cache ready to install on the main thread.
+struct DecodedModule {
+    path: PathBuf,
+    from_fallback: bool,
+    img: Image,
+    flags: u32,
+    /// Retained only when `FLAG_VERIFY_PENDING` is set and the cache is writable (so we can
+    /// clear the flag on disk after verification); dropped immediately otherwise to keep peak
+    /// RAM low during `install_image`.
+    pending_bytes: Option<Vec<u8>>,
+}
+
+unsafe fn read_and_decode_module(
     name: &str,
     base: usize,
     size: usize,
     key: &AotKey,
-) -> Option<Vec<u64>> {
+    dirs: Option<(&Path, &[PathBuf])>,
+) -> Option<DecodedModule> {
     if crate::emu::mem::jit_overlaps(base, base.wrapping_add(size)) {
         log::info!(
             "emu aot: {name}: overlaps run-time generated/modified code; skipping AOT load"
@@ -1303,7 +1537,10 @@ pub(super) unsafe fn load_module(
         return None;
     }
     let t0 = std::time::Instant::now();
-    let (path, hit) = read_cache_file(name, key);
+    let (path, hit) = match dirs {
+        Some((primary, fallbacks)) => read_cache_file_in(primary, fallbacks, name, key),
+        None => read_cache_file(name, key),
+    };
     let Some((bytes, from_fallback)) = hit else {
         log::info!("emu aot: {name}: no cache for this build/knobs ({})", path.display());
         return None;
@@ -1321,6 +1558,18 @@ pub(super) unsafe fn load_module(
         bytes.len() >> 10,
         t0.elapsed().as_secs_f64() * 1e3
     );
+    let pending = flags & FLAG_VERIFY_PENDING != 0;
+    let pending_bytes = (pending && !from_fallback).then_some(bytes);
+    Some(DecodedModule { path, from_fallback, img, flags, pending_bytes })
+}
+
+unsafe fn install_decoded_module(
+    name: &str,
+    base: usize,
+    size: usize,
+    decoded: DecodedModule,
+) -> Option<Vec<u64>> {
+    let DecodedModule { path, from_fallback, img, flags, pending_bytes } = decoded;
     if !from_fallback {
         touch(&path);
     }
@@ -1332,10 +1581,11 @@ pub(super) unsafe fn load_module(
     let verify = load_verify(verify_mode() != 0, pending, ips.len(), seed);
     let r = install_image(name, base, size, img, verify, false)?;
     if pending {
-        let cleared = !from_fallback && r.mismatches == 0 && {
-            let mut b = bytes;
-            set_flags(&mut b, flags & !FLAG_VERIFY_PENDING) && write_atomic(&path, &b).is_ok()
-        };
+        let cleared = !from_fallback
+            && r.mismatches == 0
+            && pending_bytes.is_some_and(|mut b| {
+                set_flags(&mut b, flags & !FLAG_VERIFY_PENDING) && write_atomic(&path, &b).is_ok()
+            });
         log::info!(
             "emu aot: {name}: first load of a background-built cache: {} of {} blocks verified ({}), {} mismatches, {} live; {}",
             r.verified,
@@ -1356,6 +1606,19 @@ pub(super) unsafe fn load_module(
         );
     }
     Some(ips)
+}
+
+/// Load the cache of image `name` mapped at `[base, base + size)` if it matches `key`
+/// (computed at activation). Returns the IPs of the installed image's blocks (live or not),
+/// or None if no valid cache was installed.
+pub(super) unsafe fn load_module(
+    name: &str,
+    base: usize,
+    size: usize,
+    key: &AotKey,
+) -> Option<Vec<u64>> {
+    let decoded = read_and_decode_module(name, base, size, key, None)?;
+    install_decoded_module(name, base, size, decoded)
 }
 
 /// Blocks above which the first load of a background-built cache verifies a sample ...
@@ -1465,9 +1728,8 @@ pub fn activate() {
     if aot_mode() == 2 {
         sweep_start();
     }
-    let mut jobs = Vec::new();
-    for ((name, base, size), h) in pending.iter().zip(hashes) {
-        let (base, size) = (*base, *size);
+    let mut targets: Vec<(String, usize, usize, Option<[u64; 2]>)> = Vec::with_capacity(pending.len());
+    for ((name, base, size), h) in pending.into_iter().zip(hashes) {
         if crate::exe::aw2_registry_active() && base == crate::exe::base() {
             // Every AlanWake2.exe function is a native replacement, and the emulator routes the
             // exe import thunks / special-ABI helpers natively (`emu::exe_route`). So the exe
@@ -1478,11 +1740,77 @@ pub fn activate() {
             );
             continue;
         }
-        let key = unsafe { module_key_hashed(base, size, h) };
-        let loaded = unsafe { load_module(name, base, size, &key) };
+        targets.push((name, base, size, h));
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let mut jobs = Vec::new();
+    if targets.len() == 1 {
+        let (name, base, size, h) = &targets[0];
+        let key = unsafe { module_key_hashed(*base, *size, *h) };
+        let loaded = unsafe { load_module(name, *base, *size, &key) };
         if aot_mode() == 2 {
-            jobs.extend(bg_job(name, base, size, key, loaded.as_deref()));
+            jobs.extend(bg_job(name, *base, *size, key, loaded.as_deref()));
         }
+    } else {
+        // Compute thread-local-sensitive key fields once on the caller thread, then hash all
+        // mapped executable sections in parallel before pipelining read/decode with install.
+        let cg = codegen_hash();
+        let knobs = jit::aot_knob_bits();
+        let keys: Vec<AotKey> = std::thread::scope(|s| {
+            let handles: Vec<_> = targets
+                .iter()
+                .map(|(_, base, size, h)| {
+                    let (base, size, h) = (*base, *size, *h);
+                    s.spawn(move || AotKey {
+                        image_hash: h.unwrap_or_else(|| unsafe { image_hash(base, size) }),
+                        image_base: base as u64,
+                        image_size: size as u64,
+                        codegen_hash: cg,
+                        knobs,
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("aot image_hash worker panicked")).collect()
+        });
+        let primary_dir = cache_dir();
+        let fallbacks = fallback_cache_dirs_for(&primary_dir);
+        let mode = aot_mode();
+        // Overlap disk I/O + checksum + decode of the next module with `install_image` of the
+        // current module while capping buffered decoded images to 1 (strictly deterministic order).
+        std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Option<DecodedModule>>(1);
+            let targets_ref = &targets;
+            let keys_ref = &keys;
+            let primary_ref = &primary_dir;
+            let fallbacks_ref = &fallbacks;
+            s.spawn(move || {
+                for ((name, base, size, _), key) in targets_ref.iter().zip(keys_ref.iter()) {
+                    let dec = unsafe {
+                        read_and_decode_module(
+                            name,
+                            *base,
+                            *size,
+                            key,
+                            Some((primary_ref.as_path(), fallbacks_ref.as_slice())),
+                        )
+                    };
+                    if tx.send(dec).is_err() {
+                        break;
+                    }
+                }
+            });
+            for ((name, base, size, _), key) in targets.iter().zip(keys.iter()) {
+                let decoded = rx.recv().ok().flatten();
+                let loaded = decoded.and_then(|d| unsafe {
+                    install_decoded_module(name, *base, *size, d)
+                });
+                if mode == 2 {
+                    jobs.extend(bg_job(name, *base, *size, *key, loaded.as_deref()));
+                }
+            }
+        });
     }
     if !jobs.is_empty() {
         bg_enqueue(jobs);
@@ -1669,7 +1997,136 @@ pub(in crate::emu) fn test_uninstall() {
     for ip in ips {
         unsafe { d.probe_sync(ip) };
     }
-    for v in d.incoming.values_mut() {
-        v.retain(|&(m, _)| !gone.contains(&m));
+    d.prune_incoming(&gone);
+}
+
+#[cfg(test)]
+static TEST_REVALIDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+mod fast_load_tests {
+    use super::*;
+
+    extern "C" fn dummy_host_va(_c: &mut crate::callctx::CallCtx) -> u64 {
+        99
+    }
+
+    /// Installing the first live AOT module must synchronize `CHECKED_VG` so the first `find()`
+    /// does not run a redundant full-directory `revalidate_dir()`, while still revalidating when
+    /// `va_gen()` advances after install OR between two module installs, and cleanly unlinking +
+    /// reviving cross-module links via the intrusive `incoming` chain and `unlinked` list.
+    #[test]
+    fn install_skips_redundant_initial_revalidate_and_revalidates_on_va_gen_bump() {
+        use iced_x86::code_asm::*;
+
+        const DUMMY_VA: u64 = 0x7FFF_1234_0000;
+        struct Cleanup(u64);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                jit::test_set_knobs(jit::TestKnobs::NONE);
+                crate::exe::unregister_native_va(DUMMY_VA);
+                crate::exe::unregister_native_va(self.0);
+                test_uninstall();
+            }
+        }
+
+        // Allocate small guest code buffer (fn_a -> call fn_b; fn_b -> ret).
+        let mut sl = vec![0xCCu8; 0x1000];
+        let base = sl.as_ptr() as u64;
+        let fn_a = base + 0x100;
+        let fn_b = base + 0x200;
+        let _c = Cleanup(fn_b);
+        jit::test_set_knobs(jit::TestKnobs { aot_probe: Some(true), ..jit::TestKnobs::NONE });
+
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.call(fn_b).unwrap();
+        a.add(eax, 1).unwrap();
+        a.ret().unwrap();
+        let ba = a.assemble(fn_a).unwrap();
+        sl[0x100..0x100 + ba.len()].copy_from_slice(&ba);
+
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.mov(eax, 41).unwrap();
+        a.ret().unwrap();
+        let bb = a.assemble(fn_b).unwrap();
+        sl[0x200..0x200 + bb.len()].copy_from_slice(&bb);
+
+        // Start from a clean directory with a fresh va_gen.
+        let host_ptr = dummy_host_va as *const () as usize;
+        test_uninstall();
+        crate::exe::register_native_va(DUMMY_VA, host_ptr);
+        crate::exe::unregister_native_va(DUMMY_VA);
+
+        // Install module 0 (only fn_a): its link to fn_b stays in `m.unlinked`.
+        let r0 = TEST_REVALIDATE_CALLS.load(Ordering::Relaxed);
+        let (live0, _, links0) = unsafe { test_install(&[fn_a], || {}) };
+        assert_eq!(live0, 1);
+        assert!(links0 >= 1);
+
+        // First `find()` must hit directly with ZERO redundant `revalidate_dir()` calls!
+        assert!(find(fn_a).is_some(), "fn_a must be found in AOT");
+        assert_eq!(
+            TEST_REVALIDATE_CALLS.load(Ordering::Relaxed),
+            r0,
+            "first find() after install_image must not run redundant revalidate_dir()"
+        );
+        assert!(test_probe_check().is_ok(), "probe table must agree after batch insert");
+
+        // Install module 1 (fn_b) at the same va_gen: must resolve module 0's unlinked call to fn_b.
+        let (live1, _, _) = unsafe { test_install(&[fn_b], || {}) };
+        assert_eq!(live1, 1);
+        assert!(find(fn_b).is_some(), "fn_b must be found in AOT");
+        assert_eq!(
+            TEST_REVALIDATE_CALLS.load(Ordering::Relaxed),
+            r0,
+            "second module install at same va_gen must not trigger redundant revalidate_dir()"
+        );
+        assert!(test_probe_check().is_ok(), "probe table must agree after second module");
+        {
+            let g = DIR.read().unwrap();
+            let d = g.as_ref().unwrap();
+            assert!(
+                d.incoming.contains_key(&fn_b),
+                "cross-module link from module 0 to module 1 must populate intrusive incoming chain"
+            );
+        }
+
+        // Registering a native hook on `fn_b` bumps `va_gen()`: next `find()` must revalidate,
+        // kill `fn_a` (its non-host assumption on `fn_b` fails), and unpatch module 0's link.
+        crate::exe::register_native_va(fn_b, host_ptr);
+        assert!(find(fn_a).is_none(), "fn_a must be killed when fn_b becomes host-callable");
+        assert_eq!(
+            TEST_REVALIDATE_CALLS.load(Ordering::Relaxed),
+            r0 + 1,
+            "va_gen bump must trigger revalidate_dir()"
+        );
+
+        // Removing the hook on `fn_b` must revive `fn_a` and re-link module 0 -> module 1!
+        crate::exe::unregister_native_va(fn_b);
+        assert!(find(fn_a).is_some(), "fn_a must revive after hook removal");
+        assert_eq!(TEST_REVALIDATE_CALLS.load(Ordering::Relaxed), r0 + 2);
+        {
+            let g = DIR.read().unwrap();
+            let d = g.as_ref().unwrap();
+            assert!(
+                d.incoming.contains_key(&fn_b),
+                "revived module 0 must re-link its call to fn_b via m.unlinked"
+            );
+        }
+
+        // If `va_gen()` bumps BEFORE installing another module while live modules exist,
+        // `install_image` must NOT suppress revalidation of the pre-existing modules.
+        let fn_c = base + 0x300;
+        sl[0x300..0x306].copy_from_slice(&[0xB8, 0x07, 0, 0, 0, 0xC3]);
+        crate::exe::register_native_va(DUMMY_VA, host_ptr);
+        let (live2, _, _) = unsafe { test_install(&[fn_c], || {}) };
+        assert_eq!(live2, 1);
+        assert!(find(fn_c).is_some());
+        assert_eq!(
+            TEST_REVALIDATE_CALLS.load(Ordering::Relaxed),
+            r0 + 3,
+            "mixed va_gen across pre-existing live modules must still trigger revalidate_dir()"
+        );
+        assert!(test_probe_check().is_ok());
     }
 }
