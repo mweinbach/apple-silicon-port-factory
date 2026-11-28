@@ -384,6 +384,7 @@ impl<'a> Parser<'a> {
             let idx = (b - b'0') as usize;
             return self.types.get(idx).cloned();
         }
+        let start_pos = self.pos;
         let b = self.bump()?;
         let ty = match b {
             b'C' => "signed char".to_string(),
@@ -427,15 +428,11 @@ impl<'a> Parser<'a> {
                     _ => unreachable!(),
                 };
                 let (qname, _) = self.parse_qualified_name()?;
-                let s = if (self.flags & UNDNAME_NO_ECSU) != 0 {
+                if (self.flags & UNDNAME_NO_ECSU) != 0 {
                     qname
                 } else {
                     format!("{tag}{qname}")
-                };
-                if record_backref {
-                    self.push_type_ref(&s);
                 }
-                return Some(s);
             }
             b'P' | b'Q' | b'R' | b'S' | b'A' | b'B' => {
                 let is_ref = matches!(b, b'A' | b'B');
@@ -463,42 +460,32 @@ impl<'a> Parser<'a> {
                         let k = self.kw(cc);
                         if k.is_empty() { String::new() } else { format!("{k} ") }
                     };
-                    let s = format!("{ret} ({cc_str}*)({params})");
-                    if record_backref {
-                        self.push_type_ref(&s);
-                    }
-                    return Some(s);
-                }
-                let pointee_cv = self.parse_cv()?;
-                let target = self.parse_type(false)?;
-                let mut s = if pointee_cv.is_empty() {
-                    target
+                    format!("{ret} ({cc_str}*)({params})")
                 } else {
-                    format!("{target} {pointee_cv}")
-                };
-                s.push_str(if is_ref { " &" } else { " *" });
-                if ptr64 {
-                    let k = self.kw("__ptr64");
-                    if !k.is_empty() {
-                        s.push(' ');
-                        s.push_str(&k);
+                    let pointee_cv = self.parse_cv()?;
+                    let target = self.parse_type(false)?;
+                    let mut s = if pointee_cv.is_empty() {
+                        target
+                    } else {
+                        format!("{target} {pointee_cv}")
+                    };
+                    s.push_str(if is_ref { " &" } else { " *" });
+                    if ptr64 {
+                        let k = self.kw("__ptr64");
+                        if !k.is_empty() {
+                            s.push(' ');
+                            s.push_str(&k);
+                        }
                     }
+                    s.push_str(ptr_cv);
+                    s
                 }
-                s.push_str(ptr_cv);
-                if record_backref {
-                    self.push_type_ref(&s);
-                }
-                return Some(s);
             }
             b'?' => {
                 // Qualified primitive or template parameter (`?A...`, `?B...`, `$$...`)
                 let cv = self.parse_cv()?;
                 let inner = self.parse_type(false)?;
-                let s = if cv.is_empty() { inner } else { format!("{inner} {cv}") };
-                if record_backref {
-                    self.push_type_ref(&s);
-                }
-                return Some(s);
+                if cv.is_empty() { inner } else { format!("{inner} {cv}") }
             }
             b'$' => {
                 if self.eat(b'$') {
@@ -508,15 +495,11 @@ impl<'a> Parser<'a> {
                             let _ = self.eat(b'E');
                             let cv = self.parse_cv()?;
                             let inner = self.parse_type(false)?;
-                            let s = if cv.is_empty() {
+                            if cv.is_empty() {
                                 format!("{inner} &&")
                             } else {
                                 format!("{inner} {cv} &&")
-                            };
-                            if record_backref {
-                                self.push_type_ref(&s);
                             }
-                            return Some(s);
                         }
                         b'T' => "std::nullptr_t".to_string(),
                         b'V' => String::new(),
@@ -528,6 +511,11 @@ impl<'a> Parser<'a> {
             }
             _ => return None,
         };
+        // MSVC records every non-empty parameter type whose mangled encoding is > 1 byte
+        // (including 2-byte extended primitives such as `_J`, `_N`, `_W` and `$$T`).
+        if record_backref && !ty.is_empty() && (self.pos - start_pos) > 1 {
+            self.push_type_ref(&ty);
+        }
         Some(ty)
     }
 
@@ -862,6 +850,16 @@ mod tests {
         assert_eq!(
             demangle_msvc("?p@A@@2PEBHEB", UNDNAME_NO_MS_KEYWORDS),
             "public: static int const * const A::p"
+        );
+
+        // Multi-byte extended primitives (`_J`, `_N`, `$$T`) participate in parameter type back-references.
+        assert_eq!(
+            demangle_msvc("?mix@@YAX_JPEAH0@Z", 0),
+            "void __cdecl mix(__int64,int * __ptr64,__int64)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAX_NPEAH0$$T2@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(bool,int *,bool,std::nullptr_t,std::nullptr_t)"
         );
 
         // Non-mangled C names pass through unchanged; deeply nested garbage never panics.
