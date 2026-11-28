@@ -20,6 +20,13 @@ const UNDNAME_NO_ECSU: u32 = 0x8000;
 const MAX_DEPTH: usize = 64;
 const MAX_OUT: usize = 65_536;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpecialKind {
+    Normal,
+    CtorOrDtor,
+    Conversion,
+}
+
 struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
@@ -194,80 +201,83 @@ impl<'a> Parser<'a> {
         res
     }
 
-    fn parse_special_name(&mut self) -> Option<(String, bool)> {
+    fn parse_special_name(&mut self) -> Option<(String, SpecialKind)> {
         // Called after leading `?`, when next char is also `?`.
         self.eat(b'?');
         let c = self.bump()?;
-        let (s, is_ctor_or_dtor) = match c {
-            b'0' => ("{ctor}", true),
-            b'1' => ("{dtor}", true),
-            b'2' => ("operator new", false),
-            b'3' => ("operator delete", false),
-            b'4' => ("operator=", false),
-            b'5' => ("operator>>", false),
-            b'6' => ("operator<<", false),
-            b'7' => ("operator!", false),
-            b'8' => ("operator==", false),
-            b'9' => ("operator!=", false),
-            b'A' => ("operator[]", false),
-            b'B' => ("operator conversion", false),
-            b'C' => ("operator->", false),
-            b'D' => ("operator*", false),
-            b'E' => ("operator++", false),
-            b'F' => ("operator--", false),
-            b'G' => ("operator-", false),
-            b'H' => ("operator+", false),
-            b'I' => ("operator&", false),
-            b'J' => ("operator->*", false),
-            b'K' => ("operator/", false),
-            b'L' => ("operator%", false),
-            b'M' => ("operator<", false),
-            b'N' => ("operator<=", false),
-            b'O' => ("operator>", false),
-            b'P' => ("operator>=", false),
-            b'Q' => ("operator,", false),
-            b'R' => ("operator()", false),
-            b'S' => ("operator~", false),
-            b'T' => ("operator^", false),
-            b'U' => ("operator|", false),
-            b'V' => ("operator&&", false),
-            b'W' => ("operator||", false),
-            b'X' => ("operator*=", false),
-            b'Y' => ("operator+=", false),
-            b'Z' => ("operator-=", false),
+        let (s, kind) = match c {
+            b'0' => ("{ctor}", SpecialKind::CtorOrDtor),
+            b'1' => ("{dtor}", SpecialKind::CtorOrDtor),
+            b'2' => ("operator new", SpecialKind::Normal),
+            b'3' => ("operator delete", SpecialKind::Normal),
+            b'4' => ("operator=", SpecialKind::Normal),
+            b'5' => ("operator>>", SpecialKind::Normal),
+            b'6' => ("operator<<", SpecialKind::Normal),
+            b'7' => ("operator!", SpecialKind::Normal),
+            b'8' => ("operator==", SpecialKind::Normal),
+            b'9' => ("operator!=", SpecialKind::Normal),
+            b'A' => ("operator[]", SpecialKind::Normal),
+            b'B' => ("operator {conv}", SpecialKind::Conversion),
+            b'C' => ("operator->", SpecialKind::Normal),
+            b'D' => ("operator*", SpecialKind::Normal),
+            b'E' => ("operator++", SpecialKind::Normal),
+            b'F' => ("operator--", SpecialKind::Normal),
+            b'G' => ("operator-", SpecialKind::Normal),
+            b'H' => ("operator+", SpecialKind::Normal),
+            b'I' => ("operator&", SpecialKind::Normal),
+            b'J' => ("operator->*", SpecialKind::Normal),
+            b'K' => ("operator/", SpecialKind::Normal),
+            b'L' => ("operator%", SpecialKind::Normal),
+            b'M' => ("operator<", SpecialKind::Normal),
+            b'N' => ("operator<=", SpecialKind::Normal),
+            b'O' => ("operator>", SpecialKind::Normal),
+            b'P' => ("operator>=", SpecialKind::Normal),
+            b'Q' => ("operator,", SpecialKind::Normal),
+            b'R' => ("operator()", SpecialKind::Normal),
+            b'S' => ("operator~", SpecialKind::Normal),
+            b'T' => ("operator^", SpecialKind::Normal),
+            b'U' => ("operator|", SpecialKind::Normal),
+            b'V' => ("operator&&", SpecialKind::Normal),
+            b'W' => ("operator||", SpecialKind::Normal),
+            b'X' => ("operator*=", SpecialKind::Normal),
+            b'Y' => ("operator+=", SpecialKind::Normal),
+            b'Z' => ("operator-=", SpecialKind::Normal),
             b'_' => {
                 let c2 = self.bump()?;
                 match c2 {
-                    b'0' => ("operator/=", false),
-                    b'1' => ("operator%=", false),
-                    b'2' => ("operator>>=", false),
-                    b'3' => ("operator<<=", false),
-                    b'4' => ("operator&=", false),
-                    b'5' => ("operator|=", false),
-                    b'6' => ("operator^=", false),
-                    b'7' => ("`vftable'", false),
-                    b'8' => ("`vbtable'", false),
-                    b'9' => ("`vcall'", false),
-                    b'A' => ("`typeof'", false),
-                    b'B' => ("`local static guard'", false),
-                    b'E' => ("`vector deleting destructor'", false),
-                    b'F' => ("`default constructor closure'", false),
-                    b'G' => ("`scalar deleting destructor'", false),
-                    b'H' => ("`vector constructor iterator'", false),
-                    b'I' => ("`vector destructor iterator'", false),
-                    b'U' => ("operator new[]", false),
-                    b'V' => ("operator delete[]", false),
+                    b'0' => ("operator/=", SpecialKind::Normal),
+                    b'1' => ("operator%=", SpecialKind::Normal),
+                    b'2' => ("operator>>=", SpecialKind::Normal),
+                    b'3' => ("operator<<=", SpecialKind::Normal),
+                    b'4' => ("operator&=", SpecialKind::Normal),
+                    b'5' => ("operator|=", SpecialKind::Normal),
+                    b'6' => ("operator^=", SpecialKind::Normal),
+                    b'7' => ("`vftable'", SpecialKind::Normal),
+                    b'8' => ("`vbtable'", SpecialKind::Normal),
+                    b'9' => ("`vcall'", SpecialKind::Normal),
+                    b'A' => ("`typeof'", SpecialKind::Normal),
+                    b'B' => ("`local static guard'", SpecialKind::Normal),
+                    b'E' => ("`vector deleting destructor'", SpecialKind::Normal),
+                    b'F' => ("`default constructor closure'", SpecialKind::Normal),
+                    b'G' => ("`scalar deleting destructor'", SpecialKind::Normal),
+                    b'H' => ("`vector constructor iterator'", SpecialKind::Normal),
+                    b'I' => ("`vector destructor iterator'", SpecialKind::Normal),
+                    b'U' => ("operator new[]", SpecialKind::Normal),
+                    b'V' => ("operator delete[]", SpecialKind::Normal),
                     b'R' => {
                         let r = self.bump()?;
                         match r {
                             b'0' => {
                                 let ty = self.parse_type(false)?;
-                                return Some((format!("{ty} `RTTI Type Descriptor'"), false));
+                                return Some((
+                                    format!("{ty} `RTTI Type Descriptor'"),
+                                    SpecialKind::Normal,
+                                ));
                             }
-                            b'1' => ("`RTTI Base Class Descriptor'", false),
-                            b'2' => ("`RTTI Base Class Array'", false),
-                            b'3' => ("`RTTI Class Hierarchy Descriptor'", false),
-                            b'4' => ("`RTTI Complete Object Locator'", false),
+                            b'1' => ("`RTTI Base Class Descriptor'", SpecialKind::Normal),
+                            b'2' => ("`RTTI Base Class Array'", SpecialKind::Normal),
+                            b'3' => ("`RTTI Class Hierarchy Descriptor'", SpecialKind::Normal),
+                            b'4' => ("`RTTI Complete Object Locator'", SpecialKind::Normal),
                             _ => return None,
                         }
                     }
@@ -276,18 +286,18 @@ impl<'a> Parser<'a> {
             }
             _ => return None,
         };
-        Some((s.to_string(), is_ctor_or_dtor))
+        Some((s.to_string(), kind))
     }
 
-    fn parse_unqualified_name(&mut self) -> Option<(String, bool)> {
+    fn parse_unqualified_name(&mut self) -> Option<(String, SpecialKind)> {
         if self.peek() == Some(b'?') && self.peek_at(1) == Some(b'$') {
             self.pos += 2;
-            return Some((self.parse_template_name()?, false));
+            return Some((self.parse_template_name()?, SpecialKind::Normal));
         }
         if self.peek() == Some(b'?') {
             return self.parse_special_name();
         }
-        Some((self.parse_simple_ident()?, false))
+        Some((self.parse_simple_ident()?, SpecialKind::Normal))
     }
 
     fn parse_scope_chain(&mut self) -> Option<Vec<String>> {
@@ -326,11 +336,11 @@ impl<'a> Parser<'a> {
         None
     }
 
-    fn parse_qualified_name(&mut self) -> Option<(String, bool)> {
-        let (unqual, is_cd) = self.parse_unqualified_name()?;
+    fn parse_qualified_name(&mut self) -> Option<(String, SpecialKind)> {
+        let (unqual, kind) = self.parse_unqualified_name()?;
         let mut scopes = self.parse_scope_chain()?;
         scopes.reverse();
-        let leaf = if is_cd {
+        let leaf = if kind == SpecialKind::CtorOrDtor {
             let class_name = scopes.last().cloned().unwrap_or_default();
             let base = class_name.split('<').next().unwrap_or(&class_name);
             if unqual == "{ctor}" {
@@ -342,10 +352,10 @@ impl<'a> Parser<'a> {
             unqual
         };
         if scopes.is_empty() {
-            Some((leaf, is_cd))
+            Some((leaf, kind))
         } else {
             scopes.push(leaf);
-            Some((scopes.join("::"), is_cd))
+            Some((scopes.join("::"), kind))
         }
     }
 
@@ -535,6 +545,7 @@ impl<'a> Parser<'a> {
             if b == b'Z' {
                 self.pos += 1;
                 params.push("...".to_string());
+                let _ = self.eat(b'Z');
                 break;
             }
             params.push(self.parse_type(true)?);
@@ -553,12 +564,12 @@ impl<'a> Parser<'a> {
         if !self.eat(b'?') {
             return None;
         }
-        let (qname, is_ctor_or_dtor) = self.parse_qualified_name()?;
-        if (self.flags & UNDNAME_NAME_ONLY) != 0 {
+        let (mut qname, kind) = self.parse_qualified_name()?;
+        if (self.flags & UNDNAME_NAME_ONLY) != 0 && kind != SpecialKind::Conversion {
             return Some(qname);
         }
         let Some(sc) = self.bump() else {
-            return Some(qname);
+            return if kind == SpecialKind::Conversion { None } else { Some(qname) };
         };
         // Data members / globals (`0`..`3`) and special tables (`6`, `7`)
         match sc {
@@ -624,12 +635,19 @@ impl<'a> Parser<'a> {
             this_cv = self.parse_cv()?;
         }
         let cc = self.parse_calling_conv()?;
-        let ret = if is_ctor_or_dtor {
+        let ret = if kind == SpecialKind::CtorOrDtor {
             let _ = self.eat(b'@');
             None
         } else {
             Some(self.parse_type(false)?)
         };
+        if kind == SpecialKind::Conversion {
+            let target = ret.as_deref()?;
+            qname = qname.replace("{conv}", target);
+            if (self.flags & UNDNAME_NAME_ONLY) != 0 {
+                return Some(qname);
+            }
+        }
         let params = self.parse_param_list()?;
 
         let mut out = String::new();
@@ -860,6 +878,30 @@ mod tests {
         assert_eq!(
             demangle_msvc("?f@@YAX_NPEAH0$$T2@Z", UNDNAME_NO_MS_KEYWORDS),
             "void f(bool,int *,bool,std::nullptr_t,std::nullptr_t)"
+        );
+
+        // Variadic function-pointer parameters consume the nested throw-spec terminator cleanly.
+        assert_eq!(
+            demangle_msvc("?pf@@YAXP6AHHZZ@Z", 0),
+            "void __cdecl pf(int (__cdecl *)(int,...))"
+        );
+        assert_eq!(
+            demangle_msvc("?pf2@@YAXP6AHZZ@Z", 0),
+            "void __cdecl pf2(int (__cdecl *)(...))"
+        );
+
+        // Conversion operators (`??B`) splice the target type into the operator name.
+        assert_eq!(
+            demangle_msvc("??BA@@QEBAHXZ", 0),
+            "public: int __cdecl A::operator int(void) const"
+        );
+        assert_eq!(
+            demangle_msvc("??BA@@QEBAHXZ", UNDNAME_NO_FUNCTION_RETURNS),
+            "public: __cdecl A::operator int(void) const"
+        );
+        assert_eq!(
+            demangle_msvc("??BA@@QEBAHXZ", UNDNAME_NAME_ONLY),
+            "A::operator int"
         );
 
         // Non-mangled C names pass through unchanged; deeply nested garbage never panics.
