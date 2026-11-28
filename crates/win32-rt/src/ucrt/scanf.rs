@@ -652,6 +652,7 @@ pub unsafe extern "win64" fn __stdio_common_vfscanf(
         super::runtime::invalid_parameter("fscanf: NULL");
         return -1;
     }
+    let _lock = super::stdio::Locked::new();
     let mut input = Input::from_stream(false, fp, super::locale::locale_obj_cp(loc));
     let mut a = VaList::new(va);
     let r = scan(&mut input, fmt, opts, loc, &mut a);
@@ -671,6 +672,7 @@ pub unsafe extern "win64" fn __stdio_common_vfwscanf(
         super::runtime::invalid_parameter("fwscanf: NULL");
         return -1;
     }
+    let _lock = super::stdio::Locked::new();
     let mut input = Input::from_stream(true, fp, super::locale::locale_obj_cp(loc));
     let mut a = VaList::new(va);
     let r = scan(&mut input, fmt as *const u8, opts, loc, &mut a);
@@ -1152,6 +1154,66 @@ mod tests {
             assert_eq!(stdio::fgetwc(fp_u16), b'Q' as u32);
             assert_eq!(stdio::fgetwc(fp_u16), WEOF);
             stdio::fclose(fp_u16);
+        }
+    }
+
+    #[test]
+    fn vfscanf_concurrent_readers_serialize_stream_tokens() {
+        unsafe {
+            use crate::ucrt::stdio;
+
+            const COUNT: usize = 200;
+            let fp = stdio::tmpfile();
+            assert!(!fp.is_null());
+            let mut payload = String::new();
+            for i in 0..COUNT {
+                payload.push_str(&format!("{:05}:{:05}\n", i, i * 3 + 7));
+            }
+            assert_eq!(
+                stdio::fwrite(payload.as_ptr().cast(), 1, payload.len(), fp),
+                payload.len()
+            );
+            stdio::rewind(fp);
+
+            let fp_addr = fp as usize;
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                handles.push(std::thread::spawn(move || {
+                    let mut pairs = Vec::new();
+                    loop {
+                        let mut a: i32 = -1;
+                        let mut b: i32 = -1;
+                        let args: [u64; 2] = [
+                            &mut a as *mut i32 as u64,
+                            &mut b as *mut i32 as u64,
+                        ];
+                        let n = __stdio_common_vfscanf(
+                            0,
+                            fp_addr as *mut stdio::FILE,
+                            b"%d:%d\0".as_ptr(),
+                            std::ptr::null_mut(),
+                            args.as_ptr() as *const u8,
+                        );
+                        if n == -1 {
+                            break;
+                        }
+                        assert_eq!(n, 2, "concurrent vfscanf corrupted a token pair");
+                        pairs.push((a, b));
+                    }
+                    pairs
+                }));
+            }
+
+            let mut all = Vec::with_capacity(COUNT);
+            for h in handles {
+                all.extend(h.join().unwrap());
+            }
+            all.sort_unstable();
+            assert_eq!(all.len(), COUNT);
+            for (i, &(a, b)) in all.iter().enumerate() {
+                assert_eq!((a, b), (i as i32, (i * 3 + 7) as i32));
+            }
+            stdio::fclose(fp);
         }
     }
 }

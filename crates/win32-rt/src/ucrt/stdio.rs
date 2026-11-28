@@ -61,9 +61,9 @@ impl RecLock {
 
 static STDIO_LOCK: RecLock = RecLock::new();
 
-struct Locked;
+pub(super) struct Locked;
 impl Locked {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         STDIO_LOCK.acquire();
         Locked
     }

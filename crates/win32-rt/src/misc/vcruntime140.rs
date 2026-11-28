@@ -518,6 +518,39 @@ pub(crate) unsafe fn destruct_exception_object(rec: *const ExceptionRecord) {
     }
 }
 
+/// Raise an MSVC x64 C++ exception with an explicit `throw_image_base` (used by
+/// builtin runtime throw helpers whose `ThrowInfo` slab lives in `win32-rt` static data
+/// rather than a loaded guest PE image).
+pub(crate) unsafe fn throw_cxx_exception_with_base(
+    exception_object: *mut c_void,
+    throw_info: *const u8,
+    image_base: usize,
+) {
+    let args: [u64; 4] = [
+        0x1993_0520,
+        exception_object as u64,
+        throw_info as u64,
+        image_base as u64,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        type RaiseExceptionFn = unsafe extern "win64" fn(u32, u32, u32, *const u64);
+        let raise: RaiseExceptionFn = std::mem::transmute(RaiseException as *const ());
+        raise(CXX_EXCEPTION, EXCEPTION_NONCONTINUABLE, 4, args.as_ptr());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = RaiseException(
+            CXX_EXCEPTION as u64,
+            EXCEPTION_NONCONTINUABLE as u64,
+            4,
+            args.as_ptr() as u64,
+            0,
+            0,
+        );
+    }
+}
+
 /// `_CxxThrowException` (`0x180006b10`).
 pub unsafe extern "win64" fn _CxxThrowException(
     exception_object: *mut c_void,
