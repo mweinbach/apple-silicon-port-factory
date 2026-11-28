@@ -302,6 +302,15 @@ cohtml_icuuc.dll	?getName@Locale@icu_69@@QEBAPEBDXZ	-	ENGINE_MIDDLEWARE	real	win
 cohtml_icuuc.dll	?getRoot@Locale@icu_69@@SAAEBV12@XZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::EXTRA_EXPORTS[?getRoot@Locale@icu_69@@SAAEBV12@XZ]	crates/win32-rt/src/misc/cohtml_icuuc.rs
 cohtml_icuuc.dll	?getUS@Locale@icu_69@@SAAEBV12@XZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::EXTRA_EXPORTS[?getUS@Locale@icu_69@@SAAEBV12@XZ]	crates/win32-rt/src/misc/cohtml_icuuc.rs
 cohtml_icuuc.dll	?getVariant@Locale@icu_69@@QEBAPEBDXZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::EXTRA_EXPORTS[?getVariant@Locale@icu_69@@QEBAPEBDXZ]	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	?length@UnicodeString@icu_69@@QEBAHXZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::EXTRA_EXPORTS[?length@UnicodeString@icu_69@@QEBAHXZ]	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	u_setMemoryFunctions_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::u_setMemoryFunctions_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	ubidi_close_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::ubidi_close_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	ubidi_countRuns_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::ubidi_countRuns_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	ubidi_getBaseDirection_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::ubidi_getBaseDirection_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	ubidi_getDirection_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::ubidi_getDirection_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	ubidi_getVisualRun_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::ubidi_getVisualRun_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	ubidi_openSized_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::ubidi_openSized_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
+cohtml_icuuc.dll	ubidi_setPara_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::ubidi_setPara_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
 cohtml_icuuc.dll	udata_setCommonData_69	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_icuuc::udata_setCommonData_69	crates/win32-rt/src/misc/cohtml_icuuc.rs
 cohtml_windowsdesktop.dll	??0IAllocator@cohtml@@QEAA@XZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_windowsdesktop::EXTRA_EXPORTS[??0IAllocator@cohtml@@QEAA@XZ]	crates/win32-rt/src/misc/cohtml_windowsdesktop.rs
 cohtml_windowsdesktop.dll	??0IAsyncResourceHandler@cohtml@@IEAA@XZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::cohtml_windowsdesktop::EXTRA_EXPORTS[??0IAsyncResourceHandler@cohtml@@IEAA@XZ]	crates/win32-rt/src/misc/cohtml_windowsdesktop.rs
@@ -1064,6 +1073,7 @@ kernel32.dll	FindResourceW	-	CORE_OS	real	win32_rt::kernel32::module::FindResour
 kernel32.dll	FlsAlloc	-	CORE_OS	real	win32_rt::kernel32::threads::FlsAlloc	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	FlsFree	-	CORE_OS	real	win32_rt::kernel32::threads::FlsFree	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	FlsGetValue	-	CORE_OS	real	win32_rt::kernel32::threads::FlsGetValue	crates/win32-rt/src/kernel32/threads.rs
+kernel32.dll	FlsGetValue2	-	CORE_OS	real	win32_rt::kernel32::threads::FlsGetValue2	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	FlsSetValue	-	CORE_OS	real	win32_rt::kernel32::threads::FlsSetValue	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	FlushFileBuffers	-	CORE_OS	real	win32_rt::kernel32::file::FlushFileBuffers	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	FlushInstructionCache	-	CORE_OS	real	win32_rt::kernel32::memory::FlushInstructionCache	crates/win32-rt/src/kernel32/memory.rs

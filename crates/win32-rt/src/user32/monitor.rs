@@ -387,11 +387,12 @@ fn display_device_info(device: Option<&str>, dev_num: u32) -> Option<(String, St
     if m.primary {
         flags |= DISPLAY_DEVICE_PRIMARY_DEVICE;
     }
+    let gpu = crate::misc::setupapi::primary_display_adapter();
     Some((
         format!("\\\\.\\DISPLAY{}", dev_num + 1),
-        "Apple GPU".to_string(),
+        gpu.name,
         flags,
-        "PCI\\VEN_106B&DEV_0001&SUBSYS_00000000&REV_00".to_string(),
+        gpu.pci_id,
         format!("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Video\\{{00000000-0000-0000-0000-000000000001}}\\{:04}", dev_num),
     ))
 }

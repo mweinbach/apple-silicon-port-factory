@@ -1865,6 +1865,224 @@ fn promoted_plain_leaf_exports_and_heap_inline_variants() {
     }
 }
 
+/// Verify UCRT numeric conversion/stdio, kernel32 file/event/handle, and advapi32 registry
+/// leaf promotions (`DF_PLAIN` / `DF_PLAIN | DF_PLAIN_XMM`), keep APC-capable (`ReadFileEx` /
+/// `WriteFileEx`) and >8-arg (`RegCreateKeyEx*`) exports off `DF_PLAIN`, and prove JIT vs
+/// interpreter parity (including `xmm0` preservation for `_strtoui64` and `xmm0` double return
+/// for `strtod`).
+#[test]
+fn promoted_ucrt_convert_stdio_and_win32_io_leaves_df_plain() {
+    use crate::emu::{resolve_dispatch, DF_PLAIN, DF_PLAIN_XMM};
+
+    let exp = |dll: &str, name: &str| -> usize {
+        win32_rt::lookup(dll, name)
+            .unwrap_or_else(|| panic!("expected builtin export {dll}!{name}")) as usize
+    };
+    let scratch = arena_alloc(0x1000, 16) as u64;
+    let mut next_va = scratch;
+    let mut alloc_va = || {
+        let va = next_va;
+        next_va += 16;
+        va
+    };
+
+    let int_leaves: &[(&str, &str)] = &[
+        ("ucrtbase.dll", "_strtoui64"),
+        ("ucrtbase.dll", "_strtoi64"),
+        ("ucrtbase.dll", "_strtoui64_l"),
+        ("ucrtbase.dll", "_strtoi64_l"),
+        ("ucrtbase.dll", "strtoull"),
+        ("ucrtbase.dll", "strtoll"),
+        ("ucrtbase.dll", "strtoul"),
+        ("ucrtbase.dll", "strtol"),
+        ("ucrtbase.dll", "_wcstoui64"),
+        ("ucrtbase.dll", "_wcstoi64"),
+        ("ucrtbase.dll", "atoi"),
+        ("ucrtbase.dll", "_atoi64"),
+        ("ucrtbase.dll", "fread"),
+        ("ucrtbase.dll", "fwrite"),
+        ("ucrtbase.dll", "feof"),
+        ("ucrtbase.dll", "ferror"),
+        ("ucrtbase.dll", "fseek"),
+        ("ucrtbase.dll", "_fseeki64"),
+        ("ucrtbase.dll", "ftell"),
+        ("ucrtbase.dll", "_ftelli64"),
+        ("ucrtbase.dll", "fflush"),
+        ("ucrtbase.dll", "fgetc"),
+        ("ucrtbase.dll", "fgets"),
+        ("ucrtbase.dll", "ungetc"),
+        ("kernel32.dll", "CloseHandle"),
+        ("kernel32.dll", "CreateEventA"),
+        ("kernel32.dll", "CreateEventW"),
+        ("kernel32.dll", "CreateEventExA"),
+        ("kernel32.dll", "CreateEventExW"),
+        ("kernel32.dll", "GetFullPathNameA"),
+        ("kernel32.dll", "GetFullPathNameW"),
+        ("kernel32.dll", "ReadFile"),
+        ("kernel32.dll", "WriteFile"),
+        ("kernel32.dll", "CreateFileA"),
+        ("kernel32.dll", "CreateFileW"),
+        ("advapi32.dll", "RegOpenKeyExA"),
+        ("advapi32.dll", "RegOpenKeyExW"),
+        ("advapi32.dll", "RegQueryValueExA"),
+        ("advapi32.dll", "RegQueryValueExW"),
+        ("advapi32.dll", "RegSetValueExA"),
+        ("advapi32.dll", "RegSetValueExW"),
+        ("advapi32.dll", "RegCloseKey"),
+        ("advapi32.dll", "RegFlushKey"),
+    ];
+    for &(dll, name) in int_leaves {
+        let p = exp(dll, name);
+        let va = alloc_va();
+        crate::exe::register_native_va(va, p);
+        let (h, fl) = resolve_dispatch(va);
+        assert_eq!(h, p, "{dll}!{name}: host fn mismatch");
+        assert_eq!(
+            fl & (DF_PLAIN | DF_PLAIN_XMM),
+            DF_PLAIN,
+            "{dll}!{name}: expected DF_PLAIN without DF_PLAIN_XMM, got flags={fl:#x}"
+        );
+        crate::exe::unregister_native_va(va);
+    }
+
+    let float_leaves: &[(&str, &str)] = &[
+        ("ucrtbase.dll", "strtod"),
+        ("ucrtbase.dll", "strtof"),
+        ("ucrtbase.dll", "strtold"),
+        ("ucrtbase.dll", "_strtod_l"),
+        ("ucrtbase.dll", "_strtof_l"),
+        ("ucrtbase.dll", "atof"),
+        ("ucrtbase.dll", "_atof_l"),
+        ("ucrtbase.dll", "wcstod"),
+        ("ucrtbase.dll", "wcstof"),
+    ];
+    for &(dll, name) in float_leaves {
+        let p = exp(dll, name);
+        let va = alloc_va();
+        crate::exe::register_native_va(va, p);
+        let (h, fl) = resolve_dispatch(va);
+        assert_eq!(h, p, "{dll}!{name}: host fn mismatch");
+        assert_eq!(
+            fl & (DF_PLAIN | DF_PLAIN_XMM),
+            DF_PLAIN | DF_PLAIN_XMM,
+            "{dll}!{name}: expected DF_PLAIN | DF_PLAIN_XMM, got flags={fl:#x}"
+        );
+        crate::exe::unregister_native_va(va);
+    }
+
+    // APC-capable and >8-arg exports must stay off DF_PLAIN.
+    for &(dll, name) in &[
+        ("kernel32.dll", "ReadFileEx"),
+        ("kernel32.dll", "WriteFileEx"),
+        ("advapi32.dll", "RegCreateKeyExA"),
+        ("advapi32.dll", "RegCreateKeyExW"),
+    ] {
+        let p = exp(dll, name);
+        let va = alloc_va();
+        crate::exe::register_native_va(va, p);
+        let (_, fl) = resolve_dispatch(va);
+        assert_eq!(fl & DF_PLAIN, 0, "{dll}!{name}: must NOT have DF_PLAIN");
+        crate::exe::unregister_native_va(va);
+    }
+
+    // Live JIT vs interpreter parity for _strtoui64, _strtoi64, strtod, CreateEventW, CloseHandle.
+    let reg = |dll: &str, name: &str, alloc: &mut dyn FnMut() -> u64| -> u64 {
+        let p = exp(dll, name);
+        let va = alloc();
+        crate::exe::register_native_va(va, p);
+        va
+    };
+    let va_strtoui64 = reg("ucrtbase.dll", "_strtoui64", &mut alloc_va);
+    let va_strtoi64 = reg("ucrtbase.dll", "_strtoi64", &mut alloc_va);
+    let va_strtod = reg("ucrtbase.dll", "strtod", &mut alloc_va);
+    let va_create_ev = reg("kernel32.dll", "CreateEventW", &mut alloc_va);
+    let va_close_h = reg("kernel32.dll", "CloseHandle", &mut alloc_va);
+    let registered = [va_strtoui64, va_strtoi64, va_strtod, va_create_ev, va_close_h];
+
+    let c = arena_alloc(0x400, 16);
+    let code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.push(rbx)?;
+        a.sub(rsp, 0x30)?;
+        a.mov(rbx, rcx)?; // rbx = data buffer
+
+        // Load sentinel into xmm0 before pure-integer _strtoui64("0x1234abcd5678ef90", &end, 16)
+        a.mov(rax, 0x2244_6688_AACC_EE00u64 as i64)?;
+        a.movq(xmm0, rax)?;
+        a.lea(rcx, ptr(rbx + 0x100))?;
+        a.lea(rdx, ptr(rbx + 0x08))?;
+        a.mov(r8d, 16)?;
+        a.call(va_strtoui64)?;
+        a.mov(qword_ptr(rbx + 0x00), rax)?; // [0x00] = parsed u64
+        a.movq(rax, xmm0)?;
+        a.mov(qword_ptr(rbx + 0x10), rax)?; // [0x10] = preserved xmm0 sentinel
+
+        // _strtoi64("-9876543210", &end, 10)
+        a.lea(rcx, ptr(rbx + 0x140))?;
+        a.lea(rdx, ptr(rbx + 0x20))?;
+        a.mov(r8d, 10)?;
+        a.call(va_strtoi64)?;
+        a.mov(qword_ptr(rbx + 0x18), rax)?; // [0x18] = -9876543210
+
+        // strtod("3.25e2", &end) -> returns 325.0 in xmm0
+        a.lea(rcx, ptr(rbx + 0x180))?;
+        a.lea(rdx, ptr(rbx + 0x30))?;
+        a.call(va_strtod)?;
+        a.movq(rax, xmm0)?;
+        a.mov(qword_ptr(rbx + 0x28), rax)?; // [0x28] = 325.0f64.to_bits()
+
+        // CreateEventW(NULL, 1, 0, NULL) -> CloseHandle(h)
+        a.xor(ecx, ecx)?;
+        a.mov(edx, 1)?;
+        a.xor(r8d, r8d)?;
+        a.xor(r9d, r9d)?;
+        a.call(va_create_ev)?;
+        a.mov(rcx, rax)?;
+        a.call(va_close_h)?;
+        a.mov(dword_ptr(rbx + 0x38), eax)?; // [0x38] = TRUE (1)
+
+        a.xor(eax, eax)?;
+        a.add(rsp, 0x30)?;
+        a.pop(rbx)?;
+        a.ret()?;
+        a.assemble(c as u64)
+    })()
+    .expect("assemble");
+
+    let d = arena_alloc(DATA, 64);
+    let mut init = vec![0u8; DATA];
+    let s_hex = b"0x1234abcd5678ef90!\0";
+    let s_neg = b"-9876543210z\0";
+    let s_flt = b"3.25e2x\0";
+    init[0x100..0x100 + s_hex.len()].copy_from_slice(s_hex);
+    init[0x140..0x140 + s_neg.len()].copy_from_slice(s_neg);
+    init[0x180..0x180 + s_flt.len()].copy_from_slice(s_flt);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), c, code.len());
+        let interp = run_mode(c, d, &init, 2);
+        let jit1 = run_mode(c, d, &init, 1);
+        let jit2 = run_mode(c, d, &init, 1);
+        for va in registered {
+            crate::exe::unregister_native_va(va);
+        }
+        for (label, got) in [("jit1", &jit1), ("jit2", &jit2)] {
+            assert_eq!(got.0, interp.0, "{label}: return mismatch");
+            assert_eq!(&got.1[..0x40], &interp.1[..0x40], "{label}: result mismatch vs interp");
+        }
+        let r64 = |off: usize| u64::from_le_bytes(jit2.1[off..off + 8].try_into().unwrap());
+        let r32 = |off: usize| u32::from_le_bytes(jit2.1[off..off + 4].try_into().unwrap());
+        assert_eq!(r64(0x00), 0x1234_abcd_5678_ef90);
+        assert_eq!(r64(0x08), d as u64 + 0x100 + 18); // stopped at '!'
+        assert_eq!(r64(0x10), 0x2244_6688_AACC_EE00); // xmm0 preserved across _strtoui64
+        assert_eq!(r64(0x18) as i64, -9_876_543_210i64);
+        assert_eq!(r64(0x20), d as u64 + 0x140 + 11); // stopped at 'z'
+        assert_eq!(r64(0x28), 325.0f64.to_bits());
+        assert_eq!(r64(0x30), d as u64 + 0x180 + 6); // stopped at 'x'
+        assert_eq!(r32(0x38), 1); // CloseHandle -> TRUE
+    }
+}
+
 // --- memory checks / push-pop / budget (AW2_JIT_MEMCHK, AW2_JIT_PUSHPOP, AW2_JIT_BUDGET_BACKEDGE)
 
 const MC_DATA: usize = 0x1000;

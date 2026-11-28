@@ -123,17 +123,40 @@ impl FuncMap {
         self.ranges.is_empty()
     }
 
+    /// `.pdata` range `(begin, end, root)` containing `rva`, or `None` if `rva` is `.pdata`-less.
+    pub(super) fn range_of(&self, rva: u32) -> Option<(u32, u32, u32)> {
+        let i = self.ranges.partition_point(|r| r.0 <= rva);
+        let &(b, e, root) = self.ranges.get(i.checked_sub(1)?)?;
+        (rva < e).then_some((b, e, root))
+    }
+
     /// Root begin RVA of the function containing `rva` (None: no `.pdata` entry, e.g. a
     /// leaf function).
     pub(super) fn root_of(&self, rva: u32) -> Option<u32> {
-        let i = self.ranges.partition_point(|r| r.0 <= rva);
-        let &(_, e, root) = self.ranges.get(i.checked_sub(1)?)?;
-        (rva < e).then_some(root)
+        self.range_of(rva).map(|(_, _, root)| root)
     }
 
     /// Distinct roots (functions).
     pub(super) fn functions(&self) -> usize {
         self.ranges.iter().filter(|r| r.0 == r.2).count()
+    }
+}
+
+/// Advance `begin` past contiguous leading `0xCC` (`int3`) alignment/guard bytes inside
+/// `[begin, end)` (capped at 64 bytes). Returns `begin` unchanged if the range does not
+/// start with `0xCC` or contains no non-`0xCC` byte within the cap.
+///
+/// Safety: `[base + begin, base + end)` must lie within the mapped image.
+unsafe fn skip_leading_int3(base: usize, begin: u32, end: u32) -> u32 {
+    let mut rva = begin;
+    let lim = end.min(begin.saturating_add(64));
+    while rva < lim && *(base as *const u8).add(rva as usize) == 0xCC {
+        rva += 1;
+    }
+    if rva < end && *(base as *const u8).add(rva as usize) != 0xCC {
+        rva
+    } else {
+        begin
     }
 }
 
@@ -388,9 +411,38 @@ unsafe fn discover_inner(
                 let mut is_leaf_entry = false;
                 let mut next_leaf_hops = 0u32;
                 if !fmap.is_empty() {
-                    let sf = func(s);
+                    let s_rva_u64 = s.wrapping_sub(base as u64);
+                    let s_range = (s_rva_u64 < size as u64)
+                        .then(|| fmap.range_of(s_rva_u64 as u32))
+                        .flatten();
+                    let sf = s_range.map(|(_, _, root)| root);
+                    let is_cross_pdata_interior = || -> bool {
+                        if let (Some(_), Some((sb, se, _))) = (f, s_range) {
+                            let entry = skip_leading_int3(base, sb, se);
+                            (s_rva_u64 as u32) > entry && is_plausible_code_entry(s, &text)
+                        } else {
+                            false
+                        }
+                    };
                     match kind {
-                        EdgeKind::Intra | EdgeKind::JumpTable => {
+                        EdgeKind::Intra => {
+                            if past_leaf_depth {
+                                continue;
+                            }
+                            if sf != f {
+                                if is_cross_pdata_interior() {
+                                    // Split-unwind-region branch (e.g. embedded builtins or
+                                    // unchained cold/hot `.pdata` fragments) targeting the
+                                    // strict interior of a sibling `.pdata` range: follow
+                                    // without leaking caller switch hints.
+                                    out_hint = None;
+                                } else {
+                                    st.cross += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        EdgeKind::JumpTable => {
                             if sf != f || past_leaf_depth {
                                 if sf != f {
                                     st.cross += 1;
@@ -418,6 +470,12 @@ unsafe fn discover_inner(
                                     // `.pdata`-less leaf helper: follow cleanly without leaking
                                     // caller switch hints.
                                     is_leaf_entry = true;
+                                    out_hint = None;
+                                } else if is_cross_pdata_interior() {
+                                    // Unconditional jump from a `.pdata` function into the
+                                    // strict interior of another `.pdata` range (split-unwind
+                                    // fragment or shared epilogue tail): follow without
+                                    // leaking caller switch hints.
                                     out_hint = None;
                                 } else {
                                     st.cross += 1;
@@ -869,9 +927,10 @@ pub(super) unsafe fn discover_pe_roots(base: usize, size: usize, max_roots: usiz
     };
     let mut roots = Vec::new();
     let fmap = FuncMap::read(base, size);
-    for &(begin, _, _) in &fmap.ranges {
+    for &(begin, end, _) in &fmap.ranges {
         if in_text(begin) {
-            roots.push(begin);
+            let entry = skip_leading_int3(base, begin, end);
+            roots.push(if in_text(entry) { entry } else { begin });
         }
     }
     if let Some(ep) = entry_point_rva(base, size) {

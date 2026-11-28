@@ -5,7 +5,9 @@
 //! through [`ptr`]; the loader calls [`set_base`] with the actual image base
 //! before any replacement runs (it is relocated if 0x140000000 is taken).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Default ImageBase from the `AlanWake2.exe` PE header.
 pub const PREFERRED_BASE: u64 = 0x1_4000_0000;
@@ -18,16 +20,116 @@ static BASE: AtomicUsize = AtomicUsize::new(PREFERRED_BASE as usize);
 /// image base, host text range). Never 0, so 0 can mean "not cached".
 static VA_GEN: AtomicU32 = AtomicU32::new(1);
 
+/// Bumped whenever non-`VA_DISPATCH` dispatch state changes (`invalidate_dispatch`,
+/// `set_base`, `set_preferred_base`, `set_aw2_registry_active`). Never 0.
+static VA_STRUCTURAL_GEN: AtomicU32 = AtomicU32::new(1);
+
+const VA_DELTA_CAP: usize = 512;
+
+/// Summary of `VA_DISPATCH` / dispatch-routing changes since a previous `va_seq` snapshot.
+pub(crate) enum VaDelta {
+    /// A structural routing change occurred, the delta ring overflowed, or no prior snapshot
+    /// existed: callers must run a full revalidation across all modules.
+    Full,
+    /// Exact deduplicated set of `VA_DISPATCH` keys added, updated, or removed since `prev_seq`
+    /// with zero structural routing changes in between.
+    ChangedVas(Vec<u64>),
+}
+
+struct VaDeltaLog {
+    seq: u64,
+    full_seq: u64,
+    oldest_dropped_seq: u64,
+    ring: VecDeque<(u64, u64)>,
+}
+
+static VA_DELTA_LOG: Mutex<VaDeltaLog> = Mutex::new(VaDeltaLog {
+    seq: 1,
+    full_seq: 1,
+    oldest_dropped_seq: 0,
+    ring: VecDeque::new(),
+});
+
 #[inline(always)]
 pub fn va_gen() -> u32 {
     VA_GEN.load(Ordering::Acquire)
 }
 
+/// Race-free snapshot of `(va_seq, va_gen, va_structural_gen)` for incremental AOT revalidation.
+pub(crate) fn va_snapshot_gens() -> (u64, u32, u32) {
+    let log = VA_DELTA_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    (
+        log.seq,
+        VA_GEN.load(Ordering::Acquire),
+        VA_STRUCTURAL_GEN.load(Ordering::Acquire),
+    )
+}
+
+/// Return `(cur_seq, cur_va_gen, cur_structural_gen, delta)` summarizing every dispatch change
+/// after `prev_seq`.
+pub(crate) fn va_delta_since(prev_seq: u64) -> (u64, u32, u32, VaDelta) {
+    let log = VA_DELTA_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let cur_seq = log.seq;
+    let cur_vg = VA_GEN.load(Ordering::Acquire);
+    let cur_sg = VA_STRUCTURAL_GEN.load(Ordering::Acquire);
+    if prev_seq == 0 || prev_seq < log.full_seq || prev_seq <= log.oldest_dropped_seq {
+        return (cur_seq, cur_vg, cur_sg, VaDelta::Full);
+    }
+    let mut vas = Vec::new();
+    for &(s, va) in &log.ring {
+        if s > prev_seq {
+            vas.push(va);
+        }
+    }
+    vas.sort_unstable();
+    vas.dedup();
+    (cur_seq, cur_vg, cur_sg, VaDelta::ChangedVas(vas))
+}
+
 #[inline]
-fn bump_va_gen() {
+fn bump_va_gen_structural() {
     #[cfg(test)]
     let _w = (VA_GEN_HOLDS.try_with(|c| c.get()).unwrap_or(0) == 0)
         .then(|| TEST_VA_GEN_LOCK.write().unwrap_or_else(|e| e.into_inner()));
+    let mut log = VA_DELTA_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    log.seq = log.seq.wrapping_add(1).max(1);
+    log.full_seq = log.seq;
+    log.oldest_dropped_seq = 0;
+    log.ring.clear();
+    let mut sg = VA_STRUCTURAL_GEN.load(Ordering::Relaxed).wrapping_add(1);
+    if sg == 0 {
+        sg = 1;
+    }
+    VA_STRUCTURAL_GEN.store(sg, Ordering::Release);
+    let mut g = VA_GEN.load(Ordering::Relaxed).wrapping_add(1);
+    if g == 0 {
+        g = 1;
+    }
+    VA_GEN.store(g, Ordering::Release);
+}
+
+#[inline]
+fn bump_va_gen_vas(vas: &[u64]) {
+    #[cfg(test)]
+    let _w = (VA_GEN_HOLDS.try_with(|c| c.get()).unwrap_or(0) == 0)
+        .then(|| TEST_VA_GEN_LOCK.write().unwrap_or_else(|e| e.into_inner()));
+    let mut log = VA_DELTA_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    log.seq = log.seq.wrapping_add(1).max(1);
+    let seq = log.seq;
+    if vas.len() > VA_DELTA_CAP {
+        log.full_seq = seq;
+        log.oldest_dropped_seq = 0;
+        log.ring.clear();
+    } else {
+        for &va in vas {
+            if log.ring.len() == VA_DELTA_CAP {
+                if let Some((old_seq, _)) = log.ring.pop_front() {
+                    log.oldest_dropped_seq = log.oldest_dropped_seq.max(old_seq);
+                }
+            }
+            log.ring.push_back((seq, va));
+        }
+    }
     let mut g = VA_GEN.load(Ordering::Relaxed).wrapping_add(1);
     if g == 0 {
         g = 1;
@@ -38,7 +140,7 @@ fn bump_va_gen() {
 /// Invalidate every per-thread dispatch memo (bump [`va_gen`]) after a change that affects
 /// `emu::resolve_dispatch` outside the VA table (a DLL image's IAT directory registered).
 pub(crate) fn invalidate_dispatch() {
-    bump_va_gen();
+    bump_va_gen_structural();
 }
 
 /// Tests: generation bumps (`register_native_va`, ...) from other test threads wait while a
@@ -74,7 +176,7 @@ pub(crate) fn hold_va_gen() -> VaGenHold {
 pub fn set_preferred_base(preferred_base: u64, image_size: u64) {
     PREFERRED_BASE_DYN.store(preferred_base, Ordering::Relaxed);
     IMAGE_SIZE_DYN.store(image_size.max(0x1000), Ordering::Relaxed);
-    bump_va_gen();
+    bump_va_gen_structural();
 }
 
 #[inline(always)]
@@ -96,7 +198,7 @@ static AW2_REGISTRY_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Mark the AW2 replacement registry as applied (called by the loader's `apply_registry`).
 pub fn set_aw2_registry_active(active: bool) {
     AW2_REGISTRY_ACTIVE.store(active, Ordering::Relaxed);
-    bump_va_gen();
+    bump_va_gen_structural();
 }
 
 /// Whether the AW2 replacement registry is applied (main exe is `AlanWake2.exe`).
@@ -108,7 +210,7 @@ pub fn aw2_registry_active() -> bool {
 /// Record where the loader mapped the exe.
 pub fn set_base(base: usize) {
     BASE.store(base, Ordering::Relaxed);
-    bump_va_gen();
+    bump_va_gen_structural();
     crate::eh_rt::chain::ensure_hooks();
 }
 
@@ -127,6 +229,40 @@ pub fn ptr<T>(va: u64) -> *const T {
 const VA_TABLE_BITS: u32 = 21;
 const VA_TABLE_CAP: usize = 1 << VA_TABLE_BITS;
 const VA_TABLE_MASK: usize = VA_TABLE_CAP - 1;
+
+/// L1-resident 32 KiB (262,144-bit) 2-probe Bloom filter mirroring every VA ever inserted into
+/// [`VA_DISPATCH`] with a non-zero pointer. Rejects >99% of negative `lookup_native_va` probes
+/// in ~1.5 ns without touching the 32 MiB open-addressed table. Bits are set with `Release`
+/// before inserting into `VA_DISPATCH` and never cleared on unregister (false positives always
+/// fall through to the exact table).
+const VA_BLOOM_WORDS: usize = 4096;
+const VA_BLOOM_MASK: usize = (VA_BLOOM_WORDS * 64) - 1;
+static VA_BLOOM: [AtomicU64; VA_BLOOM_WORDS] = [const { AtomicU64::new(0) }; VA_BLOOM_WORDS];
+
+#[inline(always)]
+fn va_bloom_bits(va: u64) -> (usize, u64, usize, u64) {
+    let h1 = ((va.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 46) as usize) & VA_BLOOM_MASK;
+    let h2 = ((va.wrapping_mul(0x517C_C1B7_2722_0A95) >> 46) as usize) & VA_BLOOM_MASK;
+    (h1 >> 6, 1u64 << (h1 & 63), h2 >> 6, 1u64 << (h2 & 63))
+}
+
+#[inline(always)]
+fn va_bloom_set(va: u64) {
+    let (w1, b1, w2, b2) = va_bloom_bits(va);
+    VA_BLOOM[w1].fetch_or(b1, Ordering::Release);
+    VA_BLOOM[w2].fetch_or(b2, Ordering::Release);
+}
+
+/// Fast lock-free Bloom query: `false` guarantees `va` is NOT registered in [`VA_DISPATCH`].
+#[inline(always)]
+pub(crate) fn va_bloom_may_contain(va: u64) -> bool {
+    if va == 0 {
+        return false;
+    }
+    let (w1, b1, w2, b2) = va_bloom_bits(va);
+    (VA_BLOOM[w1].load(Ordering::Acquire) & b1) != 0
+        && (VA_BLOOM[w2].load(Ordering::Acquire) & b2) != 0
+}
 
 /// Lock-free open-addressed dispatch table mapping preferred-base exe VAs (`0x1_4000_0000..`)
 /// or actual mapped addresses to their compiled native Rust function pointers.
@@ -157,6 +293,9 @@ fn va_hash(va: u64) -> usize {
 fn va_table_insert(t: &[(std::sync::atomic::AtomicU64, AtomicUsize)], va: u64, ptr: usize) -> bool {
     if va == 0 {
         return false;
+    }
+    if ptr != 0 {
+        va_bloom_set(va);
     }
     let mut idx = va_hash(va);
     for _ in 0..VA_TABLE_CAP {
@@ -196,7 +335,7 @@ fn va_table_insert(t: &[(std::sync::atomic::AtomicU64, AtomicUsize)], va: u64, p
 
 #[inline(always)]
 fn va_table_get(t: &[(std::sync::atomic::AtomicU64, AtomicUsize)], va: u64) -> Option<usize> {
-    if va == 0 {
+    if !va_bloom_may_contain(va) {
         return None;
     }
     let mut idx = va_hash(va);
@@ -247,26 +386,38 @@ pub fn is_unregistered_host_text(addr: usize) -> bool {
 /// Register a native host function pointer `ptr` for preferred-base `va`.
 pub fn register_native_va(va: u64, ptr: usize) {
     if va_table_insert(va_table(), va, ptr) {
-        bump_va_gen();
+        bump_va_gen_vas(&[va]);
     }
 }
 
 /// Remove a registered entry for `va` from the native VA dispatch table.
 pub fn unregister_native_va(va: u64) {
     if va_table_insert(va_table(), va, 0) {
-        bump_va_gen();
+        bump_va_gen_vas(&[va]);
     }
 }
 
 /// Bulk-register `(va, ptr)` pairs in the native VA dispatch table.
 pub fn register_native_vas(entries: impl IntoIterator<Item = (u64, usize)>) {
     let t = va_table();
-    let mut changed = false;
+    let mut changed_vas: Vec<u64> = Vec::new();
+    let mut overflow = false;
     for (va, ptr) in entries {
-        changed |= va_table_insert(t, va, ptr);
+        if va_table_insert(t, va, ptr) {
+            if !overflow {
+                if changed_vas.len() < VA_DELTA_CAP {
+                    changed_vas.push(va);
+                } else {
+                    overflow = true;
+                    changed_vas.clear();
+                }
+            }
+        }
     }
-    if changed {
-        bump_va_gen();
+    if overflow {
+        bump_va_gen_structural();
+    } else if !changed_vas.is_empty() {
+        bump_va_gen_vas(&changed_vas);
     }
 }
 

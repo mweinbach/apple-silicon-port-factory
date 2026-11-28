@@ -466,6 +466,13 @@ unsafe fn pe_exec_sections(base: usize, size: usize) -> Vec<(usize, usize)> {
 /// and any direct `jmp rel32` (`E9`) thunks targeting a detected [`CHKSTK_SIG`] body (such as
 /// `lld-link` incremental jump stubs in `v8.dll` and `v8_libbase.dll`).
 pub(crate) unsafe fn scan_pe_chkstk(base: usize, size: usize) -> Vec<u64> {
+    // Anchor on the `gs:` segment override byte (`0x65`) at offset 28 inside `CHKSTK_SIG`:
+    // one of the rarest bytes in x86-64 code, letting vectorized `memchr` skip nearly the
+    // entire `.text` section without byte-by-byte scalar iteration.
+    const ANCHOR_OFF: usize = 28;
+    const ANCHOR_BYTE: u8 = 0x65;
+    const _: () = assert!(CHKSTK_SIG[ANCHOR_OFF] == ANCHOR_BYTE);
+
     let secs = pe_exec_sections(base, size);
     let mut bodies = Vec::new();
     let head = u32::from_le_bytes([CHKSTK_SIG[0], CHKSTK_SIG[1], CHKSTK_SIG[2], CHKSTK_SIG[3]]);
@@ -475,16 +482,26 @@ pub(crate) unsafe fn scan_pe_chkstk(base: usize, size: usize) -> Vec<u64> {
             continue;
         }
         let bytes = core::slice::from_raw_parts(s as *const u8, len);
-        let limit = len - CHKSTK_SIG.len();
-        let mut off = 0;
-        while off <= limit {
+        let search_end = len - CHKSTK_SIG.len() + ANCHOR_OFF + 1;
+        let mut pos = ANCHOR_OFF;
+        while pos < search_end {
+            let p = win32_rt::libc::memchr(
+                bytes.as_ptr().add(pos) as *const win32_rt::libc::c_void,
+                ANCHOR_BYTE as win32_rt::libc::c_int,
+                search_end - pos,
+            );
+            if p.is_null() {
+                break;
+            }
+            let hit = (p as usize) - (bytes.as_ptr() as usize);
+            let off = hit - ANCHOR_OFF;
             if core::ptr::read_unaligned(bytes.as_ptr().add(off) as *const u32) == head
                 && bytes[off..off + CHKSTK_SIG.len()] == CHKSTK_SIG
             {
                 bodies.push((s + off) as u64);
-                off += CHKSTK_SIG.len();
+                pos = off + CHKSTK_SIG.len() + ANCHOR_OFF;
             } else {
-                off += 1;
+                pos = hit + 1;
             }
         }
     }
@@ -498,14 +515,24 @@ pub(crate) unsafe fn scan_pe_chkstk(base: usize, size: usize) -> Vec<u64> {
             continue;
         }
         let bytes = core::slice::from_raw_parts(s as *const u8, len);
-        for off in 0..=len - 5 {
-            if bytes[off] == 0xE9 {
-                let rel = core::ptr::read_unaligned(bytes.as_ptr().add(off + 1) as *const i32) as i64;
-                let tgt = ((s + off + 5) as u64).wrapping_add(rel as u64);
-                if bodies.contains(&tgt) {
-                    found.push((s + off) as u64);
-                }
+        let search_end = len - 4;
+        let mut off = 0;
+        while off < search_end {
+            let p = win32_rt::libc::memchr(
+                bytes.as_ptr().add(off) as *const win32_rt::libc::c_void,
+                0xE9,
+                search_end - off,
+            );
+            if p.is_null() {
+                break;
             }
+            let hit = (p as usize) - (bytes.as_ptr() as usize);
+            let rel = core::ptr::read_unaligned(bytes.as_ptr().add(hit + 1) as *const i32) as i64;
+            let tgt = ((s + hit + 5) as u64).wrapping_add(rel as u64);
+            if bodies.contains(&tgt) {
+                found.push((s + hit) as u64);
+            }
+            off = hit + 1;
         }
     }
     found
@@ -575,6 +602,7 @@ static STACK_POS_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub(crate) unsafe fn scan_pe_stack_pos(base: usize, size: usize) -> Vec<u64> {
     let secs = pe_exec_sections(base, size);
     let mut bodies = Vec::new();
+    let head = u32::from_le_bytes([STACK_POS_SIG[0], STACK_POS_SIG[1], STACK_POS_SIG[2], STACK_POS_SIG[3]]);
     for &(s, e) in &secs {
         let len = e - s;
         if len < STACK_POS_SIG.len() {
@@ -582,21 +610,18 @@ pub(crate) unsafe fn scan_pe_stack_pos(base: usize, size: usize) -> Vec<u64> {
         }
         let bytes = core::slice::from_raw_parts(s as *const u8, len);
         let limit = len - STACK_POS_SIG.len();
-        let mut off = 0;
+        // Only 16-byte-aligned addresses `(s + off) & 0xF == 0` can match: stride by 16.
+        let mut off = (16 - (s & 0xF)) & 0xF;
         while off <= limit {
-            let aligned_boundary = (s + off) & 0xF == 0
-                && (off == 0 || matches!(bytes[off - 1], 0xCC | 0xC3 | 0x90));
-            let clean_after = off + STACK_POS_SIG.len() == len
-                || matches!(bytes[off + STACK_POS_SIG.len()], 0xCC | 0x90);
-            if aligned_boundary
-                && clean_after
-                && bytes[off..off + STACK_POS_SIG.len()] == STACK_POS_SIG
+            if core::ptr::read_unaligned(bytes.as_ptr().add(off) as *const u32) == head
+                && bytes[off + 4] == STACK_POS_SIG[4]
+                && (off == 0 || matches!(bytes[off - 1], 0xCC | 0xC3 | 0x90))
+                && (off + STACK_POS_SIG.len() == len
+                    || matches!(bytes[off + STACK_POS_SIG.len()], 0xCC | 0x90))
             {
                 bodies.push((s + off) as u64);
-                off += 16;
-            } else {
-                off += 1;
             }
+            off += 16;
         }
     }
     if bodies.is_empty() {
@@ -609,17 +634,20 @@ pub(crate) unsafe fn scan_pe_stack_pos(base: usize, size: usize) -> Vec<u64> {
             continue;
         }
         let bytes = core::slice::from_raw_parts(s as *const u8, len);
-        for off in 0..=len - 5 {
-            let aligned_boundary = (s + off) & 0xF == 0
-                && (off == 0 || matches!(bytes[off - 1], 0xCC | 0xC3 | 0x90));
-            let clean_after = off + 5 == len || matches!(bytes[off + 5], 0xCC | 0x90 | 0xE9);
-            if aligned_boundary && clean_after && bytes[off] == 0xE9 {
+        let limit = len - 5;
+        let mut off = (16 - (s & 0xF)) & 0xF;
+        while off <= limit {
+            if bytes[off] == 0xE9
+                && (off == 0 || matches!(bytes[off - 1], 0xCC | 0xC3 | 0x90))
+                && (off + 5 == len || matches!(bytes[off + 5], 0xCC | 0x90 | 0xE9))
+            {
                 let rel = core::ptr::read_unaligned(bytes.as_ptr().add(off + 1) as *const i32) as i64;
                 let tgt = ((s + off + 5) as u64).wrapping_add(rel as u64);
                 if bodies.contains(&tgt) {
                     found.push((s + off) as u64);
                 }
             }
+            off += 16;
         }
     }
     found
@@ -725,4 +753,76 @@ pub unsafe fn install(name: &str, base: usize, size: usize) -> usize {
         n += 1;
     }
     n
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    fn build_pe_with_text(text_rva: usize, text_size: usize) -> Vec<u8> {
+        let total = text_rva + text_size;
+        let mut buf = vec![0xCCu8; total];
+        let w16 = |b: &mut [u8], off: usize, v: u16| b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        w16(&mut buf, 0, 0x5A4D);
+        w32(&mut buf, 0x3C, 0x80);
+        w32(&mut buf, 0x80, 0x0000_4550);
+        w16(&mut buf, 0x80 + 6, 1); // NumberOfSections
+        w16(&mut buf, 0x80 + 20, 240); // SizeOfOptionalHeader
+        let sec = 0x80 + 24 + 240;
+        buf[sec..sec + 5].copy_from_slice(b".text");
+        w32(&mut buf, sec + 8, text_size as u32);
+        w32(&mut buf, sec + 12, text_rva as u32);
+        w32(&mut buf, sec + 36, 0x6000_0020); // CNT_CODE | MEM_EXECUTE | MEM_READ
+        buf
+    }
+
+    #[test]
+    fn fast_scan_pe_chkstk_and_stack_pos_match_bodies_thunks_and_edges() {
+        // Test both 16-byte-aligned and intentionally unaligned section starts.
+        let mut backing = vec![0u8; 0x3020];
+        for misalign in [0usize, 5usize] {
+            let pe = build_pe_with_text(0x1000, 0x1000);
+            let slice = &mut backing[misalign..misalign + pe.len()];
+            slice.copy_from_slice(&pe);
+            let base = slice.as_ptr() as usize;
+            let text_start = base + 0x1000;
+
+            // Place a false-positive `0x65` byte, a real CHKSTK_SIG at unaligned offset +0x43,
+            // and an `E9` thunk at +0x120 targeting +0x43.
+            slice[0x1000 + 0x20] = 0x65;
+            let chk_off = 0x1000 + 0x43;
+            slice[chk_off..chk_off + CHKSTK_SIG.len()].copy_from_slice(&CHKSTK_SIG);
+            let chk_thunk_off = 0x1000 + 0x120;
+            let rel = (chk_off as i64 - (chk_thunk_off + 5) as i64) as i32;
+            slice[chk_thunk_off] = 0xE9;
+            slice[chk_thunk_off + 1..chk_thunk_off + 5].copy_from_slice(&rel.to_le_bytes());
+
+            // Place a real 16-byte-aligned STACK_POS_SIG and a 16-byte-aligned `E9` thunk to it,
+            // plus an unaligned STACK_POS_SIG that must be ignored.
+            let align_delta = (16 - (text_start & 0xF)) & 0xF;
+            let sp_off = 0x1000 + align_delta + 0x200;
+            slice[sp_off..sp_off + STACK_POS_SIG.len()].copy_from_slice(&STACK_POS_SIG);
+            let bad_sp_off = sp_off + 3 + 16; // unaligned
+            slice[bad_sp_off..bad_sp_off + STACK_POS_SIG.len()].copy_from_slice(&STACK_POS_SIG);
+            let sp_thunk_off = 0x1000 + align_delta + 0x300;
+            let sp_rel = (sp_off as i64 - (sp_thunk_off + 5) as i64) as i32;
+            slice[sp_thunk_off] = 0xE9;
+            slice[sp_thunk_off + 1..sp_thunk_off + 5].copy_from_slice(&sp_rel.to_le_bytes());
+
+            let chk = unsafe { scan_pe_chkstk(base, slice.len()) };
+            assert_eq!(
+                chk,
+                vec![(base + chk_off) as u64, (base + chk_thunk_off) as u64],
+                "chkstk scan mismatch (misalign={misalign})"
+            );
+
+            let sp = unsafe { scan_pe_stack_pos(base, slice.len()) };
+            assert_eq!(
+                sp,
+                vec![(base + sp_off) as u64, (base + sp_thunk_off) as u64],
+                "stack_pos scan mismatch (misalign={misalign})"
+            );
+        }
+    }
 }
