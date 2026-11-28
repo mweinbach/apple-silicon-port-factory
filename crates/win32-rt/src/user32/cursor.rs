@@ -1279,6 +1279,156 @@ pub unsafe extern "win64" fn LoadIconW(inst: HINSTANCE, name: LPCWSTR) -> usize 
     load_icon_impl(inst as usize, name, false, 32, 32, LR_DEFAULTSIZE)
 }
 
+const RT_BITMAP: u16 = 2;
+
+/// Decode a standalone DIB resource (`RT_BITMAP`: `BITMAPINFOHEADER` + optional palette
+/// + pixel rows, where `biHeight` is the actual image height) into top-down 32bpp BGRA.
+fn decode_dib_bitmap_to_bgra(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if bytes.len() < 40 {
+        return None;
+    }
+    let bi_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if bi_size < 40 || bi_size > bytes.len() {
+        return None;
+    }
+    let raw_w = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let raw_h = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let bpp = u16::from_le_bytes([bytes[14], bytes[15]]);
+    let compression = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let bi_clr_used = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]) as usize;
+
+    let width = raw_w.unsigned_abs();
+    let height = raw_h.unsigned_abs();
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return None;
+    }
+    // Support BI_RGB (0) and BI_BITFIELDS (3) for 16/32bpp.
+    if compression != 0 && !(compression == 3 && matches!(bpp, 16 | 32)) {
+        return None;
+    }
+
+    let top_down = raw_h < 0;
+    let w_u = width as usize;
+    let h_u = height as usize;
+    let palette_entries = if bpp <= 8 {
+        if bi_clr_used != 0 {
+            bi_clr_used.min(256)
+        } else {
+            1usize << (bpp as usize)
+        }
+    } else if compression == 3 && bi_size == 40 {
+        // 3 DWORD channel masks immediately follow a 40-byte BITMAPINFOHEADER.
+        3
+    } else {
+        0
+    };
+    let palette_off = bi_size;
+    let pixel_off = palette_off.checked_add(palette_entries.checked_mul(4)?)?;
+    let stride = ((w_u.checked_mul(bpp as usize)?.checked_add(31)?) & !31) / 8;
+    let pixel_bytes = stride.checked_mul(h_u)?;
+    if pixel_off.checked_add(pixel_bytes)? > bytes.len() {
+        return None;
+    }
+
+    let mut bgra = vec![0u8; w_u.checked_mul(h_u)?.checked_mul(4)?];
+    for y in 0..h_u {
+        let src_row = if top_down { y } else { h_u - 1 - y };
+        let row = &bytes[pixel_off + src_row * stride..pixel_off + (src_row + 1) * stride];
+        for x in 0..w_u {
+            let px: [u8; 4] = match bpp {
+                32 => {
+                    let o = x * 4;
+                    [row[o], row[o + 1], row[o + 2], row[o + 3]]
+                }
+                24 => {
+                    let o = x * 3;
+                    [row[o], row[o + 1], row[o + 2], 0xFF]
+                }
+                16 => {
+                    let o = x * 2;
+                    let v = u16::from_le_bytes([row[o], row[o + 1]]);
+                    let r = (((v >> 10) & 0x1F) * 255 / 31) as u8;
+                    let g = (((v >> 5) & 0x1F) * 255 / 31) as u8;
+                    let b = ((v & 0x1F) * 255 / 31) as u8;
+                    [b, g, r, 0xFF]
+                }
+                8 => {
+                    let idx = row[x] as usize;
+                    let po = palette_off + idx * 4;
+                    if idx < palette_entries && po + 4 <= bytes.len() {
+                        [bytes[po], bytes[po + 1], bytes[po + 2], 0xFF]
+                    } else {
+                        [0, 0, 0, 0xFF]
+                    }
+                }
+                4 => {
+                    let b = row[x / 2];
+                    let idx = if x % 2 == 0 { (b >> 4) & 0xF } else { b & 0xF } as usize;
+                    let po = palette_off + idx * 4;
+                    if idx < palette_entries && po + 4 <= bytes.len() {
+                        [bytes[po], bytes[po + 1], bytes[po + 2], 0xFF]
+                    } else {
+                        [0, 0, 0, 0xFF]
+                    }
+                }
+                1 => {
+                    let idx = ((row[x / 8] >> (7 - (x % 8))) & 1) as usize;
+                    let po = palette_off + idx * 4;
+                    if idx < palette_entries && po + 4 <= bytes.len() {
+                        [bytes[po], bytes[po + 1], bytes[po + 2], 0xFF]
+                    } else if idx != 0 {
+                        [0xFF, 0xFF, 0xFF, 0xFF]
+                    } else {
+                        [0, 0, 0, 0xFF]
+                    }
+                }
+                _ => return None,
+            };
+            let dst = (y * w_u + x) * 4;
+            bgra[dst..dst + 4].copy_from_slice(&px);
+        }
+    }
+    Some((width, height, bgra))
+}
+
+unsafe fn load_bitmap_impl(inst: usize, name: *const u16, ansi: bool) -> usize {
+    let Some(res_id) = icon_res_id(name, ansi) else {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    };
+    if inst == 0 {
+        if let IconResId::Int(id) = res_id {
+            // Standard Windows OEM bitmap IDs (OBM_CLOSE ..= OBM_OLD_CLOSE: 32734..=32767).
+            if (32734..=32767).contains(&id) {
+                return crate::misc::gdi32::CreateCompatibleBitmap(0, 16, 16);
+            }
+        }
+        set_error(e::RESOURCE_NAME_NOT_FOUND);
+        return 0;
+    }
+    let Some(pe) = PeImageView::from_hinstance(inst) else {
+        set_error(e::RESOURCE_TYPE_NOT_FOUND);
+        return 0;
+    };
+    let Some(bmp_bytes) = pe.find_resource_data(RT_BITMAP, &res_id) else {
+        set_error(e::RESOURCE_NAME_NOT_FOUND);
+        return 0;
+    };
+    let Some((w, h, bgra)) = decode_dib_bitmap_to_bgra(bmp_bytes) else {
+        set_error(1812); // ERROR_RESOURCE_DATA_NOT_FOUND
+        return 0;
+    };
+    create_icon_color_dib(w, h, &bgra)
+}
+
+pub unsafe extern "win64" fn LoadBitmapW(inst: HINSTANCE, name: LPCWSTR) -> usize {
+    load_bitmap_impl(inst as usize, name, false)
+}
+
+pub unsafe extern "win64" fn LoadBitmapA(inst: HINSTANCE, name: LPCSTR) -> usize {
+    load_bitmap_impl(inst as usize, name as *const u16, true)
+}
+
 fn destroy_icon_or_cursor(h: usize) -> BOOL {
     if h == 0 {
         set_error(e::INVALID_CURSOR_HANDLE);
@@ -2532,6 +2682,82 @@ mod tests {
             bad_img[RSRC_RVA + cur_off..RSRC_RVA + cur_off + bad_png_cur.len()].copy_from_slice(&bad_png_cur);
             bad_img[RSRC_RVA + 0x204..RSRC_RVA + 0x208].copy_from_slice(&(bad_png_cur.len() as u32).to_le_bytes());
             assert_eq!(LoadImageW(bad_img.as_ptr() as HINSTANCE, 202 as LPCWSTR, 2, 0, 0, 0), 0);
+        }
+    }
+
+    #[test]
+    fn load_bitmap_w_pe_rsrc_and_oem_ids() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // Synthetic PE32+ with RT_BITMAP (2) #301 containing a 2x2 24bpp bottom-up DIB.
+        let mut img = vec![0u8; 0x3000];
+        const RSRC_RVA: usize = 0x1000;
+        img[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
+        img[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        img[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes());
+        img[0x84 + 16..0x84 + 18].copy_from_slice(&0xF0u16.to_le_bytes());
+        let opt = 0x84 + 20;
+        let img_len = img.len() as u32;
+        img[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        img[opt + 56..opt + 60].copy_from_slice(&img_len.to_le_bytes());
+        img[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        img[opt + 112 + 16..opt + 112 + 20].copy_from_slice(&(RSRC_RVA as u32).to_le_bytes());
+        img[opt + 112 + 20..opt + 112 + 24].copy_from_slice(&0x2000u32.to_le_bytes());
+
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        bmp.extend_from_slice(&2i32.to_le_bytes()); // biWidth
+        bmp.extend_from_slice(&2i32.to_le_bytes()); // biHeight (+2 bottom-up)
+        bmp.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        bmp.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
+        bmp.extend_from_slice(&[0u8; 24]);
+        // Bottom row (y=1): BGR(0x11,0x22,0x33), BGR(0x44,0x55,0x66) + 2B pad
+        bmp.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0, 0]);
+        // Top row (y=0): BGR(0xAA,0xBB,0xCC), BGR(0xDD,0xEE,0xFF) + 2B pad
+        bmp.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0, 0]);
+
+        let bmp_off = 0x300usize;
+        img[RSRC_RVA + bmp_off..RSRC_RVA + bmp_off + bmp.len()].copy_from_slice(&bmp);
+
+        let write_dir = |buf: &mut [u8], off: usize, entries: &[(u32, u32)]| {
+            let b = RSRC_RVA + off;
+            buf[b + 14..b + 16].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+            for (i, &(k, v)) in entries.iter().enumerate() {
+                let e = b + 16 + i * 8;
+                buf[e..e + 4].copy_from_slice(&k.to_le_bytes());
+                buf[e + 4..e + 8].copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        write_dir(&mut img, 0x000, &[(RT_BITMAP as u32, 0x8000_0040)]);
+        write_dir(&mut img, 0x040, &[(301, 0x8000_0100)]);
+        write_dir(&mut img, 0x100, &[(0x0409, 0x200)]);
+        img[RSRC_RVA + 0x200..RSRC_RVA + 0x204].copy_from_slice(&((RSRC_RVA + bmp_off) as u32).to_le_bytes());
+        img[RSRC_RVA + 0x204..RSRC_RVA + 0x208].copy_from_slice(&(bmp.len() as u32).to_le_bytes());
+
+        unsafe {
+            let hinst = img.as_ptr() as HINSTANCE;
+            let hbm = LoadBitmapW(hinst, 301 as LPCWSTR);
+            assert_ne!(hbm, 0);
+            let mut bm = [0u8; 32];
+            assert_eq!(crate::misc::gdi32::GetObjectW(hbm, 32, bm.as_mut_ptr()), 32);
+            assert_eq!(i32::from_le_bytes(bm[4..8].try_into().unwrap()), 2);
+            assert_eq!(i32::from_le_bytes(bm[8..12].try_into().unwrap()), 2);
+            assert_eq!(u16::from_le_bytes(bm[18..20].try_into().unwrap()), 32);
+            let bits = usize::from_le_bytes(bm[24..32].try_into().unwrap()) as *const u8;
+            assert!(!bits.is_null());
+            // Top-down row 0 pixel (0,0) = [0xAA, 0xBB, 0xCC, 0xFF], bottom row 1 pixel (0,1) = [0x11, 0x22, 0x33, 0xFF].
+            assert_eq!(std::slice::from_raw_parts(bits, 4), &[0xAA, 0xBB, 0xCC, 0xFF]);
+            assert_eq!(std::slice::from_raw_parts(bits.add(8), 4), &[0x11, 0x22, 0x33, 0xFF]);
+            assert_eq!(crate::misc::gdi32::DeleteObject(hbm), TRUE);
+
+            // Missing resource fails cleanly.
+            assert_eq!(LoadBitmapW(hinst, 999 as LPCWSTR), 0);
+            assert_eq!(crate::teb::last_error(), e::RESOURCE_NAME_NOT_FOUND);
+
+            // OEM bitmap (OBM_CLOSE = 32754) with NULL hinst succeeds; invalid ID fails.
+            let hoem = LoadBitmapW(std::ptr::null_mut(), 32754 as LPCWSTR);
+            assert_ne!(hoem, 0);
+            assert_eq!(crate::misc::gdi32::DeleteObject(hoem), TRUE);
+            assert_eq!(LoadBitmapW(std::ptr::null_mut(), 1 as LPCWSTR), 0);
         }
     }
 }

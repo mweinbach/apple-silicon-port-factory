@@ -128,6 +128,9 @@ advapi32.dll	StartServiceCtrlDispatcherW	-	CORE_OS	real	win32_rt::advapi32::Star
 advapi32.dll	SystemFunction036	-	CORE_OS	real	win32_rt::advapi32::SystemFunction036	crates/win32-rt/src/advapi32.rs
 amd_ags_x64.dll	agsCheckDriverVersion	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::amd_ags_x64::agsCheckDriverVersion	crates/win32-rt/src/misc/amd_ags_x64.rs
 amd_ags_x64.dll	agsDeInitialize	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::amd_ags_x64::agsDeInitialize	crates/win32-rt/src/misc/amd_ags_x64.rs
+amd_ags_x64.dll	agsDriverExtensionsDX11_CreateDevice	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::amd_ags_x64::agsDriverExtensionsDX11_CreateDevice	crates/win32-rt/src/misc/amd_ags_x64.rs
+amd_ags_x64.dll	agsDriverExtensionsDX11_SetDiskShaderCacheEnabled	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::amd_ags_x64::agsDriverExtensionsDX11_SetDiskShaderCacheEnabled	crates/win32-rt/src/misc/amd_ags_x64.rs
+amd_ags_x64.dll	agsDriverExtensionsDX11_SetMaxAsyncCompileThreadCount	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::amd_ags_x64::agsDriverExtensionsDX11_SetMaxAsyncCompileThreadCount	crates/win32-rt/src/misc/amd_ags_x64.rs
 amd_ags_x64.dll	agsDriverExtensionsDX12_CreateDevice	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::amd_ags_x64::agsDriverExtensionsDX12_CreateDevice	crates/win32-rt/src/misc/amd_ags_x64.rs
 amd_ags_x64.dll	agsDriverExtensionsDX12_DestroyDevice	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::amd_ags_x64::agsDriverExtensionsDX12_DestroyDevice	crates/win32-rt/src/misc/amd_ags_x64.rs
 amd_ags_x64.dll	agsDriverExtensionsDX12_PopMarker	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::amd_ags_x64::agsDriverExtensionsDX12_PopMarker	crates/win32-rt/src/misc/amd_ags_x64.rs
@@ -802,6 +805,7 @@ gdi32.dll	GetPixel	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::GetPixel	crate
 gdi32.dll	GetStockObject	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::GetStockObject	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	GetTextExtentPoint32A	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::GetTextExtentPoint32A	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	GetTextExtentPoint32W	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::GetTextExtentPoint32W	crates/win32-rt/src/misc/gdi32.rs
+gdi32.dll	GetTextExtentPointW	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::GetTextExtentPointW	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	PatBlt	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::PatBlt	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	Rectangle	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::Rectangle	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	RemoveFontMemResourceEx	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::RemoveFontMemResourceEx	crates/win32-rt/src/misc/gdi32.rs
@@ -812,6 +816,7 @@ gdi32.dll	SetDIBits	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::SetDIBits	cra
 gdi32.dll	SetDeviceGammaRamp	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::SetDeviceGammaRamp	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	SetPixel	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::SetPixel	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	SetPixelFormat	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::SetPixelFormat	crates/win32-rt/src/misc/gdi32.rs
+gdi32.dll	SetStretchBltMode	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::SetStretchBltMode	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	SetTextColor	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::SetTextColor	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	StretchBlt	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::StretchBlt	crates/win32-rt/src/misc/gdi32.rs
 gdi32.dll	SwapBuffers	-	WINDOW_INPUT_COM	real	win32_rt::misc::gdi32::SwapBuffers	crates/win32-rt/src/misc/gdi32.rs
@@ -3802,6 +3807,8 @@ user32.dll	CallWindowProcW	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::Ca
 user32.dll	ChangeDisplaySettingsExW	-	WINDOW_INPUT_COM	real	win32_rt::user32::monitor::ChangeDisplaySettingsExW	crates/win32-rt/src/user32/monitor.rs
 user32.dll	ChangeDisplaySettingsW	-	WINDOW_INPUT_COM	real	win32_rt::user32::monitor::ChangeDisplaySettingsW	crates/win32-rt/src/user32/monitor.rs
 user32.dll	CharLowerBuffW	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::CharLowerBuffW	crates/win32-rt/src/user32/misc.rs
+user32.dll	CharUpperBuffW	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::CharUpperBuffW	crates/win32-rt/src/user32/misc.rs
+user32.dll	CharUpperW	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::CharUpperW	crates/win32-rt/src/user32/misc.rs
 user32.dll	CheckDlgButton	-	WINDOW_INPUT_COM	real	win32_rt::user32::dialog::CheckDlgButton	crates/win32-rt/src/user32/dialog.rs
 user32.dll	CheckMenuItem	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::CheckMenuItem	crates/win32-rt/src/user32/misc.rs
 user32.dll	ClientToScreen	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::ClientToScreen	crates/win32-rt/src/user32/window.rs
@@ -3844,7 +3851,9 @@ user32.dll	DispatchMessageW	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::D
 user32.dll	DisplayConfigGetDeviceInfo	-	WINDOW_INPUT_COM	real	win32_rt::user32::monitor::DisplayConfigGetDeviceInfo	crates/win32-rt/src/user32/monitor.rs
 user32.dll	DisplayConfigSetDeviceInfo	-	WINDOW_INPUT_COM	real	win32_rt::user32::monitor::DisplayConfigSetDeviceInfo	crates/win32-rt/src/user32/monitor.rs
 user32.dll	DrawFocusRect	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::DrawFocusRect	crates/win32-rt/src/user32/misc.rs
+user32.dll	DrawFrameControl	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::DrawFrameControl	crates/win32-rt/src/user32/misc.rs
 user32.dll	DrawMenuBar	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::DrawMenuBar	crates/win32-rt/src/user32/misc.rs
+user32.dll	DrawTextW	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::DrawTextW	crates/win32-rt/src/user32/misc.rs
 user32.dll	EmptyClipboard	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::EmptyClipboard	crates/win32-rt/src/user32/misc.rs
 user32.dll	EnableMenuItem	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::EnableMenuItem	crates/win32-rt/src/user32/misc.rs
 user32.dll	EnableNonClientDpiScaling	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::EnableNonClientDpiScaling	crates/win32-rt/src/user32/misc.rs
@@ -3914,6 +3923,7 @@ user32.dll	GetKeyboardLayoutNameA	-	WINDOW_INPUT_COM	real	win32_rt::user32::inpu
 user32.dll	GetKeyboardLayoutNameW	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::GetKeyboardLayoutNameW	crates/win32-rt/src/user32/input.rs
 user32.dll	GetKeyboardState	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::GetKeyboardState	crates/win32-rt/src/user32/input.rs
 user32.dll	GetLastActivePopup	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::GetLastActivePopup	crates/win32-rt/src/user32/misc.rs
+user32.dll	GetLastInputInfo	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::GetLastInputInfo	crates/win32-rt/src/user32/input.rs
 user32.dll	GetLayeredWindowAttributes	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::GetLayeredWindowAttributes	crates/win32-rt/src/user32/window.rs
 user32.dll	GetMenu	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::GetMenu	crates/win32-rt/src/user32/misc.rs
 user32.dll	GetMenuItemCount	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::GetMenuItemCount	crates/win32-rt/src/user32/misc.rs
@@ -3931,6 +3941,8 @@ user32.dll	GetParent	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::GetParent
 user32.dll	GetPhysicalCursorPos	-	WINDOW_INPUT_COM	real	win32_rt::user32::cursor::GetPhysicalCursorPos	crates/win32-rt/src/user32/cursor.rs
 user32.dll	GetProcessDpiAwareness	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::GetProcessDpiAwareness	crates/win32-rt/src/user32/misc.rs
 user32.dll	GetProcessWindowStation	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::GetProcessWindowStation	crates/win32-rt/src/user32/misc.rs
+user32.dll	GetPropA	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::GetPropA	crates/win32-rt/src/user32/window.rs
+user32.dll	GetPropW	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::GetPropW	crates/win32-rt/src/user32/window.rs
 user32.dll	GetQueueStatus	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::GetQueueStatus	crates/win32-rt/src/user32/message.rs
 user32.dll	GetRawInputBuffer	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::GetRawInputBuffer	crates/win32-rt/src/user32/input.rs
 user32.dll	GetRawInputData	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::GetRawInputData	crates/win32-rt/src/user32/input.rs
@@ -3991,6 +4003,8 @@ user32.dll	IsWindowEnabled	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::IsW
 user32.dll	IsWindowVisible	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::IsWindowVisible	crates/win32-rt/src/user32/window.rs
 user32.dll	IsZoomed	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::IsZoomed	crates/win32-rt/src/user32/window.rs
 user32.dll	KillTimer	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::KillTimer	crates/win32-rt/src/user32/message.rs
+user32.dll	LoadBitmapA	-	WINDOW_INPUT_COM	real	win32_rt::user32::cursor::LoadBitmapA	crates/win32-rt/src/user32/cursor.rs
+user32.dll	LoadBitmapW	-	WINDOW_INPUT_COM	real	win32_rt::user32::cursor::LoadBitmapW	crates/win32-rt/src/user32/cursor.rs
 user32.dll	LoadCursorA	-	WINDOW_INPUT_COM	real	win32_rt::user32::cursor::LoadCursorA	crates/win32-rt/src/user32/cursor.rs
 user32.dll	LoadCursorW	-	WINDOW_INPUT_COM	real	win32_rt::user32::cursor::LoadCursorW	crates/win32-rt/src/user32/cursor.rs
 user32.dll	LoadIconA	-	WINDOW_INPUT_COM	real	win32_rt::user32::cursor::LoadIconA	crates/win32-rt/src/user32/cursor.rs
@@ -4000,6 +4014,7 @@ user32.dll	LoadImageW	-	WINDOW_INPUT_COM	real	win32_rt::user32::cursor::LoadImag
 user32.dll	LoadKeyboardLayoutA	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::LoadKeyboardLayoutA	crates/win32-rt/src/user32/input.rs
 user32.dll	LoadKeyboardLayoutW	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::LoadKeyboardLayoutW	crates/win32-rt/src/user32/input.rs
 user32.dll	LoadStringW	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::LoadStringW	crates/win32-rt/src/user32/misc.rs
+user32.dll	LogicalToPhysicalPoint	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::LogicalToPhysicalPoint	crates/win32-rt/src/user32/window.rs
 user32.dll	MapVirtualKeyA	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::MapVirtualKeyA	crates/win32-rt/src/user32/input.rs
 user32.dll	MapVirtualKeyExW	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::MapVirtualKeyExW	crates/win32-rt/src/user32/input.rs
 user32.dll	MapVirtualKeyW	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::MapVirtualKeyW	crates/win32-rt/src/user32/input.rs
@@ -4019,6 +4034,7 @@ user32.dll	OpenDesktopW	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::OpenDesk
 user32.dll	OpenInputDesktop	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::OpenInputDesktop	crates/win32-rt/src/user32/misc.rs
 user32.dll	PeekMessageA	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::PeekMessageA	crates/win32-rt/src/user32/message.rs
 user32.dll	PeekMessageW	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::PeekMessageW	crates/win32-rt/src/user32/message.rs
+user32.dll	PhysicalToLogicalPoint	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::PhysicalToLogicalPoint	crates/win32-rt/src/user32/window.rs
 user32.dll	PostMessageA	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::PostMessageA	crates/win32-rt/src/user32/message.rs
 user32.dll	PostMessageW	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::PostMessageW	crates/win32-rt/src/user32/message.rs
 user32.dll	PostQuitMessage	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::PostQuitMessage	crates/win32-rt/src/user32/message.rs
@@ -4042,6 +4058,8 @@ user32.dll	RegisterWindowMessageW	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc
 user32.dll	ReleaseCapture	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::ReleaseCapture	crates/win32-rt/src/user32/input.rs
 user32.dll	ReleaseDC	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::ReleaseDC	crates/win32-rt/src/user32/window.rs
 user32.dll	RemoveMenu	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::RemoveMenu	crates/win32-rt/src/user32/misc.rs
+user32.dll	RemovePropA	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::RemovePropA	crates/win32-rt/src/user32/window.rs
+user32.dll	RemovePropW	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::RemovePropW	crates/win32-rt/src/user32/window.rs
 user32.dll	ReplyMessage	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::ReplyMessage	crates/win32-rt/src/user32/message.rs
 user32.dll	ScreenToClient	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::ScreenToClient	crates/win32-rt/src/user32/window.rs
 user32.dll	SendDlgItemMessageA	-	WINDOW_INPUT_COM	real	win32_rt::user32::dialog::SendDlgItemMessageA	crates/win32-rt/src/user32/dialog.rs
@@ -4070,6 +4088,8 @@ user32.dll	SetPhysicalCursorPos	-	WINDOW_INPUT_COM	real	win32_rt::user32::cursor
 user32.dll	SetProcessDPIAware	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::SetProcessDPIAware	crates/win32-rt/src/user32/misc.rs
 user32.dll	SetProcessDpiAwareness	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::SetProcessDpiAwareness	crates/win32-rt/src/user32/misc.rs
 user32.dll	SetProcessDpiAwarenessContext	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::SetProcessDpiAwarenessContext	crates/win32-rt/src/user32/misc.rs
+user32.dll	SetPropA	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::SetPropA	crates/win32-rt/src/user32/window.rs
+user32.dll	SetPropW	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::SetPropW	crates/win32-rt/src/user32/window.rs
 user32.dll	SetRect	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::SetRect	crates/win32-rt/src/user32/misc.rs
 user32.dll	SetRectEmpty	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::SetRectEmpty	crates/win32-rt/src/user32/misc.rs
 user32.dll	SetThreadDpiAwarenessContext	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::SetThreadDpiAwarenessContext	crates/win32-rt/src/user32/misc.rs
@@ -4353,6 +4373,12 @@ winhttp.dll	WinHttpSetOption	-	NET_RPC	real	win32_rt::misc::winhttp::WinHttpSetO
 winhttp.dll	WinHttpSetStatusCallback	-	NET_RPC	real	win32_rt::misc::winhttp::WinHttpSetStatusCallback	crates/win32-rt/src/misc/winhttp.rs
 winhttp.dll	WinHttpSetTimeouts	-	NET_RPC	real	win32_rt::misc::winhttp::WinHttpSetTimeouts	crates/win32-rt/src/misc/winhttp.rs
 winhttp.dll	WinHttpWriteData	-	NET_RPC	real	win32_rt::misc::winhttp::WinHttpWriteData	crates/win32-rt/src/misc/winhttp.rs
+winmm.dll	mmioAscend	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::mmioAscend	crates/win32-rt/src/misc/winmm.rs
+winmm.dll	mmioClose	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::mmioClose	crates/win32-rt/src/misc/winmm.rs
+winmm.dll	mmioDescend	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::mmioDescend	crates/win32-rt/src/misc/winmm.rs
+winmm.dll	mmioOpenA	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::mmioOpenA	crates/win32-rt/src/misc/winmm.rs
+winmm.dll	mmioRead	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::mmioRead	crates/win32-rt/src/misc/winmm.rs
+winmm.dll	mmioSeek	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::mmioSeek	crates/win32-rt/src/misc/winmm.rs
 winmm.dll	timeBeginPeriod	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::timeBeginPeriod	crates/win32-rt/src/misc/winmm.rs
 winmm.dll	timeEndPeriod	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::timeEndPeriod	crates/win32-rt/src/misc/winmm.rs
 winmm.dll	timeGetDevCaps	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::winmm::timeGetDevCaps	crates/win32-rt/src/misc/winmm.rs

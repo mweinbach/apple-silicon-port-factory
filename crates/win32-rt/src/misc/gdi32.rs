@@ -291,6 +291,7 @@ struct DcData {
     text_color: u32,
     bk_color: u32,
     bk_mode: i32,
+    stretch_blt_mode: i32,
     gamma_ramp: Option<Box<[u16; 768]>>,
 }
 
@@ -305,6 +306,7 @@ impl DcData {
             text_color: 0x0000_0000,
             bk_color: 0x00FF_FFFF,
             bk_mode: 2, // OPAQUE
+            stretch_blt_mode: 1, // BLACKONWHITE
             gamma_ramp: None,
         }
     }
@@ -869,6 +871,10 @@ pub unsafe extern "win64" fn GetTextExtentPoint32W(hdc: usize, s: LPCWSTR, n: i3
     TRUE
 }
 
+pub unsafe extern "win64" fn GetTextExtentPointW(hdc: usize, s: LPCWSTR, n: i32, out: *mut SIZE) -> BOOL {
+    GetTextExtentPoint32W(hdc, s, n, out)
+}
+
 pub unsafe extern "win64" fn GetTextExtentPoint32A(hdc: usize, s: LPCSTR, n: i32, out: *mut SIZE) -> BOOL {
     if out.is_null() || (s.is_null() && n > 0) || n < 0 {
         crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
@@ -1020,6 +1026,22 @@ pub unsafe extern "win64" fn SetBkMode(hdc: usize, mode: i32) -> i32 {
     match m.get_mut(&hdc) {
         Some(Obj::Dc(dc)) => std::mem::replace(&mut dc.bk_mode, mode),
         _ => 0,
+    }
+}
+
+pub unsafe extern "win64" fn SetStretchBltMode(hdc: usize, mode: i32) -> i32 {
+    // BLACKONWHITE (1), WHITEONBLACK (2), COLORONCOLOR (3), HALFTONE (4).
+    if !(1..=4).contains(&mode) {
+        crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut m = objs().lock().unwrap();
+    match m.get_mut(&hdc) {
+        Some(Obj::Dc(dc)) => std::mem::replace(&mut dc.stretch_blt_mode, mode),
+        _ => {
+            crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+            0
+        }
     }
 }
 
@@ -2056,6 +2078,29 @@ mod tests {
             assert_eq!(u16::from_le_bytes(bm_buf[18..20].try_into().unwrap()), 24);
             SelectObject(dc, old);
             DeleteObject(hbm);
+            DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn get_text_extent_point_w_and_set_stretch_blt_mode() {
+        unsafe {
+            let dc = CreateCompatibleDC(0);
+            assert_ne!(dc, 0);
+            let s: Vec<u16> = "Hello".encode_utf16().collect();
+            let mut sz1 = SIZE { cx: 0, cy: 0 };
+            let mut sz2 = SIZE { cx: 0, cy: 0 };
+            assert_eq!(GetTextExtentPoint32W(dc, s.as_ptr(), s.len() as i32, &mut sz1), TRUE);
+            assert_eq!(GetTextExtentPointW(dc, s.as_ptr(), s.len() as i32, &mut sz2), TRUE);
+            assert_eq!((sz1.cx, sz1.cy), (sz2.cx, sz2.cy));
+
+            // Default mode is BLACKONWHITE (1); valid modes 1..=4 return previous mode.
+            assert_eq!(SetStretchBltMode(dc, 4 /* HALFTONE */), 1);
+            assert_eq!(SetStretchBltMode(dc, 3 /* COLORONCOLOR */), 4);
+            assert_eq!(SetStretchBltMode(dc, 0), 0);
+            assert_eq!(SetStretchBltMode(dc, 5), 0);
+            assert_eq!(SetStretchBltMode(0, 4), 0);
+
             DeleteDC(dc);
         }
     }

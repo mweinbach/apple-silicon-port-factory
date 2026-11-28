@@ -2784,6 +2784,205 @@ pub unsafe extern "win64" fn LoadStringW(
     copy_len as i32
 }
 
+// ---------------------------------------------------------------------------
+// Character casing & text/control drawing
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn uppercase_utf16_unit(u: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&u) {
+        return u - 32;
+    }
+    if let Some(ch) = char::from_u32(u as u32) {
+        let mut upper = ch.to_uppercase();
+        if let (Some(first), None) = (upper.next(), upper.next()) {
+            let cp = first as u32;
+            if cp <= 0xFFFF {
+                return cp as u16;
+            }
+        }
+    }
+    u
+}
+
+pub unsafe extern "win64" fn CharUpperBuffW(lpsz: LPWSTR, cch_length: u32) -> u32 {
+    if lpsz.is_null() || cch_length == 0 {
+        return 0;
+    }
+    for i in 0..(cch_length as usize) {
+        let p = lpsz.add(i);
+        let u = p.read_unaligned();
+        p.write_unaligned(uppercase_utf16_unit(u));
+    }
+    cch_length
+}
+
+pub unsafe extern "win64" fn CharUpperW(lpsz: LPWSTR) -> LPWSTR {
+    if lpsz.is_null() {
+        return std::ptr::null_mut();
+    }
+    let addr = lpsz as usize;
+    if addr <= 0xFFFF {
+        return uppercase_utf16_unit(addr as u16) as usize as LPWSTR;
+    }
+    let mut i = 0usize;
+    loop {
+        let p = lpsz.add(i);
+        let u = p.read_unaligned();
+        if u == 0 {
+            break;
+        }
+        p.write_unaligned(uppercase_utf16_unit(u));
+        i += 1;
+    }
+    lpsz
+}
+
+const DT_SINGLELINE: u32 = 0x0020;
+const DT_CALCRECT: u32 = 0x0400;
+const DT_NOPREFIX: u32 = 0x0800;
+
+pub unsafe extern "win64" fn DrawTextW(
+    hdc: usize,
+    lpch_text: LPCWSTR,
+    cch_text: i32,
+    lprc: *mut RECT,
+    format: u32,
+) -> i32 {
+    if hdc == 0 || lprc.is_null() || (lpch_text.is_null() && cch_text != 0) {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    // Verify the DC is valid and obtain the baseline font height.
+    let mut empty_sz = crate::misc::gdi32::SIZE { cx: 0, cy: 0 };
+    if crate::misc::gdi32::GetTextExtentPoint32W(hdc, std::ptr::null(), 0, &mut empty_sz) == FALSE {
+        return 0;
+    }
+    if cch_text == 0 {
+        return 0;
+    }
+
+    let mut raw_units: Vec<u16> = Vec::new();
+    if cch_text < 0 {
+        let mut i = 0usize;
+        loop {
+            let u = lpch_text.add(i).read_unaligned();
+            if u == 0 {
+                break;
+            }
+            raw_units.push(u);
+            i += 1;
+        }
+    } else {
+        for i in 0..(cch_text as usize) {
+            let u = lpch_text.add(i).read_unaligned();
+            if u == 0 {
+                break;
+            }
+            raw_units.push(u);
+        }
+    }
+
+    if raw_units.is_empty() {
+        if (format & DT_CALCRECT) != 0 {
+            let mut rc = lprc.read_unaligned();
+            rc.right = rc.left;
+            rc.bottom = rc.top;
+            lprc.write_unaligned(rc);
+        }
+        return 0;
+    }
+
+    // Strip single '&' mnemonic prefixes unless DT_NOPREFIX is set ("&&" -> "&").
+    let units: Vec<u16> = if (format & DT_NOPREFIX) != 0 {
+        raw_units
+    } else {
+        let mut out = Vec::with_capacity(raw_units.len());
+        let mut idx = 0usize;
+        while idx < raw_units.len() {
+            if raw_units[idx] == b'&' as u16 {
+                if idx + 1 < raw_units.len() && raw_units[idx + 1] == b'&' as u16 {
+                    out.push(b'&' as u16);
+                    idx += 2;
+                } else {
+                    idx += 1;
+                }
+            } else {
+                out.push(raw_units[idx]);
+                idx += 1;
+            }
+        }
+        out
+    };
+
+    let mut lines: Vec<Vec<u16>> = Vec::new();
+    if (format & DT_SINGLELINE) != 0 {
+        lines.push(units);
+    } else {
+        let mut cur = Vec::new();
+        let mut idx = 0usize;
+        while idx < units.len() {
+            match units[idx] {
+                0x000D => {
+                    lines.push(std::mem::take(&mut cur));
+                    if idx + 1 < units.len() && units[idx + 1] == 0x000A {
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                }
+                0x000A => {
+                    lines.push(std::mem::take(&mut cur));
+                    idx += 1;
+                }
+                ch => {
+                    cur.push(ch);
+                    idx += 1;
+                }
+            }
+        }
+        lines.push(cur);
+    }
+
+    let mut max_w = 0i32;
+    let mut total_h = 0i32;
+    for line in &lines {
+        let mut sz = crate::misc::gdi32::SIZE { cx: 0, cy: 0 };
+        let ptr = if line.is_empty() { std::ptr::null() } else { line.as_ptr() };
+        if crate::misc::gdi32::GetTextExtentPoint32W(hdc, ptr, line.len() as i32, &mut sz) == FALSE {
+            return 0;
+        }
+        max_w = max_w.max(sz.cx);
+        total_h = total_h.saturating_add(sz.cy);
+    }
+
+    if (format & DT_CALCRECT) != 0 {
+        let mut rc = lprc.read_unaligned();
+        rc.right = rc.left.saturating_add(max_w);
+        rc.bottom = rc.top.saturating_add(total_h);
+        lprc.write_unaligned(rc);
+    }
+    total_h
+}
+
+pub unsafe extern "win64" fn DrawFrameControl(
+    hdc: usize,
+    lprc: *const RECT,
+    _u_type: u32,
+    _u_state: u32,
+) -> BOOL {
+    if hdc == 0 || lprc.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    let rc = lprc.read_unaligned();
+    if crate::misc::gdi32::Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom) == FALSE {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    TRUE
+}
+
 #[cfg(test)]
 pub(crate) fn set_force_defer_guest_hooks(defer: bool) {
     FORCE_DEFER_GUEST_HOOKS.store(defer, Ordering::Release);
@@ -3809,5 +4008,55 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn char_upper_w_draw_text_w_and_draw_frame_control() {
+        unsafe {
+            // 1. CharUpperW single-character (HIWORD == 0) and NUL-terminated string modes.
+            assert_eq!(CharUpperW(std::ptr::null_mut()), std::ptr::null_mut());
+            assert_eq!(CharUpperW(b'a' as usize as LPWSTR) as usize, b'A' as usize);
+            assert_eq!(CharUpperW(0x00E9usize as LPWSTR) as usize, 0x00C9usize); // é -> É
+            let mut text = crate::strings::to_wide_z("abC-é1");
+            assert_eq!(CharUpperW(text.as_mut_ptr()), text.as_mut_ptr());
+            assert_eq!(read_wide_unaligned(text.as_ptr()), "ABC-É1");
+
+            // 2. CharUpperBuffW handles unaligned odd-offset UTF-16 buffers and exact length.
+            let mut raw = vec![0xA5u8; 32];
+            let odd_ptr = raw.as_mut_ptr().add(1) as LPWSTR;
+            assert!(!odd_ptr.is_aligned());
+            for (i, u) in "hi!z".encode_utf16().enumerate() {
+                odd_ptr.add(i).write_unaligned(u);
+            }
+            assert_eq!(CharUpperBuffW(odd_ptr, 3), 3);
+            let got: Vec<u16> = (0..4).map(|i| odd_ptr.add(i).read_unaligned()).collect();
+            assert_eq!(String::from_utf16(&got).unwrap(), "HI!z");
+            assert_eq!(CharUpperBuffW(std::ptr::null_mut(), 4), 0);
+
+            // 3. DrawTextW measures single-line, mnemonic-stripped, and multi-line text with DT_CALCRECT.
+            let dc = crate::misc::gdi32::CreateCompatibleDC(0);
+            assert_ne!(dc, 0);
+            let single = crate::strings::to_wide_z("&File");
+            let mut rc = RECT::new(10, 20, 0, 0);
+            let h1 = DrawTextW(dc, single.as_ptr(), -1, &mut rc, DT_SINGLELINE | DT_CALCRECT);
+            assert!(h1 > 0);
+            assert_eq!(rc.bottom - rc.top, h1);
+            assert!(rc.right > rc.left);
+
+            let multi = crate::strings::to_wide_z("Line1\r\nLine2");
+            let mut rc2 = RECT::new(0, 0, 0, 0);
+            let h2 = DrawTextW(dc, multi.as_ptr(), -1, &mut rc2, DT_CALCRECT);
+            assert_eq!(h2, h1 * 2);
+            assert_eq!(rc2.bottom, h2);
+            assert_eq!(DrawTextW(0, multi.as_ptr(), -1, &mut rc2, 0), 0);
+
+            // 4. DrawFrameControl draws on a valid DC and rejects null/invalid DC.
+            let frame_rc = RECT::new(0, 0, 16, 16);
+            assert_eq!(DrawFrameControl(dc, &frame_rc, 4, 0), TRUE);
+            assert_eq!(DrawFrameControl(0, &frame_rc, 4, 0), FALSE);
+            assert_eq!(DrawFrameControl(dc, std::ptr::null(), 4, 0), FALSE);
+
+            crate::misc::gdi32::DeleteDC(dc);
+        }
     }
 }
