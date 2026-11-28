@@ -398,6 +398,17 @@ pub fn lookup(dll: &str, name: &str) -> Option<*const ()> {
     if let Some(p) = t.get(c.as_str()).and_then(|m| m.get(name)) {
         return Some(p.0);
     }
+    // Windows 10+ UCRT (`api-ms-win-crt-private-l1-1-0.dll` / `ucrtbase.dll`) exports
+    // OS-mode `_o_<fn>` wrappers with identical ABI to `<fn>`.
+    if c == "ucrtbase.dll" {
+        if let Some(base) = name.strip_prefix("_o_") {
+            if !base.is_empty() && !base.starts_with("_o_") {
+                if let Some(p) = t.get("ucrtbase.dll").and_then(|m| m.get(base)) {
+                    return Some(p.0);
+                }
+            }
+        }
+    }
     // kernel32 forwards a lot of its surface to ntdll (Rtl*); msvcrt falls back
     // to ucrtbase for functions with identical ABI.
     let fallback = match c.as_str() {
@@ -1224,13 +1235,44 @@ mod tests {
             ("xinput1_4.dll", "XInputGetState"),
             ("xinput1_4.dll", "XInputGetStateEx"),
             ("msvcp140.dll", "_Thrd_yield"),
+            ("api-ms-win-crt-private-l1-1-0.dll", "_o_free"),
         ] {
             let p = lookup(dll, sym).unwrap_or_else(|| panic!("missing {dll}!{sym}")) as usize;
             assert!(plain.contains(&p), "{dll}!{sym} missing from plain_builtin_fns");
         }
 
+        // OS-mode `_o_*` aliases resolve on api-ms-win-crt-private-l1-1-0.dll / ucrtbase.dll
+        // to the exact underlying UCRT function pointer, rejecting double prefixes and msvcrt `_o_*`.
+        assert_eq!(
+            lookup("api-ms-win-crt-private-l1-1-0.dll", "_o_free"),
+            lookup("ucrtbase.dll", "free")
+        );
+        for sym in [
+            "_o_malloc",
+            "_o__mbscmp",
+            "_o__mbstrlen",
+            "_o__wmakepath_s",
+            "_o__purecall",
+            "_o___std_type_info_destroy_list",
+            "_CxxThrowException",
+            "__C_specific_handler",
+            "__CxxFrameHandler3",
+            "__unDName",
+        ] {
+            assert!(
+                lookup("api-ms-win-crt-private-l1-1-0.dll", sym).is_some(),
+                "missing api-ms-win-crt-private-l1-1-0.dll!{sym}"
+            );
+        }
+        assert!(lookup("api-ms-win-crt-private-l1-1-0.dll", "_o_").is_none());
+        assert!(lookup("api-ms-win-crt-private-l1-1-0.dll", "_o__o_malloc").is_none());
+        assert!(lookup("api-ms-win-crt-private-l1-1-0.dll", "_o__o__purecall").is_none());
+        assert!(lookup("msvcrt.dll", "_o_malloc").is_none());
+
         for (dll, sym) in [
             ("ucrtbase.dll", "sinf"),
+            ("api-ms-win-crt-private-l1-1-0.dll", "_o_sin"),
+            ("api-ms-win-crt-private-l1-1-0.dll", "_o_sqrt"),
             ("ucrtbase.dll", "cosf"),
             ("ucrtbase.dll", "tanf"),
             ("ucrtbase.dll", "sqrtf"),

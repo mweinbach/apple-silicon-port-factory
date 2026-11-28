@@ -16,5 +16,6 @@ pub mod scanf;
 pub mod stdio;
 pub mod string;
 pub mod time;
+pub mod undname;
 
 pub static EXPORTS: &[crate::Export] = include!(concat!(env!("OUT_DIR"), "/ucrt_exports.rs"));

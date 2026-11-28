@@ -675,6 +675,118 @@ pub unsafe extern "win64" fn _wsplitpath_s(
     0
 }
 
+fn compose_win_path(drive: Option<&str>, dir: Option<&str>, fname: Option<&str>, ext: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(d) = drive {
+        if let Some(ch) = d.chars().next() {
+            out.push(ch);
+            out.push(':');
+        }
+    }
+    if let Some(dr) = dir {
+        if !dr.is_empty() {
+            out.push_str(dr);
+            if !dr.ends_with('\\') && !dr.ends_with('/') {
+                out.push('\\');
+            }
+        }
+    }
+    if let Some(f) = fname {
+        out.push_str(f);
+    }
+    if let Some(e) = ext {
+        if !e.is_empty() {
+            if !e.starts_with('.') {
+                out.push('.');
+            }
+            out.push_str(e);
+        }
+    }
+    out
+}
+
+pub unsafe extern "win64" fn _makepath_s(
+    path: *mut u8,
+    size: usize,
+    drive: *const u8,
+    dir: *const u8,
+    fname: *const u8,
+    ext: *const u8,
+) -> i32 {
+    if path.is_null() || size == 0 {
+        errno::set(EINVAL);
+        super::runtime::invalid_parameter("_makepath_s");
+        return EINVAL;
+    }
+    let d = if drive.is_null() { None } else { Some(from_ansi(drive)) };
+    let dr = if dir.is_null() { None } else { Some(from_ansi(dir)) };
+    let f = if fname.is_null() { None } else { Some(from_ansi(fname)) };
+    let e = if ext.is_null() { None } else { Some(from_ansi(ext)) };
+    let full = compose_win_path(d.as_deref(), dr.as_deref(), f.as_deref(), e.as_deref());
+    let bytes = full.as_bytes();
+    if bytes.len() + 1 > size {
+        *path = 0;
+        errno::set(ERANGE);
+        super::runtime::invalid_parameter("_makepath_s");
+        return ERANGE;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), path, bytes.len());
+    *path.add(bytes.len()) = 0;
+    0
+}
+
+pub unsafe extern "win64" fn _makepath(
+    path: *mut u8,
+    drive: *const u8,
+    dir: *const u8,
+    fname: *const u8,
+    ext: *const u8,
+) {
+    let _ = _makepath_s(path, usize::MAX, drive, dir, fname, ext);
+}
+
+pub unsafe extern "win64" fn _wmakepath_s(
+    path: *mut u16,
+    size: usize,
+    drive: *const u16,
+    dir: *const u16,
+    fname: *const u16,
+    ext: *const u16,
+) -> i32 {
+    if path.is_null() || size == 0 {
+        errno::set(EINVAL);
+        super::runtime::invalid_parameter("_wmakepath_s");
+        return EINVAL;
+    }
+    let d = if drive.is_null() { None } else { Some(from_wide(drive)) };
+    let dr = if dir.is_null() { None } else { Some(from_wide(dir)) };
+    let f = if fname.is_null() { None } else { Some(from_wide(fname)) };
+    let e = if ext.is_null() { None } else { Some(from_wide(ext)) };
+    let full = compose_win_path(d.as_deref(), dr.as_deref(), f.as_deref(), e.as_deref());
+    let units: Vec<u16> = full.encode_utf16().collect();
+    if units.len() + 1 > size {
+        path.write_unaligned(0);
+        errno::set(ERANGE);
+        super::runtime::invalid_parameter("_wmakepath_s");
+        return ERANGE;
+    }
+    for (i, &u) in units.iter().enumerate() {
+        path.add(i).write_unaligned(u);
+    }
+    path.add(units.len()).write_unaligned(0);
+    0
+}
+
+pub unsafe extern "win64" fn _wmakepath(
+    path: *mut u16,
+    drive: *const u16,
+    dir: *const u16,
+    fname: *const u16,
+    ext: *const u16,
+) {
+    let _ = _wmakepath_s(path, usize::MAX, drive, dir, fname, ext);
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -699,6 +811,120 @@ mod tests {
             assert_eq!(rename(b"S:\\f.bin\0".as_ptr(), b"S:\\g.bin\0".as_ptr()), 0);
             assert_eq!(remove(b"S:\\g.bin\0".as_ptr()), 0);
             assert_eq!(_rmdir(b"S:\\d\0".as_ptr()), 0);
+        }
+    }
+
+    #[test]
+    fn makepath_narrow_wide_unaligned_and_errors() {
+        unsafe extern "win64" fn noop_iph(
+            _: *const u16,
+            _: *const u16,
+            _: *const u16,
+            _: u32,
+            _: usize,
+        ) {}
+        struct IphGuard(usize);
+        impl Drop for IphGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    crate::ucrt::runtime::_set_invalid_parameter_handler(self.0);
+                }
+            }
+        }
+
+        unsafe {
+            let _iph = IphGuard(crate::ucrt::runtime::_set_invalid_parameter_handler(
+                noop_iph as *const () as usize,
+            ));
+
+            // Narrow _makepath_s adds ':' to drive, '\\' to dir without separator, '.' to ext without dot.
+            let mut out = [0u8; 64];
+            assert_eq!(
+                _makepath_s(
+                    out.as_mut_ptr(),
+                    out.len(),
+                    b"C\0".as_ptr(),
+                    b"\\Shaders\\DXIL\0".as_ptr(),
+                    b"pixel\0".as_ptr(),
+                    b"hlsl\0".as_ptr(),
+                ),
+                0
+            );
+            assert_eq!(from_ansi(out.as_ptr()), "C:\\Shaders\\DXIL\\pixel.hlsl");
+
+            // Already-formatted drive/dir/ext are not doubled; NULL components are omitted cleanly.
+            assert_eq!(
+                _makepath_s(
+                    out.as_mut_ptr(),
+                    out.len(),
+                    b"D:\0".as_ptr(),
+                    b"sub/\0".as_ptr(),
+                    std::ptr::null(),
+                    b".bin\0".as_ptr(),
+                ),
+                0
+            );
+            assert_eq!(from_ansi(out.as_ptr()), "D:sub/.bin");
+
+            // Wide _wmakepath_s with unaligned input & output buffers.
+            let write_odd_wide = |s: &str| -> Vec<u8> {
+                let units: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut raw = vec![0xAAu8; 1 + units.len() * 2];
+                for (i, &u) in units.iter().enumerate() {
+                    raw[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+                }
+                raw
+            };
+            let rd = write_odd_wide("E");
+            let rdir = write_odd_wide("\\game\\bin");
+            let rf = write_odd_wide("d3d");
+            let re = write_odd_wide("dll");
+            let mut raw_out = [0xEEu8; 129];
+            let odd_out = raw_out.as_mut_ptr().add(1) as *mut u16;
+            assert!(!odd_out.is_aligned());
+            assert_eq!(
+                _wmakepath_s(
+                    odd_out,
+                    64,
+                    rd.as_ptr().add(1) as *const u16,
+                    rdir.as_ptr().add(1) as *const u16,
+                    rf.as_ptr().add(1) as *const u16,
+                    re.as_ptr().add(1) as *const u16,
+                ),
+                0
+            );
+            assert_eq!(from_wide(odd_out), "E:\\game\\bin\\d3d.dll");
+
+            // Overflow clears path[0], sets ERANGE, and returns ERANGE; null/zero returns EINVAL.
+            odd_out.write_unaligned(b'X' as u16);
+            errno::set(0);
+            assert_eq!(
+                _wmakepath_s(
+                    odd_out,
+                    4,
+                    rd.as_ptr().add(1) as *const u16,
+                    rdir.as_ptr().add(1) as *const u16,
+                    rf.as_ptr().add(1) as *const u16,
+                    re.as_ptr().add(1) as *const u16,
+                ),
+                ERANGE
+            );
+            assert_eq!(odd_out.read_unaligned(), 0);
+            assert_eq!(errno::get(), ERANGE);
+
+            errno::set(0);
+            assert_eq!(
+                _wmakepath_s(
+                    std::ptr::null_mut(),
+                    16,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                EINVAL
+            );
+            assert_eq!(errno::get(), EINVAL);
         }
     }
 }
