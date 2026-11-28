@@ -809,6 +809,7 @@ fn parse_crash_report_meta(raw: Option<&str>) -> CrashReportMeta {
             .and_then(JsonValue::as_str)
             .map(str::to_string);
     }
+    let mut guest_frames: Vec<String> = Vec::new();
     if let Some(gs) = val.get("guest_state") {
         meta.guest_symbol = gs
             .get("symbol")
@@ -818,11 +819,12 @@ fn parse_crash_report_meta(raw: Option<&str>) -> CrashReportMeta {
         if let Some(frames) = gs.get("frames").and_then(JsonValue::as_array) {
             for f in frames.iter().take(16) {
                 if let Some(sym) = f.get("symbol").and_then(JsonValue::as_str) {
-                    meta.frames.push(sym.to_string());
+                    guest_frames.push(sym.to_string());
                 }
             }
         }
     }
+    let mut bt_frames: Vec<String> = Vec::new();
     if let Some(bt) = val.get("backtrace") {
         if let Some(frames) = bt.get("frames").and_then(JsonValue::as_array) {
             if meta.top_frame_symbol.is_none() {
@@ -832,15 +834,23 @@ fn parse_crash_report_meta(raw: Option<&str>) -> CrashReportMeta {
                     .and_then(JsonValue::as_str)
                     .map(str::to_string);
             }
-            if meta.frames.is_empty() {
-                for f in frames.iter().take(16) {
-                    if let Some(sym) = f.get("symbol").and_then(JsonValue::as_str) {
-                        meta.frames.push(sym.to_string());
-                    }
+            for f in frames.iter().take(16) {
+                if let Some(sym) = f.get("symbol").and_then(JsonValue::as_str) {
+                    bt_frames.push(sym.to_string());
                 }
             }
         }
     }
+    let has_sym = |fs: &[String]| fs.iter().any(|s| extract_module_rva(s).is_some());
+    meta.frames = if has_sym(&guest_frames) {
+        guest_frames
+    } else if has_sym(&bt_frames) {
+        bt_frames
+    } else if !guest_frames.is_empty() {
+        guest_frames
+    } else {
+        bt_frames
+    };
     if let Some(code) = val.get("code_at_rip") {
         if let Some(dis) = code.get("disassembly").and_then(JsonValue::as_array) {
             if let Some(first) = dis.first().and_then(JsonValue::as_str) {
@@ -915,7 +925,8 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
     let is_timeout = input.timed_out
         || effective_exit_code == Some(exit_codes::TIMEOUT)
         || log_timed_out
-        || matches!(boot_meta.exit_kind.as_str(), "timeout" | "stall");
+        || matches!(boot_meta.exit_kind.as_str(), "timeout" | "stall")
+        || (crash_meta.present && crash_meta.kind == "stall");
 
     // Pick the first fatal (Tier 1) blocker, respecting causal dominance:
     //  - Unresolved import / delay-load 0xc06d007e/7f wins over its own crash report.
@@ -965,6 +976,7 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
             })
             .map(|l| (l.line_no, l.raw.to_string()));
         let subkind = if boot_meta.exit_kind == "stall"
+            || (crash_meta.present && crash_meta.kind == "stall")
             || lines.iter().any(|l| {
                 l.msg.contains("CRASH REPORT:")
                     && (l.msg.contains("stall") || l.msg.contains("hang"))
@@ -1305,6 +1317,71 @@ fn detect_unresolved_import(
                 ..BlockerDetail::default()
             });
         }
+    }
+
+    if crash_meta.present
+        && (crash_meta.kind == "unimplemented_import"
+            || crash_meta
+                .title
+                .to_ascii_lowercase()
+                .starts_with("unimplemented import "))
+    {
+        let prefix = "unimplemented import ";
+        let raw_target = if crash_meta
+            .title
+            .get(..prefix.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+        {
+            &crash_meta.title[prefix.len()..]
+        } else {
+            &crash_meta.title
+        }
+        .trim();
+        let (head, caller_in_title) = split_called_from(raw_target);
+        let head = head.trim_end_matches(" (").trim();
+        let loc = caller_in_title
+            .or_else(|| {
+                crash_meta
+                    .top_frame_symbol
+                    .as_deref()
+                    .and_then(extract_module_rva)
+            })
+            .or_else(|| {
+                crash_meta
+                    .guest_symbol
+                    .as_deref()
+                    .and_then(extract_module_rva)
+            })
+            .or_else(|| crash_meta.top_frame_symbol.clone())
+            .or_else(|| crash_meta.guest_symbol.clone());
+        let (dll, sym) = match head.split_once('!') {
+            Some((d, s)) => (Some(d.trim().to_string()), Some(s.trim().to_string())),
+            None => (None, (!head.is_empty()).then(|| head.to_string())),
+        };
+        let is_com = dll.is_none() && sym.as_deref().is_some_and(|s| s.contains("::"));
+        let target_str = if head.is_empty() { "<unknown>" } else { head };
+        let summary = match &loc {
+            Some(c) if is_com => format!("Unimplemented COM method {target_str} called from {c}"),
+            None if is_com => format!("Unimplemented COM method {target_str}"),
+            Some(c) => format!("Unresolved import {target_str} called from {c}"),
+            None => format!("Unresolved import {target_str}"),
+        };
+        return Some(BlockerDetail {
+            class: Some(BlockerClass::UnresolvedImport),
+            subkind: if is_com {
+                "com_trap".to_string()
+            } else {
+                "static_trap".to_string()
+            },
+            summary,
+            evidence: Some(crash_meta.title.clone()),
+            dll,
+            symbol: sym,
+            exception_code: (!is_com).then(|| "0xc0000139".to_string()),
+            location: loc,
+            backtrace: crash_meta.frames.clone(),
+            ..BlockerDetail::default()
+        });
     }
 
     if boot_meta.exit_kind == "unimplemented_import" && !boot_meta.exit_detail.is_empty() {
@@ -3760,5 +3837,50 @@ Abort trap: 6";
             crash_rep.secondary_signals[0].subkind,
             "unimplemented_x86_op_nonfatal"
         );
+    }
+
+    #[test]
+    fn crash_json_sidecar_recognizes_unimplemented_import_and_stall() {
+        let import_crash_json = r#"{
+          "schema_version": 1,
+          "kind": "unimplemented_import",
+          "title": "unimplemented import kernel32.dll!GetGeoInfoA",
+          "exception": null,
+          "guest_state": { "rip": "0x105340fbd", "symbol": "0x105340fbd", "frames": [ { "index": 0, "symbol": "0x105340fbd [leaf]" } ] },
+          "backtrace": { "frames": [ { "index": 0, "symbol": "testgame.exe+0x318575a [va 0x14318575a]" }, { "index": 1, "symbol": "testgame.exe+0x3186fe0 [va 0x143186fe0]" } ] }
+        }"#;
+        let mut inp = synthetic_input(
+            "[2026-11-28T04:00:01.000Z INFO  port_loader] starting initial thread",
+            None,
+        );
+        inp.crash_report_json = Some(import_crash_json.to_string());
+        let rep = classify_boot_log(&inp);
+        assert_eq!(rep.blocker.class(), BlockerClass::UnresolvedImport);
+        assert_eq!(rep.blocker.subkind, "static_trap");
+        assert_eq!(rep.blocker.dll.as_deref(), Some("kernel32.dll"));
+        assert_eq!(rep.blocker.symbol.as_deref(), Some("GetGeoInfoA"));
+        assert_eq!(
+            rep.blocker.location.as_deref(),
+            Some("testgame.exe+0x318575a")
+        );
+        assert_eq!(rep.blocker.backtrace.len(), 2);
+        assert_eq!(rep.exit_code(), exit_codes::UNRESOLVED_IMPORTS);
+        assert_eq!(rep.owner.as_ref().unwrap().crate_name, "crates/win32-rt");
+
+        let stall_crash_json = r#"{
+          "schema_version": 1,
+          "kind": "stall",
+          "title": "watchdog stall detected",
+          "exception": null
+        }"#;
+        let mut stall_inp = synthetic_input(
+            "[2026-11-28T04:00:01.000Z INFO  d3d] waiting on fence",
+            None,
+        );
+        stall_inp.crash_report_json = Some(stall_crash_json.to_string());
+        let stall_rep = classify_boot_log(&stall_inp);
+        assert_eq!(stall_rep.blocker.class(), BlockerClass::HangTimeout);
+        assert_eq!(stall_rep.blocker.subkind, "watchdog_stall");
+        assert_eq!(stall_rep.exit_code(), exit_codes::TIMEOUT);
     }
 }
