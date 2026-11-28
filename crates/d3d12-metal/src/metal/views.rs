@@ -359,39 +359,53 @@ fn buffer_entry(
     if raw && stride != 0 {
         return Err(format!("raw buffer view cannot have non-zero StructureByteStride ({stride})"));
     }
+    if counter.is_some() {
+        if !writable {
+            return Err("read-only buffer view cannot have a counter resource".into());
+        }
+        if raw {
+            return Err("raw buffer UAV cannot have a counter resource".into());
+        }
+        if stride == 0 {
+            return Err("typed buffer UAV cannot have a counter resource".into());
+        }
+    }
     if raw || stride != 0 {
         let elem = if raw { 4 } else { stride as u64 };
+        let validated_counter = if let Some((cr, coff)) = counter {
+            let Some(cb) = cr.buffer() else {
+                return Err("UAV counter resource is not a buffer".into());
+            };
+            if coff % 4 != 0 {
+                return Err(format!("UAV counter byte offset {coff} is not 4-byte aligned"));
+            }
+            let clen = cr.desc.Width.min(cb.length() as u64);
+            if coff.checked_add(4).is_none_or(|end| end > clen) {
+                return Err(format!("UAV counter offset {coff} + 4 exceeds counter buffer length {clen}"));
+            }
+            Some((cr, coff))
+        } else {
+            None
+        };
         let Some((off, size)) = plan_raw_or_structured_buffer_view(len, elem, first, num) else {
             return Ok(DescriptorTableEntry::NULL.to_bytes());
         };
-        if writable {
-            if let Some((cr, coff)) = counter {
-                let Some(cb) = cr.buffer() else {
-                    return Err("UAV counter resource is not a buffer".into());
-                };
-                if coff % 4 != 0 {
-                    return Err(format!("UAV counter byte offset {coff} is not 4-byte aligned"));
-                }
-                let clen = cr.desc.Width.min(cb.length() as u64);
-                if coff.checked_add(4).is_none_or(|end| end > clen) {
-                    return Err(format!("UAV counter offset {coff} + 4 exceeds counter buffer length {clen}"));
-                }
-                cr.register_ptr();
-                let dev = super::device().ok_or("no device")?;
-                let align = dev.dev.minimumTextureBufferAlignmentForPixelFormat(MTLPixelFormat::R32Uint).max(16) as u64;
-                let (aligned, el_off) = align_typed_buffer_offset(coff / 4, 4, align)?;
-                let tv_id = cr
-                    .buffer_texture_view_id(MTLPixelFormat::R32Uint, aligned, 1 + el_off, true)
-                    .ok_or("UAV counter texture buffer view creation failed")?;
-                let v = BufferView {
-                    gpu_va: base + off,
-                    size,
-                    texture_buffer_view_id: tv_id,
-                    texture_view_offset_in_elements: el_off as u32,
-                    typed_buffer: false,
-                };
-                return Ok(DescriptorTableEntry::buffer_view(&v).to_bytes());
-            }
+        if let Some((cr, coff)) = validated_counter {
+            cr.register_ptr();
+            let dev = super::device().ok_or("no device")?;
+            let align = dev.dev.minimumTextureBufferAlignmentForPixelFormat(MTLPixelFormat::R32Uint).max(16) as u64;
+            let (aligned, el_off) = align_typed_buffer_offset(coff / 4, 4, align)?;
+            let tv_id = cr
+                .buffer_texture_view_id(MTLPixelFormat::R32Uint, aligned, 1 + el_off, true)
+                .ok_or("UAV counter texture buffer view creation failed")?;
+            let v = BufferView {
+                gpu_va: base + off,
+                size,
+                texture_buffer_view_id: tv_id,
+                texture_view_offset_in_elements: el_off as u32,
+                typed_buffer: false,
+            };
+            return Ok(DescriptorTableEntry::buffer_view(&v).to_bytes());
         }
         return Ok(DescriptorTableEntry::buffer(base + off, dxil_metal::runtime::buffer_metadata(size, 0, false)).to_bytes());
     }
@@ -557,9 +571,17 @@ pub fn uav_entry_with_counter(
     counter: Option<(&Resource, u64)>,
     desc: Option<&[u8; 40]>,
 ) -> Result<Entry, String> {
-    let Some(r) = r else { return Ok(DescriptorTableEntry::NULL.to_bytes()) };
+    let Some(r) = r else {
+        if counter.is_some() {
+            return Err("UAV counter requires a structured buffer resource".into());
+        }
+        return Ok(DescriptorTableEntry::NULL.to_bytes());
+    };
     r.register_ptr();
     let Some(d) = desc else {
+        if counter.is_some() {
+            return Err("UAV counter requires a structured buffer UAV desc".into());
+        }
         if r.desc.is_buffer() {
             return Err("UAV of a buffer without a desc".into());
         }
@@ -577,6 +599,9 @@ pub fn uav_entry_with_counter(
             (cr, if explicit_off != 0 { explicit_off } else { desc_off })
         });
         return buffer_entry(r, dxgi, DEFAULT_MAPPING, u64at(u, 0), u32s(u, 2), u32s(u, 3), u32s(u, 6), true, counter_arg);
+    }
+    if counter.is_some() {
+        return Err(format!("UAV counter is only valid for structured buffer UAVs (dimension {dimension})"));
     }
     if r.texture().is_none() {
         return Err(format!("texture UAV (dimension {dimension}) of a buffer"));
@@ -665,6 +690,229 @@ mod tests {
         assert_ne!(tex_id, 0, "counter texture buffer view resource ID must be populated");
         assert_eq!(meta & 0xffff_ffff, 256);
         assert_eq!(meta >> 63, 0, "structured buffer with counter must NOT set typed_buffer bit");
+
+        // Non-zero CounterOffsetInBytes from desc (both 4096-byte aligned and 12-byte unaligned).
+        let big_desc = ResourceDesc { Width: 8192, ..bdesc };
+        let big_ctr = Resource::new_committed_default(&big_desc, &hp, "uav counter 8k").unwrap();
+        let mut desc_4k = desc;
+        desc_4k[24..32].copy_from_slice(&4096u64.to_le_bytes()); // CounterOffsetInBytes = 4096
+        let e4k = uav_entry_with_counter(Some(&data), Some((&big_ctr, 0)), Some(&desc_4k)).unwrap();
+        let tid_4k = u64::from_le_bytes(e4k[8..16].try_into().unwrap());
+        let meta_4k = u64::from_le_bytes(e4k[16..24].try_into().unwrap());
+        assert_ne!(tid_4k, 0);
+        assert_eq!((meta_4k >> 32) & 0xff, 0, "4096-byte offset is 16-byte aligned -> el_off == 0");
+        assert_eq!(meta_4k >> 63, 0);
+
+        let mut desc_12 = desc;
+        desc_12[24..32].copy_from_slice(&12u64.to_le_bytes()); // CounterOffsetInBytes = 12
+        let e12 = uav_entry_with_counter(Some(&data), Some((&big_ctr, 0)), Some(&desc_12)).unwrap();
+        let tid_12 = u64::from_le_bytes(e12[8..16].try_into().unwrap());
+        let meta_12 = u64::from_le_bytes(e12[16..24].try_into().unwrap());
+        assert_ne!(tid_12, 0);
+        assert_eq!((meta_12 >> 32) & 0xff, 3, "12-byte offset -> el_off == 3 within 16-byte aligned view");
+        assert_eq!(meta_12 >> 63, 0);
+
+        // Same-buffer embedded counter (pCounterResource == pResource at offset 4096).
+        let combined = Resource::new_committed_default(&big_desc, &hp, "uav combined").unwrap();
+        let esame = uav_entry_with_counter(Some(&combined), Some((&combined, 0)), Some(&desc_4k)).unwrap();
+        assert_eq!(u64::from_le_bytes(esame[0..8].try_into().unwrap()), combined.gpu_va);
+        assert_ne!(u64::from_le_bytes(esame[8..16].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(esame[16..24].try_into().unwrap()) >> 63, 0);
+
+        // Counter buffer texture-view ID must be registered in ResourceRegistry for barrier tracking.
+        let big_ctr_key = &big_ctr as *const Resource as usize;
+        assert_eq!(
+            super::super::resource::with_resource_registry(|reg| reg.lookup_texture_id(tid_4k)),
+            Some(big_ctr_key)
+        );
+        assert_eq!(
+            super::super::resource::with_resource_registry(|reg| reg.lookup_texture_id(tid_12)),
+            Some(big_ctr_key)
+        );
+
+        // Validation: reject invalid counter combinations honestly.
+        let tdesc = ResourceDesc {
+            Dimension: dim::TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: 28,
+            SampleCount: 1,
+            Flags: resource_flags::ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let tex = Resource::new_committed_default(&tdesc, &hp, "uav tex").unwrap();
+        // Null resource with counter.
+        assert!(uav_entry_with_counter(None, Some((&ctr, 0)), Some(&desc)).is_err());
+        // Null desc with counter.
+        assert!(uav_entry_with_counter(Some(&tex), Some((&ctr, 0)), None).is_err());
+        // Texture UAV with counter.
+        let mut tex_uav_desc = [0u8; 40];
+        tex_uav_desc[0..4].copy_from_slice(&28u32.to_le_bytes());
+        tex_uav_desc[4..8].copy_from_slice(&4u32.to_le_bytes()); // TEXTURE2D
+        assert!(uav_entry_with_counter(Some(&tex), Some((&ctr, 0)), Some(&tex_uav_desc)).is_err());
+        // Raw buffer UAV with counter.
+        let mut raw_desc = [0u8; 40];
+        raw_desc[0..4].copy_from_slice(&39u32.to_le_bytes()); // R32_TYPELESS
+        raw_desc[4..8].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
+        raw_desc[16..20].copy_from_slice(&16u32.to_le_bytes()); // NumElements
+        raw_desc[32..36].copy_from_slice(&1u32.to_le_bytes()); // RAW flag
+        assert!(uav_entry_with_counter(Some(&data), Some((&ctr, 0)), Some(&raw_desc)).is_err());
+        // Typed buffer UAV with counter.
+        let mut typed_desc = [0u8; 40];
+        typed_desc[0..4].copy_from_slice(&42u32.to_le_bytes()); // R32_UINT
+        typed_desc[4..8].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
+        typed_desc[16..20].copy_from_slice(&16u32.to_le_bytes()); // NumElements
+        assert!(uav_entry_with_counter(Some(&data), Some((&ctr, 0)), Some(&typed_desc)).is_err());
+        // Non-buffer counter resource.
+        assert!(uav_entry_with_counter(Some(&data), Some((&tex, 0)), Some(&desc)).is_err());
+        // Unaligned counter offset (not a multiple of 4).
+        let mut unaligned_desc = desc;
+        unaligned_desc[24..32].copy_from_slice(&2u64.to_le_bytes());
+        assert!(uav_entry_with_counter(Some(&data), Some((&ctr, 0)), Some(&unaligned_desc)).is_err());
+        // Out-of-bounds counter offset.
+        let mut oob_desc = desc;
+        oob_desc[24..32].copy_from_slice(&256u64.to_le_bytes());
+        assert!(uav_entry_with_counter(Some(&data), Some((&ctr, 0)), Some(&oob_desc)).is_err());
+    }
+
+    /// End-to-end Metal 4 GPU compute test verifying `uav_entry_with_counter`'s
+    /// `IRDescriptorTableEntry` layout: a shader unpacks both the structured buffer VA
+    /// and the `R32Uint` counter texture-buffer view + `textureViewOffsetInElements`
+    /// (tested at `CounterOffsetInBytes = 4096` and non-16-byte-aligned `12`),
+    /// increments the counter, writes an element into the structured buffer, and
+    /// confirms exact GPU readback under `MTL_DEBUG_LAYER=1`.
+    #[test]
+    fn structured_uav_counter_view_gpu_roundtrip() {
+        let Some(d) = super::super::device() else { return };
+        use crate::metal::descriptor::{heap_kind, DescriptorHeap};
+        use crate::types::{dim, heap_type, resource_flags, HeapProperties, ResourceDesc};
+        use objc2::runtime::ProtocolObject;
+
+        let hp = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+        let data = Resource::new_committed_default(
+            &ResourceDesc {
+                Dimension: dim::BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleCount: 1,
+                Layout: 1,
+                Flags: resource_flags::ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            },
+            &hp,
+            "uav_ctr_gpu_data",
+        )
+        .unwrap();
+        let ctr = Resource::new_committed_default(
+            &ResourceDesc {
+                Dimension: dim::BUFFER,
+                Width: 8192,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleCount: 1,
+                Layout: 1,
+                Flags: resource_flags::ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            },
+            &hp,
+            "uav_ctr_gpu_ctr",
+        )
+        .unwrap();
+
+        // Seed initial counter values: 5 at offset 4096 and 9 at offset 12.
+        let ctr_buf = ctr.buffer().unwrap();
+        let data_buf = data.buffer().unwrap();
+        unsafe {
+            std::ptr::write_bytes(data_buf.contents().as_ptr() as *mut u8, 0, 256);
+            std::ptr::write_bytes(ctr_buf.contents().as_ptr() as *mut u8, 0, 8192);
+            *(ctr_buf.contents().as_ptr().cast::<u8>().add(4096) as *mut u32) = 5;
+            *(ctr_buf.contents().as_ptr().cast::<u8>().add(12) as *mut u32) = 9;
+        }
+
+        let make_desc = |counter_off: u64| {
+            let mut desc = [0u8; 40];
+            desc[4..8].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
+            desc[8..16].copy_from_slice(&0u64.to_le_bytes()); // FirstElement
+            desc[16..20].copy_from_slice(&64u32.to_le_bytes()); // NumElements
+            desc[20..24].copy_from_slice(&4u32.to_le_bytes()); // StructureByteStride = 4
+            desc[24..32].copy_from_slice(&counter_off.to_le_bytes()); // CounterOffsetInBytes
+            desc
+        };
+        let e0 = uav_entry_with_counter(Some(&data), Some((&ctr, 0)), Some(&make_desc(4096))).unwrap();
+        let e1 = uav_entry_with_counter(Some(&data), Some((&ctr, 0)), Some(&make_desc(12))).unwrap();
+
+        let heap = DescriptorHeap::new(heap_kind::CBV_SRV_UAV, 4, true, "uav_ctr_gpu_heap").unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(e0.as_ptr(), heap.cpu_base as *mut u8, 24);
+            std::ptr::copy_nonoverlapping(e1.as_ptr(), (heap.cpu_base + 24) as *mut u8, 24);
+        }
+
+        let msl = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct IRDescEntry {
+    device uint* data;
+    texture_buffer<uint, access::read_write> counter;
+    ulong meta;
+};
+kernel void test_uav_counter(device IRDescEntry* table [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    if (tid >= 2u) return;
+    uint el_off = uint((table[tid].meta >> 32ul) & 0xfful);
+    uint old_val = table[tid].counter.read(el_off).x;
+    table[tid].counter.write(uint4(old_val + 1u, 0u, 0u, 0u), el_off);
+    table[tid].data[old_val] = 0x1000u + tid * 0x100u + old_val;
+}
+"#;
+        let lib = super::super::pipeline::library_from_source("test_uav_counter", msl).unwrap();
+        let pso = super::super::pipeline::compute_pipeline_from_function(&lib, "test_uav_counter").unwrap();
+
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxBufferBindCount(1);
+        let at = d.dev.newArgumentTableWithDescriptor_error(&atd).unwrap();
+        let q = d.dev.newMTL4CommandQueue().unwrap();
+        d.commit_residency();
+        q.addResidencySet(&d.residency);
+        let alloc = d.dev.newCommandAllocator().unwrap();
+        let cb = d.dev.newCommandBuffer().unwrap();
+        cb.beginCommandBufferWithAllocator(&alloc);
+        let enc = cb.computeCommandEncoder().unwrap();
+        unsafe {
+            enc.setComputePipelineState(&pso);
+            at.setAddress_atIndex(heap.gpu_base, 0);
+            enc.setArgumentTable(Some(&at));
+            enc.dispatchThreads_threadsPerThreadgroup(
+                MTLSize { width: 2, height: 1, depth: 1 },
+                MTLSize { width: 2, height: 1, depth: 1 },
+            );
+        }
+        enc.endEncoding();
+        cb.endCommandBuffer();
+
+        let ev = d.dev.newSharedEvent().unwrap();
+        let mut cbs = [std::ptr::NonNull::from(&*cb)];
+        unsafe { q.commit_count(std::ptr::NonNull::new(cbs.as_mut_ptr()).unwrap(), 1) };
+        q.signalEvent_value(ProtocolObject::from_ref(&*ev), 1);
+        assert!(ev.waitUntilSignaledValue_timeoutMS(1, 5000));
+
+        let (ctr_4k, ctr_12, d5, d9) = unsafe {
+            let cp = ctr_buf.contents().as_ptr().cast::<u8>();
+            let dp = data_buf.contents().as_ptr().cast::<u32>();
+            (
+                *(cp.add(4096) as *const u32),
+                *(cp.add(12) as *const u32),
+                *dp.add(5),
+                *dp.add(9),
+            )
+        };
+        assert_eq!(ctr_4k, 6, "counter at offset 4096 must increment 5 -> 6");
+        assert_eq!(ctr_12, 10, "counter at offset 12 (el_off=3) must increment 9 -> 10");
+        assert_eq!(d5, 0x1005, "structured element at old counter 5 must be written");
+        assert_eq!(d9, 0x1109, "structured element at old counter 9 must be written");
     }
 
     #[test]
