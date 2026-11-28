@@ -7,6 +7,7 @@ pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
 
 const ERROR_SUCCESS: u32 = 0;
+const ERROR_GEN_FAILURE: u32 = 31;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_BUFFER_OVERFLOW: u32 = 111;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -829,8 +830,225 @@ pub unsafe extern "win64" fn GetIpAddrTable(ip_addr_table: *mut u8, size: *mut u
     ERROR_SUCCESS
 }
 
-/// `GetIpForwardTable`: builds an IPv4 routing table (`MIB_IPFORWARDTABLE` + 56-byte
-/// `MIB_IPFORWARDROW` entries) from live host interfaces (`getifaddrs()`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForwardRow {
+    dest: [u8; 4],
+    mask: [u8; 4],
+    next_hop: [u8; 4],
+    if_index: u32,
+    route_type: u32,
+    proto: u32,
+    metric1: u32,
+}
+
+// Darwin `<net/route.h>` constants (verified on arm64 Darwin / iOS).
+const DARWIN_RT_MSGHDR_LEN: usize = 92;
+const DARWIN_RTM_VERSION: u8 = 5;
+const DARWIN_RTF_UP: i32 = 0x1;
+const DARWIN_RTF_GATEWAY: i32 = 0x2;
+const DARWIN_RTF_HOST: i32 = 0x4;
+const DARWIN_RTF_REJECT: i32 = 0x8;
+const DARWIN_RTF_BLACKHOLE: i32 = 0x1000;
+const DARWIN_RTF_WASCLONED: i32 = 0x2_0000;
+const DARWIN_RTF_IFSCOPE: i32 = 0x100_0000;
+const DARWIN_RTA_DST: i32 = 0x1;
+const DARWIN_RTA_GATEWAY: i32 = 0x2;
+const DARWIN_RTA_NETMASK: i32 = 0x4;
+const DARWIN_AF_INET: u8 = 2;
+const DARWIN_AF_LINK: u8 = 18;
+
+fn darwin_sa_step(sa_len: u8) -> usize {
+    let n = sa_len as usize;
+    if n == 0 { 4 } else { (n + 3) & !3 }
+}
+
+/// Parses a raw Darwin `sysctl([CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0])` buffer
+/// into Windows IPv4 `ForwardRow` entries without fabricating gateways or default routes.
+fn parse_darwin_rt_dump(buf: &[u8], ifaces: &[HostInterface]) -> Vec<ForwardRow> {
+    let mut rows: Vec<ForwardRow> = Vec::new();
+    let mut off = 0usize;
+
+    while off + DARWIN_RT_MSGHDR_LEN <= buf.len() {
+        let msglen = u16::from_ne_bytes([buf[off], buf[off + 1]]) as usize;
+        if msglen < DARWIN_RT_MSGHDR_LEN || off + msglen > buf.len() {
+            break;
+        }
+        let version = buf[off + 2];
+        let if_index = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]) as u32;
+        let flags = i32::from_ne_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
+        let addrs = i32::from_ne_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]]);
+
+        let rec_end = off + msglen;
+        off = rec_end;
+
+        if version != DARWIN_RTM_VERSION
+            || if_index == 0
+            || (flags & DARWIN_RTF_UP) == 0
+            || (flags & (DARWIN_RTF_REJECT | DARWIN_RTF_BLACKHOLE | DARWIN_RTF_WASCLONED | DARWIN_RTF_IFSCOPE)) != 0
+        {
+            continue;
+        }
+
+        let mut p = (rec_end - msglen) + DARWIN_RT_MSGHDR_LEN;
+        let mut sa_slices: [Option<&[u8]>; 8] = [None; 8];
+        for (i, slot) in sa_slices.iter_mut().enumerate() {
+            if (addrs & (1 << i)) != 0 {
+                if p >= rec_end {
+                    break;
+                }
+                let sa_len = buf[p];
+                let step = darwin_sa_step(sa_len);
+                let avail_end = (p + (sa_len as usize).max(1)).min(rec_end);
+                *slot = Some(&buf[p..avail_end]);
+                p = p.saturating_add(step);
+            }
+        }
+
+        let Some(dst_sa) = sa_slices[0] else {
+            continue;
+        };
+        if (addrs & DARWIN_RTA_DST) == 0 || dst_sa.len() < 8 || dst_sa[1] != DARWIN_AF_INET {
+            continue;
+        }
+        let dest = [dst_sa[4], dst_sa[5], dst_sa[6], dst_sa[7]];
+
+        let mask = if (addrs & DARWIN_RTA_NETMASK) != 0 {
+            if let Some(m_sa) = sa_slices[2] {
+                let raw_len = m_sa[0] as usize;
+                let mut m = [0u8; 4];
+                if raw_len > 4 {
+                    let avail = (raw_len - 4).min(4).min(m_sa.len().saturating_sub(4));
+                    m[..avail].copy_from_slice(&m_sa[4..4 + avail]);
+                }
+                m
+            } else {
+                continue;
+            }
+        } else if (flags & DARWIN_RTF_HOST) != 0 {
+            [255, 255, 255, 255]
+        } else if dest == [0, 0, 0, 0] {
+            [0, 0, 0, 0]
+        } else {
+            continue;
+        };
+
+        let Some(gw_sa) = sa_slices[1] else {
+            continue;
+        };
+        if (addrs & DARWIN_RTA_GATEWAY) == 0 || gw_sa.len() < 2 {
+            continue;
+        }
+
+        let is_gateway_flag = (flags & DARWIN_RTF_GATEWAY) != 0;
+        let (next_hop, route_type, proto) = if gw_sa[1] == DARWIN_AF_INET && gw_sa.len() >= 8 {
+            let gw_ip = [gw_sa[4], gw_sa[5], gw_sa[6], gw_sa[7]];
+            if is_gateway_flag {
+                (gw_ip, MIB_IPROUTE_TYPE_INDIRECT, MIB_IPROUTE_PROTO_NETMGMT)
+            } else {
+                (gw_ip, MIB_IPROUTE_TYPE_DIRECT, MIB_IPROUTE_PROTO_LOCAL)
+            }
+        } else if gw_sa[1] == DARWIN_AF_LINK && !is_gateway_flag {
+            // Direct on-link subnet or point-to-point/VPN interface route.
+            let local_ip = ifaces
+                .iter()
+                .find(|i| i.index == if_index)
+                .and_then(|iface| {
+                    iface
+                        .ipv4
+                        .iter()
+                        .find(|v| {
+                            (u32::from_be_bytes(v.addr) & u32::from_be_bytes(mask))
+                                == (u32::from_be_bytes(dest) & u32::from_be_bytes(mask))
+                        })
+                        .or_else(|| iface.ipv4.first())
+                        .map(|v| v.addr)
+                })
+                .unwrap_or([0, 0, 0, 0]);
+            (local_ip, MIB_IPROUTE_TYPE_DIRECT, MIB_IPROUTE_PROTO_LOCAL)
+        } else {
+            continue;
+        };
+
+        let metric1 = ifaces
+            .iter()
+            .find(|i| i.index == if_index)
+            .map_or(25, |i| if i.is_loopback() { 75 } else { 25 });
+
+        if !rows.iter().any(|r| {
+            r.dest == dest && r.mask == mask && r.next_hop == next_hop && r.if_index == if_index
+        }) {
+            rows.push(ForwardRow {
+                dest,
+                mask,
+                next_hop,
+                if_index,
+                route_type,
+                proto,
+                metric1,
+            });
+        }
+    }
+
+    rows
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn query_host_ipv4_routes(ifaces: &[HostInterface]) -> Result<Vec<ForwardRow>, i32> {
+    const CTL_NET: libc::c_int = 4;
+    const PF_ROUTE: libc::c_int = 17;
+    const AF_INET: libc::c_int = 2;
+    const NET_RT_DUMP: libc::c_int = 1;
+
+    let mut mib: [libc::c_int; 6] = [CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0];
+    for _ in 0..3 {
+        let mut needed: libc::size_t = 0;
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                std::ptr::null_mut(),
+                &mut needed,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+        }
+        if needed == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; needed.saturating_add(needed / 4).max(1024)];
+        let mut actual = buf.len();
+        let rc2 = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr().cast(),
+                &mut actual,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc2 == 0 {
+            buf.truncate(actual);
+            return Ok(parse_darwin_rt_dump(&buf, ifaces));
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        if errno != libc::ENOMEM {
+            return Err(errno);
+        }
+    }
+    Err(libc::ENOMEM)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn query_host_ipv4_routes(_ifaces: &[HostInterface]) -> Result<Vec<ForwardRow>, i32> {
+    Err(libc::ENOSYS)
+}
+
+/// `GetIpForwardTable`: queries the real kernel IPv4 routing table (`sysctl` `NET_RT_DUMP`)
+/// and serializes `MIB_IPFORWARDTABLE` + 56-byte `MIB_IPFORWARDROW` entries.
 pub unsafe extern "win64" fn GetIpForwardTable(
     ip_forward_table: *mut u8,
     size: *mut u32,
@@ -840,84 +1058,14 @@ pub unsafe extern "win64" fn GetIpForwardTable(
         return ERROR_INVALID_PARAMETER;
     }
 
-    #[derive(Clone, Copy)]
-    struct ForwardRow {
-        dest: [u8; 4],
-        mask: [u8; 4],
-        next_hop: [u8; 4],
-        if_index: u32,
-        route_type: u32,
-        proto: u32,
-        metric1: u32,
-    }
-
     let ifaces = enumerate_host_interfaces();
-    let mut rows: Vec<ForwardRow> = Vec::new();
-
-    // Synthesize default route (0.0.0.0/0) on the primary up non-loopback IPv4 interface, if any.
-    let default_iface = ifaces
-        .iter()
-        .find(|i| {
-            i.is_up()
-                && !i.is_loopback()
-                && i.ipv4.iter().any(|v| !(v.addr[0] == 169 && v.addr[1] == 254))
-        })
-        .or_else(|| ifaces.iter().find(|i| i.is_up() && !i.is_loopback() && !i.ipv4.is_empty()));
-    if let Some(iface) = default_iface {
-        if let Some(v4) = iface.ipv4.first() {
-            rows.push(ForwardRow {
-                dest: [0, 0, 0, 0],
-                mask: [0, 0, 0, 0],
-                next_hop: v4.addr,
-                if_index: iface.index,
-                route_type: MIB_IPROUTE_TYPE_INDIRECT,
-                proto: MIB_IPROUTE_PROTO_NETMGMT,
-                metric1: 25,
-            });
+    let mut rows = match query_host_ipv4_routes(&ifaces) {
+        Ok(r) => r,
+        Err(errno) => {
+            log::warn!("iphlpapi: GetIpForwardTable failed to query host routing table (errno={errno})");
+            return ERROR_GEN_FAILURE;
         }
-    }
-
-    // On-link subnet and host routes for each UP IPv4 interface.
-    for iface in ifaces.iter().filter(|i| i.is_up()) {
-        let metric = if iface.is_loopback() { 75 } else { 25 };
-        for v4 in &iface.ipv4 {
-            let net = [
-                v4.addr[0] & v4.mask[0],
-                v4.addr[1] & v4.mask[1],
-                v4.addr[2] & v4.mask[2],
-                v4.addr[3] & v4.mask[3],
-            ];
-            if !rows
-                .iter()
-                .any(|r| r.dest == net && r.mask == v4.mask && r.if_index == iface.index)
-            {
-                rows.push(ForwardRow {
-                    dest: net,
-                    mask: v4.mask,
-                    next_hop: v4.addr,
-                    if_index: iface.index,
-                    route_type: MIB_IPROUTE_TYPE_DIRECT,
-                    proto: MIB_IPROUTE_PROTO_LOCAL,
-                    metric1: metric,
-                });
-            }
-            let host_mask = [255, 255, 255, 255];
-            if !rows
-                .iter()
-                .any(|r| r.dest == v4.addr && r.mask == host_mask && r.if_index == iface.index)
-            {
-                rows.push(ForwardRow {
-                    dest: v4.addr,
-                    mask: host_mask,
-                    next_hop: v4.addr,
-                    if_index: iface.index,
-                    route_type: MIB_IPROUTE_TYPE_DIRECT,
-                    proto: MIB_IPROUTE_PROTO_LOCAL,
-                    metric1: metric,
-                });
-            }
-        }
-    }
+    };
 
     if order != FALSE {
         rows.sort_by_key(|r| {
@@ -1097,16 +1245,156 @@ mod tests {
             let num_fwd = (fwd_buf.as_ptr() as *const u32).read_unaligned() as usize;
             assert!(num_fwd >= 1);
             let mut saw_lo_route = false;
+            let live_ifaces = enumerate_host_interfaces();
             for i in 0..num_fwd {
                 let row = fwd_buf.as_ptr().add(4 + i * MIB_IPFORWARDROW_SIZE);
                 let dest = (row.add(0x00) as *const u32).read_unaligned().to_ne_bytes();
+                let mask = (row.add(0x04) as *const u32).read_unaligned().to_ne_bytes();
+                let next_hop = (row.add(0x0C) as *const u32).read_unaligned().to_ne_bytes();
                 let if_idx = (row.add(0x10) as *const u32).read_unaligned();
+                let route_type = (row.add(0x14) as *const u32).read_unaligned();
                 assert_ne!(if_idx, 0);
                 if dest == [127, 0, 0, 1] {
                     saw_lo_route = true;
                 }
+                // Any indirect default route must report a real gateway, never the interface's own IP.
+                if dest == [0, 0, 0, 0] && mask == [0, 0, 0, 0] && route_type == MIB_IPROUTE_TYPE_INDIRECT {
+                    assert_ne!(next_hop, [0, 0, 0, 0]);
+                    if let Some(iface) = live_ifaces.iter().find(|x| x.index == if_idx) {
+                        assert!(
+                            !iface.ipv4.iter().any(|v| v.addr == next_hop),
+                            "default gateway {next_hop:?} must not be the interface's own address"
+                        );
+                    }
+                }
             }
             assert!(saw_lo_route, "expected 127.0.0.1 host route in GetIpForwardTable");
         }
+    }
+
+    #[test]
+    fn parse_darwin_rt_dump_extracts_real_gateway_vpn_and_no_fictitious_default() {
+        let make_sa_in = |ip: [u8; 4]| -> Vec<u8> {
+            let mut sa = vec![0u8; 16];
+            sa[0] = 16;
+            sa[1] = DARWIN_AF_INET;
+            sa[4..8].copy_from_slice(&ip);
+            sa
+        };
+        let make_sa_link = |idx: u16| -> Vec<u8> {
+            let mut sa = vec![0u8; 16];
+            sa[0] = 16;
+            sa[1] = DARWIN_AF_LINK;
+            sa[2..4].copy_from_slice(&idx.to_ne_bytes());
+            sa
+        };
+        let make_rt_msg = |if_index: u16, flags: i32, dst: [u8; 4], gw: Vec<u8>, mask_sa: Option<Vec<u8>>| -> Vec<u8> {
+            let mut msg = vec![0u8; DARWIN_RT_MSGHDR_LEN];
+            msg[2] = DARWIN_RTM_VERSION;
+            msg[4..6].copy_from_slice(&if_index.to_ne_bytes());
+            msg[8..12].copy_from_slice(&flags.to_ne_bytes());
+            let mut addrs = DARWIN_RTA_DST | DARWIN_RTA_GATEWAY;
+            if mask_sa.is_some() {
+                addrs |= DARWIN_RTA_NETMASK;
+            }
+            msg[12..16].copy_from_slice(&addrs.to_ne_bytes());
+            msg.extend_from_slice(&make_sa_in(dst));
+            msg.extend_from_slice(&gw);
+            if let Some(m) = mask_sa {
+                let step = darwin_sa_step(m[0]);
+                let start = msg.len();
+                msg.extend_from_slice(&m);
+                while msg.len() < start + step {
+                    msg.push(0);
+                }
+            }
+            let total = msg.len() as u16;
+            msg[0..2].copy_from_slice(&total.to_ne_bytes());
+            msg
+        };
+
+        let ifaces = vec![
+            HostInterface {
+                name: "en0".to_string(),
+                index: 5,
+                flags: libc::IFF_UP as u32,
+                mac: [0; 8],
+                mac_len: 6,
+                if_type: IF_TYPE_ETHERNET_CSMACD,
+                mtu: 1500,
+                ipv4: vec![HostIpv4 { addr: [192, 168, 1, 20], mask: [255, 255, 255, 0], prefix_len: 24 }],
+                ipv6: Vec::new(),
+            },
+            HostInterface {
+                name: "utun3".to_string(),
+                index: 12,
+                flags: (libc::IFF_UP | libc::IFF_POINTOPOINT) as u32,
+                mac: [0; 8],
+                mac_len: 0,
+                if_type: IF_TYPE_PPP,
+                mtu: 1400,
+                ipv4: vec![HostIpv4 { addr: [10, 8, 0, 2], mask: [255, 255, 0, 0], prefix_len: 16 }],
+                ipv6: Vec::new(),
+            },
+        ];
+
+        // 1. Disconnected LAN: only on-link 192.168.1.0/24 + scoped/rejected routes -> NO default route invented.
+        let mut lan_only = Vec::new();
+        lan_only.extend_from_slice(&make_rt_msg(
+            5,
+            DARWIN_RTF_UP,
+            [192, 168, 1, 0],
+            make_sa_link(5),
+            Some(vec![7, 0, 0, 0, 255, 255, 255]), // compressed /24 netmask (sa_len=7)
+        ));
+        lan_only.extend_from_slice(&make_rt_msg(
+            5,
+            DARWIN_RTF_UP | DARWIN_RTF_GATEWAY | DARWIN_RTF_IFSCOPE,
+            [0, 0, 0, 0],
+            make_sa_in([192, 168, 1, 1]),
+            Some(vec![0, 0, 0, 0]),
+        ));
+        lan_only.extend_from_slice(&make_rt_msg(
+            5,
+            DARWIN_RTF_UP | DARWIN_RTF_REJECT,
+            [10, 0, 0, 0],
+            make_sa_in([127, 0, 0, 1]),
+            Some(vec![5, 0, 0, 0, 255]),
+        ));
+        let lan_rows = parse_darwin_rt_dump(&lan_only, &ifaces);
+        assert_eq!(lan_rows.len(), 1);
+        assert_eq!(lan_rows[0].dest, [192, 168, 1, 0]);
+        assert_eq!(lan_rows[0].mask, [255, 255, 255, 0]);
+        assert_eq!(lan_rows[0].next_hop, [192, 168, 1, 20]);
+        assert_eq!(lan_rows[0].route_type, MIB_IPROUTE_TYPE_DIRECT);
+
+        // 2. Active default route + VPN route: real gateway 192.168.1.1 preserved (not 192.168.1.20) + utun3 route kept.
+        let mut full = Vec::new();
+        full.extend_from_slice(&make_rt_msg(
+            5,
+            DARWIN_RTF_UP | DARWIN_RTF_GATEWAY,
+            [0, 0, 0, 0],
+            make_sa_in([192, 168, 1, 1]),
+            Some(vec![0, 0, 0, 0]), // zero-length /0 netmask
+        ));
+        full.extend_from_slice(&make_rt_msg(
+            12,
+            DARWIN_RTF_UP,
+            [10, 8, 0, 0],
+            make_sa_link(12),
+            Some(vec![6, 0, 0, 0, 255, 255]), // compressed /16 netmask
+        ));
+        let full_rows = parse_darwin_rt_dump(&full, &ifaces);
+        assert_eq!(full_rows.len(), 2);
+        assert_eq!(full_rows[0].dest, [0, 0, 0, 0]);
+        assert_eq!(full_rows[0].mask, [0, 0, 0, 0]);
+        assert_eq!(full_rows[0].next_hop, [192, 168, 1, 1]);
+        assert_eq!(full_rows[0].if_index, 5);
+        assert_eq!(full_rows[0].route_type, MIB_IPROUTE_TYPE_INDIRECT);
+        assert_eq!(full_rows[1].dest, [10, 8, 0, 0]);
+        assert_eq!(full_rows[1].mask, [255, 255, 0, 0]);
+        assert_eq!(full_rows[1].next_hop, [10, 8, 0, 2]);
+        assert_eq!(full_rows[1].if_index, 12);
+        assert_eq!(full_rows[1].route_type, MIB_IPROUTE_TYPE_DIRECT);
     }
 }

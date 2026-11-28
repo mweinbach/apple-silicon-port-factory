@@ -3967,18 +3967,66 @@ pub unsafe extern "win64" fn FormatMessageA(flags: u32, source: *const c_void, i
 // Misc
 // ---------------------------------------------------------------------------
 
-static NEXT_ATOM: AtomicUsize = AtomicUsize::new(0xC000);
+struct GlobalAtomTable {
+    by_name: std::collections::HashMap<String, u16>,
+    by_atom: std::collections::HashMap<u16, String>,
+    next_atom: u16,
+}
 
-fn add_atom(s: String) -> u16 {
-    static ATOMS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, u16>>> = OnceLock::new();
-    let mut map = crate::thread::defer_lock(ATOMS.get_or_init(Default::default));
-    let key = s.to_ascii_lowercase();
-    if let Some(&a) = map.get(&key) {
+fn global_atom_table() -> &'static std::sync::Mutex<GlobalAtomTable> {
+    static ATOMS: OnceLock<std::sync::Mutex<GlobalAtomTable>> = OnceLock::new();
+    ATOMS.get_or_init(|| {
+        std::sync::Mutex::new(GlobalAtomTable {
+            by_name: std::collections::HashMap::new(),
+            by_atom: std::collections::HashMap::new(),
+            next_atom: 0xC000,
+        })
+    })
+}
+
+fn parse_integer_atom_str(s: &str) -> Option<u16> {
+    let digits = s.strip_prefix('#')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let val: u32 = digits.parse().ok()?;
+    (1..0xC000).contains(&val).then_some(val as u16)
+}
+
+pub(crate) fn global_add_atom(s: &str) -> u16 {
+    if s.is_empty() {
+        return 0;
+    }
+    if let Some(int_atom) = parse_integer_atom_str(s) {
+        return int_atom;
+    }
+    let mut tbl = crate::thread::defer_lock(global_atom_table());
+    let key = s.to_lowercase();
+    if let Some(&a) = tbl.by_name.get(&key) {
         return a;
     }
-    let a = NEXT_ATOM.fetch_add(1, Ordering::Relaxed) as u16;
-    map.insert(key, a);
-    a
+    // Allocate a free string atom in 0xC000..=0xFFFF.
+    for _ in 0..0x4000u32 {
+        let candidate = tbl.next_atom;
+        tbl.next_atom = if candidate == 0xFFFF { 0xC000 } else { candidate + 1 };
+        if !tbl.by_atom.contains_key(&candidate) {
+            tbl.by_name.insert(key.clone(), candidate);
+            tbl.by_atom.insert(candidate, key);
+            return candidate;
+        }
+    }
+    0
+}
+
+pub(crate) fn global_find_atom(s: &str) -> Option<u16> {
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(int_atom) = parse_integer_atom_str(s) {
+        return Some(int_atom);
+    }
+    let tbl = crate::thread::defer_lock(global_atom_table());
+    tbl.by_name.get(&s.to_lowercase()).copied()
 }
 
 pub unsafe extern "win64" fn GlobalAddAtomW(s: LPCWSTR) -> u16 {
@@ -3986,14 +4034,32 @@ pub unsafe extern "win64" fn GlobalAddAtomW(s: LPCWSTR) -> u16 {
         set_err(err::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    add_atom(from_wide(s))
+    let addr = s as usize;
+    if addr <= 0xFFFF {
+        return addr as u16;
+    }
+    let name = from_wide(s);
+    if name.is_empty() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    global_add_atom(&name)
 }
 pub unsafe extern "win64" fn GlobalAddAtomA(s: LPCSTR) -> u16 {
     if s.is_null() {
         set_err(err::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    add_atom(from_ansi(s))
+    let addr = s as usize;
+    if addr <= 0xFFFF {
+        return addr as u16;
+    }
+    let name = from_ansi(s);
+    if name.is_empty() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    global_add_atom(&name)
 }
 pub unsafe extern "win64" fn GlobalDeleteAtom(_a: u16) -> u16 {
     0

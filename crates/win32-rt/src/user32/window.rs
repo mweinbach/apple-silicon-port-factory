@@ -2446,14 +2446,10 @@ pub(crate) fn create_virtual_dialog_hwnd(
 // Window properties & DPI coordinate conversion
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum PropKey {
-    Atom(u16),
-    Name(String),
-}
-
-fn window_props() -> &'static Mutex<HashMap<usize, HashMap<PropKey, usize>>> {
-    static P: OnceLock<Mutex<HashMap<usize, HashMap<PropKey, usize>>>> = OnceLock::new();
+/// Window properties are keyed by canonical global atom (`u16`), matching Windows
+/// where string property names and their `GlobalAddAtomA/W` atoms alias the same entry.
+fn window_props() -> &'static Mutex<HashMap<usize, HashMap<u16, usize>>> {
+    static P: OnceLock<Mutex<HashMap<usize, HashMap<u16, usize>>>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2461,76 +2457,106 @@ fn forget_window_props(hwnd: usize) {
     window_props().lock().unwrap().remove(&hwnd);
 }
 
-unsafe fn prop_key_a(lp_string: LPCSTR) -> Option<PropKey> {
+enum PropLookup {
+    Invalid,
+    Missing,
+    Atom(u16),
+}
+
+unsafe fn resolve_prop_a(lp_string: LPCSTR, create: bool) -> PropLookup {
     let addr = lp_string as usize;
     if addr == 0 {
-        return None;
+        return PropLookup::Invalid;
     }
     if addr <= 0xFFFF {
-        return Some(PropKey::Atom(addr as u16));
+        return PropLookup::Atom(addr as u16);
     }
     let s = crate::strings::from_ansi(lp_string);
     if s.is_empty() {
-        return None;
+        return PropLookup::Invalid;
     }
-    Some(PropKey::Name(s.to_lowercase()))
+    if create {
+        let atom = crate::kernel32::process::global_add_atom(&s);
+        if atom == 0 { PropLookup::Invalid } else { PropLookup::Atom(atom) }
+    } else {
+        match crate::kernel32::process::global_find_atom(&s) {
+            Some(atom) => PropLookup::Atom(atom),
+            None => PropLookup::Missing,
+        }
+    }
 }
 
-unsafe fn prop_key_w(lp_string: LPCWSTR) -> Option<PropKey> {
+unsafe fn resolve_prop_w(lp_string: LPCWSTR, create: bool) -> PropLookup {
     let addr = lp_string as usize;
     if addr == 0 {
-        return None;
+        return PropLookup::Invalid;
     }
     if addr <= 0xFFFF {
-        return Some(PropKey::Atom(addr as u16));
+        return PropLookup::Atom(addr as u16);
     }
     let s = crate::strings::from_wide(lp_string);
     if s.is_empty() {
-        return None;
+        return PropLookup::Invalid;
     }
-    Some(PropKey::Name(s.to_lowercase()))
+    if create {
+        let atom = crate::kernel32::process::global_add_atom(&s);
+        if atom == 0 { PropLookup::Invalid } else { PropLookup::Atom(atom) }
+    } else {
+        match crate::kernel32::process::global_find_atom(&s) {
+            Some(atom) => PropLookup::Atom(atom),
+            None => PropLookup::Missing,
+        }
+    }
 }
 
-fn set_prop_impl(hwnd: usize, key: Option<PropKey>, data: usize) -> BOOL {
+fn set_prop_impl(hwnd: usize, key: PropLookup, data: usize) -> BOOL {
     if require(hwnd).is_none() {
         return FALSE;
     }
-    let Some(key) = key else {
+    let PropLookup::Atom(atom) = key else {
         set_error(e::INVALID_PARAMETER);
         return FALSE;
     };
-    window_props().lock().unwrap().entry(hwnd).or_default().insert(key, data);
+    window_props().lock().unwrap().entry(hwnd).or_default().insert(atom, data);
     TRUE
 }
 
-fn get_prop_impl(hwnd: usize, key: Option<PropKey>) -> usize {
+fn get_prop_impl(hwnd: usize, key: PropLookup) -> usize {
     if !exists(hwnd) {
         set_error(e::INVALID_WINDOW_HANDLE);
         return 0;
     }
-    let Some(key) = key else {
-        set_error(e::INVALID_PARAMETER);
-        return 0;
+    let atom = match key {
+        PropLookup::Atom(a) => a,
+        PropLookup::Missing => return 0,
+        PropLookup::Invalid => {
+            set_error(e::INVALID_PARAMETER);
+            return 0;
+        }
     };
     window_props()
         .lock()
         .unwrap()
         .get(&hwnd)
-        .and_then(|m| m.get(&key).copied())
+        .and_then(|m| m.get(&atom).copied())
         .unwrap_or(0)
 }
 
-fn remove_prop_impl(hwnd: usize, key: Option<PropKey>) -> usize {
+fn remove_prop_impl(hwnd: usize, key: PropLookup) -> usize {
     if !exists(hwnd) {
         set_error(e::INVALID_WINDOW_HANDLE);
         return 0;
     }
-    let Some(key) = key else {
-        set_error(e::INVALID_PARAMETER);
-        return 0;
+    let atom = match key {
+        PropLookup::Atom(a) => a,
+        PropLookup::Missing => return 0,
+        PropLookup::Invalid => {
+            set_error(e::INVALID_PARAMETER);
+            return 0;
+        }
     };
     let mut table = window_props().lock().unwrap();
-    let val = table.get_mut(&hwnd).and_then(|m| m.remove(&key)).unwrap_or(0);
+    let val = table.get_mut(&hwnd).and_then(|m| m.remove(&atom)).unwrap_or(0);
     if table.get(&hwnd).is_some_and(|m| m.is_empty()) {
         table.remove(&hwnd);
     }
@@ -2538,27 +2564,27 @@ fn remove_prop_impl(hwnd: usize, key: Option<PropKey>) -> usize {
 }
 
 pub unsafe extern "win64" fn SetPropA(hwnd: HWND, lp_string: LPCSTR, h_data: usize) -> BOOL {
-    set_prop_impl(hwnd as usize, prop_key_a(lp_string), h_data)
+    set_prop_impl(hwnd as usize, resolve_prop_a(lp_string, true), h_data)
 }
 
 pub unsafe extern "win64" fn GetPropA(hwnd: HWND, lp_string: LPCSTR) -> usize {
-    get_prop_impl(hwnd as usize, prop_key_a(lp_string))
+    get_prop_impl(hwnd as usize, resolve_prop_a(lp_string, false))
 }
 
 pub unsafe extern "win64" fn RemovePropA(hwnd: HWND, lp_string: LPCSTR) -> usize {
-    remove_prop_impl(hwnd as usize, prop_key_a(lp_string))
+    remove_prop_impl(hwnd as usize, resolve_prop_a(lp_string, false))
 }
 
 pub unsafe extern "win64" fn SetPropW(hwnd: HWND, lp_string: LPCWSTR, h_data: usize) -> BOOL {
-    set_prop_impl(hwnd as usize, prop_key_w(lp_string), h_data)
+    set_prop_impl(hwnd as usize, resolve_prop_w(lp_string, true), h_data)
 }
 
 pub unsafe extern "win64" fn GetPropW(hwnd: HWND, lp_string: LPCWSTR) -> usize {
-    get_prop_impl(hwnd as usize, prop_key_w(lp_string))
+    get_prop_impl(hwnd as usize, resolve_prop_w(lp_string, false))
 }
 
 pub unsafe extern "win64" fn RemovePropW(hwnd: HWND, lp_string: LPCWSTR) -> usize {
-    remove_prop_impl(hwnd as usize, prop_key_w(lp_string))
+    remove_prop_impl(hwnd as usize, resolve_prop_w(lp_string, false))
 }
 
 /// For DPI-aware processes on Windows 8.1/10/11, logical and physical screen
@@ -2955,6 +2981,25 @@ mod tests {
 
             assert_eq!(SetPropA(h, 0xC001usize as LPCSTR, 0x1234_5678), TRUE);
             assert_eq!(GetPropA(h, 0xC001usize as LPCSTR), 0x1234_5678);
+
+            // Global atom <-> string interoperability in both directions (A & W, case-insensitive).
+            let atom_w_name = crate::strings::to_wide_z("SharedAtomProp");
+            let atom = crate::kernel32::process::GlobalAddAtomW(atom_w_name.as_ptr());
+            assert!(atom >= 0xC000);
+            assert_eq!(SetPropW(h, atom as usize as LPCWSTR, 0xCAFE_BABE), TRUE);
+            assert_eq!(GetPropA(h, c"sharedatomprop".as_ptr().cast()), 0xCAFE_BABE);
+            assert_eq!(GetPropW(h, atom_w_name.as_ptr()), 0xCAFE_BABE);
+            assert_eq!(RemovePropA(h, c"SHAREDATOMPROP".as_ptr().cast()), 0xCAFE_BABE);
+            assert_eq!(GetPropW(h, atom as usize as LPCWSTR), 0);
+
+            // Set via string first, then look up and remove via GlobalAddAtomA atom.
+            assert_eq!(SetPropA(h, c"StringFirstProp".as_ptr().cast(), 0x55AA_1122), TRUE);
+            let atom2 = crate::kernel32::process::GlobalAddAtomA(c"stringfirstprop".as_ptr().cast());
+            assert!(atom2 >= 0xC000);
+            assert_eq!(GetPropW(h, atom2 as usize as LPCWSTR), 0x55AA_1122);
+            assert_eq!(RemovePropW(h, atom2 as usize as LPCWSTR), 0x55AA_1122);
+            assert_eq!(GetPropA(h, c"StringFirstProp".as_ptr().cast()), 0);
+
             assert_eq!(SetPropA(std::ptr::null_mut(), c"x".as_ptr().cast(), 1), FALSE);
             assert_eq!(SetPropA(h, std::ptr::null(), 1), FALSE);
 
