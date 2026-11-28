@@ -1,0 +1,69 @@
+# Marvel's Spider-Man 2 (Epic Games Store) target manifest for Apple Silicon Port Factory.
+# Runs on the thin universal `port-runner` binary with zero custom Rust code:
+#
+#   cargo runner -- --manifest games/spider-man-2/game.toml --game-dir /path/to/Marvels-Spider-Man-2 --prewarm-aot
+#   cargo runner -- --manifest games/spider-man-2/game.toml --game-dir /path/to/Marvels-Spider-Man-2 -- -nolauncher
+#
+# Never commit game binaries, assets, or personal filesystem paths.
+
+[app]
+id = "spider-man-2"
+name = "Marvel's Spider-Man 2"
+exe = "Spider-Man2.exe"
+win_dir = "C:\\Games\\MarvelsSpiderMan2"
+log_name = "Spider-Man2.log"
+computer_name = "WIN64PORT"
+
+[runtime]
+preferred_base_retry = false
+# V8 ships inside Coherent Gameface (`v8.dll` / `cohtml.WindowsDesktop.dll`);
+# --jitless prevents guest RWX JS codegen on Apple Silicon.
+v8_jitless = true
+legacy_remedy_migration = false
+# Pass `-nolauncher` on the CLI (`-- -nolauncher` or `--args -nolauncher`) to skip
+# the pre-launch settings dialog during headless boot triage, or uncomment below:
+# args = "-nolauncher"
+
+[middleware.eos]
+mode = "builtin"
+
+[middleware.dstorage]
+version = "1.2"
+mode = "builtin"
+
+[middleware.bink]
+version = "2"
+mode = "builtin"
+
+[middleware.d3dcompiler]
+version = "47"
+mode = "builtin"
+
+[middleware.dlss]
+version = "streamline"
+mode = "builtin"
+
+[middleware.fsr]
+version = "3"
+mode = "builtin"
+
+[middleware.xess]
+version = "1"
+mode = "builtin"
+
+[middleware.ags]
+mode = "builtin"
+
+[middleware.nri]
+mode = "builtin"
+
+[middleware.nrd]
+version = "4"
+mode = "guest"
+
+[middleware.xaudio2]
+version = "2.9"
+mode = "builtin"
+
+[middleware.zlib]
+mode = "builtin"

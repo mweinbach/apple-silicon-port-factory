@@ -950,7 +950,7 @@ pub const KNOBS: &[KnobSpec] = &[
         default: "coreaudio",
         description: "Audio output backend (coreaudio, null, etc.).",
         affects_aot_key: false,
-        crates: &["win32-rt"],
+        crates: &["port-factory", "win32-rt"],
     },
     KnobSpec {
         name: "PORT_AUDIO_CHANNELS",
@@ -1391,7 +1391,7 @@ pub const KNOBS: &[KnobSpec] = &[
         default: "0",
         description: "Echo runner log lines to stderr even in PORT_CHILD_STDIO=1 mode.",
         affects_aot_key: false,
-        crates: &["port-loader"],
+        crates: &["port-factory", "port-loader"],
     },
     KnobSpec {
         name: "PORT_CHILD_PROCESS",
@@ -1409,7 +1409,7 @@ pub const KNOBS: &[KnobSpec] = &[
         default: "0",
         description: "Internal marker keeping stdout/stderr pipes intact for guest-spawned child processes.",
         affects_aot_key: false,
-        crates: &["port-loader", "win32-rt"],
+        crates: &["port-factory", "port-loader", "win32-rt"],
     },
     KnobSpec {
         name: "PORT_CLEAR_CS_EXACT_SYNC",
@@ -1553,7 +1553,7 @@ pub const KNOBS: &[KnobSpec] = &[
         default: "",
         description: "Override directory where crash reports and minidumps are written.",
         affects_aot_key: false,
-        crates: &["port-loader", "win32-rt", "x86-runtime"],
+        crates: &["port-factory", "port-loader", "win32-rt", "x86-runtime"],
     },
     KnobSpec {
         name: "PORT_CRASH_DISASM",
@@ -4327,6 +4327,7 @@ mod tests {
         "PATH",
         "PE_DUMP_DELAY",
         "ROSETTA_ADVERTISE_AVX",
+        "RUST_LOG",
         "STEAM_APPID",
         "STEAM_USER",
         "SteamAppId",

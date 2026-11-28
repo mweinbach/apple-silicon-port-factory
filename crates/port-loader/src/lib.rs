@@ -792,10 +792,15 @@ fn init_boot_log() {
         .open(&log_path)
         .ok();
 
-    let tmp_link = std::path::PathBuf::from("/tmp").join(&log_file_name);
-    let _ = std::fs::remove_file(&tmp_link);
-    #[cfg(unix)]
-    let _ = std::os::unix::fs::symlink(&log_path, &tmp_link);
+    let explicit_log_dir = std::env::var_os("PORT_LOG_DIR")
+        .or_else(|| std::env::var_os("AW2_LOG_DIR"))
+        .is_some_and(|s| !s.is_empty());
+    if !explicit_log_dir {
+        let tmp_link = std::path::PathBuf::from("/tmp").join(&log_file_name);
+        let _ = std::fs::remove_file(&tmp_link);
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&log_path, &tmp_link);
+    }
 
     let _ = BOOT_LOG_PATH.set(log_path.clone());
     std::env::set_var("PORT_LOG_APPEND", "1");

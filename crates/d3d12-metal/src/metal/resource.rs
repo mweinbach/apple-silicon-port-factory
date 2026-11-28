@@ -868,26 +868,103 @@ pub fn texture_descriptor(desc: &ResourceDesc, extra_usage: MTLTextureUsage) -> 
 
 /// D3D12 placement alignments.
 pub const SMALL_ALIGNMENT: u64 = 4 << 10;
+pub const SMALL_MSAA_ALIGNMENT: u64 = 64 << 10;
 pub const DEFAULT_ALIGNMENT: u64 = 64 << 10;
 pub const MSAA_ALIGNMENT: u64 = 4 << 20;
 
+/// Resolve and validate `desc.Alignment` against D3D12 placement-alignment rules and
+/// Metal's actual `heapTextureSizeAndAlignWithDescriptor` / `heapBufferSizeAndAlignWithLength`
+/// alignment requirement (`mtl_align`).
+///
+/// Per D3D12, `GetResourceAllocationInfo` signals that a requested small placement alignment
+/// (`D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT` = 4 KiB, or 64 KiB for MSAA) is not supported
+/// for a resource by returning `{ SizeInBytes = UINT64_MAX, Alignment = 0 }` (i.e. `Err` here),
+/// prompting callers to fall back to `Alignment = 0` (`DEFAULT_ALIGNMENT` / `MSAA_ALIGNMENT`).
+/// Returning an illegal intermediate alignment such as 16 KiB tricks engines that check
+/// `SizeInBytes == UINT64_MAX` into keeping `Alignment = 4096` and passing unaligned offsets
+/// to `CreatePlacedResource`.
+pub(crate) fn resolve_placement_alignment(desc: &ResourceDesc, mtl_align: u64) -> Result<u64, CreateError> {
+    let hw_align = mtl_align.max(1);
+    if desc.is_buffer() {
+        return match desc.Alignment {
+            0 => {
+                let a = if hw_align <= DEFAULT_ALIGNMENT {
+                    DEFAULT_ALIGNMENT
+                } else {
+                    hw_align.checked_next_power_of_two().unwrap_or(hw_align)
+                };
+                Ok(a)
+            }
+            DEFAULT_ALIGNMENT if hw_align <= DEFAULT_ALIGNMENT => Ok(DEFAULT_ALIGNMENT),
+            a => Err(CreateError::InvalidArg(format!(
+                "invalid buffer placement alignment {a:#x} (Metal requires {hw_align:#x})"
+            ))),
+        };
+    }
+
+    if desc.SampleCount > 1 {
+        let forbids_small_msaa = desc.Layout != 0;
+        return match desc.Alignment {
+            0 => {
+                let a = if hw_align <= MSAA_ALIGNMENT {
+                    MSAA_ALIGNMENT
+                } else {
+                    hw_align.checked_next_power_of_two().unwrap_or(hw_align)
+                };
+                Ok(a)
+            }
+            MSAA_ALIGNMENT if hw_align <= MSAA_ALIGNMENT => Ok(MSAA_ALIGNMENT),
+            SMALL_MSAA_ALIGNMENT if !forbids_small_msaa && hw_align <= SMALL_MSAA_ALIGNMENT => {
+                Ok(SMALL_MSAA_ALIGNMENT)
+            }
+            a => Err(CreateError::InvalidArg(format!(
+                "MSAA texture placement alignment {a:#x} unsupported (forbids_small_msaa={forbids_small_msaa}, Metal requires {hw_align:#x})"
+            ))),
+        };
+    }
+
+    let forbids_small = desc.Layout != 0
+        || (desc.Flags & (resource_flags::ALLOW_RENDER_TARGET | resource_flags::ALLOW_DEPTH_STENCIL)) != 0;
+
+    match desc.Alignment {
+        0 => {
+            let a = if hw_align <= DEFAULT_ALIGNMENT {
+                DEFAULT_ALIGNMENT
+            } else {
+                hw_align.checked_next_power_of_two().unwrap_or(hw_align)
+            };
+            Ok(a)
+        }
+        DEFAULT_ALIGNMENT if hw_align <= DEFAULT_ALIGNMENT => Ok(DEFAULT_ALIGNMENT),
+        MSAA_ALIGNMENT if hw_align <= MSAA_ALIGNMENT => Ok(MSAA_ALIGNMENT),
+        SMALL_ALIGNMENT if !forbids_small && hw_align <= SMALL_ALIGNMENT => Ok(SMALL_ALIGNMENT),
+        a => Err(CreateError::InvalidArg(format!(
+            "texture placement alignment {a:#x} unsupported (forbids_small={forbids_small}, Metal requires {hw_align:#x})"
+        ))),
+    }
+}
+
 /// `GetResourceAllocationInfo` for one desc: (size, alignment). Sizes come
-/// from Metal's heap placement requirements, rounded up to the D3D12
-/// alignment so placed resources can be sub-allocated in an `MTLHeap`.
+/// from Metal's heap placement requirements, validated and rounded up to the
+/// D3D12 placement alignment so placed resources can be sub-allocated in an `MTLHeap`.
 pub fn allocation_info(desc: &ResourceDesc) -> Result<(u64, u64), CreateError> {
     let d = super::device().ok_or_else(|| CreateError::Unsupported("no device".into()))?;
     if desc.is_buffer() {
-        let a = DEFAULT_ALIGNMENT;
-        return Ok((desc.Width.max(1).div_ceil(a) * a, a));
+        if desc.Height != 1 || desc.DepthOrArraySize != 1 || desc.Format != 0 {
+            return Err(CreateError::InvalidArg(format!("bad buffer desc {desc:?}")));
+        }
+        let len = (desc.Width as usize).max(1);
+        let sa = d.dev.heapBufferSizeAndAlignWithLength_options(
+            len,
+            MTLResourceOptions::StorageModePrivate | MTLResourceOptions::HazardTrackingModeUntracked,
+        );
+        let align = resolve_placement_alignment(desc, sa.align as u64)?;
+        let size = (sa.size as u64).max(desc.Width).max(1);
+        return Ok((size.div_ceil(align) * align, align));
     }
     let (td, _) = texture_descriptor(desc, MTLTextureUsage::empty())?;
     let sa = d.dev.heapTextureSizeAndAlignWithDescriptor(&td);
-    let req = match desc.Alignment {
-        0 if desc.SampleCount > 1 => MSAA_ALIGNMENT,
-        0 => DEFAULT_ALIGNMENT,
-        a => a,
-    };
-    let align = req.max(sa.align as u64);
+    let align = resolve_placement_alignment(desc, sa.align as u64)?;
     Ok(((sa.size as u64).max(1).div_ceil(align) * align, align))
 }
 
@@ -1027,16 +1104,33 @@ impl Resource {
     }
 
     fn new_placed_inner(heap: &std::sync::Arc<super::heap::Heap>, offset: u64, desc: &ResourceDesc, extra_usage: MTLTextureUsage, label: &str) -> Result<Resource, CreateError> {
+        let d = super::device().ok_or_else(|| CreateError::Unsupported("no device".into()))?;
         let hp = heap.desc.Properties;
+        let heap_cap = heap.heap.size() as u64;
         let (backing, gpu_va, mtl_format, alloc_len) = if desc.is_buffer() {
             if desc.Height != 1 || desc.DepthOrArraySize != 1 || desc.Format != 0 {
                 return Err(CreateError::InvalidArg(format!("bad buffer desc {desc:?}")));
             }
             let len = (desc.Width as usize).max(1);
-            if offset + len as u64 > heap.desc.SizeInBytes {
-                return Err(CreateError::InvalidArg(format!("buffer [{offset:#x}, +{len:#x}) outside heap of {:#x}", heap.desc.SizeInBytes)));
+            let opts = heap.heap.resourceOptions();
+            let sa = d.dev.heapBufferSizeAndAlignWithLength_options(len, opts);
+            let hw_align = (sa.align as u64).max(1);
+            let _ = resolve_placement_alignment(desc, hw_align)?;
+            if offset % hw_align != 0 {
+                return Err(CreateError::InvalidArg(format!(
+                    "placed buffer offset {offset:#x} not aligned to Metal requirement {hw_align:#x}"
+                )));
             }
-            let b = unsafe { heap.heap.newBufferWithLength_options_offset(len, heap.heap.resourceOptions(), offset as usize) }
+            let req_end = offset
+                .checked_add((sa.size as u64).max(len as u64))
+                .ok_or_else(|| CreateError::InvalidArg(format!("buffer offset overflow at {offset:#x}")))?;
+            if offset.checked_add(len as u64).is_none_or(|end| end > heap.desc.SizeInBytes) || req_end > heap_cap {
+                return Err(CreateError::InvalidArg(format!(
+                    "buffer [{offset:#x}, +{len:#x}) outside heap of {:#x} (mtl {heap_cap:#x})",
+                    heap.desc.SizeInBytes
+                )));
+            }
+            let b = unsafe { heap.heap.newBufferWithLength_options_offset(len, opts, offset as usize) }
                 .ok_or_else(|| CreateError::OutOfMemory(format!("heap newBuffer({len}) at {offset:#x}")))?;
             let va = b.gpuAddress();
             let alen = (MTLResource::allocatedSize(&*b) as u64).max(len as u64);
@@ -1051,6 +1145,21 @@ impl Resource {
                 return Err(CreateError::Unsupported(format!("texture on a CPU-visible heap ({hp:?})")));
             }
             let (td, fmt) = texture_descriptor(desc, extra_usage)?;
+            let sa = d.dev.heapTextureSizeAndAlignWithDescriptor(&td);
+            let hw_align = (sa.align as u64).max(1);
+            let req_align = resolve_placement_alignment(desc, hw_align)?;
+            if offset % hw_align != 0 {
+                return Err(CreateError::InvalidArg(format!(
+                    "placed texture offset {offset:#x} not aligned to Metal requirement {hw_align:#x} (desc.Alignment={:#x}, required={req_align:#x})",
+                    desc.Alignment
+                )));
+            }
+            let req_size = (sa.size as u64).max(1);
+            if offset.checked_add(req_size).is_none_or(|end| end > heap_cap) {
+                return Err(CreateError::InvalidArg(format!(
+                    "placed texture [{offset:#x}, +{req_size:#x}) outside heap of {heap_cap:#x}"
+                )));
+            }
             let t = unsafe { heap.heap.newTextureWithDescriptor_offset(&td, offset as usize) }
                 .ok_or_else(|| CreateError::OutOfMemory(format!("heap newTexture({desc:?}) at {offset:#x}")))?;
             let alen = (MTLResource::allocatedSize(&*t) as u64).max(1);

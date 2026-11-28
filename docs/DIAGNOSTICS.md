@@ -320,6 +320,8 @@ When `--json` is passed:
 | `shader-inspect` | `shaders_inspected`, `shaders[]` (`name`, `byte_len`, `format_code`, `format_family`, `shader_model_or_version`, `container_parts[]`, `entry_points[]`, `resource_count`, `embedded_dxbc_count`, `embedded_spirv_count`) |
 | `game-profiles` | `profiles_count`, `synced_tsv`, `profiles[]`, `detected_binaries[]` |
 | `stats` / `win32-stats` / `shader-formats` / `vfs-resolve` / `bundles` / `steam-scan` | Structured inventory/catalog payloads matching the human-readable summaries |
+| `live-probe` / `bisect-runtime` | Structured probe/bisection payloads |
+| `boot-triage` | `target`, `run` (`mode`, `exit_code`, `signal`, `timed_out`, `elapsed_ms`, `frames_presented`, `graphics_api`, `log_lines`, `boot_report_found`, `crash_report_found`), `blocker` (`class`, `subkind`, `summary`, `log_line`, `evidence`, `dll`, `symbol`, `exception_code`, `hresult`, `location`, `faulting_instruction`, `backtrace[]`, `last_activity[]`), `owner` (`crate`, `paths[]`, `area`, `reason`, `next_step`), `secondary_signals[]`, `missing_probes[]`, `human_summary` |
 | `port-runner --no-run` | `target`, `exe_base`, `preferred_base`, `total_modules`, `pe_modules`, `builtin_modules`, `load_elapsed_ms`, `unresolved_count`, `unresolved_by_dll`, `ops_report` (populated when `--ops-report` is also set) |
 | `port-runner` (live run) | `target`, `stop_reason` (`"guest_exit" \| "crash" \| "max_frames" \| "timeout"`), `frames_presented`, `elapsed_ms`, `max_frames`, `timeout_secs`, `guest_exit_code` |
 
@@ -371,6 +373,7 @@ cargo runner -- --pe /path/to/Game.exe --no-run --ops-report --json
 | Shared JSON output schema & exit-code table | `crates/port-factory/src/json_output.rs` |
 | Bounded run limits & present hook seam | `crates/port-loader/src/run_limits.rs` |
 | Static hazard auditor & CLI integration | `crates/port-factory/src/diag_toolkit.rs`, `crates/port-factory/src/bin/port-factory.rs` |
+| Headless boot-triage runner & blocker classifier | `crates/port-factory/src/boot_triage.rs`, `crates/port-factory/src/bin/port_factory/diag.rs` |
 | Offline 4-tier PE/DLL verifier (`x86-verify`) | `crates/x86-runtime/src/emu/verify.rs`, `crates/x86-runtime/src/bin/x86-verify.rs` |
 | Live `NaN`-birth / watchpoint / host tracer | `crates/x86-runtime/src/diag.rs` |
 | Live frame-paced controller (`PORT_CONTROL_DIR`) | `crates/port-loader/src/live_ctl.rs` |
