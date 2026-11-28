@@ -2068,9 +2068,10 @@ pub(super) unsafe fn prep_block_with(
     }
     let host = resolved_host(bc, ip);
     // GPR write sets, read before `succ_need` may decode further blocks into the arena
-    // (`arena[off + i]` is the decoded instruction of `ops[i]`).
+    // (`arena[off + i]` is the decoded instruction of `ops[i]`). Needed by `plan_groups` /
+    // `track_rsp` (`memchk_mask & 12`) and `Tr::xa_key` invalidation (`hw_range_enabled`).
     let mut wr = [0u16; BLK_MAX_INSNS];
-    if memchk_mask() & 12 != 0 {
+    if memchk_mask() & 12 != 0 || hw_range_enabled() {
         for (i, w) in wr.iter_mut().enumerate().take(k) {
             let ins = &(&(*bc).arena)[off + i];
             let mask = fast_gpr_writes(&ops[i], ins).unwrap_or_else(|| gpr_writes(ins, f));

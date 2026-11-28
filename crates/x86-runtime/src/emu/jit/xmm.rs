@@ -690,9 +690,9 @@ impl Tr<'_> {
         if ld {
             debug_assert_ne!(v_lo, v_hi, "ldp q requires distinct destination registers");
         }
-        self.xa_key = None;
         let mut chk = Self::chk_of(op);
         if ld && chk == Chk::Ro && op.base == RNONE && op.index == RNONE {
+            self.xa_key = None;
             self.mov_lit(XA, op.disp as u64);
             self.a.ldp_q(v_lo, v_hi, XA, 0);
             return;
@@ -943,9 +943,9 @@ impl Tr<'_> {
     /// into/from vector register `v`, participating in `plan_groups` and using direct
     /// `[base, #disp]` (`ldr q`/`str q`/`ldur q`/`stur q`) when possible.
     pub(super) fn vec128_mem_op(&mut self, k: usize, op: &FastOp, ld: bool, v: u32) {
-        self.xa_key = None;
         let mut chk = Self::chk_of(op);
         if ld && chk == Chk::Ro && op.base == RNONE && op.index == RNONE {
+            self.xa_key = None;
             self.mov_lit(XA, op.disp as u64);
             self.a.ldst_ui(true, 128, v, XA, 0);
             return;
