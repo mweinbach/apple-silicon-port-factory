@@ -63,15 +63,8 @@ pub fn cmd_aot_prewarm(args: &[String]) -> Result<i32> {
                 pe_path = None;
             } else {
                 let discovered = port_factory::scanner::collect_pe_files(pe)?;
-                let primary = discovered
-                    .iter()
-                    .find(|p| {
-                        p.extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-                    })
-                    .or_else(|| discovered.first())
-                    .cloned()
+                let primary = port_factory::audit_game::select_primary_exe(pe, &discovered, None)
+                    .or_else(|| discovered.first().cloned())
                     .ok_or_else(|| {
                         usage_err(format!(
                             "no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {}",
