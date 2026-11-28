@@ -200,13 +200,36 @@ pub unsafe extern "win64" fn create_unordered_access_view(_dev: *mut c_void, res
     if handle == 0 {
         return;
     }
-    if !counter.is_null() {
-        log::warn!(target: "d3d", "CreateUnorderedAccessView: UAV counters are not implemented (counter resource ignored)");
-    }
     let r = resource::from_ptr(res);
+    if r.is_none() && !res.is_null() {
+        log::error!(target: "d3d", "CreateUnorderedAccessView: foreign resource {res:?}");
+        d3d12_metal::metal::descriptor::record_uav(handle, None, None);
+        write_entry(handle, [0; 24]);
+        bump_desc_heap_gen();
+        return;
+    }
+    let c = resource::from_ptr(counter);
+    if c.is_none() && !counter.is_null() {
+        log::error!(target: "d3d", "CreateUnorderedAccessView: foreign counter resource {counter:?}");
+        d3d12_metal::metal::descriptor::record_uav(handle, None, None);
+        write_entry(handle, [0; 24]);
+        bump_desc_heap_gen();
+        return;
+    }
     let d = if desc.is_null() { None } else { Some(std::ptr::read_unaligned(desc)) };
-    d3d12_metal::metal::descriptor::record_uav(handle, r.map(|r| &*r.r), d.as_ref());
-    write_or_null("CreateUnorderedAccessView", handle, views::uav_entry(r.map(|r| &*r.r), d.as_ref()));
+    let res_ref = r.map(|r| &*r.r);
+    let ctr_ref = c.map(|c| (&*c.r, 0u64));
+    match views::uav_entry_with_counter(res_ref, ctr_ref, d.as_ref()) {
+        Ok(e) => {
+            d3d12_metal::metal::descriptor::record_uav(handle, res_ref, d.as_ref());
+            write_entry(handle, e);
+        }
+        Err(e) => {
+            log::warn!(target: "d3d", "CreateUnorderedAccessView: {e} (null descriptor written)");
+            d3d12_metal::metal::descriptor::record_uav(handle, None, None);
+            write_entry(handle, [0; 24]);
+        }
+    }
     bump_desc_heap_gen();
 }
 
@@ -358,4 +381,85 @@ pub(crate) fn plain_fns() -> &'static [usize] {
         ]
         .into_boxed_slice()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use d3d12_metal::metal::resource::Resource as MtlResource;
+    use d3d12_metal::types::{dim, heap_type, resource_flags, HeapProperties, ResourceDesc};
+    use std::sync::Arc;
+
+    #[test]
+    fn create_unordered_access_view_wires_counter_and_rejects_invalid() {
+        if d3d12_metal::metal::device().is_none() {
+            return;
+        }
+        let hp = HeapProperties { Type: heap_type::DEFAULT, ..Default::default() };
+        let bdesc = ResourceDesc {
+            Dimension: dim::BUFFER,
+            Width: 8192,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleCount: 1,
+            Layout: 1,
+            Flags: resource_flags::ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let data_mtl = Arc::new(MtlResource::new_committed_default(&bdesc, &hp, "uav_com_data").unwrap());
+        let ctr_mtl = Arc::new(MtlResource::new_committed_default(&bdesc, &hp, "uav_com_ctr").unwrap());
+        let data_va = data_mtl.gpu_va;
+        let data_com = resource::Resource::wrap(data_mtl, 0, 0) as *mut c_void;
+        let ctr_com = resource::Resource::wrap(ctr_mtl, 0, 0) as *mut c_void;
+
+        let mut slot = [0u8; 24];
+        let handle = slot.as_mut_ptr() as usize;
+
+        // Structured buffer UAV with CounterOffsetInBytes = 4096.
+        let mut desc = [0u8; 40];
+        desc[4..8].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
+        desc[16..20].copy_from_slice(&16u32.to_le_bytes()); // NumElements = 16
+        desc[20..24].copy_from_slice(&16u32.to_le_bytes()); // StructureByteStride = 16
+        desc[24..32].copy_from_slice(&4096u64.to_le_bytes()); // CounterOffsetInBytes = 4096
+        unsafe {
+            create_unordered_access_view(std::ptr::null_mut(), data_com, ctr_com, &desc, handle);
+        }
+        let gpu_va = u64::from_le_bytes(slot[0..8].try_into().unwrap());
+        let tex_id = u64::from_le_bytes(slot[8..16].try_into().unwrap());
+        let meta = u64::from_le_bytes(slot[16..24].try_into().unwrap());
+        assert_eq!(gpu_va, data_va);
+        assert_ne!(tex_id, 0, "counter texture-buffer view ID must be written");
+        assert_eq!(meta & 0xffff_ffff, 256);
+        assert_eq!(meta >> 63, 0);
+
+        // Foreign non-null counter pointer must write a null descriptor (never silently drop).
+        let mut fake = [0usize; 4];
+        unsafe {
+            create_unordered_access_view(
+                std::ptr::null_mut(),
+                data_com,
+                fake.as_mut_ptr() as *mut c_void,
+                &desc,
+                handle,
+            );
+        }
+        assert_eq!(slot, [0u8; 24]);
+
+        // Counter on raw buffer UAV must fail honestly and write a null descriptor.
+        let mut raw_desc = [0u8; 40];
+        raw_desc[0..4].copy_from_slice(&39u32.to_le_bytes());
+        raw_desc[4..8].copy_from_slice(&1u32.to_le_bytes());
+        raw_desc[16..20].copy_from_slice(&16u32.to_le_bytes());
+        raw_desc[32..36].copy_from_slice(&1u32.to_le_bytes()); // RAW flag
+        unsafe {
+            create_unordered_access_view(std::ptr::null_mut(), data_com, ctr_com, &raw_desc, handle);
+        }
+        assert_eq!(slot, [0u8; 24]);
+
+        unsafe {
+            com_release(data_com);
+            com_release(ctr_com);
+        }
+    }
 }
