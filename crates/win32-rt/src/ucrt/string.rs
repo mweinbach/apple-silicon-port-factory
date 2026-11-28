@@ -561,6 +561,93 @@ unsafe fn narrow_coll_impl(a: *const u8, b: *const u8, max: Option<usize>, ignor
     if r == 0 { 0 } else { r - 2 }
 }
 
+unsafe fn mbstrlen_cp(s: *const u8, cp: u32) -> usize {
+    if s.is_null() {
+        errno::set(EINVAL);
+        invalid_parameter("_mbstrlen");
+        return 0;
+    }
+    if cp == 0 {
+        return strlen(s);
+    }
+    let bytes = std::slice::from_raw_parts(s, strlen(s));
+    let mut i = 0usize;
+    let mut count = 0usize;
+    while i < bytes.len() {
+        match super::convert::mb_decode_cp(cp, &bytes[i..]) {
+            Ok(Some((_, used))) => {
+                i += used;
+                count += 1;
+            }
+            Ok(None) | Err(()) => {
+                errno::set(super::errno::EILSEQ);
+                return usize::MAX;
+            }
+        }
+    }
+    count
+}
+
+pub unsafe extern "win64" fn _mbstrlen(s: *const u8) -> usize {
+    mbstrlen_cp(s, super::locale::mb_cp())
+}
+
+pub unsafe extern "win64" fn _mbstrlen_l(s: *const u8, l: *mut c_void) -> usize {
+    mbstrlen_cp(s, super::locale::locale_obj_cp(l))
+}
+
+unsafe fn mbscmp_cp(mut s1: *const u8, mut s2: *const u8, cp: u32) -> i32 {
+    if s1.is_null() || s2.is_null() {
+        errno::set(EINVAL);
+        invalid_parameter("_mbscmp");
+        return i32::MAX; // _NLSCMPERROR
+    }
+    let is_dbcs = cp != 0 && cp != 65001;
+    loop {
+        let mut c1 = *s1 as u16;
+        s1 = s1.add(1);
+        if is_dbcs && c1 != 0 && crate::kernel32::string::IsDBCSLeadByteEx(cp, c1 as u8) != 0 {
+            let t1 = *s1 as u16;
+            if t1 == 0 {
+                c1 = 0;
+            } else {
+                s1 = s1.add(1);
+                c1 = (c1 << 8) | t1;
+            }
+        }
+        let mut c2 = *s2 as u16;
+        s2 = s2.add(1);
+        if is_dbcs && c2 != 0 && crate::kernel32::string::IsDBCSLeadByteEx(cp, c2 as u8) != 0 {
+            let t2 = *s2 as u16;
+            if t2 == 0 {
+                c2 = 0;
+            } else {
+                s2 = s2.add(1);
+                c2 = (c2 << 8) | t2;
+            }
+        }
+        if c1 != c2 {
+            return if c1 < c2 { -1 } else { 1 };
+        }
+        if c1 == 0 {
+            return 0;
+        }
+    }
+}
+
+pub unsafe extern "win64" fn _mbscmp(s1: *const u8, s2: *const u8) -> i32 {
+    mbscmp_cp(s1, s2, super::locale::_getmbcp().max(0) as u32)
+}
+
+pub unsafe extern "win64" fn _mbscmp_l(s1: *const u8, s2: *const u8, l: *mut c_void) -> i32 {
+    let cp = if l.is_null() {
+        super::locale::_getmbcp().max(0) as u32
+    } else {
+        super::locale::locale_obj_cp(l)
+    };
+    mbscmp_cp(s1, s2, cp)
+}
+
 pub unsafe extern "win64" fn strcoll(a: *const u8, b: *const u8) -> i32 {
     narrow_coll_impl(a, b, None, false)
 }
@@ -1617,6 +1704,76 @@ mod tests {
             assert_eq!(strstr(hay.as_ptr().cast(), b"cada\0".as_ptr().cast()), hay.as_ptr().add(4) as *mut std::ffi::c_char);
             assert_eq!(wcschr(odd_ws, b'i' as u16), odd_ws.add(1) as *mut u16);
             assert_eq!(wcsrchr(odd_ws, b'H' as u16), odd_ws as *mut u16);
+        }
+    }
+
+    #[test]
+    fn mbstrlen_and_mbscmp_honor_locale_and_dbcs() {
+        unsafe extern "win64" fn noop_iph(
+            _: *const u16,
+            _: *const u16,
+            _: *const u16,
+            _: u32,
+            _: usize,
+        ) {}
+        struct IphGuard(usize);
+        impl Drop for IphGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    crate::ucrt::runtime::_set_invalid_parameter_handler(self.0);
+                }
+            }
+        }
+
+        unsafe {
+            let _iph = IphGuard(crate::ucrt::runtime::_set_invalid_parameter_handler(
+                noop_iph as *const () as usize,
+            ));
+
+            // UTF-8 locale: _mbstrlen_l counts scalar values and rejects invalid UTF-8 with EILSEQ.
+            let loc_u8 = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"en-US.utf8\0".as_ptr());
+            assert!(!loc_u8.is_null());
+            assert_eq!(_mbstrlen_l("aäあ😀\0".as_ptr(), loc_u8), 4);
+            errno::set(0);
+            assert_eq!(_mbstrlen_l(b"\xFF\0".as_ptr(), loc_u8), usize::MAX);
+            assert_eq!(errno::get(), super::super::errno::EILSEQ);
+            crate::ucrt::locale::_free_locale(loc_u8);
+
+            // DBCS CP932 (ja-JP): 2-byte "あ" (0x82 0xA0) is 1 char and sorts > 1-byte 0xB1 ('ｱ').
+            let loc_ja = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"ja-JP\0".as_ptr());
+            assert!(!loc_ja.is_null());
+            let ja_str: [u8; 4] = [0x82, 0xA0, b'x', 0];
+            assert_eq!(_mbstrlen_l(ja_str.as_ptr(), loc_ja), 2);
+            let dangling: [u8; 2] = [0x82, 0];
+            errno::set(0);
+            assert_eq!(_mbstrlen_l(dangling.as_ptr(), loc_ja), usize::MAX);
+            assert_eq!(errno::get(), super::super::errno::EILSEQ);
+            // Invalid CP932 lead+trail sequence [0x81, 0x20] must fail with EILSEQ (matching mbtowc).
+            let invalid_dbcs: [u8; 3] = [0x81, 0x20, 0];
+            errno::set(0);
+            assert_eq!(_mbstrlen_l(invalid_dbcs.as_ptr(), loc_ja), usize::MAX);
+            assert_eq!(errno::get(), super::super::errno::EILSEQ);
+
+            let prev_mbcp = crate::ucrt::locale::_getmbcp();
+            assert_eq!(crate::ucrt::locale::_setmbcp(932), 0);
+            let dbcs_a: [u8; 3] = [0x82, 0xA0, 0];
+            let sbcs_kana: [u8; 2] = [0xB1, 0];
+            // 0x82A0 > 0x00B1 in DBCS _mbscmp (opposite of raw unsigned byte strcmp!).
+            assert_eq!(_mbscmp(dbcs_a.as_ptr(), sbcs_kana.as_ptr()), 1);
+            assert_eq!(_mbscmp(sbcs_kana.as_ptr(), dbcs_a.as_ptr()), -1);
+            assert_eq!(_mbscmp(dbcs_a.as_ptr(), dbcs_a.as_ptr()), 0);
+            // Dangling lead byte before NUL compares equal to NUL (matching MSVC mbscmp).
+            assert_eq!(_mbscmp(dangling.as_ptr(), b"\0".as_ptr()), 0);
+            assert_eq!(crate::ucrt::locale::_setmbcp(prev_mbcp), 0);
+            crate::ucrt::locale::_free_locale(loc_ja);
+
+            // NULL pointers return 0 / i32::MAX (_NLSCMPERROR) and set EINVAL.
+            errno::set(0);
+            assert_eq!(_mbstrlen(std::ptr::null()), 0);
+            assert_eq!(errno::get(), EINVAL);
+            errno::set(0);
+            assert_eq!(_mbscmp(std::ptr::null(), b"a\0".as_ptr()), i32::MAX);
+            assert_eq!(errno::get(), EINVAL);
         }
     }
 }

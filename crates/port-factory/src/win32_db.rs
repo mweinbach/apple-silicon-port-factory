@@ -325,6 +325,17 @@ impl Win32Database {
                 if let Some(&idx) = self.by_dll_sym.get(&(c.clone(), sym.clone())) {
                     return Some(&self.entries[idx]);
                 }
+                // Windows 10+ UCRT (`api-ms-win-crt-private-l1-1-0.dll` / `ucrtbase.dll`)
+                // exports OS-mode `_o_<fn>` wrappers with identical ABI to `<fn>`.
+                if c == "ucrtbase.dll" {
+                    if let Some(base) = sym.strip_prefix("_o_") {
+                        if !base.is_empty() && !base.starts_with("_o_") {
+                            if let Some(&idx) = self.by_dll_sym.get(&(c.clone(), base.to_string())) {
+                                return Some(&self.entries[idx]);
+                            }
+                        }
+                    }
+                }
                 let fallback = match c.as_str() {
                     "kernel32.dll" => Some("ntdll.dll"),
                     "ntdll.dll" => Some("kernel32.dll"),
@@ -2097,5 +2108,28 @@ win64_stubs!(Win64StubMacroFn);
                 ),
             ]
         );
+
+        // OS-mode `_o_*` aliases resolve on api-ms-win-crt-private-l1-1-0.dll / ucrtbase.dll,
+        // while rejecting empty/double prefixes and msvcrt.dll!_o_*.
+        let o_malloc = db
+            .resolve(
+                "api-ms-win-crt-private-l1-1-0.dll",
+                &ImportName::Name { hint: 0, name: "_o_malloc".into() },
+            )
+            .expect("api-ms-win-crt-private-l1-1-0.dll!_o_malloc must resolve");
+        assert_eq!(o_malloc.symbol, "malloc");
+        assert_eq!(o_malloc.impl_kind, ImplKind::Real);
+        assert!(db
+            .resolve(
+                "api-ms-win-crt-private-l1-1-0.dll",
+                &ImportName::Name { hint: 0, name: "_o__o_malloc".into() },
+            )
+            .is_none());
+        assert!(db
+            .resolve(
+                "msvcrt.dll",
+                &ImportName::Name { hint: 0, name: "_o_malloc".into() },
+            )
+            .is_none());
     }
 }

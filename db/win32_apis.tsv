@@ -3120,6 +3120,7 @@ tbbmalloc.dll	scalable_free	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::tbbmalloc::
 tbbmalloc.dll	scalable_malloc	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::tbbmalloc::scalable_malloc	crates/win32-rt/src/misc/tbbmalloc.rs
 tbbmalloc.dll	scalable_msize	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::tbbmalloc::scalable_msize	crates/win32-rt/src/misc/tbbmalloc.rs
 tbbmalloc.dll	scalable_realloc	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::tbbmalloc::scalable_realloc	crates/win32-rt/src/misc/tbbmalloc.rs
+ucrtbase.dll	_CxxThrowException	-	CRT_STL	real	win32_rt::ucrt::runtime::_CxxThrowException	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	_Exit	-	CRT_STL	real	win32_rt::ucrt::runtime::_Exit	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	_Getdays	-	CRT_STL	real	win32_rt::ucrt::time::_Getdays	crates/win32-rt/src/ucrt/time.rs
 ucrtbase.dll	_Getmonths	-	CRT_STL	real	win32_rt::ucrt::time::_Getmonths	crates/win32-rt/src/ucrt/time.rs
@@ -3130,6 +3131,8 @@ ucrtbase.dll	_W_Getmonths	-	CRT_STL	real	win32_rt::ucrt::time::_W_Getmonths	crat
 ucrtbase.dll	_W_Gettnames	-	CRT_STL	real	win32_rt::ucrt::time::_W_Gettnames	crates/win32-rt/src/ucrt/time.rs
 ucrtbase.dll	_Wcsftime	-	CRT_STL	real	win32_rt::ucrt::time::_Wcsftime	crates/win32-rt/src/ucrt/time.rs
 ucrtbase.dll	_XcptFilter	-	CRT_STL	real	win32_rt::ucrt::runtime::_XcptFilter	crates/win32-rt/src/ucrt/runtime.rs
+ucrtbase.dll	__C_specific_handler	-	CRT_STL	real	win32_rt::ucrt::runtime::__C_specific_handler	crates/win32-rt/src/ucrt/runtime.rs
+ucrtbase.dll	__CxxFrameHandler3	-	CRT_STL	real	win32_rt::ucrt::runtime::__CxxFrameHandler3	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	___lc_codepage_func	-	CRT_STL	real	win32_rt::ucrt::locale::___lc_codepage_func	crates/win32-rt/src/ucrt/locale.rs
 ucrtbase.dll	___lc_collate_cp_func	-	CRT_STL	real	win32_rt::ucrt::locale::___lc_collate_cp_func	crates/win32-rt/src/ucrt/locale.rs
 ucrtbase.dll	___lc_locale_name_func	-	CRT_STL	real	win32_rt::ucrt::locale::___lc_locale_name_func	crates/win32-rt/src/ucrt/locale.rs
@@ -3183,6 +3186,8 @@ ucrtbase.dll	__threadid	-	CRT_STL	real	win32_rt::ucrt::runtime::__threadid	crate
 ucrtbase.dll	__timezone	-	CRT_STL	real	win32_rt::ucrt::time::__timezone	crates/win32-rt/src/ucrt/time.rs
 ucrtbase.dll	__toascii	-	CRT_STL	real	win32_rt::ucrt::string::__toascii	crates/win32-rt/src/ucrt/string.rs
 ucrtbase.dll	__tzname	-	CRT_STL	real	win32_rt::ucrt::time::__tzname	crates/win32-rt/src/ucrt/time.rs
+ucrtbase.dll	__unDName	-	CRT_STL	real	win32_rt::ucrt::undname::__unDName	crates/win32-rt/src/ucrt/undname.rs
+ucrtbase.dll	__unDNameEx	-	CRT_STL	real	win32_rt::ucrt::undname::__unDNameEx	crates/win32-rt/src/ucrt/undname.rs
 ucrtbase.dll	_abs64	-	CRT_STL	real	win32_rt::ucrt::convert::_abs64	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_access	-	CRT_STL	real	win32_rt::ucrt::env::_access	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_access_s	-	CRT_STL	real	win32_rt::ucrt::env::_access_s	crates/win32-rt/src/ucrt/env.rs
@@ -3364,7 +3369,13 @@ ucrtbase.dll	_lseeki64	-	CRT_STL	real	win32_rt::ucrt::stdio::_lseeki64	crates/wi
 ucrtbase.dll	_ltoa	-	CRT_STL	real	win32_rt::ucrt::convert::_ltoa	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_ltoa_s	-	CRT_STL	real	win32_rt::ucrt::convert::_ltoa_s	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	_ltow	-	CRT_STL	real	win32_rt::ucrt::convert::_ltow	crates/win32-rt/src/ucrt/convert.rs
+ucrtbase.dll	_makepath	-	CRT_STL	real	win32_rt::ucrt::env::_makepath	crates/win32-rt/src/ucrt/env.rs
+ucrtbase.dll	_makepath_s	-	CRT_STL	real	win32_rt::ucrt::env::_makepath_s	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_malloc_base	-	CRT_STL	real	win32_rt::ucrt::heap::_malloc_base	crates/win32-rt/src/ucrt/heap.rs
+ucrtbase.dll	_mbscmp	-	CRT_STL	real	win32_rt::ucrt::string::_mbscmp	crates/win32-rt/src/ucrt/string.rs
+ucrtbase.dll	_mbscmp_l	-	CRT_STL	real	win32_rt::ucrt::string::_mbscmp_l	crates/win32-rt/src/ucrt/string.rs
+ucrtbase.dll	_mbstrlen	-	CRT_STL	real	win32_rt::ucrt::string::_mbstrlen	crates/win32-rt/src/ucrt/string.rs
+ucrtbase.dll	_mbstrlen_l	-	CRT_STL	real	win32_rt::ucrt::string::_mbstrlen_l	crates/win32-rt/src/ucrt/string.rs
 ucrtbase.dll	_memccpy	-	CRT_STL	real	win32_rt::ucrt::string::_memccpy	crates/win32-rt/src/ucrt/string.rs
 ucrtbase.dll	_memicmp	-	CRT_STL	real	win32_rt::ucrt::string::_memicmp	crates/win32-rt/src/ucrt/string.rs
 ucrtbase.dll	_mkdir	-	CRT_STL	real	win32_rt::ucrt::env::_mkdir	crates/win32-rt/src/ucrt/env.rs
@@ -3374,6 +3385,8 @@ ucrtbase.dll	_mktime32	-	CRT_STL	real	win32_rt::ucrt::time::_mktime32	crates/win
 ucrtbase.dll	_mktime64	-	CRT_STL	real	win32_rt::ucrt::time::_mktime64	crates/win32-rt/src/ucrt/time.rs
 ucrtbase.dll	_msize	-	CRT_STL	real	win32_rt::ucrt::heap::_msize	crates/win32-rt/src/ucrt/heap.rs
 ucrtbase.dll	_msize_base	-	CRT_STL	real	win32_rt::ucrt::heap::_msize_base	crates/win32-rt/src/ucrt/heap.rs
+ucrtbase.dll	_o___std_type_info_destroy_list	-	CRT_STL	real	win32_rt::ucrt::runtime::_o___std_type_info_destroy_list	crates/win32-rt/src/ucrt/runtime.rs
+ucrtbase.dll	_o__purecall	-	CRT_STL	real	win32_rt::ucrt::runtime::_o__purecall	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	_open	-	CRT_STL	real	win32_rt::ucrt::stdio::_open	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_open_osfhandle	-	CRT_STL	real	win32_rt::ucrt::stdio::_open_osfhandle	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_pclose	-	CRT_STL	real	win32_rt::ucrt::stdio::_pclose	crates/win32-rt/src/ucrt/stdio.rs
@@ -3505,6 +3518,8 @@ ucrtbase.dll	_wfullpath	-	CRT_STL	real	win32_rt::ucrt::env::_wfullpath	crates/wi
 ucrtbase.dll	_wgetcwd	-	CRT_STL	real	win32_rt::ucrt::env::_wgetcwd	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_wgetenv	-	CRT_STL	real	win32_rt::ucrt::env::_wgetenv	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_wgetenv_s	-	CRT_STL	real	win32_rt::ucrt::env::_wgetenv_s	crates/win32-rt/src/ucrt/env.rs
+ucrtbase.dll	_wmakepath	-	CRT_STL	real	win32_rt::ucrt::env::_wmakepath	crates/win32-rt/src/ucrt/env.rs
+ucrtbase.dll	_wmakepath_s	-	CRT_STL	real	win32_rt::ucrt::env::_wmakepath_s	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_wmkdir	-	CRT_STL	real	win32_rt::ucrt::env::_wmkdir	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_wopen	-	CRT_STL	real	win32_rt::ucrt::stdio::_wopen	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_wputenv	-	CRT_STL	real	win32_rt::ucrt::env::_wputenv	crates/win32-rt/src/ucrt/env.rs

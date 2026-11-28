@@ -1107,6 +1107,51 @@ pub unsafe extern "win64" fn __threadhandle() -> HANDLE {
 
 pub unsafe extern "win64" fn _crt_debugger_hook(_r: i32) {}
 
+// Private UCRT runtime/EH exports (imported via `api-ms-win-crt-private-l1-1-0.dll` by
+// inbox/OS-built Windows DLLs such as `d3dcompiler_47.dll`).
+pub unsafe extern "win64" fn _CxxThrowException(
+    exception_object: *mut c_void,
+    throw_info: *const u8,
+) {
+    crate::misc::vcruntime140::_CxxThrowException(exception_object, throw_info)
+}
+
+pub unsafe extern "win64" fn __C_specific_handler(
+    exc_record: *mut crate::unwind::ExceptionRecord,
+    establisher_frame: u64,
+    context_record: *mut crate::unwind::Context,
+    dispatcher_context: *mut crate::unwind::DispatcherContext,
+) -> u32 {
+    crate::misc::vcruntime140::__C_specific_handler(
+        exc_record,
+        establisher_frame,
+        context_record,
+        dispatcher_context,
+    )
+}
+
+pub unsafe extern "win64" fn __CxxFrameHandler3(
+    exc_record: *mut crate::unwind::ExceptionRecord,
+    establisher_frame: u64,
+    context_record: *mut crate::unwind::Context,
+    dispatcher_context: *mut crate::unwind::DispatcherContext,
+) -> u32 {
+    crate::misc::vcruntime140::__CxxFrameHandler3(
+        exc_record,
+        establisher_frame,
+        context_record,
+        dispatcher_context,
+    )
+}
+
+pub unsafe extern "win64" fn _o__purecall() -> ! {
+    crate::misc::vcruntime140::_purecall()
+}
+
+pub unsafe extern "win64" fn _o___std_type_info_destroy_list(root_node: *mut c_void) {
+    crate::misc::vcruntime140::__std_type_info_destroy_list(root_node)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
