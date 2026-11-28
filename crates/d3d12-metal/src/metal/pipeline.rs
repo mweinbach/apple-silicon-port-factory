@@ -37,6 +37,9 @@ pub use graphics::{
     depth_stencil_state, infer_vertex_input_format, vertex_buffer_index, GeometryEmulation,
     GraphicsDesc, GraphicsPipeline, MtlDepthStencil, TessellationEmulation, MAX_VERTEX_SLOTS,
 };
+pub(crate) use graphics::{apply_color_attachments, resolve_render_targets_and_blend};
+#[cfg(test)]
+pub(crate) use graphics::resolve_render_targets_and_blend_with;
 pub(crate) use opts::RenderPsoStateKey;
 pub use opts::{
     air_no_res_heap, any_frag_buf_write, cs_mid_qb_exact_v2, cs_pso_tg, fast_bind_pso,

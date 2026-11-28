@@ -284,6 +284,36 @@ impl Default for ColorBlend {
 }
 
 impl ColorBlend {
+    /// True when any blend factor references the secondary pixel-shader output (`SRC1_*`).
+    #[inline]
+    pub fn uses_dual_source(&self) -> bool {
+        use MTLBlendFactor as F;
+        [self.src_rgb, self.dst_rgb, self.src_alpha, self.dst_alpha].iter().any(|f| {
+            matches!(
+                *f,
+                F::Source1Color
+                    | F::OneMinusSource1Color
+                    | F::Source1Alpha
+                    | F::OneMinusSource1Alpha
+            )
+        })
+    }
+
+    /// True when any blend factor references the constant blend color/alpha (`OMSetBlendFactor`).
+    #[inline]
+    pub fn uses_blend_constant(&self) -> bool {
+        use MTLBlendFactor as F;
+        [self.src_rgb, self.dst_rgb, self.src_alpha, self.dst_alpha].iter().any(|f| {
+            matches!(
+                *f,
+                F::BlendColor
+                    | F::OneMinusBlendColor
+                    | F::BlendAlpha
+                    | F::OneMinusBlendAlpha
+            )
+        })
+    }
+
     /// True when blending is masked out (`write_mask == None`) or mathematically
     /// identical to unblended overwrite (`1 * Src + 0 * Dst` for RGB and Alpha).
     #[inline]

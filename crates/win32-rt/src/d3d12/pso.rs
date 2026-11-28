@@ -336,10 +336,13 @@ fn present(b: Bytecode) -> Option<Bytecode> {
 }
 
 /// `D3D12_GRAPHICS_PIPELINE_STATE_DESC` (656 bytes).
-unsafe fn parse_desc(p: *const u8) -> GfxParts {
-    let num_rt = (rd::<u32>(p, 576) as usize).min(8);
+unsafe fn parse_desc(p: *const u8) -> Result<GfxParts, String> {
+    let num_rt = rd::<u32>(p, 576) as usize;
+    if num_rt > 8 {
+        return Err(format!("invalid NumRenderTargets {num_rt} (max 8)"));
+    }
     let so_entries: u32 = rd(p, 96);
-    GfxParts {
+    Ok(GfxParts {
         root_signature: rd(p, 0),
         vs: present(rd(p, 8)),
         ps: present(rd(p, 24)),
@@ -364,7 +367,7 @@ unsafe fn parse_desc(p: *const u8) -> GfxParts {
         ds_raw: (p.add(496), 52, 0),
         so_raw: p.add(88),
         ..Default::default()
-    }
+    })
 }
 
 /// A `D3D12_PIPELINE_STATE_STREAM_DESC` stream: pointer-aligned
@@ -424,7 +427,10 @@ unsafe fn parse_stream(p: *const u8, size: usize) -> Result<GfxParts, String> {
             13 => g.strip_cut = rd(q, 0),
             14 => g.topology_type = rd(q, 0),
             15 => {
-                let n = (rd::<u32>(q, 32) as usize).min(8);
+                let n = rd::<u32>(q, 32) as usize;
+                if n > 8 {
+                    return Err(format!("invalid RTVFormats count {n} (max 8)"));
+                }
                 g.rtv_formats = (0..n).map(|k| rd::<u32>(q, 4 * k)).collect();
             }
             16 => g.dsv_format = rd(q, 0),
@@ -447,16 +453,22 @@ unsafe fn input_layout(l: (*const InputElementDesc, u32)) -> Vec<dxil_metal::Inp
     if l.0.is_null() || l.1 == 0 {
         return Vec::new();
     }
-    std::slice::from_raw_parts(l.0, l.1 as usize)
-        .iter()
-        .map(|e| dxil_metal::InputElement {
-            semantic_name: if e.name.is_null() { String::new() } else { String::from_utf8_lossy(crate::strings::cstr_slice(e.name)).into_owned() },
-            semantic_index: e.semantic_index,
-            format: e.format,
-            input_slot: e.input_slot,
-            aligned_byte_offset: e.aligned_byte_offset,
-            input_slot_class: e.slot_class,
-            instance_data_step_rate: e.step_rate,
+    (0..l.1 as usize)
+        .map(|i| {
+            let e = std::ptr::read_unaligned(l.0.add(i));
+            dxil_metal::InputElement {
+                semantic_name: if e.name.is_null() {
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(crate::strings::cstr_slice(e.name)).into_owned()
+                },
+                semantic_index: e.semantic_index,
+                format: e.format,
+                input_slot: e.input_slot,
+                aligned_byte_offset: e.aligned_byte_offset,
+                input_slot_class: e.slot_class,
+                instance_data_step_rate: e.step_rate,
+            }
         })
         .collect()
 }
@@ -677,7 +689,10 @@ pub unsafe fn create_graphics_pipeline(desc: *const u8, riid: *const Guid, out: 
     if desc.is_null() {
         return failed!(E_INVALIDARG, "CreateGraphicsPipelineState: null desc");
     }
-    create_graphics(parse_desc(desc), "CreateGraphicsPipelineState", riid, out)
+    match parse_desc(desc) {
+        Ok(g) => create_graphics(g, "CreateGraphicsPipelineState", riid, out),
+        Err(e) => failed!(E_INVALIDARG, "CreateGraphicsPipelineState: {e}"),
+    }
 }
 
 /// `D3D12_PIPELINE_STATE_STREAM_DESC`.
