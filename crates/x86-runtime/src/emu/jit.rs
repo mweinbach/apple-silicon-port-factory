@@ -64,7 +64,9 @@ pub(super) use cache::{
     FAST_KIND_XINPUT, JMUL,
 };
 #[cfg(test)]
-pub(super) use cache::{test_aot_installs, test_probe_hits, test_translate_live_words};
+pub(super) use cache::{
+    inline_host_fn_kind, test_aot_installs, test_probe_hits, test_translate_live_words,
+};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use lazy::{flaglazy_enabled, Edges};
