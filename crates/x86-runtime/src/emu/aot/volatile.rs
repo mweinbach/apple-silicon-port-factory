@@ -29,6 +29,16 @@ pub(in crate::emu) struct ModuleVolatileMeta {
 }
 
 impl ModuleVolatileMeta {
+    /// True if `va` lies inside this module AND is explicitly listed in `VolatileAccessTable`.
+    #[inline]
+    pub(in crate::emu) fn is_volatile_access_va(&self, va: u64) -> bool {
+        if va < self.base || va >= self.end {
+            return false;
+        }
+        let rva = (va - self.base) as u32;
+        self.access_rvas.binary_search(&rva).is_ok()
+    }
+
     /// True if `va` lies inside a compiler-certified covered range AND is NOT listed in
     /// `VolatileAccessTable`.
     #[inline]

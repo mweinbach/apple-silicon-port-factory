@@ -4086,6 +4086,105 @@ fn image_hash_tracks_volatile_metadata_changes() {
     assert_ne!(h3, h4, "removing VolatileMetadata must invalidate AOT image_hash");
 }
 
+/// Explicitly-listed `VolatileAccessTable` `[rsp+disp]` stack accesses must keep TSO ordering
+/// (`ldapr`/`ldapur`/`stlr`/`stlur`) and must NOT fuse into plain `ldp`/`stp` pairs even when
+/// `PORT_JIT_STACK_TSO=0` and `PORT_JIT_VOLATILE_META=1`. Non-volatile `[rsp+disp]` accesses
+/// continue to emit plain `ldr`/`str`/`ldp`/`stp`.
+#[test]
+fn volatile_metadata_preserves_explicit_volatile_stack_accesses() {
+    use iced_x86::code_asm::*;
+
+    let mut pe = TestMappedBuf::alloc(0x4000, 0x2_3F58_0000);
+    let base = pe.base() as u64;
+    let buf = pe.as_slice_mut();
+
+    // Block 1 @ +0x1000: adjacent [rsp+0x20]/[rsp+0x28] pair loads and stores where the second
+    // load and first store are explicitly listed in `VolatileAccessTable`. Neither pair may fuse
+    // into plain `ldp`/`stp`, and the listed RVAs must emit TSO load/store instructions.
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rax, qword_ptr(rsp + 0x20)).unwrap();
+    let vol_stack_ld_rva = 0x1000u32 + a.assemble(base + 0x1000).unwrap().len() as u32;
+    a.mov(rcx, qword_ptr(rsp + 0x28)).unwrap();
+    let vol_stack_st_rva = 0x1000u32 + a.assemble(base + 0x1000).unwrap().len() as u32;
+    a.mov(qword_ptr(rsp + 0x30), rax).unwrap();
+    a.mov(qword_ptr(rsp + 0x38), rcx).unwrap();
+    a.ret().unwrap();
+    let blk1 = a.assemble(base + 0x1000).unwrap();
+    buf[0x1000..0x1000 + blk1.len()].copy_from_slice(&blk1);
+
+    // Block 2 @ +0x1080: identical adjacent [rsp+disp] loads/stores NOT listed as volatile
+    // (must still emit plain `ldp`/`stp` with zero TSO loads/stores under `PORT_JIT_STACK_TSO=0`).
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rax, qword_ptr(rsp + 0x20)).unwrap();
+    a.mov(rcx, qword_ptr(rsp + 0x28)).unwrap();
+    a.mov(qword_ptr(rsp + 0x30), rax).unwrap();
+    a.mov(qword_ptr(rsp + 0x38), rcx).unwrap();
+    a.ret().unwrap();
+    let blk2 = a.assemble(base + 0x1080).unwrap();
+    buf[0x1080..0x1080 + blk2.len()].copy_from_slice(&blk2);
+
+    struct Guard(u64);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+            crate::emu::jit::TEST_STACK_TSO.with(|c| c.set(None));
+            test_unregister_volatile_meta(self.0);
+        }
+    }
+    let _g = Guard(base);
+    test_register_volatile_meta(
+        base,
+        pe.len as u64,
+        &[(0x1000, 0x1100)],
+        &[vol_stack_ld_rva, vol_stack_st_rva],
+    );
+    crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(true)));
+    crate::emu::jit::TEST_STACK_TSO.with(|c| c.set(Some(false)));
+
+    let is_tso_ld = |w: u32| (w & 0x3FFF_FC00) == 0x18BF_C000 || (w & 0x3FE0_0C00) == 0x1940_0000;
+    let is_tso_st = |w: u32| (w & 0x3FFF_FC00) == 0x089F_FC00 || (w & 0x3FE0_0C00) == 0x1900_0000;
+    // Signed-offset 64-bit `ldp`/`stp` targeting `g(4)` (`x23`): Rn = 23 (bits 9..5).
+    let is_rsp_ldp = |w: u32| (w & 0xFFC0_03E0) == 0xA940_0000 | (23 << 5);
+    let is_rsp_stp = |w: u32| (w & 0xFFC0_03E0) == 0xA900_0000 | (23 << 5);
+
+    let words_of = |ip: u64| -> Vec<u32> {
+        let mut bc = Box::new(BlockCache::new());
+        let img = unsafe { build_image(&mut *bc, &[ip], BUILD_VBASE) }.expect("build_image");
+        let b = &img.blocks[0];
+        let start = (b.code_off as usize - AOT_STUBS_BYTES) / 4;
+        let end = start + (b.main as usize);
+        img.code[start..end].to_vec()
+    };
+
+    let w_vol = words_of(base + 0x1000);
+    assert!(
+        w_vol.iter().any(|&w| is_tso_ld(w)),
+        "explicitly volatile [rsp+disp] load must keep TSO even with PORT_JIT_STACK_TSO=0"
+    );
+    assert!(
+        w_vol.iter().any(|&w| is_tso_st(w)),
+        "explicitly volatile [rsp+disp] store must keep TSO even with PORT_JIT_STACK_TSO=0"
+    );
+    assert!(
+        !w_vol.iter().any(|&w| is_rsp_ldp(w)),
+        "adjacent [rsp+disp] load pair containing an explicit volatile RVA must not fuse into plain ldp"
+    );
+    assert!(
+        !w_vol.iter().any(|&w| is_rsp_stp(w)),
+        "adjacent [rsp+disp] store pair containing an explicit volatile RVA must not fuse into plain stp"
+    );
+
+    let w_plain = words_of(base + 0x1080);
+    assert!(
+        !w_plain.iter().any(|&w| is_tso_ld(w)) && !w_plain.iter().any(|&w| is_tso_st(w)),
+        "non-volatile [rsp+disp] accesses must remain plain under PORT_JIT_STACK_TSO=0"
+    );
+    assert!(
+        w_plain.iter().any(|&w| is_rsp_ldp(w)) && w_plain.iter().any(|&w| is_rsp_stp(w)),
+        "non-volatile adjacent [rsp+disp] pair must still fuse into ldp/stp under PORT_JIT_STACK_TSO=0"
+    );
+}
+
 #[test]
 fn aot_prewarm_skips_non_pe32_plus_and_wrong_machine_mapped_modules() {
     let mut pe32 = vec![0u8; 0x2000];
