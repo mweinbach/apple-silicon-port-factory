@@ -566,6 +566,27 @@ pub(super) unsafe fn jit_unchanged(ip: u64, p: usize, len: usize) -> bool {
     same
 }
 
+/// Test-only: allocate an isolated 16 KiB RW anonymous page at a high hint address for tests that
+/// call `mem::note_code_region`, so `SLACK = 16 MiB` region merging can never swallow ordinary
+/// heap or `jit_tests::ARENA` code buffers. Callers use distinct 256 MiB-spaced hints in
+/// `0x6_9000_0000..=0x6_C000_0000`.
+#[cfg(test)]
+pub(in crate::emu) fn alloc_isolated_smc_page(hint: usize) -> *mut u8 {
+    use win32_rt::libc;
+    let p = unsafe {
+        libc::mmap(
+            hint as *mut libc::c_void,
+            0x4000,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    assert!(!p.is_null() && p != libc::MAP_FAILED, "isolated smc mmap({hint:#x}) failed");
+    p as *mut u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

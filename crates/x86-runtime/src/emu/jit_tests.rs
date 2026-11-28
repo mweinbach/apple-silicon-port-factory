@@ -623,7 +623,9 @@ pub(super) fn arena_alloc(len: usize, align: usize) -> *mut u8 {
         }
         let m: &'static mut [u8] = Box::leak(vec![0u8; ARENA_SIZE].into_boxed_slice());
         let p = m.as_mut_ptr() as u64;
-        if p + ARENA_SIZE as u64 > 0x1_4000_0000 && p < 0x1_4500_0000 {
+        if (p + ARENA_SIZE as u64 > 0x1_4000_0000 && p < 0x1_4500_0000)
+            || super::mem::jit_overlaps(p as usize, p as usize + ARENA_SIZE)
+        {
             continue;
         }
         *a = (p as usize, 0);
@@ -9011,7 +9013,7 @@ fn indirect_branch_ic_difftest_mono_poly_mega_and_invalidation() {
     // SMC invalidation: place an indirect target inside a tracked guest JIT/SMC region,
     // call it through `call rax`, rewrite its immediate in-place + bump `note_code_region`,
     // and verify IC never serves the stale version.
-    let smc_page = arena_alloc(4096, 4096);
+    let smc_page = super::mem::alloc_isolated_smc_page(0x6_A000_0000);
     let smc_target = smc_page as u64;
     let smc_caller = smc_page as u64 + 0x100;
     unsafe {

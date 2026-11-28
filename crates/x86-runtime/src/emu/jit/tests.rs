@@ -535,12 +535,11 @@ fn indirect_branch_ic_emitter_encodes_zero_relocs_and_uses_ic_table() {
 #[test]
 fn rotated_smc_entry_revalidates_with_authoritative_meta() {
     use crate::emu::jit::cache::JMeta;
-    use crate::emu::jit_tests::arena_alloc;
     use crate::emu::mem;
 
     let mut jc = JitCache::new();
     let mut bc = Box::new(BlockCache::new());
-    let ip_ptr = arena_alloc(64, 16);
+    let ip_ptr = mem::alloc_isolated_smc_page(0x6_9000_0000);
     let ip_smc = ip_ptr as u64;
     // `mov eax, 0x11223344; ret`
     let body_v1: [u8; 6] = [0xb8, 0x44, 0x33, 0x22, 0x11, 0xc3];
