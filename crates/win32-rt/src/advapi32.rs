@@ -2282,11 +2282,18 @@ unsafe fn resolve_trustee_w(trustee: *const u8) -> Result<Vec<u8>, u32> {
 
 const ACL_REVISION: u8 = 2;
 const ACL_REVISION_DS: u8 = 4;
+const INHERITED_ACE: u8 = 0x10;
 
 fn ace_requires_ds_revision(ace_type: u8) -> bool {
     // Object-specific ACE types (ACCESS_ALLOWED_OBJECT_ACE_TYPE..SYSTEM_ALARM_OBJECT_ACE_TYPE,
     // plus their CALLBACK_OBJECT variants) require ACL_REVISION_DS (4) per Win32 ACL spec.
     matches!(ace_type, 5..=8 | 11 | 12 | 15 | 16)
+}
+
+fn is_deny_ace_type(ace_type: u8) -> bool {
+    // ACCESS_DENIED_ACE_TYPE (1), ACCESS_DENIED_OBJECT_ACE_TYPE (6),
+    // ACCESS_DENIED_CALLBACK_ACE_TYPE (10), ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE (12).
+    matches!(ace_type, ACCESS_DENIED_ACE_TYPE | 6 | 10 | 12)
 }
 
 unsafe fn parse_acl_bytes(ptr: *const u8) -> Result<(u8, Vec<ParsedAce>), u32> {
@@ -2361,41 +2368,63 @@ unsafe fn apply_explicit_access_entries(
             continue;
         }
         let sid = resolve_trustee_w(ea.add(16))?;
-        let inh_flags = (inheritance & 0x1F) as u8;
+        // Mask to explicit inheritance flags (bits 0..=3); never mark an explicit entry INHERITED_ACE (0x10).
+        let inh_flags = (inheritance & 0x0F) as u8;
         match (is_audit, mode) {
             (false, GRANT_ACCESS) => {
                 if let Some(existing) = aces.iter_mut().find(|a| {
                     a.raw_body.is_none()
+                        && (a.ace_flags & INHERITED_ACE) == 0
                         && a.ace_type == ACCESS_ALLOWED_ACE_TYPE
                         && a.ace_flags == inh_flags
                         && a.sid == sid
                 }) {
                     existing.mask |= perms;
                 } else {
-                    aces.push(ParsedAce {
+                    // Canonical DACL order & SetEntriesInAclW: place new explicit allow ACEs
+                    // after explicit deny ACEs, before existing allow ACEs and all inherited ACEs.
+                    let insert_pos = aces
+                        .iter()
+                        .position(|a| (a.ace_flags & INHERITED_ACE) != 0 || !is_deny_ace_type(a.ace_type))
+                        .unwrap_or(aces.len());
+                    aces.insert(
+                        insert_pos,
+                        ParsedAce {
+                            ace_type: ACCESS_ALLOWED_ACE_TYPE,
+                            ace_flags: inh_flags,
+                            mask: perms,
+                            sid,
+                            raw_body: None,
+                        },
+                    );
+                }
+            }
+            (false, SET_ACCESS) => {
+                // Replace existing explicit ACEs for this trustee while preserving inherited ACEs;
+                // insert the new explicit allow ahead of existing allow and inherited entries.
+                aces.retain(|a| {
+                    (a.ace_flags & INHERITED_ACE) != 0 || a.raw_body.is_some() || a.sid != sid
+                });
+                let insert_pos = aces
+                    .iter()
+                    .position(|a| (a.ace_flags & INHERITED_ACE) != 0 || !is_deny_ace_type(a.ace_type))
+                    .unwrap_or(aces.len());
+                aces.insert(
+                    insert_pos,
+                    ParsedAce {
                         ace_type: ACCESS_ALLOWED_ACE_TYPE,
                         ace_flags: inh_flags,
                         mask: perms,
                         sid,
                         raw_body: None,
-                    });
-                }
-            }
-            (false, SET_ACCESS) => {
-                aces.retain(|a| a.raw_body.is_some() || a.sid != sid);
-                aces.push(ParsedAce {
-                    ace_type: ACCESS_ALLOWED_ACE_TYPE,
-                    ace_flags: inh_flags,
-                    mask: perms,
-                    sid,
-                    raw_body: None,
-                });
+                    },
+                );
             }
             (false, DENY_ACCESS) => {
-                // Canonical Windows ACL order places explicit deny ACEs ahead of allow ACEs.
+                // Canonical Windows ACL order places explicit deny ACEs ahead of allow and inherited ACEs.
                 let insert_pos = aces
                     .iter()
-                    .position(|a| a.ace_type != ACCESS_DENIED_ACE_TYPE)
+                    .position(|a| (a.ace_flags & INHERITED_ACE) != 0 || !is_deny_ace_type(a.ace_type))
                     .unwrap_or(aces.len());
                 aces.insert(
                     insert_pos,
@@ -2409,25 +2438,41 @@ unsafe fn apply_explicit_access_entries(
                 );
             }
             (_, REVOKE_ACCESS) => {
-                aces.retain(|a| a.raw_body.is_some() || a.sid != sid);
+                aces.retain(|a| {
+                    (a.ace_flags & INHERITED_ACE) != 0 || a.raw_body.is_some() || a.sid != sid
+                });
             }
             (true, SET_AUDIT_SUCCESS) => {
-                aces.push(ParsedAce {
-                    ace_type: SYSTEM_AUDIT_ACE_TYPE,
-                    ace_flags: inh_flags | SUCCESSFUL_ACCESS_ACE_FLAG,
-                    mask: perms,
-                    sid,
-                    raw_body: None,
-                });
+                let insert_pos = aces
+                    .iter()
+                    .position(|a| (a.ace_flags & INHERITED_ACE) != 0)
+                    .unwrap_or(aces.len());
+                aces.insert(
+                    insert_pos,
+                    ParsedAce {
+                        ace_type: SYSTEM_AUDIT_ACE_TYPE,
+                        ace_flags: inh_flags | SUCCESSFUL_ACCESS_ACE_FLAG,
+                        mask: perms,
+                        sid,
+                        raw_body: None,
+                    },
+                );
             }
             (true, SET_AUDIT_FAILURE) => {
-                aces.push(ParsedAce {
-                    ace_type: SYSTEM_AUDIT_ACE_TYPE,
-                    ace_flags: inh_flags | FAILED_ACCESS_ACE_FLAG,
-                    mask: perms,
-                    sid,
-                    raw_body: None,
-                });
+                let insert_pos = aces
+                    .iter()
+                    .position(|a| (a.ace_flags & INHERITED_ACE) != 0)
+                    .unwrap_or(aces.len());
+                aces.insert(
+                    insert_pos,
+                    ParsedAce {
+                        ace_type: SYSTEM_AUDIT_ACE_TYPE,
+                        ace_flags: inh_flags | FAILED_ACCESS_ACE_FLAG,
+                        mask: perms,
+                        sid,
+                        raw_body: None,
+                    },
+                );
             }
             _ => return Err(ERROR_INVALID_PARAMETER),
         }
@@ -8961,6 +9006,72 @@ mod tests {
             assert_eq!(ds_m_aces[1].raw_body.as_deref(), Some(obj_ace_body.as_slice()));
             assert!(crate::kernel32::memory::LocalFree(ds_copy_ptr).is_null());
             assert!(crate::kernel32::memory::LocalFree(ds_merged_ptr).is_null());
+
+            // Canonical DACL order: GRANT_ACCESS and SET_ACCESS must insert new explicit allow ACEs
+            // after explicit denies but BEFORE existing explicit allows and inherited deny/allow ACEs.
+            let admins_sid = build_sid(5, &[32, 544]);
+            let inh_dacl = serialize_acl(
+                ACL_REVISION,
+                &[
+                    ParsedAce {
+                        ace_type: ACCESS_ALLOWED_ACE_TYPE,
+                        ace_flags: 0,
+                        mask: 0x000F_0000,
+                        sid: admins_sid.clone(),
+                        raw_body: None,
+                    },
+                    ParsedAce {
+                        ace_type: ACCESS_DENIED_ACE_TYPE,
+                        ace_flags: INHERITED_ACE,
+                        mask: 0x1000_0000,
+                        sid: expected_world.clone(),
+                        raw_body: None,
+                    },
+                ],
+            )
+            .unwrap();
+            let mut inh_sd = vec![0u8; 20 + inh_dacl.len()];
+            inh_sd[0] = 1;
+            inh_sd[2..4].copy_from_slice(&(SE_SELF_RELATIVE | SE_DACL_PRESENT).to_le_bytes());
+            inh_sd[16..20].copy_from_slice(&20u32.to_le_bytes());
+            inh_sd[20..].copy_from_slice(&inh_dacl);
+
+            for (mode, label) in [(GRANT_ACCESS, "GRANT_ACCESS"), (SET_ACCESS, "SET_ACCESS")] {
+                let mut grant_ea = [0u8; 48];
+                let mut w_name = crate::strings::to_wide_z("EVERYONE");
+                BuildExplicitAccessWithNameW(grant_ea.as_mut_ptr(), w_name.as_mut_ptr(), 0x1000_0000, mode, 0);
+                let mut out_sz = 0u32;
+                let mut out_ptr: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    BuildSecurityDescriptorW(
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        1,
+                        grant_ea.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        inh_sd.as_ptr(),
+                        &mut out_sz,
+                        &mut out_ptr,
+                    ),
+                    0,
+                    "{label} should succeed"
+                );
+                let out_sd = out_ptr as *const u8;
+                let off = std::ptr::read_unaligned(out_sd.add(16) as *const u32) as usize;
+                let (_, aces) = parse_acl_bytes(out_sd.add(off)).unwrap();
+                assert_eq!(aces.len(), 3, "{label} must keep explicit + inherited entries");
+                // New explicit allow for Everyone must precede both existing explicit allow and inherited deny.
+                assert_eq!(aces[0].ace_type, ACCESS_ALLOWED_ACE_TYPE);
+                assert_eq!(aces[0].ace_flags & INHERITED_ACE, 0);
+                assert_eq!(aces[0].sid, expected_world);
+                assert_eq!(aces[1].ace_type, ACCESS_ALLOWED_ACE_TYPE);
+                assert_eq!(aces[1].sid, admins_sid);
+                assert_eq!(aces[2].ace_type, ACCESS_DENIED_ACE_TYPE);
+                assert_eq!(aces[2].ace_flags, INHERITED_ACE);
+                assert_eq!(aces[2].sid, expected_world);
+                assert!(crate::kernel32::memory::LocalFree(out_ptr).is_null());
+            }
 
             // Empty request (no owner/group/access/audit/old_sd) must NOT falsely set SE_DACL_PRESENT.
             let mut empty_size = 0u32;

@@ -23,6 +23,7 @@ pub const PDH_CSTATUS_NO_OBJECT: i32 = 0xC000_0BB8u32 as i32;
 pub const PDH_CSTATUS_NO_COUNTER: i32 = 0xC000_0BB9u32 as i32;
 pub const PDH_INVALID_HANDLE: i32 = 0xC000_0BBCu32 as i32;
 pub const PDH_INVALID_ARGUMENT: i32 = 0xC000_0BBDu32 as i32;
+pub const PDH_NOT_IMPLEMENTED: i32 = 0xC000_0BD3u32 as i32;
 pub const PDH_NO_DATA: i32 = 0x8000_07D5u32 as i32;
 
 pub const PDH_FMT_LONG: u32 = 0x0000_0100;
@@ -543,12 +544,21 @@ fn sample_counter(
 }
 
 pub unsafe extern "win64" fn PdhOpenQueryW(
-    _data_source: LPCWSTR,
+    data_source: LPCWSTR,
     _user_data: usize,
     ph_query: *mut usize,
 ) -> i32 {
     if ph_query.is_null() {
         return PDH_INVALID_ARGUMENT;
+    }
+    if !data_source.is_null() {
+        let src = from_wide(data_source);
+        std::ptr::write_unaligned(ph_query, 0);
+        if src.is_empty() {
+            return PDH_INVALID_ARGUMENT;
+        }
+        log::warn!("pdh: PdhOpenQueryW log-file data source unsupported: {src:?}");
+        return PDH_NOT_IMPLEMENTED;
     }
     let q = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     state().lock().unwrap().queries.insert(q, QueryState { counters: Vec::new() });
@@ -663,6 +673,18 @@ mod tests {
     #[test]
     fn pdh_query_lifecycle_real_metrics_and_honest_unknown_counter() {
         unsafe {
+            // Non-null log-file data sources must be rejected honestly rather than silently
+            // returning live telemetry.
+            let log_src = to_wide_z("C:\\perf_capture.blg");
+            let mut q_log = 0xDEADusize;
+            assert_eq!(PdhOpenQueryW(log_src.as_ptr(), 0, &mut q_log), PDH_NOT_IMPLEMENTED);
+            assert_eq!(q_log, 0);
+
+            let empty_src = to_wide_z("");
+            let mut q_empty = 0xDEADusize;
+            assert_eq!(PdhOpenQueryW(empty_src.as_ptr(), 0, &mut q_empty), PDH_INVALID_ARGUMENT);
+            assert_eq!(q_empty, 0);
+
             let mut q = 0usize;
             assert_eq!(PdhOpenQueryW(std::ptr::null(), 0, &mut q), ERROR_SUCCESS);
             assert_ne!(q, 0);
