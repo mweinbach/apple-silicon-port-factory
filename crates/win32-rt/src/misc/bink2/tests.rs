@@ -994,6 +994,60 @@ fn bink_sound_open_variants_sound_system4_and_speaker_volumes() {
             Some((32768, 65536))
         );
 
+        // Single-speaker explicit speaker_indexes must honor FL (0), FR (1), and FC (2)
+        let spk_fl = [0u32];
+        let spk_fr = [1u32];
+        let spk_fc = [2u32];
+        let single_vol = [24576i32];
+        BinkSetSpeakerVolumes(hbink, 7, spk_fl.as_ptr(), single_vol.as_ptr(), 1);
+        assert_eq!(
+            (*(hbink as *const BinkInstance))
+                .audio_player
+                .track_volume_pan(0),
+            Some((24576, 0))
+        );
+        BinkSetSpeakerVolumes(hbink, 7, spk_fr.as_ptr(), single_vol.as_ptr(), 1);
+        assert_eq!(
+            (*(hbink as *const BinkInstance))
+                .audio_player
+                .track_volume_pan(0),
+            Some((24576, 65536))
+        );
+        BinkSetSpeakerVolumes(hbink, 7, spk_fc.as_ptr(), single_vol.as_ptr(), 1);
+        assert_eq!(
+            (*(hbink as *const BinkInstance))
+                .audio_player
+                .track_volume_pan(0),
+            Some((24576, 32768))
+        );
+
+        // Single-speaker with NULL speaker_indexes acts as mono/center master volume
+        BinkSetSpeakerVolumes(hbink, 7, std::ptr::null(), single_vol.as_ptr(), 1);
+        assert_eq!(
+            (*(hbink as *const BinkInstance))
+                .audio_player
+                .track_volume_pan(0),
+            Some((24576, 32768))
+        );
+
+        // 8-channel speaker table with NULL speaker_indexes (standard 7.1 layout)
+        let vols_8_fl = [32768i32, 0, 0, 0, 0, 0, 0, 0];
+        BinkSetSpeakerVolumes(hbink, 7, std::ptr::null(), vols_8_fl.as_ptr(), 8);
+        assert_eq!(
+            (*(hbink as *const BinkInstance))
+                .audio_player
+                .track_volume_pan(0),
+            Some((32768, 0))
+        );
+        let vols_8_fr = [0i32, 32768, 0, 0, 0, 0, 0, 0];
+        BinkSetSpeakerVolumes(hbink, 7, std::ptr::null(), vols_8_fr.as_ptr(), 8);
+        assert_eq!(
+            (*(hbink as *const BinkInstance))
+                .audio_player
+                .track_volume_pan(0),
+            Some((32768, 65536))
+        );
+
         BinkClose(hbink);
 
         // Null sound system disables audio cleanly
@@ -1249,6 +1303,122 @@ fn bink_async_wait_semantics_multi_handle_and_close_in_flight() {
             );
         }
         BinkClose(h2);
+    }
+}
+
+#[test]
+fn bink_should_skip_catches_up_respects_end_and_caps_bursts() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Instant;
+
+    unsafe {
+        assert_eq!(BinkShouldSkip(std::ptr::null_mut()), 0);
+
+        let stream = make_test_kb2n_multiframe(20, 64, 32);
+        let hbink = BinkOpen(stream.as_ptr(), 0x0400_0000);
+        assert!(!hbink.is_null());
+        BinkSetWillLoop(hbink, 0);
+
+        // Before frame 1 is decoded, never skip.
+        assert_eq!(BinkShouldSkip(hbink), 0);
+
+        // Decode frame 1 (30 fps -> ~33.33 ms/frame). Freshly on schedule -> do not skip.
+        assert_eq!(BinkDoFrame(hbink), 0);
+        assert_eq!(BinkShouldSkip(hbink), 0);
+
+        // Simulate a 3-frame stall (110 ms elapsed with 1 frame played): BinkWait must NOT
+        // prematurely re-anchor, and BinkShouldSkip must catch up by ~2-3 frames.
+        {
+            let inst = &mut *(hbink as *mut BinkInstance);
+            inst.playback_start = Instant::now().checked_sub(Duration::from_millis(110));
+        }
+        assert_eq!(BinkWait(hbink), 0);
+
+        let mut caught_up_skips = 0u32;
+        while BinkShouldSkip(hbink) != 0 {
+            caught_up_skips += 1;
+            assert!(caught_up_skips <= 4, "catch-up loop must converge cleanly");
+            BinkNextFrame(hbink);
+            assert_eq!(BinkDoFrame(hbink), 0);
+        }
+        assert!(
+            (2..=3).contains(&caught_up_skips),
+            "expected 2-3 skipped frames for 110ms stall at 30fps, got {caught_up_skips}"
+        );
+
+        let mut sum = BinkSummary::default();
+        BinkGetSummary(hbink, &mut sum);
+        assert_eq!(sum.skipped_frames, caught_up_skips);
+
+        // Severe lag (10 frames behind) must cap consecutive skips at 4 so a frame is still
+        // presented, and then re-anchor so playback recovers without infinite skipping.
+        {
+            let inst = &mut *(hbink as *mut BinkInstance);
+            inst.playback_start = Instant::now().checked_sub(Duration::from_millis(500));
+            inst.playback_base_frame = inst.played_frames.saturating_sub(1);
+        }
+        let mut burst = 0u32;
+        while BinkShouldSkip(hbink) != 0 {
+            burst += 1;
+            BinkNextFrame(hbink);
+            assert_eq!(BinkDoFrame(hbink), 0);
+        }
+        assert_eq!(burst, 4, "consecutive skip burst must be capped at 4");
+
+        // Never skip when paused, even if behind schedule.
+        {
+            let inst = &mut *(hbink as *mut BinkInstance);
+            inst.playback_start = Instant::now().checked_sub(Duration::from_millis(150));
+            inst.playback_base_frame = inst.played_frames.saturating_sub(1);
+        }
+        BinkPause(hbink, 1);
+        assert_eq!(BinkShouldSkip(hbink), 0);
+        BinkPause(hbink, 0);
+
+        // Never skip past the final frame of a non-looping stream.
+        BinkGoto(hbink, 20, 1);
+        assert_eq!(BinkDoFrame(hbink), 0);
+        {
+            let inst = &mut *(hbink as *mut BinkInstance);
+            inst.playback_start = Instant::now().checked_sub(Duration::from_millis(200));
+            inst.playback_base_frame = inst.played_frames.saturating_sub(1);
+        }
+        assert_eq!(BinkShouldSkip(hbink), 0);
+
+        // Never skip while an async decode is still in flight.
+        BinkGoto(hbink, 2, 1);
+        assert_eq!(BinkDoFrame(hbink), 0);
+        {
+            let inst = &mut *(hbink as *mut BinkInstance);
+            inst.playback_start = Instant::now().checked_sub(Duration::from_millis(200));
+            inst.playback_base_frame = inst.played_frames.saturating_sub(1);
+        }
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        super::bink2::player::start_gated_async_job_for_test(
+            hbink,
+            &[0],
+            gate.clone(),
+            done.clone(),
+        );
+        assert_eq!(BinkShouldSkip(hbink), 0);
+        {
+            let (lock, cvar) = &*gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert_eq!(BinkDoFrameAsyncWait(hbink, -1), 1);
+
+        // Extreme stall (> 2s) in BinkWait re-anchors cleanly so we don't try to skip dozens of frames.
+        {
+            let inst = &mut *(hbink as *mut BinkInstance);
+            inst.playback_start = Instant::now().checked_sub(Duration::from_secs(5));
+            inst.playback_base_frame = inst.played_frames.saturating_sub(1);
+        }
+        assert_eq!(BinkWait(hbink), 0);
+        assert_eq!(BinkShouldSkip(hbink), 0);
+
+        BinkClose(hbink);
     }
 }
 
