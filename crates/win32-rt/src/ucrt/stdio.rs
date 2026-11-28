@@ -2145,8 +2145,9 @@ pub unsafe extern "win64" fn _pipe(pfds: *mut i32, _psize: u32, textmode: i32) -
     0
 }
 
-#[cfg(target_os = "macos")]
-static POPEN_CHILDREN: Mutex<Option<HashMap<usize, std::process::Child>>> = Mutex::new(None);
+/// Child Win32 process handles (`HANDLE as usize`) created via `_popen`,
+/// keyed by the returned `FILE*` address.
+static POPEN_CHILDREN: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 pub unsafe extern "win64" fn _popen(command: *const u8, mode: *const u8) -> *mut FILE {
     if command.is_null() || mode.is_null() {
@@ -2154,6 +2155,10 @@ pub unsafe extern "win64" fn _popen(command: *const u8, mode: *const u8) -> *mut
         return std::ptr::null_mut();
     }
     let cmd_str = from_ansi(command);
+    if cmd_str.len() > 32767 {
+        errno::set(7); // E2BIG
+        return std::ptr::null_mut();
+    }
     let mode_str = from_ansi(mode);
     let Some(mf) = parse_mode(&mode_str) else {
         errno::set(EINVAL);
@@ -2163,62 +2168,109 @@ pub unsafe extern "win64" fn _popen(command: *const u8, mode: *const u8) -> *mut
         errno::set(EINVAL);
         return std::ptr::null_mut();
     }
-    #[cfg(target_os = "macos")]
+
+    flush_all();
+
+    // Never escape to the host POSIX `/bin/sh`: only invoke a real guest `%COMSPEC%` / `cmd.exe`
+    // executable through `CreateProcessW` (which enforces PE validation, pinned-runner CDHash
+    // verification, and the child environment allowlist).
+    let Some(interp) = super::runtime::resolve_comspec() else {
+        log::debug!("_popen({cmd_str:?}): COMSPEC/cmd.exe not present in virtual drive -> ENOENT");
+        errno::set(errno::ENOENT);
+        return std::ptr::null_mut();
+    };
+
+    #[cfg(not(target_os = "ios"))]
     {
-        use std::os::unix::io::IntoRawFd;
-        use std::process::{Command, Stdio};
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(&cmd_str);
-        if mf.readable {
-            cmd.stdout(Stdio::piped());
-        } else {
-            cmd.stdin(Stdio::piped());
-        }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_) => {
-                errno::set_from_host();
-                return std::ptr::null_mut();
-            }
-        };
-        let fd = if mf.readable {
-            child.stdout.take().map(IntoRawFd::into_raw_fd)
-        } else {
-            child.stdin.take().map(IntoRawFd::into_raw_fd)
-        };
-        let Some(fd) = fd else {
-            let _ = child.kill();
-            let _ = child.wait();
-            errno::set(EINVAL);
+        use crate::types::{FALSE, HANDLE, TRUE};
+
+        let mut rd_h: HANDLE = std::ptr::null_mut();
+        let mut wr_h: HANDLE = std::ptr::null_mut();
+        // SECURITY_ATTRIBUTES (x64, 24 bytes): nLength@0 = 24, lpSecurityDescriptor@8 = null, bInheritHandle@16 = TRUE.
+        let mut sa = [0u8; 24];
+        (sa.as_mut_ptr() as *mut u32).write_unaligned(24);
+        (sa.as_mut_ptr().add(16) as *mut i32).write_unaligned(TRUE);
+        if crate::kernel32::file::CreatePipe(&mut rd_h, &mut wr_h, sa.as_mut_ptr().cast(), 0) == FALSE {
+            errno::set(errno::EACCES);
             return std::ptr::null_mut();
+        }
+        let (parent_h, child_h) = if mf.readable { (rd_h, wr_h) } else { (wr_h, rd_h) };
+        let _ = crate::kernel32::threads::SetHandleInformation(parent_h, 1 /* HANDLE_FLAG_INHERIT */, 0);
+
+        const STARTF_USESTDHANDLES: u32 = 0x0100;
+        const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+        const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+        const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+
+        let mut si = [0u8; 104];
+        (si.as_mut_ptr() as *mut u32).write_unaligned(104);
+        (si.as_mut_ptr().add(60) as *mut u32).write_unaligned(STARTF_USESTDHANDLES);
+        let h_in = if mf.readable {
+            crate::kernel32::file::GetStdHandle(STD_INPUT_HANDLE)
+        } else {
+            child_h
         };
-        let is_bin = (mf.oflag & O_BINARY) != 0;
-        set_fd_info(
-            fd,
-            FdInfo {
-                mode: if is_bin { TextMode::Binary } else { TextMode::AnsiText },
-                win_mode: if is_bin { O_BINARY } else { O_TEXT },
-                raw: true,
-                temporary: false,
-                osf_handle: None,
-            },
-            None,
+        let h_out = if mf.readable {
+            child_h
+        } else {
+            crate::kernel32::file::GetStdHandle(STD_OUTPUT_HANDLE)
+        };
+        let h_err = crate::kernel32::file::GetStdHandle(STD_ERROR_HANDLE);
+        (si.as_mut_ptr().add(80) as *mut HANDLE).write_unaligned(h_in);
+        (si.as_mut_ptr().add(88) as *mut HANDLE).write_unaligned(h_out);
+        (si.as_mut_ptr().add(96) as *mut HANDLE).write_unaligned(h_err);
+
+        let app_w = crate::strings::to_wide_z(&interp);
+        let mut cmdline_w = crate::strings::to_wide_z(&format!("\"{interp}\" /c {cmd_str}"));
+        let mut pi = [0u8; 24];
+        let ok = crate::kernel32::process::CreateProcessW(
+            app_w.as_ptr(),
+            cmdline_w.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            TRUE,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            si.as_mut_ptr().cast(),
+            pi.as_mut_ptr().cast(),
         );
+        let _ = crate::kernel32::threads::CloseHandle(child_h);
+        if ok == FALSE {
+            let last_err = crate::teb::last_error();
+            let _ = crate::kernel32::threads::CloseHandle(parent_h);
+            let mapped = match last_err {
+                crate::types::err::ERROR_ACCESS_DENIED | crate::types::err::ERROR_NOT_SUPPORTED => errno::EACCES,
+                193 /* ERROR_BAD_EXE_FORMAT */ => errno::ENOEXEC,
+                _ => errno::ENOENT,
+            };
+            errno::set(mapped);
+            return std::ptr::null_mut();
+        }
+
+        let h_proc = (pi.as_ptr() as *const HANDLE).read_unaligned();
+        let h_thr = (pi.as_ptr().add(8) as *const HANDLE).read_unaligned();
+        let _ = crate::kernel32::threads::CloseHandle(h_thr);
+
+        let fd = _open_osfhandle(parent_h as isize, mf.oflag);
+        if fd < 0 {
+            let _ = crate::kernel32::threads::CloseHandle(parent_h);
+            let _ = crate::kernel32::threads::CloseHandle(h_proc);
+            return std::ptr::null_mut();
+        }
         let _l = Locked::new();
         let fp = new_stream(fd, &mf);
         POPEN_CHILDREN
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
-            .insert(fp as usize, child);
+            .insert(fp as usize, h_proc as usize);
         fp
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "ios")]
     {
-        // Native-unsupported on iOS: the iOS sandbox forbids spawning `/bin/sh`
-        // subprocesses (`posix_spawn` returns EPERM/EACCES).
-        let _ = cmd_str;
-        log::debug!("_popen: subprocess spawning unsupported on non-macOS sandbox -> EACCES");
+        let _ = interp;
+        log::debug!("_popen: subprocess spawning unsupported on iOS sandbox -> EACCES");
         errno::set(EACCES);
         std::ptr::null_mut()
     }
@@ -2229,33 +2281,25 @@ pub unsafe extern "win64" fn _pclose(fp: *mut FILE) -> i32 {
         errno::set(EINVAL);
         return -1;
     }
-    #[cfg(target_os = "macos")]
-    {
-        let child = POPEN_CHILDREN
-            .lock()
-            .unwrap()
-            .as_mut()
-            .and_then(|m| m.remove(&(fp as usize)));
-        let _ = fclose(fp);
-        match child {
-            Some(mut c) => match c.wait() {
-                Ok(status) => status.code().unwrap_or(-1),
-                Err(_) => {
-                    errno::set_from_host();
-                    -1
-                }
-            },
-            None => {
-                errno::set(EINVAL);
-                -1
-            }
+    let child_handle = POPEN_CHILDREN
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.remove(&(fp as usize)));
+    let _ = fclose(fp);
+    match child_handle {
+        Some(h_raw) => {
+            let h_proc = h_raw as crate::types::HANDLE;
+            let _ = crate::kernel32::threads::WaitForSingleObject(h_proc, crate::types::INFINITE);
+            let mut code = 0u32;
+            let _ = crate::kernel32::process::GetExitCodeProcess(h_proc, &mut code);
+            let _ = crate::kernel32::threads::CloseHandle(h_proc);
+            code as i32
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = fclose(fp);
-        errno::set(EINVAL);
-        -1
+        None => {
+            errno::set(EINVAL);
+            -1
+        }
     }
 }
 
@@ -4198,16 +4242,39 @@ mod tests {
             assert_eq!(_close(fds[0]), 0);
             assert_eq!(_close(fds[1]), 0);
 
-            // _popen + _pclose run a real child command and return its exit code on macOS.
-            #[cfg(target_os = "macos")]
-            {
-                let pfp = _popen(b"printf 'hello-popen'\0".as_ptr(), b"rb\0".as_ptr());
-                assert!(!pfp.is_null());
-                let mut out = [0u8; 32];
-                let got = fread(out.as_mut_ptr().cast(), 1, out.len(), pfp);
-                assert_eq!(&out[..got], b"hello-popen");
-                assert_eq!(_pclose(pfp), 0);
-            }
+            // _popen must NEVER escape to the host `/bin/sh`:
+            // 1. Invalid modes / null args fail with EINVAL.
+            assert!(_popen(std::ptr::null(), b"rb\0".as_ptr()).is_null());
+            assert_eq!(*errno::_errno(), EINVAL);
+            assert!(_popen(b"echo hi\0".as_ptr(), b"rw\0".as_ptr()).is_null());
+            assert_eq!(*errno::_errno(), EINVAL);
+            assert_eq!(_pclose(std::ptr::null_mut()), -1);
+            assert_eq!(*errno::_errno(), EINVAL);
+
+            // 2. Without a guest COMSPEC/cmd.exe in the virtual drive, _popen fails with ENOENT
+            //    and never executes host shell commands.
+            let prev_comspec = crate::process::get_env("COMSPEC");
+            crate::process::set_env("COMSPEC", Some("U:\\missing_cmd.exe"));
+            let canary = dir.join("host_shell_escaped.txt");
+            let shell_cmd = format!("touch '{}'\0", canary.display());
+            assert!(_popen(shell_cmd.as_ptr(), b"rb\0".as_ptr()).is_null());
+            assert_eq!(*errno::_errno(), errno::ENOENT);
+            assert!(!canary.exists(), "_popen must never invoke host /bin/sh");
+
+            // 3. Even when COMSPEC points to a valid PE header in the virtual drive, _popen
+            //    routes strictly through CreateProcessW and fails closed when no verified runner
+            //    is pinned (EACCES) or when the file is not a PE (ENOEXEC).
+            let fake_cmd_host = dir.join("cmd.exe");
+            let mut fake_pe = vec![0u8; 0x100];
+            fake_pe[0..2].copy_from_slice(b"MZ");
+            fake_pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            fake_pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+            std::fs::write(&fake_cmd_host, &fake_pe).unwrap();
+            crate::process::set_env("COMSPEC", Some("U:\\cmd.exe"));
+            assert!(_popen(b"echo hi\0".as_ptr(), b"rb\0".as_ptr()).is_null());
+            assert_eq!(*errno::_errno(), EACCES);
+
+            crate::process::set_env("COMSPEC", prev_comspec.as_deref());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
