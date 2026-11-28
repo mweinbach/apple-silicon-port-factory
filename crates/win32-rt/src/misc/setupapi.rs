@@ -141,45 +141,70 @@ fn guid_to_bytes(g: &GUID) -> [u8; 16] {
 
 #[derive(Clone)]
 enum DevEntry {
-    Hid(Arc<Device>),
+    Hid {
+        dev: Arc<Device>,
+        hid_index: usize,
+        dualsense_slot: u32,
+    },
     Display(DisplayAdapterInfo),
 }
 
 impl DevEntry {
     fn class_guid(&self) -> &'static [u8; 16] {
         match self {
-            DevEntry::Hid(_) => &GUID_HIDCLASS,
+            DevEntry::Hid { .. } => &GUID_HIDCLASS,
             DevEntry::Display(_) => &GUID_DEVCLASS_DISPLAY,
         }
     }
 
     fn interface_guid(&self) -> &'static [u8; 16] {
         match self {
-            DevEntry::Hid(_) => &GUID_DEVINTERFACE_HID,
+            DevEntry::Hid { .. } => &GUID_DEVINTERFACE_HID,
             DevEntry::Display(_) => &GUID_DEVINTERFACE_DISPLAY_ADAPTER,
         }
     }
 
     fn dev_inst(&self) -> u32 {
         match self {
-            DevEntry::Hid(d) => d.inst,
+            DevEntry::Hid { dev, .. } => dev.inst,
             DevEntry::Display(_) => DISPLAY_DEVINST,
         }
     }
 
     fn interface_path(&self) -> &str {
         match self {
-            DevEntry::Hid(d) => &d.path,
+            DevEntry::Hid { dev, .. } => &dev.path,
             DevEntry::Display(d) => &d.interface_path,
         }
     }
 
-    fn instance_id(&self, di: usize) -> String {
+    fn instance_id(&self) -> String {
         match self {
-            DevEntry::Hid(d) => format!("HID\\VID_{:04X}&PID_{:04X}\\{di}", d.desc.vendor_id, d.desc.product_id),
+            DevEntry::Hid { dev, hid_index, .. } => {
+                format!("HID\\VID_{:04X}&PID_{:04X}\\{hid_index}", dev.desc.vendor_id, dev.desc.product_id)
+            }
             DevEntry::Display(d) => d.instance_id.clone(),
         }
     }
+}
+
+/// Snapshot HID devices with their unfiltered index and USB DualSense slot so
+/// instance-ID filtering and single-interface opens preserve stable identity.
+fn hid_entries_with_identity(devs: Vec<Arc<Device>>) -> Vec<DevEntry> {
+    let mut ds_slot = 0u32;
+    devs.into_iter()
+        .enumerate()
+        .map(|(hid_index, dev)| {
+            let dualsense_slot = if is_dualsense_usb(&dev) {
+                let slot = ds_slot;
+                ds_slot += 1;
+                slot
+            } else {
+                0
+            };
+            DevEntry::Hid { dev, hid_index, dualsense_slot }
+        })
+        .collect()
 }
 
 /// Deterministic Windows container GUID for a HID device `d` at USB DualSense slot `slot`.
@@ -195,18 +220,12 @@ fn hid_container_guid(d: &Device, dualsense_slot: u32) -> GUID {
     GUID::new(a, desc.vendor_id, desc.product_id, [d3[0], d3[1], hi[0], hi[1], lo[0], lo[1], lo[2], lo[3]])
 }
 
-/// Deterministic Windows container GUID for entry `di` in `devices`.
+/// Deterministic Windows container GUID for `entry`.
 /// USB DualSense controllers share [`dualsense_usb_container_id`] with their
 /// paired USB audio-haptics endpoint in `audio::mmdevapi`.
-fn device_container_guid(devices: &[DevEntry], di: usize) -> GUID {
-    match &devices[di] {
-        DevEntry::Hid(d) => {
-            let slot = devices[..di]
-                .iter()
-                .filter(|other| matches!(other, DevEntry::Hid(h) if is_dualsense_usb(h)))
-                .count() as u32;
-            hid_container_guid(d, slot)
-        }
+fn device_container_guid(entry: &DevEntry) -> GUID {
+    match entry {
+        DevEntry::Hid { dev, dualsense_slot, .. } => hid_container_guid(dev, *dualsense_slot),
         DevEntry::Display(_) => INTERNAL_CONTAINER_GUID,
     }
 }
@@ -262,10 +281,9 @@ unsafe fn get_class_devs(guid: *const u8, enumerator: Option<String>, flags: u32
     let mut devices = Vec::new();
     if hid_class_ok && hid_enum_ok {
         hid::ensure_started();
-        for (idx, dev) in hid::devices().into_iter().enumerate() {
-            let entry = DevEntry::Hid(dev);
+        for entry in hid_entries_with_identity(hid::devices()) {
             if let Some(ref e) = enum_upper {
-                if e.starts_with("HID\\") && !entry.instance_id(idx).to_ascii_uppercase().starts_with(e) {
+                if e.starts_with("HID\\") && !entry.instance_id().to_ascii_uppercase().starts_with(e) {
                     continue;
                 }
             }
@@ -459,10 +477,10 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInterfaceDetailW(
 }
 
 /// Registry properties of a HID or PCI Display device node.
-fn property(devices: &[DevEntry], di: usize, prop: u32) -> Option<(u32, Vec<String>)> {
+fn property(entry: &DevEntry, prop: u32) -> Option<(u32, Vec<String>)> {
     let sz = |s: String| Some((REG_SZ, vec![s]));
-    match devices.get(di)? {
-        DevEntry::Hid(d) => {
+    match entry {
+        DevEntry::Hid { dev: d, .. } => {
             let x = &d.desc;
             match prop {
                 0x00 => {
@@ -489,7 +507,7 @@ fn property(devices: &[DevEntry], di: usize, prop: u32) -> Option<(u32, Vec<Stri
                 0x08 => sz("{745a17a0-74d3-11d0-b6fe-00a0c90f57da}".into()),             // SPDRP_CLASSGUID
                 0x0B => sz("(Standard system devices)".into()),                          // SPDRP_MFG
                 0x16 => sz("HID".into()),                                                // SPDRP_ENUMERATOR_NAME
-                SPDRP_BASE_CONTAINERID => sz(format_guid(&device_container_guid(devices, di))),
+                SPDRP_BASE_CONTAINERID => sz(format_guid(&device_container_guid(entry))),
                 _ => None,
             }
         }
@@ -535,12 +553,9 @@ pub unsafe extern "win64" fn SetupDiGetDeviceRegistryPropertyW(
         set_err(ERROR_INVALID_PARAMETER);
         return FALSE;
     };
-    let Some(res) = with_set(set, |s| {
-        if di >= s.devices.len() {
-            Err(ERROR_INVALID_PARAMETER)
-        } else {
-            Ok(property(&s.devices, di, prop))
-        }
+    let Some(res) = with_set(set, |s| match s.devices.get(di) {
+        Some(entry) => Ok(property(entry, prop)),
+        None => Err(ERROR_INVALID_PARAMETER),
     }) else {
         set_err(ERROR_INVALID_HANDLE);
         return FALSE;
@@ -654,12 +669,9 @@ pub unsafe extern "win64" fn SetupDiGetDeviceRegistryPropertyA(
         set_err(ERROR_INVALID_PARAMETER);
         return FALSE;
     };
-    let Some(res) = with_set(set, |s| {
-        if di >= s.devices.len() {
-            Err(ERROR_INVALID_PARAMETER)
-        } else {
-            Ok(property(&s.devices, di, prop))
-        }
+    let Some(res) = with_set(set, |s| match s.devices.get(di) {
+        Some(entry) => Ok(property(entry, prop)),
+        None => Err(ERROR_INVALID_PARAMETER),
     }) else {
         set_err(ERROR_INVALID_HANDLE);
         return FALSE;
@@ -714,7 +726,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInstanceIdW(
         set_err(ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let s = dev.instance_id(di);
+    let s = dev.instance_id();
     let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
     if !required.is_null() {
         std::ptr::write_unaligned(required, w.len() as u32);
@@ -743,7 +755,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInstanceIdA(
         set_err(ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let s = dev.instance_id(di);
+    let s = dev.instance_id();
     let need = s.len() as u32 + 1;
     if !required.is_null() {
         std::ptr::write_unaligned(required, need);
@@ -813,10 +825,11 @@ pub unsafe extern "win64" fn SetupDiGetDevicePropertyW(
     };
     let pid = (prop_key.add(16) as *const u32).read_unaligned();
     let Some(res) = with_set(set, |s| {
-        if di >= s.devices.len() {
-            Err(ERROR_INVALID_PARAMETER)
-        } else if fmtid == DEVPKEY_DEVICE_CONTAINERID_FMTID && pid == DEVPKEY_DEVICE_CONTAINERID_PID {
-            Ok(Some(device_container_guid(&s.devices, di)))
+        let Some(entry) = s.devices.get(di) else {
+            return Err(ERROR_INVALID_PARAMETER);
+        };
+        if fmtid == DEVPKEY_DEVICE_CONTAINERID_FMTID && pid == DEVPKEY_DEVICE_CONTAINERID_PID {
+            Ok(Some(device_container_guid(entry)))
         } else {
             Ok(None)
         }
@@ -878,7 +891,7 @@ pub unsafe extern "win64" fn SetupDiOpenDeviceInterfaceW(
     if can_add {
         hid::ensure_started();
     }
-    let snapshot = if can_add { Some(hid::devices()) } else { None };
+    let snapshot = if can_add { Some(hid_entries_with_identity(hid::devices())) } else { None };
     let mut map = sets().lock().unwrap();
     let Some(s) = map.get_mut(&(set as usize)) else {
         set_err(ERROR_INVALID_HANDLE);
@@ -889,13 +902,13 @@ pub unsafe extern "win64" fn SetupDiOpenDeviceInterfaceW(
         .iter()
         .position(|d| d.interface_path().eq_ignore_ascii_case(&target))
         .or_else(|| {
-            if let Some(dev) = snapshot
-                .as_ref()
-                .and_then(|v| v.iter().find(|d| d.path.eq_ignore_ascii_case(&target)))
-                .cloned()
+            if let Some(entry) = snapshot
+                .into_iter()
+                .flatten()
+                .find(|e| e.interface_path().eq_ignore_ascii_case(&target))
             {
                 let idx = s.devices.len();
-                s.devices.push(DevEntry::Hid(dev));
+                s.devices.push(entry);
                 return Some(idx);
             }
             if can_add {
@@ -955,7 +968,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInterfacePropertyW(
         if fmtid == DEVPKEY_DEVICE_CONTAINERID_FMTID && pid == DEVPKEY_DEVICE_CONTAINERID_PID {
             Ok(Some((
                 DEVPROP_TYPE_GUID,
-                guid_to_bytes(&device_container_guid(&s.devices, di)).to_vec(),
+                guid_to_bytes(&device_container_guid(entry)).to_vec(),
             )))
         } else if fmtid == DEVPKEY_DEVICEINTERFACE_FMTID
             && pid == DEVPKEY_DEVICEINTERFACE_CLASSGUID_PID
@@ -967,7 +980,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInterfacePropertyW(
             Ok(Some((DEVPROP_TYPE_BOOLEAN, vec![0xFFu8])))
         } else if fmtid == DEVPKEY_DEVICE_INSTANCEID_FMTID && pid == DEVPKEY_DEVICE_INSTANCEID_PID
         {
-            let s_id = entry.instance_id(di);
+            let s_id = entry.instance_id();
             let mut bytes = Vec::with_capacity((s_id.len() + 1) * 2);
             for u in s_id.encode_utf16().chain(std::iter::once(0u16)) {
                 bytes.extend_from_slice(&u.to_le_bytes());
@@ -1698,6 +1711,129 @@ mod tests {
             let dev_id = crate::strings::from_wide(disp_dev.as_ptr().add(328) as *const u16);
             assert_eq!(dev_str, expected.name);
             assert_eq!(dev_id, expected.pci_id);
+        }
+    }
+
+    #[test]
+    fn filtered_hid_snapshot_preserves_instance_id_and_dualsense_slot() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        hid::tests::install_fake_dualsense(0xD5_00C1);
+        let _ds1 = FakeDualSenseGuard(0xD5_00C1);
+        hid::tests::install_fake_dualsense(0xD5_00C2);
+        let _ds2 = FakeDualSenseGuard(0xD5_00C2);
+
+        let all = hid_entries_with_identity(hid::devices());
+        let second = all
+            .iter()
+            .find(|e| matches!(e, DevEntry::Hid { dev, .. } if dev.desc.id == 0xD5_00C2))
+            .expect("second fake DualSense present");
+        let (expected_inst_id, expected_dev_inst, expected_slot, expected_path) = match second {
+            DevEntry::Hid { dev, hid_index, dualsense_slot } => {
+                assert!(*hid_index >= 1, "second DualSense must have nonzero hid_index");
+                assert!(*dualsense_slot >= 1, "second USB DualSense must have nonzero slot");
+                (second.instance_id(), dev.inst, *dualsense_slot, dev.path.clone())
+            }
+            DevEntry::Display(_) => unreachable!(),
+        };
+        let expected_cid = dualsense_usb_container_id(expected_slot);
+        let expected_cid_bytes = guid_to_bytes(&expected_cid);
+        let expected_cid_str = format_guid(&expected_cid);
+
+        unsafe {
+            // Confirm CM_Get_DevNode_PropertyW agrees on the second DualSense's container ID.
+            let mut key_cid = [0u8; 20];
+            key_cid[0..16].copy_from_slice(&DEVPKEY_DEVICE_CONTAINERID_FMTID);
+            key_cid[16..20].copy_from_slice(&DEVPKEY_DEVICE_CONTAINERID_PID.to_le_bytes());
+            let mut cm_ty = 0u32;
+            let mut cm_buf = [0u8; 16];
+            let mut cm_len = 16u32;
+            assert_eq!(
+                CM_Get_DevNode_PropertyW(
+                    expected_dev_inst,
+                    key_cid.as_ptr(),
+                    &mut cm_ty,
+                    cm_buf.as_mut_ptr(),
+                    &mut cm_len,
+                    0
+                ),
+                0
+            );
+            assert_eq!(cm_buf, expected_cid_bytes);
+
+            // 1. Instance-ID enumerator filter selects only the second DualSense into index 0.
+            let enum_w = crate::strings::to_wide_z(&expected_inst_id);
+            let set = SetupDiGetClassDevsW(
+                std::ptr::null(),
+                enum_w.as_ptr(),
+                std::ptr::null_mut(),
+                DIGCF_ALLCLASSES,
+            );
+            assert!(!set.is_null());
+            let mut dd = [0u8; 32];
+            dd[0] = 32;
+            assert_eq!(SetupDiEnumDeviceInfo(set, 0, dd.as_mut_ptr()), TRUE);
+            assert_eq!(SetupDiEnumDeviceInfo(set, 1, dd.as_mut_ptr()), FALSE);
+
+            let mut inst_w = [0u16; 256];
+            let mut req_ch = 0u32;
+            assert_eq!(
+                SetupDiGetDeviceInstanceIdW(set, dd.as_ptr(), inst_w.as_mut_ptr(), inst_w.len() as u32, &mut req_ch),
+                TRUE
+            );
+            assert_eq!(crate::strings::from_wide(inst_w.as_ptr()), expected_inst_id);
+
+            let mut inst_a = [0u8; 256];
+            assert_eq!(
+                SetupDiGetDeviceInstanceIdA(set, dd.as_ptr(), inst_a.as_mut_ptr(), inst_a.len() as u32, &mut req_ch),
+                TRUE
+            );
+            let nul = inst_a.iter().position(|&b| b == 0).unwrap();
+            assert_eq!(std::str::from_utf8(&inst_a[..nul]).unwrap(), expected_inst_id);
+
+            let mut pty = 0u32;
+            let mut preq = 0u32;
+            let mut gbuf = [0u8; 16];
+            assert_eq!(
+                SetupDiGetDevicePropertyW(set, dd.as_ptr(), key_cid.as_ptr(), &mut pty, gbuf.as_mut_ptr(), 16, &mut preq, 0),
+                TRUE
+            );
+            assert_eq!(gbuf, expected_cid_bytes);
+
+            let mut rty = 0u32;
+            let mut rreq = 0u32;
+            let mut wbuf = [0u8; 256];
+            assert_eq!(
+                SetupDiGetDeviceRegistryPropertyW(set, dd.as_ptr(), SPDRP_BASE_CONTAINERID, &mut rty, wbuf.as_mut_ptr(), 256, &mut rreq),
+                TRUE
+            );
+            assert_eq!(crate::strings::from_wide(wbuf.as_ptr() as *const u16), expected_cid_str);
+            assert_eq!(SetupDiDestroyDeviceInfoList(set), TRUE);
+
+            // 2. Opening the second DualSense interface into an empty set also preserves its identity & slot.
+            let empty_guid = [0x33u8; 16];
+            let set2 = SetupDiGetClassDevsW(empty_guid.as_ptr(), std::ptr::null(), std::ptr::null_mut(), DIGCF_DEVICEINTERFACE);
+            let path_w = crate::strings::to_wide_z(&expected_path);
+            let mut ifd = [0u8; 32];
+            ifd[0] = 32;
+            assert_eq!(SetupDiOpenDeviceInterfaceW(set2, path_w.as_ptr(), 0, ifd.as_mut_ptr()), TRUE);
+
+            let mut gbuf2 = [0u8; 16];
+            assert_eq!(
+                SetupDiGetDeviceInterfacePropertyW(set2, ifd.as_ptr(), key_cid.as_ptr(), &mut pty, gbuf2.as_mut_ptr(), 16, &mut preq, 0),
+                TRUE
+            );
+            assert_eq!(gbuf2, expected_cid_bytes);
+
+            let mut key_id = [0u8; 20];
+            key_id[0..16].copy_from_slice(&DEVPKEY_DEVICE_INSTANCEID_FMTID);
+            key_id[16..20].copy_from_slice(&DEVPKEY_DEVICE_INSTANCEID_PID.to_le_bytes());
+            let mut sbuf = [0u8; 256];
+            assert_eq!(
+                SetupDiGetDeviceInterfacePropertyW(set2, ifd.as_ptr(), key_id.as_ptr(), &mut pty, sbuf.as_mut_ptr(), 256, &mut preq, 0),
+                TRUE
+            );
+            assert_eq!(crate::strings::from_wide(sbuf.as_ptr() as *const u16), expected_inst_id);
+            assert_eq!(SetupDiDestroyDeviceInfoList(set2), TRUE);
         }
     }
 }
