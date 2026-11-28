@@ -571,28 +571,19 @@ unsafe fn mbstrlen_cp(s: *const u8, cp: u32) -> usize {
         return strlen(s);
     }
     let bytes = std::slice::from_raw_parts(s, strlen(s));
-    if cp == 65001 {
-        return match std::str::from_utf8(bytes) {
-            Ok(st) => st.chars().count(),
-            Err(_) => {
-                errno::set(super::errno::EILSEQ);
-                usize::MAX
-            }
-        };
-    }
     let mut i = 0usize;
     let mut count = 0usize;
     while i < bytes.len() {
-        if crate::kernel32::string::IsDBCSLeadByteEx(cp, bytes[i]) != 0 {
-            if i + 1 >= bytes.len() {
+        match super::convert::mb_decode_cp(cp, &bytes[i..]) {
+            Ok(Some((_, used))) => {
+                i += used;
+                count += 1;
+            }
+            Ok(None) | Err(()) => {
                 errno::set(super::errno::EILSEQ);
                 return usize::MAX;
             }
-            i += 2;
-        } else {
-            i += 1;
         }
-        count += 1;
     }
     count
 }
@@ -1756,6 +1747,11 @@ mod tests {
             let dangling: [u8; 2] = [0x82, 0];
             errno::set(0);
             assert_eq!(_mbstrlen_l(dangling.as_ptr(), loc_ja), usize::MAX);
+            assert_eq!(errno::get(), super::super::errno::EILSEQ);
+            // Invalid CP932 lead+trail sequence [0x81, 0x20] must fail with EILSEQ (matching mbtowc).
+            let invalid_dbcs: [u8; 3] = [0x81, 0x20, 0];
+            errno::set(0);
+            assert_eq!(_mbstrlen_l(invalid_dbcs.as_ptr(), loc_ja), usize::MAX);
             assert_eq!(errno::get(), super::super::errno::EILSEQ);
 
             let prev_mbcp = crate::ucrt::locale::_getmbcp();

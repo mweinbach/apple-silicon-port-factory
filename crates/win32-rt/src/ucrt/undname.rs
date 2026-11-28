@@ -13,9 +13,9 @@ const UNDNAME_NO_FUNCTION_RETURNS: u32 = 0x0004;
 const UNDNAME_NO_ALLOCATION_LANGUAGE: u32 = 0x0010;
 const UNDNAME_NO_ACCESS_SPECIFIERS: u32 = 0x0080;
 const UNDNAME_NO_MEMBER_TYPE: u32 = 0x0200;
-const UNDNAME_NO_ECSU: u32 = 0x0800;
 const UNDNAME_NAME_ONLY: u32 = 0x1000;
 const UNDNAME_TYPE_ONLY: u32 = 0x2000;
+const UNDNAME_NO_ECSU: u32 = 0x8000;
 
 const MAX_DEPTH: usize = 64;
 const MAX_OUT: usize = 65_536;
@@ -667,6 +667,27 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn parse_type_only(bytes: &[u8], flags: u32) -> Option<String> {
+    let mut p = Parser::new(bytes, flags);
+    let ty = if bytes.starts_with(b"?A")
+        || bytes.starts_with(b"?B")
+        || bytes.starts_with(b"?C")
+        || bytes.starts_with(b"?D")
+    {
+        p.pos = 1;
+        let cv = p.parse_cv()?;
+        let inner = p.parse_type(false)?;
+        if cv.is_empty() { inner } else { format!("{inner} {cv}") }
+    } else {
+        p.parse_type(false)?
+    };
+    if p.pos == p.src.len() {
+        Some(ty)
+    } else {
+        None
+    }
+}
+
 /// Demangle an MSVC C++ decorated name or RTTI `TypeDescriptor` name.
 /// Returns the original input unchanged if it is not a recognized MSVC decorated name.
 pub(crate) fn demangle_msvc(input: &str, flags: u32) -> String {
@@ -676,29 +697,21 @@ pub(crate) fn demangle_msvc(input: &str, flags: u32) -> String {
     let bytes = input.as_bytes();
     let parsed = if let Some(rest) = bytes.strip_prefix(b".") {
         // RTTI TypeDescriptor names start with `.` (e.g. `.?AVFoo@ns@@`, `.PEAX`, `.H`).
-        let mut p = Parser::new(rest, flags);
-        if rest.starts_with(b"?A") || rest.starts_with(b"?B") || rest.starts_with(b"?C") || rest.starts_with(b"?D") {
-            p.pos = 1;
-            let cv = p.parse_cv();
-            let ty = p.parse_type(false);
-            match (cv, ty) {
-                (Some(""), Some(t)) => Some(t),
-                (Some(c), Some(t)) => Some(format!("{t} {c}")),
-                _ => None,
+        parse_type_only(rest, flags)
+    } else if (flags & UNDNAME_TYPE_ONLY) != 0 {
+        // Type-only mode accepts bare MSVC type encodings (`H`, `PEAX`, `VFoo@@`, `?AVFoo@@`)
+        // without requiring a leading `?` or `.`.
+        parse_type_only(bytes, flags).or_else(|| {
+            if bytes.starts_with(b"?") {
+                let mut p = Parser::new(bytes, flags);
+                p.parse_symbol_or_raw()
+            } else {
+                None
             }
-        } else {
-            p.parse_type(false)
-        }
+        })
     } else if bytes.starts_with(b"?") {
         let mut p = Parser::new(bytes, flags);
-        if (flags & UNDNAME_TYPE_ONLY) != 0 {
-            p.parse_type(false).or_else(|| {
-                let mut p2 = Parser::new(bytes, flags);
-                p2.parse_symbol_or_raw()
-            })
-        } else {
-            p.parse_symbol_or_raw()
-        }
+        p.parse_symbol_or_raw()
     } else {
         None
     };
@@ -776,16 +789,28 @@ mod tests {
 
     #[test]
     fn demangles_rtti_functions_templates_and_flags() {
-        // RTTI TypeDescriptors
+        // RTTI TypeDescriptors & literal Windows flag values (UNDNAME_NO_ECSU = 0x8000, UNDNAME_32_BIT_DECODE = 0x0800)
         assert_eq!(demangle_msvc(".?AVsystem_error@std@@", 0), "class std::system_error");
         assert_eq!(
-            demangle_msvc(".?AVsystem_error@std@@", UNDNAME_NO_ECSU),
+            demangle_msvc(".?AVsystem_error@std@@", 0x8000),
             "std::system_error"
+        );
+        assert_eq!(
+            demangle_msvc(".?AVsystem_error@std@@", 0x0800),
+            "class std::system_error"
         );
         assert_eq!(demangle_msvc(".?AU_Mbstatet@@", 0), "struct _Mbstatet");
         assert_eq!(demangle_msvc(".?AW4MyEnum@ns@@", 0), "enum ns::MyEnum");
         assert_eq!(demangle_msvc(".PEAVFoo@@", UNDNAME_NO_MS_KEYWORDS), "class Foo *");
         assert_eq!(demangle_msvc(".H", 0), "int");
+
+        // UNDNAME_TYPE_ONLY (0x2000) decodes bare type encodings without requiring leading '?' or '.'.
+        assert_eq!(demangle_msvc("H", 0x2000), "int");
+        assert_eq!(demangle_msvc("PEAX", 0x2000), "void * __ptr64");
+        assert_eq!(demangle_msvc("PEAX", 0x2000 | UNDNAME_NO_MS_KEYWORDS), "void *");
+        assert_eq!(demangle_msvc("VFoo@ns@@", 0x2000), "class ns::Foo");
+        assert_eq!(demangle_msvc("?AVFoo@ns@@", 0x2000), "class ns::Foo");
+        assert_eq!(demangle_msvc("Hello", 0x2000), "Hello");
         assert_eq!(
             demangle_msvc(
                 ".?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@",
