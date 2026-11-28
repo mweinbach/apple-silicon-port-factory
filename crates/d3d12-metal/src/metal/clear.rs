@@ -56,8 +56,149 @@ fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
+/// Decodes an unsigned 11-bit float (`DXGI_FORMAT_R11G11B10_FLOAT` R/G channel:
+/// 5-bit exponent bias 15, 6-bit mantissa) to its exact `f32` value.
+fn f11_to_f32(x: u16) -> f32 {
+    let e = ((x >> 6) & 0x1f) as i32;
+    let m = (x & 0x3f) as u32;
+    match e {
+        0 => (m as f32) * 2f32.powi(-20),
+        31 => if m == 0 { f32::INFINITY } else { f32::NAN },
+        _ => (1.0 + m as f32 / 64.0) * 2f32.powi(e - 15),
+    }
+}
+
+/// Decodes an unsigned 10-bit float (`DXGI_FORMAT_R11G11B10_FLOAT` B channel:
+/// 5-bit exponent bias 15, 5-bit mantissa) to its exact `f32` value.
+fn f10_to_f32(x: u16) -> f32 {
+    let e = ((x >> 5) & 0x1f) as i32;
+    let m = (x & 0x1f) as u32;
+    match e {
+        0 => (m as f32) * 2f32.powi(-19),
+        31 => if m == 0 { f32::INFINITY } else { f32::NAN },
+        _ => (1.0 + m as f32 / 32.0) * 2f32.powi(e - 15),
+    }
+}
+
+/// Encodes `f32` to an unsigned float with 5-bit exponent (bias 15) and `mbits` mantissa
+/// bits (`mbits == 6` for 11-bit R/G, `mbits == 5` for 10-bit B in `R11G11B10_FLOAT`).
+fn f32_to_ufloat(f: f32, mbits: u32) -> u32 {
+    let b = f.to_bits();
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff && man != 0 {
+        // NaN -> quiet NaN in target width.
+        return (0x1f << mbits) | (1 << (mbits - 1));
+    }
+    if (b >> 31) != 0 || f <= 0.0 {
+        // Unsigned float format clamps negative values (including -Inf / -0.0) to 0.
+        return 0;
+    }
+    if exp == 0xff {
+        return 0x1f << mbits; // +Inf
+    }
+    let e = exp - 127 + 15;
+    let shift = 23 - mbits;
+    let round = 1u32 << (shift - 1);
+    if e >= 0x1f {
+        return (0x1f << mbits) - 1; // clamp finite overflow to max finite
+    }
+    if e <= 0 {
+        let sub_shift = (1 - e) as u32;
+        if sub_shift > 24 {
+            return 0;
+        }
+        let m = (man | 0x80_0000) >> sub_shift;
+        return (m + round) >> shift;
+    }
+    let mant_rounded = man + round;
+    let carry = mant_rounded >> 23;
+    let out_e = (e as u32) + carry;
+    if out_e >= 0x1f {
+        return (0x1f << mbits) - 1;
+    }
+    (out_e << mbits) | ((mant_rounded & 0x7f_ffff) >> shift)
+}
+
+fn encode_packed_element(dxgi: u32, v: ClearValue) -> Option<Vec<u8>> {
+    match dxgi {
+        // DXGI_FORMAT_R11G11B10_FLOAT
+        26 => {
+            let (r, g, b) = match v {
+                ClearValue::Uint(u) => (u[0] & 0x7ff, u[1] & 0x7ff, u[2] & 0x3ff),
+                ClearValue::Float(f) => (
+                    f32_to_ufloat(f[0], 6),
+                    f32_to_ufloat(f[1], 6),
+                    f32_to_ufloat(f[2], 5),
+                ),
+            };
+            let packed = r | (g << 11) | (b << 22);
+            Some(packed.to_le_bytes().to_vec())
+        }
+        // DXGI_FORMAT_R10G10B10A2_UNORM
+        24 => {
+            let (r, g, b, a) = match v {
+                ClearValue::Uint(u) => (u[0] & 0x3ff, u[1] & 0x3ff, u[2] & 0x3ff, u[3] & 0x3),
+                ClearValue::Float(f) => (
+                    (f[0].clamp(0.0, 1.0) * 1023.0).round() as u32,
+                    (f[1].clamp(0.0, 1.0) * 1023.0).round() as u32,
+                    (f[2].clamp(0.0, 1.0) * 1023.0).round() as u32,
+                    (f[3].clamp(0.0, 1.0) * 3.0).round() as u32,
+                ),
+            };
+            let packed = r | (g << 10) | (b << 20) | (a << 30);
+            Some(packed.to_le_bytes().to_vec())
+        }
+        // DXGI_FORMAT_R10G10B10A2_UINT
+        25 => {
+            let (r, g, b, a) = match v {
+                ClearValue::Uint(u) => (u[0] & 0x3ff, u[1] & 0x3ff, u[2] & 0x3ff, u[3] & 0x3),
+                ClearValue::Float(f) => (
+                    f[0].clamp(0.0, 1023.0) as u32,
+                    f[1].clamp(0.0, 1023.0) as u32,
+                    f[2].clamp(0.0, 1023.0) as u32,
+                    f[3].clamp(0.0, 3.0) as u32,
+                ),
+            };
+            let packed = r | (g << 10) | (b << 20) | (a << 30);
+            Some(packed.to_le_bytes().to_vec())
+        }
+        // DXGI_FORMAT_B5G6R5_UNORM
+        85 => {
+            let (r, g, b) = match v {
+                ClearValue::Uint(u) => (u[0] & 0x1f, u[1] & 0x3f, u[2] & 0x1f),
+                ClearValue::Float(f) => (
+                    (f[0].clamp(0.0, 1.0) * 31.0).round() as u32,
+                    (f[1].clamp(0.0, 1.0) * 63.0).round() as u32,
+                    (f[2].clamp(0.0, 1.0) * 31.0).round() as u32,
+                ),
+            };
+            let packed = (b | (g << 5) | (r << 11)) as u16;
+            Some(packed.to_le_bytes().to_vec())
+        }
+        // DXGI_FORMAT_B5G5R5A1_UNORM
+        86 => {
+            let (r, g, b, a) = match v {
+                ClearValue::Uint(u) => (u[0] & 0x1f, u[1] & 0x1f, u[2] & 0x1f, u[3] & 0x1),
+                ClearValue::Float(f) => (
+                    (f[0].clamp(0.0, 1.0) * 31.0).round() as u32,
+                    (f[1].clamp(0.0, 1.0) * 31.0).round() as u32,
+                    (f[2].clamp(0.0, 1.0) * 31.0).round() as u32,
+                    (f[3].clamp(0.0, 1.0)).round() as u32,
+                ),
+            };
+            let packed = (b | (g << 5) | (r << 10) | (a << 15)) as u16;
+            Some(packed.to_le_bytes().to_vec())
+        }
+        _ => None,
+    }
+}
+
 /// One element of a typed buffer view (`None` = format not handled).
 pub fn encode_element(dxgi: u32, v: ClearValue) -> Option<Vec<u8>> {
+    if let Some(packed) = encode_packed_element(dxgi, v) {
+        return Some(packed);
+    }
     let fi = format::info(dxgi);
     let (n, bits) = (fi.channels as usize, fi.chan_bits);
     if n == 0 || n > 4 || !matches!(bits, 8 | 16 | 32) || fi.bytes as usize != n * bits as usize / 8 {
@@ -128,22 +269,60 @@ pub fn texture_value(dxgi: u32, v: ClearValue) -> Result<(Class, [u32; 4], [f32;
         (Num::Float | Num::Unorm | Num::Snorm | Num::Srgb, ClearValue::Float(f)) => Ok((Class::Float, [0; 4], f)),
         // Bit-precise uint clear of a float/norm format: decode the bits.
         (Num::Float | Num::Unorm | Num::Snorm | Num::Srgb, ClearValue::Uint(u)) => {
-            let bits = fi.chan_bits;
-            let mut f = [0f32; 4];
-            for c in 0..4 {
-                let mask = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
-                let x = u[c] & mask;
-                f[c] = match (fi.num, bits) {
-                    (Num::Float, 32) => f32::from_bits(x),
-                    (Num::Float, 16) => f16_to_f32(x as u16),
-                    (Num::Unorm | Num::Srgb, 8 | 16 | 10 | 2) => x as f32 / mask as f32,
-                    (Num::Snorm, 8 | 16) => {
-                        let sx = ((x << (32 - bits)) as i32) >> (32 - bits);
-                        (sx as f32 / ((1u32 << (bits - 1)) - 1) as f32).max(-1.0)
+            let f = match dxgi {
+                // DXGI_FORMAT_R11G11B10_FLOAT: 11-bit R, 11-bit G, 10-bit B unsigned floats.
+                26 => [
+                    f11_to_f32((u[0] & 0x7ff) as u16),
+                    f11_to_f32((u[1] & 0x7ff) as u16),
+                    f10_to_f32((u[2] & 0x3ff) as u16),
+                    1.0,
+                ],
+                // DXGI_FORMAT_R10G10B10A2_UNORM: 10-bit RGB, 2-bit A.
+                24 => [
+                    (u[0] & 0x3ff) as f32 / 1023.0,
+                    (u[1] & 0x3ff) as f32 / 1023.0,
+                    (u[2] & 0x3ff) as f32 / 1023.0,
+                    (u[3] & 0x3) as f32 / 3.0,
+                ],
+                // DXGI_FORMAT_B5G6R5_UNORM: 5-bit R, 6-bit G, 5-bit B.
+                85 => [
+                    (u[0] & 0x1f) as f32 / 31.0,
+                    (u[1] & 0x3f) as f32 / 63.0,
+                    (u[2] & 0x1f) as f32 / 31.0,
+                    1.0,
+                ],
+                // DXGI_FORMAT_B5G5R5A1_UNORM: 5-bit RGB, 1-bit A.
+                86 => [
+                    (u[0] & 0x1f) as f32 / 31.0,
+                    (u[1] & 0x1f) as f32 / 31.0,
+                    (u[2] & 0x1f) as f32 / 31.0,
+                    (u[3] & 0x1) as f32,
+                ],
+                _ => {
+                    let bits = fi.chan_bits;
+                    let mut out = [0f32; 4];
+                    for c in 0..4 {
+                        let mask = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+                        let x = u[c] & mask;
+                        out[c] = match (fi.num, bits) {
+                            (Num::Float, 32) => f32::from_bits(x),
+                            (Num::Float, 16) => f16_to_f32(x as u16),
+                            (Num::Unorm | Num::Srgb, 8 | 16) => x as f32 / mask as f32,
+                            (Num::Snorm, 8 | 16) => {
+                                let sx = ((x << (32 - bits)) as i32) >> (32 - bits);
+                                (sx as f32 / ((1u32 << (bits - 1)) - 1) as f32).max(-1.0)
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "bit-precise uint clear of {} not implemented",
+                                    fi.name
+                                ))
+                            }
+                        };
                     }
-                    _ => return Err(format!("bit-precise uint clear of {} not implemented", fi.name)),
-                };
-            }
+                    out
+                }
+            };
             Ok((Class::Float, [0; 4], f))
         }
         _ => Err(format!("UAV clear of format {}", fi.name)),
@@ -861,6 +1040,45 @@ mod tests {
         assert_eq!(dword_pattern(&[1, 0, 0, 0, 2, 0, 0, 0]), Some(([1, 2, 0, 0], 2)));
         assert_eq!(f32_to_f16(1.0), 0x3c00);
         assert_eq!(f16_to_f32(0x3c00), 1.0);
+
+        // Packed R11G11B10_FLOAT (26): 1.0 = 0x3c0 (f11) / 0x1e0 (f10), 2.0 = 0x400 / 0x200.
+        assert_eq!(f11_to_f32(0), 0.0);
+        assert_eq!(f11_to_f32(0x3c0), 1.0);
+        assert_eq!(f11_to_f32(0x7bf), 65024.0);
+        assert!(f11_to_f32(0x7c0).is_infinite());
+        assert!(f11_to_f32(0x7e0).is_nan());
+        assert_eq!(f10_to_f32(0), 0.0);
+        assert_eq!(f10_to_f32(0x1e0), 1.0);
+        assert_eq!(f10_to_f32(0x3df), 64512.0);
+        assert!(f10_to_f32(0x3e0).is_infinite());
+        assert_eq!(f32_to_ufloat(1.0, 6), 0x3c0);
+        assert_eq!(f32_to_ufloat(1.0, 5), 0x1e0);
+        assert_eq!(f32_to_ufloat(-5.0, 6), 0);
+        assert_eq!(f32_to_ufloat(65024.0, 6), 0x7bf);
+        assert_eq!(f32_to_ufloat(64512.0, 5), 0x3df);
+        assert_eq!(f32_to_ufloat(f32::INFINITY, 6), 0x7c0);
+        assert_eq!(
+            encode_element(26, ClearValue::Uint([0x3c0 | 0x8000, 0x400, 0x1e0 | 0x400, 99])),
+            Some((0x3c0u32 | (0x400 << 11) | (0x1e0 << 22)).to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            encode_element(26, ClearValue::Float([1.0, 2.0, 1.0, 0.0])),
+            Some((0x3c0u32 | (0x400 << 11) | (0x1e0 << 22)).to_le_bytes().to_vec())
+        );
+        // Packed R10G10B10A2_UNORM (24): A uses low 2 bits.
+        assert_eq!(
+            encode_element(24, ClearValue::Uint([0x3ff, 0x200, 0x100, 0x7])),
+            Some((0x3ffu32 | (0x200 << 10) | (0x100 << 20) | (0x3 << 30)).to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            encode_element(24, ClearValue::Float([1.0, 0.0, 0.0, 1.0])),
+            Some((0x3ffu32 | (0x3 << 30)).to_le_bytes().to_vec())
+        );
+        // Packed R10G10B10A2_UINT (25).
+        assert_eq!(
+            encode_element(25, ClearValue::Uint([5, 10, 20, 2])),
+            Some((5u32 | (10 << 10) | (20 << 20) | (2 << 30)).to_le_bytes().to_vec())
+        );
     }
 
     #[test]
@@ -871,6 +1089,154 @@ mod tests {
         assert_eq!(f[0], 1.0);
         assert!((f[2] - 128.0 / 255.0).abs() < 1e-6);
         assert_eq!(texture_value(42, ClearValue::Float([3.7, 0.0, 0.0, 0.0])).unwrap().1[0], 3);
+
+        // R11G11B10_FLOAT (26) bit-precise uint clear: zero, 1.0/2.0/0.5, subnormal, +Inf.
+        let (c, _, f) = texture_value(26, ClearValue::Uint([0, 0, 0, 0])).unwrap();
+        assert_eq!((c, f), (Class::Float, [0.0, 0.0, 0.0, 1.0]));
+        let (c, _, f) = texture_value(26, ClearValue::Uint([0x3c0 | 0x800, 0x400, 0x1c0 | 0x400, 0])).unwrap();
+        assert_eq!((c, f), (Class::Float, [1.0, 2.0, 0.5, 1.0]));
+        let (_, _, f_sub) = texture_value(26, ClearValue::Uint([1, 2, 1, 0])).unwrap();
+        assert_eq!(f_sub[0], 2f32.powi(-20));
+        assert_eq!(f_sub[1], 2f32.powi(-19));
+        assert_eq!(f_sub[2], 2f32.powi(-19));
+
+        // R10G10B10A2_UNORM (24) bit-precise uint clear: alpha uses 2-bit divisor 3.0.
+        let (_, _, f10) = texture_value(24, ClearValue::Uint([0x3ff, 0, 0x1ff, 3])).unwrap();
+        assert_eq!(f10[0], 1.0);
+        assert_eq!(f10[1], 0.0);
+        assert!((f10[2] - 511.0 / 1023.0).abs() < 1e-6);
+        assert_eq!(f10[3], 1.0);
+        let (_, _, f10_a1) = texture_value(24, ClearValue::Uint([0, 0, 0, 1])).unwrap();
+        assert!((f10_a1[3] - 1.0 / 3.0).abs() < 1e-6);
+
+        // B5G6R5_UNORM (85) and B5G5R5A1_UNORM (86).
+        let (_, _, f565) = texture_value(85, ClearValue::Uint([31, 63, 0, 0])).unwrap();
+        assert_eq!(f565, [1.0, 1.0, 0.0, 1.0]);
+        let (_, _, f5551) = texture_value(86, ClearValue::Uint([31, 0, 31, 1])).unwrap();
+        assert_eq!(f5551, [1.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// Runs `port_clear_2d_f` on `RG11B10Float` and `RGB10A2Unorm` textures with bit-precise
+    /// `ClearValue::Uint` patterns and verifies exact packed 32-bit texel bits on GPU readback.
+    #[test]
+    fn packed_uint_clear_roundtrips_bits_on_gpu() {
+        let Some(d) = super::super::device() else { return };
+        let opts = MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
+        let mk_tex = |pf: MTLPixelFormat| {
+            let td = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    pf, 4, 4, false,
+                )
+            };
+            td.setUsage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+            td.setStorageMode(MTLStorageMode::Shared);
+            td.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+            d.dev.newTextureWithDescriptor(&td).unwrap()
+        };
+        let tex_11 = mk_tex(MTLPixelFormat::RG11B10Float);
+        let tex_10 = mk_tex(MTLPixelFormat::RGB10A2Unorm);
+
+        // R=0x3d0 (1.25), G=0x408 (2.25), B=0x1c8 (0.625) in R11G11B10_FLOAT.
+        let r11 = 0x3d0u32;
+        let g11 = 0x408u32;
+        let b10 = 0x1c8u32;
+        let (c11, _, f11) = texture_value(26, ClearValue::Uint([r11, g11, b10, 0])).unwrap();
+        assert_eq!(c11, Class::Float);
+        let tp11 = TexParams { f: f11, x0: 0, y0: 0, z0: 0, w: 4, h: 4, d: 1, ..Default::default() };
+        let pb11 = unsafe {
+            d.dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&tp11 as *const _ as *mut _).unwrap(),
+                64,
+                opts,
+            )
+        }
+        .unwrap();
+
+        // R=1023, G=512, B=256, A=2 in R10G10B10A2_UNORM.
+        let (c10, _, f10) = texture_value(24, ClearValue::Uint([1023, 512, 256, 2])).unwrap();
+        assert_eq!(c10, Class::Float);
+        let tp10 = TexParams { f: f10, x0: 0, y0: 0, z0: 0, w: 4, h: 4, d: 1, ..Default::default() };
+        let pb10 = unsafe {
+            d.dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&tp10 as *const _ as *mut _).unwrap(),
+                64,
+                opts,
+            )
+        }
+        .unwrap();
+
+        let rsd = MTLResidencySetDescriptor::new();
+        let rs = d.dev.newResidencySetWithDescriptor_error(&rsd).unwrap();
+        for a in [
+            ProtocolObject::from_ref(&*tex_11),
+            ProtocolObject::from_ref(&*tex_10),
+            ProtocolObject::from_ref(&*pb11),
+            ProtocolObject::from_ref(&*pb10),
+        ] {
+            rs.addAllocation(a);
+        }
+        rs.commit();
+
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxBufferBindCount(1);
+        atd.setMaxTextureBindCount(1);
+        let table = d.dev.newArgumentTableWithDescriptor_error(&atd).unwrap();
+
+        let q = d.dev.newMTL4CommandQueue().unwrap();
+        q.addResidencySet(&rs);
+        let alloc = d.dev.newCommandAllocator().unwrap();
+        let cmd = d.dev.newCommandBuffer().unwrap();
+        cmd.beginCommandBufferWithAllocator(&alloc);
+        let e = cmd.computeCommandEncoder().unwrap();
+        unsafe {
+            e.setComputePipelineState(kernel("port_clear_2d_f").unwrap());
+            table.setAddress_atIndex(pb11.gpuAddress(), 0);
+            table.setTexture_atIndex(tex_11.gpuResourceID(), 0);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(
+                MTLSize { width: 4, height: 4, depth: 1 },
+                MTLSize { width: 4, height: 4, depth: 1 },
+            );
+            table.setAddress_atIndex(pb10.gpuAddress(), 0);
+            table.setTexture_atIndex(tex_10.gpuResourceID(), 0);
+            e.setArgumentTable(Some(&table));
+            e.dispatchThreads_threadsPerThreadgroup(
+                MTLSize { width: 4, height: 4, depth: 1 },
+                MTLSize { width: 4, height: 4, depth: 1 },
+            );
+        }
+        e.endEncoding();
+        cmd.endCommandBuffer();
+        let ev = d.dev.newSharedEvent().unwrap();
+        let mut cbs = [std::ptr::NonNull::from(&*cmd)];
+        unsafe { q.commit_count(std::ptr::NonNull::new(cbs.as_mut_ptr()).unwrap(), 1) };
+        q.signalEvent_value(ProtocolObject::from_ref(&*ev), 1);
+        assert!(ev.waitUntilSignaledValue_timeoutMS(1, 5000));
+
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize { width: 4, height: 4, depth: 1 },
+        };
+        let mut px11 = [0u32; 16];
+        let mut px10 = [0u32; 16];
+        unsafe {
+            tex_11.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::new(px11.as_mut_ptr() as *mut _).unwrap(),
+                16,
+                region,
+                0,
+            );
+            tex_10.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::new(px10.as_mut_ptr() as *mut _).unwrap(),
+                16,
+                region,
+                0,
+            );
+        }
+        let expected_11 = r11 | (g11 << 11) | (b10 << 22);
+        let expected_10 = 1023u32 | (512 << 10) | (256 << 20) | (2 << 30);
+        assert!(px11.iter().all(|&p| p == expected_11), "RG11B10Float bits: got {:#x}, want {:#x}", px11[0], expected_11);
+        assert!(px10.iter().all(|&p| p == expected_10), "RGB10A2Unorm bits: got {:#x}, want {:#x}", px10[0], expected_10);
     }
 
     #[test]
