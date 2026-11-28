@@ -9582,3 +9582,207 @@ fn deferred_x87_cold_helper_preserves_pending_ymm_hi() {
         assert_eq!(f64_bits, (f32::from_bits(1) as f64).to_bits(), "x87 subnormal fld/fstp mismatch");
     }
 }
+
+/// Compile-time constant (`Chk::Abs`) misaligned accesses must emit inline exact-TSO
+/// (`ldr; dmb ishld` / `dmb ishst; str`) without `ldapr`/`stlr` traps or `SlowMem` stubs:
+/// - Under `lse2_trap=1`: provably 16-byte-granule-crossing constants emit inline exact-TSO
+///   (zero `SIGBUS` traps, zero LSE2 patch-slab use), while intra-16B-granule constants emit
+///   single-instruction `ldapr`/`stlr`.
+/// - Under `lse2_trap=0`: naturally aligned 2B/4B/8B constants emit `ldapr`/`stlr` with zero
+///   alignment check, while naturally misaligned constants emit inline exact-TSO with zero
+///   out-of-line `SlowMem` cold stubs.
+/// - Execution parity (Generic == FastOp == Live JIT == AOT) holds across loads, stores, and
+///   RMW instructions (`inc`/`add`) without any `SIGBUS` handler installed.
+#[test]
+fn inline_exact_tso_for_compile_time_misaligned_abs_accesses() {
+    struct ResetKnobs;
+    impl Drop for ResetKnobs {
+        fn drop(&mut self) {
+            jit::test_set_knobs(jit::TestKnobs::NONE);
+            jit::TEST_STACK_TSO.with(|c| c.set(None));
+            aot::test_uninstall();
+        }
+    }
+    let _guard = ResetKnobs;
+
+    let is_ldapr = |w: u32| (w & 0x3FFF_FC00) == 0x38BF_C000;
+    let is_stlr = |w: u32| (w & 0x3FFF_FC00) == 0x089F_FC00;
+    const DMB_ISHLD: u32 = 0xD503_39BF;
+    const DMB_ISHST: u32 = 0xD503_3ABF;
+
+    // Emit RIP-relative x86-64 sequences targeting `target_va` at runtime `code_va`.
+    let push_rel = |buf: &mut Vec<u8>, code_va: u64, prefix: &[u8], target_va: u64, tail: &[u8]| {
+        buf.extend_from_slice(prefix);
+        let next_rip = code_va + buf.len() as u64 + 4 + tail.len() as u64;
+        let disp = i32::try_from(target_va as i64 - next_rip as i64).expect("rip disp32");
+        buf.extend_from_slice(&disp.to_le_bytes());
+        buf.extend_from_slice(tail);
+    };
+
+    // Place code and 16-byte-aligned RW data close together in the test arena so disp32 fits.
+    const ARENA_SZ: usize = 0x1000;
+    const DATA_OFF: usize = 0x800; // 16-byte aligned relative to 64B-aligned base
+    let base_ptr = arena_alloc(ARENA_SZ, 64);
+    let base_va = base_ptr as u64;
+    let data_va = base_va + DATA_OFF as u64;
+    assert_eq!(data_va & 15, 0);
+
+    let stubs: jit::AotStubOffs = [0; 16];
+    let translate_hot_cold = |code_bytes: &[u8], lse2_trap: bool| -> (Vec<u32>, Vec<u32>) {
+        let code_ptr = base_ptr;
+        unsafe {
+            core::ptr::copy_nonoverlapping(code_bytes.as_ptr(), code_ptr, code_bytes.len());
+            core::ptr::write_bytes(code_ptr.add(code_bytes.len()), 0xCC, 16);
+        }
+        jit::test_set_knobs(jit::TestKnobs {
+            memchk: Some(15),
+            lse2_trap: Some(lse2_trap),
+            ..jit::TestKnobs::NONE
+        });
+        let mut bc = Box::new(BlockCache::new());
+        let mut scratch = Vec::new();
+        let mut tr_scratch = jit::TrScratch::new();
+        let t = unsafe {
+            jit::aot_translate(
+                &mut *bc,
+                base_va,
+                0x2000_0000_1000,
+                0x2000_0000_0000,
+                &stubs,
+                &mut scratch,
+                &mut tr_scratch,
+            )
+        }
+        .expect("aot_translate");
+        let main = t.main as usize;
+        (t.words[..main].to_vec(), t.words[main..].to_vec())
+    };
+
+    // (label, width_bytes, data_offset, expect_inline_lse2_on, expect_inline_lse2_off)
+    let cases: &[(&str, usize, usize, bool, bool)] = &[
+        ("2B crossing 16B (+0x0F)", 2, 0x0F, true, true),
+        ("4B crossing 16B (+0x0E)", 4, 0x0E, true, true),
+        ("4B crossing 16B (+0x0D)", 4, 0x0D, true, true),
+        ("8B crossing 16B (+0x0C)", 8, 0x0C, true, true),
+        ("8B crossing 16B (+0x09)", 8, 0x09, true, true),
+        ("4B intra-16B unaligned (+0x02)", 4, 0x22, false, true),
+        ("8B intra-16B unaligned (+0x04)", 8, 0x34, false, true),
+        ("2B naturally aligned (+0x02)", 2, 0x42, false, false),
+        ("4B naturally aligned (+0x04)", 4, 0x54, false, false),
+        ("8B naturally aligned (+0x00)", 8, 0x60, false, false),
+    ];
+
+    for &(label, bytes, off, expect_inline_on, expect_inline_off) in cases {
+        let tgt = data_va + off as u64;
+        // Build a single basic block exercising load, immediate/reg store, and RMW at `tgt`.
+        let mut code = Vec::new();
+        match bytes {
+            2 => {
+                // mov ax, word ptr [rip+disp] ; add ax, 7 ; mov word ptr [rip+disp], ax ; add word ptr [rip+disp], 3 ; ret
+                push_rel(&mut code, base_va, &[0x66, 0x8B, 0x05], tgt, &[]);
+                code.extend_from_slice(&[0x66, 0x83, 0xC0, 0x07]);
+                push_rel(&mut code, base_va, &[0x66, 0x89, 0x05], tgt, &[]);
+                push_rel(&mut code, base_va, &[0x66, 0x83, 0x05], tgt, &[0x03]);
+            }
+            4 => {
+                // mov eax, dword ptr [rip+disp] ; mov dword ptr [rip+disp], 0xDEADBEEF ; inc dword ptr [rip+disp] ; ret
+                push_rel(&mut code, base_va, &[0x8B, 0x05], tgt, &[]);
+                push_rel(&mut code, base_va, &[0xC7, 0x05], tgt, &0xDEAD_BEEFu32.to_le_bytes());
+                push_rel(&mut code, base_va, &[0xFF, 0x05], tgt, &[]);
+            }
+            8 => {
+                // mov rax, qword ptr [rip+disp] ; add rax, 5 ; mov qword ptr [rip+disp], rax ; add qword ptr [rip+disp], rax ; ret
+                push_rel(&mut code, base_va, &[0x48, 0x8B, 0x05], tgt, &[]);
+                code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x05]);
+                push_rel(&mut code, base_va, &[0x48, 0x89, 0x05], tgt, &[]);
+                push_rel(&mut code, base_va, &[0x48, 0x01, 0x05], tgt, &[]);
+            }
+            _ => unreachable!(),
+        }
+        code.push(0xC3); // ret
+
+        // 1. Verify emitted ARM64 instruction sequences for both lse2_trap=true and lse2_trap=false.
+        for (lse2_on, expect_inline) in [(true, expect_inline_on), (false, expect_inline_off)] {
+            let (hot, cold) = translate_hot_cold(&code, lse2_on);
+            // Neither mode should emit any out-of-line SlowMem dmb stubs for Chk::Abs.
+            assert!(
+                !cold.iter().any(|&w| w == DMB_ISHLD || w == DMB_ISHST),
+                "{label} (lse2={lse2_on}): unexpected out-of-line SlowMem stub in cold code"
+            );
+            if expect_inline {
+                assert!(
+                    !hot.iter().any(|&w| is_ldapr(w) || is_stlr(w)),
+                    "{label} (lse2={lse2_on}): must not emit trapping ldapr/stlr"
+                );
+                assert!(
+                    hot.iter().any(|&w| w == DMB_ISHLD),
+                    "{label} (lse2={lse2_on}): expected inline dmb ishld for misaligned load"
+                );
+                assert!(
+                    hot.iter().any(|&w| w == DMB_ISHST),
+                    "{label} (lse2={lse2_on}): expected inline dmb ishst for misaligned store/RMW"
+                );
+            } else {
+                assert!(
+                    hot.iter().any(|&w| is_ldapr(w)),
+                    "{label} (lse2={lse2_on}): expected single-insn ldapr"
+                );
+                assert!(
+                    hot.iter().any(|&w| is_stlr(w)),
+                    "{label} (lse2={lse2_on}): expected single-insn stlr"
+                );
+                assert!(
+                    !hot.iter().any(|&w| w == DMB_ISHLD || w == DMB_ISHST),
+                    "{label} (lse2={lse2_on}): unexpected dmb barrier when ldapr/stlr is safe"
+                );
+            }
+        }
+
+        // 2. Verify live execution parity across Interpreter, Live JIT (lse2=0 & 1), and AOT
+        // without any SIGBUS handler installed (proving zero hardware alignment traps).
+        let init = vec![0xA5u8; 0x100];
+        let run_at = |mode: u8, lse2_on: bool, use_aot: bool| -> (u64, Vec<u8>) {
+            unsafe {
+                core::ptr::copy_nonoverlapping(code.as_ptr(), base_ptr, code.len());
+                core::ptr::write_bytes(base_ptr.add(code.len()), 0xCC, 16);
+                jit::test_set_knobs(jit::TestKnobs {
+                    memchk: Some(15),
+                    lse2_trap: Some(lse2_on),
+                    ..jit::TestKnobs::NONE
+                });
+                if use_aot {
+                    aot::test_uninstall();
+                    let (live, _, _) = aot::test_install(&[base_va], || {});
+                    assert_eq!(live, 1, "{label}: AOT install failed");
+                }
+                let res = run_mode(base_ptr, base_ptr.add(DATA_OFF), &init, mode);
+                if use_aot {
+                    aot::test_uninstall();
+                }
+                res
+            }
+        };
+
+        let interp = run_at(2, false, false);
+        let jit_off = run_at(1, false, false);
+        let jit_on = run_at(1, true, false);
+        let aot_on = run_at(1, true, true);
+        assert_eq!(jit_off, interp, "{label}: Live JIT (lse2=0) != interpreter");
+        assert_eq!(jit_on, interp, "{label}: Live JIT (lse2=1) != interpreter");
+        assert_eq!(aot_on, interp, "{label}: AOT (lse2=1) != interpreter");
+    }
+
+    // 3. Verify `store_checked_addr` respects `Chk::Stack` (`PORT_JIT_STACK_TSO=0`):
+    // `add dword ptr [rsp + 8], 1; ret` must use plain `ldr`/`str` when stack TSO is off
+    // and `ldapr`/`stlr` when stack TSO is on.
+    let stack_rmw: &[u8] = &[0x83, 0x44, 0x24, 0x08, 0x01, 0xC3];
+    for stack_tso_on in [false, true] {
+        jit::TEST_STACK_TSO.with(|c| c.set(Some(stack_tso_on)));
+        let (hot, _) = translate_hot_cold(stack_rmw, true);
+        let has_tso_st = hot.iter().any(|&w| is_stlr(w));
+        assert_eq!(
+            has_tso_st, stack_tso_on,
+            "stack RMW store_checked_addr (stack_tso={stack_tso_on}): expected stlr={stack_tso_on}"
+        );
+    }
+}

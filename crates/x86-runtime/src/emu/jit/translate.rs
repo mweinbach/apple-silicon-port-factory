@@ -146,9 +146,10 @@ pub(super) enum Chk {
     /// stores (never expected) are treated like `Align`.
     Ro,
     /// Translation-time constant address (absolute / rip-relative operand) inside
-    /// `[0x10000, 2^47)` (`AW2_JIT_MEMCHK` bit 1): no range check; `true` = 8-byte aligned,
-    /// so no alignment check either (otherwise like `Align`).
-    Abs(bool),
+    /// `[0x10000, 2^47)` (`AW2_JIT_MEMCHK` bit 1): no range check; carries the low 4 bits
+    /// (`addr & 15`) so natural alignment (`& (bytes - 1)`) and 16-byte granule crossing
+    /// (`align16 + bytes > 16`) are resolved statically at translation time.
+    Abs(u8),
 }
 
 #[cfg(test)]
@@ -2362,7 +2363,7 @@ impl Tr<'_> {
         {
             // Constant address known valid at translation time (out-of-range constants keep
             // the run-time check, which always side-exits).
-            Chk::Abs(op.disp & 7 == 0)
+            Chk::Abs((op.disp as u64 & 15) as u8)
         } else {
             Chk::Full
         }
@@ -2581,6 +2582,7 @@ impl Tr<'_> {
         let mut exit = None;
         let mut slow_lo = 0;
         let amask = (bits / 8 - 1) as u64;
+        let mut inline_unaligned_tso = false;
         match chk {
             Chk::Full if hw_range_enabled() => {
                 if bits > 8 && tso && !lse2 {
@@ -2627,15 +2629,39 @@ impl Tr<'_> {
                     self.grp_ok |= 1u64 << id;
                 }
             }
-            Chk::Abs(true) => {}
-            Chk::Align | Chk::Stack | Chk::Ro | Chk::Abs(false) => {
+            Chk::Abs(align16) => {
+                if bits > 8 && tso {
+                    let bytes = (bits / 8) as u8;
+                    if lse2 {
+                        // Under FEAT_LSE2, `ldapr`/`stlr` only SIGBUS when crossing a 16-byte
+                        // granule. Emit inline exact-TSO `ldr+dmb` / `dmb+str` for provably
+                        // crossing constants instead of trapping and consuming an LSE2 slab slot.
+                        if align16 + bytes > 16 {
+                            inline_unaligned_tso = true;
+                        }
+                    } else if (align16 & (bytes - 1)) != 0 {
+                        // Without FEAT_LSE2 trap recovery, emit inline exact-TSO for any provably
+                        // misaligned constant instead of a dead runtime branch + SlowMem stub.
+                        inline_unaligned_tso = true;
+                    }
+                }
+            }
+            Chk::Align | Chk::Stack | Chk::Ro => {
                 if bits > 8 && tso && !lse2 {
                     self.a.logic_ri(true, 0, XS, a, enc_logic_imm(amask, true).unwrap());
                     fix = Some(self.a.cbnz(true, XS));
                 }
             }
         }
-        if tso {
+        if inline_unaligned_tso {
+            if ld {
+                self.a.ldr(bits, reg, a, 0);
+                self.a.dmb_ishld();
+            } else {
+                self.a.dmb_ishst();
+                self.a.str(bits, reg, a, 0);
+            }
+        } else if tso {
             if ld {
                 self.a.ldapr(bits, reg, a);
             } else {
@@ -2652,20 +2678,14 @@ impl Tr<'_> {
         }
     }
 
-    /// Store with only an alignment check (address already range-checked in this op).
+    /// Store to op `k`'s already range-checked memory operand, preserving static alignment
+    /// (`Chk::Abs`) and stack TSO classification (`Chk::Stack`) while omitting any range check.
     pub(super) fn store_checked_addr(&mut self, k: usize, src: u32, a: u32, bits: u32) {
-        let tso = self.scalar_tso(k, Chk::Align, false);
-        if tso && bits > 8 && !lse2_trap_enabled() {
-            self.a.logic_ri(true, 0, XS, a, enc_logic_imm((bits / 8 - 1) as u64, true).unwrap());
-            let f = self.a.cbnz(true, XS);
-            self.a.stlr(bits, src, a);
-            let back = self.a.pos;
-            self.slow.push(SlowMem { fix: f, back, ld: false, reg: src, addr: a, bits, exit: None, lo: 0 });
-        } else if tso {
-            self.a.stlr(bits, src, a);
-        } else {
-            self.a.str(bits, src, a, 0);
-        }
+        let chk = match Self::chk_of(&self.ops[k]) {
+            Chk::Full => Chk::Align,
+            c => c,
+        };
+        self.mem_access(k, false, src, a, bits, chk);
     }
 
     // --- flags ---

@@ -555,6 +555,72 @@ fn mtl_tex_id(t: &MtlTexture) -> u64 {
     unsafe { std::mem::transmute::<MTLResourceID, u64>(t.gpuResourceID()) }
 }
 
+/// Maximum texel count of a Metal `MTLTextureTypeTextureBuffer` on Apple Silicon
+/// (Metal Feature Set Tables: 256M texels = `2^28`).
+///
+/// Direct3D 12 guarantees `D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP = 27`
+/// (`2^27 = 134,217,728`), so Apple Silicon already covers 2x the D3D12 spec minimum,
+/// while passing `width > MAX_TEXTURE_BUFFER_WIDTH` hard-aborts inside
+/// `-[MTLTextureDescriptorInternal validateWithDevice:]`.
+pub const MAX_TEXTURE_BUFFER_WIDTH: u64 = 1 << 28;
+
+/// True when `fmt` is accepted by Apple Silicon Metal 4 for `MTLTextureTypeTextureBuffer`
+/// with the requested write access (including under `MTL_DEBUG_LAYER=1`).
+pub fn is_texture_buffer_format_supported(dev: &super::Device, fmt: MTLPixelFormat, writable: bool) -> bool {
+    use MTLPixelFormat as P;
+    match fmt {
+        // Standard 1/2/4-channel linear integer, normalized, and float formats:
+        // supported for both read-only and read-write texture buffers on Apple Silicon.
+        P::A8Unorm
+        | P::R8Unorm
+        | P::R8Snorm
+        | P::R8Uint
+        | P::R8Sint
+        | P::R16Unorm
+        | P::R16Snorm
+        | P::R16Uint
+        | P::R16Sint
+        | P::R16Float
+        | P::RG8Unorm
+        | P::RG8Snorm
+        | P::RG8Uint
+        | P::RG8Sint
+        | P::R32Uint
+        | P::R32Sint
+        | P::R32Float
+        | P::RG16Unorm
+        | P::RG16Snorm
+        | P::RG16Uint
+        | P::RG16Sint
+        | P::RG16Float
+        | P::RGBA8Unorm
+        | P::RGBA8Snorm
+        | P::RGBA8Uint
+        | P::RGBA8Sint
+        | P::RGB10A2Unorm
+        | P::RGB10A2Uint
+        | P::RG11B10Float
+        | P::RG32Uint
+        | P::RG32Sint
+        | P::RG32Float
+        | P::RGBA16Unorm
+        | P::RGBA16Snorm
+        | P::RGBA16Uint
+        | P::RGBA16Sint
+        | P::RGBA16Float
+        | P::RGBA32Uint
+        | P::RGBA32Sint
+        | P::RGBA32Float => true,
+        // BGRA8Unorm texture buffers are read-only in Metal (shader write fails validation).
+        P::BGRA8Unorm => !writable,
+        // Metal 4.1 (Apple10+): read-only 3-channel RGB32 texture buffers.
+        P(120) | P(121) | P(122) => !writable && dev.supports_rgb32_texture_buffer(),
+        // Compressed (BC*), depth/stencil, sRGB, packed 16-bit RGB565/BGR5A1, RGB9E5Float,
+        // and Invalid cannot be used with MTLTextureTypeTextureBuffer.
+        _ => false,
+    }
+}
+
 /// Key of a cached texture-buffer view of a buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct BufferViewKey {
@@ -562,6 +628,7 @@ struct BufferViewKey {
     offset: u64,
     elements: u64,
     writable: bool,
+    swizzle: u32,
 }
 
 /// 16-bit DXIL `@dx.op.annotateHandle` / D3D12 resource handle-kind bitmask (`g50_A`).
@@ -1329,25 +1396,36 @@ impl Resource {
     /// elements of `fmt` starting at byte `offset` (which must satisfy the
     /// device's texture-buffer alignment).
     pub fn buffer_texture_view(&self, fmt: MTLPixelFormat, offset: u64, elements: u64, writable: bool) -> Option<Retained<MtlTexture>> {
+        self.buffer_texture_view_swizzled(fmt, offset, elements, writable, SWIZZLE_IDENTITY)
+    }
+
+    /// [`Self::buffer_texture_view`] with a packed `MTLTextureSwizzle` (r,g,b,a bytes;
+    /// must be [`SWIZZLE_IDENTITY`] when `writable` is true).
+    pub fn buffer_texture_view_swizzled(
+        &self,
+        fmt: MTLPixelFormat,
+        offset: u64,
+        elements: u64,
+        writable: bool,
+        swizzle: u32,
+    ) -> Option<Retained<MtlTexture>> {
         self.view_epoch.fetch_min(super::queue::submit_epoch(), Ordering::Relaxed);
+        let dev = super::device()?;
         let b = self.buffer()?;
-        let key = BufferViewKey { format: fmt.0, offset, elements, writable };
+        let key = BufferViewKey { format: fmt.0, offset, elements, writable, swizzle };
         let mut v = self.buffer_views.lock().unwrap();
         if let Some(x) = v.get(&key) {
             return Some(x.clone());
         }
-        let td = unsafe { MTLTextureDescriptor::textureBufferDescriptorWithPixelFormat_width_resourceOptions_usage(
-            fmt,
-            elements.max(1) as usize,
-            b.resourceOptions(),
-            if writable {
-                MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite | MTLTextureUsage::PixelFormatView
-            } else {
-                MTLTextureUsage::ShaderRead
-            },
-        ) };
-        let bpe = texture_buffer_bpe(fmt);
-        let t = b.newTextureWithDescriptor_offset_bytesPerRow(&td, offset as usize, (elements.max(1) * bpe) as usize)?;
+        let bytes_per_row = match validate_buffer_texture_view_args(dev, b, fmt, offset, elements, writable, swizzle) {
+            Ok(bpr) => bpr,
+            Err(e) => {
+                log::warn!(target: "d3d", "buffer_texture_view rejected: {e}");
+                return None;
+            }
+        };
+        let td = make_buffer_texture_descriptor(b, fmt, elements, writable, swizzle);
+        let t = b.newTextureWithDescriptor_offset_bytesPerRow(&td, offset as usize, bytes_per_row as usize)?;
         let rk = self.registered_key.load(Ordering::Relaxed);
         if rk != 0 {
             res_registry().write().unwrap().insert_tex_id(mtl_tex_id(&t), rk);
@@ -1438,9 +1516,23 @@ impl Resource {
     /// counter texture-buffer view, backed by Metal 4 [`super::view_pool`] when
     /// enabled (falling back to [`Self::buffer_texture_view`]).
     pub fn buffer_texture_view_id(&self, fmt: MTLPixelFormat, offset: u64, elements: u64, writable: bool) -> Option<u64> {
+        self.buffer_texture_view_id_swizzled(fmt, offset, elements, writable, SWIZZLE_IDENTITY)
+    }
+
+    /// [`Self::buffer_texture_view_id`] with a packed `MTLTextureSwizzle` (r,g,b,a bytes;
+    /// must be [`SWIZZLE_IDENTITY`] when `writable` is true).
+    pub fn buffer_texture_view_id_swizzled(
+        &self,
+        fmt: MTLPixelFormat,
+        offset: u64,
+        elements: u64,
+        writable: bool,
+        swizzle: u32,
+    ) -> Option<u64> {
         self.view_epoch.fetch_min(super::queue::submit_epoch(), Ordering::Relaxed);
+        let dev = super::device()?;
         let b = self.buffer()?;
-        let key = BufferViewKey { format: fmt.0, offset, elements, writable };
+        let key = BufferViewKey { format: fmt.0, offset, elements, writable, swizzle };
         if let Some(existing) = self.buffer_views.lock().unwrap().get(&key) {
             return Some(mtl_tex_id(existing));
         }
@@ -1449,19 +1541,15 @@ impl Resource {
             if let Some(pv) = pbv_map.get(&key) {
                 return Some(pv.id);
             }
+            let bytes_per_row = match validate_buffer_texture_view_args(dev, b, fmt, offset, elements, writable, swizzle) {
+                Ok(bpr) => bpr,
+                Err(e) => {
+                    log::warn!(target: "d3d", "buffer_texture_view_id rejected: {e}");
+                    return None;
+                }
+            };
             if super::view_pool::enabled() {
-                let td = unsafe { MTLTextureDescriptor::textureBufferDescriptorWithPixelFormat_width_resourceOptions_usage(
-                    fmt,
-                    elements.max(1) as usize,
-                    b.resourceOptions(),
-                    if writable {
-                        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite | MTLTextureUsage::PixelFormatView
-                    } else {
-                        MTLTextureUsage::ShaderRead
-                    },
-                ) };
-                let bpe = texture_buffer_bpe(fmt);
-                let bytes_per_row = elements.max(1) * bpe;
+                let td = make_buffer_texture_descriptor(b, fmt, elements, writable, swizzle);
                 if let Some(pv) = super::view_pool::create_buffer_texture_view(b, &td, offset, bytes_per_row) {
                     let rk = self.registered_key.load(Ordering::Relaxed);
                     if rk != 0 {
@@ -1472,8 +1560,84 @@ impl Resource {
                 }
             }
         }
-        self.buffer_texture_view(fmt, offset, elements, writable).map(|v| mtl_tex_id(&v))
+        self.buffer_texture_view_swizzled(fmt, offset, elements, writable, swizzle).map(|v| mtl_tex_id(&v))
     }
+}
+
+/// Validates every Metal precondition for creating a `MTLTextureTypeTextureBuffer` view
+/// (either pooled via `MTLTextureViewPool` or direct via `newTextureWithDescriptor:offset:bytesPerRow:`)
+/// before constructing an `MTLTextureDescriptor`, preventing fatal `SIGABRT` assertions
+/// inside `-[MTLTextureDescriptorInternal validateWithDevice:]` and `MTLDebugBuffer`.
+///
+/// Returns the required `bytesPerRow` (`elements * bpe`) on success.
+fn validate_buffer_texture_view_args(
+    dev: &super::Device,
+    b: &MtlBuffer,
+    fmt: MTLPixelFormat,
+    offset: u64,
+    elements: u64,
+    writable: bool,
+    swizzle: u32,
+) -> Result<u64, String> {
+    if !is_texture_buffer_format_supported(dev, fmt, writable) {
+        return Err(format!("unsupported texture-buffer format {fmt:?} (writable={writable})"));
+    }
+    if writable && swizzle != SWIZZLE_IDENTITY {
+        return Err(format!("writable texture-buffer view cannot carry non-identity swizzle {swizzle:#x}"));
+    }
+    if elements == 0 || elements > MAX_TEXTURE_BUFFER_WIDTH {
+        return Err(format!(
+            "texture-buffer width {elements} outside valid range 1..={MAX_TEXTURE_BUFFER_WIDTH}"
+        ));
+    }
+    let bpe = texture_buffer_bpe(fmt);
+    if bpe == 0 {
+        return Err(format!("unknown texel byte size for texture-buffer format {fmt:?}"));
+    }
+    let bytes_per_row = elements
+        .checked_mul(bpe)
+        .ok_or_else(|| format!("texture-buffer bytesPerRow overflow ({elements} * {bpe})"))?;
+    let align = dev.dev.minimumTextureBufferAlignmentForPixelFormat(fmt).max(1) as u64;
+    if offset % align != 0 {
+        return Err(format!(
+            "texture-buffer offset {offset} not aligned to {align} for {fmt:?}"
+        ));
+    }
+    let buf_len = b.length() as u64;
+    let end = offset
+        .checked_add(bytes_per_row)
+        .ok_or_else(|| format!("texture-buffer end overflow ({offset} + {bytes_per_row})"))?;
+    if end > buf_len {
+        return Err(format!(
+            "texture-buffer span [{offset}, {end}) exceeds MTLBuffer length {buf_len}"
+        ));
+    }
+    Ok(bytes_per_row)
+}
+
+fn make_buffer_texture_descriptor(
+    b: &MtlBuffer,
+    fmt: MTLPixelFormat,
+    elements: u64,
+    writable: bool,
+    swizzle: u32,
+) -> Retained<MTLTextureDescriptor> {
+    let td = unsafe {
+        MTLTextureDescriptor::textureBufferDescriptorWithPixelFormat_width_resourceOptions_usage(
+            fmt,
+            elements as usize,
+            b.resourceOptions(),
+            if writable {
+                MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite | MTLTextureUsage::PixelFormatView
+            } else {
+                MTLTextureUsage::ShaderRead
+            },
+        )
+    };
+    if swizzle != SWIZZLE_IDENTITY {
+        td.setSwizzle(unpack_swizzle(swizzle));
+    }
+    td
 }
 
 /// Resolves a Direct3D resource-relative `ResourceMinLODClamp` / `SetResourceMinLOD`
@@ -1491,11 +1655,14 @@ pub(crate) fn resolve_view_min_lod(mips: (u32, u32), min_lod: f32) -> f32 {
 }
 
 fn texture_buffer_bpe(fmt: MTLPixelFormat) -> u64 {
+    if fmt == MTLPixelFormat::Invalid {
+        return 0;
+    }
     match fmt.0 {
         120 | 121 | 122 => 12u64, // Metal 4.1 Apple10+ MTLPixelFormatRGB32{Uint,Sint,Float}
         95..=99 => 6u64,          // Metal 4.1 Apple10+ MTLPixelFormatRGB16*
         45..=48 => 3u64,          // Metal 4.1 Apple10+ MTLPixelFormatRGB8*
-        _ => crate::format::TABLE.iter().find(|f| f.mtl == fmt).map(|f| f.bytes).unwrap_or(4) as u64,
+        _ => crate::format::TABLE.iter().find(|f| f.mtl == fmt).map(|f| f.bytes).unwrap_or(0) as u64,
     }
 }
 
