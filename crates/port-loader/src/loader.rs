@@ -12,6 +12,45 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
 pub const PAGE: usize = 0x1000;
+const ERROR_BAD_EXE_FORMAT: u32 = 193;
+
+/// Marker error for explicit PE loads that failed image format validation
+/// (corrupt/non-PE file), mapped to Win32 `ERROR_BAD_EXE_FORMAT` (193).
+#[derive(Debug)]
+struct BadExeFormatError(String);
+
+impl std::fmt::Display for BadExeFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BadExeFormatError {}
+
+fn parse_pe_for_load<'a>(data: &'a [u8], path: &Path) -> Result<Pe<'a>> {
+    Pe::parse(data).map_err(|e| {
+        if pe_image::wrong_arch_error(&e).is_some() {
+            e.context(format!("parsing {}", path.display()))
+        } else {
+            anyhow::Error::new(BadExeFormatError(format!(
+                "parsing {}: {e:#}",
+                path.display()
+            )))
+        }
+    })
+}
+
+fn load_error_to_win32(err: &anyhow::Error) -> u32 {
+    if pe_image::wrong_arch_error(err).is_some()
+        || err
+            .chain()
+            .any(|cause| cause.downcast_ref::<BadExeFormatError>().is_some())
+    {
+        ERROR_BAD_EXE_FORMAT
+    } else {
+        w::types::err::ERROR_MOD_NOT_FOUND
+    }
+}
 
 /// Static TLS of one module.
 pub struct Tls {
@@ -237,11 +276,15 @@ pub(crate) fn peek_pe_preferred_window(path: &Path) -> Option<(usize, usize, boo
     if lfanew.checked_add(24 + 64)? > n || &buf[lfanew..lfanew + 4] != b"PE\0\0" {
         return None;
     }
+    let machine = u16::from_le_bytes(buf[lfanew + 4..lfanew + 6].try_into().ok()?);
+    if machine != IMAGE_FILE_MACHINE_AMD64 {
+        return None;
+    }
     let characteristics = u16::from_le_bytes(buf[lfanew + 22..lfanew + 24].try_into().ok()?);
     let is_dll = (characteristics & 0x2000) != 0;
     let opt = lfanew + 24;
     let magic = u16::from_le_bytes(buf[opt..opt + 2].try_into().ok()?);
-    if magic != 0x20B {
+    if magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
         return None;
     }
     let image_base = u64::from_le_bytes(buf[opt + 24..opt + 32].try_into().ok()?) as usize;
@@ -310,6 +353,142 @@ fn find_in_dir_ci(dir: &Path, base_name: &str) -> Option<PathBuf> {
         let n = n.to_str()?;
         (n.eq_ignore_ascii_case(base_name) && e.path().is_file()).then(|| e.path())
     })
+}
+
+/// Filter a bare-name DLL search-path candidate against the 64-bit AMD64 PE32+
+/// architecture requirement.
+///
+/// Mirrors Windows' 64-bit loader (`LdrpMapDllSearchPath`): when a search-path
+/// directory contains a wrong-architecture PE (PE32 `0x10b`, ROM `0x107`, or a
+/// non-AMD64 `Machine`), log it clearly and return `None` so the caller continues
+/// down the remaining DLL search order (and ultimately System32 / builtins).
+fn accept_search_candidate(
+    norm: &str,
+    candidate: PathBuf,
+    skipped: &mut Vec<PathBuf>,
+) -> Option<PathBuf> {
+    let canon = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+    if skipped.iter().any(|p| p == &canon) {
+        return None;
+    }
+    match pe_image::probe_pe_arch_file(&candidate) {
+        Ok(pe_image::PeArchProbe::Amd64Pe32Plus) | Ok(pe_image::PeArchProbe::NotPe) => {
+            Some(candidate)
+        }
+        Ok(pe_image::PeArchProbe::WrongArch(err)) => {
+            log::warn!(
+                "{norm}: skipping wrong-architecture PE candidate {} ({err}); continuing DLL search order",
+                candidate.display()
+            );
+            skipped.push(canon);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+const PREWARM_SKIPPED_DIR_NAMES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "shadercache",
+    "shader_cache",
+    "aotcache",
+    "aot_cache",
+    "crashdumps",
+    "logs",
+    "savegames",
+    "saves",
+];
+
+fn warn_non_pe32_plus_file(
+    p: &Path,
+    root_canon: &Path,
+    primary_canon: Option<&Path>,
+    warned: &mut std::collections::HashSet<PathBuf>,
+) {
+    let Ok(canon) = std::fs::canonicalize(p) else {
+        return;
+    };
+    if !canon.starts_with(root_canon) || !canon.is_file() {
+        return;
+    }
+    if primary_canon.is_some_and(|pe| pe == canon.as_path()) {
+        return;
+    }
+    match pe_image::probe_pe_arch_file(&canon) {
+        Ok(pe_image::PeArchProbe::Amd64Pe32Plus) => {}
+        Ok(pe_image::PeArchProbe::WrongArch(err)) => {
+            if warned.insert(canon) {
+                log::warn!("prewarm: skipping non-PE32+ file {} ({err})", p.display());
+            }
+        }
+        Ok(pe_image::PeArchProbe::NotPe) => {
+            if warned.insert(canon) {
+                log::warn!(
+                    "prewarm: skipping non-PE32+ file {} (not a valid PE image)",
+                    p.display()
+                );
+            }
+        }
+        Err(err) => {
+            if warned.insert(canon) {
+                log::warn!("prewarm: skipping unreadable file {} ({err})", p.display());
+            }
+        }
+    }
+}
+
+fn warn_non_pe32_plus_dir(
+    dir: &Path,
+    root_canon: &Path,
+    primary_canon: Option<&Path>,
+    depth: usize,
+    visited_dirs: &mut std::collections::HashSet<PathBuf>,
+    warned: &mut std::collections::HashSet<PathBuf>,
+) {
+    const MAX_DEPTH: usize = 12;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let p = entry.path();
+        if ft.is_symlink() {
+            if port_manifest::has_plugin_extension(&p) {
+                warn_non_pe32_plus_file(&p, root_canon, primary_canon, warned);
+            }
+            continue;
+        }
+        if ft.is_dir() {
+            if depth >= MAX_DEPTH {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if PREWARM_SKIPPED_DIR_NAMES
+                    .iter()
+                    .any(|skip| name.eq_ignore_ascii_case(skip))
+                {
+                    continue;
+                }
+            }
+            let Ok(canon) = std::fs::canonicalize(&p) else {
+                continue;
+            };
+            if canon.starts_with(root_canon) && visited_dirs.insert(canon) {
+                warn_non_pe32_plus_dir(&p, root_canon, primary_canon, depth + 1, visited_dirs, warned);
+            }
+            continue;
+        }
+        if ft.is_file() && port_manifest::has_plugin_extension(&p) {
+            warn_non_pe32_plus_file(&p, root_canon, primary_canon, warned);
+        }
+    }
 }
 
 fn parse_search_path_dirs(search_path: &str) -> Vec<PathBuf> {
@@ -393,11 +572,6 @@ impl Loader {
         self.modules.read().unwrap().iter().find(|m| m.base == base).cloned()
     }
 
-    /// Case-insensitive lookup of a file in the game directory.
-    fn find_in_game_dir(&self, base_name: &str) -> Option<PathBuf> {
-        find_in_dir_ci(&self.game_dir, base_name)
-    }
-
     /// Resolve a relative path component-by-component case-insensitively under `base_dir`.
     fn find_rel_in_dir(base_dir: &Path, rel: &str) -> Option<PathBuf> {
         let mut cur = base_dir.to_path_buf();
@@ -448,6 +622,9 @@ impl Loader {
     /// `SetDefaultDllDirectories`, `AddDllDirectory`, `SetDllDirectoryW/A`, and
     /// `LdrLoadDll` `PathToFile` hints.
     ///
+    /// Wrong-architecture PE candidates (PE32 `0x10b` or non-AMD64 `Machine`) are
+    /// logged and skipped so search continues down the remaining search order.
+    ///
     /// Returns `(guest_pe_path, allow_system32_builtins)`.
     fn search_bare_guest_pe(
         &self,
@@ -457,9 +634,15 @@ impl Loader {
     ) -> (Option<PathBuf>, bool) {
         use w::kernel32::module::*;
 
+        let mut skipped = Vec::new();
+        let mut find_valid = |dir: &Path| -> Option<PathBuf> {
+            let p = find_in_dir_ci(dir, norm)?;
+            accept_search_candidate(norm, p, &mut skipped)
+        };
+
         // 0. Explicit `LdrLoadDll` `PathToFile` directories take highest priority.
         for dir in &opts.extra_search_dirs {
-            if let Some(p) = find_in_dir_ci(dir, norm) {
+            if let Some(p) = find_valid(dir) {
                 return (Some(p), true);
             }
         }
@@ -481,13 +664,13 @@ impl Loader {
             }
             if (mask & LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR != 0) || opts.prewarm {
                 if let Some(ref d) = opts.dll_load_dir {
-                    if let Some(p) = find_in_dir_ci(d, norm) {
+                    if let Some(p) = find_valid(d) {
                         return (Some(p), (mask & LOAD_LIBRARY_SEARCH_SYSTEM32) != 0);
                     }
                 }
             }
             if mask & LOAD_LIBRARY_SEARCH_APPLICATION_DIR != 0 {
-                if let Some(p) = self.find_in_game_dir(norm) {
+                if let Some(p) = find_valid(&self.game_dir) {
                     return (Some(p), (mask & LOAD_LIBRARY_SEARCH_SYSTEM32) != 0);
                 }
             }
@@ -495,14 +678,14 @@ impl Loader {
                 // Search AddDllDirectory entries (most recently added first), then legacy SetDllDirectory.
                 for win_dir in cfg.added_dirs.iter().rev() {
                     if let Some(host_dir) = w::path::to_host(win_dir) {
-                        if let Some(p) = find_in_dir_ci(&host_dir, norm) {
+                        if let Some(p) = find_valid(&host_dir) {
                             return (Some(p), (mask & LOAD_LIBRARY_SEARCH_SYSTEM32) != 0);
                         }
                     }
                 }
                 if let Some(Some(ref legacy_dir)) = cfg.legacy_dll_dir {
                     if let Some(host_dir) = w::path::to_host(legacy_dir) {
-                        if let Some(p) = find_in_dir_ci(&host_dir, norm) {
+                        if let Some(p) = find_valid(&host_dir) {
                             return (Some(p), (mask & LOAD_LIBRARY_SEARCH_SYSTEM32) != 0);
                         }
                     }
@@ -511,7 +694,7 @@ impl Loader {
             let allow_sys32 = (mask & LOAD_LIBRARY_SEARCH_SYSTEM32) != 0;
             if allow_sys32 && w::find_builtin(norm).is_none() {
                 if let Some(sys32) = w::path::to_host("C:\\Windows\\System32") {
-                    if let Some(p) = find_in_dir_ci(&sys32, norm) {
+                    if let Some(p) = find_valid(&sys32) {
                         return (Some(p), true);
                     }
                 }
@@ -522,14 +705,14 @@ impl Loader {
         if opts.flags & LOAD_WITH_ALTERED_SEARCH_PATH != 0 {
             // Altered search path: DLL's own directory replaces the application directory.
             if let Some(ref d) = opts.dll_load_dir {
-                if let Some(p) = find_in_dir_ci(d, norm) {
+                if let Some(p) = find_valid(d) {
                     return (Some(p), true);
                 }
             }
             match &cfg.legacy_dll_dir {
                 Some(Some(legacy_dir)) => {
                     if let Some(host_dir) = w::path::to_host(legacy_dir) {
-                        if let Some(p) = find_in_dir_ci(&host_dir, norm) {
+                        if let Some(p) = find_valid(&host_dir) {
                             return (Some(p), true);
                         }
                     }
@@ -539,7 +722,7 @@ impl Loader {
                 }
                 None => {
                     if let Some(cwd_host) = w::path::to_host(&w::path::cwd()) {
-                        if let Some(p) = find_in_dir_ci(&cwd_host, norm) {
+                        if let Some(p) = find_valid(&cwd_host) {
                             return (Some(p), true);
                         }
                     }
@@ -547,7 +730,7 @@ impl Loader {
             }
             if w::find_builtin(norm).is_none() {
                 if let Some(sys32) = w::path::to_host("C:\\Windows\\System32") {
-                    if let Some(p) = find_in_dir_ci(&sys32, norm) {
+                    if let Some(p) = find_valid(&sys32) {
                         return (Some(p), true);
                     }
                 }
@@ -559,20 +742,20 @@ impl Loader {
         // 1. Propagated dll_load_dir (during offline prewarm)
         if opts.prewarm {
             if let Some(ref d) = opts.dll_load_dir {
-                if let Some(p) = find_in_dir_ci(d, norm) {
+                if let Some(p) = find_valid(d) {
                     return (Some(p), true);
                 }
             }
         }
         // 2. Application directory (game_dir)
-        if let Some(p) = self.find_in_game_dir(norm) {
+        if let Some(p) = find_valid(&self.game_dir) {
             return (Some(p), true);
         }
         // 3. SetDllDirectory(dir) OR CWD (unless SetDllDirectory("") disabled CWD)
         match &cfg.legacy_dll_dir {
             Some(Some(legacy_dir)) => {
                 if let Some(host_dir) = w::path::to_host(legacy_dir) {
-                    if let Some(p) = find_in_dir_ci(&host_dir, norm) {
+                    if let Some(p) = find_valid(&host_dir) {
                         return (Some(p), true);
                     }
                 }
@@ -580,7 +763,7 @@ impl Loader {
             Some(None) => {}
             None => {
                 if let Some(cwd_host) = w::path::to_host(&w::path::cwd()) {
-                    if let Some(p) = find_in_dir_ci(&cwd_host, norm) {
+                    if let Some(p) = find_valid(&cwd_host) {
                         return (Some(p), true);
                     }
                 }
@@ -589,7 +772,7 @@ impl Loader {
         // 4. Non-builtin guest files in System32
         if w::find_builtin(norm).is_none() {
             if let Some(sys32) = w::path::to_host("C:\\Windows\\System32") {
-                if let Some(p) = find_in_dir_ci(&sys32, norm) {
+                if let Some(p) = find_valid(&sys32) {
                     return (Some(p), true);
                 }
             }
@@ -768,11 +951,8 @@ impl Loader {
         match self.classify_with_opts(name, opts, 0) {
             Some(Source::GameDir(p)) => {
                 let data = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
-                let pe = Pe::parse(&data).with_context(|| format!("parsing {}", p.display()))?;
+                let pe = parse_pe_for_load(&data, &p)?;
                 let h = &pe.headers;
-                if h.machine != IMAGE_FILE_MACHINE_AMD64 {
-                    bail!("{}: not an x86-64 image (machine 0x{:x})", p.display(), h.machine);
-                }
                 let size = (h.size_of_image as usize + PAGE - 1) & !(PAGE - 1);
                 let base = unsafe { map_image_memory(h.image_base as usize, size, true) }
                     .ok_or_else(|| anyhow!("{}: cannot map 0x{size:x} datafile bytes", p.display()))?;
@@ -932,6 +1112,73 @@ impl Loader {
     ///
     /// Maps and resolves static imports ONLY — NEVER executes TLS callbacks or `DllMain`,
     /// and preserves lazy delay imports (missing optional delay-import DLLs are non-fatal).
+    fn warn_skipped_non_pe32_plus_plugins(
+        &self,
+        primary_exe: &Path,
+        plugin_dirs: &[String],
+        bundled_plugins: &[String],
+    ) {
+        let Ok(root_canon) = std::fs::canonicalize(&self.game_dir) else {
+            return;
+        };
+        if !root_canon.is_dir() {
+            return;
+        }
+        let primary_canon = std::fs::canonicalize(primary_exe).ok();
+        let mut visited_dirs = std::collections::HashSet::from([root_canon.clone()]);
+        let mut warned = std::collections::HashSet::new();
+
+        for rel in bundled_plugins {
+            let trimmed = rel.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = trimmed.replace('\\', "/");
+            let p = Path::new(&normalized);
+            let bytes = normalized.as_bytes();
+            if p.is_absolute() || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':') {
+                continue;
+            }
+            let joined = self.game_dir.join(p);
+            warn_non_pe32_plus_file(&joined, &root_canon, primary_canon.as_deref(), &mut warned);
+        }
+
+        for rel_dir in plugin_dirs {
+            let trimmed = rel_dir.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = trimmed.replace('\\', "/");
+            let p = Path::new(&normalized);
+            let bytes = normalized.as_bytes();
+            if p.is_absolute() || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':') {
+                continue;
+            }
+            let joined = self.game_dir.join(p);
+            if let Ok(canon) = std::fs::canonicalize(&joined) {
+                if canon.starts_with(&root_canon) && canon.is_dir() && visited_dirs.insert(canon) {
+                    warn_non_pe32_plus_dir(
+                        &joined,
+                        &root_canon,
+                        primary_canon.as_deref(),
+                        0,
+                        &mut visited_dirs,
+                        &mut warned,
+                    );
+                }
+            }
+        }
+
+        warn_non_pe32_plus_dir(
+            &self.game_dir,
+            &root_canon,
+            primary_canon.as_deref(),
+            0,
+            &mut visited_dirs,
+            &mut warned,
+        );
+    }
+
     pub fn prewarm_map_bundled_plugins(
         &self,
         primary_exe: &Path,
@@ -940,6 +1187,7 @@ impl Loader {
         let _g = self.lock.lock();
         let plugin_dirs = manifest.map_or(&[][..], |m| m.plugin_dirs.as_slice());
         let bundled_plugins = manifest.map_or(&[][..], |m| m.bundled_plugins.as_slice());
+        self.warn_skipped_non_pe32_plus_plugins(primary_exe, plugin_dirs, bundled_plugins);
         let discovered = port_manifest::discover_bundled_plugins(
             &self.game_dir,
             Some(&self.routing),
@@ -1131,8 +1379,8 @@ impl Loader {
                 Some(Source::GameDir(dep_path)) => {
                     let dep_data = std::fs::read(&dep_path)
                         .with_context(|| format!("{norm}: reading dependency {}", dep_path.display()))?;
-                    let dep_pe = Pe::parse(&dep_data)
-                        .with_context(|| format!("{norm}: parsing dependency {}", dep_path.display()))?;
+                    let dep_pe = parse_pe_for_load(&dep_data, &dep_path)
+                        .with_context(|| format!("{norm}: dependency {}", dep_path.display()))?;
                     self.check_strict_deps(&dep_norm, &dep_pe, dep_opts, seen)?;
                 }
                 None => bail!("{norm}: missing required dependency DLL {:?}", imp.dll),
@@ -1154,11 +1402,8 @@ impl Loader {
 
         w::hitch::heartbeat_stage(w::hitch::HeartbeatKind::LoaderMap, &format!("map {norm}"));
         let data = std::fs::read(host).with_context(|| format!("reading {}", host.display()))?;
-        let pe = Pe::parse(&data).with_context(|| format!("parsing {}", host.display()))?;
+        let pe = parse_pe_for_load(&data, host)?;
         let h = &pe.headers;
-        if h.machine != IMAGE_FILE_MACHINE_AMD64 {
-            bail!("{norm}: not an x86-64 image (machine 0x{:x})", h.machine);
-        }
         let dont_resolve = (opts.flags & DONT_RESOLVE_DLL_REFERENCES) != 0;
 
         let mut dep_opts = LoadOptions {
@@ -1864,8 +2109,9 @@ impl w::LoaderOps for Loader {
             return match self.load_datafile(name, &opts) {
                 Ok(h) => Ok(h),
                 Err(e) => {
-                    log::warn!("LoadLibraryEx({name:?}, datafile 0x{flags:x}) failed: {e:#}");
-                    Err(w::types::err::ERROR_MOD_NOT_FOUND)
+                    let code = load_error_to_win32(&e);
+                    log::warn!("LoadLibraryEx({name:?}, datafile 0x{flags:x}) failed (err={code}): {e:#}");
+                    Err(code)
                 }
             };
         }
@@ -1881,8 +2127,9 @@ impl w::LoaderOps for Loader {
                 Ok(m.base)
             }
             Err(e) => {
-                log::warn!("LoadLibrary({name:?}, 0x{flags:x}) failed: {e:#}");
-                Err(w::types::err::ERROR_MOD_NOT_FOUND)
+                let code = load_error_to_win32(&e);
+                log::warn!("LoadLibrary({name:?}, 0x{flags:x}) failed (err={code}): {e:#}");
+                Err(code)
             }
         }
     }
@@ -2947,6 +3194,293 @@ plugin_dirs = ["plugins/py"]
         assert_eq!(m.size, img_size);
         assert!(l.reserved_aot_slots.lock().unwrap().is_empty());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Minimal synthetic wrong-architecture PE fixture (e.g. 32-bit i386 PE32 `0x10b`
+    /// or ARM64 PE32+ `0xaa64`).
+    fn build_synthetic_wrong_arch_pe(machine: u16, magic: u16, is_dll: bool) -> Vec<u8> {
+        let mut img = vec![0u8; 0x400];
+        let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+        img[0..2].copy_from_slice(b"MZ");
+        let pe = 0x80usize;
+        w32(&mut img, 0x3C, pe as u32);
+        w32(&mut img, pe, 0x0000_4550);
+        w16(&mut img, pe + 4, machine);
+        w16(&mut img, pe + 6, 0);
+        let opt_size: u16 = if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC { 240 } else { 224 };
+        w16(&mut img, pe + 20, opt_size);
+        w16(&mut img, pe + 22, if is_dll { 0x2022 } else { 0x0022 });
+
+        let opt = pe + 24;
+        w16(&mut img, opt, magic);
+        if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+            w64(&mut img, opt + 24, 0x1_8000_0000);
+            w32(&mut img, opt + 32, 0x1000);
+            w32(&mut img, opt + 36, 0x200);
+            w32(&mut img, opt + 56, 0x2000);
+            w32(&mut img, opt + 60, 0x200);
+            w32(&mut img, opt + 108, 16);
+        } else {
+            w32(&mut img, opt + 28, 0x1000_0000);
+            w32(&mut img, opt + 32, 0x1000);
+            w32(&mut img, opt + 36, 0x200);
+            w32(&mut img, opt + 56, 0x2000);
+            w32(&mut img, opt + 60, 0x200);
+            w32(&mut img, opt + 92, 16);
+        }
+        img
+    }
+
+    #[test]
+    fn wrong_arch_pe32_search_fallback_and_error_codes() {
+        use w::kernel32::module::*;
+        use w::LoaderOps as _;
+
+        reset_dll_search_state();
+        let root = std::env::temp_dir().join(format!(
+            "port-loader-wrong-arch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let app_dir = root.join("app");
+        let later_dir = root.join("later");
+        let user_dir = root.join("user");
+        for d in [&app_dir, &later_dir, &user_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        w::path::add_mount("T:\\WrongArchTest", &root);
+        w::path::set_cwd("T:\\WrongArchTest\\later");
+
+        let pe32_bytes = build_synthetic_wrong_arch_pe(
+            IMAGE_FILE_MACHINE_I386,
+            IMAGE_NT_OPTIONAL_HDR32_MAGIC,
+            true,
+        );
+        let arm64_bytes = build_synthetic_wrong_arch_pe(
+            IMAGE_FILE_MACHINE_ARM64,
+            IMAGE_NT_OPTIONAL_HDR64_MAGIC,
+            true,
+        );
+
+        // Wrong-arch PE32 `dbghelp.dll` in app_dir (mirrors games shipping 32-bit dbghelp.dll).
+        let app_dbghelp = app_dir.join("dbghelp.dll");
+        std::fs::write(&app_dbghelp, &pe32_bytes).unwrap();
+        // Wrong-arch PE32 and ARM64 DLLs with no 64-bit fallback or builtin.
+        let app_only32 = app_dir.join("only32.dll");
+        std::fs::write(&app_only32, &pe32_bytes).unwrap();
+        let app_arm64 = app_dir.join("arm64_only.dll");
+        std::fs::write(&app_arm64, &arm64_bytes).unwrap();
+        let app_corrupt = app_dir.join("corrupt.dll");
+        std::fs::write(&app_corrupt, b"not a valid PE binary").unwrap();
+
+        // Wrong-arch in app_dir, valid AMD64 PE32+ in later search dirs (CWD and AddDllDirectory).
+        std::fs::write(app_dir.join("shadowed_cwd.dll"), &pe32_bytes).unwrap();
+        std::fs::write(
+            later_dir.join("shadowed_cwd.dll"),
+            build_synthetic_plugin_pe("shadowed_cwd.dll", 0x1_6B00_0000, true, None, None, false),
+        )
+        .unwrap();
+        std::fs::write(app_dir.join("shadowed_user.dll"), &arm64_bytes).unwrap();
+        std::fs::write(
+            user_dir.join("shadowed_user.dll"),
+            build_synthetic_plugin_pe("shadowed_user.dll", 0x1_6C00_0000, true, None, None, false),
+        )
+        .unwrap();
+
+        // Valid AMD64 PE32+ EXE statically importing `dbghelp.dll!SymInitialize`.
+        let exe_path = app_dir.join("uses_dbghelp.exe");
+        std::fs::write(
+            &exe_path,
+            build_synthetic_plugin_pe(
+                "uses_dbghelp.exe",
+                0x1_4000_0000,
+                false,
+                Some(("dbghelp.dll", "SymInitialize")),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        // Valid AMD64 PE32+ DLL statically importing `only32.dll!Nope`.
+        std::fs::write(
+            app_dir.join("needs_only32.dll"),
+            build_synthetic_plugin_pe(
+                "needs_only32.dll",
+                0x1_6D00_0000,
+                true,
+                Some(("only32.dll", "Nope")),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        // Valid AMD64 PE32+ plugin for prewarm enumeration check.
+        std::fs::write(
+            app_dir.join("valid_plugin.dll"),
+            build_synthetic_plugin_pe("valid_plugin.dll", 0x1_6E00_0000, true, None, None, false),
+        )
+        .unwrap();
+
+        // peek_pe_preferred_window must reject both PE32 and ARM64 PE32+.
+        assert!(peek_pe_preferred_window(&app_dbghelp).is_none());
+        assert!(peek_pe_preferred_window(&app_arm64).is_none());
+        assert!(peek_pe_preferred_window(&exe_path).is_some());
+
+        // 1. Static import resolution skips 32-bit `app_dir/dbghelp.dll` and falls back to builtin.
+        {
+            let l_static = Loader::new_instance(
+                app_dir.clone(),
+                "T:\\WrongArchTest\\app".into(),
+                false,
+                port_manifest::DllRoutingTable::new(),
+                false,
+            );
+            let _exe = l_static
+                .load_pe(
+                    &exe_path,
+                    "uses_dbghelp.exe",
+                    "T:\\WrongArchTest\\app\\uses_dbghelp.exe".into(),
+                    None,
+                )
+                .expect("static import of dbghelp.dll must skip 32-bit file and fall back to builtin");
+            let dbg = l_static
+                .find_loaded("dbghelp.dll")
+                .expect("dbghelp.dll must be loaded");
+            assert!(dbg.is_builtin(), "dbghelp.dll must resolve to builtin, not 32-bit guest PE");
+            assert!(
+                l_static
+                    .get_proc_address(dbg.base, ProcName::Name("SymInitialize"))
+                    .is_some(),
+                "builtin dbghelp.dll must resolve SymInitialize"
+            );
+        }
+
+        // 2. Dynamic LoadLibrary tests on a fresh Loader (dbghelp.dll not preloaded yet).
+        let l = Loader::new_instance(
+            app_dir.clone(),
+            "T:\\WrongArchTest\\app".into(),
+            false,
+            port_manifest::DllRoutingTable::new(),
+            false,
+        );
+
+        // 2a. Bare LoadLibraryEx with APPLICATION_DIR only (no SYSTEM32) skips 32-bit dbghelp.dll
+        //     and does NOT fall back to builtin -> ERROR_MOD_NOT_FOUND.
+        assert_eq!(
+            l.load_library("dbghelp.dll", LOAD_LIBRARY_SEARCH_APPLICATION_DIR),
+            Err(w::types::err::ERROR_MOD_NOT_FOUND)
+        );
+
+        // 2b. Explicit-path LoadLibrary of 32-bit dbghelp.dll -> ERROR_BAD_EXE_FORMAT (193),
+        //     never silently redirected to builtin.
+        assert_eq!(
+            l.load_library("T:\\WrongArchTest\\app\\dbghelp.dll", 0),
+            Err(ERROR_BAD_EXE_FORMAT)
+        );
+        assert_eq!(
+            l.load_library("T:\\WrongArchTest\\app\\only32.dll", 0),
+            Err(ERROR_BAD_EXE_FORMAT)
+        );
+        assert_eq!(
+            l.load_library("T:\\WrongArchTest\\app\\arm64_only.dll", 0),
+            Err(ERROR_BAD_EXE_FORMAT)
+        );
+        assert_eq!(
+            l.load_library("T:\\WrongArchTest\\app\\corrupt.dll", 0),
+            Err(ERROR_BAD_EXE_FORMAT)
+        );
+        // Explicit path that does not exist -> ERROR_MOD_NOT_FOUND (126).
+        assert_eq!(
+            l.load_library("T:\\WrongArchTest\\app\\missing_explicit.dll", 0),
+            Err(w::types::err::ERROR_MOD_NOT_FOUND)
+        );
+
+        // 2c. Bare LoadLibrary("dbghelp.dll") skips 32-bit file in app_dir and falls back to builtin.
+        let h_dbg = l
+            .load_library("dbghelp.dll", 0)
+            .expect("bare LoadLibrary(dbghelp.dll) must fall back to builtin");
+        let dbg_mod = l.module_by_base(h_dbg).expect("builtin module record");
+        assert!(dbg_mod.is_builtin());
+
+        // 2d. Bare LoadLibrary of wrong-arch-only DLLs (no later valid copy, no builtin) -> ERROR_MOD_NOT_FOUND.
+        assert_eq!(
+            l.load_library("only32.dll", 0),
+            Err(w::types::err::ERROR_MOD_NOT_FOUND)
+        );
+        assert_eq!(
+            l.load_library("arm64_only.dll", 0),
+            Err(w::types::err::ERROR_MOD_NOT_FOUND)
+        );
+
+        // 2e. Bare LoadLibrary skips wrong-arch candidate in app_dir and continues search to CWD.
+        let h_cwd = l
+            .load_library("shadowed_cwd.dll", 0)
+            .expect("bare LoadLibrary must skip 32-bit app_dir candidate and load 64-bit CWD candidate");
+        let cwd_mod = l.module_by_base(h_cwd).unwrap();
+        assert!(!cwd_mod.is_builtin());
+        assert_eq!(
+            cwd_mod.host_path.as_deref(),
+            Some(
+                std::fs::canonicalize(later_dir.join("shadowed_cwd.dll"))
+                    .unwrap()
+                    .as_path()
+            )
+        );
+
+        // 2f. Bare LoadLibraryEx with DEFAULT_DIRS + AddDllDirectory skips ARM64 app_dir candidate
+        //     and continues search to user_dir.
+        let user_w = w::strings::to_wide_z("T:\\WrongArchTest\\user");
+        let cookie = unsafe { AddDllDirectory(user_w.as_ptr()) };
+        assert!(!cookie.is_null());
+        let h_user = l
+            .load_library("shadowed_user.dll", LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+            .expect("DEFAULT_DIRS must skip ARM64 app_dir candidate and load AMD64 user_dir candidate");
+        let user_mod = l.module_by_base(h_user).unwrap();
+        assert_eq!(
+            user_mod.host_path.as_deref(),
+            Some(
+                std::fs::canonicalize(user_dir.join("shadowed_user.dll"))
+                    .unwrap()
+                    .as_path()
+            )
+        );
+        assert_eq!(unsafe { RemoveDllDirectory(cookie) }, w::types::TRUE);
+
+        // 2g. Dynamic LoadLibrary of a 64-bit DLL whose static dependency only exists as 32-bit
+        //     fails cleanly with ERROR_MOD_NOT_FOUND.
+        assert_eq!(
+            l.load_library("needs_only32.dll", 0),
+            Err(w::types::err::ERROR_MOD_NOT_FOUND)
+        );
+
+        // 3. Prewarm bundled plugin enumeration skips 32-bit PE32 / ARM64 / corrupt files without error
+        //    while still mapping valid PE32+ plugins.
+        let manifest = port_manifest::GameManifest::parse(
+            r#"
+[runtime]
+bundled_plugins = ["dbghelp.dll", "arm64_only.dll", "corrupt.dll", "valid_plugin.dll"]
+"#,
+        );
+        let l_pw = Loader::new_instance(
+            app_dir.clone(),
+            "T:\\WrongArchTest\\app".into(),
+            false,
+            manifest.routing_table(&[], None),
+            false,
+        );
+        let mapped = l_pw.prewarm_map_bundled_plugins(&exe_path, Some(&manifest));
+        let mapped_names: Vec<&str> = mapped.iter().map(|m| m.name.as_str()).collect();
+        assert!(mapped_names.contains(&"valid_plugin.dll"), "got {mapped_names:?}");
+        assert!(!mapped_names.contains(&"dbghelp.dll"), "32-bit dbghelp.dll must not be mapped as guest PE");
+        assert!(!mapped_names.contains(&"only32.dll"), "32-bit only32.dll must not be mapped");
+        assert!(!mapped_names.contains(&"arm64_only.dll"), "ARM64 DLL must not be mapped");
+        assert!(!mapped_names.contains(&"corrupt.dll"), "corrupt DLL must not be mapped");
+
+        reset_dll_search_state();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

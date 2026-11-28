@@ -2651,3 +2651,173 @@ int main(void) {
     return 0;
 }
 "##;
+
+// ---------------------------------------------------------------------------
+// 12. Wrong-architecture (PE32 0x10b) DLL skipping, builtin fallback,
+//     ERROR_BAD_EXE_FORMAT vs ERROR_MOD_NOT_FOUND, and --prewarm-aot skip
+// ---------------------------------------------------------------------------
+
+fn build_synthetic_pe32_dll() -> Vec<u8> {
+    let mut img = vec![0u8; 0x400];
+    let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    img[0..2].copy_from_slice(b"MZ");
+    let pe = 0x80usize;
+    w32(&mut img, 0x3C, pe as u32);
+    w32(&mut img, pe, 0x0000_4550);
+    w16(&mut img, pe + 4, 0x014C); // IMAGE_FILE_MACHINE_I386
+    w16(&mut img, pe + 6, 0);
+    w16(&mut img, pe + 20, 224);   // PE32 optional header size
+    w16(&mut img, pe + 22, 0x2022); // IMAGE_FILE_DLL | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    let opt = pe + 24;
+    w16(&mut img, opt, 0x010B);    // IMAGE_NT_OPTIONAL_HDR32_MAGIC
+    w32(&mut img, opt + 28, 0x1000_0000);
+    w32(&mut img, opt + 32, 0x1000);
+    w32(&mut img, opt + 36, 0x200);
+    w32(&mut img, opt + 56, 0x2000);
+    w32(&mut img, opt + 60, 0x200);
+    w32(&mut img, opt + 92, 16);
+    img
+}
+
+#[test]
+fn guest_wrong_arch_pe32_fallback_and_prewarm() {
+    let zig = corpus_compiler();
+    let tmp = TempDir::new("wrong-arch-pe32");
+
+    // Place synthetic 32-bit PE32 DLLs in the game dir alongside the 64-bit guest EXE:
+    // - `dbghelp.dll` shadows a statically imported builtin (like titles shipping 32-bit dbghelp.dll)
+    // - `version.dll` shadows a dynamically loaded builtin (not statically imported)
+    // - `only32.dll` has no 64-bit fallback or builtin
+    let pe32 = build_synthetic_pe32_dll();
+    std::fs::write(tmp.path().join("dbghelp.dll"), &pe32).expect("write 32-bit dbghelp.dll");
+    std::fs::write(tmp.path().join("version.dll"), &pe32).expect("write 32-bit version.dll");
+    let only32_path = tmp.path().join("only32.dll");
+    std::fs::write(&only32_path, &pe32).expect("write 32-bit only32.dll");
+
+    let exe = compile_c_guest(
+        &zig,
+        tmp.path(),
+        "wrong_arch_pe32",
+        WRONG_ARCH_PE32_C,
+        &["kernel32", "dbghelp"],
+    );
+
+    // Run both Live JIT and --prewarm-aot + Prewarmed AOT with no builtin_overrides workaround.
+    run_guest_both_modes(
+        "wrong_arch_pe32",
+        &exe,
+        tmp.path(),
+        &[
+            "CORPUS_PE32: static_dbghelp_builtin ok",
+            "CORPUS_PE32: dynamic_dbghelp_builtin ok",
+            "CORPUS_PE32: dynamic_unloaded_version_builtin ok",
+            "CORPUS_PE32: explicit_bad_exe_format ok",
+            "CORPUS_PE32: bare_only32_mod_not_found ok",
+            "CORPUS_PE32: PASS ALL",
+        ],
+        DEFAULT_TIMEOUT,
+    );
+
+    // Direct `--prewarm-aot` on a non-PE32+ file must skip with a warning and exit 0.
+    let direct_aot_dir = tmp.path().join("aot-direct-pe32");
+    let direct_drive_c = tmp.path().join("drive-c-direct-pe32");
+    std::fs::create_dir_all(&direct_aot_dir).unwrap();
+    std::fs::create_dir_all(&direct_drive_c).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_port-runner"))
+        .arg("--pe")
+        .arg(&only32_path)
+        .arg("--prewarm-aot")
+        .arg("--aot-dir")
+        .arg(&direct_aot_dir)
+        .env("PORT_AOT_DIR", &direct_aot_dir)
+        .env("TRANSLATOR_HOME", &direct_drive_c)
+        .env("AW2_DRIVE_C", &direct_drive_c)
+        .env("PORT_HEADLESS", "1")
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("spawn port-runner --prewarm-aot on PE32");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "direct --prewarm-aot on PE32 must exit 0 (got {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+    assert!(
+        stderr.contains("skipping non-PE32+") && stdout.contains("SKIPPED"),
+        "expected warning + SKIPPED summary for PE32 --prewarm-aot\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+const WRONG_ARCH_PE32_C: &str = r##"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <dbghelp.h>
+#include <stdio.h>
+
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL: %s (line %d, err=%lu)\n", (msg), __LINE__, (unsigned long)GetLastError()); \
+        fflush(stderr); \
+        ExitProcess(1); \
+    } \
+} while (0)
+
+int main(void) {
+    /* 1. Static import from dbghelp.dll succeeded by skipping game-dir PE32 and falling back to builtin. */
+    HANDLE proc = GetCurrentProcess();
+    CHECK(SymInitialize(proc, NULL, FALSE) != FALSE, "static dbghelp!SymInitialize");
+    CHECK(SymCleanup(proc) != FALSE, "static dbghelp!SymCleanup");
+    printf("CORPUS_PE32: static_dbghelp_builtin ok\n");
+
+    /* 2. Dynamic bare LoadLibraryW(L"dbghelp.dll") resolves to the builtin module. */
+    HMODULE h_loaded = GetModuleHandleW(L"dbghelp.dll");
+    CHECK(h_loaded != NULL, "GetModuleHandleW(dbghelp.dll)");
+    HMODULE h_bare = LoadLibraryW(L"dbghelp.dll");
+    CHECK(h_bare == h_loaded, "LoadLibraryW(dbghelp.dll) matches loaded builtin");
+    CHECK(FreeLibrary(h_bare) != FALSE, "FreeLibrary(dbghelp.dll)");
+    printf("CORPUS_PE32: dynamic_dbghelp_builtin ok\n");
+
+    /* 3. Unloaded builtin shadowed by game-dir 32-bit PE32: explicit path fails with
+          ERROR_BAD_EXE_FORMAT, while bare LoadLibraryW skips PE32 and loads builtin. */
+    CHECK(GetModuleHandleW(L"version.dll") == NULL, "version.dll not loaded yet");
+    SetLastError(0);
+    HMODULE h_exp_ver = LoadLibraryW(L".\\version.dll");
+    DWORD err_exp_ver = GetLastError();
+    CHECK(h_exp_ver == NULL && err_exp_ver == ERROR_BAD_EXE_FORMAT,
+          "explicit LoadLibraryW(.\\version.dll) -> ERROR_BAD_EXE_FORMAT");
+    HMODULE h_bare_ver = LoadLibraryW(L"version.dll");
+    CHECK(h_bare_ver != NULL, "bare LoadLibraryW(version.dll) falls back to builtin");
+    CHECK(GetProcAddress(h_bare_ver, "GetFileVersionInfoSizeW") != NULL,
+          "builtin version.dll exports GetFileVersionInfoSizeW");
+    CHECK(FreeLibrary(h_bare_ver) != FALSE, "FreeLibrary(version.dll)");
+    printf("CORPUS_PE32: dynamic_unloaded_version_builtin ok\n");
+
+    /* 4. Explicit path to 32-bit PE32 dbghelp.dll and only32.dll must fail with ERROR_BAD_EXE_FORMAT (193). */
+    SetLastError(0);
+    HMODULE h_exp_dbg = LoadLibraryW(L".\\dbghelp.dll");
+    DWORD err_exp_dbg = GetLastError();
+    CHECK(h_exp_dbg == NULL && err_exp_dbg == ERROR_BAD_EXE_FORMAT,
+          "explicit LoadLibraryW(.\\dbghelp.dll) -> ERROR_BAD_EXE_FORMAT");
+
+    SetLastError(0);
+    HMODULE h_exp_only = LoadLibraryW(L".\\only32.dll");
+    DWORD err_exp_only = GetLastError();
+    CHECK(h_exp_only == NULL && err_exp_only == ERROR_BAD_EXE_FORMAT,
+          "explicit LoadLibraryW(.\\only32.dll) -> ERROR_BAD_EXE_FORMAT");
+    printf("CORPUS_PE32: explicit_bad_exe_format ok\n");
+
+    /* 4. Bare LoadLibraryW(L"only32.dll") skips 32-bit candidate and fails with ERROR_MOD_NOT_FOUND (126). */
+    SetLastError(0);
+    HMODULE h_bare_only = LoadLibraryW(L"only32.dll");
+    DWORD err_bare_only = GetLastError();
+    CHECK(h_bare_only == NULL && err_bare_only == ERROR_MOD_NOT_FOUND,
+          "bare LoadLibraryW(only32.dll) -> ERROR_MOD_NOT_FOUND");
+    printf("CORPUS_PE32: bare_only32_mod_not_found ok\n");
+
+    printf("CORPUS_PE32: PASS ALL\n");
+    fflush(stdout);
+    return 0;
+}
+"##;
