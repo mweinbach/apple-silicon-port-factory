@@ -29,7 +29,11 @@ pub const PDH_NO_DATA: i32 = 0x8000_07D5u32 as i32;
 pub const PDH_FMT_LONG: u32 = 0x0000_0100;
 pub const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
 pub const PDH_FMT_LARGE: u32 = 0x0000_0400;
+pub const PDH_FMT_NOSCALE: u32 = 0x0000_1000;
+pub const PDH_FMT_1000: u32 = 0x0000_2000;
+pub const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 const PDH_FMT_TYPE_MASK: u32 = 0x0000_0F00;
+const PDH_FMT_SUPPORTED_MODS: u32 = PDH_FMT_NOSCALE | PDH_FMT_1000 | PDH_FMT_NOCAP100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessorTarget {
@@ -52,6 +56,19 @@ enum CounterKind {
     ProcessVirtualBytes,
     ProcessProcessorPct,
     SystemUptimeSec,
+}
+
+impl CounterKind {
+    fn is_percentage(self) -> bool {
+        matches!(
+            self,
+            Self::ProcessorTotalPct(_)
+                | Self::ProcessorUserPct(_)
+                | Self::ProcessorKernelPct(_)
+                | Self::ProcessorIdlePct(_)
+                | Self::ProcessProcessorPct
+        )
+    }
 }
 
 struct CounterState {
@@ -621,6 +638,27 @@ pub unsafe extern "win64" fn PdhCollectQueryData(h_query: usize) -> i32 {
     ERROR_SUCCESS
 }
 
+/// Apply PDH formatting modifiers (`PDH_FMT_1000`, `PDH_FMT_NOSCALE`, `PDH_FMT_NOCAP100`)
+/// and validate `dw_format` before formatting a sampled counter value.
+fn apply_pdh_format(kind: CounterKind, raw_val: f64, dw_format: u32) -> Result<(u32, f64), i32> {
+    let fmt_type = dw_format & PDH_FMT_TYPE_MASK;
+    if !matches!(fmt_type, PDH_FMT_LONG | PDH_FMT_DOUBLE | PDH_FMT_LARGE) {
+        return Err(PDH_INVALID_ARGUMENT);
+    }
+    let mods = dw_format & !PDH_FMT_TYPE_MASK;
+    if (mods & !PDH_FMT_SUPPORTED_MODS) != 0 {
+        return Err(PDH_INVALID_ARGUMENT);
+    }
+    let mut out = raw_val;
+    if kind.is_percentage() && (mods & PDH_FMT_NOCAP100) == 0 {
+        out = out.clamp(0.0, 100.0);
+    }
+    if (mods & PDH_FMT_1000) != 0 {
+        out *= 1000.0;
+    }
+    Ok((fmt_type, out))
+}
+
 /// `PDH_FMT_COUNTERVALUE` (x64, 16 bytes): `CStatus: u32 @ 0`, pad @ 4, union (`i32`/`f64`/`i64`) @ 8.
 pub unsafe extern "win64" fn PdhGetFormattedCounterValue(
     h_counter: usize,
@@ -629,6 +667,14 @@ pub unsafe extern "win64" fn PdhGetFormattedCounterValue(
     p_value: *mut u8,
 ) -> i32 {
     if p_value.is_null() {
+        return PDH_INVALID_ARGUMENT;
+    }
+    // Validate requested data type and modifiers before mutating output or claiming valid data.
+    let fmt_type_check = dw_format & PDH_FMT_TYPE_MASK;
+    let mods_check = dw_format & !PDH_FMT_TYPE_MASK;
+    if !matches!(fmt_type_check, PDH_FMT_LONG | PDH_FMT_DOUBLE | PDH_FMT_LARGE)
+        || (mods_check & !PDH_FMT_SUPPORTED_MODS) != 0
+    {
         return PDH_INVALID_ARGUMENT;
     }
     let st = state().lock().unwrap();
@@ -640,15 +686,19 @@ pub unsafe extern "win64" fn PdhGetFormattedCounterValue(
         std::ptr::write_unaligned(p_value as *mut u32, PDH_NO_DATA as u32);
         return PDH_NO_DATA;
     };
+    let (fmt_type, scaled) = match apply_pdh_format(c.kind, val, dw_format) {
+        Ok(x) => x,
+        Err(code) => return code,
+    };
     if !lpdw_type.is_null() {
         std::ptr::write_unaligned(lpdw_type, 0u32);
     }
     std::ptr::write_bytes(p_value, 0, 16);
     std::ptr::write_unaligned(p_value as *mut u32, PDH_CSTATUS_VALID_DATA);
-    match dw_format & PDH_FMT_TYPE_MASK {
-        PDH_FMT_LONG => std::ptr::write_unaligned(p_value.add(8) as *mut i32, val as i32),
-        PDH_FMT_LARGE => std::ptr::write_unaligned(p_value.add(8) as *mut i64, val as i64),
-        PDH_FMT_DOUBLE | 0 => std::ptr::write_unaligned(p_value.add(8) as *mut f64, val),
+    match fmt_type {
+        PDH_FMT_LONG => std::ptr::write_unaligned(p_value.add(8) as *mut i32, scaled as i32),
+        PDH_FMT_LARGE => std::ptr::write_unaligned(p_value.add(8) as *mut i64, scaled as i64),
+        PDH_FMT_DOUBLE => std::ptr::write_unaligned(p_value.add(8) as *mut f64, scaled),
         _ => return PDH_INVALID_ARGUMENT,
     }
     ERROR_SUCCESS
@@ -819,9 +869,10 @@ mod tests {
             assert_eq!(std::ptr::read_unaligned(val.as_ptr() as *const u32), PDH_CSTATUS_VALID_DATA);
             assert!(std::ptr::read_unaligned(val.as_ptr().add(8) as *const i64) > 0);
 
-            let mut read_pct = |ch: usize| -> f64 {
+            let read_pct = |ch: usize| -> f64 {
                 let mut v = [0u8; 16];
-                assert_eq!(PdhGetFormattedCounterValue(ch, PDH_FMT_DOUBLE, &mut ty, v.as_mut_ptr()), ERROR_SUCCESS);
+                let mut t = 99u32;
+                assert_eq!(PdhGetFormattedCounterValue(ch, PDH_FMT_DOUBLE, &mut t, v.as_mut_ptr()), ERROR_SUCCESS);
                 assert_eq!(std::ptr::read_unaligned(v.as_ptr() as *const u32), PDH_CSTATUS_VALID_DATA);
                 std::ptr::read_unaligned(v.as_ptr().add(8) as *const f64)
             };
@@ -840,9 +891,10 @@ mod tests {
 
             // Process memory counters report live Mach TASK_VM_INFO metrics (not peak ru_maxrss),
             // distinguish virtual vs resident vs private bytes, and drop when large mappings are freed.
-            let mut read_i64 = |ch: usize| -> i64 {
+            let read_i64 = |ch: usize| -> i64 {
                 let mut v = [0u8; 16];
-                assert_eq!(PdhGetFormattedCounterValue(ch, PDH_FMT_LARGE, &mut ty, v.as_mut_ptr()), ERROR_SUCCESS);
+                let mut t = 99u32;
+                assert_eq!(PdhGetFormattedCounterValue(ch, PDH_FMT_LARGE, &mut t, v.as_mut_ptr()), ERROR_SUCCESS);
                 assert_eq!(std::ptr::read_unaligned(v.as_ptr() as *const u32), PDH_CSTATUS_VALID_DATA);
                 std::ptr::read_unaligned(v.as_ptr().add(8) as *const i64)
             };
@@ -899,6 +951,73 @@ mod tests {
                 virt_high - virt_after >= 16 * 1024 * 1024,
                 "Virtual Bytes must drop on munmap (high={virt_high}, after={virt_after})"
             );
+
+            // Formatting modifiers: PDH_FMT_1000 scales by 1000, default caps percentage counters
+            // at 100 while PDH_FMT_NOCAP100 allows >100, and unsupported flags return PDH_INVALID_ARGUMENT.
+            let mem_raw_d = read_pct(c_mem);
+            let mut v1000 = [0u8; 16];
+            assert_eq!(
+                PdhGetFormattedCounterValue(c_mem, PDH_FMT_DOUBLE | PDH_FMT_1000, &mut ty, v1000.as_mut_ptr()),
+                ERROR_SUCCESS
+            );
+            assert_eq!(std::ptr::read_unaligned(v1000.as_ptr() as *const u32), PDH_CSTATUS_VALID_DATA);
+            let mem_1000 = std::ptr::read_unaligned(v1000.as_ptr().add(8) as *const f64);
+            assert!((mem_1000 - mem_raw_d * 1000.0).abs() <= 1e-6);
+
+            let mut vnoscale = [0u8; 16];
+            assert_eq!(
+                PdhGetFormattedCounterValue(c_mem, PDH_FMT_DOUBLE | PDH_FMT_NOSCALE, &mut ty, vnoscale.as_mut_ptr()),
+                ERROR_SUCCESS
+            );
+            let mem_noscale = std::ptr::read_unaligned(vnoscale.as_ptr().add(8) as *const f64);
+            assert!((mem_noscale - mem_raw_d).abs() <= 1e-6);
+
+            // Seed >100% multi-core process CPU value and verify default 100% cap vs PDH_FMT_NOCAP100.
+            {
+                let mut st = state().lock().unwrap();
+                st.counters.get_mut(&c_proc).unwrap().last_value = Some(245.5);
+            }
+            assert!((read_pct(c_proc) - 100.0).abs() <= 1e-6, "default formatting must cap percentage at 100");
+            let mut v_nocap = [0u8; 16];
+            assert_eq!(
+                PdhGetFormattedCounterValue(
+                    c_proc,
+                    PDH_FMT_DOUBLE | PDH_FMT_NOCAP100,
+                    &mut ty,
+                    v_nocap.as_mut_ptr()
+                ),
+                ERROR_SUCCESS
+            );
+            assert!((std::ptr::read_unaligned(v_nocap.as_ptr().add(8) as *const f64) - 245.5).abs() <= 1e-6);
+            let mut v_nocap_1000 = [0u8; 16];
+            assert_eq!(
+                PdhGetFormattedCounterValue(
+                    c_proc,
+                    PDH_FMT_DOUBLE | PDH_FMT_NOCAP100 | PDH_FMT_1000,
+                    &mut ty,
+                    v_nocap_1000.as_mut_ptr()
+                ),
+                ERROR_SUCCESS
+            );
+            assert!(
+                (std::ptr::read_unaligned(v_nocap_1000.as_ptr().add(8) as *const f64) - 245_500.0).abs() <= 1e-6
+            );
+
+            // Unsupported or missing format flags must fail honestly with PDH_INVALID_ARGUMENT.
+            for bad_fmt in [
+                0u32,
+                PDH_FMT_LONG | PDH_FMT_DOUBLE,
+                PDH_FMT_DOUBLE | 0x0000_0010, // PDH_FMT_RAW
+                PDH_FMT_DOUBLE | 0x0000_4000, // PDH_FMT_NODATA
+                PDH_FMT_DOUBLE | 0x0001_0000, // unknown modifier
+            ] {
+                let mut bad_v = [0xAAu8; 16];
+                assert_eq!(
+                    PdhGetFormattedCounterValue(c_mem, bad_fmt, &mut ty, bad_v.as_mut_ptr()),
+                    PDH_INVALID_ARGUMENT,
+                    "expected PDH_INVALID_ARGUMENT for dw_format={bad_fmt:#x}"
+                );
+            }
 
             assert_eq!(PdhCloseQuery(q), ERROR_SUCCESS);
             assert_eq!(PdhCloseQuery(q), PDH_INVALID_HANDLE);
