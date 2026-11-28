@@ -336,13 +336,10 @@ pub fn build_launcher_app_bundle(workspace_root: &Path, out_app: &Path) -> Resul
 
     #[cfg(target_os = "macos")]
     {
-        for target in [
-            macos.join("port-factory"),
-            launcher_bin,
-            out_app.to_path_buf(),
-        ] {
-            codesign_ad_hoc(&target);
-        }
+        // Sign nested helper binaries first, then sign the `.app` bundle once (signing the
+        // bundle signs `CFBundleExecutable` and seals `CodeResources` in a single pass).
+        codesign_ad_hoc(&macos.join("port-factory"));
+        codesign_ad_hoc(out_app);
     }
 
     Ok(out_app.to_path_buf())

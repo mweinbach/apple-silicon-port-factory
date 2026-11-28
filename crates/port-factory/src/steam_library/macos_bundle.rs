@@ -2,15 +2,21 @@
 //! framework staging (`libmetalirconverter`, `libdxilconv`, `libMoltenVK`), manifest
 //! generation, and native bundle launcher codegen.
 
+use super::acquire_manifest::{
+    is_numeric_steam_app_id, load_acquire_manifest_in_dir, sanitize_acquire_manifest_json,
+    AcquireManifest, ACQUIRE_MANIFEST_FILENAME,
+};
 use super::discovery::{
     inspect_game_directory, scan_all_steam_libraries, GameLibrarySource, InstalledGameEntry,
 };
 use super::html::html_escape;
 use super::vdf::apply_post_install;
 use crate::aot::{compile_pe_file_to_rust, AotOptions};
+use crate::audit_game::detect_v8_or_cohtml_in_game_dir;
+use crate::bundle_codesign::record_bundle_signing_receipt;
 use crate::bundle_common::{
-    codesign_ad_hoc, copy_game_payload, copy_portable_shader_cache, find_or_build_release_binary,
-    otool_install_names, set_executable_mode,
+    codesign_ad_hoc, codesign_ad_hoc_checked, copy_game_payload, copy_portable_shader_cache,
+    find_or_build_release_binary, otool_install_names, set_executable_mode,
 };
 use crate::gpu_shaders::precompile_shaders_for_paths;
 use crate::scaffold::generate_embeddable_aot_crate;
@@ -22,6 +28,7 @@ use port_manifest::GameManifest;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 const BUNDLE_LAUNCHER_TEMPLATE: &str = include_str!("../../assets/bundle_launcher.rs.tmpl");
 
@@ -58,6 +65,8 @@ pub struct SteamConvertOptions {
     pub format: ConversionFormat,
     pub output_path: Option<PathBuf>,
     pub precompile_shaders: bool,
+    /// Optional cap on embedded shaders to precompile (`None` = convert all discovered shaders).
+    pub shader_limit: Option<usize>,
     pub max_aot_functions: usize,
     /// Optional host shader cache root (e.g. `~/Translator/ShaderCache`) whose portable
     /// Tier-1 entries (`ir*`, `manifest/`, `pso/pso_manifest/`, excluding host-specific
@@ -431,7 +440,12 @@ pub fn stage_bundle_frameworks(
 #[derive(Debug, Clone)]
 pub struct BundleLauncherConfig<'a> {
     pub clean_title: &'a str,
+    /// Storefront identifier (e.g. `Some("steam")`, `Some("epic")`, `Some("gog")`, or `None`).
+    pub store: Option<&'a str>,
     pub app_id: &'a str,
+    /// Resolved numeric Steam AppID, populated ONLY when the bundle is actually a Steam title.
+    /// Non-Steam numeric IDs (e.g. GOG) MUST pass `None` so `STEAM_APPID`/`SteamAppId` are not set.
+    pub steam_app_id: Option<&'a str>,
     pub exe_rel: &'a str,
     pub image_base: u64,
     pub size_of_image: u32,
@@ -491,6 +505,113 @@ pub fn generate_info_plist(clean_title: &str, exec_ident: &str, build_id: &str) 
     )
 }
 
+/// Inputs for generating a declarative `Contents/Resources/game.toml` inside a macOS `.app` bundle.
+#[derive(Debug, Clone)]
+pub struct BundleManifestInput<'a> {
+    pub display_name: &'a str,
+    pub exec_ident: &'a str,
+    pub exe_rel: &'a str,
+    pub app_id: &'a str,
+    pub v8_jitless: bool,
+    pub acquire_manifest: Option<&'a AcquireManifest>,
+}
+
+fn escape_toml_basic_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Insert optional store-agnostic `[app]` metadata (`store`, `app_id`) into serialized
+/// `game.toml` output without duplicating existing keys or perturbing `GameManifest::parse`.
+fn inject_app_store_metadata(
+    toml: String,
+    store: Option<&str>,
+    store_app_id: Option<&str>,
+) -> String {
+    let mut extra = String::new();
+    if let Some(s) = store.map(str::trim).filter(|s| !s.is_empty()) {
+        if !toml.lines().any(|l| l.trim_start().starts_with("store =")) {
+            extra.push_str(&format!("store = \"{}\"\n", escape_toml_basic_str(s)));
+        }
+    }
+    if let Some(id) = store_app_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("custom"))
+    {
+        if !toml.lines().any(|l| l.trim_start().starts_with("app_id =")) {
+            extra.push_str(&format!("app_id = \"{}\"\n", escape_toml_basic_str(id)));
+        }
+    }
+    if extra.is_empty() {
+        return toml;
+    }
+
+    if let Some(app_pos) = toml.find("[app]\n") {
+        let after_app = app_pos + "[app]\n".len();
+        if let Some(blank_rel) = toml[after_app..].find("\n\n") {
+            let insert_at = after_app + blank_rel + 1;
+            let mut out = String::with_capacity(toml.len() + extra.len());
+            out.push_str(&toml[..insert_at]);
+            out.push_str(&extra);
+            out.push_str(&toml[insert_at..]);
+            return out;
+        }
+        let mut out = toml;
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&extra);
+        return out;
+    }
+
+    toml
+}
+
+/// Generate a declarative `Contents/Resources/game.toml` manifest from bundle metadata,
+/// optional `port-acquire-manifest.json` (any storefront), and V8/Cohtml detection.
+pub fn generate_bundle_game_manifest_toml(input: &BundleManifestInput<'_>) -> String {
+    let (store, store_app_id, steam_app_id, args) = if let Some(acq) = input.acquire_manifest {
+        let store = (!acq.store.trim().is_empty()).then_some(acq.store.trim());
+        let app_id = (!acq.app_id.trim().is_empty()
+            && !acq.app_id.trim().eq_ignore_ascii_case("custom"))
+        .then_some(acq.app_id.trim());
+        let steam_id = acq.steam_app_id().map(str::to_string);
+        let args = acq.formatted_runtime_args();
+        (store, app_id, steam_id, args)
+    } else {
+        let steam_id = is_numeric_steam_app_id(input.app_id)
+            .then(|| input.app_id.trim().to_string());
+        (None, None, steam_id, None)
+    };
+
+    let base_toml = GameManifest {
+        id: Some(input.exec_ident.to_ascii_lowercase()),
+        name: Some(input.display_name.to_string()),
+        exe: Some(input.exe_rel.to_string()),
+        win_dir: Some(format!("C:\\Games\\{}", input.exec_ident)),
+        log_name: Some(format!("{}.log", input.exec_ident)),
+        steam_app_id,
+        aot_dir: Some("AotCache".to_string()),
+        preferred_base_retry: Some(false),
+        v8_jitless: Some(input.v8_jitless),
+        args,
+        ..GameManifest::default()
+    }
+    .to_toml();
+
+    inject_app_store_metadata(base_toml, store, store_app_id)
+}
+
 /// Generate the declarative `Contents/Resources/game.toml` manifest for an `.app` bundle.
 pub fn generate_game_manifest_toml(
     clean_title: &str,
@@ -498,19 +619,44 @@ pub fn generate_game_manifest_toml(
     exe_rel: &str,
     app_id: &str,
 ) -> String {
-    GameManifest {
-        id: Some(exec_ident.to_ascii_lowercase()),
-        name: Some(clean_title.to_string()),
-        exe: Some(exe_rel.to_string()),
-        win_dir: Some(format!("C:\\Games\\{exec_ident}")),
-        log_name: Some(format!("{exec_ident}.log")),
-        steam_app_id: Some(app_id.to_string()),
-        aot_dir: Some("AotCache".to_string()),
-        preferred_base_retry: Some(false),
-        v8_jitless: Some(false),
-        ..GameManifest::default()
+    generate_bundle_game_manifest_toml(&BundleManifestInput {
+        display_name: clean_title,
+        exec_ident,
+        exe_rel,
+        app_id,
+        v8_jitless: false,
+        acquire_manifest: None,
+    })
+}
+
+pub(crate) fn merge_acquire_and_v8_into_curated_manifest(
+    curated_toml: &str,
+    v8_jitless: bool,
+    acquire_manifest: Option<&AcquireManifest>,
+) -> String {
+    let mut manifest = GameManifest::parse(curated_toml);
+    if manifest.v8_jitless.is_none() && v8_jitless {
+        manifest.v8_jitless = Some(true);
     }
-    .to_toml()
+    let mut store: Option<&str> = None;
+    let mut store_app_id: Option<&str> = None;
+    if let Some(acq) = acquire_manifest {
+        store = (!acq.store.trim().is_empty()).then_some(acq.store.trim());
+        store_app_id = (!acq.app_id.trim().is_empty()
+            && !acq.app_id.trim().eq_ignore_ascii_case("custom"))
+        .then_some(acq.app_id.trim());
+        if manifest.args.is_none() {
+            manifest.args = acq.formatted_runtime_args();
+        }
+        if store.is_some() && !acq.is_steam_store() {
+            // Explicitly non-Steam acquisition: clear any inherited curated `steam_app_id` so
+            // `port-loader` never exports `STEAM_APPID`/`SteamAppId`/`SteamGameId` from `game.toml`.
+            manifest.steam_app_id = None;
+        } else if let Some(steam_id) = acq.steam_app_id() {
+            manifest.steam_app_id = Some(steam_id.to_string());
+        }
+    }
+    inject_app_store_metadata(manifest.to_toml(), store, store_app_id)
 }
 
 /// Look up a curated declarative manifest under `<workspace_root>/games/*/game.toml` matching
@@ -588,6 +734,19 @@ pub fn find_repo_game_manifest(
     Some(manifest.to_toml())
 }
 
+fn sanitize_launcher_cache_key(app_id: &str) -> String {
+    let cleaned: String = app_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "app".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Generate the Rust source for the self-contained `.app` launcher binary.
 ///
 /// The launcher resolves `Contents/Frameworks/`, `Contents/Resources/`, and `Contents/MacOS/`
@@ -600,46 +759,144 @@ pub fn find_repo_game_manifest(
 /// - Sets `METAL_IRCONVERTER_DYLIB` when `Contents/Frameworks/libmetalirconverter.dylib` exists.
 /// - Sets `AW2_DXILCONV` when `Contents/Frameworks/libdxilconv.dylib` exists.
 /// - Sets `PORT_VULKAN_DYLIB` when `Contents/Frameworks/libMoltenVK.dylib` exists.
+/// - Sets `STEAM_APPID` / `SteamAppId` / `SteamGameId` ONLY when `steam_app_id` is a valid
+///   numeric Steam AppID and `store` is not a non-Steam storefront.
 /// - Prepends `Contents/Frameworks` to `DYLD_FALLBACK_LIBRARY_PATH`.
 /// - Preserves any explicit developer override already present in the environment.
+///
+/// Every string value is emitted strictly as a Rust debug-escaped string literal (`{:?}`)
+/// via single-pass placeholder expansion so untrusted manifest fields can never inject code
+/// or trigger secondary placeholder substitution.
 pub fn generate_bundle_launcher_source(cfg: &BundleLauncherConfig<'_>) -> String {
-    BUNDLE_LAUNCHER_TEMPLATE
-        .replace("__CLEAN_TITLE__", cfg.clean_title)
-        .replace("__APP_ID_DEBUG__", &format!("{:?}", cfg.app_id))
-        .replace("__APP_ID__", cfg.app_id)
-        .replace("__EXE_REL_DEBUG__", &format!("{:?}", cfg.exe_rel))
-        .replace("__EXE_REL__", cfg.exe_rel)
-        .replace("__IMAGE_BASE_HEX__", &format!("{:016X}", cfg.image_base))
-        .replace("__SIZE_OF_IMAGE_HEX__", &format!("{:08X}", cfg.size_of_image))
-        .replace("__AOT_FN_COUNT__", &cfg.aot_fn_count.to_string())
-        .replace(
+    let is_non_steam_store = cfg
+        .store
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|s| !s.eq_ignore_ascii_case("steam"));
+    let effective_steam_app_id = if is_non_steam_store {
+        ""
+    } else {
+        cfg.steam_app_id
+            .map(str::trim)
+            .filter(|id| is_numeric_steam_app_id(id))
+            .unwrap_or("")
+    };
+    let store_display = cfg
+        .store
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    let cache_key = sanitize_launcher_cache_key(cfg.app_id);
+
+    let replacements: &[(&str, String)] = &[
+        ("__CLEAN_TITLE_DEBUG__", format!("{:?}", cfg.clean_title)),
+        ("__STORE_DEBUG__", format!("{:?}", store_display)),
+        ("__APP_ID_DEBUG__", format!("{:?}", cfg.app_id)),
+        (
+            "__STEAM_APP_ID_DEBUG__",
+            format!("{:?}", effective_steam_app_id),
+        ),
+        ("__CACHE_KEY_DEBUG__", format!("{:?}", cache_key)),
+        ("__EXE_REL_DEBUG__", format!("{:?}", cfg.exe_rel)),
+        ("__IMAGE_BASE_HEX__", format!("{:016X}", cfg.image_base)),
+        (
+            "__SIZE_OF_IMAGE_HEX__",
+            format!("{:08X}", cfg.size_of_image),
+        ),
+        ("__AOT_FN_COUNT__", cfg.aot_fn_count.to_string()),
+        (
             "__AOT_DYLIB_NAME_DEBUG__",
-            &format!("{:?}", cfg.aot_dylib_name),
-        )
-        .replace("__AOT_DYLIB_NAME__", cfg.aot_dylib_name)
-        .replace(
+            format!("{:?}", cfg.aot_dylib_name),
+        ),
+        (
             "__EXTRA_AOT_DYLIBS_DEBUG__",
-            &format!("{:?}", cfg.extra_aot_dylibs),
-        )
+            format!("{:?}", cfg.extra_aot_dylibs),
+        ),
+    ];
+
+    let mut out = String::with_capacity(BUNDLE_LAUNCHER_TEMPLATE.len() + 256);
+    let mut rest = BUNDLE_LAUNCHER_TEMPLATE;
+    while let Some(pos) = rest.find("__") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if let Some((tok, val)) = replacements.iter().find(|(t, _)| after.starts_with(*t)) {
+            out.push_str(val);
+            rest = &after[tok.len()..];
+        } else {
+            out.push_str("__");
+            rest = &after[2..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Wall-clock stage timings recorded while packaging a macOS `.app` bundle.
+#[derive(Debug, Clone, Default)]
+pub struct BundleStageTimings {
+    pub payload_copy_secs: f64,
+    pub shader_precompile_secs: f64,
+    pub aot_prewarm_secs: f64,
+    pub codesign_secs: f64,
+    pub total_secs: f64,
 }
 
 /// Result of converting a Steam game or Windows application.
 #[derive(Debug, Clone)]
 pub struct SteamConvertResult {
     pub app_id: String,
+    pub store: Option<String>,
     pub game_name: String,
     pub source_dir: PathBuf,
     pub primary_exe: PathBuf,
     pub output_path: PathBuf,
     pub format: ConversionFormat,
     pub win32_readiness_pct: f64,
+    pub v8_jitless: bool,
     pub shaders_converted: usize,
+    pub shaders_total: usize,
+    pub shaders_failed: usize,
     pub registry_keys_seeded: usize,
+    pub aot_cache_modules: usize,
+    pub aot_prewarm_error: Option<String>,
     pub aot_functions_compiled: usize,
     pub aot_instructions_lowered: usize,
     pub aot_dylib_path: Option<PathBuf>,
     pub standalone_executable: Option<PathBuf>,
     pub staged_frameworks: StagedFrameworks,
+    pub warnings: Vec<String>,
+    pub stage_timings: BundleStageTimings,
+}
+
+fn summarize_prewarm_failure(status: std::process::ExitStatus, stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr_s = String::from_utf8_lossy(stderr);
+    let stdout_s = String::from_utf8_lossy(stdout);
+    let pick_lines = |text: &str| -> String {
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if lines.is_empty() {
+            String::new()
+        } else {
+            let start = lines.len().saturating_sub(3);
+            lines[start..].join(" | ")
+        }
+    };
+    let detail = {
+        let err_part = pick_lines(&stderr_s);
+        if !err_part.is_empty() {
+            err_part
+        } else {
+            pick_lines(&stdout_s)
+        }
+    };
+    if detail.is_empty() {
+        format!("port-runner --prewarm-aot exited with {status}")
+    } else {
+        format!("port-runner --prewarm-aot exited with {status}: {detail}")
+    }
 }
 
 /// Resolve a target (`AppID` like `2357570`, game name like `Overwatch`, `steam`, or path)
@@ -653,8 +910,10 @@ pub fn convert_steam_game(
 
     let q = opts.target.trim();
     let q_lower = q.to_ascii_lowercase();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut acquire_manifest: Option<AcquireManifest> = None;
 
-    let resolved_entry = if let Some(found) = report.installed_games.iter().find(|g| {
+    let mut resolved_entry = if let Some(found) = report.installed_games.iter().find(|g| {
         g.app_id.eq_ignore_ascii_case(q)
             || g.name.to_ascii_lowercase().contains(&q_lower)
             || (q_lower == "steam" && g.app_id == "steam-client-win64")
@@ -672,25 +931,133 @@ pub fn convert_steam_game(
         } else {
             p.clone()
         };
-        let name = dir
+        match load_acquire_manifest_in_dir(&dir) {
+            Ok(Some(acq)) => {
+                acquire_manifest = Some(acq);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let msg = format!(
+                    "failed to parse {}/{ACQUIRE_MANIFEST_FILENAME}: {e:#}",
+                    dir.display()
+                );
+                eprintln!("warning: {msg}");
+                warnings.push(msg);
+            }
+        }
+        let default_name = dir
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("ConvertedGame")
             .to_string();
+        let (init_app_id, init_name, init_build_id, init_source) =
+            if let Some(ref acq) = acquire_manifest {
+                let id = if acq.app_id.is_empty() {
+                    "custom".to_string()
+                } else {
+                    acq.app_id.clone()
+                };
+                let title = acq.title.clone().unwrap_or(default_name);
+                let ver = acq
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| "local".to_string());
+                let src = match acq.store.as_str() {
+                    "epic" => GameLibrarySource::HeroicEpic,
+                    "steam" => GameLibrarySource::PortFactoryLibrary,
+                    _ => GameLibrarySource::MacOsSteam,
+                };
+                (id, title, ver, src)
+            } else {
+                (
+                    "custom".to_string(),
+                    default_name,
+                    "local".to_string(),
+                    GameLibrarySource::MacOsSteam,
+                )
+            };
         let mut entry = inspect_game_directory(
-            "custom",
-            &name,
-            GameLibrarySource::MacOsSteam,
+            &init_app_id,
+            &init_name,
+            init_source,
             &dir,
             0,
-            "local",
+            &init_build_id,
             "Windows",
             &db,
         )?;
         if p.is_file() {
             entry.primary_exe = Some(p);
+        } else if let Some(ref acq) = acquire_manifest {
+            if let Some(ref rel_exe) = acq.executable {
+                let cand = dir.join(rel_exe);
+                if cand.is_file() {
+                    entry.primary_exe = Some(cand);
+                }
+            }
         }
         entry
+    };
+
+    // Also pick up `port-acquire-manifest.json` when the install was matched via library scan.
+    if acquire_manifest.is_none() {
+        match load_acquire_manifest_in_dir(&resolved_entry.install_dir) {
+            Ok(Some(acq)) => {
+                if (resolved_entry.app_id.is_empty()
+                    || resolved_entry.app_id.eq_ignore_ascii_case("custom"))
+                    && !acq.app_id.is_empty()
+                {
+                    resolved_entry.app_id = acq.app_id.clone();
+                }
+                if (resolved_entry.build_id.is_empty()
+                    || resolved_entry.build_id == "local"
+                    || resolved_entry.build_id == "0")
+                    && acq.version.is_some()
+                {
+                    resolved_entry.build_id = acq.version.clone().unwrap_or_default();
+                }
+                if let Some(ref rel_exe) = acq.executable {
+                    let cand = resolved_entry.install_dir.join(rel_exe);
+                    if cand.is_file() {
+                        resolved_entry.primary_exe = Some(cand);
+                    }
+                }
+                acquire_manifest = Some(acq);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let msg = format!(
+                    "failed to parse {}/{ACQUIRE_MANIFEST_FILENAME}: {e:#}",
+                    resolved_entry.install_dir.display()
+                );
+                eprintln!("warning: {msg}");
+                warnings.push(msg);
+            }
+        }
+    }
+
+    if let Some(ref acq) = acquire_manifest {
+        if acq.had_unredacted_secrets {
+            let msg = format!(
+                "{ACQUIRE_MANIFEST_FILENAME} contained unredacted auth/secret launch flags (stripped from generated game.toml and bundled manifest copies)"
+            );
+            eprintln!("warning: {msg}");
+            warnings.push(msg);
+        }
+    }
+
+    let store_label = acquire_manifest
+        .as_ref()
+        .map(|a| a.store.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            is_numeric_steam_app_id(&resolved_entry.app_id).then(|| "steam".to_string())
+        });
+    let resolved_steam_app_id: Option<&str> = if let Some(ref acq) = acquire_manifest {
+        acq.steam_app_id()
+    } else {
+        is_numeric_steam_app_id(&resolved_entry.app_id).then_some(resolved_entry.app_id.trim())
     };
 
     let primary_exe = resolved_entry.primary_exe.clone().ok_or_else(|| {
@@ -719,6 +1086,8 @@ pub fn convert_steam_game(
         exec_ident = "ConvertedGame".to_string();
     }
 
+    let shader_limit = opts.shader_limit.unwrap_or(usize::MAX);
+
     match opts.format {
         ConversionFormat::AotCrate => {
             let out_dir = opts.output_path.clone().unwrap_or_else(|| {
@@ -735,24 +1104,32 @@ pub fn convert_steam_game(
             )?;
             let post = apply_post_install(
                 &resolved_entry.install_dir,
-                &resolved_entry.app_id,
+                resolved_steam_app_id.unwrap_or("0"),
                 &out_dir,
             )?;
             Ok(SteamConvertResult {
                 app_id: resolved_entry.app_id.clone(),
+                store: store_label,
                 game_name: resolved_entry.name.clone(),
                 source_dir: resolved_entry.install_dir.clone(),
                 primary_exe,
                 output_path: out_dir,
                 format: ConversionFormat::AotCrate,
                 win32_readiness_pct: resolved_entry.readiness_pct(),
+                v8_jitless: detect_v8_or_cohtml_in_game_dir(&resolved_entry.install_dir),
                 shaders_converted: 0,
+                shaders_total: 0,
+                shaders_failed: 0,
                 registry_keys_seeded: post.registry_entries.len(),
+                aot_cache_modules: 0,
+                aot_prewarm_error: None,
                 aot_functions_compiled: summary.function_count,
                 aot_instructions_lowered: summary.lowered_instructions,
                 aot_dylib_path: None,
                 standalone_executable: None,
                 staged_frameworks: StagedFrameworks::default(),
+                warnings,
+                stage_timings: BundleStageTimings::default(),
             })
         }
         ConversionFormat::MetalShaders => {
@@ -764,23 +1141,35 @@ pub fn convert_steam_game(
             let stats = precompile_shaders_for_paths(
                 std::slice::from_ref(&resolved_entry.install_dir),
                 Some(out_dir.clone()),
-                1024,
+                shader_limit,
             )?;
             Ok(SteamConvertResult {
                 app_id: resolved_entry.app_id.clone(),
+                store: store_label,
                 game_name: resolved_entry.name.clone(),
                 source_dir: resolved_entry.install_dir.clone(),
                 primary_exe,
                 output_path: out_dir,
                 format: ConversionFormat::MetalShaders,
                 win32_readiness_pct: resolved_entry.readiness_pct(),
+                v8_jitless: detect_v8_or_cohtml_in_game_dir(&resolved_entry.install_dir),
                 shaders_converted: stats.active_wave32_converted,
+                shaders_total: stats.active_wave32_exports,
+                shaders_failed: stats.active_wave32_failed,
                 registry_keys_seeded: 0,
+                aot_cache_modules: 0,
+                aot_prewarm_error: None,
                 aot_functions_compiled: 0,
                 aot_instructions_lowered: 0,
                 aot_dylib_path: None,
                 standalone_executable: None,
                 staged_frameworks: StagedFrameworks::default(),
+                warnings,
+                stage_timings: BundleStageTimings {
+                    shader_precompile_secs: stats.elapsed_secs,
+                    total_secs: stats.elapsed_secs,
+                    ..BundleStageTimings::default()
+                },
             })
         }
         ConversionFormat::MacOsApp => {
@@ -797,8 +1186,12 @@ pub fn convert_steam_game(
                 &exec_ident,
                 &out_app,
                 opts.precompile_shaders,
+                shader_limit,
                 opts.max_aot_functions,
                 opts.bundle_shader_cache_from.as_deref(),
+                acquire_manifest.as_ref(),
+                store_label,
+                warnings,
                 &db,
             )
         }
@@ -814,10 +1207,17 @@ fn package_macos_game_bundle(
     exec_ident: &str,
     out_app: &Path,
     precompile_shaders: bool,
+    shader_limit: usize,
     max_aot_functions: usize,
     bundle_shader_cache_from: Option<&Path>,
+    acquire_manifest: Option<&AcquireManifest>,
+    store_label: Option<String>,
+    mut warnings: Vec<String>,
     db: &Win32Database,
 ) -> Result<SteamConvertResult> {
+    let t_total = Instant::now();
+    let mut stage_timings = BundleStageTimings::default();
+
     let contents_dir = out_app.join("Contents");
     let macos_dir = contents_dir.join("MacOS");
     let frameworks_dir = contents_dir.join("Frameworks");
@@ -870,13 +1270,60 @@ fn package_macos_game_bundle(
     fs::copy(&loader_bin, &dst_runner)?;
     fs::copy(&shaderd_bin, &dst_shaderd)?;
 
+    // Detect V8 / Cohtml / CEF using the exact same rules as `audit-game`.
+    let v8_jitless = detect_v8_or_cohtml_in_game_dir(&entry.install_dir);
+
+    // Resolve whether this bundle actually belongs to Steam (never treat non-Steam numeric IDs
+    // such as GOG product IDs as Steam AppIDs for `steam_appid.txt` or launcher env vars).
+    let resolved_steam_app_id: Option<&str> = if let Some(acq) = acquire_manifest {
+        acq.steam_app_id()
+    } else {
+        is_numeric_steam_app_id(&entry.app_id).then_some(entry.app_id.trim())
+    };
+
+    // Sanitize and mirror `port-acquire-manifest.json` into `Contents/Resources/` when present
+    // and valid so no unredacted auth/secret launch flags are ever packaged into the `.app`.
+    let src_acquire_manifest = entry.install_dir.join(ACQUIRE_MANIFEST_FILENAME);
+    let dst_acquire_manifest = resources_dir.join(ACQUIRE_MANIFEST_FILENAME);
+    let mut sanitized_acquire_manifest_json: Option<String> = None;
+    if acquire_manifest.is_some() && src_acquire_manifest.is_file() {
+        let raw = fs::read_to_string(&src_acquire_manifest)
+            .with_context(|| format!("reading {}", src_acquire_manifest.display()))?;
+        let (_, sanitized) = sanitize_acquire_manifest_json(&raw)
+            .with_context(|| format!("sanitizing {}", src_acquire_manifest.display()))?;
+        fs::write(&dst_acquire_manifest, &sanitized).with_context(|| {
+            format!("writing sanitized {}", dst_acquire_manifest.display())
+        })?;
+        sanitized_acquire_manifest_json = Some(sanitized);
+    } else if dst_acquire_manifest.exists() {
+        let _ = fs::remove_file(&dst_acquire_manifest);
+    }
+
     // Write declarative per-game manifest (`Contents/Resources/game.toml`), adopting any curated
-    // repo manifest under `games/<id>/game.toml` (e.g. `builtin_overrides`) when available.
+    // repo manifest under `games/<id>/game.toml` (e.g. `builtin_overrides`) when available,
+    // while honoring `port-acquire-manifest.json` metadata and `audit-game`'s `v8_jitless` check.
     let manifest_path = resources_dir.join("game.toml");
-    let manifest_toml = find_repo_game_manifest(workspace_root, &entry.app_id, &exe_rel)
-        .unwrap_or_else(|| {
-            generate_game_manifest_toml(clean_title, exec_ident, &exe_rel, &entry.app_id)
-        });
+    let display_name = acquire_manifest
+        .and_then(|a| a.title.as_deref())
+        .unwrap_or(clean_title);
+    let manifest_toml = find_repo_game_manifest(
+        workspace_root,
+        resolved_steam_app_id.unwrap_or("custom"),
+        &exe_rel,
+    )
+    .map(|curated| {
+        merge_acquire_and_v8_into_curated_manifest(&curated, v8_jitless, acquire_manifest)
+    })
+    .unwrap_or_else(|| {
+        generate_bundle_game_manifest_toml(&BundleManifestInput {
+            display_name,
+            exec_ident,
+            exe_rel: &exe_rel,
+            app_id: &entry.app_id,
+            v8_jitless,
+            acquire_manifest,
+        })
+    });
     fs::write(&manifest_path, manifest_toml)?;
 
     // Copy runtime frameworks (`libmetalirconverter.dylib`, optional `libdxilconv.dylib`,
@@ -884,10 +1331,12 @@ fn package_macos_game_bundle(
     // works with zero developer environment variables set.
     let staged_frameworks = stage_bundle_frameworks(&frameworks_dir, workspace_root)?;
 
-    // 4. Apply Post-Install (`steam_appid.txt` + `steam_registry.tsv`)
-    let post = apply_post_install(&entry.install_dir, &entry.app_id, &resources_dir)?;
+    // 4. Apply Post-Install (`steam_appid.txt` only for Steam + `steam_registry.tsv`)
+    let post_steam_id = resolved_steam_app_id.unwrap_or("0");
+    let post = apply_post_install(&entry.install_dir, post_steam_id, &resources_dir)?;
 
     // 5. Copy/clone all game files (EXEs, DLLs, assets) into `Contents/Resources/Game`
+    let t_copy = Instant::now();
     let bundle_game_dir = resources_dir.join("Game");
     let same_dir = fs::canonicalize(&entry.install_dir)
         .ok()
@@ -906,18 +1355,54 @@ fn package_macos_game_bundle(
                 copy_report.symlinks_skipped_cycle,
             );
         }
+        // Replace the cloned `Contents/Resources/Game/port-acquire-manifest.json` with the
+        // sanitized copy (removing first so copy-on-write/read-only metadata never blocks or
+        // mutates the source install directory).
+        if let Some(ref sanitized) = sanitized_acquire_manifest_json {
+            let game_manifest_copy = bundle_game_dir.join(ACQUIRE_MANIFEST_FILENAME);
+            if game_manifest_copy.exists() || game_manifest_copy.is_symlink() {
+                let _ = fs::remove_file(&game_manifest_copy);
+            }
+            fs::write(&game_manifest_copy, sanitized).with_context(|| {
+                format!("writing sanitized {}", game_manifest_copy.display())
+            })?;
+        }
     }
-    let _ = apply_post_install(&entry.install_dir, &entry.app_id, &bundle_game_dir);
+    let _ = apply_post_install(&entry.install_dir, post_steam_id, &bundle_game_dir);
+    stage_timings.payload_copy_secs = t_copy.elapsed().as_secs_f64();
 
-    // 6. Shader Pre-Compilation & optional portable Tier-1 cache copy into `Contents/Resources/ShaderCache`
+    // 6. Shader Pre-Compilation (parallel across cores, defaulting to all shaders unless capped
+    //    via `--shader-limit`) & optional portable Tier-1 cache copy into `Contents/Resources/ShaderCache`.
+    let t_shaders = Instant::now();
     let mut shaders_converted = 0usize;
+    let mut shaders_total = 0usize;
+    let mut shaders_failed = 0usize;
     if precompile_shaders {
-        if let Ok(stats) = precompile_shaders_for_paths(
+        match precompile_shaders_for_paths(
             std::slice::from_ref(&entry.install_dir),
             Some(shader_cache_dir.clone()),
-            1024,
+            shader_limit,
         ) {
-            shaders_converted = stats.active_wave32_converted;
+            Ok(stats) => {
+                shaders_converted = stats.active_wave32_converted;
+                shaders_total = stats.active_wave32_exports;
+                shaders_failed = stats.active_wave32_failed;
+                if stats.active_wave32_failed > 0 {
+                    let msg = format!(
+                        "shader precompile converted {}/{} active shader(s) ({} failed in {:.2}s)",
+                        stats.active_wave32_converted,
+                        stats.active_wave32_exports,
+                        stats.active_wave32_failed,
+                        stats.elapsed_secs
+                    );
+                    eprintln!("note: {msg}");
+                }
+            }
+            Err(e) => {
+                let msg = format!("shader precompile failed: {e:#}");
+                eprintln!("warning: {msg}");
+                warnings.push(msg);
+            }
         }
     }
     if let Some(src_cache) = bundle_shader_cache_from {
@@ -925,9 +1410,12 @@ fn package_macos_game_bundle(
             shaders_converted += copied;
         }
     }
+    stage_timings.shader_precompile_secs = t_shaders.elapsed().as_secs_f64();
 
     // 6b. Offline ARM64 `.aot` block-cache prewarming into `Contents/Resources/AotCache`
-    //     (best-effort: passes `--manifest` so curated `builtin_overrides` are prewarmed too).
+    //     (passes `--manifest` so curated `builtin_overrides` and `v8_jitless` are honored).
+    //     Failures are surfaced clearly in both stderr and `SteamConvertResult` (never hidden).
+    let t_aot = Instant::now();
     let prewarm_target_pe = bundle_game_dir.join(&exe_rel);
     let prewarm_pe = if prewarm_target_pe.is_file() {
         prewarm_target_pe.as_path()
@@ -960,6 +1448,7 @@ fn package_macos_game_bundle(
             }
         }
     }
+    let mut aot_prewarm_error: Option<String> = None;
     match prewarm_cmd.output() {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -968,18 +1457,36 @@ fn package_macos_game_bundle(
             }
         }
         Ok(out) => {
-            eprintln!(
-                "warning: offline .aot prewarm failed for {clean_title} (status {}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            let err_summary = summarize_prewarm_failure(out.status, &out.stdout, &out.stderr);
+            eprintln!("WARNING: offline --prewarm-aot FAILED for {clean_title}: {err_summary}");
+            eprintln!("         Contents/Resources/AotCache will be incomplete or empty; first launch will JIT on demand.");
+            aot_prewarm_error = Some(err_summary.clone());
+            warnings.push(format!("offline --prewarm-aot failed: {err_summary}"));
         }
         Err(e) => {
-            eprintln!(
-                "warning: could not launch port-runner for offline .aot prewarm of {clean_title}: {e}"
-            );
+            let err_summary = format!("could not launch port-runner for --prewarm-aot: {e}");
+            eprintln!("WARNING: {err_summary}");
+            aot_prewarm_error = Some(err_summary.clone());
+            warnings.push(err_summary);
         }
     }
+    let aot_cache_modules = fs::read_dir(&aot_cache_dir)
+        .ok()
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    let p = e.path();
+                    p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("aot")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if aot_prewarm_error.is_none() && aot_cache_modules == 0 {
+        let msg = "offline --prewarm-aot exited cleanly but wrote 0 .aot files into Contents/Resources/AotCache".to_string();
+        eprintln!("WARNING: {msg}");
+        warnings.push(msg);
+    }
+    stage_timings.aot_prewarm_secs = t_aot.elapsed().as_secs_f64();
 
     // 7. Optional Prototype Static Rust AOT (`--max-fns N`, skipped cleanly when `max_aot_functions == 0`,
     //    since large games use `x86-runtime`'s prewarmed `.aot` block caches above).
@@ -1111,7 +1618,9 @@ fn package_macos_game_bundle(
     let standalone_rs_path = aot_dir.join(format!("{ident_lower}_standalone_main.rs"));
     let launcher_cfg = BundleLauncherConfig {
         clean_title,
+        store: store_label.as_deref(),
         app_id: &entry.app_id,
+        steam_app_id: resolved_steam_app_id,
         exe_rel: &exe_rel,
         image_base,
         size_of_image,
@@ -1148,7 +1657,11 @@ fn package_macos_game_bundle(
         let _ = set_executable_mode(bin);
     }
 
-    // 9. Ad-hoc sign all Mach-O binaries in Frameworks and MacOS, then the .app bundle
+    // 9. Ad-hoc sign nested Mach-O binaries in Frameworks and MacOS (`dxil-metald`, `port-runner`),
+    //    then sign the `.app` bundle ONCE (do NOT sign `standalone_bin_path` separately first,
+    //    because signing `CFBundleExecutable` resolves to the enclosing `.app` bundle and hashes
+    //    the entire `Contents/Resources/Game` payload a full extra time!).
+    let t_sign = Instant::now();
     if let Ok(rd) = fs::read_dir(&frameworks_dir) {
         for f in rd.flatten() {
             let p = f.path();
@@ -1157,31 +1670,47 @@ fn package_macos_game_bundle(
             }
         }
     }
-    for bin in [
-        macos_dir.join("dxil-metald"),
-        macos_dir.join("port-runner"),
-        standalone_bin_path.clone(),
-    ] {
+    for bin in [macos_dir.join("dxil-metald"), macos_dir.join("port-runner")] {
         if bin.is_file() {
             codesign_ad_hoc(&bin);
         }
     }
-    codesign_ad_hoc(out_app);
+    codesign_ad_hoc_checked(out_app)?;
+
+    // Record an external `CDHash`-bound verification receipt immediately after signing (strictly
+    // outside the `.app` bundle so the signature remains untouched) so `bundle-verify` on the
+    // unchanged payload avoids redundantly re-hashing 100+ GiB of read-only game assets.
+    #[cfg(target_os = "macos")]
+    if let Err(e) = record_bundle_signing_receipt(out_app) {
+        let msg = format!("could not record external signing verification receipt: {e:#}");
+        eprintln!("warning: {msg}");
+        warnings.push(msg);
+    }
+    stage_timings.codesign_secs = t_sign.elapsed().as_secs_f64();
+    stage_timings.total_secs = t_total.elapsed().as_secs_f64();
 
     Ok(SteamConvertResult {
         app_id: entry.app_id.clone(),
+        store: store_label,
         game_name: entry.name.clone(),
         source_dir: entry.install_dir.clone(),
         primary_exe: primary_exe.to_path_buf(),
         output_path: out_app.to_path_buf(),
         format: ConversionFormat::MacOsApp,
         win32_readiness_pct: entry.readiness_pct(),
+        v8_jitless,
         shaders_converted,
+        shaders_total,
+        shaders_failed,
         registry_keys_seeded: post.registry_entries.len(),
+        aot_cache_modules,
+        aot_prewarm_error,
         aot_functions_compiled,
         aot_instructions_lowered,
         aot_dylib_path,
         standalone_executable: Some(standalone_bin_path),
         staged_frameworks,
+        warnings,
+        stage_timings,
     })
 }

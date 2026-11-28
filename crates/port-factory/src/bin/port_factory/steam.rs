@@ -209,6 +209,7 @@ pub fn cmd_steam_port(args: &[String]) -> Result<i32> {
     let mut validate = false;
     let mut skip_download = false;
     let mut precompile_shaders = true;
+    let mut shader_limit: Option<usize> = None;
     let mut copy_to: Option<PathBuf> = None;
     let mut dry_run = false;
 
@@ -235,6 +236,13 @@ pub fn cmd_steam_port(args: &[String]) -> Result<i32> {
             "--validate" | "--repair" => validate = true,
             "--skip-download" => skip_download = true,
             "--no-shaders" => precompile_shaders = false,
+            "--shader-limit" | "--limit" => {
+                let raw = cur.next_or_err("--shader-limit requires N")?;
+                let parsed: usize = raw
+                    .parse()
+                    .map_err(|_| usage_err(format!("invalid --shader-limit value {raw:?}")))?;
+                shader_limit = (parsed > 0).then_some(parsed);
+            }
             "--dry-run" => dry_run = true,
             other if !other.starts_with('-') && target.is_none() => {
                 target = Some(other.to_string());
@@ -259,6 +267,7 @@ pub fn cmd_steam_port(args: &[String]) -> Result<i32> {
             validate,
             skip_download,
             precompile_shaders,
+            shader_limit,
             copy_to,
             dry_run,
         },
@@ -351,13 +360,14 @@ pub fn cmd_steam_postinstall(args: &[String]) -> Result<i32> {
 pub fn cmd_steam_convert(args: &[String]) -> Result<i32> {
     if args.is_empty() {
         return Err(usage_err(
-            "steam-convert requires <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH]",
+            "steam-convert requires <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH] [--shader-limit N]",
         ));
     }
     let mut target: Option<String> = None;
     let mut format = ConversionFormat::MacOsApp;
     let mut output_path: Option<PathBuf> = None;
     let mut precompile_shaders = true;
+    let mut shader_limit: Option<usize> = None;
     let mut max_aot_functions = 2000usize;
     let mut bundle_shader_cache_from: Option<PathBuf> = None;
 
@@ -381,6 +391,14 @@ pub fn cmd_steam_convert(args: &[String]) -> Result<i32> {
                 // Self-contained copy into `Contents/Resources/Game` is always enabled.
             }
             "--no-shaders" => precompile_shaders = false,
+            "--shader-limit" | "--limit" => {
+                let raw = cur.next_or_err("--shader-limit requires N")?;
+                let parsed: usize = raw
+                    .parse()
+                    .map_err(|_| usage_err(format!("invalid --shader-limit value {raw:?}")))?;
+                // `0` explicitly requests no cap (same convention as `--aot-max-funcs 0`).
+                shader_limit = (parsed > 0).then_some(parsed);
+            }
             "--bundle-shader-cache" => {
                 if let Some(next) = cur.next_opt_value() {
                     bundle_shader_cache_from = Some(PathBuf::from(next));
@@ -415,19 +433,27 @@ pub fn cmd_steam_convert(args: &[String]) -> Result<i32> {
         format,
         output_path,
         precompile_shaders,
+        shader_limit,
         max_aot_functions,
         bundle_shader_cache_from,
     };
 
     let root = workspace_root();
     let res = convert_steam_game(&root, &opts)?;
+    let store_tag = match res.store.as_deref() {
+        Some(s) => format!("{s}:{}", res.app_id),
+        None => format!("AppID {}", res.app_id),
+    };
     println!("================================================================================");
     println!(
-        "One-Click Steam Game & Client Converter: {} (AppID {})",
-        res.game_name, res.app_id
+        "One-Click Game & Client Converter: {} ({store_tag})",
+        res.game_name
     );
     println!("================================================================================");
     println!("  Format             : {:?}", res.format);
+    if let Some(ref st) = res.store {
+        println!("  Store / AppID      : {st} / {}", res.app_id);
+    }
     println!("  Source Directory   : {}", res.source_dir.display());
     println!("  Primary Executable : {}", res.primary_exe.display());
     println!("  Output Artifact    : {}", res.output_path.display());
@@ -447,6 +473,18 @@ pub fn cmd_steam_convert(args: &[String]) -> Result<i32> {
                 fw.join(", ")
             }
         );
+        println!("  V8 / Cohtml Jitless: {}", res.v8_jitless);
+        if let Some(ref err) = res.aot_prewarm_error {
+            println!(
+                "  AOT Block Cache    : FAILED ({} .aot module(s)) — {err}",
+                res.aot_cache_modules
+            );
+        } else {
+            println!(
+                "  AOT Block Cache    : {} prewarmed .aot module(s) in Contents/Resources/AotCache",
+                res.aot_cache_modules
+            );
+        }
     }
     println!(
         "  AOT Compilation    : {} function(s) compiled ({} instructions lowered to native ARM64)",
@@ -457,9 +495,33 @@ pub fn cmd_steam_convert(args: &[String]) -> Result<i32> {
         "  Post-Install Setup : {} registry key(s) provisioned in steam_registry.tsv",
         res.registry_keys_seeded
     );
-    println!(
-        "  Shader Pipeline    : {} Metal shader(s) pre-compiled",
-        res.shaders_converted
-    );
+    if res.shaders_total > 0 {
+        println!(
+            "  Shader Pipeline    : {}/{} Metal shader(s) pre-compiled ({} failed)",
+            res.shaders_converted, res.shaders_total, res.shaders_failed
+        );
+    } else {
+        println!(
+            "  Shader Pipeline    : {} Metal shader(s) pre-compiled",
+            res.shaders_converted
+        );
+    }
+    if res.format == ConversionFormat::MacOsApp {
+        let t = &res.stage_timings;
+        println!(
+            "  Stage Timings      : copy={:.2}s, shaders={:.2}s, aot-prewarm={:.2}s, codesign={:.2}s, total={:.2}s",
+            t.payload_copy_secs,
+            t.shader_precompile_secs,
+            t.aot_prewarm_secs,
+            t.codesign_secs,
+            t.total_secs
+        );
+    }
+    if !res.warnings.is_empty() {
+        println!("  Warnings ({})       :", res.warnings.len());
+        for w in &res.warnings {
+            println!("    [WARN] {w}");
+        }
+    }
     Ok(exit_codes::OK)
 }

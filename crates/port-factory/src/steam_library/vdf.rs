@@ -268,6 +268,19 @@ pub fn scan_post_install(game_dir: &Path) -> PostInstallSummary {
         }
     }
 
+    // Also incorporate redistributable metadata from `port-acquire-manifest.json` when present
+    // (any storefront: Epic, Steam, GOG, etc.).
+    if let Ok(Some(acq)) = super::acquire_manifest::load_acquire_manifest_in_dir(game_dir) {
+        for r in &acq.redistributables {
+            if r.native_in_win32_rt {
+                let label = format!("{} (Natively provided by win32-rt runtime)", r.name);
+                if !summary.bypassable_redistributables.contains(&label) {
+                    summary.bypassable_redistributables.push(label);
+                }
+            }
+        }
+    }
+
     summary
 }
 

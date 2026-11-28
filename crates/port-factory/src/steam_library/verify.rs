@@ -1,15 +1,24 @@
 //! Portable macOS `.app` bundle verifier (`bundle-verify`).
 
+use super::acquire_manifest::{load_acquire_manifest, ACQUIRE_MANIFEST_FILENAME};
 use super::macos_bundle::{is_macho_file, parse_vtool_macos_versions, version_major};
+use crate::bundle_codesign::verify_bundle_codesign_fast;
 use crate::bundle_common::{
-    codesign_verify_deep_strict, extract_plist_string, otool_install_names, otool_linked_libs,
-    scan_shader_cache,
+    extract_plist_string, otool_install_names, otool_linked_libs, scan_shader_cache,
 };
 use anyhow::Result;
 use port_manifest::GameManifest;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Options controlling [`verify_app_bundle_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct VerifyBundleOptions {
+    /// When `true`, bypass any cached `CDHash` signing receipt and re-hash every sealed
+    /// resource in `Contents/_CodeSignature/CodeResources` byte-for-byte in parallel.
+    pub full_rehash: bool,
+}
 
 /// Outcome of a single `.app` portability check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +77,17 @@ fn is_portable_dylib_dep(dep: &str) -> bool {
 /// Verify that a macOS `.app` bundle is genuinely self-contained and ready to copy to an
 /// external SSD and launch on another Apple Silicon Mac without developer environment setup.
 pub fn verify_app_bundle(app_path: &Path) -> Result<BundleVerifyReport> {
+    verify_app_bundle_with_options(app_path, &VerifyBundleOptions::default())
+}
+
+/// Like [`verify_app_bundle`], with explicit [`VerifyBundleOptions`] (e.g. `full_rehash` to
+/// bypass any cached `CDHash` signing receipt and re-hash every sealed file in parallel).
+pub fn verify_app_bundle_with_options(
+    app_path: &Path,
+    opts: &VerifyBundleOptions,
+) -> Result<BundleVerifyReport> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = opts;
     let mut checks = Vec::new();
     let push = |checks: &mut Vec<BundleCheck>,
                 name: &str,
@@ -229,18 +249,36 @@ pub fn verify_app_bundle(app_path: &Path) -> Result<BundleVerifyReport> {
     if manifest_path.is_file() {
         let content = fs::read_to_string(&manifest_path).unwrap_or_default();
         let parsed = GameManifest::parse(&content);
-        let exe_field = parsed.exe.unwrap_or_default();
+        let exe_field = parsed.exe.clone().unwrap_or_default();
         let overrides = parsed
             .builtin_overrides
+            .clone()
             .unwrap_or_else(|| "(none)".to_string());
-        push(
-            &mut checks,
-            "game_manifest",
-            BundleCheckStatus::Pass,
-            format!(
-                "Contents/Resources/game.toml (exe={exe_field:?}, builtin_overrides={overrides:?})"
-            ),
-        );
+        let v8_flag = parsed.v8_jitless.unwrap_or(false);
+        let arg_count = parsed.split_args().len();
+        let has_custom_steam_id = parsed
+            .steam_app_id
+            .as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("custom"));
+        if has_custom_steam_id {
+            push(
+                &mut checks,
+                "game_manifest",
+                BundleCheckStatus::Warn,
+                format!(
+                    "Contents/Resources/game.toml has placeholder steam_app_id=\"custom\" (exe={exe_field:?}, v8_jitless={v8_flag}, args={arg_count})"
+                ),
+            );
+        } else {
+            push(
+                &mut checks,
+                "game_manifest",
+                BundleCheckStatus::Pass,
+                format!(
+                    "Contents/Resources/game.toml (exe={exe_field:?}, v8_jitless={v8_flag}, args={arg_count}, builtin_overrides={overrides:?})"
+                ),
+            );
+        }
     } else {
         push(
             &mut checks,
@@ -248,6 +286,70 @@ pub fn verify_app_bundle(app_path: &Path) -> Result<BundleVerifyReport> {
             BundleCheckStatus::Fail,
             "missing Contents/Resources/game.toml".to_string(),
         );
+    }
+
+    // Optional `port-acquire-manifest.json` integrity & secret-redaction audit when present
+    // in either `Contents/Resources/` or `Contents/Resources/Game/`.
+    let acquire_manifest_paths = [
+        (
+            format!("Contents/Resources/{ACQUIRE_MANIFEST_FILENAME}"),
+            resources_dir.join(ACQUIRE_MANIFEST_FILENAME),
+        ),
+        (
+            format!("Contents/Resources/Game/{ACQUIRE_MANIFEST_FILENAME}"),
+            resources_dir.join("Game").join(ACQUIRE_MANIFEST_FILENAME),
+        ),
+    ];
+    let present_manifests: Vec<&(String, PathBuf)> = acquire_manifest_paths
+        .iter()
+        .filter(|(_, p)| p.is_file())
+        .collect();
+    if !present_manifests.is_empty() {
+        let mut manifest_errors: Vec<String> = Vec::new();
+        let mut first_clean: Option<super::acquire_manifest::AcquireManifest> = None;
+        for (rel, path) in &present_manifests {
+            match load_acquire_manifest(path) {
+                Ok(acq) if acq.had_unredacted_secrets => {
+                    manifest_errors.push(format!(
+                        "{rel} contains unredacted auth/secret launch flags"
+                    ));
+                }
+                Ok(acq) => {
+                    if first_clean.is_none() {
+                        first_clean = Some(acq);
+                    }
+                }
+                Err(e) => {
+                    manifest_errors.push(format!("invalid {rel}: {e:#}"));
+                }
+            }
+        }
+        if !manifest_errors.is_empty() {
+            push(
+                &mut checks,
+                "acquire_manifest",
+                BundleCheckStatus::Fail,
+                manifest_errors.join("; "),
+            );
+        } else if let Some(acq) = first_clean {
+            let copies_note = if present_manifests.len() > 1 {
+                format!(" ({} bundled copies verified)", present_manifests.len())
+            } else {
+                String::new()
+            };
+            push(
+                &mut checks,
+                "acquire_manifest",
+                BundleCheckStatus::Pass,
+                format!(
+                    "schema_version={} (store={:?}, app_id={:?}, {} launch arg(s), zero unredacted secrets){copies_note}",
+                    acq.schema_version,
+                    acq.store,
+                    acq.app_id,
+                    acq.launch_args.len()
+                ),
+            );
+        }
     }
 
     let game_dir = resources_dir.join("Game");
@@ -533,30 +635,28 @@ pub fn verify_app_bundle(app_path: &Path) -> Result<BundleVerifyReport> {
         );
     }
 
-    // 7. Code signature verification
+    // 7. Code signature verification (Mach-O `--deep --strict --ignore-resources` +
+    //    `CodeDirectory` slot -3 binding + parallel SHA-256 / CDHash receipt verification)
     #[cfg(target_os = "macos")]
     {
-        match codesign_verify_deep_strict(app_path) {
-            Ok(out) if out.status.success() => push(
+        match verify_bundle_codesign_fast(app_path, opts.full_rehash) {
+            Ok(res) if res.passed => push(
                 &mut checks,
                 "codesign",
                 BundleCheckStatus::Pass,
-                "codesign --verify --deep --strict OK".to_string(),
+                res.detail,
             ),
-            Ok(out) => push(
+            Ok(res) => push(
                 &mut checks,
                 "codesign",
                 BundleCheckStatus::Fail,
-                format!(
-                    "codesign verify failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
+                res.detail,
             ),
             Err(e) => push(
                 &mut checks,
                 "codesign",
                 BundleCheckStatus::Warn,
-                format!("could not invoke codesign: {e}"),
+                format!("could not invoke codesign: {e:#}"),
             ),
         }
     }
