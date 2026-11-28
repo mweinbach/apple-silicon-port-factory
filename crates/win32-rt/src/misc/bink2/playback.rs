@@ -53,6 +53,7 @@ pub(crate) unsafe fn get_summary(bink: *mut c_void, sum: *mut BinkSummary) {
         total_open_time: 1,
         total_frames: frames,
         total_played_frames,
+        skipped_frames: inst.skipped_frames,
         total_blit_time: (inst.total_blit_us / 1000) as u32,
         total_read_time: (inst.total_read_us / 1000) as u32,
         total_video_decomp_time: (inst.total_video_decomp_us / 1000) as u32,
@@ -208,6 +209,10 @@ pub(crate) unsafe fn next_frame(bink: *mut c_void) {
     inst.frame_advance_epoch = inst.frame_advance_epoch.wrapping_add(1);
 }
 
+/// Maximum consecutive frames `BinkShouldSkip` may recommend skipping before
+/// forcing a displayed frame so a slow decoder never starves presentation.
+const MAX_CONSECUTIVE_SKIPS: u32 = 4;
+
 pub(crate) unsafe fn wait(bink: *mut c_void) -> i32 {
     if bink.is_null() {
         return 0;
@@ -240,15 +245,83 @@ pub(crate) unsafe fn wait(bink: *mut c_void) -> i32 {
     let due = Duration::from_micros(due_us);
     if elapsed >= due {
         let frame_dur_us = (fps_den as u64).saturating_mul(1_000_000) / (fps_num as u64);
-        if elapsed > due + Duration::from_micros(frame_dur_us.saturating_mul(4)) {
-            // Re-anchor clock after a long stall so we don't burst frames
+        let stall_reanchor = Duration::from_secs(2)
+            .max(Duration::from_micros(frame_dur_us.saturating_mul(30)));
+        if elapsed > due + stall_reanchor {
+            // Re-anchor clock after an extreme suspend/debugger pause so we don't try to skip hundreds of frames.
             inst.playback_start = Some(Instant::now());
             inst.playback_base_frame = inst.played_frames;
+            inst.consecutive_skips = 0;
         }
         0
     } else {
+        // Caught up ahead of schedule: reset burst skip counter.
+        inst.consecutive_skips = 0;
         1
     }
+}
+
+pub(crate) unsafe fn should_skip(bink: *mut c_void) -> i32 {
+    if bink.is_null() {
+        return 0;
+    }
+    let inst = &mut *(bink as *mut BinkInstance);
+    try_commit_async_decode(inst);
+    if inst.pending_async.is_some()
+        || inst.rd_u32(0x01c) != 0
+        || inst.rd_u32(0x11c) != 0
+        || inst.played_frames == 0
+    {
+        return 0;
+    }
+    let Some(start) = inst.playback_start else {
+        return 0;
+    };
+    let fps_num = inst.rd_u32(0x014);
+    let fps_den = inst.rd_u32(0x018).max(1);
+    if fps_num == 0 {
+        return 0;
+    }
+
+    // Never advise skipping past the final frame of a non-looping stream,
+    // which would otherwise spin `while (BinkShouldSkip(b)) { BinkNextFrame(b); ... }`.
+    let frames = inst.rd_u32(0x008).max(1);
+    let cur = inst.rd_u32(0x00c).max(1);
+    let will_loop = inst.rd_u32(0x3b8) != 0 || (inst.rd_u32(0x020) & 0x80) != 0;
+    if !will_loop && cur >= frames {
+        inst.consecutive_skips = 0;
+        return 0;
+    }
+
+    let elapsed_frames = inst.played_frames.saturating_sub(inst.playback_base_frame) as u64;
+    let frame_dur_us = (fps_den as u64).saturating_mul(1_000_000) / (fps_num as u64);
+    let next_due_us = elapsed_frames
+        .saturating_mul(fps_den as u64)
+        .saturating_mul(1_000_000)
+        / (fps_num as u64);
+    // Skip when the *next* frame is already past due (+25% frame jitter margin to avoid
+    // spurious skips under 60/120 Hz display vsync pacing).
+    let skip_threshold = Duration::from_micros(next_due_us.saturating_add(frame_dur_us / 4));
+    let elapsed = start.elapsed();
+
+    if elapsed < skip_threshold {
+        inst.consecutive_skips = 0;
+        return 0;
+    }
+
+    if inst.consecutive_skips >= MAX_CONSECUTIVE_SKIPS {
+        inst.consecutive_skips = 0;
+        let severe_lag = Duration::from_micros(frame_dur_us.saturating_mul(8));
+        if elapsed > Duration::from_micros(next_due_us) + severe_lag {
+            inst.playback_start = Some(Instant::now());
+            inst.playback_base_frame = inst.played_frames;
+        }
+        return 0;
+    }
+
+    inst.consecutive_skips = inst.consecutive_skips.saturating_add(1);
+    inst.skipped_frames = inst.skipped_frames.saturating_add(1);
+    1
 }
 
 pub(crate) unsafe fn pause(bink: *mut c_void, pause: i32) -> i32 {
@@ -260,6 +333,7 @@ pub(crate) unsafe fn pause(bink: *mut c_void, pause: i32) -> i32 {
     inst.wr_u32(0x11c, paused);
     inst.playback_start = None;
     inst.playback_base_frame = inst.played_frames;
+    inst.consecutive_skips = 0;
     inst.audio_player.set_paused(paused != 0);
     paused as i32
 }
@@ -383,6 +457,7 @@ pub(crate) unsafe fn goto(bink: *mut c_void, frame: u32, flags: i32) {
     inst.frame_advance_epoch = inst.frame_advance_epoch.wrapping_add(1);
     inst.playback_start = None;
     inst.playback_base_frame = inst.played_frames;
+    inst.consecutive_skips = 0;
 }
 
 // ============================================================================
@@ -426,7 +501,7 @@ pub(crate) unsafe fn set_speaker_volumes(
         } else {
             i as u32
         };
-        if count == 1 {
+        if count == 1 && speaker_indexes.is_null() {
             left_max = left_max.max(vol);
             right_max = right_max.max(vol);
         } else {

@@ -84,6 +84,7 @@ extern "C" {
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static MOUSE_IN_CLIENT: AtomicBool = AtomicBool::new(true);
+static DXGI_FULLSCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// True once [`init_main_thread`] (or [`attach_host_surface`] on iOS) ran:
 /// the platform main thread is active and services the main queue.
@@ -174,17 +175,77 @@ pub fn framed_mode() -> bool {
     active() && !fullscreen_takeover()
 }
 
+#[cfg(test)]
+static TEST_LOCK_CURSOR_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Run `f` with the cursor-lock env override forced (`Some(true)` = always allow,
+/// `Some(false)` = always disallow, `None` = automatic fullscreen/clipped behavior).
+#[cfg(test)]
+pub(crate) fn with_lock_cursor_override<R>(forced: Option<bool>, f: impl FnOnce() -> R) -> R {
+    let tag = match forced {
+        Some(false) => 1,
+        Some(true) => 2,
+        None => 3,
+    };
+    let prev = TEST_LOCK_CURSOR_OVERRIDE.swap(tag, Ordering::AcqRel);
+    struct Restore(u8);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_LOCK_CURSOR_OVERRIDE.store(self.0, Ordering::Release);
+        }
+    }
+    let _r = Restore(prev);
+    f()
+}
+
+fn parse_bool_env(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    let s = raw.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "1" | "true" | "on" => Some(true),
+        "0" | "false" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn lock_cursor_override() -> Option<bool> {
+    #[cfg(test)]
+    {
+        match TEST_LOCK_CURSOR_OVERRIDE.load(Ordering::Acquire) {
+            1 => return Some(false),
+            2 => return Some(true),
+            3 => return None,
+            _ => {}
+        }
+    }
+    static LOCK: OnceLock<Option<bool>> = OnceLock::new();
+    *LOCK.get_or_init(|| parse_bool_env("PORT_LOCK_CURSOR").or_else(|| parse_bool_env("AW2_LOCK_CURSOR")))
+}
+
+/// True while a key window is in runtime DXGI borderless fullscreen (`SetFullscreenState(TRUE)`).
+pub fn dxgi_fullscreen_active() -> bool {
+    DXGI_FULLSCREEN_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Update runtime DXGI borderless fullscreen state; returns `true` if the state changed.
+pub fn set_dxgi_fullscreen_active(active: bool) -> bool {
+    DXGI_FULLSCREEN_ACTIVE.swap(active, Ordering::AcqRel) != active
+}
+
+/// True when cursor locking/capture has been explicitly disabled via `PORT_LOCK_CURSOR=0`
+/// or `AW2_LOCK_CURSOR=0`.
+pub fn cursor_capture_disallowed() -> bool {
+    lock_cursor_override() == Some(false)
+}
+
 /// Whether physical cursor warping (`CGWarpMouseCursorPosition` on `ClipCursor`/`SetCursorPos`)
-/// is permitted. Disabled in framed window mode unless `AW2_LOCK_CURSOR=1` so the user can freely
-/// move the pointer to the title bar, Dock, menu bar, or other apps.
+/// is permitted. Enabled automatically in borderless fullscreen takeover and runtime DXGI
+/// borderless fullscreen, or explicitly controlled via `PORT_LOCK_CURSOR` / `AW2_LOCK_CURSOR`.
 pub fn lock_cursor_allowed() -> bool {
-    static LOCK: OnceLock<bool> = OnceLock::new();
-    fullscreen_takeover()
-        || *LOCK.get_or_init(|| {
-            std::env::var("AW2_LOCK_CURSOR")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        })
+    match lock_cursor_override() {
+        Some(v) => v,
+        None => fullscreen_takeover() || dxgi_fullscreen_active(),
+    }
 }
 
 /// True while the pointer is inside the active window's content area (not on the title bar or desktop).

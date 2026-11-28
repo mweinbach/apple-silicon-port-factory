@@ -241,6 +241,9 @@ impl<'a> CompileRequest<'a> {
         k.bytes(self.entry_point.unwrap_or("").as_bytes());
         self.options.hash_into(&mut k);
         k.bytes(converter_fingerprint.as_bytes());
+        if crate::bitcode::needs_fp64_lowering(self.dxil) {
+            k.bytes(b"fp64-lower/v1");
+        }
         k.finish()
     }
 }

@@ -177,7 +177,10 @@ pub unsafe extern "win64" fn SetupDiEnumDeviceInfo(set: *mut c_void, idx: u32, d
         Ok(())
     });
     match r {
-        Some(Ok(())) => TRUE,
+        Some(Ok(())) => {
+            set_err(0);
+            TRUE
+        }
         Some(Err(e)) => {
             set_err(e);
             FALSE
@@ -219,7 +222,10 @@ pub unsafe extern "win64" fn SetupDiEnumDeviceInterfaces(set: *mut c_void, dev: 
         Ok(())
     });
     match r {
-        Some(Ok(())) => TRUE,
+        Some(Ok(())) => {
+            set_err(0);
+            TRUE
+        }
         Some(Err(e)) => {
             set_err(e);
             FALSE
@@ -277,6 +283,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInterfaceDetailW(
         }
         fill_devinfo(devinfo, &dev, di);
     }
+    set_err(0);
     TRUE
 }
 
@@ -286,7 +293,16 @@ fn property(devices: &[Arc<Device>], di: usize, prop: u32) -> Option<(u32, Vec<S
     let x = &d.desc;
     let sz = |s: String| Some((REG_SZ, vec![s]));
     match prop {
-        0x00 => sz("HID-compliant game controller".into()), // SPDRP_DEVICEDESC
+        0x00 => {
+            // SPDRP_DEVICEDESC
+            let desc = x
+                .product
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("HID-compliant game controller")
+                .to_string();
+            sz(desc)
+        }
         0x01 => {
             // SPDRP_HARDWAREID
             let bus = if x.bluetooth {
@@ -361,6 +377,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceRegistryPropertyW(
         return FALSE;
     }
     std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, buf, need as usize);
+    set_err(0);
     TRUE
 }
 
@@ -419,6 +436,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInterfaceDetailA(
         }
         fill_devinfo(devinfo, &dev, di);
     }
+    set_err(0);
     TRUE
 }
 
@@ -476,6 +494,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceRegistryPropertyA(
         return FALSE;
     }
     std::ptr::copy_nonoverlapping(b.as_ptr(), buf, b.len());
+    set_err(0);
     TRUE
 }
 
@@ -504,6 +523,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInstanceIdW(
         return FALSE;
     }
     std::ptr::copy_nonoverlapping(w.as_ptr(), id, w.len());
+    set_err(0);
     TRUE
 }
 
@@ -533,6 +553,7 @@ pub unsafe extern "win64" fn SetupDiGetDeviceInstanceIdA(
     }
     std::ptr::copy_nonoverlapping(s.as_ptr(), id, s.len());
     *id.add(s.len()) = 0;
+    set_err(0);
     TRUE
 }
 
@@ -601,6 +622,7 @@ pub unsafe extern "win64" fn SetupDiGetDevicePropertyW(
                 return FALSE;
             }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, 16);
+            set_err(0);
             TRUE
         }
         Ok(None) => {
@@ -977,6 +999,57 @@ mod tests {
     impl Drop for FakeDualSenseGuard {
         fn drop(&mut self) {
             hid::device_removed(self.0);
+        }
+    }
+
+    #[test]
+    fn setupdi_clears_last_error_on_success_and_reports_product_desc() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        hid::tests::install_fake_dualsense(0xD5_0099);
+        let _ds = FakeDualSenseGuard(0xD5_0099);
+        unsafe {
+            let set = SetupDiGetClassDevsW(GUID_DEVINTERFACE_HID.as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0x12);
+            assert!(!set.is_null());
+            let mut i = 0u32;
+            let mut checked = false;
+            loop {
+                let mut dd = [0u8; 32];
+                dd[0] = 32;
+                // Poison LastError before calling SetupDiEnumDeviceInfo & SetupDiGetDeviceRegistryPropertyW.
+                crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+                if SetupDiEnumDeviceInfo(set, i, dd.as_mut_ptr()) == FALSE {
+                    break;
+                }
+                assert_eq!(crate::teb::last_error(), 0, "SetupDiEnumDeviceInfo must clear stale LastError on success");
+
+                let mut ty = 0u32;
+                let mut req = 0u32;
+                assert_eq!(
+                    SetupDiGetDeviceRegistryPropertyW(set, dd.as_ptr(), 0x00, &mut ty, std::ptr::null_mut(), 0, &mut req),
+                    FALSE
+                );
+                assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+
+                let mut buf = vec![0u8; req as usize];
+                assert_eq!(
+                    SetupDiGetDeviceRegistryPropertyW(set, dd.as_ptr(), 0x00, &mut ty, buf.as_mut_ptr(), req, &mut req),
+                    TRUE
+                );
+                assert_eq!(
+                    crate::teb::last_error(),
+                    0,
+                    "SetupDiGetDeviceRegistryPropertyW must clear stale LastError on success"
+                );
+                let w: Vec<u16> = buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
+                let desc = String::from_utf16(&w).unwrap();
+                if desc.contains("Wireless Controller") || desc.contains("DualSense") {
+                    checked = true;
+                    break;
+                }
+                i += 1;
+            }
+            assert!(checked, "SPDRP_DEVICEDESC should report device product string");
+            assert_eq!(SetupDiDestroyDeviceInfoList(set), TRUE);
         }
     }
 

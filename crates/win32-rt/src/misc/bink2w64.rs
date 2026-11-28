@@ -379,8 +379,8 @@ pub unsafe extern "win64" fn BinkWait(bink: *mut c_void) -> i32 {
     playback::wait(bink)
 }
 
-pub unsafe extern "win64" fn BinkShouldSkip(_bink: *mut c_void) -> i32 {
-    0
+pub unsafe extern "win64" fn BinkShouldSkip(bink: *mut c_void) -> i32 {
+    playback::should_skip(bink)
 }
 
 pub unsafe extern "win64" fn BinkPause(bink: *mut c_void, pause: i32) -> i32 {

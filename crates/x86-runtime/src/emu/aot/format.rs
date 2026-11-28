@@ -66,6 +66,31 @@ impl H128 {
         };
         [f(self.a ^ self.n), f(self.b ^ self.a.rotate_left(17))]
     }
+    /// Fast single-lane specialization of `H128::new(0xC5).bytes(d).finish()[0]`, omitting the
+    /// unused `b` lane and per-word counter increment. Bit-for-bit identical output.
+    pub(super) fn checksum64(d: &[u8]) -> u64 {
+        let mut a = 0x9E37_79B9_7F4A_7C15u64 ^ 0xC5;
+        let mut ch = d.chunks_exact(8);
+        let mut n = ch.len() as u64;
+        for c in ch.by_ref() {
+            let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+            a = (a ^ w).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
+        }
+        let r = ch.remainder();
+        if !r.is_empty() {
+            let mut t = [0u8; 8];
+            t[..r.len()].copy_from_slice(r);
+            let w = u64::from_le_bytes(t) ^ ((r.len() as u64) << 56);
+            a = (a ^ w).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
+            n += 1;
+        }
+        a = (a ^ (d.len() as u64)).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
+        n += 1;
+        let x = a ^ n;
+        let x = (x ^ (x >> 33)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        let x = (x ^ (x >> 33)).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+        x ^ (x >> 33)
+    }
 }
 
 /// Hash of the translator / decoder sources (embedded), the format and the `Cpu` layout:
@@ -630,6 +655,8 @@ impl Image {
 
     /// Structural sanity (a corrupt or hostile file must not make us patch outside the
     /// region, overlap a stub bank, or exceed ARM64 ±128 MiB stub-branch range).
+    /// Checked inline during [`decode_impl`]; retained for tests constructing synthetic `Image`s.
+    #[cfg(test)]
     pub(super) fn valid(&self) -> bool {
         let Some(end) = (AOT_STUBS_BYTES as u64).checked_add(self.code_bytes() as u64) else {
             return false;
@@ -831,9 +858,8 @@ pub(super) fn encode_with_version(
     for &c in &img.code {
         put32(&mut w, c);
     }
-    let mut h = H128::new(0xC5);
-    h.bytes(&w);
-    put64(&mut w, h.finish()[0]);
+    let sum = H128::checksum64(&w);
+    put64(&mut w, sum);
     w
 }
 
@@ -844,24 +870,231 @@ pub(super) fn set_flags(bytes: &mut [u8], flags: u32) -> bool {
     }
     bytes[12..16].copy_from_slice(&flags.to_le_bytes());
     let n = bytes.len() - 8;
-    let mut h = H128::new(0xC5);
-    h.bytes(&bytes[..n]);
-    bytes[n..].copy_from_slice(&h.finish()[0].to_le_bytes());
+    let sum = H128::checksum64(&bytes[..n]);
+    bytes[n..].copy_from_slice(&sum.to_le_bytes());
     true
 }
 
-/// Parse a v5 single-bank or v6/v7 multi-bank `.aot` file:
-/// `(module name, key, image, header flags)`.
-pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32)> {
+/// Minimum `.aot` body size (1 MiB) before `decode` overlaps checksum verification with parallel
+/// table decoding and inline structural validation.
+const DECODE_PAR_THRESHOLD: usize = 1 << 20;
+
+#[inline(always)]
+fn le32(s: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([s[off], s[off + 1], s[off + 2], s[off + 3]])
+}
+
+#[inline(always)]
+fn le64(s: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        s[off],
+        s[off + 1],
+        s[off + 2],
+        s[off + 3],
+        s[off + 4],
+        s[off + 5],
+        s[off + 6],
+        s[off + 7],
+    ])
+}
+
+/// Read-only bank bounds view shared across parallel decode + inline validation chunks.
+#[derive(Clone, Copy)]
+struct BankCheck<'a> {
+    banks: &'a [u32],
+    end: u64,
+}
+
+impl<'a> BankCheck<'a> {
+    #[inline(always)]
+    fn bank_index_of(&self, off: u32) -> usize {
+        if self.banks.len() <= 1 {
+            0
+        } else {
+            self.banks.partition_point(|&b| b <= off).saturating_sub(1)
+        }
+    }
+
+    #[inline(always)]
+    fn bank_end(&self, bi: usize) -> u64 {
+        if bi + 1 < self.banks.len() {
+            self.banks[bi + 1] as u64
+        } else {
+            self.end
+        }
+    }
+
+    #[inline(always)]
+    fn in_code(&self, off: u32, len: u64, align: u32) -> bool {
+        if off % align != 0 {
+            return false;
+        }
+        let bi = self.bank_index_of(off);
+        let lo = self.banks[bi] as u64 + AOT_STUBS_BYTES as u64;
+        let hi = self.bank_end(bi);
+        let off64 = off as u64;
+        off64 >= lo && off64.checked_add(len).is_some_and(|e| e <= hi)
+    }
+
+    fn validate_banks(&self) -> bool {
+        if self.banks.is_empty() || self.banks[0] != 0 {
+            return false;
+        }
+        for (bi, &bo) in self.banks.iter().enumerate() {
+            if bo % 16 != 0 {
+                return false;
+            }
+            let bo64 = bo as u64;
+            let b_end = self.bank_end(bi);
+            if bo64 + AOT_STUBS_BYTES as u64 > b_end || b_end > self.end {
+                return false;
+            }
+            if bi > 0 && bo <= self.banks[bi - 1] {
+                return false;
+            }
+            if b_end - bo64 > (128u64 << 20) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[inline(always)]
+fn valid_range(lo: u32, n: u32, len: usize) -> bool {
+    (lo as u64 + n as u64) <= len as u64
+}
+
+fn decode_blocks_chunk(
+    out: &mut [core::mem::MaybeUninit<BlockEnt>],
+    raw: &[u8],
+    image_base: u64,
+    bc: BankCheck<'_>,
+    nl: usize,
+    nr: usize,
+    na: usize,
+) -> bool {
+    let mut ok = true;
+    for (slot, c) in out.iter_mut().zip(raw.chunks_exact(52)) {
+        let b = BlockEnt {
+            ip: image_base.wrapping_add(le32(c, 0) as u64),
+            code_off: le32(c, 4),
+            cold_off: le32(c, 8),
+            words: le32(c, 12),
+            main: le32(c, 16),
+            guest: le32(c, 20),
+            host_entry: le32(c, 24) != 0,
+            link_lo: le32(c, 28),
+            link_n: le32(c, 32),
+            reloc_lo: le32(c, 36),
+            reloc_n: le32(c, 40),
+            assume_lo: le32(c, 44),
+            assume_n: le32(c, 48),
+        };
+        if !(b.main <= b.words
+            && bc.in_code(b.code_off, b.main as u64 * 4, 4)
+            && (b.words == b.main
+                || (bc.in_code(b.cold_off, (b.words - b.main) as u64 * 4, 4)
+                    && bc.bank_index_of(b.code_off) == bc.bank_index_of(b.cold_off)))
+            && valid_range(b.link_lo, b.link_n, nl)
+            && valid_range(b.reloc_lo, b.reloc_n, nr)
+            && valid_range(b.assume_lo, b.assume_n, na))
+        {
+            ok = false;
+        }
+        slot.write(b);
+    }
+    ok
+}
+
+fn decode_links_chunk(
+    out: &mut [core::mem::MaybeUninit<LinkEnt>],
+    raw: &[u8],
+    bc: BankCheck<'_>,
+) -> bool {
+    let mut ok = true;
+    for (slot, c) in out.iter_mut().zip(raw.chunks_exact(20)) {
+        let l = LinkEnt {
+            site_off: le32(c, 0),
+            fallback_off: le32(c, 4),
+            cond_off: le32(c, 8),
+            target: le64(c, 12),
+        };
+        if !(bc.in_code(l.site_off, 4, 4)
+            && bc.in_code(l.fallback_off, 4, 4)
+            && (l.cond_off == u32::MAX || bc.in_code(l.cond_off, 4, 4)))
+        {
+            ok = false;
+        }
+        slot.write(l);
+    }
+    ok
+}
+
+fn decode_relocs_chunk(
+    out: &mut [core::mem::MaybeUninit<RelocEnt>],
+    raw: &[u8],
+    bc: BankCheck<'_>,
+) -> bool {
+    let mut ok = true;
+    for (slot, c) in out.iter_mut().zip(raw.chunks_exact(24)) {
+        let slot_off = le32(c, 0);
+        let fl = le32(c, 4);
+        let va = le64(c, 8);
+        let src = le64(c, 16);
+        let kind = (fl >> 8) as u8;
+        let r = RelocEnt { slot_off, kind, bail: fl & 1 != 0, va, src };
+        if (fl & !0x3FF != 0)
+            || !(bc.in_code(r.slot_off, 8, 8)
+                && r.kind <= RELOC_XINPUT_STATE
+                && (r.kind == RELOC_HOST_FN
+                    || r.kind == RELOC_QPC_STATE
+                    || r.kind == RELOC_XINPUT_STATE
+                    || r.src != 0))
+        {
+            ok = false;
+        }
+        slot.write(r);
+    }
+    ok
+}
+
+fn decode_assume_chunk(out: &mut [core::mem::MaybeUninit<(u64, bool)>], raw: &[u8]) {
+    for (slot, c) in out.iter_mut().zip(raw.chunks_exact(16)) {
+        slot.write((le64(c, 0), le64(c, 8) != 0));
+    }
+}
+
+fn alloc_uninit_vec<T: Copy>(len: usize) -> Vec<core::mem::MaybeUninit<T>> {
+    let mut v: Vec<core::mem::MaybeUninit<T>> = Vec::with_capacity(len);
+    // SAFETY: `MaybeUninit<T>` has no initialization invariant.
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// SAFETY: every element `0..v.len()` must have been written via `MaybeUninit::write`.
+unsafe fn assume_init_vec<T: Copy>(v: Vec<core::mem::MaybeUninit<T>>) -> Vec<T> {
+    let mut v = core::mem::ManuallyDrop::new(v);
+    Vec::from_raw_parts(v.as_mut_ptr() as *mut T, v.len(), v.capacity())
+}
+
+/// Core `.aot` decoder shared by [`decode`] and [`decode_for_runtime`]: returns
+/// `(module name, key, image, header flags, code_byte_off_in_bytes)`.
+/// When `copy_code == false`, `img.code` stays empty (`img.code_words_len == nc`) so runtime
+/// callers can stream machine code straight from an mmap'd cache into `MAP_JIT` without a
+/// redundant heap allocation.
+fn decode_impl(
+    bytes: &[u8],
+    copy_code: bool,
+    par_threshold: usize,
+) -> Option<(String, AotKey, Image, u32, usize)> {
     if bytes.len() < 16 {
         return None;
     }
     let (body, sum) = bytes.split_at(bytes.len() - 8);
-    let mut h = H128::new(0xC5);
-    h.bytes(body);
-    if h.finish()[0].to_le_bytes() != sum {
-        return None;
-    }
+    let expected_sum = u64::from_le_bytes([
+        sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7],
+    ]);
     let mut r = Rd { b: body, p: 0 };
     if r.take(8)? != MAGIC {
         return None;
@@ -919,113 +1152,257 @@ pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32
         r.u32()? as usize,
         r.u32()? as usize,
     );
-    // Table sizes must fit the remaining body before allocating (overflow-safe).
+    // Table sizes must fit the remaining body exactly before allocating (overflow-safe).
     let need = nb
         .checked_mul(52)?
         .checked_add(nl.checked_mul(20)?)?
         .checked_add(nr.checked_mul(24)?)?
         .checked_add(na.checked_mul(16)?)?
         .checked_add(nc.checked_mul(4)?)?;
-    if need > body.len() - r.p {
+    if need != body.len() - r.p {
         return None;
     }
-    #[inline(always)]
-    fn le32(s: &[u8], off: usize) -> u32 {
-        u32::from_le_bytes([s[off], s[off + 1], s[off + 2], s[off + 3]])
+    let end = (AOT_STUBS_BYTES as u64).checked_add((nc as u64).checked_mul(4)?)?;
+    if end > u32::MAX as u64 {
+        return None;
     }
-    #[inline(always)]
-    fn le64(s: &[u8], off: usize) -> u64 {
-        u64::from_le_bytes([
-            s[off],
-            s[off + 1],
-            s[off + 2],
-            s[off + 3],
-            s[off + 4],
-            s[off + 5],
-            s[off + 6],
-            s[off + 7],
-        ])
+    let bc = BankCheck { banks: img.stub_banks(), end };
+    if !bc.validate_banks() {
+        return None;
     }
+
     let blocks_raw = r.take(nb * 52)?;
-    img.blocks.reserve(nb);
-    for c in blocks_raw.chunks_exact(52) {
-        img.blocks.push(BlockEnt {
-            ip: key.image_base.wrapping_add(le32(c, 0) as u64),
-            code_off: le32(c, 4),
-            cold_off: le32(c, 8),
-            words: le32(c, 12),
-            main: le32(c, 16),
-            guest: le32(c, 20),
-            host_entry: le32(c, 24) != 0,
-            link_lo: le32(c, 28),
-            link_n: le32(c, 32),
-            reloc_lo: le32(c, 36),
-            reloc_n: le32(c, 40),
-            assume_lo: le32(c, 44),
-            assume_n: le32(c, 48),
-        });
-    }
     let links_raw = r.take(nl * 20)?;
-    img.links.reserve(nl);
-    for c in links_raw.chunks_exact(20) {
-        img.links.push(LinkEnt {
-            site_off: le32(c, 0),
-            fallback_off: le32(c, 4),
-            cond_off: le32(c, 8),
-            target: le64(c, 12),
-        });
-    }
     let relocs_raw = r.take(nr * 24)?;
-    img.relocs.reserve(nr);
-    for c in relocs_raw.chunks_exact(24) {
-        let slot_off = le32(c, 0);
-        let fl = le32(c, 4);
-        let va = le64(c, 8);
-        let src = le64(c, 16);
-        if fl & !0x3FF != 0 {
+    let assume_raw = r.take(na * 16)?;
+    let code_byte_off = r.p;
+    let code_raw = r.take(nc * 4)?;
+    debug_assert_eq!(r.p, body.len());
+
+    let use_parallel = body.len() >= par_threshold
+        && std::thread::available_parallelism().map_or(1, |n| n.get()) >= 2;
+
+    if !use_parallel {
+        if H128::checksum64(body) != expected_sum {
             return None;
         }
-        img.relocs.push(RelocEnt {
-            slot_off,
-            kind: (fl >> 8) as u8,
-            bail: fl & 1 != 0,
-            va,
-            src,
-        });
+        let mut blocks_u = alloc_uninit_vec::<BlockEnt>(nb);
+        if !decode_blocks_chunk(&mut blocks_u, blocks_raw, key.image_base, bc, nl, nr, na) {
+            return None;
+        }
+        let mut links_u = alloc_uninit_vec::<LinkEnt>(nl);
+        if !decode_links_chunk(&mut links_u, links_raw, bc) {
+            return None;
+        }
+        let mut relocs_u = alloc_uninit_vec::<RelocEnt>(nr);
+        if !decode_relocs_chunk(&mut relocs_u, relocs_raw, bc) {
+            return None;
+        }
+        let mut assume_u = alloc_uninit_vec::<(u64, bool)>(na);
+        decode_assume_chunk(&mut assume_u, assume_raw);
+        if copy_code {
+            copy_code_words(code_raw, nc, &mut img.code);
+        }
+        img.code_words_len = nc;
+        // SAFETY: every element in each slice was written by the corresponding `decode_*_chunk`.
+        unsafe {
+            img.blocks = assume_init_vec(blocks_u);
+            img.links = assume_init_vec(links_u);
+            img.relocs = assume_init_vec(relocs_u);
+            img.assume = assume_init_vec(assume_u);
+        }
+        return Some((name, key, img, flags, code_byte_off));
     }
-    let assume_raw = r.take(na * 16)?;
-    img.assume.reserve(na);
-    for c in assume_raw.chunks_exact(16) {
-        img.assume.push((le64(c, 0), le64(c, 8) != 0));
+
+    // Parallel path: overlap full-file `checksum64` with multi-core chunked table decoding,
+    // inline structural validation, and optional `img.code` copy.
+    let mut blocks_u = alloc_uninit_vec::<BlockEnt>(nb);
+    let mut links_u = alloc_uninit_vec::<LinkEnt>(nl);
+    let mut relocs_u = alloc_uninit_vec::<RelocEnt>(nr);
+    let mut assume_u = alloc_uninit_vec::<(u64, bool)>(na);
+    let mut code_u: Vec<core::mem::MaybeUninit<u32>> = if copy_code {
+        alloc_uninit_vec::<u32>(nc)
+    } else {
+        Vec::new()
+    };
+
+    enum Task<'a> {
+        Blocks(&'a mut [core::mem::MaybeUninit<BlockEnt>], &'a [u8]),
+        Links(&'a mut [core::mem::MaybeUninit<LinkEnt>], &'a [u8]),
+        Relocs(&'a mut [core::mem::MaybeUninit<RelocEnt>], &'a [u8]),
+        Assume(&'a mut [core::mem::MaybeUninit<(u64, bool)>], &'a [u8]),
+        Code(&'a mut [core::mem::MaybeUninit<u32>], &'a [u8]),
     }
-    let code_raw = r.take(nc * 4)?;
+
+    const BLOCK_CHUNK: usize = 65_536;
+    const LINK_CHUNK: usize = 131_072;
+    const RELOC_CHUNK: usize = 65_536;
+    const ASSUME_CHUNK: usize = 131_072;
+    const CODE_WORD_CHUNK: usize = 1 << 20; // 4 MiB
+
+    let mut tasks: Vec<Task<'_>> = Vec::new();
+    for (o, raw) in blocks_u.chunks_mut(BLOCK_CHUNK).zip(blocks_raw.chunks(BLOCK_CHUNK * 52)) {
+        tasks.push(Task::Blocks(o, raw));
+    }
+    for (o, raw) in links_u.chunks_mut(LINK_CHUNK).zip(links_raw.chunks(LINK_CHUNK * 20)) {
+        tasks.push(Task::Links(o, raw));
+    }
+    for (o, raw) in relocs_u.chunks_mut(RELOC_CHUNK).zip(relocs_raw.chunks(RELOC_CHUNK * 24)) {
+        tasks.push(Task::Relocs(o, raw));
+    }
+    for (o, raw) in assume_u.chunks_mut(ASSUME_CHUNK).zip(assume_raw.chunks(ASSUME_CHUNK * 16)) {
+        tasks.push(Task::Assume(o, raw));
+    }
+    if copy_code {
+        for (o, raw) in code_u
+            .chunks_mut(CODE_WORD_CHUNK)
+            .zip(code_raw.chunks(CODE_WORD_CHUNK * 4))
+        {
+            tasks.push(Task::Code(o, raw));
+        }
+    }
+
+    let avail = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let decode_workers = (avail.min(8) - 1).clamp(1, tasks.len().max(1));
+    let queue = std::sync::Mutex::new(tasks.into_iter());
+    let all_ok = std::sync::atomic::AtomicBool::new(true);
+    let image_base = key.image_base;
+
+    let checksum_ok = std::thread::scope(|s| {
+        let sum_handle = s.spawn(move || H128::checksum64(body) == expected_sum);
+        for _ in 0..decode_workers {
+            let queue = &queue;
+            let all_ok = &all_ok;
+            s.spawn(move || loop {
+                let next = {
+                    let mut g = queue.lock().unwrap_or_else(|e| e.into_inner());
+                    g.next()
+                };
+                let Some(task) = next else { break };
+                match task {
+                    Task::Blocks(o, raw) => {
+                        if !decode_blocks_chunk(o, raw, image_base, bc, nl, nr, na) {
+                            all_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    Task::Links(o, raw) => {
+                        if !decode_links_chunk(o, raw, bc) {
+                            all_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    Task::Relocs(o, raw) => {
+                        if !decode_relocs_chunk(o, raw, bc) {
+                            all_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    Task::Assume(o, raw) => decode_assume_chunk(o, raw),
+                    Task::Code(o, raw) => copy_code_words_uninit(raw, o),
+                }
+            });
+        }
+        sum_handle.join().unwrap_or(false)
+    });
+
+    if !checksum_ok || !all_ok.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+
+    img.code_words_len = nc;
+    // SAFETY: every task in `queue` completed before `std::thread::scope` returned, initializing
+    // every element of `blocks_u`, `links_u`, `relocs_u`, `assume_u`, and (if `copy_code`) `code_u`.
+    unsafe {
+        img.blocks = assume_init_vec(blocks_u);
+        img.links = assume_init_vec(links_u);
+        img.relocs = assume_init_vec(relocs_u);
+        img.assume = assume_init_vec(assume_u);
+        if copy_code {
+            img.code = assume_init_vec(code_u);
+        }
+    }
+    Some((name, key, img, flags, code_byte_off))
+}
+
+fn copy_code_words(code_raw: &[u8], nc: usize, dst: &mut Vec<u32>) {
     #[cfg(target_endian = "little")]
     {
-        img.code = Vec::with_capacity(nc);
+        *dst = Vec::with_capacity(nc);
         if nc != 0 {
-            // SAFETY: `code_raw` has exact byte length `nc * 4`, `img.code` has capacity `nc`
-            // `u32` words, buffers do not overlap, and target endianness is little-endian.
+            // SAFETY: `code_raw` has exact byte length `nc * 4`, `dst` has capacity `nc` `u32`
+            // words, buffers do not overlap, and target endianness is little-endian.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     code_raw.as_ptr(),
-                    img.code.as_mut_ptr() as *mut u8,
+                    dst.as_mut_ptr() as *mut u8,
                     nc * 4,
                 );
-                img.code.set_len(nc);
+                dst.set_len(nc);
             }
         }
     }
     #[cfg(not(target_endian = "little"))]
     {
-        img.code.reserve(nc);
+        dst.clear();
+        dst.reserve(nc);
         for c in code_raw.chunks_exact(4) {
-            img.code.push(le32(c, 0));
+            dst.push(le32(c, 0));
         }
     }
-    if r.p != body.len() || !img.valid() {
+}
+
+fn copy_code_words_uninit(code_raw: &[u8], out: &mut [core::mem::MaybeUninit<u32>]) {
+    #[cfg(target_endian = "little")]
+    {
+        debug_assert_eq!(code_raw.len(), out.len() * 4);
+        if !out.is_empty() {
+            // SAFETY: `code_raw` and `out` are disjoint with equal byte length on little-endian.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    code_raw.as_ptr(),
+                    out.as_mut_ptr() as *mut u8,
+                    code_raw.len(),
+                );
+            }
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for (slot, c) in out.iter_mut().zip(code_raw.chunks_exact(4)) {
+            slot.write(le32(c, 0));
+        }
+    }
+}
+
+/// Parse a v5 single-bank or v6/v7/v8 multi-bank `.aot` file:
+/// `(module name, key, image, header flags)`.
+pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32)> {
+    let (name, key, img, flags, _) = decode_impl(bytes, true, DECODE_PAR_THRESHOLD)?;
+    Some((name, key, img, flags))
+}
+
+/// Runtime `.aot` decoder: omits copying the machine-code section into `img.code` when
+/// `!retain_code_if_clean` and `FLAG_VERIFY_PENDING` is clear on little-endian targets, returning
+/// `code_byte_off` inside `bytes` so `install_image_opts` can stream directly into `MAP_JIT`.
+pub(super) fn decode_for_runtime(
+    bytes: &[u8],
+    retain_code_if_clean: bool,
+) -> Option<(String, AotKey, Image, u32, usize)> {
+    if bytes.len() < 16 {
         return None;
     }
-    Some((name, key, img, flags))
+    let flags = le32(bytes, 12);
+    let copy_code = retain_code_if_clean
+        || (flags & FLAG_VERIFY_PENDING != 0)
+        || !cfg!(target_endian = "little");
+    decode_impl(bytes, copy_code, DECODE_PAR_THRESHOLD)
+}
+
+#[cfg(test)]
+pub(super) fn decode_with_threshold_for_test(
+    bytes: &[u8],
+    copy_code: bool,
+    par_threshold: usize,
+) -> Option<(String, AotKey, Image, u32, usize)> {
+    decode_impl(bytes, copy_code, par_threshold)
 }
 
 #[cfg(test)]
@@ -1141,20 +1518,117 @@ pub fn aot_cached_preferred_base(name: &str, image_size: usize) -> Option<usize>
     read_cached_preferred_base_in(&primary, &fallbacks, name, image_size, codegen_hash())
 }
 
+/// Backing buffer for a loaded `.aot` cache file: zero-copy read-only `MAP_PRIVATE` mapping
+/// for files >= 64 KiB (cache files are always published via `write_atomic` rename and never
+/// truncated in place), or owned `Vec<u8>` for tiny files / fallback.
+pub(super) enum AotBytes {
+    Owned(Vec<u8>),
+    #[cfg(unix)]
+    Mmap {
+        ptr: *const u8,
+        len: usize,
+    },
+}
+
+// SAFETY: `Mmap` holds an immutable `PROT_READ | MAP_PRIVATE` mapping unmapped only on `Drop`.
+unsafe impl Send for AotBytes {}
+unsafe impl Sync for AotBytes {}
+
+impl AotBytes {
+    #[inline]
+    pub(super) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v.as_slice(),
+            #[cfg(unix)]
+            Self::Mmap { ptr, len } => unsafe { core::slice::from_raw_parts(*ptr, *len) },
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_mmap(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::Mmap { .. })
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+impl core::ops::Deref for AotBytes {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Drop for AotBytes {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Self::Mmap { ptr, len } = *self {
+            if len != 0 && !ptr.is_null() {
+                unsafe {
+                    win32_rt::libc::munmap(ptr as *mut win32_rt::libc::c_void, len);
+                }
+            }
+        }
+    }
+}
+
+fn read_or_mmap_file(path: &Path) -> Option<AotBytes> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        const MMAP_MIN_BYTES: usize = 64 << 10;
+        let f = std::fs::File::open(path).ok()?;
+        let meta = f.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let len = usize::try_from(meta.len()).ok()?;
+        if len == 0 {
+            return Some(AotBytes::Owned(Vec::new()));
+        }
+        if len >= MMAP_MIN_BYTES && len <= isize::MAX as usize {
+            let ptr = unsafe {
+                win32_rt::libc::mmap(
+                    core::ptr::null_mut(),
+                    len,
+                    win32_rt::libc::PROT_READ,
+                    win32_rt::libc::MAP_PRIVATE,
+                    f.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr != win32_rt::libc::MAP_FAILED {
+                unsafe {
+                    win32_rt::libc::madvise(ptr, len, win32_rt::libc::MADV_SEQUENTIAL);
+                }
+                return Some(AotBytes::Mmap { ptr: ptr as *const u8, len });
+            }
+        }
+        drop(f);
+    }
+    std::fs::read(path).ok().map(AotBytes::Owned)
+}
+
 pub(super) fn read_cache_file_in(
     primary_dir: &Path,
     fallback_dirs: &[PathBuf],
     name: &str,
     key: &AotKey,
-) -> (PathBuf, Option<(Vec<u8>, bool)>) {
+) -> (PathBuf, Option<(AotBytes, bool)>) {
     let fname = format!("{name}-{:016x}.aot", key.id());
     let primary = primary_dir.join(&fname);
-    if let Ok(bytes) = std::fs::read(&primary) {
+    if let Some(bytes) = read_or_mmap_file(&primary) {
         return (primary, Some((bytes, false)));
     }
     for fb_dir in fallback_dirs {
         let fb = fb_dir.join(&fname);
-        if let Ok(bytes) = std::fs::read(&fb) {
+        if let Some(bytes) = read_or_mmap_file(&fb) {
             log::info!(
                 "emu aot: {name}: loading cache from read-only fallback {}",
                 fb.display()
@@ -1168,7 +1642,7 @@ pub(super) fn read_cache_file_in(
 /// Read an existing cache file for `(name, key)` from writable [`cache_dir`], falling back
 /// read-only to [`super::fallback_cache_dirs`] (`PORT_AOT_FALLBACK_DIR`, bundled
 /// `Contents/Resources/AotCache`, and legacy `~/Library/Caches/aw2-port/aot`).
-pub(super) fn read_cache_file(name: &str, key: &AotKey) -> (PathBuf, Option<(Vec<u8>, bool)>) {
+pub(super) fn read_cache_file(name: &str, key: &AotKey) -> (PathBuf, Option<(AotBytes, bool)>) {
     if super::disk_aot_disabled() {
         return (PathBuf::new(), None);
     }
