@@ -805,6 +805,32 @@ pub fn codesign_ad_hoc(path: &Path) {
         .status();
 }
 
+/// Ad-hoc `codesign --force --sign - <path>`, returning an error if `codesign` fails.
+pub fn codesign_ad_hoc_checked(path: &Path) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(path)
+            .output()
+            .with_context(|| format!("running codesign on {}", path.display()))?;
+        if !out.status.success() {
+            bail!(
+                "codesign --force --sign - {} failed (status {}): {}",
+                path.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Sign `path` with the given `codesign` identity and optional entitlements plist.
 pub fn codesign_with_identity(
     path: &Path,

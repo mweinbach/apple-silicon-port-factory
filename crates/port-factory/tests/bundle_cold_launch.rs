@@ -539,7 +539,7 @@ fn self_contained_app_bundle_cold_launch_with_empty_env() {
                 );
             }
         }
-        for target in [&bundled_runner, &launcher_bin, &app_dir] {
+        for target in [&bundled_runner, &app_dir] {
             let sign = Command::new("codesign")
                 .args(["--force", "--sign", "-", &target.to_string_lossy()])
                 .output()

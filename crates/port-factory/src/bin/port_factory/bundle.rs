@@ -13,7 +13,7 @@ use port_factory::json_output::{
 };
 use port_factory::steam_library::{
     export_app_bundle, format_bundle_verify_report, list_external_volumes, list_packaged_bundles,
-    verify_app_bundle,
+    verify_app_bundle_with_options, VerifyBundleOptions,
 };
 use port_factory::storage_opt::{
     format_storage_opt_report, optimize_game_assets, parse_manifest_storage_config,
@@ -634,20 +634,23 @@ pub fn cmd_bundles(args: &[String]) -> Result<i32> {
 pub fn cmd_bundle_verify(args: &[String]) -> Result<i32> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut json = false;
+    let mut full_rehash = false;
     for a in args {
         match a.as_str() {
             "--json" => json = true,
+            "--full" | "--full-hash" | "--rehash" => full_rehash = true,
             s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p => paths.push(PathBuf::from(p)),
         }
     }
     if paths.is_empty() {
-        return Err(usage_err("bundle-verify requires <PATH.app> [--json]"));
+        return Err(usage_err("bundle-verify requires <PATH.app> [--full] [--json]"));
     }
+    let opts = VerifyBundleOptions { full_rehash };
     let mut reports = Vec::new();
     let mut all_ok = true;
     for p in &paths {
-        let report = verify_app_bundle(p)?;
+        let report = verify_app_bundle_with_options(p, &opts)?;
         if !json {
             print!("{}", format_bundle_verify_report(&report));
         }

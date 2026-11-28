@@ -636,10 +636,7 @@ pub fn audit_game_dir(
         } else {
             exe_count += 1;
         }
-        if norm_self.contains("cohtml")
-            || norm_self.contains("v8")
-            || norm_self.contains("libcef")
-        {
+        if is_v8_or_cohtml_dll_name(&norm_self) {
             runtime_hazards.v8_or_cohtml_detected = true;
         }
 
@@ -1042,6 +1039,59 @@ fn verdict_severity(v: AntiCheatVerdict) -> u8 {
     }
 }
 
+/// Returns `true` when a raw or normalized Windows DLL/binary name indicates embedded V8,
+/// Coherent Gameface (`cohtml`), or Chromium Embedded Framework (`libcef`) — all of which
+/// require `v8_jitless = true` so guest JS engines do not emit x86-64 RWX JIT code.
+pub fn is_v8_or_cohtml_dll_name(raw_or_norm_dll: &str) -> bool {
+    let norm = pe_image::normalize_dll_name(raw_or_norm_dll);
+    let canon = canonical_dll(&norm);
+    matches!(
+        canon.as_str(),
+        "cohtml_windowsdesktop.dll" | "cohtml_icuuc.dll"
+    ) || norm.contains("cohtml")
+        || norm.contains("v8")
+        || norm.contains("libcef")
+}
+
+/// Detect whether any PE32+ binary in `game_dir` ships or imports V8, Cohtml, or CEF,
+/// using the exact same rules as [`audit_game_dir`] so `.app` bundling and `audit-game`
+/// always agree on `v8_jitless`.
+pub fn detect_v8_or_cohtml_in_game_dir(game_dir: &Path) -> bool {
+    let Ok(pe_files) = collect_pe_files(game_dir) else {
+        return false;
+    };
+    // Fast pass 1: check filenames directly (zero file reads when `v8.dll` / `cohtml*.dll` ships).
+    for path in &pe_files {
+        if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+            if is_v8_or_cohtml_dll_name(fname) {
+                return true;
+            }
+        }
+    }
+    // Pass 2: inspect static and delay-load imports of every PE32+ binary.
+    for path in &pe_files {
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        let Ok(pe) = Pe::parse(&bytes) else {
+            continue;
+        };
+        for imp in pe.imports().unwrap_or_default() {
+            if is_v8_or_cohtml_dll_name(&imp.dll) {
+                return true;
+            }
+        }
+        if let Ok(dimps) = pe.delay_imports() {
+            for imp in dimps {
+                if is_v8_or_cohtml_dll_name(&imp.dll) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn record_graphics_and_v8_dll(
     norm_dll: &str,
     detected_apis: &mut BTreeSet<String>,
@@ -1077,9 +1127,6 @@ fn record_graphics_and_v8_dll(
         "libxess.dll" | "libxess_dx11.dll" => {
             upscalers_detected.insert("Intel XeSS".to_string());
         }
-        "cohtml_windowsdesktop.dll" | "cohtml_icuuc.dll" => {
-            *v8_detected = true;
-        }
         _ => {}
     }
     if norm_dll.contains("opengl32") {
@@ -1088,7 +1135,7 @@ fn record_graphics_and_v8_dll(
     if norm_dll.contains("d3d9") {
         detected_apis.insert("D3D9".to_string());
     }
-    if norm_dll.contains("cohtml") || norm_dll.contains("v8") || norm_dll.contains("libcef") {
+    if is_v8_or_cohtml_dll_name(norm_dll) {
         *v8_detected = true;
     }
 }

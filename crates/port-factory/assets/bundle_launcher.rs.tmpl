@@ -121,11 +121,18 @@ fn main() {
         .arg("--pe")
         .arg(&target_pe)
         .args(&args)
-        .env("STEAM_APPID", __APP_ID_DEBUG__)
-        .env("SteamAppId", __APP_ID_DEBUG__)
-        .env("SteamGameId", __APP_ID_DEBUG__)
         .env("PATH", &bundled_path)
         .env("DYLD_FALLBACK_LIBRARY_PATH", &dyld_fallback);
+
+    let bundled_app_id: &str = __APP_ID_DEBUG__;
+    if !bundled_app_id.is_empty()
+        && bundled_app_id != "0"
+        && bundled_app_id.chars().all(|c| c.is_ascii_digit())
+    {
+        cmd.env("STEAM_APPID", bundled_app_id)
+            .env("SteamAppId", bundled_app_id)
+            .env("SteamGameId", bundled_app_id);
+    }
 
     if env_unset("PORT_GAME_DIR") {
         cmd.env("PORT_GAME_DIR", &game_dir);

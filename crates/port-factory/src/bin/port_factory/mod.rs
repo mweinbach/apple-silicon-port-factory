@@ -101,12 +101,13 @@ pub fn usage() -> ! {
                                                 Download or repair a Windows x64 Steam depot & run post-install setup\n\
            steam-postinstall <GAME_DIR> [--appid ID] [--out DIR]\n\
                                                 Extract installscript.vdf registry & satisfy _CommonRedist\n\
-           steam-convert <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH] [--max-fns N] [--bundle-shader-cache [DIR]]\n\
-                                                One-click convert a Steam game or steam.exe to macOS .app / AOT\n\
-           steam-port <APPID_OR_NAME> [--qr | --user ACCOUNT] [--validate] [--skip-download] [--out PATH.app] [--copy-to /Volumes/SSD] [--dry-run]\n\
+           steam-convert <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH] [--max-fns N] [--shader-limit N] [--no-shaders] [--bundle-shader-cache [DIR]]\n\
+                                                One-click convert a Steam/Epic/store game or directory to macOS .app / AOT\n\
+           steam-port <APPID_OR_NAME> [--qr | --user ACCOUNT] [--validate] [--skip-download] [--shader-limit N] [--no-shaders] [--out PATH.app] [--copy-to /Volumes/SSD] [--dry-run]\n\
                                                 Full end-to-end pipeline: Steam download -> .app bundle -> verify -> optional SSD copy\n\
            bundles [--json]                     List packaged .app bundles and mounted external SSDs\n\
-           bundle-verify <PATH.app...> [--json] Verify an .app bundle is self-contained and portable (exit 4 on failure)\n\
+           bundle-verify <PATH.app...> [--full] [--json]\n\
+                                                Verify an .app bundle is self-contained and portable (--full forces parallel re-hash; exit 4 on failure)\n\
            bundle-export <PATH.app> <DEST> [--force]\n\
                                                 Verify and copy an .app bundle to an external SSD or target folder\n\
          \n\

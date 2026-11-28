@@ -882,7 +882,6 @@ fn copy_game_payload_produces_bundle_passing_external_symlinks_check() {
     codesign_ad_hoc(&stub_dylib);
     codesign_ad_hoc(&macos_dir.join("dxil-metald"));
     codesign_ad_hoc(&macos_dir.join("port-runner"));
-    codesign_ad_hoc(&macos_dir.join("FixtureGame"));
     codesign_ad_hoc(&app_dir);
 
     // Fresh `--copy-game` bundle must pass `game_payload`, `external_symlinks`, and `codesign`.
@@ -929,4 +928,449 @@ fn copy_game_payload_produces_bundle_passing_external_symlinks_check() {
         check_status(&report_dangling, "external_symlinks").map(|(s, _)| s),
         Some(BundleCheckStatus::Fail)
     );
+}
+
+#[test]
+fn parses_port_acquire_manifest_for_any_store_and_generates_game_toml() {
+    use port_manifest::GameManifest;
+
+    // 1. Epic Games Store manifest (with Unicode title, launch args, and an injected secret
+    //    flag to prove defense-in-depth redaction).
+    let epic_json = r#"{
+      "schema_version": 1,
+      "generated_by": "port-acquire",
+      "store": "epic",
+      "app_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "title": "Hero\u2019s Journey 2",
+      "platform": "windows",
+      "version": "Build_20260810.0",
+      "executable": "Bin\\Hero2.exe",
+      "launch_args": [
+        "-epicapp=a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "-epicenv=Prod",
+        "-EpicPortal",
+        "-auth_password=SUPER_SECRET",
+        "--token",
+        "SECRET_TOK",
+        "-epiclocale=en"
+      ],
+      "compatibility_signals": {
+        "requires_eos": true,
+        "requires_steamworks": false
+      },
+      "redistributables": [
+        {
+          "id": "vcredist:2022",
+          "name": "Visual C++ 2022",
+          "category": "vcredist",
+          "native_in_win32_rt": true
+        }
+      ]
+    }"#;
+
+    let epic = parse_acquire_manifest(epic_json).unwrap();
+    assert_eq!(epic.schema_version, 1);
+    assert_eq!(epic.store, "epic");
+    assert_eq!(epic.app_id, "a1b2c3d4e5f60718293a4b5c6d7e8f90");
+    assert_eq!(epic.title.as_deref(), Some("Hero\u{2019}s Journey 2"));
+    assert_eq!(epic.version.as_deref(), Some("Build_20260810.0"));
+    assert_eq!(epic.executable.as_deref(), Some("Bin/Hero2.exe"));
+    assert!(epic.had_unredacted_secrets);
+    assert_eq!(epic.steam_app_id(), None);
+    assert_eq!(
+        epic.launch_args,
+        vec![
+            "-epicapp=a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "-epicenv=Prod",
+            "-EpicPortal",
+            "-epiclocale=en",
+        ]
+    );
+
+    let epic_toml = generate_bundle_game_manifest_toml(&BundleManifestInput {
+        display_name: epic.title.as_deref().unwrap(),
+        exec_ident: "HerosJourney2",
+        exe_rel: "Bin/Hero2.exe",
+        app_id: &epic.app_id,
+        v8_jitless: true,
+        acquire_manifest: Some(&epic),
+    });
+    assert!(epic_toml.contains("store = \"epic\""), "{epic_toml}");
+    assert!(
+        epic_toml.contains("app_id = \"a1b2c3d4e5f60718293a4b5c6d7e8f90\""),
+        "{epic_toml}"
+    );
+    assert!(!epic_toml.contains("steam_app_id"), "{epic_toml}");
+    assert!(!epic_toml.contains("SUPER_SECRET"), "{epic_toml}");
+    assert!(!epic_toml.contains("SECRET_TOK"), "{epic_toml}");
+    assert!(epic_toml.contains("v8_jitless = true"), "{epic_toml}");
+
+    let parsed_epic = GameManifest::parse(&epic_toml);
+    assert_eq!(parsed_epic.exe.as_deref(), Some("Bin/Hero2.exe"));
+    assert_eq!(parsed_epic.steam_app_id, None);
+    assert_eq!(parsed_epic.v8_jitless, Some(true));
+    assert_eq!(parsed_epic.aot_dir.as_deref(), Some("AotCache"));
+    assert_eq!(
+        parsed_epic.split_args(),
+        vec![
+            "-epicapp=a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "-epicenv=Prod",
+            "-EpicPortal",
+            "-epiclocale=en",
+        ]
+    );
+
+    // 2. Steam manifest preserves both store/app_id and numeric steam_app_id.
+    let steam_json = r#"{
+      "schema_version": 1,
+      "store": "steam",
+      "app_id": "2357570",
+      "title": "Steam Demo",
+      "executable": "Demo.exe",
+      "launch_args": ["-windowed", "-saveDir=My Saves"]
+    }"#;
+    let steam = parse_acquire_manifest(steam_json).unwrap();
+    assert!(!steam.had_unredacted_secrets);
+    assert_eq!(steam.steam_app_id(), Some("2357570"));
+    let steam_toml = generate_bundle_game_manifest_toml(&BundleManifestInput {
+        display_name: "Steam Demo",
+        exec_ident: "SteamDemo",
+        exe_rel: "Demo.exe",
+        app_id: &steam.app_id,
+        v8_jitless: false,
+        acquire_manifest: Some(&steam),
+    });
+    assert!(steam_toml.contains("store = \"steam\""), "{steam_toml}");
+    assert!(steam_toml.contains("app_id = \"2357570\""), "{steam_toml}");
+    assert!(steam_toml.contains("steam_app_id = \"2357570\""), "{steam_toml}");
+    let parsed_steam = GameManifest::parse(&steam_toml);
+    assert_eq!(parsed_steam.steam_app_id.as_deref(), Some("2357570"));
+    assert_eq!(parsed_steam.split_args(), vec!["-windowed", "-saveDir=My Saves"]);
+
+    // 3. Any other storefront (e.g. GOG) preserves store, app_id, and args without polluting steam_app_id.
+    let gog_json = r#"{
+      "schema_version": 1,
+      "store": "gog",
+      "app_id": "1207658924",
+      "title": "GOG Classic",
+      "executable": "Classic.exe",
+      "launch_args": ["-skipintro"]
+    }"#;
+    let gog = parse_acquire_manifest(gog_json).unwrap();
+    assert_eq!(gog.steam_app_id(), None);
+    let gog_toml = generate_bundle_game_manifest_toml(&BundleManifestInput {
+        display_name: "GOG Classic",
+        exec_ident: "GOGClassic",
+        exe_rel: "Classic.exe",
+        app_id: &gog.app_id,
+        v8_jitless: false,
+        acquire_manifest: Some(&gog),
+    });
+    assert!(gog_toml.contains("store = \"gog\""), "{gog_toml}");
+    assert!(gog_toml.contains("app_id = \"1207658924\""), "{gog_toml}");
+    assert!(!gog_toml.contains("steam_app_id"), "{gog_toml}");
+
+    // 4. Local directory without a manifest (`"custom"`) never emits `steam_app_id = "custom"`.
+    let custom_toml = generate_game_manifest_toml("LocalApp", "LocalApp", "LocalApp.exe", "custom");
+    assert!(!custom_toml.contains("steam_app_id"), "{custom_toml}");
+
+    // 5. Unsupported schema_version fails honestly.
+    assert!(parse_acquire_manifest(r#"{"schema_version": 99, "store": "epic"}"#).is_err());
+
+    // 6. `scan_post_install` picks up `native_in_win32_rt: true` redistributables from the manifest.
+    let tmp = make_temp_dir("acquire_postinstall");
+    fs::write(tmp.path().join(ACQUIRE_MANIFEST_FILENAME), epic_json).unwrap();
+    let post = scan_post_install(tmp.path());
+    assert!(
+        post.bypassable_redistributables
+            .iter()
+            .any(|s| s.contains("Visual C++ 2022")),
+        "expected native_in_win32_rt redist in {:?}",
+        post.bypassable_redistributables
+    );
+}
+
+#[test]
+fn bundler_and_audit_game_agree_on_v8_cohtml_detection() {
+    use crate::audit_game::{audit_game_dir, detect_v8_or_cohtml_in_game_dir, AuditGameOptions};
+    use crate::win32_db::test_pe_fixture::{build_synthetic_pe, build_synthetic_win32_workspace};
+
+    let tmp = make_temp_dir("v8_agreement");
+    let fake_ws = tmp.path().join("ws");
+    build_synthetic_win32_workspace(&fake_ws);
+    let db = Win32Database::from_workspace_src(&fake_ws).unwrap();
+
+    // Case A: ships `cohtml.WindowsDesktop.dll` beside plain EXE.
+    let dir_a = tmp.path().join("GameWithCohtmlDll");
+    fs::create_dir_all(&dir_a).unwrap();
+    let plain_exe = build_synthetic_pe(
+        false,
+        &[0x31, 0xC0, 0xC3],
+        &[("KERNEL32.dll", &["CreateFileW"])],
+        false,
+    );
+    let cohtml_dll = build_synthetic_pe(
+        true,
+        &[0x31, 0xC0, 0xC3],
+        &[("KERNEL32.dll", &["CreateFileW"])],
+        false,
+    );
+    fs::write(dir_a.join("GameA.exe"), &plain_exe).unwrap();
+    fs::write(dir_a.join("cohtml.WindowsDesktop.dll"), &cohtml_dll).unwrap();
+
+    let audit_a = audit_game_dir(&dir_a, &db, &AuditGameOptions::default()).unwrap();
+    let bundle_a = detect_v8_or_cohtml_in_game_dir(&dir_a);
+    assert!(audit_a.runtime_hazards.v8_or_cohtml_detected);
+    assert_eq!(bundle_a, audit_a.runtime_hazards.v8_or_cohtml_detected);
+
+    // Case B: EXE statically imports `v8.dll` (even without `v8.dll` file on disk).
+    let dir_b = tmp.path().join("GameImportingV8");
+    fs::create_dir_all(&dir_b).unwrap();
+    let v8_exe = build_synthetic_pe(
+        false,
+        &[0x31, 0xC0, 0xC3],
+        &[("KERNEL32.dll", &["CreateFileW"]), ("v8.dll", &["V8Init"])],
+        false,
+    );
+    fs::write(dir_b.join("GameB.exe"), &v8_exe).unwrap();
+
+    let audit_b = audit_game_dir(&dir_b, &db, &AuditGameOptions::default()).unwrap();
+    let bundle_b = detect_v8_or_cohtml_in_game_dir(&dir_b);
+    assert!(audit_b.runtime_hazards.v8_or_cohtml_detected);
+    assert_eq!(bundle_b, audit_b.runtime_hazards.v8_or_cohtml_detected);
+
+    // Case C: Plain D3D12 game with no V8/Cohtml/CEF.
+    let dir_c = tmp.path().join("PlainD3D12Game");
+    fs::create_dir_all(&dir_c).unwrap();
+    let d3d_exe = build_synthetic_pe(
+        false,
+        &[0x31, 0xC0, 0xC3],
+        &[
+            ("KERNEL32.dll", &["CreateFileW"]),
+            ("d3d12.dll", &["D3D12CreateDevice"]),
+        ],
+        false,
+    );
+    fs::write(dir_c.join("GameC.exe"), &d3d_exe).unwrap();
+
+    let audit_c = audit_game_dir(&dir_c, &db, &AuditGameOptions::default()).unwrap();
+    let bundle_c = detect_v8_or_cohtml_in_game_dir(&dir_c);
+    assert!(!audit_c.runtime_hazards.v8_or_cohtml_detected);
+    assert_eq!(bundle_c, audit_c.runtime_hazards.v8_or_cohtml_detected);
+}
+
+#[test]
+fn parallel_shader_precompile_defaults_to_all_and_honors_cap() {
+    use crate::gpu_shaders::precompile_shaders_for_paths;
+
+    let tmp = make_temp_dir("shader_cap");
+    let src_dir = tmp.path().join("shaders_src");
+    fs::create_dir_all(&src_dir).unwrap();
+    let spv = dxil_metal::spirv_metal::sample_vulkan_compute_spirv();
+    for i in 0..5 {
+        fs::write(src_dir.join(format!("comp_{i}.spv")), &spv).unwrap();
+    }
+
+    let cache_all = tmp.path().join("cache_all");
+    let all = precompile_shaders_for_paths(&[src_dir.clone()], Some(cache_all), usize::MAX)
+        .expect("precompile all synthetic .spv shaders");
+    assert_eq!(all.active_wave32_exports, 5);
+
+    let cache_cap = tmp.path().join("cache_cap");
+    let capped = precompile_shaders_for_paths(&[src_dir], Some(cache_cap), 2)
+        .expect("precompile capped synthetic .spv shaders");
+    assert_eq!(capped.active_wave32_exports, 2);
+}
+
+#[test]
+fn bundle_verify_checks_acquire_manifest_and_flags_custom_steam_app_id() {
+    let root = make_temp_dir("verify_acquire_manifest");
+    let app = root.path().join("ManifestCheck.app");
+    let contents = app.join("Contents");
+    let resources = contents.join("Resources");
+    fs::create_dir_all(contents.join("MacOS")).unwrap();
+    fs::create_dir_all(contents.join("Frameworks")).unwrap();
+    fs::create_dir_all(resources.join("Game")).unwrap();
+    fs::write(
+        contents.join("Info.plist"),
+        generate_info_plist("ManifestCheck", "ManifestCheck", "1"),
+    )
+    .unwrap();
+
+    // Legacy placeholder `steam_app_id = "custom"` must emit a WARN on `game_manifest`.
+    fs::write(
+        resources.join("game.toml"),
+        "[app]\nid = \"mc\"\nexe = \"MC.exe\"\nsteam_app_id = \"custom\"\n",
+    )
+    .unwrap();
+    // Clean `port-acquire-manifest.json` must PASS `acquire_manifest`.
+    fs::write(
+        resources.join(ACQUIRE_MANIFEST_FILENAME),
+        r#"{"schema_version":1,"store":"epic","app_id":"abc123","launch_args":["-EpicPortal"]}"#,
+    )
+    .unwrap();
+
+    let rep1 = verify_app_bundle(&app).unwrap();
+    let find = |r: &BundleVerifyReport, name: &str| {
+        r.checks
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| (c.status, c.detail.clone()))
+    };
+    assert_eq!(
+        find(&rep1, "game_manifest").map(|(s, _)| s),
+        Some(BundleCheckStatus::Warn)
+    );
+    assert_eq!(
+        find(&rep1, "acquire_manifest").map(|(s, _)| s),
+        Some(BundleCheckStatus::Pass)
+    );
+
+    // Unredacted secret in bundled `port-acquire-manifest.json` must FAIL `acquire_manifest`.
+    fs::write(
+        resources.join(ACQUIRE_MANIFEST_FILENAME),
+        r#"{"schema_version":1,"store":"epic","app_id":"abc123","launch_args":["-auth_password=leak"]}"#,
+    )
+    .unwrap();
+    let rep2 = verify_app_bundle(&app).unwrap();
+    assert_eq!(
+        find(&rep2, "acquire_manifest").map(|(s, _)| s),
+        Some(BundleCheckStatus::Fail)
+    );
+}
+
+#[test]
+fn steam_convert_surfaces_prewarm_aot_failure_clearly() {
+    use crate::win32_db::test_pe_fixture::{build_synthetic_pe, build_synthetic_win32_workspace};
+
+    let tmp = make_temp_dir("prewarm_fail_surface");
+    let fake_ws = tmp.path().join("ws");
+    build_synthetic_win32_workspace(&fake_ws);
+
+    // Stage tiny fake `port-runner` (exits 1 with a diagnostic stderr error) and `dxil-metald`
+    // in `<fake_ws>/target/aarch64-apple-darwin/release/` so `convert_steam_game` exercises the
+    // real packaging + `--prewarm-aot` failure surfacing path quickly without invoking cargo.
+    let rel_dir = fake_ws.join("target/aarch64-apple-darwin/release");
+    fs::create_dir_all(&rel_dir).unwrap();
+    let fake_runner_rs = tmp.path().join("fake_failing_runner.rs");
+    fs::write(
+        &fake_runner_rs,
+        r#"fn main() {
+    eprintln!("port-runner fatal startup error: parsing dbghelp.dll: not a PE32+ image (magic 0x10b)");
+    std::process::exit(1);
+}
+"#,
+    )
+    .unwrap();
+    let fake_runner = rel_dir.join("port-runner");
+    let st1 = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            &fake_runner_rs.to_string_lossy(),
+            "-o",
+            &fake_runner.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(st1.status.success());
+
+    let fake_shaderd_rs = tmp.path().join("fake_shaderd.rs");
+    fs::write(
+        &fake_shaderd_rs,
+        "fn main() { println!(\"dxil-metald protocol v1\"); }\n",
+    )
+    .unwrap();
+    let fake_shaderd = rel_dir.join("dxil-metald");
+    let st2 = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            &fake_shaderd_rs.to_string_lossy(),
+            "-o",
+            &fake_shaderd.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(st2.status.success());
+
+    // Synthetic Epic game directory with `port-acquire-manifest.json`, PE32+ EXE importing `v8.dll`,
+    // and an isolated `PORT_VERIFY_CACHE_DIR`.
+    let game_dir = tmp.path().join("SyntheticEpicGame");
+    fs::create_dir_all(&game_dir).unwrap();
+    let exe_bytes = build_synthetic_pe(
+        false,
+        &[0x31, 0xC0, 0xC3],
+        &[("KERNEL32.dll", &["CreateFileW"]), ("v8.dll", &["V8Init"])],
+        false,
+    );
+    fs::write(game_dir.join("SynthHero.exe"), &exe_bytes).unwrap();
+    fs::write(
+        game_dir.join(ACQUIRE_MANIFEST_FILENAME),
+        r#"{
+          "schema_version": 1,
+          "store": "epic",
+          "app_id": "deadbeef1234",
+          "title": "Synth Hero",
+          "version": "Build_1.0",
+          "executable": "SynthHero.exe",
+          "launch_args": ["-epicapp=deadbeef1234", "-EpicPortal"]
+        }"#,
+    )
+    .unwrap();
+
+    let out_app = tmp.path().join("Synth Hero.app");
+    let res = convert_steam_game(
+        &fake_ws,
+        &SteamConvertOptions {
+            target: game_dir.to_string_lossy().into_owned(),
+            format: ConversionFormat::MacOsApp,
+            output_path: Some(out_app.clone()),
+            precompile_shaders: false,
+            shader_limit: None,
+            max_aot_functions: 0,
+            bundle_shader_cache_from: None,
+        },
+    )
+    .unwrap();
+
+    // Clean up any external signing receipt written for this temporary synthetic bundle.
+    if let (Some(cache_dir), Some(ref launcher)) = (
+        crate::bundle_codesign::verify_receipt_cache_dir(),
+        &res.standalone_executable,
+    ) {
+        if let Ok(cd) = crate::bundle_codesign::read_macho_code_directory_info(launcher) {
+            let _ = fs::remove_file(cache_dir.join(format!("{}.tsv", cd.cdhash_full_hex)));
+        }
+    }
+
+    assert_eq!(res.store.as_deref(), Some("epic"));
+    assert_eq!(res.app_id, "deadbeef1234");
+    assert!(res.v8_jitless);
+    assert_eq!(res.aot_cache_modules, 0);
+    let err = res
+        .aot_prewarm_error
+        .as_deref()
+        .expect("prewarm failure must be surfaced in SteamConvertResult.aot_prewarm_error");
+    assert!(
+        err.contains("magic 0x10b"),
+        "expected stderr diagnostic in aot_prewarm_error, got: {err}"
+    );
+    assert!(
+        res.warnings.iter().any(|w| w.contains("magic 0x10b")),
+        "expected prewarm failure in res.warnings: {:?}",
+        res.warnings
+    );
+
+    let generated_toml = fs::read_to_string(out_app.join("Contents/Resources/game.toml")).unwrap();
+    assert!(generated_toml.contains("store = \"epic\""), "{generated_toml}");
+    assert!(generated_toml.contains("app_id = \"deadbeef1234\""), "{generated_toml}");
+    assert!(!generated_toml.contains("steam_app_id"), "{generated_toml}");
+    assert!(generated_toml.contains("v8_jitless = true"), "{generated_toml}");
+    assert!(
+        generated_toml.contains("args = \"-epicapp=deadbeef1234 -EpicPortal\""),
+        "{generated_toml}"
+    );
+    assert!(out_app
+        .join("Contents/Resources")
+        .join(ACQUIRE_MANIFEST_FILENAME)
+        .is_file());
 }
