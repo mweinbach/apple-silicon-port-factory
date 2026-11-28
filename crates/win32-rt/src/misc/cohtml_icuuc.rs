@@ -1,13 +1,14 @@
-//! Builtin `cohtml_icuuc.dll` — ICU 69 C++ runtime (`Locale`, `UnicodeString`,
-//! `BreakIterator`, and `udata_setCommonData_69`) backed by Apple's native
+//! Builtin `cohtml_icuuc.dll` — ICU 69 runtime (`Locale`, `UnicodeString`,
+//! `BreakIterator`, `UBiDi`, `udata_setCommonData_69`, and
+//! `u_setMemoryFunctions_69`) backed by Apple's native
 //! `/usr/lib/libicucore.A.dylib`.
 //!
-//! Apple ships the complete Unicode UAX #14 (line breaking), UAX #29 (extended
-//! grapheme cluster, word, and sentence breaking), and CJK dictionary tables in
-//! `/usr/lib/libicucore.A.dylib` on both macOS and iOS (via the dyld shared
-//! cache). We load its unversioned C `ubrk_*` / `uloc_*` entry points lazily
-//! through `dlopen`/`dlsym`, with a clean pure-Rust UTF-16 fallback if the host
-//! library is unavailable.
+//! Apple ships the complete Unicode UAX #9 (bidirectional algorithm), UAX #14
+//! (line breaking), UAX #29 (extended grapheme cluster, word, and sentence
+//! breaking), and CJK dictionary tables in `/usr/lib/libicucore.A.dylib` on
+//! both macOS and iOS (via the dyld shared cache). We load its unversioned C
+//! `ubrk_*` / `ubidi_*` / `uloc_*` entry points lazily through `dlopen`/`dlsym`,
+//! with a clean pure-Rust UTF-16 fallback if the host library is unavailable.
 //!
 //! Guest `icu_69::Locale` and `icu_69::UnicodeString` instances store only an
 //! 8-byte tagged handle at offset 0 (written via `ptr::write_unaligned`), backed
@@ -132,6 +133,10 @@ pub static EXTRA_EXPORTS: &[crate::Export] = &[
         ptr: crate::Ptr(unicode_string_dtor as *const ()),
     },
     crate::Export {
+        name: "?length@UnicodeString@icu_69@@QEBAHXZ",
+        ptr: crate::Ptr(unicode_string_length as *const ()),
+    },
+    crate::Export {
         name: "?fromUTF8@UnicodeString@icu_69@@SA?AV12@VStringPiece@2@@Z",
         ptr: crate::Ptr(unicode_string_from_utf8 as *const ()),
     },
@@ -161,9 +166,21 @@ pub static EXTRA_EXPORTS: &[crate::Export] = &[
 const UBRK_DONE: i32 = -1;
 
 const U_ZERO_ERROR: i32 = 0;
+const U_ILLEGAL_ARGUMENT_ERROR: i32 = 1;
+const U_MEMORY_ALLOCATION_ERROR: i32 = 7;
 const U_SAFECLONE_ALLOCATED_WARNING: i32 = -126;
 const U_BUFFER_OVERFLOW_ERROR: i32 = 15;
 const U_UNSUPPORTED_ERROR: i32 = 16;
+const U_INVALID_STATE_ERROR: i32 = 27;
+
+const UBIDI_LTR: i32 = 0;
+const UBIDI_RTL: i32 = 1;
+const UBIDI_MIXED: i32 = 2;
+const UBIDI_NEUTRAL: i32 = 3;
+
+const UBIDI_MAX_EXPLICIT_LEVEL: u8 = 125;
+const UBIDI_DEFAULT_LTR: u8 = 0xFE;
+const UBIDI_DEFAULT_RTL: u8 = 0xFF;
 
 const HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const LOCALE_HANDLE_TAG: u64 = 0x4C4F_4336_0000_0000; // "LOC6"
@@ -193,6 +210,33 @@ fn empty_u16_arc() -> Arc<[u16]> {
 // ---------------------------------------------------------------------------
 
 type UBreakIteratorOpaque = c_void;
+type UBiDiOpaque = c_void;
+
+struct IcuBidiCore {
+    ubidi_open_sized: unsafe extern "C" fn(
+        max_length: i32,
+        max_run_count: i32,
+        p_error_code: *mut i32,
+    ) -> *mut UBiDiOpaque,
+    ubidi_close: unsafe extern "C" fn(p_bidi: *mut UBiDiOpaque),
+    ubidi_set_para: unsafe extern "C" fn(
+        p_bidi: *mut UBiDiOpaque,
+        text: *const u16,
+        length: i32,
+        para_level: u8,
+        embedding_levels: *mut u8,
+        p_error_code: *mut i32,
+    ),
+    ubidi_get_direction: unsafe extern "C" fn(p_bidi: *const UBiDiOpaque) -> i32,
+    ubidi_get_base_direction: unsafe extern "C" fn(text: *const u16, length: i32) -> i32,
+    ubidi_count_runs: unsafe extern "C" fn(p_bidi: *mut UBiDiOpaque, p_error_code: *mut i32) -> i32,
+    ubidi_get_visual_run: unsafe extern "C" fn(
+        p_bidi: *mut UBiDiOpaque,
+        run_index: i32,
+        p_logical_start: *mut i32,
+        p_length: *mut i32,
+    ) -> i32,
+}
 
 struct IcuCore {
     ubrk_open: unsafe extern "C" fn(
@@ -241,6 +285,7 @@ struct IcuCore {
         ) -> i32,
     >,
     uloc_get_default: Option<unsafe extern "C" fn() -> *const c_char>,
+    ubidi: Option<IcuBidiCore>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -278,6 +323,17 @@ fn load_icu_core() -> Option<IcuCore> {
             );
             return None;
         }
+        let ubidi = (|| {
+            Some(IcuBidiCore {
+                ubidi_open_sized: dlsym_opt(handle, b"ubidi_openSized\0")?,
+                ubidi_close: dlsym_opt(handle, b"ubidi_close\0")?,
+                ubidi_set_para: dlsym_opt(handle, b"ubidi_setPara\0")?,
+                ubidi_get_direction: dlsym_opt(handle, b"ubidi_getDirection\0")?,
+                ubidi_get_base_direction: dlsym_opt(handle, b"ubidi_getBaseDirection\0")?,
+                ubidi_count_runs: dlsym_opt(handle, b"ubidi_countRuns\0")?,
+                ubidi_get_visual_run: dlsym_opt(handle, b"ubidi_getVisualRun\0")?,
+            })
+        })();
         let resolved = (|| {
             Some(IcuCore {
                 ubrk_open: dlsym_opt(handle, b"ubrk_open\0")?,
@@ -296,6 +352,7 @@ fn load_icu_core() -> Option<IcuCore> {
                 ubrk_get_rule_status: dlsym_opt(handle, b"ubrk_getRuleStatus\0")?,
                 ubrk_get_rule_status_vec: dlsym_opt(handle, b"ubrk_getRuleStatusVec\0"),
                 uloc_get_default: dlsym_opt(handle, b"uloc_getDefault\0"),
+                ubidi,
             })
         })();
         match resolved {
@@ -321,6 +378,92 @@ fn load_icu_core() -> Option<IcuCore> {
 fn icu_core() -> Option<&'static IcuCore> {
     static CORE: OnceLock<Option<IcuCore>> = OnceLock::new();
     CORE.get_or_init(load_icu_core).as_ref()
+}
+
+fn icu_bidi() -> Option<&'static IcuBidiCore> {
+    icu_core().and_then(|c| c.ubidi.as_ref())
+}
+
+// ---------------------------------------------------------------------------
+// Custom ICU memory callbacks (`u_setMemoryFunctions_69`)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct CustomMemFuncs {
+    context: usize,
+    alloc_fn: usize,
+    realloc_fn: usize,
+    free_fn: usize,
+}
+
+impl CustomMemFuncs {
+    unsafe fn alloc(self, size: usize) -> usize {
+        crate::call_guest8(
+            self.alloc_fn,
+            self.context as u64,
+            size as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ) as usize
+    }
+
+    unsafe fn realloc(self, mem: usize, size: usize) -> usize {
+        crate::call_guest8(
+            self.realloc_fn,
+            self.context as u64,
+            mem as u64,
+            size as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ) as usize
+    }
+
+    unsafe fn free(self, mem: usize) {
+        if mem != 0 {
+            let _ = crate::call_guest8(
+                self.free_fn,
+                self.context as u64,
+                mem as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+    }
+}
+
+struct MemFuncState {
+    heap_in_use: bool,
+    custom: Option<CustomMemFuncs>,
+}
+
+fn mem_func_state() -> &'static Mutex<MemFuncState> {
+    static STATE: OnceLock<Mutex<MemFuncState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(MemFuncState {
+            heap_in_use: false,
+            custom: None,
+        })
+    })
+}
+
+/// Latch ICU heap-in-use state and snapshot any registered custom allocator
+/// callbacks before dropping the lock (so callers never hold the mutex across
+/// `call_guest8`).
+fn acquire_custom_mem_funcs() -> Option<CustomMemFuncs> {
+    let mut st = mem_func_state().lock().unwrap_or_else(|e| e.into_inner());
+    st.heap_in_use = true;
+    st.custom
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +958,8 @@ struct IcuBreakIterator {
     /// Pure-Rust fallback boundary offsets (always starts with `0`).
     fallback_breaks: Vec<i32>,
     fallback_cursor: usize,
+    /// Optional guest-allocator backing block acquired via `u_setMemoryFunctions_69`.
+    guest_alloc: Option<(CustomMemFuncs, usize)>,
 }
 
 impl Drop for IcuBreakIterator {
@@ -824,7 +969,17 @@ impl Drop for IcuBreakIterator {
 }
 
 impl IcuBreakIterator {
-    fn new(kind: BreakKind, locale: Arc<LocaleData>) -> Self {
+    fn new(kind: BreakKind, locale: Arc<LocaleData>) -> Option<Self> {
+        let guest_alloc = if let Some(mf) = acquire_custom_mem_funcs() {
+            let ptr = unsafe { mf.alloc(std::mem::size_of::<IcuBreakIterator>()) };
+            if ptr == 0 {
+                return None;
+            }
+            Some((mf, ptr))
+        } else {
+            None
+        };
+
         let raw = if let Some(icu) = icu_core() {
             let mut open_err: i32 = U_ZERO_ERROR;
             let handle = unsafe {
@@ -852,7 +1007,7 @@ impl IcuBreakIterator {
             std::ptr::null_mut()
         };
 
-        Self {
+        Some(Self {
             vtbl: &BREAK_VTBL.0,
             kind,
             locale,
@@ -868,7 +1023,8 @@ impl IcuBreakIterator {
             }),
             fallback_breaks: vec![0],
             fallback_cursor: 0,
-        }
+            guest_alloc,
+        })
     }
 
     fn close_native(&mut self) {
@@ -890,6 +1046,9 @@ impl IcuBreakIterator {
             (*ci).begin = 0;
             (*ci).end = 0;
             (*ci).text = EMPTY_U16.as_ptr();
+        }
+        if let Some((mf, ptr)) = self.guest_alloc.take() {
+            unsafe { mf.free(ptr) };
         }
     }
 
@@ -1081,7 +1240,17 @@ impl IcuBreakIterator {
         0
     }
 
-    fn clone_boxed(&self) -> Box<Self> {
+    fn clone_boxed(&self) -> Option<Box<Self>> {
+        let guest_alloc = if let Some(mf) = acquire_custom_mem_funcs() {
+            let ptr = unsafe { mf.alloc(std::mem::size_of::<IcuBreakIterator>()) };
+            if ptr == 0 {
+                return None;
+            }
+            Some((mf, ptr))
+        } else {
+            None
+        };
+
         let cloned_raw = if !self.raw.is_null() {
             if let Some(icu) = icu_core() {
                 let mut err: i32 = U_ZERO_ERROR;
@@ -1169,7 +1338,7 @@ impl IcuBreakIterator {
             (vec![0], 0)
         };
 
-        Box::new(Self {
+        Some(Box::new(Self {
             vtbl: &BREAK_VTBL.0,
             kind: self.kind,
             locale: Arc::clone(&self.locale),
@@ -1185,7 +1354,8 @@ impl IcuBreakIterator {
             }),
             fallback_breaks,
             fallback_cursor,
-        })
+            guest_alloc,
+        }))
     }
 }
 
@@ -1294,7 +1464,10 @@ unsafe extern "win64" fn brk_clone(this: *const IcuBreakIterator) -> *mut IcuBre
     if this.is_null() {
         return std::ptr::null_mut();
     }
-    Box::into_raw((*this).clone_boxed())
+    match (*this).clone_boxed() {
+        Some(b) => Box::into_raw(b),
+        None => std::ptr::null_mut(),
+    }
 }
 
 // Slot 4 (+0x20): getText() const
@@ -1564,7 +1737,9 @@ unsafe extern "win64" fn brk_create_buffer_clone(
     }
     let cloned = brk_clone(this);
     if !err.is_null() {
-        let code = if !stack_buffer.is_null() {
+        let code = if cloned.is_null() {
+            U_MEMORY_ALLOCATION_ERROR
+        } else if !stack_buffer.is_null() {
             U_SAFECLONE_ALLOCATED_WARNING
         } else {
             U_ZERO_ERROR
@@ -1759,6 +1934,257 @@ fn compute_fallback_breaks(text: &[u16], kind: BreakKind, out: &mut Vec<i32>) {
 }
 
 // ---------------------------------------------------------------------------
+// ICU 69 Bidirectional Algorithm (`UBiDi`, backed by Apple libicucore.A.dylib)
+// ---------------------------------------------------------------------------
+
+enum BidiHandleBacking {
+    HostBox(usize),
+    Custom(CustomMemFuncs, usize),
+}
+
+impl BidiHandleBacking {
+    unsafe fn release(self) {
+        match self {
+            BidiHandleBacking::HostBox(ptr) => {
+                if ptr != 0 {
+                    drop(Box::from_raw(ptr as *mut u8));
+                }
+            }
+            BidiHandleBacking::Custom(mf, ptr) => {
+                mf.free(ptr);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FallbackBidiRun {
+    logical_start: i32,
+    length: i32,
+    direction: i32,
+}
+
+struct IcuBiDi {
+    raw: *mut UBiDiOpaque,
+    /// Owned immutable UTF-16 buffer kept alive for native `ubidi_*` queries.
+    text_buf: Arc<[u16]>,
+    /// Owned `embeddingLevels` buffer kept alive for native `ubidi_*` queries
+    /// (`ubidi_setPara` retains the pointer and mutates levels in place).
+    emb_buf: Option<Box<[u8]>>,
+    max_length: i32,
+    max_run_count: i32,
+    has_para: bool,
+    closed: bool,
+    handle_backing: Option<BidiHandleBacking>,
+    custom_mem: Option<CustomMemFuncs>,
+    guest_buf_ptr: usize,
+    guest_buf_cap: usize,
+    fallback_dir: i32,
+    fallback_runs: Vec<FallbackBidiRun>,
+}
+
+unsafe impl Send for IcuBiDi {}
+
+impl Drop for IcuBiDi {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            if let Some(ubidi) = icu_bidi() {
+                unsafe { (ubidi.ubidi_close)(self.raw) };
+            }
+            self.raw = std::ptr::null_mut();
+        }
+        self.text_buf = empty_u16_arc();
+        self.emb_buf = None;
+    }
+}
+
+fn bidi_table() -> &'static Mutex<HashMap<usize, Arc<Mutex<IcuBiDi>>>> {
+    static TABLE: OnceLock<Mutex<HashMap<usize, Arc<Mutex<IcuBiDi>>>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lookup_bidi(p_bidi: *const c_void) -> Option<Arc<Mutex<IcuBiDi>>> {
+    if p_bidi.is_null() {
+        return None;
+    }
+    let tbl = bidi_table().lock().unwrap_or_else(|e| e.into_inner());
+    tbl.get(&(p_bidi as usize)).map(Arc::clone)
+}
+
+fn classify_strong_bidi_dir(ch: char) -> Option<i32> {
+    let cp = ch as u32;
+    if cp == 0x200E {
+        return Some(UBIDI_LTR);
+    }
+    if cp == 0x200F {
+        return Some(UBIDI_RTL);
+    }
+    if matches!(
+        cp,
+        0x0590..=0x08FF
+            | 0xFB1D..=0xFDFF
+            | 0xFE70..=0xFEFF
+            | 0x10800..=0x10FFF
+            | 0x1E800..=0x1EFFF
+    ) {
+        return Some(UBIDI_RTL);
+    }
+    if ch.is_alphabetic() {
+        return Some(UBIDI_LTR);
+    }
+    None
+}
+
+fn fallback_base_direction(units: &[u16]) -> i32 {
+    let mut isolate_depth = 0usize;
+    for res in char::decode_utf16(units.iter().copied()) {
+        let Ok(ch) = res else { continue };
+        match ch as u32 {
+            0x2066..=0x2068 => isolate_depth += 1,
+            0x2069 => isolate_depth = isolate_depth.saturating_sub(1),
+            _ if isolate_depth == 0 => {
+                if let Some(dir) = classify_strong_bidi_dir(ch) {
+                    return dir;
+                }
+            }
+            _ => {}
+        }
+    }
+    UBIDI_NEUTRAL
+}
+
+fn fallback_compute_bidi(
+    units: &[u16],
+    para_level: u8,
+    embedding_levels: Option<&[u8]>,
+    max_length: i32,
+    max_run_count: i32,
+) -> Result<(i32, Vec<FallbackBidiRun>), i32> {
+    if (para_level & 0x7F) > UBIDI_MAX_EXPLICIT_LEVEL
+        && para_level != UBIDI_DEFAULT_LTR
+        && para_level != UBIDI_DEFAULT_RTL
+    {
+        return Err(U_ILLEGAL_ARGUMENT_ERROR);
+    }
+    let len = units.len().min(i32::MAX as usize) as i32;
+    if max_length > 0 && len > max_length {
+        return Err(U_MEMORY_ALLOCATION_ERROR);
+    }
+    let base_rtl = match para_level {
+        UBIDI_DEFAULT_LTR => fallback_base_direction(units) == UBIDI_RTL,
+        UBIDI_DEFAULT_RTL => fallback_base_direction(units) != UBIDI_LTR,
+        lv => (lv & 1) != 0,
+    };
+    let base_dir = if base_rtl { UBIDI_RTL } else { UBIDI_LTR };
+    if units.is_empty() {
+        return Ok((base_dir, Vec::new()));
+    }
+
+    let mut per_unit_rtl = vec![base_rtl; units.len()];
+    if let Some(levels) = embedding_levels {
+        for (dst, &lv) in per_unit_rtl.iter_mut().zip(levels.iter()) {
+            let eff = lv & 0x7F;
+            if eff > UBIDI_MAX_EXPLICIT_LEVEL {
+                return Err(U_ILLEGAL_ARGUMENT_ERROR);
+            }
+            *dst = (eff & 1) != 0;
+        }
+    } else if (para_level & 0x80) == 0 || para_level >= UBIDI_DEFAULT_LTR {
+        let mut idx = 0usize;
+        let mut active_rtl = base_rtl;
+        for res in char::decode_utf16(units.iter().copied()) {
+            let (ch, step) = match res {
+                Ok(c) => (c, c.len_utf16()),
+                Err(_) => ('\u{FFFD}', 1),
+            };
+            if let Some(d) = classify_strong_bidi_dir(ch) {
+                active_rtl = d == UBIDI_RTL;
+            }
+            for off in 0..step {
+                if idx + off < per_unit_rtl.len() {
+                    per_unit_rtl[idx + off] = active_rtl;
+                }
+            }
+            idx += step;
+        }
+    }
+
+    let mut runs = Vec::new();
+    let mut start = 0usize;
+    while start < per_unit_rtl.len() {
+        let rtl = per_unit_rtl[start];
+        let mut end = start + 1;
+        while end < per_unit_rtl.len() && per_unit_rtl[end] == rtl {
+            end += 1;
+        }
+        runs.push(FallbackBidiRun {
+            logical_start: start as i32,
+            length: (end - start) as i32,
+            direction: if rtl { UBIDI_RTL } else { UBIDI_LTR },
+        });
+        start = end;
+    }
+    if max_run_count > 0 && (runs.len() as i32) > max_run_count {
+        return Err(U_MEMORY_ALLOCATION_ERROR);
+    }
+    if base_rtl && runs.len() > 1 {
+        runs.reverse();
+    }
+    let has_ltr = runs.iter().any(|r| r.direction == UBIDI_LTR);
+    let has_rtl = runs.iter().any(|r| r.direction == UBIDI_RTL);
+    let dir = match (has_ltr, has_rtl) {
+        (true, true) => UBIDI_MIXED,
+        (false, true) => UBIDI_RTL,
+        _ => UBIDI_LTR,
+    };
+    Ok((dir, runs))
+}
+
+impl IcuBiDi {
+    fn count_runs(&mut self, status: &mut i32) -> i32 {
+        if !self.raw.is_null() {
+            if let Some(ubidi) = icu_bidi() {
+                return unsafe { (ubidi.ubidi_count_runs)(self.raw, status) };
+            }
+        }
+        if !self.has_para {
+            *status = U_INVALID_STATE_ERROR;
+            return -1;
+        }
+        self.fallback_runs.len() as i32
+    }
+
+    fn direction(&self) -> i32 {
+        if !self.raw.is_null() {
+            if let Some(ubidi) = icu_bidi() {
+                return unsafe { (ubidi.ubidi_get_direction)(self.raw) };
+            }
+        }
+        self.fallback_dir
+    }
+
+    fn visual_run_unchecked(&mut self, run_index: i32) -> (i32, i32, i32) {
+        if !self.raw.is_null() {
+            if let Some(ubidi) = icu_bidi() {
+                let mut logical_start: i32 = 0;
+                let mut run_len: i32 = 0;
+                let dir = unsafe {
+                    (ubidi.ubidi_get_visual_run)(
+                        self.raw,
+                        run_index,
+                        &mut logical_start,
+                        &mut run_len,
+                    )
+                };
+                return (dir, logical_start, run_len);
+            }
+        }
+        let run = self.fallback_runs[run_index as usize];
+        (run.direction, run.logical_start, run.length)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Exported ICU 69 C / C++ entry points
 // ---------------------------------------------------------------------------
 
@@ -1773,7 +2199,13 @@ fn new_break_iterator(kind: BreakKind, locale_ptr: *const c_void, err: *mut i32)
         }
     }
     let locale = unsafe { lookup_locale(locale_ptr) };
-    let b = Box::new(IcuBreakIterator::new(kind, locale));
+    let Some(iter) = IcuBreakIterator::new(kind, locale) else {
+        if !err.is_null() {
+            unsafe { std::ptr::write_unaligned(err, U_MEMORY_ALLOCATION_ERROR) };
+        }
+        return std::ptr::null_mut();
+    };
+    let b = Box::new(iter);
     Box::into_raw(b) as *mut c_void
 }
 
@@ -1782,6 +2214,435 @@ pub unsafe extern "win64" fn udata_setCommonData_69(_data: *const c_void, err: *
     if !err.is_null() && std::ptr::read_unaligned(err) <= 0 {
         std::ptr::write_unaligned(err, U_ZERO_ERROR);
     }
+}
+
+pub unsafe extern "win64" fn u_setMemoryFunctions_69(
+    context: *const c_void,
+    a: *const c_void,
+    r: *const c_void,
+    f: *const c_void,
+    status: *mut i32,
+) {
+    ensure_vtbl_registered();
+    if status.is_null() || std::ptr::read_unaligned(status) > 0 {
+        return;
+    }
+    if a.is_null() || r.is_null() || f.is_null() {
+        std::ptr::write_unaligned(status, U_ILLEGAL_ARGUMENT_ERROR);
+        return;
+    }
+    let mut st = mem_func_state().lock().unwrap_or_else(|e| e.into_inner());
+    if st.heap_in_use {
+        drop(st);
+        std::ptr::write_unaligned(status, U_INVALID_STATE_ERROR);
+        return;
+    }
+    st.custom = Some(CustomMemFuncs {
+        context: context as usize,
+        alloc_fn: a as usize,
+        realloc_fn: r as usize,
+        free_fn: f as usize,
+    });
+    drop(st);
+    std::ptr::write_unaligned(status, U_ZERO_ERROR);
+}
+
+pub unsafe extern "win64" fn ubidi_openSized_69(
+    max_length: i32,
+    max_run_count: i32,
+    p_error_code: *mut i32,
+) -> *mut c_void {
+    ensure_vtbl_registered();
+    if p_error_code.is_null() || std::ptr::read_unaligned(p_error_code) > 0 {
+        return std::ptr::null_mut();
+    }
+    if max_length < 0 || max_run_count < 0 {
+        std::ptr::write_unaligned(p_error_code, U_ILLEGAL_ARGUMENT_ERROR);
+        return std::ptr::null_mut();
+    }
+
+    let mut icu_err: i32 = U_ZERO_ERROR;
+    let raw = if let Some(ubidi) = icu_bidi() {
+        let h = (ubidi.ubidi_open_sized)(max_length, max_run_count, &mut icu_err);
+        if h.is_null() || icu_err > 0 {
+            if !h.is_null() {
+                (ubidi.ubidi_close)(h);
+            }
+            let code = if icu_err > 0 {
+                icu_err
+            } else {
+                U_MEMORY_ALLOCATION_ERROR
+            };
+            std::ptr::write_unaligned(p_error_code, code);
+            return std::ptr::null_mut();
+        }
+        h
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let custom_mem = acquire_custom_mem_funcs();
+    let (handle_addr, backing) = if let Some(mf) = custom_mem {
+        let initial_bytes = 16usize
+            .saturating_add((max_length as usize).saturating_mul(2))
+            .saturating_add((max_run_count as usize).saturating_mul(8))
+            .min(64 * 1024 * 1024);
+        let ptr = mf.alloc(initial_bytes);
+        if ptr == 0 {
+            if !raw.is_null() {
+                if let Some(ubidi) = icu_bidi() {
+                    (ubidi.ubidi_close)(raw);
+                }
+            }
+            std::ptr::write_unaligned(p_error_code, U_MEMORY_ALLOCATION_ERROR);
+            return std::ptr::null_mut();
+        }
+        (ptr, BidiHandleBacking::Custom(mf, ptr))
+    } else {
+        let ptr = Box::into_raw(Box::new(0u8)) as usize;
+        (ptr, BidiHandleBacking::HostBox(ptr))
+    };
+
+    let entry = Arc::new(Mutex::new(IcuBiDi {
+        raw,
+        text_buf: empty_u16_arc(),
+        emb_buf: None,
+        max_length,
+        max_run_count,
+        has_para: false,
+        closed: false,
+        handle_backing: Some(backing),
+        custom_mem,
+        guest_buf_ptr: 0,
+        guest_buf_cap: 0,
+        fallback_dir: UBIDI_LTR,
+        fallback_runs: Vec::new(),
+    }));
+
+    let mut tbl = bidi_table().lock().unwrap_or_else(|e| e.into_inner());
+    if tbl.contains_key(&handle_addr) {
+        drop(tbl);
+        // Defend against a buggy custom allocator returning a live address without corrupting
+        // the existing handle entry.
+        let mut guard = entry.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = guard.handle_backing.take();
+        drop(guard);
+        std::ptr::write_unaligned(p_error_code, U_MEMORY_ALLOCATION_ERROR);
+        return std::ptr::null_mut();
+    }
+    tbl.insert(handle_addr, entry);
+    drop(tbl);
+
+    std::ptr::write_unaligned(p_error_code, icu_err);
+    handle_addr as *mut c_void
+}
+
+pub unsafe extern "win64" fn ubidi_close_69(p_bidi: *mut c_void) {
+    if p_bidi.is_null() {
+        return;
+    }
+    let removed = {
+        let mut tbl = bidi_table().lock().unwrap_or_else(|e| e.into_inner());
+        tbl.remove(&(p_bidi as usize))
+    };
+    let Some(entry) = removed else {
+        log::warn!("cohtml_icuuc: ubidi_close_69 called with unknown handle {:p}", p_bidi);
+        return;
+    };
+
+    let (guest_buf_to_free, handle_backing) = {
+        let mut bidi = entry.lock().unwrap_or_else(|e| e.into_inner());
+        bidi.closed = true;
+        if !bidi.raw.is_null() {
+            if let Some(ubidi) = icu_bidi() {
+                (ubidi.ubidi_close)(bidi.raw);
+            }
+            bidi.raw = std::ptr::null_mut();
+        }
+        // Release text and embedding buffers strictly AFTER `ubidi_close` completes.
+        bidi.text_buf = empty_u16_arc();
+        bidi.emb_buf = None;
+        bidi.fallback_runs.clear();
+        let buf_free = if bidi.guest_buf_ptr != 0 {
+            let ptr = bidi.guest_buf_ptr;
+            bidi.guest_buf_ptr = 0;
+            bidi.guest_buf_cap = 0;
+            bidi.custom_mem.map(|mf| (mf, ptr))
+        } else {
+            None
+        };
+        (buf_free, bidi.handle_backing.take())
+    };
+
+    if let Some((mf, ptr)) = guest_buf_to_free {
+        mf.free(ptr);
+    }
+    if let Some(backing) = handle_backing {
+        backing.release();
+    }
+}
+
+pub unsafe extern "win64" fn ubidi_setPara_69(
+    p_bidi: *mut c_void,
+    text: *const u16,
+    length: i32,
+    para_level: u8,
+    embedding_levels: *mut u8,
+    p_error_code: *mut i32,
+) {
+    ensure_vtbl_registered();
+    if p_error_code.is_null() || std::ptr::read_unaligned(p_error_code) > 0 {
+        return;
+    }
+    let Some(entry) = lookup_bidi(p_bidi) else {
+        std::ptr::write_unaligned(p_error_code, U_ILLEGAL_ARGUMENT_ERROR);
+        return;
+    };
+    if text.is_null() || length < -1 {
+        std::ptr::write_unaligned(p_error_code, U_ILLEGAL_ARGUMENT_ERROR);
+        return;
+    }
+
+    let text_buf = read_guest_utf16(text, length);
+    let actual_len = text_buf.len().min(i32::MAX as usize) as i32;
+    let emb_buf: Option<Box<[u8]>> = if !embedding_levels.is_null() && actual_len > 0 {
+        let n = actual_len as usize;
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            v.push(std::ptr::read_unaligned(embedding_levels.add(i)));
+        }
+        Some(v.into_boxed_slice())
+    } else {
+        None
+    };
+
+    // If custom ICU memory callbacks are installed on a dynamically-sized UBiDi
+    // (`max_length == 0`), grow its guest staging buffer without holding any lock.
+    let text_bytes = text_buf.len().saturating_mul(std::mem::size_of::<u16>());
+    let grow_req = {
+        let mut bidi = entry.lock().unwrap_or_else(|e| e.into_inner());
+        if bidi.closed {
+            std::ptr::write_unaligned(p_error_code, U_INVALID_STATE_ERROR);
+            return;
+        }
+        if bidi.max_length == 0 && text_bytes > bidi.guest_buf_cap {
+            bidi.custom_mem.map(|mf| {
+                let old_ptr = bidi.guest_buf_ptr;
+                let old_cap = bidi.guest_buf_cap;
+                // Take ownership across `call_guest8` so a concurrent `ubidi_close_69`
+                // cannot double-free `old_ptr`.
+                bidi.guest_buf_ptr = 0;
+                bidi.guest_buf_cap = 0;
+                (mf, old_ptr, old_cap)
+            })
+        } else {
+            None
+        }
+    };
+
+    if let Some((mf, old_ptr, old_cap)) = grow_req {
+        let new_ptr = if old_ptr == 0 {
+            mf.alloc(text_bytes)
+        } else {
+            mf.realloc(old_ptr, text_bytes)
+        };
+        if new_ptr == 0 {
+            let free_old_after_unlock = {
+                let mut bidi = entry.lock().unwrap_or_else(|e| e.into_inner());
+                if old_ptr != 0 {
+                    if !bidi.closed {
+                        bidi.guest_buf_ptr = old_ptr;
+                        bidi.guest_buf_cap = old_cap;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            };
+            if free_old_after_unlock {
+                mf.free(old_ptr);
+            }
+            std::ptr::write_unaligned(p_error_code, U_MEMORY_ALLOCATION_ERROR);
+            return;
+        }
+        let closed_during_alloc = {
+            let mut bidi = entry.lock().unwrap_or_else(|e| e.into_inner());
+            if bidi.closed {
+                true
+            } else {
+                bidi.guest_buf_ptr = new_ptr;
+                bidi.guest_buf_cap = text_bytes;
+                false
+            }
+        };
+        if closed_during_alloc {
+            mf.free(new_ptr);
+            std::ptr::write_unaligned(p_error_code, U_INVALID_STATE_ERROR);
+            return;
+        }
+    }
+
+    let mut bidi = entry.lock().unwrap_or_else(|e| e.into_inner());
+    if bidi.closed {
+        std::ptr::write_unaligned(p_error_code, U_INVALID_STATE_ERROR);
+        return;
+    }
+
+    if !bidi.raw.is_null() {
+        if let Some(ubidi) = icu_bidi() {
+            let old_buf = std::mem::replace(&mut bidi.text_buf, text_buf);
+            let old_emb = std::mem::replace(&mut bidi.emb_buf, emb_buf);
+            let text_ptr = if actual_len == 0 {
+                EMPTY_U16.as_ptr()
+            } else {
+                bidi.text_buf.as_ptr()
+            };
+            let emb_ptr = bidi
+                .emb_buf
+                .as_deref_mut()
+                .map_or(std::ptr::null_mut(), <[u8]>::as_mut_ptr);
+            let mut icu_err: i32 = U_ZERO_ERROR;
+            (ubidi.ubidi_set_para)(
+                bidi.raw,
+                text_ptr,
+                actual_len,
+                para_level,
+                emb_ptr,
+                &mut icu_err,
+            );
+            if icu_err > 0 {
+                // Keep the previously referenced buffers alive if libicucore retained
+                // the prior paragraph on error.
+                bidi.text_buf = old_buf;
+                bidi.emb_buf = old_emb;
+            } else {
+                bidi.has_para = true;
+                if let Some(ref resolved) = bidi.emb_buf {
+                    if !embedding_levels.is_null() {
+                        for (i, &lv) in resolved.iter().enumerate() {
+                            std::ptr::write_unaligned(embedding_levels.add(i), lv);
+                        }
+                    }
+                }
+            }
+            std::ptr::write_unaligned(p_error_code, icu_err);
+            return;
+        }
+    }
+
+    match fallback_compute_bidi(
+        &text_buf,
+        para_level,
+        emb_buf.as_deref(),
+        bidi.max_length,
+        bidi.max_run_count,
+    ) {
+        Ok((dir, runs)) => {
+            bidi.text_buf = text_buf;
+            bidi.emb_buf = emb_buf.map(|mut b| {
+                for lv in b.iter_mut() {
+                    *lv &= 0x7F;
+                }
+                if !embedding_levels.is_null() {
+                    for (i, &lv) in b.iter().enumerate() {
+                        std::ptr::write_unaligned(embedding_levels.add(i), lv);
+                    }
+                }
+                b
+            });
+            bidi.fallback_dir = dir;
+            bidi.fallback_runs = runs;
+            bidi.has_para = true;
+            std::ptr::write_unaligned(p_error_code, U_ZERO_ERROR);
+        }
+        Err(code) => {
+            std::ptr::write_unaligned(p_error_code, code);
+        }
+    }
+}
+
+pub unsafe extern "win64" fn ubidi_getDirection_69(p_bidi: *const c_void) -> i32 {
+    let Some(entry) = lookup_bidi(p_bidi) else {
+        return UBIDI_LTR;
+    };
+    let bidi = entry.lock().unwrap_or_else(|e| e.into_inner());
+    if bidi.closed {
+        return UBIDI_LTR;
+    }
+    bidi.direction()
+}
+
+pub unsafe extern "win64" fn ubidi_getBaseDirection_69(text: *const u16, length: i32) -> i32 {
+    ensure_vtbl_registered();
+    if text.is_null() || length == 0 || length < -1 {
+        return UBIDI_NEUTRAL;
+    }
+    let buf = read_guest_utf16(text, length);
+    if buf.is_empty() {
+        return UBIDI_NEUTRAL;
+    }
+    if let Some(ubidi) = icu_bidi() {
+        return (ubidi.ubidi_get_base_direction)(
+            buf.as_ptr(),
+            buf.len().min(i32::MAX as usize) as i32,
+        );
+    }
+    fallback_base_direction(&buf)
+}
+
+pub unsafe extern "win64" fn ubidi_countRuns_69(
+    p_bidi: *mut c_void,
+    p_error_code: *mut i32,
+) -> i32 {
+    if p_error_code.is_null() || std::ptr::read_unaligned(p_error_code) > 0 {
+        return -1;
+    }
+    let Some(entry) = lookup_bidi(p_bidi) else {
+        std::ptr::write_unaligned(p_error_code, U_INVALID_STATE_ERROR);
+        return -1;
+    };
+    let mut bidi = entry.lock().unwrap_or_else(|e| e.into_inner());
+    if bidi.closed {
+        std::ptr::write_unaligned(p_error_code, U_INVALID_STATE_ERROR);
+        return -1;
+    }
+    let mut icu_err: i32 = U_ZERO_ERROR;
+    let count = bidi.count_runs(&mut icu_err);
+    std::ptr::write_unaligned(p_error_code, icu_err);
+    count
+}
+
+pub unsafe extern "win64" fn ubidi_getVisualRun_69(
+    p_bidi: *mut c_void,
+    run_index: i32,
+    p_logical_start: *mut i32,
+    p_length: *mut i32,
+) -> i32 {
+    if p_bidi.is_null() || run_index < 0 {
+        return UBIDI_LTR;
+    }
+    let Some(entry) = lookup_bidi(p_bidi) else {
+        return UBIDI_LTR;
+    };
+    let mut bidi = entry.lock().unwrap_or_else(|e| e.into_inner());
+    if bidi.closed {
+        return UBIDI_LTR;
+    }
+    let mut err: i32 = U_ZERO_ERROR;
+    let count = bidi.count_runs(&mut err);
+    if err > 0 || run_index >= count {
+        return UBIDI_LTR;
+    }
+    let (dir, logical_start, run_len) = bidi.visual_run_unchecked(run_index);
+    if !p_logical_start.is_null() {
+        std::ptr::write_unaligned(p_logical_start, logical_start);
+    }
+    if !p_length.is_null() {
+        std::ptr::write_unaligned(p_length, run_len);
+    }
+    dir
 }
 
 // --- icu_69::Locale exports ---
@@ -1959,6 +2820,11 @@ unsafe extern "win64" fn unicode_string_dtor(this: *mut usize) {
     let mut tbl = ustr_table().lock().unwrap_or_else(|e| e.into_inner());
     tbl.remove(USTR_HANDLE_TAG, raw, this as usize);
     std::ptr::write_unaligned(this, 0);
+}
+
+/// `int32_t icu_69::UnicodeString::length() const`
+unsafe extern "win64" fn unicode_string_length(this: *const usize) -> i32 {
+    lookup_unicode_string(this).len().min(i32::MAX as usize) as i32
 }
 
 /// `static UnicodeString icu_69::UnicodeString::fromUTF8(StringPiece utf8)`
@@ -2452,6 +3318,499 @@ mod tests {
             brk_scalar_deleting_dtor(bi, 0);
             assert!((*bi).raw.is_null());
             brk_scalar_deleting_dtor(bi, 1);
+        }
+    }
+
+    #[test]
+    fn unicode_string_length_handles_surrogates_unaligned_null_and_dtor() {
+        unsafe {
+            assert_eq!(unicode_string_length(std::ptr::null()), 0);
+
+            let mut empty: usize = 0;
+            unicode_string_ctor_empty(&mut empty);
+            assert_eq!(unicode_string_length(&empty), 0);
+            unicode_string_dtor(&mut empty);
+
+            // "A😀" -> 1 BMP unit + 2 UTF-16 surrogate units = 3 code units.
+            let mut ustr: usize = 0;
+            unicode_string_ctor(&mut ustr, "A\u{1F600}\0".as_ptr());
+            assert_eq!(unicode_string_length(&ustr), 3);
+            unicode_string_dtor(&mut ustr);
+            assert_eq!(unicode_string_length(&ustr), 0);
+
+            // Explicit 1-byte misaligned guest UnicodeString slot
+            let mut raw_slot = [0xCCu8; 16];
+            let unaligned_this = raw_slot.as_mut_ptr().add(1) as *mut usize;
+            unicode_string_ctor_utf8_len(unaligned_this, b"Spider-Man".as_ptr(), 10);
+            assert_eq!(unicode_string_length(unaligned_this), 10);
+            unicode_string_dtor(unaligned_this);
+            assert_eq!(unicode_string_length(unaligned_this), 0);
+        }
+    }
+
+    #[test]
+    fn ubidi_base_direction_ltr_rtl_neutral_unaligned_and_null() {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(
+            icu_bidi().is_some(),
+            "expected ubidi_* symbols in /usr/lib/libicucore.A.dylib"
+        );
+
+        unsafe {
+            assert_eq!(ubidi_getBaseDirection_69(std::ptr::null(), 0), UBIDI_NEUTRAL);
+            assert_eq!(ubidi_getBaseDirection_69(std::ptr::null(), -1), UBIDI_NEUTRAL);
+
+            let ltr: Vec<u16> = "123 Hello \u{05E9}\u{05DC}\u{05D5}\u{05DD}\0".encode_utf16().collect();
+            assert_eq!(ubidi_getBaseDirection_69(ltr.as_ptr(), -1), UBIDI_LTR);
+            assert_eq!(ubidi_getBaseDirection_69(ltr.as_ptr(), 0), UBIDI_NEUTRAL);
+            assert_eq!(ubidi_getBaseDirection_69(ltr.as_ptr(), -2), UBIDI_NEUTRAL);
+
+            // Explicit 1-byte misaligned RTL UTF-16 input (Arabic + Latin)
+            let rtl_units: Vec<u16> = "99 \u{0645}\u{0631}\u{062D}\u{0628}\u{0627} Hello".encode_utf16().collect();
+            let mut unaligned = vec![0xEEu8; 1 + rtl_units.len() * 2];
+            for (i, cu) in rtl_units.iter().enumerate() {
+                let le = cu.to_le_bytes();
+                unaligned[1 + i * 2] = le[0];
+                unaligned[1 + i * 2 + 1] = le[1];
+            }
+            assert_eq!(
+                ubidi_getBaseDirection_69(
+                    unaligned.as_ptr().add(1) as *const u16,
+                    rtl_units.len() as i32
+                ),
+                UBIDI_RTL
+            );
+
+            let neutral: Vec<u16> = "12345 !@#".encode_utf16().collect();
+            assert_eq!(
+                ubidi_getBaseDirection_69(neutral.as_ptr(), neutral.len() as i32),
+                UBIDI_NEUTRAL
+            );
+
+            // Exercise pure-Rust fallback classifier directly too.
+            assert_eq!(fallback_base_direction(&ltr[..ltr.len() - 1]), UBIDI_LTR);
+            assert_eq!(fallback_base_direction(&rtl_units), UBIDI_RTL);
+            assert_eq!(fallback_base_direction(&neutral), UBIDI_NEUTRAL);
+        }
+    }
+
+    #[test]
+    fn ubidi_runs_unaligned_io_fixed_size_and_error_handling() {
+        unsafe {
+            // Invalid openSized arguments
+            let mut err: i32 = U_ZERO_ERROR;
+            assert!(ubidi_openSized_69(-1, 0, &mut err).is_null());
+            assert_eq!(err, U_ILLEGAL_ARGUMENT_ERROR);
+
+            err = U_ZERO_ERROR;
+            assert!(ubidi_openSized_69(0, -1, &mut err).is_null());
+            assert_eq!(err, U_ILLEGAL_ARGUMENT_ERROR);
+
+            // Pre-existing error short-circuits openSized
+            err = U_INVALID_STATE_ERROR;
+            assert!(ubidi_openSized_69(0, 0, &mut err).is_null());
+            assert_eq!(err, U_INVALID_STATE_ERROR);
+
+            // Null/uninitialized handle behavior
+            assert_eq!(ubidi_getDirection_69(std::ptr::null()), UBIDI_LTR);
+            err = U_ZERO_ERROR;
+            assert_eq!(ubidi_countRuns_69(std::ptr::null_mut(), &mut err), -1);
+            assert_eq!(err, U_INVALID_STATE_ERROR);
+
+            // Open dynamically sized UBiDi via unaligned error code pointer
+            let mut err_buf = [0u8; 8];
+            let unaligned_err = err_buf.as_mut_ptr().add(1) as *mut i32;
+            std::ptr::write_unaligned(unaligned_err, U_ZERO_ERROR);
+            let bidi = ubidi_openSized_69(0, 0, unaligned_err);
+            assert!(!bidi.is_null());
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+
+            // Before setPara: countRuns returns -1 + U_INVALID_STATE_ERROR
+            assert_eq!(ubidi_countRuns_69(bidi, unaligned_err), -1);
+            assert_eq!(
+                std::ptr::read_unaligned(unaligned_err),
+                U_INVALID_STATE_ERROR
+            );
+
+            // setPara with NULL text fails with U_ILLEGAL_ARGUMENT_ERROR
+            std::ptr::write_unaligned(unaligned_err, U_ZERO_ERROR);
+            ubidi_setPara_69(
+                bidi,
+                std::ptr::null(),
+                0,
+                UBIDI_DEFAULT_LTR,
+                std::ptr::null_mut(),
+                unaligned_err,
+            );
+            assert_eq!(
+                std::ptr::read_unaligned(unaligned_err),
+                U_ILLEGAL_ARGUMENT_ERROR
+            );
+
+            // Mixed LTR + Hebrew RTL with misaligned UTF-16 input and misaligned out pointers
+            let mixed_str = "Hello \u{05E9}\u{05DC}\u{05D5}\u{05DD} world";
+            let mixed_u16: Vec<u16> = mixed_str.encode_utf16().collect();
+            let mut unaligned_text = vec![0xAAu8; 1 + mixed_u16.len() * 2];
+            for (i, cu) in mixed_u16.iter().enumerate() {
+                let le = cu.to_le_bytes();
+                unaligned_text[1 + i * 2] = le[0];
+                unaligned_text[1 + i * 2 + 1] = le[1];
+            }
+            std::ptr::write_unaligned(unaligned_err, U_ZERO_ERROR);
+            ubidi_setPara_69(
+                bidi,
+                unaligned_text.as_ptr().add(1) as *const u16,
+                mixed_u16.len() as i32,
+                UBIDI_DEFAULT_LTR,
+                std::ptr::null_mut(),
+                unaligned_err,
+            );
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+            assert_eq!(ubidi_getDirection_69(bidi), UBIDI_MIXED);
+
+            let run_count = ubidi_countRuns_69(bidi, unaligned_err);
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+            assert_eq!(run_count, 3);
+
+            let mut start_buf = [0u8; 8];
+            let mut len_buf = [0u8; 8];
+            let p_start = start_buf.as_mut_ptr().add(1) as *mut i32;
+            let p_len = len_buf.as_mut_ptr().add(3) as *mut i32;
+
+            let mut runs = Vec::new();
+            for i in 0..run_count {
+                let dir = ubidi_getVisualRun_69(bidi, i, p_start, p_len);
+                runs.push((
+                    dir,
+                    std::ptr::read_unaligned(p_start),
+                    std::ptr::read_unaligned(p_len),
+                ));
+            }
+            assert_eq!(
+                runs,
+                vec![(UBIDI_LTR, 0, 6), (UBIDI_RTL, 6, 4), (UBIDI_LTR, 10, 6)]
+            );
+
+            // NULL out pointers are accepted cleanly
+            assert_eq!(
+                ubidi_getVisualRun_69(bidi, 1, std::ptr::null_mut(), std::ptr::null_mut()),
+                UBIDI_RTL
+            );
+
+            // Out-of-range runIndex returns UBIDI_LTR and leaves caller out-params untouched
+            std::ptr::write_unaligned(p_start, 777);
+            std::ptr::write_unaligned(p_len, 888);
+            assert_eq!(ubidi_getVisualRun_69(bidi, -1, p_start, p_len), UBIDI_LTR);
+            assert_eq!(std::ptr::read_unaligned(p_start), 777);
+            assert_eq!(std::ptr::read_unaligned(p_len), 888);
+            assert_eq!(
+                ubidi_getVisualRun_69(bidi, run_count, p_start, p_len),
+                UBIDI_LTR
+            );
+            assert_eq!(std::ptr::read_unaligned(p_start), 777);
+            assert_eq!(std::ptr::read_unaligned(p_len), 888);
+
+            // RTL base paragraph with embedded Arabic + digits + Latin reverses visual order
+            let rtl_mix = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} 123 Hello";
+            let rtl_u16: Vec<u16> = rtl_mix.encode_utf16().collect();
+            std::ptr::write_unaligned(unaligned_err, U_ZERO_ERROR);
+            ubidi_setPara_69(
+                bidi,
+                rtl_u16.as_ptr(),
+                rtl_u16.len() as i32,
+                UBIDI_DEFAULT_RTL,
+                std::ptr::null_mut(),
+                unaligned_err,
+            );
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+            assert_eq!(ubidi_getDirection_69(bidi), UBIDI_MIXED);
+            let rtl_runs = ubidi_countRuns_69(bidi, unaligned_err);
+            assert!(rtl_runs >= 3);
+            let mut first_start = -1i32;
+            let mut first_len = -1i32;
+            let first_dir = ubidi_getVisualRun_69(bidi, 0, &mut first_start, &mut first_len);
+            assert_eq!(first_dir, UBIDI_LTR);
+            assert_eq!(first_start, 10);
+            assert_eq!(first_len, 5);
+
+            // Empty non-null string yields 0 runs
+            let empty_u16 = [0u16];
+            std::ptr::write_unaligned(unaligned_err, U_ZERO_ERROR);
+            ubidi_setPara_69(
+                bidi,
+                empty_u16.as_ptr(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                unaligned_err,
+            );
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+            assert_eq!(ubidi_countRuns_69(bidi, unaligned_err), 0);
+
+            // Explicit embeddingLevels override
+            let ascii_u16: Vec<u16> = "Hello".encode_utf16().collect();
+            let mut emb_levels = [0x81u8; 5]; // level 1 + UBIDI_LEVEL_OVERRIDE
+            std::ptr::write_unaligned(unaligned_err, U_ZERO_ERROR);
+            ubidi_setPara_69(
+                bidi,
+                ascii_u16.as_ptr(),
+                ascii_u16.len() as i32,
+                0,
+                emb_levels.as_mut_ptr(),
+                unaligned_err,
+            );
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+            assert_eq!(emb_levels, [1u8; 5]);
+            assert_eq!(ubidi_countRuns_69(bidi, unaligned_err), 1);
+            let mut ov_start = -1i32;
+            let mut ov_len = -1i32;
+            assert_eq!(
+                ubidi_getVisualRun_69(bidi, 0, &mut ov_start, &mut ov_len),
+                UBIDI_RTL
+            );
+            assert_eq!((ov_start, ov_len), (0, 5));
+
+            // Close + idempotent double close + NULL close
+            ubidi_close_69(bidi);
+            ubidi_close_69(bidi);
+            ubidi_close_69(std::ptr::null_mut());
+
+            // Pre-sized UBiDi rejects text longer than maxLength with U_MEMORY_ALLOCATION_ERROR
+            err = U_ZERO_ERROR;
+            let fixed = ubidi_openSized_69(2, 0, &mut err);
+            assert!(!fixed.is_null());
+            assert_eq!(err, U_ZERO_ERROR);
+            ubidi_setPara_69(
+                fixed,
+                ascii_u16.as_ptr(),
+                ascii_u16.len() as i32,
+                0,
+                std::ptr::null_mut(),
+                &mut err,
+            );
+            assert_eq!(err, U_MEMORY_ALLOCATION_ERROR);
+            ubidi_close_69(fixed);
+
+            // Pure-Rust fallback paragraph computation sanity check
+            let (fb_dir, fb_runs) =
+                fallback_compute_bidi(&mixed_u16, UBIDI_DEFAULT_LTR, None, 0, 0).unwrap();
+            assert_eq!(fb_dir, UBIDI_MIXED);
+            assert!(fb_runs.len() >= 2);
+            assert_eq!(
+                fallback_compute_bidi(&ascii_u16, 0, None, 2, 0).err(),
+                Some(U_MEMORY_ALLOCATION_ERROR)
+            );
+        }
+    }
+
+    #[test]
+    fn u_set_memory_functions_routes_alloc_realloc_free_and_enforces_state() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        struct AllocTracker {
+            alloc_calls: AtomicUsize,
+            realloc_calls: AtomicUsize,
+            free_calls: AtomicUsize,
+            live_ptrs: Mutex<HashMap<usize, Vec<u8>>>,
+            fail_alloc: AtomicBool,
+        }
+
+        unsafe extern "win64" fn test_alloc(
+            ctx: u64,
+            size: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) -> u64 {
+            let tracker = &*(ctx as *const AllocTracker);
+            tracker.alloc_calls.fetch_add(1, Ordering::AcqRel);
+            if tracker.fail_alloc.load(Ordering::Acquire) {
+                return 0;
+            }
+            let mut buf = vec![0u8; (size as usize).max(1)];
+            let ptr = buf.as_mut_ptr() as usize;
+            tracker
+                .live_ptrs
+                .lock()
+                .unwrap()
+                .insert(ptr, buf);
+            ptr as u64
+        }
+
+        unsafe extern "win64" fn test_realloc(
+            ctx: u64,
+            mem: u64,
+            size: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) -> u64 {
+            let tracker = &*(ctx as *const AllocTracker);
+            tracker.realloc_calls.fetch_add(1, Ordering::AcqRel);
+            if tracker.fail_alloc.load(Ordering::Acquire) {
+                return 0;
+            }
+            let mut map = tracker.live_ptrs.lock().unwrap();
+            let mut buf = map.remove(&(mem as usize)).unwrap_or_default();
+            buf.resize((size as usize).max(1), 0);
+            let ptr = buf.as_mut_ptr() as usize;
+            map.insert(ptr, buf);
+            ptr as u64
+        }
+
+        unsafe extern "win64" fn test_free(
+            ctx: u64,
+            mem: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) -> u64 {
+            let tracker = &*(ctx as *const AllocTracker);
+            tracker.free_calls.fetch_add(1, Ordering::AcqRel);
+            let removed = tracker.live_ptrs.lock().unwrap().remove(&(mem as usize));
+            assert!(
+                removed.is_some(),
+                "free called for unknown/double-freed pointer {mem:#x}"
+            );
+            0
+        }
+
+        struct ResetMemGuard;
+        impl Drop for ResetMemGuard {
+            fn drop(&mut self) {
+                let mut st = mem_func_state().lock().unwrap_or_else(|e| e.into_inner());
+                st.heap_in_use = false;
+                st.custom = None;
+            }
+        }
+
+        // Reset before running so earlier tests in this process don't pre-latch `heap_in_use`.
+        let _guard = {
+            let mut st = mem_func_state().lock().unwrap_or_else(|e| e.into_inner());
+            st.heap_in_use = false;
+            st.custom = None;
+            ResetMemGuard
+        };
+
+        let tracker = AllocTracker {
+            alloc_calls: AtomicUsize::new(0),
+            realloc_calls: AtomicUsize::new(0),
+            free_calls: AtomicUsize::new(0),
+            live_ptrs: Mutex::new(HashMap::new()),
+            fail_alloc: AtomicBool::new(false),
+        };
+        let ctx_ptr = (&tracker as *const AllocTracker).cast::<c_void>();
+
+        unsafe {
+            // Missing callback pointer -> U_ILLEGAL_ARGUMENT_ERROR
+            let mut err: i32 = U_ZERO_ERROR;
+            u_setMemoryFunctions_69(
+                ctx_ptr,
+                std::ptr::null(),
+                test_realloc as *const c_void,
+                test_free as *const c_void,
+                &mut err,
+            );
+            assert_eq!(err, U_ILLEGAL_ARGUMENT_ERROR);
+
+            // Pre-existing failure status -> short-circuit without altering status
+            err = U_BUFFER_OVERFLOW_ERROR;
+            u_setMemoryFunctions_69(
+                ctx_ptr,
+                test_alloc as *const c_void,
+                test_realloc as *const c_void,
+                test_free as *const c_void,
+                &mut err,
+            );
+            assert_eq!(err, U_BUFFER_OVERFLOW_ERROR);
+
+            // Register custom allocator callbacks via unaligned status pointer
+            let mut err_buf = [0u8; 8];
+            let unaligned_err = err_buf.as_mut_ptr().add(3) as *mut i32;
+            std::ptr::write_unaligned(unaligned_err, U_ZERO_ERROR);
+            u_setMemoryFunctions_69(
+                ctx_ptr,
+                test_alloc as *const c_void,
+                test_realloc as *const c_void,
+                test_free as *const c_void,
+                unaligned_err,
+            );
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+
+            // UBiDi open + growing setPara + close exercises alloc, realloc, and free
+            let bidi = ubidi_openSized_69(0, 0, unaligned_err);
+            assert!(!bidi.is_null());
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+            assert_eq!(tracker.alloc_calls.load(Ordering::Acquire), 1);
+
+            let short_u16: Vec<u16> = "Hi".encode_utf16().collect();
+            ubidi_setPara_69(
+                bidi,
+                short_u16.as_ptr(),
+                short_u16.len() as i32,
+                0,
+                std::ptr::null_mut(),
+                unaligned_err,
+            );
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+            assert_eq!(tracker.alloc_calls.load(Ordering::Acquire), 2);
+            assert_eq!(tracker.realloc_calls.load(Ordering::Acquire), 0);
+
+            let longer_u16: Vec<u16> = "Hello longer bidi paragraph".encode_utf16().collect();
+            ubidi_setPara_69(
+                bidi,
+                longer_u16.as_ptr(),
+                longer_u16.len() as i32,
+                0,
+                std::ptr::null_mut(),
+                unaligned_err,
+            );
+            assert_eq!(std::ptr::read_unaligned(unaligned_err), U_ZERO_ERROR);
+            assert_eq!(tracker.realloc_calls.load(Ordering::Acquire), 1);
+
+            ubidi_close_69(bidi);
+            assert_eq!(tracker.free_calls.load(Ordering::Acquire), 2);
+            assert!(tracker.live_ptrs.lock().unwrap().is_empty());
+
+            // BreakIterator create + delete also routes through custom alloc/free
+            err = U_ZERO_ERROR;
+            let bi = create_word_instance(locale_get_us() as *const c_void, &mut err)
+                as *mut IcuBreakIterator;
+            assert!(!bi.is_null());
+            assert_eq!(err, U_ZERO_ERROR);
+            assert_eq!(tracker.alloc_calls.load(Ordering::Acquire), 3);
+            brk_scalar_deleting_dtor(bi, 1);
+            assert_eq!(tracker.free_calls.load(Ordering::Acquire), 3);
+            assert!(tracker.live_ptrs.lock().unwrap().is_empty());
+
+            // Calling u_setMemoryFunctions_69 once heap is in use returns U_INVALID_STATE_ERROR
+            err = U_ZERO_ERROR;
+            u_setMemoryFunctions_69(
+                ctx_ptr,
+                test_alloc as *const c_void,
+                test_realloc as *const c_void,
+                test_free as *const c_void,
+                &mut err,
+            );
+            assert_eq!(err, U_INVALID_STATE_ERROR);
+
+            // Simulated OOM from custom allocator propagates U_MEMORY_ALLOCATION_ERROR cleanly
+            tracker.fail_alloc.store(true, Ordering::Release);
+            err = U_ZERO_ERROR;
+            assert!(ubidi_openSized_69(0, 0, &mut err).is_null());
+            assert_eq!(err, U_MEMORY_ALLOCATION_ERROR);
+            err = U_ZERO_ERROR;
+            assert!(create_word_instance(locale_get_us() as *const c_void, &mut err).is_null());
+            assert_eq!(err, U_MEMORY_ALLOCATION_ERROR);
+            assert!(tracker.live_ptrs.lock().unwrap().is_empty());
         }
     }
 }
