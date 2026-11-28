@@ -191,7 +191,7 @@ unsafe extern "win64" fn ta_analyze_script(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BidiClass {
+pub(crate) enum BidiClass {
     L,
     R,
     AL,
@@ -206,21 +206,33 @@ enum BidiClass {
     ON,
 }
 
-fn classify_bidi(ch: char) -> BidiClass {
+pub(crate) fn classify_bidi(ch: char) -> BidiClass {
     let cp = ch as u32;
     match cp {
         // European digits (ASCII + superscripts + Extended Arabic-Indic digits)
         0x0030..=0x0039 | 0x00B2..=0x00B3 | 0x00B9 | 0x06F0..=0x06F9 => BidiClass::EN,
-        // Arabic-Indic digits & separators
-        0x0660..=0x0669 | 0x066B..=0x066C => BidiClass::AN,
+        // Arabic-Indic digits, separators, and Arabic number format signs
+        0x0600..=0x0605
+        | 0x0660..=0x0669
+        | 0x066B..=0x066C
+        | 0x06DD
+        | 0x0890..=0x0891
+        | 0x08E2 => BidiClass::AN,
         // European separators
-        0x002B | 0x002D => BidiClass::ES,
+        0x002B | 0x002D | 0xFB29 | 0xFE62..=0xFE63 => BidiClass::ES,
         // European terminators
-        0x0023..=0x0025 | 0x00A2..=0x00A5 | 0x00B0..=0x00B1 | 0x0609..=0x060A | 0x066A | 0x20AC => {
-            BidiClass::ET
-        }
+        0x0023..=0x0025
+        | 0x00A2..=0x00A5
+        | 0x00B0..=0x00B1
+        | 0x0609..=0x060A
+        | 0x066A
+        | 0x20AC
+        | 0xFE5F
+        | 0xFE69..=0xFE6A => BidiClass::ET,
         // Common separators
-        0x002C | 0x002E..=0x002F | 0x003A | 0x00A0 | 0x060C => BidiClass::CS,
+        0x002C | 0x002E..=0x002F | 0x003A | 0x00A0 | 0x060C | 0xFE50 | 0xFE52 | 0xFE55 => {
+            BidiClass::CS
+        }
         // Nonspacing combining marks
         0x0300..=0x036F
         | 0x0483..=0x0489
@@ -236,24 +248,51 @@ fn classify_bidi(ch: char) -> BidiClass {
         | 0x06DF..=0x06E4
         | 0x06E7..=0x06E8
         | 0x06EA..=0x06ED
+        | 0x0711
+        | 0x0730..=0x074A
+        | 0x07A6..=0x07B0
+        | 0x07EB..=0x07F3
+        | 0x07FD
+        | 0x0816..=0x0819
+        | 0x081B..=0x0823
+        | 0x0825..=0x0827
+        | 0x0829..=0x082D
+        | 0x0859..=0x085B
+        | 0x0898..=0x089F
+        | 0x08CA..=0x08E1
+        | 0x08E3..=0x08FF
         | 0x1AB0..=0x1AFF
         | 0x1DC0..=0x1DFF
         | 0x20D0..=0x20FF
+        | 0xFB1E
+        | 0xFE00..=0xFE0F
         | 0xFE20..=0xFE2F => BidiClass::NSM,
-        // Boundary neutrals
-        0x0000..=0x0008 | 0x000E..=0x001B | 0x007F..=0x0084 | 0x0086..=0x009F | 0x200B..=0x200D => {
-            BidiClass::BN
-        }
+        // Boundary neutrals (including U+FEFF BOM)
+        0x0000..=0x0008
+        | 0x000E..=0x001B
+        | 0x007F..=0x0084
+        | 0x0086..=0x009F
+        | 0x200B..=0x200D
+        | 0xFEFF => BidiClass::BN,
         // Whitespace
         0x0009 | 0x000C | 0x0020 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x205F | 0x3000 => {
             BidiClass::WS
         }
+        // Neutral symbols/punctuation inside RTL script blocks
+        0x0606..=0x0607
+        | 0x060E..=0x060F
+        | 0x06DE
+        | 0x06E9
+        | 0x07F6..=0x07F9
+        | 0xFD3E..=0xFD4F
+        | 0xFDCF
+        | 0xFDFD..=0xFDFF => BidiClass::ON,
         // Arabic letters (AL)
         0x0600..=0x06FF
         | 0x0750..=0x077F
         | 0x0870..=0x08FF
         | 0xFB50..=0xFDFF
-        | 0xFE70..=0xFEFF
+        | 0xFE70..=0xFEFC
         | 0x1EE00..=0x1EEFF => BidiClass::AL,
         // Strong RTL (Hebrew, Syriac, Thaana, NKo, RLM, SMP RTL scripts)
         0x0590..=0x05FF

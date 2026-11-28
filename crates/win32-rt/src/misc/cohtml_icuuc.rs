@@ -2012,27 +2012,12 @@ fn lookup_bidi(p_bidi: *const c_void) -> Option<Arc<Mutex<IcuBiDi>>> {
 }
 
 fn classify_strong_bidi_dir(ch: char) -> Option<i32> {
-    let cp = ch as u32;
-    if cp == 0x200E {
-        return Some(UBIDI_LTR);
+    use super::dwrite::analysis::{classify_bidi, BidiClass};
+    match classify_bidi(ch) {
+        BidiClass::L => Some(UBIDI_LTR),
+        BidiClass::R | BidiClass::AL => Some(UBIDI_RTL),
+        _ => None,
     }
-    if cp == 0x200F {
-        return Some(UBIDI_RTL);
-    }
-    if matches!(
-        cp,
-        0x0590..=0x08FF
-            | 0xFB1D..=0xFDFF
-            | 0xFE70..=0xFEFF
-            | 0x10800..=0x10FFF
-            | 0x1E800..=0x1EFFF
-    ) {
-        return Some(UBIDI_RTL);
-    }
-    if ch.is_alphabetic() {
-        return Some(UBIDI_LTR);
-    }
-    None
 }
 
 fn fallback_base_direction(units: &[u16]) -> i32 {
@@ -3457,10 +3442,33 @@ mod tests {
                 UBIDI_NEUTRAL
             );
 
-            // Exercise pure-Rust fallback classifier directly too.
+            // Exercise pure-Rust fallback classifier directly too, including neutral/weak
+            // characters inside Arabic/Hebrew blocks (comma, Arabic-Indic digits, NSM, BOM).
             assert_eq!(fallback_base_direction(&ltr[..ltr.len() - 1]), UBIDI_LTR);
             assert_eq!(fallback_base_direction(&rtl_units), UBIDI_RTL);
             assert_eq!(fallback_base_direction(&neutral), UBIDI_NEUTRAL);
+
+            for (sample, expected) in [
+                ("\u{060C} Hello", UBIDI_LTR),
+                ("\u{060C}", UBIDI_NEUTRAL),
+                ("\u{0661}\u{0662}\u{0663}", UBIDI_NEUTRAL),
+                ("\u{0661}\u{0662}\u{0663} Hello", UBIDI_LTR),
+                ("\u{064E}Hello", UBIDI_LTR),
+                ("\u{FEFF}Hello", UBIDI_LTR),
+                ("\u{FEFF}", UBIDI_NEUTRAL),
+            ] {
+                let u16s: Vec<u16> = sample.encode_utf16().collect();
+                assert_eq!(
+                    ubidi_getBaseDirection_69(u16s.as_ptr(), u16s.len() as i32),
+                    expected,
+                    "native ubidi_getBaseDirection_69 mismatch for {sample:?}"
+                );
+                assert_eq!(
+                    fallback_base_direction(&u16s),
+                    expected,
+                    "fallback_base_direction mismatch for {sample:?}"
+                );
+            }
         }
     }
 
