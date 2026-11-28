@@ -113,8 +113,8 @@ pub unsafe extern "win64" fn create_render_target_view(_dev: *mut c_void, res: *
         write_target(handle, TargetView::NULL);
         return;
     };
-    let d = if desc.is_null() { None } else { Some(&*desc) };
-    match TargetView::rtv(&r.r, d) {
+    let d = if desc.is_null() { None } else { Some(std::ptr::read_unaligned(desc)) };
+    match TargetView::rtv(&r.r, d.as_ref()) {
         Ok(v) => write_target(handle, v),
         Err(e) => {
             log::warn!(target: "d3d", "CreateRenderTargetView({:?}, {d:?}): {e}", r.r.desc);
@@ -133,8 +133,8 @@ pub unsafe extern "win64" fn create_depth_stencil_view(_dev: *mut c_void, res: *
         write_target(handle, TargetView::NULL);
         return;
     };
-    let d = if desc.is_null() { None } else { Some(&*desc) };
-    match TargetView::dsv(&r.r, d) {
+    let d = if desc.is_null() { None } else { Some(std::ptr::read_unaligned(desc)) };
+    match TargetView::dsv(&r.r, d.as_ref()) {
         Ok(v) => write_target(handle, v),
         Err(e) => {
             log::warn!(target: "d3d", "CreateDepthStencilView({:?}, {d:?}): {e}", r.r.desc);
@@ -190,8 +190,8 @@ pub unsafe extern "win64" fn create_shader_resource_view(_dev: *mut c_void, res:
     if r.is_none() && !res.is_null() {
         log::error!(target: "d3d", "CreateShaderResourceView: foreign resource {res:?}");
     }
-    let d = if desc.is_null() { None } else { Some(&*desc) };
-    write_or_null("CreateShaderResourceView", handle, views::srv_entry(r.map(|r| &*r.r), d));
+    let d = if desc.is_null() { None } else { Some(std::ptr::read_unaligned(desc)) };
+    write_or_null("CreateShaderResourceView", handle, views::srv_entry(r.map(|r| &*r.r), d.as_ref()));
     bump_desc_heap_gen();
 }
 
@@ -204,9 +204,9 @@ pub unsafe extern "win64" fn create_unordered_access_view(_dev: *mut c_void, res
         log::warn!(target: "d3d", "CreateUnorderedAccessView: UAV counters are not implemented (counter resource ignored)");
     }
     let r = resource::from_ptr(res);
-    let d = if desc.is_null() { None } else { Some(&*desc) };
-    d3d12_metal::metal::descriptor::record_uav(handle, r.map(|r| &*r.r), d);
-    write_or_null("CreateUnorderedAccessView", handle, views::uav_entry(r.map(|r| &*r.r), d));
+    let d = if desc.is_null() { None } else { Some(std::ptr::read_unaligned(desc)) };
+    d3d12_metal::metal::descriptor::record_uav(handle, r.map(|r| &*r.r), d.as_ref());
+    write_or_null("CreateUnorderedAccessView", handle, views::uav_entry(r.map(|r| &*r.r), d.as_ref()));
     bump_desc_heap_gen();
 }
 
