@@ -3190,13 +3190,15 @@ unsafe extern "win64" fn ostream_shl_f64(this: *mut u8, v: f64) -> *mut u8 {
 crate::win64_bridge!(fn ostream_shl_f64(*mut u8, f64) -> *mut u8);
 
 unsafe extern "win64" fn ostream_shl_i64(this: *mut u8, v: i64) -> *mut u8 {
-    let s = v.to_string();
-    ostream_write_str(this, &s)
+    let ios = stream_ios(this);
+    let fmtfl: i32 = if ios.is_null() { 0x201 } else { read_field(ios, std::mem::offset_of!(BasicIos, fmtfl)) };
+    ostream_write_padded(this, format_int_with_flags(fmtfl, v))
 }
 
 unsafe extern "win64" fn ostream_shl_u64(this: *mut u8, v: u64) -> *mut u8 {
-    let s = v.to_string();
-    ostream_write_str(this, &s)
+    let ios = stream_ios(this);
+    let fmtfl: i32 = if ios.is_null() { 0x201 } else { read_field(ios, std::mem::offset_of!(BasicIos, fmtfl)) };
+    ostream_write_padded(this, format_uint_with_flags(fmtfl, v))
 }
 
 #[repr(C, align(16))]
@@ -3777,6 +3779,8 @@ pub struct BasicIosW {
     pub _pad1: [u8; 6],
 }
 const _: () = assert!(std::mem::size_of::<BasicIosW>() == 0x60);
+const _: () = assert!(std::mem::offset_of!(BasicIos, prec) == std::mem::offset_of!(BasicIosW, prec));
+const _: () = assert!(std::mem::offset_of!(BasicIos, wide) == std::mem::offset_of!(BasicIosW, wide));
 
 static BASIC_IOS_W_VTABLE: [Ptr; 1] = [Ptr(ios_w_deleting_dtor as *const ())];
 
@@ -3971,6 +3975,14 @@ pub(crate) fn register_static_vtables() {
         noop_method as *const () as usize as u64,
         noop_method as *const () as usize,
     );
+    crate::register_native_va(
+        smanip_setw_fn as *const () as usize as u64,
+        smanip_setw_fn as *const () as usize,
+    );
+    crate::register_native_va(
+        smanip_setprecision_fn as *const () as usize as u64,
+        smanip_setprecision_fn as *const () as usize,
+    );
     for p in FACET_VTABLE
         .iter()
         .chain(CTYPE_CHAR_VTABLE.iter())
@@ -4052,8 +4064,9 @@ unsafe extern "win64" fn ostream_ctor(
 unsafe extern "win64" fn ostream_dtor(_this_ios: *mut u8) {}
 
 unsafe extern "win64" fn ostream_shl_u32(this: *mut u8, v: u32) -> *mut u8 {
-    let s = v.to_string();
-    ostream_write_str(this, &s)
+    let ios = stream_ios(this);
+    let fmtfl: i32 = if ios.is_null() { 0x201 } else { read_field(ios, std::mem::offset_of!(BasicIos, fmtfl)) };
+    ostream_write_padded(this, format_uint_with_flags(fmtfl, v as u64))
 }
 unsafe extern "win64" fn ostream_shl_bool(this: *mut u8, v: u8) -> *mut u8 {
     let s = if v != 0 { "1" } else { "0" };
@@ -4276,9 +4289,30 @@ unsafe extern "win64" fn istream_tellg(_this: *mut u8, out: *mut [i64; 3]) -> *m
     }
     out
 }
-unsafe extern "win64" fn smanip_noop(out: *mut [usize; 2], val: i64) -> *mut [usize; 2] {
+unsafe extern "win64" fn smanip_setw_fn(ios: *mut BasicIos, width: i64) {
+    if !ios.is_null() {
+        write_field(ios, std::mem::offset_of!(BasicIos, wide), width);
+    }
+}
+
+unsafe extern "win64" fn smanip_setw(out: *mut [usize; 2], val: i64) -> *mut [usize; 2] {
+    ensure_vtables_registered();
     if !out.is_null() {
-        std::ptr::write_unaligned(out, [noop_method as *const () as usize, val as usize]);
+        std::ptr::write_unaligned(out, [smanip_setw_fn as *const () as usize, val as usize]);
+    }
+    out
+}
+
+unsafe extern "win64" fn smanip_setprecision_fn(ios: *mut BasicIos, prec: i64) {
+    if !ios.is_null() {
+        write_field(ios, std::mem::offset_of!(BasicIos, prec), prec);
+    }
+}
+
+unsafe extern "win64" fn smanip_setprecision(out: *mut [usize; 2], val: i64) -> *mut [usize; 2] {
+    ensure_vtables_registered();
+    if !out.is_null() {
+        std::ptr::write_unaligned(out, [smanip_setprecision_fn as *const () as usize, val as usize]);
     }
     out
 }
@@ -4497,10 +4531,10 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?setp@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD0@Z", ptr: Ptr(streambuf_setp2 as *const ()) },
     Export { name: "?setp@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEAAXPEA_W00@Z", ptr: Ptr(streambuf_w_setp3 as *const ()) },
     Export { name: "?setp@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEAAXPEA_W0@Z", ptr: Ptr(streambuf_w_setp2 as *const ()) },
-    Export { name: "?setprecision@std@@YA?AU?$_Smanip@_J@1@_J@Z", ptr: Ptr(smanip_noop as *const ()) },
+    Export { name: "?setprecision@std@@YA?AU?$_Smanip@_J@1@_J@Z", ptr: Ptr(smanip_setprecision as *const ()) },
     Export { name: "?setstate@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAXH_N@Z", ptr: Ptr(ios_setstate as *const ()) },
     Export { name: "?setstate@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAXH_N@Z", ptr: Ptr(ios_w_setstate as *const ()) },
-    Export { name: "?setw@std@@YA?AU?$_Smanip@_J@1@_J@Z", ptr: Ptr(smanip_noop as *const ()) },
+    Export { name: "?setw@std@@YA?AU?$_Smanip@_J@1@_J@Z", ptr: Ptr(smanip_setw as *const ()) },
     Export { name: "?sgetc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAAHXZ", ptr: Ptr(streambuf_sgetc as *const ()) },
     Export { name: "?showmanyc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA_JXZ", ptr: Ptr(streambuf_showmanyc as *const ()) },
     Export { name: "?showmanyc@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@MEAA_JXZ", ptr: Ptr(streambuf_w_showmanyc as *const ()) },
@@ -4802,12 +4836,91 @@ mod tests {
                 "?setf@ios_base@std@@QEAAHHH@Z",
                 "?width@ios_base@std@@QEBA_JXZ",
                 "?width@ios_base@std@@QEAA_J_J@Z",
+                "?setw@std@@YA?AU?$_Smanip@_J@1@_J@Z",
+                "?setprecision@std@@YA?AU?$_Smanip@_J@1@_J@Z",
                 "?tellp@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA?AV?$fpos@U_Mbstatet@@@2@XZ",
                 "??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z",
                 "??6?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QEAAAEAV01@I@Z",
             ] {
                 assert!(crate::lookup("msvcp140.dll", sym).is_some(), "missing {sym}");
             }
+        }
+    }
+
+    #[test]
+    fn smanip_setw_and_setprecision_format_wide_and_narrow_streams() {
+        unsafe {
+            type SmanipFn = unsafe extern "win64" fn(*mut BasicIos, i64);
+
+            // Wide stream: format hex values with std::setw + fill('0'), matching
+            // PCI\VEN_106B&DEV_C140&SUBSYS_106B0001&REV_01 style formatting.
+            let mut wsb: BasicStreambufW = std::mem::zeroed();
+            streambuf_w_ctor(&mut wsb);
+            let mut wpmem = [0u16; 64];
+            streambuf_w_setp2(&mut wsb, wpmem.as_mut_ptr(), wpmem.as_mut_ptr().add(64));
+            let mut wiostr = [0u8; 0x20 + std::mem::size_of::<BasicIosW>()];
+            iostream_w_ctor(wiostr.as_mut_ptr(), &mut wsb, 1);
+            let wios = stream_ios_w(wiostr.as_mut_ptr());
+
+            ios_base_setf2(wios as *mut BasicIos, 0x0800, 0x0E00); // std::hex
+            ios_base_setf1(wios as *mut BasicIos, 0x0004); // std::uppercase
+            ios_w_fill_set(wios, b'0' as u16);
+
+            let mut m = [0usize; 2];
+            assert_eq!(smanip_setw(&mut m, 2), &mut m as *mut [usize; 2]);
+            let sw_fn: SmanipFn = std::mem::transmute(m[0]);
+            sw_fn(wios as *mut BasicIos, m[1] as i64);
+            assert_eq!(ios_base_width_get(wios as *const BasicIos), 2);
+            ostream_w_shl_u32(wiostr.as_mut_ptr(), 0x1);
+            assert_eq!(ios_base_width_get(wios as *const BasicIos), 0);
+
+            assert_eq!(smanip_setw(&mut m, 8), &mut m as *mut [usize; 2]);
+            let sw_fn: SmanipFn = std::mem::transmute(m[0]);
+            sw_fn(wios as *mut BasicIos, m[1] as i64);
+            ostream_w_shl_u32(wiostr.as_mut_ptr(), 0x00AB_C140);
+
+            let written = (streambuf_w_pptr(&wsb) as usize - wpmem.as_ptr() as usize) / 2;
+            assert_eq!(String::from_utf16_lossy(&wpmem[..written]), "0100ABC140");
+
+            // setprecision updates ios_base::prec on both BasicIosW and BasicIos.
+            assert_eq!(smanip_setprecision(&mut m, 12), &mut m as *mut [usize; 2]);
+            let sp_fn: SmanipFn = std::mem::transmute(m[0]);
+            sp_fn(wios as *mut BasicIos, m[1] as i64);
+            assert_eq!(read_field::<BasicIosW, i64>(wios, std::mem::offset_of!(BasicIosW, prec)), 12);
+
+            ios_w_dtor(wios);
+            streambuf_w_dtor(&mut wsb);
+
+            // Narrow stream: std::setw + hex + uppercase + u32/u64 formatting.
+            let mut sb: BasicStreambuf = std::mem::zeroed();
+            streambuf_ctor(&mut sb);
+            let mut pmem = [0u8; 64];
+            streambuf_setp2(&mut sb, pmem.as_mut_ptr(), pmem.as_mut_ptr().add(64));
+            let mut ostr = [0u8; 0x10 + std::mem::size_of::<BasicIos>()];
+            ostream_ctor(ostr.as_mut_ptr(), &mut sb, 0, 1);
+            let ios = stream_ios(ostr.as_mut_ptr());
+            ios_base_setf2(ios, 0x0800 | 0x0004, 0x0E00 | 0x0004);
+            write_field(ios, std::mem::offset_of!(BasicIos, fillch), b'0');
+
+            smanip_setw(&mut m, 4);
+            let sw_fn: SmanipFn = std::mem::transmute(m[0]);
+            sw_fn(ios, m[1] as i64);
+            ostream_shl_u32(ostr.as_mut_ptr(), 0x1A);
+
+            smanip_setw(&mut m, 6);
+            sw_fn(ios, m[1] as i64);
+            ostream_shl_u64(ostr.as_mut_ptr(), 0x2B);
+
+            smanip_setprecision(&mut m, 9);
+            let sp_fn: SmanipFn = std::mem::transmute(m[0]);
+            sp_fn(ios, m[1] as i64);
+            assert_eq!(read_field::<BasicIos, i64>(ios, std::mem::offset_of!(BasicIos, prec)), 9);
+
+            let n = streambuf_pptr(&sb) as usize - pmem.as_ptr() as usize;
+            assert_eq!(std::str::from_utf8(&pmem[..n]).unwrap(), "001A00002B");
+
+            ios_dtor(ios);
+            streambuf_dtor(&mut sb);
         }
     }
 }
