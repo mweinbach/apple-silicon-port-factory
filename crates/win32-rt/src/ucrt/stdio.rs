@@ -2133,7 +2133,7 @@ pub unsafe extern "win64" fn _pipe(pfds: *mut i32, _psize: u32, textmode: i32) -
             FdInfo {
                 mode: eff_mode.0,
                 win_mode: eff_mode.1,
-                raw: true,
+                raw: false,
                 temporary: false,
                 osf_handle: None,
             },
@@ -4232,15 +4232,39 @@ mod tests {
             assert_eq!(fclose(fp3), 0);
             assert_eq!(std::fs::read(dir.join("one.txt")).unwrap(), b"first");
 
-            // _pipe creates a working CRT fd pair.
+            // _pipe creates a working CRT fd pair in both binary and text modes.
             let mut fds = [-1i32; 2];
             assert_eq!(_pipe(fds.as_mut_ptr(), 4096, O_BINARY | O_NOINHERIT), 0);
-            assert_eq!(_write(fds[1], b"abc".as_ptr().cast(), 3), 3);
-            let mut pbuf = [0u8; 8];
-            assert_eq!(_read(fds[0], pbuf.as_mut_ptr().cast(), 8), 3);
-            assert_eq!(&pbuf[..3], b"abc");
+            assert_eq!(_write(fds[1], b"a\r\nb\n".as_ptr().cast(), 5), 5);
+            let mut pbuf = [0u8; 16];
+            assert_eq!(_read(fds[0], pbuf.as_mut_ptr().cast(), 16), 5);
+            assert_eq!(&pbuf[..5], b"a\r\nb\n");
             assert_eq!(_close(fds[0]), 0);
             assert_eq!(_close(fds[1]), 0);
+
+            // Text-mode _pipe (both explicit O_TEXT and default _fmode == O_TEXT) expands
+            // LF -> CRLF on write and translates CRLF -> LF on read (including split reads).
+            for pipe_flags in [O_TEXT | O_NOINHERIT, O_NOINHERIT] {
+                let mut tfds = [-1i32; 2];
+                assert_eq!(_pipe(tfds.as_mut_ptr(), 4096, pipe_flags), 0);
+                // 1. Write expands '\n' -> "\r\n" on the wire (verify via raw POSIX read).
+                assert_eq!(_write(tfds[1], b"hi\nby\n".as_ptr().cast(), 6), 6);
+                let mut wire = [0u8; 16];
+                let wn = libc::read(tfds[0], wire.as_mut_ptr().cast(), wire.len());
+                assert_eq!(wn, 8);
+                assert_eq!(&wire[..8], b"hi\r\nby\r\n");
+                // 2. Read translates "\r\n" -> '\n' (including across a chunk boundary ending in '\r').
+                assert_eq!(_write(tfds[1], b"x\ny\n".as_ptr().cast(), 4), 4);
+                let mut tbuf = [0u8; 16];
+                let r1 = _read(tfds[0], tbuf.as_mut_ptr().cast(), 2); // reads "x\r", peeks '\n' -> "x\n"
+                assert_eq!(r1, 2);
+                assert_eq!(&tbuf[..2], b"x\n");
+                let r2 = _read(tfds[0], tbuf.as_mut_ptr().cast(), 16);
+                assert_eq!(r2, 2);
+                assert_eq!(&tbuf[..2], b"y\n");
+                assert_eq!(_close(tfds[0]), 0);
+                assert_eq!(_close(tfds[1]), 0);
+            }
 
             // _popen must NEVER escape to the host `/bin/sh`:
             // 1. Invalid modes / null args fail with EINVAL.

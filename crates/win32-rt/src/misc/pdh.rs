@@ -17,6 +17,7 @@ pub static ORDINALS: &[(u16, &str)] = &[];
 
 pub const ERROR_SUCCESS: i32 = 0;
 pub const PDH_CSTATUS_VALID_DATA: u32 = 0x0000_0000;
+pub const PDH_CSTATUS_NO_MACHINE: i32 = 0x8000_07D0u32 as i32;
 pub const PDH_CSTATUS_NO_INSTANCE: i32 = 0x8000_07D1u32 as i32;
 pub const PDH_CSTATUS_NO_OBJECT: i32 = 0xC000_0BB8u32 as i32;
 pub const PDH_CSTATUS_NO_COUNTER: i32 = 0xC000_0BB9u32 as i32;
@@ -163,14 +164,54 @@ fn validate_process_instance(instance: Option<&str>) -> Result<(), i32> {
     }
 }
 
+/// Returns true only when `machine` identifies the local host (`"."`, `"localhost"`,
+/// loopback literal, the configured Windows `computer_name`, or the host's `gethostname`).
+/// Remote machine names are rejected with `PDH_CSTATUS_NO_MACHINE` rather than silently
+/// returning local telemetry.
+fn is_local_machine(machine: &str) -> bool {
+    let m = machine.trim();
+    if m.is_empty() {
+        return false;
+    }
+    if m == "."
+        || m.eq_ignore_ascii_case("localhost")
+        || m == "127.0.0.1"
+        || m == "::1"
+        || m.eq_ignore_ascii_case(&crate::config::app_config().computer_name)
+    {
+        return true;
+    }
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0 {
+        let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if let Ok(host) = std::str::from_utf8(&buf[..nul]) {
+            let host = host.trim();
+            if !host.is_empty() {
+                if m.eq_ignore_ascii_case(host) {
+                    return true;
+                }
+                if let Some((short, _)) = host.split_once('.') {
+                    if !short.is_empty() && m.eq_ignore_ascii_case(short) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn parse_counter_path(path: &str) -> Result<CounterKind, i32> {
     let trimmed = path.trim();
-    // Strip optional \\machine prefix and leading '\'.
+    // Validate optional \\machine prefix (must denote the local host) and strip leading '\'.
     let rest = if let Some(after_unc) = trimmed.strip_prefix("\\\\") {
-        match after_unc.find('\\') {
-            Some(pos) => &after_unc[pos + 1..],
-            None => return Err(PDH_CSTATUS_NO_OBJECT),
+        let Some((machine, tail)) = after_unc.split_once('\\') else {
+            return Err(PDH_CSTATUS_NO_OBJECT);
+        };
+        if !is_local_machine(machine) {
+            return Err(PDH_CSTATUS_NO_MACHINE);
         }
+        tail
     } else if let Some(after_slash) = trimmed.strip_prefix('\\') {
         after_slash
     } else {
@@ -690,6 +731,38 @@ mod tests {
             let mut c_bad_inst = 1usize;
             assert_eq!(PdhAddCounterW(q, bad_inst.as_ptr(), 0, &mut c_bad_inst), PDH_CSTATUS_NO_INSTANCE);
             assert_eq!(c_bad_inst, 0);
+
+            // Local UNC machine prefixes (., localhost, configured Windows computer name) succeed,
+            // while remote or empty machine names fail honestly with PDH_CSTATUS_NO_MACHINE.
+            let local_comp = crate::config::app_config().computer_name;
+            for local_path in [
+                "\\\\.\\Memory\\Available MBytes".to_string(),
+                "\\\\localhost\\Memory\\Available MBytes".to_string(),
+                format!("\\\\{local_comp}\\Memory\\Available MBytes"),
+            ] {
+                let w = to_wide_z(&local_path);
+                let mut ch = 0usize;
+                assert_eq!(
+                    PdhAddCounterW(q, w.as_ptr(), 0, &mut ch),
+                    ERROR_SUCCESS,
+                    "expected local machine path {local_path} to succeed"
+                );
+                assert_ne!(ch, 0);
+            }
+            for remote_path in [
+                "\\\\other-host\\Processor(_Total)\\% Processor Time",
+                "\\\\192.0.2.1\\Memory\\Available MBytes",
+                "\\\\\\Memory\\Available MBytes",
+            ] {
+                let w = to_wide_z(remote_path);
+                let mut ch = 1usize;
+                assert_eq!(
+                    PdhAddCounterW(q, w.as_ptr(), 0, &mut ch),
+                    PDH_CSTATUS_NO_MACHINE,
+                    "expected PDH_CSTATUS_NO_MACHINE for {remote_path}"
+                );
+                assert_eq!(ch, 0);
+            }
 
             // Unsupported Memory counter (% Committed Bytes In Use has no Darwin fixed commit limit)
             // must fail honestly with PDH_CSTATUS_NO_COUNTER rather than substituting physical RAM load.
