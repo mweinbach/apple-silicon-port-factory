@@ -48,11 +48,21 @@ impl CommandList {
 
     /// Bind heaps and the current top-level argument buffer in the table.
     pub(super) fn bind_table(&mut self, root: u64) {
-        if self.heaps[0] != 0 {
-            self.set_table_addr(self.heaps[0], DESCRIPTOR_HEAP_BIND_POINT as usize);
+        let res_va = if self.heaps[0] != 0 {
+            self.heaps[0]
+        } else {
+            crate::metal::binding::empty_heap_va().unwrap_or(0)
+        };
+        if res_va != 0 {
+            self.set_table_addr(res_va, DESCRIPTOR_HEAP_BIND_POINT as usize);
         }
-        if self.heaps[1] != 0 {
-            self.set_table_addr(self.heaps[1], SAMPLER_HEAP_BIND_POINT as usize);
+        let samp_va = if self.heaps[1] != 0 {
+            self.heaps[1]
+        } else {
+            crate::metal::binding::empty_heap_va().unwrap_or(0)
+        };
+        if samp_va != 0 {
+            self.set_table_addr(samp_va, SAMPLER_HEAP_BIND_POINT as usize);
         }
         if root != 0 {
             self.set_table_addr(root, ARGUMENT_BUFFER_BIND_POINT as usize);

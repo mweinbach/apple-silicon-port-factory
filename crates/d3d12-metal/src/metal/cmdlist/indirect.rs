@@ -2241,7 +2241,15 @@ impl CommandList {
         self.bar.opening_pre_raster_stages = PRE_RASTER;
         let (e, size) = enc_res?;
         self.rp_sync.enc_pre_raster_reads |= eff_reads;
+        self.rp_sync.enc_pre_raster_srv_uav_reads |= eff_reads;
         self.rp_sync.enc_ps_reads |= p.ps_read_classes;
+        self.rp_sync.enc_ps_srv_uav_reads |= p.ps_srv_uav_classes;
+        if self.hk_any_active() {
+            self.rp_sync.enc_pre_raster_hk |= crate::metal::resource::HK_ALL;
+            self.rp_sync.enc_pre_raster_unb_hk |= crate::metal::resource::HK_ALL;
+            self.rp_sync.enc_ps_hk |= crate::metal::resource::HK_ALL;
+            self.rp_sync.enc_ps_unb_hk |= crate::metal::resource::HK_ALL;
+        }
         self.rp_sync.enc_uav_used |= writes_uav || p.uses_uav;
         self.render_mid_barrier(&e, emu_pre);
         self.record_gfx_draw_uav_writes(
