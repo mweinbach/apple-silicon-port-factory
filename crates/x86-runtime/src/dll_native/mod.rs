@@ -159,37 +159,78 @@ pub(crate) fn register_iat_dir(base: usize, size: usize, iat: (usize, usize)) {
         v.push((base, size, iat.0, iat.1));
         IAT_LO.fetch_min(base, Ordering::AcqRel);
         IAT_HI.fetch_max(base + size, Ordering::AcqRel);
+        IAT_SEQ.fetch_add(1, Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Release);
         let n = v.len().min(MAX_IAT_SPANS);
-        for (i, &(b, s, ..)) in v.iter().take(n).enumerate() {
-            IAT_SPANS[2 * i].store(b as u64, Ordering::Relaxed);
-            IAT_SPANS[2 * i + 1].store(s as u64, Ordering::Relaxed);
+        for (i, &(b, s, i0, i1)) in v.iter().take(n).enumerate() {
+            IAT_SPANS[4 * i].store(b as u64, Ordering::Relaxed);
+            IAT_SPANS[4 * i + 1].store(s as u64, Ordering::Relaxed);
+            IAT_SPANS[4 * i + 2].store(i0 as u64, Ordering::Relaxed);
+            IAT_SPANS[4 * i + 3].store(i1 as u64, Ordering::Relaxed);
         }
-        IAT_NSPANS.store(n, Ordering::Release);
+        IAT_NSPANS.store(n, Ordering::Relaxed);
+        IAT_OVERFLOW.store(v.len() > MAX_IAT_SPANS, Ordering::Relaxed);
+        IAT_SEQ.fetch_add(1, Ordering::Release);
     }
     crate::exe::invalidate_dispatch();
 }
 
-/// Lock-free copy of the [`IAT_DIRS`] image spans (`base, size` pairs) for the run loop's
-/// per-block check ([`in_iat_image`]); images past [`MAX_IAT_SPANS`] are not routed.
-const MAX_IAT_SPANS: usize = 32;
-static IAT_SPANS: [std::sync::atomic::AtomicU64; 2 * MAX_IAT_SPANS] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2 * MAX_IAT_SPANS];
+/// Lock-free seqlock mirror of [`IAT_DIRS`] (`(base, size, iat_lo, iat_hi)` tuples) so parallel
+/// AOT installs and runtime dispatch checks never contend on `IAT_DIRS`'s `RwLock`.
+const MAX_IAT_SPANS: usize = 64;
+static IAT_SPANS: [std::sync::atomic::AtomicU64; 4 * MAX_IAT_SPANS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4 * MAX_IAT_SPANS];
 static IAT_NSPANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static IAT_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IAT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lock-free lookup of the `(base, size, iat_lo, iat_hi)` entry containing `a` (falling back
+/// to `IAT_DIRS` only when more than [`MAX_IAT_SPANS`] DLLs are mapped).
+#[inline]
+fn iat_dir_for(a: usize) -> Option<(usize, usize, usize, usize)> {
+    use std::sync::atomic::Ordering;
+    loop {
+        let s1 = IAT_SEQ.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let n = IAT_NSPANS.load(Ordering::Relaxed).min(MAX_IAT_SPANS);
+        let mut found = None;
+        for i in 0..n {
+            let b = IAT_SPANS[4 * i].load(Ordering::Relaxed) as usize;
+            let s = IAT_SPANS[4 * i + 1].load(Ordering::Relaxed) as usize;
+            if a >= b && a - b < s {
+                let i0 = IAT_SPANS[4 * i + 2].load(Ordering::Relaxed) as usize;
+                let i1 = IAT_SPANS[4 * i + 3].load(Ordering::Relaxed) as usize;
+                found = Some((b, s, i0, i1));
+                break;
+            }
+        }
+        let overflow = found.is_none() && IAT_OVERFLOW.load(Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Acquire);
+        let s2 = IAT_SEQ.load(Ordering::Relaxed);
+        if s1 == s2 {
+            if overflow {
+                let Ok(v) = IAT_DIRS.read() else { return None };
+                return v.iter().copied().find(|&(b, s, ..)| a >= b && a - b < s);
+            }
+            return found;
+        }
+    }
+}
 
 /// Image bounds `(base, end)` when `[addr, addr + 2)` lies inside a mapped DLL image with a
 /// registered IAT directory (lock-free over [`IAT_SPANS`]).
 #[inline]
 pub fn iat_image_bounds(addr: u64) -> Option<(usize, usize)> {
-    use std::sync::atomic::Ordering;
-    let n = IAT_NSPANS.load(Ordering::Acquire).min(MAX_IAT_SPANS);
-    for i in 0..n {
-        let b = IAT_SPANS[2 * i].load(Ordering::Relaxed);
-        let s = IAT_SPANS[2 * i + 1].load(Ordering::Relaxed);
-        if addr.wrapping_sub(b) < s.saturating_sub(1) {
-            return Some((b as usize, (b + s) as usize));
-        }
+    let a = addr as usize;
+    let (b, s, ..) = iat_dir_for(a)?;
+    if a - b < s.saturating_sub(1) {
+        Some((b, b + s))
+    } else {
+        None
     }
-    None
 }
 
 /// `[addr, addr + 2)` lies inside a mapped DLL image with a registered IAT directory (so the
@@ -235,8 +276,7 @@ pub fn iat_stub_slot_checked(va: u64) -> Result<Option<usize>, StubRefusal> {
     if (va.wrapping_sub(lo)) >= span {
         return Ok(None);
     }
-    let Ok(v) = IAT_DIRS.read() else { return Ok(None) };
-    let Some(&(b, s, i0, i1)) = v.iter().find(|&&(b, s, ..)| a >= b && a - b < s) else {
+    let Some((b, s, i0, i1)) = iat_dir_for(a) else {
         return Ok(None);
     };
     let end = b + s;
