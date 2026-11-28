@@ -129,12 +129,36 @@ fn mastering_voice_resolves_wasapi_and_swd_device_id() {
             r"\\?\SWD#MMDEVAPI#{}#{{e6327cad-d664-4845-a290-00e5a8880222}}",
             ds_ep_id.to_ascii_uppercase()
         );
-        assert_eq!(choose_output_device(Some(&swd_path)).uid, ds_uid);
-        assert!(!choose_output_device(Some(&swd_path)).is_default);
+        let picked_swd = choose_output_device(Some(&swd_path));
+        assert_eq!(picked_swd.uid, ds_uid);
+        assert!(!picked_swd.is_default);
 
-        // 3. Unknown szDeviceId falls back cleanly to the default output device.
-        assert_eq!(choose_output_device(Some("{0.0.0.00000000}.{deadbeef}")).uid, default_dev.uid);
-        assert_eq!(choose_output_device(None).uid, default_dev.uid);
+        // 3. Explicitly requesting the *current default* endpoint (index 0) still pins it
+        //    (`is_default == false` -> HALOutput) so system default changes do not redirect it.
+        let default_ep_id = crate::audio::mmdevapi::render_endpoint_id_for_uid(&default_dev.uid);
+        let picked_default_explicit = choose_output_device(Some(&default_ep_id));
+        assert_eq!(picked_default_explicit.uid, default_dev.uid);
+        assert!(
+            !picked_default_explicit.is_default,
+            "explicit szDeviceId matching index 0 must pin HALOutput instead of DefaultOutput"
+        );
+        let default_swd = format!(
+            r"\\?\SWD#MMDEVAPI#{}#{{e6327cad-d664-4845-a290-00e5a8880222}}",
+            default_ep_id.to_ascii_uppercase()
+        );
+        assert!(!choose_output_device(Some(&default_swd)).is_default);
+        assert!(!choose_output_device(Some(&default_dev.uid)).is_default);
+
+        // 4. Null, empty, or unknown szDeviceId selects the default endpoint (`is_default == true`).
+        let picked_none = choose_output_device(None);
+        assert_eq!(picked_none.uid, default_dev.uid);
+        assert!(picked_none.is_default);
+        let picked_empty = choose_output_device(Some(""));
+        assert_eq!(picked_empty.uid, default_dev.uid);
+        assert!(picked_empty.is_default);
+        let picked_unknown = choose_output_device(Some("{0.0.0.00000000}.{deadbeef}"));
+        assert_eq!(picked_unknown.uid, default_dev.uid);
+        assert!(picked_unknown.is_default);
     }
 }
 

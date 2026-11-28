@@ -1717,11 +1717,9 @@ pub(super) fn choose_output_device(device_id: Option<&str>) -> backend::DeviceIn
             .or_else(|| devs.iter().position(|d| d.name.eq_ignore_ascii_case(req)));
         if let Some(idx) = matched_idx {
             let mut dev = devs.remove(idx);
-            if idx != 0 {
-                // Explicitly requested non-default endpoint: bind HALOutput to this device
-                // rather than tracking system default changes.
-                dev.is_default = false;
-            }
+            // Explicitly requested endpoint: pin HALOutput to this device rather than
+            // tracking system default switches, even when it is currently index 0.
+            dev.is_default = false;
             return dev;
         }
         log::debug!(
