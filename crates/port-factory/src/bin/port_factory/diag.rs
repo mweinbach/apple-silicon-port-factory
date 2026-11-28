@@ -418,43 +418,47 @@ pub fn cmd_nan_trace(args: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(exit_codes::RUNTIME_ERROR))
 }
 
+fn print_boot_triage_help() {
+    eprintln!(
+        "usage: port-factory boot-triage [options] [-- <game-args...>]\n\
+         \n\
+         Runs port-runner headless, captures the runtime log + boot/crash reports,\n\
+         classifies the first blocker, emits Schema v1 JSON on stdout, and prints a\n\
+         short human summary pointing at the likely owning crate.\n\
+         \n\
+         Target options (one of --manifest, --pe, --exe, or --log-file is required):\n\
+         \x20 --manifest FILE       Declarative games/<id>/game.toml manifest\n\
+         \x20 --game-dir DIR        Game install directory\n\
+         \x20 --pe FILE             Direct path to a Windows x86-64 .exe\n\
+         \x20 --exe NAME            Executable filename inside --game-dir\n\
+         \x20 --args STR            Guest CLI argument(s) (repeatable; quotes supported, e.g. --args -nolauncher)\n\
+         \x20 --timeout SECS        Wall-clock timeout in seconds (default: 30; alias: --timeout-secs)\n\
+         \x20 --max-frames N        Stop cleanly after N presented frames (default: 5; 0 disables)\n\
+         \x20 --runner PATH         Explicit path to port-runner binary\n\
+         \x20 --aot-dir DIR         Override AOT cache directory\n\
+         \x20 --drive-c DIR         Override Windows C:\\ prefix directory\n\
+         \x20 --env KEY=VAL         Extra env var passed to port-runner (repeatable)\n\
+         \x20 --metal-validation    Enable Apple Metal debug layer (MTL_DEBUG_LAYER=1)\n\
+         \n\
+         Offline log-triage mode (skip running port-runner):\n\
+         \x20 --log-file FILE       Classify an already-captured log file\n\
+         \x20 --boot-report FILE    Optional port-runner --report-json sidecar for --log-file\n\
+         \x20 --crash-json FILE     Optional crash-*.json sidecar for --log-file\n\
+         \x20 --exit-code N         Optional exit code for --log-file\n\
+         \x20 --signal N            Optional POSIX termination signal for --log-file\n\
+         \x20 --timed-out           Mark --log-file run as timed out\n\
+         \n\
+         Output options:\n\
+         \x20 --json                Emit only the Schema v1 JSON envelope on stdout (quiet stderr)\n\
+         \x20 --summary-only        Print only the short human summary on stdout\n\
+         \x20 --json-out FILE       Also write the Schema v1 JSON envelope to FILE\n\
+         \x20 --log-out FILE        Save the full captured log to FILE"
+    );
+}
+
 pub fn cmd_boot_triage(args: &[String]) -> Result<i32> {
-    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        eprintln!(
-            "usage: port-factory boot-triage [options] [-- <game-args...>]\n\
-             \n\
-             Runs port-runner headless, captures the runtime log + boot/crash reports,\n\
-             classifies the first blocker, emits Schema v1 JSON on stdout, and prints a\n\
-             short human summary pointing at the likely owning crate.\n\
-             \n\
-             Target options (one of --manifest, --pe, --exe, or --log-file is required):\n\
-             \x20 --manifest FILE       Declarative games/<id>/game.toml manifest\n\
-             \x20 --game-dir DIR        Game install directory\n\
-             \x20 --pe FILE             Direct path to a Windows x86-64 .exe\n\
-             \x20 --exe NAME            Executable filename inside --game-dir\n\
-             \x20 --args STR            Guest CLI argument(s) (repeatable; quotes supported, e.g. --args -nolauncher)\n\
-             \x20 --timeout SECS        Wall-clock timeout in seconds (default: 30; alias: --timeout-secs)\n\
-             \x20 --max-frames N        Stop cleanly after N presented frames (default: 5; 0 disables)\n\
-             \x20 --runner PATH         Explicit path to port-runner binary\n\
-             \x20 --aot-dir DIR         Override AOT cache directory\n\
-             \x20 --drive-c DIR         Override Windows C:\\ prefix directory\n\
-             \x20 --env KEY=VAL         Extra env var passed to port-runner (repeatable)\n\
-             \x20 --metal-validation    Enable Apple Metal debug layer (MTL_DEBUG_LAYER=1)\n\
-             \n\
-             Offline log-triage mode (skip running port-runner):\n\
-             \x20 --log-file FILE       Classify an already-captured log file\n\
-             \x20 --boot-report FILE    Optional port-runner --report-json sidecar for --log-file\n\
-             \x20 --crash-json FILE     Optional crash-*.json sidecar for --log-file\n\
-             \x20 --exit-code N         Optional exit code for --log-file\n\
-             \x20 --signal N            Optional POSIX termination signal for --log-file\n\
-             \x20 --timed-out           Mark --log-file run as timed out\n\
-             \n\
-             Output options:\n\
-             \x20 --json                Emit only the Schema v1 JSON envelope on stdout (quiet stderr)\n\
-             \x20 --summary-only        Print only the short human summary on stdout\n\
-             \x20 --json-out FILE       Also write the Schema v1 JSON envelope to FILE\n\
-             \x20 --log-out FILE        Save the full captured log to FILE"
-        );
+    if args.is_empty() {
+        print_boot_triage_help();
         return Ok(exit_codes::OK);
     }
 
@@ -481,6 +485,10 @@ pub fn cmd_boot_triage(args: &[String]) -> Result<i32> {
             continue;
         }
         match a {
+            "-h" | "--help" => {
+                print_boot_triage_help();
+                return Ok(exit_codes::OK);
+            }
             "--" => {
                 opts.game_args.extend(cur.take_rest().iter().cloned());
                 break;

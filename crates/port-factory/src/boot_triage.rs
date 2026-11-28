@@ -907,16 +907,6 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
     });
     let effective_exit_code = input.exit_code.or(boot_exit_code);
 
-    // Collect candidates across all classes.
-    let unresolved = detect_unresolved_import(&lines, &boot_meta, &crash_meta);
-    let metal_val = detect_metal_validation(&lines);
-    let panic_abort = detect_rust_panic_or_abort(&lines, effective_exit_code, input.signal);
-    let (guest_crash, nonfatal_unimpl_ops) =
-        detect_guest_crash(&lines, &crash_meta, effective_exit_code);
-    let hresult = detect_d3d12_dxgi_hresult(&lines);
-    let stub_hit = detect_stub_hit(&lines, &boot_meta);
-    let startup_err = detect_startup_error(&lines, &boot_meta);
-
     let log_timed_out = lines.iter().any(|l| {
         l.msg.contains("[run-limit] timed out after")
             || l.msg.contains("port-runner: timed out after")
@@ -927,6 +917,22 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
         || log_timed_out
         || matches!(boot_meta.exit_kind.as_str(), "timeout" | "stall")
         || (crash_meta.present && crash_meta.kind == "stall");
+
+    // Collect candidates across all classes.
+    let unresolved = detect_unresolved_import(&lines, &boot_meta, &crash_meta);
+    let metal_val = detect_metal_validation(&lines);
+    let panic_abort = detect_rust_panic_or_abort(&lines, effective_exit_code, input.signal);
+    let (guest_crash, nonfatal_guest_signals) = detect_guest_crash(
+        &lines,
+        &crash_meta,
+        effective_exit_code,
+        input.signal,
+        is_timeout,
+        frames_presented,
+    );
+    let hresult = detect_d3d12_dxgi_hresult(&lines);
+    let stub_hit = detect_stub_hit(&lines, &boot_meta);
+    let startup_err = detect_startup_error(&lines, &boot_meta);
 
     // Pick the first fatal (Tier 1) blocker, respecting causal dominance:
     //  - Unresolved import / delay-load 0xc06d007e/7f wins over its own crash report.
@@ -1107,7 +1113,7 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
             detail: cand.evidence.unwrap_or_default(),
         });
     }
-    secondary_signals.extend(nonfatal_unimpl_ops);
+    secondary_signals.extend(nonfatal_guest_signals);
     secondary_signals.sort_by_key(|s| s.log_line.unwrap_or(usize::MAX));
 
     let owner = attribute_owner(&blocker, &boot_meta);
@@ -1554,10 +1560,50 @@ fn detect_rust_panic_or_abort(
     None
 }
 
+fn is_guest_crash_trigger(msg: &str) -> Option<(&'static str, bool)> {
+    if msg.contains("CRASH REPORT:") {
+        if msg.contains("unimplemented import ") || msg.contains("stall") || msg.contains("hang") {
+            return None;
+        }
+        if msg.contains("host fault") {
+            return Some(("host_fault", false));
+        }
+        if msg.contains("__fastfail") {
+            return Some(("fastfail", false));
+        }
+        let provisional = msg.to_ascii_lowercase().contains("unhandled");
+        return Some(("unhandled_exception", provisional));
+    }
+    if msg.starts_with("UNHANDLED ") || msg.starts_with("emu: UNHANDLED guest ") {
+        let low = msg.to_ascii_lowercase();
+        if low.contains("0xc06d007e") || low.contains("0xc06d007f") {
+            return None;
+        }
+        return Some(("unhandled_exception", true));
+    }
+    if msg.starts_with("FAST FAIL ") {
+        return Some(("fastfail", false));
+    }
+    if msg.starts_with("FATAL: ") {
+        let sub = if msg.contains("host fault") {
+            "host_fault"
+        } else if msg.contains("__fastfail") {
+            "fastfail"
+        } else {
+            "unhandled_exception"
+        };
+        return Some((sub, false));
+    }
+    None
+}
+
 fn detect_guest_crash(
     lines: &[ParsedLine<'_>],
     crash_meta: &CrashReportMeta,
     exit_code: Option<i32>,
+    signal: Option<i32>,
+    is_timeout: bool,
+    frames_presented: u64,
 ) -> (Option<BlockerDetail>, Vec<SecondarySignal>) {
     // 1. Unimplemented x86-64 opcode (`EXIT_UNIMPL_OP = 86` when fatal; secondary signal when
     //    `PORT_FAIL_ON_UNIMPL_OP=0` logged the opcode and continued).
@@ -1573,7 +1619,7 @@ fn detect_guest_crash(
                     .contains("unimplemented x86 instruction")
         });
 
-    let mut nonfatal_unimpl: Vec<SecondarySignal> = Vec::new();
+    let mut nonfatal_signals: Vec<SecondarySignal> = Vec::new();
     for (idx, l) in lines.iter().enumerate() {
         if let Some(pos) = l.msg.find("UNIMPLEMENTED mnemonic ") {
             let rest = &l.msg[pos + "UNIMPLEMENTED mnemonic ".len()..];
@@ -1608,11 +1654,11 @@ fn detect_guest_crash(
                         backtrace: bt,
                         ..BlockerDetail::default()
                     }),
-                    nonfatal_unimpl,
+                    nonfatal_signals,
                 );
             }
-            if nonfatal_unimpl.len() < 4 {
-                nonfatal_unimpl.push(SecondarySignal {
+            if nonfatal_signals.len() < 4 {
+                nonfatal_signals.push(SecondarySignal {
                     class: BlockerClass::GuestCrash,
                     subkind: "unimplemented_x86_op_nonfatal".to_string(),
                     log_line: Some(l.line_no),
@@ -1625,47 +1671,119 @@ fn detect_guest_crash(
         }
     }
 
-    // 2. Crash report / unhandled exception / FATAL / FAST FAIL lines.
-    let mut trigger_idx: Option<usize> = None;
-    let mut subkind = "unhandled_exception";
-    for (idx, l) in lines.iter().enumerate() {
-        let msg = l.msg;
-        if msg.contains("CRASH REPORT:") {
-            if msg.contains("unimplemented import ")
-                || msg.contains("stall")
-                || msg.contains("hang")
+    // 2. Crash report / unhandled exception / FATAL / FAST FAIL blocks.
+    //    `fatal_unhandled` and emulated unhandled dispatch in `win32-rt/src/unwind.rs` log
+    //    `UNHANDLED` and write a provisional `CRASH REPORT:` *before* invoking the application's
+    //    unhandled exception filter. If the filter returns `EXCEPTION_CONTINUE_EXECUTION` (-1),
+    //    execution resumes (with an explicit `continued execution` log on the emulated path, or
+    //    `restore_context` followed by continued execution / clean exit / a later event on the
+    //    native path). Demote recovered exceptions to secondary signals rather than Tier 1 crashes.
+    let clean_exit = exit_code == Some(0) && signal.is_none() && !is_timeout;
+    let reached_max_frames = lines
+        .iter()
+        .any(|l| l.msg.contains("[run-limit] reached --max-frames"));
+
+    let mut recovered_any = false;
+    let mut scan_idx = 0usize;
+    let mut fatal_trigger: Option<(usize, &'static str)> = None;
+
+    while scan_idx < lines.len() {
+        let Some((mut subkind, provisional)) = is_guest_crash_trigger(lines[scan_idx].msg) else {
+            scan_idx += 1;
+            continue;
+        };
+        let tidx = scan_idx;
+        let max_end = (tidx + 140).min(lines.len());
+        let mut block_end = tidx + 1;
+        while block_end < max_end {
+            let m = lines[block_end].msg;
+            if m.contains("end of crash report") {
+                block_end += 1;
+                break;
+            }
+            // Do not merge a second separate `UNHANDLED` / `FATAL` trigger into the same block.
+            if block_end > tidx && !m.contains("CRASH REPORT:") && is_guest_crash_trigger(m).is_some()
             {
-                continue;
+                break;
             }
-            trigger_idx = Some(idx);
-            if msg.contains("host fault") {
-                subkind = "host_fault";
-            } else if msg.contains("__fastfail") {
-                subkind = "fastfail";
-            }
-            break;
+            block_end += 1;
         }
-        if msg.starts_with("UNHANDLED ")
-            || msg.starts_with("emu: UNHANDLED guest ")
-            || msg.starts_with("FATAL: ")
-            || msg.starts_with("FAST FAIL ")
+        // If no `end of crash report` appeared, don't jump too far past a 1-line trigger.
+        if block_end == max_end
+            && !lines[tidx..block_end]
+                .iter()
+                .any(|l| l.msg.contains("CRASH REPORT:"))
         {
-            if msg.to_ascii_lowercase().contains("0xc06d007e")
-                || msg.to_ascii_lowercase().contains("0xc06d007f")
-            {
+            block_end = (tidx + 1).min(lines.len());
+        }
+
+        // Inspect lines immediately following this crash block up to any next crash/fatal event.
+        let mut saw_filter_call = false;
+        let mut saw_continued = false;
+        let mut has_later_fatal_event = false;
+        for l in &lines[block_end..] {
+            let m = l.msg;
+            if m.contains("unhandled exception filter continued execution") {
+                saw_continued = true;
+                saw_filter_call = true;
                 continue;
             }
-            trigger_idx = Some(idx);
-            if msg.starts_with("FAST FAIL ") || msg.contains("__fastfail") {
-                subkind = "fastfail";
-            } else if msg.contains("host fault") {
-                subkind = "host_fault";
+            if m.contains("calling the application's unhandled exception filter") {
+                saw_filter_call = true;
+                continue;
             }
-            break;
+            if is_guest_crash_trigger(m).is_some()
+                || m.starts_with("PANIC on thread ")
+                || (m.starts_with("thread '") && m.contains(" panicked at "))
+                || (m.contains("UNIMPLEMENTED ") && !m.contains("UNIMPLEMENTED mnemonic "))
+            {
+                has_later_fatal_event = true;
+                break;
+            }
         }
+
+        let is_recovered = provisional
+            && (saw_continued
+                || (saw_filter_call
+                    && (has_later_fatal_event || is_timeout || clean_exit || reached_max_frames))
+                || (clean_exit && (frames_presented > 0 || reached_max_frames)));
+
+        if is_recovered {
+            recovered_any = true;
+            let ex_desc = lines[tidx..block_end]
+                .iter()
+                .find_map(|l| extract_exception_code_and_name(l.msg))
+                .map(|(c, n)| if n.is_empty() { c } else { format!("{n} ({c})") })
+                .unwrap_or_else(|| "unhandled_exception".to_string());
+            let loc_desc = lines[tidx..block_end]
+                .iter()
+                .find_map(|l| extract_module_rva(l.msg))
+                .map(|s| format!(" at {s}"))
+                .unwrap_or_default();
+            if nonfatal_signals.len() < 4 {
+                nonfatal_signals.push(SecondarySignal {
+                    class: BlockerClass::GuestCrash,
+                    subkind: "recovered_exception".to_string(),
+                    log_line: Some(lines[tidx].line_no),
+                    summary: format!(
+                        "Recovered guest exception {ex_desc}{loc_desc} (continued execution)"
+                    ),
+                    detail: lines[tidx].raw.to_string(),
+                });
+            }
+            scan_idx = block_end;
+            continue;
+        }
+
+        // Non-recovered fatal crash trigger found.
+        if lines[tidx].msg.starts_with("FAST FAIL ") || lines[tidx].msg.contains("__fastfail") {
+            subkind = "fastfail";
+        }
+        fatal_trigger = Some((tidx, subkind));
+        break;
     }
 
-    if let Some(tidx) = trigger_idx {
+    if let Some((tidx, mut subkind)) = fatal_trigger {
         let window_end = (tidx + 120).min(lines.len());
         let slice = &lines[tidx..window_end];
 
@@ -1800,12 +1918,49 @@ fn detect_guest_crash(
                 backtrace: bt,
                 ..BlockerDetail::default()
             }),
-            nonfatal_unimpl,
+            nonfatal_signals,
         );
     }
 
     // Fallback: crash-*.json present even without log markers, or exit code 86.
+    // Skip if a provisional crash report in the log was already recognized as recovered, or if
+    // the process exited cleanly after presenting frames / reaching --max-frames.
+    let sidecar_is_provisional_recovered = recovered_any
+        || (clean_exit
+            && (frames_presented > 0
+                || reached_max_frames
+                || lines.iter().any(|l| {
+                    l.msg.contains("calling the application's unhandled exception filter")
+                        || l.msg.contains("unhandled exception filter continued execution")
+                })));
     if crash_meta.present && crash_meta.kind == "crash" {
+        if sidecar_is_provisional_recovered {
+            if !recovered_any && nonfatal_signals.len() < 4 {
+                let loc = crash_meta
+                    .guest_symbol
+                    .as_deref()
+                    .and_then(extract_module_rva)
+                    .or_else(|| crash_meta.top_frame_symbol.as_deref().and_then(extract_module_rva));
+                let ex = crash_meta
+                    .exception_code
+                    .as_deref()
+                    .unwrap_or("unhandled_exception");
+                let loc_str = loc.map(|s| format!(" at {s}")).unwrap_or_default();
+                nonfatal_signals.push(SecondarySignal {
+                    class: BlockerClass::GuestCrash,
+                    subkind: "recovered_exception".to_string(),
+                    log_line: None,
+                    summary: format!(
+                        "Recovered guest exception {ex}{loc_str} (continued execution)"
+                    ),
+                    detail: crash_meta
+                        .exception_desc
+                        .clone()
+                        .unwrap_or_else(|| crash_meta.title.clone()),
+                });
+            }
+            return (None, nonfatal_signals);
+        }
         let loc = crash_meta
             .guest_symbol
             .as_deref()
@@ -1838,7 +1993,7 @@ fn detect_guest_crash(
                 backtrace: crash_meta.frames.clone(),
                 ..BlockerDetail::default()
             }),
-            nonfatal_unimpl,
+            nonfatal_signals,
         );
     }
 
@@ -1851,11 +2006,11 @@ fn detect_guest_crash(
                 exception_code: Some("EXIT_UNIMPL_OP(86)".to_string()),
                 ..BlockerDetail::default()
             }),
-            nonfatal_unimpl,
+            nonfatal_signals,
         );
     }
 
-    (None, nonfatal_unimpl)
+    (None, nonfatal_signals)
 }
 
 fn detect_d3d12_dxgi_hresult(lines: &[ParsedLine<'_>]) -> Option<BlockerDetail> {
@@ -3882,5 +4037,76 @@ Abort trap: 6";
         assert_eq!(stall_rep.blocker.class(), BlockerClass::HangTimeout);
         assert_eq!(stall_rep.blocker.subkind, "watchdog_stall");
         assert_eq!(stall_rep.exit_code(), exit_codes::TIMEOUT);
+    }
+
+    #[test]
+    fn recovered_unhandled_exception_is_demoted_to_secondary_signal() {
+        let provisional_crash_json = r#"{
+          "schema_version": 1,
+          "kind": "crash",
+          "title": "unhandled exception",
+          "exception": { "code": "0xc0000005", "description": "exception 0xc0000005 ACCESS_VIOLATION" },
+          "guest_state": { "rip": "0x140012ab0", "symbol": "testgame.exe+0x12ab0", "frames": [] },
+          "backtrace": { "frames": [] }
+        }"#;
+
+        // 1. Native fatal_unhandled restores context via EXCEPTION_CONTINUE_EXECUTION, then exits cleanly after 5 frames.
+        let clean_after_filter = "\
+[2026-11-28T04:00:01.000Z ERROR win32_rt::unwind] UNHANDLED exception 0xc0000005 ACCESS_VIOLATION flags=0x0 at testgame.exe+0x12ab0
+[2026-11-28T04:00:01.001Z ERROR win32_rt::crash] ==================== AW2 CRASH REPORT: unhandled exception ====================
+[2026-11-28T04:00:01.002Z ERROR win32_rt::crash] ==================== end of crash report (1.0ms) ====================
+[2026-11-28T04:00:01.003Z ERROR win32_rt::unwind] calling the application's unhandled exception filter at testgame.exe+0x1000
+[2026-11-28T04:00:03.000Z INFO  port_loader::run_limits] [run-limit] reached --max-frames 5 (frames_presented=5, elapsed=2000ms); exiting cleanly";
+        let mut clean_inp = synthetic_input(clean_after_filter, Some(0));
+        clean_inp.crash_report_json = Some(provisional_crash_json.to_string());
+        let clean_rep = classify_boot_log(&clean_inp);
+        assert_eq!(clean_rep.blocker.class(), BlockerClass::None);
+        assert_eq!(clean_rep.blocker.subkind, "rendered_frames");
+        assert_eq!(clean_rep.exit_code(), exit_codes::OK);
+        assert_eq!(clean_rep.secondary_signals.len(), 1);
+        assert_eq!(
+            clean_rep.secondary_signals[0].subkind,
+            "recovered_exception"
+        );
+
+        // 2. Emulated exception continued by filter, then process later times out.
+        let timeout_after_continue = "\
+[2026-11-28T04:00:01.000Z ERROR win32_rt::unwind] emu: UNHANDLED guest exception 0xc0000005 ACCESS_VIOLATION at rip 0x140012ab0 testgame.exe+0x12ab0
+[2026-11-28T04:00:01.001Z ERROR win32_rt::crash] ==================== AW2 CRASH REPORT: unhandled emulated guest exception ====================
+[2026-11-28T04:00:01.002Z ERROR win32_rt::crash] ==================== end of crash report (1.0ms) ====================
+[2026-11-28T04:00:01.003Z ERROR win32_rt::unwind] calling the application's unhandled exception filter at testgame.exe+0x1000
+[2026-11-28T04:00:01.004Z ERROR win32_rt::unwind] emu: unhandled exception filter continued execution at 0x140012ab3
+[2026-11-28T04:00:31.000Z WARN  port_loader::run_limits] [run-limit] timed out after 30s (30001 ms, frames_presented=0); exiting with code 124";
+        let mut to_inp = synthetic_input(timeout_after_continue, Some(124));
+        to_inp.timed_out = true;
+        to_inp.crash_report_json = Some(provisional_crash_json.to_string());
+        let to_rep = classify_boot_log(&to_inp);
+        assert_eq!(to_rep.blocker.class(), BlockerClass::HangTimeout);
+        assert_eq!(to_rep.exit_code(), exit_codes::TIMEOUT);
+        assert_eq!(to_rep.secondary_signals.len(), 1);
+        assert_eq!(to_rep.secondary_signals[0].subkind, "recovered_exception");
+
+        // 3. Recovered exception followed by a second genuinely fatal crash keeps the second crash as primary.
+        let second_crash = "\
+[2026-11-28T04:00:01.000Z ERROR win32_rt::unwind] UNHANDLED exception 0xc0000005 ACCESS_VIOLATION flags=0x0 at testgame.exe+0x12ab0
+[2026-11-28T04:00:01.001Z ERROR win32_rt::crash] ==================== AW2 CRASH REPORT: unhandled exception ====================
+[2026-11-28T04:00:01.002Z ERROR win32_rt::crash] ==================== end of crash report (1.0ms) ====================
+[2026-11-28T04:00:01.003Z ERROR win32_rt::unwind] calling the application's unhandled exception filter at testgame.exe+0x1000
+[2026-11-28T04:00:02.000Z ERROR win32_rt::unwind] UNHANDLED exception 0xc000001d ILLEGAL_INSTRUCTION flags=0x0 at testgame.exe+0x99900
+[2026-11-28T04:00:02.001Z ERROR win32_rt::crash] ==================== AW2 CRASH REPORT: unhandled exception ====================
+[2026-11-28T04:00:02.001Z ERROR win32_rt::crash] exception 0xc000001d ILLEGAL_INSTRUCTION flags=0x0 at testgame.exe+0x99900
+[2026-11-28T04:00:02.002Z ERROR win32_rt::crash] ==================== end of crash report (1.0ms) ====================";
+        let second_rep = classify_boot_log(&synthetic_input(second_crash, Some(29)));
+        assert_eq!(second_rep.blocker.class(), BlockerClass::GuestCrash);
+        assert_eq!(second_rep.blocker.subkind, "illegal_instruction");
+        assert_eq!(
+            second_rep.blocker.location.as_deref(),
+            Some("testgame.exe+0x99900")
+        );
+        assert_eq!(second_rep.secondary_signals.len(), 1);
+        assert_eq!(
+            second_rep.secondary_signals[0].subkind,
+            "recovered_exception"
+        );
     }
 }

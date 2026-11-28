@@ -277,6 +277,31 @@ Abort trap: 6
         Some("boot-triage")
     );
 
+    // Verify guest `-h` / `--help` forwarded via `--args` or after `--` does NOT trigger boot-triage help.
+    let (code, parsed, stderr) = run_boot_triage_cli(&[
+        "--log-file",
+        clean_lf.to_str().unwrap(),
+        "--exit-code",
+        "0",
+        "--json",
+        "--args",
+        "--help",
+        "--",
+        "-h",
+    ]);
+    assert_eq!(code, exit_codes::OK);
+    assert!(stderr.trim().is_empty(), "guest --help/-h must not trigger boot-triage help, got stderr: {stderr}");
+    let forwarded_args: Vec<&str> = parsed
+        .get("data")
+        .and_then(|d| d.get("target"))
+        .and_then(|t| t.get("args"))
+        .and_then(JsonValue::as_array)
+        .expect("target.args array")
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .collect();
+    assert_eq!(forwarded_args, vec!["--help", "-h"]);
+
     // Verify usage error returns exit code 2 with Schema v1 error envelope under --json.
     let (code, parsed, _) = run_boot_triage_cli(&["--timeout", "0", "--json"]);
     assert_eq!(code, exit_codes::USAGE_ERROR);
