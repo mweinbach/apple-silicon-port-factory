@@ -698,6 +698,7 @@ pub struct BinkAudioPlayer {
     paused: bool,
     shared: Option<Arc<StreamShared>>,
     stream: Option<OutputStream>,
+    tap: Option<crate::audio::tap::Tap>,
     decode_scratch: Vec<f32>,
     mix_scratch: Vec<f32>,
 }
@@ -716,6 +717,7 @@ impl BinkAudioPlayer {
             paused: false,
             shared: None,
             stream: None,
+            tap: None,
             decode_scratch: Vec::new(),
             mix_scratch: Vec::new(),
         }
@@ -812,7 +814,7 @@ impl BinkAudioPlayer {
     }
 
     fn ensure_stream(&mut self) {
-        if self.stream.is_some() || self.tracks.is_empty() {
+        if self.shared.is_some() || self.tracks.is_empty() {
             return;
         }
         let rate = self.output_sample_rate.clamp(8000, 192_000);
@@ -820,6 +822,23 @@ impl BinkAudioPlayer {
         // 4-second ring absorbs Bink frame-1 audio pre-buffering (~0.75-1.5 s) without drops.
         let ring_cap = (rate as usize).saturating_mul(4).max(16_384);
         let shared = StreamShared::new(Ring::new(ring_cap, channels as usize));
+
+        if self.tap.is_none() {
+            let fmt = crate::audio::format::WaveFormat::float_mix(
+                rate,
+                channels,
+                crate::audio::format::default_mask(channels),
+            );
+            self.tap = crate::audio::tap::next_path().and_then(|p| {
+                match crate::audio::tap::Tap::create_tagged(p.clone(), fmt, "bink2") {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        log::error!(target: "audio", "bink2w64: audio tap {}: {e}", p.display());
+                        None
+                    }
+                }
+            });
+        }
 
         let headless = std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
             || std::env::var("AW2_HEADLESS").is_ok_and(|v| v == "1");
@@ -892,8 +911,13 @@ impl BinkAudioPlayer {
         }
 
         self.ensure_stream();
+        let padding_before = self.shared.as_ref().map_or(0, |sh| sh.ring.len() as u32);
         if let Some(ref sh) = self.shared {
             sh.ring.push(&self.mix_scratch);
+        }
+        if let Some(ref mut t) = self.tap {
+            let frames = (self.mix_scratch.len() / 2) as u32;
+            t.submit_f32(frames, padding_before, &self.mix_scratch);
         }
         if !self.paused {
             if let Some(ref mut s) = self.stream {
@@ -1421,5 +1445,56 @@ mod tests {
                 assert!(out.iter().all(|s| s.is_finite()));
             }
         }
+    }
+
+    #[test]
+    fn bink_audio_player_writes_tap_wav() {
+        let _audio_guard = crate::audio::audio_test_lock();
+        backend::force_backend(Some(backend::Backend::Null));
+
+        let dir = std::env::temp_dir().join(format!("bink2-tap-test-{}", std::process::id()));
+        let wav = dir.join("bink2.wav");
+        crate::audio::tap::override_next(Some(wav.clone()));
+
+        let mut bw = BitWriter::new();
+        encode_simple_block(
+            &mut bw,
+            48_000,
+            1,
+            true,
+            (0, 0, false),
+            (0, 0, false),
+            65,
+            Some((10, 12, false)),
+        );
+        let pkt = wrap_audio_packet((1920 * 2) as u32, &bw.into_bytes());
+
+        {
+            let track = ActiveAudioTrack {
+                file_track_index: 0,
+                track_id: 0,
+                sample_rate: 48_000,
+                channels: 1,
+                volume: BINK_UNITY_VOLUME,
+                pan: 0, // full left
+                decoder: BinkAudioDecoder::new(48_000, 1, true, false),
+            };
+            let mut player = BinkAudioPlayer::new(vec![track], true);
+            player.submit_frame_packets(&pkt, &[(0, pkt.len())]);
+        }
+
+        let bytes = std::fs::read(&wav).expect("bink2 tap wav must exist");
+        assert_eq!(&bytes[0..4], b"RIFF");
+        let data = &bytes[crate::audio::tap::DATA_OFFSET as usize..];
+        assert_eq!(data.len(), 1920 * 2 * 4);
+        let samples: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let peak_l = samples.iter().step_by(2).map(|v| v.abs()).fold(0.0f32, f32::max);
+        let peak_r = samples.iter().skip(1).step_by(2).map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(peak_l > 0.1, "expected non-silent tapped L audio, got {peak_l}");
+        assert!(peak_r < 1e-6, "expected full-left pan to silence R, got {peak_r}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

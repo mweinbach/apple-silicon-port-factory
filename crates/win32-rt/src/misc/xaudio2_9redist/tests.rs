@@ -2558,3 +2558,86 @@ fn ms_adpcm_sustained_large_nibbles_bounds_delta_without_overflow() {
         assert!(out_neg.iter().all(|s| s.is_finite() && (-1.0..=1.0).contains(s)));
     }
 }
+
+#[test]
+fn mastering_voice_writes_tap_wav() {
+    let _audio_guard = crate::audio::audio_test_lock();
+    backend::force_backend(Some(Backend::Null));
+
+    let dir = std::env::temp_dir().join(format!("xaudio2-tap-test-{}", std::process::id()));
+    let wav = dir.join("xa2.wav");
+    crate::audio::tap::override_next(Some(wav.clone()));
+
+    unsafe {
+        let mut xa2: *mut XAudio2Engine = std::ptr::null_mut();
+        assert_eq!(XAudio2Create(&mut xa2, 0, 1), S_OK);
+        let mut mv: *mut MasteringVoice = std::ptr::null_mut();
+        assert_eq!(
+            xa2_create_mastering_voice(
+                xa2,
+                &mut mv,
+                2,
+                48_000,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                6
+            ),
+            S_OK
+        );
+        let wfx = float_wfx(2, 48_000);
+        let mut sv: *mut SourceVoice = std::ptr::null_mut();
+        assert_eq!(
+            xa2_create_source_voice(
+                xa2,
+                &mut sv,
+                &wfx,
+                0,
+                2.0,
+                0,
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            S_OK
+        );
+
+        let tone: Vec<f32> = (0..480)
+            .flat_map(|_| [0.5f32, -0.25f32])
+            .collect();
+        submit_f32_buf(sv, &tone);
+        assert_eq!(sv_start(sv, 0, 0), S_OK);
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let mut st = XAudio2VoiceState {
+            current_buffer_context: 0,
+            buffers_queued: 1,
+            samples_played: 0,
+        };
+        while std::time::Instant::now() < deadline {
+            sv_get_state(sv, &mut st, 0);
+            if st.buffers_queued == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!({ st.buffers_queued }, 0);
+
+        voice_destroy_voice(sv as *mut VoiceHeader);
+        voice_destroy_voice(mv as *mut VoiceHeader);
+        assert_eq!(xa2_release(xa2), 0);
+    }
+
+    let bytes = std::fs::read(&wav).expect("xaudio2 tap wav must exist");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    let data = &bytes[crate::audio::tap::DATA_OFFSET as usize..];
+    assert!(data.len() >= 480 * 8, "expected >= 480 stereo f32 frames, got {} bytes", data.len());
+    let samples: Vec<f32> = data
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let max_l = samples.iter().step_by(2).map(|v| v.abs()).fold(0.0f32, f32::max);
+    let max_r = samples.iter().skip(1).step_by(2).map(|v| v.abs()).fold(0.0f32, f32::max);
+    assert!((max_l - 0.5).abs() < 1e-4, "expected tapped L peak ~0.5, got {max_l}");
+    assert!((max_r - 0.25).abs() < 1e-4, "expected tapped R peak ~0.25, got {max_r}");
+    let _ = std::fs::remove_dir_all(dir);
+}

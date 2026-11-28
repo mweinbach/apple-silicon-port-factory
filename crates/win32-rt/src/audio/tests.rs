@@ -2799,3 +2799,90 @@ fn session_and_stream_volume_apply_at_playback_consumption_for_queued_audio() {
         assert_eq!(release(e), 0);
     }
 }
+
+#[test]
+fn spatial_audio_render_stream_writes_tap_wav() {
+    use super::spatial::*;
+    let _f = Fixture::null();
+    let dir = std::env::temp_dir().join(format!("spatial-tap-test-{}", std::process::id()));
+    let wav = dir.join("spatial.wav");
+    tap::override_next(Some(wav.clone()));
+    unsafe {
+        let e = enumerator();
+        let d = default_device(e);
+
+        let mut sac: P = std::ptr::null_mut();
+        assert_eq!(
+            call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &IID_ISpatialAudioClient, CLSCTX_ALL, std::ptr::null_mut(), &mut sac),
+            S_OK
+        );
+
+        let mut fe: P = std::ptr::null_mut();
+        assert_eq!(call!(sac, SAC_GET_FMT_ENUM, (*mut P) -> HRESULT; &mut fe), S_OK);
+        let mut wfx: *mut WAVEFORMATEX = std::ptr::null_mut();
+        assert_eq!(call!(fe, FE_GET_FORMAT, (u32, *mut *mut WAVEFORMATEX) -> HRESULT; 0, &mut wfx), S_OK);
+
+        let ev = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+        assert!(!ev.is_null());
+
+        let params = SpatialAudioObjectRenderStreamActivationParams {
+            object_format: wfx,
+            static_object_type_mask: AudioObjectType_FrontLeft | AudioObjectType_FrontRight,
+            min_dynamic_object_count: 0,
+            max_dynamic_object_count: 8,
+            category: 6,
+            event_handle: ev,
+            notify_object: std::ptr::null_mut(),
+        };
+        let pv = blob_propvariant(&params);
+
+        let mut stream: P = std::ptr::null_mut();
+        assert_eq!(
+            call!(sac, SAC_ACTIVATE_STREAM, (*const u8, *const GUID, *mut P) -> HRESULT; pv.as_ptr(), &IID_ISpatialAudioObjectRenderStream, &mut stream),
+            S_OK
+        );
+
+        let (mut avail, mut frames) = (0u32, 0u32);
+        assert_eq!(call!(stream, SRS_BEGIN_UPDATE, (*mut u32, *mut u32) -> HRESULT; &mut avail, &mut frames), S_OK);
+        assert_eq!(frames, QUANTUM_FRAMES);
+
+        let mut obj_fl: P = std::ptr::null_mut();
+        assert_eq!(call!(stream, SRS_ACTIVATE_OBJ, (u32, *mut P) -> HRESULT; AudioObjectType_FrontLeft, &mut obj_fl), S_OK);
+        let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+        let mut buf_len = 0u32;
+        assert_eq!(call!(obj_fl, SO_GET_BUFFER, (*mut *mut u8, *mut u32) -> HRESULT; &mut buf_ptr, &mut buf_len), S_OK);
+        assert_eq!(buf_len, QUANTUM_FRAMES * 4);
+        std::slice::from_raw_parts_mut(buf_ptr as *mut f32, QUANTUM_FRAMES as usize).fill(0.4);
+
+        let mut obj_fr: P = std::ptr::null_mut();
+        assert_eq!(call!(stream, SRS_ACTIVATE_OBJ, (u32, *mut P) -> HRESULT; AudioObjectType_FrontRight, &mut obj_fr), S_OK);
+        assert_eq!(call!(obj_fr, SO_GET_BUFFER, (*mut *mut u8, *mut u32) -> HRESULT; &mut buf_ptr, &mut buf_len), S_OK);
+        std::slice::from_raw_parts_mut(buf_ptr as *mut f32, QUANTUM_FRAMES as usize).fill(-0.2);
+
+        assert_eq!(call!(stream, SRS_END_UPDATE, () -> HRESULT;), S_OK);
+
+        assert_eq!(release(obj_fr), 0);
+        assert_eq!(release(obj_fl), 0);
+        assert_eq!(release(stream), 0);
+        assert_eq!(crate::kernel32::threads::CloseHandle(ev), TRUE);
+        CoTaskMemFree(wfx as P);
+        assert_eq!(release(fe), 0);
+        assert_eq!(release(sac), 0);
+        assert_eq!(release(d), 0);
+        assert_eq!(release(e), 0);
+    }
+
+    let bytes = std::fs::read(&wav).expect("spatial tap wav must exist");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    let data = &bytes[tap::DATA_OFFSET as usize..];
+    assert_eq!(data.len(), QUANTUM_FRAMES as usize * 2 * 4);
+    let samples: Vec<f32> = data
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert!((samples[0] - 0.4).abs() < 1e-5, "expected L=0.4, got {}", samples[0]);
+    assert!((samples[1] - (-0.2)).abs() < 1e-5, "expected R=-0.2, got {}", samples[1]);
+    let side = std::fs::read_to_string(tap::sidecar_path(&wav)).unwrap();
+    assert_eq!(side.lines().count(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
