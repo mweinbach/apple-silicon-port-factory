@@ -2005,18 +2005,10 @@ fn classify_strong_bidi_dir(ch: char) -> Option<i32> {
 }
 
 fn fallback_base_direction(units: &[u16]) -> i32 {
-    let mut isolate_depth = 0usize;
     for res in char::decode_utf16(units.iter().copied()) {
         let Ok(ch) = res else { continue };
-        match ch as u32 {
-            0x2066..=0x2068 => isolate_depth += 1,
-            0x2069 => isolate_depth = isolate_depth.saturating_sub(1),
-            _ if isolate_depth == 0 => {
-                if let Some(dir) = classify_strong_bidi_dir(ch) {
-                    return dir;
-                }
-            }
-            _ => {}
+        if let Some(dir) = classify_strong_bidi_dir(ch) {
+            return dir;
         }
     }
     UBIDI_NEUTRAL
@@ -3243,6 +3235,8 @@ mod tests {
                 ("\u{064E}Hello", UBIDI_LTR),
                 ("\u{FEFF}Hello", UBIDI_LTR),
                 ("\u{FEFF}", UBIDI_NEUTRAL),
+                ("\u{2067}\u{05D0}\u{05D1}\u{2069} Hello", UBIDI_RTL),
+                ("\u{2067}\u{05D0}\u{05D1}\u{2069}", UBIDI_RTL),
             ] {
                 let u16s: Vec<u16> = sample.encode_utf16().collect();
                 assert_eq!(
