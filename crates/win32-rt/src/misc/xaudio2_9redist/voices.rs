@@ -2,8 +2,8 @@
 //! `IXAudio2SubmixVoice`, and `IXAudio2SourceVoice`.
 
 use super::mixer::{
-    decode_pcm_to_f32, default_xaudio2_matrix, parse_send_list, parse_wave_format,
-    spawn_mastering_runtime, CallbackEvent, MasteringVoice, MasteringVoiceState,
+    choose_output_device, decode_pcm_to_f32, default_xaudio2_matrix, parse_send_list,
+    parse_wave_format, spawn_mastering_runtime, CallbackEvent, MasteringVoice, MasteringVoiceState,
     QueuedSourceBuffer, SourceVoice, SourceVoiceState, SubmixVoice, SubmixVoiceState, VoiceFilter,
     VoiceHeader, VoiceKind, VoiceSend, XAudio2Buffer, XAudio2Engine, XAudio2FilterParameters,
     XAudio2PerformanceData, XAudio2VoiceDetails, XAudio2VoiceSends, XAudio2VoiceState,
@@ -404,7 +404,7 @@ pub(super) unsafe extern "win64" fn xa2_create_mastering_voice(
     input_channels: u32,
     input_sample_rate: u32,
     flags: u32,
-    _device_id: *const u16,
+    device_id: *const u16,
     effect_chain: *const XAudio2EffectChain,
     _stream_category: u32,
 ) -> i32 {
@@ -427,13 +427,19 @@ pub(super) unsafe extern "win64" fn xa2_create_mastering_voice(
         let eng = &*this;
         eng.core.clone()
     };
+    let requested_device = (!device_id.is_null()).then(|| crate::strings::read_wide_z(device_id, 512));
+    let dev = choose_output_device(requested_device.as_deref());
     let channels = if input_channels == 0 {
-        2
+        crate::audio::mmdevapi::render_mix_channels(&dev) as usize
     } else {
         input_channels as usize
     };
     let sample_rate = if input_sample_rate == 0 {
-        48_000
+        if (XAUDIO2_MIN_SAMPLE_RATE..=XAUDIO2_MAX_SAMPLE_RATE).contains(&dev.rate) {
+            dev.rate
+        } else {
+            48_000
+        }
     } else {
         input_sample_rate
     };
@@ -469,7 +475,7 @@ pub(super) unsafe extern "win64" fn xa2_create_mastering_voice(
         });
     }
 
-    match spawn_mastering_runtime(&core, sample_rate, channels) {
+    match spawn_mastering_runtime(&core, &dev, sample_rate, channels) {
         Ok(rt) => {
             *core.runtime.lock().unwrap() = Some(rt);
         }

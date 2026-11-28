@@ -70,6 +70,75 @@ fn make_stopped_test_engine(
 }
 
 #[test]
+fn mastering_voice_resolves_wasapi_and_swd_device_id() {
+    let _audio_guard = crate::audio::audio_test_lock();
+    backend::force_backend(Some(Backend::Null));
+    let default_dev = backend::null_device();
+    let ds_dev = backend::dualsense_usb_device(0);
+    let ds_uid = ds_dev.uid.clone();
+    let ds_ep_id = crate::audio::mmdevapi::render_endpoint_id_for_uid(&ds_uid);
+    backend::force_output_devices(Some(vec![default_dev.clone(), ds_dev]));
+
+    struct RestoreDevices;
+    impl Drop for RestoreDevices {
+        fn drop(&mut self) {
+            backend::force_output_devices(None);
+        }
+    }
+    let _restore = RestoreDevices;
+
+    unsafe {
+        // 1. Direct WASAPI endpoint ID (`{0.0.0.00000000}.{guid}`) selects the DualSense USB
+        //    4-channel endpoint and defaults input_channels == 0 to 4 channels.
+        let mut xa2: *mut XAudio2Engine = std::ptr::null_mut();
+        assert_eq!(XAudio2Create(&mut xa2, 0, 1), S_OK);
+        xa2_stop_engine(xa2);
+        let ds_id_w = crate::strings::to_wide_z(&ds_ep_id);
+        let mut mv: *mut MasteringVoice = std::ptr::null_mut();
+        assert_eq!(
+            xa2_create_mastering_voice(
+                xa2,
+                &mut mv,
+                0,
+                0,
+                0,
+                ds_id_w.as_ptr(),
+                std::ptr::null(),
+                6
+            ),
+            S_OK
+        );
+        assert_eq!(
+            (&(*xa2).core).runtime.lock().unwrap().as_ref().unwrap().device_uid,
+            ds_uid
+        );
+        let mut details = XAudio2VoiceDetails {
+            creation_flags: 0,
+            active_flags: 0,
+            input_channels: 0,
+            input_sample_rate: 0,
+        };
+        voice_get_voice_details(mv as *mut VoiceHeader, &mut details);
+        assert_eq!({ details.input_channels }, 4);
+        assert_eq!({ details.input_sample_rate }, 48_000);
+        voice_destroy_voice(mv as *mut VoiceHeader);
+        assert_eq!(xa2_release(xa2), 0);
+
+        // 2. WinRT/PnP SWD device interface path (`\\?\SWD#MMDEVAPI#{...}#{guid}`) also matches.
+        let swd_path = format!(
+            r"\\?\SWD#MMDEVAPI#{}#{{e6327cad-d664-4845-a290-00e5a8880222}}",
+            ds_ep_id.to_ascii_uppercase()
+        );
+        assert_eq!(choose_output_device(Some(&swd_path)).uid, ds_uid);
+        assert!(!choose_output_device(Some(&swd_path)).is_default);
+
+        // 3. Unknown szDeviceId falls back cleanly to the default output device.
+        assert_eq!(choose_output_device(Some("{0.0.0.00000000}.{deadbeef}")).uid, default_dev.uid);
+        assert_eq!(choose_output_device(None).uid, default_dev.uid);
+    }
+}
+
+#[test]
 fn xaudio2_bink_lifecycle() {
     let _audio_guard = crate::audio::audio_test_lock();
     backend::force_backend(Some(Backend::Null));
