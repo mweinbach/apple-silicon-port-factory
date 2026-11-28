@@ -451,11 +451,6 @@ struct ConsoleSession {
     buf_size_override: Option<[i16; 2]>,
     window_rect_override: Option<[i16; 4]>,
     color_table: [u32; 16],
-    font_index: u32,
-    font_size: [i16; 2],
-    font_family: u32,
-    font_weight: u32,
-    font_face: String,
     /// Handles created by the active `AllocConsole` / `AttachConsole` session so `FreeConsole` can detach cleanly.
     session_handles: Option<[usize; 3]>,
 }
@@ -478,11 +473,6 @@ fn console_session() -> &'static Mutex<ConsoleSession> {
             buf_size_override: None,
             window_rect_override: None,
             color_table: DEFAULT_CONSOLE_COLORS,
-            font_index: 0,
-            font_size: [8, 16],
-            font_family: 0x36, // FF_MODERN | TMPF_FIXED_PITCH
-            font_weight: 400,
-            font_face: "Consolas".into(),
             session_handles: None,
         })
     })
@@ -951,10 +941,7 @@ pub unsafe extern "win64" fn SetCurrentConsoleFontEx(
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    let font_index = std::ptr::read_unaligned(info.add(4) as *const u32);
     let font_size = std::ptr::read_unaligned(info.add(8) as *const [i16; 2]);
-    let font_family = std::ptr::read_unaligned(info.add(12) as *const u32);
-    let font_weight = std::ptr::read_unaligned(info.add(16) as *const u32);
     let mut face_units = Vec::with_capacity(32);
     for i in 0..32 {
         let ch = std::ptr::read_unaligned(info.add(20 + i * 2) as *const u16);
@@ -963,15 +950,13 @@ pub unsafe extern "win64" fn SetCurrentConsoleFontEx(
         }
         face_units.push(ch);
     }
-    let mut st = console_session().lock().unwrap();
-    st.font_index = font_index;
-    st.font_size = font_size;
-    st.font_family = font_family;
-    st.font_weight = font_weight;
-    if !face_units.is_empty() {
-        st.font_face = String::from_utf16_lossy(&face_units);
-    }
-    TRUE
+    let face = String::from_utf16_lossy(&face_units);
+    // Host POSIX terminal/pipe consoles do not support changing the terminal emulator's font face or cell size.
+    log::warn!(
+        "kernel32: SetCurrentConsoleFontEx(face={face:?}, size={font_size:?}) unsupported on host terminal"
+    );
+    set_err(err::ERROR_NOT_SUPPORTED);
+    FALSE
 }
 
 pub unsafe extern "win64" fn SetConsoleTextAttribute(h: HANDLE, a: u16) -> BOOL {
@@ -13009,6 +12994,8 @@ mod tests {
 
             let mut font_raw = [0u8; 85];
             let font = font_raw.as_mut_ptr().add(1);
+            assert_eq!(SetCurrentConsoleFontEx(std::ptr::null_mut(), FALSE, font), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
             std::ptr::write_unaligned(font as *mut u32, 16u32);
             assert_eq!(SetCurrentConsoleFontEx(h_out, FALSE, font), FALSE);
             assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
@@ -13018,7 +13005,9 @@ mod tests {
             for (i, ch) in face.iter().enumerate() {
                 std::ptr::write_unaligned(font.add(20 + i * 2) as *mut u16, *ch);
             }
-            assert_eq!(SetCurrentConsoleFontEx(h_out, FALSE, font), TRUE);
+            // Host POSIX terminal cannot apply console font changes -> honest ERROR_NOT_SUPPORTED.
+            assert_eq!(SetCurrentConsoleFontEx(h_out, FALSE, font), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_NOT_SUPPORTED);
             let _ = FreeConsole();
 
             // TransactNamedPipe round-trips request/response over a named pipe.

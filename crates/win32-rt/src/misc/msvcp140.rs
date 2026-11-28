@@ -1065,9 +1065,21 @@ static FACET_VTABLE: [Ptr; 3] = [
     Ptr(facet_decref as *const ()),
 ];
 
+unsafe fn unaligned_atomic_u32_fetch_add(ptr: *mut u8, delta: u32) -> u32 {
+    if (ptr as usize).is_multiple_of(std::mem::align_of::<AtomicU32>()) {
+        (*(ptr as *const AtomicU32)).fetch_add(delta, Ordering::AcqRel)
+    } else {
+        static UNALIGNED_REF_LOCK: Mutex<()> = Mutex::new(());
+        let _g = UNALIGNED_REF_LOCK.lock().unwrap();
+        let prev = std::ptr::read_unaligned(ptr as *const u32);
+        std::ptr::write_unaligned(ptr as *mut u32, prev.wrapping_add(delta));
+        prev
+    }
+}
+
 unsafe extern "win64" fn facet_deleting_dtor(this: *mut Facet, flags: u32) -> *mut Facet {
     if !this.is_null() {
-        (*this).vtable = FACET_VTABLE.as_ptr();
+        write_field(this, std::mem::offset_of!(Facet, vtable), FACET_VTABLE.as_ptr());
         if (flags & 1) != 0 {
             crate::ucrt::heap::free(this.cast());
         }
@@ -1078,22 +1090,23 @@ unsafe extern "win64" fn facet_deleting_dtor(this: *mut Facet, flags: u32) -> *m
 unsafe extern "win64" fn facet_ctor(this: *mut Facet, refs: usize) -> *mut Facet {
     ensure_vtables_registered();
     if !this.is_null() {
-        (*this).vtable = FACET_VTABLE.as_ptr();
-        (*this).refs = AtomicU32::new(refs as u32);
-        (*this)._pad = 0;
+        write_field(this, std::mem::offset_of!(Facet, vtable), FACET_VTABLE.as_ptr());
+        write_field(this, std::mem::offset_of!(Facet, refs), refs as u32);
+        write_field(this, std::mem::offset_of!(Facet, _pad), 0u32);
     }
     this
 }
 
 unsafe extern "win64" fn facet_dtor(this: *mut Facet) {
     if !this.is_null() {
-        (*this).vtable = FACET_VTABLE.as_ptr();
+        write_field(this, std::mem::offset_of!(Facet, vtable), FACET_VTABLE.as_ptr());
     }
 }
 
 unsafe extern "win64" fn facet_incref(this: *mut Facet) {
     if !this.is_null() {
-        (*this).refs.fetch_add(1, Ordering::Relaxed);
+        let refs_ptr = field_ptr::<_, u8>(this, std::mem::offset_of!(Facet, refs));
+        unaligned_atomic_u32_fetch_add(refs_ptr, 1);
     }
 }
 
@@ -1101,7 +1114,8 @@ unsafe extern "win64" fn facet_decref(this: *mut Facet) -> *mut Facet {
     if this.is_null() {
         return std::ptr::null_mut();
     }
-    if (*this).refs.fetch_sub(1, Ordering::AcqRel) == 1 {
+    let refs_ptr = field_ptr::<_, u8>(this, std::mem::offset_of!(Facet, refs));
+    if unaligned_atomic_u32_fetch_add(refs_ptr, u32::MAX) == 1 {
         this
     } else {
         std::ptr::null_mut()
@@ -1184,12 +1198,13 @@ unsafe extern "win64" fn locimp_makeloc(
         return imp;
     }
     if cat != 0 {
-        (*imp).catmask |= cat;
+        let cur_cat: i32 = read_field(imp, std::mem::offset_of!(Locimp, catmask));
+        write_field(imp, std::mem::offset_of!(Locimp, catmask), cur_cat | cat);
     }
     if !lobj.is_null() {
         let name = locinfo_getname(lobj);
         if !name.is_null() {
-            yarn_assign(&mut (*imp).name as *mut *mut c_char as *mut *mut u8, name);
+            yarn_assign(field_ptr::<_, *mut u8>(imp, std::mem::offset_of!(Locimp, name)), name);
         }
     }
     // Populate ctype<char> and ctype<wchar_t> facets when _M_CTYPE (2) is requested.
@@ -1216,23 +1231,26 @@ unsafe extern "win64" fn locimp_new(src: *const Locimp) -> *mut Locimp {
     if dst.is_null() {
         return dst;
     }
-    (*dst).vtable = FACET_VTABLE.as_ptr();
-    (*dst).refs = AtomicU32::new(1);
-    (*dst).catmask = 0x3f;
-    (*dst).cloc_inline_name[0] = b'C';
-    if !src.is_null() && (*src).facetcount > 0 && !(*src).facetvec.is_null() {
-        let count = (*src).facetcount;
-        let vec = crate::ucrt::heap::calloc(count, std::mem::size_of::<*mut Facet>()) as *mut *mut Facet;
-        if !vec.is_null() {
-            for i in 0..count {
-                let f = *(*src).facetvec.add(i);
-                if !f.is_null() {
-                    facet_incref(f);
+    write_field(dst, std::mem::offset_of!(Locimp, vtable), FACET_VTABLE.as_ptr());
+    write_field(dst, std::mem::offset_of!(Locimp, refs), 1u32);
+    write_field(dst, std::mem::offset_of!(Locimp, catmask), 0x3fi32);
+    write_field(dst, std::mem::offset_of!(Locimp, cloc_inline_name), b'C');
+    if !src.is_null() {
+        let count: usize = read_field(src, std::mem::offset_of!(Locimp, facetcount));
+        let src_vec: *mut *mut Facet = read_field(src, std::mem::offset_of!(Locimp, facetvec));
+        if count > 0 && !src_vec.is_null() {
+            let vec = crate::ucrt::heap::calloc(count, std::mem::size_of::<*mut Facet>()) as *mut *mut Facet;
+            if !vec.is_null() {
+                for i in 0..count {
+                    let f = std::ptr::read_unaligned(src_vec.add(i));
+                    if !f.is_null() {
+                        facet_incref(f);
+                    }
+                    std::ptr::write_unaligned(vec.add(i), f);
                 }
-                *vec.add(i) = f;
+                write_field(dst, std::mem::offset_of!(Locimp, facetvec), vec);
+                write_field(dst, std::mem::offset_of!(Locimp, facetcount), count);
             }
-            (*dst).facetvec = vec;
-            (*dst).facetcount = count;
         }
     }
     dst
@@ -1242,34 +1260,39 @@ unsafe extern "win64" fn locimp_addfac(this: *mut Locimp, fac: *mut Facet, id: u
     if this.is_null() || fac.is_null() {
         return;
     }
-    if (*this).facetcount <= id {
+    let mut cur_count: usize = read_field(this, std::mem::offset_of!(Locimp, facetcount));
+    let mut cur_vec: *mut *mut Facet = read_field(this, std::mem::offset_of!(Locimp, facetvec));
+    if cur_count <= id {
         let new_count = (id + 1).max(40);
         let new_vec = crate::ucrt::heap::realloc(
-            (*this).facetvec.cast(),
+            cur_vec.cast(),
             new_count * std::mem::size_of::<*mut Facet>(),
         ) as *mut *mut Facet;
         if new_vec.is_null() {
             return;
         }
-        for i in (*this).facetcount..new_count {
-            *new_vec.add(i) = std::ptr::null_mut();
+        for i in cur_count..new_count {
+            std::ptr::write_unaligned(new_vec.add(i), std::ptr::null_mut());
         }
-        (*this).facetvec = new_vec;
-        (*this).facetcount = new_count;
+        write_field(this, std::mem::offset_of!(Locimp, facetvec), new_vec);
+        write_field(this, std::mem::offset_of!(Locimp, facetcount), new_count);
+        cur_vec = new_vec;
+        cur_count = new_count;
     }
+    let _ = cur_count;
     facet_incref(fac);
-    let old = *(*this).facetvec.add(id);
+    let old = std::ptr::read_unaligned(cur_vec.add(id));
     if !old.is_null() {
         let del = facet_decref(old);
         if !del.is_null() {
-            let vtbl = (*del).vtable;
+            let vtbl: *const Ptr = read_field(del, std::mem::offset_of!(Facet, vtable));
             if !vtbl.is_null() {
-                let dtor = (*vtbl.add(0)).0 as usize;
+                let dtor = std::ptr::read_unaligned(vtbl).0 as usize;
                 let _ = crate::call_guest8(dtor, del as u64, 1, 0, 0, 0, 0, 0, 0);
             }
         }
     }
-    *(*this).facetvec.add(id) = fac;
+    std::ptr::write_unaligned(cur_vec.add(id), fac);
 }
 
 /// `std::ctype<char>` (`0x30` bytes, `0x180006010`).
@@ -2777,7 +2800,8 @@ unsafe extern "win64" fn ios_copyfmt(
     if !rhs_ploc.is_null() {
         let loc_imp = std::ptr::read_unaligned((rhs_ploc as *const usize).add(1)) as *mut Locimp;
         if !loc_imp.is_null() {
-            (*loc_imp).refs.fetch_add(1, Ordering::Relaxed);
+            let refs_ptr = field_ptr::<_, u8>(loc_imp, std::mem::offset_of!(Locimp, refs));
+            unaligned_atomic_u32_fetch_add(refs_ptr, 1);
         }
         let mut dst_ploc: *mut [usize; 2] = read_field(this, std::mem::offset_of!(BasicIos, ploc));
         if dst_ploc.is_null() {
@@ -4547,6 +4571,25 @@ mod tests {
             assert_eq!((*imp).transparent, 1);
             let imp2 = locimp_makeloc(li.as_ptr(), 0x3f, imp, std::ptr::null());
             assert_eq!(imp2, imp);
+            // Unaligned caller-supplied Locimp passed to _Makeloc / _New_Locimp / facet helpers.
+            let mut raw_imp = [0u8; std::mem::size_of::<Locimp>() + 8];
+            let unaligned_imp = raw_imp.as_mut_ptr().add(1) as *mut Locimp;
+            assert!(!unaligned_imp.is_aligned());
+            facet_ctor(unaligned_imp as *mut Facet, 2);
+            facet_incref(unaligned_imp as *mut Facet);
+            assert_eq!(read_field::<_, u32>(unaligned_imp, std::mem::offset_of!(Locimp, refs)), 3);
+            assert!(facet_decref(unaligned_imp as *mut Facet).is_null());
+            assert_eq!(read_field::<_, u32>(unaligned_imp, std::mem::offset_of!(Locimp, refs)), 2);
+            let imp_u = locimp_makeloc(li.as_ptr(), 0x3f, unaligned_imp, std::ptr::null());
+            assert_eq!(imp_u, unaligned_imp);
+            assert_eq!(read_field::<_, i32>(unaligned_imp, std::mem::offset_of!(Locimp, catmask)), 0x3f);
+            let u_name: *mut c_char = read_field(unaligned_imp, std::mem::offset_of!(Locimp, name));
+            assert!(!u_name.is_null());
+            assert_eq!(CStr::from_ptr(u_name).to_bytes(), b"en-US");
+            let cloned_from_unaligned = locimp_new(unaligned_imp);
+            assert!(!cloned_from_unaligned.is_null());
+            assert!(read_field::<_, usize>(cloned_from_unaligned, std::mem::offset_of!(Locimp, facetcount)) > 0);
+            facet_dtor(unaligned_imp as *mut Facet);
             let mut wfac: *const Facet = std::ptr::null();
             assert_eq!(ctype_w_getcat(&mut wfac, std::ptr::null()), 2);
             assert!(!wfac.is_null());
