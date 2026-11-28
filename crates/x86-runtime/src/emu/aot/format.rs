@@ -819,6 +819,15 @@ pub(super) fn encode_with_version(
         put64(&mut w, va);
         put64(&mut w, host as u64);
     }
+    #[cfg(target_endian = "little")]
+    if !img.code.is_empty() {
+        // SAFETY: `img.code` is a contiguous `[u32]` slice and target endianness is little-endian.
+        let raw = unsafe {
+            core::slice::from_raw_parts(img.code.as_ptr() as *const u8, img.code.len() * 4)
+        };
+        w.extend_from_slice(raw);
+    }
+    #[cfg(not(target_endian = "little"))]
     for &c in &img.code {
         put32(&mut w, c);
     }
@@ -920,40 +929,59 @@ pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32
     if need > body.len() - r.p {
         return None;
     }
+    #[inline(always)]
+    fn le32(s: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([s[off], s[off + 1], s[off + 2], s[off + 3]])
+    }
+    #[inline(always)]
+    fn le64(s: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes([
+            s[off],
+            s[off + 1],
+            s[off + 2],
+            s[off + 3],
+            s[off + 4],
+            s[off + 5],
+            s[off + 6],
+            s[off + 7],
+        ])
+    }
+    let blocks_raw = r.take(nb * 52)?;
     img.blocks.reserve(nb);
-    for _ in 0..nb {
-        let mut v = [0u32; 13];
-        for x in v.iter_mut() {
-            *x = r.u32()?;
-        }
+    for c in blocks_raw.chunks_exact(52) {
         img.blocks.push(BlockEnt {
-            ip: key.image_base.wrapping_add(v[0] as u64),
-            code_off: v[1],
-            cold_off: v[2],
-            words: v[3],
-            main: v[4],
-            guest: v[5],
-            host_entry: v[6] != 0,
-            link_lo: v[7],
-            link_n: v[8],
-            reloc_lo: v[9],
-            reloc_n: v[10],
-            assume_lo: v[11],
-            assume_n: v[12],
+            ip: key.image_base.wrapping_add(le32(c, 0) as u64),
+            code_off: le32(c, 4),
+            cold_off: le32(c, 8),
+            words: le32(c, 12),
+            main: le32(c, 16),
+            guest: le32(c, 20),
+            host_entry: le32(c, 24) != 0,
+            link_lo: le32(c, 28),
+            link_n: le32(c, 32),
+            reloc_lo: le32(c, 36),
+            reloc_n: le32(c, 40),
+            assume_lo: le32(c, 44),
+            assume_n: le32(c, 48),
         });
     }
+    let links_raw = r.take(nl * 20)?;
     img.links.reserve(nl);
-    for _ in 0..nl {
+    for c in links_raw.chunks_exact(20) {
         img.links.push(LinkEnt {
-            site_off: r.u32()?,
-            fallback_off: r.u32()?,
-            cond_off: r.u32()?,
-            target: r.u64()?,
+            site_off: le32(c, 0),
+            fallback_off: le32(c, 4),
+            cond_off: le32(c, 8),
+            target: le64(c, 12),
         });
     }
+    let relocs_raw = r.take(nr * 24)?;
     img.relocs.reserve(nr);
-    for _ in 0..nr {
-        let (slot_off, fl, va, src) = (r.u32()?, r.u32()?, r.u64()?, r.u64()?);
+    for c in relocs_raw.chunks_exact(24) {
+        let slot_off = le32(c, 0);
+        let fl = le32(c, 4);
+        let va = le64(c, 8);
+        let src = le64(c, 16);
         if fl & !0x3FF != 0 {
             return None;
         }
@@ -965,13 +993,34 @@ pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32
             src,
         });
     }
+    let assume_raw = r.take(na * 16)?;
     img.assume.reserve(na);
-    for _ in 0..na {
-        img.assume.push((r.u64()?, r.u64()? != 0));
+    for c in assume_raw.chunks_exact(16) {
+        img.assume.push((le64(c, 0), le64(c, 8) != 0));
     }
-    img.code.reserve(nc);
-    for _ in 0..nc {
-        img.code.push(r.u32()?);
+    let code_raw = r.take(nc * 4)?;
+    #[cfg(target_endian = "little")]
+    {
+        img.code = Vec::with_capacity(nc);
+        if nc != 0 {
+            // SAFETY: `code_raw` has exact byte length `nc * 4`, `img.code` has capacity `nc`
+            // `u32` words, buffers do not overlap, and target endianness is little-endian.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    code_raw.as_ptr(),
+                    img.code.as_mut_ptr() as *mut u8,
+                    nc * 4,
+                );
+                img.code.set_len(nc);
+            }
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        img.code.reserve(nc);
+        for c in code_raw.chunks_exact(4) {
+            img.code.push(le32(c, 0));
+        }
     }
     if r.p != body.len() || !img.valid() {
         return None;
