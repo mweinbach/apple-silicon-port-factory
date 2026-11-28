@@ -37,7 +37,7 @@ pub unsafe fn create_heap(desc: *const HeapDesc, riid: *const Guid, out: *mut *m
     if desc.is_null() {
         return failed!(E_INVALIDARG, "CreateHeap: null desc");
     }
-    let mut d = *desc;
+    let mut d = std::ptr::read_unaligned(desc);
     if d.Alignment == 0 {
         d.Alignment = d3d12_metal::metal::resource::DEFAULT_ALIGNMENT;
     }
@@ -60,7 +60,7 @@ pub unsafe fn create_heap(desc: *const HeapDesc, riid: *const Guid, out: *mut *m
 }
 
 unsafe extern "win64" fn heap_get_desc(this: PH, ret: *mut HeapDesc) -> *mut HeapDesc {
-    *ret = Obj::get(this).h.desc;
+    std::ptr::write_unaligned(ret, Obj::get(this).h.desc);
     ret
 }
 
@@ -86,7 +86,7 @@ pub unsafe fn create_placed_resource(
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }
-    let d = *desc;
+    let d = std::ptr::read_unaligned(desc);
     let h = &Obj::get(h).h;
     let r = match MtlResource::new_placed_default(h, offset, &d, "") {
         Ok(r) => r,

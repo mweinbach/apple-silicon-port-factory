@@ -147,11 +147,21 @@ pub struct ClearValue {
 
 /// `D3D12_RESOURCE_ALLOCATION_INFO`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocationInfo {
     pub SizeInBytes: u64,
     pub Alignment: u64,
 }
+
+/// `D3D12_RESOURCE_ALLOCATION_INFO1`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocationInfo1 {
+    pub Offset: u64,
+    pub Alignment: u64,
+    pub SizeInBytes: u64,
+}
+const _: () = assert!(std::mem::size_of::<AllocationInfo1>() == 24);
 
 /// `D3D12_COMMAND_QUEUE_DESC` (16 bytes).
 #[repr(C)]
