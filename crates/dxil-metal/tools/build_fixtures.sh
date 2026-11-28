@@ -32,6 +32,15 @@ FIXTURES=(
     "../d3d12-metal/tests/fixtures/mesh.hlsl ../d3d12-metal/tests/fixtures/mesh.ps.dxil ps_6_5 mainPS"
     # d3d12-metal inline ray query GPU test (tests/gpu_rayquery.rs).
     "../d3d12-metal/tests/fixtures/rayquery.hlsl ../d3d12-metal/tests/fixtures/rayquery.cs.dxil cs_6_5 main"
+    # d3d12-metal tessellation GPU test (tests/gpu_tessellation.rs), SM 6.6 with PSV0 v2.
+    "../d3d12-metal/tests/fixtures/tessellation.hlsl ../d3d12-metal/tests/fixtures/tess_tri.vs.dxil vs_6_6 VS_Tri -validator-version 1.6"
+    "../d3d12-metal/tests/fixtures/tessellation.hlsl ../d3d12-metal/tests/fixtures/tess_tri.hs.dxil hs_6_6 HS_Tri -validator-version 1.6"
+    "../d3d12-metal/tests/fixtures/tessellation.hlsl ../d3d12-metal/tests/fixtures/tess_tri.ds.dxil ds_6_6 DS_Tri -validator-version 1.6"
+    "../d3d12-metal/tests/fixtures/tessellation.hlsl ../d3d12-metal/tests/fixtures/tess_quad.vs.dxil vs_6_6 VS_Quad -validator-version 1.6"
+    "../d3d12-metal/tests/fixtures/tessellation.hlsl ../d3d12-metal/tests/fixtures/tess_quad.hs.dxil hs_6_6 HS_Quad -validator-version 1.6"
+    "../d3d12-metal/tests/fixtures/tessellation.hlsl ../d3d12-metal/tests/fixtures/tess_quad.ds.dxil ds_6_6 DS_Quad -validator-version 1.6"
+    "../d3d12-metal/tests/fixtures/tessellation.hlsl ../d3d12-metal/tests/fixtures/tess_swizzle.gs.dxil gs_6_6 GS_Swizzle -validator-version 1.6"
+    "../d3d12-metal/tests/fixtures/tessellation.hlsl ../d3d12-metal/tests/fixtures/tess_color.ps.dxil ps_6_6 PS_Color -validator-version 1.6"
 )
 
 DXC_BIN="${DXC:-$(command -v dxc || true)}"

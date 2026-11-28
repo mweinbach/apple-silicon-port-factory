@@ -377,12 +377,6 @@ fn graphics_state(d: &GraphicsPipeline, mesh: bool, out: &mut Outcome) -> Option
 fn graphics(p: &ShaderPipeline, index: u64, d: &GraphicsPipeline, rs: &Result<Option<Arc<RootSignature>>, String>) -> Outcome {
     let mut out = Outcome { index, ..Default::default() };
     let has_tess = !d.hs.is_empty() || !d.ds.is_empty();
-    if has_tess {
-        out.unsupported.push("tessellation (HS/DS)");
-    }
-    if !d.gs.is_empty() {
-        out.unsupported.push("geometry shader");
-    }
     // D3D12_STREAM_OUTPUT_DESC: pSODeclaration (8), NumEntries (4) ...
     if d.stream_output.get(8..12).is_some_and(|n| u32::from_le_bytes(n.try_into().unwrap()) != 0) {
         out.unsupported.push("stream output");
@@ -402,6 +396,7 @@ fn graphics(p: &ShaderPipeline, index: u64, d: &GraphicsPipeline, rs: &Result<Op
 
     let mut base = CompileOptions::default();
     if has_tess || !d.gs.is_empty() {
+        base.geometry_tessellation_emulation = true;
         base.input_topology = Some(topology::input_topology(d.primitive_topology_type));
     }
     if let Some(vs) = compile(p, &mut out, ShaderStage::Vertex, d.vs, rs, &base) {

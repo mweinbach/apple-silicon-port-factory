@@ -1100,6 +1100,76 @@ impl CommandList {
         self.compute_op_tight_exact(op_stage, disp_uav, disp_read_or_touch, op_touch, None)
     }
 
+    /// Ensure a compute/blit op touching `op_touch` waits for prior render-pass writes
+    /// recorded in `self.bar.written` when no explicit barrier has already queued a
+    /// `Fragment -> op_stage` wait. Must run after `end_encoder()` when transitioning
+    /// from an open render pass so the closing pass's `pass_targets` are in `written`
+    /// with its updated `stage_gen[STAGE_FRAGMENT]`.
+    fn sync_written_rt_for_compute(
+        &mut self,
+        op_stage: MTLStages,
+        op_touch: Option<&[usize]>,
+        ps_to_cs_soft: bool,
+    ) {
+        if self.is_copy_queue_light() {
+            return;
+        }
+        let Some(t) = op_touch else {
+            return;
+        };
+        let already = if self.render_split_sync_active() {
+            self.bar
+                .split_pend
+                .after_for_compute_stage(op_stage)
+                .contains(MTLStages::Fragment)
+        } else {
+            self.bar.pend_after.contains(MTLStages::Fragment)
+        };
+        if !already && t.iter().any(|r| *r != 0 && self.bar.written.contains(r)) {
+            if ps_to_cs_soft
+                && self.ps_to_cs_active()
+                && op_stage == MTLStages::Dispatch
+                && self.render_split_sync_active()
+                && !t.contains(&0)
+            {
+                if matches!(self.enc, Encoder::Compute(_)) {
+                    let mid_on = self.mid_qb_stagesync_active();
+                    if !self
+                        .unsatisfied_enc_after_for(
+                            MTLStages::Fragment,
+                            MTLStages::Dispatch,
+                            mid_on,
+                        )
+                        .is_empty()
+                        && self.opts.opt_cs_mid_qb_unpoison_v4
+                    {
+                        self.bar.cs_mid_v3_poisoned[0] = true;
+                    }
+                    if !self.opts.opt_cs_mid_qb_unpoison_v4 {
+                        self.bar.cs_mid_v3_poisoned = [true; 3];
+                    }
+                }
+                self.bar.pend_cs_poisoned[0] = true;
+                self.bar.pend_after |= MTLStages::Fragment;
+                self.bar.pend_before |= MTLStages::Dispatch;
+                let req = self.cur_producer_gen();
+                self.bar.split_pend.add_with_req(
+                    MTLStages::Fragment,
+                    MTLStages::Dispatch,
+                    [MTLStages::empty(); 2],
+                    req,
+                );
+                for &r in t {
+                    if r != 0 && self.bar.written.contains(&r) {
+                        self.record_cs_soft_disp(r, MTLStages::Fragment, req);
+                    }
+                }
+            } else {
+                self.add_pend(MTLStages::Fragment, op_stage);
+            }
+        }
+    }
+
     pub(super) fn compute_op_tight_exact(
         &mut self,
         op_stage: MTLStages,
@@ -1110,62 +1180,9 @@ impl CommandList {
     ) -> Option<Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>> {
         self.flush_icb_prepass_if_pending();
         let copy_light = self.is_copy_queue_light();
-        if !copy_light {
-            if let Some(t) = op_touch {
-                let already = if self.render_split_sync_active() {
-                    self.bar
-                        .split_pend
-                        .after_for_compute_stage(op_stage)
-                        .contains(MTLStages::Fragment)
-                } else {
-                    self.bar.pend_after.contains(MTLStages::Fragment)
-                };
-                if !already && t.iter().any(|r| *r != 0 && self.bar.written.contains(r)) {
-                    if self.ps_to_cs_active()
-                        && op_stage == MTLStages::Dispatch
-                        && self.render_split_sync_active()
-                        && !t.contains(&0)
-                    {
-                        if matches!(self.enc, Encoder::Compute(_)) {
-                            let mid_on = self.mid_qb_stagesync_active();
-                            if !self
-                                .unsatisfied_enc_after_for(
-                                    MTLStages::Fragment,
-                                    MTLStages::Dispatch,
-                                    mid_on,
-                                )
-                                .is_empty()
-                                && self.opts.opt_cs_mid_qb_unpoison_v4
-                            {
-                                self.bar.cs_mid_v3_poisoned[0] = true;
-                            }
-                            if !self.opts.opt_cs_mid_qb_unpoison_v4 {
-                                self.bar.cs_mid_v3_poisoned = [true; 3];
-                            }
-                        }
-                        self.bar.pend_cs_poisoned[0] = true;
-                        self.bar.pend_after |= MTLStages::Fragment;
-                        self.bar.pend_before |= MTLStages::Dispatch;
-                        let req = self.cur_producer_gen();
-                        self.bar.split_pend.add_with_req(
-                            MTLStages::Fragment,
-                            MTLStages::Dispatch,
-                            [MTLStages::empty(); 2],
-                            req,
-                        );
-                        for &r in t {
-                            if r != 0 && self.bar.written.contains(&r) {
-                                self.record_cs_soft_disp(r, MTLStages::Fragment, req);
-                            }
-                        }
-                    } else {
-                        self.add_pend(MTLStages::Fragment, op_stage);
-                    }
-                }
-            }
-        }
         if let Encoder::Compute(e) = &self.enc {
             let e = e.clone();
+            self.sync_written_rt_for_compute(op_stage, op_touch, true);
             if op_stage != MTLStages::Blit && !copy_light {
                 self.upgrade_blit_only_compute_sync(&e);
             }
@@ -1589,6 +1606,7 @@ impl CommandList {
             return Some(e);
         }
         self.end_encoder();
+        self.sync_written_rt_for_compute(op_stage, op_touch, true);
         let e = self.cb.computeCommandEncoder()?;
         self.bar.has_gpu_work = true;
         stats::inc(&stats::c::compute_enc);
@@ -1812,24 +1830,9 @@ impl CommandList {
                 }
             }
         }
-        if !self.is_copy_queue_light() {
-            if let Some(t) = touch {
-                let stage = self.bar.opening_compute_stage;
-                let already = if self.render_split_sync_active() {
-                    self.bar
-                        .split_pend
-                        .after_for_compute_stage(stage)
-                        .contains(MTLStages::Fragment)
-                } else {
-                    self.bar.pend_after.contains(MTLStages::Fragment)
-                };
-                if !already && t.iter().any(|r| *r != 0 && self.bar.written.contains(r)) {
-                    self.add_pend(MTLStages::Fragment, stage);
-                }
-            }
-        }
         if let Encoder::Compute(e) = &self.enc {
             let e = e.clone();
+            self.sync_written_rt_for_compute(self.bar.opening_compute_stage, touch, false);
             if self.bar.opening_compute_stage != MTLStages::Blit && !self.is_copy_queue_light() {
                 self.upgrade_blit_only_compute_sync(&e);
             }
@@ -1862,6 +1865,7 @@ impl CommandList {
             return Some(e);
         }
         self.end_encoder();
+        self.sync_written_rt_for_compute(self.bar.opening_compute_stage, touch, false);
         let e = self.cb.computeCommandEncoder()?;
         self.bar.has_gpu_work = true;
         stats::inc(&stats::c::compute_enc);

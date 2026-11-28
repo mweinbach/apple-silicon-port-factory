@@ -553,9 +553,8 @@ unsafe fn create_graphics_inner(g: GfxParts, what: &str, riid: *const Guid, out:
         }
         return finish_pso(PipelineKind::Compute(Arc::new(p)), g.root_signature, riid, out);
     }
-    let unsupported = [(g.ds.is_some(), "domain shader"), (g.hs.is_some(), "hull shader"), (g.stream_output, "stream output")];
-    if let Some((_, s)) = unsupported.iter().find(|(b, _)| *b) {
-        return failed!(E_NOTIMPL, "{what}: {s} pipelines are not implemented");
+    if g.stream_output {
+        return failed!(E_NOTIMPL, "{what}: stream output pipelines are not implemented");
     }
     if let Some(s) = g.other_stage {
         return failed!(E_NOTIMPL, "{what}: {s} pipelines are not implemented");
@@ -564,8 +563,8 @@ unsafe fn create_graphics_inner(g: GfxParts, what: &str, riid: *const Guid, out:
         if !d3d12_metal::mesh::enabled() {
             return failed!(E_NOTIMPL, "{what}: mesh shader pipelines disabled (set PORT_MESH_SHADERS=1)");
         }
-        if g.vs.is_some() {
-            return failed!(E_INVALIDARG, "{what}: both a vertex and a mesh shader");
+        if g.vs.is_some() || g.hs.is_some() || g.ds.is_some() || g.gs.is_some() {
+            return failed!(E_INVALIDARG, "{what}: mesh shader cannot be combined with VS/HS/DS/GS");
         }
         let desc = d3d12_metal::mesh::MeshDesc {
             amplification: g.amplification.and_then(|b| b.bytes()),
@@ -610,20 +609,48 @@ unsafe fn create_graphics_inner(g: GfxParts, what: &str, riid: *const Guid, out:
         dsv_format: g.dsv_format,
         sample_count: g.sample_count.max(1),
     };
+    let hs_bytes = g.hs.and_then(|b| b.bytes());
+    let ds_bytes = g.ds.and_then(|b| b.bytes());
+    let gs_bytes = g.gs.and_then(|b| b.bytes());
+    if hs_bytes.is_some() != ds_bytes.is_some() {
+        return failed!(E_INVALIDARG, "{what}: hull and domain shaders must both be set or both omitted");
+    }
     let scope = crate::hitch::Scope::enter(crate::hitch::ActKind::PsoCompile, vs.len() as u64);
-    let p = match g.gs.and_then(|b| b.bytes()) {
-        Some(gs) => match d3d12_metal::metal::pipeline::GraphicsPipeline::new_with_geometry(rs.rs.clone(), &desc, gs, "") {
-            Ok(p) => p,
+    let (hitch_tag, p) = match (hs_bytes, ds_bytes, gs_bytes) {
+        (Some(hs), Some(ds), gs) => match d3d12_metal::metal::pipeline::GraphicsPipeline::new_with_tessellation(
+            rs.rs.clone(),
+            &desc,
+            hs,
+            ds,
+            gs,
+            "",
+        ) {
+            Ok(p) => (if gs.is_some() { "VS+HS+DS+GS+PS" } else { "VS+HS+DS+PS" }, p),
+            Err(e) => return failed!(
+                E_INVALIDARG,
+                "{what}(VS {} bytes, HS {} bytes, DS {} bytes, GS {} bytes, PS {} bytes, RTs {:?}, DSV {}): {e}",
+                vs.len(),
+                hs.len(),
+                ds.len(),
+                gs.map_or(0, |b| b.len()),
+                desc.ps.map_or(0, |b| b.len()),
+                desc.rtv_formats,
+                desc.dsv_format
+            ),
+        },
+        (None, None, Some(gs)) => match d3d12_metal::metal::pipeline::GraphicsPipeline::new_with_geometry(rs.rs.clone(), &desc, gs, "") {
+            Ok(p) => ("VS+GS+PS", p),
             Err(e) => return failed!(E_INVALIDARG, "{what}(VS {} bytes, GS {} bytes, PS {} bytes, RTs {:?}, DSV {}): {e}", vs.len(), gs.len(), desc.ps.map_or(0, |b| b.len()), desc.rtv_formats, desc.dsv_format),
         },
-        None => match d3d12_metal::metal::pipeline::GraphicsPipeline::new(rs.rs.clone(), &desc, "") {
-            Ok(p) => p,
+        (None, None, None) => match d3d12_metal::metal::pipeline::GraphicsPipeline::new(rs.rs.clone(), &desc, "") {
+            Ok(p) => ("VS+PS", p),
             Err(e) => return failed!(E_INVALIDARG, "{what}(VS {} bytes, PS {} bytes, RTs {:?}, DSV {}): {e}", vs.len(), desc.ps.map_or(0, |b| b.len()), desc.rtv_formats, desc.dsv_format),
         },
+        _ => unreachable!(),
     };
     let elapsed_ns = scope.elapsed_ns();
     drop(scope);
-    crate::hitch::record_pso("VS+PS", &p.vs.function_name, elapsed_ns);
+    crate::hitch::record_pso(hitch_tag, &p.vs.function_name, elapsed_ns);
     log::debug!(
         target: "d3d",
         "{what}: {} / {} RTs {:?} DSV {} topology type {} in {:?}",
