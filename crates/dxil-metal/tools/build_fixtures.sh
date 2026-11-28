@@ -20,6 +20,10 @@ FIXTURES=(
     "tests/fixtures/static_samplers.hlsl tests/fixtures/static_samplers.cs.dxil cs_6_0 main"
     # Validator 1.0 output: PSV0 without the entry name, so the entry comes from the bitcode.
     "tests/fixtures/entry_v2.hlsl tests/fixtures/entry_v2.vs.dxil vs_6_0 mainVS -validator-version 1.0"
+    # SM 6.6 Hull shaders with PSV0 v2 (validator 1.6): entry point lives in !dx.entryPoints
+    # metadata alongside the patch-constant function.
+    "tests/fixtures/entry_hull.hlsl tests/fixtures/entry_hull_v2.hs.dxil hs_6_6 HS_Custom -validator-version 1.6"
+    "tests/fixtures/entry_hull.hlsl tests/fixtures/entry_hull_passthrough.hs.dxil hs_6_6 HS_PassThrough -validator-version 1.6"
     "../d3d12-metal/tests/fixtures/read_texture.hlsl ../d3d12-metal/tests/fixtures/read_texture.vs.dxil vs_6_0 main"
     # d3d12-metal mesh-shader GPU test (tests/gpu_mesh.rs).
     "../d3d12-metal/tests/fixtures/mesh.hlsl ../d3d12-metal/tests/fixtures/mesh.as.dxil as_6_5 mainAS"
