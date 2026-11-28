@@ -10617,3 +10617,275 @@ fn xa_window_512b_caching_and_24bit_add_imm() {
     assert_eq!(jit_0, interp, "Live JIT (memchk=0, hw_range=1) != interpreter");
     assert_eq!(aot_15, interp, "AOT (memchk=15) != interpreter");
 }
+
+/// Verifies:
+/// 1. Direct single-instruction `K_ROT_RI` (`ror`/`rol` 32/64-bit, dead & live CF/OF, upper-32 zeroing)
+///    and `K_NOT_R` (`not` 32/64-bit) codegen + JIT/AOT/interpreter parity.
+/// 2. Direct single-instruction register-offset `ldr`/`str [base, idx{, lsl #s}]` under non-TSO
+///    (8/16/32/64-bit, scaled & unscaled, preserving cached `XA`).
+/// 3. Shared 512-byte `XA` base-window caching across `vec256_mem_op`, `vec128_mem_op`, and scalar
+///    memory accesses (plus isolation across non-whitelisted vector ops).
+/// 4. Static tail-jump `plain_call` and `emit_inline_plain_fast_path` returning via shadow RAS
+///    (`ret x2`) instead of `lookup_rip`, matching interpreter parity across repeated calls.
+#[test]
+fn tail_plain_ras_single_insn_rot_not_ldst_reg_and_vec_xa_cache() {
+    use iced_x86::code_asm::*;
+
+    // --- Part 1: verify exact AOT codegen for ror/not, ldst_reg, vec XA caching, and tail RAS ---
+    let mut bc = Box::new(BlockCache::new());
+    let bcp: *mut BlockCache = &mut *bc;
+    let mut stub_buf = vec![0u32; jit::AOT_STUBS_BYTES / 4];
+    let stubs = unsafe { jit::aot_emit_stubs(stub_buf.as_mut_ptr(), 0x10_0000).expect("stubs") };
+    let mut tr_sc = jit::TrScratch::new();
+
+    // 1a. 32-bit ror + 64-bit rol + 32/64-bit not must emit direct single instructions (no mov T0/T1).
+    let rot_ptr = arena_alloc(0x100, 16);
+    let rot_va = rot_ptr as u64;
+    let rot_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.ror(eax, 27)?;
+        a.rol(rcx, 13)?;
+        a.not(edx)?;
+        a.not(r8)?;
+        a.ret()?;
+        a.assemble(rot_va)
+    })()
+    .unwrap();
+    unsafe {
+        core::ptr::copy_nonoverlapping(rot_code.as_ptr(), rot_ptr, rot_code.len());
+        jit::test_set_knobs(jit::TestKnobs {
+            hw_range: Some(true),
+            last_bits: Some(false),
+            ..jit::TestKnobs::NONE
+        });
+        let blk = jit::aot_translate(bcp, rot_va, 0x10_0000, 0x10_0000, &stubs, &mut Vec::new(), &mut tr_sc)
+            .expect("aot_translate rot/not");
+        let main = &blk.words[..blk.main as usize];
+        // Direct `extr w19, w19, w19, #27` (ror w19, w19, #27): 0x13936E73
+        assert!(main.contains(&0x1393_6E73), "expected direct `ror w19, w19, #27`, got {main:#x?}");
+        // Direct `extr x20, x20, x20, #51` (ror x20, x20, #51 for rol 13): 0x93D4CE94
+        assert!(main.contains(&0x93D4_CE94), "expected direct `ror x20, x20, #51`, got {main:#x?}");
+        // Direct `orn w21, wzr, w21` (mvn w21, w21): 0x2A3503F5
+        assert!(main.contains(&0x2A35_03F5), "expected direct `mvn w21, w21`, got {main:#x?}");
+        // Direct `orn x27, xzr, x27` (mvn x27, x27; r8 = x27): 0xAA3B03FB
+        assert!(main.contains(&0xAA3B_03FB), "expected direct `mvn x27, x27`, got {main:#x?}");
+    }
+
+    // 1b. Non-TSO `[base + idx*scale]` (disp == 0) must emit direct `ldr`/`str [base, idx, lsl #s]`.
+    let idx_ptr = arena_alloc(0x100, 16);
+    let idx_va = idx_ptr as u64;
+    let idx_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.mov(rax, qword_ptr(rcx + rdx * 8))?;
+        a.mov(qword_ptr(rcx + rdx), rax)?;
+        a.mov(r8d, dword_ptr(rcx + rdx * 4))?;
+        a.mov(byte_ptr(rcx + rdx), r8b)?;
+        a.ret()?;
+        a.assemble(idx_va)
+    })()
+    .unwrap();
+    unsafe {
+        core::ptr::copy_nonoverlapping(idx_code.as_ptr(), idx_ptr, idx_code.len());
+        crate::emu::mem::TEST_NO_TSO.with(|c| c.set(true));
+        let blk = jit::aot_translate(bcp, idx_va, 0x10_0000, 0x10_0000, &stubs, &mut Vec::new(), &mut tr_sc)
+            .expect("aot_translate idx");
+        crate::emu::mem::TEST_NO_TSO.with(|c| c.set(false));
+        let main = &blk.words[..blk.main as usize];
+        // `ldr x19, [x20, x21, lsl #3]` = 0xF8757A93
+        assert!(main.contains(&0xF875_7A93), "expected direct `ldr x19, [x20, x21, lsl #3]`, got {main:#x?}");
+        // `str x19, [x20, x21]` = 0xF8356A93
+        assert!(main.contains(&0xF835_6A93), "expected direct `str x19, [x20, x21]`, got {main:#x?}");
+        // `ldr w27, [x20, x21, lsl #2]` = 0xB8757A9B (r8 = x27)
+        assert!(main.contains(&0xB875_7A9B), "expected direct `ldr w27, [x20, x21, lsl #2]`, got {main:#x?}");
+        // `strb w27, [x20, x21]` = 0x38356A9B (r8 = x27)
+        assert!(main.contains(&0x3835_6A9B), "expected direct `strb w27, [x20, x21]`, got {main:#x?}");
+    }
+
+    // 1c. Shared 512B XA window across vec256 -> scalar -> vec128: only 1 `add x16, x20, #0x600`.
+    let vec_ptr = arena_alloc(0x100, 16);
+    let vec_va = vec_ptr as u64;
+    let vec_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.vmovups(ymm0, ymmword_ptr(rcx + 0x520))?;
+        a.mov(qword_ptr(rcx + 0x540), rax)?;
+        a.vmovups(xmmword_ptr(rcx + 0x550), xmm0)?;
+        a.vzeroupper()?;
+        a.ret()?;
+        a.assemble(vec_va)
+    })()
+    .unwrap();
+    unsafe {
+        core::ptr::copy_nonoverlapping(vec_code.as_ptr(), vec_ptr, vec_code.len());
+        let blk = jit::aot_translate(bcp, vec_va, 0x10_0000, 0x10_0000, &stubs, &mut Vec::new(), &mut tr_sc)
+            .expect("aot_translate vec xa");
+        let main = &blk.words[..blk.main as usize];
+        // Count `add/sub x16, x20, #imm` (`(w & 0xBF80_03FF) == 0x9100_0290`): must be 1!
+        let xa_adds = main.iter().filter(|&&w| (w & 0xBF80_03FF) == 0x9100_0290).count();
+        assert_eq!(xa_adds, 1, "expected 1 shared XA window add across vec256+scalar+vec128, got {xa_adds} in {main:#x?}");
+    }
+
+    // 1d. Static tail-jump `plain_call` & inline fast path (`GetLastError`) must emit `ret x2` (0xD65F0040).
+    let exp = |dll: &str, name: &str| -> usize {
+        win32_rt::lookup(dll, name).expect("builtin export") as usize
+    };
+    let tail_va_gle = arena_alloc(0x40, 16) as u64;
+    let tail_va_errno = arena_alloc(0x40, 16) as u64;
+    crate::exe::register_native_va(tail_va_gle, exp("kernel32.dll", "GetLastError"));
+    crate::exe::register_native_va(tail_va_errno, exp("ucrtbase.dll", "_errno"));
+
+    let thunk_ptr = arena_alloc(0x100, 16);
+    let thunk_gle_va = thunk_ptr as u64;
+    let thunk_errno_va = thunk_gle_va + 0x20;
+    let t1 = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.jmp(tail_va_gle)?;
+        a.assemble(thunk_gle_va)
+    })()
+    .unwrap();
+    let t2 = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        a.jmp(tail_va_errno)?;
+        a.assemble(thunk_errno_va)
+    })()
+    .unwrap();
+    unsafe {
+        core::ptr::copy_nonoverlapping(t1.as_ptr(), thunk_ptr, t1.len());
+        core::ptr::copy_nonoverlapping(t2.as_ptr(), thunk_ptr.add(0x20), t2.len());
+        jit::test_set_knobs(jit::TestKnobs { ras: Some(true), ..jit::TestKnobs::NONE });
+        let blk_gle = jit::aot_translate(bcp, thunk_gle_va, 0x10_0000, 0x10_0000, &stubs, &mut Vec::new(), &mut tr_sc)
+            .expect("aot_translate tail gle");
+        let blk_err = jit::aot_translate(bcp, thunk_errno_va, 0x10_0000, 0x10_0000, &stubs, &mut Vec::new(), &mut tr_sc)
+            .expect("aot_translate tail errno");
+        // `ret x2` = 0xD65F0040 (appears twice in inline fast-path block: fast + slow tail return).
+        let ret_x2_gle = blk_gle.words[..blk_gle.main as usize].iter().filter(|&&w| w == 0xD65F_0040).count();
+        let ret_x2_err = blk_err.words[..blk_err.main as usize].iter().filter(|&&w| w == 0xD65F_0040).count();
+        assert!(ret_x2_gle >= 2, "expected inline+slow RAS `ret x2` in tail GetLastError, got {ret_x2_gle}");
+        assert_eq!(ret_x2_err, 1, "expected RAS `ret x2` in tail _errno, got {ret_x2_err}");
+    }
+
+    // --- Part 2: End-to-end JIT / AOT / interpreter parity across all 4 optimizations ---
+    let data_ptr = arena_alloc(0x1000, 64);
+    let mut init = vec![0u8; 0x1000];
+    for (i, b) in init.iter_mut().enumerate() {
+        *b = ((i as u32).wrapping_mul(37).wrapping_add(13) & 0xFF) as u8;
+    }
+
+    let exec_ptr = arena_alloc(0x800, 16);
+    let exec_va = exec_ptr as u64;
+    let exec_code = (|| -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        let mut lp = a.create_label();
+        a.push(rbx)?;
+        a.push(r12)?;
+        a.sub(rsp, 0x28)?;
+        a.mov(rbx, rcx)?; // rbx = data buffer
+
+        // Exercise 32/64-bit ror/rol (with dead & live CF/OF) + 32/64-bit not + upper-32 zeroing.
+        a.mov(rax, 0xDEAD_BEEF_1234_5678u64 as i64)?;
+        a.ror(eax, 27)?; // clears upper 32 bits
+        a.mov(qword_ptr(rbx + 0x00), rax)?;
+        a.mov(rax, 0x8000_0001u64 as i64)?;
+        a.ror(eax, 1)?; // CF=1, OF=1^0=1
+        a.setc(r10b)?;
+        a.seto(r11b)?;
+        a.mov(dword_ptr(rbx + 0x08), eax)?;
+        a.mov(byte_ptr(rbx + 0x0C), r10b)?;
+        a.mov(byte_ptr(rbx + 0x0D), r11b)?;
+        a.mov(rax, 0xF000_0000_0000_0001u64 as i64)?;
+        a.rol(rax, 1)?; // CF=1, OF=MSB^CF=1^1=0
+        a.setc(r10b)?;
+        a.seto(r11b)?;
+        a.mov(qword_ptr(rbx + 0x10), rax)?;
+        a.mov(byte_ptr(rbx + 0x18), r10b)?;
+        a.mov(byte_ptr(rbx + 0x19), r11b)?;
+        a.mov(rax, 0xAAAA_BBBB_1122_3344u64 as i64)?;
+        a.not(eax)?; // clears upper 32 bits
+        a.mov(qword_ptr(rbx + 0x20), rax)?;
+        a.mov(rcx, 0x0123_4567_89AB_CDEFu64 as i64)?;
+        a.not(rcx)?;
+        a.mov(qword_ptr(rbx + 0x28), rcx)?;
+
+        // Exercise register-indexed loads/stores (8/16/32/64-bit, scaled & unscaled).
+        a.mov(rdx, 3u64)?;
+        a.mov(rax, qword_ptr(rbx + rdx * 8))?;
+        a.mov(r8d, dword_ptr(rbx + rdx * 4))?;
+        a.movzx(r9d, word_ptr(rbx + rdx * 2))?;
+        a.movzx(r10d, byte_ptr(rbx + rdx))?;
+        a.xor(rax, r8)?;
+        a.add(rax, r9)?;
+        a.add(rax, r10)?;
+        a.mov(qword_ptr(rbx + rdx * 8 + 0x40), rax)?;
+        a.mov(rdx, 0x60u64)?;
+        a.mov(qword_ptr(rbx + rdx), rax)?;
+        a.mov(dword_ptr(rbx + rdx), r8d)?;
+        a.mov(word_ptr(rbx + rdx), r9w)?;
+        a.mov(byte_ptr(rbx + rdx), r10b)?;
+
+        // Exercise vec256 + scalar + vec128 sharing 512B XA window + non-whitelisted vpaddd isolation.
+        a.vmovups(ymm0, ymmword_ptr(rbx + 0x520))?;
+        a.mov(r11, qword_ptr(rbx + 0x540))?;
+        a.vmovups(xmm1, xmmword_ptr(rbx + 0x550))?;
+        a.vpaddd(ymm0, ymm0, ymmword_ptr(rbx + 0x560))?;
+        a.vmovups(ymmword_ptr(rbx + 0x580), ymm0)?;
+        a.vmovups(xmmword_ptr(rbx + 0x5A0), xmm1)?;
+        a.mov(qword_ptr(rbx + 0x5B0), r11)?;
+        a.vzeroupper()?;
+
+        // Exercise static tail-jump plain_call & inline fast path via RAS in a loop.
+        a.mov(r12d, 8)?;
+        a.xor(r11, r11)?;
+        a.set_label(&mut lp)?;
+        a.call(thunk_gle_va)?;
+        a.add(r11, rax)?;
+        a.call(thunk_errno_va)?;
+        a.mov(eax, dword_ptr(rax))?;
+        a.add(r11, rax)?;
+        a.sub(r12d, 1)?;
+        a.jne(lp)?;
+        a.mov(qword_ptr(rbx + 0x70), r11)?;
+
+        a.mov(rax, qword_ptr(rbx + 0x70))?;
+        a.add(rsp, 0x28)?;
+        a.pop(r12)?;
+        a.pop(rbx)?;
+        a.ret()?;
+        a.assemble(exec_va)
+    })()
+    .unwrap();
+
+    let run_cfg = |mode: u8, tso: bool, use_aot: bool| -> (u64, Vec<u8>) {
+        unsafe {
+            core::ptr::copy_nonoverlapping(exec_code.as_ptr(), exec_ptr, exec_code.len());
+            crate::emu::mem::TEST_NO_TSO.with(|c| c.set(!tso));
+            jit::test_set_knobs(jit::TestKnobs {
+                ras: Some(true),
+                hw_range: Some(true),
+                lse2_trap: Some(true),
+                ..jit::TestKnobs::NONE
+            });
+            if use_aot {
+                aot::test_uninstall();
+                let (live, _, _) = aot::test_install(&[exec_va, thunk_gle_va, thunk_errno_va], || {});
+                assert_eq!(live, 3, "AOT install failed");
+            }
+            let res = run_mode(exec_ptr, data_ptr, &init, mode);
+            if use_aot {
+                aot::test_uninstall();
+            }
+            crate::emu::mem::TEST_NO_TSO.with(|c| c.set(false));
+            res
+        }
+    };
+
+    let interp = run_cfg(2, true, false);
+    let jit_tso = run_cfg(1, true, false);
+    let jit_notso = run_cfg(1, false, false);
+    let aot_notso = run_cfg(1, false, true);
+    crate::exe::unregister_native_va(tail_va_gle);
+    crate::exe::unregister_native_va(tail_va_errno);
+    jit::test_set_knobs(jit::TestKnobs::NONE);
+
+    assert_eq!(jit_tso, interp, "Live JIT (TSO) != interpreter");
+    assert_eq!(jit_notso, interp, "Live JIT (non-TSO) != interpreter");
+    assert_eq!(aot_notso, interp, "AOT (non-TSO) != interpreter");
+}

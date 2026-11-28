@@ -754,6 +754,46 @@ impl Tr<'_> {
                 }
                 return;
             }
+            // Large 16B-aligned displacement `[base + disp]` under `hw_range_enabled()`:
+            // share the 512-byte `XA = base + hi` window cache with scalar/vec accesses
+            // and emit a single `ldp q`/`stp q [XA, #lo]`.
+            if hw_range_enabled() && d % 16 == 0 {
+                let cached_lo = match self.xa_key {
+                    Some((kb, RNONE, 0, prev_hi)) if kb == op.base => d
+                        .checked_sub(prev_hi)
+                        .filter(|lo| lo % 16 == 0 && (-1024..=1008).contains(lo)),
+                    _ => None,
+                };
+                let lo = if let Some(lo) = cached_lo {
+                    Some(lo)
+                } else if let Some(sum) = d.checked_add(256) {
+                    let hi = sum & !0x1FF;
+                    let lo = d.wrapping_sub(hi);
+                    if hi != 0 && lo % 16 == 0 && (-1024..=1008).contains(&lo) {
+                        self.a.add_imm(true, XA, b, hi);
+                        self.xa_key = Some((op.base, RNONE, 0u8, hi));
+                        Some(lo)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(lo) = lo {
+                    if !ld && tso {
+                        self.a.dmb_ishst();
+                    }
+                    if ld {
+                        self.a.ldp_q(v_lo, v_hi, XA, lo as i32);
+                    } else {
+                        self.a.stp_q(v_lo, v_hi, XA, lo as i32);
+                    }
+                    if ld && tso {
+                        self.a.dmb_ishld();
+                    }
+                    return;
+                }
+            }
         }
         let a = self.addr_into(op, XA);
         if chk == Chk::Full && !hw_range_enabled() {
@@ -1003,6 +1043,46 @@ impl Tr<'_> {
                     self.a.dmb_ishld();
                 }
                 return;
+            }
+            // Large or unaligned-negative displacement `[base + disp]` under `hw_range_enabled()`:
+            // share the 512-byte `XA = base + hi` window cache with scalar/vec accesses and emit
+            // direct `ldur q`/`stur q [XA, #lo]`.
+            if hw_range_enabled() {
+                let cached_lo = match self.xa_key {
+                    Some((kb, RNONE, 0, prev_hi)) if kb == op.base => {
+                        d.checked_sub(prev_hi).filter(|lo| (-256..=255).contains(lo))
+                    }
+                    _ => None,
+                };
+                let lo = if let Some(lo) = cached_lo {
+                    Some(lo)
+                } else if let Some(sum) = d.checked_add(256) {
+                    let hi = sum & !0x1FF;
+                    let lo = d.wrapping_sub(hi);
+                    if hi != 0 && (-256..=255).contains(&lo) {
+                        self.a.add_imm(true, XA, b, hi);
+                        self.xa_key = Some((op.base, RNONE, 0u8, hi));
+                        Some(lo)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(lo) = lo {
+                    if !ld && tso {
+                        self.a.dmb_ishst();
+                    }
+                    if ld {
+                        self.a.ldur_q(v, XA, lo as i32);
+                    } else {
+                        self.a.stur_q(v, XA, lo as i32);
+                    }
+                    if ld && tso {
+                        self.a.dmb_ishld();
+                    }
+                    return;
+                }
             }
         }
         let a = self.addr_into(op, XA);

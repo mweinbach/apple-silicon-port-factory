@@ -83,18 +83,12 @@ fn register_translated_instructions(cases: &mut Cases) {
     check(
         "not_ebx",
         &[0xf7, 0xd3],
-        &[
-            ("mvn_orn_log_shift", "mvn w0, w22"),
-            ("mov_orr_log_shift", "mov w22, w0"),
-        ],
+        &[("mvn_orn_log_shift", "mvn w22, w22")],
     );
     check(
         "not_rbx",
         &[0x48, 0xf7, 0xd3],
-        &[
-            ("mvn_orn_log_shift", "mvn x0, x22"),
-            ("mov_orr_log_shift", "mov x22, x0"),
-        ],
+        &[("mvn_orn_log_shift", "mvn x22, x22")],
     );
     check(
         "not_bh",

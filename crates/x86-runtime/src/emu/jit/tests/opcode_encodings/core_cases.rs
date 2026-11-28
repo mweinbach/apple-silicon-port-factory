@@ -869,6 +869,20 @@ fn register_loads_stores_barriers_sysregs(cases: &mut Cases) {
         ldur_stur(false, 64, 20, 22, -43) => "stur_gen", "stur x20, [x22, #-43]";
     );
 
+    check_words!(cases, "ldst_reg";
+        ldst_reg(true, 8, 3, 5, 6, false) => "ldrb_reg", "ldrb w3, [x5, x6]";
+        ldst_reg(false, 8, 4, 5, 6, false) => "strb_reg", "strb w4, [x5, x6]";
+        ldst_reg(true, 16, 7, 9, 10, false) => "ldrh_reg", "ldrh w7, [x9, x10]";
+        ldst_reg(true, 16, 7, 9, 10, true) => "ldrh_reg", "ldrh w7, [x9, x10, lsl #1]";
+        ldst_reg(false, 16, 8, 9, 10, true) => "strh_reg", "strh w8, [x9, x10, lsl #1]";
+        ldst_reg(true, 32, 11, 13, 14, false) => "ldr_reg_gen", "ldr w11, [x13, x14]";
+        ldst_reg(true, 32, 11, 13, 14, true) => "ldr_reg_gen", "ldr w11, [x13, x14, lsl #2]";
+        ldst_reg(false, 32, 12, 13, 14, true) => "str_reg_gen", "str w12, [x13, x14, lsl #2]";
+        ldst_reg(true, 64, 19, 21, 22, false) => "ldr_reg_gen", "ldr x19, [x21, x22]";
+        ldst_reg(true, 64, 19, 21, 22, true) => "ldr_reg_gen", "ldr x19, [x21, x22, lsl #3]";
+        ldst_reg(false, 64, 20, 21, 22, true) => "str_reg_gen", "str x20, [x21, x22, lsl #3]";
+    );
+
     check_words!(cases, "ldapur_stlur";
         ldapur_stlur(true, 8, 3, 5, -13) => "ldapurb", "ldapurb w3, [x5, #-13]";
         ldapur_stlur(false, 8, 4, 6, 19) => "stlurb", "stlurb w4, [x6, #19]";

@@ -103,9 +103,114 @@ pub fn on_present(api: PresentApi, hwnd: usize, present_ns: u64) -> u32 {
     frame
 }
 
-/// Generic scripted input runner (`PORT_INPUT_SCRIPT="900:down,960:enter"`).
+/// Default hold duration (in presented frames) for `PORT_INPUT_SCRIPT` entries
+/// without an explicit `:hold_frames` third field.
+const DEFAULT_SCRIPT_HOLD_FRAMES: u32 = 6;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScriptAction {
+    start: u32,
+    end: u32,
+    name: String,
+    mac_key: Option<(u16, Option<u16>)>,
+    buttons: u16,
+    left_trigger: u8,
+    right_trigger: u8,
+    thumb_lx: i16,
+    thumb_ly: i16,
+}
+
+fn parse_input_script(script: &str) -> Vec<ScriptAction> {
+    use crate::misc::xinput1_4::btn;
+
+    let mut out = Vec::new();
+    for item in script.split(',') {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split(':');
+        let Some(start_s) = parts.next() else {
+            continue;
+        };
+        let Some(action_s) = parts.next() else {
+            continue;
+        };
+        let hold_s = parts.next();
+        if parts.next().is_some() {
+            continue;
+        }
+        let Ok(start) = start_s.trim().parse::<u32>() else {
+            continue;
+        };
+        let hold = match hold_s {
+            Some(h) => match h.trim().parse::<u32>() {
+                Ok(n) => n.max(1),
+                Err(_) => continue,
+            },
+            None => DEFAULT_SCRIPT_HOLD_FRAMES,
+        };
+        let name = action_s.trim().to_ascii_lowercase();
+        let (mac_key, buttons, left_trigger, right_trigger, thumb_lx, thumb_ly) =
+            match name.as_str() {
+                "enter" => (Some((0x24, Some(0x0D))), btn::A, 0, 0, 0, 0),
+                "space" => (Some((0x31, Some(0x20))), btn::A, 0, 0, 0, 0),
+                "a" => (Some((0x24, Some(0x0D))), btn::A, 0, 0, 0, 0),
+                "esc" | "b" => (Some((0x35, Some(0x1B))), btn::B, 0, 0, 0, 0),
+                "x" => (Some((0x07, Some(b'x' as u16))), btn::X, 0, 0, 0, 0),
+                "y" => (Some((0x10, Some(b'y' as u16))), btn::Y, 0, 0, 0, 0),
+                "start" => (Some((0x24, Some(0x0D))), btn::START, 0, 0, 0, 0),
+                "back" | "select" | "tab" => (Some((0x30, Some(0x09))), btn::BACK, 0, 0, 0, 0),
+                "lb" => (Some((0x0C, Some(b'q' as u16))), btn::LEFT_SHOULDER, 0, 0, 0, 0),
+                "rb" => (Some((0x0E, Some(b'e' as u16))), btn::RIGHT_SHOULDER, 0, 0, 0, 0),
+                "lt" => (None, 0, 255, 0, 0, 0),
+                "rt" => (None, 0, 0, 255, 0, 0),
+                "up" => (Some((0x7E, None)), btn::DPAD_UP, 0, 0, 0, 0),
+                "down" => (Some((0x7D, None)), btn::DPAD_DOWN, 0, 0, 0, 0),
+                "left" => (Some((0x7B, None)), btn::DPAD_LEFT, 0, 0, 0, 0),
+                "right" => (Some((0x7C, None)), btn::DPAD_RIGHT, 0, 0, 0, 0),
+                "ls_up" => (Some((0x0D, None)), 0, 0, 0, 0, i16::MAX),
+                "ls_down" => (Some((0x01, None)), 0, 0, 0, 0, i16::MIN),
+                "ls_left" => (Some((0x00, None)), 0, 0, 0, i16::MIN, 0),
+                "ls_right" => (Some((0x02, None)), 0, 0, 0, i16::MAX, 0),
+                _ => continue,
+            };
+        out.push(ScriptAction {
+            start,
+            end: start.saturating_add(hold),
+            name,
+            mac_key,
+            buttons,
+            left_trigger,
+            right_trigger,
+            thumb_lx,
+            thumb_ly,
+        });
+    }
+    out
+}
+
+fn combined_gamepad_at(actions: &[ScriptAction], frame: u32) -> crate::misc::xinput1_4::Gamepad {
+    let mut gp = crate::misc::xinput1_4::Gamepad::default();
+    let mut lx: i32 = 0;
+    let mut ly: i32 = 0;
+    for a in actions {
+        if a.start <= frame && frame < a.end {
+            gp.buttons |= a.buttons;
+            gp.left_trigger = gp.left_trigger.max(a.left_trigger);
+            gp.right_trigger = gp.right_trigger.max(a.right_trigger);
+            lx += a.thumb_lx as i32;
+            ly += a.thumb_ly as i32;
+        }
+    }
+    gp.thumb_lx = lx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    gp.thumb_ly = ly.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    gp
+}
+
+/// Generic scripted input runner (`PORT_INPUT_SCRIPT="900:down,960:enter:60"`).
 fn run_input_script_step(hwnd: usize, frame: u32, script: &str) {
-    use crate::misc::xinput1_4::{self, btn, DeviceInfo, Gamepad};
+    use crate::misc::xinput1_4::{self, DeviceInfo};
     use crate::user32::input::{self, NativeKey};
     input::force_focus_for_autoplay(hwnd);
     if frame == 30 {
@@ -119,49 +224,47 @@ fn run_input_script_step(hwnd: usize, frame: u32, script: &str) {
             },
         );
     }
-    for item in script.split(',') {
-        let Some((f, action)) = item.trim().split_once(':') else {
-            continue;
-        };
-        let Ok(f) = f.trim().parse::<u32>() else {
-            continue;
-        };
-        let down = if frame == f {
-            true
-        } else if frame == f + 6 {
-            false
-        } else {
-            continue;
-        };
-        let (mac, chars, pad): (u16, Vec<u16>, u16) = match action.trim() {
-            "enter" => (0x24, vec![0x0D], btn::A),
-            "space" => (0x31, vec![0x20], btn::A),
-            "a" => (0x24, vec![0x0D], btn::A),
-            "esc" | "b" => (0x35, vec![0x1B], btn::B),
-            "up" => (0x7E, Vec::new(), btn::DPAD_UP),
-            "down" => (0x7D, Vec::new(), btn::DPAD_DOWN),
-            "left" => (0x7B, Vec::new(), btn::DPAD_LEFT),
-            "right" => (0x7C, Vec::new(), btn::DPAD_RIGHT),
-            _ => continue,
-        };
-        log::info!(
-            target: "d3d",
-            "input script: frame {frame} {action} {}",
-            if down { "down" } else { "up" }
-        );
-        input::native_key(NativeKey {
-            mac,
-            down,
-            repeat: false,
-            chars: if down { chars } else { Vec::new() },
-        });
-        xinput1_4::backend_update(
-            0,
-            Gamepad {
-                buttons: if down { pad } else { 0 },
-                ..Default::default()
-            },
-        );
+    let actions = parse_input_script(script);
+    let mut gamepad_changed = false;
+    for a in &actions {
+        if frame == a.start {
+            gamepad_changed = true;
+            log::info!(
+                target: "d3d",
+                "input script: frame {frame} {} down (hold={})",
+                a.name,
+                a.end.saturating_sub(a.start)
+            );
+            if let Some((mac, ch)) = a.mac_key {
+                input::native_key(NativeKey {
+                    mac,
+                    down: true,
+                    repeat: false,
+                    chars: ch.into_iter().collect(),
+                });
+            }
+        } else if frame == a.end {
+            gamepad_changed = true;
+            log::info!(target: "d3d", "input script: frame {frame} {} up", a.name);
+            if let Some((mac, _)) = a.mac_key {
+                let still_held = actions.iter().any(|other| {
+                    other.start <= frame
+                        && frame < other.end
+                        && other.mac_key.is_some_and(|(m, _)| m == mac)
+                });
+                if !still_held {
+                    input::native_key(NativeKey {
+                        mac,
+                        down: false,
+                        repeat: false,
+                        chars: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    if gamepad_changed {
+        xinput1_4::backend_update(0, combined_gamepad_at(&actions, frame));
     }
 }
 
@@ -201,5 +304,37 @@ mod tests {
         assert!(entries.contains(&(0x1111, f1)));
         assert!(entries.contains(&(0x2222, f2)));
         assert!(entries.contains(&(0x3333, f3)));
+    }
+
+    #[test]
+    fn input_script_parses_default_and_custom_hold_and_combines_overlapping_gamepad_state() {
+        use crate::misc::xinput1_4::btn;
+
+        let actions = parse_input_script(
+            "100:enter, 200:space:60, 210:ls_up:30, 220:rt:15, 300:start:0, bad:entry, 400:unknown:5",
+        );
+        assert_eq!(actions.len(), 5);
+        assert_eq!((actions[0].start, actions[0].end, actions[0].buttons), (100, 106, btn::A));
+        assert_eq!((actions[1].start, actions[1].end, actions[1].buttons), (200, 260, btn::A));
+        assert_eq!((actions[2].start, actions[2].end, actions[2].thumb_ly), (210, 240, i16::MAX));
+        assert_eq!((actions[3].start, actions[3].end, actions[3].right_trigger), (220, 235, 255));
+        // Hold duration 0 clamps to 1 frame.
+        assert_eq!((actions[4].start, actions[4].end, actions[4].buttons), (300, 301, btn::START));
+
+        // At frame 225, space (btn::A), ls_up (thumb_ly=MAX), and rt (right_trigger=255) are all active.
+        let gp225 = combined_gamepad_at(&actions, 225);
+        assert_eq!(gp225.buttons, btn::A);
+        assert_eq!(gp225.thumb_ly, i16::MAX);
+        assert_eq!(gp225.right_trigger, 255);
+
+        // At frame 245, ls_up & rt released, while space:60 remains continuously held until 260.
+        let gp245 = combined_gamepad_at(&actions, 245);
+        assert_eq!(gp245.buttons, btn::A);
+        assert_eq!(gp245.thumb_ly, 0);
+        assert_eq!(gp245.right_trigger, 0);
+
+        // At frame 260, everything is released.
+        let gp260 = combined_gamepad_at(&actions, 260);
+        assert_eq!(gp260, crate::misc::xinput1_4::Gamepad::default());
     }
 }
