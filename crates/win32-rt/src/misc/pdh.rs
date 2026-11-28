@@ -44,7 +44,6 @@ enum CounterKind {
     MemoryAvailBytes,
     MemoryAvailKBytes,
     MemoryAvailMBytes,
-    MemoryCommitPct,
     ProcessWorkingSet,
     ProcessWorkingSetPrivate,
     ProcessPrivateBytes,
@@ -205,7 +204,9 @@ fn parse_counter_path(path: &str) -> Result<CounterKind, i32> {
             "available bytes" => Ok(CounterKind::MemoryAvailBytes),
             "available kbytes" => Ok(CounterKind::MemoryAvailKBytes),
             "available mbytes" => Ok(CounterKind::MemoryAvailMBytes),
-            "% committed bytes in use" => Ok(CounterKind::MemoryCommitPct),
+            // Darwin/XNU uses overcommit + dynamically resized swap files without a fixed
+            // Windows-style system commit limit, so "% Committed Bytes In Use" cannot be
+            // honestly mapped to physical RAM load and is rejected with PDH_CSTATUS_NO_COUNTER.
             _ => Err(PDH_CSTATUS_NO_COUNTER),
         },
         "process" => {
@@ -461,21 +462,18 @@ fn sample_counter(
         }
         CounterKind::MemoryAvailBytes
         | CounterKind::MemoryAvailKBytes
-        | CounterKind::MemoryAvailMBytes
-        | CounterKind::MemoryCommitPct => {
+        | CounterKind::MemoryAvailMBytes => {
             let mut ms = crate::kernel32::sysinfo::MEMORYSTATUSEX {
                 dwLength: std::mem::size_of::<crate::kernel32::sysinfo::MEMORYSTATUSEX>() as u32,
                 ..unsafe { std::mem::zeroed() }
             };
             unsafe {
                 crate::kernel32::sysinfo::GlobalMemoryStatusEx(&mut ms);
-                let mem_load = ms.dwMemoryLoad;
                 let avail_phys = ms.ullAvailPhys;
                 match c.kind {
                     CounterKind::MemoryAvailBytes => avail_phys as f64,
                     CounterKind::MemoryAvailKBytes => (avail_phys / 1024) as f64,
                     CounterKind::MemoryAvailMBytes => (avail_phys / (1024 * 1024)) as f64,
-                    CounterKind::MemoryCommitPct => mem_load as f64,
                     _ => 0.0,
                 }
             }
@@ -692,6 +690,13 @@ mod tests {
             let mut c_bad_inst = 1usize;
             assert_eq!(PdhAddCounterW(q, bad_inst.as_ptr(), 0, &mut c_bad_inst), PDH_CSTATUS_NO_INSTANCE);
             assert_eq!(c_bad_inst, 0);
+
+            // Unsupported Memory counter (% Committed Bytes In Use has no Darwin fixed commit limit)
+            // must fail honestly with PDH_CSTATUS_NO_COUNTER rather than substituting physical RAM load.
+            let commit_path = to_wide_z("\\Memory\\% Committed Bytes In Use");
+            let mut c_commit = 1usize;
+            assert_eq!(PdhAddCounterW(q, commit_path.as_ptr(), 0, &mut c_commit), PDH_CSTATUS_NO_COUNTER);
+            assert_eq!(c_commit, 0);
 
             // Unknown counter object fails honestly with PDH_CSTATUS_NO_OBJECT.
             let bad_path = to_wide_z("\\NoSuchPerfObject\\Foo");

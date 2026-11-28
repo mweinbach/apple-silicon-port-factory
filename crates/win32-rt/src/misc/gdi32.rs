@@ -114,13 +114,26 @@ struct PenData {
 }
 
 /// Shared backing storage for a GDI bitmap so in-flight draw operations retain
-/// ownership even if another thread unselects and deletes the bitmap concurrently.
-#[derive(Debug)]
+/// ownership even if another thread unselects and deletes the bitmap concurrently
+/// or tears down an external DXGI surface while a draw is in flight.
 struct BitmapBuffer {
     bits_ptr: usize,
     /// True when `bits_ptr` is externally owned (e.g., a DXGI surface staging buffer)
-    /// and must not be freed on drop.
+    /// and must not be freed via `crate::heap::free` on drop.
     external_bits: bool,
+    /// Optional owner handle (e.g., `Arc<MtlResource>`) keeping externally managed
+    /// pixel memory alive for as long as any `Arc<BitmapBuffer>` clone is held.
+    external_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for BitmapBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BitmapBuffer")
+            .field("bits_ptr", &self.bits_ptr)
+            .field("external_bits", &self.external_bits)
+            .field("has_external_owner", &self.external_owner.is_some())
+            .finish()
+    }
 }
 
 impl BitmapBuffer {
@@ -128,13 +141,18 @@ impl BitmapBuffer {
         Arc::new(Self {
             bits_ptr,
             external_bits: false,
+            external_owner: None,
         })
     }
 
-    fn external(bits_ptr: usize) -> Arc<Self> {
+    fn external(
+        bits_ptr: usize,
+        external_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             bits_ptr,
             external_bits: true,
+            external_owner,
         })
     }
 }
@@ -719,13 +737,17 @@ pub unsafe extern "win64" fn CreateDIBSection(
 }
 
 /// Create a memory DC backed directly by an externally owned top-down 32bpp BGRA pixel buffer
-/// (used by `IDXGISurface1::GetDC`). Caller must release it with [`destroy_external_surface_dc`].
+/// (used by `IDXGISurface1::GetDC`). `owner` is retained in `BitmapBuffer` for the full lifetime
+/// of any cloned `BitmapData` so concurrent `ReleaseDC` / texture teardown cannot free `bits_ptr`
+/// while an in-flight draw is still writing pixels. Caller must release the handles with
+/// [`destroy_external_surface_dc`].
 pub(crate) fn create_external_surface_dc(
     width: usize,
     height: usize,
     stride: usize,
     bits_ptr: usize,
     byte_len: usize,
+    owner: Arc<dyn std::any::Any + Send + Sync>,
 ) -> (usize, usize) {
     let hbmp = NEXT.fetch_add(4, Ordering::Relaxed);
     let hdc = NEXT.fetch_add(4, Ordering::Relaxed);
@@ -741,7 +763,7 @@ pub(crate) fn create_external_surface_dc(
             planes: 1,
             top_down: true,
             is_dib: true,
-            backing: BitmapBuffer::external(bits_ptr),
+            backing: BitmapBuffer::external(bits_ptr, Some(owner)),
             stride,
             byte_len,
         }),
@@ -752,9 +774,15 @@ pub(crate) fn create_external_surface_dc(
 
 /// Destroy a DC and external bitmap previously created by [`create_external_surface_dc`].
 pub(crate) fn destroy_external_surface_dc(hdc: usize, hbmp: usize) {
-    let mut m = objs().lock().unwrap();
-    m.remove(&hdc);
-    m.remove(&hbmp);
+    let removed = {
+        let mut m = objs().lock().unwrap();
+        let dc = m.remove(&hdc);
+        let bm = m.remove(&hbmp);
+        (dc, bm)
+    };
+    // Drop outside the global object-table lock so releasing the final external owner
+    // (e.g. a Metal staging resource) never runs teardown while holding `objs()`.
+    drop(removed);
 }
 
 pub unsafe extern "win64" fn DeleteObject(h: usize) -> BOOL {
@@ -2418,7 +2446,7 @@ unsafe fn get_object_impl(h: usize, cb: i32, pv: *mut u8, wide: bool) -> i32 {
                 planes: 1,
                 top_down: true,
                 is_dib: false,
-                backing: BitmapBuffer::external(0),
+                backing: BitmapBuffer::external(0, None),
                 stride: 2,
                 byte_len: 2,
             };
@@ -2832,5 +2860,62 @@ mod tests {
 
             DeleteDC(dc);
         }
+    }
+
+    #[test]
+    fn external_surface_dc_retains_owner_until_inflight_draw_drops() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct TrackedBacking {
+            buf: Vec<u8>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for TrackedBacking {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+        let owner = Arc::new(TrackedBacking {
+            buf: vec![0u8; 16 * 16 * 4],
+            dropped: Arc::clone(&dropped),
+        });
+        let ptr = owner.buf.as_ptr() as usize;
+        let len = owner.buf.len();
+        let (hdc, hbmp) = create_external_surface_dc(
+            16,
+            16,
+            16 * 4,
+            ptr,
+            len,
+            Arc::clone(&owner) as Arc<dyn std::any::Any + Send + Sync>,
+        );
+
+        // Simulate an in-flight renderer cloning `BitmapData` and dropping the global lock.
+        let inflight_bm = {
+            let m = objs().lock().unwrap();
+            match m.get(&hbmp) {
+                Some(Obj::Bitmap(bm)) => bm.clone(),
+                other => panic!("expected external bitmap, got {other:?}"),
+            }
+        };
+
+        // Simulate concurrent ReleaseDC + texture teardown dropping both the table entry and owner.
+        destroy_external_surface_dc(hdc, hbmp);
+        drop(owner);
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "external backing allocation must stay alive while in-flight draw holds BitmapData"
+        );
+
+        // Pixel writes remain backed by live memory until the in-flight draw completes.
+        unsafe {
+            assert!(inflight_bm.set_rgba(3, 4, [0x11, 0x22, 0x33, 0xFF]));
+            assert_eq!(inflight_bm.get_rgba(3, 4), Some([0x11, 0x22, 0x33, 0xFF]));
+        }
+
+        drop(inflight_bm);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "external backing allocation must be released once the final in-flight draw drops"
+        );
     }
 }

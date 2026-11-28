@@ -416,7 +416,7 @@ pub struct MmckInfo {
 const _: () = assert!(std::mem::size_of::<MmckInfo>() == 20);
 const _: () = assert!(std::mem::offset_of!(MmckInfo, dw_data_offset) == 12);
 
-/// Win64 `MMIOINFO` (`mmsystem.h` under `#include <pshpack1.h>`, 104 bytes).
+/// Win64 `MMIOINFO` (`mmiscapi.h` / `mmsystem.h` under `#include <pshpack1.h>`, 100 bytes).
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct MmioInfo {
@@ -432,16 +432,19 @@ pub struct MmioInfo {
     pub pch_end_write: *mut u8,
     pub l_buf_offset: i32,
     pub l_disk_offset: i32,
-    pub adw_info: [u32; 4],
+    pub adw_info: [u32; 3],
     pub dw_reserved1: u32,
     pub dw_reserved2: u32,
     pub hmmio: usize,
 }
-const _: () = assert!(std::mem::size_of::<MmioInfo>() == 104);
+const _: () = assert!(std::mem::size_of::<MmioInfo>() == 100);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, w_error_ret) == 16);
 const _: () = assert!(std::mem::offset_of!(MmioInfo, cch_buffer) == 28);
 const _: () = assert!(std::mem::offset_of!(MmioInfo, pch_buffer) == 32);
 const _: () = assert!(std::mem::offset_of!(MmioInfo, l_disk_offset) == 68);
-const _: () = assert!(std::mem::offset_of!(MmioInfo, hmmio) == 96);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, adw_info) == 72);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, dw_reserved1) == 84);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, hmmio) == 92);
 
 enum MmioBacking {
     File(std::fs::File),
@@ -546,9 +549,7 @@ fn mmio_table() -> &'static Mutex<HashMap<usize, MmioBacking>> {
 
 unsafe fn set_mmio_error(pmmioinfo: *mut MmioInfo, err: u32) {
     if !pmmioinfo.is_null() {
-        let mut info = pmmioinfo.read_unaligned();
-        info.w_error_ret = err;
-        pmmioinfo.write_unaligned(info);
+        std::ptr::addr_of_mut!((*pmmioinfo).w_error_ret).write_unaligned(err);
     }
 }
 
@@ -1039,6 +1040,81 @@ mod tests {
             assert_eq!(err_rw, MMIOERR_CANNOTOPEN);
 
             let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+    }
+
+    #[test]
+    fn mmio_info_matches_100_byte_sdk_layout_without_overrunning_canary() {
+        // Independently sized 100-byte Win64 packed MMIOINFO plus 8-byte trailing canary
+        // (tested at both aligned and odd unaligned offsets).
+        const SDK_MMIOINFO_SIZE: usize = 100;
+        const OFF_FCC_IO_PROC: usize = 4;
+        const OFF_W_ERROR_RET: usize = 16;
+        const OFF_CCH_BUFFER: usize = 28;
+        const OFF_PCH_BUFFER: usize = 32;
+        const OFF_HMMIO: usize = 92;
+        const CANARY: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+
+        let mut wav = build_sample_riff_wave();
+
+        for base_off in [0usize, 1usize] {
+            let mut raw = [0u8; 1 + SDK_MMIOINFO_SIZE + CANARY.len()];
+            raw[base_off + SDK_MMIOINFO_SIZE..base_off + SDK_MMIOINFO_SIZE + CANARY.len()]
+                .copy_from_slice(&CANARY);
+
+            // 1. Successful FOURCC_MEM open: writes wErrorRet=0 at +16 and hmmio at +92, never past +100.
+            raw[base_off + OFF_FCC_IO_PROC..base_off + OFF_FCC_IO_PROC + 4]
+                .copy_from_slice(&FOURCC_MEM.to_le_bytes());
+            raw[base_off + OFF_W_ERROR_RET..base_off + OFF_W_ERROR_RET + 4]
+                .copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+            raw[base_off + OFF_CCH_BUFFER..base_off + OFF_CCH_BUFFER + 4]
+                .copy_from_slice(&(wav.len() as i32).to_le_bytes());
+            raw[base_off + OFF_PCH_BUFFER..base_off + OFF_PCH_BUFFER + 8]
+                .copy_from_slice(&(wav.as_mut_ptr() as usize).to_le_bytes());
+
+            let pinfo = unsafe { raw.as_mut_ptr().add(base_off) as *mut MmioInfo };
+            let h = unsafe { mmioOpenA(std::ptr::null(), pinfo, 0) };
+            assert_ne!(h, 0);
+            assert_eq!(
+                u32::from_le_bytes(
+                    raw[base_off + OFF_W_ERROR_RET..base_off + OFF_W_ERROR_RET + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                0
+            );
+            assert_eq!(
+                usize::from_le_bytes(
+                    raw[base_off + OFF_HMMIO..base_off + OFF_HMMIO + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                h
+            );
+            assert_eq!(
+                &raw[base_off + SDK_MMIOINFO_SIZE..base_off + SDK_MMIOINFO_SIZE + CANARY.len()],
+                &CANARY,
+                "mmioOpenA success overwrote trailing canary (base_off={base_off})"
+            );
+            assert_eq!(unsafe { mmioClose(h, 0) }, 0);
+
+            // 2. Failed open: writes wErrorRet at +16 and leaves trailing canary untouched.
+            raw[base_off..base_off + SDK_MMIOINFO_SIZE].fill(0);
+            let h_fail = unsafe { mmioOpenA(std::ptr::null(), pinfo, 0) };
+            assert_eq!(h_fail, 0);
+            assert_eq!(
+                u32::from_le_bytes(
+                    raw[base_off + OFF_W_ERROR_RET..base_off + OFF_W_ERROR_RET + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                MMIOERR_CANNOTOPEN
+            );
+            assert_eq!(
+                &raw[base_off + SDK_MMIOINFO_SIZE..base_off + SDK_MMIOINFO_SIZE + CANARY.len()],
+                &CANARY,
+                "mmioOpenA failure overwrote trailing canary (base_off={base_off})"
+            );
         }
     }
 }

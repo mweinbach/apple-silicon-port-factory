@@ -1542,6 +1542,7 @@ unsafe extern "win64" fn surf_get_dc(
         stride,
         ptr as usize,
         byte_len,
+        staging_buf.clone() as Arc<dyn std::any::Any + Send + Sync>,
     );
     *surf.dc_state.lock().unwrap() = Some(SurfaceDcState { hdc, hbmp, width, height });
     // Per IDXGISurface1::GetDC contract, acquiring a DC unbinds the surface from the
