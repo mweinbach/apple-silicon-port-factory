@@ -146,6 +146,13 @@ pub(super) struct Module {
     /// Per block: has a held import slot ([`rebase_block`]); never verified (its
     /// re-translation sees a different slot state, its guarded call is still correct).
     slot_held: Vec<bool>,
+    /// Sorted block indices in `img.blocks` that must still be checked on an out-of-module
+    /// `VA_DISPATCH` delta revalidation: blocks with relocations, `host == true` assumptions,
+    /// external assumptions, primary-EXE `FF 25` thunk or DLL IAT-stub assumptions, or
+    /// `DEAD_ASSUME`/`DEAD_HELD` revival candidates.
+    watch_blocks: Vec<u32>,
+    /// `exe::va_structural_gen()` when `watch_blocks` was last built.
+    watch_struct_gen: u32,
     /// Image overlapped run-time code: every block dead.
     killed: bool,
     /// Removed (tests).
@@ -622,6 +629,8 @@ pub(super) static DIR: RwLock<Option<Dir>> = RwLock::new(None);
 pub(super) static REVALIDATE: Mutex<()> = Mutex::new(());
 /// `va_gen` every live block was last checked against.
 static CHECKED_VG: AtomicU32 = AtomicU32::new(0);
+/// Monotonic `exe::va_seq` corresponding to [`CHECKED_VG`] for delta revalidation.
+static CHECKED_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Bumped when a module is killed (per-thread caches may hold links into it).
 static EPOCH: AtomicU32 = AtomicU32::new(0);
 /// Any module installed.
@@ -726,25 +735,228 @@ pub(in crate::emu) fn find(ip: u64) -> Option<(usize, bool)> {
     lookup_static_aot(ip)
 }
 
-/// Re-check a live block's assumptions and relocations against the current host-callable
-/// state (memoised per pass); relocation slots whose function moved go to `rewrites`.
+/// Immutable snapshot of process-wide dispatch/routing state built once per `check_install_blocks`
+/// or `revalidate_dir` pass so workers never contend on `vm_lock()` (`is_speculative_read_safe`)
+/// or `IAT_SPANS` seqlocks across millions of plain guest-to-guest assumptions.
+#[derive(Clone, Copy)]
+struct HostCheckCtx {
+    exe_base: usize,
+    exe_end: usize,
+    exe_pref: u64,
+    exe_size: u64,
+    aw2_active: bool,
+    exe_all_readable: bool,
+    iat_lo: u64,
+    iat_span: u64,
+}
+
+/// Per-module routing pre-filter derived once from [`HostCheckCtx`].
+#[derive(Clone, Copy)]
+struct ModuleRouteGate {
+    m_lo: u64,
+    m_hi: u64,
+    overlaps_iat_gate: bool,
+    exact_iat: bool,
+    overlaps_exe: bool,
+}
+
+impl HostCheckCtx {
+    fn snapshot() -> Self {
+        let exe_base = crate::exe::base();
+        let exe_size = crate::exe::image_size();
+        let exe_pref = crate::exe::preferred_base();
+        let aw2_active = crate::exe::aw2_registry_active();
+        let exe_end = exe_base.saturating_add(exe_size as usize);
+        // Check once whether every page of the mapped primary executable is committed and
+        // readable (zero `PAGE_NOACCESS` / `PAGE_GUARD` holes). In unit tests, `exe::base()`
+        // defaults to an unmapped synthetic VA (`0x1_4000_0000`), so leave `false` there.
+        let exe_all_readable = !cfg!(test)
+            && exe_base != 0
+            && exe_size != 0
+            && exe_base.checked_add(exe_size as usize).is_some()
+            && win32_rt::kernel32::memory::is_speculative_read_safe(exe_base, exe_size as usize);
+        let (iat_lo, iat_span) = crate::emu::routes::dll_route_gate();
+        Self {
+            exe_base,
+            exe_end,
+            exe_pref,
+            exe_size,
+            aw2_active,
+            exe_all_readable,
+            iat_lo,
+            iat_span,
+        }
+    }
+
+    fn module_gate(&self, m: &Module) -> ModuleRouteGate {
+        let m_lo = m.base as u64;
+        let m_hi = m.base.saturating_add(m.size) as u64;
+        let overlaps_iat_gate = self.iat_span != 0
+            && m_lo < self.iat_lo.saturating_add(self.iat_span)
+            && m_hi > self.iat_lo;
+        let exact_iat = overlaps_iat_gate
+            && crate::dll_native::iat_image_bounds(m_lo)
+                == Some((m.base, m.base.wrapping_add(m.size)));
+        let overlaps_exe = self.exe_base != 0
+            && ((m_lo < self.exe_end as u64 && m_hi > self.exe_base as u64)
+                || (self.exe_pref != 0
+                    && m_lo < self.exe_pref.saturating_add(self.exe_size)
+                    && m_hi > self.exe_pref));
+        ModuleRouteGate { m_lo, m_hi, overlaps_iat_gate, exact_iat, overlaps_exe }
+    }
+
+    /// True if `va` inside `[mg.m_lo, mg.m_hi)` could flip `host_now(va)` via an *external*
+    /// `VA_DISPATCH` change (a primary-EXE `FF 25` delay-load/IAT thunk or a DLL IAT stub).
+    /// Plain guest functions inside `m` can only flip via an in-module `VA_DISPATCH` change
+    /// (which triggers `module_affected_by_va` -> full scan) or a structural `va_gen` bump.
+    #[inline]
+    unsafe fn may_flip_on_external_va(&self, va: u64, mg: &ModuleRouteGate) -> bool {
+        if mg.overlaps_exe {
+            let eb = self.exe_base as u64;
+            let in_pref = self.exe_pref != 0
+                && va >= self.exe_pref
+                && va - self.exe_pref < self.exe_size;
+            let in_base = va >= eb && va - eb < self.exe_size;
+            if in_pref || in_base {
+                let mapped = if eb != self.exe_pref && in_pref {
+                    eb.wrapping_add(va - self.exe_pref) as usize
+                } else {
+                    va as usize
+                };
+                if mapped >= self.exe_base && mapped.saturating_add(6) <= self.exe_end {
+                    if !self.exe_all_readable
+                        || core::ptr::read_unaligned(mapped as *const u16) == 0x25ff
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if mg.overlaps_iat_gate {
+            if mg.exact_iat && va.saturating_add(2) <= mg.m_hi {
+                let w = core::ptr::read_unaligned(va as usize as *const u16);
+                if (w & 0xff) == 0xe9 || w == 0x25ff || w == 0xff48 {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True when `va` (which must lie inside `[mg.m_lo, mg.m_hi)`) is guaranteed to have
+    /// `host_now(va) == false` AND is not a primary-EXE `FF 25` thunk or DLL IAT stub.
+    ///
+    /// Returning `false` is always conservative and falls back to `hm` + exact `host_now(va)`.
+    #[inline]
+    unsafe fn is_plain_guest_in_module(&self, va: u64, mg: &ModuleRouteGate) -> bool {
+        if crate::exe::va_bloom_may_contain(va) {
+            return false;
+        }
+        let eb = self.exe_base as u64;
+        if self.aw2_active {
+            if eb != crate::exe::PREFERRED_BASE && va >= eb {
+                let pref = crate::exe::PREFERRED_BASE.wrapping_add(va - eb);
+                if crate::exe::va_bloom_may_contain(pref) {
+                    return false;
+                }
+            }
+        } else if eb != self.exe_pref && va >= eb && va - eb < self.exe_size {
+            let pref = self.exe_pref.wrapping_add(va - eb);
+            if crate::exe::va_bloom_may_contain(pref) {
+                return false;
+            }
+        }
+        if self.may_flip_on_external_va(va, mg) {
+            return false;
+        }
+        if crate::emu::is_routed_dll_chkstk(va)
+            || crate::emu::is_routed_dll_stack_pos(va)
+            || crate::emu::is_routed_regfile(va)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// True if a `VA_DISPATCH` change at `va` could affect any direct non-watch assumption inside
+    /// module `m` (either at `m`'s mapped span or via the primary-EXE preferred-base alias).
+    #[inline]
+    fn module_affected_by_va(&self, m: &Module, va: u64) -> bool {
+        let m_lo = m.base as u64;
+        let m_sz = m.size as u64;
+        if va >= m_lo && va - m_lo < m_sz {
+            return true;
+        }
+        let eb = self.exe_base as u64;
+        if self.exe_base != 0
+            && m.base == self.exe_base
+            && self.exe_pref != 0
+            && va >= self.exe_pref
+            && va - self.exe_pref < self.exe_size
+        {
+            return true;
+        }
+        if self.aw2_active && eb != crate::exe::PREFERRED_BASE && va >= crate::exe::PREFERRED_BASE {
+            let mapped = eb.wrapping_add(va - crate::exe::PREFERRED_BASE);
+            if mapped >= m_lo && mapped - m_lo < m_sz {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Re-check a block's assumptions and relocations against `ctx`/`mg` (memoising only the small
+/// non-plain subset in `hm`/`fm`). Returns `(Result, needs_watch)`, where `needs_watch` is true
+/// if this block must remain in `m.watch_blocks` for out-of-module `VA_DISPATCH` delta passes.
 unsafe fn check_block(
     m: &Module,
     b: &BlockEnt,
+    ctx: &HostCheckCtx,
+    mg: &ModuleRouteGate,
     hm: &mut FastMap<u64, bool>,
     fm: &mut FastMap<u64, Option<(usize, bool)>>,
     rewrites: &mut Vec<(usize, u64)>,
-) -> Result<(), &'static str> {
+) -> (Result<(), &'static str>, bool) {
     if crate::emu::is_routed_dll_chkstk(b.ip)
         || crate::emu::is_routed_dll_stack_pos(b.ip)
         || crate::emu::is_routed_regfile(b.ip)
-        || crate::emu::is_routed_dll_stub(b.ip)
     {
-        return Err("routed dll helper");
+        return (Err("routed dll helper"), true);
     }
+    let b_in_mod = b.ip >= mg.m_lo && b.ip < mg.m_hi;
+    let b_is_stub = if b_in_mod {
+        if !mg.overlaps_iat_gate {
+            false
+        } else if mg.exact_iat && b.ip.saturating_add(2) <= mg.m_hi {
+            let w = core::ptr::read_unaligned(b.ip as usize as *const u16);
+            ((w & 0xff) == 0xe9 || w == 0x25ff || w == 0xff48)
+                && crate::emu::is_routed_dll_stub(b.ip)
+        } else {
+            crate::emu::is_routed_dll_stub(b.ip)
+        }
+    } else {
+        crate::emu::is_routed_dll_stub(b.ip)
+    };
+    if b_is_stub {
+        return (Err("routed dll helper"), true);
+    }
+    let mut needs_watch = b.reloc_n != 0;
     for &(va, host) in m.img.assume_of(b) {
+        let in_mod = va >= mg.m_lo && va < mg.m_hi;
+        if in_mod && ctx.is_plain_guest_in_module(va, mg) {
+            if host {
+                return (Err("host-callable assumption"), true);
+            }
+            continue;
+        }
         if *hm.entry(va).or_insert_with(|| host_now(va)) != host {
-            return Err("host-callable assumption");
+            return (Err("host-callable assumption"), true);
+        }
+        if host || !in_mod || ctx.may_flip_on_external_va(va, mg) {
+            needs_watch = true;
         }
     }
     for r in m.img.relocs_of(b) {
@@ -783,60 +995,77 @@ unsafe fn check_block(
                     rewrites.push((slot, h as u64));
                 }
             }
-            _ => return Err("inline host fn"),
+            _ => return (Err("inline host fn"), true),
         }
     }
-    Ok(())
+    (Ok(()), needs_watch)
 }
 
 /// Parallel or serial block assumption/relocation check for module installation (`install_image`).
-/// Writes `DEAD_ASSUME` into disjoint `m.dead[bi]` slots and collects `(slot, value)` rewrites
-/// for the caller (which holds `JitWrite`) to apply.
-unsafe fn check_install_blocks(m: &Module, workers: usize) -> (usize, Vec<(usize, u64)>) {
+/// Writes `DEAD_ASSUME` into disjoint `m.dead[bi]` slots, collects `(slot, value)` rewrites for
+/// the caller (which holds `JitWrite`) to apply, and returns the sorted `watch_blocks` list.
+unsafe fn check_install_blocks(
+    m: &Module,
+    workers: usize,
+) -> (usize, Vec<(usize, u64)>, Vec<u32>) {
     let n = m.img.blocks.len();
+    let ctx = HostCheckCtx::snapshot();
+    let mg = ctx.module_gate(m);
     if workers <= 1 || n < 2 {
-        let hm_cap = (m.img.assume.len() / 8).min(512 * 1024);
-        let (mut hm, mut fm, mut rewrites) = (
-            FastMap::with_capacity_and_hasher(hm_cap, Default::default()),
-            FastMap::default(),
-            Vec::new(),
-        );
+        let (mut hm, mut fm, mut rewrites, mut watch) =
+            (FastMap::default(), FastMap::default(), Vec::new(), Vec::new());
         let mut bad = 0usize;
         for bi in 0..n {
-            if m.dead[bi].load(Ordering::Relaxed) != 0 {
+            let st = m.dead[bi].load(Ordering::Relaxed);
+            if st != 0 {
+                if st == DEAD_ASSUME || st == DEAD_HELD {
+                    watch.push(bi as u32);
+                }
                 continue;
             }
             let b = &m.img.blocks[bi];
-            if check_block(m, b, &mut hm, &mut fm, &mut rewrites).is_err() {
+            let (res, nw) = check_block(m, b, &ctx, &mg, &mut hm, &mut fm, &mut rewrites);
+            if res.is_err() {
                 m.dead[bi].store(DEAD_ASSUME, Ordering::Relaxed);
                 bad += 1;
+                watch.push(bi as u32);
+            } else if nw {
+                watch.push(bi as u32);
             }
         }
-        return (bad, rewrites);
+        return (bad, rewrites, watch);
     }
     let chunk = n.div_ceil(workers);
-    let results: Vec<(usize, Vec<(usize, u64)>)> = std::thread::scope(|s| {
+    let results: Vec<(usize, Vec<(usize, u64)>, Vec<u32>)> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(workers);
         let mut lo = 0usize;
         while lo < n {
             let hi = (lo + chunk).min(n);
             handles.push(s.spawn(move || {
-                let hm_cap = ((hi - lo) / 4).min(128 * 1024);
-                let mut hm = FastMap::with_capacity_and_hasher(hm_cap, Default::default());
+                let mut hm = FastMap::default();
                 let mut fm = FastMap::default();
                 let mut rewrites = Vec::new();
+                let mut watch = Vec::new();
                 let mut bad = 0usize;
                 for bi in lo..hi {
-                    if m.dead[bi].load(Ordering::Relaxed) != 0 {
+                    let st = m.dead[bi].load(Ordering::Relaxed);
+                    if st != 0 {
+                        if st == DEAD_ASSUME || st == DEAD_HELD {
+                            watch.push(bi as u32);
+                        }
                         continue;
                     }
                     let b = &m.img.blocks[bi];
-                    if check_block(m, b, &mut hm, &mut fm, &mut rewrites).is_err() {
+                    let (res, nw) = check_block(m, b, &ctx, &mg, &mut hm, &mut fm, &mut rewrites);
+                    if res.is_err() {
                         m.dead[bi].store(DEAD_ASSUME, Ordering::Relaxed);
                         bad += 1;
+                        watch.push(bi as u32);
+                    } else if nw {
+                        watch.push(bi as u32);
                     }
                 }
-                (bad, rewrites)
+                (bad, rewrites, watch)
             }));
             lo = hi;
         }
@@ -846,13 +1075,16 @@ unsafe fn check_install_blocks(m: &Module, workers: usize) -> (usize, Vec<(usize
             .collect()
     });
     let mut bad = 0usize;
-    let total_rw: usize = results.iter().map(|(_, r)| r.len()).sum();
+    let total_rw: usize = results.iter().map(|(_, r, _)| r.len()).sum();
+    let total_watch: usize = results.iter().map(|(_, _, w)| w.len()).sum();
     let mut rewrites = Vec::with_capacity(total_rw);
-    for (b, rw) in results {
+    let mut watch = Vec::with_capacity(total_watch);
+    for (b, rw, w) in results {
         bad += b;
         rewrites.extend(rw);
+        watch.extend(w);
     }
-    (bad, rewrites)
+    (bad, rewrites, watch)
 }
 
 /// Mark block `bi` of module `mi` dead (`why`: [`DEAD_PERM`] / [`DEAD_ASSUME`]) and unpatch
@@ -1124,7 +1356,7 @@ unsafe fn link_pass(d: &mut Dir, skip_icache: Option<(usize, usize)>) -> Vec<usi
     patched
 }
 
-/// After a `va_gen` change (from `JitCache::run` / [`find`]): re-check every live block's
+/// After a `va_gen` change (from `JitCache::run` / [`find`]): re-check affected blocks'
 /// assumptions and relocations once per generation; kill failing blocks (unpatching their
 /// incoming links) and rewrite moved host-fn slots. Threads still inside a killed block
 /// finish it with the old decisions (the JIT's window today); killed code is never freed.
@@ -1138,32 +1370,137 @@ pub(in crate::emu) fn revalidate(vg: u32) {
         return;
     }
     let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
+    let (new_seq, new_vg, new_sg, delta) =
+        crate::exe::va_delta_since(CHECKED_SEQ.load(Ordering::Acquire));
     if let Some(d) = g.as_mut() {
-        unsafe { revalidate_dir(d) };
+        unsafe { revalidate_dir(d, new_sg, &delta) };
     }
-    CHECKED_VG.store(vg, Ordering::Release);
+    CHECKED_SEQ.store(new_seq, Ordering::Release);
+    CHECKED_VG.store(new_vg, Ordering::Release);
 }
 
-/// Re-check every live and every [`DEAD_ASSUME`] block: kill live blocks that fail, revive
-/// dead ones that pass again (relocation slots rewritten, back in the map, re-linked; with
-/// `AW2_DLL_AOT_VERIFY` re-verified first). Returns the number of blocks killed.
-unsafe fn revalidate_dir(d: &mut Dir) -> usize {
+/// Re-check live and [`DEAD_ASSUME`]/[`DEAD_HELD`] blocks affected by `delta`: kill live blocks
+/// that fail, revive dead ones that pass again (relocation slots rewritten, back in the map,
+/// re-linked; with `AW2_DLL_AOT_VERIFY` re-verified first). Modules untouched by an out-of-module
+/// `VA_DISPATCH` delta check only their precomputed `watch_blocks` list. Returns blocks killed.
+unsafe fn revalidate_dir(d: &mut Dir, cur_sg: u32, delta: &crate::exe::VaDelta) -> usize {
     #[cfg(test)]
     TEST_REVALIDATE_CALLS.fetch_add(1, Ordering::Relaxed);
     let par_workers = if cfg!(test) { 1 } else { aot_install_workers() };
+    let ctx = HostCheckCtx::snapshot();
     let (mut kills, mut rewrites, mut revive) = (Vec::new(), Vec::new(), Vec::new());
     let (mut hm, mut fm) = (FastMap::default(), FastMap::default());
-    for (mi, m) in d.modules.iter().enumerate() {
-        if m.gone || m.killed {
+    for mi in 0..d.modules.len() {
+        if d.modules[mi].gone || d.modules[mi].killed {
             continue;
         }
-        let n = m.img.blocks.len();
-        if par_workers > 1 && n >= PARALLEL_THRESHOLD {
+        let mg = ctx.module_gate(&d.modules[mi]);
+        let full_scan = match delta {
+            crate::exe::VaDelta::Full => true,
+            crate::exe::VaDelta::ChangedVas(vas) => {
+                d.modules[mi].watch_struct_gen != cur_sg
+                    || vas.iter().any(|&va| ctx.module_affected_by_va(&d.modules[mi], va))
+            }
+        };
+        if !full_scan {
+            let m = &d.modules[mi];
+            let nw = m.watch_blocks.len();
+            #[cfg(test)]
+            TEST_REVALIDATE_BLOCKS_CHECKED.fetch_add(nw, Ordering::Relaxed);
+            if par_workers > 1 && nw >= PARALLEL_THRESHOLD {
+                let chunk = nw.div_ceil(par_workers);
+                type RevChunk = (
+                    Vec<(usize, usize)>,
+                    Vec<(usize, u64)>,
+                    Vec<(usize, usize, Vec<(usize, u64)>)>,
+                );
+                let parts: Vec<RevChunk> = std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(par_workers);
+                    let mut lo = 0usize;
+                    while lo < nw {
+                        let hi = (lo + chunk).min(nw);
+                        handles.push(s.spawn(move || {
+                            let mut lhm = FastMap::default();
+                            let mut lfm = FastMap::default();
+                            let (mut lk, mut lrw, mut lrev) = (Vec::new(), Vec::new(), Vec::new());
+                            for &bi_u32 in &m.watch_blocks[lo..hi] {
+                                let bi = bi_u32 as usize;
+                                let b = &m.img.blocks[bi];
+                                match m.dead[bi].load(Ordering::Relaxed) {
+                                    0 => {
+                                        if check_block(m, b, &ctx, &mg, &mut lhm, &mut lfm, &mut lrw)
+                                            .0
+                                            .is_err()
+                                        {
+                                            lk.push((mi, bi));
+                                        }
+                                    }
+                                    st @ (DEAD_ASSUME | DEAD_HELD) => {
+                                        let mut rw = Vec::new();
+                                        if check_block(m, b, &ctx, &mg, &mut lhm, &mut lfm, &mut rw)
+                                            .0
+                                            .is_ok()
+                                        {
+                                            lrev.push((mi, bi, rw));
+                                        } else if st == DEAD_HELD {
+                                            m.dead[bi].store(DEAD_ASSUME, Ordering::Relaxed);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            (lk, lrw, lrev)
+                        }));
+                        lo = hi;
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("aot revalidate worker panicked"))
+                        .collect()
+                });
+                for (lk, lrw, lrev) in parts {
+                    kills.extend(lk);
+                    rewrites.extend(lrw);
+                    revive.extend(lrev);
+                }
+            } else {
+                for &bi_u32 in &m.watch_blocks {
+                    let bi = bi_u32 as usize;
+                    let b = &m.img.blocks[bi];
+                    match m.dead[bi].load(Ordering::Relaxed) {
+                        0 => {
+                            if check_block(m, b, &ctx, &mg, &mut hm, &mut fm, &mut rewrites)
+                                .0
+                                .is_err()
+                            {
+                                kills.push((mi, bi));
+                            }
+                        }
+                        st @ (DEAD_ASSUME | DEAD_HELD) => {
+                            let mut rw = Vec::new();
+                            if check_block(m, b, &ctx, &mg, &mut hm, &mut fm, &mut rw).0.is_ok() {
+                                revive.push((mi, bi, rw));
+                            } else if st == DEAD_HELD {
+                                m.dead[bi].store(DEAD_ASSUME, Ordering::Relaxed);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            continue;
+        }
+        let n = d.modules[mi].img.blocks.len();
+        #[cfg(test)]
+        TEST_REVALIDATE_BLOCKS_CHECKED.fetch_add(n, Ordering::Relaxed);
+        let new_watch = if par_workers > 1 && n >= PARALLEL_THRESHOLD {
+            let m = &d.modules[mi];
             let chunk = n.div_ceil(par_workers);
             type RevChunk = (
                 Vec<(usize, usize)>,
                 Vec<(usize, u64)>,
                 Vec<(usize, usize, Vec<(usize, u64)>)>,
+                Vec<u32>,
             );
             let parts: Vec<RevChunk> = std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(par_workers);
@@ -1171,21 +1508,29 @@ unsafe fn revalidate_dir(d: &mut Dir) -> usize {
                 while lo < n {
                     let hi = (lo + chunk).min(n);
                     handles.push(s.spawn(move || {
-                        let hm_cap = ((hi - lo) / 4).min(128 * 1024);
-                        let mut lhm = FastMap::with_capacity_and_hasher(hm_cap, Default::default());
+                        let mut lhm = FastMap::default();
                         let mut lfm = FastMap::default();
-                        let (mut lk, mut lrw, mut lrev) = (Vec::new(), Vec::new(), Vec::new());
+                        let (mut lk, mut lrw, mut lrev, mut lw) =
+                            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
                         for bi in lo..hi {
                             let b = &m.img.blocks[bi];
                             match m.dead[bi].load(Ordering::Relaxed) {
                                 0 => {
-                                    if check_block(m, b, &mut lhm, &mut lfm, &mut lrw).is_err() {
+                                    let (res, nw) =
+                                        check_block(m, b, &ctx, &mg, &mut lhm, &mut lfm, &mut lrw);
+                                    if res.is_err() {
                                         lk.push((mi, bi));
+                                        lw.push(bi as u32);
+                                    } else if nw {
+                                        lw.push(bi as u32);
                                     }
                                 }
                                 st @ (DEAD_ASSUME | DEAD_HELD) => {
                                     let mut rw = Vec::new();
-                                    if check_block(m, b, &mut lhm, &mut lfm, &mut rw).is_ok() {
+                                    let (res, _nw) =
+                                        check_block(m, b, &ctx, &mg, &mut lhm, &mut lfm, &mut rw);
+                                    lw.push(bi as u32);
+                                    if res.is_ok() {
                                         lrev.push((mi, bi, rw));
                                     } else if st == DEAD_HELD {
                                         m.dead[bi].store(DEAD_ASSUME, Ordering::Relaxed);
@@ -1194,7 +1539,7 @@ unsafe fn revalidate_dir(d: &mut Dir) -> usize {
                                 _ => {}
                             }
                         }
-                        (lk, lrw, lrev)
+                        (lk, lrw, lrev, lw)
                     }));
                     lo = hi;
                 }
@@ -1203,31 +1548,48 @@ unsafe fn revalidate_dir(d: &mut Dir) -> usize {
                     .map(|h| h.join().expect("aot revalidate worker panicked"))
                     .collect()
             });
-            for (lk, lrw, lrev) in parts {
+            let total_w: usize = parts.iter().map(|(_, _, _, w)| w.len()).sum();
+            let mut merged_w = Vec::with_capacity(total_w);
+            for (lk, lrw, lrev, lw) in parts {
                 kills.extend(lk);
                 rewrites.extend(lrw);
                 revive.extend(lrev);
+                merged_w.extend(lw);
             }
-            continue;
-        }
-        for (bi, b) in m.img.blocks.iter().enumerate() {
-            match m.dead[bi].load(Ordering::Relaxed) {
-                0 => {
-                    if check_block(m, b, &mut hm, &mut fm, &mut rewrites).is_err() {
-                        kills.push((mi, bi));
+            merged_w
+        } else {
+            let m = &d.modules[mi];
+            let mut lw = Vec::new();
+            for (bi, b) in m.img.blocks.iter().enumerate() {
+                match m.dead[bi].load(Ordering::Relaxed) {
+                    0 => {
+                        let (res, nw) =
+                            check_block(m, b, &ctx, &mg, &mut hm, &mut fm, &mut rewrites);
+                        if res.is_err() {
+                            kills.push((mi, bi));
+                            lw.push(bi as u32);
+                        } else if nw {
+                            lw.push(bi as u32);
+                        }
                     }
-                }
-                st @ (DEAD_ASSUME | DEAD_HELD) => {
-                    let mut rw = Vec::new();
-                    if check_block(m, b, &mut hm, &mut fm, &mut rw).is_ok() {
-                        revive.push((mi, bi, rw));
-                    } else if st == DEAD_HELD {
-                        m.dead[bi].store(DEAD_ASSUME, Ordering::Relaxed);
+                    st @ (DEAD_ASSUME | DEAD_HELD) => {
+                        let mut rw = Vec::new();
+                        let (res, _nw) =
+                            check_block(m, b, &ctx, &mg, &mut hm, &mut fm, &mut rw);
+                        lw.push(bi as u32);
+                        if res.is_ok() {
+                            revive.push((mi, bi, rw));
+                        } else if st == DEAD_HELD {
+                            m.dead[bi].store(DEAD_ASSUME, Ordering::Relaxed);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
+            lw
+        };
+        d.modules[mi].watch_blocks = new_watch;
+        d.modules[mi].watch_struct_gen = cur_sg;
     }
     // Blocks whose checks started passing in this pass (DEAD_HELD ones were counted before).
     let would = revive
@@ -1693,7 +2055,7 @@ unsafe fn install_image_opts(
     }
     let t0 = std::time::Instant::now();
     let _r = REVALIDATE.lock().unwrap_or_else(|e| e.into_inner());
-    let vg_before = crate::exe::va_gen();
+    let (seq_before, vg_before, sg_before) = crate::exe::va_snapshot_gens();
     let n = img.blocks.len();
     let nlinks = img.links.len();
     let mut m = Module {
@@ -1712,6 +2074,8 @@ unsafe fn install_image_opts(
         unlinked: Vec::new(),
         unlinked_init: false,
         slot_held: vec![false; n],
+        watch_blocks: Vec::new(),
+        watch_struct_gen: sg_before,
         killed: false,
         gone: false,
         owner: test.then(|| std::thread::current().id()),
@@ -1850,7 +2214,8 @@ unsafe fn install_image_opts(
     // Assumptions first: a block built for another host-callable state is dead-but-revivable
     // (its re-translation now would differ, so it is not verified until revived).
     let check_workers = if test || n < PARALLEL_THRESHOLD { 1 } else { aot_install_workers() };
-    let (bad_check, rewrites) = check_install_blocks(&m, check_workers);
+    let (bad_check, rewrites, watch_blocks) = check_install_blocks(&m, check_workers);
+    m.watch_blocks = watch_blocks;
     for &(slot, h) in &rewrites {
         (*(slot as *const AtomicU64)).store(h, Ordering::Relaxed);
     }
@@ -1956,9 +2321,10 @@ unsafe fn install_image_opts(
     }
     if !had_live_modules {
         // Every block in this first live module was just validated against `>= vg_before`, and
-        // no pre-existing live modules could be at an older `va_gen`. Publishing `vg_before`
-        // avoids a redundant full-directory revalidation on the very first `find()` while still
-        // triggering revalidation if `va_gen()` advanced during install.
+        // no pre-existing live modules could be at an older `va_gen`. Publishing `seq_before` /
+        // `vg_before` avoids a redundant full-directory revalidation on the very first `find()`
+        // while still triggering revalidation if `va_gen()` advanced during install.
+        CHECKED_SEQ.store(seq_before, Ordering::Release);
         CHECKED_VG.store(vg_before, Ordering::Release);
     }
     HAVE.store(true, Ordering::Release);
@@ -2570,6 +2936,8 @@ pub(in crate::emu) fn test_uninstall() {
 
 #[cfg(test)]
 static TEST_REVALIDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_REVALIDATE_BLOCKS_CHECKED: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 mod fast_load_tests {
@@ -2718,6 +3086,7 @@ mod fast_load_tests {
         }
         jit::test_set_knobs(jit::TestKnobs { aot_probe: Some(true), ..jit::TestKnobs::NONE });
         test_uninstall();
+        TEST_AOT.with(|c| c.set(true));
 
         // Build 64 caller blocks all calling `callee_va`, plus 16 blocks calling `hook_target_va`.
         const N_CALLERS: usize = 64;
@@ -2870,7 +3239,7 @@ mod fast_load_tests {
             // Now hook `hook_target_va` and verify `check_install_blocks(&m, 4)` detects all
             // `N_HOOKED` callers PLUS `hook_target_va` itself across 4 worker threads.
             crate::exe::register_native_va(hook_target_va, host_ptr);
-            let (bad, _) = check_install_blocks(&d.modules[mi], 4);
+            let (bad, _, _) = check_install_blocks(&d.modules[mi], 4);
             crate::exe::unregister_native_va(hook_target_va);
             assert_eq!(
                 bad,
@@ -2878,5 +3247,147 @@ mod fast_load_tests {
                 "parallel check_install_blocks must flag hook_target_va and all {N_HOOKED} callers"
             );
         }
+    }
+
+    /// Out-of-module `register_native_va` bumps (e.g. lazily registered COM vtable methods) must
+    /// run incremental delta revalidation checking only `watch_blocks` instead of all blocks in
+    /// untouched modules, while still invalidating & reviving external watch callers, running a
+    /// full scan on in-module hooks or structural `invalidate_dispatch()`, and preserving exact
+    /// `VA_BLOOM` lookup semantics across register/unregister cycles.
+    #[test]
+    fn delta_revalidation_skips_plain_blocks_and_bloom_matches_va_dispatch() {
+        use iced_x86::code_asm::*;
+
+        const UNRELATED_HOST_VA: u64 = 0x7FFF_5555_1000;
+        const EXT_TARGET_VA: u64 = 0x7FFF_5555_2000;
+        struct Cleanup(u64);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                jit::test_set_knobs(jit::TestKnobs::NONE);
+                crate::exe::unregister_native_va(UNRELATED_HOST_VA);
+                crate::exe::unregister_native_va(EXT_TARGET_VA);
+                if self.0 != 0 {
+                    crate::exe::unregister_native_va(self.0);
+                }
+                test_uninstall();
+            }
+        }
+
+        // Verify VA_BLOOM rejects unregistered VAs and tracks register/unregister cleanly.
+        let host_ptr = dummy_host_va as *const () as usize;
+        assert!(crate::exe::lookup_native_va(UNRELATED_HOST_VA).is_none());
+        crate::exe::register_native_va(UNRELATED_HOST_VA, host_ptr);
+        assert!(crate::exe::va_bloom_may_contain(UNRELATED_HOST_VA));
+        assert_eq!(crate::exe::lookup_native_va(UNRELATED_HOST_VA), Some(host_ptr));
+        crate::exe::unregister_native_va(UNRELATED_HOST_VA);
+        assert!(crate::exe::lookup_native_va(UNRELATED_HOST_VA).is_none());
+
+        jit::test_set_knobs(jit::TestKnobs { aot_probe: Some(true), ..jit::TestKnobs::NONE });
+        test_uninstall();
+        TEST_AOT.with(|c| c.set(true));
+
+        // Build 32 plain intra-module blocks calling `in_mod_callee` + 1 watch block calling
+        // external `EXT_TARGET_VA` (via indirect/direct code outside `[base, base + sl.len())`).
+        const N_PLAIN: usize = 32;
+        let mut sl = vec![0xCCu8; 0x2000];
+        let base = sl.as_ptr() as u64;
+        let in_mod_callee = base + 0x100;
+        let _c = Cleanup(in_mod_callee);
+        {
+            let mut a = CodeAssembler::new(64).unwrap();
+            a.mov(eax, 123).unwrap();
+            a.ret().unwrap();
+            let b = a.assemble(in_mod_callee).unwrap();
+            sl[0x100..0x100 + b.len()].copy_from_slice(&b);
+        }
+        let mut ips = vec![in_mod_callee];
+        for i in 0..N_PLAIN {
+            let off = 0x200 + i * 0x20;
+            let ip = base + off as u64;
+            let mut a = CodeAssembler::new(64).unwrap();
+            a.call(in_mod_callee).unwrap();
+            a.ret().unwrap();
+            let b = a.assemble(ip).unwrap();
+            sl[off..off + b.len()].copy_from_slice(&b);
+            ips.push(ip);
+        }
+        // Build an image containing all N_PLAIN + 1 intra-module blocks, plus a separate tiny
+        // caller module whose sole block calls `in_mod_callee` (external to that module!).
+        let ext_caller_ip = base + 0x1000;
+        {
+            let mut a = CodeAssembler::new(64).unwrap();
+            a.call(in_mod_callee).unwrap();
+            a.ret().unwrap();
+            let b = a.assemble(ext_caller_ip).unwrap();
+            sl[0x1000..0x1000 + b.len()].copy_from_slice(&b);
+        }
+
+        let mut bc = Box::new(BlockCache::new());
+        let img = unsafe { build_image(&mut *bc, &ips, BUILD_VBASE) }.expect("build_image");
+        let inst = unsafe {
+            install_image("delta_plain", base as usize, 0x0F00, img, Verify::None, true)
+        }
+        .expect("install_image");
+        assert_eq!(inst.live, N_PLAIN + 1);
+        // Install the separate 1-block module whose sole block calls `in_mod_callee` (external to
+        // `[base + 0x1000, base + 0x1100)`), verifying external-assumption watch blocks still get
+        // killed and revived during delta revalidation.
+        let ext_img =
+            unsafe { build_image(&mut *bc, &[ext_caller_ip], BUILD_VBASE) }.expect("build_image");
+        let ext_inst = unsafe {
+            install_image("delta_ext", (base + 0x1000) as usize, 0x100, ext_img, Verify::None, true)
+        }
+        .expect("install_image ext");
+        assert_eq!(ext_inst.live, 1);
+        assert!(find(in_mod_callee).is_some());
+        assert!(find(ext_caller_ip).is_some());
+
+        // 1. Out-of-module `register_native_va(UNRELATED_HOST_VA, host_ptr)` must take the fast
+        //    delta path and check 0 plain intra-module blocks!
+        let b0 = TEST_REVALIDATE_BLOCKS_CHECKED.load(Ordering::Relaxed);
+        crate::exe::register_native_va(UNRELATED_HOST_VA, host_ptr);
+        assert!(find(in_mod_callee).is_some());
+        assert!(find(ext_caller_ip).is_some());
+        let checked_unrelated = TEST_REVALIDATE_BLOCKS_CHECKED.load(Ordering::Relaxed) - b0;
+        assert!(
+            checked_unrelated < N_PLAIN,
+            "out-of-module VA registration must skip plain blocks (checked {checked_unrelated} of {})",
+            N_PLAIN + 2
+        );
+
+        // 2. Hooking `in_mod_callee` must full-scan `delta_plain` AND check the external watch
+        //    block `ext_caller_ip` in `delta_ext`, killing both, then reviving both on unhook.
+        let b1 = TEST_REVALIDATE_BLOCKS_CHECKED.load(Ordering::Relaxed);
+        crate::exe::register_native_va(in_mod_callee, host_ptr);
+        assert!(find(base + 0x200).is_none(), "caller of hooked in-module callee must be killed");
+        assert!(find(ext_caller_ip).is_none(), "external watch caller must be killed");
+        let checked_in_mod = TEST_REVALIDATE_BLOCKS_CHECKED.load(Ordering::Relaxed) - b1;
+        assert!(
+            checked_in_mod >= N_PLAIN + 2,
+            "in-module VA registration must full-scan delta_plain + watch delta_ext (checked {checked_in_mod})"
+        );
+        crate::exe::unregister_native_va(in_mod_callee);
+        assert!(find(base + 0x200).is_some(), "caller must revive after unhook");
+        assert!(find(ext_caller_ip).is_some(), "external watch caller must revive after unhook");
+
+        // 3. Structural `invalidate_dispatch()` must force a full scan and rebuild `watch_blocks`,
+        //    after which another out-of-module registration again skips all plain blocks!
+        let b2 = TEST_REVALIDATE_BLOCKS_CHECKED.load(Ordering::Relaxed);
+        crate::exe::invalidate_dispatch();
+        assert!(find(in_mod_callee).is_some());
+        let checked_struct = TEST_REVALIDATE_BLOCKS_CHECKED.load(Ordering::Relaxed) - b2;
+        assert!(
+            checked_struct >= N_PLAIN + 2,
+            "structural invalidate_dispatch must full-scan all modules (checked {checked_struct})"
+        );
+
+        let b3 = TEST_REVALIDATE_BLOCKS_CHECKED.load(Ordering::Relaxed);
+        crate::exe::register_native_va(EXT_TARGET_VA, host_ptr);
+        assert!(find(in_mod_callee).is_some());
+        let checked_after_struct = TEST_REVALIDATE_BLOCKS_CHECKED.load(Ordering::Relaxed) - b3;
+        assert!(
+            checked_after_struct < N_PLAIN,
+            "out-of-module registration after structural scan must skip plain blocks (checked {checked_after_struct})"
+        );
     }
 }
