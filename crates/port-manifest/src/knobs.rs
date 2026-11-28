@@ -2505,7 +2505,7 @@ pub const KNOBS: &[KnobSpec] = &[
         aliases: &["AW2_AUTO_PLAY_SCRIPT"],
         kind: KnobType::Path,
         default: "",
-        description: "Path to scripted input playback file driven on swapchain Present.",
+        description: "Comma-separated frame:action[:hold_frames] scripted keyboard/XInput events driven on swapchain Present (e.g. '200:space:60,300:enter').",
         affects_aot_key: false,
         crates: &["win32-rt"],
     },
