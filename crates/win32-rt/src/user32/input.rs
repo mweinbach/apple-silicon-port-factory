@@ -1676,6 +1676,10 @@ struct RawReg {
     target: usize,
     #[allow(dead_code)] // registering thread (Windows scopes registrations per thread)
     tid: u32,
+    /// Highest `hid::Device::inst` already announced by this registration's initial
+    /// `RIDEV_DEVNOTIFY` replay; live `GIDC_ARRIVAL` callbacks with `inst <= this`
+    /// are suppressed so a device is never announced twice.
+    devnotify_after_inst: u32,
 }
 
 static RAW_REGS: Mutex<Vec<RawReg>> = Mutex::new(Vec::new());
@@ -1781,12 +1785,27 @@ pub fn native_raw_hid(inst: u32, usage_page: u16, usage: u16, report: &[u8]) {
     post_input_to(target, wm::INPUT, wparam, h as isize, Vec::new());
 }
 
+/// True when a `RegisterRawInputDevices` batch includes any live registration
+/// that can match a HID device (anything beyond legacy mouse `(1, 2)` and
+/// keyboard `(1, 6)`), regardless of whether `RIDEV_DEVNOTIFY` was requested.
+fn raw_batch_needs_hid_backend(parsed: &[RAWINPUTDEVICE]) -> bool {
+    parsed.iter().any(|d| {
+        (d.flags & RIDEV_REMOVE) == 0
+            && !is_exclude(d.flags)
+            && (is_page_only(d.flags) || !(d.usage_page == 1 && matches!(d.usage, 2 | 6)))
+    })
+}
+
 /// Notify Raw Input `RIDEV_DEVNOTIFY` listeners (`WM_INPUT_DEVICE_CHANGE`) when
 /// a HID device arrives or is removed. Safe to call from any thread.
 pub fn notify_raw_hid_device_change(inst: u32, usage_page: u16, usage: u16, arrived: bool) {
     let reg = raw_reg_matches(&RAW_REGS.lock().unwrap(), usage_page, usage)
         .filter(|r| (r.flags & RIDEV_DEVNOTIFY) != 0);
-    let Some(target) = reg.and_then(raw_devnotify_target) else { return };
+    let Some(reg) = reg else { return };
+    if arrived && inst <= reg.devnotify_after_inst {
+        return;
+    }
+    let Some(target) = raw_devnotify_target(reg) else { return };
     let wparam = if arrived { GIDC_ARRIVAL } else { GIDC_REMOVAL };
     message::post_message(target, wm::INPUT_DEVICE_CHANGE, wparam, raw_hid_handle(inst) as LPARAM);
 }
@@ -1878,10 +1897,38 @@ pub unsafe extern "win64" fn RegisterRawInputDevices(devs: *const RAWINPUTDEVICE
         }
     }
 
+    // Start the HID backend BEFORE installing the new registrations so:
+    // 1. HID registrations without RIDEV_DEVNOTIFY still start IOHIDManager and receive WM_INPUT;
+    // 2. initial HID matches delivered during backend startup cannot race ahead of our
+    //    RIDEV_DEVNOTIFY initial-arrival replay and announce the same device twice.
+    if raw_batch_needs_hid_backend(&parsed) {
+        crate::misc::hid::ensure_started();
+    }
+
     let mut newly_devnotify: Vec<(u16, u16, bool)> = Vec::new();
-    let mut need_hid_start = false;
-    let final_regs = {
+    let mut has_devnotify = false;
+    for d in &parsed {
+        if (d.flags & RIDEV_REMOVE) == 0 && !is_exclude(d.flags) && (d.flags & RIDEV_DEVNOTIFY) != 0 {
+            has_devnotify = true;
+            let key = (d.usage_page, d.usage, is_page_only(d.flags));
+            if !newly_devnotify.contains(&key) {
+                newly_devnotify.push(key);
+            }
+        }
+    }
+
+    let (final_regs, hid_snapshot) = {
         let mut regs = RAW_REGS.lock().unwrap();
+        // Lock order is strictly `RAW_REGS` -> `hid::registry()` (`hid.rs` always releases
+        // `registry()` before calling into `user32::input`). Recording `max_inst` under
+        // `RAW_REGS` ensures any concurrent `hid::device_added` arrival already in
+        // `hid_snapshot` is suppressed in `notify_raw_hid_device_change`, while any device
+        // added afterwards (`inst > max_inst`) is announced once by the live callback.
+        let (hid_snapshot, max_inst) = if has_devnotify {
+            crate::misc::hid::devices_with_max_inst()
+        } else {
+            (Vec::new(), 0)
+        };
         for d in &parsed {
             let page_only = is_page_only(d.flags);
             if d.flags & RIDEV_REMOVE != 0 {
@@ -1898,32 +1945,32 @@ pub unsafe extern "win64" fn RegisterRawInputDevices(devs: *const RAWINPUTDEVICE
                     && is_page_only(r.flags) == page_only
                     && (page_only || r.usage == d.usage))
             });
-            regs.push(RawReg { page: d.usage_page, usage: d.usage, flags: d.flags, target: d.target, tid });
-            if !is_exclude(d.flags) && (d.flags & RIDEV_DEVNOTIFY) != 0 {
-                let key = (d.usage_page, d.usage, page_only);
-                if !newly_devnotify.contains(&key) {
-                    newly_devnotify.push(key);
-                }
-                if page_only || !(d.usage_page == 1 && matches!(d.usage, 2 | 6)) {
-                    need_hid_start = true;
-                }
-            }
+            let devnotify_after_inst = if !is_exclude(d.flags) && (d.flags & RIDEV_DEVNOTIFY) != 0 {
+                max_inst
+            } else {
+                0
+            };
+            regs.push(RawReg {
+                page: d.usage_page,
+                usage: d.usage,
+                flags: d.flags,
+                target: d.target,
+                tid,
+                devnotify_after_inst,
+            });
             log::info!("RegisterRawInputDevices: ({},{}) flags={:#x} target={:#x}", d.usage_page, d.usage, d.flags, d.target);
         }
-        regs.clone()
+        (regs.clone(), hid_snapshot)
     };
 
     // Per Microsoft Learn, registering with RIDEV_DEVNOTIFY delivers initial
     // WM_INPUT_DEVICE_CHANGE(GIDC_ARRIVAL) notifications for already-present matching devices.
     if !newly_devnotify.is_empty() {
-        if need_hid_start {
-            crate::misc::hid::ensure_started();
-        }
         let mut present: Vec<(u16, u16, usize)> = vec![
             (1, 2, FAKE_MOUSE_DEVICE),
             (1, 6, FAKE_KEYBOARD_DEVICE),
         ];
-        for dev in crate::misc::hid::devices() {
+        for dev in hid_snapshot {
             if dev.connected() {
                 present.push((dev.caps.usage_page, dev.caps.usage, raw_hid_handle(dev.inst)));
             }
@@ -3495,8 +3542,59 @@ mod tests {
                 arrivals.push(m.lparam as usize);
             }
             assert!(arrivals.contains(&expected_h), "expected initial GIDC_ARRIVAL for DualSense: {arrivals:#x?}");
+            assert_eq!(
+                arrivals.iter().filter(|&&h| h == expected_h).count(),
+                1,
+                "already-connected DualSense must receive exactly one GIDC_ARRIVAL"
+            );
             assert!(arrivals.contains(&FAKE_KEYBOARD_DEVICE), "expected initial GIDC_ARRIVAL for keyboard");
             assert!(!arrivals.contains(&FAKE_MOUSE_DEVICE), "excluded mouse must not fire GIDC_ARRIVAL");
+
+            // A delayed/in-flight startup callback for the already-announced instance must not replay a second arrival.
+            notify_raw_hid_device_change(dev.inst, dev.caps.usage_page, dev.caps.usage, true);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                FALSE,
+                "delayed arrival for an already-replayed inst must be deduplicated"
+            );
+
+            // A subsequent hotplug arrival (higher inst) must fire GIDC_ARRIVAL once.
+            const DEV_ID_2: u64 = 0xD5_7702;
+            let _be2 = crate::misc::hid::tests::install_fake_dualsense(DEV_ID_2);
+            let dev2 = crate::misc::hid::devices()
+                .into_iter()
+                .find(|d| d.desc.id == DEV_ID_2)
+                .expect("second fake DualSense should be registered");
+            let expected_h2 = raw_hid_handle(dev2.inst);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                TRUE
+            );
+            assert_eq!(m.wparam, GIDC_ARRIVAL);
+            assert_eq!(m.lparam as usize, expected_h2);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                FALSE
+            );
+            crate::misc::hid::device_removed(DEV_ID_2);
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT_DEVICE_CHANGE, wm::INPUT_DEVICE_CHANGE, message::PM_REMOVE),
+                TRUE
+            );
+            assert_eq!(m.wparam, GIDC_REMOVAL);
+            assert_eq!(m.lparam as usize, expected_h2);
+
+            // Non-DEVNOTIFY HID registrations (flags=0, RIDEV_INPUTSINK, RIDEV_PAGEONLY) still require starting the HID backend,
+            // while legacy mouse/keyboard-only, REMOVE, and EXCLUDE batches do not.
+            assert!(raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: 0, target: hwnd as usize }]));
+            assert!(raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 4, flags: RIDEV_INPUTSINK, target: hwnd as usize }]));
+            assert!(raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 0, flags: RIDEV_PAGEONLY, target: hwnd as usize }]));
+            assert!(!raw_batch_needs_hid_backend(&[
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_NOLEGACY, target: hwnd as usize },
+                RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_DEVNOTIFY, target: hwnd as usize },
+            ]));
+            assert!(!raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_REMOVE, target: 0 }]));
+            assert!(!raw_batch_needs_hid_backend(&[RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_EXCLUDE, target: 0 }]));
 
             // Deliver a HID report and verify WM_INPUT + GetRawInputData(RID_INPUT) RAWHID payload.
             let mut rep = [0u8; 64];

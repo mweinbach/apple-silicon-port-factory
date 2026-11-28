@@ -284,6 +284,14 @@ pub fn devices() -> Vec<Arc<Device>> {
     registry().lock().unwrap().devices.clone()
 }
 
+/// Atomically snapshot currently connected devices along with the highest
+/// `Device::inst` assigned so far (for deduplicating initial `RIDEV_DEVNOTIFY`
+/// arrivals against concurrent `device_added` callbacks).
+pub fn devices_with_max_inst() -> (Vec<Arc<Device>>, u32) {
+    let r = registry().lock().unwrap();
+    (r.devices.clone(), r.next_inst.saturating_sub(1))
+}
+
 /// Look up a currently connected HID device by its stable instance number (`Device::inst`).
 pub fn device_by_inst(inst: u32) -> Option<Arc<Device>> {
     registry().lock().unwrap().devices.iter().find(|d| d.inst == inst && d.connected()).cloned()
