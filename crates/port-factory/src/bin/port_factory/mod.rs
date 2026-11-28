@@ -149,6 +149,8 @@ pub fn usage() -> ! {
                                                 Run execution-mode knob matrix & O(log N) PORT_AOT_SKIP/PORT_JIT_SKIP binary search\n\
            live-probe --manifest TOML|--pe EXE [--game-dir DIR] [--script FILE] [--step CMD...] [--repeat N] [--json]\n\
                                                 Frame-paced PORT_CONTROL_DIR automation, PNG capture & pass/fail repro harness\n\
+           boot-triage --manifest TOML|--pe EXE [--game-dir DIR] [--args STR] [--timeout N] [--json] [--summary-only] [--log-file FILE]\n\
+                                                Run port-runner headless, classify first blocker (imports/stubs/crash/panic/Metal/HRESULT/hang), and route to owning crate\n\
            nan-trace <PE_OR_TOML> [--game-dir DIR] [--module MOD] [--watch LO..HI] [--dump-dir DIR] [--log FILE] [--armed] [--run-oracle] [-- <game-args...>]\n\
                                                 Launch port-runner pre-configured with PORT_NAN_TRACE + PORT_NAN_BOUNDARY (and optional Rosetta oracle)\n\
            bench [--mode aot|jit] [--only W1,W2] [--tolerance 0.25] [--baseline FILE] [--out FILE] [--runner PATH] [--update-baseline] [--no-compare] [--json]\n\
