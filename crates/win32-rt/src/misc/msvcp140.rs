@@ -33,7 +33,7 @@ use crate::sync::{
 };
 use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_char, c_void};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub static ORDINALS: &[(u16, &str)] = &[];
@@ -312,6 +312,63 @@ pub unsafe extern "win64" fn _Thrd_yield() {
     let _ = crate::kernel32::time::SwitchToThread();
 }
 
+pub unsafe extern "win64" fn _Thrd_hardware_concurrency() -> u32 {
+    crate::process::num_cpus().max(1) as u32
+}
+
+static SHARED_PTR_SPIN: AtomicBool = AtomicBool::new(false);
+
+pub unsafe extern "win64" fn _Lock_shared_ptr_spin_lock() {
+    let mut spins = 0u32;
+    while SHARED_PTR_SPIN
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spins = spins.wrapping_add(1);
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+            spins = 0;
+        }
+    }
+}
+
+pub unsafe extern "win64" fn _Unlock_shared_ptr_spin_lock() {
+    SHARED_PTR_SPIN.store(false, Ordering::Release);
+}
+
+/// MSVC Dinkumware `short _FExp(float *px, float y, short eoff)`:
+/// computes `*px = exp(*px) * y * 2^eoff` and returns the MSVC floating-point
+/// class code (`0` = zero, `-1` = finite, `1` = inf, `2` = NaN).
+unsafe extern "win64" fn fexp_impl(px: *mut f32, y: f32, eoff: i16) -> i16 {
+    if px.is_null() {
+        return 0;
+    }
+    let x = std::ptr::read_unaligned(px);
+    if x.is_nan() || y.is_nan() {
+        std::ptr::write_unaligned(px, f32::NAN);
+        return 2; // _NANCODE
+    }
+    if y == 0.0 {
+        std::ptr::write_unaligned(px, 0.0f32.copysign(y));
+        return 0; // FP_ZERO
+    }
+    let scaled_x = (x as f64) + (eoff as f64) * std::f64::consts::LN_2;
+    let r = (scaled_x.exp() * (y as f64)) as f32;
+    std::ptr::write_unaligned(px, r);
+    if r.is_nan() {
+        2
+    } else if r.is_infinite() {
+        1 // _INFCODE
+    } else if r == 0.0 {
+        0 // FP_ZERO
+    } else {
+        -1 // _FINITE
+    }
+}
+crate::win64_bridge!(fn fexp_impl(*mut f32, f32, i16) -> i16);
+
 pub unsafe extern "win64" fn _Thrd_sleep(target: *const Xtime) {
     if target.is_null() {
         return;
@@ -584,6 +641,20 @@ unsafe extern "win64" fn xout_of_range(msg: *const c_char) {
     super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
 }
 
+unsafe extern "win64" fn xoverflow_error(msg: *const c_char) {
+    let s = if msg.is_null() { "" } else { CStr::from_ptr(msg).to_str().unwrap_or("") };
+    log::error!("std::_Xoverflow_error({s:?})");
+    super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
+}
+
+unsafe extern "win64" fn xruntime_error(msg: *const c_char) {
+    let s = if msg.is_null() { "" } else { CStr::from_ptr(msg).to_str().unwrap_or("") };
+    log::error!("std::_Xruntime_error({s:?})");
+    super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
+}
+
+pub static RAISE_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
 unsafe extern "win64" fn xregex_error(err: i32) {
     log::error!("std::_Xregex_error({err})");
     super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
@@ -804,8 +875,9 @@ pub static ID_CODECVT_W: LocaleId = LocaleId(UnsafeCell::new([1, 0]));
 pub static ID_COLLATE_D: LocaleId = LocaleId(UnsafeCell::new([2, 0]));
 pub static ID_CTYPE_D: LocaleId = LocaleId(UnsafeCell::new([3, 0]));
 pub static ID_NUMPUNCT_D: LocaleId = LocaleId(UnsafeCell::new([4, 0]));
+pub static ID_CTYPE_W: LocaleId = LocaleId(UnsafeCell::new([8, 0]));
 
-static NEXT_LOCALE_ID: AtomicUsize = AtomicUsize::new(8);
+static NEXT_LOCALE_ID: AtomicUsize = AtomicUsize::new(9);
 
 unsafe extern "win64" fn locale_id_operator_usize(this: *mut usize) -> usize {
     if this.is_null() {
@@ -859,11 +931,22 @@ pub struct Locinfo {
 unsafe extern "win64" fn locinfo_ctor(this: *mut u8, name: *const c_char) -> *mut u8 {
     if !this.is_null() {
         std::ptr::write_bytes(this, 0, 0x68);
-        if !name.is_null() {
-            yarn_assign(this.add(0x58) as *mut *mut u8, name);
-        }
+        let eff = if name.is_null() || *name == 0 { c"C".as_ptr() } else { name };
+        yarn_assign(this.add(0x58) as *mut *mut u8, eff);
     }
     this
+}
+
+unsafe extern "win64" fn locinfo_ctor_cat(this: *mut u8, _cat: i32, name: *const c_char) -> *mut u8 {
+    locinfo_ctor(this, name)
+}
+
+unsafe extern "win64" fn locinfo_getname(this: *const u8) -> *const c_char {
+    if this.is_null() {
+        return c"C".as_ptr();
+    }
+    let p = std::ptr::read_unaligned(this.add(0x58) as *const *const c_char);
+    if p.is_null() || *p == 0 { c"C".as_ptr() } else { p }
 }
 
 unsafe extern "win64" fn locinfo_dtor(this: *mut u8) {
@@ -1076,6 +1159,57 @@ unsafe extern "win64" fn locale_init(do_incref: u8) -> *mut Locimp {
     loc
 }
 
+unsafe extern "win64" fn locimp_new_bool(transparent: u8) -> *mut Locimp {
+    ensure_vtables_registered();
+    let dst = crate::ucrt::heap::calloc(1, std::mem::size_of::<Locimp>()) as *mut Locimp;
+    if dst.is_null() {
+        return dst;
+    }
+    (*dst).vtable = FACET_VTABLE.as_ptr();
+    (*dst).refs = AtomicU32::new(1);
+    (*dst).catmask = 0x3f;
+    (*dst).transparent = transparent;
+    (*dst).cloc_inline_name[0] = b'C';
+    dst
+}
+
+unsafe extern "win64" fn locimp_makeloc(
+    lobj: *const u8,
+    cat: i32,
+    ptrimp: *mut Locimp,
+    _ptrloc: *const c_void,
+) -> *mut Locimp {
+    let imp = if ptrimp.is_null() { locimp_new_bool(0) } else { ptrimp };
+    if imp.is_null() {
+        return imp;
+    }
+    if cat != 0 {
+        (*imp).catmask |= cat;
+    }
+    if !lobj.is_null() {
+        let name = locinfo_getname(lobj);
+        if !name.is_null() {
+            yarn_assign(&mut (*imp).name as *mut *mut c_char as *mut *mut u8, name);
+        }
+    }
+    // Populate ctype<char> and ctype<wchar_t> facets when _M_CTYPE (2) is requested.
+    if (cat & 2) != 0 {
+        let mut f_char: *const Facet = std::ptr::null();
+        let _ = ctype_getcat(&mut f_char, std::ptr::null());
+        if !f_char.is_null() {
+            let id = locale_id_operator_usize(ID_CTYPE_D.0.get() as *mut usize);
+            locimp_addfac(imp, f_char as *mut Facet, id);
+        }
+        let mut f_wide: *const Facet = std::ptr::null();
+        let _ = ctype_w_getcat(&mut f_wide, std::ptr::null());
+        if !f_wide.is_null() {
+            let id = locale_id_operator_usize(ID_CTYPE_W.0.get() as *mut usize);
+            locimp_addfac(imp, f_wide as *mut Facet, id);
+        }
+    }
+    imp
+}
+
 unsafe extern "win64" fn locimp_new(src: *const Locimp) -> *mut Locimp {
     ensure_vtables_registered();
     let dst = crate::ucrt::heap::calloc(1, std::mem::size_of::<Locimp>()) as *mut Locimp;
@@ -1274,6 +1408,285 @@ unsafe extern "win64" fn ctype_tolower_range(
     last: *const u8,
 ) -> *const u8 {
     ctype_do_tolower_range(this, first, last)
+}
+
+/// `std::ctype<wchar_t>` (`0x60` bytes on MSVC x64: `facet` + `_Ctypevec` + `_Cvtvec`).
+#[repr(C)]
+pub struct CtypeW {
+    pub vtable: *const Ptr,
+    pub refs: AtomicU32,
+    pub _pad0: u32,
+    pub page: u32,
+    pub _pad1: u32,
+    pub table: *const u16,
+    pub delfl: i32,
+    pub _pad2: u32,
+    pub locale_name: *mut u16,
+    pub cvt: Cvtvec,
+}
+const _: () = assert!(std::mem::size_of::<CtypeW>() == 0x60);
+
+static CTYPE_W_VTABLE: [Ptr; 15] = [
+    Ptr(ctype_w_deleting_dtor as *const ()),
+    Ptr(facet_incref as *const ()),
+    Ptr(facet_decref as *const ()),
+    Ptr(ctype_w_do_is_range as *const ()),
+    Ptr(ctype_w_do_is_char as *const ()),
+    Ptr(ctype_w_do_scan_is as *const ()),
+    Ptr(ctype_w_do_scan_not as *const ()),
+    Ptr(ctype_w_do_tolower_range as *const ()),
+    Ptr(ctype_w_do_tolower_char as *const ()),
+    Ptr(ctype_w_do_toupper_range as *const ()),
+    Ptr(ctype_w_do_toupper_char as *const ()),
+    Ptr(ctype_w_do_widen_range as *const ()),
+    Ptr(ctype_w_do_widen_char as *const ()),
+    Ptr(ctype_w_do_narrow_range as *const ()),
+    Ptr(ctype_w_do_narrow_char as *const ()),
+];
+
+unsafe extern "win64" fn ctype_w_deleting_dtor(this: *mut CtypeW, flags: u32) -> *mut CtypeW {
+    if !this.is_null() {
+        (*this).vtable = FACET_VTABLE.as_ptr();
+        if (flags & 1) != 0 {
+            crate::ucrt::heap::free(this.cast());
+        }
+    }
+    this
+}
+
+#[inline]
+fn wchar_ctype_mask(ch: u16) -> u16 {
+    let mut m = 0u16;
+    if ch < 256 {
+        let p = unsafe { crate::ucrt::string::__pctype_func() };
+        if !p.is_null() {
+            return unsafe { *p.add(ch as usize) };
+        }
+    }
+    if let Some(c) = char::from_u32(ch as u32) {
+        if c.is_uppercase() {
+            m |= 0x0101; // _ALPHA | _UPPER
+        }
+        if c.is_lowercase() {
+            m |= 0x0102; // _ALPHA | _LOWER
+        }
+        if c.is_alphabetic() {
+            m |= 0x0100; // _ALPHA
+        }
+        if c.is_ascii_digit() {
+            m |= 0x0004; // _DIGIT
+        }
+        if c.is_whitespace() {
+            m |= 0x0008; // _SPACE
+        }
+        if c.is_control() {
+            m |= 0x0020; // _CONTROL
+        }
+    }
+    m
+}
+
+#[inline]
+fn wchar_to_lower(ch: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&ch) {
+        ch + 32
+    } else if let Some(c) = char::from_u32(ch as u32) {
+        let mut it = c.to_lowercase();
+        if let (Some(first), None) = (it.next(), it.next()) {
+            if (first as u32) <= 0xFFFF {
+                return first as u16;
+            }
+        }
+        ch
+    } else {
+        ch
+    }
+}
+
+#[inline]
+fn wchar_to_upper(ch: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&ch) {
+        ch - 32
+    } else if let Some(c) = char::from_u32(ch as u32) {
+        let mut it = c.to_uppercase();
+        if let (Some(first), None) = (it.next(), it.next()) {
+            if (first as u32) <= 0xFFFF {
+                return first as u16;
+            }
+        }
+        ch
+    } else {
+        ch
+    }
+}
+
+unsafe extern "win64" fn ctype_w_do_is_char(_this: *const CtypeW, mask: u16, ch: u16) -> u8 {
+    ((wchar_ctype_mask(ch) & mask) != 0) as u8
+}
+
+unsafe extern "win64" fn ctype_w_do_is_range(
+    _this: *const CtypeW,
+    mut first: *const u16,
+    last: *const u16,
+    mut dest: *mut u16,
+) -> *const u16 {
+    while first < last {
+        let ch = std::ptr::read_unaligned(first);
+        if !dest.is_null() {
+            std::ptr::write_unaligned(dest, wchar_ctype_mask(ch));
+            dest = dest.add(1);
+        }
+        first = first.add(1);
+    }
+    last
+}
+
+unsafe extern "win64" fn ctype_w_do_scan_is(
+    _this: *const CtypeW,
+    mask: u16,
+    mut first: *const u16,
+    last: *const u16,
+) -> *const u16 {
+    while first < last {
+        if (wchar_ctype_mask(std::ptr::read_unaligned(first)) & mask) != 0 {
+            return first;
+        }
+        first = first.add(1);
+    }
+    last
+}
+
+unsafe extern "win64" fn ctype_w_do_scan_not(
+    _this: *const CtypeW,
+    mask: u16,
+    mut first: *const u16,
+    last: *const u16,
+) -> *const u16 {
+    while first < last {
+        if (wchar_ctype_mask(std::ptr::read_unaligned(first)) & mask) == 0 {
+            return first;
+        }
+        first = first.add(1);
+    }
+    last
+}
+
+unsafe extern "win64" fn ctype_w_do_tolower_char(_this: *const CtypeW, ch: u16) -> u16 {
+    wchar_to_lower(ch)
+}
+
+unsafe extern "win64" fn ctype_w_do_tolower_range(
+    _this: *const CtypeW,
+    mut first: *mut u16,
+    last: *const u16,
+) -> *const u16 {
+    while (first as *const u16) < last {
+        let ch = std::ptr::read_unaligned(first);
+        std::ptr::write_unaligned(first, wchar_to_lower(ch));
+        first = first.add(1);
+    }
+    last
+}
+
+unsafe extern "win64" fn ctype_w_do_toupper_char(_this: *const CtypeW, ch: u16) -> u16 {
+    wchar_to_upper(ch)
+}
+
+unsafe extern "win64" fn ctype_w_do_toupper_range(
+    _this: *const CtypeW,
+    mut first: *mut u16,
+    last: *const u16,
+) -> *const u16 {
+    while (first as *const u16) < last {
+        let ch = std::ptr::read_unaligned(first);
+        std::ptr::write_unaligned(first, wchar_to_upper(ch));
+        first = first.add(1);
+    }
+    last
+}
+
+unsafe extern "win64" fn ctype_w_do_widen_char(_this: *const CtypeW, ch: u8) -> u16 {
+    ch as u16
+}
+
+unsafe extern "win64" fn ctype_w_do_widen_range(
+    _this: *const CtypeW,
+    mut first: *const u8,
+    last: *const u8,
+    mut dest: *mut u16,
+) -> *const u8 {
+    while first < last {
+        if !dest.is_null() {
+            std::ptr::write_unaligned(dest, *first as u16);
+            dest = dest.add(1);
+        }
+        first = first.add(1);
+    }
+    last
+}
+
+unsafe extern "win64" fn ctype_w_do_narrow_char(_this: *const CtypeW, ch: u16, dflt: u8) -> u8 {
+    if ch <= 0xFF { ch as u8 } else { dflt }
+}
+
+unsafe extern "win64" fn ctype_w_do_narrow_range(
+    _this: *const CtypeW,
+    mut first: *const u16,
+    last: *const u16,
+    dflt: u8,
+    mut dest: *mut u8,
+) -> *const u16 {
+    while first < last {
+        let ch = std::ptr::read_unaligned(first);
+        if !dest.is_null() {
+            *dest = if ch <= 0xFF { ch as u8 } else { dflt };
+            dest = dest.add(1);
+        }
+        first = first.add(1);
+    }
+    last
+}
+
+unsafe extern "win64" fn ctype_w_getcat(ppf: *mut *const Facet, _ploc: *const c_void) -> usize {
+    ensure_vtables_registered();
+    if !ppf.is_null() && (*ppf).is_null() {
+        let p = crate::ucrt::heap::calloc(1, std::mem::size_of::<CtypeW>()) as *mut CtypeW;
+        if !p.is_null() {
+            (*p).vtable = CTYPE_W_VTABLE.as_ptr();
+            (*p).refs = AtomicU32::new(0);
+            (*p).page = 0;
+            (*p).table = crate::ucrt::string::__pctype_func();
+            (*p).delfl = 0;
+            locinfo_getcvt(std::ptr::null(), &mut (*p).cvt);
+            *ppf = p.cast();
+        }
+    }
+    2 // _X_CTYPE
+}
+
+unsafe extern "win64" fn ctype_w_toupper_range(
+    this: *const CtypeW,
+    first: *mut u16,
+    last: *const u16,
+) -> *const u16 {
+    if !this.is_null() && !(*this).vtable.is_null() && (*this).vtable != CTYPE_W_VTABLE.as_ptr() {
+        let f = (*(*this).vtable.add(9)).0 as usize;
+        if f != 0 {
+            return crate::call_guest8(f, this as u64, first as u64, last as u64, 0, 0, 0, 0, 0)
+                as *const u16;
+        }
+    }
+    ctype_w_do_toupper_range(this, first, last)
+}
+
+unsafe extern "win64" fn ctype_w_widen_char(this: *const CtypeW, ch: u8) -> u16 {
+    if !this.is_null() && !(*this).vtable.is_null() && (*this).vtable != CTYPE_W_VTABLE.as_ptr() {
+        let f = (*(*this).vtable.add(12)).0 as usize;
+        if f != 0 {
+            return crate::call_guest8(f, this as u64, ch as u64, 0, 0, 0, 0, 0, 0) as u16;
+        }
+    }
+    ctype_w_do_widen_char(this, ch)
 }
 
 /// `std::codecvt<char32_t, char, mbstate_t>` (`0x18` bytes) & `std::codecvt<wchar_t, char, mbstate_t>` (`0x40` bytes).
@@ -1760,6 +2173,9 @@ unsafe extern "win64" fn streambuf_xsputn(
 unsafe extern "win64" fn streambuf_seekoff(
     _this: *mut BasicStreambuf,
     out: *mut [i64; 3],
+    _off: i64,
+    _way: i32,
+    _mode: i32,
 ) -> *mut [i64; 3] {
     if !out.is_null() {
         std::ptr::write_unaligned(out, [-1, 0, 0]);
@@ -1770,11 +2186,203 @@ unsafe extern "win64" fn streambuf_seekoff(
 unsafe extern "win64" fn streambuf_seekpos(
     _this: *mut BasicStreambuf,
     out: *mut [i64; 3],
+    _pos: *const [i64; 3],
+    _mode: i32,
 ) -> *mut [i64; 3] {
     if !out.is_null() {
         std::ptr::write_unaligned(out, [-1, 0, 0]);
     }
     out
+}
+
+unsafe extern "win64" fn streambuf_copy_ctor(
+    this: *mut BasicStreambuf,
+    rhs: *const BasicStreambuf,
+) -> *mut BasicStreambuf {
+    streambuf_ctor(this);
+    if !this.is_null() && !rhs.is_null() {
+        if !(*rhs).igfirst.is_null() {
+            (*this).gfirst = *(*rhs).igfirst;
+        }
+        if !(*rhs).ipfirst.is_null() {
+            (*this).pfirst = *(*rhs).ipfirst;
+        }
+        if !(*rhs).ignext.is_null() {
+            (*this).gnext = *(*rhs).ignext;
+        }
+        if !(*rhs).ipnext.is_null() {
+            (*this).pnext = *(*rhs).ipnext;
+        }
+        if !(*rhs).igcount.is_null() {
+            (*this).gcount = *(*rhs).igcount;
+        }
+        if !(*rhs).ipcount.is_null() {
+            (*this).pcount = *(*rhs).ipcount;
+        }
+    }
+    this
+}
+
+unsafe extern "win64" fn streambuf_copy_assign(
+    this: *mut BasicStreambuf,
+    rhs: *const BasicStreambuf,
+) -> *mut BasicStreambuf {
+    if !this.is_null() && !rhs.is_null() && (this as *const BasicStreambuf) != rhs {
+        if !(*this).igfirst.is_null() && !(*rhs).igfirst.is_null() {
+            *(*this).igfirst = *(*rhs).igfirst;
+        }
+        if !(*this).ipfirst.is_null() && !(*rhs).ipfirst.is_null() {
+            *(*this).ipfirst = *(*rhs).ipfirst;
+        }
+        if !(*this).ignext.is_null() && !(*rhs).ignext.is_null() {
+            *(*this).ignext = *(*rhs).ignext;
+        }
+        if !(*this).ipnext.is_null() && !(*rhs).ipnext.is_null() {
+            *(*this).ipnext = *(*rhs).ipnext;
+        }
+        if !(*this).igcount.is_null() && !(*rhs).igcount.is_null() {
+            *(*this).igcount = *(*rhs).igcount;
+        }
+        if !(*this).ipcount.is_null() && !(*rhs).ipcount.is_null() {
+            *(*this).ipcount = *(*rhs).ipcount;
+        }
+    }
+    this
+}
+
+unsafe extern "win64" fn streambuf_init_ptrs(
+    this: *mut BasicStreambuf,
+    gf: *mut *mut u8,
+    gn: *mut *mut u8,
+    gc: *mut i32,
+    pf: *mut *mut u8,
+    pn: *mut *mut u8,
+    pc: *mut i32,
+) {
+    if !this.is_null() {
+        (*this).igfirst = gf;
+        (*this).ignext = gn;
+        (*this).igcount = gc;
+        (*this).ipfirst = pf;
+        (*this).ipnext = pn;
+        (*this).ipcount = pc;
+    }
+}
+
+unsafe extern "win64" fn streambuf_gnavail(this: *const BasicStreambuf) -> i64 {
+    if this.is_null() || (*this).ignext.is_null() || (*(*this).ignext).is_null() || (*this).igcount.is_null() {
+        0
+    } else {
+        *(*this).igcount as i64
+    }
+}
+
+unsafe extern "win64" fn streambuf_pnavail(this: *const BasicStreambuf) -> i64 {
+    if this.is_null() || (*this).ipnext.is_null() || (*(*this).ipnext).is_null() || (*this).ipcount.is_null() {
+        0
+    } else {
+        *(*this).ipcount as i64
+    }
+}
+
+unsafe extern "win64" fn streambuf_gndec(this: *mut BasicStreambuf) -> *mut u8 {
+    if this.is_null() || (*this).ignext.is_null() || (*(*this).ignext).is_null() {
+        return std::ptr::null_mut();
+    }
+    if !(*this).igcount.is_null() {
+        *(*this).igcount += 1;
+    }
+    let p = (*(*this).ignext).wrapping_sub(1);
+    *(*this).ignext = p;
+    p
+}
+
+unsafe extern "win64" fn streambuf_gninc(this: *mut BasicStreambuf) -> *mut u8 {
+    if this.is_null() || (*this).ignext.is_null() || (*(*this).ignext).is_null() {
+        return std::ptr::null_mut();
+    }
+    if !(*this).igcount.is_null() {
+        *(*this).igcount -= 1;
+    }
+    let p = *(*this).ignext;
+    *(*this).ignext = p.wrapping_add(1);
+    p
+}
+
+unsafe extern "win64" fn streambuf_gbump(this: *mut BasicStreambuf, off: i32) {
+    if this.is_null() || (*this).ignext.is_null() || (*this).igcount.is_null() {
+        return;
+    }
+    *(*this).igcount = (*(*this).igcount).wrapping_sub(off);
+    if !(*(*this).ignext).is_null() {
+        *(*this).ignext = (*(*this).ignext).wrapping_offset(off as isize);
+    }
+}
+
+unsafe extern "win64" fn streambuf_pbump(this: *mut BasicStreambuf, off: i32) {
+    if this.is_null() || (*this).ipnext.is_null() || (*this).ipcount.is_null() {
+        return;
+    }
+    *(*this).ipcount = (*(*this).ipcount).wrapping_sub(off);
+    if !(*(*this).ipnext).is_null() {
+        *(*this).ipnext = (*(*this).ipnext).wrapping_offset(off as isize);
+    }
+}
+
+unsafe extern "win64" fn streambuf_setg(
+    this: *mut BasicStreambuf,
+    first: *mut u8,
+    next: *mut u8,
+    last: *mut u8,
+) {
+    if this.is_null() {
+        return;
+    }
+    if !(*this).igfirst.is_null() {
+        *(*this).igfirst = first;
+    }
+    if !(*this).ignext.is_null() {
+        *(*this).ignext = next;
+    }
+    if !(*this).igcount.is_null() {
+        *(*this).igcount = if next.is_null() || last.is_null() {
+            0
+        } else {
+            (last as isize).wrapping_sub(next as isize) as i32
+        };
+    }
+}
+
+unsafe extern "win64" fn streambuf_setp3(
+    this: *mut BasicStreambuf,
+    first: *mut u8,
+    next: *mut u8,
+    last: *mut u8,
+) {
+    if this.is_null() {
+        return;
+    }
+    if !(*this).ipfirst.is_null() {
+        *(*this).ipfirst = first;
+    }
+    if !(*this).ipnext.is_null() {
+        *(*this).ipnext = next;
+    }
+    if !(*this).ipcount.is_null() {
+        *(*this).ipcount = if next.is_null() || last.is_null() {
+            0
+        } else {
+            (last as isize).wrapping_sub(next as isize) as i32
+        };
+    }
+}
+
+unsafe extern "win64" fn streambuf_setp2(
+    this: *mut BasicStreambuf,
+    first: *mut u8,
+    last: *mut u8,
+) {
+    streambuf_setp3(this, first, first, last);
 }
 
 unsafe extern "win64" fn streambuf_setbuf(
@@ -1924,6 +2532,115 @@ unsafe extern "win64" fn ios_ctor(this: *mut BasicIos) -> *mut BasicIos {
     if !this.is_null() {
         std::ptr::write_bytes(this, 0, 1);
         (*this).vtable = BASIC_IOS_VTABLE.as_ptr();
+    }
+    this
+}
+
+unsafe extern "win64" fn ios_ctor_sb(
+    this: *mut BasicIos,
+    sb: *mut BasicStreambuf,
+) -> *mut BasicIos {
+    ios_ctor(this);
+    ios_init(this, sb);
+    this
+}
+
+unsafe extern "win64" fn ios_init_export(
+    this: *mut BasicIos,
+    sb: *mut BasicStreambuf,
+    _isstd: u8,
+) {
+    ios_init(this, sb);
+}
+
+unsafe extern "win64" fn ios_base_bool(this: *const BasicIos) -> u8 {
+    (!this.is_null() && ((*this).mystate & 6) == 0) as u8
+}
+
+unsafe extern "win64" fn ios_base_flags(this: *const BasicIos) -> i32 {
+    if this.is_null() { 0 } else { (*this).fmtfl }
+}
+
+unsafe extern "win64" fn ios_base_setf1(this: *mut BasicIos, newfmt: i32) -> i32 {
+    if this.is_null() {
+        return 0;
+    }
+    let old = (*this).fmtfl;
+    (*this).fmtfl = (old | newfmt) & 0xFFFF;
+    old
+}
+
+unsafe extern "win64" fn ios_base_setf2(this: *mut BasicIos, newfmt: i32, mask: i32) -> i32 {
+    if this.is_null() {
+        return 0;
+    }
+    let old = (*this).fmtfl;
+    (*this).fmtfl = ((old & !mask) | (newfmt & mask)) & 0xFFFF;
+    old
+}
+
+unsafe extern "win64" fn ios_base_width_get(this: *const BasicIos) -> i64 {
+    if this.is_null() { 0 } else { (*this).wide }
+}
+
+unsafe extern "win64" fn ios_base_width_set(this: *mut BasicIos, newwidth: i64) -> i64 {
+    if this.is_null() {
+        return 0;
+    }
+    let old = (*this).wide;
+    (*this).wide = newwidth;
+    old
+}
+
+unsafe extern "win64" fn ios_fill_get(this: *const BasicIos) -> u8 {
+    if this.is_null() { b' ' } else { (*this).fillch }
+}
+
+unsafe extern "win64" fn ios_rdbuf_get(this: *const BasicIos) -> *mut BasicStreambuf {
+    if this.is_null() { std::ptr::null_mut() } else { (*this).mystrbuf }
+}
+
+unsafe extern "win64" fn ios_rdbuf_set(
+    this: *mut BasicIos,
+    sb: *mut BasicStreambuf,
+) -> *mut BasicStreambuf {
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let old = (*this).mystrbuf;
+    (*this).mystrbuf = sb;
+    (*this).mystate = if sb.is_null() { 4 } else { 0 };
+    old
+}
+
+unsafe extern "win64" fn ios_tie_get(this: *const BasicIos) -> *mut c_void {
+    if this.is_null() { std::ptr::null_mut() } else { (*this).tiestr }
+}
+
+unsafe extern "win64" fn ios_copyfmt(
+    this: *mut BasicIos,
+    rhs: *const BasicIos,
+) -> *mut BasicIos {
+    if this.is_null() || rhs.is_null() || (this as *const BasicIos) == rhs {
+        return this;
+    }
+    (*this).fmtfl = (*rhs).fmtfl;
+    (*this).prec = (*rhs).prec;
+    (*this).wide = (*rhs).wide;
+    (*this).fillch = (*rhs).fillch;
+    (*this).tiestr = (*rhs).tiestr;
+    (*this).except = (*rhs).except;
+    if !(*rhs).ploc.is_null() {
+        let loc_imp = (*(*rhs).ploc)[1] as *mut Locimp;
+        if !loc_imp.is_null() {
+            (*loc_imp).refs.fetch_add(1, Ordering::Relaxed);
+        }
+        if (*this).ploc.is_null() {
+            (*this).ploc = crate::ucrt::heap::calloc(1, 16) as *mut [usize; 2];
+        }
+        if !(*this).ploc.is_null() {
+            (*(*this).ploc)[1] = loc_imp as usize;
+        }
     }
     this
 }
@@ -2131,6 +2848,69 @@ unsafe fn ostream_write_str(this: *mut u8, s: &str) -> *mut u8 {
     ostream_write(this, s.as_ptr(), s.len() as i64)
 }
 
+fn format_uint_with_flags(fmtfl: i32, val: u64) -> String {
+    let base = fmtfl & 0x0E00;
+    let upper = (fmtfl & 0x0004) != 0;
+    let showbase = (fmtfl & 0x0008) != 0;
+    match base {
+        0x0800 => {
+            let prefix = if showbase && val != 0 {
+                if upper { "0X" } else { "0x" }
+            } else {
+                ""
+            };
+            if upper { format!("{prefix}{val:X}") } else { format!("{prefix}{val:x}") }
+        }
+        0x0400 => {
+            let prefix = if showbase && val != 0 { "0" } else { "" };
+            format!("{prefix}{val:o}")
+        }
+        _ => format!("{val}"),
+    }
+}
+
+fn format_int_with_flags(fmtfl: i32, val: i64) -> String {
+    let base = fmtfl & 0x0E00;
+    if base == 0x0800 || base == 0x0400 {
+        // Per C++ standard, oct/hex formats signed integers as their unsigned representation.
+        format_uint_with_flags(fmtfl, val as u64)
+    } else if val >= 0 && (fmtfl & 0x0020) != 0 {
+        format!("+{val}")
+    } else {
+        format!("{val}")
+    }
+}
+
+fn pad_formatted(s: String, fmtfl: i32, width: i64, fill: char) -> String {
+    let w = width.max(0) as usize;
+    let len = s.chars().count();
+    if w <= len {
+        return s;
+    }
+    let pad_n = w - len;
+    let pad: String = std::iter::repeat_n(fill, pad_n).collect();
+    if (fmtfl & 0x01C0) == 0x0040 {
+        // ios_base::left
+        format!("{s}{pad}")
+    } else {
+        format!("{pad}{s}")
+    }
+}
+
+unsafe fn ostream_write_padded(this: *mut u8, raw: String) -> *mut u8 {
+    let ios = stream_ios(this);
+    let out = if !ios.is_null() {
+        let w = (*ios).wide;
+        let fmtfl = (*ios).fmtfl;
+        let fill = (*ios).fillch as char;
+        (*ios).wide = 0;
+        pad_formatted(raw, fmtfl, w, fill)
+    } else {
+        raw
+    };
+    ostream_write_str(this, &out)
+}
+
 unsafe extern "win64" fn ostream_shl_manip(
     this: *mut u8,
     manip: usize,
@@ -2141,14 +2921,75 @@ unsafe extern "win64" fn ostream_shl_manip(
     crate::call_guest8(manip, this as u64, 0, 0, 0, 0, 0, 0, 0) as *mut u8
 }
 
+unsafe extern "win64" fn ostream_shl_ios_base_manip(
+    this: *mut u8,
+    manip: usize,
+) -> *mut u8 {
+    if this.is_null() || manip == 0 {
+        return this;
+    }
+    let ios = stream_ios(this);
+    if !ios.is_null() {
+        let _ = crate::call_guest8(manip, ios as u64, 0, 0, 0, 0, 0, 0, 0);
+    }
+    this
+}
+
+unsafe extern "win64" fn ostream_shl_i16(this: *mut u8, v: i16) -> *mut u8 {
+    let ios = stream_ios(this);
+    let fmtfl = if ios.is_null() { 0x201 } else { (*ios).fmtfl };
+    let s = if (fmtfl & 0x0E00) == 0x0800 || (fmtfl & 0x0E00) == 0x0400 {
+        format_uint_with_flags(fmtfl, (v as u16) as u64)
+    } else {
+        format_int_with_flags(fmtfl, v as i64)
+    };
+    ostream_write_padded(this, s)
+}
+
 unsafe extern "win64" fn ostream_shl_u16(this: *mut u8, v: u16) -> *mut u8 {
-    let s = v.to_string();
-    ostream_write_str(this, &s)
+    let ios = stream_ios(this);
+    let fmtfl = if ios.is_null() { 0x201 } else { (*ios).fmtfl };
+    ostream_write_padded(this, format_uint_with_flags(fmtfl, v as u64))
 }
 
 unsafe extern "win64" fn ostream_shl_i32(this: *mut u8, v: i32) -> *mut u8 {
-    let s = v.to_string();
-    ostream_write_str(this, &s)
+    let ios = stream_ios(this);
+    let fmtfl = if ios.is_null() { 0x201 } else { (*ios).fmtfl };
+    let s = if (fmtfl & 0x0E00) == 0x0800 || (fmtfl & 0x0E00) == 0x0400 {
+        format_uint_with_flags(fmtfl, (v as u32) as u64)
+    } else {
+        format_int_with_flags(fmtfl, v as i64)
+    };
+    ostream_write_padded(this, s)
+}
+
+unsafe extern "win64" fn ostream_shl_ptr(this: *mut u8, p: *const c_void) -> *mut u8 {
+    let s = format!("{:016X}", p as usize);
+    ostream_write_padded(this, s)
+}
+
+unsafe extern "win64" fn ostream_tellp(
+    this: *mut u8,
+    out: *mut [i64; 3],
+) -> *mut [i64; 3] {
+    if !out.is_null() {
+        std::ptr::write_unaligned(out, [-1, 0, 0]);
+    }
+    if this.is_null() || out.is_null() {
+        return out;
+    }
+    let ios = stream_ios(this);
+    if !ios.is_null() && ((*ios).mystate & 6) == 0 && !(*ios).mystrbuf.is_null() {
+        let sb = (*ios).mystrbuf;
+        let vtable = (*sb).vtable;
+        if !vtable.is_null() {
+            let seekoff = (*vtable.add(10)).0 as usize;
+            if seekoff != 0 {
+                let _ = crate::call_guest8(seekoff, sb as u64, out as u64, 0, 1, 2, 0, 0, 0);
+            }
+        }
+    }
+    out
 }
 
 unsafe extern "win64" fn ostream_shl_f64(this: *mut u8, v: f64) -> *mut u8 {
@@ -2240,19 +3081,614 @@ pub static CERR: StaticOstream = StaticOstream {
     },
 };
 
+// ---------------------------------------------------------------------------
+// 7b. Wide Streams (`basic_streambuf<wchar_t>`, `basic_ios<wchar_t>`,
+//     `basic_ostream<wchar_t>`, `basic_iostream<wchar_t>`)
+// ---------------------------------------------------------------------------
+
+const WEOF_U16: u16 = 0xFFFF;
+
+/// `std::basic_streambuf<wchar_t>` (`0x68` bytes on MSVC x64; `gcount`/`pcount` count `wchar_t`s).
+#[repr(C)]
+pub struct BasicStreambufW {
+    pub vtable: *const Ptr,
+    pub gfirst: *mut u16,
+    pub pfirst: *mut u16,
+    pub igfirst: *mut *mut u16,
+    pub ipfirst: *mut *mut u16,
+    pub gnext: *mut u16,
+    pub pnext: *mut u16,
+    pub ignext: *mut *mut u16,
+    pub ipnext: *mut *mut u16,
+    pub gcount: i32,
+    pub pcount: i32,
+    pub igcount: *mut i32,
+    pub ipcount: *mut i32,
+    pub plocale: *mut [usize; 2],
+}
+const _: () = assert!(std::mem::size_of::<BasicStreambufW>() == 0x68);
+
+static BASIC_STREAMBUF_W_VTABLE: [Ptr; 15] = [
+    Ptr(streambuf_w_deleting_dtor as *const ()),
+    Ptr(streambuf_w_lock as *const ()),
+    Ptr(streambuf_w_unlock as *const ()),
+    Ptr(streambuf_w_overflow as *const ()),
+    Ptr(streambuf_w_pbackfail as *const ()),
+    Ptr(streambuf_w_showmanyc as *const ()),
+    Ptr(streambuf_w_underflow as *const ()),
+    Ptr(streambuf_w_uflow as *const ()),
+    Ptr(streambuf_w_xsgetn as *const ()),
+    Ptr(streambuf_w_xsputn as *const ()),
+    Ptr(streambuf_w_seekoff as *const ()),
+    Ptr(streambuf_w_seekpos as *const ()),
+    Ptr(streambuf_w_setbuf as *const ()),
+    Ptr(streambuf_w_sync as *const ()),
+    Ptr(streambuf_w_imbue as *const ()),
+];
+
+unsafe extern "win64" fn streambuf_w_ctor(this: *mut BasicStreambufW) -> *mut BasicStreambufW {
+    ensure_vtables_registered();
+    if !this.is_null() {
+        (*this).vtable = BASIC_STREAMBUF_W_VTABLE.as_ptr();
+        (*this).gfirst = std::ptr::null_mut();
+        (*this).pfirst = std::ptr::null_mut();
+        (*this).igfirst = &mut (*this).gfirst;
+        (*this).ipfirst = &mut (*this).pfirst;
+        (*this).gnext = std::ptr::null_mut();
+        (*this).pnext = std::ptr::null_mut();
+        (*this).ignext = &mut (*this).gnext;
+        (*this).ipnext = &mut (*this).pnext;
+        (*this).gcount = 0;
+        (*this).pcount = 0;
+        (*this).igcount = &mut (*this).gcount;
+        (*this).ipcount = &mut (*this).pcount;
+        let loc = crate::ucrt::heap::calloc(1, 16) as *mut [usize; 2];
+        if !loc.is_null() {
+            (*loc)[1] = locale_init(1) as usize;
+        }
+        (*this).plocale = loc;
+    }
+    this
+}
+
+unsafe extern "win64" fn streambuf_w_dtor(this: *mut BasicStreambufW) {
+    if !this.is_null() {
+        (*this).vtable = BASIC_STREAMBUF_W_VTABLE.as_ptr();
+        if !(*this).plocale.is_null() {
+            crate::ucrt::heap::free((*this).plocale.cast());
+            (*this).plocale = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe extern "win64" fn streambuf_w_deleting_dtor(
+    this: *mut BasicStreambufW,
+    flags: u32,
+) -> *mut BasicStreambufW {
+    streambuf_w_dtor(this);
+    if (flags & 1) != 0 && !this.is_null() {
+        crate::ucrt::heap::free(this.cast());
+    }
+    this
+}
+
+unsafe extern "win64" fn streambuf_w_lock(_this: *mut BasicStreambufW) {}
+unsafe extern "win64" fn streambuf_w_unlock(_this: *mut BasicStreambufW) {}
+unsafe extern "win64" fn streambuf_w_overflow(_this: *mut BasicStreambufW, _ch: u16) -> u16 {
+    WEOF_U16
+}
+unsafe extern "win64" fn streambuf_w_pbackfail(_this: *mut BasicStreambufW, _ch: u16) -> u16 {
+    WEOF_U16
+}
+unsafe extern "win64" fn streambuf_w_showmanyc(_this: *mut BasicStreambufW) -> i64 {
+    0
+}
+unsafe extern "win64" fn streambuf_w_underflow(_this: *mut BasicStreambufW) -> u16 {
+    WEOF_U16
+}
+
+unsafe extern "win64" fn streambuf_w_uflow(this: *mut BasicStreambufW) -> u16 {
+    if this.is_null() {
+        return WEOF_U16;
+    }
+    let vtable = (*this).vtable;
+    let underflow = (*vtable.add(6)).0 as usize;
+    if crate::call_guest8(underflow, this as u64, 0, 0, 0, 0, 0, 0, 0) as u16 == WEOF_U16 {
+        return WEOF_U16;
+    }
+    let cnt = (*this).igcount;
+    let nxt = (*this).ignext;
+    if cnt.is_null() || nxt.is_null() || (*nxt).is_null() {
+        return WEOF_U16;
+    }
+    *cnt -= 1;
+    let p = *nxt;
+    *nxt = p.add(1);
+    std::ptr::read_unaligned(p)
+}
+
+unsafe extern "win64" fn streambuf_w_xsgetn(
+    this: *mut BasicStreambufW,
+    mut dst: *mut u16,
+    count: i64,
+) -> i64 {
+    if this.is_null() || dst.is_null() || count <= 0 {
+        return 0;
+    }
+    let mut rem = count;
+    while rem > 0 {
+        let avail = if !(*this).ignext.is_null()
+            && !(*(*this).ignext).is_null()
+            && !(*this).igcount.is_null()
+        {
+            (*(*this).igcount).max(0) as i64
+        } else {
+            0
+        };
+        if avail > 0 {
+            let n = rem.min(avail) as usize;
+            let src = *(*this).ignext;
+            std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n * 2);
+            *(*this).ignext = src.add(n);
+            *(*this).igcount -= n as i32;
+            dst = dst.add(n);
+            rem -= n as i64;
+        } else {
+            let vtable = (*this).vtable;
+            let uflow = (*vtable.add(7)).0 as usize;
+            let c = crate::call_guest8(uflow, this as u64, 0, 0, 0, 0, 0, 0, 0) as u16;
+            if c == WEOF_U16 {
+                break;
+            }
+            std::ptr::write_unaligned(dst, c);
+            dst = dst.add(1);
+            rem -= 1;
+        }
+    }
+    count - rem
+}
+
+unsafe extern "win64" fn streambuf_w_xsputn(
+    this: *mut BasicStreambufW,
+    mut src: *const u16,
+    count: i64,
+) -> i64 {
+    if this.is_null() || src.is_null() || count <= 0 {
+        return 0;
+    }
+    let mut rem = count;
+    while rem > 0 {
+        let avail = if !(*this).ipnext.is_null()
+            && !(*(*this).ipnext).is_null()
+            && !(*this).ipcount.is_null()
+        {
+            (*(*this).ipcount).max(0) as i64
+        } else {
+            0
+        };
+        if avail > 0 {
+            let n = rem.min(avail) as usize;
+            let dst = *(*this).ipnext;
+            std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n * 2);
+            *(*this).ipnext = dst.add(n);
+            *(*this).ipcount -= n as i32;
+            src = src.add(n);
+            rem -= n as i64;
+        } else {
+            let vtable = (*this).vtable;
+            let overflow = (*vtable.add(3)).0 as usize;
+            let ch = std::ptr::read_unaligned(src);
+            if crate::call_guest8(overflow, this as u64, ch as u64, 0, 0, 0, 0, 0, 0) as u16
+                == WEOF_U16
+            {
+                break;
+            }
+            src = src.add(1);
+            rem -= 1;
+        }
+    }
+    count - rem
+}
+
+unsafe extern "win64" fn streambuf_w_seekoff(
+    _this: *mut BasicStreambufW,
+    out: *mut [i64; 3],
+    _off: i64,
+    _way: i32,
+    _mode: i32,
+) -> *mut [i64; 3] {
+    if !out.is_null() {
+        std::ptr::write_unaligned(out, [-1, 0, 0]);
+    }
+    out
+}
+
+unsafe extern "win64" fn streambuf_w_seekpos(
+    _this: *mut BasicStreambufW,
+    out: *mut [i64; 3],
+    _pos: *const [i64; 3],
+    _mode: i32,
+) -> *mut [i64; 3] {
+    if !out.is_null() {
+        std::ptr::write_unaligned(out, [-1, 0, 0]);
+    }
+    out
+}
+
+unsafe extern "win64" fn streambuf_w_setbuf(
+    this: *mut BasicStreambufW,
+    _buf: *mut u16,
+    _count: i64,
+) -> *mut BasicStreambufW {
+    this
+}
+
+unsafe extern "win64" fn streambuf_w_sync(_this: *mut BasicStreambufW) -> i32 {
+    0
+}
+
+unsafe extern "win64" fn streambuf_w_imbue(_this: *mut BasicStreambufW, _loc: *const c_void) {}
+
+unsafe extern "win64" fn streambuf_w_sputc(this: *mut BasicStreambufW, ch: u16) -> u16 {
+    if this.is_null() {
+        return WEOF_U16;
+    }
+    if !(*this).ipnext.is_null()
+        && !(*(*this).ipnext).is_null()
+        && !(*this).ipcount.is_null()
+        && *(*this).ipcount > 0
+    {
+        *(*this).ipcount -= 1;
+        let p = *(*this).ipnext;
+        *(*this).ipnext = p.add(1);
+        std::ptr::write_unaligned(p, ch);
+        ch
+    } else {
+        let vtable = (*this).vtable;
+        let overflow = (*vtable.add(3)).0 as usize;
+        crate::call_guest8(overflow, this as u64, ch as u64, 0, 0, 0, 0, 0, 0) as u16
+    }
+}
+
+unsafe extern "win64" fn streambuf_w_sputn(
+    this: *mut BasicStreambufW,
+    s: *const u16,
+    count: i64,
+) -> i64 {
+    if this.is_null() {
+        return 0;
+    }
+    let vtable = (*this).vtable;
+    let xsputn = (*vtable.add(9)).0 as usize;
+    crate::call_guest8(xsputn, this as u64, s as u64, count as u64, 0, 0, 0, 0, 0) as i64
+}
+
+unsafe extern "win64" fn streambuf_w_pninc(this: *mut BasicStreambufW) -> *mut u16 {
+    if this.is_null() || (*this).ipnext.is_null() || (*(*this).ipnext).is_null() {
+        return std::ptr::null_mut();
+    }
+    if !(*this).ipcount.is_null() {
+        *(*this).ipcount -= 1;
+    }
+    let p = *(*this).ipnext;
+    *(*this).ipnext = p.add(1);
+    p
+}
+
+unsafe extern "win64" fn streambuf_w_eback(this: *const BasicStreambufW) -> *mut u16 {
+    if this.is_null() || (*this).igfirst.is_null() { std::ptr::null_mut() } else { *(*this).igfirst }
+}
+
+unsafe extern "win64" fn streambuf_w_gptr(this: *const BasicStreambufW) -> *mut u16 {
+    if this.is_null() || (*this).ignext.is_null() { std::ptr::null_mut() } else { *(*this).ignext }
+}
+
+unsafe extern "win64" fn streambuf_w_egptr(this: *const BasicStreambufW) -> *mut u16 {
+    if this.is_null()
+        || (*this).ignext.is_null()
+        || (*(*this).ignext).is_null()
+        || (*this).igcount.is_null()
+    {
+        std::ptr::null_mut()
+    } else {
+        (*(*this).ignext).wrapping_offset((*(*this).igcount) as isize)
+    }
+}
+
+unsafe extern "win64" fn streambuf_w_pbase(this: *const BasicStreambufW) -> *mut u16 {
+    if this.is_null() || (*this).ipfirst.is_null() { std::ptr::null_mut() } else { *(*this).ipfirst }
+}
+
+unsafe extern "win64" fn streambuf_w_pptr(this: *const BasicStreambufW) -> *mut u16 {
+    if this.is_null() || (*this).ipnext.is_null() { std::ptr::null_mut() } else { *(*this).ipnext }
+}
+
+unsafe extern "win64" fn streambuf_w_epptr(this: *const BasicStreambufW) -> *mut u16 {
+    if this.is_null()
+        || (*this).ipnext.is_null()
+        || (*(*this).ipnext).is_null()
+        || (*this).ipcount.is_null()
+    {
+        std::ptr::null_mut()
+    } else {
+        (*(*this).ipnext).wrapping_offset((*(*this).ipcount) as isize)
+    }
+}
+
+unsafe extern "win64" fn streambuf_w_gbump(this: *mut BasicStreambufW, off: i32) {
+    if this.is_null() || (*this).ignext.is_null() || (*this).igcount.is_null() {
+        return;
+    }
+    *(*this).igcount = (*(*this).igcount).wrapping_sub(off);
+    if !(*(*this).ignext).is_null() {
+        *(*this).ignext = (*(*this).ignext).wrapping_offset(off as isize);
+    }
+}
+
+unsafe extern "win64" fn streambuf_w_setg(
+    this: *mut BasicStreambufW,
+    first: *mut u16,
+    next: *mut u16,
+    last: *mut u16,
+) {
+    if this.is_null() {
+        return;
+    }
+    if !(*this).igfirst.is_null() {
+        *(*this).igfirst = first;
+    }
+    if !(*this).ignext.is_null() {
+        *(*this).ignext = next;
+    }
+    if !(*this).igcount.is_null() {
+        *(*this).igcount = if next.is_null() || last.is_null() {
+            0
+        } else {
+            ((last as isize).wrapping_sub(next as isize) / 2) as i32
+        };
+    }
+}
+
+unsafe extern "win64" fn streambuf_w_setp3(
+    this: *mut BasicStreambufW,
+    first: *mut u16,
+    next: *mut u16,
+    last: *mut u16,
+) {
+    if this.is_null() {
+        return;
+    }
+    if !(*this).ipfirst.is_null() {
+        *(*this).ipfirst = first;
+    }
+    if !(*this).ipnext.is_null() {
+        *(*this).ipnext = next;
+    }
+    if !(*this).ipcount.is_null() {
+        *(*this).ipcount = if next.is_null() || last.is_null() {
+            0
+        } else {
+            ((last as isize).wrapping_sub(next as isize) / 2) as i32
+        };
+    }
+}
+
+unsafe extern "win64" fn streambuf_w_setp2(
+    this: *mut BasicStreambufW,
+    first: *mut u16,
+    last: *mut u16,
+) {
+    streambuf_w_setp3(this, first, first, last);
+}
+
+/// `std::basic_ios<wchar_t>` (`0x60` bytes on MSVC x64).
+#[repr(C)]
+pub struct BasicIosW {
+    pub vtable: *const Ptr,
+    pub stdstr: usize,
+    pub mystate: i32,
+    pub except: i32,
+    pub fmtfl: i32,
+    pub _pad0: i32,
+    pub prec: i64,
+    pub wide: i64,
+    pub arr: *mut c_void,
+    pub calls: *mut c_void,
+    pub ploc: *mut [usize; 2],
+    pub mystrbuf: *mut BasicStreambufW,
+    pub tiestr: *mut c_void,
+    pub fillch: u16,
+    pub _pad1: [u8; 6],
+}
+const _: () = assert!(std::mem::size_of::<BasicIosW>() == 0x60);
+
+static BASIC_IOS_W_VTABLE: [Ptr; 1] = [Ptr(ios_w_deleting_dtor as *const ())];
+
+unsafe extern "win64" fn ios_w_ctor(this: *mut BasicIosW) -> *mut BasicIosW {
+    ensure_vtables_registered();
+    if !this.is_null() {
+        std::ptr::write_bytes(this, 0, 1);
+        (*this).vtable = BASIC_IOS_W_VTABLE.as_ptr();
+    }
+    this
+}
+
+unsafe extern "win64" fn ios_w_dtor(this: *mut BasicIosW) {
+    if !this.is_null() {
+        (*this).vtable = BASIC_IOS_W_VTABLE.as_ptr();
+        if !(*this).ploc.is_null() {
+            crate::ucrt::heap::free((*this).ploc.cast());
+            (*this).ploc = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe extern "win64" fn ios_w_deleting_dtor(this: *mut BasicIosW, flags: u32) -> *mut BasicIosW {
+    ios_w_dtor(this);
+    if (flags & 1) != 0 && !this.is_null() {
+        crate::ucrt::heap::free(this.cast());
+    }
+    this
+}
+
+unsafe fn ios_w_init(ios: *mut BasicIosW, sb: *mut BasicStreambufW) {
+    if ios.is_null() {
+        return;
+    }
+    (*ios).vtable = BASIC_IOS_W_VTABLE.as_ptr();
+    (*ios).mystate = if sb.is_null() { 4 } else { 0 };
+    (*ios).except = 0;
+    (*ios).fmtfl = 0x201;
+    (*ios).prec = 6;
+    (*ios).wide = 0;
+    let loc = crate::ucrt::heap::calloc(1, 16) as *mut [usize; 2];
+    if !loc.is_null() {
+        (*loc)[1] = locale_init(1) as usize;
+    }
+    (*ios).ploc = loc;
+    (*ios).mystrbuf = sb;
+    (*ios).tiestr = std::ptr::null_mut();
+    (*ios).fillch = b' ' as u16;
+}
+
+unsafe extern "win64" fn ios_w_setstate(this: *mut BasicIosW, state: i32, _reraise: u8) {
+    if this.is_null() {
+        return;
+    }
+    let extra = if (*this).mystrbuf.is_null() { 4 } else { 0 };
+    (*this).mystate = ((*this).mystate | state | extra) & 0x17;
+}
+
+unsafe extern "win64" fn ios_w_fill_get(this: *const BasicIosW) -> u16 {
+    if this.is_null() { b' ' as u16 } else { (*this).fillch }
+}
+
+unsafe extern "win64" fn ios_w_fill_set(this: *mut BasicIosW, ch: u16) -> u16 {
+    if this.is_null() {
+        return b' ' as u16;
+    }
+    let old = (*this).fillch;
+    (*this).fillch = ch;
+    old
+}
+
+unsafe extern "win64" fn ios_w_rdbuf_get(this: *const BasicIosW) -> *mut BasicStreambufW {
+    if this.is_null() { std::ptr::null_mut() } else { (*this).mystrbuf }
+}
+
+unsafe extern "win64" fn ios_w_tie_get(this: *const BasicIosW) -> *mut c_void {
+    if this.is_null() { std::ptr::null_mut() } else { (*this).tiestr }
+}
+
+#[inline]
+unsafe fn stream_ios_w(stream: *mut u8) -> *mut BasicIosW {
+    stream_ios(stream) as *mut BasicIosW
+}
+
+unsafe extern "win64" fn iostream_w_ctor(
+    this: *mut u8,
+    sb: *mut BasicStreambufW,
+    most_derived: i32,
+) -> *mut u8 {
+    ensure_vtables_registered();
+    if this.is_null() {
+        return this;
+    }
+    if most_derived != 0 {
+        std::ptr::write_unaligned(this as *mut *const i32, IOSTREAM_IN_VBTABLE.as_ptr());
+        std::ptr::write_unaligned(this.add(0x10) as *mut *const i32, IOSTREAM_OUT_VBTABLE.as_ptr());
+        std::ptr::write_bytes(this.add(0x20), 0, std::mem::size_of::<BasicIosW>());
+    }
+    std::ptr::write_unaligned(this.add(8) as *mut u64, 0);
+    let ios = stream_ios_w(this);
+    if !ios.is_null() {
+        std::ptr::write_unaligned((ios as *mut u8).sub(4) as *mut i32, 0);
+        ios_w_init(ios, sb);
+    }
+    this
+}
+
+unsafe extern "win64" fn ostream_w_osfx(this: *mut u8) {
+    if this.is_null() {
+        return;
+    }
+    let ios = stream_ios_w(this);
+    if !ios.is_null()
+        && (*ios).mystate == 0
+        && ((*ios).fmtfl & 2) != 0
+        && !(*ios).mystrbuf.is_null()
+    {
+        let sb = (*ios).mystrbuf;
+        let vtable = (*sb).vtable;
+        let sync = (*vtable.add(13)).0 as usize;
+        if crate::call_guest8(sync, sb as u64, 0, 0, 0, 0, 0, 0, 0) as i32 == -1 {
+            ios_w_setstate(ios, 4, 0);
+        }
+    }
+}
+
+unsafe extern "win64" fn ostream_w_flush(this: *mut u8) -> *mut u8 {
+    if this.is_null() {
+        return this;
+    }
+    let ios = stream_ios_w(this);
+    if !ios.is_null() && !(*ios).mystrbuf.is_null() {
+        let sb = (*ios).mystrbuf;
+        let vtable = (*sb).vtable;
+        let sync = (*vtable.add(13)).0 as usize;
+        if crate::call_guest8(sync, sb as u64, 0, 0, 0, 0, 0, 0, 0) as i32 == -1 {
+            ios_w_setstate(ios, 4, 0);
+        }
+    }
+    this
+}
+
+unsafe extern "win64" fn ostream_w_shl_u32(this: *mut u8, v: u32) -> *mut u8 {
+    if this.is_null() {
+        return this;
+    }
+    let ios = stream_ios_w(this);
+    let (fmtfl, w, fill) = if !ios.is_null() {
+        let f = (*ios).fmtfl;
+        let wi = (*ios).wide;
+        let fl = char::from_u32((*ios).fillch as u32).unwrap_or(' ');
+        (*ios).wide = 0;
+        (f, wi, fl)
+    } else {
+        (0x201, 0, ' ')
+    };
+    let s = pad_formatted(format_uint_with_flags(fmtfl, v as u64), fmtfl, w, fill);
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if !ios.is_null() && !(*ios).mystrbuf.is_null() && !units.is_empty() {
+        if streambuf_w_sputn((*ios).mystrbuf, units.as_ptr(), units.len() as i64)
+            != units.len() as i64
+        {
+            ios_w_setstate(ios, 4, 0);
+        }
+    }
+    this
+}
+
 pub(crate) fn register_static_vtables() {
     crate::register_native_va(
         chore_work_callback as *const () as usize as u64,
         chore_work_callback as *const () as usize,
     );
+    crate::register_native_va(
+        noop_method as *const () as usize as u64,
+        noop_method as *const () as usize,
+    );
     for p in FACET_VTABLE
         .iter()
         .chain(CTYPE_CHAR_VTABLE.iter())
+        .chain(CTYPE_W_VTABLE.iter())
         .chain(CODECVT_U32_VTABLE.iter())
         .chain(CODECVT_W_VTABLE.iter())
         .chain(BASIC_STREAMBUF_VTABLE.iter())
         .chain(STDIO_STREAMBUF_VTABLE.iter())
         .chain(BASIC_IOS_VTABLE.iter())
+        .chain(BASIC_STREAMBUF_W_VTABLE.iter())
+        .chain(BASIC_IOS_W_VTABLE.iter())
     {
         let fn_addr = p.0 as usize;
         crate::register_native_va(fn_addr as u64, fn_addr);
@@ -2273,7 +3709,7 @@ fn ensure_vtables_registered() {
 pub static ID_CODECVT_D: LocaleId = LocaleId(UnsafeCell::new([5, 0]));
 pub static ID_NUMPUNCT_W: LocaleId = LocaleId(UnsafeCell::new([6, 0]));
 pub static ID_TIME_PUT_D: LocaleId = LocaleId(UnsafeCell::new([7, 0]));
-pub static LOCALE_ID_CNT: AtomicU32 = AtomicU32::new(8);
+pub static LOCALE_ID_CNT: AtomicU32 = AtomicU32::new(9);
 
 static W_DAYS_STR: [u16; 15] = [
     b':' as u16, b'S' as u16, b'u' as u16, b'n' as u16, b':' as u16, b'S' as u16, b'u' as u16,
@@ -2505,39 +3941,55 @@ unsafe extern "win64" fn throw_future_error(_ec: *const c_void) {
 
 pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "??0?$basic_ios@DU?$char_traits@D@std@@@std@@IEAA@XZ", ptr: Ptr(ios_ctor as *const ()) },
+    Export { name: "??0?$basic_ios@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z", ptr: Ptr(ios_ctor_sb as *const ()) },
+    Export { name: "??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@IEAA@XZ", ptr: Ptr(ios_w_ctor as *const ()) },
     Export { name: "??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z", ptr: Ptr(iostream_ctor as *const ()) },
+    Export { name: "??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z", ptr: Ptr(iostream_w_ctor as *const ()) },
     Export { name: "??0?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z", ptr: Ptr(istream_ctor as *const ()) },
     Export { name: "??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z", ptr: Ptr(ostream_ctor as *const ()) },
+    Export { name: "??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAA@AEBV01@@Z", ptr: Ptr(streambuf_copy_ctor as *const ()) },
     Export { name: "??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAA@XZ", ptr: Ptr(streambuf_ctor as *const ()) },
+    Export { name: "??0?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEAA@XZ", ptr: Ptr(streambuf_w_ctor as *const ()) },
     Export { name: "??0?$codecvt@_UDU_Mbstatet@@@std@@QEAA@_K@Z", ptr: Ptr(codecvt_u32_ctor as *const ()) },
     Export { name: "??0?$codecvt@_WDU_Mbstatet@@@std@@QEAA@_K@Z", ptr: Ptr(codecvt_w_ctor as *const ()) },
+    Export { name: "??0_Locinfo@std@@QEAA@HPEBD@Z", ptr: Ptr(locinfo_ctor_cat as *const ()) },
     Export { name: "??0_Locinfo@std@@QEAA@PEBD@Z", ptr: Ptr(locinfo_ctor as *const ()) },
     Export { name: "??0_Lockit@std@@QEAA@H@Z", ptr: Ptr(lockit_ctor as *const ()) },
     Export { name: "??0facet@locale@std@@IEAA@_K@Z", ptr: Ptr(facet_ctor as *const ()) },
     Export { name: "??0task_continuation_context@Concurrency@@AEAA@XZ", ptr: Ptr(task_continuation_context_ctor as *const ()) },
     Export { name: "??1?$basic_ios@DU?$char_traits@D@std@@@std@@UEAA@XZ", ptr: Ptr(ios_dtor as *const ()) },
+    Export { name: "??1?$basic_ios@_WU?$char_traits@_W@std@@@std@@UEAA@XZ", ptr: Ptr(ios_w_dtor as *const ()) },
     Export { name: "??1?$basic_iostream@DU?$char_traits@D@std@@@std@@UEAA@XZ", ptr: Ptr(iostream_dtor as *const ()) },
+    Export { name: "??1?$basic_iostream@_WU?$char_traits@_W@std@@@std@@UEAA@XZ", ptr: Ptr(iostream_dtor as *const ()) },
     Export { name: "??1?$basic_istream@DU?$char_traits@D@std@@@std@@UEAA@XZ", ptr: Ptr(istream_dtor as *const ()) },
     Export { name: "??1?$basic_ostream@DU?$char_traits@D@std@@@std@@UEAA@XZ", ptr: Ptr(ostream_dtor as *const ()) },
     Export { name: "??1?$basic_streambuf@DU?$char_traits@D@std@@@std@@UEAA@XZ", ptr: Ptr(streambuf_dtor as *const ()) },
+    Export { name: "??1?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@UEAA@XZ", ptr: Ptr(streambuf_w_dtor as *const ()) },
     Export { name: "??1?$codecvt@_UDU_Mbstatet@@@std@@MEAA@XZ", ptr: Ptr(facet_dtor as *const ()) },
     Export { name: "??1?$codecvt@_WDU_Mbstatet@@@std@@MEAA@XZ", ptr: Ptr(facet_dtor as *const ()) },
     Export { name: "??1_Locinfo@std@@QEAA@XZ", ptr: Ptr(locinfo_dtor as *const ()) },
     Export { name: "??1_Lockit@std@@QEAA@XZ", ptr: Ptr(lockit_dtor as *const ()) },
     Export { name: "??1facet@locale@std@@MEAA@XZ", ptr: Ptr(facet_dtor as *const ()) },
+    Export { name: "??4?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAAEAV01@AEBV01@@Z", ptr: Ptr(streambuf_copy_assign as *const ()) },
     Export { name: "??4?$_Yarn@D@std@@QEAAAEAV01@PEBD@Z", ptr: Ptr(yarn_assign as *const ()) },
+    Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@F@Z", ptr: Ptr(ostream_shl_i16 as *const ()) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@G@Z", ptr: Ptr(ostream_shl_u16 as *const ()) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@H@Z", ptr: Ptr(ostream_shl_i32 as *const ()) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@I@Z", ptr: Ptr(ostream_shl_u32 as *const ()) },
+    Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@J@Z", ptr: Ptr(ostream_shl_i32 as *const ()) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@K@Z", ptr: Ptr(ostream_shl_u32 as *const ()) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@M@Z", ptr: Ptr(crate::bridge_entry!(ostream_shl_f32)) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@N@Z", ptr: Ptr(crate::bridge_entry!(ostream_shl_f64)) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@P6AAEAV01@AEAV01@@Z@Z", ptr: Ptr(ostream_shl_manip as *const ()) },
-    Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@P6AAEAVios_base@1@AEAV21@@Z@Z", ptr: Ptr(ostream_shl_manip as *const ()) },
+    Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@P6AAEAVios_base@1@AEAV21@@Z@Z", ptr: Ptr(ostream_shl_ios_base_manip as *const ()) },
+    Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@PEBX@Z", ptr: Ptr(ostream_shl_ptr as *const ()) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@_J@Z", ptr: Ptr(ostream_shl_i64 as *const ()) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@_K@Z", ptr: Ptr(ostream_shl_u64 as *const ()) },
     Export { name: "??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@_N@Z", ptr: Ptr(ostream_shl_bool as *const ()) },
+    Export { name: "??6?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QEAAAEAV01@I@Z", ptr: Ptr(ostream_w_shl_u32 as *const ()) },
+    Export { name: "??6?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QEAAAEAV01@P6AAEAVios_base@1@AEAV21@@Z@Z", ptr: Ptr(ostream_shl_ios_base_manip as *const ()) },
     Export { name: "??Bid@locale@std@@QEAA_KXZ", ptr: Ptr(locale_id_operator_usize as *const ()) },
+    Export { name: "??Bios_base@std@@QEBA_NXZ", ptr: Ptr(ios_base_bool as *const ()) },
     Export { name: "?GetCurrentThreadId@platform@details@Concurrency@@YAJXZ", ptr: Ptr(concurrency_get_current_thread_id as *const ()) },
     Export { name: "?ReportUnhandledError@_ExceptionHolder@details@Concurrency@@AEAAXXZ", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?_Addfac@_Locimp@locale@std@@AEAAXPEAVfacet@23@_K@Z", ptr: Ptr(locimp_addfac as *const ()) },
@@ -2548,30 +4000,43 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z", ptr: Ptr(fiopen_w as *const ()) },
     Export { name: "?_Getcat@?$codecvt@DDU_Mbstatet@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(codecvt_d_getcat as *const ()) },
     Export { name: "?_Getcat@?$ctype@D@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(ctype_getcat as *const ()) },
+    Export { name: "?_Getcat@?$ctype@_W@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(ctype_w_getcat as *const ()) },
     Export { name: "?_Getcat@?$time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(time_put_getcat as *const ()) },
     Export { name: "?_Getcoll@_Locinfo@std@@QEBA?AU_Collvec@@XZ", ptr: Ptr(locinfo_getcoll as *const ()) },
     Export { name: "?_Getcvt@_Locinfo@std@@QEBA?AU_Cvtvec@@XZ", ptr: Ptr(locinfo_getcvt as *const ()) },
     Export { name: "?_Getfalse@_Locinfo@std@@QEBAPEBDXZ", ptr: Ptr(locinfo_getfalse as *const ()) },
     Export { name: "?_Getgloballocale@locale@std@@CAPEAV_Locimp@12@XZ", ptr: Ptr(locale_getgloballocale as *const ()) },
     Export { name: "?_Getlconv@_Locinfo@std@@QEBAPEBUlconv@@XZ", ptr: Ptr(locinfo_getlconv as *const ()) },
+    Export { name: "?_Getname@_Locinfo@std@@QEBAPEBDXZ", ptr: Ptr(locinfo_getname as *const ()) },
     Export { name: "?_Gettrue@_Locinfo@std@@QEBAPEBDXZ", ptr: Ptr(locinfo_gettrue as *const ()) },
+    Export { name: "?_Gnavail@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBA_JXZ", ptr: Ptr(streambuf_gnavail as *const ()) },
+    Export { name: "?_Gndec@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAPEADXZ", ptr: Ptr(streambuf_gndec as *const ()) },
+    Export { name: "?_Gninc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAPEADXZ", ptr: Ptr(streambuf_gninc as *const ()) },
     Export { name: "?_Id_cnt@id@locale@std@@0HA", ptr: Ptr(&LOCALE_ID_CNT as *const AtomicU32 as *const ()) },
     Export { name: "?_Incref@facet@locale@std@@UEAAXXZ", ptr: Ptr(facet_incref as *const ()) },
+    Export { name: "?_Init@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAPEAD0PEAH001@Z", ptr: Ptr(streambuf_init_ptrs as *const ()) },
     Export { name: "?_Init@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXXZ", ptr: Ptr(streambuf_init_empty as *const ()) },
     Export { name: "?_Init@locale@std@@CAPEAV_Locimp@12@_N@Z", ptr: Ptr(locale_init as *const ()) },
     Export { name: "?_Ipfx@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA_N_N@Z", ptr: Ptr(istream_ipfx as *const ()) },
     Export { name: "?_IsCurrentOriginSTA@_ContextCallback@details@Concurrency@@CA_NXZ", ptr: Ptr(is_current_origin_sta as *const ()) },
     Export { name: "?_Locimp_Addfac@_Locimp@locale@std@@CAXPEAV123@PEAVfacet@23@_K@Z", ptr: Ptr(locimp_addfac as *const ()) },
     Export { name: "?_Lock@?$basic_streambuf@DU?$char_traits@D@std@@@std@@UEAAXXZ", ptr: Ptr(streambuf_lock as *const ()) },
+    Export { name: "?_Lock@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@UEAAXXZ", ptr: Ptr(streambuf_w_lock as *const ()) },
     Export { name: "?_LogCancelTask@_TaskEventLogger@details@Concurrency@@QEAAXXZ", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?_LogScheduleTask@_TaskEventLogger@details@Concurrency@@QEAAX_N@Z", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?_LogTaskCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?_LogTaskExecutionCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?_LogWorkItemCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?_LogWorkItemStarted@_TaskEventLogger@details@Concurrency@@QEAAXXZ", ptr: Ptr(noop_method as *const ()) },
+    Export { name: "?_Makeloc@_Locimp@locale@std@@CAPEAV123@AEBV_Locinfo@3@HPEAV123@PEBV23@@Z", ptr: Ptr(locimp_makeloc as *const ()) },
     Export { name: "?_New_Locimp@_Locimp@locale@std@@CAPEAV123@AEBV123@@Z", ptr: Ptr(locimp_new as *const ()) },
+    Export { name: "?_New_Locimp@_Locimp@locale@std@@CAPEAV123@_N@Z", ptr: Ptr(locimp_new_bool as *const ()) },
     Export { name: "?_Osfx@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAXXZ", ptr: Ptr(ostream_osfx as *const ()) },
+    Export { name: "?_Osfx@?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QEAAXXZ", ptr: Ptr(ostream_w_osfx as *const ()) },
+    Export { name: "?_Pnavail@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBA_JXZ", ptr: Ptr(streambuf_pnavail as *const ()) },
     Export { name: "?_Pninc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAPEADXZ", ptr: Ptr(streambuf_pninc as *const ()) },
+    Export { name: "?_Pninc@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEAAPEA_WXZ", ptr: Ptr(streambuf_w_pninc as *const ()) },
+    Export { name: "?_Raise_handler@std@@3P6AXAEBVexception@stdext@@@ZEA", ptr: Ptr(&RAISE_HANDLER as *const AtomicUsize as *const ()) },
     Export { name: "?_Random_device@std@@YAIXZ", ptr: Ptr(std_random_device as *const ()) },
     Export { name: "?_Release_chore@details@Concurrency@@YAXPEAU_Threadpool_chore@12@@Z", ptr: Ptr(release_chore as *const ()) },
     Export { name: "?_ReportUnobservedException@details@Concurrency@@YAXXZ", ptr: Ptr(noop_method as *const ()) },
@@ -2583,6 +4048,7 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?_Throw_Cpp_error@std@@YAXH@Z", ptr: Ptr(throw_cpp_error as *const ()) },
     Export { name: "?_Throw_future_error@std@@YAXAEBVerror_code@1@@Z", ptr: Ptr(throw_future_error as *const ()) },
     Export { name: "?_Unlock@?$basic_streambuf@DU?$char_traits@D@std@@@std@@UEAAXXZ", ptr: Ptr(streambuf_unlock as *const ()) },
+    Export { name: "?_Unlock@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@UEAAXXZ", ptr: Ptr(streambuf_w_unlock as *const ()) },
     Export { name: "?_W_Getdays@_Locinfo@std@@QEBAPEBGXZ", ptr: Ptr(locinfo_w_getdays as *const ()) },
     Export { name: "?_W_Getmonths@_Locinfo@std@@QEBAPEBGXZ", ptr: Ptr(locinfo_w_getmonths as *const ()) },
     Export { name: "?_Winerror_map@std@@YAHH@Z", ptr: Ptr(winerror_map as *const ()) },
@@ -2591,7 +4057,9 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?_Xinvalid_argument@std@@YAXPEBD@Z", ptr: Ptr(xinvalid_argument as *const ()) },
     Export { name: "?_Xlength_error@std@@YAXPEBD@Z", ptr: Ptr(xlength_error as *const ()) },
     Export { name: "?_Xout_of_range@std@@YAXPEBD@Z", ptr: Ptr(xout_of_range as *const ()) },
+    Export { name: "?_Xoverflow_error@std@@YAXPEBD@Z", ptr: Ptr(xoverflow_error as *const ()) },
     Export { name: "?_Xregex_error@std@@YAXW4error_type@regex_constants@1@@Z", ptr: Ptr(xregex_error as *const ()) },
+    Export { name: "?_Xruntime_error@std@@YAXPEBD@Z", ptr: Ptr(xruntime_error as *const ()) },
     Export { name: "?__ExceptionPtrAssign@@YAXPEAXPEBX@Z", ptr: Ptr(exception_ptr_assign as *const ()) },
     Export { name: "?__ExceptionPtrCopy@@YAXPEAXPEBX@Z", ptr: Ptr(exception_ptr_copy as *const ()) },
     Export { name: "?__ExceptionPtrCopyException@@YAXPEAXPEBX1@Z", ptr: Ptr(exception_ptr_copy_exception as *const ()) },
@@ -2604,57 +4072,244 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?c_str@?$_Yarn@D@std@@QEBAPEBDXZ", ptr: Ptr(yarn_c_str as *const ()) },
     Export { name: "?cerr@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A", ptr: Ptr(&CERR as *const StaticOstream as *const ()) },
     Export { name: "?clear@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAXH_N@Z", ptr: Ptr(ios_clear as *const ()) },
+    Export { name: "?copyfmt@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAAEAV12@AEBV12@@Z", ptr: Ptr(ios_copyfmt as *const ()) },
     Export { name: "?cout@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A", ptr: Ptr(&COUT as *const StaticOstream as *const ()) },
     Export { name: "?eback@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ", ptr: Ptr(streambuf_eback as *const ()) },
+    Export { name: "?eback@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_eback as *const ()) },
     Export { name: "?egptr@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ", ptr: Ptr(streambuf_egptr as *const ()) },
+    Export { name: "?egptr@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_egptr as *const ()) },
     Export { name: "?epptr@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ", ptr: Ptr(streambuf_epptr as *const ()) },
+    Export { name: "?epptr@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_epptr as *const ()) },
+    Export { name: "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBADXZ", ptr: Ptr(ios_fill_get as *const ()) },
+    Export { name: "?fill@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAA_W_W@Z", ptr: Ptr(ios_w_fill_set as *const ()) },
+    Export { name: "?fill@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEBA_WXZ", ptr: Ptr(ios_w_fill_get as *const ()) },
+    Export { name: "?flags@ios_base@std@@QEBAHXZ", ptr: Ptr(ios_base_flags as *const ()) },
     Export { name: "?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@XZ", ptr: Ptr(ostream_flush as *const ()) },
+    Export { name: "?flush@?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QEAAAEAV12@XZ", ptr: Ptr(ostream_w_flush as *const ()) },
+    Export { name: "?gbump@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXH@Z", ptr: Ptr(streambuf_gbump as *const ()) },
+    Export { name: "?gbump@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEAAXH@Z", ptr: Ptr(streambuf_w_gbump as *const ()) },
     Export { name: "?getloc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEBA?AVlocale@2@XZ", ptr: Ptr(streambuf_getloc as *const ()) },
     Export { name: "?getloc@ios_base@std@@QEBA?AVlocale@2@XZ", ptr: Ptr(streambuf_getloc as *const ()) },
     Export { name: "?good@ios_base@std@@QEBA_NXZ", ptr: Ptr(ios_good as *const ()) },
     Export { name: "?gptr@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ", ptr: Ptr(streambuf_gptr as *const ()) },
+    Export { name: "?gptr@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_gptr as *const ()) },
     Export { name: "?id@?$codecvt@DDU_Mbstatet@@@std@@2V0locale@2@A", ptr: Ptr(&ID_CODECVT_D as *const LocaleId as *const ()) },
     Export { name: "?id@?$codecvt@_WDU_Mbstatet@@@std@@2V0locale@2@A", ptr: Ptr(&ID_CODECVT_W as *const LocaleId as *const ()) },
     Export { name: "?id@?$collate@D@std@@2V0locale@2@A", ptr: Ptr(&ID_COLLATE_D as *const LocaleId as *const ()) },
     Export { name: "?id@?$ctype@D@std@@2V0locale@2@A", ptr: Ptr(&ID_CTYPE_D as *const LocaleId as *const ()) },
+    Export { name: "?id@?$ctype@_W@std@@2V0locale@2@A", ptr: Ptr(&ID_CTYPE_W as *const LocaleId as *const ()) },
     Export { name: "?id@?$numpunct@D@std@@2V0locale@2@A", ptr: Ptr(&ID_NUMPUNCT_D as *const LocaleId as *const ()) },
     Export { name: "?id@?$numpunct@_W@std@@2V0locale@2@A", ptr: Ptr(&ID_NUMPUNCT_W as *const LocaleId as *const ()) },
     Export { name: "?id@?$time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A", ptr: Ptr(&ID_TIME_PUT_D as *const LocaleId as *const ()) },
     Export { name: "?imbue@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAAXAEBVlocale@2@@Z", ptr: Ptr(streambuf_imbue as *const ()) },
+    Export { name: "?imbue@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@MEAAXAEBVlocale@2@@Z", ptr: Ptr(streambuf_w_imbue as *const ()) },
     Export { name: "?in@?$codecvt@DDU_Mbstatet@@@std@@QEBAHAEAU_Mbstatet@@PEBD1AEAPEBDPEAD3AEAPEAD@Z", ptr: Ptr(codecvt_d_in_out as *const ()) },
     Export { name: "?in@?$codecvt@_UDU_Mbstatet@@@std@@QEBAHAEAU_Mbstatet@@PEBD1AEAPEBDPEA_U3AEAPEA_U@Z", ptr: Ptr(codecvt_u32_in as *const ()) },
     Export { name: "?in@?$codecvt@_WDU_Mbstatet@@@std@@QEBAHAEAU_Mbstatet@@PEBD1AEAPEBDPEA_W3AEAPEA_W@Z", ptr: Ptr(codecvt_w_in as *const ()) },
+    Export { name: "?init@?$basic_ios@DU?$char_traits@D@std@@@std@@IEAAXPEAV?$basic_streambuf@DU?$char_traits@D@std@@@2@_N@Z", ptr: Ptr(ios_init_export as *const ()) },
     Export { name: "?out@?$codecvt@DDU_Mbstatet@@@std@@QEBAHAEAU_Mbstatet@@PEBD1AEAPEBDPEAD3AEAPEAD@Z", ptr: Ptr(codecvt_d_in_out as *const ()) },
     Export { name: "?out@?$codecvt@_UDU_Mbstatet@@@std@@QEBAHAEAU_Mbstatet@@PEB_U1AEAPEB_UPEAD3AEAPEAD@Z", ptr: Ptr(codecvt_u32_out as *const ()) },
     Export { name: "?out@?$codecvt@_WDU_Mbstatet@@@std@@QEBAHAEAU_Mbstatet@@PEB_W1AEAPEB_WPEAD3AEAPEAD@Z", ptr: Ptr(codecvt_w_out as *const ()) },
+    Export { name: "?pbackfail@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAAHH@Z", ptr: Ptr(streambuf_pbackfail as *const ()) },
     Export { name: "?pbase@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ", ptr: Ptr(streambuf_pbase as *const ()) },
+    Export { name: "?pbase@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_pbase as *const ()) },
+    Export { name: "?pbump@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXH@Z", ptr: Ptr(streambuf_pbump as *const ()) },
     Export { name: "?pptr@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ", ptr: Ptr(streambuf_pptr as *const ()) },
+    Export { name: "?pptr@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_pptr as *const ()) },
     Export { name: "?put@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@D@Z", ptr: Ptr(ostream_put as *const ()) },
     Export { name: "?put@?$time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@QEBA?AV?$ostreambuf_iterator@DU?$char_traits@D@std@@@2@V32@AEAVios_base@2@DPEBUtm@@PEBD3@Z", ptr: Ptr(time_put_put as *const ()) },
+    Export { name: "?rdbuf@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAPEAV?$basic_streambuf@DU?$char_traits@D@std@@@2@PEAV32@@Z", ptr: Ptr(ios_rdbuf_set as *const ()) },
+    Export { name: "?rdbuf@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBAPEAV?$basic_streambuf@DU?$char_traits@D@std@@@2@XZ", ptr: Ptr(ios_rdbuf_get as *const ()) },
+    Export { name: "?rdbuf@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEBAPEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@2@XZ", ptr: Ptr(ios_w_rdbuf_get as *const ()) },
     Export { name: "?read@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@PEAD_J@Z", ptr: Ptr(istream_read as *const ()) },
     Export { name: "?sbumpc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAAHXZ", ptr: Ptr(streambuf_sbumpc as *const ()) },
     Export { name: "?seekg@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@_JH@Z", ptr: Ptr(istream_seekg as *const ()) },
+    Export { name: "?seekoff@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA?AV?$fpos@U_Mbstatet@@@2@_JHH@Z", ptr: Ptr(streambuf_seekoff as *const ()) },
+    Export { name: "?seekpos@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA?AV?$fpos@U_Mbstatet@@@2@V32@H@Z", ptr: Ptr(streambuf_seekpos as *const ()) },
     Export { name: "?setbuf@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAAPEAV12@PEAD_J@Z", ptr: Ptr(streambuf_setbuf as *const ()) },
+    Export { name: "?setbuf@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@MEAAPEAV12@PEA_W_J@Z", ptr: Ptr(streambuf_w_setbuf as *const ()) },
+    Export { name: "?setf@ios_base@std@@QEAAHH@Z", ptr: Ptr(ios_base_setf1 as *const ()) },
+    Export { name: "?setf@ios_base@std@@QEAAHHH@Z", ptr: Ptr(ios_base_setf2 as *const ()) },
+    Export { name: "?setg@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD00@Z", ptr: Ptr(streambuf_setg as *const ()) },
+    Export { name: "?setg@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEAAXPEA_W00@Z", ptr: Ptr(streambuf_w_setg as *const ()) },
+    Export { name: "?setp@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD00@Z", ptr: Ptr(streambuf_setp3 as *const ()) },
+    Export { name: "?setp@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD0@Z", ptr: Ptr(streambuf_setp2 as *const ()) },
+    Export { name: "?setp@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEAAXPEA_W00@Z", ptr: Ptr(streambuf_w_setp3 as *const ()) },
+    Export { name: "?setp@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEAAXPEA_W0@Z", ptr: Ptr(streambuf_w_setp2 as *const ()) },
     Export { name: "?setprecision@std@@YA?AU?$_Smanip@_J@1@_J@Z", ptr: Ptr(smanip_noop as *const ()) },
     Export { name: "?setstate@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAXH_N@Z", ptr: Ptr(ios_setstate as *const ()) },
+    Export { name: "?setstate@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAXH_N@Z", ptr: Ptr(ios_w_setstate as *const ()) },
     Export { name: "?setw@std@@YA?AU?$_Smanip@_J@1@_J@Z", ptr: Ptr(smanip_noop as *const ()) },
     Export { name: "?sgetc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAAHXZ", ptr: Ptr(streambuf_sgetc as *const ()) },
     Export { name: "?showmanyc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA_JXZ", ptr: Ptr(streambuf_showmanyc as *const ()) },
+    Export { name: "?showmanyc@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@MEAA_JXZ", ptr: Ptr(streambuf_w_showmanyc as *const ()) },
     Export { name: "?snextc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAAHXZ", ptr: Ptr(streambuf_snextc as *const ()) },
     Export { name: "?sputc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAAHD@Z", ptr: Ptr(streambuf_sputc as *const ()) },
+    Export { name: "?sputc@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@QEAAG_W@Z", ptr: Ptr(streambuf_w_sputc as *const ()) },
     Export { name: "?sputn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAA_JPEBD_J@Z", ptr: Ptr(streambuf_sputn as *const ()) },
+    Export { name: "?sputn@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@QEAA_JPEB_W_J@Z", ptr: Ptr(streambuf_w_sputn as *const ()) },
     Export { name: "?swap@?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAAXAEAV12@@Z", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?swap@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXAEAV12@@Z", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?sync@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAAHXZ", ptr: Ptr(streambuf_sync as *const ()) },
+    Export { name: "?sync@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@MEAAHXZ", ptr: Ptr(streambuf_w_sync as *const ()) },
     Export { name: "?tellg@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA?AV?$fpos@U_Mbstatet@@@2@XZ", ptr: Ptr(istream_tellg as *const ()) },
+    Export { name: "?tellp@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA?AV?$fpos@U_Mbstatet@@@2@XZ", ptr: Ptr(ostream_tellp as *const ()) },
+    Export { name: "?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBAPEAV?$basic_ostream@DU?$char_traits@D@std@@@2@XZ", ptr: Ptr(ios_tie_get as *const ()) },
+    Export { name: "?tie@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEBAPEAV?$basic_ostream@_WU?$char_traits@_W@std@@@2@XZ", ptr: Ptr(ios_w_tie_get as *const ()) },
     Export { name: "?tolower@?$ctype@D@std@@QEBADD@Z", ptr: Ptr(ctype_tolower_char as *const ()) },
     Export { name: "?tolower@?$ctype@D@std@@QEBAPEBDPEADPEBD@Z", ptr: Ptr(ctype_tolower_range as *const ()) },
+    Export { name: "?toupper@?$ctype@_W@std@@QEBAPEB_WPEA_WPEB_W@Z", ptr: Ptr(ctype_w_toupper_range as *const ()) },
     Export { name: "?uflow@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAAHXZ", ptr: Ptr(streambuf_uflow as *const ()) },
+    Export { name: "?uflow@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@MEAAGXZ", ptr: Ptr(streambuf_w_uflow as *const ()) },
     Export { name: "?uncaught_exception@std@@YA_NXZ", ptr: Ptr(std_uncaught_exception as *const ()) },
     Export { name: "?uncaught_exceptions@std@@YAHXZ", ptr: Ptr(std_uncaught_exceptions as *const ()) },
+    Export { name: "?underflow@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAAHXZ", ptr: Ptr(streambuf_underflow as *const ()) },
     Export { name: "?unshift@?$codecvt@DDU_Mbstatet@@@std@@QEBAHAEAU_Mbstatet@@PEAD1AEAPEAD@Z", ptr: Ptr(codecvt_unshift as *const ()) },
     Export { name: "?widen@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBADD@Z", ptr: Ptr(ios_widen as *const ()) },
+    Export { name: "?widen@?$ctype@_W@std@@QEBA_WD@Z", ptr: Ptr(ctype_w_widen_char as *const ()) },
+    Export { name: "?width@ios_base@std@@QEAA_J_J@Z", ptr: Ptr(ios_base_width_set as *const ()) },
+    Export { name: "?width@ios_base@std@@QEBA_JXZ", ptr: Ptr(ios_base_width_get as *const ()) },
     Export { name: "?write@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@PEBD_J@Z", ptr: Ptr(ostream_write as *const ()) },
     Export { name: "?xsgetn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA_JPEAD_J@Z", ptr: Ptr(streambuf_xsgetn as *const ()) },
+    Export { name: "?xsgetn@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@MEAA_JPEA_W_J@Z", ptr: Ptr(streambuf_w_xsgetn as *const ()) },
     Export { name: "?xsputn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA_JPEBD_J@Z", ptr: Ptr(streambuf_xsputn as *const ()) },
+    Export { name: "?xsputn@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@MEAA_JPEB_W_J@Z", ptr: Ptr(streambuf_w_xsputn as *const ()) },
+    Export { name: "_FExp", ptr: Ptr(crate::bridge_entry!(fexp_impl)) },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msvcp140_runtime_locale_and_streams_roundtrip() {
+        unsafe {
+            assert!(_Thrd_hardware_concurrency() >= 1);
+
+            // Spin lock acquires and releases cleanly across threads.
+            _Lock_shared_ptr_spin_lock();
+            _Unlock_shared_ptr_spin_lock();
+
+            // _FExp scales exp(*px) * y * 2^eoff and returns MSVC FP class codes.
+            let mut x = 0.0f32;
+            assert_eq!(fexp_impl(&mut x, 1.5, 2), -1); // 1.5 * 4 = 6.0 (_FINITE)
+            assert!((x - 6.0).abs() < 1e-5);
+            let mut z = 1.0f32;
+            assert_eq!(fexp_impl(&mut z, 0.0, 0), 0); // FP_ZERO
+            assert_eq!(z, 0.0);
+            let mut ov = 200.0f32;
+            assert_eq!(fexp_impl(&mut ov, 1.0, 0), 1); // _INFCODE
+            assert!(ov.is_infinite());
+
+            // _Locinfo(int, const char*), _Getname, _New_Locimp(bool), _Makeloc, ctype<wchar_t>.
+            let mut li = [0u8; 0x68];
+            locinfo_ctor_cat(li.as_mut_ptr(), 0x3f, c"en-US".as_ptr());
+            assert_eq!(CStr::from_ptr(locinfo_getname(li.as_ptr())).to_bytes(), b"en-US");
+            let imp = locimp_new_bool(1);
+            assert!(!imp.is_null());
+            assert_eq!((*imp).transparent, 1);
+            let imp2 = locimp_makeloc(li.as_ptr(), 0x3f, imp, std::ptr::null());
+            assert_eq!(imp2, imp);
+            let mut wfac: *const Facet = std::ptr::null();
+            assert_eq!(ctype_w_getcat(&mut wfac, std::ptr::null()), 2);
+            assert!(!wfac.is_null());
+            let cw = wfac as *const CtypeW;
+            assert_eq!(ctype_w_widen_char(cw, b'z'), b'z' as u16);
+            let mut wbuf: [u16; 4] = [b'a' as u16, b'B' as u16, b'z' as u16, b'9' as u16];
+            let end = ctype_w_toupper_range(cw, wbuf.as_mut_ptr(), wbuf.as_ptr().add(4));
+            assert_eq!(end, wbuf.as_ptr().add(4));
+            assert_eq!(wbuf, [b'A' as u16, b'B' as u16, b'Z' as u16, b'9' as u16]);
+            locinfo_dtor(li.as_mut_ptr());
+
+            // Narrow basic_streambuf + basic_ios + ios_base helpers.
+            let mut sb: BasicStreambuf = std::mem::zeroed();
+            streambuf_ctor(&mut sb);
+            let mut gmem = *b"abcd";
+            let mut pmem = [0u8; 16];
+            streambuf_setg(&mut sb, gmem.as_mut_ptr(), gmem.as_mut_ptr(), gmem.as_mut_ptr().add(4));
+            streambuf_setp2(&mut sb, pmem.as_mut_ptr(), pmem.as_mut_ptr().add(16));
+            assert_eq!(streambuf_gnavail(&sb), 4);
+            assert_eq!(streambuf_pnavail(&sb), 16);
+            assert_eq!(*streambuf_gninc(&mut sb), b'a');
+            assert_eq!(streambuf_gnavail(&sb), 3);
+            assert_eq!(*streambuf_gndec(&mut sb), b'a');
+            assert_eq!(streambuf_gnavail(&sb), 4);
+            streambuf_gbump(&mut sb, 2);
+            assert_eq!(*streambuf_gptr(&sb), b'c');
+            streambuf_pbump(&mut sb, 1);
+            assert_eq!(streambuf_pnavail(&sb), 15);
+
+            // Copy ctor + copy assign preserve buffer pointers cleanly.
+            let mut sb_copy: BasicStreambuf = std::mem::zeroed();
+            streambuf_copy_ctor(&mut sb_copy, &sb);
+            assert_eq!(streambuf_gnavail(&sb_copy), 2);
+            assert_eq!(streambuf_pnavail(&sb_copy), 15);
+            streambuf_dtor(&mut sb_copy);
+
+            // Wide basic_streambuf + basic_iostream + ostream formatting & manipulators.
+            let mut wsb: BasicStreambufW = std::mem::zeroed();
+            streambuf_w_ctor(&mut wsb);
+            let mut wpmem = [0u16; 32];
+            streambuf_w_setp2(&mut wsb, wpmem.as_mut_ptr(), wpmem.as_mut_ptr().add(32));
+            let mut wiostr = [0u8; 0x20 + std::mem::size_of::<BasicIosW>()];
+            iostream_w_ctor(wiostr.as_mut_ptr(), &mut wsb, 1);
+            let wios = stream_ios_w(wiostr.as_mut_ptr());
+            assert_eq!(ios_base_bool(wios as *const BasicIos), 1);
+            assert_eq!(ios_w_fill_set(wios, b'0' as u16), b' ' as u16);
+            assert_eq!(ios_w_fill_get(wios), b'0' as u16);
+            ios_base_setf2(wios as *mut BasicIos, 0x0800 | 0x0004, 0x0E00 | 0x0004); // hex | uppercase
+            assert_eq!(ios_base_width_set(wios as *mut BasicIos, 4), 0);
+            assert_eq!(ios_base_width_get(wios as *const BasicIos), 4);
+            ostream_w_shl_u32(wiostr.as_mut_ptr(), 0x2A);
+            assert_eq!(ios_base_width_get(wios as *const BasicIos), 0);
+            let written = (streambuf_w_pptr(&wsb) as usize - wpmem.as_ptr() as usize) / 2;
+            let text = String::from_utf16_lossy(&wpmem[..written]);
+            assert_eq!(text, "002A");
+            assert_eq!(streambuf_w_sputc(&mut wsb, b'!' as u16), b'!' as u16);
+            assert_eq!(wpmem[written], b'!' as u16);
+            ios_w_dtor(wios);
+            streambuf_w_dtor(&mut wsb);
+
+            // Narrow basic_ios ctor(sb) + rdbuf + copyfmt + tellp.
+            let mut ios1: BasicIos = std::mem::zeroed();
+            ios_ctor_sb(&mut ios1, &mut sb);
+            assert_eq!(ios_rdbuf_get(&ios1), &mut sb as *mut BasicStreambuf);
+            assert_eq!(ios_fill_get(&ios1), b' ');
+            assert_eq!(ios_base_bool(&ios1), 1);
+            assert_eq!(ios_rdbuf_set(&mut ios1, std::ptr::null_mut()), &mut sb as *mut BasicStreambuf);
+            assert_eq!(ios_base_bool(&ios1), 0);
+            ios_dtor(&mut ios1);
+            streambuf_dtor(&mut sb);
+
+            // Verify every newly added Spider-Man 2 msvcp140 symbol resolves via lookup().
+            for sym in [
+                "_FExp",
+                "_Lock_shared_ptr_spin_lock",
+                "_Thrd_hardware_concurrency",
+                "_Unlock_shared_ptr_spin_lock",
+                "?_Raise_handler@std@@3P6AXAEBVexception@stdext@@@ZEA",
+                "?_Xoverflow_error@std@@YAXPEBD@Z",
+                "?_Xruntime_error@std@@YAXPEBD@Z",
+                "??0_Locinfo@std@@QEAA@HPEBD@Z",
+                "?_Getname@_Locinfo@std@@QEBAPEBDXZ",
+                "?_New_Locimp@_Locimp@locale@std@@CAPEAV123@_N@Z",
+                "?_Makeloc@_Locimp@locale@std@@CAPEAV123@AEBV_Locinfo@3@HPEAV123@PEBV23@@Z",
+                "?id@?$ctype@_W@std@@2V0locale@2@A",
+                "?_Getcat@?$ctype@_W@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z",
+                "?toupper@?$ctype@_W@std@@QEBAPEB_WPEA_WPEB_W@Z",
+                "?widen@?$ctype@_W@std@@QEBA_WD@Z",
+                "??Bios_base@std@@QEBA_NXZ",
+                "?flags@ios_base@std@@QEBAHXZ",
+                "?setf@ios_base@std@@QEAAHH@Z",
+                "?setf@ios_base@std@@QEAAHHH@Z",
+                "?width@ios_base@std@@QEBA_JXZ",
+                "?width@ios_base@std@@QEAA_J_J@Z",
+                "?tellp@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA?AV?$fpos@U_Mbstatet@@@2@XZ",
+                "??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z",
+                "??6?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QEAAAEAV01@I@Z",
+            ] {
+                assert!(crate::lookup("msvcp140.dll", sym).is_some(), "missing {sym}");
+            }
+        }
+    }
+}
