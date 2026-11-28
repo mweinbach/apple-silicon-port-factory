@@ -326,6 +326,7 @@ pub mod wm {
     pub const BM_CLICK: u32 = 0x00F5;
     pub const BM_GETIMAGE: u32 = 0x00F6;
     pub const BM_SETIMAGE: u32 = 0x00F7;
+    pub const INPUT_DEVICE_CHANGE: u32 = 0x00FE;
     pub const INPUT: u32 = 0x00FF;
     pub const KEYDOWN: u32 = 0x0100;
     pub const KEYUP: u32 = 0x0101;
