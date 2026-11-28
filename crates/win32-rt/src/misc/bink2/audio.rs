@@ -840,9 +840,7 @@ impl BinkAudioPlayer {
             });
         }
 
-        let headless = std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
-            || std::env::var("AW2_HEADLESS").is_ok_and(|v| v == "1");
-        let dev = if headless {
+        let dev = if backend::use_null_in_headless_mode() {
             backend::null_device()
         } else {
             backend::output_devices()
@@ -853,7 +851,19 @@ impl BinkAudioPlayer {
 
         let io_req = 512u32;
         let stream = match OutputStream::open(&dev, rate, channels, shared.clone(), io_req) {
-            Ok(s) => Some(s),
+            Ok(s) => {
+                log::info!(
+                    target: "audio",
+                    "bink2w64: audio opened '{}' ({}) {} Hz {} ch ({:?}, io={} frames)",
+                    dev.name,
+                    dev.uid,
+                    rate,
+                    channels,
+                    s.kind,
+                    s.io_frames
+                );
+                Some(s)
+            }
             Err(e) => {
                 log::warn!(
                     target: "audio",
