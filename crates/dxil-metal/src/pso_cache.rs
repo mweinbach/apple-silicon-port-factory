@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -421,6 +421,44 @@ fn ns_err(what: &str, e: &NSError) -> Error {
     Error::Metal(format!("{what}: {}", e.localizedDescription()))
 }
 
+const XPC_RETRY_BACKOFFS_MS: &[u64] = &[50, 150];
+
+fn is_transient_xpc_interrupt(err: &Error) -> bool {
+    let Error::Metal(msg) = err else {
+        return false;
+    };
+    !msg.contains("Objective-C exception")
+        && (msg.contains("XPC_ERROR_CONNECTION_INTERRUPTED")
+            || msg.contains("interrupted connection"))
+}
+
+/// Retries a Metal compiler call when Apple's out-of-process `MTLCompilerService`
+/// XPC helper restarts while concurrent threads are compiling pipelines/libraries.
+fn retry_on_xpc_interrupt<T>(
+    what: &str,
+    backoffs_ms: &[u64],
+    mut f: impl FnMut() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut attempt = 0usize;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < backoffs_ms.len() && is_transient_xpc_interrupt(&e) => {
+                let wait_ms = backoffs_ms[attempt];
+                attempt += 1;
+                log::warn!(
+                    "pso cache: {what} hit transient Metal compiler XPC disconnect (retry {attempt}/{} after {wait_ms}ms): {e}",
+                    backoffs_ms.len()
+                );
+                if wait_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(wait_ms));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Runs Metal calls that report misuse by raising an Objective-C exception (which would
 /// otherwise abort the process across the Rust boundary) and turns the exception into an error.
 fn guarded<R>(what: &str, f: impl FnOnce() -> R) -> Result<R, Error> {
@@ -690,7 +728,7 @@ impl PipelineCache {
         memo: &RwLock<HashMap<u128, P>>,
         in_flight: &InFlightTable,
         from_archive: impl Fn(&ProtocolObject<dyn MTL4Archive>) -> Result<P, Retained<NSError>>,
-        compile: impl FnOnce(&ProtocolObject<dyn MTL4Compiler>, Option<&MTL4CompilerTaskOptions>) -> Result<P, Retained<NSError>>,
+        compile: impl Fn(&ProtocolObject<dyn MTL4Compiler>, Option<&MTL4CompilerTaskOptions>) -> Result<P, Retained<NSError>>,
         what: &str,
     ) -> Result<P, Error> {
         // 1. Fast path + per-key singleflight deduplication so concurrent requests for
@@ -783,22 +821,27 @@ impl PipelineCache {
                 }
             }
             let t = Instant::now();
-            let opts = self.task_options();
-            let _compile_guard = self.flush_core.compile_lock.read().unwrap();
-            let compiler = self.flush_core.compiler.read().unwrap();
-            let r = guarded(what, || compile(&*compiler, opts.as_deref()))
-                .and_then(|r| r.map_err(|e| ns_err(what, &e)));
-            drop(compiler);
-            if r.is_ok() {
-                if let Some(k) = key {
-                    self.flush_core.serializer_keys.lock().unwrap().insert((kind, k));
+            let r = retry_on_xpc_interrupt(what, XPC_RETRY_BACKOFFS_MS, || {
+                // Re-acquire locks per attempt so we never hold `compile_lock` or `compiler`
+                // across retry backoff sleeps, while still keeping `compile_lock` held from a
+                // successful compile through serializer key/dirty updates.
+                let opts = self.task_options();
+                let _compile_guard = self.flush_core.compile_lock.read().unwrap();
+                let compiler = self.flush_core.compiler.read().unwrap();
+                let res = guarded(what, || compile(&*compiler, opts.as_deref()))
+                    .and_then(|r| r.map_err(|e| ns_err(what, &e)));
+                drop(compiler);
+                if res.is_ok() {
+                    if let Some(k) = key {
+                        self.flush_core.serializer_keys.lock().unwrap().insert((kind, k));
+                    }
+                    self.flush_core.counters.compiles.fetch_add(1, Ordering::Relaxed);
+                    self.flush_core.compiles_since_flush.fetch_add(1, Ordering::Relaxed);
+                    self.flush_core.dirty.store(true, Ordering::Release);
+                    did_compile = true;
                 }
-                self.flush_core.counters.compiles.fetch_add(1, Ordering::Relaxed);
-                self.flush_core.compiles_since_flush.fetch_add(1, Ordering::Relaxed);
-                self.flush_core.dirty.store(true, Ordering::Release);
-                did_compile = true;
-            }
-            drop(_compile_guard);
+                res
+            });
             self.flush_core.counters.compile_nanos.fetch_add(nanos(t), Ordering::Relaxed);
             match r {
                 Ok(p) => Ok(p),
@@ -870,44 +913,52 @@ impl PipelineCache {
     ) -> Result<Library, Error> {
         let try_compile = |ver: Option<MTLLanguageVersion>| -> Result<Library, Error> {
             let _permit = self.compile_limiter.acquire();
-            objc2::rc::autoreleasepool(|_| {
-                let opts = MTLCompileOptions::new();
-                if let Some(v) = ver {
-                    opts.setLanguageVersion(v);
-                }
-                if compile_opts.fast_math {
-                    opts.setMathMode(MTLMathMode::Fast);
-                    opts.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Fast);
-                }
-                if compile_opts.rtz_fp_conversion && ver == Some(LANGUAGE_VERSION_4_1) {
-                    unsafe {
-                        let has_sel: objc2::runtime::Bool = objc2::msg_send![
-                            &*opts,
-                            respondsToSelector: objc2::sel!(setFloatingPointConversionRoundingMode:)
-                        ];
-                        if has_sel.as_bool() {
-                            let _: () = objc2::msg_send![
+            retry_on_xpc_interrupt(name, XPC_RETRY_BACKOFFS_MS, || {
+                objc2::rc::autoreleasepool(|_| {
+                    let opts = MTLCompileOptions::new();
+                    if let Some(v) = ver {
+                        opts.setLanguageVersion(v);
+                    }
+                    if compile_opts.fast_math {
+                        opts.setMathMode(MTLMathMode::Fast);
+                        opts.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Fast);
+                    }
+                    if compile_opts.rtz_fp_conversion && ver == Some(LANGUAGE_VERSION_4_1) {
+                        unsafe {
+                            let has_sel: objc2::runtime::Bool = objc2::msg_send![
                                 &*opts,
-                                setFloatingPointConversionRoundingMode: FP_CONVERSION_ROUNDING_RTZ
+                                respondsToSelector: objc2::sel!(setFloatingPointConversionRoundingMode:)
                             ];
+                            if has_sel.as_bool() {
+                                let _: () = objc2::msg_send![
+                                    &*opts,
+                                    setFloatingPointConversionRoundingMode: FP_CONVERSION_ROUNDING_RTZ
+                                ];
+                            }
                         }
                     }
-                }
-                let desc = MTL4LibraryDescriptor::new();
-                desc.setSource(Some(&NSString::from_str(source)));
-                desc.setOptions(Some(&opts));
-                if !name.is_empty() {
-                    desc.setName(Some(&NSString::from_str(name)));
-                }
-                let _compile_guard = self.flush_core.compile_lock.read().unwrap();
-                let compiler = self.flush_core.compiler.read().unwrap();
-                guarded(name, || compiler.newLibraryWithDescriptor_error(&desc))
-                    .and_then(|r| r.map_err(|e| ns_err(name, &e)))
+                    let desc = MTL4LibraryDescriptor::new();
+                    desc.setSource(Some(&NSString::from_str(source)));
+                    desc.setOptions(Some(&opts));
+                    if !name.is_empty() {
+                        desc.setName(Some(&NSString::from_str(name)));
+                    }
+                    let _compile_guard = self.flush_core.compile_lock.read().unwrap();
+                    let compiler = self.flush_core.compiler.read().unwrap();
+                    guarded(name, || compiler.newLibraryWithDescriptor_error(&desc))
+                        .and_then(|r| r.map_err(|e| ns_err(name, &e)))
+                })
             })
         };
-        try_compile(Some(LANGUAGE_VERSION_4_1))
-            .or_else(|_| try_compile(Some(MTLLanguageVersion(4 << 16))))
-            .or_else(|_| try_compile(None))
+        match try_compile(Some(LANGUAGE_VERSION_4_1)) {
+            Ok(lib) => Ok(lib),
+            Err(e) if is_transient_xpc_interrupt(&e) => Err(e),
+            Err(_) => match try_compile(Some(MTLLanguageVersion(4 << 16))) {
+                Ok(lib) => Ok(lib),
+                Err(e) if is_transient_xpc_interrupt(&e) => Err(e),
+                Err(_) => try_compile(None),
+            },
+        }
     }
 
     /// Builds a [`MTLComputePipelineState`] for `function_name` in `lib` through [`MTL4Compiler`]
@@ -1551,5 +1602,51 @@ kernel void cvt_f16(device const float* inp [[buffer(0)]], device half* outp [[b
         assert_eq!((st.archive_hits, st.compiles), (2, 0), "{st:?}");
         drop(warm);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xpc_interrupt_retry_recovers_on_transient_disconnect_and_bounds_attempts() {
+        let xpc_err = || {
+            Error::Metal(
+                "compute pipeline: Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries.".into(),
+            )
+        };
+        assert!(is_transient_xpc_interrupt(&xpc_err()));
+        assert!(!is_transient_xpc_interrupt(&Error::Metal("compute pipeline: syntax error".into())));
+        assert!(!is_transient_xpc_interrupt(&Error::Metal(
+            "compute pipeline: Objective-C exception: interrupted connection".into()
+        )));
+        assert!(!is_transient_xpc_interrupt(&Error::Io("XPC_ERROR_CONNECTION_INTERRUPTED".into())));
+
+        // 1) Recovers when a transient XPC disconnect clears on retry.
+        let mut calls = 0usize;
+        let ok = retry_on_xpc_interrupt("test", &[0, 0], || {
+            calls += 1;
+            if calls < 3 {
+                Err(xpc_err())
+            } else {
+                Ok(42u32)
+            }
+        });
+        assert_eq!(ok.unwrap(), 42);
+        assert_eq!(calls, 3);
+
+        // 2) Bounds retries when the XPC disconnect persists.
+        let mut calls = 0usize;
+        let err = retry_on_xpc_interrupt::<u32>("test", &[0, 0], || {
+            calls += 1;
+            Err(xpc_err())
+        });
+        assert!(err.is_err());
+        assert_eq!(calls, 3, "1 initial attempt + 2 bounded retries");
+
+        // 3) Does not retry non-XPC compiler errors.
+        let mut calls = 0usize;
+        let err = retry_on_xpc_interrupt::<u32>("test", &[0, 0], || {
+            calls += 1;
+            Err(Error::Metal("compute pipeline: invalid shader".into()))
+        });
+        assert!(err.is_err());
+        assert_eq!(calls, 1, "non-transient compiler errors must fail immediately");
     }
 }
