@@ -3237,59 +3237,210 @@ fn runtime_callback_replay_triggers_bg_rebuild() {
 }
 
 /// A large `.pdata` function whose intra-function CFG extends past `DEFAULT_AOT_CLOSURE`
-/// (128 hops) must still admit direct calls and tail-jumps to `.pdata`-less leaf helpers.
+/// (128 hops) must still admit direct calls, tail-jumps, and `LEA` references to `.pdata`-less
+/// leaf helpers AND expand the multi-block CFG inside those leaves, while keeping `.pdata`-less
+/// chains strictly bounded by `DEFAULT_AOT_CLOSURE`.
 #[test]
 fn aot_deep_pdata_function_discovers_leaf_callees_past_default_depth() {
     use iced_x86::code_asm::*;
 
-    let mut pe = TestMappedBuf::alloc(0x8000, 0x2_3F10_0000);
+    let mut pe = TestMappedBuf::alloc(0xA000, 0x2_3F10_0000);
     let base = pe.base();
     let base64 = base as u64;
     let buf = pe.as_slice_mut();
     let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
 
-    // .text @ 0x1000..0x5000, .rdata @ 0x5000..0x7000, .pdata @ 0x6000 (1 entry = 12 bytes)
-    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x4000, 0x5000, 0x2000, None, Some((0x6000, 12)));
+    // .text @ 0x1000..0x7000, .rdata @ 0x7000..0x9000, .pdata @ 0x8000 (1 entry = 12 bytes)
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x6000, 0x7000, 0x2000, None, Some((0x8000, 12)));
 
-    // 140-hop chain (> DEFAULT_AOT_CLOSURE = 128) ending in call 0x4000; jmp 0x4100.
+    // 140-hop chain (> DEFAULT_AOT_CLOSURE = 128) ending in:
+    //   lea rax, [rip + 0x4200]
+    //   call 0x4000
+    //   jmp 0x4100
     let mut a = CodeAssembler::new(64).unwrap();
     let mut exit_lbl = a.create_label();
     for i in 0..140 {
         a.cmp(ecx, i as i32).unwrap();
         a.je(exit_lbl).unwrap();
     }
-    a.call(base64 + 0x4000).unwrap();
-    a.jmp(base64 + 0x4100).unwrap();
+    a.jmp(base64 + 0x3E00).unwrap();
     a.set_label(&mut exit_lbl).unwrap();
     a.xor(eax, eax).unwrap();
     a.ret().unwrap();
     let fn0 = a.assemble(base64 + 0x1000).unwrap();
-    assert!(0x1000 + fn0.len() < 0x3F00);
+    assert!(0x1000 + fn0.len() < 0x3E00);
     buf[0x1000..0x1000 + fn0.len()].copy_from_slice(&fn0);
 
-    // .pdata entry covering only [0x1000, 0x1000 + fn0.len())
-    w32(buf, 0x6000, 0x1000);
-    w32(buf, 0x6004, 0x1000 + fn0.len() as u32);
-    w32(buf, 0x6008, 0);
+    // Tail of the same `.pdata` function at 0x3E00 (>140 hops from entry).
+    let mut tail = Vec::new();
+    emit_lea_rip(&mut tail, base64 + 0x3E00, 0 /* rax */, base64 + 0x4200);
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.call(base64 + 0x4000).unwrap();
+    a.jmp(base64 + 0x4100).unwrap();
+    tail.extend_from_slice(&a.assemble(base64 + 0x3E00 + tail.len() as u64).unwrap());
+    let fn0_end = 0x3E00 + tail.len();
+    assert!(fn0_end < 0x3F00);
+    buf[0x3E00..fn0_end].copy_from_slice(&tail);
 
-    // Two `.pdata`-less leaf helpers at 0x4000 (direct call) and 0x4100 (tail jump).
-    buf[0x4000..0x4006].copy_from_slice(&[0xB8, 0x11, 0, 0, 0, 0xC3]);
-    buf[0x4100..0x4106].copy_from_slice(&[0xB8, 0x22, 0, 0, 0, 0xC3]);
+    // .pdata entry covering [0x1000, fn0_end)
+    w32(buf, 0x8000, 0x1000);
+    w32(buf, 0x8004, fn0_end as u32);
+    w32(buf, 0x8008, 0);
+
+    // Multi-block `.pdata`-less leaf helper at 0x4000 (direct call): branches to 0x4020 -> 0x4040.
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.test(ecx, ecx).unwrap();
+    a.je(base64 + 0x4020).unwrap();
+    a.mov(eax, 0x11).unwrap();
+    a.ret().unwrap();
+    let b = a.assemble(base64 + 0x4000).unwrap();
+    buf[0x4000..0x4000 + b.len()].copy_from_slice(&b);
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.cmp(edx, 1).unwrap();
+    a.jne(base64 + 0x4040).unwrap();
+    a.mov(eax, 0x12).unwrap();
+    a.ret().unwrap();
+    let b = a.assemble(base64 + 0x4020).unwrap();
+    buf[0x4020..0x4020 + b.len()].copy_from_slice(&b);
+    buf[0x4040..0x4046].copy_from_slice(&[0xB8, 0x13, 0, 0, 0, 0xC3]);
+
+    // Multi-block `.pdata`-less leaf helper at 0x4100 (tail jump): branches to 0x4120.
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.test(ecx, ecx).unwrap();
+    a.jne(base64 + 0x4120).unwrap();
+    a.mov(eax, 0x22).unwrap();
+    a.ret().unwrap();
+    let b = a.assemble(base64 + 0x4100).unwrap();
+    buf[0x4100..0x4100 + b.len()].copy_from_slice(&b);
+    buf[0x4120..0x4126].copy_from_slice(&[0xB8, 0x23, 0, 0, 0, 0xC3]);
+
+    // Multi-block `.pdata`-less leaf helper at 0x4200 (LEA reference): branches to 0x4220.
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.test(ecx, ecx).unwrap();
+    a.je(base64 + 0x4220).unwrap();
+    a.mov(eax, 0x33).unwrap();
+    a.ret().unwrap();
+    let b = a.assemble(base64 + 0x4200).unwrap();
+    buf[0x4200..0x4200 + b.len()].copy_from_slice(&b);
+    buf[0x4220..0x4226].copy_from_slice(&[0xB8, 0x34, 0, 0, 0, 0xC3]);
+
+    // Long `.pdata`-less chain starting at 0x4800 with 135 hops (> DEFAULT_AOT_CLOSURE = 128),
+    // ending at a sentinel block 0x6F00 that must NOT be reached because `.pdata`-less chains
+    // remain bounded by `DEFAULT_AOT_CLOSURE`.
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut chain_exit = a.create_label();
+    for i in 0..135 {
+        a.cmp(ecx, i as i32).unwrap();
+        a.je(chain_exit).unwrap();
+    }
+    a.jmp(base64 + 0x6F00).unwrap();
+    a.set_label(&mut chain_exit).unwrap();
+    a.ret().unwrap();
+    let chain = a.assemble(base64 + 0x4800).unwrap();
+    assert!(0x4800 + chain.len() < 0x6E00);
+    buf[0x4800..0x4800 + chain.len()].copy_from_slice(&chain);
+    buf[0x6F00..0x6F06].copy_from_slice(&[0xB8, 0x99, 0, 0, 0, 0xC3]);
 
     let mut bc = Box::new(BlockCache::new());
-    let (ips, closure) = unsafe { discover(&mut *bc, base, pe.len, &[0x1000], DEFAULT_AOT_CLOSURE) };
+    let (ips, closure) = unsafe {
+        discover(&mut *bc, base, pe.len, &[0x1000, 0x4800], DEFAULT_AOT_CLOSURE)
+    };
+    for (rva, label) in [
+        (0x4000, "direct-called .pdata-less leaf entry"),
+        (0x4020, "direct-called .pdata-less leaf branch block 1"),
+        (0x4040, "direct-called .pdata-less leaf branch block 2"),
+        (0x4100, "tail-jumped .pdata-less leaf entry"),
+        (0x4120, "tail-jumped .pdata-less leaf branch block"),
+        (0x4200, "LEA-referenced .pdata-less leaf entry"),
+        (0x4220, "LEA-referenced .pdata-less leaf branch block"),
+    ] {
+        assert!(
+            ips.contains(&(base64 + rva)),
+            "deep .pdata function (>128 hops) must discover {label} (rva={rva:#x})"
+        );
+    }
     assert!(
-        ips.contains(&(base64 + 0x4000)),
-        "deep .pdata function (>128 hops) must discover direct-called .pdata-less leaf"
-    );
-    assert!(
-        ips.contains(&(base64 + 0x4100)),
-        "deep .pdata function (>128 hops) must discover tail-jumped .pdata-less leaf"
+        !ips.contains(&(base64 + 0x6F00)),
+        ".pdata`-less chain >128 hops must remain bounded by DEFAULT_AOT_CLOSURE"
     );
     assert!(
         closure.leaf_callees >= 2,
         "expected >=2 leaf callees, got {}",
         closure.leaf_callees
+    );
+    assert!(
+        closure.lea_leaves >= 1,
+        "expected >=1 LEA leaf, got {}",
+        closure.lea_leaves
+    );
+}
+
+/// A `.pdata`-less block first reached at the `DEFAULT_AOT_CLOSURE` hop boundary (truncated)
+/// must still be expanded if a deep `.pdata` caller later enters it with a fresh leaf hop budget.
+#[test]
+fn aot_truncated_leaf_expands_when_called_from_deep_pdata() {
+    use iced_x86::code_asm::*;
+
+    let mut pe = TestMappedBuf::alloc(0xA000, 0x2_3F11_0000);
+    let base = pe.base();
+    let base64 = base as u64;
+    let buf = pe.as_slice_mut();
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+
+    // .text @ 0x1000..0x7000, .rdata @ 0x7000..0x9000, .pdata @ 0x8000 (1 entry = 12 bytes)
+    init_synth_pe(buf, base64, 0x1000, 0x1000, 0x6000, 0x7000, 0x2000, None, Some((0x8000, 12)));
+
+    // 140-hop `.pdata` function calling 0x6A00 at hop 140.
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut exit_lbl = a.create_label();
+    for i in 0..140 {
+        a.cmp(ecx, i as i32).unwrap();
+        a.je(exit_lbl).unwrap();
+    }
+    a.call(base64 + 0x6A00).unwrap();
+    a.set_label(&mut exit_lbl).unwrap();
+    a.ret().unwrap();
+    let fn0 = a.assemble(base64 + 0x1000).unwrap();
+    assert!(0x1000 + fn0.len() < 0x3800);
+    buf[0x1000..0x1000 + fn0.len()].copy_from_slice(&fn0);
+    w32(buf, 0x8000, 0x1000);
+    w32(buf, 0x8004, 0x1000 + fn0.len() as u32);
+    w32(buf, 0x8008, 0);
+
+    // 128-hop `.pdata`-less chain starting at 0x3800 that lands on 0x6A00 at hop 128
+    // (exactly `DEFAULT_AOT_CLOSURE`, where expansion is truncated).
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut chain_exit = a.create_label();
+    for i in 0..127 {
+        a.cmp(ecx, i as i32).unwrap();
+        a.je(chain_exit).unwrap();
+    }
+    a.jmp(base64 + 0x6A00).unwrap();
+    a.set_label(&mut chain_exit).unwrap();
+    a.ret().unwrap();
+    let chain = a.assemble(base64 + 0x3800).unwrap();
+    assert!(0x3800 + chain.len() < 0x6A00);
+    buf[0x3800..0x3800 + chain.len()].copy_from_slice(&chain);
+
+    // Leaf at 0x6A00 branches to 0x6A40.
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.test(ecx, ecx).unwrap();
+    a.je(base64 + 0x6A40).unwrap();
+    a.mov(eax, 1).unwrap();
+    a.ret().unwrap();
+    let b = a.assemble(base64 + 0x6A00).unwrap();
+    buf[0x6A00..0x6A00 + b.len()].copy_from_slice(&b);
+    buf[0x6A40..0x6A46].copy_from_slice(&[0xB8, 0x02, 0, 0, 0, 0xC3]);
+
+    let mut bc = Box::new(BlockCache::new());
+    let (ips, _) = unsafe {
+        discover(&mut *bc, base, pe.len, &[0x1000, 0x3800], DEFAULT_AOT_CLOSURE)
+    };
+    assert!(ips.contains(&(base64 + 0x6A00)), "shared leaf entry must be discovered");
+    assert!(
+        ips.contains(&(base64 + 0x6A40)),
+        "leaf truncated at depth=128 must still expand when called by a deep .pdata function"
     );
 }
 

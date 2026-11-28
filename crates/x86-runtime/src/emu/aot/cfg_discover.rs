@@ -233,17 +233,22 @@ unsafe fn discover_inner(
     let mut jt_blocks: HashSet<u64> = HashSet::new();
     // Per-block count of hint-upgrade re-analyses (capped at `MAX_JT_REANALYZE`).
     let mut reanalyzed: HashMap<u64, u8> = HashMap::new();
-    // `(ip, incoming_hint, is_reanalysis)`.
-    let mut frontier: Vec<(u64, Option<Box<JtRegs>>, bool)> = prof
+    // Minimum `.pdata`-less hop depth seen for each `.pdata`-less block, plus `.pdata`-less blocks
+    // that reached `depth` without expanding (eligible to expand once if a `.pdata` caller later
+    // enters them with a fresh leaf hop budget).
+    let mut seen_leaf_hops: HashMap<u64, u32> = HashMap::new();
+    let mut truncated_leaves: HashSet<u64> = HashSet::new();
+    // `(ip, incoming_hint, is_reanalysis, leaf_hops)`.
+    let mut frontier: Vec<(u64, Option<Box<JtRegs>>, bool, u32)> = prof
         .iter()
-        .map(|&r| (base as u64 + r as u64, None, false))
-        .filter(|&(ip, _, _)| in_text(ip))
+        .map(|&r| (base as u64 + r as u64, None, false, 0))
+        .filter(|&(ip, _, _, _)| in_text(ip))
         .collect();
 
     // When `.pdata` is present and caller didn't request a shallow explicit depth
     // (`depth >= DEFAULT_AOT_CLOSURE`), allow intra-`.pdata` edges (`sf == f`) to expand up to
     // `MAX_INTRA_PDATA_DEPTH` hops so long sequential/unrolled functions aren't truncated, while
-    // keeping cross-leaf and `.pdata`-less hops strictly bounded by `depth`.
+    // keeping `.pdata`-less leaf traversal bounded to `depth` hops per leaf entry.
     let max_depth = if !fmap.is_empty() && depth >= super::DEFAULT_AOT_CLOSURE {
         depth.max(MAX_INTRA_PDATA_DEPTH)
     } else {
@@ -251,21 +256,37 @@ unsafe fn discover_inner(
     };
 
     for d in 0..=max_depth {
-        let mut batch: Vec<(u64, Option<Box<JtRegs>>)> = Vec::new();
-        for (ip, hint, is_re) in frontier {
+        let mut batch: Vec<(u64, Option<Box<JtRegs>>, u32)> = Vec::new();
+        for (ip, hint, is_re, leaf_hops) in frontier {
             if is_re {
                 if d == max_depth {
                     continue;
                 }
-                batch.push((ip, hint));
+                if !fmap.is_empty() && leaf_hops >= depth && func(ip).is_none() {
+                    continue;
+                }
+                if !fmap.is_empty() && func(ip).is_none() {
+                    seen_leaf_hops
+                        .entry(ip)
+                        .and_modify(|prev| *prev = (*prev).min(leaf_hops))
+                        .or_insert(leaf_hops);
+                }
+                batch.push((ip, hint, leaf_hops));
             } else {
                 if !seen.insert(ip) || d == max_depth {
                     continue;
                 }
+                if !fmap.is_empty() && func(ip).is_none() {
+                    if leaf_hops >= depth {
+                        truncated_leaves.insert(ip);
+                        continue;
+                    }
+                    seen_leaf_hops.insert(ip, leaf_hops);
+                }
                 if let Some(ref h) = hint {
                     seen_hints.insert(ip, **h);
                 }
-                batch.push((ip, hint));
+                batch.push((ip, hint, leaf_hops));
             }
         }
         if batch.is_empty() {
@@ -278,7 +299,7 @@ unsafe fn discover_inner(
         {
             let workers = threads.min(batch.len());
             let chunk_len = (batch.len() / (workers * 8)).clamp(1, 256);
-            let chunks: Vec<&[(u64, Option<Box<JtRegs>>)]> = batch.chunks(chunk_len).collect();
+            let chunks: Vec<&[(u64, Option<Box<JtRegs>>, u32)]> = batch.chunks(chunk_len).collect();
             let n_chunks = chunks.len();
             let next_chunk = AtomicUsize::new(0);
             let worker_bcs = pool.as_deref_mut().unwrap().ensure(workers);
@@ -306,7 +327,7 @@ unsafe fn discover_inner(
                                 }
                                 let slice = chunks_ref[ci];
                                 let mut out = Vec::with_capacity(slice.len());
-                                for (ip, hint) in slice {
+                                for (ip, hint, _) in slice {
                                     out.push(analyze_block(
                                         bcp,
                                         *ip,
@@ -343,16 +364,17 @@ unsafe fn discover_inner(
             };
             batch
                 .iter()
-                .map(|(ip, hint)| {
+                .map(|(ip, hint, _)| {
                     analyze_block(bcp, *ip, hint.as_deref(), base, size, &text, &fmap, jt_on)
                 })
                 .collect()
         };
 
-        let mut next: Vec<(u64, Option<Box<JtRegs>>, bool)> = Vec::new();
+        let mut next: Vec<(u64, Option<Box<JtRegs>>, bool, u32)> = Vec::new();
         let mut next_pos: HashMap<u64, usize> = HashMap::new();
-        for ((ip, _), step) in batch.into_iter().zip(steps) {
+        for ((ip, _, leaf_hops), step) in batch.into_iter().zip(steps) {
             let f = func(ip);
+            let past_leaf_depth = f.is_none() && leaf_hops >= depth;
             if step.ends_indirect_jmp {
                 indirect_blocks.insert(ip);
             }
@@ -364,12 +386,12 @@ unsafe fn discover_inner(
                     continue;
                 }
                 let mut is_leaf_entry = false;
+                let mut next_leaf_hops = 0u32;
                 if !fmap.is_empty() {
                     let sf = func(s);
-                    let past_base_depth = d >= depth;
                     match kind {
                         EdgeKind::Intra | EdgeKind::JumpTable => {
-                            if sf != f || (past_base_depth && f.is_none()) {
+                            if sf != f || past_leaf_depth {
                                 if sf != f {
                                     st.cross += 1;
                                 }
@@ -377,7 +399,7 @@ unsafe fn discover_inner(
                             }
                         }
                         EdgeKind::DirectCall => {
-                            if past_base_depth && f.is_none() {
+                            if past_leaf_depth {
                                 continue;
                             }
                             if sf.is_some() && sf != f {
@@ -391,10 +413,7 @@ unsafe fn discover_inner(
                         }
                         EdgeKind::TailBranch => {
                             if sf != f {
-                                if (!past_base_depth || f.is_some())
-                                    && sf.is_none()
-                                    && valid_code_target(s, &text)
-                                {
+                                if f.is_some() && sf.is_none() && valid_code_target(s, &text) {
                                     // Direct tail-jump from a `.pdata` function into a
                                     // `.pdata`-less leaf helper: follow cleanly without leaking
                                     // caller switch hints.
@@ -404,20 +423,50 @@ unsafe fn discover_inner(
                                     st.cross += 1;
                                     continue;
                                 }
-                            } else if past_base_depth && f.is_none() {
+                            } else if past_leaf_depth {
                                 continue;
                             }
                         }
                         EdgeKind::LeaLeaf => {
-                            if past_base_depth || sf.is_some() {
+                            if past_leaf_depth || sf.is_some() {
                                 continue;
                             }
                             out_hint = None;
                         }
                     }
+                    // Entering a `.pdata`-less leaf from a `.pdata` function starts a fresh
+                    // `depth`-hop leaf budget; hops within/between `.pdata`-less blocks count
+                    // against that budget so `.pdata`-less traversal remains bounded at `depth`.
+                    next_leaf_hops = if sf.is_some() || f.is_some() {
+                        0
+                    } else {
+                        leaf_hops.saturating_add(1)
+                    };
                 }
 
                 if seen.contains(&s) {
+                    // If `s` was a `.pdata`-less block previously truncated at the leaf hop limit
+                    // and is now reached with remaining leaf budget (e.g. from a deep `.pdata`
+                    // caller), expand it once.
+                    if !fmap.is_empty() && next_leaf_hops < depth && truncated_leaves.remove(&s) {
+                        if let Some(&idx) = next_pos.get(&s) {
+                            next[idx].3 = next[idx].3.min(next_leaf_hops);
+                            if let Some(ref incoming) = out_hint {
+                                if let Some(ref mut cur) = next[idx].1 {
+                                    merge_jt_regs(cur, incoming);
+                                } else {
+                                    next[idx].1 = out_hint;
+                                }
+                            }
+                        } else {
+                            if let Some(ref h) = out_hint {
+                                seen_hints.insert(s, **h);
+                            }
+                            next_pos.insert(s, next.len());
+                            next.push((s, out_hint, true, next_leaf_hops));
+                        }
+                        continue;
+                    }
                     // Re-analyze an already-seen block if it receives strictly richer register
                     // hints (e.g. a switch dispatch block reached first without base/bound
                     // hints, or an intermediate block on the way to one).
@@ -432,7 +481,13 @@ unsafe fn discover_inner(
                                     && *prev != **incoming;
                                 if upgraded || indirect_alt {
                                     let re_hint = if indirect_alt { **incoming } else { *prev };
+                                    let re_hops = seen_leaf_hops
+                                        .get(&s)
+                                        .copied()
+                                        .unwrap_or(next_leaf_hops)
+                                        .min(next_leaf_hops);
                                     if let Some(&idx) = next_pos.get(&s) {
+                                        next[idx].3 = next[idx].3.min(re_hops);
                                         if let Some(ref mut cur) = next[idx].1 {
                                             merge_jt_regs(cur, &re_hint);
                                         } else {
@@ -441,7 +496,7 @@ unsafe fn discover_inner(
                                     } else {
                                         reanalyzed.insert(s, count + 1);
                                         next_pos.insert(s, next.len());
-                                        next.push((s, Some(Box::new(re_hint)), true));
+                                        next.push((s, Some(Box::new(re_hint)), true, re_hops));
                                     }
                                 }
                             }
@@ -451,6 +506,7 @@ unsafe fn discover_inner(
                 }
 
                 if let Some(&idx) = next_pos.get(&s) {
+                    next[idx].3 = next[idx].3.min(next_leaf_hops);
                     if let Some(ref incoming) = out_hint {
                         if let Some(ref mut cur) = next[idx].1 {
                             merge_jt_regs(cur, incoming);
@@ -470,7 +526,7 @@ unsafe fn discover_inner(
                     st.lea_leaves += 1;
                 }
                 next_pos.insert(s, next.len());
-                next.push((s, out_hint, false));
+                next.push((s, out_hint, false, next_leaf_hops));
             }
         }
         frontier = next;
