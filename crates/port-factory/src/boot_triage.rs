@@ -567,7 +567,7 @@ struct ParsedLine<'a> {
 struct BootReportMeta {
     present: bool,
     exit_kind: String,
-    exit_code: Option<u64>,
+    exit_code: Option<i64>,
     exit_detail: String,
     frames_presented: u64,
     graphics_api: String,
@@ -676,7 +676,9 @@ fn parse_boot_report_meta(raw: Option<&str>) -> BootReportMeta {
             .and_then(JsonValue::as_str)
             .unwrap_or("")
             .to_string();
-        meta.exit_code = exit.get("code").and_then(JsonValue::as_u64);
+        meta.exit_code = exit
+            .get("code")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
         meta.exit_detail = exit
             .get("detail")
             .and_then(JsonValue::as_str)
@@ -847,11 +849,29 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
 
     let missing_probes = collect_missing_probes(&lines);
 
+    // Fall back to `boot_report.json` `exit.code` when no explicit process status was supplied
+    // (e.g. offline `--log-file` + `--boot-report` without `--exit-code`).
+    let boot_exit_code = boot_meta.exit_code.map(|c| {
+        if c == 0 {
+            0
+        } else if let Ok(v) = i32::try_from(c) {
+            v
+        } else {
+            let low = c as i32;
+            if low != 0 {
+                low
+            } else {
+                1
+            }
+        }
+    });
+    let effective_exit_code = input.exit_code.or(boot_exit_code);
+
     // Collect candidates across all classes.
     let unresolved = detect_unresolved_import(&lines, &boot_meta, &crash_meta);
     let metal_val = detect_metal_validation(&lines);
-    let panic_abort = detect_rust_panic_or_abort(&lines, input.exit_code, input.signal);
-    let guest_crash = detect_guest_crash(&lines, &crash_meta, input.exit_code);
+    let panic_abort = detect_rust_panic_or_abort(&lines, effective_exit_code, input.signal);
+    let guest_crash = detect_guest_crash(&lines, &crash_meta, effective_exit_code);
     let hresult = detect_d3d12_dxgi_hresult(&lines);
     let stub_hit = detect_stub_hit(&lines, &boot_meta);
     let startup_err = detect_startup_error(&lines, &boot_meta);
@@ -862,7 +882,7 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
             || l.msg.contains("CRASH REPORT:") && (l.msg.contains("stall") || l.msg.contains("hang"))
     });
     let is_timeout = input.timed_out
-        || input.exit_code == Some(exit_codes::TIMEOUT)
+        || effective_exit_code == Some(exit_codes::TIMEOUT)
         || log_timed_out
         || matches!(boot_meta.exit_kind.as_str(), "timeout" | "stall");
 
@@ -949,7 +969,7 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
     // Tier 3: Non-crashing boot failures (D3D12/DXGI HRESULT failure or stub!/failing! hit).
     // Applies when the run did not present frames (or exited non-zero). Pick whichever happened first.
     let clean_rendered = frames_presented > 0
-        && input.exit_code.unwrap_or(0) == 0
+        && effective_exit_code.unwrap_or(0) == 0
         && input.signal.is_none()
         && !is_timeout;
     if primary.is_none() && !clean_rendered {
@@ -971,9 +991,9 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
         b
     } else if let Some(se) = startup_err {
         se
-    } else if input.signal.is_some() || input.exit_code.is_some_and(|c| c != 0) {
+    } else if input.signal.is_some() || effective_exit_code.is_some_and(|c| c != 0) {
         let last_activity = extract_last_activity(&lines, 8);
-        let desc = match (input.exit_code, input.signal) {
+        let desc = match (effective_exit_code, input.signal) {
             (_, Some(sig)) => format!("port-runner terminated by signal {sig}"),
             (Some(c), None) => format!("port-runner exited with non-zero code {c}"),
             (None, None) => "port-runner failed with unknown status".to_string(),
@@ -1056,7 +1076,7 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
             } else {
                 input.mode.clone()
             },
-            exit_code: input.exit_code,
+            exit_code: effective_exit_code,
             signal: input.signal,
             timed_out: is_timeout,
             elapsed_ms: input.elapsed_ms,
@@ -1281,11 +1301,26 @@ fn detect_unresolved_import(
 fn detect_metal_validation(lines: &[ParsedLine<'_>]) -> Option<BlockerDetail> {
     for (idx, l) in lines.iter().enumerate() {
         let msg = l.msg;
+        let low = msg.to_ascii_lowercase();
+        let has_failure_word = low.contains("error")
+            || low.contains("failed")
+            || low.contains("assertion")
+            || low.contains("abort")
+            || low.contains("invalid")
+            || low.contains("violation")
+            || low.contains("fatal");
+        // Exclude Apple's informational startup banners printed whenever `--metal-validation`
+        // (`MTL_DEBUG_LAYER=1`) or GPU shader validation is enabled (e.g. `Metal API Validation Enabled`).
+        if (low.contains("validation enabled") || low.contains("validation: enabled"))
+            && !has_failure_word
+        {
+            continue;
+        }
         let is_mtl_debug = msg.contains("MTLDebug")
             || msg.contains("MTL4Debug")
             || msg.contains("MTLGPUDebug")
             || msg.contains("MTLReportFailure")
-            || msg.contains("Metal API Validation")
+            || (msg.contains("Metal API Validation") && has_failure_word)
             || msg.contains("validateWithDevice")
             || msg.contains("validateCommonDrawErrors")
             || msg.contains("validateVertexFunction")
@@ -3542,5 +3577,62 @@ Abort trap: 6";
         assert_eq!(rep.blocker.backtrace.len(), 2);
         assert!(rep.blocker.backtrace[0].contains("testgame.exe+0x318575a"));
         assert!(rep.blocker.backtrace[1].contains("testgame.exe+0x3186fe0"));
+    }
+
+    #[test]
+    fn ignores_metal_validation_enabled_banner_on_clean_boot() {
+        let clean_log = "\
+2026-11-28 04:00:01.000 port-runner[1234:5678] Metal API Validation Enabled
+2026-11-28 04:00:01.001 port-runner[1234:5678] Metal GPU Validation Enabled
+[2026-11-28T04:00:03.000Z INFO  port_loader::run_limits] [run-limit] reached --max-frames 5 (frames_presented=5, elapsed=1800ms); exiting cleanly";
+        let rep = classify_boot_log(&synthetic_input(clean_log, Some(0)));
+        assert_eq!(rep.blocker.class(), BlockerClass::None);
+        assert_eq!(rep.blocker.subkind, "rendered_frames");
+        assert_eq!(rep.exit_code(), exit_codes::OK);
+        assert!(rep.secondary_signals.is_empty());
+
+        // Real Metal API Validation failure still classifies as MetalValidationError.
+        let fail_log = "\
+2026-11-28 04:00:01.000 port-runner[1234:5678] Metal API Validation Enabled
+2026-11-28 04:00:02.000 port-runner[1234:5678] Metal API Validation Error: texture usage does not permit render target";
+        let fail_rep = classify_boot_log(&synthetic_input(fail_log, Some(1)));
+        assert_eq!(fail_rep.blocker.class(), BlockerClass::MetalValidationError);
+        assert_eq!(fail_rep.blocker.log_line, Some(2));
+    }
+
+    #[test]
+    fn offline_classification_honors_boot_report_nonzero_exit_code() {
+        let log = "[2026-11-28T04:00:01.000Z INFO  port_loader] calling exe entry point testgame.exe+0x1000";
+        let boot_report = r#"{
+          "schema_version": 1,
+          "exit": { "kind": "clean_exit", "code": 1, "detail": "", "elapsed_ms": 250, "frames_presented": 0, "graphics_api": "unknown" },
+          "stubs": { "total_hits": 0, "unique_sites": 0, "entries": [] },
+          "unresolved_imports": []
+        }"#;
+        let mut inp = synthetic_input(log, None);
+        inp.boot_report_json = Some(boot_report.to_string());
+        let rep = classify_boot_log(&inp);
+        assert_eq!(rep.blocker.class(), BlockerClass::UnknownFailure);
+        assert_eq!(rep.run.exit_code, Some(1));
+        assert_eq!(rep.exit_code(), exit_codes::RUNTIME_ERROR);
+    }
+
+    #[test]
+    fn offline_boot_report_nonzero_exit_does_not_suppress_stub_when_frames_presented() {
+        let log = "\
+[2026-11-28T04:00:01.000Z INFO  port_loader] calling exe entry point testgame.exe+0x1000
+[2026-11-28T04:00:02.000Z WARN  stub] STUB CreateQueryHeapEx: CreateQueryHeapEx -> 0x80004001 (last error 120)";
+        let boot_report = r#"{
+          "schema_version": 1,
+          "exit": { "kind": "clean_exit", "code": 2, "detail": "", "elapsed_ms": 900, "frames_presented": 2, "graphics_api": "d3d12" },
+          "stubs": { "total_hits": 1, "unique_sites": 1, "entries": [] },
+          "unresolved_imports": []
+        }"#;
+        let mut inp = synthetic_input(log, None);
+        inp.boot_report_json = Some(boot_report.to_string());
+        let rep = classify_boot_log(&inp);
+        assert_eq!(rep.blocker.class(), BlockerClass::StubHit);
+        assert_eq!(rep.run.exit_code, Some(2));
+        assert_eq!(rep.exit_code(), exit_codes::RUNTIME_ERROR);
     }
 }
