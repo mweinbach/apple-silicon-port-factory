@@ -120,6 +120,8 @@ pub unsafe fn compare(c: &Cmp, rep: &mut Report) -> Detail {
         rep.fault_addr[r] = c.res[r].fault_addr;
         rep.fault_pc[r] = c.res[r].fault_pc;
         rep.run_status[r] = c.res[r].wait_status;
+        rep.run_exit_kind[r] = c.res[r].exit_kind;
+        rep.run_exit_code[r] = c.res[r].exit_code;
         rep.fault_sig[r] = c.res[r].fault_sig;
         rep.pages[r] = c.bufs.hdr(r).npages as u32;
     }

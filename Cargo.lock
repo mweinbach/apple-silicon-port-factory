@@ -218,6 +218,7 @@ dependencies = [
  "dxil-metal",
  "env_logger",
  "log",
+ "objc2",
  "objc2-metal",
 ]
 

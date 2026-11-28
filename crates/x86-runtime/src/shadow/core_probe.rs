@@ -460,8 +460,16 @@ unsafe fn write_dump(
     for (r, n) in ["G1", "N ", "G2"].iter().enumerate() {
         let _ = writeln!(
             f,
-            "{n}: rax={:#x} xmm0={:#x} pages={} t={}us fault_addr={:#x} fault_pc={:#x}",
-            rep.rax[r], rep.xmm0[r], rep.pages[r], rep.t_us[r], rep.fault_addr[r], rep.fault_pc[r]
+            "{n}: rax={:#x} xmm0={:#x} pages={} t={}us exit={} wait={:#x} fault_sig={} fault_addr={:#x} fault_pc={:#x}",
+            rep.rax[r],
+            rep.xmm0[r],
+            rep.pages[r],
+            rep.t_us[r],
+            rep.run_exit(r).describe(),
+            rep.run_status[r],
+            rep.fault_sig[r],
+            rep.fault_addr[r],
+            rep.fault_pc[r]
         );
     }
     let poisoned = rep.poison & POISON_RAN != 0;

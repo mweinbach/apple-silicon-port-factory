@@ -374,6 +374,8 @@ cargo runner -- --pe /path/to/Game.exe --no-run --ops-report --json
 | Offline 4-tier PE/DLL verifier (`x86-verify`) | `crates/x86-runtime/src/emu/verify.rs`, `crates/x86-runtime/src/bin/x86-verify.rs` |
 | Live `NaN`-birth / watchpoint / host tracer | `crates/x86-runtime/src/diag.rs` |
 | Live frame-paced controller (`PORT_CONTROL_DIR`) | `crates/port-loader/src/live_ctl.rs` |
+| Offline D3D12 trace replay, Metal 4 `--bench` & `--golden` | `crates/d3d12-replay/` ([D3D12.md](D3D12.md#binary-trace--offline-replay-tracers-cratesd3d12-replay)) |
+| Self-hosted Apple Silicon GPU, audio & E2E CI lane | `.github/workflows/gpu-e2e.yml` ([GPU_CI.md](GPU_CI.md)) |
 | Universal game-agnostic probe harness | `tools/debug/live_probe.py` |
 | Execution-mode matrix & VA bisector | `tools/debug/bisect_runtime.py` |
 | Rosetta 2 x86-64 hardware snapshot oracle | `tools/debug/x86_oracle.py` |

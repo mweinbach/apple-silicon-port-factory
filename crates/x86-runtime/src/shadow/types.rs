@@ -1,6 +1,103 @@
 //! Probe outcome types for [`super`].
 
+use win32_rt::libc;
+
 pub const N_OUTCOMES: usize = 9;
+
+/// Termination kind recorded from `waitpid` (`Report::run_exit_kind`).
+pub const TERM_NONE: u8 = 0;
+pub const TERM_EXITED: u8 = 1;
+pub const TERM_SIGNALED: u8 = 2;
+pub const TERM_STOPPED: u8 = 3;
+pub const TERM_WAIT_ERR: u8 = 4;
+
+/// Decoded child termination from a raw `waitpid` status (or `-errno` when `waitpid < 0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildExit {
+    NotRun,
+    Exited(i32),
+    Signaled { sig: i32, core_dumped: bool },
+    Stopped(i32),
+    WaitError(i32),
+}
+
+impl ChildExit {
+    pub fn from_raw(raw_status: i32) -> Self {
+        if raw_status < 0 {
+            return ChildExit::WaitError(-raw_status);
+        }
+        if libc::WIFEXITED(raw_status) {
+            ChildExit::Exited(libc::WEXITSTATUS(raw_status))
+        } else if libc::WIFSIGNALED(raw_status) {
+            ChildExit::Signaled {
+                sig: libc::WTERMSIG(raw_status),
+                core_dumped: (raw_status & 0x80) != 0,
+            }
+        } else if libc::WIFSTOPPED(raw_status) {
+            ChildExit::Stopped(libc::WSTOPSIG(raw_status))
+        } else {
+            ChildExit::WaitError(0)
+        }
+    }
+
+    pub fn from_parts(kind: u8, code: i32, raw_status: i32) -> Self {
+        match kind {
+            TERM_NONE => ChildExit::NotRun,
+            TERM_EXITED => ChildExit::Exited(code),
+            TERM_SIGNALED => ChildExit::Signaled { sig: code, core_dumped: raw_status >= 0 && (raw_status & 0x80) != 0 },
+            TERM_STOPPED => ChildExit::Stopped(code),
+            TERM_WAIT_ERR => ChildExit::WaitError(code),
+            _ => Self::from_raw(raw_status),
+        }
+    }
+
+    pub fn to_parts(self) -> (u8, i32) {
+        match self {
+            ChildExit::NotRun => (TERM_NONE, 0),
+            ChildExit::Exited(c) => (TERM_EXITED, c),
+            ChildExit::Signaled { sig, .. } => (TERM_SIGNALED, sig),
+            ChildExit::Stopped(sig) => (TERM_STOPPED, sig),
+            ChildExit::WaitError(err) => (TERM_WAIT_ERR, err),
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self {
+            ChildExit::NotRun => "not_run".into(),
+            ChildExit::Exited(code) => format!("exited({code})"),
+            ChildExit::Signaled { sig, core_dumped } => {
+                let name = signal_name(sig);
+                if core_dumped {
+                    format!("signaled({name}={sig},core)")
+                } else {
+                    format!("signaled({name}={sig})")
+                }
+            }
+            ChildExit::Stopped(sig) => format!("stopped({}={sig})", signal_name(sig)),
+            ChildExit::WaitError(err) => format!("waitpid_err({err})"),
+        }
+    }
+}
+
+pub fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGSYS => "SIGSYS",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        _ => "SIG?",
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -120,6 +217,10 @@ pub struct Report {
     pub fault_pc: [u64; 3],
     /// Raw `waitpid` status (or `-errno` when `waitpid < 0`) per run: G1, N, G2.
     pub run_status: [i32; 3],
+    /// Decoded termination kind ([`TERM_EXITED`], [`TERM_SIGNALED`], ...) per run: G1, N, G2.
+    pub run_exit_kind: [u8; 3],
+    /// Decoded exit status, terminating signal, or `waitpid` errno per run: G1, N, G2.
+    pub run_exit_code: [i32; 3],
     /// Signal recorded by `on_fault` (`RunHdr::fault_sig`) per run: G1, N, G2.
     pub fault_sig: [u32; 3],
     pub diff_bytes: u64,
@@ -240,5 +341,28 @@ impl Report {
     }
     pub fn reason(&self) -> Reason {
         Reason::from_u32(self.reason)
+    }
+    /// Decoded child termination for run `r` (`0` = G1, `1` = N, `2` = G2).
+    pub fn run_exit(&self, r: usize) -> ChildExit {
+        ChildExit::from_parts(self.run_exit_kind[r], self.run_exit_code[r], self.run_status[r])
+    }
+    /// Human-readable termination summary for G1, N, and G2 (for logs, dumps, and test failures).
+    pub fn run_diagnostics(&self) -> String {
+        ["G1", "N", "G2"]
+            .iter()
+            .enumerate()
+            .map(|(r, name)| {
+                format!(
+                    "{name}:{} (wait={:#x} fault_sig={} addr={:#x} pc={:#x} t={}us)",
+                    self.run_exit(r).describe(),
+                    self.run_status[r],
+                    self.fault_sig[r],
+                    self.fault_addr[r],
+                    self.fault_pc[r],
+                    self.t_us[r],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
