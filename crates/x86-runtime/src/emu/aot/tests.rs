@@ -401,9 +401,7 @@ fn aot_prewarm_synthetic_pe_writes_and_loads_via_activate() {
                     for ip in ips {
                         unsafe { dir.probe_sync(ip) };
                     }
-                    for v in dir.incoming.values_mut() {
-                        v.retain(|&(m, _)| !gone.contains(&m));
-                    }
+                    dir.prune_incoming(&gone);
                 }
             }
             let _ = std::fs::remove_dir_all(&d);
@@ -697,9 +695,7 @@ fn teardown_test_modules(names: &[&str]) {
         for ip in ips {
             unsafe { dir.probe_sync(ip) };
         }
-        for v in dir.incoming.values_mut() {
-            v.retain(|&(m, _)| !gone.contains(&m));
-        }
+        dir.prune_incoming(&gone);
     }
 }
 
