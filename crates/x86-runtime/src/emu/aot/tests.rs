@@ -3738,10 +3738,11 @@ fn one_shot_and_static_only_misses_feed_callbacks() {
     }
 }
 
-/// PE `VolatileMetadata` TSO elision: inside a covered range, non-volatile loads/stores emit
-/// plain ARM64 `ldr`/`str`, listed volatile RVAs keep `ldapr`/`ldapur`/`stlr`/`stlur`, `LOCK`
-/// atomics stay unconditionally ordered, uncovered ranges keep full TSO, and
-/// `PORT_JIT_VOLATILE_META=0` restores full TSO everywhere.
+/// PE `VolatileMetadata` TSO elision: off by default (preserving full TSO everywhere); when opted
+/// in via `PORT_JIT_VOLATILE_META=1`, covered non-volatile loads/stores emit plain ARM64
+/// `ldr`/`str`, listed volatile RVAs keep `ldapr`/`ldapur`/`stlr`/`stlur`, `LOCK` atomics stay
+/// unconditionally ordered, uncovered ranges keep full TSO, and `PORT_JIT_VOLATILE_META=0`
+/// restores full TSO everywhere.
 #[test]
 fn volatile_metadata_elides_non_volatile_and_preserves_volatile_and_atomics() {
     use iced_x86::code_asm::*;
@@ -3808,6 +3809,51 @@ fn volatile_metadata_elides_non_volatile_and_preserves_volatile_and_atomics() {
         let end = start + (b.main as usize);
         img.code[start..end].to_vec()
     };
+
+    // Default (PORT_JIT_VOLATILE_META unset): elision is OFF, even inside covered ranges.
+    struct EnvRestore(Option<std::ffi::OsString>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("PORT_JIT_VOLATILE_META", v),
+                None => std::env::remove_var("PORT_JIT_VOLATILE_META"),
+            }
+        }
+    }
+    {
+        let _env_guard = EnvRestore(std::env::var_os("PORT_JIT_VOLATILE_META"));
+        std::env::remove_var("PORT_JIT_VOLATILE_META");
+        crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+        assert!(
+            !crate::emu::mem::volatile_meta_enabled(),
+            "PORT_JIT_VOLATILE_META must default off"
+        );
+        let key_default = jit::aot_knob_bits();
+        let w_default = words_of(base + 0x1000);
+        assert!(w_default.iter().any(|&w| is_tso_ld(w)), "default must keep TSO load");
+        assert!(w_default.iter().any(|&w| is_tso_st(w)), "default must keep TSO store");
+
+        // Opt-in via env PORT_JIT_VOLATILE_META=1 enables elision and partitions the AOT key.
+        std::env::set_var("PORT_JIT_VOLATILE_META", "1");
+        assert!(
+            crate::emu::mem::volatile_meta_enabled(),
+            "PORT_JIT_VOLATILE_META=1 must opt in to elision"
+        );
+        let key_opt_in = jit::aot_knob_bits();
+        assert_ne!(
+            key_default, key_opt_in,
+            "PORT_JIT_VOLATILE_META default-off vs =1 must produce distinct AOT knob bits"
+        );
+        let w_env_on = words_of(base + 0x1000);
+        assert!(!w_env_on.iter().any(|&w| is_tso_ld(w)), "PORT_JIT_VOLATILE_META=1 must elide TSO load");
+        assert!(!w_env_on.iter().any(|&w| is_tso_st(w)), "PORT_JIT_VOLATILE_META=1 must elide TSO store");
+
+        std::env::set_var("PORT_JIT_VOLATILE_META", "0");
+        assert!(
+            !crate::emu::mem::volatile_meta_enabled(),
+            "PORT_JIT_VOLATILE_META=0 must disable elision"
+        );
+    }
 
     // With PORT_JIT_VOLATILE_META=1:
     crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(true)));
@@ -4038,4 +4084,164 @@ fn image_hash_tracks_volatile_metadata_changes() {
     buf[0x2000 + 0x100..0x2000 + 0x108].fill(0);
     let h4 = unsafe { image_hash(base, len) };
     assert_ne!(h3, h4, "removing VolatileMetadata must invalidate AOT image_hash");
+}
+
+/// Explicitly-listed `VolatileAccessTable` `[rsp+disp]` stack accesses must keep TSO ordering
+/// (`ldapr`/`ldapur`/`stlr`/`stlur`) and must NOT fuse into plain `ldp`/`stp` pairs even when
+/// `PORT_JIT_STACK_TSO=0` and `PORT_JIT_VOLATILE_META=1`. Non-volatile `[rsp+disp]` accesses
+/// continue to emit plain `ldr`/`str`/`ldp`/`stp`.
+#[test]
+fn volatile_metadata_preserves_explicit_volatile_stack_accesses() {
+    use iced_x86::code_asm::*;
+
+    let mut pe = TestMappedBuf::alloc(0x4000, 0x2_3F58_0000);
+    let base = pe.base() as u64;
+    let buf = pe.as_slice_mut();
+
+    // Block 1 @ +0x1000: adjacent [rsp+0x20]/[rsp+0x28] pair loads and stores where the second
+    // load and first store are explicitly listed in `VolatileAccessTable`. Neither pair may fuse
+    // into plain `ldp`/`stp`, and the listed RVAs must emit TSO load/store instructions.
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rax, qword_ptr(rsp + 0x20)).unwrap();
+    let vol_stack_ld_rva = 0x1000u32 + a.assemble(base + 0x1000).unwrap().len() as u32;
+    a.mov(rcx, qword_ptr(rsp + 0x28)).unwrap();
+    let vol_stack_st_rva = 0x1000u32 + a.assemble(base + 0x1000).unwrap().len() as u32;
+    a.mov(qword_ptr(rsp + 0x30), rax).unwrap();
+    a.mov(qword_ptr(rsp + 0x38), rcx).unwrap();
+    a.ret().unwrap();
+    let blk1 = a.assemble(base + 0x1000).unwrap();
+    buf[0x1000..0x1000 + blk1.len()].copy_from_slice(&blk1);
+
+    // Block 2 @ +0x1080: identical adjacent [rsp+disp] loads/stores NOT listed as volatile
+    // (must still emit plain `ldp`/`stp` with zero TSO loads/stores under `PORT_JIT_STACK_TSO=0`).
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rax, qword_ptr(rsp + 0x20)).unwrap();
+    a.mov(rcx, qword_ptr(rsp + 0x28)).unwrap();
+    a.mov(qword_ptr(rsp + 0x30), rax).unwrap();
+    a.mov(qword_ptr(rsp + 0x38), rcx).unwrap();
+    a.ret().unwrap();
+    let blk2 = a.assemble(base + 0x1080).unwrap();
+    buf[0x1080..0x1080 + blk2.len()].copy_from_slice(&blk2);
+
+    struct Guard(u64);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+            crate::emu::jit::TEST_STACK_TSO.with(|c| c.set(None));
+            test_unregister_volatile_meta(self.0);
+        }
+    }
+    let _g = Guard(base);
+    test_register_volatile_meta(
+        base,
+        pe.len as u64,
+        &[(0x1000, 0x1100)],
+        &[vol_stack_ld_rva, vol_stack_st_rva],
+    );
+    crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(true)));
+    crate::emu::jit::TEST_STACK_TSO.with(|c| c.set(Some(false)));
+
+    let is_tso_ld = |w: u32| (w & 0x3FFF_FC00) == 0x18BF_C000 || (w & 0x3FE0_0C00) == 0x1940_0000;
+    let is_tso_st = |w: u32| (w & 0x3FFF_FC00) == 0x089F_FC00 || (w & 0x3FE0_0C00) == 0x1900_0000;
+    // Signed-offset 64-bit `ldp`/`stp` targeting `g(4)` (`x23`): Rn = 23 (bits 9..5).
+    let is_rsp_ldp = |w: u32| (w & 0xFFC0_03E0) == 0xA940_0000 | (23 << 5);
+    let is_rsp_stp = |w: u32| (w & 0xFFC0_03E0) == 0xA900_0000 | (23 << 5);
+
+    let words_of = |ip: u64| -> Vec<u32> {
+        let mut bc = Box::new(BlockCache::new());
+        let img = unsafe { build_image(&mut *bc, &[ip], BUILD_VBASE) }.expect("build_image");
+        let b = &img.blocks[0];
+        let start = (b.code_off as usize - AOT_STUBS_BYTES) / 4;
+        let end = start + (b.main as usize);
+        img.code[start..end].to_vec()
+    };
+
+    let w_vol = words_of(base + 0x1000);
+    assert!(
+        w_vol.iter().any(|&w| is_tso_ld(w)),
+        "explicitly volatile [rsp+disp] load must keep TSO even with PORT_JIT_STACK_TSO=0"
+    );
+    assert!(
+        w_vol.iter().any(|&w| is_tso_st(w)),
+        "explicitly volatile [rsp+disp] store must keep TSO even with PORT_JIT_STACK_TSO=0"
+    );
+    assert!(
+        !w_vol.iter().any(|&w| is_rsp_ldp(w)),
+        "adjacent [rsp+disp] load pair containing an explicit volatile RVA must not fuse into plain ldp"
+    );
+    assert!(
+        !w_vol.iter().any(|&w| is_rsp_stp(w)),
+        "adjacent [rsp+disp] store pair containing an explicit volatile RVA must not fuse into plain stp"
+    );
+
+    let w_plain = words_of(base + 0x1080);
+    assert!(
+        !w_plain.iter().any(|&w| is_tso_ld(w)) && !w_plain.iter().any(|&w| is_tso_st(w)),
+        "non-volatile [rsp+disp] accesses must remain plain under PORT_JIT_STACK_TSO=0"
+    );
+    assert!(
+        w_plain.iter().any(|&w| is_rsp_ldp(w)) && w_plain.iter().any(|&w| is_rsp_stp(w)),
+        "non-volatile adjacent [rsp+disp] pair must still fuse into ldp/stp under PORT_JIT_STACK_TSO=0"
+    );
+}
+
+#[test]
+fn aot_prewarm_skips_non_pe32_plus_and_wrong_machine_mapped_modules() {
+    let mut pe32 = vec![0u8; 0x2000];
+    pe32[0..2].copy_from_slice(b"MZ");
+    w32(&mut pe32, 0x3C, 0x80);
+    w32(&mut pe32, 0x80, 0x0000_4550);
+    w16(&mut pe32, 0x84, 0x014C); // i386
+    w16(&mut pe32, 0x94, 224);    // SizeOfOptionalHeader (PE32)
+    w16(&mut pe32, 0x98, 0x010B); // PE32 magic
+
+    let mut arm64 = vec![0u8; 0x2000];
+    arm64[0..2].copy_from_slice(b"MZ");
+    w32(&mut arm64, 0x3C, 0x80);
+    w32(&mut arm64, 0x80, 0x0000_4550);
+    w16(&mut arm64, 0x84, 0xAA64); // ARM64
+    w16(&mut arm64, 0x94, 240);    // SizeOfOptionalHeader (PE32+)
+    w16(&mut arm64, 0x98, 0x020B); // PE32+ magic
+
+    let base_pe32 = pe32.as_ptr() as usize;
+    let base_arm64 = arm64.as_ptr() as usize;
+    assert!(unsafe { super::format::exec_sections(base_pe32, pe32.len()) }.is_empty());
+    assert!(unsafe { super::format::exec_sections(base_arm64, arm64.len()) }.is_empty());
+
+    super::runtime::module_mapped("synth_wrong_pe32.dll", base_pe32, pe32.len());
+    super::runtime::module_mapped("synth_wrong_arm64.dll", base_arm64, arm64.len());
+
+    let reports = aot_prewarm_all_mapped(0);
+
+    if let Ok(mut v) = MAPPED.lock() {
+        v.retain(|m| m.base != base_pe32 && m.base != base_arm64);
+    }
+
+    let r32 = reports
+        .iter()
+        .find(|r| r.module == "synth_wrong_pe32.dll")
+        .expect("PE32 module should be reported as skipped");
+    assert!(r32.cache_path.is_none());
+    assert_eq!(r32.blocks, 0);
+    assert!(
+        r32.skipped_reason
+            .as_deref()
+            .is_some_and(|s| s.contains("not a PE32+ image")),
+        "unexpected PE32 skipped_reason: {:?}",
+        r32.skipped_reason
+    );
+
+    let r64 = reports
+        .iter()
+        .find(|r| r.module == "synth_wrong_arm64.dll")
+        .expect("ARM64 module should be reported as skipped");
+    assert!(r64.cache_path.is_none());
+    assert_eq!(r64.blocks, 0);
+    assert!(
+        r64.skipped_reason
+            .as_deref()
+            .is_some_and(|s| s.contains("unsupported machine")),
+        "unexpected ARM64 skipped_reason: {:?}",
+        r64.skipped_reason
+    );
 }

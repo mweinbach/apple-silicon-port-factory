@@ -517,6 +517,18 @@ pub fn aot_prewarm_all_mapped(max_roots_per_module: usize) -> Vec<AotPrewarmRepo
     let mut reports = Vec::with_capacity(mapped.len());
 
     for (name, base, size) in mapped {
+        if let Err(reason) = unsafe { super::format::validate_mapped_pe32_plus(base, size) } {
+            log::warn!("emu aot: prewarm {name}: skipping non-PE32+ module ({reason})");
+            reports.push(AotPrewarmReport {
+                module: name,
+                roots: 0,
+                blocks: 0,
+                code_bytes: 0,
+                cache_path: None,
+                skipped_reason: Some(reason),
+            });
+            continue;
+        }
         if crate::exe::aw2_registry_active() && base == crate::exe::base() {
             log::info!(
                 "emu aot: prewarm {name}: skipped (native replacement registry active for exe)"

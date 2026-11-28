@@ -391,6 +391,30 @@ pub fn static_index_type_va(ir: u16) -> Result<u64, String> {
     Err(format!("unexpected index type uniform {ir}"))
 }
 
+/// Pre-allocated zeroed resident GPU buffer bound at `DESCRIPTOR_HEAP_BIND_POINT` (0) /
+/// `SAMPLER_HEAP_BIND_POINT` (1) when a D3D12 command list draws without calling
+/// `SetDescriptorHeaps` (e.g. root constants / root descriptors only). MSC's tessellation
+/// and geometry emulation wrappers declare those buffer parameters unconditionally, so
+/// Metal API validation requires valid buffer bindings on both slots.
+#[inline]
+pub fn empty_heap_va() -> Option<u64> {
+    static BUF: OnceLock<Option<StaticIndexBuf>> = OnceLock::new();
+    BUF.get_or_init(|| {
+        let d = super::device()?;
+        let opts = MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
+        let buf = d.dev.newBufferWithLength_options(256, opts)?;
+        buf.setLabel(Some(&objc2_foundation::NSString::from_str("port empty descriptor heap fallback")));
+        unsafe {
+            std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, 256);
+        }
+        d.add_resident(ProtocolObject::from_ref(&*buf));
+        let base_va = buf.gpuAddress();
+        Some(StaticIndexBuf { _buf: buf, base_va })
+    })
+    .as_ref()
+    .map(|b| b.base_va)
+}
+
 /// Pre-allocated resident GPU address for Apple Metal Shader Converter's fixed-function
 /// tessellator lookup tables (`kIRTessellatorTablesCountsAndOffset` + `kIRTessellatorTablesLookupTable`,
 /// Apache-2.0 licensed, 733,882 bytes uncompressed), bound at `TESSELLATOR_TABLES_BIND_POINT` (7)

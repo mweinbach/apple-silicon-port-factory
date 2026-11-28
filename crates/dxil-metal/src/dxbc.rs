@@ -111,25 +111,36 @@ impl<'a> Container<'a> {
     }
 
     /// Names of the functions the `DXIL` part's bitcode defines. For a non-library shader
-    /// that is exactly the entry point; used when `PSV0` predates the entry name (v0-v2).
+    /// that is usually the entry point (Hull shaders may also define a patch-constant function
+    /// or only the patch-constant function when pass-through).
     pub fn defined_functions(&self) -> Option<Vec<String>> {
         crate::bitcode::defined_functions(crate::bitcode::dxil_part_bitcode(self.part(FOURCC_DXIL)?)?)
     }
 
-    /// Entry point of a non-library shader: `PSV0` (v3+), else the single function the
-    /// bitcode defines (skipped for Hull shaders, whose pass-through control-point phase
-    /// defines only the patch-constant function such as `pc_main` while the DXIL entry
-    /// point name remains `main`).
+    /// Entry point names recorded in the `DXIL` bitcode's `!dx.entryPoints` metadata.
+    pub fn dxil_entry_points(&self) -> Option<Vec<String>> {
+        crate::bitcode::entry_points(crate::bitcode::dxil_part_bitcode(self.part(FOURCC_DXIL)?)?)
+    }
+
+    /// Entry point of a non-library shader: `PSV0` (v3+), else `!dx.entryPoints` from the
+    /// DXIL bitcode metadata (handles validator < 1.8 / pre-v3 `PSV0` shaders of all stages,
+    /// including Hull shaders with patch-constant functions or pass-through control-point phases),
+    /// else the single defined function (skipped for Hull shaders).
     pub fn entry_point(&self) -> Option<String> {
-        self.psv_entry_point().or_else(|| {
-            if self.program().is_some_and(|p| p.kind == ProgramKind::Hull) {
-                return None;
-            }
-            match self.defined_functions() {
-                Some(mut f) if f.len() == 1 => f.pop(),
+        self.psv_entry_point()
+            .or_else(|| match self.dxil_entry_points() {
+                Some(mut eps) if eps.len() == 1 => eps.pop(),
                 _ => None,
-            }
-        })
+            })
+            .or_else(|| {
+                if self.program().is_some_and(|p| p.kind == ProgramKind::Hull) {
+                    return None;
+                }
+                match self.defined_functions() {
+                    Some(mut f) if f.len() == 1 => f.pop(),
+                    _ => None,
+                }
+            })
     }
 
     /// `MinimumExpectedWaveLaneCount` and `MaximumExpectedWaveLaneCount` from `PSV0` (`PSVRuntimeInfo0`).

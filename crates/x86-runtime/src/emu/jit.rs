@@ -69,6 +69,8 @@ pub(super) use cache::{test_aot_installs, test_probe_hits, test_translate_live_w
 #[allow(unused_imports)]
 pub(super) use lazy::{flaglazy_enabled, Edges};
 pub(super) use stubs::plaincall_enabled;
+#[cfg(test)]
+pub(in crate::emu) use translate::TEST_STACK_TSO;
 pub(super) use translate::{supported, Term};
 #[cfg(test)]
 #[allow(unused_imports)]

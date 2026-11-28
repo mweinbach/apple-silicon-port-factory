@@ -159,24 +159,60 @@ impl AotKey {
     }
 }
 
-/// Executable sections `[start, end)` of the PE image mapped at `[base, base + size)`
-/// (empty if the headers are not a valid PE).
-pub(super) unsafe fn exec_sections(base: usize, size: usize) -> Vec<(usize, usize)> {
-    const CNT_CODE: u32 = 0x20;
-    const MEM_EXECUTE: u32 = 0x2000_0000;
-    let mut out = Vec::new();
+/// Verify that the mapped image at `[base, base + size)` is a 64-bit AMD64 PE32+ image
+/// (`COFF.Machine == 0x8664`, `OptionalHeader.Magic == 0x020b`).
+pub(super) unsafe fn validate_mapped_pe32_plus(base: usize, size: usize) -> Result<(), String> {
+    const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+    const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x020B;
     if base == 0 || size < 0x400 {
-        return out;
+        return Err("mapped image too small for PE headers".into());
     }
     let rd16 = |off: usize| core::ptr::read_unaligned((base + off) as *const u16);
     let rd32 = |off: usize| core::ptr::read_unaligned((base + off) as *const u32);
     if rd16(0) != 0x5A4D {
-        return out;
+        return Err("not a PE image (missing MZ signature)".into());
     }
     let nt = rd32(0x3C) as usize;
-    if nt + 24 > size || rd32(nt) != 0x0000_4550 {
+    let Some(opt) = nt.checked_add(24) else {
+        return Err("invalid PE header offset".into());
+    };
+    let Some(opt_magic_end) = opt.checked_add(2) else {
+        return Err("invalid PE optional header offset".into());
+    };
+    if opt_magic_end > size || rd32(nt) != 0x0000_4550 {
+        return Err("not a PE image (missing PE signature)".into());
+    }
+    let machine = rd16(nt + 4);
+    let size_of_opt = rd16(nt + 20);
+    if size_of_opt < 2 {
+        return Err("PE has no optional header".into());
+    }
+    let magic = rd16(opt);
+    if magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+        return Err(format!(
+            "not a PE32+ image (magic 0x{magic:x}, machine 0x{machine:x})"
+        ));
+    }
+    if machine != IMAGE_FILE_MACHINE_AMD64 {
+        return Err(format!(
+            "unsupported machine 0x{machine:x} (expected AMD64 0x{IMAGE_FILE_MACHINE_AMD64:x})"
+        ));
+    }
+    Ok(())
+}
+
+/// Executable sections `[start, end)` of the PE32+ AMD64 image mapped at `[base, base + size)`
+/// (empty if the headers are not a valid AMD64 PE32+ image).
+pub(super) unsafe fn exec_sections(base: usize, size: usize) -> Vec<(usize, usize)> {
+    const CNT_CODE: u32 = 0x20;
+    const MEM_EXECUTE: u32 = 0x2000_0000;
+    let mut out = Vec::new();
+    if validate_mapped_pe32_plus(base, size).is_err() {
         return out;
     }
+    let rd16 = |off: usize| core::ptr::read_unaligned((base + off) as *const u16);
+    let rd32 = |off: usize| core::ptr::read_unaligned((base + off) as *const u32);
+    let nt = rd32(0x3C) as usize;
     let nsec = rd16(nt + 6) as usize;
     let table = nt + 24 + rd16(nt + 20) as usize;
     if table + nsec * 40 > size {
@@ -198,7 +234,7 @@ pub(super) unsafe fn exec_sections(base: usize, size: usize) -> Vec<(usize, usiz
     out
 }
 
-/// Non-executable initialized data sections `[start, end)` of the PE image mapped at
+/// Non-executable initialized data sections `[start, end)` of the PE32+ AMD64 image mapped at
 /// `[base, base + size)`, excluding PE headers `[0..0x400)` and discardable sections.
 pub(super) unsafe fn data_sections(base: usize, size: usize) -> Vec<(usize, usize)> {
     const CNT_CODE: u32 = 0x20;
@@ -206,21 +242,15 @@ pub(super) unsafe fn data_sections(base: usize, size: usize) -> Vec<(usize, usiz
     const MEM_DISCARDABLE: u32 = 0x0200_0000;
     const MEM_EXECUTE: u32 = 0x2000_0000;
     let mut out = Vec::new();
-    if base == 0 || size < 0x400 {
+    if validate_mapped_pe32_plus(base, size).is_err() {
         return out;
     }
     let rd16 = |off: usize| core::ptr::read_unaligned((base + off) as *const u16);
     let rd32 = |off: usize| core::ptr::read_unaligned((base + off) as *const u32);
-    if rd16(0) != 0x5A4D {
-        return out;
-    }
     let nt = rd32(0x3C) as usize;
     let Some(nt_end) = nt.checked_add(24) else {
         return out;
     };
-    if nt_end > size || rd32(nt) != 0x0000_4550 {
-        return out;
-    }
     let nsec = rd16(nt + 6) as usize;
     let Some(table) = nt_end.checked_add(rd16(nt + 20) as usize) else {
         return out;

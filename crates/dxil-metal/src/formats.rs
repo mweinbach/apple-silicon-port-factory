@@ -506,13 +506,17 @@ pub fn inspect_shader_bytes(
             if let Some(prog) = ProgramInfo::parse(bytes) {
                 shader_model_or_version = format!("Bare DXIL {}", prog.profile());
                 let bc = bitcode::dxil_part_bitcode(bytes).unwrap_or(bytes);
-                let funcs = bitcode::defined_functions(bc).unwrap_or_default();
+                let funcs = bitcode::entry_points(bc)
+                    .or_else(|| bitcode::defined_functions(bc))
+                    .unwrap_or_default();
                 for f in funcs {
                     entry_points.push((f, prog.profile()));
                 }
             } else {
                 shader_model_or_version = "LLVM 3.7 Bitcode (BC\\xc0\\xde)".to_string();
-                let funcs = bitcode::defined_functions(bytes).unwrap_or_default();
+                let funcs = bitcode::entry_points(bytes)
+                    .or_else(|| bitcode::defined_functions(bytes))
+                    .unwrap_or_default();
                 for f in funcs {
                     entry_points.push((f, "dxil_bc".to_string()));
                 }

@@ -16,6 +16,10 @@ use std::collections::HashMap;
 pub mod consts {
     pub const IMAGE_FILE_MACHINE_I386: u16 = 0x014c;
     pub const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+    pub const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
+    pub const IMAGE_NT_OPTIONAL_HDR32_MAGIC: u16 = 0x010b;
+    pub const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x020b;
+    pub const IMAGE_ROM_OPTIONAL_HDR_MAGIC: u16 = 0x0107;
     pub const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
     pub const IMAGE_FILE_DLL: u16 = 0x2000;
 
@@ -338,6 +342,135 @@ impl VolatileMetadata {
     }
 }
 
+/// Error returned when a file is structurally recognized as a PE image, but is
+/// not a 64-bit AMD64 PE32+ image (for example, a 32-bit PE32 `0x10b` DLL or a
+/// non-AMD64 PE32+ image such as ARM64 `0xaa64`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongArchError {
+    pub machine: u16,
+    pub magic: u16,
+}
+
+impl std::fmt::Display for WrongArchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+            write!(
+                f,
+                "not a PE32+ image (magic 0x{:x}, machine 0x{:x})",
+                self.magic, self.machine
+            )
+        } else {
+            write!(
+                f,
+                "unsupported machine 0x{:x} (expected AMD64 0x{:x})",
+                self.machine, IMAGE_FILE_MACHINE_AMD64
+            )
+        }
+    }
+}
+
+impl std::error::Error for WrongArchError {}
+
+/// Extract [`WrongArchError`] from anywhere in an `anyhow::Error` chain.
+pub fn wrong_arch_error(err: &anyhow::Error) -> Option<WrongArchError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<WrongArchError>().copied())
+}
+
+/// Result of a fast header-only PE architecture probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeArchProbe {
+    /// Valid 64-bit AMD64 PE32+ (`Machine == 0x8664`, `Magic == 0x20b`).
+    Amd64Pe32Plus,
+    /// Valid PE header, but wrong architecture (PE32 `0x10b`, ROM `0x107`, or non-AMD64 `Machine`).
+    WrongArch(WrongArchError),
+    /// Not a PE image (missing `MZ`/`PE\0\0`, truncated headers, or missing/unknown optional header).
+    NotPe,
+}
+
+const MAX_PROBE_LFANEW: usize = 16 * 1024 * 1024;
+
+fn classify_pe_header_prefix(hdr: &[u8; 26]) -> PeArchProbe {
+    if &hdr[0..4] != b"PE\0\0" {
+        return PeArchProbe::NotPe;
+    }
+    let machine = u16::from_le_bytes([hdr[4], hdr[5]]);
+    let size_of_opt = u16::from_le_bytes([hdr[20], hdr[21]]);
+    if size_of_opt < 2 {
+        return PeArchProbe::NotPe;
+    }
+    let magic = u16::from_le_bytes([hdr[24], hdr[25]]);
+    if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC && machine == IMAGE_FILE_MACHINE_AMD64 {
+        PeArchProbe::Amd64Pe32Plus
+    } else if matches!(
+        magic,
+        IMAGE_NT_OPTIONAL_HDR32_MAGIC
+            | IMAGE_NT_OPTIONAL_HDR64_MAGIC
+            | IMAGE_ROM_OPTIONAL_HDR_MAGIC
+    ) {
+        PeArchProbe::WrongArch(WrongArchError { machine, magic })
+    } else {
+        PeArchProbe::NotPe
+    }
+}
+
+/// Fast header-only PE architecture probe on in-memory bytes.
+pub fn probe_pe_arch_bytes(data: &[u8]) -> PeArchProbe {
+    if data.len() < 0x40 || &data[0..2] != b"MZ" {
+        return PeArchProbe::NotPe;
+    }
+    let lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+    if !(0x40..=MAX_PROBE_LFANEW).contains(&lfanew) {
+        return PeArchProbe::NotPe;
+    }
+    let Some(hdr_slice) = lfanew.checked_add(26).and_then(|end| data.get(lfanew..end)) else {
+        return PeArchProbe::NotPe;
+    };
+    classify_pe_header_prefix(hdr_slice.try_into().unwrap())
+}
+
+/// Fast header-only PE architecture probe on a file on disk (reads at most 90 header bytes).
+pub fn probe_pe_arch_file(path: &std::path::Path) -> std::io::Result<PeArchProbe> {
+    use std::io::{ErrorKind, Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Ok(PeArchProbe::NotPe);
+    }
+    let file_len = meta.len();
+    if file_len < 0x40 + 26 {
+        return Ok(PeArchProbe::NotPe);
+    }
+    let mut dos = [0u8; 64];
+    match f.read_exact(&mut dos) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(PeArchProbe::NotPe),
+        Err(e) => return Err(e),
+    }
+    if &dos[0..2] != b"MZ" {
+        return Ok(PeArchProbe::NotPe);
+    }
+    let lfanew = u32::from_le_bytes(dos[0x3C..0x40].try_into().unwrap()) as u64;
+    if lfanew < 0x40 || lfanew > MAX_PROBE_LFANEW as u64 {
+        return Ok(PeArchProbe::NotPe);
+    }
+    let Some(hdr_end) = lfanew.checked_add(26) else {
+        return Ok(PeArchProbe::NotPe);
+    };
+    if hdr_end > file_len {
+        return Ok(PeArchProbe::NotPe);
+    }
+    f.seek(SeekFrom::Start(lfanew))?;
+    let mut hdr = [0u8; 26];
+    match f.read_exact(&mut hdr) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(PeArchProbe::NotPe),
+        Err(e) => return Err(e),
+    }
+    Ok(classify_pe_header_prefix(&hdr))
+}
+
 /// A parsed PE32+ image (borrowing the bytes).
 pub struct Pe<'a> {
     data: &'a [u8],
@@ -379,7 +512,18 @@ impl<'a> Pe<'a> {
             .optional_header
             .ok_or_else(|| anyhow!("PE has no optional header"))?;
         if opt.standard_fields.magic != goblin::pe::optional_header::MAGIC_64 {
-            bail!("not a PE32+ image (magic 0x{:x})", opt.standard_fields.magic);
+            return Err(WrongArchError {
+                machine: hdr.coff_header.machine,
+                magic: opt.standard_fields.magic,
+            }
+            .into());
+        }
+        if hdr.coff_header.machine != IMAGE_FILE_MACHINE_AMD64 {
+            return Err(WrongArchError {
+                machine: hdr.coff_header.machine,
+                magic: opt.standard_fields.magic,
+            }
+            .into());
         }
         let wf = &opt.windows_fields;
         let pe_off = hdr.dos_header.pe_pointer as usize;
@@ -413,9 +557,6 @@ impl<'a> Pe<'a> {
             minor_os_version: wf.minor_operating_system_version as u16,
             data_dirs,
         };
-        if headers.machine != IMAGE_FILE_MACHINE_AMD64 {
-            bail!("unsupported machine 0x{:x}", headers.machine);
-        }
         let mut off = opt_off + hdr.coff_header.size_of_optional_header as usize;
         let goblin_sections = hdr
             .coff_header
@@ -1555,5 +1696,93 @@ mod tests {
         let vm_reloc = pe_reloc.volatile_metadata().unwrap().unwrap();
         assert!(vm_reloc.can_elide_tso(0x1000));
         assert!(!vm_reloc.can_elide_tso(0x1010));
+    }
+
+    fn build_minimal_pe(machine: u16, magic: u16, is_dll: bool) -> Vec<u8> {
+        let mut img = vec![0u8; 0x400];
+        let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+        img[0..2].copy_from_slice(b"MZ");
+        let pe = 0x80usize;
+        w32(&mut img, 0x3C, pe as u32);
+        w32(&mut img, pe, 0x0000_4550);
+        w16(&mut img, pe + 4, machine);
+        w16(&mut img, pe + 6, 0); // NumberOfSections
+        let opt_size: u16 = if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC { 240 } else { 224 };
+        w16(&mut img, pe + 20, opt_size);
+        w16(&mut img, pe + 22, if is_dll { 0x2022 } else { 0x0022 });
+
+        let opt = pe + 24;
+        w16(&mut img, opt, magic);
+        if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+            w64(&mut img, opt + 24, 0x1_8000_0000);
+            w32(&mut img, opt + 32, 0x1000);
+            w32(&mut img, opt + 36, 0x200);
+            w32(&mut img, opt + 56, 0x1000);
+            w32(&mut img, opt + 60, 0x200);
+            w32(&mut img, opt + 108, 16);
+        } else {
+            w32(&mut img, opt + 28, 0x1000_0000);
+            w32(&mut img, opt + 32, 0x1000);
+            w32(&mut img, opt + 36, 0x200);
+            w32(&mut img, opt + 56, 0x1000);
+            w32(&mut img, opt + 60, 0x200);
+            w32(&mut img, opt + 92, 16);
+        }
+        img
+    }
+
+    #[test]
+    fn probe_and_parse_wrong_arch_pe32_and_arm64() {
+        let pe32 = build_minimal_pe(IMAGE_FILE_MACHINE_I386, IMAGE_NT_OPTIONAL_HDR32_MAGIC, true);
+        let arm64 = build_minimal_pe(IMAGE_FILE_MACHINE_ARM64, IMAGE_NT_OPTIONAL_HDR64_MAGIC, true);
+        let amd64 = build_minimal_pe(IMAGE_FILE_MACHINE_AMD64, IMAGE_NT_OPTIONAL_HDR64_MAGIC, true);
+        let not_pe = b"definitely not a PE image at all".to_vec();
+
+        let expected_pe32 = WrongArchError {
+            machine: IMAGE_FILE_MACHINE_I386,
+            magic: IMAGE_NT_OPTIONAL_HDR32_MAGIC,
+        };
+        let expected_arm64 = WrongArchError {
+            machine: IMAGE_FILE_MACHINE_ARM64,
+            magic: IMAGE_NT_OPTIONAL_HDR64_MAGIC,
+        };
+
+        assert_eq!(probe_pe_arch_bytes(&pe32), PeArchProbe::WrongArch(expected_pe32));
+        assert_eq!(probe_pe_arch_bytes(&arm64), PeArchProbe::WrongArch(expected_arm64));
+        assert_eq!(probe_pe_arch_bytes(&amd64), PeArchProbe::Amd64Pe32Plus);
+        assert_eq!(probe_pe_arch_bytes(&not_pe), PeArchProbe::NotPe);
+        assert_eq!(probe_pe_arch_bytes(b"MZ"), PeArchProbe::NotPe);
+
+        let err_pe32 = Pe::parse(&pe32).err().expect("PE32 must fail Pe::parse").context("wrapped");
+        assert_eq!(wrong_arch_error(&err_pe32), Some(expected_pe32));
+        assert!(err_pe32.to_string().contains("wrapped"));
+        assert!(format!("{err_pe32:#}").contains("not a PE32+ image"));
+
+        let err_arm64 = Pe::parse(&arm64).err().expect("ARM64 must fail Pe::parse").context("wrapped");
+        assert_eq!(wrong_arch_error(&err_arm64), Some(expected_arm64));
+        assert!(format!("{err_arm64:#}").contains("unsupported machine"));
+
+        assert!(Pe::parse(&amd64).is_ok());
+
+        let err_not_pe = Pe::parse(&not_pe).err().expect("non-PE must fail Pe::parse");
+        assert_eq!(wrong_arch_error(&err_not_pe), None);
+
+        let dir = std::env::temp_dir().join(format!("pe-image-arch-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes, expected) in [
+            ("x86.dll", &pe32, PeArchProbe::WrongArch(expected_pe32)),
+            ("arm64.dll", &arm64, PeArchProbe::WrongArch(expected_arm64)),
+            ("x64.dll", &amd64, PeArchProbe::Amd64Pe32Plus),
+            ("text.dll", &not_pe, PeArchProbe::NotPe),
+        ] {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            assert_eq!(probe_pe_arch_file(&p).unwrap(), expected, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -61,6 +61,7 @@ impl Tr<'_> {
             K_MOV_RM => {
                 if w == 64
                     && (!mem::tso() || !stack_tso())
+                    && !self.is_explicit_volatile(k)
                     && op.base == 4
                     && op.index == RNONE
                     && op.r0 != 4
@@ -70,6 +71,7 @@ impl Tr<'_> {
                     let body = self.body;
                     if let Some(n) = self.ops.get(k + 1).copied().filter(|n| {
                         k + 1 < body
+                            && !self.is_explicit_volatile(k + 1)
                             && n.kind == K_MOV_RM
                             && n.w == 64
                             && n.base == 4
@@ -96,6 +98,7 @@ impl Tr<'_> {
             K_MOV_MR => {
                 if w == 64
                     && (!mem::tso() || !stack_tso())
+                    && !self.is_explicit_volatile(k)
                     && op.base == 4
                     && op.index == RNONE
                     && op.disp % 8 == 0
@@ -104,6 +107,7 @@ impl Tr<'_> {
                     let body = self.body;
                     if let Some(n) = self.ops.get(k + 1).copied().filter(|n| {
                         k + 1 < body
+                            && !self.is_explicit_volatile(k + 1)
                             && n.kind == K_MOV_MR
                             && n.w == 64
                             && n.base == 4

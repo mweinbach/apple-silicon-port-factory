@@ -2936,8 +2936,8 @@ pub const KNOBS: &[KnobSpec] = &[
         name: "PORT_JIT_VOLATILE_META",
         aliases: &[],
         kind: KnobType::Bool,
-        default: "1",
-        description: "Use PE IMAGE_LOAD_CONFIG_DIRECTORY64.VolatileMetadataPointer to elide TSO ordering on compiler-certified non-volatile accesses.",
+        default: "0",
+        description: "Opt-in: use PE IMAGE_LOAD_CONFIG_DIRECTORY64.VolatileMetadataPointer to elide TSO ordering on compiler-certified non-volatile accesses (default off).",
         affects_aot_key: true,
         crates: &["x86-runtime"],
     },
@@ -4907,5 +4907,32 @@ mod tests {
         assert!(!json.contains(sentinel), "json leaked sensitive knob value");
         assert!(table.contains("<redacted>"));
         assert!(json.contains("\"value\": \"<redacted>\""));
+    }
+
+    #[test]
+    fn volatile_meta_knob_defaults_off_and_affects_aot_key() {
+        let prev = std::env::var_os("PORT_JIT_VOLATILE_META");
+        std::env::remove_var("PORT_JIT_VOLATILE_META");
+
+        let spec = lookup("PORT_JIT_VOLATILE_META").expect("PORT_JIT_VOLATILE_META registered");
+        assert_eq!(spec.default, "0");
+        assert!(spec.affects_aot_key);
+        let resolved = resolve_spec(spec, None);
+        assert_eq!(resolved.value, "0");
+        assert_eq!(resolved.source, KnobSource::Default);
+
+        let base_hash = aot_key_hash_with(None);
+        let mut opt_in = BTreeMap::new();
+        opt_in.insert("PORT_JIT_VOLATILE_META".to_string(), "1".to_string());
+        assert_ne!(
+            aot_key_hash_with(Some(&opt_in)),
+            base_hash,
+            "PORT_JIT_VOLATILE_META=1 must produce a distinct AOT key hash from default-off"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("PORT_JIT_VOLATILE_META", v),
+            None => std::env::remove_var("PORT_JIT_VOLATILE_META"),
+        }
     }
 }

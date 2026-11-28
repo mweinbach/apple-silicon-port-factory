@@ -958,4 +958,174 @@ mod tests {
             com_release(deser12);
         }
     }
+
+    #[test]
+    fn create_graphics_and_stream_tessellation_psos() {
+        if !dxil_metal::converter_available() || d3d12_metal::metal::device().is_none() {
+            return;
+        }
+        fn sign(raw: &[u8]) -> Vec<u8> {
+            let mut v = raw.to_vec();
+            dxil_metal::dxbc::sign_container(&mut v).unwrap();
+            v
+        }
+        let vs = sign(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../d3d12-metal/tests/fixtures/tess_tri.vs.dxil"
+        )));
+        let hs = sign(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../d3d12-metal/tests/fixtures/tess_tri.hs.dxil"
+        )));
+        let ds = sign(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../d3d12-metal/tests/fixtures/tess_tri.ds.dxil"
+        )));
+        let gs = sign(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../d3d12-metal/tests/fixtures/tess_swizzle.gs.dxil"
+        )));
+        let ps = sign(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../d3d12-metal/tests/fixtures/tess_color.ps.dxil"
+        )));
+
+        let il = [
+            pso::InputElementDesc {
+                name: b"POSITION\0".as_ptr(),
+                semantic_index: 0,
+                format: 2,
+                input_slot: 0,
+                aligned_byte_offset: 0,
+                slot_class: 0,
+                step_rate: 0,
+            },
+            pso::InputElementDesc {
+                name: b"COLOR\0".as_ptr(),
+                semantic_index: 0,
+                format: 2,
+                input_slot: 0,
+                aligned_byte_offset: 16,
+                slot_class: 0,
+                step_rate: 0,
+            },
+        ];
+
+        unsafe {
+            let mut rs_com: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                pso::create_root_signature(vs.as_ptr(), vs.len(), &IID_ID3D12RootSignature, &mut rs_com),
+                S_OK
+            );
+            assert!(!rs_com.is_null());
+
+            // Build a 656-byte D3D12_GRAPHICS_PIPELINE_STATE_DESC buffer.
+            let mk_desc = |hs_s: Option<&[u8]>, ds_s: Option<&[u8]>, gs_s: Option<&[u8]>, so_entries: u32| -> [u8; 656] {
+                let mut d = [0u8; 656];
+                let put_u64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+                let put_u32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                let put_bc = |b: &mut [u8], o: usize, s: Option<&[u8]>| {
+                    if let Some(s) = s {
+                        put_u64(b, o, s.as_ptr() as u64);
+                        put_u64(b, o + 8, s.len() as u64);
+                    }
+                };
+                put_u64(&mut d, 0, rs_com as u64);
+                put_bc(&mut d, 8, Some(&vs));
+                put_bc(&mut d, 24, Some(&ps));
+                put_bc(&mut d, 40, ds_s);
+                put_bc(&mut d, 56, hs_s);
+                put_bc(&mut d, 72, gs_s);
+                put_u32(&mut d, 96, so_entries);
+                // BlendDesc default write mask = 0xF for RT0 (offset 120 + 8 + 36 = 164? Write full BlendDesc).
+                let mut blend = d3d12_metal::state::BlendDesc::default();
+                blend.RenderTarget[0].RenderTargetWriteMask = 0xF;
+                d[120..120 + std::mem::size_of::<d3d12_metal::state::BlendDesc>()]
+                    .copy_from_slice(std::slice::from_raw_parts(
+                        &blend as *const _ as *const u8,
+                        std::mem::size_of::<d3d12_metal::state::BlendDesc>(),
+                    ));
+                put_u32(&mut d, 448, u32::MAX); // SampleMask
+                put_u32(&mut d, 452, 3); // FillMode = SOLID
+                put_u32(&mut d, 456, 1); // CullMode = NONE
+                put_u64(&mut d, 552, il.as_ptr() as u64);
+                put_u32(&mut d, 560, il.len() as u32);
+                put_u32(&mut d, 572, d3d12_metal::topology::topology_type::PATCH);
+                put_u32(&mut d, 576, 1); // NumRenderTargets
+                put_u32(&mut d, 580, 28); // RTVFormats[0] = RGBA8_UNORM
+                put_u32(&mut d, 616, 1); // SampleCount
+                d
+            };
+
+            // 1. Mismatched HS-only / DS-only must fail honestly with E_INVALIDARG.
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let d_hs_only = mk_desc(Some(&hs), None, None, 0);
+            assert_eq!(pso::create_graphics_pipeline(d_hs_only.as_ptr(), &IID_ID3D12PipelineState, &mut out), E_INVALIDARG);
+            let d_ds_only = mk_desc(None, Some(&ds), None, 0);
+            assert_eq!(pso::create_graphics_pipeline(d_ds_only.as_ptr(), &IID_ID3D12PipelineState, &mut out), E_INVALIDARG);
+
+            // 2. Stream output stays honestly E_NOTIMPL.
+            let d_so = mk_desc(Some(&hs), Some(&ds), None, 1);
+            assert_eq!(pso::create_graphics_pipeline(d_so.as_ptr(), &IID_ID3D12PipelineState, &mut out), E_NOTIMPL);
+
+            // 3. Valid VS+HS+DS+PS via CreateGraphicsPipelineState.
+            let d_tess = mk_desc(Some(&hs), Some(&ds), None, 0);
+            assert_eq!(pso::create_graphics_pipeline(d_tess.as_ptr(), &IID_ID3D12PipelineState, &mut out), S_OK);
+            assert!(!out.is_null());
+            {
+                let p = pso::pso_from_ptr(out).unwrap();
+                let pso::PipelineKind::Graphics(ref g) = p.kind else { panic!("expected graphics PSO") };
+                assert!(g.tess_emu.is_some(), "CreateGraphicsPipelineState must produce tess_emu");
+                assert!(g.tess_emu.as_ref().unwrap().gs.is_none());
+            }
+            com_release(out);
+
+            // 4. Valid VS+HS+DS+GS+PS via CreatePipelineState (D3D12_PIPELINE_STATE_STREAM_DESC).
+            let mut stream = Vec::<u8>::new();
+            let push_sub = |buf: &mut Vec<u8>, ty: u32, align: usize, payload: &[u8]| {
+                buf.extend_from_slice(&ty.to_le_bytes());
+                while buf.len() % align != 0 {
+                    buf.push(0);
+                }
+                buf.extend_from_slice(payload);
+                while buf.len() % 8 != 0 {
+                    buf.push(0);
+                }
+            };
+            let bc_bytes = |s: &[u8]| -> [u8; 16] {
+                let mut b = [0u8; 16];
+                b[0..8].copy_from_slice(&(s.as_ptr() as u64).to_le_bytes());
+                b[8..16].copy_from_slice(&(s.len() as u64).to_le_bytes());
+                b
+            };
+            push_sub(&mut stream, 0, 8, &(rs_com as u64).to_le_bytes()); // ROOT_SIGNATURE
+            push_sub(&mut stream, 1, 8, &bc_bytes(&vs)); // VS
+            push_sub(&mut stream, 2, 8, &bc_bytes(&ps)); // PS
+            push_sub(&mut stream, 3, 8, &bc_bytes(&ds)); // DS
+            push_sub(&mut stream, 4, 8, &bc_bytes(&hs)); // HS
+            push_sub(&mut stream, 5, 8, &bc_bytes(&gs)); // GS
+            let mut il_sub = [0u8; 16];
+            il_sub[0..8].copy_from_slice(&(il.as_ptr() as u64).to_le_bytes());
+            il_sub[8..12].copy_from_slice(&(il.len() as u32).to_le_bytes());
+            push_sub(&mut stream, 12, 8, &il_sub); // INPUT_LAYOUT
+            push_sub(&mut stream, 14, 4, &d3d12_metal::topology::topology_type::PATCH.to_le_bytes());
+            let mut rtv_sub = [0u8; 36];
+            rtv_sub[0..4].copy_from_slice(&28u32.to_le_bytes());
+            rtv_sub[32..36].copy_from_slice(&1u32.to_le_bytes());
+            push_sub(&mut stream, 15, 4, &rtv_sub); // RENDER_TARGET_FORMATS
+
+            let sdesc = pso::StreamDesc { size: stream.len(), stream: stream.as_ptr() };
+            let mut out_stream: *mut c_void = std::ptr::null_mut();
+            assert_eq!(pso::create_pipeline_state(&sdesc, &IID_ID3D12PipelineState, &mut out_stream), S_OK);
+            assert!(!out_stream.is_null());
+            {
+                let p = pso::pso_from_ptr(out_stream).unwrap();
+                let pso::PipelineKind::Graphics(ref g) = p.kind else { panic!("expected graphics PSO") };
+                let emu = g.tess_emu.as_ref().expect("stream PSO must produce tess_emu");
+                assert!(emu.gs.is_some(), "stream PSO must preserve GS");
+            }
+            com_release(out_stream);
+            com_release(rs_com);
+        }
+    }
 }
