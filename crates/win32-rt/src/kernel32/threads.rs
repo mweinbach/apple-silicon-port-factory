@@ -1375,8 +1375,12 @@ pub unsafe extern "win64" fn WaitForMultipleObjectsEx(n: u32, hs: *const HANDLE,
         set_err(err::ERROR_INVALID_PARAMETER);
         return WAIT_FAILED;
     }
-    let hs = std::slice::from_raw_parts(hs, n as usize);
-    match resolve_waitables(hs) {
+    let count = n as usize;
+    let mut handles_buf = [std::ptr::null_mut(); 64];
+    for (i, slot) in handles_buf[..count].iter_mut().enumerate() {
+        *slot = std::ptr::read_unaligned(hs.add(i));
+    }
+    match resolve_waitables(&handles_buf[..count]) {
         Ok(objs) => {
             let t0 = if ms != 0 { crate::hitch::span_begin() } else { 0 };
             let r = wait_result_code(handles::wait_for(objs.as_slice(), all != 0, ms, alertable != 0));
@@ -2167,6 +2171,23 @@ mod tests {
             assert_eq!(CloseHandle(ready2), TRUE);
             assert_eq!(CloseHandle(ready), TRUE);
             assert_eq!(CloseHandle(ev), TRUE);
+        }
+    }
+
+    #[test]
+    fn wait_for_multiple_objects_accepts_unaligned_handle_array() {
+        unsafe {
+            let e0 = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let e1 = CreateEventW(std::ptr::null_mut(), TRUE, TRUE, std::ptr::null());
+            assert!(!e0.is_null() && !e1.is_null());
+            let mut raw = [0u8; 32];
+            let unaligned = raw.as_mut_ptr().add(4) as *mut HANDLE;
+            assert!(!unaligned.is_aligned());
+            std::ptr::write_unaligned(unaligned, e0);
+            std::ptr::write_unaligned(unaligned.add(1), e1);
+            assert_eq!(WaitForMultipleObjectsEx(2, unaligned, FALSE, 0, FALSE), WAIT_OBJECT_0 + 1);
+            assert_eq!(CloseHandle(e0), TRUE);
+            assert_eq!(CloseHandle(e1), TRUE);
         }
     }
 }
