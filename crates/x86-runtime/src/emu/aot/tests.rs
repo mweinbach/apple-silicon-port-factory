@@ -3738,10 +3738,11 @@ fn one_shot_and_static_only_misses_feed_callbacks() {
     }
 }
 
-/// PE `VolatileMetadata` TSO elision: inside a covered range, non-volatile loads/stores emit
-/// plain ARM64 `ldr`/`str`, listed volatile RVAs keep `ldapr`/`ldapur`/`stlr`/`stlur`, `LOCK`
-/// atomics stay unconditionally ordered, uncovered ranges keep full TSO, and
-/// `PORT_JIT_VOLATILE_META=0` restores full TSO everywhere.
+/// PE `VolatileMetadata` TSO elision: off by default (preserving full TSO everywhere); when opted
+/// in via `PORT_JIT_VOLATILE_META=1`, covered non-volatile loads/stores emit plain ARM64
+/// `ldr`/`str`, listed volatile RVAs keep `ldapr`/`ldapur`/`stlr`/`stlur`, `LOCK` atomics stay
+/// unconditionally ordered, uncovered ranges keep full TSO, and `PORT_JIT_VOLATILE_META=0`
+/// restores full TSO everywhere.
 #[test]
 fn volatile_metadata_elides_non_volatile_and_preserves_volatile_and_atomics() {
     use iced_x86::code_asm::*;
@@ -3808,6 +3809,51 @@ fn volatile_metadata_elides_non_volatile_and_preserves_volatile_and_atomics() {
         let end = start + (b.main as usize);
         img.code[start..end].to_vec()
     };
+
+    // Default (PORT_JIT_VOLATILE_META unset): elision is OFF, even inside covered ranges.
+    struct EnvRestore(Option<std::ffi::OsString>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("PORT_JIT_VOLATILE_META", v),
+                None => std::env::remove_var("PORT_JIT_VOLATILE_META"),
+            }
+        }
+    }
+    {
+        let _env_guard = EnvRestore(std::env::var_os("PORT_JIT_VOLATILE_META"));
+        std::env::remove_var("PORT_JIT_VOLATILE_META");
+        crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+        assert!(
+            !crate::emu::mem::volatile_meta_enabled(),
+            "PORT_JIT_VOLATILE_META must default off"
+        );
+        let key_default = jit::aot_knob_bits();
+        let w_default = words_of(base + 0x1000);
+        assert!(w_default.iter().any(|&w| is_tso_ld(w)), "default must keep TSO load");
+        assert!(w_default.iter().any(|&w| is_tso_st(w)), "default must keep TSO store");
+
+        // Opt-in via env PORT_JIT_VOLATILE_META=1 enables elision and partitions the AOT key.
+        std::env::set_var("PORT_JIT_VOLATILE_META", "1");
+        assert!(
+            crate::emu::mem::volatile_meta_enabled(),
+            "PORT_JIT_VOLATILE_META=1 must opt in to elision"
+        );
+        let key_opt_in = jit::aot_knob_bits();
+        assert_ne!(
+            key_default, key_opt_in,
+            "PORT_JIT_VOLATILE_META default-off vs =1 must produce distinct AOT knob bits"
+        );
+        let w_env_on = words_of(base + 0x1000);
+        assert!(!w_env_on.iter().any(|&w| is_tso_ld(w)), "PORT_JIT_VOLATILE_META=1 must elide TSO load");
+        assert!(!w_env_on.iter().any(|&w| is_tso_st(w)), "PORT_JIT_VOLATILE_META=1 must elide TSO store");
+
+        std::env::set_var("PORT_JIT_VOLATILE_META", "0");
+        assert!(
+            !crate::emu::mem::volatile_meta_enabled(),
+            "PORT_JIT_VOLATILE_META=0 must disable elision"
+        );
+    }
 
     // With PORT_JIT_VOLATILE_META=1:
     crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(Some(true)));

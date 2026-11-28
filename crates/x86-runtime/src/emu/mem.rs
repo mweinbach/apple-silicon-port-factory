@@ -16,6 +16,17 @@ use core::sync::atomic::{fence, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Atomi
 /// `lock` atomics and fences).
 const TSO_DEFAULT: bool = true;
 
+/// Default PE `IMAGE_VOLATILE_METADATA` TSO elision switch (`PORT_JIT_VOLATILE_META=1` opts in).
+const VOLATILE_META_DEFAULT: bool = false;
+
+#[inline]
+fn parse_opt_in_bool(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[cfg(not(test))]
 static TSO_STATE: AtomicU8 = AtomicU8::new(0);
 #[cfg(not(test))]
@@ -65,9 +76,10 @@ fn init_tso_memcpy() -> bool {
 #[cold]
 #[inline(never)]
 fn init_volatile_meta() -> bool {
-    let on = std::env::var("PORT_JIT_VOLATILE_META").map_or(true, |s| s.trim() != "0");
-    if !on {
-        log::info!("emu: PE VolatileMetadata TSO elision disabled (PORT_JIT_VOLATILE_META=0)");
+    let on = std::env::var("PORT_JIT_VOLATILE_META")
+        .map_or(VOLATILE_META_DEFAULT, |s| parse_opt_in_bool(&s));
+    if on {
+        log::info!("emu: PE VolatileMetadata TSO elision enabled (PORT_JIT_VOLATILE_META=1)");
     }
     VOLATILE_META_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
     on
@@ -139,7 +151,7 @@ pub(super) fn tso_memcpy() -> bool {
 }
 
 /// Whether PE `IMAGE_LOAD_CONFIG_DIRECTORY64.VolatileMetadataPointer` TSO elision is enabled
-/// (`PORT_JIT_VOLATILE_META`, default on).
+/// (`PORT_JIT_VOLATILE_META`, default off; opt in with `PORT_JIT_VOLATILE_META=1`).
 #[inline(always)]
 pub(super) fn volatile_meta_enabled() -> bool {
     #[cfg(test)]
@@ -148,9 +160,9 @@ pub(super) fn volatile_meta_enabled() -> bool {
             return v;
         }
         if let Ok(s) = std::env::var("PORT_JIT_VOLATILE_META") {
-            return s.trim() != "0";
+            return parse_opt_in_bool(&s);
         }
-        true
+        VOLATILE_META_DEFAULT
     }
     #[cfg(not(test))]
     {
