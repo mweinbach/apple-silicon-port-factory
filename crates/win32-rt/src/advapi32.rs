@@ -2280,14 +2280,23 @@ unsafe fn resolve_trustee_w(trustee: *const u8) -> Result<Vec<u8>, u32> {
     }
 }
 
-unsafe fn parse_acl_bytes(ptr: *const u8) -> Result<Vec<ParsedAce>, u32> {
+const ACL_REVISION: u8 = 2;
+const ACL_REVISION_DS: u8 = 4;
+
+fn ace_requires_ds_revision(ace_type: u8) -> bool {
+    // Object-specific ACE types (ACCESS_ALLOWED_OBJECT_ACE_TYPE..SYSTEM_ALARM_OBJECT_ACE_TYPE,
+    // plus their CALLBACK_OBJECT variants) require ACL_REVISION_DS (4) per Win32 ACL spec.
+    matches!(ace_type, 5..=8 | 11 | 12 | 15 | 16)
+}
+
+unsafe fn parse_acl_bytes(ptr: *const u8) -> Result<(u8, Vec<ParsedAce>), u32> {
     if ptr.is_null() {
         return Err(ERROR_INVALID_PARAMETER);
     }
     let rev = std::ptr::read_unaligned(ptr);
     let acl_size = std::ptr::read_unaligned(ptr.add(2) as *const u16) as usize;
     let ace_count = std::ptr::read_unaligned(ptr.add(4) as *const u16) as usize;
-    if (rev != 2 && rev != 4) || acl_size < 8 {
+    if (rev != ACL_REVISION && rev != ACL_REVISION_DS) || acl_size < 8 {
         return Err(ERROR_INVALID_SECURITY_DESCR);
     }
     let mut aces = Vec::with_capacity(ace_count);
@@ -2334,7 +2343,7 @@ unsafe fn parse_acl_bytes(ptr: *const u8) -> Result<Vec<ParsedAce>, u32> {
         }
         off += ace_size;
     }
-    Ok(aces)
+    Ok((rev, aces))
 }
 
 unsafe fn apply_explicit_access_entries(
@@ -2426,7 +2435,7 @@ unsafe fn apply_explicit_access_entries(
     Ok(())
 }
 
-fn serialize_acl(aces: &[ParsedAce]) -> Result<Vec<u8>, u32> {
+fn serialize_acl(base_rev: u8, aces: &[ParsedAce]) -> Result<Vec<u8>, u32> {
     if aces.len() > u16::MAX as usize {
         return Err(ERROR_INVALID_PARAMETER);
     }
@@ -2455,7 +2464,14 @@ fn serialize_acl(aces: &[ParsedAce]) -> Result<Vec<u8>, u32> {
         return Err(ERROR_INVALID_PARAMETER);
     }
     let total_len = out.len() as u16;
-    out[0] = 2; // ACL_REVISION
+    let rev = if base_rev == ACL_REVISION_DS
+        || aces.iter().any(|a| ace_requires_ds_revision(a.ace_type))
+    {
+        ACL_REVISION_DS
+    } else {
+        ACL_REVISION
+    };
+    out[0] = rev;
     out[1] = 0;
     out[2..4].copy_from_slice(&total_len.to_le_bytes());
     out[4..6].copy_from_slice(&(aces.len() as u16).to_le_bytes());
@@ -2486,8 +2502,10 @@ pub unsafe extern "win64" fn BuildSecurityDescriptorW(
     let mut owner_sid: Option<Vec<u8>> = None;
     let mut group_sid: Option<Vec<u8>> = None;
     let mut dacl_present = false;
+    let mut dacl_rev: u8 = ACL_REVISION;
     let mut dacl_aces: Option<Vec<ParsedAce>> = None;
     let mut sacl_present = false;
+    let mut sacl_rev: u8 = ACL_REVISION;
     let mut sacl_aces: Option<Vec<ParsedAce>> = None;
     let mut ctrl_flags: u16 = 0;
 
@@ -2528,20 +2546,26 @@ pub unsafe extern "win64" fn BuildSecurityDescriptorW(
             dacl_present = true;
             ctrl_flags |= old_ctrl & SE_DACL_DEFAULTED;
             if !old_dacl.is_null() {
-                dacl_aces = match parse_acl_bytes(old_dacl) {
-                    Ok(a) => Some(a),
+                match parse_acl_bytes(old_dacl) {
+                    Ok((rev, a)) => {
+                        dacl_rev = rev;
+                        dacl_aces = Some(a);
+                    }
                     Err(e) => return e,
-                };
+                }
             }
         }
         if (old_ctrl & SE_SACL_PRESENT) != 0 {
             sacl_present = true;
             ctrl_flags |= old_ctrl & SE_SACL_DEFAULTED;
             if !old_sacl.is_null() {
-                sacl_aces = match parse_acl_bytes(old_sacl) {
-                    Ok(a) => Some(a),
+                match parse_acl_bytes(old_sacl) {
+                    Ok((rev, a)) => {
+                        sacl_rev = rev;
+                        sacl_aces = Some(a);
+                    }
                     Err(e) => return e,
-                };
+                }
             }
         }
     }
@@ -2596,7 +2620,7 @@ pub unsafe extern "win64" fn BuildSecurityDescriptorW(
     let sacl_off = if sacl_present {
         control |= SE_SACL_PRESENT;
         match &sacl_aces {
-            Some(aces) => match serialize_acl(aces) {
+            Some(aces) => match serialize_acl(sacl_rev, aces) {
                 Ok(acl) => append_aligned(&mut buf, &acl),
                 Err(e) => return e,
             },
@@ -2608,7 +2632,7 @@ pub unsafe extern "win64" fn BuildSecurityDescriptorW(
     let dacl_off = if dacl_present {
         control |= SE_DACL_PRESENT;
         match &dacl_aces {
-            Some(aces) => match serialize_acl(aces) {
+            Some(aces) => match serialize_acl(dacl_rev, aces) {
                 Ok(acl) => append_aligned(&mut buf, &acl),
                 Err(e) => return e,
             },
@@ -8845,7 +8869,8 @@ mod tests {
             assert_eq!(read_sid_bytes(msd.add(m_owner_off as usize)).unwrap(), build_sid(5, &[18]));
             assert_eq!(read_sid_bytes(msd.add(m_group_off as usize)).unwrap(), group_sid);
 
-            let merged_dacl = parse_acl_bytes(msd.add(m_dacl_off as usize)).unwrap();
+            let (merged_dacl_rev, merged_dacl) = parse_acl_bytes(msd.add(m_dacl_off as usize)).unwrap();
+            assert_eq!(merged_dacl_rev, ACL_REVISION);
             assert_eq!(merged_dacl.len(), 2);
             assert_eq!(merged_dacl[0].ace_type, ACCESS_DENIED_ACE_TYPE);
             assert_eq!(merged_dacl[0].ace_flags, 0x03);
@@ -8855,12 +8880,87 @@ mod tests {
             assert_eq!(merged_dacl[1].mask, 0x1000_0000);
             assert_eq!(merged_dacl[1].sid, expected_world);
 
-            let merged_sacl = parse_acl_bytes(msd.add(m_sacl_off as usize)).unwrap();
+            let (merged_sacl_rev, merged_sacl) = parse_acl_bytes(msd.add(m_sacl_off as usize)).unwrap();
+            assert_eq!(merged_sacl_rev, ACL_REVISION);
             assert_eq!(merged_sacl.len(), 1);
             assert_eq!(merged_sacl[0].ace_type, SYSTEM_AUDIT_ACE_TYPE);
             assert_eq!(merged_sacl[0].ace_flags, FAILED_ACCESS_ACE_FLAG);
             assert_eq!(merged_sacl[0].mask, 0x0001_0000);
             assert_eq!(merged_sacl[0].sid, build_sid(5, &[11]));
+
+            // Revision-4 (ACL_REVISION_DS) ACL with an object-specific ACE must preserve revision 4
+            // and raw ACE bytes both on pure copy and when merging additional entries.
+            let mut obj_ace_body = Vec::new();
+            obj_ace_body.extend_from_slice(&0x0000_0100u32.to_le_bytes()); // Mask
+            obj_ace_body.extend_from_slice(&0x0000_0001u32.to_le_bytes()); // Flags (ACE_OBJECT_TYPE_PRESENT)
+            obj_ace_body.extend_from_slice(&[0x11u8; 16]); // ObjectType GUID
+            obj_ace_body.extend_from_slice(&expected_world); // Sid
+            let obj_ace_len = (4 + obj_ace_body.len()) as u16;
+            let ds_acl_len = 8 + obj_ace_len;
+            let mut ds_sd = vec![0u8; 20 + ds_acl_len as usize];
+            ds_sd[0] = 1; // SECURITY_DESCRIPTOR_REVISION
+            ds_sd[2..4].copy_from_slice(&(SE_SELF_RELATIVE | SE_DACL_PRESENT).to_le_bytes());
+            ds_sd[16..20].copy_from_slice(&20u32.to_le_bytes()); // Dacl offset
+            ds_sd[20] = ACL_REVISION_DS;
+            ds_sd[22..24].copy_from_slice(&ds_acl_len.to_le_bytes());
+            ds_sd[24..26].copy_from_slice(&1u16.to_le_bytes()); // AceCount
+            ds_sd[28] = 5; // ACCESS_ALLOWED_OBJECT_ACE_TYPE
+            ds_sd[29] = 0x02; // CONTAINER_INHERIT_ACE
+            ds_sd[30..32].copy_from_slice(&obj_ace_len.to_le_bytes());
+            ds_sd[32..32 + obj_ace_body.len()].copy_from_slice(&obj_ace_body);
+
+            let mut ds_copy_size = 0u32;
+            let mut ds_copy_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    ds_sd.as_ptr(),
+                    &mut ds_copy_size,
+                    &mut ds_copy_ptr,
+                ),
+                0
+            );
+            let ds_copy = ds_copy_ptr as *const u8;
+            let ds_dacl_off = std::ptr::read_unaligned(ds_copy.add(16) as *const u32) as usize;
+            let (ds_rev, ds_aces) = parse_acl_bytes(ds_copy.add(ds_dacl_off)).unwrap();
+            assert_eq!(ds_rev, ACL_REVISION_DS);
+            assert_eq!(ds_aces.len(), 1);
+            assert_eq!(ds_aces[0].ace_type, 5);
+            assert_eq!(ds_aces[0].ace_flags, 0x02);
+            assert_eq!(ds_aces[0].raw_body.as_deref(), Some(obj_ace_body.as_slice()));
+
+            // Adding a standard GRANT_ACCESS entry to the revision-4 DACL must keep ACL_REVISION_DS.
+            let mut ds_merged_size = 0u32;
+            let mut ds_merged_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    deny_ea.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    ds_sd.as_ptr(),
+                    &mut ds_merged_size,
+                    &mut ds_merged_ptr,
+                ),
+                0
+            );
+            let ds_merged = ds_merged_ptr as *const u8;
+            let ds_m_off = std::ptr::read_unaligned(ds_merged.add(16) as *const u32) as usize;
+            let (ds_m_rev, ds_m_aces) = parse_acl_bytes(ds_merged.add(ds_m_off)).unwrap();
+            assert_eq!(ds_m_rev, ACL_REVISION_DS);
+            assert_eq!(ds_m_aces.len(), 2);
+            assert_eq!(ds_m_aces[0].ace_type, ACCESS_DENIED_ACE_TYPE);
+            assert_eq!(ds_m_aces[1].ace_type, 5);
+            assert_eq!(ds_m_aces[1].raw_body.as_deref(), Some(obj_ace_body.as_slice()));
+            assert!(crate::kernel32::memory::LocalFree(ds_copy_ptr).is_null());
+            assert!(crate::kernel32::memory::LocalFree(ds_merged_ptr).is_null());
 
             // Empty request (no owner/group/access/audit/old_sd) must NOT falsely set SE_DACL_PRESENT.
             let mut empty_size = 0u32;
