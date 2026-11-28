@@ -2838,9 +2838,67 @@ pub unsafe extern "win64" fn CharUpperW(lpsz: LPWSTR) -> LPWSTR {
     lpsz
 }
 
+const DT_WORDBREAK: u32 = 0x0010;
 const DT_SINGLELINE: u32 = 0x0020;
 const DT_CALCRECT: u32 = 0x0400;
 const DT_NOPREFIX: u32 = 0x0800;
+
+unsafe fn measure_u16_width(hdc: usize, units: &[u16]) -> Option<i32> {
+    let mut sz = crate::misc::gdi32::SIZE { cx: 0, cy: 0 };
+    let ptr = if units.is_empty() { std::ptr::null() } else { units.as_ptr() };
+    if crate::misc::gdi32::GetTextExtentPoint32W(hdc, ptr, units.len() as i32, &mut sz) == FALSE {
+        return None;
+    }
+    Some(sz.cx)
+}
+
+unsafe fn wrap_paragraph_wordbreak(hdc: usize, para: &[u16], max_w: i32) -> Option<Vec<Vec<u16>>> {
+    if para.is_empty() {
+        return Some(vec![Vec::new()]);
+    }
+    let mut out: Vec<Vec<u16>> = Vec::new();
+    let mut cur: Vec<u16> = Vec::new();
+    let mut i = 0usize;
+    let is_ws = |u: u16| u == b' ' as u16 || u == b'\t' as u16;
+
+    while i < para.len() {
+        let sep_start = i;
+        while i < para.len() && is_ws(para[i]) {
+            i += 1;
+        }
+        let sep = &para[sep_start..i];
+        let word_start = i;
+        while i < para.len() && !is_ws(para[i]) {
+            i += 1;
+        }
+        let word = &para[word_start..i];
+
+        if cur.is_empty() {
+            if out.is_empty() {
+                cur.extend_from_slice(sep);
+            }
+            cur.extend_from_slice(word);
+            continue;
+        }
+        if word.is_empty() {
+            // Trailing whitespace at end of paragraph.
+            continue;
+        }
+
+        let mut cand = Vec::with_capacity(cur.len() + sep.len() + word.len());
+        cand.extend_from_slice(&cur);
+        cand.extend_from_slice(sep);
+        cand.extend_from_slice(word);
+        if measure_u16_width(hdc, &cand)? <= max_w {
+            cur = cand;
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.extend_from_slice(word);
+        }
+    }
+    out.push(cur);
+    Some(out)
+}
 
 pub unsafe extern "win64" fn DrawTextW(
     hdc: usize,
@@ -2944,6 +3002,19 @@ pub unsafe extern "win64" fn DrawTextW(
         lines.push(cur);
     }
 
+    let mut rc = lprc.read_unaligned();
+    let wrap_w = rc.right.saturating_sub(rc.left);
+    if (format & DT_WORDBREAK) != 0 && (format & DT_SINGLELINE) == 0 && wrap_w > 0 {
+        let mut wrapped = Vec::with_capacity(lines.len());
+        for para in &lines {
+            let Some(mut wlines) = wrap_paragraph_wordbreak(hdc, para, wrap_w) else {
+                return 0;
+            };
+            wrapped.append(&mut wlines);
+        }
+        lines = wrapped;
+    }
+
     let mut max_w = 0i32;
     let mut total_h = 0i32;
     let mut measured: Vec<(String, i32, i32)> = Vec::with_capacity(lines.len());
@@ -2958,7 +3029,6 @@ pub unsafe extern "win64" fn DrawTextW(
         measured.push((String::from_utf16_lossy(line), sz.cx, sz.cy));
     }
 
-    let mut rc = lprc.read_unaligned();
     if (format & DT_CALCRECT) != 0 {
         rc.right = rc.left.saturating_add(max_w);
         rc.bottom = rc.top.saturating_add(total_h);
@@ -4127,6 +4197,32 @@ mod tests {
             }
             assert!(lit_inside > 20, "expected rasterized glyph pixels inside lprc, got {lit_inside}");
             assert_eq!(lit_outside, 0, "glyph pixels must be clipped to lprc");
+
+            // 3c. DT_WORDBREAK wraps text at word boundaries to lprc width for both DT_CALCRECT and painting.
+            let phrase = crate::strings::to_wide_z("alpha beta gamma delta");
+            let mut single_rc = RECT::new(0, 0, 64, 0);
+            let single_h = DrawTextW(dc, phrase.as_ptr(), -1, &mut single_rc, DT_SINGLELINE | DT_CALCRECT);
+            assert!(single_rc.right > 64, "unwrapped phrase must exceed 64px width");
+            let mut wrap_rc = RECT::new(4, 4, 68, 0);
+            let wrap_h = DrawTextW(dc, phrase.as_ptr(), -1, &mut wrap_rc, DT_WORDBREAK | DT_CALCRECT);
+            assert!(wrap_h >= single_h * 2, "DT_WORDBREAK must wrap into multiple lines (got {wrap_h} vs {single_h})");
+            assert!(wrap_rc.right - wrap_rc.left <= 64, "wrapped width {} must fit within 64px", wrap_rc.right - wrap_rc.left);
+            assert_eq!(wrap_rc.bottom - wrap_rc.top, wrap_h);
+
+            buf.fill(0);
+            let mut wrap_paint_rc = RECT::new(4, 4, 68, 44);
+            let wrap_drawn_h = DrawTextW(dc, phrase.as_ptr(), -1, &mut wrap_paint_rc, DT_WORDBREAK);
+            assert_eq!(wrap_drawn_h, wrap_h);
+            let ro: &[u8] = buf;
+            let line1_lit = (4..(4 + single_h as usize))
+                .flat_map(|py| (4..68).map(move |px| ro[(py * 128 + px) * 4 + 2]))
+                .filter(|&r| r > 0)
+                .count();
+            let line2_lit = ((4 + single_h as usize)..44)
+                .flat_map(|py| (4..68).map(move |px| ro[(py * 128 + px) * 4 + 2]))
+                .filter(|&r| r > 0)
+                .count();
+            assert!(line1_lit > 10 && line2_lit > 10, "DT_WORDBREAK must render glyphs on both line 1 ({line1_lit}) and line 2+ ({line2_lit})");
 
             // 4. DrawFrameControl renders distinct real controls/states into the DIB
             //    and rejects unsupported control types or null/invalid args.

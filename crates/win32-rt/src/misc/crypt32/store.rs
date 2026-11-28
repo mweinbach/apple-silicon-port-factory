@@ -147,12 +147,14 @@ struct RegisteredCert {
     private_key_pkcs8: Option<Vec<u8>>,
 }
 
+const CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG: u32 = 0x0000_0001;
+
 struct RegisteredStore {
     refcount: usize,
     certs: Vec<usize>,
-    /// Sibling stores added via `CertAddStoreToCollection`: `(dwPriority, store_handle)`
-    /// ordered from highest priority to lowest.
-    siblings: Vec<(u32, usize)>,
+    /// Sibling stores added via `CertAddStoreToCollection`:
+    /// `(dwPriority, dwUpdateFlags, store_handle)` ordered from highest priority to lowest.
+    siblings: Vec<(u32, u32, usize)>,
     is_collection: bool,
     is_ntauth: bool,
     enum_archived: bool,
@@ -169,10 +171,38 @@ fn collect_store_cert_handles_locked(
     }
     if let Some(store) = st.stores.get(&store_h) {
         out.extend_from_slice(&store.certs);
-        for &(_, sib_h) in &store.siblings {
+        for &(_, _, sib_h) in &store.siblings {
             collect_store_cert_handles_locked(st, sib_h, visited, out);
         }
     }
+}
+
+/// Resolves the destination physical/memory store for a certificate addition.
+/// For a collection store, routes to the highest-priority sibling registered with
+/// `CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG` (recursing into nested collections), or
+/// returns `ERROR_ACCESS_DENIED` if no sibling is add-enabled.
+fn resolve_add_target_store_locked(
+    st: &StoreState,
+    store_h: usize,
+    visited: &mut std::collections::HashSet<usize>,
+) -> Result<usize, u32> {
+    if !visited.insert(store_h) {
+        return Err(err::ERROR_ACCESS_DENIED);
+    }
+    let Some(store) = st.stores.get(&store_h) else {
+        return Err(err::ERROR_INVALID_HANDLE);
+    };
+    if !store.is_collection {
+        return Ok(store_h);
+    }
+    for &(_, update_flags, sib_h) in &store.siblings {
+        if (update_flags & CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG) != 0 {
+            if let Ok(target) = resolve_add_target_store_locked(st, sib_h, visited) {
+                return Ok(target);
+            }
+        }
+    }
+    Err(err::ERROR_ACCESS_DENIED)
 }
 
 fn store_all_cert_handles_locked(st: &StoreState, store_h: usize) -> Option<(Vec<usize>, bool)> {
@@ -503,7 +533,7 @@ fn release_store_locked(st: &mut StoreState, handle: usize) -> bool {
     for cert_h in removed.certs {
         release_cert_locked(st, cert_h);
     }
-    for (_, sib_h) in removed.siblings {
+    for (_, _, sib_h) in removed.siblings {
         release_store_locked(st, sib_h);
     }
     true
@@ -958,7 +988,7 @@ pub(super) fn cert_close_store_impl(store: *mut c_void) -> BOOL {
 pub(super) fn cert_add_store_to_collection_impl(
     h_collection_store: *mut c_void,
     h_sibling_store: *mut c_void,
-    _dw_update_flags: u32,
+    dw_update_flags: u32,
     dw_priority: u32,
 ) -> BOOL {
     if h_collection_store.is_null() || h_sibling_store.is_null() {
@@ -991,9 +1021,9 @@ pub(super) fn cert_add_store_to_collection_impl(
     let pos = coll
         .siblings
         .iter()
-        .position(|&(p, _)| p < dw_priority)
+        .position(|&(p, _, _)| p < dw_priority)
         .unwrap_or(coll.siblings.len());
-    coll.siblings.insert(pos, (dw_priority, sib_h));
+    coll.siblings.insert(pos, (dw_priority, dw_update_flags, sib_h));
     TRUE
 }
 
@@ -1139,16 +1169,19 @@ unsafe fn add_der_to_store_with_source(
     pp_store_context: *mut *mut c_void,
     src_cert_handle: Option<usize>,
 ) -> BOOL {
-    let Some(owned) = wintrust::build_owned_cert_context(der, h_cert_store) else {
+    let mut st = STORE_STATE.lock().unwrap();
+    let mut visited = std::collections::HashSet::new();
+    let store_key = match resolve_add_target_store_locked(&st, h_cert_store as usize, &mut visited) {
+        Ok(k) => k,
+        Err(e) => {
+            crate::teb::set_last_error(e);
+            return FALSE;
+        }
+    };
+    let Some(owned) = wintrust::build_owned_cert_context(der, store_key as *mut c_void) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return FALSE;
     };
-    let mut st = STORE_STATE.lock().unwrap();
-    let store_key = h_cert_store as usize;
-    if !st.stores.contains_key(&store_key) {
-        crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
-        return FALSE;
-    }
 
     let copied_meta = src_cert_handle
         .and_then(|src_h| st.certs.get(&src_h))

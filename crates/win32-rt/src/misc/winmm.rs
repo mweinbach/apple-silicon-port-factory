@@ -596,6 +596,11 @@ pub unsafe extern "win64" fn mmioOpenA(
         return usize::from(host_path.exists());
     }
     if (fdw_open & MMIO_DELETE) != 0 {
+        if crate::path::is_protected_host_remove_or_rename(&host_path) {
+            log::warn!("winmm: mmioOpenA(MMIO_DELETE) blocked protected host path {:?}", host_path);
+            set_mmio_error(pmmioinfo, MMIOERR_CANNOTOPEN);
+            return 0;
+        }
         return match std::fs::remove_file(&host_path) {
             Ok(()) => 1,
             Err(_) => {
@@ -607,6 +612,12 @@ pub unsafe extern "win64" fn mmioOpenA(
 
     let mut opts = std::fs::OpenOptions::new();
     let mode = fdw_open & 0x3;
+    let wants_write = matches!(mode, MMIO_WRITE | MMIO_READWRITE) || (fdw_open & MMIO_CREATE) != 0;
+    if wants_write && crate::path::is_protected_host_write(&host_path) {
+        log::warn!("winmm: mmioOpenA(write/create) blocked protected host path {:?}", host_path);
+        set_mmio_error(pmmioinfo, MMIOERR_CANNOTOPEN);
+        return 0;
+    }
     match mode {
         MMIO_WRITE => {
             opts.write(true);
@@ -624,6 +635,16 @@ pub unsafe extern "win64" fn mmioOpenA(
 
     match opts.open(&host_path) {
         Ok(file) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                if wants_write && crate::path::is_protected_fd(file.as_raw_fd()) {
+                    log::warn!("winmm: mmioOpenA(write) blocked protected fd for {:?}", host_path);
+                    drop(file);
+                    set_mmio_error(pmmioinfo, MMIOERR_CANNOTOPEN);
+                    return 0;
+                }
+            }
             let handle = NEXT_MMIO.fetch_add(4, Ordering::Relaxed);
             mmio_table().lock().unwrap().insert(handle, MmioBacking::File(file));
             if let Some(mut out) = info_opt {
@@ -991,6 +1012,32 @@ mod tests {
             assert_eq!(mmioRead(hf, fbuf.as_mut_ptr(), 5), 5);
             assert_eq!(fbuf, [10, 20, 30, 40, 50]);
             assert_eq!(mmioClose(hf, 0), 0);
+
+            // 3. Protected host paths must be blocked for MMIO_DELETE, MMIO_CREATE, and write modes.
+            let prot_dir = tmp_dir.join("protected_bundle");
+            std::fs::create_dir_all(&prot_dir).unwrap();
+            let prot_file = prot_dir.join("runner.bin");
+            std::fs::write(&prot_file, b"PROTECTED_BYTES").unwrap();
+            crate::path::protect_native_subtree(&prot_dir);
+            let prot_win = std::ffi::CString::new("M:\\MmioTest\\protected_bundle\\runner.bin").unwrap();
+
+            let mut err_info: MmioInfo = std::mem::zeroed();
+            assert_eq!(mmioOpenA(prot_win.as_ptr().cast(), &mut err_info, MMIO_DELETE), 0);
+            let err_del = err_info.w_error_ret;
+            assert_eq!(err_del, MMIOERR_CANNOTOPEN);
+            assert_eq!(std::fs::read(&prot_file).unwrap(), b"PROTECTED_BYTES");
+
+            err_info = std::mem::zeroed();
+            assert_eq!(mmioOpenA(prot_win.as_ptr().cast(), &mut err_info, MMIO_CREATE | MMIO_WRITE), 0);
+            let err_cr = err_info.w_error_ret;
+            assert_eq!(err_cr, MMIOERR_CANNOTOPEN);
+            assert_eq!(std::fs::read(&prot_file).unwrap(), b"PROTECTED_BYTES");
+
+            err_info = std::mem::zeroed();
+            assert_eq!(mmioOpenA(prot_win.as_ptr().cast(), &mut err_info, MMIO_READWRITE), 0);
+            let err_rw = err_info.w_error_ret;
+            assert_eq!(err_rw, MMIOERR_CANNOTOPEN);
+
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
     }

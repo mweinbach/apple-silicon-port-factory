@@ -9303,6 +9303,44 @@ fn cert_collection_store_and_enhanced_key_usage() {
         }
         assert_eq!(names, vec!["CollHighPrio", "CollLowPrio"]);
 
+        // 1b. Collection with no CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG sibling rejects additions;
+        //     with add-enabled siblings, additions route to the highest-priority add-enabled sibling
+        //     and persist in that sibling after the collection closes.
+        let cert_added = make_cert(12, "CollAddedToSib", None);
+        assert_eq!(
+            CertAddEncodedCertificateToStore(coll, X509_ASN_ENCODING, cert_added.as_ptr(), cert_added.len() as u32, 4, std::ptr::null_mut()),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+        let st_ro_top = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let st_rw_low = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let st_rw_mid = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddStoreToCollection(coll, st_ro_top, 0 /* read-only */, 50), TRUE);
+        assert_eq!(CertAddStoreToCollection(coll, st_rw_low, 1 /* ADD_ENABLE */, 5), TRUE);
+        assert_eq!(CertAddStoreToCollection(coll, st_rw_mid, 1 /* ADD_ENABLE */, 20), TRUE);
+
+        assert_eq!(
+            CertAddEncodedCertificateToStore(coll, X509_ASN_ENCODING, cert_added.as_ptr(), cert_added.len() as u32, 4, std::ptr::null_mut()),
+            TRUE
+        );
+        assert_eq!(CertCloseStore(coll, 0), TRUE);
+
+        // Must have been routed to st_rw_mid (highest-priority add-enabled sibling) and survive collection close.
+        let c_mid = CertEnumCertificatesInStore(st_rw_mid, std::ptr::null_mut());
+        assert!(!c_mid.is_null(), "added cert must persist in highest-priority add-enabled sibling");
+        let mut mid_name = [0u8; 64];
+        let _ = CertGetNameStringA(c_mid, 4, 0, std::ptr::null_mut(), mid_name.as_mut_ptr(), 64);
+        assert_eq!(crate::strings::from_ansi(mid_name.as_ptr()), "CollAddedToSib");
+        assert!(CertEnumCertificatesInStore(st_rw_mid, c_mid).is_null());
+        assert!(CertEnumCertificatesInStore(st_ro_top, std::ptr::null_mut()).is_null());
+        assert!(CertEnumCertificatesInStore(st_rw_low, std::ptr::null_mut()).is_null());
+        assert_eq!(CertCloseStore(st_ro_top, 0), TRUE);
+        assert_eq!(CertCloseStore(st_rw_low, 0), TRUE);
+        assert_eq!(CertCloseStore(st_rw_mid, 0), TRUE);
+        // Re-open dummy coll handle so cleanup at bottom remains valid.
+        let coll = CertOpenStore(CERT_STORE_PROV_COLLECTION as *const u8, 0, 0, 0, std::ptr::null());
+
         // 2. CertGetEnhancedKeyUsage on cert with NO EKU -> cUsageIdentifier = 0, last_error = CRYPT_E_NOT_FOUND.
         let c0 = CertCreateCertificateContext(X509_ASN_ENCODING, cert_no_eku.as_ptr(), cert_no_eku.len() as u32);
         assert!(!c0.is_null());
