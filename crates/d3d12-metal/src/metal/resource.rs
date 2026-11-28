@@ -866,6 +866,7 @@ pub(crate) fn resolve_placement_alignment(desc: &ResourceDesc, mtl_align: u64) -
             Ok(a)
         }
         DEFAULT_ALIGNMENT if hw_align <= DEFAULT_ALIGNMENT => Ok(DEFAULT_ALIGNMENT),
+        MSAA_ALIGNMENT if hw_align <= MSAA_ALIGNMENT => Ok(MSAA_ALIGNMENT),
         SMALL_ALIGNMENT if !forbids_small && hw_align <= SMALL_ALIGNMENT => Ok(SMALL_ALIGNMENT),
         a => Err(CreateError::InvalidArg(format!(
             "texture placement alignment {a:#x} unsupported (forbids_small={forbids_small}, Metal requires {hw_align:#x})"

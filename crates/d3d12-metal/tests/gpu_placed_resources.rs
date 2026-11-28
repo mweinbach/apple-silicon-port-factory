@@ -125,6 +125,16 @@ fn small_4kb_alignment_works_for_genuinely_small_textures_and_rejects_forbidden_
     let (b_sz, b_al) = allocation_info(&buf_desc(4096, 0)).expect("buffer default alignment");
     assert_eq!((b_sz, b_al), (DEFAULT_ALIGNMENT, DEFAULT_ALIGNMENT));
 
+    // Explicit 4 MiB alignment is permitted on non-MSAA textures by D3D12.
+    let explicit_4m = tex2d_desc(64, 64, 1, 1, 28, 1, 0, MSAA_ALIGNMENT);
+    let (sz_4m, al_4m) = allocation_info(&explicit_4m).expect("explicit 4 MiB non-MSAA texture alignment");
+    assert_eq!(al_4m, MSAA_ALIGNMENT);
+    assert_eq!(sz_4m % MSAA_ALIGNMENT, 0);
+    let heap_4m = default_heap(sz_4m);
+    let placed_4m = Resource::new_placed_default(&heap_4m, 0, &explicit_4m, "placed_non_msaa_4m")
+        .expect("4 MiB-aligned placement of non-MSAA texture must succeed");
+    assert!(placed_4m.texture().is_some());
+
     // Illegal non-D3D12 texture alignment (e.g. 16 KiB) must be rejected.
     let bogus = tex2d_desc(64, 64, 1, 1, 61, 1, 0, 16384);
     assert!(matches!(allocation_info(&bogus), Err(CreateError::InvalidArg(_))));
