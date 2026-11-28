@@ -18,9 +18,9 @@ use objc2::rc::Retained;
 use objc2::Message;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder,
-    MTL4RenderPassDescriptor, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderStages, MTLScissorRect, MTLSize, MTLStages, MTLStoreAction, MTLTexture,
-    MTLTextureType, MTLTextureUsage, MTLViewport,
+    MTL4RenderPassDescriptor, MTLBlitOption, MTLBuffer, MTLClearColor, MTLLoadAction, MTLOrigin,
+    MTLPixelFormat, MTLPrimitiveType, MTLRenderStages, MTLScissorRect, MTLSize, MTLStages,
+    MTLStoreAction, MTLTexture, MTLTextureType, MTLTextureUsage, MTLViewport,
 };
 
 /// Clip D3D12 clear scissor rects to a mip level's `(mw, mh)` dimensions.
@@ -1564,6 +1564,9 @@ impl CommandList {
         let view_dxgi = if dxgi != 0 { dxgi } else { r.desc.Format };
         let fmt = crate::format::view_format(view_dxgi, r.mtl_format);
         let kind = clear::texture_kind(ty).ok_or_else(|| format!("UAV clear of texture type {ty:?}"))?;
+        if let Some(elem) = clear::raw_texture_uint_clear_element(view_dxgi, v) {
+            return self.clear_uav_texture_raw_bytes(r, t, ty, mip, slices, z, rects, &elem, tight_stages);
+        }
         let (class, uv, fv) = clear::texture_value(view_dxgi, v)?;
         let view = r.texture_view(fmt, ty, (mip, 1), slices).ok_or("UAV clear: texture view")?;
         let (w, h) = (
@@ -1611,6 +1614,194 @@ impl CommandList {
                     tight_stages,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    /// Bit-preserving texture UAV clear via `copyFromBuffer` from the command
+    /// allocator's upload ring. Used when `ClearUnorderedAccessViewUint` on a
+    /// floating-point texture carries a NaN channel payload that GPU float
+    /// texture-write instructions would canonicalize.
+    #[allow(clippy::too_many_arguments)]
+    fn clear_uav_texture_raw_bytes(
+        &mut self,
+        r: &Resource,
+        t: &MtlTexture,
+        ty: MTLTextureType,
+        mip: u32,
+        slices: (u32, u32),
+        z: Option<(u32, u32)>,
+        rects: &[Rect],
+        elem: &[u8],
+        tight_stages: bool,
+    ) -> Result<(), String> {
+        use MTLTextureType as T;
+        let bpp = elem.len();
+        let base_bpp = crate::format::info(r.desc.Format).bytes as usize;
+        if bpp == 0 || (base_bpp != 0 && base_bpp != bpp) {
+            return Err(format!(
+                "UAV raw clear: element size {bpp} does not match texture format {}",
+                crate::format::name(r.desc.Format)
+            ));
+        }
+        if mip >= t.mipmapLevelCount() as u32 {
+            return Err(format!("UAV clear: mip {mip} out of bounds"));
+        }
+        let base_ty = t.textureType();
+        let ty_ok = match ty {
+            T::Type1D | T::Type1DArray => matches!(base_ty, T::Type1D | T::Type1DArray),
+            T::Type2D | T::Type2DArray => matches!(base_ty, T::Type2D | T::Type2DArray),
+            T::Type3D => base_ty == T::Type3D,
+            _ => false,
+        };
+        if !ty_ok {
+            return Err(format!("UAV clear: incompatible view type {ty:?} for {base_ty:?}"));
+        }
+        let is_1d = matches!(base_ty, T::Type1D | T::Type1DArray);
+        let full = (r.desc.Width as u32, r.desc.Height.max(1));
+        let (w, h) = ((full.0 >> mip).max(1), if is_1d { 1 } else { (full.1 >> mip).max(1) });
+        let arr_len = (t.arrayLength() as u32).max(1);
+        let (first_slice, slice_count, z0, depth) = if ty == T::Type3D {
+            let td = (r.desc.depth() >> mip).max(1);
+            let (z0, d) = match z {
+                Some((first, size)) => {
+                    let first = first.min(td);
+                    (first, if size == u32::MAX { td - first } else { size.min(td - first) })
+                }
+                None => (0, td),
+            };
+            (0u32, 1u32, z0, d)
+        } else {
+            if slices.0 >= arr_len {
+                return Err(format!("UAV clear: first slice {} >= array length {arr_len}", slices.0));
+            }
+            let max_rem = arr_len - slices.0;
+            let count = if slices.1 == u32::MAX {
+                max_rem
+            } else if slices.1 > max_rem {
+                return Err(format!(
+                    "UAV clear: slice range {}..{} exceeds array length {arr_len}",
+                    slices.0,
+                    slices.0.saturating_add(slices.1)
+                ));
+            } else {
+                slices.1
+            };
+            (slices.0, count, 0u32, 1u32)
+        };
+        if slice_count == 0 || depth == 0 {
+            return Ok(());
+        }
+        let whole = [Rect { left: 0, top: 0, right: w as i32, bottom: h as i32 }];
+        let mut clipped: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for rc in if rects.is_empty() { &whole[..] } else { rects } {
+            let x0 = rc.left.clamp(0, w as i32) as u32;
+            let y0 = if is_1d { 0 } else { rc.top.clamp(0, h as i32) as u32 };
+            let x1 = rc.right.clamp(0, w as i32) as u32;
+            let y1 = if is_1d { 1 } else { rc.bottom.clamp(0, h as i32) as u32 };
+            if x1 > x0 && y1 > y0 {
+                clipped.push((x0, y0, x1 - x0, y1 - y0));
+            }
+        }
+        if clipped.is_empty() {
+            return Ok(());
+        }
+
+        let ring = self.ring.clone().ok_or("command list is not open")?;
+        let res_key = r as *const Resource as usize;
+        let touch = [res_key];
+        let masked = tight_stages && !legacy_barriers() && barrier_masks();
+        let ib_tight = self.ib_tight_active();
+        if masked {
+            const UTIL_AFTER: MTLStages = PRE_RASTER
+                .union(MTLStages::Fragment)
+                .union(MTLStages::Dispatch)
+                .union(MTLStages::Blit)
+                .union(MTLStages::AccelerationStructure);
+            self.add_pend(UTIL_AFTER, MTLStages::Blit);
+            if ib_tight {
+                self.ib_note_touch_before_tight(res_key, MTLStages::Blit);
+            } else {
+                self.ib_note(res_key);
+            }
+            stats::inc(&stats::c::qb_upscale_masked);
+        } else {
+            self.need_full(FullWhy::ClearUav);
+        }
+        let e = if ib_tight && masked {
+            self.compute_op_tight(MTLStages::Blit, Some(&touch), Some(&[]), Some(&touch))
+        } else {
+            self.compute_touch(if masked { Some(&touch) } else { None })
+        }
+        .ok_or("compute encoder")?;
+        self.pt_note_util(pt::synth::CLEAR_UAV, 0);
+
+        const STRIP_BUDGET: usize = 64 * 1024;
+        let row_align = if 256 % bpp == 0 { 256 } else { bpp };
+        for (x0, y0, rw, rh) in clipped {
+            let row_payload = rw as usize * bpp;
+            let row_bytes = if is_1d { row_payload } else { row_payload.next_multiple_of(row_align) };
+            let strip_h = if is_1d {
+                1
+            } else {
+                (STRIP_BUDGET / row_bytes.max(1)).clamp(1, rh as usize)
+            };
+            let strip_bytes = row_bytes * strip_h;
+            let (src_buf, src_off) = ring.lock().unwrap().alloc_buffer(strip_bytes, 256)?;
+            unsafe {
+                let base = (src_buf.contents().as_ptr() as *mut u8).add(src_off);
+                for px in 0..rw as usize {
+                    std::ptr::copy_nonoverlapping(elem.as_ptr(), base.add(px * bpp), bpp);
+                }
+                for row in 1..strip_h {
+                    std::ptr::copy_nonoverlapping(base, base.add(row * row_bytes), row_payload);
+                }
+            }
+            for s in 0..slice_count {
+                for dz in 0..depth {
+                    let mut ry = 0usize;
+                    while ry < rh as usize {
+                        let ch = strip_h.min(rh as usize - ry);
+                        let (src_bpr, src_bpi) = if is_1d { (0, 0) } else { (row_bytes, row_bytes * ch) };
+                        unsafe {
+                            e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                                &src_buf,
+                                src_off,
+                                src_bpr,
+                                src_bpi,
+                                MTLSize { width: rw as usize, height: ch, depth: 1 },
+                                t,
+                                (first_slice + s) as usize,
+                                mip as usize,
+                                MTLOrigin {
+                                    x: x0 as usize,
+                                    y: if is_1d { 0 } else { y0 as usize + ry },
+                                    z: (z0 + dz) as usize,
+                                },
+                                MTLBlitOption::None,
+                            );
+                        }
+                        ry += ch;
+                    }
+                }
+            }
+        }
+
+        self.note_stage_ran(MTLStages::Blit);
+        if masked {
+            const UTIL_BEFORE: MTLStages = PRE_RASTER
+                .union(MTLStages::Fragment)
+                .union(MTLStages::Dispatch)
+                .union(MTLStages::Blit)
+                .union(MTLStages::AccelerationStructure);
+            self.add_pend(MTLStages::Blit, UTIL_BEFORE);
+            if ib_tight {
+                self.ib_add_obl_tight(res_key, MTLStages::Blit, COMPUTE_STAGES);
+            } else {
+                self.ib_note(res_key);
+            }
+        } else {
+            self.need_full(FullWhy::ClearUav);
         }
         Ok(())
     }
