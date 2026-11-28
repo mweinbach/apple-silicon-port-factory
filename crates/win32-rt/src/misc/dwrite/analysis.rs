@@ -310,7 +310,7 @@ pub(crate) fn classify_bidi(ch: char) -> BidiClass {
 
 /// True if `units` contains any UAX #9 explicit bidi formatting control
 /// (`LRE`, `RLE`, `PDF`, `LRO`, `RLO`, `LRI`, `RLI`, `FSI`, `PDI`).
-pub(crate) fn has_explicit_bidi_controls(units: &[u16]) -> bool {
+fn has_explicit_bidi_controls(units: &[u16]) -> bool {
     units
         .iter()
         .any(|&u| matches!(u, 0x202A..=0x202E | 0x2066..=0x2069))
@@ -583,7 +583,7 @@ fn resolve_bidi_levels_icu(units: &[u16], para_level: u8) -> Option<Vec<u8>> {
 
 /// Pure-Rust fallback resolving per-UTF-16-code-unit bidi embedding levels (W1-W7,
 /// N1-N2, I1-I2) when `libicucore` is unavailable and no explicit bidi controls exist.
-pub(crate) fn resolve_bidi_levels_fallback(units: &[u16], explicit: u8) -> Vec<u8> {
+fn resolve_bidi_levels_fallback(units: &[u16], explicit: u8) -> Vec<u8> {
     let mut spans: Vec<(usize, usize, BidiClass)> = Vec::with_capacity(units.len());
     let mut i = 0usize;
     while i < units.len() {
