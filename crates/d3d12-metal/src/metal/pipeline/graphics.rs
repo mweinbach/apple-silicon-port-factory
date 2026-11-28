@@ -39,6 +39,144 @@ pub fn vertex_buffer_index(slot: u32) -> usize {
 /// Highest usable IA slot (Metal has 31 buffer bind points).
 pub const MAX_VERTEX_SLOTS: u32 = 24;
 
+/// Maximum number of simultaneous color render targets in D3D12 and Metal.
+pub const MAX_RENDER_TARGETS: usize = 8;
+
+/// Maximum Metal vertex attribute index (`0..=30`).
+const MAX_VERTEX_ATTRIBUTES: usize = 31;
+
+/// Validates D3D12 render-target formats, MSAA sample count, and dual-source blend rules,
+/// and disables fixed-function blending on non-blendable attachments (e.g. `UINT`/`SINT`
+/// integer MRTs when `IndependentBlendEnable = FALSE` broadcasts RT0's blend state, or
+/// 32-bit float attachments on devices without `float32_blend`) while preserving each
+/// attachment's color write mask.
+pub(crate) fn resolve_render_targets_and_blend_with(
+    blend_desc: &BlendDesc,
+    rtv_formats: &[u32],
+    sample_count: u32,
+    float32_blend: bool,
+    supports_sample_count: impl FnOnce(u32) -> bool,
+) -> Result<(BlendState, [MTLPixelFormat; MAX_RENDER_TARGETS], usize), String> {
+    if rtv_formats.len() > MAX_RENDER_TARGETS {
+        return Err(format!(
+            "too many render targets: {} (max {MAX_RENDER_TARGETS})",
+            rtv_formats.len()
+        ));
+    }
+    let samples = sample_count.max(1);
+    if !supports_sample_count(samples) {
+        return Err(format!("unsupported raster sample count {samples}"));
+    }
+
+    let mut mtl_formats = [MTLPixelFormat::Invalid; MAX_RENDER_TARGETS];
+    let mut active_rtvs = 0usize;
+    for (i, &dxgi) in rtv_formats.iter().enumerate() {
+        if dxgi == 0 {
+            continue;
+        }
+        if !crate::format::is_render_target_format(dxgi) {
+            return Err(format!(
+                "render target {i} format {dxgi} ({}) is not color-renderable",
+                crate::format::name(dxgi)
+            ));
+        }
+        mtl_formats[i] = crate::format::info(dxgi).mtl;
+        active_rtvs += 1;
+    }
+
+    let mut blend = crate::state::blend_state(blend_desc);
+    let mut sanitized = false;
+    for (i, &dxgi) in rtv_formats.iter().enumerate() {
+        if mtl_formats[i] == MTLPixelFormat::Invalid || !blend.attachments[i].enabled {
+            continue;
+        }
+        if !crate::format::is_blendable_format(dxgi, float32_blend) {
+            let write_mask = blend.attachments[i].write_mask;
+            blend.attachments[i] = crate::state::ColorBlend {
+                write_mask,
+                ..crate::state::ColorBlend::default()
+            };
+            sanitized = true;
+            let info = crate::format::info(dxgi);
+            let is_integer = matches!(info.num, crate::format::Num::Uint | crate::format::Num::Sint);
+            if blend_desc.IndependentBlendEnable == 0 && is_integer {
+                log::debug!(
+                    target: "d3d",
+                    "render PSO: disabling broadcast blend on integer RT {i} ({})",
+                    crate::format::name(dxgi)
+                );
+            } else {
+                log::warn!(
+                    target: "d3d",
+                    "render PSO: disabling blend on non-blendable RT {i} ({}, independent={}, float32_blend={float32_blend})",
+                    crate::format::name(dxgi),
+                    blend_desc.IndependentBlendEnable != 0
+                );
+            }
+        }
+    }
+
+    if sanitized || blend.dual_source {
+        let mut dual_source = false;
+        let mut uses_blend_constant = false;
+        for (i, &pf) in mtl_formats.iter().enumerate().take(rtv_formats.len()) {
+            if pf != MTLPixelFormat::Invalid && blend.attachments[i].enabled {
+                dual_source |= blend.attachments[i].uses_dual_source();
+                uses_blend_constant |= blend.attachments[i].uses_blend_constant();
+            }
+        }
+        blend.dual_source = dual_source;
+        if sanitized {
+            blend.uses_blend_constant = uses_blend_constant;
+        }
+    }
+
+    for (i, &pf) in mtl_formats.iter().enumerate().take(rtv_formats.len()) {
+        if pf != MTLPixelFormat::Invalid
+            && blend.attachments[i].enabled
+            && blend.attachments[i].uses_dual_source()
+            && (i != 0 || active_rtvs > 1)
+        {
+            return Err(format!(
+                "dual-source blending is only valid on render target 0 with a single active color attachment (rt {i}, active_rtvs {active_rtvs})"
+            ));
+        }
+    }
+
+    Ok((blend, mtl_formats, rtv_formats.len()))
+}
+
+/// Device-backed wrapper around [`resolve_render_targets_and_blend_with`].
+pub(crate) fn resolve_render_targets_and_blend(
+    blend_desc: &BlendDesc,
+    rtv_formats: &[u32],
+    sample_count: u32,
+) -> Result<(BlendState, [MTLPixelFormat; MAX_RENDER_TARGETS], usize), String> {
+    let dev = crate::metal::device();
+    let float32_blend = dev.map_or(cfg!(target_os = "macos"), |d| d.float32_blend);
+    resolve_render_targets_and_blend_with(blend_desc, rtv_formats, sample_count, float32_blend, |s| {
+        dev.map_or(matches!(s, 1 | 2 | 4), |d| d.supports_sample_count(s))
+    })
+}
+
+/// Applies validated color-attachment pixel formats and blend states to a Metal 4
+/// render or mesh pipeline descriptor's color attachment array.
+pub(crate) fn apply_color_attachments(
+    ca: &MTL4RenderPipelineColorAttachmentDescriptorArray,
+    mtl_formats: &[MTLPixelFormat; MAX_RENDER_TARGETS],
+    rtv_count: usize,
+    blend: &BlendState,
+    pso_opt_v2: bool,
+) {
+    for (i, &pf) in mtl_formats.iter().enumerate().take(rtv_count) {
+        let a = unsafe { ca.objectAtIndexedSubscript(i) };
+        a.setPixelFormat(pf);
+        if pf != MTLPixelFormat::Invalid {
+            blend.attachments[i].apply_to_with_opt(&a, pso_opt_v2);
+        }
+    }
+}
+
 /// `D3D12_GRAPHICS_PIPELINE_STATE_DESC` (or a flattened stream), parsed.
 pub struct GraphicsDesc<'a> {
     pub vs: &'a [u8],
@@ -275,7 +413,8 @@ impl GraphicsPipeline {
         immut_opt: bool,
         pso_opt_v2: bool,
     ) -> Result<GraphicsPipeline, String> {
-        let blend = crate::state::blend_state(&d.blend);
+        let (blend, mtl_rtvs, rtv_count) =
+            resolve_render_targets_and_blend(&d.blend, &d.rtv_formats, d.sample_count)?;
         if !blend.unsupported_logic_ops.is_empty() {
             log::warn!(
                 target: "d3d",
@@ -426,14 +565,7 @@ impl GraphicsPipeline {
         }
 
         let ca = desc.colorAttachments();
-        for (i, f) in d.rtv_formats.iter().enumerate().take(8) {
-            let a = unsafe { ca.objectAtIndexedSubscript(i) };
-            let pf = crate::format::info(*f).mtl;
-            a.setPixelFormat(pf);
-            if pf != MTLPixelFormat::Invalid {
-                blend.attachments[i].apply_to_with_opt(&a, pso_opt_v2);
-            }
-        }
+        apply_color_attachments(&ca, &mtl_rtvs, rtv_count, &blend, pso_opt_v2);
         unsafe { desc.setRasterSampleCount(d.sample_count.max(1) as usize) };
         desc.setAlphaToCoverageState(if blend.alpha_to_coverage {
             MTL4AlphaToCoverageState::Enabled
@@ -589,7 +721,8 @@ impl GraphicsPipeline {
         immut_opt: bool,
         pso_opt_v2: bool,
     ) -> Result<GraphicsPipeline, String> {
-        let blend = crate::state::blend_state(&d.blend);
+        let (blend, mtl_rtvs, rtv_count) =
+            resolve_render_targets_and_blend(&d.blend, &d.rtv_formats, d.sample_count)?;
         if !blend.unsupported_logic_ops.is_empty() {
             log::warn!(
                 target: "d3d",
@@ -834,14 +967,7 @@ impl GraphicsPipeline {
         }
 
         let ca = desc.colorAttachments();
-        for (i, f) in d.rtv_formats.iter().enumerate().take(8) {
-            let a = unsafe { ca.objectAtIndexedSubscript(i) };
-            let pf = crate::format::info(*f).mtl;
-            a.setPixelFormat(pf);
-            if pf != MTLPixelFormat::Invalid {
-                blend.attachments[i].apply_to_with_opt(&a, pso_opt_v2);
-            }
-        }
+        apply_color_attachments(&ca, &mtl_rtvs, rtv_count, &blend, pso_opt_v2);
         unsafe { desc.setRasterSampleCount(d.sample_count.max(1) as usize) };
         desc.setAlphaToCoverageState(if blend.alpha_to_coverage {
             MTL4AlphaToCoverageState::Enabled
@@ -1025,7 +1151,8 @@ impl GraphicsPipeline {
         immut_opt: bool,
         pso_opt_v2: bool,
     ) -> Result<GraphicsPipeline, String> {
-        let blend = crate::state::blend_state(&d.blend);
+        let (blend, mtl_rtvs, rtv_count) =
+            resolve_render_targets_and_blend(&d.blend, &d.rtv_formats, d.sample_count)?;
         if !blend.unsupported_logic_ops.is_empty() {
             log::warn!(
                 target: "d3d",
@@ -1126,12 +1253,15 @@ impl GraphicsPipeline {
                 let fmt = crate::format_ext::vertex_format(e.format).ok_or_else(|| {
                     format!("vertex format {} ({})", e.format, crate::format::info(e.format).name)
                 })?;
-                let a = unsafe {
-                    vd.attributes().objectAtIndexedSubscript(
-                        dxil_metal::runtime::STAGE_IN_ATTRIBUTE_START_INDEX as usize
-                            + inp.attribute_index as usize,
-                    )
-                };
+                let attr_idx = dxil_metal::runtime::STAGE_IN_ATTRIBUTE_START_INDEX as usize
+                    + inp.attribute_index as usize;
+                if attr_idx >= MAX_VERTEX_ATTRIBUTES {
+                    return Err(format!(
+                        "vertex attribute index {attr_idx} (max {})",
+                        MAX_VERTEX_ATTRIBUTES - 1
+                    ));
+                }
+                let a = unsafe { vd.attributes().objectAtIndexedSubscript(attr_idx) };
                 a.setFormat(fmt);
                 unsafe {
                     a.setOffset(e.aligned_byte_offset as usize);
@@ -1162,14 +1292,7 @@ impl GraphicsPipeline {
         }
 
         let ca = desc.colorAttachments();
-        for (i, f) in d.rtv_formats.iter().enumerate().take(8) {
-            let a = unsafe { ca.objectAtIndexedSubscript(i) };
-            let pf = crate::format::info(*f).mtl;
-            a.setPixelFormat(pf);
-            if pf != MTLPixelFormat::Invalid {
-                blend.attachments[i].apply_to_with_opt(&a, pso_opt_v2);
-            }
-        }
+        apply_color_attachments(&ca, &mtl_rtvs, rtv_count, &blend, pso_opt_v2);
         unsafe { desc.setRasterSampleCount(d.sample_count.max(1) as usize) };
         desc.setAlphaToCoverageState(if blend.alpha_to_coverage {
             MTL4AlphaToCoverageState::Enabled

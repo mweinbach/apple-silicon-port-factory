@@ -82,6 +82,10 @@ pub struct Device {
     /// True on Apple GPU Family 10+ (e.g. M5 / A19 Pro), required for macOS 27
     /// read-only `MTLPixelFormatRGB32{Float,Uint,Sint}` texture buffers.
     pub apple10: bool,
+    /// True when the GPU supports fixed-function color blending on 32-bit float
+    /// attachments (`R32Float`, `RG32Float`, `RGBA32Float`), i.e. macOS Apple Silicon
+    /// (`MTLGPUFamily::Mac2`); false on iOS Apple7-9 devices.
+    pub float32_blend: bool,
     /// Device-wide residency set: everything the GPU may touch through
     /// descriptor heaps or GPU VAs lives here (Metal 4 has no implicit
     /// residency). Commit is batched: see [`Device::commit_residency`].
@@ -106,6 +110,8 @@ pub fn device() -> Option<&'static Device> {
             let dev = MTLCreateSystemDefaultDevice()?;
             let metal4 = dev.supportsFamily(MTLGPUFamily::Metal4);
             let apple10 = dev.supportsFamily(MTLGPUFamily::Apple10);
+            #[allow(deprecated)]
+            let float32_blend = dev.supportsFamily(MTLGPUFamily::Mac2);
             if !metal4 {
                 log::error!(target: "d3d", "{}: Metal 4 not supported; no D3D12 adapter", dev.name());
                 return None;
@@ -128,6 +134,7 @@ pub fn device() -> Option<&'static Device> {
                 recommended_working_set: dev.recommendedMaxWorkingSetSize(),
                 metal4,
                 apple10,
+                float32_blend,
                 residency,
                 residency_dirty: Mutex::new(false),
                 residency_dirty_fast: AtomicBool::new(false),
@@ -157,6 +164,13 @@ impl Device {
     #[inline]
     pub fn supports_rgb32_texture_buffer(&self) -> bool {
         self.apple10 && super::m41::rgb32_texture_buffer_enabled()
+    }
+
+    /// True when the active Metal device supports `samples` MSAA samples for render targets
+    /// and render pipelines (`-[MTLDevice supportsTextureSampleCount:]`).
+    #[inline]
+    pub fn supports_sample_count(&self, samples: u32) -> bool {
+        self.dev.supportsTextureSampleCount(samples as usize)
     }
 
     /// True when the active GPU supports macOS 27 hardware `MTLTextureViewDescriptor.minLOD`

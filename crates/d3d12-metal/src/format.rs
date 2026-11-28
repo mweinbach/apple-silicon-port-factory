@@ -376,6 +376,32 @@ pub fn support(dxgi: u32) -> (u32, u32) {
     (s1, s2)
 }
 
+/// True when `dxgi` is a concrete D3D12 color render-target format backed by a
+/// color-renderable Metal pixel format (excludes `UNKNOWN`, typeless, depth/stencil,
+/// block-compressed, `RGB9E5`, and 3-channel/video formats).
+pub fn is_render_target_format(dxgi: u32) -> bool {
+    (support(dxgi).0 & support1::RENDER_TARGET) != 0
+}
+
+/// True when `dxgi` supports fixed-function color blending in Metal.
+///
+/// Integer formats (`UINT`/`SINT`) are never blendable in D3D12 or Metal.
+/// 32-bit float formats (`R32`/`RG32`/`RGBA32_FLOAT`) additionally require
+/// `float32_blend` (`MTLGPUFamily::Mac2` / macOS Apple Silicon; iOS Apple7-9
+/// devices do not support 32-bit float color blending).
+pub fn is_blendable_format(dxgi: u32, float32_blend: bool) -> bool {
+    if (support(dxgi).0 & support1::BLENDABLE) == 0 {
+        return false;
+    }
+    if !float32_blend {
+        let f = info(dxgi);
+        if f.num == Num::Float && f.chan_bits == 32 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Supported MSAA sample counts (Apple GPUs: 1, 2, 4; 8 not on Apple7+ for
 /// all formats — be conservative).
 pub fn msaa_quality_levels(dxgi: u32, samples: u32) -> u32 {
@@ -413,5 +439,27 @@ mod tests {
         let (s1, _) = support(6);
         assert_eq!(s1 & support1::TEXTURE2D, 0);
         assert!(s1 & support1::IA_VERTEX_BUFFER != 0);
+
+        // Render-target and blendability predicates.
+        assert!(!is_render_target_format(0)); // UNKNOWN
+        assert!(!is_render_target_format(27)); // R8G8B8A8_TYPELESS
+        assert!(!is_render_target_format(40)); // D32_FLOAT
+        assert!(!is_render_target_format(71)); // BC1_UNORM
+        assert!(!is_render_target_format(67)); // R9G9B9E5_SHAREDEXP
+        assert!(!is_render_target_format(6)); // R32G32B32_FLOAT
+        assert!(is_render_target_format(28)); // R8G8B8A8_UNORM
+        assert!(is_render_target_format(41)); // R32_FLOAT
+        assert!(is_render_target_format(17)); // R32G32_UINT
+        assert!(is_render_target_format(42)); // R32_UINT
+
+        assert!(is_blendable_format(28, false));
+        assert!(is_blendable_format(34, false)); // R16G16_FLOAT
+        assert!(!is_blendable_format(17, true)); // R32G32_UINT
+        assert!(!is_blendable_format(42, true)); // R32_UINT
+        assert!(!is_blendable_format(25, true)); // R10G10B10A2_UINT
+        assert!(is_blendable_format(41, true)); // R32_FLOAT on macOS Apple Silicon
+        assert!(!is_blendable_format(41, false)); // R32_FLOAT on iOS without float32 blend
+        assert!(is_blendable_format(2, true)); // R32G32B32A32_FLOAT on macOS
+        assert!(!is_blendable_format(2, false)); // R32G32B32A32_FLOAT on iOS
     }
 }
