@@ -1,46 +1,139 @@
-//! scanf engine (`__stdio_common_vsscanf`, `__stdio_common_vswscanf`).
+//! scanf engine (`__stdio_common_vsscanf`, `__stdio_common_vswscanf`,
+//! `__stdio_common_vfscanf`, `__stdio_common_vfwscanf`).
 //!
 //! Option bits: 1 = SECURECRT (`%s`/`%c`/`%[` take a buffer size argument
 //! after the pointer), 2 = LEGACY_WIDE_SPECIFIERS, 4 = LEGACY_MSVCRT_COMPAT.
 
 use crate::va::VaList;
+use std::cell::RefCell;
 use std::ffi::c_void;
 
 const SECURE: u64 = 1;
 const LEGACY_WIDE: u64 = 2;
+const WEOF: u32 = 0xFFFF;
+
+struct StreamBuf {
+    ahead: Vec<u32>,
+    eof: bool,
+}
+
+enum Source {
+    Mem {
+        p: *const u8,
+        len: usize,
+    },
+    Stream {
+        fp: *mut super::stdio::FILE,
+        cp: u32,
+        buf: RefCell<StreamBuf>,
+    },
+}
 
 struct Input {
     wide: bool,
-    p: *const u8,
-    len: usize,
+    src: Source,
     pos: usize,
 }
 
 impl Input {
-    unsafe fn peek_at(&self, off: usize) -> Option<u32> {
-        let idx = self.pos.checked_add(off)?;
-        if idx >= self.len {
-            return None;
-        }
-        let c = if self.wide {
-            (self.p as *const u16).add(idx).read_unaligned() as u32
-        } else {
-            *self.p.add(idx) as u32
-        };
-        if c == 0 {
-            None
-        } else {
-            Some(c)
+    fn from_mem(wide: bool, p: *const u8, len: usize) -> Self {
+        Self { wide, src: Source::Mem { p, len }, pos: 0 }
+    }
+
+    fn from_stream(wide: bool, fp: *mut super::stdio::FILE, cp: u32) -> Self {
+        Self {
+            wide,
+            src: Source::Stream { fp, cp, buf: RefCell::new(StreamBuf { ahead: Vec::new(), eof: false }) },
+            pos: 0,
         }
     }
+
+    unsafe fn read_stream_unit(wide: bool, fp: *mut super::stdio::FILE, cp: u32) -> Option<u32> {
+        if wide {
+            let c = super::stdio::read_stream_wide_cp(fp, cp);
+            if c == WEOF { None } else { Some(c) }
+        } else {
+            let c = super::stdio::fgetc(fp);
+            if c < 0 { None } else { Some(c as u32) }
+        }
+    }
+
+    unsafe fn peek_at(&self, off: usize) -> Option<u32> {
+        match &self.src {
+            Source::Mem { p, len } => {
+                let idx = self.pos.checked_add(off)?;
+                if idx >= *len {
+                    return None;
+                }
+                let c = if self.wide {
+                    (*p as *const u16).add(idx).read_unaligned() as u32
+                } else {
+                    *p.add(idx) as u32
+                };
+                if c == 0 { None } else { Some(c) }
+            }
+            Source::Stream { fp, cp, buf } => {
+                let mut sb = buf.borrow_mut();
+                while sb.ahead.len() <= off && !sb.eof {
+                    match Self::read_stream_unit(self.wide, *fp, *cp) {
+                        Some(c) => sb.ahead.push(c),
+                        None => sb.eof = true,
+                    }
+                }
+                sb.ahead.get(off).copied()
+            }
+        }
+    }
+
     unsafe fn peek(&self) -> Option<u32> {
         self.peek_at(0)
     }
+
     fn bump(&mut self) {
-        self.pos += 1;
+        self.advance(1);
     }
+
     fn advance(&mut self, n: usize) {
-        self.pos += n;
+        match &mut self.src {
+            Source::Mem { .. } => {
+                self.pos += n;
+            }
+            Source::Stream { fp, cp, buf } => {
+                let mut sb = buf.borrow_mut();
+                let drain = n.min(sb.ahead.len());
+                sb.ahead.drain(..drain);
+                let mut consumed = drain;
+                for _ in 0..(n - drain) {
+                    if sb.eof {
+                        break;
+                    }
+                    match unsafe { Self::read_stream_unit(self.wide, *fp, *cp) } {
+                        Some(_) => consumed += 1,
+                        None => {
+                            sb.eof = true;
+                            break;
+                        }
+                    }
+                }
+                self.pos += consumed;
+            }
+        }
+    }
+
+    /// Push any unconsumed lookahead units back onto the backing `FILE*` stream
+    /// in reverse order so subsequent reads see the exact next unconsumed unit.
+    /// Leaves `feof(fp)` intact when lookahead is empty.
+    unsafe fn flush_unget(&mut self) {
+        if let Source::Stream { fp, cp, buf } = &self.src {
+            let mut sb = buf.borrow_mut();
+            for c in sb.ahead.drain(..).rev() {
+                if self.wide {
+                    let _ = super::stdio::unget_stream_wide_cp(c, *fp, *cp);
+                } else {
+                    let _ = super::stdio::ungetc(c as i32, *fp);
+                }
+            }
+        }
     }
 }
 
@@ -50,7 +143,7 @@ fn is_space(c: u32) -> bool {
 
 unsafe fn fmt_at(fmt: *const u8, wide: bool, i: usize) -> u32 {
     if wide {
-        *(fmt as *const u16).add(i) as u32
+        (fmt as *const u16).add(i).read_unaligned() as u32
     } else {
         *fmt.add(i) as u32
     }
@@ -92,12 +185,15 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
             while input.peek().is_some_and(is_space) {
                 input.bump();
             }
-            if input.peek() == Some('%' as u32) {
-                input.bump();
-                i += 1;
-                continue;
+            match input.peek() {
+                Some(c) if c == '%' as u32 => {
+                    input.bump();
+                    i += 1;
+                    continue;
+                }
+                None if !converted_any => return -1,
+                _ => break,
             }
-            break;
         }
         let mut suppress = false;
         if fmt_at(fmt, wide, i) == '*' as u32 {
@@ -221,26 +317,29 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
                 converted_any = true;
                 if !suppress {
                     let p = args.next_ptr::<u8>();
+                    if p.is_null() {
+                        super::errno::set(super::errno::EINVAL);
+                        super::runtime::invalid_parameter("scanf: NULL output");
+                        return -1;
+                    }
                     let sz = if conv == b'p' { 8 } else { size };
                     match sz {
-                        1 => *p = v as u8,
-                        2 => *(p as *mut u16) = v as u16,
-                        8 => *(p as *mut u64) = v,
-                        _ => *(p as *mut u32) = v as u32,
+                        1 => p.write_unaligned(v as u8),
+                        2 => (p as *mut u16).write_unaligned(v as u16),
+                        8 => (p as *mut u64).write_unaligned(v),
+                        _ => (p as *mut u32).write_unaligned(v as u32),
                     }
                     assigned += 1;
                 }
             }
             b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A' => {
-                let start = input.pos;
                 let inp = &*input;
                 let lim = maxw;
                 let get = |k: usize| -> u32 {
                     if k >= lim {
                         return 0;
                     }
-                    let q = Input { wide: inp.wide, p: inp.p, len: inp.len, pos: start + k };
-                    q.peek().unwrap_or(0)
+                    inp.peek_at(k).unwrap_or(0)
                 };
                 let mut dec_buf = [0u32; 8];
                 let dec_len = if wide {
@@ -262,14 +361,19 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
                 if used == 0 {
                     break;
                 }
-                input.pos = start + used;
+                input.advance(used);
                 converted_any = true;
                 if !suppress {
                     let p = args.next_ptr::<u8>();
+                    if p.is_null() {
+                        super::errno::set(super::errno::EINVAL);
+                        super::runtime::invalid_parameter("scanf: NULL output");
+                        return -1;
+                    }
                     if is_double {
-                        *(p as *mut f64) = v;
+                        (p as *mut f64).write_unaligned(v);
                     } else {
-                        *(p as *mut f32) = v as f32;
+                        (p as *mut f32).write_unaligned(v as f32);
                     }
                     assigned += 1;
                 }
@@ -441,6 +545,11 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
                 if !suppress {
                     let p = args.next_ptr::<u8>();
                     let cap = if opts & SECURE != 0 { args.next_u64() as u32 as usize } else { usize::MAX };
+                    if p.is_null() {
+                        super::errno::set(super::errno::EINVAL);
+                        super::runtime::invalid_parameter("scanf: NULL output");
+                        return -1;
+                    }
                     let need = units.len() + if lower == b'c' { 0 } else { 1 };
                     if need > cap {
                         if cap > 0 {
@@ -472,8 +581,18 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
             }
             b'n' => {
                 if !suppress {
-                    let p = args.next_ptr::<i32>();
-                    *p = input.pos as i32;
+                    let p = args.next_ptr::<u8>();
+                    if p.is_null() {
+                        super::errno::set(super::errno::EINVAL);
+                        super::runtime::invalid_parameter("scanf: NULL output");
+                        return -1;
+                    }
+                    match size {
+                        1 => p.write_unaligned(input.pos as u8),
+                        2 => (p as *mut u16).write_unaligned(input.pos as u16),
+                        8 => (p as *mut u64).write_unaligned(input.pos as u64),
+                        _ => (p as *mut u32).write_unaligned(input.pos as u32),
+                    }
                 }
             }
             _ => {
@@ -498,7 +617,7 @@ pub unsafe extern "win64" fn __stdio_common_vsscanf(
         super::runtime::invalid_parameter("sscanf: NULL");
         return -1;
     }
-    let mut input = Input { wide: false, p: buf, len: count, pos: 0 };
+    let mut input = Input::from_mem(false, buf, count);
     let mut a = VaList::new(va);
     scan(&mut input, fmt, opts, loc, &mut a)
 }
@@ -516,9 +635,47 @@ pub unsafe extern "win64" fn __stdio_common_vswscanf(
         super::runtime::invalid_parameter("swscanf: NULL");
         return -1;
     }
-    let mut input = Input { wide: true, p: buf as *const u8, len: count, pos: 0 };
+    let mut input = Input::from_mem(true, buf as *const u8, count);
     let mut a = VaList::new(va);
     scan(&mut input, fmt as *const u8, opts, loc, &mut a)
+}
+
+pub unsafe extern "win64" fn __stdio_common_vfscanf(
+    opts: u64,
+    fp: *mut super::stdio::FILE,
+    fmt: *const u8,
+    loc: *mut c_void,
+    va: *const u8,
+) -> i32 {
+    if fp.is_null() || fmt.is_null() {
+        super::errno::set(super::errno::EINVAL);
+        super::runtime::invalid_parameter("fscanf: NULL");
+        return -1;
+    }
+    let mut input = Input::from_stream(false, fp, super::locale::locale_obj_cp(loc));
+    let mut a = VaList::new(va);
+    let r = scan(&mut input, fmt, opts, loc, &mut a);
+    input.flush_unget();
+    r
+}
+
+pub unsafe extern "win64" fn __stdio_common_vfwscanf(
+    opts: u64,
+    fp: *mut super::stdio::FILE,
+    fmt: *const u16,
+    loc: *mut c_void,
+    va: *const u8,
+) -> i32 {
+    if fp.is_null() || fmt.is_null() {
+        super::errno::set(super::errno::EINVAL);
+        super::runtime::invalid_parameter("fwscanf: NULL");
+        return -1;
+    }
+    let mut input = Input::from_stream(true, fp, super::locale::locale_obj_cp(loc));
+    let mut a = VaList::new(va);
+    let r = scan(&mut input, fmt as *const u8, opts, loc, &mut a);
+    input.flush_unget();
+    r
 }
 
 #[cfg(test)]
@@ -680,6 +837,321 @@ mod tests {
             assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EILSEQ);
             assert_eq!(wcan5, [0xAAAA, 0xBEEF]);
             crate::ucrt::locale::_free_locale(loc_u8);
+        }
+    }
+
+    #[test]
+    fn vfscanf_stream_roundtrip_and_pushback() {
+        unsafe {
+            use crate::ucrt::stdio;
+
+            // Helper: populate a temporary binary stream and rewind to 0.
+            let make_stream = |bytes: &[u8]| -> *mut stdio::FILE {
+                let fp = stdio::tmpfile();
+                assert!(!fp.is_null());
+                if !bytes.is_empty() {
+                    let nw = stdio::fwrite(bytes.as_ptr().cast(), 1, bytes.len(), fp);
+                    assert_eq!(nw, bytes.len());
+                }
+                stdio::rewind(fp);
+                fp
+            };
+
+            // Install a scoped no-op invalid-parameter handler so NULL-arg checks return -1 + EINVAL
+            // rather than fast-failing the test process.
+            unsafe extern "win64" fn noop_iph(
+                _: *const u16,
+                _: *const u16,
+                _: *const u16,
+                _: u32,
+                _: usize,
+            ) {}
+            struct IphGuard(usize);
+            impl Drop for IphGuard {
+                fn drop(&mut self) {
+                    unsafe {
+                        crate::ucrt::runtime::_set_invalid_parameter_handler(self.0);
+                    }
+                }
+            }
+            let _iph = IphGuard(crate::ucrt::runtime::_set_invalid_parameter_handler(
+                noop_iph as *const () as usize,
+            ));
+
+            // Null stream or null format returns EOF (-1) and sets EINVAL.
+            let dummy_args = [0u64; 1];
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    std::ptr::null_mut(),
+                    b"%d\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    dummy_args.as_ptr() as *const u8,
+                ),
+                -1
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EINVAL);
+
+            let fp = make_stream(b"  -42 0x2A 3.5 token [abc]123rest");
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    fp,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    dummy_args.as_ptr() as *const u8,
+                ),
+                -1
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EINVAL);
+
+            // Null output pointer returns -1 + EINVAL without crashing.
+            let fp_null_out = make_stream(b"123");
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    fp_null_out,
+                    b"%d\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    dummy_args.as_ptr() as *const u8,
+                ),
+                -1
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EINVAL);
+            stdio::fclose(fp_null_out);
+
+            // Scan into unaligned output buffers with SECURE flag + %n + %[ set.
+            let mut raw = [0u8; 64];
+            let p_int = raw.as_mut_ptr().add(1);
+            let p_hex = raw.as_mut_ptr().add(7);
+            let p_dbl = raw.as_mut_ptr().add(17);
+            let p_str = raw.as_mut_ptr().add(27);
+            let p_set = raw.as_mut_ptr().add(40);
+            let p_n = raw.as_mut_ptr().add(49);
+            assert!(!(p_int as *const i32).is_aligned());
+            assert!(!(p_hex as *const u64).is_aligned());
+            assert!(!(p_dbl as *const f64).is_aligned());
+            assert!(!(p_n as *const i16).is_aligned());
+
+            let args: [u64; 8] = [
+                p_int as u64,
+                p_hex as u64,
+                p_dbl as u64,
+                p_str as u64,
+                12,
+                p_set as u64,
+                8,
+                p_n as u64,
+            ];
+            let n = __stdio_common_vfscanf(
+                SECURE,
+                fp,
+                b"%d %llx %lf %s [%[a-z]]%hn\0".as_ptr(),
+                std::ptr::null_mut(),
+                args.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 5);
+            assert_eq!((p_int as *const i32).read_unaligned(), -42);
+            assert_eq!((p_hex as *const u64).read_unaligned(), 0x2A);
+            assert_eq!((p_dbl as *const f64).read_unaligned(), 3.5);
+            assert_eq!(std::slice::from_raw_parts(p_str, 6), b"token\0");
+            assert_eq!(std::slice::from_raw_parts(p_set, 4), b"abc\0");
+            assert_eq!((p_n as *const i16).read_unaligned(), 26);
+            // Next unconsumed byte after ']' is '1', followed by "23rest".
+            let mut tail = [0u8; 7];
+            for b in &mut tail {
+                let c = stdio::fgetc(fp);
+                assert!(c >= 0);
+                *b = c as u8;
+            }
+            assert_eq!(&tail, b"123rest");
+            assert_eq!(stdio::fgetc(fp), -1);
+            assert_ne!(stdio::feof(fp), 0);
+            stdio::fclose(fp);
+
+            // Multi-byte float lookahead backtrack ("1.5e+x") must push back "e+x" in exact order.
+            let fp_bt = make_stream(b"1.5e+x");
+            let mut fv: f64 = 0.0;
+            let args_bt = [&mut fv as *mut f64 as u64];
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    fp_bt,
+                    b"%lf\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    args_bt.as_ptr() as *const u8,
+                ),
+                1
+            );
+            assert_eq!(fv, 1.5);
+            assert_eq!(stdio::fgetc(fp_bt), b'e' as i32);
+            assert_eq!(stdio::fgetc(fp_bt), b'+' as i32);
+            assert_eq!(stdio::fgetc(fp_bt), b'x' as i32);
+            assert_eq!(stdio::fgetc(fp_bt), -1);
+            stdio::fclose(fp_bt);
+
+            // Matching failure returns 0 (not EOF) and leaves the offending byte in the stream.
+            let fp_mf = make_stream(b"xyz");
+            let mut iv = 777i32;
+            let args_mf = [&mut iv as *mut i32 as u64];
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    fp_mf,
+                    b"%d\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    args_mf.as_ptr() as *const u8,
+                ),
+                0
+            );
+            assert_eq!(iv, 777);
+            assert_eq!(stdio::fgetc(fp_mf), b'x' as i32);
+            stdio::fclose(fp_mf);
+
+            // Reading to EOF without trailing bytes preserves feof(fp) == 1; empty/EOF returns -1.
+            let fp_eof = make_stream(b"99");
+            let mut iv2 = 0i32;
+            let args_eof = [&mut iv2 as *mut i32 as u64];
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    fp_eof,
+                    b"%d\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    args_eof.as_ptr() as *const u8,
+                ),
+                1
+            );
+            assert_eq!(iv2, 99);
+            assert_ne!(stdio::feof(fp_eof), 0);
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    fp_eof,
+                    b"%d\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    args_eof.as_ptr() as *const u8,
+                ),
+                -1
+            );
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    fp_eof,
+                    b"%%\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    args_eof.as_ptr() as *const u8,
+                ),
+                -1
+            );
+            stdio::fclose(fp_eof);
+
+            // Explicit LC_NUMERIC = de-DE uses ',' decimal separator on FILE* streams.
+            let loc_de = crate::ucrt::locale::_create_locale(4 /* LC_NUMERIC */, b"de-DE\0".as_ptr());
+            assert!(!loc_de.is_null());
+            let fp_de = make_stream(b"2,25!");
+            let mut df = 0.0f64;
+            let args_de = [&mut df as *mut f64 as u64];
+            assert_eq!(
+                __stdio_common_vfscanf(
+                    0,
+                    fp_de,
+                    b"%lf\0".as_ptr(),
+                    loc_de,
+                    args_de.as_ptr() as *const u8,
+                ),
+                1
+            );
+            assert_eq!(df, 2.25);
+            assert_eq!(stdio::fgetc(fp_de), b'!' as i32);
+            stdio::fclose(fp_de);
+            crate::ucrt::locale::_free_locale(loc_de);
+
+            // Verify API-set resolution for both new UCRT exports.
+            assert!(crate::lookup("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfscanf").is_some());
+            assert!(crate::lookup("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfwscanf").is_some());
+        }
+    }
+
+    #[test]
+    fn vfwscanf_stream_roundtrip_unicode_and_locale() {
+        unsafe {
+            use crate::ucrt::stdio;
+
+            // Narrow CP1252 file scanned via __stdio_common_vfwscanf with explicit de-DE _locale_t.
+            let loc_de_ct = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"de-DE\0".as_ptr());
+            assert!(!loc_de_ct.is_null());
+            let fp_cp1252 = stdio::tmpfile();
+            assert!(!fp_cp1252.is_null());
+            let raw_1252: &[u8] = &[b'7', b' ', 0xE4, 0x80, b' ', b'Z']; // "7 ä€ Z" in CP1252
+            assert_eq!(stdio::fwrite(raw_1252.as_ptr().cast(), 1, raw_1252.len(), fp_cp1252), raw_1252.len());
+            stdio::rewind(fp_cp1252);
+
+            // Unaligned wide format string (odd byte offset).
+            let fmt_units: Vec<u16> = "%d %ls\0".encode_utf16().collect();
+            let mut raw_fmt = vec![0xAAu8; fmt_units.len() * 2 + 3];
+            let odd_fmt = raw_fmt.as_mut_ptr().add(1) as *mut u16;
+            assert!(!odd_fmt.is_aligned());
+            for (i, &u) in fmt_units.iter().enumerate() {
+                odd_fmt.add(i).write_unaligned(u);
+            }
+
+            let mut iv = 0i32;
+            let mut wbuf = [0u16; 8];
+            let args: [u64; 3] = [&mut iv as *mut i32 as u64, wbuf.as_mut_ptr() as u64, 8];
+            assert_eq!(
+                __stdio_common_vfwscanf(
+                    SECURE,
+                    fp_cp1252,
+                    odd_fmt,
+                    loc_de_ct,
+                    args.as_ptr() as *const u8,
+                ),
+                2
+            );
+            assert_eq!(iv, 7);
+            assert_eq!(&wbuf[..3], &[0x00E4, 0x20AC, 0]);
+            // Lookahead space before 'Z' was pushed back cleanly.
+            assert_eq!(stdio::fgetc(fp_cp1252), b' ' as i32);
+            assert_eq!(stdio::fgetc(fp_cp1252), b'Z' as i32);
+            stdio::fclose(fp_cp1252);
+            crate::ucrt::locale::_free_locale(loc_de_ct);
+
+            // Unicode (_O_U16TEXT) stream with lookahead backtrack pushes back UTF-16LE units cleanly.
+            let fp_u16 = stdio::tmpfile();
+            assert!(!fp_u16.is_null());
+            let u16_units: Vec<u16> = "1.25e+Q".encode_utf16().collect();
+            let mut le_bytes = Vec::with_capacity(u16_units.len() * 2);
+            for u in &u16_units {
+                le_bytes.extend_from_slice(&u.to_le_bytes());
+            }
+            assert_eq!(stdio::fwrite(le_bytes.as_ptr().cast(), 1, le_bytes.len(), fp_u16), le_bytes.len());
+            stdio::rewind(fp_u16);
+            let fd = stdio::_fileno(fp_u16);
+            assert!(stdio::_setmode(fd, 0x0002_0000 /* _O_U16TEXT */) >= 0);
+
+            let fmt_f: Vec<u16> = "%lf\0".encode_utf16().collect();
+            let mut fv = 0.0f64;
+            let args_f = [&mut fv as *mut f64 as u64];
+            assert_eq!(
+                __stdio_common_vfwscanf(
+                    0,
+                    fp_u16,
+                    fmt_f.as_ptr(),
+                    std::ptr::null_mut(),
+                    args_f.as_ptr() as *const u8,
+                ),
+                1
+            );
+            assert_eq!(fv, 1.25);
+            assert_eq!(stdio::fgetwc(fp_u16), b'e' as u32);
+            assert_eq!(stdio::fgetwc(fp_u16), b'+' as u32);
+            assert_eq!(stdio::fgetwc(fp_u16), b'Q' as u32);
+            assert_eq!(stdio::fgetwc(fp_u16), WEOF);
+            stdio::fclose(fp_u16);
         }
     }
 }

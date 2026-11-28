@@ -618,6 +618,28 @@ unsafe extern "win64" fn xbad_alloc() {
     super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
 }
 
+unsafe extern "win64" fn xget_last_error() {
+    let err = crate::teb::last_error();
+    log::error!("std::_XGetLastError(last_error={err})");
+    super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
+}
+
+unsafe extern "win64" fn execute_once(
+    flag: *mut c_void,
+    callback: Option<crate::sync::InitOnceFn>,
+    pv: *mut c_void,
+) -> i32 {
+    let Some(cb) = callback else {
+        crate::teb::set_last_error(crate::types::err::ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if flag.is_null() {
+        crate::teb::set_last_error(crate::types::err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    crate::sync::InitOnceExecuteOnce(flag, cb, pv, std::ptr::null_mut())
+}
+
 unsafe extern "win64" fn xbad_function_call() {
     log::error!("std::_Xbad_function_call()");
     super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
@@ -1805,11 +1827,11 @@ unsafe extern "win64" fn codecvt_length(
 unsafe extern "win64" fn codecvt_u32_ctor(this: *mut CodecvtU32, refs: usize) -> *mut CodecvtU32 {
     ensure_vtables_registered();
     if !this.is_null() {
-        (*this).vtable = CODECVT_U32_VTABLE.as_ptr();
-        (*this).refs = AtomicU32::new(refs as u32);
-        (*this)._pad = 0;
-        (*this).maxcode = 0x10ffff;
-        (*this).mode = 4;
+        write_field(this, std::mem::offset_of!(CodecvtU32, vtable), CODECVT_U32_VTABLE.as_ptr());
+        write_field(this, std::mem::offset_of!(CodecvtU32, refs), refs as u32);
+        write_field(this, std::mem::offset_of!(CodecvtU32, _pad), 0u32);
+        write_field(this, std::mem::offset_of!(CodecvtU32, maxcode), 0x10ffffu32);
+        write_field(this, std::mem::offset_of!(CodecvtU32, mode), 4u32);
     }
     this
 }
@@ -1817,12 +1839,24 @@ unsafe extern "win64" fn codecvt_u32_ctor(this: *mut CodecvtU32, refs: usize) ->
 unsafe extern "win64" fn codecvt_w_ctor(this: *mut CodecvtW, refs: usize) -> *mut CodecvtW {
     ensure_vtables_registered();
     if !this.is_null() {
-        (*this).vtable = CODECVT_W_VTABLE.as_ptr();
-        (*this).refs = AtomicU32::new(refs as u32);
-        (*this)._pad = 0;
-        locinfo_getcvt(std::ptr::null(), &mut (*this).cvt);
+        write_field(this, std::mem::offset_of!(CodecvtW, vtable), CODECVT_W_VTABLE.as_ptr());
+        write_field(this, std::mem::offset_of!(CodecvtW, refs), refs as u32);
+        write_field(this, std::mem::offset_of!(CodecvtW, _pad), 0u32);
+        locinfo_getcvt(std::ptr::null(), field_ptr::<_, Cvtvec>(this, std::mem::offset_of!(CodecvtW, cvt)));
     }
     this
+}
+
+unsafe extern "win64" fn codecvt_w_getcat(ppf: *mut *const Facet, _ploc: *const c_void) -> usize {
+    ensure_vtables_registered();
+    if !ppf.is_null() && std::ptr::read_unaligned(ppf).is_null() {
+        let p = crate::ucrt::heap::calloc(1, std::mem::size_of::<CodecvtW>()) as *mut CodecvtW;
+        if !p.is_null() {
+            codecvt_w_ctor(p, 0);
+            std::ptr::write_unaligned(ppf, p.cast());
+        }
+    }
+    2 // _X_CTYPE
 }
 
 unsafe extern "win64" fn codecvt_u32_in(
@@ -2752,6 +2786,15 @@ unsafe extern "win64" fn ios_base_width_set(this: *mut BasicIos, newwidth: i64) 
 
 unsafe extern "win64" fn ios_fill_get(this: *const BasicIos) -> u8 {
     if this.is_null() { b' ' } else { read_field(this, std::mem::offset_of!(BasicIos, fillch)) }
+}
+
+unsafe extern "win64" fn ios_fill_set(this: *mut BasicIos, ch: u8) -> u8 {
+    if this.is_null() {
+        return b' ';
+    }
+    let old: u8 = read_field(this, std::mem::offset_of!(BasicIos, fillch));
+    write_field(this, std::mem::offset_of!(BasicIos, fillch), ch);
+    old
 }
 
 unsafe extern "win64" fn ios_rdbuf_get(this: *const BasicIos) -> *mut BasicStreambuf {
@@ -4280,12 +4323,119 @@ unsafe extern "win64" fn istream_read(this: *mut u8, dst: *mut u8, count: i64) -
     }
     this
 }
-unsafe extern "win64" fn istream_seekg(this: *mut u8, _off: i64, _way: i32) -> *mut u8 {
+unsafe extern "win64" fn istream_seekg_pos(this: *mut u8, pos: *const [i64; 3]) -> *mut u8 {
+    if this.is_null() {
+        return this;
+    }
+    let ios = stream_ios(this);
+    if ios.is_null() {
+        return this;
+    }
+    // Per C++11 [istream.unformatted]: seekg clears eofbit first, then calls rdbuf()->pubseekpos
+    // if !fail(), setting failbit when the returned fpos converts to streamoff(-1).
+    let cur: i32 = read_field(ios, std::mem::offset_of!(BasicIos, mystate));
+    let cleared = cur & !1;
+    write_field(ios, std::mem::offset_of!(BasicIos, mystate), cleared);
+    if (cleared & 6) == 0 {
+        let sb: *mut BasicStreambuf = read_field(ios, std::mem::offset_of!(BasicIos, mystrbuf));
+        let mut out_pos = [-1i64, 0, 0];
+        if !sb.is_null() && !pos.is_null() {
+            let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambuf, vtable));
+            if !vtable.is_null() {
+                let seekpos = std::ptr::read_unaligned(vtable.add(11)).0 as usize;
+                if seekpos != 0 {
+                    let pos_copy = std::ptr::read_unaligned(pos);
+                    let _ = crate::call_guest8(
+                        seekpos,
+                        sb as u64,
+                        &mut out_pos as *mut [i64; 3] as u64,
+                        &pos_copy as *const [i64; 3] as u64,
+                        1, // ios_base::in
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
+        if out_pos[0].wrapping_add(out_pos[1]) == -1 {
+            ios_setstate(ios, 2, 0);
+        }
+    }
     this
 }
-unsafe extern "win64" fn istream_tellg(_this: *mut u8, out: *mut [i64; 3]) -> *mut [i64; 3] {
+
+unsafe extern "win64" fn istream_seekg(this: *mut u8, off: i64, way: i32) -> *mut u8 {
+    if this.is_null() {
+        return this;
+    }
+    let ios = stream_ios(this);
+    if ios.is_null() {
+        return this;
+    }
+    let cur: i32 = read_field(ios, std::mem::offset_of!(BasicIos, mystate));
+    let cleared = cur & !1;
+    write_field(ios, std::mem::offset_of!(BasicIos, mystate), cleared);
+    if (cleared & 6) == 0 {
+        let sb: *mut BasicStreambuf = read_field(ios, std::mem::offset_of!(BasicIos, mystrbuf));
+        let mut out_pos = [-1i64, 0, 0];
+        if !sb.is_null() {
+            let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambuf, vtable));
+            if !vtable.is_null() {
+                let seekoff = std::ptr::read_unaligned(vtable.add(10)).0 as usize;
+                if seekoff != 0 {
+                    let _ = crate::call_guest8(
+                        seekoff,
+                        sb as u64,
+                        &mut out_pos as *mut [i64; 3] as u64,
+                        off as u64,
+                        way as u32 as u64,
+                        1, // ios_base::in
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
+        if out_pos[0].wrapping_add(out_pos[1]) == -1 {
+            ios_setstate(ios, 2, 0);
+        }
+    }
+    this
+}
+
+unsafe extern "win64" fn istream_tellg(this: *mut u8, out: *mut [i64; 3]) -> *mut [i64; 3] {
+    let mut local_out = [-1i64, 0, 0];
+    if !this.is_null() && !out.is_null() {
+        let ios = stream_ios(this);
+        if !ios.is_null() {
+            let mystate: i32 = read_field(ios, std::mem::offset_of!(BasicIos, mystate));
+            let sb: *mut BasicStreambuf = read_field(ios, std::mem::offset_of!(BasicIos, mystrbuf));
+            if (mystate & 6) == 0 && !sb.is_null() {
+                let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambuf, vtable));
+                if !vtable.is_null() {
+                    let seekoff = std::ptr::read_unaligned(vtable.add(10)).0 as usize;
+                    if seekoff != 0 {
+                        let _ = crate::call_guest8(
+                            seekoff,
+                            sb as u64,
+                            &mut local_out as *mut [i64; 3] as u64,
+                            0,
+                            1, // ios_base::cur
+                            1, // ios_base::in
+                            0,
+                            0,
+                            0,
+                        );
+                    }
+                }
+            }
+        }
+    }
     if !out.is_null() {
-        std::ptr::write_unaligned(out, [0, 0, 0]);
+        std::ptr::write_unaligned(out, local_out);
     }
     out
 }
@@ -4391,9 +4541,11 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?_CallInContext@_ContextCallback@details@Concurrency@@QEBAXV?$function@$$A6AXXZ@std@@_N@Z", ptr: Ptr(call_in_context as *const ()) },
     Export { name: "?_Capture@_ContextCallback@details@Concurrency@@AEAAXXZ", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?_Decref@facet@locale@std@@UEAAPEAV_Facet_base@3@XZ", ptr: Ptr(facet_decref as *const ()) },
+    Export { name: "?_Execute_once@std@@YAHAEAUonce_flag@1@P6AHPEAX1PEAPEAX@Z1@Z", ptr: Ptr(execute_once as *const ()) },
     Export { name: "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z", ptr: Ptr(fiopen_a as *const ()) },
     Export { name: "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z", ptr: Ptr(fiopen_w as *const ()) },
     Export { name: "?_Getcat@?$codecvt@DDU_Mbstatet@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(codecvt_d_getcat as *const ()) },
+    Export { name: "?_Getcat@?$codecvt@_WDU_Mbstatet@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(codecvt_w_getcat as *const ()) },
     Export { name: "?_Getcat@?$ctype@D@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(ctype_getcat as *const ()) },
     Export { name: "?_Getcat@?$ctype@_W@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(ctype_w_getcat as *const ()) },
     Export { name: "?_Getcat@?$time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(time_put_getcat as *const ()) },
@@ -4447,6 +4599,7 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?_W_Getdays@_Locinfo@std@@QEBAPEBGXZ", ptr: Ptr(locinfo_w_getdays as *const ()) },
     Export { name: "?_W_Getmonths@_Locinfo@std@@QEBAPEBGXZ", ptr: Ptr(locinfo_w_getmonths as *const ()) },
     Export { name: "?_Winerror_map@std@@YAHH@Z", ptr: Ptr(winerror_map as *const ()) },
+    Export { name: "?_XGetLastError@std@@YAXXZ", ptr: Ptr(xget_last_error as *const ()) },
     Export { name: "?_Xbad_alloc@std@@YAXXZ", ptr: Ptr(xbad_alloc as *const ()) },
     Export { name: "?_Xbad_function_call@std@@YAXXZ", ptr: Ptr(xbad_function_call as *const ()) },
     Export { name: "?_Xinvalid_argument@std@@YAXPEBD@Z", ptr: Ptr(xinvalid_argument as *const ()) },
@@ -4475,6 +4628,7 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?egptr@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_egptr as *const ()) },
     Export { name: "?epptr@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ", ptr: Ptr(streambuf_epptr as *const ()) },
     Export { name: "?epptr@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_epptr as *const ()) },
+    Export { name: "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAADD@Z", ptr: Ptr(ios_fill_set as *const ()) },
     Export { name: "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBADXZ", ptr: Ptr(ios_fill_get as *const ()) },
     Export { name: "?fill@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAA_W_W@Z", ptr: Ptr(ios_w_fill_set as *const ()) },
     Export { name: "?fill@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEBA_WXZ", ptr: Ptr(ios_w_fill_get as *const ()) },
@@ -4518,6 +4672,7 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?rdbuf@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEBAPEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@2@XZ", ptr: Ptr(ios_w_rdbuf_get as *const ()) },
     Export { name: "?read@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@PEAD_J@Z", ptr: Ptr(istream_read as *const ()) },
     Export { name: "?sbumpc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAAHXZ", ptr: Ptr(streambuf_sbumpc as *const ()) },
+    Export { name: "?seekg@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@V?$fpos@U_Mbstatet@@@2@@Z", ptr: Ptr(istream_seekg_pos as *const ()) },
     Export { name: "?seekg@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@_JH@Z", ptr: Ptr(istream_seekg as *const ()) },
     Export { name: "?seekoff@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA?AV?$fpos@U_Mbstatet@@@2@_JHH@Z", ptr: Ptr(streambuf_seekoff as *const ()) },
     Export { name: "?seekpos@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA?AV?$fpos@U_Mbstatet@@@2@V32@H@Z", ptr: Ptr(streambuf_seekpos as *const ()) },
@@ -4921,6 +5076,228 @@ mod tests {
 
             ios_dtor(ios);
             streambuf_dtor(&mut sb);
+        }
+    }
+
+    #[test]
+    fn fill_seekg_tellg_codecvt_w_getcat_and_execute_once() {
+        use std::sync::atomic::AtomicI32;
+
+        static SEEKOFF_CALLS: AtomicI32 = AtomicI32::new(0);
+        static SEEKPOS_CALLS: AtomicI32 = AtomicI32::new(0);
+        static LAST_SEEKOFF_ARGS: Mutex<(i64, i32, i32)> = Mutex::new((0, 0, 0));
+        static LAST_SEEKPOS_ARGS: Mutex<([i64; 3], i32)> = Mutex::new(([0, 0, 0], 0));
+        static CUR_POS: AtomicI32 = AtomicI32::new(12);
+
+        unsafe extern "win64" fn custom_seekoff(
+            _this: *mut BasicStreambuf,
+            out: *mut [i64; 3],
+            off: i64,
+            way: i32,
+            mode: i32,
+        ) -> *mut [i64; 3] {
+            SEEKOFF_CALLS.fetch_add(1, Ordering::SeqCst);
+            *LAST_SEEKOFF_ARGS.lock().unwrap() = (off, way, mode);
+            let next = match way {
+                0 => off,                                               // beg
+                1 => CUR_POS.load(Ordering::SeqCst) as i64 + off,       // cur
+                2 => 100 + off,                                         // end
+                _ => -1,
+            };
+            if next < 0 {
+                std::ptr::write_unaligned(out, [-1, 0, 0]);
+            } else {
+                CUR_POS.store(next as i32, Ordering::SeqCst);
+                std::ptr::write_unaligned(out, [next, 0, 0]);
+            }
+            out
+        }
+
+        unsafe extern "win64" fn custom_seekpos(
+            _this: *mut BasicStreambuf,
+            out: *mut [i64; 3],
+            pos: *const [i64; 3],
+            mode: i32,
+        ) -> *mut [i64; 3] {
+            SEEKPOS_CALLS.fetch_add(1, Ordering::SeqCst);
+            let p = std::ptr::read_unaligned(pos);
+            *LAST_SEEKPOS_ARGS.lock().unwrap() = (p, mode);
+            let total = p[0].wrapping_add(p[1]);
+            if total < 0 {
+                std::ptr::write_unaligned(out, [-1, 0, 0]);
+            } else {
+                CUR_POS.store(total as i32, Ordering::SeqCst);
+                std::ptr::write_unaligned(out, [total, 0, p[2]]);
+            }
+            out
+        }
+
+        unsafe {
+            // 1. Export resolution for all 5 new msvcp140 symbols.
+            for sym in [
+                "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAADD@Z",
+                "?seekg@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@V?$fpos@U_Mbstatet@@@2@@Z",
+                "?_Getcat@?$codecvt@_WDU_Mbstatet@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z",
+                "?_XGetLastError@std@@YAXXZ",
+                "?_Execute_once@std@@YAHAEAUonce_flag@1@P6AHPEAX1PEAPEAX@Z1@Z",
+            ] {
+                assert!(crate::lookup("msvcp140.dll", sym).is_some(), "missing {sym}");
+            }
+
+            // 2. basic_ios<char>::fill(char) on unaligned BasicIos + null safety.
+            assert_eq!(ios_fill_set(std::ptr::null_mut(), b'*'), b' ');
+            let mut raw_ios = vec![0u8; std::mem::size_of::<BasicIos>() + 8];
+            let u_ios = raw_ios.as_mut_ptr().add(3) as *mut BasicIos;
+            assert!(!u_ios.is_aligned());
+            ios_ctor(u_ios);
+            ios_init(u_ios, std::ptr::null_mut());
+            assert_eq!(ios_fill_get(u_ios), b' ');
+            assert_eq!(ios_fill_set(u_ios, b'0'), b' ');
+            assert_eq!(ios_fill_get(u_ios), b'0');
+            assert_eq!(ios_fill_set(u_ios, b'_'), b'0');
+            assert_eq!(ios_fill_get(u_ios), b'_');
+            ios_dtor(u_ios);
+
+            // 3. codecvt<wchar_t, char, _Mbstatet>::_Getcat + unaligned ctors.
+            let mut raw_ppf = [0u8; std::mem::size_of::<*const Facet>() + 8];
+            let u_ppf = raw_ppf.as_mut_ptr().add(3) as *mut *const Facet;
+            assert!(!u_ppf.is_aligned());
+            std::ptr::write_unaligned(u_ppf, std::ptr::null());
+            assert_eq!(codecvt_w_getcat(u_ppf, std::ptr::null()), 2);
+            let fac = std::ptr::read_unaligned(u_ppf);
+            assert!(!fac.is_null());
+            let cw = fac as *mut CodecvtW;
+            assert_eq!(read_field::<_, *const Ptr>(cw, std::mem::offset_of!(CodecvtW, vtable)), CODECVT_W_VTABLE.as_ptr());
+            assert_eq!(read_field::<_, u32>(cw, std::mem::offset_of!(CodecvtW, refs)), 0);
+            // Calling _Getcat again when *ppf is non-null must not overwrite it.
+            assert_eq!(codecvt_w_getcat(u_ppf, std::ptr::null()), 2);
+            assert_eq!(std::ptr::read_unaligned(u_ppf), fac);
+            // Verify codecvt_w_in works on the allocated facet.
+            let src = b"Hi";
+            let mut fnxt: *const u8 = std::ptr::null();
+            let mut dst = [0u16; 2];
+            let mut tnxt: *mut u16 = std::ptr::null_mut();
+            let mut st = 0u64;
+            assert_eq!(
+                codecvt_w_in(cw, &mut st, src.as_ptr(), src.as_ptr().add(2), &mut fnxt, dst.as_mut_ptr(), dst.as_mut_ptr().add(2), &mut tnxt),
+                0
+            );
+            assert_eq!(dst, [b'H' as u16, b'i' as u16]);
+            codecvt_deleting_dtor(fac as *mut Facet, 1);
+
+            let mut raw_cw = vec![0u8; std::mem::size_of::<CodecvtW>() + 8];
+            let u_cw = raw_cw.as_mut_ptr().add(1) as *mut CodecvtW;
+            assert!(!u_cw.is_aligned());
+            codecvt_w_ctor(u_cw, 3);
+            assert_eq!(read_field::<_, u32>(u_cw, std::mem::offset_of!(CodecvtW, refs)), 3);
+
+            let mut raw_cu32 = vec![0u8; std::mem::size_of::<CodecvtU32>() + 8];
+            let u_cu32 = raw_cu32.as_mut_ptr().add(1) as *mut CodecvtU32;
+            assert!(!u_cu32.is_aligned());
+            codecvt_u32_ctor(u_cu32, 2);
+            assert_eq!(read_field::<_, u32>(u_cu32, std::mem::offset_of!(CodecvtU32, maxcode)), 0x10ffff);
+
+            // 4. basic_istream<char>::seekg(fpos), seekg(off, way), and tellg() on unaligned objects.
+            SEEKOFF_CALLS.store(0, Ordering::SeqCst);
+            SEEKPOS_CALLS.store(0, Ordering::SeqCst);
+            CUR_POS.store(12, Ordering::SeqCst);
+
+            let mut custom_vt = BASIC_STREAMBUF_VTABLE;
+            custom_vt[10] = Ptr(custom_seekoff as *const ());
+            custom_vt[11] = Ptr(custom_seekpos as *const ());
+
+            let mut raw_sb = vec![0u8; std::mem::size_of::<BasicStreambuf>() + 8];
+            let u_sb = raw_sb.as_mut_ptr().add(3) as *mut BasicStreambuf;
+            assert!(!u_sb.is_aligned());
+            streambuf_ctor(u_sb);
+            write_field(u_sb, std::mem::offset_of!(BasicStreambuf, vtable), custom_vt.as_ptr());
+
+            let mut raw_istr = vec![0u8; 0x18 + std::mem::size_of::<BasicIos>() + 8];
+            let u_istr = raw_istr.as_mut_ptr().add(5);
+            istream_ctor(u_istr, u_sb, 0, 1);
+            let istr_ios = stream_ios(u_istr);
+            assert!(!istr_ios.is_aligned());
+
+            // tellg dispatches vtable[10] with (0, cur=1, in=1) into unaligned fpos output.
+            let mut raw_pos = [0u8; 24 + 8];
+            let u_pos = raw_pos.as_mut_ptr().add(3) as *mut [i64; 3];
+            assert!(!u_pos.is_aligned());
+            assert_eq!(istream_tellg(u_istr, u_pos), u_pos);
+            assert_eq!(std::ptr::read_unaligned(u_pos), [12, 0, 0]);
+            assert_eq!(*LAST_SEEKOFF_ARGS.lock().unwrap(), (0, 1, 1));
+
+            // seekg(fpos) clears eofbit first and invokes vtable[11] with mode=in(1).
+            ios_setstate(istr_ios, 1, 0); // eofbit
+            assert_eq!(ios_good(istr_ios), 0);
+            std::ptr::write_unaligned(u_pos, [42, 0, 7]);
+            assert_eq!(istream_seekg_pos(u_istr, u_pos), u_istr);
+            assert_eq!(ios_good(istr_ios), 1);
+            assert_eq!(*LAST_SEEKPOS_ARGS.lock().unwrap(), ([42, 0, 7], 1));
+            assert_eq!(CUR_POS.load(Ordering::SeqCst), 42);
+
+            // seekg(off, way) clears eofbit and invokes vtable[10] with (off, way, in=1).
+            ios_setstate(istr_ios, 1, 0);
+            assert_eq!(istream_seekg(u_istr, -10, 2 /* end */), u_istr);
+            assert_eq!(ios_good(istr_ios), 1);
+            assert_eq!(*LAST_SEEKOFF_ARGS.lock().unwrap(), (-10, 2, 1));
+            assert_eq!(CUR_POS.load(Ordering::SeqCst), 90);
+
+            // seekg(fpos(-1)) sets failbit (2); subsequent tellg returns [-1, 0, 0] and
+            // subsequent seekg(pos) does not invoke seekpos while failbit is set.
+            std::ptr::write_unaligned(u_pos, [-1, 0, 0]);
+            istream_seekg_pos(u_istr, u_pos);
+            assert_eq!(read_field::<_, i32>(istr_ios, std::mem::offset_of!(BasicIos, mystate)) & 2, 2);
+            let prev_seekpos = SEEKPOS_CALLS.load(Ordering::SeqCst);
+            let prev_seekoff = SEEKOFF_CALLS.load(Ordering::SeqCst);
+            std::ptr::write_unaligned(u_pos, [5, 0, 0]);
+            istream_seekg_pos(u_istr, u_pos);
+            assert_eq!(SEEKPOS_CALLS.load(Ordering::SeqCst), prev_seekpos);
+            istream_tellg(u_istr, u_pos);
+            assert_eq!(std::ptr::read_unaligned(u_pos), [-1, 0, 0]);
+            assert_eq!(SEEKOFF_CALLS.load(Ordering::SeqCst), prev_seekoff);
+
+            // Clear failbit and verify null pos sets failbit.
+            ios_clear(istr_ios, 0, 0);
+            istream_seekg_pos(u_istr, std::ptr::null());
+            assert_eq!(read_field::<_, i32>(istr_ios, std::mem::offset_of!(BasicIos, mystate)) & 2, 2);
+
+            ios_dtor(istr_ios);
+            streambuf_dtor(u_sb);
+
+            // 5. std::_Execute_once: null validation, retry on failure, single execution on success, unaligned flag.
+            unsafe extern "win64" fn once_cb(
+                _once: *mut c_void,
+                param: *mut c_void,
+                _ctx: *mut *mut c_void,
+            ) -> i32 {
+                let state = &*(param as *const AtomicI32);
+                let prev = state.fetch_add(1, Ordering::SeqCst);
+                if prev == 0 { 0 } else { 1 } // Fail first attempt, succeed second.
+            }
+
+            crate::teb::set_last_error(0);
+            assert_eq!(execute_once(std::ptr::null_mut(), Some(once_cb), std::ptr::null_mut()), 0);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_PARAMETER);
+
+            let mut raw_flag = [0u8; 16];
+            let u_flag = raw_flag.as_mut_ptr().add(3) as *mut c_void;
+            assert!(!(u_flag as *const usize).is_aligned());
+            crate::teb::set_last_error(0);
+            assert_eq!(execute_once(u_flag, None, std::ptr::null_mut()), 0);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_PARAMETER);
+
+            let calls = AtomicI32::new(0);
+            let param = (&calls as *const AtomicI32) as *mut c_void;
+            // First call returns 0 (failed init), leaving flag retryable.
+            assert_eq!(execute_once(u_flag, Some(once_cb), param), 0);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            // Second call succeeds and marks once_flag complete.
+            assert_eq!(execute_once(u_flag, Some(once_cb), param), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            // Subsequent calls return 1 without re-running callback.
+            assert_eq!(execute_once(u_flag, Some(once_cb), param), 1);
+            assert_eq!(execute_once(u_flag, Some(once_cb), param), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
         }
     }
 }
