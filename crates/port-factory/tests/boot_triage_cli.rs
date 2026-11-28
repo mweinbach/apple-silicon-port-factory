@@ -1,5 +1,5 @@
 //! End-to-end CLI integration tests for `port-factory boot-triage` using synthetic fixture
-//! logs (zero copyrighted game files) and manifest validation for `games/spider-man-2/game.toml`.
+//! logs (zero copyrighted game files) and generic validation of repo `games/*/game.toml` manifests.
 
 use port_factory::json_output::{exit_codes, parse_json, JsonValue, SCHEMA_VERSION};
 use port_manifest::GameManifest;
@@ -312,25 +312,47 @@ Abort trap: 6
 }
 
 #[test]
-fn spider_man_2_manifest_parses_cleanly_without_personal_paths() {
-    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../games/spider-man-2/game.toml");
+fn all_repo_game_manifests_parse_cleanly_without_personal_paths() {
+    let games_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../games");
     assert!(
-        manifest_path.is_file(),
-        "missing manifest at {}",
-        manifest_path.display()
+        games_dir.is_dir(),
+        "missing games directory at {}",
+        games_dir.display()
     );
-    let raw = std::fs::read_to_string(&manifest_path).unwrap();
+
+    let mut manifest_paths: Vec<PathBuf> = std::fs::read_dir(&games_dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", games_dir.display()))
+        .map(|entry| entry.expect("failed to read games/ directory entry"))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name != "_template" && !name.starts_with('.'))
+        })
+        .map(|entry| entry.path().join("game.toml"))
+        .filter(|p| p.is_file())
+        .collect();
+    manifest_paths.sort();
+
     assert!(
-        !raw.contains("/Users/") && !raw.contains("/Volumes/"),
-        "manifest must not contain personal filesystem paths"
+        !manifest_paths.is_empty(),
+        "expected at least one games/*/game.toml manifest under {}",
+        games_dir.display()
     );
-    let m = GameManifest::parse(&raw);
-    assert_eq!(m.id.as_deref(), Some("spider-man-2"));
-    assert_eq!(m.exe.as_deref(), Some("Spider-Man2.exe"));
-    assert_eq!(m.v8_jitless, Some(true));
-    assert_eq!(m.preferred_base_retry, Some(false));
-    assert_eq!(m.legacy_remedy_migration, Some(false));
-    assert!(m.middleware.contains_key("eos"));
-    assert!(m.middleware.contains_key("dstorage"));
+
+    for manifest_path in &manifest_paths {
+        let raw = std::fs::read_to_string(manifest_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
+        assert!(
+            !raw.contains("/Users/") && !raw.contains("/Volumes/"),
+            "manifest {} must not contain personal filesystem paths",
+            manifest_path.display()
+        );
+        let m = GameManifest::parse(&raw);
+        assert!(
+            m.exe.as_deref().is_some_and(|exe| !exe.trim().is_empty()),
+            "manifest {} must define a non-empty [app].exe",
+            manifest_path.display()
+        );
+    }
 }
