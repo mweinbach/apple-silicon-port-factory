@@ -385,6 +385,7 @@ fn audit_and_verify_commands_emit_valid_json_and_canonical_exit_codes() {
         .parent()
         .unwrap();
     std::os::unix::fs::symlink(repo_root.join("crates"), fake_ws.join("crates")).unwrap();
+    std::os::unix::fs::symlink(repo_root.join("docs"), fake_ws.join("docs")).unwrap();
     std::fs::create_dir_all(fake_ws.join("db")).unwrap();
     for tsv in [
         "ops_x86_to_arm64.tsv",
@@ -392,6 +393,9 @@ fn audit_and_verify_commands_emit_valid_json_and_canonical_exit_codes() {
         "shader_formats.tsv",
         "game_profiles.tsv",
         "stub_inventory.tsv",
+        "isa_coverage.tsv",
+        "a64_emitter_matches.tsv",
+        "a64_encodings.tsv",
     ] {
         std::fs::copy(repo_root.join("db").join(tsv), fake_ws.join("db").join(tsv)).unwrap();
     }

@@ -11,6 +11,7 @@
 //! - `verify`: `.app` self-containment & portability verifier
 //! - `html`: interactive HTML library browser & CLI report formatting
 
+mod acquire_manifest;
 mod discovery;
 mod download;
 mod html;
@@ -22,6 +23,12 @@ mod verify;
 mod tests;
 
 pub use crate::bundle_common::{copy_ios_shader_cache, copy_portable_shader_cache};
+pub use acquire_manifest::{
+    format_game_toml_args, is_numeric_steam_app_id, is_valid_app_id, is_valid_store_name,
+    load_acquire_manifest, load_acquire_manifest_in_dir, parse_acquire_manifest,
+    redact_launch_args, sanitize_acquire_manifest_json, AcquireManifest, AcquireRedistItem,
+    ACQUIRE_MANIFEST_FILENAME, ACQUIRE_MANIFEST_SCHEMA_VERSION,
+};
 pub use discovery::{
     default_apps_dir, default_steam_downloads_dir, known_steam_app_metadata,
     resolve_steam_target_app_id, sanitize_game_title, scan_all_steam_libraries,
@@ -37,17 +44,18 @@ pub use download::{
 pub use html::{format_steam_scan_report, write_steam_browser_html};
 pub use macos_bundle::{
     convert_steam_game, dxilconv_candidates, find_repo_game_manifest,
-    generate_bundle_launcher_source, generate_game_manifest_toml, generate_info_plist,
-    is_macho_file, metal_irconverter_candidates, moltenvk_candidates, parse_vtool_macos_versions,
+    generate_bundle_game_manifest_toml, generate_bundle_launcher_source,
+    generate_game_manifest_toml, generate_info_plist, is_macho_file,
+    metal_irconverter_candidates, moltenvk_candidates, parse_vtool_macos_versions,
     stage_bundle_frameworks, stage_bundle_frameworks_with_env, BundleLauncherConfig,
-    ConversionFormat, FrameworkDiscoveryEnv, StagedFrameworks, SteamConvertOptions,
-    SteamConvertResult,
+    BundleManifestInput, BundleStageTimings, ConversionFormat, FrameworkDiscoveryEnv,
+    StagedFrameworks, SteamConvertOptions, SteamConvertResult,
 };
 pub use vdf::{
     apply_post_install, parse_installscript_vdf, parse_vdf, scan_post_install, PostInstallSummary,
     SteamRegistryEntry, VdfValue,
 };
 pub use verify::{
-    format_bundle_verify_report, verify_app_bundle, BundleCheck, BundleCheckStatus,
-    BundleVerifyReport,
+    format_bundle_verify_report, verify_app_bundle, verify_app_bundle_with_options, BundleCheck,
+    BundleCheckStatus, BundleVerifyReport, VerifyBundleOptions,
 };

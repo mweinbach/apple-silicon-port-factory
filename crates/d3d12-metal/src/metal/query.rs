@@ -1,22 +1,74 @@
 //! Query heaps.
 //!
-//! * Timestamps (`TIMESTAMP`, `COPY_QUEUE_TIMESTAMP`): an `MTL4CounterHeap`
-//!   of type timestamp; `EndQuery` writes a GPU timestamp, `ResolveQueryData`
-//!   resolves into the destination buffer as u64 ticks of
-//!   [`timestamp_frequency`].
-//! * Occlusion: a shared visibility-result buffer (one u64 per query).
-//!   `BeginQuery` zeroes the slot and arms it; render passes opened while a
-//!   query is active get the buffer (accumulate mode) and count into the
-//!   slot; `ResolveQueryData` copies the slots. Binary occlusion uses
-//!   Metal's boolean mode, which writes "nonzero" rather than exactly 1.
+//! * Timestamps (`TIMESTAMP`, `COPY_QUEUE_TIMESTAMP`):
+//!   - Heaps with `count <= MAX_DIRECT_COUNTER_HEAP_ENTRIES` (`4096`, Apple AGX's
+//!     per-`MTL4CounterHeap` hardware limit) use a direct `MTL4CounterHeap`:
+//!     `EndQuery` writes a GPU timestamp, `ResolveQueryData` resolves into the
+//!     destination buffer as u64 ticks of [`timestamp_frequency`].
+//!   - Heaps with `count > 4096` (e.g. 1M entries = 8 MiB) or created when the
+//!     ~32-heap per-process hardware ceiling is reached use a GPU-resident
+//!     backing `MTLBuffer` (`count * 8` bytes) fed by a lazily initialized shared
+//!     scratch `MTL4CounterHeap` ring via real Metal 4 `writeTimestamp` +
+//!     `resolveCounterHeap`, and `ResolveQueryData` copies the resolved u64
+//!     ticks from the backing buffer into the destination buffer.
+//! * Occlusion (`OCCLUSION`, supporting `D3D12_QUERY_TYPE_OCCLUSION` and
+//!   `D3D12_QUERY_TYPE_BINARY_OCCLUSION`):
+//!   - Backed by shared visibility-result `MTLBuffer` chunks (8 bytes per query,
+//!     at most `MAX_VIS_CHUNK_ENTRIES` = 32,768 entries / 256 KiB per chunk so
+//!     `MTL4RenderCommandEncoder::setVisibilityResultMode:offset:` stays within
+//!     Apple AGX's 15-bit hardware slot index limit without wrap-around).
+//!   - `BeginQuery` arms the slot with `MTLVisibilityResultMode::Counting` or
+//!     `Boolean`; `EndQuery` disarms it (zero-filling 0-draw queries);
+//!     `ResolveQueryData` copies u64 sample counts for `OCCLUSION` or normalizes
+//!     each u64 slot to strictly `0` or `1` for `BINARY_OCCLUSION`.
 //! * Pipeline statistics: not implemented (the callers trap).
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::*;
+use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 pub type MtlCounterHeap = ProtocolObject<dyn MTL4CounterHeap>;
+
+/// Maximum entries per visibility-result `MTLBuffer` chunk (`32,768 * 8 = 256 KiB`).
+///
+/// Apple AGX hardware truncates `setVisibilityResultMode:offset:` slot indices to
+/// 15 bits (`offset < 262_144`), silently wrapping indices `>= 32_768` back into
+/// `index % 32_768` with no Metal validation error. Chunking at 32,768 keeps
+/// every query index from `0` to millions strictly in bounds.
+pub const MAX_VIS_CHUNK_ENTRIES: u32 = 32_768;
+
+/// Maximum entries Apple AGX supports in a single `MTL4CounterHeap`.
+pub const MAX_DIRECT_COUNTER_HEAP_ENTRIES: u32 = 4096;
+
+/// Number of entries per scratch `MTL4CounterHeap` in [`TimestampScratchPool`].
+pub(crate) const SCRATCH_HEAP_ENTRIES: usize = MAX_DIRECT_COUNTER_HEAP_ENTRIES as usize;
+
+/// Number of exclusively-owned scratch slots leased to a single command list recording.
+///
+/// Each 4096-entry `MTL4CounterHeap` supplies `64` disjoint leases. A command list
+/// flushes and reuses only its own lease when it fills all `64` slots, and keeps the
+/// lease pinned to its `CommandAllocator` until `CommandAllocator::reset()` (GPU
+/// completion), preventing both recording-time interleaving collisions and in-flight
+/// GPU execution races across command lists.
+pub const SCRATCH_SLICE_LEN: usize = 64;
+const SLICES_PER_HEAP: usize = SCRATCH_HEAP_ENTRIES / SCRATCH_SLICE_LEN;
+const _: () = assert!(SCRATCH_HEAP_ENTRIES % SCRATCH_SLICE_LEN == 0);
+/// Maximum number of shared scratch `MTL4CounterHeap`s allocated on demand
+/// (`4 * 64 = 256` simultaneous in-flight command-list leases while leaving >=20
+/// AGX counter heaps free even alongside `passtiming`).
+const MAX_SCRATCH_HEAPS: usize = 4;
+
+/// Soft cap on simultaneous direct `MTL4CounterHeap`s allocated by small
+/// `QueryHeap(TIMESTAMP)` requests. Apple AGX enforces a ~32-heap per-process
+/// ceiling (`passtiming` reserves 8), so capping direct heaps at 16 leaves
+/// headroom for [`TimestampScratchPool`] (up to 4 heaps) so overflow and large
+/// staged timestamp heaps remain usable even after many small heaps are created.
+const MAX_DIRECT_TIMESTAMP_HEAPS: usize = 16;
+static LIVE_DIRECT_TIMESTAMP_HEAPS: AtomicUsize = AtomicUsize::new(0);
 
 /// `D3D12_QUERY_HEAP_TYPE`.
 pub mod heap_type {
@@ -34,59 +86,396 @@ pub mod query_type {
     pub const TIMESTAMP: u32 = 2;
 }
 
+/// Error returned by [`QueryHeap::try_new`], separating argument validation
+/// (`E_INVALIDARG`) from real Metal allocation failures (`E_OUTOFMEMORY`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryHeapError {
+    InvalidArg(String),
+    OutOfMemory(String),
+}
+
+impl fmt::Display for QueryHeapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidArg(s) | Self::OutOfMemory(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for QueryHeapError {}
+
+impl From<QueryHeapError> for String {
+    fn from(e: QueryHeapError) -> Self {
+        e.to_string()
+    }
+}
+
+struct ScratchPoolInner {
+    heaps: Vec<Retained<MtlCounterHeap>>,
+    /// Free `(heap_idx, slice_idx)` pairs available for exclusive lease.
+    free_slices: Vec<(u8, u16)>,
+}
+
+/// Lazily initialized shared pool of hardware `MTL4CounterHeap` slices feeding
+/// large (`count > 4096`) or overflow timestamp query heaps.
+///
+/// Each active command list recording leases an exclusively-owned `SCRATCH_SLICE_LEN`
+/// slice and retains ownership on its `CommandAllocator` until reset/drop, so no
+/// other command list can overwrite an unresolved or in-flight scratch slot.
+pub(crate) struct TimestampScratchPool {
+    inner: Mutex<ScratchPoolInner>,
+}
+unsafe impl Send for TimestampScratchPool {}
+unsafe impl Sync for TimestampScratchPool {}
+
+/// Exclusively-owned `SCRATCH_SLICE_LEN`-slot slice of a hardware `MTL4CounterHeap`.
+/// Automatically returned to [`TimestampScratchPool`] on drop.
+pub struct TimestampScratchLease {
+    heap: Retained<MtlCounterHeap>,
+    heap_idx: u8,
+    slice_idx: u16,
+    base_slot: u16,
+    pool: &'static TimestampScratchPool,
+}
+unsafe impl Send for TimestampScratchLease {}
+unsafe impl Sync for TimestampScratchLease {}
+
+impl TimestampScratchLease {
+    #[inline]
+    pub(crate) fn heap_retained(&self) -> Retained<MtlCounterHeap> {
+        self.heap.clone()
+    }
+
+    #[inline]
+    pub(crate) fn base_slot(&self) -> usize {
+        self.base_slot as usize
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        SCRATCH_SLICE_LEN
+    }
+
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> (u8, u16) {
+        (self.heap_idx, self.slice_idx)
+    }
+}
+
+impl Drop for TimestampScratchLease {
+    fn drop(&mut self) {
+        self.pool.release_slice(self.heap_idx, self.slice_idx);
+    }
+}
+
+impl TimestampScratchPool {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(ScratchPoolInner {
+                heaps: Vec::new(),
+                free_slices: Vec::new(),
+            }),
+        }
+    }
+
+    fn alloc_counter_heap(heap_idx: usize) -> Result<Retained<MtlCounterHeap>, String> {
+        let d = super::device().ok_or_else(|| "no Metal 4 device".to_string())?;
+        let entry = d.dev.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
+        if entry != 8 {
+            return Err(format!("timestamp heap entries are {entry} bytes, expected 8"));
+        }
+        let desc = MTL4CounterHeapDescriptor::new();
+        desc.setType(MTL4CounterHeapType::Timestamp);
+        unsafe { desc.setCount(SCRATCH_HEAP_ENTRIES) };
+        let h = d
+            .dev
+            .newCounterHeapWithDescriptor_error(&desc)
+            .map_err(|e| format!("newCounterHeap(timestamp scratch {heap_idx}, {SCRATCH_HEAP_ENTRIES}): {e}"))?;
+        h.setLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+            "port timestamp scratch {heap_idx}"
+        ))));
+        Ok(h)
+    }
+
+    /// Ensure at least one hardware scratch `MTL4CounterHeap` is initialized.
+    ///
+    /// Unlike `OnceLock<Result<..>>`, transient allocation failures are never
+    /// cached: if AGX's counter-heap budget is temporarily exhausted and later
+    /// freed, subsequent calls retry cleanly and succeed.
+    pub(crate) fn ensure_ready(&self) -> Result<(), String> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.heaps.is_empty() {
+            return Ok(());
+        }
+        let h0 = Self::alloc_counter_heap(0)?;
+        g.heaps.push(h0);
+        g.free_slices.reserve(SLICES_PER_HEAP);
+        for s in (0..SLICES_PER_HEAP).rev() {
+            g.free_slices.push((0, s as u16));
+        }
+        Ok(())
+    }
+
+    /// Lease an exclusively-owned `SCRATCH_SLICE_LEN`-slot slice, lazily growing the
+    /// pool up to `MAX_SCRATCH_HEAPS` if all existing slices are currently checked out.
+    pub(crate) fn acquire_lease(&'static self) -> Result<TimestampScratchLease, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.free_slices.is_empty() {
+            if g.heaps.len() >= MAX_SCRATCH_HEAPS {
+                return Err(format!(
+                    "timestamp scratch pool exhausted ({} slices across {} heaps all leased by active/in-flight command lists)",
+                    g.heaps.len() * SLICES_PER_HEAP,
+                    g.heaps.len()
+                ));
+            }
+            let next_idx = g.heaps.len();
+            let h = Self::alloc_counter_heap(next_idx)?;
+            g.heaps.push(h);
+            for s in (0..SLICES_PER_HEAP).rev() {
+                g.free_slices.push((next_idx as u8, s as u16));
+            }
+        }
+        let (heap_idx, slice_idx) = g.free_slices.pop().unwrap();
+        let heap = g.heaps[heap_idx as usize].clone();
+        Ok(TimestampScratchLease {
+            heap,
+            heap_idx,
+            slice_idx,
+            base_slot: (slice_idx as usize * SCRATCH_SLICE_LEN) as u16,
+            pool: self,
+        })
+    }
+
+    fn release_slice(&self, heap_idx: u8, slice_idx: u16) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.free_slices.push((heap_idx, slice_idx));
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, usize) {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (g.heaps.len(), g.free_slices.len())
+    }
+}
+
+pub(crate) fn timestamp_scratch_pool() -> &'static TimestampScratchPool {
+    static POOL: OnceLock<TimestampScratchPool> = OnceLock::new();
+    POOL.get_or_init(TimestampScratchPool::new)
+}
+
+/// One staged GPU timestamp waiting to be resolved from this command list's
+/// exclusively-leased scratch `MTL4CounterHeap` slice into its `QueryHeap`'s
+/// backing `MTLBuffer`.
+pub(crate) struct PendingStagedTimestamp {
+    pub scratch_slot: u16,
+    /// Retains the destination backing buffer until the resolve is encoded.
+    pub _dst_buf: Retained<super::resource::MtlBuffer>,
+    pub dst_gpu_va: u64,
+}
+
+/// Compute `(chunk_index, local_index)` for an occlusion query slot.
+#[inline]
+pub fn visibility_chunk_slot(index: u32) -> (usize, u32) {
+    ((index / MAX_VIS_CHUNK_ENTRIES) as usize, index % MAX_VIS_CHUNK_ENTRIES)
+}
+
+/// Compute the number of visibility-result chunks needed for `count` occlusion queries.
+#[inline]
+pub fn visibility_chunk_count_for(count: u32) -> usize {
+    if count == 0 {
+        0
+    } else {
+        count.div_ceil(MAX_VIS_CHUNK_ENTRIES) as usize
+    }
+}
+
 pub struct QueryHeap {
     pub ty: u32,
     pub count: u32,
+    /// Direct hardware counter heap for small `TIMESTAMP` / `COPY_QUEUE_TIMESTAMP` heaps (`count <= 4096`).
     pub timestamps: Option<Retained<MtlCounterHeap>>,
-    pub visibility: Option<Retained<super::resource::MtlBuffer>>,
+    /// GPU-resident backing buffer (`count * 8` bytes) for large (`count > 4096`) or overflow
+    /// `TIMESTAMP` / `COPY_QUEUE_TIMESTAMP` heaps.
+    pub timestamp_buffer: Option<Retained<super::resource::MtlBuffer>>,
+    /// Chunked 256 KiB visibility-result buffers for `OCCLUSION` heaps (`<= 32,768` entries each).
+    pub visibility_chunks: Vec<Retained<super::resource::MtlBuffer>>,
 }
 unsafe impl Send for QueryHeap {}
 unsafe impl Sync for QueryHeap {}
 
 /// GPU timestamp ticks per second (`GetTimestampFrequency`).
 pub fn timestamp_frequency() -> u64 {
-    super::device().map(|d| d.dev.queryTimestampFrequency()).filter(|&f| f != 0).unwrap_or(1_000_000_000)
+    super::device()
+        .map(|d| d.dev.queryTimestampFrequency())
+        .filter(|&f| f != 0)
+        .unwrap_or(1_000_000_000)
 }
 
 impl QueryHeap {
-    pub fn new(ty: u32, count: u32) -> Result<QueryHeap, String> {
-        let timestamps = match ty {
+    /// Returns `(chunk_buffer, local_index)` for logical occlusion query `index`.
+    #[inline]
+    pub fn visibility_slot(&self, index: u32) -> Option<(&Retained<super::resource::MtlBuffer>, u32)> {
+        if index >= self.count {
+            return None;
+        }
+        let (chunk, local) = visibility_chunk_slot(index);
+        self.visibility_chunks.get(chunk).map(|b| (b, local))
+    }
+
+    /// True if this timestamp heap uses a GPU-resident backing buffer fed by the
+    /// shared scratch `MTL4CounterHeap` ring.
+    #[inline]
+    pub fn is_staged_timestamp(&self) -> bool {
+        self.timestamp_buffer.is_some()
+    }
+
+    /// Create a query heap with distinct validation (`InvalidArg`) vs allocation
+    /// (`OutOfMemory`) errors.
+    pub fn try_new(ty: u32, count: u32) -> Result<QueryHeap, QueryHeapError> {
+        if !matches!(
+            ty,
+            heap_type::OCCLUSION
+                | heap_type::TIMESTAMP
+                | heap_type::PIPELINE_STATISTICS
+                | heap_type::COPY_QUEUE_TIMESTAMP
+                | heap_type::PIPELINE_STATISTICS1
+        ) {
+            return Err(QueryHeapError::InvalidArg(format!("unsupported query heap type {ty}")));
+        }
+        if count == 0 {
+            return Err(QueryHeapError::InvalidArg("query heap count must be > 0".into()));
+        }
+
+        let mut timestamps = None;
+        let mut timestamp_buffer = None;
+        let mut visibility_chunks = Vec::new();
+
+        match ty {
             heap_type::TIMESTAMP | heap_type::COPY_QUEUE_TIMESTAMP => {
-                let d = super::device().ok_or("no device")?;
-                let desc = MTL4CounterHeapDescriptor::new();
-                desc.setType(MTL4CounterHeapType::Timestamp);
-                unsafe { desc.setCount(count.max(1) as usize) };
-                let h = d.dev.newCounterHeapWithDescriptor_error(&desc).map_err(|e| format!("newCounterHeap(timestamp, {count}): {e}"))?;
-                let entry = d.dev.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
-                if entry != 8 {
-                    return Err(format!("timestamp heap entries are {entry} bytes, expected 8"));
+                let d = super::device()
+                    .ok_or_else(|| QueryHeapError::OutOfMemory("no Metal 4 device".into()))?;
+                let mut direct_ok = false;
+                if count <= MAX_DIRECT_COUNTER_HEAP_ENTRIES {
+                    let claimed_direct = LIVE_DIRECT_TIMESTAMP_HEAPS
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                            (cur < MAX_DIRECT_TIMESTAMP_HEAPS).then_some(cur + 1)
+                        })
+                        .is_ok();
+                    if claimed_direct {
+                        let desc = MTL4CounterHeapDescriptor::new();
+                        desc.setType(MTL4CounterHeapType::Timestamp);
+                        unsafe { desc.setCount(count as usize) };
+                        if let Ok(h) = d.dev.newCounterHeapWithDescriptor_error(&desc) {
+                            let entry = d.dev.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
+                            if entry != 8 {
+                                LIVE_DIRECT_TIMESTAMP_HEAPS.fetch_sub(1, Ordering::AcqRel);
+                                return Err(QueryHeapError::OutOfMemory(format!(
+                                    "timestamp heap entries are {entry} bytes, expected 8"
+                                )));
+                            }
+                            timestamps = Some(h);
+                            direct_ok = true;
+                        } else {
+                            LIVE_DIRECT_TIMESTAMP_HEAPS.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
                 }
-                Some(h)
+                if !direct_ok {
+                    timestamp_scratch_pool()
+                        .ensure_ready()
+                        .map_err(QueryHeapError::OutOfMemory)?;
+                    let total_bytes = (count as u64)
+                        .checked_mul(8)
+                        .ok_or_else(|| QueryHeapError::OutOfMemory(format!("timestamp heap byte size overflow ({count})")))?;
+                    let max_buf = d.dev.maxBufferLength() as u64;
+                    if total_bytes > max_buf {
+                        return Err(QueryHeapError::OutOfMemory(format!(
+                            "timestamp query heap ({total_bytes} bytes) exceeds device maxBufferLength ({max_buf})"
+                        )));
+                    }
+                    let bytes = total_bytes as usize;
+                    let b = d
+                        .dev
+                        .newBufferWithLength_options(
+                            bytes,
+                            MTLResourceOptions::StorageModeShared
+                                | MTLResourceOptions::HazardTrackingModeUntracked,
+                        )
+                        .ok_or_else(|| {
+                            QueryHeapError::OutOfMemory(format!(
+                                "newBuffer({bytes}) for a timestamp query heap ({count} entries)"
+                            ))
+                        })?;
+                    unsafe { std::ptr::write_bytes(b.contents().as_ptr() as *mut u8, 0, bytes) };
+                    b.setLabel(Some(&objc2_foundation::NSString::from_str("port timestamp queries")));
+                    d.add_resident(ProtocolObject::from_ref(&*b));
+                    log::debug!(
+                        target: "d3d",
+                        "CreateQueryHeap(timestamp ty={ty}, count={count}): staged backing buffer ({bytes} bytes)"
+                    );
+                    timestamp_buffer = Some(b);
+                }
             }
-            _ => None,
-        };
-        let visibility = match ty {
             heap_type::OCCLUSION => {
-                let d = super::device().ok_or("no device")?;
-                let bytes = count.max(1) as usize * 8;
-                let b = d
-                    .dev
-                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked)
-                    .ok_or_else(|| format!("newBuffer({bytes}) for an occlusion query heap"))?;
-                unsafe { std::ptr::write_bytes(b.contents().as_ptr() as *mut u8, 0, bytes) };
-                b.setLabel(Some(&objc2_foundation::NSString::from_str("port occlusion queries")));
-                d.add_resident(ProtocolObject::from_ref(&*b));
-                Some(b)
+                let d = super::device()
+                    .ok_or_else(|| QueryHeapError::OutOfMemory("no Metal 4 device".into()))?;
+                let total_bytes = (count as u64)
+                    .checked_mul(8)
+                    .ok_or_else(|| QueryHeapError::OutOfMemory(format!("occlusion heap byte size overflow ({count})")))?;
+                let max_buf = d.dev.maxBufferLength() as u64;
+                if total_bytes > max_buf {
+                    return Err(QueryHeapError::OutOfMemory(format!(
+                        "occlusion query heap ({total_bytes} bytes) exceeds device maxBufferLength ({max_buf})"
+                    )));
+                }
+                let n_chunks = visibility_chunk_count_for(count);
+                visibility_chunks.reserve(n_chunks);
+                let mut remaining = count;
+                while remaining > 0 {
+                    let chunk_entries = remaining.min(MAX_VIS_CHUNK_ENTRIES);
+                    let bytes = chunk_entries as usize * 8;
+                    let b = d
+                        .dev
+                        .newBufferWithLength_options(
+                            bytes,
+                            MTLResourceOptions::StorageModeShared
+                                | MTLResourceOptions::HazardTrackingModeUntracked,
+                        )
+                        .ok_or_else(|| {
+                            QueryHeapError::OutOfMemory(format!(
+                                "newBuffer({bytes}) for an occlusion query heap ({count} entries)"
+                            ))
+                        })?;
+                    unsafe { std::ptr::write_bytes(b.contents().as_ptr() as *mut u8, 0, bytes) };
+                    b.setLabel(Some(&objc2_foundation::NSString::from_str("port occlusion queries")));
+                    visibility_chunks.push(b);
+                    remaining -= chunk_entries;
+                }
+                for b in &visibility_chunks {
+                    d.add_resident(ProtocolObject::from_ref(&**b));
+                }
             }
-            _ => None,
-        };
-        Ok(QueryHeap { ty, count, timestamps, visibility })
+            _ => {}
+        }
+
+        Ok(QueryHeap { ty, count, timestamps, timestamp_buffer, visibility_chunks })
+    }
+
+    pub fn new(ty: u32, count: u32) -> Result<QueryHeap, String> {
+        Self::try_new(ty, count).map_err(Into::into)
     }
 }
 
 impl Drop for QueryHeap {
     fn drop(&mut self) {
-        if let (Some(b), Some(d)) = (&self.visibility, super::device()) {
+        if self.timestamps.take().is_some() {
+            LIVE_DIRECT_TIMESTAMP_HEAPS.fetch_sub(1, Ordering::AcqRel);
+        }
+        let Some(d) = super::device() else { return };
+        if let Some(b) = &self.timestamp_buffer {
+            d.remove_resident(ProtocolObject::from_ref(&**b));
+        }
+        for b in &self.visibility_chunks {
             d.remove_resident(ProtocolObject::from_ref(&**b));
         }
     }
@@ -103,57 +492,336 @@ pub struct ActiveOcclusion {
 impl super::cmdlist::CommandList {
     /// `BeginQuery(OCCLUSION | BINARY_OCCLUSION)`.
     pub fn begin_occlusion(&mut self, heap: &QueryHeap, index: u32, binary: bool) -> Result<(), String> {
-        let b = heap.visibility.as_ref().ok_or("not an occlusion heap")?;
-        if index >= heap.count {
-            return Err(format!("query index {index} out of range ({})", heap.count));
+        if heap.visibility_chunks.is_empty() {
+            return Err("not an occlusion heap".into());
         }
-        self.set_occlusion(Some(ActiveOcclusion { buffer: b.clone(), index, binary }))
+        let (b, local_index) = heap
+            .visibility_slot(index)
+            .ok_or_else(|| format!("query index {index} out of range ({})", heap.count))?;
+        self.set_occlusion(Some(ActiveOcclusion { buffer: b.clone(), index: local_index, binary }))
     }
 
     /// `EndQuery(OCCLUSION | BINARY_OCCLUSION)`.
     pub fn end_occlusion(&mut self, heap: &QueryHeap, index: u32) -> Result<(), String> {
-        if heap.visibility.is_none() {
+        if heap.visibility_chunks.is_empty() {
             return Err("not an occlusion heap".into());
         }
-        self.set_occlusion(None)?;
-        let _ = index;
-        Ok(())
+        if index >= heap.count {
+            return Err(format!("query index {index} out of range ({})", heap.count));
+        }
+        self.set_occlusion(None)
     }
 
-    /// `ResolveQueryData(OCCLUSION | BINARY_OCCLUSION)`.
-    pub fn resolve_occlusion(&mut self, heap: &QueryHeap, start: u32, n: u32, dst: &super::resource::Resource, offset: u64) -> Result<(), String> {
-        let v = heap.visibility.as_ref().ok_or("not an occlusion heap")?.clone();
+    fn resolve_occlusion_inner(
+        &mut self,
+        heap: &QueryHeap,
+        start: u32,
+        n: u32,
+        dst: &super::resource::Resource,
+        offset: u64,
+        binary: bool,
+    ) -> Result<(), String> {
+        if heap.visibility_chunks.is_empty() {
+            return Err("not an occlusion heap".into());
+        }
         if start.checked_add(n).is_none_or(|e| e > heap.count) {
             return Err(format!("queries {start}+{n} out of range ({})", heap.count));
         }
         let d = dst.buffer().ok_or("resolve destination is not a buffer")?;
-        if offset + n as u64 * 8 > d.length() as u64 {
+        let bytes = (n as u64).checked_mul(8).ok_or("resolve size overflow")?;
+        if offset.checked_add(bytes).is_none_or(|e| e > d.length() as u64) {
             return Err("resolve destination too small".into());
         }
-        self.copy_after_render(&v, start as u64 * 8, dst, offset, n as u64 * 8)
+        if n == 0 {
+            return Ok(());
+        }
+        let mut cur = start;
+        let end = start + n;
+        let mut dst_cur = offset;
+        while cur < end {
+            let (chunk_idx, local_start) = visibility_chunk_slot(cur);
+            let take = (end - cur).min(MAX_VIS_CHUNK_ENTRIES - local_start);
+            let v = heap.visibility_chunks[chunk_idx].clone();
+            if binary {
+                self.resolve_binary_after_render(&v, local_start as u64 * 8, dst, dst_cur, take)?;
+            } else {
+                self.copy_after_render(&v, local_start as u64 * 8, dst, dst_cur, take as u64 * 8)?;
+            }
+            cur += take;
+            dst_cur += take as u64 * 8;
+        }
+        Ok(())
+    }
+
+    /// `ResolveQueryData(OCCLUSION)`: copies u64 sample counts into `dst` at `offset`.
+    pub fn resolve_occlusion(
+        &mut self,
+        heap: &QueryHeap,
+        start: u32,
+        n: u32,
+        dst: &super::resource::Resource,
+        offset: u64,
+    ) -> Result<(), String> {
+        self.resolve_occlusion_inner(heap, start, n, dst, offset, false)
+    }
+
+    /// `ResolveQueryData(BINARY_OCCLUSION)`: writes strictly `0u64` or `1u64` per
+    /// query into `dst` at `offset` (matching D3D12 binary-occlusion semantics).
+    pub fn resolve_binary_occlusion(
+        &mut self,
+        heap: &QueryHeap,
+        start: u32,
+        n: u32,
+        dst: &super::resource::Resource,
+        offset: u64,
+    ) -> Result<(), String> {
+        self.resolve_occlusion_inner(heap, start, n, dst, offset, true)
     }
 
     /// `EndQuery(TIMESTAMP)`.
     pub fn write_timestamp(&mut self, heap: &QueryHeap, index: u32) -> Result<(), String> {
-        let h = heap.timestamps.as_deref().ok_or("not a timestamp heap")?;
         if index >= heap.count {
             return Err(format!("query index {index} out of range ({})", heap.count));
         }
-        self.timestamp_into(h, index as usize);
+        if let Some(h) = heap.timestamps.as_deref() {
+            self.timestamp_into(h, index as usize);
+            return Ok(());
+        }
+        let buf = heap.timestamp_buffer.as_ref().ok_or("not a timestamp heap")?;
+        if self.ts_scratch_lease.is_none() {
+            let pool = timestamp_scratch_pool();
+            self.ts_scratch_lease = Some(pool.acquire_lease()?);
+            self.ts_scratch_cursor = 0;
+        }
+        let cap = self.ts_scratch_lease.as_ref().unwrap().len();
+        if self.ts_scratch_cursor >= cap {
+            self.flush_staged_timestamps();
+        }
+        let (scratch_heap, slot) = {
+            let lease = self.ts_scratch_lease.as_ref().unwrap();
+            let slot = lease.base_slot() + self.ts_scratch_cursor;
+            self.ts_scratch_cursor += 1;
+            (lease.heap_retained(), slot)
+        };
+        self.timestamp_into(&scratch_heap, slot);
+        self.pending_staged_ts.push(PendingStagedTimestamp {
+            scratch_slot: slot as u16,
+            _dst_buf: buf.clone(),
+            dst_gpu_va: buf.gpuAddress() + index as u64 * 8,
+        });
         Ok(())
     }
 
     /// `ResolveQueryData(TIMESTAMP)`: u64 ticks into `dst` at `offset`.
-    pub fn resolve_timestamps(&mut self, heap: &QueryHeap, start: u32, n: u32, dst: &super::resource::Resource, offset: u64) -> Result<(), String> {
-        let h = heap.timestamps.as_deref().ok_or("not a timestamp heap")?;
+    pub fn resolve_timestamps(
+        &mut self,
+        heap: &QueryHeap,
+        start: u32,
+        n: u32,
+        dst: &super::resource::Resource,
+        offset: u64,
+    ) -> Result<(), String> {
+        if heap.timestamps.is_none() && heap.timestamp_buffer.is_none() {
+            return Err("not a timestamp heap".into());
+        }
         if start.checked_add(n).is_none_or(|e| e > heap.count) {
             return Err(format!("queries {start}+{n} out of range ({})", heap.count));
         }
         let b = dst.buffer().ok_or("resolve destination is not a buffer")?;
-        if offset + n as u64 * 8 > b.length() as u64 {
+        let bytes = (n as u64).checked_mul(8).ok_or("resolve size overflow")?;
+        if offset.checked_add(bytes).is_none_or(|e| e > b.length() as u64) {
             return Err("resolve destination too small".into());
         }
-        self.resolve_counters(h, NSRange::new(start as usize, n as usize), MTL4BufferRange { bufferAddress: b.gpuAddress() + offset, length: n as u64 * 8 });
-        Ok(())
+        if n == 0 {
+            return Ok(());
+        }
+        if let Some(h) = heap.timestamps.as_deref() {
+            self.resolve_counters(
+                h,
+                NSRange::new(start as usize, n as usize),
+                MTL4BufferRange { bufferAddress: b.gpuAddress() + offset, length: bytes },
+            );
+            return Ok(());
+        }
+        let v = heap.timestamp_buffer.as_ref().unwrap().clone();
+        self.flush_staged_timestamps();
+        self.copy_timestamp_buffer(&v, start as u64 * 8, dst, offset, bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visibility_chunk_mapping_stays_within_15_bit_agx_limit() {
+        assert_eq!(visibility_chunk_count_for(0), 0);
+        assert_eq!(visibility_chunk_count_for(1), 1);
+        assert_eq!(visibility_chunk_count_for(MAX_VIS_CHUNK_ENTRIES), 1);
+        assert_eq!(visibility_chunk_count_for(MAX_VIS_CHUNK_ENTRIES + 1), 2);
+        assert_eq!(visibility_chunk_count_for(1_048_576), 32);
+
+        assert_eq!(visibility_chunk_slot(0), (0, 0));
+        assert_eq!(visibility_chunk_slot(MAX_VIS_CHUNK_ENTRIES - 1), (0, MAX_VIS_CHUNK_ENTRIES - 1));
+        assert_eq!(visibility_chunk_slot(MAX_VIS_CHUNK_ENTRIES), (1, 0));
+        assert_eq!(visibility_chunk_slot(1_048_575), (31, MAX_VIS_CHUNK_ENTRIES - 1));
+    }
+
+    #[test]
+    fn query_heap_validation_rejects_zero_count_and_unknown_type() {
+        assert!(matches!(
+            QueryHeap::try_new(heap_type::OCCLUSION, 0),
+            Err(QueryHeapError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            QueryHeap::try_new(heap_type::TIMESTAMP, 0),
+            Err(QueryHeapError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            QueryHeap::try_new(99, 16),
+            Err(QueryHeapError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn large_1m_occlusion_and_timestamp_heaps_allocate_and_pipeline_stats_preserved() {
+        if super::super::device().is_none() {
+            return;
+        }
+        let occ = QueryHeap::try_new(heap_type::OCCLUSION, 1_048_576)
+            .expect("1M occlusion query heap (8 MiB) must succeed");
+        assert_eq!(occ.visibility_chunks.len(), 32);
+        assert!(occ.timestamps.is_none());
+        assert!(occ.timestamp_buffer.is_none());
+        let (c0, s0) = occ.visibility_slot(0).unwrap();
+        let (c31, s31) = occ.visibility_slot(1_048_575).unwrap();
+        assert_eq!(s0, 0);
+        assert_eq!(s31, MAX_VIS_CHUNK_ENTRIES - 1);
+        assert_ne!(c0.gpuAddress(), c31.gpuAddress());
+        assert!(occ.visibility_slot(1_048_576).is_none());
+
+        let ts_small = QueryHeap::try_new(heap_type::TIMESTAMP, 128)
+            .expect("small timestamp query heap must keep direct counter-heap path");
+        assert!(ts_small.timestamps.is_some());
+        assert!(!ts_small.is_staged_timestamp());
+
+        let ts_large = QueryHeap::try_new(heap_type::TIMESTAMP, 1_048_576)
+            .expect("1M timestamp query heap (8 MiB) must succeed via staged backing buffer");
+        assert!(ts_large.timestamps.is_none());
+        assert!(ts_large.is_staged_timestamp());
+        assert_eq!(ts_large.timestamp_buffer.as_ref().unwrap().length(), 1_048_576 * 8);
+
+        let ts_copy_large = QueryHeap::try_new(heap_type::COPY_QUEUE_TIMESTAMP, 65_536)
+            .expect("large COPY_QUEUE_TIMESTAMP heap must succeed");
+        assert!(ts_copy_large.is_staged_timestamp());
+
+        let ps = QueryHeap::try_new(heap_type::PIPELINE_STATISTICS, 64)
+            .expect("pipeline statistics heap creation keeps current path");
+        assert!(ps.timestamps.is_none());
+        assert!(ps.timestamp_buffer.is_none());
+        assert!(ps.visibility_chunks.is_empty());
+    }
+
+    #[test]
+    fn scratch_pool_leases_are_disjoint_grow_on_demand_and_recycle_on_drop() {
+        if super::super::device().is_none() {
+            return;
+        }
+        let pool = timestamp_scratch_pool();
+        pool.ensure_ready().expect("scratch pool ready");
+        // Acquire more leases than a single 4096-entry heap supplies (64 slices) to
+        // prove disjointness across lists AND lazy second-heap growth.
+        let mut leases = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..(SLICES_PER_HEAP + 10) {
+            let l = pool.acquire_lease().expect("lease acquisition");
+            assert!(
+                seen.insert(l.id()),
+                "duplicate scratch slice {:?} leased while still owned",
+                l.id()
+            );
+            assert!(l.base_slot() + l.len() <= SCRATCH_HEAP_ENTRIES);
+            leases.push(l);
+        }
+        let first_id = leases[0].id();
+        drop(leases);
+        // After dropping all leases, re-acquiring must recycle freed slices cleanly.
+        let mut recycled = Vec::new();
+        let mut saw_first = false;
+        for _ in 0..(SLICES_PER_HEAP + 10) {
+            let l = pool.acquire_lease().expect("recycled lease");
+            if l.id() == first_id {
+                saw_first = true;
+            }
+            recycled.push(l);
+        }
+        assert!(saw_first, "dropped lease {:?} must be returned to the pool", first_id);
+    }
+
+    #[test]
+    fn direct_timestamp_heap_cap_preserves_scratch_headroom_for_overflow_and_large_heaps() {
+        if super::super::device().is_none() {
+            return;
+        }
+        // Create 40 small timestamp heaps simultaneously (> AGX's ~32-heap process ceiling).
+        // The soft direct cap (16) keeps hardware counter-heap headroom free so overflow
+        // small heaps and subsequent 1M staged heaps all succeed cleanly.
+        let mut heaps = Vec::new();
+        for i in 0..40 {
+            heaps.push(
+                QueryHeap::try_new(heap_type::TIMESTAMP, 128)
+                    .unwrap_or_else(|e| panic!("timestamp heap #{i} must succeed: {e}")),
+            );
+        }
+        let direct_count = heaps.iter().filter(|h| h.timestamps.is_some()).count();
+        let staged_count = heaps.iter().filter(|h| h.is_staged_timestamp()).count();
+        assert!(
+            direct_count <= MAX_DIRECT_TIMESTAMP_HEAPS,
+            "direct timestamp heaps ({direct_count}) must not exceed cap ({MAX_DIRECT_TIMESTAMP_HEAPS})"
+        );
+        assert_eq!(direct_count + staged_count, 40);
+        assert!(staged_count >= 40 - MAX_DIRECT_TIMESTAMP_HEAPS);
+
+        // Even while all 40 small heaps are live, a 1M staged timestamp heap must still succeed.
+        let big = QueryHeap::try_new(heap_type::TIMESTAMP, 1_048_576)
+            .expect("1M staged timestamp heap must succeed while 40 small heaps are live");
+        assert!(big.is_staged_timestamp());
+        drop(big);
+        drop(heaps);
+        assert_eq!(LIVE_DIRECT_TIMESTAMP_HEAPS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn scratch_pool_recovers_after_transient_counter_heap_exhaustion() {
+        let Some(d) = super::super::device() else { return };
+        // Exhaust AGX's remaining hardware counter-heap budget temporarily.
+        let mut raw_heaps = Vec::new();
+        for _ in 0..64 {
+            let desc = MTL4CounterHeapDescriptor::new();
+            desc.setType(MTL4CounterHeapType::Timestamp);
+            unsafe { desc.setCount(128) };
+            match d.dev.newCounterHeapWithDescriptor_error(&desc) {
+                Ok(h) => raw_heaps.push(h),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !raw_heaps.is_empty(),
+            "expected at least one raw MTL4CounterHeap allocation before hitting AGX limit"
+        );
+
+        let pool = TimestampScratchPool::new();
+        assert!(
+            pool.ensure_ready().is_err(),
+            "ensure_ready must report an honest error when hardware counter heaps are exhausted"
+        );
+        assert_eq!(pool.stats(), (0, 0), "failed init must not leave partial pool state");
+
+        // Release the raw heaps; the SAME scratch pool must now recover cleanly instead of
+        // remaining permanently stuck in a cached error state.
+        drop(raw_heaps);
+        pool.ensure_ready()
+            .expect("scratch pool must recover once hardware counter-heap capacity is released");
+        assert_eq!(pool.stats(), (1, SLICES_PER_HEAP));
     }
 }

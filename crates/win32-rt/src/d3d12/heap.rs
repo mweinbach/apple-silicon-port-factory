@@ -115,9 +115,11 @@ pub struct QueryHeapDesc {
     pub node_mask: u32,
 }
 
-/// Timestamp heaps are real (`d3d12_metal::metal::query`); occlusion and
-/// pipeline-statistics queries trap in EndQuery/ResolveQueryData so no
-/// fabricated results reach the game.
+/// Timestamp (`TIMESTAMP`, `COPY_QUEUE_TIMESTAMP`) and occlusion (`OCCLUSION`,
+/// supporting both counting and `BINARY_OCCLUSION` queries) heaps are real
+/// (`d3d12_metal::metal::query`); pipeline-statistics queries still trap in
+/// `BeginQuery`/`EndQuery`/`ResolveQueryData` so no fabricated results reach
+/// the game.
 pub struct QueryHeap {
     pub desc: QueryHeapDesc,
     pub q: d3d12_metal::metal::query::QueryHeap,
@@ -143,21 +145,67 @@ pub unsafe fn create_query_heap(desc: *const QueryHeapDesc, riid: *const Guid, o
     if desc.is_null() {
         return failed!(E_INVALIDARG, "CreateQueryHeap: null desc");
     }
-    let d = *desc;
+    let d = std::ptr::read_unaligned(desc);
     if !matches!(d.ty, 0 | 1 | 2 | 5 | 7) {
         return failed!(E_INVALIDARG, "CreateQueryHeap({d:?}): unsupported query heap type");
+    }
+    if d.count == 0 {
+        return failed!(E_INVALIDARG, "CreateQueryHeap({d:?}): count must be > 0");
     }
     if out.is_null() {
         return S_FALSE;
     }
     *out = std::ptr::null_mut();
-    let q = match d3d12_metal::metal::query::QueryHeap::new(d.ty, d.count) {
+    let q = match d3d12_metal::metal::query::QueryHeap::try_new(d.ty, d.count) {
         Ok(q) => q,
-        Err(e) => return failed!(E_OUTOFMEMORY, "CreateQueryHeap({d:?}): {e}"),
+        Err(d3d12_metal::metal::query::QueryHeapError::InvalidArg(e)) => {
+            return failed!(E_INVALIDARG, "CreateQueryHeap({d:?}): {e}");
+        }
+        Err(d3d12_metal::metal::query::QueryHeapError::OutOfMemory(e)) => {
+            return failed!(E_OUTOFMEMORY, "CreateQueryHeap({d:?}): {e}");
+        }
     };
     log::debug!(target: "d3d", "CreateQueryHeap({d:?})");
     let o = Obj::new(QueryHeap { desc: d, q });
     let hr = query_out(o as *mut c_void, riid, out);
     Obj::release(o);
     hr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_query_heap_validates_args_and_supports_1m_heaps() {
+        unsafe {
+            let mut out: *mut c_void = std::ptr::null_mut();
+            assert_eq!(create_query_heap(std::ptr::null(), &IID_ID3D12QueryHeap, &mut out), E_INVALIDARG);
+
+            let bad_ty = QueryHeapDesc { ty: 99, count: 16, node_mask: 0 };
+            assert_eq!(create_query_heap(&bad_ty, &IID_ID3D12QueryHeap, &mut out), E_INVALIDARG);
+
+            let zero_cnt = QueryHeapDesc { ty: 0, count: 0, node_mask: 0 };
+            assert_eq!(create_query_heap(&zero_cnt, &IID_ID3D12QueryHeap, &mut out), E_INVALIDARG);
+
+            let valid_probe = QueryHeapDesc { ty: 0, count: 1_048_576, node_mask: 0 };
+            assert_eq!(create_query_heap(&valid_probe, &IID_ID3D12QueryHeap, std::ptr::null_mut()), S_FALSE);
+
+            if d3d12_metal::metal::device().is_none() {
+                return;
+            }
+            for (ty, count) in [(0u32, 1_048_576u32), (1, 1_048_576), (1, 128), (2, 64), (5, 65_536)] {
+                let d = QueryHeapDesc { ty, count, node_mask: 0 };
+                let mut p: *mut c_void = std::ptr::null_mut();
+                let hr = create_query_heap(&d, &IID_ID3D12QueryHeap, &mut p);
+                assert_eq!(hr, S_OK, "CreateQueryHeap({d:?}) failed with {hr:#x}");
+                assert!(!p.is_null());
+                let qh = query_heap_from_ptr(p).expect("valid QueryHeap COM object");
+                assert_eq!(qh.desc.ty, ty);
+                assert_eq!(qh.desc.count, count);
+                let obj = Obj::<QueryHeap>::from_iface(p).unwrap();
+                Obj::release(obj);
+            }
+        }
+    }
 }

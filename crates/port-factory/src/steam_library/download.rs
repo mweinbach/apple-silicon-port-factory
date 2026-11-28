@@ -9,7 +9,9 @@ use super::discovery::{
 use super::macos_bundle::{convert_steam_game, ConversionFormat, SteamConvertOptions};
 use super::vdf::apply_post_install;
 use super::verify::{format_bundle_verify_report, verify_app_bundle, BundleVerifyReport};
-use crate::bundle_common::{codesign_verify_deep_strict, set_executable_mode};
+use crate::bundle_common::set_executable_mode;
+#[cfg(target_os = "macos")]
+use crate::bundle_codesign::verify_bundle_codesign_fast;
 use anyhow::{bail, Context, Result};
 use port_manifest::GameManifest;
 use std::collections::BTreeSet;
@@ -421,6 +423,7 @@ pub struct SteamPortOptions {
     pub validate: bool,
     pub skip_download: bool,
     pub precompile_shaders: bool,
+    pub shader_limit: Option<usize>,
     pub copy_to: Option<PathBuf>,
     pub dry_run: bool,
 }
@@ -528,6 +531,7 @@ pub fn port_steam_game(workspace_root: &Path, opts: &SteamPortOptions) -> Result
         format: ConversionFormat::MacOsApp,
         output_path: Some(app_bundle.clone()),
         precompile_shaders: opts.precompile_shaders,
+        shader_limit: opts.shader_limit,
         max_aot_functions: 0,
         bundle_shader_cache_from: None,
     };
@@ -820,14 +824,21 @@ pub fn export_app_bundle(app_path: &Path, dest: &Path, force: bool) -> Result<Pa
         let _ = Command::new("/usr/bin/xattr")
             .args(["-dr", "com.apple.quarantine", &dest_app.to_string_lossy()])
             .status();
-        if let Ok(o) = codesign_verify_deep_strict(&dest_app) {
-            if !o.status.success() {
+        match verify_bundle_codesign_fast(&dest_app, true) {
+            Ok(res) if !res.passed => {
                 eprintln!(
                     "warning: codesign verify on exported bundle {}: {}",
                     dest_app.display(),
-                    String::from_utf8_lossy(&o.stderr).trim()
+                    res.detail
                 );
             }
+            Err(e) => {
+                eprintln!(
+                    "warning: codesign verify on exported bundle {}: {e:#}",
+                    dest_app.display()
+                );
+            }
+            Ok(_) => {}
         }
     }
 
