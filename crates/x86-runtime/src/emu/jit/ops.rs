@@ -12,53 +12,56 @@ impl Tr<'_> {
     pub(super) fn op(&mut self, k: usize) {
         use fast::*;
         let op = self.ops[k];
-        if self.xa_key.is_some()
-            && !matches!(
-                op.kind,
-                K_NOP
-                    | K_MOV_RR
-                    | K_MOV_RI
-                    | K_MOV_RM
-                    | K_MOV_MR
-                    | K_MOV_MI
-                    | K_MOVZX_RR
-                    | K_MOVSX_RR
-                    | K_MOVZX_RM
-                    | K_MOVSX_RM
-                    | K_LEA
-                    | K_ALU_RR
-                    | K_ALU_RI
-                    | K_ALU_RM
-                    | K_ALU_MR
-                    | K_ALU_MI
-                    | K_CMPJ_RR
-                    | K_CMPJ_RI
-                    | K_CMPJ_RM
-                    | K_INC_R
-                    | K_DEC_R
-                    | K_SHIFT_RI
-                    | K_SETCC_R
-                    | K_CMOV_RR
-                    | K_NOT_R
-                    | K_NEG_R
-                    | K_BT_RR
-                    | K_BT_RI
-                    | K_IMUL_RR
-                    | K_IMUL_RM
-                    | K_IMUL_RRI
-                    | K_IMUL_RMI
-                    | K_VSHUF_RR
-                    | K_VSHUF_RM
-                    | K_VFP_RR
-                    | K_VFP_RM
-                    | K_VST
-                    | K_COMI_RR
-                    | K_COMI_RM
-            )
-        {
+        let xa_safe = matches!(
+            op.kind,
+            K_NOP
+                | K_MOV_RR
+                | K_MOV_RI
+                | K_MOV_RM
+                | K_MOV_MR
+                | K_MOV_MI
+                | K_MOVZX_RR
+                | K_MOVSX_RR
+                | K_MOVZX_RM
+                | K_MOVSX_RM
+                | K_LEA
+                | K_ALU_RR
+                | K_ALU_RI
+                | K_ALU_RM
+                | K_ALU_MR
+                | K_ALU_MI
+                | K_CMPJ_RR
+                | K_CMPJ_RI
+                | K_CMPJ_RM
+                | K_INC_R
+                | K_DEC_R
+                | K_SHIFT_RI
+                | K_ROT_RI
+                | K_SETCC_R
+                | K_CMOV_RR
+                | K_NOT_R
+                | K_NEG_R
+                | K_BT_RR
+                | K_BT_RI
+                | K_IMUL_RR
+                | K_IMUL_RM
+                | K_IMUL_RRI
+                | K_IMUL_RMI
+                | K_VSHUF_RR
+                | K_VSHUF_RM
+                | K_VFP_RR
+                | K_VFP_RM
+                | K_VST
+                | K_COMI_RR
+                | K_COMI_RM
+        );
+        if !xa_safe {
             self.xa_key = None;
         }
         if self.xon && self.xmm_op(k, &op) {
+            if !xa_safe {
+                self.xa_key = None;
+            }
             return;
         }
         let w = op.w;
@@ -265,8 +268,14 @@ impl Tr<'_> {
             K_CMOV_RR | K_CMOV_RM => self.cmov(k, &op),
             K_NOT_R => {
                 // `orn d, zr, m` (`mvn`).
-                self.a.emit(sf(w == 64) | 0x2A20_03E0 | g(op.r0) << 16 | 31 << 5 | T0);
-                self.wr_gpr(op.r0, w, T0);
+                if w >= 32 {
+                    let d = g(op.r0);
+                    self.a.emit(sf(w == 64) | 0x2A20_03E0 | d << 16 | 31 << 5 | d);
+                    self.set_lb(op.r0, w);
+                } else {
+                    self.a.emit(0x2A20_03E0 | g(op.r0) << 16 | 31 << 5 | T0);
+                    self.wr_gpr(op.r0, w, T0);
+                }
             }
             K_CX => match op.x & 0x3F {
                 0 => self.a.sbfm(false, g(0), g(0), 0, 15),
@@ -674,34 +683,36 @@ impl Tr<'_> {
                 let cnt = op.imm as u32;
                 let ror = (op.x & 0x3F) != 0;
                 let la = self.live[k + 1];
-                let ua = self.ua(op.r0, wb);
-                match wb {
-                    64 => self.a.ror_i(true, T1, ua, if ror { cnt } else { 64 - cnt }),
-                    32 => self.a.ror_i(false, T1, ua, if ror { cnt } else { 32 - cnt }),
-                    _ => {
-                        let c_mod = cnt % wb;
-                        if c_mod == 0 {
-                            self.a.mov_rr(false, T1, ua);
-                        } else {
-                            let rcnt = if ror { c_mod } else { wb - c_mod };
-                            self.a.lsr_i(false, T1, ua, rcnt);
-                            self.a.lsl_i(false, T2, ua, wb - rcnt);
-                            self.a.logic_rr(false, 1, T1, T1, T2, 0, 0);
-                            self.a.ubfm(false, T1, T1, 0, wb - 1);
-                        }
+                let res = if wb >= 32 {
+                    let d = g(op.r0);
+                    self.a.ror_i(wb == 64, d, d, if ror { cnt } else { wb - cnt });
+                    self.set_lb(op.r0, w);
+                    d
+                } else {
+                    let ua = self.ua(op.r0, wb);
+                    let c_mod = cnt % wb;
+                    if c_mod == 0 {
+                        self.a.mov_rr(false, T1, ua);
+                    } else {
+                        let rcnt = if ror { c_mod } else { wb - c_mod };
+                        self.a.lsr_i(false, T1, ua, rcnt);
+                        self.a.lsl_i(false, T2, ua, wb - rcnt);
+                        self.a.logic_rr(false, 1, T1, T1, T2, 0, 0);
+                        self.a.ubfm(false, T1, T1, 0, wb - 1);
                     }
-                }
-                self.wr_gpr(op.r0, w, T1);
+                    self.wr_gpr(op.r0, w, T1);
+                    T1
+                };
                 if la & (FC | FO) != 0 {
-                    self.a.ubfx(T2, T1, wb - 1, 1);
+                    self.a.ubfx(T2, res, wb - 1, 1);
                     let cf_reg = if ror {
                         if la & FO != 0 {
-                            self.a.ubfx(T3, T1, wb - 2, 1);
+                            self.a.ubfx(T3, res, wb - 2, 1);
                             self.a.logic_rr(false, 2, T3, T2, T3, 0, 0);
                         }
                         T2
                     } else {
-                        self.a.ubfx(T4, T1, 0, 1);
+                        self.a.ubfx(T4, res, 0, 1);
                         if la & FO != 0 {
                             self.a.logic_rr(false, 2, T3, T2, T4, 0, 0);
                         }
@@ -819,6 +830,9 @@ impl Tr<'_> {
             K_BSWAP_R..=K_MMX_MISC => self.ext_op(k, &op),
             K_X87 => self.emit_x87_op(k, &op),
             _ => unreachable!("unsupported op kind {}", op.kind),
+        }
+        if !xa_safe {
+            self.xa_key = None;
         }
     }
 
