@@ -4392,3 +4392,123 @@ fn aot_prewarm_skips_non_pe32_plus_and_wrong_machine_mapped_modules() {
         r64.skipped_reason
     );
 }
+
+/// `.pdata` root discovery must advance past leading `0xCC` (`int3`) alignment/guard bytes
+/// inside a `.pdata` range, and static CFG closure must follow direct `jcc`/`jmp` edges from
+/// a `.pdata` function into the strict interior of a sibling unchained `.pdata` range (e.g.
+/// split-unwind embedded builtins or shared epilogue tails) while keeping normal cross-`.pdata`
+/// function-entry tail-calls isolated.
+#[test]
+fn aot_pdata_leading_int3_and_cross_pdata_interior_branches() {
+    let mut img = vec![0u8; 0x4000];
+    // Minimal PE32+ with .text @ 0x1000..0x3000 and .rdata @ 0x3000..0x4000.
+    img[0..2].copy_from_slice(b"MZ");
+    w32(&mut img, 0x3C, 0x80);
+    w32(&mut img, 0x80, 0x0000_4550);
+    w16(&mut img, 0x84, 0x8664);
+    w16(&mut img, 0x86, 2); // NumberOfSections
+    w16(&mut img, 0x94, 0xF0); // SizeOfOptionalHeader
+    let opt = 0x98usize;
+    w16(&mut img, opt, 0x20B);
+    w32(&mut img, opt + 108, 16); // NumberOfRvaAndSizes
+    // DataDirectory[3]: Exception Directory (.pdata) @ 0x3200 (4 entries * 12 = 48 bytes)
+    w32(&mut img, opt + 112 + 3 * 8, 0x3200);
+    w32(&mut img, opt + 112 + 3 * 8 + 4, 48);
+
+    let sec0 = opt + 0xF0;
+    img[sec0..sec0 + 5].copy_from_slice(b".text");
+    w32(&mut img, sec0 + 8, 0x2000);
+    w32(&mut img, sec0 + 12, 0x1000);
+    w32(&mut img, sec0 + 36, 0x6000_0020); // MEM_EXECUTE | MEM_READ | CNT_CODE
+
+    let sec1 = sec0 + 40;
+    img[sec1..sec1 + 6].copy_from_slice(b".rdata");
+    w32(&mut img, sec1 + 8, 0x1000);
+    w32(&mut img, sec1 + 12, 0x3000);
+    w32(&mut img, sec1 + 36, 0x4000_0040);
+
+    // .pdata[0] [0x1000, 0x1040): 4 leading `0xCC` bytes, then code @ 0x1004:
+    //   0x1004: test ecx, ecx          (85 C9)
+    //   0x1006: je   +0x4D -> 0x1055   (74 4D)  [strict interior of .pdata[1], past `int3`]
+    //   0x1008: cmp  ecx, 1            (83 F9 01)
+    //   0x100B: je   +0x73 -> 0x1080   (74 73)  [entry of .pdata[2] -> must stay cross]
+    //   0x100D: jmp  +0x51 -> 0x1060   (EB 51)  [strict interior of .pdata[1]]
+    img[0x1000..0x1004].copy_from_slice(&[0xCC, 0xCC, 0xCC, 0xCC]);
+    img[0x1004..0x100F].copy_from_slice(&[
+        0x85, 0xC9, 0x74, 0x4D, 0x83, 0xF9, 0x01, 0x74, 0x73, 0xEB, 0x51,
+    ]);
+
+    // .pdata[1] [0x1040, 0x1070): cold unwind fragment ending in `int3`, followed by
+    // interior targets @ 0x1055 and 0x1060 unreachable from 0x1040:
+    //   0x1040: call +0x3B -> 0x1080   (E8 3B 00 00 00)
+    //   0x1045: int3                   (CC)
+    //   0x1055: mov  eax, 11; ret      (B8 0B 00 00 00 C3)
+    //   0x1060: mov  eax, 22; ret      (B8 16 00 00 00 C3)
+    img[0x1040..0x1046].copy_from_slice(&[0xE8, 0x3B, 0x00, 0x00, 0x00, 0xCC]);
+    img[0x1055..0x105B].copy_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00, 0xC3]);
+    img[0x1060..0x1066].copy_from_slice(&[0xB8, 0x16, 0x00, 0x00, 0x00, 0xC3]);
+
+    // .pdata[2] [0x1080, 0x10A0): normal independent function @ 0x1080 (with 4 leading 0xCC?
+    // no, normal prologue; plus test a second leading-0xCC entry @ 0x10B0 that is all 0xCC).
+    img[0x1080..0x1086].copy_from_slice(&[0xB8, 0x21, 0x00, 0x00, 0x00, 0xC3]);
+
+    // .pdata[3] [0x10B0, 0x10B8): pure 0xCC trap range -> must stay at 0x10B0 without OOB.
+    img[0x10B0..0x10B8].fill(0xCC);
+
+    // .pdata entries @ 0x3200 (all unchained, UNWIND_INFO @ 0x3300):
+    img[0x3300] = 0x01;
+    let pdata_entries = [
+        (0x1000u32, 0x1040u32, 0x3300u32),
+        (0x1040, 0x1070, 0x3300),
+        (0x1080, 0x10A0, 0x3300),
+        (0x10B0, 0x10B8, 0x3300),
+    ];
+    for (i, &(b, e, u)) in pdata_entries.iter().enumerate() {
+        let off = 0x3200 + i * 12;
+        w32(&mut img, off, b);
+        w32(&mut img, off + 4, e);
+        w32(&mut img, off + 8, u);
+    }
+
+    let base = img.as_ptr() as usize;
+    let base64 = base as u64;
+    let size = img.len();
+
+    let roots = unsafe { discover_pe_roots(base, size, 0) };
+    assert_eq!(
+        roots,
+        vec![0x1004, 0x1040, 0x1080, 0x10B0],
+        "leading 0xCC range must advance to first real instruction while all-0xCC keeps begin"
+    );
+
+    let mut bc = Box::new(BlockCache::new());
+    let (ips_single, cl_single) =
+        unsafe { discover(&mut *bc, base, size, &[0x1004], DEFAULT_AOT_CLOSURE) };
+    assert!(ips_single.contains(&(base64 + 0x1004)), "seed entry 0x1004");
+    assert!(ips_single.contains(&(base64 + 0x1008)), "fallthrough block 0x1008");
+    assert!(
+        ips_single.contains(&(base64 + 0x1055)),
+        "cross-.pdata jcc into strict interior 0x1055 must be discovered"
+    );
+    assert!(
+        ips_single.contains(&(base64 + 0x1060)),
+        "cross-.pdata jmp into strict interior 0x1060 must be discovered"
+    );
+    assert!(
+        !ips_single.contains(&(base64 + 0x1040)),
+        "entry of sibling .pdata[1] must not be pulled in spuriously"
+    );
+    assert!(
+        !ips_single.contains(&(base64 + 0x1080)),
+        "cross-.pdata branch to another function's entry 0x1080 must remain isolated"
+    );
+    assert!(cl_single.cross >= 1, "expected cross-.pdata count for 0x1080 entry jump");
+
+    let (ips_all, _) = unsafe { discover(&mut *bc, base, size, &roots, DEFAULT_AOT_CLOSURE) };
+    for rva in [0x1004u64, 0x1008, 0x1040, 0x1055, 0x1060, 0x1080] {
+        assert!(
+            ips_all.contains(&(base64 + rva)),
+            "full PE discovery missing expected block +{rva:#x}"
+        );
+    }
+}
