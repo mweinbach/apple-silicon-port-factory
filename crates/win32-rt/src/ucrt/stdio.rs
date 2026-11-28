@@ -61,9 +61,9 @@ impl RecLock {
 
 static STDIO_LOCK: RecLock = RecLock::new();
 
-struct Locked;
+pub(super) struct Locked;
 impl Locked {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         STDIO_LOCK.acquire();
         Locked
     }
@@ -2544,7 +2544,7 @@ pub unsafe extern "win64" fn _ungetc_nolock(c: i32, fp: *mut FILE) -> i32 {
 
 const WEOF: u32 = 0xFFFF;
 
-pub unsafe extern "win64" fn fgetwc(fp: *mut FILE) -> u32 {
+pub(super) unsafe fn read_stream_wide_cp(fp: *mut FILE, cp: u32) -> u32 {
     let _l = Locked::new();
     let r = with_stream(fp as *mut c_void, |s| {
         if fd_info(s.fd).mode.is_unicode() {
@@ -2554,7 +2554,6 @@ pub unsafe extern "win64" fn fgetwc(fp: *mut FILE) -> u32 {
             return Some(u16::from_le_bytes([lo, hi]) as u32);
         }
         let b0 = s.getc()?;
-        let cp = super::locale::mb_cp();
         if b0 < 0x80 || cp == 0 {
             return Some(b0 as u32);
         }
@@ -2614,15 +2613,15 @@ pub unsafe extern "win64" fn fgetwc(fp: *mut FILE) -> u32 {
     });
     r.flatten().unwrap_or(WEOF)
 }
+
+pub unsafe extern "win64" fn fgetwc(fp: *mut FILE) -> u32 {
+    read_stream_wide_cp(fp, super::locale::mb_cp())
+}
 pub unsafe extern "win64" fn getwc(fp: *mut FILE) -> u32 {
     fgetwc(fp)
 }
 pub unsafe extern "win64" fn _fgetwc_nolock(fp: *mut FILE) -> u32 {
     fgetwc(fp)
-}
-
-fn stream_is_unicode(fp: *mut FILE) -> bool {
-    with_stream(fp as *mut c_void, |s| fd_info(s.fd).mode.is_unicode()).unwrap_or(false)
 }
 
 /// Write wide code units to a `FILE*` stream using an explicit `LC_CTYPE` code page
@@ -2700,21 +2699,20 @@ pub unsafe extern "win64" fn fputws(s: *const u16, fp: *mut FILE) -> i32 {
     if write_stream_wide(fp as *mut c_void, &units) < 0 { -1 } else { 0 }
 }
 
-pub unsafe extern "win64" fn ungetwc(c: u32, fp: *mut FILE) -> u32 {
+pub(super) unsafe fn unget_stream_wide_cp(c: u32, fp: *mut FILE, cp: u32) -> u32 {
     if c == WEOF {
         return WEOF;
     }
     let _l = Locked::new();
-    let unicode = stream_is_unicode(fp);
-    let bytes: Vec<u8> = if unicode {
-        (c as u16).to_le_bytes().to_vec()
-    } else {
-        match super::convert::wc_encode(c as u16) {
-            Ok(b) => b,
-            Err(()) => return WEOF,
-        }
-    };
     with_stream(fp as *mut c_void, |s| {
+        let bytes: Vec<u8> = if fd_info(s.fd).mode.is_unicode() {
+            (c as u16).to_le_bytes().to_vec()
+        } else {
+            match super::convert::wc_encode_cp(cp, c as u16) {
+                Ok(b) => b,
+                Err(()) => return WEOF,
+            }
+        };
         for b in bytes.iter().rev() {
             s.unget.push(*b);
         }
@@ -2722,6 +2720,10 @@ pub unsafe extern "win64" fn ungetwc(c: u32, fp: *mut FILE) -> u32 {
         c
     })
     .unwrap_or(WEOF)
+}
+
+pub unsafe extern "win64" fn ungetwc(c: u32, fp: *mut FILE) -> u32 {
+    unget_stream_wide_cp(c, fp, super::locale::mb_cp())
 }
 
 pub unsafe extern "win64" fn fgetws(buf: *mut u16, n: i32, fp: *mut FILE) -> *mut u16 {

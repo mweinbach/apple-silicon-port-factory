@@ -909,6 +909,34 @@ pub unsafe extern "win64" fn _strnset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     s
 }
 
+pub unsafe extern "win64" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    crate::misc::vcruntime140::memcpy(dst, src, n)
+}
+pub unsafe extern "win64" fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    crate::misc::vcruntime140::memmove(dst, src, n)
+}
+pub unsafe extern "win64" fn memset(dst: *mut c_void, c: i32, n: usize) -> *mut c_void {
+    crate::misc::vcruntime140::memset(dst, c, n)
+}
+pub unsafe extern "win64" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
+    crate::misc::vcruntime140::memcmp(a, b, n)
+}
+pub unsafe extern "win64" fn memchr(s: *const c_void, c: i32, n: usize) -> *mut c_void {
+    crate::misc::vcruntime140::memchr(s, c, n)
+}
+pub unsafe extern "win64" fn strchr(s: *const std::ffi::c_char, c: i32) -> *mut std::ffi::c_char {
+    crate::misc::vcruntime140::strchr(s, c)
+}
+pub unsafe extern "win64" fn strrchr(s: *const std::ffi::c_char, c: i32) -> *mut std::ffi::c_char {
+    crate::misc::vcruntime140::strrchr(s, c)
+}
+pub unsafe extern "win64" fn strstr(
+    haystack: *const std::ffi::c_char,
+    needle: *const std::ffi::c_char,
+) -> *mut std::ffi::c_char {
+    crate::misc::vcruntime140::strstr(haystack, needle)
+}
+
 pub unsafe extern "win64" fn memcpy_s(d: *mut c_void, dsz: usize, s: *const c_void, n: usize) -> i32 {
     if n == 0 {
         return 0;
@@ -1129,6 +1157,12 @@ pub unsafe extern "win64" fn wcsxfrm(d: *mut u16, s: *const u16, n: usize) -> us
         std::ptr::write_unaligned(d.add(len), 0);
     }
     len
+}
+pub unsafe extern "win64" fn wcschr(s: *const u16, c: u16) -> *mut u16 {
+    crate::misc::vcruntime140::wcschr(s, c)
+}
+pub unsafe extern "win64" fn wcsrchr(s: *const u16, c: u16) -> *mut u16 {
+    crate::misc::vcruntime140::wcsrchr(s, c)
 }
 pub unsafe extern "win64" fn wcsstr(haystack: *const u16, needle: *const u16) -> *mut u16 {
     crate::misc::vcruntime140::wcsstr(haystack, needle)
@@ -1550,6 +1584,39 @@ mod tests {
             assert!(!dup.is_null());
             assert_eq!(crate::strings::from_wide(dup), "Hi");
             crate::ucrt::heap::free(dup.cast());
+
+            // UCRT memory and search exports resolve via api-ms-win-crt-string/private and tolerate overlap/unaligned inputs.
+            for (dll, sym) in [
+                ("api-ms-win-crt-string-l1-1-0.dll", "memset"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "memcpy"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "memmove"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "memcmp"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "memchr"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "strchr"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "strrchr"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "strstr"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "wcschr"),
+                ("api-ms-win-crt-string-l1-1-0.dll", "wcsrchr"),
+                ("api-ms-win-crt-private-l1-1-0.dll", "memset"),
+                ("api-ms-win-crt-private-l1-1-0.dll", "memcpy"),
+            ] {
+                assert!(crate::lookup(dll, sym).is_some(), "missing {dll}!{sym}");
+            }
+            let mut m = *b"abcdefgh";
+            assert_eq!(memset(m.as_mut_ptr().add(1).cast(), b'Z' as i32, 3), m.as_mut_ptr().add(1).cast());
+            assert_eq!(&m, b"aZZZefgh");
+            assert_eq!(memcpy(m.as_mut_ptr().add(2).cast(), m.as_ptr().cast(), 4), m.as_mut_ptr().add(2).cast());
+            assert_eq!(&m, b"aZaZZZgh");
+            assert_eq!(memmove(m.as_mut_ptr().cast(), m.as_ptr().add(2).cast(), 4), m.as_mut_ptr().cast());
+            assert_eq!(&m, b"aZZZZZgh");
+            assert_eq!(memcmp(m.as_ptr().cast(), b"aZZZ".as_ptr().cast(), 4), 0);
+            assert_eq!(memchr(m.as_ptr().cast(), b'g' as i32, m.len()), m.as_mut_ptr().add(6).cast());
+            let hay = b"abracadabra\0";
+            assert_eq!(strchr(hay.as_ptr().cast(), b'r' as i32), hay.as_ptr().add(2) as *mut std::ffi::c_char);
+            assert_eq!(strrchr(hay.as_ptr().cast(), b'r' as i32), hay.as_ptr().add(9) as *mut std::ffi::c_char);
+            assert_eq!(strstr(hay.as_ptr().cast(), b"cada\0".as_ptr().cast()), hay.as_ptr().add(4) as *mut std::ffi::c_char);
+            assert_eq!(wcschr(odd_ws, b'i' as u16), odd_ws.add(1) as *mut u16);
+            assert_eq!(wcsrchr(odd_ws, b'H' as u16), odd_ws as *mut u16);
         }
     }
 }

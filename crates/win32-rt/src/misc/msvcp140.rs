@@ -613,9 +613,557 @@ unsafe extern "win64" fn throw_cpp_error(code: i32) {
     super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
 }
 
+/// MSVC x64 `std::exception` / `std::runtime_error` (`0x18` bytes).
+#[repr(C)]
+struct StdException {
+    vtable: *const Ptr,
+    data: super::vcruntime140::StdExceptionData,
+}
+const _: () = assert!(std::mem::size_of::<StdException>() == 0x18);
+
+/// MSVC x64 `std::error_category` (`0x10` bytes).
+#[repr(C)]
+struct StdErrorCategory {
+    vtable: *const Ptr,
+    addr: usize,
+}
+const _: () = assert!(std::mem::size_of::<StdErrorCategory>() == 0x10);
+unsafe impl Sync for StdErrorCategory {}
+
+/// MSVC x64 `std::error_code` / `std::error_condition` (`0x10` bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StdErrorCode {
+    val: i32,
+    _pad: u32,
+    cat: *const StdErrorCategory,
+}
+const _: () = assert!(std::mem::size_of::<StdErrorCode>() == 0x10);
+
+/// MSVC x64 `std::system_error` (`0x28` bytes, inherits `std::runtime_error`).
+#[repr(C)]
+struct StdSystemError {
+    base: StdException,
+    code: StdErrorCode,
+}
+const _: () = assert!(std::mem::size_of::<StdSystemError>() == 0x28);
+
+unsafe fn write_msvc_string(out: *mut [u8; 32], text: &str) {
+    if out.is_null() {
+        return;
+    }
+    let bytes = text.as_bytes();
+    let mut raw = [0u8; 32];
+    if bytes.len() < 16 {
+        raw[..bytes.len()].copy_from_slice(bytes);
+        raw[bytes.len()] = 0;
+        raw[16..24].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+        raw[24..32].copy_from_slice(&15u64.to_le_bytes());
+    } else {
+        let cap = bytes.len();
+        let buf = crate::ucrt::heap::malloc(cap + 1) as *mut u8;
+        if !buf.is_null() {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+            *buf.add(bytes.len()) = 0;
+            raw[0..8].copy_from_slice(&(buf as usize as u64).to_le_bytes());
+            raw[16..24].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+            raw[24..32].copy_from_slice(&(cap as u64).to_le_bytes());
+        } else {
+            raw[24..32].copy_from_slice(&15u64.to_le_bytes());
+        }
+    }
+    std::ptr::write_unaligned(out, raw);
+}
+
+fn system_error_message(win_err: i32) -> String {
+    let posix = unsafe { winerror_map(win_err) };
+    if posix != 0 {
+        let msg = unsafe { CStr::from_ptr(syserror_map(posix)) }.to_string_lossy();
+        if msg != "unknown error" {
+            return msg.into_owned();
+        }
+    }
+    format!("system error {win_err}")
+}
+
+unsafe extern "win64" fn error_category_deleting_dtor(
+    this: *mut StdErrorCategory,
+    _flags: u32,
+) -> *mut StdErrorCategory {
+    this
+}
+
+unsafe extern "win64" fn system_category_name(_this: *const StdErrorCategory) -> *const c_char {
+    c"system".as_ptr()
+}
+
+unsafe extern "win64" fn generic_category_name(_this: *const StdErrorCategory) -> *const c_char {
+    c"generic".as_ptr()
+}
+
+unsafe extern "win64" fn system_category_message(
+    _this: *const StdErrorCategory,
+    out: *mut [u8; 32],
+    errval: i32,
+) -> *mut [u8; 32] {
+    let msg = system_error_message(errval);
+    write_msvc_string(out, &msg);
+    out
+}
+
+unsafe extern "win64" fn generic_category_message(
+    _this: *const StdErrorCategory,
+    out: *mut [u8; 32],
+    errval: i32,
+) -> *mut [u8; 32] {
+    let msg = CStr::from_ptr(syserror_map(errval)).to_string_lossy();
+    write_msvc_string(out, &msg);
+    out
+}
+
+unsafe extern "win64" fn system_category_default_error_condition(
+    this: *const StdErrorCategory,
+    out: *mut StdErrorCode,
+    errval: i32,
+) -> *mut StdErrorCode {
+    if !out.is_null() {
+        let posix = winerror_map(errval);
+        let cond = if posix != 0 {
+            StdErrorCode { val: posix, _pad: 0, cat: &GENERIC_CATEGORY }
+        } else {
+            StdErrorCode { val: errval, _pad: 0, cat: this }
+        };
+        std::ptr::write_unaligned(out, cond);
+    }
+    out
+}
+
+unsafe extern "win64" fn generic_category_default_error_condition(
+    this: *const StdErrorCategory,
+    out: *mut StdErrorCode,
+    errval: i32,
+) -> *mut StdErrorCode {
+    if !out.is_null() {
+        std::ptr::write_unaligned(out, StdErrorCode { val: errval, _pad: 0, cat: this });
+    }
+    out
+}
+
+unsafe extern "win64" fn error_category_equiv_code_int(
+    this: *const StdErrorCategory,
+    code: *const StdErrorCode,
+    errval: i32,
+) -> u8 {
+    if this.is_null() || code.is_null() {
+        return 0;
+    }
+    let c = std::ptr::read_unaligned(code);
+    if c.val != errval || c.cat.is_null() {
+        return 0;
+    }
+    let this_addr: usize = read_field(this, std::mem::offset_of!(StdErrorCategory, addr));
+    let other_addr: usize = read_field(c.cat, std::mem::offset_of!(StdErrorCategory, addr));
+    (this_addr == other_addr) as u8
+}
+
+unsafe extern "win64" fn error_category_equiv_int_cond(
+    this: *const StdErrorCategory,
+    errval: i32,
+    cond: *const StdErrorCode,
+) -> u8 {
+    if this.is_null() || cond.is_null() {
+        return 0;
+    }
+    let mut def = StdErrorCode { val: 0, _pad: 0, cat: std::ptr::null() };
+    let vtable: *const Ptr = read_field(this, std::mem::offset_of!(StdErrorCategory, vtable));
+    if !vtable.is_null() {
+        let f = std::ptr::read_unaligned(vtable.add(3)).0 as usize;
+        if f != 0 {
+            let _ = crate::call_guest8(
+                f,
+                this as u64,
+                &mut def as *mut StdErrorCode as u64,
+                errval as u32 as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+    }
+    let rhs = std::ptr::read_unaligned(cond);
+    if def.val != rhs.val || def.cat.is_null() || rhs.cat.is_null() {
+        return 0;
+    }
+    let a: usize = read_field(def.cat, std::mem::offset_of!(StdErrorCategory, addr));
+    let b: usize = read_field(rhs.cat, std::mem::offset_of!(StdErrorCategory, addr));
+    (a == b) as u8
+}
+
+// MSVC reverses overloaded virtuals of the same name: slot 4 = equivalent(error_code, int),
+// slot 5 = equivalent(int, error_condition).
+static SYSTEM_CATEGORY_VTABLE: [Ptr; 6] = [
+    Ptr(error_category_deleting_dtor as *const ()),
+    Ptr(system_category_name as *const ()),
+    Ptr(system_category_message as *const ()),
+    Ptr(system_category_default_error_condition as *const ()),
+    Ptr(error_category_equiv_code_int as *const ()),
+    Ptr(error_category_equiv_int_cond as *const ()),
+];
+
+static GENERIC_CATEGORY_VTABLE: [Ptr; 6] = [
+    Ptr(error_category_deleting_dtor as *const ()),
+    Ptr(generic_category_name as *const ()),
+    Ptr(generic_category_message as *const ()),
+    Ptr(generic_category_default_error_condition as *const ()),
+    Ptr(error_category_equiv_code_int as *const ()),
+    Ptr(error_category_equiv_int_cond as *const ()),
+];
+
+static SYSTEM_CATEGORY: StdErrorCategory = StdErrorCategory {
+    vtable: SYSTEM_CATEGORY_VTABLE.as_ptr(),
+    addr: 0x1fc7_0001,
+};
+
+static GENERIC_CATEGORY: StdErrorCategory = StdErrorCategory {
+    vtable: GENERIC_CATEGORY_VTABLE.as_ptr(),
+    addr: 0x1fc7_0002,
+};
+
+unsafe extern "win64" fn exception_deleting_dtor(
+    this: *mut StdException,
+    flags: u32,
+) -> *mut StdException {
+    if !this.is_null() {
+        let mut data: super::vcruntime140::StdExceptionData =
+            read_field(this, std::mem::offset_of!(StdException, data));
+        super::vcruntime140::__std_exception_destroy(&mut data);
+        write_field(this, std::mem::offset_of!(StdException, data), data);
+        if (flags & 1) != 0 {
+            crate::ucrt::heap::free(this.cast());
+        }
+    }
+    this
+}
+
+unsafe extern "win64" fn exception_what(this: *const StdException) -> *const c_char {
+    if !this.is_null() {
+        let data: super::vcruntime140::StdExceptionData =
+            read_field(this, std::mem::offset_of!(StdException, data));
+        if !data.what.is_null() {
+            return data.what;
+        }
+    }
+    c"Unknown exception".as_ptr()
+}
+
+static EXCEPTION_VTABLE: [Ptr; 2] = [
+    Ptr(exception_deleting_dtor as *const ()),
+    Ptr(exception_what as *const ()),
+];
+
+static RUNTIME_ERROR_VTABLE: [Ptr; 2] = [
+    Ptr(exception_deleting_dtor as *const ()),
+    Ptr(exception_what as *const ()),
+];
+
+static SYSTEM_ERROR_VTABLE: [Ptr; 2] = [
+    Ptr(exception_deleting_dtor as *const ()),
+    Ptr(exception_what as *const ()),
+];
+
+unsafe extern "win64" fn exception_copy_ctor(
+    dst: *mut StdException,
+    src: *const StdException,
+) -> *mut StdException {
+    if !dst.is_null() && !src.is_null() {
+        write_field(dst, std::mem::offset_of!(StdException, vtable), EXCEPTION_VTABLE.as_ptr());
+        let src_data: super::vcruntime140::StdExceptionData =
+            read_field(src, std::mem::offset_of!(StdException, data));
+        let mut dst_data = super::vcruntime140::StdExceptionData {
+            what: std::ptr::null(),
+            do_free: 0,
+        };
+        super::vcruntime140::__std_exception_copy(&src_data, &mut dst_data);
+        write_field(dst, std::mem::offset_of!(StdException, data), dst_data);
+    }
+    dst
+}
+
+unsafe extern "win64" fn runtime_error_copy_ctor(
+    dst: *mut StdException,
+    src: *const StdException,
+) -> *mut StdException {
+    if !dst.is_null() && !src.is_null() {
+        write_field(dst, std::mem::offset_of!(StdException, vtable), RUNTIME_ERROR_VTABLE.as_ptr());
+        let src_data: super::vcruntime140::StdExceptionData =
+            read_field(src, std::mem::offset_of!(StdException, data));
+        let mut dst_data = super::vcruntime140::StdExceptionData {
+            what: std::ptr::null(),
+            do_free: 0,
+        };
+        super::vcruntime140::__std_exception_copy(&src_data, &mut dst_data);
+        write_field(dst, std::mem::offset_of!(StdException, data), dst_data);
+    }
+    dst
+}
+
+unsafe extern "win64" fn system_error_copy_ctor(
+    dst: *mut StdSystemError,
+    src: *const StdSystemError,
+) -> *mut StdSystemError {
+    if !dst.is_null() && !src.is_null() {
+        write_field(
+            dst,
+            std::mem::offset_of!(StdSystemError, base) + std::mem::offset_of!(StdException, vtable),
+            SYSTEM_ERROR_VTABLE.as_ptr(),
+        );
+        let src_data: super::vcruntime140::StdExceptionData = read_field(
+            src,
+            std::mem::offset_of!(StdSystemError, base) + std::mem::offset_of!(StdException, data),
+        );
+        let mut dst_data = super::vcruntime140::StdExceptionData {
+            what: std::ptr::null(),
+            do_free: 0,
+        };
+        super::vcruntime140::__std_exception_copy(&src_data, &mut dst_data);
+        write_field(
+            dst,
+            std::mem::offset_of!(StdSystemError, base) + std::mem::offset_of!(StdException, data),
+            dst_data,
+        );
+        let code: StdErrorCode = read_field(src, std::mem::offset_of!(StdSystemError, code));
+        write_field(dst, std::mem::offset_of!(StdSystemError, code), code);
+    }
+    dst
+}
+
+/// Invoked solely via `ThrowInfo::pmfn_unwind` when `destruct_exception_object` tears down
+/// the heap-allocated thrown `StdSystemError` after its catch block completes.
+unsafe extern "win64" fn system_error_unwind_dtor(this: *mut StdSystemError) {
+    if !this.is_null() {
+        let mut data: super::vcruntime140::StdExceptionData = read_field(
+            this,
+            std::mem::offset_of!(StdSystemError, base) + std::mem::offset_of!(StdException, data),
+        );
+        super::vcruntime140::__std_exception_destroy(&mut data);
+        write_field(
+            this,
+            std::mem::offset_of!(StdSystemError, base) + std::mem::offset_of!(StdException, data),
+            data,
+        );
+        crate::ucrt::heap::free(this.cast());
+    }
+}
+
+#[repr(C)]
+struct MsvcTypeDescriptor<const N: usize> {
+    vftable: usize,
+    spare: usize,
+    name: [u8; N],
+}
+
+#[repr(C)]
+struct MsvcCatchableType {
+    properties: u32,
+    p_type: i32,
+    mdisp: i32,
+    pdisp: i32,
+    vdisp: i32,
+    size_or_offset: i32,
+    copy_function: i32,
+}
+const _: () = assert!(std::mem::size_of::<MsvcCatchableType>() == 28);
+
+#[repr(C)]
+struct MsvcCatchableTypeArray3 {
+    n_catchable_types: i32,
+    types: [i32; 3],
+}
+
+#[repr(C)]
+struct MsvcThrowInfo {
+    attributes: u32,
+    pmfn_unwind: i32,
+    p_forward_compat: i32,
+    p_catchable_type_array: i32,
+}
+const _: () = assert!(std::mem::size_of::<MsvcThrowInfo>() == 16);
+
+#[repr(C)]
+struct SystemErrorThrowSlab {
+    td_system_error: MsvcTypeDescriptor<23>,
+    td_runtime_error: MsvcTypeDescriptor<24>,
+    td_exception: MsvcTypeDescriptor<20>,
+    ct_system_error: MsvcCatchableType,
+    ct_runtime_error: MsvcCatchableType,
+    ct_exception: MsvcCatchableType,
+    cta: MsvcCatchableTypeArray3,
+    ti_heap: MsvcThrowInfo,
+    ti_nofree: MsvcThrowInfo,
+}
+
+struct SyncSystemErrorSlab(UnsafeCell<SystemErrorThrowSlab>);
+unsafe impl Sync for SyncSystemErrorSlab {}
+
+const fn mk_td<const N: usize>(bytes: &[u8; N]) -> MsvcTypeDescriptor<N> {
+    MsvcTypeDescriptor { vftable: 0, spare: 0, name: *bytes }
+}
+
+const fn mk_ct(size: i32) -> MsvcCatchableType {
+    MsvcCatchableType {
+        properties: 0,
+        p_type: 0,
+        mdisp: 0,
+        pdisp: -1,
+        vdisp: 0,
+        size_or_offset: size,
+        copy_function: 0,
+    }
+}
+
+/// Static `__DATA`-resident `ThrowInfo` slab for `std::system_error` so all RVAs — both
+/// metadata offsets and `__TEXT` copy-ctor/dtor function offsets — fit within `i32`.
+static SYSTEM_ERROR_THROW_SLAB: SyncSystemErrorSlab = SyncSystemErrorSlab(UnsafeCell::new(
+    SystemErrorThrowSlab {
+        td_system_error: mk_td(b".?AVsystem_error@std@@\0"),
+        td_runtime_error: mk_td(b".?AVruntime_error@std@@\0"),
+        td_exception: mk_td(b".?AVexception@std@@\0"),
+        ct_system_error: mk_ct(std::mem::size_of::<StdSystemError>() as i32),
+        ct_runtime_error: mk_ct(std::mem::size_of::<StdException>() as i32),
+        ct_exception: mk_ct(std::mem::size_of::<StdException>() as i32),
+        cta: MsvcCatchableTypeArray3 { n_catchable_types: 3, types: [0; 3] },
+        ti_heap: MsvcThrowInfo {
+            attributes: 0,
+            pmfn_unwind: 0,
+            p_forward_compat: 0,
+            p_catchable_type_array: 0,
+        },
+        ti_nofree: MsvcThrowInfo {
+            attributes: 0,
+            pmfn_unwind: 0,
+            p_forward_compat: 0,
+            p_catchable_type_array: 0,
+        },
+    },
+));
+
+static SYSTEM_ERROR_SLAB_INIT: std::sync::Once = std::sync::Once::new();
+
+fn system_error_throw_slab() -> &'static SystemErrorThrowSlab {
+    SYSTEM_ERROR_SLAB_INIT.call_once(|| unsafe {
+        let slab = &mut *SYSTEM_ERROR_THROW_SLAB.0.get();
+        let base = slab as *const SystemErrorThrowSlab as usize;
+        let data_rva = |p: *const u8| i32::try_from((p as isize) - (base as isize)).unwrap_or(0);
+        let fn_rva = |f: *const ()| i32::try_from((f as usize as isize) - (base as isize)).unwrap_or(0);
+
+        slab.ct_system_error.p_type = data_rva(std::ptr::addr_of!(slab.td_system_error).cast());
+        slab.ct_runtime_error.p_type = data_rva(std::ptr::addr_of!(slab.td_runtime_error).cast());
+        slab.ct_exception.p_type = data_rva(std::ptr::addr_of!(slab.td_exception).cast());
+
+        slab.ct_system_error.copy_function = fn_rva(system_error_copy_ctor as *const ());
+        slab.ct_runtime_error.copy_function = fn_rva(runtime_error_copy_ctor as *const ());
+        slab.ct_exception.copy_function = fn_rva(exception_copy_ctor as *const ());
+
+        slab.cta.types = [
+            data_rva(std::ptr::addr_of!(slab.ct_system_error).cast()),
+            data_rva(std::ptr::addr_of!(slab.ct_runtime_error).cast()),
+            data_rva(std::ptr::addr_of!(slab.ct_exception).cast()),
+        ];
+
+        let cta_rva = data_rva(std::ptr::addr_of!(slab.cta).cast());
+        slab.ti_heap.pmfn_unwind = fn_rva(system_error_unwind_dtor as *const ());
+        slab.ti_heap.p_catchable_type_array = cta_rva;
+        slab.ti_nofree.pmfn_unwind = 0;
+        slab.ti_nofree.p_catchable_type_array = cta_rva;
+    });
+    unsafe { &*SYSTEM_ERROR_THROW_SLAB.0.get() }
+}
+
+unsafe fn init_system_error(dst: *mut StdSystemError, win_err: i32) {
+    let msg = system_error_message(win_err);
+    let len = msg.len() + 1;
+    let buf = crate::ucrt::heap::malloc(len) as *mut c_char;
+    let data = if !buf.is_null() {
+        std::ptr::copy_nonoverlapping(msg.as_ptr(), buf as *mut u8, msg.len());
+        *(buf as *mut u8).add(msg.len()) = 0;
+        super::vcruntime140::StdExceptionData { what: buf, do_free: 1 }
+    } else {
+        super::vcruntime140::StdExceptionData {
+            what: c"system error".as_ptr(),
+            do_free: 0,
+        }
+    };
+    write_field(
+        dst,
+        std::mem::offset_of!(StdSystemError, base) + std::mem::offset_of!(StdException, vtable),
+        SYSTEM_ERROR_VTABLE.as_ptr(),
+    );
+    write_field(
+        dst,
+        std::mem::offset_of!(StdSystemError, base) + std::mem::offset_of!(StdException, data),
+        data,
+    );
+    write_field(
+        dst,
+        std::mem::offset_of!(StdSystemError, code),
+        StdErrorCode { val: win_err, _pad: 0, cat: &SYSTEM_CATEGORY },
+    );
+}
+
 unsafe extern "win64" fn xbad_alloc() {
     log::error!("std::_Xbad_alloc()");
     super::vcruntime140::_CxxThrowException(std::ptr::null_mut(), std::ptr::null());
+}
+
+unsafe extern "win64" fn xget_last_error() {
+    ensure_vtables_registered();
+    let err = crate::teb::last_error() as i32;
+    let slab = system_error_throw_slab();
+    let base = slab as *const SystemErrorThrowSlab as usize;
+    let obj = crate::ucrt::heap::calloc(1, std::mem::size_of::<StdSystemError>())
+        as *mut StdSystemError;
+    if !obj.is_null() {
+        init_system_error(obj, err);
+        super::vcruntime140::throw_cxx_exception_with_base(
+            obj.cast(),
+            std::ptr::addr_of!(slab.ti_heap).cast(),
+            base,
+        );
+    } else {
+        let mut fallback = StdSystemError {
+            base: StdException {
+                vtable: SYSTEM_ERROR_VTABLE.as_ptr(),
+                data: super::vcruntime140::StdExceptionData {
+                    what: c"system error".as_ptr(),
+                    do_free: 0,
+                },
+            },
+            code: StdErrorCode { val: err, _pad: 0, cat: &SYSTEM_CATEGORY },
+        };
+        super::vcruntime140::throw_cxx_exception_with_base(
+            std::ptr::addr_of_mut!(fallback).cast(),
+            std::ptr::addr_of!(slab.ti_nofree).cast(),
+            base,
+        );
+    }
+}
+
+unsafe extern "win64" fn execute_once(
+    flag: *mut c_void,
+    callback: Option<crate::sync::InitOnceFn>,
+    pv: *mut c_void,
+) -> i32 {
+    let Some(cb) = callback else {
+        crate::teb::set_last_error(crate::types::err::ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if flag.is_null() {
+        crate::teb::set_last_error(crate::types::err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    crate::sync::InitOnceExecuteOnce(flag, cb, pv, std::ptr::null_mut())
 }
 
 unsafe extern "win64" fn xbad_function_call() {
@@ -1805,11 +2353,11 @@ unsafe extern "win64" fn codecvt_length(
 unsafe extern "win64" fn codecvt_u32_ctor(this: *mut CodecvtU32, refs: usize) -> *mut CodecvtU32 {
     ensure_vtables_registered();
     if !this.is_null() {
-        (*this).vtable = CODECVT_U32_VTABLE.as_ptr();
-        (*this).refs = AtomicU32::new(refs as u32);
-        (*this)._pad = 0;
-        (*this).maxcode = 0x10ffff;
-        (*this).mode = 4;
+        write_field(this, std::mem::offset_of!(CodecvtU32, vtable), CODECVT_U32_VTABLE.as_ptr());
+        write_field(this, std::mem::offset_of!(CodecvtU32, refs), refs as u32);
+        write_field(this, std::mem::offset_of!(CodecvtU32, _pad), 0u32);
+        write_field(this, std::mem::offset_of!(CodecvtU32, maxcode), 0x10ffffu32);
+        write_field(this, std::mem::offset_of!(CodecvtU32, mode), 4u32);
     }
     this
 }
@@ -1817,12 +2365,24 @@ unsafe extern "win64" fn codecvt_u32_ctor(this: *mut CodecvtU32, refs: usize) ->
 unsafe extern "win64" fn codecvt_w_ctor(this: *mut CodecvtW, refs: usize) -> *mut CodecvtW {
     ensure_vtables_registered();
     if !this.is_null() {
-        (*this).vtable = CODECVT_W_VTABLE.as_ptr();
-        (*this).refs = AtomicU32::new(refs as u32);
-        (*this)._pad = 0;
-        locinfo_getcvt(std::ptr::null(), &mut (*this).cvt);
+        write_field(this, std::mem::offset_of!(CodecvtW, vtable), CODECVT_W_VTABLE.as_ptr());
+        write_field(this, std::mem::offset_of!(CodecvtW, refs), refs as u32);
+        write_field(this, std::mem::offset_of!(CodecvtW, _pad), 0u32);
+        locinfo_getcvt(std::ptr::null(), field_ptr::<_, Cvtvec>(this, std::mem::offset_of!(CodecvtW, cvt)));
     }
     this
+}
+
+unsafe extern "win64" fn codecvt_w_getcat(ppf: *mut *const Facet, _ploc: *const c_void) -> usize {
+    ensure_vtables_registered();
+    if !ppf.is_null() && std::ptr::read_unaligned(ppf).is_null() {
+        let p = crate::ucrt::heap::calloc(1, std::mem::size_of::<CodecvtW>()) as *mut CodecvtW;
+        if !p.is_null() {
+            codecvt_w_ctor(p, 0);
+            std::ptr::write_unaligned(ppf, p.cast());
+        }
+    }
+    2 // _X_CTYPE
 }
 
 unsafe extern "win64" fn codecvt_u32_in(
@@ -2752,6 +3312,15 @@ unsafe extern "win64" fn ios_base_width_set(this: *mut BasicIos, newwidth: i64) 
 
 unsafe extern "win64" fn ios_fill_get(this: *const BasicIos) -> u8 {
     if this.is_null() { b' ' } else { read_field(this, std::mem::offset_of!(BasicIos, fillch)) }
+}
+
+unsafe extern "win64" fn ios_fill_set(this: *mut BasicIos, ch: u8) -> u8 {
+    if this.is_null() {
+        return b' ';
+    }
+    let old: u8 = read_field(this, std::mem::offset_of!(BasicIos, fillch));
+    write_field(this, std::mem::offset_of!(BasicIos, fillch), ch);
+    old
 }
 
 unsafe extern "win64" fn ios_rdbuf_get(this: *const BasicIos) -> *mut BasicStreambuf {
@@ -3983,8 +4552,21 @@ pub(crate) fn register_static_vtables() {
         smanip_setprecision_fn as *const () as usize as u64,
         smanip_setprecision_fn as *const () as usize,
     );
+    for fn_addr in [
+        system_error_unwind_dtor as *const () as usize,
+        system_error_copy_ctor as *const () as usize,
+        runtime_error_copy_ctor as *const () as usize,
+        exception_copy_ctor as *const () as usize,
+    ] {
+        crate::register_native_va(fn_addr as u64, fn_addr);
+    }
     for p in FACET_VTABLE
         .iter()
+        .chain(EXCEPTION_VTABLE.iter())
+        .chain(RUNTIME_ERROR_VTABLE.iter())
+        .chain(SYSTEM_ERROR_VTABLE.iter())
+        .chain(SYSTEM_CATEGORY_VTABLE.iter())
+        .chain(GENERIC_CATEGORY_VTABLE.iter())
         .chain(CTYPE_CHAR_VTABLE.iter())
         .chain(CTYPE_W_VTABLE.iter())
         .chain(CODECVT_U32_VTABLE.iter())
@@ -4280,12 +4862,119 @@ unsafe extern "win64" fn istream_read(this: *mut u8, dst: *mut u8, count: i64) -
     }
     this
 }
-unsafe extern "win64" fn istream_seekg(this: *mut u8, _off: i64, _way: i32) -> *mut u8 {
+unsafe extern "win64" fn istream_seekg_pos(this: *mut u8, pos: *const [i64; 3]) -> *mut u8 {
+    if this.is_null() {
+        return this;
+    }
+    let ios = stream_ios(this);
+    if ios.is_null() {
+        return this;
+    }
+    // Per C++11 [istream.unformatted]: seekg clears eofbit first, then calls rdbuf()->pubseekpos
+    // if !fail(), setting failbit when the returned fpos converts to streamoff(-1).
+    let cur: i32 = read_field(ios, std::mem::offset_of!(BasicIos, mystate));
+    let cleared = cur & !1;
+    write_field(ios, std::mem::offset_of!(BasicIos, mystate), cleared);
+    if (cleared & 6) == 0 {
+        let sb: *mut BasicStreambuf = read_field(ios, std::mem::offset_of!(BasicIos, mystrbuf));
+        let mut out_pos = [-1i64, 0, 0];
+        if !sb.is_null() && !pos.is_null() {
+            let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambuf, vtable));
+            if !vtable.is_null() {
+                let seekpos = std::ptr::read_unaligned(vtable.add(11)).0 as usize;
+                if seekpos != 0 {
+                    let pos_copy = std::ptr::read_unaligned(pos);
+                    let _ = crate::call_guest8(
+                        seekpos,
+                        sb as u64,
+                        &mut out_pos as *mut [i64; 3] as u64,
+                        &pos_copy as *const [i64; 3] as u64,
+                        1, // ios_base::in
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
+        if out_pos[0].wrapping_add(out_pos[1]) == -1 {
+            ios_setstate(ios, 2, 0);
+        }
+    }
     this
 }
-unsafe extern "win64" fn istream_tellg(_this: *mut u8, out: *mut [i64; 3]) -> *mut [i64; 3] {
+
+unsafe extern "win64" fn istream_seekg(this: *mut u8, off: i64, way: i32) -> *mut u8 {
+    if this.is_null() {
+        return this;
+    }
+    let ios = stream_ios(this);
+    if ios.is_null() {
+        return this;
+    }
+    let cur: i32 = read_field(ios, std::mem::offset_of!(BasicIos, mystate));
+    let cleared = cur & !1;
+    write_field(ios, std::mem::offset_of!(BasicIos, mystate), cleared);
+    if (cleared & 6) == 0 {
+        let sb: *mut BasicStreambuf = read_field(ios, std::mem::offset_of!(BasicIos, mystrbuf));
+        let mut out_pos = [-1i64, 0, 0];
+        if !sb.is_null() {
+            let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambuf, vtable));
+            if !vtable.is_null() {
+                let seekoff = std::ptr::read_unaligned(vtable.add(10)).0 as usize;
+                if seekoff != 0 {
+                    let _ = crate::call_guest8(
+                        seekoff,
+                        sb as u64,
+                        &mut out_pos as *mut [i64; 3] as u64,
+                        off as u64,
+                        way as u32 as u64,
+                        1, // ios_base::in
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
+        if out_pos[0].wrapping_add(out_pos[1]) == -1 {
+            ios_setstate(ios, 2, 0);
+        }
+    }
+    this
+}
+
+unsafe extern "win64" fn istream_tellg(this: *mut u8, out: *mut [i64; 3]) -> *mut [i64; 3] {
+    let mut local_out = [-1i64, 0, 0];
+    if !this.is_null() && !out.is_null() {
+        let ios = stream_ios(this);
+        if !ios.is_null() {
+            let mystate: i32 = read_field(ios, std::mem::offset_of!(BasicIos, mystate));
+            let sb: *mut BasicStreambuf = read_field(ios, std::mem::offset_of!(BasicIos, mystrbuf));
+            if (mystate & 6) == 0 && !sb.is_null() {
+                let vtable: *const Ptr = read_field(sb, std::mem::offset_of!(BasicStreambuf, vtable));
+                if !vtable.is_null() {
+                    let seekoff = std::ptr::read_unaligned(vtable.add(10)).0 as usize;
+                    if seekoff != 0 {
+                        let _ = crate::call_guest8(
+                            seekoff,
+                            sb as u64,
+                            &mut local_out as *mut [i64; 3] as u64,
+                            0,
+                            1, // ios_base::cur
+                            1, // ios_base::in
+                            0,
+                            0,
+                            0,
+                        );
+                    }
+                }
+            }
+        }
+    }
     if !out.is_null() {
-        std::ptr::write_unaligned(out, [0, 0, 0]);
+        std::ptr::write_unaligned(out, local_out);
     }
     out
 }
@@ -4391,9 +5080,11 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?_CallInContext@_ContextCallback@details@Concurrency@@QEBAXV?$function@$$A6AXXZ@std@@_N@Z", ptr: Ptr(call_in_context as *const ()) },
     Export { name: "?_Capture@_ContextCallback@details@Concurrency@@AEAAXXZ", ptr: Ptr(noop_method as *const ()) },
     Export { name: "?_Decref@facet@locale@std@@UEAAPEAV_Facet_base@3@XZ", ptr: Ptr(facet_decref as *const ()) },
+    Export { name: "?_Execute_once@std@@YAHAEAUonce_flag@1@P6AHPEAX1PEAPEAX@Z1@Z", ptr: Ptr(execute_once as *const ()) },
     Export { name: "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z", ptr: Ptr(fiopen_a as *const ()) },
     Export { name: "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z", ptr: Ptr(fiopen_w as *const ()) },
     Export { name: "?_Getcat@?$codecvt@DDU_Mbstatet@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(codecvt_d_getcat as *const ()) },
+    Export { name: "?_Getcat@?$codecvt@_WDU_Mbstatet@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(codecvt_w_getcat as *const ()) },
     Export { name: "?_Getcat@?$ctype@D@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(ctype_getcat as *const ()) },
     Export { name: "?_Getcat@?$ctype@_W@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(ctype_w_getcat as *const ()) },
     Export { name: "?_Getcat@?$time_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z", ptr: Ptr(time_put_getcat as *const ()) },
@@ -4447,6 +5138,7 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?_W_Getdays@_Locinfo@std@@QEBAPEBGXZ", ptr: Ptr(locinfo_w_getdays as *const ()) },
     Export { name: "?_W_Getmonths@_Locinfo@std@@QEBAPEBGXZ", ptr: Ptr(locinfo_w_getmonths as *const ()) },
     Export { name: "?_Winerror_map@std@@YAHH@Z", ptr: Ptr(winerror_map as *const ()) },
+    Export { name: "?_XGetLastError@std@@YAXXZ", ptr: Ptr(xget_last_error as *const ()) },
     Export { name: "?_Xbad_alloc@std@@YAXXZ", ptr: Ptr(xbad_alloc as *const ()) },
     Export { name: "?_Xbad_function_call@std@@YAXXZ", ptr: Ptr(xbad_function_call as *const ()) },
     Export { name: "?_Xinvalid_argument@std@@YAXPEBD@Z", ptr: Ptr(xinvalid_argument as *const ()) },
@@ -4475,6 +5167,7 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?egptr@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_egptr as *const ()) },
     Export { name: "?epptr@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ", ptr: Ptr(streambuf_epptr as *const ()) },
     Export { name: "?epptr@?$basic_streambuf@_WU?$char_traits@_W@std@@@std@@IEBAPEA_WXZ", ptr: Ptr(streambuf_w_epptr as *const ()) },
+    Export { name: "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAADD@Z", ptr: Ptr(ios_fill_set as *const ()) },
     Export { name: "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBADXZ", ptr: Ptr(ios_fill_get as *const ()) },
     Export { name: "?fill@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAA_W_W@Z", ptr: Ptr(ios_w_fill_set as *const ()) },
     Export { name: "?fill@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEBA_WXZ", ptr: Ptr(ios_w_fill_get as *const ()) },
@@ -4518,6 +5211,7 @@ pub static EXTRA_EXPORTS: &[Export] = &[
     Export { name: "?rdbuf@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEBAPEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@2@XZ", ptr: Ptr(ios_w_rdbuf_get as *const ()) },
     Export { name: "?read@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@PEAD_J@Z", ptr: Ptr(istream_read as *const ()) },
     Export { name: "?sbumpc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAAHXZ", ptr: Ptr(streambuf_sbumpc as *const ()) },
+    Export { name: "?seekg@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@V?$fpos@U_Mbstatet@@@2@@Z", ptr: Ptr(istream_seekg_pos as *const ()) },
     Export { name: "?seekg@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@_JH@Z", ptr: Ptr(istream_seekg as *const ()) },
     Export { name: "?seekoff@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA?AV?$fpos@U_Mbstatet@@@2@_JHH@Z", ptr: Ptr(streambuf_seekoff as *const ()) },
     Export { name: "?seekpos@?$basic_streambuf@DU?$char_traits@D@std@@@std@@MEAA?AV?$fpos@U_Mbstatet@@@2@V32@H@Z", ptr: Ptr(streambuf_seekpos as *const ()) },
@@ -4921,6 +5615,377 @@ mod tests {
 
             ios_dtor(ios);
             streambuf_dtor(&mut sb);
+        }
+    }
+
+    #[test]
+    fn fill_seekg_tellg_codecvt_w_getcat_and_execute_once() {
+        use std::sync::atomic::AtomicI32;
+
+        static SEEKOFF_CALLS: AtomicI32 = AtomicI32::new(0);
+        static SEEKPOS_CALLS: AtomicI32 = AtomicI32::new(0);
+        static LAST_SEEKOFF_ARGS: Mutex<(i64, i32, i32)> = Mutex::new((0, 0, 0));
+        static LAST_SEEKPOS_ARGS: Mutex<([i64; 3], i32)> = Mutex::new(([0, 0, 0], 0));
+        static CUR_POS: AtomicI32 = AtomicI32::new(12);
+
+        unsafe extern "win64" fn custom_seekoff(
+            _this: *mut BasicStreambuf,
+            out: *mut [i64; 3],
+            off: i64,
+            way: i32,
+            mode: i32,
+        ) -> *mut [i64; 3] {
+            SEEKOFF_CALLS.fetch_add(1, Ordering::SeqCst);
+            *LAST_SEEKOFF_ARGS.lock().unwrap() = (off, way, mode);
+            let next = match way {
+                0 => off,                                               // beg
+                1 => CUR_POS.load(Ordering::SeqCst) as i64 + off,       // cur
+                2 => 100 + off,                                         // end
+                _ => -1,
+            };
+            if next < 0 {
+                std::ptr::write_unaligned(out, [-1, 0, 0]);
+            } else {
+                CUR_POS.store(next as i32, Ordering::SeqCst);
+                std::ptr::write_unaligned(out, [next, 0, 0]);
+            }
+            out
+        }
+
+        unsafe extern "win64" fn custom_seekpos(
+            _this: *mut BasicStreambuf,
+            out: *mut [i64; 3],
+            pos: *const [i64; 3],
+            mode: i32,
+        ) -> *mut [i64; 3] {
+            SEEKPOS_CALLS.fetch_add(1, Ordering::SeqCst);
+            let p = std::ptr::read_unaligned(pos);
+            *LAST_SEEKPOS_ARGS.lock().unwrap() = (p, mode);
+            let total = p[0].wrapping_add(p[1]);
+            if total < 0 {
+                std::ptr::write_unaligned(out, [-1, 0, 0]);
+            } else {
+                CUR_POS.store(total as i32, Ordering::SeqCst);
+                std::ptr::write_unaligned(out, [total, 0, p[2]]);
+            }
+            out
+        }
+
+        unsafe {
+            // 1. Export resolution for all 5 new msvcp140 symbols.
+            for sym in [
+                "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAADD@Z",
+                "?seekg@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@V?$fpos@U_Mbstatet@@@2@@Z",
+                "?_Getcat@?$codecvt@_WDU_Mbstatet@@@std@@SA_KPEAPEBVfacet@locale@2@PEBV42@@Z",
+                "?_XGetLastError@std@@YAXXZ",
+                "?_Execute_once@std@@YAHAEAUonce_flag@1@P6AHPEAX1PEAPEAX@Z1@Z",
+            ] {
+                assert!(crate::lookup("msvcp140.dll", sym).is_some(), "missing {sym}");
+            }
+
+            // 2. basic_ios<char>::fill(char) on unaligned BasicIos + null safety.
+            assert_eq!(ios_fill_set(std::ptr::null_mut(), b'*'), b' ');
+            let mut raw_ios = vec![0u8; std::mem::size_of::<BasicIos>() + 8];
+            let u_ios = raw_ios.as_mut_ptr().add(3) as *mut BasicIos;
+            assert!(!u_ios.is_aligned());
+            ios_ctor(u_ios);
+            ios_init(u_ios, std::ptr::null_mut());
+            assert_eq!(ios_fill_get(u_ios), b' ');
+            assert_eq!(ios_fill_set(u_ios, b'0'), b' ');
+            assert_eq!(ios_fill_get(u_ios), b'0');
+            assert_eq!(ios_fill_set(u_ios, b'_'), b'0');
+            assert_eq!(ios_fill_get(u_ios), b'_');
+            ios_dtor(u_ios);
+
+            // 3. codecvt<wchar_t, char, _Mbstatet>::_Getcat + unaligned ctors.
+            let mut raw_ppf = [0u8; std::mem::size_of::<*const Facet>() + 8];
+            let u_ppf = raw_ppf.as_mut_ptr().add(3) as *mut *const Facet;
+            assert!(!u_ppf.is_aligned());
+            std::ptr::write_unaligned(u_ppf, std::ptr::null());
+            assert_eq!(codecvt_w_getcat(u_ppf, std::ptr::null()), 2);
+            let fac = std::ptr::read_unaligned(u_ppf);
+            assert!(!fac.is_null());
+            let cw = fac as *mut CodecvtW;
+            assert_eq!(read_field::<_, *const Ptr>(cw, std::mem::offset_of!(CodecvtW, vtable)), CODECVT_W_VTABLE.as_ptr());
+            assert_eq!(read_field::<_, u32>(cw, std::mem::offset_of!(CodecvtW, refs)), 0);
+            // Calling _Getcat again when *ppf is non-null must not overwrite it.
+            assert_eq!(codecvt_w_getcat(u_ppf, std::ptr::null()), 2);
+            assert_eq!(std::ptr::read_unaligned(u_ppf), fac);
+            // Verify codecvt_w_in works on the allocated facet.
+            let src = b"Hi";
+            let mut fnxt: *const u8 = std::ptr::null();
+            let mut dst = [0u16; 2];
+            let mut tnxt: *mut u16 = std::ptr::null_mut();
+            let mut st = 0u64;
+            assert_eq!(
+                codecvt_w_in(cw, &mut st, src.as_ptr(), src.as_ptr().add(2), &mut fnxt, dst.as_mut_ptr(), dst.as_mut_ptr().add(2), &mut tnxt),
+                0
+            );
+            assert_eq!(dst, [b'H' as u16, b'i' as u16]);
+            codecvt_deleting_dtor(fac as *mut Facet, 1);
+
+            let mut raw_cw = vec![0u8; std::mem::size_of::<CodecvtW>() + 8];
+            let u_cw = raw_cw.as_mut_ptr().add(1) as *mut CodecvtW;
+            assert!(!u_cw.is_aligned());
+            codecvt_w_ctor(u_cw, 3);
+            assert_eq!(read_field::<_, u32>(u_cw, std::mem::offset_of!(CodecvtW, refs)), 3);
+
+            let mut raw_cu32 = vec![0u8; std::mem::size_of::<CodecvtU32>() + 8];
+            let u_cu32 = raw_cu32.as_mut_ptr().add(1) as *mut CodecvtU32;
+            assert!(!u_cu32.is_aligned());
+            codecvt_u32_ctor(u_cu32, 2);
+            assert_eq!(read_field::<_, u32>(u_cu32, std::mem::offset_of!(CodecvtU32, maxcode)), 0x10ffff);
+
+            // 4. basic_istream<char>::seekg(fpos), seekg(off, way), and tellg() on unaligned objects.
+            SEEKOFF_CALLS.store(0, Ordering::SeqCst);
+            SEEKPOS_CALLS.store(0, Ordering::SeqCst);
+            CUR_POS.store(12, Ordering::SeqCst);
+
+            let mut custom_vt = BASIC_STREAMBUF_VTABLE;
+            custom_vt[10] = Ptr(custom_seekoff as *const ());
+            custom_vt[11] = Ptr(custom_seekpos as *const ());
+
+            let mut raw_sb = vec![0u8; std::mem::size_of::<BasicStreambuf>() + 8];
+            let u_sb = raw_sb.as_mut_ptr().add(3) as *mut BasicStreambuf;
+            assert!(!u_sb.is_aligned());
+            streambuf_ctor(u_sb);
+            write_field(u_sb, std::mem::offset_of!(BasicStreambuf, vtable), custom_vt.as_ptr());
+
+            let mut raw_istr = vec![0u8; 0x18 + std::mem::size_of::<BasicIos>() + 8];
+            let u_istr = raw_istr.as_mut_ptr().add(5);
+            istream_ctor(u_istr, u_sb, 0, 1);
+            let istr_ios = stream_ios(u_istr);
+            assert!(!istr_ios.is_aligned());
+
+            // tellg dispatches vtable[10] with (0, cur=1, in=1) into unaligned fpos output.
+            let mut raw_pos = [0u8; 24 + 8];
+            let u_pos = raw_pos.as_mut_ptr().add(3) as *mut [i64; 3];
+            assert!(!u_pos.is_aligned());
+            assert_eq!(istream_tellg(u_istr, u_pos), u_pos);
+            assert_eq!(std::ptr::read_unaligned(u_pos), [12, 0, 0]);
+            assert_eq!(*LAST_SEEKOFF_ARGS.lock().unwrap(), (0, 1, 1));
+
+            // seekg(fpos) clears eofbit first and invokes vtable[11] with mode=in(1).
+            ios_setstate(istr_ios, 1, 0); // eofbit
+            assert_eq!(ios_good(istr_ios), 0);
+            std::ptr::write_unaligned(u_pos, [42, 0, 7]);
+            assert_eq!(istream_seekg_pos(u_istr, u_pos), u_istr);
+            assert_eq!(ios_good(istr_ios), 1);
+            assert_eq!(*LAST_SEEKPOS_ARGS.lock().unwrap(), ([42, 0, 7], 1));
+            assert_eq!(CUR_POS.load(Ordering::SeqCst), 42);
+
+            // seekg(off, way) clears eofbit and invokes vtable[10] with (off, way, in=1).
+            ios_setstate(istr_ios, 1, 0);
+            assert_eq!(istream_seekg(u_istr, -10, 2 /* end */), u_istr);
+            assert_eq!(ios_good(istr_ios), 1);
+            assert_eq!(*LAST_SEEKOFF_ARGS.lock().unwrap(), (-10, 2, 1));
+            assert_eq!(CUR_POS.load(Ordering::SeqCst), 90);
+
+            // seekg(fpos(-1)) sets failbit (2); subsequent tellg returns [-1, 0, 0] and
+            // subsequent seekg(pos) does not invoke seekpos while failbit is set.
+            std::ptr::write_unaligned(u_pos, [-1, 0, 0]);
+            istream_seekg_pos(u_istr, u_pos);
+            assert_eq!(read_field::<_, i32>(istr_ios, std::mem::offset_of!(BasicIos, mystate)) & 2, 2);
+            let prev_seekpos = SEEKPOS_CALLS.load(Ordering::SeqCst);
+            let prev_seekoff = SEEKOFF_CALLS.load(Ordering::SeqCst);
+            std::ptr::write_unaligned(u_pos, [5, 0, 0]);
+            istream_seekg_pos(u_istr, u_pos);
+            assert_eq!(SEEKPOS_CALLS.load(Ordering::SeqCst), prev_seekpos);
+            istream_tellg(u_istr, u_pos);
+            assert_eq!(std::ptr::read_unaligned(u_pos), [-1, 0, 0]);
+            assert_eq!(SEEKOFF_CALLS.load(Ordering::SeqCst), prev_seekoff);
+
+            // Clear failbit and verify null pos sets failbit.
+            ios_clear(istr_ios, 0, 0);
+            istream_seekg_pos(u_istr, std::ptr::null());
+            assert_eq!(read_field::<_, i32>(istr_ios, std::mem::offset_of!(BasicIos, mystate)) & 2, 2);
+
+            ios_dtor(istr_ios);
+            streambuf_dtor(u_sb);
+
+            // 5. std::_Execute_once: null validation, retry on failure, single execution on success, unaligned flag.
+            unsafe extern "win64" fn once_cb(
+                _once: *mut c_void,
+                param: *mut c_void,
+                _ctx: *mut *mut c_void,
+            ) -> i32 {
+                let state = &*(param as *const AtomicI32);
+                let prev = state.fetch_add(1, Ordering::SeqCst);
+                if prev == 0 { 0 } else { 1 } // Fail first attempt, succeed second.
+            }
+
+            crate::teb::set_last_error(0);
+            assert_eq!(execute_once(std::ptr::null_mut(), Some(once_cb), std::ptr::null_mut()), 0);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_PARAMETER);
+
+            let mut raw_flag = [0u8; 16];
+            let u_flag = raw_flag.as_mut_ptr().add(3) as *mut c_void;
+            assert!(!(u_flag as *const usize).is_aligned());
+            crate::teb::set_last_error(0);
+            assert_eq!(execute_once(u_flag, None, std::ptr::null_mut()), 0);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_PARAMETER);
+
+            let calls = AtomicI32::new(0);
+            let param = (&calls as *const AtomicI32) as *mut c_void;
+            // First call returns 0 (failed init), leaving flag retryable.
+            assert_eq!(execute_once(u_flag, Some(once_cb), param), 0);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            // Second call succeeds and marks once_flag complete.
+            assert_eq!(execute_once(u_flag, Some(once_cb), param), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            // Subsequent calls return 1 without re-running callback.
+            assert_eq!(execute_once(u_flag, Some(once_cb), param), 1);
+            assert_eq!(execute_once(u_flag, Some(once_cb), param), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn xget_last_error_system_error_metadata_and_lifecycle() {
+        unsafe {
+            let slab = system_error_throw_slab();
+            let base = slab as *const SystemErrorThrowSlab as usize;
+            let ti = std::ptr::addr_of!(slab.ti_heap) as *const u8;
+            let attrs = std::ptr::read_unaligned(ti as *const u32);
+            let unwind_rva = std::ptr::read_unaligned(ti.add(4) as *const i32);
+            let cta_rva = std::ptr::read_unaligned(ti.add(12) as *const i32);
+            assert_eq!(attrs, 0);
+            assert_ne!(unwind_rva, 0);
+            assert_eq!(
+                (base as isize + unwind_rva as isize) as usize,
+                system_error_unwind_dtor as *const () as usize
+            );
+            assert!(cta_rva > 0);
+
+            let cta = (base as isize + cta_rva as isize) as *const i32;
+            assert_eq!(std::ptr::read_unaligned(cta), 3);
+
+            let expected: [(&str, i32, usize); 3] = [
+                (
+                    ".?AVsystem_error@std@@",
+                    0x28,
+                    system_error_copy_ctor as *const () as usize,
+                ),
+                (
+                    ".?AVruntime_error@std@@",
+                    0x18,
+                    runtime_error_copy_ctor as *const () as usize,
+                ),
+                (
+                    ".?AVexception@std@@",
+                    0x18,
+                    exception_copy_ctor as *const () as usize,
+                ),
+            ];
+            let mut copy_fns = [0usize; 3];
+            for (i, &(want_name, want_size, want_copy)) in expected.iter().enumerate() {
+                let ct_rva = std::ptr::read_unaligned(cta.add(1 + i));
+                let ct = (base as isize + ct_rva as isize) as *const u8;
+                let props = std::ptr::read_unaligned(ct as *const u32);
+                let td_rva = std::ptr::read_unaligned(ct.add(4) as *const i32);
+                let pmd = [
+                    std::ptr::read_unaligned(ct.add(8) as *const i32),
+                    std::ptr::read_unaligned(ct.add(12) as *const i32),
+                    std::ptr::read_unaligned(ct.add(16) as *const i32),
+                ];
+                let sz = std::ptr::read_unaligned(ct.add(20) as *const i32);
+                let copy_rva = std::ptr::read_unaligned(ct.add(24) as *const i32);
+                assert_eq!(props, 0);
+                assert_eq!(pmd, [0, -1, 0]);
+                assert_eq!(sz, want_size);
+                assert_ne!(copy_rva, 0);
+                let copy_va = (base as isize + copy_rva as isize) as usize;
+                assert_eq!(copy_va, want_copy);
+                copy_fns[i] = copy_va;
+
+                let td = (base as isize + td_rva as isize) as *const u8;
+                let got_name = CStr::from_ptr(td.add(16) as *const c_char).to_str().unwrap();
+                assert_eq!(got_name, want_name);
+            }
+
+            // Construct a heap-allocated StdSystemError for ERROR_ACCESS_DENIED (5 -> EACCES 13).
+            let obj = crate::ucrt::heap::calloc(1, std::mem::size_of::<StdSystemError>())
+                as *mut StdSystemError;
+            assert!(!obj.is_null());
+            init_system_error(obj, 5);
+            assert_eq!(
+                CStr::from_ptr(exception_what(obj.cast())).to_str().unwrap(),
+                "permission denied"
+            );
+            let code: StdErrorCode = read_field(obj, std::mem::offset_of!(StdSystemError, code));
+            assert_eq!(code.val, 5);
+            assert_eq!(code.cat, &SYSTEM_CATEGORY as *const StdErrorCategory);
+            assert_eq!(CStr::from_ptr(system_category_name(code.cat)).to_str().unwrap(), "system");
+
+            // error_category virtuals: default_error_condition, equivalent, message.
+            let mut cond = StdErrorCode { val: 0, _pad: 0, cat: std::ptr::null() };
+            system_category_default_error_condition(code.cat, &mut cond, 5);
+            assert_eq!(cond.val, 13); // EACCES
+            assert_eq!(cond.cat, &GENERIC_CATEGORY as *const StdErrorCategory);
+            assert_eq!(error_category_equiv_code_int(code.cat, &code, 5), 1);
+            assert_eq!(error_category_equiv_int_cond(code.cat, 5, &cond), 1);
+
+            let mut msg_str = [0u8; 32];
+            system_category_message(code.cat, &mut msg_str, 5);
+            let msg_len = u64::from_le_bytes(msg_str[16..24].try_into().unwrap()) as usize;
+            let msg_cap = u64::from_le_bytes(msg_str[24..32].try_into().unwrap()) as usize;
+            assert_eq!(msg_len, "permission denied".len());
+            assert!(msg_cap >= 16);
+            let msg_ptr = u64::from_le_bytes(msg_str[0..8].try_into().unwrap()) as *mut c_void;
+            assert_eq!(CStr::from_ptr(msg_ptr.cast()).to_str().unwrap(), "permission denied");
+            crate::ucrt::heap::free(msg_ptr);
+
+            // Unmapped Win32 error formats fallback string and preserves system category.
+            let mut unmapped_cond = StdErrorCode { val: 0, _pad: 0, cat: std::ptr::null() };
+            system_category_default_error_condition(code.cat, &mut unmapped_cond, 99_999);
+            assert_eq!(unmapped_cond.val, 99_999);
+            assert_eq!(unmapped_cond.cat, &SYSTEM_CATEGORY as *const StdErrorCategory);
+            assert_eq!(system_error_message(99_999), "system error 99999");
+
+            // Copy-construct into unaligned catch buffers for all 3 catchable types via ThrowInfo copy_fn RVAs.
+            let mut raw_se = [0u8; std::mem::size_of::<StdSystemError>() + 8];
+            let u_se = raw_se.as_mut_ptr().add(3) as *mut StdSystemError;
+            assert!(!u_se.is_aligned());
+            let _ = crate::call_guest8(copy_fns[0], u_se as u64, obj as u64, 0, 0, 0, 0, 0, 0);
+            assert_eq!(
+                CStr::from_ptr(exception_what(u_se.cast())).to_str().unwrap(),
+                "permission denied"
+            );
+            assert_eq!(
+                read_field::<_, StdErrorCode>(u_se, std::mem::offset_of!(StdSystemError, code)).val,
+                5
+            );
+            exception_deleting_dtor(u_se.cast(), 0);
+
+            let mut raw_re = [0u8; std::mem::size_of::<StdException>() + 8];
+            let u_re = raw_re.as_mut_ptr().add(3) as *mut StdException;
+            let _ = crate::call_guest8(copy_fns[1], u_re as u64, obj as u64, 0, 0, 0, 0, 0, 0);
+            assert_eq!(
+                CStr::from_ptr(exception_what(u_re)).to_str().unwrap(),
+                "permission denied"
+            );
+            exception_deleting_dtor(u_re, 0);
+
+            let mut raw_ex = [0u8; std::mem::size_of::<StdException>() + 8];
+            let u_ex = raw_ex.as_mut_ptr().add(1) as *mut StdException;
+            let _ = crate::call_guest8(copy_fns[2], u_ex as u64, obj as u64, 0, 0, 0, 0, 0, 0);
+            assert_eq!(
+                CStr::from_ptr(exception_what(u_ex)).to_str().unwrap(),
+                "permission denied"
+            );
+            exception_deleting_dtor(u_ex, 0);
+
+            // Destroy the original thrown object through vcruntime140::destruct_exception_object.
+            let rec = crate::unwind::ExceptionRecord {
+                code: crate::unwind::CXX_EXCEPTION,
+                flags: crate::unwind::EXCEPTION_NONCONTINUABLE,
+                record: std::ptr::null_mut(),
+                address: std::ptr::null_mut(),
+                number_parameters: 4,
+                _pad: 0,
+                information: [0x1993_0520, obj as u64, ti as u64, base as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            };
+            crate::misc::vcruntime140::destruct_exception_object(&rec);
         }
     }
 }
