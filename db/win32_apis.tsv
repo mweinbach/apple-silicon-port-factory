@@ -1010,6 +1010,7 @@ kernel32.dll	ExpandEnvironmentStringsA	-	CORE_OS	real	win32_rt::kernel32::proces
 kernel32.dll	ExpandEnvironmentStringsW	-	CORE_OS	real	win32_rt::kernel32::process::ExpandEnvironmentStringsW	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	FatalAppExitA	-	CORE_OS	real	win32_rt::kernel32::process::FatalAppExitA	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	FatalAppExitW	-	CORE_OS	real	win32_rt::kernel32::process::FatalAppExitW	crates/win32-rt/src/kernel32/process.rs
+kernel32.dll	FileTimeToDosDateTime	-	CORE_OS	real	win32_rt::kernel32::time::FileTimeToDosDateTime	crates/win32-rt/src/kernel32/time.rs
 kernel32.dll	FileTimeToLocalFileTime	-	CORE_OS	real	win32_rt::kernel32::time::FileTimeToLocalFileTime	crates/win32-rt/src/kernel32/time.rs
 kernel32.dll	FileTimeToSystemTime	-	CORE_OS	real	win32_rt::kernel32::time::FileTimeToSystemTime	crates/win32-rt/src/kernel32/time.rs
 kernel32.dll	FindClose	-	CORE_OS	real	win32_rt::kernel32::file::FindClose	crates/win32-rt/src/kernel32/file.rs
@@ -1063,6 +1064,7 @@ kernel32.dll	GetConsoleCP	-	CORE_OS	real	win32_rt::kernel32::file::GetConsoleCP	
 kernel32.dll	GetConsoleMode	-	CORE_OS	real	win32_rt::kernel32::file::GetConsoleMode	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetConsoleOutputCP	-	CORE_OS	real	win32_rt::kernel32::file::GetConsoleOutputCP	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetConsoleScreenBufferInfo	-	CORE_OS	real	win32_rt::kernel32::file::GetConsoleScreenBufferInfo	crates/win32-rt/src/kernel32/file.rs
+kernel32.dll	GetConsoleScreenBufferInfoEx	-	CORE_OS	real	win32_rt::kernel32::file::GetConsoleScreenBufferInfoEx	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetConsoleWindow	-	CORE_OS	real	win32_rt::kernel32::file::GetConsoleWindow	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetCurrentActCtx	-	CORE_OS	real	win32_rt::kernel32::module::GetCurrentActCtx	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	GetCurrentDirectoryA	-	CORE_OS	real	win32_rt::kernel32::file::GetCurrentDirectoryA	crates/win32-rt/src/kernel32/file.rs
@@ -1108,6 +1110,7 @@ kernel32.dll	GetFinalPathNameByHandleA	-	CORE_OS	real	win32_rt::kernel32::file::
 kernel32.dll	GetFinalPathNameByHandleW	-	CORE_OS	real	win32_rt::kernel32::file::GetFinalPathNameByHandleW	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetFullPathNameA	-	CORE_OS	real	win32_rt::kernel32::file::GetFullPathNameA	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetFullPathNameW	-	CORE_OS	real	win32_rt::kernel32::file::GetFullPathNameW	crates/win32-rt/src/kernel32/file.rs
+kernel32.dll	GetGeoInfoA	-	CORE_OS	real	win32_rt::kernel32::string::GetGeoInfoA	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetGeoInfoW	-	CORE_OS	real	win32_rt::kernel32::string::GetGeoInfoW	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetHandleInformation	-	CORE_OS	real	win32_rt::kernel32::threads::GetHandleInformation	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	GetLargePageMinimum	-	CORE_OS	real	win32_rt::kernel32::sysinfo::GetLargePageMinimum	crates/win32-rt/src/kernel32/sysinfo.rs
@@ -1128,6 +1131,7 @@ kernel32.dll	GetMaximumProcessorCount	-	CORE_OS	real	win32_rt::kernel32::sysinfo
 kernel32.dll	GetModuleBaseNameA	-	CORE_OS	real	win32_rt::kernel32::module::GetModuleBaseNameA	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	GetModuleBaseNameW	-	CORE_OS	real	win32_rt::kernel32::module::GetModuleBaseNameW	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	GetModuleFileNameA	-	CORE_OS	real	win32_rt::kernel32::module::GetModuleFileNameA	crates/win32-rt/src/kernel32/module.rs
+kernel32.dll	GetModuleFileNameExA	-	CORE_OS	real	win32_rt::kernel32::module::GetModuleFileNameExA	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	GetModuleFileNameExW	-	CORE_OS	real	win32_rt::kernel32::module::GetModuleFileNameExW	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	GetModuleFileNameW	-	CORE_OS	real	win32_rt::kernel32::module::GetModuleFileNameW	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	GetModuleHandleA	-	CORE_OS	real	win32_rt::kernel32::module::GetModuleHandleA	crates/win32-rt/src/kernel32/module.rs
@@ -1185,6 +1189,7 @@ kernel32.dll	GetSystemDefaultLocaleName	-	CORE_OS	real	win32_rt::kernel32::strin
 kernel32.dll	GetSystemDefaultUILanguage	-	CORE_OS	real	win32_rt::kernel32::string::GetSystemDefaultUILanguage	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetSystemDirectoryA	-	CORE_OS	real	win32_rt::kernel32::sysinfo::GetSystemDirectoryA	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	GetSystemDirectoryW	-	CORE_OS	real	win32_rt::kernel32::sysinfo::GetSystemDirectoryW	crates/win32-rt/src/kernel32/sysinfo.rs
+kernel32.dll	GetSystemFirmwareTable	-	CORE_OS	real	win32_rt::kernel32::sysinfo::GetSystemFirmwareTable	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	GetSystemInfo	-	CORE_OS	real	win32_rt::kernel32::sysinfo::GetSystemInfo	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	GetSystemPowerStatus	-	CORE_OS	real	win32_rt::kernel32::process::GetSystemPowerStatus	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	GetSystemPreferredUILanguages	-	CORE_OS	real	win32_rt::kernel32::string::GetSystemPreferredUILanguages	crates/win32-rt/src/kernel32/string.rs
@@ -1220,6 +1225,7 @@ kernel32.dll	GetTimeFormatA	-	CORE_OS	real	win32_rt::kernel32::time::GetTimeForm
 kernel32.dll	GetTimeFormatEx	-	CORE_OS	real	win32_rt::kernel32::string::GetTimeFormatEx	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetTimeFormatW	-	CORE_OS	real	win32_rt::kernel32::string::GetTimeFormatW	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetTimeZoneInformation	-	CORE_OS	real	win32_rt::kernel32::time::GetTimeZoneInformation	crates/win32-rt/src/kernel32/time.rs
+kernel32.dll	GetUserDefaultGeoName	-	CORE_OS	real	win32_rt::kernel32::string::GetUserDefaultGeoName	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetUserDefaultLCID	-	CORE_OS	real	win32_rt::kernel32::string::GetUserDefaultLCID	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetUserDefaultLangID	-	CORE_OS	real	win32_rt::kernel32::string::GetUserDefaultLangID	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetUserDefaultLocaleName	-	CORE_OS	real	win32_rt::kernel32::string::GetUserDefaultLocaleName	crates/win32-rt/src/kernel32/string.rs
@@ -1246,6 +1252,7 @@ kernel32.dll	GlobalDeleteAtom	-	CORE_OS	real	win32_rt::kernel32::process::Global
 kernel32.dll	GlobalFree	-	CORE_OS	real	win32_rt::kernel32::memory::GlobalFree	crates/win32-rt/src/kernel32/memory.rs
 kernel32.dll	GlobalHandle	-	CORE_OS	real	win32_rt::kernel32::memory::GlobalHandle	crates/win32-rt/src/kernel32/memory.rs
 kernel32.dll	GlobalLock	-	CORE_OS	real	win32_rt::kernel32::memory::GlobalLock	crates/win32-rt/src/kernel32/memory.rs
+kernel32.dll	GlobalMemoryStatus	-	CORE_OS	real	win32_rt::kernel32::sysinfo::GlobalMemoryStatus	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	GlobalMemoryStatusEx	-	CORE_OS	real	win32_rt::kernel32::sysinfo::GlobalMemoryStatusEx	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	GlobalReAlloc	-	CORE_OS	real	win32_rt::kernel32::memory::GlobalReAlloc	crates/win32-rt/src/kernel32/memory.rs
 kernel32.dll	GlobalSize	-	CORE_OS	real	win32_rt::kernel32::memory::GlobalSize	crates/win32-rt/src/kernel32/memory.rs
@@ -1299,6 +1306,7 @@ kernel32.dll	K32GetMappedFileNameA	-	CORE_OS	real	win32_rt::kernel32::module::K3
 kernel32.dll	K32GetMappedFileNameW	-	CORE_OS	real	win32_rt::kernel32::module::K32GetMappedFileNameW	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	K32GetModuleBaseNameA	-	CORE_OS	real	win32_rt::kernel32::module::K32GetModuleBaseNameA	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	K32GetModuleBaseNameW	-	CORE_OS	real	win32_rt::kernel32::module::K32GetModuleBaseNameW	crates/win32-rt/src/kernel32/module.rs
+kernel32.dll	K32GetModuleFileNameExA	-	CORE_OS	real	win32_rt::kernel32::module::K32GetModuleFileNameExA	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	K32GetModuleFileNameExW	-	CORE_OS	real	win32_rt::kernel32::module::K32GetModuleFileNameExW	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	K32GetModuleInformation	-	CORE_OS	real	win32_rt::kernel32::module::K32GetModuleInformation	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	K32GetProcessImageFileNameW	-	CORE_OS	real	win32_rt::kernel32::process::K32GetProcessImageFileNameW	crates/win32-rt/src/kernel32/process.rs
@@ -1424,12 +1432,14 @@ kernel32.dll	SetConsoleCP	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleCP	
 kernel32.dll	SetConsoleCtrlHandler	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleCtrlHandler	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetConsoleMode	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleMode	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetConsoleOutputCP	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleOutputCP	crates/win32-rt/src/kernel32/file.rs
+kernel32.dll	SetConsoleScreenBufferInfoEx	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleScreenBufferInfoEx	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetConsoleScreenBufferSize	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleScreenBufferSize	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetConsoleTextAttribute	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleTextAttribute	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetConsoleTitleA	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleTitleA	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetConsoleTitleW	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleTitleW	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetConsoleWindowInfo	-	CORE_OS	real	win32_rt::kernel32::file::SetConsoleWindowInfo	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetCriticalSectionSpinCount	-	CORE_OS	real	win32_rt::sync::SetCriticalSectionSpinCount	crates/win32-rt/src/sync.rs
+kernel32.dll	SetCurrentConsoleFontEx	-	CORE_OS	real	win32_rt::kernel32::file::SetCurrentConsoleFontEx	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetCurrentDirectoryA	-	CORE_OS	real	win32_rt::kernel32::file::SetCurrentDirectoryA	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetCurrentDirectoryW	-	CORE_OS	real	win32_rt::kernel32::file::SetCurrentDirectoryW	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetDefaultDllDirectories	-	CORE_OS	real	win32_rt::kernel32::module::SetDefaultDllDirectories	crates/win32-rt/src/kernel32/module.rs
@@ -1442,6 +1452,7 @@ kernel32.dll	SetErrorMode	-	CORE_OS	real	win32_rt::kernel32::process::SetErrorMo
 kernel32.dll	SetEvent	-	CORE_OS	real	win32_rt::kernel32::threads::SetEvent	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	SetEventWhenCallbackReturns	-	CORE_OS	real	win32_rt::kernel32::threadpool::SetEventWhenCallbackReturns	crates/win32-rt/src/kernel32/threadpool.rs
 kernel32.dll	SetFileApisToANSI	-	CORE_OS	real	win32_rt::kernel32::file::SetFileApisToANSI	crates/win32-rt/src/kernel32/file.rs
+kernel32.dll	SetFileAttributesA	-	CORE_OS	real	win32_rt::kernel32::file::SetFileAttributesA	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetFileAttributesW	-	CORE_OS	real	win32_rt::kernel32::file::SetFileAttributesW	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetFileCompletionNotificationModes	-	CORE_OS	real	win32_rt::kernel32::file::SetFileCompletionNotificationModes	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	SetFileInformationByHandle	-	CORE_OS	real	win32_rt::kernel32::file::SetFileInformationByHandle	crates/win32-rt/src/kernel32/file.rs
@@ -1513,6 +1524,7 @@ kernel32.dll	TlsAlloc	-	CORE_OS	real	win32_rt::kernel32::threads::TlsAlloc	crate
 kernel32.dll	TlsFree	-	CORE_OS	real	win32_rt::kernel32::threads::TlsFree	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	TlsGetValue	-	CORE_OS	real	win32_rt::kernel32::threads::TlsGetValue	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	TlsSetValue	-	CORE_OS	real	win32_rt::kernel32::threads::TlsSetValue	crates/win32-rt/src/kernel32/threads.rs
+kernel32.dll	TransactNamedPipe	-	CORE_OS	real	win32_rt::kernel32::file::TransactNamedPipe	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	TryAcquireSRWLockExclusive	-	CORE_OS	real	win32_rt::sync::TryAcquireSRWLockExclusive	crates/win32-rt/src/sync.rs
 kernel32.dll	TryAcquireSRWLockShared	-	CORE_OS	real	win32_rt::sync::TryAcquireSRWLockShared	crates/win32-rt/src/sync.rs
 kernel32.dll	TryEnterCriticalSection	-	CORE_OS	real	win32_rt::sync::TryEnterCriticalSection	crates/win32-rt/src/sync.rs

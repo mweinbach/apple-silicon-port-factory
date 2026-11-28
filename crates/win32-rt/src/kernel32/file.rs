@@ -431,6 +431,13 @@ pub unsafe extern "win64" fn SetStdHandle(which: u32, h: HANDLE) -> BOOL {
     TRUE
 }
 
+const DEFAULT_CONSOLE_COLORS: [u32; 16] = [
+    0x0000_0000, 0x0080_0000, 0x0000_8000, 0x0080_8000,
+    0x0000_0080, 0x0080_0080, 0x0000_8080, 0x00C0_C0C0,
+    0x0080_8080, 0x00FF_0000, 0x0000_FF00, 0x00FF_FF00,
+    0x0000_00FF, 0x00FF_00FF, 0x0000_FFFF, 0x00FF_FFFF,
+];
+
 struct ConsoleSession {
     attached: bool,
     in_mode: u32,
@@ -438,6 +445,17 @@ struct ConsoleSession {
     in_cp: u32,
     out_cp: u32,
     title: String,
+    attributes: u16,
+    popup_attributes: u16,
+    cursor_pos: [i16; 2],
+    buf_size_override: Option<[i16; 2]>,
+    window_rect_override: Option<[i16; 4]>,
+    color_table: [u32; 16],
+    font_index: u32,
+    font_size: [i16; 2],
+    font_family: u32,
+    font_weight: u32,
+    font_face: String,
     /// Handles created by the active `AllocConsole` / `AttachConsole` session so `FreeConsole` can detach cleanly.
     session_handles: Option<[usize; 3]>,
 }
@@ -454,6 +472,17 @@ fn console_session() -> &'static Mutex<ConsoleSession> {
             in_cp: ACP,
             out_cp: ACP,
             title: String::new(),
+            attributes: 7,
+            popup_attributes: 0x00F5,
+            cursor_pos: [0, 0],
+            buf_size_override: None,
+            window_rect_override: None,
+            color_table: DEFAULT_CONSOLE_COLORS,
+            font_index: 0,
+            font_size: [8, 16],
+            font_family: 0x36, // FF_MODERN | TMPF_FIXED_PITCH
+            font_weight: 400,
+            font_face: "Consolas".into(),
             session_handles: None,
         })
     })
@@ -810,6 +839,10 @@ pub unsafe extern "win64" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *mut u1
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
+    if info.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     // Query real terminal window size via TIOCGWINSZ when available.
     let (cols, rows) = get_file(h)
         .and_then(|f| {
@@ -821,13 +854,130 @@ pub unsafe extern "win64" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *mut u1
             }
         })
         .unwrap_or((120, 50));
+    let st = console_session().lock().unwrap();
+    let (buf_x, buf_y) = st
+        .buf_size_override
+        .map(|s| (s[0] as u16, s[1] as u16))
+        .unwrap_or((cols, rows.max(9000)));
     // COORD dwSize, COORD cursor, WORD attr, SMALL_RECT window, COORD max
-    let vals: [u16; 11] = [cols, rows.max(9000), 0, 0, 7, 0, 0, cols.saturating_sub(1), rows.saturating_sub(1), cols, rows];
+    let vals: [u16; 11] = [
+        buf_x,
+        buf_y,
+        st.cursor_pos[0] as u16,
+        st.cursor_pos[1] as u16,
+        st.attributes,
+        0,
+        0,
+        cols.saturating_sub(1),
+        rows.saturating_sub(1),
+        cols,
+        rows,
+    ];
     std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, info as *mut u8, 22);
     TRUE
 }
 
-pub unsafe extern "win64" fn SetConsoleTextAttribute(_h: HANDLE, _a: u16) -> BOOL {
+pub unsafe extern "win64" fn GetConsoleScreenBufferInfoEx(h: HANDLE, info: *mut u8) -> BOOL {
+    if !is_console(h) {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if info.is_null() || std::ptr::read_unaligned(info as *const u32) < 96 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let (cols, rows) = get_file(h)
+        .and_then(|f| {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(f.fd(), libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                Some((ws.ws_col as i16, ws.ws_row as i16))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((120, 50));
+    let st = console_session().lock().unwrap();
+    let buf_size = st.buf_size_override.unwrap_or([cols, rows.max(9000)]);
+    let sr_window = st.window_rect_override.unwrap_or([0, 0, cols, rows]);
+    std::ptr::write_unaligned(info as *mut u32, 96u32);
+    std::ptr::write_unaligned(info.add(4) as *mut [i16; 2], buf_size);
+    std::ptr::write_unaligned(info.add(8) as *mut [i16; 2], st.cursor_pos);
+    std::ptr::write_unaligned(info.add(12) as *mut u16, st.attributes);
+    std::ptr::write_unaligned(info.add(14) as *mut [i16; 4], sr_window);
+    std::ptr::write_unaligned(info.add(22) as *mut [i16; 2], [cols, rows]);
+    std::ptr::write_unaligned(info.add(26) as *mut u16, st.popup_attributes);
+    std::ptr::write_unaligned(info.add(28) as *mut BOOL, FALSE);
+    std::ptr::write_unaligned(info.add(32) as *mut [u32; 16], st.color_table);
+    TRUE
+}
+
+pub unsafe extern "win64" fn SetConsoleScreenBufferInfoEx(h: HANDLE, info: *const u8) -> BOOL {
+    if !is_console(h) {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if info.is_null() || std::ptr::read_unaligned(info as *const u32) < 96 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let buf_size = std::ptr::read_unaligned(info.add(4) as *const [i16; 2]);
+    let cursor_pos = std::ptr::read_unaligned(info.add(8) as *const [i16; 2]);
+    let attributes = std::ptr::read_unaligned(info.add(12) as *const u16);
+    let sr_window = std::ptr::read_unaligned(info.add(14) as *const [i16; 4]);
+    let popup_attributes = std::ptr::read_unaligned(info.add(26) as *const u16);
+    let color_table = std::ptr::read_unaligned(info.add(32) as *const [u32; 16]);
+    let mut st = console_session().lock().unwrap();
+    if buf_size[0] > 0 && buf_size[1] > 0 {
+        st.buf_size_override = Some(buf_size);
+    }
+    st.cursor_pos = cursor_pos;
+    st.attributes = attributes;
+    st.window_rect_override = Some(sr_window);
+    st.popup_attributes = popup_attributes;
+    st.color_table = color_table;
+    TRUE
+}
+
+pub unsafe extern "win64" fn SetCurrentConsoleFontEx(
+    h: HANDLE,
+    _max_window: BOOL,
+    info: *const u8,
+) -> BOOL {
+    if !is_console(h) {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if info.is_null() || std::ptr::read_unaligned(info as *const u32) < 84 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let font_index = std::ptr::read_unaligned(info.add(4) as *const u32);
+    let font_size = std::ptr::read_unaligned(info.add(8) as *const [i16; 2]);
+    let font_family = std::ptr::read_unaligned(info.add(12) as *const u32);
+    let font_weight = std::ptr::read_unaligned(info.add(16) as *const u32);
+    let mut face_units = Vec::with_capacity(32);
+    for i in 0..32 {
+        let ch = std::ptr::read_unaligned(info.add(20 + i * 2) as *const u16);
+        if ch == 0 {
+            break;
+        }
+        face_units.push(ch);
+    }
+    let mut st = console_session().lock().unwrap();
+    st.font_index = font_index;
+    st.font_size = font_size;
+    st.font_family = font_family;
+    st.font_weight = font_weight;
+    if !face_units.is_empty() {
+        st.font_face = String::from_utf16_lossy(&face_units);
+    }
+    TRUE
+}
+
+pub unsafe extern "win64" fn SetConsoleTextAttribute(h: HANDLE, a: u16) -> BOOL {
+    if is_console(h) {
+        console_session().lock().unwrap().attributes = a;
+    }
     TRUE
 }
 pub unsafe extern "win64" fn SetConsoleTitleA(t: LPCSTR) -> BOOL {
@@ -3411,6 +3561,10 @@ pub unsafe extern "win64" fn GetFileAttributesExA(name: LPCSTR, level: u32, out:
 }
 
 pub unsafe extern "win64" fn SetFileAttributesW(name: LPCWSTR, attrs: u32) -> BOOL {
+    if name.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     let n = from_wide(name);
     let host = match host_path(&n) {
         Ok(h) => h,
@@ -3432,6 +3586,15 @@ pub unsafe extern "win64" fn SetFileAttributesW(name: LPCWSTR, attrs: u32) -> BO
     perm.set_mode(if attrs & FILE_ATTRIBUTE_READONLY != 0 { mode & !0o222 } else { mode | 0o200 });
     let _ = std::fs::set_permissions(&host, perm);
     TRUE
+}
+
+pub unsafe extern "win64" fn SetFileAttributesA(name: LPCSTR, attrs: u32) -> BOOL {
+    if name.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let w = to_wide_z(&from_ansi(name));
+    SetFileAttributesW(w.as_ptr(), attrs)
 }
 
 fn path_op(name: &str, op: impl FnOnce(&Path) -> std::io::Result<()>) -> BOOL {
@@ -7742,6 +7905,43 @@ pub unsafe extern "win64" fn WaitNamedPipeW(name: LPCWSTR, timeout: u32) -> BOOL
             }
         }
     }
+}
+
+pub unsafe extern "win64" fn TransactNamedPipe(
+    h_named_pipe: HANDLE,
+    in_buf: LPCVOID,
+    in_size: u32,
+    out_buf: LPVOID,
+    out_size: u32,
+    bytes_read: *mut u32,
+    ov: *mut OVERLAPPED,
+) -> BOOL {
+    if !bytes_read.is_null() {
+        std::ptr::write_unaligned(bytes_read, 0);
+    }
+    let Some(f) = get_file(h_named_pipe) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if f.kind != FileKind::Pipe {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (bytes_read.is_null() && ov.is_null())
+        || (in_size > 0 && in_buf.is_null())
+        || (out_size > 0 && out_buf.is_null())
+    {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    drop(f);
+    if in_size > 0 {
+        let mut written = 0u32;
+        if WriteFile(h_named_pipe, in_buf, in_size, &mut written, std::ptr::null_mut()) == FALSE {
+            return FALSE;
+        }
+    }
+    ReadFile(h_named_pipe, out_buf, out_size, bytes_read, ov)
 }
 
 // ---------------------------------------------------------------------------
@@ -12757,6 +12957,140 @@ mod tests {
             crate::kernel32::threads::CloseHandle(h_orig);
         }
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_file_attributes_a_console_ex_and_transact_named_pipe() {
+        let dir = std::env::temp_dir().join(format!("win32_rt_sm2_k32_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fpath = dir.join("attr_test.txt");
+        std::fs::write(&fpath, b"hello").unwrap();
+        crate::path::add_mount("V:\\", &dir);
+
+        unsafe {
+            // SetFileAttributesA sets/clears read-only mode + validates null/missing.
+            assert_eq!(SetFileAttributesA(std::ptr::null(), FILE_ATTRIBUTE_NORMAL), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            let missing = b"V:\\no_such_file.txt\0";
+            assert_eq!(SetFileAttributesA(missing.as_ptr(), FILE_ATTRIBUTE_NORMAL), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+            let p_ansi = b"V:\\attr_test.txt\0";
+            assert_eq!(SetFileAttributesA(p_ansi.as_ptr(), FILE_ATTRIBUTE_READONLY), TRUE);
+            assert_eq!(std::fs::metadata(&fpath).unwrap().permissions().mode() & 0o222, 0);
+            assert_eq!(SetFileAttributesA(p_ansi.as_ptr(), FILE_ATTRIBUTE_NORMAL), TRUE);
+            assert_ne!(std::fs::metadata(&fpath).unwrap().permissions().mode() & 0o200, 0);
+
+            // Console *Ex APIs round-trip on an AllocConsole handle and reject bad sizes/handles.
+            let _ = FreeConsole();
+            assert_eq!(AllocConsole(), TRUE);
+            let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut csbi_raw = [0u8; 97];
+            let csbi = csbi_raw.as_mut_ptr().add(1);
+            // Too-small cbSize fails with ERROR_INVALID_PARAMETER.
+            std::ptr::write_unaligned(csbi as *mut u32, 40u32);
+            assert_eq!(GetConsoleScreenBufferInfoEx(h_out, csbi), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            std::ptr::write_unaligned(csbi as *mut u32, 96u32);
+            assert_eq!(GetConsoleScreenBufferInfoEx(h_out, csbi), TRUE);
+            std::ptr::write_unaligned(csbi.add(4) as *mut [i16; 2], [100i16, 400i16]);
+            std::ptr::write_unaligned(csbi.add(12) as *mut u16, 0x1Eu16);
+            std::ptr::write_unaligned(csbi.add(32) as *mut u32, 0x0011_2233u32);
+            assert_eq!(SetConsoleScreenBufferInfoEx(h_out, csbi), TRUE);
+
+            let mut csbi2 = [0u8; 96];
+            std::ptr::write_unaligned(csbi2.as_mut_ptr() as *mut u32, 96u32);
+            assert_eq!(GetConsoleScreenBufferInfoEx(h_out, csbi2.as_mut_ptr()), TRUE);
+            assert_eq!(std::ptr::read_unaligned(csbi2.as_ptr().add(4) as *const [i16; 2]), [100, 400]);
+            assert_eq!(std::ptr::read_unaligned(csbi2.as_ptr().add(12) as *const u16), 0x1E);
+            assert_eq!(std::ptr::read_unaligned(csbi2.as_ptr().add(32) as *const u32), 0x0011_2233);
+
+            let mut font_raw = [0u8; 85];
+            let font = font_raw.as_mut_ptr().add(1);
+            std::ptr::write_unaligned(font as *mut u32, 16u32);
+            assert_eq!(SetCurrentConsoleFontEx(h_out, FALSE, font), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            std::ptr::write_unaligned(font as *mut u32, 84u32);
+            std::ptr::write_unaligned(font.add(8) as *mut [i16; 2], [10i16, 18i16]);
+            let face: Vec<u16> = "Lucida Console\0".encode_utf16().collect();
+            for (i, ch) in face.iter().enumerate() {
+                std::ptr::write_unaligned(font.add(20 + i * 2) as *mut u16, *ch);
+            }
+            assert_eq!(SetCurrentConsoleFontEx(h_out, FALSE, font), TRUE);
+            let _ = FreeConsole();
+
+            // TransactNamedPipe round-trips request/response over a named pipe.
+            let pname = to_wide_z(&format!("\\\\.\\pipe\\win32_rt_transact_{}", std::process::id()));
+            let srv = CreateNamedPipeW(
+                pname.as_ptr(),
+                0x3, // PIPE_ACCESS_DUPLEX
+                0x4 | 0x2, // PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv, INVALID_HANDLE_VALUE);
+            let srv_raw = srv as usize;
+            let cli = CreateFileW(
+                pname.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli, INVALID_HANDLE_VALUE);
+            assert_eq!(ConnectNamedPipe(srv, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), ERROR_PIPE_CONNECTED);
+            let t = std::thread::spawn(move || {
+                let h = srv_raw as HANDLE;
+                let mut req = [0u8; 32];
+                let mut got = 0u32;
+                assert_eq!(ReadFile(h, req.as_mut_ptr() as _, 32, &mut got, std::ptr::null_mut()), TRUE);
+                assert_eq!(&req[..got as usize], b"ping");
+                let mut wr = 0u32;
+                assert_eq!(WriteFile(h, b"pong!".as_ptr() as _, 5, &mut wr, std::ptr::null_mut()), TRUE);
+                assert_eq!(wr, 5);
+            });
+            let mut resp = [0u8; 32];
+            let mut got = 0u32;
+            assert_eq!(
+                TransactNamedPipe(
+                    cli,
+                    b"ping".as_ptr() as _,
+                    4,
+                    resp.as_mut_ptr() as _,
+                    resp.len() as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+            assert_eq!(got, 5);
+            assert_eq!(&resp[..5], b"pong!");
+            // Invalid handle fails cleanly.
+            assert_eq!(
+                TransactNamedPipe(
+                    INVALID_HANDLE_VALUE,
+                    b"a".as_ptr() as _,
+                    1,
+                    resp.as_mut_ptr() as _,
+                    4,
+                    &mut got,
+                    std::ptr::null_mut(),
+                ),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+            t.join().unwrap();
+            crate::kernel32::threads::CloseHandle(cli);
+            crate::kernel32::threads::CloseHandle(srv);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

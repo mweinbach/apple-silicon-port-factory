@@ -441,10 +441,183 @@ pub unsafe extern "win64" fn GlobalMemoryStatusEx(m: *mut MEMORYSTATUSEX) -> BOO
     TRUE
 }
 
+#[repr(C)]
+pub struct MEMORYSTATUS {
+    pub dwLength: u32,
+    pub dwMemoryLoad: u32,
+    pub dwTotalPhys: usize,
+    pub dwAvailPhys: usize,
+    pub dwTotalPageFile: usize,
+    pub dwAvailPageFile: usize,
+    pub dwTotalVirtual: usize,
+    pub dwAvailVirtual: usize,
+}
+const _: () = assert!(std::mem::size_of::<MEMORYSTATUS>() == 56);
+
+pub unsafe extern "win64" fn GlobalMemoryStatus(m: *mut MEMORYSTATUS) {
+    if m.is_null() {
+        return;
+    }
+    let mut ex: MEMORYSTATUSEX = std::mem::zeroed();
+    ex.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let _ = GlobalMemoryStatusEx(&mut ex);
+    let status = MEMORYSTATUS {
+        dwLength: std::mem::size_of::<MEMORYSTATUS>() as u32,
+        dwMemoryLoad: ex.dwMemoryLoad,
+        dwTotalPhys: ex.ullTotalPhys as usize,
+        dwAvailPhys: ex.ullAvailPhys as usize,
+        dwTotalPageFile: ex.ullTotalPageFile as usize,
+        dwAvailPageFile: ex.ullAvailPageFile as usize,
+        dwTotalVirtual: ex.ullTotalVirtual as usize,
+        dwAvailVirtual: ex.ullAvailVirtual as usize,
+    };
+    m.write_unaligned(status);
+}
+
 pub unsafe extern "win64" fn GetPhysicallyInstalledSystemMemory(kb: *mut u64) -> BOOL {
     let (total, _) = reported_physical_memory();
     *kb = total / 1024;
     TRUE
+}
+
+fn host_sysctl_string(name: &std::ffi::CStr) -> Option<String> {
+    let mut len: usize = 0;
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 || len > 512 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+}
+
+fn push_smbios_struct(out: &mut Vec<u8>, ty: u8, handle: u16, formatted_extra: &[u8], strings: &[&str]) {
+    let len = (4 + formatted_extra.len()) as u8;
+    out.push(ty);
+    out.push(len);
+    out.extend_from_slice(&handle.to_le_bytes());
+    out.extend_from_slice(formatted_extra);
+    if strings.is_empty() {
+        out.extend_from_slice(&[0, 0]);
+    } else {
+        for s in strings {
+            let clean: Vec<u8> = s.bytes().filter(|&b| b != 0).collect();
+            if clean.is_empty() {
+                out.push(b' ');
+            } else {
+                out.extend_from_slice(&clean);
+            }
+            out.push(0);
+        }
+        out.push(0);
+    }
+}
+
+/// Build an honest RawSMBIOSData table populated from Apple Silicon host `sysctl` hardware properties.
+fn build_raw_smbios_table() -> Vec<u8> {
+    let model = host_sysctl_string(c"hw.model").unwrap_or_else(|| "Apple Silicon".to_string());
+    let family = if cfg!(target_os = "ios") { "iOS" } else { "Mac" };
+    let mut table = Vec::with_capacity(256);
+
+    // Type 0: BIOS Information (24 bytes formatted)
+    let mut t0 = [0u8; 20];
+    t0[0] = 1; // Vendor
+    t0[1] = 2; // BIOS Version
+    t0[4] = 3; // BIOS Release Date
+    push_smbios_struct(&mut table, 0, 0x0000, &t0, &["Apple Inc.", "Apple Silicon", "01/01/2024"]);
+
+    // Type 1: System Information (27 bytes formatted)
+    let mut t1 = [0u8; 23];
+    t1[0] = 1; // Manufacturer
+    t1[1] = 2; // Product Name
+    t1[2] = 3; // Version
+    t1[3] = 4; // Serial Number
+    t1[20] = 6; // Wake-up Type: Power Switch
+    t1[21] = 0; // SKU Number
+    t1[22] = 5; // Family
+    push_smbios_struct(&mut table, 1, 0x0001, &t1, &["Apple Inc.", &model, "1.0", "0", family]);
+
+    // Type 2: Baseboard Information (15 bytes formatted)
+    let mut t2 = [0u8; 11];
+    t2[0] = 1; // Manufacturer
+    t2[1] = 2; // Product
+    t2[2] = 3; // Version
+    t2[3] = 4; // Serial Number
+    t2[5] = 0x09; // Hosting board + replaceable
+    push_smbios_struct(&mut table, 2, 0x0002, &t2, &["Apple Inc.", &model, "1.0", "0"]);
+
+    // Type 127: End-of-Table
+    push_smbios_struct(&mut table, 127, 0x007F, &[], &[]);
+
+    let mut raw = Vec::with_capacity(8 + table.len());
+    raw.push(0); // Used20CallingMethod
+    raw.push(3); // SMBIOSMajorVersion
+    raw.push(0); // SMBIOSMinorVersion
+    raw.push(0); // DmiRevision
+    raw.extend_from_slice(&(table.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&table);
+    raw
+}
+
+/// `GetSystemFirmwareTable`: serves honest SMBIOS (`'RSMB'`, table 0) derived from host
+/// `sysctl` hardware identification, and returns documented Win32 errors (`ERROR_NOT_FOUND` /
+/// `ERROR_INVALID_FUNCTION`) for ACPI/FIRM or unknown providers.
+pub unsafe extern "win64" fn GetSystemFirmwareTable(
+    provider: u32,
+    table_id: u32,
+    buf: *mut u8,
+    buf_size: u32,
+) -> u32 {
+    const PROVIDER_RSMB: u32 = u32::from_be_bytes(*b"RSMB");
+    const PROVIDER_ACPI: u32 = u32::from_be_bytes(*b"ACPI");
+    const PROVIDER_FIRM: u32 = u32::from_be_bytes(*b"FIRM");
+
+    match provider {
+        PROVIDER_RSMB => {
+            if table_id != 0 {
+                crate::teb::set_last_error(err::ERROR_NOT_FOUND);
+                return 0;
+            }
+            let data = build_raw_smbios_table();
+            let need = data.len() as u32;
+            if buf.is_null() || buf_size < need {
+                crate::teb::set_last_error(err::ERROR_INSUFFICIENT_BUFFER);
+                return need;
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
+            need
+        }
+        PROVIDER_ACPI | PROVIDER_FIRM => {
+            crate::teb::set_last_error(err::ERROR_NOT_FOUND);
+            0
+        }
+        _ => {
+            crate::teb::set_last_error(err::ERROR_INVALID_FUNCTION);
+            0
+        }
+    }
 }
 
 /// (performance core count, efficiency core count) from the shared guest topology.
@@ -901,6 +1074,51 @@ mod tests {
             assert_eq!(count, n);
             assert_eq!(p_seen, topo.guest_p_cores);
             assert_eq!(mask, si.dwActiveProcessorMask);
+        }
+    }
+
+    #[test]
+    fn global_memory_status_and_firmware_table_behavior() {
+        unsafe {
+            // Unaligned MEMORYSTATUS (56 bytes) matches GlobalMemoryStatusEx.
+            let mut raw = [0u8; 64];
+            let p = raw.as_mut_ptr().add(1) as *mut MEMORYSTATUS;
+            GlobalMemoryStatus(p);
+            let ms = p.read_unaligned();
+            assert_eq!(ms.dwLength, 56);
+            assert!(ms.dwTotalPhys > 0);
+            assert!(ms.dwAvailPhys <= ms.dwTotalPhys);
+            assert!(ms.dwMemoryLoad <= 100);
+            // Null pointer is a safe no-op.
+            GlobalMemoryStatus(std::ptr::null_mut());
+
+            // GetSystemFirmwareTable('RSMB', 0) returns valid RawSMBIOSData.
+            let rsmb = u32::from_be_bytes(*b"RSMB");
+            let need = GetSystemFirmwareTable(rsmb, 0, std::ptr::null_mut(), 0);
+            assert!(need > 8);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INSUFFICIENT_BUFFER);
+
+            let mut small = [0u8; 4];
+            assert_eq!(GetSystemFirmwareTable(rsmb, 0, small.as_mut_ptr(), 4), need);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INSUFFICIENT_BUFFER);
+
+            let mut buf = vec![0u8; need as usize + 1];
+            let got = GetSystemFirmwareTable(rsmb, 0, buf.as_mut_ptr().add(1), need);
+            assert_eq!(got, need);
+            let table = &buf[1..1 + got as usize];
+            assert_eq!(table[1], 3); // SMBIOSMajorVersion == 3
+            let body_len = u32::from_le_bytes(table[4..8].try_into().unwrap()) as usize;
+            assert_eq!(8 + body_len, table.len());
+            assert_eq!(table[8], 0); // Type 0 BIOS entry first
+            assert!(table[8..].windows(b"Apple Inc.".len()).any(|w| w == b"Apple Inc."));
+
+            // Non-zero RSMB table ID, ACPI, FIRM, and unknown providers fail honestly.
+            assert_eq!(GetSystemFirmwareTable(rsmb, 1, buf.as_mut_ptr(), need), 0);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_FOUND);
+            assert_eq!(GetSystemFirmwareTable(u32::from_be_bytes(*b"ACPI"), 0, buf.as_mut_ptr(), need), 0);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_FOUND);
+            assert_eq!(GetSystemFirmwareTable(u32::from_be_bytes(*b"NOPE"), 0, buf.as_mut_ptr(), need), 0);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_FUNCTION);
         }
     }
 }
