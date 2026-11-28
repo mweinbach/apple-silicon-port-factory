@@ -9202,3 +9202,203 @@ fn lookup_cert_private_key_and_chain_orders_issuers_and_excludes_unrelated_store
         CertCloseStore(st2, 0);
     }
 }
+
+#[test]
+fn cert_collection_store_and_enhanced_key_usage() {
+    use super::asn1::encode_der_tlv as tlv;
+    use super::store::{
+        CERT_ENHKEY_USAGE_PROP_ID, CERT_STORE_PROV_COLLECTION, CERT_STORE_PROV_MEMORY,
+        CRYPT_E_NOT_FOUND,
+    };
+
+    let pk_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(
+            crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER.to_vec(),
+        ),
+    );
+    let key = crate::net_tls::crypto_provider()
+        .key_provider
+        .load_private_key(pk_der)
+        .unwrap();
+    let spki = key.public_key().unwrap().as_ref().to_vec();
+    let alg = tlv(0x30, &tlv(0x06, &[0x2B, 0x65, 0x70]));
+    let mk_dn = |cn: &str| {
+        let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+        atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+        tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+    };
+    let make_cert = |serial: u8, cn: &str, eku_oid_ders: Option<&[&[u8]]>| -> Vec<u8> {
+        let mut val = tlv(0x17, b"240101000000Z");
+        val.extend_from_slice(&tlv(0x17, b"350101000000Z"));
+        let mut tbs_body = tlv(0xA0, &tlv(0x02, &[0x02]));
+        tbs_body.extend_from_slice(&tlv(0x02, &[serial]));
+        tbs_body.extend_from_slice(&alg);
+        tbs_body.extend_from_slice(&mk_dn(cn));
+        tbs_body.extend_from_slice(&tlv(0x30, &val));
+        tbs_body.extend_from_slice(&mk_dn(cn));
+        tbs_body.extend_from_slice(&spki);
+        if let Some(oids) = eku_oid_ders {
+            let mut seq_inner = Vec::new();
+            for o in oids {
+                seq_inner.extend_from_slice(&tlv(0x06, o));
+            }
+            let eku_val = tlv(0x30, &seq_inner);
+            let mut ext = tlv(0x06, &[0x55, 0x1D, 0x25]);
+            ext.extend_from_slice(&tlv(0x04, &eku_val));
+            tbs_body.extend_from_slice(&tlv(0xA3, &tlv(0x30, &tlv(0x30, &ext))));
+        }
+        let tbs = tlv(0x30, &tbs_body);
+        let sig = key
+            .choose_scheme(&[rustls::SignatureScheme::ED25519])
+            .unwrap()
+            .sign(&tbs)
+            .unwrap();
+        let mut sb = vec![0u8];
+        sb.extend_from_slice(&sig);
+        let mut body = tbs;
+        body.extend_from_slice(&alg);
+        body.extend_from_slice(&tlv(0x03, &sb));
+        tlv(0x30, &body)
+    };
+
+    // Server Auth (1.3.6.1.5.5.7.3.1) and Code Signing (1.3.6.1.5.5.7.3.3)
+    const OID_SERVER_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+    const OID_CODE_SIGN: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+    let cert_no_eku = make_cert(10, "CollLowPrio", None);
+    let cert_with_eku = make_cert(11, "CollHighPrio", Some(&[OID_SERVER_AUTH, OID_CODE_SIGN]));
+
+    unsafe {
+        // 1. Collection store aggregates siblings in descending dwPriority order and retains sibling lifetime.
+        let coll = CertOpenStore(CERT_STORE_PROV_COLLECTION as *const u8, 0, 0, 0, std::ptr::null());
+        assert!(!coll.is_null());
+        let st_low = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let st_high = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(
+            CertAddEncodedCertificateToStore(st_low, X509_ASN_ENCODING, cert_no_eku.as_ptr(), cert_no_eku.len() as u32, 4, std::ptr::null_mut()),
+            TRUE
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(st_high, X509_ASN_ENCODING, cert_with_eku.as_ptr(), cert_with_eku.len() as u32, 4, std::ptr::null_mut()),
+            TRUE
+        );
+        // Non-collection store rejects CertAddStoreToCollection.
+        assert_eq!(CertAddStoreToCollection(st_low, st_high, 0, 0), FALSE);
+        // Add low priority first, then high priority -> high priority enumerated first!
+        assert_eq!(CertAddStoreToCollection(coll, st_low, 0, 1), TRUE);
+        assert_eq!(CertAddStoreToCollection(coll, st_high, 0, 10), TRUE);
+        // Caller closes sibling handles; collection still owns references.
+        assert_eq!(CertCloseStore(st_low, 0), TRUE);
+        assert_eq!(CertCloseStore(st_high, 0), TRUE);
+
+        let mut names = Vec::new();
+        let mut cur = std::ptr::null_mut();
+        loop {
+            cur = CertEnumCertificatesInStore(coll, cur);
+            if cur.is_null() {
+                break;
+            }
+            let mut buf = [0u8; 64];
+            let _ = CertGetNameStringA(cur, 4, 0, std::ptr::null_mut(), buf.as_mut_ptr(), 64);
+            names.push(crate::strings::from_ansi(buf.as_ptr()));
+        }
+        assert_eq!(names, vec!["CollHighPrio", "CollLowPrio"]);
+
+        // 1b. Collection with no CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG sibling rejects additions;
+        //     with add-enabled siblings, additions route to the highest-priority add-enabled sibling
+        //     and persist in that sibling after the collection closes.
+        let cert_added = make_cert(12, "CollAddedToSib", None);
+        assert_eq!(
+            CertAddEncodedCertificateToStore(coll, X509_ASN_ENCODING, cert_added.as_ptr(), cert_added.len() as u32, 4, std::ptr::null_mut()),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+        let st_ro_top = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let st_rw_low = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let st_rw_mid = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddStoreToCollection(coll, st_ro_top, 0 /* read-only */, 50), TRUE);
+        assert_eq!(CertAddStoreToCollection(coll, st_rw_low, 1 /* ADD_ENABLE */, 5), TRUE);
+        assert_eq!(CertAddStoreToCollection(coll, st_rw_mid, 1 /* ADD_ENABLE */, 20), TRUE);
+
+        assert_eq!(
+            CertAddEncodedCertificateToStore(coll, X509_ASN_ENCODING, cert_added.as_ptr(), cert_added.len() as u32, 4, std::ptr::null_mut()),
+            TRUE
+        );
+        assert_eq!(CertCloseStore(coll, 0), TRUE);
+
+        // Must have been routed to st_rw_mid (highest-priority add-enabled sibling) and survive collection close.
+        let c_mid = CertEnumCertificatesInStore(st_rw_mid, std::ptr::null_mut());
+        assert!(!c_mid.is_null(), "added cert must persist in highest-priority add-enabled sibling");
+        let mut mid_name = [0u8; 64];
+        let _ = CertGetNameStringA(c_mid, 4, 0, std::ptr::null_mut(), mid_name.as_mut_ptr(), 64);
+        assert_eq!(crate::strings::from_ansi(mid_name.as_ptr()), "CollAddedToSib");
+        assert!(CertEnumCertificatesInStore(st_rw_mid, c_mid).is_null());
+        assert!(CertEnumCertificatesInStore(st_ro_top, std::ptr::null_mut()).is_null());
+        assert!(CertEnumCertificatesInStore(st_rw_low, std::ptr::null_mut()).is_null());
+        assert_eq!(CertCloseStore(st_ro_top, 0), TRUE);
+        assert_eq!(CertCloseStore(st_rw_low, 0), TRUE);
+        assert_eq!(CertCloseStore(st_rw_mid, 0), TRUE);
+        // Re-open dummy coll handle so cleanup at bottom remains valid.
+        let coll = CertOpenStore(CERT_STORE_PROV_COLLECTION as *const u8, 0, 0, 0, std::ptr::null());
+
+        // 2. CertGetEnhancedKeyUsage on cert with NO EKU -> cUsageIdentifier = 0, last_error = CRYPT_E_NOT_FOUND.
+        let c0 = CertCreateCertificateContext(X509_ASN_ENCODING, cert_no_eku.as_ptr(), cert_no_eku.len() as u32);
+        assert!(!c0.is_null());
+        let mut cb = 0u32;
+        assert_eq!(CertGetEnhancedKeyUsage(c0, 0, std::ptr::null_mut(), &mut cb), TRUE);
+        assert_eq!(cb, 16);
+        assert_eq!(crate::teb::last_error(), CRYPT_E_NOT_FOUND);
+        let mut buf0 = vec![0u8; cb as usize];
+        assert_eq!(CertGetEnhancedKeyUsage(c0, 0, buf0.as_mut_ptr() as *mut c_void, &mut cb), TRUE);
+        assert_eq!(crate::teb::last_error(), CRYPT_E_NOT_FOUND);
+        let u0 = std::ptr::read_unaligned(buf0.as_ptr() as *const CertEnhkeyUsage);
+        assert_eq!(u0.c_usage_identifier, 0);
+
+        // 3. CertGetEnhancedKeyUsage on cert WITH EKU extension -> 2 OIDs; intersection with property -> 1 OID.
+        let c1 = CertCreateCertificateContext(X509_ASN_ENCODING, cert_with_eku.as_ptr(), cert_with_eku.len() as u32);
+        assert!(!c1.is_null());
+        let mut cb1 = 0u32;
+        assert_eq!(CertGetEnhancedKeyUsage(c1, 0, std::ptr::null_mut(), &mut cb1), TRUE);
+        assert!(cb1 > 16);
+        assert_eq!(crate::teb::last_error(), 0);
+        // Too-small buffer -> ERROR_MORE_DATA.
+        let mut small = [0u8; 8];
+        let mut small_cb = 8u32;
+        assert_eq!(CertGetEnhancedKeyUsage(c1, 0, small.as_mut_ptr() as *mut c_void, &mut small_cb), FALSE);
+        assert_eq!(crate::teb::last_error(), err::ERROR_MORE_DATA);
+        assert_eq!(small_cb, cb1);
+
+        let mut buf1 = vec![0u8; cb1 as usize];
+        assert_eq!(CertGetEnhancedKeyUsage(c1, 0, buf1.as_mut_ptr() as *mut c_void, &mut cb1), TRUE);
+        let u1 = std::ptr::read_unaligned(buf1.as_ptr() as *const CertEnhkeyUsage);
+        assert_eq!(u1.c_usage_identifier, 2);
+        assert_eq!(crate::strings::from_ansi(*u1.rgpsz_usage_identifier), "1.3.6.1.5.5.7.3.1");
+        assert_eq!(crate::strings::from_ansi(*u1.rgpsz_usage_identifier.add(1)), "1.3.6.1.5.5.7.3.3");
+
+        // Attach EKU property restricting to Code Signing only -> default flag intersects to 1 OID; EXT_ONLY returns 2.
+        let prop_der = tlv(0x30, &tlv(0x06, OID_CODE_SIGN));
+        let prop_blob = CryptDataBlob { cb_data: prop_der.len() as u32, pb_data: prop_der.as_ptr() };
+        assert_eq!(
+            CertSetCertificateContextProperty(c1, CERT_ENHKEY_USAGE_PROP_ID, 0, &prop_blob as *const _ as *const c_void),
+            TRUE
+        );
+        let mut cb2 = 0u32;
+        assert_eq!(CertGetEnhancedKeyUsage(c1, 0, std::ptr::null_mut(), &mut cb2), TRUE);
+        let mut buf2 = vec![0u8; cb2 as usize];
+        assert_eq!(CertGetEnhancedKeyUsage(c1, 0, buf2.as_mut_ptr() as *mut c_void, &mut cb2), TRUE);
+        let u2 = std::ptr::read_unaligned(buf2.as_ptr() as *const CertEnhkeyUsage);
+        assert_eq!(u2.c_usage_identifier, 1);
+        assert_eq!(crate::strings::from_ansi(*u2.rgpsz_usage_identifier), "1.3.6.1.5.5.7.3.3");
+
+        let mut cb_ext = 0u32;
+        assert_eq!(CertGetEnhancedKeyUsage(c1, 0x2, std::ptr::null_mut(), &mut cb_ext), TRUE);
+        let mut buf_ext = vec![0u8; cb_ext as usize];
+        assert_eq!(CertGetEnhancedKeyUsage(c1, 0x2, buf_ext.as_mut_ptr() as *mut c_void, &mut cb_ext), TRUE);
+        let u_ext = std::ptr::read_unaligned(buf_ext.as_ptr() as *const CertEnhkeyUsage);
+        assert_eq!(u_ext.c_usage_identifier, 2);
+
+        CertFreeCertificateContext(c0);
+        CertFreeCertificateContext(c1);
+        CertCloseStore(coll, 0);
+    }
+}

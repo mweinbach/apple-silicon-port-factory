@@ -9,7 +9,7 @@ pub unsafe fn wcslen(p: *const u16) -> usize {
         return 0;
     }
     let mut n = 0;
-    while *p.add(n) != 0 {
+    while p.add(n).read_unaligned() != 0 {
         n += 1;
     }
     n

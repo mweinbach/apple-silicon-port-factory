@@ -295,6 +295,33 @@ pub unsafe extern "win64" fn FileTimeToSystemTime(ft: *const FILETIME, st: *mut 
     TRUE
 }
 
+pub unsafe extern "win64" fn FileTimeToDosDateTime(
+    ft: *const FILETIME,
+    fat_date: *mut u16,
+    fat_time: *mut u16,
+) -> BOOL {
+    if ft.is_null() || fat_date.is_null() || fat_time.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let v = std::ptr::read_unaligned(ft).to_u64();
+    // Round up to the next 2-second MS-DOS resolution boundary.
+    let Some(rounded) = v.checked_add(19_999_999) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    let st = filetime_to_systemtime(rounded);
+    if st.wYear < 1980 || st.wYear > 2107 {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let d = ((st.wYear - 1980) << 9) | (st.wMonth << 5) | st.wDay;
+    let t = (st.wHour << 11) | (st.wMinute << 5) | (st.wSecond / 2);
+    std::ptr::write_unaligned(fat_date, d);
+    std::ptr::write_unaligned(fat_time, t);
+    TRUE
+}
+
 pub unsafe extern "win64" fn SystemTimeToFileTime(st: *const SYSTEMTIME, ft: *mut FILETIME) -> BOOL {
     match systemtime_to_filetime(&*st) {
         Some(v) => {
@@ -1019,6 +1046,40 @@ mod tests {
             assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_HANDLE);
             assert_eq!(QueryThreadCycleTime(0xDEAD_BEEF as HANDLE, &mut cyc), FALSE);
             assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_HANDLE);
+        }
+    }
+
+    #[test]
+    fn filetime_to_dos_datetime_valid_rounding_and_bounds() {
+        unsafe {
+            // 2024-02-29 13:14:16 -> exact 2-second boundary
+            let st_even = SYSTEMTIME { wYear: 2024, wMonth: 2, wDayOfWeek: 0, wDay: 29, wHour: 13, wMinute: 14, wSecond: 16, wMilliseconds: 0 };
+            let ft_even = FILETIME::from_u64(systemtime_to_filetime(&st_even).unwrap());
+            let mut raw = [0u8; 8];
+            let dp = raw.as_mut_ptr().add(1) as *mut u16;
+            let tp = raw.as_mut_ptr().add(3) as *mut u16;
+            assert_eq!(FileTimeToDosDateTime(&ft_even, dp, tp), TRUE);
+            let d = dp.read_unaligned();
+            let t = tp.read_unaligned();
+            assert_eq!(d, ((2024 - 1980) << 9) | (2 << 5) | 29);
+            assert_eq!(t, (13 << 11) | (14 << 5) | 8);
+
+            // Odd second rounds up to next 2-second interval (13:14:15 -> 13:14:16).
+            let st_odd = SYSTEMTIME { wSecond: 15, ..st_even };
+            let ft_odd = FILETIME::from_u64(systemtime_to_filetime(&st_odd).unwrap());
+            let mut d2 = 0u16;
+            let mut t2 = 0u16;
+            assert_eq!(FileTimeToDosDateTime(&ft_odd, &mut d2, &mut t2), TRUE);
+            assert_eq!((d2, t2), (d, t));
+
+            // Pre-1980 date fails with ERROR_INVALID_PARAMETER.
+            let ft_1970 = FILETIME::from_u64(EPOCH_DIFF_100NS);
+            assert_eq!(FileTimeToDosDateTime(&ft_1970, &mut d2, &mut t2), FALSE);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_PARAMETER);
+
+            // Null pointers fail with ERROR_INVALID_PARAMETER.
+            assert_eq!(FileTimeToDosDateTime(std::ptr::null(), &mut d2, &mut t2), FALSE);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_PARAMETER);
         }
     }
 }

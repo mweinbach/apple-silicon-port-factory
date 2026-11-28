@@ -19,4 +19,4 @@ physx3common_x64.dll	geom_sweep	middleware_stub	crates/win32-rt/src/misc/physx3c
 physx3common_x64.dll	mesh_find_overlap_triangle_mesh	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2614	"PxMeshQuery::findOverlapTriangleMesh without cooked triangle mesh payload"
 physx3common_x64.dll	mesh_get_triangle	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2629	"PxMeshQuery::getTriangle without cooked triangle mesh payload"
 physx3common_x64.dll	mesh_sweep	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2642	"PxMeshQuery::sweep without cooked triangle mesh payload"
-shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1863	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
+shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1895	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"

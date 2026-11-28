@@ -2784,6 +2784,296 @@ pub unsafe extern "win64" fn LoadStringW(
     copy_len as i32
 }
 
+// ---------------------------------------------------------------------------
+// Character casing & text/control drawing
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn uppercase_utf16_unit(u: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&u) {
+        return u - 32;
+    }
+    if let Some(ch) = char::from_u32(u as u32) {
+        let mut upper = ch.to_uppercase();
+        if let (Some(first), None) = (upper.next(), upper.next()) {
+            let cp = first as u32;
+            if cp <= 0xFFFF {
+                return cp as u16;
+            }
+        }
+    }
+    u
+}
+
+pub unsafe extern "win64" fn CharUpperBuffW(lpsz: LPWSTR, cch_length: u32) -> u32 {
+    if lpsz.is_null() || cch_length == 0 {
+        return 0;
+    }
+    for i in 0..(cch_length as usize) {
+        let p = lpsz.add(i);
+        let u = p.read_unaligned();
+        p.write_unaligned(uppercase_utf16_unit(u));
+    }
+    cch_length
+}
+
+pub unsafe extern "win64" fn CharUpperW(lpsz: LPWSTR) -> LPWSTR {
+    if lpsz.is_null() {
+        return std::ptr::null_mut();
+    }
+    let addr = lpsz as usize;
+    if addr <= 0xFFFF {
+        return uppercase_utf16_unit(addr as u16) as usize as LPWSTR;
+    }
+    let mut i = 0usize;
+    loop {
+        let p = lpsz.add(i);
+        let u = p.read_unaligned();
+        if u == 0 {
+            break;
+        }
+        p.write_unaligned(uppercase_utf16_unit(u));
+        i += 1;
+    }
+    lpsz
+}
+
+const DT_WORDBREAK: u32 = 0x0010;
+const DT_SINGLELINE: u32 = 0x0020;
+const DT_CALCRECT: u32 = 0x0400;
+const DT_NOPREFIX: u32 = 0x0800;
+
+unsafe fn measure_u16_width(hdc: usize, units: &[u16]) -> Option<i32> {
+    let mut sz = crate::misc::gdi32::SIZE { cx: 0, cy: 0 };
+    let ptr = if units.is_empty() { std::ptr::null() } else { units.as_ptr() };
+    if crate::misc::gdi32::GetTextExtentPoint32W(hdc, ptr, units.len() as i32, &mut sz) == FALSE {
+        return None;
+    }
+    Some(sz.cx)
+}
+
+unsafe fn wrap_paragraph_wordbreak(hdc: usize, para: &[u16], max_w: i32) -> Option<Vec<Vec<u16>>> {
+    if para.is_empty() {
+        return Some(vec![Vec::new()]);
+    }
+    let mut out: Vec<Vec<u16>> = Vec::new();
+    let mut cur: Vec<u16> = Vec::new();
+    let mut i = 0usize;
+    let is_ws = |u: u16| u == b' ' as u16 || u == b'\t' as u16;
+
+    while i < para.len() {
+        let sep_start = i;
+        while i < para.len() && is_ws(para[i]) {
+            i += 1;
+        }
+        let sep = &para[sep_start..i];
+        let word_start = i;
+        while i < para.len() && !is_ws(para[i]) {
+            i += 1;
+        }
+        let word = &para[word_start..i];
+
+        if cur.is_empty() {
+            if out.is_empty() {
+                cur.extend_from_slice(sep);
+            }
+            cur.extend_from_slice(word);
+            continue;
+        }
+        if word.is_empty() {
+            // Trailing whitespace at end of paragraph.
+            continue;
+        }
+
+        let mut cand = Vec::with_capacity(cur.len() + sep.len() + word.len());
+        cand.extend_from_slice(&cur);
+        cand.extend_from_slice(sep);
+        cand.extend_from_slice(word);
+        if measure_u16_width(hdc, &cand)? <= max_w {
+            cur = cand;
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.extend_from_slice(word);
+        }
+    }
+    out.push(cur);
+    Some(out)
+}
+
+pub unsafe extern "win64" fn DrawTextW(
+    hdc: usize,
+    lpch_text: LPCWSTR,
+    cch_text: i32,
+    lprc: *mut RECT,
+    format: u32,
+) -> i32 {
+    if hdc == 0 || lprc.is_null() || (lpch_text.is_null() && cch_text != 0) {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    // Verify the DC is valid and obtain the baseline font height.
+    let mut empty_sz = crate::misc::gdi32::SIZE { cx: 0, cy: 0 };
+    if crate::misc::gdi32::GetTextExtentPoint32W(hdc, std::ptr::null(), 0, &mut empty_sz) == FALSE {
+        return 0;
+    }
+    if cch_text == 0 {
+        return 0;
+    }
+
+    let mut raw_units: Vec<u16> = Vec::new();
+    if cch_text < 0 {
+        let mut i = 0usize;
+        loop {
+            let u = lpch_text.add(i).read_unaligned();
+            if u == 0 {
+                break;
+            }
+            raw_units.push(u);
+            i += 1;
+        }
+    } else {
+        for i in 0..(cch_text as usize) {
+            let u = lpch_text.add(i).read_unaligned();
+            if u == 0 {
+                break;
+            }
+            raw_units.push(u);
+        }
+    }
+
+    if raw_units.is_empty() {
+        if (format & DT_CALCRECT) != 0 {
+            let mut rc = lprc.read_unaligned();
+            rc.right = rc.left;
+            rc.bottom = rc.top;
+            lprc.write_unaligned(rc);
+        }
+        return 0;
+    }
+
+    // Strip single '&' mnemonic prefixes unless DT_NOPREFIX is set ("&&" -> "&").
+    let units: Vec<u16> = if (format & DT_NOPREFIX) != 0 {
+        raw_units
+    } else {
+        let mut out = Vec::with_capacity(raw_units.len());
+        let mut idx = 0usize;
+        while idx < raw_units.len() {
+            if raw_units[idx] == b'&' as u16 {
+                if idx + 1 < raw_units.len() && raw_units[idx + 1] == b'&' as u16 {
+                    out.push(b'&' as u16);
+                    idx += 2;
+                } else {
+                    idx += 1;
+                }
+            } else {
+                out.push(raw_units[idx]);
+                idx += 1;
+            }
+        }
+        out
+    };
+
+    let mut lines: Vec<Vec<u16>> = Vec::new();
+    if (format & DT_SINGLELINE) != 0 {
+        lines.push(units);
+    } else {
+        let mut cur = Vec::new();
+        let mut idx = 0usize;
+        while idx < units.len() {
+            match units[idx] {
+                0x000D => {
+                    lines.push(std::mem::take(&mut cur));
+                    if idx + 1 < units.len() && units[idx + 1] == 0x000A {
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                }
+                0x000A => {
+                    lines.push(std::mem::take(&mut cur));
+                    idx += 1;
+                }
+                ch => {
+                    cur.push(ch);
+                    idx += 1;
+                }
+            }
+        }
+        lines.push(cur);
+    }
+
+    let mut rc = lprc.read_unaligned();
+    let wrap_w = rc.right.saturating_sub(rc.left);
+    if (format & DT_WORDBREAK) != 0 && (format & DT_SINGLELINE) == 0 && wrap_w > 0 {
+        let mut wrapped = Vec::with_capacity(lines.len());
+        for para in &lines {
+            let Some(mut wlines) = wrap_paragraph_wordbreak(hdc, para, wrap_w) else {
+                return 0;
+            };
+            wrapped.append(&mut wlines);
+        }
+        lines = wrapped;
+    }
+
+    let mut max_w = 0i32;
+    let mut total_h = 0i32;
+    let mut measured: Vec<(String, i32, i32)> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let mut sz = crate::misc::gdi32::SIZE { cx: 0, cy: 0 };
+        let ptr = if line.is_empty() { std::ptr::null() } else { line.as_ptr() };
+        if crate::misc::gdi32::GetTextExtentPoint32W(hdc, ptr, line.len() as i32, &mut sz) == FALSE {
+            return 0;
+        }
+        max_w = max_w.max(sz.cx);
+        total_h = total_h.saturating_add(sz.cy);
+        measured.push((String::from_utf16_lossy(line), sz.cx, sz.cy));
+    }
+
+    if (format & DT_CALCRECT) != 0 {
+        rc.right = rc.left.saturating_add(max_w);
+        rc.bottom = rc.top.saturating_add(total_h);
+        lprc.write_unaligned(rc);
+        return total_h;
+    }
+
+    let line_refs: Vec<(&str, i32, i32)> = measured.iter().map(|(s, w, h)| (s.as_str(), *w, *h)).collect();
+    if !crate::misc::gdi32::draw_text_lines(hdc, &line_refs, rc.left, rc.top, rc.right, rc.bottom, format) {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    total_h
+}
+
+pub unsafe extern "win64" fn DrawFrameControl(
+    hdc: usize,
+    lprc: *mut RECT,
+    u_type: u32,
+    u_state: u32,
+) -> BOOL {
+    const DFCS_ADJUSTRECT: u32 = 0x2000;
+    if hdc == 0 || lprc.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    let mut rc = lprc.read_unaligned();
+    match crate::misc::gdi32::draw_frame_control(hdc, rc.left, rc.top, rc.right, rc.bottom, u_type, u_state) {
+        Ok(inset) => {
+            if (u_state & DFCS_ADJUSTRECT) != 0 {
+                rc.left = rc.left.saturating_add(inset);
+                rc.top = rc.top.saturating_add(inset);
+                rc.right = rc.right.saturating_sub(inset);
+                rc.bottom = rc.bottom.saturating_sub(inset);
+                lprc.write_unaligned(rc);
+            }
+            TRUE
+        }
+        Err(()) => {
+            set_error(e::INVALID_PARAMETER);
+            FALSE
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn set_force_defer_guest_hooks(defer: bool) {
     FORCE_DEFER_GUEST_HOOKS.store(defer, Ordering::Release);
@@ -3809,5 +4099,165 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn char_upper_w_draw_text_w_and_draw_frame_control() {
+        unsafe {
+            // 1. CharUpperW single-character (HIWORD == 0) and NUL-terminated string modes.
+            assert_eq!(CharUpperW(std::ptr::null_mut()), std::ptr::null_mut());
+            assert_eq!(CharUpperW(b'a' as usize as LPWSTR) as usize, b'A' as usize);
+            assert_eq!(CharUpperW(0x00E9usize as LPWSTR) as usize, 0x00C9usize); // é -> É
+            let mut text = crate::strings::to_wide_z("abC-é1");
+            assert_eq!(CharUpperW(text.as_mut_ptr()), text.as_mut_ptr());
+            assert_eq!(read_wide_unaligned(text.as_ptr()), "ABC-É1");
+
+            // 2. CharUpperBuffW handles unaligned odd-offset UTF-16 buffers and exact length.
+            let mut raw = vec![0xA5u8; 32];
+            let odd_ptr = raw.as_mut_ptr().add(1) as LPWSTR;
+            assert!(!odd_ptr.is_aligned());
+            for (i, u) in "hi!z".encode_utf16().enumerate() {
+                odd_ptr.add(i).write_unaligned(u);
+            }
+            assert_eq!(CharUpperBuffW(odd_ptr, 3), 3);
+            let got: Vec<u16> = (0..4).map(|i| odd_ptr.add(i).read_unaligned()).collect();
+            assert_eq!(String::from_utf16(&got).unwrap(), "HI!z");
+            assert_eq!(CharUpperBuffW(std::ptr::null_mut(), 4), 0);
+
+            // 3. DrawTextW measures single-line, mnemonic-stripped, and multi-line text with DT_CALCRECT.
+            let dc = crate::misc::gdi32::CreateCompatibleDC(0);
+            assert_ne!(dc, 0);
+            let single = crate::strings::to_wide_z("&File");
+            let mut rc = RECT::new(10, 20, 0, 0);
+            let h1 = DrawTextW(dc, single.as_ptr(), -1, &mut rc, DT_SINGLELINE | DT_CALCRECT);
+            assert!(h1 > 0);
+            assert_eq!(rc.bottom - rc.top, h1);
+            assert!(rc.right > rc.left);
+
+            let multi = crate::strings::to_wide_z("Line1\r\nLine2");
+            let mut rc2 = RECT::new(0, 0, 0, 0);
+            let h2 = DrawTextW(dc, multi.as_ptr(), -1, &mut rc2, DT_CALCRECT);
+            assert_eq!(h2, h1 * 2);
+            assert_eq!(rc2.bottom, h2);
+            assert_eq!(DrawTextW(0, multi.as_ptr(), -1, &mut rc2, 0), 0);
+
+            // 3b. DrawTextW without DT_CALCRECT actually rasterizes glyphs onto a DIB-backed DC,
+            // respects clipping to lprc, and DT_CALCRECT leaves pixels untouched.
+            let mut bmi = [0u8; 40];
+            bmi[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+            bmi[4..8].copy_from_slice(&128i32.to_le_bytes()); // biWidth
+            bmi[8..12].copy_from_slice(&(-48i32).to_le_bytes()); // top-down biHeight
+            bmi[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
+            bmi[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbm = crate::misc::gdi32::CreateDIBSection(
+                dc,
+                bmi.as_ptr(),
+                0,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_ne!(hbm, 0);
+            assert!(!bits.is_null());
+            let old_bm = crate::misc::gdi32::SelectObject(dc, hbm);
+            let buf = std::slice::from_raw_parts_mut(bits as *mut u8, 128 * 48 * 4);
+            buf.fill(0);
+
+            crate::misc::gdi32::SetBkMode(dc, 1 /* TRANSPARENT */);
+            crate::misc::gdi32::SetTextColor(dc, 0x0000_00FF /* bright red COLORREF */);
+            let label = crate::strings::to_wide_z("HELLO");
+
+            // DT_CALCRECT must measure only and never write pixels.
+            let mut calc_rc = RECT::new(8, 8, 120, 40);
+            assert!(DrawTextW(dc, label.as_ptr(), -1, &mut calc_rc, DT_SINGLELINE | DT_CALCRECT) > 0);
+            assert!(buf.iter().all(|&b| b == 0), "DT_CALCRECT must not draw pixels");
+
+            // Painting mode draws non-zero red glyph pixels strictly inside paint_rc.
+            let mut paint_rc = RECT::new(8, 8, 96, 36);
+            let drawn_h = DrawTextW(dc, label.as_ptr(), -1, &mut paint_rc, DT_SINGLELINE);
+            assert!(drawn_h > 0);
+            assert_eq!(paint_rc, RECT::new(8, 8, 96, 36), "painting must not mutate lprc");
+
+            let mut lit_inside = 0usize;
+            let mut lit_outside = 0usize;
+            for py in 0..48usize {
+                for px in 0..128usize {
+                    let off = (py * 128 + px) * 4;
+                    let r = buf[off + 2];
+                    let inside = px >= 8 && px < 96 && py >= 8 && py < 36;
+                    if r > 0 {
+                        if inside {
+                            lit_inside += 1;
+                        } else {
+                            lit_outside += 1;
+                        }
+                    }
+                }
+            }
+            assert!(lit_inside > 20, "expected rasterized glyph pixels inside lprc, got {lit_inside}");
+            assert_eq!(lit_outside, 0, "glyph pixels must be clipped to lprc");
+
+            // 3c. DT_WORDBREAK wraps text at word boundaries to lprc width for both DT_CALCRECT and painting.
+            let phrase = crate::strings::to_wide_z("alpha beta gamma delta");
+            let mut single_rc = RECT::new(0, 0, 64, 0);
+            let single_h = DrawTextW(dc, phrase.as_ptr(), -1, &mut single_rc, DT_SINGLELINE | DT_CALCRECT);
+            assert!(single_rc.right > 64, "unwrapped phrase must exceed 64px width");
+            let mut wrap_rc = RECT::new(4, 4, 68, 0);
+            let wrap_h = DrawTextW(dc, phrase.as_ptr(), -1, &mut wrap_rc, DT_WORDBREAK | DT_CALCRECT);
+            assert!(wrap_h >= single_h * 2, "DT_WORDBREAK must wrap into multiple lines (got {wrap_h} vs {single_h})");
+            assert!(wrap_rc.right - wrap_rc.left <= 64, "wrapped width {} must fit within 64px", wrap_rc.right - wrap_rc.left);
+            assert_eq!(wrap_rc.bottom - wrap_rc.top, wrap_h);
+
+            buf.fill(0);
+            let mut wrap_paint_rc = RECT::new(4, 4, 68, 44);
+            let wrap_drawn_h = DrawTextW(dc, phrase.as_ptr(), -1, &mut wrap_paint_rc, DT_WORDBREAK);
+            assert_eq!(wrap_drawn_h, wrap_h);
+            let ro: &[u8] = buf;
+            let line1_lit = (4..(4 + single_h as usize))
+                .flat_map(|py| (4..68).map(move |px| ro[(py * 128 + px) * 4 + 2]))
+                .filter(|&r| r > 0)
+                .count();
+            let line2_lit = ((4 + single_h as usize)..44)
+                .flat_map(|py| (4..68).map(move |px| ro[(py * 128 + px) * 4 + 2]))
+                .filter(|&r| r > 0)
+                .count();
+            assert!(line1_lit > 10 && line2_lit > 10, "DT_WORDBREAK must render glyphs on both line 1 ({line1_lit}) and line 2+ ({line2_lit})");
+
+            // 4. DrawFrameControl renders distinct real controls/states into the DIB
+            //    and rejects unsupported control types or null/invalid args.
+            let mut render_ctrl = |u_type: u32, u_state: u32| -> Vec<u8> {
+                buf.fill(0);
+                let mut r = RECT::new(0, 0, 20, 20);
+                assert_eq!(DrawFrameControl(dc, &mut r, u_type, u_state), TRUE);
+                buf[..128 * 20 * 4].to_vec()
+            };
+            let chk_off = render_ctrl(4 /* DFC_BUTTON */, 0x0000 /* DFCS_BUTTONCHECK */);
+            let chk_on = render_ctrl(4, 0x0000 | 0x0400 /* DFCS_CHECKED */);
+            assert_ne!(chk_off, chk_on, "checked checkbox must render a checkmark");
+            let radio_off = render_ctrl(4, 0x0004 /* DFCS_BUTTONRADIO */);
+            let radio_on = render_ctrl(4, 0x0004 | 0x0400 /* DFCS_CHECKED */);
+            assert_ne!(radio_off, radio_on, "checked radio button must render a center dot");
+            assert_ne!(chk_off, radio_off, "checkbox and radio button must render distinct artwork");
+            let cap_close = render_ctrl(1 /* DFC_CAPTION */, 0x0000 /* DFCS_CAPTIONCLOSE */);
+            let scroll_up = render_ctrl(3 /* DFC_SCROLL */, 0x0000 /* DFCS_SCROLLUP */);
+            assert_ne!(cap_close, scroll_up, "caption close and scroll arrow must render distinct glyphs");
+            let push_up = render_ctrl(4, 0x0010 /* DFCS_BUTTONPUSH */);
+            let push_dn = render_ctrl(4, 0x0010 | 0x0200 /* DFCS_PUSHED */);
+            assert_ne!(push_up, push_dn, "pushed button must invert 3D bevel");
+
+            let mut adj_rc = RECT::new(0, 0, 20, 20);
+            assert_eq!(DrawFrameControl(dc, &mut adj_rc, 4, 0x0010 | 0x2000 /* DFCS_ADJUSTRECT */), TRUE);
+            assert_eq!(adj_rc, RECT::new(2, 2, 18, 18));
+
+            let mut frame_rc = RECT::new(0, 0, 16, 16);
+            assert_eq!(DrawFrameControl(dc, &mut frame_rc, 99, 0), FALSE);
+            assert_eq!(DrawFrameControl(0, &mut frame_rc, 4, 0), FALSE);
+            assert_eq!(DrawFrameControl(dc, std::ptr::null_mut(), 4, 0), FALSE);
+
+            crate::misc::gdi32::SelectObject(dc, old_bm);
+            crate::misc::gdi32::DeleteObject(hbm);
+            crate::misc::gdi32::DeleteDC(dc);
+        }
     }
 }

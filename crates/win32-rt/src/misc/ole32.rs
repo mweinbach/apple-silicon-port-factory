@@ -1018,6 +1018,25 @@ pub unsafe extern "win64" fn StringFromGUID2(g: *const u8, buf: *mut u16, cch: i
     (s.len() + 1) as i32
 }
 
+pub unsafe extern "win64" fn StringFromCLSID(rclsid: *const u8, lplpsz: *mut LPWSTR) -> HRESULT {
+    if lplpsz.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(lplpsz, std::ptr::null_mut());
+    if rclsid.is_null() {
+        return E_INVALIDARG;
+    }
+    let s = guid_string(rclsid);
+    let units: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    let mem = CoTaskMemAlloc(units.len() * 2) as *mut u16;
+    if mem.is_null() {
+        return E_OUTOFMEMORY;
+    }
+    std::ptr::copy_nonoverlapping(units.as_ptr() as *const u8, mem as *mut u8, units.len() * 2);
+    std::ptr::write_unaligned(lplpsz, mem);
+    S_OK
+}
+
 // ---------------------------------------------------------------------------
 // 14-slot Win64 COM `IStream` backed by `GlobalAlloc` / `GlobalReAlloc` / `GlobalFree`
 // ---------------------------------------------------------------------------
@@ -5609,6 +5628,28 @@ mod tests {
 
             assert_eq!(com_call_release(urif), 0);
             WindowsDeleteString(uri_class);
+        }
+    }
+
+    #[test]
+    fn string_from_clsid_formats_and_validates() {
+        unsafe {
+            assert_eq!(
+                StringFromCLSID(IID_IUNKNOWN_BYTES.as_ptr(), std::ptr::null_mut()),
+                E_POINTER
+            );
+            let mut out: LPWSTR = 0x1usize as LPWSTR;
+            assert_eq!(StringFromCLSID(std::ptr::null(), &mut out), E_INVALIDARG);
+            assert!(out.is_null());
+
+            assert_eq!(StringFromCLSID(IID_IUNKNOWN_BYTES.as_ptr(), &mut out), S_OK);
+            assert!(!out.is_null());
+            let s = crate::strings::from_wide(out);
+            let mut g2 = [0u16; 64];
+            assert_eq!(StringFromGUID2(IID_IUNKNOWN_BYTES.as_ptr(), g2.as_mut_ptr(), 64), 39);
+            assert_eq!(s, crate::strings::from_wide(g2.as_ptr()));
+            assert_eq!(s, "{00000000-0000-0000-C000-000000000046}");
+            CoTaskMemFree(out as *mut c_void);
         }
     }
 }

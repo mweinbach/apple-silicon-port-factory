@@ -374,6 +374,467 @@ pub unsafe extern "win64" fn waveInMessage(_hwi: usize, _msg: u32, _dw1: usize, 
     MMSYSERR_NODRIVER
 }
 
+// ---------------------------------------------------------------------------
+// Multimedia I/O (`mmio*` RIFF/file/memory stream API)
+// ---------------------------------------------------------------------------
+
+use std::io::{Read, Seek, SeekFrom};
+
+const MMIO_WRITE: u32 = 0x0000_0001;
+const MMIO_READWRITE: u32 = 0x0000_0002;
+const MMIO_DELETE: u32 = 0x0000_0200;
+const MMIO_CREATE: u32 = 0x0000_1000;
+const MMIO_EXIST: u32 = 0x0000_4000;
+
+const MMIO_FINDCHUNK: u32 = 0x0010;
+const MMIO_FINDRIFF: u32 = 0x0020;
+const MMIO_FINDLIST: u32 = 0x0040;
+
+const FOURCC_RIFF: u32 = u32::from_le_bytes(*b"RIFF");
+const FOURCC_LIST: u32 = u32::from_le_bytes(*b"LIST");
+const FOURCC_MEM: u32 = u32::from_le_bytes(*b"MEM ");
+
+const MMIOERR_FILENOTFOUND: u32 = 257;
+const MMIOERR_CANNOTOPEN: u32 = 259;
+const MMIOERR_CANNOTSEEK: u32 = 263;
+const MMIOERR_CHUNKNOTFOUND: u32 = 265;
+
+const MMIO_SEEK_SET: i32 = 0;
+const MMIO_SEEK_CUR: i32 = 1;
+const MMIO_SEEK_END: i32 = 2;
+
+/// Win64 `MMCKINFO` (`mmsystem.h` under `#include <pshpack1.h>`, 20 bytes).
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+pub struct MmckInfo {
+    pub ckid: u32,
+    pub cksize: u32,
+    pub fcc_type: u32,
+    pub dw_data_offset: u32,
+    pub dw_flags: u32,
+}
+const _: () = assert!(std::mem::size_of::<MmckInfo>() == 20);
+const _: () = assert!(std::mem::offset_of!(MmckInfo, dw_data_offset) == 12);
+
+/// Win64 `MMIOINFO` (`mmiscapi.h` / `mmsystem.h` under `#include <pshpack1.h>`, 100 bytes).
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct MmioInfo {
+    pub dw_flags: u32,
+    pub fcc_io_proc: u32,
+    pub p_io_proc: usize,
+    pub w_error_ret: u32,
+    pub h_task: usize,
+    pub cch_buffer: i32,
+    pub pch_buffer: *mut u8,
+    pub pch_next: *mut u8,
+    pub pch_end_read: *mut u8,
+    pub pch_end_write: *mut u8,
+    pub l_buf_offset: i32,
+    pub l_disk_offset: i32,
+    pub adw_info: [u32; 3],
+    pub dw_reserved1: u32,
+    pub dw_reserved2: u32,
+    pub hmmio: usize,
+}
+const _: () = assert!(std::mem::size_of::<MmioInfo>() == 100);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, w_error_ret) == 16);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, cch_buffer) == 28);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, pch_buffer) == 32);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, l_disk_offset) == 68);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, adw_info) == 72);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, dw_reserved1) == 84);
+const _: () = assert!(std::mem::offset_of!(MmioInfo, hmmio) == 92);
+
+enum MmioBacking {
+    File(std::fs::File),
+    /// Caller-owned memory buffer (`pchBuffer`, `cchBuffer`), never freed by `mmioClose`.
+    ExternalMem { ptr: usize, len: usize, pos: usize },
+    /// Internally allocated memory buffer.
+    OwnedMem { data: Vec<u8>, pos: usize },
+}
+
+impl MmioBacking {
+    fn pos(&mut self) -> Result<u64, std::io::Error> {
+        match self {
+            Self::File(f) => f.stream_position(),
+            Self::ExternalMem { pos, .. } => Ok(*pos as u64),
+            Self::OwnedMem { pos, .. } => Ok(*pos as u64),
+        }
+    }
+
+    fn len(&mut self) -> Result<u64, std::io::Error> {
+        match self {
+            Self::File(f) => Ok(f.metadata()?.len()),
+            Self::ExternalMem { len, .. } => Ok(*len as u64),
+            Self::OwnedMem { data, .. } => Ok(data.len() as u64),
+        }
+    }
+
+    fn seek_to(&mut self, target: u64) -> Result<u64, std::io::Error> {
+        match self {
+            Self::File(f) => f.seek(SeekFrom::Start(target)),
+            Self::ExternalMem { len, pos, .. } => {
+                if target > *len as u64 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek past memory end"));
+                }
+                *pos = target as usize;
+                Ok(target)
+            }
+            Self::OwnedMem { data, pos } => {
+                if target > data.len() as u64 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek past memory end"));
+                }
+                *pos = target as usize;
+                Ok(target)
+            }
+        }
+    }
+
+    unsafe fn read_into(&mut self, dst: *mut u8, count: usize) -> Result<usize, std::io::Error> {
+        if count == 0 {
+            return Ok(0);
+        }
+        match self {
+            Self::File(f) => {
+                let mut tmp = vec![0u8; count];
+                let mut total = 0usize;
+                while total < count {
+                    match f.read(&mut tmp[total..]) {
+                        Ok(0) => break,
+                        Ok(n) => total += n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                if total > 0 {
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), dst, total);
+                }
+                Ok(total)
+            }
+            Self::ExternalMem { ptr, len, pos } => {
+                let avail = len.saturating_sub(*pos);
+                let n = count.min(avail);
+                if n > 0 {
+                    std::ptr::copy_nonoverlapping((*ptr as *const u8).add(*pos), dst, n);
+                    *pos += n;
+                }
+                Ok(n)
+            }
+            Self::OwnedMem { data, pos } => {
+                let avail = data.len().saturating_sub(*pos);
+                let n = count.min(avail);
+                if n > 0 {
+                    std::ptr::copy_nonoverlapping(data.as_ptr().add(*pos), dst, n);
+                    *pos += n;
+                }
+                Ok(n)
+            }
+        }
+    }
+
+    unsafe fn read_exact_bytes<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let mut buf = [0u8; N];
+        let got = self.read_into(buf.as_mut_ptr(), N).ok()?;
+        (got == N).then_some(buf)
+    }
+}
+
+static NEXT_MMIO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0x004D_4D10);
+
+fn mmio_table() -> &'static Mutex<HashMap<usize, MmioBacking>> {
+    static T: OnceLock<Mutex<HashMap<usize, MmioBacking>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe fn set_mmio_error(pmmioinfo: *mut MmioInfo, err: u32) {
+    if !pmmioinfo.is_null() {
+        std::ptr::addr_of_mut!((*pmmioinfo).w_error_ret).write_unaligned(err);
+    }
+}
+
+pub unsafe extern "win64" fn mmioOpenA(
+    psz_file_name: LPCSTR,
+    pmmioinfo: *mut MmioInfo,
+    fdw_open: u32,
+) -> usize {
+    let info_opt = (!pmmioinfo.is_null()).then(|| pmmioinfo.read_unaligned());
+    let is_mem = info_opt.is_some_and(|info| {
+        info.fcc_io_proc == FOURCC_MEM || (psz_file_name.is_null() && !info.pch_buffer.is_null())
+    });
+
+    if is_mem {
+        let info = info_opt.unwrap();
+        let len = info.cch_buffer.max(0) as usize;
+        let backing = if !info.pch_buffer.is_null() {
+            MmioBacking::ExternalMem { ptr: info.pch_buffer as usize, len, pos: 0 }
+        } else {
+            MmioBacking::OwnedMem { data: vec![0u8; len], pos: 0 }
+        };
+        let handle = NEXT_MMIO.fetch_add(4, Ordering::Relaxed);
+        mmio_table().lock().unwrap().insert(handle, backing);
+        if !pmmioinfo.is_null() {
+            let mut out = info;
+            out.w_error_ret = 0;
+            out.hmmio = handle;
+            pmmioinfo.write_unaligned(out);
+        }
+        return handle;
+    }
+
+    if psz_file_name.is_null() {
+        set_mmio_error(pmmioinfo, MMIOERR_CANNOTOPEN);
+        return 0;
+    }
+
+    let win_path = crate::strings::from_ansi(psz_file_name);
+    let Some(host_path) = crate::path::to_host(&win_path) else {
+        set_mmio_error(pmmioinfo, MMIOERR_FILENOTFOUND);
+        return 0;
+    };
+
+    if (fdw_open & MMIO_EXIST) != 0 {
+        return usize::from(host_path.exists());
+    }
+    if (fdw_open & MMIO_DELETE) != 0 {
+        if crate::path::is_protected_host_remove_or_rename(&host_path) {
+            log::warn!("winmm: mmioOpenA(MMIO_DELETE) blocked protected host path {:?}", host_path);
+            set_mmio_error(pmmioinfo, MMIOERR_CANNOTOPEN);
+            return 0;
+        }
+        return match std::fs::remove_file(&host_path) {
+            Ok(()) => 1,
+            Err(_) => {
+                set_mmio_error(pmmioinfo, MMIOERR_FILENOTFOUND);
+                0
+            }
+        };
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    let mode = fdw_open & 0x3;
+    let wants_write = matches!(mode, MMIO_WRITE | MMIO_READWRITE) || (fdw_open & MMIO_CREATE) != 0;
+    if wants_write && crate::path::is_protected_host_write(&host_path) {
+        log::warn!("winmm: mmioOpenA(write/create) blocked protected host path {:?}", host_path);
+        set_mmio_error(pmmioinfo, MMIOERR_CANNOTOPEN);
+        return 0;
+    }
+    match mode {
+        MMIO_WRITE => {
+            opts.write(true);
+        }
+        MMIO_READWRITE => {
+            opts.read(true).write(true);
+        }
+        _ => {
+            opts.read(true);
+        }
+    }
+    if (fdw_open & MMIO_CREATE) != 0 {
+        opts.write(true).create(true).truncate(true);
+    }
+
+    match opts.open(&host_path) {
+        Ok(file) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                if wants_write && crate::path::is_protected_fd(file.as_raw_fd()) {
+                    log::warn!("winmm: mmioOpenA(write) blocked protected fd for {:?}", host_path);
+                    drop(file);
+                    set_mmio_error(pmmioinfo, MMIOERR_CANNOTOPEN);
+                    return 0;
+                }
+            }
+            let handle = NEXT_MMIO.fetch_add(4, Ordering::Relaxed);
+            mmio_table().lock().unwrap().insert(handle, MmioBacking::File(file));
+            if let Some(mut out) = info_opt {
+                out.w_error_ret = 0;
+                out.hmmio = handle;
+                pmmioinfo.write_unaligned(out);
+            }
+            handle
+        }
+        Err(e) => {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                MMIOERR_FILENOTFOUND
+            } else {
+                MMIOERR_CANNOTOPEN
+            };
+            set_mmio_error(pmmioinfo, code);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn mmioDescend(
+    hmmio: usize,
+    pmmcki: *mut MmckInfo,
+    pmmcki_parent: *const MmckInfo,
+    fu_descend: u32,
+) -> u32 {
+    if hmmio == 0 || pmmcki.is_null() {
+        return MMSYSERR_INVALHANDLE;
+    }
+    let want = pmmcki.read_unaligned();
+    let want_ckid = want.ckid;
+    let want_fcc = want.fcc_type;
+    let parent_end: Option<u64> = if pmmcki_parent.is_null() {
+        None
+    } else {
+        let p = pmmcki_parent.read_unaligned();
+        Some((p.dw_data_offset as u64).saturating_add(p.cksize as u64))
+    };
+
+    let mut table = mmio_table().lock().unwrap();
+    let Some(stream) = table.get_mut(&hmmio) else {
+        return MMSYSERR_INVALHANDLE;
+    };
+
+    let find_flags = fu_descend & (MMIO_FINDCHUNK | MMIO_FINDRIFF | MMIO_FINDLIST);
+    loop {
+        let Ok(hdr_pos) = stream.pos() else {
+            return MMIOERR_CHUNKNOTFOUND;
+        };
+        if parent_end.is_some_and(|end| hdr_pos.saturating_add(8) > end) {
+            return MMIOERR_CHUNKNOTFOUND;
+        }
+        let Some(hdr) = stream.read_exact_bytes::<8>() else {
+            return MMIOERR_CHUNKNOTFOUND;
+        };
+        let ckid = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let cksize = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let data_offset = hdr_pos.saturating_add(8);
+
+        let is_container = ckid == FOURCC_RIFF || ckid == FOURCC_LIST;
+        let fcc_type = if is_container {
+            if parent_end.is_some_and(|end| hdr_pos.saturating_add(12) > end) {
+                return MMIOERR_CHUNKNOTFOUND;
+            }
+            let Some(fcc_bytes) = stream.read_exact_bytes::<4>() else {
+                return MMIOERR_CHUNKNOTFOUND;
+            };
+            u32::from_le_bytes(fcc_bytes)
+        } else {
+            0
+        };
+
+        let matched = match find_flags {
+            0 => true,
+            f if (f & MMIO_FINDRIFF) != 0 => {
+                ckid == FOURCC_RIFF && (want_fcc == 0 || fcc_type == want_fcc)
+            }
+            f if (f & MMIO_FINDLIST) != 0 => {
+                ckid == FOURCC_LIST && (want_fcc == 0 || fcc_type == want_fcc)
+            }
+            f if (f & MMIO_FINDCHUNK) != 0 => ckid == want_ckid,
+            _ => true,
+        };
+
+        if matched {
+            pmmcki.write_unaligned(MmckInfo {
+                ckid,
+                cksize,
+                fcc_type,
+                dw_data_offset: data_offset as u32,
+                dw_flags: 0,
+            });
+            return 0;
+        }
+
+        // Skip over this chunk's payload plus optional word-alignment pad byte.
+        let next_pos = data_offset
+            .saturating_add(cksize as u64)
+            .saturating_add((cksize & 1) as u64);
+        if parent_end.is_some_and(|end| next_pos > end) {
+            return MMIOERR_CHUNKNOTFOUND;
+        }
+        if stream.seek_to(next_pos).is_err() {
+            return MMIOERR_CHUNKNOTFOUND;
+        }
+    }
+}
+
+pub unsafe extern "win64" fn mmioRead(hmmio: usize, pch: *mut u8, cch: i32) -> i32 {
+    if hmmio == 0 || pch.is_null() || cch < 0 {
+        return -1;
+    }
+    if cch == 0 {
+        return 0;
+    }
+    let mut table = mmio_table().lock().unwrap();
+    let Some(stream) = table.get_mut(&hmmio) else {
+        return -1;
+    };
+    match stream.read_into(pch, cch as usize) {
+        Ok(n) => n as i32,
+        Err(_) => -1,
+    }
+}
+
+pub unsafe extern "win64" fn mmioAscend(
+    hmmio: usize,
+    pmmcki: *mut MmckInfo,
+    _fu_ascend: u32,
+) -> u32 {
+    if hmmio == 0 || pmmcki.is_null() {
+        return MMSYSERR_INVALHANDLE;
+    }
+    let ck = pmmcki.read_unaligned();
+    let end_pos = (ck.dw_data_offset as u64)
+        .saturating_add(ck.cksize as u64)
+        .saturating_add((ck.cksize & 1) as u64);
+    let mut table = mmio_table().lock().unwrap();
+    let Some(stream) = table.get_mut(&hmmio) else {
+        return MMSYSERR_INVALHANDLE;
+    };
+    if stream.seek_to(end_pos).is_err() {
+        return MMIOERR_CANNOTSEEK;
+    }
+    0
+}
+
+pub unsafe extern "win64" fn mmioSeek(hmmio: usize, l_offset: i32, i_origin: i32) -> i32 {
+    if hmmio == 0 {
+        return -1;
+    }
+    let mut table = mmio_table().lock().unwrap();
+    let Some(stream) = table.get_mut(&hmmio) else {
+        return -1;
+    };
+    let base: i64 = match i_origin {
+        MMIO_SEEK_SET => 0,
+        MMIO_SEEK_CUR => match stream.pos() {
+            Ok(p) => p as i64,
+            Err(_) => return -1,
+        },
+        MMIO_SEEK_END => match stream.len() {
+            Ok(l) => l as i64,
+            Err(_) => return -1,
+        },
+        _ => return -1,
+    };
+    let target = base + (l_offset as i64);
+    if target < 0 {
+        return -1;
+    }
+    match stream.seek_to(target as u64) {
+        Ok(pos) => pos as i32,
+        Err(_) => -1,
+    }
+}
+
+pub unsafe extern "win64" fn mmioClose(hmmio: usize, _fu_close: u32) -> u32 {
+    if hmmio == 0 {
+        return MMSYSERR_INVALHANDLE;
+    }
+    if mmio_table().lock().unwrap().remove(&hmmio).is_some() {
+        0
+    } else {
+        MMSYSERR_INVALHANDLE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +918,203 @@ mod tests {
             assert_eq!(requested_timer_period_ms(), None);
             assert!(!high_res_timer_active());
             assert_eq!(timeEndPeriod(20), TIMERR_NOCANDO);
+        }
+    }
+
+    fn build_sample_riff_wave() -> Vec<u8> {
+        // Construct RIFF('WAVE', chunk('JUNK', 3 bytes + 1 pad), chunk('fmt ', 4 bytes), chunk('data', 5 bytes + 1 pad))
+        let mut body = Vec::new();
+        body.extend_from_slice(b"WAVE");
+        body.extend_from_slice(b"JUNK");
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0x00]); // odd size 3 + 1 pad byte
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&[1, 0, 2, 0]);
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&5u32.to_le_bytes());
+        body.extend_from_slice(&[10, 20, 30, 40, 50, 0]);
+
+        let mut riff = Vec::new();
+        riff.extend_from_slice(b"RIFF");
+        riff.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        riff.extend_from_slice(&body);
+        riff
+    }
+
+    #[test]
+    fn mmio_memory_and_file_riff_parsing_with_odd_chunk_padding() {
+        let mut wav = build_sample_riff_wave();
+        let fcc_wave = u32::from_le_bytes(*b"WAVE");
+        let fcc_fmt = u32::from_le_bytes(*b"fmt ");
+        let fcc_data = u32::from_le_bytes(*b"data");
+
+        unsafe {
+            // 1. In-memory FOURCC_MEM stream.
+            let mut info: MmioInfo = std::mem::zeroed();
+            info.fcc_io_proc = FOURCC_MEM;
+            info.pch_buffer = wav.as_mut_ptr();
+            info.cch_buffer = wav.len() as i32;
+            let h = mmioOpenA(std::ptr::null(), &mut info, 0);
+            assert_ne!(h, 0);
+
+            let mut parent = MmckInfo { fcc_type: fcc_wave, ..Default::default() };
+            assert_eq!(mmioDescend(h, &mut parent, std::ptr::null(), MMIO_FINDRIFF), 0);
+            let p_ckid = parent.ckid;
+            let p_fcc = parent.fcc_type;
+            let p_off = parent.dw_data_offset;
+            assert_eq!(p_ckid, FOURCC_RIFF);
+            assert_eq!(p_fcc, fcc_wave);
+            assert_eq!(p_off, 8);
+
+            // Skipping odd-sized JUNK chunk must respect the 1-byte word-alignment pad.
+            let mut sub = MmckInfo { ckid: fcc_fmt, ..Default::default() };
+            assert_eq!(mmioDescend(h, &mut sub, &parent, MMIO_FINDCHUNK), 0);
+            let fmt_size = sub.cksize;
+            assert_eq!(fmt_size, 4);
+            let mut fmt_buf = [0u8; 4];
+            assert_eq!(mmioRead(h, fmt_buf.as_mut_ptr(), 4), 4);
+            assert_eq!(fmt_buf, [1, 0, 2, 0]);
+            assert_eq!(mmioAscend(h, &mut sub, 0), 0);
+
+            // Descend into 'data', read, seek back, re-read.
+            let mut data_ck = MmckInfo { ckid: fcc_data, ..Default::default() };
+            assert_eq!(mmioDescend(h, &mut data_ck, &parent, MMIO_FINDCHUNK), 0);
+            let data_size = data_ck.cksize;
+            let data_off = data_ck.dw_data_offset;
+            assert_eq!(data_size, 5);
+            let mut data_buf = [0u8; 5];
+            assert_eq!(mmioRead(h, data_buf.as_mut_ptr(), 5), 5);
+            assert_eq!(data_buf, [10, 20, 30, 40, 50]);
+            assert_eq!(mmioSeek(h, data_off as i32 + 2, MMIO_SEEK_SET), data_off as i32 + 2);
+            let mut b1 = [0u8; 2];
+            assert_eq!(mmioRead(h, b1.as_mut_ptr(), 2), 2);
+            assert_eq!(b1, [30, 40]);
+            assert_eq!(mmioAscend(h, &mut data_ck, 0), 0);
+            assert_eq!(mmioSeek(h, 0, MMIO_SEEK_CUR), wav.len() as i32);
+            assert_eq!(mmioClose(h, 0), 0);
+            assert_eq!(mmioClose(h, 0), MMSYSERR_INVALHANDLE);
+
+            // 2. File-backed stream via virtual Windows mount.
+            let tmp_dir = std::env::temp_dir().join(format!("winmm_mmio_test_{}", std::process::id()));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+            let tmp_file = tmp_dir.join("sample.wav");
+            std::fs::write(&tmp_file, &wav).unwrap();
+            crate::path::add_mount("M:\\MmioTest", &tmp_dir);
+            let cpath = std::ffi::CString::new("M:\\MmioTest\\sample.wav").unwrap();
+            assert_eq!(mmioOpenA(cpath.as_ptr().cast(), std::ptr::null_mut(), MMIO_EXIST), 1);
+            let hf = mmioOpenA(cpath.as_ptr().cast(), std::ptr::null_mut(), 0);
+            assert_ne!(hf, 0);
+            let mut fp = MmckInfo { fcc_type: fcc_wave, ..Default::default() };
+            assert_eq!(mmioDescend(hf, &mut fp, std::ptr::null(), MMIO_FINDRIFF), 0);
+            let mut fd = MmckInfo { ckid: fcc_data, ..Default::default() };
+            assert_eq!(mmioDescend(hf, &mut fd, &fp, MMIO_FINDCHUNK), 0);
+            let mut fbuf = [0u8; 5];
+            assert_eq!(mmioRead(hf, fbuf.as_mut_ptr(), 5), 5);
+            assert_eq!(fbuf, [10, 20, 30, 40, 50]);
+            assert_eq!(mmioClose(hf, 0), 0);
+
+            // 3. Protected host paths must be blocked for MMIO_DELETE, MMIO_CREATE, and write modes.
+            let prot_dir = tmp_dir.join("protected_bundle");
+            std::fs::create_dir_all(&prot_dir).unwrap();
+            let prot_file = prot_dir.join("runner.bin");
+            std::fs::write(&prot_file, b"PROTECTED_BYTES").unwrap();
+            crate::path::protect_native_subtree(&prot_dir);
+            let prot_win = std::ffi::CString::new("M:\\MmioTest\\protected_bundle\\runner.bin").unwrap();
+
+            let mut err_info: MmioInfo = std::mem::zeroed();
+            assert_eq!(mmioOpenA(prot_win.as_ptr().cast(), &mut err_info, MMIO_DELETE), 0);
+            let err_del = err_info.w_error_ret;
+            assert_eq!(err_del, MMIOERR_CANNOTOPEN);
+            assert_eq!(std::fs::read(&prot_file).unwrap(), b"PROTECTED_BYTES");
+
+            err_info = std::mem::zeroed();
+            assert_eq!(mmioOpenA(prot_win.as_ptr().cast(), &mut err_info, MMIO_CREATE | MMIO_WRITE), 0);
+            let err_cr = err_info.w_error_ret;
+            assert_eq!(err_cr, MMIOERR_CANNOTOPEN);
+            assert_eq!(std::fs::read(&prot_file).unwrap(), b"PROTECTED_BYTES");
+
+            err_info = std::mem::zeroed();
+            assert_eq!(mmioOpenA(prot_win.as_ptr().cast(), &mut err_info, MMIO_READWRITE), 0);
+            let err_rw = err_info.w_error_ret;
+            assert_eq!(err_rw, MMIOERR_CANNOTOPEN);
+
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+    }
+
+    #[test]
+    fn mmio_info_matches_100_byte_sdk_layout_without_overrunning_canary() {
+        // Independently sized 100-byte Win64 packed MMIOINFO plus 8-byte trailing canary
+        // (tested at both aligned and odd unaligned offsets).
+        const SDK_MMIOINFO_SIZE: usize = 100;
+        const OFF_FCC_IO_PROC: usize = 4;
+        const OFF_W_ERROR_RET: usize = 16;
+        const OFF_CCH_BUFFER: usize = 28;
+        const OFF_PCH_BUFFER: usize = 32;
+        const OFF_HMMIO: usize = 92;
+        const CANARY: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+
+        let mut wav = build_sample_riff_wave();
+
+        for base_off in [0usize, 1usize] {
+            let mut raw = [0u8; 1 + SDK_MMIOINFO_SIZE + CANARY.len()];
+            raw[base_off + SDK_MMIOINFO_SIZE..base_off + SDK_MMIOINFO_SIZE + CANARY.len()]
+                .copy_from_slice(&CANARY);
+
+            // 1. Successful FOURCC_MEM open: writes wErrorRet=0 at +16 and hmmio at +92, never past +100.
+            raw[base_off + OFF_FCC_IO_PROC..base_off + OFF_FCC_IO_PROC + 4]
+                .copy_from_slice(&FOURCC_MEM.to_le_bytes());
+            raw[base_off + OFF_W_ERROR_RET..base_off + OFF_W_ERROR_RET + 4]
+                .copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+            raw[base_off + OFF_CCH_BUFFER..base_off + OFF_CCH_BUFFER + 4]
+                .copy_from_slice(&(wav.len() as i32).to_le_bytes());
+            raw[base_off + OFF_PCH_BUFFER..base_off + OFF_PCH_BUFFER + 8]
+                .copy_from_slice(&(wav.as_mut_ptr() as usize).to_le_bytes());
+
+            let pinfo = unsafe { raw.as_mut_ptr().add(base_off) as *mut MmioInfo };
+            let h = unsafe { mmioOpenA(std::ptr::null(), pinfo, 0) };
+            assert_ne!(h, 0);
+            assert_eq!(
+                u32::from_le_bytes(
+                    raw[base_off + OFF_W_ERROR_RET..base_off + OFF_W_ERROR_RET + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                0
+            );
+            assert_eq!(
+                usize::from_le_bytes(
+                    raw[base_off + OFF_HMMIO..base_off + OFF_HMMIO + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                h
+            );
+            assert_eq!(
+                &raw[base_off + SDK_MMIOINFO_SIZE..base_off + SDK_MMIOINFO_SIZE + CANARY.len()],
+                &CANARY,
+                "mmioOpenA success overwrote trailing canary (base_off={base_off})"
+            );
+            assert_eq!(unsafe { mmioClose(h, 0) }, 0);
+
+            // 2. Failed open: writes wErrorRet at +16 and leaves trailing canary untouched.
+            raw[base_off..base_off + SDK_MMIOINFO_SIZE].fill(0);
+            let h_fail = unsafe { mmioOpenA(std::ptr::null(), pinfo, 0) };
+            assert_eq!(h_fail, 0);
+            assert_eq!(
+                u32::from_le_bytes(
+                    raw[base_off + OFF_W_ERROR_RET..base_off + OFF_W_ERROR_RET + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                MMIOERR_CANNOTOPEN
+            );
+            assert_eq!(
+                &raw[base_off + SDK_MMIOINFO_SIZE..base_off + SDK_MMIOINFO_SIZE + CANARY.len()],
+                &CANARY,
+                "mmioOpenA failure overwrote trailing canary (base_off={base_off})"
+            );
         }
     }
 }

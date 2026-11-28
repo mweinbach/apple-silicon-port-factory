@@ -414,89 +414,41 @@ pub(crate) unsafe fn restore_context_for_caller(
     resume_at(&target, cur)
 }
 
-/// Defines a naked export that captures the caller's CONTEXT on its own
-/// stack and calls `$imp(ctx: *mut Context, cur: usize) -> u64` (`cur` = the
-/// caller's walk cursor, [`cur_to_raw`]); the original register
-/// arguments are available as `ctx.gpr[RCX]`, `[RDX]`, `[R8]`, `[R9]` and
-/// stack arguments at `ctx.rsp() + 0x28 + 8*n`.
-///
-/// aarch64: called directly by guest code (the innermost EH record is an emulated region
-/// whose in-flight host call is this export), the CONTEXT is that guest frame's
-/// ([`guest_caller_context`]); otherwise the host capture, cursor `Host`.
-macro_rules! context_capturing_export {
-    ($name:ident => $imp:path) => {
-        #[cfg(target_arch = "x86_64")]
-        #[unsafe(naked)]
-        pub unsafe extern "win64" fn $name() {
-            std::arch::naked_asm!(
-                "sub rsp, 0x4F8",
-                "mov [rsp+0x20+0x78], rax",
-                "mov [rsp+0x20+0x80], rcx",
-                "mov [rsp+0x20+0x88], rdx",
-                "mov [rsp+0x20+0x90], rbx",
-                "mov [rsp+0x20+0xA0], rbp",
-                "mov [rsp+0x20+0xA8], rsi",
-                "mov [rsp+0x20+0xB0], rdi",
-                "mov [rsp+0x20+0xB8], r8",
-                "mov [rsp+0x20+0xC0], r9",
-                "mov [rsp+0x20+0xC8], r10",
-                "mov [rsp+0x20+0xD0], r11",
-                "mov [rsp+0x20+0xD8], r12",
-                "mov [rsp+0x20+0xE0], r13",
-                "mov [rsp+0x20+0xE8], r14",
-                "mov [rsp+0x20+0xF0], r15",
-                "lea rax, [rsp+0x500]",
-                "mov [rsp+0x20+0x98], rax",
-                "mov rax, [rsp+0x4F8]",
-                "mov [rsp+0x20+0xF8], rax",
-                "pushfq",
-                "pop rax",
-                "mov [rsp+0x20+0x44], eax",
-                "mov word ptr [rsp+0x20+0x38], cs",
-                "mov word ptr [rsp+0x20+0x42], ss",
-                "fxsave [rsp+0x20+0x100]",
-                "stmxcsr [rsp+0x20+0x34]",
-                "mov dword ptr [rsp+0x20+0x30], 0x10000F",
-                "lea rcx, [rsp+0x20]",
-                "xor edx, edx",
-                "call {imp}",
-                "add rsp, 0x4F8",
-                "ret",
-                imp = sym $imp,
-            )
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        pub unsafe extern "win64" fn $name(
-            rcx: u64,
-            rdx: u64,
-            r8: u64,
-            r9: u64,
-            a5: u64,
-            a6: u64,
-        ) -> u64 {
-            let mut ctx = Context::zeroed();
-            let cur = match guest_caller_context($name as *const () as usize, &mut ctx) {
-                Some(c) => c,
-                None => {
-                    RtlCaptureContext(&mut ctx);
-                    Cur::Host
-                }
-            };
-            ctx.gpr[RCX] = rcx;
-            ctx.gpr[RDX] = rdx;
-            ctx.gpr[R8] = r8;
-            ctx.gpr[R9] = r9;
-            ctx.gpr[R10] = a5;
-            ctx.gpr[R11] = a6;
-            let mut stack_slots = [0u64; 8];
-            stack_slots[4] = a5;
-            stack_slots[5] = a6;
-            if ctx.gpr[RSP] == 0 {
-                ctx.gpr[RSP] = stack_slots.as_ptr() as u64;
-            }
-            $imp(&mut ctx, cur_to_raw(cur))
+/// Helper invoked by [`crate::context_capturing_export!`] on non-x86_64 hosts to capture
+/// either the calling emulated guest frame's `CONTEXT` (when called directly by guest code)
+/// or the host thread's `CONTEXT`, then dispatch to `imp`.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn capture_context_and_dispatch(
+    export_addr: usize,
+    rcx: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    a5: u64,
+    a6: u64,
+    imp: unsafe extern "win64" fn(*mut Context, usize) -> u64,
+) -> u64 {
+    let mut ctx = Context::zeroed();
+    let cur = match guest_caller_context(export_addr, &mut ctx) {
+        Some(c) => c,
+        None => {
+            RtlCaptureContext(&mut ctx);
+            Cur::Host
         }
     };
+    ctx.gpr[RCX] = rcx;
+    ctx.gpr[RDX] = rdx;
+    ctx.gpr[R8] = r8;
+    ctx.gpr[R9] = r9;
+    ctx.gpr[R10] = a5;
+    ctx.gpr[R11] = a6;
+    let mut stack_slots = [0u64; 8];
+    stack_slots[4] = a5;
+    stack_slots[5] = a6;
+    if ctx.gpr[RSP] == 0 {
+        ctx.gpr[RSP] = stack_slots.as_ptr() as u64;
+    }
+    imp(&mut ctx, cur_to_raw(cur))
 }
 
 /// [`Cur`] as one register-sized value (records are 8-aligned: tag in the low 2 bits).
@@ -3299,6 +3251,76 @@ unsafe fn restore_jump_buffer(context: &mut Context, jb: u64) {
         *context.xmm_mut(6 + k) = x;
     }
     context.context_flags |= CONTEXT_AW2_LONGJMP;
+}
+
+/// `vcruntime140!__intrinsic_setjmp(jb, frame)`: captures the caller's nonvolatile GP/XMM
+/// registers, `RSP`, `RIP`, `MXCSR`, and `Frame` into the 256-byte x64 `_JUMP_BUFFER`,
+/// returning `0`.
+pub(crate) unsafe extern "win64" fn setjmp_impl(ctx: *mut Context, _cur: usize) -> u64 {
+    let c = &*ctx;
+    let jb = c.gpr[RCX];
+    let frame = c.gpr[RDX];
+    if jb == 0 {
+        return 0;
+    }
+    let w = |i: usize, v: u64| std::ptr::write_unaligned((jb + 8 * i as u64) as *mut u64, v);
+    w(0, frame);
+    w(1, c.gpr[RBX]);
+    w(2, c.gpr[RSP]);
+    w(3, c.gpr[RBP]);
+    w(4, c.gpr[RSI]);
+    w(5, c.gpr[RDI]);
+    w(6, c.gpr[12]);
+    w(7, c.gpr[13]);
+    w(8, c.gpr[14]);
+    w(9, c.gpr[15]);
+    w(JB_RIP, c.rip);
+    std::ptr::write_unaligned((jb + JB_MXCSR as u64) as *mut u32, c.mx_csr);
+    std::ptr::write_unaligned((jb + (JB_MXCSR + 4) as u64) as *mut u16, 0x027Fu16);
+    std::ptr::write_unaligned((jb + (JB_MXCSR + 6) as u64) as *mut u16, 0u16);
+    for k in 0..10 {
+        std::ptr::write_unaligned((jb + (JB_XMM6 + 16 * k) as u64) as *mut [u8; 16], c.xmm(6 + k));
+    }
+    0
+}
+
+/// `vcruntime140!longjmp(jb, val)`: unwinds via `do_unwind(STATUS_LONGJMP)` when
+/// `jb.Frame != 0` so SEH `__finally` and C++ FH3/FH4 destructors run before landing at
+/// `jb.Rip`, or restores directly when `jb.Frame == 0`.
+pub(crate) unsafe extern "win64" fn longjmp_impl(ctx: *mut Context, cur: usize) -> u64 {
+    let c = &*ctx;
+    let jb = c.gpr[RCX];
+    let val = c.gpr[RDX] as i32;
+    let ret = (if val == 0 { 1 } else { val }) as u32 as u64;
+    if jb == 0 {
+        log::error!("longjmp(NULL, {val})");
+        crate::process::exit_process(0xC000_0028);
+    }
+    let frame = rd::<u64>(jb);
+    let target_ip = rd::<u64>(jb + 8 * JB_RIP as u64);
+    let start_cur = cur_from_raw(cur);
+    if frame == 0 {
+        let mut target = *c;
+        restore_jump_buffer(&mut target, jb);
+        target.gpr[RAX] = ret;
+        if start_cur == Cur::Host {
+            abandon_crossings_below(target.gpr[RSP]);
+        }
+        resume_at(&target, start_cur)
+    } else {
+        let mut rec = ExceptionRecord {
+            code: STATUS_LONGJMP,
+            flags: 0,
+            record: std::ptr::null_mut(),
+            address: c.rip as *mut c_void,
+            number_parameters: 1,
+            _pad: 0,
+            information: [0; 15],
+        };
+        rec.information[0] = jb;
+        let mut out = Context::zeroed();
+        do_unwind(c, start_cur, frame, target_ip, &mut rec, ret, &mut out)
+    }
 }
 
 pub const STATUS_UNWIND_CONSOLIDATE: u32 = 0x8000_0029;

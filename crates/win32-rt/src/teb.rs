@@ -250,9 +250,11 @@ pub mod peb_off {
     pub const LDR: usize = 0x18;
     pub const PROCESS_PARAMETERS: usize = 0x20;
     pub const PROCESS_HEAP: usize = 0x30;
+    pub const FAST_PEB_LOCK: usize = 0x38;
     pub const TLS_EXPANSION_COUNTER: usize = 0x6C;
     pub const NUMBER_OF_PROCESSORS: usize = 0xB8;
     pub const NT_GLOBAL_FLAG: usize = 0xBC;
+    pub const LOADER_LOCK: usize = 0x110;
     pub const OS_MAJOR: usize = 0x118;
     pub const OS_MINOR: usize = 0x11C;
     pub const OS_BUILD: usize = 0x120;
@@ -353,6 +355,14 @@ fn init_peb() -> *mut u8 {
         set_field(peb, peb_off::OS_PLATFORM_ID, 2u32);
         set_field(peb, peb_off::SESSION_ID, 1u32);
         set_field(peb, peb_off::PROCESS_HEAP, crate::heap::process_heap() as usize);
+        let fast_peb_lock = libc::calloc(1, std::mem::size_of::<crate::sync::CriticalSection>())
+            as *mut crate::sync::CriticalSection;
+        crate::sync::InitializeCriticalSection(fast_peb_lock);
+        set_field(peb, peb_off::FAST_PEB_LOCK, fast_peb_lock as usize);
+        let loader_lock = libc::calloc(1, std::mem::size_of::<crate::sync::CriticalSection>())
+            as *mut crate::sync::CriticalSection;
+        crate::sync::InitializeCriticalSection(loader_lock);
+        set_field(peb, peb_off::LOADER_LOCK, loader_lock as usize);
         LDR.store(ldr as usize, Ordering::Release);
         PEB.store(peb as usize, Ordering::Release);
     });
@@ -551,5 +561,20 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn peb_has_initialized_loader_and_fast_peb_locks() {
+        unsafe {
+            let p = peb();
+            let ll: *const crate::sync::CriticalSection = field(p, peb_off::LOADER_LOCK);
+            let fpl: *const crate::sync::CriticalSection = field(p, peb_off::FAST_PEB_LOCK);
+            assert!(!ll.is_null(), "PEB->LoaderLock (+0x110) must be initialized");
+            assert!(!fpl.is_null(), "PEB->FastPebLock (+0x38) must be initialized");
+            assert_eq!((*ll).lock_count.load(Ordering::Relaxed), -1);
+            assert_eq!((*ll).owning_thread.load(Ordering::Relaxed), 0);
+            assert_eq!((*fpl).lock_count.load(Ordering::Relaxed), -1);
+            assert_eq!((*fpl).owning_thread.load(Ordering::Relaxed), 0);
+        }
     }
 }

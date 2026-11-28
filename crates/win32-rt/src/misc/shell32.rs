@@ -8,7 +8,10 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
-pub static ORDINALS: &[(u16, &str)] = &[(680, "IsUserAnAdmin")];
+pub static ORDINALS: &[(u16, &str)] = &[
+    (165, "SHCreateDirectory"),
+    (680, "IsUserAnAdmin"),
+];
 
 fn user() -> String {
     std::env::var("USER").unwrap_or_else(|_| "player".into())
@@ -621,16 +624,28 @@ pub unsafe extern "win64" fn SHQueryUserNotificationState(state: *mut u32) -> HR
     S_OK
 }
 
+pub unsafe extern "win64" fn SHCreateDirectory(hwnd: HWND, path: LPCWSTR) -> i32 {
+    SHCreateDirectoryExW(hwnd, path, std::ptr::null_mut())
+}
+
 pub unsafe extern "win64" fn SHCreateDirectoryExW(_hwnd: HWND, path: LPCWSTR, _sec: *mut c_void) -> i32 {
     if path.is_null() {
         return err::ERROR_INVALID_PARAMETER as i32;
     }
     let w = from_wide(path);
     match crate::path::to_host(&w) {
-        Some(h) => match std::fs::create_dir_all(h) {
-            Ok(()) => 0,
-            Err(_) => err::ERROR_ACCESS_DENIED as i32,
-        },
+        Some(h) => {
+            if h.is_dir() {
+                return err::ERROR_ALREADY_EXISTS as i32;
+            }
+            if h.exists() {
+                return 80; // ERROR_FILE_EXISTS
+            }
+            match std::fs::create_dir_all(h) {
+                Ok(()) => 0,
+                Err(_) => err::ERROR_ACCESS_DENIED as i32,
+            }
+        }
         None => err::ERROR_PATH_NOT_FOUND as i32,
     }
 }
@@ -641,10 +656,18 @@ pub unsafe extern "win64" fn SHCreateDirectoryExA(_hwnd: HWND, path: LPCSTR, _se
     }
     let a = crate::strings::from_ansi(path);
     match crate::path::to_host(&a) {
-        Some(h) => match std::fs::create_dir_all(h) {
-            Ok(()) => 0,
-            Err(_) => err::ERROR_ACCESS_DENIED as i32,
-        },
+        Some(h) => {
+            if h.is_dir() {
+                return err::ERROR_ALREADY_EXISTS as i32;
+            }
+            if h.exists() {
+                return 80; // ERROR_FILE_EXISTS
+            }
+            match std::fs::create_dir_all(h) {
+                Ok(()) => 0,
+                Err(_) => err::ERROR_ACCESS_DENIED as i32,
+            }
+        }
         None => err::ERROR_PATH_NOT_FOUND as i32,
     }
 }
@@ -1307,6 +1330,15 @@ pub unsafe extern "win64" fn PathIsRelativeA(path: LPCSTR) -> BOOL {
     let b = s.as_bytes();
     let abs = b.starts_with(b"\\") || b.starts_with(b"/") || (b.len() >= 2 && b[1] == b':');
     (!abs) as BOOL
+}
+
+pub unsafe extern "win64" fn PathIsUNCA(path: LPCSTR) -> BOOL {
+    if path.is_null() {
+        return FALSE;
+    }
+    let s = crate::strings::from_ansi(path);
+    let b = s.as_bytes();
+    (b.len() >= 2 && b[0] == b'\\' && b[1] == b'\\' && b.get(2).copied() != Some(b'?')) as BOOL
 }
 
 pub unsafe extern "win64" fn PathAddBackslashW(path: LPWSTR) -> LPWSTR {
@@ -2476,6 +2508,39 @@ mod tests {
             Some(v) => std::env::set_var("AW2_DRIVE_C", v),
             None => std::env::remove_var("AW2_DRIVE_C"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sh_create_directory_ordinal_and_path_is_unc_a() {
+        let root = std::env::temp_dir().join(format!("pf_sh_createdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::path::add_mount("U:\\", &root);
+
+        unsafe {
+            let target_w = crate::strings::to_wide_z("U:\\nested\\dir\\leaf");
+            assert_eq!(SHCreateDirectory(std::ptr::null_mut(), target_w.as_ptr()), 0);
+            assert!(root.join("nested").join("dir").join("leaf").is_dir());
+            assert_eq!(
+                SHCreateDirectory(std::ptr::null_mut(), target_w.as_ptr()),
+                err::ERROR_ALREADY_EXISTS as i32
+            );
+            assert_eq!(
+                crate::lookup_ordinal("shell32.dll", 165),
+                Some(SHCreateDirectory as *const ())
+            );
+
+            assert_eq!(PathIsUNCA(std::ptr::null()), FALSE);
+            assert_eq!(PathIsUNCA(b"\\\\server\\share\\file.txt\0".as_ptr()), TRUE);
+            assert_eq!(PathIsUNCA(b"\\\\?\\C:\\file.txt\0".as_ptr()), FALSE);
+            assert_eq!(PathIsUNCA(b"C:\\Windows\\System32\0".as_ptr()), FALSE);
+            assert_eq!(
+                crate::lookup("shlwapi.dll", "PathIsUNCA"),
+                Some(PathIsUNCA as *const ())
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

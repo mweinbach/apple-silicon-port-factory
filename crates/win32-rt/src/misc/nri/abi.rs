@@ -1731,7 +1731,15 @@ pub(super) fn nri_texel_block_size(fmt: u8) -> u32 {
 }
 
 pub(super) fn dxgi_to_nri(dxgi: u32) -> u8 {
+    if dxgi == 0 {
+        return 0;
+    }
     for (i, &d) in NRI_TO_DXGI.iter().enumerate() {
+        if d == dxgi && i != 0 {
+            return i as u8;
+        }
+    }
+    for (i, &d) in NRI_TO_DXGI_TYPELESS.iter().enumerate() {
         if d == dxgi && i != 0 {
             return i as u8;
         }

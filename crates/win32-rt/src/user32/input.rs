@@ -9,8 +9,17 @@ use super::message::{self, InputMsg};
 use super::window;
 use super::*;
 use crate::types::*;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// Last hardware input tick timestamp (bit 32 set once recorded so tick `0` is distinguishable).
+static LAST_INPUT_TICK: AtomicU64 = AtomicU64::new(0);
+static INITIAL_INPUT_TICK: OnceLock<u32> = OnceLock::new();
+
+#[inline]
+fn record_last_input(time: u32) {
+    LAST_INPUT_TICK.store((time as u64) | (1u64 << 32), Ordering::Release);
+}
 
 // ---------------------------------------------------------------------------
 // Activation / focus / capture (process-wide; Windows tracks these per
@@ -742,8 +751,12 @@ fn post_input_to(hwnd: usize, msg: u32, wparam: WPARAM, lparam: LPARAM, chars: V
 fn post_input_to_checked(hwnd: usize, msg: u32, wparam: WPARAM, lparam: LPARAM, chars: Vec<u16>, ll_checked: bool) -> bool {
     let Some(w) = window::get(hwnd) else { return false };
     let Some(q) = message::queue_of(w.tid) else { return false };
+    let time = tick_ms();
+    if is_keyboard_msg(msg) || is_mouse_msg(msg) {
+        record_last_input(time);
+    }
     q.post_input(InputMsg {
-        msg: MSG { hwnd, message: msg, wparam, lparam, time: tick_ms(), pt: cursor_screen(), l_private: 0 },
+        msg: MSG { hwnd, message: msg, wparam, lparam, time, pt: cursor_screen(), l_private: 0 },
         chars,
         ll_checked,
         seq: 0,
@@ -995,6 +1008,7 @@ pub fn native_key_state_only(k: NativeKey) {
     let Some(key) = keymap::from_mac(k.mac) else {
         return;
     };
+    record_last_input(tick_ms());
     set_async_key(key, k.down);
     {
         let mut s = SYNC.lock().unwrap();
@@ -1035,6 +1049,7 @@ fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
         (false, true) => wm::SYSKEYUP,
     };
     let time = tick_ms();
+    record_last_input(time);
     let ll_checked = if super::misc::can_invoke_guest_hooks_on_this_thread() {
         if dispatch_keyboard_ll_hook(msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time) {
             return;
@@ -1306,7 +1321,9 @@ pub fn native_raw_mouse(dx: f64, dy: f64) {
     if raw_source() == RawSource::NsEvent {
         return;
     }
-    GC_RAW_LAST.store(tick_ms().max(1), Ordering::Release);
+    let now = tick_ms();
+    record_last_input(now);
+    GC_RAW_LAST.store(now.max(1), Ordering::Release);
     if let Some((x, y)) = accumulate(&RAW_ACC_GC, dx, dy) {
         raw_mouse(x, y, 0, 0);
     }
@@ -1316,6 +1333,7 @@ pub fn native_mouse(ev: NativeMouse) {
     match ev {
         NativeMouse::Move { hwnd, client, screen, dx, dy } => {
             let time = tick_ms();
+            record_last_input(time);
             let ll_checked = if super::misc::can_invoke_guest_hooks_on_this_thread() {
                 if dispatch_mouse_ll_hook(wm::MOUSEMOVE, screen, 0, time) {
                     return;
@@ -1378,6 +1396,7 @@ pub fn native_mouse(ev: NativeMouse) {
                 (MouseButton::X2, false) => (VK_XBUTTON2, 0x100, 0x200, wm::XBUTTONUP, 2),
             };
             let time = tick_ms();
+            record_last_input(time);
             let ll_mouse_data = (ll_xbtn << 16) as u32;
             let ll_checked = if super::misc::can_invoke_guest_hooks_on_this_thread() {
                 if dispatch_mouse_ll_hook(ll_msg, screen, ll_mouse_data, time) {
@@ -1443,6 +1462,7 @@ pub fn native_mouse(ev: NativeMouse) {
                 return;
             }
             let time = tick_ms();
+            record_last_input(time);
             let msg = if horizontal { wm::MOUSEHWHEEL } else { wm::MOUSEWHEEL };
             let pos = if super::cursor::relative_mode() { super::cursor::cursor_pos() } else { screen };
             let mouse_data = ((delta as i16 as u16) as u32) << 16;
@@ -1874,6 +1894,27 @@ pub unsafe extern "win64" fn GetRawInputBuffer(
 
 pub unsafe extern "win64" fn DefRawInputProc(_raw: *mut *mut u8, _n: i32, _header_size: u32) -> LRESULT {
     0
+}
+
+/// `LASTINPUTINFO`: `{ UINT cbSize; DWORD dwTime; }` (8 bytes).
+pub unsafe extern "win64" fn GetLastInputInfo(plii: *mut u8) -> BOOL {
+    if plii.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    let cb_size = (plii as *const u32).read_unaligned();
+    if cb_size != 8 {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    let raw = LAST_INPUT_TICK.load(Ordering::Acquire);
+    let dw_time = if raw != 0 {
+        raw as u32
+    } else {
+        *INITIAL_INPUT_TICK.get_or_init(tick_ms)
+    };
+    (plii.add(4) as *mut u32).write_unaligned(dw_time);
+    TRUE
 }
 
 #[cfg(test)]
@@ -2950,5 +2991,34 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn get_last_input_info_tracks_input_ticks_and_validates_size() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            assert_eq!(GetLastInputInfo(std::ptr::null_mut()), FALSE);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+
+            let mut bad = [0u8; 8];
+            (bad.as_mut_ptr() as *mut u32).write_unaligned(4);
+            assert_eq!(GetLastInputInfo(bad.as_mut_ptr()), FALSE);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+
+            // Unaligned 8-byte LASTINPUTINFO succeeds and advances after native input.
+            let mut raw = [0u8; 12];
+            let lii = raw.as_mut_ptr().add(1);
+            (lii as *mut u32).write_unaligned(8);
+            assert_eq!(GetLastInputInfo(lii), TRUE);
+            let t0 = (lii.add(4) as *const u32).read_unaligned();
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            native_key_state_only(NativeKey { mac: 0x00, down: true, repeat: false, chars: Vec::new() });
+            native_key_state_only(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+
+            assert_eq!(GetLastInputInfo(lii), TRUE);
+            let t1 = (lii.add(4) as *const u32).read_unaligned();
+            assert!(t1.wrapping_sub(t0) < 60_000 && t1 != t0, "expected dwTime to advance: t0={t0}, t1={t1}");
+        }
     }
 }

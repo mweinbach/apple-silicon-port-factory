@@ -3570,14 +3570,18 @@ pub unsafe extern "win64" fn GetUserGeoID(_class: u32) -> i32 {
     244 // United States
 }
 
-pub unsafe extern "win64" fn GetGeoInfoW(geo: i32, ty: u32, out: *mut u16, cap: i32, lang: u16) -> i32 {
-    if cap < 0 || (cap > 0 && out.is_null()) {
+pub unsafe extern "win64" fn GetUserDefaultGeoName(geo_name: *mut u16, geo_name_count: i32) -> i32 {
+    if geo_name_count < 0 || (geo_name_count > 0 && geo_name.is_null()) {
         set_err(err::ERROR_INVALID_PARAMETER);
         return 0;
     }
+    let iso2 = geo_by_id(GetUserGeoID(16)).map(|e| e.iso2).unwrap_or("US");
+    put_name(geo_name, geo_name_count, iso2)
+}
+
+unsafe fn geo_info_string(geo: i32, ty: u32, lang: u16) -> Result<String, u32> {
     let Some(entry) = geo_by_id(geo) else {
-        set_err(err::ERROR_INVALID_PARAMETER);
-        return 0;
+        return Err(err::ERROR_INVALID_PARAMETER);
     };
     let region_icu = format!("{}_{}", entry.default_lang, entry.iso2);
     let disp_icu = if lang != 0 {
@@ -3633,12 +3637,58 @@ pub unsafe extern "win64" fn GetGeoInfoW(geo: i32, ty: u32, out: *mut u16, cap: 
         16 => locale_info_for(&region_loc, 0x14).unwrap_or_default(), // GEO_CURRENCYSYMBOL
         17 => entry.iso2.into(),                       // GEO_NAME
         18 => entry.geoid.to_string(),                 // GEO_ID
-        _ => {
-            set_err(err::ERROR_INVALID_FLAGS);
+        _ => return Err(err::ERROR_INVALID_FLAGS),
+    };
+    Ok(val)
+}
+
+pub unsafe extern "win64" fn GetGeoInfoW(geo: i32, ty: u32, out: *mut u16, cap: i32, lang: u16) -> i32 {
+    if cap < 0 || (cap > 0 && out.is_null()) {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    match geo_info_string(geo, ty, lang) {
+        Ok(val) => put_name(out, cap, &val),
+        Err(e) => {
+            set_err(e);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn GetGeoInfoA(geo: i32, ty: u32, out: *mut u8, cap: i32, lang: u16) -> i32 {
+    if cap < 0 || (cap > 0 && out.is_null()) {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let val = match geo_info_string(geo, ty, lang) {
+        Ok(v) => v,
+        Err(e) => {
+            set_err(e);
             return 0;
         }
     };
-    put_name(out, cap, &val)
+    let encoded: Vec<u8> = if ACP == 65001 {
+        val.into_bytes()
+    } else {
+        let units = to_wide(&val);
+        encode_utf16_to_cp(ACP, &units, Some(b'?'))
+            .map(|(b, _)| b)
+            .unwrap_or_else(|_| val.into_bytes())
+    };
+    let need = encoded.len() as i32 + 1;
+    if cap == 0 {
+        return need;
+    }
+    if need > cap {
+        set_err(err::ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if !encoded.is_empty() {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), out, encoded.len());
+    }
+    *out.add(encoded.len()) = 0;
+    need
 }
 
 // ---------------------------------------------------------------------------
@@ -5154,6 +5204,29 @@ mod tests {
             assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
             assert_eq!(GetGeoInfoW(94, 999, buf.as_mut_ptr(), 64, 0), 0);
             assert_eq!(teb::last_error(), err::ERROR_INVALID_FLAGS);
+
+            // GetGeoInfoA (ANSI) + sizing + buffer-too-small + invalid GeoID/type.
+            let mut abuf = [0u8; 64];
+            assert_eq!(GetGeoInfoA(244, 4, std::ptr::null_mut(), 0, 0), 3);
+            assert_eq!(GetGeoInfoA(244, 4, abuf.as_mut_ptr(), 2, 0), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(GetGeoInfoA(244, 4, abuf.as_mut_ptr(), 64, 0), 3);
+            assert_eq!(from_ansi(abuf.as_ptr()), "US");
+            assert_eq!(GetGeoInfoA(94, 5, abuf.as_mut_ptr(), 64, 0), 4);
+            assert_eq!(from_ansi(abuf.as_ptr()), "DEU");
+            assert_eq!(GetGeoInfoA(99999, 4, abuf.as_mut_ptr(), 64, 0), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(GetGeoInfoA(244, 4, std::ptr::null_mut(), 16, 0), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // GetUserDefaultGeoName returns "US" matching GetUserGeoID(16) == 244.
+            assert_eq!(GetUserDefaultGeoName(std::ptr::null_mut(), 0), 3);
+            assert_eq!(GetUserDefaultGeoName(buf.as_mut_ptr(), 2), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(GetUserDefaultGeoName(buf.as_mut_ptr(), 64), 3);
+            assert_eq!(from_wide(buf.as_ptr()), "US");
+            assert_eq!(GetUserDefaultGeoName(std::ptr::null_mut(), 4), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
         }
     }
 

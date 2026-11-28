@@ -1016,7 +1016,8 @@ pub unsafe extern "win64" fn MsgWaitForMultipleObjectsEx(n: u32, hs: *const HAND
         return WAIT_FAILED;
     }
     let mut objs = handles::WaitableList::with_capacity(n as usize + 1);
-    for &h in std::slice::from_raw_parts(hs, n as usize) {
+    for i in 0..(n as usize) {
+        let h = std::ptr::read_unaligned(hs.add(i));
         match handles::get(h) {
             Some(o) if o.waitable().is_some() => objs.push(o),
             _ => {
@@ -1360,5 +1361,25 @@ mod tests {
             WNDPROC_OBSERVED_SENDER_UNBLOCKED.load(Ordering::Acquire),
             "sender must unblock before receiver WndProc returns"
         );
+    }
+
+    #[test]
+    fn msg_wait_accepts_unaligned_and_null_zero_handles() {
+        std::thread::spawn(|| unsafe {
+            // Zero handles with NULL pointer is valid on Windows.
+            assert_eq!(MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 0, QS_ALLINPUT, 0), WAIT_TIMEOUT);
+
+            // Unaligned handle array must not panic.
+            let ev = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, TRUE, std::ptr::null());
+            assert!(!ev.is_null());
+            let mut raw = [0u8; 16];
+            let unaligned = raw.as_mut_ptr().add(4) as *mut HANDLE;
+            assert!(!unaligned.is_aligned());
+            std::ptr::write_unaligned(unaligned, ev);
+            assert_eq!(MsgWaitForMultipleObjectsEx(1, unaligned, 0, QS_ALLINPUT, 0), WAIT_OBJECT_0);
+            assert_eq!(crate::kernel32::threads::CloseHandle(ev), TRUE);
+        })
+        .join()
+        .unwrap();
     }
 }

@@ -171,3 +171,75 @@ macro_rules! bridge_entry {
         p
     }};
 }
+
+/// Defines a Win64 export that captures the caller's `CONTEXT` and calls
+/// `$imp(ctx: *mut Context, cur: usize) -> u64`.
+///
+/// Recognized at column 0 by `build.rs` so exports in any DLL module (e.g.
+/// `kernel32` `RaiseException`/`RtlUnwindEx` or `vcruntime140` `__intrinsic_setjmp`/`longjmp`)
+/// are registered automatically.
+#[macro_export]
+macro_rules! context_capturing_export {
+    ($name:ident => $imp:path) => {
+        #[cfg(target_arch = "x86_64")]
+        #[unsafe(naked)]
+        pub unsafe extern "win64" fn $name() {
+            std::arch::naked_asm!(
+                "sub rsp, 0x4F8",
+                "mov [rsp+0x20+0x78], rax",
+                "mov [rsp+0x20+0x80], rcx",
+                "mov [rsp+0x20+0x88], rdx",
+                "mov [rsp+0x20+0x90], rbx",
+                "mov [rsp+0x20+0xA0], rbp",
+                "mov [rsp+0x20+0xA8], rsi",
+                "mov [rsp+0x20+0xB0], rdi",
+                "mov [rsp+0x20+0xB8], r8",
+                "mov [rsp+0x20+0xC0], r9",
+                "mov [rsp+0x20+0xC8], r10",
+                "mov [rsp+0x20+0xD0], r11",
+                "mov [rsp+0x20+0xD8], r12",
+                "mov [rsp+0x20+0xE0], r13",
+                "mov [rsp+0x20+0xE8], r14",
+                "mov [rsp+0x20+0xF0], r15",
+                "lea rax, [rsp+0x500]",
+                "mov [rsp+0x20+0x98], rax",
+                "mov rax, [rsp+0x4F8]",
+                "mov [rsp+0x20+0xF8], rax",
+                "pushfq",
+                "pop rax",
+                "mov [rsp+0x20+0x44], eax",
+                "mov word ptr [rsp+0x20+0x38], cs",
+                "mov word ptr [rsp+0x20+0x42], ss",
+                "fxsave [rsp+0x20+0x100]",
+                "stmxcsr [rsp+0x20+0x34]",
+                "mov dword ptr [rsp+0x20+0x30], 0x10000F",
+                "lea rcx, [rsp+0x20]",
+                "xor edx, edx",
+                "call {imp}",
+                "add rsp, 0x4F8",
+                "ret",
+                imp = sym $imp,
+            )
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        pub unsafe extern "C" fn $name(
+            rcx: u64,
+            rdx: u64,
+            r8: u64,
+            r9: u64,
+            a5: u64,
+            a6: u64,
+        ) -> u64 {
+            $crate::unwind::capture_context_and_dispatch(
+                $name as *const () as usize,
+                rcx,
+                rdx,
+                r8,
+                r9,
+                a5,
+                a6,
+                $imp,
+            )
+        }
+    };
+}

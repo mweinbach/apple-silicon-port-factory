@@ -1019,7 +1019,7 @@ pub unsafe extern "win64" fn _kbhit() -> i32 {
 
 /// Resolve the Windows command interpreter (`%COMSPEC%`, defaulting to
 /// `C:\Windows\System32\cmd.exe`) if a real guest executable exists at that path.
-fn resolve_comspec() -> Option<String> {
+pub(crate) fn resolve_comspec() -> Option<String> {
     #[cfg(target_os = "ios")]
     {
         return None;

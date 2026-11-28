@@ -345,6 +345,14 @@ pub unsafe extern "win64" fn GetModuleFileNameExW(p: HANDLE, h: HMODULE, buf: LP
     K32GetModuleFileNameExW(p, h, buf, size)
 }
 
+pub unsafe extern "win64" fn K32GetModuleFileNameExA(_p: HANDLE, h: HMODULE, buf: LPSTR, size: u32) -> u32 {
+    GetModuleFileNameA(h, buf, size)
+}
+
+pub unsafe extern "win64" fn GetModuleFileNameExA(p: HANDLE, h: HMODULE, buf: LPSTR, size: u32) -> u32 {
+    K32GetModuleFileNameExA(p, h, buf, size)
+}
+
 pub unsafe extern "win64" fn K32GetModuleBaseNameW(_p: HANDLE, h: HMODULE, buf: LPWSTR, size: u32) -> u32 {
     let h = (!h.is_null()).then_some(h as usize);
     let Some(path) = crate::loader().module_path(h) else { return 0 };
@@ -1254,6 +1262,27 @@ mod tests {
             let c_bit0 = &calls[calls.len() - 1];
             assert_eq!(c_bit0.flags, LOAD_LIBRARY_SEARCH_SYSTEM32);
             assert_eq!(c_bit0.search_path, None);
+
+            // K32GetModuleFileNameExA / GetModuleFileNameExA return ANSI module path.
+            let mut abuf = [0u8; 64];
+            let n = K32GetModuleFileNameExA(
+                crate::handles::CURRENT_PROCESS,
+                0x1000_0000 as HMODULE,
+                abuf.as_mut_ptr(),
+                abuf.len() as u32,
+            );
+            assert_eq!(n as usize, "C:\\Game\\mock_plugin.dll".len());
+            assert_eq!(from_ansi(abuf.as_ptr()), "C:\\Game\\mock_plugin.dll");
+            assert_eq!(
+                GetModuleFileNameExA(
+                    crate::handles::CURRENT_PROCESS,
+                    0xDEAD_BEEF as HMODULE,
+                    abuf.as_mut_ptr(),
+                    abuf.len() as u32,
+                ),
+                0
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_MOD_NOT_FOUND);
         }
     }
 }

@@ -586,7 +586,9 @@ pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i3
     } else {
         (TextMode::Binary, O_BINARY)
     };
-    let raw = kind != FileKind::Disk;
+    // Keep TTY/console handles untranslated, but allow explicit text translation on both
+    // disk files and Win32 pipes (e.g., `_open_osfhandle(..., O_TEXT)` and `_popen("rt"/"wt")`).
+    let raw = !matches!(kind, FileKind::Disk | FileKind::Pipe);
     set_fd_info(
         crt_fd,
         FdInfo {
@@ -2019,6 +2021,308 @@ pub unsafe extern "win64" fn _fdopen(fd: i32, mode: *const u8) -> *mut FILE {
 pub unsafe extern "win64" fn _wfdopen(fd: i32, mode: *const u16) -> *mut FILE {
     let m = crate::strings::leak_ansi_z(&from_wide(mode));
     _fdopen(fd, m)
+}
+
+unsafe fn freopen_str(path: &str, mode: &str, fp: *mut FILE) -> *mut FILE {
+    if fp.is_null() {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    let Some(mf) = parse_mode(mode) else {
+        errno::set(EINVAL);
+        super::runtime::invalid_parameter("freopen: bad mode");
+        return std::ptr::null_mut();
+    };
+    let _l = Locked::new();
+    let Some((old_fd, is_static)) = with_table(|t| {
+        t.map.get_mut(&(fp as usize)).map(|s| {
+            let _ = s.flush();
+            (s.fd, s.is_static)
+        })
+    }) else {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    };
+    let new_fd = open_host_bom(path, mf.oflag, 0x180, mf.write_bom, mf.detect_bom, false);
+    if new_fd < 0 {
+        if !is_static {
+            if let Some(s) = with_table(|t| t.map.remove(&(fp as usize))) {
+                let _ = _close(s.fd);
+            }
+        }
+        return std::ptr::null_mut();
+    }
+    let final_fd = if is_static && (0..=2).contains(&old_fd) {
+        if libc::dup2(new_fd, old_fd) >= 0 {
+            let info = fd_info(new_fd);
+            let _ = _close(new_fd);
+            set_fd_info(old_fd, info, None);
+            old_fd
+        } else {
+            new_fd
+        }
+    } else {
+        if old_fd >= 0 && !is_static {
+            let _ = _close(old_fd);
+        }
+        new_fd
+    };
+    (*fp)._file = final_fd;
+    (*fp)._flag = (mf.readable as i32) | ((mf.writable as i32) << 1);
+    with_table(|t| {
+        if let Some(s) = t.map.get_mut(&(fp as usize)) {
+            s.fd = final_fd;
+            s.readable = mf.readable;
+            s.writable = mf.writable;
+            s.eof = false;
+            s.err = false;
+            s.wbuf.clear();
+            s.rbuf.clear();
+            s.rbuf_src_pos.clear();
+            s.rpos = 0;
+            s.unget.clear();
+        }
+    });
+    fp
+}
+
+pub unsafe extern "win64" fn freopen(path: *const u8, mode: *const u8, fp: *mut FILE) -> *mut FILE {
+    if path.is_null() || mode.is_null() || fp.is_null() {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    freopen_str(&from_ansi(path), &from_ansi(mode), fp)
+}
+
+pub unsafe extern "win64" fn _wfreopen(path: *const u16, mode: *const u16, fp: *mut FILE) -> *mut FILE {
+    if path.is_null() || mode.is_null() || fp.is_null() {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    freopen_str(&from_wide(path), &from_wide(mode), fp)
+}
+
+pub unsafe extern "win64" fn _pipe(pfds: *mut i32, _psize: u32, textmode: i32) -> i32 {
+    if pfds.is_null() {
+        errno::set(EINVAL);
+        return -1;
+    }
+    let mut fds = [-1i32; 2];
+    if libc::pipe(fds.as_mut_ptr()) != 0 {
+        errno::set_from_host();
+        return -1;
+    }
+    if (textmode & O_NOINHERIT) != 0 {
+        for &fd in &fds {
+            let fl = libc::fcntl(fd, libc::F_GETFD);
+            if fl >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    let eff_mode = if (textmode & O_BINARY) != 0 {
+        (TextMode::Binary, O_BINARY)
+    } else if (textmode & O_TEXT) != 0 {
+        (TextMode::AnsiText, O_TEXT)
+    } else if FMODE.load(std::sync::atomic::Ordering::Relaxed) == O_BINARY {
+        (TextMode::Binary, O_BINARY)
+    } else {
+        (TextMode::AnsiText, O_TEXT)
+    };
+    for &fd in &fds {
+        set_fd_info(
+            fd,
+            FdInfo {
+                mode: eff_mode.0,
+                win_mode: eff_mode.1,
+                raw: false,
+                temporary: false,
+                osf_handle: None,
+            },
+            None,
+        );
+    }
+    std::ptr::write_unaligned(pfds, fds[0]);
+    std::ptr::write_unaligned(pfds.add(1), fds[1]);
+    0
+}
+
+/// Child Win32 process handles (`HANDLE as usize`) created via `_popen`,
+/// keyed by the returned `FILE*` address.
+static POPEN_CHILDREN: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+/// Wrap the parent end of a `_popen` pipe handle into a CRT `FILE*`, honoring explicit
+/// `"t"`/`"b"`/`ccs=` modes and defaulting unspecified modes (`"r"`, `"w"`) to `_fmode`
+/// with CRLF <-> LF text translation enabled for text-mode pipe streams.
+#[cfg(any(not(target_os = "ios"), test))]
+unsafe fn popen_open_pipe_stream(parent_h: crate::types::HANDLE, mf: &ModeFlags) -> *mut FILE {
+    const MODE_MASK: i32 = O_BINARY | O_TEXT | O_WTEXT | O_U16TEXT | O_U8TEXT;
+    let mut open_flags = mf.oflag;
+    if (open_flags & MODE_MASK) == 0 {
+        open_flags |= match FMODE.load(std::sync::atomic::Ordering::Relaxed) {
+            O_BINARY => O_BINARY,
+            O_WTEXT => O_WTEXT,
+            _ => O_TEXT,
+        };
+    }
+    let fd = _open_osfhandle(parent_h as isize, open_flags);
+    if fd < 0 {
+        return std::ptr::null_mut();
+    }
+    let _l = Locked::new();
+    new_stream(fd, mf)
+}
+
+pub unsafe extern "win64" fn _popen(command: *const u8, mode: *const u8) -> *mut FILE {
+    if command.is_null() || mode.is_null() {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+    let cmd_str = from_ansi(command);
+    if cmd_str.len() > 32767 {
+        errno::set(7); // E2BIG
+        return std::ptr::null_mut();
+    }
+    let mode_str = from_ansi(mode);
+    let Some(mf) = parse_mode(&mode_str) else {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    };
+    if mf.readable == mf.writable {
+        errno::set(EINVAL);
+        return std::ptr::null_mut();
+    }
+
+    flush_all();
+
+    // Never escape to the host POSIX `/bin/sh`: only invoke a real guest `%COMSPEC%` / `cmd.exe`
+    // executable through `CreateProcessW` (which enforces PE validation, pinned-runner CDHash
+    // verification, and the child environment allowlist).
+    let Some(interp) = super::runtime::resolve_comspec() else {
+        log::debug!("_popen({cmd_str:?}): COMSPEC/cmd.exe not present in virtual drive -> ENOENT");
+        errno::set(errno::ENOENT);
+        return std::ptr::null_mut();
+    };
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        use crate::types::{FALSE, HANDLE, TRUE};
+
+        let mut rd_h: HANDLE = std::ptr::null_mut();
+        let mut wr_h: HANDLE = std::ptr::null_mut();
+        // SECURITY_ATTRIBUTES (x64, 24 bytes): nLength@0 = 24, lpSecurityDescriptor@8 = null, bInheritHandle@16 = TRUE.
+        let mut sa = [0u8; 24];
+        (sa.as_mut_ptr() as *mut u32).write_unaligned(24);
+        (sa.as_mut_ptr().add(16) as *mut i32).write_unaligned(TRUE);
+        if crate::kernel32::file::CreatePipe(&mut rd_h, &mut wr_h, sa.as_mut_ptr().cast(), 0) == FALSE {
+            errno::set(errno::EACCES);
+            return std::ptr::null_mut();
+        }
+        let (parent_h, child_h) = if mf.readable { (rd_h, wr_h) } else { (wr_h, rd_h) };
+        let _ = crate::kernel32::threads::SetHandleInformation(parent_h, 1 /* HANDLE_FLAG_INHERIT */, 0);
+
+        const STARTF_USESTDHANDLES: u32 = 0x0100;
+        const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+        const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+        const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+
+        let mut si = [0u8; 104];
+        (si.as_mut_ptr() as *mut u32).write_unaligned(104);
+        (si.as_mut_ptr().add(60) as *mut u32).write_unaligned(STARTF_USESTDHANDLES);
+        let h_in = if mf.readable {
+            crate::kernel32::file::GetStdHandle(STD_INPUT_HANDLE)
+        } else {
+            child_h
+        };
+        let h_out = if mf.readable {
+            child_h
+        } else {
+            crate::kernel32::file::GetStdHandle(STD_OUTPUT_HANDLE)
+        };
+        let h_err = crate::kernel32::file::GetStdHandle(STD_ERROR_HANDLE);
+        (si.as_mut_ptr().add(80) as *mut HANDLE).write_unaligned(h_in);
+        (si.as_mut_ptr().add(88) as *mut HANDLE).write_unaligned(h_out);
+        (si.as_mut_ptr().add(96) as *mut HANDLE).write_unaligned(h_err);
+
+        let app_w = crate::strings::to_wide_z(&interp);
+        let mut cmdline_w = crate::strings::to_wide_z(&format!("\"{interp}\" /c {cmd_str}"));
+        let mut pi = [0u8; 24];
+        let ok = crate::kernel32::process::CreateProcessW(
+            app_w.as_ptr(),
+            cmdline_w.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            TRUE,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            si.as_mut_ptr().cast(),
+            pi.as_mut_ptr().cast(),
+        );
+        let _ = crate::kernel32::threads::CloseHandle(child_h);
+        if ok == FALSE {
+            let last_err = crate::teb::last_error();
+            let _ = crate::kernel32::threads::CloseHandle(parent_h);
+            let mapped = match last_err {
+                crate::types::err::ERROR_ACCESS_DENIED | crate::types::err::ERROR_NOT_SUPPORTED => errno::EACCES,
+                193 /* ERROR_BAD_EXE_FORMAT */ => errno::ENOEXEC,
+                _ => errno::ENOENT,
+            };
+            errno::set(mapped);
+            return std::ptr::null_mut();
+        }
+
+        let h_proc = (pi.as_ptr() as *const HANDLE).read_unaligned();
+        let h_thr = (pi.as_ptr().add(8) as *const HANDLE).read_unaligned();
+        let _ = crate::kernel32::threads::CloseHandle(h_thr);
+
+        let fp = popen_open_pipe_stream(parent_h, &mf);
+        if fp.is_null() {
+            let _ = crate::kernel32::threads::CloseHandle(parent_h);
+            let _ = crate::kernel32::threads::CloseHandle(h_proc);
+            return std::ptr::null_mut();
+        }
+        POPEN_CHILDREN
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(fp as usize, h_proc as usize);
+        fp
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = interp;
+        log::debug!("_popen: subprocess spawning unsupported on iOS sandbox -> EACCES");
+        errno::set(EACCES);
+        std::ptr::null_mut()
+    }
+}
+
+pub unsafe extern "win64" fn _pclose(fp: *mut FILE) -> i32 {
+    if fp.is_null() {
+        errno::set(EINVAL);
+        return -1;
+    }
+    let child_handle = POPEN_CHILDREN
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.remove(&(fp as usize)));
+    let _ = fclose(fp);
+    match child_handle {
+        Some(h_raw) => {
+            let h_proc = h_raw as crate::types::HANDLE;
+            let _ = crate::kernel32::threads::WaitForSingleObject(h_proc, crate::types::INFINITE);
+            let mut code = 0u32;
+            let _ = crate::kernel32::process::GetExitCodeProcess(h_proc, &mut code);
+            let _ = crate::kernel32::threads::CloseHandle(h_proc);
+            code as i32
+        }
+        None => {
+            errno::set(EINVAL);
+            -1
+        }
+    }
 }
 
 pub unsafe extern "win64" fn fclose(fp: *mut FILE) -> i32 {
@@ -3920,6 +4224,179 @@ mod tests {
             clear_u8_pending(synth_fd);
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn freopen_pipe_and_popen_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("win32_rt_stdio_sm2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("U:\\", &dir);
+
+        unsafe {
+            // freopen + _wfreopen redirect an open FILE* cleanly.
+            let p1 = b"U:\\one.txt\0";
+            let p2 = b"U:\\two.txt\0";
+            let fp = fopen(p1.as_ptr(), b"wb\0".as_ptr());
+            assert!(!fp.is_null());
+            assert_eq!(fwrite(b"first".as_ptr().cast(), 1, 5, fp), 5);
+            let fp2 = freopen(p2.as_ptr(), b"wb\0".as_ptr(), fp);
+            assert_eq!(fp2, fp);
+            assert_eq!(fwrite(b"second".as_ptr().cast(), 1, 6, fp2), 6);
+            let wp2: Vec<u16> = "U:\\two.txt\0".encode_utf16().collect();
+            let wrm: Vec<u16> = "rb\0".encode_utf16().collect();
+            let fp3 = _wfreopen(wp2.as_ptr(), wrm.as_ptr(), fp2);
+            assert_eq!(fp3, fp);
+            let mut rbuf = [0u8; 16];
+            let n = fread(rbuf.as_mut_ptr().cast(), 1, 16, fp3);
+            assert_eq!(&rbuf[..n], b"second");
+            assert_eq!(fclose(fp3), 0);
+            assert_eq!(std::fs::read(dir.join("one.txt")).unwrap(), b"first");
+
+            // _pipe creates a working CRT fd pair in both binary and text modes.
+            let mut fds = [-1i32; 2];
+            assert_eq!(_pipe(fds.as_mut_ptr(), 4096, O_BINARY | O_NOINHERIT), 0);
+            assert_eq!(_write(fds[1], b"a\r\nb\n".as_ptr().cast(), 5), 5);
+            let mut pbuf = [0u8; 16];
+            assert_eq!(_read(fds[0], pbuf.as_mut_ptr().cast(), 16), 5);
+            assert_eq!(&pbuf[..5], b"a\r\nb\n");
+            assert_eq!(_close(fds[0]), 0);
+            assert_eq!(_close(fds[1]), 0);
+
+            // Text-mode _pipe (both explicit O_TEXT and default _fmode == O_TEXT) expands
+            // LF -> CRLF on write and translates CRLF -> LF on read (including split reads).
+            for pipe_flags in [O_TEXT | O_NOINHERIT, O_NOINHERIT] {
+                let mut tfds = [-1i32; 2];
+                assert_eq!(_pipe(tfds.as_mut_ptr(), 4096, pipe_flags), 0);
+                // 1. Write expands '\n' -> "\r\n" on the wire (verify via raw POSIX read).
+                assert_eq!(_write(tfds[1], b"hi\nby\n".as_ptr().cast(), 6), 6);
+                let mut wire = [0u8; 16];
+                let wn = libc::read(tfds[0], wire.as_mut_ptr().cast(), wire.len());
+                assert_eq!(wn, 8);
+                assert_eq!(&wire[..8], b"hi\r\nby\r\n");
+                // 2. Read translates "\r\n" -> '\n' (including across a chunk boundary ending in '\r').
+                assert_eq!(_write(tfds[1], b"x\ny\n".as_ptr().cast(), 4), 4);
+                let mut tbuf = [0u8; 16];
+                let r1 = _read(tfds[0], tbuf.as_mut_ptr().cast(), 2); // reads "x\r", peeks '\n' -> "x\n"
+                assert_eq!(r1, 2);
+                assert_eq!(&tbuf[..2], b"x\n");
+                let r2 = _read(tfds[0], tbuf.as_mut_ptr().cast(), 16);
+                assert_eq!(r2, 2);
+                assert_eq!(&tbuf[..2], b"y\n");
+                assert_eq!(_close(tfds[0]), 0);
+                assert_eq!(_close(tfds[1]), 0);
+            }
+
+            // _popen pipe streams (via popen_open_pipe_stream / _open_osfhandle on CreatePipe)
+            // must translate CRLF <-> LF in text modes ("rt", "r", "wt", "w") and preserve
+            // raw bytes in binary modes ("rb", "wb").
+            for (mode_str, expect_translated) in [
+                ("rt", true),
+                ("r", true),
+                ("rb", false),
+            ] {
+                let mut rd_h: crate::types::HANDLE = std::ptr::null_mut();
+                let mut wr_h: crate::types::HANDLE = std::ptr::null_mut();
+                assert_eq!(
+                    crate::kernel32::file::CreatePipe(&mut rd_h, &mut wr_h, std::ptr::null_mut(), 0),
+                    crate::types::TRUE
+                );
+                let mut written = 0u32;
+                assert_eq!(
+                    crate::kernel32::file::WriteFile(
+                        wr_h,
+                        b"L1\r\nL2\r\n".as_ptr().cast(),
+                        8,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    ),
+                    crate::types::TRUE
+                );
+                assert_eq!(crate::kernel32::threads::CloseHandle(wr_h), crate::types::TRUE);
+                let mf = parse_mode(mode_str).unwrap();
+                let fp = popen_open_pipe_stream(rd_h, &mf);
+                assert!(!fp.is_null());
+                let mut out = [0u8; 16];
+                let got = fread(out.as_mut_ptr().cast(), 1, out.len(), fp);
+                if expect_translated {
+                    assert_eq!(&out[..got], b"L1\nL2\n", "mode {mode_str} must translate CRLF -> LF");
+                } else {
+                    assert_eq!(&out[..got], b"L1\r\nL2\r\n", "mode {mode_str} must keep CRLF verbatim");
+                }
+                assert_eq!(fclose(fp), 0);
+            }
+
+            for (mode_str, expect_translated) in [
+                ("wt", true),
+                ("w", true),
+                ("wb", false),
+            ] {
+                let mut rd_h: crate::types::HANDLE = std::ptr::null_mut();
+                let mut wr_h: crate::types::HANDLE = std::ptr::null_mut();
+                assert_eq!(
+                    crate::kernel32::file::CreatePipe(&mut rd_h, &mut wr_h, std::ptr::null_mut(), 0),
+                    crate::types::TRUE
+                );
+                let mf = parse_mode(mode_str).unwrap();
+                let fp = popen_open_pipe_stream(wr_h, &mf);
+                assert!(!fp.is_null());
+                assert_eq!(fwrite(b"A\nB\n".as_ptr().cast(), 1, 4, fp), 4);
+                assert_eq!(fclose(fp), 0);
+                let mut wire = [0u8; 16];
+                let mut got = 0u32;
+                assert_eq!(
+                    crate::kernel32::file::ReadFile(
+                        rd_h,
+                        wire.as_mut_ptr().cast(),
+                        wire.len() as u32,
+                        &mut got,
+                        std::ptr::null_mut(),
+                    ),
+                    crate::types::TRUE
+                );
+                if expect_translated {
+                    assert_eq!(&wire[..got as usize], b"A\r\nB\r\n", "mode {mode_str} must expand LF -> CRLF");
+                } else {
+                    assert_eq!(&wire[..got as usize], b"A\nB\n", "mode {mode_str} must keep LF verbatim");
+                }
+                assert_eq!(crate::kernel32::threads::CloseHandle(rd_h), crate::types::TRUE);
+            }
+
+            // _popen must NEVER escape to the host `/bin/sh`:
+            // 1. Invalid modes / null args fail with EINVAL.
+            assert!(_popen(std::ptr::null(), b"rb\0".as_ptr()).is_null());
+            assert_eq!(*errno::_errno(), EINVAL);
+            assert!(_popen(b"echo hi\0".as_ptr(), b"rw\0".as_ptr()).is_null());
+            assert_eq!(*errno::_errno(), EINVAL);
+            assert_eq!(_pclose(std::ptr::null_mut()), -1);
+            assert_eq!(*errno::_errno(), EINVAL);
+
+            // 2. Without a guest COMSPEC/cmd.exe in the virtual drive, _popen fails with ENOENT
+            //    and never executes host shell commands.
+            let prev_comspec = crate::process::get_env("COMSPEC");
+            crate::process::set_env("COMSPEC", Some("U:\\missing_cmd.exe"));
+            let canary = dir.join("host_shell_escaped.txt");
+            let shell_cmd = format!("touch '{}'\0", canary.display());
+            assert!(_popen(shell_cmd.as_ptr(), b"rb\0".as_ptr()).is_null());
+            assert_eq!(*errno::_errno(), errno::ENOENT);
+            assert!(!canary.exists(), "_popen must never invoke host /bin/sh");
+
+            // 3. Even when COMSPEC points to a valid PE header in the virtual drive, _popen
+            //    routes strictly through CreateProcessW and fails closed when no verified runner
+            //    is pinned (EACCES) or when the file is not a PE (ENOEXEC).
+            let fake_cmd_host = dir.join("cmd.exe");
+            let mut fake_pe = vec![0u8; 0x100];
+            fake_pe[0..2].copy_from_slice(b"MZ");
+            fake_pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            fake_pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+            std::fs::write(&fake_cmd_host, &fake_pe).unwrap();
+            crate::process::set_env("COMSPEC", Some("U:\\cmd.exe"));
+            assert!(_popen(b"echo hi\0".as_ptr(), b"rb\0".as_ptr()).is_null());
+            assert_eq!(*errno::_errno(), EACCES);
+
+            crate::process::set_env("COMSPEC", prev_comspec.as_deref());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

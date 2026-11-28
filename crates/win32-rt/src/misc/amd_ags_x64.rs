@@ -445,6 +445,48 @@ pub extern "win64" fn agsDriverExtensionsDX12_SetMarker(
     AGS_SUCCESS
 }
 
+pub extern "win64" fn agsDriverExtensionsDX11_CreateDevice(
+    context: usize,
+    creation_params: *const c_void,
+    _extension_params: *const c_void,
+    returned_params: *mut c_void,
+) -> i32 {
+    if context == 0 || creation_params.is_null() || returned_params.is_null() {
+        return AGS_INVALID_ARGS;
+    }
+    unsafe {
+        // Zero `returnedParams->pDevice` (first field across all AGS DX11 SDK versions).
+        std::ptr::write_unaligned(returned_params as *mut usize, 0);
+    }
+    // Native-unsupported (AMD GPUOpen AGS SDK `amd_ags.h`): Apple Silicon exposes no
+    // AMD DX11 driver extensions; return `AGS_EXTENSION_NOT_SUPPORTED` (7) so callers
+    // fall back to standard `D3D11CreateDevice`.
+    log::debug!("agsDriverExtensionsDX11_CreateDevice: non-AMD GPU -> AGS_EXTENSION_NOT_SUPPORTED");
+    AGS_EXTENSION_NOT_SUPPORTED
+}
+
+pub extern "win64" fn agsDriverExtensionsDX11_SetDiskShaderCacheEnabled(
+    context: usize,
+    _enable: i32,
+) -> i32 {
+    if context == 0 {
+        return AGS_INVALID_ARGS;
+    }
+    log::debug!("agsDriverExtensionsDX11_SetDiskShaderCacheEnabled: non-AMD GPU -> AGS_EXTENSION_NOT_SUPPORTED");
+    AGS_EXTENSION_NOT_SUPPORTED
+}
+
+pub extern "win64" fn agsDriverExtensionsDX11_SetMaxAsyncCompileThreadCount(
+    context: usize,
+    _max_threads: u32,
+) -> i32 {
+    if context == 0 {
+        return AGS_INVALID_ARGS;
+    }
+    log::debug!("agsDriverExtensionsDX11_SetMaxAsyncCompileThreadCount: non-AMD GPU -> AGS_EXTENSION_NOT_SUPPORTED");
+    AGS_EXTENSION_NOT_SUPPORTED
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,5 +694,57 @@ mod tests {
             agsCheckDriverVersion(b"23.12.1\0".as_ptr(), min),
             AGS_SOFTWAREVERSIONCHECK_OLDER
         );
+    }
+
+    #[test]
+    fn ags_dx11_extensions_report_unsupported_honestly() {
+        let mut ctx = 0usize;
+        assert_eq!(
+            agsInitialize(agsGetVersionNumber(), 0, &mut ctx, std::ptr::null_mut()),
+            AGS_SUCCESS
+        );
+        let dummy_params = [0u8; 32];
+        let mut ret_dev: usize = 0xDEAD_BEEF;
+
+        assert_eq!(
+            agsDriverExtensionsDX11_CreateDevice(
+                0,
+                dummy_params.as_ptr().cast(),
+                std::ptr::null(),
+                (&mut ret_dev as *mut usize).cast()
+            ),
+            AGS_INVALID_ARGS
+        );
+        assert_eq!(
+            agsDriverExtensionsDX11_CreateDevice(
+                ctx,
+                std::ptr::null(),
+                std::ptr::null(),
+                (&mut ret_dev as *mut usize).cast()
+            ),
+            AGS_INVALID_ARGS
+        );
+        assert_eq!(
+            agsDriverExtensionsDX11_CreateDevice(
+                ctx,
+                dummy_params.as_ptr().cast(),
+                std::ptr::null(),
+                (&mut ret_dev as *mut usize).cast()
+            ),
+            AGS_EXTENSION_NOT_SUPPORTED
+        );
+        assert_eq!(ret_dev, 0);
+
+        assert_eq!(agsDriverExtensionsDX11_SetDiskShaderCacheEnabled(0, 1), AGS_INVALID_ARGS);
+        assert_eq!(
+            agsDriverExtensionsDX11_SetDiskShaderCacheEnabled(ctx, 1),
+            AGS_EXTENSION_NOT_SUPPORTED
+        );
+        assert_eq!(agsDriverExtensionsDX11_SetMaxAsyncCompileThreadCount(0, 4), AGS_INVALID_ARGS);
+        assert_eq!(
+            agsDriverExtensionsDX11_SetMaxAsyncCompileThreadCount(ctx, 4),
+            AGS_EXTENSION_NOT_SUPPORTED
+        );
+        assert_eq!(agsDeInitialize(ctx), AGS_SUCCESS);
     }
 }

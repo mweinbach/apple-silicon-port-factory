@@ -4,7 +4,7 @@
 use crate::types::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
@@ -113,6 +113,60 @@ struct PenData {
     color: u32,
 }
 
+/// Shared backing storage for a GDI bitmap so in-flight draw operations retain
+/// ownership even if another thread unselects and deletes the bitmap concurrently
+/// or tears down an external DXGI surface while a draw is in flight.
+struct BitmapBuffer {
+    bits_ptr: usize,
+    /// True when `bits_ptr` is externally owned (e.g., a DXGI surface staging buffer)
+    /// and must not be freed via `crate::heap::free` on drop.
+    external_bits: bool,
+    /// Optional owner handle (e.g., `Arc<MtlResource>`) keeping externally managed
+    /// pixel memory alive for as long as any `Arc<BitmapBuffer>` clone is held.
+    external_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for BitmapBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BitmapBuffer")
+            .field("bits_ptr", &self.bits_ptr)
+            .field("external_bits", &self.external_bits)
+            .field("has_external_owner", &self.external_owner.is_some())
+            .finish()
+    }
+}
+
+impl BitmapBuffer {
+    fn owned(bits_ptr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            bits_ptr,
+            external_bits: false,
+            external_owner: None,
+        })
+    }
+
+    fn external(
+        bits_ptr: usize,
+        external_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            bits_ptr,
+            external_bits: true,
+            external_owner,
+        })
+    }
+}
+
+impl Drop for BitmapBuffer {
+    fn drop(&mut self) {
+        if self.bits_ptr != 0 && !self.external_bits {
+            unsafe {
+                crate::heap::free(self.bits_ptr as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BitmapData {
     width: usize,
@@ -121,17 +175,19 @@ struct BitmapData {
     planes: u16,
     top_down: bool,
     is_dib: bool,
-    bits_ptr: usize,
+    backing: Arc<BitmapBuffer>,
     stride: usize,
     byte_len: usize,
-    /// True when `bits_ptr` is externally owned (e.g., a DXGI surface staging buffer)
-    /// and must not be freed by `DeleteObject`.
-    external_bits: bool,
 }
 
 impl BitmapData {
+    #[inline]
+    fn bits_ptr(&self) -> usize {
+        self.backing.bits_ptr
+    }
+
     fn row_offset(&self, y: usize) -> Option<usize> {
-        if y >= self.height || self.bits_ptr == 0 {
+        if y >= self.height || self.bits_ptr() == 0 {
             return None;
         }
         let phys_row = if self.top_down { y } else { self.height - 1 - y };
@@ -149,7 +205,7 @@ impl BitmapData {
             return None;
         }
         let row = self.row_offset(uy)?;
-        let base = self.bits_ptr as *const u8;
+        let base = self.bits_ptr() as *const u8;
         match self.bpp {
             32 => {
                 let off = row + ux * 4;
@@ -218,7 +274,7 @@ impl BitmapData {
         let Some(row) = self.row_offset(uy) else {
             return false;
         };
-        let base = self.bits_ptr as *mut u8;
+        let base = self.bits_ptr() as *mut u8;
         match self.bpp {
             32 => {
                 let off = row + ux * 4;
@@ -291,6 +347,7 @@ struct DcData {
     text_color: u32,
     bk_color: u32,
     bk_mode: i32,
+    stretch_blt_mode: i32,
     gamma_ramp: Option<Box<[u16; 768]>>,
 }
 
@@ -305,6 +362,7 @@ impl DcData {
             text_color: 0x0000_0000,
             bk_color: 0x00FF_FFFF,
             bk_mode: 2, // OPAQUE
+            stretch_blt_mode: 1, // BLACKONWHITE
             gamma_ramp: None,
         }
     }
@@ -670,23 +728,26 @@ pub unsafe extern "win64" fn CreateDIBSection(
             planes,
             top_down,
             is_dib: true,
-            bits_ptr: bits as usize,
+            backing: BitmapBuffer::owned(bits as usize),
             stride,
             byte_len: total,
-            external_bits: false,
         }),
     );
     h
 }
 
 /// Create a memory DC backed directly by an externally owned top-down 32bpp BGRA pixel buffer
-/// (used by `IDXGISurface1::GetDC`). Caller must release it with [`destroy_external_surface_dc`].
+/// (used by `IDXGISurface1::GetDC`). `owner` is retained in `BitmapBuffer` for the full lifetime
+/// of any cloned `BitmapData` so concurrent `ReleaseDC` / texture teardown cannot free `bits_ptr`
+/// while an in-flight draw is still writing pixels. Caller must release the handles with
+/// [`destroy_external_surface_dc`].
 pub(crate) fn create_external_surface_dc(
     width: usize,
     height: usize,
     stride: usize,
     bits_ptr: usize,
     byte_len: usize,
+    owner: Arc<dyn std::any::Any + Send + Sync>,
 ) -> (usize, usize) {
     let hbmp = NEXT.fetch_add(4, Ordering::Relaxed);
     let hdc = NEXT.fetch_add(4, Ordering::Relaxed);
@@ -702,10 +763,9 @@ pub(crate) fn create_external_surface_dc(
             planes: 1,
             top_down: true,
             is_dib: true,
-            bits_ptr,
+            backing: BitmapBuffer::external(bits_ptr, Some(owner)),
             stride,
             byte_len,
-            external_bits: true,
         }),
     );
     m.insert(hdc, Obj::Dc(dc));
@@ -714,9 +774,15 @@ pub(crate) fn create_external_surface_dc(
 
 /// Destroy a DC and external bitmap previously created by [`create_external_surface_dc`].
 pub(crate) fn destroy_external_surface_dc(hdc: usize, hbmp: usize) {
-    let mut m = objs().lock().unwrap();
-    m.remove(&hdc);
-    m.remove(&hbmp);
+    let removed = {
+        let mut m = objs().lock().unwrap();
+        let dc = m.remove(&hdc);
+        let bm = m.remove(&hbmp);
+        (dc, bm)
+    };
+    // Drop outside the global object-table lock so releasing the final external owner
+    // (e.g. a Metal staging resource) never runs teardown while holding `objs()`.
+    drop(removed);
 }
 
 pub unsafe extern "win64" fn DeleteObject(h: usize) -> BOOL {
@@ -724,13 +790,19 @@ pub unsafe extern "win64" fn DeleteObject(h: usize) -> BOOL {
         return TRUE; // deleting a stock object is a harmless no-op
     }
     let mut m = objs().lock().unwrap();
+    // Per Win32 GDI contract, reject deleting a bitmap while it is selected into any DC.
+    if matches!(m.get(&h), Some(Obj::Bitmap(_)))
+        && m.values().any(|o| matches!(o, Obj::Dc(dc) if dc.bitmap == h))
+    {
+        return FALSE;
+    }
     match m.remove(&h) {
         Some(Obj::Font(_) | Obj::Brush(_) | Obj::Pen(_) | Obj::Region) => TRUE,
         Some(Obj::Bitmap(bm)) => {
+            // Drop `bm` outside the global object-table lock; `BitmapBuffer::drop` frees
+            // owned storage once the last shared reference (including any in-flight draw) ends.
             drop(m);
-            if bm.bits_ptr != 0 && !bm.external_bits {
-                crate::heap::free(bm.bits_ptr as *mut std::ffi::c_void);
-            }
+            drop(bm);
             TRUE
         }
         Some(dc @ Obj::Dc(_)) => {
@@ -869,6 +941,10 @@ pub unsafe extern "win64" fn GetTextExtentPoint32W(hdc: usize, s: LPCWSTR, n: i3
     TRUE
 }
 
+pub unsafe extern "win64" fn GetTextExtentPointW(hdc: usize, s: LPCWSTR, n: i32, out: *mut SIZE) -> BOOL {
+    GetTextExtentPoint32W(hdc, s, n, out)
+}
+
 pub unsafe extern "win64" fn GetTextExtentPoint32A(hdc: usize, s: LPCSTR, n: i32, out: *mut SIZE) -> BOOL {
     if out.is_null() || (s.is_null() && n > 0) || n < 0 {
         crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
@@ -965,10 +1041,9 @@ pub unsafe extern "win64" fn CreateCompatibleBitmap(_hdc: usize, cx: i32, cy: i3
             planes: 1,
             top_down: true,
             is_dib: false,
-            bits_ptr: bits as usize,
+            backing: BitmapBuffer::owned(bits as usize),
             stride,
             byte_len: total,
-            external_bits: false,
         }),
     );
     handle
@@ -1023,14 +1098,694 @@ pub unsafe extern "win64" fn SetBkMode(hdc: usize, mode: i32) -> i32 {
     }
 }
 
+pub unsafe extern "win64" fn SetStretchBltMode(hdc: usize, mode: i32) -> i32 {
+    // BLACKONWHITE (1), WHITEONBLACK (2), COLORONCOLOR (3), HALFTONE (4).
+    if !(1..=4).contains(&mode) {
+        crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut m = objs().lock().unwrap();
+    match m.get_mut(&hdc) {
+        Some(Obj::Dc(dc)) => std::mem::replace(&mut dc.stretch_blt_mode, mode),
+        _ => {
+            crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+/// Draws pre-split text lines into a DC's selected bitmap using CoreText/CoreGraphics.
+///
+/// Respects `dc.text_color`, `dc.bk_color`, `dc.bk_mode` (`OPAQUE = 2`), selected font metrics,
+/// horizontal/vertical alignment (`DT_CENTER`, `DT_RIGHT`, `DT_VCENTER`, `DT_BOTTOM`, `DT_SINGLELINE`),
+/// and clipping to `(left, top, right, bottom)` unless `DT_NOCLIP` is set.
+/// Returns `false` if `hdc` is invalid or rendering fails on a bitmap-backed DC.
+pub(crate) unsafe fn draw_text_lines(
+    hdc: usize,
+    lines: &[(&str, i32, i32)],
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    format: u32,
+) -> bool {
+    const DT_CENTER: u32 = 0x0001;
+    const DT_RIGHT: u32 = 0x0002;
+    const DT_VCENTER: u32 = 0x0004;
+    const DT_BOTTOM: u32 = 0x0008;
+    const DT_SINGLELINE: u32 = 0x0020;
+    const DT_NOCLIP: u32 = 0x0100;
+    const OPAQUE: i32 = 2;
+
+    let (bm, font, text_rgba, bk_rgba, opaque_bg) = {
+        let m = objs().lock().unwrap();
+        let Some(Obj::Dc(dc)) = m.get(&hdc) else {
+            return false;
+        };
+        let Some(Obj::Bitmap(bm)) = m.get(&dc.bitmap) else {
+            // Valid DC with the default 1x1 stock bitmap (no user DIB selected), matching Rectangle/PatBlt.
+            return true;
+        };
+        (
+            bm.clone(),
+            resolve_font(&m, dc.font),
+            colorref_to_rgba(dc.text_color),
+            colorref_to_rgba(dc.bk_color),
+            dc.bk_mode == OPAQUE,
+        )
+    };
+
+    if bm.width == 0 || bm.height == 0 || bm.bits_ptr() == 0 {
+        return true;
+    }
+
+    let (clip_x0, clip_y0, clip_x1, clip_y1) = if (format & DT_NOCLIP) != 0 {
+        (0, 0, bm.width as i32, bm.height as i32)
+    } else {
+        (
+            left.max(0).min(bm.width as i32),
+            top.max(0).min(bm.height as i32),
+            right.max(0).min(bm.width as i32),
+            bottom.max(0).min(bm.height as i32),
+        )
+    };
+    if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
+        return true;
+    }
+
+    let total_h: i32 = lines.iter().fold(0i32, |acc, (_, _, h)| acc.saturating_add(*h));
+    let mut cur_y = if (format & DT_SINGLELINE) != 0 {
+        if (format & DT_BOTTOM) != 0 {
+            bottom.saturating_sub(total_h)
+        } else if (format & DT_VCENTER) != 0 {
+            top.saturating_add((bottom.saturating_sub(top).saturating_sub(total_h)) / 2)
+        } else {
+            top
+        }
+    } else {
+        top
+    };
+
+    let mut positioned: Vec<(&str, i32, i32, i32, i32)> = Vec::with_capacity(lines.len());
+    let mut min_x = clip_x1;
+    let mut min_y = clip_y1;
+    let mut max_x = clip_x0;
+    let mut max_y = clip_y0;
+
+    for &(line, line_w, line_h) in lines {
+        let x = if (format & DT_RIGHT) != 0 {
+            right.saturating_sub(line_w)
+        } else if (format & DT_CENTER) != 0 {
+            left.saturating_add((right.saturating_sub(left).saturating_sub(line_w)) / 2)
+        } else {
+            left
+        };
+        if opaque_bg && line_w > 0 && line_h > 0 {
+            let fx0 = x.max(clip_x0);
+            let fy0 = cur_y.max(clip_y0);
+            let fx1 = x.saturating_add(line_w).min(clip_x1);
+            let fy1 = cur_y.saturating_add(line_h).min(clip_y1);
+            for py in fy0..fy1 {
+                for px in fx0..fx1 {
+                    bm.set_rgba(px, py, bk_rgba);
+                }
+            }
+        }
+        if !line.is_empty() && line_h > 0 {
+            // CoreText advance can differ slightly from GDI heuristic width; allow full clip width on right.
+            let lx0 = x.max(clip_x0);
+            let ly0 = cur_y.max(clip_y0);
+            let lx1 = clip_x1;
+            let ly1 = cur_y.saturating_add(line_h).saturating_add(4).min(clip_y1);
+            if lx0 < lx1 && ly0 < ly1 {
+                min_x = min_x.min(lx0);
+                min_y = min_y.min(ly0);
+                max_x = max_x.max(lx1);
+                max_y = max_y.max(ly1);
+            }
+            positioned.push((line, x, cur_y, line_w, line_h));
+        }
+        cur_y = cur_y.saturating_add(line_h);
+    }
+
+    if positioned.is_empty() || min_x >= max_x || min_y >= max_y {
+        return true;
+    }
+
+    rasterize_text_coretext(&bm, &font, &positioned, min_x, min_y, max_x, max_y, text_rgba)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe fn rasterize_text_coretext(
+    bm: &BitmapData,
+    font: &FontData,
+    lines: &[(&str, i32, i32, i32, i32)],
+    origin_x: i32,
+    origin_y: i32,
+    end_x: i32,
+    end_y: i32,
+    text_rgba: [u8; 4],
+) -> bool {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CFRange {
+        location: isize,
+        length: isize,
+    }
+
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFBooleanTrue: *const c_void;
+        fn CFRelease(cf: *const c_void);
+        fn CFStringCreateWithBytes(
+            alloc: *const c_void,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external: u8,
+        ) -> *const c_void;
+        fn CFAttributedStringCreateMutable(alloc: *const c_void, max_length: isize) -> *mut c_void;
+        fn CFAttributedStringReplaceString(a_str: *mut c_void, range: CFRange, replacement: *const c_void);
+        fn CFAttributedStringGetLength(a_str: *const c_void) -> isize;
+        fn CFAttributedStringSetAttribute(
+            a_str: *mut c_void,
+            range: CFRange,
+            attr_name: *const c_void,
+            value: *const c_void,
+        );
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+        fn CGColorSpaceRelease(cs: *mut c_void);
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *mut c_void,
+            bitmap_info: u32,
+        ) -> *mut c_void;
+        fn CGContextRelease(ctx: *mut c_void);
+        fn CGContextSetRGBFillColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);
+        fn CGContextSetTextPosition(ctx: *mut c_void, x: f64, y: f64);
+    }
+
+    #[link(name = "CoreText", kind = "framework")]
+    extern "C" {
+        static kCTFontAttributeName: *const c_void;
+        static kCTForegroundColorFromContextAttributeName: *const c_void;
+        fn CTFontCreateWithName(name: *const c_void, size: f64, matrix: *const c_void) -> *const c_void;
+        fn CTFontGetAscent(font: *const c_void) -> f64;
+        fn CTLineCreateWithAttributedString(attr_str: *const c_void) -> *const c_void;
+        fn CTLineDraw(line: *const c_void, context: *mut c_void);
+    }
+
+    let surf_w = (end_x - origin_x) as usize;
+    let surf_h = (end_y - origin_y) as usize;
+    let bytes_per_row = surf_w.saturating_mul(4);
+    let mut pixels = vec![0u8; bytes_per_row.saturating_mul(surf_h)];
+
+    let cs = CGColorSpaceCreateDeviceRGB();
+    if cs.is_null() {
+        return false;
+    }
+    let ctx = CGBitmapContextCreate(
+        pixels.as_mut_ptr().cast(),
+        surf_w,
+        surf_h,
+        8,
+        bytes_per_row,
+        cs,
+        K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+    );
+    CGColorSpaceRelease(cs);
+    if ctx.is_null() {
+        return false;
+    }
+
+    let pt_size = (if font.height != 0 { font.height.unsigned_abs() } else { 16 }).max(4) as f64;
+    let font_name = if font.is_monospace() {
+        "Courier"
+    } else if !font.face.is_empty() {
+        font.face.as_str()
+    } else {
+        "Helvetica"
+    };
+    let cf_font_name = CFStringCreateWithBytes(
+        std::ptr::null(),
+        font_name.as_ptr(),
+        font_name.len() as isize,
+        CF_STRING_ENCODING_UTF8,
+        0,
+    );
+    let ct_font = if !cf_font_name.is_null() {
+        let f = CTFontCreateWithName(cf_font_name, pt_size, std::ptr::null());
+        CFRelease(cf_font_name);
+        f
+    } else {
+        std::ptr::null()
+    };
+    if ct_font.is_null() {
+        CGContextRelease(ctx);
+        return false;
+    }
+
+    let ascent = CTFontGetAscent(ct_font).clamp(1.0, pt_size);
+    CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+
+    for &(line, x, y, _w, line_h) in lines {
+        let cf_str = CFStringCreateWithBytes(
+            std::ptr::null(),
+            line.as_ptr(),
+            line.len() as isize,
+            CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        if cf_str.is_null() {
+            continue;
+        }
+        let attr = CFAttributedStringCreateMutable(std::ptr::null(), 0);
+        if !attr.is_null() {
+            CFAttributedStringReplaceString(attr, CFRange { location: 0, length: 0 }, cf_str);
+            let utf16_len = CFAttributedStringGetLength(attr);
+            let full_range = CFRange { location: 0, length: utf16_len };
+            CFAttributedStringSetAttribute(attr, full_range, kCTFontAttributeName, ct_font);
+            CFAttributedStringSetAttribute(
+                attr,
+                full_range,
+                kCTForegroundColorFromContextAttributeName,
+                kCFBooleanTrue,
+            );
+            let ct_line = CTLineCreateWithAttributedString(attr);
+            if !ct_line.is_null() {
+                let cg_x = (x - origin_x) as f64;
+                let baseline_y = (y as f64) + ascent.min(line_h.max(1) as f64);
+                let cg_y = (end_y as f64) - baseline_y;
+                CGContextSetTextPosition(ctx, cg_x, cg_y);
+                CTLineDraw(ct_line, ctx);
+                CFRelease(ct_line);
+            }
+            CFRelease(attr);
+        }
+        CFRelease(cf_str);
+    }
+
+    CFRelease(ct_font);
+    CGContextRelease(ctx);
+
+    for dy in 0..surf_h {
+        let py = origin_y + dy as i32;
+        let row_off = dy * bytes_per_row;
+        for dx in 0..surf_w {
+            let alpha = pixels[row_off + dx * 4 + 3];
+            if alpha == 0 {
+                continue;
+            }
+            let px = origin_x + dx as i32;
+            let dst = bm.get_rgba(px, py).unwrap_or([0, 0, 0, 0xFF]);
+            let a = alpha as u32;
+            let inv = 255 - a;
+            let out_r = ((text_rgba[0] as u32 * a + dst[0] as u32 * inv + 127) / 255) as u8;
+            let out_g = ((text_rgba[1] as u32 * a + dst[1] as u32 * inv + 127) / 255) as u8;
+            let out_b = ((text_rgba[2] as u32 * a + dst[2] as u32 * inv + 127) / 255) as u8;
+            let out_a = dst[3].max(alpha);
+            bm.set_rgba(px, py, [out_r, out_g, out_b, out_a]);
+        }
+    }
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+unsafe fn rasterize_text_coretext(
+    _bm: &BitmapData,
+    _font: &FontData,
+    _lines: &[(&str, i32, i32, i32, i32)],
+    _origin_x: i32,
+    _origin_y: i32,
+    _end_x: i32,
+    _end_y: i32,
+    _text_rgba: [u8; 4],
+) -> bool {
+    false
+}
+
+/// Renders a standard Windows frame control (`DrawFrameControl`: `DFC_CAPTION`, `DFC_MENU`,
+/// `DFC_SCROLL`, `DFC_BUTTON`, `DFC_POPUPMENU`) directly onto the DC's selected bitmap.
+///
+/// Returns `Ok(adjusted_inset)` on success (where `adjusted_inset` is the border inset for
+/// `DFCS_ADJUSTRECT`), or `Err(())` for an invalid DC or unsupported `u_type`/`u_state` combination.
+pub(crate) unsafe fn draw_frame_control(
+    hdc: usize,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    u_type: u32,
+    u_state: u32,
+) -> Result<i32, ()> {
+    const DFC_CAPTION: u32 = 1;
+    const DFC_MENU: u32 = 2;
+    const DFC_SCROLL: u32 = 3;
+    const DFC_BUTTON: u32 = 4;
+    const DFC_POPUPMENU: u32 = 5;
+
+    const DFCS_INACTIVE: u32 = 0x0100;
+    const DFCS_PUSHED: u32 = 0x0200;
+    const DFCS_CHECKED: u32 = 0x0400;
+    const DFCS_FLAT: u32 = 0x4000;
+    const DFCS_MONO: u32 = 0x8000;
+
+    // Validate control type & subtype up front (never fake success on unsupported control types).
+    let sub = u_state & 0x001F;
+    let supported = match u_type {
+        DFC_CAPTION => matches!(sub, 0..=4), // CLOSE, MIN, MAX, RESTORE, HELP
+        DFC_MENU | DFC_POPUPMENU => matches!(sub, 0 | 1 | 2 | 4), // ARROW, CHECK, BULLET, ARROWRIGHT
+        DFC_SCROLL => matches!(sub, 0 | 1 | 2 | 3 | 5 | 8 | 0x10), // UP, DOWN, LEFT, RIGHT, COMBOBOX, SIZEGRIP, SIZEGRIPRIGHT
+        DFC_BUTTON => matches!(sub, 0 | 1 | 2 | 4 | 8 | 0x10), // CHECK, RADIOIMAGE, RADIOMASK, RADIO, 3STATE, PUSH
+        _ => false,
+    };
+    if !supported {
+        log::warn!("gdi32: DrawFrameControl unsupported u_type={u_type} u_state={u_state:#x}");
+        return Err(());
+    }
+
+    let bm = {
+        let m = objs().lock().unwrap();
+        let Some(Obj::Dc(dc)) = m.get(&hdc) else {
+            return Err(());
+        };
+        match m.get(&dc.bitmap) {
+            Some(Obj::Bitmap(bm)) => bm.clone(),
+            // Valid DC with the default 1x1 stock bitmap (no user DIB selected), matching Rectangle.
+            _ => return Ok(if (u_state & (DFCS_FLAT | DFCS_MONO)) != 0 { 1 } else { 2 }),
+        }
+    };
+
+    let x0 = left.min(right);
+    let x1 = left.max(right);
+    let y0 = top.min(bottom);
+    let y1 = top.max(bottom);
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let inset = if (u_state & (DFCS_FLAT | DFCS_MONO)) != 0 { 1 } else { 2 };
+    if w <= 0 || h <= 0 || bm.width == 0 || bm.height == 0 || bm.bits_ptr() == 0 {
+        return Ok(inset);
+    }
+
+    const FACE: [u8; 4] = [0xD4, 0xD4, 0xD4, 0xFF];
+    const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+    const BLACK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
+    const SHADOW: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
+    const DARK: [u8; 4] = [0x40, 0x40, 0x40, 0xFF];
+
+    let inactive = (u_state & DFCS_INACTIVE) != 0;
+    let pushed = (u_state & DFCS_PUSHED) != 0;
+    let checked = (u_state & DFCS_CHECKED) != 0;
+    let flat = (u_state & DFCS_FLAT) != 0;
+    let mono = (u_state & DFCS_MONO) != 0;
+
+    let fg = if inactive { SHADOW } else { BLACK };
+    let shift = if pushed { 1 } else { 0 };
+
+    let fill_rect = |rx0: i32, ry0: i32, rx1: i32, ry1: i32, c: [u8; 4]| {
+        let cx0 = rx0.max(x0).max(0).min(bm.width as i32);
+        let cy0 = ry0.max(y0).max(0).min(bm.height as i32);
+        let cx1 = rx1.min(x1).min(bm.width as i32);
+        let cy1 = ry1.min(y1).min(bm.height as i32);
+        for py in cy0..cy1 {
+            for px in cx0..cx1 {
+                bm.set_rgba(px, py, c);
+            }
+        }
+    };
+    let set_px = |px: i32, py: i32, c: [u8; 4]| {
+        if px >= x0 && px < x1 && py >= y0 && py < y1 {
+            bm.set_rgba(px, py, c);
+        }
+    };
+    let draw_line = |ax: i32, ay: i32, bx: i32, by: i32, c: [u8; 4]| {
+        let steps = (bx - ax).abs().max((by - ay).abs()).max(1);
+        for s in 0..=steps {
+            let px = ax + ((bx - ax) * s + steps / 2) / steps;
+            let py = ay + ((by - ay) * s + steps / 2) / steps;
+            set_px(px, py, c);
+        }
+    };
+    let draw_bevel = |sunken: bool, bg: [u8; 4]| {
+        fill_rect(x0, y0, x1, y1, bg);
+        if flat || mono {
+            let border = if mono { BLACK } else { DARK };
+            fill_rect(x0, y0, x1, y0 + 1, border);
+            fill_rect(x0, y1 - 1, x1, y1, border);
+            fill_rect(x0, y0, x0 + 1, y1, border);
+            fill_rect(x1 - 1, y0, x1, y1, border);
+        } else if sunken {
+            fill_rect(x0, y0, x1, y0 + 1, SHADOW);
+            fill_rect(x0, y0, x0 + 1, y1, SHADOW);
+            fill_rect(x0 + 1, y0 + 1, x1 - 1, y0 + 2, DARK);
+            fill_rect(x0 + 1, y0 + 1, x0 + 2, y1 - 1, DARK);
+            fill_rect(x0, y1 - 1, x1, y1, WHITE);
+            fill_rect(x1 - 1, y0, x1, y1, WHITE);
+        } else {
+            fill_rect(x0, y0, x1, y0 + 1, WHITE);
+            fill_rect(x0, y0, x0 + 1, y1, WHITE);
+            fill_rect(x0, y1 - 1, x1, y1, DARK);
+            fill_rect(x1 - 1, y0, x1, y1, DARK);
+            if w > 2 && h > 2 {
+                fill_rect(x0 + 1, y1 - 2, x1 - 1, y1 - 1, SHADOW);
+                fill_rect(x1 - 2, y0 + 1, x1 - 1, y1 - 1, SHADOW);
+            }
+        }
+    };
+    let draw_checkmark = |cx0: i32, cy0: i32, cw: i32, ch: i32, c: [u8; 4]| {
+        let p0x = cx0 + cw / 5;
+        let p0y = cy0 + ch / 2;
+        let p1x = cx0 + (cw * 2) / 5;
+        let p1y = cy0 + (ch * 3) / 4;
+        let p2x = cx0 + (cw * 4) / 5;
+        let p2y = cy0 + ch / 4;
+        for dy in 0..=1 {
+            draw_line(p0x, p0y + dy, p1x, p1y + dy, c);
+            draw_line(p1x, p1y + dy, p2x, p2y + dy, c);
+        }
+    };
+    let draw_triangle = |dir: u32, cx: i32, cy: i32, r: i32, c: [u8; 4]| {
+        let rad = r.max(2);
+        match dir {
+            0 => {
+                // Up
+                for dy in -rad..=rad {
+                    let span = ((dy + rad) * rad) / (2 * rad).max(1);
+                    for dx in -span..=span {
+                        set_px(cx + dx, cy + dy, c);
+                    }
+                }
+            }
+            1 => {
+                // Down
+                for dy in -rad..=rad {
+                    let span = ((rad - dy) * rad) / (2 * rad).max(1);
+                    for dx in -span..=span {
+                        set_px(cx + dx, cy + dy, c);
+                    }
+                }
+            }
+            2 => {
+                // Left
+                for dx in -rad..=rad {
+                    let span = ((dx + rad) * rad) / (2 * rad).max(1);
+                    for dy in -span..=span {
+                        set_px(cx + dx, cy + dy, c);
+                    }
+                }
+            }
+            _ => {
+                // Right
+                for dx in -rad..=rad {
+                    let span = ((rad - dx) * rad) / (2 * rad).max(1);
+                    for dy in -span..=span {
+                        set_px(cx + dx, cy + dy, c);
+                    }
+                }
+            }
+        }
+    };
+
+    let cx = x0 + w / 2 + shift;
+    let cy = y0 + h / 2 + shift;
+    let pad = (w.min(h) / 4).max(2);
+
+    match u_type {
+        DFC_BUTTON => match sub {
+            0x10 => {
+                // DFCS_BUTTONPUSH
+                draw_bevel(pushed || checked, if mono { WHITE } else { FACE });
+            }
+            0 | 8 => {
+                // DFCS_BUTTONCHECK / DFCS_BUTTON3STATE
+                let bg = if pushed || inactive || (sub == 8 && checked) { FACE } else { WHITE };
+                draw_bevel(true, bg);
+                if checked {
+                    draw_checkmark(x0 + 2, y0 + 2, (w - 4).max(4), (h - 4).max(4), fg);
+                }
+            }
+            1 | 2 | 4 => {
+                // DFCS_BUTTONRADIO / RADIOIMAGE / RADIOMASK
+                let bg = if pushed || inactive { FACE } else { WHITE };
+                let rad = (w.min(h) / 2 - 1).max(2);
+                let r_out2 = rad * rad;
+                let r_in2 = (rad - 2).max(1) * (rad - 2).max(1);
+                let dot_r2 = (rad / 2).max(1) * (rad / 2).max(1);
+                let rcx = x0 + w / 2;
+                let rcy = y0 + h / 2;
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        let dx = px - rcx;
+                        let dy = py - rcy;
+                        let d2 = dx * dx + dy * dy;
+                        if d2 <= r_out2 {
+                            if d2 >= r_in2 {
+                                let edge = if flat || mono { BLACK } else if dx + dy < 0 { DARK } else { WHITE };
+                                set_px(px, py, edge);
+                            } else if checked && d2 <= dot_r2 {
+                                set_px(px, py, fg);
+                            } else {
+                                set_px(px, py, bg);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => return Err(()),
+        },
+        DFC_CAPTION => {
+            draw_bevel(pushed, if mono { WHITE } else { FACE });
+            let gx0 = x0 + pad + shift;
+            let gy0 = y0 + pad + shift;
+            let gx1 = (x1 - pad - 1 + shift).max(gx0);
+            let gy1 = (y1 - pad - 1 + shift).max(gy0);
+            match sub {
+                0 => {
+                    // DFCS_CAPTIONCLOSE: 'X'
+                    draw_line(gx0, gy0, gx1, gy1, fg);
+                    draw_line(gx0 + 1, gy0, gx1, gy1 - 1, fg);
+                    draw_line(gx0, gy1, gx1, gy0, fg);
+                    draw_line(gx0 + 1, gy1, gx1, gy0 + 1, fg);
+                }
+                1 => {
+                    // DFCS_CAPTIONMIN: bottom underscore bar
+                    fill_rect(gx0, gy1 - 1, gx1 + 1, gy1 + 1, fg);
+                }
+                2 => {
+                    // DFCS_CAPTIONMAX: hollow box with thick top bar
+                    fill_rect(gx0, gy0, gx1 + 1, gy0 + 2, fg);
+                    draw_line(gx0, gy0, gx0, gy1, fg);
+                    draw_line(gx1, gy0, gx1, gy1, fg);
+                    draw_line(gx0, gy1, gx1, gy1, fg);
+                }
+                3 => {
+                    // DFCS_CAPTIONRESTORE: overlapping back + front boxes
+                    let mid_x = (gx0 + gx1) / 2;
+                    let mid_y = (gy0 + gy1) / 2;
+                    draw_line(mid_x, gy0, gx1, gy0, fg);
+                    draw_line(gx1, gy0, gx1, mid_y + 1, fg);
+                    fill_rect(gx0, mid_y, mid_x + 2, mid_y + 2, fg);
+                    draw_line(gx0, mid_y, gx0, gy1, fg);
+                    draw_line(mid_x + 1, mid_y, mid_x + 1, gy1, fg);
+                    draw_line(gx0, gy1, mid_x + 1, gy1, fg);
+                }
+                4 => {
+                    // DFCS_CAPTIONHELP: '?' glyph
+                    draw_line(gx0 + 1, gy0, gx1 - 1, gy0, fg);
+                    draw_line(gx1 - 1, gy0, gx1 - 1, cy, fg);
+                    draw_line(cx, cy, cx, gy1 - 2, fg);
+                    set_px(cx, gy1, fg);
+                }
+                _ => return Err(()),
+            }
+        }
+        DFC_SCROLL => {
+            draw_bevel(pushed, if mono { WHITE } else { FACE });
+            let r = (w.min(h) / 4).max(2);
+            match sub {
+                0 => draw_triangle(0, cx, cy, r, fg), // UP
+                1 | 5 => draw_triangle(1, cx, cy, r, fg), // DOWN / COMBOBOX
+                2 => draw_triangle(2, cx, cy, r, fg), // LEFT
+                3 => draw_triangle(3, cx, cy, r, fg), // RIGHT
+                8 | 0x10 => {
+                    // SIZEGRIP / SIZEGRIPRIGHT: three diagonal grip stripes
+                    for step in [4, 8, 12] {
+                        if sub == 8 {
+                            draw_line(x1 - step, y1 - 1, x1 - 1, y1 - step, fg);
+                        } else {
+                            draw_line(x0 + step, y1 - 1, x0 + 1, y1 - step, fg);
+                        }
+                    }
+                }
+                _ => return Err(()),
+            }
+        }
+        DFC_MENU | DFC_POPUPMENU => {
+            fill_rect(x0, y0, x1, y1, WHITE);
+            let r = (w.min(h) / 4).max(2);
+            match sub {
+                0 => draw_triangle(3, cx, cy, r, fg), // DFCS_MENUARROW (right)
+                1 => draw_checkmark(x0 + 2, y0 + 2, (w - 4).max(4), (h - 4).max(4), fg), // DFCS_MENUCHECK
+                2 => {
+                    // DFCS_MENUBULLET
+                    let br2 = r * r;
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            if dx * dx + dy * dy <= br2 {
+                                set_px(cx + dx, cy + dy, fg);
+                            }
+                        }
+                    }
+                }
+                4 => draw_triangle(2, cx, cy, r, fg), // DFCS_MENUARROWRIGHT (left)
+                _ => return Err(()),
+            }
+        }
+        _ => return Err(()),
+    }
+
+    Ok(inset)
+}
+
 pub unsafe extern "win64" fn TextOutW(
-    _hdc: usize,
-    _x: i32,
-    _y: i32,
-    _str: LPCWSTR,
-    _count: i32,
+    hdc: usize,
+    x: i32,
+    y: i32,
+    s: LPCWSTR,
+    count: i32,
 ) -> BOOL {
-    TRUE
+    if count < 0 || (s.is_null() && count > 0) {
+        crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let font = {
+        let m = objs().lock().unwrap();
+        let Some(Obj::Dc(dc)) = m.get(&hdc) else {
+            crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        };
+        resolve_font(&m, dc.font)
+    };
+    let mut units = Vec::with_capacity(count as usize);
+    for i in 0..(count as usize) {
+        units.push(s.add(i).read_unaligned());
+    }
+    let text = String::from_utf16_lossy(&units);
+    let sz = measure_text(&font, &text);
+    draw_text_lines(hdc, &[(&text, sz.cx, sz.cy)], x, y, x.saturating_add(sz.cx), y.saturating_add(sz.cy), 0x0100 /* DT_NOCLIP */) as BOOL
 }
 
 pub unsafe extern "win64" fn ChoosePixelFormat(_hdc: usize, _ppfd: *const u8) -> i32 {
@@ -1102,10 +1857,9 @@ pub unsafe extern "win64" fn CreateBitmap(
             planes: pl,
             top_down: true,
             is_dib: false,
-            bits_ptr: bits as usize,
+            backing: BitmapBuffer::owned(bits as usize),
             stride,
             byte_len: total,
-            external_bits: false,
         }),
     );
     handle
@@ -1258,6 +2012,158 @@ pub unsafe extern "win64" fn BitBlt(
     TRUE
 }
 
+const BLACKONWHITE: i32 = 1;
+const WHITEONBLACK: i32 = 2;
+const COLORONCOLOR: i32 = 3;
+const HALFTONE: i32 = 4;
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn sample_stretch_pixel(
+    src_bm: &BitmapData,
+    sx_start: i32,
+    sy_start: i32,
+    src_w: i64,
+    src_h: i64,
+    dst_w: i64,
+    dst_h: i64,
+    sample_x: i64,
+    sample_y: i64,
+    mode: i32,
+) -> Option<[u8; 4]> {
+    match mode {
+        COLORONCOLOR => {
+            let sx = sx_start.saturating_add(((sample_x * src_w) / dst_w) as i32);
+            let sy = sy_start.saturating_add(((sample_y * src_h) / dst_h) as i32);
+            src_bm.get_rgba(sx, sy)
+        }
+        BLACKONWHITE | WHITEONBLACK => {
+            let x0 = (sample_x * src_w) / dst_w;
+            let x1 = (((sample_x + 1) * src_w) / dst_w).max(x0 + 1).min(src_w);
+            let y0 = (sample_y * src_h) / dst_h;
+            let y1 = (((sample_y + 1) * src_h) / dst_h).max(y0 + 1).min(src_h);
+            let mut acc: Option<[u8; 4]> = None;
+            for ry in y0..y1 {
+                let sy = sy_start.saturating_add(ry as i32);
+                for rx in x0..x1 {
+                    let sx = sx_start.saturating_add(rx as i32);
+                    if let Some(px) = src_bm.get_rgba(sx, sy) {
+                        acc = Some(match acc {
+                            None => px,
+                            Some(cur) if mode == BLACKONWHITE => [
+                                cur[0] & px[0],
+                                cur[1] & px[1],
+                                cur[2] & px[2],
+                                cur[3] & px[3],
+                            ],
+                            Some(cur) => [
+                                cur[0] | px[0],
+                                cur[1] | px[1],
+                                cur[2] | px[2],
+                                cur[3] | px[3],
+                            ],
+                        });
+                    }
+                }
+            }
+            acc
+        }
+        HALFTONE => {
+            // Area-weighted box average when shrinking on either axis; bilinear interpolation
+            // when enlarging on both axes (and exact identity when 1:1).
+            if src_w > dst_w || src_h > dst_h {
+                let u0 = (sample_x as f64) * (src_w as f64) / (dst_w as f64);
+                let u1 = ((sample_x + 1) as f64) * (src_w as f64) / (dst_w as f64);
+                let v0 = (sample_y as f64) * (src_h as f64) / (dst_h as f64);
+                let v1 = ((sample_y + 1) as f64) * (src_h as f64) / (dst_h as f64);
+                let ix0 = (u0.floor() as i64).max(0);
+                let ix1 = (u1.ceil() as i64).max(ix0 + 1).min(src_w);
+                let iy0 = (v0.floor() as i64).max(0);
+                let iy1 = (v1.ceil() as i64).max(iy0 + 1).min(src_h);
+                let mut sum = [0.0f64; 4];
+                let mut wsum = 0.0f64;
+                for ry in iy0..iy1 {
+                    let wy = (v1.min((ry + 1) as f64) - v0.max(ry as f64)).max(0.0);
+                    if wy <= 0.0 {
+                        continue;
+                    }
+                    let sy = sy_start.saturating_add(ry as i32);
+                    for rx in ix0..ix1 {
+                        let wx = (u1.min((rx + 1) as f64) - u0.max(rx as f64)).max(0.0);
+                        let w = wx * wy;
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        let sx = sx_start.saturating_add(rx as i32);
+                        if let Some(px) = src_bm.get_rgba(sx, sy) {
+                            for c in 0..4 {
+                                sum[c] += (px[c] as f64) * w;
+                            }
+                            wsum += w;
+                        }
+                    }
+                }
+                if wsum > 0.0 {
+                    Some([
+                        (sum[0] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[1] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[2] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[3] / wsum).round().clamp(0.0, 255.0) as u8,
+                    ])
+                } else {
+                    None
+                }
+            } else {
+                let fx = ((sample_x as f64 + 0.5) * (src_w as f64 / dst_w as f64) - 0.5)
+                    .clamp(0.0, (src_w - 1) as f64);
+                let fy = ((sample_y as f64 + 0.5) * (src_h as f64 / dst_h as f64) - 0.5)
+                    .clamp(0.0, (src_h - 1) as f64);
+                let x0 = fx.floor() as i64;
+                let y0 = fy.floor() as i64;
+                let x1 = (x0 + 1).min(src_w - 1);
+                let y1 = (y0 + 1).min(src_h - 1);
+                let tx = fx - (x0 as f64);
+                let ty = fy - (y0 as f64);
+                let samples = [
+                    ((x0, y0), (1.0 - tx) * (1.0 - ty)),
+                    ((x1, y0), tx * (1.0 - ty)),
+                    ((x0, y1), (1.0 - tx) * ty),
+                    ((x1, y1), tx * ty),
+                ];
+                let mut sum = [0.0f64; 4];
+                let mut wsum = 0.0f64;
+                for ((rx, ry), w) in samples {
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let sx = sx_start.saturating_add(rx as i32);
+                    let sy = sy_start.saturating_add(ry as i32);
+                    if let Some(px) = src_bm.get_rgba(sx, sy) {
+                        for c in 0..4 {
+                            sum[c] += (px[c] as f64) * w;
+                        }
+                        wsum += w;
+                    }
+                }
+                if wsum > 0.0 {
+                    Some([
+                        (sum[0] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[1] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[2] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[3] / wsum).round().clamp(0.0, 255.0) as u8,
+                    ])
+                } else {
+                    None
+                }
+            }
+        }
+        _ => {
+            let sx = sx_start.saturating_add(((sample_x * src_w) / dst_w) as i32);
+            let sy = sy_start.saturating_add(((sample_y * src_h) / dst_h) as i32);
+            src_bm.get_rgba(sx, sy)
+        }
+    }
+}
+
 pub unsafe extern "win64" fn StretchBlt(
     dst: usize,
     x: i32,
@@ -1293,6 +2199,7 @@ pub unsafe extern "win64" fn StretchBlt(
         return TRUE;
     };
 
+    let stretch_mode = dst_dc.stretch_blt_mode;
     let dst_w = cx.unsigned_abs() as i64;
     let dst_h = cy.unsigned_abs() as i64;
     let src_w = w1.unsigned_abs() as i64;
@@ -1313,15 +2220,24 @@ pub unsafe extern "win64" fn StretchBlt(
             continue;
         }
         let sample_y = if flip_y { dst_h - 1 - row } else { row };
-        let sy = sy_start.saturating_add(((sample_y * src_h) / dst_h) as i32);
         for col in 0..dst_w {
             let dx = dx_start.saturating_add(col as i32);
             if dx < 0 || (dx as usize) >= dst_bm.width {
                 continue;
             }
             let sample_x = if flip_x { dst_w - 1 - col } else { col };
-            let sx = sx_start.saturating_add(((sample_x * src_w) / dst_w) as i32);
-            tmp[(row as usize) * tw + (col as usize)] = src_bm.get_rgba(sx, sy);
+            tmp[(row as usize) * tw + (col as usize)] = sample_stretch_pixel(
+                src_bm,
+                sx_start,
+                sy_start,
+                src_w,
+                src_h,
+                dst_w,
+                dst_h,
+                sample_x,
+                sample_y,
+                stretch_mode,
+            );
         }
     }
     for row in 0..th {
@@ -1399,13 +2315,28 @@ pub unsafe extern "win64" fn Rectangle(hdc: usize, l: i32, t: i32, r: i32, b: i3
 }
 
 pub unsafe extern "win64" fn TextOutA(
-    _hdc: usize,
-    _x: i32,
-    _y: i32,
-    _str: LPCSTR,
-    _count: i32,
+    hdc: usize,
+    x: i32,
+    y: i32,
+    s: LPCSTR,
+    count: i32,
 ) -> BOOL {
-    TRUE
+    if count < 0 || (s.is_null() && count > 0) {
+        crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let font = {
+        let m = objs().lock().unwrap();
+        let Some(Obj::Dc(dc)) = m.get(&hdc) else {
+            crate::teb::set_last_error(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        };
+        resolve_font(&m, dc.font)
+    };
+    let bytes = if count > 0 { std::slice::from_raw_parts(s, count as usize) } else { &[] };
+    let text = String::from_utf8_lossy(bytes);
+    let sz = measure_text(&font, &text);
+    draw_text_lines(hdc, &[(&text, sz.cx, sz.cy)], x, y, x.saturating_add(sz.cx), y.saturating_add(sz.cy), 0x0100 /* DT_NOCLIP */) as BOOL
 }
 
 unsafe fn write_dib_pixel(row_ptr: *mut u8, x: usize, bpp: u16, rgba: [u8; 4]) {
@@ -1600,7 +2531,7 @@ fn serialize_bitmap(bm: &BitmapData, want_dibsection: bool) -> Vec<u8> {
     out[12..16].copy_from_slice(&(bm.stride as i32).to_le_bytes()); // bmWidthBytes
     out[16..18].copy_from_slice(&bm.planes.to_le_bytes()); // bmPlanes
     out[18..20].copy_from_slice(&bm.bpp.to_le_bytes()); // bmBitsPixel
-    let exposed_bits: usize = if bm.is_dib { bm.bits_ptr } else { 0 };
+    let exposed_bits: usize = if bm.is_dib { bm.bits_ptr() } else { 0 };
     out[24..32].copy_from_slice(&exposed_bits.to_le_bytes()); // bmBits
     if len == 104 {
         // DIBSECTION.dsBmih (BITMAPINFOHEADER @0x20, 40 bytes)
@@ -1677,10 +2608,9 @@ unsafe fn get_object_impl(h: usize, cb: i32, pv: *mut u8, wide: bool) -> i32 {
                 planes: 1,
                 top_down: true,
                 is_dib: false,
-                bits_ptr: 0,
+                backing: BitmapBuffer::external(0, None),
                 stride: 2,
                 byte_len: 2,
-                external_bits: false,
             };
             Some(serialize_bitmap(&def, false))
         } else {
@@ -2057,6 +2987,172 @@ mod tests {
             SelectObject(dc, old);
             DeleteObject(hbm);
             DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn get_text_extent_point_w_and_set_stretch_blt_mode() {
+        unsafe {
+            let dc = CreateCompatibleDC(0);
+            assert_ne!(dc, 0);
+            let s: Vec<u16> = "Hello".encode_utf16().collect();
+            let mut sz1 = SIZE { cx: 0, cy: 0 };
+            let mut sz2 = SIZE { cx: 0, cy: 0 };
+            assert_eq!(GetTextExtentPoint32W(dc, s.as_ptr(), s.len() as i32, &mut sz1), TRUE);
+            assert_eq!(GetTextExtentPointW(dc, s.as_ptr(), s.len() as i32, &mut sz2), TRUE);
+            assert_eq!((sz1.cx, sz1.cy), (sz2.cx, sz2.cy));
+
+            // Default mode is BLACKONWHITE (1); valid modes 1..=4 return previous mode.
+            assert_eq!(SetStretchBltMode(dc, 4 /* HALFTONE */), 1);
+            assert_eq!(SetStretchBltMode(dc, 3 /* COLORONCOLOR */), 4);
+            assert_eq!(SetStretchBltMode(dc, 0), 0);
+            assert_eq!(SetStretchBltMode(dc, 5), 0);
+            assert_eq!(SetStretchBltMode(0, 4), 0);
+
+            // DeleteObject must reject deleting a bitmap while it is selected into a DC,
+            // and succeed once unselected.
+            let bmi = make_bmi_header(16, -16, 32);
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbm = CreateDIBSection(dc, bmi.as_ptr(), 0, &mut bits, std::ptr::null_mut(), 0);
+            assert_ne!(hbm, 0);
+            let old = SelectObject(dc, hbm);
+            assert_eq!(DeleteObject(hbm), FALSE, "must reject DeleteObject on selected bitmap");
+            assert_eq!(SelectObject(dc, old), hbm);
+            assert_eq!(DeleteObject(hbm), TRUE);
+
+            DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn external_surface_dc_retains_owner_until_inflight_draw_drops() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct TrackedBacking {
+            buf: Vec<u8>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for TrackedBacking {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+        let owner = Arc::new(TrackedBacking {
+            buf: vec![0u8; 16 * 16 * 4],
+            dropped: Arc::clone(&dropped),
+        });
+        let ptr = owner.buf.as_ptr() as usize;
+        let len = owner.buf.len();
+        let (hdc, hbmp) = create_external_surface_dc(
+            16,
+            16,
+            16 * 4,
+            ptr,
+            len,
+            Arc::clone(&owner) as Arc<dyn std::any::Any + Send + Sync>,
+        );
+
+        // Simulate an in-flight renderer cloning `BitmapData` and dropping the global lock.
+        let inflight_bm = {
+            let m = objs().lock().unwrap();
+            match m.get(&hbmp) {
+                Some(Obj::Bitmap(bm)) => bm.clone(),
+                other => panic!("expected external bitmap, got {other:?}"),
+            }
+        };
+
+        // Simulate concurrent ReleaseDC + texture teardown dropping both the table entry and owner.
+        destroy_external_surface_dc(hdc, hbmp);
+        drop(owner);
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "external backing allocation must stay alive while in-flight draw holds BitmapData"
+        );
+
+        // Pixel writes remain backed by live memory until the in-flight draw completes.
+        unsafe {
+            assert!(inflight_bm.set_rgba(3, 4, [0x11, 0x22, 0x33, 0xFF]));
+            assert_eq!(inflight_bm.get_rgba(3, 4), Some([0x11, 0x22, 0x33, 0xFF]));
+        }
+
+        drop(inflight_bm);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "external backing allocation must be released once the final in-flight draw drops"
+        );
+    }
+
+    #[test]
+    fn stretch_blt_honors_blackonwhite_whiteonblack_coloroncolor_and_halftone() {
+        unsafe {
+            let src_dc = CreateCompatibleDC(0);
+            let dst_dc = CreateCompatibleDC(0);
+            assert_ne!(src_dc, 0);
+            assert_ne!(dst_dc, 0);
+
+            // 1. 1bpp monochrome 2x1 [black, white] shrunk to 1x1:
+            //    BLACKONWHITE -> black (AND), WHITEONBLACK -> white (OR).
+            let mono_src = CreateBitmap(2, 1, 1, 1, std::ptr::null());
+            let mono_dst = CreateBitmap(1, 1, 1, 1, std::ptr::null());
+            let old_s = SelectObject(src_dc, mono_src);
+            let old_d = SelectObject(dst_dc, mono_dst);
+            SetPixel(src_dc, 0, 0, 0x0000_0000); // black
+            SetPixel(src_dc, 1, 0, 0x00FF_FFFF); // white
+
+            assert_eq!(SetStretchBltMode(dst_dc, WHITEONBLACK), BLACKONWHITE);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            assert_eq!(GetPixel(dst_dc, 0, 0), 0x00FF_FFFF, "WHITEONBLACK must preserve white via OR");
+
+            assert_eq!(SetStretchBltMode(dst_dc, BLACKONWHITE), WHITEONBLACK);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            assert_eq!(GetPixel(dst_dc, 0, 0), 0x0000_0000, "BLACKONWHITE must preserve black via AND");
+
+            // Reversed [white, black]: BLACKONWHITE still preserves black, while COLORONCOLOR picks pixel 0 (white).
+            SetPixel(src_dc, 0, 0, 0x00FF_FFFF);
+            SetPixel(src_dc, 1, 0, 0x0000_0000);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            assert_eq!(GetPixel(dst_dc, 0, 0), 0x0000_0000, "BLACKONWHITE must AND reversed pair to black");
+
+            assert_eq!(SetStretchBltMode(dst_dc, COLORONCOLOR), BLACKONWHITE);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            assert_eq!(GetPixel(dst_dc, 0, 0), 0x00FF_FFFF, "COLORONCOLOR must drop eliminated pixel");
+
+            SelectObject(src_dc, old_s);
+            SelectObject(dst_dc, old_d);
+            DeleteObject(mono_src);
+            DeleteObject(mono_dst);
+
+            // 2. 32bpp color shrink & enlarge with HALFTONE vs COLORONCOLOR.
+            let bmi2 = make_bmi_header(2, -1, 32);
+            let bmi4 = make_bmi_header(4, -1, 32);
+            let mut sb: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut db: *mut std::ffi::c_void = std::ptr::null_mut();
+            let color_src = CreateDIBSection(src_dc, bmi2.as_ptr(), 0, &mut sb, std::ptr::null_mut(), 0);
+            let color_dst = CreateDIBSection(dst_dc, bmi4.as_ptr(), 0, &mut db, std::ptr::null_mut(), 0);
+            let old_s2 = SelectObject(src_dc, color_src);
+            let old_d2 = SelectObject(dst_dc, color_dst);
+
+            SetPixel(src_dc, 0, 0, 0x0000_0000); // black
+            SetPixel(src_dc, 1, 0, 0x00FF_FFFF); // white
+
+            assert_eq!(SetStretchBltMode(dst_dc, HALFTONE), COLORONCOLOR);
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 1, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            let avg = GetPixel(dst_dc, 0, 0);
+            assert_eq!(avg, 0x0080_8080, "HALFTONE shrink of black+white must average to mid-gray");
+
+            // HALFTONE 2x1 -> 4x1 upscale produces an interior blended pixel rather than hard nearest-neighbor.
+            assert_eq!(StretchBlt(dst_dc, 0, 0, 4, 1, src_dc, 0, 0, 2, 1, SRCCOPY), TRUE);
+            let p0 = GetPixel(dst_dc, 0, 0) & 0xFF;
+            let p1 = GetPixel(dst_dc, 1, 0) & 0xFF;
+            let p2 = GetPixel(dst_dc, 2, 0) & 0xFF;
+            let p3 = GetPixel(dst_dc, 3, 0) & 0xFF;
+            assert!(p0 < p1 && p1 < p2 && p2 < p3, "HALFTONE upscale must interpolate smoothly: {p0}, {p1}, {p2}, {p3}");
+
+            SelectObject(src_dc, old_s2);
+            SelectObject(dst_dc, old_d2);
+            DeleteObject(color_src);
+            DeleteObject(color_dst);
+            DeleteDC(src_dc);
+            DeleteDC(dst_dc);
         }
     }
 }

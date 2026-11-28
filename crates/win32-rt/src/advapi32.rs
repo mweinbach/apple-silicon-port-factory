@@ -2105,6 +2105,609 @@ pub unsafe extern "win64" fn ConvertStringSecurityDescriptorToSecurityDescriptor
     TRUE
 }
 
+/// `BuildExplicitAccessWithNameW`: initializes a 48-byte `EXPLICIT_ACCESS_W`
+/// (`accctrl.h`, x64) with `TRUSTEE_IS_NAME` (1) and `TRUSTEE_IS_UNKNOWN` (0).
+pub unsafe extern "win64" fn BuildExplicitAccessWithNameW(
+    p_explicit_access: *mut u8,
+    p_trustee_name: LPWSTR,
+    access_permissions: u32,
+    access_mode: u32,
+    inheritance: u32,
+) {
+    if p_explicit_access.is_null() {
+        return;
+    }
+    std::ptr::write_bytes(p_explicit_access, 0, 48);
+    std::ptr::write_unaligned(p_explicit_access as *mut u32, access_permissions);
+    std::ptr::write_unaligned(p_explicit_access.add(4) as *mut u32, access_mode);
+    std::ptr::write_unaligned(p_explicit_access.add(8) as *mut u32, inheritance);
+    // TRUSTEE_W starts at +16: pMultipleTrustee@16, MultipleTrusteeOperation@24,
+    // TrusteeForm@28 (= 1 TRUSTEE_IS_NAME), TrusteeType@32 (= 0 TRUSTEE_IS_UNKNOWN),
+    // ptstrName@40.
+    std::ptr::write_unaligned(p_explicit_access.add(28) as *mut u32, 1u32);
+    std::ptr::write_unaligned(p_explicit_access.add(40) as *mut LPWSTR, p_trustee_name);
+}
+
+const SE_OWNER_DEFAULTED: u16 = 0x0001;
+const SE_GROUP_DEFAULTED: u16 = 0x0002;
+const SE_DACL_PRESENT: u16 = 0x0004;
+const SE_DACL_DEFAULTED: u16 = 0x0008;
+const SE_SACL_PRESENT: u16 = 0x0010;
+const SE_SACL_DEFAULTED: u16 = 0x0020;
+const SE_SELF_RELATIVE: u16 = 0x8000;
+
+const ERROR_NONE_MAPPED: u32 = 1332;
+const ERROR_INVALID_SID: u32 = 1337;
+const ERROR_INVALID_SECURITY_DESCR: u32 = 1338;
+
+const TRUSTEE_IS_SID: u32 = 0;
+const TRUSTEE_IS_NAME: u32 = 1;
+
+const NOT_USED_ACCESS: u32 = 0;
+const GRANT_ACCESS: u32 = 1;
+const SET_ACCESS: u32 = 2;
+const DENY_ACCESS: u32 = 3;
+const REVOKE_ACCESS: u32 = 4;
+const SET_AUDIT_SUCCESS: u32 = 5;
+const SET_AUDIT_FAILURE: u32 = 6;
+
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+const SYSTEM_AUDIT_ACE_TYPE: u8 = 2;
+const SUCCESSFUL_ACCESS_ACE_FLAG: u8 = 0x40;
+const FAILED_ACCESS_ACE_FLAG: u8 = 0x80;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedAce {
+    ace_type: u8,
+    ace_flags: u8,
+    mask: u32,
+    sid: Vec<u8>,
+    /// Verbatim payload (after the 4-byte ACE_HEADER) for non-standard ACE types.
+    raw_body: Option<Vec<u8>>,
+}
+
+unsafe fn read_sid_bytes(ptr: *const u8) -> Result<Vec<u8>, u32> {
+    if ptr.is_null() {
+        return Err(ERROR_INVALID_SID);
+    }
+    let rev = std::ptr::read_unaligned(ptr);
+    let sub_count = std::ptr::read_unaligned(ptr.add(1));
+    if rev != 1 || sub_count > 15 {
+        return Err(ERROR_INVALID_SID);
+    }
+    let len = 8 + 4 * (sub_count as usize);
+    Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+}
+
+fn parse_string_sid(s: &str) -> Option<Vec<u8>> {
+    let rest = s.strip_prefix("S-").or_else(|| s.strip_prefix("s-"))?;
+    let mut parts = rest.split('-');
+    let rev: u8 = parts.next()?.parse().ok()?;
+    if rev != 1 {
+        return None;
+    }
+    let auth_str = parts.next()?;
+    let auth: u64 = if let Some(hex) = auth_str
+        .strip_prefix("0x")
+        .or_else(|| auth_str.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()?
+    } else {
+        auth_str.parse().ok()?
+    };
+    if auth > 0x0000_FFFF_FFFF_FFFF {
+        return None;
+    }
+    let mut subs = Vec::new();
+    for p in parts {
+        if subs.len() >= 15 {
+            return None;
+        }
+        subs.push(p.parse::<u32>().ok()?);
+    }
+    let mut out = Vec::with_capacity(8 + subs.len() * 4);
+    out.push(1);
+    out.push(subs.len() as u8);
+    out.extend_from_slice(&auth.to_be_bytes()[2..8]);
+    for sub in subs {
+        out.extend_from_slice(&sub.to_le_bytes());
+    }
+    Some(out)
+}
+
+fn resolve_account_name_to_sid(name: &str) -> Result<Vec<u8>, u32> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    if let Some(sid) = parse_string_sid(trimmed) {
+        return Ok(sid);
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let short = upper
+        .strip_prefix("NT AUTHORITY\\")
+        .or_else(|| upper.strip_prefix("BUILTIN\\"))
+        .or_else(|| upper.strip_prefix(".\\"))
+        .unwrap_or(upper.as_str());
+    match short {
+        "EVERYONE" | "WORLD" | "WD" => Ok(build_sid(1, &[0])),
+        "CURRENT_USER" => Ok(token_user_sid()),
+        "SYSTEM" | "LOCAL SYSTEM" | "SY" => Ok(build_sid(5, &[18])),
+        "LOCAL SERVICE" | "LS" => Ok(build_sid(5, &[19])),
+        "NETWORK SERVICE" | "NS" => Ok(build_sid(5, &[20])),
+        "AUTHENTICATED USERS" | "AU" => Ok(build_sid(5, &[11])),
+        "INTERACTIVE" | "IU" => Ok(build_sid(5, &[4])),
+        "ANONYMOUS LOGON" | "AN" => Ok(build_sid(5, &[7])),
+        "ADMINISTRATORS" | "BA" => Ok(build_sid(5, &[32, 544])),
+        "USERS" | "BU" => Ok(build_sid(5, &[32, 545])),
+        "GUESTS" | "BG" => Ok(build_sid(5, &[32, 546])),
+        "CREATOR OWNER" | "CO" => Ok(build_sid(3, &[0])),
+        "CREATOR GROUP" | "CG" => Ok(build_sid(3, &[1])),
+        _ => {
+            if let Ok(cur_user) = std::env::var("USER") {
+                if !cur_user.is_empty() && short.eq_ignore_ascii_case(&cur_user) {
+                    return Ok(token_user_sid());
+                }
+            }
+            Err(ERROR_NONE_MAPPED)
+        }
+    }
+}
+
+/// Resolves an x64 `TRUSTEE_W` (32 bytes) to binary SID bytes.
+unsafe fn resolve_trustee_w(trustee: *const u8) -> Result<Vec<u8>, u32> {
+    if trustee.is_null() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let p_mult = std::ptr::read_unaligned(trustee as *const usize);
+    let mult_op = std::ptr::read_unaligned(trustee.add(8) as *const u32);
+    if p_mult != 0 || mult_op != 0 {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let form = std::ptr::read_unaligned(trustee.add(12) as *const u32);
+    let name_or_sid = std::ptr::read_unaligned(trustee.add(24) as *const usize);
+    match form {
+        TRUSTEE_IS_SID => read_sid_bytes(name_or_sid as *const u8),
+        TRUSTEE_IS_NAME => {
+            if name_or_sid == 0 {
+                return Err(ERROR_INVALID_PARAMETER);
+            }
+            let name = crate::strings::from_wide(name_or_sid as LPCWSTR);
+            resolve_account_name_to_sid(&name)
+        }
+        _ => Err(ERROR_INVALID_PARAMETER),
+    }
+}
+
+const ACL_REVISION: u8 = 2;
+const ACL_REVISION_DS: u8 = 4;
+const INHERITED_ACE: u8 = 0x10;
+
+fn ace_requires_ds_revision(ace_type: u8) -> bool {
+    // Object-specific ACE types (ACCESS_ALLOWED_OBJECT_ACE_TYPE..SYSTEM_ALARM_OBJECT_ACE_TYPE,
+    // plus their CALLBACK_OBJECT variants) require ACL_REVISION_DS (4) per Win32 ACL spec.
+    matches!(ace_type, 5..=8 | 11 | 12 | 15 | 16)
+}
+
+fn is_deny_ace_type(ace_type: u8) -> bool {
+    // ACCESS_DENIED_ACE_TYPE (1), ACCESS_DENIED_OBJECT_ACE_TYPE (6),
+    // ACCESS_DENIED_CALLBACK_ACE_TYPE (10), ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE (12).
+    matches!(ace_type, ACCESS_DENIED_ACE_TYPE | 6 | 10 | 12)
+}
+
+unsafe fn parse_acl_bytes(ptr: *const u8) -> Result<(u8, Vec<ParsedAce>), u32> {
+    if ptr.is_null() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let rev = std::ptr::read_unaligned(ptr);
+    let acl_size = std::ptr::read_unaligned(ptr.add(2) as *const u16) as usize;
+    let ace_count = std::ptr::read_unaligned(ptr.add(4) as *const u16) as usize;
+    if (rev != ACL_REVISION && rev != ACL_REVISION_DS) || acl_size < 8 {
+        return Err(ERROR_INVALID_SECURITY_DESCR);
+    }
+    let mut aces = Vec::with_capacity(ace_count);
+    let mut off = 8usize;
+    for _ in 0..ace_count {
+        if off + 4 > acl_size {
+            return Err(ERROR_INVALID_SECURITY_DESCR);
+        }
+        let ace_ptr = ptr.add(off);
+        let ace_type = std::ptr::read_unaligned(ace_ptr);
+        let ace_flags = std::ptr::read_unaligned(ace_ptr.add(1));
+        let ace_size = std::ptr::read_unaligned(ace_ptr.add(2) as *const u16) as usize;
+        if ace_size < 4 || off + ace_size > acl_size {
+            return Err(ERROR_INVALID_SECURITY_DESCR);
+        }
+        match ace_type {
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE | SYSTEM_AUDIT_ACE_TYPE => {
+                if ace_size < 16 {
+                    return Err(ERROR_INVALID_SECURITY_DESCR);
+                }
+                let mask = std::ptr::read_unaligned(ace_ptr.add(4) as *const u32);
+                let sid = read_sid_bytes(ace_ptr.add(8))?;
+                if 8 + sid.len() > ace_size {
+                    return Err(ERROR_INVALID_SECURITY_DESCR);
+                }
+                aces.push(ParsedAce {
+                    ace_type,
+                    ace_flags,
+                    mask,
+                    sid,
+                    raw_body: None,
+                });
+            }
+            _ => {
+                let body = std::slice::from_raw_parts(ace_ptr.add(4), ace_size - 4).to_vec();
+                aces.push(ParsedAce {
+                    ace_type,
+                    ace_flags,
+                    mask: 0,
+                    sid: Vec::new(),
+                    raw_body: Some(body),
+                });
+            }
+        }
+        off += ace_size;
+    }
+    Ok((rev, aces))
+}
+
+unsafe fn apply_explicit_access_entries(
+    aces: &mut Vec<ParsedAce>,
+    entries: *const u8,
+    count: u32,
+    is_audit: bool,
+) -> Result<(), u32> {
+    for i in 0..(count as usize) {
+        let ea = entries.add(i * 48);
+        let perms = std::ptr::read_unaligned(ea as *const u32);
+        let mode = std::ptr::read_unaligned(ea.add(4) as *const u32);
+        let inheritance = std::ptr::read_unaligned(ea.add(8) as *const u32);
+        if mode == NOT_USED_ACCESS {
+            continue;
+        }
+        let sid = resolve_trustee_w(ea.add(16))?;
+        // Mask to explicit inheritance flags (bits 0..=3); never mark an explicit entry INHERITED_ACE (0x10).
+        let inh_flags = (inheritance & 0x0F) as u8;
+        match (is_audit, mode) {
+            (false, GRANT_ACCESS) => {
+                if let Some(existing) = aces.iter_mut().find(|a| {
+                    a.raw_body.is_none()
+                        && (a.ace_flags & INHERITED_ACE) == 0
+                        && a.ace_type == ACCESS_ALLOWED_ACE_TYPE
+                        && a.ace_flags == inh_flags
+                        && a.sid == sid
+                }) {
+                    existing.mask |= perms;
+                } else {
+                    // Canonical DACL order & SetEntriesInAclW: place new explicit allow ACEs
+                    // after explicit deny ACEs, before existing allow ACEs and all inherited ACEs.
+                    let insert_pos = aces
+                        .iter()
+                        .position(|a| (a.ace_flags & INHERITED_ACE) != 0 || !is_deny_ace_type(a.ace_type))
+                        .unwrap_or(aces.len());
+                    aces.insert(
+                        insert_pos,
+                        ParsedAce {
+                            ace_type: ACCESS_ALLOWED_ACE_TYPE,
+                            ace_flags: inh_flags,
+                            mask: perms,
+                            sid,
+                            raw_body: None,
+                        },
+                    );
+                }
+            }
+            (false, SET_ACCESS) => {
+                // Replace existing explicit ACEs for this trustee while preserving inherited ACEs;
+                // insert the new explicit allow ahead of existing allow and inherited entries.
+                aces.retain(|a| {
+                    (a.ace_flags & INHERITED_ACE) != 0 || a.raw_body.is_some() || a.sid != sid
+                });
+                let insert_pos = aces
+                    .iter()
+                    .position(|a| (a.ace_flags & INHERITED_ACE) != 0 || !is_deny_ace_type(a.ace_type))
+                    .unwrap_or(aces.len());
+                aces.insert(
+                    insert_pos,
+                    ParsedAce {
+                        ace_type: ACCESS_ALLOWED_ACE_TYPE,
+                        ace_flags: inh_flags,
+                        mask: perms,
+                        sid,
+                        raw_body: None,
+                    },
+                );
+            }
+            (false, DENY_ACCESS) => {
+                // Canonical Windows ACL order places explicit deny ACEs ahead of allow and inherited ACEs.
+                let insert_pos = aces
+                    .iter()
+                    .position(|a| (a.ace_flags & INHERITED_ACE) != 0 || !is_deny_ace_type(a.ace_type))
+                    .unwrap_or(aces.len());
+                aces.insert(
+                    insert_pos,
+                    ParsedAce {
+                        ace_type: ACCESS_DENIED_ACE_TYPE,
+                        ace_flags: inh_flags,
+                        mask: perms,
+                        sid,
+                        raw_body: None,
+                    },
+                );
+            }
+            (_, REVOKE_ACCESS) => {
+                aces.retain(|a| {
+                    (a.ace_flags & INHERITED_ACE) != 0 || a.raw_body.is_some() || a.sid != sid
+                });
+            }
+            (true, SET_AUDIT_SUCCESS) => {
+                let insert_pos = aces
+                    .iter()
+                    .position(|a| (a.ace_flags & INHERITED_ACE) != 0)
+                    .unwrap_or(aces.len());
+                aces.insert(
+                    insert_pos,
+                    ParsedAce {
+                        ace_type: SYSTEM_AUDIT_ACE_TYPE,
+                        ace_flags: inh_flags | SUCCESSFUL_ACCESS_ACE_FLAG,
+                        mask: perms,
+                        sid,
+                        raw_body: None,
+                    },
+                );
+            }
+            (true, SET_AUDIT_FAILURE) => {
+                let insert_pos = aces
+                    .iter()
+                    .position(|a| (a.ace_flags & INHERITED_ACE) != 0)
+                    .unwrap_or(aces.len());
+                aces.insert(
+                    insert_pos,
+                    ParsedAce {
+                        ace_type: SYSTEM_AUDIT_ACE_TYPE,
+                        ace_flags: inh_flags | FAILED_ACCESS_ACE_FLAG,
+                        mask: perms,
+                        sid,
+                        raw_body: None,
+                    },
+                );
+            }
+            _ => return Err(ERROR_INVALID_PARAMETER),
+        }
+    }
+    Ok(())
+}
+
+fn serialize_acl(base_rev: u8, aces: &[ParsedAce]) -> Result<Vec<u8>, u32> {
+    if aces.len() > u16::MAX as usize {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let mut out = vec![0u8; 8];
+    for ace in aces {
+        let start = out.len();
+        out.push(ace.ace_type);
+        out.push(ace.ace_flags);
+        out.extend_from_slice(&0u16.to_le_bytes()); // AceSize placeholder
+        if let Some(body) = &ace.raw_body {
+            out.extend_from_slice(body);
+        } else {
+            out.extend_from_slice(&ace.mask.to_le_bytes());
+            out.extend_from_slice(&ace.sid);
+        }
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        let ace_size = out.len() - start;
+        if ace_size > u16::MAX as usize {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        out[start + 2..start + 4].copy_from_slice(&(ace_size as u16).to_le_bytes());
+    }
+    if out.len() > u16::MAX as usize {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let total_len = out.len() as u16;
+    let rev = if base_rev == ACL_REVISION_DS
+        || aces.iter().any(|a| ace_requires_ds_revision(a.ace_type))
+    {
+        ACL_REVISION_DS
+    } else {
+        ACL_REVISION
+    };
+    out[0] = rev;
+    out[1] = 0;
+    out[2..4].copy_from_slice(&total_len.to_le_bytes());
+    out[4..6].copy_from_slice(&(aces.len() as u16).to_le_bytes());
+    out[6..8].copy_from_slice(&0u16.to_le_bytes());
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "win64" fn BuildSecurityDescriptorW(
+    p_owner: *const u8,
+    p_group: *const u8,
+    c_access_entries: u32,
+    p_access_entries: *const u8,
+    c_audit_entries: u32,
+    p_audit_entries: *const u8,
+    p_old_sd: *const u8,
+    p_size_new_sd: *mut u32,
+    p_new_sd: *mut *mut c_void,
+) -> u32 {
+    if p_size_new_sd.is_null()
+        || p_new_sd.is_null()
+        || (c_access_entries > 0 && p_access_entries.is_null())
+        || (c_audit_entries > 0 && p_audit_entries.is_null())
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    let mut owner_sid: Option<Vec<u8>> = None;
+    let mut group_sid: Option<Vec<u8>> = None;
+    let mut dacl_present = false;
+    let mut dacl_rev: u8 = ACL_REVISION;
+    let mut dacl_aces: Option<Vec<ParsedAce>> = None;
+    let mut sacl_present = false;
+    let mut sacl_rev: u8 = ACL_REVISION;
+    let mut sacl_aces: Option<Vec<ParsedAce>> = None;
+    let mut ctrl_flags: u16 = 0;
+
+    if !p_old_sd.is_null() {
+        let rev = std::ptr::read_unaligned(p_old_sd);
+        if rev != 1 {
+            return ERROR_INVALID_SECURITY_DESCR;
+        }
+        let old_ctrl = std::ptr::read_unaligned(p_old_sd.add(2) as *const u16);
+        let (old_owner, old_group, old_sacl, old_dacl) = if (old_ctrl & SE_SELF_RELATIVE) != 0 {
+            let off = |at: usize| -> *const u8 {
+                let v = std::ptr::read_unaligned(p_old_sd.add(at) as *const u32);
+                if v == 0 { std::ptr::null() } else { p_old_sd.add(v as usize) }
+            };
+            (off(4), off(8), off(12), off(16))
+        } else {
+            let ptr = |at: usize| -> *const u8 {
+                std::ptr::read_unaligned(p_old_sd.add(at) as *const *const u8)
+            };
+            (ptr(8), ptr(16), ptr(24), ptr(32))
+        };
+
+        if !old_owner.is_null() {
+            owner_sid = match read_sid_bytes(old_owner) {
+                Ok(s) => Some(s),
+                Err(e) => return e,
+            };
+            ctrl_flags |= old_ctrl & SE_OWNER_DEFAULTED;
+        }
+        if !old_group.is_null() {
+            group_sid = match read_sid_bytes(old_group) {
+                Ok(s) => Some(s),
+                Err(e) => return e,
+            };
+            ctrl_flags |= old_ctrl & SE_GROUP_DEFAULTED;
+        }
+        if (old_ctrl & SE_DACL_PRESENT) != 0 {
+            dacl_present = true;
+            ctrl_flags |= old_ctrl & SE_DACL_DEFAULTED;
+            if !old_dacl.is_null() {
+                match parse_acl_bytes(old_dacl) {
+                    Ok((rev, a)) => {
+                        dacl_rev = rev;
+                        dacl_aces = Some(a);
+                    }
+                    Err(e) => return e,
+                }
+            }
+        }
+        if (old_ctrl & SE_SACL_PRESENT) != 0 {
+            sacl_present = true;
+            ctrl_flags |= old_ctrl & SE_SACL_DEFAULTED;
+            if !old_sacl.is_null() {
+                match parse_acl_bytes(old_sacl) {
+                    Ok((rev, a)) => {
+                        sacl_rev = rev;
+                        sacl_aces = Some(a);
+                    }
+                    Err(e) => return e,
+                }
+            }
+        }
+    }
+
+    if !p_owner.is_null() {
+        owner_sid = match resolve_trustee_w(p_owner) {
+            Ok(s) => Some(s),
+            Err(e) => return e,
+        };
+        ctrl_flags &= !SE_OWNER_DEFAULTED;
+    }
+    if !p_group.is_null() {
+        group_sid = match resolve_trustee_w(p_group) {
+            Ok(s) => Some(s),
+            Err(e) => return e,
+        };
+        ctrl_flags &= !SE_GROUP_DEFAULTED;
+    }
+    if c_access_entries > 0 {
+        let mut aces = dacl_aces.unwrap_or_default();
+        if let Err(e) = apply_explicit_access_entries(&mut aces, p_access_entries, c_access_entries, false) {
+            return e;
+        }
+        dacl_present = true;
+        dacl_aces = Some(aces);
+        ctrl_flags &= !SE_DACL_DEFAULTED;
+    }
+    if c_audit_entries > 0 {
+        let mut aces = sacl_aces.unwrap_or_default();
+        if let Err(e) = apply_explicit_access_entries(&mut aces, p_audit_entries, c_audit_entries, true) {
+            return e;
+        }
+        sacl_present = true;
+        sacl_aces = Some(aces);
+        ctrl_flags &= !SE_SACL_DEFAULTED;
+    }
+
+    // Pack self-relative SECURITY_DESCRIPTOR_RELATIVE (20-byte header + aligned payloads).
+    let mut buf = vec![0u8; 20];
+    let append_aligned = |dst: &mut Vec<u8>, bytes: &[u8]| -> u32 {
+        while dst.len() % 4 != 0 {
+            dst.push(0);
+        }
+        let off = dst.len() as u32;
+        dst.extend_from_slice(bytes);
+        off
+    };
+
+    let mut control = SE_SELF_RELATIVE | ctrl_flags;
+    let owner_off = owner_sid.as_deref().map_or(0, |s| append_aligned(&mut buf, s));
+    let group_off = group_sid.as_deref().map_or(0, |s| append_aligned(&mut buf, s));
+    let sacl_off = if sacl_present {
+        control |= SE_SACL_PRESENT;
+        match &sacl_aces {
+            Some(aces) => match serialize_acl(sacl_rev, aces) {
+                Ok(acl) => append_aligned(&mut buf, &acl),
+                Err(e) => return e,
+            },
+            None => 0,
+        }
+    } else {
+        0
+    };
+    let dacl_off = if dacl_present {
+        control |= SE_DACL_PRESENT;
+        match &dacl_aces {
+            Some(aces) => match serialize_acl(dacl_rev, aces) {
+                Ok(acl) => append_aligned(&mut buf, &acl),
+                Err(e) => return e,
+            },
+            None => 0,
+        }
+    } else {
+        0
+    };
+    while buf.len() % 4 != 0 {
+        buf.push(0);
+    }
+
+    buf[0] = 1; // SECURITY_DESCRIPTOR_REVISION
+    buf[1] = 0;
+    buf[2..4].copy_from_slice(&control.to_le_bytes());
+    buf[4..8].copy_from_slice(&owner_off.to_le_bytes());
+    buf[8..12].copy_from_slice(&group_off.to_le_bytes());
+    buf[12..16].copy_from_slice(&sacl_off.to_le_bytes());
+    buf[16..20].copy_from_slice(&dacl_off.to_le_bytes());
+
+    let sd = crate::heap::alloc(buf.len(), false) as *mut u8;
+    if sd.is_null() {
+        return crate::types::err::ERROR_NOT_ENOUGH_MEMORY;
+    }
+    std::ptr::copy_nonoverlapping(buf.as_ptr(), sd, buf.len());
+    std::ptr::write_unaligned(p_new_sd, sd as *mut c_void);
+    std::ptr::write_unaligned(p_size_new_sd, buf.len() as u32);
+    0 // ERROR_SUCCESS
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "win64" fn AllocateAndInitializeSid(
     auth: *const u8,
@@ -8173,6 +8776,347 @@ mod tests {
                 None => std::env::remove_var("AW2_DRIVE_C"),
             }
             let _ = std::fs::remove_dir_all(&tmp_root);
+        }
+    }
+
+    #[test]
+    fn build_explicit_access_and_security_descriptor_w() {
+        unsafe {
+            let mut trustee = crate::strings::to_wide_z("EVERYONE");
+            let mut ea = [0xAAu8; 48];
+            BuildExplicitAccessWithNameW(ea.as_mut_ptr(), trustee.as_mut_ptr(), 0x1000_0000, 2, 0);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr() as *const u32), 0x1000_0000);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(4) as *const u32), 2);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(8) as *const u32), 0);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(16) as *const usize), 0);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(24) as *const u32), 0);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(28) as *const u32), 1); // TRUSTEE_IS_NAME
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(32) as *const u32), 0); // TRUSTEE_IS_UNKNOWN
+            assert_eq!(
+                std::ptr::read_unaligned(ea.as_ptr().add(40) as *const LPWSTR),
+                trustee.as_mut_ptr()
+            );
+
+            // Null output / inconsistent array counts fail with ERROR_INVALID_PARAMETER.
+            let mut sd_size = 0u32;
+            let mut sd_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut sd_size,
+                    &mut sd_ptr,
+                ),
+                ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    ea.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    &mut sd_ptr,
+                ),
+                ERROR_INVALID_PARAMETER
+            );
+
+            // Valid call produces a real self-relative SD containing the requested DACL and ACE.
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    ea.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut sd_size,
+                    &mut sd_ptr,
+                ),
+                0
+            );
+            // 20-byte self-relative header + 8-byte ACL header + 20-byte ACCESS_ALLOWED_ACE (8 + 12-byte S-1-1-0).
+            assert_eq!(sd_size, 48);
+            assert!(!sd_ptr.is_null());
+            let sd = sd_ptr as *const u8;
+            assert_eq!(*sd, 1); // SECURITY_DESCRIPTOR_REVISION
+            assert_eq!(std::ptr::read_unaligned(sd.add(2) as *const u16), SE_SELF_RELATIVE | SE_DACL_PRESENT);
+            assert_eq!(std::ptr::read_unaligned(sd.add(4) as *const u32), 0); // no owner
+            assert_eq!(std::ptr::read_unaligned(sd.add(8) as *const u32), 0); // no group
+            assert_eq!(std::ptr::read_unaligned(sd.add(12) as *const u32), 0); // no SACL
+            let dacl_off = std::ptr::read_unaligned(sd.add(16) as *const u32);
+            assert_eq!(dacl_off, 20);
+            let dacl = sd.add(dacl_off as usize);
+            assert_eq!(*dacl, 2); // ACL_REVISION
+            assert_eq!(std::ptr::read_unaligned(dacl.add(2) as *const u16), 28); // AclSize
+            assert_eq!(std::ptr::read_unaligned(dacl.add(4) as *const u16), 1); // AceCount
+            let ace = dacl.add(8);
+            assert_eq!(*ace, ACCESS_ALLOWED_ACE_TYPE);
+            assert_eq!(*ace.add(1), 0);
+            assert_eq!(std::ptr::read_unaligned(ace.add(2) as *const u16), 20);
+            assert_eq!(std::ptr::read_unaligned(ace.add(4) as *const u32), 0x1000_0000);
+            let expected_world = build_sid(1, &[0]);
+            assert_eq!(std::slice::from_raw_parts(ace.add(8), expected_world.len()), expected_world.as_slice());
+
+            // Merge owner, group, deny DACL entry, and audit SACL entry onto p_old_sd (sd_ptr).
+            let mut owner_name = crate::strings::to_wide_z("SYSTEM");
+            let mut owner_trustee = [0u8; 32];
+            std::ptr::write_unaligned(owner_trustee.as_mut_ptr().add(12) as *mut u32, TRUSTEE_IS_NAME);
+            std::ptr::write_unaligned(owner_trustee.as_mut_ptr().add(24) as *mut LPWSTR, owner_name.as_mut_ptr());
+
+            let group_sid = build_sid(5, &[32, 544]); // BUILTIN\Administrators
+            let mut group_trustee = [0u8; 32];
+            std::ptr::write_unaligned(group_trustee.as_mut_ptr().add(12) as *mut u32, TRUSTEE_IS_SID);
+            std::ptr::write_unaligned(group_trustee.as_mut_ptr().add(24) as *mut *const u8, group_sid.as_ptr());
+
+            let mut deny_name = crate::strings::to_wide_z("GUESTS");
+            let mut deny_ea = [0u8; 48];
+            BuildExplicitAccessWithNameW(deny_ea.as_mut_ptr(), deny_name.as_mut_ptr(), 0x0002_0000, DENY_ACCESS, 0x03);
+
+            let mut audit_name = crate::strings::to_wide_z("AUTHENTICATED USERS");
+            let mut audit_ea = [0u8; 48];
+            BuildExplicitAccessWithNameW(audit_ea.as_mut_ptr(), audit_name.as_mut_ptr(), 0x0001_0000, SET_AUDIT_FAILURE, 0);
+
+            let mut merged_size = 0u32;
+            let mut merged_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    owner_trustee.as_ptr(),
+                    group_trustee.as_ptr(),
+                    1,
+                    deny_ea.as_ptr(),
+                    1,
+                    audit_ea.as_ptr(),
+                    sd,
+                    &mut merged_size,
+                    &mut merged_ptr,
+                ),
+                0
+            );
+            assert!(!merged_ptr.is_null());
+            let msd = merged_ptr as *const u8;
+            let mctrl = std::ptr::read_unaligned(msd.add(2) as *const u16);
+            assert_eq!(mctrl, SE_SELF_RELATIVE | SE_DACL_PRESENT | SE_SACL_PRESENT);
+            let m_owner_off = std::ptr::read_unaligned(msd.add(4) as *const u32);
+            let m_group_off = std::ptr::read_unaligned(msd.add(8) as *const u32);
+            let m_sacl_off = std::ptr::read_unaligned(msd.add(12) as *const u32);
+            let m_dacl_off = std::ptr::read_unaligned(msd.add(16) as *const u32);
+            assert!(m_owner_off >= 20 && m_group_off > m_owner_off && m_sacl_off > m_group_off && m_dacl_off > m_sacl_off);
+            assert_eq!(read_sid_bytes(msd.add(m_owner_off as usize)).unwrap(), build_sid(5, &[18]));
+            assert_eq!(read_sid_bytes(msd.add(m_group_off as usize)).unwrap(), group_sid);
+
+            let (merged_dacl_rev, merged_dacl) = parse_acl_bytes(msd.add(m_dacl_off as usize)).unwrap();
+            assert_eq!(merged_dacl_rev, ACL_REVISION);
+            assert_eq!(merged_dacl.len(), 2);
+            assert_eq!(merged_dacl[0].ace_type, ACCESS_DENIED_ACE_TYPE);
+            assert_eq!(merged_dacl[0].ace_flags, 0x03);
+            assert_eq!(merged_dacl[0].mask, 0x0002_0000);
+            assert_eq!(merged_dacl[0].sid, build_sid(5, &[32, 546]));
+            assert_eq!(merged_dacl[1].ace_type, ACCESS_ALLOWED_ACE_TYPE);
+            assert_eq!(merged_dacl[1].mask, 0x1000_0000);
+            assert_eq!(merged_dacl[1].sid, expected_world);
+
+            let (merged_sacl_rev, merged_sacl) = parse_acl_bytes(msd.add(m_sacl_off as usize)).unwrap();
+            assert_eq!(merged_sacl_rev, ACL_REVISION);
+            assert_eq!(merged_sacl.len(), 1);
+            assert_eq!(merged_sacl[0].ace_type, SYSTEM_AUDIT_ACE_TYPE);
+            assert_eq!(merged_sacl[0].ace_flags, FAILED_ACCESS_ACE_FLAG);
+            assert_eq!(merged_sacl[0].mask, 0x0001_0000);
+            assert_eq!(merged_sacl[0].sid, build_sid(5, &[11]));
+
+            // Revision-4 (ACL_REVISION_DS) ACL with an object-specific ACE must preserve revision 4
+            // and raw ACE bytes both on pure copy and when merging additional entries.
+            let mut obj_ace_body = Vec::new();
+            obj_ace_body.extend_from_slice(&0x0000_0100u32.to_le_bytes()); // Mask
+            obj_ace_body.extend_from_slice(&0x0000_0001u32.to_le_bytes()); // Flags (ACE_OBJECT_TYPE_PRESENT)
+            obj_ace_body.extend_from_slice(&[0x11u8; 16]); // ObjectType GUID
+            obj_ace_body.extend_from_slice(&expected_world); // Sid
+            let obj_ace_len = (4 + obj_ace_body.len()) as u16;
+            let ds_acl_len = 8 + obj_ace_len;
+            let mut ds_sd = vec![0u8; 20 + ds_acl_len as usize];
+            ds_sd[0] = 1; // SECURITY_DESCRIPTOR_REVISION
+            ds_sd[2..4].copy_from_slice(&(SE_SELF_RELATIVE | SE_DACL_PRESENT).to_le_bytes());
+            ds_sd[16..20].copy_from_slice(&20u32.to_le_bytes()); // Dacl offset
+            ds_sd[20] = ACL_REVISION_DS;
+            ds_sd[22..24].copy_from_slice(&ds_acl_len.to_le_bytes());
+            ds_sd[24..26].copy_from_slice(&1u16.to_le_bytes()); // AceCount
+            ds_sd[28] = 5; // ACCESS_ALLOWED_OBJECT_ACE_TYPE
+            ds_sd[29] = 0x02; // CONTAINER_INHERIT_ACE
+            ds_sd[30..32].copy_from_slice(&obj_ace_len.to_le_bytes());
+            ds_sd[32..32 + obj_ace_body.len()].copy_from_slice(&obj_ace_body);
+
+            let mut ds_copy_size = 0u32;
+            let mut ds_copy_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    ds_sd.as_ptr(),
+                    &mut ds_copy_size,
+                    &mut ds_copy_ptr,
+                ),
+                0
+            );
+            let ds_copy = ds_copy_ptr as *const u8;
+            let ds_dacl_off = std::ptr::read_unaligned(ds_copy.add(16) as *const u32) as usize;
+            let (ds_rev, ds_aces) = parse_acl_bytes(ds_copy.add(ds_dacl_off)).unwrap();
+            assert_eq!(ds_rev, ACL_REVISION_DS);
+            assert_eq!(ds_aces.len(), 1);
+            assert_eq!(ds_aces[0].ace_type, 5);
+            assert_eq!(ds_aces[0].ace_flags, 0x02);
+            assert_eq!(ds_aces[0].raw_body.as_deref(), Some(obj_ace_body.as_slice()));
+
+            // Adding a standard GRANT_ACCESS entry to the revision-4 DACL must keep ACL_REVISION_DS.
+            let mut ds_merged_size = 0u32;
+            let mut ds_merged_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    deny_ea.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    ds_sd.as_ptr(),
+                    &mut ds_merged_size,
+                    &mut ds_merged_ptr,
+                ),
+                0
+            );
+            let ds_merged = ds_merged_ptr as *const u8;
+            let ds_m_off = std::ptr::read_unaligned(ds_merged.add(16) as *const u32) as usize;
+            let (ds_m_rev, ds_m_aces) = parse_acl_bytes(ds_merged.add(ds_m_off)).unwrap();
+            assert_eq!(ds_m_rev, ACL_REVISION_DS);
+            assert_eq!(ds_m_aces.len(), 2);
+            assert_eq!(ds_m_aces[0].ace_type, ACCESS_DENIED_ACE_TYPE);
+            assert_eq!(ds_m_aces[1].ace_type, 5);
+            assert_eq!(ds_m_aces[1].raw_body.as_deref(), Some(obj_ace_body.as_slice()));
+            assert!(crate::kernel32::memory::LocalFree(ds_copy_ptr).is_null());
+            assert!(crate::kernel32::memory::LocalFree(ds_merged_ptr).is_null());
+
+            // Canonical DACL order: GRANT_ACCESS and SET_ACCESS must insert new explicit allow ACEs
+            // after explicit denies but BEFORE existing explicit allows and inherited deny/allow ACEs.
+            let admins_sid = build_sid(5, &[32, 544]);
+            let inh_dacl = serialize_acl(
+                ACL_REVISION,
+                &[
+                    ParsedAce {
+                        ace_type: ACCESS_ALLOWED_ACE_TYPE,
+                        ace_flags: 0,
+                        mask: 0x000F_0000,
+                        sid: admins_sid.clone(),
+                        raw_body: None,
+                    },
+                    ParsedAce {
+                        ace_type: ACCESS_DENIED_ACE_TYPE,
+                        ace_flags: INHERITED_ACE,
+                        mask: 0x1000_0000,
+                        sid: expected_world.clone(),
+                        raw_body: None,
+                    },
+                ],
+            )
+            .unwrap();
+            let mut inh_sd = vec![0u8; 20 + inh_dacl.len()];
+            inh_sd[0] = 1;
+            inh_sd[2..4].copy_from_slice(&(SE_SELF_RELATIVE | SE_DACL_PRESENT).to_le_bytes());
+            inh_sd[16..20].copy_from_slice(&20u32.to_le_bytes());
+            inh_sd[20..].copy_from_slice(&inh_dacl);
+
+            for (mode, label) in [(GRANT_ACCESS, "GRANT_ACCESS"), (SET_ACCESS, "SET_ACCESS")] {
+                let mut grant_ea = [0u8; 48];
+                let mut w_name = crate::strings::to_wide_z("EVERYONE");
+                BuildExplicitAccessWithNameW(grant_ea.as_mut_ptr(), w_name.as_mut_ptr(), 0x1000_0000, mode, 0);
+                let mut out_sz = 0u32;
+                let mut out_ptr: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    BuildSecurityDescriptorW(
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        1,
+                        grant_ea.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        inh_sd.as_ptr(),
+                        &mut out_sz,
+                        &mut out_ptr,
+                    ),
+                    0,
+                    "{label} should succeed"
+                );
+                let out_sd = out_ptr as *const u8;
+                let off = std::ptr::read_unaligned(out_sd.add(16) as *const u32) as usize;
+                let (_, aces) = parse_acl_bytes(out_sd.add(off)).unwrap();
+                assert_eq!(aces.len(), 3, "{label} must keep explicit + inherited entries");
+                // New explicit allow for Everyone must precede both existing explicit allow and inherited deny.
+                assert_eq!(aces[0].ace_type, ACCESS_ALLOWED_ACE_TYPE);
+                assert_eq!(aces[0].ace_flags & INHERITED_ACE, 0);
+                assert_eq!(aces[0].sid, expected_world);
+                assert_eq!(aces[1].ace_type, ACCESS_ALLOWED_ACE_TYPE);
+                assert_eq!(aces[1].sid, admins_sid);
+                assert_eq!(aces[2].ace_type, ACCESS_DENIED_ACE_TYPE);
+                assert_eq!(aces[2].ace_flags, INHERITED_ACE);
+                assert_eq!(aces[2].sid, expected_world);
+                assert!(crate::kernel32::memory::LocalFree(out_ptr).is_null());
+            }
+
+            // Empty request (no owner/group/access/audit/old_sd) must NOT falsely set SE_DACL_PRESENT.
+            let mut empty_size = 0u32;
+            let mut empty_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut empty_size,
+                    &mut empty_ptr,
+                ),
+                0
+            );
+            assert_eq!(empty_size, 20);
+            assert_eq!(std::ptr::read_unaligned((empty_ptr as *const u8).add(2) as *const u16), SE_SELF_RELATIVE);
+
+            // Unknown trustee account name fails honestly with ERROR_NONE_MAPPED.
+            let mut bad_name = crate::strings::to_wide_z("NONEXISTENT_ACCOUNT_XYZ");
+            let mut bad_ea = [0u8; 48];
+            BuildExplicitAccessWithNameW(bad_ea.as_mut_ptr(), bad_name.as_mut_ptr(), 1, GRANT_ACCESS, 0);
+            let mut bad_size = 0u32;
+            let mut bad_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    bad_ea.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut bad_size,
+                    &mut bad_ptr,
+                ),
+                ERROR_NONE_MAPPED
+            );
+
+            assert!(crate::kernel32::memory::LocalFree(sd_ptr).is_null());
+            assert!(crate::kernel32::memory::LocalFree(merged_ptr).is_null());
+            assert!(crate::kernel32::memory::LocalFree(empty_ptr).is_null());
         }
     }
 }

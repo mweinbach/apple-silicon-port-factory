@@ -824,6 +824,7 @@ fn free_window(hwnd: usize) {
     crate::misc::uxtheme::forget_window_subclasses(hwnd);
     super::dialog::forget_dialog(hwnd);
     super::controls::forget_control(hwnd);
+    forget_window_props(hwnd);
 }
 
 pub unsafe fn create_window_w(
@@ -2441,6 +2442,179 @@ pub(crate) fn create_virtual_dialog_hwnd(
     hwnd
 }
 
+// ---------------------------------------------------------------------------
+// Window properties & DPI coordinate conversion
+// ---------------------------------------------------------------------------
+
+/// Window properties are keyed by canonical global atom (`u16`), matching Windows
+/// where string property names and their `GlobalAddAtomA/W` atoms alias the same entry.
+fn window_props() -> &'static Mutex<HashMap<usize, HashMap<u16, usize>>> {
+    static P: OnceLock<Mutex<HashMap<usize, HashMap<u16, usize>>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn forget_window_props(hwnd: usize) {
+    window_props().lock().unwrap().remove(&hwnd);
+}
+
+enum PropLookup {
+    Invalid,
+    Missing,
+    Atom(u16),
+}
+
+unsafe fn resolve_prop_a(lp_string: LPCSTR, create: bool) -> PropLookup {
+    let addr = lp_string as usize;
+    if addr == 0 {
+        return PropLookup::Invalid;
+    }
+    if addr <= 0xFFFF {
+        return PropLookup::Atom(addr as u16);
+    }
+    let s = crate::strings::from_ansi(lp_string);
+    if s.is_empty() {
+        return PropLookup::Invalid;
+    }
+    if create {
+        let atom = crate::kernel32::process::global_add_atom(&s);
+        if atom == 0 { PropLookup::Invalid } else { PropLookup::Atom(atom) }
+    } else {
+        match crate::kernel32::process::global_find_atom(&s) {
+            Some(atom) => PropLookup::Atom(atom),
+            None => PropLookup::Missing,
+        }
+    }
+}
+
+unsafe fn resolve_prop_w(lp_string: LPCWSTR, create: bool) -> PropLookup {
+    let addr = lp_string as usize;
+    if addr == 0 {
+        return PropLookup::Invalid;
+    }
+    if addr <= 0xFFFF {
+        return PropLookup::Atom(addr as u16);
+    }
+    let s = crate::strings::from_wide(lp_string);
+    if s.is_empty() {
+        return PropLookup::Invalid;
+    }
+    if create {
+        let atom = crate::kernel32::process::global_add_atom(&s);
+        if atom == 0 { PropLookup::Invalid } else { PropLookup::Atom(atom) }
+    } else {
+        match crate::kernel32::process::global_find_atom(&s) {
+            Some(atom) => PropLookup::Atom(atom),
+            None => PropLookup::Missing,
+        }
+    }
+}
+
+fn set_prop_impl(hwnd: usize, key: PropLookup, data: usize) -> BOOL {
+    if require(hwnd).is_none() {
+        return FALSE;
+    }
+    let PropLookup::Atom(atom) = key else {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    };
+    window_props().lock().unwrap().entry(hwnd).or_default().insert(atom, data);
+    TRUE
+}
+
+fn get_prop_impl(hwnd: usize, key: PropLookup) -> usize {
+    if !exists(hwnd) {
+        set_error(e::INVALID_WINDOW_HANDLE);
+        return 0;
+    }
+    let atom = match key {
+        PropLookup::Atom(a) => a,
+        PropLookup::Missing => return 0,
+        PropLookup::Invalid => {
+            set_error(e::INVALID_PARAMETER);
+            return 0;
+        }
+    };
+    window_props()
+        .lock()
+        .unwrap()
+        .get(&hwnd)
+        .and_then(|m| m.get(&atom).copied())
+        .unwrap_or(0)
+}
+
+fn remove_prop_impl(hwnd: usize, key: PropLookup) -> usize {
+    if !exists(hwnd) {
+        set_error(e::INVALID_WINDOW_HANDLE);
+        return 0;
+    }
+    let atom = match key {
+        PropLookup::Atom(a) => a,
+        PropLookup::Missing => return 0,
+        PropLookup::Invalid => {
+            set_error(e::INVALID_PARAMETER);
+            return 0;
+        }
+    };
+    let mut table = window_props().lock().unwrap();
+    let val = table.get_mut(&hwnd).and_then(|m| m.remove(&atom)).unwrap_or(0);
+    if table.get(&hwnd).is_some_and(|m| m.is_empty()) {
+        table.remove(&hwnd);
+    }
+    val
+}
+
+pub unsafe extern "win64" fn SetPropA(hwnd: HWND, lp_string: LPCSTR, h_data: usize) -> BOOL {
+    set_prop_impl(hwnd as usize, resolve_prop_a(lp_string, true), h_data)
+}
+
+pub unsafe extern "win64" fn GetPropA(hwnd: HWND, lp_string: LPCSTR) -> usize {
+    get_prop_impl(hwnd as usize, resolve_prop_a(lp_string, false))
+}
+
+pub unsafe extern "win64" fn RemovePropA(hwnd: HWND, lp_string: LPCSTR) -> usize {
+    remove_prop_impl(hwnd as usize, resolve_prop_a(lp_string, false))
+}
+
+pub unsafe extern "win64" fn SetPropW(hwnd: HWND, lp_string: LPCWSTR, h_data: usize) -> BOOL {
+    set_prop_impl(hwnd as usize, resolve_prop_w(lp_string, true), h_data)
+}
+
+pub unsafe extern "win64" fn GetPropW(hwnd: HWND, lp_string: LPCWSTR) -> usize {
+    get_prop_impl(hwnd as usize, resolve_prop_w(lp_string, false))
+}
+
+pub unsafe extern "win64" fn RemovePropW(hwnd: HWND, lp_string: LPCWSTR) -> usize {
+    remove_prop_impl(hwnd as usize, resolve_prop_w(lp_string, false))
+}
+
+/// For DPI-aware processes on Windows 8.1/10/11, logical and physical screen
+/// coordinates are identical (1:1).
+pub unsafe extern "win64" fn LogicalToPhysicalPoint(hwnd: HWND, lp_point: *mut POINT) -> BOOL {
+    let h = hwnd as usize;
+    if h != DESKTOP_HWND && require(h).is_none() {
+        return FALSE;
+    }
+    if lp_point.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    TRUE
+}
+
+/// For DPI-aware processes on Windows 8.1/10/11, physical and logical screen
+/// coordinates are identical (1:1).
+pub unsafe extern "win64" fn PhysicalToLogicalPoint(hwnd: HWND, lp_point: *mut POINT) -> BOOL {
+    let h = hwnd as usize;
+    if h != DESKTOP_HWND && require(h).is_none() {
+        return FALSE;
+    }
+    if lp_point.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    TRUE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2774,5 +2948,76 @@ mod tests {
                 .unwrap();
             });
         });
+    }
+
+    #[test]
+    fn window_props_and_logical_physical_points() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            let cls = register("Aw2TestPropsAndDpiPts");
+            let h = CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                ws::POPUP,
+                0,
+                0,
+                100,
+                100,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!h.is_null());
+
+            // Case-insensitive string keys and integer atom keys roundtrip and clean up on destroy.
+            assert_eq!(SetPropA(h, c"MyCustomProp".as_ptr().cast(), 0xDEAD_BEEF), TRUE);
+            assert_eq!(GetPropA(h, c"mycustomprop".as_ptr().cast()), 0xDEAD_BEEF);
+            let wide_key = crate::strings::to_wide_z("MYCUSTOMPROP");
+            assert_eq!(GetPropW(h, wide_key.as_ptr()), 0xDEAD_BEEF);
+            assert_eq!(RemovePropA(h, c"MYCUSTOMPROP".as_ptr().cast()), 0xDEAD_BEEF);
+            assert_eq!(GetPropA(h, c"MyCustomProp".as_ptr().cast()), 0);
+
+            assert_eq!(SetPropA(h, 0xC001usize as LPCSTR, 0x1234_5678), TRUE);
+            assert_eq!(GetPropA(h, 0xC001usize as LPCSTR), 0x1234_5678);
+
+            // Global atom <-> string interoperability in both directions (A & W, case-insensitive).
+            let atom_w_name = crate::strings::to_wide_z("SharedAtomProp");
+            let atom = crate::kernel32::process::GlobalAddAtomW(atom_w_name.as_ptr());
+            assert!(atom >= 0xC000);
+            assert_eq!(SetPropW(h, atom as usize as LPCWSTR, 0xCAFE_BABE), TRUE);
+            assert_eq!(GetPropA(h, c"sharedatomprop".as_ptr().cast()), 0xCAFE_BABE);
+            assert_eq!(GetPropW(h, atom_w_name.as_ptr()), 0xCAFE_BABE);
+            assert_eq!(RemovePropA(h, c"SHAREDATOMPROP".as_ptr().cast()), 0xCAFE_BABE);
+            assert_eq!(GetPropW(h, atom as usize as LPCWSTR), 0);
+
+            // Set via string first, then look up and remove via GlobalAddAtomA atom.
+            assert_eq!(SetPropA(h, c"StringFirstProp".as_ptr().cast(), 0x55AA_1122), TRUE);
+            let atom2 = crate::kernel32::process::GlobalAddAtomA(c"stringfirstprop".as_ptr().cast());
+            assert!(atom2 >= 0xC000);
+            assert_eq!(GetPropW(h, atom2 as usize as LPCWSTR), 0x55AA_1122);
+            assert_eq!(RemovePropW(h, atom2 as usize as LPCWSTR), 0x55AA_1122);
+            assert_eq!(GetPropA(h, c"StringFirstProp".as_ptr().cast()), 0);
+
+            assert_eq!(SetPropA(std::ptr::null_mut(), c"x".as_ptr().cast(), 1), FALSE);
+            assert_eq!(SetPropA(h, std::ptr::null(), 1), FALSE);
+
+            // LogicalToPhysicalPoint / PhysicalToLogicalPoint validate HWND + pointer.
+            let mut pt = POINT { x: 320, y: 240 };
+            assert_eq!(LogicalToPhysicalPoint(h, &mut pt), TRUE);
+            assert_eq!(pt, POINT { x: 320, y: 240 });
+            assert_eq!(PhysicalToLogicalPoint(h, &mut pt), TRUE);
+            assert_eq!(pt, POINT { x: 320, y: 240 });
+            assert_eq!(LogicalToPhysicalPoint(h, std::ptr::null_mut()), FALSE);
+            assert_eq!(PhysicalToLogicalPoint(0xBADusize as HWND, &mut pt), FALSE);
+
+            let hu = h as usize;
+            DestroyWindow(h);
+            assert!(!window_props().lock().unwrap().contains_key(&hu));
+            class::UnregisterClassW(cls.as_ptr(), std::ptr::null_mut());
+        })
+        .join()
+        .unwrap();
     }
 }

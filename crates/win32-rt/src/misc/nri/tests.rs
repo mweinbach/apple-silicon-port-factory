@@ -1254,3 +1254,16 @@ fn nri_mesh_and_task_pipeline_on_real_d3d12_device() {
         com_release(d3d_dev);
     }
 }
+
+#[test]
+fn nri_convert_dxgi_format_to_nri_typed_and_typeless() {
+    unsafe {
+        assert_eq!(nriConvertDXGIFormatToNRI(0), 0); // DXGI_FORMAT_UNKNOWN -> Format::UNKNOWN
+        assert_eq!(nriConvertDXGIFormatToNRI(28), 11); // DXGI_FORMAT_R8G8B8A8_UNORM -> RGBA8_UNORM
+        assert_eq!(nriConvertDXGIFormatToNRI(87), 9); // DXGI_FORMAT_B8G8R8A8_UNORM -> BGRA8_UNORM
+        assert_eq!(nriConvertDXGIFormatToNRI(40), 63); // DXGI_FORMAT_D32_FLOAT -> D32_SFLOAT
+        assert_eq!(nriConvertDXGIFormatToNRI(27), 11); // DXGI_FORMAT_R8G8B8A8_TYPELESS -> RGBA8_UNORM
+        assert_eq!(nriConvertDXGIFormatToNRI(44), 62); // DXGI_FORMAT_R24G8_TYPELESS -> D24_UNORM_S8_UINT
+        assert_eq!(nriConvertDXGIFormatToNRI(9999), 0);
+    }
+}
