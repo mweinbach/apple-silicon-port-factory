@@ -2070,72 +2070,142 @@ fn fallback_compute_bidi(
     if max_length > 0 && len > max_length {
         return Err(U_MEMORY_ALLOCATION_ERROR);
     }
-    let base_rtl = match para_level {
-        UBIDI_DEFAULT_LTR => fallback_base_direction(units) == UBIDI_RTL,
-        UBIDI_DEFAULT_RTL => fallback_base_direction(units) != UBIDI_LTR,
-        lv => (lv & 1) != 0,
+    let base_level: u8 = match para_level {
+        UBIDI_DEFAULT_LTR => {
+            if fallback_base_direction(units) == UBIDI_RTL {
+                1
+            } else {
+                0
+            }
+        }
+        UBIDI_DEFAULT_RTL => {
+            if fallback_base_direction(units) == UBIDI_LTR {
+                0
+            } else {
+                1
+            }
+        }
+        lv => lv & 0x7F,
     };
-    let base_dir = if base_rtl { UBIDI_RTL } else { UBIDI_LTR };
+    let base_dir = if (base_level & 1) != 0 {
+        UBIDI_RTL
+    } else {
+        UBIDI_LTR
+    };
     if units.is_empty() {
         return Ok((base_dir, Vec::new()));
     }
 
-    let mut per_unit_rtl = vec![base_rtl; units.len()];
-    if let Some(levels) = embedding_levels {
-        for (dst, &lv) in per_unit_rtl.iter_mut().zip(levels.iter()) {
+    let mut levels: Vec<u8> = if let Some(emb) = embedding_levels {
+        let mut out = Vec::with_capacity(units.len());
+        let mut all_overridden = true;
+        for &lv in emb.iter().take(units.len()) {
             let eff = lv & 0x7F;
             if eff > UBIDI_MAX_EXPLICIT_LEVEL {
                 return Err(U_ILLEGAL_ARGUMENT_ERROR);
             }
-            *dst = (eff & 1) != 0;
+            if (lv & 0x80) == 0 {
+                all_overridden = false;
+            }
+            out.push(eff);
         }
-    } else if (para_level & 0x80) == 0 || para_level >= UBIDI_DEFAULT_LTR {
-        let mut idx = 0usize;
-        let mut active_rtl = base_rtl;
-        for res in char::decode_utf16(units.iter().copied()) {
-            let (ch, step) = match res {
-                Ok(c) => (c, c.len_utf16()),
-                Err(_) => ('\u{FFFD}', 1),
-            };
-            if let Some(d) = classify_strong_bidi_dir(ch) {
-                active_rtl = d == UBIDI_RTL;
+        if !all_overridden {
+            // Non-override per-character embeddingLevels require full UAX #9
+            // explicit-level run resolution; fail honestly without libicucore.
+            return Err(U_UNSUPPORTED_ERROR);
+        }
+        out
+    } else if para_level < UBIDI_DEFAULT_LTR && (para_level & 0x80) != 0 {
+        vec![base_level; units.len()]
+    } else {
+        if super::dwrite::analysis::has_explicit_bidi_controls(units) {
+            return Err(U_UNSUPPORTED_ERROR);
+        }
+        super::dwrite::analysis::resolve_bidi_levels_fallback(units, base_level)
+    };
+
+    // UAX #9 L1: reset segment/paragraph separators and any immediately preceding
+    // whitespace/BN (plus trailing whitespace/BN at end of paragraph) to base_level.
+    if embedding_levels.is_none() && (para_level >= UBIDI_DEFAULT_LTR || (para_level & 0x80) == 0) {
+        let is_seg_or_para_sep = |u: u16| {
+            matches!(u, 0x0009..=0x000D | 0x001C..=0x001F | 0x0085 | 0x2029)
+        };
+        let is_ws_or_bn = |u: u16| {
+            matches!(
+                u,
+                0x0009 | 0x000C | 0x0020 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x205F | 0x3000
+                    | 0x0000..=0x0008
+                    | 0x000E..=0x001B
+                    | 0x007F..=0x0084
+                    | 0x0086..=0x009F
+                    | 0x200B..=0x200D
+            )
+        };
+        let mut reset_run = true;
+        for idx in (0..units.len()).rev() {
+            let u = units[idx];
+            if is_seg_or_para_sep(u) {
+                levels[idx] = base_level;
+                reset_run = true;
+            } else if reset_run && is_ws_or_bn(u) {
+                levels[idx] = base_level;
+            } else {
+                reset_run = false;
             }
-            for off in 0..step {
-                if idx + off < per_unit_rtl.len() {
-                    per_unit_rtl[idx + off] = active_rtl;
-                }
-            }
-            idx += step;
         }
     }
 
-    let mut runs = Vec::new();
+    // Group contiguous equal-level spans into logical runs, then reorder per UAX #9 L2.
+    let mut level_runs: Vec<(i32, i32, u8)> = Vec::new();
     let mut start = 0usize;
-    while start < per_unit_rtl.len() {
-        let rtl = per_unit_rtl[start];
+    while start < levels.len() {
+        let lv = levels[start];
         let mut end = start + 1;
-        while end < per_unit_rtl.len() && per_unit_rtl[end] == rtl {
+        while end < levels.len() && levels[end] == lv {
             end += 1;
         }
-        runs.push(FallbackBidiRun {
-            logical_start: start as i32,
-            length: (end - start) as i32,
-            direction: if rtl { UBIDI_RTL } else { UBIDI_LTR },
-        });
+        level_runs.push((start as i32, (end - start) as i32, lv));
         start = end;
     }
-    if max_run_count > 0 && (runs.len() as i32) > max_run_count {
+    if max_run_count > 0 && (level_runs.len() as i32) > max_run_count {
         return Err(U_MEMORY_ALLOCATION_ERROR);
     }
-    if base_rtl && runs.len() > 1 {
-        runs.reverse();
+
+    let max_lv = level_runs.iter().map(|r| r.2).max().unwrap_or(0);
+    let min_odd_lv = level_runs
+        .iter()
+        .map(|r| r.2)
+        .filter(|&lv| (lv & 1) != 0)
+        .min();
+    if let Some(min_odd) = min_odd_lv {
+        for lv in (min_odd..=max_lv).rev() {
+            let mut i = 0usize;
+            while i < level_runs.len() {
+                if level_runs[i].2 >= lv {
+                    let s = i;
+                    while i < level_runs.len() && level_runs[i].2 >= lv {
+                        i += 1;
+                    }
+                    level_runs[s..i].reverse();
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
-    let has_ltr = runs.iter().any(|r| r.direction == UBIDI_LTR);
-    let has_rtl = runs.iter().any(|r| r.direction == UBIDI_RTL);
-    let dir = match (has_ltr, has_rtl) {
-        (true, true) => UBIDI_MIXED,
-        (false, true) => UBIDI_RTL,
-        _ => UBIDI_LTR,
+
+    let runs: Vec<FallbackBidiRun> = level_runs
+        .into_iter()
+        .map(|(logical_start, length, lv)| FallbackBidiRun {
+            logical_start,
+            length,
+            direction: if (lv & 1) != 0 { UBIDI_RTL } else { UBIDI_LTR },
+        })
+        .collect();
+    let dir = if runs.iter().all(|r| r.direction == base_dir) {
+        base_dir
+    } else {
+        UBIDI_MIXED
     };
     Ok((dir, runs))
 }
@@ -3591,11 +3661,40 @@ mod tests {
             assert_eq!(err, U_MEMORY_ALLOCATION_ERROR);
             ubidi_close_69(fixed);
 
-            // Pure-Rust fallback paragraph computation sanity check
+            // Pure-Rust UAX #9 fallback matches native libicucore on mixed LTR/RTL and Arabic + digits
             let (fb_dir, fb_runs) =
                 fallback_compute_bidi(&mixed_u16, UBIDI_DEFAULT_LTR, None, 0, 0).unwrap();
             assert_eq!(fb_dir, UBIDI_MIXED);
-            assert!(fb_runs.len() >= 2);
+            assert_eq!(
+                fb_runs
+                    .iter()
+                    .map(|r| (r.direction, r.logical_start, r.length))
+                    .collect::<Vec<_>>(),
+                vec![(UBIDI_LTR, 0, 6), (UBIDI_RTL, 6, 4), (UBIDI_LTR, 10, 6)]
+            );
+
+            let (fb_rtl_dir, fb_rtl_runs) =
+                fallback_compute_bidi(&rtl_u16, UBIDI_DEFAULT_RTL, None, 0, 0).unwrap();
+            assert_eq!(fb_rtl_dir, UBIDI_MIXED);
+            assert_eq!(
+                fb_rtl_runs
+                    .iter()
+                    .map(|r| (r.direction, r.logical_start, r.length))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (UBIDI_LTR, 10, 5),
+                    (UBIDI_RTL, 9, 1),
+                    (UBIDI_LTR, 6, 3),
+                    (UBIDI_RTL, 0, 6),
+                ]
+            );
+
+            // Explicit bidi controls fail honestly in fallback mode instead of returning wrong runs
+            let explicit_u16: Vec<u16> = "\u{202E}abc\u{202C}".encode_utf16().collect();
+            assert_eq!(
+                fallback_compute_bidi(&explicit_u16, UBIDI_DEFAULT_LTR, None, 0, 0).err(),
+                Some(U_UNSUPPORTED_ERROR)
+            );
             assert_eq!(
                 fallback_compute_bidi(&ascii_u16, 0, None, 2, 0).err(),
                 Some(U_MEMORY_ALLOCATION_ERROR)
