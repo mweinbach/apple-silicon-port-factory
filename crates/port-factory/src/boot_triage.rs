@@ -2782,7 +2782,7 @@ fn split_called_from(s: &str) -> (&str, Option<String>) {
     }
 }
 
-/// Extract a canonical `module+0x<hex>` token (e.g. `spider-man2.exe+0x5081964`) from a string.
+/// Extract a canonical `module+0x<hex>` token (e.g. `game.exe+0x1234`) from a string.
 pub fn extract_module_rva(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut search_from = 0usize;

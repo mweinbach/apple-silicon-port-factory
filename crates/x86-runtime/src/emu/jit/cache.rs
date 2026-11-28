@@ -2494,7 +2494,7 @@ pub(in crate::emu) fn inline_host_fn_kind(t: u64) -> Option<(usize, bool, bool)>
         return Some((h, false, true));
     }
     if f == crate::emu::DF_VALID | crate::emu::DF_HOST {
-        return crate::emu::inline_variant(h).map(|(f2, bail)| (f2, bail, true));
+        return crate::emu::inline_variant(h);
     }
     None
 }
