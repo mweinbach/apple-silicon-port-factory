@@ -463,7 +463,16 @@ pub struct CodeResourcesEntry {
     pub hash2: Option<[u8; 32]>,
     pub symlink: Option<String>,
     pub optional: bool,
-    pub is_cdhash: bool,
+    pub cdhash: Option<Vec<u8>>,
+    pub requirement: Option<String>,
+}
+
+impl CodeResourcesEntry {
+    /// Returns `true` when this `files2` entry seals a nested code object (helper binary,
+    /// dylib, framework, XPC service, plugin, etc.) by `cdhash` and/or designated `requirement`.
+    pub fn is_nested_code(&self) -> bool {
+        self.cdhash.is_some() || self.requirement.is_some()
+    }
 }
 
 fn xml_unescape(s: &str) -> String {
@@ -665,12 +674,24 @@ pub fn parse_code_resources_files2(plist_xml: &str) -> Result<BTreeMap<String, C
                         }
                     }
                     "cdhash" => {
-                        entry.is_cdhash = true;
-                        if let Some((_, next_i)) = find_next_tag(inner, fval_start, "data") {
-                            icur = next_i;
-                        } else {
-                            icur = fval_start + 1;
+                        let (b64, next_i) = find_next_tag(inner, fval_start, "data")
+                            .ok_or_else(|| anyhow!("missing <data> for cdhash of {path_key:?}"))?;
+                        let decoded = base64_decode(&b64)?;
+                        if !decoded.is_empty() {
+                            entry.cdhash = Some(decoded);
                         }
+                        icur = next_i;
+                    }
+                    "requirement" => {
+                        let (req, next_i) =
+                            find_next_tag(inner, fval_start, "string").ok_or_else(|| {
+                                anyhow!("missing <string> for requirement of {path_key:?}")
+                            })?;
+                        let unescaped = xml_unescape(req.trim());
+                        if !unescaped.is_empty() {
+                            entry.requirement = Some(unescaped);
+                        }
+                        icur = next_i;
                     }
                     _ => {
                         // Skip `<data>`, `<string>`, `<true/>`, `<false/>`, `<dict>`, etc.
@@ -854,11 +875,18 @@ fn write_receipt(cache_dir: &Path, receipt: &VerifyReceipt) -> Result<()> {
     Ok(())
 }
 
-/// Returns `true` if `rel` (relative to `<App>.app/Contents/`) is excluded from `CodeResources`
-/// `files2` by Apple's v2 default bundle resource rules (nested code directories, `Info.plist`,
-/// `PkgInfo`, `_CodeSignature/`, `.DS_Store`, `*.lproj/locversion.plist`).
-fn is_omitted_or_nested_code_rel(rel: &str) -> bool {
-    if rel == "Info.plist"
+/// Returns `true` ONLY for bundle metadata paths that Apple's v2 default resource rules
+/// intentionally exclude from `CodeResources` `files2` (already verified via Mach-O special
+/// slots or outer `codesign --verify --strict --ignore-resources`):
+/// `Info.plist` (slot -1), `PkgInfo`, `_CodeSignature/*` (slot -3), `.DS_Store`,
+/// `Resources/*.lproj/locversion.plist`, and the bundle's main `MacOS/<CFBundleExecutable>`.
+///
+/// Nested code directories (`MacOS/` helpers, `Frameworks/`, `PlugIns/`, etc.) are NOT
+/// skipped here so every nested Mach-O binary/dylib/framework is explicitly verified against
+/// its sealed `requirement`/`cdhash` and unsealed additions/deletions are always caught.
+fn is_omitted_bundle_metadata_rel(rel: &str, main_exec_rel: &str) -> bool {
+    if rel == main_exec_rel
+        || rel == "Info.plist"
         || rel == "PkgInfo"
         || rel == "_CodeSignature"
         || rel.starts_with("_CodeSignature/")
@@ -868,32 +896,28 @@ fn is_omitted_or_nested_code_rel(rel: &str) -> bool {
     if rel == ".DS_Store" || rel.ends_with("/.DS_Store") {
         return true;
     }
-    for prefix in [
-        "MacOS/",
-        "Frameworks/",
-        "SharedFrameworks/",
-        "PlugIns/",
-        "Plug-ins/",
-        "XPCServices/",
-        "Helpers/",
-        "Library/Automator/",
-        "Library/Spotlight/",
-        "Library/LoginItems/",
-    ] {
-        if rel.starts_with(prefix) || rel == prefix.trim_end_matches('/') {
-            return true;
-        }
-    }
     if rel.starts_with("Resources/") && rel.ends_with(".lproj/locversion.plist") {
         return true;
     }
     false
 }
 
-/// Walk `<App>.app/Contents/` without following symlinks and collect every non-omitted regular file
-/// and symlink keyed by its `Contents/`-relative forward-slash path.
-fn collect_bundle_resource_entries(contents_dir: &Path) -> Result<BTreeMap<String, bool>> {
-    // bool: true => symlink, false => regular file
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskEntryKind {
+    File,
+    Symlink,
+    NestedCodeDir,
+}
+
+/// Walk `<App>.app/Contents/` without following symlinks and collect every non-omitted entry
+/// keyed by its `Contents/`-relative forward-slash path. Nested code bundle directories present
+/// in `files2` (e.g. `Frameworks/Foo.framework`) are recorded as `NestedCodeDir` without
+/// descending so their own `codesign --verify --deep --strict -R ...` verifies them recursively.
+fn collect_bundle_entries(
+    contents_dir: &Path,
+    main_exec_rel: &str,
+    files2: &BTreeMap<String, CodeResourcesEntry>,
+) -> Result<BTreeMap<String, DiskEntryKind>> {
     let mut found = BTreeMap::new();
     let mut stack = vec![contents_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -910,36 +934,119 @@ fn collect_bundle_resource_entries(contents_dir: &Path) -> Result<BTreeMap<Strin
                 .unwrap_or(&p)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if is_omitted_or_nested_code_rel(&rel) {
+            if is_omitted_bundle_metadata_rel(&rel, main_exec_rel) {
                 continue;
             }
             if ft.is_symlink() {
-                found.insert(rel, true);
+                found.insert(rel, DiskEntryKind::Symlink);
             } else if ft.is_dir() {
-                stack.push(p);
+                if files2
+                    .get(&rel)
+                    .is_some_and(CodeResourcesEntry::is_nested_code)
+                {
+                    found.insert(rel, DiskEntryKind::NestedCodeDir);
+                } else {
+                    stack.push(p);
+                }
             } else if ft.is_file() {
-                found.insert(rel, false);
+                found.insert(rel, DiskEntryKind::File);
             }
         }
     }
     Ok(found)
 }
 
-fn resolve_bundle_executable(app_path: &Path) -> Result<PathBuf> {
+fn resolve_bundle_executable(app_path: &Path) -> Result<(String, PathBuf)> {
     let plist_path = app_path.join("Contents/Info.plist");
     let plist_xml = fs::read_to_string(&plist_path)
         .with_context(|| format!("reading {}", plist_path.display()))?;
     let exec_name = extract_plist_string(&plist_xml, "CFBundleExecutable")
         .ok_or_else(|| anyhow!("missing CFBundleExecutable in {}", plist_path.display()))?;
-    Ok(app_path.join("Contents/MacOS").join(exec_name))
+    let rel = format!("MacOS/{exec_name}");
+    let full = app_path.join("Contents/MacOS").join(exec_name);
+    Ok((rel, full))
+}
+
+/// Verify all nested code objects sealed in `files2` in parallel via Apple's
+/// `codesign --verify --deep --strict -R <sealed_requirement_or_cdhash>`.
+///
+/// This validates both each nested Mach-O/bundle's own code signature AND that it satisfies
+/// the enclosing `.app`'s sealed requirement/cdhash (catching byte tampering, replacement with
+/// unsigned files, AND ad-hoc re-signing by an attacker).
+#[cfg(target_os = "macos")]
+fn verify_nested_code_objects(
+    nested_jobs: &[(String, PathBuf, CodeResourcesEntry)],
+) -> Result<Vec<String>> {
+    if nested_jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(nested_jobs.len().max(1));
+    let next_idx = AtomicUsize::new(0);
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let i = next_idx.fetch_add(1, Ordering::Relaxed);
+                let Some((rel, full_path, entry)) = nested_jobs.get(i) else {
+                    break;
+                };
+                let req_expr = if let Some(ref req) = entry.requirement {
+                    format!("={req}")
+                } else if let Some(ref cdh) = entry.cdhash {
+                    format!("=cdhash H\"{}\"", hex_encode(cdh))
+                } else {
+                    failures.lock().unwrap().push(format!(
+                        "{rel} (missing both requirement and cdhash in CodeResources)"
+                    ));
+                    continue;
+                };
+                match Command::new("codesign")
+                    .args(["--verify", "--deep", "--strict", "-R", &req_expr])
+                    .arg(full_path)
+                    .output()
+                {
+                    Ok(out) if out.status.success() => {}
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        failures
+                            .lock()
+                            .unwrap()
+                            .push(format!("{rel} ({err})"));
+                    }
+                    Err(e) => {
+                        failures
+                            .lock()
+                            .unwrap()
+                            .push(format!("{rel} (could not invoke codesign: {e})"));
+                    }
+                }
+            });
+        }
+    });
+
+    let mut fails = failures.into_inner().unwrap();
+    fails.sort();
+    Ok(fails)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_nested_code_objects(
+    _nested_jobs: &[(String, PathBuf, CodeResourcesEntry)],
+) -> Result<Vec<String>> {
+    Ok(Vec::new())
 }
 
 /// Record an external verification receipt immediately after `codesign --force --sign - <App>.app`
 /// has sealed `Contents/_CodeSignature/CodeResources`, so a subsequent `bundle-verify` on the
 /// unchanged payload does not have to re-hash 100+ GiB of read-only game assets.
 ///
-/// Performs a fast (~20 ms) sanity check (`codesign --verify --deep --strict --ignore-resources`
-/// plus `CodeDirectory` slot `-3` vs `SHA256(CodeResources)`) before recording the receipt.
+/// Performs a fast sanity check (`codesign --verify --strict --ignore-resources`, all nested
+/// Mach-O signatures + sealed requirements, and `CodeDirectory` slot `-3` vs `SHA256(CodeResources)`)
+/// before recording the receipt.
 pub fn record_bundle_signing_receipt(app_path: &Path) -> Result<Option<String>> {
     let cache_dir = verify_receipt_cache_dir();
     record_bundle_signing_receipt_in(app_path, cache_dir.as_deref())
@@ -956,10 +1063,10 @@ pub fn record_bundle_signing_receipt_in(
     #[cfg(target_os = "macos")]
     {
         let shallow = Command::new("codesign")
-            .args(["--verify", "--deep", "--strict", "--ignore-resources"])
+            .args(["--verify", "--strict", "--ignore-resources"])
             .arg(app_path)
             .output()
-            .context("running codesign --verify --ignore-resources")?;
+            .context("running codesign --verify --strict --ignore-resources")?;
         if !shallow.status.success() {
             bail!(
                 "codesign shallow verify failed right after signing: {}",
@@ -968,7 +1075,7 @@ pub fn record_bundle_signing_receipt_in(
         }
     }
 
-    let exec_path = resolve_bundle_executable(app_path)?;
+    let (_main_exec_rel, exec_path) = resolve_bundle_executable(app_path)?;
     let cd = read_macho_code_directory_info(&exec_path)?;
     let cr_path = app_path.join("Contents/_CodeSignature/CodeResources");
     let cr_bytes = fs::read(&cr_path)
@@ -981,6 +1088,19 @@ pub fn record_bundle_signing_receipt_in(
     let cr_xml = String::from_utf8_lossy(&cr_bytes);
     let files2 = parse_code_resources_files2(&cr_xml)?;
     let contents_dir = app_path.join("Contents");
+
+    let nested_jobs: Vec<(String, PathBuf, CodeResourcesEntry)> = files2
+        .iter()
+        .filter(|(_, item)| item.is_nested_code())
+        .map(|(rel, item)| (rel.clone(), contents_dir.join(rel), item.clone()))
+        .collect();
+    let nested_failures = verify_nested_code_objects(&nested_jobs)?;
+    if !nested_failures.is_empty() {
+        bail!(
+            "nested code signature verification failed right after signing: {}",
+            nested_failures.join("; ")
+        );
+    }
 
     let mut entries = BTreeMap::new();
     for (rel, item) in &files2 {
@@ -1043,13 +1163,15 @@ pub fn verify_bundle_codesign_fast_in(
 ) -> Result<FastCodesignVerifyResult> {
     let t0 = Instant::now();
 
-    // Step 1: Verify all Mach-O binaries (nested dylibs, helpers, main launcher), Info.plist,
-    // strict bundle structure, and symlink policy via Apple's `codesign`.
+    // Step 1: Verify the main `CFBundleExecutable`, Info.plist (slot -1), requirements,
+    // and strict outer bundle structure via Apple's `codesign`. Note that `--ignore-resources`
+    // also skips nested-code validation in Apple's `StaticCode`, so Step 3b explicitly verifies
+    // every nested Mach-O helper/dylib/framework against its sealed `requirement`/`cdhash`.
     let shallow = Command::new("codesign")
-        .args(["--verify", "--deep", "--strict", "--ignore-resources"])
+        .args(["--verify", "--strict", "--ignore-resources"])
         .arg(app_path)
         .output()
-        .context("invoking codesign --verify --deep --strict --ignore-resources")?;
+        .context("invoking codesign --verify --strict --ignore-resources")?;
     if !shallow.status.success() {
         return Ok(FastCodesignVerifyResult {
             passed: false,
@@ -1068,7 +1190,7 @@ pub fn verify_bundle_codesign_fast_in(
 
     // Step 2: Cryptographically bind `Contents/_CodeSignature/CodeResources` to the signed
     // Mach-O `CodeDirectory` special slot `-3` (`CSSLOT_RESOURCEDIR`).
-    let exec_path = match resolve_bundle_executable(app_path) {
+    let (main_exec_rel, exec_path) = match resolve_bundle_executable(app_path) {
         Ok(p) => p,
         Err(e) => {
             return Ok(FastCodesignVerifyResult {
@@ -1127,38 +1249,42 @@ pub fn verify_bundle_codesign_fast_in(
         Ok(m) => m,
         Err(_) => return fallback_apple_codesign_verify(app_path, t0),
     };
-    if files2
-        .iter()
-        .any(|(rel, e)| !is_omitted_or_nested_code_rel(rel) && e.is_cdhash)
-    {
-        // Nested code objects sealed by cdhash outside standard nested code dirs:
-        // delegate to Apple's full check.
-        return fallback_apple_codesign_verify(app_path, t0);
-    }
 
-    // Step 3: Walk `Contents/` and verify exact file/symlink set against `files2`.
+    // Step 3: Walk `Contents/` (including `MacOS/` helpers and `Frameworks/`) and verify the
+    // exact set of files, symlinks, and nested code objects against `files2`.
     let contents_dir = app_path.join("Contents");
-    let disk_entries = collect_bundle_resource_entries(&contents_dir)?;
+    let disk_entries = collect_bundle_entries(&contents_dir, &main_exec_rel, &files2)?;
 
     let mut unsealed_added = Vec::new();
     let mut bad_symlinks = Vec::new();
-    for (rel, &is_sym) in &disk_entries {
+    let mut nested_code_jobs: Vec<(String, PathBuf, CodeResourcesEntry)> = Vec::new();
+    for (rel, &kind) in &disk_entries {
         let Some(sealed) = files2.get(rel) else {
             unsealed_added.push(rel.clone());
             continue;
         };
-        if is_sym {
-            let raw_target = fs::read_link(contents_dir.join(rel))
-                .ok()
-                .map(|t| t.to_string_lossy().into_owned());
-            if sealed.symlink.as_deref() != raw_target.as_deref() {
-                bad_symlinks.push(format!(
-                    "{rel} (expected {:?}, got {:?})",
-                    sealed.symlink, raw_target
-                ));
+        match kind {
+            DiskEntryKind::Symlink => {
+                let raw_target = fs::read_link(contents_dir.join(rel))
+                    .ok()
+                    .map(|t| t.to_string_lossy().into_owned());
+                if sealed.symlink.as_deref() != raw_target.as_deref() {
+                    bad_symlinks.push(format!(
+                        "{rel} (expected {:?}, got {:?})",
+                        sealed.symlink, raw_target
+                    ));
+                }
             }
-        } else if sealed.hash2.is_none() {
-            bad_symlinks.push(format!("{rel} (expected symlink, found regular file)"));
+            DiskEntryKind::NestedCodeDir => {
+                nested_code_jobs.push((rel.clone(), contents_dir.join(rel), sealed.clone()));
+            }
+            DiskEntryKind::File => {
+                if sealed.is_nested_code() {
+                    nested_code_jobs.push((rel.clone(), contents_dir.join(rel), sealed.clone()));
+                } else if sealed.hash2.is_none() {
+                    bad_symlinks.push(format!("{rel} (expected symlink, found regular file)"));
+                }
+            }
         }
     }
     if !unsealed_added.is_empty() {
@@ -1206,7 +1332,7 @@ pub fn verify_bundle_codesign_fast_in(
     let disk_keys: BTreeSet<&str> = disk_entries.keys().map(String::as_str).collect();
     let mut missing_sealed = Vec::new();
     for (rel, entry) in &files2 {
-        if is_omitted_or_nested_code_rel(rel) {
+        if is_omitted_bundle_metadata_rel(rel, &main_exec_rel) {
             continue;
         }
         if !entry.optional && !disk_keys.contains(rel.as_str()) {
@@ -1225,6 +1351,32 @@ pub fn verify_bundle_codesign_fast_in(
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            cdhash_short: Some(cdhash_short),
+            hashed_files: 0,
+            hashed_bytes: 0,
+            receipt_verified_files: 0,
+            receipt_verified_bytes: 0,
+            elapsed_secs: t0.elapsed().as_secs_f64(),
+        });
+    }
+
+    // Step 3b: Verify EVERY nested code object (helpers under `MacOS/`, dylibs/frameworks under
+    // `Frameworks/`, etc.) fresh against its own code signature AND its sealed requirement/cdhash.
+    let nested_verified = nested_code_jobs.len();
+    let nested_failures = verify_nested_code_objects(&nested_code_jobs)?;
+    if !nested_failures.is_empty() {
+        return Ok(FastCodesignVerifyResult {
+            passed: false,
+            detail: format!(
+                "codesign verify failed: {} nested code signature(s) invalid: {}",
+                nested_failures.len(),
+                nested_failures
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
             cdhash_short: Some(cdhash_short),
             hashed_files: 0,
@@ -1262,11 +1414,17 @@ pub fn verify_bundle_codesign_fast_in(
     let mut receipt_verified_bytes = 0u64;
     let mut game_receipt_entries: BTreeMap<String, ReceiptRecord> = BTreeMap::new();
 
-    for (rel, &is_sym) in &disk_entries {
-        if is_sym {
+    for (rel, &kind) in &disk_entries {
+        if kind != DiskEntryKind::File {
             continue;
         }
-        let Some(expected) = files2.get(rel).and_then(|e| e.hash2) else {
+        let Some(sealed) = files2.get(rel) else {
+            continue;
+        };
+        if sealed.is_nested_code() {
+            continue;
+        }
+        let Some(expected) = sealed.hash2 else {
             continue;
         };
         let full_path = contents_dir.join(rel);
@@ -1394,7 +1552,7 @@ pub fn verify_bundle_codesign_fast_in(
 
     let detail = if receipt_verified_files > 0 {
         format!(
-            "codesign --verify --deep --strict --ignore-resources OK + CodeResources slot-3 OK; hashed {hashed_files} file(s) ({:.2} MiB) + {receipt_verified_files} Game/ file(s) ({:.2} GiB) unchanged since CDHash {cdhash_short} receipt ({elapsed:.2}s; pass --full to re-hash)",
+            "codesign --verify --strict --ignore-resources OK + {nested_verified} nested code signature(s) OK + CodeResources slot-3 OK; hashed {hashed_files} file(s) ({:.2} MiB) + {receipt_verified_files} Game/ file(s) ({:.2} GiB) unchanged since CDHash {cdhash_short} receipt ({elapsed:.2}s; pass --full to re-hash)",
             hashed_bytes as f64 / (1024.0 * 1024.0),
             receipt_verified_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         )
@@ -1405,7 +1563,7 @@ pub fn verify_bundle_codesign_fast_in(
             format!("{:.2} MiB", hashed_bytes as f64 / (1024.0 * 1024.0))
         };
         format!(
-            "codesign --verify --deep --strict --ignore-resources OK + CodeResources slot-3 OK + parallel SHA-256 verified {hashed_files} sealed file(s) ({size_desc}) in {elapsed:.2}s ({threads} thread(s))"
+            "codesign --verify --strict --ignore-resources OK + {nested_verified} nested code signature(s) OK + CodeResources slot-3 OK + parallel SHA-256 verified {hashed_files} sealed file(s) ({size_desc}) in {elapsed:.2}s ({threads} thread(s))"
         )
     };
 
@@ -1562,7 +1720,32 @@ mod tests {
         assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
         fs::copy(&exe, &helper).unwrap();
 
-        // Sign nested helper first, then the `.app` bundle ONCE (never double-signing `CFBundleExecutable`).
+        let dylib_rs = root.path().join("nested_dylib.rs");
+        fs::write(
+            &dylib_rs,
+            "#[no_mangle]\npub extern \"C\" fn helper_fn() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        let dylib = frameworks.join("libnested.dylib");
+        let st_dy = Command::new("rustc")
+            .args([
+                "--edition=2021",
+                "--crate-type",
+                "cdylib",
+                &dylib_rs.to_string_lossy(),
+                "-o",
+                &dylib.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            st_dy.status.success(),
+            "{}",
+            String::from_utf8_lossy(&st_dy.stderr)
+        );
+
+        // Sign nested helper and dylib first, then the `.app` bundle ONCE (never double-signing `CFBundleExecutable`).
+        codesign_ad_hoc(&dylib);
         codesign_ad_hoc(&helper);
         codesign_ad_hoc_checked(&app_dir).unwrap();
 
@@ -1580,11 +1763,12 @@ mod tests {
         );
 
         // 1. Default fast verify hits the receipt for `Resources/Game/*` (zero redundant payload hashes)
-        //    while still hashing non-Game files (`game.toml`).
+        //    while verifying both nested Mach-O signatures and hashing non-Game files (`game.toml`).
         let fast = verify_bundle_codesign_fast_in(&app_dir, false, Some(&receipt_cache)).unwrap();
         assert!(fast.passed, "fast verify failed: {}", fast.detail);
         assert_eq!(fast.receipt_verified_files, 2);
         assert_eq!(fast.hashed_files, 1); // game.toml
+        assert!(fast.detail.contains("2 nested code signature(s) OK"), "{}", fast.detail);
         assert!(fast.detail.contains("pass --full to re-hash"));
 
         // 2. Explicit `full_rehash = true` bypasses the receipt and hashes all 3 regular sealed files in parallel.
@@ -1592,6 +1776,7 @@ mod tests {
         assert!(full.passed, "full verify failed: {}", full.detail);
         assert_eq!(full.receipt_verified_files, 0);
         assert_eq!(full.hashed_files, 3);
+        assert!(full.detail.contains("2 nested code signature(s) OK"), "{}", full.detail);
         assert!(full.detail.contains("parallel SHA-256 verified 3 sealed file(s)"));
 
         // 3. Tamper with a `Game/` payload file (different size/mtime): default verify MUST detect and FAIL!
@@ -1608,7 +1793,7 @@ mod tests {
         assert!(res_tamper.detail.contains("asset1.bin"), "{}", res_tamper.detail);
         fs::write(game_dir.join("asset1.bin"), &orig_asset1).unwrap();
 
-        // 4. Inject an extra unsealed file: MUST FAIL!
+        // 4. Inject an extra unsealed file in Resources/Game: MUST FAIL!
         let extra = game_dir.join("injected.txt");
         fs::write(&extra, b"UNSEALED").unwrap();
         let res_added = verify_bundle_codesign_fast_in(&app_dir, false, Some(&receipt_cache)).unwrap();
@@ -1642,5 +1827,109 @@ mod tests {
         assert!(!res_cr.passed, "tampered CodeResources must fail slot -3 check");
         assert!(res_cr.detail.contains("slot -3"), "{}", res_cr.detail);
         fs::write(&cr_path, &orig_cr).unwrap();
+
+        // 8. Tamper with a nested helper Mach-O (`Contents/MacOS/port-runner`): MUST FAIL in BOTH
+        //    default and `--full` modes!
+        let orig_helper = fs::read(&helper).unwrap();
+        let mut bad_helper = orig_helper.clone();
+        let mid = bad_helper.len() / 2;
+        bad_helper[mid] ^= 0xFF;
+        fs::write(&helper, &bad_helper).unwrap();
+        for full_flag in [false, true] {
+            let res_helper =
+                verify_bundle_codesign_fast_in(&app_dir, full_flag, Some(&receipt_cache)).unwrap();
+            assert!(
+                !res_helper.passed,
+                "tampered nested helper must fail verification (full_rehash={full_flag})"
+            );
+            assert!(
+                res_helper.detail.contains("MacOS/port-runner"),
+                "{}",
+                res_helper.detail
+            );
+        }
+        fs::write(&helper, &orig_helper).unwrap();
+
+        // 9. Replace AND ad-hoc re-sign a nested dylib (`Contents/Frameworks/libnested.dylib`):
+        //    even though the dylib has a valid standalone signature, its CDHash no longer satisfies
+        //    the bundle's sealed requirement, so verification MUST FAIL!
+        let orig_dylib = fs::read(&dylib).unwrap();
+        let alt_dylib_rs = root.path().join("alt_dylib.rs");
+        fs::write(
+            &alt_dylib_rs,
+            "#[no_mangle]\npub extern \"C\" fn helper_fn() -> u32 { 99 }\n",
+        )
+        .unwrap();
+        let st_alt = Command::new("rustc")
+            .args([
+                "--edition=2021",
+                "--crate-type",
+                "cdylib",
+                &alt_dylib_rs.to_string_lossy(),
+                "-o",
+                &dylib.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(st_alt.status.success());
+        codesign_ad_hoc(&dylib);
+        assert_ne!(
+            fs::read(&dylib).unwrap(),
+            orig_dylib,
+            "rebuilt alt dylib must have different bytes/CDHash"
+        );
+        let res_resigned =
+            verify_bundle_codesign_fast_in(&app_dir, true, Some(&receipt_cache)).unwrap();
+        assert!(
+            !res_resigned.passed,
+            "swapped & re-signed nested dylib must fail sealed requirement check"
+        );
+        assert!(
+            res_resigned.detail.contains("Frameworks/libnested.dylib"),
+            "{}",
+            res_resigned.detail
+        );
+        fs::write(&dylib, &orig_dylib).unwrap();
+
+        // 10. Delete a sealed nested dylib: MUST FAIL!
+        fs::remove_file(&dylib).unwrap();
+        let res_del_dylib =
+            verify_bundle_codesign_fast_in(&app_dir, false, Some(&receipt_cache)).unwrap();
+        assert!(!res_del_dylib.passed, "deleted nested dylib must fail verification");
+        assert!(
+            res_del_dylib.detail.contains("Frameworks/libnested.dylib"),
+            "{}",
+            res_del_dylib.detail
+        );
+        fs::write(&dylib, &orig_dylib).unwrap();
+
+        // 11. Drop an unsealed extra file inside `Contents/Frameworks/` or `Contents/MacOS/`: MUST FAIL!
+        let unsealed_fw = frameworks.join("evil.dylib");
+        fs::copy(&dylib, &unsealed_fw).unwrap();
+        let res_extra_fw =
+            verify_bundle_codesign_fast_in(&app_dir, false, Some(&receipt_cache)).unwrap();
+        assert!(!res_extra_fw.passed, "unsealed extra dylib in Frameworks/ must fail");
+        assert!(
+            res_extra_fw.detail.contains("Frameworks/evil.dylib"),
+            "{}",
+            res_extra_fw.detail
+        );
+        fs::remove_file(&unsealed_fw).unwrap();
+
+        let unsealed_helper = macos.join("evil_helper");
+        fs::copy(&helper, &unsealed_helper).unwrap();
+        let res_extra_helper =
+            verify_bundle_codesign_fast_in(&app_dir, false, Some(&receipt_cache)).unwrap();
+        assert!(!res_extra_helper.passed, "unsealed extra helper in MacOS/ must fail");
+        assert!(
+            res_extra_helper.detail.contains("MacOS/evil_helper"),
+            "{}",
+            res_extra_helper.detail
+        );
+        fs::remove_file(&unsealed_helper).unwrap();
+
+        // Final sanity check: restored bundle passes cleanly again!
+        let final_ok = verify_bundle_codesign_fast_in(&app_dir, false, Some(&receipt_cache)).unwrap();
+        assert!(final_ok.passed, "restored bundle should pass: {}", final_ok.detail);
     }
 }
