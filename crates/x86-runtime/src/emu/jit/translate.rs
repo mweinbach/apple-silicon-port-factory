@@ -151,6 +151,12 @@ pub(super) enum Chk {
     Abs(bool),
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only override for `PORT_JIT_STACK_TSO` on this thread.
+    pub(in crate::emu) static TEST_STACK_TSO: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+}
+
 /// `PORT_JIT_STACK_TSO` / `AW2_JIT_STACK_TSO` (default 0 in production, 1 in unit tests):
 /// TSO ordering (`ldapr`/`stlr`) for rsp-relative stack accesses in translated code.
 /// Stack slots are thread-private (and any cross-thread publication happens through a heap/
@@ -159,6 +165,9 @@ pub(super) enum Chk {
 pub(super) fn stack_tso() -> bool {
     #[cfg(test)]
     {
+        if let Some(v) = TEST_STACK_TSO.with(|c| c.get()) {
+            return v;
+        }
         if let Ok(s) = std::env::var("PORT_JIT_STACK_TSO").or_else(|_| std::env::var("AW2_JIT_STACK_TSO")) {
             return s.trim() != "0";
         }
@@ -2158,6 +2167,15 @@ impl Tr<'_> {
         }
     }
 
+    /// Whether PE `IMAGE_VOLATILE_METADATA::VolatileAccessTable` explicitly marks instruction `k`
+    /// as a volatile/atomic memory access.
+    #[inline(always)]
+    pub(super) fn is_explicit_volatile(&self, k: usize) -> bool {
+        self.vol_meta
+            .as_ref()
+            .is_some_and(|m| m.is_volatile_access_va(self.ops[k].ip))
+    }
+
     /// Whether PE `IMAGE_VOLATILE_METADATA` certifies that instruction `k` is a non-volatile
     /// memory access whose TSO ordering may be safely elided. Explicit `LOCK` atomics and
     /// fences never call this and remain unconditionally ordered.
@@ -2169,28 +2187,51 @@ impl Tr<'_> {
     }
 
     /// Whether a non-atomic scalar load/store at instruction `k` requires TSO ordering.
+    ///
+    /// Explicit `VolatileAccessTable` entries take precedence over the `PORT_JIT_STACK_TSO=0`
+    /// stack-slot shortcut: Windows binaries can share the address of a stack-allocated volatile
+    /// or atomic variable with another thread, and MSVC `/volatileMetadata` marks those `[rsp+disp]`
+    /// accesses explicitly.
     #[inline(always)]
     pub(super) fn scalar_tso(&self, k: usize, chk: Chk, ld: bool) -> bool {
-        mem::tso()
-            && (chk != Chk::Stack || stack_tso())
-            && !(chk == Chk::Ro && ld)
-            && !self.can_elide_tso(k)
+        if !mem::tso() || (chk == Chk::Ro && ld) {
+            return false;
+        }
+        if self.is_explicit_volatile(k) {
+            return true;
+        }
+        if chk == Chk::Stack && !stack_tso() {
+            return false;
+        }
+        !self.can_elide_tso(k)
     }
 
     /// Whether a 128/256-bit vector load/store at instruction `k` requires TSO barriers.
     #[inline(always)]
     pub(super) fn vec_tso(&self, k: usize, chk: Chk, ld: bool) -> bool {
-        mem::tso_vec()
-            && (chk != Chk::Stack || stack_tso())
-            && !(chk == Chk::Ro && ld)
-            && !self.can_elide_tso(k)
+        if !mem::tso_vec() || (chk == Chk::Ro && ld) {
+            return false;
+        }
+        if self.is_explicit_volatile(k) {
+            return true;
+        }
+        if chk == Chk::Stack && !stack_tso() {
+            return false;
+        }
+        !self.can_elide_tso(k)
     }
 
     /// Whether a bulk string/memcpy instruction (`rep movs`/`stos`/`lods`/`scas`/`cmps`) at
     /// instruction `k` requires TSO ordering.
     #[inline(always)]
     pub(super) fn memcpy_tso(&self, k: usize) -> bool {
-        mem::tso_memcpy() && !self.can_elide_tso(k)
+        if !mem::tso_memcpy() {
+            return false;
+        }
+        if self.is_explicit_volatile(k) {
+            return true;
+        }
+        !self.can_elide_tso(k)
     }
 
     /// `AW2_JIT_MEMCHK` bit 3: displacement for `ldapur`/`stlur [x23, #disp]` if op `k`'s

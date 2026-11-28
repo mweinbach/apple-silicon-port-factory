@@ -152,6 +152,11 @@ pub(super) fn tso_memcpy() -> bool {
 
 /// Whether PE `IMAGE_LOAD_CONFIG_DIRECTORY64.VolatileMetadataPointer` TSO elision is enabled
 /// (`PORT_JIT_VOLATILE_META`, default off; opt in with `PORT_JIT_VOLATILE_META=1`).
+///
+/// Kept opt-in because real-world Windows x86-64 binaries frequently rely on hardware x86-TSO
+/// load-load and store-store ordering for non-volatile lock-free structures (e.g. in-band MPSC
+/// ring-buffer slot headers) that MSVC `/volatileMetadata` omits from `VolatileAccessTable`.
+/// Eliding TSO on those accesses causes ARM64 reordering races even when all stores retain `stlr`.
 #[inline(always)]
 pub(super) fn volatile_meta_enabled() -> bool {
     #[cfg(test)]

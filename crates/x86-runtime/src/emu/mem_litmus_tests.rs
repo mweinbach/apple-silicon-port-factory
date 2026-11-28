@@ -749,3 +749,148 @@ fn litmus_mp_interp_string_ops_honor_memcpy_tso_override() {
         "interpreter stosq/lodsq MP failed under PORT_JIT_TSO=0 + PORT_JIT_TSO_MEMCPY=1"
     );
 }
+
+/// Regression litmus modeling the x86-TSO MPSC ring-buffer pattern where an in-band slot header
+/// (written immediately before `lock inc` and polled by the consumer before reading payload) is
+/// NOT annotated `volatile`/`std::atomic` and is therefore omitted from PE `VolatileAccessTable`
+/// despite residing inside a covered `VolatileInfoRangeTable` range.
+///
+/// With `PORT_JIT_VOLATILE_META` defaulting off, full TSO ordering (`stlr`/`ldapr`) is preserved
+/// on both the non-volatile commit store and the non-volatile consumer poll, yielding 0 stale reads
+/// across interpreter, JIT, and AOT execution.
+#[test]
+fn litmus_mpsc_non_volatile_header_preserved_by_default_off() {
+    let mut code = CodeBuf::new(0x4000);
+    let base = code.base();
+    let prod_ip = base + 0x100;
+    let cons_ip = base + 0x200;
+
+    // Producer(rcx = &payload, rdx = &header, r8 = &counter, r9 = iter):
+    //   mov [rcx], r9        ; payload store (non-volatile)
+    //   mov [rdx], r9        ; in-band slot header commit (non-volatile, omitted from VolatileAccessTable)
+    //   lock inc qword [r8]  ; atomic produced_count bump
+    //   ret
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(qword_ptr(rcx), r9).unwrap();
+    a.mov(qword_ptr(rdx), r9).unwrap();
+    a.lock().inc(qword_ptr(r8)).unwrap();
+    a.ret().unwrap();
+    code.put(0x100, &a.assemble(prod_ip).unwrap());
+
+    // Consumer(rcx = &payload, rdx = &header, r8 = iter) -> rax = payload:
+    //   spin:
+    //     cmp [rdx], r8      ; non-volatile slot header poll (omitted from VolatileAccessTable)
+    //     jne spin
+    //   mov rax, [rcx]       ; payload load (no data dependency on [rdx], only control dependency!)
+    //   ret
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut spin = a.create_label();
+    a.set_label(&mut spin).unwrap();
+    a.cmp(qword_ptr(rdx), r8).unwrap();
+    a.jne(spin).unwrap();
+    a.mov(rax, qword_ptr(rcx)).unwrap();
+    a.ret().unwrap();
+    code.put(0x200, &a.assemble(cons_ip).unwrap());
+
+    // Register PE VolatileMetadata covering both producer and consumer with an EMPTY
+    // VolatileAccessTable (exact model of MSVC omitting non-volatile MPSC slot header accesses).
+    struct DefaultOffGuard {
+        base: u64,
+        prev_env: Option<std::ffi::OsString>,
+    }
+    impl Drop for DefaultOffGuard {
+        fn drop(&mut self) {
+            crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+            match self.prev_env.take() {
+                Some(v) => std::env::set_var("PORT_JIT_VOLATILE_META", v),
+                None => std::env::remove_var("PORT_JIT_VOLATILE_META"),
+            }
+            aot::test_unregister_volatile_meta(self.base);
+        }
+    }
+    struct WorkerDefaultOffGuard;
+    impl WorkerDefaultOffGuard {
+        fn enter() -> Self {
+            crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+            Self
+        }
+    }
+    impl Drop for WorkerDefaultOffGuard {
+        fn drop(&mut self) {
+            crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+        }
+    }
+    let _meta_guard = DefaultOffGuard {
+        base,
+        prev_env: std::env::var_os("PORT_JIT_VOLATILE_META"),
+    };
+    std::env::remove_var("PORT_JIT_VOLATILE_META");
+    crate::emu::mem::TEST_VOLATILE_META.with(|c| c.set(None));
+    assert!(
+        !crate::emu::mem::volatile_meta_enabled(),
+        "PORT_JIT_VOLATILE_META must default off"
+    );
+    aot::test_register_volatile_meta(base, code.len() as u64, &[(0x100, 0x300)], &[]);
+
+    let shared = SharedPair::new();
+    let payload_ptr = shared.a.as_ptr() as u64;
+    let header_ptr = shared.b.as_ptr() as u64;
+    let counter = AtomicU64::new(0);
+    let counter_ptr = &counter as *const AtomicU64 as u64;
+
+    for mode in [ExecMode::Interp, ExecMode::Jit, ExecMode::Aot] {
+        let _aot = if mode == ExecMode::Aot {
+            let (live, _, _) = unsafe { aot::test_install(&[prod_ip, cons_ip], || {}) };
+            assert!(live >= 2);
+            Some(AotGuard)
+        } else {
+            None
+        };
+
+        let iters = if mode == ExecMode::Interp { 1000u64 } else { 4000u64 };
+        let start_bar = Barrier::new(2);
+        let end_bar = Barrier::new(2);
+        let stale = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            let sb_r = &start_bar;
+            let eb_r = &end_bar;
+            let stale_r = &stale;
+            let shared_r = &*shared;
+            let t_cons = s.spawn(move || {
+                let _vol_w = WorkerDefaultOffGuard::enter();
+                let g = ParticipantGuard::enter(mode, "mpsc-nv-header-consumer");
+                for iter in 1..=iters {
+                    sb_r.wait();
+                    let got = unsafe { call_va8(cons_ip, payload_ptr, header_ptr, iter, 0, 0, 0, 0, 0) };
+                    if got != iter {
+                        stale_r.fetch_add(1, Ordering::Relaxed);
+                    }
+                    eb_r.wait();
+                }
+                g.verify_and_exit();
+            });
+            let t_prod = s.spawn(move || {
+                let _vol_w = WorkerDefaultOffGuard::enter();
+                let g = ParticipantGuard::enter(mode, "mpsc-nv-header-producer");
+                for iter in 1..=iters {
+                    shared_r.a[0].store(0, Ordering::SeqCst);
+                    shared_r.b[0].store(0, Ordering::SeqCst);
+                    sb_r.wait();
+                    unsafe {
+                        call_va8(prod_ip, payload_ptr, header_ptr, counter_ptr, iter, 0, 0, 0, 0);
+                    }
+                    eb_r.wait();
+                }
+                g.verify_and_exit();
+            });
+            t_prod.join().unwrap();
+            t_cons.join().unwrap();
+        });
+
+        assert_eq!(
+            stale.load(Ordering::Relaxed),
+            0,
+            "MPSC non-volatile header litmus observed stale payload in {mode:?}"
+        );
+    }
+}
