@@ -925,7 +925,8 @@ pub unsafe extern "win64" fn memcpy_s(d: *mut c_void, dsz: usize, s: *const c_vo
         invalid_parameter("memcpy_s");
         return e;
     }
-    std::ptr::copy_nonoverlapping(s as *const u8, d as *mut u8, n);
+    // Match MSVC tolerance for overlapping/unaligned guest buffers without debug ub_checks panics.
+    std::ptr::copy(s as *const u8, d as *mut u8, n);
     0
 }
 pub unsafe extern "win64" fn memmove_s(d: *mut c_void, dsz: usize, s: *const c_void, n: usize) -> i32 {
@@ -976,7 +977,7 @@ pub unsafe extern "win64" fn wcslen(s: *const u16) -> usize {
 }
 pub unsafe extern "win64" fn wcsnlen(s: *const u16, n: usize) -> usize {
     let mut i = 0;
-    while i < n && *s.add(i) != 0 {
+    while i < n && s.add(i).read_unaligned() != 0 {
         i += 1;
     }
     i
@@ -1279,7 +1280,7 @@ pub unsafe extern "win64" fn _wcsdup(s: *const u16) -> *mut u16 {
     let n = wcslen(s) + 1;
     let p = heap::alloc(n * 2, false) as *mut u16;
     if !p.is_null() {
-        std::ptr::copy_nonoverlapping(s, p, n);
+        std::ptr::copy_nonoverlapping(s as *const u8, p as *mut u8, n * 2);
     }
     p
 }
@@ -1534,6 +1535,21 @@ mod tests {
             let mut buf = [0u8; 4];
             assert_eq!(strncpy_s(buf.as_mut_ptr(), 4, b"hello\0".as_ptr(), TRUNCATE), STRUNCATE);
             assert_eq!(&buf, b"hel\0");
+
+            // memcpy_s tolerates overlapping buffers and _wcsdup tolerates odd-aligned wide strings.
+            let mut ov = *b"abcdefgh";
+            assert_eq!(memcpy_s(ov.as_mut_ptr().add(2).cast(), 6, ov.as_ptr().add(1).cast(), 4), 0);
+            assert_eq!(&ov, b"abbcdegh");
+            let mut raw_w = [0u8; 11];
+            for (i, u) in [b'H' as u16, b'i' as u16, 0u16].iter().enumerate() {
+                raw_w[1 + i * 2..1 + (i + 1) * 2].copy_from_slice(&u.to_le_bytes());
+            }
+            let odd_ws = raw_w.as_ptr().add(1) as *const u16;
+            assert!(!odd_ws.is_aligned());
+            let dup = _wcsdup(odd_ws);
+            assert!(!dup.is_null());
+            assert_eq!(crate::strings::from_wide(dup), "Hi");
+            crate::ucrt::heap::free(dup.cast());
         }
     }
 }

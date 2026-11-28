@@ -29,8 +29,10 @@ pub static ORDINALS: &[(u16, &str)] = &[];
 
 #[inline(never)]
 pub unsafe extern "win64" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    // MSVC x64 vcruntime140!memcpy aliases memmove and tolerates overlapping and unaligned ranges;
+    // using `ptr::copy` avoids Rust debug-mode `ub_checks` panics on overlapping guest copies.
     if n != 0 && !dst.is_null() && !src.is_null() {
-        std::ptr::copy_nonoverlapping(src.cast::<u8>(), dst.cast::<u8>(), n);
+        std::ptr::copy(src.cast::<u8>(), dst.cast::<u8>(), n);
     }
     dst
 }
@@ -819,6 +821,15 @@ mod tests {
             assert_eq!(std::ptr::read_unaligned(jb.as_ptr().add(0x58) as *const u32), 0x1F80);
             assert_eq!(&jb[0x60..0x70], &[6u8; 16]);
             assert_eq!(&jb[0xF0..0x100], &[15u8; 16]);
+
+            // memcpy must tolerate overlapping (forward, backward, self) and unaligned guest pointers.
+            let mut ov = *b"0123456789ABCDEF";
+            assert_eq!(memcpy(ov.as_mut_ptr().add(3).cast(), ov.as_ptr().add(1).cast(), 8), ov.as_mut_ptr().add(3).cast());
+            assert_eq!(&ov, b"01212345678BCDEF");
+            assert_eq!(memcpy(ov.as_mut_ptr().add(1).cast(), ov.as_ptr().add(3).cast(), 8), ov.as_mut_ptr().add(1).cast());
+            assert_eq!(&ov, b"01234567878BCDEF");
+            assert_eq!(memcpy(ov.as_mut_ptr().add(1).cast(), ov.as_ptr().add(1).cast(), 6), ov.as_mut_ptr().add(1).cast());
+            assert_eq!(&ov, b"01234567878BCDEF");
         }
     }
 }

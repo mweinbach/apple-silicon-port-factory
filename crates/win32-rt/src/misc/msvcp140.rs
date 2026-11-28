@@ -1179,11 +1179,11 @@ unsafe extern "win64" fn locimp_new_bool(transparent: u8) -> *mut Locimp {
     if dst.is_null() {
         return dst;
     }
-    (*dst).vtable = FACET_VTABLE.as_ptr();
-    (*dst).refs = AtomicU32::new(1);
-    (*dst).catmask = 0x3f;
-    (*dst).transparent = transparent;
-    (*dst).cloc_inline_name[0] = b'C';
+    write_field(dst, std::mem::offset_of!(Locimp, vtable), FACET_VTABLE.as_ptr());
+    write_field(dst, std::mem::offset_of!(Locimp, refs), 1u32);
+    write_field(dst, std::mem::offset_of!(Locimp, catmask), 0x3fi32);
+    write_field(dst, std::mem::offset_of!(Locimp, transparent), transparent);
+    write_field(dst, std::mem::offset_of!(Locimp, cloc_inline_name), b'C');
     dst
 }
 
@@ -1326,7 +1326,7 @@ static CTYPE_CHAR_VTABLE: [Ptr; 11] = [
 
 unsafe extern "win64" fn ctype_deleting_dtor(this: *mut CtypeChar, flags: u32) -> *mut CtypeChar {
     if !this.is_null() {
-        (*this).vtable = FACET_VTABLE.as_ptr();
+        write_field(this, std::mem::offset_of!(CtypeChar, vtable), FACET_VTABLE.as_ptr());
         if (flags & 1) != 0 {
             crate::ucrt::heap::free(this.cast());
         }
@@ -1469,7 +1469,7 @@ static CTYPE_W_VTABLE: [Ptr; 15] = [
 
 unsafe extern "win64" fn ctype_w_deleting_dtor(this: *mut CtypeW, flags: u32) -> *mut CtypeW {
     if !this.is_null() {
-        (*this).vtable = FACET_VTABLE.as_ptr();
+        write_field(this, std::mem::offset_of!(CtypeW, vtable), FACET_VTABLE.as_ptr());
         if (flags & 1) != 0 {
             crate::ucrt::heap::free(this.cast());
         }
@@ -1675,12 +1675,12 @@ unsafe extern "win64" fn ctype_w_getcat(ppf: *mut *const Facet, _ploc: *const c_
     if !ppf.is_null() && std::ptr::read_unaligned(ppf).is_null() {
         let p = crate::ucrt::heap::calloc(1, std::mem::size_of::<CtypeW>()) as *mut CtypeW;
         if !p.is_null() {
-            (*p).vtable = CTYPE_W_VTABLE.as_ptr();
-            (*p).refs = AtomicU32::new(0);
-            (*p).page = 0;
-            (*p).table = crate::ucrt::string::__pctype_func();
-            (*p).delfl = 0;
-            locinfo_getcvt(std::ptr::null(), &mut (*p).cvt);
+            write_field(p, std::mem::offset_of!(CtypeW, vtable), CTYPE_W_VTABLE.as_ptr());
+            write_field(p, std::mem::offset_of!(CtypeW, refs), 0u32);
+            write_field(p, std::mem::offset_of!(CtypeW, page), 0u32);
+            write_field(p, std::mem::offset_of!(CtypeW, table), crate::ucrt::string::__pctype_func());
+            write_field(p, std::mem::offset_of!(CtypeW, delfl), 0i32);
+            locinfo_getcvt(std::ptr::null(), field_ptr::<_, Cvtvec>(p, std::mem::offset_of!(CtypeW, cvt)));
             std::ptr::write_unaligned(ppf, p.cast());
         }
     }
@@ -4599,6 +4599,25 @@ mod tests {
             let end = ctype_w_toupper_range(cw, wbuf.as_mut_ptr(), wbuf.as_ptr().add(4));
             assert_eq!(end, wbuf.as_ptr().add(4));
             assert_eq!(wbuf, [b'A' as u16, b'B' as u16, b'Z' as u16, b'9' as u16]);
+            // Unaligned caller-supplied ctype<wchar_t> and ctype<char> destroying destructors (flags == 0).
+            let mut raw_cw = [0u8; std::mem::size_of::<CtypeW>() + 8];
+            let unaligned_cw = raw_cw.as_mut_ptr().add(1) as *mut CtypeW;
+            assert!(!unaligned_cw.is_aligned());
+            write_field(unaligned_cw, std::mem::offset_of!(CtypeW, vtable), CTYPE_W_VTABLE.as_ptr());
+            assert_eq!(ctype_w_deleting_dtor(unaligned_cw, 0), unaligned_cw);
+            assert_eq!(
+                read_field::<_, *const Ptr>(unaligned_cw, std::mem::offset_of!(CtypeW, vtable)),
+                FACET_VTABLE.as_ptr()
+            );
+            let mut raw_cc = [0u8; std::mem::size_of::<CtypeChar>() + 8];
+            let unaligned_cc = raw_cc.as_mut_ptr().add(1) as *mut CtypeChar;
+            assert!(!unaligned_cc.is_aligned());
+            write_field(unaligned_cc, std::mem::offset_of!(CtypeChar, vtable), CTYPE_CHAR_VTABLE.as_ptr());
+            assert_eq!(ctype_deleting_dtor(unaligned_cc, 0), unaligned_cc);
+            assert_eq!(
+                read_field::<_, *const Ptr>(unaligned_cc, std::mem::offset_of!(CtypeChar, vtable)),
+                FACET_VTABLE.as_ptr()
+            );
             locinfo_dtor(li.as_mut_ptr());
 
             // Narrow basic_streambuf + basic_ios + ios_base helpers.
