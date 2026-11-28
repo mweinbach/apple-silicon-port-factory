@@ -49,6 +49,7 @@ impl ComClass for Device {
                     m!("CopyDescriptorsSimple" => super::descheap::copy_descriptors_simple),
                     m!("GetCopyableFootprints" => get_copyable_footprints),
                     m!("GetResourceAllocationInfo" => get_resource_allocation_info),
+                    m!("GetResourceAllocationInfo1" => get_resource_allocation_info1),
                     m!("CreateRootSignature" => create_root_signature),
                     m!("CreateHeap" => create_heap),
                     m!("CreatePlacedResource" => create_placed_resource),
@@ -344,6 +345,52 @@ unsafe extern "win64" fn get_copyable_footprints(
     }
 }
 
+unsafe fn compute_allocation_info(
+    n: u32,
+    descs: *const d3d12_metal::types::ResourceDesc,
+    infos1: *mut d3d12_metal::types::AllocationInfo1,
+) -> d3d12_metal::types::AllocationInfo {
+    use d3d12_metal::types::{AllocationInfo, AllocationInfo1};
+    let fail = AllocationInfo { SizeInBytes: u64::MAX, Alignment: 0 };
+    if n == 0 {
+        return AllocationInfo { SizeInBytes: 0, Alignment: 0 };
+    }
+    if descs.is_null() {
+        return fail;
+    }
+    let (mut size, mut align) = (0u64, 0u64);
+    for i in 0..n as usize {
+        let d = std::ptr::read_unaligned(descs.add(i));
+        match d3d12_metal::metal::resource::allocation_info(&d) {
+            Ok((s, a)) => {
+                let off = size.div_ceil(a).saturating_mul(a);
+                if !infos1.is_null() {
+                    std::ptr::write_unaligned(
+                        infos1.add(i),
+                        AllocationInfo1 { Offset: off, Alignment: a, SizeInBytes: s },
+                    );
+                }
+                size = off.saturating_add(s);
+                align = align.max(a);
+            }
+            Err(e) => {
+                log::debug!(target: "d3d", "GetResourceAllocationInfo({d:?}): {e:?}");
+                if !infos1.is_null() {
+                    for j in 0..n as usize {
+                        std::ptr::write_unaligned(
+                            infos1.add(j),
+                            AllocationInfo1 { Offset: u64::MAX, Alignment: 0, SizeInBytes: u64::MAX },
+                        );
+                    }
+                }
+                return fail;
+            }
+        }
+    }
+    let total = if align > 0 { size.div_ceil(align).saturating_mul(align) } else { size };
+    AllocationInfo { SizeInBytes: total, Alignment: align }
+}
+
 /// Struct return: `D3D12_RESOURCE_ALLOCATION_INFO* (this, ret, mask, n, descs)`.
 unsafe extern "win64" fn get_resource_allocation_info(
     _this: PD,
@@ -352,22 +399,20 @@ unsafe extern "win64" fn get_resource_allocation_info(
     n: u32,
     descs: *const d3d12_metal::types::ResourceDesc,
 ) -> *mut d3d12_metal::types::AllocationInfo {
-    let (mut size, mut align) = (0u64, 0u64);
-    for i in 0..n as usize {
-        let d = &*descs.add(i);
-        match d3d12_metal::metal::resource::allocation_info(d) {
-            Ok((s, a)) => {
-                size = size.div_ceil(a) * a + s;
-                align = align.max(a);
-            }
-            Err(e) => {
-                log::warn!(target: "d3d", "GetResourceAllocationInfo({d:?}): {e:?}");
-                *ret = d3d12_metal::types::AllocationInfo { SizeInBytes: u64::MAX, Alignment: 0 };
-                return ret;
-            }
-        }
-    }
-    *ret = d3d12_metal::types::AllocationInfo { SizeInBytes: size, Alignment: align };
+    std::ptr::write_unaligned(ret, compute_allocation_info(n, descs, std::ptr::null_mut()));
+    ret
+}
+
+/// Struct return: `D3D12_RESOURCE_ALLOCATION_INFO* (this, ret, mask, n, descs, infos1)`.
+unsafe extern "win64" fn get_resource_allocation_info1(
+    _this: PD,
+    ret: *mut d3d12_metal::types::AllocationInfo,
+    _mask: u32,
+    n: u32,
+    descs: *const d3d12_metal::types::ResourceDesc,
+    infos1: *mut d3d12_metal::types::AllocationInfo1,
+) -> *mut d3d12_metal::types::AllocationInfo {
+    std::ptr::write_unaligned(ret, compute_allocation_info(n, descs, infos1));
     ret
 }
 
@@ -497,5 +542,69 @@ unsafe extern "win64" fn enqueue_make_resident(_this: PD, _flags: u32, _n: u32, 
 unsafe extern "win64" fn set_residency_priority(_this: PD, _n: u32, _objects: *const *mut c_void, _priorities: *const u32) -> HRESULT {
     S_OK
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use d3d12_metal::metal::resource::{DEFAULT_ALIGNMENT, SMALL_ALIGNMENT};
+    use d3d12_metal::types::{dim, AllocationInfo, AllocationInfo1, ResourceDesc};
+
+    #[test]
+    fn get_resource_allocation_info_rejects_unsupported_4k_and_populates_info1() {
+        if d3d12_metal::metal::device().is_none() {
+            return;
+        }
+        unsafe {
+            // 128x128x32 mips=4 R8_UNORM requires 16 KiB on Metal, so Alignment=4096 must
+            // return SizeInBytes=UINT64_MAX, Alignment=0 (D3D12 small-alignment probe failure).
+            let probe_4k = ResourceDesc {
+                Dimension: dim::TEXTURE2D,
+                Alignment: SMALL_ALIGNMENT,
+                Width: 128,
+                Height: 128,
+                DepthOrArraySize: 32,
+                MipLevels: 4,
+                Format: 61,
+                SampleCount: 1,
+                ..Default::default()
+            };
+            let mut info = AllocationInfo::default();
+            get_resource_allocation_info(std::ptr::null_mut(), &mut info, 0, 1, &probe_4k);
+            assert_eq!(info, AllocationInfo { SizeInBytes: u64::MAX, Alignment: 0 });
+
+            // Multi-resource GetResourceAllocationInfo1 with a 4 KiB small texture + 64 KiB array.
+            let small = ResourceDesc {
+                Dimension: dim::TEXTURE2D,
+                Alignment: SMALL_ALIGNMENT,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: 61,
+                SampleCount: 1,
+                ..Default::default()
+            };
+            let large = ResourceDesc { Alignment: 0, ..probe_4k };
+            let descs = [small, large];
+            let mut infos1 = [AllocationInfo1::default(); 2];
+            get_resource_allocation_info1(
+                std::ptr::null_mut(),
+                &mut info,
+                0,
+                2,
+                descs.as_ptr(),
+                infos1.as_mut_ptr(),
+            );
+            assert_eq!(infos1[0].Offset, 0);
+            assert_eq!(infos1[0].Alignment, SMALL_ALIGNMENT);
+            assert!(infos1[0].SizeInBytes >= SMALL_ALIGNMENT);
+            assert_eq!(infos1[1].Alignment, DEFAULT_ALIGNMENT);
+            assert_eq!(infos1[1].Offset, DEFAULT_ALIGNMENT);
+            assert_eq!(info.Alignment, DEFAULT_ALIGNMENT);
+            assert_eq!(info.SizeInBytes, infos1[1].Offset + infos1[1].SizeInBytes);
+        }
+    }
+}
+
 
 
