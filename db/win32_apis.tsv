@@ -3361,7 +3361,7 @@ ucrtbase.dll	_open	-	CRT_STL	real	win32_rt::ucrt::stdio::_open	crates/win32-rt/s
 ucrtbase.dll	_open_osfhandle	-	CRT_STL	real	win32_rt::ucrt::stdio::_open_osfhandle	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_pclose	-	CRT_STL	real	win32_rt::ucrt::stdio::_pclose	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_pipe	-	CRT_STL	real	win32_rt::ucrt::stdio::_pipe	crates/win32-rt/src/ucrt/stdio.rs
-ucrtbase.dll	_popen	-	CRT_STL	partial	win32_rt::ucrt::stdio::_popen	crates/win32-rt/src/ucrt/stdio.rs
+ucrtbase.dll	_popen	-	CRT_STL	real	win32_rt::ucrt::stdio::_popen	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_putc_nolock	-	CRT_STL	real	win32_rt::ucrt::stdio::_putc_nolock	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_putenv	-	CRT_STL	real	win32_rt::ucrt::env::_putenv	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_putenv_s	-	CRT_STL	real	win32_rt::ucrt::env::_putenv_s	crates/win32-rt/src/ucrt/env.rs

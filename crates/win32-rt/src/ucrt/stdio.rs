@@ -2215,8 +2215,10 @@ pub unsafe extern "win64" fn _popen(command: *const u8, mode: *const u8) -> *mut
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // Native-unsupported on iOS: the iOS sandbox forbids spawning `/bin/sh`
+        // subprocesses (`posix_spawn` returns EPERM/EACCES).
         let _ = cmd_str;
-        crate::stub!("_popen unsupported on this platform");
+        log::debug!("_popen: subprocess spawning unsupported on non-macOS sandbox -> EACCES");
         errno::set(EACCES);
         std::ptr::null_mut()
     }
