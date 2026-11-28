@@ -835,10 +835,8 @@ pub(crate) fn resolve_placement_alignment(desc: &ResourceDesc, mtl_align: u64) -
         };
     }
 
-    let forbids_small = desc.Layout != 0
-        || (desc.Flags & (resource_flags::ALLOW_RENDER_TARGET | resource_flags::ALLOW_DEPTH_STENCIL)) != 0;
-
     if desc.SampleCount > 1 {
+        let forbids_small_msaa = desc.Layout != 0;
         return match desc.Alignment {
             0 => {
                 let a = if hw_align <= MSAA_ALIGNMENT {
@@ -849,12 +847,17 @@ pub(crate) fn resolve_placement_alignment(desc: &ResourceDesc, mtl_align: u64) -
                 Ok(a)
             }
             MSAA_ALIGNMENT if hw_align <= MSAA_ALIGNMENT => Ok(MSAA_ALIGNMENT),
-            SMALL_MSAA_ALIGNMENT if !forbids_small && hw_align <= SMALL_MSAA_ALIGNMENT => Ok(SMALL_MSAA_ALIGNMENT),
+            SMALL_MSAA_ALIGNMENT if !forbids_small_msaa && hw_align <= SMALL_MSAA_ALIGNMENT => {
+                Ok(SMALL_MSAA_ALIGNMENT)
+            }
             a => Err(CreateError::InvalidArg(format!(
-                "MSAA texture placement alignment {a:#x} unsupported (forbids_small={forbids_small}, Metal requires {hw_align:#x})"
+                "MSAA texture placement alignment {a:#x} unsupported (forbids_small_msaa={forbids_small_msaa}, Metal requires {hw_align:#x})"
             ))),
         };
     }
+
+    let forbids_small = desc.Layout != 0
+        || (desc.Flags & (resource_flags::ALLOW_RENDER_TARGET | resource_flags::ALLOW_DEPTH_STENCIL)) != 0;
 
     match desc.Alignment {
         0 => {

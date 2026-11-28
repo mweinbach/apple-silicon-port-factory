@@ -139,11 +139,22 @@ fn small_4kb_alignment_works_for_genuinely_small_textures_and_rejects_forbidden_
     let bogus = tex2d_desc(64, 64, 1, 1, 61, 1, 0, 16384);
     assert!(matches!(allocation_info(&bogus), Err(CreateError::InvalidArg(_))));
 
-    // MSAA textures: 4 KiB rejected; 0 -> 4 MiB; 64 KiB allowed only when non-RT/non-DSV.
-    let msaa_4k = tex2d_desc(64, 64, 1, 1, 28, 4, 0, SMALL_ALIGNMENT);
+    // MSAA textures: 4 KiB rejected; 0 -> 4 MiB; 64 KiB small-MSAA allowed for RT/DSV with
+    // UNKNOWN layout (and rejected for non-UNKNOWN layouts).
+    let msaa_4k = tex2d_desc(64, 64, 1, 1, 28, 4, resource_flags::ALLOW_RENDER_TARGET, SMALL_ALIGNMENT);
     assert!(matches!(allocation_info(&msaa_4k), Err(CreateError::InvalidArg(_))));
     let msaa_rt_64k = tex2d_desc(64, 64, 1, 1, 28, 4, resource_flags::ALLOW_RENDER_TARGET, SMALL_MSAA_ALIGNMENT);
-    assert!(matches!(allocation_info(&msaa_rt_64k), Err(CreateError::InvalidArg(_))));
+    let (msaa_small_sz, msaa_small_al) =
+        allocation_info(&msaa_rt_64k).expect("small MSAA render target supports 64 KiB alignment");
+    assert_eq!(msaa_small_al, SMALL_MSAA_ALIGNMENT);
+    assert_eq!(msaa_small_sz % SMALL_MSAA_ALIGNMENT, 0);
+    let msaa_heap = default_heap(msaa_small_sz);
+    let placed_msaa = Resource::new_placed_default(&msaa_heap, 0, &msaa_rt_64k, "placed_msaa_64k")
+        .expect("64 KiB-aligned small MSAA RT placement must succeed");
+    assert!(placed_msaa.texture().is_some());
+    let mut msaa_bad_layout = msaa_rt_64k;
+    msaa_bad_layout.Layout = 1; // ROW_MAJOR
+    assert!(matches!(allocation_info(&msaa_bad_layout), Err(CreateError::InvalidArg(_))));
     let msaa_def = tex2d_desc(64, 64, 1, 1, 28, 4, resource_flags::ALLOW_RENDER_TARGET, 0);
     let (_, msaa_al) = allocation_info(&msaa_def).expect("MSAA default alignment");
     assert_eq!(msaa_al, MSAA_ALIGNMENT);
