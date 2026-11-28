@@ -2976,20 +2976,32 @@ pub unsafe extern "win64" fn DrawTextW(
 
 pub unsafe extern "win64" fn DrawFrameControl(
     hdc: usize,
-    lprc: *const RECT,
-    _u_type: u32,
-    _u_state: u32,
+    lprc: *mut RECT,
+    u_type: u32,
+    u_state: u32,
 ) -> BOOL {
+    const DFCS_ADJUSTRECT: u32 = 0x2000;
     if hdc == 0 || lprc.is_null() {
         set_error(e::INVALID_PARAMETER);
         return FALSE;
     }
-    let rc = lprc.read_unaligned();
-    if crate::misc::gdi32::Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom) == FALSE {
-        set_error(e::INVALID_PARAMETER);
-        return FALSE;
+    let mut rc = lprc.read_unaligned();
+    match crate::misc::gdi32::draw_frame_control(hdc, rc.left, rc.top, rc.right, rc.bottom, u_type, u_state) {
+        Ok(inset) => {
+            if (u_state & DFCS_ADJUSTRECT) != 0 {
+                rc.left = rc.left.saturating_add(inset);
+                rc.top = rc.top.saturating_add(inset);
+                rc.right = rc.right.saturating_sub(inset);
+                rc.bottom = rc.bottom.saturating_sub(inset);
+                lprc.write_unaligned(rc);
+            }
+            TRUE
+        }
+        Err(()) => {
+            set_error(e::INVALID_PARAMETER);
+            FALSE
+        }
     }
-    TRUE
 }
 
 #[cfg(test)]
@@ -4116,15 +4128,39 @@ mod tests {
             assert!(lit_inside > 20, "expected rasterized glyph pixels inside lprc, got {lit_inside}");
             assert_eq!(lit_outside, 0, "glyph pixels must be clipped to lprc");
 
+            // 4. DrawFrameControl renders distinct real controls/states into the DIB
+            //    and rejects unsupported control types or null/invalid args.
+            let mut render_ctrl = |u_type: u32, u_state: u32| -> Vec<u8> {
+                buf.fill(0);
+                let mut r = RECT::new(0, 0, 20, 20);
+                assert_eq!(DrawFrameControl(dc, &mut r, u_type, u_state), TRUE);
+                buf[..128 * 20 * 4].to_vec()
+            };
+            let chk_off = render_ctrl(4 /* DFC_BUTTON */, 0x0000 /* DFCS_BUTTONCHECK */);
+            let chk_on = render_ctrl(4, 0x0000 | 0x0400 /* DFCS_CHECKED */);
+            assert_ne!(chk_off, chk_on, "checked checkbox must render a checkmark");
+            let radio_off = render_ctrl(4, 0x0004 /* DFCS_BUTTONRADIO */);
+            let radio_on = render_ctrl(4, 0x0004 | 0x0400 /* DFCS_CHECKED */);
+            assert_ne!(radio_off, radio_on, "checked radio button must render a center dot");
+            assert_ne!(chk_off, radio_off, "checkbox and radio button must render distinct artwork");
+            let cap_close = render_ctrl(1 /* DFC_CAPTION */, 0x0000 /* DFCS_CAPTIONCLOSE */);
+            let scroll_up = render_ctrl(3 /* DFC_SCROLL */, 0x0000 /* DFCS_SCROLLUP */);
+            assert_ne!(cap_close, scroll_up, "caption close and scroll arrow must render distinct glyphs");
+            let push_up = render_ctrl(4, 0x0010 /* DFCS_BUTTONPUSH */);
+            let push_dn = render_ctrl(4, 0x0010 | 0x0200 /* DFCS_PUSHED */);
+            assert_ne!(push_up, push_dn, "pushed button must invert 3D bevel");
+
+            let mut adj_rc = RECT::new(0, 0, 20, 20);
+            assert_eq!(DrawFrameControl(dc, &mut adj_rc, 4, 0x0010 | 0x2000 /* DFCS_ADJUSTRECT */), TRUE);
+            assert_eq!(adj_rc, RECT::new(2, 2, 18, 18));
+
+            let mut frame_rc = RECT::new(0, 0, 16, 16);
+            assert_eq!(DrawFrameControl(dc, &mut frame_rc, 99, 0), FALSE);
+            assert_eq!(DrawFrameControl(0, &mut frame_rc, 4, 0), FALSE);
+            assert_eq!(DrawFrameControl(dc, std::ptr::null_mut(), 4, 0), FALSE);
+
             crate::misc::gdi32::SelectObject(dc, old_bm);
             crate::misc::gdi32::DeleteObject(hbm);
-
-            // 4. DrawFrameControl draws on a valid DC and rejects null/invalid DC.
-            let frame_rc = RECT::new(0, 0, 16, 16);
-            assert_eq!(DrawFrameControl(dc, &frame_rc, 4, 0), TRUE);
-            assert_eq!(DrawFrameControl(0, &frame_rc, 4, 0), FALSE);
-            assert_eq!(DrawFrameControl(dc, std::ptr::null(), 4, 0), FALSE);
-
             crate::misc::gdi32::DeleteDC(dc);
         }
     }

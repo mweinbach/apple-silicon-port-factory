@@ -4,7 +4,7 @@
 use crate::types::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
@@ -113,6 +113,42 @@ struct PenData {
     color: u32,
 }
 
+/// Shared backing storage for a GDI bitmap so in-flight draw operations retain
+/// ownership even if another thread unselects and deletes the bitmap concurrently.
+#[derive(Debug)]
+struct BitmapBuffer {
+    bits_ptr: usize,
+    /// True when `bits_ptr` is externally owned (e.g., a DXGI surface staging buffer)
+    /// and must not be freed on drop.
+    external_bits: bool,
+}
+
+impl BitmapBuffer {
+    fn owned(bits_ptr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            bits_ptr,
+            external_bits: false,
+        })
+    }
+
+    fn external(bits_ptr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            bits_ptr,
+            external_bits: true,
+        })
+    }
+}
+
+impl Drop for BitmapBuffer {
+    fn drop(&mut self) {
+        if self.bits_ptr != 0 && !self.external_bits {
+            unsafe {
+                crate::heap::free(self.bits_ptr as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BitmapData {
     width: usize,
@@ -121,17 +157,19 @@ struct BitmapData {
     planes: u16,
     top_down: bool,
     is_dib: bool,
-    bits_ptr: usize,
+    backing: Arc<BitmapBuffer>,
     stride: usize,
     byte_len: usize,
-    /// True when `bits_ptr` is externally owned (e.g., a DXGI surface staging buffer)
-    /// and must not be freed by `DeleteObject`.
-    external_bits: bool,
 }
 
 impl BitmapData {
+    #[inline]
+    fn bits_ptr(&self) -> usize {
+        self.backing.bits_ptr
+    }
+
     fn row_offset(&self, y: usize) -> Option<usize> {
-        if y >= self.height || self.bits_ptr == 0 {
+        if y >= self.height || self.bits_ptr() == 0 {
             return None;
         }
         let phys_row = if self.top_down { y } else { self.height - 1 - y };
@@ -149,7 +187,7 @@ impl BitmapData {
             return None;
         }
         let row = self.row_offset(uy)?;
-        let base = self.bits_ptr as *const u8;
+        let base = self.bits_ptr() as *const u8;
         match self.bpp {
             32 => {
                 let off = row + ux * 4;
@@ -218,7 +256,7 @@ impl BitmapData {
         let Some(row) = self.row_offset(uy) else {
             return false;
         };
-        let base = self.bits_ptr as *mut u8;
+        let base = self.bits_ptr() as *mut u8;
         match self.bpp {
             32 => {
                 let off = row + ux * 4;
@@ -672,10 +710,9 @@ pub unsafe extern "win64" fn CreateDIBSection(
             planes,
             top_down,
             is_dib: true,
-            bits_ptr: bits as usize,
+            backing: BitmapBuffer::owned(bits as usize),
             stride,
             byte_len: total,
-            external_bits: false,
         }),
     );
     h
@@ -704,10 +741,9 @@ pub(crate) fn create_external_surface_dc(
             planes: 1,
             top_down: true,
             is_dib: true,
-            bits_ptr,
+            backing: BitmapBuffer::external(bits_ptr),
             stride,
             byte_len,
-            external_bits: true,
         }),
     );
     m.insert(hdc, Obj::Dc(dc));
@@ -726,13 +762,19 @@ pub unsafe extern "win64" fn DeleteObject(h: usize) -> BOOL {
         return TRUE; // deleting a stock object is a harmless no-op
     }
     let mut m = objs().lock().unwrap();
+    // Per Win32 GDI contract, reject deleting a bitmap while it is selected into any DC.
+    if matches!(m.get(&h), Some(Obj::Bitmap(_)))
+        && m.values().any(|o| matches!(o, Obj::Dc(dc) if dc.bitmap == h))
+    {
+        return FALSE;
+    }
     match m.remove(&h) {
         Some(Obj::Font(_) | Obj::Brush(_) | Obj::Pen(_) | Obj::Region) => TRUE,
         Some(Obj::Bitmap(bm)) => {
+            // Drop `bm` outside the global object-table lock; `BitmapBuffer::drop` frees
+            // owned storage once the last shared reference (including any in-flight draw) ends.
             drop(m);
-            if bm.bits_ptr != 0 && !bm.external_bits {
-                crate::heap::free(bm.bits_ptr as *mut std::ffi::c_void);
-            }
+            drop(bm);
             TRUE
         }
         Some(dc @ Obj::Dc(_)) => {
@@ -971,10 +1013,9 @@ pub unsafe extern "win64" fn CreateCompatibleBitmap(_hdc: usize, cx: i32, cy: i3
             planes: 1,
             top_down: true,
             is_dib: false,
-            bits_ptr: bits as usize,
+            backing: BitmapBuffer::owned(bits as usize),
             stride,
             byte_len: total,
-            external_bits: false,
         }),
     );
     handle
@@ -1086,7 +1127,7 @@ pub(crate) unsafe fn draw_text_lines(
         )
     };
 
-    if bm.width == 0 || bm.height == 0 || bm.bits_ptr == 0 {
+    if bm.width == 0 || bm.height == 0 || bm.bits_ptr() == 0 {
         return true;
     }
 
@@ -1368,6 +1409,329 @@ unsafe fn rasterize_text_coretext(
     false
 }
 
+/// Renders a standard Windows frame control (`DrawFrameControl`: `DFC_CAPTION`, `DFC_MENU`,
+/// `DFC_SCROLL`, `DFC_BUTTON`, `DFC_POPUPMENU`) directly onto the DC's selected bitmap.
+///
+/// Returns `Ok(adjusted_inset)` on success (where `adjusted_inset` is the border inset for
+/// `DFCS_ADJUSTRECT`), or `Err(())` for an invalid DC or unsupported `u_type`/`u_state` combination.
+pub(crate) unsafe fn draw_frame_control(
+    hdc: usize,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    u_type: u32,
+    u_state: u32,
+) -> Result<i32, ()> {
+    const DFC_CAPTION: u32 = 1;
+    const DFC_MENU: u32 = 2;
+    const DFC_SCROLL: u32 = 3;
+    const DFC_BUTTON: u32 = 4;
+    const DFC_POPUPMENU: u32 = 5;
+
+    const DFCS_INACTIVE: u32 = 0x0100;
+    const DFCS_PUSHED: u32 = 0x0200;
+    const DFCS_CHECKED: u32 = 0x0400;
+    const DFCS_FLAT: u32 = 0x4000;
+    const DFCS_MONO: u32 = 0x8000;
+
+    // Validate control type & subtype up front (never fake success on unsupported control types).
+    let sub = u_state & 0x001F;
+    let supported = match u_type {
+        DFC_CAPTION => matches!(sub, 0..=4), // CLOSE, MIN, MAX, RESTORE, HELP
+        DFC_MENU | DFC_POPUPMENU => matches!(sub, 0 | 1 | 2 | 4), // ARROW, CHECK, BULLET, ARROWRIGHT
+        DFC_SCROLL => matches!(sub, 0 | 1 | 2 | 3 | 5 | 8 | 0x10), // UP, DOWN, LEFT, RIGHT, COMBOBOX, SIZEGRIP, SIZEGRIPRIGHT
+        DFC_BUTTON => matches!(sub, 0 | 1 | 2 | 4 | 8 | 0x10), // CHECK, RADIOIMAGE, RADIOMASK, RADIO, 3STATE, PUSH
+        _ => false,
+    };
+    if !supported {
+        log::warn!("gdi32: DrawFrameControl unsupported u_type={u_type} u_state={u_state:#x}");
+        return Err(());
+    }
+
+    let bm = {
+        let m = objs().lock().unwrap();
+        let Some(Obj::Dc(dc)) = m.get(&hdc) else {
+            return Err(());
+        };
+        match m.get(&dc.bitmap) {
+            Some(Obj::Bitmap(bm)) => bm.clone(),
+            // Valid DC with the default 1x1 stock bitmap (no user DIB selected), matching Rectangle.
+            _ => return Ok(if (u_state & (DFCS_FLAT | DFCS_MONO)) != 0 { 1 } else { 2 }),
+        }
+    };
+
+    let x0 = left.min(right);
+    let x1 = left.max(right);
+    let y0 = top.min(bottom);
+    let y1 = top.max(bottom);
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let inset = if (u_state & (DFCS_FLAT | DFCS_MONO)) != 0 { 1 } else { 2 };
+    if w <= 0 || h <= 0 || bm.width == 0 || bm.height == 0 || bm.bits_ptr() == 0 {
+        return Ok(inset);
+    }
+
+    const FACE: [u8; 4] = [0xD4, 0xD4, 0xD4, 0xFF];
+    const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+    const BLACK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
+    const SHADOW: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
+    const DARK: [u8; 4] = [0x40, 0x40, 0x40, 0xFF];
+
+    let inactive = (u_state & DFCS_INACTIVE) != 0;
+    let pushed = (u_state & DFCS_PUSHED) != 0;
+    let checked = (u_state & DFCS_CHECKED) != 0;
+    let flat = (u_state & DFCS_FLAT) != 0;
+    let mono = (u_state & DFCS_MONO) != 0;
+
+    let fg = if inactive { SHADOW } else { BLACK };
+    let shift = if pushed { 1 } else { 0 };
+
+    let fill_rect = |rx0: i32, ry0: i32, rx1: i32, ry1: i32, c: [u8; 4]| {
+        let cx0 = rx0.max(x0).max(0).min(bm.width as i32);
+        let cy0 = ry0.max(y0).max(0).min(bm.height as i32);
+        let cx1 = rx1.min(x1).min(bm.width as i32);
+        let cy1 = ry1.min(y1).min(bm.height as i32);
+        for py in cy0..cy1 {
+            for px in cx0..cx1 {
+                bm.set_rgba(px, py, c);
+            }
+        }
+    };
+    let set_px = |px: i32, py: i32, c: [u8; 4]| {
+        if px >= x0 && px < x1 && py >= y0 && py < y1 {
+            bm.set_rgba(px, py, c);
+        }
+    };
+    let draw_line = |ax: i32, ay: i32, bx: i32, by: i32, c: [u8; 4]| {
+        let steps = (bx - ax).abs().max((by - ay).abs()).max(1);
+        for s in 0..=steps {
+            let px = ax + ((bx - ax) * s + steps / 2) / steps;
+            let py = ay + ((by - ay) * s + steps / 2) / steps;
+            set_px(px, py, c);
+        }
+    };
+    let draw_bevel = |sunken: bool, bg: [u8; 4]| {
+        fill_rect(x0, y0, x1, y1, bg);
+        if flat || mono {
+            let border = if mono { BLACK } else { DARK };
+            fill_rect(x0, y0, x1, y0 + 1, border);
+            fill_rect(x0, y1 - 1, x1, y1, border);
+            fill_rect(x0, y0, x0 + 1, y1, border);
+            fill_rect(x1 - 1, y0, x1, y1, border);
+        } else if sunken {
+            fill_rect(x0, y0, x1, y0 + 1, SHADOW);
+            fill_rect(x0, y0, x0 + 1, y1, SHADOW);
+            fill_rect(x0 + 1, y0 + 1, x1 - 1, y0 + 2, DARK);
+            fill_rect(x0 + 1, y0 + 1, x0 + 2, y1 - 1, DARK);
+            fill_rect(x0, y1 - 1, x1, y1, WHITE);
+            fill_rect(x1 - 1, y0, x1, y1, WHITE);
+        } else {
+            fill_rect(x0, y0, x1, y0 + 1, WHITE);
+            fill_rect(x0, y0, x0 + 1, y1, WHITE);
+            fill_rect(x0, y1 - 1, x1, y1, DARK);
+            fill_rect(x1 - 1, y0, x1, y1, DARK);
+            if w > 2 && h > 2 {
+                fill_rect(x0 + 1, y1 - 2, x1 - 1, y1 - 1, SHADOW);
+                fill_rect(x1 - 2, y0 + 1, x1 - 1, y1 - 1, SHADOW);
+            }
+        }
+    };
+    let draw_checkmark = |cx0: i32, cy0: i32, cw: i32, ch: i32, c: [u8; 4]| {
+        let p0x = cx0 + cw / 5;
+        let p0y = cy0 + ch / 2;
+        let p1x = cx0 + (cw * 2) / 5;
+        let p1y = cy0 + (ch * 3) / 4;
+        let p2x = cx0 + (cw * 4) / 5;
+        let p2y = cy0 + ch / 4;
+        for dy in 0..=1 {
+            draw_line(p0x, p0y + dy, p1x, p1y + dy, c);
+            draw_line(p1x, p1y + dy, p2x, p2y + dy, c);
+        }
+    };
+    let draw_triangle = |dir: u32, cx: i32, cy: i32, r: i32, c: [u8; 4]| {
+        let rad = r.max(2);
+        match dir {
+            0 => {
+                // Up
+                for dy in -rad..=rad {
+                    let span = ((dy + rad) * rad) / (2 * rad).max(1);
+                    for dx in -span..=span {
+                        set_px(cx + dx, cy + dy, c);
+                    }
+                }
+            }
+            1 => {
+                // Down
+                for dy in -rad..=rad {
+                    let span = ((rad - dy) * rad) / (2 * rad).max(1);
+                    for dx in -span..=span {
+                        set_px(cx + dx, cy + dy, c);
+                    }
+                }
+            }
+            2 => {
+                // Left
+                for dx in -rad..=rad {
+                    let span = ((dx + rad) * rad) / (2 * rad).max(1);
+                    for dy in -span..=span {
+                        set_px(cx + dx, cy + dy, c);
+                    }
+                }
+            }
+            _ => {
+                // Right
+                for dx in -rad..=rad {
+                    let span = ((rad - dx) * rad) / (2 * rad).max(1);
+                    for dy in -span..=span {
+                        set_px(cx + dx, cy + dy, c);
+                    }
+                }
+            }
+        }
+    };
+
+    let cx = x0 + w / 2 + shift;
+    let cy = y0 + h / 2 + shift;
+    let pad = (w.min(h) / 4).max(2);
+
+    match u_type {
+        DFC_BUTTON => match sub {
+            0x10 => {
+                // DFCS_BUTTONPUSH
+                draw_bevel(pushed || checked, if mono { WHITE } else { FACE });
+            }
+            0 | 8 => {
+                // DFCS_BUTTONCHECK / DFCS_BUTTON3STATE
+                let bg = if pushed || inactive || (sub == 8 && checked) { FACE } else { WHITE };
+                draw_bevel(true, bg);
+                if checked {
+                    draw_checkmark(x0 + 2, y0 + 2, (w - 4).max(4), (h - 4).max(4), fg);
+                }
+            }
+            1 | 2 | 4 => {
+                // DFCS_BUTTONRADIO / RADIOIMAGE / RADIOMASK
+                let bg = if pushed || inactive { FACE } else { WHITE };
+                let rad = (w.min(h) / 2 - 1).max(2);
+                let r_out2 = rad * rad;
+                let r_in2 = (rad - 2).max(1) * (rad - 2).max(1);
+                let dot_r2 = (rad / 2).max(1) * (rad / 2).max(1);
+                let rcx = x0 + w / 2;
+                let rcy = y0 + h / 2;
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        let dx = px - rcx;
+                        let dy = py - rcy;
+                        let d2 = dx * dx + dy * dy;
+                        if d2 <= r_out2 {
+                            if d2 >= r_in2 {
+                                let edge = if flat || mono { BLACK } else if dx + dy < 0 { DARK } else { WHITE };
+                                set_px(px, py, edge);
+                            } else if checked && d2 <= dot_r2 {
+                                set_px(px, py, fg);
+                            } else {
+                                set_px(px, py, bg);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => return Err(()),
+        },
+        DFC_CAPTION => {
+            draw_bevel(pushed, if mono { WHITE } else { FACE });
+            let gx0 = x0 + pad + shift;
+            let gy0 = y0 + pad + shift;
+            let gx1 = (x1 - pad - 1 + shift).max(gx0);
+            let gy1 = (y1 - pad - 1 + shift).max(gy0);
+            match sub {
+                0 => {
+                    // DFCS_CAPTIONCLOSE: 'X'
+                    draw_line(gx0, gy0, gx1, gy1, fg);
+                    draw_line(gx0 + 1, gy0, gx1, gy1 - 1, fg);
+                    draw_line(gx0, gy1, gx1, gy0, fg);
+                    draw_line(gx0 + 1, gy1, gx1, gy0 + 1, fg);
+                }
+                1 => {
+                    // DFCS_CAPTIONMIN: bottom underscore bar
+                    fill_rect(gx0, gy1 - 1, gx1 + 1, gy1 + 1, fg);
+                }
+                2 => {
+                    // DFCS_CAPTIONMAX: hollow box with thick top bar
+                    fill_rect(gx0, gy0, gx1 + 1, gy0 + 2, fg);
+                    draw_line(gx0, gy0, gx0, gy1, fg);
+                    draw_line(gx1, gy0, gx1, gy1, fg);
+                    draw_line(gx0, gy1, gx1, gy1, fg);
+                }
+                3 => {
+                    // DFCS_CAPTIONRESTORE: overlapping back + front boxes
+                    let mid_x = (gx0 + gx1) / 2;
+                    let mid_y = (gy0 + gy1) / 2;
+                    draw_line(mid_x, gy0, gx1, gy0, fg);
+                    draw_line(gx1, gy0, gx1, mid_y + 1, fg);
+                    fill_rect(gx0, mid_y, mid_x + 2, mid_y + 2, fg);
+                    draw_line(gx0, mid_y, gx0, gy1, fg);
+                    draw_line(mid_x + 1, mid_y, mid_x + 1, gy1, fg);
+                    draw_line(gx0, gy1, mid_x + 1, gy1, fg);
+                }
+                4 => {
+                    // DFCS_CAPTIONHELP: '?' glyph
+                    draw_line(gx0 + 1, gy0, gx1 - 1, gy0, fg);
+                    draw_line(gx1 - 1, gy0, gx1 - 1, cy, fg);
+                    draw_line(cx, cy, cx, gy1 - 2, fg);
+                    set_px(cx, gy1, fg);
+                }
+                _ => return Err(()),
+            }
+        }
+        DFC_SCROLL => {
+            draw_bevel(pushed, if mono { WHITE } else { FACE });
+            let r = (w.min(h) / 4).max(2);
+            match sub {
+                0 => draw_triangle(0, cx, cy, r, fg), // UP
+                1 | 5 => draw_triangle(1, cx, cy, r, fg), // DOWN / COMBOBOX
+                2 => draw_triangle(2, cx, cy, r, fg), // LEFT
+                3 => draw_triangle(3, cx, cy, r, fg), // RIGHT
+                8 | 0x10 => {
+                    // SIZEGRIP / SIZEGRIPRIGHT: three diagonal grip stripes
+                    for step in [4, 8, 12] {
+                        if sub == 8 {
+                            draw_line(x1 - step, y1 - 1, x1 - 1, y1 - step, fg);
+                        } else {
+                            draw_line(x0 + step, y1 - 1, x0 + 1, y1 - step, fg);
+                        }
+                    }
+                }
+                _ => return Err(()),
+            }
+        }
+        DFC_MENU | DFC_POPUPMENU => {
+            fill_rect(x0, y0, x1, y1, WHITE);
+            let r = (w.min(h) / 4).max(2);
+            match sub {
+                0 => draw_triangle(3, cx, cy, r, fg), // DFCS_MENUARROW (right)
+                1 => draw_checkmark(x0 + 2, y0 + 2, (w - 4).max(4), (h - 4).max(4), fg), // DFCS_MENUCHECK
+                2 => {
+                    // DFCS_MENUBULLET
+                    let br2 = r * r;
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            if dx * dx + dy * dy <= br2 {
+                                set_px(cx + dx, cy + dy, fg);
+                            }
+                        }
+                    }
+                }
+                4 => draw_triangle(2, cx, cy, r, fg), // DFCS_MENUARROWRIGHT (left)
+                _ => return Err(()),
+            }
+        }
+        _ => return Err(()),
+    }
+
+    Ok(inset)
+}
+
 pub unsafe extern "win64" fn TextOutW(
     hdc: usize,
     x: i32,
@@ -1465,10 +1829,9 @@ pub unsafe extern "win64" fn CreateBitmap(
             planes: pl,
             top_down: true,
             is_dib: false,
-            bits_ptr: bits as usize,
+            backing: BitmapBuffer::owned(bits as usize),
             stride,
             byte_len: total,
-            external_bits: false,
         }),
     );
     handle
@@ -1978,7 +2341,7 @@ fn serialize_bitmap(bm: &BitmapData, want_dibsection: bool) -> Vec<u8> {
     out[12..16].copy_from_slice(&(bm.stride as i32).to_le_bytes()); // bmWidthBytes
     out[16..18].copy_from_slice(&bm.planes.to_le_bytes()); // bmPlanes
     out[18..20].copy_from_slice(&bm.bpp.to_le_bytes()); // bmBitsPixel
-    let exposed_bits: usize = if bm.is_dib { bm.bits_ptr } else { 0 };
+    let exposed_bits: usize = if bm.is_dib { bm.bits_ptr() } else { 0 };
     out[24..32].copy_from_slice(&exposed_bits.to_le_bytes()); // bmBits
     if len == 104 {
         // DIBSECTION.dsBmih (BITMAPINFOHEADER @0x20, 40 bytes)
@@ -2055,10 +2418,9 @@ unsafe fn get_object_impl(h: usize, cb: i32, pv: *mut u8, wide: bool) -> i32 {
                 planes: 1,
                 top_down: true,
                 is_dib: false,
-                bits_ptr: 0,
+                backing: BitmapBuffer::external(0),
                 stride: 2,
                 byte_len: 2,
-                external_bits: false,
             };
             Some(serialize_bitmap(&def, false))
         } else {
@@ -2456,6 +2818,17 @@ mod tests {
             assert_eq!(SetStretchBltMode(dc, 0), 0);
             assert_eq!(SetStretchBltMode(dc, 5), 0);
             assert_eq!(SetStretchBltMode(0, 4), 0);
+
+            // DeleteObject must reject deleting a bitmap while it is selected into a DC,
+            // and succeed once unselected.
+            let bmi = make_bmi_header(16, -16, 32);
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbm = CreateDIBSection(dc, bmi.as_ptr(), 0, &mut bits, std::ptr::null_mut(), 0);
+            assert_ne!(hbm, 0);
+            let old = SelectObject(dc, hbm);
+            assert_eq!(DeleteObject(hbm), FALSE, "must reject DeleteObject on selected bitmap");
+            assert_eq!(SelectObject(dc, old), hbm);
+            assert_eq!(DeleteObject(hbm), TRUE);
 
             DeleteDC(dc);
         }

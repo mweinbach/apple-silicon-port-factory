@@ -106,6 +106,64 @@ fn parse_processor_instance(instance: Option<&str>) -> Result<ProcessorTarget, i
     Ok(ProcessorTarget::Core(core))
 }
 
+/// Returns the Windows PDH `\Process(<name>)` instance stem for the current process:
+/// the guest `.exe` file stem when running a Windows PE via `ProcessConfig`, or the
+/// host executable file stem otherwise (matching Windows PDH's extension-stripped name).
+fn current_process_instance_name() -> Option<String> {
+    if let Some(cfg) = crate::process::try_config() {
+        let file = cfg
+            .exe_path
+            .rsplit(['\\', '/'])
+            .next()
+            .filter(|s| !s.is_empty())?;
+        let stem = file
+            .strip_suffix(".exe")
+            .or_else(|| file.strip_suffix(".EXE"))
+            .unwrap_or_else(|| {
+                if let Some(dot) = file.rfind('.') {
+                    if file[dot..].eq_ignore_ascii_case(".exe") {
+                        &file[..dot]
+                    } else {
+                        file
+                    }
+                } else {
+                    file
+                }
+            });
+        return (!stem.is_empty()).then(|| stem.to_string());
+    }
+    let exe = std::env::current_exe().ok()?;
+    let stem = exe.file_stem()?.to_string_lossy().into_owned();
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// Validates that a `\Process(<instance>)\...` counter targets the current process.
+/// Rejects empty instances, `_Total`, other process names, and non-zero `#N` indices
+/// honestly with `PDH_CSTATUS_NO_INSTANCE` rather than substituting the current process.
+fn validate_process_instance(instance: Option<&str>) -> Result<(), i32> {
+    let raw = instance.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return Err(PDH_CSTATUS_NO_INSTANCE);
+    }
+    let base = match raw.split_once('#') {
+        Some((stem, idx)) => {
+            if idx.trim() != "0" {
+                return Err(PDH_CSTATUS_NO_INSTANCE);
+            }
+            stem.trim()
+        }
+        None => raw,
+    };
+    let Some(cur) = current_process_instance_name() else {
+        return Err(PDH_CSTATUS_NO_INSTANCE);
+    };
+    if base.eq_ignore_ascii_case(&cur) {
+        Ok(())
+    } else {
+        Err(PDH_CSTATUS_NO_INSTANCE)
+    }
+}
+
 fn parse_counter_path(path: &str) -> Result<CounterKind, i32> {
     let trimmed = path.trim();
     // Strip optional \\machine prefix and leading '\'.
@@ -150,14 +208,17 @@ fn parse_counter_path(path: &str) -> Result<CounterKind, i32> {
             "% committed bytes in use" => Ok(CounterKind::MemoryCommitPct),
             _ => Err(PDH_CSTATUS_NO_COUNTER),
         },
-        "process" => match ctr_name.as_str() {
-            "working set" => Ok(CounterKind::ProcessWorkingSet),
-            "working set - private" => Ok(CounterKind::ProcessWorkingSetPrivate),
-            "private bytes" => Ok(CounterKind::ProcessPrivateBytes),
-            "virtual bytes" => Ok(CounterKind::ProcessVirtualBytes),
-            "% processor time" => Ok(CounterKind::ProcessProcessorPct),
-            _ => Err(PDH_CSTATUS_NO_COUNTER),
-        },
+        "process" => {
+            validate_process_instance(instance)?;
+            match ctr_name.as_str() {
+                "working set" => Ok(CounterKind::ProcessWorkingSet),
+                "working set - private" => Ok(CounterKind::ProcessWorkingSetPrivate),
+                "private bytes" => Ok(CounterKind::ProcessPrivateBytes),
+                "virtual bytes" => Ok(CounterKind::ProcessVirtualBytes),
+                "% processor time" => Ok(CounterKind::ProcessProcessorPct),
+                _ => Err(PDH_CSTATUS_NO_COUNTER),
+            }
+        }
         "system" => match ctr_name.as_str() {
             "system up time" => Ok(CounterKind::SystemUptimeSec),
             _ => Err(PDH_CSTATUS_NO_COUNTER),
@@ -588,25 +649,43 @@ mod tests {
             let mut c_core0 = 0usize;
             assert_eq!(PdhAddCounterW(q, core0_path.as_ptr(), 0, &mut c_core0), ERROR_SUCCESS);
 
-            let proc_path = to_wide_z("\\Process(self)\\% Processor Time");
+            let cur_proc = current_process_instance_name().expect("current process instance name");
+            let proc_path = to_wide_z(&format!("\\Process({cur_proc})\\% Processor Time"));
             let mut c_proc = 0usize;
             assert_eq!(PdhAddCounterW(q, proc_path.as_ptr(), 0, &mut c_proc), ERROR_SUCCESS);
 
-            let ws_path = to_wide_z("\\Process(self)\\Working Set");
+            let ws_path = to_wide_z(&format!("\\Process({cur_proc}#0)\\Working Set"));
             let mut c_ws = 0usize;
             assert_eq!(PdhAddCounterW(q, ws_path.as_ptr(), 0, &mut c_ws), ERROR_SUCCESS);
 
-            let ws_priv_path = to_wide_z("\\Process(self)\\Working Set - Private");
+            let ws_priv_path = to_wide_z(&format!("\\Process({})\\Working Set - Private", cur_proc.to_ascii_uppercase()));
             let mut c_ws_priv = 0usize;
             assert_eq!(PdhAddCounterW(q, ws_priv_path.as_ptr(), 0, &mut c_ws_priv), ERROR_SUCCESS);
 
-            let priv_path = to_wide_z("\\Process(self)\\Private Bytes");
+            let priv_path = to_wide_z(&format!("\\Process({cur_proc})\\Private Bytes"));
             let mut c_priv = 0usize;
             assert_eq!(PdhAddCounterW(q, priv_path.as_ptr(), 0, &mut c_priv), ERROR_SUCCESS);
 
-            let virt_path = to_wide_z("\\Process(self)\\Virtual Bytes");
+            let virt_path = to_wide_z(&format!("\\Process({cur_proc})\\Virtual Bytes"));
             let mut c_virt = 0usize;
             assert_eq!(PdhAddCounterW(q, virt_path.as_ptr(), 0, &mut c_virt), ERROR_SUCCESS);
+
+            // Other/nonexistent/aggregate Process instances must fail honestly with PDH_CSTATUS_NO_INSTANCE.
+            for bad_proc in [
+                "\\Process(other-process)\\Working Set",
+                "\\Process(_Total)\\Working Set",
+                "\\Process\\Working Set",
+                &format!("\\Process({cur_proc}#1)\\Working Set"),
+            ] {
+                let w = to_wide_z(bad_proc);
+                let mut ch = 1usize;
+                assert_eq!(
+                    PdhAddCounterW(q, w.as_ptr(), 0, &mut ch),
+                    PDH_CSTATUS_NO_INSTANCE,
+                    "expected PDH_CSTATUS_NO_INSTANCE for {bad_proc}"
+                );
+                assert_eq!(ch, 0);
+            }
 
             // Out-of-range or missing processor instance fails honestly with PDH_CSTATUS_NO_INSTANCE.
             let bad_inst = to_wide_z("\\Processor(99999)\\% Processor Time");
