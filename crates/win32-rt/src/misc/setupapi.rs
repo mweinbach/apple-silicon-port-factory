@@ -27,14 +27,18 @@ const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_USER_BUFFER: u32 = 1784;
 const ERROR_INVALID_FLAGS: u32 = 1004;
 const ERROR_NOT_FOUND: u32 = 1168;
+const ERROR_NO_SUCH_DEVICE_INTERFACE: u32 = 0xE000_022E;
 
 const DIGCF_ALLCLASSES: u32 = 0x4;
 const DIGCF_DEVICEINTERFACE: u32 = 0x10;
+const DIODI_NO_ADD: u32 = 0x1;
 const SPINT_ACTIVE: u32 = 1;
 const REG_SZ: u32 = 1;
 const REG_MULTI_SZ: u32 = 7;
 const SPDRP_BASE_CONTAINERID: u32 = 0x24;
 const DEVPROP_TYPE_GUID: u32 = 13;
+const DEVPROP_TYPE_BOOLEAN: u32 = 17;
+const DEVPROP_TYPE_STRING: u32 = 18;
 
 /// HIDClass setup class {745A17A0-74D3-11D0-B6FE-00A0C90F57DA}.
 const GUID_HIDCLASS: [u8; 16] = [0xA0, 0x17, 0x5A, 0x74, 0xD3, 0x74, 0xD0, 0x11, 0xB6, 0xFE, 0x00, 0xA0, 0xC9, 0x0F, 0x57, 0xDA];
@@ -43,6 +47,18 @@ const GUID_HIDCLASS: [u8; 16] = [0xA0, 0x17, 0x5A, 0x74, 0xD3, 0x74, 0xD0, 0x11,
 const DEVPKEY_DEVICE_CONTAINERID_FMTID: [u8; 16] =
     [0x06, 0xD2, 0x7E, 0x8C, 0x8A, 0x3F, 0x27, 0x48, 0xB3, 0xAB, 0xAE, 0x9E, 0x1F, 0xAE, 0xFC, 0x6C];
 const DEVPKEY_DEVICE_CONTAINERID_PID: u32 = 2;
+
+/// DEVPKEY_Device_InstanceId {78C34FC8-104A-4ACA-9EA4-524D52996E57}, 256.
+const DEVPKEY_DEVICE_INSTANCEID_FMTID: [u8; 16] =
+    [0xC8, 0x4F, 0xC3, 0x78, 0x4A, 0x10, 0xCA, 0x4A, 0x9E, 0xA4, 0x52, 0x4D, 0x52, 0x99, 0x6E, 0x57];
+const DEVPKEY_DEVICE_INSTANCEID_PID: u32 = 256;
+
+/// DEVPKEY_DeviceInterface_Enabled (pid 2) and DEVPKEY_DeviceInterface_ClassGuid (pid 3)
+/// {026E516E-B814-414B-83CD-856D6FEF4822}.
+const DEVPKEY_DEVICEINTERFACE_FMTID: [u8; 16] =
+    [0x6E, 0x51, 0x6E, 0x02, 0x14, 0xB8, 0x4B, 0x41, 0x83, 0xCD, 0x85, 0x6D, 0x6F, 0xEF, 0x48, 0x22];
+const DEVPKEY_DEVICEINTERFACE_ENABLED_PID: u32 = 2;
+const DEVPKEY_DEVICEINTERFACE_CLASSGUID_PID: u32 = 3;
 
 const SONY_VID: u16 = 0x054C;
 const DUALSENSE_PID: u16 = 0x0CE6;
@@ -601,6 +617,154 @@ pub unsafe extern "win64" fn SetupDiGetDevicePropertyW(
     }
 }
 
+pub unsafe extern "win64" fn SetupDiOpenDeviceInterfaceW(
+    set: *mut c_void,
+    device_path: LPCWSTR,
+    open_flags: u32,
+    data: *mut u8,
+) -> BOOL {
+    if device_path.is_null() {
+        set_err(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (open_flags & !DIODI_NO_ADD) != 0 {
+        set_err(ERROR_INVALID_FLAGS);
+        return FALSE;
+    }
+    if !data.is_null() && (data as *const u32).read_unaligned() != 32 {
+        set_err(ERROR_INVALID_USER_BUFFER);
+        return FALSE;
+    }
+    let target = crate::strings::from_wide(device_path);
+    let can_add = (open_flags & DIODI_NO_ADD) == 0;
+    if can_add {
+        hid::ensure_started();
+    }
+    let snapshot = if can_add { Some(hid::devices()) } else { None };
+    let mut map = sets().lock().unwrap();
+    let Some(s) = map.get_mut(&(set as usize)) else {
+        set_err(ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let found_idx = s
+        .devices
+        .iter()
+        .position(|d| d.path.eq_ignore_ascii_case(&target))
+        .or_else(|| {
+            let dev = snapshot
+                .as_ref()?
+                .iter()
+                .find(|d| d.path.eq_ignore_ascii_case(&target))?
+                .clone();
+            let idx = s.devices.len();
+            s.devices.push(dev);
+            Some(idx)
+        });
+    let Some(di) = found_idx else {
+        set_err(ERROR_NO_SUCH_DEVICE_INTERFACE);
+        return FALSE;
+    };
+    if !data.is_null() {
+        std::ptr::copy_nonoverlapping(GUID_DEVINTERFACE_HID.as_ptr(), data.add(4), 16);
+        (data.add(20) as *mut u32).write_unaligned(SPINT_ACTIVE);
+        (data.add(24) as *mut usize).write_unaligned(di + 1);
+    }
+    TRUE
+}
+
+pub unsafe extern "win64" fn SetupDiGetDeviceInterfacePropertyW(
+    set: *mut c_void,
+    iface: *const u8,
+    prop_key: *const u8,
+    prop_type: *mut u32,
+    buf: *mut u8,
+    size: u32,
+    required: *mut u32,
+    flags: u32,
+) -> BOOL {
+    if flags != 0 {
+        set_err(ERROR_INVALID_FLAGS);
+        return FALSE;
+    }
+    if prop_key.is_null() {
+        set_err(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(di) = devinfo_index(iface) else {
+        set_err(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    let Some(fmtid) = read_guid(prop_key) else {
+        set_err(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    let pid = (prop_key.add(16) as *const u32).read_unaligned();
+    let Some(res) = with_set(set, |s| {
+        if di >= s.devices.len() {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        if fmtid == DEVPKEY_DEVICE_CONTAINERID_FMTID && pid == DEVPKEY_DEVICE_CONTAINERID_PID {
+            Ok(Some((
+                DEVPROP_TYPE_GUID,
+                guid_to_bytes(&device_container_guid(&s.devices, di)).to_vec(),
+            )))
+        } else if fmtid == DEVPKEY_DEVICEINTERFACE_FMTID
+            && pid == DEVPKEY_DEVICEINTERFACE_CLASSGUID_PID
+        {
+            Ok(Some((DEVPROP_TYPE_GUID, GUID_DEVINTERFACE_HID.to_vec())))
+        } else if fmtid == DEVPKEY_DEVICEINTERFACE_FMTID
+            && pid == DEVPKEY_DEVICEINTERFACE_ENABLED_PID
+        {
+            Ok(Some((DEVPROP_TYPE_BOOLEAN, vec![0xFFu8])))
+        } else if fmtid == DEVPKEY_DEVICE_INSTANCEID_FMTID && pid == DEVPKEY_DEVICE_INSTANCEID_PID
+        {
+            let dev = &s.devices[di];
+            let s_id = format!(
+                "HID\\VID_{:04X}&PID_{:04X}\\{}",
+                dev.desc.vendor_id, dev.desc.product_id, di
+            );
+            let mut bytes = Vec::with_capacity((s_id.len() + 1) * 2);
+            for u in s_id.encode_utf16().chain(std::iter::once(0u16)) {
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+            Ok(Some((DEVPROP_TYPE_STRING, bytes)))
+        } else {
+            Ok(None)
+        }
+    }) else {
+        set_err(ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    match res {
+        Ok(Some((ty, data))) => {
+            let need = data.len() as u32;
+            if !prop_type.is_null() {
+                std::ptr::write_unaligned(prop_type, ty);
+            }
+            if !required.is_null() {
+                std::ptr::write_unaligned(required, need);
+            }
+            if buf.is_null() || size < need {
+                set_err(ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
+            TRUE
+        }
+        Ok(None) => {
+            if !required.is_null() {
+                std::ptr::write_unaligned(required, 0);
+            }
+            set_err(ERROR_NOT_FOUND);
+            FALSE
+        }
+        Err(e) => {
+            set_err(e);
+            FALSE
+        }
+    }
+}
+
 pub unsafe extern "win64" fn SetupGetInfDriverStoreLocationW(
     _file_name: LPCWSTR,
     _alt_platform: *const c_void,
@@ -1043,6 +1207,79 @@ mod tests {
             rel_coll(coll);
             let rel_enum: unsafe extern "win64" fn(P) -> u32 = std::mem::transmute(slot(enum_obj, 2));
             rel_enum(enum_obj);
+        }
+    }
+
+    #[test]
+    fn open_device_interface_and_get_interface_property_w() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        hid::tests::install_fake_dualsense(0xD5_0099);
+        let _ds = FakeDualSenseGuard(0xD5_0099);
+        unsafe {
+            let ds_path = hid::devices()
+                .into_iter()
+                .find(|d| d.desc.id == 0xD5_0099)
+                .expect("fake DualSense installed")
+                .path
+                .clone();
+            let ds_path_upper = crate::strings::to_wide_z(&ds_path.to_ascii_uppercase());
+
+            // Start with an empty device set (unrelated class), then open interface into it.
+            let other_guid = [0x22u8; 16];
+            let set = SetupDiGetClassDevsW(other_guid.as_ptr(), std::ptr::null(), std::ptr::null_mut(), DIGCF_DEVICEINTERFACE);
+            assert!(!set.is_null());
+
+            // DIODI_NO_ADD fails when interface is not yet in the set.
+            let mut ifd = [0u8; 32];
+            ifd[0] = 32;
+            assert_eq!(SetupDiOpenDeviceInterfaceW(set, ds_path_upper.as_ptr(), DIODI_NO_ADD, ifd.as_mut_ptr()), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_NO_SUCH_DEVICE_INTERFACE);
+
+            // Default open adds and populates SP_DEVICE_INTERFACE_DATA.
+            assert_eq!(SetupDiOpenDeviceInterfaceW(set, ds_path_upper.as_ptr(), 0, ifd.as_mut_ptr()), TRUE);
+            assert_eq!(&ifd[4..20], &GUID_DEVINTERFACE_HID);
+
+            // DEVPKEY_DeviceInterface_Enabled -> DEVPROP_TYPE_BOOLEAN (0xFF).
+            let mut key_en = [0u8; 20];
+            key_en[0..16].copy_from_slice(&DEVPKEY_DEVICEINTERFACE_FMTID);
+            key_en[16..20].copy_from_slice(&DEVPKEY_DEVICEINTERFACE_ENABLED_PID.to_le_bytes());
+            let (mut ty, mut req) = (0u32, 0u32);
+            let mut bval = 0u8;
+            assert_eq!(
+                SetupDiGetDeviceInterfacePropertyW(set, ifd.as_ptr(), key_en.as_ptr(), &mut ty, &mut bval, 1, &mut req, 0),
+                TRUE
+            );
+            assert_eq!(ty, DEVPROP_TYPE_BOOLEAN);
+            assert_eq!(req, 1);
+            assert_eq!(bval, 0xFF);
+
+            // DEVPKEY_Device_InstanceId -> DEVPROP_TYPE_STRING.
+            let mut key_id = [0u8; 20];
+            key_id[0..16].copy_from_slice(&DEVPKEY_DEVICE_INSTANCEID_FMTID);
+            key_id[16..20].copy_from_slice(&DEVPKEY_DEVICE_INSTANCEID_PID.to_le_bytes());
+            assert_eq!(
+                SetupDiGetDeviceInterfacePropertyW(set, ifd.as_ptr(), key_id.as_ptr(), &mut ty, std::ptr::null_mut(), 0, &mut req, 0),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(ty, DEVPROP_TYPE_STRING);
+            let mut sbuf = vec![0u8; req as usize];
+            assert_eq!(
+                SetupDiGetDeviceInterfacePropertyW(set, ifd.as_ptr(), key_id.as_ptr(), &mut ty, sbuf.as_mut_ptr(), req, &mut req, 0),
+                TRUE
+            );
+            let inst_str = crate::strings::from_wide(sbuf.as_ptr() as *const u16);
+            assert!(inst_str.starts_with("HID\\VID_054C&PID_0CE6\\"));
+
+            // Unknown property -> ERROR_NOT_FOUND.
+            let bad_key = [0x99u8; 20];
+            assert_eq!(
+                SetupDiGetDeviceInterfacePropertyW(set, ifd.as_ptr(), bad_key.as_ptr(), &mut ty, sbuf.as_mut_ptr(), req, &mut req, 0),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_NOT_FOUND);
+
+            assert_eq!(SetupDiDestroyDeviceInfoList(set), TRUE);
         }
     }
 }

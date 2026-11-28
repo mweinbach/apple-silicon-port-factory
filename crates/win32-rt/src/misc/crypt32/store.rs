@@ -55,8 +55,12 @@ pub(super) const CERT_FIND_EXISTING: u32 = 0x000D_0000;
 pub(super) const CERT_STORE_PROV_MEMORY: usize = 2;
 pub(super) const CERT_STORE_PROV_SYSTEM_A: usize = 9;
 pub(super) const CERT_STORE_PROV_SYSTEM_W: usize = 10;
+pub(super) const CERT_STORE_PROV_COLLECTION: usize = 11;
 pub(super) const CERT_STORE_PROV_SYSTEM_REGISTRY_A: usize = 12;
 pub(super) const CERT_STORE_PROV_SYSTEM_REGISTRY_W: usize = 13;
+
+const CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG: u32 = 0x0000_0002;
+const CERT_FIND_PROP_ONLY_ENHKEY_USAGE_FLAG: u32 = 0x0000_0004;
 #[cfg(test)]
 pub(super) const CERT_SYSTEM_STORE_CURRENT_USER: u32 = 0x0001_0000;
 
@@ -146,8 +150,37 @@ struct RegisteredCert {
 struct RegisteredStore {
     refcount: usize,
     certs: Vec<usize>,
+    /// Sibling stores added via `CertAddStoreToCollection`: `(dwPriority, store_handle)`
+    /// ordered from highest priority to lowest.
+    siblings: Vec<(u32, usize)>,
+    is_collection: bool,
     is_ntauth: bool,
     enum_archived: bool,
+}
+
+fn collect_store_cert_handles_locked(
+    st: &StoreState,
+    store_h: usize,
+    visited: &mut std::collections::HashSet<usize>,
+    out: &mut Vec<usize>,
+) {
+    if !visited.insert(store_h) {
+        return;
+    }
+    if let Some(store) = st.stores.get(&store_h) {
+        out.extend_from_slice(&store.certs);
+        for &(_, sib_h) in &store.siblings {
+            collect_store_cert_handles_locked(st, sib_h, visited, out);
+        }
+    }
+}
+
+fn store_all_cert_handles_locked(st: &StoreState, store_h: usize) -> Option<(Vec<usize>, bool)> {
+    let enum_archived = st.stores.get(&store_h)?.enum_archived;
+    let mut visited = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    collect_store_cert_handles_locked(st, store_h, &mut visited, &mut out);
+    Some((out, enum_archived))
 }
 
 #[derive(Default)]
@@ -470,6 +503,9 @@ fn release_store_locked(st: &mut StoreState, handle: usize) -> bool {
     for cert_h in removed.certs {
         release_cert_locked(st, cert_h);
     }
+    for (_, sib_h) in removed.siblings {
+        release_store_locked(st, sib_h);
+    }
     true
 }
 
@@ -498,9 +534,9 @@ pub(super) fn lookup_cert_for_chain(
     let mut eku_props = HashMap::new();
     let mut collect_store = |store_id: usize| {
         if store_id != 0 {
-            if let Some(store) = st.stores.get(&store_id) {
-                for h in &store.certs {
-                    if let Some(c) = st.certs.get(h) {
+            if let Some((handles, _)) = store_all_cert_handles_locked(&st, store_id) {
+                for h in handles {
+                    if let Some(c) = st.certs.get(&h) {
                         if let Some(raw) = c.properties.get(&CERT_ENHKEY_USAGE_PROP_ID) {
                             if let Some(oids) = parse_eku_der_oids(raw) {
                                 eku_props.insert(c.owned.raw_der().to_vec(), oids);
@@ -550,6 +586,8 @@ pub(crate) fn register_peer_cert_chain(
         RegisteredStore {
             refcount: 1,
             certs: store_certs,
+            siblings: Vec::new(),
+            is_collection: false,
             is_ntauth: false,
             enum_archived: false,
         },
@@ -579,13 +617,13 @@ pub(super) fn store_certs_with_eku_props(
         return (Vec::new(), HashMap::new());
     }
     let st = STORE_STATE.lock().unwrap();
-    let Some(store) = st.stores.get(&(h_cert_store as usize)) else {
+    let Some((handles, _)) = store_all_cert_handles_locked(&st, h_cert_store as usize) else {
         return (Vec::new(), HashMap::new());
     };
-    let mut ders = Vec::with_capacity(store.certs.len());
+    let mut ders = Vec::with_capacity(handles.len());
     let mut eku_props = HashMap::new();
-    for h in &store.certs {
-        if let Some(c) = st.certs.get(h) {
+    for h in handles {
+        if let Some(c) = st.certs.get(&h) {
             let der = c.owned.raw_der().to_vec();
             if let Some(raw) = c.properties.get(&CERT_ENHKEY_USAGE_PROP_ID) {
                 if let Some(oids) = parse_eku_der_oids(raw) {
@@ -614,13 +652,12 @@ pub(crate) unsafe fn copy_store_certs_with_properties(
     }
     let items: Vec<(Vec<u8>, usize)> = {
         let st = STORE_STATE.lock().unwrap();
-        let Some(store) = st.stores.get(&(src_store as usize)) else {
+        let Some((handles, _)) = store_all_cert_handles_locked(&st, src_store as usize) else {
             return;
         };
-        store
-            .certs
-            .iter()
-            .filter_map(|&h| {
+        handles
+            .into_iter()
+            .filter_map(|h| {
                 st.certs
                     .get(&h)
                     .map(|c| (c.owned.raw_der().to_vec(), h))
@@ -735,6 +772,8 @@ fn open_named_system_store(store_name: &str, enum_archived: bool) -> *mut c_void
         RegisteredStore {
             refcount: 1,
             certs,
+            siblings: Vec::new(),
+            is_collection: false,
             is_ntauth,
             enum_archived,
         },
@@ -772,7 +811,11 @@ pub(super) unsafe fn cert_open_store_with_flags_impl(
         || prov_str
             .as_deref()
             .is_some_and(|s| s.eq_ignore_ascii_case("Memory"));
-    if is_memory {
+    let is_collection = prov == CERT_STORE_PROV_COLLECTION
+        || prov_str
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("Collection"));
+    if is_memory || is_collection {
         let mut st = STORE_STATE.lock().unwrap();
         let id = st.next_store_id;
         st.next_store_id += 1;
@@ -781,6 +824,8 @@ pub(super) unsafe fn cert_open_store_with_flags_impl(
             RegisteredStore {
                 refcount: 1,
                 certs: Vec::new(),
+                siblings: Vec::new(),
+                is_collection,
                 is_ntauth: false,
                 enum_archived,
             },
@@ -907,6 +952,143 @@ pub(super) fn cert_close_store_impl(store: *mut c_void) -> BOOL {
     if !release_store_locked(&mut st, store as usize) {
         stub!("CertCloseStore({store:p}): foreign store ignored");
     }
+    TRUE
+}
+
+pub(super) fn cert_add_store_to_collection_impl(
+    h_collection_store: *mut c_void,
+    h_sibling_store: *mut c_void,
+    _dw_update_flags: u32,
+    dw_priority: u32,
+) -> BOOL {
+    if h_collection_store.is_null() || h_sibling_store.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let coll_h = h_collection_store as usize;
+    let sib_h = h_sibling_store as usize;
+    if coll_h == sib_h {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let mut st = STORE_STATE.lock().unwrap();
+    if !st.stores.contains_key(&sib_h) {
+        crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    let Some(is_coll) = st.stores.get(&coll_h).map(|s| s.is_collection) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if !is_coll {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    // Duplicate sibling store reference so the collection holds its own lifetime reference.
+    st.stores.get_mut(&sib_h).unwrap().refcount += 1;
+    let coll = st.stores.get_mut(&coll_h).unwrap();
+    // Highest dwPriority is searched first; equal priority preserves insertion order.
+    let pos = coll
+        .siblings
+        .iter()
+        .position(|&(p, _)| p < dw_priority)
+        .unwrap_or(coll.siblings.len());
+    coll.siblings.insert(pos, (dw_priority, sib_h));
+    TRUE
+}
+
+pub(super) unsafe fn cert_get_enhanced_key_usage_impl(
+    p_cert_context: *const c_void,
+    dw_flags: u32,
+    p_usage: *mut c_void,
+    pcb_usage: *mut u32,
+) -> BOOL {
+    if p_cert_context.is_null() || pcb_usage.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let cc = std::ptr::read_unaligned(p_cert_context as *const CertContext);
+    let der_bytes: &[u8] = if !cc.pb_cert_encoded.is_null() && cc.cb_cert_encoded > 0 {
+        std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize)
+    } else {
+        &[]
+    };
+
+    let ext_oids = super::asn1::cert_eku_oids(der_bytes);
+    let prop_oids = {
+        let st = STORE_STATE.lock().unwrap();
+        st.certs
+            .get(&(p_cert_context as usize))
+            .and_then(|e| e.properties.get(&CERT_ENHKEY_USAGE_PROP_ID))
+            .and_then(|raw| parse_eku_der_oids(raw))
+    };
+
+    let ext_only = (dw_flags & CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG) != 0;
+    let prop_only = (dw_flags & CERT_FIND_PROP_ONLY_ENHKEY_USAGE_FLAG) != 0;
+    let selected: Option<Vec<Vec<u8>>> = match (ext_only, prop_only) {
+        (true, true) => None,
+        (true, false) => ext_oids,
+        (false, true) => prop_oids,
+        (false, false) => match (ext_oids, prop_oids) {
+            (Some(ext), Some(prop)) => Some(ext.into_iter().filter(|o| prop.contains(o)).collect()),
+            (Some(ext), None) => Some(ext),
+            (None, Some(prop)) => Some(prop),
+            (None, None) => None,
+        },
+    };
+
+    let hdr_sz = std::mem::size_of::<super::asn1::CertEnhkeyUsage>(); // 16 bytes on x64
+    let (oid_strs, not_found_all_uses): (Vec<String>, bool) = match selected {
+        None => (Vec::new(), true),
+        Some(oids) => (
+            oids.iter()
+                .filter_map(|raw| wintrust::try_decode_oid_str(raw))
+                .collect(),
+            false,
+        ),
+    };
+
+    let ptrs_sz = oid_strs.len() * std::mem::size_of::<*const u8>();
+    let strs_sz: usize = oid_strs.iter().map(|s| s.len() + 1).sum();
+    let need = (hdr_sz + ptrs_sz + strs_sz) as u32;
+
+    if p_usage.is_null() {
+        std::ptr::write_unaligned(pcb_usage, need);
+        crate::teb::set_last_error(if not_found_all_uses { CRYPT_E_NOT_FOUND } else { 0 });
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pcb_usage);
+    if cap < need {
+        std::ptr::write_unaligned(pcb_usage, need);
+        crate::teb::set_last_error(err::ERROR_MORE_DATA);
+        return FALSE;
+    }
+
+    let base = p_usage as *mut u8;
+    std::ptr::write_bytes(base, 0, need as usize);
+    let rgpsz = if oid_strs.is_empty() {
+        std::ptr::null()
+    } else {
+        let ptr_arr = base.add(hdr_sz) as *mut *const u8;
+        let mut str_off = hdr_sz + ptrs_sz;
+        for (i, s) in oid_strs.iter().enumerate() {
+            let dst = base.add(str_off);
+            std::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+            dst.add(s.len()).write_unaligned(0);
+            std::ptr::write_unaligned(ptr_arr.add(i), dst as *const u8);
+            str_off += s.len() + 1;
+        }
+        ptr_arr as *const *const u8
+    };
+    std::ptr::write_unaligned(
+        p_usage as *mut super::asn1::CertEnhkeyUsage,
+        super::asn1::CertEnhkeyUsage {
+            c_usage_identifier: oid_strs.len() as u32,
+            rgpsz_usage_identifier: rgpsz,
+        },
+    );
+    std::ptr::write_unaligned(pcb_usage, need);
+    crate::teb::set_last_error(if not_found_all_uses { CRYPT_E_NOT_FOUND } else { 0 });
     TRUE
 }
 
@@ -1086,10 +1268,7 @@ pub(super) fn cert_enum_certificates_in_store_impl(
     p_prev_cert_context: *mut c_void,
 ) -> *mut c_void {
     let mut st = STORE_STATE.lock().unwrap();
-    let Some((certs, enum_archived)) = st
-        .stores
-        .get(&(h_cert_store as usize))
-        .map(|s| (s.certs.clone(), s.enum_archived))
+    let Some((certs, enum_archived)) = store_all_cert_handles_locked(&st, h_cert_store as usize)
     else {
         if !p_prev_cert_context.is_null() {
             release_cert_locked(&mut st, p_prev_cert_context as usize);
@@ -1471,10 +1650,7 @@ pub(super) unsafe fn cert_find_certificate_in_store_impl(
     p_prev_cert_context: *mut c_void,
 ) -> *mut c_void {
     let mut st = STORE_STATE.lock().unwrap();
-    let Some((certs, enum_archived)) = st
-        .stores
-        .get(&(h_cert_store as usize))
-        .map(|s| (s.certs.clone(), s.enum_archived))
+    let Some((certs, enum_archived)) = store_all_cert_handles_locked(&st, h_cert_store as usize)
     else {
         if !p_prev_cert_context.is_null() {
             release_cert_locked(&mut st, p_prev_cert_context as usize);

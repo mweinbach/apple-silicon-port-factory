@@ -115,6 +115,29 @@ pub unsafe extern "win64" fn CertCloseStore(store_h: *mut c_void, _flags: u32) -
     store::cert_close_store_impl(store_h)
 }
 
+pub unsafe extern "win64" fn CertAddStoreToCollection(
+    h_collection_store: *mut c_void,
+    h_sibling_store: *mut c_void,
+    dw_update_flags: u32,
+    dw_priority: u32,
+) -> BOOL {
+    store::cert_add_store_to_collection_impl(
+        h_collection_store,
+        h_sibling_store,
+        dw_update_flags,
+        dw_priority,
+    )
+}
+
+pub unsafe extern "win64" fn CertGetEnhancedKeyUsage(
+    p_cert_context: *const c_void,
+    dw_flags: u32,
+    p_usage: *mut c_void,
+    pcb_usage: *mut u32,
+) -> BOOL {
+    store::cert_get_enhanced_key_usage_impl(p_cert_context, dw_flags, p_usage, pcb_usage)
+}
+
 pub unsafe extern "win64" fn CertAddCertificateContextToStore(
     h_cert_store: *mut c_void,
     p_cert_context: *const c_void,

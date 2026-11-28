@@ -2105,6 +2105,60 @@ pub unsafe extern "win64" fn ConvertStringSecurityDescriptorToSecurityDescriptor
     TRUE
 }
 
+/// `BuildExplicitAccessWithNameW`: initializes a 48-byte `EXPLICIT_ACCESS_W`
+/// (`accctrl.h`, x64) with `TRUSTEE_IS_NAME` (1) and `TRUSTEE_IS_UNKNOWN` (0).
+pub unsafe extern "win64" fn BuildExplicitAccessWithNameW(
+    p_explicit_access: *mut u8,
+    p_trustee_name: LPWSTR,
+    access_permissions: u32,
+    access_mode: u32,
+    inheritance: u32,
+) {
+    if p_explicit_access.is_null() {
+        return;
+    }
+    std::ptr::write_bytes(p_explicit_access, 0, 48);
+    std::ptr::write_unaligned(p_explicit_access as *mut u32, access_permissions);
+    std::ptr::write_unaligned(p_explicit_access.add(4) as *mut u32, access_mode);
+    std::ptr::write_unaligned(p_explicit_access.add(8) as *mut u32, inheritance);
+    // TRUSTEE_W starts at +16: pMultipleTrustee@16, MultipleTrusteeOperation@24,
+    // TrusteeForm@28 (= 1 TRUSTEE_IS_NAME), TrusteeType@32 (= 0 TRUSTEE_IS_UNKNOWN),
+    // ptstrName@40.
+    std::ptr::write_unaligned(p_explicit_access.add(28) as *mut u32, 1u32);
+    std::ptr::write_unaligned(p_explicit_access.add(40) as *mut LPWSTR, p_trustee_name);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "win64" fn BuildSecurityDescriptorW(
+    _p_owner: *const u8,
+    _p_group: *const u8,
+    c_access_entries: u32,
+    p_access_entries: *const u8,
+    c_audit_entries: u32,
+    p_audit_entries: *const u8,
+    _p_old_sd: *const u8,
+    p_size_new_sd: *mut u32,
+    p_new_sd: *mut *mut c_void,
+) -> u32 {
+    if p_size_new_sd.is_null()
+        || p_new_sd.is_null()
+        || (c_access_entries > 0 && p_access_entries.is_null())
+        || (c_audit_entries > 0 && p_audit_entries.is_null())
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+    let sd = crate::heap::alloc(40, true) as *mut u8;
+    if sd.is_null() {
+        return crate::types::err::ERROR_NOT_ENOUGH_MEMORY;
+    }
+    // SECURITY_DESCRIPTOR_REVISION (1), SE_SELF_RELATIVE | SE_DACL_PRESENT (0x8004)
+    *sd = 1;
+    std::ptr::write_unaligned(sd.add(2) as *mut u16, 0x8004u16);
+    std::ptr::write_unaligned(p_new_sd, sd as *mut c_void);
+    std::ptr::write_unaligned(p_size_new_sd, 40u32);
+    0 // ERROR_SUCCESS
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "win64" fn AllocateAndInitializeSid(
     auth: *const u8,
@@ -8173,6 +8227,79 @@ mod tests {
                 None => std::env::remove_var("AW2_DRIVE_C"),
             }
             let _ = std::fs::remove_dir_all(&tmp_root);
+        }
+    }
+
+    #[test]
+    fn build_explicit_access_and_security_descriptor_w() {
+        unsafe {
+            let mut trustee = crate::strings::to_wide_z("EVERYONE");
+            let mut ea = [0xAAu8; 48];
+            BuildExplicitAccessWithNameW(ea.as_mut_ptr(), trustee.as_mut_ptr(), 0x1000_0000, 2, 0);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr() as *const u32), 0x1000_0000);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(4) as *const u32), 2);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(8) as *const u32), 0);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(16) as *const usize), 0);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(24) as *const u32), 0);
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(28) as *const u32), 1); // TRUSTEE_IS_NAME
+            assert_eq!(std::ptr::read_unaligned(ea.as_ptr().add(32) as *const u32), 0); // TRUSTEE_IS_UNKNOWN
+            assert_eq!(
+                std::ptr::read_unaligned(ea.as_ptr().add(40) as *const LPWSTR),
+                trustee.as_mut_ptr()
+            );
+
+            // Null output / inconsistent array counts fail with ERROR_INVALID_PARAMETER.
+            let mut sd_size = 0u32;
+            let mut sd_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut sd_size,
+                    &mut sd_ptr,
+                ),
+                ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    ea.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    &mut sd_ptr,
+                ),
+                ERROR_INVALID_PARAMETER
+            );
+
+            // Valid call produces a 40-byte self-relative SD freeable with LocalFree.
+            assert_eq!(
+                BuildSecurityDescriptorW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    ea.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut sd_size,
+                    &mut sd_ptr,
+                ),
+                0
+            );
+            assert_eq!(sd_size, 40);
+            assert!(!sd_ptr.is_null());
+            assert_eq!(*(sd_ptr as *const u8), 1);
+            assert_eq!(std::ptr::read_unaligned((sd_ptr as *const u8).add(2) as *const u16), 0x8004);
+            assert!(crate::kernel32::memory::LocalFree(sd_ptr).is_null());
         }
     }
 }

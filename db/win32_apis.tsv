@@ -2,6 +2,8 @@ dll	symbol	ordinal	category	impl_kind	rust_path	source_file
 advapi32.dll	AdjustTokenPrivileges	-	CORE_OS	real	win32_rt::advapi32::AdjustTokenPrivileges	crates/win32-rt/src/advapi32.rs
 advapi32.dll	AllocateAndInitializeSid	-	CORE_OS	real	win32_rt::advapi32::AllocateAndInitializeSid	crates/win32-rt/src/advapi32.rs
 advapi32.dll	AllocateLocallyUniqueId	-	CORE_OS	real	win32_rt::advapi32::AllocateLocallyUniqueId	crates/win32-rt/src/advapi32.rs
+advapi32.dll	BuildExplicitAccessWithNameW	-	CORE_OS	real	win32_rt::advapi32::BuildExplicitAccessWithNameW	crates/win32-rt/src/advapi32.rs
+advapi32.dll	BuildSecurityDescriptorW	-	CORE_OS	real	win32_rt::advapi32::BuildSecurityDescriptorW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	ChangeServiceConfig2W	-	CORE_OS	real	win32_rt::advapi32::ChangeServiceConfig2W	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CheckTokenMembership	-	CORE_OS	real	win32_rt::advapi32::CheckTokenMembership	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CloseServiceHandle	-	CORE_OS	real	win32_rt::advapi32::CloseServiceHandle	crates/win32-rt/src/advapi32.rs
@@ -372,6 +374,7 @@ comdlg32.dll	ChooseColorW	-	WINDOW_INPUT_COM	real	win32_rt::misc::comdlg32::Choo
 comdlg32.dll	ChooseFontA	-	WINDOW_INPUT_COM	real	win32_rt::misc::comdlg32::ChooseFontA	crates/win32-rt/src/misc/comdlg32.rs
 comdlg32.dll	ChooseFontW	-	WINDOW_INPUT_COM	real	win32_rt::misc::comdlg32::ChooseFontW	crates/win32-rt/src/misc/comdlg32.rs
 comdlg32.dll	CommDlgExtendedError	-	WINDOW_INPUT_COM	real	win32_rt::misc::comdlg32::CommDlgExtendedError	crates/win32-rt/src/misc/comdlg32.rs
+comdlg32.dll	GetFileTitleA	-	WINDOW_INPUT_COM	real	win32_rt::misc::comdlg32::GetFileTitleA	crates/win32-rt/src/misc/comdlg32.rs
 comdlg32.dll	GetOpenFileNameA	-	WINDOW_INPUT_COM	real	win32_rt::misc::comdlg32::GetOpenFileNameA	crates/win32-rt/src/misc/comdlg32.rs
 comdlg32.dll	GetOpenFileNameW	-	WINDOW_INPUT_COM	real	win32_rt::misc::comdlg32::GetOpenFileNameW	crates/win32-rt/src/misc/comdlg32.rs
 comdlg32.dll	GetSaveFileNameA	-	WINDOW_INPUT_COM	real	win32_rt::misc::comdlg32::GetSaveFileNameA	crates/win32-rt/src/misc/comdlg32.rs
@@ -385,6 +388,7 @@ coreclr.dll	coreclr_shutdown	-	CRT_STL	real	win32_rt::misc::coreclr::coreclr_shu
 coreclr.dll	coreclr_shutdown_2	-	CRT_STL	real	win32_rt::misc::coreclr::coreclr_shutdown_2	crates/win32-rt/src/misc/coreclr.rs
 crypt32.dll	CertAddCertificateContextToStore	-	CORE_OS	real	win32_rt::misc::crypt32::CertAddCertificateContextToStore	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertAddEncodedCertificateToStore	-	CORE_OS	real	win32_rt::misc::crypt32::CertAddEncodedCertificateToStore	crates/win32-rt/src/misc/crypt32.rs
+crypt32.dll	CertAddStoreToCollection	-	CORE_OS	real	win32_rt::misc::crypt32::CertAddStoreToCollection	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertCloseStore	-	CORE_OS	real	win32_rt::misc::crypt32::CertCloseStore	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertCompareCertificateName	-	CORE_OS	real	win32_rt::misc::crypt32::CertCompareCertificateName	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertCompareIntegerBlob	-	CORE_OS	real	win32_rt::misc::crypt32::CertCompareIntegerBlob	crates/win32-rt/src/misc/crypt32.rs
@@ -408,6 +412,7 @@ crypt32.dll	CertFreeCertificateChainEngine	-	CORE_OS	real	win32_rt::misc::crypt3
 crypt32.dll	CertFreeCertificateContext	-	CORE_OS	real	win32_rt::misc::crypt32::CertFreeCertificateContext	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertGetCertificateChain	-	CORE_OS	real	win32_rt::misc::crypt32::CertGetCertificateChain	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertGetCertificateContextProperty	-	CORE_OS	real	win32_rt::misc::crypt32::CertGetCertificateContextProperty	crates/win32-rt/src/misc/crypt32.rs
+crypt32.dll	CertGetEnhancedKeyUsage	-	CORE_OS	real	win32_rt::misc::crypt32::CertGetEnhancedKeyUsage	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertGetIssuerCertificateFromStore	-	CORE_OS	real	win32_rt::misc::crypt32::CertGetIssuerCertificateFromStore	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertGetNameStringA	-	CORE_OS	real	win32_rt::misc::crypt32::CertGetNameStringA	crates/win32-rt/src/misc/crypt32.rs
 crypt32.dll	CertGetNameStringW	-	CORE_OS	real	win32_rt::misc::crypt32::CertGetNameStringW	crates/win32-rt/src/misc/crypt32.rs
@@ -568,6 +573,7 @@ eossdk-win64-shipping.dll	EOS_Shutdown	-	ENGINE_MIDDLEWARE	real	win32_rt::eossdk
 eossdk-win64-shipping.dll	EOS_Stats_IngestStat	-	ENGINE_MIDDLEWARE	real	win32_rt::eossdk::EOS_Stats_IngestStat	crates/win32-rt/src/eossdk.rs
 eossdk-win64-shipping.dll	EOS_UserInfo_CopyUserInfo	-	ENGINE_MIDDLEWARE	real	win32_rt::eossdk::EOS_UserInfo_CopyUserInfo	crates/win32-rt/src/eossdk.rs
 eossdk-win64-shipping.dll	EOS_UserInfo_Release	-	ENGINE_MIDDLEWARE	real	win32_rt::eossdk::EOS_UserInfo_Release	crates/win32-rt/src/eossdk.rs
+faultrep.dll	ReportFault	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::faultrep::ReportFault	crates/win32-rt/src/misc/faultrep.rs
 fmod.dll	FMOD_ChannelGroup_AddGroup	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::fmod::FMOD_ChannelGroup_AddGroup	crates/win32-rt/src/misc/fmod.rs
 fmod.dll	FMOD_ChannelGroup_GetMute	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::fmod::FMOD_ChannelGroup_GetMute	crates/win32-rt/src/misc/fmod.rs
 fmod.dll	FMOD_ChannelGroup_GetName	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::fmod::FMOD_ChannelGroup_GetName	crates/win32-rt/src/misc/fmod.rs
@@ -839,6 +845,9 @@ hostfxr.dll	hostfxr_main_startupinfo	-	CRT_STL	real	win32_rt::misc::hostfxr::hos
 hostfxr.dll	hostfxr_run_app	-	CRT_STL	real	win32_rt::misc::hostfxr::hostfxr_run_app	crates/win32-rt/src/misc/hostfxr.rs
 hostfxr.dll	hostfxr_set_error_writer	-	CRT_STL	real	win32_rt::misc::hostfxr::hostfxr_set_error_writer	crates/win32-rt/src/misc/hostfxr.rs
 hostfxr.dll	hostfxr_set_runtime_property_value	-	CRT_STL	real	win32_rt::misc::hostfxr::hostfxr_set_runtime_property_value	crates/win32-rt/src/misc/hostfxr.rs
+imagehlp.dll	ImageEnumerateCertificates	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::imagehlp::ImageEnumerateCertificates	crates/win32-rt/src/misc/imagehlp.rs
+imagehlp.dll	ImageGetCertificateData	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::imagehlp::ImageGetCertificateData	crates/win32-rt/src/misc/imagehlp.rs
+imagehlp.dll	ImageGetCertificateHeader	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::imagehlp::ImageGetCertificateHeader	crates/win32-rt/src/misc/imagehlp.rs
 imm32.dll	ImmAssociateContext	-	WINDOW_INPUT_COM	real	win32_rt::misc::imm32::ImmAssociateContext	crates/win32-rt/src/misc/imm32.rs
 imm32.dll	ImmAssociateContextEx	-	WINDOW_INPUT_COM	real	win32_rt::misc::imm32::ImmAssociateContextEx	crates/win32-rt/src/misc/imm32.rs
 imm32.dll	ImmCreateContext	-	WINDOW_INPUT_COM	real	win32_rt::misc::imm32::ImmCreateContext	crates/win32-rt/src/misc/imm32.rs
@@ -879,6 +888,7 @@ iphlpapi.dll	GetBestInterface	-	NET_RPC	real	win32_rt::misc::iphlpapi::GetBestIn
 iphlpapi.dll	GetBestInterfaceEx	-	NET_RPC	real	win32_rt::misc::iphlpapi::GetBestInterfaceEx	crates/win32-rt/src/misc/iphlpapi.rs
 iphlpapi.dll	GetIfTable	-	NET_RPC	real	win32_rt::misc::iphlpapi::GetIfTable	crates/win32-rt/src/misc/iphlpapi.rs
 iphlpapi.dll	GetIpAddrTable	-	NET_RPC	real	win32_rt::misc::iphlpapi::GetIpAddrTable	crates/win32-rt/src/misc/iphlpapi.rs
+iphlpapi.dll	GetIpForwardTable	-	NET_RPC	real	win32_rt::misc::iphlpapi::GetIpForwardTable	crates/win32-rt/src/misc/iphlpapi.rs
 iphlpapi.dll	if_indextoname	-	NET_RPC	real	win32_rt::misc::iphlpapi::if_indextoname	crates/win32-rt/src/misc/iphlpapi.rs
 iphlpapi.dll	if_nametoindex	-	NET_RPC	real	win32_rt::misc::iphlpapi::if_nametoindex	crates/win32-rt/src/misc/iphlpapi.rs
 kernel32.dll	AcquireSRWLockExclusive	-	CORE_OS	real	win32_rt::sync::AcquireSRWLockExclusive	crates/win32-rt/src/sync.rs
@@ -2568,6 +2578,7 @@ ole32.dll	RoActivateInstance	-	WINDOW_INPUT_COM	real	win32_rt::misc::ole32::RoAc
 ole32.dll	RoGetActivationFactory	-	WINDOW_INPUT_COM	real	win32_rt::misc::ole32::RoGetActivationFactory	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	RoInitialize	-	WINDOW_INPUT_COM	real	win32_rt::misc::ole32::RoInitialize	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	RoUninitialize	-	WINDOW_INPUT_COM	real	win32_rt::misc::ole32::RoUninitialize	crates/win32-rt/src/misc/ole32.rs
+ole32.dll	StringFromCLSID	-	WINDOW_INPUT_COM	real	win32_rt::misc::ole32::StringFromCLSID	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	StringFromGUID2	-	WINDOW_INPUT_COM	real	win32_rt::misc::ole32::StringFromGUID2	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	WindowsCreateString	-	WINDOW_INPUT_COM	real	win32_rt::misc::ole32::WindowsCreateString	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	WindowsCreateStringReference	-	WINDOW_INPUT_COM	real	win32_rt::misc::ole32::WindowsCreateStringReference	crates/win32-rt/src/misc/ole32.rs
@@ -2722,6 +2733,11 @@ opencl.dll	clReleaseProgram	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::opencl::
 opencl.dll	clRetainContext	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::opencl::clRetainContext	crates/win32-rt/src/misc/opencl.rs
 opencl.dll	clSetKernelArg	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::opencl::clSetKernelArg	crates/win32-rt/src/misc/opencl.rs
 opencl.dll	clWaitForEvents	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::misc::opencl::clWaitForEvents	crates/win32-rt/src/misc/opencl.rs
+pdh.dll	PdhAddCounterW	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::pdh::PdhAddCounterW	crates/win32-rt/src/misc/pdh.rs
+pdh.dll	PdhCloseQuery	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::pdh::PdhCloseQuery	crates/win32-rt/src/misc/pdh.rs
+pdh.dll	PdhCollectQueryData	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::pdh::PdhCollectQueryData	crates/win32-rt/src/misc/pdh.rs
+pdh.dll	PdhGetFormattedCounterValue	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::pdh::PdhGetFormattedCounterValue	crates/win32-rt/src/misc/pdh.rs
+pdh.dll	PdhOpenQueryW	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::pdh::PdhOpenQueryW	crates/win32-rt/src/misc/pdh.rs
 physx3_x64.dll	??0PxAggregateGeneratedInfo@physx@@QEAA@XZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::physx3_x64::EXTRA_EXPORTS[??0PxAggregateGeneratedInfo@physx@@QEAA@XZ]	crates/win32-rt/src/misc/physx3_x64.rs
 physx3_x64.dll	??0PxArticulationGeneratedInfo@physx@@QEAA@XZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::physx3_x64::EXTRA_EXPORTS[??0PxArticulationGeneratedInfo@physx@@QEAA@XZ]	crates/win32-rt/src/misc/physx3_x64.rs
 physx3_x64.dll	??0PxArticulationJointGeneratedInfo@physx@@QEAA@XZ	-	ENGINE_MIDDLEWARE	real	win32_rt::misc::physx3_x64::EXTRA_EXPORTS[??0PxArticulationJointGeneratedInfo@physx@@QEAA@XZ]	crates/win32-rt/src/misc/physx3_x64.rs
@@ -2878,12 +2894,14 @@ setupapi.dll	SetupDiGetDeviceInstanceIdA	-	WINDOW_INPUT_COM	real	win32_rt::misc:
 setupapi.dll	SetupDiGetDeviceInstanceIdW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDeviceInstanceIdW	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiGetDeviceInterfaceDetailA	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDeviceInterfaceDetailA	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiGetDeviceInterfaceDetailW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDeviceInterfaceDetailW	crates/win32-rt/src/misc/setupapi.rs
+setupapi.dll	SetupDiGetDeviceInterfacePropertyW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDeviceInterfacePropertyW	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiGetDevicePropertyW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDevicePropertyW	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiGetDeviceRegistryPropertyA	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDeviceRegistryPropertyA	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiGetDeviceRegistryPropertyW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDeviceRegistryPropertyW	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiGetDriverInfoDetailA	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDriverInfoDetailA	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiGetDriverInfoDetailW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiGetDriverInfoDetailW	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiOpenDevRegKey	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiOpenDevRegKey	crates/win32-rt/src/misc/setupapi.rs
+setupapi.dll	SetupDiOpenDeviceInterfaceW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiOpenDeviceInterfaceW	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiSetDeviceInstallParamsA	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiSetDeviceInstallParamsA	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupDiSetDeviceInstallParamsW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupDiSetDeviceInstallParamsW	crates/win32-rt/src/misc/setupapi.rs
 setupapi.dll	SetupGetInfDriverStoreLocationW	-	WINDOW_INPUT_COM	real	win32_rt::misc::setupapi::SetupGetInfDriverStoreLocationW	crates/win32-rt/src/misc/setupapi.rs
@@ -2914,6 +2932,7 @@ shell32.dll	PathIsDirectoryA	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::Pa
 shell32.dll	PathIsDirectoryW	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathIsDirectoryW	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	PathIsRelativeA	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathIsRelativeA	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	PathIsRelativeW	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathIsRelativeW	crates/win32-rt/src/misc/shell32.rs
+shell32.dll	PathIsUNCA	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathIsUNCA	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	PathMatchSpecA	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathMatchSpecA	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	PathMatchSpecW	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathMatchSpecW	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	PathRemoveBackslashA	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathRemoveBackslashA	crates/win32-rt/src/misc/shell32.rs
@@ -2925,6 +2944,7 @@ shell32.dll	PathRemoveFileSpecW	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32:
 shell32.dll	PathStripPathA	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathStripPathA	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	PathStripPathW	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::PathStripPathW	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHChangeNotify	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::SHChangeNotify	crates/win32-rt/src/misc/shell32.rs
+shell32.dll	SHCreateDirectory	165	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::SHCreateDirectory	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHCreateDirectoryExA	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::SHCreateDirectoryExA	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHCreateDirectoryExW	-	WINDOW_INPUT_COM	real	win32_rt::misc::shell32::SHCreateDirectoryExW	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHCreateItemFromParsingName	-	WINDOW_INPUT_COM	partial	win32_rt::misc::shell32::SHCreateItemFromParsingName	crates/win32-rt/src/misc/shell32.rs
@@ -4100,6 +4120,7 @@ user32.dll	wsprintfW	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::wsprintfW	c
 uxtheme.dll	CloseThemeData	-	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::CloseThemeData	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	DefSubclassProc	413	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::DefSubclassProc	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	DrawThemeBackground	-	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::DrawThemeBackground	crates/win32-rt/src/misc/uxtheme.rs
+uxtheme.dll	EnableThemeDialogTexture	-	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::EnableThemeDialogTexture	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	GetThemeColor	-	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::GetThemeColor	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	GetThemeSysColor	-	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::GetThemeSysColor	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	GetWindowSubclass	411	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::GetWindowSubclass	crates/win32-rt/src/misc/uxtheme.rs

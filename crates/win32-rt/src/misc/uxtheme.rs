@@ -76,6 +76,14 @@ pub unsafe extern "win64" fn SetWindowTheme(_hwnd: HWND, _sub_app: LPCWSTR, _sub
     S_OK
 }
 
+pub unsafe extern "win64" fn EnableThemeDialogTexture(hwnd: HWND, _dw_flags: u32) -> HRESULT {
+    if hwnd.is_null() {
+        E_HANDLE
+    } else {
+        S_OK
+    }
+}
+
 pub unsafe extern "win64" fn GetThemeColor(
     htheme: usize,
     _part: i32,
@@ -4319,5 +4327,13 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn enable_theme_dialog_texture_validates_hwnd() {
+        unsafe {
+            assert_eq!(EnableThemeDialogTexture(std::ptr::null_mut(), 0x6), E_HANDLE);
+            assert_eq!(EnableThemeDialogTexture(0x1000usize as HWND, 0x6), S_OK);
+        }
     }
 }

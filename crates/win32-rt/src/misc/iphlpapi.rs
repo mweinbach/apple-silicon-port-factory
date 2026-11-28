@@ -47,6 +47,11 @@ const IP_ADAPTER_INFO_SIZE: usize = 704;
 const IP_ADDR_STRING_SIZE: usize = 48;
 const MIB_IFROW_SIZE: usize = 860;
 const MIB_IPADDRROW_SIZE: usize = 24;
+const MIB_IPFORWARDROW_SIZE: usize = 56;
+const MIB_IPROUTE_TYPE_DIRECT: u32 = 3;
+const MIB_IPROUTE_TYPE_INDIRECT: u32 = 4;
+const MIB_IPROUTE_PROTO_LOCAL: u32 = 2;
+const MIB_IPROUTE_PROTO_NETMGMT: u32 = 3;
 
 #[derive(Clone, Debug)]
 struct HostIpv4 {
@@ -824,6 +829,138 @@ pub unsafe extern "win64" fn GetIpAddrTable(ip_addr_table: *mut u8, size: *mut u
     ERROR_SUCCESS
 }
 
+/// `GetIpForwardTable`: builds an IPv4 routing table (`MIB_IPFORWARDTABLE` + 56-byte
+/// `MIB_IPFORWARDROW` entries) from live host interfaces (`getifaddrs()`).
+pub unsafe extern "win64" fn GetIpForwardTable(
+    ip_forward_table: *mut u8,
+    size: *mut u32,
+    order: BOOL,
+) -> u32 {
+    if size.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    #[derive(Clone, Copy)]
+    struct ForwardRow {
+        dest: [u8; 4],
+        mask: [u8; 4],
+        next_hop: [u8; 4],
+        if_index: u32,
+        route_type: u32,
+        proto: u32,
+        metric1: u32,
+    }
+
+    let ifaces = enumerate_host_interfaces();
+    let mut rows: Vec<ForwardRow> = Vec::new();
+
+    // Synthesize default route (0.0.0.0/0) on the primary up non-loopback IPv4 interface, if any.
+    let default_iface = ifaces
+        .iter()
+        .find(|i| {
+            i.is_up()
+                && !i.is_loopback()
+                && i.ipv4.iter().any(|v| !(v.addr[0] == 169 && v.addr[1] == 254))
+        })
+        .or_else(|| ifaces.iter().find(|i| i.is_up() && !i.is_loopback() && !i.ipv4.is_empty()));
+    if let Some(iface) = default_iface {
+        if let Some(v4) = iface.ipv4.first() {
+            rows.push(ForwardRow {
+                dest: [0, 0, 0, 0],
+                mask: [0, 0, 0, 0],
+                next_hop: v4.addr,
+                if_index: iface.index,
+                route_type: MIB_IPROUTE_TYPE_INDIRECT,
+                proto: MIB_IPROUTE_PROTO_NETMGMT,
+                metric1: 25,
+            });
+        }
+    }
+
+    // On-link subnet and host routes for each UP IPv4 interface.
+    for iface in ifaces.iter().filter(|i| i.is_up()) {
+        let metric = if iface.is_loopback() { 75 } else { 25 };
+        for v4 in &iface.ipv4 {
+            let net = [
+                v4.addr[0] & v4.mask[0],
+                v4.addr[1] & v4.mask[1],
+                v4.addr[2] & v4.mask[2],
+                v4.addr[3] & v4.mask[3],
+            ];
+            if !rows
+                .iter()
+                .any(|r| r.dest == net && r.mask == v4.mask && r.if_index == iface.index)
+            {
+                rows.push(ForwardRow {
+                    dest: net,
+                    mask: v4.mask,
+                    next_hop: v4.addr,
+                    if_index: iface.index,
+                    route_type: MIB_IPROUTE_TYPE_DIRECT,
+                    proto: MIB_IPROUTE_PROTO_LOCAL,
+                    metric1: metric,
+                });
+            }
+            let host_mask = [255, 255, 255, 255];
+            if !rows
+                .iter()
+                .any(|r| r.dest == v4.addr && r.mask == host_mask && r.if_index == iface.index)
+            {
+                rows.push(ForwardRow {
+                    dest: v4.addr,
+                    mask: host_mask,
+                    next_hop: v4.addr,
+                    if_index: iface.index,
+                    route_type: MIB_IPROUTE_TYPE_DIRECT,
+                    proto: MIB_IPROUTE_PROTO_LOCAL,
+                    metric1: metric,
+                });
+            }
+        }
+    }
+
+    if order != FALSE {
+        rows.sort_by_key(|r| {
+            (
+                u32::from_be_bytes(r.dest),
+                r.proto,
+                u32::from_be_bytes(r.next_hop),
+            )
+        });
+    }
+
+    let needed = 4 + rows.len() * MIB_IPFORWARDROW_SIZE;
+    let avail = size.read_unaligned() as usize;
+    if ip_forward_table.is_null() || avail < needed {
+        size.write_unaligned(needed as u32);
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
+
+    std::ptr::write_bytes(ip_forward_table, 0, needed);
+    (ip_forward_table as *mut u32).write_unaligned(rows.len() as u32);
+
+    for (idx, r) in rows.iter().enumerate() {
+        let row = ip_forward_table.add(4 + idx * MIB_IPFORWARDROW_SIZE);
+        (row.add(0x00) as *mut u32).write_unaligned(u32::from_ne_bytes(r.dest));
+        (row.add(0x04) as *mut u32).write_unaligned(u32::from_ne_bytes(r.mask));
+        (row.add(0x08) as *mut u32).write_unaligned(0); // dwForwardPolicy
+        (row.add(0x0C) as *mut u32).write_unaligned(u32::from_ne_bytes(r.next_hop));
+        (row.add(0x10) as *mut u32).write_unaligned(r.if_index);
+        (row.add(0x14) as *mut u32).write_unaligned(r.route_type);
+        (row.add(0x18) as *mut u32).write_unaligned(r.proto);
+        (row.add(0x1C) as *mut u32).write_unaligned(0); // dwForwardAge
+        (row.add(0x20) as *mut u32).write_unaligned(0); // dwForwardNextHopAS
+        (row.add(0x24) as *mut u32).write_unaligned(r.metric1);
+        (row.add(0x28) as *mut u32).write_unaligned(u32::MAX); // dwForwardMetric2
+        (row.add(0x2C) as *mut u32).write_unaligned(u32::MAX); // dwForwardMetric3
+        (row.add(0x30) as *mut u32).write_unaligned(u32::MAX); // dwForwardMetric4
+        (row.add(0x34) as *mut u32).write_unaligned(u32::MAX); // dwForwardMetric5
+    }
+
+    size.write_unaligned(needed as u32);
+    ERROR_SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,6 +1086,27 @@ mod tests {
             let mut best6_ex = 0u32;
             assert_eq!(GetBestInterfaceEx(sa6.as_ptr(), &mut best6_ex), ERROR_SUCCESS);
             assert_ne!(best6_ex, 0);
+
+            // GetIpForwardTable
+            assert_eq!(GetIpForwardTable(std::ptr::null_mut(), std::ptr::null_mut(), TRUE), ERROR_INVALID_PARAMETER);
+            let mut fwd_sz = 0u32;
+            assert_eq!(GetIpForwardTable(std::ptr::null_mut(), &mut fwd_sz, TRUE), ERROR_INSUFFICIENT_BUFFER);
+            assert!(fwd_sz >= (4 + MIB_IPFORWARDROW_SIZE) as u32);
+            let mut fwd_buf = vec![0u8; fwd_sz as usize];
+            assert_eq!(GetIpForwardTable(fwd_buf.as_mut_ptr(), &mut fwd_sz, TRUE), ERROR_SUCCESS);
+            let num_fwd = (fwd_buf.as_ptr() as *const u32).read_unaligned() as usize;
+            assert!(num_fwd >= 1);
+            let mut saw_lo_route = false;
+            for i in 0..num_fwd {
+                let row = fwd_buf.as_ptr().add(4 + i * MIB_IPFORWARDROW_SIZE);
+                let dest = (row.add(0x00) as *const u32).read_unaligned().to_ne_bytes();
+                let if_idx = (row.add(0x10) as *const u32).read_unaligned();
+                assert_ne!(if_idx, 0);
+                if dest == [127, 0, 0, 1] {
+                    saw_lo_route = true;
+                }
+            }
+            assert!(saw_lo_route, "expected 127.0.0.1 host route in GetIpForwardTable");
         }
     }
 }
