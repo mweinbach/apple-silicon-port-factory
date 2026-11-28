@@ -931,6 +931,47 @@ fn bridge_port_env_vars() {
     let _ = port_manifest::knobs::apply_manifest_and_aliases(None);
 }
 
+fn emit_prewarm_aot_output(args: &Args, reports: &[x86_runtime::emu::AotPrewarmReport]) {
+    if args.json {
+        #[cfg(feature = "cli")]
+        {
+            use port_factory::json_output::{JsonEnvelope, JsonObj, JsonValue};
+            let prewarmed = reports.iter().filter(|r| r.cache_path.is_some()).count();
+            let skipped = reports.len().saturating_sub(prewarmed);
+            let total_roots: usize = reports.iter().map(|r| r.roots).sum();
+            let total_blocks: usize = reports.iter().map(|r| r.blocks).sum();
+            let total_bytes: usize = reports.iter().map(|r| r.code_bytes).sum();
+            let modules: Vec<JsonValue> = reports
+                .iter()
+                .map(|r| {
+                    JsonObj::new()
+                        .str("module", r.module.clone())
+                        .usize("roots", r.roots)
+                        .usize("blocks", r.blocks)
+                        .usize("code_bytes", r.code_bytes)
+                        .opt_str(
+                            "cache_path",
+                            r.cache_path.as_ref().map(|p| p.display().to_string()),
+                        )
+                        .opt_str("skipped_reason", r.skipped_reason.clone())
+                        .build()
+                })
+                .collect();
+            let data = JsonObj::new()
+                .usize("modules_prewarmed", prewarmed)
+                .usize("modules_skipped", skipped)
+                .usize("total_roots", total_roots)
+                .usize("total_blocks", total_blocks)
+                .usize("total_code_bytes", total_bytes)
+                .val("modules", JsonValue::Array(modules))
+                .build();
+            run_limits::write_json_stdout(&JsonEnvelope::ok("port-runner", data).to_json_pretty());
+        }
+        return;
+    }
+    print_aot_prewarm_summary(reports);
+}
+
 fn print_aot_prewarm_summary(reports: &[x86_runtime::emu::AotPrewarmReport]) {
     println!("=== Offline AOT Block-Cache Prewarm Summary ===");
     if reports.is_empty() {
@@ -1575,6 +1616,29 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
 
     // Map the target PE (.exe or .dll) and, recursively, all statically imported DLLs.
     let pe_data = std::fs::read(&exe_host)?;
+    if args.prewarm_aot {
+        let non_pe32_plus_reason = match pe_image::probe_pe_arch_bytes(&pe_data) {
+            pe_image::PeArchProbe::Amd64Pe32Plus => None,
+            pe_image::PeArchProbe::WrongArch(err) => Some(err.to_string()),
+            pe_image::PeArchProbe::NotPe => Some("not a PE32+ image".to_string()),
+        };
+        if let Some(reason) = non_pe32_plus_reason {
+            log::warn!(
+                "prewarm: skipping non-PE32+ target {} ({reason})",
+                exe_host.display()
+            );
+            let reports = vec![x86_runtime::emu::AotPrewarmReport {
+                module: norm,
+                roots: 0,
+                blocks: 0,
+                code_bytes: 0,
+                cache_path: None,
+                skipped_reason: Some(reason),
+            }];
+            emit_prewarm_aot_output(&args, &reports);
+            return Ok(());
+        }
+    }
     #[cfg(feature = "cli")]
     let mut ops_report_json: Option<port_factory::json_output::JsonValue> = None;
     if args.ops_report {
@@ -1729,44 +1793,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     }
     if args.prewarm_aot {
         let reports = x86_runtime::emu::aot_prewarm_all_mapped(args.aot_max_funcs);
-        if args.json {
-            #[cfg(feature = "cli")]
-            {
-                use port_factory::json_output::{JsonEnvelope, JsonObj, JsonValue};
-                let prewarmed = reports.iter().filter(|r| r.cache_path.is_some()).count();
-                let skipped = reports.len().saturating_sub(prewarmed);
-                let total_roots: usize = reports.iter().map(|r| r.roots).sum();
-                let total_blocks: usize = reports.iter().map(|r| r.blocks).sum();
-                let total_bytes: usize = reports.iter().map(|r| r.code_bytes).sum();
-                let modules: Vec<JsonValue> = reports
-                    .iter()
-                    .map(|r| {
-                        JsonObj::new()
-                            .str("module", r.module.clone())
-                            .usize("roots", r.roots)
-                            .usize("blocks", r.blocks)
-                            .usize("code_bytes", r.code_bytes)
-                            .opt_str(
-                                "cache_path",
-                                r.cache_path.as_ref().map(|p| p.display().to_string()),
-                            )
-                            .opt_str("skipped_reason", r.skipped_reason.clone())
-                            .build()
-                    })
-                    .collect();
-                let data = JsonObj::new()
-                    .usize("modules_prewarmed", prewarmed)
-                    .usize("modules_skipped", skipped)
-                    .usize("total_roots", total_roots)
-                    .usize("total_blocks", total_blocks)
-                    .usize("total_code_bytes", total_bytes)
-                    .val("modules", JsonValue::Array(modules))
-                    .build();
-                run_limits::write_json_stdout(&JsonEnvelope::ok("port-runner", data).to_json_pretty());
-            }
-            return Ok(());
-        }
-        print_aot_prewarm_summary(&reports);
+        emit_prewarm_aot_output(&args, &reports);
         return Ok(());
     }
     if args.diff_test {

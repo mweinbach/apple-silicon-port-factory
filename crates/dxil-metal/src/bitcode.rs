@@ -15,7 +15,21 @@ const MODULE_BLOCK: u64 = 8;
 const CONSTANTS_BLOCK: u64 = 11;
 const FUNCTION_BLOCK: u64 = 12;
 const VALUE_SYMTAB_BLOCK: u64 = 14;
+const METADATA_BLOCK: u64 = 15;
 const TYPE_BLOCK_NEW: u64 = 17;
+
+const METADATA_STRING: u64 = 1;
+const METADATA_VALUE: u64 = 2;
+const METADATA_NODE: u64 = 3;
+const METADATA_NAME: u64 = 4;
+const METADATA_DISTINCT_NODE: u64 = 5;
+const METADATA_KIND: u64 = 6;
+const METADATA_LOCATION: u64 = 7;
+const METADATA_OLD_NODE: u64 = 8;
+const METADATA_OLD_FN_NODE: u64 = 9;
+const METADATA_NAMED_NODE: u64 = 10;
+const METADATA_GENERIC_DEBUG: u64 = 12;
+const METADATA_MODULE: u64 = 32;
 
 const MODULE_CODE_GLOBALVAR: u64 = 7;
 const MODULE_CODE_FUNCTION: u64 = 8;
@@ -304,6 +318,94 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn metadata_block(
+        &mut self,
+        next_md_id: &mut u64,
+        md_strings: &mut HashMap<u64, String>,
+        md_nodes: &mut HashMap<u64, Vec<u64>>,
+        named_nodes: &mut HashMap<String, Vec<u64>>,
+    ) -> Option<()> {
+        let (w, _) = self.block_header()?;
+        let mut abbrevs = self.blockinfo.get(&METADATA_BLOCK).cloned().unwrap_or_default();
+        let mut pending_name: Option<String> = None;
+        loop {
+            match self.next(w, &mut abbrevs)? {
+                Entry::End => return Some(()),
+                Entry::Block(_) => self.skip_block()?,
+                Entry::Record(code, ops) => match code {
+                    METADATA_NAME => {
+                        let s: String = ops.iter().map(|&c| (c as u8) as char).collect();
+                        pending_name = Some(s);
+                    }
+                    METADATA_NAMED_NODE => {
+                        if let Some(name) = pending_name.take() {
+                            named_nodes.entry(name).or_default().extend(ops);
+                        }
+                    }
+                    METADATA_STRING => {
+                        let id = *next_md_id;
+                        *next_md_id += 1;
+                        let s: String = ops.iter().map(|&c| (c as u8) as char).collect();
+                        md_strings.insert(id, s);
+                    }
+                    METADATA_NODE | METADATA_DISTINCT_NODE => {
+                        let id = *next_md_id;
+                        *next_md_id += 1;
+                        md_nodes.insert(id, ops);
+                    }
+                    METADATA_VALUE
+                    | METADATA_LOCATION
+                    | METADATA_OLD_NODE
+                    | METADATA_OLD_FN_NODE
+                    | METADATA_GENERIC_DEBUG..=METADATA_MODULE => {
+                        *next_md_id += 1;
+                    }
+                    METADATA_KIND => {}
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    fn module_entry_points(&mut self) -> Option<Vec<String>> {
+        let (w, _) = self.block_header()?;
+        let mut abbrevs = self.blockinfo.get(&MODULE_BLOCK).cloned().unwrap_or_default();
+        let mut next_md_id = 0u64;
+        let mut md_strings = HashMap::new();
+        let mut md_nodes = HashMap::new();
+        let mut named_nodes = HashMap::new();
+        loop {
+            match self.next(w, &mut abbrevs)? {
+                Entry::End => break,
+                Entry::Block(BLOCKINFO) => self.blockinfo_block()?,
+                Entry::Block(METADATA_BLOCK) => {
+                    self.metadata_block(&mut next_md_id, &mut md_strings, &mut md_nodes, &mut named_nodes)?;
+                }
+                Entry::Block(_) => self.skip_block()?,
+                Entry::Record(..) => {}
+            }
+        }
+        let ep_ids = named_nodes.get("dx.entryPoints")?;
+        let mut out = Vec::new();
+        for &ep_id in ep_ids {
+            let Some(tuple) = md_nodes.get(&ep_id) else {
+                continue;
+            };
+            // DXIL !dx.entryPoints tuple: !{fn_or_null, !"EntryName", !sigs, !resources, !props}
+            // METADATA_NODE operands are 1-based (0 = null, k = md[k - 1]).
+            if let Some(&name_ref) = tuple.get(1) {
+                if name_ref > 0 {
+                    if let Some(name) = md_strings.get(&(name_ref - 1)) {
+                        if !name.is_empty() {
+                            out.push(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     fn module(&mut self) -> Option<Vec<String>> {
         let (w, _) = self.block_header()?;
         let mut abbrevs = self.blockinfo.get(&MODULE_BLOCK).cloned().unwrap_or_default();
@@ -350,6 +452,28 @@ pub fn defined_functions(bitcode: &[u8]) -> Option<Vec<String>> {
         match r.next(2, &mut top)? {
             Entry::Block(BLOCKINFO) => r.blockinfo_block()?,
             Entry::Block(MODULE_BLOCK) => return r.module(),
+            Entry::Block(_) => r.skip_block()?,
+            Entry::End | Entry::Record(..) => return None,
+        }
+    }
+    None
+}
+
+/// Non-empty DXIL entry point names from the LLVM bitcode's `!dx.entryPoints` named metadata.
+///
+/// Every DXIL shader records its entry point tuple `!{fn_or_null, !"EntryName", ...}` in
+/// `!dx.entryPoints` (even pre-v3 `PSV0` containers, pass-through Hull shaders whose control-point
+/// function is `null`, and Hull shaders that also define a patch-constant function).
+pub fn entry_points(bitcode: &[u8]) -> Option<Vec<String>> {
+    if bitcode.get(0..4)? != b"BC\xC0\xDE" {
+        return None;
+    }
+    let mut r = Reader { b: Bits { data: bitcode, pos: 32 }, blockinfo: HashMap::new() };
+    let mut top = Vec::new();
+    while !r.b.at_end() {
+        match r.next(2, &mut top)? {
+            Entry::Block(BLOCKINFO) => r.blockinfo_block()?,
+            Entry::Block(MODULE_BLOCK) => return r.module_entry_points(),
             Entry::Block(_) => r.skip_block()?,
             Entry::End | Entry::Record(..) => return None,
         }
@@ -1169,13 +1293,51 @@ mod tests {
         w.out
     }
 
+    /// A module containing a `METADATA_BLOCK` with `!dx.entryPoints = !{!2}` where
+    /// `!2 = !{null, !"HS_NullCP", null, null, null}` (mirroring a pass-through Hull shader
+    /// whose control-point function pointer is null and whose only defined function is `pc_main`).
+    fn module_with_dx_entrypoints(entry_name: &str) -> Vec<u8> {
+        let mut w = W::default();
+        w.out.extend_from_slice(b"BC\xC0\xDE");
+        w.bit = 32;
+        let m = w.enter(2, MODULE_BLOCK, 3);
+        w.unabbrev(3, 1, &[1]); // VERSION
+        w.unabbrev(3, MODULE_CODE_FUNCTION, &[6, 0, 0, 0, 0, 0]); // value 0: pc_main
+        let md = w.enter(3, METADATA_BLOCK, 4);
+        // md 0: METADATA_STRING "other"
+        w.unabbrev(4, METADATA_STRING, &b"other".iter().map(|&c| c as u64).collect::<Vec<_>>());
+        // METADATA_KIND does NOT allocate a metadata ID.
+        let mut kind_ops = vec![0u64];
+        kind_ops.extend(b"dbg".iter().map(|&c| c as u64));
+        w.unabbrev(4, METADATA_KIND, &kind_ops);
+        // md 1: METADATA_STRING entry_name
+        w.unabbrev(4, METADATA_STRING, &entry_name.bytes().map(|c| c as u64).collect::<Vec<_>>());
+        // md 2: METADATA_NODE [0 (null fn), 2 (1-based -> md 1), 0, 0, 0]
+        w.unabbrev(4, METADATA_NODE, &[0, 2, 0, 0, 0]);
+        // Named metadata !dx.entryPoints = !{!2} (0-based -> md 2)
+        w.unabbrev(4, METADATA_NAME, &b"dx.entryPoints".iter().map(|&c| c as u64).collect::<Vec<_>>());
+        w.unabbrev(4, METADATA_NAMED_NODE, &[2]);
+        w.end(4, md);
+        w.end(3, m);
+        w.out
+    }
+
     #[test]
     fn finds_the_defined_function() {
         let bc = module("FullscreenVS_main2");
         assert_eq!(defined_functions(&bc).unwrap(), ["FullscreenVS_main2"]);
+        assert_eq!(entry_points(&bc), None);
         assert_eq!(lower_sm69_bitcode(&bc), None);
         assert!(defined_functions(b"BC\xC0\xDE").is_none());
         assert!(defined_functions(&bc[..bc.len() - 9]).is_none());
         assert!(defined_functions(b"nope").is_none());
+    }
+
+    #[test]
+    fn finds_dx_entrypoints_metadata_with_null_fn_ptr() {
+        let bc = module_with_dx_entrypoints("HS_NullCP");
+        assert_eq!(entry_points(&bc).unwrap(), ["HS_NullCP"]);
+        let empty = module_with_dx_entrypoints("");
+        assert_eq!(entry_points(&empty), None);
     }
 }

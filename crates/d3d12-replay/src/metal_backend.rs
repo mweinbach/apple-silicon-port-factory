@@ -1010,12 +1010,22 @@ impl Backend for MetalBackend {
                 if self.psos.contains_key(pso) {
                     return Err(format!("CreateGraphicsPipelineState: duplicate still-live PSO id {pso:#x}"));
                 }
-                if !desc.hs.is_empty() || !desc.ds.is_empty() {
-                    return Ok(Handled::Skipped);
+                if desc.hs.is_empty() != desc.ds.is_empty() {
+                    return Err(format!("CreateGraphicsPipelineState: mismatched HS/DS on PSO {pso:#x}"));
                 }
                 let rs = self.resolve_root_sig(desc.root_signature, desc.vs)?;
                 let gdesc = decode_graphics_desc(desc)?;
-                let gp = if !desc.gs.is_empty() {
+                let gp = if !desc.hs.is_empty() && !desc.ds.is_empty() {
+                    let gs = (!desc.gs.is_empty()).then_some(desc.gs);
+                    GraphicsPipeline::new_with_tessellation(
+                        rs,
+                        &gdesc,
+                        desc.hs,
+                        desc.ds,
+                        gs,
+                        &format!("replay tess pso {pso:#x}"),
+                    )?
+                } else if !desc.gs.is_empty() {
                     GraphicsPipeline::new_with_geometry(rs, &gdesc, desc.gs, &format!("replay gs pso {pso:#x}"))?
                 } else {
                     GraphicsPipeline::new(rs, &gdesc, &format!("replay gfx pso {pso:#x}"))?

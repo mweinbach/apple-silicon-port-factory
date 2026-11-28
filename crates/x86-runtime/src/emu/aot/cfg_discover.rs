@@ -34,7 +34,11 @@ pub(super) unsafe fn data_dir(base: usize, size: usize, idx: usize) -> Option<(u
     }
     let nt = rd32(0x3C) as usize;
     let opt = nt + 24;
-    if opt + 112 + 16 * 8 > size || rd32(nt) != 0x0000_4550 || rd16(opt) != 0x20B {
+    if opt + 112 + 16 * 8 > size
+        || rd32(nt) != 0x0000_4550
+        || rd16(nt + 4) != 0x8664
+        || rd16(opt) != 0x20B
+    {
         return None;
     }
     if rd32(opt + 108) as usize <= idx {
@@ -488,7 +492,11 @@ unsafe fn entry_point_rva(base: usize, size: usize) -> Option<u32> {
     }
     let nt = rd32(0x3C) as usize;
     let opt = nt.checked_add(24)?;
-    if opt.checked_add(20)? > size || rd32(nt) != 0x0000_4550 || rd16(opt) != 0x20B {
+    if opt.checked_add(20)? > size
+        || rd32(nt) != 0x0000_4550
+        || rd16(nt + 4) != 0x8664
+        || rd16(opt) != 0x20B
+    {
         return None;
     }
     let entry = rd32(opt + 16);
@@ -548,7 +556,11 @@ pub(super) unsafe fn opt_image_base(base: usize, size: usize) -> Option<u64> {
     }
     let nt = rd32(0x3C) as usize;
     let opt = nt.checked_add(24)?;
-    if opt.checked_add(32)? > size || rd32(nt) != 0x0000_4550 || rd16(opt) != 0x20B {
+    if opt.checked_add(32)? > size
+        || rd32(nt) != 0x0000_4550
+        || rd16(nt + 4) != 0x8664
+        || rd16(opt) != 0x20B
+    {
         return None;
     }
     Some(core::ptr::read_unaligned((base + opt + 24) as *const u64))

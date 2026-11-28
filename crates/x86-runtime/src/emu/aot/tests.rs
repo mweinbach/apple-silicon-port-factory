@@ -4184,3 +4184,64 @@ fn volatile_metadata_preserves_explicit_volatile_stack_accesses() {
         "non-volatile adjacent [rsp+disp] pair must still fuse into ldp/stp under PORT_JIT_STACK_TSO=0"
     );
 }
+
+#[test]
+fn aot_prewarm_skips_non_pe32_plus_and_wrong_machine_mapped_modules() {
+    let mut pe32 = vec![0u8; 0x2000];
+    pe32[0..2].copy_from_slice(b"MZ");
+    w32(&mut pe32, 0x3C, 0x80);
+    w32(&mut pe32, 0x80, 0x0000_4550);
+    w16(&mut pe32, 0x84, 0x014C); // i386
+    w16(&mut pe32, 0x94, 224);    // SizeOfOptionalHeader (PE32)
+    w16(&mut pe32, 0x98, 0x010B); // PE32 magic
+
+    let mut arm64 = vec![0u8; 0x2000];
+    arm64[0..2].copy_from_slice(b"MZ");
+    w32(&mut arm64, 0x3C, 0x80);
+    w32(&mut arm64, 0x80, 0x0000_4550);
+    w16(&mut arm64, 0x84, 0xAA64); // ARM64
+    w16(&mut arm64, 0x94, 240);    // SizeOfOptionalHeader (PE32+)
+    w16(&mut arm64, 0x98, 0x020B); // PE32+ magic
+
+    let base_pe32 = pe32.as_ptr() as usize;
+    let base_arm64 = arm64.as_ptr() as usize;
+    assert!(unsafe { super::format::exec_sections(base_pe32, pe32.len()) }.is_empty());
+    assert!(unsafe { super::format::exec_sections(base_arm64, arm64.len()) }.is_empty());
+
+    super::runtime::module_mapped("synth_wrong_pe32.dll", base_pe32, pe32.len());
+    super::runtime::module_mapped("synth_wrong_arm64.dll", base_arm64, arm64.len());
+
+    let reports = aot_prewarm_all_mapped(0);
+
+    if let Ok(mut v) = MAPPED.lock() {
+        v.retain(|m| m.base != base_pe32 && m.base != base_arm64);
+    }
+
+    let r32 = reports
+        .iter()
+        .find(|r| r.module == "synth_wrong_pe32.dll")
+        .expect("PE32 module should be reported as skipped");
+    assert!(r32.cache_path.is_none());
+    assert_eq!(r32.blocks, 0);
+    assert!(
+        r32.skipped_reason
+            .as_deref()
+            .is_some_and(|s| s.contains("not a PE32+ image")),
+        "unexpected PE32 skipped_reason: {:?}",
+        r32.skipped_reason
+    );
+
+    let r64 = reports
+        .iter()
+        .find(|r| r.module == "synth_wrong_arm64.dll")
+        .expect("ARM64 module should be reported as skipped");
+    assert!(r64.cache_path.is_none());
+    assert_eq!(r64.blocks, 0);
+    assert!(
+        r64.skipped_reason
+            .as_deref()
+            .is_some_and(|s| s.contains("unsupported machine")),
+        "unexpected ARM64 skipped_reason: {:?}",
+        r64.skipped_reason
+    );
+}

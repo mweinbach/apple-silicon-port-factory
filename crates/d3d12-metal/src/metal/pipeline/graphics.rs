@@ -797,8 +797,12 @@ impl GraphicsPipeline {
                 ("max_tessellation_factor_fc", MTLDataType::Float, &max_tess_bytes),
             ],
         );
-        let domain_fn: Retained<MTL4FunctionDescriptor> =
-            Retained::into_super(function_descriptor(&dlib, "irconverter_dxil_domain_shader"));
+        let domain_fn = specialized_function_descriptor(
+            &dlib,
+            "irconverter_dxil_domain_shader",
+            &ds,
+            &[],
+        );
         let mesh_linked = NSArray::from_retained_slice(&[tess_fn, domain_fn]);
         let mesh_linking = MTL4StaticLinkingDescriptor::new();
         mesh_linking.setFunctionDescriptors(Some(&mesh_linked));
