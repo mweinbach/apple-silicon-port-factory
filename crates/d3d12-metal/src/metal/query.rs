@@ -28,6 +28,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::*;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub type MtlCounterHeap = ProtocolObject<dyn MTL4CounterHeap>;
@@ -60,6 +61,14 @@ const _: () = assert!(SCRATCH_HEAP_ENTRIES % SCRATCH_SLICE_LEN == 0);
 /// (`4 * 64 = 256` simultaneous in-flight command-list leases while leaving >=20
 /// AGX counter heaps free even alongside `passtiming`).
 const MAX_SCRATCH_HEAPS: usize = 4;
+
+/// Soft cap on simultaneous direct `MTL4CounterHeap`s allocated by small
+/// `QueryHeap(TIMESTAMP)` requests. Apple AGX enforces a ~32-heap per-process
+/// ceiling (`passtiming` reserves 8), so capping direct heaps at 16 leaves
+/// headroom for [`TimestampScratchPool`] (up to 4 heaps) so overflow and large
+/// staged timestamp heaps remain usable even after many small heaps are created.
+const MAX_DIRECT_TIMESTAMP_HEAPS: usize = 16;
+static LIVE_DIRECT_TIMESTAMP_HEAPS: AtomicUsize = AtomicUsize::new(0);
 
 /// `D3D12_QUERY_HEAP_TYPE`.
 pub mod heap_type {
@@ -160,6 +169,15 @@ impl Drop for TimestampScratchLease {
 }
 
 impl TimestampScratchPool {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(ScratchPoolInner {
+                heaps: Vec::new(),
+                free_slices: Vec::new(),
+            }),
+        }
+    }
+
     fn alloc_counter_heap(heap_idx: usize) -> Result<Retained<MtlCounterHeap>, String> {
         let d = super::device().ok_or_else(|| "no Metal 4 device".to_string())?;
         let entry = d.dev.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
@@ -179,13 +197,23 @@ impl TimestampScratchPool {
         Ok(h)
     }
 
-    fn init() -> Result<Self, String> {
-        let h0 = Self::alloc_counter_heap(0)?;
-        let mut free_slices = Vec::with_capacity(SLICES_PER_HEAP);
-        for s in (0..SLICES_PER_HEAP).rev() {
-            free_slices.push((0, s as u16));
+    /// Ensure at least one hardware scratch `MTL4CounterHeap` is initialized.
+    ///
+    /// Unlike `OnceLock<Result<..>>`, transient allocation failures are never
+    /// cached: if AGX's counter-heap budget is temporarily exhausted and later
+    /// freed, subsequent calls retry cleanly and succeed.
+    pub(crate) fn ensure_ready(&self) -> Result<(), String> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.heaps.is_empty() {
+            return Ok(());
         }
-        Ok(Self { inner: Mutex::new(ScratchPoolInner { heaps: vec![h0], free_slices }) })
+        let h0 = Self::alloc_counter_heap(0)?;
+        g.heaps.push(h0);
+        g.free_slices.reserve(SLICES_PER_HEAP);
+        for s in (0..SLICES_PER_HEAP).rev() {
+            g.free_slices.push((0, s as u16));
+        }
+        Ok(())
     }
 
     /// Lease an exclusively-owned `SCRATCH_SLICE_LEN`-slot slice, lazily growing the
@@ -222,14 +250,17 @@ impl TimestampScratchPool {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.free_slices.push((heap_idx, slice_idx));
     }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, usize) {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (g.heaps.len(), g.free_slices.len())
+    }
 }
 
-pub(crate) fn timestamp_scratch_pool() -> Result<&'static TimestampScratchPool, String> {
-    static POOL: OnceLock<Result<TimestampScratchPool, String>> = OnceLock::new();
-    match POOL.get_or_init(TimestampScratchPool::init) {
-        Ok(p) => Ok(p),
-        Err(e) => Err(e.clone()),
-    }
+pub(crate) fn timestamp_scratch_pool() -> &'static TimestampScratchPool {
+    static POOL: OnceLock<TimestampScratchPool> = OnceLock::new();
+    POOL.get_or_init(TimestampScratchPool::new)
 }
 
 /// One staged GPU timestamp waiting to be resolved from this command list's
@@ -325,22 +356,34 @@ impl QueryHeap {
                     .ok_or_else(|| QueryHeapError::OutOfMemory("no Metal 4 device".into()))?;
                 let mut direct_ok = false;
                 if count <= MAX_DIRECT_COUNTER_HEAP_ENTRIES {
-                    let desc = MTL4CounterHeapDescriptor::new();
-                    desc.setType(MTL4CounterHeapType::Timestamp);
-                    unsafe { desc.setCount(count as usize) };
-                    if let Ok(h) = d.dev.newCounterHeapWithDescriptor_error(&desc) {
-                        let entry = d.dev.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
-                        if entry != 8 {
-                            return Err(QueryHeapError::OutOfMemory(format!(
-                                "timestamp heap entries are {entry} bytes, expected 8"
-                            )));
+                    let claimed_direct = LIVE_DIRECT_TIMESTAMP_HEAPS
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                            (cur < MAX_DIRECT_TIMESTAMP_HEAPS).then_some(cur + 1)
+                        })
+                        .is_ok();
+                    if claimed_direct {
+                        let desc = MTL4CounterHeapDescriptor::new();
+                        desc.setType(MTL4CounterHeapType::Timestamp);
+                        unsafe { desc.setCount(count as usize) };
+                        if let Ok(h) = d.dev.newCounterHeapWithDescriptor_error(&desc) {
+                            let entry = d.dev.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
+                            if entry != 8 {
+                                LIVE_DIRECT_TIMESTAMP_HEAPS.fetch_sub(1, Ordering::AcqRel);
+                                return Err(QueryHeapError::OutOfMemory(format!(
+                                    "timestamp heap entries are {entry} bytes, expected 8"
+                                )));
+                            }
+                            timestamps = Some(h);
+                            direct_ok = true;
+                        } else {
+                            LIVE_DIRECT_TIMESTAMP_HEAPS.fetch_sub(1, Ordering::AcqRel);
                         }
-                        timestamps = Some(h);
-                        direct_ok = true;
                     }
                 }
                 if !direct_ok {
-                    timestamp_scratch_pool().map_err(QueryHeapError::OutOfMemory)?;
+                    timestamp_scratch_pool()
+                        .ensure_ready()
+                        .map_err(QueryHeapError::OutOfMemory)?;
                     let total_bytes = (count as u64)
                         .checked_mul(8)
                         .ok_or_else(|| QueryHeapError::OutOfMemory(format!("timestamp heap byte size overflow ({count})")))?;
@@ -425,6 +468,9 @@ impl QueryHeap {
 
 impl Drop for QueryHeap {
     fn drop(&mut self) {
+        if self.timestamps.take().is_some() {
+            LIVE_DIRECT_TIMESTAMP_HEAPS.fetch_sub(1, Ordering::AcqRel);
+        }
         let Some(d) = super::device() else { return };
         if let Some(b) = &self.timestamp_buffer {
             d.remove_resident(ProtocolObject::from_ref(&**b));
@@ -543,7 +589,7 @@ impl super::cmdlist::CommandList {
         }
         let buf = heap.timestamp_buffer.as_ref().ok_or("not a timestamp heap")?;
         if self.ts_scratch_lease.is_none() {
-            let pool = timestamp_scratch_pool()?;
+            let pool = timestamp_scratch_pool();
             self.ts_scratch_lease = Some(pool.acquire_lease()?);
             self.ts_scratch_cursor = 0;
         }
@@ -681,7 +727,8 @@ mod tests {
         if super::super::device().is_none() {
             return;
         }
-        let pool = timestamp_scratch_pool().expect("scratch pool");
+        let pool = timestamp_scratch_pool();
+        pool.ensure_ready().expect("scratch pool ready");
         // Acquire more leases than a single 4096-entry heap supplies (64 slices) to
         // prove disjointness across lists AND lazy second-heap growth.
         let mut leases = Vec::new();
@@ -709,5 +756,72 @@ mod tests {
             recycled.push(l);
         }
         assert!(saw_first, "dropped lease {:?} must be returned to the pool", first_id);
+    }
+
+    #[test]
+    fn direct_timestamp_heap_cap_preserves_scratch_headroom_for_overflow_and_large_heaps() {
+        if super::super::device().is_none() {
+            return;
+        }
+        // Create 40 small timestamp heaps simultaneously (> AGX's ~32-heap process ceiling).
+        // The soft direct cap (16) keeps hardware counter-heap headroom free so overflow
+        // small heaps and subsequent 1M staged heaps all succeed cleanly.
+        let mut heaps = Vec::new();
+        for i in 0..40 {
+            heaps.push(
+                QueryHeap::try_new(heap_type::TIMESTAMP, 128)
+                    .unwrap_or_else(|e| panic!("timestamp heap #{i} must succeed: {e}")),
+            );
+        }
+        let direct_count = heaps.iter().filter(|h| h.timestamps.is_some()).count();
+        let staged_count = heaps.iter().filter(|h| h.is_staged_timestamp()).count();
+        assert!(
+            direct_count <= MAX_DIRECT_TIMESTAMP_HEAPS,
+            "direct timestamp heaps ({direct_count}) must not exceed cap ({MAX_DIRECT_TIMESTAMP_HEAPS})"
+        );
+        assert_eq!(direct_count + staged_count, 40);
+        assert!(staged_count >= 40 - MAX_DIRECT_TIMESTAMP_HEAPS);
+
+        // Even while all 40 small heaps are live, a 1M staged timestamp heap must still succeed.
+        let big = QueryHeap::try_new(heap_type::TIMESTAMP, 1_048_576)
+            .expect("1M staged timestamp heap must succeed while 40 small heaps are live");
+        assert!(big.is_staged_timestamp());
+        drop(big);
+        drop(heaps);
+        assert_eq!(LIVE_DIRECT_TIMESTAMP_HEAPS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn scratch_pool_recovers_after_transient_counter_heap_exhaustion() {
+        let Some(d) = super::super::device() else { return };
+        // Exhaust AGX's remaining hardware counter-heap budget temporarily.
+        let mut raw_heaps = Vec::new();
+        for _ in 0..64 {
+            let desc = MTL4CounterHeapDescriptor::new();
+            desc.setType(MTL4CounterHeapType::Timestamp);
+            unsafe { desc.setCount(128) };
+            match d.dev.newCounterHeapWithDescriptor_error(&desc) {
+                Ok(h) => raw_heaps.push(h),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !raw_heaps.is_empty(),
+            "expected at least one raw MTL4CounterHeap allocation before hitting AGX limit"
+        );
+
+        let pool = TimestampScratchPool::new();
+        assert!(
+            pool.ensure_ready().is_err(),
+            "ensure_ready must report an honest error when hardware counter heaps are exhausted"
+        );
+        assert_eq!(pool.stats(), (0, 0), "failed init must not leave partial pool state");
+
+        // Release the raw heaps; the SAME scratch pool must now recover cleanly instead of
+        // remaining permanently stuck in a cached error state.
+        drop(raw_heaps);
+        pool.ensure_ready()
+            .expect("scratch pool must recover once hardware counter-heap capacity is released");
+        assert_eq!(pool.stats(), (1, SLICES_PER_HEAP));
     }
 }
