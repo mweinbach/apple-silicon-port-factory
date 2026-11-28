@@ -3,7 +3,7 @@
 //! and Win32 callback thread dispatch.
 
 use super::xapo::{process_effect_chain, AlignedF32Buf, VoiceEffectSlot};
-use crate::audio::backend::{self, Backend, OutputStream, StreamControl, StreamShared};
+use crate::audio::backend::{self, OutputStream, StreamControl, StreamShared};
 use crate::audio::com::{GUID, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM};
 use crate::audio::format::{
     self, decode_pcm_buffer_f32, SampleType, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
@@ -1173,6 +1173,8 @@ pub(super) struct MasteringRuntime {
     pub(super) wake: Arc<(Mutex<()>, Condvar)>,
     pub(super) shared: Arc<StreamShared>,
     pub(super) control: StreamControl,
+    #[allow(dead_code)]
+    pub(super) device_uid: String,
     mixer_thread: Option<std::thread::JoinHandle<()>>,
     stream: Option<OutputStream>,
 }
@@ -1695,24 +1697,45 @@ impl Drop for EngineCore {
     }
 }
 
-fn choose_output_device() -> backend::DeviceInfo {
+pub(super) fn choose_output_device(device_id: Option<&str>) -> backend::DeviceInfo {
     let headless = std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
         || std::env::var("AW2_HEADLESS").is_ok_and(|v| v == "1");
-    if headless || backend::backend() == Backend::Null {
+    if headless {
         return backend::null_device();
     }
-    backend::output_devices()
-        .into_iter()
-        .next()
-        .unwrap_or_else(backend::null_device)
+    let mut devs = backend::output_devices();
+    if let Some(req) = device_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let req_lower = req.to_ascii_lowercase();
+        let is_swd_path = req_lower.starts_with(r"\\?\swd#mmdevapi#");
+        let matched_idx = devs
+            .iter()
+            .position(|d| {
+                let ep_id = crate::audio::mmdevapi::render_endpoint_id_for_uid(&d.uid);
+                req_lower == ep_id || (is_swd_path && req_lower.contains(&ep_id))
+            })
+            .or_else(|| devs.iter().position(|d| d.uid == req))
+            .or_else(|| devs.iter().position(|d| d.name.eq_ignore_ascii_case(req)));
+        if let Some(idx) = matched_idx {
+            let mut dev = devs.remove(idx);
+            // Explicitly requested endpoint: pin HALOutput to this device rather than
+            // tracking system default switches, even when it is currently index 0.
+            dev.is_default = false;
+            return dev;
+        }
+        log::debug!(
+            target: "audio",
+            "xaudio2: requested szDeviceId {req:?} not found; falling back to default output"
+        );
+    }
+    devs.into_iter().next().unwrap_or_else(backend::null_device)
 }
 
 pub(super) fn spawn_mastering_runtime(
     engine: &Arc<EngineCore>,
+    dev: &backend::DeviceInfo,
     sample_rate: u32,
     channels: usize,
 ) -> Result<MasteringRuntime, String> {
-    let dev = choose_output_device();
     let io_request: u32 = 512;
     let quantum_frames = (sample_rate as usize / 100).clamp(64, 2048);
     let ring_cap = (2 * backend::MAX_SLICE as usize)
@@ -1808,7 +1831,9 @@ pub(super) fn spawn_mastering_runtime(
 
     log::info!(
         target: "audio",
-        "xaudio2: mastering voice opened {} Hz {} ch ({:?}, io={} frames, quantum={} frames)",
+        "xaudio2: mastering voice opened '{}' ({}) {} Hz {} ch ({:?}, io={} frames, quantum={} frames)",
+        dev.name,
+        dev.uid,
         sample_rate,
         channels,
         stream.kind,
@@ -1821,6 +1846,7 @@ pub(super) fn spawn_mastering_runtime(
         wake,
         shared,
         control,
+        device_uid: dev.uid.clone(),
         mixer_thread: Some(mixer_thread),
         stream: Some(stream),
     })

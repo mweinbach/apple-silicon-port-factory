@@ -70,6 +70,99 @@ fn make_stopped_test_engine(
 }
 
 #[test]
+fn mastering_voice_resolves_wasapi_and_swd_device_id() {
+    let _audio_guard = crate::audio::audio_test_lock();
+    backend::force_backend(Some(Backend::Null));
+    let default_dev = backend::null_device();
+    let ds_dev = backend::dualsense_usb_device(0);
+    let ds_uid = ds_dev.uid.clone();
+    let ds_ep_id = crate::audio::mmdevapi::render_endpoint_id_for_uid(&ds_uid);
+    backend::force_output_devices(Some(vec![default_dev.clone(), ds_dev]));
+
+    struct RestoreDevices;
+    impl Drop for RestoreDevices {
+        fn drop(&mut self) {
+            backend::force_output_devices(None);
+        }
+    }
+    let _restore = RestoreDevices;
+
+    unsafe {
+        // 1. Direct WASAPI endpoint ID (`{0.0.0.00000000}.{guid}`) selects the DualSense USB
+        //    4-channel endpoint and defaults input_channels == 0 to 4 channels.
+        let mut xa2: *mut XAudio2Engine = std::ptr::null_mut();
+        assert_eq!(XAudio2Create(&mut xa2, 0, 1), S_OK);
+        xa2_stop_engine(xa2);
+        let ds_id_w = crate::strings::to_wide_z(&ds_ep_id);
+        let mut mv: *mut MasteringVoice = std::ptr::null_mut();
+        assert_eq!(
+            xa2_create_mastering_voice(
+                xa2,
+                &mut mv,
+                0,
+                0,
+                0,
+                ds_id_w.as_ptr(),
+                std::ptr::null(),
+                6
+            ),
+            S_OK
+        );
+        assert_eq!(
+            (&(*xa2).core).runtime.lock().unwrap().as_ref().unwrap().device_uid,
+            ds_uid
+        );
+        let mut details = XAudio2VoiceDetails {
+            creation_flags: 0,
+            active_flags: 0,
+            input_channels: 0,
+            input_sample_rate: 0,
+        };
+        voice_get_voice_details(mv as *mut VoiceHeader, &mut details);
+        assert_eq!({ details.input_channels }, 4);
+        assert_eq!({ details.input_sample_rate }, 48_000);
+        voice_destroy_voice(mv as *mut VoiceHeader);
+        assert_eq!(xa2_release(xa2), 0);
+
+        // 2. WinRT/PnP SWD device interface path (`\\?\SWD#MMDEVAPI#{...}#{guid}`) also matches.
+        let swd_path = format!(
+            r"\\?\SWD#MMDEVAPI#{}#{{e6327cad-d664-4845-a290-00e5a8880222}}",
+            ds_ep_id.to_ascii_uppercase()
+        );
+        let picked_swd = choose_output_device(Some(&swd_path));
+        assert_eq!(picked_swd.uid, ds_uid);
+        assert!(!picked_swd.is_default);
+
+        // 3. Explicitly requesting the *current default* endpoint (index 0) still pins it
+        //    (`is_default == false` -> HALOutput) so system default changes do not redirect it.
+        let default_ep_id = crate::audio::mmdevapi::render_endpoint_id_for_uid(&default_dev.uid);
+        let picked_default_explicit = choose_output_device(Some(&default_ep_id));
+        assert_eq!(picked_default_explicit.uid, default_dev.uid);
+        assert!(
+            !picked_default_explicit.is_default,
+            "explicit szDeviceId matching index 0 must pin HALOutput instead of DefaultOutput"
+        );
+        let default_swd = format!(
+            r"\\?\SWD#MMDEVAPI#{}#{{e6327cad-d664-4845-a290-00e5a8880222}}",
+            default_ep_id.to_ascii_uppercase()
+        );
+        assert!(!choose_output_device(Some(&default_swd)).is_default);
+        assert!(!choose_output_device(Some(&default_dev.uid)).is_default);
+
+        // 4. Null, empty, or unknown szDeviceId selects the default endpoint (`is_default == true`).
+        let picked_none = choose_output_device(None);
+        assert_eq!(picked_none.uid, default_dev.uid);
+        assert!(picked_none.is_default);
+        let picked_empty = choose_output_device(Some(""));
+        assert_eq!(picked_empty.uid, default_dev.uid);
+        assert!(picked_empty.is_default);
+        let picked_unknown = choose_output_device(Some("{0.0.0.00000000}.{deadbeef}"));
+        assert_eq!(picked_unknown.uid, default_dev.uid);
+        assert!(picked_unknown.is_default);
+    }
+}
+
+#[test]
 fn xaudio2_bink_lifecycle() {
     let _audio_guard = crate::audio::audio_test_lock();
     backend::force_backend(Some(Backend::Null));
