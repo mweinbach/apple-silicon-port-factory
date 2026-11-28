@@ -12,12 +12,12 @@ use super::builder::{build_all, split_and_rebase_block};
 #[cfg(test)]
 use super::builder::build_image;
 use super::format::{
-    codegen_hash, decode, image_hash, module_key_hashed, read_cache_file, read_cache_file_in,
-    set_flags, word_to_off, write_atomic, AotKey, BlockEnt, Image, LinkEnt, RelocEnt,
-    AOT_FAR_SLAB, AOT_LSE2_SLAB, FLAG_VERIFY_PENDING,
+    codegen_hash, decode_for_runtime, image_hash, module_key_hashed, read_cache_file,
+    read_cache_file_in, set_flags, word_to_off, write_atomic, AotBytes, AotKey, BlockEnt, Image,
+    LinkEnt, RelocEnt, AOT_FAR_SLAB, AOT_LSE2_SLAB, FLAG_VERIFY_PENDING,
 };
 #[cfg(test)]
-use super::format::{encode, BUILD_VBASE};
+use super::format::{decode, encode, BUILD_VBASE};
 use super::{
     aot_mode, build_request, cache_dir, env_u32_any, fallback_cache_dirs_for, profile_enabled,
     verify_mode, ACTIVATED,
@@ -278,6 +278,37 @@ impl ProbeTab {
             i = (i + 1) & (self.cap - 1);
         }
     }
+
+    /// Wait-free parallel insert of a unique non-zero `(ip, v)` into an unpublished table
+    /// during [`Dir::probe_rebuild`]. Callers guarantee `ip != 0` and `used <= cap / 2`.
+    #[inline(always)]
+    unsafe fn insert_unique_parallel(&self, ip: u64, v: u64) {
+        if ip == 0 {
+            return;
+        }
+        let ents = (self.base + 16) as *const [AtomicU64; 2];
+        let shift = 64 - self.cap.trailing_zeros();
+        let mask = self.cap - 1;
+        let mut i = (ip.wrapping_mul(jit::JMUL) >> shift) as usize;
+        loop {
+            let e = &*ents.add(i);
+            let mut k = e[0].load(Ordering::Relaxed);
+            if k == 0 {
+                match e[0].compare_exchange(0, ip, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        e[1].store(v, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(actual) => k = actual,
+                }
+            }
+            if k == ip {
+                e[1].store(v, Ordering::Relaxed);
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
 }
 
 impl Dir {
@@ -362,32 +393,117 @@ impl Dir {
 
     /// Build a table sized for every live entry of the map and publish it.
     unsafe fn probe_rebuild(&mut self) {
-        let mut live_count = 0usize;
+        self.probe_rebuild_with_workers(aot_install_workers());
+    }
+
+    /// [`Self::probe_rebuild`] parameterized by worker count (also called directly by tests).
+    unsafe fn probe_rebuild_with_workers(&mut self, workers: usize) {
+        let mut total_blocks = 0usize;
+        let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
         if !self.has_overlaps {
+            const CHUNK: usize = 16_384;
+            for (mi, m) in self.modules.iter().enumerate() {
+                if m.gone || m.killed {
+                    continue;
+                }
+                let nb = m.img.blocks.len();
+                total_blocks += nb;
+                let mut lo = 0;
+                while lo < nb {
+                    let hi = (lo + CHUNK).min(nb);
+                    chunks.push((mi, lo, hi));
+                    lo = hi;
+                }
+            }
+        }
+        let use_parallel = !self.has_overlaps
+            && workers > 1
+            && (total_blocks >= PARALLEL_THRESHOLD || (cfg!(test) && total_blocks > 0));
+
+        let live_count = if use_parallel {
+            let n_workers = workers.min(chunks.len().max(1));
+            let next = AtomicUsize::new(0);
+            let total = AtomicUsize::new(0);
+            let modules = &self.modules;
+            let chunks_ref = &chunks;
+            std::thread::scope(|s| {
+                for _ in 0..n_workers {
+                    let next = &next;
+                    let total = &total;
+                    s.spawn(move || {
+                        let mut local = 0usize;
+                        loop {
+                            let ci = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&(mi, lo, hi)) = chunks_ref.get(ci) else { break };
+                            let m = &modules[mi];
+                            for bi in lo..hi {
+                                if !m.img.blocks[bi].host_entry
+                                    && m.dead[bi].load(Ordering::Relaxed) == 0
+                                {
+                                    local += 1;
+                                }
+                            }
+                        }
+                        if local != 0 {
+                            total.fetch_add(local, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            total.load(Ordering::Relaxed)
+        } else if !self.has_overlaps {
+            let mut c = 0usize;
             for m in &self.modules {
                 if m.gone || m.killed {
                     continue;
                 }
                 for (bi, b) in m.img.blocks.iter().enumerate() {
                     if !b.host_entry && m.dead[bi].load(Ordering::Relaxed) == 0 {
-                        live_count += 1;
+                        c += 1;
                     }
                 }
             }
+            c
         } else {
+            let mut c = 0usize;
             for &(mi, bi) in self.map.values() {
                 if self.probe_val_entry(mi, bi) != 0 {
-                    live_count += 1;
+                    c += 1;
                 }
             }
-        }
+            c
+        };
+
         let bits = (2 * live_count).max(2).next_power_of_two().trailing_zeros().max(PROBE_MIN_BITS);
         let cap = 1usize << bits;
         let p = Box::leak(vec![0u64; 2 + 2 * cap].into_boxed_slice()).as_mut_ptr();
         *p = 64 - bits as u64;
         *p.add(1) = cap as u64 - 1;
         let t = ProbeTab { base: p as usize, cap, used: live_count };
-        if !self.has_overlaps {
+        if use_parallel {
+            let n_workers = workers.min(chunks.len().max(1));
+            let next = AtomicUsize::new(0);
+            let modules = &self.modules;
+            let chunks_ref = &chunks;
+            let t_ref = &t;
+            std::thread::scope(|s| {
+                for _ in 0..n_workers {
+                    let next = &next;
+                    s.spawn(move || loop {
+                        let ci = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(mi, lo, hi)) = chunks_ref.get(ci) else { break };
+                        let m = &modules[mi];
+                        for bi in lo..hi {
+                            let b = &m.img.blocks[bi];
+                            if !b.host_entry && m.dead[bi].load(Ordering::Relaxed) == 0 {
+                                let v = m.host_addr(b.code_off) as u64;
+                                t_ref.insert_unique_parallel(b.ip, v);
+                            }
+                        }
+                    });
+                }
+            });
+        } else if !self.has_overlaps {
             for m in &self.modules {
                 if m.gone || m.killed {
                     continue;
@@ -1479,7 +1595,7 @@ pub(super) unsafe fn install_image(
     verify: Verify,
     test: bool,
 ) -> Option<Installed> {
-    install_image_opts(name, base, size, img, verify, test, false)
+    install_image_opts(name, base, size, img, None, verify, test, false)
 }
 
 unsafe fn install_image_opts(
@@ -1487,6 +1603,7 @@ unsafe fn install_image_opts(
     base: usize,
     size: usize,
     img: Image,
+    raw_code: Option<&[u8]>,
     verify: Verify,
     test: bool,
     defer_probe: bool,
@@ -1504,6 +1621,22 @@ unsafe fn install_image_opts(
         return None;
     }
     let code_bytes = img.code_bytes();
+    if let Some(raw) = raw_code {
+        if raw.len() != code_bytes {
+            log::warn!(
+                "emu aot: {name}: raw code slice len {} != expected {code_bytes}; ignored",
+                raw.len()
+            );
+            return None;
+        }
+    } else if img.code.len() * 4 != code_bytes {
+        log::warn!(
+            "emu aot: {name}: heap code buffer len {} != expected {code_bytes}; ignored",
+            img.code.len() * 4
+        );
+        return None;
+    }
+    debug_assert!(verify == Verify::None || img.code.len() * 4 == code_bytes);
     let banks_snap: Vec<(usize, usize)> = img
         .stub_banks()
         .iter()
@@ -1597,17 +1730,73 @@ unsafe fn install_image_opts(
             );
             return None;
         }
-        let code_start_off = banks_snap[bi].0 + AOT_STUBS_BYTES;
-        let code_end_off = banks_snap[bi].1;
-        if code_end_off > code_start_off {
-            let word_lo = (code_start_off - AOT_STUBS_BYTES) / 4;
-            let word_len = (code_end_off - code_start_off) / 4;
-            core::ptr::copy_nonoverlapping(
-                m.img.code.as_ptr().add(word_lo),
-                (rt_base + AOT_STUBS_BYTES) as *mut u32,
-                word_len,
-            );
+    }
+    // Stream machine code straight from `raw_code` (mmap'd `.aot`) or `m.img.code` into `MAP_JIT`.
+    // For multi-megabyte modules, split into 2 MiB chunks across worker threads so initial page
+    // faults and copies scale across cores.
+    let copy_workers = if test || code_bytes < (4 << 20) { 1 } else { aot_install_workers() };
+    let src_bytes: &[u8] = match raw_code {
+        Some(raw) => raw,
+        None => core::slice::from_raw_parts(m.img.code.as_ptr() as *const u8, code_bytes),
+    };
+    if copy_workers <= 1 {
+        for bi in 0..nbanks {
+            let rt_base = region + bank_rt_offs[bi];
+            let code_start_off = banks_snap[bi].0 + AOT_STUBS_BYTES;
+            let code_end_off = banks_snap[bi].1;
+            if code_end_off > code_start_off {
+                let byte_lo = code_start_off - AOT_STUBS_BYTES;
+                let byte_len = code_end_off - code_start_off;
+                core::ptr::copy_nonoverlapping(
+                    src_bytes.as_ptr().add(byte_lo),
+                    (rt_base + AOT_STUBS_BYTES) as *mut u8,
+                    byte_len,
+                );
+            }
         }
+    } else {
+        const COPY_CHUNK: usize = 2 << 20;
+        let mut copy_chunks: Vec<(usize, usize, usize)> = Vec::new();
+        let src_base = src_bytes.as_ptr() as usize;
+        for bi in 0..nbanks {
+            let rt_base = region + bank_rt_offs[bi];
+            let code_start_off = banks_snap[bi].0 + AOT_STUBS_BYTES;
+            let code_end_off = banks_snap[bi].1;
+            if code_end_off > code_start_off {
+                let mut byte_lo = code_start_off - AOT_STUBS_BYTES;
+                let mut dst_addr = rt_base + AOT_STUBS_BYTES;
+                let mut rem = code_end_off - code_start_off;
+                while rem > 0 {
+                    let take = rem.min(COPY_CHUNK);
+                    copy_chunks.push((src_base + byte_lo, dst_addr, take));
+                    byte_lo += take;
+                    dst_addr += take;
+                    rem -= take;
+                }
+            }
+        }
+        let n_workers = copy_workers.min(copy_chunks.len().max(1));
+        let next = AtomicUsize::new(0);
+        let chunks_ref = &copy_chunks;
+        std::thread::scope(|s| {
+            for _ in 0..n_workers {
+                let next = &next;
+                s.spawn(move || {
+                    let _ww = JitWrite::new();
+                    loop {
+                        let ci = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(src_addr, dst_addr, chunk_len)) = chunks_ref.get(ci) else {
+                            break;
+                        };
+                        core::ptr::copy_nonoverlapping(
+                            src_addr as *const u8,
+                            dst_addr as *mut u8,
+                            chunk_len,
+                        );
+                    }
+                });
+            }
+        });
     }
     let (mut bad_verify, mut bad_slot, mut rebased) = (0usize, 0usize, 0usize);
     let mut slots: FastMap<u64, u64> = FastMap::default();
@@ -1832,10 +2021,11 @@ struct DecodedModule {
     from_fallback: bool,
     img: Image,
     flags: u32,
-    /// Retained only when `FLAG_VERIFY_PENDING` is set and the cache is writable (so we can
-    /// clear the flag on disk after verification); dropped immediately otherwise to keep peak
-    /// RAM low during `install_image`.
-    pending_bytes: Option<Vec<u8>>,
+    /// Retained mmap/backing file when either `img.code` was not copied to heap (so
+    /// `install_image_opts` copies straight from `&bytes[code_byte_off..]` into `MAP_JIT`) or
+    /// `FLAG_VERIFY_PENDING` is set on a writable cache (so we can clear the flag on disk).
+    /// Dropped immediately after `install_decoded_module` finishes.
+    backing: Option<(AotBytes, usize)>,
 }
 
 unsafe fn read_and_decode_module(
@@ -1844,6 +2034,7 @@ unsafe fn read_and_decode_module(
     size: usize,
     key: &AotKey,
     dirs: Option<(&Path, &[PathBuf])>,
+    retain_code: bool,
 ) -> Option<DecodedModule> {
     if crate::emu::mem::jit_overlaps(base, base.wrapping_add(size)) {
         log::info!(
@@ -1860,7 +2051,8 @@ unsafe fn read_and_decode_module(
         log::info!("emu aot: {name}: no cache for this build/knobs ({})", path.display());
         return None;
     };
-    let Some((fname, fkey, img, flags)) = decode(&bytes) else {
+    let Some((fname, fkey, img, flags, code_byte_off)) = decode_for_runtime(&bytes, retain_code)
+    else {
         log::warn!("emu aot: {name}: {} is corrupt; ignored", path.display());
         return None;
     };
@@ -1874,8 +2066,9 @@ unsafe fn read_and_decode_module(
         t0.elapsed().as_secs_f64() * 1e3
     );
     let pending = flags & FLAG_VERIFY_PENDING != 0;
-    let pending_bytes = (pending && !from_fallback).then_some(bytes);
-    Some(DecodedModule { path, from_fallback, img, flags, pending_bytes })
+    let need_raw_code = img.code.is_empty() && img.code_bytes() > 0;
+    let backing = (need_raw_code || (pending && !from_fallback)).then_some((bytes, code_byte_off));
+    Some(DecodedModule { path, from_fallback, img, flags, backing })
 }
 
 /// Publish a single coalesced probe table after a multi-module `activate()` batch.
@@ -1917,7 +2110,7 @@ unsafe fn install_decoded_module(
     need_ips: bool,
     defer_probe: bool,
 ) -> Option<Vec<u64>> {
-    let DecodedModule { path, from_fallback, img, flags, pending_bytes } = decoded;
+    let DecodedModule { path, from_fallback, img, flags, backing } = decoded;
     if !from_fallback {
         touch(&path);
     }
@@ -1932,12 +2125,24 @@ unsafe fn install_decoded_module(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
     let verify = load_verify(verify_mode() != 0, pending, nblocks, seed);
-    let r = install_image_opts(name, base, size, img, verify, false, defer_probe)?;
+    let code_bytes = img.code_bytes();
+    let r = {
+        let raw_code = if img.code.is_empty() && code_bytes > 0 {
+            backing
+                .as_ref()
+                .and_then(|(b, off)| b.as_slice().get(*off..(*off).checked_add(code_bytes)?))
+        } else {
+            None
+        };
+        install_image_opts(name, base, size, img, raw_code, verify, false, defer_probe)?
+    };
     if pending {
         let cleared = !from_fallback
             && r.mismatches == 0
-            && pending_bytes.is_some_and(|mut b| {
-                set_flags(&mut b, flags & !FLAG_VERIFY_PENDING) && write_atomic(&path, &b).is_ok()
+            && backing.is_some_and(|(b, _)| {
+                let mut owned = b.as_slice().to_vec();
+                set_flags(&mut owned, flags & !FLAG_VERIFY_PENDING)
+                    && write_atomic(&path, &owned).is_ok()
             });
         log::info!(
             "emu aot: {name}: first load of a background-built cache: {} of {} blocks verified ({}), {} mismatches, {} live; {}",
@@ -1970,7 +2175,7 @@ pub(super) unsafe fn load_module(
     size: usize,
     key: &AotKey,
 ) -> Option<Vec<u64>> {
-    let decoded = read_and_decode_module(name, base, size, key, None)?;
+    let decoded = read_and_decode_module(name, base, size, key, None, verify_mode() != 0)?;
     install_decoded_module(name, base, size, decoded, true, false)
 }
 
@@ -2107,6 +2312,9 @@ pub fn activate() {
             jobs.extend(bg_job(name, *base, *size, key, loaded.as_deref()));
         }
     } else {
+        // Schedule largest images first (stable tie-break) so the biggest `.aot` cache decodes
+        // and installs immediately instead of stalling the pipeline at the tail of the batch.
+        targets.sort_by(|a, b| b.2.cmp(&a.2));
         // Compute thread-local-sensitive key fields once on the caller thread, then hash all
         // mapped executable sections in parallel before pipelining read/decode with install.
         let cg = codegen_hash();
@@ -2131,6 +2339,7 @@ pub fn activate() {
         let fallbacks = fallback_cache_dirs_for(&primary_dir);
         let mode = aot_mode();
         let need_ips = mode == 2;
+        let retain_code = verify_mode() != 0;
         // Coalesce startup `probe_rebuild` into one final pass when no probe table is published
         // yet, avoiding repeated intermediate rebuilds and leaked probe tables across a batch.
         let defer_probe = PROBE.load(Ordering::Relaxed) == 0;
@@ -2152,6 +2361,7 @@ pub fn activate() {
                             *size,
                             key,
                             Some((primary_ref.as_path(), fallbacks_ref.as_slice())),
+                            retain_code,
                         )
                     };
                     if tx.send(dec).is_err() {
@@ -2557,13 +2767,41 @@ mod fast_load_tests {
         let mut bc = Box::new(BlockCache::new());
         let img = unsafe { build_image(&mut *bc, &ips, BUILD_VBASE) }.expect("build_image");
 
-        // Install with `defer_probe = true` (simulating multi-module `activate()`), then publish
-        // once via `flush_probe_table()`.
+        // Round-trip via `decode_for_runtime(..., retain_code_if_clean=false)` so `img.code` is
+        // NOT copied onto the heap and `install_image_opts` streams machine code directly from
+        // `raw_code` into `MAP_JIT`, with `defer_probe = true` followed by parallel `probe_rebuild`.
+        let key = AotKey {
+            image_base: base,
+            image_size: sl.len() as u64,
+            ..AotKey::default()
+        };
+        let encoded = encode("par_batch", &key, &img, 0);
+        let (_, _, img_nocopy, _, code_off) =
+            decode_for_runtime(&encoded, false).expect("decode_for_runtime");
+        assert!(
+            img_nocopy.code.is_empty() && img_nocopy.code_bytes() == img.code_bytes(),
+            "zero-copy runtime decode must omit heap Vec<u32> while preserving code_bytes"
+        );
+        let raw_code = &encoded[code_off..code_off + img_nocopy.code_bytes()];
         let inst = unsafe {
-            install_image_opts("par_batch", base as usize, sl.len(), img, Verify::None, true, true)
+            install_image_opts(
+                "par_batch",
+                base as usize,
+                sl.len(),
+                img_nocopy,
+                Some(raw_code),
+                Verify::None,
+                true,
+                true,
+            )
         }
         .expect("install_image_opts");
         assert_eq!(inst.live, ips.len());
+        unsafe {
+            let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
+            g.as_mut().unwrap().probe_rebuild_with_workers(4);
+        }
+        assert!(test_probe_check().is_ok(), "parallel probe_rebuild_with_workers(4) must match directory");
         unsafe { flush_probe_table() };
         assert!(test_probe_check().is_ok(), "coalesced flush_probe_table must match directory");
 

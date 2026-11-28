@@ -4512,3 +4512,147 @@ fn aot_pdata_leading_int3_and_cross_pdata_interior_branches() {
         );
     }
 }
+
+#[test]
+fn aot_checksum64_matches_h128_and_parallel_decode_mmap_roundtrip() {
+    use super::format::{decode_for_runtime, decode_with_threshold_for_test, H128};
+
+    // 1. H128::checksum64 must be bit-for-bit identical to H128::new(0xC5).bytes(d).finish()[0]
+    //    across every tail length 0..=128 and multi-kilobyte payloads.
+    for len in (0usize..=128).chain([511, 512, 513, 4096, 8197]) {
+        let data: Vec<u8> = (0..len).map(|i| ((i * 131 + 17) & 0xFF) as u8).collect();
+        let mut h = H128::new(0xC5);
+        h.bytes(&data);
+        assert_eq!(
+            H128::checksum64(&data),
+            h.finish()[0],
+            "H128::checksum64 mismatch at len={len}"
+        );
+    }
+
+    // 2. Build a synthetic image with > 64 KiB encoded payload so `read_cache_file_in` exercises
+    //    the zero-copy `AotBytes::Mmap` path, and exercise both serial and parallel decode modes
+    //    (with `copy_code = true` and `copy_code = false`) plus corruption rejection.
+    let mut img = Image::default();
+    img.stubs = [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240];
+    img.stub_banks = vec![0];
+    let n_blocks = 128usize;
+    let words_per_block = 256u32; // 128 * 256 * 4 = 128 KiB code (> 64 KiB mmap threshold)
+    img.code.resize(n_blocks * words_per_block as usize, 0xD503_201F);
+    for bi in 0..n_blocks {
+        let code_off = crate::emu::jit::AOT_STUBS_BYTES as u32 + (bi as u32) * words_per_block * 4;
+        img.blocks.push(super::format::BlockEnt {
+            ip: 0x1_8000_1000 + (bi as u64) * 16,
+            code_off,
+            cold_off: code_off,
+            words: words_per_block,
+            main: words_per_block,
+            guest: 4,
+            host_entry: false,
+            link_lo: bi as u32,
+            link_n: 1,
+            reloc_lo: bi as u32,
+            reloc_n: 1,
+            assume_lo: bi as u32,
+            assume_n: 1,
+        });
+        img.links.push(super::format::LinkEnt {
+            site_off: code_off,
+            fallback_off: code_off + 4,
+            cond_off: u32::MAX,
+            target: 0x1_8000_1000 + (((bi + 1) % n_blocks) as u64) * 16,
+        });
+        img.relocs.push(super::format::RelocEnt {
+            slot_off: (code_off + 8) & !7,
+            kind: crate::emu::jit::RELOC_HOST_FN,
+            bail: false,
+            va: 0x1_8000_9000,
+            src: 0,
+        });
+        img.assume.push((0x1_8000_9000, true));
+    }
+    assert!(img.valid());
+
+    let key = AotKey {
+        image_hash: [0x1234, 0x5678],
+        image_base: 0x1_8000_0000,
+        image_size: 0x10_0000,
+        codegen_hash: 0xCAFE,
+        knobs: 0,
+    };
+    let encoded = encode("par_decode.dll", &key, &img, 0);
+    assert!(encoded.len() >= (64 << 10));
+
+    // Write to a temporary cache directory and read back via `read_cache_file_in` (mmap path).
+    let root = test_dir("mmap-par-decode");
+    std::fs::create_dir_all(&root).unwrap();
+    let fname = format!("par_decode.dll-{:016x}.aot", key.id());
+    std::fs::write(root.join(&fname), &encoded).unwrap();
+    let (_, hit) = read_cache_file_in(&root, &[], "par_decode.dll", &key);
+    let (mapped, from_fb) = hit.expect("cache hit");
+    assert!(!from_fb);
+    #[cfg(unix)]
+    assert!(mapped.is_mmap(), "files >= 64 KiB must use zero-copy mmap");
+    assert_eq!(mapped.as_slice(), encoded.as_slice());
+
+    // Parallel decode (`par_threshold = 0`) with `copy_code = true` must match serial decode.
+    let (n_par, k_par, img_par, fl_par, off_par) =
+        decode_with_threshold_for_test(&mapped, true, 0).expect("parallel decode (copy_code=true)");
+    assert_eq!(n_par, "par_decode.dll");
+    assert_eq!(k_par, key);
+    assert_eq!(fl_par, 0);
+    assert!(img_par.valid());
+    assert_eq!(img_par.blocks.len(), n_blocks);
+    assert_eq!(img_par.links.len(), n_blocks);
+    assert_eq!(img_par.relocs.len(), n_blocks);
+    assert_eq!(img_par.assume.len(), n_blocks);
+    assert_eq!(img_par.code, img.code);
+
+    // Parallel decode with `copy_code = false` must leave `img.code` empty while preserving
+    // `code_bytes()` and exact raw slice bytes at `off_par`.
+    let (_, _, img_nc, _, off_nc) = decode_with_threshold_for_test(&mapped, false, 0)
+        .expect("parallel decode (copy_code=false)");
+    assert_eq!(off_nc, off_par);
+    assert!(img_nc.code.is_empty());
+    assert_eq!(img_nc.code_bytes(), img.code_bytes());
+    let raw_code = &mapped[off_nc..off_nc + img_nc.code_bytes()];
+    assert_eq!(raw_code.len(), img.code.len() * 4);
+    for (i, w) in img.code.iter().enumerate() {
+        assert_eq!(
+            u32::from_le_bytes(raw_code[i * 4..i * 4 + 4].try_into().unwrap()),
+            *w
+        );
+    }
+
+    // `decode_for_runtime` with `FLAG_VERIFY_PENDING` must retain `img.code` even when
+    // `retain_code_if_clean == false`.
+    let mut pending_buf = encoded.clone();
+    assert!(set_flags(&mut pending_buf, super::format::FLAG_VERIFY_PENDING));
+    let (_, _, img_pend, fl_pend, _) =
+        decode_for_runtime(&pending_buf, false).expect("decode_for_runtime pending");
+    assert_eq!(fl_pend, super::format::FLAG_VERIFY_PENDING);
+    assert_eq!(img_pend.code.len(), img.code.len());
+
+    // 1-bit corruption in checksum or payload must be rejected in both serial and parallel paths.
+    let mut bad_sum = encoded.clone();
+    let last = bad_sum.len() - 1;
+    bad_sum[last] ^= 1;
+    assert!(decode_with_threshold_for_test(&bad_sum, true, 0).is_none());
+    assert!(decode_with_threshold_for_test(&bad_sum, false, usize::MAX).is_none());
+
+    let mut bad_block_img = Image::default();
+    bad_block_img.stubs = img.stubs;
+    bad_block_img.stub_banks = vec![0];
+    bad_block_img.code = img.code.clone();
+    bad_block_img.blocks = img.blocks.clone();
+    bad_block_img.links = img.links.clone();
+    bad_block_img.relocs = img.relocs.clone();
+    bad_block_img.assume = img.assume.clone();
+    bad_block_img.blocks[64].code_off = 3; // unaligned & inside stub header -> structurally invalid
+    let bad_struct = encode("par_decode.dll", &key, &bad_block_img, 0);
+    assert!(decode_with_threshold_for_test(&bad_struct, true, 0).is_none());
+    assert!(decode_with_threshold_for_test(&bad_struct, false, usize::MAX).is_none());
+
+    drop(mapped);
+    let _ = std::fs::remove_dir_all(&root);
+}
