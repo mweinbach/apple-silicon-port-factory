@@ -1166,7 +1166,7 @@ fn bundler_and_audit_game_agree_on_v8_cohtml_detection() {
 
 #[test]
 fn parallel_shader_precompile_defaults_to_all_and_honors_cap() {
-    use crate::gpu_shaders::precompile_shaders_for_paths;
+    use crate::gpu_shaders::{plan_shader_precompile_jobs, precompile_shaders_for_paths};
 
     let tmp = make_temp_dir("shader_cap");
     let src_dir = tmp.path().join("shaders_src");
@@ -1176,15 +1176,65 @@ fn parallel_shader_precompile_defaults_to_all_and_honors_cap() {
         fs::write(src_dir.join(format!("comp_{i}.spv")), &spv).unwrap();
     }
 
-    let cache_all = tmp.path().join("cache_all");
-    let all = precompile_shaders_for_paths(&[src_dir.clone()], Some(cache_all), usize::MAX)
-        .expect("precompile all synthetic .spv shaders");
-    assert_eq!(all.active_wave32_exports, 5);
+    // 1. Always verify discovery, uncapped default (`usize::MAX`), explicit cap (`2`), and
+    //    deterministic sorted job ordering without requiring `libmetalirconverter.dylib`
+    //    (runs on CI runners that do not ship Metal Shader Converter).
+    let planned_all = plan_shader_precompile_jobs(&[src_dir.clone()], usize::MAX);
+    assert_eq!(planned_all.len(), 5);
+    assert_eq!(
+        planned_all
+            .iter()
+            .map(|(bin, _, _)| bin.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "comp_0.spv",
+            "comp_1.spv",
+            "comp_2.spv",
+            "comp_3.spv",
+            "comp_4.spv"
+        ]
+    );
 
-    let cache_cap = tmp.path().join("cache_cap");
-    let capped = precompile_shaders_for_paths(&[src_dir], Some(cache_cap), 2)
-        .expect("precompile capped synthetic .spv shaders");
-    assert_eq!(capped.active_wave32_exports, 2);
+    let planned_cap = plan_shader_precompile_jobs(&[src_dir.clone()], 2);
+    assert_eq!(planned_cap.len(), 2);
+    assert_eq!(
+        planned_cap
+            .iter()
+            .map(|(bin, _, _)| bin.as_str())
+            .collect::<Vec<_>>(),
+        vec!["comp_0.spv", "comp_1.spv"]
+    );
+
+    // 2. Full end-to-end parallel compilation when Metal Shader Converter is installed
+    //    (matching `gpu_shaders::tests::audits_and_precompiles_embedded_pe_and_vulkan_spirv_shaders`).
+    //    When unavailable (e.g. GitHub Actions macOS runners), assert an honest error instead
+    //    of faking a pass.
+    let cache_all = tmp.path().join("cache_all");
+    if dxil_metal::converter_available() {
+        let all = precompile_shaders_for_paths(&[src_dir.clone()], Some(cache_all), usize::MAX)
+            .expect("precompile all synthetic .spv shaders");
+        assert_eq!(all.active_wave32_exports, 5);
+
+        let cache_cap = tmp.path().join("cache_cap");
+        let capped = precompile_shaders_for_paths(&[src_dir], Some(cache_cap), 2)
+            .expect("precompile capped synthetic .spv shaders");
+        assert_eq!(capped.active_wave32_exports, 2);
+
+        if dxil_metal::spirv_metal::metal_toolchain_available() {
+            assert_eq!(all.active_wave32_converted, 5);
+            assert_eq!(all.active_wave32_failed, 0);
+            assert_eq!(capped.active_wave32_converted, 2);
+            assert_eq!(capped.active_wave32_failed, 0);
+        }
+    } else {
+        eprintln!(
+            "note: skipping end-to-end precompile_shaders_for_paths (Metal Shader Converter unavailable)"
+        );
+        assert!(
+            precompile_shaders_for_paths(&[src_dir], Some(cache_all), usize::MAX).is_err(),
+            "precompile_shaders_for_paths must fail honestly when libmetalirconverter.dylib is absent"
+        );
+    }
 }
 
 #[test]

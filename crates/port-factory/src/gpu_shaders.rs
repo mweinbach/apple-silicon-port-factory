@@ -475,20 +475,8 @@ pub struct ShaderPrecompileSummary {
     pub failures: Vec<String>,
 }
 
-/// Scans one or more files or directories (`.exe`, `.dll`, `.dxbc`, `.dxil`, `.cso`, `.fxo`,
-/// `.spv`, `.spirv`, `.wgsl`, `.metal`) for DirectX `DXBC`/`DXIL` and Vulkan `SPIR-V` shaders
-/// and AOT pre-compiles them into `cache_dir` (defaulting to `~/Translator/ShaderCache`).
-pub fn precompile_shaders_for_paths(
-    inputs: &[PathBuf],
-    cache_dir: Option<PathBuf>,
-    limit: usize,
-) -> Result<ShaderPrecompileSummary> {
-    let t0 = Instant::now();
-    let resolved_cache_dir = cache_dir.unwrap_or_else(WinFs::default_shader_cache_dir);
-    std::fs::create_dir_all(&resolved_cache_dir)
-        .with_context(|| format!("create shader cache dir {}", resolved_cache_dir.display()))?;
-
-    fn collect_shader_targets_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn collect_shader_target_files(inputs: &[PathBuf]) -> Vec<PathBuf> {
+    fn collect_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if depth > 3 {
             return;
         }
@@ -509,7 +497,7 @@ pub fn precompile_shaders_for_paths(
                 ) {
                     continue;
                 }
-                collect_shader_targets_recursive(&ep, depth + 1, out);
+                collect_recursive(&ep, depth + 1, out);
             } else if ep.is_file() {
                 if ep.extension().is_some_and(|e| {
                     let s = e.to_string_lossy();
@@ -534,14 +522,26 @@ pub fn precompile_shaders_for_paths(
         if p.is_file() {
             target_files.push(p.clone());
         } else if p.is_dir() {
-            collect_shader_targets_recursive(p, 0, &mut target_files);
+            collect_recursive(p, 0, &mut target_files);
         }
     }
     target_files.sort();
     target_files.dedup();
+    target_files
+}
 
-    let mut all_dxbc_shaders: Vec<PeEmbeddedShader> = Vec::new();
-    let mut all_spirv_shaders: Vec<PeEmbeddedSpirvShader> = Vec::new();
+struct DiscoveredShaders {
+    files_scanned: usize,
+    files_with_shaders: usize,
+    by_binary: BTreeMap<String, (usize, usize, usize)>,
+    dxbc: Vec<PeEmbeddedShader>,
+    spirv: Vec<PeEmbeddedSpirvShader>,
+}
+
+fn discover_shaders_for_paths(inputs: &[PathBuf]) -> DiscoveredShaders {
+    let target_files = collect_shader_target_files(inputs);
+    let mut dxbc: Vec<PeEmbeddedShader> = Vec::new();
+    let mut spirv: Vec<PeEmbeddedSpirvShader> = Vec::new();
     let mut files_with_shaders = 0usize;
     let mut by_binary: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
 
@@ -560,7 +560,7 @@ pub fn precompile_shaders_for_paths(
             if !spv_list.is_empty() {
                 files_with_shaders += 1;
                 by_binary.entry(name).or_default().0 += spv_list.len();
-                all_spirv_shaders.extend(spv_list);
+                spirv.extend(spv_list);
                 continue;
             }
         }
@@ -576,10 +576,116 @@ pub fn precompile_shaders_for_paths(
         if count > 0 {
             files_with_shaders += 1;
             by_binary.entry(name).or_default().0 += count;
-            all_dxbc_shaders.extend(extracted_dxbc);
-            all_spirv_shaders.extend(extracted_spirv);
+            dxbc.extend(extracted_dxbc);
+            spirv.extend(extracted_spirv);
         }
     }
+
+    DiscoveredShaders {
+        files_scanned: target_files.len(),
+        files_with_shaders,
+        by_binary,
+        dxbc,
+        spirv,
+    }
+}
+
+enum ShaderCompileJob<'a> {
+    Dxbc {
+        shader: &'a PeEmbeddedShader,
+        entry_point: String,
+        profile: String,
+    },
+    Spirv {
+        shader: &'a PeEmbeddedSpirvShader,
+        entry_point: String,
+        profile: String,
+    },
+}
+
+fn select_shader_compile_jobs<'a>(
+    all_dxbc_shaders: &'a [PeEmbeddedShader],
+    all_spirv_shaders: &'a [PeEmbeddedSpirvShader],
+    limit: usize,
+) -> (Vec<ShaderCompileJob<'a>>, usize) {
+    let mut wave64_skipped = 0usize;
+    let mut jobs: Vec<ShaderCompileJob<'_>> = Vec::new();
+    'outer_dxbc: for sh in all_dxbc_shaders {
+        if sh.is_wave64 {
+            wave64_skipped += sh.exports().len();
+            continue;
+        }
+        for exp in sh.exports() {
+            if jobs.len() >= limit {
+                break 'outer_dxbc;
+            }
+            jobs.push(ShaderCompileJob::Dxbc {
+                shader: sh,
+                entry_point: exp.entry_point,
+                profile: exp.profile,
+            });
+        }
+    }
+    'outer_spirv: for spv in all_spirv_shaders {
+        for ep in &spv.entry_points {
+            if jobs.len() >= limit {
+                break 'outer_spirv;
+            }
+            jobs.push(ShaderCompileJob::Spirv {
+                shader: spv,
+                entry_point: ep.name.clone(),
+                profile: ep.profile.clone(),
+            });
+        }
+    }
+    (jobs, wave64_skipped)
+}
+
+/// Pure discovery + cap + deterministic ordering planner (requires no Metal Shader Converter
+/// dylib), returning `(binary_name, entry_point, profile)` tuples in execution order.
+#[cfg(test)]
+pub(crate) fn plan_shader_precompile_jobs(
+    inputs: &[PathBuf],
+    limit: usize,
+) -> Vec<(String, String, String)> {
+    let discovered = discover_shaders_for_paths(inputs);
+    let (jobs, _) = select_shader_compile_jobs(&discovered.dxbc, &discovered.spirv, limit);
+    jobs.into_iter()
+        .map(|job| match job {
+            ShaderCompileJob::Dxbc {
+                shader,
+                entry_point,
+                profile,
+            } => (shader.binary_name.clone(), entry_point, profile),
+            ShaderCompileJob::Spirv {
+                shader,
+                entry_point,
+                profile,
+            } => (shader.binary_name.clone(), entry_point, profile),
+        })
+        .collect()
+}
+
+/// Scans one or more files or directories (`.exe`, `.dll`, `.dxbc`, `.dxil`, `.cso`, `.fxo`,
+/// `.spv`, `.spirv`, `.wgsl`, `.metal`) for DirectX `DXBC`/`DXIL` and Vulkan `SPIR-V` shaders
+/// and AOT pre-compiles them into `cache_dir` (defaulting to `~/Translator/ShaderCache`).
+pub fn precompile_shaders_for_paths(
+    inputs: &[PathBuf],
+    cache_dir: Option<PathBuf>,
+    limit: usize,
+) -> Result<ShaderPrecompileSummary> {
+    let t0 = Instant::now();
+    let resolved_cache_dir = cache_dir.unwrap_or_else(WinFs::default_shader_cache_dir);
+    std::fs::create_dir_all(&resolved_cache_dir)
+        .with_context(|| format!("create shader cache dir {}", resolved_cache_dir.display()))?;
+
+    let DiscoveredShaders {
+        files_scanned,
+        files_with_shaders,
+        mut by_binary,
+        dxbc: all_dxbc_shaders,
+        spirv: all_spirv_shaders,
+    } = discover_shaders_for_paths(inputs);
 
     let dxil_containers = all_dxbc_shaders.iter().filter(|s| !s.is_sm4_5).count();
     let sm4_5_containers = all_dxbc_shaders.iter().filter(|s| s.is_sm4_5).count();
@@ -599,50 +705,8 @@ pub fn precompile_shaders_for_paths(
         .map_err(|e| anyhow::anyhow!("failed to initialize Metal ShaderPipeline: {e}"))?;
 
     let compile_opts = CompileOptions::default();
-    let mut wave64_skipped = 0usize;
-
-    enum ShaderCompileJob<'a> {
-        Dxbc {
-            shader: &'a PeEmbeddedShader,
-            entry_point: String,
-            profile: String,
-        },
-        Spirv {
-            shader: &'a PeEmbeddedSpirvShader,
-            entry_point: String,
-            profile: String,
-        },
-    }
-
-    let mut jobs: Vec<ShaderCompileJob<'_>> = Vec::new();
-    'outer_dxbc: for sh in &all_dxbc_shaders {
-        if sh.is_wave64 {
-            wave64_skipped += sh.exports().len();
-            continue;
-        }
-        for exp in sh.exports() {
-            if jobs.len() >= limit {
-                break 'outer_dxbc;
-            }
-            jobs.push(ShaderCompileJob::Dxbc {
-                shader: sh,
-                entry_point: exp.entry_point,
-                profile: exp.profile,
-            });
-        }
-    }
-    'outer_spirv: for spv in &all_spirv_shaders {
-        for ep in &spv.entry_points {
-            if jobs.len() >= limit {
-                break 'outer_spirv;
-            }
-            jobs.push(ShaderCompileJob::Spirv {
-                shader: spv,
-                entry_point: ep.name.clone(),
-                profile: ep.profile.clone(),
-            });
-        }
-    }
+    let (jobs, wave64_skipped) =
+        select_shader_compile_jobs(&all_dxbc_shaders, &all_spirv_shaders, limit);
 
     struct ShaderJobOutcome {
         idx: usize,
@@ -788,7 +852,7 @@ pub fn precompile_shaders_for_paths(
         converter_fingerprint: pipeline.converter_fingerprint().to_string(),
         dxilconv_available: dxil_metal::dxilconv::available(),
         spirv_metal_available: metal_toolchain_available(),
-        files_scanned: target_files.len(),
+        files_scanned,
         files_with_shaders,
         total_containers,
         unique_containers,
