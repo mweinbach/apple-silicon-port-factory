@@ -582,11 +582,25 @@ impl<'a> Parser<'a> {
                     _ => "",
                 };
                 let ty = self.parse_type(false)?;
+                // Skip optional x64/MS extended storage qualifiers (`E` __ptr64, `F` __unaligned, `I` __restrict)
+                // before the trailing storage CV qualifier (`A`/`B`/`C`/`D`).
+                while matches!(self.peek(), Some(b'E' | b'F' | b'I')) {
+                    self.pos += 1;
+                }
+                let cv = if self.peek().is_some() {
+                    self.parse_cv()?
+                } else {
+                    ""
+                };
                 let mut out = String::new();
                 if (self.flags & UNDNAME_NO_ACCESS_SPECIFIERS) == 0 {
                     out.push_str(access);
                 }
                 out.push_str(&ty);
+                if !cv.is_empty() {
+                    out.push(' ');
+                    out.push_str(cv);
+                }
                 out.push(' ');
                 out.push_str(&qname);
                 return Some(out);
@@ -835,6 +849,19 @@ mod tests {
         assert_eq!(
             demangle_msvc("??1Widget@ui@@UEAA@XZ", 0),
             "public: virtual __cdecl ui::Widget::~Widget(void)"
+        );
+
+        // Decorated data symbols preserve trailing const/volatile storage qualifiers.
+        assert_eq!(demangle_msvc("?k@A@@2HB", 0), "public: static int const A::k");
+        assert_eq!(demangle_msvc("?v@A@@2HC", 0), "public: static int volatile A::v");
+        assert_eq!(
+            demangle_msvc("?cv@A@@2HD", 0),
+            "public: static int const volatile A::cv"
+        );
+        assert_eq!(demangle_msvc("?g@@3HA", 0), "int g");
+        assert_eq!(
+            demangle_msvc("?p@A@@2PEBHEB", UNDNAME_NO_MS_KEYWORDS),
+            "public: static int const * const A::p"
         );
 
         // Non-mangled C names pass through unchanged; deeply nested garbage never panics.

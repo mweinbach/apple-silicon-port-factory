@@ -675,31 +675,95 @@ pub unsafe extern "win64" fn _wsplitpath_s(
     0
 }
 
-fn compose_win_path(drive: Option<&str>, dir: Option<&str>, fname: Option<&str>, ext: Option<&str>) -> String {
-    let mut out = String::new();
+fn narrow_dir_ends_with_sep(dir: &[u8]) -> bool {
+    if dir.is_empty() {
+        return false;
+    }
+    let cp = unsafe { super::locale::_getmbcp().max(0) as u32 };
+    if cp == 0 || cp == 65001 {
+        return matches!(dir.last(), Some(b'\\' | b'/'));
+    }
+    // Walk DBCS character boundaries so a 0x5C trail byte (e.g. CP932 '表' = [0x95, 0x5C])
+    // is not mistaken for a trailing backslash separator.
+    let mut i = 0usize;
+    let mut last_single = None;
+    while i < dir.len() {
+        if unsafe { crate::kernel32::string::IsDBCSLeadByteEx(cp, dir[i]) != 0 } && i + 1 < dir.len() {
+            last_single = None;
+            i += 2;
+        } else {
+            last_single = Some(dir[i]);
+            i += 1;
+        }
+    }
+    matches!(last_single, Some(b'\\' | b'/'))
+}
+
+fn compose_win_path_bytes(
+    drive: Option<&[u8]>,
+    dir: Option<&[u8]>,
+    fname: Option<&[u8]>,
+    ext: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
     if let Some(d) = drive {
-        if let Some(ch) = d.chars().next() {
-            out.push(ch);
-            out.push(':');
+        if let Some(&b0) = d.first() {
+            out.push(b0);
+            out.push(b':');
         }
     }
     if let Some(dr) = dir {
         if !dr.is_empty() {
-            out.push_str(dr);
-            if !dr.ends_with('\\') && !dr.ends_with('/') {
-                out.push('\\');
+            out.extend_from_slice(dr);
+            if !narrow_dir_ends_with_sep(dr) {
+                out.push(b'\\');
             }
         }
     }
     if let Some(f) = fname {
-        out.push_str(f);
+        out.extend_from_slice(f);
     }
     if let Some(e) = ext {
         if !e.is_empty() {
-            if !e.starts_with('.') {
-                out.push('.');
+            if e[0] != b'.' {
+                out.push(b'.');
             }
-            out.push_str(e);
+            out.extend_from_slice(e);
+        }
+    }
+    out
+}
+
+fn compose_win_path_wide(
+    drive: Option<&[u16]>,
+    dir: Option<&[u16]>,
+    fname: Option<&[u16]>,
+    ext: Option<&[u16]>,
+) -> Vec<u16> {
+    let mut out = Vec::new();
+    if let Some(d) = drive {
+        if let Some(&u0) = d.first() {
+            out.push(u0);
+            out.push(b':' as u16);
+        }
+    }
+    if let Some(dr) = dir {
+        if !dr.is_empty() {
+            out.extend_from_slice(dr);
+            if !matches!(dr.last().copied(), Some(0x005C | 0x002F)) {
+                out.push(b'\\' as u16);
+            }
+        }
+    }
+    if let Some(f) = fname {
+        out.extend_from_slice(f);
+    }
+    if let Some(e) = ext {
+        if !e.is_empty() {
+            if e[0] != b'.' as u16 {
+                out.push(b'.' as u16);
+            }
+            out.extend_from_slice(e);
         }
     }
     out
@@ -718,12 +782,11 @@ pub unsafe extern "win64" fn _makepath_s(
         super::runtime::invalid_parameter("_makepath_s");
         return EINVAL;
     }
-    let d = if drive.is_null() { None } else { Some(from_ansi(drive)) };
-    let dr = if dir.is_null() { None } else { Some(from_ansi(dir)) };
-    let f = if fname.is_null() { None } else { Some(from_ansi(fname)) };
-    let e = if ext.is_null() { None } else { Some(from_ansi(ext)) };
-    let full = compose_win_path(d.as_deref(), dr.as_deref(), f.as_deref(), e.as_deref());
-    let bytes = full.as_bytes();
+    let d = if drive.is_null() { None } else { Some(crate::strings::cstr_slice(drive)) };
+    let dr = if dir.is_null() { None } else { Some(crate::strings::cstr_slice(dir)) };
+    let f = if fname.is_null() { None } else { Some(crate::strings::cstr_slice(fname)) };
+    let e = if ext.is_null() { None } else { Some(crate::strings::cstr_slice(ext)) };
+    let bytes = compose_win_path_bytes(d, dr, f, e);
     if bytes.len() + 1 > size {
         *path = 0;
         errno::set(ERANGE);
@@ -758,12 +821,27 @@ pub unsafe extern "win64" fn _wmakepath_s(
         super::runtime::invalid_parameter("_wmakepath_s");
         return EINVAL;
     }
-    let d = if drive.is_null() { None } else { Some(from_wide(drive)) };
-    let dr = if dir.is_null() { None } else { Some(from_wide(dir)) };
-    let f = if fname.is_null() { None } else { Some(from_wide(fname)) };
-    let e = if ext.is_null() { None } else { Some(from_wide(ext)) };
-    let full = compose_win_path(d.as_deref(), dr.as_deref(), f.as_deref(), e.as_deref());
-    let units: Vec<u16> = full.encode_utf16().collect();
+    let d = if drive.is_null() {
+        None
+    } else {
+        Some(crate::strings::read_wide_units_z(drive, crate::strings::DEFAULT_MAX_STR_LEN))
+    };
+    let dr = if dir.is_null() {
+        None
+    } else {
+        Some(crate::strings::read_wide_units_z(dir, crate::strings::DEFAULT_MAX_STR_LEN))
+    };
+    let f = if fname.is_null() {
+        None
+    } else {
+        Some(crate::strings::read_wide_units_z(fname, crate::strings::DEFAULT_MAX_STR_LEN))
+    };
+    let e = if ext.is_null() {
+        None
+    } else {
+        Some(crate::strings::read_wide_units_z(ext, crate::strings::DEFAULT_MAX_STR_LEN))
+    };
+    let units = compose_win_path_wide(d.as_deref(), dr.as_deref(), f.as_deref(), e.as_deref());
     if units.len() + 1 > size {
         path.write_unaligned(0);
         errno::set(ERANGE);
@@ -865,6 +943,27 @@ mod tests {
                 0
             );
             assert_eq!(from_ansi(out.as_ptr()), "D:sub/.bin");
+
+            // Narrow _makepath_s preserves arbitrary non-UTF-8 bytes verbatim (e.g. CP932)
+            // without UTF-8 replacement expansion, and recognizes DBCS 0x5C trail bytes.
+            let prev_mbcp = crate::ucrt::locale::_getmbcp();
+            assert_eq!(crate::ucrt::locale::_setmbcp(932), 0);
+            let mut exact = [0u8; 8]; // "C:\x95\x5C\\\x82\xA0\0" = 8 bytes
+            let cp932_dir: [u8; 3] = [0x95, 0x5C, 0]; // '表' ends with 0x5C trail byte, not '\\'
+            let cp932_fname: [u8; 3] = [0x82, 0xA0, 0]; // 'あ'
+            assert_eq!(
+                _makepath_s(
+                    exact.as_mut_ptr(),
+                    exact.len(),
+                    b"C\0".as_ptr(),
+                    cp932_dir.as_ptr(),
+                    cp932_fname.as_ptr(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(&exact, &[b'C', b':', 0x95, 0x5C, b'\\', 0x82, 0xA0, 0]);
+            assert_eq!(crate::ucrt::locale::_setmbcp(prev_mbcp), 0);
 
             // Wide _wmakepath_s with unaligned input & output buffers.
             let write_odd_wide = |s: &str| -> Vec<u8> {
