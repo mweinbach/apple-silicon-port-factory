@@ -82,13 +82,73 @@ pub fn force_input_devices(devs: Option<Vec<DeviceInfo>>) {
     *FORCED_INPUT_DEVICES.lock().unwrap() = devs;
 }
 
+fn parse_backend_value(val: Option<&str>) -> Option<Backend> {
+    let s = val?.trim();
+    if s.eq_ignore_ascii_case("null") {
+        Some(Backend::Null)
+    } else if s.eq_ignore_ascii_case("coreaudio") {
+        Some(Backend::CoreAudio)
+    } else {
+        None
+    }
+}
+
+fn resolve_env_backend(port_val: Option<&str>, legacy_val: Option<&str>) -> Option<Backend> {
+    let chosen = port_val
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| legacy_val.filter(|s| !s.trim().is_empty()));
+    parse_backend_value(chosen)
+}
+
+fn resolve_use_null_in_headless(
+    port_backend: Option<&str>,
+    legacy_backend: Option<&str>,
+    port_headless: Option<&str>,
+    legacy_headless: Option<&str>,
+) -> bool {
+    if let Some(b) = resolve_env_backend(port_backend, legacy_backend) {
+        return b == Backend::Null;
+    }
+    port_headless.is_some_and(|v| v.trim() == "1")
+        || legacy_headless.is_some_and(|v| v.trim() == "1")
+}
+
+/// Explicit backend requested via `PORT_AUDIO_BACKEND` (legacy alias `AW2_AUDIO_BACKEND`).
+pub(crate) fn env_backend() -> Option<Backend> {
+    let port_val = std::env::var("PORT_AUDIO_BACKEND").ok();
+    let legacy_val = std::env::var("AW2_AUDIO_BACKEND").ok();
+    resolve_env_backend(port_val.as_deref(), legacy_val.as_deref())
+}
+
+/// Whether middleware/spatial audio sinks (XAudio2, Spatial Audio, Bink2) should
+/// route to the null output device instead of opening host CoreAudio hardware.
+///
+/// An explicit `PORT_AUDIO_BACKEND` / `AW2_AUDIO_BACKEND` override takes precedence
+/// over `PORT_HEADLESS` / `AW2_HEADLESS`:
+/// - `coreaudio` forces real CoreAudio output even in headless runs;
+/// - `null` forces null output even in non-headless runs.
+pub(crate) fn use_null_in_headless_mode() -> bool {
+    let port_backend = std::env::var("PORT_AUDIO_BACKEND").ok();
+    let legacy_backend = std::env::var("AW2_AUDIO_BACKEND").ok();
+    let port_headless = std::env::var("PORT_HEADLESS").ok();
+    let legacy_headless = std::env::var("AW2_HEADLESS").ok();
+    resolve_use_null_in_headless(
+        port_backend.as_deref(),
+        legacy_backend.as_deref(),
+        port_headless.as_deref(),
+        legacy_headless.as_deref(),
+    )
+}
+
 pub fn backend() -> Backend {
     if let Some(b) = *FORCED.lock().unwrap() {
         return b;
     }
-    match std::env::var("AW2_AUDIO_BACKEND").as_deref() {
-        Ok("null") => Backend::Null,
-        _ if cfg!(any(target_os = "macos", target_os = "ios")) => Backend::CoreAudio,
+    match env_backend() {
+        Some(Backend::Null) => Backend::Null,
+        Some(Backend::CoreAudio) | None if cfg!(any(target_os = "macos", target_os = "ios")) => {
+            Backend::CoreAudio
+        }
         _ => Backend::Null,
     }
 }
@@ -155,8 +215,12 @@ pub fn output_devices() -> Vec<DeviceInfo> {
         Backend::CoreAudio => ca_sync(ca::output_devices),
         _ => Vec::new(),
     };
-    if let Ok(want) = std::env::var("AW2_AUDIO_DEVICE") {
-        if !want.is_empty() && !v.is_empty() {
+    let want_device = std::env::var("PORT_AUDIO_DEVICE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("AW2_AUDIO_DEVICE").ok().filter(|s| !s.is_empty()));
+    if let Some(want) = want_device {
+        if !v.is_empty() {
             select_device(&mut v, &want);
         }
     }
@@ -2599,5 +2663,31 @@ mod tap_tests {
         assert!(samples.iter().all(|&s| s == 0.0));
 
         crate::audio::mmdevapi::reset_endpoint_software_gains_for_test();
+    }
+
+    #[test]
+    fn port_audio_backend_precedence_and_headless_override() {
+        assert_eq!(super::resolve_env_backend(None, None), None);
+        assert_eq!(super::resolve_env_backend(Some("null"), None), Some(super::Backend::Null));
+        assert_eq!(super::resolve_env_backend(Some("CoreAudio"), None), Some(super::Backend::CoreAudio));
+        assert_eq!(super::resolve_env_backend(None, Some("null")), Some(super::Backend::Null));
+        // PORT_AUDIO_BACKEND overrides legacy AW2_AUDIO_BACKEND; empty PORT falls back.
+        assert_eq!(
+            super::resolve_env_backend(Some("coreaudio"), Some("null")),
+            Some(super::Backend::CoreAudio)
+        );
+        assert_eq!(
+            super::resolve_env_backend(Some("   "), Some("null")),
+            Some(super::Backend::Null)
+        );
+
+        // Headless defaults to Null unless explicitly overridden with coreaudio.
+        assert!(!super::resolve_use_null_in_headless(None, None, None, None));
+        assert!(super::resolve_use_null_in_headless(None, None, Some("1"), None));
+        assert!(super::resolve_use_null_in_headless(None, None, None, Some("1")));
+        assert!(!super::resolve_use_null_in_headless(Some("coreaudio"), None, Some("1"), None));
+        assert!(!super::resolve_use_null_in_headless(None, Some("coreaudio"), Some("1"), None));
+        assert!(super::resolve_use_null_in_headless(Some("null"), None, Some("0"), None));
+        assert!(super::resolve_use_null_in_headless(Some("null"), Some("coreaudio"), None, None));
     }
 }
