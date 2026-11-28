@@ -198,6 +198,17 @@ pub struct FfxReactiveParams {
     pub _pad1: f32,
 }
 
+/// Parameters for `ResolveQueryData(D3D12_QUERY_TYPE_BINARY_OCCLUSION)` normalization
+/// (matches MSL `BinaryOcclResolveParams`): maps each 64-bit visibility slot to strictly `0` or `1`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BinaryOcclResolveParams {
+    pub src: u64,
+    pub dst: u64,
+    pub count: u32,
+    pub _pad: u32,
+}
+
 pub fn bytes_of<T: Copy>(t: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(t as *const T as *const u8, std::mem::size_of::<T>()) }
 }
@@ -205,6 +216,15 @@ pub fn bytes_of<T: Copy>(t: &T) -> &[u8] {
 const SRC_HEAD: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+
+struct BinaryOcclResolveParams { const device ulong* src; device uint* dst; uint count; uint pad; };
+kernel void port_resolve_binary_occl(constant BinaryOcclResolveParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    if (i < p.count) {
+        uint v = p.src[i] != 0ul ? 1u : 0u;
+        p.dst[i * 2u] = v;
+        p.dst[i * 2u + 1u] = 0u;
+    }
+}
 
 struct FillParams { device uint* dst; uint words; uint period; uint pattern[4]; };
 kernel void port_fill(constant FillParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
@@ -618,7 +638,7 @@ unsafe impl Send for Kernels {}
 unsafe impl Sync for Kernels {}
 
 fn default_tg(name: &str) -> [u32; 3] {
-    if name == "port_fill" || name == "port_fill_v4" {
+    if name == "port_fill" || name == "port_fill_v4" || name == "port_resolve_binary_occl" {
         [64, 1, 1]
     } else if name.ends_with("_t4")
         || name == "port_clamp_f16_inf_2d"
@@ -631,7 +651,7 @@ fn default_tg(name: &str) -> [u32; 3] {
 }
 
 fn fast_tg(name: &str) -> [u32; 3] {
-    if name == "port_fill" || name == "port_fill_v4" {
+    if name == "port_fill" || name == "port_fill_v4" || name == "port_resolve_binary_occl" {
         [256, 1, 1]
     } else if name.ends_with("_t4")
         || name == "port_clamp_f16_inf_2d"
@@ -654,6 +674,7 @@ fn kernels() -> &'static Kernels {
             let mut names = vec![
                 "port_fill".to_string(),
                 "port_fill_v4".to_string(),
+                "port_resolve_binary_occl".to_string(),
                 "port_upscale_2d_f".to_string(),
                 "port_ffx_gen_reactive_2d".to_string(),
                 "port_ffx_gen_reactive_2d_b2".to_string(),
@@ -856,6 +877,7 @@ mod tests {
     fn params_layout() {
         assert_eq!(std::mem::size_of::<FillParams>(), 32);
         assert_eq!(std::mem::size_of::<TexParams>(), 64);
+        assert_eq!(std::mem::size_of::<BinaryOcclResolveParams>(), 24);
     }
 
     #[test]
@@ -864,6 +886,7 @@ mod tests {
             return;
         }
         kernel("port_fill").unwrap();
+        kernel("port_resolve_binary_occl").unwrap();
         kernel("port_clear_3d_i").unwrap();
     }
 

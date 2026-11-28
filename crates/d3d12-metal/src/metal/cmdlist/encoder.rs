@@ -231,6 +231,7 @@ impl CommandList {
         // earlier producer. Cleared only when drained, on a full `All -> PRE_RASTER` barrier, or
         // on `BarrierState::reset()`.
         self.bar.list_blit_unwaited_stages = MTLStages::empty();
+        self.enc_ts_count = 0;
         let enc = std::mem::replace(&mut self.enc, Encoder::None);
         if matches!(enc, Encoder::None) {
             return;
@@ -521,6 +522,13 @@ impl CommandList {
                 }
             }
             Encoder::Compute(e) => {
+                if std::mem::replace(&mut self.bar.ts_buf_blit_read, false) {
+                    e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                        MTLStages::Blit,
+                        MTLStages::Blit,
+                        MTL4VisibilityOptions::Device,
+                    );
+                }
                 e.endEncoding();
                 for (i, &bit) in STAGE_BITS.iter().enumerate() {
                     if ran.contains(bit) {
@@ -1987,9 +1995,10 @@ impl CommandList {
             };
             unsafe { e.setVisibilityResultMode_offset(mode, o.index as usize * 8) };
             let q_buf_ptr = &*o.buffer as *const crate::metal::resource::MtlBuffer as usize;
-            // `begin_barrier` above just consumed any pending `Blit -> Fragment` wait for this
-            // visibility buffer, so clear its resolve-read WAR marker now that a render pass opened.
+            // `begin_barrier` above just consumed any pending `Blit`/`Dispatch -> Fragment` wait for
+            // this visibility buffer, so clear its resolve-read WAR markers now that a render pass opened.
             self.bar.vis_buf_blit_read.retain(|&p| p != q_buf_ptr);
+            self.bar.vis_buf_cs_read.retain(|&p| p != q_buf_ptr);
             self.enc_vis_buf = Some(q_buf_ptr);
             self.enc_vis_reset = use_vis_reset;
             self.enc_vis_used_indices.clear();

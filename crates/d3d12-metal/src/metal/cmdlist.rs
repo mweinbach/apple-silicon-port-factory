@@ -208,6 +208,12 @@ pub struct CommandList {
     enc_vis_reset: bool,
     /// Query slot indices already enabled in the open `Reset` render pass.
     enc_vis_used_indices: Vec<u32>,
+    /// Staged GPU timestamps written into the shared scratch `MTL4CounterHeap` ring
+    /// and awaiting `resolveCounterHeap` into their `QueryHeap` backing buffers.
+    pub(super) pending_staged_ts: Vec<super::query::PendingStagedTimestamp>,
+    /// Number of D3D12 `writeTimestampWithGranularity` calls issued on the open encoder
+    /// (Apple AGX silently drops the 5th+ timestamp inside a single encoder to 0).
+    pub(super) enc_ts_count: u8,
     predication: Option<Predication>,
     /// Argument table of utility kernels (ClearUAV, RT), created on first use.
     util_table: Option<Retained<MtlArgumentTable>>,
@@ -275,6 +281,8 @@ impl CommandList {
             enc_vis_buf: None,
             enc_vis_reset: false,
             enc_vis_used_indices: Vec::new(),
+            pending_staged_ts: Vec::new(),
+            enc_ts_count: 0,
             predication: None,
             util_table: None,
             mfx_fence: None,
@@ -392,6 +400,8 @@ impl CommandList {
         self.enc_vis_buf = None;
         self.enc_vis_reset = false;
         self.enc_vis_used_indices.clear();
+        self.pending_staged_ts.clear();
+        self.enc_ts_count = 0;
         self.predication = None;
         self.gfx = GfxState::default();
         Ok(())
@@ -429,6 +439,9 @@ impl CommandList {
         }
         let flushed = self.flush_clears(&stats::c::cf_close, |_| true);
         self.flush_pending_mfx_wait_fence_on_close();
+        if !self.pending_staged_ts.is_empty() {
+            self.flush_staged_timestamps();
+        }
         if self.list_barrier_tight_active() {
             self.emit_close_producer_barriers();
         } else if !opts::legacy_barriers()

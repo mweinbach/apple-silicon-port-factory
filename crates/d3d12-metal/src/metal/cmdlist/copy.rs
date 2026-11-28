@@ -657,16 +657,34 @@ impl CommandList {
         if !self.icb.icb_segs.is_empty() {
             self.flush_draw_batch(true);
         }
+        // Apple AGX silently drops the 5th+ `writeTimestampWithGranularity` call inside a
+        // single encoder (and drops timestamps inside an empty compute encoder) to 0.
+        // Reserve 2 slots for `passtiming` (open + close) when active; overflow safely
+        // closes the encoder and uses command-buffer-level `writeTimestampIntoHeap`, which
+        // has no per-encoder cap.
+        let max_enc_ts: u8 = if self.pt.is_some() { 2 } else { 4 };
+        let must_close = match &self.enc {
+            Encoder::Render(_) => self.enc_ts_count >= max_enc_ts,
+            Encoder::Compute(_) => self.enc_ts_count >= max_enc_ts || self.bar.enc_ran_stages.is_empty(),
+            Encoder::None => false,
+        };
+        if must_close {
+            self.end_encoder();
+        }
         unsafe {
             match &self.enc {
-                Encoder::Render(e) => e.writeTimestampWithGranularity_afterStage_intoHeap_atIndex(
-                    timestamp_granularity(),
-                    MTLRenderStages::Fragment,
-                    h,
-                    index,
-                ),
+                Encoder::Render(e) => {
+                    e.writeTimestampWithGranularity_afterStage_intoHeap_atIndex(
+                        timestamp_granularity(),
+                        MTLRenderStages::Fragment,
+                        h,
+                        index,
+                    );
+                    self.enc_ts_count = self.enc_ts_count.saturating_add(1);
+                }
                 Encoder::Compute(e) => {
-                    e.writeTimestampWithGranularity_intoHeap_atIndex(timestamp_granularity(), h, index)
+                    e.writeTimestampWithGranularity_intoHeap_atIndex(timestamp_granularity(), h, index);
+                    self.enc_ts_count = self.enc_ts_count.saturating_add(1);
                 }
                 Encoder::None => self.cb.writeTimestampIntoHeap_atIndex(h, index),
             }
@@ -690,6 +708,72 @@ impl CommandList {
                     h, range, dst, None, None,
                 )
         };
+        self.need_full(FullWhy::Internal);
+    }
+
+    /// Flush all pending staged GPU timestamps from the shared scratch
+    /// `MTL4CounterHeap` ring into their `QueryHeap` backing `MTLBuffer`s.
+    pub(crate) fn flush_staged_timestamps(&mut self) {
+        if self.pending_staged_ts.is_empty() {
+            return;
+        }
+        let Ok(pool) = crate::metal::query::timestamp_scratch_pool() else {
+            self.pending_staged_ts.clear();
+            return;
+        };
+        // Ensure any in-flight encoder work writing timestamps (or reading a timestamp
+        // backing buffer in Blit) completes before `resolveCounterHeap` (MTLStages::Blit).
+        match &self.enc {
+            Encoder::Render(e) => {
+                e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                    MTLStages::All,
+                    MTLStages::Blit,
+                    MTL4VisibilityOptions::Device,
+                );
+            }
+            Encoder::Compute(e) => {
+                self.bar.ts_buf_blit_read = false;
+                e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                    MTLStages::All,
+                    MTLStages::Blit,
+                    MTL4VisibilityOptions::Device,
+                );
+            }
+            Encoder::None => {}
+        }
+        self.end_encoder();
+        self.bar.has_gpu_work = true;
+        let pending = std::mem::take(&mut self.pending_staged_ts);
+        let mut i = 0;
+        while i < pending.len() {
+            let first = &pending[i];
+            let mut run_len = 1usize;
+            while i + run_len < pending.len() {
+                let next = &pending[i + run_len];
+                if next.heap_idx == first.heap_idx
+                    && next.scratch_slot as usize == first.scratch_slot as usize + run_len
+                    && next.dst_gpu_va == first.dst_gpu_va + (run_len as u64) * 8
+                {
+                    run_len += 1;
+                } else {
+                    break;
+                }
+            }
+            let h = pool.heap(first.heap_idx as usize);
+            let range = objc2_foundation::NSRange::new(first.scratch_slot as usize, run_len);
+            let dst = MTL4BufferRange {
+                bufferAddress: first.dst_gpu_va,
+                length: (run_len as u64) * 8,
+            };
+            stats::inc(&stats::c::q_resolve);
+            unsafe {
+                self.cb
+                    .resolveCounterHeap_withRange_intoBuffer_waitFence_updateFence(
+                        h, range, dst, None, None,
+                    );
+            }
+            i += run_len;
+        }
         self.need_full(FullWhy::Internal);
     }
 
@@ -722,14 +806,16 @@ impl CommandList {
                         MTLVisibilityResultMode::Counting
                     };
                     let had_blit_read = self.bar.vis_buf_blit_read.contains(&q_buf_ptr);
+                    let had_cs_read = self.bar.vis_buf_cs_read.contains(&q_buf_ptr);
                     let slot_previously_written =
                         self.bar.vis_buf_written.contains(&(q_buf_ptr, q.index));
                     // Reuse the open `Reset` render pass when it already has this visibility
-                    // buffer attached, targets have not changed, no Blit read intervened, and
+                    // buffer attached, targets have not changed, no resolve read intervened, and
                     // this query slot has neither been written in an earlier pass nor used in
                     // the current pass (reusing a slot written in an earlier pass on another
                     // target requires closing and emitting `Fragment -> Fragment` sync).
                     if !had_blit_read
+                        && !had_cs_read
                         && !slot_previously_written
                         && self.enc_vis_buf == Some(q_buf_ptr)
                         && self.enc_vis_reset
@@ -751,15 +837,21 @@ impl CommandList {
                     if matches!(self.enc, Encoder::Render(_)) {
                         self.end_encoder();
                     }
-                    // Preserve `vis_buf_blit_read` until either a render pass actually opens
-                    // and consumes `Blit -> PRE_RASTER | Fragment`, or a 0-draw `EndQuery`
-                    // consumes it with a `Blit -> Blit` barrier before zero-filling the slot.
+                    // Preserve `vis_buf_{blit,cs}_read` until either a render pass actually opens
+                    // and consumes `Blit|Dispatch -> PRE_RASTER | Fragment`, or a 0-draw `EndQuery`
+                    // consumes it with a `Blit|Dispatch -> Blit` barrier before zero-filling the slot.
                     // Wait before `PRE_RASTER | Fragment` (not `Fragment` alone) so the next
                     // render pass's `MTLVisibilityResultType::Reset` prologue cannot race an
-                    // earlier pass's `Fragment` write or `ResolveQueryData`'s `Blit` read.
+                    // earlier pass's `Fragment` write or `ResolveQueryData`'s read.
                     if had_blit_read {
                         self.add_pend(
                             MTLStages::Blit,
+                            super::state::PRE_RASTER | MTLStages::Fragment,
+                        );
+                    }
+                    if had_cs_read {
+                        self.add_pend(
+                            MTLStages::Dispatch,
                             super::state::PRE_RASTER | MTLStages::Fragment,
                         );
                     }
@@ -802,8 +894,13 @@ impl CommandList {
                 let drew = std::mem::replace(&mut self.occl_drew, false);
                 if self.enc_vis_buf.is_some() {
                     if let Encoder::Render(e) = &self.enc {
+                        // Pass the ended query's own offset rather than 0: in a
+                        // `MTLVisibilityResultType::Reset` pass, AGX zeroes whatever offset
+                        // is touched by `setVisibilityResultMode:offset:`, so passing 0 would
+                        // clobber slot 0 whenever any non-zero slot ends.
+                        let off = prev.as_ref().map_or(0, |q| q.index as usize * 8);
                         unsafe {
-                            e.setVisibilityResultMode_offset(MTLVisibilityResultMode::Disabled, 0)
+                            e.setVisibilityResultMode_offset(MTLVisibilityResultMode::Disabled, off)
                         };
                     }
                 } else if masked && !drew {
@@ -820,6 +917,17 @@ impl CommandList {
                             if matches!(self.enc, Encoder::Compute(_)) {
                                 if self.ib_tight_active() {
                                     self.ib_add_obl_tight(0, MTLStages::Blit, MTLStages::Blit);
+                                } else {
+                                    self.ib_note(0);
+                                }
+                            }
+                        }
+                        if self.bar.vis_buf_cs_read.contains(&q_buf_ptr) {
+                            self.bar.vis_buf_cs_read.retain(|&p| p != q_buf_ptr);
+                            self.add_pend(MTLStages::Dispatch, MTLStages::Blit);
+                            if matches!(self.enc, Encoder::Compute(_)) {
+                                if self.ib_tight_active() {
+                                    self.ib_add_obl_tight(0, MTLStages::Dispatch, MTLStages::Blit);
                                 } else {
                                     self.ib_note(0);
                                 }
@@ -848,14 +956,14 @@ impl CommandList {
         Ok(())
     }
 
-    /// Buffer copy ordered after render-pass visibility results (`ResolveQueryData`).
-    pub(crate) fn copy_after_render(
+    fn copy_query_buffer(
         &mut self,
         src: &MtlBuffer,
         src_off: u64,
         dst: &Resource,
         dst_off: u64,
         n: u64,
+        is_vis: bool,
     ) -> Result<(), String> {
         if n == 0 {
             return Ok(());
@@ -870,10 +978,10 @@ impl CommandList {
                 self.end_encoder();
             }
             self.add_pend(MTLStages::Fragment | MTLStages::Blit, MTLStages::Blit);
-            // Include `0` alongside `dst_id` because `src` is a visibility-result `MtlBuffer`
-            // (not a tracked `Resource`) written by `Fragment`, potentially in an earlier list;
-            // this prevents destination-only list-start `READBACK` narrowing from dropping
-            // cross-list `Fragment -> Blit` synchronization.
+            // Include `0` alongside `dst_id` because `src` is a query backing `MtlBuffer`
+            // (not a tracked `Resource`) written by `Fragment` or `Blit`, potentially in an
+            // earlier list; this prevents destination-only list-start `READBACK` narrowing from
+            // dropping cross-list synchronization.
             let e = self.compute_blit_touch(&[dst_id, 0]).ok_or("compute encoder")?;
             self.pt_note_util(pt::synth::COPY_BLIT, 0);
             unsafe {
@@ -886,8 +994,12 @@ impl CommandList {
                 )
             };
             self.note_stage_ran(MTLStages::Blit);
-            if !self.bar.vis_buf_blit_read.contains(&src_ptr) {
-                self.bar.vis_buf_blit_read.push(src_ptr);
+            if is_vis {
+                if !self.bar.vis_buf_blit_read.contains(&src_ptr) {
+                    self.bar.vis_buf_blit_read.push(src_ptr);
+                }
+            } else {
+                self.bar.ts_buf_blit_read = true;
             }
             return Ok(());
         }
@@ -905,6 +1017,88 @@ impl CommandList {
             )
         };
         self.note_stage_ran(MTLStages::Blit);
+        if !is_vis {
+            self.bar.ts_buf_blit_read = true;
+        }
+        Ok(())
+    }
+
+    /// Buffer copy ordered after render-pass visibility results (`ResolveQueryData(OCCLUSION)`).
+    pub(crate) fn copy_after_render(
+        &mut self,
+        src: &MtlBuffer,
+        src_off: u64,
+        dst: &Resource,
+        dst_off: u64,
+        n: u64,
+    ) -> Result<(), String> {
+        self.copy_query_buffer(src, src_off, dst, dst_off, n, true)
+    }
+
+    /// Buffer copy from a staged timestamp backing buffer (`ResolveQueryData(TIMESTAMP)`).
+    pub(crate) fn copy_timestamp_buffer(
+        &mut self,
+        src: &MtlBuffer,
+        src_off: u64,
+        dst: &Resource,
+        dst_off: u64,
+        n: u64,
+    ) -> Result<(), String> {
+        self.copy_query_buffer(src, src_off, dst, dst_off, n, false)
+    }
+
+    /// Resolve binary occlusion slots (`ResolveQueryData(BINARY_OCCLUSION)`), normalizing
+    /// each 64-bit visibility slot on the GPU to strictly `0u64` or `1u64`.
+    pub(crate) fn resolve_binary_after_render(
+        &mut self,
+        src: &MtlBuffer,
+        src_off: u64,
+        dst: &Resource,
+        dst_off: u64,
+        count: u32,
+    ) -> Result<(), String> {
+        if count == 0 {
+            return Ok(());
+        }
+        if dst_off % 4 != 0 {
+            return Err(format!(
+                "binary occlusion resolve destination offset {dst_off} must be at least 4-byte aligned"
+            ));
+        }
+        let d = dst.buffer().ok_or("resolve destination is not a buffer")?;
+        dst.register_ptr();
+        dst.mark_gpu_used();
+        let dst_id = dst as *const Resource as usize;
+        let src_ptr = src as *const MtlBuffer as usize;
+        self.flush_clears_for(&[dst_id])?;
+        let p = crate::metal::clear::BinaryOcclResolveParams {
+            src: src.gpuAddress() + src_off,
+            dst: d.gpuAddress() + dst_off,
+            count,
+            _pad: 0,
+        };
+        // Include `0` alongside `dst_id` because `src` is a visibility-result `MtlBuffer`
+        // (not a tracked `Resource`) written by `Fragment`/`Blit`, potentially in an earlier list.
+        self.util_dispatch_with(
+            "port_resolve_binary_occl",
+            None,
+            None,
+            crate::metal::clear::bytes_of(&p),
+            [count, 1, 1],
+            &[dst_id, 0],
+            true,
+        )?;
+        if !legacy_barriers() && barrier_masks() {
+            // Ensure subsequent render-pass `Reset` or 0-draw `fillBuffer` on `src` waits on this
+            // compute read, even when `opt_cs_to_ps_overlap` narrows `util_dispatch_with`'s post-sync.
+            self.add_pend(
+                MTLStages::Dispatch,
+                super::state::PRE_RASTER | MTLStages::Fragment | MTLStages::Blit,
+            );
+            if !self.bar.vis_buf_cs_read.contains(&src_ptr) {
+                self.bar.vis_buf_cs_read.push(src_ptr);
+            }
+        }
         Ok(())
     }
 }
