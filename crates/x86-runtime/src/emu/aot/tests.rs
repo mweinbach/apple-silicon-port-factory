@@ -401,7 +401,6 @@ fn aot_prewarm_synthetic_pe_writes_and_loads_via_activate() {
                     for ip in ips {
                         unsafe { dir.probe_sync(ip) };
                     }
-                    dir.prune_incoming(&gone);
                 }
             }
             let _ = std::fs::remove_dir_all(&d);
@@ -695,7 +694,6 @@ fn teardown_test_modules(names: &[&str]) {
         for ip in ips {
             unsafe { dir.probe_sync(ip) };
         }
-        dir.prune_incoming(&gone);
     }
 }
 
@@ -4024,9 +4022,10 @@ fn volatile_metadata_elides_non_volatile_and_preserves_volatile_and_atomics() {
     assert!(w_uncov.iter().any(|&w| is_tso_st(w)), "uncovered store must keep TSO");
 
     // Runtime-modified code overlapping a covered PE range must disable VolatileMetadata elision
-    // in live JIT translations (uses a distinct mapping so `note_code_region` never merges with `pe`).
+    // in live JIT translations (uses an isolated high-VA mapping so `note_code_region` never
+    // merges with `pe` or other tests' code arenas under `SLACK = 16 MiB`).
     {
-        let mut smc_pe = TestMappedBuf::alloc(0x2000, 0x2_3F50_0000);
+        let mut smc_pe = TestMappedBuf::alloc(0x2000, 0x6_B000_0000);
         let smc_base = smc_pe.base() as u64;
         let smc_buf = smc_pe.as_slice_mut();
         let mut a = CodeAssembler::new(64).unwrap();

@@ -174,12 +174,17 @@ fn interp_burst_code_gen_invalidation() {
     assert_ne!(old_fgen, 0);
     assert_eq!(stamped_fgen, old_fgen);
 
-    // 2. Allocate a dynamic-code buffer, register it with `note_code_region` (bumps code_gen),
-    //    execute it (must NOT be stamped since `e.gen != 0`), rewrite it, bump code_gen again,
-    //    and verify the rewritten code runs.
-    let dyn_buf: &'static mut [u8] = Box::leak(vec![0xCCu8; 64].into_boxed_slice());
+    // 2. Allocate an isolated dynamic-code buffer, register it with `note_code_region` (bumps
+    //    code_gen), execute it (must NOT be stamped since `e.gen != 0`), rewrite it, bump
+    //    code_gen again, and verify the rewritten code runs. Using an isolated high-VA page
+    //    keeps `SLACK = 16 MiB` region merging away from ordinary heap allocations.
+    let dyn_ptr = mem::alloc_isolated_smc_page(0x6_C000_0000);
+    let dyn_buf: &mut [u8] = unsafe {
+        core::ptr::write_bytes(dyn_ptr, 0xCC, 64);
+        core::slice::from_raw_parts_mut(dyn_ptr, 64)
+    };
     dyn_buf[..6].copy_from_slice(&[0xB8, 0x15, 0x00, 0x00, 0x00, 0xC3]); // mov eax, 21; ret
-    let dyn_lo = dyn_buf.as_ptr() as usize;
+    let dyn_lo = dyn_ptr as usize;
     mem::note_code_region(dyn_lo, dyn_lo + 64);
 
     let r1 = unsafe { emu_run_full(dyn_lo as u64, [0; 8], [0; 4], [0; 8]).0 };

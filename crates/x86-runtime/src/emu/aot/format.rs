@@ -435,6 +435,8 @@ pub(in crate::emu) struct Image {
     pub(in crate::emu) code: Vec<u32>,
     /// Retained word count of `code` after [`Image::release_code_heap`] frees the heap buffer.
     pub(super) code_words_len: usize,
+    /// True when `blocks` is sorted in non-decreasing `ip` order (allows O(log N) lookups).
+    pub(super) blocks_sorted: bool,
 }
 
 impl Default for Image {
@@ -448,6 +450,7 @@ impl Default for Image {
             assume: Vec::new(),
             code: Vec::new(),
             code_words_len: 0,
+            blocks_sorted: true,
         }
     }
 }
@@ -589,6 +592,9 @@ impl Image {
                 offs,
             );
             let main = b.main;
+            if self.blocks.last().is_some_and(|prev| prev.ip > ip) {
+                self.blocks_sorted = false;
+            }
             self.blocks.push(BlockEnt {
                 ip,
                 code_off: hot_off,
@@ -973,11 +979,18 @@ fn decode_blocks_chunk(
     nl: usize,
     nr: usize,
     na: usize,
-) -> bool {
+) -> (bool, bool) {
     let mut ok = true;
+    let mut sorted = true;
+    let mut prev_ip: Option<u64> = None;
     for (slot, c) in out.iter_mut().zip(raw.chunks_exact(52)) {
+        let ip = image_base.wrapping_add(le32(c, 0) as u64);
+        if prev_ip.is_some_and(|p| p > ip) {
+            sorted = false;
+        }
+        prev_ip = Some(ip);
         let b = BlockEnt {
-            ip: image_base.wrapping_add(le32(c, 0) as u64),
+            ip,
             code_off: le32(c, 4),
             cold_off: le32(c, 8),
             words: le32(c, 12),
@@ -1004,7 +1017,7 @@ fn decode_blocks_chunk(
         }
         slot.write(b);
     }
-    ok
+    (ok, sorted)
 }
 
 fn decode_links_chunk(
@@ -1187,7 +1200,9 @@ fn decode_impl(
             return None;
         }
         let mut blocks_u = alloc_uninit_vec::<BlockEnt>(nb);
-        if !decode_blocks_chunk(&mut blocks_u, blocks_raw, key.image_base, bc, nl, nr, na) {
+        let (blocks_ok, blocks_sorted) =
+            decode_blocks_chunk(&mut blocks_u, blocks_raw, key.image_base, bc, nl, nr, na);
+        if !blocks_ok {
             return None;
         }
         let mut links_u = alloc_uninit_vec::<LinkEnt>(nl);
@@ -1204,6 +1219,7 @@ fn decode_impl(
             copy_code_words(code_raw, nc, &mut img.code);
         }
         img.code_words_len = nc;
+        img.blocks_sorted = blocks_sorted;
         // SAFETY: every element in each slice was written by the corresponding `decode_*_chunk`.
         unsafe {
             img.blocks = assume_init_vec(blocks_u);
@@ -1266,6 +1282,7 @@ fn decode_impl(
     let decode_workers = (avail.min(8) - 1).clamp(1, tasks.len().max(1));
     let queue = std::sync::Mutex::new(tasks.into_iter());
     let all_ok = std::sync::atomic::AtomicBool::new(true);
+    let chunks_sorted = std::sync::atomic::AtomicBool::new(true);
     let image_base = key.image_base;
 
     let checksum_ok = std::thread::scope(|s| {
@@ -1273,6 +1290,7 @@ fn decode_impl(
         for _ in 0..decode_workers {
             let queue = &queue;
             let all_ok = &all_ok;
+            let chunks_sorted = &chunks_sorted;
             s.spawn(move || loop {
                 let next = {
                     let mut g = queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -1281,8 +1299,13 @@ fn decode_impl(
                 let Some(task) = next else { break };
                 match task {
                     Task::Blocks(o, raw) => {
-                        if !decode_blocks_chunk(o, raw, image_base, bc, nl, nr, na) {
+                        let (ok, sorted) =
+                            decode_blocks_chunk(o, raw, image_base, bc, nl, nr, na);
+                        if !ok {
                             all_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if !sorted {
+                            chunks_sorted.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     Task::Links(o, raw) => {
@@ -1319,6 +1342,18 @@ fn decode_impl(
             img.code = assume_init_vec(code_u);
         }
     }
+    let mut blocks_sorted = chunks_sorted.load(std::sync::atomic::Ordering::Acquire);
+    if blocks_sorted {
+        let mut boundary = BLOCK_CHUNK;
+        while boundary < img.blocks.len() {
+            if img.blocks[boundary - 1].ip > img.blocks[boundary].ip {
+                blocks_sorted = false;
+                break;
+            }
+            boundary += BLOCK_CHUNK;
+        }
+    }
+    img.blocks_sorted = blocks_sorted;
     Some((name, key, img, flags, code_byte_off))
 }
 
