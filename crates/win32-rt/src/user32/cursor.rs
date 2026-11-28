@@ -1711,12 +1711,23 @@ fn current_shape() -> Option<Shape> {
     None
 }
 
+pub fn has_clip_rect() -> bool {
+    CLIP.lock()
+        .unwrap()
+        .is_some_and(|r| r.right > r.left && r.bottom > r.top)
+}
+
 /// Recompute the native cursor state (visibility, shape, relative mode).
 pub fn update_state() {
     let shape = current_shape();
     let hidden = SHOW_COUNT.load(Ordering::Acquire) < 0 || matches!(shape, None | Some(Shape::Blank));
     let ours = super::input::app_active() && super::input::active_window() != 0;
-    let relative = hidden && ours && super::input::raw_mouse_registered() && crate::macos::lock_cursor_allowed();
+    let in_client = crate::macos::fullscreen_takeover()
+        || crate::macos::dxgi_fullscreen_active()
+        || crate::macos::mouse_in_client();
+    let can_capture = !crate::macos::cursor_capture_disallowed()
+        && (crate::macos::lock_cursor_allowed() || (has_clip_rect() && in_client));
+    let relative = hidden && ours && super::input::raw_mouse_registered() && can_capture;
     let was = RELATIVE.swap(relative, Ordering::AcqRel);
     if was != relative {
         log::info!("cursor relative mode {}", if relative { "ON" } else { "off" });
@@ -1822,8 +1833,17 @@ pub unsafe extern "win64" fn SetPhysicalCursorPos(x: i32, y: i32) -> BOOL {
 ///   menu bar, or other windows.
 pub unsafe extern "win64" fn ClipCursor(r: *const RECT) -> BOOL {
     let v = if r.is_null() { None } else { Some(*r) };
-    *CLIP.lock().unwrap() = v;
+    let now_active = v.is_some_and(|rc| rc.right > rc.left && rc.bottom > rc.top);
+    let prev_active = {
+        let mut guard = CLIP.lock().unwrap();
+        let prev = guard.is_some_and(|rc| rc.right > rc.left && rc.bottom > rc.top);
+        *guard = v;
+        prev
+    };
     log::debug!("ClipCursor({v:?})");
+    if prev_active != now_active {
+        update_state();
+    }
     if v.is_some() && super::input::app_active() && !relative_mode() {
         let p = cursor_pos();
         let c = clip_point(p);
@@ -1894,6 +1914,86 @@ mod tests {
             assert_ne!(c, 0);
             assert_eq!(DestroyCursor(c), TRUE);
         }
+    }
+
+    #[test]
+    fn relative_mode_follows_dxgi_fullscreen_clip_and_override() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        crate::macos::with_lock_cursor_override(None, || unsafe {
+            // Save baseline state.
+            let prev_show = SHOW_COUNT.load(Ordering::Acquire);
+            let prev_active = super::super::input::app_active();
+            let prev_win = super::super::input::active_window();
+            let prev_dxgi = crate::macos::dxgi_fullscreen_active();
+            let prev_in_client = crate::macos::mouse_in_client();
+
+            let dev_add = super::super::input::RAWINPUTDEVICE {
+                usage_page: 1,
+                usage: 2,
+                flags: 0,
+                target: 0,
+            };
+            let dev_rem = super::super::input::RAWINPUTDEVICE {
+                usage_page: 1,
+                usage: 2,
+                flags: 1, // RIDEV_REMOVE
+                target: 0,
+            };
+            assert_eq!(super::super::input::RegisterRawInputDevices(&dev_add, 1, 16), TRUE);
+            super::super::input::set_active_window(0x1000, true);
+            SHOW_COUNT.store(-1, Ordering::Release);
+            crate::macos::set_dxgi_fullscreen_active(false);
+            crate::macos::set_mouse_in_client(true);
+            ClipCursor(std::ptr::null());
+            update_state();
+
+            // 1. Framed windowed mode without ClipCursor: relative mode stays off.
+            assert!(!relative_mode());
+            assert!(!crate::macos::lock_cursor_allowed());
+
+            // 2. Clipped windowed gameplay with pointer inside client area: relative mode ON.
+            let rect = RECT { left: 0, top: 0, right: 1280, bottom: 720 };
+            assert_eq!(ClipCursor(&rect), TRUE);
+            assert!(relative_mode());
+
+            // 3. Pointer moves outside client area (e.g. title bar): relative mode turns off.
+            crate::macos::set_mouse_in_client(false);
+            update_state();
+            assert!(!relative_mode());
+
+            // 4. Unclipping in windowed mode keeps relative mode off even inside client.
+            crate::macos::set_mouse_in_client(true);
+            assert_eq!(ClipCursor(std::ptr::null()), TRUE);
+            assert!(!relative_mode());
+
+            // 5. Runtime DXGI borderless fullscreen enables lock_cursor_allowed + relative mode.
+            crate::macos::set_dxgi_fullscreen_active(true);
+            update_state();
+            assert!(crate::macos::lock_cursor_allowed());
+            assert!(relative_mode());
+
+            // 6. Explicit disable override (PORT_LOCK_CURSOR=0 / AW2_LOCK_CURSOR=0) suppresses both.
+            crate::macos::with_lock_cursor_override(Some(false), || {
+                update_state();
+                assert!(!crate::macos::lock_cursor_allowed());
+                assert!(!relative_mode());
+            });
+
+            // 7. Deactivating the window (e.g. Cmd+Tab) immediately releases relative mode.
+            super::super::input::native_deactivated(0x1000);
+            assert!(!relative_mode());
+
+            // Restore baseline state.
+            crate::macos::set_dxgi_fullscreen_active(prev_dxgi);
+            crate::macos::set_mouse_in_client(prev_in_client);
+            ClipCursor(std::ptr::null());
+            SHOW_COUNT.store(prev_show, Ordering::Release);
+            if prev_active && prev_win != 0 {
+                super::super::input::set_active_window(prev_win, true);
+            }
+            let _ = super::super::input::RegisterRawInputDevices(&dev_rem, 1, 16);
+            update_state();
+        });
     }
 
     fn build_dib_icon_32(w: u32, h: u32, bgra_fill: [u8; 4]) -> Vec<u8> {

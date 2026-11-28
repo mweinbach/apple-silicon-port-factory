@@ -960,28 +960,39 @@ pub(super) fn window_activate(hwnd: usize) {
 fn update_presentation() {
     let mtm = mtm();
     let app = NSApplication::sharedApplication(mtm);
-    let fullscreen = WINDOWS.with(|m| {
+    let (dxgi_fs, fullscreen) = WINDOWS.with(|m| {
         let monitors = display::monitors();
-        m.borrow().values().any(|w| {
+        let mut any_dxgi_fs = false;
+        let mut any_fs = false;
+        for w in m.borrow().values() {
             if !w.window.isKeyWindow() {
-                return false;
+                continue;
             }
             if w.dxgi_fullscreen_saved.borrow().is_some() {
-                return true;
+                any_dxgi_fs = true;
+                any_fs = true;
+                break;
             }
             if !super::fullscreen_takeover() {
-                return false;
+                continue;
             }
             let d = w.desc.borrow();
-            style_mask(&d) == NSWindowStyleMask::Borderless
+            if style_mask(&d) == NSWindowStyleMask::Borderless
                 && monitors.iter().any(|mon| {
                     d.client.left <= mon.rect.left
                         && d.client.top <= mon.rect.top
                         && d.client.right >= mon.rect.right
                         && d.client.bottom >= mon.rect.bottom
                 })
-        })
+            {
+                any_fs = true;
+            }
+        }
+        (any_dxgi_fs, any_fs)
     });
+    if super::set_dxgi_fullscreen_active(dxgi_fs) {
+        crate::user32::cursor::update_state();
+    }
     let want = if fullscreen {
         NSApplicationPresentationOptions::AutoHideMenuBar | NSApplicationPresentationOptions::AutoHideDock
     } else {
@@ -1036,6 +1047,7 @@ pub(super) fn refresh_cursor_for_client(inside: bool, scale: f64) {
         super::set_mouse_in_client(inside);
         let s = LAST_CURSOR.with(|last| last.borrow().clone());
         apply_cursor(s, scale);
+        crate::user32::cursor::update_state();
     } else if inside && scale_changed {
         let s = LAST_CURSOR.with(|last| last.borrow().clone());
         if matches!(s.shape, Shape::Custom(_)) {
@@ -1105,8 +1117,10 @@ fn custom_ns_cursor(img: &CustomCursorImage, scale: f64) -> Option<Retained<NSCu
 
 fn apply_cursor(s: CursorState, scale: f64) {
     let mtm = mtm();
-    let in_client = super::fullscreen_takeover() || super::mouse_in_client();
-    let relative = s.relative && super::lock_cursor_allowed() && in_client;
+    let in_client = super::fullscreen_takeover()
+        || super::dxgi_fullscreen_active()
+        || super::mouse_in_client();
+    let relative = s.relative && !super::cursor_capture_disallowed() && in_client;
     let hidden = s.hidden && in_client;
     LAST_CURSOR_SCALE.with(|c| c.set(scale));
 

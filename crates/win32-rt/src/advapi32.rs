@@ -412,6 +412,13 @@ impl Registry {
             gpu_vram.min(u32::MAX as u64) as u32,
         );
 
+        // Standard Windows US-English keyboard layout key (`00000409`) queried by
+        // input libraries mapping HKL -> keyboard layout DLL / display name.
+        let kbd_us = "hklm\\system\\currentcontrolset\\control\\keyboard layouts\\00000409";
+        reg.seed_sz(kbd_us, "Layout File", "KBDUS.DLL");
+        reg.seed_sz(kbd_us, "Layout Text", "US");
+        reg.seed_sz(kbd_us, "Layout Display Name", "US");
+
         // Automatically load any Steam post-install registry manifest (`steam_registry.tsv`
         // or `AW2_REGISTRY_TSV`) generated from `installscript.vdf`.
         reg.load_external_tsv();
@@ -6355,6 +6362,23 @@ mod tests {
             assert_eq!(rel_ty, REG_DWORD);
             assert_eq!(rel_val, 528040);
             assert_eq!(RegCloseKey(hndp), ERROR_SUCCESS);
+
+            // Verify pre-populated US-English keyboard layout key (`00000409`)
+            let kbd_sub = crate::strings::to_wide_z("SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts\\00000409");
+            let mut hkbd = std::ptr::null_mut();
+            assert_eq!(RegOpenKeyExW(hklm, kbd_sub.as_ptr(), 0, 0x20019, &mut hkbd), ERROR_SUCCESS);
+            let lf_name = crate::strings::to_wide_z("Layout File");
+            let mut lf_ty = 0u32;
+            let mut lf_buf = [0u16; 32];
+            let mut lf_len = (lf_buf.len() * 2) as u32;
+            assert_eq!(
+                RegQueryValueExW(hkbd, lf_name.as_ptr(), std::ptr::null_mut(), &mut lf_ty, lf_buf.as_mut_ptr() as *mut u8, &mut lf_len),
+                ERROR_SUCCESS
+            );
+            assert_eq!(lf_ty, REG_SZ);
+            let lf_str = String::from_utf16_lossy(&lf_buf[..(lf_len as usize / 2).saturating_sub(1)]);
+            assert_eq!(lf_str, "KBDUS.DLL");
+            assert_eq!(RegCloseKey(hkbd), ERROR_SUCCESS);
 
             let hkcu = 0xFFFF_FFFF_8000_0001usize as HANDLE;
             let epic_sub = crate::strings::to_wide_z("Software\\Epic Games\\Unreal Engine\\Identifiers");

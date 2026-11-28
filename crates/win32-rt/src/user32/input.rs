@@ -689,6 +689,83 @@ pub unsafe extern "win64" fn VkKeyScanExA(ch: u8, _hkl: usize) -> i16 {
     VkKeyScanW(ch as u16)
 }
 
+fn key_name_us(scan: u32, ext: bool, dont_care: bool) -> Option<&'static str> {
+    match (scan, ext) {
+        (0x01, false) => Some("Esc"),
+        (0x0E, false) => Some("Backspace"),
+        (0x0F, false) => Some("Tab"),
+        (0x1C, false) => Some("Enter"),
+        (0x1C, true) => Some("Num Enter"),
+        (0x1D, false) => Some("Ctrl"),
+        (0x1D, true) => Some(if dont_care { "Ctrl" } else { "Right Ctrl" }),
+        (0x2A, false) => Some("Shift"),
+        (0x35, true) => Some("Num /"),
+        (0x36, false) => Some(if dont_care { "Shift" } else { "Right Shift" }),
+        (0x37, false) => Some("Num *"),
+        (0x37, true) => Some("Prnt Scrn"),
+        (0x38, false) => Some("Alt"),
+        (0x38, true) => Some(if dont_care { "Alt" } else { "Right Alt" }),
+        (0x39, false) => Some("Space"),
+        (0x3A, false) => Some("Caps Lock"),
+        (0x3B, false) => Some("F1"),
+        (0x3C, false) => Some("F2"),
+        (0x3D, false) => Some("F3"),
+        (0x3E, false) => Some("F4"),
+        (0x3F, false) => Some("F5"),
+        (0x40, false) => Some("F6"),
+        (0x41, false) => Some("F7"),
+        (0x42, false) => Some("F8"),
+        (0x43, false) => Some("F9"),
+        (0x44, false) => Some("F10"),
+        (0x45, false) => Some("Pause"),
+        (0x45, true) => Some("Num Lock"),
+        (0x46, false) => Some("Scroll Lock"),
+        (0x46, true) => Some("Break"),
+        (0x47, false) => Some("Num 7"),
+        (0x47, true) => Some("Home"),
+        (0x48, false) => Some("Num 8"),
+        (0x48, true) => Some("Up"),
+        (0x49, false) => Some("Num 9"),
+        (0x49, true) => Some("Page Up"),
+        (0x4A, false) => Some("Num -"),
+        (0x4B, false) => Some("Num 4"),
+        (0x4B, true) => Some("Left"),
+        (0x4C, false) => Some("Num 5"),
+        (0x4D, false) => Some("Num 6"),
+        (0x4D, true) => Some("Right"),
+        (0x4E, false) => Some("Num +"),
+        (0x4F, false) => Some("Num 1"),
+        (0x4F, true) => Some("End"),
+        (0x50, false) => Some("Num 2"),
+        (0x50, true) => Some("Down"),
+        (0x51, false) => Some("Num 3"),
+        (0x51, true) => Some("Page Down"),
+        (0x52, false) => Some("Num 0"),
+        (0x52, true) => Some("Insert"),
+        (0x53, false) => Some("Num Del"),
+        (0x53, true) => Some("Delete"),
+        (0x57, false) => Some("F11"),
+        (0x58, false) => Some("F12"),
+        (0x59, false) => Some("Num ="),
+        (0x5B, true) => Some("Left Windows"),
+        (0x5C, true) => Some("Right Windows"),
+        (0x5D, true) => Some("Application"),
+        (0x64, false) => Some("F13"),
+        (0x65, false) => Some("F14"),
+        (0x66, false) => Some("F15"),
+        (0x67, false) => Some("F16"),
+        (0x68, false) => Some("F17"),
+        (0x69, false) => Some("F18"),
+        (0x6A, false) => Some("F19"),
+        (0x6B, false) => Some("F20"),
+        (0x6C, false) => Some("F21"),
+        (0x6D, false) => Some("F22"),
+        (0x6E, false) => Some("F23"),
+        (0x6F, false) => Some("F24"),
+        _ => None,
+    }
+}
+
 pub unsafe extern "win64" fn GetKeyNameTextA(lparam: i32, buf: *mut u8, cap: i32) -> i32 {
     if buf.is_null() || cap <= 0 {
         return 0;
@@ -699,22 +776,47 @@ pub unsafe extern "win64" fn GetKeyNameTextA(lparam: i32, buf: *mut u8, cap: i32
         return 0;
     }
     let s = String::from_utf16_lossy(&w[..n as usize]);
+    let truncated = s.len() >= cap as usize;
     crate::strings::write_ansi_buf(&s, buf, cap as usize);
+    set_error(if truncated { e::INSUFFICIENT_BUFFER } else { 0 });
     s.len().min((cap as usize).saturating_sub(1)) as i32
 }
 
 pub unsafe extern "win64" fn GetKeyNameTextW(lparam: i32, buf: *mut u16, cap: i32) -> i32 {
-    let scan = ((lparam >> 16) & 0xFF) as u32;
-    let ext = (lparam >> 24) & 1 != 0;
-    let vk = keymap::map_virtual_key(if ext { 0xE000 | scan } else { scan }, MAPVK_VSC_TO_VK_EX);
-    let name = match keymap::us_char(vk, true, false) {
-        Some(c) if c > 0x20 => String::from_utf16_lossy(&[c]),
-        _ => format!("VK_{vk:02X}"),
-    };
     if buf.is_null() || cap <= 0 {
         return 0;
     }
-    crate::strings::write_wide_trunc(&name, buf, cap as usize).1 as i32
+    let scan = ((lparam >> 16) & 0xFF) as u32;
+    let ext = (lparam >> 24) & 1 != 0;
+    let dont_care = (lparam >> 25) & 1 != 0;
+    if scan == 0 {
+        set_error(0);
+        return 0;
+    }
+    let owned;
+    let name: &str = if let Some(special) = key_name_us(scan, ext, dont_care) {
+        special
+    } else {
+        let vk = keymap::map_virtual_key(if ext { 0xE000 | scan } else { scan }, MAPVK_VSC_TO_VK_EX);
+        match keymap::us_char(vk, false, true) {
+            Some(c) if c > 0x20 => {
+                owned = String::from_utf16_lossy(&[c]);
+                &owned
+            }
+            _ if vk != 0 => {
+                owned = format!("VK_{vk:02X}");
+                &owned
+            }
+            _ => {
+                set_error(0);
+                return 0;
+            }
+        }
+    };
+    let truncated = name.encode_utf16().count() >= cap as usize;
+    let written = crate::strings::write_wide_trunc(name, buf, cap as usize).1 as i32;
+    set_error(if truncated { e::INSUFFICIENT_BUFFER } else { 0 });
+    written
 }
 
 // ---------------------------------------------------------------------------
@@ -1907,6 +2009,65 @@ mod tests {
         let m = MSG { message: wm::KEYUP, wparam: b'A' as usize, lparam: 1 | (0x1E << 16) | (3 << 30), ..Default::default() };
         on_input_retrieved(&m);
         unsafe { assert!(GetKeyState(b'A' as i32) >= 0) };
+    }
+
+    #[test]
+    fn key_name_text_covers_special_numpad_modifiers_and_printable() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let get_w = |scan: i32, ext: bool, dont_care: bool| -> String {
+                let lparam = (scan << 16) | ((ext as i32) << 24) | ((dont_care as i32) << 25);
+                let mut buf = [0u16; 32];
+                let n = GetKeyNameTextW(lparam, buf.as_mut_ptr(), buf.len() as i32);
+                String::from_utf16_lossy(&buf[..n.max(0) as usize])
+            };
+
+            // Printable keys: uppercase letters and unshifted digits/punctuation.
+            assert_eq!(get_w(0x1E, false, false), "A");
+            assert_eq!(get_w(0x02, false, false), "1");
+            assert_eq!(get_w(0x0C, false, false), "-");
+            assert_eq!(get_w(0x35, false, false), "/");
+
+            // Special, modifier (with bit 25 don't-care), navigation, and numpad keys.
+            assert_eq!(get_w(0x01, false, false), "Esc");
+            assert_eq!(get_w(0x39, false, false), "Space");
+            assert_eq!(get_w(0x1C, false, false), "Enter");
+            assert_eq!(get_w(0x1C, true, false), "Num Enter");
+            assert_eq!(get_w(0x1D, false, false), "Ctrl");
+            assert_eq!(get_w(0x1D, true, false), "Right Ctrl");
+            assert_eq!(get_w(0x1D, true, true), "Ctrl");
+            assert_eq!(get_w(0x2A, false, false), "Shift");
+            assert_eq!(get_w(0x36, false, false), "Right Shift");
+            assert_eq!(get_w(0x36, false, true), "Shift");
+            assert_eq!(get_w(0x38, true, false), "Right Alt");
+            assert_eq!(get_w(0x38, true, true), "Alt");
+            assert_eq!(get_w(0x48, true, false), "Up");
+            assert_eq!(get_w(0x48, false, false), "Num 8");
+            assert_eq!(get_w(0x35, true, false), "Num /");
+            assert_eq!(get_w(0x3B, false, false), "F1");
+            assert_eq!(get_w(0x58, false, false), "F12");
+            assert_eq!(get_w(0x00, false, false), "");
+
+            // Truncation sets ERROR_INSUFFICIENT_BUFFER; full fit clears it.
+            let mut tiny = [0u16; 4];
+            let n_trunc = GetKeyNameTextW(0x39 << 16, tiny.as_mut_ptr(), tiny.len() as i32);
+            assert_eq!(n_trunc, 3);
+            assert_eq!(String::from_utf16_lossy(&tiny[..3]), "Spa");
+            assert_eq!(crate::teb::last_error(), e::INSUFFICIENT_BUFFER);
+
+            let mut full = [0u16; 16];
+            let n_full = GetKeyNameTextW(0x39 << 16, full.as_mut_ptr(), full.len() as i32);
+            assert_eq!(n_full, 5);
+            assert_eq!(String::from_utf16_lossy(&full[..5]), "Space");
+            assert_eq!(crate::teb::last_error(), 0);
+
+            // ANSI wrapper returns matching name.
+            let mut ansi = [0u8; 16];
+            let na = GetKeyNameTextA((0x48 << 16) | (1 << 24), ansi.as_mut_ptr(), ansi.len() as i32);
+            assert_eq!(na, 2);
+            assert_eq!(&ansi[..2], b"Up");
+            assert_eq!(crate::teb::last_error(), 0);
+        }
     }
 
     #[test]
