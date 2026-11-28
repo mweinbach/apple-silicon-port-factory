@@ -92,6 +92,9 @@ cargo opsdb -- runtime-audit /path/to/Game/
 # 2. Offline 4-tier differential verifier (Generic vs FastOp vs JIT vs AOT + linked CFG + Rosetta 2 oracle)
 cargo opsdb -- verify-x86 /path/to/Game/ --oracle
 
+# 2.5. Headless boot-triage (launch port-runner headless, classify first blocker & point to owning crate)
+cargo opsdb -- boot-triage --manifest games/<id>/game.toml --game-dir /path/to/Game --args -nolauncher --timeout 30
+
 # 3. Frame-paced automated probe & screenshot/log-regex reproducer
 cargo opsdb -- live-probe --manifest games/<id>/game.toml --game-dir /path/to/Game --script repro.txt --repeat 5
 
