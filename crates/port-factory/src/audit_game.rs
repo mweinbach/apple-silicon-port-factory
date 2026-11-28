@@ -1157,6 +1157,9 @@ fn is_helper_exe(name_lower: &str) -> bool {
     const SKIP: &[&str] = &[
         "unins",
         "crash",
+        "crs-handler",
+        "crs-video",
+        "bugsplat",
         "redist",
         "setup",
         "vcredist",
@@ -1168,7 +1171,10 @@ fn is_helper_exe(name_lower: &str) -> bool {
     SKIP.iter().any(|k| name_lower.contains(k))
 }
 
-fn resolve_main_exe(
+/// Select the primary `.exe` from discovered PE32+ files in `game_dir`, preferring top-level
+/// non-helper executables (excluding crash reporters, installers, and redistributables), then
+/// nested non-helper executables, breaking ties by largest file size (then path order).
+pub fn select_primary_exe(
     game_dir: &Path,
     pe_files: &[PathBuf],
     explicit: Option<&Path>,
@@ -1194,7 +1200,7 @@ fn resolve_main_exe(
         return None;
     }
 
-    let score = |p: &&PathBuf| -> (u8, u64) {
+    let score = |p: &&PathBuf| -> (u8, u64, std::cmp::Reverse<String>) {
         let name = p
             .file_name()
             .map(|s| s.to_string_lossy().to_ascii_lowercase())
@@ -1208,10 +1214,18 @@ fn resolve_main_exe(
             (false, true) => 0,
         };
         let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-        (tier, size)
+        (tier, size, std::cmp::Reverse(p.to_string_lossy().to_ascii_lowercase()))
     };
 
     exes.into_iter().max_by_key(score).cloned()
+}
+
+fn resolve_main_exe(
+    game_dir: &Path,
+    pe_files: &[PathBuf],
+    explicit: Option<&Path>,
+) -> Option<PathBuf> {
+    select_primary_exe(game_dir, pe_files, explicit)
 }
 
 fn read_steam_appid(dir: &Path) -> Option<String> {
@@ -1724,5 +1738,42 @@ mod tests {
             .blockers
             .iter()
             .any(|b| b.contains("Ring-0 kernel driver")));
+    }
+
+    #[test]
+    fn select_primary_exe_skips_crash_reporters_and_picks_main_game() {
+        let tmp = make_temp_dir("select_primary_exe");
+        let dir = tmp.path();
+
+        // Alphabetically earlier crash helpers (including larger CrashReportClient.exe than a
+        // nested game binary) must lose to the actual game executable.
+        let crash = dir.join("CrashReportClient.exe");
+        let crs_h = dir.join("crs-handler.exe");
+        let crs_v = dir.join("crs-video.exe");
+        let nested_dir = dir.join("Binaries/Win64");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested_game = nested_dir.join("RealGame-Win64-Shipping.exe");
+
+        fs::write(&crash, vec![0u8; 4096]).unwrap();
+        fs::write(&crs_h, vec![0u8; 4096]).unwrap();
+        fs::write(&crs_v, vec![0u8; 4096]).unwrap();
+        fs::write(&nested_game, vec![0u8; 1024]).unwrap();
+
+        let files = vec![crash.clone(), crs_h.clone(), crs_v.clone(), nested_game.clone()];
+        assert_eq!(
+            select_primary_exe(dir, &files, None).as_deref(),
+            Some(nested_game.as_path()),
+            "nested non-helper game exe must beat top-level crash reporters"
+        );
+
+        // Once a top-level non-helper game exe exists, it wins over nested exes and helpers.
+        let top_game = dir.join("ZetaGame.exe");
+        fs::write(&top_game, vec![0u8; 2048]).unwrap();
+        let files2 = vec![crash, crs_h, crs_v, nested_game, top_game.clone()];
+        assert_eq!(
+            select_primary_exe(dir, &files2, None).as_deref(),
+            Some(top_game.as_path()),
+            "top-level non-helper game exe must beat alphabetically earlier helpers"
+        );
     }
 }
