@@ -1793,6 +1793,22 @@ pub(super) fn spawn_mastering_runtime(
         .min(ring_cap / 2)
         .max(quantum_frames * 2);
 
+    let mut tap = crate::audio::tap::next_path().and_then(|p| {
+        let ch_u16 = channels as u16;
+        let fmt = crate::audio::format::WaveFormat::float_mix(
+            sample_rate,
+            ch_u16,
+            crate::audio::format::default_mask(ch_u16),
+        );
+        match crate::audio::tap::Tap::create_tagged(p.clone(), fmt, "xaudio2") {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log::error!(target: "audio", "xaudio2: audio tap {}: {e}", p.display());
+                None
+            }
+        }
+    });
+
     let mixer_thread = std::thread::Builder::new()
         .name("xaudio2-mixer".into())
         .spawn(move || {
@@ -1810,7 +1826,13 @@ pub(super) fn spawn_mastering_runtime(
                         && quantums < 4
                     {
                         let events = eng.mix_quantum(quantum_frames, &mut mix_buf);
+                        let padding_before = shared_worker.ring.len() as u32;
                         let pushed = shared_worker.ring.push(&mix_buf);
+                        if pushed > 0 {
+                            if let Some(t) = tap.as_mut() {
+                                t.submit_f32(pushed as u32, padding_before, &mix_buf[..pushed * channels]);
+                            }
+                        }
                         if !events.is_empty() {
                             eng.dispatch_callbacks(events);
                         }

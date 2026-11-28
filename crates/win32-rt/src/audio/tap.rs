@@ -1,10 +1,11 @@
-//! PCM tap: `AW2_AUDIO_TAP=path.wav` records exactly the bytes every render
-//! client submits through `IAudioRenderClient::ReleaseBuffer` (in the client's
-//! own format, before any conversion; `AUDCLNT_BUFFERFLAGS_SILENT` buffers are
-//! written as zeros because that is what the client asked to play).
+//! PCM tap: `PORT_AUDIO_TAP=path.wav` (legacy alias `AW2_AUDIO_TAP`) records
+//! the PCM audio submitted by render backends — WASAPI `IAudioRenderClient`,
+//! `ISpatialAudioObjectRenderStream`, `IXAudio2MasteringVoice`, `BinkAudioPlayer`,
+//! and `akrec` (`AUDCLNT_BUFFERFLAGS_SILENT` WASAPI buffers are written as zeros
+//! because that is what the client asked to play).
 //!
 //! The first stream writes to `path`, later streams to `path.<n>.wav`. Next to
-//! each WAV, `<wav>.tsv` logs one line per ReleaseBuffer
+//! each WAV, `<wav>.tsv` logs one line per submitted block
 //! (`seq frames flags padding_before frame_offset qpc_100ns`) for aligning the
 //! tap against other captures (e.g. Wwise's `StartOutputCapture`).
 //!
@@ -36,10 +37,20 @@ pub struct Tap {
 static STREAMS: AtomicU32 = AtomicU32::new(0);
 static OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Tap the next initialized stream to `p`, regardless of `AW2_AUDIO_TAP`
-/// (unit tests, audio harness). One-shot.
+/// Tap the next initialized stream to `p`, regardless of `PORT_AUDIO_TAP` /
+/// `AW2_AUDIO_TAP` (unit tests, audio harness). One-shot.
 pub fn override_next(p: Option<PathBuf>) {
     *OVERRIDE.lock().unwrap() = p;
+}
+
+fn select_env_base(
+    port_var: Option<std::ffi::OsString>,
+    legacy_var: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    port_var
+        .filter(|v| !v.is_empty())
+        .or_else(|| legacy_var.filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
 }
 
 /// Path for the next stream, if tapping is enabled.
@@ -47,11 +58,10 @@ pub fn next_path() -> Option<PathBuf> {
     if let Some(p) = OVERRIDE.lock().unwrap().take() {
         return Some(p);
     }
-    let base = std::env::var_os("AW2_AUDIO_TAP")?;
-    if base.is_empty() {
-        return None;
-    }
-    let base = PathBuf::from(base);
+    let base = select_env_base(
+        std::env::var_os("PORT_AUDIO_TAP"),
+        std::env::var_os("AW2_AUDIO_TAP"),
+    )?;
     let n = STREAMS.fetch_add(1, Ordering::Relaxed);
     Some(if n == 0 { base } else { numbered(&base, n) })
 }
@@ -84,6 +94,14 @@ pub const DATA_OFFSET: u64 = 12 + 8 + 40 + 8;
 
 impl Tap {
     pub fn create(path: PathBuf, fmt: WaveFormat) -> std::io::Result<Tap> {
+        Self::create_inner(path, fmt, None)
+    }
+
+    pub fn create_tagged(path: PathBuf, fmt: WaveFormat, tag: &str) -> std::io::Result<Tap> {
+        Self::create_inner(path, fmt, Some(tag))
+    }
+
+    fn create_inner(path: PathBuf, fmt: WaveFormat, tag: Option<&str>) -> std::io::Result<Tap> {
         if let Some(d) = path.parent() {
             if !d.as_os_str().is_empty() {
                 std::fs::create_dir_all(d)?;
@@ -135,7 +153,18 @@ impl Tap {
                 let _ = f.flush();
                 let _ = side.flush();
             })?;
-        log::info!(target: "audio", "audio tap -> {} ({} Hz, {} ch, {} bit {:?})", path.display(), fmt.rate, fmt.channels, fmt.bits, fmt.sample);
+        match tag {
+            Some(t) => log::info!(
+                target: "audio",
+                "audio tap [{t}] -> {} ({} Hz, {} ch, {} bit {:?})",
+                path.display(), fmt.rate, fmt.channels, fmt.bits, fmt.sample
+            ),
+            None => log::info!(
+                target: "audio",
+                "audio tap -> {} ({} Hz, {} ch, {} bit {:?})",
+                path.display(), fmt.rate, fmt.channels, fmt.bits, fmt.sample
+            ),
+        }
         Ok(Tap { tx: Some(tx), thread: Some(thread), path, seq: 0, frames: 0 })
     }
 
@@ -149,6 +178,23 @@ impl Tap {
             Some(b) => Msg::Data(b.to_vec()),
             None => Msg::Zeros(zero_len),
         });
+        self.seq += 1;
+        self.frames += frames as u64;
+    }
+
+    /// Record one interleaved IEEE-754 `f32` audio block.
+    pub fn submit_f32(&mut self, frames: u32, padding_before: u32, samples: &[f32]) {
+        if frames == 0 || samples.is_empty() {
+            return;
+        }
+        let Some(tx) = &self.tx else { return };
+        let qpc = crate::kernel32::time::interrupt_time_100ns();
+        let mut bytes = Vec::with_capacity(samples.len() * 4);
+        for &s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let _ = tx.send(Msg::Line(format!("{}\t{frames}\t0\t{padding_before}\t{}\t{qpc}\n", self.seq, self.frames)));
+        let _ = tx.send(Msg::Data(bytes));
         self.seq += 1;
         self.frames += frames as u64;
     }
@@ -197,6 +243,48 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(lines[2].starts_with("1\t1\t2\t1\t1\t"), "{}", lines[2]);
         assert_eq!(numbered(Path::new("out/x.wav"), 2), PathBuf::from("out/x.2.wav"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn env_var_prefers_port_audio_tap_with_legacy_fallback_and_submit_f32() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            select_env_base(Some(OsString::from("port.wav")), Some(OsString::from("legacy.wav"))),
+            Some(PathBuf::from("port.wav"))
+        );
+        assert_eq!(
+            select_env_base(Some(OsString::from("")), Some(OsString::from("legacy.wav"))),
+            Some(PathBuf::from("legacy.wav"))
+        );
+        assert_eq!(
+            select_env_base(None, Some(OsString::from("legacy.wav"))),
+            Some(PathBuf::from("legacy.wav"))
+        );
+        assert_eq!(select_env_base(None, Some(OsString::from(""))), None);
+        assert_eq!(select_env_base(None, None), None);
+
+        let dir = std::env::temp_dir().join(format!("port-tap-f32-test-{}", std::process::id()));
+        let p = dir.join("f32.wav");
+        let fmt = WaveFormat::float_mix(48_000, 2, 0x3);
+        let mut t = Tap::create_tagged(p.clone(), fmt, "test").unwrap();
+        let samples = [0.25f32, -0.75, 0.5, -0.25];
+        t.submit_f32(0, 0, &samples); // ignored
+        t.submit_f32(2, 12, &samples);
+        t.finish();
+
+        let b = std::fs::read(&p).unwrap();
+        assert_eq!(u32::from_le_bytes(b[64..68].try_into().unwrap()), 16);
+        let pcm: Vec<f32> = b[DATA_OFFSET as usize..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(pcm, samples);
+        let side = std::fs::read_to_string(sidecar_path(&p)).unwrap();
+        let lines: Vec<&str> = side.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("0\t2\t0\t12\t0\t"), "{}", lines[1]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

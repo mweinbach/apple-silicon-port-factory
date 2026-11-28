@@ -23,9 +23,10 @@ use super::audioclient::{
 };
 use super::backend::{self, Backend, OutputStream, StreamControl, StreamShared};
 use super::com::*;
-use super::format::{SampleType, WaveFormat, WAVEFORMATEX, WAVE_FORMAT_IEEE_FLOAT};
+use super::format::{default_mask, SampleType, WaveFormat, WAVEFORMATEX, WAVE_FORMAT_IEEE_FLOAT};
 use super::mmdevapi::{new_session_control, new_simple_audio_volume, Endpoint, SessionState};
 use super::ring::Ring;
+use super::tap::{self, Tap};
 use crate::types::*;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
@@ -425,6 +426,7 @@ struct StreamState {
     mix_buf: Vec<f32>,
     quanta_mixed: u64,
     last_mixed: Vec<f32>,
+    tap: Option<Tap>,
 }
 
 impl StreamState {
@@ -443,6 +445,7 @@ impl StreamState {
             mix_buf: vec![0.0f32; quantum_frames as usize * 2],
             quanta_mixed: 0,
             last_mixed: Vec::new(),
+            tap: None,
         }
     }
 
@@ -1271,6 +1274,7 @@ mod render_stream {
                 quanta_mixed,
                 in_update,
                 started,
+                tap,
                 ..
             } = &mut *st;
             mix_buf.resize(frames * 2, 0.0);
@@ -1298,7 +1302,11 @@ mod render_stream {
                 pair[0] = if pair[0].is_finite() { pair[0].clamp(-1.0, 1.0) } else { 0.0 };
                 pair[1] = if pair[1].is_finite() { pair[1].clamp(-1.0, 1.0) } else { 0.0 };
             }
+            let padding_before = core.shared.ring.len() as u32;
             core.shared.ring.push(mix_buf);
+            if let Some(t) = tap.as_mut() {
+                t.submit_f32(frames as u32, padding_before, mix_buf);
+            }
             last_mixed.clear();
             last_mixed.extend_from_slice(mix_buf);
             *quanta_mixed += 1;
@@ -1677,6 +1685,16 @@ mod client {
                 return AUDCLNT_E_ALREADY_INITIALIZED;
             }
             *active = Arc::downgrade(&core);
+        }
+
+        if let Some(tap_path) = tap::next_path() {
+            let fmt = WaveFormat::float_mix(SPATIAL_SAMPLE_RATE, 2, default_mask(2));
+            match Tap::create_tagged(tap_path.clone(), fmt, "spatial") {
+                Ok(t) => core.st.lock().unwrap().tap = Some(t),
+                Err(e) => {
+                    log::error!(target: "audio", "spatial audio tap {}: {e}", tap_path.display());
+                }
+            }
         }
 
         log::info!(

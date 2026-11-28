@@ -1218,7 +1218,7 @@ pub const KNOBS: &[KnobSpec] = &[
         aliases: &["AW2_AUDIO_TAP"],
         kind: KnobType::Path,
         default: "",
-        description: "Base path to tap mixed WASAPI audio output to WAV file.",
+        description: "Base path to tap mixed WASAPI, Spatial Audio, XAudio2, and Bink2 audio output to WAV files.",
         affects_aot_key: false,
         crates: &["win32-rt"],
     },
