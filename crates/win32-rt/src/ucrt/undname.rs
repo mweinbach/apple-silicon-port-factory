@@ -20,6 +20,18 @@ const UNDNAME_NO_ECSU: u32 = 0x8000;
 const MAX_DEPTH: usize = 64;
 const MAX_OUT: usize = 65_536;
 
+const CV_CONST: u8 = 1;
+const CV_VOLATILE: u8 = 2;
+
+fn format_cv(cv: u8) -> &'static str {
+    match cv & (CV_CONST | CV_VOLATILE) {
+        0 => "",
+        CV_CONST => "const",
+        CV_VOLATILE => "volatile",
+        _ => "const volatile",
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SpecialKind {
     Normal,
@@ -34,7 +46,7 @@ struct Parser<'a> {
     depth: usize,
     budget: usize,
     names: Vec<String>,
-    types: Vec<String>,
+    types: Vec<(String, u8)>,
 }
 
 impl<'a> Parser<'a> {
@@ -101,10 +113,10 @@ impl<'a> Parser<'a> {
         Some(())
     }
 
-    fn push_type_ref(&mut self, ty: &str) -> Option<()> {
+    fn push_type_ref(&mut self, ty: &str, cv: u8) -> Option<()> {
         if self.types.len() < 10 {
             self.charge(ty.len())?;
-            self.types.push(ty.to_string());
+            self.types.push((ty.to_string(), cv));
         }
         Some(())
     }
@@ -187,10 +199,13 @@ impl<'a> Parser<'a> {
                     match self.bump()? {
                         b'0' => {
                             let n = self.parse_signed_number()?;
-                            args.push(n.to_string());
+                            let s = n.to_string();
+                            self.charge(s.len())?;
+                            args.push(s);
                         }
                         b'1' | b'H' => {
                             let sym = self.parse_symbol_or_raw()?;
+                            self.charge(sym.len().checked_add(1)?)?;
                             args.push(format!("&{sym}"));
                         }
                         _ => return None,
@@ -291,6 +306,7 @@ impl<'a> Parser<'a> {
                         match r {
                             b'0' => {
                                 let ty = self.parse_type(false)?;
+                                self.charge(ty.len().checked_add(24)?)?;
                                 return Some((
                                     format!("{ty} `RTTI Type Descriptor'"),
                                     SpecialKind::Normal,
@@ -343,6 +359,7 @@ impl<'a> Parser<'a> {
                 if self.pos == start {
                     return None;
                 }
+                self.charge(21)?;
                 scopes.push("`anonymous namespace'".to_string());
             } else if b == b'?' {
                 // Local function scope or numbered scope (`?1?func@...`)
@@ -386,14 +403,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_cv(&mut self) -> Option<&'static str> {
+    fn parse_cv_bits(&mut self) -> Option<u8> {
         match self.bump()? {
-            b'A' => Some(""),
-            b'B' => Some("const"),
-            b'C' => Some("volatile"),
-            b'D' => Some("const volatile"),
+            b'A' => Some(0),
+            b'B' => Some(CV_CONST),
+            b'C' => Some(CV_VOLATILE),
+            b'D' => Some(CV_CONST | CV_VOLATILE),
             _ => None,
         }
+    }
+
+    fn parse_cv(&mut self) -> Option<&'static str> {
+        Some(format_cv(self.parse_cv_bits()?))
     }
 
     fn parse_calling_conv(&mut self) -> Option<&'static str> {
@@ -409,52 +430,87 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self, record_backref: bool) -> Option<String> {
+        self.parse_type_with_cv(record_backref, 0).map(|(s, _)| s)
+    }
+
+    fn parse_type_with_cv(&mut self, record_backref: bool, outer_cv: u8) -> Option<(String, u8)> {
         self.enter()?;
-        let res = self.parse_type_inner(record_backref);
+        let res = self.parse_type_inner(record_backref, outer_cv);
         self.leave();
         res
     }
 
-    fn parse_type_inner(&mut self, record_backref: bool) -> Option<String> {
+    fn parse_type_inner(&mut self, record_backref: bool, outer_cv: u8) -> Option<(String, u8)> {
         if let Some(b @ b'0'..=b'9') = self.peek() {
             self.pos += 1;
             let idx = (b - b'0') as usize;
-            let len = self.types.get(idx)?.len();
-            self.charge(len)?;
-            return self.types.get(idx).cloned();
+            let (base_len, base_cv) = {
+                let (s, cv) = self.types.get(idx)?;
+                (s.len(), *cv)
+            };
+            let extra = format_cv(outer_cv & !base_cv);
+            self.charge(base_len.checked_add(extra.len())?.checked_add(1)?)?;
+            let mut s = self.types.get(idx)?.0.clone();
+            if !extra.is_empty() {
+                s.push(' ');
+                s.push_str(extra);
+            }
+            return Some((s, base_cv | outer_cv));
         }
         let start_pos = self.pos;
         let b = self.bump()?;
-        let ty = match b {
-            b'C' => "signed char".to_string(),
-            b'D' => "char".to_string(),
-            b'E' => "unsigned char".to_string(),
-            b'F' => "short".to_string(),
-            b'G' => "unsigned short".to_string(),
-            b'H' => "int".to_string(),
-            b'I' => "unsigned int".to_string(),
-            b'J' => "long".to_string(),
-            b'K' => "unsigned long".to_string(),
-            b'M' => "float".to_string(),
-            b'N' => "double".to_string(),
-            b'O' => "long double".to_string(),
-            b'X' => "void".to_string(),
-            b'Z' => "...".to_string(),
-            b'_' => match self.bump()? {
-                b'D' => "__int8".to_string(),
-                b'E' => "unsigned __int8".to_string(),
-                b'F' => "__int16".to_string(),
-                b'G' => "unsigned __int16".to_string(),
-                b'H' => "__int32".to_string(),
-                b'I' => "unsigned __int32".to_string(),
-                b'J' => "__int64".to_string(),
-                b'K' => "unsigned __int64".to_string(),
-                b'N' => "bool".to_string(),
-                b'S' => "char16_t".to_string(),
-                b'U' => "char32_t".to_string(),
-                b'W' => "wchar_t".to_string(),
-                _ => return None,
-            },
+        let (ty, top_cv) = match b {
+            b'C' | b'D' | b'E' | b'F' | b'G' | b'H' | b'I' | b'J' | b'K' | b'M' | b'N' | b'O'
+            | b'X' => {
+                let base = match b {
+                    b'C' => "signed char",
+                    b'D' => "char",
+                    b'E' => "unsigned char",
+                    b'F' => "short",
+                    b'G' => "unsigned short",
+                    b'H' => "int",
+                    b'I' => "unsigned int",
+                    b'J' => "long",
+                    b'K' => "unsigned long",
+                    b'M' => "float",
+                    b'N' => "double",
+                    b'O' => "long double",
+                    b'X' => "void",
+                    _ => unreachable!(),
+                };
+                let cv = format_cv(outer_cv);
+                if cv.is_empty() {
+                    (base.to_string(), 0)
+                } else {
+                    self.charge(base.len().checked_add(cv.len())?.checked_add(1)?)?;
+                    (format!("{base} {cv}"), outer_cv)
+                }
+            }
+            b'Z' => ("...".to_string(), 0),
+            b'_' => {
+                let base = match self.bump()? {
+                    b'D' => "__int8",
+                    b'E' => "unsigned __int8",
+                    b'F' => "__int16",
+                    b'G' => "unsigned __int16",
+                    b'H' => "__int32",
+                    b'I' => "unsigned __int32",
+                    b'J' => "__int64",
+                    b'K' => "unsigned __int64",
+                    b'N' => "bool",
+                    b'S' => "char16_t",
+                    b'U' => "char32_t",
+                    b'W' => "wchar_t",
+                    _ => return None,
+                };
+                let cv = format_cv(outer_cv);
+                if cv.is_empty() {
+                    (base.to_string(), 0)
+                } else {
+                    self.charge(base.len().checked_add(cv.len())?.checked_add(1)?)?;
+                    (format!("{base} {cv}"), outer_cv)
+                }
+            }
             b'V' | b'U' | b'T' | b'W' => {
                 let tag = match b {
                     b'V' => "class ",
@@ -467,26 +523,38 @@ impl<'a> Parser<'a> {
                     _ => unreachable!(),
                 };
                 let (qname, _) = self.parse_qualified_name()?;
-                if (self.flags & UNDNAME_NO_ECSU) != 0 {
+                let base = if (self.flags & UNDNAME_NO_ECSU) != 0 {
                     qname
                 } else {
                     self.charge(tag.len().checked_add(qname.len())?)?;
                     format!("{tag}{qname}")
+                };
+                let cv = format_cv(outer_cv);
+                if cv.is_empty() {
+                    (base, 0)
+                } else {
+                    self.charge(base.len().checked_add(cv.len())?.checked_add(1)?)?;
+                    (format!("{base} {cv}"), outer_cv)
                 }
             }
             b'P' | b'Q' | b'R' | b'S' | b'A' | b'B' => {
                 let is_ref = matches!(b, b'A' | b'B');
-                let ptr_cv = match b {
-                    b'Q' => " const",
-                    b'R' => " volatile",
-                    b'S' => " const volatile",
-                    b'B' => " volatile",
-                    _ => "",
+                let own_cv = match b {
+                    b'Q' => CV_CONST,
+                    b'R' | b'B' => CV_VOLATILE,
+                    b'S' => CV_CONST | CV_VOLATILE,
+                    _ => 0,
                 };
+                // Reconcile the enclosing pointee qualifier with this pointer/ref's own qualifier
+                // so MSVC's redundant encoding (e.g. `PEBQEAH` for `int * const *`) emits each
+                // CV qualifier only once.
+                let combined_cv = own_cv | outer_cv;
+                let ptr_cv = format_cv(combined_cv);
                 let mut ptr64 = false;
-                if self.peek() == Some(b'E') {
-                    self.pos += 1;
-                    ptr64 = true;
+                while matches!(self.peek(), Some(b'E' | b'F' | b'I')) {
+                    if self.bump() == Some(b'E') {
+                        ptr64 = true;
+                    }
                 }
                 // Function pointer: `P6<cc><ret><args>@Z`
                 if !is_ref && self.peek() == Some(b'6') {
@@ -504,18 +572,19 @@ impl<'a> Parser<'a> {
                         ret.len()
                             .checked_add(cc_str.len())?
                             .checked_add(params.len())?
-                            .checked_add(8)?,
+                            .checked_add(ptr_cv.len())?
+                            .checked_add(10)?,
                     )?;
-                    format!("{ret} ({cc_str}*)({params})")
-                } else {
-                    let pointee_cv = self.parse_cv()?;
-                    let target = self.parse_type(false)?;
-                    self.charge(target.len().checked_add(32)?)?;
-                    let mut s = if pointee_cv.is_empty() {
-                        target
+                    let formatted = if ptr_cv.is_empty() {
+                        format!("{ret} ({cc_str}*)({params})")
                     } else {
-                        format!("{target} {pointee_cv}")
+                        format!("{ret} ({cc_str}* {ptr_cv})({params})")
                     };
+                    (formatted, combined_cv)
+                } else {
+                    let pointee_cv = self.parse_cv_bits()?;
+                    let (mut s, _) = self.parse_type_with_cv(false, pointee_cv)?;
+                    self.charge(s.len().checked_add(32)?)?;
                     s.push_str(if is_ref { " &" } else { " *" });
                     if ptr64 {
                         let k = self.kw("__ptr64");
@@ -524,38 +593,45 @@ impl<'a> Parser<'a> {
                             s.push_str(&k);
                         }
                     }
-                    s.push_str(ptr_cv);
-                    s
+                    if !ptr_cv.is_empty() {
+                        s.push(' ');
+                        s.push_str(ptr_cv);
+                    }
+                    (s, combined_cv)
                 }
             }
             b'?' => {
                 // Qualified primitive or template parameter (`?A...`, `?B...`, `$$...`)
-                let cv = self.parse_cv()?;
-                let inner = self.parse_type(false)?;
-                if cv.is_empty() {
-                    inner
-                } else {
-                    self.charge(inner.len().checked_add(cv.len())?.checked_add(1)?)?;
-                    format!("{inner} {cv}")
+                let cv = self.parse_cv_bits()?;
+                let (inner, inner_cv) = self.parse_type_with_cv(false, cv | outer_cv)?;
+                if record_backref && !inner.is_empty() && (self.pos - start_pos) > 1 {
+                    self.push_type_ref(&inner, inner_cv)?;
                 }
+                return Some((inner, inner_cv));
             }
             b'$' => {
                 if self.eat(b'$') {
                     match self.bump()? {
                         b'Q' => {
                             // Rvalue reference `&&`
-                            let _ = self.eat(b'E');
-                            let cv = self.parse_cv()?;
-                            let inner = self.parse_type(false)?;
-                            self.charge(inner.len().checked_add(cv.len())?.checked_add(4)?)?;
+                            while matches!(self.peek(), Some(b'E' | b'F' | b'I')) {
+                                self.pos += 1;
+                            }
+                            let cv = self.parse_cv_bits()?;
+                            let (inner, _) = self.parse_type_with_cv(false, cv)?;
+                            self.charge(inner.len().checked_add(4)?)?;
+                            (format!("{inner} &&"), 0)
+                        }
+                        b'T' => {
+                            let cv = format_cv(outer_cv);
                             if cv.is_empty() {
-                                format!("{inner} &&")
+                                ("std::nullptr_t".to_string(), 0)
                             } else {
-                                format!("{inner} {cv} &&")
+                                self.charge(15usize.checked_add(cv.len())?)?;
+                                (format!("std::nullptr_t {cv}"), outer_cv)
                             }
                         }
-                        b'T' => "std::nullptr_t".to_string(),
-                        b'V' => String::new(),
+                        b'V' => (String::new(), 0),
                         _ => return None,
                     }
                 } else {
@@ -567,9 +643,9 @@ impl<'a> Parser<'a> {
         // MSVC records every non-empty parameter type whose mangled encoding is > 1 byte
         // (including 2-byte extended primitives such as `_J`, `_N`, `_W` and `$$T`).
         if record_backref && !ty.is_empty() && (self.pos - start_pos) > 1 {
-            self.push_type_ref(&ty)?;
+            self.push_type_ref(&ty, top_cv)?;
         }
-        Some(ty)
+        Some((ty, top_cv))
     }
 
     fn parse_param_list(&mut self) -> Option<String> {
@@ -628,17 +704,26 @@ impl<'a> Parser<'a> {
                     b'2' => "public: static ",
                     _ => "",
                 };
-                let ty = self.parse_type(false)?;
+                let (ty, ty_cv) = self.parse_type_with_cv(false, 0)?;
                 // Skip optional x64/MS extended storage qualifiers (`E` __ptr64, `F` __unaligned, `I` __restrict)
                 // before the trailing storage CV qualifier (`A`/`B`/`C`/`D`).
                 while matches!(self.peek(), Some(b'E' | b'F' | b'I')) {
                     self.pos += 1;
                 }
-                let cv = if self.peek().is_some() {
-                    self.parse_cv()?
+                let storage_cv = if self.peek().is_some() {
+                    self.parse_cv_bits()?
                 } else {
-                    ""
+                    0
                 };
+                let cv = format_cv(storage_cv & !ty_cv);
+                self.charge(
+                    access
+                        .len()
+                        .checked_add(ty.len())?
+                        .checked_add(cv.len())?
+                        .checked_add(qname.len())?
+                        .checked_add(2)?,
+                )?;
                 let mut out = String::new();
                 if (self.flags & UNDNAME_NO_ACCESS_SPECIFIERS) == 0 {
                     out.push_str(access);
@@ -691,6 +776,7 @@ impl<'a> Parser<'a> {
         };
         if kind == SpecialKind::Conversion {
             let target = ret.as_deref()?;
+            self.charge(qname.len().checked_add(target.len())?)?;
             qname = qname.replace("{conv}", target);
             if (self.flags & UNDNAME_NAME_ONLY) != 0 {
                 return Some(qname);
@@ -698,6 +784,13 @@ impl<'a> Parser<'a> {
         }
         let params = self.parse_param_list()?;
 
+        self.charge(
+            qname
+                .len()
+                .checked_add(params.len())?
+                .checked_add(ret.as_ref().map_or(0, String::len))?
+                .checked_add(64)?,
+        )?;
         let mut out = String::new();
         if (self.flags & UNDNAME_NO_ACCESS_SPECIFIERS) == 0 && !access.is_empty() {
             out.push_str(access);
@@ -737,18 +830,7 @@ impl<'a> Parser<'a> {
 
 fn parse_type_only(bytes: &[u8], flags: u32) -> Option<String> {
     let mut p = Parser::new(bytes, flags);
-    let ty = if bytes.starts_with(b"?A")
-        || bytes.starts_with(b"?B")
-        || bytes.starts_with(b"?C")
-        || bytes.starts_with(b"?D")
-    {
-        p.pos = 1;
-        let cv = p.parse_cv()?;
-        let inner = p.parse_type(false)?;
-        if cv.is_empty() { inner } else { format!("{inner} {cv}") }
-    } else {
-        p.parse_type(false)?
-    };
+    let ty = p.parse_type(false)?;
     if p.pos == p.src.len() {
         Some(ty)
     } else {
@@ -786,7 +868,11 @@ pub(crate) fn demangle_msvc(input: &str, flags: u32) -> String {
 
     let mut out = parsed.unwrap_or_else(|| input.to_string());
     if out.len() > MAX_OUT {
-        out.truncate(MAX_OUT);
+        let mut end = MAX_OUT;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
     }
     out
 }
@@ -917,6 +1003,56 @@ mod tests {
             demangle_msvc("?p@A@@2PEBHEB", UNDNAME_NO_MS_KEYWORDS),
             "public: static int const * const A::p"
         );
+        assert_eq!(
+            demangle_msvc("?p@A@@2QEBHEB", UNDNAME_NO_MS_KEYWORDS),
+            "public: static int const * const A::p"
+        );
+
+        // Nested pointer/reference CV qualifiers are reconciled once rather than duplicated.
+        assert_eq!(
+            demangle_msvc("?f@@YAXPEBQEAH@Z", 0),
+            "void __cdecl f(int * __ptr64 const * __ptr64)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAXPEBQEAH@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int * const *)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAXPECREAH@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int * volatile *)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAXPEDSEAH@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int * const volatile *)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAXPEBQEBH@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int const * const *)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAXAEBQEAH@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int * const &)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAX$$QEBQEAH@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int * const &&)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAXPEBQEBQEAH@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int * const * const *)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAXPECREBQEAH@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int * const * volatile *)"
+        );
+        assert_eq!(
+            demangle_msvc("?f@@YAXPEBQEAH0@Z", UNDNAME_NO_MS_KEYWORDS),
+            "void f(int * const *,int * const *)"
+        );
+        assert_eq!(
+            demangle_msvc(".?BQEAH", UNDNAME_NO_MS_KEYWORDS),
+            "int * const"
+        );
 
         // Multi-byte extended primitives (`_J`, `_N`, `$$T`) participate in parameter type back-references.
         assert_eq!(
@@ -963,6 +1099,15 @@ mod tests {
         }
         let rtti_bomb = format!(".{bomb}");
         assert_eq!(demangle_msvc(&rtti_bomb, 0), rtti_bomb);
+
+        // Overlong unrecognized input containing a multibyte UTF-8 character straddling MAX_OUT
+        // truncates cleanly at a UTF-8 character boundary without panicking.
+        let mut long_utf8 = "a".repeat(MAX_OUT - 1);
+        long_utf8.push('é');
+        long_utf8.push_str("tail");
+        let truncated = demangle_msvc(&long_utf8, 0);
+        assert_eq!(truncated.len(), MAX_OUT - 1);
+        assert!(truncated.bytes().all(|b| b == b'a'));
     }
 
     #[test]
