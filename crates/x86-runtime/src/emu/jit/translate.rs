@@ -1489,11 +1489,41 @@ impl Tr<'_> {
         self.set_lb(0, 64);
         self.flush_lb();
         if tail {
-            self.a.ldr(64, T0, XCPU, OFF_RIP);
-            self.a.b_to(self.lookup_rip);
+            self.emit_tail_return();
         }
         if let Some(d) = fast_done {
             self.a.bind(d);
+        }
+    }
+
+    /// Return to the caller after an inline tail-jump `plain_call` (`cpu.rip` already holds the
+    /// popped guest return address). Pops the shadow RAS (`ret x2`) when enabled (matching
+    /// `Term::Ret` and dynamic `plain_ret_jmp` in `stubs.rs`) instead of branching to
+    /// `lookup_rip` and leaving a stale RAS entry behind for the caller's next `ret`.
+    fn emit_tail_return(&mut self) {
+        self.a.ldr(64, T0, XCPU, OFF_RIP);
+        if self.ras_miss != 0 {
+            let bud_fix = if budget_backedge_enabled() {
+                Some(self.a.tbnz(XBUD, 63))
+            } else {
+                None
+            };
+            self.a.ldp_x(1, 2, XRAS, 0);
+            self.a.addsub_ri(true, true, false, XA, XRAS, 16, false);
+            self.a.logic_rr(true, 2, 1, 1, T0, 0, 0); // eor x1, x1, x0
+            let miss = self.a.cbnz(true, 1);
+            self.a.bfxil0(XRAS, XA, 16);
+            self.a.ret_r(2);
+            if let Some(bf) = bud_fix {
+                self.a.bind(bf);
+                // `cpu.rip` already holds the popped return address (stored on tail entry).
+                self.a.movz(false, T0, EXIT_RIP as u32, 0);
+                self.a.b_to(self.exit);
+            }
+            self.a.bind(miss);
+            self.a.b_to(self.ras_miss);
+        } else {
+            self.a.b_to(self.lookup_rip);
         }
     }
 
@@ -1501,7 +1531,7 @@ impl Tr<'_> {
     /// Win32 leaf exports (`QueryPerformanceCounter`, `timeGetTime`/`GetTickCount*`,
     /// `EnterCriticalSection`/`LeaveCriticalSection`, `XInputGetState*`, `SwitchToThread`).
     /// Returns a branch fixup to bind at the end of `plain_call` (or `None` when not matched
-    /// or `tail == true`, in which case the fast path jumps straight to `lookup_rip`).
+    /// or `tail == true`, in which case the fast path returns directly via `emit_tail_return`).
     fn emit_inline_plain_fast_path(&mut self, h: usize, tail: bool) -> Option<usize> {
         #[derive(Clone, Copy)]
         enum InlineKind {
@@ -1947,8 +1977,7 @@ impl Tr<'_> {
         self.set_lb(0, 64);
         self.flush_lb();
         let done = if tail {
-            self.a.ldr(64, T0, XCPU, OFF_RIP);
-            self.a.b_to(self.lookup_rip);
+            self.emit_tail_return();
             None
         } else {
             Some(self.a.b())
@@ -2525,10 +2554,20 @@ impl Tr<'_> {
         if hw_range_enabled() && op.base < RNONE && op.index < RNONE && bits <= 64 {
             let chk = Self::chk_of(op);
             let tso = self.scalar_tso(k, chk, ld);
+            let scale = op.x >> 6;
+            let d = op.disp;
+            let lg = match bits {
+                8 => 0u8,
+                16 => 1,
+                32 => 2,
+                _ => 3,
+            };
+            if !tso && d == 0 && (scale == 0 || (lg > 0 && scale == lg)) {
+                self.a.ldst_reg(ld, bits, reg, g(op.base), g(op.index), scale != 0);
+                return;
+            }
             let lse2 = lse2_trap_enabled();
             if !tso || (host().has(HostFeatures::LRCPC2) && (lse2 || bits == 8)) {
-                let scale = op.x >> 6;
-                let d = op.disp;
                 let cached_lo = match self.xa_key {
                     Some((kb, ki, ks, prev_hi)) if kb == op.base && ki == op.index && ks == scale => {
                         d.checked_sub(prev_hi).filter(|lo| (-256..=255).contains(lo))

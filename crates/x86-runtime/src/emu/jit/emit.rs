@@ -359,6 +359,19 @@ impl Asm {
         let opc = if ld { 0x0040_0000 } else { 0 };
         self.emit(0x3800_0000 | size << 30 | opc | ((off as u32) & 0x1FF) << 12 | n << 5 | t);
     }
+    /// `ldr{b,h,}`/`str{b,h,}` with 64-bit register offset `[xn, xm{, lsl #size}]` (plain non-TSO).
+    pub(super) fn ldst_reg(&mut self, ld: bool, bits: u32, t: u32, n: u32, m: u32, scaled: bool) {
+        let size = match bits {
+            8 => 0u32,
+            16 => 1,
+            32 => 2,
+            _ => 3,
+        };
+        assert!(size > 0 || !scaled, "8-bit ldst_reg does not use LSL scale");
+        let opc = if ld { 0x0040_0000 } else { 0 };
+        let s = if scaled { 0x0000_1000 } else { 0 };
+        self.emit(0x3820_6800 | size << 30 | opc | m << 16 | s | n << 5 | t);
+    }
     /// `ldapur{b,h,}`/`stlur{b,h,}` (FEAT_LRCPC2): RCpc load-acquire / store-release with a
     /// signed 9-bit unscaled offset.
     pub(super) fn ldapur_stlur(&mut self, ld: bool, bits: u32, t: u32, n: u32, off: i32) {
