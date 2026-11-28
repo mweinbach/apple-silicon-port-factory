@@ -36,6 +36,7 @@ fn canonical_command_name(cmd: &str) -> &str {
         "oracle" | "x86-oracle" => "oracle",
         "bisect-runtime" | "bisect" => "bisect-runtime",
         "live-probe" | "probe" => "live-probe",
+        "boot-triage" | "triage" => "boot-triage",
         other => other,
     }
 }
@@ -104,6 +105,7 @@ fn main() {
         "bisect-runtime" | "bisect" => diag::cmd_bisect_runtime(rest),
         "live-probe" | "probe" => diag::cmd_live_probe(rest),
         "nan-trace" => diag::cmd_nan_trace(rest),
+        "boot-triage" | "triage" => diag::cmd_boot_triage(rest),
         "bench" | "benchmark" => bench::cmd_bench(rest),
         "-h" | "--help" | "help" => usage(),
         other => Err(usage_err(format!("unknown subcommand {other:?}"))),
