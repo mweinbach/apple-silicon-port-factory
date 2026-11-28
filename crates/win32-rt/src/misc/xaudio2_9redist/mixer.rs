@@ -1698,9 +1698,7 @@ impl Drop for EngineCore {
 }
 
 pub(super) fn choose_output_device(device_id: Option<&str>) -> backend::DeviceInfo {
-    let headless = std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
-        || std::env::var("AW2_HEADLESS").is_ok_and(|v| v == "1");
-    if headless {
+    if backend::use_null_in_headless_mode() {
         return backend::null_device();
     }
     let mut devs = backend::output_devices();

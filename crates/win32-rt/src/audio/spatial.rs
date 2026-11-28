@@ -1609,10 +1609,11 @@ mod client {
         shared.set_event(event);
 
         // Open CoreAudio output stream, auto-falling back to Backend::Null when
-        // headless, AW2_AUDIO_BACKEND=null, or hardware open fails.
-        let headless = std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
-            || std::env::var("AW2_HEADLESS").is_ok_and(|v| v == "1");
-        let use_null = headless || backend::backend() == Backend::Null || inner.ep.info.id == 0;
+        // headless (unless PORT_AUDIO_BACKEND=coreaudio), PORT_AUDIO_BACKEND=null,
+        // or hardware open fails.
+        let use_null = backend::use_null_in_headless_mode()
+            || backend::backend() == Backend::Null
+            || inner.ep.info.id == 0;
         let out = if use_null {
             match OutputStream::open(
                 &backend::null_device(),
