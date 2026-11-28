@@ -586,7 +586,9 @@ pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i3
     } else {
         (TextMode::Binary, O_BINARY)
     };
-    let raw = kind != FileKind::Disk;
+    // Keep TTY/console handles untranslated, but allow explicit text translation on both
+    // disk files and Win32 pipes (e.g., `_open_osfhandle(..., O_TEXT)` and `_popen("rt"/"wt")`).
+    let raw = !matches!(kind, FileKind::Disk | FileKind::Pipe);
     set_fd_info(
         crt_fd,
         FdInfo {
@@ -2149,6 +2151,28 @@ pub unsafe extern "win64" fn _pipe(pfds: *mut i32, _psize: u32, textmode: i32) -
 /// keyed by the returned `FILE*` address.
 static POPEN_CHILDREN: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
+/// Wrap the parent end of a `_popen` pipe handle into a CRT `FILE*`, honoring explicit
+/// `"t"`/`"b"`/`ccs=` modes and defaulting unspecified modes (`"r"`, `"w"`) to `_fmode`
+/// with CRLF <-> LF text translation enabled for text-mode pipe streams.
+#[cfg(any(not(target_os = "ios"), test))]
+unsafe fn popen_open_pipe_stream(parent_h: crate::types::HANDLE, mf: &ModeFlags) -> *mut FILE {
+    const MODE_MASK: i32 = O_BINARY | O_TEXT | O_WTEXT | O_U16TEXT | O_U8TEXT;
+    let mut open_flags = mf.oflag;
+    if (open_flags & MODE_MASK) == 0 {
+        open_flags |= match FMODE.load(std::sync::atomic::Ordering::Relaxed) {
+            O_BINARY => O_BINARY,
+            O_WTEXT => O_WTEXT,
+            _ => O_TEXT,
+        };
+    }
+    let fd = _open_osfhandle(parent_h as isize, open_flags);
+    if fd < 0 {
+        return std::ptr::null_mut();
+    }
+    let _l = Locked::new();
+    new_stream(fd, mf)
+}
+
 pub unsafe extern "win64" fn _popen(command: *const u8, mode: *const u8) -> *mut FILE {
     if command.is_null() || mode.is_null() {
         errno::set(EINVAL);
@@ -2252,14 +2276,12 @@ pub unsafe extern "win64" fn _popen(command: *const u8, mode: *const u8) -> *mut
         let h_thr = (pi.as_ptr().add(8) as *const HANDLE).read_unaligned();
         let _ = crate::kernel32::threads::CloseHandle(h_thr);
 
-        let fd = _open_osfhandle(parent_h as isize, mf.oflag);
-        if fd < 0 {
+        let fp = popen_open_pipe_stream(parent_h, &mf);
+        if fp.is_null() {
             let _ = crate::kernel32::threads::CloseHandle(parent_h);
             let _ = crate::kernel32::threads::CloseHandle(h_proc);
             return std::ptr::null_mut();
         }
-        let _l = Locked::new();
-        let fp = new_stream(fd, &mf);
         POPEN_CHILDREN
             .lock()
             .unwrap()
@@ -4264,6 +4286,81 @@ mod tests {
                 assert_eq!(&tbuf[..2], b"y\n");
                 assert_eq!(_close(tfds[0]), 0);
                 assert_eq!(_close(tfds[1]), 0);
+            }
+
+            // _popen pipe streams (via popen_open_pipe_stream / _open_osfhandle on CreatePipe)
+            // must translate CRLF <-> LF in text modes ("rt", "r", "wt", "w") and preserve
+            // raw bytes in binary modes ("rb", "wb").
+            for (mode_str, expect_translated) in [
+                ("rt", true),
+                ("r", true),
+                ("rb", false),
+            ] {
+                let mut rd_h: crate::types::HANDLE = std::ptr::null_mut();
+                let mut wr_h: crate::types::HANDLE = std::ptr::null_mut();
+                assert_eq!(
+                    crate::kernel32::file::CreatePipe(&mut rd_h, &mut wr_h, std::ptr::null_mut(), 0),
+                    crate::types::TRUE
+                );
+                let mut written = 0u32;
+                assert_eq!(
+                    crate::kernel32::file::WriteFile(
+                        wr_h,
+                        b"L1\r\nL2\r\n".as_ptr().cast(),
+                        8,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    ),
+                    crate::types::TRUE
+                );
+                assert_eq!(crate::kernel32::threads::CloseHandle(wr_h), crate::types::TRUE);
+                let mf = parse_mode(mode_str).unwrap();
+                let fp = popen_open_pipe_stream(rd_h, &mf);
+                assert!(!fp.is_null());
+                let mut out = [0u8; 16];
+                let got = fread(out.as_mut_ptr().cast(), 1, out.len(), fp);
+                if expect_translated {
+                    assert_eq!(&out[..got], b"L1\nL2\n", "mode {mode_str} must translate CRLF -> LF");
+                } else {
+                    assert_eq!(&out[..got], b"L1\r\nL2\r\n", "mode {mode_str} must keep CRLF verbatim");
+                }
+                assert_eq!(fclose(fp), 0);
+            }
+
+            for (mode_str, expect_translated) in [
+                ("wt", true),
+                ("w", true),
+                ("wb", false),
+            ] {
+                let mut rd_h: crate::types::HANDLE = std::ptr::null_mut();
+                let mut wr_h: crate::types::HANDLE = std::ptr::null_mut();
+                assert_eq!(
+                    crate::kernel32::file::CreatePipe(&mut rd_h, &mut wr_h, std::ptr::null_mut(), 0),
+                    crate::types::TRUE
+                );
+                let mf = parse_mode(mode_str).unwrap();
+                let fp = popen_open_pipe_stream(wr_h, &mf);
+                assert!(!fp.is_null());
+                assert_eq!(fwrite(b"A\nB\n".as_ptr().cast(), 1, 4, fp), 4);
+                assert_eq!(fclose(fp), 0);
+                let mut wire = [0u8; 16];
+                let mut got = 0u32;
+                assert_eq!(
+                    crate::kernel32::file::ReadFile(
+                        rd_h,
+                        wire.as_mut_ptr().cast(),
+                        wire.len() as u32,
+                        &mut got,
+                        std::ptr::null_mut(),
+                    ),
+                    crate::types::TRUE
+                );
+                if expect_translated {
+                    assert_eq!(&wire[..got as usize], b"A\r\nB\r\n", "mode {mode_str} must expand LF -> CRLF");
+                } else {
+                    assert_eq!(&wire[..got as usize], b"A\nB\n", "mode {mode_str} must keep LF verbatim");
+                }
+                assert_eq!(crate::kernel32::threads::CloseHandle(rd_h), crate::types::TRUE);
             }
 
             // _popen must NEVER escape to the host `/bin/sh`:
