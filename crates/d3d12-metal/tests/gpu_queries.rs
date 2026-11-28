@@ -348,6 +348,123 @@ fn large_1m_and_direct_timestamp_query_heaps_on_gpu() {
 }
 
 #[test]
+fn interleaved_command_lists_isolate_staged_timestamp_scratch_slots_on_gpu() {
+    if d3d12_metal::metal::device().is_none() {
+        eprintln!("skipping: no Metal 4 device");
+        return;
+    }
+
+    let ts_heap = QueryHeap::try_new(qh_type::TIMESTAMP, 1_048_576).expect("1M timestamp heap");
+    assert!(ts_heap.is_staged_timestamp());
+
+    let dsv_tex = depth_texture(64, 64);
+    let dsv = TargetView::dsv(&dsv_tex, None).unwrap();
+    let rb_a = readback_buffer(2 * 8);
+    let rb_b = readback_buffer(8_200 * 8);
+    let rb_same_alloc = readback_buffer(2 * 8);
+
+    let q = Queue::new(ListType::Direct, "gpu_queries interleave queue").unwrap();
+    let alloc_a = CommandAllocator::new(ListType::Direct).unwrap();
+    let alloc_b = CommandAllocator::new(ListType::Direct).unwrap();
+
+    // Case 1 (Codex PR #68 interleaving scenario):
+    // List A records 1 staged timestamp and stays open/unflushed while List B records 8,200
+    // staged timestamps (> 2 * 4096) on another allocator. List A then records GPU work + a
+    // second staged timestamp. Even when ONLY List A is submitted, its two timestamps must
+    // use distinct scratch slots (t0 < t1) instead of colliding on a wrapped global ring.
+    let mut la = CommandList::new(ListType::Direct).unwrap();
+    let mut lb = CommandList::new(ListType::Direct).unwrap();
+    la.begin(&alloc_a).unwrap();
+    lb.begin(&alloc_b).unwrap();
+
+    la.write_timestamp(&ts_heap, 100).unwrap();
+
+    for i in 0..8_200u32 {
+        lb.write_timestamp(&ts_heap, 1_000 + i).unwrap();
+    }
+    lb.resolve_timestamps(&ts_heap, 1_000, 8_200, &rb_b, 0).unwrap();
+    lb.close().unwrap();
+
+    // Force measurable GPU work between List A's first and second timestamps so an
+    // overwritten slot would produce identical values (`t0 == t1`) rather than `t0 < t1`.
+    for _ in 0..8 {
+        unsafe { la.clear_dsv(&dsv, true, 1.0, false, 0, &[]).unwrap() };
+    }
+    la.write_timestamp(&ts_heap, 101).unwrap();
+    la.resolve_timestamps(&ts_heap, 100, 2, &rb_a, 0).unwrap();
+    la.close().unwrap();
+
+    // Submit ONLY List A (List B is recorded with 8,200 timestamps on another allocator and not
+    // submitted yet). Wait idle and verify List A's two timestamps are distinct and advancing.
+    q.submit(&[&la.cb]);
+    q.wait_idle();
+    let got_a_only = read_u64s(&rb_a, 2);
+    assert!(
+        got_a_only[0] > 0 && got_a_only[1] > got_a_only[0],
+        "List A timestamps must be distinct and strictly advancing after 8,200 interleaved List B writes: {got_a_only:?}"
+    );
+    alloc_a.reset();
+
+    // Now re-record List A interleaved with already-recorded List B and submit BOTH together in
+    // one batch to verify concurrent GPU execution isolation across their separate scratch leases.
+    la.begin(&alloc_a).unwrap();
+    la.write_timestamp(&ts_heap, 100).unwrap();
+    for _ in 0..8 {
+        unsafe { la.clear_dsv(&dsv, true, 1.0, false, 0, &[]).unwrap() };
+    }
+    la.write_timestamp(&ts_heap, 101).unwrap();
+    la.resolve_timestamps(&ts_heap, 100, 2, &rb_a, 0).unwrap();
+    la.close().unwrap();
+
+    q.submit(&[&la.cb, &lb.cb]);
+    q.wait_idle();
+    let got_a_both = read_u64s(&rb_a, 2);
+    assert!(
+        got_a_both[0] > 0 && got_a_both[1] > got_a_both[0],
+        "List A timestamps must stay distinct when submitted alongside List B: {got_a_both:?}"
+    );
+    let got_b = read_u64s(&rb_b, 8_200);
+    assert!(got_b[0] > 0, "first List B timestamp must be non-zero");
+    for i in 1..got_b.len() {
+        assert!(
+            got_b[i] >= got_b[i - 1],
+            "List B 8,200 timestamps must be monotonically non-decreasing at {i}: {} < {}",
+            got_b[i],
+            got_b[i - 1]
+        );
+    }
+    alloc_a.reset();
+    alloc_b.reset();
+
+    // Case 2: Two command lists recorded sequentially on the SAME CommandAllocator and
+    // submitted together must keep distinct leases until CommandAllocator::reset().
+    let mut l1 = CommandList::new(ListType::Direct).unwrap();
+    let mut l2 = CommandList::new(ListType::Direct).unwrap();
+    l1.begin(&alloc_a).unwrap();
+    l1.write_timestamp(&ts_heap, 200).unwrap();
+    l1.resolve_timestamps(&ts_heap, 200, 1, &rb_same_alloc, 0).unwrap();
+    l1.close().unwrap();
+
+    l2.begin(&alloc_a).unwrap();
+    for _ in 0..8 {
+        unsafe { l2.clear_dsv(&dsv, true, 1.0, false, 0, &[]).unwrap() };
+    }
+    l2.write_timestamp(&ts_heap, 201).unwrap();
+    l2.resolve_timestamps(&ts_heap, 201, 1, &rb_same_alloc, 8).unwrap();
+    l2.close().unwrap();
+
+    q.submit(&[&l1.cb, &l2.cb]);
+    q.wait_idle();
+    alloc_a.reset();
+
+    let got_same = read_u64s(&rb_same_alloc, 2);
+    assert!(
+        got_same[0] > 0 && got_same[1] >= got_same[0],
+        "sequential lists on the same allocator must keep isolated scratch leases until reset: {got_same:?}"
+    );
+}
+
+#[test]
 fn query_heap_error_classification() {
     assert!(matches!(
         QueryHeap::try_new(qh_type::OCCLUSION, 0),

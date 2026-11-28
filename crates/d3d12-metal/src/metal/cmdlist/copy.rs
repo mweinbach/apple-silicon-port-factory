@@ -711,14 +711,17 @@ impl CommandList {
         self.need_full(FullWhy::Internal);
     }
 
-    /// Flush all pending staged GPU timestamps from the shared scratch
-    /// `MTL4CounterHeap` ring into their `QueryHeap` backing `MTLBuffer`s.
+    /// Flush all pending staged GPU timestamps from this command list's
+    /// exclusively-leased scratch `MTL4CounterHeap` slice into their `QueryHeap`
+    /// backing `MTLBuffer`s, then rewind this list's slice cursor to 0.
     pub(crate) fn flush_staged_timestamps(&mut self) {
         if self.pending_staged_ts.is_empty() {
+            self.ts_scratch_cursor = 0;
             return;
         }
-        let Ok(pool) = crate::metal::query::timestamp_scratch_pool() else {
+        let Some(lease_heap) = self.ts_scratch_lease.as_ref().map(|l| l.heap_retained()) else {
             self.pending_staged_ts.clear();
+            self.ts_scratch_cursor = 0;
             return;
         };
         // Ensure any in-flight encoder work writing timestamps (or reading a timestamp
@@ -744,14 +747,14 @@ impl CommandList {
         self.end_encoder();
         self.bar.has_gpu_work = true;
         let pending = std::mem::take(&mut self.pending_staged_ts);
+        self.ts_scratch_cursor = 0;
         let mut i = 0;
         while i < pending.len() {
             let first = &pending[i];
             let mut run_len = 1usize;
             while i + run_len < pending.len() {
                 let next = &pending[i + run_len];
-                if next.heap_idx == first.heap_idx
-                    && next.scratch_slot as usize == first.scratch_slot as usize + run_len
+                if next.scratch_slot as usize == first.scratch_slot as usize + run_len
                     && next.dst_gpu_va == first.dst_gpu_va + (run_len as u64) * 8
                 {
                     run_len += 1;
@@ -759,7 +762,6 @@ impl CommandList {
                     break;
                 }
             }
-            let h = pool.heap(first.heap_idx as usize);
             let range = objc2_foundation::NSRange::new(first.scratch_slot as usize, run_len);
             let dst = MTL4BufferRange {
                 bufferAddress: first.dst_gpu_va,
@@ -769,7 +771,7 @@ impl CommandList {
             unsafe {
                 self.cb
                     .resolveCounterHeap_withRange_intoBuffer_waitFence_updateFence(
-                        h, range, dst, None, None,
+                        &lease_heap, range, dst, None, None,
                     );
             }
             i += run_len;

@@ -28,8 +28,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::*;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub type MtlCounterHeap = ProtocolObject<dyn MTL4CounterHeap>;
 
@@ -47,9 +46,20 @@ pub const MAX_DIRECT_COUNTER_HEAP_ENTRIES: u32 = 4096;
 /// Number of entries per scratch `MTL4CounterHeap` in [`TimestampScratchPool`].
 pub(crate) const SCRATCH_HEAP_ENTRIES: usize = MAX_DIRECT_COUNTER_HEAP_ENTRIES as usize;
 
-/// Target number of shared scratch `MTL4CounterHeap`s (8,192 concurrent scratch
-/// slots = 64 KiB, consuming only 2 of the ~32 process-wide AGX counter heaps).
-const SCRATCH_HEAP_COUNT: usize = 2;
+/// Number of exclusively-owned scratch slots leased to a single command list recording.
+///
+/// Each 4096-entry `MTL4CounterHeap` supplies `64` disjoint leases. A command list
+/// flushes and reuses only its own lease when it fills all `64` slots, and keeps the
+/// lease pinned to its `CommandAllocator` until `CommandAllocator::reset()` (GPU
+/// completion), preventing both recording-time interleaving collisions and in-flight
+/// GPU execution races across command lists.
+pub const SCRATCH_SLICE_LEN: usize = 64;
+const SLICES_PER_HEAP: usize = SCRATCH_HEAP_ENTRIES / SCRATCH_SLICE_LEN;
+const _: () = assert!(SCRATCH_HEAP_ENTRIES % SCRATCH_SLICE_LEN == 0);
+/// Maximum number of shared scratch `MTL4CounterHeap`s allocated on demand
+/// (`4 * 64 = 256` simultaneous in-flight command-list leases while leaving >=20
+/// AGX counter heaps free even alongside `passtiming`).
+const MAX_SCRATCH_HEAPS: usize = 4;
 
 /// `D3D12_QUERY_HEAP_TYPE`.
 pub mod heap_type {
@@ -91,68 +101,126 @@ impl From<QueryHeapError> for String {
     }
 }
 
-/// Lazily initialized shared ring of hardware `MTL4CounterHeap`s feeding large
-/// (`count > 4096`) or overflow timestamp query heaps.
-pub(crate) struct TimestampScratchPool {
+struct ScratchPoolInner {
     heaps: Vec<Retained<MtlCounterHeap>>,
-    next_slot: AtomicU64,
+    /// Free `(heap_idx, slice_idx)` pairs available for exclusive lease.
+    free_slices: Vec<(u8, u16)>,
+}
+
+/// Lazily initialized shared pool of hardware `MTL4CounterHeap` slices feeding
+/// large (`count > 4096`) or overflow timestamp query heaps.
+///
+/// Each active command list recording leases an exclusively-owned `SCRATCH_SLICE_LEN`
+/// slice and retains ownership on its `CommandAllocator` until reset/drop, so no
+/// other command list can overwrite an unresolved or in-flight scratch slot.
+pub(crate) struct TimestampScratchPool {
+    inner: Mutex<ScratchPoolInner>,
 }
 unsafe impl Send for TimestampScratchPool {}
 unsafe impl Sync for TimestampScratchPool {}
 
+/// Exclusively-owned `SCRATCH_SLICE_LEN`-slot slice of a hardware `MTL4CounterHeap`.
+/// Automatically returned to [`TimestampScratchPool`] on drop.
+pub struct TimestampScratchLease {
+    heap: Retained<MtlCounterHeap>,
+    heap_idx: u8,
+    slice_idx: u16,
+    base_slot: u16,
+    pool: &'static TimestampScratchPool,
+}
+unsafe impl Send for TimestampScratchLease {}
+unsafe impl Sync for TimestampScratchLease {}
+
+impl TimestampScratchLease {
+    #[inline]
+    pub(crate) fn heap_retained(&self) -> Retained<MtlCounterHeap> {
+        self.heap.clone()
+    }
+
+    #[inline]
+    pub(crate) fn base_slot(&self) -> usize {
+        self.base_slot as usize
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        SCRATCH_SLICE_LEN
+    }
+
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> (u8, u16) {
+        (self.heap_idx, self.slice_idx)
+    }
+}
+
+impl Drop for TimestampScratchLease {
+    fn drop(&mut self) {
+        self.pool.release_slice(self.heap_idx, self.slice_idx);
+    }
+}
+
 impl TimestampScratchPool {
-    fn init() -> Result<Self, String> {
+    fn alloc_counter_heap(heap_idx: usize) -> Result<Retained<MtlCounterHeap>, String> {
         let d = super::device().ok_or_else(|| "no Metal 4 device".to_string())?;
         let entry = d.dev.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
         if entry != 8 {
             return Err(format!("timestamp heap entries are {entry} bytes, expected 8"));
         }
-        let mut heaps = Vec::with_capacity(SCRATCH_HEAP_COUNT);
-        let mut last_err = None;
-        for i in 0..SCRATCH_HEAP_COUNT {
-            let desc = MTL4CounterHeapDescriptor::new();
-            desc.setType(MTL4CounterHeapType::Timestamp);
-            unsafe { desc.setCount(SCRATCH_HEAP_ENTRIES) };
-            match d.dev.newCounterHeapWithDescriptor_error(&desc) {
-                Ok(h) => {
-                    h.setLabel(Some(&objc2_foundation::NSString::from_str(&format!(
-                        "port timestamp scratch {i}"
-                    ))));
-                    heaps.push(h);
-                }
-                Err(e) => {
-                    last_err = Some(format!(
-                        "newCounterHeap(timestamp scratch {i}, {SCRATCH_HEAP_ENTRIES}): {e}"
-                    ));
-                    break;
-                }
+        let desc = MTL4CounterHeapDescriptor::new();
+        desc.setType(MTL4CounterHeapType::Timestamp);
+        unsafe { desc.setCount(SCRATCH_HEAP_ENTRIES) };
+        let h = d
+            .dev
+            .newCounterHeapWithDescriptor_error(&desc)
+            .map_err(|e| format!("newCounterHeap(timestamp scratch {heap_idx}, {SCRATCH_HEAP_ENTRIES}): {e}"))?;
+        h.setLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+            "port timestamp scratch {heap_idx}"
+        ))));
+        Ok(h)
+    }
+
+    fn init() -> Result<Self, String> {
+        let h0 = Self::alloc_counter_heap(0)?;
+        let mut free_slices = Vec::with_capacity(SLICES_PER_HEAP);
+        for s in (0..SLICES_PER_HEAP).rev() {
+            free_slices.push((0, s as u16));
+        }
+        Ok(Self { inner: Mutex::new(ScratchPoolInner { heaps: vec![h0], free_slices }) })
+    }
+
+    /// Lease an exclusively-owned `SCRATCH_SLICE_LEN`-slot slice, lazily growing the
+    /// pool up to `MAX_SCRATCH_HEAPS` if all existing slices are currently checked out.
+    pub(crate) fn acquire_lease(&'static self) -> Result<TimestampScratchLease, String> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.free_slices.is_empty() {
+            if g.heaps.len() >= MAX_SCRATCH_HEAPS {
+                return Err(format!(
+                    "timestamp scratch pool exhausted ({} slices across {} heaps all leased by active/in-flight command lists)",
+                    g.heaps.len() * SLICES_PER_HEAP,
+                    g.heaps.len()
+                ));
+            }
+            let next_idx = g.heaps.len();
+            let h = Self::alloc_counter_heap(next_idx)?;
+            g.heaps.push(h);
+            for s in (0..SLICES_PER_HEAP).rev() {
+                g.free_slices.push((next_idx as u8, s as u16));
             }
         }
-        if heaps.is_empty() {
-            return Err(last_err.unwrap_or_else(|| "failed to allocate timestamp scratch heap".into()));
-        }
-        Ok(Self { heaps, next_slot: AtomicU64::new(0) })
+        let (heap_idx, slice_idx) = g.free_slices.pop().unwrap();
+        let heap = g.heaps[heap_idx as usize].clone();
+        Ok(TimestampScratchLease {
+            heap,
+            heap_idx,
+            slice_idx,
+            base_slot: (slice_idx as usize * SCRATCH_SLICE_LEN) as u16,
+            pool: self,
+        })
     }
 
-    /// Claim the next scratch `(heap_idx, entry_idx)` from the lock-free ring.
-    #[inline]
-    pub(crate) fn alloc_slot(&self) -> (usize, usize) {
-        let total = self.heaps.len() * SCRATCH_HEAP_ENTRIES;
-        let raw = self.next_slot.fetch_add(1, Ordering::Relaxed) as usize;
-        let slot = raw % total;
-        (slot / SCRATCH_HEAP_ENTRIES, slot % SCRATCH_HEAP_ENTRIES)
-    }
-
-    #[inline]
-    pub(crate) fn heap(&self, heap_idx: usize) -> &MtlCounterHeap {
-        &self.heaps[heap_idx]
-    }
-
-    /// Flush pending staged timestamps well before a single command list can wrap
-    /// around its own scratch slots.
-    #[inline]
-    pub(crate) fn flush_threshold(&self) -> usize {
-        SCRATCH_HEAP_ENTRIES / 2
+    fn release_slice(&self, heap_idx: u8, slice_idx: u16) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.free_slices.push((heap_idx, slice_idx));
     }
 }
 
@@ -164,10 +232,10 @@ pub(crate) fn timestamp_scratch_pool() -> Result<&'static TimestampScratchPool, 
     }
 }
 
-/// One staged GPU timestamp waiting to be resolved from the shared scratch
-/// `MTL4CounterHeap` ring into its `QueryHeap`'s backing `MTLBuffer`.
+/// One staged GPU timestamp waiting to be resolved from this command list's
+/// exclusively-leased scratch `MTL4CounterHeap` slice into its `QueryHeap`'s
+/// backing `MTLBuffer`.
 pub(crate) struct PendingStagedTimestamp {
-    pub heap_idx: u8,
     pub scratch_slot: u16,
     /// Retains the destination backing buffer until the resolve is encoded.
     pub _dst_buf: Retained<super::resource::MtlBuffer>,
@@ -474,15 +542,24 @@ impl super::cmdlist::CommandList {
             return Ok(());
         }
         let buf = heap.timestamp_buffer.as_ref().ok_or("not a timestamp heap")?;
-        let pool = timestamp_scratch_pool()?;
-        if self.pending_staged_ts.len() >= pool.flush_threshold() {
+        if self.ts_scratch_lease.is_none() {
+            let pool = timestamp_scratch_pool()?;
+            self.ts_scratch_lease = Some(pool.acquire_lease()?);
+            self.ts_scratch_cursor = 0;
+        }
+        let cap = self.ts_scratch_lease.as_ref().unwrap().len();
+        if self.ts_scratch_cursor >= cap {
             self.flush_staged_timestamps();
         }
-        let (heap_idx, entry_idx) = pool.alloc_slot();
-        self.timestamp_into(pool.heap(heap_idx), entry_idx);
+        let (scratch_heap, slot) = {
+            let lease = self.ts_scratch_lease.as_ref().unwrap();
+            let slot = lease.base_slot() + self.ts_scratch_cursor;
+            self.ts_scratch_cursor += 1;
+            (lease.heap_retained(), slot)
+        };
+        self.timestamp_into(&scratch_heap, slot);
         self.pending_staged_ts.push(PendingStagedTimestamp {
-            heap_idx: heap_idx as u8,
-            scratch_slot: entry_idx as u16,
+            scratch_slot: slot as u16,
             _dst_buf: buf.clone(),
             dst_gpu_va: buf.gpuAddress() + index as u64 * 8,
         });
@@ -597,5 +674,40 @@ mod tests {
         assert!(ps.timestamps.is_none());
         assert!(ps.timestamp_buffer.is_none());
         assert!(ps.visibility_chunks.is_empty());
+    }
+
+    #[test]
+    fn scratch_pool_leases_are_disjoint_grow_on_demand_and_recycle_on_drop() {
+        if super::super::device().is_none() {
+            return;
+        }
+        let pool = timestamp_scratch_pool().expect("scratch pool");
+        // Acquire more leases than a single 4096-entry heap supplies (64 slices) to
+        // prove disjointness across lists AND lazy second-heap growth.
+        let mut leases = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..(SLICES_PER_HEAP + 10) {
+            let l = pool.acquire_lease().expect("lease acquisition");
+            assert!(
+                seen.insert(l.id()),
+                "duplicate scratch slice {:?} leased while still owned",
+                l.id()
+            );
+            assert!(l.base_slot() + l.len() <= SCRATCH_HEAP_ENTRIES);
+            leases.push(l);
+        }
+        let first_id = leases[0].id();
+        drop(leases);
+        // After dropping all leases, re-acquiring must recycle freed slices cleanly.
+        let mut recycled = Vec::new();
+        let mut saw_first = false;
+        for _ in 0..(SLICES_PER_HEAP + 10) {
+            let l = pool.acquire_lease().expect("recycled lease");
+            if l.id() == first_id {
+                saw_first = true;
+            }
+            recycled.push(l);
+        }
+        assert!(saw_first, "dropped lease {:?} must be returned to the pool", first_id);
     }
 }
