@@ -6,13 +6,15 @@
 //! Metal 4 [`super::view_pool`] (cached on their resource, recycled after GPU
 //! completion), while samplers live in a process-wide table.
 
-use super::resource::{Resource, SWIZZLE_IDENTITY};
+use super::resource::{
+    is_texture_buffer_format_supported, Resource, MAX_TEXTURE_BUFFER_WIDTH, SWIZZLE_IDENTITY,
+};
 use crate::format;
 use dxil_metal::runtime::{BufferView, DescriptorTableEntry};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 pub type Entry = [u8; 24];
@@ -200,14 +202,147 @@ fn align_typed_buffer_offset(first: u64, bpe: u64, align: u64) -> Result<(u64, u
     Ok((aligned, el_off))
 }
 
+/// Planned byte offset and Metal texture-buffer geometry for a D3D12 typed buffer view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TypedBufferViewPlan {
+    aligned_offset: u64,
+    element_offset: u32,
+    width: u64,
+    bytes_per_row: u64,
+    metadata_size: u64,
+    clamped_to_buffer: bool,
+    clamped_to_max_width: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypedBufferPlan {
+    /// Zero elements lie inside the backing buffer (`NumElements == 0` or `FirstElement` past end):
+    /// encode a null descriptor (D3D12 OOB reads return 0, writes are discarded).
+    Empty,
+    View(TypedBufferViewPlan),
+}
+
+/// Compute a validated raw or structured buffer view `(byte_offset, metadata_size)` inside
+/// `buf_len`, or `None` when the view is empty / starts past the end of the buffer.
+fn plan_raw_or_structured_buffer_view(buf_len: u64, elem: u64, first: u64, num: u32) -> Option<(u64, u64)> {
+    if elem == 0 || num == 0 {
+        return None;
+    }
+    let off = first.checked_mul(elem)?;
+    if off >= buf_len {
+        return None;
+    }
+    let avail = buf_len - off;
+    let req = (num as u64).checked_mul(elem).unwrap_or(u64::MAX);
+    let size = req.min(avail);
+    if size == 0 {
+        return None;
+    }
+    // `IRDescriptorTableEntry.metadata` carries byte size in its low 32 bits; saturate at
+    // `u32::MAX` so >= 4 GiB views never wrap around to 0 bytes.
+    Some((off, size.min(u32::MAX as u64)))
+}
+
+/// Plan a Metal `MTLTextureTypeTextureBuffer` backing a D3D12 typed buffer SRV/UAV.
+///
+/// Enforces every Metal hardware and debug-layer constraint:
+/// - `aligned_offset` is a multiple of `lcm(align, bpe)` with `element_offset <= 255`
+/// - `1 <= width <= max_width` (clamped if the D3D12 view exceeds Metal's `maxTextureBufferWidth`)
+/// - `aligned_offset + width * bpe <= buf_len` (clamped if `FirstElement + NumElements` overhangs)
+/// - `num == 0` or starting past the buffer end yields `TypedBufferPlan::Empty` (null descriptor).
+fn plan_typed_buffer_view(
+    buf_len: u64,
+    bpe: u64,
+    align: u64,
+    first: u64,
+    num: u32,
+    max_width: u64,
+) -> Result<TypedBufferPlan, String> {
+    if bpe == 0 || max_width == 0 {
+        return Err(format!("invalid typed buffer geometry (bpe={bpe}, max_width={max_width})"));
+    }
+    if num == 0 {
+        return Ok(TypedBufferPlan::Empty);
+    }
+    let Some(start_byte) = first.checked_mul(bpe) else {
+        return Ok(TypedBufferPlan::Empty);
+    };
+    if start_byte >= buf_len {
+        return Ok(TypedBufferPlan::Empty);
+    }
+    let (aligned_offset, el_off) = align_typed_buffer_offset(first, bpe, align)?;
+    let avail_elements = (buf_len - aligned_offset) / bpe;
+    if avail_elements <= el_off {
+        return Ok(TypedBufferPlan::Empty);
+    }
+    let requested = (num as u64).saturating_add(el_off);
+    let in_bounds = requested.min(avail_elements);
+    let clamped_to_buffer = in_bounds < requested;
+    let width = in_bounds.min(max_width);
+    let clamped_to_max_width = width < in_bounds;
+    if width <= el_off {
+        return Err(format!(
+            "typed buffer view element offset {el_off} exceeds hardware maxTextureBufferWidth {max_width}"
+        ));
+    }
+    let bytes_per_row = width
+        .checked_mul(bpe)
+        .ok_or_else(|| format!("typed buffer bytesPerRow overflow ({width} * {bpe})"))?;
+    Ok(TypedBufferPlan::View(TypedBufferViewPlan {
+        aligned_offset,
+        element_offset: el_off as u32,
+        width,
+        bytes_per_row,
+        metadata_size: bytes_per_row.min(u32::MAX as u64),
+        clamped_to_buffer,
+        clamped_to_max_width,
+    }))
+}
+
+/// Deduplicated warning helper so oversized typed-buffer SRVs/UAVs are logged honestly once
+/// per distinct `(dxgi, writable, first, num, buf_len)` without spamming per-frame rebuilds.
+fn warn_clamped_typed_buffer_once(
+    dxgi: u32,
+    writable: bool,
+    first: u64,
+    num: u32,
+    buf_len: u64,
+    plan: &TypedBufferViewPlan,
+) {
+    static SEEN: OnceLock<Mutex<HashSet<(u32, bool, u64, u32, u64)>>> = OnceLock::new();
+    let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut g = set.lock().unwrap();
+    if g.len() < 256 && g.insert((dxgi, writable, first, num, buf_len)) {
+        let kind = if writable { "UAV" } else { "SRV" };
+        let visible = plan.width - plan.element_offset as u64;
+        log::warn!(
+            target: "d3d",
+            "typed buffer {kind} ({}) requests {} elements (first={}, num={}, el_off={}, buf={} B) exceeding Metal maxTextureBufferWidth ({}); clamping to {} elements ({} visible, {} B); accesses at index >= {} will read 0 / drop writes",
+            format::name(dxgi),
+            num as u64 + plan.element_offset as u64,
+            first,
+            num,
+            plan.element_offset,
+            buf_len,
+            MAX_TEXTURE_BUFFER_WIDTH,
+            plan.width,
+            visible,
+            plan.bytes_per_row,
+            visible,
+        );
+    }
+}
+
 /// Buffer SRV/UAV (`D3D12_BUFFER_SRV`/`_UAV`): raw (flag 1), structured
 /// (stride) or typed (format, via a texture-buffer view). When `counter` is
 /// supplied on a writable raw/structured buffer UAV, its `R32Uint` texture-buffer
 /// view is attached in `texture_buffer_view_id` (matching `IRRuntimeCreateAppendBufferView`)
 /// so append/consume and `IncrementCounter`/`DecrementCounter` instructions hit the GPU counter.
+#[allow(clippy::too_many_arguments)]
 fn buffer_entry(
     r: &Resource,
     dxgi: u32,
+    mapping: u32,
     first: u64,
     num: u32,
     stride: u32,
@@ -215,23 +350,36 @@ fn buffer_entry(
     writable: bool,
     counter: Option<(&Resource, u64)>,
 ) -> Result<Entry, String> {
+    let Some(b) = r.buffer() else {
+        return Err("buffer view of a non-buffer resource".into());
+    };
     let raw = flags & 1 != 0;
     let base = r.gpu_va;
-    let len = r.desc.Width;
+    let len = r.desc.Width.min(b.length() as u64);
+    if raw && stride != 0 {
+        return Err(format!("raw buffer view cannot have non-zero StructureByteStride ({stride})"));
+    }
     if raw || stride != 0 {
         let elem = if raw { 4 } else { stride as u64 };
-        let off = first * elem;
-        let size = (num as u64 * elem).min(len.saturating_sub(off));
+        let Some((off, size)) = plan_raw_or_structured_buffer_view(len, elem, first, num) else {
+            return Ok(DescriptorTableEntry::NULL.to_bytes());
+        };
         if writable {
             if let Some((cr, coff)) = counter {
+                let Some(cb) = cr.buffer() else {
+                    return Err("UAV counter resource is not a buffer".into());
+                };
+                if coff % 4 != 0 {
+                    return Err(format!("UAV counter byte offset {coff} is not 4-byte aligned"));
+                }
+                let clen = cr.desc.Width.min(cb.length() as u64);
+                if coff.checked_add(4).is_none_or(|end| end > clen) {
+                    return Err(format!("UAV counter offset {coff} + 4 exceeds counter buffer length {clen}"));
+                }
                 cr.register_ptr();
                 let dev = super::device().ok_or("no device")?;
                 let align = dev.dev.minimumTextureBufferAlignmentForPixelFormat(MTLPixelFormat::R32Uint).max(16) as u64;
-                let aligned = coff / align * align;
-                let el_off = (coff - aligned) / 4;
-                if el_off > 255 {
-                    return Err(format!("UAV counter element offset {el_off} > 255"));
-                }
+                let (aligned, el_off) = align_typed_buffer_offset(coff / 4, 4, align)?;
                 let tv_id = cr
                     .buffer_texture_view_id(MTLPixelFormat::R32Uint, aligned, 1 + el_off, true)
                     .ok_or("UAV counter texture buffer view creation failed")?;
@@ -248,6 +396,14 @@ fn buffer_entry(
         return Ok(DescriptorTableEntry::buffer(base + off, dxil_metal::runtime::buffer_metadata(size, 0, false)).to_bytes());
     }
     let fi = format::info(dxgi);
+    if matches!(fi.num, format::Num::Typeless | format::Num::Video)
+        || fi.is_bc()
+        || fi.is_depth_stencil()
+        || fi.block_w != 1
+        || fi.block_h != 1
+    {
+        return Err(format!("typed buffer view with unsupported format {}", format::name(dxgi)));
+    }
     let dev = super::device().ok_or("no device")?;
     // Metal 4.1 (`macOS 27` / `iOS 27`, Apple10+): read-only 3-channel RGB32 texture buffers
     // (`MTLPixelFormatRGB32{Uint=120, Sint=121, Float=122}`) support D3D12/D3D11 typed
@@ -264,15 +420,61 @@ fn buffer_entry(
     } else {
         return Err(format!("typed buffer view with format {}", format::name(dxgi)));
     };
+    if !is_texture_buffer_format_supported(dev, mtl_fmt, writable) {
+        return Err(format!(
+            "typed buffer {} format {} ({:?}) is not supported by Metal texture buffers",
+            if writable { "UAV" } else { "SRV" },
+            format::name(dxgi),
+            mtl_fmt,
+        ));
+    }
     let align = dev.dev.minimumTextureBufferAlignmentForPixelFormat(mtl_fmt).max(1) as u64;
-    let (aligned, el_off) = align_typed_buffer_offset(first, bpe, align)?;
-    let tv_id = r.buffer_texture_view_id(mtl_fmt, aligned, num as u64 + el_off, writable).ok_or("texture buffer view creation failed")?;
+    let plan = match plan_typed_buffer_view(len, bpe, align, first, num, MAX_TEXTURE_BUFFER_WIDTH)? {
+        TypedBufferPlan::Empty => {
+            if num > 0 {
+                log::debug!(
+                    target: "d3d",
+                    "typed buffer {} ({}) first={} num={} starts past buffer length {} (null descriptor)",
+                    if writable { "UAV" } else { "SRV" },
+                    format::name(dxgi),
+                    first,
+                    num,
+                    len,
+                );
+            }
+            return Ok(DescriptorTableEntry::NULL.to_bytes());
+        }
+        TypedBufferPlan::View(p) => p,
+    };
+    if plan.clamped_to_max_width {
+        warn_clamped_typed_buffer_once(dxgi, writable, first, num, len, &plan);
+    } else if plan.clamped_to_buffer {
+        log::debug!(
+            target: "d3d",
+            "typed buffer {} ({}) first={} num={} extends past buffer length {}; clamped to {} elements",
+            if writable { "UAV" } else { "SRV" },
+            format::name(dxgi),
+            first,
+            num,
+            len,
+            plan.width,
+        );
+    }
+    let eff_mapping = if mapping == 0 { DEFAULT_MAPPING } else { mapping };
+    let swz = if writable || (eff_mapping == DEFAULT_MAPPING && !matches!(dxgi, 47 | 22 | 88 | 93)) {
+        SWIZZLE_IDENTITY
+    } else {
+        swizzle(eff_mapping, dxgi)
+    };
+    let tv_id = r
+        .buffer_texture_view_id_swizzled(mtl_fmt, plan.aligned_offset, plan.width, writable, swz)
+        .ok_or("texture buffer view creation failed")?;
     r.note_view_kind(super::resource::HK_TYPED_BUF);
     let v = BufferView {
-        gpu_va: base + aligned,
-        size: (num as u64 + el_off) * bpe,
+        gpu_va: base + plan.aligned_offset,
+        size: plan.metadata_size,
         texture_buffer_view_id: tv_id,
-        texture_view_offset_in_elements: el_off as u32,
+        texture_view_offset_in_elements: plan.element_offset,
         typed_buffer: true,
     };
     Ok(DescriptorTableEntry::buffer_view(&v).to_bytes())
@@ -316,7 +518,7 @@ pub fn srv_entry(r: Option<&Resource>, desc: Option<&[u8; 40]>) -> Result<Entry,
     let mapping = u32s(d, 2);
     let u = &d[16..];
     if dimension == 1 {
-        return buffer_entry(r, dxgi, u64at(u, 0), u32s(u, 2), u32s(u, 3), u32s(u, 4), false, None);
+        return buffer_entry(r, dxgi, mapping, u64at(u, 0), u32s(u, 2), u32s(u, 3), u32s(u, 4), false, None);
     }
     if r.texture().is_none() {
         return Err(format!("texture SRV (dimension {dimension}) of a buffer"));
@@ -374,7 +576,7 @@ pub fn uav_entry_with_counter(
             let desc_off = u64at(u, 16);
             (cr, if explicit_off != 0 { explicit_off } else { desc_off })
         });
-        return buffer_entry(r, dxgi, u64at(u, 0), u32s(u, 2), u32s(u, 3), u32s(u, 6), true, counter_arg);
+        return buffer_entry(r, dxgi, DEFAULT_MAPPING, u64at(u, 0), u32s(u, 2), u32s(u, 3), u32s(u, 6), true, counter_arg);
     }
     if r.texture().is_none() {
         return Err(format!("texture UAV (dimension {dimension}) of a buffer"));
@@ -586,5 +788,90 @@ mod tests {
         // Power-of-two texels stay identical to baseline alignment.
         assert_eq!(align_typed_buffer_offset(5, 4, 16).unwrap(), (16, 1));
         assert_eq!(align_typed_buffer_offset(3, 16, 16).unwrap(), (48, 0));
+    }
+
+    #[test]
+    fn plan_typed_buffer_view_handles_limits_overhang_and_empty() {
+        // Exact mega-buffer case that used to abort in Metal validation:
+        // 2,145,386,496-byte buffer viewed as R8G8B8A8_UNORM (536,346,624 elements > 2^28).
+        let mega = 2_145_386_496u64;
+        let plan = plan_typed_buffer_view(mega, 4, 16, 0, (mega / 4) as u32, MAX_TEXTURE_BUFFER_WIDTH).unwrap();
+        assert_eq!(
+            plan,
+            TypedBufferPlan::View(TypedBufferViewPlan {
+                aligned_offset: 0,
+                element_offset: 0,
+                width: MAX_TEXTURE_BUFFER_WIDTH,
+                bytes_per_row: MAX_TEXTURE_BUFFER_WIDTH * 4,
+                metadata_size: MAX_TEXTURE_BUFFER_WIDTH * 4,
+                clamped_to_buffer: false,
+                clamped_to_max_width: true,
+            })
+        );
+
+        // Exact hardware ceiling (2^28) must not report clamping, and a 4 GiB 16-byte view
+        // must saturate `metadata_size` at u32::MAX rather than wrapping to 0.
+        let four_gib = MAX_TEXTURE_BUFFER_WIDTH * 16;
+        let p4 = plan_typed_buffer_view(four_gib, 16, 16, 0, MAX_TEXTURE_BUFFER_WIDTH as u32, MAX_TEXTURE_BUFFER_WIDTH).unwrap();
+        assert_eq!(
+            p4,
+            TypedBufferPlan::View(TypedBufferViewPlan {
+                aligned_offset: 0,
+                element_offset: 0,
+                width: MAX_TEXTURE_BUFFER_WIDTH,
+                bytes_per_row: four_gib,
+                metadata_size: u32::MAX as u64,
+                clamped_to_buffer: false,
+                clamped_to_max_width: false,
+            })
+        );
+
+        // High-offset window beyond 2^28 elements stays unclamped because width <= 2^28.
+        let high = plan_typed_buffer_view(mega, 4, 16, 300_000_001, 1024, MAX_TEXTURE_BUFFER_WIDTH).unwrap();
+        assert_eq!(
+            high,
+            TypedBufferPlan::View(TypedBufferViewPlan {
+                aligned_offset: 1_200_000_000,
+                element_offset: 1,
+                width: 1025,
+                bytes_per_row: 4100,
+                metadata_size: 4100,
+                clamped_to_buffer: false,
+                clamped_to_max_width: false,
+            })
+        );
+
+        // Partial overhang clamps cleanly to buffer capacity.
+        let overhang = plan_typed_buffer_view(64, 4, 16, 5, 100, MAX_TEXTURE_BUFFER_WIDTH).unwrap();
+        assert_eq!(
+            overhang,
+            TypedBufferPlan::View(TypedBufferViewPlan {
+                aligned_offset: 16,
+                element_offset: 1,
+                width: 12,
+                bytes_per_row: 48,
+                metadata_size: 48,
+                clamped_to_buffer: true,
+                clamped_to_max_width: false,
+            })
+        );
+
+        // Empty, past-end, overflow, and sub-element tail all yield Empty (null descriptor).
+        assert_eq!(plan_typed_buffer_view(64, 4, 16, 0, 0, MAX_TEXTURE_BUFFER_WIDTH).unwrap(), TypedBufferPlan::Empty);
+        assert_eq!(plan_typed_buffer_view(64, 4, 16, 16, 4, MAX_TEXTURE_BUFFER_WIDTH).unwrap(), TypedBufferPlan::Empty);
+        assert_eq!(plan_typed_buffer_view(64, 4, 16, u64::MAX, 4, MAX_TEXTURE_BUFFER_WIDTH).unwrap(), TypedBufferPlan::Empty);
+        assert_eq!(plan_typed_buffer_view(6, 4, 16, 1, 4, MAX_TEXTURE_BUFFER_WIDTH).unwrap(), TypedBufferPlan::Empty);
+    }
+
+    #[test]
+    fn plan_raw_or_structured_handles_bounds_and_u32_saturation() {
+        assert_eq!(plan_raw_or_structured_buffer_view(256, 16, 2, 4), Some((32, 64)));
+        assert_eq!(plan_raw_or_structured_buffer_view(256, 16, 12, 10), Some((192, 64)));
+        assert_eq!(plan_raw_or_structured_buffer_view(256, 16, 0, 0), None);
+        assert_eq!(plan_raw_or_structured_buffer_view(256, 16, 16, 1), None);
+        assert_eq!(plan_raw_or_structured_buffer_view(256, 16, u64::MAX, 1), None);
+        // 4 GiB view saturates metadata size to u32::MAX instead of wrapping to 0.
+        let four_gib = 1u64 << 32;
+        assert_eq!(plan_raw_or_structured_buffer_view(four_gib, 16, 0, 1 << 28), Some((0, u32::MAX as u64)));
     }
 }
