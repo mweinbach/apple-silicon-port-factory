@@ -87,9 +87,24 @@ fn guid_from(s: &str) -> GUID {
 
 /// Compute the deterministic Windows render endpoint ID (`{0.0.0.00000000}.{guid}`)
 /// corresponding to a host `DeviceInfo::uid`.
-pub(super) fn render_endpoint_id_for_uid(uid: &str) -> String {
+pub(crate) fn render_endpoint_id_for_uid(uid: &str) -> String {
     let guid = guid_from(uid);
     format!("{{0.0.0.00000000}}.{guid:?}").to_ascii_lowercase()
+}
+
+/// Shared-mode mix channel count for a render endpoint (`DeviceInfo`), honoring
+/// `AW2_AUDIO_CHANNELS` and exposing 4 channels for USB DualSense audio-haptics endpoints.
+pub(crate) fn render_mix_channels(info: &DeviceInfo) -> u16 {
+    let mappable = |c: u32| matches!(c, 1 | 2 | 4 | 6 | 8);
+    match std::env::var("AW2_AUDIO_CHANNELS").as_deref() {
+        Ok("device") if mappable(info.channels) => info.channels as u16,
+        Ok(s) => match s.parse::<u32>() {
+            Ok(c) if mappable(c) => c as u16,
+            _ => 2,
+        },
+        Err(_) if is_dualsense_audio_device(info) && info.channels >= 4 => 4,
+        Err(_) => 2,
+    }
 }
 
 impl Endpoint {
@@ -138,16 +153,7 @@ impl Endpoint {
         if self.flow == eCapture {
             return if self.info.channels == 1 { 1 } else { 2 };
         }
-        let mappable = |c: u32| matches!(c, 1 | 2 | 4 | 6 | 8);
-        match std::env::var("AW2_AUDIO_CHANNELS").as_deref() {
-            Ok("device") if mappable(self.info.channels) => self.info.channels as u16,
-            Ok(s) => match s.parse::<u32>() {
-                Ok(c) if mappable(c) => c as u16,
-                _ => 2,
-            },
-            Err(_) if is_dualsense_audio_device(&self.info) && self.info.channels >= 4 => 4,
-            Err(_) => 2,
-        }
+        render_mix_channels(&self.info)
     }
 
     /// Shared-mode mix format rate. Default **48 kHz** (Wwise's engine rate,
