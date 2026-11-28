@@ -1219,14 +1219,25 @@ fn resolve_render_targets_and_blend_sanitizes_non_blendable_and_rejects_invalid(
         assert_eq!(resolved.attachments[i].write_mask, expected_mask);
     }
 
-    // Without float32_blend (e.g. iOS Apple7-9), R32_FLOAT (slot 0) must also disable blending
-    // while R16G16_FLOAT (slot 1) remains blendable.
-    let (ios_resolved, _, _) =
+    // Without float32_blend (e.g. iOS Apple7-9), enabled blending on R32_FLOAT / RG32_FLOAT /
+    // RGBA32_FLOAT must return an explicit error instead of silently turning into an unblended
+    // overwrite, while unblended 32-bit float RTVs still succeed.
+    assert!(
         resolve_render_targets_and_blend_with(&desc, &rtvs, 1, false, |s| matches!(s, 1 | 2 | 4))
-            .expect("iOS fallback must disable blend on R32_FLOAT");
-    assert!(!ios_resolved.attachments[0].enabled);
-    assert_eq!(ios_resolved.attachments[0].write_mask, expected_mask);
-    assert!(ios_resolved.attachments[1].enabled);
+            .is_err(),
+        "enabled blending on R32_FLOAT without float32_blend must be rejected"
+    );
+    let mut unblended_f32 = BlendDesc::default();
+    unblended_f32.RenderTarget[0].RenderTargetWriteMask = 0xF;
+    let (f32_ok, _, _) = resolve_render_targets_and_blend_with(
+        &unblended_f32,
+        &[41, 16, 2],
+        1,
+        false,
+        |s| matches!(s, 1 | 2 | 4),
+    )
+    .expect("unblended 32-bit float RTVs must succeed even without float32_blend");
+    assert!(!f32_ok.attachments[0].enabled);
 
     // Pure blendable MRT must preserve the exact BlendState produced by `state::blend_state`
     // (no cache-key perturbation for already-valid pipelines).

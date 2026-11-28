@@ -91,15 +91,21 @@ pub(crate) fn resolve_render_targets_and_blend_with(
             continue;
         }
         if !crate::format::is_blendable_format(dxgi, float32_blend) {
+            let info = crate::format::info(dxgi);
+            let is_integer = matches!(info.num, crate::format::Num::Uint | crate::format::Num::Sint);
+            if !is_integer {
+                return Err(format!(
+                    "render target {i} format {dxgi} ({}) does not support color blending on this device (float32_blend={float32_blend})",
+                    crate::format::name(dxgi)
+                ));
+            }
             let write_mask = blend.attachments[i].write_mask;
             blend.attachments[i] = crate::state::ColorBlend {
                 write_mask,
                 ..crate::state::ColorBlend::default()
             };
             sanitized = true;
-            let info = crate::format::info(dxgi);
-            let is_integer = matches!(info.num, crate::format::Num::Uint | crate::format::Num::Sint);
-            if blend_desc.IndependentBlendEnable == 0 && is_integer {
+            if blend_desc.IndependentBlendEnable == 0 {
                 log::debug!(
                     target: "d3d",
                     "render PSO: disabling broadcast blend on integer RT {i} ({})",
@@ -108,9 +114,8 @@ pub(crate) fn resolve_render_targets_and_blend_with(
             } else {
                 log::warn!(
                     target: "d3d",
-                    "render PSO: disabling blend on non-blendable RT {i} ({}, independent={}, float32_blend={float32_blend})",
-                    crate::format::name(dxgi),
-                    blend_desc.IndependentBlendEnable != 0
+                    "render PSO: disabling blend on integer RT {i} ({}, independent=true)",
+                    crate::format::name(dxgi)
                 );
             }
         }
