@@ -28,9 +28,10 @@ pub const EOS_NO_CONNECTION: i32 = 6;
 pub const EOS_NOT_FOUND: i32 = 18;
 pub const EOS_NO_CHANGE: i32 = 20;
 
-/// Maximum UTF-8 byte length of an `EOS_EpicAccountId` string (excluding NUL),
-/// matching `EOS_EPICACCOUNTID_MAX_LENGTH` in `eos_common.h`.
+/// Maximum UTF-8 byte length of an `EOS_EpicAccountId` or `EOS_ProductUserId`
+/// string (excluding NUL), matching `eos_common.h`.
 pub const EOS_EPICACCOUNTID_MAX_LENGTH: usize = 32;
+pub const EOS_PRODUCTUSERID_MAX_LENGTH: usize = 32;
 
 const H_PLATFORM: usize = 0xE050_0001;
 const H_AUTH: usize = 0xE050_0002;
@@ -39,11 +40,16 @@ const H_ECOM: usize = 0xE050_0004;
 const H_STATS: usize = 0xE050_0005;
 const H_ACHIEVEMENTS: usize = 0xE050_0006;
 const H_USERINFO: usize = 0xE050_0007;
+const H_LEADERBOARDS: usize = 0xE050_0008;
+const H_LOBBY: usize = 0xE050_0009;
+const H_FRIENDS: usize = 0xE050_000A;
 const H_ACCOUNT_BASE: usize = 0xE050_1000;
+const H_PUID_BASE: usize = 0xE050_2000;
 
 static NEXT_NOTIFY_ID: AtomicU64 = AtomicU64::new(1);
 static PENDING_CALLBACKS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static ACCOUNT_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static PRODUCT_USER_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Generic layout shared by all EOS `*_CallbackInfo` structs (`ResultCode` at
 /// `+0x00`, `ClientData` at `+0x08`, followed by zeroed handle/count fields).
@@ -76,6 +82,10 @@ pub static EXPORTS: &[crate::Export] = exports![
     EOS_Platform_GetStatsInterface,
     EOS_Platform_GetAchievementsInterface,
     EOS_Platform_GetUserInfoInterface,
+    EOS_Platform_GetLeaderboardsInterface,
+    EOS_Platform_GetLobbyInterface,
+    EOS_Platform_GetFriendsInterface,
+    EOS_EResult_ToString,
     EOS_Auth_Login,
     EOS_Auth_GetLoggedInAccountsCount,
     EOS_Auth_GetLoggedInAccountByIndex,
@@ -86,10 +96,14 @@ pub static EXPORTS: &[crate::Export] = exports![
     EOS_Auth_RemoveNotifyLoginStatusChanged,
     EOS_Connect_Login,
     EOS_Connect_CreateUser,
+    EOS_Connect_QueryExternalAccountMappings,
     EOS_Connect_AddNotifyAuthExpiration,
     EOS_Connect_RemoveNotifyAuthExpiration,
     EOS_Ecom_QueryOwnership,
     EOS_Stats_IngestStat,
+    EOS_Stats_QueryStats,
+    EOS_Stats_CopyStatByName,
+    EOS_Stats_Stat_Release,
     EOS_Achievements_QueryDefinitions,
     EOS_Achievements_GetAchievementDefinitionCount,
     EOS_Achievements_CopyAchievementDefinitionV2ByIndex,
@@ -98,12 +112,22 @@ pub static EXPORTS: &[crate::Export] = exports![
     EOS_Achievements_CopyPlayerAchievementByAchievementId,
     EOS_Achievements_PlayerAchievement_Release,
     EOS_Achievements_UnlockAchievements,
+    EOS_Achievements_AddNotifyAchievementsUnlockedV2,
+    EOS_Achievements_RemoveNotifyAchievementsUnlocked,
+    EOS_UserInfo_QueryUserInfo,
+    EOS_UserInfo_QueryUserInfoByExternalAccount,
     EOS_UserInfo_CopyUserInfo,
     EOS_UserInfo_Release,
+    EOS_Friends_QueryFriends,
+    EOS_Leaderboards_QueryLeaderboardUserScores,
+    EOS_Leaderboards_QueryLeaderboardRanks,
     EOS_PresenceModification_Release,
     EOS_EpicAccountId_IsValid,
     EOS_EpicAccountId_FromString,
     EOS_EpicAccountId_ToString,
+    EOS_ProductUserId_IsValid,
+    EOS_ProductUserId_FromString,
+    EOS_ProductUserId_ToString,
 ];
 
 pub unsafe extern "win64" fn EOS_Initialize(_options: *const c_void) -> i32 {
@@ -180,6 +204,36 @@ pub unsafe extern "win64" fn EOS_Platform_GetUserInfoInterface(_handle: usize) -
     H_USERINFO
 }
 
+pub unsafe extern "win64" fn EOS_Platform_GetLeaderboardsInterface(_handle: usize) -> usize {
+    H_LEADERBOARDS
+}
+
+pub unsafe extern "win64" fn EOS_Platform_GetLobbyInterface(_handle: usize) -> usize {
+    H_LOBBY
+}
+
+pub unsafe extern "win64" fn EOS_Platform_GetFriendsInterface(_handle: usize) -> usize {
+    H_FRIENDS
+}
+
+pub unsafe extern "win64" fn EOS_EResult_ToString(result: i32) -> *const u8 {
+    let s: &'static [u8] = match result {
+        EOS_SUCCESS => b"EOS_Success\0",
+        EOS_INVALID_PARAMETERS | 10 => b"EOS_InvalidParameters\0",
+        EOS_LIMIT_EXCEEDED | 22 => b"EOS_LimitExceeded\0",
+        EOS_NO_CONNECTION | 1 => b"EOS_NoConnection\0",
+        EOS_NOT_FOUND => b"EOS_NotFound\0",
+        EOS_NO_CHANGE => b"EOS_NoChange\0",
+        2 => b"EOS_InvalidCredentials\0",
+        5 => b"EOS_AccessDenied\0",
+        16 => b"EOS_NotImplemented\0",
+        17 => b"EOS_Canceled\0",
+        21 => b"EOS_VersionMismatch\0",
+        _ => b"EOS_UnexpectedError\0",
+    };
+    s.as_ptr()
+}
+
 pub unsafe extern "win64" fn EOS_Auth_Login(
     _handle: usize,
     _options: *const c_void,
@@ -244,6 +298,15 @@ pub unsafe extern "win64" fn EOS_Connect_CreateUser(
     queue_callback(client_data, completion_delegate);
 }
 
+pub unsafe extern "win64" fn EOS_Connect_QueryExternalAccountMappings(
+    _handle: usize,
+    _options: *const c_void,
+    client_data: usize,
+    completion_delegate: usize,
+) {
+    queue_callback(client_data, completion_delegate);
+}
+
 pub unsafe extern "win64" fn EOS_Connect_AddNotifyAuthExpiration(
     _handle: usize,
     _options: *const c_void,
@@ -272,6 +335,28 @@ pub unsafe extern "win64" fn EOS_Stats_IngestStat(
 ) {
     queue_callback(client_data, completion_delegate);
 }
+
+pub unsafe extern "win64" fn EOS_Stats_QueryStats(
+    _handle: usize,
+    _options: *const c_void,
+    client_data: usize,
+    completion_delegate: usize,
+) {
+    queue_callback(client_data, completion_delegate);
+}
+
+pub unsafe extern "win64" fn EOS_Stats_CopyStatByName(
+    _handle: usize,
+    _options: *const c_void,
+    out_stat: *mut usize,
+) -> i32 {
+    if !out_stat.is_null() {
+        std::ptr::write_unaligned(out_stat, 0);
+    }
+    EOS_NOT_FOUND
+}
+
+pub unsafe extern "win64" fn EOS_Stats_Stat_Release(_stat: usize) {}
 
 pub unsafe extern "win64" fn EOS_Achievements_QueryDefinitions(
     _handle: usize,
@@ -333,23 +418,83 @@ pub unsafe extern "win64" fn EOS_Achievements_UnlockAchievements(
     queue_callback(client_data, completion_delegate);
 }
 
+pub unsafe extern "win64" fn EOS_Achievements_AddNotifyAchievementsUnlockedV2(
+    _handle: usize,
+    _options: *const c_void,
+    _client_data: usize,
+    _notification: usize,
+) -> u64 {
+    NEXT_NOTIFY_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub unsafe extern "win64" fn EOS_Achievements_RemoveNotifyAchievementsUnlocked(
+    _handle: usize,
+    _in_id: u64,
+) {
+}
+
+pub unsafe extern "win64" fn EOS_UserInfo_QueryUserInfo(
+    _handle: usize,
+    _options: *const c_void,
+    client_data: usize,
+    completion_delegate: usize,
+) {
+    queue_callback(client_data, completion_delegate);
+}
+
+pub unsafe extern "win64" fn EOS_UserInfo_QueryUserInfoByExternalAccount(
+    _handle: usize,
+    _options: *const c_void,
+    client_data: usize,
+    completion_delegate: usize,
+) {
+    queue_callback(client_data, completion_delegate);
+}
+
 pub unsafe extern "win64" fn EOS_UserInfo_CopyUserInfo(
     _handle: usize,
     _options: *const c_void,
     out_user_info: *mut usize,
 ) -> i32 {
     if !out_user_info.is_null() {
-        *out_user_info = 0;
+        std::ptr::write_unaligned(out_user_info, 0);
     }
     EOS_NOT_FOUND
 }
 
 pub unsafe extern "win64" fn EOS_UserInfo_Release(_user_info: usize) {}
 
+pub unsafe extern "win64" fn EOS_Friends_QueryFriends(
+    _handle: usize,
+    _options: *const c_void,
+    client_data: usize,
+    completion_delegate: usize,
+) {
+    queue_callback(client_data, completion_delegate);
+}
+
+pub unsafe extern "win64" fn EOS_Leaderboards_QueryLeaderboardUserScores(
+    _handle: usize,
+    _options: *const c_void,
+    client_data: usize,
+    completion_delegate: usize,
+) {
+    queue_callback(client_data, completion_delegate);
+}
+
+pub unsafe extern "win64" fn EOS_Leaderboards_QueryLeaderboardRanks(
+    _handle: usize,
+    _options: *const c_void,
+    client_data: usize,
+    completion_delegate: usize,
+) {
+    queue_callback(client_data, completion_delegate);
+}
+
 pub unsafe extern "win64" fn EOS_PresenceModification_Release(_handle: usize) {}
 
 fn lookup_account_id(account_id: usize) -> Option<String> {
-    if account_id < H_ACCOUNT_BASE {
+    if !(H_ACCOUNT_BASE..H_PUID_BASE).contains(&account_id) {
         return None;
     }
     let idx = account_id - H_ACCOUNT_BASE;
@@ -357,7 +502,7 @@ fn lookup_account_id(account_id: usize) -> Option<String> {
 }
 
 pub unsafe extern "win64" fn EOS_EpicAccountId_IsValid(account_id: usize) -> i32 {
-    if account_id < H_ACCOUNT_BASE {
+    if !(H_ACCOUNT_BASE..H_PUID_BASE).contains(&account_id) {
         return 0;
     }
     let idx = account_id - H_ACCOUNT_BASE;
@@ -427,6 +572,85 @@ pub unsafe extern "win64" fn EOS_EpicAccountId_ToString(
     EOS_SUCCESS
 }
 
+fn lookup_product_user_id(account_id: usize) -> Option<String> {
+    if account_id < H_PUID_BASE {
+        return None;
+    }
+    let idx = account_id - H_PUID_BASE;
+    PRODUCT_USER_IDS.lock().unwrap().get(idx).cloned()
+}
+
+pub unsafe extern "win64" fn EOS_ProductUserId_IsValid(account_id: usize) -> i32 {
+    if account_id < H_PUID_BASE {
+        return 0;
+    }
+    let idx = account_id - H_PUID_BASE;
+    i32::from(idx < PRODUCT_USER_IDS.lock().unwrap().len())
+}
+
+pub unsafe extern "win64" fn EOS_ProductUserId_FromString(product_user_id_string: *const u8) -> usize {
+    if product_user_id_string.is_null() {
+        return 0;
+    }
+    let mut bytes = Vec::with_capacity(EOS_PRODUCTUSERID_MAX_LENGTH);
+    for i in 0..=EOS_PRODUCTUSERID_MAX_LENGTH {
+        let b = std::ptr::read_unaligned(product_user_id_string.add(i));
+        if b == 0 {
+            break;
+        }
+        if i == EOS_PRODUCTUSERID_MAX_LENGTH || !(0x21..=0x7E).contains(&b) {
+            return 0;
+        }
+        bytes.push(b);
+    }
+    if bytes.is_empty() {
+        return 0;
+    }
+    let Ok(s) = String::from_utf8(bytes) else {
+        return 0;
+    };
+    let mut table = PRODUCT_USER_IDS.lock().unwrap();
+    if let Some(idx) = table.iter().position(|existing| existing == &s) {
+        return H_PUID_BASE + idx;
+    }
+    let idx = table.len();
+    log::info!("eossdk (builtin): EOS_ProductUserId_FromString({s:?}) -> {:#x}", H_PUID_BASE + idx);
+    table.push(s);
+    H_PUID_BASE + idx
+}
+
+pub unsafe extern "win64" fn EOS_ProductUserId_ToString(
+    account_id: usize,
+    out_buffer: *mut u8,
+    in_out_buffer_length: *mut i32,
+) -> i32 {
+    if in_out_buffer_length.is_null() {
+        return EOS_INVALID_PARAMETERS;
+    }
+    let Some(s) = lookup_product_user_id(account_id) else {
+        std::ptr::write_unaligned(in_out_buffer_length, 0);
+        if !out_buffer.is_null() {
+            std::ptr::write_unaligned(out_buffer, 0);
+        }
+        return EOS_INVALID_PARAMETERS;
+    };
+    let needed = (s.len() + 1) as i32;
+    let cap = std::ptr::read_unaligned(in_out_buffer_length);
+    if out_buffer.is_null() || cap <= 0 {
+        std::ptr::write_unaligned(in_out_buffer_length, needed);
+        return EOS_INVALID_PARAMETERS;
+    }
+    if cap < needed {
+        std::ptr::write_unaligned(out_buffer, 0);
+        std::ptr::write_unaligned(in_out_buffer_length, needed);
+        return EOS_LIMIT_EXCEEDED;
+    }
+    std::ptr::copy_nonoverlapping(s.as_ptr(), out_buffer, s.len());
+    std::ptr::write_unaligned(out_buffer.add(s.len()), 0);
+    std::ptr::write_unaligned(in_out_buffer_length, needed);
+    EOS_SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +696,53 @@ mod tests {
             let mut bad_len = 33;
             assert_eq!(EOS_EpicAccountId_ToString(0, buf.as_mut_ptr(), &mut bad_len), EOS_INVALID_PARAMETERS);
             assert_eq!(bad_len, 0);
+        }
+    }
+
+    #[test]
+    fn product_user_id_eresult_and_subinterfaces_offline() {
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(EOS_EResult_ToString(EOS_SUCCESS).cast()).to_str().unwrap(),
+                "EOS_Success"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(EOS_EResult_ToString(EOS_NO_CONNECTION).cast()).to_str().unwrap(),
+                "EOS_NoConnection"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(EOS_EResult_ToString(EOS_NOT_FOUND).cast()).to_str().unwrap(),
+                "EOS_NotFound"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(EOS_EResult_ToString(0x7FFF).cast()).to_str().unwrap(),
+                "EOS_UnexpectedError"
+            );
+
+            assert_eq!(EOS_Platform_GetLeaderboardsInterface(H_PLATFORM), H_LEADERBOARDS);
+            assert_eq!(EOS_Platform_GetLobbyInterface(H_PLATFORM), H_LOBBY);
+            assert_eq!(EOS_Platform_GetFriendsInterface(H_PLATFORM), H_FRIENDS);
+
+            let nid = EOS_Achievements_AddNotifyAchievementsUnlockedV2(H_ACHIEVEMENTS, std::ptr::null(), 0, 0);
+            assert_ne!(nid, 0);
+            EOS_Achievements_RemoveNotifyAchievementsUnlocked(H_ACHIEVEMENTS, nid);
+
+            let mut out_stat = 0x1234usize;
+            assert_eq!(EOS_Stats_CopyStatByName(H_STATS, std::ptr::null(), &mut out_stat), EOS_NOT_FOUND);
+            assert_eq!(out_stat, 0);
+            EOS_Stats_Stat_Release(0);
+
+            // ProductUserId handle namespace is distinct from EpicAccountId.
+            assert_eq!(EOS_ProductUserId_IsValid(0), 0);
+            assert_eq!(EOS_ProductUserId_FromString(std::ptr::null()), 0);
+            let puid = EOS_ProductUserId_FromString(c"0002aabbccdd11223344".as_ptr().cast());
+            assert_ne!(puid, 0);
+            assert_eq!(EOS_ProductUserId_IsValid(puid), 1);
+            assert_eq!(EOS_EpicAccountId_IsValid(puid), 0);
+            let mut buf = [0u8; EOS_PRODUCTUSERID_MAX_LENGTH + 1];
+            let mut cap = buf.len() as i32;
+            assert_eq!(EOS_ProductUserId_ToString(puid, buf.as_mut_ptr(), &mut cap), EOS_SUCCESS);
+            assert_eq!(&buf[..cap as usize - 1], b"0002aabbccdd11223344");
         }
     }
 }

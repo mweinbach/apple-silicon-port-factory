@@ -114,8 +114,14 @@ pub unsafe extern "win64" fn nriGetInterface(
     NRI_RESULT_SUCCESS
 }
 
+pub unsafe extern "win64" fn nriConvertDXGIFormatToNRI(dxgi_format: u32) -> u8 {
+    abi::dxgi_to_nri(dxgi_format)
+}
+
 pub mod exports {
-    pub use super::{nriCreateDeviceFromD3D12Device, nriDestroyDevice, nriGetInterface};
+    pub use super::{
+        nriConvertDXGIFormatToNRI, nriCreateDeviceFromD3D12Device, nriDestroyDevice, nriGetInterface,
+    };
 }
 
 #[cfg(test)]
