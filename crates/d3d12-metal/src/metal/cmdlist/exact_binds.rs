@@ -1479,6 +1479,17 @@ impl CommandList {
                         if !found {
                             return false;
                         }
+                        if tex_id != 0 && (meta >> 63) == 0 {
+                            let Some(rk) = reg.lookup_texture_id(tex_id) else {
+                                return false;
+                            };
+                            if out.last() != Some(&rk) && !out.contains(&rk) {
+                                out.push(rk);
+                            }
+                            if let Some(sp) = spans.as_deref_mut() {
+                                push_subrange(sp, SubRange::whole(rk));
+                            }
+                        }
                     } else if tex_id != 0 {
                         let Some(rk) = reg.lookup_texture_id(tex_id) else {
                             return false;
@@ -1538,7 +1549,7 @@ impl CommandList {
                             p.add(2).read_unaligned(),
                         )
                     };
-                    tokens.extend_from_slice(&[gpu_va, tex_id, meta & 0xffff_ffff]);
+                    tokens.extend_from_slice(&[gpu_va, tex_id, meta & 0x8000_0000_ffff_ffff]);
                 }
             }
         }
@@ -1760,5 +1771,80 @@ mod tests {
         plan_toks.clear();
         assert!(cache.plan(idx_after_inv).extract_tokens(&root, heap0, &mut plan_toks));
         assert_eq!(plan_toks, vec![0x10_0000]);
+    }
+
+    #[test]
+    fn slot_resolution_tracks_uav_counter_resource_without_widening_typed_buffers() {
+        let mut root = RootState::default();
+        root.set_root_signature(make_rs_a()).unwrap();
+
+        let mut heap = [0u64; 16 * 3];
+        // Entry 0: structured buffer UAV with attached counter (`typed_buffer == 0`, `tex_id != 0`).
+        heap[0] = 0x10_0000;
+        heap[1] = 0x8888; // counter buffer texture-view ID -> resource 55
+        heap[2] = 0x200 | (3u64 << 32); // size=0x200, el_off=3, typed_buffer=0
+
+        // Entry 1: typed buffer view (`typed_buffer == 1`, `tex_id != 0`).
+        heap[3] = 0x20_0000;
+        heap[4] = 0x9999; // same-resource typed texture-buffer view -> resource 22
+        heap[5] = 0x400 | (1u64 << 63); // size=0x400, typed_buffer=1
+
+        let hcpu = heap.as_ptr() as usize;
+        let hbase = 0x5000_0000u64;
+        let hlen = (heap.len() * 8) as u64;
+        let heap0 = Some((hbase, hlen, hcpu));
+
+        root.set_table(1, hbase).unwrap();
+
+        let mut reg = ResRegistry::default();
+        reg.insert_buffer(0x10_0000, 0x12_0000, 11);
+        reg.insert_buffer(0x20_0000, 0x22_0000, 22);
+        reg.insert_tex_id(0x8888, 55);
+        reg.insert_tex_id(0x9999, 22);
+
+        let slot_counter = vec![ComputeBind::TableEntry { param: 1, byte_offset: 0 }];
+        let slot_typed = vec![ComputeBind::TableEntry { param: 1, byte_offset: 24 }];
+
+        let mut cache = SlotPlanCache::new();
+        let idx_ctr = cache.get_or_compile(0x3000, 0, &slot_counter, &root);
+        let idx_typ = cache.get_or_compile(0x3000, 1, &slot_typed, &root);
+
+        // Structured UAV with counter must resolve BOTH the data buffer (11, tight span)
+        // AND the counter buffer (55, whole resource) via both token and direct paths.
+        let mut plan_toks = Vec::new();
+        let mut ref_toks = Vec::new();
+        assert!(cache.plan(idx_ctr).extract_tokens(&root, heap0, &mut plan_toks));
+        assert!(CommandList::extract_compute_slot_tokens(&slot_counter, &root, heap0, &mut ref_toks));
+        assert_eq!(plan_toks, ref_toks);
+
+        let mut va_a = BufVaCache::new();
+        let mut va_b = BufVaCache::new();
+        let (mut out_plan, mut out_ref) = (Vec::new(), Vec::new());
+        let (mut sp_plan, mut sp_ref) = (Vec::new(), Vec::new());
+        assert!(cache.plan(idx_ctr).resolve_from_tokens(&reg, &mut va_a, &plan_toks, &mut out_plan, Some(&mut sp_plan)));
+        assert!(CommandList::resolve_slots_with_reg(&reg, &mut va_b, &slot_counter, &root, heap0, &mut out_ref, Some(&mut sp_ref)));
+        assert_eq!(out_plan, vec![11, 55]);
+        assert_eq!(out_ref, vec![11, 55]);
+        assert_eq!(sp_plan, vec![SubRange { r: 11, lo: 0x10_0000, hi: 0x10_0200 }, SubRange::whole(55)]);
+        assert_eq!(sp_ref, sp_plan);
+
+        // Typed buffer (`typed_buffer == 1`) must keep ONLY the tight buffer span without
+        // widening to `SubRange::whole(22)` or needing a counter lookup.
+        plan_toks.clear();
+        ref_toks.clear();
+        assert!(cache.plan(idx_typ).extract_tokens(&root, heap0, &mut plan_toks));
+        assert!(CommandList::extract_compute_slot_tokens(&slot_typed, &root, heap0, &mut ref_toks));
+        assert_eq!(plan_toks, ref_toks);
+
+        out_plan.clear();
+        out_ref.clear();
+        sp_plan.clear();
+        sp_ref.clear();
+        assert!(cache.plan(idx_typ).resolve_from_tokens(&reg, &mut va_a, &plan_toks, &mut out_plan, Some(&mut sp_plan)));
+        assert!(CommandList::resolve_slots_with_reg(&reg, &mut va_b, &slot_typed, &root, heap0, &mut out_ref, Some(&mut sp_ref)));
+        assert_eq!(out_plan, vec![22]);
+        assert_eq!(out_ref, vec![22]);
+        assert_eq!(sp_plan, vec![SubRange { r: 22, lo: 0x20_0000, hi: 0x20_0400 }]);
+        assert_eq!(sp_ref, sp_plan);
     }
 }

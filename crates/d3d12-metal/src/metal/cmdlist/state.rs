@@ -2712,7 +2712,10 @@ impl SlotPlan {
                             let p = (base_lo_cpu + (byte_offset - min_off) as usize) as *const u64;
                             let gpu_va = p.read_unaligned();
                             let tex_id = p.add(1).read_unaligned();
-                            let meta = p.add(2).read_unaligned() & 0xffff_ffff;
+                            // Keep low 32-bit byte size plus bit 63 (`typed_buffer`) so
+                            // structured UAVs with an attached counter buffer (`typed_buffer == 0`
+                            // and `tex_id != 0`) can also resolve the counter resource.
+                            let meta = p.add(2).read_unaligned() & 0x8000_0000_ffff_ffff;
                             dst.write(gpu_va);
                             dst.add(1).write(tex_id);
                             dst.add(2).write(meta);
@@ -2766,7 +2769,8 @@ impl SlotPlan {
                     while pos < end {
                         let gpu_va = toks[pos];
                         let tex_id = toks[pos + 1];
-                        let meta_lo = toks[pos + 2];
+                        let meta = toks[pos + 2];
+                        let meta_lo = meta & 0xffff_ffff;
                         pos += 3;
                         if gpu_va != 0 {
                             let found = match spans.as_deref_mut() {
@@ -2777,6 +2781,17 @@ impl SlotPlan {
                             };
                             if !found {
                                 return false;
+                            }
+                            if tex_id != 0 && (meta >> 63) == 0 {
+                                let Some(rk) = reg.lookup_texture_id(tex_id) else {
+                                    return false;
+                                };
+                                if out.last() != Some(&rk) && !out.contains(&rk) {
+                                    out.push(rk);
+                                }
+                                if let Some(sp) = spans.as_deref_mut() {
+                                    push_subrange(sp, SubRange::whole(rk));
+                                }
                             }
                         } else if tex_id != 0 {
                             let Some(rk) = reg.lookup_texture_id(tex_id) else {
