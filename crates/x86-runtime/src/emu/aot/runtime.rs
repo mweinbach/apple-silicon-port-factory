@@ -328,13 +328,23 @@ impl ProbeTab {
 impl Dir {
     /// Probe-table value for `(mi, bi)` without re-looking up `self.map`.
     #[inline]
-    fn probe_val_entry(&self, mi: u32, bi: u32) -> u64 {
+    fn probe_val_entry_opts(&self, mi: u32, bi: u32, include_staged: bool) -> u64 {
         let m = &self.modules[mi as usize];
         let b = &m.img.blocks[bi as usize];
-        if m.gone || m.killed || b.host_entry || m.dead[bi as usize].load(Ordering::Relaxed) != 0 {
+        if m.gone
+            || m.killed
+            || (!include_staged && m.needs_icache_flush)
+            || b.host_entry
+            || m.dead[bi as usize].load(Ordering::Relaxed) != 0
+        {
             return 0;
         }
         m.host_addr(b.code_off) as u64
+    }
+
+    #[inline]
+    fn probe_val_entry(&self, mi: u32, bi: u32) -> u64 {
+        self.probe_val_entry_opts(mi, bi, false)
     }
 
     /// Probe-table value for `ip`: the code of its live, non-host-entry owner, else 0.
@@ -412,13 +422,14 @@ impl Dir {
 
     /// Build a fresh probe table covering every live non-host-entry block without publishing
     /// it to [`PROBE`] yet (lets batch startup link against the table before icache flush).
-    unsafe fn build_probe_table(&self, workers: usize) -> ProbeTab {
+    /// When `include_staged` is false, modules with `needs_icache_flush == true` stay excluded.
+    unsafe fn build_probe_table(&self, workers: usize, include_staged: bool) -> ProbeTab {
         let mut total_blocks = 0usize;
         let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
         if !self.has_overlaps {
             const CHUNK: usize = 16_384;
             for (mi, m) in self.modules.iter().enumerate() {
-                if m.gone || m.killed {
+                if m.gone || m.killed || (!include_staged && m.needs_icache_flush) {
                     continue;
                 }
                 let nb = m.img.blocks.len();
@@ -469,7 +480,7 @@ impl Dir {
         } else if !self.has_overlaps {
             let mut c = 0usize;
             for m in &self.modules {
-                if m.gone || m.killed {
+                if m.gone || m.killed || (!include_staged && m.needs_icache_flush) {
                     continue;
                 }
                 for (bi, b) in m.img.blocks.iter().enumerate() {
@@ -482,7 +493,7 @@ impl Dir {
         } else {
             let mut c = 0usize;
             for &(mi, bi) in self.map.values() {
-                if self.probe_val_entry(mi, bi) != 0 {
+                if self.probe_val_entry_opts(mi, bi, include_staged) != 0 {
                     c += 1;
                 }
             }
@@ -520,7 +531,7 @@ impl Dir {
             });
         } else if !self.has_overlaps {
             for m in &self.modules {
-                if m.gone || m.killed {
+                if m.gone || m.killed || (!include_staged && m.needs_icache_flush) {
                     continue;
                 }
                 for (bi, b) in m.img.blocks.iter().enumerate() {
@@ -534,7 +545,7 @@ impl Dir {
             }
         } else {
             for (&ip, &(mi, bi)) in &self.map {
-                let v = self.probe_val_entry(mi, bi);
+                let v = self.probe_val_entry_opts(mi, bi, include_staged);
                 if v != 0 {
                     let e = t.slot(ip);
                     e[1].store(v, Ordering::Relaxed);
@@ -547,7 +558,7 @@ impl Dir {
 
     /// [`Self::probe_rebuild`] parameterized by worker count (also called directly by tests).
     unsafe fn probe_rebuild_with_workers(&mut self, workers: usize) {
-        let t = self.build_probe_table(workers);
+        let t = self.build_probe_table(workers, false);
         PROBE.store(t.base, Ordering::Release);
         self.probe = t;
     }
@@ -711,7 +722,8 @@ pub(in crate::emu) fn find(ip: u64) -> Option<(usize, bool)> {
             if let Some(d) = g.as_ref() {
                 if let Some(&(mi, bi)) = d.map.get(&ip) {
                     let m = &d.modules[mi as usize];
-                    if m.dead[bi as usize].load(Ordering::Acquire) == 0
+                    if !m.needs_icache_flush
+                        && m.dead[bi as usize].load(Ordering::Acquire) == 0
                         && !crate::emu::mem::in_jit(crate::emu::to_mapped_addr(ip))
                     {
                         let b = &m.img.blocks[bi as usize];
@@ -1212,6 +1224,7 @@ unsafe fn link_one(
     li: usize,
     force_far: bool,
     probe: Option<&ProbeTab>,
+    allow_staged: bool,
     skip_icache: &[(usize, usize)],
     patched: &mut Vec<usize>,
 ) -> bool {
@@ -1226,7 +1239,12 @@ unsafe fn link_one(
         let Some(&(tm, tb)) = d.map.get(&l.target) else { return false };
         let t = &d.modules[tm as usize];
         let tb_ = &t.img.blocks[tb as usize];
-        if t.gone || t.dead[tb as usize].load(Ordering::Relaxed) != 0 || tb_.host_entry {
+        if t.gone
+            || t.killed
+            || (!allow_staged && t.needs_icache_flush)
+            || t.dead[tb as usize].load(Ordering::Relaxed) != 0
+            || tb_.host_entry
+        {
             return false;
         }
         t.host_addr(tb_.code_off)
@@ -1279,6 +1297,7 @@ unsafe fn link_module_initial_parallel(
     mi: usize,
     workers: usize,
     probe: Option<&ProbeTab>,
+    allow_staged: bool,
     skip_icache: &[(usize, usize)],
     patched: &mut Vec<usize>,
 ) {
@@ -1319,6 +1338,8 @@ unsafe fn link_module_initial_parallel(
                             let t = &d_ref.modules[tm as usize];
                             let tb_ = &t.img.blocks[tb as usize];
                             if t.gone
+                                || t.killed
+                                || (!allow_staged && t.needs_icache_flush)
                                 || t.dead[tb as usize].load(Ordering::Relaxed) != 0
                                 || tb_.host_entry
                             {
@@ -1371,7 +1392,7 @@ unsafe fn link_module_initial_parallel(
         patched.extend(p);
     }
     for li in far_sites {
-        if !link_one(d, mi, li as usize, false, probe, skip_icache, patched) {
+        if !link_one(d, mi, li as usize, false, probe, allow_staged, skip_icache, patched) {
             unlinked.push(li);
         }
     }
@@ -1387,6 +1408,7 @@ unsafe fn link_pass_with_probe(
     d: &mut Dir,
     probe: Option<&ProbeTab>,
     skip_icache: &[(usize, usize)],
+    allow_staged: bool,
 ) -> Vec<usize> {
     static NO_LINK: OnceLock<bool> = OnceLock::new();
     if *NO_LINK.get_or_init(|| {
@@ -1407,18 +1429,38 @@ unsafe fn link_pass_with_probe(
     let workers = aot_install_workers();
     let mut patched = Vec::new();
     for mi in 0..d.modules.len() {
-        if d.modules[mi].gone || d.modules[mi].killed {
+        if d.modules[mi].gone
+            || d.modules[mi].killed
+            || (!allow_staged && d.modules[mi].needs_icache_flush)
+        {
             continue;
         }
         if !d.modules[mi].unlinked_init {
             let nlinks = d.modules[mi].img.links.len();
             if !force_far && workers > 1 && nlinks >= PARALLEL_THRESHOLD {
-                link_module_initial_parallel(d, mi, workers, probe, skip_icache, &mut patched);
+                link_module_initial_parallel(
+                    d,
+                    mi,
+                    workers,
+                    probe,
+                    allow_staged,
+                    skip_icache,
+                    &mut patched,
+                );
             } else {
                 let mut unlinked = Vec::new();
                 for li in 0..nlinks {
                     if !d.modules[mi].linked[li]
-                        && !link_one(d, mi, li, force_far, probe, skip_icache, &mut patched)
+                        && !link_one(
+                            d,
+                            mi,
+                            li,
+                            force_far,
+                            probe,
+                            allow_staged,
+                            skip_icache,
+                            &mut patched,
+                        )
                     {
                         unlinked.push(li as u32);
                     }
@@ -1432,7 +1474,16 @@ unsafe fn link_pass_with_probe(
             for i in 0..unlinked.len() {
                 let li = unlinked[i] as usize;
                 if d.modules[mi].linked[li]
-                    || link_one(d, mi, li, force_far, probe, skip_icache, &mut patched)
+                    || link_one(
+                        d,
+                        mi,
+                        li,
+                        force_far,
+                        probe,
+                        allow_staged,
+                        skip_icache,
+                        &mut patched,
+                    )
                 {
                     continue;
                 }
@@ -1448,7 +1499,7 @@ unsafe fn link_pass_with_probe(
 
 unsafe fn link_pass(d: &mut Dir, skip_icache: Option<(usize, usize)>) -> Vec<usize> {
     let slice = skip_icache.as_slice();
-    link_pass_with_probe(d, None, slice)
+    link_pass_with_probe(d, None, slice, false)
 }
 
 /// After a `va_gen` change (from `JitCache::run` / [`find`]): re-check affected blocks'
@@ -2597,23 +2648,22 @@ unsafe fn flush_probe_table() {
     let workers = aot_install_workers();
     let t_probe0 = std::time::Instant::now();
     let new_probe = if jit::aot_probe_enabled() && !d.map.is_empty() {
-        Some(d.build_probe_table(workers))
+        Some(d.build_probe_table(workers, true))
     } else {
         None
     };
     let probe_ms = t_probe0.elapsed().as_secs_f64() * 1e3;
 
     let mut pending_icache: Vec<(usize, usize)> = Vec::new();
-    for m in &mut d.modules {
+    for m in &d.modules {
         if m.needs_icache_flush {
             pending_icache.push((m.region, m.region + m.region_len));
-            m.needs_icache_flush = false;
         }
     }
     let t_link0 = std::time::Instant::now();
     let patched = {
         let _w = JitWrite::new();
-        link_pass_with_probe(d, new_probe.as_ref(), &pending_icache)
+        link_pass_with_probe(d, new_probe.as_ref(), &pending_icache, true)
     };
     let link_ms = t_link0.elapsed().as_secs_f64() * 1e3;
 
@@ -2621,6 +2671,9 @@ unsafe fn flush_probe_table() {
     icache_invalidate_regions_parallel(&pending_icache, workers);
     for &s in &patched {
         icache_invalidate(s as *mut u8, 4);
+    }
+    for m in &mut d.modules {
+        m.needs_icache_flush = false;
     }
     let icache_ms = t_ic0.elapsed().as_secs_f64() * 1e3;
 
@@ -2960,9 +3013,10 @@ pub fn activate() {
         let mode = aot_mode();
         let retain_code = verify_mode() != 0;
         // Coalesce startup `probe_rebuild` + linking + icache invalidation into one final pass
-        // when no probe table is published yet, avoiding intermediate rebuilds and letting the
-        // parallel link pass resolve targets via single-probe `ProbeTab::lookup`.
-        let defer_probe = PROBE.load(Ordering::Relaxed) == 0;
+        // only for the initial unpublished directory (`!HAVE && PROBE == 0`), so later
+        // multi-module activations (including under `AW2_DLL_AOT_PROBE=0`) never stage modules
+        // behind an already-active directory.
+        let defer_probe = !HAVE.load(Ordering::Acquire) && PROBE.load(Ordering::Acquire) == 0;
         let _probe_guard = ProbeBatchGuard(defer_probe);
         // Overlap disk I/O + checksum + decode of the next module with `install_image` of the
         // current module while capping buffered decoded images to 1 (strictly deterministic order).
@@ -3419,6 +3473,14 @@ mod fast_load_tests {
         }
         .expect("install_image_opts");
         assert_eq!(inst.live, ips.len());
+        // Staged deferred modules must remain invisible to `find()` until `flush_probe_table()`
+        // finishes linking and icache invalidation, even when `HAVE` is already true (e.g. under
+        // `AW2_DLL_AOT_PROBE=0`).
+        HAVE.store(true, Ordering::Release);
+        assert!(
+            find(callee_va).is_none(),
+            "staged module with unflushed icache must stay hidden from find()"
+        );
         // Verify `img_nocopy.blocks_sorted` and zero-allocation `count_missing_profile_ips`
         // (both the sorted O(log N) binary-search path and the unsorted fallback path).
         let inst_mi = inst.mi;
@@ -3453,6 +3515,7 @@ mod fast_load_tests {
         // Flush deferred batch: builds probe table, links via ProbeTab::lookup, flushes icache,
         // and publishes PROBE + HAVE.
         unsafe { flush_probe_table() };
+        assert!(find(callee_va).is_some(), "flushed module must become visible to find()");
         assert!(test_probe_check().is_ok(), "coalesced flush_probe_table must match directory");
 
         // Reset the installed module's link state and exercise `link_module_initial_parallel`
@@ -3492,6 +3555,7 @@ mod fast_load_tests {
                 mi,
                 4,
                 Some(&probe_snap),
+                false,
                 &[(region, region + region_len)],
                 &mut patched,
             );
@@ -3672,5 +3736,135 @@ mod fast_load_tests {
             checked_after_struct < N_PLAIN,
             "out-of-module registration after structural scan must skip plain blocks (checked {checked_after_struct})"
         );
+    }
+
+    /// With `AW2_DLL_AOT_PROBE=0`, `PROBE` stays 0 even after live modules are published.
+    /// Verify that:
+    /// 1. `defer_probe` (`!HAVE && PROBE == 0`) is false once `HAVE` is already set.
+    /// 2. Any staged module (`needs_icache_flush == true`) remains hidden from `find()` and
+    ///    non-batch `link_pass` until `flush_probe_table()` completes icache invalidation.
+    /// 3. `flush_probe_table()` with `aot_probe = false` links staged modules via `d.map`,
+    ///    flushes their icache, clears `needs_icache_flush`, and exposes them to `find()`.
+    #[test]
+    fn deferred_staged_module_hidden_from_find_until_flushed_even_with_probe_off() {
+        use iced_x86::code_asm::*;
+
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                jit::test_set_knobs(jit::TestKnobs::NONE);
+                test_uninstall();
+            }
+        }
+        let _c = Cleanup;
+        jit::test_set_knobs(jit::TestKnobs { aot_probe: Some(false), ..jit::TestKnobs::NONE });
+        test_uninstall();
+        TEST_AOT.with(|c| c.set(true));
+
+        let mut sl = vec![0xCCu8; 0x2000];
+        let base = sl.as_ptr() as u64;
+        let live_caller = base + 0x100;
+        let staged_callee = base + 0x200;
+        let staged_caller = base + 0x300;
+        {
+            let mut a = CodeAssembler::new(64).unwrap();
+            a.call(staged_callee).unwrap();
+            a.ret().unwrap();
+            let bytes = a.assemble(live_caller).unwrap();
+            sl[0x100..0x100 + bytes.len()].copy_from_slice(&bytes);
+
+            let mut a = CodeAssembler::new(64).unwrap();
+            a.mov(eax, 123).unwrap();
+            a.ret().unwrap();
+            let bytes = a.assemble(staged_callee).unwrap();
+            sl[0x200..0x200 + bytes.len()].copy_from_slice(&bytes);
+
+            let mut a = CodeAssembler::new(64).unwrap();
+            a.call(staged_callee).unwrap();
+            a.ret().unwrap();
+            let bytes = a.assemble(staged_caller).unwrap();
+            sl[0x300..0x300 + bytes.len()].copy_from_slice(&bytes);
+        }
+
+        // 1. Install `mod_live` immediately (non-deferred) with probe disabled.
+        let mut bc = Box::new(BlockCache::new());
+        let img_live = unsafe { build_image(&mut *bc, &[live_caller], BUILD_VBASE) }.unwrap();
+        let inst_live = unsafe {
+            install_image_opts(
+                "probe_off_live",
+                base as usize,
+                0x180,
+                img_live,
+                None,
+                Verify::None,
+                true,
+                false,
+            )
+        }
+        .expect("install mod_live");
+        assert_eq!(inst_live.live, 1);
+        assert!(HAVE.load(Ordering::Acquire), "HAVE must be set after publishing mod_live");
+        assert!(
+            !(!HAVE.load(Ordering::Acquire) && PROBE.load(Ordering::Acquire) == 0),
+            "subsequent activation must not defer once HAVE is already true"
+        );
+        assert!(find(live_caller).is_some(), "live_caller must be visible");
+
+        // 2. Stage `mod_staged` with `defer_probe = true` while `HAVE` is already true:
+        //    its blocks must stay hidden from `find()` and non-batch `link_pass` until flushed.
+        let img_staged =
+            unsafe { build_image(&mut *bc, &[staged_callee, staged_caller], BUILD_VBASE) }.unwrap();
+        let inst_staged = unsafe {
+            install_image_opts(
+                "probe_off_staged",
+                (base + 0x200) as usize,
+                0x200,
+                img_staged,
+                None,
+                Verify::None,
+                true,
+                true,
+            )
+        }
+        .expect("stage mod_staged");
+        assert_eq!(inst_staged.live, 2);
+        assert!(
+            find(staged_callee).is_none() && find(staged_caller).is_none(),
+            "staged module with unflushed icache must stay hidden from find()"
+        );
+        {
+            let _r = REVALIDATE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = DIR.write().unwrap_or_else(|e| e.into_inner());
+            let d = g.as_mut().unwrap();
+            let patched = unsafe {
+                let _w = JitWrite::new();
+                link_pass(d, None)
+            };
+            assert!(
+                patched.is_empty() && !d.has_incoming_links(staged_callee),
+                "non-batch link_pass must not link into an unflushed staged module"
+            );
+        }
+
+        // 3. Flush the batch with `aot_probe = false`: must link both intra-staged and
+        //    cross-module calls via `d.map`, flush icache, clear `needs_icache_flush`,
+        //    and expose the blocks to `find()`.
+        unsafe { flush_probe_table() };
+        assert!(
+            find(staged_callee).is_some() && find(staged_caller).is_some(),
+            "flushed module must become visible to find() even with AW2_DLL_AOT_PROBE=0"
+        );
+        {
+            let g = DIR.read().unwrap_or_else(|e| e.into_inner());
+            let d = g.as_ref().unwrap();
+            assert!(
+                d.has_incoming_links(staged_callee),
+                "flush_probe_table with probe off must still link callers to staged_callee"
+            );
+            assert!(
+                !d.modules[inst_staged.mi].needs_icache_flush,
+                "needs_icache_flush must be cleared after flush_probe_table"
+            );
+        }
     }
 }
