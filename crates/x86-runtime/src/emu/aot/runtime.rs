@@ -2457,7 +2457,7 @@ unsafe fn install_image_opts(
         drop(w);
         drop(g);
         log::info!(
-            "emu aot: {name}: {live}/{n} blocks staged ({} KiB code across {nbanks} bank(s) at {region:#x}; {bad_verify} verify mismatches ({verified} verified), {bad_check} stale (revivable), {bad_slot} stale import slots, {held_blocks} slot state differs (guarded, unverified); {rebased} slot relocations rebased; {nlinks} links deferred; {:.1} ms)",
+            "emu aot: {name}: {live}/{n} blocks live ({} KiB code across {nbanks} bank(s) at {region:#x}; {bad_verify} verify mismatches ({verified} verified), {bad_check} stale (revivable), {bad_slot} stale import slots, {held_blocks} slot state differs (guarded, unverified); {rebased} slot relocations rebased; {nlinks} links deferred; {:.1} ms)",
             code_bytes >> 10,
             t0.elapsed().as_secs_f64() * 1e3
         );
