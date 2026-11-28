@@ -242,32 +242,62 @@ impl Default for BootTriageOptions {
     }
 }
 
-/// Split an `--args` string into individual guest CLI tokens (supporting single and double quotes).
+/// Split an `--args` string into individual guest CLI tokens (supporting single and double quotes
+/// while preserving literal Windows backslashes inside double-quoted paths).
 pub fn split_arg_string(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut has_token = false;
     let mut in_double = false;
     let mut in_single = false;
-    let mut escaped = false;
-    for ch in raw.chars() {
-        if escaped {
-            cur.push(ch);
-            escaped = false;
-            continue;
-        }
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
-            '\\' if in_double => escaped = true,
-            '"' if !in_single => in_double = !in_double,
-            '\'' if !in_double => in_single = !in_single,
+            '\\' if in_double => {
+                // Windows CommandLineToArgvW rule: backslashes are literal unless immediately
+                // preceding a double quote (`2k` slashes + `"` => `k` slashes + close quote;
+                // `2k+1` slashes + `"` => `k` slashes + literal `"`).
+                let mut slashes = 1usize;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    slashes += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    for _ in 0..(slashes / 2) {
+                        cur.push('\\');
+                    }
+                    if slashes % 2 == 1 {
+                        chars.next();
+                        cur.push('"');
+                    }
+                } else {
+                    for _ in 0..slashes {
+                        cur.push('\\');
+                    }
+                }
+                has_token = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                has_token = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                has_token = true;
+            }
             c if c.is_whitespace() && !in_double && !in_single => {
-                if !cur.is_empty() {
+                if has_token {
                     out.push(std::mem::take(&mut cur));
+                    has_token = false;
                 }
             }
-            c => cur.push(c),
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
         }
     }
-    if !cur.is_empty() {
+    if has_token {
         out.push(cur);
     }
     out
@@ -871,7 +901,8 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
     let unresolved = detect_unresolved_import(&lines, &boot_meta, &crash_meta);
     let metal_val = detect_metal_validation(&lines);
     let panic_abort = detect_rust_panic_or_abort(&lines, effective_exit_code, input.signal);
-    let guest_crash = detect_guest_crash(&lines, &crash_meta, effective_exit_code);
+    let (guest_crash, nonfatal_unimpl_ops) =
+        detect_guest_crash(&lines, &crash_meta, effective_exit_code);
     let hresult = detect_d3d12_dxgi_hresult(&lines);
     let stub_hit = detect_stub_hit(&lines, &boot_meta);
     let startup_err = detect_startup_error(&lines, &boot_meta);
@@ -1064,6 +1095,7 @@ pub fn classify_boot_log(input: &BootTriageInput) -> BootTriageReport {
             detail: cand.evidence.unwrap_or_default(),
         });
     }
+    secondary_signals.extend(nonfatal_unimpl_ops);
     secondary_signals.sort_by_key(|s| s.log_line.unwrap_or(usize::MAX));
 
     let owner = attribute_owner(&blocker, &boot_meta);
@@ -1449,9 +1481,23 @@ fn detect_guest_crash(
     lines: &[ParsedLine<'_>],
     crash_meta: &CrashReportMeta,
     exit_code: Option<i32>,
-) -> Option<BlockerDetail> {
-    // 1. Unimplemented x86-64 opcode (`EXIT_UNIMPL_OP = 86`).
-    for l in lines {
+) -> (Option<BlockerDetail>, Vec<SecondarySignal>) {
+    // 1. Unimplemented x86-64 opcode (`EXIT_UNIMPL_OP = 86` when fatal; secondary signal when
+    //    `PORT_FAIL_ON_UNIMPL_OP=0` logged the opcode and continued).
+    let has_unimpl_crash_report = (crash_meta.present
+        && crash_meta
+            .title
+            .to_ascii_lowercase()
+            .contains("unimplemented x86 instruction"))
+        || lines.iter().any(|l| {
+            l.msg.contains("CRASH REPORT:")
+                && l.msg
+                    .to_ascii_lowercase()
+                    .contains("unimplemented x86 instruction")
+        });
+
+    let mut nonfatal_unimpl: Vec<SecondarySignal> = Vec::new();
+    for (idx, l) in lines.iter().enumerate() {
         if let Some(pos) = l.msg.find("UNIMPLEMENTED mnemonic ") {
             let rest = &l.msg[pos + "UNIMPLEMENTED mnemonic ".len()..];
             let mn = rest.split_whitespace().next().unwrap_or("unknown");
@@ -1465,18 +1511,40 @@ fn detect_guest_crash(
                 .as_deref()
                 .map(|s| format!(" (`{s}`)"))
                 .unwrap_or_default();
-            return Some(BlockerDetail {
-                class: Some(BlockerClass::GuestCrash),
-                subkind: "unimplemented_x86_op".to_string(),
-                summary: format!("Unimplemented x86-64 opcode {mn}{at_str}{insn_str}"),
-                log_line: Some(l.line_no),
-                evidence: Some(l.raw.to_string()),
-                symbol: Some(mn.to_string()),
-                exception_code: Some("EXIT_UNIMPL_OP(86)".to_string()),
-                location: loc,
-                faulting_instruction: insn,
-                ..BlockerDetail::default()
-            });
+            let is_fatal = l.msg.contains("aborting")
+                || l.msg.contains("exit 86")
+                || exit_code == Some(86)
+                || has_unimpl_crash_report;
+            if is_fatal {
+                let bt = extract_crash_backtrace_after(lines, idx);
+                return (
+                    Some(BlockerDetail {
+                        class: Some(BlockerClass::GuestCrash),
+                        subkind: "unimplemented_x86_op".to_string(),
+                        summary: format!("Unimplemented x86-64 opcode {mn}{at_str}{insn_str}"),
+                        log_line: Some(l.line_no),
+                        evidence: Some(l.raw.to_string()),
+                        symbol: Some(mn.to_string()),
+                        exception_code: Some("EXIT_UNIMPL_OP(86)".to_string()),
+                        location: loc,
+                        faulting_instruction: insn,
+                        backtrace: bt,
+                        ..BlockerDetail::default()
+                    }),
+                    nonfatal_unimpl,
+                );
+            }
+            if nonfatal_unimpl.len() < 4 {
+                nonfatal_unimpl.push(SecondarySignal {
+                    class: BlockerClass::GuestCrash,
+                    subkind: "unimplemented_x86_op_nonfatal".to_string(),
+                    log_line: Some(l.line_no),
+                    summary: format!(
+                        "Nonfatal unimplemented x86-64 opcode {mn}{at_str}{insn_str} (continued)"
+                    ),
+                    detail: l.raw.to_string(),
+                });
+            }
         }
     }
 
@@ -1642,18 +1710,21 @@ fn detect_guest_crash(
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
 
-        return Some(BlockerDetail {
-            class: Some(BlockerClass::GuestCrash),
-            subkind: subkind.to_string(),
-            summary: format!("Guest crash: {ex_str}{loc_str}{insn_str}{av_str}"),
-            log_line: Some(lines[tidx].line_no),
-            evidence: Some(lines[tidx].raw.to_string()),
-            exception_code,
-            location,
-            faulting_instruction: faulting_insn,
-            backtrace: bt,
-            ..BlockerDetail::default()
-        });
+        return (
+            Some(BlockerDetail {
+                class: Some(BlockerClass::GuestCrash),
+                subkind: subkind.to_string(),
+                summary: format!("Guest crash: {ex_str}{loc_str}{insn_str}{av_str}"),
+                log_line: Some(lines[tidx].line_no),
+                evidence: Some(lines[tidx].raw.to_string()),
+                exception_code,
+                location,
+                faulting_instruction: faulting_insn,
+                backtrace: bt,
+                ..BlockerDetail::default()
+            }),
+            nonfatal_unimpl,
+        );
     }
 
     // Fallback: crash-*.json present even without log markers, or exit code 86.
@@ -1669,39 +1740,45 @@ fn detect_guest_crash(
             .exception_code
             .clone()
             .unwrap_or_else(|| "crash".to_string());
-        return Some(BlockerDetail {
-            class: Some(BlockerClass::GuestCrash),
-            subkind: "crash_report".to_string(),
-            summary: format!(
-                "Guest crash ({ex}) at {}{}",
-                loc.as_deref().unwrap_or("<unknown>"),
-                insn.as_deref()
-                    .map(|s| format!(" [`{s}`]"))
-                    .unwrap_or_default()
-            ),
-            evidence: crash_meta
-                .exception_desc
-                .clone()
-                .or_else(|| Some(crash_meta.title.clone())),
-            exception_code: crash_meta.exception_code.clone(),
-            location: loc,
-            faulting_instruction: insn,
-            backtrace: crash_meta.frames.clone(),
-            ..BlockerDetail::default()
-        });
+        return (
+            Some(BlockerDetail {
+                class: Some(BlockerClass::GuestCrash),
+                subkind: "crash_report".to_string(),
+                summary: format!(
+                    "Guest crash ({ex}) at {}{}",
+                    loc.as_deref().unwrap_or("<unknown>"),
+                    insn.as_deref()
+                        .map(|s| format!(" [`{s}`]"))
+                        .unwrap_or_default()
+                ),
+                evidence: crash_meta
+                    .exception_desc
+                    .clone()
+                    .or_else(|| Some(crash_meta.title.clone())),
+                exception_code: crash_meta.exception_code.clone(),
+                location: loc,
+                faulting_instruction: insn,
+                backtrace: crash_meta.frames.clone(),
+                ..BlockerDetail::default()
+            }),
+            nonfatal_unimpl,
+        );
     }
 
     if exit_code == Some(86) {
-        return Some(BlockerDetail {
-            class: Some(BlockerClass::GuestCrash),
-            subkind: "unimplemented_x86_op".to_string(),
-            summary: "Unimplemented x86-64 opcode (exit 86)".to_string(),
-            exception_code: Some("EXIT_UNIMPL_OP(86)".to_string()),
-            ..BlockerDetail::default()
-        });
+        return (
+            Some(BlockerDetail {
+                class: Some(BlockerClass::GuestCrash),
+                subkind: "unimplemented_x86_op".to_string(),
+                summary: "Unimplemented x86-64 opcode (exit 86)".to_string(),
+                exception_code: Some("EXIT_UNIMPL_OP(86)".to_string()),
+                ..BlockerDetail::default()
+            }),
+            nonfatal_unimpl,
+        );
     }
 
-    None
+    (None, nonfatal_unimpl)
 }
 
 fn detect_d3d12_dxgi_hresult(lines: &[ParsedLine<'_>]) -> Option<BlockerDetail> {
@@ -3522,6 +3599,19 @@ Abort trap: 6";
             split_arg_string(r#"-nolauncher -lang "en US" -foo='bar baz'"#),
             vec!["-nolauncher", "-lang", "en US", "-foo=bar baz"]
         );
+        assert_eq!(
+            split_arg_string(r#"-config "C:\Game Data\settings.ini" -share "\\server\share\dir""#),
+            vec![
+                "-config",
+                r"C:\Game Data\settings.ini",
+                "-share",
+                r"\\server\share\dir",
+            ]
+        );
+        assert_eq!(
+            split_arg_string(r#"-dir "C:\Game Data\\" -msg "say \"hi\"""#),
+            vec!["-dir", r"C:\Game Data\", "-msg", r#"say "hi""#]
+        );
     }
 
     #[test]
@@ -3634,5 +3724,41 @@ Abort trap: 6";
         assert_eq!(rep.blocker.class(), BlockerClass::StubHit);
         assert_eq!(rep.run.exit_code, Some(2));
         assert_eq!(rep.exit_code(), exit_codes::RUNTIME_ERROR);
+    }
+
+    #[test]
+    fn nonfatal_unimplemented_x86_op_does_not_fail_clean_boot_or_hide_real_crash() {
+        // PORT_FAIL_ON_UNIMPL_OP=0 logs the opcode and continues to a clean boot.
+        let clean_log = "\
+[2026-11-28T04:00:01.000Z ERROR x86_runtime::emu::interp] emu: UNIMPLEMENTED mnemonic Xgetbv at 0x140010000 `xgetbv`
+[2026-11-28T04:00:03.000Z INFO  port_loader::run_limits] [run-limit] reached --max-frames 5 (frames_presented=5, elapsed=1500ms); exiting cleanly";
+        let clean_rep = classify_boot_log(&synthetic_input(clean_log, Some(0)));
+        assert_eq!(clean_rep.blocker.class(), BlockerClass::None);
+        assert_eq!(clean_rep.exit_code(), exit_codes::OK);
+        assert_eq!(clean_rep.secondary_signals.len(), 1);
+        assert_eq!(
+            clean_rep.secondary_signals[0].subkind,
+            "unimplemented_x86_op_nonfatal"
+        );
+
+        // Nonfatal opcode earlier in the log must not hide a later real guest crash.
+        let crash_log = "\
+[2026-11-28T04:00:01.000Z ERROR x86_runtime::emu::interp] emu: UNIMPLEMENTED mnemonic Xgetbv at 0x140010000 `xgetbv`
+[2026-11-28T04:00:02.000Z ERROR win32_rt::unwind] UNHANDLED exception 0xc0000005 ACCESS_VIOLATION flags=0x0 at testgame.exe+0x20000 [va 0x140020000]
+[2026-11-28T04:00:02.001Z ERROR win32_rt::crash] ==================== AW2 CRASH REPORT: unhandled exception ====================
+[2026-11-28T04:00:02.001Z ERROR win32_rt::crash] exception 0xc0000005 ACCESS_VIOLATION flags=0x0 at testgame.exe+0x20000
+[2026-11-28T04:00:02.002Z ERROR win32_rt::crash] ==================== end of crash report (1.0ms) ====================";
+        let crash_rep = classify_boot_log(&synthetic_input(crash_log, Some(5)));
+        assert_eq!(crash_rep.blocker.class(), BlockerClass::GuestCrash);
+        assert_eq!(crash_rep.blocker.subkind, "access_violation");
+        assert_eq!(
+            crash_rep.blocker.location.as_deref(),
+            Some("testgame.exe+0x20000")
+        );
+        assert_eq!(crash_rep.secondary_signals.len(), 1);
+        assert_eq!(
+            crash_rep.secondary_signals[0].subkind,
+            "unimplemented_x86_op_nonfatal"
+        );
     }
 }
