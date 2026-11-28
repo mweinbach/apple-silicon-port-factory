@@ -475,49 +475,51 @@ fn sample_counter(
                 c.last_value = None;
                 return;
             };
-            let pct = if let Some(prev) = c.prev_host_ticks {
-                let du = cur[0].wrapping_sub(prev[0]) as f64;
-                let ds = cur[1].wrapping_sub(prev[1]) as f64;
-                let di = cur[2].wrapping_sub(prev[2]) as f64;
-                let dn = cur[3].wrapping_sub(prev[3]) as f64;
-                let total = du + ds + di + dn;
-                if total > 0.0 {
-                    let raw = match c.kind {
-                        CounterKind::ProcessorTotalPct(_) => ((du + ds + dn) / total) * 100.0,
-                        CounterKind::ProcessorUserPct(_) => ((du + dn) / total) * 100.0,
-                        CounterKind::ProcessorKernelPct(_) => (ds / total) * 100.0,
-                        CounterKind::ProcessorIdlePct(_) => (di / total) * 100.0,
-                        _ => 0.0,
-                    };
-                    raw.clamp(0.0, 100.0)
-                } else {
-                    c.last_value.unwrap_or(0.0)
-                }
-            } else {
-                0.0
+            let Some(prev) = c.prev_host_ticks else {
+                // First sample only captures baseline ticks; rate counters stay unavailable
+                // (PDH_NO_DATA) until a subsequent collect provides a non-zero tick interval.
+                c.prev_host_ticks = Some(cur);
+                c.prev_sample_time = Some(now);
+                return;
+            };
+            let du = cur[0].wrapping_sub(prev[0]) as f64;
+            let ds = cur[1].wrapping_sub(prev[1]) as f64;
+            let di = cur[2].wrapping_sub(prev[2]) as f64;
+            let dn = cur[3].wrapping_sub(prev[3]) as f64;
+            let total = du + ds + di + dn;
+            if total <= 0.0 {
+                // Keep baseline and prior last_value (None if not yet measured) until ticks advance.
+                return;
+            }
+            let raw = match c.kind {
+                CounterKind::ProcessorTotalPct(_) => ((du + ds + dn) / total) * 100.0,
+                CounterKind::ProcessorUserPct(_) => ((du + dn) / total) * 100.0,
+                CounterKind::ProcessorKernelPct(_) => (ds / total) * 100.0,
+                CounterKind::ProcessorIdlePct(_) => (di / total) * 100.0,
+                _ => 0.0,
             };
             c.prev_host_ticks = Some(cur);
             c.prev_sample_time = Some(now);
-            pct
+            raw.clamp(0.0, 100.0)
         }
         CounterKind::ProcessProcessorPct => {
             let (u, s) = process_cpu_seconds();
             let cur_cpu = u + s;
-            let pct = if let Some(prev_t) = c.prev_sample_time {
-                let dt = now.saturating_duration_since(prev_t).as_secs_f64();
-                if dt > 1e-6 {
-                    let cpus = crate::process::num_cpus().max(1) as f64;
-                    let delta = (cur_cpu - c.prev_cpu_sec).max(0.0);
-                    ((delta / dt) * 100.0).clamp(0.0, 100.0 * cpus)
-                } else {
-                    c.last_value.unwrap_or(0.0)
-                }
-            } else {
-                0.0
+            let Some(prev_t) = c.prev_sample_time else {
+                // First sample only captures the baseline; leave last_value = None until a second sample.
+                c.prev_sample_time = Some(now);
+                c.prev_cpu_sec = cur_cpu;
+                return;
             };
+            let dt = now.saturating_duration_since(prev_t).as_secs_f64();
+            if dt <= 1e-6 {
+                return;
+            }
+            let cpus = crate::process::num_cpus().max(1) as f64;
+            let delta = (cur_cpu - c.prev_cpu_sec).max(0.0);
             c.prev_sample_time = Some(now);
             c.prev_cpu_sec = cur_cpu;
-            pct
+            ((delta / dt) * 100.0).clamp(0.0, 100.0 * cpus)
         }
         CounterKind::MemoryAvailBytes
         | CounterKind::MemoryAvailKBytes
@@ -856,10 +858,19 @@ mod tests {
             assert!(core0_t0.iter().map(|&v| v as u64).sum::<u64>() > 0);
 
             assert_eq!(PdhCollectQueryData(q), ERROR_SUCCESS);
-            // Allow at least one host scheduler tick to elapse so host-wide delta is sampled.
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            assert_eq!(PdhCollectQueryData(q), ERROR_SUCCESS);
-
+            // Rate-based CPU counters must remain unavailable (PDH_NO_DATA) after only one sample
+            // rather than reporting a fabricated 0% measurement.
+            for rate_ch in [c_cpu, c_user, c_kern, c_core0, c_proc] {
+                let mut v1 = [0u8; 16];
+                let mut t1 = 0u32;
+                assert_eq!(
+                    PdhGetFormattedCounterValue(rate_ch, PDH_FMT_DOUBLE, &mut t1, v1.as_mut_ptr()),
+                    PDH_NO_DATA,
+                    "rate counter must return PDH_NO_DATA after first sample"
+                );
+                assert_eq!(std::ptr::read_unaligned(v1.as_ptr() as *const u32), PDH_NO_DATA as u32);
+            }
+            // Instantaneous memory counter is already valid after the first sample.
             let mut val = [0u8; 16];
             let mut ty = 99u32;
             assert_eq!(
@@ -868,6 +879,10 @@ mod tests {
             );
             assert_eq!(std::ptr::read_unaligned(val.as_ptr() as *const u32), PDH_CSTATUS_VALID_DATA);
             assert!(std::ptr::read_unaligned(val.as_ptr().add(8) as *const i64) > 0);
+
+            // Allow at least one host scheduler tick to elapse so host-wide and per-core deltas are measurable.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert_eq!(PdhCollectQueryData(q), ERROR_SUCCESS);
 
             let read_pct = |ch: usize| -> f64 {
                 let mut v = [0u8; 16];

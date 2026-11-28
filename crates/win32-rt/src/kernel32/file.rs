@@ -446,11 +446,6 @@ struct ConsoleSession {
     out_cp: u32,
     title: String,
     attributes: u16,
-    popup_attributes: u16,
-    cursor_pos: [i16; 2],
-    buf_size_override: Option<[i16; 2]>,
-    window_rect_override: Option<[i16; 4]>,
-    color_table: [u32; 16],
     /// Handles created by the active `AllocConsole` / `AttachConsole` session so `FreeConsole` can detach cleanly.
     session_handles: Option<[usize; 3]>,
 }
@@ -468,11 +463,6 @@ fn console_session() -> &'static Mutex<ConsoleSession> {
             out_cp: ACP,
             title: String::new(),
             attributes: 7,
-            popup_attributes: 0x00F5,
-            cursor_pos: [0, 0],
-            buf_size_override: None,
-            window_rect_override: None,
-            color_table: DEFAULT_CONSOLE_COLORS,
             session_handles: None,
         })
     })
@@ -845,16 +835,12 @@ pub unsafe extern "win64" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *mut u1
         })
         .unwrap_or((120, 50));
     let st = console_session().lock().unwrap();
-    let (buf_x, buf_y) = st
-        .buf_size_override
-        .map(|s| (s[0] as u16, s[1] as u16))
-        .unwrap_or((cols, rows.max(9000)));
     // COORD dwSize, COORD cursor, WORD attr, SMALL_RECT window, COORD max
     let vals: [u16; 11] = [
-        buf_x,
-        buf_y,
-        st.cursor_pos[0] as u16,
-        st.cursor_pos[1] as u16,
+        cols,
+        rows.max(9000),
+        0,
+        0,
         st.attributes,
         0,
         0,
@@ -887,17 +873,15 @@ pub unsafe extern "win64" fn GetConsoleScreenBufferInfoEx(h: HANDLE, info: *mut 
         })
         .unwrap_or((120, 50));
     let st = console_session().lock().unwrap();
-    let buf_size = st.buf_size_override.unwrap_or([cols, rows.max(9000)]);
-    let sr_window = st.window_rect_override.unwrap_or([0, 0, cols, rows]);
     std::ptr::write_unaligned(info as *mut u32, 96u32);
-    std::ptr::write_unaligned(info.add(4) as *mut [i16; 2], buf_size);
-    std::ptr::write_unaligned(info.add(8) as *mut [i16; 2], st.cursor_pos);
+    std::ptr::write_unaligned(info.add(4) as *mut [i16; 2], [cols, rows.max(9000)]);
+    std::ptr::write_unaligned(info.add(8) as *mut [i16; 2], [0i16, 0i16]);
     std::ptr::write_unaligned(info.add(12) as *mut u16, st.attributes);
-    std::ptr::write_unaligned(info.add(14) as *mut [i16; 4], sr_window);
+    std::ptr::write_unaligned(info.add(14) as *mut [i16; 4], [0i16, 0i16, cols, rows]);
     std::ptr::write_unaligned(info.add(22) as *mut [i16; 2], [cols, rows]);
-    std::ptr::write_unaligned(info.add(26) as *mut u16, st.popup_attributes);
+    std::ptr::write_unaligned(info.add(26) as *mut u16, 0x00F5u16);
     std::ptr::write_unaligned(info.add(28) as *mut BOOL, FALSE);
-    std::ptr::write_unaligned(info.add(32) as *mut [u32; 16], st.color_table);
+    std::ptr::write_unaligned(info.add(32) as *mut [u32; 16], DEFAULT_CONSOLE_COLORS);
     TRUE
 }
 
@@ -911,21 +895,14 @@ pub unsafe extern "win64" fn SetConsoleScreenBufferInfoEx(h: HANDLE, info: *cons
         return FALSE;
     }
     let buf_size = std::ptr::read_unaligned(info.add(4) as *const [i16; 2]);
-    let cursor_pos = std::ptr::read_unaligned(info.add(8) as *const [i16; 2]);
-    let attributes = std::ptr::read_unaligned(info.add(12) as *const u16);
     let sr_window = std::ptr::read_unaligned(info.add(14) as *const [i16; 4]);
-    let popup_attributes = std::ptr::read_unaligned(info.add(26) as *const u16);
-    let color_table = std::ptr::read_unaligned(info.add(32) as *const [u32; 16]);
-    let mut st = console_session().lock().unwrap();
-    if buf_size[0] > 0 && buf_size[1] > 0 {
-        st.buf_size_override = Some(buf_size);
-    }
-    st.cursor_pos = cursor_pos;
-    st.attributes = attributes;
-    st.window_rect_override = Some(sr_window);
-    st.popup_attributes = popup_attributes;
-    st.color_table = color_table;
-    TRUE
+    // Host POSIX terminal/pipe consoles do not support modifying screen buffer geometry,
+    // scrollback window rectangles, or the 16-color console palette table.
+    log::warn!(
+        "kernel32: SetConsoleScreenBufferInfoEx(buf_size={buf_size:?}, sr_window={sr_window:?}) unsupported on host terminal"
+    );
+    set_err(err::ERROR_NOT_SUPPORTED);
+    FALSE
 }
 
 pub unsafe extern "win64" fn SetCurrentConsoleFontEx(
@@ -12980,17 +12957,30 @@ mod tests {
 
             std::ptr::write_unaligned(csbi as *mut u32, 96u32);
             assert_eq!(GetConsoleScreenBufferInfoEx(h_out, csbi), TRUE);
+            let orig_size = std::ptr::read_unaligned(csbi.add(4) as *const [i16; 2]);
+            let orig_color0 = std::ptr::read_unaligned(csbi.add(32) as *const u32);
+            assert!(orig_size[0] > 0 && orig_size[1] > 0);
+            assert_eq!(orig_color0, DEFAULT_CONSOLE_COLORS[0]);
+
+            // SetConsoleScreenBufferInfoEx validates handle/cbSize and honestly reports
+            // ERROR_NOT_SUPPORTED on host POSIX terminals without mutating GetConsoleScreenBufferInfoEx.
+            assert_eq!(SetConsoleScreenBufferInfoEx(std::ptr::null_mut(), csbi), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+            std::ptr::write_unaligned(csbi as *mut u32, 40u32);
+            assert_eq!(SetConsoleScreenBufferInfoEx(h_out, csbi), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            std::ptr::write_unaligned(csbi as *mut u32, 96u32);
             std::ptr::write_unaligned(csbi.add(4) as *mut [i16; 2], [100i16, 400i16]);
             std::ptr::write_unaligned(csbi.add(12) as *mut u16, 0x1Eu16);
             std::ptr::write_unaligned(csbi.add(32) as *mut u32, 0x0011_2233u32);
-            assert_eq!(SetConsoleScreenBufferInfoEx(h_out, csbi), TRUE);
+            assert_eq!(SetConsoleScreenBufferInfoEx(h_out, csbi), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_NOT_SUPPORTED);
 
             let mut csbi2 = [0u8; 96];
             std::ptr::write_unaligned(csbi2.as_mut_ptr() as *mut u32, 96u32);
             assert_eq!(GetConsoleScreenBufferInfoEx(h_out, csbi2.as_mut_ptr()), TRUE);
-            assert_eq!(std::ptr::read_unaligned(csbi2.as_ptr().add(4) as *const [i16; 2]), [100, 400]);
-            assert_eq!(std::ptr::read_unaligned(csbi2.as_ptr().add(12) as *const u16), 0x1E);
-            assert_eq!(std::ptr::read_unaligned(csbi2.as_ptr().add(32) as *const u32), 0x0011_2233);
+            assert_eq!(std::ptr::read_unaligned(csbi2.as_ptr().add(4) as *const [i16; 2]), orig_size);
+            assert_eq!(std::ptr::read_unaligned(csbi2.as_ptr().add(32) as *const u32), orig_color0);
 
             let mut font_raw = [0u8; 85];
             let font = font_raw.as_mut_ptr().add(1);
