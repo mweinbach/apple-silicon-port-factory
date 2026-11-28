@@ -3922,7 +3922,7 @@ fn occlusion_query_same_pass_reset_coalescing_and_resolve_on_gpu() {
     }
     let rtv = TargetView::rtv(&rt, None).unwrap();
     let qh = QueryHeap::new(qh_type::OCCLUSION, 8).unwrap();
-    let vis_buf = qh.visibility.as_ref().unwrap();
+    let vis_buf = qh.visibility_slot(0).unwrap().0;
     unsafe {
         let vp = vis_buf.contents().as_ptr() as *mut u64;
         for i in 0..6 {

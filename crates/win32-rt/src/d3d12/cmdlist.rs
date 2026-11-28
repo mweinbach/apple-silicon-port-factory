@@ -1142,6 +1142,7 @@ unsafe extern "win64" fn resolve_query_data(this: PL, heap: *mut c_void, ty: u32
     rec(this, move |s| {
         let r = match ty {
             query_type::TIMESTAMP => s.l.resolve_timestamps(&*q.0, start, n, &*d.0, offset),
+            query_type::BINARY_OCCLUSION => s.l.resolve_binary_occlusion(&*q.0, start, n, &*d.0, offset),
             _ => s.l.resolve_occlusion(&*q.0, start, n, &*d.0, offset),
         };
         if let Err(e) = r {

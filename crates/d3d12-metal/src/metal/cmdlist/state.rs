@@ -1968,6 +1968,8 @@ pub(super) struct BarrierState {
     pub(super) enc_pre_unwaited_req: [u32; 7],
     pub(super) vis_buf_written: Vec<(usize, u32)>,
     pub(super) vis_buf_blit_read: Vec<usize>,
+    pub(super) vis_buf_cs_read: Vec<usize>,
+    pub(super) ts_buf_blit_read: bool,
     pub(super) split_barriers: Vec<(usize, u32, u32, u32, [u32; 7])>,
     pub(super) opening_render_split_ok: bool,
     pub(super) opening_clear_frag_cap: Option<(MTLStages, [u32; 7])>,
@@ -2088,6 +2090,8 @@ impl BarrierState {
             enc_pre_unwaited_req: [0; 7],
             vis_buf_written: Vec::new(),
             vis_buf_blit_read: Vec::new(),
+            vis_buf_cs_read: Vec::new(),
+            ts_buf_blit_read: false,
             split_barriers: Vec::new(),
             opening_render_split_ok: false,
             opening_clear_frag_cap: None,
@@ -2176,6 +2180,8 @@ impl BarrierState {
         self.enc_pre_unwaited_req = [0; 7];
         self.vis_buf_written.clear();
         self.vis_buf_blit_read.clear();
+        self.vis_buf_cs_read.clear();
+        self.ts_buf_blit_read = false;
         self.split_barriers.clear();
         self.opening_render_split_ok = false;
         self.enc_blit_only_sync = false;

@@ -118,6 +118,9 @@ pub struct CommandAllocator {
     pub icbs: Arc<Mutex<super::indirect_icb::IcbRing>>,
     /// Per-allocator MetalFX fences (rewound on `CommandAllocator::reset` after GPU completion).
     pub mfx_fences: Arc<Mutex<MfxFencePool>>,
+    /// Exclusively-leased scratch `MTL4CounterHeap` slices owned by lists recorded on this
+    /// allocator; kept reserved until [`Self::reset`] / drop (after GPU completion).
+    pub ts_scratch_leases: Arc<Mutex<Vec<super::query::TimestampScratchLease>>>,
 }
 unsafe impl Send for CommandAllocator {}
 unsafe impl Sync for CommandAllocator {}
@@ -133,6 +136,7 @@ impl CommandAllocator {
             rt_keep: Arc::default(),
             icbs: Arc::default(),
             mfx_fences: Arc::default(),
+            ts_scratch_leases: Arc::default(),
         })
     }
 
@@ -147,6 +151,7 @@ impl CommandAllocator {
         self.rt_keep.lock().unwrap().clear();
         self.icbs.lock().unwrap().reset();
         self.mfx_fences.lock().unwrap().reset();
+        self.ts_scratch_leases.lock().unwrap().clear();
     }
 }
 
@@ -208,6 +213,18 @@ pub struct CommandList {
     enc_vis_reset: bool,
     /// Query slot indices already enabled in the open `Reset` render pass.
     enc_vis_used_indices: Vec<u32>,
+    /// Staged GPU timestamps written into this list's exclusively-leased scratch
+    /// `MTL4CounterHeap` slice and awaiting `resolveCounterHeap` into their `QueryHeap` backing buffers.
+    pub(super) pending_staged_ts: Vec<super::query::PendingStagedTimestamp>,
+    /// Exclusively-owned scratch `MTL4CounterHeap` slice for staged timestamps on the open recording.
+    pub(super) ts_scratch_lease: Option<super::query::TimestampScratchLease>,
+    /// Next slot offset within `ts_scratch_lease` (`0..SCRATCH_SLICE_LEN`).
+    pub(super) ts_scratch_cursor: usize,
+    /// Bound `CommandAllocator`'s scratch-lease retention list (transferred on `close()`).
+    ts_scratch_keep: Option<Arc<Mutex<Vec<super::query::TimestampScratchLease>>>>,
+    /// Number of D3D12 `writeTimestampWithGranularity` calls issued on the open encoder
+    /// (Apple AGX silently drops the 5th+ timestamp inside a single encoder to 0).
+    pub(super) enc_ts_count: u8,
     predication: Option<Predication>,
     /// Argument table of utility kernels (ClearUAV, RT), created on first use.
     util_table: Option<Retained<MtlArgumentTable>>,
@@ -275,6 +292,11 @@ impl CommandList {
             enc_vis_buf: None,
             enc_vis_reset: false,
             enc_vis_used_indices: Vec::new(),
+            pending_staged_ts: Vec::new(),
+            ts_scratch_lease: None,
+            ts_scratch_cursor: 0,
+            ts_scratch_keep: None,
+            enc_ts_count: 0,
             predication: None,
             util_table: None,
             mfx_fence: None,
@@ -371,6 +393,7 @@ impl CommandList {
         self.ring = Some(alloc.ring.clone());
         self.rt_keep = Some(alloc.rt_keep.clone());
         self.mfx_fences = Some(alloc.mfx_fences.clone());
+        self.ts_scratch_keep = Some(alloc.ts_scratch_leases.clone());
         self.icb.reset_for_begin(alloc.icb_scratch.clone(), alloc.icbs.clone());
         self.binds.cs_bind_cache.valid = false;
         self.binds.gfx_bind_cache.valid = false;
@@ -392,6 +415,10 @@ impl CommandList {
         self.enc_vis_buf = None;
         self.enc_vis_reset = false;
         self.enc_vis_used_indices.clear();
+        self.pending_staged_ts.clear();
+        self.ts_scratch_lease = None;
+        self.ts_scratch_cursor = 0;
+        self.enc_ts_count = 0;
         self.predication = None;
         self.gfx = GfxState::default();
         Ok(())
@@ -429,6 +456,9 @@ impl CommandList {
         }
         let flushed = self.flush_clears(&stats::c::cf_close, |_| true);
         self.flush_pending_mfx_wait_fence_on_close();
+        if !self.pending_staged_ts.is_empty() {
+            self.flush_staged_timestamps();
+        }
         if self.list_barrier_tight_active() {
             self.emit_close_producer_barriers();
         } else if !opts::legacy_barriers()
@@ -438,6 +468,12 @@ impl CommandList {
             self.emit_close_trailing_producer_barriers();
         }
         self.end_encoder();
+        if let Some(lease) = self.ts_scratch_lease.take() {
+            self.ts_scratch_cursor = 0;
+            if let Some(keep) = &self.ts_scratch_keep {
+                keep.lock().unwrap().push(lease);
+            }
+        }
         self.cb.endCommandBuffer();
         self.open = false;
         self.pt_armed = false;
